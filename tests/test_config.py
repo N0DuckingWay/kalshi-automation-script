@@ -380,7 +380,9 @@ class TestOrderWriteBudget:
                 <= self.BASIC_TIER_WRITE_REFILL_PER_SECOND)
 
     def test_the_pacer_admits_writes_at_all(self):
-        assert config.ORDER_WRITE_BURST >= 1
+        # A pair's NO leg takes two places at once (its own and one held for
+        # its YES leg), and trader._WritePacer refuses a smaller burst at import
+        assert config.ORDER_WRITE_BURST >= 2
         assert config.ORDER_WRITES_PER_SECOND > 0
 
 

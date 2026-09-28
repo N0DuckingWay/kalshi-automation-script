@@ -29,6 +29,11 @@ tree, that no module imports the SDK's CreateOrderRequest or spells any name
 containing "createorder" (underscores and case ignored), that config.py is the
 only module referencing ORDER_API_VERSION, and that no string constant other
 than a docstring starts with the retired /portfolio/orders endpoint's path.
+
+The write pacer (trader._WritePacer) is covered from `class _FakeClock` to
+the end. Single-thread tests use _FakeClock; multi-thread tests use _SimTime,
+simulated time that only moves once every thread is blocked, so their times
+are exact on any machine.
 """
 import ast
 import copy
@@ -38,6 +43,7 @@ import json
 import logging
 import math
 import pickle
+import random
 import textwrap
 import threading
 import time
@@ -2244,7 +2250,7 @@ class TestPartialUnwindCount:
         # unknown.
         submitted: list = []
 
-        def submit(client, order):
+        def submit(client, order, *, pace=None):
             submitted.append(order)
             raise trader._UnclassifiableV2Response("unclassifiable", [{"fill_count": 3}])
 
@@ -2265,8 +2271,10 @@ class TestPartialUnwindCount:
         # a Decimal refuses to compare with (numpy's int64 here) falls back to
         # "up to" instead of raising out of _rollback_no_leg.
         np = pytest.importorskip("numpy")
+        submitted: list = []
 
-        def submit(client, order):
+        def submit(client, order, *, pace=None):
+            submitted.append(order)
             raise trader._UnclassifiableV2Response("unclassifiable", v2_resp(3))
 
         monkeypatch.setattr(trader, "_submit_order_v2", submit)
@@ -2277,6 +2285,7 @@ class TestPartialUnwindCount:
         assert result.status == "rollback_failed"
         (alert,) = self._orphan_alerts(caplog)
         assert "up to 5 NO contracts on TICK-A" in alert
+        assert len(submitted) == 1
 
     def test_a_zero_fill_names_the_full_count(self, post, caplog):
         # A 2xx fill count of zero is a clean "canceled", not an unknown: the
@@ -3595,44 +3604,164 @@ class TestNonObject2xxTransferResponse:
 
 
 class _FakeClock:
-    """A clock and a sleep for driving a _WritePacer without real time.
+    """A clock and a wait for driving a _WritePacer from one thread.
 
-    `advance_on_sleep` decides whether a sleep moves the clock (one caller
-    at a time, as a single thread sees it) or leaves it where it is (every
-    caller arriving at the same instant, so each wait is its place in line).
+    Each wait moves the clock on by its timeout. A wait with no timeout would
+    never end in one thread, so it fails the test instead of hanging.
     """
 
-    def __init__(self, start: float = 0.0, *, advance_on_sleep: bool = True):
+    def __init__(self, start: float = 0.0):
         self.now = start
-        self.advance_on_sleep = advance_on_sleep
-        self.slept: list[float] = []
-        self._lock = threading.Lock()
+        self.waited: list[float] = []
 
     def monotonic(self) -> float:
         return self.now
 
-    def sleep(self, seconds: float) -> None:
-        with self._lock:
-            self.slept.append(seconds)
-            if self.advance_on_sleep:
-                self.now += seconds
+    def wait(self, timeout) -> None:
+        if timeout is None:
+            raise AssertionError("the pacer would wait forever for a held write to end")
+        self.waited.append(timeout)
+        self.now += timeout
 
 
 def _fake_pacer(rate, burst, clock: _FakeClock) -> _WritePacer:
-    """A _WritePacer on a fake clock."""
-    return _WritePacer(rate, burst, clock=clock.monotonic, sleep=clock.sleep)
+    """A _WritePacer on a single-thread fake clock."""
+    return _WritePacer(rate, burst, clock=clock.monotonic, wait=clock.wait)
+
+
+class _SimStuck(BaseException):
+    """Raised in every simulated thread once the simulation cannot move on
+    (a BaseException, so no `except Exception` in trader turns it into a
+    trade result)."""
+
+
+class _SimCondition(threading.Condition):
+    """The simulation's condition: notify_all() counts every blocked thread as
+    running until it blocks again."""
+
+    def __init__(self, sim: "_SimTime"):
+        super().__init__()
+        self._sim = sim
+
+    def notify_all(self) -> None:
+        self._sim._blocked.clear()
+        super().notify_all()
+
+
+class _SimTime:
+    """Simulated time for threads that block only through wait() (the
+    pacer's) or sleep() (a round trip, a pause).
+
+    Time stands still while any thread runs and jumps to the earliest
+    deadline once all are blocked, so times are exact. Threads woken together
+    run in OS order, so tests check times, not which thread got which.
+    `tasks` pieces of work run on `workers` threads, and each task calls
+    done() when it ends. The pacer must share `cond` (see _sim_pacer).
+    """
+
+    REAL_LIMIT_SECONDS = 10.0
+
+    def __init__(self, tasks: int, workers: int | None = None):
+        self.now = 0.0
+        self.cond = _SimCondition(self)
+        self._tasks = tasks
+        self._workers = tasks if workers is None else workers
+        self._blocked: dict[int, float] = {}
+        self.stuck = False
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def done(self) -> None:
+        """One task has ended."""
+        with self.cond:
+            self._tasks -= 1
+            self._advance_if_all_blocked()
+
+    def wait(self, timeout) -> None:
+        """The pacer's wait: called with self.cond held."""
+        self._block(math.inf if timeout is None else self.now + timeout)
+
+    def sleep(self, seconds: float) -> None:
+        with self.cond:
+            deadline = self.now + seconds
+            while self.now < deadline:
+                self._block(deadline)
+
+    def _block(self, deadline: float) -> None:
+        if self.stuck:
+            raise _SimStuck
+        me = threading.get_ident()
+        self._blocked[me] = deadline
+        if self._advance_if_all_blocked():
+            return
+        if not self.cond.wait(self.REAL_LIMIT_SECONDS):
+            self.stuck = True
+            self.cond.notify_all()
+        self._blocked.pop(me, None)
+        if self.stuck:
+            raise _SimStuck
+
+    def _advance_if_all_blocked(self) -> bool:
+        running = min(self._workers, self._tasks)
+        if not self._blocked or len(self._blocked) < running:
+            return False
+        nxt = min(self._blocked.values())
+        if nxt == math.inf:
+            self.stuck = True          # everyone waits on someone: deadlock
+        else:
+            self.now = max(self.now, nxt)
+        self.cond.notify_all()
+        return True
+
+
+def _sim_pacer(rate, burst, sim: _SimTime) -> _WritePacer:
+    """A _WritePacer running in the simulation's time."""
+    pacer = _WritePacer(rate, burst, clock=sim.monotonic, wait=sim.wait)
+    pacer._cond = sim.cond
+    return pacer
+
+
+def _run_sim_threads(sim: _SimTime, bodies) -> None:
+    """Run each body on its own thread in the simulation and wait for all."""
+    errors: list[BaseException] = []
+
+    def run(body):
+        try:
+            body()
+        except BaseException as exc:   # noqa: BLE001 — reported below
+            errors.append(exc)
+        finally:
+            sim.done()
+
+    threads = [threading.Thread(target=run, args=(b,)) for b in bodies]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not sim.stuck, "the simulation stopped: every thread was waiting for another"
+    assert errors == []
+
+
+def _assert_within_bucket(send_times, rate, burst) -> None:
+    """No stretch of time holds more than burst + rate * (its length) sends."""
+    times = sorted(send_times)
+    for i in range(len(times)):
+        for j in range(i, len(times)):
+            assert j - i + 1 <= burst + rate * (times[j] - times[i]) + 1e-6, (
+                f"{j - i + 1} sends in {times[j] - times[i]:.4f}s: {times}"
+            )
 
 
 class TestWritePacer:
-    """The token bucket every order and transfer POST waits on: a burst of
-    `burst` writes back to back, then one every 1/rate seconds, callers
-    queued in the order they take its lock."""
+    """The bucket itself: `burst` writes back to back, then one per 1/rate s,
+    first come, first served within a lane."""
 
     def test_the_first_burst_does_not_wait(self):
         clock = _FakeClock()
         pacer = _fake_pacer(4, 3, clock)
         assert [pacer.acquire() for _ in range(3)] == [0.0, 0.0, 0.0]
-        assert clock.slept == []
+        assert clock.waited == []
 
     def test_the_next_caller_waits_one_over_the_rate(self):
         clock = _FakeClock()
@@ -3640,24 +3769,13 @@ class TestWritePacer:
         for _ in range(3):
             pacer.acquire()
         assert pacer.acquire() == pytest.approx(0.25)
-        assert clock.slept == [pytest.approx(0.25)]
+        assert clock.waited == [pytest.approx(0.25)]
 
-    def test_queued_callers_wait_in_turn(self):
-        # Every caller arrives at the same instant: the k-th past the burst
-        # is admitted k/rate after it, so the waits accumulate.
-        clock = _FakeClock(advance_on_sleep=False)
-        pacer = _fake_pacer(4, 3, clock)
-        waits = [pacer.acquire() for _ in range(7)]
-        assert waits == [0.0, 0.0, 0.0,
-                         pytest.approx(0.25), pytest.approx(0.5),
-                         pytest.approx(0.75), pytest.approx(1.0)]
-
-    def test_a_caller_after_the_queue_drains_waits_only_its_own_turn(self):
-        # One caller sleeps its 0.25 s and the clock moves with it; the next
-        # caller arrives then and waits one more 1/rate, not the sum of both.
+    def test_a_caller_after_the_line_drains_waits_only_its_own_turn(self):
+        # The 4th arrives after the 3rd was served, so it waits one 1/rate, not two
         clock = _FakeClock()
-        pacer = _fake_pacer(4, 1, clock)
-        assert pacer.acquire() == 0.0
+        pacer = _fake_pacer(4, 2, clock)
+        assert [pacer.acquire(), pacer.acquire()] == [0.0, 0.0]
         assert pacer.acquire() == pytest.approx(0.25)
         assert pacer.acquire() == pytest.approx(0.25)
         assert clock.now == pytest.approx(0.5)
@@ -3681,12 +3799,10 @@ class TestWritePacer:
         assert pacer.acquire() == pytest.approx(0.25)
 
     def test_the_first_acquire_starts_the_clock(self):
-        # The pacer reads its clock for the first time on its first acquire,
-        # so it refills from there on whatever clock it was given — here one
-        # that starts at zero, far below the real monotonic clock.
-        clock = _FakeClock(start=0.0, advance_on_sleep=False)
-        pacer = _fake_pacer(1, 1, clock)
-        assert pacer.acquire() == 0.0
+        # Refill starts from the first request's clock reading, whatever clock
+        clock = _FakeClock(start=0.0)
+        pacer = _fake_pacer(1, 2, clock)
+        assert [pacer.acquire(), pacer.acquire()] == [0.0, 0.0]
         assert pacer.acquire() == pytest.approx(1.0)
         clock.now = 10.0
         assert pacer.acquire() == 0.0
@@ -3698,14 +3814,14 @@ class TestWritePacer:
         with pytest.raises(ValueError, match="rate"):
             _WritePacer(rate, 8)
 
-    @pytest.mark.parametrize("burst", [0, -1, 1.5, 8.0, True, "8", None])
+    @pytest.mark.parametrize("burst", [0, -1, 1, 1.5, 8.0, True, "8", None])
     def test_an_invalid_burst_raises(self, burst):
+        # 1 too: a pair's NO leg takes two places at once
         with pytest.raises(ValueError, match="burst"):
             _WritePacer(8, burst)
 
     def test_the_shipped_pacer_uses_the_config_constants(self):
-        # conftest replaces trader._ORDER_WRITE_PACER per test, so the module's
-        # construction is checked through a fresh build of the same call.
+        # conftest replaces the module's pacer, so build the same call afresh
         pacer = _WritePacer(config.ORDER_WRITES_PER_SECOND, config.ORDER_WRITE_BURST)
         assert pacer._rate == float(config.ORDER_WRITES_PER_SECOND)
         assert pacer._burst == float(config.ORDER_WRITE_BURST)
@@ -3713,11 +3829,8 @@ class TestWritePacer:
         assert trader.ORDER_WRITE_BURST == config.ORDER_WRITE_BURST
 
     def test_the_module_pacer_is_built_from_the_config_names(self):
-        # Read trader.py's syntax tree, not its text, so a comment or a
-        # docstring spelling the call cannot stand in for the assignment: the
-        # module binds _ORDER_WRITE_PACER exactly once at top level, to
-        # _WritePacer called with the two config names, positionally, and
-        # with nothing else — never a literal rate or burst.
+        # By syntax tree: bound once, to _WritePacer(ORDER_WRITES_PER_SECOND,
+        # ORDER_WRITE_BURST), never literal numbers
         tree = ast.parse(inspect.getsource(trader))
         bindings = []
         for node in tree.body:
@@ -3742,118 +3855,422 @@ class TestWritePacer:
 
     def test_a_long_wait_is_logged_once(self, caplog):
         clock = _FakeClock()
-        pacer = _fake_pacer(2, 1, clock)
+        pacer = _fake_pacer(2, 2, clock)
+        pacer.acquire()
         pacer.acquire()
         with caplog.at_level(logging.INFO):
             assert pacer.acquire() == pytest.approx(0.5)
-        lines = [r for r in caplog.records if "Pacing order and transfer writes" in r.getMessage()]
+        lines = [r for r in caplog.records
+                 if "Paced an order or transfer write" in r.getMessage()]
         assert len(lines) == 1
         assert lines[0].levelno == logging.INFO
         assert "0.50s" in lines[0].getMessage()
 
     def test_a_short_wait_is_not_logged(self, caplog):
         clock = _FakeClock()
-        pacer = _fake_pacer(8, 1, clock)
+        pacer = _fake_pacer(8, 2, clock)
+        pacer.acquire()
         pacer.acquire()
         with caplog.at_level(logging.INFO):
             assert pacer.acquire() == pytest.approx(0.125)
-        assert "Pacing order and transfer writes" not in caplog.text
+        assert "Paced an order or transfer write" not in caplog.text
 
-    def test_the_sleep_happens_outside_the_lock(self):
-        # One caller's wait must never stop another caller from taking its
-        # place in line, so the lock is released before the sleep.
-        held = []
+    def test_the_balance_is_read_under_the_lock_and_the_wait_is_handed_the_lock(self):
+        # The clock is read inside the locked block, and the wait hook gets
+        # the lock so Condition.wait can release it while waiting
         clock = _FakeClock()
-        pacer = _WritePacer(
-            4, 1, clock=clock.monotonic,
-            sleep=lambda s: held.append(pacer._lock.locked()),
-        )
-        pacer.acquire()
-        pacer.acquire()
-        assert held == [False]
-
-    def test_concurrent_callers_each_get_their_own_place(self):
-        # 20 threads at one frozen instant: the lock must hand out 20 distinct
-        # places, so the waits are exactly 0 for the burst and then 1/rate,
-        # 2/rate, ... — a lost update would repeat a wait. A lost update is a
-        # race, which a run can miss, so the clock also records whether the
-        # lock is held each time the pacer reads it: acquire() reads the clock
-        # first thing in the block that updates the balance, so a reading
-        # taken without the lock means that block is not guarded.
-        clock = _FakeClock(advance_on_sleep=False)
-        rate, burst, callers = 4, 3, 20
-        lock_held: list[bool] = []
+        owned_at_clock: list[bool] = []
+        owned_at_wait: list[bool] = []
 
         def locked_clock():
-            lock_held.append(pacer._lock.locked())
+            owned_at_clock.append(pacer._cond._is_owned())
             return clock.monotonic()
 
-        pacer = _WritePacer(rate, burst, clock=locked_clock, sleep=clock.sleep)
-        start = threading.Barrier(callers)
+        def wait(timeout):
+            owned_at_wait.append(pacer._cond._is_owned())
+            clock.wait(timeout)
+
+        pacer = _WritePacer(4, 2, clock=locked_clock, wait=wait)
+        pacer.acquire()
+        pacer.acquire()
+        pacer.acquire()
+        assert owned_at_clock and all(owned_at_clock)
+        assert owned_at_wait == [True]
+
+    def test_a_caller_that_stops_waiting_leaves_the_line(self):
+        # An interrupted caller (Ctrl-C) leaves the line, or those behind wait forever
+        clock = _FakeClock()
+        interrupted = [False]
+
+        def wait(timeout):
+            if not interrupted[0]:
+                interrupted[0] = True
+                raise KeyboardInterrupt
+            clock.wait(timeout)
+
+        pacer = _WritePacer(4, 2, clock=clock.monotonic, wait=wait)
+        pacer.acquire()
+        pacer.acquire()
+        with pytest.raises(KeyboardInterrupt):
+            pacer.acquire()
+        assert not pacer._in_turn and not pacer._hedges
+        assert pacer.acquire() == pytest.approx(0.25)
+
+    def test_a_caller_that_stops_waiting_removes_its_own_place_not_another(self):
+        # Two identical waiting requests; the second stops. Only its own place
+        # may go, or the first waits forever (why _PaceRequest is eq=False).
+        sim = _SimTime(tasks=2)
+        pacer = _sim_pacer(4, 2, sim)
+        pacer.acquire()
+        pacer.acquire()                       # bucket empty at t=0
+        served: dict[str, float] = {}
+        second_arrived = threading.Event()
+
+        def first():
+            pacer.acquire()
+            served["first"] = sim.now
+
+        def second():
+            real_wait = pacer._wait
+
+            def wait_once(timeout):
+                pacer._wait = real_wait
+                second_arrived.set()
+                raise KeyboardInterrupt
+
+            with sim.cond:
+                while not pacer._in_turn:     # let the first caller join first
+                    sim.cond.wait(0.01)
+                pacer._wait = wait_once
+            try:
+                pacer.acquire()
+            except KeyboardInterrupt:
+                served["second"] = -1.0
+
+        _run_sim_threads(sim, [first, second])
+        assert second_arrived.is_set()
+        assert served == {"first": pytest.approx(0.25), "second": -1.0}
+
+    def test_a_held_write_served_just_before_its_caller_stops_goes_back(self):
+        # Served by another waiter, then stopped before getting its held write:
+        # the pacer takes the held token back
+        clock = _FakeClock()
+
+        def wait(timeout):
+            clock.wait(timeout)
+            pacer._serve(clock.now)           # served, as another waiter would
+            raise KeyboardInterrupt
+
+        pacer = _WritePacer(4, 2, clock=clock.monotonic, wait=wait)
+        pacer.acquire()
+        pacer.acquire()
+        with pytest.raises(KeyboardInterrupt):
+            pacer.acquire_with_hold()
+        assert pacer._held == 0
+        assert not pacer._in_turn
+        # The held token is back; the one for the unsent POST stays spent
+        assert pacer._tokens == pytest.approx(1.0)
+
+
+class TestHeldWrites:
+    """acquire_with_hold: a place now plus one held for later, counted
+    against the bucket until sent or released, so a late send stays in bounds."""
+
+    def test_it_takes_two_places(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 4, clock)
+        wait, held = pacer.acquire_with_hold()
+        assert wait == 0.0 and held is not None
+        assert [pacer.acquire(), pacer.acquire()] == [0.0, 0.0]
+        assert pacer.acquire() == pytest.approx(0.25)
+
+    def test_it_waits_until_two_places_are_free_together(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        pacer.acquire()
+        pacer.acquire()
+        wait, _ = pacer.acquire_with_hold()   # one token left: needs one more
+        assert wait == pytest.approx(0.25)
+
+    def test_a_held_write_is_sent_with_no_wait_on_an_empty_bucket(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 2, clock)
+        _, held = pacer.acquire_with_hold()   # both tokens gone
+        assert held.send() is True
+        assert clock.waited == []
+
+    def test_a_held_write_counts_against_the_bucket_until_it_ends(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        _, held = pacer.acquire_with_hold()
+        clock.now = 1_000.0      # refills to 3 - 1 held, not 3
+        assert [pacer.acquire(), pacer.acquire()] == [0.0, 0.0]
+        assert pacer.acquire() == pytest.approx(0.25)
+        assert held.send() is True
+        # Once sent, the refill may reach 3 again
+        clock.now += 1_000.0
+        assert [pacer.acquire() for _ in range(3)] == [0.0, 0.0, 0.0]
+
+    def test_a_held_write_sent_late_frees_its_room_only_after_the_refill(self):
+        # Hold, idle, send late, then two singles at that instant: the held
+        # send and the first single fill the burst of 2, so the second waits.
+        # Freeing the hold's room before the refill would let all three go.
+        clock = _FakeClock()
+        pacer = _fake_pacer(8, 2, clock)
+        _, held = pacer.acquire_with_hold()
+        clock.now = 10.0
+        assert held.send() is True
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == pytest.approx(0.125)
+
+    def test_a_released_write_gives_its_token_back(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 2, clock)
+        _, held = pacer.acquire_with_hold()
+        held.release()
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == pytest.approx(0.25)
+
+    def test_a_hold_ends_once(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 4, clock)
+        _, released = pacer.acquire_with_hold()
+        released.release()
+        assert released.send() is False       # the caller must take its own place
+        released.release()                    # and a second release adds nothing
+        _, sent = pacer.acquire_with_hold()
+        assert sent.send() is True
+        assert sent.send() is False
+        sent.release()                        # a sent write is never given back
+        assert pacer._held == 0
+        assert pacer._tokens == pytest.approx(4 - 1 - 2)
+
+    def test_at_most_burst_minus_one_writes_are_ever_held(self):
+        # A hold needs two free tokens, so room never drops below one: a hedge still goes
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        pacer.acquire_with_hold()
+        clock.now += 100.0
+        pacer.acquire_with_hold()
+        assert pacer._held == 2
+        clock.now += 100.0
+        assert pacer._tokens + pacer._held <= pacer._burst
+        with pytest.raises(AssertionError, match="forever"):
+            pacer.acquire_with_hold()         # room for 1, never for 2 until a hold ends
+        assert pacer.acquire_hedge() == 0.0   # a single write still goes
+
+    def test_a_hold_waiting_for_room_is_woken_when_another_hold_ends(self):
+        sim = _SimTime(tasks=2)
+        pacer = _sim_pacer(4, 2, sim)
+        served: dict[str, float] = {}
+
+        def first():
+            _, held = pacer.acquire_with_hold()   # bucket empty, one held
+            sim.sleep(0.5)
+            held.release()
+
+        def second():
+            sim.sleep(0.1)
+            pacer.acquire_with_hold()[1].release()
+            served["second"] = sim.now
+
+        _run_sim_threads(sim, [first, second])
+        # Released at 0.5: its token plus the refill covers two at once
+        assert served["second"] == pytest.approx(0.5)
+
+    def test_a_pair_waiting_for_room_is_woken_when_a_held_write_is_sent(self):
+        # Real threads. The second pair can only wait to be woken (room for
+        # one, needs two); sending the held write (which adds no token) must
+        # still wake it.
+        pacer = _WritePacer(20, 2)
+        _, held = pacer.acquire_with_hold()
+        served = threading.Event()
+
+        def second():
+            pacer.acquire_with_hold()[1].release()
+            served.set()
+
+        thread = threading.Thread(target=second, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:     # until the second pair is in line
+            with pacer._cond:
+                if pacer._in_turn:
+                    break
+            time.sleep(0.001)
+        with pacer._cond:
+            assert list(pacer._in_turn), "the second pair never joined the line"
+        assert not served.is_set()
+        assert held.send() is True
+        assert served.wait(timeout=5.0)
+        thread.join(timeout=5.0)
+
+    @pytest.mark.parametrize("seed", range(12))
+    def test_sends_never_exceed_the_bucket_however_late_held_writes_go(self, seed):
+        # Random mixes of holds sent late or released, singles and hedges.
+        # Plans are drawn up front so a seed always replays the same plans.
+        rng = random.Random(seed)
+        rate, burst, callers = 8.0, 4, 8
+        plans = [
+            [(rng.random() * 0.3, rng.choice(["pair", "pair", "single", "hedge"]),
+              rng.random() * 2.0, rng.random() < 0.8) for _ in range(4)]
+            for _ in range(callers)
+        ]
+        sim = _SimTime(tasks=callers)
+        pacer = _sim_pacer(rate, burst, sim)
+        sends: list[float] = []
+
+        def caller(plan):
+            for pause, kind, hold_for, send in plan:
+                sim.sleep(pause)
+                if kind == "pair":
+                    _, held = pacer.acquire_with_hold()
+                    sends.append(sim.now)
+                    sim.sleep(hold_for)
+                    if send:
+                        held.send()
+                        sends.append(sim.now)
+                    else:
+                        held.release()
+                elif kind == "single":
+                    pacer.acquire()
+                    sends.append(sim.now)
+                else:
+                    pacer.acquire_hedge()
+                    sends.append(sim.now)
+
+        _run_sim_threads(sim, [lambda plan=plan: caller(plan) for plan in plans])
+        assert len(sends) >= callers * 4
+        _assert_within_bucket(sends, rate, burst)
+        assert pacer._held == 0
+
+
+class TestHedgeLane:
+    """acquire_hedge is served before every waiting in-turn caller."""
+
+    def test_a_hedge_goes_ahead_of_a_waiting_pair(self):
+        sim = _SimTime(tasks=3)
+        pacer = _sim_pacer(4, 2, sim)
+        served: dict[str, float] = {}
+
+        def holder():
+            _, held = pacer.acquire_with_hold()   # t=0: bucket empty, one held
+            sim.sleep(0.5)
+            held.send()
+
+        def pair():
+            sim.sleep(0.01)
+            pacer.acquire_with_hold()[1].send()
+            served["pair"] = sim.now
+
+        def hedge():
+            sim.sleep(0.1)
+            pacer.acquire_hedge()
+            served["hedge"] = sim.now
+
+        _run_sim_threads(sim, [holder, pair, hedge])
+        # The hedge came later but gets the next token (0.25); the pair gets
+        # room at 0.5 when the hold is sent, and two tokens at 0.75
+        assert served["hedge"] == pytest.approx(0.25)
+        assert served["pair"] == pytest.approx(0.75)
+
+    def test_without_the_hedge_lane_the_same_write_would_wait_behind_the_pair(self):
+        # Control for the test above: taken in turn, it goes after the pair
+        sim = _SimTime(tasks=3)
+        pacer = _sim_pacer(4, 2, sim)
+        served: dict[str, float] = {}
+
+        def holder():
+            _, held = pacer.acquire_with_hold()
+            sim.sleep(0.5)
+            held.send()
+
+        def pair():
+            sim.sleep(0.01)
+            pacer.acquire_with_hold()[1].send()
+            served["pair"] = sim.now
+
+        def in_turn():
+            sim.sleep(0.1)
+            pacer.acquire()
+            served["in_turn"] = sim.now
+
+        _run_sim_threads(sim, [holder, pair, in_turn])
+        assert served["pair"] == pytest.approx(0.75)
+        assert served["in_turn"] == pytest.approx(1.0)
+
+    def test_hedges_are_served_in_the_order_they_arrive(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 2, clock)
+        pacer.acquire()
+        pacer.acquire()
+        assert pacer.acquire_hedge() == pytest.approx(0.25)
+        assert pacer.acquire_hedge() == pytest.approx(0.25)
+
+    def test_concurrent_callers_each_get_their_own_place(self):
+        # 20 callers at once get 20 distinct places (a lost update repeats a wait)
+        rate, burst, callers = 4, 3, 20
+        sim = _SimTime(tasks=callers)
+        pacer = _sim_pacer(rate, burst, sim)
         waits: list[float] = []
-        waits_lock = threading.Lock()
 
-        def run():
-            start.wait()
-            wait = pacer.acquire()
-            with waits_lock:
-                waits.append(wait)
+        def caller():
+            waits.append(pacer.acquire())
 
-        threads = [threading.Thread(target=run) for _ in range(callers)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        _run_sim_threads(sim, [caller for _ in range(callers)])
         expected = [0.0] * burst + [k / rate for k in range(1, callers - burst + 1)]
         assert sorted(waits) == [pytest.approx(w) for w in expected]
-        assert lock_held == [True] * callers
 
-    def test_real_threads_are_never_admitted_faster_than_the_bucket(self):
-        # Real time and real sleeps, at a rate high enough to finish at once.
-        # Each thread's admission time is the clock reading the pacer took
-        # under its lock plus the wait it returned, so the check reads the
-        # pacer's own schedule rather than when the OS happened to wake a
-        # thread. In any stretch from one admission to a later one, the
-        # bucket admits at most burst + rate * (stretch).
-        rate, burst, callers = 400.0, 4, 20
+    def test_real_threads_are_never_served_faster_than_the_bucket(self):
+        # Real threads at a high rate, some holding and sending late. Send
+        # times come from the pacer's own clock readings, not OS wake-ups.
+        rate, burst, callers = 400.0, 4, 16
         local = threading.local()
 
         def clock():
-            local.now = time.monotonic()
-            return local.now
+            now = time.monotonic()
+            if getattr(local, "first", None) is None:
+                local.first = now
+            return now
 
         pacer = _WritePacer(rate, burst, clock=clock)
         start = threading.Barrier(callers)
-        admitted: list[float] = []
-        returned: list[tuple[float, float]] = []
+        sends: list[float] = []
         lock = threading.Lock()
 
-        def run():
-            start.wait()
-            wait = pacer.acquire()
-            done = time.monotonic()
-            with lock:
-                admitted.append(local.now + wait)
-                returned.append((local.now + wait, done))
+        def timed(call):
+            local.first = None
+            result = call()
+            return local.first, result
 
-        threads = [threading.Thread(target=run) for _ in range(callers)]
+        def run(i):
+            start.wait()
+            if i % 2:
+                arrived, (wait, held) = timed(pacer.acquire_with_hold)
+                time.sleep(0.001 * (i % 5))
+                sent_at, ok = timed(held.send)
+                assert ok
+                times = [arrived + wait, sent_at]
+            else:
+                take = pacer.acquire_hedge if i % 4 == 0 else pacer.acquire
+                arrived, wait = timed(take)
+                times = [arrived + wait]
+            with lock:
+                sends.extend(times)
+
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(callers)]
         for t in threads:
             t.start()
         for t in threads:
-            t.join()
-        assert len(admitted) == callers
-        admitted.sort()
-        for i in range(callers):
-            for j in range(i, callers):
-                assert j - i + 1 <= burst + rate * (admitted[j] - admitted[i]) + 1e-6
-        # Nobody returned before its admission time: the sleep covered it
-        for due, done in returned:
-            assert done >= due - 1e-3
+            t.join(timeout=10)
+        assert not any(t.is_alive() for t in threads)
+        assert len(sends) == callers + callers // 2
+        _assert_within_bucket(sends, rate, burst)
+        assert pacer._held == 0
 
 
 class TestWritesArePaced:
-    """Every order and transfer POST takes one place on the pacer, before
-    the POST, and is still sent exactly once."""
+    """Each POST takes exactly one pacer place first and is sent once."""
 
     @pytest.fixture
     def events(self):
@@ -3861,9 +4278,34 @@ class TestWritesArePaced:
 
     @pytest.fixture
     def pacer(self, monkeypatch, events):
-        """A stand-in pacer that records each acquire in `events`."""
+        """A stand-in pacer recording "acquire", "hedge", "opening" (a place
+        plus a held one), "held" (a held place sent) and "released" in `events`."""
         mock = MagicMock()
         mock.acquire.side_effect = lambda: events.append("acquire") or 0.0
+        mock.acquire_hedge.side_effect = lambda: events.append("hedge") or 0.0
+
+        def with_hold():
+            events.append("opening")
+            held = MagicMock()
+            live = [True]
+
+            def send():
+                if not live[0]:
+                    return False
+                live[0] = False
+                events.append("held")
+                return True
+
+            def release():
+                if live[0]:
+                    live[0] = False
+                    events.append("released")
+
+            held.send.side_effect = send
+            held.release.side_effect = release
+            return 0.0, held
+
+        mock.acquire_with_hold.side_effect = with_hold
         monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", mock)
         return mock
 
@@ -3898,9 +4340,17 @@ class TestWritesArePaced:
         assert _submit_order_v2(MagicMock(), _build_no_order_v2(_no_leg(make_spec()))) == "executed"
         assert events == ["acquire", "post"]
 
+    def test_a_v2_order_takes_the_place_it_is_given(self, pacer, post, events):
+        # The given place is used instead of one in turn
+        post.replies.append(v2_resp(5))
+        pace = MagicMock(side_effect=lambda: events.append("given") or 0.0)
+        body = _build_no_order_v2(_no_leg(make_spec()))
+        assert _submit_order_v2(MagicMock(), body, pace=pace) == "executed"
+        assert events == ["given", "post"]
+        pacer.acquire.assert_not_called()
+
     def test_the_v2_log_line_is_written_after_the_wait(self, pacer, post, caplog):
-        # The "Submitting V2 order" line's time is the send time, so a pacing
-        # wait shows up as a gap before it, never between it and the POST.
+        # So the "Submitting V2 order" line's time is the send time
         logged_before_wait = []
         pacer.acquire.side_effect = lambda: logged_before_wait.append(
             "Submitting V2 order" in caplog.text
@@ -3924,8 +4374,7 @@ class TestWritesArePaced:
     def test_a_v2_429_takes_one_place_and_one_post_and_still_raises(
         self, pacer, post, events,
     ):
-        # Pacing is not a retry: a 429 that comes back anyway raises into the
-        # caller's ambiguous path exactly as before.
+        # Pacing is not a retry: a 429 still raises
         err = self._too_many_requests()
         post.replies.append(err)
         with pytest.raises(ApiException) as exc_info:
@@ -3939,13 +4388,19 @@ class TestWritesArePaced:
             _execute_transfer(MagicMock(), 0, 1, 100)
         assert events == ["acquire", "post"]
 
+    def test_an_unwind_takes_the_hedge_lane_by_default(self, pacer, post, events):
+        post.replies.append(v2_resp(5))
+        spec = make_spec()
+        result = trader._rollback_no_leg(MagicMock(), spec, _no_leg(spec), "why")
+        assert result.status == "rolled_back"
+        assert events == ["hedge", "post"]
+        pacer.acquire.assert_not_called()
+
     def test_a_429_on_the_yes_leg_paces_the_rollback_too(
         self, pacer, post, events, v2_mapping_confirmed, monkeypatch,
     ):
-        # One pair whose YES leg the exchange rejects with a 429: the position
-        # check finds nothing filled and the NO leg is unwound. Each of the
-        # three orders takes its own place on the pacer before its own POST,
-        # and none is sent twice.
+        # YES leg 429'd and unfilled, so the NO leg is unwound: NO takes two
+        # places, YES sends the held one, the unwind takes the hedge lane
         monkeypatch.setattr(trader.time, "sleep", lambda s: None)
         post.replies.extend([v2_resp(5), self._too_many_requests(), v2_resp(5)])
         client = MagicMock()
@@ -3957,24 +4412,191 @@ class TestWritesArePaced:
         )
         result = _execute_one(client, make_spec())
         assert result.status == "rolled_back"
-        assert events == ["acquire", "post"] * 3
+        assert events == ["opening", "post", "held", "post", "hedge", "post"]
         assert post.call_args_list[2].kwargs["body"]["reduce_only"] is True
+        pacer.acquire.assert_not_called()
 
     def test_a_dry_run_takes_no_place(self, pacer):
         results = execute_trades(MagicMock(), [make_spec()], dry_run=True)
         assert [r.status for r in results] == ["simulated"]
         pacer.acquire.assert_not_called()
+        pacer.acquire_with_hold.assert_not_called()
+        pacer.acquire_hedge.assert_not_called()
+
+
+class TestPairWrites:
+    """Which pacer places each _execute_one path takes, read from the places
+    held at each POST, the hedge-lane places and the balance afterwards (a
+    real pacer that never waits: every case fits in one burst)."""
+
+    BURST = 8
+
+    @pytest.fixture
+    def pacer(self, monkeypatch):
+        clock = _FakeClock()
+        pacer = _fake_pacer(8, self.BURST, clock)
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", pacer)
+        return pacer
+
+    @pytest.fixture
+    def posts(self, monkeypatch):
+        """signed_request_json answering from a script, recording each body."""
+        bodies: list[dict] = []
+        replies: list = []
+
+        held_at_post: list[int] = []
+
+        def answer(client, method, path, body):
+            bodies.append(body)
+            held_at_post.append(trader._ORDER_WRITE_PACER._held)
+            reply = replies.pop(0)
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+        monkeypatch.setattr(trader, "signed_request_json", answer)
+        return SimpleNamespace(bodies=bodies, replies=replies, held_at_post=held_at_post)
+
+    @staticmethod
+    def _count_hedges(pacer, monkeypatch) -> list:
+        """Record each hedge-lane place the pacer hands out."""
+        hedges: list = []
+        real = pacer.acquire_hedge
+        monkeypatch.setattr(pacer, "acquire_hedge", lambda: hedges.append(1) or real())
+        return hedges
+
+    @staticmethod
+    def _spent(pacer) -> float:
+        """Tokens taken so far (the fake clock never moves, so no refill)."""
+        return pacer._burst - pacer._tokens - pacer._held
+
+    def test_a_filled_pair_sends_its_yes_leg_on_the_held_place(
+        self, pacer, posts, v2_mapping_confirmed, monkeypatch,
+    ):
+        posts.replies.extend([v2_resp(5), v2_resp(5)])
+        hedges = self._count_hedges(pacer, monkeypatch)
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+        result = _execute_one(client, make_spec())
+        assert result.status == "executed"
+        assert [b["side"] for b in posts.bodies] == ["ask", "bid"]
+        # One place held while the NO leg posts, spent by the YES leg
+        assert posts.held_at_post == [1, 0]
+        assert hedges == []
+        assert pacer._held == 0 and self._spent(pacer) == 2
+
+    def test_a_killed_no_leg_gives_the_held_place_back(
+        self, pacer, posts, v2_mapping_confirmed,
+    ):
+        posts.replies.append(fok_kill_error())
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+        result = _execute_one(client, make_spec())
+        assert result.status == "failed"
+        assert pacer._held == 0 and self._spent(pacer) == 1
+
+    def test_a_killed_yes_leg_is_unwound_through_the_hedge_lane(
+        self, pacer, posts, v2_mapping_confirmed, monkeypatch,
+    ):
+        posts.replies.extend([v2_resp(5), fok_kill_error(), v2_resp(5)])
+        hedges = self._count_hedges(pacer, monkeypatch)
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+        assert posts.held_at_post == [1, 0, 0]
+        assert hedges == [1]
+        assert pacer._held == 0 and self._spent(pacer) == 3
+
+    def test_a_no_leg_whose_fill_was_unclear_gives_its_place_back_before_the_reads(
+        self, pacer, posts, v2_mapping_confirmed, monkeypatch,
+    ):
+        # The NO leg raised: its held place goes back before the (possibly
+        # slow) reads; they show it filled, so it is unwound through the hedge lane
+        posts.replies.extend([ConnectionError("reset"), v2_resp(5)])
+        hedges = self._count_hedges(pacer, monkeypatch)
+        held_at_read: list[int] = []
+        script = positions_seq(None, None, ("TICK-A", -5))
+
+        def read(**kwargs):
+            held_at_read.append(pacer._held)
+            return script(**kwargs)
+
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=read)
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+        assert posts.bodies[-1]["reduce_only"] is True
+        assert held_at_read == [0, 0, 0]   # the baselines, and the read after the error
+        assert posts.held_at_post == [1, 0]
+        assert hedges == [1]
+        assert pacer._held == 0 and self._spent(pacer) == 2
+
+    def test_a_no_leg_that_did_not_fill_gives_the_held_place_back(
+        self, pacer, posts, v2_mapping_confirmed, monkeypatch,
+    ):
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
+        posts.replies.append(ConnectionError("reset"))
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(None, None, None, None)
+        result = _execute_one(client, make_spec())
+        assert result.status == "failed"
+        assert pacer._held == 0 and self._spent(pacer) == 1
+
+    def test_a_disproven_mapping_gives_the_held_place_back(
+        self, pacer, posts, monkeypatch,
+    ):
+        posts.replies.append(v2_resp(5))
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(
+            None, None, ("TICK-A", 5),     # the NO buy moved the position the wrong way
+        )
+        result = _execute_one(client, make_spec())
+        assert result.status == "manual_review"
+        assert len(posts.bodies) == 1
+        assert pacer._held == 0 and self._spent(pacer) == 1
+
+    def test_an_exception_escaping_the_pair_gives_the_held_place_back(
+        self, pacer, posts, monkeypatch,
+    ):
+        posts.replies.append(v2_resp(5))
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(trader, "_confirm_v2_no_mapping", broken)
+        results = execute_trades(client, [make_spec()], dry_run=False)
+        assert [r.status for r in results] == ["manual_review"]
+        assert pacer._held == 0 and self._spent(pacer) == 1
+
+    def test_a_pair_never_holds_two_places(self, pacer):
+        writes = trader._PairWrites(pacer)
+        writes.opening()
+        writes.opening()
+        assert pacer._held == 1
+        writes.close()
+        assert pacer._held == 0
+
+    def test_the_second_hedge_write_takes_the_hedge_lane(self, pacer, monkeypatch):
+        hedges = self._count_hedges(pacer, monkeypatch)
+        writes = trader._PairWrites(pacer)
+        writes.opening()
+        assert writes.hedge() == 0.0 and hedges == []
+        writes.hedge()
+        assert hedges == [1]
+        writes.close()
+        assert pacer._held == 0 and self._spent(pacer) == 3
 
 
 class TestExecuteTradesArePaced:
-    """execute_trades runs its pairs on concurrent workers, and every one of
-    their POSTs goes through the one shared pacer, so seven pairs' 14 orders
-    leave no faster than the account's write limit instead of inside one
-    second."""
+    """Whole portfolios through execute_trades in simulated time, at the
+    shipped rate and burst: sends stay in bounds, YES legs never wait, and
+    unwinds go ahead of waiting NO legs."""
 
-    RATE = 2
-    BURST = 2
-    PAIRS = 7
+    POST_SECONDS = 0.1
+    READ_SECONDS = 0.05
 
     @staticmethod
     def _specs(n: int) -> list:
@@ -3987,52 +4609,102 @@ class TestExecuteTradesArePaced:
             specs.append(spec)
         return specs
 
-    def test_the_pairs_orders_are_spread_to_the_write_limit(
-        self, monkeypatch, v2_mapping_confirmed,
-    ):
-        # A frozen clock: every worker arrives at the same instant, so each
-        # order's admission time is exactly the wait the pacer gave it. Each
-        # worker records the wait of its own last acquire, and each POST reads
-        # it off that worker, which proves the POST came after the acquire.
-        clock = _FakeClock(advance_on_sleep=False)
-        shared = _fake_pacer(self.RATE, self.BURST, clock)
-        local = threading.local()
-
-        class _Recording:
-            def acquire(self):
-                wait = shared.acquire()
-                local.admitted = wait
-                return wait
-
-        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", _Recording())
-        admissions: list = []
+    def _run(self, monkeypatch, pairs: int, *, kill_yes: bool = False) -> list:
+        """Run the pairs; return each POST as (sent, returned, ticker, kind),
+        kind being "no", "yes" or "unwind"."""
+        rate, burst = config.ORDER_WRITES_PER_SECOND, config.ORDER_WRITE_BURST
+        workers = min(config.TRADER_MAX_WORKERS, pairs)
+        sim = _SimTime(tasks=pairs, workers=workers)
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", _sim_pacer(rate, burst, sim))
+        monkeypatch.setattr(trader.time, "sleep", sim.sleep)
+        posts: list[tuple[float, float, str, str]] = []
         lock = threading.Lock()
 
         def post(client, method, path, body):
-            admitted = local.__dict__.pop("admitted", None)
+            sent = sim.now
+            kind = ("unwind" if body.get("reduce_only")
+                    else "no" if body["side"] == "ask" else "yes")
+            sim.sleep(self.POST_SECONDS)
             with lock:
-                admissions.append(admitted)
+                posts.append((sent, sim.now, body["ticker"], kind))
+            if kind == "yes" and kill_yes:
+                raise fok_kill_error()
             return v2_resp(5)
 
+        def read(**kwargs):
+            sim.sleep(self.READ_SECONDS)
+            return positions_resp()
+
         monkeypatch.setattr(trader, "signed_request_json", post)
+        real = trader._execute_one
+
+        def run(client, spec):
+            try:
+                return real(client, spec)
+            finally:
+                sim.done()
+
+        monkeypatch.setattr(trader, "_execute_one", run)
         client = MagicMock()
-        client.get_positions_without_preload_content = MagicMock(
-            return_value=positions_resp()
-        )
+        client.get_positions_without_preload_content = MagicMock(side_effect=read)
+        results = execute_trades(client, self._specs(pairs), dry_run=False)
+        assert not sim.stuck
+        expected = "rolled_back" if kill_yes else "executed"
+        assert [r.status for r in results] == [expected] * pairs
+        _assert_within_bucket([p[0] for p in posts], rate, burst)
+        return posts
 
-        results = execute_trades(client, self._specs(self.PAIRS), dry_run=False)
+    @staticmethod
+    def _by_pair(posts) -> dict:
+        """Each pair's POSTs by kind, keyed by the pair's index."""
+        pairs: dict = {}
+        for sent, returned, ticker, kind in posts:
+            index = ticker.split("TICK-")[1][1:]
+            pairs.setdefault(index, {})[kind] = (sent, returned)
+        return pairs
 
-        assert [r.status for r in results] == ["executed"] * self.PAIRS
-        orders = 2 * self.PAIRS
-        assert len(admissions) == orders
-        assert None not in admissions            # every POST had its own acquire
-        admissions.sort()
-        # The burst goes at once, then one order every 1/rate seconds
-        expected = [max(0.0, (i - self.BURST + 1) / self.RATE) for i in range(orders)]
-        assert admissions == [pytest.approx(a) for a in expected]
-        # No 1-second window holds more than burst + rate orders
-        for start in admissions:
-            in_window = [a for a in admissions if start <= a <= start + 1.0 + 1e-9]
-            assert len(in_window) <= self.BURST + self.RATE
-        # Each worker slept its own wait, outside the POST
-        assert sorted(clock.slept) == [pytest.approx(a) for a in expected if a > 0]
+    @pytest.mark.parametrize("pairs", [7, 14])
+    def test_every_yes_leg_goes_out_the_moment_its_no_leg_returns(
+        self, monkeypatch, v2_mapping_confirmed, pairs,
+    ):
+        posts = self._run(monkeypatch, pairs)
+        by_pair = self._by_pair(posts)
+        assert len(by_pair) == pairs
+        for legs in by_pair.values():
+            no_returned = legs["no"][1]
+            yes_sent = legs["yes"][0]
+            assert yes_sent == pytest.approx(no_returned, abs=1e-9)
+
+    def test_the_opening_no_legs_are_spread_to_the_write_limit(
+        self, monkeypatch, v2_mapping_confirmed,
+    ):
+        # All pairs ask at 0.1 (two 0.05 s reads). Four fit in the burst of 8
+        # (two places each); each later pair goes 2/8 s after the one before.
+        posts = self._run(monkeypatch, 7)
+        rate, burst = config.ORDER_WRITES_PER_SECOND, config.ORDER_WRITE_BURST
+        start = 2 * self.READ_SECONDS
+        first = burst // 2
+        expected = [start] * first + [
+            start + 2 * k / rate for k in range(1, 7 - first + 1)
+        ]
+        no_sent = sorted(p[0] for p in posts if p[3] == "no")
+        assert no_sent == [pytest.approx(t) for t in expected]
+
+    @pytest.mark.parametrize("pairs", [7, 14])
+    def test_every_unwind_goes_ahead_of_the_waiting_no_legs(
+        self, monkeypatch, v2_mapping_confirmed, pairs,
+    ):
+        # Every YES leg is killed. No NO leg may go out between an unwind's
+        # request and its POST, and it waits at most 1/rate for itself plus
+        # 1/rate per unwind ahead of it.
+        posts = self._run(monkeypatch, pairs, kill_yes=True)
+        rate = config.ORDER_WRITES_PER_SECOND
+        by_pair = self._by_pair(posts)
+        no_sent = [legs["no"][0] for legs in by_pair.values()]
+        asked = sorted(legs["yes"][1] for legs in by_pair.values())
+        for legs in by_pair.values():
+            requested = legs["yes"][1]
+            sent = legs["unwind"][0]
+            assert not [t for t in no_sent if requested < t < sent - 1e-9]
+            ahead = sum(1 for t in asked if t <= requested)
+            assert sent - requested <= ahead / rate + 1e-9
