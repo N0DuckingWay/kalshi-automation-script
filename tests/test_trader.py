@@ -331,9 +331,11 @@ class TestOrderPriceProtection:
 
 
 class TestRollbackPriceFloor:
-    """The NO-leg unwind is a floored FoK limit sell, not an unbounded market
-    sell. The floor is read from the NO leg's own scanned entry — `nA` for the
-    same-title default used here (market_a is the NO leg)."""
+    """The NO-leg unwind is floored, never an unbounded market order: on the
+    legacy path the floor is the price of a fill-or-kill limit sell, and on V2
+    the same floor caps the immediate-or-cancel bid. The floor is read from
+    the NO leg's own scanned entry — `nA` for the same-title default used here
+    (market_a is the NO leg)."""
 
     def test_floor_is_entry_less_max_loss(self):
         spec = make_spec(nA=0.62)
@@ -1704,13 +1706,72 @@ class TestV2OrderBuilders:
             make_market("center_deci_edge_centi_cent", CENTER_DECI_EDGE_CENTI_BANDS)
         ) == Decimal("0.9999")
 
-    def test_all_legs_fill_or_kill(self):
+    def test_buy_legs_fill_or_kill_and_the_unwind_immediate_or_cancel(self):
+        # The two buy legs fill in full or not at all. The unwind is
+        # reduce_only, which the V2 endpoint accepts only with
+        # immediate_or_cancel, so it closes what it can and cancels the rest.
         spec = make_spec()
-        for body in (
-            _build_no_order_v2(_no_leg(spec)), _build_yes_order_v2(_yes_leg(spec)), _build_rollback_order_v2(_no_leg(spec)),
-        ):
-            assert body["time_in_force"] == "fill_or_kill"
+        no_body = _build_no_order_v2(_no_leg(spec))
+        yes_body = _build_yes_order_v2(_yes_leg(spec))
+        rollback_body = _build_rollback_order_v2(_no_leg(spec))
+        assert no_body["time_in_force"] == "fill_or_kill"
+        assert yes_body["time_in_force"] == "fill_or_kill"
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
+        assert rollback_body["reduce_only"] is True
+        for body in (no_body, yes_body, rollback_body):
             assert body["post_only"] is False
+
+    # Every value the V2 create-order endpoint documents for the fields it
+    # requires (https://docs.kalshi.com/api-reference/orders/create-order-v2).
+    # A body missing one is rejected with HTTP 400.
+    _V2_REQUIRED_FIELDS = {
+        "ticker", "side", "count", "price", "time_in_force", "self_trade_prevention_type",
+    }
+    _V2_SIDES = {"bid", "ask"}
+    _V2_TIME_IN_FORCE = {"fill_or_kill", "good_till_canceled", "immediate_or_cancel"}
+    _V2_SELF_TRADE_PREVENTION = {"taker_at_cross", "maker"}
+
+    @staticmethod
+    def _all_v2_bodies(spec) -> list[dict]:
+        """The three V2 bodies _execute_one can send for one spec."""
+        return [
+            _build_no_order_v2(_no_leg(spec)),
+            _build_yes_order_v2(_yes_leg(spec)),
+            _build_rollback_order_v2(_no_leg(spec)),
+        ]
+
+    def test_every_v2_body_carries_the_documented_required_fields(self):
+        for spec in (make_spec(), TestTimeSeriesLegOrder._ts_spec()):
+            for body in self._all_v2_bodies(spec):
+                assert self._V2_REQUIRED_FIELDS <= body.keys()
+                assert body["side"] in self._V2_SIDES
+                assert body["time_in_force"] in self._V2_TIME_IN_FORCE
+                assert body["self_trade_prevention_type"] in self._V2_SELF_TRADE_PREVENTION
+
+    def test_reduce_only_only_with_immediate_or_cancel(self):
+        # The docs, verbatim: "Orders with reduce_only set to true will be
+        # rejected unless time_in_force is immediate_or_cancel."
+        for structure, bands in (
+            ("linear_cent", None),
+            ("deci_cent", DECI_CENT_BANDS),
+            ("center_deci_edge_centi_cent", CENTER_DECI_EDGE_CENTI_BANDS),
+        ):
+            for spec in (
+                make_spec(structure=structure, ranges=bands),
+                TestTimeSeriesLegOrder._ts_spec(structure=structure, ranges=bands),
+            ):
+                for body in self._all_v2_bodies(spec):
+                    assert (
+                        not body["reduce_only"]
+                        or body["time_in_force"] == "immediate_or_cancel"
+                    )
+
+    def test_self_trade_prevention_type_comes_from_config(self, monkeypatch):
+        # The builders read the module binding of the config constant, so a
+        # change there reaches every V2 body.
+        monkeypatch.setattr(trader, "V2_SELF_TRADE_PREVENTION_TYPE", "maker")
+        for body in self._all_v2_bodies(make_spec()):
+            assert body["self_trade_prevention_type"] == "maker"
 
     def test_each_leg_carries_its_own_markets_shard(self):
         # Per-leg routing: a pair's two legs can live on different shards, so
@@ -1773,9 +1834,10 @@ class TestV2FillStatus:
         assert _v2_fill_status({"order": {"fill_count_fp": "0.00"}}, 10) == "canceled"
 
     def test_partial_fill_raises_for_ambiguous_path(self):
-        # A partial fill violates the fill-or-kill invariant, so the fill state
-        # is not trustworthy — raising routes _execute_one into the position
-        # lookup instead of reporting a clean fill or a clean kill.
+        # A partial fill is neither a clean fill nor a clean kill, so it raises.
+        # On a buy leg (fill-or-kill) that routes _execute_one into the
+        # position lookup; on the immediate-or-cancel unwind, _rollback_no_leg
+        # reports it as rollback_failed.
         with pytest.raises(ValueError):
             _v2_fill_status({"order": {"fill_count": 4}}, 10)
 
@@ -1831,6 +1893,10 @@ class TestV2ExecuteOne:
         assert rollback_body["ticker"] == "TICK-A"
         assert rollback_body["side"] == "bid"
         assert rollback_body["reduce_only"] is True
+        # reduce_only is accepted only with immediate_or_cancel, and every V2
+        # body carries the required self-trade-prevention field
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
+        assert rollback_body["self_trade_prevention_type"] == "taker_at_cross"
         # Loss-floored, not a flat top-of-grid bid: default spec nA=0.40 ->
         # floor 40-12=28c -> bid cap 1 - 0.28 = 0.72 on the $0.01 grid
         assert rollback_body["price"] == "0.7200"
@@ -1840,6 +1906,22 @@ class TestV2ExecuteOne:
         result = _execute_one(MagicMock(), make_spec())
         assert result.status == "rollback_failed"
         assert "rollback FoK not filled" in result.error
+
+    def test_v2_partial_unwind_is_rollback_failed(self, post, caplog):
+        # The immediate-or-cancel unwind closes 3 of the 5 NO contracts and
+        # cancels the rest. That is never reported as flat: the fill count
+        # makes _v2_fill_status raise, _rollback_no_leg reports
+        # rollback_failed, and no second order is sent.
+        post.side_effect = [v2_resp(5), v2_resp(0), v2_resp(3)]
+        with caplog.at_level(logging.CRITICAL):
+            result = _execute_one(MagicMock(), make_spec())
+        assert result.status == "rollback_failed"
+        assert "fill_count=3" in result.error
+        assert post.call_count == 3
+        assert any(
+            r.levelno == logging.CRITICAL and "up to 5 NO contracts" in r.getMessage()
+            for r in caplog.records
+        )
 
     def test_v2_leg_a_exception_with_position_is_unwound(self, post):
         post.side_effect = [TimeoutError("timeout"), v2_resp(5)]
@@ -2208,7 +2290,7 @@ class TestOrderVersionDispatch:
         v2 = _build_rollback_order_any(_no_leg(spec))
         assert v2["side"] == "bid"
         assert v2["reduce_only"] is True
-        assert v2["time_in_force"] == "fill_or_kill"
+        assert v2["time_in_force"] == "immediate_or_cancel"
         assert v2["price"] == _format_price(
             Decimal("1") - Decimal(floor_cents) / Decimal("100")
         )
@@ -2597,12 +2679,16 @@ class TestPreExecutionCheckSettings:
 
 
 class TestSameTitleWireIdentity:
-    """Same-title orders must be BYTE-IDENTICAL to what the trader sent before
-    the time-series leg inversion: every field of every V2 body (except the
-    random client_order_id) and every field of every legacy request, pinned as
-    the literal values today's builders produce for make_spec()'s default
-    (x=5, nA=0.40, pB=0.35, shard 0). A same_title pair still buys NO on
-    market_a and YES on market_b, so nothing here may move."""
+    """Pins every field of every V2 body (except the random client_order_id)
+    and every field of every legacy request the builders produce for
+    make_spec()'s default same-title spec (x=5, nA=0.40, pB=0.35, shard 0), as
+    literal values, so nothing a same-title order sends can move by accident.
+    A same_title pair buys NO on market_a and YES on market_b.
+
+    Every V2 body carries self_trade_prevention_type (a required field of the
+    V2 create-order endpoint), and the reduce_only unwind is
+    immediate_or_cancel (the only time in force the endpoint accepts with
+    reduce_only)."""
 
     def test_v2_bodies_are_unchanged(self):
         spec = make_spec()
@@ -2613,17 +2699,20 @@ class TestSameTitleWireIdentity:
             uuid.UUID(body.pop("client_order_id"))
         assert no_body == {
             "ticker": "TICK-A", "side": "ask", "price": "0.5900", "count": "5.00",
-            "time_in_force": "fill_or_kill", "exchange_index": 0,
+            "time_in_force": "fill_or_kill",
+            "self_trade_prevention_type": "taker_at_cross", "exchange_index": 0,
             "reduce_only": False, "post_only": False,
         }
         assert yes_body == {
             "ticker": "TICK-B", "side": "bid", "price": "0.3600", "count": "5.00",
-            "time_in_force": "fill_or_kill", "exchange_index": 0,
+            "time_in_force": "fill_or_kill",
+            "self_trade_prevention_type": "taker_at_cross", "exchange_index": 0,
             "reduce_only": False, "post_only": False,
         }
         assert rollback_body == {
             "ticker": "TICK-A", "side": "bid", "price": "0.7200", "count": "5.00",
-            "time_in_force": "fill_or_kill", "exchange_index": 0,
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross", "exchange_index": 0,
             "reduce_only": True, "post_only": False,
         }
 

@@ -1995,6 +1995,8 @@ class TestRunProdLiveV2Replay:
             assert price_re.match(body["price"])
             assert count_re.match(body["count"])
             assert body["time_in_force"] == "fill_or_kill"
+            # Required by the V2 endpoint, which rejects a body without it
+            assert body["self_trade_prevention_type"] == "taker_at_cross"
             assert body["exchange_index"] == 0
 
         assert len(captured["results"]) == 1
@@ -2007,9 +2009,15 @@ class TestRunProdLiveV2Replay:
         calls = client.rest_client.request.call_args_list
         assert len(calls) == 3
 
+        # Every V2 body carries the endpoint's required self-trade-prevention
+        # field, the unwind included
+        for call in calls:
+            assert call.kwargs["body"]["self_trade_prevention_type"] == "taker_at_cross"
         rollback_body = calls[2].kwargs["body"]
         assert rollback_body["side"] == "bid"
         assert rollback_body["reduce_only"] is True
+        # The endpoint accepts reduce_only only with immediate_or_cancel
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
         # The unwind is LOSS-FLOORED, not a flat top-of-grid bid: the NO leg's
         # scanned NO entry is 0.45, so the floor is 45 - 12 = 33c and the bid
         # cap is its YES-book mirror, 1 - 0.33 = 0.67, already on the replay

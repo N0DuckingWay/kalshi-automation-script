@@ -58,6 +58,15 @@ Notes:
     neither the V2 order endpoint nor exchange sharding, so a sandbox "pass"
     would prove nothing about the mapping this probe exists to verify.
 
+    CANCEL YOUR RESTING ORDERS ON THE PROBE TICKER FIRST. Every order the
+    probe submits carries the builders' self_trade_prevention_type
+    (config.V2_SELF_TRADE_PREVENTION_TYPE, "taker_at_cross"), so a probe order
+    that would trade against an order this account already has resting on the
+    ticker is cancelled at that point instead of filling, and the step's
+    verdict then no longer tests what the step is for. The probe checks only
+    that the POSITION is flat before it starts; it does not read the account's
+    resting orders.
+
     COUNT OVERRIDE. trader's builders read the whole-contract count from the
     trader._Leg they are handed (rendered "<n>.00") because the bot sizes in
     whole contracts. The probe wants the V2 minimum of 0.01 contracts, so
@@ -301,9 +310,9 @@ def _no_buy_body(market: Any, no_price: float) -> dict:
     Build the NO-buy request body: the real builder, with a 0.01 count.
 
     Built through trader._build_no_order_v2 so every other field (side from
-    _V2_LEG_SIDE, the tick-aware limit price, time_in_force, client_order_id,
-    exchange_index, reduce_only, post_only) is byte-identical to what the live
-    path would send.
+    _V2_LEG_SIDE, the tick-aware limit price, time_in_force,
+    self_trade_prevention_type, client_order_id, exchange_index, reduce_only,
+    post_only) is byte-identical to what the live path would send.
 
     Args:
         market (Any): The scanner.ApiMarket to trade.
@@ -331,9 +340,10 @@ def _no_close_body(market: Any) -> dict:
 
     Everything that makes this body a CLOSE comes from
     trader._build_rollback_order_v2 — side "bid" (trader._V2_LEG_SIDE's
-    "close_no"), reduce_only=True, time_in_force "fill_or_kill", the ticker and
-    the market's own exchange shard — so the probe verifies the real unwind
-    body rather than a reimplementation of it. TWO fields are then overridden:
+    "close_no"), reduce_only=True, time_in_force "immediate_or_cancel",
+    self_trade_prevention_type, the ticker and the market's own exchange shard
+    — so the probe verifies the real unwind body rather than a
+    reimplementation of it. TWO fields are then overridden:
     the count (the V2 fractional minimum, see _no_buy_body) and the price. See
     the module header's PRICE OVERRIDE note for why the builder's price cannot
     be used here.
@@ -662,9 +672,10 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
          (reduce_only bid nets a NO position to flat) rests on the same
          disproven assumption and would add to the wrong exposure instead.
       5. Submit the closing body from trader._build_rollback_order_v2 (side
-         "bid", reduce_only=True), priced at the top of this market's own grid
-         rather than at the builder's loss floor, so the close crosses
-         whatever is resting on the book (see _no_close_body). PASS half two
+         "bid", reduce_only=True, time_in_force "immediate_or_cancel"), priced
+         at the top of this market's own grid rather than at the builder's
+         loss floor, so the close crosses whatever is resting on the book
+         (see _no_close_body). PASS half two
          iff the position returns to 0. This is the step's SECOND submission
          — the probe's second order-submission site of three — and it needs
          no _non_object_body_fail guard: its 2xx body is only
@@ -906,9 +917,10 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
     _emit("REQUEST BODY (NO close — hypothesis: reduce_only bid nets to flat)", close_body)
     if not _confirm(
         assume_yes,
-        f"Submit a fill-or-kill {close_body['side'].upper()} on {ticker} for "
+        f"Submit a {close_body['side'].upper()} on {ticker} for "
         f"{PROBE_COUNT_STR} contracts at a limit of {close_body['price']} with "
-        f"reduce_only=true, to close the {after} position just opened.",
+        f"time_in_force={close_body['time_in_force']} and reduce_only=true, to "
+        f"close the {after} position just opened.",
     ):
         print(
             f"{_FAIL}: declined at the prompt while a {after} position is OPEN on {ticker}. "

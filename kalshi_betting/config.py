@@ -602,11 +602,12 @@ BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 # Maximum accepted per-contract loss (cents) when unwinding the NO leg (the
 # first-submitted leg: market_a for a same-title pair, market_b for a
 # time-series pair) after the YES leg failed, relative to the NO leg's scanned
-# NO entry price. The rollback is a fill-or-kill LIMIT sell at (entry - this),
-# so a book that has collapsed past the floor kills the unwind instead of
-# realizing an unbounded loss; the orphaned position then surfaces as
-# status="rollback_failed" for manual review — the same path an unfilled
-# market unwind already took.
+# NO entry price. On the legacy path the rollback is a fill-or-kill LIMIT sell
+# at (entry - this); on the V2 path the same bound caps an immediate-or-cancel
+# bid, which closes only what rests at or under the cap (see the last
+# paragraph below). Either way a book that has collapsed past the floor leaves
+# the position, or what is left of it, open instead of realizing an unbounded
+# loss, and that surfaces as status="rollback_failed" for manual review.
 #
 # This allowance must cover the market's ENTIRE bid-ask spread, not just the
 # "acceptable loss": the NO leg entered at the NO ASK, but the unwind is a sell
@@ -682,7 +683,8 @@ PRICE_EPSILON                 = 1e-6
 
 # Which create-order endpoint trader.py submits through. Allowed values:
 #   "v2"     — POST V2_ORDER_PATH below: dollar-string fill-or-kill LIMIT prices
-#              (the limit price IS the price protection), fixed-point counts,
+#              (the reduce_only unwind is immediate_or_cancel instead; the
+#              limit price IS the price protection), fixed-point counts,
 #              bid/ask sides on the single YES book, explicit exchange_index.
 #              Only this path can express a cap at the market's real tick
 #              resolution (see BUY_SLIPPAGE_TICKS above).
@@ -705,6 +707,20 @@ ORDER_API_VERSION             = "v2"
 # so the string used to build the URL and the string that is signed must be one
 # and the same value.
 V2_ORDER_PATH                 = "/trade-api/v2/portfolio/events/orders"
+
+# Self-trade prevention for every V2 order. The V2 create-order endpoint
+# REQUIRES this field ("taker_at_cross" | "maker") and rejects a body without
+# it. "taker_at_cross" cancels OUR incoming order if it would trade against
+# another order on this account; "maker" would cancel the account's resting
+# order instead. The bot never leaves an order resting, so the only order it
+# could meet is one placed outside the bot (by hand, or by another client on
+# this account), and taker_at_cross leaves that order alone. What the endpoint
+# reports for the bot's cancelled order has not been observed; the trader
+# handles each shape through its existing paths. Nothing filled is an ordinary
+# non-fill. On a buy leg, part filled or an error response goes to the
+# position-delta check (a part fill the account shows ends as manual_review).
+# On the unwind, either one is rollback_failed.
+V2_SELF_TRADE_PREVENTION_TYPE = "taker_at_cross"
 
 # TOP-OF-GRID CEILING CLAMP, as a dollar string, on the V2 reduce-only rollback
 # bid that unwinds a filled NO leg (market_a for same-title, market_b for

@@ -38,6 +38,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from kalshi_python_sync.exceptions import ApiException
 
 from kalshi_betting import trader, v2_probe
 from kalshi_betting.scanner import PriceRange
@@ -124,17 +125,41 @@ def v2_resp(fill_count: str, remaining_count: str) -> dict:
 FILLED = v2_resp("0.01", "0.00")
 KILLED = v2_resp("0.00", "0.01")
 
+# The values the V2 create-order endpoint accepts for its required
+# self_trade_prevention_type field
+# (https://docs.kalshi.com/api-reference/orders/create-order-v2).
+_V2_SELF_TRADE_PREVENTION = {"taker_at_cross", "maker"}
+
+
+def reject_like_the_endpoint(body: dict) -> None:
+    """Raise the HTTP 400 the V2 endpoint returns for a body it refuses.
+
+    Two of the endpoint's own checks: self_trade_prevention_type is required
+    and must be one of its two values, and "Orders with reduce_only set to
+    true will be rejected unless time_in_force is immediate_or_cancel." A
+    stand-in submission seam calls this first, so a probe test fails if a
+    trader builder stops sending either.
+    """
+    if body.get("self_trade_prevention_type") not in _V2_SELF_TRADE_PREVENTION:
+        raise ApiException(status=400, reason="self_trade_prevention_type is required")
+    if body.get("reduce_only") and body.get("time_in_force") != "immediate_or_cancel":
+        raise ApiException(
+            status=400, reason="reduce_only requires time_in_force immediate_or_cancel",
+        )
+
 
 class FakeExchange:
     """A one-price book that honours limit prices, plus the position it moves.
 
     Everywhere else in this file the submission seam returns a canned fill or
     a canned kill, which cannot show whether a price would actually have
-    crossed. This models the single fact DR-04 turns on: a fill-or-kill ASK
-    (sell YES) fills only at or BELOW the resting YES bid, a fill-or-kill BID
-    (buy YES) fills only at or ABOVE the resting YES ask, and anything else
-    comes back killed with the full count remaining. `position` is a Decimal
-    so -0.01 + 0.01 is exactly 0.
+    crossed. This models the single fact DR-04 turns on: an ASK (sell YES)
+    fills only at or BELOW the resting YES bid, a BID (buy YES) fills only at
+    or ABOVE the resting YES ask, and anything else comes back with nothing
+    filled and the full count remaining — the fill-or-kill NO buy killed, the
+    immediate-or-cancel close cancelled. A body the endpoint itself would
+    refuse (reject_like_the_endpoint) raises its HTTP 400 before any of that.
+    `position` is a Decimal so -0.01 + 0.01 is exactly 0.
     """
 
     def __init__(self, yes_bid: str, yes_ask: str):
@@ -147,6 +172,7 @@ class FakeExchange:
         """Stand-in for v2_probe.signed_request_json."""
         assert method == "POST"
         self.submitted.append(body)
+        reject_like_the_endpoint(body)
         count = Decimal(body["count"])
         price = Decimal(body["price"])
         if body["side"] == "ask":
@@ -176,6 +202,9 @@ class FakeExchange:
 def submits(monkeypatch) -> list:
     """Capture every body the probe submits, returning fills by default.
 
+    A body the endpoint would refuse is answered with its HTTP 400 instead
+    (reject_like_the_endpoint), after it is captured.
+
     Patched at v2_probe.signed_request_json — the probe's one submission seam
     (it deliberately bypasses trader._submit_order_v2, whose int-count fill
     classifier cannot express the fractional probe count).
@@ -185,6 +214,7 @@ def submits(monkeypatch) -> list:
     def fake_post(client, method, path, *, query=None, body=None):
         assert method == "POST"
         captured.append({"path": path, "body": body})
+        reject_like_the_endpoint(body)
         return FILLED
 
     monkeypatch.setattr(v2_probe, "signed_request_json", fake_post)
@@ -234,7 +264,8 @@ class TestBodyConstruction:
         reference = trader._build_no_order_v2(v2_probe._probe_leg(market, 0.41))
         # Everything except count (random client_order_id aside) is the
         # builder's own output — the probe verifies the real code.
-        for key in ("ticker", "side", "price", "time_in_force", "exchange_index",
+        for key in ("ticker", "side", "price", "time_in_force",
+                    "self_trade_prevention_type", "exchange_index",
                     "reduce_only", "post_only"):
             assert body[key] == reference[key]
         assert body["count"] == v2_probe.PROBE_COUNT_STR
@@ -297,10 +328,13 @@ class TestBodyConstruction:
         )
         body = v2_probe._no_close_body(market)
         reference = trader._build_rollback_order_v2(v2_probe._probe_leg(market, 0.5))
-        for key in ("ticker", "side", "time_in_force", "exchange_index",
+        for key in ("ticker", "side", "time_in_force",
+                    "self_trade_prevention_type", "exchange_index",
                     "reduce_only", "post_only"):
             assert body[key] == reference[key]
         assert body["reduce_only"] is True
+        # The endpoint accepts reduce_only only with immediate_or_cancel
+        assert body["time_in_force"] == "immediate_or_cancel"
         assert body["count"] == v2_probe.PROBE_COUNT_STR
         # The price is the one key that must NOT be the builder's.
         assert body["price"] == expected_price
@@ -329,6 +363,18 @@ class TestConfirmationGate:
         out = v2_probe._step_no_mapping(client, TICKER, False, 1)
         assert out == v2_probe._FAIL
         assert len(submits) == 1  # only the opening ask went out
+
+    def test_close_prompt_names_the_close_bodys_time_in_force(
+        self, submits, monkeypatch, capsys,
+    ):
+        # The close's confirmation text is built from the close body, so it
+        # names the time in force the endpoint actually receives.
+        client = probe_client([0, -0.01, 0])
+        assert v2_probe._step_no_mapping(client, TICKER, True, 1) == v2_probe._PASS
+        close_body = submits[1]["body"]
+        printed = capsys.readouterr().out
+        assert close_body["time_in_force"] == "immediate_or_cancel"
+        assert f"time_in_force={close_body['time_in_force']}" in printed
 
     def test_yes_flag_skips_the_prompt(self, submits, monkeypatch):
         monkeypatch.setattr(

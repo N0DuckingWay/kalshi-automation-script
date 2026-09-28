@@ -22,10 +22,10 @@ Purpose:
     — never an unpriced market order — at the NO leg's scanned entry less
     config.ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, so a collapsed book kills the
     unwind instead of realizing an unbounded loss; the rollback's own fill
-    status is verified either way, and an unfilled rollback is reported as
-    status="rollback_failed" (orphaned position, manual review). Multiple pairs
-    are executed concurrently via ThreadPoolExecutor so no pair waits for
-    another to complete.
+    status is verified either way, and a rollback that did not close the whole
+    position is reported as status="rollback_failed" (orphaned position,
+    manual review). Multiple pairs are executed concurrently via
+    ThreadPoolExecutor so no pair waits for another to complete.
 
     Two order paths exist, selected by config.ORDER_API_VERSION:
       "v2" (default) — POST config.V2_ORDER_PATH (/portfolio/events/orders) with
@@ -35,7 +35,12 @@ Purpose:
         the shard its market actually lives on. There is no "market" order type
         in V2, so a taker order IS a marketable FoK limit and the LIMIT PRICE IS
         THE PRICE PROTECTION: scanned price ceiled to the market's own tick grid
-        plus config.BUY_SLIPPAGE_TICKS ticks (see _v2_limit_price).
+        plus config.BUY_SLIPPAGE_TICKS ticks (see _v2_limit_price). Every body
+        also carries the self_trade_prevention_type the endpoint requires
+        (config.V2_SELF_TRADE_PREVENTION_TYPE). The unwind is the one order that
+        is not fill_or_kill: it is reduce_only, and the endpoint accepts
+        reduce_only only with immediate_or_cancel, so it fills what it can at
+        or under its loss-floored cap and cancels the rest.
       "legacy" — the original /portfolio/orders create-order call
         (CreateOrderRequest, type="market", integer-cents buy_max_cost). Kept
         fully intact and unmodified so flipping ORDER_API_VERSION back to
@@ -83,7 +88,8 @@ Dependencies:
     BUY_SLIPPAGE_TICKS, BUY_MAX_COST_SLIPPAGE_CENTS, DEFAULT_EXCHANGE_INDEX,
     ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, TRADER_MAX_WORKERS, TRANSFER_PATH,
     TRANSFER_POLL_INTERVAL_SECONDS, TRANSFER_SETTLE_TIMEOUT_SECONDS,
-    V2_ORDER_PATH and V2_ROLLBACK_BID_PRICE_DOLLARS from config.py, with
+    V2_ORDER_PATH, V2_ROLLBACK_BID_PRICE_DOLLARS and
+    V2_SELF_TRADE_PREVENTION_TYPE from config.py, with
     LiveSettings and live_settings for pre_execution_check. Called by
     main.py after select_portfolio() selects the final trade list. Depends on
     the KalshiClient produced by auth.py.
@@ -184,6 +190,7 @@ from .config import (
     TRANSFER_SETTLE_TIMEOUT_SECONDS,
     V2_ORDER_PATH,
     V2_ROLLBACK_BID_PRICE_DOLLARS,
+    V2_SELF_TRADE_PREVENTION_TYPE,
     LiveSettings,
     live_settings,
 )
@@ -377,17 +384,18 @@ def _rollback_floor_cents(no_leg: _Leg) -> int:
     """
     Minimum acceptable per-contract NO sale price (cents) for a NO-leg unwind.
 
-    The unwind is a fill-or-kill LIMIT sell rather than a market sell, so a book
-    that has collapsed since the NO leg filled kills the order instead of
-    realizing an unbounded loss. The floor is the NO leg's scanned entry price
-    less ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, clamped into the API's valid
-    limit price range (1..99 cents inclusive) — an entry near either extreme
-    would otherwise produce a price the exchange rejects outright.
+    On the legacy path the unwind is a fill-or-kill LIMIT sell rather than a
+    market sell (on V2 the same bound caps an immediate-or-cancel bid — see
+    _v2_rollback_price), so a book that has collapsed since the NO leg filled
+    kills the order instead of realizing an unbounded loss. The floor is the
+    NO leg's scanned entry price less ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT,
+    clamped into the API's valid limit price range (1..99 cents inclusive) —
+    an entry near either extreme would otherwise produce a price the exchange
+    rejects outright.
 
-    A killed unwind leaves the NO-leg position open, which _rollback_no_leg
-    reports as status="rollback_failed" for manual review: the same outcome an
-    unfilled market unwind already produced, now with a bounded loss instead of
-    whatever the book happened to offer.
+    An unwind that does not close the whole position leaves the NO-leg
+    position, or what is left of it, open, which _rollback_no_leg reports as
+    status="rollback_failed" for manual review.
 
     Args:
         no_leg (_Leg): The first-submitted NO leg being unwound (market_a for a
@@ -593,9 +601,11 @@ def _v2_rollback_price(no_leg: _Leg) -> Decimal:
         legacy floor (NO sell)  =  floor_cents / 100
         V2 cap      (YES bid)   =  1 - floor_cents / 100
 
-    A book that has collapsed past the bound kills the FoK on either path
-    rather than realizing an unbounded loss; the orphaned NO-leg position then
-    surfaces as status="rollback_failed" for manual review.
+    A book that has collapsed past the bound kills the unwind on either path
+    rather than realizing an unbounded loss (on V2 the immediate-or-cancel bid
+    fills only what rests at or under the cap, which can be part of the
+    position or none of it); the NO-leg position left open then surfaces as
+    status="rollback_failed" for manual review.
 
     Two roundings, both deliberate:
 
@@ -711,6 +721,8 @@ def _build_no_order_v2(leg: _Leg) -> dict:
         "count": _format_count(leg.count),
         # fill_or_kill: execute the full count immediately or cancel with no fill
         "time_in_force": "fill_or_kill",
+        # Required by the V2 endpoint — see config.V2_SELF_TRADE_PREVENTION_TYPE
+        "self_trade_prevention_type": V2_SELF_TRADE_PREVENTION_TYPE,
         # This leg's OWN market's shard, read from the market itself — legs of
         # one pair can live on different shards. Explicit, never the -1
         # auto-route sentinel: if our notion of a market's shard is ever wrong
@@ -755,6 +767,8 @@ def _build_yes_order_v2(leg: _Leg) -> dict:
         "count": _format_count(leg.count),
         # fill_or_kill: execute the full count immediately or cancel with no fill
         "time_in_force": "fill_or_kill",
+        # Required by the V2 endpoint — see config.V2_SELF_TRADE_PREVENTION_TYPE
+        "self_trade_prevention_type": V2_SELF_TRADE_PREVENTION_TYPE,
         # The YES leg's own market's shard — a pair's two markets may sit on
         # different shards. Explicit, never -1 auto-route — see _build_no_order_v2
         "exchange_index": leg.market.exchange_index,
@@ -774,10 +788,15 @@ def _build_rollback_order_v2(no_leg: _Leg) -> dict:
     the SAME bounded-loss protection the legacy limit sell does:
     _v2_rollback_price caps it at 1 - (the NO leg's scanned entry less
     ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT), clamped by this market's own top
-    tradeable level. A book that collapsed since the NO leg filled kills the
-    fill_or_kill order instead of buying the YES short back at any price. The
-    bid/reduce-only semantics here are part of the mapping to verify at the
-    first live unwind.
+    tradeable level. The order is immediate_or_cancel, not fill_or_kill,
+    because the endpoint rejects a reduce_only order with any other time in
+    force: it buys back what rests at or under the cap and cancels the rest,
+    never resting on the book. On a book that collapsed since the NO leg
+    filled it therefore closes only what the cap reaches — part of the
+    position, or none of it — instead of buying the YES short back at any
+    price, and _rollback_no_leg reports anything short of a full close as
+    rollback_failed. The bid/reduce-only semantics here are part of the
+    mapping to verify at the first live unwind.
 
     Args:
         no_leg (_Leg): The first-submitted NO leg to unwind (market_a for a
@@ -797,7 +816,15 @@ def _build_rollback_order_v2(no_leg: _Leg) -> dict:
         # protection the legacy limit sell carries (see _v2_rollback_price)
         "price": _format_price(_v2_rollback_price(no_leg)),
         "count": _format_count(no_leg.count),
-        "time_in_force": "fill_or_kill",
+        # immediate_or_cancel, not fill_or_kill: the exchange rejects a
+        # reduce_only order with any other time in force. It fills what rests
+        # at or under the loss-floored cap and cancels the rest (nothing is
+        # left resting), so it can close only part of the position;
+        # _rollback_no_leg reports anything short of a full close as
+        # rollback_failed.
+        "time_in_force": "immediate_or_cancel",
+        # Required by the V2 endpoint — see config.V2_SELF_TRADE_PREVENTION_TYPE
+        "self_trade_prevention_type": V2_SELF_TRADE_PREVENTION_TYPE,
         # The NO leg's own market's shard — the unwind must route to the same
         # shard the NO-leg order opened the position on. Explicit, never -1
         # auto-route — see _build_no_order_v2
@@ -844,18 +871,26 @@ def _v2_fill_status(data: dict, requested_count: int) -> str:
     Classify a V2 create-order response into the legacy fill-status vocabulary.
 
     Returns the same strings the legacy path's order.status field carried, so
-    _execute_one's branching is untouched: "executed" for a full fill,
-    "canceled" for a fill-or-kill that killed with no fill.
+    _execute_one and _rollback_no_leg branch on one vocabulary for both order
+    paths: "executed" for a full fill, "canceled" when nothing filled (a
+    fill-or-kill buy leg that was killed, or an immediate-or-cancel unwind
+    that crossed nothing).
 
-    Anything else — a partial fill (which violates the fill-or-kill invariant)
-    or a response with no readable fill count at all — is NOT guessed at. It is
-    logged at CRITICAL and raised, because raising routes the caller into
-    _execute_one's EXISTING ambiguous-exception path, which consults the
-    account's actual position (the ground truth) before classifying the trade.
-    That means a mispredicted V2 response shape degrades safely into
-    failed / rolled_back / manual_review instead of being misread as a clean
-    fill or a clean kill. Silently returning a status here is what would be
-    dangerous.
+    Anything else — a partial fill (which violates the fill-or-kill invariant
+    on a buy leg) or a response with no readable fill count at all — is NOT
+    guessed at. It is logged at CRITICAL and raised, because raising routes a
+    buy leg into _execute_one's ambiguous-exception path, which consults the
+    account's actual position (the ground truth) before classifying the
+    trade. That means a mispredicted V2 response shape degrades
+    safely into failed / rolled_back / manual_review instead of being misread
+    as a clean fill or a clean kill. Silently returning a status here is what
+    would be dangerous.
+
+    The unwind is the one caller for which a partial fill is a real outcome:
+    it is immediate_or_cancel (see _build_rollback_order_v2), so it can close
+    part of the position and cancel the rest. The ValueError raised for it is
+    caught by _rollback_no_leg's except branch, which reports rollback_failed
+    and sends no further order.
 
     Args:
         data (dict): The parsed V2 response body. The order object may be
@@ -867,8 +902,9 @@ def _v2_fill_status(data: dict, requested_count: int) -> str:
 
     Raises:
         ValueError: When the fill count is missing, unparseable, or is a
-            partial fill — deliberately routing the caller into the
-            position-lookup disambiguation path.
+            partial fill — deliberately routing a buy leg into the
+            position-lookup disambiguation path, and an unwind into
+            rollback_failed.
     """
     inner = data.get("order")
     order = inner if isinstance(inner, dict) else data
@@ -880,8 +916,9 @@ def _v2_fill_status(data: dict, requested_count: int) -> str:
             return "canceled"
     logging.critical(
         "V2 order response could not be classified (fill_count=%s, requested=%d,"
-        " response keys=%s, order keys=%s) — treating as an AMBIGUOUS submission"
-        " so the account position decides the outcome.",
+        " response keys=%s, order keys=%s) — raising: on a buy leg the account's"
+        " position change decides the outcome; on the unwind the pair is"
+        " reported rollback_failed.",
         fill, requested_count, sorted(data.keys()), sorted(order.keys()),
     )
     raise ValueError(
@@ -912,8 +949,9 @@ def _submit_order_v2(client: Any, body: dict) -> str:
     Raises:
         ApiException: On non-2xx HTTP status.
         ValueError: When the response's fill count is missing or partial —
-            callers treat any exception as an ambiguous submission and consult
-            the account position.
+            _execute_one treats any exception on a buy leg as an ambiguous
+            submission and consults the account position; _rollback_no_leg
+            reports one on the unwind as rollback_failed.
     """
     requested = int(Decimal(body["count"]))
     # Log before submitting: the client_order_id is the only handle a human has
@@ -977,9 +1015,9 @@ def _build_rollback_order_any(no_leg: _Leg) -> Any:
             same_title pair, market_b for a time_series pair).
 
     Returns:
-        Any: A V2 reduce-only floored bid body when config.ORDER_API_VERSION is
-            "v2", otherwise a legacy reduce-only floored FoK limit sell
-            CreateOrderRequest.
+        Any: A V2 reduce-only floored immediate-or-cancel bid body when
+            config.ORDER_API_VERSION is "v2", otherwise a legacy reduce-only
+            floored FoK limit sell CreateOrderRequest.
     """
     if ORDER_API_VERSION == "v2":
         return _build_rollback_order_v2(no_leg)
@@ -1230,20 +1268,25 @@ def _rollback_no_leg(client: Any, spec: TradeSpec, no_leg: _Leg, reason: str) ->
     leg's scanned entry less ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT — expressed
     as:
       * legacy: a fill-or-kill LIMIT sell at that NO price directly;
-      * V2:     a reduce-only YES BID (closing a NO position is buying back the
-                YES short) capped at 1 - floor, ceiling-quantized onto the
-                market's tick grid — see _v2_rollback_price.
-    Either way the unwind recovers at least that much per contract or does not
-    happen.
+      * V2:     a reduce-only immediate-or-cancel YES BID (closing a NO
+                position is buying back the YES short) capped at 1 - floor,
+                ceiling-quantized onto the market's tick grid — see
+                _v2_rollback_price. The endpoint accepts reduce_only only with
+                immediate_or_cancel, so this bid can close part of the
+                position and cancel the rest.
+    Either way every contract the unwind closes recovers at least that much.
 
     reduce_only guarantees either form can only close an existing position, so
     it is safe to submit even when the NO leg's fill state is ambiguous (it
-    cannot open new exposure). The rollback's own FoK status IS checked: an
+    cannot open new exposure). The rollback's own fill status IS checked: an
     unfilled rollback — including one killed by the price floor — means the
     NO-leg position is still open, which is reported as
     status="rollback_failed" for manual review, never silently as
-    "rolled_back". That is the same path an unfilled market unwind already
-    took, so the caller's contract is unchanged; only the loss is now bounded.
+    "rolled_back". A V2 unwind that closes only part of the position makes
+    _v2_fill_status raise (the fill count is neither the full count nor
+    zero); the except branch below catches it and reports rollback_failed as
+    well, sending no second order, so a partial close is never reported as
+    flat.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -1254,9 +1297,9 @@ def _rollback_no_leg(client: Any, spec: TradeSpec, no_leg: _Leg, reason: str) ->
             in the TradeResult error field.
 
     Returns:
-        TradeResult: status="rolled_back" when the unwind filled,
+        TradeResult: status="rolled_back" when the unwind filled in full,
             status="rollback_failed" when it did not fill (rejected, or killed
-            by the price floor) or raised.
+            by the price floor), filled only part of the position, or raised.
     """
     # Version-dispatched build: a reduce-only floored bid on V2, a reduce-only
     # floored limit sell on the legacy path — both close the NO-leg position
@@ -1268,8 +1311,9 @@ def _rollback_no_leg(client: Any, spec: TradeSpec, no_leg: _Leg, reason: str) ->
         rb_status = _submit_any(client, rollback)
     except Exception as rb_err:
         logging.critical(
-            "ROLLBACK FAILED for '%s' — ORPHANED POSITION: %d NO contracts on %s."
-            " Manual review required. Error: %s",
+            "ROLLBACK FAILED for '%s' — ORPHANED POSITION: up to %d NO contracts"
+            " on %s (a V2 unwind can close part of the position before it stops —"
+            " check the account). Manual review required. Error: %s",
             spec.pair.canonical_title, no_leg.count, no_leg.market.ticker, rb_err,
         )
         return TradeResult(
@@ -2099,11 +2143,13 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     (market_a for a same_title pair, market_b for a time_series pair) then the
     YES leg — and submits the NO leg first via fill_or_kill. If it fills,
     submits the YES leg via fill_or_kill. If the YES leg fails, immediately
-    submits a reduce-only, LOSS-FLOORED fill-or-kill order closing the NO-leg
-    contracts to unwind the position (see _rollback_no_leg) and verifies that
-    the rollback itself filled. Which endpoint each order goes to is decided by
-    config.ORDER_API_VERSION inside the _*_any dispatchers; every status and
-    safety rule below is identical on both paths and for both pair types.
+    submits a reduce-only, LOSS-FLOORED order closing the NO-leg contracts to
+    unwind the position — a fill-or-kill limit sell on the legacy path, an
+    immediate-or-cancel limit bid on V2 (see _rollback_no_leg) — and verifies
+    that the rollback itself filled in full. Which endpoint each order goes to
+    is decided by config.ORDER_API_VERSION inside the _*_any dispatchers; every
+    status and safety rule below is identical on both paths and for both pair
+    types.
 
     A rejected FoK (status != "executed") is a confirmed non-fill. An exception,
     however, is ambiguous — the order may have filled before a timeout — so
@@ -2168,7 +2214,9 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
 
     Returns:
         TradeResult: With status "executed", "failed", "rolled_back",
-            "rollback_failed" (unwind did not fill — orphaned position needing
+            "rollback_failed" (the unwind did not fill, or — on V2, whose
+            immediate-or-cancel unwind can stop part-way — closed only part of
+            the position; what is left open is an orphaned position needing
             manual review), or "manual_review" (a leg's fill state could not be
             attributed to this order, or the V2 NO-leg mapping was disproven —
             in every such case no automated action was taken).
