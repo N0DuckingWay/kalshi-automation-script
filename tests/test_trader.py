@@ -39,10 +39,13 @@ deadline once all of them are blocked, so their times are exact on any
 machine.
 """
 import ast
+import copy
+import dataclasses
 import inspect
 import json
 import logging
 import math
+import pickle
 import random
 import textwrap
 import threading
@@ -2083,17 +2086,22 @@ class TestV2ExecuteOne:
         # The immediate-or-cancel unwind closes 3 of the 5 NO contracts and
         # cancels the rest. That is never reported as flat: the fill count
         # makes _v2_fill_status raise, _rollback_no_leg reports
-        # rollback_failed, and no second order is sent.
+        # rollback_failed, and no second order is sent. Its alert and the
+        # error text name the exact count still open, 5 - 3 = 2, read from the
+        # unwind's own response, not the "up to 5" said when it is unknown.
         post.side_effect = [v2_resp(5), v2_resp(0), v2_resp(3)]
         with caplog.at_level(logging.CRITICAL):
             result = _execute_one(MagicMock(), make_spec())
         assert result.status == "rollback_failed"
         assert "fill_count=3" in result.error
+        assert result.error.endswith("; 2 of 5 NO contracts still open")
         assert post.call_count == 3
-        assert any(
-            r.levelno == logging.CRITICAL and "up to 5 NO contracts" in r.getMessage()
-            for r in caplog.records
-        )
+        orphan = [r.getMessage() for r in caplog.records
+                  if r.levelno == logging.CRITICAL and "ORPHANED POSITION" in r.getMessage()]
+        assert len(orphan) == 1
+        assert "closed 3 of the 5 NO contracts this pair bought on TICK-A," in orphan[0]
+        assert "so 2 of them are still open" in orphan[0]
+        assert "up to" not in orphan[0]
 
     def test_v2_leg_a_exception_with_position_is_unwound(self, post):
         post.side_effect = [TimeoutError("timeout"), v2_resp(5)]
@@ -2191,6 +2199,322 @@ class TestV2ExecuteOne:
         result = _execute_one(client, make_spec())
         assert result.status == "failed"
         assert post.call_count == 1
+
+
+class TestPartialUnwindCount:
+    """How many NO contracts a failed V2 unwind leaves open, as its alert says.
+
+    The V2 unwind is immediate_or_cancel, so its 2xx response can report a
+    fill count strictly between zero and the NO leg's count: it closed that
+    many and left nothing resting. _rollback_no_leg reads that count from the
+    body _submit_order_v2 attaches to its error and names the exact number
+    still open (count minus fill). Every other failure leaves the number
+    unknown and the alert says "up to" the count. Either way the pair is
+    rollback_failed and no further order is sent. The two buy legs keep
+    raising on a partial fill into _execute_one's position check.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _use_v2(self, v2_mode, v2_mapping_confirmed):
+        """V2 path, NO-leg mapping already latched (see TestV2ExecuteOne)."""
+
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
+
+    @pytest.fixture
+    def slept(self, monkeypatch):
+        """Every pause _execute_one takes, recorded instead of slept."""
+        pauses: list = []
+        monkeypatch.setattr(trader.time, "sleep", pauses.append)
+        return pauses
+
+    @staticmethod
+    def _orphan_alerts(caplog) -> list[str]:
+        """The CRITICAL lines that report an orphaned NO position."""
+        return [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.CRITICAL and "ORPHANED POSITION" in r.getMessage()
+        ]
+
+    def _unwind(self, post, caplog, rollback_reply, spec=None):
+        """Run one pair whose NO leg fills, whose YES leg is killed, and whose
+        unwind answers with `rollback_reply` (a body, or an exception to
+        raise). Returns the result and the client, whose position reads are
+        scripted for the two up-front baselines only."""
+        post.side_effect = [v2_resp(5), v2_resp(0), rollback_reply]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(None, None)
+        with caplog.at_level(logging.CRITICAL):
+            result = _execute_one(client, spec or make_spec())
+        return result, client
+
+    @pytest.mark.parametrize(
+        "body, closed, still_open",
+        [
+            pytest.param({"order": {"fill_count": 1}}, "1", "4", id="int-1"),
+            pytest.param({"order": {"fill_count": 4}}, "4", "1", id="int-4"),
+            pytest.param({"order": {"fill_count_fp": "3.00"}}, "3", "2", id="fp-string"),
+            # A flat body, not wrapped under "order"
+            pytest.param({"fill_count_fp": "3.00"}, "3", "2", id="flat"),
+            # Fractional contracts are counted exactly
+            pytest.param({"order": {"fill_count_fp": "2.50"}}, "2.5", "2.5", id="fractional"),
+            pytest.param({"order": {"fill_count_fp": "0.01"}}, "0.01", "4.99", id="one-hundredth"),
+            # The _fp field wins when both are present, as in _v2_fill_status
+            pytest.param(
+                {"order": {"fill_count_fp": "1.00", "fill_count": 4}}, "1", "4",
+                id="fp-over-int",
+            ),
+        ],
+    )
+    def test_a_partial_close_names_the_exact_count_still_open(
+        self, post, caplog, slept, body, closed, still_open,
+    ):
+        result, client = self._unwind(post, caplog, body)
+        assert result.status == "rollback_failed"
+        assert result.error.startswith(
+            "YES leg FoK not filled: status=canceled; rollback error: "
+            "Unclassifiable V2 order response: fill_count="
+        )
+        assert result.error.endswith(f"; {still_open} of 5 NO contracts still open")
+        (alert,) = self._orphan_alerts(caplog)
+        assert (
+            f"closed {closed} of the 5 NO contracts this pair bought on TICK-A,"
+            f" so {still_open} of them are still open"
+        ) in alert
+        assert "check the account" in alert
+        assert "up to" not in alert
+        # No further order, no position read after the unwind, and no pause
+        assert post.call_count == 3
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert slept == []
+
+    def test_a_time_series_partial_close_names_market_b(self, post, caplog, slept):
+        # For a time-series pair the NO leg is market_b, so the unwind — and
+        # its alert — are on TICK-B.
+        result, client = self._unwind(
+            post, caplog, v2_resp(2), spec=make_spec(pair_type="time_series"),
+        )
+        assert result.status == "rollback_failed"
+        assert post.call_args_list[2].kwargs["body"]["ticker"] == "TICK-B"
+        (alert,) = self._orphan_alerts(caplog)
+        assert "closed 2 of the 5 NO contracts this pair bought on TICK-B" in alert
+        assert "so 3 of them are still open" in alert
+        assert result.error.endswith("; 3 of 5 NO contracts still open")
+        assert post.call_count == 3
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert slept == []
+
+    def test_a_partial_close_after_an_ambiguous_no_leg_is_counted_too(
+        self, post, caplog, slept,
+    ):
+        # The other way into the unwind: the NO leg's submission raised, and
+        # the ledger moved by exactly -5, our NO buy. The partial unwind is
+        # counted the same way, with no further order or read after it.
+        post.side_effect = [TimeoutError("read timed out"), v2_resp(2)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(
+            None, None, ("TICK-A", -5),
+        )
+        with caplog.at_level(logging.CRITICAL):
+            result = _execute_one(client, make_spec())
+        assert result.status == "rollback_failed"
+        assert result.error.startswith("NO leg ambiguous error: read timed out;")
+        assert result.error.endswith("; 3 of 5 NO contracts still open")
+        (alert,) = self._orphan_alerts(caplog)
+        assert "closed 2 of the 5 NO contracts this pair bought on TICK-A" in alert
+        assert post.call_count == 2
+        assert client.get_positions_without_preload_content.call_count == 3
+        assert slept == []
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            # 2xx objects whose fill count is unreadable or impossible: they
+            # reach the count reader, which finds nothing it can use
+            pytest.param({"order": {"order_id": "ord-1"}}, id="no-count"),
+            pytest.param({"order": {"fill_count": 7}}, id="over-count"),
+            pytest.param({"order": {"fill_count": -1}}, id="negative"),
+            pytest.param({"order": {"fill_count": "three"}}, id="not-a-number"),
+            pytest.param({"order": {"fill_count": True}}, id="bool"),
+            pytest.param({"order": {"fill_count_fp": "NaN"}}, id="nan"),
+            pytest.param({"order": {"fill_count_fp": "Infinity"}}, id="infinity"),
+            pytest.param({"order": [{"fill_count": 3}]}, id="order-not-an-object"),
+            # Counts the default 28-digit decimal precision would round: never
+            # printed as an exact count that is wrong or a line that is huge
+            pytest.param(
+                {"order": {"fill_count_fp": "4.9999999999999999999999999999999"}},
+                id="too-many-digits",
+            ),
+            pytest.param({"order": {"fill_count_fp": "1E-40"}}, id="tiny"),
+            pytest.param({"order": {"fill_count_fp": "1E-999999999"}}, id="underflow"),
+            # Replies that fail before the count reader: the classifier raises
+            # something other than its ValueError (a signalling NaN), the body
+            # is not a JSON object or not JSON at all, the exchange answered
+            # with an error (the 409 kill is read as a clean non-fill only on
+            # a fill_or_kill body, and the unwind is not one), or the
+            # connection failed
+            pytest.param({"order": {"fill_count_fp": "sNaN"}}, id="signalling-nan"),
+            pytest.param([{"fill_count": 3}], id="list-body"),
+            pytest.param("accepted", id="string-body"),
+            pytest.param(3, id="number-body"),
+            pytest.param(None, id="null-body"),
+            pytest.param(JSONDecodeError("Expecting value", "", 0), id="not-json"),
+            pytest.param(ApiException(status=400, reason="Bad Request"), id="http-400"),
+            pytest.param(ApiException(status=500, reason="Server Error"), id="http-500"),
+            pytest.param(fok_kill_error(), id="http-409-kill"),
+            pytest.param(TimeoutError("read timed out"), id="timeout"),
+            pytest.param(ConnectionError("connection reset"), id="connection-error"),
+        ],
+    )
+    def test_an_unknown_count_still_says_up_to(self, post, caplog, slept, reply):
+        result, client = self._unwind(post, caplog, reply)
+        assert result.status == "rollback_failed"
+        assert result.error.startswith(
+            "YES leg FoK not filled: status=canceled; rollback error: "
+        )
+        assert "still open" not in result.error
+        (alert,) = self._orphan_alerts(caplog)
+        assert "up to 5 NO contracts on TICK-A" in alert
+        assert "still open" not in alert
+        assert len(alert) < 1000
+        assert post.call_count == 3
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert slept == []
+
+    def test_a_carried_body_that_is_not_an_object_still_says_up_to(
+        self, monkeypatch, caplog,
+    ):
+        # The reader checks the carried body's type rather than assuming it:
+        # an error carrying something other than a dict leaves the count
+        # unknown.
+        submitted: list = []
+
+        def submit(client, order, *, pace=None):
+            submitted.append(order)
+            raise trader._UnclassifiableV2Response("unclassifiable", [{"fill_count": 3}])
+
+        monkeypatch.setattr(trader, "_submit_any", submit)
+        with caplog.at_level(logging.CRITICAL):
+            result = trader._rollback_no_leg(
+                MagicMock(), make_spec(), _no_leg(make_spec()), "YES leg failed",
+            )
+        assert result.status == "rollback_failed"
+        (alert,) = self._orphan_alerts(caplog)
+        assert "up to 5 NO contracts on TICK-A" in alert
+        assert len(submitted) == 1
+
+    def test_a_count_that_cannot_be_compared_still_says_up_to(
+        self, monkeypatch, caplog,
+    ):
+        # Reading the count never costs the orphan alert: a NO-leg count that
+        # a Decimal refuses to compare with (numpy's int64 here) falls back to
+        # "up to" instead of raising out of _rollback_no_leg.
+        np = pytest.importorskip("numpy")
+        submitted: list = []
+
+        def submit(client, order, *, pace=None):
+            submitted.append(order)
+            raise trader._UnclassifiableV2Response("unclassifiable", v2_resp(3))
+
+        monkeypatch.setattr(trader, "_submit_any", submit)
+        spec = make_spec()
+        leg = dataclasses.replace(_no_leg(spec), count=np.int64(5))
+        with caplog.at_level(logging.CRITICAL):
+            result = trader._rollback_no_leg(MagicMock(), spec, leg, "YES leg failed")
+        assert result.status == "rollback_failed"
+        (alert,) = self._orphan_alerts(caplog)
+        assert "up to 5 NO contracts on TICK-A" in alert
+        assert len(submitted) == 1
+
+    def test_a_zero_fill_names_the_full_count(self, post, caplog):
+        # A 2xx fill count of zero is a clean "canceled", not an unknown: the
+        # unwind closed nothing, so all 5 are open, and the alert says so.
+        result, _ = self._unwind(post, caplog, {"order": {"fill_count_fp": "0.00"}})
+        assert result.status == "rollback_failed"
+        assert result.error == (
+            "YES leg FoK not filled: status=canceled; rollback FoK not filled:"
+            " status=canceled"
+        )
+        (alert,) = self._orphan_alerts(caplog)
+        assert "ROLLBACK NOT FILLED (status=canceled)" in alert
+        assert "5 NO contracts on TICK-A" in alert
+        assert "up to" not in alert
+
+    def test_a_full_fill_is_rolled_back(self, post, caplog):
+        result, _ = self._unwind(post, caplog, {"order": {"fill_count_fp": "5.00"}})
+        assert result.status == "rolled_back"
+        assert self._orphan_alerts(caplog) == []
+
+    def test_a_partial_fill_error_carries_the_response(self, post):
+        # _submit_order_v2 re-raises _v2_fill_status's error with the body
+        # attached. It is still a ValueError with the same message, so a buy
+        # leg's caller sees the error it always did.
+        body = v2_resp(3)
+        post.return_value = body
+        with pytest.raises(ValueError) as exc_info:
+            _submit_order_v2(MagicMock(), _build_rollback_order_v2(_no_leg(make_spec())))
+        err = exc_info.value
+        assert isinstance(err, trader._UnclassifiableV2Response)
+        assert err.response is body
+        assert str(err) == "Unclassifiable V2 order response: fill_count=3, requested=5"
+        assert type(err.__cause__) is ValueError
+
+    def test_the_carrying_error_survives_copy_and_pickle(self):
+        err = trader._UnclassifiableV2Response("unclassifiable", {"order": {"fill_count": 3}})
+        for clone in (copy.copy(err), copy.deepcopy(err), pickle.loads(pickle.dumps(err))):
+            assert type(clone) is trader._UnclassifiableV2Response
+            assert str(clone) == "unclassifiable"
+            assert clone.response == {"order": {"fill_count": 3}}
+
+    def test_a_partial_no_leg_fill_is_still_judged_by_the_position(self, post):
+        # A partial fill on the NO leg (a fill-or-kill buy) is not a partial
+        # unwind: it raises into the position check, which cannot attribute
+        # a -3 move to a 5-contract order, so nothing further is sent.
+        post.side_effect = [v2_resp(3)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(
+            None, None, ("TICK-A", -3),
+        )
+        result = _execute_one(client, make_spec())
+        assert result.status == "manual_review"
+        assert "fill_count=3" in result.error
+        assert post.call_count == 1
+
+    def test_a_partial_yes_leg_fill_is_never_rolled_back(self, post):
+        # A partial fill on the YES leg must not read as a non-fill: the
+        # position moved +3, which this 5-contract order cannot explain, so
+        # the NO leg is left in place for a human rather than unwound.
+        post.side_effect = [v2_resp(5), v2_resp(3)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(
+            None, None, ("TICK-B", 3),
+        )
+        result = _execute_one(client, make_spec())
+        assert result.status == "manual_review"
+        assert "fill_count=3" in result.error
+        assert post.call_count == 2
+
+    def test_a_legacy_unwind_error_still_says_up_to(self, legacy_mode, caplog):
+        # The legacy unwind is fill-or-kill and has no fill count to read, so
+        # a raised submission keeps the "up to" wording.
+        client = MagicMock()
+        client.create_order_without_preload_content = MagicMock(side_effect=[
+            order_resp("executed"),
+            order_resp("canceled"),
+            RuntimeError("connection reset"),
+        ])
+        client.get_positions_without_preload_content = positions_seq(None, None)
+        with caplog.at_level(logging.CRITICAL):
+            result = _execute_one(client, make_spec())
+        assert result.status == "rollback_failed"
+        assert "still open" not in result.error
+        (alert,) = self._orphan_alerts(caplog)
+        assert "up to 5 NO contracts on TICK-A" in alert
+        assert client.create_order_without_preload_content.call_count == 3
 
 
 class TestV2NoMappingBackstop:
