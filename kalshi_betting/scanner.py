@@ -47,7 +47,8 @@ Dependencies:
     downstream of pair formation. ladder_keys(), market_ladder_keys() and
     pair_ladder_keys() name the ladders a market is on (its event, and its
     question with the dates removed), and resolve_held_ladders() finds the
-    ladders of the markets the account holds. historical.py imports
+    ladders of the markets the account holds; find_time_series_pairs refuses
+    any candidate with a market on one of them. historical.py imports
     event_series too, so the backtest's event-title lookup budget tells a
     combo ticker from any other exactly as the one-series rule does (DR-51).
     Depends on the KalshiClient produced by auth.py.
@@ -3357,6 +3358,7 @@ def find_time_series_pairs(
     inactive_shards: set | None = None,
     *,
     settings: LiveSettings | None = None,
+    held_ladders: frozenset = frozenset(),
 ) -> list:
     """
     Find time-series candidate pairs (YES on the earlier contract, NO on the later).
@@ -3373,6 +3375,11 @@ def find_time_series_pairs(
     otherwise have paired the widest mismatch (DR-01).
 
     A pair is eligible when:
+      0. Neither market is on a ladder we already hold (held_ladders). A
+         ladder is one question asked at several deadlines. Two markets are
+         on one ladder when they share an event, or ask the same question
+         once the dates are removed. This is checked first, so a group whose
+         best candidate is refused here can still offer its next best.
       1. Both markets are actively priced: ask price in [1%, 99%]
       2. Different event_tickers (which rules out an MVE event's multi-choice
          option labels) — UNLESS config.TIME_SERIES_SAME_EVENT_LADDERS is on
@@ -3438,8 +3445,8 @@ def find_time_series_pairs(
     preferred, then largest pB - pA). NOTE: since DR-01 that key carries the
     outcome label, so the rule no longer bounds one FAMILY to one pair — a
     daily family of N strikes now yields up to N pairs, every one on the same
-    underlying over the same window, and nothing downstream caps that
-    concentration (strategy.select_portfolio dedups tickers only).
+    underlying over the same window. Two such pairs that share an event are
+    on one ladder, so the bot does not open one while it holds the other.
 
     The legs are YES on A at pA and NO on B at nB, so tradeable=True when
     pA + nB < 1 - fee_per_pair_approx(pA, nB) AND pB > pA. A cumulative-deadline
@@ -3475,6 +3482,8 @@ def find_time_series_pairs(
             excludes no shard.
         settings (LiveSettings | None): Keyword-only. The run's toggles (items 6
             and 8). None resolves config.live_settings() once.
+        held_ladders (frozenset): Keyword-only. Ladder labels of the markets we
+            hold, from resolve_held_ladders (item 0). Empty refuses nothing.
 
     Returns:
         list: CandidatePair objects, one per normalized title+outcome group
@@ -3576,6 +3585,9 @@ def find_time_series_pairs(
                 stated_deadline(profile, "", "", ""),
             )
 
+    # Candidates with a market on a ladder we already hold. They are refused
+    # before every other check, so none of them reaches the counters below.
+    held_ladder_skips = 0
     # Candidates refused because the two legs are not one question at two
     # cumulative deadlines, split by REASON (DR-72) rather than folded into
     # one counter: a snapshot leg, a leg naming no comparable deadline, and
@@ -3642,6 +3654,14 @@ def find_time_series_pairs(
         # instant or in the opposite order to their deadlines.
         members_sorted = sorted(members, key=lambda m: m.close_time)
         group_pairs: list = []
+        # Tickers of this group's markets that sit on a ladder we already hold.
+        # The group key is each member's question, so a held question blocks
+        # the whole group, while a held event blocks only that event's members.
+        on_held_ladder = (
+            {m.ticker for m in members_sorted
+             if ladder_keys(m.event_ticker, norm_title) & held_ladders}
+            if held_ladders else set()
+        )
 
         for i, m_outer in enumerate(members_sorted):
             for m_inner in members_sorted[i + 1:]:
@@ -3655,6 +3675,12 @@ def find_time_series_pairs(
                 # A same-event ladder's gap is its STATED deadline gap; None
                 # means "this pair is tiered on close_time" (pair_gap_days).
                 stated_gap = None
+
+                # No new pair on a ladder we already hold. Refused here, before
+                # the group's best pair is chosen, so the next best can win.
+                if mA.ticker in on_held_ladder or mB.ticker in on_held_ladder:
+                    held_ladder_skips += 1
+                    continue
 
                 if mA.event_ticker == mB.event_ticker:
                     # DR-73: two markets of ONE event. Every previous version
@@ -3935,6 +3961,13 @@ def find_time_series_pairs(
         group_pairs.sort(key=lambda p: (p.tradeable, p.pB - p.pA), reverse=True)
         candidate_pairs.append(group_pairs[0])
 
+    # Logged only when something was refused, so a run that holds nothing adds no line
+    if held_ladder_skips:
+        logging.info(
+            "Time-series candidates refused because one of their markets is on a "
+            "ladder we already hold (counted before every other check): %d",
+            held_ladder_skips,
+        )
     # The one-series conjunct's count (M10), silent at zero: the same line
     # backtester._extract_pairs logs for its sweep, whose parenthesis says
     # "within the deadline-gap window" instead, as its DR-72 lines do. The

@@ -5324,6 +5324,133 @@ class TestTimeSeriesBestPairPerGroup:
         assert pair.tradeable is True
 
 
+def _btc_market(ticker, event_ticker, day, *, strike="$80k", yes_ask, no_ask):
+    """One Bitcoin question at a March deadline, one event per deadline."""
+    return _ingest_market(ticker, event_ticker,
+                          f"Will BTC exceed {strike} by March {day}, 2026?", "Bitcoin record",
+                          close=f"2026-03-{day:02d}T00:00:00Z", yes_ask=yes_ask, no_ask=no_ask)
+
+
+_HELD_LINE = ("Time-series candidates refused because one of their markets is on a "
+              "ladder we already hold (counted before every other check): ")
+
+
+class TestFinderRefusesHeldLadders:
+    """No new time-series pair may use a market on a ladder we already hold. A
+    ladder is one question asked at several deadlines. Two markets are on one
+    ladder when they share an event, or ask the same question once the dates
+    are removed. Each test scans with the held market left out of the list,
+    as a live run does."""
+
+    @staticmethod
+    def _scan(markets, **kwargs):
+        # The tier rule alone, so no test depends on the toggles config.py ships
+        return find_time_series_pairs(MagicMock(), held_tickers=set(), markets=markets,
+                                      settings=_live(), **kwargs)
+
+    def _btc_family(self):
+        """Three deadlines of one question, each in its own event."""
+        early = _btc_market("BTC-MAR01", "KXBTCMAX-26MAR01", 1, yes_ask="0.20", no_ask="0.80")
+        mid = _btc_market("BTC-MAR06", "KXBTCMAX-26MAR06", 6, yes_ask="0.35", no_ask="0.65")
+        late = _btc_market("BTC-MAR11", "KXBTCMAX-26MAR11", 11, yes_ask="0.70", no_ask="0.30")
+        return early, mid, late
+
+    def test_a_held_rung_refuses_every_pair_of_its_ladder(self, monkeypatch, caplog):
+        monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+        held = _ladder_rung("RUNG-HELD", "by March 10, 2026", yes_ask=0.40, no_ask=0.60,
+                            close=datetime(2026, 3, 10, tzinfo=UTC))
+        rungs = [
+            _ladder_rung("RUNG-EARLY", "by March 1, 2026", yes_ask=0.20, no_ask=0.80,
+                         close=datetime(2026, 3, 1, tzinfo=UTC)),
+            _ladder_rung("RUNG-MID", "by March 15, 2026", yes_ask=0.45, no_ask=0.55,
+                         close=datetime(2026, 3, 15, tzinfo=UTC)),
+            _ladder_rung("RUNG-LATE", "by March 20, 2026", yes_ask=0.60, no_ask=0.40,
+                         close=datetime(2026, 3, 20, tzinfo=UTC)),
+        ]
+        _assert_one_ladder_group(held, rungs[0])
+        # control: the rungs we do not hold pair on their own
+        assert len(self._scan(rungs)) == 1
+        with caplog.at_level(logging.INFO):
+            assert self._scan(rungs, held_ladders=market_ladder_keys(held)) == []
+        # All three candidates of the ladder are refused and counted
+        assert _HELD_LINE + "3" in caplog.text
+
+    def test_a_held_question_refuses_a_family_listed_as_one_event_per_deadline(self, caplog):
+        early, mid, late = self._btc_family()
+        # The same question at a later deadline, in an event not in this run's list
+        held = _btc_market("BTC-MAR21", "KXBTCMAX-26MAR21", 21, yes_ask="0.80", no_ask="0.20")
+        assert market_ladder_keys(held) & market_ladder_keys(early) == frozenset({
+            ("question", _question_of(early)),
+        })
+        with caplog.at_level(logging.INFO):
+            assert self._scan([early, mid, late], held_ladders=market_ladder_keys(held)) == []
+        assert _HELD_LINE + "3" in caplog.text
+
+    def test_a_held_event_blocks_its_own_markets_and_promotes_the_runner_up(self, caplog):
+        early, mid, late = self._btc_family()
+        # control: the widest pair uses the Mar 1 market
+        [best] = self._scan([early, mid, late])
+        assert (best.market_a.ticker, best.market_b.ticker) == ("BTC-MAR01", "BTC-MAR11")
+        # We hold a different question in the Mar 1 event
+        held = _btc_market("BTC-90K-MAR01", "KXBTCMAX-26MAR01", 1, strike="$90k",
+                           yes_ask="0.10", no_ask="0.90")
+        assert _question_of(held) != _question_of(early)
+        with caplog.at_level(logging.INFO):
+            [pair] = self._scan([early, mid, late], held_ladders=market_ladder_keys(held))
+        # The two candidates on the Mar 1 market are refused, and the next best wins
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("BTC-MAR06", "BTC-MAR11")
+        assert _HELD_LINE + "2" in caplog.text
+
+    def test_a_held_event_of_the_later_market_blocks_it_too(self, caplog):
+        early, mid, late = self._btc_family()
+        # We hold a different question in the Mar 11 event, the later market's
+        held = _btc_market("BTC-90K-MAR11", "KXBTCMAX-26MAR11", 11, strike="$90k",
+                           yes_ask="0.10", no_ask="0.90")
+        assert _question_of(held) != _question_of(late)
+        with caplog.at_level(logging.INFO):
+            [pair] = self._scan([early, mid, late], held_ladders=market_ladder_keys(held))
+        # Both candidates using the Mar 11 market are refused; the Mar 1 / Mar 6 pair wins
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("BTC-MAR01", "BTC-MAR06")
+        assert _HELD_LINE + "2" in caplog.text
+
+    def test_an_empty_held_set_changes_nothing(self, caplog):
+        markets = list(self._btc_family())
+        with caplog.at_level(logging.INFO):
+            plain = self._scan(markets)
+            plain_log = caplog.text
+            caplog.clear()
+            explicit = self._scan(markets, held_ladders=frozenset())
+        assert explicit == plain and plain
+        assert caplog.text == plain_log
+        # Silent at zero
+        assert "on a ladder we already hold" not in plain_log
+
+    def test_an_unrelated_held_ladder_refuses_nothing_and_logs_nothing(self, caplog):
+        markets = list(self._btc_family())
+        unrelated = _ingest_market("RAIN-1", "KXRAIN-1", "Will it rain in NYC by March 1, 2026?",
+                                   "NYC weather")
+        with caplog.at_level(logging.INFO):
+            pairs = self._scan(markets, held_ladders=market_ladder_keys(unrelated))
+        assert pairs == self._scan(markets)
+        assert "on a ladder we already hold" not in caplog.text
+
+    def test_the_check_runs_before_every_other_check(self, monkeypatch, caplog):
+        # With the same-event switch off these rungs would be counted as held
+        # back by the switch; on a held ladder they are counted here instead
+        monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", False)
+        early = _ladder_rung("RUNG-EARLY", "by March 1, 2026", yes_ask=0.20, no_ask=0.80,
+                             close=datetime(2026, 3, 1, tzinfo=UTC))
+        late = _ladder_rung("RUNG-LATE", "by March 20, 2026", yes_ask=0.60, no_ask=0.40,
+                            close=datetime(2026, 3, 20, tzinfo=UTC))
+        # A third rung of the same ladder, the one we hold
+        held = _ladder_rung("RUNG-HELD", "by March 10, 2026", yes_ask=0.40, no_ask=0.60,
+                            close=datetime(2026, 3, 10, tzinfo=UTC))
+        with caplog.at_level(logging.INFO):
+            assert self._scan([early, late], held_ladders=market_ladder_keys(held)) == []
+        assert _HELD_LINE + "1" in caplog.text
+        assert "same-event deadline ladders are disabled" not in caplog.text
+
+
 class TestLegHelpers:
     """leg_sides / leg_prices / deadline_gap_days are the cross-module contract
     for which side each leg buys and what it costs."""

@@ -36,6 +36,7 @@ Dependencies:
     historical.py (load_series_categories, series_labels, infer_category —
     the dashboard's filing rule, which _filter_by_category shares),
     reporter.py (Excel output), scanner.py (market fetching, pair detection,
+    resolve_held_ladders (the ladders the held positions are on),
     leg_sides — the only source of truth for which side each leg buys — and
     close_gap_bound_text, which renders that close-gap bound in the same
     words the finders' refusal lines use), strategy.py (trade sizing and
@@ -108,6 +109,7 @@ from .scanner import (
     get_held_tickers,
     inactive_shard_indexes,
     leg_sides,
+    resolve_held_ladders,
 )
 from .strategy import compute_trade, select_portfolio
 from .trader import (
@@ -218,7 +220,8 @@ def _print_portfolio(portfolio: list, label: str) -> None:
         )
 
 
-def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None) -> str:
+def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None, *,
+                  time_series_searched: bool = True) -> str:
     """
     Build the "no qualifying pairs found" log message with the run's live rule.
 
@@ -232,11 +235,16 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None) -
     scanner.close_gap_bound_text. A set category/tag filter is named too,
     since it can empty the list on its own.
 
+    When the run did not look for time-series pairs at all, the message says
+    so instead of naming a rule that was never applied.
+
     Args:
         sandbox (bool): True to phrase the message for a dev/sandbox run
             ("... found in sandbox ..."), False for a production run.
             Defaults to False.
         settings (LiveSettings | None): The run's toggles; None reads config.py's.
+        time_series_searched (bool): Keyword-only. False when the run skipped
+            time-series pairs because a held market could not be identified.
 
     Returns:
         str: The fully formatted log message, ready to pass to logging.info().
@@ -246,12 +254,19 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None) -
     """
     # The run's toggles, or config.py's for a caller that hands none
     settings = live_settings() if settings is None else settings
+    if time_series_searched:
+        time_series = (
+            "time-series: both legs worded as cumulative deadlines "
+            "(“by <date>”, two different ones) with the later leg's YES ask above "
+            "the earlier's by the run's entry rule — "
+            # In the finder's own rule-line words, so the two cannot disagree
+            f"{describe_time_series_rule(settings.tier_floors, settings.spread_band)}"
+        )
+    else:
+        time_series = ("time-series: not searched this run, because a held market "
+                       "could not be identified (see the ERROR above)")
     thresholds = (
-        "time-series: both legs worded as cumulative deadlines "
-        "(“by <date>”, two different ones) with the later leg's YES ask above "
-        "the earlier's by the run's entry rule — "
-        # In the finder's own rule-line words, so the two cannot disagree
-        f"{describe_time_series_rule(settings.tier_floors, settings.spread_band)}"
+        f"{time_series}"
         " — or same-title: "
         f"≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff on two different series "
         # This module's own binding, like the same-title threshold above; the scanner
@@ -889,6 +904,11 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     normally except order submission — the log still records rows with
     status="simulated".
 
+    It also finds the ladders the held positions are on (a ladder is one
+    question asked at several deadlines), and makes no new time-series trade
+    on any of them. If a held market cannot be identified, the run makes no
+    time-series trade at all; same-title trades still go ahead.
+
     Args:
         client: KalshiClient pointed at the production endpoint, produced by
             auth.build_client("prod").
@@ -913,7 +933,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             results has status "rollback_failed" or "manual_review" — either
             means a human must check the account/trade log. EXIT_OK for every
             other path, including dry-run, no candidate pairs, no executable
-            trades, and all-pairs-failed-pre-execution-check.
+            trades, and all-pairs-failed-pre-execution-check. That includes a
+            run that skipped time-series pairs because a held market could not
+            be identified: it still searched for same-title pairs, so it says
+            so in its log (an ERROR line), not in its exit code.
 
     Raises:
         ValueError: When settings is None and a config.py toggle is invalid.
@@ -980,14 +1003,24 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.warning("%s", blind_reason)
         return EXIT_NO_TRADEABLE_SHARDS
 
+    # The ladders our open positions are on, read from the full market list
+    # before held markets are removed from it. None means a held market could
+    # not be identified, so this run makes no time-series trade.
+    held_ladders      = resolve_held_ladders(client, markets, held_tickers)
     markets           = [m for m in markets if m.ticker not in held_tickers]
 
     # Optional opt-in cap so both bet types only see markets closing within
     # the requested window — a no-op (returns markets unchanged) when unset
     markets           = filter_markets_within_horizon(markets, args.max_horizon_days)
 
-    # Run both pair detection paths: time-series (the run's entry rule) and same-title
-    time_series_pairs = find_time_series_pairs(client, held_tickers, markets, settings=settings)
+    # Run both pair detection paths: time-series (the run's entry rule, and no
+    # pair on a ladder we hold) and same-title
+    if held_ladders is None:
+        time_series_pairs = []
+    else:
+        time_series_pairs = find_time_series_pairs(
+            client, held_tickers, markets, settings=settings, held_ladders=held_ladders,
+        )
     same_title_pairs  = find_same_title_pairs(markets, held_tickers)
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
@@ -1000,14 +1033,18 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     )
 
     if not candidate_pairs:
-        # Names the entry rule this run applied, flags included
-        logging.info(_no_pairs_msg(settings=settings))
+        # Names the entry rule this run applied, flags included, or says the
+        # time-series side was not searched at all
+        logging.info(_no_pairs_msg(settings=settings,
+                                   time_series_searched=held_ladders is not None))
         return EXIT_OK
 
     # Apply Kelly sizing to each candidate pair using the real account balance
     trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents, settings)
-    # Greedy portfolio selection ranked by monthly_profit_ratio descending
-    portfolio     = select_portfolio(list(trade_specs.values()), balance_cents)
+    # Greedy portfolio selection ranked by monthly_profit_ratio descending, at
+    # most one time-series trade per ladder (the ladders we hold count too)
+    portfolio     = select_portfolio(list(trade_specs.values()), balance_cents,
+                                     held_ladders=held_ladders or frozenset())
     # Map pair id → TradeSpec for fast lookup in the pairs table display.
     # Keyed off the CANDIDATE each spec was built from, not off spec.pair:
     # compute_trade returns a re-priced copy of the pair (the marginal fill
