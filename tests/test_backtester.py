@@ -5122,10 +5122,10 @@ class TestEquityCurveFutureStartDate:
     the public API.
 
     TestRunBacktestFeasibilityPreCheck cannot catch this: it freezes
-    `backtester.date.today()`, which drives the Monday pre-check but NOT
-    _build_equity_curve's own `datetime.now(UTC).date()`, so its windows are
-    always non-empty. These tests use a genuinely future start_date instead of
-    freezing anything, so both clocks agree it is ahead of today.
+    `backtester.datetime.now`, which the pre-check and _build_equity_curve
+    both read, but every start_date it uses is on or before its frozen today,
+    so the curve always has days to cover. These tests leave the clock alone
+    and use a start_date 30 days ahead of the real UTC date.
     """
 
     # Comfortably ahead of both `date.today()` (local tz) and UTC today, so
