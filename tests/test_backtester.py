@@ -6189,12 +6189,22 @@ class TestRunBacktestTimeSeriesFlow:
         # which run_backtest turns back into the empty-result shape.
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: pytest.fail("fetch must be skipped"))
-        today = date.today()
+        # Freeze the UTC clock the check reads. A local date.today() lags UTC
+        # west of it, so on a Sunday evening in PDT "tomorrow" was already
+        # Monday in UTC, and that Monday's checkpoint made the window feasible.
+        moment = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)   # Friday; next day Saturday
+
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return moment if tz is None else moment.astimezone(tz)
+
+        monkeypatch.setattr(backtester, "datetime", _Frozen)
         # The sentinel lives on ELEMENT 0 of the returned pair: a caller that
         # forgot to unpack would hold a 2-tuple, which is never None, so its
         # guard would silently go false. Assert the shape explicitly.
         raw_entries, coverage = backtester._prepare_entries(
-            MagicMock(), MagicMock(), today + timedelta(days=1), True, None
+            MagicMock(), MagicMock(), moment.date() + timedelta(days=1), True, None
         )
         assert raw_entries is None
         # No census either: the fetch never ran, so there was no corpus.
