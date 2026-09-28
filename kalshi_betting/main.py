@@ -81,6 +81,7 @@ from .config import (
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
     EXIT_SKIPPED_LOW_BALANCE,
+    EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
     MIN_BALANCE_CENTS,
     PROJECT_ROOT,
@@ -931,12 +932,12 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             the weekly slot as satisfied by a run that never looked at a book.
             EXIT_TRADES_NEED_ATTENTION if any TradeResult in this run's
             results has status "rollback_failed" or "manual_review" — either
-            means a human must check the account/trade log. EXIT_OK for every
-            other path, including dry-run, no candidate pairs, no executable
-            trades, and all-pairs-failed-pre-execution-check. That includes a
-            run that skipped time-series pairs because a held market could not
-            be identified: it still searched for same-title pairs, so it says
-            so in its log (an ERROR line), not in its exit code.
+            means a human must check the account/trade log; it wins over the
+            code below. EXIT_TIME_SERIES_SKIPPED if a held market could not be
+            identified, so the run made no time-series trade (it still
+            searched for and traded same-title pairs). EXIT_OK for every other
+            path, including dry-run, no candidate pairs, no executable trades,
+            and all-pairs-failed-pre-execution-check.
 
     Raises:
         ValueError: When settings is None and a config.py toggle is invalid.
@@ -1007,6 +1008,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # before held markets are removed from it. None means a held market could
     # not be identified, so this run makes no time-series trade.
     held_ladders      = resolve_held_ladders(client, markets, held_tickers)
+    # What a run that needs no human returns from here on: EXIT_OK, or
+    # EXIT_TIME_SERIES_SKIPPED when this run makes no time-series trade, so
+    # the scheduler's log says so too
+    clean_exit        = EXIT_OK if held_ladders is not None else EXIT_TIME_SERIES_SKIPPED
     markets           = [m for m in markets if m.ticker not in held_tickers]
 
     # Optional opt-in cap so both bet types only see markets closing within
@@ -1037,7 +1042,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         # time-series side was not searched at all
         logging.info(_no_pairs_msg(settings=settings,
                                    time_series_searched=held_ladders is not None))
-        return EXIT_OK
+        return clean_exit
 
     # Apply Kelly sizing to each candidate pair using the real account balance
     trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents, settings)
@@ -1058,7 +1063,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
 
     if not portfolio:
         logging.info("No executable trades found.")
-        return EXIT_OK
+        return clean_exit
 
     _print_portfolio(portfolio, "Selected")
 
@@ -1066,7 +1071,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     portfolio = pre_execution_check(client, portfolio, settings=settings)
     if not portfolio:
         logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
-        return EXIT_OK
+        return clean_exit
 
     # On the legacy order path, drop statically-unroutable specs BEFORE any
     # collateral is planned — otherwise real, non-idempotent transfers would
@@ -1075,11 +1080,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     portfolio = drop_legacy_unroutable(portfolio)
     if not portfolio:
         logging.info("No selected pair is routable by the configured order path.")
-        # EXIT_OK, never a bare return: sys.exit(None) exits 0 silently, which
-        # is the right CODE here (a clean no-trade run) but only by accident —
-        # the exit-code contract (BS-14) requires every _run_prod path to name
-        # its code explicitly.
-        return EXIT_OK
+        # Return the code by name, never a bare return: sys.exit(None) exits
+        # 0, which would hide EXIT_TIME_SERIES_SKIPPED. Every path of
+        # _run_prod names its exit code.
+        return clean_exit
 
     # Move collateral to the shards the selected trades draw from — sizing is
     # portfolio-wide, but each order settles against its own shard's balance.
@@ -1092,8 +1096,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.info(
             "No selected pair could be funded on its exchange shard — no trades submitted."
         )
-        # EXIT_OK explicitly — see the routability short-circuit above
-        return EXIT_OK
+        # Return the code by name — see the routability check above
+        return clean_exit
 
     # Submit orders sequentially per leg, concurrently across pairs
     results = execute_trades(client, portfolio, dry_run=args.dry_run)
@@ -1142,7 +1146,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
 
     if args.dry_run:
         logging.info("[DRY RUN] No orders were actually submitted.")
-        return EXIT_OK
+        return clean_exit
 
     n_ok       = sum(1 for r in results if r.status == "executed")
     n_rolled   = sum(1 for r in results if r.status == "rolled_back")
@@ -1172,7 +1176,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         # but need a human to check" from a clean run.
         return EXIT_TRADES_NEED_ATTENTION
 
-    return EXIT_OK
+    return clean_exit
 
 
 def _setup_logging(log_path: pathlib.Path) -> None:

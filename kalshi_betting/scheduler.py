@@ -23,10 +23,10 @@ Dependencies:
     Imports PROJECT_ROOT, SCHEDULER_JOB_TIMEOUT_SECONDS,
     SCHEDULER_BLIND_RETRY_SECONDS / SCHEDULER_BLIND_MAX_RETRIES, and the
     EXIT_OK / EXIT_SKIPPED_LOW_BALANCE / EXIT_TRADES_NEED_ATTENTION /
-    EXIT_NO_TRADEABLE_SHARDS exit-code constants from config.py — the EXIT_*
-    imports are what let run_job() map the subprocess's exit code to a
-    distinct log level/message (BS-14) rather than treating every nonzero code
-    identically. Spawns kalshi_betting.main as a
+    EXIT_NO_TRADEABLE_SHARDS / EXIT_TIME_SERIES_SKIPPED exit-code constants
+    from config.py — the EXIT_* imports are what let run_job() map the
+    subprocess's exit code to a distinct log level/message (BS-14) rather
+    than treating every nonzero code identically. Spawns kalshi_betting.main as a
     subprocess (via sys.executable) rather than importing it directly, to
     isolate run-time errors and capture stdout/stderr separately. Entry point for
     `python3 -m kalshi_betting.scheduler`.
@@ -146,6 +146,7 @@ from .config import (
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
     EXIT_SKIPPED_LOW_BALANCE,
+    EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
     PROJECT_ROOT,
     SCHEDULER_BLIND_MAX_RETRIES,
@@ -450,17 +451,17 @@ def run_job(retries: int = 0) -> None:
 
     Logs the subprocess's stdout unconditionally (whether the run succeeded or
     failed). Its stderr is logged only on the catch-all failure branch (an
-    exit code that is none of EXIT_OK / EXIT_SKIPPED_LOW_BALANCE /
-    EXIT_TRADES_NEED_ATTENTION) and on TimeoutExpired; the
-    EXIT_TRADES_NEED_ATTENTION and EXIT_SKIPPED_LOW_BALANCE branches log their
-    message without stderr. All of that re-logged output lands in THIS
-    daemon's log (kalshi_scheduler.log), while the bot's own log lines go to
-    kalshi_arb.log through the subprocess's own handler. The exit code is
-    mapped to a distinct log level/message per the EXIT_* contract in
-    config.py (BS-14): a low-balance skip and a run with trades needing manual
-    review are no longer indistinguishable from a clean run in this log —
-    previously the only signal was a WARNING inside kalshi_arb.log that this
-    scheduler process never reads.
+    exit code that is none of the EXIT_* codes) and on TimeoutExpired; every
+    EXIT_* branch logs its message without stderr. All of that re-logged
+    output lands in THIS daemon's log (kalshi_scheduler.log), while the bot's
+    own log lines go to kalshi_arb.log through the subprocess's own handler.
+    The exit code is mapped to a distinct log level/message per the EXIT_*
+    contract in config.py (BS-14): a low-balance skip and a run with trades
+    needing manual review are no longer indistinguishable from a clean run in
+    this log — previously the only signal was a WARNING inside kalshi_arb.log
+    that this scheduler process never reads. EXIT_TIME_SERIES_SKIPPED (a held
+    market could not be identified, so the run made no time-series trade) is
+    an ERROR here, and still counts the slot as done.
 
     A subprocess.TimeoutExpired's stdout/stderr are decoded before logging
     (BS-16 — see _decode()), and both streams are logged (stderr, the hung
@@ -554,6 +555,16 @@ def run_job(retries: int = 0) -> None:
         logging.error(
             "Job completed but one or more trades need MANUAL REVIEW — "
             "check kalshi_arb.log and trade_log.xlsx.",
+        )
+    elif result.returncode == EXIT_TIME_SERIES_SKIPPED:
+        # The run scanned and could still trade same-title pairs, so the slot
+        # counts as done; a retry would most likely fail the same lookup
+        logging.error(
+            "Job made NO time-series trade (exit %d): a held market could not "
+            "be identified, so the run could not tell which ladders it already "
+            "holds. Same-title pairs were still searched. The weekly slot counts "
+            "as done — see the ERROR in kalshi_arb.log naming the market.",
+            result.returncode,
         )
     elif result.returncode == EXIT_NO_TRADEABLE_SHARDS:
         # Not a satisfied slot: nothing was scanned (TS-01, VI-02). The exit

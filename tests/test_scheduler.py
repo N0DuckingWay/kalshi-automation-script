@@ -29,11 +29,12 @@ from unittest.mock import patch
 import pytest
 import schedule
 
-from kalshi_betting import scheduler
+from kalshi_betting import config, scheduler
 from kalshi_betting.config import (
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
     EXIT_SKIPPED_LOW_BALANCE,
+    EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
     SCHEDULER_BLIND_MAX_RETRIES,
     SCHEDULER_BLIND_RETRY_SECONDS,
@@ -115,6 +116,45 @@ class TestRunJobExitCodeMapping:
         # Points the operator at where the detail actually lives.
         assert "kalshi_arb.log" in matches[0].getMessage()
         assert "trade_log.xlsx" in matches[0].getMessage()
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_time_series_skipped_logs_error(self, mock_run, caplog):
+        # A held market could not be identified, so the run made no
+        # time-series trade. It is an ERROR of its own, never a clean run or
+        # the catch-all failure, and it points at the line naming the market.
+        mock_run.return_value = _completed(EXIT_TIME_SERIES_SKIPPED, stderr="noise")
+
+        with caplog.at_level(logging.INFO):
+            scheduler.run_job()
+
+        matches = [r for r in caplog.records if "NO time-series trade" in r.getMessage()]
+        assert len(matches) == 1
+        assert matches[0].levelno == logging.ERROR
+        message = matches[0].getMessage()
+        assert f"exit {EXIT_TIME_SERIES_SKIPPED}" in message
+        assert "Same-title pairs were still searched" in message
+        assert "kalshi_arb.log" in message
+        assert "noise" not in message
+        assert not any("Job completed successfully." in r.getMessage() for r in caplog.records)
+        assert not any("Job failed" in r.getMessage() for r in caplog.records)
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_every_exit_code_has_a_message_of_its_own(self, mock_run, caplog):
+        # Every EXIT_* code in config.py is distinct, none is the crash (1) or
+        # usage-error (2) code, and none falls through to the catch-all
+        # "Job failed" branch, so a new code cannot be added without a message.
+        codes = {name: getattr(config, name) for name in dir(config)
+                 if name.startswith("EXIT_")}
+        assert EXIT_TIME_SERIES_SKIPPED in codes.values()
+        assert len(set(codes.values())) == len(codes)
+        assert not {1, 2} & set(codes.values())
+        for name, code in codes.items():
+            caplog.clear()
+            schedule.clear()
+            mock_run.return_value = _completed(code, stderr="x")
+            with caplog.at_level(logging.INFO):
+                scheduler.run_job()
+            assert not any("Job failed" in r.getMessage() for r in caplog.records), name
 
     @patch("kalshi_betting.scheduler.subprocess.run")
     def test_other_nonzero_code_logs_existing_failure_path(self, mock_run, caplog):
@@ -405,6 +445,21 @@ class TestCatchUp:
 
         mock_run_job.assert_called_once_with(retries=0)
 
+    def test_a_run_that_skipped_time_series_is_not_retried(self, tmp_path):
+        # It scanned and could trade same-title pairs, so the slot is done: a
+        # restart does not re-run it.
+        now = datetime(2026, 9, 2, 10, 0)
+        current_slot = scheduler._most_recent_slot(now)
+        _write_state(
+            tmp_path, last_slot=current_slot.isoformat(),
+            exit_code=EXIT_TIME_SERIES_SKIPPED,
+        )
+
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job:
+            scheduler._maybe_catch_up(now=now)
+
+        mock_run_job.assert_not_called()
+
     def test_failed_but_scanning_run_is_still_not_retried(self, tmp_path):
         # BS-17's deliberate behaviour, unchanged: only a BLIND run reopens a
         # slot. A run that scanned and merely failed stays satisfied.
@@ -635,8 +690,10 @@ class TestBlindRunRetry:
     @patch("kalshi_betting.scheduler.subprocess.run")
     def test_other_exit_codes_register_no_retry(self, mock_run):
         # Only a BLIND run reopens the slot. A clean run, a low-balance skip,
-        # a manual-review run and a crash all leave the schedule empty.
-        for code in (EXIT_OK, EXIT_SKIPPED_LOW_BALANCE, EXIT_TRADES_NEED_ATTENTION, 1):
+        # a manual-review run, a run that skipped time-series trading and a
+        # crash all leave the schedule empty.
+        for code in (EXIT_OK, EXIT_SKIPPED_LOW_BALANCE, EXIT_TRADES_NEED_ATTENTION,
+                     EXIT_TIME_SERIES_SKIPPED, 1):
             mock_run.return_value = _completed(code, stderr="x")
             scheduler.run_job()
             assert schedule.jobs == [], f"exit {code} must not schedule a retry"

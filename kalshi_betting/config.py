@@ -841,6 +841,12 @@ EXIT_TRADES_NEED_ATTENTION    = 20
 # everything, found no edge": scheduler.run_job maps this to a WARNING, never
 # counts the weekly slot as satisfied, and retries it.
 EXIT_NO_TRADEABLE_SHARDS      = 30
+# The run made no time-series trade because it could not tell which ladder
+# one of the account's open positions is on (a ladder is one question asked
+# at several deadlines). Same-title pairs were still searched and traded, so
+# the run did scan. The scheduler logs this as an ERROR and counts the weekly
+# slot as done: a retry an hour later would most likely fail the same lookup.
+EXIT_TIME_SERIES_SKIPPED      = 40
 
 # ── API pagination ────────────────────────────────────────────────────────────
 
