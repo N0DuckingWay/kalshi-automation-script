@@ -1,7 +1,9 @@
 """Tests for config.py fee helpers, the time-series probability model, the
 leg-side tuples, the deadline-gap tier (with the backtest's spread band and
 tier-floors switch), the live toggles (LiveSettings and its helpers), the
-values config.py ships, conftest's apply_pre_toggle_defaults, and PROJECT_ROOT."""
+values config.py ships, conftest's apply_pre_toggle_defaults, the V2 order
+path's self-trade-prevention value, the order-write pacer's budget, and
+PROJECT_ROOT."""
 import ast
 import dataclasses
 import importlib
@@ -220,6 +222,37 @@ class TestLegSideTuples:
         # type must have exactly one, and one YES leg to hedge it
         for sides in (SAME_TITLE_LEG_SIDES, TIME_SERIES_LEG_SIDES):
             assert sorted(sides) == ["no", "yes"]
+
+
+class TestV2SelfTradePrevention:
+    def test_is_one_of_the_two_values_the_endpoint_accepts(self):
+        # The V2 create-order endpoint requires self_trade_prevention_type and
+        # accepts only these two values; any other is rejected with HTTP 400
+        assert config.V2_SELF_TRADE_PREVENTION_TYPE in {"taker_at_cross", "maker"}
+
+
+class TestOrderWriteBudget:
+    """trader's write pacer, built from ORDER_WRITES_PER_SECOND and
+    ORDER_WRITE_BURST, must stay inside the account's write budget, or the
+    exchange answers the excess with HTTP 429 and does not process it."""
+
+    # Kalshi's Basic usage tier: a write bucket of 100 tokens that refills at
+    # 100 tokens a second, and an order or transfer POST costs 10 tokens.
+    BASIC_TIER_WRITE_BUCKET_CAPACITY = 100
+    BASIC_TIER_WRITE_REFILL_PER_SECOND = 100
+    TOKENS_PER_WRITE = 10
+
+    def test_the_burst_fits_the_basic_tier_bucket(self):
+        assert (config.ORDER_WRITE_BURST * self.TOKENS_PER_WRITE
+                <= self.BASIC_TIER_WRITE_BUCKET_CAPACITY)
+
+    def test_the_rate_fits_the_basic_tier_refill(self):
+        assert (config.ORDER_WRITES_PER_SECOND * self.TOKENS_PER_WRITE
+                <= self.BASIC_TIER_WRITE_REFILL_PER_SECOND)
+
+    def test_the_pacer_admits_writes_at_all(self):
+        assert config.ORDER_WRITE_BURST >= 1
+        assert config.ORDER_WRITES_PER_SECOND > 0
 
 
 class TestMinPriceDiffForGap:

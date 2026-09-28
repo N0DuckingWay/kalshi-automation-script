@@ -602,11 +602,12 @@ BUY_MAX_COST_SLIPPAGE_CENTS   = 1
 # Maximum accepted per-contract loss (cents) when unwinding the NO leg (the
 # first-submitted leg: market_a for a same-title pair, market_b for a
 # time-series pair) after the YES leg failed, relative to the NO leg's scanned
-# NO entry price. The rollback is a fill-or-kill LIMIT sell at (entry - this),
-# so a book that has collapsed past the floor kills the unwind instead of
-# realizing an unbounded loss; the orphaned position then surfaces as
-# status="rollback_failed" for manual review — the same path an unfilled
-# market unwind already took.
+# NO entry price. On the legacy path the rollback is a fill-or-kill LIMIT sell
+# at (entry - this); on the V2 path the same bound caps an immediate-or-cancel
+# bid, which closes only what rests at or under the cap (see the last
+# paragraph below). Either way a book that has collapsed past the floor leaves
+# the position, or what is left of it, open instead of realizing an unbounded
+# loss, and that surfaces as status="rollback_failed" for manual review.
 #
 # This allowance must cover the market's ENTIRE bid-ask spread, not just the
 # "acceptable loss": the NO leg entered at the NO ASK, but the unwind is a sell
@@ -682,7 +683,8 @@ PRICE_EPSILON                 = 1e-6
 
 # Which create-order endpoint trader.py submits through. Allowed values:
 #   "v2"     — POST V2_ORDER_PATH below: dollar-string fill-or-kill LIMIT prices
-#              (the limit price IS the price protection), fixed-point counts,
+#              (the reduce_only unwind is immediate_or_cancel instead; the
+#              limit price IS the price protection), fixed-point counts,
 #              bid/ask sides on the single YES book, explicit exchange_index.
 #              Only this path can express a cap at the market's real tick
 #              resolution (see BUY_SLIPPAGE_TICKS above).
@@ -705,6 +707,32 @@ ORDER_API_VERSION             = "v2"
 # so the string used to build the URL and the string that is signed must be one
 # and the same value.
 V2_ORDER_PATH                 = "/trade-api/v2/portfolio/events/orders"
+
+# Self-trade prevention for every V2 order. The V2 create-order endpoint
+# REQUIRES this field ("taker_at_cross" | "maker") and rejects a body without
+# it. "taker_at_cross" cancels OUR incoming order if it would trade against
+# another order on this account; "maker" would cancel the account's resting
+# order instead. The bot never leaves an order resting, so the only order it
+# could meet is one placed outside the bot (by hand, or by another client on
+# this account), and taker_at_cross leaves that order alone. What the endpoint
+# reports for the bot's cancelled order has not been observed; the trader
+# handles each shape through its existing paths. Nothing filled is an ordinary
+# non-fill. On a buy leg, part filled or an error response goes to the
+# position-delta check (a part fill the account shows ends as manual_review).
+# On the unwind, either one is rollback_failed.
+V2_SELF_TRADE_PREVENTION_TYPE = "taker_at_cross"
+
+# What the V2 create-order endpoint sends when a fill_or_kill order cannot fill
+# in full: an HTTP 409 error whose JSON body reads
+# {"error": {"code": V2_FOK_KILL_ERROR_CODE, "message": ...}}. The exchange
+# rejects such an order before it matches, so nothing filled and nothing rests
+# — it is the endpoint's kill. trader._submit_order_v2 reads exactly this
+# status AND this code, on a fill_or_kill body only, as a kill ("canceled").
+# Every other error response still raises — on a buy leg into the caller's
+# position check, on the unwind into rollback_failed — because an error the
+# bot cannot name is no proof that nothing filled.
+V2_FOK_KILL_HTTP_STATUS       = 409
+V2_FOK_KILL_ERROR_CODE        = "fill_or_kill_insufficient_resting_volume"
 
 # TOP-OF-GRID CEILING CLAMP, as a dollar string, on the V2 reduce-only rollback
 # bid that unwinds a filled NO leg (market_a for same-title, market_b for
@@ -1110,8 +1138,39 @@ FLAT_RETURN_TOLERANCE: float = 1e-12
 # ceiling rather than a tuned throughput figure; unlike the fetch pools it has
 # never been exercised at scale against the live API. Raise cautiously — the
 # execution pool submits real orders, so each extra worker is another
-# concurrent write against the account.
+# concurrent write against the account. The workers' writes share one pacer
+# (ORDER_WRITES_PER_SECOND below), so more workers never mean faster writes,
+# but they do mean longer waits: a pair's YES leg and its rollback each wait
+# their turn behind the other workers' writes while its NO leg is filled and
+# unhedged, at most TRADER_MAX_WORKERS / ORDER_WRITES_PER_SECOND seconds per
+# write (1 s at 8 and 8), since each worker holds at most one place in line.
+# That wait is the accepted cost of the HTTP 429s the pacer prevents (a 429 on
+# a rollback leaves the position open); see trader._execute_one.
 TRADER_MAX_WORKERS = 8
+
+# How fast trader.py sends order and collateral-transfer POSTs, across every
+# worker thread together: at most ORDER_WRITE_BURST back to back, then one
+# every 1/ORDER_WRITES_PER_SECOND seconds (trader._ORDER_WRITE_PACER, a token
+# bucket that refills at this rate up to this burst). Kalshi limits writes per
+# account with a token bucket of its own that refills continuously, not per
+# window: the Basic tier refills 100 tokens a second into a 100-token bucket
+# (GET /account/limits), and an order or transfer POST costs the default 10
+# tokens (GET /account/endpoint_costs lists no override for either), so the
+# exchange accepts 10 orders a second and 10 back to back. Beyond that it
+# answers HTTP 429 and rejects the request outright, unprocessed, which on a
+# YES leg means an unhedged NO leg and a rollback, and on the rollback itself
+# an open position. In any T seconds the pacer admits at most 8 + 8*T writes,
+# never more than the exchange's 10 + 10*T; 8 and 8 leave 20% of that budget
+# for writes the bot does not see (another client on the account, a manual
+# order). Pacing sets when a request is sent, not when it arrives, so large
+# network jitter can still bunch arrivals, and the pacer is per process, so a
+# second process writing to the account (a manual run overlapping a scheduled
+# one, a probe's transfer) paces itself separately at the full rate. A higher
+# usage tier (GET /account/limits names the account's own) allows more; these
+# are safe to raise only up to that tier's write budget divided by the order
+# cost (10 tokens).
+ORDER_WRITES_PER_SECOND = 8
+ORDER_WRITE_BURST = 8
 
 # Names the SEMANTICS of backtester._can_ever_enter(), which run_backtest()
 # passes to historical.fetch_all_settled_markets() as a prefilter so ineligible

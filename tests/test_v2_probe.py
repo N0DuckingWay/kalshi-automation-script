@@ -38,6 +38,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from kalshi_python_sync.exceptions import ApiException
 
 from kalshi_betting import trader, v2_probe
 from kalshi_betting.scanner import PriceRange
@@ -124,17 +125,57 @@ def v2_resp(fill_count: str, remaining_count: str) -> dict:
 FILLED = v2_resp("0.01", "0.00")
 KILLED = v2_resp("0.00", "0.01")
 
+# The code the V2 endpoint sent when it killed the probe's fill-or-kill ask on
+# the production API (2026-09-28); with the default code, fok_kill_error's body
+# is the compact body it sent, byte for byte. KILLED above is the other kill
+# shape, a 2xx with nothing filled, which the probe still accepts.
+FOK_KILL_CODE = "fill_or_kill_insufficient_resting_volume"
+
+
+def fok_kill_error(code: str = FOK_KILL_CODE) -> ApiException:
+    """The HTTP 409 the V2 endpoint answers a fill-or-kill that cannot fill."""
+    body = json.dumps(
+        {"error": {"code": code, "message": "fill or kill insufficient resting volume"}},
+        separators=(",", ":"),
+    )
+    return ApiException(status=409, reason="Conflict", body=body)
+
+# The values the V2 create-order endpoint accepts for its required
+# self_trade_prevention_type field
+# (https://docs.kalshi.com/api-reference/orders/create-order-v2).
+_V2_SELF_TRADE_PREVENTION = {"taker_at_cross", "maker"}
+
+
+def reject_like_the_endpoint(body: dict) -> None:
+    """Raise the HTTP 400 the V2 endpoint returns for a body it refuses.
+
+    Two of the endpoint's own checks: self_trade_prevention_type is required
+    and must be one of its two values, and "Orders with reduce_only set to
+    true will be rejected unless time_in_force is immediate_or_cancel." A
+    stand-in submission seam calls this first, so a probe test fails if a
+    trader builder stops sending either.
+    """
+    if body.get("self_trade_prevention_type") not in _V2_SELF_TRADE_PREVENTION:
+        raise ApiException(status=400, reason="self_trade_prevention_type is required")
+    if body.get("reduce_only") and body.get("time_in_force") != "immediate_or_cancel":
+        raise ApiException(
+            status=400, reason="reduce_only requires time_in_force immediate_or_cancel",
+        )
+
 
 class FakeExchange:
     """A one-price book that honours limit prices, plus the position it moves.
 
     Everywhere else in this file the submission seam returns a canned fill or
     a canned kill, which cannot show whether a price would actually have
-    crossed. This models the single fact DR-04 turns on: a fill-or-kill ASK
-    (sell YES) fills only at or BELOW the resting YES bid, a fill-or-kill BID
-    (buy YES) fills only at or ABOVE the resting YES ask, and anything else
-    comes back killed with the full count remaining. `position` is a Decimal
-    so -0.01 + 0.01 is exactly 0.
+    crossed. This models the single fact DR-04 turns on: an ASK (sell YES)
+    fills only at or BELOW the resting YES bid, a BID (buy YES) fills only at
+    or ABOVE the resting YES ask. An order that does not cross is answered as
+    the exchange answers it: a fill_or_kill order with the HTTP 409 kill
+    response (fok_kill_error), an immediate_or_cancel order with a 2xx that
+    has nothing filled and the full count remaining. A body the endpoint
+    itself would refuse (reject_like_the_endpoint) raises its HTTP 400 before
+    any of that. `position` is a Decimal so -0.01 + 0.01 is exactly 0.
     """
 
     def __init__(self, yes_bid: str, yes_ask: str):
@@ -147,6 +188,7 @@ class FakeExchange:
         """Stand-in for v2_probe.signed_request_json."""
         assert method == "POST"
         self.submitted.append(body)
+        reject_like_the_endpoint(body)
         count = Decimal(body["count"])
         price = Decimal(body["price"])
         if body["side"] == "ask":
@@ -157,6 +199,10 @@ class FakeExchange:
             # Buying YES: the limit is a CEILING, so it crosses only a resting
             # ask at or below it.
             signed = count if price >= self.yes_ask else Decimal("0")
+        if body["time_in_force"] == "fill_or_kill" and signed == 0:
+            # The exchange rejects a fill-or-kill that cannot fill before it
+            # matches: an error response, and the position does not move.
+            raise fok_kill_error()
         if body["reduce_only"]:
             # reduce_only can only close existing exposure: a YES bid buys
             # back no more than the NO position actually held, and cannot
@@ -176,6 +222,9 @@ class FakeExchange:
 def submits(monkeypatch) -> list:
     """Capture every body the probe submits, returning fills by default.
 
+    A body the endpoint would refuse is answered with its HTTP 400 instead
+    (reject_like_the_endpoint), after it is captured.
+
     Patched at v2_probe.signed_request_json — the probe's one submission seam
     (it deliberately bypasses trader._submit_order_v2, whose int-count fill
     classifier cannot express the fractional probe count).
@@ -185,6 +234,7 @@ def submits(monkeypatch) -> list:
     def fake_post(client, method, path, *, query=None, body=None):
         assert method == "POST"
         captured.append({"path": path, "body": body})
+        reject_like_the_endpoint(body)
         return FILLED
 
     monkeypatch.setattr(v2_probe, "signed_request_json", fake_post)
@@ -234,7 +284,8 @@ class TestBodyConstruction:
         reference = trader._build_no_order_v2(v2_probe._probe_leg(market, 0.41))
         # Everything except count (random client_order_id aside) is the
         # builder's own output — the probe verifies the real code.
-        for key in ("ticker", "side", "price", "time_in_force", "exchange_index",
+        for key in ("ticker", "side", "price", "time_in_force",
+                    "self_trade_prevention_type", "exchange_index",
                     "reduce_only", "post_only"):
             assert body[key] == reference[key]
         assert body["count"] == v2_probe.PROBE_COUNT_STR
@@ -297,10 +348,13 @@ class TestBodyConstruction:
         )
         body = v2_probe._no_close_body(market)
         reference = trader._build_rollback_order_v2(v2_probe._probe_leg(market, 0.5))
-        for key in ("ticker", "side", "time_in_force", "exchange_index",
+        for key in ("ticker", "side", "time_in_force",
+                    "self_trade_prevention_type", "exchange_index",
                     "reduce_only", "post_only"):
             assert body[key] == reference[key]
         assert body["reduce_only"] is True
+        # The endpoint accepts reduce_only only with immediate_or_cancel
+        assert body["time_in_force"] == "immediate_or_cancel"
         assert body["count"] == v2_probe.PROBE_COUNT_STR
         # The price is the one key that must NOT be the builder's.
         assert body["price"] == expected_price
@@ -329,6 +383,18 @@ class TestConfirmationGate:
         out = v2_probe._step_no_mapping(client, TICKER, False, 1)
         assert out == v2_probe._FAIL
         assert len(submits) == 1  # only the opening ask went out
+
+    def test_close_prompt_names_the_close_bodys_time_in_force(
+        self, submits, monkeypatch, capsys,
+    ):
+        # The close's confirmation text is built from the close body, so it
+        # names the time in force the endpoint actually receives.
+        client = probe_client([0, -0.01, 0])
+        assert v2_probe._step_no_mapping(client, TICKER, True, 1) == v2_probe._PASS
+        close_body = submits[1]["body"]
+        printed = capsys.readouterr().out
+        assert close_body["time_in_force"] == "immediate_or_cancel"
+        assert f"time_in_force={close_body['time_in_force']}" in printed
 
     def test_yes_flag_skips_the_prompt(self, submits, monkeypatch):
         monkeypatch.setattr(
@@ -370,7 +436,10 @@ class TestNoMappingVerdict:
         assert len(submitted) == 1
 
     def test_unwind_that_leaves_a_position_fails(self, submits, monkeypatch):
-        client = probe_client([0, -0.01, -0.01])
+        # The close's verdict is judged on a re-read after the pause, so a
+        # position that stays open needs a fourth read (TestCloseVerdictReRead).
+        monkeypatch.setattr(v2_probe.time, "sleep", lambda s: None)
+        client = probe_client([0, -0.01, -0.01, -0.01])
         assert v2_probe._step_no_mapping(client, TICKER, True, 1) == v2_probe._FAIL
 
     def test_non_flat_start_aborts_before_submitting(self, submits, monkeypatch):
@@ -460,6 +529,8 @@ class TestCloseCrossesTheBook:
         exchange = FakeExchange(yes_bid="0.89", yes_ask="0.90")
         monkeypatch.setattr(v2_probe, "signed_request_json", exchange.submit)
         monkeypatch.setattr(trader, "_position_count", exchange.position_count)
+        # The open position is read again after the close's re-read pause
+        monkeypatch.setattr(v2_probe.time, "sleep", lambda s: None)
 
         def builder_priced_close(market):
             body = trader._build_rollback_order_v2(v2_probe._probe_leg(market, 0.5))
@@ -598,6 +669,216 @@ class TestUnfillableAskStep:
         monkeypatch.setattr(v2_probe, "signed_request_json", lambda *a, **k: KILLED)
         client = probe_client([0, -0.01])
         assert v2_probe._step_unfillable_ask(client, TICKER, True, 1) == v2_probe._FAIL
+
+
+class TestKillResponse:
+    """The exchange answers a fill-or-kill that cannot fill with HTTP 409 and
+    the code fill_or_kill_insufficient_resting_volume, not with a 2xx that has
+    nothing filled. Both order steps read that response through
+    trader._is_fok_kill as a kill and judge the account, re-reading once after
+    the pause when the first read is not exactly 0 (a failed lookup, or a
+    position the kill cannot explain)."""
+
+    @staticmethod
+    def _arm(monkeypatch, error, reads: list):
+        """Answer every submission with `error` and script the position reads.
+
+        Returns (submitted bodies, observed reads, sleep durations).
+        """
+        submitted: list = []
+
+        def post(client, method, path, *, query=None, body=None):
+            submitted.append(body)
+            reject_like_the_endpoint(body)
+            raise error
+
+        monkeypatch.setattr(v2_probe, "signed_request_json", post)
+
+        seq = iter(reads)
+        observed: list = []
+
+        def scripted(client, ticker):
+            value = next(seq)
+            observed.append(value)
+            return value
+
+        slept: list = []
+        monkeypatch.setattr(trader, "_position_count", scripted)
+        monkeypatch.setattr(v2_probe.time, "sleep", lambda s: slept.append(s))
+        return submitted, observed, slept
+
+    def test_unfillable_ask_kill_with_a_flat_account_passes(self, monkeypatch, capsys):
+        submitted, observed, slept = self._arm(monkeypatch, fok_kill_error(), [0, 0])
+        out = v2_probe._step_unfillable_ask(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._PASS
+        assert len(submitted) == 1
+        # A flat first read is the expected answer and is not re-polled
+        assert observed == [0, 0]
+        assert slept == []
+        printed = capsys.readouterr().out
+        assert "HTTP 409" in printed
+        assert FOK_KILL_CODE in printed
+
+    def test_unfillable_ask_kill_with_a_non_flat_first_read_is_judged_on_the_re_read(
+        self, monkeypatch, capsys,
+    ):
+        _, observed, slept = self._arm(monkeypatch, fok_kill_error(), [0, -0.01, 0])
+        out = v2_probe._step_unfillable_ask(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._PASS
+        assert observed == [0, -0.01, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "kill response: -0.01" in printed
+        assert "Position after re-read: 0" in printed
+        # A position a kill cannot explain stays in the evidence
+        assert "NOTE: the first read (-0.01) was not flat" in printed
+
+    def test_unfillable_ask_kill_with_a_failed_first_read_is_re_read(self, monkeypatch, capsys):
+        _, observed, slept = self._arm(monkeypatch, fok_kill_error(), [0, None, 0])
+        out = v2_probe._step_unfillable_ask(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._PASS
+        assert observed == [0, None, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        # A failed lookup explains itself: no note
+        assert "NOTE:" not in capsys.readouterr().out
+
+    @pytest.mark.parametrize("reads", [[0, -0.01, -0.01], [0, None, None]],
+                             ids=["position-stays-open", "lookup-keeps-failing"])
+    def test_unfillable_ask_kill_with_an_account_that_is_not_flat_fails(
+        self, monkeypatch, capsys, reads,
+    ):
+        _, observed, slept = self._arm(monkeypatch, fok_kill_error(), reads)
+        out = v2_probe._step_unfillable_ask(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        assert observed == reads
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert "CHECK THE ACCOUNT" in capsys.readouterr().out
+
+    def test_unfillable_ask_with_another_409_code_fails(self, monkeypatch, capsys):
+        # Only the kill code is a kill; any other error keeps today's FAIL.
+        _, observed, slept = self._arm(
+            monkeypatch, fok_kill_error("insufficient_balance"), [0, 0],
+        )
+        out = v2_probe._step_unfillable_ask(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        assert observed == [0, 0]
+        assert slept == []
+        assert "submission raised" in capsys.readouterr().out
+
+    def test_no_buy_kill_with_a_flat_account_is_neutral(self, monkeypatch, capsys):
+        submitted, observed, slept = self._arm(monkeypatch, fok_kill_error(), [0, 0])
+        out = v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._NEUTRAL
+        # The close is never submitted: nothing was opened
+        assert len(submitted) == 1
+        assert observed == [0, 0]
+        assert slept == []
+        printed = capsys.readouterr().out
+        assert "killed unfilled" in printed
+        assert "more liquid ticker" in printed
+
+    def test_no_buy_kill_with_a_non_flat_first_read_is_judged_on_the_re_read(
+        self, monkeypatch, capsys,
+    ):
+        submitted, observed, slept = self._arm(monkeypatch, fok_kill_error(), [0, -0.01, 0])
+        out = v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._NEUTRAL
+        assert len(submitted) == 1
+        assert observed == [0, -0.01, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert "NOTE: the first read (-0.01) was not flat" in capsys.readouterr().out
+
+    def test_no_buy_kill_with_a_position_that_stays_open_fails(self, monkeypatch, capsys):
+        submitted, observed, slept = self._arm(
+            monkeypatch, fok_kill_error(), [0, -0.01, -0.01],
+        )
+        out = v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        assert len(submitted) == 1
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert "FLATTEN ANY POSITION YOU FIND" in capsys.readouterr().out
+
+    def test_no_buy_with_another_409_code_fails(self, monkeypatch, capsys):
+        submitted, observed, slept = self._arm(
+            monkeypatch, fok_kill_error("insufficient_balance"), [0, 0],
+        )
+        out = v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        assert len(submitted) == 1
+        assert slept == []
+        assert "NO-buy submission raised" in capsys.readouterr().out
+
+    def test_the_stand_in_exchange_kills_the_unfillable_ask(self, monkeypatch):
+        # End to end against a book that honours limit prices: a top-of-grid
+        # ask crosses no resting bid, so the exchange answers with its 409.
+        exchange = FakeExchange(yes_bid="0.59", yes_ask="0.60")
+        monkeypatch.setattr(v2_probe, "signed_request_json", exchange.submit)
+        monkeypatch.setattr(trader, "_position_count", exchange.position_count)
+        out = v2_probe._step_unfillable_ask(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._PASS
+        assert exchange.position == 0
+        assert len(exchange.submitted) == 1
+
+    def test_a_no_buy_that_no_longer_crosses_is_neutral_end_to_end(self, monkeypatch):
+        # The book the probe priced against shows a YES bid of 0.59, but the
+        # exchange's bid has dropped to 0.50: the 0.5800 ask cannot fill, the
+        # exchange kills it with its 409, and nothing is opened or closed.
+        exchange = FakeExchange(yes_bid="0.50", yes_ask="0.60")
+        monkeypatch.setattr(v2_probe, "signed_request_json", exchange.submit)
+        monkeypatch.setattr(trader, "_position_count", exchange.position_count)
+        out = v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._NEUTRAL
+        assert exchange.position == 0
+        [ask_body] = exchange.submitted
+        assert (ask_body["side"], ask_body["price"]) == ("ask", "0.5800")
+
+
+class TestCloseVerdictReRead:
+    """A position that is not exactly 0 straight after the reduce-only close is
+    read once more after trader._V2_MAPPING_RECHECK_DELAY_SECONDS, and the
+    close is judged on the re-read: the positions ledger lags a fill, so the
+    lone read after a close that did flatten the account can still show the
+    open position."""
+
+    def test_a_lagging_ledger_after_the_close_passes(self, submits, monkeypatch, capsys):
+        observed, slept = TestZeroPositionIsReReadOnce._arm(
+            monkeypatch, [0, -0.01, -0.01, 0],
+        )
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._PASS
+        assert observed == [0, -0.01, -0.01, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert len(submits) == 2
+        printed = capsys.readouterr().out
+        assert "Position after the close: -0.01" in printed
+        assert "Position after re-read: 0" in printed
+
+    def test_a_failed_read_after_the_close_is_re_read(self, submits, monkeypatch):
+        observed, slept = TestZeroPositionIsReReadOnce._arm(
+            monkeypatch, [0, -0.01, None, 0],
+        )
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._PASS
+        assert observed == [0, -0.01, None, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+
+    @pytest.mark.parametrize("last", [-0.01, None], ids=["stays-open", "lookup-fails"])
+    def test_a_position_still_open_after_the_re_read_fails(
+        self, submits, monkeypatch, capsys, last,
+    ):
+        observed, slept = TestZeroPositionIsReReadOnce._arm(
+            monkeypatch, [0, -0.01, -0.01, last],
+        )
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, -0.01, -0.01, last]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "did NOT return the position to flat" in printed
+        assert f"Position after re-read: {last}" in printed
+
+    def test_a_flat_read_after_the_close_is_not_re_read(self, submits, monkeypatch):
+        observed, slept = TestZeroPositionIsReReadOnce._arm(monkeypatch, [0, -0.01, 0])
+        assert v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1) == v2_probe._PASS
+        assert observed == [0, -0.01, 0]
+        assert slept == []
 
 
 class TestNonObjectOrderBody:

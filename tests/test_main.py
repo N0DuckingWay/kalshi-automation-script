@@ -1268,8 +1268,10 @@ def _order_side_effect(fill_pattern: list):
 
     Each tag in fill_pattern is "full" (fills the exact requested count,
     read back from the submitted body so the response is always self-
-    consistent regardless of the sized contract count), "kill" (fill_count
-    0), or "error" (HTTP 500, exercising the ambiguous-response path)."""
+    consistent regardless of the sized contract count), "kill" (a 2xx with
+    fill_count 0), "fok_kill" (the HTTP 409 fill_or_kill_insufficient_resting_volume
+    error the exchange really sends when it kills a fill-or-kill), or "error"
+    (HTTP 500, exercising the ambiguous-response path)."""
     state = {"i": 0}
 
     def _effect(verb, url, headers=None, body=None):
@@ -1279,6 +1281,16 @@ def _order_side_effect(fill_pattern: list):
         if tag == "error":
             return _raw_json_response(
                 {"error": "internal"}, status=500, reason="Internal Server Error"
+            )
+        if tag == "fok_kill":
+            return _raw_json_response(
+                {
+                    "error": {
+                        "code": "fill_or_kill_insufficient_resting_volume",
+                        "message": "fill or kill insufficient resting volume",
+                    }
+                },
+                status=409, reason="Conflict",
             )
         requested = int(Decimal(body["count"]))
         fill = requested if tag == "full" else 0
@@ -1995,6 +2007,8 @@ class TestRunProdLiveV2Replay:
             assert price_re.match(body["price"])
             assert count_re.match(body["count"])
             assert body["time_in_force"] == "fill_or_kill"
+            # Required by the V2 endpoint, which rejects a body without it
+            assert body["self_trade_prevention_type"] == "taker_at_cross"
             assert body["exchange_index"] == 0
 
         assert len(captured["results"]) == 1
@@ -2007,9 +2021,15 @@ class TestRunProdLiveV2Replay:
         calls = client.rest_client.request.call_args_list
         assert len(calls) == 3
 
+        # Every V2 body carries the endpoint's required self-trade-prevention
+        # field, the unwind included
+        for call in calls:
+            assert call.kwargs["body"]["self_trade_prevention_type"] == "taker_at_cross"
         rollback_body = calls[2].kwargs["body"]
         assert rollback_body["side"] == "bid"
         assert rollback_body["reduce_only"] is True
+        # The endpoint accepts reduce_only only with immediate_or_cancel
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
         # The unwind is LOSS-FLOORED, not a flat top-of-grid bid: the NO leg's
         # scanned NO entry is 0.45, so the floor is 45 - 12 = 33c and the bid
         # cap is its YES-book mirror, 1 - 0.33 = 0.67, already on the replay
@@ -2024,6 +2044,45 @@ class TestRunProdLiveV2Replay:
 
         assert client.rest_client.request.call_count == 1
         assert captured["results"][0].status == "failed"
+        client.create_order_without_preload_content.assert_not_called()
+
+    def test_run_prod_live_v2_leg_a_kill_response_is_failed_end_to_end(
+        self, monkeypatch, caplog,
+    ):
+        # The exchange's real kill: an HTTP 409 through the signed transport,
+        # raised by the SDK as its ConflictException. The pair ends "failed" on
+        # one order request, with no position read after it and no pause.
+        slept: list = []
+        monkeypatch.setattr(trader_mod.time, "sleep", lambda s: slept.append(s))
+        with caplog.at_level(logging.INFO):
+            client, captured = self._run(monkeypatch, ["fok_kill"])
+
+        assert client.rest_client.request.call_count == 1
+        result = captured["results"][0]
+        assert result.status == "failed"
+        assert result.error == "NO leg FoK not filled: status=canceled"
+        assert slept == []
+        assert "killed by the exchange (HTTP 409" in caplog.text
+        # The only per-ticker position reads are the two baselines taken
+        # before the NO leg was submitted: none follows the kill
+        ticker_reads = [
+            c for c in client.get_positions_without_preload_content.call_args_list
+            if "ticker" in c.kwargs
+        ]
+        assert len(ticker_reads) == 2
+        client.create_order_without_preload_content.assert_not_called()
+
+    def test_run_prod_live_v2_leg_b_kill_response_rolls_back_end_to_end(self, monkeypatch):
+        client, captured = self._run(monkeypatch, ["full", "fok_kill", "full"])
+
+        calls = client.rest_client.request.call_args_list
+        assert len(calls) == 3
+        rollback_body = calls[2].kwargs["body"]
+        assert rollback_body["reduce_only"] is True
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
+        result = captured["results"][0]
+        assert result.status == "rolled_back"
+        assert result.error == "YES leg FoK not filled: status=canceled"
         client.create_order_without_preload_content.assert_not_called()
 
     def test_run_prod_live_v2_error_response_routes_to_position_lookup(self, monkeypatch):

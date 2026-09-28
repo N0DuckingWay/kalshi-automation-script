@@ -33,6 +33,8 @@ import json
 import logging
 import math
 import textwrap
+import threading
+import time
 import uuid
 from decimal import Decimal
 from json import JSONDecodeError
@@ -68,6 +70,7 @@ from kalshi_betting.trader import (
     _execute_transfer,
     _format_count,
     _format_price,
+    _is_fok_kill,
     _legacy_routable,
     _ordered_legs,
     _partition_by_funding,
@@ -75,12 +78,15 @@ from kalshi_betting.trader import (
     _position_count,
     _required_cents_by_shard,
     _rollback_floor_cents,
+    _submit_order,
+    _submit_order_v2,
     _transfers_active,
     _unfunded_shards,
     _v2_fill_status,
     _v2_limit_price,
     _v2_rollback_price,
     _v2_top_of_grid_price,
+    _WritePacer,
     ensure_shard_collateral,
     execute_trades,
     pre_execution_check,
@@ -238,6 +244,19 @@ def v2_resp(fill_count, requested: int = 5) -> dict:
     }
 
 
+# The body the V2 endpoint sent, verbatim, when it killed a fill-or-kill ask
+# that could not fill on the production API (2026-09-28).
+FOK_KILL_BODY = (
+    '{"error":{"code":"fill_or_kill_insufficient_resting_volume",'
+    '"message":"fill or kill insufficient resting volume"}}'
+)
+
+
+def fok_kill_error() -> ApiException:
+    """The HTTP 409 the V2 endpoint answers a fill-or-kill that cannot fill."""
+    return ApiException(status=409, reason="Conflict", body=FOK_KILL_BODY)
+
+
 def order_resp(status: str) -> SimpleNamespace:
     """Raw create_order response — trader parses the JSON body directly
     because the SDK's Order response model can't deserialize live payloads."""
@@ -331,9 +350,11 @@ class TestOrderPriceProtection:
 
 
 class TestRollbackPriceFloor:
-    """The NO-leg unwind is a floored FoK limit sell, not an unbounded market
-    sell. The floor is read from the NO leg's own scanned entry — `nA` for the
-    same-title default used here (market_a is the NO leg)."""
+    """The NO-leg unwind is floored, never an unbounded market order: on the
+    legacy path the floor is the price of a fill-or-kill limit sell, and on V2
+    the same floor caps the immediate-or-cancel bid. The floor is read from
+    the NO leg's own scanned entry — `nA` for the same-title default used here
+    (market_a is the NO leg)."""
 
     def test_floor_is_entry_less_max_loss(self):
         spec = make_spec(nA=0.62)
@@ -1704,13 +1725,72 @@ class TestV2OrderBuilders:
             make_market("center_deci_edge_centi_cent", CENTER_DECI_EDGE_CENTI_BANDS)
         ) == Decimal("0.9999")
 
-    def test_all_legs_fill_or_kill(self):
+    def test_buy_legs_fill_or_kill_and_the_unwind_immediate_or_cancel(self):
+        # The two buy legs fill in full or not at all. The unwind is
+        # reduce_only, which the V2 endpoint accepts only with
+        # immediate_or_cancel, so it closes what it can and cancels the rest.
         spec = make_spec()
-        for body in (
-            _build_no_order_v2(_no_leg(spec)), _build_yes_order_v2(_yes_leg(spec)), _build_rollback_order_v2(_no_leg(spec)),
-        ):
-            assert body["time_in_force"] == "fill_or_kill"
+        no_body = _build_no_order_v2(_no_leg(spec))
+        yes_body = _build_yes_order_v2(_yes_leg(spec))
+        rollback_body = _build_rollback_order_v2(_no_leg(spec))
+        assert no_body["time_in_force"] == "fill_or_kill"
+        assert yes_body["time_in_force"] == "fill_or_kill"
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
+        assert rollback_body["reduce_only"] is True
+        for body in (no_body, yes_body, rollback_body):
             assert body["post_only"] is False
+
+    # Every value the V2 create-order endpoint documents for the fields it
+    # requires (https://docs.kalshi.com/api-reference/orders/create-order-v2).
+    # A body missing one is rejected with HTTP 400.
+    _V2_REQUIRED_FIELDS = {
+        "ticker", "side", "count", "price", "time_in_force", "self_trade_prevention_type",
+    }
+    _V2_SIDES = {"bid", "ask"}
+    _V2_TIME_IN_FORCE = {"fill_or_kill", "good_till_canceled", "immediate_or_cancel"}
+    _V2_SELF_TRADE_PREVENTION = {"taker_at_cross", "maker"}
+
+    @staticmethod
+    def _all_v2_bodies(spec) -> list[dict]:
+        """The three V2 bodies _execute_one can send for one spec."""
+        return [
+            _build_no_order_v2(_no_leg(spec)),
+            _build_yes_order_v2(_yes_leg(spec)),
+            _build_rollback_order_v2(_no_leg(spec)),
+        ]
+
+    def test_every_v2_body_carries_the_documented_required_fields(self):
+        for spec in (make_spec(), TestTimeSeriesLegOrder._ts_spec()):
+            for body in self._all_v2_bodies(spec):
+                assert self._V2_REQUIRED_FIELDS <= body.keys()
+                assert body["side"] in self._V2_SIDES
+                assert body["time_in_force"] in self._V2_TIME_IN_FORCE
+                assert body["self_trade_prevention_type"] in self._V2_SELF_TRADE_PREVENTION
+
+    def test_reduce_only_only_with_immediate_or_cancel(self):
+        # The docs, verbatim: "Orders with reduce_only set to true will be
+        # rejected unless time_in_force is immediate_or_cancel."
+        for structure, bands in (
+            ("linear_cent", None),
+            ("deci_cent", DECI_CENT_BANDS),
+            ("center_deci_edge_centi_cent", CENTER_DECI_EDGE_CENTI_BANDS),
+        ):
+            for spec in (
+                make_spec(structure=structure, ranges=bands),
+                TestTimeSeriesLegOrder._ts_spec(structure=structure, ranges=bands),
+            ):
+                for body in self._all_v2_bodies(spec):
+                    assert (
+                        not body["reduce_only"]
+                        or body["time_in_force"] == "immediate_or_cancel"
+                    )
+
+    def test_self_trade_prevention_type_comes_from_config(self, monkeypatch):
+        # The builders read the module binding of the config constant, so a
+        # change there reaches every V2 body.
+        monkeypatch.setattr(trader, "V2_SELF_TRADE_PREVENTION_TYPE", "maker")
+        for body in self._all_v2_bodies(make_spec()):
+            assert body["self_trade_prevention_type"] == "maker"
 
     def test_each_leg_carries_its_own_markets_shard(self):
         # Per-leg routing: a pair's two legs can live on different shards, so
@@ -1773,9 +1853,10 @@ class TestV2FillStatus:
         assert _v2_fill_status({"order": {"fill_count_fp": "0.00"}}, 10) == "canceled"
 
     def test_partial_fill_raises_for_ambiguous_path(self):
-        # A partial fill violates the fill-or-kill invariant, so the fill state
-        # is not trustworthy — raising routes _execute_one into the position
-        # lookup instead of reporting a clean fill or a clean kill.
+        # A partial fill is neither a clean fill nor a clean kill, so it raises.
+        # On a buy leg (fill-or-kill) that routes _execute_one into the
+        # position lookup; on the immediate-or-cancel unwind, _rollback_no_leg
+        # reports it as rollback_failed.
         with pytest.raises(ValueError):
             _v2_fill_status({"order": {"fill_count": 4}}, 10)
 
@@ -1790,6 +1871,147 @@ class TestV2FillStatus:
 
     def test_flat_response_accepted(self):
         assert _v2_fill_status({"fill_count": 10}, 10) == "executed"
+
+
+class TestIsFokKill:
+    """_is_fok_kill recognises exactly one response: HTTP 409 whose JSON body
+    carries the fill-or-kill kill code under ["error"]["code"]."""
+
+    def test_the_exchanges_kill_response_is_a_kill(self):
+        assert _is_fok_kill(fok_kill_error()) is True
+
+    def test_a_bytes_body_is_read_as_utf_8(self):
+        exc = ApiException(status=409, reason="Conflict", body=FOK_KILL_BODY.encode())
+        assert _is_fok_kill(exc) is True
+
+    def test_the_sdk_exception_for_a_409_response_is_a_kill(self):
+        # The exception the live transport really raises: _check_and_parse
+        # hands a 409 to ApiException.from_response, which raises the SDK's
+        # ConflictException subclass with the decoded body.
+        resp = SimpleNamespace(
+            status=409, reason="Conflict", data=FOK_KILL_BODY.encode("utf-8"),
+            getheaders=lambda: {"content-type": "application/json"},
+        )
+        with pytest.raises(ApiException) as exc_info:
+            _http._check_and_parse(resp)
+        assert type(exc_info.value) is not ApiException
+        assert _is_fok_kill(exc_info.value) is True
+
+    @pytest.mark.parametrize("exc", [
+        ApiException(status=409, reason="Conflict", body=None),
+        ApiException(status=409, reason="Conflict"),
+        ApiException(
+            status=409, reason="Conflict",
+            body='{"error":{"code":"insufficient_balance","message":"x"}}',
+        ),
+        ApiException(status=400, reason="Bad Request", body=FOK_KILL_BODY),
+        ApiException(status=409, reason="Conflict", body="not json"),
+        ApiException(status=409, reason="Conflict", body=""),
+        ApiException(status=409, reason="Conflict", body=b"\xff\xfe"),
+        ApiException(status=409, reason="Conflict", body=json.dumps([FOK_KILL_BODY])),
+        ApiException(
+            status=409, reason="Conflict",
+            body='{"error":"fill_or_kill_insufficient_resting_volume"}',
+        ),
+        ApiException(
+            status=409, reason="Conflict",
+            body='{"code":"fill_or_kill_insufficient_resting_volume"}',
+        ),
+        ApiException(status=409, reason="Conflict", body=123),
+        ApiException(status="409", reason="Conflict", body=FOK_KILL_BODY),
+        Exception(FOK_KILL_BODY),
+        TimeoutError("timeout"),
+    ], ids=[
+        "none-body", "no-body", "another-code", "status-400", "non-json",
+        "empty-body", "non-utf8-bytes", "json-list", "error-not-object",
+        "code-not-under-error", "int-body", "string-status", "plain-exception",
+        "timeout",
+    ])
+    def test_anything_else_is_not_a_kill(self, exc):
+        assert _is_fok_kill(exc) is False
+
+    def test_an_exception_that_is_not_an_api_exception_is_not_a_kill(self):
+        # Carrying the kill's status and body is not enough: only the SDK's
+        # ApiException comes from the exchange's HTTP response.
+        exc = Exception("look-alike")
+        exc.status = 409
+        exc.body = FOK_KILL_BODY
+        assert _is_fok_kill(exc) is False
+
+    def test_a_subclass_with_another_status_is_not_a_kill(self):
+        # The SDK's own 400 subclass carrying the kill code is still not the
+        # kill: the status and the code must both match.
+        from kalshi_python_sync.exceptions import BadRequestException
+        exc = BadRequestException(status=400, reason="Bad Request", body=FOK_KILL_BODY)
+        assert _is_fok_kill(exc) is False
+
+    def test_the_constants_are_the_observed_response(self):
+        # The wire values the exchange sent; config is the one place they live.
+        assert config.V2_FOK_KILL_HTTP_STATUS == 409
+        assert config.V2_FOK_KILL_ERROR_CODE == "fill_or_kill_insufficient_resting_volume"
+
+
+class TestSubmitOrderV2KillResponse:
+    """_submit_order_v2 returns the kill response to a fill_or_kill body as
+    "canceled", single-shot, and re-raises every other error."""
+
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
+
+    @pytest.mark.parametrize("builder, leg", [
+        (_build_no_order_v2, _no_leg), (_build_yes_order_v2, _yes_leg),
+    ], ids=["no-leg", "yes-leg"])
+    def test_a_killed_fill_or_kill_is_canceled(self, post, caplog, builder, leg):
+        body = builder(leg(make_spec()))
+        assert body["time_in_force"] == "fill_or_kill"
+        post.side_effect = fok_kill_error()
+        with caplog.at_level(logging.INFO):
+            assert _submit_order_v2(MagicMock(), body) == "canceled"
+        # One POST: the kill is an answer, never a reason to resubmit
+        assert post.call_count == 1
+        kill_lines = [r for r in caplog.records if "killed by the exchange" in r.getMessage()]
+        assert len(kill_lines) == 1
+        assert kill_lines[0].levelno == logging.INFO
+        line = kill_lines[0].getMessage()
+        for part in (
+            "409", "fill_or_kill_insufficient_resting_volume", body["ticker"],
+            body["side"], body["price"], body["count"], body["client_order_id"],
+        ):
+            assert part in line
+        # Nothing at WARNING or above: a kill is routine
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_the_same_response_to_the_unwind_raises(self, post):
+        # The immediate_or_cancel unwind never gets the fill-or-kill reading:
+        # an error on it stays an error, which _rollback_no_leg reports as
+        # rollback_failed.
+        body = _build_rollback_order_v2(_no_leg(make_spec()))
+        assert body["time_in_force"] == "immediate_or_cancel"
+        err = fok_kill_error()
+        post.side_effect = err
+        with pytest.raises(ApiException) as exc_info:
+            _submit_order_v2(MagicMock(), body)
+        assert exc_info.value is err
+        assert post.call_count == 1
+
+    @pytest.mark.parametrize("err", [
+        ApiException(
+            status=409, reason="Conflict",
+            body='{"error":{"code":"insufficient_balance","message":"x"}}',
+        ),
+        ApiException(status=400, reason="Bad Request", body=FOK_KILL_BODY),
+        ApiException(status=500, reason="Internal Server Error"),
+    ], ids=["409-another-code", "400-kill-code", "500"])
+    def test_any_other_error_raises(self, post, err):
+        post.side_effect = err
+        with pytest.raises(ApiException) as exc_info:
+            _submit_order_v2(MagicMock(), _build_no_order_v2(_no_leg(make_spec())))
+        assert exc_info.value is err
+        assert post.call_count == 1
 
 
 class TestV2ExecuteOne:
@@ -1831,6 +2053,10 @@ class TestV2ExecuteOne:
         assert rollback_body["ticker"] == "TICK-A"
         assert rollback_body["side"] == "bid"
         assert rollback_body["reduce_only"] is True
+        # reduce_only is accepted only with immediate_or_cancel, and every V2
+        # body carries the required self-trade-prevention field
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
+        assert rollback_body["self_trade_prevention_type"] == "taker_at_cross"
         # Loss-floored, not a flat top-of-grid bid: default spec nA=0.40 ->
         # floor 40-12=28c -> bid cap 1 - 0.28 = 0.72 on the $0.01 grid
         assert rollback_body["price"] == "0.7200"
@@ -1840,6 +2066,22 @@ class TestV2ExecuteOne:
         result = _execute_one(MagicMock(), make_spec())
         assert result.status == "rollback_failed"
         assert "rollback FoK not filled" in result.error
+
+    def test_v2_partial_unwind_is_rollback_failed(self, post, caplog):
+        # The immediate-or-cancel unwind closes 3 of the 5 NO contracts and
+        # cancels the rest. That is never reported as flat: the fill count
+        # makes _v2_fill_status raise, _rollback_no_leg reports
+        # rollback_failed, and no second order is sent.
+        post.side_effect = [v2_resp(5), v2_resp(0), v2_resp(3)]
+        with caplog.at_level(logging.CRITICAL):
+            result = _execute_one(MagicMock(), make_spec())
+        assert result.status == "rollback_failed"
+        assert "fill_count=3" in result.error
+        assert post.call_count == 3
+        assert any(
+            r.levelno == logging.CRITICAL and "up to 5 NO contracts" in r.getMessage()
+            for r in caplog.records
+        )
 
     def test_v2_leg_a_exception_with_position_is_unwound(self, post):
         post.side_effect = [TimeoutError("timeout"), v2_resp(5)]
@@ -1887,6 +2129,45 @@ class TestV2ExecuteOne:
         result = _execute_one(client, make_spec())
         assert result.status == "manual_review"
         assert post.call_count == 2
+
+    def test_v2_leg_a_kill_response_is_failed_at_once(self, post, monkeypatch, caplog):
+        # The exchange's HTTP 409 kill of the NO leg is a confirmed non-fill:
+        # the pair ends "failed" with no position read after the submission
+        # and no pause, and nothing is logged at ERROR.
+        slept: list = []
+        monkeypatch.setattr(trader.time, "sleep", lambda s: slept.append(s))
+        post.side_effect = [fok_kill_error()]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(None, None)
+        with caplog.at_level(logging.INFO):
+            result = _execute_one(client, make_spec())
+        assert result.status == "failed"
+        assert result.error == "NO leg FoK not filled: status=canceled"
+        assert post.call_count == 1
+        # The two up-front baselines only
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert slept == []
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_v2_leg_b_kill_response_rolls_back_at_once(self, post, monkeypatch):
+        # The exchange's HTTP 409 kill of the YES leg goes straight to the
+        # unwind: no position read after the submission and no pause before
+        # the rollback, which is immediate_or_cancel as always.
+        slept: list = []
+        monkeypatch.setattr(trader.time, "sleep", lambda s: slept.append(s))
+        post.side_effect = [v2_resp(5), fok_kill_error(), v2_resp(5)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(None, None)
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+        assert result.error == "YES leg FoK not filled: status=canceled"
+        assert post.call_count == 3
+        rollback_body = post.call_args_list[2].kwargs["body"]
+        assert rollback_body["ticker"] == "TICK-A"
+        assert rollback_body["reduce_only"] is True
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert slept == []
 
     def test_v2_exactly_one_post_per_leg_no_retry_on_5xx(self, post, monkeypatch):
         # A 5xx on an order submission must NEVER be retried: a second FoK
@@ -2208,7 +2489,7 @@ class TestOrderVersionDispatch:
         v2 = _build_rollback_order_any(_no_leg(spec))
         assert v2["side"] == "bid"
         assert v2["reduce_only"] is True
-        assert v2["time_in_force"] == "fill_or_kill"
+        assert v2["time_in_force"] == "immediate_or_cancel"
         assert v2["price"] == _format_price(
             Decimal("1") - Decimal(floor_cents) / Decimal("100")
         )
@@ -2597,12 +2878,16 @@ class TestPreExecutionCheckSettings:
 
 
 class TestSameTitleWireIdentity:
-    """Same-title orders must be BYTE-IDENTICAL to what the trader sent before
-    the time-series leg inversion: every field of every V2 body (except the
-    random client_order_id) and every field of every legacy request, pinned as
-    the literal values today's builders produce for make_spec()'s default
-    (x=5, nA=0.40, pB=0.35, shard 0). A same_title pair still buys NO on
-    market_a and YES on market_b, so nothing here may move."""
+    """Pins every field of every V2 body (except the random client_order_id)
+    and every field of every legacy request the builders produce for
+    make_spec()'s default same-title spec (x=5, nA=0.40, pB=0.35, shard 0), as
+    literal values, so nothing a same-title order sends can move by accident.
+    A same_title pair buys NO on market_a and YES on market_b.
+
+    Every V2 body carries self_trade_prevention_type (a required field of the
+    V2 create-order endpoint), and the reduce_only unwind is
+    immediate_or_cancel (the only time in force the endpoint accepts with
+    reduce_only)."""
 
     def test_v2_bodies_are_unchanged(self):
         spec = make_spec()
@@ -2613,17 +2898,20 @@ class TestSameTitleWireIdentity:
             uuid.UUID(body.pop("client_order_id"))
         assert no_body == {
             "ticker": "TICK-A", "side": "ask", "price": "0.5900", "count": "5.00",
-            "time_in_force": "fill_or_kill", "exchange_index": 0,
+            "time_in_force": "fill_or_kill",
+            "self_trade_prevention_type": "taker_at_cross", "exchange_index": 0,
             "reduce_only": False, "post_only": False,
         }
         assert yes_body == {
             "ticker": "TICK-B", "side": "bid", "price": "0.3600", "count": "5.00",
-            "time_in_force": "fill_or_kill", "exchange_index": 0,
+            "time_in_force": "fill_or_kill",
+            "self_trade_prevention_type": "taker_at_cross", "exchange_index": 0,
             "reduce_only": False, "post_only": False,
         }
         assert rollback_body == {
             "ticker": "TICK-A", "side": "bid", "price": "0.7200", "count": "5.00",
-            "time_in_force": "fill_or_kill", "exchange_index": 0,
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross", "exchange_index": 0,
             "reduce_only": True, "post_only": False,
         }
 
@@ -3095,3 +3383,474 @@ class TestNonObject2xxTransferResponse:
         with caplog.at_level(logging.CRITICAL):
             assert _execute_transfer(MagicMock(), 0, 1, 9662) is None
         assert [r for r in caplog.records if r.levelno == logging.CRITICAL] == []
+
+
+class _FakeClock:
+    """A clock and a sleep for driving a _WritePacer without real time.
+
+    `advance_on_sleep` decides whether a sleep moves the clock (one caller
+    at a time, as a single thread sees it) or leaves it where it is (every
+    caller arriving at the same instant, so each wait is its place in line).
+    """
+
+    def __init__(self, start: float = 0.0, *, advance_on_sleep: bool = True):
+        self.now = start
+        self.advance_on_sleep = advance_on_sleep
+        self.slept: list[float] = []
+        self._lock = threading.Lock()
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        with self._lock:
+            self.slept.append(seconds)
+            if self.advance_on_sleep:
+                self.now += seconds
+
+
+def _fake_pacer(rate, burst, clock: _FakeClock) -> _WritePacer:
+    """A _WritePacer on a fake clock."""
+    return _WritePacer(rate, burst, clock=clock.monotonic, sleep=clock.sleep)
+
+
+class TestWritePacer:
+    """The token bucket every order and transfer POST waits on: a burst of
+    `burst` writes back to back, then one every 1/rate seconds, callers
+    queued in the order they take its lock."""
+
+    def test_the_first_burst_does_not_wait(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        assert [pacer.acquire() for _ in range(3)] == [0.0, 0.0, 0.0]
+        assert clock.slept == []
+
+    def test_the_next_caller_waits_one_over_the_rate(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        for _ in range(3):
+            pacer.acquire()
+        assert pacer.acquire() == pytest.approx(0.25)
+        assert clock.slept == [pytest.approx(0.25)]
+
+    def test_queued_callers_wait_in_turn(self):
+        # Every caller arrives at the same instant: the k-th past the burst
+        # is admitted k/rate after it, so the waits accumulate.
+        clock = _FakeClock(advance_on_sleep=False)
+        pacer = _fake_pacer(4, 3, clock)
+        waits = [pacer.acquire() for _ in range(7)]
+        assert waits == [0.0, 0.0, 0.0,
+                         pytest.approx(0.25), pytest.approx(0.5),
+                         pytest.approx(0.75), pytest.approx(1.0)]
+
+    def test_a_caller_after_the_queue_drains_waits_only_its_own_turn(self):
+        # One caller sleeps its 0.25 s and the clock moves with it; the next
+        # caller arrives then and waits one more 1/rate, not the sum of both.
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 1, clock)
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == pytest.approx(0.25)
+        assert pacer.acquire() == pytest.approx(0.25)
+        assert clock.now == pytest.approx(0.5)
+
+    def test_tokens_refill_with_elapsed_time(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        for _ in range(3):
+            pacer.acquire()
+        clock.now = 0.5          # half a second at 4 a second refills 2 tokens
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == pytest.approx(0.25)
+
+    def test_the_refill_stops_at_the_burst(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        pacer.acquire()
+        clock.now = 1_000.0      # a long idle spell holds a full bucket, no more
+        assert [pacer.acquire() for _ in range(3)] == [0.0, 0.0, 0.0]
+        assert pacer.acquire() == pytest.approx(0.25)
+
+    def test_the_first_acquire_starts_the_clock(self):
+        # The pacer reads its clock for the first time on its first acquire,
+        # so it refills from there on whatever clock it was given — here one
+        # that starts at zero, far below the real monotonic clock.
+        clock = _FakeClock(start=0.0, advance_on_sleep=False)
+        pacer = _fake_pacer(1, 1, clock)
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == pytest.approx(1.0)
+        clock.now = 10.0
+        assert pacer.acquire() == 0.0
+
+    @pytest.mark.parametrize(
+        "rate", [0, -1, 0.0, float("nan"), float("inf"), True, "8", None],
+    )
+    def test_an_invalid_rate_raises(self, rate):
+        with pytest.raises(ValueError, match="rate"):
+            _WritePacer(rate, 8)
+
+    @pytest.mark.parametrize("burst", [0, -1, 1.5, 8.0, True, "8", None])
+    def test_an_invalid_burst_raises(self, burst):
+        with pytest.raises(ValueError, match="burst"):
+            _WritePacer(8, burst)
+
+    def test_the_shipped_pacer_uses_the_config_constants(self):
+        # conftest replaces trader._ORDER_WRITE_PACER per test, so the module's
+        # construction is checked through a fresh build of the same call.
+        pacer = _WritePacer(config.ORDER_WRITES_PER_SECOND, config.ORDER_WRITE_BURST)
+        assert pacer._rate == float(config.ORDER_WRITES_PER_SECOND)
+        assert pacer._burst == float(config.ORDER_WRITE_BURST)
+        assert trader.ORDER_WRITES_PER_SECOND == config.ORDER_WRITES_PER_SECOND
+        assert trader.ORDER_WRITE_BURST == config.ORDER_WRITE_BURST
+
+    def test_the_module_pacer_is_built_from_the_config_names(self):
+        # Read trader.py's syntax tree, not its text, so a comment or a
+        # docstring spelling the call cannot stand in for the assignment: the
+        # module binds _ORDER_WRITE_PACER exactly once at top level, to
+        # _WritePacer called with the two config names, positionally, and
+        # with nothing else — never a literal rate or burst.
+        tree = ast.parse(inspect.getsource(trader))
+        bindings = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            else:
+                continue
+            if any(isinstance(t, ast.Name) and t.id == "_ORDER_WRITE_PACER"
+                   for t in targets):
+                bindings.append(node)
+        assert len(bindings) == 1
+        (node,) = bindings
+        assert isinstance(node, ast.Assign) and len(node.targets) == 1
+        call = node.value
+        assert isinstance(call, ast.Call)
+        assert isinstance(call.func, ast.Name) and call.func.id == "_WritePacer"
+        assert [type(a) for a in call.args] == [ast.Name, ast.Name]
+        assert [a.id for a in call.args] == ["ORDER_WRITES_PER_SECOND", "ORDER_WRITE_BURST"]
+        assert call.keywords == []
+
+    def test_a_long_wait_is_logged_once(self, caplog):
+        clock = _FakeClock()
+        pacer = _fake_pacer(2, 1, clock)
+        pacer.acquire()
+        with caplog.at_level(logging.INFO):
+            assert pacer.acquire() == pytest.approx(0.5)
+        lines = [r for r in caplog.records if "Pacing order and transfer writes" in r.getMessage()]
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.INFO
+        assert "0.50s" in lines[0].getMessage()
+
+    def test_a_short_wait_is_not_logged(self, caplog):
+        clock = _FakeClock()
+        pacer = _fake_pacer(8, 1, clock)
+        pacer.acquire()
+        with caplog.at_level(logging.INFO):
+            assert pacer.acquire() == pytest.approx(0.125)
+        assert "Pacing order and transfer writes" not in caplog.text
+
+    def test_the_sleep_happens_outside_the_lock(self):
+        # One caller's wait must never stop another caller from taking its
+        # place in line, so the lock is released before the sleep.
+        held = []
+        clock = _FakeClock()
+        pacer = _WritePacer(
+            4, 1, clock=clock.monotonic,
+            sleep=lambda s: held.append(pacer._lock.locked()),
+        )
+        pacer.acquire()
+        pacer.acquire()
+        assert held == [False]
+
+    def test_concurrent_callers_each_get_their_own_place(self):
+        # 20 threads at one frozen instant: the lock must hand out 20 distinct
+        # places, so the waits are exactly 0 for the burst and then 1/rate,
+        # 2/rate, ... — a lost update would repeat a wait. A lost update is a
+        # race, which a run can miss, so the clock also records whether the
+        # lock is held each time the pacer reads it: acquire() reads the clock
+        # first thing in the block that updates the balance, so a reading
+        # taken without the lock means that block is not guarded.
+        clock = _FakeClock(advance_on_sleep=False)
+        rate, burst, callers = 4, 3, 20
+        lock_held: list[bool] = []
+
+        def locked_clock():
+            lock_held.append(pacer._lock.locked())
+            return clock.monotonic()
+
+        pacer = _WritePacer(rate, burst, clock=locked_clock, sleep=clock.sleep)
+        start = threading.Barrier(callers)
+        waits: list[float] = []
+        waits_lock = threading.Lock()
+
+        def run():
+            start.wait()
+            wait = pacer.acquire()
+            with waits_lock:
+                waits.append(wait)
+
+        threads = [threading.Thread(target=run) for _ in range(callers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        expected = [0.0] * burst + [k / rate for k in range(1, callers - burst + 1)]
+        assert sorted(waits) == [pytest.approx(w) for w in expected]
+        assert lock_held == [True] * callers
+
+    def test_real_threads_are_never_admitted_faster_than_the_bucket(self):
+        # Real time and real sleeps, at a rate high enough to finish at once.
+        # Each thread's admission time is the clock reading the pacer took
+        # under its lock plus the wait it returned, so the check reads the
+        # pacer's own schedule rather than when the OS happened to wake a
+        # thread. In any stretch from one admission to a later one, the
+        # bucket admits at most burst + rate * (stretch).
+        rate, burst, callers = 400.0, 4, 20
+        local = threading.local()
+
+        def clock():
+            local.now = time.monotonic()
+            return local.now
+
+        pacer = _WritePacer(rate, burst, clock=clock)
+        start = threading.Barrier(callers)
+        admitted: list[float] = []
+        returned: list[tuple[float, float]] = []
+        lock = threading.Lock()
+
+        def run():
+            start.wait()
+            wait = pacer.acquire()
+            done = time.monotonic()
+            with lock:
+                admitted.append(local.now + wait)
+                returned.append((local.now + wait, done))
+
+        threads = [threading.Thread(target=run) for _ in range(callers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(admitted) == callers
+        admitted.sort()
+        for i in range(callers):
+            for j in range(i, callers):
+                assert j - i + 1 <= burst + rate * (admitted[j] - admitted[i]) + 1e-6
+        # Nobody returned before its admission time: the sleep covered it
+        for due, done in returned:
+            assert done >= due - 1e-3
+
+
+class TestWritesArePaced:
+    """Every order and transfer POST takes one place on the pacer, before
+    the POST, and is still sent exactly once."""
+
+    @pytest.fixture
+    def events(self):
+        return []
+
+    @pytest.fixture
+    def pacer(self, monkeypatch, events):
+        """A stand-in pacer that records each acquire in `events`."""
+        mock = MagicMock()
+        mock.acquire.side_effect = lambda: events.append("acquire") or 0.0
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", mock)
+        return mock
+
+    @pytest.fixture
+    def post(self, monkeypatch, events):
+        """signed_request_json, recording each POST in `events`."""
+        mock = MagicMock()
+        replies: list = []
+
+        def answer(*args, **kwargs):
+            events.append("post")
+            reply = replies.pop(0)
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+        mock.side_effect = answer
+        mock.replies = replies
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
+
+    @staticmethod
+    def _too_many_requests() -> ApiException:
+        # The body the exchange sends with a 429
+        return ApiException(
+            status=429, reason="Too Many Requests",
+            body='{"error":{"code":"too_many_requests","message":"too many requests"}}',
+        )
+
+    def test_a_v2_order_waits_before_its_post(self, pacer, post, events):
+        post.replies.append(v2_resp(5))
+        assert _submit_order_v2(MagicMock(), _build_no_order_v2(_no_leg(make_spec()))) == "executed"
+        assert events == ["acquire", "post"]
+
+    def test_the_v2_log_line_is_written_after_the_wait(self, pacer, post, caplog):
+        # The "Submitting V2 order" line's time is the send time, so a pacing
+        # wait shows up as a gap before it, never between it and the POST.
+        logged_before_wait = []
+        pacer.acquire.side_effect = lambda: logged_before_wait.append(
+            "Submitting V2 order" in caplog.text
+        ) or 0.0
+        post.replies.append(v2_resp(5))
+        with caplog.at_level(logging.INFO):
+            _submit_order_v2(MagicMock(), _build_no_order_v2(_no_leg(make_spec())))
+        assert logged_before_wait == [False]
+        assert "Submitting V2 order" in caplog.text
+
+    def test_a_legacy_order_waits_before_its_post(self, pacer, events):
+        client = MagicMock()
+
+        def create(**kwargs):
+            events.append("post")
+            return order_resp("executed")
+
+        client.create_order_without_preload_content.side_effect = create
+        assert _submit_order(client, _build_no_order(_no_leg(make_spec()))) == "executed"
+        assert events == ["acquire", "post"]
+
+    def test_a_transfer_waits_before_its_post(self, pacer, post, events):
+        post.replies.append(transfer_resp("tr_9"))
+        assert _execute_transfer(MagicMock(), 1, 0, 1400) == "tr_9"
+        assert events == ["acquire", "post"]
+
+    def test_a_v2_kill_takes_one_place_and_one_post(self, pacer, post, events):
+        post.replies.append(fok_kill_error())
+        assert _submit_order_v2(MagicMock(), _build_no_order_v2(_no_leg(make_spec()))) == "canceled"
+        assert events == ["acquire", "post"]
+
+    def test_a_v2_429_takes_one_place_and_one_post_and_still_raises(
+        self, pacer, post, events,
+    ):
+        # Pacing is not a retry: a 429 that comes back anyway raises into the
+        # caller's ambiguous path exactly as before.
+        err = self._too_many_requests()
+        post.replies.append(err)
+        with pytest.raises(ApiException) as exc_info:
+            _submit_order_v2(MagicMock(), _build_yes_order_v2(_yes_leg(make_spec())))
+        assert exc_info.value is err
+        assert events == ["acquire", "post"]
+
+    def test_a_legacy_429_takes_one_place_and_one_post(self, pacer, events):
+        client = MagicMock()
+
+        def create(**kwargs):
+            events.append("post")
+            return SimpleNamespace(
+                status=429, reason="Too Many Requests",
+                data=b'{"error":{"code":"too_many_requests","message":"too many requests"}}',
+                getheaders=lambda: {"content-type": "application/json"},
+            )
+
+        client.create_order_without_preload_content.side_effect = create
+        with pytest.raises(ApiException):
+            _submit_order(client, _build_no_order(_no_leg(make_spec())))
+        assert events == ["acquire", "post"]
+
+    def test_a_transfer_429_takes_one_place_and_one_post(self, pacer, post, events):
+        post.replies.append(self._too_many_requests())
+        with pytest.raises(ApiException):
+            _execute_transfer(MagicMock(), 0, 1, 100)
+        assert events == ["acquire", "post"]
+
+    def test_a_429_on_the_yes_leg_paces_the_rollback_too(
+        self, pacer, post, events, v2_mode, v2_mapping_confirmed, monkeypatch,
+    ):
+        # One pair whose YES leg the exchange rejects with a 429: the position
+        # check finds nothing filled and the NO leg is unwound. Each of the
+        # three orders takes its own place on the pacer before its own POST,
+        # and none is sent twice.
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
+        post.replies.extend([v2_resp(5), self._too_many_requests(), v2_resp(5)])
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(
+            None,   # before_no
+            None,   # before_yes
+            None,   # after_yes — unmoved
+            None,   # lag re-read — still unmoved
+        )
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+        assert events == ["acquire", "post"] * 3
+        assert post.call_args_list[2].kwargs["body"]["reduce_only"] is True
+
+    def test_a_dry_run_takes_no_place(self, pacer):
+        results = execute_trades(MagicMock(), [make_spec()], dry_run=True)
+        assert [r.status for r in results] == ["simulated"]
+        pacer.acquire.assert_not_called()
+
+
+class TestExecuteTradesArePaced:
+    """execute_trades runs its pairs on concurrent workers, and every one of
+    their POSTs goes through the one shared pacer, so seven pairs' 14 orders
+    leave no faster than the account's write limit instead of inside one
+    second."""
+
+    RATE = 2
+    BURST = 2
+    PAIRS = 7
+
+    @staticmethod
+    def _specs(n: int) -> list:
+        """n specs on distinct tickers, like a real portfolio's."""
+        specs = []
+        for i in range(n):
+            spec = make_spec(title=f"pair {i}")
+            spec.pair.market_a.ticker = f"TICK-A{i}"
+            spec.pair.market_b.ticker = f"TICK-B{i}"
+            specs.append(spec)
+        return specs
+
+    def test_the_pairs_orders_are_spread_to_the_write_limit(
+        self, monkeypatch, v2_mode, v2_mapping_confirmed,
+    ):
+        # A frozen clock: every worker arrives at the same instant, so each
+        # order's admission time is exactly the wait the pacer gave it. Each
+        # worker records the wait of its own last acquire, and each POST reads
+        # it off that worker, which proves the POST came after the acquire.
+        clock = _FakeClock(advance_on_sleep=False)
+        shared = _fake_pacer(self.RATE, self.BURST, clock)
+        local = threading.local()
+
+        class _Recording:
+            def acquire(self):
+                wait = shared.acquire()
+                local.admitted = wait
+                return wait
+
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", _Recording())
+        admissions: list = []
+        lock = threading.Lock()
+
+        def post(client, method, path, body):
+            admitted = local.__dict__.pop("admitted", None)
+            with lock:
+                admissions.append(admitted)
+            return v2_resp(5)
+
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(
+            return_value=positions_resp()
+        )
+
+        results = execute_trades(client, self._specs(self.PAIRS), dry_run=False)
+
+        assert [r.status for r in results] == ["executed"] * self.PAIRS
+        orders = 2 * self.PAIRS
+        assert len(admissions) == orders
+        assert None not in admissions            # every POST had its own acquire
+        admissions.sort()
+        # The burst goes at once, then one order every 1/rate seconds
+        expected = [max(0.0, (i - self.BURST + 1) / self.RATE) for i in range(orders)]
+        assert admissions == [pytest.approx(a) for a in expected]
+        # No 1-second window holds more than burst + rate orders
+        for start in admissions:
+            in_window = [a for a in admissions if start <= a <= start + 1.0 + 1e-9]
+            assert len(in_window) <= self.BURST + self.RATE
+        # Each worker slept its own wait, outside the POST
+        assert sorted(clock.slept) == [pytest.approx(a) for a in expected if a > 0]

@@ -134,9 +134,11 @@ class TradeResult:
             delta, or — on the legacy order path — a spec refused before
             submission because a leg sits off the routable shard),
             "rolled_back" if the NO leg filled but the YES leg is confirmed
-            unfilled and the NO leg's unwind filled, "rollback_failed" if that
-            unwind itself did not fill (orphaned position requiring manual
-            review), or "manual_review" if a leg's fill state could not be
+            unfilled and the NO leg's unwind filled in full, "rollback_failed"
+            if that unwind itself did not fill or closed only part of the
+            position (the V2 unwind is immediate-or-cancel and can stop
+            part-way), leaving an orphaned position that needs manual review,
+            or "manual_review" if a leg's fill state could not be
             attributed to this order (the position lookup failed, the position
             moved by an unexplained amount, the NO-leg side mapping was
             disproven after the NO leg filled on the V2 path, or an unhandled
