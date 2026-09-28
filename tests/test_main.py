@@ -47,7 +47,9 @@ Notes:
     scalar — every mock of it here must return a dict, and _run_prod sizes on
     sum(...) of it.
 """
+import ast
 import dataclasses
+import inspect
 import json
 import logging
 import logging.handlers
@@ -71,6 +73,7 @@ from kalshi_betting.config import (
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
     EXIT_SKIPPED_LOW_BALANCE,
+    EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
     MIN_BALANCE_CENTS,
     MIN_PRICE_DIFF_LONG_GAP,
@@ -215,6 +218,17 @@ class TestNoPairsMsg:
         assert "tier floors off" in main._no_pairs_msg()
         monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", True)
         assert "tier floors on" in main._no_pairs_msg()
+
+    def test_a_run_that_did_not_search_time_series_says_so(self):
+        settings = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
+        searched = main._no_pairs_msg(settings=settings)
+        skipped = main._no_pairs_msg(settings=settings, time_series_searched=False)
+        assert skipped.startswith(
+            "No qualifying pairs found (time-series: not searched this run, because a "
+            "held market could not be identified (see the ERROR above)")
+        assert config.describe_time_series_rule(True, (0.0, 1.0)) not in skipped
+        # The same-title clause does not change
+        assert skipped.endswith(searched[searched.index(" — or same-title"):])
 
     def test_a_category_or_tag_filter_is_named_only_when_set(self):
         # A filter alone can empty the list: named when set, unmentioned when not
@@ -1301,6 +1315,8 @@ def _live_shape_client(
     order_side_effect=None,
     mve_bailout: bool = False,
     include_time_series: bool = False,
+    extra_events: tuple = (),
+    extra_held: tuple = (),
 ):
     """Build a MagicMock KalshiClient wired end-to-end with current-generation
     payload shapes over the fixed 4-group market set described above.
@@ -1345,6 +1361,8 @@ def _live_shape_client(
             the opt-in later-pricier time-series pair (TS-EARLY / TS-LATE)
             and the orderbook mock serves its depth. MUST default to False:
             the ingest-census pins in the replays count the fixed set.
+        extra_events (tuple): More events for the events page, after the rest.
+        extra_held (tuple): More tickers the account holds, beside HELD-A.
     """
     if mve_bailout:
         monkeypatch.setattr(scanner_mod, "INCLUDE_MVE_MARKETS", True)
@@ -1357,7 +1375,7 @@ def _live_shape_client(
     client.get_events_without_preload_content = MagicMock(
         return_value=_raw_events_page(_build_events(
             same_cheap_shard=same_cheap_shard, include_time_series=include_time_series,
-        ))
+        ) + list(extra_events))
     )
     if mve_bailout:
         # A non-None cursor on every page means only the consecutive-empty-
@@ -1381,7 +1399,7 @@ def _live_shape_client(
     held_payload = {
         "market_positions": (
             [{"ticker": _TICKER_HELD_A, "position_fp": "3.00"}] if include_held_position else []
-        ),
+        ) + [{"ticker": ticker, "position_fp": "2.00"} for ticker in extra_held],
         "cursor": None,
     }
     client.get_positions_without_preload_content = MagicMock(
@@ -2421,6 +2439,136 @@ class TestLiveSettingsReachEverySite:
         assert ("in sandbox" in line) is (mode == "dev")
 
 
+# A third deadline of the TS-EARLY / TS-LATE question, in an event of its own
+_TICKER_TS_MID = "TS-MID"
+_TS_MID_MARKET = _mk_market(
+    _TICKER_TS_MID, "EVT-TS-MID", "Will Z happen by December 6, 2026?", "Outcome",
+    "0.45", "0.55", price_level_structure="linear_cent", close_time="2026-12-06T00:00:00Z",
+)
+
+
+@pytest.mark.usefixtures("pinned_config_toggles")
+class TestRunProdHeldLadders:
+    """A production run makes no new time-series trade on a ladder it already
+    holds, whether or not the held market is in this run's market list. If a
+    held market cannot be looked up, the run makes no time-series trade at
+    all."""
+
+    @staticmethod
+    def _dry_run(client, monkeypatch, caplog, expected_code=EXIT_OK) -> list:
+        """Run a production dry run, check its exit code, and return the
+        simulated trades' results."""
+        captured: dict = {}
+
+        def fake_append_to_prod_log(results, balance_before, balance_after, *, run_note=""):
+            captured["results"] = results
+            return pathlib.Path("/fake/trade_log.xlsx")
+
+        monkeypatch.setattr(main, "append_to_prod_log", fake_append_to_prod_log)
+        with caplog.at_level(logging.INFO):
+            code = main._run_prod(client, _args(dry_run=True))
+        assert code == expected_code
+        return captured.get("results", [])
+
+    @staticmethod
+    def _traded(results) -> set:
+        return {(r.spec.pair.pair_type, r.spec.pair.market_a.ticker) for r in results}
+
+    def test_the_time_series_pair_trades_when_no_ladder_is_held(self, monkeypatch, caplog):
+        # control for the tests below: the same books trade both kinds of pair
+        client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD,
+                                    include_time_series=True)
+        results = self._dry_run(client, monkeypatch, caplog)
+        assert self._traded(results) == {("time_series", _TICKER_TS_EARLY),
+                                         ("same_title", _TICKER_SAME_EXP)}
+        # HELD-A is in the market list, so nothing was looked up
+        assert ("Open ladder exposure: 1 held market(s) in 1 event(s), asking 1 question(s) "
+                "(0 looked up") in caplog.text
+        client.get_market_without_preload_content.assert_not_called()
+
+    def test_a_run_that_holds_nothing_still_trades_time_series(self, monkeypatch, caplog):
+        # An empty held set is a lookup that worked, not one that failed
+        client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD,
+                                    include_time_series=True, include_held_position=False)
+        results = self._dry_run(client, monkeypatch, caplog)
+        assert ("time_series", _TICKER_TS_EARLY) in self._traded(results)
+        assert ("Open ladder exposure: 0 held market(s) in 0 event(s), asking 0 question(s) "
+                "(0 looked up") in caplog.text
+        assert "on a ladder we already hold" not in caplog.text
+
+    def test_a_held_rung_in_the_market_list_blocks_its_ladder(self, monkeypatch, caplog):
+        client = _live_shape_client(
+            monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True,
+            extra_events=(_ev("TS Event", _TS_MID_MARKET),), extra_held=(_TICKER_TS_MID,),
+        )
+        results = self._dry_run(client, monkeypatch, caplog)
+        # The same-title trade goes ahead; the time-series pair shares the held question
+        assert self._traded(results) == {("same_title", _TICKER_SAME_EXP)}
+        assert ("Open ladder exposure: 2 held market(s) in 2 event(s), asking 2 question(s) "
+                "(0 looked up") in caplog.text
+        assert ("Time-series candidates refused because one of their markets is on a "
+                "ladder we already hold (counted before every other check): 1") in caplog.text
+        client.get_market_without_preload_content.assert_not_called()
+
+    def test_a_held_rung_missing_from_the_market_list_is_looked_up(self, monkeypatch, caplog):
+        client = _live_shape_client(
+            monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True,
+            extra_held=(_TICKER_TS_MID,),
+        )
+        # The market is closed but not yet paid out, so the run's list lacks it
+        client.get_market_without_preload_content = MagicMock(
+            return_value=_raw_json_response({"market": {**_TS_MID_MARKET, "status": "closed"}}))
+        client.get_event_without_preload_content = MagicMock(
+            return_value=_raw_json_response({"event": {"event_ticker": "EVT-TS-MID",
+                                                       "title": "TS Event"}}))
+        results = self._dry_run(client, monkeypatch, caplog)
+        assert self._traded(results) == {("same_title", _TICKER_SAME_EXP)}
+        client.get_market_without_preload_content.assert_called_once_with(ticker=_TICKER_TS_MID)
+        client.get_event_without_preload_content.assert_called_once_with(
+            event_ticker="EVT-TS-MID")
+        assert "(1 looked up because this run's market list did not have them)" in caplog.text
+        assert ("ladder we already hold (counted before every other check): 1") in caplog.text
+
+    def test_a_failed_lookup_stops_every_time_series_trade(self, monkeypatch, caplog):
+        client = _live_shape_client(
+            monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True,
+            extra_held=("TS-GONE",),
+        )
+        client.get_market_without_preload_content = MagicMock(
+            return_value=_raw_json_response({"error": "not found"}, status=404,
+                                            reason="Not Found"))
+        # The run exits with its own code, so the scheduler's log says so too
+        results = self._dry_run(client, monkeypatch, caplog,
+                                expected_code=EXIT_TIME_SERIES_SKIPPED)
+        # Same-title trades still go through; no time-series pair is even searched for
+        assert self._traded(results) == {("same_title", _TICKER_SAME_EXP)}
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("Could not look up held market 'TS-GONE'" in e
+                   and "no time-series trade will be made this run" in e for e in errors), errors
+        assert "Time-series entry rule:" not in caplog.text
+        assert "Open ladder exposure" not in caplog.text
+
+    def test_a_failed_lookup_with_no_pair_says_time_series_was_not_searched(
+            self, monkeypatch, caplog):
+        client = _live_shape_client(
+            monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True,
+            extra_held=("TS-GONE",),
+        )
+        client.get_market_without_preload_content = MagicMock(
+            return_value=_raw_json_response({"error": "not found"}, status=404,
+                                            reason="Not Found"))
+        # No same-title pair either, so the run ends on its "no pairs" line
+        monkeypatch.setattr(main, "find_same_title_pairs", lambda markets, held: [])
+        assert self._dry_run(client, monkeypatch, caplog,
+                             expected_code=EXIT_TIME_SERIES_SKIPPED) == []
+        [line] = [r.getMessage() for r in caplog.records
+                  if r.getMessage().startswith("No qualifying pairs found")]
+        # The line does not describe a time-series rule the run never applied
+        assert ("time-series: not searched this run, because a held market could not "
+                "be identified") in line
+        assert "worded as cumulative deadlines" not in line
+
+
 def _args(dry_run: bool = False, max_horizon_days=None) -> SimpleNamespace:
     """Minimal stand-in for the argparse.Namespace _run_prod/_run_dev read."""
     return SimpleNamespace(dry_run=dry_run, max_horizon_days=max_horizon_days)
@@ -2681,6 +2829,82 @@ class TestRunProdExitCodes:
             code = main._run_prod(MagicMock(), _args())
 
         assert code == EXIT_OK
+
+
+class TestRunProdTimeSeriesSkippedCode:
+    """A production run that could not identify a held market makes no
+    time-series trade and exits EXIT_TIME_SERIES_SKIPPED, not EXIT_OK, so the
+    scheduler's own log says so. A trade that needs a human still wins."""
+
+    @staticmethod
+    def _run(monkeypatch, *, dry_run, status, held_ladders=None, same_title=True):
+        """Run _run_prod with every request stubbed and one same-title trade
+        (none when same_title is False) that ends with the given status;
+        return (exit code, the time-series finder's calls)."""
+        spec = make_spec()
+        ts_calls = []
+        monkeypatch.setattr(main, "verify_auth",
+                            lambda client: {DEFAULT_EXCHANGE_INDEX: 100_000})
+        monkeypatch.setattr(main, "get_held_tickers", lambda client: {"HELD-X"})
+        monkeypatch.setattr(main, "fetch_shard_statuses", lambda client: None)
+        monkeypatch.setattr(main, "fetch_open_events_with_markets",
+                            lambda client, inactive_shards: _stub_ingest())
+        monkeypatch.setattr(main, "resolve_held_ladders",
+                            lambda client, markets, held: held_ladders)
+        monkeypatch.setattr(main, "filter_markets_within_horizon", lambda m, d: m)
+        monkeypatch.setattr(main, "find_time_series_pairs",
+                            lambda *a, **k: ts_calls.append(k) or [])
+        monkeypatch.setattr(main, "find_same_title_pairs",
+                            lambda markets, held: [spec.pair] if same_title else [])
+        monkeypatch.setattr(main, "enrich_with_orderbook_prices",
+                            lambda client, pairs, balance, *, settings: pairs)
+        monkeypatch.setattr(main, "compute_trade", lambda pair, balance, *, settings: spec)
+        monkeypatch.setattr(main, "select_portfolio",
+                            lambda specs, balance, *, held_ladders: specs)
+        monkeypatch.setattr(main, "pre_execution_check",
+                            lambda client, portfolio, *, settings: portfolio)
+        monkeypatch.setattr(main, "execute_trades", lambda client, portfolio, *, dry_run: [
+            TradeResult(spec=s, status=status) for s in portfolio])
+        monkeypatch.setattr(main, "append_to_prod_log",
+                            lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"))
+        return main._run_prod(MagicMock(), _args(dry_run=dry_run)), ts_calls
+
+    @pytest.mark.parametrize("dry_run, status", [(True, "simulated"), (False, "executed")])
+    def test_a_failed_lookup_exits_with_its_own_code(self, monkeypatch, dry_run, status):
+        code, ts_calls = self._run(monkeypatch, dry_run=dry_run, status=status)
+        assert code == EXIT_TIME_SERIES_SKIPPED == 40
+        assert ts_calls == []
+
+    @pytest.mark.parametrize("dry_run, status", [(True, "simulated"), (False, "executed")])
+    def test_a_lookup_that_worked_still_exits_ok(self, monkeypatch, dry_run, status):
+        code, ts_calls = self._run(monkeypatch, dry_run=dry_run, status=status,
+                                   held_ladders=frozenset())
+        assert code == EXIT_OK
+        assert len(ts_calls) == 1
+
+    def test_a_trade_needing_a_human_wins(self, monkeypatch):
+        code, _ = self._run(monkeypatch, dry_run=False, status="manual_review")
+        assert code == EXIT_TRADES_NEED_ATTENTION
+
+    def test_no_pair_at_all_still_exits_with_its_own_code(self, monkeypatch):
+        code, _ = self._run(monkeypatch, dry_run=True, status="simulated", same_title=False)
+        assert code == EXIT_TIME_SERIES_SKIPPED
+
+    def test_every_clean_exit_after_the_lookup_uses_the_run_code(self):
+        # Every return in _run_prod after clean_exit is set returns it or the
+        # manual-review code, so no later path can report EXIT_OK instead.
+        tree = ast.parse(inspect.getsource(main._run_prod).lstrip())
+        fn = tree.body[0]
+        assigned = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "clean_exit"
+                            for t in n.targets)]
+        assert len(assigned) == 1
+        after = assigned[0].lineno
+        returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return) and n.lineno > after]
+        assert len(returns) >= 7
+        for ret in returns:
+            assert isinstance(ret.value, ast.Name), ast.dump(ret)
+            assert ret.value.id in {"clean_exit", "EXIT_TRADES_NEED_ATTENTION"}, ret.value.id
 
 
 class TestBlindRunReason:

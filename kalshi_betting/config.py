@@ -355,10 +355,10 @@ MAX_DEADLINE_GAP_DAYS         = 30
 # BOTH PATHS IMPLEMENT THIS since DR-73c: backtester._extract_pairs forms the
 # same pairs from a per-event sub-pass and _find_entry orders and gaps them on
 # the same stated deadlines, so a ladder-enabled backtest measures the strategy
-# a ladder-enabled live run would trade — with the one standing caveat the code
-# already records at backtester._simulate_at_discount's one-best dedup: the
-# backtest's one-best-per-group winner is the largest entry_monthly_ratio, not
-# the live finder's tradeable-then-largest-gap, so the two paths can replay
+# a ladder-enabled live run would trade — with one caveat: they pick the rung
+# differently (live: the largest pB - pA per group, before Kelly; backtest:
+# the Kelly-passing candidate with the largest entry_monthly_ratio whose
+# ladder is free, Monday by Monday). So the two paths can replay
 # DIFFERENT rungs of the same ladder (on the 2026-09-22 snapshot, with the tier
 # floors on and no band, the live funnel narrows 87 eligible ladder candidates
 # to 24 emitted, so that contest decides 63 of them). backtest.py's
@@ -839,6 +839,10 @@ EXIT_TRADES_NEED_ATTENTION    = 20
 # everything, found no edge": scheduler.run_job maps this to a WARNING, never
 # counts the weekly slot as satisfied, and retries it.
 EXIT_NO_TRADEABLE_SHARDS      = 30
+# No time-series trade: a held market's ladder could not be identified.
+# Same-title still ran, so the scheduler logs an ERROR but counts the slot as
+# done (a retry would most likely fail the same lookup).
+EXIT_TIME_SERIES_SKIPPED      = 40
 
 # ── API pagination ────────────────────────────────────────────────────────────
 

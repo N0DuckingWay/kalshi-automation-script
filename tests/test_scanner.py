@@ -6,11 +6,13 @@ import re
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
+from kalshi_python_sync.exceptions import ApiException
+from urllib3.exceptions import ProtocolError
 
-from kalshi_betting import config, scanner
+from kalshi_betting import _http, config, scanner
 from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
     INCLUDE_MVE_MARKETS,
@@ -38,11 +40,15 @@ from kalshi_betting.scanner import (
     find_same_title_pairs,
     find_time_series_pairs,
     inactive_shard_indexes,
+    ladder_keys,
     leg_prices,
     leg_sides,
+    market_ladder_keys,
     normalize_title,
     pair_key,
+    pair_ladder_keys,
     prefix_fill_prices,
+    resolve_held_ladders,
     tick_size_for_price,
     time_series_group_key,
     validate_pair_price,
@@ -1372,6 +1378,159 @@ class TestTimeSeriesGroupKey:
         assert time_series_group_key("Will BTC exceed $80k", "") == normalize_title(
             "Will BTC exceed $80k"
         )
+
+
+def _ingest_market(ticker, event_ticker, title, event_title, *, subtitle="",
+                   close="2026-06-01T00:00:00Z", yes_ask="0.50", no_ask="0.50"):
+    """Build a market exactly as the market list builds one."""
+    return _market_from_dict({
+        "ticker": ticker, "event_ticker": event_ticker, "title": title,
+        "yes_sub_title": subtitle, "status": "active", "close_time": close,
+        "yes_ask_dollars": yes_ask, "no_ask_dollars": no_ask,
+        "yes_bid_dollars": str(round(1.0 - float(no_ask), 4)),
+    }, event_title)
+
+
+def _question_of(market):
+    """The time-series finder's group key for one market."""
+    return time_series_group_key(pair_key(market), market.subtitle)
+
+
+def _question_label(market):
+    """The question label of one market: its group key as ladders compare it."""
+    return ("question", scanner._ladder_question(_question_of(market)))
+
+
+class TestLadderKeys:
+    """A ladder is one question asked at several deadlines. A market is on
+    the ladder of its event and on the ladder of its question."""
+
+    def test_each_label_is_tagged_with_its_kind(self):
+        assert ladder_keys("KXSENATEREC-26MAY", "senate recount") == frozenset({
+            ("event", "KXSENATEREC-26MAY"), ("question", "senate recount"),
+        })
+
+    def test_an_event_ticker_never_matches_a_question(self):
+        # The same text as an event and as a question is two labels
+        assert ladder_keys("SAME", "") & ladder_keys("", "SAME") == frozenset()
+
+    @pytest.mark.parametrize("blank", ["", None, 7, MagicMock()])
+    def test_blank_or_non_text_values_are_skipped(self, blank):
+        assert ladder_keys(blank, blank) == frozenset()
+        assert ladder_keys(blank, "q") == frozenset({("question", "q")})
+        assert ladder_keys("E-1", blank) == frozenset({("event", "E-1")})
+
+    def test_small_wording_differences_share_one_question_label(self):
+        # One question listed twice by the exchange, once without "the"
+        first = _ingest_market("KXVOTESAVEAMERICA-26-MAR20", "KXVOTESAVEAMERICA-26",
+                               "Will the Senate vote on SAVE America Act?",
+                               "When will the Senate vote on the SAVE America Act?",
+                               subtitle="Before Mar 20, 2026")
+        second = _ingest_market("KXVOTESAVEAMERICA-26MAR-MAR24", "KXVOTESAVEAMERICA-26MAR",
+                                "Will the Senate vote on the SAVE America Act?",
+                                "When will the Senate vote on the SAVE America Act?",
+                                subtitle="Before Mar 24, 2026")
+        assert _question_of(first) != _question_of(second)
+        assert market_ladder_keys(first) & market_ladder_keys(second) == frozenset({
+            _question_label(first),
+        })
+
+    @pytest.mark.parametrize("one, other", [
+        ("Will BTC exceed \u2018$80k\u2019?", "will btc exceed '$80k'"),
+        ("Who wins: Smith (R)?", "who wins smith r"),
+        ("An upset in the final", "upset in final"),
+    ])
+    def test_case_quotes_punctuation_and_articles_are_ignored(self, one, other):
+        assert ladder_keys("", one) == ladder_keys("", other)
+
+    @pytest.mark.parametrize("one, other", [
+        ("btc | $80,000 or above", "btc | $80,500 or above"),
+        ("rate | 1.5%", "rate | 15%"),
+        ("spacex starship 11th launch | will spacex launch another starship by",
+         "spacex starship 12th launch | will spacex launch another starship by"),
+        ("temperature | -5 or below", "temperature | 5 or below"),
+    ])
+    def test_different_questions_keep_different_labels(self, one, other):
+        assert ladder_keys("", one) != ladder_keys("", other)
+
+    def test_a_question_of_filler_alone_gives_no_label(self):
+        assert ladder_keys("E-1", "The ?") == frozenset({("event", "E-1")})
+
+    def test_a_mock_market_gets_no_event_label(self):
+        # A mock market's event ticker is not text, so it names no event
+        keys = market_ladder_keys(MagicMock())
+        assert not any(kind == "event" for kind, _ in keys)
+
+    def test_a_market_with_no_text_name_gets_no_question_label(self):
+        market = SimpleNamespace(ticker=None, event_ticker="E-1", title=None, subtitle=None)
+        assert market_ladder_keys(market) == frozenset({("event", "E-1")})
+
+    def test_an_event_title_alone_still_gives_a_question_label(self):
+        # The event title makes the name text even when the market has no title
+        market = SimpleNamespace(ticker="T", event_ticker="E-1", title=None, subtitle=None,
+                                 _event_title="Some Event")
+        assert _question_of(market)
+        assert market_ladder_keys(market) == frozenset({
+            ("event", "E-1"), _question_label(market),
+        })
+
+    @pytest.mark.parametrize("market", [
+        # One deadline of a question whose deadlines share one event
+        _ingest_market("KXSTAR-14-SEP23", "KXSTAR-14",
+                       "Will SpaceX launch another Starship before Sep 23, 2026?",
+                       "SpaceX Starship launches"),
+        # One deadline of a question listed as one event per deadline
+        _ingest_market("KXBTCMAX-26MAR01-80K", "KXBTCMAX-26MAR01",
+                       "Will BTC exceed $80k by March 1, 2026?", "Bitcoin record"),
+        # One option of a multi-choice event, named only by its label
+        _ingest_market("KXPRES-28-DJT", "KXPRES-28", "",
+                       "2028 Presidential Election Winner", subtitle="Donald Trump"),
+    ], ids=["same-event deadline", "cross-event deadline", "option label"])
+    def test_the_question_label_is_the_finders_group_key(self, market):
+        assert _question_of(market)
+        assert market_ladder_keys(market) == frozenset({
+            ("event", market.event_ticker), _question_label(market),
+        })
+
+    def test_two_deadlines_of_one_event_share_both_labels(self):
+        early = _ingest_market("KXSTAR-14-SEP23", "KXSTAR-14",
+                               "Will SpaceX launch another Starship before Sep 23, 2026?",
+                               "SpaceX Starship launches")
+        late = _ingest_market("KXSTAR-14-OCT16", "KXSTAR-14",
+                              "Will SpaceX launch another Starship before Oct 16, 2026?",
+                              "SpaceX Starship launches")
+        assert market_ladder_keys(early) == market_ladder_keys(late)
+
+    def test_two_options_of_one_event_share_only_the_event_label(self):
+        trump = _ingest_market("KXPRES-28-DJT", "KXPRES-28", "",
+                               "2028 Presidential Election Winner", subtitle="Donald Trump")
+        vance = _ingest_market("KXPRES-28-JDV", "KXPRES-28", "",
+                               "2028 Presidential Election Winner", subtitle="JD Vance")
+        assert market_ladder_keys(trump) & market_ladder_keys(vance) == frozenset({
+            ("event", "KXPRES-28"),
+        })
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_a_pair_the_finder_forms_shares_one_question_label(self):
+        # Two deadlines of one question, listed as two events
+        early = _ingest_market("KXBTCMAX-26MAR01-80K", "KXBTCMAX-26MAR01",
+                               "Will BTC exceed $80k by March 1, 2026?", "Bitcoin record",
+                               close="2026-03-01T00:00:00Z", yes_ask="0.30", no_ask="0.70")
+        late = _ingest_market("KXBTCMAX-26MAR11-80K", "KXBTCMAX-26MAR11",
+                              "Will BTC exceed $80k by March 11, 2026?", "Bitcoin record",
+                              close="2026-03-11T00:00:00Z", yes_ask="0.50", no_ask="0.50")
+        [pair] = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[early, late])
+        assert pair_ladder_keys(pair) == frozenset({
+            ("event", "KXBTCMAX-26MAR01"), ("event", "KXBTCMAX-26MAR11"),
+            _question_label(early),
+        })
+
+    def test_a_pair_has_the_labels_of_both_its_markets(self):
+        a = SimpleNamespace(ticker="A", event_ticker="E-A", title="Q one", subtitle="")
+        b = SimpleNamespace(ticker="B", event_ticker="E-B", title="Q two", subtitle="")
+        pair = SimpleNamespace(market_a=a, market_b=b)
+        assert pair_ladder_keys(pair) == market_ladder_keys(a) | market_ladder_keys(b)
+        assert len(pair_ladder_keys(pair)) == 4
 
 
 # One row per _CUMULATIVE_DEADLINE_PATTERNS[0] alternative (phrase, expected
@@ -5206,6 +5365,153 @@ class TestTimeSeriesBestPairPerGroup:
         assert pair.tradeable is True
 
 
+def _btc_market(ticker, event_ticker, day, *, strike="$80k", yes_ask, no_ask):
+    """One Bitcoin question at a March deadline, one event per deadline."""
+    return _ingest_market(ticker, event_ticker,
+                          f"Will BTC exceed {strike} by March {day}, 2026?", "Bitcoin record",
+                          close=f"2026-03-{day:02d}T00:00:00Z", yes_ask=yes_ask, no_ask=no_ask)
+
+
+_HELD_LINE = ("Time-series candidates refused because one of their markets is on a "
+              "ladder we already hold (counted before every other check): ")
+
+
+class TestFinderRefusesHeldLadders:
+    """No new time-series pair may use a market on a ladder we already hold.
+    Each test scans with the held market left out of the list, as a live run
+    does."""
+
+    @staticmethod
+    def _scan(markets, **kwargs):
+        # Explicit settings, so no test depends on the toggles config.py ships
+        return find_time_series_pairs(MagicMock(), held_tickers=set(), markets=markets,
+                                      settings=_live(), **kwargs)
+
+    def _btc_family(self):
+        """Three deadlines of one question, each in its own event."""
+        early = _btc_market("BTC-MAR01", "KXBTCMAX-26MAR01", 1, yes_ask="0.20", no_ask="0.80")
+        mid = _btc_market("BTC-MAR06", "KXBTCMAX-26MAR06", 6, yes_ask="0.35", no_ask="0.65")
+        late = _btc_market("BTC-MAR11", "KXBTCMAX-26MAR11", 11, yes_ask="0.70", no_ask="0.30")
+        return early, mid, late
+
+    def test_a_held_rung_refuses_every_pair_of_its_ladder(self, monkeypatch, caplog):
+        monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+        held = _ladder_rung("RUNG-HELD", "by March 10, 2026", yes_ask=0.40, no_ask=0.60,
+                            close=datetime(2026, 3, 10, tzinfo=UTC))
+        rungs = [
+            _ladder_rung("RUNG-EARLY", "by March 1, 2026", yes_ask=0.20, no_ask=0.80,
+                         close=datetime(2026, 3, 1, tzinfo=UTC)),
+            _ladder_rung("RUNG-MID", "by March 15, 2026", yes_ask=0.45, no_ask=0.55,
+                         close=datetime(2026, 3, 15, tzinfo=UTC)),
+            _ladder_rung("RUNG-LATE", "by March 20, 2026", yes_ask=0.60, no_ask=0.40,
+                         close=datetime(2026, 3, 20, tzinfo=UTC)),
+        ]
+        _assert_one_ladder_group(held, rungs[0])
+        # control: the rungs we do not hold pair on their own
+        assert len(self._scan(rungs)) == 1
+        with caplog.at_level(logging.INFO):
+            assert self._scan(rungs, held_ladders=market_ladder_keys(held)) == []
+        # All three candidates of the ladder are refused and counted
+        assert _HELD_LINE + "3" in caplog.text
+
+    def test_a_held_question_blocks_a_relisting_worded_slightly_differently(
+            self, monkeypatch, caplog):
+        monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+        # The exchange listed one question twice; the first listing drops "the"
+        held = _ingest_market("KXVOTESAVEAMERICA-26-MAR20", "KXVOTESAVEAMERICA-26",
+                              "Will the Senate vote on SAVE America Act?",
+                              "When will the Senate vote on the SAVE America Act?",
+                              subtitle="Before Mar 20, 2026", close="2026-03-20T00:00:00Z")
+        rungs = [_ingest_market(f"KXVOTESAVEAMERICA-26MAR-{day}", "KXVOTESAVEAMERICA-26MAR",
+                                "Will the Senate vote on the SAVE America Act?",
+                                "When will the Senate vote on the SAVE America Act?",
+                                subtitle=f"Before {label}, 2026", close=close,
+                                yes_ask=yes, no_ask=f"{1 - float(yes):.2f}")
+                 for day, label, close, yes in (
+                     ("MAR24", "Mar 24", "2026-03-24T00:00:00Z", "0.20"),
+                     ("APR01", "Apr 1", "2026-04-01T00:00:00Z", "0.45"))]
+        # control: the relisting's rungs pair on their own
+        assert len(self._scan(rungs)) == 1
+        with caplog.at_level(logging.INFO):
+            assert self._scan(rungs, held_ladders=market_ladder_keys(held)) == []
+        assert _HELD_LINE + "1" in caplog.text
+
+    def test_a_held_question_refuses_a_family_listed_as_one_event_per_deadline(self, caplog):
+        early, mid, late = self._btc_family()
+        # The same question at a later deadline, in an event not in this run's list
+        held = _btc_market("BTC-MAR21", "KXBTCMAX-26MAR21", 21, yes_ask="0.80", no_ask="0.20")
+        assert market_ladder_keys(held) & market_ladder_keys(early) == frozenset({
+            _question_label(early),
+        })
+        with caplog.at_level(logging.INFO):
+            assert self._scan([early, mid, late], held_ladders=market_ladder_keys(held)) == []
+        assert _HELD_LINE + "3" in caplog.text
+
+    def test_a_held_event_blocks_its_own_markets_and_promotes_the_runner_up(self, caplog):
+        early, mid, late = self._btc_family()
+        # control: the widest pair uses the Mar 1 market
+        [best] = self._scan([early, mid, late])
+        assert (best.market_a.ticker, best.market_b.ticker) == ("BTC-MAR01", "BTC-MAR11")
+        # We hold a different question in the Mar 1 event
+        held = _btc_market("BTC-90K-MAR01", "KXBTCMAX-26MAR01", 1, strike="$90k",
+                           yes_ask="0.10", no_ask="0.90")
+        assert _question_of(held) != _question_of(early)
+        with caplog.at_level(logging.INFO):
+            [pair] = self._scan([early, mid, late], held_ladders=market_ladder_keys(held))
+        # The two candidates on the Mar 1 market are refused, and the next best wins
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("BTC-MAR06", "BTC-MAR11")
+        assert _HELD_LINE + "2" in caplog.text
+
+    def test_a_held_event_of_the_later_market_blocks_it_too(self, caplog):
+        early, mid, late = self._btc_family()
+        # We hold a different question in the Mar 11 event, the later market's
+        held = _btc_market("BTC-90K-MAR11", "KXBTCMAX-26MAR11", 11, strike="$90k",
+                           yes_ask="0.10", no_ask="0.90")
+        assert _question_of(held) != _question_of(late)
+        with caplog.at_level(logging.INFO):
+            [pair] = self._scan([early, mid, late], held_ladders=market_ladder_keys(held))
+        # Both candidates using the Mar 11 market are refused; the Mar 1 / Mar 6 pair wins
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("BTC-MAR01", "BTC-MAR06")
+        assert _HELD_LINE + "2" in caplog.text
+
+    def test_an_empty_held_set_changes_nothing(self, caplog):
+        markets = list(self._btc_family())
+        with caplog.at_level(logging.INFO):
+            plain = self._scan(markets)
+            plain_log = caplog.text
+            caplog.clear()
+            explicit = self._scan(markets, held_ladders=frozenset())
+        assert explicit == plain and plain
+        assert caplog.text == plain_log
+        # Silent at zero
+        assert "on a ladder we already hold" not in plain_log
+
+    def test_an_unrelated_held_ladder_refuses_nothing_and_logs_nothing(self, caplog):
+        markets = list(self._btc_family())
+        unrelated = _ingest_market("RAIN-1", "KXRAIN-1", "Will it rain in NYC by March 1, 2026?",
+                                   "NYC weather")
+        with caplog.at_level(logging.INFO):
+            pairs = self._scan(markets, held_ladders=market_ladder_keys(unrelated))
+        assert pairs == self._scan(markets)
+        assert "on a ladder we already hold" not in caplog.text
+
+    def test_the_check_runs_before_every_other_check(self, monkeypatch, caplog):
+        # With the same-event switch off these rungs would be counted as held
+        # back by the switch; on a held ladder they are counted here instead
+        monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", False)
+        early = _ladder_rung("RUNG-EARLY", "by March 1, 2026", yes_ask=0.20, no_ask=0.80,
+                             close=datetime(2026, 3, 1, tzinfo=UTC))
+        late = _ladder_rung("RUNG-LATE", "by March 20, 2026", yes_ask=0.60, no_ask=0.40,
+                            close=datetime(2026, 3, 20, tzinfo=UTC))
+        # A third rung of the same ladder, the one we hold
+        held = _ladder_rung("RUNG-HELD", "by March 10, 2026", yes_ask=0.40, no_ask=0.60,
+                            close=datetime(2026, 3, 10, tzinfo=UTC))
+        with caplog.at_level(logging.INFO):
+            assert self._scan([early, late], held_ladders=market_ladder_keys(held)) == []
+        assert _HELD_LINE + "1" in caplog.text
+        assert "same-event deadline ladders are disabled" not in caplog.text
+
+
 class TestLegHelpers:
     """leg_sides / leg_prices / deadline_gap_days are the cross-module contract
     for which side each leg buys and what it costs."""
@@ -6088,6 +6394,298 @@ class TestMarketFromDictTagsExchangeIndex:
 
         untagged = _market_from_dict(_raw_market("SHARD-NONE", "Rain tomorrow"), "Weather Event")
         assert untagged.exchange_index == DEFAULT_EXCHANGE_INDEX
+
+
+def _json_reply(payload) -> SimpleNamespace:
+    """A successful raw reply carrying this JSON body."""
+    return SimpleNamespace(status=200, data=json.dumps(payload).encode())
+
+
+def _error_reply(status: int, reason: str) -> SimpleNamespace:
+    """A failed raw reply whose headers must never reach the log."""
+    return SimpleNamespace(
+        status=status, reason=reason, data=b'{"error": "nope"}',
+        getheaders=lambda: {"X-Header-Dump": "HEADER-DUMP"},
+    )
+
+
+_STAR_EVENT = "KXSTAR-14"
+_STAR_TITLE = "SpaceX Starship launches"
+
+
+def _star_raw(ticker: str, deadline: str, *, event_ticker: str = _STAR_EVENT) -> dict:
+    """One deadline of the Starship question, as the market reply sends it."""
+    return {
+        "ticker": ticker, "event_ticker": event_ticker, "status": "closed",
+        "title": f"Will SpaceX launch another Starship before {deadline}?",
+        "close_time": "2026-10-16T00:00:00Z",
+    }
+
+
+def _btc_raw(ticker: str, event_ticker: str, deadline: str, *,
+             strike: str = "$80,000 or above") -> dict:
+    """One strike of a Bitcoin question, one event per deadline, as the market reply sends it."""
+    return {
+        "ticker": ticker, "event_ticker": event_ticker, "status": "closed",
+        "title": f"Bitcoin high by {deadline}?", "yes_sub_title": strike,
+        "close_time": "2026-03-11T00:00:00Z",
+    }
+
+
+def _titled_client(raws: dict, titles: dict) -> MagicMock:
+    """A client that answers market lookups from `raws` and each event with its own title."""
+    client = MagicMock()
+    client.get_market_without_preload_content.side_effect = (
+        lambda ticker: _json_reply({"market": raws[ticker]})
+    )
+    client.get_event_without_preload_content.side_effect = (
+        lambda event_ticker: _json_reply(
+            {"event": {"event_ticker": event_ticker, "title": titles[event_ticker]}})
+    )
+    return client
+
+
+def _lookup_client(raws: dict, *, event_reply=None) -> MagicMock:
+    """A client that answers market lookups from `raws` and one event reply."""
+    client = MagicMock()
+    client.get_market_without_preload_content.side_effect = (
+        lambda ticker: _json_reply({"market": raws[ticker]})
+    )
+    client.get_event_without_preload_content.return_value = (
+        event_reply if event_reply is not None
+        else _json_reply({"event": {"event_ticker": _STAR_EVENT, "title": _STAR_TITLE}})
+    )
+    return client
+
+
+class TestResolveHeldLadders:
+    """The ladders we hold come from this run's market list, or from the
+    exchange for a held market the list lacks. A held market that can't be
+    identified gives None."""
+
+    def _listed(self):
+        """A deadline of the Starship question that is in this run's market list."""
+        return _ingest_market("KXSTAR-14-SEP23", _STAR_EVENT,
+                              "Will SpaceX launch another Starship before Sep 23, 2026?",
+                              _STAR_TITLE)
+
+    def test_a_held_market_in_the_list_needs_no_request(self, caplog):
+        held = self._listed()
+        client = MagicMock()
+        with caplog.at_level(logging.INFO):
+            keys = resolve_held_ladders(client, [held], {held.ticker})
+        assert keys == market_ladder_keys(held)
+        client.get_market_without_preload_content.assert_not_called()
+        client.get_event_without_preload_content.assert_not_called()
+        assert ("Open ladder exposure: 1 held market(s) in 1 event(s), asking 1 "
+                "question(s) (0 looked up") in caplog.text
+
+    def test_a_held_market_missing_from_the_list_is_looked_up(self, caplog):
+        raw = _star_raw("KXSTAR-14-OCT16", "Oct 16, 2026")
+        client = _lookup_client({raw["ticker"]: raw})
+        with caplog.at_level(logging.INFO):
+            keys = resolve_held_ladders(client, [self._listed()], {raw["ticker"]})
+        # The looked-up market lands on the same ladder as the listed one
+        assert keys == market_ladder_keys(self._listed())
+        client.get_market_without_preload_content.assert_called_once_with(
+            ticker=raw["ticker"])
+        client.get_event_without_preload_content.assert_called_once_with(
+            event_ticker=_STAR_EVENT)
+        assert "(1 looked up" in caplog.text
+
+    def test_the_event_title_is_what_makes_the_question_match(self):
+        # Without its event's title, the market asks a different question
+        raw = _star_raw("KXSTAR-14-OCT16", "Oct 16, 2026")
+        untitled = _market_from_dict(raw, "")
+        assert market_ladder_keys(untitled) != market_ladder_keys(self._listed())
+
+    def test_two_held_markets_of_one_event_cost_one_event_request(self):
+        raws = {t: _star_raw(t, d) for t, d in
+                (("KXSTAR-14-OCT16", "Oct 16, 2026"), ("KXSTAR-14-NOV30", "Nov 30, 2026"))}
+        client = _lookup_client(raws)
+        keys = resolve_held_ladders(client, [], set(raws))
+        assert keys == market_ladder_keys(self._listed())
+        assert client.get_market_without_preload_content.call_count == 2
+        client.get_event_without_preload_content.assert_called_once()
+
+    def test_an_event_without_a_title_reads_as_untitled(self):
+        # The market list reads a missing event title as "", and so does the lookup
+        raw = _star_raw("KXSTAR-14-OCT16", "Oct 16, 2026")
+        client = _lookup_client({raw["ticker"]: raw},
+                                event_reply=_json_reply({"event": {"event_ticker": _STAR_EVENT}}))
+        keys = resolve_held_ladders(client, [], {raw["ticker"]})
+        assert keys == market_ladder_keys(_market_from_dict(raw, ""))
+
+    def test_a_failed_market_lookup_gives_none_and_names_the_ticker(self, caplog):
+        client = MagicMock()
+        client.get_market_without_preload_content.return_value = _error_reply(404, "Not Found")
+        with caplog.at_level(logging.INFO):
+            keys = resolve_held_ladders(client, [], {"KXGONE-1"})
+        assert keys is None
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1 and "KXGONE-1" in errors[0]
+        assert "no time-series trade will be made this run" in errors[0]
+        assert "HTTP 404 Not Found" in caplog.text
+        # The failed reply's headers never reach the log
+        assert "HEADER-DUMP" not in caplog.text
+        assert "Open ladder exposure" not in caplog.text
+        client.get_event_without_preload_content.assert_not_called()
+
+    def test_a_failed_event_lookup_gives_none(self, caplog):
+        raw = _star_raw("KXSTAR-14-OCT16", "Oct 16, 2026")
+        client = _lookup_client({raw["ticker"]: raw},
+                                event_reply=_error_reply(404, "Not Found"))
+        with caplog.at_level(logging.INFO):
+            keys = resolve_held_ladders(client, [], {raw["ticker"]})
+        assert keys is None
+        assert any(r.levelno == logging.ERROR and raw["ticker"] in r.getMessage()
+                   for r in caplog.records)
+        assert "HEADER-DUMP" not in caplog.text
+
+    @pytest.mark.parametrize("body", [[], "ok", None, {}, {"market": None}, {"market": []}])
+    def test_a_reply_without_a_market_gives_none(self, body):
+        client = MagicMock()
+        client.get_market_without_preload_content.return_value = _json_reply(body)
+        assert resolve_held_ladders(client, [], {"KXODD-1"}) is None
+        client.get_event_without_preload_content.assert_not_called()
+
+    @pytest.mark.parametrize("body", [[], "ok", None, {}, {"event": None}, {"event": "x"}])
+    def test_a_reply_without_an_event_gives_none(self, body):
+        raw = _star_raw("KXSTAR-14-OCT16", "Oct 16, 2026")
+        client = _lookup_client({raw["ticker"]: raw}, event_reply=_json_reply(body))
+        assert resolve_held_ladders(client, [], {raw["ticker"]}) is None
+
+    @pytest.mark.parametrize("event_ticker", ["", None, 5])
+    def test_a_market_without_an_event_ticker_gives_none(self, event_ticker):
+        raw = _star_raw("KXSTAR-14-OCT16", "Oct 16, 2026", event_ticker=event_ticker)
+        client = _lookup_client({raw["ticker"]: raw})
+        assert resolve_held_ladders(client, [], {raw["ticker"]}) is None
+        client.get_event_without_preload_content.assert_not_called()
+
+    def test_a_held_position_with_no_ticker_gives_none_without_a_request(self, caplog):
+        client = MagicMock()
+        # Not even a listed market with a blank ticker identifies it
+        blank = _ingest_market("", _STAR_EVENT, "Will it rain by Oct 1, 2026?", _STAR_TITLE)
+        with caplog.at_level(logging.ERROR):
+            assert resolve_held_ladders(client, [self._listed(), blank], {""}) is None
+        client.get_market_without_preload_content.assert_not_called()
+        assert "Could not look up held market ''" in caplog.text
+
+    def test_the_first_failure_stops_further_requests(self):
+        client = MagicMock()
+        client.get_market_without_preload_content.return_value = _error_reply(404, "Not Found")
+        assert resolve_held_ladders(client, [], {"KXGONE-1", "KXGONE-2"}) is None
+        client.get_market_without_preload_content.assert_called_once_with(ticker="KXGONE-1")
+
+    def test_no_held_market_gives_no_labels_and_still_logs(self, caplog):
+        client = MagicMock()
+        with caplog.at_level(logging.INFO):
+            assert resolve_held_ladders(client, [self._listed()], set()) == frozenset()
+        client.get_market_without_preload_content.assert_not_called()
+        assert ("Open ladder exposure: 0 held market(s) in 0 event(s), asking 0 "
+                "question(s) (0 looked up") in caplog.text
+
+    def test_each_looked_up_market_gets_its_own_events_title(self, caplog):
+        # Two deadlines of one question in two events, and a market of a third event
+        raws = {
+            "KXBTCMAX-26MAR01-80K": _btc_raw("KXBTCMAX-26MAR01-80K", "KXBTCMAX-26MAR01",
+                                             "March 1, 2026"),
+            "KXBTCMAX-26MAR11-80K": _btc_raw("KXBTCMAX-26MAR11-80K", "KXBTCMAX-26MAR11",
+                                             "March 11, 2026"),
+            "KXSTAR-14-OCT16": _star_raw("KXSTAR-14-OCT16", "Oct 16, 2026"),
+        }
+        titles = {"KXBTCMAX-26MAR01": "Bitcoin record", "KXBTCMAX-26MAR11": "Bitcoin record",
+                  _STAR_EVENT: _STAR_TITLE}
+        client = _titled_client(raws, titles)
+        with caplog.at_level(logging.INFO):
+            keys = resolve_held_ladders(client, [], set(raws))
+        assert keys == frozenset().union(*(
+            market_ladder_keys(_market_from_dict(raw, titles[raw["event_ticker"]]))
+            for raw in raws.values()))
+        # One event request per event, each with that event's ticker
+        assert sorted(c.kwargs["event_ticker"] for c in
+                      client.get_event_without_preload_content.call_args_list) == sorted(titles)
+        # The two Bitcoin markets ask one question, so three events hold two questions
+        assert ("Open ladder exposure: 3 held market(s) in 3 event(s), asking 2 "
+                "question(s) (3 looked up") in caplog.text
+
+    def test_a_looked_up_market_keeps_its_outcome_label(self):
+        # The held $80,000 market is on the $80,000 question, not the $90,000 one
+        held = _btc_raw("KXBTCMAX-26MAR11-80K", "KXBTCMAX-26MAR11", "March 11, 2026")
+        listed_80 = _ingest_market("KXBTCMAX-26MAR01-80K", "KXBTCMAX-26MAR01",
+                                   "Bitcoin high by March 1, 2026?", "Bitcoin record",
+                                   subtitle="$80,000 or above")
+        listed_90 = _ingest_market("KXBTCMAX-26MAR01-90K", "KXBTCMAX-26MAR01",
+                                   "Bitcoin high by March 1, 2026?", "Bitcoin record",
+                                   subtitle="$90,000 or above")
+        assert _question_of(listed_80) != _question_of(listed_90)
+        client = _titled_client({held["ticker"]: held}, {"KXBTCMAX-26MAR11": "Bitcoin record"})
+        keys = resolve_held_ladders(client, [listed_80, listed_90], {held["ticker"]})
+        assert _question_label(listed_80) in keys
+        assert _question_label(listed_90) not in keys
+
+    def test_a_rate_limited_lookup_is_retried(self):
+        raw = _star_raw("KXSTAR-14-OCT16", "Oct 16, 2026")
+        client = MagicMock()
+        client.get_market_without_preload_content.side_effect = [
+            _error_reply(429, "Too Many Requests"), _json_reply({"market": raw})]
+        client.get_event_without_preload_content.side_effect = [
+            _error_reply(429, "Too Many Requests"),
+            _json_reply({"event": {"event_ticker": _STAR_EVENT, "title": _STAR_TITLE}})]
+        with patch.object(_http.time, "sleep"):
+            keys = resolve_held_ladders(client, [self._listed()], {raw["ticker"]})
+        assert keys == market_ladder_keys(self._listed())
+        assert client.get_market_without_preload_content.call_count == 2
+        assert client.get_event_without_preload_content.call_count == 2
+
+    def test_a_connection_failure_gives_none_and_names_its_cause(self, caplog):
+        client = MagicMock()
+        client.get_market_without_preload_content.side_effect = ProtocolError(
+            "Connection broken: IncompleteRead(0 bytes read)")
+        with patch.object(_http.time, "sleep"), caplog.at_level(logging.WARNING):
+            assert resolve_held_ladders(client, [], {"KXSTAR-14-OCT16"}) is None
+        assert any(r.levelno == logging.ERROR and "KXSTAR-14-OCT16" in r.getMessage()
+                   for r in caplog.records)
+        assert ("Could not look up held market KXSTAR-14-OCT16: ProtocolError: "
+                "Connection broken: IncompleteRead(0 bytes read)") in caplog.text
+
+
+class TestErrorText:
+    """A failed request is described in one short line, never with the
+    exchange's full error text."""
+
+    def test_an_http_error_gives_its_status_and_reason(self):
+        exc = ApiException(http_resp=_error_reply(404, "Not Found"))
+        assert scanner._error_text(exc) == "ApiException (HTTP 404 Not Found)"
+
+    def test_any_other_error_gives_only_the_first_line_of_its_message(self):
+        exc = ProtocolError("Connection broken\nX-Header-Dump: HEADER-DUMP")
+        assert scanner._error_text(exc) == "ProtocolError: Connection broken"
+
+    def test_an_error_with_no_message_gives_its_type(self):
+        assert scanner._error_text(KeyError()) == "KeyError"
+
+    @pytest.mark.parametrize("exc", [
+        ApiException(status=500, reason="x" * 500),
+        RuntimeError("y" * 500),
+    ], ids=["http error", "other error"])
+    def test_the_line_is_cut_at_160_characters(self, exc):
+        text = scanner._error_text(exc)
+        assert len(text) == 160
+        assert text.startswith(type(exc).__name__)
+
+    def test_an_error_whose_status_cannot_be_read_is_still_named(self):
+        class Broken(Exception):
+            @property
+            def status(self):
+                raise RuntimeError("boom")
+        assert scanner._error_text(Broken()) == "Broken"
+
+    def test_an_error_whose_message_cannot_be_read_is_still_named(self):
+        class Unprintable(Exception):
+            def __str__(self):
+                raise RuntimeError("boom")
+        assert scanner._error_text(Unprintable()) == "Unprintable"
 
 
 class TestFetchShardStatuses:

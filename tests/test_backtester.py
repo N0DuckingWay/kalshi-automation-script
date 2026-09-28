@@ -7949,10 +7949,10 @@ def _flipping_same_title_record() -> tuple[dict, dict, dict]:
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestKellyPicksTheEarliestPassingMonday:
-    """_simulate_at_discount enters each pair on its EARLIEST qualifying Monday
-    whose Kelly fraction is positive at the simulated k (DR-75) — the first
-    Monday the weekly live run could have entered it on — and everything
-    after the gate reads that Monday: its prices, its date and its legs.
+    """_simulate_at_discount enters a pair on its earliest qualifying Monday
+    that passes the Kelly gate at the simulated k and on which it can be
+    taken, and everything after the gate reads that Monday: its prices, its
+    date and its legs.
 
     The time-series Mondays are the golden tier-off ladder's quotes
     (TestTierFloorsOff): Q1 pA 0.20 / pB 0.45 / nB 0.55 (a 0.25 spread on a
@@ -8039,11 +8039,13 @@ class TestKellyPicksTheEarliestPassingMonday:
         point = self._sim([rec], k=0.85)
         (t,) = point.trades
         assert (t.entry_date, t.entry_pB, t.entry_nB) == (self._M1, 0.45, 0.55)
-        assert point.peak_kelly_fraction == pytest.approx(f1, abs=1e-12)
-        # ... exactly the first-Monday-alone simulation
+        # The peak counts the later passing Monday too
+        assert point.peak_kelly_fraction == pytest.approx(f2, abs=1e-12)
+        # ... and the trades match a simulation of the first Monday alone
         alone = self._sim([_without_later(rec)], k=0.85)
         assert [astuple(x) for x in point.trades] == [astuple(x) for x in alone.trades]
         pd.testing.assert_frame_equal(point.equity_df, alone.equity_df)
+        assert alone.peak_kelly_fraction == pytest.approx(f1, abs=1e-12)
 
     def test_no_passing_monday_drops_the_pair(self):
         rec = self._record(self._Q1, self._Q2, self._Q3)
@@ -8051,14 +8053,10 @@ class TestKellyPicksTheEarliestPassingMonday:
         point = self._sim([rec], k=0.95)
         assert point.trades == [] and point.peak_kelly_fraction == 0.0
 
-    def test_a_pair_no_monday_passes_never_reaches_its_group_contest(self):
-        # ONE group at k = 0.95. R_FAIL fails the gate on both of its Mondays
-        # (pA 0.30 / pB 0.90 / nB 0.15: Kelly about -0.083) but carries the
-        # larger ranking ratio (profit ratio about 1.17); R_PASS passes (pA
-        # 0.10 / pB 0.45 / nB 0.52: about +0.067, profit ratio about 0.57).
-        # The gate drops R_FAIL BEFORE the one-pair-per-group contest: kept
-        # to it, R_FAIL would win the group and Pass 2 could not size its
-        # negative fraction, so nothing would trade.
+    def test_a_pair_no_monday_passes_never_blocks_its_ladder(self):
+        # One ladder (both ask question "g") at k = 0.95. R_FAIL ranks higher
+        # but fails the gate on both Mondays; R_PASS passes. R_FAIL never
+        # becomes a candidate, so it never holds the ladder, and R_PASS trades.
         r_fail = self._record((self._M1, 0.90, 0.15), (self._M2, 0.90, 0.15), pA=0.30,
                               legs=self._legs("no", "no", tag="-F"), group_key="g")
         r_pass = self._record((self._M1, 0.45, 0.52), pA=0.10,
@@ -8086,9 +8084,10 @@ class TestKellyPicksTheEarliestPassingMonday:
         point = self._sim([rec], k=0.90)
         (t,) = point.trades
         assert (t.entry_date, t.entry_pB, t.entry_nB) == (self._M2, 0.60, 0.40)
-        # The peak is the CHOSEN Monday's fraction, never the best Monday's
-        assert point.peak_kelly_fraction == pytest.approx(f2, abs=1e-12)
-        assert point.peak_kelly_fraction < f3
+        assert t.kelly_fraction == pytest.approx(f2, abs=1e-12)
+        # The peak is the best passing Monday's fraction, not the traded one's
+        assert point.peak_kelly_fraction == pytest.approx(f3, abs=1e-12)
+        assert point.peak_kelly_fraction > f2
 
     def test_an_entry_without_later_is_one_monday(self):
         # Hand-built entries carry no "later": they simulate exactly as the
@@ -8126,15 +8125,12 @@ class TestKellyPicksTheEarliestPassingMonday:
         assert premise_lines(0.90, [_without_later(rec)]) == []
 
     def test_holding_days_and_ranking_use_the_chosen_monday(self):
-        # Two candidates in ONE group, which keeps the one with the larger
-        # entry_monthly_ratio = profit ratio x 30 / days from entry to the
-        # later close. R1 enters on Monday 2 (closing 03-20). R2 has Monday
-        # 2's prices on Monday 2 too, but closes 03-23, so its ratio falls
-        # between two readings of R1's ratio that differ only in where the
-        # horizon starts: R1's Monday 2 prices counted from its first Monday
-        # (74 days) and from Monday 2 (67). So R1 wins only if its horizon
-        # starts on the Monday it entered on — and it would lose on its first
-        # Monday's prices too.
+        # Two pairs on one ladder (both ask question "g"), both passing on
+        # Monday 2: the one with the larger monthly ratio trades and the
+        # ladder rule refuses the other. Both have Monday 2's prices; R2
+        # closes 03-23 and R1 03-20, so R2's ratio falls between R1's counted
+        # from its first Monday (74 days) and from Monday 2 (67). R1 wins only
+        # if its ratio is counted from the Monday it enters on.
         r1 = self._record(self._Q1, self._Q2, group_key="g")
         r2 = self._record(self._Q2, legs=self._legs(tag="-R2", close="2026-03-23"),
                           group_key="g")
@@ -8153,7 +8149,7 @@ class TestKellyPicksTheEarliestPassingMonday:
         assert all(f > 0 for f in self._kelly(r2, 0.90))
         point = self._sim([r1, r2], k=0.90)
         (t,) = point.trades
-        # R1 wins the group, on its chosen Monday
+        # R1 trades on its chosen Monday; R2 is refused on the ladder
         assert (t.ticker_a, t.entry_date) == ("EARLY", self._M2)
         # Held from the CHOSEN Monday to the later settlement (03-20)
         assert t.exit_date == close_1
@@ -8279,9 +8275,10 @@ class TestSplitHalvesKeepEachHalfOnItsSide:
 
     def test_neither_half_s_peak_exceeds_the_full_run_s(self):
         # The CapSweep invariant its shared copies of the halves rest on:
-        # every half candidate is on the Monday the full run chose, or absent.
-        # P qualifies before the split (Monday 1, a small fraction at 0.85)
-        # and after it (Monday 3, a larger one); R first qualifies on the split.
+        # each half's candidates are among the full run's. P qualifies before
+        # the split (Monday 1, a small fraction at 0.85) and after it (Monday
+        # 3, a larger one); R first qualifies on the split. Both ask one
+        # question, so they share a ladder.
         g = TestKellyPicksTheEarliestPassingMonday()
         p = g._record(g._Q1, g._Q3, legs=g._legs(tag="-P"))
         r = g._record(g._Q2, legs=g._legs(tag="-R"))
@@ -8294,11 +8291,16 @@ class TestSplitHalvesKeepEachHalfOnItsSide:
                 assert point.peak_kelly_fraction <= full.peak_kelly_fraction, k
             # ... and no H1 trade is ever dated in the second period
             assert all(t.entry_date < split for t in g._sim(h1, k=k).trades), k
-        # Not vacuous: re-listing P in H2 on its Mondays after the split would
-        # enter it there at Monday 3 and lift H2's peak above the full run's
-        relisted = {**p, "entry": dict(p["entry"]["later"][0], later=())}
+        # Not vacuous: at 0.85 the full run trades only P on Monday 1 (R is
+        # refused on the ladder), yet its peak is P's Monday 3 fraction.
+        # Re-listing P in H2 on Monday 3 gives H2 exactly that peak; were the
+        # full run's peak taken only from traded Mondays, H2's would exceed it
+        f1, f3 = g._kelly(p, 0.85)
         full = g._sim([p, r], k=0.85)
-        assert g._sim(h2 + [relisted], k=0.85).peak_kelly_fraction > full.peak_kelly_fraction
+        assert [(t.ticker_a, t.entry_date) for t in full.trades] == [("EARLY-P", g._M1)]
+        assert full.peak_kelly_fraction == pytest.approx(f3, abs=1e-12) and f3 > f1
+        relisted = {**p, "entry": dict(p["entry"]["later"][0], later=())}
+        assert g._sim(h2 + [relisted], k=0.85).peak_kelly_fraction == full.peak_kelly_fraction
 
     def test_a_cap_sweep_cell_s_halves_cut_h1_at_the_split(self):
         # CapSweep builds its lazy halves through _split_halves too. One pair
@@ -8449,8 +8451,8 @@ class TestCapSweepEntryEventsReadEveryMonday:
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestCalibrationReadsTheFirstMonday:
     """What always uses each pair's first qualifying Monday, whatever its
-    later Mondays hold (DR-75): the interval calibration (measuring at the
-    Monday the Kelly gate picks, which depends on k, would let k shape the
+    later Mondays hold: the interval calibration (measuring at the Monday a
+    simulation trades a pair on, which depends on k, would let k shape the
     very measurement meant to check it), the split date (every (spread band,
     k) scenario must split at one date) and the populations."""
 
@@ -8495,6 +8497,521 @@ class TestCalibrationReadsTheFirstMonday:
 
         assert shape(backtester._population_subsets(entries)) == shape(
             backtester._population_subsets(stripped))
+
+
+# ─── At most one open time-series trade per ladder, in the backtest ─────────
+
+_LADDER_M1, _LADDER_M2, _LADDER_M3 = date(2026, 1, 5), date(2026, 1, 12), date(2026, 1, 19)
+
+_LADDER_LINE = ("Time-series pairs skipped on a Monday because we still held a trade on "
+                "the same ladder (k=0.750, band 0-1, all): ")
+
+
+def _ladder_market(ticker: str, event: str, paid_out: str, *, result: str = "no") -> dict:
+    """One cached market that closes and pays out on `paid_out`. Its title
+    names the ticker, so no two markets ask the same question by accident."""
+    return {"ticker": ticker, "event_ticker": event, "title": f"Will {ticker} happen?",
+            "subtitle": "", "result": result,
+            "close_time": f"{paid_out}T00:00:00+00:00",
+            "settlement_ts": f"{paid_out}T12:00:00+00:00"}
+
+
+def _ladder_record(mA: dict, mB: dict, question: str, mondays) -> dict:
+    """A time-series record whose two markets ask `question`. Each Monday is a
+    date, quoted pA 0.20 / pB 0.60 / nB 0.40 (Kelly about +0.19 at k 0.75),
+    or a (date, pA, pB, nB) tuple with its own quotes."""
+    rows = []
+    for monday in mondays:
+        day, pA, pB, nB = monday if isinstance(monday, tuple) else (monday, 0.20, 0.60, 0.40)
+        rows.append({"entry_date": day, "pA": pA, "pB": pB, "nA": round(1.0 - pA, 4),
+                     "nB": nB, "mA": mA, "mB": mB, "gap_days": 10})
+    first, *rest = rows
+    return {"pair_type": "time_series", "canon": question, "group_key": question,
+            "entry": {**first, "later": tuple(rest)}}
+
+
+def _ladder_same_title(mA: dict, mB: dict, mondays) -> dict:
+    """A same-title record qualifying on each of `mondays`, market A the
+    pricier at YES 0.70 against B's 0.40 (legs nA 0.30 and pB 0.40, Kelly
+    about +0.81)."""
+    rows = [{"entry_date": day, "pA": 0.70, "pB": 0.40, "nA": 0.30, "nB": 0.60,
+             "mA": mA, "mB": mB, "gap_days": None} for day in mondays]
+    first, *rest = rows
+    return {"pair_type": "same_title", "canon": "Q", "group_key": ("EV", "Q", mA["ticker"]),
+            "entry": {**first, "later": tuple(rest)}}
+
+
+def _traded(point) -> list[tuple[str, date]]:
+    """(market A's ticker, entry date) of every trade, in order."""
+    return [(t.ticker_a, t.entry_date) for t in point.trades]
+
+
+@pytest.mark.usefixtures("pre_toggle_defaults")
+class TestOpenLadderExposure:
+    """_simulate_at_discount holds at most one open time-series trade per
+    ladder. A ladder is one question asked at several deadlines: two markets
+    are on one ladder when they share an event or ask the same question once
+    the dates are removed. A time-series pair is skipped on a Monday while an
+    open trade of either kind has a market on one of its ladders, and is
+    tried again on its next passing Monday; a same-title pair is not. A
+    market frees its ladders on the day it pays out. Figures are at
+    pre_toggle_defaults (k 0.75, a 20% cap)."""
+
+    _START = date(2026, 1, 1)
+
+    def _sim(self, records, **kw):
+        return backtester._simulate_at_discount(records, self._START, 10_000.0,
+                                                 end_date=date(2026, 4, 1), **kw)
+
+    @staticmethod
+    def _ladder_lines(caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("Time-series pairs skipped on a Monday")]
+
+    def test_a_second_rung_waits_until_the_first_trade_pays_out(self, caplog):
+        # P1 and P2 are pairs of one event's rungs. P1 ranks first on Monday 1
+        # (it closes sooner) and pays out on Monday 3's day
+        p1 = _ladder_record(_ladder_market("P1A", "LAD-1", "2026-01-19"),
+                            _ladder_market("P1B", "LAD-1", "2026-01-19"), "lad", [_LADDER_M1])
+        p2 = _ladder_record(_ladder_market("P2A", "LAD-1", "2026-03-20"),
+                            _ladder_market("P2B", "LAD-1", "2026-03-20"), "lad",
+                            [_LADDER_M1, _LADDER_M2, _LADDER_M3])
+        with caplog.at_level(logging.INFO):
+            point = self._sim([p2, p1])
+        # P2 is skipped on Mondays 1 and 2, and traded on Monday 3
+        assert _traded(point) == [("P1A", _LADDER_M1), ("P2A", _LADDER_M3)]
+        assert self._ladder_lines(caplog) == [_LADDER_LINE + "2"]
+        # ... sized on Monday 3's cash, which P1's payout has refilled
+        assert point.trades[1].balance_at_entry > point.trades[0].balance_at_entry
+        # CONTROL: alone, P2 trades on its first Monday
+        assert _traded(self._sim([p2])) == [("P2A", _LADDER_M1)]
+        # A quiet run logs the count at DEBUG only
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            self._sim([p2, p1], quiet=True)
+        (record,) = [r for r in caplog.records
+                     if r.getMessage().startswith("Time-series pairs skipped on a Monday")]
+        assert record.levelno == logging.DEBUG
+
+    def test_a_shared_event_blocks_a_pair_asking_another_question(self, caplog):
+        p1 = _ladder_record(_ladder_market("P1A", "EVA-1", "2026-02-20"),
+                            _ladder_market("P1B", "EVB-1", "2026-02-20"), "q1", [_LADDER_M1])
+        # P2's market A sits in P1's market A's event
+        p2 = _ladder_record(_ladder_market("P2A", "EVA-1", "2026-03-20"),
+                            _ladder_market("P2B", "EVC-1", "2026-03-20"), "q2",
+                            [_LADDER_M1, _LADDER_M2])
+        with caplog.at_level(logging.INFO):
+            point = self._sim([p1, p2])
+        assert _traded(point) == [("P1A", _LADDER_M1)]
+        assert self._ladder_lines(caplog) == [_LADDER_LINE + "2"]
+        # CONTROL: a market in P1's market B's event is blocked too; one in
+        # neither of P1's events is not
+        p3 = _ladder_record(_ladder_market("P3A", "EVD-1", "2026-03-20"),
+                            _ladder_market("P3B", "EVB-1", "2026-03-20"), "q3", [_LADDER_M2])
+        p4 = _ladder_record(_ladder_market("P4A", "EVE-1", "2026-03-20"),
+                            _ladder_market("P4B", "EVF-1", "2026-03-20"), "q4", [_LADDER_M2])
+        assert _traded(self._sim([p1, p3, p4])) == [("P1A", _LADDER_M1), ("P4A", _LADDER_M2)]
+
+    def test_one_question_across_events_is_one_ladder(self, caplog):
+        p1 = _ladder_record(_ladder_market("P1A", "EVA-1", "2026-02-20"),
+                            _ladder_market("P1B", "EVB-1", "2026-02-20"), "q", [_LADDER_M1])
+        p2 = _ladder_record(_ladder_market("P2A", "EVC-1", "2026-03-20"),
+                            _ladder_market("P2B", "EVD-1", "2026-03-20"), "q",
+                            [_LADDER_M1, _LADDER_M2])
+        with caplog.at_level(logging.INFO):
+            assert _traded(self._sim([p1, p2])) == [("P1A", _LADDER_M1)]
+        assert self._ladder_lines(caplog) == [_LADDER_LINE + "2"]
+        # CONTROL: the same pair asking another question trades beside P1
+        other = {**p2, "group_key": "other"}
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert _traded(self._sim([p1, other])) == [("P1A", _LADDER_M1),
+                                                       ("P2A", _LADDER_M1)]
+        assert self._ladder_lines(caplog) == []
+
+    def test_a_question_worded_slightly_differently_is_one_ladder(self, caplog):
+        # One question listed twice, once without "the"
+        p1 = _ladder_record(_ladder_market("P1A", "EVA-1", "2026-02-20"),
+                            _ladder_market("P1B", "EVB-1", "2026-02-20"),
+                            "will the senate vote on save america act?", [_LADDER_M1])
+        p2 = _ladder_record(_ladder_market("P2A", "EVC-1", "2026-03-20"),
+                            _ladder_market("P2B", "EVD-1", "2026-03-20"),
+                            "will the senate vote on the save america act?",
+                            [_LADDER_M1, _LADDER_M2])
+        with caplog.at_level(logging.INFO):
+            assert _traded(self._sim([p1, p2])) == [("P1A", _LADDER_M1)]
+        assert self._ladder_lines(caplog) == [_LADDER_LINE + "2"]
+
+    def test_a_ladder_is_free_again_on_the_day_its_trade_pays_out(self):
+        # Paid out on Monday 2's day frees the ladder for Monday 2; a day
+        # later frees it for Monday 3
+        for paid_out, taken_on in (("2026-01-12", _LADDER_M2), ("2026-01-13", _LADDER_M3)):
+            p1 = _ladder_record(_ladder_market("P1A", "EVA-1", paid_out),
+                                _ladder_market("P1B", "EVB-1", paid_out), "q", [_LADDER_M1])
+            p2 = _ladder_record(_ladder_market("P2A", "EVC-1", "2026-03-20"),
+                                _ladder_market("P2B", "EVD-1", "2026-03-20"), "q",
+                                [_LADDER_M1, _LADDER_M2, _LADDER_M3])
+            assert _traded(self._sim([p1, p2])) == [("P1A", _LADDER_M1), ("P2A", taken_on)]
+
+    def test_each_market_frees_its_own_ladders_when_it_pays_out(self, caplog):
+        # P1's market A (event EVA-1) pays out on 01-10 and its market B
+        # (event EVB-1) on 02-20; both ask question "q". On Monday 2 A's event
+        # is free while B's event and the question are still held.
+        p1 = _ladder_record(_ladder_market("P1A", "EVA-1", "2026-01-10"),
+                            _ladder_market("P1B", "EVB-1", "2026-02-20"), "q", [_LADDER_M1])
+        on_a_event = _ladder_record(_ladder_market("P2A", "EVA-1", "2026-03-20"),
+                                    _ladder_market("P2B", "EVZ-1", "2026-03-20"), "q2",
+                                    [_LADDER_M2])
+        on_question = _ladder_record(_ladder_market("P3A", "EVC-1", "2026-03-20"),
+                                     _ladder_market("P3B", "EVD-1", "2026-03-20"), "q",
+                                     [_LADDER_M2, _LADDER_M3])
+        on_b_event = _ladder_record(_ladder_market("P4A", "EVB-1", "2026-03-20"),
+                                    _ladder_market("P4B", "EVY-1", "2026-03-20"), "q4",
+                                    [_LADDER_M2, _LADDER_M3])
+        with caplog.at_level(logging.INFO):
+            point = self._sim([p1, on_a_event, on_question, on_b_event])
+        assert _traded(point) == [("P1A", _LADDER_M1), ("P2A", _LADDER_M2)]
+        assert self._ladder_lines(caplog) == [_LADDER_LINE + "4"]
+
+    def test_a_pair_trades_at_most_once(self, caplog):
+        # P's markets pay out on 01-10, before its Monday 3, so only the
+        # trade-once rule stops it there
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-01-10"),
+                           _ladder_market("PB", "EVB-1", "2026-01-10"), "q",
+                           [_LADDER_M1, _LADDER_M3])
+        assert _traded(self._sim([p])) == [("PA", _LADDER_M1)]
+        # A pair already traded is skipped before the ladder check, so it is
+        # not counted: Q takes the ladder on Monday 2 and P's Monday 3 is
+        # skipped uncounted
+        q = _ladder_record(_ladder_market("QA", "EVC-1", "2026-03-20"),
+                           _ladder_market("QB", "EVD-1", "2026-03-20"), "q", [_LADDER_M2])
+        with caplog.at_level(logging.INFO):
+            assert _traded(self._sim([p, q])) == [("PA", _LADDER_M1), ("QA", _LADDER_M2)]
+        assert self._ladder_lines(caplog) == []
+
+    def test_of_two_pairs_on_one_ladder_on_one_monday_the_better_ratio_trades(self, caplog):
+        # Same quotes; HI closes sooner, so its monthly ratio is larger
+        lo = _ladder_record(_ladder_market("LOA", "EVA-1", "2026-03-20"),
+                            _ladder_market("LOB", "EVB-1", "2026-03-20"), "q", [_LADDER_M1])
+        hi = _ladder_record(_ladder_market("HIA", "EVC-1", "2026-02-01"),
+                            _ladder_market("HIB", "EVD-1", "2026-02-01"), "q", [_LADDER_M1])
+        for records in ([lo, hi], [hi, lo]):
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                assert _traded(self._sim(records)) == [("HIA", _LADDER_M1)]
+            assert self._ladder_lines(caplog) == [_LADDER_LINE + "1"]
+
+    def test_a_time_series_pair_short_of_cash_is_tried_again_and_a_same_title_one_is_not(self):
+        # At k 0.40 with no size cap each pair takes over half the balance, so
+        # once X (ranked first, paying out on 01-11) trades on Monday 1,
+        # neither Y nor S fits beside it. Each pair is on its own ladder.
+        x = _ladder_record(_ladder_market("XA", "EVX-1", "2026-01-11"),
+                           _ladder_market("XB", "EVX-2", "2026-01-11"), "x", [_LADDER_M1])
+        y = _ladder_record(_ladder_market("YA", "EVY-1", "2026-03-20"),
+                           _ladder_market("YB", "EVY-2", "2026-03-20"), "y",
+                           [_LADDER_M1, _LADDER_M2])
+        s = _ladder_same_title(_ladder_market("SA", "EVS-1", "2026-03-20"),
+                               _ladder_market("SB", "EVS-2", "2026-03-20", result="yes"),
+                               [_LADDER_M1, _LADDER_M2])
+        run = {"k": 0.40, "size_cap": 1.0}
+        # Y is skipped for cash on Monday 1 and taken on Monday 2
+        assert _traded(self._sim([x, y], **run)) == [("XA", _LADDER_M1), ("YA", _LADDER_M2)]
+        assert _traded(self._sim([y], **run)) == [("YA", _LADDER_M1)]
+        # S is skipped on Monday 1 and never tried again ...
+        assert _traded(self._sim([x, s], **run)) == [("XA", _LADDER_M1)]
+        assert _traded(self._sim([s], **run)) == [("SA", _LADDER_M1)]
+        # ... though, listed from Monday 2, it fits there
+        s_from_2 = _ladder_same_title(s["entry"]["mA"], s["entry"]["mB"], [_LADDER_M2])
+        assert _traded(self._sim([x, s_from_2], **run)) == [("XA", _LADDER_M1),
+                                                             ("SA", _LADDER_M2)]
+
+    def test_an_open_same_title_trade_blocks_a_time_series_pair_and_not_the_reverse(
+        self, caplog,
+    ):
+        s = _ladder_same_title(_ladder_market("SA", "EVS-1", "2026-02-20"),
+                               _ladder_market("SB", "EVT-1", "2026-02-20", result="yes"),
+                               [_LADDER_M1])
+        t = _ladder_record(_ladder_market("TA", "EVS-1", "2026-03-20"),
+                           _ladder_market("TB", "EVU-1", "2026-03-20"), "t",
+                           [_LADDER_M2, _LADDER_M3])
+        with caplog.at_level(logging.INFO):
+            assert _traded(self._sim([s, t])) == [("SA", _LADDER_M1)]
+        assert self._ladder_lines(caplog) == [_LADDER_LINE + "2"]
+        assert _traded(self._sim([t])) == [("TA", _LADDER_M2)]
+        # The reverse: an open time-series trade never holds a same-title pair back
+        t2 = _ladder_record(_ladder_market("T2A", "EVV-1", "2026-03-20"),
+                            _ladder_market("T2B", "EVW-1", "2026-03-20"), "t2", [_LADDER_M1])
+        s2 = _ladder_same_title(_ladder_market("S2A", "EVV-1", "2026-02-20"),
+                                _ladder_market("S2B", "EVX-1", "2026-02-20", result="yes"),
+                                [_LADDER_M2])
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert _traded(self._sim([t2, s2])) == [("T2A", _LADDER_M1), ("S2A", _LADDER_M2)]
+        assert self._ladder_lines(caplog) == []
+
+    def test_both_same_title_markets_hold_their_event_and_their_question(self, caplog):
+        # An open same-title trade holds market B's event as well as A's: TB
+        # shares only SB's event and is refused on Mondays 2 and 3
+        s = _ladder_same_title(_ladder_market("SA", "EVS-1", "2026-02-20"),
+                               _ladder_market("SB", "EVT-1", "2026-02-20", result="yes"),
+                               [_LADDER_M1])
+        tb = _ladder_record(_ladder_market("TA", "EVT-1", "2026-03-20"),
+                            _ladder_market("TB", "EVU-1", "2026-03-20"), "tb",
+                            [_LADDER_M2, _LADDER_M3])
+        with caplog.at_level(logging.INFO):
+            assert _traded(self._sim([s, tb])) == [("SA", _LADDER_M1)]
+        assert self._ladder_lines(caplog) == [_LADDER_LINE + "2"]
+
+        # ... and each market's question. QA and QB ask one dated question in
+        # two events; TQ asks it at two later deadlines in two more. QB pays
+        # out on 01-15, so TQ is refused on Monday 2 (01-12) though QA paid
+        # out on 01-10, and trades on Monday 3
+        def snow(ticker, event, deadline, paid_out, result="no"):
+            market = _ladder_market(ticker, event, paid_out, result=result)
+            market["title"] = f"Will it snow by {deadline}, 2026?"
+            return market
+
+        sq = _ladder_same_title(snow("QA", "EVQ-1", "January 20", "2026-01-10"),
+                                snow("QB", "EVQ-2", "January 20", "2026-01-15", result="yes"),
+                                [_LADDER_M1])
+        tq_a = snow("TQA", "EVR-1", "February 20", "2026-03-20")
+        tq_b = snow("TQB", "EVR-2", "March 5", "2026-03-20")
+        question = backtester._ts_group_key(tq_a)
+        assert question and all(backtester._ts_group_key(m) == question
+                                for m in (sq["entry"]["mA"], sq["entry"]["mB"], tq_b))
+        tq = _ladder_record(tq_a, tq_b, question, [_LADDER_M2, _LADDER_M3])
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert _traded(self._sim([sq, tq])) == [("QA", _LADDER_M1), ("TQA", _LADDER_M3)]
+        assert self._ladder_lines(caplog) == [_LADDER_LINE + "1"]
+        # CONTROL: alone, TQ trades on Monday 2
+        assert _traded(self._sim([tq])) == [("TQA", _LADDER_M2)]
+
+    def test_a_retried_pair_is_ranked_and_held_from_the_monday_it_trades(self, caplog):
+        # B holds question "q" on Monday 1 and pays out on 01-10. P passes on
+        # Mondays 1 and 2 and is refused on Monday 1; R passes on Monday 2
+        # only. At equal quotes R's monthly ratio (70 days to 03-23) falls
+        # between P's from Monday 2 (67 days to 03-20) and from Monday 1 (74),
+        # so P wins Monday 2 only if its ratio is counted from Monday 2
+        blocker = _ladder_record(_ladder_market("BA", "EVA-1", "2026-01-10"),
+                                 _ladder_market("BB", "EVB-1", "2026-01-10"), "q", [_LADDER_M1])
+        p = _ladder_record(_ladder_market("PA", "EVC-1", "2026-03-20"),
+                           _ladder_market("PB", "EVD-1", "2026-03-20"), "q",
+                           [_LADDER_M1, _LADDER_M2])
+        r = _ladder_record(_ladder_market("RA", "EVE-1", "2026-03-23"),
+                           _ladder_market("RB", "EVF-1", "2026-03-23"), "q", [_LADDER_M2])
+        with caplog.at_level(logging.INFO):
+            point = self._sim([blocker, p, r])
+        assert _traded(point) == [("BA", _LADDER_M1), ("PA", _LADDER_M2)]
+        # P refused on Monday 1, R on Monday 2
+        assert self._ladder_lines(caplog) == [_LADDER_LINE + "2"]
+        # P is held from Monday 2 to its 03-20 pay-out
+        t = point.trades[1]
+        assert t.holding_days == (date(2026, 3, 20) - _LADDER_M2).days == 67
+        assert t.monthly_profit_ratio == pytest.approx(t.profit_ratio * 30.0 / 67)
+
+    def test_a_pair_held_back_by_a_ticker_is_not_counted_as_a_busy_ladder(self, caplog):
+        # P2 shares market XB with the open P1 and asks its question too. The
+        # ticker check comes first, so the ladder count stays at zero
+        p1 = _ladder_record(_ladder_market("XA", "EVX-1", "2026-03-20"),
+                            _ladder_market("XB", "EVX-2", "2026-03-20"), "q", [_LADDER_M1])
+        p2 = _ladder_record(p1["entry"]["mB"], _ladder_market("XC", "EVX-3", "2026-03-20"),
+                            "q", [_LADDER_M2])
+        with caplog.at_level(logging.INFO):
+            assert _traded(self._sim([p1, p2])) == [("XA", _LADDER_M1)]
+        assert self._ladder_lines(caplog) == []
+        # CONTROL: alone, P2 trades on Monday 2
+        assert _traded(self._sim([p2])) == [("XB", _LADDER_M2)]
+
+    def test_the_premise_count_is_one_per_pair_whatever_its_passing_mondays(self, caplog):
+        # Each pair settles earlier YES, later NO: the impossible outcome.
+        # V1 and V2 pass on every Monday, V3 on none (a wide book) and V4 on
+        # its second only. The count is of pairs with a passing Monday (3),
+        # not of passing Mondays (6)
+        wide = (0.30, 0.50, 0.55)
+
+        def violator(tag, mondays):
+            return _ladder_record(
+                _ladder_market(f"{tag}A", f"EV{tag}A-1", "2026-03-20", result="yes"),
+                _ladder_market(f"{tag}B", f"EV{tag}B-1", "2026-03-20", result="no"),
+                tag, mondays)
+
+        records = [
+            violator("V1", [_LADDER_M1, _LADDER_M2, _LADDER_M3]),
+            violator("V2", [_LADDER_M1, _LADDER_M2]),
+            violator("V3", [(_LADDER_M1, *wide), (_LADDER_M2, *wide)]),
+            violator("V4", [(_LADDER_M1, *wide), _LADDER_M2]),
+        ]
+        passing = [sum(f is not None and f > 0 for f in (
+            _uncapped_kelly({"pair_type": "time_series", "entry": m}, 0.75)
+            for m in backtester._entry_mondays(r["entry"]))) for r in records]
+        assert passing == [3, 2, 0, 1]
+        with caplog.at_level(logging.WARNING):
+            point = self._sim(records)
+        assert point.trades == []
+        (line,) = [r.getMessage() for r in caplog.records
+                   if "cumulative-deadline premise" in r.getMessage()]
+        assert line.startswith("Excluded 3 time-series candidate(s)")
+
+    def test_the_peak_covers_every_passing_monday_of_every_pair(self):
+        # At k 0.85 P1 passes Monday 1 (about +0.041) and trades there. P2,
+        # on the same ladder, passes Monday 1 at the same quotes and Monday 2
+        # (about +0.104) and is refused on both; the peak is still P2's
+        # Monday 2 fraction
+        narrow, wide = (0.20, 0.45, 0.55), (0.20, 0.70, 0.30)
+        p1 = _ladder_record(_ladder_market("P1A", "EVA-1", "2026-02-20"),
+                            _ladder_market("P1B", "EVB-1", "2026-02-20"), "q",
+                            [(_LADDER_M1, *narrow)])
+        p2 = _ladder_record(_ladder_market("P2A", "EVC-1", "2026-03-20"),
+                            _ladder_market("P2B", "EVD-1", "2026-03-20"), "q",
+                            [(_LADDER_M1, *narrow), (_LADDER_M2, *wide)])
+        f_narrow = _uncapped_kelly(p1, 0.85)
+        (_, f_wide) = (_uncapped_kelly({"pair_type": "time_series", "entry": m}, 0.85)
+                       for m in backtester._entry_mondays(p2["entry"]))
+        assert f_narrow == pytest.approx(0.041, abs=1e-3)
+        assert f_wide == pytest.approx(0.104, abs=1e-3)
+        point = self._sim([p1, p2], k=0.85)
+        assert _traded(point) == [("P1A", _LADDER_M1)]
+        assert point.trades[0].kelly_fraction == pytest.approx(f_narrow, abs=1e-12)
+        assert point.peak_kelly_fraction == pytest.approx(f_wide, abs=1e-12)
+
+    def test_the_peak_covers_a_middle_monday(self):
+        # At k 0.85 P passes on three Mondays (about +0.041, +0.104, +0.086).
+        # It trades on Monday 1, and the peak is Monday 2's fraction
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-03-20"),
+                           _ladder_market("PB", "EVB-1", "2026-03-20"), "q",
+                           [(_LADDER_M1, 0.20, 0.45, 0.55), (_LADDER_M2, 0.20, 0.70, 0.30),
+                            (_LADDER_M3, 0.20, 0.60, 0.40)])
+        f1, f2, f3 = (_uncapped_kelly({"pair_type": "time_series", "entry": m}, 0.85)
+                      for m in backtester._entry_mondays(p["entry"]))
+        assert 0 < f1 < f3 < f2
+        full = self._sim([p], k=0.85)
+        assert _traded(full) == [("PA", _LADDER_M1)]
+        assert full.peak_kelly_fraction == pytest.approx(f2, abs=1e-12)
+        # Split on Monday 3: H1 keeps Mondays 1 and 2, and its peak is no
+        # higher than the full run's
+        h1, h2 = backtester._split_halves([p], _LADDER_M3)
+        assert h2 == []
+        assert [m["entry_date"] for m in backtester._entry_mondays(h1[0]["entry"])] == [
+            _LADDER_M1, _LADDER_M2]
+        assert self._sim(h1, k=0.85).peak_kelly_fraction <= full.peak_kelly_fraction
+
+    # A fixture for the size-cap sweep. Q (snow) and P (rain) ask different
+    # questions but each has a market in event EVE-1, so they share a ladder.
+    # Q ranks first on Monday 1 and pays out by 01-10, so P is refused on
+    # Monday 1 and trades on Monday 2. At k 0.5 P's fractions are about 0.404
+    # (Monday 1) and 0.476 (Monday 2), Q's about 0.441, and R's, S's and T's
+    # (unrelated pairs that first qualify on Monday 2) about 0.436. So P
+    # trades capped at a 0.45 cap and uncapped at 0.50, and R, S and T
+    # compete with it for cash at large caps.
+    @staticmethod
+    def _parity_markets() -> list[dict]:
+        def mk(ticker, event, title, result, close):
+            return {"ticker": ticker, "event_ticker": event, "event_title": "EV",
+                    "title": title, "subtitle": "", "result": result,
+                    "open_time": "2026-01-01T00:00:00+00:00",
+                    "close_time": f"{close}T00:00:00+00:00",
+                    "settlement_ts": f"{close}T12:00:00+00:00"}
+        return [
+            mk("QA", "EVE-1", "Snow falls by January 6, 2026", "yes", "2026-01-06"),
+            mk("QB", "EVF-1", "Snow falls by January 10, 2026", "yes", "2026-01-10"),
+            mk("PA", "EVE-1", "Rain falls by January 25, 2026", "no", "2026-01-25"),
+            mk("PB", "EVG-1", "Rain falls by February 5, 2026", "no", "2026-02-05"),
+            mk("RA", "EVH-1", "Hail falls by January 20, 2026", "no", "2026-01-20"),
+            mk("RB", "EVI-1", "Hail falls by January 30, 2026", "yes", "2026-01-30"),
+            mk("SA", "EVJ-1", "Fog rolls in by January 20, 2026", "no", "2026-01-20"),
+            mk("SB", "EVK-1", "Fog rolls in by January 30, 2026", "no", "2026-01-30"),
+            mk("TA", "EVL-1", "Wind blows by January 20, 2026", "yes", "2026-01-20"),
+            mk("TB", "EVM-1", "Wind blows by January 30, 2026", "yes", "2026-01-30"),
+        ]
+
+    _PARITY_CANDLES = {
+        "QA": [_candle(_MONDAY_TS, 0.10, 0.90)],
+        "QB": [_candle(_MONDAY_TS, 0.30, 0.70)],
+        "PA": [_candle(_MONDAY_TS, 0.30, 0.70), _candle(_MONDAY2_TS, 0.10, 0.90)],
+        "PB": [_candle(_MONDAY_TS, 0.50, 0.50), _candle(_MONDAY2_TS, 0.60, 0.40)],
+        **{f"{x}A": [_candle(_MONDAY_TS, 0.30, 0.70), _candle(_MONDAY2_TS, 0.20, 0.80)]
+           for x in "RST"},
+        **{f"{x}B": [_candle(_MONDAY_TS, 0.40, 0.60), _candle(_MONDAY2_TS, 0.45, 0.55)]
+           for x in "RST"},
+    }
+
+    def _parity_run(self, monkeypatch):
+        markets = self._parity_markets()
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets", lambda *a, **k: markets)
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda _c, ticker, *a, **k: self._PARITY_CANDLES[ticker])
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        return run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                  start_date=self._START, initial_balance=10_000.0,
+                                  band_sweep=True, cap_sweep=True)
+
+    def test_every_cap_of_a_multi_rung_cell_equals_a_fresh_simulation(self, monkeypatch):
+        res = self._parity_run(monkeypatch)
+        cs, band = res.cap_sweep, (0.0, 1.0)
+        assert cs.bands == (band,) and cs.ks == (0.5, 0.75)
+        # One entry each for Q, P, R, S, T; the split falls on Monday 2
+        entries = cs.entries_by_band[band]
+        assert [r["entry"]["mA"]["ticker"] for r in entries] == ["QA", "PA", "RA", "SA", "TA"]
+        assert res.split_date == _LADDER_M2
+        p_rec = next(r for r in entries if r["entry"]["mA"]["ticker"] == "PA")
+        f1, f2, _f3 = (_uncapped_kelly({"pair_type": "time_series", "entry": m}, 0.5)
+                       for m in backtester._entry_mondays(p_rec["entry"]))
+        assert f1 == pytest.approx(0.404, abs=1e-3) and f2 == pytest.approx(0.476, abs=1e-3)
+        checked = 0
+        for k in cs.ks:
+            cell = cs.cell(band, k)
+            subsets = _cap_sweep_subsets(entries)
+            for cap in cs.caps:
+                for pop, point in cell[cap].items():
+                    end = backtester._curve_end_date(cs.eager[(band, k, pop)])
+                    TestCapSweep._assert_parity(point, subsets[pop], self._START, k, band, pop,
+                                                cap, res.split_date, checks=True, end_date=end)
+                    checked += 1
+        assert checked > 100
+        # Not vacuous: at k 0.5 P is refused on Monday 1 and trades on Monday
+        # 2, capped at 0.45 and uncapped from 0.50 ...
+        cell = cs.cell(band, 0.5)
+
+        def p_trade(cap):
+            (t,) = [t for t in cell[cap]["all"].trades if t.ticker_a == "PA"]
+            return t
+
+        assert (p_trade(0.45).entry_date, p_trade(0.45).kelly_fraction) == (
+            _LADDER_M2, pytest.approx(0.45))
+        assert (p_trade(0.5).entry_date, p_trade(0.5).kelly_fraction) == (
+            _LADDER_M2, pytest.approx(f2))
+        # ... priced, sized and held from Monday 2 (pA 0.10, nB 0.40) ...
+        for cap in (0.45, 0.5):
+            t = p_trade(cap)
+            assert (t.entry_pA, t.entry_pB, t.entry_nB) == pytest.approx((0.10, 0.60, 0.40))
+            assert t.total_cost == pytest.approx(t.n * (0.10 + 0.40))
+            assert t.holding_days == (t.exit_date - _LADDER_M2).days
+        # ... the peak is P's Monday 2 fraction ...
+        assert cs.eager[(band, 0.5, "all")].peak_kelly_fraction == pytest.approx(f2, abs=1e-12)
+        # ... and caps were simulated as well as shared
+        assert cs.simulated > 0 and cs.reused > 0
+
+    def test_neither_half_s_peak_exceeds_the_full_run_s(self, monkeypatch):
+        res = self._parity_run(monkeypatch)
+        band = (0.0, 1.0)
+        entries = res.cap_sweep.entries_by_band[band]
+        h1, h2 = backtester._split_halves(entries, res.split_date)
+        # Q and P, with P cut to Monday 1; then R, S and T
+        assert sorted(r["entry"]["mA"]["ticker"] for r in h1) == ["PA", "QA"]
+        assert sorted(r["entry"]["mA"]["ticker"] for r in h2) == ["RA", "SA", "TA"]
+        for k in (*INTERVAL_DISCOUNT_SWEEP, 0.5):
+            for cap in (0.2, 0.45, 1.0):
+                full = self._sim(entries, k=k, size_cap=cap)
+                for half in (h1, h2):
+                    assert self._sim(half, k=k, size_cap=cap).peak_kelly_fraction <= \
+                        full.peak_kelly_fraction, (k, cap)
+        # Not vacuous: at k 0.5 the full run's peak is P's Monday 2 fraction,
+        # which H1 has lost, so H1's peak is strictly lower
+        full = self._sim(entries, k=0.5)
+        assert self._sim(h1, k=0.5).peak_kelly_fraction < full.peak_kelly_fraction
 
 
 class TestPrepareCandidates:
@@ -10958,9 +11475,9 @@ def _uncapped_kelly(rec: dict, k: float) -> float | None:
     """Pass 1b's uncapped Kelly fraction at one prepared entry's first
     qualifying Monday (or, handed {"pair_type": ..., "entry": monday}, at
     that Monday), rebuilt from the config helpers — the oracle for
-    peak_kelly_fraction wherever each candidate enters on its first Monday
-    (TestPrepareEntriesGolden's tier-on entries, whose later Mondays repeat
-    the first's quotes). None when the net spread leaves nothing to size."""
+    peak_kelly_fraction wherever a pair's later Mondays repeat its first
+    Monday's quotes, as TestPrepareEntriesGolden's tier-on entries do. None
+    when the net spread leaves nothing to size."""
     e = rec["entry"]
     price_a, price_b = backtester._leg_prices_for(rec["pair_type"], e["pA"], e["nA"],
                                                   e["pB"], e["nB"])
@@ -13301,12 +13818,11 @@ class TestTierOffCapSweep:
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestLaterMondayThroughTheCapSweep:
-    """DR-75 through the lazy tier-floors-off size-cap sweep. At k = 0.90 the
-    golden ladder's first qualifying Monday (2026-01-05) fails the Kelly gate
-    with the tiers off and it enters on Monday 2 instead (see TestTierOffSweep).
-    CapSweep's reuse rule rests on the Monday choice depending on k and never
-    on the cap, so every cap of that re-dated cell must equal a fresh
-    simulation — entry dates included."""
+    """A pair entering on a later Monday, through the lazy tier-floors-off
+    size-cap sweep. At k = 0.90 the golden ladder's first qualifying Monday
+    (2026-01-05) fails the Kelly gate with the tiers off and it enters on
+    Monday 2 instead (see TestTierOffSweep). Every cap of that cell must equal
+    a fresh simulation, entry dates included."""
 
     def test_every_cap_of_a_redated_cell_equals_a_fresh_simulation(self, monkeypatch):
         golden = TestPrepareEntriesGolden()

@@ -12,13 +12,14 @@ Purpose:
 Dependencies:
     config (constants, fee helpers, the probability model, LiveSettings,
     live_settings, pair_size_cap) and scanner (CandidatePair,
-    leg_prices/leg_sides, book-pricing helpers). TradeSpec is consumed by
-    trader and reporter; main calls compute_trade and
+    leg_prices/leg_sides, book-pricing helpers, pair_ladder_keys). TradeSpec
+    is consumed by trader and reporter; main calls compute_trade and
     select_portfolio. backtester and dashboard do NOT import this module: they
     share config's probability model, fee helpers and constants, but
     re-implement the Kelly formula (net spread, b with the fee in its
-    denominator, f* = p - q/b), and backtester's Pass 2 also re-implements
-    select_portfolio. A change to either must be made in every copy.
+    denominator, f* = p - q/b), and backtester also re-implements
+    select_portfolio's ticker, cash and ladder rules. A change to either must
+    be made in every copy.
 
 Notes:
     All prices here are LEG prices from scanner.leg_prices(pair): (nA, pB) for
@@ -51,6 +52,7 @@ from .scanner import (
     CandidatePair,
     leg_prices,
     leg_sides,
+    pair_ladder_keys,
     prefix_fill_prices,
     v2_effective_cap,
 )
@@ -560,9 +562,11 @@ def compute_trade(
     )
 
 
-def select_portfolio(specs: list, balance_cents: int) -> list:
+def select_portfolio(specs: list, balance_cents: int, *,
+                     held_ladders: frozenset = frozenset()) -> list:
     """
-    Greedy portfolio: best monthly return first, within balance, no reused tickers.
+    Greedy portfolio: best monthly return first, within balance, no reused
+    tickers, and at most one time-series trade per ladder.
 
     Walks specs by monthly_profit_ratio descending (same_title before
     time_series on ties — it is the near-arbitrage). A spec is taken if neither
@@ -570,11 +574,20 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
     remaining balance; a spec that doesn't fit is skipped, not a stop, so a
     cheaper one further down can still be taken. Open positions from earlier
     runs are excluded upstream by scanner.get_held_tickers (prod only).
-    backtester's Pass 2 mirrors this selection; change both together.
+
+    A time-series spec is also skipped when one of its markets is on a ladder
+    the account holds, or on the ladder of a spec picked earlier (a ladder is
+    one question asked at several deadlines; see scanner.ladder_keys). A
+    same-title spec is never skipped this way, but its ladders count once
+    picked. A skipped spec spends no cash, so a later spec may then fit. The
+    backtester repeats the ticker, cash and ladder rules; change both
+    together.
 
     Args:
         specs (list): TradeSpecs from compute_trade.
         balance_cents (int): Available balance in cents.
+        held_ladders (frozenset): Keyword-only. Ladder labels of the markets we
+            hold. Empty means none.
 
     Returns:
         list: The selected specs in ranking order; may be empty.
@@ -591,11 +604,19 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
     )
     selected = []
     used_tickers: set[str] = set()
+    # Ladders we already hold, plus those of the specs picked earlier in this run
+    used_ladders: set = set(held_ladders)
+    ladder_skips = 0
     for spec in specs_sorted:
         ta = spec.pair.market_a.ticker
         tb = spec.pair.market_b.ticker
         # Skip trades that would re-use a ticker already committed to a higher-priority pair
         if ta in used_tickers or tb in used_tickers:
+            continue
+        keys = pair_ladder_keys(spec.pair)
+        # At most one open time-series trade per ladder
+        if spec.pair.pair_type == "time_series" and keys & used_ladders:
+            ladder_skips += 1
             continue
         # Skip this trade if its full cash requirement (contracts + taker fees)
         # would exceed the remaining available balance
@@ -605,6 +626,13 @@ def select_portfolio(specs: list, balance_cents: int) -> list:
         available -= spec.total_cost_with_fees
         used_tickers.add(ta)
         used_tickers.add(tb)
+        used_ladders |= keys
+    if ladder_skips:
+        logging.info(
+            "Time-series trades skipped because the account already holds, or this "
+            "run already picked, a trade on the same ladder: %d",
+            ladder_skips,
+        )
     logging.info(
         # Fee-inclusive: the figure this loop budgets against (TS-12)
         "Portfolio: %d trades selected, total cost $%.2f incl. fees",
