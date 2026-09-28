@@ -3943,7 +3943,7 @@ class TestHeldWrites:
         # moments the POSTs would go out must stay inside burst + rate * T
         # in every stretch.
         # Each caller's plan is drawn before any thread starts, so a seed
-        # replays the same schedule whatever order the OS runs the threads in.
+        # replays the same plans whatever order the OS runs the threads in.
         rng = random.Random(seed)
         rate, burst, callers = 8.0, 4, 8
         plans = [

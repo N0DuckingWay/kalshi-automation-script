@@ -72,9 +72,9 @@ Purpose:
     to read as "our leg didn't").
 
     The write pacer keeps its waits out of that window as far as it can. A
-    pair's NO leg waits until the pacer has room for TWO writes, sends one and
+    pair's NO leg waits until TWO tokens are free together, sends one and
     holds the other (_PairWrites, _WritePacer.acquire_with_hold), so the YES
-    leg is sent at once on the held place. Every unwind takes a place in the
+    leg is sent at once on the held place. An unwind takes a place in the
     pacer's hedge lane, served before every waiting opening NO leg, so it waits
     only for the refill of one token for itself and one for each unwind
     already ahead of it. A held place counts against the bucket until it is
@@ -125,11 +125,11 @@ Notes:
     is not idempotent, so a retried transfer moves the money twice.
     _submit_order calls fetch_json_page directly and _submit_order_v2 /
     _execute_transfer call signed_request_json directly; none of those three may
-    ever be wrapped in api_call_with_retry. Each of the three takes exactly one
-    place on _ORDER_WRITE_PACER before its POST (a pair's YES leg sends the
-    place its NO leg held for it), and that is not a retry: the pacer only
-    delays a request, which is then sent exactly once. An HTTP 429 that still
-    comes back raises like any other error response.
+    ever be wrapped in api_call_with_retry. Each of the three takes one place on
+    _ORDER_WRITE_PACER for its POST before sending it (a pair's NO leg also
+    holds a second place, which its YES leg sends), and that is not a retry:
+    the pacer only delays a request, which is then sent exactly once. An HTTP
+    429 that still comes back raises like any other error response.
 
     The read-only position lookups in _position_count ARE retried, and that
     asymmetry is the rule, not an oversight: they are read-only GETs, so a
@@ -485,8 +485,8 @@ class _WritePacer:
         the POSTs actually sent never exceed `burst` plus `rate` times the
         stretch between them, however late each held write goes out.
       * acquire_hedge takes one token in the hedge lane, which is served
-        before every waiting acquire and acquire_with_hold. Every unwind of a
-        pair's NO leg uses it.
+        before every waiting acquire and acquire_with_hold. An unwind of a
+        pair's NO leg uses it (see _PairWrites.hedge).
 
     A caller that holds a write never waits on the pacer before sending it,
     and acquire_with_hold never lets the held tokens reach `burst` (it needs
@@ -2822,9 +2822,9 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
 
     Every POST waits for its place on the shared write pacer
     (_ORDER_WRITE_PACER), and the pair's places come from one _PairWrites.
-    The NO leg's POST waits in turn until the pacer has room for two writes,
-    sends one and holds the other for the YES leg, which is then sent with no
-    wait. Every unwind takes a place in the pacer's hedge lane, ahead of every
+    The NO leg's POST waits in turn until two tokens are free together, sends
+    one and holds the other for the YES leg, which is then sent with no wait.
+    An unwind takes a place in the pacer's hedge lane, ahead of every
     waiting opening NO leg. The held place goes back to the pacer as soon as
     the NO leg's POST raises (the reads that work out whether it filled can
     take a minute, and the place would keep room from every other pair
@@ -2918,7 +2918,7 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
     # _await_transfer_settlement uses; the mapping read costs at most one round
     # trip and disappears for the rest of the process once confirmed.
     # The write pacer adds no wait to that window for the YES leg: the NO
-    # leg's POST waits until the pacer has room for two writes and holds the
+    # leg's POST waits until two tokens are free together and holds the
     # second (writes.opening), so the YES leg is sent on the held place at
     # once (writes.hedge). An unwind takes a place in the pacer's hedge lane,
     # which is served before every other pair's opening NO leg, so it waits
@@ -2931,8 +2931,8 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
     # Submit the NO leg (version-dispatched; see _submit_any)
     no_leg_error: str | None = None
     try:
-        # Opening write: waits in turn for room for two writes and holds the
-        # second for this pair's hedge
+        # Opening write: waits in turn until two tokens are free together and
+        # holds the second for this pair's YES leg
         status_no = _submit_any(client, order_no, pace=writes.opening)
         if status_no != "executed":
             # FoK rejection is a confirmed non-fill — safe to walk away
@@ -2955,8 +2955,8 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
     # full backoff schedule (~62s) before this already-urgent decision could
     # be made.
     if no_leg_error is not None:
-        # The YES leg will not be sent while this is worked out, and the reads
-        # below can take a minute of retries: give the held place back now so
+        # The YES leg is never sent on this path, and the reads below can take
+        # a minute of retries: give the held place back now so
         # it does not keep room from every other pair. An unwind below takes
         # the hedge lane instead.
         writes.close()
@@ -3146,8 +3146,9 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
             "YES leg (%s) failed after the NO leg filled — attempting rollback: %s",
             yes_leg.label, yes_leg_error,
         )
-        # The held place went to the YES leg (unless its submission raised
-        # before taking its place), so the unwind usually takes the hedge lane
+        # The held place went to the YES leg's POST, so the unwind takes the
+        # hedge lane (had the YES leg's submission raised before taking its
+        # place, the unwind would send the held place instead)
         return _rollback_no_leg(client, spec, no_leg, yes_leg_error, pace=writes.hedge)
 
     logging.info(
