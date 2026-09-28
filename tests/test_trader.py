@@ -26,6 +26,17 @@ such failures through that lens first.
 
 The merged default is ORDER_API_VERSION="v2", so any class that drives
 _execute_one down the legacy path opts in via the `legacy_mode` fixture.
+
+The write pacer (trader._WritePacer: the token bucket every order and
+transfer POST takes a place on, with a place a pair's NO leg holds for its YES
+leg and a hedge lane for unwinds) is covered from `class _FakeClock` to the
+end: TestWritePacer, TestHeldWrites and TestHedgeLane drive the bucket itself,
+TestWritesArePaced and TestPairWrites check which place each POST takes, and
+TestExecuteTradesArePaced runs whole portfolios. Tests with one thread use
+_FakeClock, whose waits move the clock; tests with several use _SimTime, a
+simulated clock that stands still while any thread runs and jumps to the next
+deadline once all of them are blocked, so their times are exact on any
+machine.
 """
 import ast
 import inspect
@@ -3677,11 +3688,12 @@ class TestWritePacer:
             assert pacer.acquire() == pytest.approx(0.125)
         assert "Paced an order or transfer write" not in caplog.text
 
-    def test_the_balance_is_read_under_the_lock_and_the_wait_releases_it(self):
+    def test_the_balance_is_read_under_the_lock_and_the_wait_is_handed_the_lock(self):
         # acquire() reads the clock first thing in the block that updates the
         # balance, so a reading taken without the lock means that block is
-        # not guarded; and the wait must hand the lock back (as
-        # Condition.wait does), or no other caller could join the line.
+        # not guarded; and the wait hook is called with the lock held, so the
+        # default hook (Condition.wait) can release it while it waits, or no
+        # other caller could join the line.
         clock = _FakeClock()
         owned_at_clock: list[bool] = []
         owned_at_wait: list[bool] = []
@@ -3722,6 +3734,63 @@ class TestWritePacer:
             pacer.acquire()
         assert not pacer._in_turn and not pacer._hedges
         assert pacer.acquire() == pytest.approx(0.25)
+
+    def test_a_caller_that_stops_waiting_removes_its_own_place_not_another(self):
+        # Two callers wait in turn with identical requests; the second stops.
+        # Its own place must go, not the first caller's equal-looking one, or
+        # the first would wait forever for a place that is no longer in line.
+        sim = _SimTime(tasks=2)
+        pacer = _sim_pacer(4, 2, sim)
+        pacer.acquire()
+        pacer.acquire()                       # bucket empty at t=0
+        served: dict[str, float] = {}
+        second_arrived = threading.Event()
+
+        def first():
+            pacer.acquire()
+            served["first"] = sim.now
+
+        def second():
+            real_wait = pacer._wait
+
+            def wait_once(timeout):
+                pacer._wait = real_wait
+                second_arrived.set()
+                raise KeyboardInterrupt
+
+            with sim.cond:
+                while not pacer._in_turn:     # let the first caller join first
+                    sim.cond.wait(0.01)
+                pacer._wait = wait_once
+            try:
+                pacer.acquire()
+            except KeyboardInterrupt:
+                served["second"] = -1.0
+
+        _run_sim_threads(sim, [first, second])
+        assert second_arrived.is_set()
+        assert served == {"first": pytest.approx(0.25), "second": -1.0}
+
+    def test_a_held_write_served_just_before_its_caller_stops_goes_back(self):
+        # Another waiter serves this caller's two-token request, and then the
+        # caller stops before it gets its held write: nobody could ever send
+        # or release that write, so the pacer takes it back itself.
+        clock = _FakeClock()
+
+        def wait(timeout):
+            clock.wait(timeout)
+            pacer._serve(clock.now)           # served, as another waiter would
+            raise KeyboardInterrupt
+
+        pacer = _WritePacer(4, 2, clock=clock.monotonic, wait=wait)
+        pacer.acquire()
+        pacer.acquire()
+        with pytest.raises(KeyboardInterrupt):
+            pacer.acquire_with_hold()
+        assert pacer._held == 0
+        assert not pacer._in_turn
+        # The held token came back; the write the caller would have sent stays spent
+        assert pacer._tokens == pytest.approx(1.0)
 
 
 class TestHeldWrites:
@@ -3764,6 +3833,22 @@ class TestHeldWrites:
         # Sending it frees its room: the refill may now reach 3 again
         clock.now += 1_000.0
         assert [pacer.acquire() for _ in range(3)] == [0.0, 0.0, 0.0]
+
+    def test_a_held_write_sent_late_frees_its_room_only_after_the_refill(self):
+        # Hold, go idle, send late, then take single writes at that instant.
+        # Over the idle spell the refill could only fill the room the hold
+        # left (burst - 1); the held send and one single use it all, so the
+        # next single waits. Freeing the room before bringing the balance up
+        # to date would let the refill fill the whole bucket over the idle
+        # spell, and three writes would go out at once where the burst allows
+        # two.
+        clock = _FakeClock()
+        pacer = _fake_pacer(8, 2, clock)
+        _, held = pacer.acquire_with_hold()
+        clock.now = 10.0
+        assert held.send() is True
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == pytest.approx(0.125)
 
     def test_a_released_write_gives_its_token_back(self):
         clock = _FakeClock()
@@ -3838,7 +3923,14 @@ class TestHeldWrites:
 
         thread = threading.Thread(target=second, daemon=True)
         thread.start()
-        time.sleep(0.1)          # the second pair is waiting by now
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:     # until the second pair is in line
+            with pacer._cond:
+                if pacer._in_turn:
+                    break
+            time.sleep(0.001)
+        with pacer._cond:
+            assert list(pacer._in_turn), "the second pair never joined the line"
         assert not served.is_set()
         assert held.send() is True
         assert served.wait(timeout=5.0)
@@ -3850,21 +3942,27 @@ class TestHeldWrites:
         # delay (or give it back), single writes, and hedge-lane writes. The
         # moments the POSTs would go out must stay inside burst + rate * T
         # in every stretch.
+        # Each caller's plan is drawn before any thread starts, so a seed
+        # replays the same schedule whatever order the OS runs the threads in.
         rng = random.Random(seed)
         rate, burst, callers = 8.0, 4, 8
+        plans = [
+            [(rng.random() * 0.3, rng.choice(["pair", "pair", "single", "hedge"]),
+              rng.random() * 2.0, rng.random() < 0.8) for _ in range(4)]
+            for _ in range(callers)
+        ]
         sim = _SimTime(tasks=callers)
         pacer = _sim_pacer(rate, burst, sim)
         sends: list[float] = []
 
-        def caller():
-            for _ in range(4):
-                sim.sleep(rng.random() * 0.3)
-                kind = rng.choice(["pair", "pair", "single", "hedge"])
+        def caller(plan):
+            for pause, kind, hold_for, send in plan:
+                sim.sleep(pause)
                 if kind == "pair":
                     _, held = pacer.acquire_with_hold()
                     sends.append(sim.now)
-                    sim.sleep(rng.random() * 2.0)
-                    if rng.random() < 0.8:
+                    sim.sleep(hold_for)
+                    if send:
                         held.send()
                         sends.append(sim.now)
                     else:
@@ -3876,9 +3974,10 @@ class TestHeldWrites:
                     pacer.acquire_hedge()
                     sends.append(sim.now)
 
-        _run_sim_threads(sim, [caller for _ in range(callers)])
+        _run_sim_threads(sim, [lambda plan=plan: caller(plan) for plan in plans])
         assert len(sends) >= callers * 4
         _assert_within_bucket(sends, rate, burst)
+        assert pacer._held == 0
 
 
 class TestHedgeLane:
@@ -4219,11 +4318,12 @@ class TestWritesArePaced:
 
 class TestPairWrites:
     """_execute_one's places on the pacer, path by path. The NO leg takes two
-    (one held for the pair's first hedge write); the YES leg, or the unwind of
-    a NO leg whose fill was unclear, sends the held one; an unwind after the
-    YES leg takes the hedge lane; a held place that is never sent goes back.
-    The pacer is real and never has to wait (every case fits in one burst),
-    so its balance afterwards shows which places were taken."""
+    (one held for the YES leg); the YES leg sends the held one; every unwind
+    takes the hedge lane; a held place that is never sent goes back, at once
+    when the NO leg's POST raises. The pacer is real and never has to wait
+    (every case fits in one burst); how many places were held at each POST,
+    the hedge-lane places handed out and the balance afterwards show which
+    places each path took."""
 
     BURST = 8
 
@@ -4240,15 +4340,26 @@ class TestPairWrites:
         bodies: list[dict] = []
         replies: list = []
 
+        held_at_post: list[int] = []
+
         def answer(client, method, path, body):
             bodies.append(body)
+            held_at_post.append(trader._ORDER_WRITE_PACER._held)
             reply = replies.pop(0)
             if isinstance(reply, BaseException):
                 raise reply
             return reply
 
         monkeypatch.setattr(trader, "signed_request_json", answer)
-        return SimpleNamespace(bodies=bodies, replies=replies)
+        return SimpleNamespace(bodies=bodies, replies=replies, held_at_post=held_at_post)
+
+    @staticmethod
+    def _count_hedges(pacer, monkeypatch) -> list:
+        """Record each hedge-lane place the pacer hands out."""
+        hedges: list = []
+        real = pacer.acquire_hedge
+        monkeypatch.setattr(pacer, "acquire_hedge", lambda: hedges.append(1) or real())
+        return hedges
 
     @staticmethod
     def _spent(pacer) -> float:
@@ -4256,14 +4367,18 @@ class TestPairWrites:
         return pacer._burst - pacer._tokens - pacer._held
 
     def test_a_filled_pair_sends_its_yes_leg_on_the_held_place(
-        self, pacer, posts, v2_mode, v2_mapping_confirmed,
+        self, pacer, posts, v2_mode, v2_mapping_confirmed, monkeypatch,
     ):
         posts.replies.extend([v2_resp(5), v2_resp(5)])
+        hedges = self._count_hedges(pacer, monkeypatch)
         client = MagicMock()
         client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
         result = _execute_one(client, make_spec())
         assert result.status == "executed"
         assert [b["side"] for b in posts.bodies] == ["ask", "bid"]
+        # One place held while the NO leg posts, spent by the YES leg
+        assert posts.held_at_post == [1, 0]
+        assert hedges == []
         assert pacer._held == 0 and self._spent(pacer) == 2
 
     def test_a_killed_no_leg_gives_the_held_place_back(
@@ -4280,38 +4395,39 @@ class TestPairWrites:
         self, pacer, posts, v2_mode, v2_mapping_confirmed, monkeypatch,
     ):
         posts.replies.extend([v2_resp(5), fok_kill_error(), v2_resp(5)])
-        hedges = []
-        monkeypatch.setattr(
-            pacer, "acquire_hedge",
-            lambda real=pacer.acquire_hedge: hedges.append(1) or real(),
-        )
+        hedges = self._count_hedges(pacer, monkeypatch)
         client = MagicMock()
         client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
         result = _execute_one(client, make_spec())
         assert result.status == "rolled_back"
+        assert posts.held_at_post == [1, 0, 0]
         assert hedges == [1]
         assert pacer._held == 0 and self._spent(pacer) == 3
 
-    def test_a_no_leg_whose_fill_was_unclear_is_unwound_on_the_held_place(
+    def test_a_no_leg_whose_fill_was_unclear_gives_its_place_back_before_the_reads(
         self, pacer, posts, v2_mode, v2_mapping_confirmed, monkeypatch,
     ):
-        # The NO leg raised, the position moved by exactly our NO buy: the
-        # YES leg is never sent, and the unwind takes the held place rather
-        # than a new one.
+        # The NO leg raised, and working out whether it filled can take a
+        # minute of retried reads, so the held place goes back before the
+        # first of them; the position then moved by exactly our NO buy, and
+        # the unwind takes the hedge lane.
         posts.replies.extend([ConnectionError("reset"), v2_resp(5)])
-        hedges = []
-        monkeypatch.setattr(
-            pacer, "acquire_hedge",
-            lambda real=pacer.acquire_hedge: hedges.append(1) or real(),
-        )
+        hedges = self._count_hedges(pacer, monkeypatch)
+        held_at_read: list[int] = []
+        script = positions_seq(None, None, ("TICK-A", -5))
+
+        def read(**kwargs):
+            held_at_read.append(pacer._held)
+            return script(**kwargs)
+
         client = MagicMock()
-        client.get_positions_without_preload_content = positions_seq(
-            None, None, ("TICK-A", -5),
-        )
+        client.get_positions_without_preload_content = MagicMock(side_effect=read)
         result = _execute_one(client, make_spec())
         assert result.status == "rolled_back"
         assert posts.bodies[-1]["reduce_only"] is True
-        assert hedges == []
+        assert held_at_read == [0, 0, 0]   # the baselines, and the read after the error
+        assert posts.held_at_post == [1, 0]
+        assert hedges == [1]
         assert pacer._held == 0 and self._spent(pacer) == 2
 
     def test_a_no_leg_that_did_not_fill_gives_the_held_place_back(
@@ -4353,17 +4469,47 @@ class TestPairWrites:
         assert [r.status for r in results] == ["manual_review"]
         assert pacer._held == 0 and self._spent(pacer) == 1
 
-    def test_the_legacy_path_takes_the_same_places(
+    @staticmethod
+    def _legacy_client(pacer, replies) -> tuple:
+        """A client whose legacy create-order call answers from `replies`,
+        recording how many places were held at each POST."""
+        held_at_post: list[int] = []
+
+        def create(**kwargs):
+            held_at_post.append(pacer._held)
+            return replies.pop(0)
+
+        client = MagicMock()
+        client.create_order_without_preload_content.side_effect = create
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+        return client, held_at_post
+
+    def test_the_legacy_path_sends_its_yes_leg_on_the_held_place(
         self, pacer, legacy_mode, monkeypatch,
     ):
-        client = MagicMock()
-        client.create_order_without_preload_content.side_effect = [
-            order_resp("executed"), order_resp("executed"),
-        ]
-        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+        hedges = self._count_hedges(pacer, monkeypatch)
+        client, held_at_post = self._legacy_client(
+            pacer, [order_resp("executed"), order_resp("executed")],
+        )
         result = _execute_one(client, make_spec())
         assert result.status == "executed"
+        assert held_at_post == [1, 0]
+        assert hedges == []
         assert pacer._held == 0 and self._spent(pacer) == 2
+
+    def test_the_legacy_path_unwinds_a_killed_yes_leg_through_the_hedge_lane(
+        self, pacer, legacy_mode, monkeypatch,
+    ):
+        hedges = self._count_hedges(pacer, monkeypatch)
+        client, held_at_post = self._legacy_client(
+            pacer,
+            [order_resp("executed"), order_resp("canceled"), order_resp("executed")],
+        )
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+        assert held_at_post == [1, 0, 0]
+        assert hedges == [1]
+        assert pacer._held == 0 and self._spent(pacer) == 3
 
     def test_a_pair_never_holds_two_places(self, pacer):
         writes = trader._PairWrites(pacer)
@@ -4374,11 +4520,7 @@ class TestPairWrites:
         assert pacer._held == 0
 
     def test_the_second_hedge_write_takes_the_hedge_lane(self, pacer, monkeypatch):
-        hedges = []
-        monkeypatch.setattr(
-            pacer, "acquire_hedge",
-            lambda real=pacer.acquire_hedge: hedges.append(1) or real(),
-        )
+        hedges = self._count_hedges(pacer, monkeypatch)
         writes = trader._PairWrites(pacer)
         writes.opening()
         assert writes.hedge() == 0.0 and hedges == []
@@ -4480,8 +4622,8 @@ class TestExecuteTradesArePaced:
     def test_the_opening_no_legs_are_spread_to_the_write_limit(
         self, monkeypatch, v2_mode, v2_mapping_confirmed,
     ):
-        # Both baseline reads take 0.1 s, so every pair asks for its opening
-        # places at 0.1. Four pairs fit in the burst of 8 (a NO leg and its
+        # The two baseline reads take 0.05 s each, so every pair asks for its
+        # opening places at 0.1. Four pairs fit in the burst of 8 (a NO leg and its
         # held YES place each); each later pair needs two more tokens, 2/8 s
         # apart, and the four YES legs sent at 0.2 free their room in time.
         posts = self._run(monkeypatch, 7)
@@ -4501,8 +4643,8 @@ class TestExecuteTradesArePaced:
         # Every YES leg is killed, so every pair unwinds. An unwind asks for
         # its place the moment its YES leg's POST returns; no opening NO leg
         # may go out between that moment and the unwind's own POST, and the
-        # unwind waits only for the refill of one token per unwind ahead of
-        # it in the hedge lane.
+        # unwind waits only for the refill of one token for itself and one
+        # per unwind ahead of it in the hedge lane.
         posts = self._run(monkeypatch, pairs, kill_yes=True)
         rate = config.ORDER_WRITES_PER_SECOND
         by_pair = self._by_pair(posts)

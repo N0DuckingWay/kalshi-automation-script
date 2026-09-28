@@ -1143,8 +1143,9 @@ FLAT_RETURN_TOLERANCE: float = 1e-12
 # but they do mean longer waits for a pair's opening NO leg, which waits its
 # turn behind the other workers' writes. A pair's hedge writes do not: its NO
 # leg holds a place for its YES leg, and an unwind goes ahead of every waiting
-# NO leg, waiting at most 1/ORDER_WRITES_PER_SECOND seconds for each unwind
-# already ahead of it (trader._PairWrites; see trader._execute_one).
+# NO leg, waiting at most 1/ORDER_WRITES_PER_SECOND seconds for its own token
+# plus that again for each unwind already ahead of it (trader._PairWrites;
+# see trader._execute_one).
 TRADER_MAX_WORKERS = 8
 
 # How fast trader.py sends order and collateral-transfer POSTs, across every
