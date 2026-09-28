@@ -2269,8 +2269,8 @@ class TestPartialUnwindCount:
     ):
         result, client = self._unwind(post, caplog, body)
         assert result.status == "rollback_failed"
-        # The rollback error is the one-line _http.api_error_summary text:
-        # the error's class, then _v2_fill_status's own message
+        # The rollback error is the one-line description: the error's type,
+        # then its message
         assert result.error.startswith(
             "YES leg FoK not filled: status=canceled; rollback error: "
             "_UnclassifiableV2Response: Unclassifiable V2 order response: fill_count="
@@ -4905,8 +4905,7 @@ class TestExecuteTradesArePaced:
             assert sent - requested <= ahead / rate + 1e-9
 
 
-# Error bodies the V2 order endpoint sent on the production API (2026-09-28),
-# verbatim
+# Error responses Kalshi's order endpoint sent in live trading, word for word
 MISSING_PARAMETERS_BODY = (
     '{"error":{"code":"missing_parameters","message":"missing parameters",'
     '"details":"Key: \'CreateOrderV2Request.SelfTradePreventionType\' '
@@ -4923,9 +4922,8 @@ TOO_MANY_REQUESTS_LINE = "HTTP 429 Too Many Requests — too_many_requests: too 
 
 
 def sdk_error(status: int, reason: str, body: str) -> ApiException:
-    """The exception the order POST raises for a non-2xx response, built the
-    way the SDK builds it — so, like the real one, its text lists every
-    response header."""
+    """Return the error an order POST raises for a rejected response, with its
+    status, reason, headers and body."""
     resp = SimpleNamespace(
         status=status, reason=reason, data=body.encode("utf-8"),
         getheaders=lambda: {
@@ -4940,17 +4938,15 @@ def sdk_error(status: int, reason: str, body: str) -> ApiException:
 
 
 class TestFailedRequestsAreLoggedOnOneLine:
-    """A failed order submission, unwind or position read is logged, and
-    recorded in TradeResult.error, as one line — HTTP status, reason, the
-    exchange's error code and message (_http.api_error_summary) — never as the
-    SDK's exception text, which spreads every response header over several
-    lines (TS-02). The error fields reach the trade log's Notes column, so
-    they must stay informative as well as short."""
+    """A failed order or unwind is logged, and recorded in TradeResult.error,
+    as one line: the HTTP status and reason, then Kalshi's error code, message
+    and details, with no response headers. A failed position read is logged
+    the same way."""
 
     @pytest.fixture(autouse=True)
     def _use_v2(self, v2_mode, v2_mapping_confirmed, monkeypatch):
-        """V2 path, mapping already latched; the ledger-lag re-read's pause is
-        patched out so the suite does not wait for it."""
+        """V2 path, with the check that a NO order opens a NO position already
+        passed (so it makes no extra position read), and no real pauses."""
         monkeypatch.setattr(trader.time, "sleep", lambda s: None)
 
     @pytest.fixture
@@ -4970,16 +4966,14 @@ class TestFailedRequestsAreLoggedOnOneLine:
             assert "HTTP response headers" not in message
 
     def test_the_sdk_text_would_have_listed_the_headers(self):
-        # The SDK's own text for this exception: status, reason, headers and
-        # body on separate lines
+        # The exception's own text runs over several lines and lists the headers
         text = str(sdk_error(429, "Too Many Requests", TOO_MANY_REQUESTS_BODY))
         assert len(text.splitlines()) >= 4
         assert "cloudfront" in text
 
     def test_a_rejected_no_leg(self, post, caplog):
-        # The NO leg is rejected with the 400 the endpoint sent while the
-        # self-trade-prevention field was missing; the ledger stays flat on
-        # both readings, so nothing filled and the pair ends "failed"
+        # The NO leg is rejected with a 400 and the position does not move,
+        # so the pair ends "failed"
         post.side_effect = [sdk_error(400, "Bad Request", MISSING_PARAMETERS_BODY)]
         client = MagicMock()
         client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
@@ -4992,8 +4986,8 @@ class TestFailedRequestsAreLoggedOnOneLine:
         self._assert_every_record_is_one_line(caplog)
 
     def test_a_rejected_yes_leg_and_its_unwind(self, post, caplog):
-        # The YES leg draws a 429; the ledger stays flat, so the NO leg is
-        # unwound
+        # The YES leg is rejected with a 429 and the position does not move,
+        # so the NO leg is unwound
         post.side_effect = [
             v2_resp(5), sdk_error(429, "Too Many Requests", TOO_MANY_REQUESTS_BODY), v2_resp(5),
         ]
@@ -5009,8 +5003,7 @@ class TestFailedRequestsAreLoggedOnOneLine:
         self._assert_every_record_is_one_line(caplog)
 
     def test_a_rejected_unwind(self, post, caplog):
-        # The YES leg is killed, and the unwind itself draws a 429: the
-        # orphaned-position alert and the error field name the 429 in one line
+        # The YES leg is killed and the unwind is rejected with a 429
         post.side_effect = [
             v2_resp(5), fok_kill_error(), sdk_error(429, "Too Many Requests", TOO_MANY_REQUESTS_BODY),
         ]
@@ -5029,8 +5022,7 @@ class TestFailedRequestsAreLoggedOnOneLine:
         self._assert_every_record_is_one_line(caplog)
 
     def test_a_failed_position_read(self, caplog):
-        # A 400 is not retried, so the retried reader fails at once; both
-        # readers log the same one line
+        # A 400 is not retried, so both readers fail at once
         client = MagicMock()
         client.get_positions_without_preload_content = MagicMock(
             side_effect=sdk_error(400, "Bad Request", '{"error":{"code":"bad_request","message":"bad"}}')
@@ -5044,12 +5036,10 @@ class TestFailedRequestsAreLoggedOnOneLine:
         ]
 
     def test_no_handler_logs_or_records_an_exception_whole(self):
-        # Every exception trader.py catches by name is either re-raised (a
-        # raise statement, which logs nothing) or handed, as the first
-        # argument, only to api_error_summary (to describe it), _is_fok_kill
-        # (to classify it) or _partial_unwind_counts (to read a partial
-        # unwind's fill count from it) — so no log line or error field can
-        # carry the SDK's multi-line text
+        # Every exception trader.py catches by name is either used only inside
+        # a raise statement or passed, as the first argument, only to
+        # api_error_summary, _is_fok_kill or _partial_unwind_counts — so no log
+        # line or error field contains the exception's own multi-line text
         tree = ast.parse(inspect.getsource(trader))
         allowed = {"api_error_summary", "_is_fok_kill", "_partial_unwind_counts"}
         handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler) and n.name]

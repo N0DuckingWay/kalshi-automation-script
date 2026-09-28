@@ -5765,10 +5765,8 @@ def _raw_market(ticker: str, title: str, status: str = "active", **extra) -> dic
 
 
 class TestFetchOrderbookFailureIsOneLine:
-    """A failed order-book read — per ticker, and inside the pre-execution
-    check right before orders are sent — is logged as one line through
-    _http.api_error_summary, never as the SDK's multi-line exception text
-    with every response header (TS-02)."""
+    """A failed order-book read is logged as one line: the HTTP status and
+    reason, then Kalshi's error code and message."""
 
     def test_a_rejected_read_logs_one_line(self, caplog):
         client = MagicMock()

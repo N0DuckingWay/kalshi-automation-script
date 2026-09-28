@@ -11,11 +11,9 @@ Purpose:
     request for API routes the pinned SDK has no generated method for. Both the
     live scanner and the historical fetch pipeline import from here so backoff
     behavior stays consistent and there is no scanner → historical reverse
-    import. It also reads a failed request back: api_error_payload() parses
-    the exchange's JSON error object out of an ApiException, and
-    api_error_summary() turns any failed request into one short log line
-    (status, reason, the exchange's error code, message and details), which
-    trader.py logs and records in place of the SDK's multi-line exception text.
+    import. It also describes failed requests: api_error_payload() reads the
+    error details Kalshi sends back, and api_error_summary() turns a failed
+    request into one short line of text for trader.py and scanner.py to log.
 
 Dependencies:
     No project imports — this module is a leaf so auth.py, scanner.py,
@@ -129,9 +127,8 @@ _MAX_ATTEMPTS = 6
 _INITIAL_DELAY = 2.0
 _MAX_DELAY = 60.0
 
-# The longest line api_error_summary returns. Room for a status, a reason, and
-# the exchange's error code, message and a sentence of details; a longer
-# description is cut rather than let one error fill a log line.
+# The longest description api_error_summary returns by default; anything
+# longer is cut.
 _ERROR_SUMMARY_MAX_CHARS = 300
 
 
@@ -237,10 +234,8 @@ def _check_and_parse(resp: Any) -> Any:
 
 def _body_text(exc: BaseException) -> str | None:
     """
-    Return a failed request's response body as text.
-
-    The SDK's ApiException keeps the body on its .body attribute as text; a
-    hand-built one may hold UTF-8 bytes instead, which are decoded here.
+    Return the exception's .body (the response body of a failed request) as
+    text, decoding bytes as UTF-8.
 
     Args:
         exc (BaseException): The exception a request raised.
@@ -260,28 +255,26 @@ def _body_text(exc: BaseException) -> str | None:
 
 def api_error_payload(exc: BaseException) -> dict | None:
     """
-    Read the exchange's own error object out of a failed request's response.
+    Return the error details Kalshi sent back with a rejected request.
 
-    Kalshi answers a rejected request with a JSON body of the form
-    {"error": {"code": ..., "message": ..., "details": ...}} ("details" is
-    optional). This is the one place that body is parsed: trader._is_fok_kill
-    reads the code from it to recognise the V2 kill response, and
-    api_error_summary prints it in log lines.
+    Kalshi's error response looks like
+    {"error": {"code": ..., "message": ..., "details": ...}}; this returns the
+    inner object. trader._is_fok_kill checks its code, and api_error_summary
+    prints it.
 
     Args:
         exc (BaseException): The exception a request raised.
 
     Returns:
-        dict | None: The object under "error", or None when the exception has
-            no body, the body is not UTF-8 text, is not JSON, or has no
-            "error" object. Never raises.
+        dict | None: The error details, or None when the response carries none
+            in that form. Never raises.
     """
     body = _body_text(exc)
     if body is None:
         return None
     try:
-        # The stdlib parser, not _json_loads: an error body is tiny, and this
-        # keeps the parse identical whether or not the optional orjson is installed
+        # The standard-library parser, so the result is the same with or
+        # without the optional orjson installed
         payload = json.loads(body)
     except (ValueError, RecursionError):
         return None
@@ -291,13 +284,11 @@ def api_error_payload(exc: BaseException) -> dict | None:
 
 def _one_line(value: Any) -> str:
     """
-    Render any value as printable text on a single line.
+    Return a value's text on one line of printable characters.
 
-    Every character that is not printable — newlines and tabs, but also
-    control characters such as a terminal escape or a NUL, which a JSON body
-    can carry as \\u escapes — becomes a space, and runs of spaces collapse
-    to one. The result is safe in a log line and in a spreadsheet cell (the
-    trade log's Notes cell refuses control characters).
+    Line breaks, tabs and other unprintable characters become spaces and
+    repeated spaces are merged, so the text is safe in a log line or a
+    spreadsheet cell.
 
     Args:
         value (Any): The value to render.
@@ -311,30 +302,20 @@ def _one_line(value: Any) -> str:
 
 def api_error_summary(exc: BaseException, limit: int = _ERROR_SUMMARY_MAX_CHARS) -> str:
     """
-    Describe a failed request in one line, for log lines and error fields.
+    Describe a failed request in one short line of text.
 
-    The SDK's own str(ApiException) spreads the status, the reason, every
-    response header and the body over several lines — about 900 bytes, most
-    of it headers — so logging the exception whole buries the part that says
-    what went wrong (TS-02 in CLAUDE.md). This keeps only that part:
+    For an HTTP error (the exception's .status is set), the line is the status
+    and reason, then whichever of Kalshi's error code, message and details it
+    sent:
+        HTTP 400 Bad Request — missing_parameters: missing parameters (Key: ...)
+    If none of those three was sent, the response body itself follows a
+    colon, on one line. For any other error, the line is the error's type and
+    the first line of its message, e.g. "TimeoutError: read timed out".
 
-      * An HTTP error (the exception has a .status, as ApiException does):
-        "HTTP <status> <reason>", then the exchange's error code, message and,
-        when present, details from the response body (see api_error_payload):
-            HTTP 409 Conflict — fill_or_kill_insufficient_resting_volume: fill
-            or kill insufficient resting volume
-            HTTP 400 Bad Request — missing_parameters: missing parameters
-            (Key: 'CreateOrderV2Request.SelfTradePreventionType' ...)
-        A body that is not the exchange's JSON error object (a gateway's HTML
-        page, plain text) is kept as it is after a colon, on one line, so
-        nothing the exchange said is lost.
-      * Anything else (a dropped connection, a response the caller could not
-        read): the exception's class name and the first line of its message,
-        e.g. "ProtocolError: ('Connection aborted.', ...)".
-
-    trader.py uses it wherever it logs or records a failed request (order
-    submissions, the unwind, position and balance reads, transfers), and
-    scanner._fetch_orderbook for a failed order-book read.
+    trader.py logs and records failed orders, unwinds, reads and transfers
+    this way, and scanner.py failed order-book reads, instead of the
+    exception's own text, which runs over several lines and lists every
+    response header.
 
     Args:
         exc (BaseException): The exception to describe.
@@ -343,8 +324,7 @@ def api_error_summary(exc: BaseException, limit: int = _ERROR_SUMMARY_MAX_CHARS)
 
     Returns:
         str: One line of printable text, at most `limit` characters. Never
-            raises: an exception whose attributes cannot be read is named by
-            its class.
+            raises.
     """
     try:
         name = _one_line(type(exc).__name__) or "Exception"
@@ -368,7 +348,7 @@ def api_error_summary(exc: BaseException, limit: int = _ERROR_SUMMARY_MAX_CHARS)
             if details not in (None, ""):
                 text += f" ({_one_line(details)})"
             if not parts and details in (None, ""):
-                # Not the exchange's error object: keep whatever the body says
+                # Not Kalshi's error format: show the body itself
                 body = _one_line(_body_text(exc) or "")
                 if body:
                     text += f": {body}"
@@ -377,8 +357,7 @@ def api_error_summary(exc: BaseException, limit: int = _ERROR_SUMMARY_MAX_CHARS)
             first = _one_line(lines[0]) if lines else ""
             text = f"{name}: {first}" if first else name
     except Exception:
-        # The promise is one line and no exception: a broken error object is
-        # still named
+        # An error whose details cannot be read is named by its type
         text = name
     if len(text) <= limit:
         return text

@@ -13,8 +13,8 @@ Purpose:
     and its deliberate absence of internal retries, and the un-narrowed return
     contract both public helpers carry: a 2xx body is handed back exactly as the
     JSON parser produced it, object or not (DR-05). The error readers are
-    pinned to one line with the exchange's own code and message and none of
-    the response headers the SDK's exception text carries (TS-02).
+    checked to give one line with Kalshi's error code and message and no
+    response headers.
 
 Dependencies:
     Imports api_call_with_retry, api_error_payload, api_error_summary,
@@ -445,8 +445,7 @@ class TestNonObject2xxBodyIsReturnedUnnarrowed:
             assert "-> Any" in signature
 
 
-# Error bodies the V2 order endpoint sent on the production API (2026-09-28),
-# verbatim
+# Error responses Kalshi's order endpoint sent in live trading, word for word
 _MISSING_PARAMETERS_BODY = (
     '{"error":{"code":"missing_parameters","message":"missing parameters",'
     '"details":"Key: \'CreateOrderV2Request.SelfTradePreventionType\' '
@@ -457,8 +456,8 @@ _TOO_MANY_REQUESTS_BODY = '{"error":{"code":"too_many_requests","message":"too m
 
 
 def _raised_by_the_sdk(status: int, reason: str, body: bytes) -> ApiException:
-    """The exception _check_and_parse raises for a non-2xx response, built the
-    way the SDK builds it: status, reason, the response headers and the body."""
+    """Return the error _check_and_parse raises for a rejected response, with
+    its status, reason, headers and body."""
     resp = SimpleNamespace(
         status=status, reason=reason, data=body,
         getheaders=lambda: {
@@ -473,9 +472,8 @@ def _raised_by_the_sdk(status: int, reason: str, body: bytes) -> ApiException:
 
 
 class TestApiErrorSummary:
-    """api_error_summary describes a failed request in one line: the HTTP
-    status and reason, then the exchange's error code, message and details —
-    and never the response headers the SDK's own exception text lists."""
+    """api_error_summary gives one line: the HTTP status and reason, then
+    Kalshi's error code, message and details, and no response headers."""
 
     def test_status_reason_code_message_and_details_on_one_line(self):
         exc = _raised_by_the_sdk(400, "Bad Request", _MISSING_PARAMETERS_BODY.encode())
@@ -487,8 +485,7 @@ class TestApiErrorSummary:
 
     def test_the_headers_the_sdk_text_carries_are_left_out(self):
         exc = _raised_by_the_sdk(429, "Too Many Requests", _TOO_MANY_REQUESTS_BODY.encode())
-        # The SDK's own text for this exception: several lines, with every
-        # response header on one of them
+        # The exception's own text runs over several lines and lists the headers
         assert len(str(exc).splitlines()) >= 4
         assert "cloudfront" in str(exc)
         summary = api_error_summary(exc)
@@ -520,7 +517,8 @@ class TestApiErrorSummary:
         (b"plain bytes", "plain bytes"),
     ])
     def test_a_body_that_is_not_the_exchange_error_object_is_kept_on_one_line(self, body, shown):
-        # Whatever the exchange (or a gateway in front of it) said is kept
+        # A body that is not in Kalshi's error format is shown, flattened onto
+        # one line
         exc = ApiException(status=502, reason="Bad Gateway", body=body)
         assert api_error_summary(exc) == f"HTTP 502 Bad Gateway: {shown}"
 
@@ -542,9 +540,7 @@ class TestApiErrorSummary:
         assert api_error_summary(exc) == "HTTP 400 Bad Request — bad request: one two"
 
     def test_control_characters_become_spaces(self):
-        # A JSON body can carry control characters as \\u escapes, which the
-        # parse turns into real ones; the trade log's spreadsheet cell refuses
-        # them and a terminal escape would reach the log
+        # Control characters in the body become spaces
         body = json.dumps({"error": {"code": "bad", "message": "value \u0007\u001b[0m\u0000 here"}})
         exc = ApiException(status=400, reason="Bad Request", body=body)
         summary = api_error_summary(exc)
@@ -553,8 +549,8 @@ class TestApiErrorSummary:
         assert api_error_summary(ValueError("a\x1bb\x00c")) == "ValueError: a b c"
 
     def test_only_a_status_attribute_makes_an_http_summary(self):
-        # An error that keeps its status elsewhere (requests' .response) is
-        # described by its own message, which already names the status
+        # Only an error with a .status value is described as "HTTP <status>
+        # <reason>"; one whose status sits elsewhere is described by its message
         exc = RuntimeError("503 Server Error: upstream said no")
         exc.response = SimpleNamespace(status_code=503)
         assert api_error_summary(exc) == "RuntimeError: 503 Server Error: upstream said no"
@@ -619,8 +615,8 @@ class TestApiErrorSummary:
 
 
 class TestApiErrorPayload:
-    """api_error_payload is the one reader of an error response's JSON body,
-    shared by the V2 kill test (trader._is_fok_kill) and api_error_summary."""
+    """api_error_payload returns the error details in Kalshi's response, or
+    None when the body is not in that form."""
 
     def test_the_error_object_is_returned(self):
         exc = ApiException(status=400, reason="Bad Request", body=_MISSING_PARAMETERS_BODY)

@@ -99,12 +99,10 @@ Dependencies:
     from the kalshi_python_sync SDK, and fetch_json_page,
     signed_request_json plus api_call_with_retry from _http.py (the retry
     wrapper is used ONLY for the read-only position lookups, never for order
-    submission or the transfer POST), with api_error_payload (the reader of an
-    error response's JSON body, which _is_fok_kill checks for the kill code)
-    and api_error_summary (the one-line description every failed request is
-    logged and recorded with here, in place of the SDK's own exception text,
-    which lists every response header; only execute_trades' log of an
-    unexpected crash also carries the full traceback). Imports leg_prices, leg_sides,
+    submission or the transfer POST), with api_error_payload (reads the error
+    details Kalshi sends back; _is_fok_kill checks their code) and
+    api_error_summary (the one-line description every failed request is
+    logged and recorded with here). Imports leg_prices, leg_sides,
     tick_size_for_price and validate_pair_price from scanner.py (the first two
     are the only source of the side/market assignment, see _ordered_legs),
     read_shard_balances from auth.py (the shard-aware
@@ -1390,8 +1388,7 @@ def _is_fok_kill(exc: BaseException) -> bool:
         return False
     if getattr(exc, "status", None) != V2_FOK_KILL_HTTP_STATUS:
         return False
-    # The one reader of an error response's body, shared with the one-line
-    # summaries this module logs
+    # The error details Kalshi sent back
     error = api_error_payload(exc)
     return error is not None and error.get("code") == V2_FOK_KILL_ERROR_CODE
 
@@ -1824,44 +1821,37 @@ def _submit_order(
 
 def _partial_unwind_counts(exc: BaseException, count: int) -> tuple[str, str] | None:
     """
-    Read how many NO contracts a partial V2 unwind closed, and how many it
-    left open, from the unwind's own 2xx response.
+    Return how many NO contracts a partial unwind closed and how many are
+    still open.
 
-    When _v2_fill_status cannot classify a 2xx response, _submit_order_v2
-    raises _UnclassifiableV2Response with the response body attached. For the
-    immediate-or-cancel unwind, a fill count between zero and the full count
-    means it closed part of the position. Only _rollback_no_leg calls this: on
-    the two buy legs a partial fill must keep raising into _execute_one's
-    position check.
+    The unwind is immediate-or-cancel, so it may close only part of the
+    position. When it does, _submit_order_v2 raises _UnclassifiableV2Response carrying the order
+    response, and this reads the fill count from it. Only _rollback_no_leg
+    calls it.
 
     Args:
-        exc (BaseException): The exception the unwind's submission raised.
-        count (int): The NO leg's contract count.
+        exc (BaseException): The error the unwind raised.
+        count (int): How many NO contracts the pair bought.
 
     Returns:
-        tuple[str, str] | None: The contracts closed and the contracts still
-            open, as plain decimal text ("3.00" reads 3, "2.50" reads 2.5).
-            None when the count cannot be known — any other error, a body that
-            is not an object, a fill count that is missing, not a finite
-            number, not between zero and the full count, or too long to
-            subtract exactly. Never raises, so reading the count can never
-            cost the orphan alert.
+        tuple[str, str] | None: Contracts closed and contracts still open, as
+            plain numbers ("3", "2.5"), or None when the error carries no
+            usable fill count. Never raises.
     """
     try:
         if not (isinstance(exc, _UnclassifiableV2Response)
                 and isinstance(exc.response, dict)):
             return None
-        # The order object may be wrapped under "order" or sent flat — the
-        # same unwrap _v2_fill_status applies
+        # The order may be nested under "order" or sent at the top level
         inner = exc.response.get("order")
         order = inner if isinstance(inner, dict) else exc.response
         fill = _parse_fixed_point(order, "fill_count")
-        # is_finite first: comparing a NaN with < raises
+        # Only a finite count above zero and below the full count is a
+        # partial fill
         if fill is None or not fill.is_finite() or not 0 < fill < count:
             return None
-        # Exact decimal arithmetic only: a count that decimal's default
-        # 28-digit precision would round raises Inexact here, so it is
-        # reported as unknown rather than wrong
+        # Exact arithmetic only: a count too long to subtract exactly is
+        # treated as unknown
         with localcontext() as ctx:
             ctx.traps[Inexact] = True
             still_open = count - fill
@@ -1914,14 +1904,10 @@ def _rollback_no_leg(
 
     For that partial close the alert names the exact number of NO contracts
     still open: the NO leg's count minus the fill count the unwind's own 2xx
-    response reports, read by _partial_unwind_counts from the body
-    _submit_order_v2 attaches to its error (_UnclassifiableV2Response). Only
-    the unwind reads it, because _v2_fill_status also classifies the two buy
-    legs, where a partial fill must keep raising into _execute_one's position
-    check. The count
-    covers only the contracts this pair bought, as the unwind's response
-    reports them; the account may hold others on the same market, so the
-    alert still says to check the account. When the count cannot be known —
+    response reports, read by _partial_unwind_counts. The count covers only
+    the contracts this pair bought, as the unwind's response reports them;
+    the account may hold others on the same market, so the alert still says
+    to check the account. When the count cannot be known —
     an error response, a transport error, a body that is not JSON or not an
     object, a fill count that is missing, not a finite number, below zero or
     above the full count, or one too long to subtract exactly — the alert
@@ -1960,12 +1946,10 @@ def _rollback_no_leg(
             pace=pace if pace is not None else _ORDER_WRITE_PACER.acquire_hedge,
         )
     except Exception as exc:
-        # One line — status, reason, the exchange's error code and message —
-        # never the SDK's multi-line text with every response header
+        # One-line description of the error
         rb_error = api_error_summary(exc)
-        # How many NO contracts a partial V2 unwind closed and left open, as
-        # plain decimal text, when its own 2xx response says so (see the
-        # docstring); None when not known
+        # Contracts closed and still open after a partial unwind; None when
+        # not known
         counts = _partial_unwind_counts(exc, no_leg.count)
         if counts is not None:
             closed_text, open_text = counts
@@ -3000,10 +2984,7 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
                 error=f"NO leg FoK not filled: status={status_no}",
             )
     except Exception as e:
-        # One line — status, reason, the exchange's error code and message —
-        # for the logs below and TradeResult.error (the trade log's Notes
-        # cell); the SDK's own text spreads every response header over
-        # several lines
+        # One-line description of the error, for the logs and TradeResult.error
         no_leg_error = api_error_summary(e)
 
     # Disambiguation runs OUTSIDE the except block (mirroring the YES leg
@@ -3114,7 +3095,7 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
         if status_yes != "executed":
             yes_leg_error = f"YES leg FoK not filled: status={status_yes}"
     except Exception as e:
-        # One line, as for the NO leg above
+        # One-line description of the error
         yes_leg_error = f"YES leg error: {api_error_summary(e)}"
         yes_leg_ambiguous = True
 
@@ -3296,9 +3277,8 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
                 # could reverse a real fill, the same reasoning behind every
                 # other manual_review case in _execute_one. "A"/"B" are MARKET
                 # labels (market_a / market_b), not submission legs.
-                # The message and the result get the one-line summary; the
-                # traceback (exc_info) stays, since this is a bug, not a
-                # rejected request
+                # One-line description in the message and the result;
+                # exc_info adds the traceback
                 logging.critical(
                     "Unhandled exception executing '%s' (A=%s B=%s) — fill state "
                     "UNKNOWN, manual review required: %s",
