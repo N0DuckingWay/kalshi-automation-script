@@ -40,7 +40,10 @@ Purpose:
         (config.V2_SELF_TRADE_PREVENTION_TYPE). The unwind is the one order that
         is not fill_or_kill: it is reduce_only, and the endpoint accepts
         reduce_only only with immediate_or_cancel, so it fills what it can at
-        or under its loss-floored cap and cancels the rest.
+        or under its loss-floored cap and cancels the rest. The endpoint kills
+        a fill_or_kill order that cannot fill in full with an HTTP 409 error
+        (config.V2_FOK_KILL_ERROR_CODE) rather than a 2xx; _submit_order_v2
+        reads exactly that response as the status "canceled" (_is_fok_kill).
       "legacy" — the original /portfolio/orders create-order call
         (CreateOrderRequest, type="market", integer-cents buy_max_cost). Kept
         fully intact and unmodified so flipping ORDER_API_VERSION back to
@@ -51,7 +54,9 @@ Purpose:
 
     An exception from either submission path does NOT prove the order was
     rejected (a timeout can land after the fill), so exception paths consult the
-    actual account position for the ticker before classifying the outcome. The
+    actual account position for the ticker before classifying the outcome. (The
+    V2 kill response is not an exception by the time _execute_one sees it:
+    _submit_order_v2 returns it as "canceled", a confirmed non-fill.) The
     check is a DELTA, never an absolute holding: baseline snapshots for both
     tickers are taken up front, before either order is submitted (so no blocking
     call sits in the unhedged window between the NO leg's fill and the YES
@@ -77,7 +82,8 @@ Purpose:
 
 Dependencies:
     Imports TradeResult from reporter.py and TradeSpec from strategy.py. Imports
-    CreateOrderRequest from the kalshi_python_sync SDK, and fetch_json_page,
+    CreateOrderRequest and ApiException (to recognise the V2 kill response)
+    from the kalshi_python_sync SDK, and fetch_json_page,
     signed_request_json plus api_call_with_retry from _http.py (the retry
     wrapper is used ONLY for the read-only position lookups, never for order
     submission or the transfer POST). Imports leg_prices, leg_sides,
@@ -88,8 +94,9 @@ Dependencies:
     BUY_SLIPPAGE_TICKS, BUY_MAX_COST_SLIPPAGE_CENTS, DEFAULT_EXCHANGE_INDEX,
     ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, TRADER_MAX_WORKERS, TRANSFER_PATH,
     TRANSFER_POLL_INTERVAL_SECONDS, TRANSFER_SETTLE_TIMEOUT_SECONDS,
-    V2_ORDER_PATH, V2_ROLLBACK_BID_PRICE_DOLLARS and
-    V2_SELF_TRADE_PREVENTION_TYPE from config.py, with
+    V2_FOK_KILL_ERROR_CODE, V2_FOK_KILL_HTTP_STATUS, V2_ORDER_PATH,
+    V2_ROLLBACK_BID_PRICE_DOLLARS and V2_SELF_TRADE_PREVENTION_TYPE from
+    config.py, with
     LiveSettings and live_settings for pre_execution_check. Called by
     main.py after select_portfolio() selects the final trade list. Depends on
     the KalshiClient produced by auth.py.
@@ -165,6 +172,7 @@ Notes:
     dollar-string prices, and binary float noise would produce a string the
     exchange rejects as off-grid.
 """
+import json
 import logging
 import math
 import time
@@ -175,6 +183,7 @@ from decimal import ROUND_FLOOR, Decimal
 from json import JSONDecodeError
 from typing import Any
 
+from kalshi_python_sync.exceptions import ApiException
 from kalshi_python_sync.models import CreateOrderRequest
 
 from ._http import api_call_with_retry, fetch_json_page, signed_request_json
@@ -188,6 +197,8 @@ from .config import (
     TRANSFER_PATH,
     TRANSFER_POLL_INTERVAL_SECONDS,
     TRANSFER_SETTLE_TIMEOUT_SECONDS,
+    V2_FOK_KILL_ERROR_CODE,
+    V2_FOK_KILL_HTTP_STATUS,
     V2_ORDER_PATH,
     V2_ROLLBACK_BID_PRICE_DOLLARS,
     V2_SELF_TRADE_PREVENTION_TYPE,
@@ -874,7 +885,10 @@ def _v2_fill_status(data: dict, requested_count: int) -> str:
     _execute_one and _rollback_no_leg branch on one vocabulary for both order
     paths: "executed" for a full fill, "canceled" when nothing filled (a
     fill-or-kill buy leg that was killed, or an immediate-or-cancel unwind
-    that crossed nothing).
+    that crossed nothing). The endpoint reports a killed fill-or-kill as an
+    HTTP 409 error, which _submit_order_v2 turns into "canceled" before this
+    reader is reached (_is_fok_kill); a 2xx with a fill count of zero is also
+    read as a kill here.
 
     Anything else — a partial fill (which violates the fill-or-kill invariant
     on a buy leg) or a response with no readable fill count at all — is NOT
@@ -926,6 +940,51 @@ def _v2_fill_status(data: dict, requested_count: int) -> str:
     )
 
 
+def _is_fok_kill(exc: BaseException) -> bool:
+    """
+    Tell whether a submission's exception is the V2 endpoint's fill-or-kill kill.
+
+    The V2 create-order endpoint answers a fill_or_kill order that cannot fill
+    in full with HTTP config.V2_FOK_KILL_HTTP_STATUS and a JSON body of the
+    form {"error": {"code": config.V2_FOK_KILL_ERROR_CODE, "message": ...}}.
+    The exchange rejects such an order before it matches, so nothing filled:
+    it is a clean kill, not an ambiguous submission. Only that exact status
+    AND code count — any other error response says nothing certain about
+    whether the order filled, so it must keep reaching the caller's position
+    check.
+
+    Args:
+        exc (BaseException): The exception a submission raised.
+
+    Returns:
+        bool: True only for an ApiException (the SDK raises its
+            ConflictException subclass for a 409) whose status is the kill
+            status and whose body — a str, or UTF-8 bytes — parses as a JSON
+            object carrying the kill code under ["error"]["code"]. False for
+            anything else: another status or code, a missing or unparseable
+            body, a body that is not a JSON object, or any other exception
+            type. Never raises.
+    """
+    if not isinstance(exc, ApiException):
+        return False
+    if getattr(exc, "status", None) != V2_FOK_KILL_HTTP_STATUS:
+        return False
+    body = getattr(exc, "body", None)
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            body = bytes(body).decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+    if not isinstance(body, str):
+        return False
+    try:
+        payload = json.loads(body)
+    except (ValueError, RecursionError):
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return isinstance(error, dict) and error.get("code") == V2_FOK_KILL_ERROR_CODE
+
+
 def _submit_order_v2(client: Any, body: dict) -> str:
     """
     Submit one V2 order and return its fill status in the legacy vocabulary.
@@ -934,6 +993,15 @@ def _submit_order_v2(client: Any, body: dict) -> str:
     request is signed and executed through _http.signed_request_json, which
     raises ApiException on non-2xx exactly as the legacy path's fetch_json_page
     does — callers' exception handling is therefore unchanged.
+
+    One error response is not an exception here: the exchange's kill of a
+    fill_or_kill order (HTTP config.V2_FOK_KILL_HTTP_STATUS with
+    config.V2_FOK_KILL_ERROR_CODE — see _is_fok_kill). The order was rejected
+    before it matched, so nothing filled, and it is returned as "canceled",
+    exactly like a 2xx with a fill count of zero. A killed NO leg therefore ends
+    the pair as "failed" at once, and a killed YES leg goes straight to the
+    rollback, with no position read and no pause. The immediate_or_cancel
+    unwind is never read this way, so any error on it stays rollback_failed.
 
     Deliberately NOT wrapped in api_call_with_retry, for the same reason as the
     legacy _submit_order: retrying a fill-or-kill leg could double-submit it at
@@ -944,10 +1012,13 @@ def _submit_order_v2(client: Any, body: dict) -> str:
         body (dict): Request body from one of the _build_*_order_v2 builders.
 
     Returns:
-        str: "executed" (full fill) or "canceled" (killed with no fill).
+        str: "executed" (full fill) or "canceled" (killed with no fill — a 2xx
+            with a fill count of zero, or the exchange's kill response to a
+            fill_or_kill body).
 
     Raises:
-        ApiException: On non-2xx HTTP status.
+        ApiException: On any other non-2xx HTTP status or error code, and on
+            every error response to the immediate_or_cancel unwind.
         ValueError: When the response's fill count is missing or partial —
             _execute_one treats any exception on a buy leg as an ambiguous
             submission and consults the account position; _rollback_no_leg
@@ -960,9 +1031,24 @@ def _submit_order_v2(client: Any, body: dict) -> str:
         "Submitting V2 order: ticker=%s side=%s price=%s count=%s client_order_id=%s",
         body["ticker"], body["side"], body["price"], body["count"], body["client_order_id"],
     )
-    # Retry-free by design (see docstring); signed_request_json contains no
-    # retry logic of its own precisely so this call site stays single-shot
-    data = signed_request_json(client, "POST", V2_ORDER_PATH, body=body)
+    try:
+        # Retry-free by design (see docstring); signed_request_json contains no
+        # retry logic of its own precisely so this call site stays single-shot
+        data = signed_request_json(client, "POST", V2_ORDER_PATH, body=body)
+    except ApiException as exc:
+        # The exchange's kill of a fill-or-kill order is a clean non-fill, not
+        # an ambiguous error. Only on a fill_or_kill body: every other error,
+        # and any error on the immediate_or_cancel unwind, still raises.
+        if body.get("time_in_force") == "fill_or_kill" and _is_fok_kill(exc):
+            logging.info(
+                "V2 order killed by the exchange (HTTP %d %s), nothing filled:"
+                " ticker=%s side=%s price=%s count=%s client_order_id=%s",
+                V2_FOK_KILL_HTTP_STATUS, V2_FOK_KILL_ERROR_CODE,
+                body["ticker"], body["side"], body["price"], body["count"],
+                body["client_order_id"],
+            )
+            return "canceled"
+        raise
     return _v2_fill_status(data, requested)
 
 
@@ -1056,7 +1142,8 @@ def _submit_any(client: Any, order: Any) -> str:
             status string the legacy endpoint reports.
 
     Raises:
-        ApiException: On non-2xx HTTP status.
+        ApiException: On a non-2xx HTTP status, except the V2 fill-or-kill
+            kill response, which _submit_order_v2 returns as "canceled".
         ValueError/KeyError/TypeError: When the response cannot be classified;
             callers treat any exception as an ambiguous submission.
     """
@@ -2151,8 +2238,10 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     status and safety rule below is identical on both paths and for both pair
     types.
 
-    A rejected FoK (status != "executed") is a confirmed non-fill. An exception,
-    however, is ambiguous — the order may have filled before a timeout — so
+    A rejected FoK (status != "executed") is a confirmed non-fill; on V2 that
+    includes the exchange's HTTP 409 kill response, which _submit_order_v2
+    returns as "canceled". An exception, however, is ambiguous — the order may
+    have filled before a timeout — so
     exception paths attribute the outcome by POSITION DELTA: baseline positions
     for BOTH legs' tickers are read up front (the NO leg's first, then the YES
     leg's), before any order is submitted, and are compared with a reading

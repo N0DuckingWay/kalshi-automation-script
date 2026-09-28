@@ -68,6 +68,7 @@ from kalshi_betting.trader import (
     _execute_transfer,
     _format_count,
     _format_price,
+    _is_fok_kill,
     _legacy_routable,
     _ordered_legs,
     _partition_by_funding,
@@ -75,6 +76,7 @@ from kalshi_betting.trader import (
     _position_count,
     _required_cents_by_shard,
     _rollback_floor_cents,
+    _submit_order_v2,
     _transfers_active,
     _unfunded_shards,
     _v2_fill_status,
@@ -236,6 +238,19 @@ def v2_resp(fill_count, requested: int = 5) -> dict:
             "ts_ms": 1_700_000_000_000,
         }
     }
+
+
+# The body the V2 endpoint sent, verbatim, when it killed a fill-or-kill ask
+# that could not fill on the production API (2026-09-28).
+FOK_KILL_BODY = (
+    '{"error":{"code":"fill_or_kill_insufficient_resting_volume",'
+    '"message":"fill or kill insufficient resting volume"}}'
+)
+
+
+def fok_kill_error() -> ApiException:
+    """The HTTP 409 the V2 endpoint answers a fill-or-kill that cannot fill."""
+    return ApiException(status=409, reason="Conflict", body=FOK_KILL_BODY)
 
 
 def order_resp(status: str) -> SimpleNamespace:
@@ -1854,6 +1869,147 @@ class TestV2FillStatus:
         assert _v2_fill_status({"fill_count": 10}, 10) == "executed"
 
 
+class TestIsFokKill:
+    """_is_fok_kill recognises exactly one response: HTTP 409 whose JSON body
+    carries the fill-or-kill kill code under ["error"]["code"]."""
+
+    def test_the_exchanges_kill_response_is_a_kill(self):
+        assert _is_fok_kill(fok_kill_error()) is True
+
+    def test_a_bytes_body_is_read_as_utf_8(self):
+        exc = ApiException(status=409, reason="Conflict", body=FOK_KILL_BODY.encode())
+        assert _is_fok_kill(exc) is True
+
+    def test_the_sdk_exception_for_a_409_response_is_a_kill(self):
+        # The exception the live transport really raises: _check_and_parse
+        # hands a 409 to ApiException.from_response, which raises the SDK's
+        # ConflictException subclass with the decoded body.
+        resp = SimpleNamespace(
+            status=409, reason="Conflict", data=FOK_KILL_BODY.encode("utf-8"),
+            getheaders=lambda: {"content-type": "application/json"},
+        )
+        with pytest.raises(ApiException) as exc_info:
+            _http._check_and_parse(resp)
+        assert type(exc_info.value) is not ApiException
+        assert _is_fok_kill(exc_info.value) is True
+
+    @pytest.mark.parametrize("exc", [
+        ApiException(status=409, reason="Conflict", body=None),
+        ApiException(status=409, reason="Conflict"),
+        ApiException(
+            status=409, reason="Conflict",
+            body='{"error":{"code":"insufficient_balance","message":"x"}}',
+        ),
+        ApiException(status=400, reason="Bad Request", body=FOK_KILL_BODY),
+        ApiException(status=409, reason="Conflict", body="not json"),
+        ApiException(status=409, reason="Conflict", body=""),
+        ApiException(status=409, reason="Conflict", body=b"\xff\xfe"),
+        ApiException(status=409, reason="Conflict", body=json.dumps([FOK_KILL_BODY])),
+        ApiException(
+            status=409, reason="Conflict",
+            body='{"error":"fill_or_kill_insufficient_resting_volume"}',
+        ),
+        ApiException(
+            status=409, reason="Conflict",
+            body='{"code":"fill_or_kill_insufficient_resting_volume"}',
+        ),
+        ApiException(status=409, reason="Conflict", body=123),
+        ApiException(status="409", reason="Conflict", body=FOK_KILL_BODY),
+        Exception(FOK_KILL_BODY),
+        TimeoutError("timeout"),
+    ], ids=[
+        "none-body", "no-body", "another-code", "status-400", "non-json",
+        "empty-body", "non-utf8-bytes", "json-list", "error-not-object",
+        "code-not-under-error", "int-body", "string-status", "plain-exception",
+        "timeout",
+    ])
+    def test_anything_else_is_not_a_kill(self, exc):
+        assert _is_fok_kill(exc) is False
+
+    def test_an_exception_that_is_not_an_api_exception_is_not_a_kill(self):
+        # Carrying the kill's status and body is not enough: only the SDK's
+        # ApiException comes from the exchange's HTTP response.
+        exc = Exception("look-alike")
+        exc.status = 409
+        exc.body = FOK_KILL_BODY
+        assert _is_fok_kill(exc) is False
+
+    def test_a_subclass_with_another_status_is_not_a_kill(self):
+        # The SDK's own 400 subclass carrying the kill code is still not the
+        # kill: the status and the code must both match.
+        from kalshi_python_sync.exceptions import BadRequestException
+        exc = BadRequestException(status=400, reason="Bad Request", body=FOK_KILL_BODY)
+        assert _is_fok_kill(exc) is False
+
+    def test_the_constants_are_the_observed_response(self):
+        # The wire values the exchange sent; config is the one place they live.
+        assert config.V2_FOK_KILL_HTTP_STATUS == 409
+        assert config.V2_FOK_KILL_ERROR_CODE == "fill_or_kill_insufficient_resting_volume"
+
+
+class TestSubmitOrderV2KillResponse:
+    """_submit_order_v2 returns the kill response to a fill_or_kill body as
+    "canceled", single-shot, and re-raises every other error."""
+
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
+
+    @pytest.mark.parametrize("builder, leg", [
+        (_build_no_order_v2, _no_leg), (_build_yes_order_v2, _yes_leg),
+    ], ids=["no-leg", "yes-leg"])
+    def test_a_killed_fill_or_kill_is_canceled(self, post, caplog, builder, leg):
+        body = builder(leg(make_spec()))
+        assert body["time_in_force"] == "fill_or_kill"
+        post.side_effect = fok_kill_error()
+        with caplog.at_level(logging.INFO):
+            assert _submit_order_v2(MagicMock(), body) == "canceled"
+        # One POST: the kill is an answer, never a reason to resubmit
+        assert post.call_count == 1
+        kill_lines = [r for r in caplog.records if "killed by the exchange" in r.getMessage()]
+        assert len(kill_lines) == 1
+        assert kill_lines[0].levelno == logging.INFO
+        line = kill_lines[0].getMessage()
+        for part in (
+            "409", "fill_or_kill_insufficient_resting_volume", body["ticker"],
+            body["side"], body["price"], body["count"], body["client_order_id"],
+        ):
+            assert part in line
+        # Nothing at WARNING or above: a kill is routine
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_the_same_response_to_the_unwind_raises(self, post):
+        # The immediate_or_cancel unwind never gets the fill-or-kill reading:
+        # an error on it stays an error, which _rollback_no_leg reports as
+        # rollback_failed.
+        body = _build_rollback_order_v2(_no_leg(make_spec()))
+        assert body["time_in_force"] == "immediate_or_cancel"
+        err = fok_kill_error()
+        post.side_effect = err
+        with pytest.raises(ApiException) as exc_info:
+            _submit_order_v2(MagicMock(), body)
+        assert exc_info.value is err
+        assert post.call_count == 1
+
+    @pytest.mark.parametrize("err", [
+        ApiException(
+            status=409, reason="Conflict",
+            body='{"error":{"code":"insufficient_balance","message":"x"}}',
+        ),
+        ApiException(status=400, reason="Bad Request", body=FOK_KILL_BODY),
+        ApiException(status=500, reason="Internal Server Error"),
+    ], ids=["409-another-code", "400-kill-code", "500"])
+    def test_any_other_error_raises(self, post, err):
+        post.side_effect = err
+        with pytest.raises(ApiException) as exc_info:
+            _submit_order_v2(MagicMock(), _build_no_order_v2(_no_leg(make_spec())))
+        assert exc_info.value is err
+        assert post.call_count == 1
+
+
 class TestV2ExecuteOne:
     """The full legacy outcome matrix, replayed against the V2 order path."""
 
@@ -1969,6 +2125,45 @@ class TestV2ExecuteOne:
         result = _execute_one(client, make_spec())
         assert result.status == "manual_review"
         assert post.call_count == 2
+
+    def test_v2_leg_a_kill_response_is_failed_at_once(self, post, monkeypatch, caplog):
+        # The exchange's HTTP 409 kill of the NO leg is a confirmed non-fill:
+        # the pair ends "failed" with no position read after the submission
+        # and no pause, and nothing is logged at ERROR.
+        slept: list = []
+        monkeypatch.setattr(trader.time, "sleep", lambda s: slept.append(s))
+        post.side_effect = [fok_kill_error()]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(None, None)
+        with caplog.at_level(logging.INFO):
+            result = _execute_one(client, make_spec())
+        assert result.status == "failed"
+        assert result.error == "NO leg FoK not filled: status=canceled"
+        assert post.call_count == 1
+        # The two up-front baselines only
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert slept == []
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_v2_leg_b_kill_response_rolls_back_at_once(self, post, monkeypatch):
+        # The exchange's HTTP 409 kill of the YES leg goes straight to the
+        # unwind: no position read after the submission and no pause before
+        # the rollback, which is immediate_or_cancel as always.
+        slept: list = []
+        monkeypatch.setattr(trader.time, "sleep", lambda s: slept.append(s))
+        post.side_effect = [v2_resp(5), fok_kill_error(), v2_resp(5)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(None, None)
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+        assert result.error == "YES leg FoK not filled: status=canceled"
+        assert post.call_count == 3
+        rollback_body = post.call_args_list[2].kwargs["body"]
+        assert rollback_body["ticker"] == "TICK-A"
+        assert rollback_body["reduce_only"] is True
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert slept == []
 
     def test_v2_exactly_one_post_per_leg_no_retry_on_5xx(self, post, monkeypatch):
         # A 5xx on an order submission must NEVER be retried: a second FoK

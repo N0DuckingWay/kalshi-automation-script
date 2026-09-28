@@ -722,6 +722,18 @@ V2_ORDER_PATH                 = "/trade-api/v2/portfolio/events/orders"
 # On the unwind, either one is rollback_failed.
 V2_SELF_TRADE_PREVENTION_TYPE = "taker_at_cross"
 
+# What the V2 create-order endpoint sends when a fill_or_kill order cannot fill
+# in full: an HTTP 409 error whose JSON body reads
+# {"error": {"code": V2_FOK_KILL_ERROR_CODE, "message": ...}}. The exchange
+# rejects such an order before it matches, so nothing filled and nothing rests
+# — it is the endpoint's kill. trader._submit_order_v2 reads exactly this
+# status AND this code, on a fill_or_kill body only, as a kill ("canceled").
+# Every other error response still raises — on a buy leg into the caller's
+# position check, on the unwind into rollback_failed — because an error the
+# bot cannot name is no proof that nothing filled.
+V2_FOK_KILL_HTTP_STATUS       = 409
+V2_FOK_KILL_ERROR_CODE        = "fill_or_kill_insufficient_resting_volume"
+
 # TOP-OF-GRID CEILING CLAMP, as a dollar string, on the V2 reduce-only rollback
 # bid that unwinds a filled NO leg (market_a for same-title, market_b for
 # time-series — see trader._ordered_legs). On the single-YES-book model a held
