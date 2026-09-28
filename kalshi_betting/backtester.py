@@ -2405,7 +2405,8 @@ def _ladder_keys_dict(m: dict, question_key: str | None = None) -> frozenset:
     Returns:
         frozenset: Up to two labels, one for the event and one for the question.
     """
-    # The live rule's own labels, so the two paths agree on what a ladder is
+    # The same labels the live rule uses. A cached market often has no event
+    # title, which can make its question match more markets than it would live
     return ladder_keys(m.get("event_ticker"),
                        _ts_group_key(m) if question_key is None else question_key)
 
@@ -7071,8 +7072,10 @@ def _split_halves(entries: list[dict], split_date: date) -> tuple[list[dict], li
     on one of its Mondays — are a subset of the full run's, at the same
     prices, and its peak Kelly fraction is never above the full run's, which
     lets CapSweep reuse the halves at every size cap at or above that
-    fraction. The cost: an H1 pair whose only Kelly-passing Mondays fall on
-    or after the split trades in neither half.
+    fraction. The cost: an H1 pair trades in neither half when the full run
+    can only take it after the split — because its only Kelly-passing
+    Mondays fall there, or because its ladder was busy (or cash short) on
+    every earlier one.
 
     Trimming a pair's Mondays builds a new record rather than editing the
     old one, because records are shared (by a band's populations, checks and
