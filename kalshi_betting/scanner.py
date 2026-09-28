@@ -44,10 +44,13 @@ Dependencies:
     the one definition of the same-title close gate, with
     close_gap_bound_text, the bound its refusal line prints (DR-74)).
     pair_gap_days() is the single reader of that gap for everything
-    downstream of pair formation. historical.py imports event_series too, so
-    the backtest's event-title lookup budget tells a combo ticker from any
-    other exactly as the one-series rule does (DR-51). Depends on the
-    KalshiClient produced by auth.py.
+    downstream of pair formation. ladder_keys(), market_ladder_keys() and
+    pair_ladder_keys() name the ladders a market is on (its event, and its
+    question with the dates removed), and resolve_held_ladders() finds the
+    ladders of the markets the account holds. historical.py imports
+    event_series too, so the backtest's event-title lookup budget tells a
+    combo ticker from any other exactly as the one-series rule does (DR-51).
+    Depends on the KalshiClient produced by auth.py.
 
 Notes:
     The normalize_title() approach avoids fuzzy matching entirely — it relies on
@@ -2158,6 +2161,64 @@ def time_series_group_key(combined_title: str, subtitle: Any) -> str:
     return f"{base} | {sub}" if sub else base
 
 
+def ladder_keys(event_ticker: Any, question_key: Any) -> frozenset:
+    """
+    Return labels naming the ladders a market belongs to.
+
+    A ladder is one question asked at several deadlines. Two markets are on
+    the same ladder if they are in the same event, or ask the same question
+    once the dates are removed. Each label is tagged with its kind, so an
+    event ticker can never match a question. Blank or non-text values are
+    ignored.
+
+    Args:
+        event_ticker (Any): The market's event ticker.
+        question_key (Any): The market's question with its dates removed.
+
+    Returns:
+        frozenset: Up to two labels, such as ("event", "KXSENATEREC-26MAY").
+    """
+    keys = set()
+    if isinstance(event_ticker, str) and event_ticker:
+        keys.add(("event", event_ticker))
+    if isinstance(question_key, str) and question_key:
+        keys.add(("question", question_key))
+    return frozenset(keys)
+
+
+def market_ladder_keys(market: Any) -> frozenset:
+    """
+    Return the ladder labels of one market.
+
+    The question label is the same key the time-series finder groups
+    markets by.
+
+    Args:
+        market (Any): A market object with an event ticker and titles.
+
+    Returns:
+        frozenset: The market's event and question labels.
+    """
+    name = pair_key(market)
+    # A market whose name is not text, such as a fake one in a test, gets no question label
+    question = (time_series_group_key(name, getattr(market, "subtitle", "") or "")
+                if isinstance(name, str) else "")
+    return ladder_keys(getattr(market, "event_ticker", ""), question)
+
+
+def pair_ladder_keys(pair: Any) -> frozenset:
+    """
+    Return the ladder labels of both markets in a pair.
+
+    Args:
+        pair (Any): A pair with market_a and market_b.
+
+    Returns:
+        frozenset: Every label of either market.
+    """
+    return market_ladder_keys(pair.market_a) | market_ladder_keys(pair.market_b)
+
+
 def display_title(market: Any) -> str:
     """
     Human-readable label for console and Excel output.
@@ -2410,7 +2471,7 @@ def get_held_tickers(client: Any) -> set:
 @dataclass
 class ApiMarket:
     """
-    Lightweight market object parsed from a raw /events JSON dict.
+    Lightweight market object parsed from a raw market JSON dict.
 
     Stands in for the SDK's Market model, which can no longer deserialize live
     responses: as of 2026-07 the API stopped populating the legacy integer-cent
@@ -2474,7 +2535,7 @@ def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
     handles the API's trailing-"Z" UTC format on Python >= 3.11.
 
     Args:
-        m (dict): One market object from a raw events-endpoint JSON payload.
+        m (dict): One market from a raw market or event reply.
         event_title (str): Parent event's title, attached as _event_title.
 
     Returns:
@@ -2509,6 +2570,132 @@ def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
         exchange_index=_shard_index(m),
         _event_title=event_title,
     )
+
+
+def _error_text(exc: BaseException) -> str:
+    """
+    Describe a failed request in one short line.
+
+    An error with an HTTP status gives its type, the status and any
+    reason. Any other error gives its type and the first line of its
+    message. An error's whole message is never used, because an exchange
+    error's message lists every response header.
+
+    Args:
+        exc (BaseException): The error to describe.
+
+    Returns:
+        str: One line of at most 160 characters, such as
+            "NotFoundException (HTTP 404 Not Found)".
+    """
+    name = type(exc).__name__
+    try:
+        status = getattr(exc, "status", None)
+        if status is not None:
+            reason = getattr(exc, "reason", None)
+            detail = f"HTTP {status} {reason}" if reason else f"HTTP {status}"
+            return f"{name} ({detail})"[:160]
+        lines = str(exc).strip().splitlines()
+        first = lines[0].strip() if lines else ""
+        return f"{name}: {first}"[:160] if first else name
+    except Exception:
+        # A broken error object still gets named
+        return name
+
+
+def _fetch_held_market(client: Any, ticker: str, event_titles: dict) -> ApiMarket | None:
+    """
+    Ask the exchange for one held market and its event's title.
+
+    The event title is part of the market's question, so without it the
+    market's question label would not match the other markets on its
+    ladder. Titles are kept in `event_titles`, so two markets of one event
+    cost one event request.
+
+    Args:
+        client (Any): An authenticated Kalshi client.
+        ticker (str): The held market's ticker.
+        event_titles (dict): Event titles already fetched, by event ticker.
+
+    Returns:
+        ApiMarket | None: The market, or None if it or its event can't be read.
+    """
+    try:
+        # Raw reply, retried on rate limits and server errors
+        data = api_call_with_retry(
+            fetch_json_page, client.get_market_without_preload_content, ticker=ticker
+        )
+        raw = data.get("market") if isinstance(data, dict) else None
+        if not isinstance(raw, dict):
+            logging.warning("Could not look up held market %s: the reply had no market", ticker)
+            return None
+        event_ticker = raw.get("event_ticker")
+        if not isinstance(event_ticker, str) or not event_ticker:
+            logging.warning("Could not look up held market %s: it has no event ticker", ticker)
+            return None
+        if event_ticker not in event_titles:
+            # Same raw, retried request for the market's event
+            ev_data = api_call_with_retry(
+                fetch_json_page, client.get_event_without_preload_content,
+                event_ticker=event_ticker,
+            )
+            event = ev_data.get("event") if isinstance(ev_data, dict) else None
+            if not isinstance(event, dict):
+                logging.warning("Could not look up held market %s: the reply for its event "
+                                "%s had no event", ticker, event_ticker)
+                return None
+            # An event without a title reads as "", as it does in the market list
+            event_titles[event_ticker] = event.get("title") or ""
+        # Same parsing as the market list, so its labels match the other markets on its ladder
+        return _market_from_dict(raw, event_titles[event_ticker])
+    except Exception as exc:
+        logging.warning("Could not look up held market %s: %s", ticker, _error_text(exc))
+        return None
+
+
+def resolve_held_ladders(client: Any, markets: list, held_tickers: set) -> frozenset | None:
+    """
+    Return the ladder labels of every market we currently hold.
+
+    Uses this run's market list where it can, and asks the exchange about
+    any held market missing from it, such as one that has closed but not
+    yet paid out. If a held market can't be identified, it returns None:
+    the caller must then make no time-series trade, because it can't tell
+    which ladder that position is on.
+
+    Args:
+        client (Any): An authenticated Kalshi client.
+        markets (list): This run's markets, before held ones are removed.
+        held_tickers (set): Tickers the account holds a position in.
+
+    Returns:
+        frozenset | None: Every held market's labels, or None if one is unknown.
+    """
+    by_ticker = {m.ticker: m for m in markets}
+    event_titles: dict = {}
+    keys: set = set()
+    looked_up = 0
+    for ticker in sorted(held_tickers, key=str):
+        market = None
+        # A position with no ticker can't be matched to any market
+        if isinstance(ticker, str) and ticker:
+            market = by_ticker.get(ticker)
+            if market is None:
+                market = _fetch_held_market(client, ticker, event_titles)
+                looked_up += 1
+        if market is None:
+            # The answer is already None, so stop rather than wait on more requests
+            logging.error(
+                "Could not look up held market %r, so no time-series trade will be "
+                "made this run (%d held market(s) in all)", ticker, len(held_tickers))
+            return None
+        keys |= market_ladder_keys(market)
+    logging.info(
+        "Open ladder exposure: %d held market(s) in %d event(s), asking %d question(s) "
+        "(%d looked up because this run's market list did not have them)",
+        len(held_tickers), sum(k[0] == "event" for k in keys),
+        sum(k[0] == "question" for k in keys), looked_up)
+    return frozenset(keys)
 
 
 def _shard_index(m: dict) -> int:

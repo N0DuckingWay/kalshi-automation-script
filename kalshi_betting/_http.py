@@ -51,13 +51,14 @@ Notes:
     None) reaches the caller unchanged. Callers that immediately `.get()` it
     raise AttributeError on such a body, and callers that subscript it
     (trader._submit_order's `data["order"]["status"]`) raise TypeError. Both
-    are deliberate loud failures at every call site, order submission included:
+    are deliberate loud failures at most call sites, order submission included:
     there an exception is what routes trader._execute_one into its
     ambiguous-submission path, which reconciles the outcome against the
-    account's position ledger. trader._execute_transfer is the one exception —
+    account's position ledger. trader._execute_transfer is one exception —
     an accepted transfer has no such ledger to reconcile it against and its
     caller's generic handler would report a FAILED POST — so it guards with
-    isinstance(..., dict) instead (DR-05).
+    isinstance(..., dict) instead (DR-05). Some read-only lookups also check
+    the type, and treat such a body as a failed read.
 """
 import json
 import logging
@@ -251,11 +252,12 @@ def fetch_json_page(fetch_fn: Any, **kwargs) -> Any:  # whatever the 2xx body pa
             raise TypeError. Both are deliberate loud failures: on the order
             path, raising is what routes trader._execute_one into its
             ambiguous-submission path, where the account position decides the
-            outcome. The one call site that instead guards with
+            outcome. One call site that instead guards with
             isinstance(..., dict) — because its 2xx has already moved money and
             nothing reconciles a transfer after the fact — is
             trader._execute_transfer, which reads signed_request_json rather
-            than this helper (DR-05).
+            than this helper (DR-05). Some read-only lookups also check the
+            type, and treat such a body as a failed read.
 
     Raises:
         ApiException: (or a status-specific subclass) when the HTTP status is
