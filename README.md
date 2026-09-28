@@ -510,6 +510,10 @@ scheduler runs at Monday 09:00 host-local; anchored at 09:00 PT the cell
 returns +26.3% with a −24.2% max drawdown, and across 13 anchors the live
 replay spans −56% to +51%). The operator shipped them despite V0's STOP and the
 anchor finding.
+The backtest now enters at the scheduler's own instant (see the v3 prefilter
+note below); measured exactly over one corpus assembled for it, this rule's
+cell returns +1.9% with a −26.4% max drawdown at 09:00 Los Angeles, against
++58.9% / −13.2% at 09:00 UTC on the same corpus.
 
 Each toggle has a flag that
 overrides it for **this run only**, in either mode: `--tier-floors` /
@@ -940,8 +944,12 @@ backtest used to enter every trade at Monday 09:00 UTC; it now enters at
 Monday 09:00 America/Los_Angeles, 16:00 UTC under daylight time and 17:00 UTC
 under standard time. Two replays of the 365-day window on 2026-09-27 (band
 0–0.5, tier floors off, k 0.80, cap 0.20) put the difference at roughly +78.4%
-at 09:00 UTC against +26.3% at 09:00 Los Angeles, so no backtest result or
-dashboard from before this change is comparable with one after it. The
+at 09:00 UTC against +26.3% at 09:00 Los Angeles. Measured exactly the same day
+over one corpus assembled under the new prefilter, that cell went from +58.9%
+(09:00 UTC) to +1.9% (09:00 Los Angeles), the primary cell from +116.4% to
++136.3%, and the pooled empirical k̂ from 0.891 to 0.958 (see the entry-checkpoint
+gotcha in `CLAUDE.md`). No backtest result or dashboard from before this change is
+comparable with one after it. The
 eligibility prefilter now keeps a market only if it opened before the start of
 some reachable checkpoint's candle hour, and the assembled cache is keyed by
 the prefilter's version and the schedule together
