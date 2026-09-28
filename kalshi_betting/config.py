@@ -1138,8 +1138,39 @@ FLAT_RETURN_TOLERANCE: float = 1e-12
 # ceiling rather than a tuned throughput figure; unlike the fetch pools it has
 # never been exercised at scale against the live API. Raise cautiously — the
 # execution pool submits real orders, so each extra worker is another
-# concurrent write against the account.
+# concurrent write against the account. The workers' writes share one pacer
+# (ORDER_WRITES_PER_SECOND below), so more workers never mean faster writes,
+# but they do mean longer waits: a pair's YES leg and its rollback each wait
+# their turn behind the other workers' writes while its NO leg is filled and
+# unhedged, at most TRADER_MAX_WORKERS / ORDER_WRITES_PER_SECOND seconds per
+# write (1 s at 8 and 8), since each worker holds at most one place in line.
+# That wait is the accepted cost of the HTTP 429s the pacer prevents (a 429 on
+# a rollback leaves the position open); see trader._execute_one.
 TRADER_MAX_WORKERS = 8
+
+# How fast trader.py sends order and collateral-transfer POSTs, across every
+# worker thread together: at most ORDER_WRITE_BURST back to back, then one
+# every 1/ORDER_WRITES_PER_SECOND seconds (trader._ORDER_WRITE_PACER, a token
+# bucket that refills at this rate up to this burst). Kalshi limits writes per
+# account with a token bucket of its own that refills continuously, not per
+# window: the Basic tier refills 100 tokens a second into a 100-token bucket
+# (GET /account/limits), and an order or transfer POST costs the default 10
+# tokens (GET /account/endpoint_costs lists no override for either), so the
+# exchange accepts 10 orders a second and 10 back to back. Beyond that it
+# answers HTTP 429 and rejects the request outright, unprocessed, which on a
+# YES leg means an unhedged NO leg and a rollback, and on the rollback itself
+# an open position. In any T seconds the pacer admits at most 8 + 8*T writes,
+# never more than the exchange's 10 + 10*T; 8 and 8 leave 20% of that budget
+# for writes the bot does not see (another client on the account, a manual
+# order). Pacing sets when a request is sent, not when it arrives, so large
+# network jitter can still bunch arrivals, and the pacer is per process, so a
+# second process writing to the account (a manual run overlapping a scheduled
+# one, a probe's transfer) paces itself separately at the full rate. A higher
+# usage tier (GET /account/limits names the account's own) allows more; these
+# are safe to raise only up to that tier's write budget divided by the order
+# cost (10 tokens).
+ORDER_WRITES_PER_SECOND = 8
+ORDER_WRITE_BURST = 8
 
 # Names the SEMANTICS of backtester._can_ever_enter(), which run_backtest()
 # passes to historical.fetch_all_settled_markets() as a prefilter so ineligible

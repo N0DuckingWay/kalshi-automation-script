@@ -25,7 +25,12 @@ Purpose:
     status is verified either way, and a rollback that did not close the whole
     position is reported as status="rollback_failed" (orphaned position,
     manual review). Multiple pairs are executed concurrently via
-    ThreadPoolExecutor so no pair waits for another to complete.
+    ThreadPoolExecutor, so no pair waits for another to complete, but their
+    POSTs share one pacer: every order and collateral-transfer POST, from every
+    worker, first takes a place on _ORDER_WRITE_PACER (a token bucket at
+    config.ORDER_WRITES_PER_SECOND with bursts of config.ORDER_WRITE_BURST),
+    so concurrent pairs stay under the account's write limit instead of
+    drawing HTTP 429 rejections from the exchange.
 
     Two order paths exist, selected by config.ORDER_API_VERSION:
       "v2" (default) — POST config.V2_ORDER_PATH (/portfolio/events/orders) with
@@ -58,13 +63,24 @@ Purpose:
     V2 kill response is not an exception by the time _execute_one sees it:
     _submit_order_v2 returns it as "canceled", a confirmed non-fill.) The
     check is a DELTA, never an absolute holding: baseline snapshots for both
-    tickers are taken up front, before either order is submitted (so no blocking
-    call sits in the unhedged window between the NO leg's fill and the YES
-    leg's submission), and each is compared against a reading taken after the
-    exception, so the decision reflects what this order did rather than what the
-    account happens to hold (an unrelated pre-existing holding in the same
-    ticker used to read as "our leg filled", and an unrelated absence used to
-    read as "our leg didn't").
+    tickers are taken up front, before either order is submitted (so neither
+    baseline read sits in the unhedged window between the NO leg's fill and the
+    YES leg's submission), and each is compared against a reading taken after
+    the exception, so the decision reflects what this order did rather than
+    what the account happens to hold (an unrelated pre-existing holding in the
+    same ticker used to read as "our leg filled", and an unrelated absence used
+    to read as "our leg didn't").
+
+    The write pacer's wait does sit in that window. The YES leg's POST, and a
+    rollback's, each take a place on _ORDER_WRITE_PACER like every other write,
+    first come, first served in the order callers take its lock, so another
+    pair's opening NO leg can go ahead of this pair's hedge. Each worker holds
+    at most one place at a time, so one wait is at most
+    TRADER_MAX_WORKERS / ORDER_WRITES_PER_SECOND seconds (1 s at the shipped
+    values); raising TRADER_MAX_WORKERS or lowering the rate lengthens it. That
+    wait is the accepted cost of the HTTP 429s the pacer prevents: a 429 on a
+    YES leg costs a rollback, and a 429 on the rollback is rollback_failed, an
+    open position (see _execute_one for the measured waits).
 
     pre_execution_check() re-fetches order books for each spec in the portfolio
     concurrently and drops any whose prices have moved since the scan, reducing
@@ -91,6 +107,7 @@ Dependencies:
     are the only source of the side/market assignment, see _ordered_legs),
     read_shard_balances from auth.py (the shard-aware
     balance re-read the transfer settle-poll needs), and ORDER_API_VERSION,
+    ORDER_WRITES_PER_SECOND, ORDER_WRITE_BURST,
     BUY_SLIPPAGE_TICKS, BUY_MAX_COST_SLIPPAGE_CENTS, DEFAULT_EXCHANGE_INDEX,
     ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, TRADER_MAX_WORKERS, TRANSFER_PATH,
     TRANSFER_POLL_INTERVAL_SECONDS, TRANSFER_SETTLE_TIMEOUT_SECONDS,
@@ -109,7 +126,10 @@ Notes:
     is not idempotent, so a retried transfer moves the money twice.
     _submit_order calls fetch_json_page directly and _submit_order_v2 /
     _execute_transfer call signed_request_json directly; none of those three may
-    ever be wrapped in api_call_with_retry.
+    ever be wrapped in api_call_with_retry. Each of the three waits on
+    _ORDER_WRITE_PACER before its POST, and that is not a retry: the pacer only
+    delays a request, which is then sent exactly once. An HTTP 429 that still
+    comes back raises like any other error response.
 
     The read-only position lookups in _position_count ARE retried, and that
     asymmetry is the rule, not an oversight: they are read-only GETs, so a
@@ -175,8 +195,10 @@ Notes:
 import json
 import logging
 import math
+import threading
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from decimal import ROUND_FLOOR, Decimal
@@ -192,6 +214,8 @@ from .config import (
     BUY_MAX_COST_SLIPPAGE_CENTS,
     DEFAULT_EXCHANGE_INDEX,
     ORDER_API_VERSION,
+    ORDER_WRITE_BURST,
+    ORDER_WRITES_PER_SECOND,
     ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT,
     TRADER_MAX_WORKERS,
     TRANSFER_PATH,
@@ -359,6 +383,111 @@ _V2_NO_MAPPING_CONFIRMED = False
 # never the absolute sign). One second is far above observed ledger lag and
 # far below any price-staleness concern.
 _V2_MAPPING_RECHECK_DELAY_SECONDS = 1.0
+
+# A pacing wait at or under this many seconds is not logged: a few orders
+# queued behind a full burst wait a fraction of a second each, and a line per
+# order would bury the execution log. A longer wait gets one INFO line, so a
+# gap between two submissions in the log has its cause beside it.
+_PACE_LOG_MIN_WAIT_SECONDS = 0.25
+
+
+class _WritePacer:
+    """
+    A thread-safe token bucket that spaces out the account's write requests.
+
+    Holds up to `burst` tokens and refills at `rate` tokens a second. Each
+    acquire() takes one token. When none is left the balance goes negative,
+    and the caller sleeps until the refill covers its share, so callers queue
+    first come, first served in the order they take the lock (a lock does not
+    promise strict arrival order): when burst + k callers arrive at one
+    instant, the last is admitted k / rate seconds later. In any stretch of T
+    seconds the bucket admits at most burst + rate * T callers.
+
+    The wait is worked out under a lock and slept OUTSIDE it, so one caller's
+    sleep never blocks another caller from reserving its own place in line.
+    Pacing is not a retry: it only delays a request that is then sent exactly
+    once.
+
+    The clock and the sleep are read at call time from the time module unless
+    the constructor is given its own, so a test can drive the bucket with a
+    fake clock.
+    """
+
+    def __init__(
+        self,
+        rate: float,
+        burst: int,
+        *,
+        clock: Callable[[], float] | None = None,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        """
+        Build a full bucket.
+
+        Args:
+            rate (float): Tokens added per second. Must be a finite number > 0.
+            burst (int): Most tokens the bucket holds, i.e. how many callers
+                pass back to back with no wait. Must be an int >= 1.
+            clock (Callable[[], float] | None): Seconds on a clock that never
+                goes backwards. None reads time.monotonic at each call.
+            sleep (Callable[[float], None] | None): Blocks for the given
+                seconds. None calls time.sleep at each call.
+
+        Raises:
+            ValueError: When rate or burst is outside the ranges above. That
+                is a configuration error, so it is raised rather than returned.
+        """
+        if (isinstance(rate, bool) or not isinstance(rate, (int, float))
+                or not math.isfinite(rate) or rate <= 0):
+            raise ValueError(f"write pacer rate must be a finite number > 0, got {rate!r}")
+        if isinstance(burst, bool) or not isinstance(burst, int) or burst < 1:
+            raise ValueError(f"write pacer burst must be an int >= 1, got {burst!r}")
+        self._rate = float(rate)
+        self._burst = float(burst)
+        self._tokens = float(burst)
+        # When the balance was last brought up to date. None until the first
+        # acquire, so the bucket starts from the first reading of whichever
+        # clock it was given rather than from a reading taken at import.
+        self._stamp: float | None = None
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = threading.Lock()
+
+    def acquire(self) -> float:
+        """
+        Take one token, sleeping first if the bucket is empty.
+
+        Returns:
+            float: Seconds this caller waited (0.0 when a token was free).
+        """
+        clock = self._clock if self._clock is not None else time.monotonic
+        with self._lock:
+            now = clock()
+            if self._stamp is None:
+                self._stamp = now
+            elif now > self._stamp:
+                self._tokens = min(self._burst, self._tokens + (now - self._stamp) * self._rate)
+                self._stamp = now
+            self._tokens -= 1.0
+            wait = -self._tokens / self._rate if self._tokens < 0 else 0.0
+        if wait > 0:
+            if wait > _PACE_LOG_MIN_WAIT_SECONDS:
+                logging.info(
+                    "Pacing order and transfer writes to the exchange's write limit:"
+                    " waiting %.2fs"
+                    " (at most %g writes a second, %d back to back)",
+                    wait, self._rate, int(self._burst),
+                )
+            sleep = self._sleep if self._sleep is not None else time.sleep
+            sleep(wait)
+        return wait
+
+
+# The one pacer every order and collateral-transfer POST in this module goes
+# through, shared by all of execute_trades' worker threads, so together they
+# stay under the account's write limit (see config.ORDER_WRITES_PER_SECOND).
+# Built at import from config.py, so a bad value there fails the import.
+_ORDER_WRITE_PACER = _WritePacer(ORDER_WRITES_PER_SECOND, ORDER_WRITE_BURST)
 
 
 def _buy_max_cost_cents(count: int, price_dollars: float) -> int:
@@ -1000,7 +1129,8 @@ def _submit_order_v2(client: Any, body: dict) -> str:
     before it matched, so nothing filled, and it is returned as "canceled",
     exactly like a 2xx with a fill count of zero. A killed NO leg therefore ends
     the pair as "failed" at once, and a killed YES leg goes straight to the
-    rollback, with no position read and no pause. The immediate_or_cancel
+    rollback with no position read; the only wait is the pacer's, before the
+    rollback's POST. The immediate_or_cancel
     unwind is never read this way, so any error on it stays rollback_failed.
 
     Deliberately NOT wrapped in api_call_with_retry, for the same reason as the
@@ -1023,8 +1153,15 @@ def _submit_order_v2(client: Any, body: dict) -> str:
             _execute_one treats any exception on a buy leg as an ambiguous
             submission and consults the account position; _rollback_no_leg
             reports one on the unwind as rollback_failed.
+
+    Paced by _ORDER_WRITE_PACER before it is sent, like every write in this
+    module, so concurrent pairs stay under the account's write limit. An HTTP
+    429 is not caught here: it raises like any other error response.
     """
     requested = int(Decimal(body["count"]))
+    # Wait for a place under the account's write limit before logging, so the
+    # log line's time is the time the order is sent
+    _ORDER_WRITE_PACER.acquire()
     # Log before submitting: the client_order_id is the only handle a human has
     # for finding this order in the account if the outcome turns out ambiguous
     logging.info(
@@ -1321,7 +1458,8 @@ def _submit_order(client: Any, order: CreateOrderRequest) -> str:
     that asymmetry is the rule, not an oversight. A GET can be repeated
     harmlessly; a state-changing POST cannot.
     fetch_json_page raises ApiException on non-2xx just like the modeled call
-    did, so callers' exception handling is unchanged.
+    did, so callers' exception handling is unchanged. Paced by
+    _ORDER_WRITE_PACER before it is sent, like every write in this module.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -1335,6 +1473,8 @@ def _submit_order(client: Any, order: CreateOrderRequest) -> str:
         KeyError/TypeError: If the response lacks order.status — callers treat
             any exception as an ambiguous submission and consult the position.
     """
+    # Wait for a place under the account's write limit; the order is still sent once
+    _ORDER_WRITE_PACER.acquire()
     data = fetch_json_page(client.create_order_without_preload_content, create_order_request=order)
     return data["order"]["status"]
 
@@ -1703,6 +1843,8 @@ def _execute_transfer(client: Any, source: int, dest: int, cents: int) -> str | 
     applies the shared non-2xx -> ApiException + JSON-parse contract and, by
     design, contains NO retry logic of its own. That is exactly the single-shot
     contract this call site needs (the same reason _submit_order_v2 uses it).
+    The POST is a write, so it waits its turn on _ORDER_WRITE_PACER first, like
+    every order.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -1726,6 +1868,8 @@ def _execute_transfer(client: Any, source: int, dest: int, cents: int) -> str | 
         Exception: Any transport-level error — the transfer's fate is then
             unknown and it is NEVER re-sent.
     """
+    # Wait for a place under the account's write limit; the transfer is still sent once
+    _ORDER_WRITE_PACER.acquire()
     # Retry-free by design (see docstring): signed_request_json signs the path
     # verbatim, raises ApiException on non-2xx, and never retries.
     try:
@@ -2358,6 +2502,18 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     # once there after a 1s pause (DR-64). Both use the same bounded-wait idiom
     # _await_transfer_settlement uses; the mapping read costs at most one round
     # trip and disappears for the rest of the process once confirmed.
+    # The write pacer is a third exception, a wait rather than a read: the YES
+    # leg's POST, and a rollback's, each take a place on _ORDER_WRITE_PACER like
+    # every write. Its queue is first come, first served in the order callers
+    # take its lock, so another pair's opening NO leg can go ahead of this
+    # pair's hedge. Each worker holds at most one place at a time, so one wait
+    # is at most TRADER_MAX_WORKERS / ORDER_WRITES_PER_SECOND seconds (1 s at
+    # the shipped values), and raising TRADER_MAX_WORKERS or lowering the rate
+    # lengthens it. In a simulation at the shipped values, NO fill to YES sent
+    # took up to about 0.75 s with 7 pairs and 1.0 s with 14, and NO fill to
+    # rollback sent up to about 1.6 s and 2.0 s. That wait is the accepted cost
+    # of the HTTP 429s the pacer prevents: a 429 on the YES leg costs a
+    # rollback, and a 429 on the rollback is rollback_failed, an open position.
     before_no = _position_count(client, no_leg.market.ticker)
     before_yes = _position_count(client, yes_leg.market.ticker)
 
@@ -2586,8 +2742,10 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     for a same_title pair, market_b for a time_series pair — see
     _ordered_legs) is submitted first, then the YES leg only if the NO leg
     filled, with a floored-limit rollback of the NO leg if the YES leg fails.
-    All specs are submitted concurrently via ThreadPoolExecutor so no pair
-    waits on another.
+    All specs run concurrently via ThreadPoolExecutor, so no pair waits for
+    another to finish, but their POSTs share one pacer (_ORDER_WRITE_PACER):
+    each order waits its turn under the account's write limit, so one pair's
+    order can wait behind other pairs' (see _execute_one for how long).
 
     In dry_run mode, no orders are submitted. The function logs the intended
     trade — both legs in SUBMISSION order (NO leg first), with each leg's own

@@ -33,6 +33,8 @@ import json
 import logging
 import math
 import textwrap
+import threading
+import time
 import uuid
 from decimal import Decimal
 from json import JSONDecodeError
@@ -76,6 +78,7 @@ from kalshi_betting.trader import (
     _position_count,
     _required_cents_by_shard,
     _rollback_floor_cents,
+    _submit_order,
     _submit_order_v2,
     _transfers_active,
     _unfunded_shards,
@@ -83,6 +86,7 @@ from kalshi_betting.trader import (
     _v2_limit_price,
     _v2_rollback_price,
     _v2_top_of_grid_price,
+    _WritePacer,
     ensure_shard_collateral,
     execute_trades,
     pre_execution_check,
@@ -3379,3 +3383,474 @@ class TestNonObject2xxTransferResponse:
         with caplog.at_level(logging.CRITICAL):
             assert _execute_transfer(MagicMock(), 0, 1, 9662) is None
         assert [r for r in caplog.records if r.levelno == logging.CRITICAL] == []
+
+
+class _FakeClock:
+    """A clock and a sleep for driving a _WritePacer without real time.
+
+    `advance_on_sleep` decides whether a sleep moves the clock (one caller
+    at a time, as a single thread sees it) or leaves it where it is (every
+    caller arriving at the same instant, so each wait is its place in line).
+    """
+
+    def __init__(self, start: float = 0.0, *, advance_on_sleep: bool = True):
+        self.now = start
+        self.advance_on_sleep = advance_on_sleep
+        self.slept: list[float] = []
+        self._lock = threading.Lock()
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        with self._lock:
+            self.slept.append(seconds)
+            if self.advance_on_sleep:
+                self.now += seconds
+
+
+def _fake_pacer(rate, burst, clock: _FakeClock) -> _WritePacer:
+    """A _WritePacer on a fake clock."""
+    return _WritePacer(rate, burst, clock=clock.monotonic, sleep=clock.sleep)
+
+
+class TestWritePacer:
+    """The token bucket every order and transfer POST waits on: a burst of
+    `burst` writes back to back, then one every 1/rate seconds, callers
+    queued in the order they take its lock."""
+
+    def test_the_first_burst_does_not_wait(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        assert [pacer.acquire() for _ in range(3)] == [0.0, 0.0, 0.0]
+        assert clock.slept == []
+
+    def test_the_next_caller_waits_one_over_the_rate(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        for _ in range(3):
+            pacer.acquire()
+        assert pacer.acquire() == pytest.approx(0.25)
+        assert clock.slept == [pytest.approx(0.25)]
+
+    def test_queued_callers_wait_in_turn(self):
+        # Every caller arrives at the same instant: the k-th past the burst
+        # is admitted k/rate after it, so the waits accumulate.
+        clock = _FakeClock(advance_on_sleep=False)
+        pacer = _fake_pacer(4, 3, clock)
+        waits = [pacer.acquire() for _ in range(7)]
+        assert waits == [0.0, 0.0, 0.0,
+                         pytest.approx(0.25), pytest.approx(0.5),
+                         pytest.approx(0.75), pytest.approx(1.0)]
+
+    def test_a_caller_after_the_queue_drains_waits_only_its_own_turn(self):
+        # One caller sleeps its 0.25 s and the clock moves with it; the next
+        # caller arrives then and waits one more 1/rate, not the sum of both.
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 1, clock)
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == pytest.approx(0.25)
+        assert pacer.acquire() == pytest.approx(0.25)
+        assert clock.now == pytest.approx(0.5)
+
+    def test_tokens_refill_with_elapsed_time(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        for _ in range(3):
+            pacer.acquire()
+        clock.now = 0.5          # half a second at 4 a second refills 2 tokens
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == pytest.approx(0.25)
+
+    def test_the_refill_stops_at_the_burst(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        pacer.acquire()
+        clock.now = 1_000.0      # a long idle spell holds a full bucket, no more
+        assert [pacer.acquire() for _ in range(3)] == [0.0, 0.0, 0.0]
+        assert pacer.acquire() == pytest.approx(0.25)
+
+    def test_the_first_acquire_starts_the_clock(self):
+        # The pacer reads its clock for the first time on its first acquire,
+        # so it refills from there on whatever clock it was given — here one
+        # that starts at zero, far below the real monotonic clock.
+        clock = _FakeClock(start=0.0, advance_on_sleep=False)
+        pacer = _fake_pacer(1, 1, clock)
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == pytest.approx(1.0)
+        clock.now = 10.0
+        assert pacer.acquire() == 0.0
+
+    @pytest.mark.parametrize(
+        "rate", [0, -1, 0.0, float("nan"), float("inf"), True, "8", None],
+    )
+    def test_an_invalid_rate_raises(self, rate):
+        with pytest.raises(ValueError, match="rate"):
+            _WritePacer(rate, 8)
+
+    @pytest.mark.parametrize("burst", [0, -1, 1.5, 8.0, True, "8", None])
+    def test_an_invalid_burst_raises(self, burst):
+        with pytest.raises(ValueError, match="burst"):
+            _WritePacer(8, burst)
+
+    def test_the_shipped_pacer_uses_the_config_constants(self):
+        # conftest replaces trader._ORDER_WRITE_PACER per test, so the module's
+        # construction is checked through a fresh build of the same call.
+        pacer = _WritePacer(config.ORDER_WRITES_PER_SECOND, config.ORDER_WRITE_BURST)
+        assert pacer._rate == float(config.ORDER_WRITES_PER_SECOND)
+        assert pacer._burst == float(config.ORDER_WRITE_BURST)
+        assert trader.ORDER_WRITES_PER_SECOND == config.ORDER_WRITES_PER_SECOND
+        assert trader.ORDER_WRITE_BURST == config.ORDER_WRITE_BURST
+
+    def test_the_module_pacer_is_built_from_the_config_names(self):
+        # Read trader.py's syntax tree, not its text, so a comment or a
+        # docstring spelling the call cannot stand in for the assignment: the
+        # module binds _ORDER_WRITE_PACER exactly once at top level, to
+        # _WritePacer called with the two config names, positionally, and
+        # with nothing else — never a literal rate or burst.
+        tree = ast.parse(inspect.getsource(trader))
+        bindings = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            else:
+                continue
+            if any(isinstance(t, ast.Name) and t.id == "_ORDER_WRITE_PACER"
+                   for t in targets):
+                bindings.append(node)
+        assert len(bindings) == 1
+        (node,) = bindings
+        assert isinstance(node, ast.Assign) and len(node.targets) == 1
+        call = node.value
+        assert isinstance(call, ast.Call)
+        assert isinstance(call.func, ast.Name) and call.func.id == "_WritePacer"
+        assert [type(a) for a in call.args] == [ast.Name, ast.Name]
+        assert [a.id for a in call.args] == ["ORDER_WRITES_PER_SECOND", "ORDER_WRITE_BURST"]
+        assert call.keywords == []
+
+    def test_a_long_wait_is_logged_once(self, caplog):
+        clock = _FakeClock()
+        pacer = _fake_pacer(2, 1, clock)
+        pacer.acquire()
+        with caplog.at_level(logging.INFO):
+            assert pacer.acquire() == pytest.approx(0.5)
+        lines = [r for r in caplog.records if "Pacing order and transfer writes" in r.getMessage()]
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.INFO
+        assert "0.50s" in lines[0].getMessage()
+
+    def test_a_short_wait_is_not_logged(self, caplog):
+        clock = _FakeClock()
+        pacer = _fake_pacer(8, 1, clock)
+        pacer.acquire()
+        with caplog.at_level(logging.INFO):
+            assert pacer.acquire() == pytest.approx(0.125)
+        assert "Pacing order and transfer writes" not in caplog.text
+
+    def test_the_sleep_happens_outside_the_lock(self):
+        # One caller's wait must never stop another caller from taking its
+        # place in line, so the lock is released before the sleep.
+        held = []
+        clock = _FakeClock()
+        pacer = _WritePacer(
+            4, 1, clock=clock.monotonic,
+            sleep=lambda s: held.append(pacer._lock.locked()),
+        )
+        pacer.acquire()
+        pacer.acquire()
+        assert held == [False]
+
+    def test_concurrent_callers_each_get_their_own_place(self):
+        # 20 threads at one frozen instant: the lock must hand out 20 distinct
+        # places, so the waits are exactly 0 for the burst and then 1/rate,
+        # 2/rate, ... — a lost update would repeat a wait. A lost update is a
+        # race, which a run can miss, so the clock also records whether the
+        # lock is held each time the pacer reads it: acquire() reads the clock
+        # first thing in the block that updates the balance, so a reading
+        # taken without the lock means that block is not guarded.
+        clock = _FakeClock(advance_on_sleep=False)
+        rate, burst, callers = 4, 3, 20
+        lock_held: list[bool] = []
+
+        def locked_clock():
+            lock_held.append(pacer._lock.locked())
+            return clock.monotonic()
+
+        pacer = _WritePacer(rate, burst, clock=locked_clock, sleep=clock.sleep)
+        start = threading.Barrier(callers)
+        waits: list[float] = []
+        waits_lock = threading.Lock()
+
+        def run():
+            start.wait()
+            wait = pacer.acquire()
+            with waits_lock:
+                waits.append(wait)
+
+        threads = [threading.Thread(target=run) for _ in range(callers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        expected = [0.0] * burst + [k / rate for k in range(1, callers - burst + 1)]
+        assert sorted(waits) == [pytest.approx(w) for w in expected]
+        assert lock_held == [True] * callers
+
+    def test_real_threads_are_never_admitted_faster_than_the_bucket(self):
+        # Real time and real sleeps, at a rate high enough to finish at once.
+        # Each thread's admission time is the clock reading the pacer took
+        # under its lock plus the wait it returned, so the check reads the
+        # pacer's own schedule rather than when the OS happened to wake a
+        # thread. In any stretch from one admission to a later one, the
+        # bucket admits at most burst + rate * (stretch).
+        rate, burst, callers = 400.0, 4, 20
+        local = threading.local()
+
+        def clock():
+            local.now = time.monotonic()
+            return local.now
+
+        pacer = _WritePacer(rate, burst, clock=clock)
+        start = threading.Barrier(callers)
+        admitted: list[float] = []
+        returned: list[tuple[float, float]] = []
+        lock = threading.Lock()
+
+        def run():
+            start.wait()
+            wait = pacer.acquire()
+            done = time.monotonic()
+            with lock:
+                admitted.append(local.now + wait)
+                returned.append((local.now + wait, done))
+
+        threads = [threading.Thread(target=run) for _ in range(callers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(admitted) == callers
+        admitted.sort()
+        for i in range(callers):
+            for j in range(i, callers):
+                assert j - i + 1 <= burst + rate * (admitted[j] - admitted[i]) + 1e-6
+        # Nobody returned before its admission time: the sleep covered it
+        for due, done in returned:
+            assert done >= due - 1e-3
+
+
+class TestWritesArePaced:
+    """Every order and transfer POST takes one place on the pacer, before
+    the POST, and is still sent exactly once."""
+
+    @pytest.fixture
+    def events(self):
+        return []
+
+    @pytest.fixture
+    def pacer(self, monkeypatch, events):
+        """A stand-in pacer that records each acquire in `events`."""
+        mock = MagicMock()
+        mock.acquire.side_effect = lambda: events.append("acquire") or 0.0
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", mock)
+        return mock
+
+    @pytest.fixture
+    def post(self, monkeypatch, events):
+        """signed_request_json, recording each POST in `events`."""
+        mock = MagicMock()
+        replies: list = []
+
+        def answer(*args, **kwargs):
+            events.append("post")
+            reply = replies.pop(0)
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+        mock.side_effect = answer
+        mock.replies = replies
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
+
+    @staticmethod
+    def _too_many_requests() -> ApiException:
+        # The body the exchange sends with a 429
+        return ApiException(
+            status=429, reason="Too Many Requests",
+            body='{"error":{"code":"too_many_requests","message":"too many requests"}}',
+        )
+
+    def test_a_v2_order_waits_before_its_post(self, pacer, post, events):
+        post.replies.append(v2_resp(5))
+        assert _submit_order_v2(MagicMock(), _build_no_order_v2(_no_leg(make_spec()))) == "executed"
+        assert events == ["acquire", "post"]
+
+    def test_the_v2_log_line_is_written_after_the_wait(self, pacer, post, caplog):
+        # The "Submitting V2 order" line's time is the send time, so a pacing
+        # wait shows up as a gap before it, never between it and the POST.
+        logged_before_wait = []
+        pacer.acquire.side_effect = lambda: logged_before_wait.append(
+            "Submitting V2 order" in caplog.text
+        ) or 0.0
+        post.replies.append(v2_resp(5))
+        with caplog.at_level(logging.INFO):
+            _submit_order_v2(MagicMock(), _build_no_order_v2(_no_leg(make_spec())))
+        assert logged_before_wait == [False]
+        assert "Submitting V2 order" in caplog.text
+
+    def test_a_legacy_order_waits_before_its_post(self, pacer, events):
+        client = MagicMock()
+
+        def create(**kwargs):
+            events.append("post")
+            return order_resp("executed")
+
+        client.create_order_without_preload_content.side_effect = create
+        assert _submit_order(client, _build_no_order(_no_leg(make_spec()))) == "executed"
+        assert events == ["acquire", "post"]
+
+    def test_a_transfer_waits_before_its_post(self, pacer, post, events):
+        post.replies.append(transfer_resp("tr_9"))
+        assert _execute_transfer(MagicMock(), 1, 0, 1400) == "tr_9"
+        assert events == ["acquire", "post"]
+
+    def test_a_v2_kill_takes_one_place_and_one_post(self, pacer, post, events):
+        post.replies.append(fok_kill_error())
+        assert _submit_order_v2(MagicMock(), _build_no_order_v2(_no_leg(make_spec()))) == "canceled"
+        assert events == ["acquire", "post"]
+
+    def test_a_v2_429_takes_one_place_and_one_post_and_still_raises(
+        self, pacer, post, events,
+    ):
+        # Pacing is not a retry: a 429 that comes back anyway raises into the
+        # caller's ambiguous path exactly as before.
+        err = self._too_many_requests()
+        post.replies.append(err)
+        with pytest.raises(ApiException) as exc_info:
+            _submit_order_v2(MagicMock(), _build_yes_order_v2(_yes_leg(make_spec())))
+        assert exc_info.value is err
+        assert events == ["acquire", "post"]
+
+    def test_a_legacy_429_takes_one_place_and_one_post(self, pacer, events):
+        client = MagicMock()
+
+        def create(**kwargs):
+            events.append("post")
+            return SimpleNamespace(
+                status=429, reason="Too Many Requests",
+                data=b'{"error":{"code":"too_many_requests","message":"too many requests"}}',
+                getheaders=lambda: {"content-type": "application/json"},
+            )
+
+        client.create_order_without_preload_content.side_effect = create
+        with pytest.raises(ApiException):
+            _submit_order(client, _build_no_order(_no_leg(make_spec())))
+        assert events == ["acquire", "post"]
+
+    def test_a_transfer_429_takes_one_place_and_one_post(self, pacer, post, events):
+        post.replies.append(self._too_many_requests())
+        with pytest.raises(ApiException):
+            _execute_transfer(MagicMock(), 0, 1, 100)
+        assert events == ["acquire", "post"]
+
+    def test_a_429_on_the_yes_leg_paces_the_rollback_too(
+        self, pacer, post, events, v2_mode, v2_mapping_confirmed, monkeypatch,
+    ):
+        # One pair whose YES leg the exchange rejects with a 429: the position
+        # check finds nothing filled and the NO leg is unwound. Each of the
+        # three orders takes its own place on the pacer before its own POST,
+        # and none is sent twice.
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
+        post.replies.extend([v2_resp(5), self._too_many_requests(), v2_resp(5)])
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(
+            None,   # before_no
+            None,   # before_yes
+            None,   # after_yes — unmoved
+            None,   # lag re-read — still unmoved
+        )
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+        assert events == ["acquire", "post"] * 3
+        assert post.call_args_list[2].kwargs["body"]["reduce_only"] is True
+
+    def test_a_dry_run_takes_no_place(self, pacer):
+        results = execute_trades(MagicMock(), [make_spec()], dry_run=True)
+        assert [r.status for r in results] == ["simulated"]
+        pacer.acquire.assert_not_called()
+
+
+class TestExecuteTradesArePaced:
+    """execute_trades runs its pairs on concurrent workers, and every one of
+    their POSTs goes through the one shared pacer, so seven pairs' 14 orders
+    leave no faster than the account's write limit instead of inside one
+    second."""
+
+    RATE = 2
+    BURST = 2
+    PAIRS = 7
+
+    @staticmethod
+    def _specs(n: int) -> list:
+        """n specs on distinct tickers, like a real portfolio's."""
+        specs = []
+        for i in range(n):
+            spec = make_spec(title=f"pair {i}")
+            spec.pair.market_a.ticker = f"TICK-A{i}"
+            spec.pair.market_b.ticker = f"TICK-B{i}"
+            specs.append(spec)
+        return specs
+
+    def test_the_pairs_orders_are_spread_to_the_write_limit(
+        self, monkeypatch, v2_mode, v2_mapping_confirmed,
+    ):
+        # A frozen clock: every worker arrives at the same instant, so each
+        # order's admission time is exactly the wait the pacer gave it. Each
+        # worker records the wait of its own last acquire, and each POST reads
+        # it off that worker, which proves the POST came after the acquire.
+        clock = _FakeClock(advance_on_sleep=False)
+        shared = _fake_pacer(self.RATE, self.BURST, clock)
+        local = threading.local()
+
+        class _Recording:
+            def acquire(self):
+                wait = shared.acquire()
+                local.admitted = wait
+                return wait
+
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", _Recording())
+        admissions: list = []
+        lock = threading.Lock()
+
+        def post(client, method, path, body):
+            admitted = local.__dict__.pop("admitted", None)
+            with lock:
+                admissions.append(admitted)
+            return v2_resp(5)
+
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(
+            return_value=positions_resp()
+        )
+
+        results = execute_trades(client, self._specs(self.PAIRS), dry_run=False)
+
+        assert [r.status for r in results] == ["executed"] * self.PAIRS
+        orders = 2 * self.PAIRS
+        assert len(admissions) == orders
+        assert None not in admissions            # every POST had its own acquire
+        admissions.sort()
+        # The burst goes at once, then one order every 1/rate seconds
+        expected = [max(0.0, (i - self.BURST + 1) / self.RATE) for i in range(orders)]
+        assert admissions == [pytest.approx(a) for a in expected]
+        # No 1-second window holds more than burst + rate orders
+        for start in admissions:
+            in_window = [a for a in admissions if start <= a <= start + 1.0 + 1e-9]
+            assert len(in_window) <= self.BURST + self.RATE
+        # Each worker slept its own wait, outside the POST
+        assert sorted(clock.slept) == [pytest.approx(a) for a in expected if a > 0]

@@ -4,18 +4,20 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Suite-wide pytest fixtures and one helper. Two autouse guards: one points
+    Suite-wide pytest fixtures and one helper. Three autouse guards: one points
     the event-title accumulator and Kalshi's cached /series listing at a
     per-test tmp_path, so no test can touch the operator's real event-title
-    accumulators or series_categories.json; the other keeps every test off the
-    Treasury API and the real rates cache. pre_toggle_defaults pins the live
-    toggles for a test whose figures assume fixed values (they pin arithmetic,
-    not config.py's policy); its helper, apply_pre_toggle_defaults, also
-    serves class-scoped fixtures.
+    accumulators or series_categories.json; one keeps every test off the
+    Treasury API and the real rates cache; and one gives every test a full,
+    fresh order-write pacer, so no test waits on writes an earlier test made.
+    pre_toggle_defaults pins the live toggles for a test whose figures assume
+    fixed values (they pin arithmetic, not config.py's policy); its helper,
+    apply_pre_toggle_defaults, also serves class-scoped fixtures.
 
 Dependencies:
     Imports kalshi_betting.historical (the three cache paths),
-    kalshi_betting.treasury (its _RATES_CACHE path and _get_json), config, and
+    kalshi_betting.treasury (its _RATES_CACHE path and _get_json),
+    kalshi_betting.trader (its _WritePacer and _ORDER_WRITE_PACER), config, and
     backtester and backtest (the by-value copies they bind). Imported by
     pytest, and by test modules for apply_pre_toggle_defaults.
 
@@ -38,7 +40,7 @@ Notes:
 """
 import pytest
 
-from kalshi_betting import backtest, backtester, config, historical, treasury
+from kalshi_betting import backtest, backtester, config, historical, trader, treasury
 
 
 @pytest.fixture(autouse=True)
@@ -118,3 +120,24 @@ def _isolate_treasury_rates(tmp_path, monkeypatch):
         raise RuntimeError("the Treasury API is not reachable from the test suite")
 
     monkeypatch.setattr(treasury, "_get_json", _offline)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_order_write_pacer(monkeypatch):
+    """
+    Give each test its own full order-write pacer.
+
+    trader._ORDER_WRITE_PACER is one module-level token bucket shared by every
+    order and transfer POST. Without this, the writes of every earlier test
+    would drain it, and a later test would sleep (a real time.sleep, or one a
+    test records) for reasons of its own history. A fresh pacer built from
+    config's rate and burst lets any test make up to ORDER_WRITE_BURST writes
+    with no wait.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): Restores the module's pacer afterwards.
+    """
+    monkeypatch.setattr(
+        trader, "_ORDER_WRITE_PACER",
+        trader._WritePacer(config.ORDER_WRITES_PER_SECOND, config.ORDER_WRITE_BURST),
+    )
