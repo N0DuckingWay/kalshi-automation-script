@@ -5122,10 +5122,10 @@ class TestEquityCurveFutureStartDate:
     the public API.
 
     TestRunBacktestFeasibilityPreCheck cannot catch this: it freezes
-    `backtester.date.today()`, which drives the Monday pre-check but NOT
-    _build_equity_curve's own `datetime.now(UTC).date()`, so its windows are
-    always non-empty. These tests use a genuinely future start_date instead of
-    freezing anything, so both clocks agree it is ahead of today.
+    `backtester.datetime.now`, which the pre-check and _build_equity_curve
+    both read, but every start_date it uses is on or before its frozen today,
+    so the curve always has days to cover. These tests leave the clock alone
+    and use a start_date 30 days ahead of the real UTC date.
     """
 
     # Comfortably ahead of both `date.today()` (local tz) and UTC today, so
@@ -6189,12 +6189,22 @@ class TestRunBacktestTimeSeriesFlow:
         # which run_backtest turns back into the empty-result shape.
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: pytest.fail("fetch must be skipped"))
-        today = date.today()
+        # Freeze the UTC clock the check reads. A local date.today() lags UTC
+        # west of it, so on a Sunday evening in PDT "tomorrow" was already
+        # Monday in UTC, and that Monday's checkpoint made the window feasible.
+        moment = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)   # Friday; next day Saturday
+
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return moment if tz is None else moment.astimezone(tz)
+
+        monkeypatch.setattr(backtester, "datetime", _Frozen)
         # The sentinel lives on ELEMENT 0 of the returned pair: a caller that
         # forgot to unpack would hold a 2-tuple, which is never None, so its
         # guard would silently go false. Assert the shape explicitly.
         raw_entries, coverage = backtester._prepare_entries(
-            MagicMock(), MagicMock(), today + timedelta(days=1), True, None
+            MagicMock(), MagicMock(), moment.date() + timedelta(days=1), True, None
         )
         assert raw_entries is None
         # No census either: the fetch never ran, so there was no corpus.
