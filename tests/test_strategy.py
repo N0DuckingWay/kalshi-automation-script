@@ -1452,6 +1452,15 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "market_ladder_keys", "ladder_keys")
         assert _function_calls(scanner, "market_ladder_keys", "time_series_group_key")
 
+    def test_ast_the_backtest_reads_ladders_through_the_one_definition(self):
+        # The backtest's one-open-trade-per-ladder rule labels each market
+        # through the same scanner.ladder_keys the live rule reads, so the two
+        # paths cannot disagree about which markets share a ladder
+        assert _function_calls(backtester, "_simulate_at_discount", "_ladder_keys_dict")
+        assert _function_calls(backtester, "_ladder_keys_dict", "ladder_keys")
+        # ... and a question worked out from the market uses the grouping key
+        assert _function_calls(backtester, "_ladder_keys_dict", "_ts_group_key")
+
     def test_keyword_values_finds_every_call(self):
         # The helper the pin above reads: a call without the keyword is a None,
         # so a second, unwired call cannot hide behind the first one

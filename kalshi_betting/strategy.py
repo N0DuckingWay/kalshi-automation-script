@@ -19,8 +19,8 @@ Dependencies:
     share config's probability model, fee helpers and constants, but
     re-implement the Kelly formula (net spread, b with the fee in its
     denominator, f* = p - q/b), and backtester also re-implements
-    select_portfolio's ticker and cash rules, but not its ladder rule. A
-    change to either must be made in every copy.
+    select_portfolio's ticker, cash and ladder rules. A change to either must
+    be made in every copy.
 
 Notes:
     All prices here are LEG prices from scanner.leg_prices(pair): (nA, pB) for
@@ -583,8 +583,8 @@ def select_portfolio(specs: list, balance_cents: int, *,
     the same question once the dates are removed. A same-title spec is never
     skipped this way, but once picked its ladders count too. A skipped spec
     spends no cash, so a later spec of either kind may then fit where it
-    would not have. The backtester repeats the ticker and cash rules; change
-    both together.
+    would not have. The backtester repeats the ticker, cash and ladder rules;
+    change both together.
 
     Args:
         specs (list): TradeSpecs from compute_trade.

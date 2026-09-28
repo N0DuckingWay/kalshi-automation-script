@@ -42,7 +42,9 @@ Dependencies:
     same_event_ladder with the SAME_DAY sentinel, the one definition of a
     same-event deadline ladder's leg order and gap (DR-73), and closes_apart,
     the one definition of the same-title close gate, with
-    close_gap_bound_text, the bound its refusal line prints (DR-74)).
+    close_gap_bound_text, the bound its refusal line prints (DR-74), and
+    ladder_keys, the one definition of which ladders a market is on, which
+    the backtest's one-open-trade-per-ladder rule labels each market with).
     pair_gap_days() is the single reader of that gap for everything
     downstream of pair formation. ladder_keys(), market_ladder_keys() and
     pair_ladder_keys() name the ladders a market is on (its event, and its
