@@ -35,9 +35,10 @@ Notes:
     Raw-response variants bypass the models — but they also skip the SDK's
     status check, which fetch_json_page restores.
 
-    signed_request_json() generalizes that to routes with no SDK method at all —
-    notably the V2 order endpoint /portfolio/events/orders, which trader.py now
-    submits through by default. It shares fetch_json_page's status-check + parse
+    signed_request_json() generalizes that to routes with no SDK method at all:
+    trader.py submits every order through it to the V2 order endpoint
+    /portfolio/events/orders, and the collateral transfer to
+    config.TRANSFER_PATH. It shares fetch_json_page's status-check + parse
     tail via _check_and_parse, so the non-2xx → ApiException contract is
     single-sourced. It contains NO retry logic on purpose: order submission
     calls it directly and retry-free, because a retried fill-or-kill leg can
@@ -50,8 +51,9 @@ Notes:
     `"accepted"`, `[]`, `123`, `true` or a literal `null` (which parses to
     None) reaches the caller unchanged. Callers that immediately `.get()` it
     raise AttributeError on such a body, and callers that subscript it
-    (trader._submit_order's `data["order"]["status"]`) raise TypeError. Both
-    are deliberate loud failures at most call sites, order submission included:
+    (historical's /historical/cutoff read, `cutoff["market_settled_ts"]`)
+    raise TypeError. Both are deliberate loud failures at most call sites,
+    order submission included:
     there an exception is what routes trader._execute_one into its
     ambiguous-submission path, which reconciles the outcome against the
     account's position ledger. trader._execute_transfer is one exception —
@@ -92,8 +94,7 @@ _RETRYABLE_STATUS: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 # from resp.read() inside fetch_json_page, because the retry wrapper only knew
 # how to recognize status-carrying errors. Retrying is safe here: every caller
 # of api_call_with_retry is a read-only market-data GET (order submission
-# deliberately bypasses this wrapper on both paths — see trader._submit_order
-# and trader._submit_order_v2).
+# deliberately bypasses this wrapper — see trader._submit_order_v2).
 _urllib3_transient: tuple[type[BaseException], ...]
 try:
     # urllib3 ships as a dependency of the Kalshi SDK's rest client, but guard
@@ -248,16 +249,16 @@ def fetch_json_page(fetch_fn: Any, **kwargs) -> Any:  # whatever the 2xx body pa
             `[]`, `123`, `true` or a literal `null` (which parses to None)
             reaches the caller as-is. Callers that immediately `.get()` the
             result raise AttributeError on such a body, and callers that
-            subscript it (trader._submit_order's `data["order"]["status"]`)
-            raise TypeError. Both are deliberate loud failures: on the order
-            path, raising is what routes trader._execute_one into its
-            ambiguous-submission path, where the account position decides the
-            outcome. One call site that instead guards with
-            isinstance(..., dict) — because its 2xx has already moved money and
-            nothing reconciles a transfer after the fact — is
-            trader._execute_transfer, which reads signed_request_json rather
-            than this helper (DR-05). A few read-only lookups also check the
-            type, as a failed read.
+            subscript it (historical's /historical/cutoff read,
+            `cutoff["market_settled_ts"]`) raise TypeError. Both are
+            deliberate loud failures: every caller of this helper is a
+            read-only GET, so the request that raises has changed nothing on
+            the account. Order submission and the collateral transfer read
+            signed_request_json instead (see the module Notes: an order that
+            raises is settled by trader._execute_one's ambiguous-submission
+            path, and trader._execute_transfer guards with
+            isinstance(..., dict), DR-05). A few read-only lookups also check
+            the type, as a failed read.
 
     Raises:
         ApiException: (or a status-specific subclass) when the HTTP status is

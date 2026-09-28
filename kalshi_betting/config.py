@@ -580,63 +580,41 @@ MVE_SERIES_FAMILY_PREFIX      = "KXMVE"
 # The quadratic P*(1-P) factor means fees are highest near 50¢ and lowest near 1¢/99¢.
 TAKER_FEE_RATE                = 0.07
 
-# LEGACY ORDER PATH ONLY — the V2 order path uses BUY_SLIPPAGE_TICKS below.
-# Slippage allowance, in cents per contract, added on top of the scanned price
-# when computing the buy_max_cost cap for each market FoK order leg. The cap
-# protects against the order book moving between the pre-execution check and
-# submission: the order fills at or below (scanned price + allowance) or not at all.
-# This stays a whole-cent value because `buy_max_cost` is an integer-cents field
-# on the legacy /portfolio/orders create-order endpoint — a sub-cent-aware cap
-# can't be expressed there no matter how finely a market's own tick grid is
-# subdivided (see ApiMarket.price_level_structure / price_ranges in scanner.py).
-# On 2026-08-17, all MVE/combo markets migrated to the
-# `center_deci_edge_centi_cent` tick regime — $0.0001 ticks below $0.01 and
-# above $0.99, $0.001 ticks in between — so this 1c tolerance permits roughly
-# 10-100 ticks of price drift on those markets, depending on where in the band
-# the price sits, rather than the intended ~1. That is why the bot orders
-# through the V2 path (ORDER_API_VERSION, below), whose dollar-string limit
-# price is capped in ticks (BUY_SLIPPAGE_TICKS). Only trader.py's legacy order
-# builders read this constant, and no entry point reaches them: main.py and
-# the human-run order-path probe refuse to start on any order path but "v2".
-BUY_MAX_COST_SLIPPAGE_CENTS   = 1
-
 # Maximum accepted per-contract loss (cents) when unwinding the NO leg (the
 # first-submitted leg: market_a for a same-title pair, market_b for a
 # time-series pair) after the YES leg failed, relative to the NO leg's scanned
-# NO entry price. On the legacy path the rollback is a fill-or-kill LIMIT sell
-# at (entry - this); on the V2 path the same bound caps an immediate-or-cancel
-# bid, which closes only what rests at or under the cap (see the last
-# paragraph below). Either way a book that has collapsed past the floor leaves
-# the position, or what is left of it, open instead of realizing an unbounded
+# NO entry price. The unwind is a reduce-only immediate-or-cancel YES bid (a
+# held NO position is a short YES, so closing it is a YES BUY), and this bound
+# is its bid CEILING of (1 - floor/100) dollars, where floor = entry - this:
+# ceiling-quantized onto the market's tick grid and clamped by
+# V2_ROLLBACK_BID_PRICE_DOLLARS (see trader._rollback_floor_cents(no_leg) and
+# trader._v2_rollback_price(no_leg)). The bid closes only what rests at or
+# under the cap, so a book that has collapsed past the floor leaves the
+# position, or what is left of it, open instead of realizing an unbounded
 # loss, and that surfaces as status="rollback_failed" for manual review.
 #
 # This allowance must cover the market's ENTIRE bid-ask spread, not just the
-# "acceptable loss": the NO leg entered at the NO ASK, but the unwind is a sell
-# that only fills against the NO BID, so (NO ask - NO bid) — the spread
-# itself — is a floor on the loss even with zero adverse price movement.
-# Any adverse move since entry is additive on top of that spread. At 5 cents
-# this was narrower than the spread on the illiquid markets this strategy
-# targets, so killed unwinds (rollback_failed orphans) were the normal
-# outcome, not the tail case. 12 cents lets a normal-spread book fill the
-# unwind while a genuinely collapsed book still kills it and surfaces
-# rollback_failed for manual review — the deliberate bounded-loss trade-off.
-#
-# The floor applies to BOTH order paths. On the legacy path it is the NO limit
-# sell price directly. On the V2 path a held NO position is a short YES, so the
-# unwind is a YES BUY and the same bound becomes a bid CEILING of
-# (1 - floor/100) dollars, ceiling-quantized onto the market's tick grid and
-# clamped by V2_ROLLBACK_BID_PRICE_DOLLARS (see trader._v2_rollback_price(no_leg)).
+# "acceptable loss": the NO leg entered at the NO ASK, but the unwind closes it
+# at the NO BID (buying the YES back at the YES ask, 1 - NO bid), so
+# (NO ask - NO bid) — the spread itself — is a floor on the loss even with
+# zero adverse price movement. Any adverse move since entry is additive on top
+# of that spread. A 5-cent allowance is narrower than the spread on the
+# illiquid markets this strategy targets, so killed unwinds (rollback_failed
+# orphans) would be the normal outcome, not the tail case. 12 cents lets a
+# normal-spread book fill the unwind while a genuinely collapsed book still
+# kills it and surfaces rollback_failed for manual review — the deliberate
+# bounded-loss trade-off.
 ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT = 12
 
-# Slippage allowance for the V2 order path, denominated in TICKS of the market's
-# own price grid rather than in whole cents. The V2 endpoint
-# (/portfolio/events/orders) takes dollar-string limit prices, so a FoK cap can
-# finally be expressed at the market's real resolution: cap = scanned price +
-# BUY_SLIPPAGE_TICKS × tick size, where the tick size comes from
-# scanner.tick_size_for_price(). One tick restores the original intent of
-# BUY_MAX_COST_SLIPPAGE_CENTS = 1, which meant ~1 tick back when every market
-# was on a 1c grid but means roughly 10-100 ticks on the centi-cent regimes
-# MVE/combo markets migrated to on 2026-08-17.
+# Slippage allowance on each buy leg, denominated in TICKS of the market's own
+# price grid rather than in whole cents. The V2 endpoint
+# (/portfolio/events/orders) takes dollar-string limit prices, and that limit
+# price IS the order's price protection: cap = scanned price (ceiled onto the
+# grid) + BUY_SLIPPAGE_TICKS × tick size, where the tick size comes from
+# scanner.tick_size_for_price() (see scanner.v2_limit_price). One tick lets a
+# book that moved up by one tick since the pre-execution check still fill,
+# on every tick regime alike: 1c on a linear-cent market, $0.001 or $0.0001 on
+# the finer regimes MVE/combo markets use.
 BUY_SLIPPAGE_TICKS            = 1
 
 # Fallback tick size, in dollars, for a market whose tick structure is unknown
@@ -758,15 +736,16 @@ V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
 # The DEFAULT exchange shard. Kalshi partitions the exchange into parallel
 # instances keyed by `exchange_index` (on markets and in the balance breakdown;
 # combos migrated to shard 1 on 2026-08-17, crypto to shard 2 and
-# tennis/baseball to shard 3 on 2026-08-24). "Default" carries three
-# path-independent meanings, which is why this is not named "routable" —
-# routability depends on the order path (the legacy endpoint reaches only this
-# shard; V2 takes an explicit per-order exchange_index):
+# tennis/baseball to shard 3 on 2026-08-24). It is not the shard orders go
+# to: every V2 order carries its own market's exchange_index. "Default" means
+# three things:
 #   1. the shard assumed when a market payload omits `exchange_index`
 #      (fail-safe — absence of the field must never drop markets);
 #   2. the shard the legacy/sandbox single-scalar balance shapes are
 #      attributed to (auth.py fallback tiers 2-3);
-#   3. the only shard the legacy order path may route to.
+#   3. the transfer source shard of the human-run order-path probe: its
+#      one-cent collateral-transfer check moves money from this shard to
+#      another and back.
 DEFAULT_EXCHANGE_INDEX       = 0
 
 # The JSON re-typings of an /exchange/status boolean that scanner._status_flag()

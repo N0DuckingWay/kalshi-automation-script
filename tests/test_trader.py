@@ -1,7 +1,6 @@
-"""Tests for trader.py — order construction (both the V2 and the retained
-legacy endpoint), V2 price/tick math, rollback verification and its loss
-floor, exception disambiguation, and the cross-shard collateral transfer
-machinery. All Kalshi API interaction is mocked per project policy (tests must
+"""Tests for trader.py — V2 order construction, V2 price/tick math, rollback
+verification and its loss floor, exception disambiguation, and the
+cross-shard collateral transfer machinery. All Kalshi API interaction is mocked per project policy (tests must
 run offline).
 
 Legs are named by SUBMISSION order, not by market: the NO leg is always
@@ -24,8 +23,12 @@ reads before anything else, so a mock sequence written for the old
 read-on-demand protocol will fail with StopIteration or a wrong status; read
 such failures through that lens first.
 
-The merged default is ORDER_API_VERSION="v2", so any class that drives
-_execute_one down the legacy path opts in via the `legacy_mode` fixture.
+Every order goes to the V2 endpoint through signed_request_json, which the
+cases below replace with a mock. TestV2IsTheOnlyOrderPath pins, by syntax
+tree, that no module imports the SDK's CreateOrderRequest or spells any name
+containing "createorder" (underscores and case ignored), that config.py is the
+only module referencing ORDER_API_VERSION, and that no string constant other
+than a docstring starts with the retired /portfolio/orders endpoint's path.
 """
 import ast
 import copy
@@ -41,6 +44,7 @@ import time
 import uuid
 from decimal import Decimal
 from json import JSONDecodeError
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -49,7 +53,6 @@ from kalshi_python_sync.exceptions import ApiException
 
 from kalshi_betting import _http, config, trader
 from kalshi_betting.config import (
-    BUY_MAX_COST_SLIPPAGE_CENTS,
     BUY_SLIPPAGE_TICKS,
     DEFAULT_EXCHANGE_INDEX,
     ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT,
@@ -60,13 +63,9 @@ from kalshi_betting.reporter import TradeResult
 from kalshi_betting.scanner import PriceRange
 from kalshi_betting.trader import (
     _await_transfer_settlement,
-    _build_no_order,
     _build_no_order_v2,
-    _build_rollback_order_any,
     _build_rollback_order_v2,
-    _build_yes_order,
     _build_yes_order_v2,
-    _buy_max_cost_cents,
     _ceil_to_tick,
     _cents_to_centicents,
     _execute_one,
@@ -74,14 +73,12 @@ from kalshi_betting.trader import (
     _format_count,
     _format_price,
     _is_fok_kill,
-    _legacy_routable,
     _ordered_legs,
     _partition_by_funding,
     _plan_transfers,
     _position_count,
     _required_cents_by_shard,
     _rollback_floor_cents,
-    _submit_order,
     _submit_order_v2,
     _transfers_active,
     _unfunded_shards,
@@ -260,13 +257,6 @@ def fok_kill_error() -> ApiException:
     return ApiException(status=409, reason="Conflict", body=FOK_KILL_BODY)
 
 
-def order_resp(status: str) -> SimpleNamespace:
-    """Raw create_order response — trader parses the JSON body directly
-    because the SDK's Order response model can't deserialize live payloads."""
-    payload = {"order": {"status": status}}
-    return SimpleNamespace(status=201, data=json.dumps(payload).encode("utf-8"))
-
-
 def positions_resp(ticker: str | None = None, position: float = 0) -> SimpleNamespace:
     """Raw get_positions response with zero or one market position.
 
@@ -321,43 +311,13 @@ def positions_seq(*readings) -> MagicMock:
     return MagicMock(side_effect=effects)
 
 
-class TestOrderPriceProtection:
-    def test_no_leg_has_buy_max_cost(self):
-        spec = make_spec(x=5, nA=0.40)
-        order = _build_no_order(_no_leg(spec))
-        expected = math.ceil(5 * 0.40 * 100) + 5 * BUY_MAX_COST_SLIPPAGE_CENTS
-        assert order.buy_max_cost == expected
-        assert order.side == "no"
-        assert order.action == "buy"
-        assert order.time_in_force == "fill_or_kill"
-
-    def test_yes_leg_has_buy_max_cost(self):
-        spec = make_spec(x=5, pB=0.35)
-        order = _build_yes_order(_yes_leg(spec))
-        expected = math.ceil(5 * 0.35 * 100) + 5 * BUY_MAX_COST_SLIPPAGE_CENTS
-        assert order.buy_max_cost == expected
-        assert order.side == "yes"
-
-    def test_float_noise_does_not_loosen_the_cap(self):
-        # 7 * 0.07 * 100 == 49.00000000000001 in binary float, so a bare
-        # ceil() would hand the order a spurious extra cent of headroom.
-        # Rounding to 6 decimals first keeps the cap at the true 49 cents —
-        # strictly tighter price protection, never looser.
-        assert _buy_max_cost_cents(7, 0.07) == 49 + 7 * BUY_MAX_COST_SLIPPAGE_CENTS
-        assert math.ceil(7 * 0.07 * 100) == 50  # what the un-rounded form gave
-
-    def test_genuine_fraction_still_rounds_up(self):
-        # The guard must only remove noise: a real sub-cent remainder still
-        # ceils, or the cap could reject a fill at the scanned price.
-        assert _buy_max_cost_cents(3, 0.335) == 101 + 3 * BUY_MAX_COST_SLIPPAGE_CENTS
-
-
 class TestRollbackPriceFloor:
-    """The NO-leg unwind is floored, never an unbounded market order: on the
-    legacy path the floor is the price of a fill-or-kill limit sell, and on V2
-    the same floor caps the immediate-or-cancel bid. The floor is read from
-    the NO leg's own scanned entry — `nA` for the same-title default used here
-    (market_a is the NO leg)."""
+    """The NO-leg unwind is floored, never an unbounded order: the floor is
+    the lowest NO price per contract the unwind may realize, and mirrored onto
+    the YES book it caps the immediate-or-cancel unwind bid at 1 - floor/100
+    (see TestV2OrderBuilders). The floor is read from the NO leg's own scanned
+    entry — `nA` for the same-title default used here (market_a is the NO
+    leg)."""
 
     def test_floor_is_entry_less_max_loss(self):
         spec = make_spec(nA=0.62)
@@ -380,23 +340,6 @@ class TestRollbackPriceFloor:
         assert _rollback_floor_cents(_no_leg(make_spec(nA=0.03))) == 1
         # And the upper clamp keeps the price inside the API's 1..99 range.
         assert _rollback_floor_cents(_no_leg(make_spec(nA=1.20))) == 99
-
-
-@pytest.fixture
-def legacy_mode(monkeypatch):
-    """Pin trader to the retained legacy /portfolio/orders order path.
-
-    ORDER_API_VERSION now defaults to "v2", so the legacy-endpoint cases below
-    must select their path explicitly rather than relying on the default —
-    otherwise they would silently stop covering the legacy code they exist for.
-    """
-    monkeypatch.setattr(trader, "ORDER_API_VERSION", "legacy")
-
-
-@pytest.fixture
-def v2_mode(monkeypatch):
-    """Pin trader to the V2 order path (the config default, made explicit)."""
-    monkeypatch.setattr(trader, "ORDER_API_VERSION", "v2")
 
 
 @pytest.fixture(autouse=True)
@@ -440,115 +383,67 @@ def assert_disproof_names_the_remedy(caplog) -> None:
 
 
 class TestRollbackVerification:
+    """What _execute_one sends and reports around the unwind: the loss-floored
+    rollback is checked like any other order, a clean fill-or-kill rejection is
+    a confirmed non-fill with no position read after it, and both baselines are
+    read before any order goes out. The NO-leg mapping backstop is latched so
+    it cannot consume these cases' position scripts."""
+
     @pytest.fixture(autouse=True)
-    def _use_legacy(self, legacy_mode):
-        """These cases assert on the legacy CreateOrderRequest wire format."""
+    def _use_v2(self, v2_mapping_confirmed):
+        """The V2 NO-leg mapping is already confirmed, as on a second trade."""
 
-    def test_unfilled_rollback_reports_rollback_failed(self):
-        # NO leg fills, YES leg FoK is rejected, and the rollback FoK is ALSO
-        # rejected — the orphaned NO-leg position must surface as
-        # "rollback_failed", never be logged away as a successful rollback.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            order_resp("canceled"),   # YES leg rejected (confirmed non-fill)
-            order_resp("canceled"),   # rollback rejected → orphaned position
-        ])
-        # Only the two pre-submission baselines are read: neither leg raised,
-        # so no ambiguity snapshot is taken.
-        client.get_positions_without_preload_content = positions_seq(None, None)
-        result = _execute_one(client, make_spec())
-        assert result.status == "rollback_failed"
-        assert "rollback FoK not filled" in result.error
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
 
-    def test_filled_rollback_reports_rolled_back(self):
+    def test_floored_rollback_killed_by_price_reports_rollback_failed(self, post):
+        # A book past the floor leaves the capped unwind bid nothing to buy.
+        # The position is still open, so the outcome must stay
+        # "rollback_failed" for manual review, and the unwind that went out
+        # carried the floor: NO entry 62c less the max loss, mirrored onto the
+        # YES book as the bid cap.
+        post.side_effect = [
+            v2_resp(5),   # NO leg
+            v2_resp(0),   # YES leg rejected
+            v2_resp(0),   # floored unwind finds nothing at or under its cap
+        ]
         client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            order_resp("canceled"),   # YES leg rejected
-            order_resp("executed"),   # rollback filled
-        ])
-        client.get_positions_without_preload_content = positions_seq(None, None)
-        result = _execute_one(client, make_spec())
-        assert result.status == "rolled_back"
-
-    def test_rollback_order_is_floored_reduce_only_limit_sell(self):
-        # The unwind must be a LIMIT sell carrying a proceeds floor: a market
-        # sell has no such knob, so a collapsed book would realize an unbounded
-        # loss on a position we only hold because YES leg failed.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),
-            order_resp("canceled"),
-            order_resp("executed"),
-        ])
-        client.get_positions_without_preload_content = positions_seq(None, None)
-        spec = make_spec(nA=0.40)
-        _execute_one(client, spec)
-        rollback_call = client.create_order_without_preload_content.call_args_list[2]
-        rollback_req = rollback_call.kwargs["create_order_request"]
-        assert rollback_req.action == "sell"
-        assert rollback_req.side == "no"
-        assert rollback_req.type == "limit"
-        assert rollback_req.no_price == 40 - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT
-        assert rollback_req.count == spec.x
-        assert rollback_req.time_in_force == "fill_or_kill"
-        assert rollback_req.reduce_only is True
-
-    def test_floored_rollback_killed_by_price_reports_rollback_failed(self):
-        # A book below the floor kills the FoK limit sell. The position is
-        # still open, so the outcome must stay "rollback_failed" for manual
-        # review — the same contract the old market unwind had when unfilled.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            order_resp("canceled"),   # YES leg rejected
-            order_resp("canceled"),   # floored unwind killed by the price floor
-        ])
         client.get_positions_without_preload_content = positions_seq(None, None)
         result = _execute_one(client, make_spec(nA=0.62))
         assert result.status == "rollback_failed"
         assert "rollback FoK not filled" in result.error
-        rollback_req = client.create_order_without_preload_content.call_args_list[2].kwargs[
-            "create_order_request"
-        ]
-        assert rollback_req.no_price == 62 - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT
-
-    def test_clean_double_fill_submits_exactly_two_orders(self):
-        # The happy path must be untouched by the delta protocol: two orders,
-        # no rollback, and no submit-retry.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            order_resp("executed"),   # YES leg
-        ])
-        client.get_positions_without_preload_content = positions_seq(None, None)
-        result = _execute_one(client, make_spec())
-        assert result.status == "executed"
-        assert client.create_order_without_preload_content.call_count == 2
-
-    def test_leg_a_fok_rejection_is_failed_without_position_check(self):
-        # A clean FoK rejection is a confirmed non-fill — no ambiguity
-        # snapshot, no rollback, and YES leg is never submitted.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(
-            return_value=order_resp("canceled")
+        rollback_body = post.call_args_list[2].kwargs["body"]
+        assert rollback_body["price"] == _format_price(
+            Decimal("1") - Decimal(62 - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT) / Decimal("100")
         )
+        assert rollback_body["reduce_only"] is True
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
+
+    def test_leg_a_fok_rejection_is_failed_without_position_check(self, post):
+        # A clean FoK rejection (a 2xx with nothing filled) is a confirmed
+        # non-fill — no ambiguity snapshot, no rollback, and the YES leg is
+        # never submitted.
+        post.side_effect = [v2_resp(0)]
+        client = MagicMock()
         client.get_positions_without_preload_content = positions_seq(None, None)
         result = _execute_one(client, make_spec())
         assert result.status == "failed"
         assert "NO leg FoK not filled" in result.error
-        assert client.create_order_without_preload_content.call_count == 1
+        assert post.call_count == 1
         # Only the two up-front baselines were read — no ambiguity snapshot
         assert client.get_positions_without_preload_content.call_count == 2
 
-    def test_both_baselines_are_read_before_any_order_is_submitted(self):
-        # The unhedged window is the gap between NO leg's fill and YES leg's
-        # submission. A position read in there is a blocking network call that
-        # can burn the full ~62s retry schedule while the account holds a naked
-        # NO on market A, so BOTH baselines must be taken up front. YES leg's is
-        # equally valid there: it reads a different ticker, and no fill on that
-        # ticker can have happened yet.
+    def test_both_baselines_are_read_before_any_order_is_submitted(self, post):
+        # The unhedged window is the gap between the NO leg's fill and the YES
+        # leg's submission. A retried position read in there is a blocking
+        # network call that can burn the full ~62s retry schedule while the
+        # account holds a naked NO on market A, so BOTH baselines must be taken
+        # up front. The YES leg's is equally valid there: it reads a different
+        # ticker, and no fill on that ticker can have happened yet.
         calls: list[str] = []
 
         def record_positions(*args, **kwargs):
@@ -557,11 +452,11 @@ class TestRollbackVerification:
 
         def record_order(*args, **kwargs):
             calls.append("order")
-            return order_resp("executed")
+            return v2_resp(5)
 
+        post.side_effect = record_order
         client = MagicMock()
         client.get_positions_without_preload_content = MagicMock(side_effect=record_positions)
-        client.create_order_without_preload_content = MagicMock(side_effect=record_order)
 
         result = _execute_one(client, make_spec())
         assert result.status == "executed"
@@ -571,36 +466,31 @@ class TestRollbackVerification:
 class TestNoLegExceptionDisambiguation:
     """The NO leg raised: the outcome is attributed to the position DELTA.
 
-    Same-title default, so the NO leg is TICK-A (market_a)."""
+    Same-title default, so the NO leg is TICK-A (market_a). A submission that
+    raises may still have filled, so a stale holding in the ticker must never
+    be read as this order's fill, and a delta the order cannot explain must
+    never be traded against."""
 
     @pytest.fixture(autouse=True)
-    def _use_legacy(self, legacy_mode):
-        """Exercises the legacy submission path's exception handling."""
+    def _use_v2(self, v2_mapping_confirmed):
+        """The V2 NO-leg mapping is already confirmed, as on a second trade."""
 
-    def test_no_movement_is_failed(self, monkeypatch):
-        # Exception + position unchanged → confirmed non-fill, no rollback sent.
-        # RE-PINNED (DR-64) from a three-entry script: a zero delta is only a
-        # confirmed non-fill once the LAG RE-READ has also come back zero, so
-        # the genuine-non-fill case now scripts a fourth, still-unmoved reading.
-        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
-        # before_no, before_yes (both up front), then after_no, then the re-read
-        client.get_positions_without_preload_content = positions_seq(None, None, None, None)
-        result = _execute_one(client, make_spec())
-        assert result.status == "failed"
-        assert client.create_order_without_preload_content.call_count == 1
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
 
-    def test_external_no_position_unchanged_is_failed_not_unwound(self, monkeypatch):
+    def test_external_no_position_unchanged_is_failed_not_unwound(self, post, monkeypatch):
         # REGRESSION (BS-01): the account already holds 10 NO contracts on
         # TICK-A from an earlier run, and our order genuinely did not fill.
-        # The old absolute check (held_a != 0) unwound that unrelated holding;
-        # the delta is 0, so this must be a clean "failed" with NO sell order.
-        # RE-PINNED (DR-64) from a three-entry script — the fourth reading is
-        # the lag re-read, still unmoved because this really is a non-fill.
+        # An absolute check (held_a != 0) would unwind that unrelated holding;
+        # the delta is 0 on both the first read and the lag re-read (DR-64),
+        # so this must be a clean "failed" with no unwind sent.
         monkeypatch.setattr(trader.time, "sleep", lambda s: None)
+        post.side_effect = TimeoutError("timeout")
         client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
         client.get_positions_without_preload_content = positions_seq(
             ("TICK-A", -10),   # before_no
             None,              # before_yes (taken up front, unused here)
@@ -609,18 +499,18 @@ class TestNoLegExceptionDisambiguation:
         )
         result = _execute_one(client, make_spec())
         assert result.status == "failed"
-        assert client.create_order_without_preload_content.call_count == 1
+        assert post.call_count == 1
 
-    def test_delta_of_our_no_buy_is_unwound(self):
+    def test_delta_of_our_no_buy_is_unwound(self, post):
         # Exception but the position moved by exactly -spec.x (timeout AFTER
         # the fill) — the half-filled pair must be unwound, not abandoned.
         # The account also held 10 unrelated NO contracts, which the delta
         # correctly ignores.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
+        post.side_effect = [
             TimeoutError("timeout"),  # NO leg raises after actually filling
-            order_resp("executed"),   # rollback fills
-        ])
+            v2_resp(5),               # rollback fills
+        ]
+        client = MagicMock()
         client.get_positions_without_preload_content = positions_seq(
             ("TICK-A", -10),   # before_no
             None,              # before_yes (taken up front, unused here)
@@ -628,15 +518,16 @@ class TestNoLegExceptionDisambiguation:
         )
         result = _execute_one(client, make_spec(x=5))
         assert result.status == "rolled_back"
-        # Exactly one submission attempt per NO-leg order plus the rollback
-        assert client.create_order_without_preload_content.call_count == 2
+        # Exactly one submission attempt for the NO leg, plus the rollback
+        assert post.call_count == 2
+        assert post.call_args_list[1].kwargs["body"]["reduce_only"] is True
 
-    def test_unattributable_delta_is_manual_review(self):
+    def test_unattributable_delta_is_manual_review(self, post):
         # The position moved, but by an amount our order cannot explain (an
-        # unrelated trade landed in the snapshot window). A reduce-only sell
-        # would liquidate a position we may not own — surface it instead.
+        # unrelated trade landed in the snapshot window). A reduce-only unwind
+        # would close a position we may not own — surface it instead.
+        post.side_effect = TimeoutError("timeout")
         client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
         client.get_positions_without_preload_content = positions_seq(
             ("TICK-A", 0),     # before_no
             None,              # before_yes (taken up front, unused here)
@@ -646,19 +537,18 @@ class TestNoLegExceptionDisambiguation:
         assert result.status == "manual_review"
         assert "delta=-3" in result.error
         # No unwind order was submitted
-        assert client.create_order_without_preload_content.call_count == 1
+        assert post.call_count == 1
 
-    def test_snapshot_failure_is_manual_review(self):
-        # The lookup itself failed, so the state is unknown. This is the
-        # behavior change: the old code unwound blindly here.
+    def test_snapshot_failure_is_manual_review(self, post):
+        # The lookup itself failed, so the state is unknown: no unwind.
         #
         # The call_count assertion is load-bearing beyond "no retry loop": the
-        # snapshot must run OUTSIDE NO leg's except block. Inside it, the
+        # snapshot must run OUTSIDE the NO leg's except block. Inside it, the
         # RuntimeError would inherit the submission's TimeoutError as
         # __context__, api_call_with_retry's cause-chain walk would classify it
         # as transient, and this decision would stall for the full ~62s backoff.
+        post.side_effect = TimeoutError("timeout")
         client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
         client.get_positions_without_preload_content = positions_seq(
             None,                            # before_no
             None,                            # before_yes (taken up front)
@@ -668,53 +558,42 @@ class TestNoLegExceptionDisambiguation:
             result = _execute_one(client, make_spec())
         assert result.status == "manual_review"
         assert "delta=None" in result.error
-        assert client.create_order_without_preload_content.call_count == 1
+        assert post.call_count == 1
         assert client.get_positions_without_preload_content.call_count == 3
         sleep.assert_not_called()
 
 
 class TestYesLegExceptionDisambiguation:
-    """The YES leg raised: same delta protocol, but never auto-rollback on
-    unknown. Same-title default, so the YES leg is TICK-B (market_b)."""
+    """The YES leg raised: same delta protocol, but never auto-rollback on an
+    outcome the order cannot explain. Same-title default, so the YES leg is
+    TICK-B (market_b)."""
 
     @pytest.fixture(autouse=True)
-    def _use_legacy(self, legacy_mode):
-        """Exercises the legacy submission path's exception handling."""
+    def _use_v2(self, v2_mapping_confirmed):
+        """The V2 NO-leg mapping is already confirmed, as on a second trade, so
+        the NO leg's fill costs no extra position read."""
 
-    def test_delta_of_our_yes_buy_is_executed(self):
-        # YES leg raises but the position moved by exactly +spec.y — the pair
-        # actually completed; rolling back NO leg would REVERSE the hedge.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            TimeoutError("timeout"),  # YES leg raises after actually filling
-        ])
-        client.get_positions_without_preload_content = positions_seq(
-            None,              # before_no
-            None,              # before_yes
-            ("TICK-B", 5),     # after_yes — moved by +5 == spec.y
-        )
-        result = _execute_one(client, make_spec(x=5))
-        assert result.status == "executed"
-        # No rollback order was submitted
-        assert client.create_order_without_preload_content.call_count == 2
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
 
-    def test_external_yes_position_unchanged_rolls_back(self, monkeypatch):
+    def test_external_yes_position_unchanged_rolls_back(self, post, monkeypatch):
         # HEADLINE REGRESSION (BS-01): the account already holds 5 YES
-        # contracts on TICK-B, and YES leg did NOT fill. The old truthiness
-        # check (`if held_b:`) read that stale holding as our fill and
-        # reported "executed", leaving NO leg unhedged and the log claiming a
-        # complete pair. The delta is 0, so NO leg must be rolled back.
-        # RE-PINNED (DR-63) from a three-entry script: a zero delta is only a
-        # confirmed non-fill once the LAG RE-READ has also come back zero, so
-        # the genuine-non-fill case scripts a fourth, still-unmoved reading.
+        # contracts on TICK-B, and the YES leg did NOT fill. A truthiness
+        # check (`if held_b:`) would read that stale holding as our fill and
+        # report "executed", leaving the NO leg unhedged and the log claiming
+        # a complete pair. The delta is 0 on both the first read and the lag
+        # re-read (DR-63), so the NO leg must be rolled back.
         monkeypatch.setattr(trader.time, "sleep", lambda s: None)
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
+        post.side_effect = [
+            v2_resp(5),               # NO leg
             TimeoutError("timeout"),  # YES leg raises, truly unfilled
-            order_resp("executed"),   # rollback fills
-        ])
+            v2_resp(5),               # rollback fills
+        ]
+        client = MagicMock()
         client.get_positions_without_preload_content = positions_seq(
             None,              # before_no
             ("TICK-B", 5),     # before_yes — pre-existing external position
@@ -723,30 +602,31 @@ class TestYesLegExceptionDisambiguation:
         )
         result = _execute_one(client, make_spec(x=5))
         assert result.status == "rolled_back"
-        assert client.create_order_without_preload_content.call_count == 3
+        assert post.call_count == 3
 
-    def test_no_position_at_all_rolls_back(self, monkeypatch):
-        # RE-PINNED (DR-63) from a three-entry script — the fourth reading is
-        # the lag re-read, still flat because this really is a non-fill.
+    def test_no_position_at_all_rolls_back(self, post, monkeypatch):
+        # No position on file on any reading (the ticker is absent from every
+        # page), the lag re-read included: a confirmed non-fill, so the NO leg
+        # is unwound.
         monkeypatch.setattr(trader.time, "sleep", lambda s: None)
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
+        post.side_effect = [
+            v2_resp(5),               # NO leg
             TimeoutError("timeout"),  # YES leg raises, truly unfilled
-            order_resp("executed"),   # rollback fills
-        ])
+            v2_resp(5),               # rollback fills
+        ]
+        client = MagicMock()
         client.get_positions_without_preload_content = positions_seq(None, None, None, None)
         result = _execute_one(client, make_spec())
         assert result.status == "rolled_back"
 
-    def test_unexpected_delta_is_manual_review_without_rollback(self):
+    def test_unexpected_delta_is_manual_review_without_rollback(self, post):
         # The position moved by +2 but we ordered 7 — unattributable. Never
         # auto-rollback on an outcome we cannot explain.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
+        post.side_effect = [
+            v2_resp(7, 7),            # NO leg
             TimeoutError("timeout"),  # YES leg raises
-        ])
+        ]
+        client = MagicMock()
         client.get_positions_without_preload_content = positions_seq(
             None,
             ("TICK-B", 0),
@@ -756,27 +636,7 @@ class TestYesLegExceptionDisambiguation:
         assert result.status == "manual_review"
         assert "delta=2" in result.error
         # No third (rollback) order was submitted
-        assert client.create_order_without_preload_content.call_count == 2
-
-    def test_unknown_position_does_not_auto_rollback(self):
-        # YES leg raises AND the position lookup itself fails — the fill state
-        # is genuinely unknown. Auto-rolling-back here would be wrong if YES leg
-        # actually filled: it would sell the NO-leg hedge and leave a naked YES
-        # position on B while reporting "rolled_back" (which implies flat).
-        # RuntimeError is non-retryable, so api_call_with_retry fails fast and
-        # the lookup returns None on the first attempt.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            TimeoutError("timeout"),  # YES leg raises
-        ])
-        client.get_positions_without_preload_content = MagicMock(
-            side_effect=RuntimeError("lookup failed")
-        )
-        result = _execute_one(client, make_spec())
-        assert result.status == "manual_review"
-        # No rollback order was submitted — only NO leg and YES leg's attempt
-        assert client.create_order_without_preload_content.call_count == 2
+        assert post.call_count == 2
 
 
 class TestLedgerLagOnAmbiguousLegs:
@@ -812,9 +672,9 @@ class TestLedgerLagOnAmbiguousLegs:
     """
 
     @pytest.fixture(autouse=True)
-    def _use_v2(self, v2_mode, v2_mapping_confirmed):
-        """The production default path, with the NO-mapping backstop already
-        latched so it cannot consume these cases' position scripts."""
+    def _use_v2(self, v2_mapping_confirmed):
+        """The NO-mapping backstop already latched, so it cannot consume these
+        cases' position scripts."""
 
     @pytest.fixture
     def post(self, monkeypatch):
@@ -1035,71 +895,6 @@ class TestPositionCountRetry:
             return_value=positions_resp()
         )
         assert _position_count(client, "TICK-A") == 0
-
-
-class TestLegacyShardGuard:
-    """The legacy /portfolio/orders endpoint has no shard-routing parameter, so
-    while it is the selected path a pair with a leg off DEFAULT_EXCHANGE_INDEX
-    must be refused BEFORE anything is submitted. Markets are tagged with their
-    shard at ingest, so this guard is the only thing standing between an
-    unreachable shard and a misrouted real-money order. The V2 path is exempt:
-    every V2 body routes itself via its own market's exchange_index."""
-
-    def test_both_legs_default_shard_is_routable(self):
-        assert _legacy_routable(make_spec(shard_a=0, shard_b=0)) is True
-
-    def test_leg_a_off_default_shard_is_not_routable(self):
-        assert _legacy_routable(make_spec(shard_a=1, shard_b=0)) is False
-
-    def test_leg_b_off_default_shard_is_not_routable(self):
-        assert _legacy_routable(make_spec(shard_a=0, shard_b=1)) is False
-
-    def test_both_legs_off_default_shard_is_not_routable(self):
-        assert _legacy_routable(make_spec(shard_a=2, shard_b=2)) is False
-
-    def test_routable_check_is_gated_on_config_constant(self):
-        # Not a hardcoded 0 that would silently diverge from config.py.
-        assert _legacy_routable(
-            make_spec(shard_a=DEFAULT_EXCHANGE_INDEX, shard_b=DEFAULT_EXCHANGE_INDEX)
-        ) is True
-
-    def test_legacy_mode_off_shard_spec_fails_before_any_submission(
-        self, legacy_mode
-    ):
-        client = MagicMock()
-        result = _execute_one(client, make_spec(shard_b=1))
-        assert result.status == "failed", (
-            'nothing was submitted, so there is nothing to unwind — "failed" '
-            "is the correct status vocabulary, not manual_review"
-        )
-        assert "shard" in result.error
-        # The guard must run BEFORE anything reaches either order path
-        client.create_order_without_preload_content.assert_not_called()
-        client.rest_client.request.assert_not_called()
-
-    def test_legacy_mode_default_shard_spec_proceeds(self, legacy_mode):
-        # Sanity: the guard must not block the ordinary single-shard case.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            order_resp("executed"),   # YES leg
-        ])
-        result = _execute_one(client, make_spec(shard_a=0, shard_b=0))
-        assert result.status == "executed"
-        assert client.create_order_without_preload_content.call_count == 2
-
-    def test_v2_mode_off_shard_spec_proceeds(
-        self, v2_mode, v2_mapping_confirmed, monkeypatch
-    ):
-        # V2 bodies carry their own market's shard, so an off-shard pair is
-        # perfectly routable there — the guard must not fire.
-        post = MagicMock(side_effect=[v2_resp(5), v2_resp(5)])
-        monkeypatch.setattr(trader, "signed_request_json", post)
-        client = MagicMock()
-        result = _execute_one(client, make_spec(shard_a=1))
-        assert result.status == "executed"
-        assert post.call_count == 2
-        assert post.call_args_list[0].kwargs["body"]["exchange_index"] == 1
 
 
 class TestCentsToCenticents:
@@ -1511,8 +1306,8 @@ class TestEnsureShardCollateral:
         # _position_count (a GET cannot duplicate a trade, and an unretried
         # transient 429 there escalates a resolvable ambiguity into a rollback
         # or manual_review). What must never be retried is the state-changing
-        # side: the two submission paths and the non-idempotent transfer POST.
-        for fn in (trader._submit_order, trader._submit_order_v2, trader._execute_transfer):
+        # side: order submission and the non-idempotent transfer POST.
+        for fn in (trader._submit_order_v2, trader._execute_transfer):
             assert not _calls_retry_wrapper(fn), (
                 f"{fn.__name__} must not be wrapped in retry/backoff — "
                 "a retried submission can double-fill and a retried transfer "
@@ -1521,6 +1316,14 @@ class TestEnsureShardCollateral:
         # The asymmetry is deliberate and is itself pinned: the read-only
         # position lookup DOES retry (see TestPositionCountRetry).
         assert _calls_retry_wrapper(trader._position_count)
+
+    def test_order_submission_call_sites_bypass_the_retry_wrapper(self):
+        # Neither caller of _submit_order_v2 may retry it: a retried order POST can fill twice.
+        for fn in (trader._execute_one, trader._rollback_no_leg):
+            assert not _calls_retry_wrapper(fn), (
+                f"{fn.__name__} must not wrap an order submission in "
+                "retry/backoff — a retried order POST can fill twice"
+            )
 
     def test_cross_shard_spec_funds_both_legs_shards(self, monkeypatch):
         # Legs on different shards: BOTH must be covered or the pair is a
@@ -1571,35 +1374,38 @@ class TestV2PriceMath:
         assert price == Decimal("1") - (Decimal("0.40") + BUY_SLIPPAGE_TICKS * Decimal("0.01"))
         assert price == Decimal("0.59")
 
-    def test_linear_cent_cap_equals_legacy_one_cent_slippage(self):
-        # On a 1c-grid market the V2 cap must be exactly the legacy intent:
-        # scanned price + $0.01 per contract, i.e. the same total buy_max_cost.
+    def test_linear_cent_cap_is_one_cent_above_the_scanned_price(self):
+        # On a 1c-grid market one tick is one cent: the cap is the scanned
+        # price ceiled to the cent plus BUY_SLIPPAGE_TICKS cents, so count
+        # contracts cost at most count times that.
         market = make_market("linear_cent")
         price = _v2_limit_price("buy_yes", 0.35, market)
+        cap_cents = math.ceil(round(0.35 * 100, 6)) + BUY_SLIPPAGE_TICKS
         for count in (1, 5, 17):
-            assert price * count * 100 == _buy_max_cost_cents(count, 0.35)
+            assert price * count * 100 == count * cap_cents
 
     def test_v2_float_noise_does_not_loosen_the_cap(self):
         # 1.0 - 0.43 == 0.5700000000000001: the cap must be 0.58 (one tick of
-        # slippage), not 0.59 — the V2 twin of the legacy round-before-ceil
-        # guard pinned by test_float_noise_does_not_loosen_the_cap (TS-03).
+        # slippage), not 0.59 — the scanned price is rounded to 6 decimals
+        # before it is ceiled onto the grid (TS-03).
         market = make_market("linear_cent")
         assert _v2_limit_price("buy_yes", 1.0 - 0.43, market) == Decimal("0.58")
         # buy_no: NO price 0.30000000000000004 -> cap 0.31 -> YES-book ask 0.69
         assert _v2_limit_price("buy_no", 1.0 - 0.70, market) == Decimal("0.69")
 
-    def test_v2_cap_parity_with_legacy_over_every_whole_cent_bid(self):
+    def test_linear_cent_cap_is_one_cent_above_every_whole_cent_ask(self):
         # Every scanned ask is 1.0 - float(bid), so walk all 99 whole-cent bids
         # in exactly the form scanner._bids_to_ask_levels produces and require
-        # the V2 cap to equal the legacy one-cent cap to the cent.
+        # the cap to be the ask ceiled to the cent (after rounding away float
+        # noise) plus BUY_SLIPPAGE_TICKS cents, to the cent.
         market = make_market("linear_cent")
         for cents in range(2, 100):
             p = 1.0 - cents / 100          # the exact form the scanner produces
             cap = _v2_limit_price("buy_yes", p, market)
-            assert cap * 100 == _buy_max_cost_cents(1, p), cents
-        # cents == 1 (scanned 0.99) is the one deliberate divergence and is NOT
-        # float noise: the legacy cap is $1.00, which is a settlement value and
-        # not a tradeable level, so the V2 cap clamps to the top of this
+            assert cap * 100 == math.ceil(round(p * 100, 6)) + BUY_SLIPPAGE_TICKS, cents
+        # cents == 1 (scanned 0.99) is the one deliberate exception and is NOT
+        # float noise: one cent above 0.99 is $1.00, which is a settlement value
+        # and not a tradeable level, so the cap clamps to the top of this
         # market's grid. That clamp is stricter, which is the allowed direction.
         assert _v2_limit_price("buy_yes", 1.0 - 0.01, market) == Decimal("0.99")
 
@@ -1672,18 +1478,19 @@ class TestV2OrderBuilders:
     def test_rollback_is_reduce_only_bid_at_the_loss_floored_price(self):
         # Closing a held NO position is buying the YES short back — a bid —
         # and reduce_only keeps it from ever opening new exposure. The price is
-        # NOT a flat top-of-grid bid: it is the legacy limit sell's loss floor
-        # mirrored onto the YES book. Default spec nA=0.40 -> floor 40-12=28c
-        # -> bid cap 1 - 0.28 = 0.72.
+        # NOT a flat top-of-grid bid: it is the NO leg's loss floor
+        # (_rollback_floor_cents) mirrored onto the YES book. Default spec
+        # nA=0.40 -> floor 40-12=28c -> bid cap 1 - 0.28 = 0.72.
         body = _build_rollback_order_v2(_no_leg(make_spec()))
         assert body["ticker"] == "TICK-A"
         assert body["side"] == "bid"
         assert body["reduce_only"] is True
         assert body["price"] == "0.7200"
 
-    def test_rollback_price_is_the_yes_book_mirror_of_the_legacy_floor(self):
-        # One bound, two expressions — this is the invariant that keeps the two
-        # order paths from diverging in how much loss an unwind may realize.
+    def test_rollback_price_is_the_yes_book_mirror_of_the_loss_floor(self):
+        # One bound read on both sides of the book: the unwind bid's cap is the
+        # NO-side loss floor's complement, so the loss an unwind may realize
+        # is set by _rollback_floor_cents alone.
         for nA in (0.40, 0.57, 0.62, 0.85):
             spec = make_spec(nA=nA)
             floor_cents = _rollback_floor_cents(_no_leg(spec))
@@ -1824,6 +1631,21 @@ class TestV2OrderBuilders:
         assert rollback_body["exchange_index"] == 2
         for body in (no_body, yes_body, rollback_body):
             assert body["exchange_index"] != -1
+
+    def test_an_off_default_shard_pair_is_submitted_on_each_legs_own_shard(
+        self, v2_mapping_confirmed, monkeypatch
+    ):
+        # A pair with a leg off DEFAULT_EXCHANGE_INDEX is traded like any
+        # other: nothing refuses it, and each order goes out on its own
+        # market's shard.
+        post = MagicMock(side_effect=[v2_resp(5), v2_resp(5)])
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        client = MagicMock()
+        result = _execute_one(client, make_spec(shard_a=1))
+        assert result.status == "executed"
+        assert post.call_count == 2
+        assert post.call_args_list[0].kwargs["body"]["exchange_index"] == 1
+        assert post.call_args_list[1].kwargs["body"]["exchange_index"] == DEFAULT_EXCHANGE_INDEX
 
     def test_default_shard_spec_carries_the_default_exchange_index(self):
         # The universal case today: everything is on DEFAULT_EXCHANGE_INDEX.
@@ -2032,13 +1854,14 @@ class TestSubmitOrderV2KillResponse:
 
 
 class TestV2ExecuteOne:
-    """The full legacy outcome matrix, replayed against the V2 order path."""
+    """_execute_one's outcome matrix on the V2 order path: every status, how
+    many orders go out, and the unwind's body."""
 
     @pytest.fixture(autouse=True)
-    def _use_v2(self, v2_mode, v2_mapping_confirmed):
-        """V2 path, with the NO-leg backstop already latched: these cases test
-        the state machine, not the first-fill mapping check, and must not have
-        their position mocks consumed by it."""
+    def _use_v2(self, v2_mapping_confirmed):
+        """The NO-leg backstop already latched: these cases test the state
+        machine, not the first-fill mapping check, and must not have their
+        position mocks consumed by it."""
 
     @pytest.fixture
     def post(self, monkeypatch):
@@ -2143,14 +1966,25 @@ class TestV2ExecuteOne:
         assert post.call_count == 2
 
     def test_v2_leg_b_exception_with_unknown_position_is_manual_review(self, post):
+        # The lookup itself failed, so the state is unknown: no rollback.
+        #
+        # The call_count and sleep assertions pin that the YES leg's
+        # post-failure read runs OUTSIDE the except block. Inside it, the
+        # RuntimeError would inherit the submission's TimeoutError as
+        # __context__, api_call_with_retry's cause-chain walk would classify it
+        # as transient, and this decision would stall for the full ~62s backoff.
         post.side_effect = [v2_resp(5), TimeoutError("timeout")]
         client = MagicMock()
         client.get_positions_without_preload_content = MagicMock(
             side_effect=RuntimeError("lookup failed")
         )
-        result = _execute_one(client, make_spec())
+        with patch.object(_http.time, "sleep") as sleep:
+            result = _execute_one(client, make_spec())
         assert result.status == "manual_review"
         assert post.call_count == 2
+        # The two up-front baselines and one read after the YES leg raised
+        assert client.get_positions_without_preload_content.call_count == 3
+        sleep.assert_not_called()
 
     def test_v2_leg_a_kill_response_is_failed_at_once(self, post, monkeypatch, caplog):
         # The exchange's HTTP 409 kill of the NO leg is a confirmed non-fill:
@@ -2202,6 +2036,21 @@ class TestV2ExecuteOne:
         assert result.status == "failed"
         assert post.call_count == 1
 
+    def test_the_sdk_create_order_endpoint_is_never_called(self, post):
+        # Both legs and the unwind go through signed_request_json to the V2
+        # route. The SDK's own create-order methods belong to the retired
+        # /portfolio/orders endpoint, which answers every order with an error,
+        # so none of them may ever be reached.
+        post.side_effect = [v2_resp(5), v2_resp(0), v2_resp(5)]
+        client = MagicMock()
+        assert _execute_one(client, make_spec()).status == "rolled_back"
+        assert post.call_count == 3
+        for call in post.call_args_list:
+            assert call.args[1:] == ("POST", V2_ORDER_PATH)
+        for name in ("create_order", "create_order_without_preload_content",
+                     "batch_create_orders", "batch_create_orders_without_preload_content"):
+            getattr(client, name).assert_not_called()
+
 
 class TestPartialUnwindCount:
     """How many NO contracts a failed V2 unwind leaves open, as its alert says.
@@ -2217,8 +2066,8 @@ class TestPartialUnwindCount:
     """
 
     @pytest.fixture(autouse=True)
-    def _use_v2(self, v2_mode, v2_mapping_confirmed):
-        """V2 path, NO-leg mapping already latched (see TestV2ExecuteOne)."""
+    def _use_v2(self, v2_mapping_confirmed):
+        """NO-leg mapping already latched (see TestV2ExecuteOne)."""
 
     @pytest.fixture
     def post(self, monkeypatch):
@@ -2399,7 +2248,7 @@ class TestPartialUnwindCount:
             submitted.append(order)
             raise trader._UnclassifiableV2Response("unclassifiable", [{"fill_count": 3}])
 
-        monkeypatch.setattr(trader, "_submit_any", submit)
+        monkeypatch.setattr(trader, "_submit_order_v2", submit)
         with caplog.at_level(logging.CRITICAL):
             result = trader._rollback_no_leg(
                 MagicMock(), make_spec(), _no_leg(make_spec()), "YES leg failed",
@@ -2420,7 +2269,7 @@ class TestPartialUnwindCount:
         def submit(client, order):
             raise trader._UnclassifiableV2Response("unclassifiable", v2_resp(3))
 
-        monkeypatch.setattr(trader, "_submit_any", submit)
+        monkeypatch.setattr(trader, "_submit_order_v2", submit)
         spec = make_spec()
         leg = dataclasses.replace(_no_leg(spec), count=np.int64(5))
         with caplog.at_level(logging.CRITICAL):
@@ -2497,23 +2346,6 @@ class TestPartialUnwindCount:
         assert "fill_count=3" in result.error
         assert post.call_count == 2
 
-    def test_a_legacy_unwind_error_still_says_up_to(self, legacy_mode, caplog):
-        # The legacy unwind is fill-or-kill and has no fill count to read, so
-        # a raised submission keeps the "up to" wording.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),
-            order_resp("canceled"),
-            RuntimeError("connection reset"),
-        ])
-        client.get_positions_without_preload_content = positions_seq(None, None)
-        with caplog.at_level(logging.CRITICAL):
-            result = _execute_one(client, make_spec())
-        assert result.status == "rollback_failed"
-        assert "still open" not in result.error
-        (alert,) = self._orphan_alerts(caplog)
-        assert "up to 5 NO contracts on TICK-A" in alert
-        assert client.create_order_without_preload_content.call_count == 3
 
 
 class TestV2NoMappingBackstop:
@@ -2538,12 +2370,11 @@ class TestV2NoMappingBackstop:
     two baselines around it, because it sits in the window where NO leg is
     filled and unhedged. Both readers call the same client method, so the
     call-count assertions below still count every read on one mock; what
-    changes is that the backstop's read never retries."""
+    changes is that the backstop's read never retries.
 
-    @pytest.fixture(autouse=True)
-    def _use_v2(self, v2_mode):
-        """V2 path with the latch left False — the state a fresh process is in
-        on its first trade (the module-level fixture resets it)."""
+    Every case starts with the latch False, the state a fresh process is in
+    on its first trade (the module-level _reset_v2_mapping_latch fixture
+    resets it)."""
 
     @pytest.fixture
     def post(self, monkeypatch):
@@ -2791,94 +2622,176 @@ class TestV2NoMappingBackstop:
         assert client.get_positions_without_preload_content.call_count == 6
         assert trader._V2_NO_MAPPING_CONFIRMED is True
 
-    def test_legacy_mode_never_consults_positions_on_a_fill(self, legacy_mode):
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"), order_resp("executed"),
-        ])
-        assert _execute_one(client, make_spec()).status == "executed"
-        # The backstop verifies the V2 mapping; on the legacy path there is
-        # nothing to verify, and an extra positions read would be pure cost.
-        # The two up-front ambiguity baselines are path-independent, so exactly
-        # those two reads happen and no third.
-        assert client.get_positions_without_preload_content.call_count == 2
-        assert trader._V2_NO_MAPPING_CONFIRMED is False
 
+class TestV2IsTheOnlyOrderPath:
+    """Three syntax-tree pins that keep the retired /portfolio/orders order
+    endpoint, which answers every order with an error, out of the package:
+    no module imports the SDK's CreateOrderRequest or spells any name
+    containing "createorder" once underscores and case are ignored (the SDK's
+    create-order methods belong to that endpoint); only config.py references
+    ORDER_API_VERSION, the startup switch whose only accepted value is "v2"
+    (config.order_api_version_error reads it); and no string constant other
+    than a docstring starts with that endpoint's path, "/portfolio/orders" or
+    "/trade-api/v2/portfolio/orders", which a signed POST to it would need.
+    All three read the syntax tree, so a comment or docstring naming any of
+    them can neither trip a check nor stand in for code; each finder is run
+    on snippets first, so a finder that stopped seeing anything fails here."""
 
-class TestOrderVersionDispatch:
-    def test_rollback_dispatcher_floors_the_loss_on_both_paths(self, monkeypatch):
-        # _build_rollback_order_any must never hand back an UNPRICED order on
-        # either path: an unwind with no proceeds bound realizes an unbounded
-        # loss on a book that collapsed since NO leg filled. One bound, two
-        # expressions — the legacy NO sell prices AT the floor, the V2 YES
-        # buy-back caps at its mirror (1 - floor).
-        spec = make_spec(nA=0.62)
-        floor_cents = _rollback_floor_cents(_no_leg(spec))
+    # Modules the walk must find: a moved package or an empty glob fails
+    # rather than passing vacuously
+    _EXPECTED = {
+        "config.py", "trader.py", "main.py", "scanner.py", "strategy.py",
+        "v2_probe.py", "_http.py", "auth.py",
+    }
 
-        monkeypatch.setattr(trader, "ORDER_API_VERSION", "legacy")
-        legacy = _build_rollback_order_any(_no_leg(spec))
-        assert legacy.type == "limit"          # never "market" — no floor there
-        assert legacy.no_price == floor_cents
-        assert legacy.reduce_only is True
-        assert legacy.time_in_force == "fill_or_kill"
+    @classmethod
+    def _modules(cls) -> dict[str, ast.Module]:
+        package = Path(inspect.getsourcefile(trader)).parent
+        found = {
+            path.name: ast.parse(path.read_text(encoding="utf-8"))
+            for path in sorted(package.glob("*.py"))
+        }
+        assert cls._EXPECTED <= found.keys(), sorted(found)
+        return found
 
-        monkeypatch.setattr(trader, "ORDER_API_VERSION", "v2")
-        v2 = _build_rollback_order_any(_no_leg(spec))
-        assert v2["side"] == "bid"
-        assert v2["reduce_only"] is True
-        assert v2["time_in_force"] == "immediate_or_cancel"
-        assert v2["price"] == _format_price(
-            Decimal("1") - Decimal(floor_cents) / Decimal("100")
-        )
+    @staticmethod
+    def _names_and_strings(tree: ast.AST):
+        """Every identifier the code spells — names, attributes, imported
+        modules and their aliases — plus the string a getattr / setattr /
+        hasattr / delattr call names, which is an attribute reached by text."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                yield node.id
+            elif isinstance(node, ast.Attribute):
+                yield node.attr
+            elif isinstance(node, ast.ImportFrom):
+                yield node.module or ""
+                for alias in node.names:
+                    yield alias.name
+                    yield alias.asname or ""
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    yield alias.name
+                    yield alias.asname or ""
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                  and node.func.id in {"getattr", "setattr", "hasattr", "delattr"}
+                  and len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
+                  and isinstance(node.args[1].value, str)):
+                yield node.args[1].value
 
-    def test_legacy_mode_uses_create_order_endpoint_unchanged(self, legacy_mode, monkeypatch):
-        posted = MagicMock()
-        monkeypatch.setattr(trader, "signed_request_json", posted)
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"), order_resp("executed"),
-        ])
-        result = _execute_one(client, make_spec())
-        assert result.status == "executed"
-        assert client.create_order_without_preload_content.call_count == 2
-        # The V2 route is never touched on the legacy path
-        posted.assert_not_called()
+    @classmethod
+    def _create_order_uses(cls, tree: ast.AST) -> list[str]:
+        """Every name that reaches the SDK's legacy create-order surface:
+        CreateOrderRequest, create_order*, batch_create_orders*, or the
+        models module that defines the request (underscores and case
+        ignored)."""
+        return [
+            name for name in cls._names_and_strings(tree)
+            if "createorder" in name.replace("_", "").lower()
+        ]
 
-    def test_v2_mode_never_touches_legacy_endpoint(
-        self, v2_mode, v2_mapping_confirmed, monkeypatch
-    ):
-        posted = MagicMock(side_effect=[v2_resp(5), v2_resp(5)])
-        monkeypatch.setattr(trader, "signed_request_json", posted)
-        client = MagicMock()
-        result = _execute_one(client, make_spec())
-        assert result.status == "executed"
-        assert client.create_order_without_preload_content.call_count == 0
+    @classmethod
+    def _order_api_version_uses(cls, tree: ast.AST) -> list[str]:
+        return [name for name in cls._names_and_strings(tree) if name == "ORDER_API_VERSION"]
 
-    def test_config_default_is_v2(self):
-        # "v2" is the only order path; config.order_api_version_error refuses any other.
-        assert config.ORDER_API_VERSION == "v2"
-        assert trader.ORDER_API_VERSION == "v2"
+    # The retired endpoint's path, in the two spellings a request could use
+    _RETIRED_ORDER_PATHS = ("/trade-api/v2/portfolio/orders", "/portfolio/orders")
 
+    @staticmethod
+    def _docstring_ids(tree: ast.AST) -> set[int]:
+        """ids of the string constants that are docstrings: the first
+        statement of a module, class or function, when it is a bare string."""
+        found = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                first = node.body[0] if node.body else None
+                if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                        and isinstance(first.value.value, str)):
+                    found.add(id(first.value))
+        return found
 
-class TestDropLegacyUnroutable:
-    """Regression (adversarial review): on the legacy path, unroutable specs
-    must be dropped BEFORE collateral moves — never funded and then refused."""
+    @classmethod
+    def _retired_order_path_strings(cls, tree: ast.AST) -> list[str]:
+        """Every string constant, other than a docstring, that starts (after
+        leading whitespace) with the retired endpoint's path — the shape a
+        request path to it would need, f-string pieces included. A message
+        that names the path mid-sentence is not a request path."""
+        docstrings = cls._docstring_ids(tree)
+        return [
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and id(node) not in docstrings
+            and node.value.lstrip().startswith(cls._RETIRED_ORDER_PATHS)
+        ]
 
-    def test_v2_mode_is_a_no_op(self, v2_mode):
-        portfolio = [make_spec(shard_a=0, shard_b=3)]
-        assert trader.drop_legacy_unroutable(portfolio) == portfolio
+    def test_the_finders_see_every_shape(self):
+        for snippet in (
+            "from kalshi_python_sync.models import CreateOrderRequest",
+            "from kalshi_python_sync.models.create_order_request import X",
+            "import kalshi_python_sync.models.create_order_request",
+            "client.create_order_without_preload_content(create_order_request=o)",
+            "client.batch_create_orders(orders)",
+            "f = getattr(client, 'create_order')",
+            "CreateOrderRequest(ticker='T')",
+        ):
+            assert self._create_order_uses(ast.parse(snippet)), snippet
+        for snippet in (
+            "from .config import ORDER_API_VERSION",
+            "from .config import OTHER as ORDER_API_VERSION",
+            "from .config import ORDER_API_VERSION as other",
+            "if config.ORDER_API_VERSION != 'v2': pass",
+            "x = ORDER_API_VERSION",
+            "getattr(config, 'ORDER_API_VERSION')",
+        ):
+            assert self._order_api_version_uses(ast.parse(snippet)), snippet
+        # Words in a docstring or comment are not code
+        prose = ast.parse('"""create_order and CreateOrderRequest, ORDER_API_VERSION"""\n# create_order')
+        assert not self._create_order_uses(prose)
+        assert not self._order_api_version_uses(prose)
 
-    def test_legacy_mode_drops_off_shard_specs_with_a_warning(self, legacy_mode, caplog):
-        keep = make_spec(shard_a=0, shard_b=0, title="routable")
-        drop = make_spec(shard_a=0, shard_b=1, title="off-shard")
-        with caplog.at_level(logging.WARNING):
-            kept = trader.drop_legacy_unroutable([keep, drop])
-        assert kept == [keep]
-        assert "before collateral funding" in caplog.text
+    def test_no_module_reaches_the_sdk_create_order_surface(self):
+        hits = {
+            name: uses for name, tree in self._modules().items()
+            if (uses := self._create_order_uses(tree))
+        }
+        assert hits == {}
 
-    def test_legacy_mode_keeps_default_shard_specs(self, legacy_mode):
-        portfolio = [make_spec(shard_a=0, shard_b=0)]
-        assert trader.drop_legacy_unroutable(portfolio) == portfolio
+    def test_only_config_references_order_api_version(self):
+        referencing = {
+            name for name, tree in self._modules().items()
+            if self._order_api_version_uses(tree)
+        }
+        # config.py must be found too: it defines the switch and its check reads it
+        assert referencing == {"config.py"}
+
+    def test_the_retired_path_finder_sees_every_shape(self):
+        for snippet in (
+            'PATH = "/portfolio/orders"',
+            'signed_request_json(client, "POST", "/trade-api/v2/portfolio/orders", body=b)',
+            'url = f"/portfolio/orders/{order_id}"',
+            'x = "  /portfolio/orders/batched"',
+            'def f():\n    """Doc."""\n    return "/portfolio/orders"',
+        ):
+            assert self._retired_order_path_strings(ast.parse(snippet)), snippet
+        # A docstring naming the path is prose, not a request path
+        for snippet in (
+            '"""/portfolio/orders is retired."""',
+            'def f():\n    """/portfolio/orders is retired."""',
+            'class C:\n    """/trade-api/v2/portfolio/orders"""',
+        ):
+            assert not self._retired_order_path_strings(ast.parse(snippet)), snippet
+        # The startup check's message names the path mid-string: a real
+        # negative, not a vacuous one, since its source does contain the path
+        source = textwrap.dedent(inspect.getsource(config.order_api_version_error))
+        assert "/portfolio/orders" in source
+        assert not self._retired_order_path_strings(ast.parse(source))
+
+    def test_no_code_string_spells_the_retired_order_path(self):
+        hits = {
+            name: paths for name, tree in self._modules().items()
+            if (paths := self._retired_order_path_strings(tree))
+        }
+        assert hits == {}
 
 
 class TestSettleAwaitTargeting:
@@ -3216,9 +3129,9 @@ class TestPreExecutionCheckSettings:
 
 class TestSameTitleWireIdentity:
     """Pins every field of every V2 body (except the random client_order_id)
-    and every field of every legacy request the builders produce for
-    make_spec()'s default same-title spec (x=5, nA=0.40, pB=0.35, shard 0), as
-    literal values, so nothing a same-title order sends can move by accident.
+    the builders produce for make_spec()'s default same-title spec (x=5,
+    nA=0.40, pB=0.35, shard 0), as literal values, so nothing a same-title
+    order sends can move by accident.
     A same_title pair buys NO on market_a and YES on market_b.
 
     Every V2 body carries self_trade_prevention_type (a required field of the
@@ -3252,22 +3165,8 @@ class TestSameTitleWireIdentity:
             "reduce_only": True, "post_only": False,
         }
 
-    def test_legacy_requests_are_unchanged(self, legacy_mode):
-        spec = make_spec()
-        no = _build_no_order(_no_leg(spec))
-        assert (no.ticker, no.side, no.action, no.type, no.count, no.time_in_force,
-                no.buy_max_cost) == ("TICK-A", "no", "buy", "market", 5, "fill_or_kill", 205)
-        yes = _build_yes_order(_yes_leg(spec))
-        assert (yes.ticker, yes.side, yes.action, yes.type, yes.count,
-                yes.time_in_force, yes.buy_max_cost) == (
-            "TICK-B", "yes", "buy", "market", 5, "fill_or_kill", 180)
-        rb = _build_rollback_order_any(_no_leg(spec))
-        assert (rb.ticker, rb.side, rb.action, rb.type, rb.no_price, rb.count,
-                rb.time_in_force, rb.reduce_only) == (
-            "TICK-A", "no", "sell", "limit", 28, 5, "fill_or_kill", True)
-
     def test_same_title_baselines_read_market_a_then_market_b(
-        self, v2_mode, v2_mapping_confirmed, monkeypatch
+        self, v2_mapping_confirmed, monkeypatch
     ):
         # Nothing used to pin the ORDER of the two baseline reads; now that the
         # NO leg can be either market, pin it for both pair types (the
@@ -3292,8 +3191,8 @@ class TestTimeSeriesLegOrder:
     for this pair type the whole state machine runs "backwards" across the
     markets: TICK-B is submitted first, baselined first, unwound on failure,
     and is the market the V2 NO-mapping backstop reads. Every expected price is
-    derived the way TestV2PriceMath / TestOrderPriceProtection derive theirs,
-    from the leg's own scanned price, never from nA/pB."""
+    derived the way TestV2PriceMath derives its own, from the leg's own scanned
+    price, never from nA/pB."""
 
     @staticmethod
     def _ts_spec(**overrides) -> MagicMock:
@@ -3332,7 +3231,7 @@ class TestTimeSeriesLegOrder:
             _no_leg(self._ts_spec()).count = 99
 
     def test_v2_submits_no_on_market_b_then_yes_on_market_a(
-        self, v2_mode, v2_mapping_confirmed, post
+        self, v2_mapping_confirmed, post
     ):
         post.side_effect = [v2_resp(5), v2_resp(5)]
         spec = self._ts_spec()
@@ -3354,7 +3253,7 @@ class TestTimeSeriesLegOrder:
         for body in (first, second):
             assert body["reduce_only"] is False and body["exchange_index"] != -1
 
-    def test_baselines_read_market_b_then_market_a(self, v2_mode, v2_mapping_confirmed, post):
+    def test_baselines_read_market_b_then_market_a(self, v2_mapping_confirmed, post):
         post.side_effect = [v2_resp(5), v2_resp(5)]
         tickers: list[str] = []
 
@@ -3368,7 +3267,7 @@ class TestTimeSeriesLegOrder:
         assert tickers == ["TICK-B", "TICK-A"]
 
     def test_yes_leg_kill_rolls_back_the_no_leg_on_market_b(
-        self, v2_mode, v2_mapping_confirmed, post
+        self, v2_mapping_confirmed, post
     ):
         post.side_effect = [v2_resp(5), v2_resp(0), v2_resp(5)]
         spec = self._ts_spec()
@@ -3386,7 +3285,7 @@ class TestTimeSeriesLegOrder:
         )
 
     def test_no_leg_kill_is_failed_before_anything_touches_market_a(
-        self, v2_mode, v2_mapping_confirmed, post
+        self, v2_mapping_confirmed, post
     ):
         post.side_effect = [v2_resp(0)]
         result = _execute_one(MagicMock(), self._ts_spec())
@@ -3396,7 +3295,7 @@ class TestTimeSeriesLegOrder:
         assert post.call_args_list[0].kwargs["body"]["ticker"] == "TICK-B"
 
     def test_no_leg_exception_delta_is_judged_on_market_b(
-        self, v2_mode, v2_mapping_confirmed, post
+        self, v2_mapping_confirmed, post
     ):
         # The NO leg raised after actually filling: the delta on TICK-B (not
         # TICK-A) is -y, so the NO leg is unwound on TICK-B.
@@ -3410,35 +3309,7 @@ class TestTimeSeriesLegOrder:
         assert _execute_one(client, self._ts_spec()).status == "rolled_back"
         assert post.call_args_list[1].kwargs["body"]["ticker"] == "TICK-B"
 
-    def test_legacy_path_submits_no_on_market_b_then_yes_on_market_a(self, legacy_mode):
-        # Both legs on DEFAULT_EXCHANGE_INDEX: the legacy endpoint routes
-        # nothing else, and this case is about leg ORDER, not the shard guard.
-        spec = self._ts_spec(shard_a=0, shard_b=0)
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg on TICK-B
-            order_resp("canceled"),   # YES leg on TICK-A rejected
-            order_resp("executed"),   # rollback on TICK-B fills
-        ])
-        client.get_positions_without_preload_content = positions_seq(None, None)
-        assert _execute_one(client, spec).status == "rolled_back"
-        reqs = [
-            c.kwargs["create_order_request"]
-            for c in client.create_order_without_preload_content.call_args_list
-        ]
-        assert (reqs[0].ticker, reqs[0].side, reqs[0].action, reqs[0].count) == (
-            "TICK-B", "no", "buy", spec.y)
-        assert reqs[0].buy_max_cost == _buy_max_cost_cents(spec.y, 0.40)
-        assert (reqs[1].ticker, reqs[1].side, reqs[1].action, reqs[1].count) == (
-            "TICK-A", "yes", "buy", spec.x)
-        assert reqs[1].buy_max_cost == _buy_max_cost_cents(spec.x, 0.30)
-        assert (reqs[2].ticker, reqs[2].side, reqs[2].action, reqs[2].type) == (
-            "TICK-B", "no", "sell", "limit")
-        assert reqs[2].no_price == 40 - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT
-        assert reqs[2].count == spec.y
-        assert reqs[2].reduce_only is True
-
-    def test_backstop_reads_market_b_and_confirms(self, v2_mode, post):
+    def test_backstop_reads_market_b_and_confirms(self, post):
         post.side_effect = [v2_resp(5), v2_resp(5)]
         readings = iter([positions_resp(), positions_resp(), positions_resp("TICK-B", -5)])
         tickers: list[str] = []
@@ -3456,7 +3327,7 @@ class TestTimeSeriesLegOrder:
         assert trader._V2_NO_MAPPING_CONFIRMED is True
         assert post.call_count == 2
 
-    def test_backstop_disproof_on_market_b_stops_after_one_post(self, v2_mode, post, caplog):
+    def test_backstop_disproof_on_market_b_stops_after_one_post(self, post, caplog):
         post.side_effect = [v2_resp(5), v2_resp(5), v2_resp(5)]
         client = MagicMock(get_positions_without_preload_content=positions_seq(
             None, None, ("TICK-B", 5),   # flat -> +5 on TICK-B: the ask opened YES
@@ -4040,17 +3911,6 @@ class TestWritesArePaced:
         assert logged_before_wait == [False]
         assert "Submitting V2 order" in caplog.text
 
-    def test_a_legacy_order_waits_before_its_post(self, pacer, events):
-        client = MagicMock()
-
-        def create(**kwargs):
-            events.append("post")
-            return order_resp("executed")
-
-        client.create_order_without_preload_content.side_effect = create
-        assert _submit_order(client, _build_no_order(_no_leg(make_spec()))) == "executed"
-        assert events == ["acquire", "post"]
-
     def test_a_transfer_waits_before_its_post(self, pacer, post, events):
         post.replies.append(transfer_resp("tr_9"))
         assert _execute_transfer(MagicMock(), 1, 0, 1400) == "tr_9"
@@ -4073,22 +3933,6 @@ class TestWritesArePaced:
         assert exc_info.value is err
         assert events == ["acquire", "post"]
 
-    def test_a_legacy_429_takes_one_place_and_one_post(self, pacer, events):
-        client = MagicMock()
-
-        def create(**kwargs):
-            events.append("post")
-            return SimpleNamespace(
-                status=429, reason="Too Many Requests",
-                data=b'{"error":{"code":"too_many_requests","message":"too many requests"}}',
-                getheaders=lambda: {"content-type": "application/json"},
-            )
-
-        client.create_order_without_preload_content.side_effect = create
-        with pytest.raises(ApiException):
-            _submit_order(client, _build_no_order(_no_leg(make_spec())))
-        assert events == ["acquire", "post"]
-
     def test_a_transfer_429_takes_one_place_and_one_post(self, pacer, post, events):
         post.replies.append(self._too_many_requests())
         with pytest.raises(ApiException):
@@ -4096,7 +3940,7 @@ class TestWritesArePaced:
         assert events == ["acquire", "post"]
 
     def test_a_429_on_the_yes_leg_paces_the_rollback_too(
-        self, pacer, post, events, v2_mode, v2_mapping_confirmed, monkeypatch,
+        self, pacer, post, events, v2_mapping_confirmed, monkeypatch,
     ):
         # One pair whose YES leg the exchange rejects with a 429: the position
         # check finds nothing filled and the NO leg is unwound. Each of the
@@ -4144,7 +3988,7 @@ class TestExecuteTradesArePaced:
         return specs
 
     def test_the_pairs_orders_are_spread_to_the_write_limit(
-        self, monkeypatch, v2_mode, v2_mapping_confirmed,
+        self, monkeypatch, v2_mapping_confirmed,
     ):
         # A frozen clock: every worker arrives at the same instant, so each
         # order's admission time is exactly the wait the pacer gave it. Each

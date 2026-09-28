@@ -170,7 +170,6 @@ main.py
   ├─ strategy.select_portfolio()   — greedy portfolio selection, at most one time-series trade per ladder (none on
   │                                   a held ladder, and none on the ladder of a trade picked earlier in the run)
   ├─ trader.pre_execution_check()  — re-fetch order books, drop pairs whose prices moved or whose depth is no longer reachable at the limit about to be submitted, counting only the fresh levels that still keep an edge after the fee (a time-series pair also when its later book has no YES ask now, or its fresh spread exceeds the band's ceiling)
-  ├─ trader.drop_legacy_unroutable() — legacy path only: drop specs with a leg off the default shard BEFORE any money moves
   ├─ trader.ensure_shard_collateral() — move funds onto the shards the selected legs settle against (prod; dry-run only plans)
   ├─ trader.execute_trades()       — submit fill-or-kill orders leg-by-leg to the V2 order endpoint, each leg routed to its own market's shard (parallel across pairs, rollback on partial fill)
   ├─ auth.verify_auth()            — re-read the post-trade balance for the Excel log (falls back to the pre-trade balance if this read fails)

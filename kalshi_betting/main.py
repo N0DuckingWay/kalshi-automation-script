@@ -120,7 +120,6 @@ from .scanner import (
 )
 from .strategy import compute_trade, select_portfolio
 from .trader import (
-    drop_legacy_unroutable,
     ensure_shard_collateral,
     execute_trades,
     pre_execution_check,
@@ -1067,18 +1066,6 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
         return clean_exit
 
-    # On the legacy order path, drop statically-unroutable specs BEFORE any
-    # collateral is planned — otherwise real, non-idempotent transfers would
-    # fund shards whose trades _execute_one's guard then refuses, stranding
-    # money on a shard nothing will trade against. No-op on the V2 path, the
-    # only one main() allows.
-    portfolio = drop_legacy_unroutable(portfolio)
-    if not portfolio:
-        logging.info("No selected pair is routable by the configured order path.")
-        # Never a bare return: sys.exit(None) exits 0, which would hide
-        # EXIT_TIME_SERIES_SKIPPED
-        return clean_exit
-
     # Move collateral to the shards the selected trades draw from — sizing is
     # portfolio-wide, but each order settles against its own shard's balance.
     # Trades whose shard could not be funded (transfer blocked, failed, or not
@@ -1090,7 +1077,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.info(
             "No selected pair could be funded on its exchange shard — no trades submitted."
         )
-        # Never a bare return — see the routability check above
+        # Never a bare return: sys.exit(None) exits 0, which would hide
+        # EXIT_TIME_SERIES_SKIPPED
         return clean_exit
 
     # Submit orders sequentially per leg, concurrently across pairs
@@ -1148,11 +1136,11 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # "manual_review" means no automated order was submitted in response to
     # an outcome the trader could not attribute: the NO leg's or the YES leg's
     # fill state was undetermined (position lookup failed, or the position
-    # moved by an amount the order can't explain), or — on the V2 path — the
-    # NO-leg side mapping was disproven by the positions ledger after a
-    # confirmed NO-leg fill, leaving that leg in place and the YES leg
-    # unsubmitted. Every case is just as urgent as an orphaned rollback
-    # failure, so it's counted in the same manual-review alert.
+    # moved by an amount the order can't explain), or the NO-leg side mapping
+    # was disproven by the positions ledger after a confirmed NO-leg fill,
+    # leaving that leg in place and the YES leg unsubmitted. Every case is just
+    # as urgent as an orphaned rollback failure, so it's counted in the same
+    # manual-review alert.
     n_unknown  = sum(1 for r in results if r.status == "manual_review")
     logging.info(
         "Submitted %d of %d order pair(s) successfully. %d rolled back, "

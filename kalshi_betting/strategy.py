@@ -36,7 +36,6 @@ from datetime import UTC, datetime
 from typing import NamedTuple
 
 from .config import (
-    ORDER_API_VERSION,
     PRICE_EPSILON,
     SAME_TITLE_CO_RESOLVE_PROB,
     SIZE_SOLVE_MAX_ITERATIONS,
@@ -274,10 +273,9 @@ def _evaluate_size(
     if price_b <= 0.0 or price_b >= 1.0 or price_a <= 0.0 or price_a >= 1.0:
         return None
 
-    if levels and ORDER_API_VERSION == "v2":
+    if levels:
         # A V2 FoK only reaches depth at or below its own limit (TS-08); an
-        # unreachable n returns None so the search tries smaller sizes. V2 only:
-        # the legacy buy_max_cost is a total-cost cap that can sweep a ladder.
+        # unreachable n returns None so the search tries smaller sizes.
         if _reachable_contracts(pair, levels, price_a, price_b) < n:
             return None
 
@@ -470,28 +468,27 @@ def compute_trade(
             fee_b = fee_leg_exact(n, price_b)
 
         # BACKSTOP: the shrink changed n outside _evaluate_size, and
-        # reachability is not downward-closed, so re-check it (TS-08, V2 only
-        # for the same reason as in _evaluate_size). It has never been observed
-        # to fire, but nothing guarantees that: do not delete it as dead code.
+        # reachability is not downward-closed, so re-check it (TS-08). It has
+        # never been observed to fire, but nothing guarantees that: do not
+        # delete it as dead code.
         # Terminates: each pass breaks or sets n = int(reachable) < n; if
         # nothing is reachable (n < 1) the pair is dropped.
-        if ORDER_API_VERSION == "v2":
-            while n >= 1:
-                reachable = _reachable_contracts(pair, levels, price_a, price_b)
-                if reachable >= n:
-                    break
-                n = int(reachable)
-                if n < 1:
-                    break
-                fills = prefix_fill_prices(levels, n)
-                if fills is None:
-                    break
-                price_a, price_b = fills
-                fee_a = fee_leg_exact(n, price_a)
-                fee_b = fee_leg_exact(n, price_b)
+        while n >= 1:
+            reachable = _reachable_contracts(pair, levels, price_a, price_b)
+            if reachable >= n:
+                break
+            n = int(reachable)
             if n < 1:
-                # Nothing the cap can reach
-                return None
+                break
+            fills = prefix_fill_prices(levels, n)
+            if fills is None:
+                break
+            price_a, price_b = fills
+            fee_a = fee_leg_exact(n, price_a)
+            fee_b = fee_leg_exact(n, price_b)
+        if n < 1:
+            # Nothing the cap can reach
+            return None
 
     # Exact-fee win payoff; ceiling rounding can erase it at small n
     min_payoff = n * (1.0 - price_a - price_b) - fee_a - fee_b
