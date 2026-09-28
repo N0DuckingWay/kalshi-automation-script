@@ -38,11 +38,10 @@ Dependencies:
     never touched.
 
 Notes:
-    The V2 live-execution replays run with dry_run=False on the V2 order
-    path, the only one trader has, with config.ORDER_API_VERSION left at its
-    shipped "v2" (never monkeypatched), so they prove the shipped path. Order
-    responses are generated from each request's own submitted count, so the
-    tests don't depend on exact Kelly sizing.
+    The V2 live-execution replays run with dry_run=False and
+    config.ORDER_API_VERSION left at its shipped "v2". Order responses are
+    generated from each request's own submitted count, so the tests don't
+    depend on exact Kelly sizing.
 
     verify_auth() returns dict[int, int] (exchange_index -> cents), never a
     scalar — every mock of it here must return a dict, and _run_prod sizes on
@@ -303,11 +302,9 @@ def _main_with(monkeypatch, argv: list, **patches) -> dict:
 
 
 class TestOrderApiVersionGate:
-    """main() refuses any config.ORDER_API_VERSION but "v2" as a usage error
-    (exit 2) in either mode, before the live settings are resolved, logging is
-    configured (TS-20), a client is built or a run mode starts: the V2
-    endpoint is the only order path the bot has, so no order may be built
-    under another value."""
+    """main() exits 2 on any config.ORDER_API_VERSION but "v2", in either
+    mode, before the live settings are resolved, logging is configured, a
+    client is built or a run mode starts; "v2" reaches the run mode."""
 
     @pytest.mark.parametrize("mode", ["dev", "prod"])
     @pytest.mark.parametrize("value", ["legacy", "V2", "", None])
@@ -1453,8 +1450,7 @@ def _live_shape_client(
         side_effect=_orderbook_side_effect
     )
 
-    # The SDK's create-order method (the retired /portfolio/orders endpoint)
-    # must never be touched: every order goes through signed_request_json.
+    # Never called: every order goes through signed_request_json
     client.create_order_without_preload_content = MagicMock()
 
     # V2 submission plumbing — signed_request_json reads these directly.
@@ -1939,11 +1935,10 @@ class TestRunProdDryRunLiveShapeReplay:
 
 
 class TestRunProdLiveV2Replay:
-    """dry_run=False replays on the V2 order path, the only one trader has
-    (config.ORDER_API_VERSION is never monkeypatched here — this proves the
-    shipped live-execution path end-to-end). Every test tunes the market set
-    down to exactly one tradeable, selectable pair (SAME-EXP / SAME-CHEAP) so
-    order counts are fully deterministic."""
+    """dry_run=False replays of the shipped V2 order path end to end.
+    Every test tunes the market set down to exactly one tradeable,
+    selectable pair (SAME-EXP / SAME-CHEAP) so order counts are fully
+    deterministic."""
 
     @pytest.fixture(autouse=True)
     def _fresh_v2_mapping_latch(self, monkeypatch):
@@ -2021,8 +2016,7 @@ class TestRunProdLiveV2Replay:
         return client, captured
 
     def test_run_prod_live_v2_all_filled_end_to_end(self, monkeypatch):
-        # Not monkeypatched anywhere in this class: the shipped switch, whose
-        # only accepted value is "v2", is what these replays run under.
+        # The replays run under the shipped setting
         assert ORDER_API_VERSION == "v2"
 
         client, captured = self._run(monkeypatch, ["full", "full"])

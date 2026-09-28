@@ -20,9 +20,8 @@ Purpose:
     subprocess) — see the EXIT_* constants in config.py (BS-14): an unhandled
     exception still propagates to exit 1, same as always.
 
-    Right after parsing its arguments, main() refuses any
-    config.ORDER_API_VERSION but "v2" (config.order_api_version_error): the V2
-    endpoint is the only order path the bot has, so another value exits 2
+    Right after parsing its arguments, main() exits 2 if
+    config.ORDER_API_VERSION is not "v2" (config.order_api_version_error),
     before logging is configured.
 
     The live toggles are config.py's, each overridable for one run by a flag
@@ -475,9 +474,8 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
             # characters, which the daily families this exists for all do
             _truncate(getattr(pair.market_a, "subtitle", "") or "—", 24),
             _truncate(getattr(pair.market_b, "subtitle", "") or "—", 24),
-            # Which exchange shard each leg's market lives on ("a/b"): every
-            # order routes to its own leg's shard, so this is the at-a-glance
-            # view of where a pair trades and of what shard coverage looks like.
+            # Which exchange shard each leg's market is on ("a/b"); each
+            # order goes to its own leg's shard
             f"{pair.market_a.exchange_index}/{pair.market_b.exchange_index}",
             _format_deadline(pair.market_a.close_time),
             _format_deadline(pair.market_b.close_time),
@@ -1133,14 +1131,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     n_ok       = sum(1 for r in results if r.status == "executed")
     n_rolled   = sum(1 for r in results if r.status == "rolled_back")
     n_orphaned = sum(1 for r in results if r.status == "rollback_failed")
-    # "manual_review" means no automated order was submitted in response to
-    # an outcome the trader could not attribute: the NO leg's or the YES leg's
-    # fill state was undetermined (position lookup failed, or the position
-    # moved by an amount the order can't explain), or the NO-leg side mapping
-    # was disproven by the positions ledger after a confirmed NO-leg fill,
-    # leaving that leg in place and the YES leg unsubmitted. Every case is just
-    # as urgent as an orphaned rollback failure, so it's counted in the same
-    # manual-review alert.
+    # "manual_review": the trader could not tell what a leg did (see
+    # reporter.TradeResult) and sent no follow-up order. It needs a person as
+    # urgently as a failed rollback, so both are counted in one alert.
     n_unknown  = sum(1 for r in results if r.status == "manual_review")
     logging.info(
         "Submitted %d of %d order pair(s) successfully. %d rolled back, "
@@ -1205,21 +1198,15 @@ def main() -> None:
     pairs, sizes them, and trades them.
 
     Parses command-line arguments (--mode, --dry-run, --sandbox-balance,
-    --max-horizon-days, and the "live trading toggles" group), then refuses
-    any config.ORDER_API_VERSION but "v2" (config.order_api_version_error,
-    exit 2 in either mode) — argparse's own usage errors and --help come
-    before this check, and the --max-horizon-days check and the live-toggle
-    validation after it — resolves the run's settings and config.py's
-    reference (_resolve_live_settings; all of these run before logging is
-    configured or any request is made), configures logging, builds the
-    appropriate Kalshi client, and dispatches to _run_dev (sandbox
-    simulation) or _run_prod (real account trading) with both. Exits the
-    process via sys.exit() with the dispatched run's return code (see the
-    EXIT_* constants in config.py, BS-14) so a caller that only sees the
-    process exit status — the scheduler, which runs this as a subprocess —
-    can distinguish a clean run from a low-balance skip or a run with trades
-    needing manual review. An unhandled exception is not caught here and
-    propagates to the normal interpreter exit code 1.
+    --max-horizon-days, and the "live trading toggles" group), exits 2 if
+    config.ORDER_API_VERSION is not "v2" (config.order_api_version_error),
+    checks --max-horizon-days, resolves the run's settings and config.py's
+    reference (_resolve_live_settings) — all before logging is configured or
+    any request is made — then configures logging, builds the Kalshi client
+    and runs _run_dev (sandbox simulation) or _run_prod (real trading). Ends
+    with sys.exit() and the run's return code (the EXIT_* constants in
+    config.py), which the scheduler reads. An unhandled exception propagates
+    and exits 1.
 
     Returns:
         None: This function never returns to its caller — it always ends by
@@ -1315,9 +1302,8 @@ def main() -> None:
         help="Trade any tag this run, whatever config.TRADE_TAGS says",
     )
     args = parser.parse_args()
-    # "v2" is the only order path the bot has; any other ORDER_API_VERSION is a
-    # config error, refused (exit 2) in either mode before anything is logged,
-    # a client is built or an order could be sent
+    # Exit 2 unless ORDER_API_VERSION is "v2", before anything is logged, a
+    # client is built or an order could be sent
     problem = order_api_version_error()
     if problem:
         parser.error(problem)

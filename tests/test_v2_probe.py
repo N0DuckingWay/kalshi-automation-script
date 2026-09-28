@@ -15,14 +15,12 @@ Purpose:
     that will run), it must never submit before confirmation, and a position
     going the WRONG way after the ask — the exact failure the probe exists to
     catch — must be a hard FAIL that does not go on to submit the unwind.
-    The probe refuses to start on any ORDER_API_VERSION but "v2", and never
-    tells the operator to switch order paths: there is no other path to
-    switch to. The FAIL lines that doubt the V2 path after a submission on an
-    account the probe verified flat say to stop trading and flatten by hand in
-    the Kalshi UI; main()'s closing line says to stop trading after a FAIL
-    (checking shard balances after a transfer FAIL) but never, by itself, to
-    flatten, since the ticker may carry the bot's own position; and after a
-    NEUTRAL it calls for no action at all.
+    The probe exits 2 on any ORDER_API_VERSION but "v2" and never tells the
+    operator to switch order paths. The three FAILs that doubt the V2 path
+    after a submission on a ticker the probe found flat say to stop trading
+    and flatten by hand in the Kalshi UI; main()'s closing
+    line says to stop trading after a FAIL but never to flatten, and asks for
+    nothing after a NEUTRAL.
 
 Dependencies:
     Imports v2_probe and trader; patches at each function's definition site.
@@ -255,17 +253,14 @@ def answer(monkeypatch, value: str) -> None:
 
 
 def assert_names_no_other_order_path(printed: str) -> None:
-    """The probe's output never tells the operator to switch the bot to
-    another order path: the V2 endpoint is the only one there is."""
+    """Assert the output names no other order path to switch to."""
     assert "legacy" not in printed.lower()
     assert "ORDER_API_VERSION" not in printed
 
 
 def assert_names_the_remedy(printed: str) -> None:
-    """A FAIL line that doubts the V2 path after a submission on an account
-    the probe verified flat tells the operator to stop trading and flatten by
-    hand in the Kalshi UI (v2_probe._REMEDY), and never to switch the bot to
-    another order path."""
+    """Assert the output carries v2_probe._REMEDY (stop trading, flatten by
+    hand in the Kalshi UI) and names no other order path."""
     assert v2_probe._REMEDY in printed
     assert "Kalshi UI" in printed
     assert_names_no_other_order_path(printed)
@@ -1464,8 +1459,8 @@ class TestMainDispatch:
     def test_a_non_v2_order_path_is_refused_before_anything_runs(
         self, monkeypatch, capsys, value, step,
     ):
-        # "v2" is the only order path there is: any other value is a usage
-        # error (exit 2) before the banner, logging, a client or any step
+        # Any value but "v2" exits 2 before the banner, logging, a client or
+        # any step
         monkeypatch.setattr(config, "ORDER_API_VERSION", value)
         monkeypatch.setattr(
             v2_probe.auth, "build_client",
@@ -1501,9 +1496,8 @@ class TestMainDispatch:
     def test_an_order_step_fail_ends_on_stop_trading_and_never_says_flatten(
         self, monkeypatch, capsys, step,
     ):
-        # A FAIL of an order step halts the bot, but the closing line itself
-        # never tells the operator to flatten: the ticker may carry the bot's
-        # own position, so only the step's own position warnings may
+        # The closing line after an order-step FAIL says to stop trading and
+        # to act only on the step's own warnings, never to flatten
         closing = self._closing(
             monkeypatch, capsys, step, v2_probe._FAIL, ["--ticker", TICKER, "--step", step],
         )
@@ -1518,8 +1512,8 @@ class TestMainDispatch:
     def test_a_transfer_fail_ends_on_stop_trading_and_the_shard_balances(
         self, monkeypatch, capsys,
     ):
-        # A transfer moves collateral and opens no position: its FAIL halts the
-        # bot and points at the shard balances, never at a ticker to flatten
+        # The closing line after a transfer FAIL says to stop trading and
+        # check the shard balances, and names no ticker
         closing = self._closing(
             monkeypatch, capsys, "transfer", v2_probe._FAIL,
             ["--step", "transfer", "--ticker", TICKER],
@@ -1532,9 +1526,8 @@ class TestMainDispatch:
 
     @pytest.mark.parametrize("step", sorted(v2_probe._STEPS))
     def test_a_neutral_calls_for_no_action(self, monkeypatch, capsys, step):
-        # A NEUTRAL reached no verdict on the V2 path, so its closing line must
-        # neither halt the bot nor ask for a position to be closed; the
-        # transfer step runs with no ticker at all
+        # The closing line after a NEUTRAL asks for no halt and no flatten
+        # (the transfer step runs with no ticker)
         argv = ["--step", step] + (["--ticker", TICKER] if step in v2_probe._TICKER_STEPS
                                    else [])
         closing = self._closing(monkeypatch, capsys, step, v2_probe._NEUTRAL, argv)
@@ -1550,10 +1543,9 @@ class TestMainDispatch:
     def test_a_fail_before_any_submission_never_says_to_flatten(
         self, monkeypatch, capsys, submits, step, cause,
     ):
-        # The real steps, refusing before they submit: the account already
-        # holds a position on the ticker (possibly the bot's own live
-        # position), or the market cannot be read. Nothing printed may tell
-        # the operator to flatten, and nothing is submitted
+        # A real step that stops before submitting (the ticker already holds
+        # a position, or the market cannot be read) submits nothing and never
+        # says to flatten
         client = probe_client([5])
         if cause == "no_market":
             client.get_market_without_preload_content = MagicMock(

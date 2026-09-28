@@ -7038,8 +7038,8 @@ class TestInactiveShardIndexes:
 class TestFetchOpenEventsShardTagging:
     """Market data is cross-shard: every shard's markets are INGESTED and
     tagged with exchange_index. Only shards the exchange reports as
-    trading-inactive are dropped. (Routing happens at order submission — each
-    V2 order body carries its own market's exchange_index — never here.)"""
+    trading-inactive are dropped; each order is routed by its own market's
+    exchange_index later."""
 
     @staticmethod
     def _client(std_events, mve_events=()):
@@ -7922,8 +7922,8 @@ class TestValidatePairPriceReachableDepth:
         assert "reachable at the FoK limit" in caplog.text
 
     def test_the_rejection_line_is_pinned_word_for_word(self, caplog, monkeypatch):
-        # The one WARNING for this drop, exactly as the operator reads it in
-        # kalshi_arb.log: 300 of the 600 contracts rest at or below the caps.
+        # The drop logs exactly one WARNING, word for word: 300 of the 600
+        # contracts rest at or below the caps
         with caplog.at_level(logging.WARNING):
             assert self._run(monkeypatch, 600) is False
         assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [

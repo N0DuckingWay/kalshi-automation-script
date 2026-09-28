@@ -580,41 +580,28 @@ MVE_SERIES_FAMILY_PREFIX      = "KXMVE"
 # The quadratic P*(1-P) factor means fees are highest near 50¢ and lowest near 1¢/99¢.
 TAKER_FEE_RATE                = 0.07
 
-# Maximum accepted per-contract loss (cents) when unwinding the NO leg (the
-# first-submitted leg: market_a for a same-title pair, market_b for a
-# time-series pair) after the YES leg failed, relative to the NO leg's scanned
-# NO entry price. The unwind is a reduce-only immediate-or-cancel YES bid (a
-# held NO position is a short YES, so closing it is a YES BUY), and this bound
-# is its bid CEILING of (1 - floor/100) dollars, where floor = entry - this:
-# ceiling-quantized onto the market's tick grid and clamped by
-# V2_ROLLBACK_BID_PRICE_DOLLARS (see trader._rollback_floor_cents(no_leg) and
-# trader._v2_rollback_price(no_leg)). The bid closes only what rests at or
-# under the cap, so a book that has collapsed past the floor leaves the
-# position, or what is left of it, open instead of realizing an unbounded
-# loss, and that surfaces as status="rollback_failed" for manual review.
+# Largest loss per contract, in cents below the NO leg's entry price, that
+# the unwind of a filled NO leg may take when the YES leg did not fill. The
+# unwind buys the YES side back (holding NO is the same as being short YES)
+# with a reduce-only immediate-or-cancel bid (it fills what it can right away
+# and cancels the rest) capped at 1 - floor/100 dollars, where floor is the
+# entry price in cents less this, kept within 1..99 cents; see
+# trader._rollback_floor_cents and trader._v2_rollback_price. If the book has
+# moved further than that, what is left stays open and the pair is reported
+# as "rollback_failed" for a person to handle.
 #
-# This allowance must cover the market's ENTIRE bid-ask spread, not just the
-# "acceptable loss": the NO leg entered at the NO ASK, but the unwind closes it
-# at the NO BID (buying the YES back at the YES ask, 1 - NO bid), so
-# (NO ask - NO bid) — the spread itself — is a floor on the loss even with
-# zero adverse price movement. Any adverse move since entry is additive on top
-# of that spread. A 5-cent allowance is narrower than the spread on the
-# illiquid markets this strategy targets, so killed unwinds (rollback_failed
-# orphans) would be the normal outcome, not the tail case. 12 cents lets a
-# normal-spread book fill the unwind while a genuinely collapsed book still
-# kills it and surfaces rollback_failed for manual review — the deliberate
-# bounded-loss trade-off.
+# The allowance must cover the whole bid-ask spread, because the NO leg was
+# bought at the ask and is closed at the bid: the spread alone is lost even
+# if prices do not move. 12 cents lets a normal book close the position while
+# a collapsed book still stops the unwind.
 ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT = 12
 
-# Slippage allowance on each buy leg, denominated in TICKS of the market's own
-# price grid rather than in whole cents. The V2 endpoint
-# (/portfolio/events/orders) takes dollar-string limit prices, and that limit
-# price IS the order's price protection: cap = scanned price (ceiled onto the
-# grid) + BUY_SLIPPAGE_TICKS × tick size, where the tick size comes from
-# scanner.tick_size_for_price() (see scanner.v2_limit_price). One tick lets a
-# book that moved up by one tick since the pre-execution check still fill,
-# on every tick regime alike: 1c on a linear-cent market, $0.001 or $0.0001 on
-# the finer regimes MVE/combo markets use.
+# How far above the scanned price, in ticks of the market's own price grid,
+# each buy leg may fill. The V2 order's limit price is its price protection:
+# scanned price rounded up onto the grid plus this many ticks (see
+# scanner.v2_limit_price, which gets the tick size from
+# scanner.tick_size_for_price). One tick lets a book that moved up by one
+# tick since the pre-execution check still fill.
 BUY_SLIPPAGE_TICKS            = 1
 
 # Fallback tick size, in dollars, for a market whose tick structure is unknown
@@ -660,21 +647,15 @@ MAX_ACTIVE_PRICE_DOLLARS      = 0.9999
 # genuinely sub-threshold pairs at the bottom of the book.
 PRICE_EPSILON                 = 1e-6
 
-# The order path the bot submits through. "v2" is the only supported value:
-# POST V2_ORDER_PATH below, with dollar-string fill-or-kill LIMIT prices (the
-# reduce_only unwind is immediate_or_cancel instead; the limit price IS the
-# price protection), fixed-point counts, bid/ask sides on the single YES book
-# and an explicit exchange_index on every order. It is the only endpoint
-# Kalshi accepts orders on, and the only one that can cap a price at the
-# market's real tick resolution (see BUY_SLIPPAGE_TICKS above).
+# The order path the bot sends orders through. "v2" is the only allowed value:
+# POST V2_ORDER_PATH below, the only endpoint Kalshi accepts orders on. Its
+# orders carry dollar-string limit prices, fixed-point counts, a bid/ask side
+# on the YES book and each market's own exchange_index.
 #
-# It stays a named, checked setting so a wrong value is caught before any
-# money moves: main.py and the human-run order-path probe call
-# order_api_version_error() at startup, before logging is configured or any
-# request is made, and exit 2 on anything but "v2". If the V2 path ever
-# misbehaves, the remedy is to stop trading and flatten by hand in the Kalshi
-# UI — there is no other order path to fall back on (see the V2 gotcha in
-# CLAUDE.md).
+# main.py and the human-run order-path probe check it at startup, before
+# logging is configured or any request is made, and exit 2 on any other
+# value (order_api_version_error). If the V2 path misbehaves, stop trading
+# and flatten positions by hand in the Kalshi UI; there is no other path.
 ORDER_API_VERSION             = "v2"
 
 # Full API path of the V2 create-order endpoint, including the /trade-api/v2
@@ -733,19 +714,16 @@ V2_FOK_KILL_ERROR_CODE        = "fill_or_kill_insufficient_resting_volume"
 # tradeable level.
 V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
 
-# The DEFAULT exchange shard. Kalshi partitions the exchange into parallel
-# instances keyed by `exchange_index` (on markets and in the balance breakdown;
-# combos migrated to shard 1 on 2026-08-17, crypto to shard 2 and
-# tennis/baseball to shard 3 on 2026-08-24). It is not the shard orders go
-# to: every V2 order carries its own market's exchange_index. "Default" means
-# three things:
-#   1. the shard assumed when a market payload omits `exchange_index`
-#      (fail-safe — absence of the field must never drop markets);
-#   2. the shard the legacy/sandbox single-scalar balance shapes are
-#      attributed to (auth.py fallback tiers 2-3);
-#   3. the transfer source shard of the human-run order-path probe: its
-#      one-cent collateral-transfer check moves money from this shard to
-#      another and back.
+# The DEFAULT exchange shard. Kalshi splits the exchange into parallel shards,
+# numbered by `exchange_index` on markets and in the balance breakdown.
+# Orders do not use this constant: every V2 order carries its own market's
+# exchange_index. It is:
+#   1. the shard assumed when a market payload omits `exchange_index`, so a
+#      missing field never drops a market;
+#   2. the shard a balance reply with a single total (the sandbox shape) is
+#      credited to (auth.py);
+#   3. the shard the human-run order-path probe's one-cent collateral-transfer
+#      check moves money out of and back into.
 DEFAULT_EXCHANGE_INDEX       = 0
 
 # The JSON re-typings of an /exchange/status boolean that scanner._status_flag()
@@ -2223,24 +2201,16 @@ def live_rule_warnings(settings: LiveSettings) -> list[str]:
 
 def order_api_version_error() -> str | None:
     """
-    Say why ORDER_API_VERSION is unusable, or return None when it is "v2".
+    Return an error message if ORDER_API_VERSION is not exactly the str "v2".
 
-    The bot has one order path, the V2 endpoint at V2_ORDER_PATH, so the only
-    accepted value is exactly the str "v2": anything else — another spelling
-    ("V2", " v2"), an empty string, a non-str, or the name of an order path
-    Kalshi does not accept — is a configuration error. main.main() and the
-    human-run order-path probe's main() call this right after parsing their
-    arguments, before logging is configured and before any request is made,
-    and hand a message to argparse's parser.error, so the process exits 2
-    with the message on stderr and no order can be built. The message only
-    ever points back at "v2", since there is no other path to switch to.
-
-    Reads this module's ORDER_API_VERSION at call time, so a test that
-    monkeypatches config.ORDER_API_VERSION takes effect.
+    main.main() and the human-run order-path probe's main() call this right
+    after parsing their arguments, before logging is configured or any
+    request is made, and pass a message to parser.error, which exits 2. Reads
+    ORDER_API_VERSION at call time, so a test can monkeypatch it.
 
     Returns:
         str | None: None if ORDER_API_VERSION is exactly "v2"; otherwise one
-            line naming the value (by repr) and how to fix it.
+            line naming the value and saying to set it to "v2".
     """
     value = ORDER_API_VERSION
     if type(value) is str and value == "v2":

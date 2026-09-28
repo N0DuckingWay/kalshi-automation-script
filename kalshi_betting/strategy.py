@@ -274,8 +274,8 @@ def _evaluate_size(
         return None
 
     if levels:
-        # A V2 FoK only reaches depth at or below its own limit (TS-08); an
-        # unreachable n returns None so the search tries smaller sizes.
+        # A fill-or-kill order only buys depth at or under its own limit
+        # (TS-08); if n is out of reach, return None so the search tries less
         if _reachable_contracts(pair, levels, price_a, price_b) < n:
             return None
 
@@ -467,12 +467,10 @@ def compute_trade(
             fee_a = fee_leg_exact(n, price_a)
             fee_b = fee_leg_exact(n, price_b)
 
-        # BACKSTOP: the shrink changed n outside _evaluate_size, and
-        # reachability is not downward-closed, so re-check it (TS-08). It has
-        # never been observed to fire, but nothing guarantees that: do not
-        # delete it as dead code.
-        # Terminates: each pass breaks or sets n = int(reachable) < n; if
-        # nothing is reachable (n < 1) the pair is dropped.
+        # BACKSTOP: the shrink changed n outside _evaluate_size, and a smaller
+        # n is not always reachable, so check it again (TS-08). Keep it even if
+        # it never fires. Each pass stops or lowers n; if nothing is reachable
+        # the pair is dropped.
         while n >= 1:
             reachable = _reachable_contracts(pair, levels, price_a, price_b)
             if reachable >= n:
