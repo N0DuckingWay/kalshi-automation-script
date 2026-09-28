@@ -1396,6 +1396,11 @@ def _question_of(market):
     return time_series_group_key(pair_key(market), market.subtitle)
 
 
+def _question_label(market):
+    """The question label of one market: its group key as ladders compare it."""
+    return ("question", scanner._ladder_question(_question_of(market)))
+
+
 class TestLadderKeys:
     """A ladder is one question asked at several deadlines. A market is on
     the ladder of its event and on the ladder of its question."""
@@ -1415,6 +1420,42 @@ class TestLadderKeys:
         assert ladder_keys(blank, "q") == frozenset({("question", "q")})
         assert ladder_keys("E-1", blank) == frozenset({("event", "E-1")})
 
+    def test_small_wording_differences_share_one_question_label(self):
+        # One question listed twice by the exchange, once without "the"
+        first = _ingest_market("KXVOTESAVEAMERICA-26-MAR20", "KXVOTESAVEAMERICA-26",
+                               "Will the Senate vote on SAVE America Act?",
+                               "When will the Senate vote on the SAVE America Act?",
+                               subtitle="Before Mar 20, 2026")
+        second = _ingest_market("KXVOTESAVEAMERICA-26MAR-MAR24", "KXVOTESAVEAMERICA-26MAR",
+                                "Will the Senate vote on the SAVE America Act?",
+                                "When will the Senate vote on the SAVE America Act?",
+                                subtitle="Before Mar 24, 2026")
+        assert _question_of(first) != _question_of(second)
+        assert market_ladder_keys(first) & market_ladder_keys(second) == frozenset({
+            _question_label(first),
+        })
+
+    @pytest.mark.parametrize("one, other", [
+        ("Will BTC exceed \u2018$80k\u2019?", "will btc exceed '$80k'"),
+        ("Who wins: Smith (R)?", "who wins smith r"),
+        ("An upset in the final", "upset in final"),
+    ])
+    def test_case_quotes_punctuation_and_articles_are_ignored(self, one, other):
+        assert ladder_keys("", one) == ladder_keys("", other)
+
+    @pytest.mark.parametrize("one, other", [
+        ("btc | $80,000 or above", "btc | $80,500 or above"),
+        ("rate | 1.5%", "rate | 15%"),
+        ("spacex starship 11th launch | will spacex launch another starship by",
+         "spacex starship 12th launch | will spacex launch another starship by"),
+        ("temperature | -5 or below", "temperature | 5 or below"),
+    ])
+    def test_different_questions_keep_different_labels(self, one, other):
+        assert ladder_keys("", one) != ladder_keys("", other)
+
+    def test_a_question_of_filler_alone_gives_no_label(self):
+        assert ladder_keys("E-1", "The ?") == frozenset({("event", "E-1")})
+
     def test_a_mock_market_gets_no_event_label(self):
         # A mock market's event ticker is not text, so it names no event
         keys = market_ladder_keys(MagicMock())
@@ -1430,7 +1471,7 @@ class TestLadderKeys:
                                  _event_title="Some Event")
         assert _question_of(market)
         assert market_ladder_keys(market) == frozenset({
-            ("event", "E-1"), ("question", _question_of(market)),
+            ("event", "E-1"), _question_label(market),
         })
 
     @pytest.mark.parametrize("market", [
@@ -1448,7 +1489,7 @@ class TestLadderKeys:
     def test_the_question_label_is_the_finders_group_key(self, market):
         assert _question_of(market)
         assert market_ladder_keys(market) == frozenset({
-            ("event", market.event_ticker), ("question", _question_of(market)),
+            ("event", market.event_ticker), _question_label(market),
         })
 
     def test_two_deadlines_of_one_event_share_both_labels(self):
@@ -1481,7 +1522,7 @@ class TestLadderKeys:
         [pair] = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[early, late])
         assert pair_ladder_keys(pair) == frozenset({
             ("event", "KXBTCMAX-26MAR01"), ("event", "KXBTCMAX-26MAR11"),
-            ("question", _question_of(early)),
+            _question_label(early),
         })
 
     def test_a_pair_has_the_labels_of_both_its_markets(self):
@@ -5373,12 +5414,34 @@ class TestFinderRefusesHeldLadders:
         # All three candidates of the ladder are refused and counted
         assert _HELD_LINE + "3" in caplog.text
 
+    def test_a_held_question_blocks_a_relisting_worded_slightly_differently(
+            self, monkeypatch, caplog):
+        monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+        # The exchange listed one question twice; the first listing drops "the"
+        held = _ingest_market("KXVOTESAVEAMERICA-26-MAR20", "KXVOTESAVEAMERICA-26",
+                              "Will the Senate vote on SAVE America Act?",
+                              "When will the Senate vote on the SAVE America Act?",
+                              subtitle="Before Mar 20, 2026", close="2026-03-20T00:00:00Z")
+        rungs = [_ingest_market(f"KXVOTESAVEAMERICA-26MAR-{day}", "KXVOTESAVEAMERICA-26MAR",
+                                "Will the Senate vote on the SAVE America Act?",
+                                "When will the Senate vote on the SAVE America Act?",
+                                subtitle=f"Before {label}, 2026", close=close,
+                                yes_ask=yes, no_ask=f"{1 - float(yes):.2f}")
+                 for day, label, close, yes in (
+                     ("MAR24", "Mar 24", "2026-03-24T00:00:00Z", "0.20"),
+                     ("APR01", "Apr 1", "2026-04-01T00:00:00Z", "0.45"))]
+        # control: the relisting's rungs pair on their own
+        assert len(self._scan(rungs)) == 1
+        with caplog.at_level(logging.INFO):
+            assert self._scan(rungs, held_ladders=market_ladder_keys(held)) == []
+        assert _HELD_LINE + "1" in caplog.text
+
     def test_a_held_question_refuses_a_family_listed_as_one_event_per_deadline(self, caplog):
         early, mid, late = self._btc_family()
         # The same question at a later deadline, in an event not in this run's list
         held = _btc_market("BTC-MAR21", "KXBTCMAX-26MAR21", 21, yes_ask="0.80", no_ask="0.20")
         assert market_ladder_keys(held) & market_ladder_keys(early) == frozenset({
-            ("question", _question_of(early)),
+            _question_label(early),
         })
         with caplog.at_level(logging.INFO):
             assert self._scan([early, mid, late], held_ladders=market_ladder_keys(held)) == []
@@ -6558,8 +6621,8 @@ class TestResolveHeldLadders:
         assert _question_of(listed_80) != _question_of(listed_90)
         client = _titled_client({held["ticker"]: held}, {"KXBTCMAX-26MAR11": "Bitcoin record"})
         keys = resolve_held_ladders(client, [listed_80, listed_90], {held["ticker"]})
-        assert ("question", _question_of(listed_80)) in keys
-        assert ("question", _question_of(listed_90)) not in keys
+        assert _question_label(listed_80) in keys
+        assert _question_label(listed_90) not in keys
 
     def test_a_rate_limited_lookup_is_retried(self):
         raw = _star_raw("KXSTAR-14-OCT16", "Oct 16, 2026")

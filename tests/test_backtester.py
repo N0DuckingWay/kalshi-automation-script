@@ -8629,6 +8629,19 @@ class TestOpenLadderExposure:
                                                        ("P2A", _LADDER_M1)]
         assert self._ladder_lines(caplog) == []
 
+    def test_a_question_worded_slightly_differently_is_one_ladder(self, caplog):
+        # One question listed twice, once without "the"
+        p1 = _ladder_record(_ladder_market("P1A", "EVA-1", "2026-02-20"),
+                            _ladder_market("P1B", "EVB-1", "2026-02-20"),
+                            "will the senate vote on save america act?", [_LADDER_M1])
+        p2 = _ladder_record(_ladder_market("P2A", "EVC-1", "2026-03-20"),
+                            _ladder_market("P2B", "EVD-1", "2026-03-20"),
+                            "will the senate vote on the save america act?",
+                            [_LADDER_M1, _LADDER_M2])
+        with caplog.at_level(logging.INFO):
+            assert _traded(self._sim([p1, p2])) == [("P1A", _LADDER_M1)]
+        assert self._ladder_lines(caplog) == [_LADDER_LINE + "2"]
+
     def test_a_ladder_is_free_again_on_the_day_its_trade_pays_out(self):
         # Paid out on Monday 2's day frees the ladder for Monday 2; a day
         # later frees it for Monday 3

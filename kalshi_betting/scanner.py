@@ -126,6 +126,7 @@ import calendar
 import itertools
 import logging
 import re
+import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -2161,14 +2162,41 @@ def time_series_group_key(combined_title: str, subtitle: Any) -> str:
     return f"{base} | {sub}" if sub else base
 
 
+# Words and marks that do not change which question a market asks
+_LADDER_FILLER_WORDS = re.compile(r"\b(?:the|a|an)\b")
+_LADDER_FILLER_MARKS = re.compile(r"[?!:;()\"'`\u2018\u2019\u201c\u201d]")
+
+
+def _ladder_question(question_key: str) -> str:
+    """
+    Return the form of a question key that ladder labels compare.
+
+    Two listings of one question can be worded a little differently ("vote
+    on the SAVE America Act?" and "vote on SAVE America Act?"). Letter case,
+    the words "the", "a" and "an", quote marks and ?!:;() are ignored, so
+    they still share a ladder. Numbers, $, %, commas, hyphens and full stops
+    are kept, so two strikes or two amounts never merge.
+
+    Args:
+        question_key (str): A question with its dates removed.
+
+    Returns:
+        str: The comparable form; empty if nothing is left.
+    """
+    text = unicodedata.normalize("NFKC", question_key).casefold()
+    text = _LADDER_FILLER_WORDS.sub(" ", _LADDER_FILLER_MARKS.sub(" ", text))
+    return " ".join(text.split())
+
+
 def ladder_keys(event_ticker: Any, question_key: Any) -> frozenset:
     """
     Return labels naming the ladders a market belongs to.
 
     A ladder is one question asked at several deadlines: two markets are on
     one ladder if they share an event, or ask the same question once the
-    dates are removed. Labels are tagged with their kind, so an event can
-    never match a question. Blank or non-text values are ignored.
+    dates are removed (compared through _ladder_question). Labels are tagged
+    with their kind, so an event can never match a question. Blank or
+    non-text values are ignored.
 
     Args:
         event_ticker (Any): The market's event ticker.
@@ -2180,8 +2208,9 @@ def ladder_keys(event_ticker: Any, question_key: Any) -> frozenset:
     keys = set()
     if isinstance(event_ticker, str) and event_ticker:
         keys.add(("event", event_ticker))
-    if isinstance(question_key, str) and question_key:
-        keys.add(("question", question_key))
+    question = _ladder_question(question_key) if isinstance(question_key, str) else ""
+    if question:
+        keys.add(("question", question))
     return frozenset(keys)
 
 
