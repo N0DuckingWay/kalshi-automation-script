@@ -24,10 +24,12 @@ Purpose:
     unwind instead of realizing an unbounded loss; the rollback's own fill
     status is verified either way, and a rollback that did not close the whole
     position is reported as status="rollback_failed" (orphaned position,
-    manual review). Multiple pairs are executed concurrently via
-    ThreadPoolExecutor, so no pair waits for another to complete, but their
-    POSTs share one pacer: every order and collateral-transfer POST, from every
-    worker, first takes a place on _ORDER_WRITE_PACER (a token bucket at
+    manual review), naming how many NO contracts are still open when a V2
+    unwind's response reports a partial close. Multiple pairs are executed
+    concurrently via ThreadPoolExecutor, so no pair waits for another to
+    complete, but their POSTs share one pacer: every order and
+    collateral-transfer POST, from every worker, first takes a place on
+    _ORDER_WRITE_PACER (a token bucket at
     config.ORDER_WRITES_PER_SECOND with bursts of config.ORDER_WRITE_BURST),
     so concurrent pairs stay under the account's write limit instead of
     drawing HTTP 429 rejections from the exchange.
@@ -201,7 +203,7 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_FLOOR, Decimal, Inexact, localcontext
 from json import JSONDecodeError
 from typing import Any
 
@@ -1031,9 +1033,13 @@ def _v2_fill_status(data: dict, requested_count: int) -> str:
 
     The unwind is the one caller for which a partial fill is a real outcome:
     it is immediate_or_cancel (see _build_rollback_order_v2), so it can close
-    part of the position and cancel the rest. The ValueError raised for it is
-    caught by _rollback_no_leg's except branch, which reports rollback_failed
-    and sends no further order.
+    part of the position and cancel the rest. The ValueError raised for it
+    reaches _rollback_no_leg with the response body attached
+    (_submit_order_v2 re-raises it as _UnclassifiableV2Response), and
+    _rollback_no_leg reads the fill count from that body itself to report
+    exactly how many NO contracts are still open; it reports rollback_failed
+    and sends no further order. This function never returns a status for a
+    partial fill, because a status here would reach the buy legs too.
 
     Args:
         data (dict): The parsed V2 response body. The order object may be
@@ -1114,6 +1120,40 @@ def _is_fok_kill(exc: BaseException) -> bool:
     return isinstance(error, dict) and error.get("code") == V2_FOK_KILL_ERROR_CODE
 
 
+class _UnclassifiableV2Response(ValueError):
+    """
+    The error _submit_order_v2 raises when _v2_fill_status cannot classify a
+    2xx V2 order response, with the parsed response body attached.
+
+    It is a ValueError carrying _v2_fill_status's own message, so a caller
+    that treats any exception as an ambiguous submission (the two buy legs in
+    _execute_one) sees the same error text it would see from _v2_fill_status
+    itself. The one caller that reads the body is _rollback_no_leg: the unwind
+    is immediate_or_cancel, so a fill count between zero and the full count
+    means it closed part of the position, and _rollback_no_leg reads that
+    count from `response` to report how many NO contracts are still open.
+
+    Attributes:
+        response (Any): The parsed response body _v2_fill_status rejected. It
+            is a dict, because _v2_fill_status reads it with .get before it
+            can raise; _rollback_no_leg still checks the type before reading.
+    """
+
+    def __init__(self, message: str, response: Any = None) -> None:
+        """
+        Build the error from the classifier's message and the rejected body.
+
+        Args:
+            message (str): _v2_fill_status's own error message, kept word for
+                word so the buy legs record the same error text.
+            response (Any): The parsed response body. Defaults to None only so
+                copy and pickle can rebuild the error from its message; they
+                restore the body afterwards from the instance's attributes.
+        """
+        super().__init__(message)
+        self.response = response
+
+
 def _submit_order_v2(client: Any, body: dict) -> str:
     """
     Submit one V2 order and return its fill status in the legacy vocabulary.
@@ -1149,10 +1189,14 @@ def _submit_order_v2(client: Any, body: dict) -> str:
     Raises:
         ApiException: On any other non-2xx HTTP status or error code, and on
             every error response to the immediate_or_cancel unwind.
-        ValueError: When the response's fill count is missing or partial —
-            _execute_one treats any exception on a buy leg as an ambiguous
-            submission and consults the account position; _rollback_no_leg
-            reports one on the unwind as rollback_failed.
+        ValueError: When the response's fill count is missing or partial,
+            raised as _UnclassifiableV2Response with the response body
+            attached — _execute_one treats any exception on a buy leg as an
+            ambiguous submission and consults the account position;
+            _rollback_no_leg reports one on the unwind as rollback_failed,
+            reading the fill count from the attached body to say how many NO
+            contracts are still open. A 2xx body that is not JSON raises
+            json.JSONDecodeError (also a ValueError) with no body attached.
 
     Paced by _ORDER_WRITE_PACER before it is sent, like every write in this
     module, so concurrent pairs stay under the account's write limit. An HTTP
@@ -1186,7 +1230,13 @@ def _submit_order_v2(client: Any, body: dict) -> str:
             )
             return "canceled"
         raise
-    return _v2_fill_status(data, requested)
+    try:
+        return _v2_fill_status(data, requested)
+    except ValueError as exc:
+        # Re-raised with the same message, still a ValueError, carrying the
+        # body: only the unwind's caller reads it, to count what a partial
+        # close left open
+        raise _UnclassifiableV2Response(str(exc), data) from exc
 
 
 def _build_no_order_any(leg: _Leg) -> Any:
@@ -1281,8 +1331,11 @@ def _submit_any(client: Any, order: Any) -> str:
     Raises:
         ApiException: On a non-2xx HTTP status, except the V2 fill-or-kill
             kill response, which _submit_order_v2 returns as "canceled".
-        ValueError/KeyError/TypeError: When the response cannot be classified;
-            callers treat any exception as an ambiguous submission.
+        ValueError/KeyError/TypeError: When the response cannot be classified.
+            _execute_one treats any exception on a buy leg as an ambiguous
+            submission; _rollback_no_leg reports one on the unwind as
+            rollback_failed, reading the body a V2 partial fill carries (see
+            _UnclassifiableV2Response).
     """
     if isinstance(order, dict):
         return _submit_order_v2(client, order)
@@ -1515,6 +1568,21 @@ def _rollback_no_leg(client: Any, spec: TradeSpec, no_leg: _Leg, reason: str) ->
     well, sending no second order, so a partial close is never reported as
     flat.
 
+    For that partial close the alert names the exact number of NO contracts
+    still open: the NO leg's count minus the fill count the unwind's own 2xx
+    response reports, read here from the body _submit_order_v2 attaches to
+    its error (_UnclassifiableV2Response). It is read here and nowhere else,
+    because _v2_fill_status also classifies the two buy legs, where a partial
+    fill must keep raising into _execute_one's position check. The count
+    covers only the contracts this pair bought, as the unwind's response
+    reports them; the account may hold others on the same market, so the
+    alert still says to check the account. When the count cannot be known —
+    an error response, a transport error, a body that is not JSON or not an
+    object, a fill count that is missing, not a finite number, below zero or
+    above the full count, or one too long to subtract exactly — the alert
+    says "up to" the NO leg's count instead. (A fill count of exactly zero is
+    a clean "canceled": nothing closed, and the alert names the full count.)
+
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         spec (TradeSpec): The trade being unwound; carried into the TradeResult.
@@ -1527,6 +1595,8 @@ def _rollback_no_leg(client: Any, spec: TradeSpec, no_leg: _Leg, reason: str) ->
         TradeResult: status="rolled_back" when the unwind filled in full,
             status="rollback_failed" when it did not fill (rejected, or killed
             by the price floor), filled only part of the position, or raised.
+            On a partial close the error text ends with how many NO contracts
+            are still open.
     """
     # Version-dispatched build: a reduce-only floored bid on V2, a reduce-only
     # floored limit sell on the legacy path — both close the NO-leg position
@@ -1537,6 +1607,51 @@ def _rollback_no_leg(client: Any, spec: TradeSpec, no_leg: _Leg, reason: str) ->
         # _submit_order_v2 for why the modeled create_order call cannot be used
         rb_status = _submit_any(client, rollback)
     except Exception as rb_err:
+        # How many NO contracts a partial V2 unwind closed and left open, as
+        # plain decimal text ("3.00" reads 3, "2.50" reads 2.5), when its own
+        # 2xx response says so (see the docstring); None when not known
+        counts = None
+        try:
+            if (isinstance(rb_err, _UnclassifiableV2Response)
+                    and isinstance(rb_err.response, dict)):
+                # The order object may be wrapped under "order" or sent flat —
+                # the same unwrap _v2_fill_status applies
+                inner = rb_err.response.get("order")
+                order = inner if isinstance(inner, dict) else rb_err.response
+                fill = _parse_fixed_point(order, "fill_count")
+                # is_finite first: comparing a NaN with < raises
+                if fill is not None and fill.is_finite() and 0 < fill < no_leg.count:
+                    # Exact decimal arithmetic only: a count that decimal's
+                    # default 28-digit precision would round raises Inexact
+                    # here, so it is reported as unknown rather than wrong
+                    with localcontext() as ctx:
+                        ctx.traps[Inexact] = True
+                        still_open = no_leg.count - fill
+                        counts = (
+                            format(fill.normalize(), "f"),
+                            format(still_open.normalize(), "f"),
+                        )
+        except Exception:
+            # Reading the count must never cost the orphan alert below
+            counts = None
+        if counts is not None:
+            closed_text, open_text = counts
+            logging.critical(
+                "ROLLBACK FAILED for '%s' — ORPHANED POSITION: the unwind's"
+                " response reports it closed %s of the %d NO contracts this"
+                " pair bought on %s, so %s of them are still open (an"
+                " immediate-or-cancel order leaves nothing resting) — check the"
+                " account. Manual review required. Error: %s",
+                spec.pair.canonical_title, closed_text, no_leg.count,
+                no_leg.market.ticker, open_text, rb_err,
+            )
+            return TradeResult(
+                spec=spec, status="rollback_failed",
+                error=(
+                    f"{reason}; rollback error: {rb_err}; {open_text} of"
+                    f" {no_leg.count} NO contracts still open"
+                ),
+            )
         logging.critical(
             "ROLLBACK FAILED for '%s' — ORPHANED POSITION: up to %d NO contracts"
             " on %s (a V2 unwind can close part of the position before it stops —"
@@ -2766,7 +2881,8 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
             result has status="executed" (both legs filled), "simulated" (dry
             run), "failed" (NO leg confirmed unfilled), "rolled_back" (YES leg
             confirmed unfilled, NO leg unwound), "rollback_failed" (NO-leg
-            unwind did not fill — orphaned position), or "manual_review" (a
+            unwind did not fill, or on V2 closed only part of the position —
+            orphaned position), or "manual_review" (a
             leg's fill state could not be attributed to this order, or an
             exception escaped the worker — no automated order was submitted in
             response). The list is in SUBMISSION order: results[i] corresponds
