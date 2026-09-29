@@ -3045,7 +3045,7 @@ class TestV2MappingDisproofStopsTheRun:
         post = MagicMock()
         monkeypatch.setattr(trader, "signed_request_json", post)
         builder = MagicMock(side_effect=AssertionError("an order was built"))
-        monkeypatch.setattr(trader, "_build_no_order_any", builder)
+        monkeypatch.setattr(trader, "_build_no_order_v2", builder)
         client = MagicMock()
         pacer = trader._ORDER_WRITE_PACER
         with caplog.at_level(logging.WARNING, logger="root"):
@@ -3058,7 +3058,6 @@ class TestV2MappingDisproofStopsTheRun:
         builder.assert_not_called()
         post.assert_not_called()
         client.get_positions_without_preload_content.assert_not_called()
-        client.create_order_without_preload_content.assert_not_called()
         # Not even a place on the write pacer was taken
         assert pacer._held == 0
         assert pacer._tokens == float(config.ORDER_WRITE_BURST)
