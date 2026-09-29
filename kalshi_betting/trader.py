@@ -170,9 +170,11 @@ Notes:
     the exchange's side mapping, not any particular market. A disproof sets a
     second process-lifetime latch (_V2_NO_MAPPING_DISPROVEN), and every later
     pair of the run is then stopped before anything is read or sent
-    (status "failed"). Until one of the two latches is set, execute_trades
-    runs pairs one at a time, so a disproof costs one wrong-side position
-    rather than one per pair already in flight.
+    (status "failed"). On the V2 path, until one of the two latches is set,
+    execute_trades runs pairs one at a time (for at most
+    config.V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS pairs that give no verdict),
+    so a disproof costs one wrong-side position rather than one per pair
+    already in flight.
 
     Shard routing is per LEG, not per bot. Kalshi partitioned the exchange into
     shards and every market carries its own exchange_index; each V2 order body
@@ -229,6 +231,9 @@ from .config import (
     TRANSFER_SETTLE_TIMEOUT_SECONDS,
     V2_FOK_KILL_ERROR_CODE,
     V2_FOK_KILL_HTTP_STATUS,
+    V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS,
+    V2_MAPPING_VERDICT_POLL_SECONDS,
+    V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS,
     V2_ORDER_PATH,
     V2_ROLLBACK_BID_PRICE_DOLLARS,
     V2_SELF_TRADE_PREVENTION_TYPE,
@@ -380,25 +385,35 @@ _V2_PRICE_QUANTUM = Decimal("0.0001")
 _V2_NO_MAPPING_CONFIRMED = False
 
 # Process-lifetime latch set when the backstop DISPROVES the V2 NO-leg
-# mapping. From then on no pair in this process sends anything: _execute_one
-# stops each later pair before it reads a position or builds an order
-# (status "failed", nothing submitted), and a pair whose NO leg filled before
-# the stop reached it stops at manual_review before its YES leg. The CRITICAL
+# mapping, by the mapping check or by an ambiguous NO leg whose position moved
+# in a way a NO buy cannot explain. From then on no pair in this process
+# sends anything: _execute_one stops each later pair before it reads a
+# position or builds an order (status "failed", nothing submitted), and a
+# pair whose NO leg filled before the stop reached it stops at manual_review
+# before its YES leg. The CRITICAL
 # logged at the disproof tells the operator to stop trading and flatten by
 # hand, so the bot must not keep opening positions on the same mapping for
 # the rest of the run. Only a new process clears it; like the confirmation
-# latch it is never persisted.
+# latch it is never persisted, so a scheduled run the next week starts clear.
 _V2_NO_MAPPING_DISPROVEN = False
 
-# Pause before re-reading a ZERO position delta. Named for its first caller,
-# the V2 NO-mapping backstop, but it is now the module's single ledger-lag
-# delay and _execute_one's two ambiguous-leg branches use it too: a position
+# NO-leg tickers of pairs that went ahead in this process although the mapping
+# check could not read the account after their NO leg filled (the check's
+# "unknown" outcome). Such a pair sends its YES leg as usual, so if a later
+# pair then disproves the mapping, these positions rest on the same wrong
+# mapping while the pairs report "executed". The disproof's CRITICAL names
+# them so a human checks them too. Appended to from worker threads (a list
+# append is atomic under the GIL) and cleared only with the process.
+_V2_UNCHECKED_NO_LEGS: list[str] = []
+
+# Pause before re-reading a ZERO position delta in _execute_one's two
+# ambiguous-leg branches (the human-run V2 probe reads it too): a position
 # that has not moved immediately after a fill the exchange may already have
 # processed is most often read-after-write lag in the positions ledger, not
-# evidence of a non-fill (and, in the backstop, not disproof — genuine
-# disproof MOVES the position, the wrong way; the delta is what is judged,
-# never the absolute sign). One second is far above observed ledger lag and
-# far below any price-staleness concern.
+# evidence of a non-fill. The name is historical: the V2 NO-mapping backstop used this one
+# pause too, and now re-reads on its own schedule,
+# config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS. One second is about the lag
+# observed live and far below any price-staleness concern.
 _V2_MAPPING_RECHECK_DELAY_SECONDS = 1.0
 
 # Pacing waits this short or shorter are not logged, so an ordinary queue
@@ -2642,6 +2657,32 @@ def ensure_shard_collateral(
     return kept
 
 
+def _stop_run_on_v2_mapping_disproof() -> str:
+    """
+    Set the disproven latch, so no later pair of this process sends anything.
+
+    Called wherever the V2 NO-leg side mapping is found disproven: by the
+    mapping check (_confirm_v2_no_mapping) and by an ambiguous NO leg whose
+    position moved in a way a NO buy cannot explain (_execute_legs).
+
+    Returns:
+        str: A sentence to end the disproof's CRITICAL with, naming the NO
+            legs that earlier pairs of this process sent while the mapping
+            check could not read the account (_V2_UNCHECKED_NO_LEGS). Those
+            pairs went ahead as if the mapping held, so their positions rest
+            on the same wrong mapping. An empty string when there are none.
+    """
+    global _V2_NO_MAPPING_DISPROVEN
+    _V2_NO_MAPPING_DISPROVEN = True
+    if not _V2_UNCHECKED_NO_LEGS:
+        return ""
+    return (
+        " Earlier pairs of this run went ahead after their NO-leg fill could"
+        " not be checked, so they rest on the same mapping: check the"
+        f" positions on {', '.join(_V2_UNCHECKED_NO_LEGS)} too."
+    )
+
+
 def _confirm_v2_no_mapping(
     client: Any, spec: TradeSpec, no_leg: _Leg, before_no: float | None,
 ) -> TradeResult | None:
@@ -2678,9 +2719,9 @@ def _confirm_v2_no_mapping(
     (whose NO leg is market_b): one confirmed `ask` proves the side mapping
     for every market.
 
-    The position read here is _position_count_once — SINGLE-SHOT, never
-    retried, one of the two such reads in this module (the other is
-    _execute_one's NO-leg ledger-lag re-read). It is a blocking call inside
+    Every position read here is _position_count_once — SINGLE-SHOT, never
+    retried; the only other single-shot read in this module is
+    _execute_one's NO-leg ledger-lag re-read. Each is a blocking call inside
     the window where the NO leg is filled and unhedged,
     and api_call_with_retry's backoff can hold one call for ~62s of sleeps;
     worse, a failing endpoint never latches, so in a 429 storm EVERY V2 trade
@@ -2711,13 +2752,20 @@ def _confirm_v2_no_mapping(
         re-arms the check. One flaky positions read must not stall trading, and
         the fill itself was already confirmed by the FoK response, so
         proceeding leaves the trade no more ambiguous than it already was.
+        The NO leg's ticker is recorded (_V2_UNCHECKED_NO_LEGS), so that if a
+        later pair disproves the mapping its CRITICAL names this position too.
 
-    A delta of exactly zero gets one short pause and a re-read before being
-    judged: genuine disproof moves the position the wrong way, while a
-    momentarily unchanged ledger is usually read-after-write lag. A zero that
-    survives the re-read is judged disproven like any other wrong delta, and
-    sets the latch too: the ledger then contradicts the fill report, a state
-    the bot cannot model.
+    A delta of exactly zero is re-read after each pause in
+    config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS (1, 2 and 4 s, so up to
+    7 s) before being judged: genuine disproof moves the position the wrong
+    way, while a momentarily unchanged ledger is usually read-after-write
+    lag, which was seen at about 1 s live. The first re-read that moved is
+    judged; a re-read that fails is the unknown outcome above. A zero that
+    survives every re-read is judged disproven like any other wrong delta,
+    and sets the latch too: the ledger then contradicts the fill report, a
+    state the bot cannot model. The price is that this pair's filled NO leg
+    can wait up to 7 s unhedged, once per process, and only when the ledger
+    lags.
 
     If the mapping was already disproven in this process when this runs —
     this pair's NO leg filled after another pair's disproof — no position is
@@ -2727,12 +2775,14 @@ def _confirm_v2_no_mapping(
     never outweighed by a confirmation from another pair.
 
     Concurrency: execute_trades() runs pairs one at a time until this check
-    has confirmed or disproven the mapping, so through it no two pairs reach
-    the check together, and no pair is past its NO leg when the disproven
-    latch is set. A caller that ran _execute_one concurrently some other way
-    could send two pairs here at once: that costs a duplicate positions read,
-    and each pair still stops on its own evidence or on the latch. A bool
-    assignment is atomic under the GIL.
+    has confirmed or disproven the mapping, so while it does no two pairs
+    reach the check together and no pair is past its NO leg when the
+    disproven latch is set. After config.V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS
+    pairs without a verdict it runs the rest together, and a caller could run
+    _execute_one concurrently some other way; then two pairs can be here at
+    once, which costs a duplicate positions read, and each pair still stops
+    on its own evidence or on the latch. A bool assignment is atomic under
+    the GIL.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -2753,7 +2803,7 @@ def _confirm_v2_no_mapping(
             mapping was disproven — by this pair, or earlier in this process —
             and the pair must stop.
     """
-    global _V2_NO_MAPPING_CONFIRMED, _V2_NO_MAPPING_DISPROVEN
+    global _V2_NO_MAPPING_CONFIRMED
     # Read the module-level ORDER_API_VERSION exactly as the _*_any dispatchers
     # do, so the backstop can never check a path that was not the one submitted
     if ORDER_API_VERSION != "v2":
@@ -2789,23 +2839,29 @@ def _confirm_v2_no_mapping(
             " response, and the check re-arms on the next V2 NO fill",
             ticker,
         )
+        # Named in the CRITICAL if a later pair disproves the mapping
+        _V2_UNCHECKED_NO_LEGS.append(ticker)
         return None
     if abs(delta) < _DELTA_EPS:
         # A delta of exactly zero right after a confirmed fill is ambiguous:
         # genuine disproof MOVES the position (the wrong way), while an
-        # unchanged ledger can simply be read-after-write lag. One short pause
-        # and a re-read separates the two — without it, ledger lag on an
-        # unattended run would falsely halt the pair at manual_review with a
-        # real, unhedged NO-leg position open.
-        time.sleep(_V2_MAPPING_RECHECK_DELAY_SECONDS)
-        delta = _fill_delta(before_no, _position_count_once(client, ticker))
-        if delta is None:
-            logging.warning(
-                "V2 NO-leg re-read failed on %s after a zero first delta —"
-                " proceeding unlatched; the check re-arms on the next fill",
-                ticker,
-            )
-            return None
+        # unchanged ledger can simply be read-after-write lag. Re-reading
+        # after each pause in turn separates the two — without it, ledger
+        # lag would falsely stop the run with this pair's real NO leg
+        # unhedged. Stops at the first re-read that moved.
+        for pause in V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS:
+            time.sleep(pause)
+            delta = _fill_delta(before_no, _position_count_once(client, ticker))
+            if delta is None:
+                logging.warning(
+                    "V2 NO-leg re-read failed on %s after a zero first delta —"
+                    " proceeding unlatched; the check re-arms on the next fill",
+                    ticker,
+                )
+                _V2_UNCHECKED_NO_LEGS.append(ticker)
+                return None
+            if abs(delta) >= _DELTA_EPS:
+                break
     if abs(delta + no_leg.count) < _DELTA_EPS:
         _V2_NO_MAPPING_CONFIRMED = True
         logging.info(
@@ -2816,7 +2872,7 @@ def _confirm_v2_no_mapping(
         )
         return None
     # Latch before logging, so no later pair of this process sends anything
-    _V2_NO_MAPPING_DISPROVEN = True
+    unchecked = _stop_run_on_v2_mapping_disproof()
     logging.critical(
         "V2 NO-LEG MAPPING DISPROVEN on %s — the NO leg's ask did not open NO"
         " exposure: expected a position delta of %d, got %s. NOT submitting the"
@@ -2824,8 +2880,8 @@ def _confirm_v2_no_mapping(
         " same disproven hypothesis, so it could double the error). The rest"
         " of this run is stopped: no later pair sends any order. A human"
         " must flatten this account position; set config.ORDER_API_VERSION ="
-        " \"legacy\" to revert to the proven order path.",
-        ticker, -no_leg.count, delta,
+        " \"legacy\" to revert to the proven order path.%s",
+        ticker, -no_leg.count, delta, unchecked,
     )
     return TradeResult(
         spec=spec, status="manual_review",
@@ -2891,7 +2947,11 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     _rollback_no_leg. Anything else — either lookup failed, or the position
     moved by an amount this order cannot explain — is status="manual_review"
     with NO automated unwind: a reduce_only sell against a position this order
-    may not own would liquidate an unrelated holding.
+    may not own would liquidate an unrelated holding. A known move of that
+    kind on the V2 path, while the NO-leg mapping is not yet confirmed in
+    this process, is also treated as disproving the mapping (a wrong mapping
+    moves it by +no_leg.count), so it sets _V2_NO_MAPPING_DISPROVEN and stops
+    the rest of the run, as the mapping check would.
 
     YES leg ambiguous resolves as: delta of exactly +yes_leg.count → the pair
     actually completed, status="executed"; delta 0 on both readings → confirmed
@@ -2917,13 +2977,15 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     position is read or any order is built: status "failed", because nothing
     was sent and there is nothing to unwind. The check sits at the top rather
     than just before the NO leg's POST because execute_trades runs pairs one
-    at a time until the mapping is confirmed or disproven, so no pair can be
-    between the two points when the latch is set; checking first also spares
-    each stopped pair its two baseline reads. A pair already past this check
-    when another pair sets the latch — possible only for a caller that runs
-    pairs concurrently before the mapping is verified, which execute_trades
-    does not — still sends its NO leg, and stops at manual_review before its
-    YES leg (see _confirm_v2_no_mapping).
+    at a time until the mapping is confirmed or disproven, so while it does
+    no pair can be between the two points when the latch is set; checking
+    first also spares each stopped pair its two baseline reads. A pair
+    already past this check when another pair sets the latch — possible only
+    once execute_trades has stopped running pairs one at a time without a
+    verdict (config.V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS), or for a caller
+    that runs pairs concurrently some other way — still sends its NO leg; if
+    it fills, the pair stops at manual_review before its YES leg (see
+    _confirm_v2_no_mapping).
 
     The pair's places on the shared write pacer come from one _PairWrites:
     the NO leg waits for two free tokens and holds the second, so the YES leg
@@ -3031,11 +3093,12 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
     # to "nothing in that window", and both are SINGLE-SHOT (never retried, so
     # each is bounded by a single request), which is what keeps the claim above
     # true of RETRYABLE calls: on the V2 path, until the NO-leg mapping latches,
-    # _confirm_v2_no_mapping reads once there — the mapping cannot be proven any
-    # other way — and an ambiguous NO leg whose ledger reads unchanged re-reads
-    # once there after a 1s pause (DR-64). Both use the same bounded-wait idiom
-    # _await_transfer_settlement uses; the mapping read costs at most one round
-    # trip and disappears for the rest of the process once confirmed.
+    # _confirm_v2_no_mapping reads there — the mapping cannot be proven any
+    # other way — once, or up to three more times over 7 s when the ledger
+    # reads unchanged; and an ambiguous NO leg whose ledger reads unchanged
+    # re-reads once there after a 1s pause (DR-64). Both use the same
+    # bounded-wait idiom _await_transfer_settlement uses; the mapping reads
+    # disappear for the rest of the process once it is confirmed.
     # The write pacer adds no wait there: the YES leg is sent on the place the
     # NO leg held for it (see _PairWrites).
     before_no = _position_count(client, no_leg.market.ticker)
@@ -3128,18 +3191,42 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
         # an amount this order cannot explain — e.g. an unrelated trade landed
         # in the snapshot window). Do NOT auto-trade against it: a reduce_only
         # sell would liquidate a holding this order may not own.
+        #
+        # A KNOWN move of anything but 0 or -no_leg.count is also what a wrong
+        # V2 side mapping makes (an ask that opened YES moves it by +count).
+        # While the mapping is not yet confirmed in this process, treat it as
+        # a disproof and stop the rest of the run, exactly as the mapping
+        # check does: otherwise every later pair whose NO POST also raised
+        # would open another wrong-side position without the check ever
+        # running. If the move was an unrelated trade, the cost is only the
+        # run's remaining trades.
+        stops_run = (
+            delta is not None
+            and ORDER_API_VERSION == "v2"
+            and not _V2_NO_MAPPING_CONFIRMED
+        )
+        stop_note = ""
+        if stops_run:
+            stop_note = (
+                " The V2 NO-leg mapping is not yet confirmed in this process and"
+                " a NO buy cannot move the position this way, so the mapping is"
+                " treated as disproven: the rest of this run is stopped and no"
+                " later pair sends any order; set config.ORDER_API_VERSION ="
+                " \"legacy\" to revert to the proven order path."
+                + _stop_run_on_v2_mapping_disproof()
+            )
         logging.critical(
             "NO leg (%s) raised for '%s' and the fill could NOT be attributed"
             " (position delta=%s, expected 0 or %d) — NOT unwinding, since a"
             " reduce-only sell could liquidate an unrelated position. Manual"
-            " review required: %s",
+            " review required: %s%s",
             no_leg.label, spec.pair.canonical_title, delta, -no_leg.count,
-            no_leg_error,
+            no_leg_error, stop_note,
         )
-        return TradeResult(
-            spec=spec, status="manual_review",
-            error=f"NO leg ambiguous, delta={delta}: {no_leg_error}",
-        )
+        error = f"NO leg ambiguous, delta={delta}: {no_leg_error}"
+        if stops_run:
+            error += "; V2 NO-leg mapping treated as disproven, rest of run stopped"
+        return TradeResult(spec=spec, status="manual_review", error=error)
 
     # The NO leg is now a CONFIRMED fill (a clean "executed" status above,
     # since every ambiguous outcome returned). On the V2 path only, and only
@@ -3265,7 +3352,10 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
 
 def _v2_mapping_unverified() -> bool:
     """
-    Whether pairs must still run one at a time (see execute_trades).
+    Whether this process has yet to settle the V2 NO-leg mapping.
+
+    execute_trades runs pairs one at a time while this is True, up to
+    config.V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS pairs without a verdict.
 
     Returns:
         bool: True while the V2 order path is selected and this process has
@@ -3285,7 +3375,7 @@ def _v2_mapping_unverified() -> bool:
 def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     """
     Execute each TradeSpec as a sequential two-leg trade, with pairs running
-    concurrently across specs.
+    concurrently across specs once the V2 NO-leg mapping is settled.
 
     In live mode, each spec is handled by _execute_one(): the NO leg (market_a
     for a same_title pair, market_b for a time_series pair — see
@@ -3296,20 +3386,32 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     other pairs' NO legs.
 
     The exception is the V2 path before this process has confirmed or
-    disproven the NO-leg side mapping (_confirm_v2_no_mapping): until then
-    each pair must finish before the next one starts. The mapping is checked
-    on a pair's own NO fill, and concurrent pairs all send their NO legs
-    before the first check can finish (on the first live run, 2026-09-28, all
-    7 NO legs went out before the first confirmation), so a disproof would
-    otherwise find a wrong-side position on every pair already in flight.
-    One at a time, a disproof costs one position: its latch stops every later
-    pair before anything is sent (status "failed"). Once the mapping is
-    confirmed the remaining pairs start together, as before. The cost is
-    paid once per process: the first pair (and any after it whose NO leg is
-    killed, or whose check cannot read the account's positions) runs alone,
-    typically a few round trips, or about a second more when the ledger lags
-    and the check re-reads. The legacy path has no mapping check and always
-    runs pairs concurrently.
+    disproven the NO-leg side mapping (_confirm_v2_no_mapping): until then a
+    pair runs alone, and the next one starts only when it has settled the
+    mapping or finished. The mapping is checked on a pair's own NO fill, and
+    concurrent pairs all send their NO legs before the first check can
+    finish (on the first live run, 2026-09-28, all 7 NO legs went out before
+    the first confirmation), so a disproof would otherwise find a wrong-side
+    position on every pair already in flight. One at a time, a disproof costs
+    one position: its latch stops every later pair before anything is sent
+    (status "failed"). The next pair starts the moment the mapping is
+    settled, even while the pair that settled it is still sending its YES
+    leg or an unwind; once it is confirmed the remaining pairs start
+    together, as before.
+
+    A pair can also finish without a verdict: its NO leg killed, its NO POST
+    raising (an ambiguous leg the check never reaches, unless its position
+    moved in a way that disproves the mapping), its worker raising, or the
+    check unable to read the account. Such a pair proves nothing, and when
+    position reads keep failing every pair would finish that way behind about
+    two minutes of retried reads. So after
+    config.V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS (3) pairs have run alone
+    without a verdict, a WARNING is logged and the rest start together, each
+    still checking its own NO fill; a disproof after that stops only the
+    pairs that start after it. The cost is paid once per process: usually
+    the first pair's NO POST and mapping check (a few round trips, up to 7 s
+    more when the ledger lags), and at most three pairs run alone in full.
+    The legacy path has no mapping check and always runs pairs concurrently.
 
     In dry_run mode, no orders are submitted. The function logs the intended
     trade — both legs in SUBMISSION order (NO leg first), with each leg's own
@@ -3363,16 +3465,35 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
 
     with ThreadPoolExecutor(max_workers=min(TRADER_MAX_WORKERS, len(specs))) as pool:
         future_to_spec: dict = {}
+        # Pairs that ran alone and finished with the mapping still unsettled
+        without_verdict = 0
+        cap_logged = False
         for spec in specs:
             future = pool.submit(_execute_one, client, spec)
             future_to_spec[future] = spec
-            # While the V2 NO-leg mapping is neither confirmed nor disproven,
-            # let this pair finish before the next one starts (see the
-            # docstring). Checked after submitting: if this pair settled the
-            # mapping in the meantime, there is nothing to wait for. wait()
-            # never raises; a worker's exception is collected below.
+            # Checked after submitting: once the mapping is settled there is
+            # nothing to wait for (see the docstring)
+            if not _v2_mapping_unverified():
+                continue
+            if without_verdict >= V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS:
+                if not cap_logged:
+                    logging.warning(
+                        "V2 NO-leg mapping still unverified after %d pair(s)"
+                        " ran one at a time without a verdict — starting the"
+                        " remaining pairs together; each still checks its own"
+                        " NO fill, but a disproof now stops only the pairs that"
+                        " start after it",
+                        without_verdict,
+                    )
+                    cap_logged = True
+                continue
+            # Hold the next pair back until this one settles the mapping or
+            # finishes. The wait never raises; a worker's exception is
+            # collected below.
+            while _v2_mapping_unverified() and not future.done():
+                wait_for_futures([future], timeout=V2_MAPPING_VERDICT_POLL_SECONDS)
             if _v2_mapping_unverified():
-                wait_for_futures([future])
+                without_verdict += 1
         results = []
         # Collect per-future so one worker's exception cannot discard every other
         # pair's TradeResult — including confirmed real fills. A list
