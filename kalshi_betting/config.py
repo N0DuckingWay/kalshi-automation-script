@@ -580,62 +580,28 @@ MVE_SERIES_FAMILY_PREFIX      = "KXMVE"
 # The quadratic P*(1-P) factor means fees are highest near 50¢ and lowest near 1¢/99¢.
 TAKER_FEE_RATE                = 0.07
 
-# LEGACY ORDER PATH ONLY — the V2 order path uses BUY_SLIPPAGE_TICKS below.
-# Slippage allowance, in cents per contract, added on top of the scanned price
-# when computing the buy_max_cost cap for each market FoK order leg. The cap
-# protects against the order book moving between the pre-execution check and
-# submission: the order fills at or below (scanned price + allowance) or not at all.
-# This stays a whole-cent value because `buy_max_cost` is an integer-cents field
-# on the legacy /portfolio/orders create-order endpoint — a sub-cent-aware cap
-# can't be expressed there no matter how finely a market's own tick grid is
-# subdivided (see ApiMarket.price_level_structure / price_ranges in scanner.py).
-# On 2026-08-17, all MVE/combo markets migrated to the
-# `center_deci_edge_centi_cent` tick regime — $0.0001 ticks below $0.01 and
-# above $0.99, $0.001 ticks in between — so this 1c tolerance permits roughly
-# 10-100 ticks of price drift on those markets, depending on where in the band
-# the price sits, rather than the intended ~1. That is precisely why the
-# default order path is now ORDER_API_VERSION = "v2" (below), whose dollar-
-# string limit price is capped in ticks; this constant only still applies when
-# that switch is flipped back to "legacy" as a rollback.
-BUY_MAX_COST_SLIPPAGE_CENTS   = 1
-
-# Maximum accepted per-contract loss (cents) when unwinding the NO leg (the
-# first-submitted leg: market_a for a same-title pair, market_b for a
-# time-series pair) after the YES leg failed, relative to the NO leg's scanned
-# NO entry price. On the legacy path the rollback is a fill-or-kill LIMIT sell
-# at (entry - this); on the V2 path the same bound caps an immediate-or-cancel
-# bid, which closes only what rests at or under the cap (see the last
-# paragraph below). Either way a book that has collapsed past the floor leaves
-# the position, or what is left of it, open instead of realizing an unbounded
-# loss, and that surfaces as status="rollback_failed" for manual review.
+# Largest loss per contract, in cents below the NO leg's entry price, that
+# the unwind of a filled NO leg may take when the YES leg did not fill. The
+# unwind buys the YES side back (holding NO is the same as being short YES)
+# with a reduce-only immediate-or-cancel bid (it fills what it can right away
+# and cancels the rest) capped at 1 - floor/100 dollars, where floor is the
+# entry price in cents less this, kept within 1..99 cents; see
+# trader._rollback_floor_cents and trader._v2_rollback_price. If the book has
+# moved further than that, what is left stays open and the pair is reported
+# as "rollback_failed" for a person to handle.
 #
-# This allowance must cover the market's ENTIRE bid-ask spread, not just the
-# "acceptable loss": the NO leg entered at the NO ASK, but the unwind is a sell
-# that only fills against the NO BID, so (NO ask - NO bid) — the spread
-# itself — is a floor on the loss even with zero adverse price movement.
-# Any adverse move since entry is additive on top of that spread. At 5 cents
-# this was narrower than the spread on the illiquid markets this strategy
-# targets, so killed unwinds (rollback_failed orphans) were the normal
-# outcome, not the tail case. 12 cents lets a normal-spread book fill the
-# unwind while a genuinely collapsed book still kills it and surfaces
-# rollback_failed for manual review — the deliberate bounded-loss trade-off.
-#
-# The floor applies to BOTH order paths. On the legacy path it is the NO limit
-# sell price directly. On the V2 path a held NO position is a short YES, so the
-# unwind is a YES BUY and the same bound becomes a bid CEILING of
-# (1 - floor/100) dollars, ceiling-quantized onto the market's tick grid and
-# clamped by V2_ROLLBACK_BID_PRICE_DOLLARS (see trader._v2_rollback_price(no_leg)).
+# The allowance must cover the whole bid-ask spread, because the NO leg was
+# bought at the ask and is closed at the bid: the spread alone is lost even
+# if prices do not move. 12 cents lets a normal book close the position while
+# a collapsed book still stops the unwind.
 ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT = 12
 
-# Slippage allowance for the V2 order path, denominated in TICKS of the market's
-# own price grid rather than in whole cents. The V2 endpoint
-# (/portfolio/events/orders) takes dollar-string limit prices, so a FoK cap can
-# finally be expressed at the market's real resolution: cap = scanned price +
-# BUY_SLIPPAGE_TICKS × tick size, where the tick size comes from
-# scanner.tick_size_for_price(). One tick restores the original intent of
-# BUY_MAX_COST_SLIPPAGE_CENTS = 1, which meant ~1 tick back when every market
-# was on a 1c grid but means roughly 10-100 ticks on the centi-cent regimes
-# MVE/combo markets migrated to on 2026-08-17.
+# How far above the scanned price, in ticks of the market's own price grid,
+# each buy leg may fill. The V2 order's limit price is its price protection:
+# scanned price rounded up onto the grid plus this many ticks (see
+# scanner.v2_limit_price, which gets the tick size from
+# scanner.tick_size_for_price). One tick lets a book that moved up by one
+# tick since the pre-execution check still fill.
 BUY_SLIPPAGE_TICKS            = 1
 
 # Fallback tick size, in dollars, for a market whose tick structure is unknown
@@ -681,24 +647,15 @@ MAX_ACTIVE_PRICE_DOLLARS      = 0.9999
 # genuinely sub-threshold pairs at the bottom of the book.
 PRICE_EPSILON                 = 1e-6
 
-# Which create-order endpoint trader.py submits through. Allowed values:
-#   "v2"     — POST V2_ORDER_PATH below: dollar-string fill-or-kill LIMIT prices
-#              (the reduce_only unwind is immediate_or_cancel instead; the
-#              limit price IS the price protection), fixed-point counts,
-#              bid/ask sides on the single YES book, explicit exchange_index.
-#              Only this path can express a cap at the market's real tick
-#              resolution (see BUY_SLIPPAGE_TICKS above).
-#   "legacy" — the original /portfolio/orders create-order call
-#              (CreateOrderRequest, type="market", integer-cents buy_max_cost
-#              via BUY_MAX_COST_SLIPPAGE_CENTS).
-# The legacy path is retained UNMODIFIED in trader.py purely so flipping this
-# constant to "legacy" is the instant rollback procedure if the first live or
-# sandbox V2 submission misbehaves — no code change, no redeploy of logic.
-# Default is "v2" because the legacy endpoint is past its "no earlier than
-# 2026-05-06" deprecation window and costs 5x rate-limit tokens per request.
-# Note that dev/sandbox V2 support is UNVERIFIED (dev mode never submits
-# orders), so the first real production submission is the true verification of
-# the V2 request/response mapping — see the V2 gotcha in CLAUDE.md.
+# The order path the bot sends orders through. "v2" is the only allowed value:
+# POST V2_ORDER_PATH below, the only endpoint Kalshi accepts orders on. Its
+# orders carry dollar-string limit prices, fixed-point counts, a bid/ask side
+# on the YES book and each market's own exchange_index.
+#
+# main.py and the human-run order-path probe check it at startup, before
+# logging is configured or any request is made, and exit 2 on any other
+# value (order_api_version_error). If the V2 path misbehaves, stop trading
+# and flatten positions by hand in the Kalshi UI; there is no other path.
 ORDER_API_VERSION             = "v2"
 
 # Full API path of the V2 create-order endpoint, including the /trade-api/v2
@@ -757,18 +714,16 @@ V2_FOK_KILL_ERROR_CODE        = "fill_or_kill_insufficient_resting_volume"
 # tradeable level.
 V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
 
-# The DEFAULT exchange shard. Kalshi partitions the exchange into parallel
-# instances keyed by `exchange_index` (on markets and in the balance breakdown;
-# combos migrated to shard 1 on 2026-08-17, crypto to shard 2 and
-# tennis/baseball to shard 3 on 2026-08-24). "Default" carries three
-# path-independent meanings, which is why this is not named "routable" —
-# routability depends on the order path (the legacy endpoint reaches only this
-# shard; V2 takes an explicit per-order exchange_index):
-#   1. the shard assumed when a market payload omits `exchange_index`
-#      (fail-safe — absence of the field must never drop markets);
-#   2. the shard the legacy/sandbox single-scalar balance shapes are
-#      attributed to (auth.py fallback tiers 2-3);
-#   3. the only shard the legacy order path may route to.
+# The DEFAULT exchange shard. Kalshi splits the exchange into parallel shards,
+# numbered by `exchange_index` on markets and in the balance breakdown.
+# Orders do not use this constant: every V2 order carries its own market's
+# exchange_index. It is:
+#   1. the shard assumed when a market payload omits `exchange_index`, so a
+#      missing field never drops a market;
+#   2. the shard a balance reply with a single total (the sandbox shape) is
+#      credited to (auth.py);
+#   3. the shard the human-run order-path probe's one-cent collateral-transfer
+#      check moves money out of and back into.
 DEFAULT_EXCHANGE_INDEX       = 0
 
 # The JSON re-typings of an /exchange/status boolean that scanner._status_flag()
@@ -2242,6 +2197,30 @@ def live_rule_warnings(settings: LiveSettings) -> list[str]:
         out.append(f"k = {settings.interval_discount!r}: time-series Kelly cannot be "
                    "positive, so no time-series trade can size")
     return out
+
+
+def order_api_version_error() -> str | None:
+    """
+    Return an error message if ORDER_API_VERSION is not exactly the str "v2".
+
+    main.main() and the human-run order-path probe's main() call this right
+    after parsing their arguments, before logging is configured or any
+    request is made, and pass a message to parser.error, which exits 2. Reads
+    ORDER_API_VERSION at call time, so a test can monkeypatch it.
+
+    Returns:
+        str | None: None if ORDER_API_VERSION is exactly "v2"; otherwise one
+            line naming the value and saying to set it to "v2".
+    """
+    value = ORDER_API_VERSION
+    if type(value) is str and value == "v2":
+        return None
+    return (
+        f"config.ORDER_API_VERSION is {value!r}, but \"v2\" (POST {V2_ORDER_PATH}) is the "
+        "only order path this bot has: Kalshi retired the legacy /portfolio/orders order "
+        "endpoint, so there is nothing to switch to. Set ORDER_API_VERSION = \"v2\" in "
+        "config.py."
+    )
 
 
 def create_new_output(path: Path) -> tuple[Path, BinaryIO]:

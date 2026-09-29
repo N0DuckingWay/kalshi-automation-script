@@ -20,6 +20,10 @@ Purpose:
     subprocess) — see the EXIT_* constants in config.py (BS-14): an unhandled
     exception still propagates to exit 1, same as always.
 
+    Right after parsing its arguments, main() exits 2 if
+    config.ORDER_API_VERSION is not "v2" (config.order_api_version_error),
+    before logging is configured.
+
     The live toggles are config.py's, each overridable for one run by a flag
     of the "live trading toggles" group. _resolve_live_settings builds the
     run's one config.LiveSettings before logging is configured (a bad value
@@ -30,7 +34,8 @@ Purpose:
 
 Dependencies:
     Imports from auth.py (client construction and auth verification), config.py
-    (balance threshold, exit-code contract, the same-title threshold and
+    (balance threshold, exit-code contract, the order-path check
+    order_api_version_error, the same-title threshold and
     close-gap bound, file paths, and the live toggles: LiveSettings,
     live_settings, the describe_* helpers, live_rule_warnings, SIZE_CAP_STEP),
     historical.py (load_series_categories, series_labels, infer_category —
@@ -93,6 +98,7 @@ from .config import (
     describe_trade_filter,
     live_rule_warnings,
     live_settings,
+    order_api_version_error,
 )
 from .historical import infer_category, load_series_categories, series_labels
 from .reporter import append_to_prod_log, write_dev_simulation
@@ -113,7 +119,6 @@ from .scanner import (
 )
 from .strategy import compute_trade, select_portfolio
 from .trader import (
-    drop_legacy_unroutable,
     ensure_shard_collateral,
     execute_trades,
     pre_execution_check,
@@ -469,11 +474,8 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
             # characters, which the daily families this exists for all do
             _truncate(getattr(pair.market_a, "subtitle", "") or "—", 24),
             _truncate(getattr(pair.market_b, "subtitle", "") or "—", 24),
-            # Which exchange shard each leg lives on — while the legacy order
-            # path is in use (ORDER_API_VERSION="legacy") a pair spanning
-            # shards is unexecutable (see trader._legacy_routable), so this
-            # explains an otherwise-puzzling "failed" result at a glance, and
-            # it is the at-a-glance view of what shard coverage looks like.
+            # Which exchange shard each leg's market is on ("a/b"); each
+            # order goes to its own leg's shard
             f"{pair.market_a.exchange_index}/{pair.market_b.exchange_index}",
             _format_deadline(pair.market_a.close_time),
             _format_deadline(pair.market_b.close_time),
@@ -1062,17 +1064,6 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
         return clean_exit
 
-    # On the legacy order path, drop statically-unroutable specs BEFORE any
-    # collateral is planned — otherwise real, non-idempotent transfers would
-    # fund shards whose trades _execute_one's guard then refuses, stranding
-    # money on a shard nothing will trade against. No-op on the V2 default.
-    portfolio = drop_legacy_unroutable(portfolio)
-    if not portfolio:
-        logging.info("No selected pair is routable by the configured order path.")
-        # Never a bare return: sys.exit(None) exits 0, which would hide
-        # EXIT_TIME_SERIES_SKIPPED
-        return clean_exit
-
     # Move collateral to the shards the selected trades draw from — sizing is
     # portfolio-wide, but each order settles against its own shard's balance.
     # Trades whose shard could not be funded (transfer blocked, failed, or not
@@ -1084,7 +1075,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.info(
             "No selected pair could be funded on its exchange shard — no trades submitted."
         )
-        # Never a bare return — see the routability check above
+        # Never a bare return: sys.exit(None) exits 0, which would hide
+        # EXIT_TIME_SERIES_SKIPPED
         return clean_exit
 
     # Submit orders sequentially per leg, concurrently across pairs
@@ -1139,14 +1131,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     n_ok       = sum(1 for r in results if r.status == "executed")
     n_rolled   = sum(1 for r in results if r.status == "rolled_back")
     n_orphaned = sum(1 for r in results if r.status == "rollback_failed")
-    # "manual_review" means no automated order was submitted in response to
-    # an outcome the trader could not attribute: the NO leg's or the YES leg's
-    # fill state was undetermined (position lookup failed, or the position
-    # moved by an amount the order can't explain), or — on the V2 path — the
-    # NO-leg side mapping was disproven by the positions ledger after a
-    # confirmed NO-leg fill, leaving that leg in place and the YES leg
-    # unsubmitted. Every case is just as urgent as an orphaned rollback
-    # failure, so it's counted in the same manual-review alert.
+    # "manual_review": the trader could not tell what a leg did (see
+    # reporter.TradeResult) and sent no follow-up order. It needs a person as
+    # urgently as a failed rollback, so both are counted in one alert.
     n_unknown  = sum(1 for r in results if r.status == "manual_review")
     logging.info(
         "Submitted %d of %d order pair(s) successfully. %d rolled back, "
@@ -1211,17 +1198,15 @@ def main() -> None:
     pairs, sizes them, and trades them.
 
     Parses command-line arguments (--mode, --dry-run, --sandbox-balance,
-    --max-horizon-days, and the "live trading toggles" group), resolves the
-    run's settings and config.py's reference (_resolve_live_settings, before
-    logging is configured), configures logging, builds the appropriate Kalshi
-    client, and dispatches to _run_dev (sandbox simulation) or _run_prod (real
-    account trading) with both. Exits the process via sys.exit() with the
-    dispatched run's return code (see the EXIT_* constants in config.py,
-    BS-14) so a caller that only sees the process exit status — the
-    scheduler, which runs this as a subprocess — can distinguish a clean run
-    from a low-balance skip or a run with trades needing manual review. An
-    unhandled exception is not caught here and propagates to the normal
-    interpreter exit code 1.
+    --max-horizon-days, and the "live trading toggles" group), exits 2 if
+    config.ORDER_API_VERSION is not "v2" (config.order_api_version_error),
+    checks --max-horizon-days, resolves the run's settings and config.py's
+    reference (_resolve_live_settings) — all before logging is configured or
+    any request is made — then configures logging, builds the Kalshi client
+    and runs _run_dev (sandbox simulation) or _run_prod (real trading). Ends
+    with sys.exit() and the run's return code (the EXIT_* constants in
+    config.py), which the scheduler reads. An unhandled exception propagates
+    and exits 1.
 
     Returns:
         None: This function never returns to its caller — it always ends by
@@ -1317,6 +1302,11 @@ def main() -> None:
         help="Trade any tag this run, whatever config.TRADE_TAGS says",
     )
     args = parser.parse_args()
+    # Exit 2 unless ORDER_API_VERSION is "v2", before anything is logged, a
+    # client is built or an order could be sent
+    problem = order_api_version_error()
+    if problem:
+        parser.error(problem)
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
         parser.error("--max-horizon-days must be a positive integer")
     # Validated BEFORE logging is configured (TS-20): a bad flag or config.py
