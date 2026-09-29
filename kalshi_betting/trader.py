@@ -1565,7 +1565,9 @@ def pre_execution_check(client: Any, portfolio: list, *,
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         portfolio (list): List of TradeSpec objects selected by select_portfolio().
-        settings (LiveSettings | None): Keyword-only; the run's toggles. None reads config.py's.
+        settings (LiveSettings | None): Keyword-only; the run's toggles. None
+            reads config.py's (tests and direct calls only: a live run always
+            hands the run's, built from the saved live defaults).
 
     Returns:
         list: Filtered list of TradeSpec objects that still pass the price check.
@@ -1577,7 +1579,8 @@ def pre_execution_check(client: Any, portfolio: list, *,
     if not portfolio:
         return []
 
-    # One rule for every spec's re-check: the run's LiveSettings, or config's
+    # One rule for every spec's re-check: the run's LiveSettings, or config.py's
+    # for a caller that hands none
     settings = live_settings() if settings is None else settings
 
     valid = []

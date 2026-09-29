@@ -24,20 +24,26 @@ Purpose:
     config.ORDER_API_VERSION is not "v2" (config.order_api_version_error),
     before logging is configured.
 
-    The live toggles are config.py's, each overridable for one run by a flag
-    of the "live trading toggles" group. _resolve_live_settings builds the
-    run's one config.LiveSettings before logging is configured (a bad value
-    exits 2); each run mode logs it (_log_live_settings) and hands it to
-    every live site. The scheduler passes no toggle flag. Two pair-list
-    filters run between the finders and enrichment: _dedup_pairs and
-    _filter_by_category.
+    The live toggles are the saved live defaults (config.LIVE_DEFAULTS_FILE,
+    live_defaults.json, saved through python3 -m kalshi_betting.defaults_server),
+    each overridable for one run by a flag of the "live trading toggles"
+    group. _resolve_live_settings reads them once and builds the run's one
+    config.LiveSettings before logging is configured: with no file saved, a
+    refused file or a bad flag, the run exits 2 before anything is logged or
+    requested, and it never falls back to config.py's toggle constants. Each
+    run mode logs where the defaults came from and the run's settings
+    (_log_live_settings) and hands them to every live site. The scheduler
+    passes no toggle flag. Two pair-list filters run between the finders and
+    enrichment: _dedup_pairs and _filter_by_category.
 
 Dependencies:
     Imports from auth.py (client construction and auth verification), config.py
     (balance threshold, exit-code contract, the order-path check
     order_api_version_error, the same-title threshold and
     close-gap bound, file paths, and the live toggles: LiveSettings,
-    live_settings, the describe_* helpers, live_rule_warnings, SIZE_CAP_STEP),
+    live_defaults with its LiveDefaultsError / LiveDefaultsMissing refusals
+    and LIVE_DEFAULTS_FROM_CONFIG, live_settings (the no-settings fallback),
+    the describe_* helpers, live_rule_warnings, SIZE_CAP_STEP),
     historical.py (load_series_categories, series_labels, infer_category —
     the dashboard's filing rule, which _filter_by_category shares),
     reporter.py (Excel output), scanner.py (market fetching, pair detection,
@@ -87,15 +93,19 @@ from .config import (
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
+    LIVE_DEFAULTS_FROM_CONFIG,
     MIN_BALANCE_CENTS,
     PROJECT_ROOT,
     SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
     SAME_TITLE_MIN_PRICE_DIFF,
     SIZE_CAP_STEP,
+    LiveDefaultsError,
+    LiveDefaultsMissing,
     LiveSettings,
     describe_live_settings,
     describe_time_series_rule,
     describe_trade_filter,
+    live_defaults,
     live_rule_warnings,
     live_settings,
     order_api_version_error,
@@ -643,32 +653,39 @@ _LIVE_PERCENT_FLAGS = frozenset({"size_cap", "same_title_size_cap"})
 
 def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     """
-    Resolve this run's LiveSettings, and config.py's to compare it against.
+    Resolve this run's LiveSettings: the saved live defaults, with each given flag laid over.
 
-    The run's settings are config.py's (read at call time) with each GIVEN
-    toggle flag replacing its field; LiveSettings validates the result
-    (dataclasses.replace re-runs __post_init__), so a flag meets config.py's
-    rule. Called before logging is configured (TS-20); the one live function
-    that calls config.live_settings() unconditionally (the AST pin
-    test_ast_live_path_reads_toggles_only_through_live_settings).
+    The run's one read of the defaults (config.live_defaults, the one caller
+    the AST pin test_ast_live_path_reads_toggles_only_through_live_settings
+    allows); exits 2 when none are saved or the file is refused. There is no
+    fallback to config.py's toggle constants. LiveSettings validates the
+    result (dataclasses.replace re-runs __post_init__), so a flag meets the
+    same rule a saved value does; the result keeps the defaults' origin.
+    Called before logging is configured, so a refusal logs nothing and makes
+    no request.
 
     Args:
         args (argparse.Namespace): The parsed flags; a missing attribute reads
             as not given.
-        parser (argparse.ArgumentParser): Used to report an invalid value.
+        parser (argparse.ArgumentParser): Used to report a refusal.
 
     Returns:
-        tuple[LiveSettings, LiveSettings]: (this run's settings, config.py's),
-            equal when no toggle flag was given.
+        tuple[LiveSettings, LiveSettings]: (this run's settings, the saved
+            defaults they were built from), equal when no toggle flag was given.
 
     Raises:
-        SystemExit: Status 2 (parser.error) on an invalid config.py value or flag.
+        SystemExit: Status 2 (parser.error) when no live defaults are saved,
+            the saved file is refused, or a flag's value is invalid.
     """
     try:
-        # config.py's toggles: the reference, and the base the flags lay over
-        reference = live_settings()
-    except ValueError as exc:
-        parser.error(f"config.py's live settings are invalid: {exc}")
+        # The saved live defaults: the reference, and the base the flags lay over.
+        # There is no fallback: with none saved, the run does not start
+        reference = live_defaults()
+    except LiveDefaultsMissing as exc:
+        parser.error(str(exc))
+    except LiveDefaultsError as exc:
+        parser.error(f"the saved live defaults are refused (fix the file, or save new "
+                     f"ones through python3 -m kalshi_betting.defaults_server): {exc}")
     overrides: dict = {}
     if getattr(args, "tier_floors", None) is not None:
         overrides["tier_floors"] = args.tier_floors
@@ -683,7 +700,7 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     if getattr(args, "same_title_size_cap", None) is not None:
         overrides["same_title_size_cap"] = args.same_title_size_cap / 100
     # --category / --tag (repeatable) set the filter; --any-category / --any-tag
-    # clear config.py's (argparse keeps each pair mutually exclusive)
+    # clear the saved one (argparse keeps each pair mutually exclusive)
     if getattr(args, "category", None) is not None:
         overrides["categories"] = tuple(args.category)
     elif getattr(args, "any_category", None):
@@ -715,25 +732,39 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
 def _log_live_settings(settings: LiveSettings, reference: LiveSettings, *,
                        real_money: bool) -> None:
     """
-    Log the run's toggles, any departure from config.py, and every live_rule_warnings line.
+    Log the run's defaults' origin, its toggles, any departure, and every rule warning.
 
-    One INFO line marks each field that departs from reference "(config: X)";
-    only a real-money run WARNs on a departure. Resolves neither object itself
-    (TestLiveSettingsReachEverySite).
+    One INFO line names the defaults' origin (the saved file, when and from
+    what it was saved). One INFO line marks each field that departs from
+    reference: "(default: X)" when reference is the saved live defaults, as a
+    live run's always is, "(config: X)" when it was built from config.py's
+    constants (a reference a test or direct call builds, e.g. with
+    config.live_settings()). Only a real-money run WARNs on a departure.
+    Resolves neither object itself (TestLiveSettingsReachEverySite).
 
     Args:
         settings (LiveSettings): The run's toggles.
-        reference (LiveSettings): config.py's toggles (the run's own when a
-            run mode was handed none, which marks nothing).
+        reference (LiveSettings): The defaults the run's toggles were built
+            from (the run's own when a run mode was handed none, which marks
+            nothing).
         real_money (bool): True for a prod run that submits orders.
     """
-    # Every field, with a "(config: X)" mark on each one a flag moved
+    # Where the defaults came from: the saved file, when and from what
+    logging.info("Live defaults: %s", reference.origin)
+    # Every field, with a mark on each one a flag moved: "(default: X)" (the
+    # saved defaults), or "(config: X)" for a reference built from config.py
     logging.info("Live settings: %s", describe_live_settings(settings, reference))
     if real_money and settings != reference:
-        logging.warning(
-            "This PRODUCTION run overrides config.py's live settings (see the "
-            "\"(config: …)\" marks on the line above): its trades follow the "
-            "flags, not the committed configuration")
+        if reference.origin == LIVE_DEFAULTS_FROM_CONFIG:
+            logging.warning(
+                "This PRODUCTION run overrides config.py's live settings (see the "
+                "\"(config: …)\" marks on the line above): its trades follow the "
+                "flags, not the committed configuration")
+        else:
+            logging.warning(
+                "This PRODUCTION run overrides the saved live defaults (see the "
+                "\"(default: …)\" marks on the line above): its trades follow the "
+                "flags, not the saved defaults")
     # A setting that empties part of the strategy or lifts one pair's stake
     for text in live_rule_warnings(settings):
         logging.warning("Live settings: %s", text)
@@ -755,8 +786,11 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
             auth.build_client("dev").
         args: Parsed argparse Namespace with sandbox_balance and
             max_horizon_days attributes.
-        settings (LiveSettings | None): The run's toggles; None resolves config.py's.
-        reference (LiveSettings | None): config.py's toggles; None means the run's own.
+        settings (LiveSettings | None): The run's toggles; None resolves
+            config.py's (tests and direct calls only: main() always hands the
+            run's, built from the saved live defaults).
+        reference (LiveSettings | None): The saved live defaults the run's
+            toggles were built from; None means the run's own.
 
     Returns:
         int: EXIT_NO_TRADEABLE_SHARDS when the run was blind — every
@@ -912,9 +946,12 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             auth.build_client("prod").
         args: Parsed argparse Namespace with dry_run and max_horizon_days
             attributes.
-        settings (LiveSettings | None): The run's toggles; None resolves config.py's.
-        reference (LiveSettings | None): config.py's toggles, which departures
-            are marked against; None means the run's own.
+        settings (LiveSettings | None): The run's toggles; None resolves
+            config.py's (tests and direct calls only: main() always hands the
+            run's, built from the saved live defaults).
+        reference (LiveSettings | None): The saved live defaults the run's
+            toggles were built from, which departures are marked against;
+            None means the run's own.
 
     Returns:
         int: EXIT_SKIPPED_LOW_BALANCE if the run was skipped because the
@@ -1102,11 +1139,14 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     try:
         # append_to_prod_log() already logs "Trade log updated: %s (%d new row(s))"
         # itself (BS-26) — don't duplicate that line here. The note marks the
-        # toggles a flag moved, so the workbook tells rows traded under a flag
-        # from rows traded under config.py's values
+        # toggles a flag moved and names the saved defaults the run started
+        # from, so the workbook tells rows traded under a flag from rows traded
+        # under the defaults, and one set of saved defaults from the next
         append_to_prod_log(
             results, balance_cents / 100, balance_after,
-            run_note=f"settings: {describe_live_settings(settings, reference)}",
+            run_note=(f"settings: {describe_live_settings(settings, reference)}"
+                      + ("" if reference.origin == LIVE_DEFAULTS_FROM_CONFIG
+                         else f" | defaults: {reference.origin}")),
         )
     except Exception as exc:
         logging.critical("Failed to write trade log: %s — rescue dump follows", exc)
@@ -1206,13 +1246,14 @@ def main() -> None:
     Parses command-line arguments (--mode, --dry-run, --sandbox-balance,
     --max-horizon-days, and the "live trading toggles" group), exits 2 if
     config.ORDER_API_VERSION is not "v2" (config.order_api_version_error),
-    checks --max-horizon-days, resolves the run's settings and config.py's
-    reference (_resolve_live_settings) — all before logging is configured or
-    any request is made — then configures logging, builds the Kalshi client
-    and runs _run_dev (sandbox simulation) or _run_prod (real trading). Ends
-    with sys.exit() and the run's return code (the EXIT_* constants in
-    config.py), which the scheduler reads. An unhandled exception propagates
-    and exits 1.
+    checks --max-horizon-days, resolves the run's settings and the saved live
+    defaults they were built from (_resolve_live_settings: with no defaults
+    saved, a refused file or a bad flag it exits 2) — all before logging is
+    configured or any request is made — then configures logging, builds the
+    Kalshi client and runs _run_dev (sandbox simulation) or _run_prod (real
+    trading). Ends with sys.exit() and the run's return code (the EXIT_*
+    constants in config.py), which the scheduler reads. An unhandled exception
+    propagates and exits 1.
 
     Returns:
         None: This function never returns to its caller — it always ends by
@@ -1247,41 +1288,43 @@ def main() -> None:
     # values — no choices, range check or literal here
     live = parser.add_argument_group(
         "live trading toggles",
-        "Override one config.py setting for THIS run only, in either mode. The weekly "
-        "scheduler passes none of these, so a scheduled run trades exactly config.py.",
+        "Override one live default for THIS run only, in either mode. The live defaults "
+        "are the ones saved through python3 -m kalshi_betting.defaults_server "
+        "(live_defaults.json); a run refuses to start without them. The weekly scheduler "
+        "passes none of these flags, so a scheduled run trades exactly the saved defaults.",
     )
     live.add_argument(
         "--tier-floors", action=argparse.BooleanOptionalAction, default=None,
         help="Apply (or, with --no-tier-floors, drop) the deadline-gap tier floors on "
-             "time-series pairs (default: config.TIME_SERIES_TIER_FLOORS)",
+             "time-series pairs (default: the saved live defaults)",
     )
     live.add_argument(
         "--spread-min", type=float, default=None, metavar="X",
         help="Time-series spread-band FLOOR on pB - pA, 0-1 "
-             "(default: config.TIME_SERIES_SPREAD_BAND's floor)",
+             "(default: the saved live defaults)",
     )
     live.add_argument(
         "--spread-max", type=float, default=None, metavar="Y",
         help="Time-series spread-band CEILING on pB - pA, 0-1 "
-             "(default: config.TIME_SERIES_SPREAD_BAND's ceiling)",
+             "(default: the saved live defaults)",
     )
     live.add_argument(
         "--interval-discount", type=float, default=None, metavar="K",
         help="Time-series interval discount k, in (0, 1] "
-             "(default: config.TIME_SERIES_INTERVAL_PROB_DISCOUNT)",
+             "(default: the saved live defaults)",
     )
     # The caps' grid step in percent (SIZE_CAP_STEP); argparse %-formats help, hence "%%"
     cap_step = f"{SIZE_CAP_STEP * 100:g}"
     live.add_argument(
         "--size-cap", type=int, default=None, metavar="PCT",
         help=f"Per-trade Kelly cap for every pair, in whole percent, in {cap_step}%% "
-             "steps; 100 = no cap (default: config.BUDGET_FRACTION)",
+             "steps; 100 = no cap (default: the saved live defaults)",
     )
     live.add_argument(
         "--same-title-size-cap", type=int, default=None, metavar="PCT",
         help=f"Extra per-trade cap on same-title pairs, in whole percent, in {cap_step}%% "
              "steps; 100 = no extra cap beyond --size-cap "
-             "(default: config.SAME_TITLE_SIZE_CAP)",
+             "(default: the saved live defaults)",
     )
     # Filed as the backtest dashboard files a trade (_filter_by_category)
     categories = live.add_mutually_exclusive_group()
@@ -1289,11 +1332,11 @@ def main() -> None:
         "--category", action="append", default=None, metavar="NAME",
         help="Trade only pairs filed under this Kalshi category, as the backtest "
              "dashboard's Category select names it (repeatable; case-insensitive; "
-             "default: config.TRADE_CATEGORIES)",
+             "default: the saved live defaults)",
     )
     categories.add_argument(
         "--any-category", action="store_true", default=None,
-        help="Trade any category this run, whatever config.TRADE_CATEGORIES says",
+        help="Trade any category this run, whatever the saved live defaults say",
     )
     tags = live.add_mutually_exclusive_group()
     tags.add_argument(
@@ -1301,11 +1344,11 @@ def main() -> None:
         help="Trade only pairs whose series' FIRST Kalshi tag is NAME, under ANY "
              "category unless --category narrows it: the backtest dashboard's Tag "
              "option \"C · T\" is --category C --tag T (repeatable; case-insensitive; "
-             "combined with --category by AND; default: config.TRADE_TAGS)",
+             "combined with --category by AND; default: the saved live defaults)",
     )
     tags.add_argument(
         "--any-tag", action="store_true", default=None,
-        help="Trade any tag this run, whatever config.TRADE_TAGS says",
+        help="Trade any tag this run, whatever the saved live defaults say",
     )
     args = parser.parse_args()
     # Exit 2 unless ORDER_API_VERSION is "v2", before anything is logged, a
@@ -1315,8 +1358,8 @@ def main() -> None:
         parser.error(problem)
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
         parser.error("--max-horizon-days must be a positive integer")
-    # Validated BEFORE logging is configured (TS-20): a bad flag or config.py
-    # value exits 2 with nothing logged or requested
+    # Read and validated BEFORE logging is configured: no saved live defaults,
+    # a refused file or a bad flag exits 2 with nothing logged or requested
     settings, reference = _resolve_live_settings(args, parser)
 
     # Echo to the console (foreground/interactive runs) as well as the
@@ -1345,7 +1388,8 @@ def main() -> None:
 
     client = build_client(args.mode)  # returns KalshiClient authenticated via RSA key from secrets.json
 
-    # Both run modes get the run's settings and config.py's reference
+    # Both run modes get the run's settings and the saved defaults they were
+    # built from
     if args.mode == "dev":
         code = _run_dev(client, args, settings, reference)
     else:

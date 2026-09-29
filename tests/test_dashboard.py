@@ -2093,10 +2093,12 @@ class TestRunSettingsHeader:
 
 
 class TestLiveRuleHeader:
-    """dashboard._live_rule_html(sweep, bar=...): config.py's own live rule, as
-    run_backtest_sweep read it before its fetch, and where this page shows it
+    """dashboard._live_rule_html(sweep, bar=...): the saved live defaults' rule,
+    as run_backtest_sweep read it before its fetch, and where this page shows it
     (backtester._live_rule_view's verdict, in the filter bar's option texts),
-    on a <p> of its own: _run_settings_html's exact "</p>" suffix is pinned."""
+    on a <p> of its own: _run_settings_html's exact "</p>" suffix is pinned.
+    When the saved k or caps are not the run's own, it says so and how the
+    filter bar shows them."""
 
     _P = '<p style="color:#616161; font-size:14px;">'
     _CAP = "same-title trades capped at the size cap shown, like every pair (20% at this run's own cap)"
@@ -2106,8 +2108,12 @@ class TestLiveRuleHeader:
                primary_band=(0.0, 1.0), size_cap=0.2, same_title_size_cap=1.0,
                calibrations_by_band=None, tier_off_calibrations_by_band=None,
                tier_off_scenarios=None, live_categories=None, live_tags=None,
-               same_event_ladders=None, config_same_event_ladders=None) -> BacktestSweep:
+               same_event_ladders=None, config_same_event_ladders=None,
+               live_sizing=(None, None, None)) -> BacktestSweep:
+        """A sweep at k 0.75 recording these live_* fields; live_sizing is the
+        saved defaults' (k, per-trade cap, same-title cap), unrecorded by default."""
         pt = dataclasses.replace(_scn_point(primary_band, 0.75), size_cap=size_cap)
+        live_k, live_cap, live_st = live_sizing
         return BacktestSweep(
             primary=pt, points=[pt], calibration=None,
             calibrations_by_band=(calibrations_by_band if calibrations_by_band is not None
@@ -2119,15 +2125,43 @@ class TestLiveRuleHeader:
             config_same_event_ladders=config_same_event_ladders,
             live_tier_floors=live_tier_floors, live_spread_band=live_spread_band,
             live_categories=live_categories, live_tags=live_tags,
+            live_interval_discount=live_k, live_size_cap=live_cap,
+            live_same_title_size_cap=live_st,
         )
 
     @staticmethod
     def _bar(bands=((0.0, 1.0),), primary=(0.0, 1.0), off=True, categories=(),
-             subcats=()) -> dict:
-        """The base-block keys _live_rule_html reads, labelled as _filter_payload labels them."""
+             subcats=(), ks=(0.75,), caps=(0.2,), off_caps=None) -> dict:
+        """The base-block keys _live_rule_html reads, labelled as _filter_payload labels
+        them; the primary k and cap are the first of each. Every tier-on cell holds a
+        chunk; with the tiers off only the caps in off_caps do (every cap when None),
+        as on a page that could not read a tier-floors-off size-cap sweep."""
         def mark(b):
             return " (primary)" if b == primary else ""
+
+        def grid(cap_held):
+            """
+            A [band][k][cap] grid of chunk ids, shaped as _filter_payload ships one.
+
+            Args:
+                cap_held (Callable[[float], bool]): Whether a cell at this cap holds
+                    a chunk; a cell that does not is None, as the bar ships one the
+                    run never simulated.
+
+            Returns:
+                list: The grid.
+            """
+            return [[[f"chunk-{bi}-{ki}-{ci}" if cap_held(c) else None
+                      for ci, c in enumerate(caps)] for ki in range(len(ks))]
+                    for bi in range(len(bands))]
+
         return {
+            "grid": grid(lambda c: True),
+            "grid_off": None if not off else grid(
+                lambda c: off_caps is None or c in off_caps),
+            "ks": [{"label": dashboard._k_option(k), "value": k} for k in ks],
+            "caps": [{"label": dashboard._cap_option(c), "value": c} for c in caps],
+            "primary": [list(bands).index(primary) if primary in bands else 0, 0, 0],
             "bands": [{"label": dashboard._band_option(b),
                        "option": dashboard._band_option(b) + mark(b)} for b in bands],
             "bands_off": None if not off else [
@@ -2146,15 +2180,16 @@ class TestLiveRuleHeader:
 
     def test_no_sweep_is_not_recorded(self):
         assert dashboard._live_rule_html(None, bar=None) == (
-            self._P + "Live rule (config.py): not recorded</p>")
+            self._P + "Live rule: not recorded</p>")
 
     @pytest.mark.parametrize("live_tier_floors, live_spread_band",
                              [(None, (0.0, 1.0)), (True, None), (None, None)])
-    def test_either_unrecorded_field_is_not_recorded(self, live_tier_floors, live_spread_band):
+    def test_either_unrecorded_field_is_none_recorded(self, live_tier_floors, live_spread_band):
         sweep = self._sweep(live_tier_floors=live_tier_floors,
                             live_spread_band=live_spread_band)
         assert dashboard._live_rule_html(sweep, bar=self._bar()) == (
-            self._P + "Live rule (config.py): not recorded</p>")
+            self._P + "Live rule: none recorded — no usable live defaults were saved when "
+            "this run started, and live runs refuse to start without them</p>")
 
     # ── The primary scenario ────────────────────────────────────────────────
 
@@ -2163,20 +2198,20 @@ class TestLiveRuleHeader:
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
         # The page as rendered IS the primary scenario: no bar needed
         assert self._text(self._sweep(), self._bar() if bar else None) == (
-            f"Live rule (config.py): {rule}; {self._CAP} — this run's primary")
+            f"Live rule (saved live defaults): {rule}; {self._CAP} — this run's primary")
 
     def test_the_primary_is_matched_by_its_own_band(self):
         rule = config.describe_time_series_rule(True, (0.3, 0.6))
         sweep = self._sweep(live_spread_band=(0.3, 0.6), primary_band=(0.3, 0.6))
         assert self._text(sweep, self._bar(bands=[(0.3, 0.6)], primary=(0.3, 0.6))) == (
-            f"Live rule (config.py): {rule}; {self._CAP} — this run's primary")
+            f"Live rule (saved live defaults): {rule}; {self._CAP} — this run's primary")
         # ... so a live band equal to the DEFAULT band is elsewhere on it
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
         sweep = self._sweep(live_spread_band=(0.0, 1.0), primary_band=(0.3, 0.6),
                             calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
         bar = self._bar(bands=[(0.0, 1.0), (0.3, 0.6)], primary=(0.3, 0.6))
         assert self._text(sweep, bar) == (
-            f"Live rule (config.py): {rule}; {self._CAP} — choose Spread band "
+            f"Live rule (saved live defaults): {rule}; {self._CAP} — choose Spread band "
             "max(tier,0)-1 and Tier floors on in the filter bar")
 
     # ── Elsewhere on the grid, named as the bar names it ────────────────────
@@ -2187,7 +2222,7 @@ class TestLiveRuleHeader:
                             calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
         bar = self._bar(bands=[(0.0, 1.0), (0.3, 0.6)])
         assert self._text(sweep, bar) == (
-            f"Live rule (config.py): {rule}; {self._CAP} — choose Spread band "
+            f"Live rule (saved live defaults): {rule}; {self._CAP} — choose Spread band "
             "max(tier,0.3)-0.6 and Tier floors on in the filter bar")
         assert "max(tier,0.3)-0.6" in [e["option"] for e in bar["bands"]]
 
@@ -2201,7 +2236,7 @@ class TestLiveRuleHeader:
                             tier_off_scenarios=[object()])
         bar = self._bar(bands=[(0.0, 0.5), (0.0, 1.0)])
         assert self._text(sweep, bar) == (
-            f"Live rule (config.py): {rule}; {self._CAP} — choose Tier floors off and "
+            f"Live rule (saved live defaults): {rule}; {self._CAP} — choose Tier floors off and "
             "Spread band 0-0.5 in the filter bar")
         # ... and at the primary band, its tier-off option carries the mark
         sweep = self._sweep(live_tier_floors=False, live_spread_band=(0.0, 1.0),
@@ -2291,6 +2326,126 @@ class TestLiveRuleHeader:
         sweep = self._sweep(size_cap=size_cap, same_title_size_cap=st_cap)
         assert f"; {clause} — this run's primary" in self._text(sweep, self._bar())
 
+    # ── The saved defaults' own sizing ──────────────────────────────────────
+
+    # The run's own sizing, as _sweep records it: k 0.75, a 20% cap, no extra
+    # same-title cap
+    _RUN_SIZING = "k 0.75, per-trade cap 20% and same-title cap 100% (no extra cap)"
+
+    def test_no_sizing_note_when_the_saved_sizing_is_the_runs(self):
+        for live_sizing in ((0.75, 0.2, 1.0), (None, None, None), (0.8, None, 1.0)):
+            text = self._text(self._sweep(live_sizing=live_sizing),
+                              self._bar(ks=(0.75, 0.8)))
+            assert text.endswith("— this run's primary"), (live_sizing, text)
+
+    def test_a_bar_offering_the_saved_sizing_names_its_options(self):
+        sweep = self._sweep(live_sizing=(0.8, 0.1, 1.0))
+        bar = self._bar(ks=(0.75, 0.8), caps=(0.2, 0.1))
+        assert self._text(sweep, bar).endswith(
+            "— this run's primary; the live defaults size at k 0.8, per-trade cap 10% and "
+            f"same-title cap 100% (no extra cap), where this run's primary sized at "
+            f"{self._RUN_SIZING}; choose {dashboard._k_option(0.8)} and Size cap 10% in the "
+            "filter bar to see it")
+
+    def test_an_offered_primary_option_is_named_as_the_bar_shows_it(self):
+        # The saved k is the run's own, the cap is not: the k option is the primary's
+        sweep = self._sweep(live_sizing=(0.75, 0.1, 1.0))
+        text = self._text(sweep, self._bar(ks=(0.75, 0.8), caps=(0.2, 0.1)))
+        assert text.endswith(f"; choose {dashboard._k_option(0.75)} (primary) and Size cap "
+                             "10% in the filter bar to see it")
+
+    @pytest.mark.parametrize("ks, caps, live_st, clause", [
+        ((0.75,), (0.2, 0.1), 1.0,
+         "this page's filter bar does not offer k = 0.80"),
+        ((0.75, 0.8), (0.2,), 1.0,
+         "this page's filter bar does not offer size cap 10%"),
+        ((0.75,), (0.2,), 1.0,
+         "this page's filter bar does not offer k = 0.80 or size cap 10%"),
+        ((0.75, 0.8), (0.2, 0.1), 0.2,
+         "the same-title cap is not a filter-bar choice"),
+        ((0.75,), (0.2, 0.1), 0.2,
+         "this page's filter bar does not offer k = 0.80, and the same-title cap is not "
+         "a filter-bar choice"),
+    ])
+    def test_what_the_bar_cannot_show_is_named(self, ks, caps, live_st, clause):
+        assert dashboard._k_option(0.8) == "k = 0.80"
+        sweep = self._sweep(live_sizing=(0.8, 0.1, live_st))
+        text = self._text(sweep, self._bar(ks=ks, caps=caps))
+        assert text.endswith(f"where this run's primary sized at {self._RUN_SIZING}; "
+                             f"{clause}"), text
+
+    def test_only_the_same_title_cap_differing_is_named(self):
+        # k and the per-trade cap are the run's own: the bar shows those already
+        sweep = self._sweep(live_sizing=(0.75, 0.2, 0.2))
+        assert self._text(sweep, self._bar()).endswith(
+            "; the live defaults size at k 0.75, per-trade cap 20% and same-title cap 20%, "
+            f"where this run's primary sized at {self._RUN_SIZING}; the same-title cap is "
+            "not a filter-bar choice")
+
+    def test_without_a_bar_the_saved_sizing_is_not_shown(self):
+        sweep = self._sweep(live_sizing=(0.8, 0.1, 1.0))
+        assert self._text(sweep, None).endswith(
+            f"where this run's primary sized at {self._RUN_SIZING}; this page's filter bar "
+            "could not be built, so it does not show that sizing")
+
+    # The note as _live_sizing_note words a seed-like saved sizing against _sweep's run
+    _NOTE = ("; the live defaults size at k 0.8, per-trade cap 10% and same-title cap "
+             "100% (no extra cap), where this run's primary sized at k 0.75, per-trade cap "
+             "20% and same-title cap 100% (no extra cap)")
+
+    def test_the_note_follows_every_verdict(self):
+        # Not simulated, and a grid cell elsewhere: the note closes the line either way
+        assert self._NOTE.endswith(self._RUN_SIZING)
+        sweep = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1, 1.0),
+                            calibrations_by_band={(0.0, 1.0): None})
+        assert self._text(sweep, self._bar()).endswith(
+            f"— not simulated by this run{self._NOTE}")
+        sweep = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1, 1.0),
+                            calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
+        bar = self._bar(bands=[(0.0, 1.0), (0.3, 0.6)], ks=(0.75, 0.8), caps=(0.2, 0.1))
+        assert self._text(sweep, bar).endswith(
+            f"Tier floors on in the filter bar{self._NOTE}; choose k = 0.80 and Size cap 10% "
+            "in the filter bar to see it")
+
+    def test_a_page_that_does_not_show_the_rule_never_offers_its_sizing(self):
+        # A bar that offers the saved k and cap still cannot show a rule the run never
+        # simulated, or one at a band the bar does not offer: no "choose ..." clause
+        bar = self._bar(ks=(0.75, 0.8), caps=(0.2, 0.1))
+        not_simulated = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1, 1.0),
+                                    calibrations_by_band={(0.0, 1.0): None})
+        assert self._text(not_simulated, bar).endswith(
+            f"— not simulated by this run{self._NOTE}")
+        not_offered = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1, 1.0),
+                                  calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
+        assert self._text(not_offered, bar).endswith(
+            "— not shown: this page's filter bar does not offer that scenario"
+            f"{self._NOTE}")
+        not_built = self._sweep(live_spread_band=(0.3, 0.6), live_sizing=(0.8, 0.1, 1.0),
+                                calibrations_by_band={(0.0, 1.0): None, (0.3, 0.6): None})
+        assert self._text(not_built, None).endswith(
+            f"— not shown: this page's filter bar could not be built{self._NOTE}")
+
+    def test_a_tier_off_cell_the_page_does_not_hold_is_named(self):
+        # Tiers off at a binding band, on a page holding tier-off cells at its own cap
+        # only (no tier-floors-off size-cap sweep to read): the saved 10% cap is on the
+        # bar, but its tier-off view there is the "missing" template
+        band = (0.0, 0.5)
+        sweep = self._sweep(live_tier_floors=False, live_spread_band=band,
+                            live_sizing=(0.8, 0.1, 1.0),
+                            calibrations_by_band={(0.0, 1.0): None, band: None},
+                            tier_off_calibrations_by_band={(0.0, 1.0): None, band: None},
+                            tier_off_scenarios=[object()])
+        bar = self._bar(bands=[band, (0.0, 1.0)], ks=(0.75, 0.8), caps=(0.2, 0.1),
+                        off_caps=(0.2,))
+        assert self._text(sweep, bar).endswith(
+            f"Spread band 0-0.5 in the filter bar{self._NOTE}; this page's filter bar offers "
+            "k = 0.80 and Size cap 10% but holds no scenario of the live rule there")
+        # ... and with a tier-off cell at every cap, it is chosen like any other
+        bar = self._bar(bands=[band, (0.0, 1.0)], ks=(0.75, 0.8), caps=(0.2, 0.1))
+        assert self._text(sweep, bar).endswith(
+            f"Spread band 0-0.5 in the filter bar{self._NOTE}; choose k = 0.80 and Size cap "
+            "10% in the filter bar to see it")
+
     # ── The category/tag filter ─────────────────────────────────────────────
 
     _CATS = ("Economics", "Oil & Gas", "Sports")
@@ -2322,7 +2477,7 @@ class TestLiveRuleHeader:
         text = self._filtered(categories, tags)
         words = backtester._live_filter_text(categories, tags)
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
-        assert text == (f"Live rule (config.py): {rule}; category/tag filter "
+        assert text == (f"Live rule (saved live defaults): {rule}; category/tag filter "
                         f"({html.escape(words, quote=False)}); {self._CAP} — {tail}")
 
     def test_a_filter_on_a_grid_cell_follows_its_band_choice(self):
@@ -2423,7 +2578,7 @@ class TestEntryCheckpointHeader:
                 < page.index("Entry checkpoint:") < page.index("Portfolio Performance"))
         assert re.search(
             r"\(size-cap sweep [^<]*\)</p>\n"
-            r"<p [^>]*>Live rule \(config\.py\):[^\n]*</p>\n"
+            r"<p [^>]*>Live rule: none recorded[^\n]*</p>\n"
             rf'<p style="color:#616161; font-size:14px;">{re.escape(self._RECORDED)}\n'
             r"<p [^>]*>Risk-free rate[^\n]*</p>\n"
             r"<p [^>]*>Outcome-label coverage for this run is below the floor",
@@ -3318,8 +3473,8 @@ class TestScenarioExplorerTierFloors:
                 "still apply.") in lead
         assert dashboard._TIER_FLOORS == (
             f"{config.MIN_PRICE_DIFF_SHORT_GAP:.2f}/{config.MIN_PRICE_DIFF_LONG_GAP:.2f}")
-        assert ("Live trading follows config.TIME_SERIES_TIER_FLOORS (main.py "
-                "--tier-floors / --no-tier-floors for one run).") in lead
+        assert ("Live trading follows the saved live defaults' tier floors (main.py "
+                "--tier-floors / --no-tier-floors overrides them for one run).") in lead
 
     def test_the_data_blocks_ship_each_off_cell_once(self):
         # (#68's test_the_data_block_ships_each_off_cell_once, over the base
@@ -4171,8 +4326,8 @@ class TestFilterPayloadTierOff:
             f"on — a time-series pair needs pB − pA of at least {short:.2f} when its "
             f"deadlines are up to {near} days apart and {long_:.2f} for {near + 1}–{cap} "
             "days, and at least the band's floor; off — the band's floor alone (the spread "
-            "must still be positive); live trading follows config.TIME_SERIES_TIER_FLOORS "
-            "(main.py --tier-floors / --no-tier-floors for one run).")
+            "must still be positive); live trading follows the saved live defaults' tier "
+            "floors (main.py --tier-floors / --no-tier-floors overrides them for one run).")
         assert dashboard._KHAT_TEXT["khat_scope_tier_off"] == (
             f"{{scope}}, with the {short:.2f}/{long_:.2f} tier floors off")
 
@@ -9596,7 +9751,7 @@ class TestRiskFreeHeader:
         kwargs = {} if risk_free is None else {"risk_free": risk_free}
         page = TestRunSettingsHeader._page(monkeypatch, tmp_path, **kwargs)
         assert (page.index("Period:") < page.index("Primary spread band:")
-                < page.index("Live rule (config.py)")
+                < page.index('14px;">Live rule')
                 < page.index(words) < page.index("Portfolio Performance"))
         assert page.count("Risk-free rate") == 1
 

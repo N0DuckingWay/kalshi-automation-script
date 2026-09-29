@@ -46,8 +46,9 @@ Notes:
 
     append_to_prod_log's keyword-only run_note goes on the run's separator
     banner, never in a column; main._run_prod passes the run's live toggles
-    (config.describe_live_settings), with "(config: X)" after each toggle a
-    flag moved.
+    (config.describe_live_settings), with "(default: X)" after each toggle a
+    flag moved away from the saved live defaults, ending " | defaults:
+    <origin>" (which saved file, when and from what it was saved).
 """
 import fcntl
 import logging

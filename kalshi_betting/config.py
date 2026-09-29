@@ -24,8 +24,11 @@ Notes:
     The sandbox URL (demo-api.kalshi.co) requires a completely separate account
     registered at demo.kalshi.co — the production API key will return 401 there.
     The saved live defaults (LIVE_DEFAULTS_FILE, live_defaults.json in the repo
-    root) are read and written here too: read_saved_live_defaults and
-    live_defaults read the file, and save_live_defaults writes it.
+    root), which every live run starts from, are read and written here too:
+    read_saved_live_defaults and live_defaults read the file, and
+    save_live_defaults writes it. The toggle constants here are the backtest's
+    k and caps and the fallback live_settings() returns, never a live run's
+    defaults.
 """
 import fcntl
 import json
@@ -76,19 +79,20 @@ DEV_PEM_FILE = PROJECT_ROOT / "kalshi_demo_private_key.pem"
 
 # The per-trade Kelly cap for EVERY pair, as a fraction of the balance: a
 # multiple of SIZE_CAP_STEP from 5% to 100%, where 1.0 is no cap (f* <= p <= 1).
-# Live runs read it as LiveSettings.size_cap (main.py --size-cap PCT overrides it
-# for one run); backtester binds it by value at import for its eager points. At
-# 1.0, with the shipped k and SAME_TITLE_SIZE_CAP, one live pair still stakes at
-# most 20%: a time-series pair under 1 - k (max_kelly_fraction), a same-title
-# pair under SAME_TITLE_SIZE_CAP.
+# backtester binds it by value at import for its eager points, and
+# live_settings() reads it (see "Live trading toggles" below: a live run sizes
+# at the saved live defaults' size_cap instead). At 1.0, with this file's k and
+# SAME_TITLE_SIZE_CAP, one pair still stakes at most 20%: a time-series pair
+# under 1 - k (max_kelly_fraction), a same-title pair under SAME_TITLE_SIZE_CAP.
 BUDGET_FRACTION               = 1.0
 
 # An EXTRA per-trade cap on SAME-TITLE pairs, on the same grid: a same-title
 # pair is capped at min(BUDGET_FRACTION, this), a time-series pair never reads
 # it (pair_size_cap); 1.0 adds no cap. Under a BUDGET_FRACTION of 1.0 it bounds
-# a same-title pair, whose f* reaches about 0.89 on a wide divergence. Live runs
-# read it as LiveSettings.same_title_size_cap (main.py --same-title-size-cap PCT
-# overrides it); backtester binds it by value and caps through pair_size_cap.
+# a same-title pair, whose f* reaches about 0.89 on a wide divergence.
+# backtester binds it by value and caps through pair_size_cap, and
+# live_settings() reads it; a live run caps at the saved live defaults'
+# same_title_size_cap instead.
 SAME_TITLE_SIZE_CAP           = 0.20
 
 # Defensive ceiling on strategy.compute_trade's marginal-price descent. That
@@ -422,7 +426,7 @@ TIME_SERIES_SAME_EVENT_LADDERS = True
 # face value) the Kelly fraction is <= 0 for every candidate and the strategy
 # never fires; smaller values size more aggressively. Measure it against
 # settled history with `backtest.py --interval-discount K` (overrides k for
-# that backtest run only; live runs read LiveSettings.interval_discount, which
+# that backtest run only; live runs price at the saved live defaults' k, which
 # main.py --interval-discount K overrides for one run) and
 # read the dashboard's "Interval Discount (k) Calibration" section, or the
 # calibration block in kalshi_backtest.log — see CLAUDE.md, "Interval-discount
@@ -450,61 +454,72 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 #
 # Seven live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
 # TRADE_CATEGORIES and TRADE_TAGS below; k, BUDGET_FRACTION and
-# SAME_TITLE_SIZE_CAP above); no live module reads them but through LiveSettings
-# (see there). main.py's flags override them per run; scheduler.py passes none.
-# tests/test_config.py::TestShippedLiveToggles pins the values; see CLAUDE.md:
-# "The live defaults of 2026-09-27 — decision record".
+# SAME_TITLE_SIZE_CAP above). They are NOT the live defaults: a live run starts
+# only from the saved ones (LIVE_DEFAULTS_FILE, below) and never falls back to
+# these. They are the backtest's k and caps (backtester and backtest bind them
+# by value), and what live_settings() returns: the settings a live entry point
+# falls back to when a caller hands it none, which only tests and direct
+# library calls do. No live module reads them but through LiveSettings (see
+# there). tests/test_config.py::TestShippedLiveToggles pins the values; see
+# CLAUDE.md: "The live defaults of 2026-09-27 — decision record".
 
-# Whether the live time-series entry rule applies the deadline-gap tier floors
+# Whether the time-series entry rule applies the deadline-gap tier floors
 # (MIN_PRICE_DIFF_SHORT_GAP / MIN_PRICE_DIFF_LONG_GAP): True -> pB - pA must
 # clear max(tier, band floor); False -> the band floor alone, and pB - pA must
 # still be strictly positive. The floor also sets the leg-price-sum ceiling,
 # 1 - floor; at 1.0 scanner._levels_with_edge_after_fee is the edge check
 # (residual: a book that moves after validate_pair_price can still fill within
 # the FoK caps' tick of slippage per leg, and a spec whose edge is thinner than
-# that then loses in its win cells too). main.py --tier-floors /
-# --no-tier-floors overrides it for one run.
+# that then loses in its win cells too). A live run reads the saved live
+# defaults' tier_floors instead, which main.py --tier-floors / --no-tier-floors
+# overrides for one run.
 TIME_SERIES_TIER_FLOORS = False
 
-# The live time-series spread band (floor, ceiling) on pB - pA, validated like
+# The time-series spread band (floor, ceiling) on pB - pA, validated like
 # the backtest's (0 <= floor < ceiling <= 1); (0.0, 1.0) is no band. The floor
 # is layered on the tier, or stands alone with the tier floors off. A spread
 # above the ceiling is refused at scan time (the two YES asks), in enrichment
-# (the top of the refreshed book) and before submission (a fresh book).
-# main.py --spread-min / --spread-max overrides either bound for one run.
+# (the top of the refreshed book) and before submission (a fresh book). A live
+# run reads the saved live defaults' spread_band instead, and main.py
+# --spread-min / --spread-max overrides either bound of it for one run.
 TIME_SERIES_SPREAD_BAND = (0.0, 0.5)
 
-# Kalshi categories a live pair may trade in ("Economics", ...), or None for
+# Kalshi categories a pair may trade in ("Economics", ...), or None for
 # any: a non-empty tuple of names, matched case-insensitively against market A's
 # series category as the dashboard files it (historical.series_labels). Applied
 # by main._filter_by_category, which fails CLOSED (no listing to file by: no
-# trades). main.py --category NAME (repeatable) / --any-category overrides it.
+# trades). A live run reads the saved live defaults' categories instead, which
+# main.py --category NAME (repeatable) / --any-category overrides for one run.
 TRADE_CATEGORIES: tuple[str, ...] | None = None
 
-# Kalshi tags a live pair may trade in, or None for any: matched like
+# Kalshi tags a pair may trade in, or None for any: matched like
 # TRADE_CATEGORIES against the series' FIRST tag under every category, and ANDed
 # with it (so the dashboard's category-scoped Tag option "Sports · Basketball"
-# is both filters set). main.py --tag NAME (repeatable) / --any-tag overrides it.
+# is both filters set). A live run reads the saved live defaults' tags instead,
+# which main.py --tag NAME (repeatable) / --any-tag overrides for one run.
 TRADE_TAGS: tuple[str, ...] | None = None
 
-# The size caps' grid: BUDGET_FRACTION, SAME_TITLE_SIZE_CAP and main.py's
-# --size-cap / --same-title-size-cap (in percent) must each be a multiple of it
+# The size caps' grid: BUDGET_FRACTION, SAME_TITLE_SIZE_CAP, the saved live
+# defaults' two caps and main.py's --size-cap / --same-title-size-cap (in
+# percent) must each be a multiple of it
 # from 5% to 100%; LiveSettings normalises each onto a backtester.SIZE_CAP_SWEEP
 # cell (float-equal). Same value as SAME_TITLE_MIN_PRICE_DIFF, not the same
 # constant.
 SIZE_CAP_STEP = 0.05
 
 # The largest per-pair stake (max_kelly_fraction, a fraction of the balance)
-# live_rule_warnings accepts without a WARNING; this file's values stay within
-# it. It bounds no trade and is not the per-trade cap: it only decides when a
-# live run is warned.
+# live_rule_warnings accepts without a WARNING; this file's values and
+# LIVE_DEFAULTS_SEED stay within it. It bounds no trade and is not the per-trade
+# cap: it only decides when a live run is warned.
 LIVE_EXPOSURE_WARN_FRACTION = 0.20
 
 # ── Saved live defaults ───────────────────────────────────────────────────────
 
-# The saved live defaults: one JSON record of the seven live toggles, which
-# save_live_defaults writes and read_saved_live_defaults / live_defaults read
-# (LIVE_DEFAULTS_SEED holds the starting values for a first save). Read
+# The live defaults every live run starts from: one JSON record of the seven
+# live toggles, which save_live_defaults writes and read_saved_live_defaults /
+# live_defaults read (LIVE_DEFAULTS_SEED holds the starting values for a first
+# save). A live run refuses to start without it; it never falls back to the
+# toggle constants above. main.py's flags still override it for one run. Read
 # at call time through this module's global, so tests can point it elsewhere
 # (tests/conftest.py). Operator state, like scheduler_state.json: gitignored,
 # in the checkout the scheduler runs from.
@@ -2033,8 +2048,8 @@ def _names(value, name: str) -> tuple[str, ...] | None:
         if item.strip().casefold() == "any":
             raise ValueError(
                 f"{name} cannot hold the name {item!r} (in {value!r}): any category or "
-                "tag is None in config.py, or --any-category / --any-tag on main.py, "
-                f"or null in {LIVE_DEFAULTS_FILE.name}")
+                f"tag is null in {LIVE_DEFAULTS_FILE.name}, --any-category / --any-tag on "
+                "main.py, or None in config.py")
         names.append(item.strip())
     return tuple(names)
 
@@ -2044,14 +2059,16 @@ class LiveSettings:
     """
     One live run's strategy toggles, validated and normalised on construction.
 
-    One per run: main._resolve_live_settings builds it from live_settings() and
-    lays main.py's toggle flags over it with dataclasses.replace (re-running
-    __post_init__), and each run mode hands it, always as the bare name
-    `settings` (never the config.py reference beside it), to every site that
-    reads a toggle. Internal helpers REQUIRE it; a live entry point handed
-    none resolves live_settings() once (pinned by
-    tests/test_strategy.py's test_ast_live_path_reads_toggles_only_through_live_settings
-    and tests/test_main.py::TestLiveSettingsReachEverySite).
+    One per run: main._resolve_live_settings builds it from the saved live
+    defaults (live_defaults()) and lays main.py's toggle flags over it with
+    dataclasses.replace (re-running __post_init__), and each run mode hands
+    it, always as the bare name `settings` (never the `reference` beside it,
+    the saved defaults themselves), to every site that reads a toggle.
+    Internal helpers REQUIRE it; a live entry point handed none resolves
+    live_settings() once, which only tests and direct library calls rely on
+    (pinned by tests/test_strategy.py's
+    test_ast_live_path_reads_toggles_only_through_live_settings and
+    tests/test_main.py::TestLiveSettingsReachEverySite).
 
     Attributes:
         tier_floors (bool): Whether the tier floors apply; a real bool, since
@@ -2157,18 +2174,21 @@ class LiveDefaultsMissing(LiveDefaultsError):
 
 def live_settings() -> LiveSettings:
     """
-    Return the live toggles exactly as this module sets them, validated.
+    Return config.py's own seven toggle constants as LiveSettings, validated.
 
-    Read at CALL time, so a test that monkeypatches a constant ON THIS MODULE
-    takes effect (unlike the by-value TIME_SERIES_SAME_EVENT_LADDERS). Its
-    live callers: see LiveSettings.
+    Read at call time, so a test that monkeypatches a constant here takes
+    effect. It is NOT the live defaults: a live run starts only from the saved
+    ones (live_defaults()). It is what a live entry point falls back to when a
+    caller hands it no settings — tests and direct library calls only, since
+    the AST pin makes every live call path hand the run's settings — and what
+    tests save as the defaults they run under (tests/conftest.py).
 
     Returns:
-        LiveSettings: Built from this module's toggle constants.
+        LiveSettings: Built from this module's toggle constants; its origin is
+            LIVE_DEFAULTS_FROM_CONFIG.
 
     Raises:
-        ValueError: If any constant is out of range; main.py reports it as a
-            usage error (exit 2) before logging is configured.
+        ValueError: If any constant is out of range.
     """
     return LiveSettings(
         tier_floors=TIME_SERIES_TIER_FLOORS,
@@ -2418,10 +2438,13 @@ def read_saved_live_defaults() -> LiveSettings | None:
 
 def live_defaults() -> LiveSettings:
     """
-    Return the saved live defaults, which must exist.
+    Return the live defaults a live run starts from: the saved ones, which must exist.
 
-    It never falls back to this module's toggle constants: with no file saved
-    it raises, naming the two ways to save one.
+    main._resolve_live_settings is its one live caller, so a live run never
+    falls back to this module's constants; the backtest's report
+    (backtester._live_settings_for_report) and backtest.py's pre-fetch echo
+    also read it, failing soft. With no file saved it raises, naming the two
+    ways to save one.
 
     Returns:
         LiveSettings: The saved defaults (read_saved_live_defaults).

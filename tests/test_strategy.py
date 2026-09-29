@@ -1108,10 +1108,34 @@ class TestTimeSeriesKellyParity:
         ("main", "_no_pairs_msg"),
     })
 
-    # The one LIVE function that calls a bare live_settings(), once: it lays main.py's
-    # toggle flags over config.py's values for main() to hand on.
-    _DIRECT_RESOLVERS = frozenset({
-        ("main", "_resolve_live_settings"),
+    # config.py's constants as LiveSettings are read on the live path only by a
+    # whitelisted entry point's None fallback (above); no function calls
+    # live_settings() directly
+    _DIRECT_RESOLVERS = frozenset()
+
+    # The readers of the SAVED live defaults, each called directly once, and
+    # only in these functions: main._resolve_live_settings lays the flags over
+    # them for a run; scheduler._check_live_defaults warns at daemon start
+    _DEFAULTS_READERS = {
+        "live_defaults": frozenset({("main", "_resolve_live_settings")}),
+        "read_saved_live_defaults": frozenset({("scheduler", "_check_live_defaults")}),
+    }
+
+    # The writer of the saved live defaults and the functions that may call it,
+    # each exactly once: none in the walked modules
+    _DEFAULTS_WRITERS = {
+        "save_live_defaults": frozenset(),
+    }
+
+    # The saved file's path, config's private parse of it and the seed values: a
+    # walked module reaches the saved live defaults only through a
+    # _DEFAULTS_READERS reader, so it names none of these (a second read of the
+    # file through them would slip past that table)
+    _SAVED_FILE_INTERNALS = frozenset({
+        "LIVE_DEFAULTS_FILE",
+        "LIVE_DEFAULTS_SEED",
+        "_saved_settings",
+        "_settings_from_bytes",
     })
 
     def test_ast_live_path_reads_toggles_only_through_live_settings(self):
@@ -1122,7 +1146,12 @@ class TestTimeSeriesKellyParity:
         #     included) or toggle constant is named, spelled, shadowed or
         #     imported, and no band reader is imported;
         #   - live_settings is read only by each whitelisted entry point's one
-        #     resolving statement and main._resolve_live_settings' one call;
+        #     resolving statement, and never called directly;
+        #   - the saved live defaults are read only where _DEFAULTS_READERS
+        #     allows, each allowed function calling its reader exactly once,
+        #     and written only where _DEFAULTS_WRITERS allows (nowhere here);
+        #     the saved file's path, config's private parse of it and the seed
+        #     (_SAVED_FILE_INTERNALS) are never named;
         #   - a def with a `settings` parameter is only ever called (pool.submit
         #     too), with the bare name `settings`, never None or the `reference`,
         #     and every whitelisted def, and only those, defaults it to None;
@@ -1160,8 +1189,14 @@ class TestTimeSeriesKellyParity:
             "SAME_TITLE_SIZE_CAP",
             "TRADE_CATEGORIES",
             "TRADE_TAGS",
-        }
+        } | self._SAVED_FILE_INTERNALS
         resolver = "live_settings"
+        # The saved live defaults' readers and writer: name -> the (module,
+        # function) pairs that may call it, each exactly once
+        tracked = {**self._DEFAULTS_READERS, **self._DEFAULTS_WRITERS}
+        # A rename in config must fail here, not leave the tables naming nothing
+        for name in (*tracked, *self._SAVED_FILE_INTERNALS):
+            assert hasattr(config, name), name
         # Helpers that read config.py's k / fraction when handed None (or, where
         # it is defaulted, nothing): name -> (positional index, keyword name)
         explicit_args = {
@@ -1263,6 +1298,8 @@ class TestTimeSeriesKellyParity:
         resolutions: dict = {}
         direct_resolutions: dict = {}
         explicit_calls: dict = {}
+        # (tracked name, module, function) -> direct calls found there
+        defaults_calls: dict = {}
         for mod, tree in trees.items():
             parents = {}
             for node in ast.walk(tree):
@@ -1302,6 +1339,13 @@ class TestTimeSeriesKellyParity:
                         and node.func.id == resolver and not node.args
                         and not node.keywords and id(node.func) not in allowed):
                     direct[id(node.func)] = enclosing(node)
+
+            # A direct call of a saved-defaults reader or writer, recorded by the
+            # id of its called name, checked against its table below
+            tracked_calls = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and call_name(node.func) in tracked:
+                    tracked_calls[id(node.func)] = enclosing(node)
 
             # Callees handed as pool.submit's first argument, checked below
             submitted = set()
@@ -1344,14 +1388,21 @@ class TestTimeSeriesKellyParity:
                         assert a.name not in forbidden, f"{mod} imports {a.name}"
                         # Only the plain import is exempt; an alias could call it
                         assert not (a.name == resolver and a.asname), mod
+                        assert not (a.name in tracked and a.asname), (
+                            f"{mod} imports {a.name} under another name")
+                        # ... and only into a module the tables allow to call it
+                        assert a.name not in tracked or any(
+                            m == mod for m, _ in tracked[a.name]), (
+                            f"{mod} imports {a.name}, which _DEFAULTS_READERS / "
+                            "_DEFAULTS_WRITERS allow no function of it to call")
                     continue
                 if isinstance(node, ast.Constant):
                     if isinstance(node.value, str):
-                        assert node.value not in forbidden | {resolver}, (
+                        assert node.value not in forbidden | {resolver} | set(tracked), (
                             f"{mod}:{node.lineno} spells {node.value!r}")
                     continue
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    assert node.name not in forbidden | {resolver}, (
+                    assert node.name not in forbidden | {resolver} | set(tracked), (
                         f"{mod}:{node.lineno} shadows {node.name}")
                     continue
                 if isinstance(node, ast.Name):
@@ -1370,12 +1421,25 @@ class TestTimeSeriesKellyParity:
                     continue
                 where = f"{mod}:{node.lineno}"
                 assert name not in forbidden, f"{where} references {name}"
+                if name in tracked:
+                    table = ("_DEFAULTS_READERS" if name in self._DEFAULTS_READERS
+                             else "_DEFAULTS_WRITERS")
+                    assert id(node) in tracked_calls, (
+                        f"{where} references {name} other than by calling it; "
+                        f"only the functions {table} names may, by calling it")
+                    func = tracked_calls[id(node)]
+                    assert (mod, func) in tracked[name], (
+                        f"{where}: {mod}.{func} calls {name}(); only the functions "
+                        f"{table} names for it may")
+                    key = (name, mod, func)
+                    defaults_calls[key] = defaults_calls.get(key, 0) + 1
+                    continue
                 if name == resolver and id(node) in direct:
                     func = direct[id(node)]
                     assert (mod, func) in self._DIRECT_RESOLVERS, (
-                        f"{where}: {mod}.{func} calls live_settings() directly; only "
-                        "main._resolve_live_settings may, and every other live "
-                        "function must be handed the run's settings")
+                        f"{where}: {mod}.{func} calls live_settings() directly; no live "
+                        "function may (_DIRECT_RESOLVERS): a run starts from the saved "
+                        "live defaults, and every live function is handed the run's settings")
                     direct_resolutions[(mod, func)] = (
                         direct_resolutions.get((mod, func), 0) + 1)
                 elif name == resolver:
@@ -1401,6 +1465,16 @@ class TestTimeSeriesKellyParity:
         assert resolutions == dict.fromkeys(self._LIVE_SETTINGS_RESOLVERS, 1), resolutions
         assert direct_resolutions == dict.fromkeys(self._DIRECT_RESOLVERS, 1), (
             direct_resolutions)
+        # Every function the saved-defaults tables allow is found and calls its
+        # reader or writer exactly once (so the tables are never vacuous), and
+        # no other call exists
+        expected = {(name, mod, func): 1
+                    for name, allowed in tracked.items() for mod, func in allowed}
+        assert defaults_calls == expected, (
+            f"_DEFAULTS_READERS / _DEFAULTS_WRITERS: expected {expected}, found "
+            f"{defaults_calls}")
+        # The two readers are both in use (a table emptied by an edit fails here)
+        assert {name for name, _, _ in defaults_calls} == set(self._DEFAULTS_READERS)
         # main() hands both run modes the settings it resolved, positionally
         main_tree = trees["main"]
         main_fn = next(n for n in ast.walk(main_tree)
@@ -1424,6 +1498,37 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "_pair_max_sum", "live_time_series_floor")
         # ... which reaches the floor through the helper _find_entry uses
         assert _function_calls(config, "live_time_series_floor", "min_price_diff_for_gap")
+
+    def test_ast_the_reports_never_write_the_saved_live_defaults(self):
+        # The backtest, its CLI and the dashboard read the saved live defaults for
+        # their reports only: none of them names the writer, the file's path, the
+        # seed or config's private parse, so none can change what live runs trade
+        from kalshi_betting import backtest
+
+        writes = {"save_live_defaults", "_saved_text", "_sync_directory"}
+        names = writes | self._SAVED_FILE_INTERNALS
+        # A rename in config must fail here, not leave the check naming nothing
+        for name in names:
+            assert hasattr(config, name), name
+        for module in (backtester, backtest, dashboard):
+            mod = module.__name__.rsplit(".", 1)[-1]
+            for node in ast.walk(ast.parse(inspect.getsource(module))):
+                if isinstance(node, ast.Name):
+                    found = node.id
+                elif isinstance(node, ast.Attribute):
+                    found = node.attr
+                elif isinstance(node, ast.alias):
+                    found = node.name
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    found = node.name
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    found = node.value
+                else:
+                    continue
+                assert found not in names, f"{mod}:{getattr(node, 'lineno', '?')} names {found}"
+        # Non-vacuous: both report reads are there, through the one reader
+        assert _function_calls(backtester, "_live_settings_for_report", "live_defaults")
+        assert _function_calls(backtest, "main", "live_defaults")
 
     def test_ast_every_sizer_caps_through_pair_size_cap(self):
         # config.pair_size_cap is the ONE definition of a pair's per-trade cap,

@@ -27,7 +27,9 @@ Notes:
     not per side — trader funds each market's exchange shard from them.
 
     k and the per-pair caps come from one config.LiveSettings per call, which
-    compute_trade hands to both sizing paths (config.py's when handed none).
+    compute_trade hands to both sizing paths: a live run's, built from the
+    saved live defaults, or config.py's toggles for a caller that hands none
+    (tests and direct calls).
 """
 import logging
 from dataclasses import dataclass
@@ -404,7 +406,7 @@ def compute_trade(
         balance_cents (int): Account balance in cents.
         settings (LiveSettings | None): Keyword-only. The run's toggles; pass
             the object enrichment's affordability bound read. None resolves
-            config.live_settings() once.
+            config.live_settings() once (tests and direct calls only).
 
     Returns:
         TradeSpec | None: None if the pair is not tradeable, a leg price is

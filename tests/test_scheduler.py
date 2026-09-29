@@ -602,6 +602,88 @@ class TestStartupCatchUp:
         assert "_maybe_catch_up" not in called
 
 
+class TestCheckLiveDefaults:
+    """_check_live_defaults: at daemon start, one ERROR when every scheduled run
+    would exit 2 for want of usable saved live defaults, naming the fix; nothing
+    when a usable file is saved. It never raises, so main() still registers the
+    weekly job, and main() calls it before registering that job."""
+
+    @staticmethod
+    def _errors(caplog) -> list[str]:
+        """
+        The messages of every ERROR (or worse) record captured so far.
+
+        Args:
+            caplog (pytest.LogCaptureFixture): The test's captured log.
+
+        Returns:
+            list[str]: Each such record's message, in order.
+        """
+        return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_no_saved_file_logs_the_missing_file_error(self, caplog):
+        assert not config.LIVE_DEFAULTS_FILE.exists()
+        with caplog.at_level(logging.INFO):
+            scheduler._check_live_defaults()
+        (error,) = self._errors(caplog)
+        assert error.startswith("No live defaults are saved: every scheduled run will exit 2")
+        assert "python3 -m kalshi_betting.defaults_server --seed" in error
+        assert "Save as live defaults…" in error
+
+    def test_a_refused_file_logs_the_refused_file_error(self, caplog):
+        config.LIVE_DEFAULTS_FILE.write_text("not json", encoding="utf-8")
+        with caplog.at_level(logging.INFO):
+            scheduler._check_live_defaults()
+        (error,) = self._errors(caplog)
+        assert error.startswith("The saved live defaults are refused (")
+        assert str(config.LIVE_DEFAULTS_FILE) in error
+        assert error.endswith("every scheduled run will exit 2 until the file is fixed "
+                              "or saved again")
+
+    @pytest.mark.usefixtures("saved_live_defaults")
+    def test_a_usable_file_logs_nothing(self, caplog):
+        with caplog.at_level(logging.DEBUG):
+            scheduler._check_live_defaults()
+        assert not [r for r in caplog.records if r.name == "root"]
+
+    def test_it_never_raises(self, monkeypatch, caplog):
+        def broken():
+            """
+            Stand in for a reader that fails in a way no refusal covers.
+
+            Raises:
+                RuntimeError: Always.
+            """
+            raise RuntimeError("an unexpected failure")
+
+        monkeypatch.setattr(scheduler, "read_saved_live_defaults", broken)
+        with caplog.at_level(logging.INFO):
+            scheduler._check_live_defaults()  # must not raise
+        (error,) = self._errors(caplog)
+        assert "an unexpected failure" in error
+
+    def test_main_calls_it_before_registering_the_weekly_job(self):
+        # main() spawns a real prod run and is never invoked by this suite, so
+        # the order is pinned on the source: after the host-clock check, before
+        # the catch-up (which can spawn a run) and the weekly job's registration
+        tree = ast.parse(inspect.getsource(scheduler))
+        main_fn = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.FunctionDef) and node.name == "main")
+        checks = [n.lineno for n in ast.walk(main_fn)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                  and n.func.id == "_check_live_defaults"]
+        registrations = [n.lineno for n in ast.walk(main_fn)
+                         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                         and n.func.attr == "do"]
+        assert len(checks) == 1 and len(registrations) == 1
+        assert checks[0] < registrations[0]
+        lines = {n.func.id: n.lineno for n in ast.walk(main_fn)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id in ("_host_clock_realises_run", "_startup_catch_up")}
+        assert (lines["_host_clock_realises_run"] < checks[0]
+                < lines["_startup_catch_up"] < registrations[0])
+
+
 class TestBlindRunRetry:
     """TS-01/VI-02: EXIT_NO_TRADEABLE_SHARDS means the run scanned nothing —
     either an exchange-wide halt dropped every market at ingest, or the ingest

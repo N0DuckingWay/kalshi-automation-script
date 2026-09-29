@@ -19,16 +19,23 @@ Purpose:
     subprocess, see scheduler.run_job) can distinguish a clean run from a
     low-balance skip or a run whose trades need manual review.
 
-    On the live toggles: TestLiveSettingsFlags, TestLogLiveSettings and
+    On the live toggles: a live run starts only from the saved live defaults
+    (config.LIVE_DEFAULTS_FILE, each test's own tmp_path under conftest's
+    _isolate_live_defaults). TestLiveDefaultsRequired pins that it exits 2
+    with none saved or a refused file; TestSavedLiveDefaults that it reads
+    them once and names them. TestLiveSettingsFlags, TestLogLiveSettings and
     TestLiveSettingsReachEverySite (the runtime half of test_strategy.py's
-    live-toggle AST pin) run under pinned_config_toggles; TestCategoryFilter
-    covers main._filter_by_category.
+    live-toggle AST pin) run under pinned_config_toggles, which pins config's
+    toggles and saves them as the test's live defaults; every other test that
+    runs main.main() saves config.py's toggles first (conftest's
+    saved_live_defaults). TestCategoryFilter covers main._filter_by_category.
 
 Dependencies:
     Imports _run_dev/_run_prod and the pure helpers from kalshi_betting.main,
     plus config constants asserted against and conftest's
-    apply_pre_toggle_defaults; for the category/tag filter, historical,
-    dashboard and backtester.BacktestTrade. The live-shape replays mock all
+    apply_pre_toggle_defaults and save_config_live_defaults; for the
+    category/tag filter, historical, dashboard and backtester.BacktestTrade.
+    The live-shape replays mock all
     Kalshi API interaction at the HTTP boundary (raw-response mocks and
     rest_client.request); the exit-code tests mock the heavy collaborators
     (auth, scanner, strategy, trader, reporter) at their main-module import
@@ -90,7 +97,7 @@ from kalshi_betting.config import (
 from kalshi_betting.historical import infer_category
 from kalshi_betting.reporter import TradeResult
 
-from .conftest import apply_pre_toggle_defaults
+from .conftest import apply_pre_toggle_defaults, save_config_live_defaults
 
 
 def make_pair(ticker_a: str, ticker_b: str, pair_type: str = "time_series"):
@@ -245,11 +252,37 @@ class TestNoPairsMsg:
 
 
 @pytest.fixture
-def pinned_config_toggles(monkeypatch):
-    """Pin the seven live toggles through conftest's apply_pre_toggle_defaults, the
-    one definition of their values, so every "(config: X)" mark reads the same
-    whatever config.py ships."""
+def pinned_config_toggles(monkeypatch, _isolate_live_defaults):
+    """
+    Pin the seven live toggles and save them as this test's live defaults.
+
+    Through conftest's apply_pre_toggle_defaults, the one definition of their
+    values, then save_config_live_defaults into the test's own path (requested
+    by name, so the save lands after conftest's per-test redirect): a run
+    through main.main() starts from those values, and every "(default: X)"
+    mark reads the same whatever config.py ships. config.live_settings()
+    returns the same toggles, so a run mode handed none reads them too.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
+        _isolate_live_defaults (None): conftest's per-test redirect, set up first.
+    """
     apply_pre_toggle_defaults(monkeypatch)
+    save_config_live_defaults()
+
+
+def _save_live_defaults(**changes) -> LiveSettings:
+    """
+    Save config.py's toggles with these fields replaced as this test's live defaults.
+
+    Args:
+        **changes: LiveSettings fields to replace in config.live_settings().
+
+    Returns:
+        LiveSettings: The saved defaults as read back (their origin names the file).
+    """
+    return config.save_live_defaults(dataclasses.replace(live_settings(), **changes),
+                                     source="")
 
 
 def _seed_series_listing(series: dict, fetched_at: datetime | None = None) -> None:
@@ -323,7 +356,10 @@ class TestOrderApiVersionGate:
         assert config.order_api_version_error() in err
         assert repr(value) in err and '"v2"' in err
 
+    @pytest.mark.usefixtures("saved_live_defaults")
     def test_the_shipped_value_reaches_the_run_mode(self, monkeypatch):
+        # Saved live defaults too: with none saved, the run exits 2 before
+        # its run mode (TestLiveDefaultsRequired)
         assert config.ORDER_API_VERSION == "v2"
         seen = _main_with(monkeypatch, ["--mode", "dev"])
         assert seen["code"] == EXIT_OK and seen["mode"] == "dev"
@@ -331,9 +367,9 @@ class TestOrderApiVersionGate:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestLiveSettingsFlags:
-    """Each live-toggle flag overrides ONE config.py toggle for one run, over
-    config.live_settings() read at call time; a value LiveSettings refuses is a
-    usage error (exit 2) before logging is configured (TS-20) or a client built."""
+    """Each live-toggle flag overrides ONE saved live default for one run, over
+    the saved file read at call time; a value LiveSettings refuses is a usage
+    error (exit 2) before logging is configured (TS-20) or a client built."""
 
     @pytest.mark.parametrize("mode", ["dev", "prod"])
     @pytest.mark.parametrize("argv, field, value", [
@@ -359,26 +395,30 @@ class TestLiveSettingsFlags:
             if other != field:
                 assert getattr(settings, other) == getattr(reference, other), other
 
-    def test_no_flag_hands_the_run_config_py_itself(self, monkeypatch):
+    def test_no_flag_hands_the_run_the_saved_defaults_themselves(self, monkeypatch):
         # The scheduler's exact argv (tests/test_scheduler.py pins it)
         seen = _main_with(monkeypatch, ["--mode", "prod"])
-        assert seen["settings"] == seen["reference"] == live_settings()
+        assert seen["settings"] == seen["reference"] == config.read_saved_live_defaults()
+        # ... which the fixture saved from the pinned constants
+        assert seen["reference"] == live_settings()
+        assert seen["settings"].origin == seen["reference"].origin
+        assert seen["reference"].origin.startswith("live_defaults.json, saved ")
 
-    def test_a_flag_equal_to_config_departs_nothing(self, monkeypatch):
-        cfg = live_settings()
+    def test_a_flag_equal_to_the_saved_default_departs_nothing(self, monkeypatch):
+        saved = config.read_saved_live_defaults()
         seen = _main_with(monkeypatch, [
-            "--mode", "prod", "--tier-floors" if cfg.tier_floors else "--no-tier-floors",
-            "--interval-discount", repr(cfg.interval_discount),
-            "--size-cap", str(round(cfg.size_cap * 100)),
+            "--mode", "prod", "--tier-floors" if saved.tier_floors else "--no-tier-floors",
+            "--interval-discount", repr(saved.interval_discount),
+            "--size-cap", str(round(saved.size_cap * 100)),
         ])
         assert seen["settings"] == seen["reference"]
 
-    def test_one_band_flag_keeps_config_pys_other_bound(self, monkeypatch):
-        # Read at call time from config.py, never bound at import
-        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.1, 0.8))
+    def test_one_band_flag_keeps_the_saved_other_bound(self, monkeypatch):
+        # Read at call time from the saved file, never bound at import
+        _save_live_defaults(spread_band=(0.1, 0.8))
         assert _main_with(monkeypatch, ["--spread-max", "0.5"])["settings"].spread_band == (0.1, 0.5)
         assert _main_with(monkeypatch, ["--spread-min", "0.2"])["settings"].spread_band == (0.2, 0.8)
-        # 0 is a value, not "not given": it lowers config.py's floor to 0
+        # 0 is a value, not "not given": it lowers the saved floor to 0
         assert _main_with(monkeypatch, ["--spread-min", "0"])["settings"].spread_band == (0.0, 0.8)
         both = _main_with(monkeypatch, ["--spread-min", "0.05", "--spread-max", "0.9"])
         assert both["settings"].spread_band == (0.05, 0.9)
@@ -395,7 +435,7 @@ class TestLiveSettingsFlags:
         (["--size-cap", "150"], ["--size-cap", "size_cap", "(0, 1]"], True),
         (["--same-title-size-cap", "105"], ["--same-title-size-cap", "same_title_size_cap"],
          True),
-        # 0 is a value, not "not given": refused, never silently config.py's
+        # 0 is a value, not "not given": refused, never silently the saved one
         (["--same-title-size-cap", "0"],
          ["--same-title-size-cap", "same_title_size_cap", "(0, 1]"], True),
         (["--interval-discount", "0"], ["--interval-discount", "interval_discount"], False),
@@ -434,20 +474,18 @@ class TestLiveSettingsFlags:
         else:
             assert "whole percent" not in err, err
 
-    @pytest.mark.parametrize("field, constant, flag", [
-        ("categories", "TRADE_CATEGORIES", "--any-category"),
-        ("tags", "TRADE_TAGS", "--any-tag"),
+    @pytest.mark.parametrize("field, flag", [
+        ("categories", "--any-category"),
+        ("tags", "--any-tag"),
     ])
-    def test_an_any_flag_clears_config_pys_filter_for_one_run(
-        self, monkeypatch, field, constant, flag,
-    ):
-        monkeypatch.setattr(config, constant, ("Sports",))
+    def test_an_any_flag_clears_the_saved_filter_for_one_run(self, monkeypatch, field, flag):
+        _save_live_defaults(**{field: ("Sports",)})
         seen = _main_with(monkeypatch, ["--mode", "prod", flag])
         assert getattr(seen["reference"], field) == ("Sports",)
         assert getattr(seen["settings"], field) is None
         line = describe_live_settings(seen["settings"], seen["reference"])
-        assert f"{field} any (config: Sports)" in line and line.count("(config:") == 1
-        # No flag keeps config.py's filter
+        assert f"{field} any (default: Sports)" in line and line.count("(default:") == 1
+        # No flag keeps the saved filter
         seen = _main_with(monkeypatch, ["--mode", "prod"])
         assert getattr(seen["settings"], field) == ("Sports",)
 
@@ -473,14 +511,6 @@ class TestLiveSettingsFlags:
         err = capsys.readouterr().err
         assert f"--size-cap and --same-title-size-cap take {self._PERCENT}" in err, err
 
-    def test_an_invalid_config_value_is_a_usage_error(self, monkeypatch, capsys):
-        monkeypatch.setattr(config, "BUDGET_FRACTION", 0.37)
-        seen = _main_with(monkeypatch, ["--mode", "prod"])
-        assert seen["code"] == 2
-        assert not seen["logging_set_up"] and not seen["client_built"]
-        err = capsys.readouterr().err
-        assert "config.py's live settings are invalid" in err and "size_cap" in err
-
     def test_help_names_every_flag_and_the_grid(self, monkeypatch, capsys):
         # argparse %-formats help: a bare "%" would raise here, so "%%" is pinned
         monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--help"])
@@ -493,7 +523,16 @@ class TestLiveSettingsFlags:
                      "--interval-discount", "--size-cap", "--same-title-size-cap",
                      "--category", "--any-category", "--tag", "--any-tag"):
             assert flag in out, flag
-        assert "config.TRADE_CATEGORIES" in out and "config.TRADE_TAGS" in out
+        # Every value flag defaults to the saved live defaults, never a config.py constant
+        assert out.count("default: the saved live defaults") == 8
+        assert out.count("whatever the saved live defaults say") == 2
+        assert "config.TIME_SERIES" not in out and "config.TRADE" not in out
+        assert "config.BUDGET_FRACTION" not in out and "config.SAME_TITLE" not in out
+        assert ("Override one live default for THIS run only, in either mode. The live "
+                "defaults are the ones saved through python3 -m "
+                "kalshi_betting.defaults_server (live_defaults.json); a run refuses to "
+                "start without them. The weekly scheduler passes none of these flags, so "
+                "a scheduled run trades exactly the saved defaults.") in out
         assert out.count(f"in {config.SIZE_CAP_STEP * 100:g}% steps") == 2
         assert "100 = no cap" in out
         assert "100 = no extra cap beyond --size-cap" in out
@@ -502,17 +541,17 @@ class TestLiveSettingsFlags:
     def test_the_echo_marks_exactly_the_departing_fields(self, monkeypatch):
         seen = _main_with(monkeypatch, ["--interval-discount", "0.751"])
         line = describe_live_settings(seen["settings"], seen["reference"])
-        # k renders exactly, so 0.751 never prints as config.py's 0.75
-        assert "k 0.751 (config: 0.75)" in line
-        assert line.count("(config:") == 1
+        # k renders exactly, so 0.751 never prints as the saved 0.75
+        assert "k 0.751 (default: 0.75)" in line
+        assert line.count("(default:") == 1 and "(config:" not in line
 
         seen = _main_with(monkeypatch, [
             "--no-tier-floors", "--spread-max", "0.5", "--size-cap", "35"])
         line = describe_live_settings(seen["settings"], seen["reference"])
-        assert "tier floors off (config: on)" in line
-        assert "spread band 0-0.5 (config: none)" in line
-        assert "per-trade cap 35% (config: 20%)" in line
-        assert line.count("(config:") == 3
+        assert "tier floors off (default: on)" in line
+        assert "spread band 0-0.5 (default: none)" in line
+        assert "per-trade cap 35% (default: 20%)" in line
+        assert line.count("(default:") == 3
 
 
 def _prod_until_the_balance_gate(monkeypatch, argv: list, caplog) -> int:
@@ -529,13 +568,17 @@ def _prod_until_the_balance_gate(monkeypatch, argv: list, caplog) -> int:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestLogLiveSettings:
-    """Each live run logs its toggles on one INFO line, marking each departure from
-    config.py; it WARNS on every live_rule_warnings sentence and, when a prod run
-    that submits orders departs, on that."""
+    """Each live run logs where its defaults came from and its toggles on INFO
+    lines, marking each departure from the saved live defaults; it WARNS on
+    every live_rule_warnings sentence and, when a prod run that submits orders
+    departs, on that."""
 
-    _DEPARTURE = "This PRODUCTION run overrides config.py's live settings"
+    _DEPARTURE = "This PRODUCTION run overrides the saved live defaults"
+    # The same WARNING for a reference built from config.py's constants (one a
+    # test hands a run mode explicitly, or builds by hand)
+    _CONFIG_DEPARTURE = "This PRODUCTION run overrides config.py's live settings"
 
-    def test_a_scheduled_run_logs_config_py_with_no_mark_and_no_warning(
+    def test_a_scheduled_run_logs_the_saved_defaults_with_no_mark_and_no_warning(
         self, monkeypatch, caplog,
     ):
         code = _prod_until_the_balance_gate(monkeypatch, [], caplog)
@@ -543,7 +586,10 @@ class TestLogLiveSettings:
         lines = [r.getMessage() for r in caplog.records
                  if r.getMessage().startswith("Live settings:")]
         assert lines == [f"Live settings: {describe_live_settings(live_settings())}"]
-        assert "(config:" not in lines[0]
+        assert "(default:" not in lines[0] and "(config:" not in lines[0]
+        # The line before it names the saved file the run started from
+        saved = config.read_saved_live_defaults()
+        assert f"Live defaults: {saved.origin}" in caplog.text
         assert self._DEPARTURE not in caplog.text
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING
                     and r.getMessage().startswith("Live settings:")]
@@ -551,14 +597,14 @@ class TestLogLiveSettings:
     # One departing flag per live toggle (config.LIVE_TOGGLE_FIELDS), with the
     # mark its line must carry
     _ONE_FLAG_PER_FIELD = {
-        "tier_floors": (["--no-tier-floors"], "tier floors off (config: on)"),
-        "spread_band": (["--spread-max", "0.5"], "spread band 0-0.5 (config: none)"),
-        "interval_discount": (["--interval-discount", "0.6"], "k 0.6 (config: 0.75)"),
-        "size_cap": (["--size-cap", "35"], "per-trade cap 35% (config: 20%)"),
+        "tier_floors": (["--no-tier-floors"], "tier floors off (default: on)"),
+        "spread_band": (["--spread-max", "0.5"], "spread band 0-0.5 (default: none)"),
+        "interval_discount": (["--interval-discount", "0.6"], "k 0.6 (default: 0.75)"),
+        "size_cap": (["--size-cap", "35"], "per-trade cap 35% (default: 20%)"),
         "same_title_size_cap": (["--same-title-size-cap", "15"],
-                                "same-title cap 15% (config: 100% (no extra cap))"),
-        "categories": (["--category", "Economics"], "categories Economics (config: any)"),
-        "tags": (["--tag", "Oil & Gas"], "tags Oil & Gas (config: any)"),
+                                "same-title cap 15% (default: 100% (no extra cap))"),
+        "categories": (["--category", "Economics"], "categories Economics (default: any)"),
+        "tags": (["--tag", "Oil & Gas"], "tags Oil & Gas (default: any)"),
     }
 
     def test_every_field_has_a_departing_flag(self):
@@ -572,15 +618,16 @@ class TestLogLiveSettings:
         assert code == EXIT_SKIPPED_LOW_BALANCE
         (line,) = [r.getMessage() for r in caplog.records
                    if r.getMessage().startswith("Live settings: tier floors")]
-        assert mark in line and line.count("(config:") == 1, line
+        assert mark in line and line.count("(default:") == 1, line
         warnings = [r for r in caplog.records
                     if r.levelno == logging.WARNING and self._DEPARTURE in r.getMessage()]
         assert len(warnings) == 1
+        assert self._CONFIG_DEPARTURE not in caplog.text
 
     def test_a_departing_dry_run_marks_but_does_not_warn(self, monkeypatch, caplog):
         _prod_until_the_balance_gate(
             monkeypatch, ["--dry-run", "--interval-discount", "0.6"], caplog)
-        assert "k 0.6 (config: 0.75)" in caplog.text
+        assert "k 0.6 (default: 0.75)" in caplog.text
         assert self._DEPARTURE not in caplog.text
 
     def test_a_departing_dev_run_marks_but_does_not_warn(self, caplog):
@@ -596,7 +643,8 @@ class TestLogLiveSettings:
             )
         assert code == EXIT_NO_TRADEABLE_SHARDS
         assert "k 0.6 (config: 0.75)" in caplog.text
-        assert self._DEPARTURE not in caplog.text
+        # Neither wording: this reference is config.py's, so a WARNING would name it
+        assert "This PRODUCTION run overrides" not in caplog.text
 
     def test_every_rule_warning_is_logged(self, monkeypatch, caplog):
         _prod_until_the_balance_gate(
@@ -611,17 +659,139 @@ class TestLogLiveSettings:
         ]
         assert any("one time-series pair may stake up to 60%" in w for w in warned)
 
-    def test_it_never_resolves_config_py_itself(self, monkeypatch, caplog):
+    def test_it_never_resolves_config_py_or_the_saved_defaults_itself(
+        self, monkeypatch, caplog,
+    ):
         def tripwire():
-            raise AssertionError("_log_live_settings resolved config.py's settings")
+            raise AssertionError("_log_live_settings read settings of its own")
         s = LiveSettings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
-        r = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
-        monkeypatch.setattr(main, "live_settings", tripwire)
-        monkeypatch.setattr(config, "live_settings", tripwire)
+        r = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, origin=self._ORIGIN)
+        for name in ("live_settings", "live_defaults"):
+            monkeypatch.setattr(main, name, tripwire)
+        for name in ("live_settings", "live_defaults", "read_saved_live_defaults"):
+            monkeypatch.setattr(config, name, tripwire)
         with caplog.at_level(logging.INFO):
             main._log_live_settings(s, r, real_money=True)
+        assert f"Live defaults: {self._ORIGIN}" in caplog.text
         assert f"Live settings: {describe_live_settings(s, r)}" in caplog.text
+        assert "(default: on)" in caplog.text
         assert self._DEPARTURE in caplog.text
+
+    # An origin as config.read_saved_live_defaults writes it
+    _ORIGIN = "live_defaults.json, saved 2026-09-27T21:05:13Z from a note"
+
+    def test_a_config_reference_keeps_the_config_mark_and_warning(self, caplog):
+        # A reference built from config.py's constants (origin "config.py"):
+        # marked "(config: X)", and the WARNING names config.py
+        s = LiveSettings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
+        r = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
+        with caplog.at_level(logging.INFO):
+            main._log_live_settings(s, r, real_money=True)
+        assert f"Live defaults: {config.LIVE_DEFAULTS_FROM_CONFIG}" in caplog.text
+        assert "tier floors off (config: on)" in caplog.text
+        assert "(default:" not in caplog.text
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                  and "PRODUCTION run overrides" in r.getMessage()]
+        assert warned == [
+            "This PRODUCTION run overrides config.py's live settings (see the \"(config: …)\" "
+            "marks on the line above): its trades follow the flags, not the committed "
+            "configuration"]
+
+    def test_the_saved_warning_is_worded_for_the_saved_defaults(self, caplog):
+        s = LiveSettings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
+        r = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, origin=self._ORIGIN)
+        with caplog.at_level(logging.INFO):
+            main._log_live_settings(s, r, real_money=True)
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                  and "PRODUCTION run overrides" in r.getMessage()]
+        assert warned == [
+            "This PRODUCTION run overrides the saved live defaults (see the \"(default: …)\" "
+            "marks on the line above): its trades follow the flags, not the saved defaults"]
+
+
+def _saved_record(**toggles) -> str:
+    """
+    A saved live defaults file's text: config.py's toggles with these replaced.
+
+    Built as the file's JSON record by hand, so a test can hold a value
+    save_live_defaults itself would refuse to write.
+
+    Args:
+        **toggles: Raw JSON values for the "settings" block's fields.
+
+    Returns:
+        str: The file's text.
+    """
+    cfg = live_settings()
+    settings = {name: getattr(cfg, name) for name in config.LIVE_TOGGLE_FIELDS}
+    settings["spread_band"] = list(settings["spread_band"])
+    settings.update(toggles)
+    return json.dumps({"format": config.LIVE_DEFAULTS_FORMAT,
+                       "saved_at": "2026-09-27T21:05:13Z", "source": "",
+                       "settings": settings})
+
+
+class TestLiveDefaultsRequired:
+    """A live run starts only from the saved live defaults: with none saved, or
+    a saved file refused, main() exits 2 (parser.error) in either mode, with or
+    without a toggle flag, before logging is configured, any client is built or
+    either run mode runs — and never falls back to config.py's toggles."""
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("flags", [[], ["--interval-discount", "0.6"], ["--any-tag"]])
+    def test_no_saved_file_exits_2_before_anything_runs(self, monkeypatch, capsys, mode,
+                                                        flags):
+        assert not config.LIVE_DEFAULTS_FILE.exists()
+        seen = _main_with(monkeypatch, ["--mode", mode, *flags])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = " ".join(capsys.readouterr().err.split())
+        assert f"no live defaults are saved at {config.LIVE_DEFAULTS_FILE}" in err
+        assert "\"Save as live defaults…\" button" in err
+        assert "python3 -m kalshi_betting.defaults_server --seed" in err
+        assert "live runs never fall back to config.py's toggles" in err
+
+    @staticmethod
+    def _recursion_bomb(path) -> None:
+        """
+        Write a saved-defaults file nested too deeply to parse.
+
+        Args:
+            path (pathlib.Path): Where to write it (config.LIVE_DEFAULTS_FILE).
+        """
+        path.write_text("[" * 200_000, encoding="utf-8")
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("write", [
+        pytest.param(lambda path: path.write_text("not json", encoding="utf-8"), id="not-json"),
+        pytest.param(lambda path: path.write_text(_saved_record(size_cap=0.33),
+                                                  encoding="utf-8"), id="cap-0.33"),
+        pytest.param(lambda path: path.mkdir(), id="directory"),
+        pytest.param(_recursion_bomb, id="recursion-bomb"),
+    ])
+    def test_a_refused_file_exits_2_naming_it(self, monkeypatch, capsys, mode, write):
+        write(config.LIVE_DEFAULTS_FILE)
+        seen = _main_with(monkeypatch, ["--mode", mode])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = " ".join(capsys.readouterr().err.split())
+        assert "the saved live defaults are refused" in err
+        assert str(config.LIVE_DEFAULTS_FILE) in err
+        assert "python3 -m kalshi_betting.defaults_server" in err
+
+    def test_an_invalid_config_constant_does_not_stop_a_run_with_a_saved_file(
+        self, monkeypatch, saved_live_defaults,
+    ):
+        # config.py's toggles are no live run's defaults: an invalid one only
+        # breaks a caller that hands no settings, never main()
+        monkeypatch.setattr(config, "BUDGET_FRACTION", 0.37)
+        with pytest.raises(ValueError):
+            live_settings()
+        seen = _main_with(monkeypatch, ["--mode", "prod"])
+        assert seen["code"] == EXIT_OK
+        assert seen["settings"] == seen["reference"] == config.read_saved_live_defaults()
 
 
 def _filter_pair(event_ticker: str) -> SimpleNamespace:
@@ -2272,10 +2442,12 @@ class TestLiveSettingsReachEverySite:
     """The runtime tripwire behind test_strategy.py's
     test_ast_live_path_reads_toggles_only_through_live_settings: a prod dry run and a
     dev run handed _SETTINGS (every toggle departing from the pinned config) and an
-    explicit reference while live_settings raises in config, scanner, strategy, trader
-    and main, so a site reading config.py or the reference raises or hands a spy the
-    wrong value. _SETTINGS keeps both pairs trading, the time-series f* between the
-    0.25 same-title and 0.35 per-trade caps."""
+    explicit reference while live_settings, live_defaults and read_saved_live_defaults
+    raise in config, scanner, strategy, trader and main, so a site reading config.py,
+    the saved file or the reference raises or hands a spy the wrong value. It runs
+    twice: with config.py's toggles as the reference, and with _SETTINGS saved as the
+    live defaults and resolved as main() resolves them. _SETTINGS keeps both pairs
+    trading, the time-series f* between the 0.25 same-title and 0.35 per-trade caps."""
 
     _SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.05, 0.9),
                              interval_discount=0.6, size_cap=0.35, same_title_size_cap=0.25,
@@ -2298,9 +2470,22 @@ class TestLiveSettingsReachEverySite:
         (config, ("live_time_series_floor", "pair_size_cap")),
     )
 
-    def _run_under_the_tripwire(self, monkeypatch, caplog, mode: str):
+    def _run_under_the_tripwire(self, monkeypatch, caplog, mode: str, *,
+                                settings: LiveSettings | None = None,
+                                reference: LiveSettings | None = None):
         """
-        Run one mode on _SETTINGS under the tripwire, recording every _SPIED call.
+        Run one mode under the tripwire, recording every _SPIED call.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
+            caplog (pytest.LogCaptureFixture): Captures the run's log.
+            mode (str): "prod" (a dry run) or "dev".
+            settings (LiveSettings | None): Keyword-only. The run's toggles;
+                None hands _SETTINGS.
+            reference (LiveSettings | None): Keyword-only. The defaults the
+                run's toggles depart from; None reads config.py's toggles
+                (live_settings()) before the tripwire, and every toggle must
+                then differ from settings'.
 
         Returns:
             tuple: (settings, reference, calls, captured) — calls maps (module
@@ -2308,11 +2493,12 @@ class TestLiveSettingsReachEverySite:
                 captured holds "results", "filter", "enriched" and, in prod,
                 "run_note".
         """
-        settings = self._SETTINGS
-        # config.py's toggles, read before the tripwire; every toggle must differ
-        reference = live_settings()
-        for name in config.LIVE_TOGGLE_FIELDS:
-            assert getattr(settings, name) != getattr(reference, name), name
+        settings = self._SETTINGS if settings is None else settings
+        if reference is None:
+            # config.py's toggles, read before the tripwire; every toggle must differ
+            reference = live_settings()
+            for name in config.LIVE_TOGGLE_FIELDS:
+                assert getattr(settings, name) != getattr(reference, name), name
 
         client = _live_shape_client(
             monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True,
@@ -2361,12 +2547,16 @@ class TestLiveSettingsReachEverySite:
 
         monkeypatch.setattr(main, "execute_trades", execute_spy)
 
-        # The tripwire: no module may resolve config.py's settings this run
+        # The tripwire: no module may resolve config.py's settings, or read the
+        # saved defaults, this run
         def tripwire(*args, **kwargs):
-            raise AssertionError("live_settings() read during a run handed its settings")
+            raise AssertionError("settings read during a run handed its settings")
 
         for module in (config, scanner_mod, strategy_mod, trader_mod, main):
             monkeypatch.setattr(module, "live_settings", tripwire)
+        for module, name in ((config, "live_defaults"), (config, "read_saved_live_defaults"),
+                             (main, "live_defaults")):
+            monkeypatch.setattr(module, name, tripwire)
 
         calls: dict = {}
 
@@ -2500,6 +2690,52 @@ class TestLiveSettingsReachEverySite:
         # Dev never submits an order, so never the production WARNING
         assert "This PRODUCTION run overrides" not in caplog.text
 
+    def _saved_and_resolved(self) -> tuple[LiveSettings, LiveSettings]:
+        """
+        Save _SETTINGS as the live defaults and resolve them as main() does.
+
+        Through main._resolve_live_settings, with the scheduler's argv plus
+        --dry-run (no toggle flag), before any tripwire is in place.
+
+        Returns:
+            tuple[LiveSettings, LiveSettings]: (the run's settings, the saved
+                defaults they were built from).
+        """
+        cfg = live_settings()
+        # Every toggle of the saved defaults differs from config.py's
+        for name in config.LIVE_TOGGLE_FIELDS:
+            assert getattr(self._SETTINGS, name) != getattr(cfg, name), name
+        config.save_live_defaults(self._SETTINGS, source="a note")
+        args = SimpleNamespace(mode="prod", dry_run=True)
+        settings, reference = main._resolve_live_settings(args, MagicMock())
+        assert settings == reference == self._SETTINGS
+        assert reference.origin.startswith("live_defaults.json, saved ")
+        assert reference.origin.endswith(" from a note")
+        return settings, reference
+
+    @pytest.mark.parametrize("mode", ["prod", "dev"])
+    def test_a_run_from_saved_defaults_reads_them_at_every_site(
+        self, monkeypatch, caplog, mode,
+    ):
+        settings, reference = self._saved_and_resolved()
+        settings, reference, calls, captured = self._run_under_the_tripwire(
+            monkeypatch, caplog, mode, settings=settings, reference=reference)
+        self._assert_every_site_read_the_runs_settings(settings, calls)
+        results = captured["results"]
+        assert {r.status for r in results} == {"simulated"}
+        assert {r.spec.pair.pair_type for r in results} == {"time_series", "same_title"}
+        # The run names the saved file, and its settings carry no mark: no flag moved one
+        assert f"Live defaults: {reference.origin}" in caplog.text
+        echo = f"Live settings: {describe_live_settings(settings, reference)}"
+        assert echo in caplog.text
+        assert "(default:" not in echo and "(config:" not in echo
+        assert "This PRODUCTION run overrides" not in caplog.text
+        if mode == "prod":
+            # The workbook's separator row names the saved file too
+            assert captured["run_note"] == (
+                f"settings: {describe_live_settings(settings, reference)} | defaults: "
+                f"{reference.origin}")
+
     @pytest.mark.parametrize("mode", ["prod", "dev"])
     def test_a_run_with_no_pairs_names_its_own_rule(self, monkeypatch, caplog, mode):
         settings = dataclasses.replace(live_settings(), tier_floors=False,
@@ -2523,6 +2759,159 @@ class TestLiveSettingsReachEverySite:
         assert config.describe_time_series_rule(False, (0.0, 0.5)) in line, line
         assert config.describe_time_series_rule(True, (0.0, 1.0)) not in line, line
         assert ("in sandbox" in line) is (mode == "dev")
+
+
+@pytest.mark.usefixtures("pinned_config_toggles")
+class TestSavedLiveDefaults:
+    """A live run through main() starts from the saved live defaults: one read of
+    the file per run (a counting spy), the file named on a "Live defaults:" line,
+    each field a flag moves marked "(default: X)" (plus the production WARNING
+    when orders go out), and the trade log's separator note naming the file. The
+    saved values differ from the pinned config.py toggles in every field, so a
+    site that read config.py instead would show."""
+
+    # Every toggle differs from the pinned constants; both pairs of the
+    # live-shape replay trade under it
+    _SAVED = TestLiveSettingsReachEverySite._SETTINGS
+
+    def _save(self) -> LiveSettings:
+        """
+        Save _SAVED as this test's live defaults.
+
+        Returns:
+            LiveSettings: The saved defaults as read back (their origin names the
+                file and the "a note" source).
+        """
+        cfg = live_settings()
+        for name in config.LIVE_TOGGLE_FIELDS:
+            assert getattr(self._SAVED, name) != getattr(cfg, name), name
+        return config.save_live_defaults(self._SAVED, source="a note")
+
+    def test_the_schedulers_argv_runs_on_the_saved_defaults_read_once(
+        self, monkeypatch, caplog,
+    ):
+        saved = self._save()
+        reads: list = []
+        real_read = config.read_saved_live_defaults
+
+        def counting_read():
+            """
+            Count one read of the saved file, then read it.
+
+            Returns:
+                LiveSettings | None: What config.read_saved_live_defaults returns.
+            """
+            reads.append(1)
+            return real_read()
+
+        monkeypatch.setattr(config, "read_saved_live_defaults", counting_read)
+        # Every parse of the file's bytes too, so a second read that bypasses the
+        # reader would still be counted
+        parses: list = []
+        real_parse = config._settings_from_bytes
+
+        def counting_parse(data: bytes) -> LiveSettings:
+            """
+            Count one parse of saved-defaults bytes, then parse them.
+
+            Args:
+                data (bytes): The file's bytes.
+
+            Returns:
+                LiveSettings: What config._settings_from_bytes returns.
+            """
+            parses.append(1)
+            return real_parse(data)
+
+        monkeypatch.setattr(config, "_settings_from_bytes", counting_parse)
+        seen: dict = {}
+        real_prod = main._run_prod
+
+        def prod_spy(client, args, settings, reference):
+            """
+            Record what main() hands the production run mode, then run it.
+
+            Args:
+                client: The client main() built.
+                args (argparse.Namespace): The parsed flags.
+                settings (LiveSettings): The run's settings.
+                reference (LiveSettings): The saved defaults they were built from.
+
+            Returns:
+                int: What main._run_prod returns.
+            """
+            seen.update(settings=settings, reference=reference)
+            return real_prod(client, args, settings, reference)
+
+        with caplog.at_level(logging.INFO):
+            out = _main_with(
+                monkeypatch, ["--mode", "prod"], _run_prod=prod_spy,
+                verify_auth=lambda client: {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1},
+            )
+        assert out["code"] == EXIT_SKIPPED_LOW_BALANCE
+        # One read for the whole run, before logging, the client and the run mode
+        assert len(reads) == 1 and len(parses) == 1
+        assert seen["settings"] == seen["reference"] == self._SAVED
+        assert seen["settings"].origin == seen["reference"].origin == saved.origin
+        assert saved.origin.startswith("live_defaults.json, saved ")
+        assert saved.origin.endswith(" from a note")
+        # The file is named, and the settings line carries no mark
+        info = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert f"Live defaults: {saved.origin}" in info
+        (line,) = [m for m in info if m.startswith("Live settings:")]
+        assert line == f"Live settings: {describe_live_settings(self._SAVED)}"
+        assert "(default:" not in line and "(config:" not in line
+        assert "PRODUCTION run overrides" not in caplog.text
+
+    def test_a_flag_marks_the_saved_default_and_warns(self, monkeypatch, caplog):
+        self._save()
+        code = _prod_until_the_balance_gate(
+            monkeypatch, ["--interval-discount", "0.7"], caplog)
+        assert code == EXIT_SKIPPED_LOW_BALANCE
+        (line,) = [r.getMessage() for r in caplog.records
+                   if r.levelno == logging.INFO and r.getMessage().startswith("Live settings:")]
+        assert "k 0.7 (default: 0.6)" in line
+        assert line.count("(default:") == 1 and "(config:" not in line
+        warned = [r for r in caplog.records if r.levelno == logging.WARNING
+                  and "This PRODUCTION run overrides the saved live defaults" in r.getMessage()]
+        assert len(warned) == 1
+
+    def test_the_separator_note_names_the_saved_defaults(self, monkeypatch, caplog):
+        saved = self._save()
+        client = _live_shape_client(
+            monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True)
+        # A fresh cached listing for the saved category/tag filter: no request
+        _seed_series_listing(TestLiveSettingsReachEverySite._LISTING)
+        captured: dict = {}
+
+        def fake_append_to_prod_log(results, balance_before, balance_after, *, run_note=""):
+            """
+            Record the run's results and separator note instead of writing a workbook.
+
+            Args:
+                results (list[TradeResult]): The run's trade results.
+                balance_before (float): The balance before the run, in dollars.
+                balance_after (float | None): The balance after it, in dollars.
+                run_note (str): Keyword-only. The separator row's note.
+
+            Returns:
+                pathlib.Path: A path standing in for the workbook.
+            """
+            captured["results"] = results
+            captured["run_note"] = run_note
+            return pathlib.Path("/fake/trade_log.xlsx")
+
+        monkeypatch.setattr(main, "append_to_prod_log", fake_append_to_prod_log)
+        with caplog.at_level(logging.INFO):
+            out = _main_with(monkeypatch, ["--mode", "prod", "--dry-run",
+                                           "--same-title-size-cap", "20"],
+                             _run_prod=main._run_prod, build_client=lambda mode: client)
+        assert out["code"] == EXIT_OK
+        assert {r.status for r in captured["results"]} == {"simulated"}
+        note = captured["run_note"]
+        assert note.startswith("settings: ")
+        assert "same-title cap 20% (default: 25%)" in note
+        assert note.endswith(f" | defaults: {saved.origin}")
 
 
 # A third deadline of the TS-EARLY / TS-LATE question, in an event of its own
@@ -3191,6 +3580,8 @@ class TestRunDevExitCode:
         assert code == EXIT_OK
 
 
+# main.main() starts only from saved live defaults: config.py's, saved first
+@pytest.mark.usefixtures("saved_live_defaults")
 class TestMainEntryPoint:
     @patch("kalshi_betting.main.write_dev_simulation")
     @patch("kalshi_betting.main.enrich_with_orderbook_prices")
@@ -3405,6 +3796,7 @@ class TestLoggingRotation:
             root.handlers = saved_handlers
             root.level = saved_level
 
+    @pytest.mark.usefixtures("saved_live_defaults")
     def test_main_installs_the_rotating_handler(self, tmp_path, monkeypatch):
         # End-to-end: main() must route through _setup_logging, so the
         # rotating handler is what a real run actually gets.
@@ -3450,6 +3842,7 @@ class TestLoggingRotation:
             root.setLevel(saved_level)
 
 
+@pytest.mark.usefixtures("saved_live_defaults")
 class TestDryRunInertInDev:
     """BS-32: --dry-run has no effect in dev mode (dev always simulates), so
     main() logs a warning naming that rather than leaving it silently
@@ -3510,6 +3903,7 @@ def test_exit_code_constants_distinct():
     }) == 4
 
 
+@pytest.mark.usefixtures("saved_live_defaults")
 class TestSandboxBalanceInertInProd:
     """
     TS-19: --sandbox-balance is read only by _run_dev. Passing it in prod

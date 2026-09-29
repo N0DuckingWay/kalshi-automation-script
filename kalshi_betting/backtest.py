@@ -37,8 +37,9 @@ Dependencies:
     time_series_spread_too_wide — backtest is one of the four band readers
     tests/test_strategy.py::TestTimeSeriesKellyParity::
     test_ast_live_path_reads_toggles_only_through_live_settings allows — and
-    live_settings / describe_time_series_rule / describe_trade_filter (the
-    pre-fetch echo's "live rule=" clause). Entry point for
+    live_defaults with its LiveDefaultsError / LiveDefaultsMissing refusals,
+    describe_time_series_rule and describe_trade_filter (the pre-fetch echo's
+    "live rule=" clause, which names the saved live defaults). Entry point for
     `python3 -m kalshi_betting.backtest`.
 
 Notes:
@@ -48,8 +49,9 @@ Notes:
 
     --interval-discount overrides the time-series interval discount k for this
     run ONLY: no live module imports this one (main.py's --interval-discount is
-    a separate flag), and nothing here writes config.py — the calibration the
-    run reports is a recommendation for a human to act on.
+    a separate flag), and nothing here writes config.py or the saved live
+    defaults — the calibration the run reports is a recommendation for a human
+    to act on.
 
     --same-event-ladders / --no-same-event-ladders (DR-73) is the same kind of
     one-run override for config.TIME_SERIES_SAME_EVENT_LADDERS, and also never
@@ -125,12 +127,17 @@ Notes:
     --no-cap-sweep returns cap_sweep=None, and the dashboard then offers the
     run's own cap only — a far smaller page, built far faster. Like the band
     and k sweeps it is backtest-only: live sizing reads
-    its caps from its run's config.LiveSettings.
+    its caps from its run's config.LiveSettings, built from the saved live
+    defaults.
 
-    The pre-fetch echo's "live rule=" clause names config.py's own live rule
-    and, when one is set, its category/tag filter (never main.py's per-run
-    overrides), read failing soft; run_backtest_sweep logs where THIS run's grid holds that rule.
-    Nothing chosen here or on the dashboard changes what the live bot does.
+    The pre-fetch echo's "live rule=" clause names the saved live defaults'
+    time-series rule and, when one is set, their category/tag filter (never
+    main.py's per-run overrides), from a read of its own, failing soft;
+    run_backtest_sweep reads them again and logs where THIS run's grid holds
+    that rule. Only the dashboard's "Save as live defaults…" button (or
+    python3 -m kalshi_betting.defaults_server --seed), confirmed through
+    defaults_server, sets the live defaults; nothing else chosen here reaches
+    live trading.
 """
 import argparse
 import logging
@@ -147,9 +154,11 @@ from .config import (
     SHORT_DEADLINE_GAP_DAYS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     TIME_SERIES_SAME_EVENT_LADDERS,
+    LiveDefaultsError,
+    LiveDefaultsMissing,
     describe_time_series_rule,
     describe_trade_filter,
-    live_settings,
+    live_defaults,
     time_series_spread_band,
     time_series_spread_too_wide,
 )
@@ -300,8 +309,8 @@ def main() -> None:
         "--interval-discount", type=float, default=None, metavar="K",
         help="Override the time-series interval discount k for this backtest "
              "(0-1; default: config.TIME_SERIES_INTERVAL_PROB_DISCOUNT). Affects "
-             "this backtest only — the live sizer reads config.py's own k unless "
-             "main.py's own --interval-discount overrides it for one live run.",
+             "this backtest only — the live sizer reads the saved live defaults' k "
+             "unless main.py's own --interval-discount overrides it for one live run.",
     )
     parser.add_argument(
         "--no-sweep", action="store_true",
@@ -331,7 +340,7 @@ def main() -> None:
              "default: config.BACKTEST_DEFAULT_SPREAD_BAND's floor (the "
              "deadline-gap tier alone while that floor is 0). Given alone, "
              "the ceiling comes from that default. Backtest only — live "
-             "trading reads config.TIME_SERIES_SPREAD_BAND, or main.py's own "
+             "trading reads the saved live defaults' band, or main.py's own "
              "--spread-min / --spread-max for one live run.",
     )
     parser.add_argument(
@@ -340,7 +349,7 @@ def main() -> None:
              "scenario; default: config.BACKTEST_DEFAULT_SPREAD_BAND's "
              "ceiling (no ceiling while it is 1). Given alone, the floor "
              "comes from that default. Backtest only — live trading reads "
-             "config.TIME_SERIES_SPREAD_BAND, or main.py's own --spread-min / "
+             "the saved live defaults' band, or main.py's own --spread-min / "
              "--spread-max for one live run.",
     )
     parser.add_argument(
@@ -355,8 +364,8 @@ def main() -> None:
         help="Skip the per-trade size-cap sweep: the dashboard offers the "
              "run's own cap (config.BUDGET_FRACTION) only — a far smaller, "
              "faster page. Backtest only — live sizing reads its caps from "
-             "config.py (BUDGET_FRACTION, SAME_TITLE_SIZE_CAP), or main.py's "
-             "own --size-cap / --same-title-size-cap for one live run",
+             "the saved live defaults, or main.py's own --size-cap / "
+             "--same-title-size-cap for one live run",
     )
     args = parser.parse_args()
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
@@ -467,17 +476,21 @@ def main() -> None:
     # opt-out saves nothing in the run itself — only the time and size of
     # whatever report reads the cells, and the entries kept alive for it
     cap_sweep = not args.no_cap_sweep
-    # config.py's live rule and filter, for the echo only. Fails soft, unlike
-    # the checks above (one echo clause must not abort a run);
-    # run_backtest_sweep's own read logs the WARNING.
+    # The saved live defaults' rule and filter, for the echo only: a read of its
+    # own, separate from run_backtest_sweep's (which logs the INFO or WARNING).
+    # Fails soft, unlike the checks above (one echo clause must not abort a run)
     try:
-        _live = live_settings()
+        _live = live_defaults()
         live_rule_echo = describe_time_series_rule(_live.tier_floors, _live.spread_band)
         # The category/tag filter only when one is set, in the live run's words
         if _live.categories is not None or _live.tags is not None:
             live_rule_echo += f"; category/tag filter ({describe_trade_filter(_live)})"
-    except ValueError as e:
-        live_rule_echo = f"not recorded — config.py's live toggles do not validate ({e})"
+        # Which saved file, when and from what
+        live_rule_echo += f" ({_live.origin})"
+    except LiveDefaultsMissing:
+        live_rule_echo = "none saved (live runs refuse to start)"
+    except LiveDefaultsError as e:
+        live_rule_echo = f"not recorded — the saved live defaults are refused ({e})"
 
     logging.info(
         "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f | ladders=%s "

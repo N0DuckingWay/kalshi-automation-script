@@ -17,16 +17,22 @@ Dependencies:
     EXIT_NO_TRADEABLE_SHARDS / EXIT_TIME_SERIES_SKIPPED exit-code constants
     from config.py — the EXIT_* imports are what let run_job() map the
     subprocess's exit code to a distinct log level/message rather than
-    treating every nonzero code identically. Spawns kalshi_betting.main as a
+    treating every nonzero code identically — and read_saved_live_defaults,
+    which _check_live_defaults reads once at daemon start. Spawns kalshi_betting.main as a
     subprocess (via sys.executable) rather than importing it directly, to
     isolate run-time errors and capture stdout/stderr separately. Entry point for
     `python3 -m kalshi_betting.scheduler`.
 
 Notes:
-    The scheduler runs the bot in production mode (--mode prod). For the bot to
-    trade, valid prod credentials must be present in secrets.json and the PEM key
-    file. To change the run day or time, edit config.SCHEDULED_RUN (the
-    backtest enters trades at the same moments).
+    The scheduler runs the bot in production mode (--mode prod) with no live
+    toggle flag, so a scheduled run trades exactly the saved live defaults
+    (live_defaults.json). For the bot to trade, valid prod credentials must be
+    present in secrets.json and the PEM key file, and live defaults must be
+    saved: with none saved, or a saved file that is refused, every run exits 2
+    (logged as "Job failed (exit 2)", and the slot is spent), and main() logs
+    an ERROR saying so as soon as the daemon starts (_check_live_defaults). To
+    change the run day or time, edit config.SCHEDULED_RUN (the backtest enters
+    trades at the same moments).
 
     Host clock: `schedule` fires on the computer's local clock and must stay
     that way, never `.at(time, tz)` (see _weekly_job). At startup
@@ -85,6 +91,7 @@ from .config import (
     SCHEDULER_BLIND_MAX_RETRIES,
     SCHEDULER_BLIND_RETRY_SECONDS,
     SCHEDULER_JOB_TIMEOUT_SECONDS,
+    read_saved_live_defaults,
 )
 
 # Schema version for scheduler_state.json — bump if the record shape changes
@@ -767,6 +774,36 @@ def _startup_catch_up() -> None:
         logging.exception("Startup catch-up check raised — daemon continues")
 
 
+def _check_live_defaults() -> None:
+    """
+    Log an ERROR at daemon start when the weekly run would refuse to start.
+
+    A live run exits 2 when no live defaults are saved or the saved file is
+    refused. The daemon says so as soon as it starts, naming the fix, rather
+    than only after the next Monday run has spent its slot. Nothing is logged
+    when a usable file is saved.
+
+    Returns:
+        None
+
+    Raises:
+        Nothing: any exception from the read is logged as an ERROR instead,
+            so the daemon still registers its weekly job.
+    """
+    try:
+        # The one read the daemon makes of the saved defaults; main.py reads
+        # them again, itself, on every run it spawns
+        saved = read_saved_live_defaults()
+    except Exception as exc:     # a refused file, or anything unexpected
+        logging.error("The saved live defaults are refused (%s): every scheduled run "
+                      "will exit 2 until the file is fixed or saved again", exc)
+        return
+    if saved is None:
+        logging.error("No live defaults are saved: every scheduled run will exit 2 until "
+                      "they are (python3 -m kalshi_betting.defaults_server --seed, or the "
+                      "backtest dashboard's Save as live defaults… button)")
+
+
 def _setup_logging(log_path: pathlib.Path) -> None:
     """
     Configure root logging with both a console handler and a rotating file
@@ -811,12 +848,14 @@ def main() -> None:
     """
     Entry point for the weekly scheduler daemon.
 
-    Sets up logging, checks the host's clock (_host_clock_realises_run), runs
-    the startup catch-up (_startup_catch_up), registers run_job() at
-    SCHEDULED_RUN's weekday and time through _guarded_job(), then polls every
-    60 seconds. The clock check and the catch-up never raise, so the weekly
-    job is always registered. With no scheduler_state.json yet, the catch-up
-    runs the bot at once.
+    Sets up logging, checks the host's clock (_host_clock_realises_run), logs
+    an ERROR when no usable live defaults are saved (_check_live_defaults:
+    every run would exit 2 until they are), runs the startup catch-up
+    (_startup_catch_up), registers run_job() at SCHEDULED_RUN's weekday and
+    time through _guarded_job(), then polls every 60 seconds. The clock
+    check, the live-defaults check and the catch-up never raise, so the
+    weekly job is always registered. With no scheduler_state.json yet, the
+    catch-up runs the bot at once.
     """
     # The daemon logs to its OWN file — see _SCHEDULER_LOG_PATH for why it
     # must not share kalshi_arb.log with the subprocess that rotates it.
@@ -827,6 +866,11 @@ def main() -> None:
     # handler and make _setup_logging's basicConfig a no-op, so the log file
     # would never be written. It never raises, so what follows always runs.
     _host_clock_realises_run()
+
+    # Say now, not after next Monday's run, when every run would exit 2 for
+    # want of saved live defaults (never raises, so the weekly job is still
+    # registered below)
+    _check_live_defaults()
 
     # Catch up on a missed run before registering future ones.
     # _startup_catch_up logs any raise (e.g. from a corrupt

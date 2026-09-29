@@ -3452,7 +3452,8 @@ def find_time_series_pairs(
             every caller does today, making the fallback unreachable. None
             excludes no shard.
         settings (LiveSettings | None): Keyword-only. The run's toggles (items 6
-            and 8). None resolves config.live_settings() once.
+            and 8). None resolves config.live_settings() once (tests and
+            direct calls only: a live run hands the run's settings).
         held_ladders (frozenset): Keyword-only. Ladder labels of the markets we
             hold, from resolve_held_ladders (item 0). Empty refuses nothing.
 
@@ -4962,7 +4963,8 @@ def enrich_with_orderbook_prices(
             real-money path with no signal that it had.
         settings (LiveSettings | None): Keyword-only. The run's toggles (the
             price-sum ceiling, the spread rule, the affordability bound). None
-            resolves config.live_settings() once.
+            resolves config.live_settings() once (tests and direct calls only:
+            a live run hands the run's settings).
 
     Returns:
         list: One CandidatePair per input pair, in the same order, with the
@@ -5227,7 +5229,8 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
         client: Authenticated KalshiClient from auth.build_client().
         spec: TradeSpec whose pair prices should be re-validated.
         settings (LiveSettings | None): Keyword-only. The run's toggles; None
-            resolves config.live_settings().
+            resolves config.live_settings() (tests and direct calls only: a
+            live run hands the run's settings).
 
     Returns:
         bool: True if the pair still qualifies; False if prices moved or order

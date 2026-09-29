@@ -71,8 +71,10 @@ Dependencies:
     band's tier-on run may stand in for its tier-floors-off view, or the
     whole off view is withheld — the family's calibration keys, never this
     test, decide which bands were simulated again), _live_rule_view() with
-    its _LIVE_RULE_* verdicts, _live_rule_ladder_note() and _live_filter_text()
-    (the live-rule line's pieces, shared with the run's log line) — and reads
+    its _LIVE_RULE_* verdicts, _live_rule_ladder_note(), _live_filter_text(),
+    _live_sizing_note(), _LIVE_RULE_LABEL and _LIVE_RULE_NONE (the live-rule
+    line's pieces, shared with the run's log line, which names the saved live
+    defaults) — and reads
     BacktestSweep.cap_sweep (a backtester.CapSweep) by its attributes — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT,
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
@@ -345,6 +347,8 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 from .backtester import (
+    _LIVE_RULE_LABEL,
+    _LIVE_RULE_NONE,
     _LIVE_RULE_NOT_SIMULATED,
     _LIVE_RULE_PRIMARY,
     BacktestSweep,
@@ -362,6 +366,7 @@ from .backtester import (
     _live_filter_text,
     _live_rule_ladder_note,
     _live_rule_view,
+    _live_sizing_note,
     _tier_floors_bind,
     max_trades_simulated,
 )
@@ -961,9 +966,9 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
         k (float | None): Interval-discount override in [0, 1] handed straight to
             config.time_series_profit_prob. None (default) means "no override",
             which that helper resolves at call time to
-            config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the value live sizing
-            reads on a run without main.py's --interval-discount. Ignored for
-            same_title, which prices on a fixed prior.
+            config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (config.py's k, which
+            the backtest defaults to; live sizing reads the saved live
+            defaults' k). Ignored for same_title, which prices on a fixed prior.
 
     Returns:
         float: Uncapped Kelly fraction, clamped to be >= 0.
@@ -1888,6 +1893,13 @@ _KD_TEXT = {
                "(the log names the error): it shows the run's own k and size cap."),
 }
 
+# What live trading reads for k and for the tier floors, as the page's captions
+# name it: the saved live defaults, which a main.py flag overrides for one run
+_LIVE_K_READ = ("the saved live defaults' k (main.py --interval-discount overrides it for "
+                "one run)")
+_LIVE_TIER_FLOORS_READ = ("the saved live defaults' tier floors (main.py --tier-floors / "
+                          "--no-tier-floors overrides them for one run)")
+
 # The k-hat cards' caption, under the Portfolio Performance cards
 # (_section_performance's extra_kpis): what the two figures are, and that
 # they follow the filter bar.
@@ -1899,9 +1911,7 @@ _KHAT_CARDS_CAPTION = (
     "size cap. k&#770; − k is that figure minus the k shown: positive means the in-between "
     "outcome landed more often than the sizer assumed, i.e. it sized too big. The Empirical "
     "k&#770; section below breaks the same figure down by category, tag and spread band. "
-    "Recommendation only: live sizing reads "
-    "config.TIME_SERIES_INTERVAL_PROB_DISCOUNT unless main.py --interval-discount "
-    "overrides it for one run.</p>")
+    f"Recommendation only: live sizing reads {_LIVE_K_READ}.</p>")
 
 
 def _khat_delta_value(khat: float | None, k: float | None) -> float | None:
@@ -2429,9 +2439,8 @@ def _section_interval_discount(
 
     cal_table += (
         "<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
-        "Recommendation only — the backtester never writes config.py, and live "
-        "sizing reads config.TIME_SERIES_INTERVAL_PROB_DISCOUNT unless main.py "
-        "--interval-discount overrides it for one run.</p>"
+        "Recommendation only — the backtester never writes config.py or the saved "
+        f"live defaults, and live sizing reads {_LIVE_K_READ}.</p>"
     )
 
     # ── The equity curve at the k and cap shown: one trace, no selector ─────
@@ -2875,8 +2884,7 @@ def _section_khat(payload: dict | None, k_used: float | None) -> str:
         "the highlighted bar is the tag's category. A bar rests on its entries, but "
         "entries of one event (a ladder's rungs) settle together, so its event count is "
         "the better measure of how much evidence it holds. Recommendation only: live "
-        "sizing reads config.TIME_SERIES_INTERVAL_PROB_DISCOUNT unless main.py "
-        "--interval-discount overrides it for one run.</p>"
+        f"sizing reads {_LIVE_K_READ}.</p>"
     )
     notice_style = "font-family:sans-serif;font-size:14px;color:#616161;"
     if payload is None:
@@ -3968,14 +3976,109 @@ def _live_filter_options(categories: tuple[str, ...] | None,
             if (wanted is None or names[ci].casefold() in wanted) and tag.casefold() in tagged]
 
 
+def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
+                            shown: tuple[int | None, bool] | None) -> str:
+    """
+    Say how this page's filter bar shows the saved defaults' sizing, or what it cannot show.
+
+    Added to the live-rule line only after backtester._live_sizing_note, i.e.
+    when the saved defaults' k or caps differ from this run's primary, and
+    only where the line says this page shows the live rule: choosing a k and
+    a cap in the bar then shows that rule at them. The bar offers k and a
+    per-trade size cap; the same-title cap every row sized under is the run's
+    own (BacktestSweep.same_title_size_cap), never a bar choice.
+
+    Args:
+        sweep (BacktestSweep): The run's sweep, its live_* sizing recorded.
+        bar (dict | None): _filter_payload's base block ("ks" and "caps", each
+            [{label, value}], "primary", and "grid" / "grid_off", each
+            [band][k][cap] -> chunk id or null), or None when the page has no
+            filter bar.
+        shown (tuple[int | None, bool] | None): Where the bar holds the live
+            rule: its band's index in the bar (None when there is no bar) and
+            whether the tier-on grid holds it (False: the tier-floors-off
+            grid). None when this page does not show the live rule at all,
+            which the line has already said.
+
+    Returns:
+        str: "" when shown is None; "; choose <k option> and Size cap <cap
+            option> in the filter bar to see it" when the bar offers both
+            values, holds a scenario of the live rule there and the two
+            same-title caps agree; otherwise a "; ..." clause naming what the
+            bar cannot show.
+
+    Raises:
+        Nothing. It only reads the sweep and the bar's entries.
+    """
+    if shown is None:
+        return ""
+    if bar is None:
+        return "; this page's filter bar could not be built, so it does not show that sizing"
+    band, tier_on = shown
+    k, cap = sweep.live_interval_discount, sweep.live_size_cap
+    pk, pc = (bar.get("primary") or [None, None, None])[1:3]
+
+    def offered(entries: list | None, value: float,
+                chosen: int | None) -> tuple[int, str] | None:
+        """
+        Find the bar's option for a value.
+
+        Args:
+            entries (list | None): The bar's [{label, value}] entries ("ks"
+                or "caps").
+            value (float): The saved value to find.
+            chosen (int | None): The index the page was rendered at, whose
+                option the bar marks " (primary)".
+
+        Returns:
+            tuple[int, str] | None: The entry's index and the option text it
+                shows (its label, plus " (primary)" on the rendered one);
+                None when the bar does not offer the value.
+
+        Raises:
+            Nothing.
+        """
+        for i, entry in enumerate(entries or []):
+            if entry.get("value") == value:
+                return i, entry["label"] + (" (primary)" if i == chosen else "")
+        return None
+
+    k_found = offered(bar.get("ks"), k, pk)
+    cap_found = offered(bar.get("caps"), cap, pc)
+    same_title_agrees = sweep.live_same_title_size_cap == sweep.same_title_size_cap
+    if k_found is not None and cap_found is not None and same_title_agrees:
+        # The bar's scenario at that band, k and cap: a chunk id, or null where
+        # the run simulated none (a tier-floors-off cell at a cap the page could
+        # not simulate it at)
+        grid = bar.get("grid") if tier_on else bar.get("grid_off")
+        cell = None if grid is None else grid[band][k_found[0]][cap_found[0]]
+        if cell is None:
+            return (f"; this page's filter bar offers {k_found[1]} and Size cap "
+                    f"{cap_found[1]} but holds no scenario of the live rule there")
+        return (f"; choose {k_found[1]} and Size cap {cap_found[1]} in the filter bar "
+                "to see it")
+    missing = [text for found, text in ((k_found, _k_option(k)),
+                                        (cap_found, f"size cap {_cap_option(cap)}"))
+               if found is None]
+    parts = ([f"this page's filter bar does not offer {' or '.join(missing)}"]
+             if missing else [])
+    if not same_title_agrees:
+        parts.append("the same-title cap is not a filter-bar choice")
+    return "; " + ", and ".join(parts)
+
+
 def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     """
-    Render the page-header line naming config.py's LIVE rule, and where this page shows it.
+    Render the page-header line naming the saved live defaults' rule, and where this page shows it.
 
     Its own <p> under _run_settings_html's, never appended to it (tests pin that
-    line's "</p>" suffix). It reads the BacktestSweep.live_* fields the run recorded
-    before its fetch, never main.py's per-run overrides, and takes where the grid
-    holds the rule from backtester._live_rule_view, as the run's log line does.
+    line's "</p>" suffix). It reads the BacktestSweep.live_* fields the run
+    recorded from the saved live defaults before its fetch, never main.py's
+    per-run overrides, and takes where the grid holds the rule from
+    backtester._live_rule_view, as the run's log line does. When the saved
+    defaults size at a k or caps other than this run's primary, it says so
+    (backtester._live_sizing_note) and, where the page shows the rule, how
+    its filter bar shows it at that sizing (_live_sizing_bar_clause).
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
@@ -3985,13 +4088,16 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     Returns:
         str: One <p>, its text escaped: the rule, any live filter, the same-title cap
             and where (or whether) the page shows the rule, plus any ladder-departure
-            note; "Live rule (config.py): not recorded" when sweep is None or records
-            no live rule.
+            and sizing notes; "Live rule: not recorded" when sweep is None, and
+            backtester._LIVE_RULE_NONE's words when the run recorded no live rule.
     """
     style = '<p style="color:#616161; font-size:14px;">'
-    view = None if sweep is None else _live_rule_view(sweep)
+    if sweep is None:
+        # No run's sweep reached this page, so there is nothing to say about one
+        return style + "Live rule: not recorded</p>"
+    view = _live_rule_view(sweep)
     if view is None:
-        return style + "Live rule (config.py): not recorded</p>"
+        return style + html.escape(f"Live rule: {_LIVE_RULE_NONE}", quote=False) + "</p>"
     rule = describe_time_series_rule(sweep.live_tier_floors, sweep.live_spread_band)
     categories, tags = sweep.live_categories, sweep.live_tags
     filtered = categories is not None or tags is not None
@@ -4026,11 +4132,17 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     never_binds = ("" if sweep.live_tier_floors or not view.tier_floors else
                    " (no tier floor binds at this band, so off and on are one rule)")
     ladders = _live_rule_ladder_note(sweep)
+    # Where the bar holds the live rule, for the sizing clause: (the band's index
+    # in the bar, whether the tier-on grid holds it); None where the page does
+    # not show the rule
+    shown = None
     if view.where == _LIVE_RULE_NOT_SIMULATED:
         tail = "not simulated by this run"
     elif view.where == _LIVE_RULE_PRIMARY:
         chosen = "" if one_slice is None else f", with {one_slice} chosen in the filter bar"
         tail = f"this run's primary{never_binds}{chosen}{slices}{ladders}"
+        # The primary is a tier-on cell, at the band the page was rendered at
+        shown = (None if bar is None else bar["primary"][0], True)
     elif bar is None:
         tail = "not shown: this page's filter bar could not be built"
     else:
@@ -4039,17 +4151,22 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
         band = sweep.live_spread_band
         label = _band_option(band) if view.tier_floors else _band_label(band)
         entries = bar["bands"] if view.tier_floors else (bar.get("bands_off") or [])
-        option = next((e["option"] for e in entries if e["label"] == label), None)
-        if option is None:
+        index = next((i for i, e in enumerate(entries) if e["label"] == label), None)
+        if index is None:
             tail = "not shown: this page's filter bar does not offer that scenario"
         else:
+            option = entries[index]["option"]
             choices = ([f"Spread band {option}", f"Tier floors on{never_binds}"]
                        if view.tier_floors else ["Tier floors off", f"Spread band {option}"])
             if one_slice is not None:
                 choices.append(one_slice)
             tail = (f"choose {', '.join(choices[:-1])} and {choices[-1]} in the filter bar"
                     f"{slices}{ladders}")
-    text = f"Live rule (config.py): {rule}; {cap_clause} — {tail}"
+            shown = (index, view.tier_floors)
+    # The saved defaults' own sizing when it is not this run's, and where the bar shows it
+    note = _live_sizing_note(sweep)
+    sizing = f"{note}{_live_sizing_bar_clause(sweep, bar, shown)}" if note else ""
+    text = f"Live rule ({_LIVE_RULE_LABEL}): {rule}; {cap_clause} — {tail}{sizing}"
     return f"{style}{html.escape(text, quote=False)}</p>"
 
 
@@ -4276,9 +4393,9 @@ def _corpus_provenance_html(sweep: BacktestSweep | None, *,
 # The scenario explorer's tier-floors-off banner opens on this HTML, so none
 # of its figures can be read as the run's own: what "off" replaces (the entry
 # threshold max(tier, floor), and nothing else — backtester._find_entry with
-# tier_floors False), what still applies, where it changes nothing, and which
-# toggle live trading follows — the tiers and the gap cap named from
-# config (_TIER_FLOORS, MAX_DEADLINE_GAP_DAYS), never as literals.
+# tier_floors False), what still applies, where it changes nothing, and what
+# live trading follows (_LIVE_TIER_FLOORS_READ) — the tiers and the gap cap
+# named from config (_TIER_FLOORS, MAX_DEADLINE_GAP_DAYS), never as literals.
 _SCENARIO_TIER_OFF_LEAD = (
     "<b>Tier floors off:</b> each band's own floor replaces max(tier, floor) as the "
     f"time-series entry threshold, without the {_TIER_FLOORS} deadline-gap tier floors: "
@@ -4286,9 +4403,7 @@ _SCENARIO_TIER_OFF_LEAD = (
     f"ceiling, the {MAX_DEADLINE_GAP_DAYS}-day deadline-gap cap, the positive-spread rule "
     "(pB above pA), the fee check and the Kelly gate still apply. A band whose floor sits "
     "at or above both tiers was not simulated again, since they never bind there: its "
-    "cells are its run with them on. Live trading follows "
-    "config.TIME_SERIES_TIER_FLOORS (main.py --tier-floors / --no-tier-floors for "
-    "one run). ")
+    f"cells are its run with them on. Live trading follows {_LIVE_TIER_FLOORS_READ}. ")
 
 # The scenario explorer's tier-floors-off heatmap title (on every metric) and
 # k-hat table title end on this.
@@ -5408,16 +5523,15 @@ _TIER_OPTION_ON = (f"on ({_exact_label(MIN_PRICE_DIFF_SHORT_GAP, '.2f')} / "
 _TIER_OPTION_OFF = "off (each band's own floor alone)"
 
 # The Tier floors select's tooltip (its title attribute, escaped where the bar
-# renders it): what each setting admits, and which toggle live trading
-# follows — every number in it read from config.
+# renders it): what each setting admits, and what live trading follows
+# (_LIVE_TIER_FLOORS_READ) — every number in it read from config.
 _TIER_SELECT_TITLE = (
     "on — a time-series pair needs pB − pA of at least "
     f"{_exact_label(MIN_PRICE_DIFF_SHORT_GAP, '.2f')} when its deadlines are up to "
     f"{SHORT_DEADLINE_GAP_DAYS} days apart and {_exact_label(MIN_PRICE_DIFF_LONG_GAP, '.2f')} "
     f"for {SHORT_DEADLINE_GAP_DAYS + 1}–{MAX_DEADLINE_GAP_DAYS} days, and at least the "
     "band's floor; off — the band's floor alone (the spread must still be positive); "
-    "live trading follows config.TIME_SERIES_TIER_FLOORS (main.py --tier-floors / "
-    "--no-tier-floors for one run).")
+    f"live trading follows {_LIVE_TIER_FLOORS_READ}.")
 
 # What the filter bar reaches beyond the seven sections it re-scopes whole,
 # said once, for the bar's summary line and its tests: the interval-discount
