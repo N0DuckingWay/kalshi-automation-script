@@ -3210,8 +3210,8 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
                 " The V2 NO-leg mapping is not yet confirmed in this process and"
                 " a NO buy cannot move the position this way, so the mapping is"
                 " treated as disproven: the rest of this run is stopped and no"
-                " later pair sends any order; set config.ORDER_API_VERSION ="
-                " \"legacy\" to revert to the proven order path."
+                " later pair sends any order. Stop the bot and flatten this"
+                " position by hand in the Kalshi UI."
                 + _stop_run_on_v2_mapping_disproof()
             )
         logging.critical(
