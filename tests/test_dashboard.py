@@ -2397,6 +2397,75 @@ class TestLiveRuleHeader:
                          r'max\(tier,0\.3\)-0\.6</option>', page)
 
 
+class TestEntryCheckpointHeader:
+    """The page header names the entry checkpoint (the live scheduler's run
+    time, BacktestSweep.entry_checkpoint) under the run-settings line, or
+    says it was not recorded."""
+
+    _LABEL = "Monday 09:00 America/Los_Angeles"
+    _RECORDED = (f"Entry checkpoint: {_LABEL} — the live scheduler's run "
+                 "time</p>")
+    _NOT_RECORDED = "Entry checkpoint: not recorded</p>"
+
+    def test_a_recorded_checkpoint_is_named_under_the_run_settings(
+        self, monkeypatch, tmp_path,
+    ):
+        # A below-floor census renders the strike-blind notice too, so the
+        # regex below pins the line's place among all the header lines
+        pt = _scn_point((0.3, 0.6), 0.75)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              label_coverage=_coverage(0), scenarios=[],
+                              entry_checkpoint=self._LABEL)
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
+        assert self._RECORDED in page
+        assert self._NOT_RECORDED not in page
+        assert (page.index("Period:") < page.index("Primary spread band:")
+                < page.index("Entry checkpoint:") < page.index("Portfolio Performance"))
+        assert re.search(
+            r"\(size-cap sweep [^<]*\)</p>\n"
+            r"<p [^>]*>Live rule \(config\.py\):[^\n]*</p>\n"
+            rf'<p style="color:#616161; font-size:14px;">{re.escape(self._RECORDED)}\n'
+            r"<p [^>]*>Risk-free rate[^\n]*</p>\n"
+            r"<p [^>]*>Outcome-label coverage for this run is below the floor",
+            page)
+
+    def test_no_sweep_says_not_recorded(self, monkeypatch, tmp_path):
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path)
+        assert self._NOT_RECORDED in page
+
+    def test_a_sweep_without_one_says_not_recorded(self, monkeypatch, tmp_path):
+        pt = _scn_point((0.3, 0.6), 0.75)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None)
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
+        assert self._NOT_RECORDED in page
+        assert "the live scheduler&#x27;s run time" not in page
+        assert "the live scheduler's run time" not in page
+
+    @pytest.mark.parametrize("value", [None, "", MagicMock(), 7])
+    def test_anything_but_a_label_reads_not_recorded(self, value):
+        pt = _scn_point((0.3, 0.6), 0.75)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              entry_checkpoint=value)
+        assert dashboard._entry_checkpoint_html(sweep).endswith(self._NOT_RECORDED)
+
+    def test_the_label_is_escaped(self):
+        pt = _scn_point((0.3, 0.6), 0.75)
+        sweep = BacktestSweep(primary=pt, points=[pt], calibration=None,
+                              entry_checkpoint="Monday 09:00 <Zone>")
+        line = dashboard._entry_checkpoint_html(sweep)
+        assert "Entry checkpoint: Monday 09:00 &lt;Zone&gt; — the live" in line
+        assert "<Zone>" not in line
+
+    def test_a_run_s_sweep_reaches_the_page(self, monkeypatch, tmp_path):
+        # The label run_backtest_sweep records is the one the header prints
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        sweep = backtester.run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1),
+                                              1000.0, sweep=False)
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
+        assert (f"Entry checkpoint: {backtester.SCHEDULED_RUN.label()} — the live "
+                "scheduler's run time</p>") in page
+
+
 class TestCorpusProvenanceHeader:
     """DR-13 / M2 (P2): directly under the Period line the header says what
     settled-market corpus the run read — its assembly time (the Period runs to

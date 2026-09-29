@@ -1,4 +1,5 @@
 """Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
+import ast
 import gc
 import inspect
 import logging
@@ -6,6 +7,7 @@ import math
 import random
 import re
 import statistics
+import textwrap
 import time
 import weakref
 from array import array
@@ -16,6 +18,7 @@ from decimal import Decimal
 from fractions import Fraction
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfoNotFoundError
 
 import numpy as np
 import pandas as pd
@@ -49,8 +52,10 @@ from kalshi_betting.config import (
     MAX_DEADLINE_GAP_DAYS,
     MVE_SERIES_FAMILY_PREFIX,
     SAME_TITLE_CO_RESOLVE_PROB,
+    SCHEDULED_RUN,
     SPREAD_BAND_SWEEP_CEILINGS,
     SPREAD_BAND_SWEEP_FLOORS,
+    ScheduledRun,
     fee_leg_exact,
     fee_per_pair_approx,
     min_price_diff_for_gap,
@@ -60,6 +65,7 @@ from kalshi_betting.scanner import CandidatePair
 from kalshi_betting.strategy import compute_trade
 
 from .conftest import apply_pre_toggle_defaults
+from .test_scheduler import _host_zone
 
 
 class _WeakrefDict(dict):
@@ -2438,11 +2444,9 @@ class TestParseIsoDatetime:
 class TestCanEverEnter:
     """_can_ever_enter mirrors _find_entry's exact scan-window construction:
     upper = close_time's date - 1 day, and the market is eligible iff some
-    Monday on/after start_date and on or before upper has its 09:00 UTC
-    checkpoint strictly after open_time. Every market here opens at MIDNIGHT
-    UTC, where that is the same as the pre-P5 date test (a Monday on/after
-    max(open date, start_date)); the time-of-day cases are
-    TestCanEverEnterAtTheCheckpointInstant's."""
+    Monday on/after start_date and on or before upper has its checkpoint's
+    candle period starting after open_time. These markets open at midnight
+    UTC; TestCanEverEnterAtTheCheckpointInstant covers times of day."""
 
     def test_two_hour_market_never_spans_a_monday(self):
         # open == close date (a 2-hour market truncates to the same calendar
@@ -2511,14 +2515,12 @@ class TestCanEverEnter:
         assert _can_ever_enter(m, start_date=earlier_start) is True
 
 
-# ─── P5 (M8): the prefilter tests the checkpoint INSTANT, not the date ────────
+# ─── The prefilter places the opening against the checkpoint's candle period ─
 
 def _date_granular_can_ever_enter(m: dict, start_date: date) -> bool:
-    """The pre-P5 backtester._can_ever_enter, verbatim: open_time read as a DATE.
-
-    The reference the checkpoint-precise predicate must never widen, and the
-    predicate the result-neutrality tests below run the old pipeline under.
-    """
+    """A dates-only reference prefilter: some Monday from max(open date,
+    start_date) to the day before the close date. The real prefilter never keeps
+    a UTC-stamped market this drops; the result-neutrality tests use it as baseline."""
     open_d = _parse_iso_date(m.get("open_time"))
     close_d = _parse_iso_date(m.get("close_time"))
     if open_d is None or close_d is None:
@@ -2531,6 +2533,46 @@ def _date_granular_can_ever_enter(m: dict, start_date: date) -> bool:
     while d.weekday() != 0:
         d += timedelta(days=1)
     return d <= upper
+
+
+def _run_weekday_date_test(m: dict, start_date: date, weekday: int) -> bool:
+    """The date test on any run weekday: some `weekday` date in [max(open date,
+    start_date), close date - 1 day]. _can_ever_enter's rule for a naive
+    open_time; _scan_reachable passes the patched schedule's weekday."""
+    open_d = _parse_iso_date(m.get("open_time"))
+    close_d = _parse_iso_date(m.get("close_time"))
+    if open_d is None or close_d is None:
+        return True
+    d = max(open_d, start_date)
+    while d.weekday() != weekday:
+        d += timedelta(days=1)
+    return d <= close_d - timedelta(days=1)
+
+
+def _utc0900_can_ever_enter(m: dict, start_date: date) -> bool:
+    """_can_ever_enter's steps with the checkpoint fixed at Monday 09:00 UTC.
+    The shipped checkpoint (16:00 or 17:00 UTC) is later on the same UTC
+    date, so the real prefilter must admit every market this one admits."""
+    open_dt = _parse_iso_datetime(m.get("open_time"))
+    close_d = _parse_iso_date(m.get("close_time"))
+    if open_dt is None or close_d is None:
+        return True
+    open_utc = None
+    open_d = open_dt.date()
+    if open_dt.utcoffset() is not None:
+        try:
+            open_utc = open_dt.astimezone(UTC)
+        except OverflowError:
+            pass
+        else:
+            open_d = open_utc.date()
+    first = max(open_d, start_date)
+    room = (close_d - first).days - 1
+    ahead = (7 - first.weekday()) % 7
+    if (open_utc is not None and ahead == 0 and first == open_d
+            and open_utc >= datetime(first.year, first.month, first.day, 9, 0, tzinfo=UTC)):
+        ahead = 7
+    return ahead <= room
 
 
 _P5_HOUR = 3_600
@@ -2551,13 +2593,13 @@ def _scan_reachable(m: dict, start_date: date) -> bool:
     partner (the union of every partner's window is [start_date, close date
     - 1 day]) has a candle of this market at or before it, i.e. is at or after
     the market's first possible candle. A naive open_time has no instant, so
-    the date test is its whole answer."""
+    the date test on backtester.SCHEDULED_RUN's weekday is its whole answer."""
     open_dt = _parse_iso_datetime(m.get("open_time"))
     close_d = _parse_iso_date(m.get("close_time"))
     if open_dt is None or close_d is None:
         return True
     if open_dt.utcoffset() is None:
-        return _date_granular_can_ever_enter(m, start_date)
+        return _run_weekday_date_test(m, start_date, backtester.SCHEDULED_RUN.weekday)
     first = _first_candle_ts(open_dt)
     return any(first <= c for c in backtester._monday_timestamps(
         start_date, close_d - timedelta(days=1)))
@@ -2568,15 +2610,33 @@ def _mkt_at(open_time: str | None, close_time: str | None) -> dict:
     return {"open_time": open_time, "close_time": close_time}
 
 
+# Schedules the exactness test patches into backtester.SCHEDULED_RUN, placing
+# the checkpoint differently against hourly candles and the UTC date: shipped,
+# 09:00 UTC, 03:30 UTC (mid-hour), Thursday 16:30/17:30 UTC, and 00:00 UTC.
+_EXACTNESS_SCHEDULES = [
+    pytest.param(SCHEDULED_RUN, id="shipped"),
+    pytest.param(ScheduledRun(0, 9, 0, "UTC"), id="mon0900-UTC"),
+    pytest.param(ScheduledRun(0, 9, 0, "Asia/Kolkata"), id="mon0900-Kolkata"),
+    pytest.param(ScheduledRun(3, 9, 30, "America/Los_Angeles"), id="thu0930-Los_Angeles"),
+    pytest.param(ScheduledRun(0, 9, 0, "Asia/Tokyo"), id="mon0900-Tokyo"),
+]
+
+
 class TestCanEverEnterAtTheCheckpointInstant:
-    """M8 of the 2026-09-24 review (P5): _find_entry needs a candle at or
-    before Monday 09:00 UTC for both legs and a market has none before its
-    opening hour, so a market that opened AT or AFTER its only checkpoint can
-    never be entered. The pre-P5 predicate compared open_time by DATE and kept
-    it. 2026-09-21 is the 7-day review window's only Monday."""
+    """_find_entry needs each leg's candle at or before the checkpoint, and a
+    market has no candle ending at or before the start of the hour it opened
+    in, so one opening at or after the start of its only checkpoint's hour
+    never enters.
+    The checkpoint is 16:00 UTC on 2026-09-21 (daylight time), 17:00 UTC from 2026-11-02."""
 
     _START = date(2026, 9, 17)
     _CLOSE = "2026-09-24T12:15:33Z"   # no later Monday is admissible
+
+    def test_the_checkpoint_is_the_scheduled_run_instant(self):
+        monday = date(2026, 9, 21)
+        assert backtester.SCHEDULED_RUN == SCHEDULED_RUN
+        assert backtester._checkpoint_datetime(monday) == datetime(2026, 9, 21, 16, tzinfo=UTC)
+        assert backtester._checkpoint_datetime(monday) == SCHEDULED_RUN.instant(monday)
 
     def test_the_review_example_is_dropped_and_the_date_test_kept_it(self):
         # KXLOLMAP-26SEP240800MVKACBC-1-MVKA, the first record of the
@@ -2586,14 +2646,16 @@ class TestCanEverEnterAtTheCheckpointInstant:
         assert _date_granular_can_ever_enter(m, self._START) is True
 
     @pytest.mark.parametrize(("open_time", "kept"), [
-        ("2026-09-21T08:00:00Z", True),
-        # its first candle ends at 09:00, which counts as at or before the checkpoint
-        ("2026-09-21T08:30:00Z", True),
-        ("2026-09-21T08:59:59Z", True),
-        ("2026-09-21T08:59:59.999999Z", True),
-        # opened AT the checkpoint: its first candle ends at 10:00
-        ("2026-09-21T09:00:00Z", False),
-        ("2026-09-21T09:00:01Z", False),
+        # 02:00 in Los Angeles: before the run
+        ("2026-09-21T09:00:00Z", True),
+        ("2026-09-21T15:00:00Z", True),
+        # its first candle ends at 16:00, which counts as at or before the checkpoint
+        ("2026-09-21T15:30:00Z", True),
+        ("2026-09-21T15:59:59Z", True),
+        ("2026-09-21T15:59:59.999999Z", True),
+        # opened AT the checkpoint: its first candle ends at 17:00
+        ("2026-09-21T16:00:00Z", False),
+        ("2026-09-21T16:00:01Z", False),
         ("2026-09-21T23:59:59Z", False),
     ])
     def test_the_boundary_is_strictly_before_the_checkpoint(self, open_time, kept):
@@ -2602,22 +2664,49 @@ class TestCanEverEnterAtTheCheckpointInstant:
     def test_a_late_monday_opening_waits_for_the_next_monday(self):
         # The next Monday (09-28) is admissible only when the close date is
         # 09-29 or later (upper = close date - 1 day).
-        opened = "2026-09-21T10:00:00Z"
+        opened = "2026-09-21T17:00:00Z"
         assert _can_ever_enter(_mkt_at(opened, "2026-09-29T00:00:00Z"), self._START) is True
         assert _can_ever_enter(_mkt_at(opened, "2026-09-28T23:00:00Z"), self._START) is False
 
     @pytest.mark.parametrize(("open_time", "kept"), [
-        ("2026-09-21T04:59:59-04:00", True),    # 08:59:59Z
-        ("2026-09-21T05:00:00-04:00", False),   # 09:00:00Z
-        ("2026-09-21T22:59:59+14:00", True),    # 08:59:59Z
-        # a Tuesday local date, 10:30Z on the Monday: dropped either way
-        ("2026-09-22T00:30:00+14:00", False),
-        # a SUNDAY local date, 11:30Z on the Monday: the date test read Sunday
-        # and kept it; the instant is after the checkpoint
-        ("2026-09-20T23:30:00-12:00", False),
+        ("2026-09-21T11:59:59-04:00", True),    # 15:59:59Z
+        ("2026-09-21T12:00:00-04:00", False),   # 16:00:00Z
+        ("2026-09-22T05:59:59+14:00", True),    # 15:59:59Z
+        # a Tuesday local date, 16:30Z on the Monday: dropped either way
+        ("2026-09-22T06:30:00+14:00", False),
+        # a Tuesday local date, 15:30Z on the Monday: the date test drops it,
+        # but the UTC moment is before the checkpoint
+        ("2026-09-22T00:30:00+09:00", True),
+        # a SUNDAY local date, 11:30Z on the Monday: before the checkpoint
+        ("2026-09-20T23:30:00-12:00", True),
     ])
     def test_the_opening_is_compared_as_a_utc_instant(self, open_time, kept):
         assert _can_ever_enter(_mkt_at(open_time, self._CLOSE), self._START) is kept
+
+    @pytest.mark.parametrize(("monday", "hour"), [
+        (date(2026, 10, 26), 16),   # daylight time
+        (date(2026, 11, 2), 17),    # standard time, after the November change
+        (date(2027, 3, 8), 17),     # standard time
+        (date(2027, 3, 15), 16),    # daylight time, after the March change
+    ])
+    def test_the_checkpoint_instant_follows_the_clock_change(self, monday, hour):
+        assert backtester._checkpoint_datetime(monday) == \
+            datetime(monday.year, monday.month, monday.day, hour, tzinfo=UTC)
+
+    @pytest.mark.parametrize(("open_time", "close_time", "start", "kept"), [
+        # The checkpoint: 16:00 UTC in daylight time, 17:00 UTC in standard time
+        ("2026-10-26T15:59:59Z", "2026-10-29T00:00:00Z", date(2026, 10, 20), True),
+        ("2026-10-26T16:30:00Z", "2026-10-29T00:00:00Z", date(2026, 10, 20), False),
+        ("2026-11-02T16:30:00Z", "2026-11-05T00:00:00Z", date(2026, 10, 20), True),
+        ("2026-11-02T16:59:59Z", "2026-11-05T00:00:00Z", date(2026, 10, 20), True),
+        ("2026-11-02T17:00:00Z", "2026-11-05T00:00:00Z", date(2026, 10, 20), False),
+        ("2027-03-08T16:30:00Z", "2027-03-11T00:00:00Z", date(2027, 3, 2), True),
+        ("2027-03-08T17:00:00Z", "2027-03-11T00:00:00Z", date(2027, 3, 2), False),
+        ("2027-03-15T15:59:59Z", "2027-03-18T00:00:00Z", date(2027, 3, 2), True),
+        ("2027-03-15T16:30:00Z", "2027-03-18T00:00:00Z", date(2027, 3, 2), False),
+    ])
+    def test_the_checkpoint_follows_the_clock_change(self, open_time, close_time, start, kept):
+        assert _can_ever_enter(_mkt_at(open_time, close_time), start) is kept
 
     def test_a_naive_opening_keeps_the_date_test(self):
         # No offset: the instant is unknown, so the looser date test stands.
@@ -2626,19 +2715,16 @@ class TestCanEverEnterAtTheCheckpointInstant:
         assert _can_ever_enter(m, self._START) == _date_granular_can_ever_enter(m, self._START)
 
     @pytest.mark.parametrize(("open_time", "close_time", "kept"), [
-        # The UTC instant falls outside datetime's range (astimezone(UTC)
-        # raises OverflowError): the pre-P5 date test decides, exactly as it
-        # did.
+        # The UTC instant is outside datetime's range (OverflowError): the date test decides
         ("0001-01-01T00:00:00+14:00", "2026-01-20T00:00:00Z", True),
         ("9999-12-31T23:00:00-05:00", "9999-12-31T23:00:00Z", False),
-        # Monday 9999-12-27 opened after its checkpoint: the next Monday lies
-        # past date.max, so adding the week would raise ...
-        ("9999-12-27T10:00:00Z", "9999-12-31T00:00:00Z", False),
-        # ... and before it, that Monday is still reachable.
+        # Monday 9999-12-27's checkpoint is 17:00 UTC: earlier openings reach it ...
+        ("9999-12-27T10:00:00Z", "9999-12-31T00:00:00Z", True),
         ("9999-12-27T08:00:00Z", "9999-12-31T00:00:00Z", True),
+        # ... one at it needs a Monday past date.max: dropped, never an overflow
+        ("9999-12-27T17:00:00Z", "9999-12-31T00:00:00Z", False),
         # The advance to Monday would pass date.max, and a close on date.min
-        # would put the upper bound before it: the pre-P5 predicate raised on
-        # both.
+        # would put the upper bound before it.
         ("9999-12-28T00:00:00Z", "9999-12-31T00:00:00Z", False),
         ("2026-01-01T00:00:00Z", "0001-01-01T00:00:00Z", False),
     ])
@@ -2648,113 +2734,416 @@ class TestCanEverEnterAtTheCheckpointInstant:
         assert _can_ever_enter(_mkt_at(open_time, close_time), date(2026, 1, 1)) is kept
 
     def test_the_ends_of_the_date_range_stay_a_subset_of_the_date_test(self):
-        # Seeded sweep of openings, closes and start dates within a few weeks
-        # of either end of datetime's range, in offsets from -12:00 to +14:00:
-        # never an exception, and never a market the date test dropped.
+        # Seeded sweep near both ends of datetime's range, offsets -12:00 to +14:00:
+        # never an exception, and for openings at or west of +07:00 never a market
+        # the date test dropped (TestCanEverEnterMatchesTheScan explains the bound).
         rng = random.Random(1_2026_0924)
         zones = [timezone(timedelta(minutes=15 * q)) for q in range(-48, 57)]
         lo, hi = datetime(1, 1, 1), datetime(9999, 12, 31, 23, 59)
-        cases = 0
-        for _ in range(20_000):
+        cases = unplaceable = 0
+        for _ in range(30_000):
             end = rng.choice((lo, hi))
             sign = 1 if end is lo else -1
 
             def near(end=end, sign=sign):
                 return end + sign * timedelta(minutes=rng.randrange(0, 60 * 24 * 40))
 
-            open_s = near().replace(tzinfo=rng.choice(zones)).isoformat()
+            open_zone = rng.choice(zones)
+            opened = near().replace(tzinfo=open_zone)
+            open_s = opened.isoformat()
             close_s = near().replace(tzinfo=rng.choice(zones)).isoformat()
             start = near().date()
             m = _mkt_at(open_s, close_s)
-            new = _can_ever_enter(m, start)
+            new = _can_ever_enter(m, start)   # any offset: a verdict, never an exception
+            try:
+                opened.astimezone(UTC)
+            except OverflowError:
+                unplaceable += 1   # the predicate's OverflowError branch
+            if open_zone.utcoffset(None) > timedelta(hours=7):
+                continue
             try:
                 old = _date_granular_can_ever_enter(m, start)
             except OverflowError:
-                continue   # the pre-P5 predicate had no verdict to compare
+                continue   # the date-granular reference has no verdict to compare
             cases += 1
             assert not (new and not old), (open_s, close_s, start)
-        assert cases > 10_000
+        assert cases > 15_000
+        assert unplaceable > 50
 
     def test_a_start_date_on_the_opening_monday(self):
         monday = date(2026, 9, 21)
         assert _can_ever_enter(_mkt_at("2026-09-21T07:00:00Z", self._CLOSE), monday) is True
-        assert _can_ever_enter(_mkt_at("2026-09-21T12:00:00Z", self._CLOSE), monday) is False
+        assert _can_ever_enter(_mkt_at("2026-09-21T15:00:00Z", self._CLOSE), monday) is True
+        assert _can_ever_enter(_mkt_at("2026-09-21T17:00:00Z", self._CLOSE), monday) is False
 
     def test_an_opening_before_start_date_is_unaffected(self):
         m = _mkt_at("2026-09-10T15:00:00Z", self._CLOSE)
         assert _can_ever_enter(m, self._START) is True
 
     def test_the_checkpoint_is_the_scans_shared_definition(self, monkeypatch):
-        # The prefilter reads the checkpoint through the one helper
-        # _monday_timestamps builds the scan from, so moving it moves both.
+        # The scan and the prefilter both read backtester.SCHEDULED_RUN: a 16:30
+        # UTC opening misses 09:00 Los Angeles (16:00 UTC) but reaches 10:00 (17:00)
         monday = date(2026, 9, 21)
         assert backtester._monday_timestamps(monday, monday) == [
-            int(backtester._checkpoint_datetime(monday).timestamp())]
-        assert backtester._checkpoint_datetime(monday) == datetime(2026, 9, 21, 9, tzinfo=UTC)
-        m = _mkt_at("2026-09-21T09:30:00Z", self._CLOSE)
+            int(SCHEDULED_RUN.instant(monday).timestamp())]
+        m = _mkt_at("2026-09-21T16:30:00Z", self._CLOSE)
         assert _can_ever_enter(m, self._START) is False
-        monkeypatch.setattr(backtester, "_checkpoint_datetime",
-                            lambda d: datetime(d.year, d.month, d.day, 10, tzinfo=UTC))
+        later = ScheduledRun(0, 10, 0, "America/Los_Angeles")
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", later)
+        assert backtester._checkpoint_datetime(monday) == datetime(2026, 9, 21, 17, tzinfo=UTC)
+        assert backtester._monday_timestamps(monday, monday) == [
+            int(later.instant(monday).timestamp())]
         assert _can_ever_enter(m, self._START) is True
+
+    def test_the_run_weekday_is_the_schedules(self, monkeypatch):
+        # On a Thursday schedule the scan and the prefilter both walk Thursdays
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN",
+                            ScheduledRun(3, 9, 30, "America/Los_Angeles"))
+        thursday = date(2026, 9, 24)
+        assert backtester._monday_timestamps(date(2026, 9, 21), date(2026, 9, 27)) == [
+            int(datetime(2026, 9, 24, 16, 30, tzinfo=UTC).timestamp())]
+        # 09:30 Los Angeles is 16:30 UTC: an opening from 16:00 has no candle by then
+        assert _can_ever_enter(_mkt_at("2026-09-24T15:59:59Z", "2026-09-26T00:00:00Z"),
+                               thursday) is True
+        assert _can_ever_enter(_mkt_at("2026-09-24T16:00:00Z", "2026-09-26T00:00:00Z"),
+                               thursday) is False
+        assert _can_ever_enter(_mkt_at("2026-09-24T16:29:59Z", "2026-09-26T00:00:00Z"),
+                               thursday) is False
+        assert _can_ever_enter(_mkt_at("2026-09-20T12:00:00Z", "2026-09-23T00:00:00Z"),
+                               date(2026, 9, 17)) is False
+
+
+class TestCheckpointFloor:
+    """_checkpoint_floor: the start of the candle period holding the run's
+    instant. Cached per (schedule, date), so a patch needs no cache clearing.
+    None where the instant cannot be placed: _can_ever_enter then counts that
+    checkpoint as reachable (never raising) and lets the close date decide."""
+
+    def test_the_shipped_schedule_is_on_the_hour(self):
+        d = date(2026, 9, 21)
+        assert backtester._checkpoint_floor(SCHEDULED_RUN, d) == SCHEDULED_RUN.instant(d)
+
+    def test_an_instant_off_the_hour_floors_to_its_hour(self):
+        kolkata = ScheduledRun(0, 9, 0, "Asia/Kolkata")
+        d = date(2026, 9, 21)
+        assert kolkata.instant(d) == datetime(2026, 9, 21, 3, 30, tzinfo=UTC)
+        assert backtester._checkpoint_floor(kolkata, d) == datetime(2026, 9, 21, 3, tzinfo=UTC)
+
+    def test_a_patched_schedule_is_honoured_without_clearing_the_cache(self, monkeypatch):
+        # 03:10 UTC reaches the shipped 16:00 checkpoint, not Kolkata's 03:30 (floor 03:00)
+        d = date(2026, 9, 21)
+        m = _mkt_at("2026-09-21T03:10:00Z", "2026-09-24T00:00:00Z")
+        assert _can_ever_enter(m, d) is True
+        assert backtester._checkpoint_floor(SCHEDULED_RUN, d) == datetime(2026, 9, 21, 16, tzinfo=UTC)
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", ScheduledRun(0, 9, 0, "Asia/Kolkata"))
+        assert _can_ever_enter(m, d) is False
+        assert _can_ever_enter(_mkt_at("2026-09-21T02:59:59Z", "2026-09-24T00:00:00Z"), d) is True
+
+    @pytest.mark.parametrize(("run", "d"), [
+        # 08:00 Tokyo on 0001-01-01 is the previous day in UTC, before date.min
+        (ScheduledRun(0, 8, 0, "Asia/Tokyo"), date(1, 1, 1)),
+        # 20:00 Los Angeles on Friday 9999-12-31 is past date.max in UTC
+        (ScheduledRun(4, 20, 0, "America/Los_Angeles"), date(9999, 12, 31)),
+    ])
+    def test_an_instant_outside_datetimes_range_is_none(self, run, d):
+        assert backtester._checkpoint_floor(run, d) is None
+
+    def test_a_checkpoint_that_cannot_be_placed_counts_as_reachable(self, monkeypatch):
+        # No floor on 0001-01-01: a later opening reaches it; only a same-day close bars it
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", ScheduledRun(0, 8, 0, "Asia/Tokyo"))
+        assert backtester._checkpoint_floor(backtester.SCHEDULED_RUN, date(1, 1, 1)) is None
+        opened = "0001-01-01T12:00:00Z"
+        assert _can_ever_enter(_mkt_at(opened, "0001-01-05T00:00:00Z"), date(1, 1, 1)) is True
+        assert _can_ever_enter(_mkt_at(opened, "0001-01-02T20:00:00Z"), date(1, 1, 1)) is True
+        assert _can_ever_enter(_mkt_at(opened, "0001-01-01T20:00:00Z"), date(1, 1, 1)) is False
 
 
 def _p5_grid() -> list[tuple[dict, date]]:
-    """Every (market, start_date) the grid tests sweep: openings every 30
-    minutes over three weeks from Monday 2026-09-14 plus one second either
-    side of each Monday's checkpoint, rendered in four UTC offsets in turn
-    (every seventh also naive), against eight close dates and seven start
-    dates (one of each weekday)."""
+    """Every (market, start_date) the grid tests sweep under
+    backtester.SCHEDULED_RUN: openings every 30 minutes over three weeks from
+    2026-09-14 and two weeks across each clock change, plus one second either
+    side of each checkpoint and its floor, in four UTC offsets (every seventh
+    also naive), against eight close dates and seven start dates per span."""
     zones = [UTC, timezone(timedelta(hours=-5)), timezone(timedelta(hours=14)),
              timezone(timedelta(hours=5, minutes=30))]
-    base = datetime(2026, 9, 14, tzinfo=UTC)
-    instants = [base + timedelta(minutes=30 * i) for i in range(21 * 48)]
-    for week in range(3):
-        cp = base + timedelta(weeks=week, hours=9)
-        instants += [cp - timedelta(seconds=1), cp, cp + timedelta(seconds=1)]
-    opens: list[datetime] = []
-    for i, t in enumerate(instants):
-        opens.append(t.astimezone(zones[i % len(zones)]))
-        if i % 7 == 0:
-            opens.append(t.replace(tzinfo=None))   # naive, same wall clock
-    starts = [date(2026, 9, 10) + timedelta(days=k) for k in range(7)]
+    run = backtester.SCHEDULED_RUN
     grid = []
-    for o in opens:
-        od = o.date()
-        for k in (0, 1, 2, 6, 7, 8, 9, 14):
-            close = datetime(od.year, od.month, od.day, 12, tzinfo=UTC) + timedelta(days=k)
-            m = _mkt_at(o.isoformat(), close.isoformat())
-            grid.extend((m, s) for s in starts)
+    for first_day, weeks in ((date(2026, 9, 14), 3), (date(2026, 10, 26), 2),
+                             (date(2027, 3, 8), 2)):
+        base = datetime(first_day.year, first_day.month, first_day.day, tzinfo=UTC)
+        instants = [base + timedelta(minutes=30 * i) for i in range(weeks * 7 * 48)]
+        for day in range(weeks * 7):
+            d = first_day + timedelta(days=day)
+            if d.weekday() != run.weekday:
+                continue
+            for edge in {backtester._checkpoint_datetime(d),
+                         backtester._checkpoint_floor(run, d)}:
+                instants += [edge - timedelta(seconds=1), edge, edge + timedelta(seconds=1)]
+        opens: list[datetime] = []
+        for i, t in enumerate(instants):
+            opens.append(t.astimezone(zones[i % len(zones)]))
+            if i % 7 == 0:
+                opens.append(t.replace(tzinfo=None))   # naive, same wall clock
+        starts = [first_day - timedelta(days=4) + timedelta(days=k) for k in range(7)]
+        for o in opens:
+            od = o.date()
+            for k in (0, 1, 2, 6, 7, 8, 9, 14):
+                close = datetime(od.year, od.month, od.day, 12, tzinfo=UTC) + timedelta(days=k)
+                m = _mkt_at(o.isoformat(), close.isoformat())
+                grid.extend((m, s) for s in starts)
     return grid
 
 
 class TestCanEverEnterMatchesTheScan:
-    """The predicate is EXACTLY what the scan could ever reach — no looser
-    (the M8 slack) and no tighter (a dropped market that could enter would
-    move a result) — and it never admits a market the pre-P5 date test
-    dropped, so a corpus assembled under it is a subset of an old one."""
+    """The predicate is EXACTLY what the scan could ever reach under any
+    schedule _prepare_candidates accepts: looser pairs markets that can never
+    enter, tighter moves results. The other two tests compare it with the date
+    test and with a fixed Monday 09:00 UTC checkpoint."""
 
-    def test_the_predicate_is_exactly_what_the_scan_can_reach(self):
+    @pytest.mark.parametrize("run", _EXACTNESS_SCHEDULES)
+    def test_the_predicate_is_exactly_what_the_scan_can_reach(self, monkeypatch, run):
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", run)
         grid = _p5_grid()
         assert len(grid) > 50_000
         mismatches = [(m, s) for m, s in grid if _can_ever_enter(m, s) != _scan_reachable(m, s)]
         assert mismatches == []
 
     def test_it_never_admits_what_the_date_test_dropped(self):
-        grid = _p5_grid()
+        # Naive openings and ones at or west of +07:00 (UTC included). Further
+        # east, local Tuesday 00:00 at +X is Monday (24 - X):00 UTC, before the
+        # 17:00 UTC checkpoint once X > 7 (8 in daylight time), so the date
+        # test drops markets the scan reaches.
+        def west_of_plus_seven(open_time):
+            offset = _parse_iso_datetime(open_time).utcoffset()
+            return offset is None or offset <= timedelta(hours=7)
+
+        grid = [(m, s) for m, s in _p5_grid() if west_of_plus_seven(m["open_time"])]
+        assert any(m["open_time"].endswith("+05:30") for m, _ in grid)
         new = [_can_ever_enter(m, s) for m, s in grid]
         old = [_date_granular_can_ever_enter(m, s) for m, s in grid]
         assert not any(n and not o for n, o in zip(new, old, strict=True))
         # ... and it is a real tightening on this grid, not a relabelling
-        assert sum(o and not n for n, o in zip(new, old, strict=True)) > 1_000
-        assert sum(n for n in new) > 1_000
+        assert sum(o and not n for n, o in zip(new, old, strict=True)) > 1_500
+        assert sum(n for n in new) > 50_000
+
+    def test_v3_admits_everything_v2_did(self):
+        # "v2" is the fixed Monday 09:00 UTC reference, "v3" the shipped prefilter
+        # (cache tag "checkpoint-v3"): its checkpoint is later on the same UTC
+        # date, so it admits all v2 does, in every offset, and more.
+        grid = _p5_grid()
+        new = [_can_ever_enter(m, s) for m, s in grid]
+        v2 = [_utc0900_can_ever_enter(m, s) for m, s in grid]
+        assert not any(o and not n for n, o in zip(new, v2, strict=True))
+        assert sum(n and not o for n, o in zip(new, v2, strict=True)) > 2_000
+
+
+class TestOneCheckpointDefinition:
+    """The scan (_checkpoint_datetime) and the prefilter (_checkpoint_floor,
+    handed backtester.SCHEDULED_RUN by _can_ever_enter) take the checkpoint's
+    instant and weekday only from SCHEDULED_RUN. A literal hour or weekday
+    would let the backtest drift from the live scheduler silently."""
+
+    @staticmethod
+    def _tree(func):
+        return ast.parse(textwrap.dedent(inspect.getsource(func)))
+
+    @staticmethod
+    def _schedule_attrs(tree, attr):
+        return [n for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+                and n.attr == attr and isinstance(n.value, ast.Name)
+                and n.value.id == "SCHEDULED_RUN"]
+
+    def test_the_checkpoint_instant_is_the_schedules(self):
+        tree = self._tree(backtester._checkpoint_datetime)
+        instants = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                    and n.func in self._schedule_attrs(tree, "instant")]
+        assert len(instants) == 1
+        numbers = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant)
+                   and isinstance(n.value, (int, float)) and not isinstance(n.value, bool)]
+        assert numbers == []
+
+    def test_the_prefilter_floors_the_same_instant(self):
+        # _checkpoint_floor uses only its `run` argument; _can_ever_enter passes SCHEDULED_RUN
+        floor = self._tree(backtester._checkpoint_floor)
+        instants = [n for n in ast.walk(floor) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute) and n.func.attr == "instant"]
+        assert len(instants) == 1
+        assert isinstance(instants[0].func.value, ast.Name)
+        assert instants[0].func.value.id == "run"
+        assert not [n for n in ast.walk(floor) if isinstance(n, ast.Name)
+                    and n.id == "SCHEDULED_RUN"]
+        calls = [n for n in ast.walk(self._tree(backtester._can_ever_enter))
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == "_checkpoint_floor"]
+        assert calls
+        assert all(isinstance(c.args[0], ast.Name) and c.args[0].id == "SCHEDULED_RUN"
+                   for c in calls)
+
+    @pytest.mark.parametrize("func", ["_monday_timestamps", "_can_ever_enter"])
+    def test_the_run_weekday_is_the_schedules(self, func):
+        assert self._schedule_attrs(self._tree(getattr(backtester, func)), "weekday")
+
+
+class TestScheduleProblemsAreRefused:
+    """The backtest works in UTC dates, so _prepare_candidates raises ValueError
+    before any fetch on a schedule whose instant falls on another UTC date,
+    whose wall time a clock change skips or repeats, or whose zone is unknown.
+    It checks start_date to _SCHEDULE_CHECK_DAYS_AHEAD past today."""
+
+    _START = date(2026, 1, 1)
+
+    @staticmethod
+    def _prepare(start=_START):
+        return backtester._prepare_candidates(MagicMock(), MagicMock(), start, True, None)
+
+    @staticmethod
+    def _no_fetch(monkeypatch):
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: pytest.fail("the fetch must not be reached"))
+
+    @pytest.mark.parametrize(("run", "shown"), [
+        # 20:00 Los Angeles is the next day in UTC
+        (ScheduledRun(0, 20, 0, "America/Los_Angeles"), "on another date in UTC"),
+        # 08:00 Tokyo is the previous day in UTC
+        (ScheduledRun(0, 8, 0, "Asia/Tokyo"), "on another date in UTC"),
+        # 02:30 on the March change's Sunday does not exist in Los Angeles
+        (ScheduledRun(6, 2, 30, "America/Los_Angeles"), "skipped by a clock change"),
+        # 01:30 on the November change's Sunday happens twice
+        (ScheduledRun(6, 1, 30, "America/Los_Angeles"), "repeated by a clock change"),
+    ])
+    def test_an_unsound_schedule_raises_before_the_fetch(self, monkeypatch, run, shown):
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", run)
+        self._no_fetch(monkeypatch)
+        with pytest.raises(ValueError, match="config.SCHEDULED_RUN") as err:
+            self._prepare()
+        assert run.label() in str(err.value)
+        assert shown in str(err.value)
+
+    def test_a_single_problem_date_is_refused(self, monkeypatch):
+        # Sao Paulo Sunday 00:30 is sound on every checked date but 2018-11-04 (skipped)
+        run = ScheduledRun(6, 0, 30, "America/Sao_Paulo")
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", run)
+        self._no_fetch(monkeypatch)
+        with pytest.raises(ValueError) as err:
+            self._prepare(start=date(2018, 6, 1))
+        message = str(err.value)
+        assert "1 run date(s)" in message
+        assert "2018-11-04: 00:30 America/Sao_Paulo is skipped by a clock change" in message
+
+    def test_the_message_names_the_first_three_problems(self, monkeypatch):
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN",
+                            ScheduledRun(0, 20, 0, "America/Los_Angeles"))
+        self._no_fetch(monkeypatch)
+        with pytest.raises(ValueError) as err:
+            self._prepare()
+        message = str(err.value)
+        assert all(d in message for d in ("2026-01-05:", "2026-01-12:", "2026-01-19:"))
+        assert "2026-01-26" not in message
+
+    @pytest.mark.parametrize("zone", ["No/Such_Zone", "America"])
+    def test_an_unresolvable_zone_raises_a_value_error(self, monkeypatch, zone):
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", ScheduledRun(0, 9, 0, zone))
+        self._no_fetch(monkeypatch)
+        with pytest.raises(ValueError, match="cannot be resolved"):
+            self._prepare()
+
+    def test_the_window_runs_from_start_date_to_ten_years_past_today(self, monkeypatch):
+        moment = datetime(2026, 9, 27, 12, tzinfo=UTC)
+
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return moment if tz is None else moment.astimezone(tz)
+
+        seen = []
+        real = ScheduledRun.date_problems
+
+        def spy(run, first, last):
+            seen.append((run, first, last))
+            return real(run, first, last)
+
+        monkeypatch.setattr(backtester, "datetime", _Frozen)
+        monkeypatch.setattr(ScheduledRun, "date_problems", spy)
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets", lambda *a, **k: [])
+        self._prepare()
+        assert backtester._SCHEDULE_CHECK_DAYS_AHEAD >= 3_652
+        assert seen == [(SCHEDULED_RUN, self._START,
+                         date(2026, 9, 27) + timedelta(days=backtester._SCHEDULE_CHECK_DAYS_AHEAD))]
+
+    def test_it_runs_before_the_feasibility_short_circuit(self, monkeypatch):
+        # No checkpoint yet: the shipped schedule short-circuits, an unsound one is refused
+        future = datetime.now(UTC).date() + timedelta(days=30)
+        self._no_fetch(monkeypatch)
+        assert self._prepare(start=future) is None
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN",
+                            ScheduledRun(0, 20, 0, "America/Los_Angeles"))
+        with pytest.raises(ValueError):
+            self._prepare(start=future)
+
+    def test_the_public_entry_points_raise_it(self, monkeypatch):
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN",
+                            ScheduledRun(0, 20, 0, "America/Los_Angeles"))
+        self._no_fetch(monkeypatch)
+        with pytest.raises(ValueError, match="config.SCHEDULED_RUN"):
+            run_backtest(MagicMock(), MagicMock(), start_date=self._START)
+        with pytest.raises(ValueError, match="config.SCHEDULED_RUN"):
+            run_backtest_sweep(MagicMock(), MagicMock(), start_date=self._START)
+
+
+class TestPrefilterCacheTag:
+    """The assembled cache (the on-disk prefiltered market list) is named by
+    the prefilter's version and the schedule, read at fetch time, so a list
+    is never served to a run filtering for another schedule. The candle
+    period is not in the name: the version must change with it."""
+
+    def test_the_shipped_tag(self):
+        assert backtester._prefilter_cache_tag() == "checkpoint-v3-mon0900-America-Los_Angeles"
+
+    def test_a_patched_schedule_re_keys_it(self, monkeypatch):
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", ScheduledRun(0, 9, 0, "UTC"))
+        assert backtester._prefilter_cache_tag() == "checkpoint-v3-mon0900-UTC"
+
+    def test_the_fetch_is_keyed_by_the_schedule_it_filters_for(self, monkeypatch):
+        seen = []
+
+        def fetch(*_a, **k):
+            seen.append(k["prefilter_tag"])
+            return []
+
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets", fetch)
+        start = date(2026, 1, 1)
+        backtester._prepare_candidates(MagicMock(), MagicMock(), start, True, None)
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN",
+                            ScheduledRun(3, 9, 30, "America/Los_Angeles"))
+        backtester._prepare_candidates(MagicMock(), MagicMock(), start, True, None)
+        assert seen == ["checkpoint-v3-mon0900-America-Los_Angeles",
+                        "checkpoint-v3-thu0930-America-Los_Angeles"]
+
+    def test_the_bare_version_is_read_only_by_the_tag_builder(self):
+        # Any other reader of the bare version would name a corpus without its schedule
+        tree = ast.parse(inspect.getsource(backtester))
+        builder = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                       and n.name == "_prefilter_cache_tag")
+        inside = {id(n) for n in ast.walk(builder)}
+        reads = [n for n in ast.walk(tree)
+                 if (isinstance(n, ast.Name) and n.id == "SETTLED_PREFILTER_CACHE_TAG")
+                 or (isinstance(n, ast.Attribute) and n.attr == "SETTLED_PREFILTER_CACHE_TAG")]
+        assert [n for n in reads if id(n) in inside]
+        assert [n.lineno for n in reads if id(n) not in inside] == []
+
+    def test_the_version_names_this_candle_period(self):
+        # _checkpoint_floor reads the candle period, which the tag does not name:
+        # change the period and SETTLED_PREFILTER_CACHE_TAG together, then this pin
+        assert (backtester.SETTLED_PREFILTER_CACHE_TAG,
+                backtester.CANDLESTICK_PERIOD_INTERVAL_MINUTES) == ("checkpoint-v3", 60)
 
 
 _P5_START = date(2026, 1, 1)                       # a Thursday
 _P5_MONDAYS = [date(2026, 1, 5), date(2026, 1, 12), date(2026, 1, 19)]
-# Seconds from a Monday's 09:00 UTC checkpoint: the boundary on both sides,
-# and openings far enough either way to exercise the next Monday.
+# Seconds from a Monday's checkpoint (17:00 UTC in January): both sides of the
+# boundary, openings far enough to reach another Monday, and None for 23:59 UTC.
 _P5_OFFSETS = [-3 * 86_400, -5 * _P5_HOUR, -_P5_HOUR, -1_800, -1, 0, 1, 1_800,
-               _P5_HOUR, 5 * _P5_HOUR, 14 * _P5_HOUR + 3_540]
+               _P5_HOUR, 5 * _P5_HOUR, None]
 
 
 def _p5_candles(open_dt: datetime, close_dt: datetime,
@@ -2790,9 +3179,13 @@ def _p5_corpus(seed: int) -> tuple[list[dict], dict[str, list[dict]]]:
     def opening() -> datetime:
         monday = rng.choice(_P5_MONDAYS)
         off = rng.choice(_P5_OFFSETS)
+        cp = backtester._checkpoint_datetime(monday)
+        if off is None:   # 23:59 of the checkpoint's UTC day
+            off = int((datetime(cp.year, cp.month, cp.day, 23, 59, tzinfo=UTC) - cp)
+                      .total_seconds())
         if off not in (-1, 0, 1):
             off += rng.randrange(0, 1_800)
-        return backtester._checkpoint_datetime(monday) + timedelta(seconds=off)
+        return cp + timedelta(seconds=off)
 
     def add(ticker, event_ticker, event_title, title, open_dt, close_dt, yes, no):
         close = close_dt.isoformat()
@@ -5006,16 +5399,13 @@ class TestCorpusProvenanceIsCarried:
 
 
 class TestRunBacktestFeasibilityPreCheck:
-    """BS-11: no Monday 09:00 UTC checkpoint in the window means no trade can
-    ever be entered, so run_backtest must skip the fetch entirely rather than
-    discover that only after paying for it.
+    """No entry checkpoint in the window (no Monday, on the shipped schedule)
+    means no trade can enter, so run_backtest must skip the fetch entirely.
 
     `backtester.datetime` (not the stdlib one) is patched with a thin subclass
     whose `.now(tz)` is frozen, since backtester.py imports `datetime` by name
     (`from datetime import ... datetime ...`) and the feasibility window is
-    `datetime.now(UTC).date()`. It used to be `date.today()`, and this helper
-    used to freeze `backtester.date` accordingly — the switch to UTC (TS-13)
-    is what moved the seam.
+    `datetime.now(UTC).date()`.
     """
 
     class _FrozenDateTime(datetime):
@@ -6892,6 +7282,32 @@ class TestRunBacktestSweep:
         # on/off.
         assert result.config_same_event_ladders is configured
 
+    @pytest.mark.parametrize("run", [
+        SCHEDULED_RUN,
+        # A Sunday run: the Tuesday-to-Friday window still holds no checkpoint
+        ScheduledRun(6, 9, 0, "Asia/Tokyo"),
+    ])
+    def test_feasibility_short_circuit_records_the_entry_checkpoint(self, monkeypatch, run):
+        # The infeasible branch records this module's schedule, read at run time
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", run)
+        result = self._infeasible(monkeypatch)
+        assert result.label_coverage is None      # the short-circuit path
+        assert result.entry_checkpoint == run.label()
+
+    def test_the_sweep_records_the_schedule_it_entered_at(self, monkeypatch):
+        # _sweep_from_candidates records the patched schedule, not config's
+        run = ScheduledRun(3, 9, 30, "Asia/Kolkata")
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", run)
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: backtester._Candidates(
+                                all_pairs=[], candles_by_ticker={},
+                                label_coverage=None, start_date=date(2026, 1, 1),
+                                max_horizon_days=None, same_event_ladders=None))
+        monkeypatch.setattr(backtester, "_interval_calibration", lambda *a, **k: None)
+        sweep = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False)
+        assert sweep.entry_checkpoint == "Thursday 09:30 Asia/Kolkata"
+
 
 class TestSimulationsAreLabelledWithTheirDiscount:
     """
@@ -7060,12 +7476,9 @@ class TestSimulationsAreLabelledWithTheirDiscount:
 
 class TestFeasibilityWindowIsMeasuredInUTC:
     """
-    TS-13: the feasibility pre-check used date.today() — a LOCAL date — while
-    _monday_timestamps builds 09:00 UTC checkpoints and _build_equity_curve
-    already used datetime.now(UTC).date(). West of UTC the local date lags the
-    UTC one for the first hours of each UTC day (7 of every 24 on a PDT host),
-    so a window whose only Monday is the current UTC day short-circuited to
-    zero trades and reported the run as structurally impossible when it was not.
+    The feasibility pre-check measures its window in UTC dates, like every
+    checkpoint. West of UTC the local date lags for hours each day, so a local
+    window whose only Monday is today in UTC would wrongly skip the run.
     """
 
     # 2026-08-31 is a Monday. At 02:00 UTC that day it is still Sunday
@@ -7139,8 +7552,7 @@ class TestFeasibilityWindowIsMeasuredInUTC:
 
 # ─── PB2: band-aware entry detection, split at the band ──────────────────────
 
-# The Monday after _MONDAY_TS (2026-01-12 09:00 UTC) — the second checkpoint a
-# scan starting 2026-01-01 visits.
+# 2026-01-12 09:00 UTC: a candle stamp before that Monday's checkpoint (17:00 UTC)
 _MONDAY2_TS = _MONDAY_TS + 7 * 86_400
 
 
@@ -7415,11 +7827,8 @@ class TestPrepareEntriesGolden:
 
 # ─── DR-75: every qualifying Monday is recorded, not just the first ──────────
 
-# The third checkpoint a scan starting 2026-01-01 visits (2026-01-19 09:00 UTC)
+# 2026-01-19 09:00 UTC: a candle stamp before that Monday's checkpoint (17:00 UTC)
 _MONDAY3_TS = _MONDAY2_TS + 7 * 86_400
-
-# One week between two checkpoints, in seconds
-_WEEK_SECONDS = 7 * 86_400
 
 
 def _random_find_entry_cases(seed: int, count: int) -> list[tuple]:
@@ -7498,7 +7907,10 @@ def _random_find_entry_cases(seed: int, count: int) -> list[tuple]:
     for k in range(count):
         pair_type = "same_title" if rng.random() < 0.35 else "time_series"
         weeks = ri(4, 10)
-        last_checkpoint = datetime.fromtimestamp(_MONDAY_TS + (weeks - 1) * _WEEK_SECONDS, tz=UTC)
+        # Each Monday's checkpoint from 2026-01-05 (17:00 UTC; 16:00 after the March change)
+        checkpoints = [int(backtester._checkpoint_datetime(
+            date(2026, 1, 5) + timedelta(weeks=w)).timestamp()) for w in range(weeks)]
+        last_checkpoint = datetime.fromtimestamp(checkpoints[-1], tz=UTC)
         # The earlier leg closes 1-6 days after the last checkpoint, so the
         # scan (to the day before its close) ends between the two
         close_a = last_checkpoint + timedelta(days=ri(1, 6), hours=ri(0, 14))
@@ -7529,7 +7941,7 @@ def _random_find_entry_cases(seed: int, count: int) -> list[tuple]:
                 legs = [rich_q, cheap_q] if rng.random() < 0.5 else [cheap_q, rich_q]
             if kind == "unparseable-quote":
                 rng.choice(legs)[ri(0, 1)] = rng.choice((None, "abc"))
-            checkpoint = _MONDAY_TS + week * _WEEK_SECONDS
+            checkpoint = checkpoints[week]
             for leg in (0, 1):
                 if week < late[leg] or (week > late[leg] and rng.random() < 0.1):
                     continue          # not listed yet, or no candle this week
@@ -9072,8 +9484,7 @@ def _ss1_record(ticker, event_ticker, title, *, subtitle="", event_title="",
     if eligible:
         open_t, close_t = "2026-01-01T00:00:00+00:00", f"{close}T00:00:00+00:00"
     else:
-        # Opens and closes inside one Tuesday: no Monday 09:00 UTC checkpoint
-        # fits, so _can_ever_enter proves it can never enter any pair.
+        # Opens and closes inside one Tuesday: _can_ever_enter drops it
         open_t, close_t = "2026-01-13T00:00:00+00:00", "2026-01-13T02:00:00+00:00"
     return {"ticker": ticker, "event_ticker": event_ticker,
             "event_title": event_title, "title": title, "subtitle": subtitle,
@@ -9702,7 +10113,8 @@ class TestPrefilterLinesSayItRanDuringAssembly:
     anything is a WARNING, since only a predicate changed without a tag bump
     (or an altered cache) can do that."""
 
-    TAG = backtester.SETTLED_PREFILTER_CACHE_TAG
+    # The full tag: the predicate's version plus the schedule's slug
+    TAG = backtester._prefilter_cache_tag()
     COUNTS = historical.AssemblyCounts(settled=40, rejected=25, duplicates=3)
 
     @staticmethod
@@ -10324,6 +10736,20 @@ class TestBandSweep:
         assert res.same_title_point is not None
         assert res.same_title_point.population == "same_title"
         assert [t.pair_type for t in res.same_title_point.trades] == ["same_title"]
+
+    def test_the_sweep_records_its_entry_checkpoint(self, golden_band_sweep):
+        # Both runs record their checkpoints' schedule, for the dashboard header
+        label = backtester.SCHEDULED_RUN.label()
+        assert label == "Monday 09:00 America/Los_Angeles"
+        assert golden_band_sweep.result.entry_checkpoint == label
+        assert golden_band_sweep.single.entry_checkpoint == label
+        # ... and the log names it once
+        lines = [m for m in golden_band_sweep.messages
+                 if m.startswith("Entry checkpoint (backtest): ")]
+        assert len(lines) == 1
+        assert lines[0].startswith(
+            f"Entry checkpoint (backtest): {label} (config.SCHEDULED_RUN, the live "
+            "scheduler's run time): ")
 
     def test_scenarios_are_ordered_band_then_k_then_population(self, golden_band_sweep):
         order = {"all": 0, "time_series": 1, "ladder": 2, "cross": 3}
@@ -12941,6 +13367,140 @@ class TestLiveRuleLine:
             "live bot's")
         self._infeasible(monkeypatch, caplog, same_event_ladders=configured)
         assert self._line(caplog).endswith("applies it")
+
+
+class TestEntryCheckpointLogging:
+    """run_backtest_sweep logs the entry checkpoint (this module's SCHEDULED_RUN)
+    right after the size-cap line, with its UTC times in [start_date, today]
+    (two across a clock change). The line never raises, so a bad zone or a
+    start near date.max still reaches _prepare_candidates' own error."""
+
+    _PREFIX = "Entry checkpoint (backtest): "
+    _SOURCE = " (config.SCHEDULED_RUN, the live scheduler's run time): "
+
+    @staticmethod
+    def _freeze(monkeypatch, today: date) -> None:
+        fixed = datetime(today.year, today.month, today.day, 12, tzinfo=UTC)
+        frozen = type("FrozenDateTime",
+                      (TestRunBacktestFeasibilityPreCheck._FrozenDateTime,),
+                      {"_fixed": fixed})
+        monkeypatch.setattr(backtester, "datetime", frozen)
+
+    def _line(self, monkeypatch, caplog, start: date, today: date) -> tuple[list[str], str]:
+        self._freeze(monkeypatch, today)
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            run_backtest_sweep(MagicMock(), MagicMock(), start, 1000.0, sweep=False)
+        messages = [r.getMessage() for r in caplog.records]
+        lines = [m for m in messages if m.startswith(self._PREFIX)]
+        assert len(lines) == 1
+        return messages, lines[0]
+
+    def test_the_line_follows_the_cap_line(self, monkeypatch, caplog):
+        messages, line = self._line(monkeypatch, caplog, date(2026, 1, 1), date(2026, 9, 27))
+        cap = next(i for i, m in enumerate(messages)
+                   if m.startswith("Per-trade size cap (backtest):"))
+        assert messages.index(line) == cap + 1
+
+    @pytest.mark.parametrize("start, today, times", [
+        # Standard time (17:00 UTC) until the March change, daylight after
+        (date(2026, 1, 1), date(2026, 9, 27), "16:00/17:00"),
+        (date(2026, 6, 1), date(2026, 8, 28), "16:00"),
+        (date(2025, 12, 1), date(2026, 2, 27), "17:00"),
+        # A lone checkpoint on the window's first day, then its last: both ends count
+        (date(2026, 11, 2), date(2026, 11, 6), "17:00"),
+        (date(2026, 10, 27), date(2026, 11, 2), "17:00"),
+    ])
+    def test_the_line_names_the_utc_times_in_the_window(
+        self, monkeypatch, caplog, start, today, times,
+    ):
+        _, line = self._line(monkeypatch, caplog, start, today)
+        assert line == (f"{self._PREFIX}Monday 09:00 America/Los_Angeles{self._SOURCE}"
+                        f"{times} UTC in this window")
+
+    def test_a_window_without_a_checkpoint_says_so(self, monkeypatch, caplog):
+        # Tuesday to Friday: no Monday, so the real _prepare_candidates skips the fetch
+        self._freeze(monkeypatch, date(2026, 8, 28))
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: pytest.fail("fetch must be skipped"))
+        with caplog.at_level(logging.INFO):
+            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 8, 25), 1000.0,
+                                     sweep=False)
+        assert res.label_coverage is None
+        assert (f"{self._PREFIX}Monday 09:00 America/Los_Angeles{self._SOURCE}"
+                "no checkpoint in this window") in caplog.messages
+
+    def test_the_line_reads_this_module_s_schedule(self, monkeypatch, caplog):
+        # 09:00 in Kolkata (UTC+05:30) is 03:30 UTC: the minutes are printed
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", ScheduledRun(3, 9, 0, "Asia/Kolkata"))
+        _, line = self._line(monkeypatch, caplog, date(2026, 1, 1), date(2026, 9, 27))
+        assert line == (f"{self._PREFIX}Thursday 09:00 Asia/Kolkata{self._SOURCE}"
+                        "03:30 UTC in this window")
+
+    @pytest.mark.parametrize("zone", ["No/Such_Zone", "America", "/UTC", "../x"])
+    def test_an_unresolvable_zone_still_reaches_the_refusal(self, monkeypatch, caplog, zone):
+        run = ScheduledRun(0, 9, 0, zone)
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN", run)
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: pytest.fail("the fetch must not be reached"))
+        with caplog.at_level(logging.INFO), \
+                pytest.raises(ValueError, match="cannot be resolved"):
+            run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                               sweep=False)
+        lines = [m for m in caplog.messages if m.startswith(self._PREFIX)]
+        assert len(lines) == 1
+        assert lines[0].startswith(f"{self._PREFIX}{run.label()}{self._SOURCE}"
+                                   "UTC times not computable (")
+
+    @pytest.mark.parametrize("error", [
+        ZoneInfoNotFoundError, ValueError, OSError, OverflowError,
+    ])
+    def test_every_error_the_times_can_raise_is_named(self, monkeypatch, caplog, error):
+        # Each exception _monday_timestamps documents is named; the run goes on
+        def raise_error(*_a, **_k):
+            raise error("stand-in")
+
+        monkeypatch.setattr(backtester, "_checkpoint_utc_times", raise_error)
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                                     sweep=False)
+        assert res.entry_checkpoint == SCHEDULED_RUN.label()
+        lines = [m for m in caplog.messages if m.startswith(self._PREFIX)]
+        assert lines == [f"{self._PREFIX}Monday 09:00 America/Los_Angeles{self._SOURCE}"
+                         f"UTC times not computable ({error.__name__})"]
+
+    def test_a_start_date_at_the_end_of_date_s_range(self, monkeypatch, caplog):
+        # 9999-12-28 (a Tuesday): the next Monday is past date.max, yet the line logs
+        self._freeze(monkeypatch, date(2026, 9, 27))
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: pytest.fail("the fetch must not be reached"))
+        with caplog.at_level(logging.INFO), pytest.raises(OverflowError):
+            run_backtest_sweep(MagicMock(), MagicMock(), date(9999, 12, 28), 1000.0,
+                               sweep=False)
+        lines = [m for m in caplog.messages if m.startswith(self._PREFIX)]
+        assert lines == [f"{self._PREFIX}Monday 09:00 America/Los_Angeles{self._SOURCE}"
+                         "UTC times not computable (OverflowError)"]
+
+    def test_the_utc_times_helper(self, monkeypatch):
+        # The week of the November change: 16:00 on 2026-10-26, 17:00 on 11-02
+        assert backtester._checkpoint_utc_times(date(2026, 10, 26), date(2026, 11, 2)) == [
+            "16:00", "17:00"]
+        assert backtester._checkpoint_utc_times(date(2026, 11, 2), date(2026, 11, 2)) == [
+            "17:00"]
+        # Tuesday to Sunday: no Monday, no checkpoint
+        assert backtester._checkpoint_utc_times(date(2026, 10, 27), date(2026, 11, 1)) == []
+        # A run off the hour keeps its minutes
+        monkeypatch.setattr(backtester, "SCHEDULED_RUN",
+                            ScheduledRun(0, 9, 30, "America/Los_Angeles"))
+        assert backtester._checkpoint_utc_times(date(2026, 10, 26), date(2026, 11, 2)) == [
+            "16:30", "17:30"]
+
+    def test_the_utc_times_ignore_the_host_clock(self):
+        # UTC whatever the host's zone (these read 21:30 and 22:30 in Kolkata)
+        with _host_zone("Asia/Kolkata"):
+            assert backtester._checkpoint_utc_times(date(2026, 10, 26), date(2026, 11, 2)) == [
+                "16:00", "17:00"]
 
 
 class TestCapSweepNeverSeedsTierOff:
