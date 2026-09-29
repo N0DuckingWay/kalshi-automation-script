@@ -189,7 +189,7 @@ import json
 import logging
 import sys
 import time
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from typing import Any
 
 from . import auth, config, scanner, trader
@@ -201,6 +201,11 @@ from ._http import api_call_with_retry, fetch_json_page, signed_request_json
 # strategy, and nothing in the pipeline may ever size an order from it.
 PROBE_COUNT_STR = "0.01"
 PROBE_COUNT = Decimal(PROBE_COUNT_STR)
+
+# Kalshi rounds each order's total fee up to a multiple of one of these dollar
+# amounts ($0.0001 for direct exchange members, $0.01 for other accounts) and
+# rebates the excess later. Used only by the fee check (_report_fee).
+FEE_BALANCE_PRECISIONS = ("0.0001", "0.01")
 
 # Default shards for the transfer step. Source is the shard everything
 # historically lived on; the default destination is the first shard Kalshi
@@ -507,24 +512,82 @@ def _fill_counts(data: dict) -> tuple:
     )
 
 
-def _report_fee(data: dict, price_str: str) -> None:
+def _fee_model_price(order: dict, price_str: str) -> tuple[float, str] | None:
     """
-    Print the fee the exchange actually charged next to the bot's fee model.
-
-    INFORMATIONAL ONLY — no pass/fail. The two numbers are not directly
-    comparable: config.fee_leg_exact() is defined for a whole number of
-    contracts and ceilings to a whole cent, while the probe trades 0.01 of one,
-    so the model figure is printed for n=1 and the reader does the scaling. The
-    point is to catch an order-of-magnitude surprise in the V2 fee shape before
-    real size flows through it.
+    Pick the price to work out the modelled fee at: the order's average fill
+    price if the response has a usable one, otherwise the limit price the
+    order was sent at.
 
     Args:
-        data (dict): Parsed V2 order response body; average_fee_paid is
-            typically absent when nothing filled, but this function reads no
-            fill counts and so cannot assert that — see the printed wording
-            below (DR-20).
-        price_str (str): The limit price the order was submitted at, used as
-            the model's price input.
+        order (dict): The order object from the V2 response body.
+        price_str (str): The limit price the order was submitted at.
+
+    Returns:
+        tuple[float, str] | None: The price and which one it is ("average fill
+            price" or "limit price"), or None when neither is a number
+            strictly between 0 and 1.
+    """
+    for raw, label in ((order.get("average_fill_price"), "average fill price"),
+                       (price_str, "limit price")):
+        if isinstance(raw, bool):
+            # true/false in the response is not a price
+            continue
+        try:
+            price = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if 0.0 < price < 1.0:
+            return price, label
+    return None
+
+
+def _order_rounded_fee_per_contract(price: float, precision: str) -> Decimal:
+    """
+    Return the modelled fee per contract for the probe's order, rounded the
+    way Kalshi rounds an order's fee.
+
+    The order's total fee (TAKER_FEE_RATE × p × (1 − p) × the probe's contract
+    count) is rounded up to a multiple of `precision`, then divided by the
+    contract count. The arithmetic is exact (Decimal).
+
+    Args:
+        price (float): The price the fee is charged at (0 < price < 1).
+        precision (str): A dollar amount from FEE_BALANCE_PRECISIONS.
+
+    Returns:
+        Decimal: Dollars per contract.
+    """
+    p = Decimal(str(price))
+    step = Decimal(precision)
+    total = Decimal(str(config.TAKER_FEE_RATE)) * p * (1 - p) * PROBE_COUNT
+    rounded = (total / step).to_integral_value(rounding=ROUND_CEILING) * step
+    return rounded / PROBE_COUNT
+
+
+def _report_fee(data: dict, price_str: str) -> None:
+    """
+    Print the fee the exchange charged per contract next to the bot's fee
+    model, also per contract.
+
+    Informational only: it passes or fails nothing. The response's
+    average_fee_paid is the average fee per contract across the order's
+    fills, including Kalshi's rounding of the order's total fee. The model is
+    printed three ways, at the price _fee_model_price picks:
+      * TAKER_FEE_RATE × p × (1 − p), before any rounding;
+      * config.fee_leg_exact(1, p): one whole contract, rounded up to the
+        cent, as the bot's trade sizing uses;
+      * rounded as Kalshi rounds this order, at each amount in
+        FEE_BALANCE_PRECISIONS (second line). On the probe's tiny order the
+        rounding is a large part of the fee, so the figure at the account's
+        precision is the one the charge should match.
+    p × (1 − p) is the same for a price and its complement, so a YES price
+    and the matching NO price give the same fee.
+
+    Args:
+        data (dict): The parsed V2 order response. Without an
+            average_fee_paid, only a line saying so is printed.
+        price_str (str): The limit price the order was submitted at, used when
+            the response carries no readable average fill price.
 
     Returns:
         None
@@ -533,28 +596,42 @@ def _report_fee(data: dict, price_str: str) -> None:
     order = inner if isinstance(inner, dict) else data
     charged = order.get("average_fee_paid")
     if charged is None:
-        # Deliberately does NOT claim "nothing filled": this function never
-        # reads fill_count/remaining_count, and on a PARTIAL fill that claim
-        # was a second, independent false assertion of an empty fill printed
-        # right above the verdict (DR-20).
+        # Says nothing about what filled: this function does not read the
+        # fill counts (DR-20)
         print(
             "Fee check: response carried no average_fee_paid, so there is no charged fee "
             "to compare (the raw response body and the verdict below, not this line, say "
             "what filled)."
         )
         return
-    try:
-        price = float(price_str)
-    except (TypeError, ValueError):
-        print(f"Fee check: charged={charged} (limit price {price_str!r} unparseable)")
+    model_price = _fee_model_price(order, price_str)
+    if model_price is None:
+        print(
+            f"Fee check: exchange average_fee_paid=${charged} per contract (no readable "
+            f"average fill price or limit price {price_str!r} to evaluate the fee model at)"
+        )
         return
-    # config.fee_leg_exact is the bot's own fee model — the same function
-    # strategy.py sizes trades against.
-    modelled = config.fee_leg_exact(1, price)
+    price, price_label = model_price
+    # Fee per contract before any rounding
+    unrounded = config.TAKER_FEE_RATE * price * (1.0 - price)
+    # The bot's own fee for one whole contract (what trade sizing uses)
+    whole_contract = config.fee_leg_exact(1, price)
     print(
-        f"Fee check (informational, no verdict): exchange average_fee_paid={charged} | "
-        f"config.fee_leg_exact(1, {price}) = ${modelled:.4f} for ONE whole contract "
-        f"(the probe traded {PROBE_COUNT_STR})"
+        f"Fee check (informational, no verdict), per contract at p={price} ({price_label}): "
+        f"exchange average_fee_paid=${charged} per contract | "
+        f"model TAKER_FEE_RATE*p*(1-p) = ${unrounded:.6f} per contract before rounding | "
+        f"config.fee_leg_exact(1, {price}) = ${whole_contract:.2f} for one whole contract, "
+        "rounded up to the cent"
+    )
+    # The model rounded as Kalshi rounds this order, at each amount
+    rounded = " or ".join(
+        f"${_order_rounded_fee_per_contract(price, step):.4f} per contract at ${step} precision"
+        for step in FEE_BALANCE_PRECISIONS
+    )
+    print(
+        "  Kalshi rounds each order's total fee up to the account's balance precision "
+        "(rebating the excess later), and average_fee_paid includes that rounding: on "
+        f"this {PROBE_COUNT_STR}-contract order the model comes to {rounded}."
     )
 
 
@@ -720,8 +797,8 @@ def _kill_response_text(exc: Any) -> str:
         exc (Any): An exception trader._is_fok_kill accepted.
 
     Returns:
-        str: "HTTP <status> <body>", with a bytes body decoded as UTF-8 (as
-            trader._is_fok_kill reads it).
+        str: "HTTP <status> <body>". A body in bytes is decoded as UTF-8, with
+            any byte that cannot be decoded replaced.
     """
     body = exc.body
     if isinstance(body, (bytes, bytearray)):

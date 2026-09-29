@@ -11,7 +11,9 @@ Purpose:
     request for API routes the pinned SDK has no generated method for. Both the
     live scanner and the historical fetch pipeline import from here so backoff
     behavior stays consistent and there is no scanner → historical reverse
-    import.
+    import. It also describes failed requests: api_error_payload() reads the
+    error details Kalshi sends back, and api_error_summary() turns a failed
+    request into one short line of text for trader.py and scanner.py to log.
 
 Dependencies:
     No project imports — this module is a leaf so auth.py, scanner.py,
@@ -113,6 +115,10 @@ _MAX_ATTEMPTS = 6
 _INITIAL_DELAY = 2.0
 _MAX_DELAY = 60.0
 
+# The longest description api_error_summary returns by default; anything
+# longer is cut.
+_ERROR_SUMMARY_MAX_CHARS = 300
+
 
 def _extract_status(exc: BaseException) -> int | None:
     """
@@ -212,6 +218,138 @@ def _check_and_parse(resp: Any) -> Any:
             data=None,
         )
     return _json_loads(body)
+
+
+def _body_text(exc: BaseException) -> str | None:
+    """
+    Return the exception's .body (the response body of a failed request) as
+    text, decoding bytes as UTF-8.
+
+    Args:
+        exc (BaseException): The exception a request raised.
+
+    Returns:
+        str | None: The body, or None when there is none or it is not UTF-8
+            text. Never raises.
+    """
+    try:
+        body = getattr(exc, "body", None)
+        if isinstance(body, (bytes, bytearray)):
+            body = bytes(body).decode("utf-8")
+    except Exception:
+        return None
+    return body if isinstance(body, str) else None
+
+
+def api_error_payload(exc: BaseException) -> dict | None:
+    """
+    Return the error details Kalshi sent back with a rejected request.
+
+    Kalshi's error response looks like
+    {"error": {"code": ..., "message": ..., "details": ...}}; this returns the
+    inner object. trader._is_fok_kill checks its code, and api_error_summary
+    prints it.
+
+    Args:
+        exc (BaseException): The exception a request raised.
+
+    Returns:
+        dict | None: The error details, or None when the response carries none
+            in that form. Never raises.
+    """
+    body = _body_text(exc)
+    if body is None:
+        return None
+    try:
+        # The standard-library parser, so the result is the same with or
+        # without the optional orjson installed
+        payload = json.loads(body)
+    except (ValueError, RecursionError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return error if isinstance(error, dict) else None
+
+
+def _one_line(value: Any) -> str:
+    """
+    Return a value's text on one line of printable characters.
+
+    Line breaks, tabs and other unprintable characters become spaces and
+    repeated spaces are merged, so the text is safe in a log line or a
+    spreadsheet cell.
+
+    Args:
+        value (Any): The value to render.
+
+    Returns:
+        str: The value's text on one line, stripped at both ends.
+    """
+    text = "".join(ch if ch.isprintable() else " " for ch in str(value))
+    return " ".join(text.split())
+
+
+def api_error_summary(exc: BaseException, limit: int = _ERROR_SUMMARY_MAX_CHARS) -> str:
+    """
+    Describe a failed request in one short line of text.
+
+    For an HTTP error (the exception's .status is set), the line is the status
+    and reason, then whichever of Kalshi's error code, message and details it
+    sent:
+        HTTP 400 Bad Request — missing_parameters: missing parameters (Key: ...)
+    If none of those three was sent, the response body itself follows a
+    colon, on one line. For any other error, the line is the error's type and
+    the first line of its message, e.g. "TimeoutError: read timed out".
+
+    trader.py logs and records failed orders, unwinds, reads and transfers
+    this way, and scanner.py failed order-book reads, instead of the
+    exception's own text, which runs over several lines and lists every
+    response header.
+
+    Args:
+        exc (BaseException): The exception to describe.
+        limit (int): The most characters to return; a longer description is
+            cut and ends in "…".
+
+    Returns:
+        str: One line of printable text, at most `limit` characters. Never
+            raises.
+    """
+    try:
+        name = _one_line(type(exc).__name__) or "Exception"
+    except Exception:
+        name = "Exception"
+    try:
+        status = getattr(exc, "status", None)
+        if status is not None:
+            reason = getattr(exc, "reason", None)
+            text = f"HTTP {_one_line(status)}"
+            if reason:
+                text += f" {_one_line(reason)}"
+            error = api_error_payload(exc)
+            parts = [] if error is None else [
+                _one_line(error[key]) for key in ("code", "message")
+                if error.get(key) not in (None, "")
+            ]
+            details = None if error is None else error.get("details")
+            if parts:
+                text += " — " + ": ".join(parts)
+            if details not in (None, ""):
+                text += f" ({_one_line(details)})"
+            if not parts and details in (None, ""):
+                # Not Kalshi's error format: show the body itself
+                body = _one_line(_body_text(exc) or "")
+                if body:
+                    text += f": {body}"
+        else:
+            lines = str(exc).strip().splitlines()
+            first = _one_line(lines[0]) if lines else ""
+            text = f"{name}: {first}" if first else name
+    except Exception:
+        # An error whose details cannot be read is named by its type
+        text = name
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…" if limit > 0 else ""
 
 
 def fetch_json_page(fetch_fn: Any, **kwargs) -> Any:  # whatever the 2xx body parses to; _check_and_parse does not narrow (a literal null is None)

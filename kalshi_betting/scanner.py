@@ -26,7 +26,8 @@ Purpose:
 Dependencies:
     Imports constants, the leg-side tuples, fee helpers and the live toggles
     (LiveSettings and the helpers that read it) from config.py, and the
-    retry/raw-fetch helpers from _http.py. Exports the CandidatePair and
+    retry/raw-fetch helpers and api_error_summary (describes a failed
+    order-book read in one line) from _http.py. Exports the CandidatePair and
     ApiMarket dataclasses, the leg helpers leg_sides()/leg_prices()/
     deadline_gap_days() (the only source of truth for which side each leg
     buys and what it costs — consumed by strategy.py, trader.py, reporter.py,
@@ -135,7 +136,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any
 
-from ._http import api_call_with_retry, fetch_json_page
+from ._http import api_call_with_retry, api_error_summary, fetch_json_page
 from .config import (
     BUY_SLIPPAGE_TICKS,
     DEFAULT_EXCHANGE_INDEX,
@@ -4851,7 +4852,10 @@ def _fetch_orderbook(client: Any, ticker: str) -> dict | None:
             no_raw  = _cents_bids_to_dollar_bids(ticker, no_key, no_raw)
         return {"yes": yes_raw, "no": no_raw}
     except Exception as exc:
-        logging.warning("Orderbook fetch failed for %s: %s", ticker, exc)
+        # One-line description of the error
+        logging.warning(
+            "Orderbook fetch failed for %s: %s", ticker, api_error_summary(exc)
+        )
         return None
 
 
