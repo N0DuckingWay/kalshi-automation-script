@@ -73,7 +73,10 @@ Dependencies:
     ApiException (to recognise the V2 kill reply) from the kalshi_python_sync
     SDK; fetch_json_page (position reads), signed_request_json and
     api_call_with_retry (position reads only, never orders or transfers) from
-    _http.py; ceil_to_tick, leg_prices, leg_sides, tick_size_for_price,
+    _http.py, with api_error_payload (reads the error details Kalshi sends
+    back; _is_fok_kill checks their code) and api_error_summary (the one-line
+    description every failed request is logged and recorded with here);
+    ceil_to_tick, leg_prices, leg_sides, tick_size_for_price,
     v2_limit_price and validate_pair_price from scanner.py (leg_sides and
     leg_prices decide which market gets which side; ceil_to_tick and
     v2_limit_price are re-exported here as _ceil_to_tick and _v2_limit_price);
@@ -140,7 +143,6 @@ Notes:
     dollar-string prices, and binary float noise would produce a string the
     exchange rejects as off-grid.
 """
-import json
 import logging
 import math
 import threading
@@ -156,7 +158,13 @@ from typing import Any
 
 from kalshi_python_sync.exceptions import ApiException
 
-from ._http import api_call_with_retry, fetch_json_page, signed_request_json
+from ._http import (
+    api_call_with_retry,
+    api_error_payload,
+    api_error_summary,
+    fetch_json_page,
+    signed_request_json,
+)
 from .auth import read_shard_balances
 from .config import (
     ORDER_WRITE_BURST,
@@ -1091,20 +1099,9 @@ def _is_fok_kill(exc: BaseException) -> bool:
         return False
     if getattr(exc, "status", None) != V2_FOK_KILL_HTTP_STATUS:
         return False
-    body = getattr(exc, "body", None)
-    if isinstance(body, (bytes, bytearray)):
-        try:
-            body = bytes(body).decode("utf-8")
-        except UnicodeDecodeError:
-            return False
-    if not isinstance(body, str):
-        return False
-    try:
-        payload = json.loads(body)
-    except (ValueError, RecursionError):
-        return False
-    error = payload.get("error") if isinstance(payload, dict) else None
-    return isinstance(error, dict) and error.get("code") == V2_FOK_KILL_ERROR_CODE
+    # The error details Kalshi sent back
+    error = api_error_payload(exc)
+    return error is not None and error.get("code") == V2_FOK_KILL_ERROR_CODE
 
 
 class _UnclassifiableV2Response(ValueError):
@@ -1289,7 +1286,8 @@ def _position_count_once(client: Any, ticker: str) -> float | None:
         return _read_position(client, ticker)
     except Exception as exc:
         logging.warning(
-            "Single-shot position lookup failed for %s: %s", ticker, exc
+            "Single-shot position lookup failed for %s: %s",
+            ticker, api_error_summary(exc),
         )
         return None
 
@@ -1335,7 +1333,9 @@ def _position_count(client: Any, ticker: str) -> float | None:
         # "position unknown" — see _execute_one's ambiguity handling.
         return api_call_with_retry(_read_position, client, ticker)
     except Exception as exc:
-        logging.warning("Position lookup failed for %s: %s", ticker, exc)
+        logging.warning(
+            "Position lookup failed for %s: %s", ticker, api_error_summary(exc)
+        )
         return None
 
 
@@ -1366,6 +1366,50 @@ def _fill_delta(before: float | None, after: float | None) -> float | None:
     return after - before
 
 
+def _partial_unwind_counts(exc: BaseException, count: int) -> tuple[str, str] | None:
+    """
+    Return how many NO contracts a partial unwind closed and how many are
+    still open.
+
+    The unwind is immediate-or-cancel, so it may close only part of the
+    position. When it does, _submit_order_v2 raises _UnclassifiableV2Response
+    carrying the order response, and this reads the fill count from it. Only
+    _rollback_no_leg calls it.
+
+    Args:
+        exc (BaseException): The error the unwind raised.
+        count (int): How many NO contracts the pair bought.
+
+    Returns:
+        tuple[str, str] | None: Contracts closed and contracts still open, as
+            plain numbers ("3", "2.5"), or None when the error carries no
+            usable fill count. Never raises.
+    """
+    try:
+        if not (isinstance(exc, _UnclassifiableV2Response)
+                and isinstance(exc.response, dict)):
+            return None
+        # The order may be nested under "order" or sent at the top level
+        inner = exc.response.get("order")
+        order = inner if isinstance(inner, dict) else exc.response
+        fill = _parse_fixed_point(order, "fill_count")
+        # Only a finite count above zero and below the full count is a
+        # partial fill
+        if fill is None or not fill.is_finite() or not 0 < fill < count:
+            return None
+        # Exact arithmetic only: a count too long to subtract exactly is
+        # treated as unknown
+        with localcontext() as ctx:
+            ctx.traps[Inexact] = True
+            still_open = count - fill
+            return (
+                format(fill.normalize(), "f"),
+                format(still_open.normalize(), "f"),
+            )
+    except Exception:
+        return None
+
+
 def _rollback_no_leg(
     client: Any, spec: TradeSpec, no_leg: _Leg, reason: str, *,
     pace: Callable[[], float] | None = None,
@@ -1382,11 +1426,11 @@ def _rollback_no_leg(
     Its own result is checked: a full close is "rolled_back"; no fill, a part
     fill or an error is "rollback_failed", and no second order is sent. For a
     part close the CRITICAL names how many NO contracts are still open (the
-    NO count minus the fill count in the unwind's reply, read from the reply
-    _submit_order_v2 attaches to its error); when that count cannot be read,
-    or the unwind raised for any other reason, it says "up to" the NO count. Both of those alerts say to
-    check the account. An unwind that filled nothing logs ROLLBACK NOT FILLED
-    with the full NO count.
+    NO count minus the fill count in the unwind's reply, read by
+    _partial_unwind_counts); when that count cannot be read, or the unwind
+    raised for any other reason, it says "up to" the NO count. Both of those
+    alerts say to check the account. An unwind that filled nothing logs
+    ROLLBACK NOT FILLED with the full NO count.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -1417,34 +1461,12 @@ def _rollback_no_leg(
             client, rollback,
             pace=pace if pace is not None else _ORDER_WRITE_PACER.acquire_hedge,
         )
-    except Exception as rb_err:
-        # How many NO contracts a partial unwind closed and left open, as
-        # plain decimal text ("3.00" reads 3, "2.50" reads 2.5), when its own
-        # 2xx response says so (see the docstring); None when not known
-        counts = None
-        try:
-            if (isinstance(rb_err, _UnclassifiableV2Response)
-                    and isinstance(rb_err.response, dict)):
-                # The order object may be wrapped under "order" or sent flat —
-                # the same unwrap _v2_fill_status applies
-                inner = rb_err.response.get("order")
-                order = inner if isinstance(inner, dict) else rb_err.response
-                fill = _parse_fixed_point(order, "fill_count")
-                # is_finite first: comparing a NaN with < raises
-                if fill is not None and fill.is_finite() and 0 < fill < no_leg.count:
-                    # Exact decimal arithmetic only: a count that decimal's
-                    # default 28-digit precision would round raises Inexact
-                    # here, so it is reported as unknown rather than wrong
-                    with localcontext() as ctx:
-                        ctx.traps[Inexact] = True
-                        still_open = no_leg.count - fill
-                        counts = (
-                            format(fill.normalize(), "f"),
-                            format(still_open.normalize(), "f"),
-                        )
-        except Exception:
-            # Reading the count must never cost the orphan alert below
-            counts = None
+    except Exception as exc:
+        # One-line description of the error
+        rb_error = api_error_summary(exc)
+        # Contracts closed and still open after a partial unwind; None when
+        # not known
+        counts = _partial_unwind_counts(exc, no_leg.count)
         if counts is not None:
             closed_text, open_text = counts
             logging.critical(
@@ -1454,12 +1476,12 @@ def _rollback_no_leg(
                 " immediate-or-cancel order leaves nothing resting) — check the"
                 " account. Manual review required. Error: %s",
                 spec.pair.canonical_title, closed_text, no_leg.count,
-                no_leg.market.ticker, open_text, rb_err,
+                no_leg.market.ticker, open_text, rb_error,
             )
             return TradeResult(
                 spec=spec, status="rollback_failed",
                 error=(
-                    f"{reason}; rollback error: {rb_err}; {open_text} of"
+                    f"{reason}; rollback error: {rb_error}; {open_text} of"
                     f" {no_leg.count} NO contracts still open"
                 ),
             )
@@ -1467,11 +1489,11 @@ def _rollback_no_leg(
             "ROLLBACK FAILED for '%s' — ORPHANED POSITION: up to %d NO contracts"
             " on %s (the unwind can close part of the position before it stops —"
             " check the account). Manual review required. Error: %s",
-            spec.pair.canonical_title, no_leg.count, no_leg.market.ticker, rb_err,
+            spec.pair.canonical_title, no_leg.count, no_leg.market.ticker, rb_error,
         )
         return TradeResult(
             spec=spec, status="rollback_failed",
-            error=f"{reason}; rollback error: {rb_err}",
+            error=f"{reason}; rollback error: {rb_error}",
         )
     if rb_status != "executed":
         logging.critical(
@@ -1539,7 +1561,7 @@ def pre_execution_check(client: Any, portfolio: list, *,
             except Exception as exc:
                 logging.warning(
                     "Pre-execution check raised for '%s' — dropping: %s",
-                    spec.pair.canonical_title, exc,
+                    spec.pair.canonical_title, api_error_summary(exc),
                 )
                 continue
             if ok:
@@ -1812,7 +1834,7 @@ def _execute_transfer(client: Any, source: int, dest: int, cents: int) -> str | 
             "Transfer POST of $%.2f shard %d→%d was ACCEPTED (2xx) but its response "
             "could not be parsed — MONEY IS IN FLIGHT, CHECK THE ACCOUNT. Treating as "
             "accepted with no transfer_id; NOT re-sent. Parse error: %s",
-            cents / 100, source, dest, exc,
+            cents / 100, source, dest, api_error_summary(exc),
         )
         return None
     if not isinstance(data, dict):
@@ -1905,7 +1927,10 @@ def _await_transfer_settlement(client: Any, required: dict[int, int]) -> dict[in
             # never the retry-wrapped verify_auth — see docstring for why.
             balances = read_shard_balances(client)
         except Exception as exc:
-            logging.warning("Balance re-read failed while awaiting transfers: %s", exc)
+            logging.warning(
+                "Balance re-read failed while awaiting transfers: %s",
+                api_error_summary(exc),
+            )
             balances = {}
         if not _unfunded_shards(required, balances):
             return balances
@@ -2035,7 +2060,7 @@ def ensure_shard_collateral(
             logging.error(
                 "Collateral transfer of $%.2f from shard %d to shard %d FAILED (not "
                 "retried — the endpoint is not idempotent): %s",
-                cents / 100, source, dest, exc,
+                cents / 100, source, dest, api_error_summary(exc),
             )
             continue
         accepted.append(str(transfer_id))
@@ -2348,7 +2373,8 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
                 error=f"NO leg FoK not filled: status={status_no}",
             )
     except Exception as e:
-        no_leg_error = str(e)
+        # One-line description of the error, for the logs and TradeResult.error
+        no_leg_error = api_error_summary(e)
 
     # Disambiguation runs OUTSIDE the except block (mirroring the YES leg
     # below) so the position lookup is not executed while the NO leg's
@@ -2449,7 +2475,8 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
         if status_yes != "executed":
             yes_leg_error = f"YES leg FoK not filled: status={status_yes}"
     except Exception as e:
-        yes_leg_error = f"YES leg error: {e}"
+        # One-line description of the error
+        yes_leg_error = f"YES leg error: {api_error_summary(e)}"
         yes_leg_ambiguous = True
 
     if yes_leg_error:
@@ -2630,20 +2657,22 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
                 # could reverse a real fill, the same reasoning behind every
                 # other manual_review case in _execute_one. "A"/"B" are MARKET
                 # labels (market_a / market_b), not submission legs.
+                # One-line description in the message and the result;
+                # exc_info adds the traceback
                 logging.critical(
                     "Unhandled exception executing '%s' (A=%s B=%s) — fill state "
-                    "UNKNOWN, manual review required: %r",
+                    "UNKNOWN, manual review required: %s",
                     spec.pair.canonical_title,
                     spec.pair.market_a.ticker,
                     spec.pair.market_b.ticker,
-                    exc,
+                    api_error_summary(exc),
                     exc_info=True,
                 )
                 results.append(
                     TradeResult(
                         spec=spec,
                         status="manual_review",
-                        error=f"Unhandled exception in _execute_one: {exc!r}",
+                        error=f"Unhandled exception in _execute_one: {api_error_summary(exc)}",
                     )
                 )
 

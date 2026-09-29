@@ -2069,9 +2069,11 @@ class TestPartialUnwindCount:
     ):
         result, client = self._unwind(post, caplog, body)
         assert result.status == "rollback_failed"
+        # The rollback error is the one-line description: the error's type,
+        # then its message
         assert result.error.startswith(
             "YES leg FoK not filled: status=canceled; rollback error: "
-            "Unclassifiable V2 order response: fill_count="
+            "_UnclassifiableV2Response: Unclassifiable V2 order response: fill_count="
         )
         assert result.error.endswith(f"; {still_open} of 5 NO contracts still open")
         (alert,) = self._orphan_alerts(caplog)
@@ -2116,7 +2118,7 @@ class TestPartialUnwindCount:
         with caplog.at_level(logging.CRITICAL):
             result = _execute_one(client, make_spec())
         assert result.status == "rollback_failed"
-        assert result.error.startswith("NO leg ambiguous error: read timed out;")
+        assert result.error.startswith("NO leg ambiguous error: TimeoutError: read timed out;")
         assert result.error.endswith("; 3 of 5 NO contracts still open")
         (alert,) = self._orphan_alerts(caplog)
         assert "closed 2 of the 5 NO contracts this pair bought on TICK-A" in alert
@@ -4611,3 +4613,164 @@ class TestExecuteTradesArePaced:
             assert not [t for t in no_sent if requested < t < sent - 1e-9]
             ahead = sum(1 for t in asked if t <= requested)
             assert sent - requested <= ahead / rate + 1e-9
+
+
+# Error responses Kalshi's order endpoint sent in live trading, word for word
+MISSING_PARAMETERS_BODY = (
+    '{"error":{"code":"missing_parameters","message":"missing parameters",'
+    '"details":"Key: \'CreateOrderV2Request.SelfTradePreventionType\' '
+    "Error:Field validation for 'SelfTradePreventionType' failed on the "
+    "'required' tag\"}}"
+)
+TOO_MANY_REQUESTS_BODY = '{"error":{"code":"too_many_requests","message":"too many requests"}}'
+MISSING_PARAMETERS_LINE = (
+    "HTTP 400 Bad Request — missing_parameters: missing parameters"
+    " (Key: 'CreateOrderV2Request.SelfTradePreventionType' Error:Field"
+    " validation for 'SelfTradePreventionType' failed on the 'required' tag)"
+)
+TOO_MANY_REQUESTS_LINE = "HTTP 429 Too Many Requests — too_many_requests: too many requests"
+
+
+def sdk_error(status: int, reason: str, body: str) -> ApiException:
+    """Return the error an order POST raises for a rejected response, with its
+    status, reason, headers and body."""
+    resp = SimpleNamespace(
+        status=status, reason=reason, data=body.encode("utf-8"),
+        getheaders=lambda: {
+            "Content-Type": "application/json; charset=utf-8",
+            "X-Cache": "Error from cloudfront",
+            "Via": "1.1 bf301dc40604cc700e6167cb307dc8ca.cloudfront.net (CloudFront)",
+        },
+    )
+    with pytest.raises(ApiException) as exc_info:
+        _http._check_and_parse(resp)
+    return exc_info.value
+
+
+class TestFailedRequestsAreLoggedOnOneLine:
+    """A failed order or unwind is logged, and recorded in TradeResult.error,
+    as one line: the HTTP status and reason, then Kalshi's error code, message
+    and details, with no response headers. A failed position read is logged
+    the same way."""
+
+    @pytest.fixture(autouse=True)
+    def _no_mapping_read(self, v2_mapping_confirmed, monkeypatch):
+        """The check that a NO order opens a NO position is already passed (so
+        it makes no extra position read), and pauses take no real time."""
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
+
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
+
+    @staticmethod
+    def _assert_every_record_is_one_line(caplog):
+        assert caplog.records
+        for record in caplog.records:
+            message = record.getMessage()
+            assert "\n" not in message
+            assert "cloudfront" not in message
+            assert "HTTP response headers" not in message
+
+    def test_the_sdk_text_would_have_listed_the_headers(self):
+        # The exception's own text runs over several lines and lists the headers
+        text = str(sdk_error(429, "Too Many Requests", TOO_MANY_REQUESTS_BODY))
+        assert len(text.splitlines()) >= 4
+        assert "cloudfront" in text
+
+    def test_a_rejected_no_leg(self, post, caplog):
+        # The NO leg is rejected with a 400 and the position does not move,
+        # so the pair ends "failed"
+        post.side_effect = [sdk_error(400, "Bad Request", MISSING_PARAMETERS_BODY)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+        with caplog.at_level(logging.INFO):
+            result = _execute_one(client, make_spec())
+        assert result.status == "failed"
+        assert result.error == f"NO leg error: {MISSING_PARAMETERS_LINE}"
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1 and errors[0].endswith(f"(position unchanged — no fill): {MISSING_PARAMETERS_LINE}")
+        self._assert_every_record_is_one_line(caplog)
+
+    def test_a_rejected_yes_leg_and_its_unwind(self, post, caplog):
+        # The YES leg is rejected with a 429 and the position does not move,
+        # so the NO leg is unwound
+        post.side_effect = [
+            v2_resp(5), sdk_error(429, "Too Many Requests", TOO_MANY_REQUESTS_BODY), v2_resp(5),
+        ]
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+        with caplog.at_level(logging.INFO):
+            result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+        assert result.error == f"YES leg error: {TOO_MANY_REQUESTS_LINE}"
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert errors[0].endswith(f"attempting rollback: YES leg error: {TOO_MANY_REQUESTS_LINE}")
+        self._assert_every_record_is_one_line(caplog)
+
+    def test_a_rejected_unwind(self, post, caplog):
+        # The YES leg is killed and the unwind is rejected with a 429
+        post.side_effect = [
+            v2_resp(5), fok_kill_error(), sdk_error(429, "Too Many Requests", TOO_MANY_REQUESTS_BODY),
+        ]
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+        with caplog.at_level(logging.INFO):
+            result = _execute_one(client, make_spec())
+        assert result.status == "rollback_failed"
+        assert result.error == (
+            f"YES leg FoK not filled: status=canceled; rollback error: {TOO_MANY_REQUESTS_LINE}"
+        )
+        criticals = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert len(criticals) == 1
+        assert criticals[0].startswith("ROLLBACK FAILED")
+        assert criticals[0].endswith(f"Error: {TOO_MANY_REQUESTS_LINE}")
+        self._assert_every_record_is_one_line(caplog)
+
+    def test_a_failed_position_read(self, caplog):
+        # A 400 is not retried, so both readers fail at once
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(
+            side_effect=sdk_error(400, "Bad Request", '{"error":{"code":"bad_request","message":"bad"}}')
+        )
+        with caplog.at_level(logging.WARNING):
+            assert trader._position_count(client, "TICK-A") is None
+            assert trader._position_count_once(client, "TICK-A") is None
+        assert [r.getMessage() for r in caplog.records] == [
+            "Position lookup failed for TICK-A: HTTP 400 Bad Request — bad_request: bad",
+            "Single-shot position lookup failed for TICK-A: HTTP 400 Bad Request — bad_request: bad",
+        ]
+
+    def test_no_handler_logs_or_records_an_exception_whole(self):
+        # Every exception trader.py catches by name is either used only inside
+        # a raise statement or passed, as the first argument, only to
+        # api_error_summary, _is_fok_kill or _partial_unwind_counts — so no log
+        # line or error field contains the exception's own multi-line text
+        tree = ast.parse(inspect.getsource(trader))
+        allowed = {"api_error_summary", "_is_fok_kill", "_partial_unwind_counts"}
+        handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler) and n.name]
+        assert len(handlers) >= 10
+        for handler in handlers:
+            parents = {
+                child: node for node in ast.walk(handler) for child in ast.iter_child_nodes(node)
+            }
+            for node in ast.walk(handler):
+                if not (isinstance(node, ast.Name) and node.id == handler.name):
+                    continue
+                ancestor, in_raise = node, False
+                while ancestor is not handler:
+                    ancestor = parents[ancestor]
+                    in_raise = in_raise or isinstance(ancestor, ast.Raise)
+                if in_raise:
+                    continue
+                parent = parents[node]
+                assert (
+                    isinstance(parent, ast.Call)
+                    and isinstance(parent.func, ast.Name)
+                    and parent.func.id in allowed
+                    and parent.args[:1] == [node]
+                ), f"line {node.lineno}: {handler.name} used as {ast.unparse(parent)}"
