@@ -784,12 +784,21 @@ V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS = (1.0, 2.0, 4.0)
 # than a count of pairs without a verdict, because killed NO legs cost one
 # round trip each and should not use up the protection: three kills in a row
 # under a 3-pair count let a wrong mapping open a wrong-side position on
-# every pair started together after them. Sixty seconds covers the usual
-# first pair (a few round trips, up to 7 s more when the ledger lags) and
-# dozens of killed legs, and adds at most about a minute to a run when the
-# positions endpoint is down. It also means a stuck order POST holds the
-# rest of the run back for at most this long.
-V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS = 60.0
+# every pair started together after them. The clock starts with the run, so
+# slow position reads spend it before any NO leg is checked: at 60 s, reads
+# that each succeed only after ~35 s (a 429 storm that clears) used the whole
+# budget during the first pair's two baseline reads, and a wrong mapping then
+# opened 7 wrong-side positions instead of 1 (review measurement,
+# 2026-09-28). Three hundred seconds covers a first pair behind such reads
+# (~105 s to a verdict) plus two or three killed legs at that speed, and
+# dozens of killed legs at normal speed (operator decision, 2026-09-28). When
+# every position read fails, pairs take ~2 min each, so about 3 run alone
+# before the rest start: 7 pairs take ~10-13 min instead of ~2, and 30
+# pairs ~15 min, inside the scheduler's one-hour
+# SCHEDULER_JOB_TIMEOUT_SECONDS. A stuck order POST holds the other pairs
+# back for at most this long; execute_trades itself still returns only when
+# that POST does, since order POSTs carry no request timeout.
+V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS = 300.0
 
 # How often, in seconds, trader.execute_trades looks at whether the pair
 # running alone has settled the V2 NO-leg mapping. The next pair starts as
