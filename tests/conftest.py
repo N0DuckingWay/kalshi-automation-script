@@ -23,7 +23,9 @@ Purpose:
     saves defaults never leaks them into the next; and one points the
     live-run lock (config.LIVE_RUN_LOCK_FILE) at each test's own tmp_path and
     shortens its waits, so no test takes or waits on the machine's real lock
-    in the home folder. pre_toggle_defaults pins
+    in the home folder, and points the defaults server's run folders
+    (config.LIVE_RUNS_DIR) there too, so no test writes a run folder into the
+    checkout. pre_toggle_defaults pins
     the live toggles for a test whose figures assume fixed values (they pin
     arithmetic, not config.py's policy); its helper, apply_pre_toggle_defaults,
     also serves class-scoped fixtures. save_config_live_defaults (and the
@@ -36,9 +38,10 @@ Dependencies:
     kalshi_betting.trader (its _WritePacer, _ORDER_WRITE_PACER,
     _V2_NO_MAPPING_DISPROVEN and _V2_UNCHECKED_NO_LEGS), config (the toggle
     constants, the order-write rate and burst, LIVE_DEFAULTS_FILE,
-    live_settings and save_live_defaults, and the live-run lock's
+    live_settings and save_live_defaults, the live-run lock's
     LIVE_RUN_LOCK_FILE, LIVE_RUN_LOCK_WAIT_SECONDS and
-    LIVE_RUN_LOCK_POLL_SECONDS), and backtester and backtest (the
+    LIVE_RUN_LOCK_POLL_SECONDS, and the defaults server's LIVE_RUNS_DIR), and
+    backtester and backtest (the
     by-value copies they bind). Imported by pytest, and by test modules for
     apply_pre_toggle_defaults and save_config_live_defaults.
 
@@ -229,7 +232,7 @@ def _isolate_live_defaults(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _isolate_live_runs(tmp_path, monkeypatch):
     """
-    Point the live-run lock at this test's tmp_path and shorten its waits.
+    Point the live-run lock and the defaults server's run folders at this test's tmp_path.
 
     config.LIVE_RUN_LOCK_FILE is read at call time (run_lock.py), so every
     test that runs main.main() in production without --dry-run takes a lock
@@ -237,7 +240,9 @@ def _isolate_live_runs(tmp_path, monkeypatch):
     wait drops to 0.2 s and the retry interval to 0.01 s, so a test that
     holds the lock sees a second run refused quickly. The folder under
     tmp_path is not made here: run_lock.acquire() makes it, as it would the
-    real one.
+    real one. config.LIVE_RUNS_DIR, where defaults_server keeps each run it
+    starts, is read at call time too, so no test writes one into the
+    checkout's live_runs/.
 
     Args:
         tmp_path (Path): pytest's per-test temporary directory.
@@ -246,6 +251,7 @@ def _isolate_live_runs(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "LIVE_RUN_LOCK_FILE", tmp_path / "lock" / "live_run.lock")
     monkeypatch.setattr(config, "LIVE_RUN_LOCK_WAIT_SECONDS", 0.2)
     monkeypatch.setattr(config, "LIVE_RUN_LOCK_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(config, "LIVE_RUNS_DIR", tmp_path / "live_runs")
 
 
 def save_config_live_defaults() -> None:

@@ -42,6 +42,12 @@ live_defaults.json
 run_result.json
 .run_result.json.*.tmp
 
+# The runs defaults_server starts (config.LIVE_RUNS_DIR): one folder per run,
+# holding what it is, everything it printed and its result (balances and
+# trades). It is operator state, like scheduler_state.json, so it stays out
+# of git
+/live_runs/
+
 # Python
 __pycache__/
 *.py[cod]

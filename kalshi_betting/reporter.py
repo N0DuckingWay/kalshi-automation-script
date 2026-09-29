@@ -779,8 +779,9 @@ class RunReport:
     """
     What one production run did, for the program that started it.
 
-    main.py fills it in as the run goes when it is started with --result-file,
-    and writes it as JSON (write_run_report) in a finally once logging is set
+    main.py fills it in as the run goes when it is started with --result-file
+    (the defaults server passes that flag for every run it starts), and
+    writes it as JSON (write_run_report) in a finally once logging is set
     up, so however the run ends from there. Nothing is written when main.py
     stops before that — a usage error, which exits 2 with its reason on
     stderr — or when a kill signal stops the process.

@@ -8,15 +8,18 @@ Purpose:
     main.py takes the lock for a production run that sends orders (not a dry
     run or a dev run, which send none) and releases it when the run ends. A
     second such run finds it taken and stops before it builds a client, with
-    config.EXIT_RUN_IN_PROGRESS. Scheduled runs and runs started by hand both
-    go through main.py, from any checkout or worktree, so they all share this
-    one lock: they trade one Kalshi account, and two at once would size on
-    the same balance and could pick the same pairs.
+    config.EXIT_RUN_IN_PROGRESS. Scheduled runs, runs started by hand and runs
+    started from the defaults server all go through main.py, from any
+    checkout or worktree, so they all share this one lock: they trade one
+    Kalshi account, and two at once would size on the same balance and could
+    pick the same pairs.
 
 Dependencies:
     Imports config (the lock file's path, the waits, and PROJECT_ROOT, which
     the holder record names). main.py imports it to take the lock;
-    scheduler.py reads its holder record for its exit-50 message.
+    scheduler.py reads its holder record for its exit-50 message; and
+    defaults_server.py checks it with held() before it offers a real-money
+    run, naming the run in the way with holder().
 
 Notes:
     The lock is an flock on config.LIVE_RUN_LOCK_FILE, read at call time so
@@ -26,12 +29,12 @@ Notes:
     for a long time. The file also records the holder's process id, checkout
     and start time, for messages only: whether a run may trade is decided by
     the flock, never by the record. held() is for a caller that only wants
-    to know whether a run is trading: it takes a shared lock and drops it at
-    once. acquire() keeps retrying for config.LIVE_RUN_LOCK_WAIT_SECONDS
-    before it gives up, so such a momentary check can never make a starting
-    run stop. An flock belongs to one open file, so two opens of the lock
-    file in one process also exclude each other, which is what lets the
-    tests hold the lock in-process.
+    to know whether a run is trading (the defaults server): it takes a shared
+    lock and drops it at once. acquire() keeps retrying for
+    config.LIVE_RUN_LOCK_WAIT_SECONDS before it gives up, so such a momentary
+    check can never make a starting run stop. An flock belongs to one open
+    file, so two opens of the lock file in one process also exclude each
+    other, which is what lets the tests hold the lock in-process.
 """
 import fcntl
 import json

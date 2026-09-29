@@ -17,7 +17,8 @@ Dependencies:
     scheduler.py, treasury.py, run_lock.py, and main.py — plus two standalone,
     human-run tools kept deliberately outside the pipeline's import graph: the
     verification CLI (see CLAUDE.md's pipeline-isolation rule) and
-    defaults_server.py, the confirmation page that saves the live defaults.
+    defaults_server.py, the local pages that save the live defaults and start
+    live trading runs with them.
 
 Notes:
     PROJECT_ROOT is derived from __file__ so the package works correctly on any
@@ -27,9 +28,11 @@ Notes:
     The saved live defaults (LIVE_DEFAULTS_FILE, live_defaults.json in the repo
     root), which every live run starts from, are read and written here too:
     read_saved_live_defaults and live_defaults read the file, and
-    save_live_defaults writes it (on defaults_server's Confirm). The toggle
-    constants here are the backtest's k and caps and the fallback
-    live_settings() returns, never a live run's defaults.
+    save_live_defaults writes it (on defaults_server's Confirm and save, or
+    Confirm and trade). The toggle constants here are the backtest's k and
+    caps and the fallback live_settings() returns, never a live run's
+    defaults. The runs defaults_server starts keep their files under
+    LIVE_RUNS_DIR, which the server reads at call time, so tests redirect it.
 """
 import fcntl
 import json
@@ -520,7 +523,8 @@ LIVE_EXPOSURE_WARN_FRACTION = 0.20
 # live toggles, saved through defaults_server's confirmation page
 # (python3 -m kalshi_betting.defaults_server; its --seed proposes
 # LIVE_DEFAULTS_SEED for a first save). save_live_defaults writes it, on that
-# page's Confirm, and read_saved_live_defaults / live_defaults read it. A live
+# page's Confirm and save (or Confirm and trade, which saves before it runs
+# the bot), and read_saved_live_defaults / live_defaults read it. A live
 # run refuses to start without it; it never falls back to the toggle constants
 # above. main.py's flags still override it for one run. Read at call time
 # through this module's global, so tests can point it elsewhere
@@ -567,9 +571,9 @@ LIVE_DEFAULTS_SOURCE_PATTERN = (
 
 # ── Defaults server ───────────────────────────────────────────────────────────
 
-# Where defaults_server.py listens: the confirmation page that saves the live
-# defaults. Loopback only. Changing the port needs a new dashboard, since the
-# page's save address is written into it when it is built.
+# Where defaults_server.py listens: the pages that save the live defaults and
+# start live runs with them. Loopback only. Changing the port needs a new
+# dashboard, since the page's save address is written into it when it is built.
 DEFAULTS_SERVER_HOST = "127.0.0.1"
 DEFAULTS_SERVER_PORT = 8765
 
@@ -581,14 +585,33 @@ DEFAULTS_SERVER_MAX_REQUEST_BYTES = 16_384
 # without sending anything.
 DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS = 5
 
-# How long, in milliseconds, the confirmation page must be visible before a
-# mouse move or key press enables its Confirm button: a click aimed at another
-# page cannot land on it (the DoubleClickjacking defence).
+# How long, in milliseconds, a page of the server must be visible before a
+# mouse move or key press enables its buttons: a click aimed at another page
+# cannot land on one (the DoubleClickjacking defence).
 DEFAULTS_SERVER_CONFIRM_ARM_MS = 1000
 
 # The one dashboard file every backtest run writes (and overwrites) in
 # PROJECT_ROOT; defaults_server opens it when it starts.
 DASHBOARD_FILENAME = "backtest_dashboard.html"
+
+# Where defaults_server keeps each live trading run it starts: one folder per
+# run, named by its UTC start time and its id, holding run.json (what the run
+# is, written before it starts), output.log (everything it prints) and
+# result.json (what main.py --result-file writes when it ends). Operator state
+# like scheduler_state.json, so gitignored. Read at call time, so tests point
+# it elsewhere (tests/conftest.py).
+LIVE_RUNS_DIR = PROJECT_ROOT / "live_runs"
+
+# How often, in seconds, the page of a run that is still going reloads itself.
+DEFAULTS_SERVER_RUN_REFRESH_SECONDS = 2
+
+# How much of a run's output.log its page shows: the last this-many lines,
+# read from at most its last this-many bytes, so a long log is never read whole.
+DEFAULTS_SERVER_RUN_LOG_TAIL_LINES = 25
+DEFAULTS_SERVER_RUN_LOG_TAIL_BYTES = 65_536
+
+# How many of the newest run folders the server's index page lists.
+DEFAULTS_SERVER_INDEX_RUNS = 10
 
 # Which side each leg of a pair buys, as (side bought on market_a, side bought
 # on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
@@ -1209,7 +1232,8 @@ LIVE_RUN_LOCK_FILE = pathlib.Path.home() / ".kalshi_betting" / "live_run.lock"
 
 # How long a run keeps trying a taken lock before it stops with
 # EXIT_RUN_IN_PROGRESS, and how often it tries. This is long enough to ride out
-# a momentary check of the lock (run_lock.held), and far shorter than any run.
+# a momentary check of the lock (run_lock.held — the defaults server's check
+# before it offers a real-money run), and far shorter than any run.
 LIVE_RUN_LOCK_WAIT_SECONDS = 2.0
 LIVE_RUN_LOCK_POLL_SECONDS = 0.1
 
@@ -2610,7 +2634,8 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
     """
     Write settings as the saved live defaults, and return them as read back.
 
-    defaults_server's Confirm is its one caller outside the tests. The
+    Its one caller outside the tests is defaults_server's
+    _App._post_confirm, on Confirm and save and on Confirm and trade. The
     record's text is first parsed exactly as read_saved_live_defaults
     will parse it, and must equal settings, so a file the reader would refuse
     is never written. It is then written next to the file under a name holding
