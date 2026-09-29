@@ -1,18 +1,22 @@
 """Tests for config.py fee helpers, the time-series probability model, the
 leg-side tuples, the deadline-gap tier (with the backtest's spread band and
-tier-floors switch), the live toggles (LiveSettings and its helpers), the
-weekly run schedule (ScheduledRun), the values config.py ships, conftest's
-apply_pre_toggle_defaults, the V2 order
-path's self-trade-prevention value, the startup check that refuses any order
-path but "v2" (order_api_version_error), the order-write pacer's budget, and
+tier-floors switch), the live toggles (LiveSettings and its helpers), the saved
+live defaults (their file's reader and writer, the seed, and the comparison of
+two sets of defaults), the weekly run schedule (ScheduledRun), the values
+config.py ships, conftest's apply_pre_toggle_defaults, the V2 order path's
+self-trade-prevention value, the startup check that refuses any order path but
+"v2" (order_api_version_error), the order-write pacer's budget, and
 PROJECT_ROOT."""
 import ast
 import dataclasses
 import importlib
+import json
 import logging
 import math
+import os
 import pathlib
 import re
+import threading
 from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -57,12 +61,17 @@ from .conftest import apply_pre_toggle_defaults
 
 def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
               same_title_size_cap=1.0, categories=None, tags=None):
-    """A LiveSettings with every field named, defaulting to the pre-toggle
+    """A LiveSettings with every toggle named, defaulting to the pre-toggle
     values conftest's apply_pre_toggle_defaults pins."""
     return LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
                         interval_discount=interval_discount, size_cap=size_cap,
                         same_title_size_cap=same_title_size_cap,
                         categories=categories, tags=tags)
+
+
+# An origin as read_saved_live_defaults writes it: any origin but config.py's
+# means the toggles are the saved live defaults
+_SAVED_ORIGIN = "live_defaults.json, saved 2026-09-27T21:05:13Z"
 
 
 class TestProjectRoot:
@@ -829,8 +838,8 @@ class TestLiveSettings:
         expected = _settings(True, (0.1, 0.6), 0.6, 0.35, 0.25,
                              ("Economics",), ("Oil & Gas",))
         assert live_settings() == expected
-        assert all(getattr(expected, f.name) != getattr(shipped, f.name)
-                   for f in dataclasses.fields(LiveSettings))
+        assert all(getattr(expected, name) != getattr(shipped, name)
+                   for name in config.LIVE_TOGGLE_FIELDS)
 
     def test_live_settings_refuses_an_invalid_constant(self, monkeypatch):
         monkeypatch.setattr(config, "BUDGET_FRACTION", 0.37)
@@ -900,8 +909,10 @@ class TestLiveSettings:
     def test_a_construction_without_the_filters_filters_nothing(self):
         s = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
         assert s.categories is None and s.tags is None
-        # Defaulted and last: the first five fields keep their positions
-        assert [f.name for f in dataclasses.fields(LiveSettings)][-2:] == ["categories", "tags"]
+        # Defaulted and last of the toggles: the first five fields keep their
+        # positions; origin, not a toggle, comes after them
+        assert list(config.LIVE_TOGGLE_FIELDS)[-2:] == ["categories", "tags"]
+        assert [f.name for f in dataclasses.fields(LiveSettings)][-1] == "origin"
 
     @pytest.mark.parametrize("name, value", [("TRADE_CATEGORIES", "Sports"),
                                              ("TRADE_TAGS", ())])
@@ -1100,8 +1111,9 @@ class TestDescribeLiveSettings:
         s = live_settings()
         assert "(config:" not in config.describe_live_settings(s, s)
 
-    # One departing value per LiveSettings field and the mark it must carry; a
-    # new field fails test_every_field_has_a_departure_row until it has a row
+    # One departing value per live toggle (config.LIVE_TOGGLE_FIELDS) and the
+    # mark it must carry; a new toggle fails test_every_field_has_a_departure_row
+    # until it has a row
     _DEPARTURES = {
         "tier_floors": (False, "tier floors off (config: on)"),
         "spread_band": ((0.1, 1.0), "spread band 0.1-1 (config: none)"),
@@ -1113,7 +1125,7 @@ class TestDescribeLiveSettings:
     }
 
     def test_every_field_has_a_departure_row(self):
-        assert set(self._DEPARTURES) == {f.name for f in dataclasses.fields(LiveSettings)}
+        assert set(self._DEPARTURES) == set(config.LIVE_TOGGLE_FIELDS)
 
     def test_every_departing_field_is_marked_and_no_other(self):
         ref = _settings()
@@ -1122,12 +1134,12 @@ class TestDescribeLiveSettings:
             "tier floors off (config: on) | spread band 0-0.5 (config: none) | "
             "k 0.8 (config: 0.75) | per-trade cap 100% (no cap) (config: 20%) | "
             "same-title cap 20% (config: 100% (no extra cap)) | categories any | tags any")
-        for field in dataclasses.fields(LiveSettings):
-            value, mark = self._DEPARTURES[field.name]
+        for name in config.LIVE_TOGGLE_FIELDS:
+            value, mark = self._DEPARTURES[name]
             line = config.describe_live_settings(
-                dataclasses.replace(ref, **{field.name: value}), ref)
+                dataclasses.replace(ref, **{name: value}), ref)
             assert line.count("(config:") == 1, line
-            assert mark in line, (field.name, line)
+            assert mark in line, (name, line)
 
     def test_k_renders_exactly(self):
         # 0.751 and 0.75 must never print alike: a departure would read as none
@@ -1177,6 +1189,34 @@ class TestDescribeLiveSettings:
         assert getattr(s, field) == ("Companies", "Any Awards")
         assert f"{field} Companies, Any Awards" in config.describe_live_settings(s)
         assert config.describe_live_settings(s) != config.describe_live_settings(_settings())
+
+    def test_a_saved_defaults_reference_marks_default(self):
+        # A reference read from the saved file (any origin but config.py's)
+        ref = dataclasses.replace(_settings(), origin=_SAVED_ORIGIN)
+        s = _settings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
+        line = config.describe_live_settings(s, ref)
+        assert line == (
+            "tier floors off (default: on) | spread band 0-0.5 (default: none) | "
+            "k 0.8 (default: 0.75) | per-trade cap 100% (no cap) (default: 20%) | "
+            "same-title cap 20% (default: 100% (no extra cap)) | categories any | tags any")
+        assert "(config:" not in line
+        # Every field's mark follows the reference's origin, one mark per departure
+        for name in config.LIVE_TOGGLE_FIELDS:
+            value, mark = self._DEPARTURES[name]
+            line = config.describe_live_settings(
+                dataclasses.replace(ref, **{name: value}), ref)
+            assert line.count("(default:") == 1 and "(config:" not in line, line
+            assert mark.replace("(config:", "(default:") in line, (name, line)
+        # Equal toggles mark nothing, whatever either origin says
+        assert "(default:" not in config.describe_live_settings(_settings(), ref)
+
+    def test_a_config_reference_still_marks_config(self):
+        # The mark reads the REFERENCE's origin, never the settings'
+        ref = _settings()
+        assert ref.origin == config.LIVE_DEFAULTS_FROM_CONFIG
+        s = dataclasses.replace(_settings(interval_discount=0.6), origin=_SAVED_ORIGIN)
+        line = config.describe_live_settings(s, ref)
+        assert "k 0.6 (config: 0.75)" in line and "(default:" not in line
 
     def test_describe_trade_filter_names_the_filter_in_the_same_words(self):
         assert config.describe_trade_filter(_settings()) == "categories any; tags any"
@@ -1614,3 +1654,721 @@ class TestScheduledRun:
         # No Monday is left before date.max: an empty list, never an overflow
         assert SCHEDULED_RUN.date_problems(date(9999, 12, 28), date.max) == []
         assert SCHEDULED_RUN.date_problems(date.max, date.max) == []
+
+
+class TestLiveSettingsOrigin:
+    """LiveSettings.origin says where the toggles' defaults came from; it is
+    one printable line and is never compared."""
+
+    def test_it_defaults_to_config_py(self):
+        assert config.LIVE_DEFAULTS_FROM_CONFIG == "config.py"
+        assert _settings().origin == config.LIVE_DEFAULTS_FROM_CONFIG
+        assert live_settings().origin == config.LIVE_DEFAULTS_FROM_CONFIG
+
+    @pytest.mark.parametrize("bad", [
+        None, 7, b"config.py", "", "   ",
+        "two\nlines", "a\ttab", "zero\u200bwidth", "\u202edirection",
+    ])
+    def test_a_blank_multi_line_or_non_printable_origin_is_refused(self, bad):
+        with pytest.raises(ValueError, match="origin"):
+            LiveSettings(True, (0.0, 1.0), 0.75, 0.2, origin=bad)
+        with pytest.raises(ValueError, match="origin"):
+            dataclasses.replace(_settings(), origin=bad)
+
+    def test_equal_toggles_are_equal_and_hash_alike_across_origins(self):
+        a = _settings()
+        b = dataclasses.replace(a, origin=_SAVED_ORIGIN)
+        assert a.origin != b.origin
+        assert a == b and hash(a) == hash(b) and len({a, b}) == 1
+        # ... while any toggle still tells two apart
+        assert a != dataclasses.replace(b, size_cap=0.35)
+
+    def test_replace_keeps_it(self):
+        s = dataclasses.replace(_settings(), origin=_SAVED_ORIGIN)
+        assert dataclasses.replace(s, size_cap=0.35).origin == _SAVED_ORIGIN
+        assert dataclasses.replace(s, categories=("Sports",)).origin == _SAVED_ORIGIN
+
+    def test_the_toggle_fields_are_the_seven(self):
+        assert config.LIVE_TOGGLE_FIELDS == (
+            "tier_floors", "spread_band", "interval_discount", "size_cap",
+            "same_title_size_cap", "categories", "tags")
+        assert [f.name for f in dataclasses.fields(LiveSettings)] == [
+            *config.LIVE_TOGGLE_FIELDS, "origin"]
+
+
+class _FrozenDatetime(datetime):
+    """datetime whose now() is fixed at 2026-09-27 21:05:13 UTC; tests put it
+    in place of config.datetime, so a save stamps a known time."""
+
+    @classmethod
+    def now(cls, tz=None):
+        """
+        Return the fixed instant, in UTC.
+
+        Args:
+            tz: Ignored; the instant is always UTC.
+
+        Returns:
+            datetime: 2026-09-27 21:05:13 UTC.
+        """
+        return datetime(2026, 9, 27, 21, 5, 13, tzinfo=UTC)
+
+
+def _valid_record(**changes) -> dict:
+    """
+    Build a saved-defaults record the reader accepts, then apply changes.
+
+    Its toggles are LIVE_DEFAULTS_SEED's, saved at 2026-09-27T21:05:13Z with
+    no source note.
+
+    Args:
+        **changes: Top-level keys to replace; a value of _DROP removes the key.
+
+    Returns:
+        dict: The record, ready for json.dumps.
+    """
+    record = {
+        "format": config.LIVE_DEFAULTS_FORMAT,
+        "saved_at": "2026-09-27T21:05:13Z",
+        "source": "",
+        "settings": {
+            "tier_floors": False, "spread_band": [0.0, 0.5], "interval_discount": 0.8,
+            "size_cap": 0.1, "same_title_size_cap": 0.2, "categories": None, "tags": None,
+        },
+    }
+    for key, value in changes.items():
+        if value is _DROP:
+            del record[key]
+        else:
+            record[key] = value
+    return record
+
+
+def _with_toggles(**changes) -> dict:
+    """
+    Build _valid_record() with toggles in its "settings" block changed.
+
+    Args:
+        **changes: Toggles to replace; a value of _DROP removes the toggle.
+
+    Returns:
+        dict: The record, ready for json.dumps.
+    """
+    record = _valid_record()
+    for key, value in changes.items():
+        if value is _DROP:
+            del record["settings"][key]
+        else:
+            record["settings"][key] = value
+    return record
+
+
+# Marks a key _valid_record / _with_toggles should remove
+_DROP = object()
+
+
+def _text(record) -> bytes:
+    """
+    Render a record as the bytes of a saved-defaults file.
+
+    Args:
+        record: Any JSON value; json.dumps writes NaN and Infinity as the bare
+            words the reader must refuse.
+
+    Returns:
+        bytes: The UTF-8 text.
+    """
+    return json.dumps(record).encode("utf-8")
+
+
+def _only(directory: pathlib.Path) -> list[str]:
+    """
+    List what a save left behind in a directory.
+
+    Args:
+        directory (pathlib.Path): The directory to list.
+
+    Returns:
+        list[str]: The names of its entries, sorted.
+    """
+    return sorted(p.name for p in directory.iterdir())
+
+
+class TestSavedLiveDefaults:
+    """read_saved_live_defaults and save_live_defaults: the saved live defaults
+    file, written atomically, read strictly, refused whole on any flaw. Each
+    test writes to its own path (conftest's _isolate_live_defaults)."""
+
+    _SETTINGS = LiveSettings(
+        tier_floors=True, spread_band=(0.1, 0.6), interval_discount=0.6, size_cap=0.35,
+        same_title_size_cap=0.5, categories=("Sports",), tags=("Basketball",))
+
+    def test_the_path_is_this_test_s_own(self, tmp_path):
+        # conftest's per-test redirect, never the repo's own file
+        assert config.LIVE_DEFAULTS_FILE == tmp_path / "live_defaults.json"
+
+    def test_conftest_saves_config_py_s_toggles(self, saved_live_defaults, tmp_path):
+        # tests/conftest.py's saved_live_defaults fixture: config.py's toggles,
+        # saved into this test's own path, with no source note
+        assert config.LIVE_DEFAULTS_FILE == tmp_path / "live_defaults.json"
+        saved = config.read_saved_live_defaults()
+        assert saved == config.live_settings()
+        assert saved.origin.startswith("live_defaults.json, saved ")
+        assert " from " not in saved.origin
+
+    def test_a_missing_file_reads_none(self):
+        assert not config.LIVE_DEFAULTS_FILE.exists()
+        assert config.read_saved_live_defaults() is None
+
+    def test_a_save_round_trips_every_toggle(self):
+        # A Category · Tag filter (the dashboard's "Sports · Basketball") and a
+        # same-title cap below the per-trade cap
+        saved = config.save_live_defaults(self._SETTINGS, source="a note")
+        assert saved == self._SETTINGS
+        for name in config.LIVE_TOGGLE_FIELDS:
+            assert getattr(saved, name) == getattr(self._SETTINGS, name), name
+        again = config.read_saved_live_defaults()
+        assert again == self._SETTINGS and again.origin == saved.origin
+        text = config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8")
+        assert '"categories": ["Sports"],' in text and '"tags": ["Basketball"]\n' in text
+
+    def test_the_written_text_is_pinned(self, monkeypatch):
+        monkeypatch.setattr(config, "datetime", _FrozenDatetime)
+        config.save_live_defaults(config.LIVE_DEFAULTS_SEED,
+                                  source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == (
+            b'{\n'
+            b'  "format": "live-defaults-v1",\n'
+            b'  "saved_at": "2026-09-27T21:05:13Z",\n'
+            b'  "source": "seed values (config.LIVE_DEFAULTS_SEED)",\n'
+            b'  "settings": {\n'
+            b'    "tier_floors": false,\n'
+            b'    "spread_band": [0.0, 0.5],\n'
+            b'    "interval_discount": 0.8,\n'
+            b'    "size_cap": 0.1,\n'
+            b'    "same_title_size_cap": 0.2,\n'
+            b'    "categories": null,\n'
+            b'    "tags": null\n'
+            b'  }\n'
+            b'}\n')
+
+    def test_the_origin_names_the_file_the_time_and_the_source(self, monkeypatch):
+        monkeypatch.setattr(config, "datetime", _FrozenDatetime)
+        saved = config.save_live_defaults(config.LIVE_DEFAULTS_SEED,
+                                          source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert saved.origin == ("live_defaults.json, saved 2026-09-27T21:05:13Z from "
+                                "seed values (config.LIVE_DEFAULTS_SEED)")
+        # No note, no "from"; surrounding spaces are dropped from a note
+        assert config.save_live_defaults(self._SETTINGS, source="").origin == (
+            "live_defaults.json, saved 2026-09-27T21:05:13Z")
+        assert config.save_live_defaults(self._SETTINGS, source="  a note  ").origin == (
+            "live_defaults.json, saved 2026-09-27T21:05:13Z from a note")
+
+    def test_no_staging_file_is_left_after_a_save(self):
+        config.save_live_defaults(self._SETTINGS, source="")
+        config.save_live_defaults(config.LIVE_DEFAULTS_SEED, source="")
+        assert _only(config.LIVE_DEFAULTS_FILE.parent) == ["live_defaults.json"]
+        assert config.read_saved_live_defaults() == config.LIVE_DEFAULTS_SEED
+
+    def test_the_staging_name_holds_the_process_id_and_is_gitignored(self, monkeypatch):
+        staged = []
+        real_replace = os.replace
+
+        def replace_spy(src, dst):
+            staged.append(pathlib.Path(src).name)
+            real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", replace_spy)
+        config.save_live_defaults(self._SETTINGS, source="")
+        assert staged == [f".live_defaults.json.{os.getpid()}.tmp"]
+        ignored = (PROJECT_ROOT / ".gitignore").read_text().splitlines()
+        assert "live_defaults.json" in ignored and ".live_defaults.json.*.tmp" in ignored
+
+    def test_a_failed_rename_keeps_the_old_file(self, monkeypatch):
+        config.save_live_defaults(config.LIVE_DEFAULTS_SEED, source="")
+        before = config.LIVE_DEFAULTS_FILE.read_bytes()
+
+        def refuse(src, dst):
+            raise OSError("no rename today")
+
+        monkeypatch.setattr(os, "replace", refuse)
+        with pytest.raises(config.LiveDefaultsError, match="could not be written") as err:
+            config.save_live_defaults(self._SETTINGS, source="")
+        assert str(config.LIVE_DEFAULTS_FILE) in str(err.value)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+        assert _only(config.LIVE_DEFAULTS_FILE.parent) == ["live_defaults.json"]
+
+    def test_a_missing_directory_is_refused(self, tmp_path, monkeypatch):
+        path = tmp_path / "missing" / "live_defaults.json"
+        monkeypatch.setattr(config, "LIVE_DEFAULTS_FILE", path)
+        with pytest.raises(config.LiveDefaultsError, match="could not be written") as err:
+            config.save_live_defaults(self._SETTINGS, source="")
+        assert str(path) in str(err.value)
+        assert not path.parent.exists()
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a read-only directory")
+    def test_a_read_only_directory_is_refused(self, tmp_path, monkeypatch):
+        directory = tmp_path / "read-only"
+        directory.mkdir()
+        path = directory / "live_defaults.json"
+        monkeypatch.setattr(config, "LIVE_DEFAULTS_FILE", path)
+        directory.chmod(0o555)
+        try:
+            with pytest.raises(config.LiveDefaultsError, match="could not be written"):
+                config.save_live_defaults(self._SETTINGS, source="")
+            assert _only(directory) == []
+        finally:
+            directory.chmod(0o755)
+
+    def test_a_failed_directory_flush_says_the_file_was_written(self, monkeypatch):
+        def refuse(directory):
+            raise OSError("no flush today")
+
+        monkeypatch.setattr(config, "_sync_directory", refuse)
+        with pytest.raises(config.LiveDefaultsError, match="written, but its directory"):
+            config.save_live_defaults(self._SETTINGS, source="")
+        # The rename happened: the new file is in place, and nothing is staged
+        assert config.read_saved_live_defaults() == self._SETTINGS
+        assert _only(config.LIVE_DEFAULTS_FILE.parent) == ["live_defaults.json"]
+
+    @pytest.mark.parametrize("read_back", [None, _settings()])
+    def test_a_read_back_mismatch_raises(self, monkeypatch, read_back):
+        monkeypatch.setattr(config, "read_saved_live_defaults", lambda: read_back)
+        with pytest.raises(config.LiveDefaultsError, match="read back as") as err:
+            config.save_live_defaults(self._SETTINGS, source="")
+        assert str(config.LIVE_DEFAULTS_FILE) in str(err.value)
+
+    @pytest.mark.parametrize("source", [7, None, "two\nlines", "zero\u200bwidth",
+                                        "x" * (config.LIVE_DEFAULTS_SOURCE_MAX_CHARS + 1)])
+    def test_a_bad_source_is_refused_before_anything_is_written(self, monkeypatch, source):
+        opened = []
+        monkeypatch.setattr(config, "_sync_directory", lambda d: opened.append(d))
+        with pytest.raises(config.LiveDefaultsError, match="source") as err:
+            config.save_live_defaults(self._SETTINGS, source=source)
+        assert str(config.LIVE_DEFAULTS_FILE) in str(err.value)
+        assert _only(config.LIVE_DEFAULTS_FILE.parent) == [] and opened == []
+
+    @pytest.mark.parametrize("changes, words", [
+        ({"categories": ("Sports\u200b",)}, "printable"),
+        ({"tags": ("Basket\u202eball",)}, "printable"),
+        ({"categories": tuple(f"Category {i:05d}" for i in range(5000))},
+         f"over {config.LIVE_DEFAULTS_MAX_BYTES} bytes"),
+    ], ids=["zero-width category", "text-direction tag", "a filter over the size limit"])
+    def test_settings_the_reader_would_refuse_are_never_written(self, monkeypatch, changes,
+                                                                words):
+        # LiveSettings takes these values and the file's rules do not: the good
+        # file already in place must survive the attempt untouched
+        config.save_live_defaults(config.LIVE_DEFAULTS_SEED, source="")
+        before = config.LIVE_DEFAULTS_FILE.read_bytes()
+        bad = dataclasses.replace(self._SETTINGS, **changes)
+        renamed = []
+        monkeypatch.setattr(os, "replace", lambda src, dst: renamed.append(src))
+        with pytest.raises(config.LiveDefaultsError, match=re.escape(words)) as err:
+            config.save_live_defaults(bad, source="")
+        assert str(err.value).startswith(f"{config.LIVE_DEFAULTS_FILE}: not saved: ")
+        assert renamed == []
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+        assert _only(config.LIVE_DEFAULTS_FILE.parent) == ["live_defaults.json"]
+
+    def test_settings_that_would_read_back_differently_are_never_written(self, monkeypatch):
+        config.save_live_defaults(config.LIVE_DEFAULTS_SEED, source="")
+        before = config.LIVE_DEFAULTS_FILE.read_bytes()
+        real_text = config._saved_text
+        # A renderer that writes another valid per-trade cap than the one given
+        monkeypatch.setattr(config, "_saved_text", lambda record: real_text(
+            {**record, "settings": {**record["settings"], "size_cap": 0.1}}))
+        with pytest.raises(config.LiveDefaultsError, match="not saved: it would read back as"):
+            config.save_live_defaults(self._SETTINGS, source="")
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+        assert _only(config.LIVE_DEFAULTS_FILE.parent) == ["live_defaults.json"]
+
+    def test_the_data_is_flushed_before_the_rename_and_the_directory_after(self, monkeypatch):
+        # In order: the staging file's data is fsynced, it is renamed into
+        # place, and the directory is flushed with F_FULLFSYNC (a stand-in value
+        # here, so the check runs on any platform) and not with plain fsync
+        events = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync_spy(fd):
+            """
+            Record which file an fsync flushed (by inode), then flush it.
+
+            Args:
+                fd (int): The descriptor being flushed.
+            """
+            events.append(("fsync", os.fstat(fd).st_ino))
+            real_fsync(fd)
+
+        def replace_spy(src, dst):
+            """
+            Record a rename, then make it.
+
+            Args:
+                src: The file being renamed.
+                dst: The name it takes.
+            """
+            events.append(("replace",))
+            real_replace(src, dst)
+
+        def fcntl_spy(fd, cmd, *args):
+            """
+            Record which file an fcntl call named (by inode) and its command.
+
+            Args:
+                fd (int): The descriptor.
+                cmd (int): The fcntl command.
+                *args: Ignored.
+
+            Returns:
+                int: 0, as a successful fcntl returns.
+            """
+            events.append(("fcntl", os.fstat(fd).st_ino, cmd))
+            return 0
+
+        monkeypatch.setattr(os, "fsync", fsync_spy)
+        monkeypatch.setattr(os, "replace", replace_spy)
+        monkeypatch.setattr(config.fcntl, "F_FULLFSYNC", 51, raising=False)
+        monkeypatch.setattr(config.fcntl, "fcntl", fcntl_spy)
+        config.save_live_defaults(self._SETTINGS, source="")
+        path = config.LIVE_DEFAULTS_FILE
+        # A rename keeps the inode: the file fsynced is the one now in place
+        assert events == [("fsync", path.stat().st_ino), ("replace",),
+                          ("fcntl", path.parent.stat().st_ino, 51)]
+
+    def test_the_directory_is_flushed_after_the_rename(self, monkeypatch):
+        flushed = []
+
+        def spy(directory):
+            # Called once the new file is in place under its own name
+            flushed.append((directory, config.LIVE_DEFAULTS_FILE.exists()))
+
+        monkeypatch.setattr(config, "_sync_directory", spy)
+        config.save_live_defaults(self._SETTINGS, source="")
+        assert flushed == [(config.LIVE_DEFAULTS_FILE.parent, True)]
+
+    def test_sync_directory_flushes_a_real_directory(self, tmp_path):
+        # F_FULLFSYNC on macOS, fsync elsewhere: either way it returns quietly
+        config._sync_directory(tmp_path)
+
+    def test_sync_directory_falls_back_to_fsync(self, tmp_path, monkeypatch):
+        synced = []
+        real_fsync = os.fsync
+
+        def fsync_spy(fd):
+            synced.append(fd)
+            real_fsync(fd)
+
+        def refuse(fd, cmd, *args):
+            raise OSError("F_FULLFSYNC refused")
+
+        monkeypatch.setattr(os, "fsync", fsync_spy)
+        # A filesystem that refuses F_FULLFSYNC ...
+        monkeypatch.setattr(config.fcntl, "F_FULLFSYNC", 51, raising=False)
+        monkeypatch.setattr(config.fcntl, "fcntl", refuse)
+        config._sync_directory(tmp_path)
+        assert len(synced) == 1
+        # ... and a platform without it
+        monkeypatch.delattr(config.fcntl, "F_FULLFSYNC")
+        config._sync_directory(tmp_path)
+        assert len(synced) == 2
+
+    def test_the_error_is_a_value_error(self):
+        assert issubclass(config.LiveDefaultsError, ValueError)
+        assert issubclass(config.LiveDefaultsMissing, config.LiveDefaultsError)
+
+    _REFUSED = [
+        # The file as a whole
+        ("not JSON", b"not json"),
+        ("not UTF-8", b'\xff\xfe{"format": 1}'),
+        ("over the size limit", _text(_valid_record()) + b" " * config.LIVE_DEFAULTS_MAX_BYTES),
+        # Under the size limit, nested past the recursion limit
+        ("too deeply nested", b"[" * 60_000),
+        ("a JSON array", b"[]"),
+        ("a JSON string", b'"live-defaults-v1"'),
+        # The top-level keys
+        ("a missing key", _text(_valid_record(source=_DROP))),
+        ("an extra key", _text(_valid_record(note="hello"))),
+        ("a wrong format", _text(_valid_record(format="live-defaults-v2"))),
+        ("a saved_at with a space", _text(_valid_record(saved_at="2026-09-27 21:05:13Z"))),
+        ("a saved_at without zero padding", _text(_valid_record(saved_at="2026-9-27T21:05:13Z"))),
+        ("a saved_at that is a number", _text(_valid_record(saved_at=20260927))),
+        ("a source that is a number", _text(_valid_record(source=7))),
+        ("a two-line source", _text(_valid_record(source="two\nlines"))),
+        ("settings that are a list", _text(_valid_record(settings=[]))),
+        # The settings block
+        ("a missing toggle", _text(_with_toggles(tags=_DROP))),
+        ("an extra toggle", _text(_with_toggles(origin="config.py"))),
+        # Values
+        # LiveSettings alone would read these two as the band (0.0, 1.0): only the
+        # reader's own spread_band rule refuses them
+        ("a band of booleans", _text(_with_toggles(spread_band=[False, True]))),
+        ("a band with a boolean ceiling", _text(_with_toggles(spread_band=[0.0, True]))),
+        ("a band with nothing between", _text(_with_toggles(spread_band=[0.5, 0.5]))),
+        ("a band of three", _text(_with_toggles(spread_band=[0.0, 0.5, 1.0]))),
+        ("a band as a string", _text(_with_toggles(spread_band="0-0.5"))),
+        ("a NaN", _text(_with_toggles(interval_discount=float("nan")))),
+        ("an Infinity", _text(_with_toggles(size_cap=float("inf")))),
+        ("a duplicate key", _text(_valid_record()).replace(
+            b'"size_cap": 0.1,', b'"size_cap": 0.1, "size_cap": 1.0,')),
+        ("k of 0", _text(_with_toggles(interval_discount=0))),
+        ("a cap off the grid", _text(_with_toggles(size_cap=0.33))),
+        ("tier floors as 1", _text(_with_toggles(tier_floors=1))),
+        # Category and tag names
+        ("the name any", _text(_with_toggles(categories=["any"]))),
+        ("an empty name", _text(_with_toggles(tags=[""]))),
+        ("a zero-width name", _text(_with_toggles(categories=["Sports\u200b"]))),
+        ("a bare string filter", _text(_with_toggles(tags="Basketball"))),
+    ]
+
+    @pytest.mark.parametrize("label, data", _REFUSED, ids=[label for label, _ in _REFUSED])
+    def test_every_refused_file_names_the_file(self, label, data):
+        path = config.LIVE_DEFAULTS_FILE
+        path.write_bytes(data)
+        with pytest.raises(config.LiveDefaultsError) as err:
+            config.read_saved_live_defaults()
+        assert str(path) in str(err.value), label
+        assert not isinstance(err.value, config.LiveDefaultsMissing)
+
+    def test_the_refusals_name_their_cause(self):
+        # A few of the rules above, by their words
+        path = config.LIVE_DEFAULTS_FILE
+        for data, words in [
+            (_text(_valid_record()) + b" " * config.LIVE_DEFAULTS_MAX_BYTES, "over 65536 bytes"),
+            (b"[" * 60_000, "recursion"),
+            (_text(_with_toggles(interval_discount=float("nan"))), "NaN"),
+            (_text(_valid_record()).replace(b'"size_cap": 0.1,',
+                                            b'"size_cap": 0.1, "size_cap": 1.0,'), "twice"),
+            (_text(_with_toggles(categories=["Sports\u200b"])), "printable"),
+            (_text(_with_toggles(categories=["any"])), "null in live_defaults.json"),
+            (_text(_with_toggles(size_cap=0.33)), "size_cap"),
+            (_text(_with_toggles(spread_band=[False, True])),
+             '"spread_band" must be [floor, ceiling]'),
+            (_text(_with_toggles(spread_band=[0.0, True])),
+             '"spread_band" must be [floor, ceiling]'),
+        ]:
+            path.write_bytes(data)
+            with pytest.raises(config.LiveDefaultsError, match=re.escape(words)):
+                config.read_saved_live_defaults()
+
+    def test_a_directory_at_the_path_is_refused(self):
+        path = config.LIVE_DEFAULTS_FILE
+        path.mkdir()
+        with pytest.raises(config.LiveDefaultsError,
+                           match=re.escape("cannot be read (not a regular file)")) as err:
+            config.read_saved_live_defaults()
+        assert str(path) in str(err.value)
+
+    @pytest.mark.skipif(not hasattr(os, "symlink"), reason="no symbolic links on this platform")
+    def test_a_link_to_nothing_is_refused_not_read_as_missing(self):
+        # A link whose target is gone is something at the path: it must be
+        # refused, never read as "no defaults saved yet"
+        path = config.LIVE_DEFAULTS_FILE
+        target = path.with_name("moved-away.json")
+        os.symlink(target, path)
+        words = "cannot be read (a link to a file that does not exist)"
+        with pytest.raises(config.LiveDefaultsError, match=re.escape(words)) as err:
+            config.read_saved_live_defaults()
+        assert str(path) in str(err.value)
+        assert not isinstance(err.value, config.LiveDefaultsMissing)
+        with pytest.raises(config.LiveDefaultsError, match=re.escape(words)) as err:
+            config.live_defaults()
+        assert not isinstance(err.value, config.LiveDefaultsMissing)
+        # Control: the same link, once its target exists, reads as the saved defaults
+        target.write_bytes(_text(_valid_record()))
+        assert config.read_saved_live_defaults() == config.LIVE_DEFAULTS_SEED
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no named pipes on this platform")
+    def test_a_fifo_at_the_path_is_refused_without_waiting(self):
+        # Opening a FIFO for reading normally waits for a writer; the reader
+        # must refuse it at once instead of hanging a live run
+        path = config.LIVE_DEFAULTS_FILE
+        os.mkfifo(path)
+        outcome = []
+
+        def read():
+            """Read the saved defaults, keeping the refusal's message."""
+            try:
+                outcome.append(config.read_saved_live_defaults())
+            except config.LiveDefaultsError as exc:
+                outcome.append(str(exc))
+
+        worker = threading.Thread(target=read, daemon=True)
+        worker.start()
+        worker.join(10)
+        if worker.is_alive():
+            # Open the FIFO for writing so the blocked read returns, then fail
+            os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+            worker.join(10)
+            pytest.fail("reading a FIFO at the path waited for a writer")
+        assert outcome == [f"{path}: cannot be read (not a regular file)"]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads an unreadable file")
+    def test_an_unreadable_file_is_refused(self):
+        path = config.LIVE_DEFAULTS_FILE
+        path.write_bytes(_text(_valid_record()))
+        path.chmod(0o000)
+        try:
+            with pytest.raises(config.LiveDefaultsError, match="cannot be read"):
+                config.read_saved_live_defaults()
+        finally:
+            path.chmod(0o644)
+
+    def test_a_file_exactly_at_the_size_limit_is_read(self):
+        data = _text(_valid_record())
+        config.LIVE_DEFAULTS_FILE.write_bytes(
+            data + b" " * (config.LIVE_DEFAULTS_MAX_BYTES - len(data)))
+        assert config.read_saved_live_defaults() == config.LIVE_DEFAULTS_SEED
+
+    def test_a_hand_written_record_reads_as_its_toggles(self):
+        # Whole numbers and names with surrounding spaces are normalised by LiveSettings
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(
+            spread_band=[0, 1], interval_discount=1, size_cap=1,
+            categories=[" Sports "], tags=["Basketball"])))
+        saved = config.read_saved_live_defaults()
+        assert saved == LiveSettings(False, (0.0, 1.0), 1.0, 1.0, 0.2, ("Sports",),
+                                     ("Basketball",))
+        assert saved.origin == "live_defaults.json, saved 2026-09-27T21:05:13Z"
+
+
+class TestLiveDefaults:
+    """live_defaults: the saved defaults, which must exist; never config.py's."""
+
+    def test_saved_defaults_are_returned(self):
+        config.save_live_defaults(config.LIVE_DEFAULTS_SEED, source="")
+        got = config.live_defaults()
+        assert got == config.LIVE_DEFAULTS_SEED
+        assert got.origin.startswith("live_defaults.json, saved ")
+
+    def test_no_file_raises_missing_naming_the_path_and_both_ways_to_save(self):
+        with pytest.raises(config.LiveDefaultsMissing) as err:
+            config.live_defaults()
+        message = str(err.value)
+        assert str(config.LIVE_DEFAULTS_FILE) in message
+        assert "Save as live defaults…" in message
+        assert "python3 -m kalshi_betting.defaults_server --seed" in message
+        # It is also a LiveDefaultsError and a ValueError
+        assert isinstance(err.value, config.LiveDefaultsError)
+        assert isinstance(err.value, ValueError)
+
+    def test_a_refused_file_raises_the_refusal(self):
+        config.LIVE_DEFAULTS_FILE.write_bytes(b"not json")
+        with pytest.raises(config.LiveDefaultsError) as err:
+            config.live_defaults()
+        assert not isinstance(err.value, config.LiveDefaultsMissing)
+
+    def test_it_never_reads_config_py(self, monkeypatch):
+        # An invalid constant does not reach it, and a valid file is read as saved
+        monkeypatch.setattr(config, "BUDGET_FRACTION", 0.37)
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(_valid_record()))
+        assert config.live_defaults() == config.LIVE_DEFAULTS_SEED
+
+
+class TestLiveDefaultsSeed:
+    """LIVE_DEFAULTS_SEED, the starting values offered for a first save."""
+
+    def test_the_seed_values(self):
+        seed = config.LIVE_DEFAULTS_SEED
+        assert seed == LiveSettings(False, (0.0, 0.5), 0.8, 0.10, 0.20)
+        assert seed.categories is None and seed.tags is None
+        assert seed.origin == config.LIVE_DEFAULTS_FROM_CONFIG
+
+    def test_the_seed_warns_nothing(self):
+        assert config.live_rule_warnings(config.LIVE_DEFAULTS_SEED) == []
+
+    def test_one_pair_stakes_at_most_ten_percent_of_either_type(self):
+        assert max_kelly_fraction("time_series", config.LIVE_DEFAULTS_SEED) == 0.10
+        assert max_kelly_fraction("same_title", config.LIVE_DEFAULTS_SEED) == 0.10
+
+    def test_the_seed_saves_and_reads_back(self):
+        saved = config.save_live_defaults(config.LIVE_DEFAULTS_SEED,
+                                          source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert saved == config.LIVE_DEFAULTS_SEED
+        assert config.read_saved_live_defaults() == config.LIVE_DEFAULTS_SEED
+        assert saved.origin.endswith(" from " + config.LIVE_DEFAULTS_SEED_SOURCE)
+
+
+class TestLiveDefaultsSource:
+    """live_defaults_source's rules for the saved note, and the two note shapes
+    LIVE_DEFAULTS_SOURCE_PATTERN accepts."""
+
+    def test_a_note_is_stripped_and_may_be_empty(self):
+        assert config.live_defaults_source("") == ""
+        assert config.live_defaults_source("   ") == ""
+        assert config.live_defaults_source("  a note ") == "a note"
+        at_limit = "x" * config.LIVE_DEFAULTS_SOURCE_MAX_CHARS
+        assert config.live_defaults_source(f" {at_limit} ") == at_limit
+
+    @pytest.mark.parametrize("bad", [None, 7, b"note", ["note"], "two\nlines", "a\ttab",
+                                     "zero\u200bwidth", "\u202edirection",
+                                     "x" * (config.LIVE_DEFAULTS_SOURCE_MAX_CHARS + 1)])
+    def test_a_bad_note_is_refused(self, bad):
+        with pytest.raises(ValueError, match="source"):
+            config.live_defaults_source(bad)
+
+    @pytest.mark.parametrize("note", [
+        config.LIVE_DEFAULTS_SEED_SOURCE,
+        "backtest dashboard for 2025-09-24 to 2026-09-27",
+        "backtest dashboard for 2025-09-24 to 2026-09-27 (same-event ladders off, "
+        "config.py on: its pairs are not the live bot's)",
+    ])
+    def test_the_pattern_accepts_the_two_shapes(self, note):
+        assert re.fullmatch(config.LIVE_DEFAULTS_SOURCE_PATTERN, note)
+        assert config.live_defaults_source(note) == note
+
+    @pytest.mark.parametrize("note", [
+        "",
+        "evil words",
+        "backtest dashboard for 2025-09-24 to 2026-09-27; and more",
+        "backtest dashboard for 2025-09-24",
+        "backtest dashboard for 2025-09-24 to 2026-09-27 (same-event ladders maybe, "
+        "config.py on: its pairs are not the live bot's)",
+        "seed values",
+        " " + config.LIVE_DEFAULTS_SEED_SOURCE,
+    ])
+    def test_the_pattern_refuses_anything_else(self, note):
+        assert re.fullmatch(config.LIVE_DEFAULTS_SOURCE_PATTERN, note) is None
+
+
+class TestLiveSettingsChanges:
+    """live_settings_changes: the saved defaults against proposed ones, toggle
+    by toggle, in the "Live settings:" line's order and words."""
+
+    def test_labels_and_values_match_describe_live_settings(self):
+        current = _settings(categories=("Sports",), tags=("Basketball",))
+        proposed = _settings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
+        rows = config.live_settings_changes(current, proposed)
+        assert [f"{label} {new}" for label, _, new, _ in rows] == \
+            config.describe_live_settings(proposed).split(" | ")
+        assert [f"{label} {old}" for label, old, _, _ in rows] == \
+            config.describe_live_settings(current).split(" | ")
+        assert rows == [
+            ("tier floors", "on", "off", True),
+            ("spread band", "none", "0-0.5", True),
+            ("k", "0.75", "0.8", True),
+            ("per-trade cap", "20%", "100% (no cap)", True),
+            ("same-title cap", "100% (no extra cap)", "20%", True),
+            ("categories", "Sports", "any", True),
+            ("tags", "Basketball", "any", True),
+        ]
+
+    def test_changed_flags_exactly_the_fields_that_differ(self):
+        ref = _settings()
+        for name in config.LIVE_TOGGLE_FIELDS:
+            value, _ = TestDescribeLiveSettings._DEPARTURES[name]
+            rows = config.live_settings_changes(ref, dataclasses.replace(ref, **{name: value}))
+            assert [changed for *_, changed in rows] == [
+                other == name for other in config.LIVE_TOGGLE_FIELDS], name
+        # Equal toggles change nothing, whatever the origins say
+        rows = config.live_settings_changes(dataclasses.replace(ref, origin=_SAVED_ORIGIN), ref)
+        assert not any(changed for *_, changed in rows)
+        # Case is part of the raw value, as on the "Live settings:" line
+        rows = config.live_settings_changes(_settings(categories=("Sports",)),
+                                            _settings(categories=("sports",)))
+        assert rows[5] == ("categories", "Sports", "sports", True)
+
+    def test_no_current_defaults_changes_every_row(self):
+        rows = config.live_settings_changes(None, config.LIVE_DEFAULTS_SEED)
+        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 7
+        assert all(old == "—" and changed for _, old, _, changed in rows)
+        assert [new for _, _, new, _ in rows] == [
+            "off", "0-0.5", "0.8", "10%", "20%", "any", "any"]

@@ -10600,13 +10600,25 @@ def _completion_prefixes(messages: list[str]) -> list[str]:
 
 
 @pytest.fixture(scope="class")
-def golden_band_sweep():
+def golden_band_sweep(tmp_path_factory):
     """ONE full band sweep (36 bands x 13 k, ladders on) over the
     TestPrepareEntriesGolden fixture, with spies on every seam the tests
     below read, plus a band_sweep=False run of the same fixture. Class-scoped
     so the whole class pays for one sweep, not one per test. Pins
     apply_pre_toggle_defaults on its own MonkeyPatch, held through both runs
-    and the class's tests, which re-simulate at call time."""
+    and the class's tests, which re-simulate at call time. Takes pytest's
+    session temporary-directory maker (tmp_path_factory) only to check where
+    the saved live defaults file points during class setup."""
+    from kalshi_betting import config
+    # Class setup runs before any function-scoped fixture: conftest's session
+    # redirect of the saved live defaults file (a directory it made with
+    # tmp_path_factory.mktemp, directly under the session's base temporary
+    # directory) is what is in force here, never the checkout's own
+    # live_defaults.json
+    assert config.LIVE_DEFAULTS_FILE != config.PROJECT_ROOT / "live_defaults.json", \
+        config.LIVE_DEFAULTS_FILE
+    assert config.LIVE_DEFAULTS_FILE.parent.parent == tmp_path_factory.getbasetemp(), \
+        config.LIVE_DEFAULTS_FILE
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     handler = _LogCapture()

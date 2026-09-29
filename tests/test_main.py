@@ -355,9 +355,9 @@ class TestLiveSettingsFlags:
         assert reference == live_settings()
         assert getattr(settings, field) == value
         assert getattr(settings, field) != getattr(reference, field)
-        for other in dataclasses.fields(LiveSettings):
-            if other.name != field:
-                assert getattr(settings, other.name) == getattr(reference, other.name), other.name
+        for other in config.LIVE_TOGGLE_FIELDS:
+            if other != field:
+                assert getattr(settings, other) == getattr(reference, other), other
 
     def test_no_flag_hands_the_run_config_py_itself(self, monkeypatch):
         # The scheduler's exact argv (tests/test_scheduler.py pins it)
@@ -548,7 +548,8 @@ class TestLogLiveSettings:
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING
                     and r.getMessage().startswith("Live settings:")]
 
-    # One departing flag per LiveSettings field, with the mark its line must carry
+    # One departing flag per live toggle (config.LIVE_TOGGLE_FIELDS), with the
+    # mark its line must carry
     _ONE_FLAG_PER_FIELD = {
         "tier_floors": (["--no-tier-floors"], "tier floors off (config: on)"),
         "spread_band": (["--spread-max", "0.5"], "spread band 0-0.5 (config: none)"),
@@ -561,8 +562,8 @@ class TestLogLiveSettings:
     }
 
     def test_every_field_has_a_departing_flag(self):
-        # A new LiveSettings field needs a row, so its departure WARNING is tested
-        assert set(self._ONE_FLAG_PER_FIELD) == {f.name for f in dataclasses.fields(LiveSettings)}
+        # A new toggle needs a row, so its departure WARNING is tested
+        assert set(self._ONE_FLAG_PER_FIELD) == set(config.LIVE_TOGGLE_FIELDS)
 
     @pytest.mark.parametrize("field", sorted(_ONE_FLAG_PER_FIELD))
     def test_a_departing_production_run_warns(self, monkeypatch, caplog, field):
@@ -2270,7 +2271,7 @@ class TestRunProdLiveV2Replay:
 class TestLiveSettingsReachEverySite:
     """The runtime tripwire behind test_strategy.py's
     test_ast_live_path_reads_toggles_only_through_live_settings: a prod dry run and a
-    dev run handed _SETTINGS (every field departing from the pinned config) and an
+    dev run handed _SETTINGS (every toggle departing from the pinned config) and an
     explicit reference while live_settings raises in config, scanner, strategy, trader
     and main, so a site reading config.py or the reference raises or hands a spy the
     wrong value. _SETTINGS keeps both pairs trading, the time-series f* between the
@@ -2308,10 +2309,10 @@ class TestLiveSettingsReachEverySite:
                 "run_note".
         """
         settings = self._SETTINGS
-        # config.py's toggles, read before the tripwire; every field must differ
+        # config.py's toggles, read before the tripwire; every toggle must differ
         reference = live_settings()
-        for field in dataclasses.fields(LiveSettings):
-            assert getattr(settings, field.name) != getattr(reference, field.name), field.name
+        for name in config.LIVE_TOGGLE_FIELDS:
+            assert getattr(settings, name) != getattr(reference, name), name
 
         client = _live_shape_client(
             monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True,

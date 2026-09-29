@@ -4,26 +4,34 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Suite-wide pytest fixtures and one helper. Four autouse guards: one points
+    Suite-wide pytest fixtures and two helpers. Six autouse guards: one points
     the event-title accumulator and Kalshi's cached /series listing at a
     per-test tmp_path, so no test can touch the operator's real event-title
     accumulators or series_categories.json; one keeps every test off the
     Treasury API and the real rates cache; one gives every test a full,
     fresh order-write pacer, so no test waits on writes an earlier test made;
-    and one clears trader's disproven-mapping latch and its record of
-    unchecked NO legs, so a test that disproves the V2 NO-leg mapping cannot
-    stop every later test's trades.
-    pre_toggle_defaults pins the live toggles for a test whose figures assume
-    fixed values (they pin arithmetic, not config.py's policy); its helper,
-    apply_pre_toggle_defaults, also serves class-scoped fixtures.
+    one clears trader's disproven-mapping latch and its record of unchecked
+    NO legs, so a test that disproves the V2 NO-leg mapping cannot stop every
+    later test's trades; and two point the saved live defaults file
+    (config.LIVE_DEFAULTS_FILE) away from the repo's live_defaults.json — at
+    an empty session directory for the whole run, so class-scoped fixtures
+    never see the real file, and at each test's own tmp_path, so a test that
+    saves defaults never leaks them into the next. pre_toggle_defaults pins
+    the live toggles for a test whose figures assume fixed values (they pin
+    arithmetic, not config.py's policy); its helper, apply_pre_toggle_defaults,
+    also serves class-scoped fixtures. save_config_live_defaults (and the
+    saved_live_defaults fixture that calls it) saves config.py's toggles as
+    the live defaults, for a test that needs a saved file.
 
 Dependencies:
     Imports kalshi_betting.historical (the three cache paths),
     kalshi_betting.treasury (its _RATES_CACHE path and _get_json),
     kalshi_betting.trader (its _WritePacer, _ORDER_WRITE_PACER,
-    _V2_NO_MAPPING_DISPROVEN and _V2_UNCHECKED_NO_LEGS), config, and
-    backtester and backtest (the by-value copies they bind). Imported by
-    pytest, and by test modules for apply_pre_toggle_defaults.
+    _V2_NO_MAPPING_DISPROVEN and _V2_UNCHECKED_NO_LEGS), config (the toggle
+    constants, the order-write rate and burst, LIVE_DEFAULTS_FILE,
+    live_settings and save_live_defaults), and backtester and backtest (the
+    by-value copies they bind). Imported by pytest, and by test modules for
+    apply_pre_toggle_defaults.
 
 Notes:
     Before DR-51 four tests in test_historical.py (TestFetchAllSettledMarkets'
@@ -164,3 +172,75 @@ def _fresh_v2_mapping_disproof_state(monkeypatch):
     """
     monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", False)
     monkeypatch.setattr(trader, "_V2_UNCHECKED_NO_LEGS", [])
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_live_defaults_for_the_session(tmp_path_factory):
+    """
+    Point the saved live defaults file at an empty session directory.
+
+    In place before class-scoped fixtures run: those set up before any
+    function-scoped fixture is active (the backtester's sweep fixtures run
+    whole backtests there), so the per-test redirect below cannot cover them.
+    A class fixture that needs saved defaults points the file at a directory
+    of its own, never this one. That redirect is in force during class setup
+    only: each test body sees its own tmp_path (the per-test redirect below),
+    so a test that reads the saved defaults itself saves them there (the
+    saved_live_defaults fixture).
+
+    Args:
+        tmp_path_factory (pytest.TempPathFactory): pytest's session-wide
+            temporary-directory maker.
+
+    Yields:
+        None: The redirect holds until the session ends.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(config, "LIVE_DEFAULTS_FILE",
+               tmp_path_factory.mktemp("live-defaults") / "live_defaults.json")
+    yield
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_live_defaults(tmp_path, monkeypatch):
+    """
+    Give each test its own saved live defaults path, under its tmp_path.
+
+    So a test that saves defaults never leaks them into the next one, and a
+    test with nothing saved reads "none saved".
+
+    Args:
+        tmp_path (Path): pytest's per-test temporary directory.
+        monkeypatch (pytest.MonkeyPatch): Restores the session path afterwards.
+    """
+    monkeypatch.setattr(config, "LIVE_DEFAULTS_FILE", tmp_path / "live_defaults.json")
+
+
+def save_config_live_defaults() -> None:
+    """
+    Save config.py's toggles, as live_settings() reads them now, as the live defaults.
+
+    Saves exactly the values config.py's constants give (after any patch a
+    test made), for a test that needs a saved file. Writes wherever
+    config.LIVE_DEFAULTS_FILE points (a test's tmp_path under
+    _isolate_live_defaults).
+
+    Raises:
+        LiveDefaultsError: If the save fails (config.save_live_defaults).
+    """
+    config.save_live_defaults(config.live_settings(), source="")
+
+
+@pytest.fixture
+def saved_live_defaults(_isolate_live_defaults):
+    """
+    Run save_config_live_defaults() for one test, into that test's own path.
+
+    Requests _isolate_live_defaults by name so the file is written only after
+    the path points at the test's tmp_path.
+
+    Args:
+        _isolate_live_defaults (None): The per-test redirect, set up first.
+    """
+    save_config_live_defaults()

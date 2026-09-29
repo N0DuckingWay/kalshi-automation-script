@@ -23,11 +23,18 @@ Notes:
     machine regardless of where the repo is cloned.
     The sandbox URL (demo-api.kalshi.co) requires a completely separate account
     registered at demo.kalshi.co — the production API key will return 401 there.
+    The saved live defaults (LIVE_DEFAULTS_FILE, live_defaults.json in the repo
+    root) are read and written here too: read_saved_live_defaults and
+    live_defaults read the file, and save_live_defaults writes it.
 """
+import fcntl
+import json
 import math
 import numbers
+import os
 import pathlib
-from dataclasses import dataclass
+import stat
+from dataclasses import dataclass, field, fields
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO
@@ -492,6 +499,44 @@ SIZE_CAP_STEP = 0.05
 # it. It bounds no trade and is not the per-trade cap: it only decides when a
 # live run is warned.
 LIVE_EXPOSURE_WARN_FRACTION = 0.20
+
+# ── Saved live defaults ───────────────────────────────────────────────────────
+
+# The saved live defaults: one JSON record of the seven live toggles, which
+# save_live_defaults writes and read_saved_live_defaults / live_defaults read
+# (LIVE_DEFAULTS_SEED holds the starting values for a first save). Read
+# at call time through this module's global, so tests can point it elsewhere
+# (tests/conftest.py). Operator state, like scheduler_state.json: gitignored,
+# in the checkout the scheduler runs from.
+LIVE_DEFAULTS_FILE = PROJECT_ROOT / "live_defaults.json"
+
+# The format tag the saved file carries; a file with any other is refused.
+LIVE_DEFAULTS_FORMAT = "live-defaults-v1"
+
+# The largest saved file read; its record is well under 1 KB.
+LIVE_DEFAULTS_MAX_BYTES = 65_536
+
+# LiveSettings.origin for toggles built from this module's constants.
+LIVE_DEFAULTS_FROM_CONFIG = "config.py"
+
+# The longest note the saved file may keep about what it was saved from.
+LIVE_DEFAULTS_SOURCE_MAX_CHARS = 300
+
+# The source note written when the defaults are saved from LIVE_DEFAULTS_SEED.
+LIVE_DEFAULTS_SEED_SOURCE = "seed values (config.LIVE_DEFAULTS_SEED)"
+
+# The two shapes of source note a confirmation page proposes: the backtest
+# dashboard's own wording (with an optional note when that run's same-event
+# ladder switch differed from config.py's), or the seed's. It is meant for
+# re.fullmatch: re.match or re.search would also accept a valid note followed
+# by any other words. Nothing in this module checks a note against it:
+# save_live_defaults and read_saved_live_defaults accept any note
+# live_defaults_source allows, an empty one included.
+LIVE_DEFAULTS_SOURCE_PATTERN = (
+    r"backtest dashboard for \d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}"
+    r"( \(same-event ladders (on|off), config\.py (on|off): its pairs are not "
+    r"the live bot's\))?"
+    r"|seed values \(config\.LIVE_DEFAULTS_SEED\)")
 
 # Which side each leg of a pair buys, as (side bought on market_a, side bought
 # on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
@@ -1964,7 +2009,8 @@ def _names(value, name: str) -> tuple[str, ...] | None:
     trade-log note).
 
     Args:
-        value: The filter (TRADE_CATEGORIES / TRADE_TAGS, main.py --category / --tag).
+        value: The filter (TRADE_CATEGORIES / TRADE_TAGS, main.py --category / --tag,
+            or the saved live defaults file's "categories" / "tags").
         name (str): The field's name, for the error message.
 
     Returns:
@@ -1987,7 +2033,8 @@ def _names(value, name: str) -> tuple[str, ...] | None:
         if item.strip().casefold() == "any":
             raise ValueError(
                 f"{name} cannot hold the name {item!r} (in {value!r}): any category or "
-                "tag is None in config.py, or --any-category / --any-tag on main.py")
+                "tag is None in config.py, or --any-category / --any-tag on main.py, "
+                f"or null in {LIVE_DEFAULTS_FILE.name}")
         names.append(item.strip())
     return tuple(names)
 
@@ -2019,6 +2066,11 @@ class LiveSettings:
             grid; default 1.0 (no extra cap).
         categories (tuple[str, ...] | None): Categories to trade; None (default) for any.
         tags (tuple[str, ...] | None): Series first tags, ANDed with categories; None for any.
+        origin (str): Where these toggles' defaults were read: the saved defaults
+            file with when (and from what) it was saved, or LIVE_DEFAULTS_FROM_CONFIG
+            for toggles built from this module's constants (the default).
+            Not compared: equal toggles are equal wherever they came from, and
+            main.py's flags laid over the defaults keep it.
 
     Raises:
         ValueError: If any field is out of range or of the wrong type.
@@ -2030,6 +2082,7 @@ class LiveSettings:
     same_title_size_cap: float = 1.0
     categories: tuple[str, ...] | None = None
     tags: tuple[str, ...] | None = None
+    origin: str = field(default=LIVE_DEFAULTS_FROM_CONFIG, compare=False)
 
     def __post_init__(self) -> None:
         """
@@ -2062,6 +2115,44 @@ class LiveSettings:
                            _step_cap(self.same_title_size_cap, "same_title_size_cap"))
         object.__setattr__(self, "categories", _names(self.categories, "categories"))
         object.__setattr__(self, "tags", _names(self.tags, "tags"))
+        # One printable line: no newline, control, zero-width or text-direction
+        # character, so it prints on one log line and cannot pass for other
+        # text. Printable is not HTML-safe: a web page must still escape it
+        if not isinstance(self.origin, str) or not self.origin.strip() \
+                or not self.origin.isprintable():
+            raise ValueError(f"origin must be a printable description, got {self.origin!r}")
+
+
+# The seven toggles by field name: every LiveSettings field except origin
+LIVE_TOGGLE_FIELDS = tuple(f.name for f in fields(LiveSettings) if f.compare)
+
+# The seed live defaults, the starting values for a first save: tier
+# floors off, spread band 0-0.5, k 0.80, a 10% per-trade cap, any category or
+# tag. One pair stakes at most 10% of the balance: a time-series pair under the
+# cap (1 - k is 0.20), a same-title pair under the lower of the cap and the 20%
+# same-title cap. Nothing reads it as the live defaults until it is saved to
+# LIVE_DEFAULTS_FILE (save_live_defaults, with LIVE_DEFAULTS_SEED_SOURCE).
+LIVE_DEFAULTS_SEED = LiveSettings(
+    tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.80,
+    size_cap=0.10, same_title_size_cap=0.20, categories=None, tags=None)
+
+
+class LiveDefaultsError(ValueError):
+    """
+    The saved live defaults cannot be used, or could not be saved.
+
+    Reading: something exists at the path but is not a regular file (a link
+    to a file that does not exist included), is unreadable, too large, not
+    UTF-8, malformed or too deeply nested, or holds a value LiveSettings
+    refuses. Saving: the source note is refused, the settings would make a
+    file the reader refuses, the write fails, or the file does not read back
+    as what was written. The message names the file. It is a ValueError, so a
+    caller handling an invalid constant also stops on it.
+    """
+
+
+class LiveDefaultsMissing(LiveDefaultsError):
+    """No live defaults are saved (LIVE_DEFAULTS_FILE does not exist)."""
 
 
 def live_settings() -> LiveSettings:
@@ -2088,6 +2179,397 @@ def live_settings() -> LiveSettings:
         categories=TRADE_CATEGORIES,
         tags=TRADE_TAGS,
     )
+
+
+# The saved file's top-level keys, in the order save_live_defaults writes them
+_SAVED_KEYS = ("format", "saved_at", "source", "settings")
+# How the file stamps when it was saved: UTC, to the second
+_SAVED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def live_defaults_source(source) -> str:
+    """
+    Check the note the saved live defaults keep about what they were saved from.
+
+    The note becomes part of LiveSettings.origin, so it must be short and one
+    printable line (no newline, tab, zero-width or text-direction character):
+    it then prints on one log line and cannot pass for other text. Printable
+    is not HTML-safe, so a web page that shows it must still escape it.
+
+    Args:
+        source: The note; must be a str.
+
+    Returns:
+        str: The note with surrounding spaces removed; "" (no note) is allowed.
+
+    Raises:
+        ValueError: If it is not a str, is not printable, or is longer than
+            LIVE_DEFAULTS_SOURCE_MAX_CHARS once stripped.
+    """
+    if not isinstance(source, str):
+        raise ValueError(f'"source" must be a string, got {source!r}')
+    if not source.isprintable():
+        raise ValueError(f'"source" must be one printable line, got {source!r}')
+    stripped = source.strip()
+    if len(stripped) > LIVE_DEFAULTS_SOURCE_MAX_CHARS:
+        raise ValueError(f'"source" must be at most {LIVE_DEFAULTS_SOURCE_MAX_CHARS} '
+                         f"characters, got {len(stripped)}")
+    return stripped
+
+
+def _unique_keys(pairs: list) -> dict:
+    """
+    Build a JSON object for json.loads, refusing a key given twice.
+
+    json.loads' default keeps the last of two equal keys without a word; the
+    saved defaults must say one thing only.
+
+    Args:
+        pairs (list): The object's (key, value) pairs, in file order.
+
+    Returns:
+        dict: The object.
+
+    Raises:
+        ValueError: If a key appears more than once.
+    """
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"the key {key!r} is given twice")
+        out[key] = value
+    return out
+
+
+def _no_constant(name: str):
+    """
+    Refuse NaN, Infinity and -Infinity, which json.loads would otherwise read as floats.
+
+    Args:
+        name (str): The constant's spelling in the file.
+
+    Raises:
+        ValueError: Always.
+    """
+    raise ValueError(f"{name} is not a number the saved live defaults may hold")
+
+
+def _filter_names(value, name: str) -> None:
+    """
+    Refuse a category or tag name that is not printable, before LiveSettings strips it.
+
+    A zero-width or text-direction character would make two different
+    filters look alike on every line that prints them. None and anything that
+    is not a list pass through for LiveSettings to judge.
+
+    Args:
+        value: The filter as the file holds it (null or a list of names).
+        name (str): The field's name ("categories" or "tags"), for the message.
+
+    Raises:
+        ValueError: If a name in the list is a str that is not printable.
+    """
+    if not isinstance(value, list):
+        return
+    for item in value:
+        if isinstance(item, str) and not item.isprintable():
+            raise ValueError(f'"{name}" must hold printable names, got {item!r}')
+
+
+def _saved_settings(record) -> LiveSettings:
+    """
+    Turn a parsed saved-defaults record into LiveSettings, or refuse it.
+
+    Checks what LiveSettings cannot see in JSON: the file's keys and format, the
+    save time, the source note, exactly the seven toggle names, a spread band of
+    two real numbers (LiveSettings would read a JSON true as 1) and printable
+    filter names. LiveSettings then validates every value.
+
+    Args:
+        record: What json.loads returned for the file.
+
+    Returns:
+        LiveSettings: The toggles, their origin naming the file, when it was
+            saved and (when there is one) the source note.
+
+    Raises:
+        ValueError: Naming the first rule the record breaks.
+    """
+    if not isinstance(record, dict) or set(record) != set(_SAVED_KEYS):
+        raise ValueError(f"must be one JSON object with exactly the keys {', '.join(_SAVED_KEYS)}")
+    if record["format"] != LIVE_DEFAULTS_FORMAT:
+        raise ValueError(f'"format" must be {LIVE_DEFAULTS_FORMAT!r}, got {record["format"]!r}')
+    saved_at = record["saved_at"]
+    try:
+        # Written back in the same format, it must be the same text: strptime
+        # alone would take "2026-9-7T1:2:3Z"
+        exact = datetime.strptime(saved_at, _SAVED_AT_FORMAT).strftime(_SAVED_AT_FORMAT) == saved_at
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'"saved_at" must be a UTC time like 2026-09-27T21:05:13Z, '
+                         f"got {saved_at!r}") from exc
+    if not exact:
+        raise ValueError(f'"saved_at" must be a UTC time like 2026-09-27T21:05:13Z, '
+                         f"got {saved_at!r}")
+    source = live_defaults_source(record["source"])
+    raw = record["settings"]
+    if not isinstance(raw, dict) or set(raw) != set(LIVE_TOGGLE_FIELDS):
+        raise ValueError(f'"settings" must hold exactly {", ".join(LIVE_TOGGLE_FIELDS)}')
+    band = raw["spread_band"]
+    if not (isinstance(band, list) and len(band) == 2 and all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) for x in band)):
+        raise ValueError(f'"spread_band" must be [floor, ceiling], got {band!r}')
+    for name in ("categories", "tags"):
+        _filter_names(raw[name], name)
+    origin = f"{LIVE_DEFAULTS_FILE.name}, saved {saved_at}" + (f" from {source}" if source else "")
+    return LiveSettings(**{**raw, "spread_band": tuple(band)}, origin=origin)
+
+
+def _settings_from_bytes(data: bytes) -> LiveSettings:
+    """
+    Parse a saved live defaults file's bytes into LiveSettings, or refuse them.
+
+    The one parse read_saved_live_defaults applies to the file on disk and
+    save_live_defaults applies to the text it is about to write, so a save
+    can never put in place a file the reader refuses.
+
+    Args:
+        data (bytes): The file's bytes.
+
+    Returns:
+        LiveSettings: The toggles, their origin naming the file, when it was
+            saved and (when there is one) the source note.
+
+    Raises:
+        ValueError: The bytes are over LIVE_DEFAULTS_MAX_BYTES, are not UTF-8
+            or not JSON (UnicodeDecodeError and JSONDecodeError are
+            ValueErrors), hold a repeated key or NaN / Infinity, or break a
+            rule of _saved_settings or LiveSettings.
+        TypeError: A value's type trips a check that raises TypeError rather
+            than ValueError; both callers treat it as a refusal.
+        RecursionError: The document is nested too deeply to parse.
+    """
+    if len(data) > LIVE_DEFAULTS_MAX_BYTES:
+        raise ValueError(f"over {LIVE_DEFAULTS_MAX_BYTES} bytes")
+    record = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_keys,
+                        parse_constant=_no_constant)
+    return _saved_settings(record)
+
+
+def read_saved_live_defaults() -> LiveSettings | None:
+    """
+    Read the saved live defaults (LIVE_DEFAULTS_FILE), or None when none are saved.
+
+    Strict, because a live run trades what it returns. The file is one JSON
+    object with these keys:
+    - "format": LIVE_DEFAULTS_FORMAT;
+    - "saved_at": UTC, e.g. 2026-09-27T21:05:13Z;
+    - "source": a note (live_defaults_source's rules);
+    - "settings": the seven toggles by LiveSettings field name. tier_floors is
+      true/false, spread_band is [floor, ceiling], interval_discount, size_cap
+      and same_title_size_cap are numbers (the caps as fractions), and
+      categories and tags are null (any) or a list of names.
+
+    Refused on top of that: a repeated key, NaN or Infinity, a file over
+    LIVE_DEFAULTS_MAX_BYTES, any value LiveSettings rejects, and anything at
+    the path that is not a regular file (a directory or a FIFO, say, which is
+    refused without waiting on it, or a link to a file that does not exist).
+    A link to a regular file is read through.
+
+    Returns:
+        LiveSettings | None: The toggles, their origin naming the file and when
+            they were saved; None when nothing is at the path.
+
+    Raises:
+        LiveDefaultsError: Something exists at the path but breaks a rule
+            above; the message names the file.
+    """
+    path = LIVE_DEFAULTS_FILE
+    try:
+        # O_NONBLOCK: a FIFO (named pipe) at the path opens at once instead of
+        # waiting for a writer, and is refused below; a regular file reads as usual
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError as exc:
+        # A link whose target does not exist is something at the path, so it
+        # is refused rather than read as "no defaults saved yet"
+        if os.path.islink(path):
+            raise LiveDefaultsError(
+                f"{path}: cannot be read (a link to a file that does not exist)") from exc
+        return None
+    except OSError as exc:
+        raise LiveDefaultsError(f"{path}: cannot be read ({exc})") from exc
+    try:
+        # A directory, FIFO or device at the path is not a saved file
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise LiveDefaultsError(f"{path}: cannot be read (not a regular file)")
+        with os.fdopen(fd, "rb") as handle:
+            # The file object now owns the descriptor and closes it
+            fd = None
+            data = handle.read(LIVE_DEFAULTS_MAX_BYTES + 1)
+    except OSError as exc:
+        raise LiveDefaultsError(f"{path}: cannot be read ({exc})") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+    try:
+        return _settings_from_bytes(data)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise LiveDefaultsError(f"{path}: {exc}") from exc
+
+
+def live_defaults() -> LiveSettings:
+    """
+    Return the saved live defaults, which must exist.
+
+    It never falls back to this module's toggle constants: with no file saved
+    it raises, naming the two ways to save one.
+
+    Returns:
+        LiveSettings: The saved defaults (read_saved_live_defaults).
+
+    Raises:
+        LiveDefaultsMissing: No file is saved; the message names the file and
+            the two ways to create it.
+        LiveDefaultsError: The file is refused.
+    """
+    saved = read_saved_live_defaults()
+    if saved is None:
+        raise LiveDefaultsMissing(
+            f"no live defaults are saved at {LIVE_DEFAULTS_FILE}: save them from the backtest "
+            "dashboard's \"Save as live defaults…\" button, or start from the seed values "
+            "with python3 -m kalshi_betting.defaults_server --seed (live runs never fall "
+            "back to config.py's toggles)")
+    return saved
+
+
+def _sync_directory(directory: Path) -> None:
+    """
+    Flush a directory's entries (a rename just made in it) to disk.
+
+    Uses F_FULLFSYNC where the platform has it (macOS, whose plain fsync does
+    not flush the drive's own cache), and plain fsync otherwise or when the
+    filesystem refuses F_FULLFSYNC.
+
+    Args:
+        directory (Path): The directory to flush.
+
+    Raises:
+        OSError: If the directory cannot be opened or flushed.
+    """
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        full_sync = getattr(fcntl, "F_FULLFSYNC", None)
+        if full_sync is not None:
+            try:
+                fcntl.fcntl(fd, full_sync)
+                return
+            except OSError:
+                # Some filesystems (network or FAT volumes) refuse it: fall
+                # back to fsync below
+                pass
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _saved_text(record: dict) -> str:
+    """
+    Render a saved-defaults record as the file's text.
+
+    Valid JSON, laid out for a person to read: one key per line, and each
+    toggle's value (the spread band and any names too) on its own key's line.
+
+    Args:
+        record (dict): The record, with _SAVED_KEYS in that order and
+            "settings" holding the seven toggles as JSON values.
+
+    Returns:
+        str: The text, ending in a newline.
+
+    Raises:
+        ValueError: If a value is NaN or infinite (never true of a LiveSettings').
+    """
+    # json.dumps prints each value (a list included) on one line
+    toggles = ",\n".join(f"    {json.dumps(name)}: {json.dumps(v, allow_nan=False)}"
+                         for name, v in record["settings"].items())
+    top = [f"  {json.dumps(key)}: {json.dumps(record[key], allow_nan=False)}"
+           for key in _SAVED_KEYS if key != "settings"]
+    top.append(f'  "settings": {{\n{toggles}\n  }}')
+    return "{\n" + ",\n".join(top) + "\n}\n"
+
+
+def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
+    """
+    Write settings as the saved live defaults, and return them as read back.
+
+    The record's text is first parsed exactly as read_saved_live_defaults
+    will parse it, and must equal settings, so a file the reader would refuse
+    is never written. It is then written next to the file under a name holding
+    this process id, flushed, and renamed over the file, so a reader at the
+    same moment sees the old file or the new one, never part of one. The
+    directory is flushed too, so the rename survives a power cut. The file is
+    then read back from disk and must equal settings (the seven toggles;
+    origin is not compared).
+
+    Args:
+        settings (LiveSettings): The new defaults.
+        source (str): What they were saved from (live_defaults_source's rules).
+
+    Returns:
+        LiveSettings: The saved defaults as read back (origin names the file).
+
+    Raises:
+        LiveDefaultsError: source is refused, or settings would make a file
+            read_saved_live_defaults refuses or reads differently (nothing is
+            written in either case); the write fails; or the file on disk does
+            not read back as settings.
+    """
+    path = LIVE_DEFAULTS_FILE
+    try:
+        source = live_defaults_source(source)
+    except ValueError as exc:
+        raise LiveDefaultsError(f"{path}: not saved: {exc}") from exc
+    values = {name: getattr(settings, name) for name in LIVE_TOGGLE_FIELDS}
+    record = {
+        "format": LIVE_DEFAULTS_FORMAT,
+        "saved_at": datetime.now(UTC).strftime(_SAVED_AT_FORMAT),
+        "source": source,
+        # JSON has no tuples: the band and any names as lists
+        "settings": {k: list(v) if isinstance(v, tuple) else v for k, v in values.items()},
+    }
+    # Parse the text exactly as the reader will before anything is written:
+    # LiveSettings takes some values the file's rules refuse (a name that is
+    # not printable, a filter too long for LIVE_DEFAULTS_MAX_BYTES), and such a
+    # file must never replace the one in place
+    try:
+        text = _saved_text(record)
+        staged = _settings_from_bytes(text.encode("utf-8"))
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise LiveDefaultsError(f"{path}: not saved: {exc}") from exc
+    if staged != settings:
+        raise LiveDefaultsError(
+            f"{path}: not saved: it would read back as {staged!r}, not the settings given")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    replaced = False
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        replaced = True
+        _sync_directory(path.parent)
+    except OSError as exc:
+        if replaced:
+            raise LiveDefaultsError(
+                f"{path}: written, but its directory could not be flushed to disk ({exc}), "
+                "so a power cut could still undo the save") from exc
+        raise LiveDefaultsError(f"{path}: could not be written ({exc})") from exc
+    finally:
+        tmp.unlink(missing_ok=True)
+    saved = read_saved_live_defaults()
+    if saved != settings:
+        raise LiveDefaultsError(f"{path}: read back as {saved!r}, not the settings written")
+    return saved
 
 
 def live_time_series_floor(gap_days: int, settings: LiveSettings) -> float:
@@ -2308,6 +2790,21 @@ def _names_text(names: tuple[str, ...] | None) -> str:
     return ", ".join(names)
 
 
+# Every live toggle as the "Live settings:" line (describe_live_settings) and
+# the comparison of two sets of defaults (live_settings_changes) name it:
+# (label, field, renderer), each exact where a short form would print two
+# values alike.
+_LIVE_SETTING_FIELDS = (
+    ("tier floors", "tier_floors", lambda v: "on" if v else "off"),
+    ("spread band", "spread_band", _band_text),
+    ("k", "interval_discount", repr),
+    ("per-trade cap", "size_cap", lambda v: _cap_text(v, "no cap")),
+    ("same-title cap", "same_title_size_cap", lambda v: _cap_text(v, "no extra cap")),
+    ("categories", "categories", _names_text),
+    ("tags", "tags", _names_text),
+)
+
+
 def describe_trade_filter(settings: LiveSettings) -> str:
     """
     Name a run's category/tag filter, as describe_live_settings renders it.
@@ -2329,7 +2826,7 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
     Name every live toggle on one line, marking each that departs from reference.
 
     main._log_live_settings logs it on every live run and main._run_prod hands
-    it to the prod trade log's separator row, both against config.py's
+    it to the prod trade log's separator row, both against the run's reference
     toggles. A field departs when its RAW value differs, and every renderer is
     exact where a short form would print two values alike. The same-title cap
     reads "100% (no extra cap)" at 1.0: the per-trade cap still applies.
@@ -2342,25 +2839,51 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
     Returns:
         str: e.g. "tier floors off | spread band 0-0.5 | k 0.8 | per-trade cap
             100% (no cap) | same-title cap 20% | categories any | tags any",
-            with " (config: X)" after each field that differs from reference's.
+            with " (default: X)" after each field that differs from reference's
+            when reference is the saved live defaults (its origin is anything
+            but LIVE_DEFAULTS_FROM_CONFIG), " (config: X)" when it was built
+            from config.py's constants.
     """
-    fields = (
-        ("tier floors", "tier_floors", lambda v: "on" if v else "off"),
-        ("spread band", "spread_band", _band_text),
-        ("k", "interval_discount", repr),
-        ("per-trade cap", "size_cap", lambda v: _cap_text(v, "no cap")),
-        ("same-title cap", "same_title_size_cap", lambda v: _cap_text(v, "no extra cap")),
-        ("categories", "categories", _names_text),
-        ("tags", "tags", _names_text),
-    )
+    # The mark names what the reference is: the saved defaults, or config.py
+    mark = ("config" if reference is None or reference.origin == LIVE_DEFAULTS_FROM_CONFIG
+            else "default")
     parts = []
-    for label, name, render in fields:
+    for label, name, render in _LIVE_SETTING_FIELDS:
         value = getattr(settings, name)
         text = f"{label} {render(value)}"
         if reference is not None and getattr(reference, name) != value:
-            text += f" (config: {render(getattr(reference, name))})"
+            text += f" ({mark}: {render(getattr(reference, name))})"
         parts.append(text)
     return " | ".join(parts)
+
+
+def live_settings_changes(current: LiveSettings | None,
+                          proposed: LiveSettings) -> list[tuple[str, str, str, bool]]:
+    """
+    Compare the live defaults in force with proposed ones, toggle by toggle.
+
+    For a page that asks before new defaults are saved: in the "Live settings:"
+    line's order and words (_LIVE_SETTING_FIELDS), and, like that line's marks,
+    a toggle changes when its RAW value differs.
+
+    Args:
+        current (LiveSettings | None): The saved defaults, or None when none are saved.
+        proposed (LiveSettings): What a save would write.
+
+    Returns:
+        list[tuple[str, str, str, bool]]: (label, current value, proposed value,
+            changed), one per toggle. With no current defaults, every current
+            value is "—" and every row is changed.
+    """
+    rows = []
+    for label, name, render in _LIVE_SETTING_FIELDS:
+        new = getattr(proposed, name)
+        if current is None:
+            rows.append((label, "—", render(new), True))
+        else:
+            old = getattr(current, name)
+            rows.append((label, render(old), render(new), old != new))
+    return rows
 
 
 def live_rule_warnings(settings: LiveSettings) -> list[str]:

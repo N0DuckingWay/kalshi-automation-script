@@ -29,6 +29,11 @@ backtest_cache/
 dashboard.html
 backtest_dashboard*.html
 
+# Saved live trading defaults (operator state, written by
+# config.save_live_defaults) and the file its atomic save stages beside it
+live_defaults.json
+.live_defaults.json.*.tmp
+
 # Python
 __pycache__/
 *.py[cod]
