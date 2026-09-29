@@ -626,7 +626,10 @@ class TestCheckLiveDefaults:
         with caplog.at_level(logging.INFO):
             scheduler._check_live_defaults()
         (error,) = self._errors(caplog)
-        assert error.startswith("No live defaults are saved: every scheduled run will exit 2")
+        # It names the checkout the spawned runs read the file in
+        assert error.startswith(f"No live defaults are saved in {scheduler.PROJECT_ROOT} "
+                                "(the checkout this daemon runs): every scheduled run will "
+                                "exit 2")
         assert "python3 -m kalshi_betting.defaults_server --seed" in error
         assert "Save as live defaults…" in error
 
@@ -637,8 +640,9 @@ class TestCheckLiveDefaults:
         (error,) = self._errors(caplog)
         assert error.startswith("The saved live defaults are refused (")
         assert str(config.LIVE_DEFAULTS_FILE) in error
-        assert error.endswith("every scheduled run will exit 2 until the file is fixed "
-                              "or saved again")
+        # The server will not save over a refused file: fix it, or delete it first
+        assert error.endswith("every scheduled run will exit 2 until the file is fixed, "
+                              "or deleted and saved again")
 
     @pytest.mark.usefixtures("saved_live_defaults")
     def test_a_usable_file_logs_nothing(self, caplog):

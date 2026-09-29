@@ -780,8 +780,11 @@ def _check_live_defaults() -> None:
 
     A live run exits 2 when no live defaults are saved or the saved file is
     refused. The daemon says so as soon as it starts, naming the fix, rather
-    than only after the next Monday run has spent its slot. Nothing is logged
-    when a usable file is saved.
+    than only after the next Monday run has spent its slot: for a missing
+    file, the checkout (PROJECT_ROOT) the defaults must be saved in, since the
+    runs it spawns read the file there; for a refused one, that it must be
+    fixed, or deleted before new defaults are saved (the defaults server will
+    not save over it). Nothing is logged when a usable file is saved.
 
     Returns:
         None
@@ -795,13 +798,19 @@ def _check_live_defaults() -> None:
         # them again, itself, on every run it spawns
         saved = read_saved_live_defaults()
     except Exception as exc:     # a refused file, or anything unexpected
+        # The defaults server will not save over a refused file, so it must be
+        # fixed, or deleted before new defaults are saved
         logging.error("The saved live defaults are refused (%s): every scheduled run "
-                      "will exit 2 until the file is fixed or saved again", exc)
+                      "will exit 2 until the file is fixed, or deleted and saved again", exc)
         return
     if saved is None:
-        logging.error("No live defaults are saved: every scheduled run will exit 2 until "
-                      "they are (python3 -m kalshi_betting.defaults_server --seed, or the "
-                      "backtest dashboard's Save as live defaults… button)")
+        # Name the checkout: the runs this daemon spawns read the file there, so
+        # defaults saved from any other checkout (a worktree, say) do not count
+        logging.error("No live defaults are saved in %s (the checkout this daemon runs): "
+                      "every scheduled run will exit 2 until they are — save them from "
+                      "that directory with python3 -m kalshi_betting.defaults_server "
+                      "--seed, or through that server and the backtest dashboard's Save "
+                      "as live defaults… button", PROJECT_ROOT)
 
 
 def _setup_logging(log_path: pathlib.Path) -> None:

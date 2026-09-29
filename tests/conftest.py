@@ -31,7 +31,7 @@ Dependencies:
     constants, the order-write rate and burst, LIVE_DEFAULTS_FILE,
     live_settings and save_live_defaults), and backtester and backtest (the
     by-value copies they bind). Imported by pytest, and by test modules for
-    apply_pre_toggle_defaults.
+    apply_pre_toggle_defaults and save_config_live_defaults.
 
 Notes:
     Before DR-51 four tests in test_historical.py (TestFetchAllSettledMarkets'

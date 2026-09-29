@@ -89,11 +89,17 @@ Dependencies:
     curve, which its page-wide filter runs over a category's or tag's trades
     for that slice's curve — _calibration_bucket, _band_label (the bare
     "floor-ceiling" its filter bar and scenario explorer name a band's
-    tier-floors-off run with, so the page and the log spell that run alike)
-    and _tier_floors_bind (the one test of whether a deadline-gap tier binds
+    tier-floors-off run with, so the page and the log spell that run alike),
+    _tier_floors_bind (the one test of whether a deadline-gap tier binds
     at a band, which the page's Tier floors views — the filter bar's and the
     scenario explorer's — read to decide whether a band absent from the
-    tier-off family may show its tier-on run, or no off view is shown); an
+    tier-off family may show its tier-on run, or no off view is shown),
+    _cap_percent (the size-cap option formatter), and the pieces of the live
+    rule's report that dashboard._live_rule_html shares with this module's
+    log line — _live_rule_view with its _LIVE_RULE_PRIMARY and
+    _LIVE_RULE_NOT_SIMULATED verdicts, _live_rule_ladder_note,
+    _live_filter_text, _live_sizing_note, _LIVE_RULE_LABEL and
+    _LIVE_RULE_NONE; an
     IntervalCalibration carries the CalibrationObservations its pooled row
     was reduced from, so a report can regroup that population through
     _calibration_bucket, the one definition of the k-hat arithmetic, as

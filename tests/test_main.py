@@ -780,6 +780,10 @@ class TestLiveDefaultsRequired:
         assert "the saved live defaults are refused" in err
         assert str(config.LIVE_DEFAULTS_FILE) in err
         assert "python3 -m kalshi_betting.defaults_server" in err
+        # The server will not save over a refused file, so the stderr says to
+        # fix it, or delete it first
+        assert "fix the file, or delete it and then save new ones" in err
+        assert "the server will not save over a file it refuses" in err
 
     def test_an_invalid_config_constant_does_not_stop_a_run_with_a_saved_file(
         self, monkeypatch, saved_live_defaults,
