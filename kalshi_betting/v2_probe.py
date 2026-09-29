@@ -25,14 +25,14 @@ Purpose:
     priced at the top of the market's own grid and crosses any resting YES ask
     (see PRICE OVERRIDE below); reduce_only is what bounds it.
 
-    STRONGLY RECOMMENDED, NOT A HARD GATE. The V2 path is on by default
-    (config.ORDER_API_VERSION = "v2") and does not wait for this probe. What
-    backstops it instead is trader._confirm_v2_no_mapping(), which checks the
-    very same position MOVEMENT on the first live V2 NO fill of a process — but
-    that check pays for its evidence with a REAL trade-sized position, while
-    this probe buys the identical evidence for ~1c. If either mapping step
-    FAILS, set config.ORDER_API_VERSION = "legacy" to hold the bot on the
-    legacy order path.
+    STRONGLY RECOMMENDED, NOT A HARD GATE. The bot does not wait for this
+    probe. trader._confirm_v2_no_mapping() checks the same thing on the first
+    real NO fill of each run, but with a full-size position; this probe does
+    it for about 1c. If a mapping step FAILS, stop trading until the failure
+    is understood: there is no other order path. Only the FAIL lines printed
+    after a submission on a ticker the probe first found flat also say to
+    flatten that ticker by hand (_REMEDY); main()'s closing line never says
+    to flatten on its own, since a position there could be the bot's.
 
     *** REAL MONEY. *** Every step here submits live orders (or moves live
     collateral) against the PRODUCTION account. Worst-case exposure is the V2
@@ -40,7 +40,7 @@ Purpose:
     real, it is not a simulation, and there is no dry-run mode: a probe that
     doesn't submit proves nothing. Every request body and every raw response is
     printed verbatim, and that printed output IS the evidence log behind the
-    decision to keep ORDER_API_VERSION = "v2" (or to flip it to "legacy").
+    decision to keep trading on the V2 order path.
 
 Dependencies:
     Imports the auth, config, scanner and trader MODULES (module-style, so the
@@ -57,6 +57,20 @@ Notes:
     PROD ONLY. auth.build_client("prod") is hardcoded — the sandbox implements
     neither the V2 order endpoint nor exchange sharding, so a sandbox "pass"
     would prove nothing about the mapping this probe exists to verify.
+
+    V2 ONLY. main() exits 2 unless config.ORDER_API_VERSION is "v2"
+    (config.order_api_version_error, the same check main.py runs), right
+    after parsing its arguments and before anything is printed, logged or
+    requested.
+
+    CANCEL YOUR RESTING ORDERS ON THE PROBE TICKER FIRST. Every order the
+    probe submits carries the builders' self_trade_prevention_type
+    (config.V2_SELF_TRADE_PREVENTION_TYPE, "taker_at_cross"), so a probe order
+    that would trade against an order this account already has resting on the
+    ticker is cancelled at that point instead of filling, and the step's
+    verdict then no longer tests what the step is for. The probe checks only
+    that the POSITION is flat before it starts; it does not read the account's
+    resting orders.
 
     COUNT OVERRIDE. trader's builders read the whole-contract count from the
     trader._Leg they are handed (rendered "<n>.00") because the bot sizes in
@@ -120,8 +134,34 @@ Notes:
     its only post-submission position read, its `not killed` branch names the
     counts but reports the account from one un-refreshed read and never says
     FLATTEN, and both steps' submission-EXCEPTION handlers decide from one
-    un-refreshed read too. Those four are recorded residuals — see CLAUDE.md's
-    DR-60 bullet — so nothing here should be read as a module-wide guarantee.
+    un-refreshed read too, for any error other than the kill response below.
+    Those four are recorded residuals — see CLAUDE.md's DR-60 bullet — so
+    nothing here should be read as a module-wide guarantee.
+
+    THE KILL RESPONSE. The exchange answers a fill-or-kill that cannot fill in
+    full with an HTTP 409 error whose body carries the code
+    fill_or_kill_insufficient_resting_volume (config.V2_FOK_KILL_HTTP_STATUS /
+    config.V2_FOK_KILL_ERROR_CODE), not with a 2xx whose fill count is zero:
+    the order is rejected before it matches, so nothing filled. Both order
+    steps recognise it through trader._is_fok_kill — the one definition the
+    live path's _submit_order_v2 reads too — and still accept the 2xx shape.
+    For the unfillable ask the kill response is the expected outcome (PASS on
+    a flat account); for the NO buy it is a kill (NEUTRAL on a flat account).
+    Either way the position is read, and a read that is not exactly 0 — a
+    failed lookup, or a position the kill response cannot explain, since the
+    account started flat — is read once more after
+    trader._V2_MAPPING_RECHECK_DELAY_SECONDS before the verdict
+    (_position_after_kill). A first read of exactly 0 is judged at once. Any
+    other error keeps its FAIL.
+
+    THE CLOSE RE-READ. The positions ledger can lag a fill: on the first live
+    run the read straight after the NO buy's fill showed 0.0 and the re-read
+    about a second later showed -0.01, and the lone read straight after a close
+    that did flatten the account showed -0.01. So a position that is not
+    exactly 0 after the reduce-only close is read once more after the same
+    pause, and the close's verdict is judged on the re-read. How long the
+    ledger can lag is not known, so one re-read can still FAIL a close that
+    worked.
 
     CONFIRMATION. Nothing is submitted until the request body has been printed
     and the operator has typed "yes" — unless --yes was passed, which is for a
@@ -140,7 +180,9 @@ Notes:
     close a real open position is not a neutral outcome, and the printed
     message tells the operator to flatten it manually. Only a 0 from BOTH
     mapping steps (--step no-mapping and --step unfillable-ask) is evidence
-    that the V2 order path may be trusted to run unsupervised.
+    that the V2 order path may be trusted to run unsupervised. A bad argument,
+    or an ORDER_API_VERSION other than "v2", also exits 2 before any step
+    runs.
 """
 import argparse
 import json
@@ -176,6 +218,51 @@ _FAIL = "FAIL"
 _NEUTRAL = "NEUTRAL"
 
 _EXIT_CODES = {_PASS: 0, _FAIL: 1, _NEUTRAL: 2}
+
+# What the operator is told to do when a step shows the V2 order path
+# misbehaving. _STOP_TRADING says to halt the bot; _REMEDY and every closing
+# line main() prints after a FAIL start with it.
+_STOP_TRADING = (
+    "Stop trading until this is understood: stop the scheduler daemon if it is running, "
+    "and do not run main.py --mode prod."
+)
+# _FLATTEN is printed only where the probe found the ticker flat before it
+# submitted, so any position there is the probe's own; elsewhere it could be
+# the bot's live trade.
+_FLATTEN = (
+    "Flatten any position on the probed ticker by hand in the Kalshi UI; there is no "
+    "other order path to fall back on."
+)
+# Both halves, printed by _step_no_mapping's three FAIL lines that follow a
+# submission: a disproven NO-leg mapping, an impossible fill-or-kill reply,
+# and a close that did not leave the ticker flat.
+_REMEDY = f"{_STOP_TRADING} {_FLATTEN}"
+
+# Last sentence of main()'s closing line after an order step that did not PASS.
+_BOTH_STEPS_MUST_PASS = (
+    "Both --step no-mapping and --step unfillable-ask have to PASS before the V2 order "
+    "path should be trusted to run unsupervised."
+)
+# main()'s closing line after --step no-mapping or --step unfillable-ask FAILs.
+# It does not say to flatten; the step's own lines say whether a position is open.
+_ORDER_FAIL_CLOSING = (
+    f"{_STOP_TRADING} Act only on the position warnings printed above: a FAIL before "
+    "anything was submitted (a market that could not be read, or a starting position "
+    "that was not flat or could not be read) opened nothing, so never flatten a position "
+    f"the bot holds because of it. {_BOTH_STEPS_MUST_PASS}"
+)
+# main()'s closing line after --step transfer FAILs: check the shard balances.
+_TRANSFER_FAIL_CLOSING = (
+    f"{_STOP_TRADING} Check each shard's balance in the Kalshi UI before the bot moves "
+    "collateral again."
+)
+# main()'s closing line after any step comes back NEUTRAL (no verdict, so no
+# action is needed).
+_NEUTRAL_CLOSING = (
+    "This result is inconclusive: nothing above shows the V2 order path misbehaving, so "
+    "it gives no reason to halt the bot or close a position. Address the reason printed "
+    f"above and re-run the step. {_BOTH_STEPS_MUST_PASS}"
+)
 
 
 def _emit(label: str, payload: Any) -> None:
@@ -301,9 +388,9 @@ def _no_buy_body(market: Any, no_price: float) -> dict:
     Build the NO-buy request body: the real builder, with a 0.01 count.
 
     Built through trader._build_no_order_v2 so every other field (side from
-    _V2_LEG_SIDE, the tick-aware limit price, time_in_force, client_order_id,
-    exchange_index, reduce_only, post_only) is byte-identical to what the live
-    path would send.
+    _V2_LEG_SIDE, the tick-aware limit price, time_in_force,
+    self_trade_prevention_type, client_order_id, exchange_index, reduce_only,
+    post_only) is byte-identical to what the live path would send.
 
     Args:
         market (Any): The scanner.ApiMarket to trade.
@@ -331,9 +418,10 @@ def _no_close_body(market: Any) -> dict:
 
     Everything that makes this body a CLOSE comes from
     trader._build_rollback_order_v2 — side "bid" (trader._V2_LEG_SIDE's
-    "close_no"), reduce_only=True, time_in_force "fill_or_kill", the ticker and
-    the market's own exchange shard — so the probe verifies the real unwind
-    body rather than a reimplementation of it. TWO fields are then overridden:
+    "close_no"), reduce_only=True, time_in_force "immediate_or_cancel",
+    self_trade_prevention_type, the ticker and the market's own exchange shard
+    — so the probe verifies the real unwind body rather than a
+    reimplementation of it. TWO fields are then overridden:
     the count (the V2 fractional minimum, see _no_buy_body) and the price. See
     the module header's PRICE OVERRIDE note for why the builder's price cannot
     be used here.
@@ -501,7 +589,9 @@ def _recheck_and_report_position(
     new one, which names the counts and FAILs but decides its account report
     from a single un-refreshed read and never says FLATTEN; and both steps'
     post-submission EXCEPTION handlers, which likewise decide from a single
-    un-refreshed read. Widening to them is a separate change, and the word
+    un-refreshed read for any error other than the exchange's kill response
+    (that one goes through _position_after_kill). Widening to them is a
+    separate change, and the word
     "SINGLE DEFINITION" above is about this tail's ONE implementation, never a
     claim that every such branch runs it.
 
@@ -618,6 +708,76 @@ def _non_object_body_fail(client: Any, ticker: str, data: Any, label: str) -> st
     return _FAIL
 
 
+def _kill_response_text(exc: Any) -> str:
+    """
+    Describe the exchange's fill-or-kill kill response in one line.
+
+    Prints only the status and the body, never str(exc): the SDK's own string
+    spreads the whole header dict over several lines, and the body is what
+    names the kill.
+
+    Args:
+        exc (Any): An exception trader._is_fok_kill accepted.
+
+    Returns:
+        str: "HTTP <status> <body>", with a bytes body decoded as UTF-8 (as
+            trader._is_fok_kill reads it).
+    """
+    body = exc.body
+    if isinstance(body, (bytes, bytearray)):
+        body = bytes(body).decode("utf-8", errors="replace")
+    return f"HTTP {exc.status} {body}"
+
+
+def _position_after_kill(client: Any, ticker: str, label: str) -> float | None:
+    """
+    Read the position after the exchange killed a fill-or-kill, re-reading once
+    unless it is exactly flat.
+
+    A kill response means the order was rejected before it matched, and both
+    order steps refuse to run unless the account starts flat, so the expected
+    read is exactly 0 — and a ledger lagging behind a fill could only show that
+    flat start. A first read that is not exactly 0 — a failed lookup, or a
+    position the kill response cannot explain — is read ONCE more after
+    trader._V2_MAPPING_RECHECK_DELAY_SECONDS, and the re-read is what the
+    caller judges. When a first read that named a position is followed by a
+    flat re-read, a note says the verdict rests on the re-read, so the anomaly
+    stays in the evidence. A first read of exactly 0 is the expected answer
+    and is not re-polled. Both reads are printed.
+
+    The retried trader._position_count is used, as in every other probe read:
+    the probe is human-supervised with 0.01 contracts at stake, so a transient
+    429 must not read as "state unknown".
+
+    Args:
+        client (Any): Authenticated prod KalshiClient.
+        ticker (str): The market the killed order was submitted against.
+        label (str): Which order was killed, e.g. "NO buy", for the message.
+
+    Returns:
+        float | None: The position the caller judges — the first read when it
+            is exactly 0, otherwise the re-read. None means the lookup failed.
+    """
+    # Cross-module: the account's ledger is the only evidence of what the
+    # killed order did.
+    first = trader._position_count(client, ticker)
+    print(f"Position after the {label} kill response: {first}")
+    if first == 0:
+        return first
+    # A failed lookup or an unexplained position: read once more before
+    # judging, as the DR-21 re-read does.
+    time.sleep(trader._V2_MAPPING_RECHECK_DELAY_SECONDS)
+    after = trader._position_count(client, ticker)
+    print(f"Position after re-read: {after}")
+    if first is not None and after == 0:
+        print(
+            f"NOTE: the first read ({first}) was not flat, although a kill response "
+            "means nothing filled and the account started flat. The verdict below "
+            "rests on the re-read — check the account if in doubt."
+        )
+    return after
+
+
 def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int) -> str:
     """
     THE CORE GATE: verify that an `ask` opens a NO position and reduce_only
@@ -638,7 +798,12 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
          _recheck_and_report_position: the ledger is refreshed once and the
          account is reported as unreadable, open or genuinely flat, where this
          branch used to decide from one un-refreshed read and print nothing at
-         all for the first two (DR-60). The verdict stays FAIL.
+         all for the first two (DR-60). The verdict stays FAIL. The exchange's
+         kill response — HTTP 409 fill_or_kill_insufficient_resting_volume,
+         recognised by trader._is_fok_kill — is a kill like a 2xx with nothing
+         filled: the position is read (once more after a pause when it is not
+         exactly 0, _position_after_kill), NEUTRAL when flat, FAIL with a
+         FLATTEN warning otherwise. Any other error is a FAIL.
       3a. Classify the readable counts into THREE outcomes, not two: a
          complete fill, a true kill (nothing filled, the full count still
          remaining), and anything else — a partial fill, an over-fill or a
@@ -662,10 +827,14 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
          (reduce_only bid nets a NO position to flat) rests on the same
          disproven assumption and would add to the wrong exposure instead.
       5. Submit the closing body from trader._build_rollback_order_v2 (side
-         "bid", reduce_only=True), priced at the top of this market's own grid
-         rather than at the builder's loss floor, so the close crosses
-         whatever is resting on the book (see _no_close_body). PASS half two
-         iff the position returns to 0. This is the step's SECOND submission
+         "bid", reduce_only=True, time_in_force "immediate_or_cancel"), priced
+         at the top of this market's own grid rather than at the builder's
+         loss floor, so the close crosses whatever is resting on the book
+         (see _no_close_body). PASS half two
+         iff the position returns to 0. A position that is not exactly 0
+         straight after the close is read once more after
+         trader._V2_MAPPING_RECHECK_DELAY_SECONDS and the re-read is judged,
+         because the ledger can lag a fill. This is the step's SECOND submission
          — the probe's second order-submission site of three — and it needs
          no _non_object_body_fail guard: its 2xx body is only
          handed to _emit (typed Any — it just pretty-prints), and the verdict
@@ -689,9 +858,10 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
             confirmation, since a real position is open by then and declining
             to close it is not a neutral outcome; _NEUTRAL only when the step
             never reached a verdict with no position at risk: no liquidity, a
-            TRUE kill (nothing filled, the full count remaining) against a
-            genuinely flat account, or declining the FIRST (opening)
-            confirmation, before any order was submitted.
+            TRUE kill (nothing filled, the full count remaining — or the
+            exchange's HTTP 409 kill response) against a genuinely flat
+            account, or declining the FIRST (opening) confirmation, before any
+            order was submitted.
     """
     print("\n===== STEP: no-mapping (the V2 NO-leg mapping gate) =====")
 
@@ -735,7 +905,8 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
     if start != 0:
         print(
             f"{_FAIL}: probe must start FLAT on {ticker} (position={start}; None means the "
-            "lookup itself failed). Close the position or pick another ticker."
+            "lookup itself failed). Pick another ticker: the position may be one the bot "
+            "holds, so never close it for the probe."
         )
         return _FAIL
 
@@ -752,18 +923,42 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
     ):
         return _NEUTRAL
 
+    kill = None
     try:
         # Same transport/path/no-retry contract as the live path — one attempt.
         data = _submit_probe_order(client, body)
     except Exception as exc:
-        print(f"{_FAIL}: NO-buy submission raised: {exc}")
-        after_err = trader._position_count(client, ticker)
-        print(f"Position after the error: {after_err}")
-        if after_err:
+        if not trader._is_fok_kill(exc):
+            print(f"{_FAIL}: NO-buy submission raised: {exc}")
+            after_err = trader._position_count(client, ticker)
+            print(f"Position after the error: {after_err}")
+            if after_err:
+                print(
+                    "*** The order may still have filled — a position is open on "
+                    f"{ticker}. FLATTEN IT MANUALLY in the Kalshi UI. ***"
+                )
+            return _FAIL
+        kill = exc
+    if kill is not None:
+        # The exchange's kill response (trader._is_fok_kill, the one definition
+        # the live path reads too): nothing crossed, so the mapping is
+        # unproven — the same outcome as a 2xx with nothing filled, judged on
+        # the account after one re-read of a first read that is not flat.
+        print(f"The exchange killed the fill-or-kill NO buy: {_kill_response_text(kill)}")
+        after = _position_after_kill(client, ticker, "NO buy")
+        if after == 0:
             print(
-                "*** The order may still have filled — a position is open on "
-                f"{ticker}. FLATTEN IT MANUALLY in the Kalshi UI. ***"
+                f"{_NEUTRAL}: the fill-or-kill was killed unfilled (HTTP "
+                f"{config.V2_FOK_KILL_HTTP_STATUS} {config.V2_FOK_KILL_ERROR_CODE}) and "
+                "the account is flat, so the mapping is unproven. Pick a more liquid "
+                "ticker and re-run."
             )
+            return _NEUTRAL
+        print(
+            f"{_FAIL}: the exchange reported a kill but the position on {ticker} is "
+            f"{after} after a re-read (None means the lookup failed). Do not trust "
+            "either signal. *** CHECK THE ACCOUNT and FLATTEN ANY POSITION YOU FIND. ***"
+        )
         return _FAIL
     _emit("RAW RESPONSE (NO buy)", data)
     if not isinstance(data, dict):
@@ -858,8 +1053,7 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
             "the requested count nor zero (trader._v2_fill_status), but it reads no "
             "remaining_count at all — so a surprise confined to that field would pass it "
             "as a clean fill or a clean kill. This probe checks both counts deliberately. "
-            "*** CHECK THE ACCOUNT. *** Set config.ORDER_API_VERSION = \"legacy\" to hold "
-            "the bot on the legacy order path."
+            f"*** CHECK THE ACCOUNT. *** {_REMEDY}"
         )
         _recheck_and_report_position(client, ticker, after)
         return _FAIL
@@ -884,8 +1078,7 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
             f"(YES) position of {after} on {ticker}. 'ask' does NOT open a NO position, so "
             "trader._V2_LEG_SIDE takes the wrong side of the market. The reduce_only "
             "unwind is NOT being submitted — it rests on the same disproven mapping and "
-            "would add to this exposure. *** FLATTEN THE POSITION MANUALLY. *** "
-            'Set config.ORDER_API_VERSION = "legacy" to hold the bot on the legacy path.'
+            f"would add to this exposure. *** A POSITION IS OPEN ON {ticker}. *** {_REMEDY}"
         )
         return _FAIL
     if after == 0:
@@ -906,9 +1099,10 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
     _emit("REQUEST BODY (NO close — hypothesis: reduce_only bid nets to flat)", close_body)
     if not _confirm(
         assume_yes,
-        f"Submit a fill-or-kill {close_body['side'].upper()} on {ticker} for "
+        f"Submit a {close_body['side'].upper()} on {ticker} for "
         f"{PROBE_COUNT_STR} contracts at a limit of {close_body['price']} with "
-        f"reduce_only=true, to close the {after} position just opened.",
+        f"time_in_force={close_body['time_in_force']} and reduce_only=true, to "
+        f"close the {after} position just opened.",
     ):
         print(
             f"{_FAIL}: declined at the prompt while a {after} position is OPEN on {ticker}. "
@@ -929,10 +1123,18 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
     final = trader._position_count(client, ticker)
     print(f"Position after the close: {final}")
     if final != 0:
+        # The positions ledger can lag a fill, so a close that really
+        # flattened the account can still read as the open position (or as a
+        # failed lookup). Re-read ONCE and judge the re-read, as the DR-21
+        # re-read after the NO buy does.
+        time.sleep(trader._V2_MAPPING_RECHECK_DELAY_SECONDS)
+        final = trader._position_count(client, ticker)
+        print(f"Position after re-read: {final}")
+    if final != 0:
         print(
             f"{_FAIL}: the reduce_only bid did NOT return the position to flat (position="
             f"{final}; None means the lookup failed). *** CHECK THE ACCOUNT MANUALLY. *** "
-            'Set config.ORDER_API_VERSION = "legacy" to hold the bot on the legacy path.'
+            f"{_REMEDY}"
         )
         return _FAIL
 
@@ -953,9 +1155,15 @@ def _step_unfillable_ask(client: Any, ticker: str, assume_yes: bool, dest_shard:
     MINIMUM proceeds accepted per contract, so demanding almost the full dollar
     to sell one YES is above any realistic resting bid and the order cannot
     fill. Two things are proven at once: that a FoK that cannot fill comes back
-    killed with the full count remaining (rather than resting, or partially
-    filling), and that the ask's limit really is a floor on proceeds — the
-    direction trader._v2_limit_price's ceiling quantization assumes.
+    killed (rather than resting, or partially filling), and that the ask's
+    limit really is a floor on proceeds — the direction
+    trader._v2_limit_price's ceiling quantization assumes. The exchange's kill
+    is an HTTP 409 error with the code fill_or_kill_insufficient_resting_volume
+    (recognised by trader._is_fok_kill); a 2xx with nothing filled and the full
+    count remaining is accepted as a kill too. After the kill response the
+    position is read, and read once more after a pause when it is not exactly
+    0 — a failed lookup, or a position the kill cannot explain
+    (_position_after_kill).
 
     Args:
         client (Any): Authenticated prod KalshiClient.
@@ -964,8 +1172,11 @@ def _step_unfillable_ask(client: Any, ticker: str, assume_yes: bool, dest_shard:
         dest_shard (int): Unused — shared step signature.
 
     Returns:
-        str: _PASS when the order came back with zero filled, the full count
-            remaining, and the account still flat; _FAIL if anything filled,
+        str: _PASS when the order came back killed — the exchange's kill
+            response, or a 2xx with zero filled and the full count remaining —
+            and the account is flat; _FAIL if anything filled, any other error
+            came back, the account is not flat after a kill response and its
+            re-read,
             the response/position disagrees, the 2xx body is not a JSON object
             (unreadable is not proof of a kill — DR-58), or the market could
             not be read at all (no market means no order was even attempted);
@@ -1023,11 +1234,35 @@ def _step_unfillable_ask(client: Any, ticker: str, assume_yes: bool, dest_shard:
     ):
         return _NEUTRAL
 
+    kill = None
     try:
         data = _submit_probe_order(client, body)
     except Exception as exc:
-        print(f"{_FAIL}: submission raised: {exc}")
-        print(f"Position after the error: {trader._position_count(client, ticker)}")
+        if not trader._is_fok_kill(exc):
+            print(f"{_FAIL}: submission raised: {exc}")
+            print(f"Position after the error: {trader._position_count(client, ticker)}")
+            return _FAIL
+        kill = exc
+    if kill is not None:
+        # The exchange's kill response (trader._is_fok_kill, the one definition
+        # the live path reads too) is the outcome this step expects; the
+        # account decides the verdict, after one re-read of a first read that
+        # is not flat.
+        print(f"The exchange killed the fill-or-kill ask: {_kill_response_text(kill)}")
+        after = _position_after_kill(client, ticker, "unfillable ask")
+        if after == 0:
+            print(
+                f"{_PASS}: the exchange rejected the fill-or-kill with HTTP "
+                f"{config.V2_FOK_KILL_HTTP_STATUS} {config.V2_FOK_KILL_ERROR_CODE} — its "
+                "kill response — so nothing filled, and the account is flat. Kill "
+                "semantics and the ask's proceeds-floor direction are confirmed."
+            )
+            return _PASS
+        print(
+            f"{_FAIL}: the exchange reported a kill but the position on {ticker} is "
+            f"{after} after a re-read (None means the lookup failed). "
+            "*** CHECK THE ACCOUNT. ***"
+        )
         return _FAIL
     _emit("RAW RESPONSE (unfillable ask)", data)
     if not isinstance(data, dict):
@@ -1268,10 +1503,13 @@ def main(argv: list | None = None) -> int:
     """
     Parse arguments, run one probe step against the live account, and report.
 
-    Builds a PRODUCTION client unconditionally (the sandbox implements neither
-    the V2 order endpoint nor sharding, so a sandbox result would prove
-    nothing), verifies credentials with a balance read, then runs the selected
-    step.
+    Exits 2 unless config.ORDER_API_VERSION is "v2"
+    (config.order_api_version_error), before anything is printed, logged or
+    requested. Then builds a PRODUCTION client (the sandbox has neither the
+    V2 order endpoint nor shards), checks credentials with a balance read,
+    and runs the selected step. The closing line depends on the outcome:
+    _NEUTRAL_CLOSING after a NEUTRAL, _TRANSFER_FAIL_CLOSING after a FAIL of
+    --step transfer, _ORDER_FAIL_CLOSING after a FAIL of an order step.
 
     Args:
         argv (list | None): Argument vector for testing. None reads sys.argv.
@@ -1284,6 +1522,10 @@ def main(argv: list | None = None) -> int:
             FAIL, not a NEUTRAL — DR-20). Only a 0 from BOTH no-mapping and
             unfillable-ask is evidence that the V2 order path may be trusted
             to run unsupervised.
+
+    Raises:
+        SystemExit: Status 2 on an invalid argument or on any
+            config.ORDER_API_VERSION but "v2", before anything is submitted.
     """
     parser = argparse.ArgumentParser(
         prog="python3 -m kalshi_betting.v2_probe",
@@ -1317,6 +1559,11 @@ def main(argv: list | None = None) -> int:
         help="Skip the interactive confirmation before each submission.",
     )
     args = parser.parse_args(argv)
+    # Exit 2 unless ORDER_API_VERSION is "v2", before the banner, logging or
+    # any request
+    problem = config.order_api_version_error()
+    if problem:
+        parser.error(problem)
 
     # The scanner/trader/auth calls below log at INFO (order-book key mismatches,
     # transfer acceptance, submissions); without a handler those lines would be
@@ -1348,17 +1595,18 @@ def main(argv: list | None = None) -> int:
     outcome = _STEPS[args.step](client, args.ticker, args.yes, args.dest_shard)
 
     print(f"\n================ RESULT: {args.step} -> {outcome} ================")
-    if outcome != _PASS:
-        print(
-            'Set config.ORDER_API_VERSION = "legacy" to hold the bot on the legacy order '
-            "path. Both --step no-mapping and --step unfillable-ask have to PASS before "
-            "the V2 order path should be trusted to run unsupervised."
-        )
-    else:
+    # Closing line by outcome and step (see the *_CLOSING constants)
+    if outcome == _PASS:
         print(
             "Record this output. The V2 order path is only known-good once BOTH "
             "--step no-mapping and --step unfillable-ask have PASSED."
         )
+    elif outcome == _NEUTRAL:
+        print(_NEUTRAL_CLOSING)
+    elif args.step in _TICKER_STEPS:
+        print(_ORDER_FAIL_CLOSING)
+    else:
+        print(_TRANSFER_FAIL_CLOSING)
     return _EXIT_CODES[outcome]
 
 

@@ -1,41 +1,44 @@
-"""Tests for trader.py — order construction (both the V2 and the retained
-legacy endpoint), V2 price/tick math, rollback verification and its loss
-floor, exception disambiguation, and the cross-shard collateral transfer
-machinery. All Kalshi API interaction is mocked per project policy (tests must
-run offline).
+"""Tests for trader.py: V2 order bodies and price/tick math, the rollback and
+its loss floor, how uncertain outcomes are judged, the collateral transfers,
+and the write pacer. All Kalshi calls are mocked, so the tests run offline.
 
-Legs are named by SUBMISSION order, not by market: the NO leg is always
-submitted first and is the leg the rollback unwinds, the YES leg second. Which
-market carries which side is the pair type's business (trader._ordered_legs):
-same_title puts the NO leg on market_a (TICK-A) — make_spec's default, so the
-long-standing same-title cases below read "TICK-A" for the NO leg unchanged —
-while time_series puts it on market_b (TICK-B); TestTimeSeriesLegOrder pins
-that flip end to end and TestSameTitleWireIdentity pins the same-title bodies
-byte for byte.
+Legs are named by the order they are sent: the NO leg goes first and is the
+one the rollback undoes, the YES leg second. For same_title pairs (make_spec's
+default) the NO leg is market_a (TICK-A); for time_series pairs it is
+market_b (TICK-B), covered by TestTimeSeriesLegOrder.
 
-Ambiguity handling is DELTA-based: _execute_one reads BOTH legs' baseline
-positions up front (NO leg's ticker first, then the YES leg's), before either
-order is submitted, and compares each against a reading taken after an
-exception, attributing the outcome to the change. Mocks therefore sequence
-get_positions responses with side_effect (see positions_seq) rather than
-returning one flat payload — a single return_value would make before and
-after identical, i.e. delta 0. Every _execute_one call consumes TWO baseline
-reads before anything else, so a mock sequence written for the old
-read-on-demand protocol will fail with StopIteration or a wrong status; read
-such failures through that lens first.
+_execute_one reads BOTH legs' positions before sending anything (the NO
+leg's ticker first) and judges an exception by how a position changed
+afterwards. Mocks therefore script get_positions replies in order with
+side_effect (see positions_seq); every _execute_one call uses two baseline
+reads first.
 
-The merged default is ORDER_API_VERSION="v2", so any class that drives
-_execute_one down the legacy path opts in via the `legacy_mode` fixture.
+Every order goes through signed_request_json, which the tests mock.
+TestV2IsTheOnlyOrderPath checks, on the syntax tree, that nothing reaches the
+SDK's create-order methods, that only config.py reads ORDER_API_VERSION, and
+that no code string starts with the retired /portfolio/orders path.
+
+The write pacer (trader._WritePacer) is covered from `class _FakeClock` to
+the end. Single-thread tests use _FakeClock; multi-thread tests use _SimTime,
+simulated time that only moves once every thread is blocked, so their times
+are exact on any machine.
 """
 import ast
+import copy
+import dataclasses
 import inspect
 import json
 import logging
 import math
+import pickle
+import random
 import textwrap
+import threading
+import time
 import uuid
 from decimal import Decimal
 from json import JSONDecodeError
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -44,7 +47,6 @@ from kalshi_python_sync.exceptions import ApiException
 
 from kalshi_betting import _http, config, trader
 from kalshi_betting.config import (
-    BUY_MAX_COST_SLIPPAGE_CENTS,
     BUY_SLIPPAGE_TICKS,
     DEFAULT_EXCHANGE_INDEX,
     ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT,
@@ -55,32 +57,30 @@ from kalshi_betting.reporter import TradeResult
 from kalshi_betting.scanner import PriceRange
 from kalshi_betting.trader import (
     _await_transfer_settlement,
-    _build_no_order,
     _build_no_order_v2,
-    _build_rollback_order_any,
     _build_rollback_order_v2,
-    _build_yes_order,
     _build_yes_order_v2,
-    _buy_max_cost_cents,
     _ceil_to_tick,
     _cents_to_centicents,
     _execute_one,
     _execute_transfer,
     _format_count,
     _format_price,
-    _legacy_routable,
+    _is_fok_kill,
     _ordered_legs,
     _partition_by_funding,
     _plan_transfers,
     _position_count,
     _required_cents_by_shard,
     _rollback_floor_cents,
+    _submit_order_v2,
     _transfers_active,
     _unfunded_shards,
     _v2_fill_status,
     _v2_limit_price,
     _v2_rollback_price,
     _v2_top_of_grid_price,
+    _WritePacer,
     ensure_shard_collateral,
     execute_trades,
     pre_execution_check,
@@ -238,11 +238,17 @@ def v2_resp(fill_count, requested: int = 5) -> dict:
     }
 
 
-def order_resp(status: str) -> SimpleNamespace:
-    """Raw create_order response — trader parses the JSON body directly
-    because the SDK's Order response model can't deserialize live payloads."""
-    payload = {"order": {"status": status}}
-    return SimpleNamespace(status=201, data=json.dumps(payload).encode("utf-8"))
+# The body the V2 endpoint sent, verbatim, when it killed a fill-or-kill ask
+# that could not fill on the production API (2026-09-28).
+FOK_KILL_BODY = (
+    '{"error":{"code":"fill_or_kill_insufficient_resting_volume",'
+    '"message":"fill or kill insufficient resting volume"}}'
+)
+
+
+def fok_kill_error() -> ApiException:
+    """The HTTP 409 the V2 endpoint answers a fill-or-kill that cannot fill."""
+    return ApiException(status=409, reason="Conflict", body=FOK_KILL_BODY)
 
 
 def positions_resp(ticker: str | None = None, position: float = 0) -> SimpleNamespace:
@@ -299,41 +305,11 @@ def positions_seq(*readings) -> MagicMock:
     return MagicMock(side_effect=effects)
 
 
-class TestOrderPriceProtection:
-    def test_no_leg_has_buy_max_cost(self):
-        spec = make_spec(x=5, nA=0.40)
-        order = _build_no_order(_no_leg(spec))
-        expected = math.ceil(5 * 0.40 * 100) + 5 * BUY_MAX_COST_SLIPPAGE_CENTS
-        assert order.buy_max_cost == expected
-        assert order.side == "no"
-        assert order.action == "buy"
-        assert order.time_in_force == "fill_or_kill"
-
-    def test_yes_leg_has_buy_max_cost(self):
-        spec = make_spec(x=5, pB=0.35)
-        order = _build_yes_order(_yes_leg(spec))
-        expected = math.ceil(5 * 0.35 * 100) + 5 * BUY_MAX_COST_SLIPPAGE_CENTS
-        assert order.buy_max_cost == expected
-        assert order.side == "yes"
-
-    def test_float_noise_does_not_loosen_the_cap(self):
-        # 7 * 0.07 * 100 == 49.00000000000001 in binary float, so a bare
-        # ceil() would hand the order a spurious extra cent of headroom.
-        # Rounding to 6 decimals first keeps the cap at the true 49 cents —
-        # strictly tighter price protection, never looser.
-        assert _buy_max_cost_cents(7, 0.07) == 49 + 7 * BUY_MAX_COST_SLIPPAGE_CENTS
-        assert math.ceil(7 * 0.07 * 100) == 50  # what the un-rounded form gave
-
-    def test_genuine_fraction_still_rounds_up(self):
-        # The guard must only remove noise: a real sub-cent remainder still
-        # ceils, or the cap could reject a fill at the scanned price.
-        assert _buy_max_cost_cents(3, 0.335) == 101 + 3 * BUY_MAX_COST_SLIPPAGE_CENTS
-
-
 class TestRollbackPriceFloor:
-    """The NO-leg unwind is a floored FoK limit sell, not an unbounded market
-    sell. The floor is read from the NO leg's own scanned entry — `nA` for the
-    same-title default used here (market_a is the NO leg)."""
+    """_rollback_floor_cents: the lowest NO price per contract the unwind may
+    take, from the NO leg's own entry price (`nA` here, since market_a is the
+    NO leg). The unwind bid is capped at 1 - floor/100 (see
+    TestV2OrderBuilders)."""
 
     def test_floor_is_entry_less_max_loss(self):
         spec = make_spec(nA=0.62)
@@ -356,23 +332,6 @@ class TestRollbackPriceFloor:
         assert _rollback_floor_cents(_no_leg(make_spec(nA=0.03))) == 1
         # And the upper clamp keeps the price inside the API's 1..99 range.
         assert _rollback_floor_cents(_no_leg(make_spec(nA=1.20))) == 99
-
-
-@pytest.fixture
-def legacy_mode(monkeypatch):
-    """Pin trader to the retained legacy /portfolio/orders order path.
-
-    ORDER_API_VERSION now defaults to "v2", so the legacy-endpoint cases below
-    must select their path explicitly rather than relying on the default —
-    otherwise they would silently stop covering the legacy code they exist for.
-    """
-    monkeypatch.setattr(trader, "ORDER_API_VERSION", "legacy")
-
-
-@pytest.fixture
-def v2_mode(monkeypatch):
-    """Pin trader to the V2 order path (the config default, made explicit)."""
-    monkeypatch.setattr(trader, "ORDER_API_VERSION", "v2")
 
 
 @pytest.fixture(autouse=True)
@@ -401,116 +360,72 @@ def v2_mapping_confirmed(monkeypatch):
     monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", True)
 
 
+def assert_disproof_names_the_remedy(caplog) -> None:
+    """Assert the disproven-mapping CRITICAL says to stop trading and flatten
+    by hand in the Kalshi UI, and names no other order path."""
+    criticals = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+    assert len(criticals) == 1, criticals
+    message = criticals[0]
+    assert "MAPPING DISPROVEN" in message
+    assert "Stop trading" in message and "Kalshi UI" in message
+    assert "no other order path to fall back on" in message
+    assert "legacy" not in message.lower()
+    assert "ORDER_API_VERSION" not in message
+
+
 class TestRollbackVerification:
+    """_execute_one around the unwind: the capped unwind's own result is
+    checked, a clean fill-or-kill rejection needs no position read, and both
+    baselines are read before any order is sent. The NO-mapping check is
+    pre-latched so it does not use up the position scripts."""
+
     @pytest.fixture(autouse=True)
-    def _use_legacy(self, legacy_mode):
-        """These cases assert on the legacy CreateOrderRequest wire format."""
+    def _use_v2(self, v2_mapping_confirmed):
+        """The V2 NO-leg mapping is already confirmed, as on a second trade."""
 
-    def test_unfilled_rollback_reports_rollback_failed(self):
-        # NO leg fills, YES leg FoK is rejected, and the rollback FoK is ALSO
-        # rejected — the orphaned NO-leg position must surface as
-        # "rollback_failed", never be logged away as a successful rollback.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            order_resp("canceled"),   # YES leg rejected (confirmed non-fill)
-            order_resp("canceled"),   # rollback rejected → orphaned position
-        ])
-        # Only the two pre-submission baselines are read: neither leg raised,
-        # so no ambiguity snapshot is taken.
-        client.get_positions_without_preload_content = positions_seq(None, None)
-        result = _execute_one(client, make_spec())
-        assert result.status == "rollback_failed"
-        assert "rollback FoK not filled" in result.error
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
 
-    def test_filled_rollback_reports_rolled_back(self):
+    def test_floored_rollback_killed_by_price_reports_rollback_failed(self, post):
+        # The unwind finds nothing at or under its cap: "rollback_failed",
+        # and the unwind sent carried the cap (1 - (62c entry - max loss))
+        post.side_effect = [
+            v2_resp(5),   # NO leg
+            v2_resp(0),   # YES leg rejected
+            v2_resp(0),   # floored unwind finds nothing at or under its cap
+        ]
         client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            order_resp("canceled"),   # YES leg rejected
-            order_resp("executed"),   # rollback filled
-        ])
-        client.get_positions_without_preload_content = positions_seq(None, None)
-        result = _execute_one(client, make_spec())
-        assert result.status == "rolled_back"
-
-    def test_rollback_order_is_floored_reduce_only_limit_sell(self):
-        # The unwind must be a LIMIT sell carrying a proceeds floor: a market
-        # sell has no such knob, so a collapsed book would realize an unbounded
-        # loss on a position we only hold because YES leg failed.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),
-            order_resp("canceled"),
-            order_resp("executed"),
-        ])
-        client.get_positions_without_preload_content = positions_seq(None, None)
-        spec = make_spec(nA=0.40)
-        _execute_one(client, spec)
-        rollback_call = client.create_order_without_preload_content.call_args_list[2]
-        rollback_req = rollback_call.kwargs["create_order_request"]
-        assert rollback_req.action == "sell"
-        assert rollback_req.side == "no"
-        assert rollback_req.type == "limit"
-        assert rollback_req.no_price == 40 - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT
-        assert rollback_req.count == spec.x
-        assert rollback_req.time_in_force == "fill_or_kill"
-        assert rollback_req.reduce_only is True
-
-    def test_floored_rollback_killed_by_price_reports_rollback_failed(self):
-        # A book below the floor kills the FoK limit sell. The position is
-        # still open, so the outcome must stay "rollback_failed" for manual
-        # review — the same contract the old market unwind had when unfilled.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            order_resp("canceled"),   # YES leg rejected
-            order_resp("canceled"),   # floored unwind killed by the price floor
-        ])
         client.get_positions_without_preload_content = positions_seq(None, None)
         result = _execute_one(client, make_spec(nA=0.62))
         assert result.status == "rollback_failed"
         assert "rollback FoK not filled" in result.error
-        rollback_req = client.create_order_without_preload_content.call_args_list[2].kwargs[
-            "create_order_request"
-        ]
-        assert rollback_req.no_price == 62 - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT
-
-    def test_clean_double_fill_submits_exactly_two_orders(self):
-        # The happy path must be untouched by the delta protocol: two orders,
-        # no rollback, and no submit-retry.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            order_resp("executed"),   # YES leg
-        ])
-        client.get_positions_without_preload_content = positions_seq(None, None)
-        result = _execute_one(client, make_spec())
-        assert result.status == "executed"
-        assert client.create_order_without_preload_content.call_count == 2
-
-    def test_leg_a_fok_rejection_is_failed_without_position_check(self):
-        # A clean FoK rejection is a confirmed non-fill — no ambiguity
-        # snapshot, no rollback, and YES leg is never submitted.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(
-            return_value=order_resp("canceled")
+        rollback_body = post.call_args_list[2].kwargs["body"]
+        assert rollback_body["price"] == _format_price(
+            Decimal("1") - Decimal(62 - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT) / Decimal("100")
         )
+        assert rollback_body["reduce_only"] is True
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
+
+    def test_leg_a_fok_rejection_is_failed_without_position_check(self, post):
+        # A 2xx with nothing filled is a non-fill: no extra read, no
+        # rollback, no YES leg
+        post.side_effect = [v2_resp(0)]
+        client = MagicMock()
         client.get_positions_without_preload_content = positions_seq(None, None)
         result = _execute_one(client, make_spec())
         assert result.status == "failed"
         assert "NO leg FoK not filled" in result.error
-        assert client.create_order_without_preload_content.call_count == 1
+        assert post.call_count == 1
         # Only the two up-front baselines were read — no ambiguity snapshot
         assert client.get_positions_without_preload_content.call_count == 2
 
-    def test_both_baselines_are_read_before_any_order_is_submitted(self):
-        # The unhedged window is the gap between NO leg's fill and YES leg's
-        # submission. A position read in there is a blocking network call that
-        # can burn the full ~62s retry schedule while the account holds a naked
-        # NO on market A, so BOTH baselines must be taken up front. YES leg's is
-        # equally valid there: it reads a different ticker, and no fill on that
-        # ticker can have happened yet.
+    def test_both_baselines_are_read_before_any_order_is_submitted(self, post):
+        # Both baselines are read before the NO leg is sent, so no retried
+        # read sits between the NO fill and the YES order
         calls: list[str] = []
 
         def record_positions(*args, **kwargs):
@@ -519,11 +434,11 @@ class TestRollbackVerification:
 
         def record_order(*args, **kwargs):
             calls.append("order")
-            return order_resp("executed")
+            return v2_resp(5)
 
+        post.side_effect = record_order
         client = MagicMock()
         client.get_positions_without_preload_content = MagicMock(side_effect=record_positions)
-        client.create_order_without_preload_content = MagicMock(side_effect=record_order)
 
         result = _execute_one(client, make_spec())
         assert result.status == "executed"
@@ -531,38 +446,28 @@ class TestRollbackVerification:
 
 
 class TestNoLegExceptionDisambiguation:
-    """The NO leg raised: the outcome is attributed to the position DELTA.
-
-    Same-title default, so the NO leg is TICK-A (market_a)."""
+    """The NO leg (TICK-A) raised: the outcome follows the position change,
+    an existing holding is never read as this order's fill, and an
+    unexplained change is never traded against."""
 
     @pytest.fixture(autouse=True)
-    def _use_legacy(self, legacy_mode):
-        """Exercises the legacy submission path's exception handling."""
+    def _use_v2(self, v2_mapping_confirmed):
+        """The V2 NO-leg mapping is already confirmed, as on a second trade."""
 
-    def test_no_movement_is_failed(self, monkeypatch):
-        # Exception + position unchanged → confirmed non-fill, no rollback sent.
-        # RE-PINNED (DR-64) from a three-entry script: a zero delta is only a
-        # confirmed non-fill once the LAG RE-READ has also come back zero, so
-        # the genuine-non-fill case now scripts a fourth, still-unmoved reading.
-        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
-        # before_no, before_yes (both up front), then after_no, then the re-read
-        client.get_positions_without_preload_content = positions_seq(None, None, None, None)
-        result = _execute_one(client, make_spec())
-        assert result.status == "failed"
-        assert client.create_order_without_preload_content.call_count == 1
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
 
-    def test_external_no_position_unchanged_is_failed_not_unwound(self, monkeypatch):
-        # REGRESSION (BS-01): the account already holds 10 NO contracts on
-        # TICK-A from an earlier run, and our order genuinely did not fill.
-        # The old absolute check (held_a != 0) unwound that unrelated holding;
-        # the delta is 0, so this must be a clean "failed" with NO sell order.
-        # RE-PINNED (DR-64) from a three-entry script — the fourth reading is
-        # the lag re-read, still unmoved because this really is a non-fill.
+    def test_external_no_position_unchanged_is_failed_not_unwound(self, post, monkeypatch):
+        # BS-01: the account already holds 10 NO on TICK-A and the order did
+        # not fill. The change is 0 on both reads (DR-64), so "failed" with
+        # no unwind
         monkeypatch.setattr(trader.time, "sleep", lambda s: None)
+        post.side_effect = TimeoutError("timeout")
         client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
         client.get_positions_without_preload_content = positions_seq(
             ("TICK-A", -10),   # before_no
             None,              # before_yes (taken up front, unused here)
@@ -571,18 +476,18 @@ class TestNoLegExceptionDisambiguation:
         )
         result = _execute_one(client, make_spec())
         assert result.status == "failed"
-        assert client.create_order_without_preload_content.call_count == 1
+        assert post.call_count == 1
 
-    def test_delta_of_our_no_buy_is_unwound(self):
+    def test_delta_of_our_no_buy_is_unwound(self, post):
         # Exception but the position moved by exactly -spec.x (timeout AFTER
         # the fill) — the half-filled pair must be unwound, not abandoned.
         # The account also held 10 unrelated NO contracts, which the delta
         # correctly ignores.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
+        post.side_effect = [
             TimeoutError("timeout"),  # NO leg raises after actually filling
-            order_resp("executed"),   # rollback fills
-        ])
+            v2_resp(5),               # rollback fills
+        ]
+        client = MagicMock()
         client.get_positions_without_preload_content = positions_seq(
             ("TICK-A", -10),   # before_no
             None,              # before_yes (taken up front, unused here)
@@ -590,15 +495,14 @@ class TestNoLegExceptionDisambiguation:
         )
         result = _execute_one(client, make_spec(x=5))
         assert result.status == "rolled_back"
-        # Exactly one submission attempt per NO-leg order plus the rollback
-        assert client.create_order_without_preload_content.call_count == 2
+        # Exactly one submission attempt for the NO leg, plus the rollback
+        assert post.call_count == 2
+        assert post.call_args_list[1].kwargs["body"]["reduce_only"] is True
 
-    def test_unattributable_delta_is_manual_review(self):
-        # The position moved, but by an amount our order cannot explain (an
-        # unrelated trade landed in the snapshot window). A reduce-only sell
-        # would liquidate a position we may not own — surface it instead.
+    def test_unattributable_delta_is_manual_review(self, post):
+        # An unexplained change: manual_review, no unwind
+        post.side_effect = TimeoutError("timeout")
         client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
         client.get_positions_without_preload_content = positions_seq(
             ("TICK-A", 0),     # before_no
             None,              # before_yes (taken up front, unused here)
@@ -608,19 +512,14 @@ class TestNoLegExceptionDisambiguation:
         assert result.status == "manual_review"
         assert "delta=-3" in result.error
         # No unwind order was submitted
-        assert client.create_order_without_preload_content.call_count == 1
+        assert post.call_count == 1
 
-    def test_snapshot_failure_is_manual_review(self):
-        # The lookup itself failed, so the state is unknown. This is the
-        # behavior change: the old code unwound blindly here.
-        #
-        # The call_count assertion is load-bearing beyond "no retry loop": the
-        # snapshot must run OUTSIDE NO leg's except block. Inside it, the
-        # RuntimeError would inherit the submission's TimeoutError as
-        # __context__, api_call_with_retry's cause-chain walk would classify it
-        # as transient, and this decision would stall for the full ~62s backoff.
+    def test_snapshot_failure_is_manual_review(self, post):
+        # The read failed, so the state is unknown: no unwind. The call count
+        # also checks the read runs outside the except block, where the
+        # TimeoutError context would make the retry wrapper retry it
+        post.side_effect = TimeoutError("timeout")
         client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=TimeoutError("timeout"))
         client.get_positions_without_preload_content = positions_seq(
             None,                            # before_no
             None,                            # before_yes (taken up front)
@@ -630,53 +529,38 @@ class TestNoLegExceptionDisambiguation:
             result = _execute_one(client, make_spec())
         assert result.status == "manual_review"
         assert "delta=None" in result.error
-        assert client.create_order_without_preload_content.call_count == 1
+        assert post.call_count == 1
         assert client.get_positions_without_preload_content.call_count == 3
         sleep.assert_not_called()
 
 
 class TestYesLegExceptionDisambiguation:
-    """The YES leg raised: same delta protocol, but never auto-rollback on
-    unknown. Same-title default, so the YES leg is TICK-B (market_b)."""
+    """The YES leg (TICK-B) raised: judged by the position change, and never
+    unwound on a change the order cannot explain."""
 
     @pytest.fixture(autouse=True)
-    def _use_legacy(self, legacy_mode):
-        """Exercises the legacy submission path's exception handling."""
+    def _use_v2(self, v2_mapping_confirmed):
+        """The V2 NO-leg mapping is already confirmed, as on a second trade, so
+        the NO leg's fill costs no extra position read."""
 
-    def test_delta_of_our_yes_buy_is_executed(self):
-        # YES leg raises but the position moved by exactly +spec.y — the pair
-        # actually completed; rolling back NO leg would REVERSE the hedge.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            TimeoutError("timeout"),  # YES leg raises after actually filling
-        ])
-        client.get_positions_without_preload_content = positions_seq(
-            None,              # before_no
-            None,              # before_yes
-            ("TICK-B", 5),     # after_yes — moved by +5 == spec.y
-        )
-        result = _execute_one(client, make_spec(x=5))
-        assert result.status == "executed"
-        # No rollback order was submitted
-        assert client.create_order_without_preload_content.call_count == 2
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
 
-    def test_external_yes_position_unchanged_rolls_back(self, monkeypatch):
-        # HEADLINE REGRESSION (BS-01): the account already holds 5 YES
-        # contracts on TICK-B, and YES leg did NOT fill. The old truthiness
-        # check (`if held_b:`) read that stale holding as our fill and
-        # reported "executed", leaving NO leg unhedged and the log claiming a
-        # complete pair. The delta is 0, so NO leg must be rolled back.
-        # RE-PINNED (DR-63) from a three-entry script: a zero delta is only a
-        # confirmed non-fill once the LAG RE-READ has also come back zero, so
-        # the genuine-non-fill case scripts a fourth, still-unmoved reading.
+    def test_external_yes_position_unchanged_rolls_back(self, post, monkeypatch):
+        # BS-01: the account already holds 5 YES on TICK-B and the YES leg did
+        # not fill. The change is 0 on both reads (DR-63), so the NO leg is
+        # rolled back
         monkeypatch.setattr(trader.time, "sleep", lambda s: None)
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
+        post.side_effect = [
+            v2_resp(5),               # NO leg
             TimeoutError("timeout"),  # YES leg raises, truly unfilled
-            order_resp("executed"),   # rollback fills
-        ])
+            v2_resp(5),               # rollback fills
+        ]
+        client = MagicMock()
         client.get_positions_without_preload_content = positions_seq(
             None,              # before_no
             ("TICK-B", 5),     # before_yes — pre-existing external position
@@ -685,30 +569,30 @@ class TestYesLegExceptionDisambiguation:
         )
         result = _execute_one(client, make_spec(x=5))
         assert result.status == "rolled_back"
-        assert client.create_order_without_preload_content.call_count == 3
+        assert post.call_count == 3
 
-    def test_no_position_at_all_rolls_back(self, monkeypatch):
-        # RE-PINNED (DR-63) from a three-entry script — the fourth reading is
-        # the lag re-read, still flat because this really is a non-fill.
+    def test_no_position_at_all_rolls_back(self, post, monkeypatch):
+        # The ticker is absent on every read, re-read included: a non-fill,
+        # so the NO leg is unwound
         monkeypatch.setattr(trader.time, "sleep", lambda s: None)
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
+        post.side_effect = [
+            v2_resp(5),               # NO leg
             TimeoutError("timeout"),  # YES leg raises, truly unfilled
-            order_resp("executed"),   # rollback fills
-        ])
+            v2_resp(5),               # rollback fills
+        ]
+        client = MagicMock()
         client.get_positions_without_preload_content = positions_seq(None, None, None, None)
         result = _execute_one(client, make_spec())
         assert result.status == "rolled_back"
 
-    def test_unexpected_delta_is_manual_review_without_rollback(self):
+    def test_unexpected_delta_is_manual_review_without_rollback(self, post):
         # The position moved by +2 but we ordered 7 — unattributable. Never
         # auto-rollback on an outcome we cannot explain.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
+        post.side_effect = [
+            v2_resp(7, 7),            # NO leg
             TimeoutError("timeout"),  # YES leg raises
-        ])
+        ]
+        client = MagicMock()
         client.get_positions_without_preload_content = positions_seq(
             None,
             ("TICK-B", 0),
@@ -718,27 +602,7 @@ class TestYesLegExceptionDisambiguation:
         assert result.status == "manual_review"
         assert "delta=2" in result.error
         # No third (rollback) order was submitted
-        assert client.create_order_without_preload_content.call_count == 2
-
-    def test_unknown_position_does_not_auto_rollback(self):
-        # YES leg raises AND the position lookup itself fails — the fill state
-        # is genuinely unknown. Auto-rolling-back here would be wrong if YES leg
-        # actually filled: it would sell the NO-leg hedge and leave a naked YES
-        # position on B while reporting "rolled_back" (which implies flat).
-        # RuntimeError is non-retryable, so api_call_with_retry fails fast and
-        # the lookup returns None on the first attempt.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            TimeoutError("timeout"),  # YES leg raises
-        ])
-        client.get_positions_without_preload_content = MagicMock(
-            side_effect=RuntimeError("lookup failed")
-        )
-        result = _execute_one(client, make_spec())
-        assert result.status == "manual_review"
-        # No rollback order was submitted — only NO leg and YES leg's attempt
-        assert client.create_order_without_preload_content.call_count == 2
+        assert post.call_count == 2
 
 
 class TestLedgerLagOnAmbiguousLegs:
@@ -774,9 +638,9 @@ class TestLedgerLagOnAmbiguousLegs:
     """
 
     @pytest.fixture(autouse=True)
-    def _use_v2(self, v2_mode, v2_mapping_confirmed):
-        """The production default path, with the NO-mapping backstop already
-        latched so it cannot consume these cases' position scripts."""
+    def _use_v2(self, v2_mapping_confirmed):
+        """The NO-mapping backstop already latched, so it cannot consume these
+        cases' position scripts."""
 
     @pytest.fixture
     def post(self, monkeypatch):
@@ -997,71 +861,6 @@ class TestPositionCountRetry:
             return_value=positions_resp()
         )
         assert _position_count(client, "TICK-A") == 0
-
-
-class TestLegacyShardGuard:
-    """The legacy /portfolio/orders endpoint has no shard-routing parameter, so
-    while it is the selected path a pair with a leg off DEFAULT_EXCHANGE_INDEX
-    must be refused BEFORE anything is submitted. Markets are tagged with their
-    shard at ingest, so this guard is the only thing standing between an
-    unreachable shard and a misrouted real-money order. The V2 path is exempt:
-    every V2 body routes itself via its own market's exchange_index."""
-
-    def test_both_legs_default_shard_is_routable(self):
-        assert _legacy_routable(make_spec(shard_a=0, shard_b=0)) is True
-
-    def test_leg_a_off_default_shard_is_not_routable(self):
-        assert _legacy_routable(make_spec(shard_a=1, shard_b=0)) is False
-
-    def test_leg_b_off_default_shard_is_not_routable(self):
-        assert _legacy_routable(make_spec(shard_a=0, shard_b=1)) is False
-
-    def test_both_legs_off_default_shard_is_not_routable(self):
-        assert _legacy_routable(make_spec(shard_a=2, shard_b=2)) is False
-
-    def test_routable_check_is_gated_on_config_constant(self):
-        # Not a hardcoded 0 that would silently diverge from config.py.
-        assert _legacy_routable(
-            make_spec(shard_a=DEFAULT_EXCHANGE_INDEX, shard_b=DEFAULT_EXCHANGE_INDEX)
-        ) is True
-
-    def test_legacy_mode_off_shard_spec_fails_before_any_submission(
-        self, legacy_mode
-    ):
-        client = MagicMock()
-        result = _execute_one(client, make_spec(shard_b=1))
-        assert result.status == "failed", (
-            'nothing was submitted, so there is nothing to unwind — "failed" '
-            "is the correct status vocabulary, not manual_review"
-        )
-        assert "shard" in result.error
-        # The guard must run BEFORE anything reaches either order path
-        client.create_order_without_preload_content.assert_not_called()
-        client.rest_client.request.assert_not_called()
-
-    def test_legacy_mode_default_shard_spec_proceeds(self, legacy_mode):
-        # Sanity: the guard must not block the ordinary single-shard case.
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg
-            order_resp("executed"),   # YES leg
-        ])
-        result = _execute_one(client, make_spec(shard_a=0, shard_b=0))
-        assert result.status == "executed"
-        assert client.create_order_without_preload_content.call_count == 2
-
-    def test_v2_mode_off_shard_spec_proceeds(
-        self, v2_mode, v2_mapping_confirmed, monkeypatch
-    ):
-        # V2 bodies carry their own market's shard, so an off-shard pair is
-        # perfectly routable there — the guard must not fire.
-        post = MagicMock(side_effect=[v2_resp(5), v2_resp(5)])
-        monkeypatch.setattr(trader, "signed_request_json", post)
-        client = MagicMock()
-        result = _execute_one(client, make_spec(shard_a=1))
-        assert result.status == "executed"
-        assert post.call_count == 2
-        assert post.call_args_list[0].kwargs["body"]["exchange_index"] == 1
 
 
 class TestCentsToCenticents:
@@ -1467,14 +1266,9 @@ class TestEnsureShardCollateral:
         assert post.call_count == 1
 
     def test_transfer_path_bypasses_the_retry_wrapper_entirely(self):
-        # Structural guarantee, not just a call count — but asserted PER
-        # FUNCTION, not as a module-wide import ban. trader.py legitimately
-        # imports api_call_with_retry for the read-only position lookups in
-        # _position_count (a GET cannot duplicate a trade, and an unretried
-        # transient 429 there escalates a resolvable ambiguity into a rollback
-        # or manual_review). What must never be retried is the state-changing
-        # side: the two submission paths and the non-idempotent transfer POST.
-        for fn in (trader._submit_order, trader._submit_order_v2, trader._execute_transfer):
+        # Checked per function: order and transfer POSTs never go through the
+        # retry wrapper, while the read-only position lookup does
+        for fn in (trader._submit_order_v2, trader._execute_transfer):
             assert not _calls_retry_wrapper(fn), (
                 f"{fn.__name__} must not be wrapped in retry/backoff — "
                 "a retried submission can double-fill and a retried transfer "
@@ -1483,6 +1277,14 @@ class TestEnsureShardCollateral:
         # The asymmetry is deliberate and is itself pinned: the read-only
         # position lookup DOES retry (see TestPositionCountRetry).
         assert _calls_retry_wrapper(trader._position_count)
+
+    def test_order_submission_call_sites_bypass_the_retry_wrapper(self):
+        # Neither caller of _submit_order_v2 retries it
+        for fn in (trader._execute_one, trader._rollback_no_leg):
+            assert not _calls_retry_wrapper(fn), (
+                f"{fn.__name__} must not wrap an order submission in "
+                "retry/backoff — a retried order POST can fill twice"
+            )
 
     def test_cross_shard_spec_funds_both_legs_shards(self, monkeypatch):
         # Legs on different shards: BOTH must be covered or the pair is a
@@ -1533,36 +1335,33 @@ class TestV2PriceMath:
         assert price == Decimal("1") - (Decimal("0.40") + BUY_SLIPPAGE_TICKS * Decimal("0.01"))
         assert price == Decimal("0.59")
 
-    def test_linear_cent_cap_equals_legacy_one_cent_slippage(self):
-        # On a 1c-grid market the V2 cap must be exactly the legacy intent:
-        # scanned price + $0.01 per contract, i.e. the same total buy_max_cost.
+    def test_linear_cent_cap_is_one_cent_above_the_scanned_price(self):
+        # On a 1c grid the cap is the price rounded up to the cent plus
+        # BUY_SLIPPAGE_TICKS cents
         market = make_market("linear_cent")
         price = _v2_limit_price("buy_yes", 0.35, market)
+        cap_cents = math.ceil(round(0.35 * 100, 6)) + BUY_SLIPPAGE_TICKS
         for count in (1, 5, 17):
-            assert price * count * 100 == _buy_max_cost_cents(count, 0.35)
+            assert price * count * 100 == count * cap_cents
 
     def test_v2_float_noise_does_not_loosen_the_cap(self):
-        # 1.0 - 0.43 == 0.5700000000000001: the cap must be 0.58 (one tick of
-        # slippage), not 0.59 — the V2 twin of the legacy round-before-ceil
-        # guard pinned by test_float_noise_does_not_loosen_the_cap (TS-03).
+        # 1.0 - 0.43 is 0.5700000000000001; the cap must still be 0.58, not
+        # 0.59 (TS-03)
         market = make_market("linear_cent")
         assert _v2_limit_price("buy_yes", 1.0 - 0.43, market) == Decimal("0.58")
         # buy_no: NO price 0.30000000000000004 -> cap 0.31 -> YES-book ask 0.69
         assert _v2_limit_price("buy_no", 1.0 - 0.70, market) == Decimal("0.69")
 
-    def test_v2_cap_parity_with_legacy_over_every_whole_cent_bid(self):
-        # Every scanned ask is 1.0 - float(bid), so walk all 99 whole-cent bids
-        # in exactly the form scanner._bids_to_ask_levels produces and require
-        # the V2 cap to equal the legacy one-cent cap to the cent.
+    def test_linear_cent_cap_is_one_cent_above_every_whole_cent_ask(self):
+        # For every whole-cent bid, the ask 1.0 - bid gets a cap of that ask
+        # rounded up to the cent plus BUY_SLIPPAGE_TICKS cents
         market = make_market("linear_cent")
         for cents in range(2, 100):
             p = 1.0 - cents / 100          # the exact form the scanner produces
             cap = _v2_limit_price("buy_yes", p, market)
-            assert cap * 100 == _buy_max_cost_cents(1, p), cents
-        # cents == 1 (scanned 0.99) is the one deliberate divergence and is NOT
-        # float noise: the legacy cap is $1.00, which is a settlement value and
-        # not a tradeable level, so the V2 cap clamps to the top of this
-        # market's grid. That clamp is stricter, which is the allowed direction.
+            assert cap * 100 == math.ceil(round(p * 100, 6)) + BUY_SLIPPAGE_TICKS, cents
+        # Except 0.99: one cent above it is $1.00, not a tradeable level, so
+        # the cap is the top of the grid
         assert _v2_limit_price("buy_yes", 1.0 - 0.01, market) == Decimal("0.99")
 
     def test_deci_cent_cap_moves_one_deci_cent_not_one_cent(self):
@@ -1632,20 +1431,16 @@ class TestV2OrderBuilders:
         assert body["price"] == "0.3600"
 
     def test_rollback_is_reduce_only_bid_at_the_loss_floored_price(self):
-        # Closing a held NO position is buying the YES short back — a bid —
-        # and reduce_only keeps it from ever opening new exposure. The price is
-        # NOT a flat top-of-grid bid: it is the legacy limit sell's loss floor
-        # mirrored onto the YES book. Default spec nA=0.40 -> floor 40-12=28c
-        # -> bid cap 1 - 0.28 = 0.72.
+        # The unwind is a reduce-only YES bid capped at 1 - the NO loss floor:
+        # nA=0.40 -> floor 40-12=28c -> cap 0.72
         body = _build_rollback_order_v2(_no_leg(make_spec()))
         assert body["ticker"] == "TICK-A"
         assert body["side"] == "bid"
         assert body["reduce_only"] is True
         assert body["price"] == "0.7200"
 
-    def test_rollback_price_is_the_yes_book_mirror_of_the_legacy_floor(self):
-        # One bound, two expressions — this is the invariant that keeps the two
-        # order paths from diverging in how much loss an unwind may realize.
+    def test_rollback_price_is_the_yes_book_mirror_of_the_loss_floor(self):
+        # The bid cap is 1 - the NO loss floor
         for nA in (0.40, 0.57, 0.62, 0.85):
             spec = make_spec(nA=nA)
             floor_cents = _rollback_floor_cents(_no_leg(spec))
@@ -1704,13 +1499,72 @@ class TestV2OrderBuilders:
             make_market("center_deci_edge_centi_cent", CENTER_DECI_EDGE_CENTI_BANDS)
         ) == Decimal("0.9999")
 
-    def test_all_legs_fill_or_kill(self):
+    def test_buy_legs_fill_or_kill_and_the_unwind_immediate_or_cancel(self):
+        # The two buy legs fill in full or not at all. The unwind is
+        # reduce_only, which the V2 endpoint accepts only with
+        # immediate_or_cancel, so it closes what it can and cancels the rest.
         spec = make_spec()
-        for body in (
-            _build_no_order_v2(_no_leg(spec)), _build_yes_order_v2(_yes_leg(spec)), _build_rollback_order_v2(_no_leg(spec)),
-        ):
-            assert body["time_in_force"] == "fill_or_kill"
+        no_body = _build_no_order_v2(_no_leg(spec))
+        yes_body = _build_yes_order_v2(_yes_leg(spec))
+        rollback_body = _build_rollback_order_v2(_no_leg(spec))
+        assert no_body["time_in_force"] == "fill_or_kill"
+        assert yes_body["time_in_force"] == "fill_or_kill"
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
+        assert rollback_body["reduce_only"] is True
+        for body in (no_body, yes_body, rollback_body):
             assert body["post_only"] is False
+
+    # Every value the V2 create-order endpoint documents for the fields it
+    # requires (https://docs.kalshi.com/api-reference/orders/create-order-v2).
+    # A body missing one is rejected with HTTP 400.
+    _V2_REQUIRED_FIELDS = {
+        "ticker", "side", "count", "price", "time_in_force", "self_trade_prevention_type",
+    }
+    _V2_SIDES = {"bid", "ask"}
+    _V2_TIME_IN_FORCE = {"fill_or_kill", "good_till_canceled", "immediate_or_cancel"}
+    _V2_SELF_TRADE_PREVENTION = {"taker_at_cross", "maker"}
+
+    @staticmethod
+    def _all_v2_bodies(spec) -> list[dict]:
+        """The three V2 bodies _execute_one can send for one spec."""
+        return [
+            _build_no_order_v2(_no_leg(spec)),
+            _build_yes_order_v2(_yes_leg(spec)),
+            _build_rollback_order_v2(_no_leg(spec)),
+        ]
+
+    def test_every_v2_body_carries_the_documented_required_fields(self):
+        for spec in (make_spec(), TestTimeSeriesLegOrder._ts_spec()):
+            for body in self._all_v2_bodies(spec):
+                assert self._V2_REQUIRED_FIELDS <= body.keys()
+                assert body["side"] in self._V2_SIDES
+                assert body["time_in_force"] in self._V2_TIME_IN_FORCE
+                assert body["self_trade_prevention_type"] in self._V2_SELF_TRADE_PREVENTION
+
+    def test_reduce_only_only_with_immediate_or_cancel(self):
+        # The docs, verbatim: "Orders with reduce_only set to true will be
+        # rejected unless time_in_force is immediate_or_cancel."
+        for structure, bands in (
+            ("linear_cent", None),
+            ("deci_cent", DECI_CENT_BANDS),
+            ("center_deci_edge_centi_cent", CENTER_DECI_EDGE_CENTI_BANDS),
+        ):
+            for spec in (
+                make_spec(structure=structure, ranges=bands),
+                TestTimeSeriesLegOrder._ts_spec(structure=structure, ranges=bands),
+            ):
+                for body in self._all_v2_bodies(spec):
+                    assert (
+                        not body["reduce_only"]
+                        or body["time_in_force"] == "immediate_or_cancel"
+                    )
+
+    def test_self_trade_prevention_type_comes_from_config(self, monkeypatch):
+        # The builders read the module binding of the config constant, so a
+        # change there reaches every V2 body.
+        monkeypatch.setattr(trader, "V2_SELF_TRADE_PREVENTION_TYPE", "maker")
+        for body in self._all_v2_bodies(make_spec()):
+            assert body["self_trade_prevention_type"] == "maker"
 
     def test_each_leg_carries_its_own_markets_shard(self):
         # Per-leg routing: a pair's two legs can live on different shards, so
@@ -1727,6 +1581,20 @@ class TestV2OrderBuilders:
         assert rollback_body["exchange_index"] == 2
         for body in (no_body, yes_body, rollback_body):
             assert body["exchange_index"] != -1
+
+    def test_an_off_default_shard_pair_is_submitted_on_each_legs_own_shard(
+        self, v2_mapping_confirmed, monkeypatch
+    ):
+        # A leg off DEFAULT_EXCHANGE_INDEX is traded normally, each order on
+        # its own market's shard
+        post = MagicMock(side_effect=[v2_resp(5), v2_resp(5)])
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        client = MagicMock()
+        result = _execute_one(client, make_spec(shard_a=1))
+        assert result.status == "executed"
+        assert post.call_count == 2
+        assert post.call_args_list[0].kwargs["body"]["exchange_index"] == 1
+        assert post.call_args_list[1].kwargs["body"]["exchange_index"] == DEFAULT_EXCHANGE_INDEX
 
     def test_default_shard_spec_carries_the_default_exchange_index(self):
         # The universal case today: everything is on DEFAULT_EXCHANGE_INDEX.
@@ -1773,9 +1641,10 @@ class TestV2FillStatus:
         assert _v2_fill_status({"order": {"fill_count_fp": "0.00"}}, 10) == "canceled"
 
     def test_partial_fill_raises_for_ambiguous_path(self):
-        # A partial fill violates the fill-or-kill invariant, so the fill state
-        # is not trustworthy — raising routes _execute_one into the position
-        # lookup instead of reporting a clean fill or a clean kill.
+        # A partial fill is neither a clean fill nor a clean kill, so it raises.
+        # On a buy leg (fill-or-kill) that routes _execute_one into the
+        # position lookup; on the immediate-or-cancel unwind, _rollback_no_leg
+        # reports it as rollback_failed.
         with pytest.raises(ValueError):
             _v2_fill_status({"order": {"fill_count": 4}}, 10)
 
@@ -1792,14 +1661,156 @@ class TestV2FillStatus:
         assert _v2_fill_status({"fill_count": 10}, 10) == "executed"
 
 
+class TestIsFokKill:
+    """_is_fok_kill recognises exactly one response: HTTP 409 whose JSON body
+    carries the fill-or-kill kill code under ["error"]["code"]."""
+
+    def test_the_exchanges_kill_response_is_a_kill(self):
+        assert _is_fok_kill(fok_kill_error()) is True
+
+    def test_a_bytes_body_is_read_as_utf_8(self):
+        exc = ApiException(status=409, reason="Conflict", body=FOK_KILL_BODY.encode())
+        assert _is_fok_kill(exc) is True
+
+    def test_the_sdk_exception_for_a_409_response_is_a_kill(self):
+        # The exception the live transport really raises: _check_and_parse
+        # hands a 409 to ApiException.from_response, which raises the SDK's
+        # ConflictException subclass with the decoded body.
+        resp = SimpleNamespace(
+            status=409, reason="Conflict", data=FOK_KILL_BODY.encode("utf-8"),
+            getheaders=lambda: {"content-type": "application/json"},
+        )
+        with pytest.raises(ApiException) as exc_info:
+            _http._check_and_parse(resp)
+        assert type(exc_info.value) is not ApiException
+        assert _is_fok_kill(exc_info.value) is True
+
+    @pytest.mark.parametrize("exc", [
+        ApiException(status=409, reason="Conflict", body=None),
+        ApiException(status=409, reason="Conflict"),
+        ApiException(
+            status=409, reason="Conflict",
+            body='{"error":{"code":"insufficient_balance","message":"x"}}',
+        ),
+        ApiException(status=400, reason="Bad Request", body=FOK_KILL_BODY),
+        ApiException(status=409, reason="Conflict", body="not json"),
+        ApiException(status=409, reason="Conflict", body=""),
+        ApiException(status=409, reason="Conflict", body=b"\xff\xfe"),
+        ApiException(status=409, reason="Conflict", body=json.dumps([FOK_KILL_BODY])),
+        ApiException(
+            status=409, reason="Conflict",
+            body='{"error":"fill_or_kill_insufficient_resting_volume"}',
+        ),
+        ApiException(
+            status=409, reason="Conflict",
+            body='{"code":"fill_or_kill_insufficient_resting_volume"}',
+        ),
+        ApiException(status=409, reason="Conflict", body=123),
+        ApiException(status="409", reason="Conflict", body=FOK_KILL_BODY),
+        Exception(FOK_KILL_BODY),
+        TimeoutError("timeout"),
+    ], ids=[
+        "none-body", "no-body", "another-code", "status-400", "non-json",
+        "empty-body", "non-utf8-bytes", "json-list", "error-not-object",
+        "code-not-under-error", "int-body", "string-status", "plain-exception",
+        "timeout",
+    ])
+    def test_anything_else_is_not_a_kill(self, exc):
+        assert _is_fok_kill(exc) is False
+
+    def test_an_exception_that_is_not_an_api_exception_is_not_a_kill(self):
+        # Carrying the kill's status and body is not enough: only the SDK's
+        # ApiException comes from the exchange's HTTP response.
+        exc = Exception("look-alike")
+        exc.status = 409
+        exc.body = FOK_KILL_BODY
+        assert _is_fok_kill(exc) is False
+
+    def test_a_subclass_with_another_status_is_not_a_kill(self):
+        # The SDK's own 400 subclass carrying the kill code is still not the
+        # kill: the status and the code must both match.
+        from kalshi_python_sync.exceptions import BadRequestException
+        exc = BadRequestException(status=400, reason="Bad Request", body=FOK_KILL_BODY)
+        assert _is_fok_kill(exc) is False
+
+    def test_the_constants_are_the_observed_response(self):
+        # The wire values the exchange sent; config is the one place they live.
+        assert config.V2_FOK_KILL_HTTP_STATUS == 409
+        assert config.V2_FOK_KILL_ERROR_CODE == "fill_or_kill_insufficient_resting_volume"
+
+
+class TestSubmitOrderV2KillResponse:
+    """_submit_order_v2 returns the kill response to a fill_or_kill body as
+    "canceled", single-shot, and re-raises every other error."""
+
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
+
+    @pytest.mark.parametrize("builder, leg", [
+        (_build_no_order_v2, _no_leg), (_build_yes_order_v2, _yes_leg),
+    ], ids=["no-leg", "yes-leg"])
+    def test_a_killed_fill_or_kill_is_canceled(self, post, caplog, builder, leg):
+        body = builder(leg(make_spec()))
+        assert body["time_in_force"] == "fill_or_kill"
+        post.side_effect = fok_kill_error()
+        with caplog.at_level(logging.INFO):
+            assert _submit_order_v2(MagicMock(), body) == "canceled"
+        # One POST: the kill is an answer, never a reason to resubmit
+        assert post.call_count == 1
+        kill_lines = [r for r in caplog.records if "killed by the exchange" in r.getMessage()]
+        assert len(kill_lines) == 1
+        assert kill_lines[0].levelno == logging.INFO
+        line = kill_lines[0].getMessage()
+        for part in (
+            "409", "fill_or_kill_insufficient_resting_volume", body["ticker"],
+            body["side"], body["price"], body["count"], body["client_order_id"],
+        ):
+            assert part in line
+        # Nothing at WARNING or above: a kill is routine
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_the_same_response_to_the_unwind_raises(self, post):
+        # The immediate_or_cancel unwind never gets the fill-or-kill reading:
+        # an error on it stays an error, which _rollback_no_leg reports as
+        # rollback_failed.
+        body = _build_rollback_order_v2(_no_leg(make_spec()))
+        assert body["time_in_force"] == "immediate_or_cancel"
+        err = fok_kill_error()
+        post.side_effect = err
+        with pytest.raises(ApiException) as exc_info:
+            _submit_order_v2(MagicMock(), body)
+        assert exc_info.value is err
+        assert post.call_count == 1
+
+    @pytest.mark.parametrize("err", [
+        ApiException(
+            status=409, reason="Conflict",
+            body='{"error":{"code":"insufficient_balance","message":"x"}}',
+        ),
+        ApiException(status=400, reason="Bad Request", body=FOK_KILL_BODY),
+        ApiException(status=500, reason="Internal Server Error"),
+    ], ids=["409-another-code", "400-kill-code", "500"])
+    def test_any_other_error_raises(self, post, err):
+        post.side_effect = err
+        with pytest.raises(ApiException) as exc_info:
+            _submit_order_v2(MagicMock(), _build_no_order_v2(_no_leg(make_spec())))
+        assert exc_info.value is err
+        assert post.call_count == 1
+
+
 class TestV2ExecuteOne:
-    """The full legacy outcome matrix, replayed against the V2 order path."""
+    """_execute_one's outcomes: every status, how many orders are sent, and
+    the unwind's body."""
 
     @pytest.fixture(autouse=True)
-    def _use_v2(self, v2_mode, v2_mapping_confirmed):
-        """V2 path, with the NO-leg backstop already latched: these cases test
-        the state machine, not the first-fill mapping check, and must not have
-        their position mocks consumed by it."""
+    def _use_v2(self, v2_mapping_confirmed):
+        """The NO-leg backstop already latched: these cases test the state
+        machine, not the first-fill mapping check, and must not have their
+        position mocks consumed by it."""
 
     @pytest.fixture
     def post(self, monkeypatch):
@@ -1831,6 +1842,10 @@ class TestV2ExecuteOne:
         assert rollback_body["ticker"] == "TICK-A"
         assert rollback_body["side"] == "bid"
         assert rollback_body["reduce_only"] is True
+        # reduce_only is accepted only with immediate_or_cancel, and every V2
+        # body carries the required self-trade-prevention field
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
+        assert rollback_body["self_trade_prevention_type"] == "taker_at_cross"
         # Loss-floored, not a flat top-of-grid bid: default spec nA=0.40 ->
         # floor 40-12=28c -> bid cap 1 - 0.28 = 0.72 on the $0.01 grid
         assert rollback_body["price"] == "0.7200"
@@ -1840,6 +1855,27 @@ class TestV2ExecuteOne:
         result = _execute_one(MagicMock(), make_spec())
         assert result.status == "rollback_failed"
         assert "rollback FoK not filled" in result.error
+
+    def test_v2_partial_unwind_is_rollback_failed(self, post, caplog):
+        # The immediate-or-cancel unwind closes 3 of the 5 NO contracts and
+        # cancels the rest. That is never reported as flat: the fill count
+        # makes _v2_fill_status raise, _rollback_no_leg reports
+        # rollback_failed, and no second order is sent. Its alert and the
+        # error text name the exact count still open, 5 - 3 = 2, read from the
+        # unwind's own response, not the "up to 5" said when it is unknown.
+        post.side_effect = [v2_resp(5), v2_resp(0), v2_resp(3)]
+        with caplog.at_level(logging.CRITICAL):
+            result = _execute_one(MagicMock(), make_spec())
+        assert result.status == "rollback_failed"
+        assert "fill_count=3" in result.error
+        assert result.error.endswith("; 2 of 5 NO contracts still open")
+        assert post.call_count == 3
+        orphan = [r.getMessage() for r in caplog.records
+                  if r.levelno == logging.CRITICAL and "ORPHANED POSITION" in r.getMessage()]
+        assert len(orphan) == 1
+        assert "closed 3 of the 5 NO contracts this pair bought on TICK-A," in orphan[0]
+        assert "so 2 of them are still open" in orphan[0]
+        assert "up to" not in orphan[0]
 
     def test_v2_leg_a_exception_with_position_is_unwound(self, post):
         post.side_effect = [TimeoutError("timeout"), v2_resp(5)]
@@ -1879,14 +1915,60 @@ class TestV2ExecuteOne:
         assert post.call_count == 2
 
     def test_v2_leg_b_exception_with_unknown_position_is_manual_review(self, post):
+        # The read failed, so the state is unknown: no rollback. The call
+        # count and sleeps also check the read runs outside the except block,
+        # where the TimeoutError context would make the retry wrapper retry it
         post.side_effect = [v2_resp(5), TimeoutError("timeout")]
         client = MagicMock()
         client.get_positions_without_preload_content = MagicMock(
             side_effect=RuntimeError("lookup failed")
         )
-        result = _execute_one(client, make_spec())
+        with patch.object(_http.time, "sleep") as sleep:
+            result = _execute_one(client, make_spec())
         assert result.status == "manual_review"
         assert post.call_count == 2
+        # The two up-front baselines and one read after the YES leg raised
+        assert client.get_positions_without_preload_content.call_count == 3
+        sleep.assert_not_called()
+
+    def test_v2_leg_a_kill_response_is_failed_at_once(self, post, monkeypatch, caplog):
+        # The exchange's HTTP 409 kill of the NO leg is a confirmed non-fill:
+        # the pair ends "failed" with no position read after the submission
+        # and no pause, and nothing is logged at ERROR.
+        slept: list = []
+        monkeypatch.setattr(trader.time, "sleep", lambda s: slept.append(s))
+        post.side_effect = [fok_kill_error()]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(None, None)
+        with caplog.at_level(logging.INFO):
+            result = _execute_one(client, make_spec())
+        assert result.status == "failed"
+        assert result.error == "NO leg FoK not filled: status=canceled"
+        assert post.call_count == 1
+        # The two up-front baselines only
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert slept == []
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_v2_leg_b_kill_response_rolls_back_at_once(self, post, monkeypatch):
+        # The exchange's HTTP 409 kill of the YES leg goes straight to the
+        # unwind: no position read after the submission and no pause before
+        # the rollback, which is immediate_or_cancel as always.
+        slept: list = []
+        monkeypatch.setattr(trader.time, "sleep", lambda s: slept.append(s))
+        post.side_effect = [v2_resp(5), fok_kill_error(), v2_resp(5)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(None, None)
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+        assert result.error == "YES leg FoK not filled: status=canceled"
+        assert post.call_count == 3
+        rollback_body = post.call_args_list[2].kwargs["body"]
+        assert rollback_body["ticker"] == "TICK-A"
+        assert rollback_body["reduce_only"] is True
+        assert rollback_body["time_in_force"] == "immediate_or_cancel"
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert slept == []
 
     def test_v2_exactly_one_post_per_leg_no_retry_on_5xx(self, post, monkeypatch):
         # A 5xx on an order submission must NEVER be retried: a second FoK
@@ -1899,35 +1981,330 @@ class TestV2ExecuteOne:
         assert result.status == "failed"
         assert post.call_count == 1
 
+    def test_the_sdk_create_order_endpoint_is_never_called(self, post):
+        # All three orders go through signed_request_json; the SDK's
+        # create-order methods are never called
+        post.side_effect = [v2_resp(5), v2_resp(0), v2_resp(5)]
+        client = MagicMock()
+        assert _execute_one(client, make_spec()).status == "rolled_back"
+        assert post.call_count == 3
+        for call in post.call_args_list:
+            assert call.args[1:] == ("POST", V2_ORDER_PATH)
+        for name in ("create_order", "create_order_without_preload_content",
+                     "batch_create_orders", "batch_create_orders_without_preload_content"):
+            getattr(client, name).assert_not_called()
 
-class TestV2NoMappingBackstop:
-    """_V2_LEG_SIDE's NO-leg mapping (an `ask` on the YES book OPENS a NO
-    position) is doc-derived and unverifiable offline, so the first V2 NO-leg
-    fill of a process must prove it: the account position has to MOVE by
-    exactly -no_leg.count across the fill (Kalshi's ledger is signed — a long
-    NO reads negative). Any other movement disproves the mapping, and the pair
-    stops at manual_review with the YES leg unsubmitted and the NO leg
-    deliberately left in place. These cases use the same-title default, so the
-    NO leg is TICK-A; TestTimeSeriesLegOrder replays the check on TICK-B. The
-    latch is shared across pair types — it proves the exchange's side mapping,
-    not a market.
 
-    The evidence is the DELTA against _execute_one's up-front NO-leg baseline,
-    never the absolute holding — the same rule the rest of the module's
-    ambiguity handling follows. The two regression cases below pin why: an
-    external LONG position fakes a disproof under an absolute-sign test, and an
-    external SHORT one masks a real disproof.
+class TestPartialUnwindCount:
+    """How many NO contracts a failed V2 unwind leaves open, as its alert says.
 
-    The backstop's own read is SINGLE-SHOT (_position_count_once), unlike the
-    two baselines around it, because it sits in the window where NO leg is
-    filled and unhedged. Both readers call the same client method, so the
-    call-count assertions below still count every read on one mock; what
-    changes is that the backstop's read never retries."""
+    The V2 unwind is immediate_or_cancel, so its 2xx response can report a
+    fill count strictly between zero and the NO leg's count: it closed that
+    many and left nothing resting. _rollback_no_leg reads that count from the
+    body _submit_order_v2 attaches to its error and names the exact number
+    still open (count minus fill). Every other failure leaves the number
+    unknown and the alert says "up to" the count. Either way the pair is
+    rollback_failed and no further order is sent. The two buy legs keep
+    raising on a partial fill into _execute_one's position check.
+    """
 
     @pytest.fixture(autouse=True)
-    def _use_v2(self, v2_mode):
-        """V2 path with the latch left False — the state a fresh process is in
-        on its first trade (the module-level fixture resets it)."""
+    def _use_v2(self, v2_mapping_confirmed):
+        """NO-leg mapping already latched (see TestV2ExecuteOne)."""
+
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
+
+    @pytest.fixture
+    def slept(self, monkeypatch):
+        """Every pause _execute_one takes, recorded instead of slept."""
+        pauses: list = []
+        monkeypatch.setattr(trader.time, "sleep", pauses.append)
+        return pauses
+
+    @staticmethod
+    def _orphan_alerts(caplog) -> list[str]:
+        """The CRITICAL lines that report an orphaned NO position."""
+        return [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.CRITICAL and "ORPHANED POSITION" in r.getMessage()
+        ]
+
+    def _unwind(self, post, caplog, rollback_reply, spec=None):
+        """Run one pair whose NO leg fills, whose YES leg is killed, and whose
+        unwind answers with `rollback_reply` (a body, or an exception to
+        raise). Returns the result and the client, whose position reads are
+        scripted for the two up-front baselines only."""
+        post.side_effect = [v2_resp(5), v2_resp(0), rollback_reply]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(None, None)
+        with caplog.at_level(logging.CRITICAL):
+            result = _execute_one(client, spec or make_spec())
+        return result, client
+
+    @pytest.mark.parametrize(
+        "body, closed, still_open",
+        [
+            pytest.param({"order": {"fill_count": 1}}, "1", "4", id="int-1"),
+            pytest.param({"order": {"fill_count": 4}}, "4", "1", id="int-4"),
+            pytest.param({"order": {"fill_count_fp": "3.00"}}, "3", "2", id="fp-string"),
+            # A flat body, not wrapped under "order"
+            pytest.param({"fill_count_fp": "3.00"}, "3", "2", id="flat"),
+            # Fractional contracts are counted exactly
+            pytest.param({"order": {"fill_count_fp": "2.50"}}, "2.5", "2.5", id="fractional"),
+            pytest.param({"order": {"fill_count_fp": "0.01"}}, "0.01", "4.99", id="one-hundredth"),
+            # The _fp field wins when both are present, as in _v2_fill_status
+            pytest.param(
+                {"order": {"fill_count_fp": "1.00", "fill_count": 4}}, "1", "4",
+                id="fp-over-int",
+            ),
+        ],
+    )
+    def test_a_partial_close_names_the_exact_count_still_open(
+        self, post, caplog, slept, body, closed, still_open,
+    ):
+        result, client = self._unwind(post, caplog, body)
+        assert result.status == "rollback_failed"
+        assert result.error.startswith(
+            "YES leg FoK not filled: status=canceled; rollback error: "
+            "Unclassifiable V2 order response: fill_count="
+        )
+        assert result.error.endswith(f"; {still_open} of 5 NO contracts still open")
+        (alert,) = self._orphan_alerts(caplog)
+        assert (
+            f"closed {closed} of the 5 NO contracts this pair bought on TICK-A,"
+            f" so {still_open} of them are still open"
+        ) in alert
+        assert "check the account" in alert
+        assert "up to" not in alert
+        # No further order, no position read after the unwind, and no pause
+        assert post.call_count == 3
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert slept == []
+
+    def test_a_time_series_partial_close_names_market_b(self, post, caplog, slept):
+        # For a time-series pair the NO leg is market_b, so the unwind — and
+        # its alert — are on TICK-B.
+        result, client = self._unwind(
+            post, caplog, v2_resp(2), spec=make_spec(pair_type="time_series"),
+        )
+        assert result.status == "rollback_failed"
+        assert post.call_args_list[2].kwargs["body"]["ticker"] == "TICK-B"
+        (alert,) = self._orphan_alerts(caplog)
+        assert "closed 2 of the 5 NO contracts this pair bought on TICK-B" in alert
+        assert "so 3 of them are still open" in alert
+        assert result.error.endswith("; 3 of 5 NO contracts still open")
+        assert post.call_count == 3
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert slept == []
+
+    def test_a_partial_close_after_an_ambiguous_no_leg_is_counted_too(
+        self, post, caplog, slept,
+    ):
+        # The other way into the unwind: the NO leg's submission raised, and
+        # the ledger moved by exactly -5, our NO buy. The partial unwind is
+        # counted the same way, with no further order or read after it.
+        post.side_effect = [TimeoutError("read timed out"), v2_resp(2)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(
+            None, None, ("TICK-A", -5),
+        )
+        with caplog.at_level(logging.CRITICAL):
+            result = _execute_one(client, make_spec())
+        assert result.status == "rollback_failed"
+        assert result.error.startswith("NO leg ambiguous error: read timed out;")
+        assert result.error.endswith("; 3 of 5 NO contracts still open")
+        (alert,) = self._orphan_alerts(caplog)
+        assert "closed 2 of the 5 NO contracts this pair bought on TICK-A" in alert
+        assert post.call_count == 2
+        assert client.get_positions_without_preload_content.call_count == 3
+        assert slept == []
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            # 2xx objects whose fill count is unreadable or impossible: they
+            # reach the count reader, which finds nothing it can use
+            pytest.param({"order": {"order_id": "ord-1"}}, id="no-count"),
+            pytest.param({"order": {"fill_count": 7}}, id="over-count"),
+            pytest.param({"order": {"fill_count": -1}}, id="negative"),
+            pytest.param({"order": {"fill_count": "three"}}, id="not-a-number"),
+            pytest.param({"order": {"fill_count": True}}, id="bool"),
+            pytest.param({"order": {"fill_count_fp": "NaN"}}, id="nan"),
+            pytest.param({"order": {"fill_count_fp": "Infinity"}}, id="infinity"),
+            pytest.param({"order": [{"fill_count": 3}]}, id="order-not-an-object"),
+            # Counts the default 28-digit decimal precision would round: never
+            # printed as an exact count that is wrong or a line that is huge
+            pytest.param(
+                {"order": {"fill_count_fp": "4.9999999999999999999999999999999"}},
+                id="too-many-digits",
+            ),
+            pytest.param({"order": {"fill_count_fp": "1E-40"}}, id="tiny"),
+            pytest.param({"order": {"fill_count_fp": "1E-999999999"}}, id="underflow"),
+            # Replies that fail before the count reader: the classifier raises
+            # something other than its ValueError (a signalling NaN), the body
+            # is not a JSON object or not JSON at all, the exchange answered
+            # with an error (the 409 kill is read as a clean non-fill only on
+            # a fill_or_kill body, and the unwind is not one), or the
+            # connection failed
+            pytest.param({"order": {"fill_count_fp": "sNaN"}}, id="signalling-nan"),
+            pytest.param([{"fill_count": 3}], id="list-body"),
+            pytest.param("accepted", id="string-body"),
+            pytest.param(3, id="number-body"),
+            pytest.param(None, id="null-body"),
+            pytest.param(JSONDecodeError("Expecting value", "", 0), id="not-json"),
+            pytest.param(ApiException(status=400, reason="Bad Request"), id="http-400"),
+            pytest.param(ApiException(status=500, reason="Server Error"), id="http-500"),
+            pytest.param(fok_kill_error(), id="http-409-kill"),
+            pytest.param(TimeoutError("read timed out"), id="timeout"),
+            pytest.param(ConnectionError("connection reset"), id="connection-error"),
+        ],
+    )
+    def test_an_unknown_count_still_says_up_to(self, post, caplog, slept, reply):
+        result, client = self._unwind(post, caplog, reply)
+        assert result.status == "rollback_failed"
+        assert result.error.startswith(
+            "YES leg FoK not filled: status=canceled; rollback error: "
+        )
+        assert "still open" not in result.error
+        (alert,) = self._orphan_alerts(caplog)
+        assert "up to 5 NO contracts on TICK-A" in alert
+        assert "still open" not in alert
+        assert len(alert) < 1000
+        assert post.call_count == 3
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert slept == []
+
+    def test_a_carried_body_that_is_not_an_object_still_says_up_to(
+        self, monkeypatch, caplog,
+    ):
+        # The reader checks the carried body's type rather than assuming it:
+        # an error carrying something other than a dict leaves the count
+        # unknown.
+        submitted: list = []
+
+        def submit(client, order, *, pace=None):
+            submitted.append(order)
+            raise trader._UnclassifiableV2Response("unclassifiable", [{"fill_count": 3}])
+
+        monkeypatch.setattr(trader, "_submit_order_v2", submit)
+        with caplog.at_level(logging.CRITICAL):
+            result = trader._rollback_no_leg(
+                MagicMock(), make_spec(), _no_leg(make_spec()), "YES leg failed",
+            )
+        assert result.status == "rollback_failed"
+        (alert,) = self._orphan_alerts(caplog)
+        assert "up to 5 NO contracts on TICK-A" in alert
+        assert len(submitted) == 1
+
+    def test_a_count_that_cannot_be_compared_still_says_up_to(
+        self, monkeypatch, caplog,
+    ):
+        # Reading the count never costs the orphan alert: a NO-leg count that
+        # a Decimal refuses to compare with (numpy's int64 here) falls back to
+        # "up to" instead of raising out of _rollback_no_leg.
+        np = pytest.importorskip("numpy")
+        submitted: list = []
+
+        def submit(client, order, *, pace=None):
+            submitted.append(order)
+            raise trader._UnclassifiableV2Response("unclassifiable", v2_resp(3))
+
+        monkeypatch.setattr(trader, "_submit_order_v2", submit)
+        spec = make_spec()
+        leg = dataclasses.replace(_no_leg(spec), count=np.int64(5))
+        with caplog.at_level(logging.CRITICAL):
+            result = trader._rollback_no_leg(MagicMock(), spec, leg, "YES leg failed")
+        assert result.status == "rollback_failed"
+        (alert,) = self._orphan_alerts(caplog)
+        assert "up to 5 NO contracts on TICK-A" in alert
+        assert len(submitted) == 1
+
+    def test_a_zero_fill_names_the_full_count(self, post, caplog):
+        # A 2xx fill count of zero is a clean "canceled", not an unknown: the
+        # unwind closed nothing, so all 5 are open, and the alert says so.
+        result, _ = self._unwind(post, caplog, {"order": {"fill_count_fp": "0.00"}})
+        assert result.status == "rollback_failed"
+        assert result.error == (
+            "YES leg FoK not filled: status=canceled; rollback FoK not filled:"
+            " status=canceled"
+        )
+        (alert,) = self._orphan_alerts(caplog)
+        assert "ROLLBACK NOT FILLED (status=canceled)" in alert
+        assert "5 NO contracts on TICK-A" in alert
+        assert "up to" not in alert
+
+    def test_a_full_fill_is_rolled_back(self, post, caplog):
+        result, _ = self._unwind(post, caplog, {"order": {"fill_count_fp": "5.00"}})
+        assert result.status == "rolled_back"
+        assert self._orphan_alerts(caplog) == []
+
+    def test_a_partial_fill_error_carries_the_response(self, post):
+        # _submit_order_v2 re-raises _v2_fill_status's error with the body
+        # attached. It is still a ValueError with the same message, so a buy
+        # leg's caller sees the error it always did.
+        body = v2_resp(3)
+        post.return_value = body
+        with pytest.raises(ValueError) as exc_info:
+            _submit_order_v2(MagicMock(), _build_rollback_order_v2(_no_leg(make_spec())))
+        err = exc_info.value
+        assert isinstance(err, trader._UnclassifiableV2Response)
+        assert err.response is body
+        assert str(err) == "Unclassifiable V2 order response: fill_count=3, requested=5"
+        assert type(err.__cause__) is ValueError
+
+    def test_the_carrying_error_survives_copy_and_pickle(self):
+        err = trader._UnclassifiableV2Response("unclassifiable", {"order": {"fill_count": 3}})
+        for clone in (copy.copy(err), copy.deepcopy(err), pickle.loads(pickle.dumps(err))):
+            assert type(clone) is trader._UnclassifiableV2Response
+            assert str(clone) == "unclassifiable"
+            assert clone.response == {"order": {"fill_count": 3}}
+
+    def test_a_partial_no_leg_fill_is_still_judged_by_the_position(self, post):
+        # A partial fill on the NO leg (a fill-or-kill buy) is not a partial
+        # unwind: it raises into the position check, which cannot attribute
+        # a -3 move to a 5-contract order, so nothing further is sent.
+        post.side_effect = [v2_resp(3)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(
+            None, None, ("TICK-A", -3),
+        )
+        result = _execute_one(client, make_spec())
+        assert result.status == "manual_review"
+        assert "fill_count=3" in result.error
+        assert post.call_count == 1
+
+    def test_a_partial_yes_leg_fill_is_never_rolled_back(self, post):
+        # A partial fill on the YES leg must not read as a non-fill: the
+        # position moved +3, which this 5-contract order cannot explain, so
+        # the NO leg is left in place for a human rather than unwound.
+        post.side_effect = [v2_resp(5), v2_resp(3)]
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(
+            None, None, ("TICK-B", 3),
+        )
+        result = _execute_one(client, make_spec())
+        assert result.status == "manual_review"
+        assert "fill_count=3" in result.error
+        assert post.call_count == 2
+
+
+
+class TestV2NoMappingBackstop:
+    """_confirm_v2_no_mapping: on a process's first V2 NO fill, the NO leg's
+    position must change by exactly -no_leg.count (a held NO reads negative).
+    Any other change stops the pair at manual_review, with the YES leg not
+    sent and the NO leg left in place. The change is measured from
+    _execute_one's NO baseline, never the holding: an existing long position
+    must not fake a disproof, nor a short one hide a real one. The check's own
+    read is single-shot (_position_count_once) but uses the same client
+    method, so call counts include it. Same-title default, so the NO leg is
+    TICK-A (TestTimeSeriesLegOrder covers TICK-B); each case starts with the
+    latch False, as a fresh process does."""
 
     @pytest.fixture
     def post(self, monkeypatch):
@@ -1982,6 +2359,7 @@ class TestV2NoMappingBackstop:
         assert result.status == "manual_review"
         assert "mapping disproven" in result.error
         assert any(r.levelno == logging.CRITICAL for r in caplog.records)
+        assert_disproof_names_the_remedy(caplog)
         assert trader._V2_NO_MAPPING_CONFIRMED is False
         # YES leg was never submitted, so a false confirmation cannot have latched
         assert post.call_count == 1
@@ -2023,6 +2401,7 @@ class TestV2NoMappingBackstop:
         assert result.status == "manual_review"
         assert "mapping disproven" in result.error
         assert any(r.levelno == logging.CRITICAL for r in caplog.records)
+        assert_disproof_names_the_remedy(caplog)
         # A disproven mapping must NOT latch — nothing was confirmed
         assert trader._V2_NO_MAPPING_CONFIRMED is False
 
@@ -2173,94 +2552,167 @@ class TestV2NoMappingBackstop:
         assert client.get_positions_without_preload_content.call_count == 6
         assert trader._V2_NO_MAPPING_CONFIRMED is True
 
-    def test_legacy_mode_never_consults_positions_on_a_fill(self, legacy_mode):
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"), order_resp("executed"),
-        ])
-        assert _execute_one(client, make_spec()).status == "executed"
-        # The backstop verifies the V2 mapping; on the legacy path there is
-        # nothing to verify, and an extra positions read would be pure cost.
-        # The two up-front ambiguity baselines are path-independent, so exactly
-        # those two reads happen and no third.
-        assert client.get_positions_without_preload_content.call_count == 2
-        assert trader._V2_NO_MAPPING_CONFIRMED is False
 
+class TestV2IsTheOnlyOrderPath:
+    """Syntax-tree checks over the package that keep the retired
+    /portfolio/orders endpoint out: no name contains "createorder" (ignoring
+    underscores and case), only config.py reads ORDER_API_VERSION, and no
+    non-docstring string starts with "/portfolio/orders" or
+    "/trade-api/v2/portfolio/orders". Comments and docstrings do not count.
+    Each finder is first run on sample snippets so it cannot pass by seeing
+    nothing."""
 
-class TestOrderVersionDispatch:
-    def test_rollback_dispatcher_floors_the_loss_on_both_paths(self, monkeypatch):
-        # _build_rollback_order_any must never hand back an UNPRICED order on
-        # either path: an unwind with no proceeds bound realizes an unbounded
-        # loss on a book that collapsed since NO leg filled. One bound, two
-        # expressions — the legacy NO sell prices AT the floor, the V2 YES
-        # buy-back caps at its mirror (1 - floor).
-        spec = make_spec(nA=0.62)
-        floor_cents = _rollback_floor_cents(_no_leg(spec))
+    # Modules the walk must find: a moved package or an empty glob fails
+    # rather than passing vacuously
+    _EXPECTED = {
+        "config.py", "trader.py", "main.py", "scanner.py", "strategy.py",
+        "v2_probe.py", "_http.py", "auth.py",
+    }
 
-        monkeypatch.setattr(trader, "ORDER_API_VERSION", "legacy")
-        legacy = _build_rollback_order_any(_no_leg(spec))
-        assert legacy.type == "limit"          # never "market" — no floor there
-        assert legacy.no_price == floor_cents
-        assert legacy.reduce_only is True
-        assert legacy.time_in_force == "fill_or_kill"
+    @classmethod
+    def _modules(cls) -> dict[str, ast.Module]:
+        package = Path(inspect.getsourcefile(trader)).parent
+        found = {
+            path.name: ast.parse(path.read_text(encoding="utf-8"))
+            for path in sorted(package.glob("*.py"))
+        }
+        assert cls._EXPECTED <= found.keys(), sorted(found)
+        return found
 
-        monkeypatch.setattr(trader, "ORDER_API_VERSION", "v2")
-        v2 = _build_rollback_order_any(_no_leg(spec))
-        assert v2["side"] == "bid"
-        assert v2["reduce_only"] is True
-        assert v2["time_in_force"] == "fill_or_kill"
-        assert v2["price"] == _format_price(
-            Decimal("1") - Decimal(floor_cents) / Decimal("100")
-        )
+    @staticmethod
+    def _names_and_strings(tree: ast.AST):
+        """Every identifier in the code (names, attributes, imports and
+        aliases), plus the attribute name a getattr/setattr/hasattr/delattr
+        call passes as a string."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                yield node.id
+            elif isinstance(node, ast.Attribute):
+                yield node.attr
+            elif isinstance(node, ast.ImportFrom):
+                yield node.module or ""
+                for alias in node.names:
+                    yield alias.name
+                    yield alias.asname or ""
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    yield alias.name
+                    yield alias.asname or ""
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                  and node.func.id in {"getattr", "setattr", "hasattr", "delattr"}
+                  and len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
+                  and isinstance(node.args[1].value, str)):
+                yield node.args[1].value
 
-    def test_legacy_mode_uses_create_order_endpoint_unchanged(self, legacy_mode, monkeypatch):
-        posted = MagicMock()
-        monkeypatch.setattr(trader, "signed_request_json", posted)
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"), order_resp("executed"),
-        ])
-        result = _execute_one(client, make_spec())
-        assert result.status == "executed"
-        assert client.create_order_without_preload_content.call_count == 2
-        # The V2 route is never touched on the rollback path
-        posted.assert_not_called()
+    @classmethod
+    def _create_order_uses(cls, tree: ast.AST) -> list[str]:
+        """Every name containing "createorder", ignoring underscores and case
+        (CreateOrderRequest, create_order*, batch_create_orders*)."""
+        return [
+            name for name in cls._names_and_strings(tree)
+            if "createorder" in name.replace("_", "").lower()
+        ]
 
-    def test_v2_mode_never_touches_legacy_endpoint(
-        self, v2_mode, v2_mapping_confirmed, monkeypatch
-    ):
-        posted = MagicMock(side_effect=[v2_resp(5), v2_resp(5)])
-        monkeypatch.setattr(trader, "signed_request_json", posted)
-        client = MagicMock()
-        result = _execute_one(client, make_spec())
-        assert result.status == "executed"
-        assert client.create_order_without_preload_content.call_count == 0
+    @classmethod
+    def _order_api_version_uses(cls, tree: ast.AST) -> list[str]:
+        return [name for name in cls._names_and_strings(tree) if name == "ORDER_API_VERSION"]
 
-    def test_config_default_is_v2(self):
-        # The default must be V2; "legacy" is only ever a deliberate rollback.
-        assert config.ORDER_API_VERSION == "v2"
-        assert trader.ORDER_API_VERSION == "v2"
+    # The retired endpoint's path, in the two spellings a request could use
+    _RETIRED_ORDER_PATHS = ("/trade-api/v2/portfolio/orders", "/portfolio/orders")
 
+    @staticmethod
+    def _docstring_ids(tree: ast.AST) -> set[int]:
+        """ids of the string constants that are docstrings: the first
+        statement of a module, class or function, when it is a bare string."""
+        found = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                first = node.body[0] if node.body else None
+                if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                        and isinstance(first.value.value, str)):
+                    found.add(id(first.value))
+        return found
 
-class TestDropLegacyUnroutable:
-    """Regression (adversarial review): on the legacy path, unroutable specs
-    must be dropped BEFORE collateral moves — never funded and then refused."""
+    @classmethod
+    def _retired_order_path_strings(cls, tree: ast.AST) -> list[str]:
+        """Every non-docstring string constant (f-string pieces included)
+        that starts, after leading whitespace, with the retired path."""
+        docstrings = cls._docstring_ids(tree)
+        return [
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and id(node) not in docstrings
+            and node.value.lstrip().startswith(cls._RETIRED_ORDER_PATHS)
+        ]
 
-    def test_v2_mode_is_a_no_op(self, v2_mode):
-        portfolio = [make_spec(shard_a=0, shard_b=3)]
-        assert trader.drop_legacy_unroutable(portfolio) == portfolio
+    def test_the_finders_see_every_shape(self):
+        for snippet in (
+            "from kalshi_python_sync.models import CreateOrderRequest",
+            "from kalshi_python_sync.models.create_order_request import X",
+            "import kalshi_python_sync.models.create_order_request",
+            "client.create_order_without_preload_content(create_order_request=o)",
+            "client.batch_create_orders(orders)",
+            "f = getattr(client, 'create_order')",
+            "CreateOrderRequest(ticker='T')",
+        ):
+            assert self._create_order_uses(ast.parse(snippet)), snippet
+        for snippet in (
+            "from .config import ORDER_API_VERSION",
+            "from .config import OTHER as ORDER_API_VERSION",
+            "from .config import ORDER_API_VERSION as other",
+            "if config.ORDER_API_VERSION != 'v2': pass",
+            "x = ORDER_API_VERSION",
+            "getattr(config, 'ORDER_API_VERSION')",
+        ):
+            assert self._order_api_version_uses(ast.parse(snippet)), snippet
+        # Words in a docstring or comment are not code
+        prose = ast.parse('"""create_order and CreateOrderRequest, ORDER_API_VERSION"""\n# create_order')
+        assert not self._create_order_uses(prose)
+        assert not self._order_api_version_uses(prose)
 
-    def test_legacy_mode_drops_off_shard_specs_with_a_warning(self, legacy_mode, caplog):
-        keep = make_spec(shard_a=0, shard_b=0, title="routable")
-        drop = make_spec(shard_a=0, shard_b=1, title="off-shard")
-        with caplog.at_level(logging.WARNING):
-            kept = trader.drop_legacy_unroutable([keep, drop])
-        assert kept == [keep]
-        assert "before collateral funding" in caplog.text
+    def test_no_module_reaches_the_sdk_create_order_surface(self):
+        hits = {
+            name: uses for name, tree in self._modules().items()
+            if (uses := self._create_order_uses(tree))
+        }
+        assert hits == {}
 
-    def test_legacy_mode_keeps_default_shard_specs(self, legacy_mode):
-        portfolio = [make_spec(shard_a=0, shard_b=0)]
-        assert trader.drop_legacy_unroutable(portfolio) == portfolio
+    def test_only_config_references_order_api_version(self):
+        referencing = {
+            name for name, tree in self._modules().items()
+            if self._order_api_version_uses(tree)
+        }
+        # config.py itself must be found
+        assert referencing == {"config.py"}
+
+    def test_the_retired_path_finder_sees_every_shape(self):
+        for snippet in (
+            'PATH = "/portfolio/orders"',
+            'signed_request_json(client, "POST", "/trade-api/v2/portfolio/orders", body=b)',
+            'url = f"/portfolio/orders/{order_id}"',
+            'x = "  /portfolio/orders/batched"',
+            'def f():\n    """Doc."""\n    return "/portfolio/orders"',
+        ):
+            assert self._retired_order_path_strings(ast.parse(snippet)), snippet
+        # A docstring naming the path is prose, not a request path
+        for snippet in (
+            '"""/portfolio/orders is retired."""',
+            'def f():\n    """/portfolio/orders is retired."""',
+            'class C:\n    """/trade-api/v2/portfolio/orders"""',
+        ):
+            assert not self._retired_order_path_strings(ast.parse(snippet)), snippet
+        # The startup check's message names the path mid-string, so it is
+        # not a hit
+        source = textwrap.dedent(inspect.getsource(config.order_api_version_error))
+        assert "/portfolio/orders" in source
+        assert not self._retired_order_path_strings(ast.parse(source))
+
+    def test_no_code_string_spells_the_retired_order_path(self):
+        hits = {
+            name: paths for name, tree in self._modules().items()
+            if (paths := self._retired_order_path_strings(tree))
+        }
+        assert hits == {}
 
 
 class TestSettleAwaitTargeting:
@@ -2597,12 +3049,10 @@ class TestPreExecutionCheckSettings:
 
 
 class TestSameTitleWireIdentity:
-    """Same-title orders must be BYTE-IDENTICAL to what the trader sent before
-    the time-series leg inversion: every field of every V2 body (except the
-    random client_order_id) and every field of every legacy request, pinned as
-    the literal values today's builders produce for make_spec()'s default
-    (x=5, nA=0.40, pB=0.35, shard 0). A same_title pair still buys NO on
-    market_a and YES on market_b, so nothing here may move."""
+    """Every field (except the random client_order_id) of the three V2
+    bodies built for make_spec()'s default same-title spec (x=5, nA=0.40,
+    pB=0.35, shard 0), as literal values: NO on market_a, YES on market_b,
+    and a reduce-only immediate_or_cancel unwind."""
 
     def test_v2_bodies_are_unchanged(self):
         spec = make_spec()
@@ -2613,36 +3063,25 @@ class TestSameTitleWireIdentity:
             uuid.UUID(body.pop("client_order_id"))
         assert no_body == {
             "ticker": "TICK-A", "side": "ask", "price": "0.5900", "count": "5.00",
-            "time_in_force": "fill_or_kill", "exchange_index": 0,
+            "time_in_force": "fill_or_kill",
+            "self_trade_prevention_type": "taker_at_cross", "exchange_index": 0,
             "reduce_only": False, "post_only": False,
         }
         assert yes_body == {
             "ticker": "TICK-B", "side": "bid", "price": "0.3600", "count": "5.00",
-            "time_in_force": "fill_or_kill", "exchange_index": 0,
+            "time_in_force": "fill_or_kill",
+            "self_trade_prevention_type": "taker_at_cross", "exchange_index": 0,
             "reduce_only": False, "post_only": False,
         }
         assert rollback_body == {
             "ticker": "TICK-A", "side": "bid", "price": "0.7200", "count": "5.00",
-            "time_in_force": "fill_or_kill", "exchange_index": 0,
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross", "exchange_index": 0,
             "reduce_only": True, "post_only": False,
         }
 
-    def test_legacy_requests_are_unchanged(self, legacy_mode):
-        spec = make_spec()
-        no = _build_no_order(_no_leg(spec))
-        assert (no.ticker, no.side, no.action, no.type, no.count, no.time_in_force,
-                no.buy_max_cost) == ("TICK-A", "no", "buy", "market", 5, "fill_or_kill", 205)
-        yes = _build_yes_order(_yes_leg(spec))
-        assert (yes.ticker, yes.side, yes.action, yes.type, yes.count,
-                yes.time_in_force, yes.buy_max_cost) == (
-            "TICK-B", "yes", "buy", "market", 5, "fill_or_kill", 180)
-        rb = _build_rollback_order_any(_no_leg(spec))
-        assert (rb.ticker, rb.side, rb.action, rb.type, rb.no_price, rb.count,
-                rb.time_in_force, rb.reduce_only) == (
-            "TICK-A", "no", "sell", "limit", 28, 5, "fill_or_kill", True)
-
     def test_same_title_baselines_read_market_a_then_market_b(
-        self, v2_mode, v2_mapping_confirmed, monkeypatch
+        self, v2_mapping_confirmed, monkeypatch
     ):
         # Nothing used to pin the ORDER of the two baseline reads; now that the
         # NO leg can be either market, pin it for both pair types (the
@@ -2662,13 +3101,10 @@ class TestSameTitleWireIdentity:
 
 
 class TestTimeSeriesLegOrder:
-    """A time_series pair buys NO on the LATER contract (market_b) and YES on
-    the EARLIER one (market_a), and the NO leg is always submitted first — so
-    for this pair type the whole state machine runs "backwards" across the
-    markets: TICK-B is submitted first, baselined first, unwound on failure,
-    and is the market the V2 NO-mapping backstop reads. Every expected price is
-    derived the way TestV2PriceMath / TestOrderPriceProtection derive theirs,
-    from the leg's own scanned price, never from nA/pB."""
+    """A time_series pair buys NO on the later contract (market_b) and YES on
+    the earlier one (market_a), so TICK-B is sent first, read first, unwound
+    on failure and checked by the NO-mapping check. Expected prices come from
+    each leg's own scanned price, as in TestV2PriceMath."""
 
     @staticmethod
     def _ts_spec(**overrides) -> MagicMock:
@@ -2707,7 +3143,7 @@ class TestTimeSeriesLegOrder:
             _no_leg(self._ts_spec()).count = 99
 
     def test_v2_submits_no_on_market_b_then_yes_on_market_a(
-        self, v2_mode, v2_mapping_confirmed, post
+        self, v2_mapping_confirmed, post
     ):
         post.side_effect = [v2_resp(5), v2_resp(5)]
         spec = self._ts_spec()
@@ -2729,7 +3165,7 @@ class TestTimeSeriesLegOrder:
         for body in (first, second):
             assert body["reduce_only"] is False and body["exchange_index"] != -1
 
-    def test_baselines_read_market_b_then_market_a(self, v2_mode, v2_mapping_confirmed, post):
+    def test_baselines_read_market_b_then_market_a(self, v2_mapping_confirmed, post):
         post.side_effect = [v2_resp(5), v2_resp(5)]
         tickers: list[str] = []
 
@@ -2743,7 +3179,7 @@ class TestTimeSeriesLegOrder:
         assert tickers == ["TICK-B", "TICK-A"]
 
     def test_yes_leg_kill_rolls_back_the_no_leg_on_market_b(
-        self, v2_mode, v2_mapping_confirmed, post
+        self, v2_mapping_confirmed, post
     ):
         post.side_effect = [v2_resp(5), v2_resp(0), v2_resp(5)]
         spec = self._ts_spec()
@@ -2761,7 +3197,7 @@ class TestTimeSeriesLegOrder:
         )
 
     def test_no_leg_kill_is_failed_before_anything_touches_market_a(
-        self, v2_mode, v2_mapping_confirmed, post
+        self, v2_mapping_confirmed, post
     ):
         post.side_effect = [v2_resp(0)]
         result = _execute_one(MagicMock(), self._ts_spec())
@@ -2771,7 +3207,7 @@ class TestTimeSeriesLegOrder:
         assert post.call_args_list[0].kwargs["body"]["ticker"] == "TICK-B"
 
     def test_no_leg_exception_delta_is_judged_on_market_b(
-        self, v2_mode, v2_mapping_confirmed, post
+        self, v2_mapping_confirmed, post
     ):
         # The NO leg raised after actually filling: the delta on TICK-B (not
         # TICK-A) is -y, so the NO leg is unwound on TICK-B.
@@ -2785,35 +3221,7 @@ class TestTimeSeriesLegOrder:
         assert _execute_one(client, self._ts_spec()).status == "rolled_back"
         assert post.call_args_list[1].kwargs["body"]["ticker"] == "TICK-B"
 
-    def test_legacy_path_submits_no_on_market_b_then_yes_on_market_a(self, legacy_mode):
-        # Both legs on DEFAULT_EXCHANGE_INDEX: the legacy endpoint routes
-        # nothing else, and this case is about leg ORDER, not the shard guard.
-        spec = self._ts_spec(shard_a=0, shard_b=0)
-        client = MagicMock()
-        client.create_order_without_preload_content = MagicMock(side_effect=[
-            order_resp("executed"),   # NO leg on TICK-B
-            order_resp("canceled"),   # YES leg on TICK-A rejected
-            order_resp("executed"),   # rollback on TICK-B fills
-        ])
-        client.get_positions_without_preload_content = positions_seq(None, None)
-        assert _execute_one(client, spec).status == "rolled_back"
-        reqs = [
-            c.kwargs["create_order_request"]
-            for c in client.create_order_without_preload_content.call_args_list
-        ]
-        assert (reqs[0].ticker, reqs[0].side, reqs[0].action, reqs[0].count) == (
-            "TICK-B", "no", "buy", spec.y)
-        assert reqs[0].buy_max_cost == _buy_max_cost_cents(spec.y, 0.40)
-        assert (reqs[1].ticker, reqs[1].side, reqs[1].action, reqs[1].count) == (
-            "TICK-A", "yes", "buy", spec.x)
-        assert reqs[1].buy_max_cost == _buy_max_cost_cents(spec.x, 0.30)
-        assert (reqs[2].ticker, reqs[2].side, reqs[2].action, reqs[2].type) == (
-            "TICK-B", "no", "sell", "limit")
-        assert reqs[2].no_price == 40 - ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT
-        assert reqs[2].count == spec.y
-        assert reqs[2].reduce_only is True
-
-    def test_backstop_reads_market_b_and_confirms(self, v2_mode, post):
+    def test_backstop_reads_market_b_and_confirms(self, post):
         post.side_effect = [v2_resp(5), v2_resp(5)]
         readings = iter([positions_resp(), positions_resp(), positions_resp("TICK-B", -5)])
         tickers: list[str] = []
@@ -2831,7 +3239,7 @@ class TestTimeSeriesLegOrder:
         assert trader._V2_NO_MAPPING_CONFIRMED is True
         assert post.call_count == 2
 
-    def test_backstop_disproof_on_market_b_stops_after_one_post(self, v2_mode, post, caplog):
+    def test_backstop_disproof_on_market_b_stops_after_one_post(self, post, caplog):
         post.side_effect = [v2_resp(5), v2_resp(5), v2_resp(5)]
         client = MagicMock(get_positions_without_preload_content=positions_seq(
             None, None, ("TICK-B", 5),   # flat -> +5 on TICK-B: the ask opened YES
@@ -2841,6 +3249,7 @@ class TestTimeSeriesLegOrder:
         assert result.status == "manual_review"
         assert "mapping disproven" in result.error and "TICK-B" in result.error
         assert any(r.levelno == logging.CRITICAL for r in caplog.records)
+        assert_disproof_names_the_remedy(caplog)
         assert trader._V2_NO_MAPPING_CONFIRMED is False
         # Only the NO leg went out — no YES leg, no unwind
         assert post.call_count == 1
@@ -3095,3 +3504,1110 @@ class TestNonObject2xxTransferResponse:
         with caplog.at_level(logging.CRITICAL):
             assert _execute_transfer(MagicMock(), 0, 1, 9662) is None
         assert [r for r in caplog.records if r.levelno == logging.CRITICAL] == []
+
+
+class _FakeClock:
+    """A clock and a wait for driving a _WritePacer from one thread.
+
+    Each wait moves the clock on by its timeout. A wait with no timeout would
+    never end in one thread, so it fails the test instead of hanging.
+    """
+
+    def __init__(self, start: float = 0.0):
+        self.now = start
+        self.waited: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def wait(self, timeout) -> None:
+        if timeout is None:
+            raise AssertionError("the pacer would wait forever for a held write to end")
+        self.waited.append(timeout)
+        self.now += timeout
+
+
+def _fake_pacer(rate, burst, clock: _FakeClock) -> _WritePacer:
+    """A _WritePacer on a single-thread fake clock."""
+    return _WritePacer(rate, burst, clock=clock.monotonic, wait=clock.wait)
+
+
+class _SimStuck(BaseException):
+    """Raised in every simulated thread once the simulation cannot move on
+    (a BaseException, so no `except Exception` in trader turns it into a
+    trade result)."""
+
+
+class _SimCondition(threading.Condition):
+    """The simulation's condition: notify_all() counts every blocked thread as
+    running until it blocks again."""
+
+    def __init__(self, sim: "_SimTime"):
+        super().__init__()
+        self._sim = sim
+
+    def notify_all(self) -> None:
+        self._sim._blocked.clear()
+        super().notify_all()
+
+
+class _SimTime:
+    """Simulated time for threads that block only through wait() (the
+    pacer's) or sleep() (a round trip, a pause).
+
+    Time stands still while any thread runs and jumps to the earliest
+    deadline once all are blocked, so times are exact. Threads woken together
+    run in OS order, so tests check times, not which thread got which.
+    `tasks` pieces of work run on `workers` threads, and each task calls
+    done() when it ends. The pacer must share `cond` (see _sim_pacer).
+    """
+
+    REAL_LIMIT_SECONDS = 10.0
+
+    def __init__(self, tasks: int, workers: int | None = None):
+        self.now = 0.0
+        self.cond = _SimCondition(self)
+        self._tasks = tasks
+        self._workers = tasks if workers is None else workers
+        self._blocked: dict[int, float] = {}
+        self.stuck = False
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def done(self) -> None:
+        """One task has ended."""
+        with self.cond:
+            self._tasks -= 1
+            self._advance_if_all_blocked()
+
+    def wait(self, timeout) -> None:
+        """The pacer's wait: called with self.cond held."""
+        self._block(math.inf if timeout is None else self.now + timeout)
+
+    def sleep(self, seconds: float) -> None:
+        with self.cond:
+            deadline = self.now + seconds
+            while self.now < deadline:
+                self._block(deadline)
+
+    def _block(self, deadline: float) -> None:
+        if self.stuck:
+            raise _SimStuck
+        me = threading.get_ident()
+        self._blocked[me] = deadline
+        if self._advance_if_all_blocked():
+            return
+        if not self.cond.wait(self.REAL_LIMIT_SECONDS):
+            self.stuck = True
+            self.cond.notify_all()
+        self._blocked.pop(me, None)
+        if self.stuck:
+            raise _SimStuck
+
+    def _advance_if_all_blocked(self) -> bool:
+        running = min(self._workers, self._tasks)
+        if not self._blocked or len(self._blocked) < running:
+            return False
+        nxt = min(self._blocked.values())
+        if nxt == math.inf:
+            self.stuck = True          # everyone waits on someone: deadlock
+        else:
+            self.now = max(self.now, nxt)
+        self.cond.notify_all()
+        return True
+
+
+def _sim_pacer(rate, burst, sim: _SimTime) -> _WritePacer:
+    """A _WritePacer running in the simulation's time."""
+    pacer = _WritePacer(rate, burst, clock=sim.monotonic, wait=sim.wait)
+    pacer._cond = sim.cond
+    return pacer
+
+
+def _run_sim_threads(sim: _SimTime, bodies) -> None:
+    """Run each body on its own thread in the simulation and wait for all."""
+    errors: list[BaseException] = []
+
+    def run(body):
+        try:
+            body()
+        except BaseException as exc:   # noqa: BLE001 — reported below
+            errors.append(exc)
+        finally:
+            sim.done()
+
+    threads = [threading.Thread(target=run, args=(b,)) for b in bodies]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not sim.stuck, "the simulation stopped: every thread was waiting for another"
+    assert errors == []
+
+
+def _assert_within_bucket(send_times, rate, burst) -> None:
+    """No stretch of time holds more than burst + rate * (its length) sends."""
+    times = sorted(send_times)
+    for i in range(len(times)):
+        for j in range(i, len(times)):
+            assert j - i + 1 <= burst + rate * (times[j] - times[i]) + 1e-6, (
+                f"{j - i + 1} sends in {times[j] - times[i]:.4f}s: {times}"
+            )
+
+
+class TestWritePacer:
+    """The bucket itself: `burst` writes back to back, then one per 1/rate s,
+    first come, first served within a lane."""
+
+    def test_the_first_burst_does_not_wait(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        assert [pacer.acquire() for _ in range(3)] == [0.0, 0.0, 0.0]
+        assert clock.waited == []
+
+    def test_the_next_caller_waits_one_over_the_rate(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        for _ in range(3):
+            pacer.acquire()
+        assert pacer.acquire() == pytest.approx(0.25)
+        assert clock.waited == [pytest.approx(0.25)]
+
+    def test_a_caller_after_the_line_drains_waits_only_its_own_turn(self):
+        # The 4th arrives after the 3rd was served, so it waits one 1/rate, not two
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 2, clock)
+        assert [pacer.acquire(), pacer.acquire()] == [0.0, 0.0]
+        assert pacer.acquire() == pytest.approx(0.25)
+        assert pacer.acquire() == pytest.approx(0.25)
+        assert clock.now == pytest.approx(0.5)
+
+    def test_tokens_refill_with_elapsed_time(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        for _ in range(3):
+            pacer.acquire()
+        clock.now = 0.5          # half a second at 4 a second refills 2 tokens
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == pytest.approx(0.25)
+
+    def test_the_refill_stops_at_the_burst(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        pacer.acquire()
+        clock.now = 1_000.0      # a long idle spell holds a full bucket, no more
+        assert [pacer.acquire() for _ in range(3)] == [0.0, 0.0, 0.0]
+        assert pacer.acquire() == pytest.approx(0.25)
+
+    def test_the_first_acquire_starts_the_clock(self):
+        # Refill starts from the first request's clock reading, whatever clock
+        clock = _FakeClock(start=0.0)
+        pacer = _fake_pacer(1, 2, clock)
+        assert [pacer.acquire(), pacer.acquire()] == [0.0, 0.0]
+        assert pacer.acquire() == pytest.approx(1.0)
+        clock.now = 10.0
+        assert pacer.acquire() == 0.0
+
+    @pytest.mark.parametrize(
+        "rate", [0, -1, 0.0, float("nan"), float("inf"), True, "8", None],
+    )
+    def test_an_invalid_rate_raises(self, rate):
+        with pytest.raises(ValueError, match="rate"):
+            _WritePacer(rate, 8)
+
+    @pytest.mark.parametrize("burst", [0, -1, 1, 1.5, 8.0, True, "8", None])
+    def test_an_invalid_burst_raises(self, burst):
+        # 1 too: a pair's NO leg takes two places at once
+        with pytest.raises(ValueError, match="burst"):
+            _WritePacer(8, burst)
+
+    def test_the_shipped_pacer_uses_the_config_constants(self):
+        # conftest replaces the module's pacer, so build the same call afresh
+        pacer = _WritePacer(config.ORDER_WRITES_PER_SECOND, config.ORDER_WRITE_BURST)
+        assert pacer._rate == float(config.ORDER_WRITES_PER_SECOND)
+        assert pacer._burst == float(config.ORDER_WRITE_BURST)
+        assert trader.ORDER_WRITES_PER_SECOND == config.ORDER_WRITES_PER_SECOND
+        assert trader.ORDER_WRITE_BURST == config.ORDER_WRITE_BURST
+
+    def test_the_module_pacer_is_built_from_the_config_names(self):
+        # By syntax tree: bound once, to _WritePacer(ORDER_WRITES_PER_SECOND,
+        # ORDER_WRITE_BURST), never literal numbers
+        tree = ast.parse(inspect.getsource(trader))
+        bindings = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            else:
+                continue
+            if any(isinstance(t, ast.Name) and t.id == "_ORDER_WRITE_PACER"
+                   for t in targets):
+                bindings.append(node)
+        assert len(bindings) == 1
+        (node,) = bindings
+        assert isinstance(node, ast.Assign) and len(node.targets) == 1
+        call = node.value
+        assert isinstance(call, ast.Call)
+        assert isinstance(call.func, ast.Name) and call.func.id == "_WritePacer"
+        assert [type(a) for a in call.args] == [ast.Name, ast.Name]
+        assert [a.id for a in call.args] == ["ORDER_WRITES_PER_SECOND", "ORDER_WRITE_BURST"]
+        assert call.keywords == []
+
+    def test_a_long_wait_is_logged_once(self, caplog):
+        clock = _FakeClock()
+        pacer = _fake_pacer(2, 2, clock)
+        pacer.acquire()
+        pacer.acquire()
+        with caplog.at_level(logging.INFO):
+            assert pacer.acquire() == pytest.approx(0.5)
+        lines = [r for r in caplog.records
+                 if "Paced an order or transfer write" in r.getMessage()]
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.INFO
+        assert "0.50s" in lines[0].getMessage()
+
+    def test_a_short_wait_is_not_logged(self, caplog):
+        clock = _FakeClock()
+        pacer = _fake_pacer(8, 2, clock)
+        pacer.acquire()
+        pacer.acquire()
+        with caplog.at_level(logging.INFO):
+            assert pacer.acquire() == pytest.approx(0.125)
+        assert "Paced an order or transfer write" not in caplog.text
+
+    def test_the_balance_is_read_under_the_lock_and_the_wait_is_handed_the_lock(self):
+        # The clock is read inside the locked block, and the wait hook gets
+        # the lock so Condition.wait can release it while waiting
+        clock = _FakeClock()
+        owned_at_clock: list[bool] = []
+        owned_at_wait: list[bool] = []
+
+        def locked_clock():
+            owned_at_clock.append(pacer._cond._is_owned())
+            return clock.monotonic()
+
+        def wait(timeout):
+            owned_at_wait.append(pacer._cond._is_owned())
+            clock.wait(timeout)
+
+        pacer = _WritePacer(4, 2, clock=locked_clock, wait=wait)
+        pacer.acquire()
+        pacer.acquire()
+        pacer.acquire()
+        assert owned_at_clock and all(owned_at_clock)
+        assert owned_at_wait == [True]
+
+    def test_a_caller_that_stops_waiting_leaves_the_line(self):
+        # An interrupted caller (Ctrl-C) leaves the line, or those behind wait forever
+        clock = _FakeClock()
+        interrupted = [False]
+
+        def wait(timeout):
+            if not interrupted[0]:
+                interrupted[0] = True
+                raise KeyboardInterrupt
+            clock.wait(timeout)
+
+        pacer = _WritePacer(4, 2, clock=clock.monotonic, wait=wait)
+        pacer.acquire()
+        pacer.acquire()
+        with pytest.raises(KeyboardInterrupt):
+            pacer.acquire()
+        assert not pacer._in_turn and not pacer._hedges
+        assert pacer.acquire() == pytest.approx(0.25)
+
+    def test_a_caller_that_stops_waiting_removes_its_own_place_not_another(self):
+        # Two identical waiting requests; the second stops. Only its own place
+        # may go, or the first waits forever (why _PaceRequest is eq=False).
+        sim = _SimTime(tasks=2)
+        pacer = _sim_pacer(4, 2, sim)
+        pacer.acquire()
+        pacer.acquire()                       # bucket empty at t=0
+        served: dict[str, float] = {}
+        second_arrived = threading.Event()
+
+        def first():
+            pacer.acquire()
+            served["first"] = sim.now
+
+        def second():
+            real_wait = pacer._wait
+
+            def wait_once(timeout):
+                pacer._wait = real_wait
+                second_arrived.set()
+                raise KeyboardInterrupt
+
+            with sim.cond:
+                while not pacer._in_turn:     # let the first caller join first
+                    sim.cond.wait(0.01)
+                pacer._wait = wait_once
+            try:
+                pacer.acquire()
+            except KeyboardInterrupt:
+                served["second"] = -1.0
+
+        _run_sim_threads(sim, [first, second])
+        assert second_arrived.is_set()
+        assert served == {"first": pytest.approx(0.25), "second": -1.0}
+
+    def test_a_held_write_served_just_before_its_caller_stops_goes_back(self):
+        # Served by another waiter, then stopped before getting its held write:
+        # the pacer takes the held token back
+        clock = _FakeClock()
+
+        def wait(timeout):
+            clock.wait(timeout)
+            pacer._serve(clock.now)           # served, as another waiter would
+            raise KeyboardInterrupt
+
+        pacer = _WritePacer(4, 2, clock=clock.monotonic, wait=wait)
+        pacer.acquire()
+        pacer.acquire()
+        with pytest.raises(KeyboardInterrupt):
+            pacer.acquire_with_hold()
+        assert pacer._held == 0
+        assert not pacer._in_turn
+        # The held token is back; the one for the unsent POST stays spent
+        assert pacer._tokens == pytest.approx(1.0)
+
+
+class TestHeldWrites:
+    """acquire_with_hold: a place now plus one held for later, counted
+    against the bucket until sent or released, so a late send stays in bounds."""
+
+    def test_it_takes_two_places(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 4, clock)
+        wait, held = pacer.acquire_with_hold()
+        assert wait == 0.0 and held is not None
+        assert [pacer.acquire(), pacer.acquire()] == [0.0, 0.0]
+        assert pacer.acquire() == pytest.approx(0.25)
+
+    def test_it_waits_until_two_places_are_free_together(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        pacer.acquire()
+        pacer.acquire()
+        wait, _ = pacer.acquire_with_hold()   # one token left: needs one more
+        assert wait == pytest.approx(0.25)
+
+    def test_a_held_write_is_sent_with_no_wait_on_an_empty_bucket(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 2, clock)
+        _, held = pacer.acquire_with_hold()   # both tokens gone
+        assert held.send() is True
+        assert clock.waited == []
+
+    def test_a_held_write_counts_against_the_bucket_until_it_ends(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        _, held = pacer.acquire_with_hold()
+        clock.now = 1_000.0      # refills to 3 - 1 held, not 3
+        assert [pacer.acquire(), pacer.acquire()] == [0.0, 0.0]
+        assert pacer.acquire() == pytest.approx(0.25)
+        assert held.send() is True
+        # Once sent, the refill may reach 3 again
+        clock.now += 1_000.0
+        assert [pacer.acquire() for _ in range(3)] == [0.0, 0.0, 0.0]
+
+    def test_a_held_write_sent_late_frees_its_room_only_after_the_refill(self):
+        # Hold, idle, send late, then two singles at that instant: the held
+        # send and the first single fill the burst of 2, so the second waits.
+        # Freeing the hold's room before the refill would let all three go.
+        clock = _FakeClock()
+        pacer = _fake_pacer(8, 2, clock)
+        _, held = pacer.acquire_with_hold()
+        clock.now = 10.0
+        assert held.send() is True
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == pytest.approx(0.125)
+
+    def test_a_released_write_gives_its_token_back(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 2, clock)
+        _, held = pacer.acquire_with_hold()
+        held.release()
+        assert pacer.acquire() == 0.0
+        assert pacer.acquire() == pytest.approx(0.25)
+
+    def test_a_hold_ends_once(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 4, clock)
+        _, released = pacer.acquire_with_hold()
+        released.release()
+        assert released.send() is False       # the caller must take its own place
+        released.release()                    # and a second release adds nothing
+        _, sent = pacer.acquire_with_hold()
+        assert sent.send() is True
+        assert sent.send() is False
+        sent.release()                        # a sent write is never given back
+        assert pacer._held == 0
+        assert pacer._tokens == pytest.approx(4 - 1 - 2)
+
+    def test_at_most_burst_minus_one_writes_are_ever_held(self):
+        # A hold needs two free tokens, so room never drops below one: a hedge still goes
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 3, clock)
+        pacer.acquire_with_hold()
+        clock.now += 100.0
+        pacer.acquire_with_hold()
+        assert pacer._held == 2
+        clock.now += 100.0
+        assert pacer._tokens + pacer._held <= pacer._burst
+        with pytest.raises(AssertionError, match="forever"):
+            pacer.acquire_with_hold()         # room for 1, never for 2 until a hold ends
+        assert pacer.acquire_hedge() == 0.0   # a single write still goes
+
+    def test_a_hold_waiting_for_room_is_woken_when_another_hold_ends(self):
+        sim = _SimTime(tasks=2)
+        pacer = _sim_pacer(4, 2, sim)
+        served: dict[str, float] = {}
+
+        def first():
+            _, held = pacer.acquire_with_hold()   # bucket empty, one held
+            sim.sleep(0.5)
+            held.release()
+
+        def second():
+            sim.sleep(0.1)
+            pacer.acquire_with_hold()[1].release()
+            served["second"] = sim.now
+
+        _run_sim_threads(sim, [first, second])
+        # Released at 0.5: its token plus the refill covers two at once
+        assert served["second"] == pytest.approx(0.5)
+
+    def test_a_pair_waiting_for_room_is_woken_when_a_held_write_is_sent(self):
+        # Real threads. The second pair can only wait to be woken (room for
+        # one, needs two); sending the held write (which adds no token) must
+        # still wake it.
+        pacer = _WritePacer(20, 2)
+        _, held = pacer.acquire_with_hold()
+        served = threading.Event()
+
+        def second():
+            pacer.acquire_with_hold()[1].release()
+            served.set()
+
+        thread = threading.Thread(target=second, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:     # until the second pair is in line
+            with pacer._cond:
+                if pacer._in_turn:
+                    break
+            time.sleep(0.001)
+        with pacer._cond:
+            assert list(pacer._in_turn), "the second pair never joined the line"
+        assert not served.is_set()
+        assert held.send() is True
+        assert served.wait(timeout=5.0)
+        thread.join(timeout=5.0)
+
+    @pytest.mark.parametrize("seed", range(12))
+    def test_sends_never_exceed_the_bucket_however_late_held_writes_go(self, seed):
+        # Random mixes of holds sent late or released, singles and hedges.
+        # Plans are drawn up front so a seed always replays the same plans.
+        rng = random.Random(seed)
+        rate, burst, callers = 8.0, 4, 8
+        plans = [
+            [(rng.random() * 0.3, rng.choice(["pair", "pair", "single", "hedge"]),
+              rng.random() * 2.0, rng.random() < 0.8) for _ in range(4)]
+            for _ in range(callers)
+        ]
+        sim = _SimTime(tasks=callers)
+        pacer = _sim_pacer(rate, burst, sim)
+        sends: list[float] = []
+
+        def caller(plan):
+            for pause, kind, hold_for, send in plan:
+                sim.sleep(pause)
+                if kind == "pair":
+                    _, held = pacer.acquire_with_hold()
+                    sends.append(sim.now)
+                    sim.sleep(hold_for)
+                    if send:
+                        held.send()
+                        sends.append(sim.now)
+                    else:
+                        held.release()
+                elif kind == "single":
+                    pacer.acquire()
+                    sends.append(sim.now)
+                else:
+                    pacer.acquire_hedge()
+                    sends.append(sim.now)
+
+        _run_sim_threads(sim, [lambda plan=plan: caller(plan) for plan in plans])
+        assert len(sends) >= callers * 4
+        _assert_within_bucket(sends, rate, burst)
+        assert pacer._held == 0
+
+
+class TestHedgeLane:
+    """acquire_hedge is served before every waiting in-turn caller."""
+
+    def test_a_hedge_goes_ahead_of_a_waiting_pair(self):
+        sim = _SimTime(tasks=3)
+        pacer = _sim_pacer(4, 2, sim)
+        served: dict[str, float] = {}
+
+        def holder():
+            _, held = pacer.acquire_with_hold()   # t=0: bucket empty, one held
+            sim.sleep(0.5)
+            held.send()
+
+        def pair():
+            sim.sleep(0.01)
+            pacer.acquire_with_hold()[1].send()
+            served["pair"] = sim.now
+
+        def hedge():
+            sim.sleep(0.1)
+            pacer.acquire_hedge()
+            served["hedge"] = sim.now
+
+        _run_sim_threads(sim, [holder, pair, hedge])
+        # The hedge came later but gets the next token (0.25); the pair gets
+        # room at 0.5 when the hold is sent, and two tokens at 0.75
+        assert served["hedge"] == pytest.approx(0.25)
+        assert served["pair"] == pytest.approx(0.75)
+
+    def test_without_the_hedge_lane_the_same_write_would_wait_behind_the_pair(self):
+        # Control for the test above: taken in turn, it goes after the pair
+        sim = _SimTime(tasks=3)
+        pacer = _sim_pacer(4, 2, sim)
+        served: dict[str, float] = {}
+
+        def holder():
+            _, held = pacer.acquire_with_hold()
+            sim.sleep(0.5)
+            held.send()
+
+        def pair():
+            sim.sleep(0.01)
+            pacer.acquire_with_hold()[1].send()
+            served["pair"] = sim.now
+
+        def in_turn():
+            sim.sleep(0.1)
+            pacer.acquire()
+            served["in_turn"] = sim.now
+
+        _run_sim_threads(sim, [holder, pair, in_turn])
+        assert served["pair"] == pytest.approx(0.75)
+        assert served["in_turn"] == pytest.approx(1.0)
+
+    def test_hedges_are_served_in_the_order_they_arrive(self):
+        clock = _FakeClock()
+        pacer = _fake_pacer(4, 2, clock)
+        pacer.acquire()
+        pacer.acquire()
+        assert pacer.acquire_hedge() == pytest.approx(0.25)
+        assert pacer.acquire_hedge() == pytest.approx(0.25)
+
+    def test_concurrent_callers_each_get_their_own_place(self):
+        # 20 callers at once get 20 distinct places (a lost update repeats a wait)
+        rate, burst, callers = 4, 3, 20
+        sim = _SimTime(tasks=callers)
+        pacer = _sim_pacer(rate, burst, sim)
+        waits: list[float] = []
+
+        def caller():
+            waits.append(pacer.acquire())
+
+        _run_sim_threads(sim, [caller for _ in range(callers)])
+        expected = [0.0] * burst + [k / rate for k in range(1, callers - burst + 1)]
+        assert sorted(waits) == [pytest.approx(w) for w in expected]
+
+    def test_real_threads_are_never_served_faster_than_the_bucket(self):
+        # Real threads at a high rate, some holding and sending late. Send
+        # times come from the pacer's own clock readings, not OS wake-ups.
+        rate, burst, callers = 400.0, 4, 16
+        local = threading.local()
+
+        def clock():
+            now = time.monotonic()
+            if getattr(local, "first", None) is None:
+                local.first = now
+            return now
+
+        pacer = _WritePacer(rate, burst, clock=clock)
+        start = threading.Barrier(callers)
+        sends: list[float] = []
+        lock = threading.Lock()
+
+        def timed(call):
+            local.first = None
+            result = call()
+            return local.first, result
+
+        def run(i):
+            start.wait()
+            if i % 2:
+                arrived, (wait, held) = timed(pacer.acquire_with_hold)
+                time.sleep(0.001 * (i % 5))
+                sent_at, ok = timed(held.send)
+                assert ok
+                times = [arrived + wait, sent_at]
+            else:
+                take = pacer.acquire_hedge if i % 4 == 0 else pacer.acquire
+                arrived, wait = timed(take)
+                times = [arrived + wait]
+            with lock:
+                sends.extend(times)
+
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(callers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert not any(t.is_alive() for t in threads)
+        assert len(sends) == callers + callers // 2
+        _assert_within_bucket(sends, rate, burst)
+        assert pacer._held == 0
+
+
+class TestWritesArePaced:
+    """Each POST takes exactly one pacer place first and is sent once."""
+
+    @pytest.fixture
+    def events(self):
+        return []
+
+    @pytest.fixture
+    def pacer(self, monkeypatch, events):
+        """A stand-in pacer recording "acquire", "hedge", "opening" (a place
+        plus a held one), "held" (a held place sent) and "released" in `events`."""
+        mock = MagicMock()
+        mock.acquire.side_effect = lambda: events.append("acquire") or 0.0
+        mock.acquire_hedge.side_effect = lambda: events.append("hedge") or 0.0
+
+        def with_hold():
+            events.append("opening")
+            held = MagicMock()
+            live = [True]
+
+            def send():
+                if not live[0]:
+                    return False
+                live[0] = False
+                events.append("held")
+                return True
+
+            def release():
+                if live[0]:
+                    live[0] = False
+                    events.append("released")
+
+            held.send.side_effect = send
+            held.release.side_effect = release
+            return 0.0, held
+
+        mock.acquire_with_hold.side_effect = with_hold
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", mock)
+        return mock
+
+    @pytest.fixture
+    def post(self, monkeypatch, events):
+        """signed_request_json, recording each POST in `events`."""
+        mock = MagicMock()
+        replies: list = []
+
+        def answer(*args, **kwargs):
+            events.append("post")
+            reply = replies.pop(0)
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+        mock.side_effect = answer
+        mock.replies = replies
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
+
+    @staticmethod
+    def _too_many_requests() -> ApiException:
+        # The body the exchange sends with a 429
+        return ApiException(
+            status=429, reason="Too Many Requests",
+            body='{"error":{"code":"too_many_requests","message":"too many requests"}}',
+        )
+
+    def test_a_v2_order_waits_before_its_post(self, pacer, post, events):
+        post.replies.append(v2_resp(5))
+        assert _submit_order_v2(MagicMock(), _build_no_order_v2(_no_leg(make_spec()))) == "executed"
+        assert events == ["acquire", "post"]
+
+    def test_a_v2_order_takes_the_place_it_is_given(self, pacer, post, events):
+        # The given place is used instead of one in turn
+        post.replies.append(v2_resp(5))
+        pace = MagicMock(side_effect=lambda: events.append("given") or 0.0)
+        body = _build_no_order_v2(_no_leg(make_spec()))
+        assert _submit_order_v2(MagicMock(), body, pace=pace) == "executed"
+        assert events == ["given", "post"]
+        pacer.acquire.assert_not_called()
+
+    def test_the_v2_log_line_is_written_after_the_wait(self, pacer, post, caplog):
+        # So the "Submitting V2 order" line's time is the send time
+        logged_before_wait = []
+        pacer.acquire.side_effect = lambda: logged_before_wait.append(
+            "Submitting V2 order" in caplog.text
+        ) or 0.0
+        post.replies.append(v2_resp(5))
+        with caplog.at_level(logging.INFO):
+            _submit_order_v2(MagicMock(), _build_no_order_v2(_no_leg(make_spec())))
+        assert logged_before_wait == [False]
+        assert "Submitting V2 order" in caplog.text
+
+    def test_a_transfer_waits_before_its_post(self, pacer, post, events):
+        post.replies.append(transfer_resp("tr_9"))
+        assert _execute_transfer(MagicMock(), 1, 0, 1400) == "tr_9"
+        assert events == ["acquire", "post"]
+
+    def test_a_v2_kill_takes_one_place_and_one_post(self, pacer, post, events):
+        post.replies.append(fok_kill_error())
+        assert _submit_order_v2(MagicMock(), _build_no_order_v2(_no_leg(make_spec()))) == "canceled"
+        assert events == ["acquire", "post"]
+
+    def test_a_v2_429_takes_one_place_and_one_post_and_still_raises(
+        self, pacer, post, events,
+    ):
+        # Pacing is not a retry: a 429 still raises
+        err = self._too_many_requests()
+        post.replies.append(err)
+        with pytest.raises(ApiException) as exc_info:
+            _submit_order_v2(MagicMock(), _build_yes_order_v2(_yes_leg(make_spec())))
+        assert exc_info.value is err
+        assert events == ["acquire", "post"]
+
+    def test_a_transfer_429_takes_one_place_and_one_post(self, pacer, post, events):
+        post.replies.append(self._too_many_requests())
+        with pytest.raises(ApiException):
+            _execute_transfer(MagicMock(), 0, 1, 100)
+        assert events == ["acquire", "post"]
+
+    def test_an_unwind_takes_the_hedge_lane_by_default(self, pacer, post, events):
+        post.replies.append(v2_resp(5))
+        spec = make_spec()
+        result = trader._rollback_no_leg(MagicMock(), spec, _no_leg(spec), "why")
+        assert result.status == "rolled_back"
+        assert events == ["hedge", "post"]
+        pacer.acquire.assert_not_called()
+
+    def test_a_429_on_the_yes_leg_paces_the_rollback_too(
+        self, pacer, post, events, v2_mapping_confirmed, monkeypatch,
+    ):
+        # YES leg 429'd and unfilled, so the NO leg is unwound: NO takes two
+        # places, YES sends the held one, the unwind takes the hedge lane
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
+        post.replies.extend([v2_resp(5), self._too_many_requests(), v2_resp(5)])
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(
+            None,   # before_no
+            None,   # before_yes
+            None,   # after_yes — unmoved
+            None,   # lag re-read — still unmoved
+        )
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+        assert events == ["opening", "post", "held", "post", "hedge", "post"]
+        assert post.call_args_list[2].kwargs["body"]["reduce_only"] is True
+        pacer.acquire.assert_not_called()
+
+    def test_a_dry_run_takes_no_place(self, pacer):
+        results = execute_trades(MagicMock(), [make_spec()], dry_run=True)
+        assert [r.status for r in results] == ["simulated"]
+        pacer.acquire.assert_not_called()
+        pacer.acquire_with_hold.assert_not_called()
+        pacer.acquire_hedge.assert_not_called()
+
+
+class TestPairWrites:
+    """Which pacer places each _execute_one path takes, read from the places
+    held at each POST, the hedge-lane places and the balance afterwards (a
+    real pacer that never waits: every case fits in one burst)."""
+
+    BURST = 8
+
+    @pytest.fixture
+    def pacer(self, monkeypatch):
+        clock = _FakeClock()
+        pacer = _fake_pacer(8, self.BURST, clock)
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", pacer)
+        return pacer
+
+    @pytest.fixture
+    def posts(self, monkeypatch):
+        """signed_request_json answering from a script, recording each body."""
+        bodies: list[dict] = []
+        replies: list = []
+
+        held_at_post: list[int] = []
+
+        def answer(client, method, path, body):
+            bodies.append(body)
+            held_at_post.append(trader._ORDER_WRITE_PACER._held)
+            reply = replies.pop(0)
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+        monkeypatch.setattr(trader, "signed_request_json", answer)
+        return SimpleNamespace(bodies=bodies, replies=replies, held_at_post=held_at_post)
+
+    @staticmethod
+    def _count_hedges(pacer, monkeypatch) -> list:
+        """Record each hedge-lane place the pacer hands out."""
+        hedges: list = []
+        real = pacer.acquire_hedge
+        monkeypatch.setattr(pacer, "acquire_hedge", lambda: hedges.append(1) or real())
+        return hedges
+
+    @staticmethod
+    def _spent(pacer) -> float:
+        """Tokens taken so far (the fake clock never moves, so no refill)."""
+        return pacer._burst - pacer._tokens - pacer._held
+
+    def test_a_filled_pair_sends_its_yes_leg_on_the_held_place(
+        self, pacer, posts, v2_mapping_confirmed, monkeypatch,
+    ):
+        posts.replies.extend([v2_resp(5), v2_resp(5)])
+        hedges = self._count_hedges(pacer, monkeypatch)
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+        result = _execute_one(client, make_spec())
+        assert result.status == "executed"
+        assert [b["side"] for b in posts.bodies] == ["ask", "bid"]
+        # One place held while the NO leg posts, spent by the YES leg
+        assert posts.held_at_post == [1, 0]
+        assert hedges == []
+        assert pacer._held == 0 and self._spent(pacer) == 2
+
+    def test_a_killed_no_leg_gives_the_held_place_back(
+        self, pacer, posts, v2_mapping_confirmed,
+    ):
+        posts.replies.append(fok_kill_error())
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+        result = _execute_one(client, make_spec())
+        assert result.status == "failed"
+        assert pacer._held == 0 and self._spent(pacer) == 1
+
+    def test_a_killed_yes_leg_is_unwound_through_the_hedge_lane(
+        self, pacer, posts, v2_mapping_confirmed, monkeypatch,
+    ):
+        posts.replies.extend([v2_resp(5), fok_kill_error(), v2_resp(5)])
+        hedges = self._count_hedges(pacer, monkeypatch)
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+        assert posts.held_at_post == [1, 0, 0]
+        assert hedges == [1]
+        assert pacer._held == 0 and self._spent(pacer) == 3
+
+    def test_a_no_leg_whose_fill_was_unclear_gives_its_place_back_before_the_reads(
+        self, pacer, posts, v2_mapping_confirmed, monkeypatch,
+    ):
+        # The NO leg raised: its held place goes back before the (possibly
+        # slow) reads; they show it filled, so it is unwound through the hedge lane
+        posts.replies.extend([ConnectionError("reset"), v2_resp(5)])
+        hedges = self._count_hedges(pacer, monkeypatch)
+        held_at_read: list[int] = []
+        script = positions_seq(None, None, ("TICK-A", -5))
+
+        def read(**kwargs):
+            held_at_read.append(pacer._held)
+            return script(**kwargs)
+
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=read)
+        result = _execute_one(client, make_spec())
+        assert result.status == "rolled_back"
+        assert posts.bodies[-1]["reduce_only"] is True
+        assert held_at_read == [0, 0, 0]   # the baselines, and the read after the error
+        assert posts.held_at_post == [1, 0]
+        assert hedges == [1]
+        assert pacer._held == 0 and self._spent(pacer) == 2
+
+    def test_a_no_leg_that_did_not_fill_gives_the_held_place_back(
+        self, pacer, posts, v2_mapping_confirmed, monkeypatch,
+    ):
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
+        posts.replies.append(ConnectionError("reset"))
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(None, None, None, None)
+        result = _execute_one(client, make_spec())
+        assert result.status == "failed"
+        assert pacer._held == 0 and self._spent(pacer) == 1
+
+    def test_a_disproven_mapping_gives_the_held_place_back(
+        self, pacer, posts, monkeypatch,
+    ):
+        posts.replies.append(v2_resp(5))
+        client = MagicMock()
+        client.get_positions_without_preload_content = positions_seq(
+            None, None, ("TICK-A", 5),     # the NO buy moved the position the wrong way
+        )
+        result = _execute_one(client, make_spec())
+        assert result.status == "manual_review"
+        assert len(posts.bodies) == 1
+        assert pacer._held == 0 and self._spent(pacer) == 1
+
+    def test_an_exception_escaping_the_pair_gives_the_held_place_back(
+        self, pacer, posts, monkeypatch,
+    ):
+        posts.replies.append(v2_resp(5))
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(return_value=positions_resp())
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(trader, "_confirm_v2_no_mapping", broken)
+        results = execute_trades(client, [make_spec()], dry_run=False)
+        assert [r.status for r in results] == ["manual_review"]
+        assert pacer._held == 0 and self._spent(pacer) == 1
+
+    def test_a_pair_never_holds_two_places(self, pacer):
+        writes = trader._PairWrites(pacer)
+        writes.opening()
+        writes.opening()
+        assert pacer._held == 1
+        writes.close()
+        assert pacer._held == 0
+
+    def test_the_second_hedge_write_takes_the_hedge_lane(self, pacer, monkeypatch):
+        hedges = self._count_hedges(pacer, monkeypatch)
+        writes = trader._PairWrites(pacer)
+        writes.opening()
+        assert writes.hedge() == 0.0 and hedges == []
+        writes.hedge()
+        assert hedges == [1]
+        writes.close()
+        assert pacer._held == 0 and self._spent(pacer) == 3
+
+
+class TestExecuteTradesArePaced:
+    """Whole portfolios through execute_trades in simulated time, at the
+    shipped rate and burst: sends stay in bounds, YES legs never wait, and
+    unwinds go ahead of waiting NO legs."""
+
+    POST_SECONDS = 0.1
+    READ_SECONDS = 0.05
+
+    @staticmethod
+    def _specs(n: int) -> list:
+        """n specs on distinct tickers, like a real portfolio's."""
+        specs = []
+        for i in range(n):
+            spec = make_spec(title=f"pair {i}")
+            spec.pair.market_a.ticker = f"TICK-A{i}"
+            spec.pair.market_b.ticker = f"TICK-B{i}"
+            specs.append(spec)
+        return specs
+
+    def _run(self, monkeypatch, pairs: int, *, kill_yes: bool = False) -> list:
+        """Run the pairs; return each POST as (sent, returned, ticker, kind),
+        kind being "no", "yes" or "unwind"."""
+        rate, burst = config.ORDER_WRITES_PER_SECOND, config.ORDER_WRITE_BURST
+        workers = min(config.TRADER_MAX_WORKERS, pairs)
+        sim = _SimTime(tasks=pairs, workers=workers)
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", _sim_pacer(rate, burst, sim))
+        monkeypatch.setattr(trader.time, "sleep", sim.sleep)
+        posts: list[tuple[float, float, str, str]] = []
+        lock = threading.Lock()
+
+        def post(client, method, path, body):
+            sent = sim.now
+            kind = ("unwind" if body.get("reduce_only")
+                    else "no" if body["side"] == "ask" else "yes")
+            sim.sleep(self.POST_SECONDS)
+            with lock:
+                posts.append((sent, sim.now, body["ticker"], kind))
+            if kind == "yes" and kill_yes:
+                raise fok_kill_error()
+            return v2_resp(5)
+
+        def read(**kwargs):
+            sim.sleep(self.READ_SECONDS)
+            return positions_resp()
+
+        monkeypatch.setattr(trader, "signed_request_json", post)
+        real = trader._execute_one
+
+        def run(client, spec):
+            try:
+                return real(client, spec)
+            finally:
+                sim.done()
+
+        monkeypatch.setattr(trader, "_execute_one", run)
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=read)
+        results = execute_trades(client, self._specs(pairs), dry_run=False)
+        assert not sim.stuck
+        expected = "rolled_back" if kill_yes else "executed"
+        assert [r.status for r in results] == [expected] * pairs
+        _assert_within_bucket([p[0] for p in posts], rate, burst)
+        return posts
+
+    @staticmethod
+    def _by_pair(posts) -> dict:
+        """Each pair's POSTs by kind, keyed by the pair's index."""
+        pairs: dict = {}
+        for sent, returned, ticker, kind in posts:
+            index = ticker.split("TICK-")[1][1:]
+            pairs.setdefault(index, {})[kind] = (sent, returned)
+        return pairs
+
+    @pytest.mark.parametrize("pairs", [7, 14])
+    def test_every_yes_leg_goes_out_the_moment_its_no_leg_returns(
+        self, monkeypatch, v2_mapping_confirmed, pairs,
+    ):
+        posts = self._run(monkeypatch, pairs)
+        by_pair = self._by_pair(posts)
+        assert len(by_pair) == pairs
+        for legs in by_pair.values():
+            no_returned = legs["no"][1]
+            yes_sent = legs["yes"][0]
+            assert yes_sent == pytest.approx(no_returned, abs=1e-9)
+
+    def test_the_opening_no_legs_are_spread_to_the_write_limit(
+        self, monkeypatch, v2_mapping_confirmed,
+    ):
+        # All pairs ask at 0.1 (two 0.05 s reads). Four fit in the burst of 8
+        # (two places each); each later pair goes 2/8 s after the one before.
+        posts = self._run(monkeypatch, 7)
+        rate, burst = config.ORDER_WRITES_PER_SECOND, config.ORDER_WRITE_BURST
+        start = 2 * self.READ_SECONDS
+        first = burst // 2
+        expected = [start] * first + [
+            start + 2 * k / rate for k in range(1, 7 - first + 1)
+        ]
+        no_sent = sorted(p[0] for p in posts if p[3] == "no")
+        assert no_sent == [pytest.approx(t) for t in expected]
+
+    @pytest.mark.parametrize("pairs", [7, 14])
+    def test_every_unwind_goes_ahead_of_the_waiting_no_legs(
+        self, monkeypatch, v2_mapping_confirmed, pairs,
+    ):
+        # Every YES leg is killed. No NO leg may go out between an unwind's
+        # request and its POST, and it waits at most 1/rate for itself plus
+        # 1/rate per unwind ahead of it.
+        posts = self._run(monkeypatch, pairs, kill_yes=True)
+        rate = config.ORDER_WRITES_PER_SECOND
+        by_pair = self._by_pair(posts)
+        no_sent = [legs["no"][0] for legs in by_pair.values()]
+        asked = sorted(legs["yes"][1] for legs in by_pair.values())
+        for legs in by_pair.values():
+            requested = legs["yes"][1]
+            sent = legs["unwind"][0]
+            assert not [t for t in no_sent if requested < t < sent - 1e-9]
+            ahead = sum(1 for t in asked if t <= requested)
+            assert sent - requested <= ahead / rate + 1e-9

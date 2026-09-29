@@ -20,6 +20,10 @@ Purpose:
     subprocess) — see the EXIT_* constants in config.py (BS-14): an unhandled
     exception still propagates to exit 1, same as always.
 
+    Right after parsing its arguments, main() exits 2 if
+    config.ORDER_API_VERSION is not "v2" (config.order_api_version_error),
+    before logging is configured.
+
     The live toggles are config.py's, each overridable for one run by a flag
     of the "live trading toggles" group. _resolve_live_settings builds the
     run's one config.LiveSettings before logging is configured (a bad value
@@ -30,17 +34,18 @@ Purpose:
 
 Dependencies:
     Imports from auth.py (client construction and auth verification), config.py
-    (balance threshold, exit-code contract, the same-title threshold and
+    (balance threshold, exit-code contract, the order-path check
+    order_api_version_error, the same-title threshold and
     close-gap bound, file paths, and the live toggles: LiveSettings,
     live_settings, the describe_* helpers, live_rule_warnings, SIZE_CAP_STEP),
     historical.py (load_series_categories, series_labels, infer_category —
     the dashboard's filing rule, which _filter_by_category shares),
     reporter.py (Excel output), scanner.py (market fetching, pair detection,
-    leg_sides — the only source of truth for which side each leg buys — and
-    close_gap_bound_text, which renders that close-gap bound in the same
-    words the finders' refusal lines use), strategy.py (trade sizing and
-    portfolio selection), and trader.py (order execution). Entry point for
-    `python3 -m kalshi_betting.main`.
+    resolve_held_ladders, leg_sides — the only source of truth for which
+    side each leg buys — and close_gap_bound_text, which renders that
+    close-gap bound in the same words the finders' refusal lines use),
+    strategy.py (trade sizing and portfolio selection), and trader.py (order
+    execution). Entry point for `python3 -m kalshi_betting.main`.
 
 Notes:
     Label rule for everything this module logs: "A"/"B" always mean
@@ -80,6 +85,7 @@ from .config import (
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
     EXIT_SKIPPED_LOW_BALANCE,
+    EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
     MIN_BALANCE_CENTS,
     PROJECT_ROOT,
@@ -92,6 +98,7 @@ from .config import (
     describe_trade_filter,
     live_rule_warnings,
     live_settings,
+    order_api_version_error,
 )
 from .historical import infer_category, load_series_categories, series_labels
 from .reporter import append_to_prod_log, write_dev_simulation
@@ -108,10 +115,10 @@ from .scanner import (
     get_held_tickers,
     inactive_shard_indexes,
     leg_sides,
+    resolve_held_ladders,
 )
 from .strategy import compute_trade, select_portfolio
 from .trader import (
-    drop_legacy_unroutable,
     ensure_shard_collateral,
     execute_trades,
     pre_execution_check,
@@ -218,7 +225,8 @@ def _print_portfolio(portfolio: list, label: str) -> None:
         )
 
 
-def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None) -> str:
+def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None, *,
+                  time_series_searched: bool = True) -> str:
     """
     Build the "no qualifying pairs found" log message with the run's live rule.
 
@@ -237,6 +245,8 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None) -
             ("... found in sandbox ..."), False for a production run.
             Defaults to False.
         settings (LiveSettings | None): The run's toggles; None reads config.py's.
+        time_series_searched (bool): Keyword-only. False says the run did not
+            look for time-series pairs, instead of naming their rule.
 
     Returns:
         str: The fully formatted log message, ready to pass to logging.info().
@@ -246,12 +256,19 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None) -
     """
     # The run's toggles, or config.py's for a caller that hands none
     settings = live_settings() if settings is None else settings
+    if time_series_searched:
+        time_series = (
+            "time-series: both legs worded as cumulative deadlines "
+            "(“by <date>”, two different ones) with the later leg's YES ask above "
+            "the earlier's by the run's entry rule — "
+            # In the finder's own rule-line words, so the two cannot disagree
+            f"{describe_time_series_rule(settings.tier_floors, settings.spread_band)}"
+        )
+    else:
+        time_series = ("time-series: not searched this run, because a held market "
+                       "could not be identified (see the ERROR above)")
     thresholds = (
-        "time-series: both legs worded as cumulative deadlines "
-        "(“by <date>”, two different ones) with the later leg's YES ask above "
-        "the earlier's by the run's entry rule — "
-        # In the finder's own rule-line words, so the two cannot disagree
-        f"{describe_time_series_rule(settings.tier_floors, settings.spread_band)}"
+        f"{time_series}"
         " — or same-title: "
         f"≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff on two different series "
         # This module's own binding, like the same-title threshold above; the scanner
@@ -457,11 +474,8 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
             # characters, which the daily families this exists for all do
             _truncate(getattr(pair.market_a, "subtitle", "") or "—", 24),
             _truncate(getattr(pair.market_b, "subtitle", "") or "—", 24),
-            # Which exchange shard each leg lives on — while the legacy order
-            # path is in use (ORDER_API_VERSION="legacy") a pair spanning
-            # shards is unexecutable (see trader._legacy_routable), so this
-            # explains an otherwise-puzzling "failed" result at a glance, and
-            # it is the at-a-glance view of what shard coverage looks like.
+            # Which exchange shard each leg's market is on ("a/b"); each
+            # order goes to its own leg's shard
             f"{pair.market_a.exchange_index}/{pair.market_b.exchange_index}",
             _format_deadline(pair.market_a.close_time),
             _format_deadline(pair.market_b.close_time),
@@ -889,6 +903,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     normally except order submission — the log still records rows with
     status="simulated".
 
+    It makes no new time-series trade on a ladder the account holds (a ladder
+    is one question asked at several deadlines), and none at all if a held
+    market cannot be identified; same-title trades still go ahead.
+
     Args:
         client: KalshiClient pointed at the production endpoint, produced by
             auth.build_client("prod").
@@ -911,9 +929,11 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             the weekly slot as satisfied by a run that never looked at a book.
             EXIT_TRADES_NEED_ATTENTION if any TradeResult in this run's
             results has status "rollback_failed" or "manual_review" — either
-            means a human must check the account/trade log. EXIT_OK for every
-            other path, including dry-run, no candidate pairs, no executable
-            trades, and all-pairs-failed-pre-execution-check.
+            means a human must check the account/trade log, and wins over the
+            next code. EXIT_TIME_SERIES_SKIPPED if a held market could not be
+            identified, so the run made no time-series trade. EXIT_OK for
+            every other path, including dry-run, no candidate pairs, no
+            executable trades, and all-pairs-failed-pre-execution-check.
 
     Raises:
         ValueError: When settings is None and a config.py toggle is invalid.
@@ -980,14 +1000,25 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.warning("%s", blind_reason)
         return EXIT_NO_TRADEABLE_SHARDS
 
+    # Our positions' ladders, read before held markets are dropped; None
+    # means one could not be identified, so no time-series trade this run
+    held_ladders      = resolve_held_ladders(client, markets, held_tickers)
+    # The exit code of every clean return below
+    clean_exit        = EXIT_OK if held_ladders is not None else EXIT_TIME_SERIES_SKIPPED
     markets           = [m for m in markets if m.ticker not in held_tickers]
 
     # Optional opt-in cap so both bet types only see markets closing within
     # the requested window — a no-op (returns markets unchanged) when unset
     markets           = filter_markets_within_horizon(markets, args.max_horizon_days)
 
-    # Run both pair detection paths: time-series (the run's entry rule) and same-title
-    time_series_pairs = find_time_series_pairs(client, held_tickers, markets, settings=settings)
+    # Run both pair detection paths: time-series (the run's entry rule, and no
+    # pair on a ladder we hold) and same-title
+    if held_ladders is None:
+        time_series_pairs = []
+    else:
+        time_series_pairs = find_time_series_pairs(
+            client, held_tickers, markets, settings=settings, held_ladders=held_ladders,
+        )
     same_title_pairs  = find_same_title_pairs(markets, held_tickers)
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
@@ -1000,14 +1031,16 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     )
 
     if not candidate_pairs:
-        # Names the entry rule this run applied, flags included
-        logging.info(_no_pairs_msg(settings=settings))
-        return EXIT_OK
+        # Names the run's entry rule, or says time-series was not searched
+        logging.info(_no_pairs_msg(settings=settings,
+                                   time_series_searched=held_ladders is not None))
+        return clean_exit
 
     # Apply Kelly sizing to each candidate pair using the real account balance
     trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents, settings)
-    # Greedy portfolio selection ranked by monthly_profit_ratio descending
-    portfolio     = select_portfolio(list(trade_specs.values()), balance_cents)
+    # Greedy selection by monthly_profit_ratio, one time-series trade per ladder
+    portfolio     = select_portfolio(list(trade_specs.values()), balance_cents,
+                                     held_ladders=held_ladders or frozenset())
     # Map pair id → TradeSpec for fast lookup in the pairs table display.
     # Keyed off the CANDIDATE each spec was built from, not off spec.pair:
     # compute_trade returns a re-priced copy of the pair (the marginal fill
@@ -1021,7 +1054,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
 
     if not portfolio:
         logging.info("No executable trades found.")
-        return EXIT_OK
+        return clean_exit
 
     _print_portfolio(portfolio, "Selected")
 
@@ -1029,20 +1062,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     portfolio = pre_execution_check(client, portfolio, settings=settings)
     if not portfolio:
         logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
-        return EXIT_OK
-
-    # On the legacy order path, drop statically-unroutable specs BEFORE any
-    # collateral is planned — otherwise real, non-idempotent transfers would
-    # fund shards whose trades _execute_one's guard then refuses, stranding
-    # money on a shard nothing will trade against. No-op on the V2 default.
-    portfolio = drop_legacy_unroutable(portfolio)
-    if not portfolio:
-        logging.info("No selected pair is routable by the configured order path.")
-        # EXIT_OK, never a bare return: sys.exit(None) exits 0 silently, which
-        # is the right CODE here (a clean no-trade run) but only by accident —
-        # the exit-code contract (BS-14) requires every _run_prod path to name
-        # its code explicitly.
-        return EXIT_OK
+        return clean_exit
 
     # Move collateral to the shards the selected trades draw from — sizing is
     # portfolio-wide, but each order settles against its own shard's balance.
@@ -1055,8 +1075,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.info(
             "No selected pair could be funded on its exchange shard — no trades submitted."
         )
-        # EXIT_OK explicitly — see the routability short-circuit above
-        return EXIT_OK
+        # Never a bare return: sys.exit(None) exits 0, which would hide
+        # EXIT_TIME_SERIES_SKIPPED
+        return clean_exit
 
     # Submit orders sequentially per leg, concurrently across pairs
     results = execute_trades(client, portfolio, dry_run=args.dry_run)
@@ -1105,19 +1126,14 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
 
     if args.dry_run:
         logging.info("[DRY RUN] No orders were actually submitted.")
-        return EXIT_OK
+        return clean_exit
 
     n_ok       = sum(1 for r in results if r.status == "executed")
     n_rolled   = sum(1 for r in results if r.status == "rolled_back")
     n_orphaned = sum(1 for r in results if r.status == "rollback_failed")
-    # "manual_review" means no automated order was submitted in response to
-    # an outcome the trader could not attribute: the NO leg's or the YES leg's
-    # fill state was undetermined (position lookup failed, or the position
-    # moved by an amount the order can't explain), or — on the V2 path — the
-    # NO-leg side mapping was disproven by the positions ledger after a
-    # confirmed NO-leg fill, leaving that leg in place and the YES leg
-    # unsubmitted. Every case is just as urgent as an orphaned rollback
-    # failure, so it's counted in the same manual-review alert.
+    # "manual_review": the trader could not tell what a leg did (see
+    # reporter.TradeResult) and sent no follow-up order. It needs a person as
+    # urgently as a failed rollback, so both are counted in one alert.
     n_unknown  = sum(1 for r in results if r.status == "manual_review")
     logging.info(
         "Submitted %d of %d order pair(s) successfully. %d rolled back, "
@@ -1135,7 +1151,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         # but need a human to check" from a clean run.
         return EXIT_TRADES_NEED_ATTENTION
 
-    return EXIT_OK
+    return clean_exit
 
 
 def _setup_logging(log_path: pathlib.Path) -> None:
@@ -1182,17 +1198,15 @@ def main() -> None:
     pairs, sizes them, and trades them.
 
     Parses command-line arguments (--mode, --dry-run, --sandbox-balance,
-    --max-horizon-days, and the "live trading toggles" group), resolves the
-    run's settings and config.py's reference (_resolve_live_settings, before
-    logging is configured), configures logging, builds the appropriate Kalshi
-    client, and dispatches to _run_dev (sandbox simulation) or _run_prod (real
-    account trading) with both. Exits the process via sys.exit() with the
-    dispatched run's return code (see the EXIT_* constants in config.py,
-    BS-14) so a caller that only sees the process exit status — the
-    scheduler, which runs this as a subprocess — can distinguish a clean run
-    from a low-balance skip or a run with trades needing manual review. An
-    unhandled exception is not caught here and propagates to the normal
-    interpreter exit code 1.
+    --max-horizon-days, and the "live trading toggles" group), exits 2 if
+    config.ORDER_API_VERSION is not "v2" (config.order_api_version_error),
+    checks --max-horizon-days, resolves the run's settings and config.py's
+    reference (_resolve_live_settings) — all before logging is configured or
+    any request is made — then configures logging, builds the Kalshi client
+    and runs _run_dev (sandbox simulation) or _run_prod (real trading). Ends
+    with sys.exit() and the run's return code (the EXIT_* constants in
+    config.py), which the scheduler reads. An unhandled exception propagates
+    and exits 1.
 
     Returns:
         None: This function never returns to its caller — it always ends by
@@ -1288,6 +1302,11 @@ def main() -> None:
         help="Trade any tag this run, whatever config.TRADE_TAGS says",
     )
     args = parser.parse_args()
+    # Exit 2 unless ORDER_API_VERSION is "v2", before anything is logged, a
+    # client is built or an order could be sent
+    problem = order_api_version_error()
+    if problem:
+        parser.error(problem)
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
         parser.error("--max-horizon-days must be a positive integer")
     # Validated BEFORE logging is configured (TS-20): a bad flag or config.py

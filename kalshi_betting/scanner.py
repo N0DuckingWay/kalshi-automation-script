@@ -42,12 +42,15 @@ Dependencies:
     same_event_ladder with the SAME_DAY sentinel, the one definition of a
     same-event deadline ladder's leg order and gap (DR-73), and closes_apart,
     the one definition of the same-title close gate, with
-    close_gap_bound_text, the bound its refusal line prints (DR-74)).
+    close_gap_bound_text, the bound its refusal line prints (DR-74), and
+    ladder_keys, which ladders a market is on).
     pair_gap_days() is the single reader of that gap for everything
-    downstream of pair formation. historical.py imports event_series too, so
-    the backtest's event-title lookup budget tells a combo ticker from any
-    other exactly as the one-series rule does (DR-51). Depends on the
-    KalshiClient produced by auth.py.
+    downstream of pair formation. resolve_held_ladders() finds the ladders
+    of the markets the account holds, and find_time_series_pairs refuses any
+    candidate with a market on one of them. historical.py imports
+    event_series too, so the backtest's event-title lookup budget tells a
+    combo ticker from any other exactly as the one-series rule does (DR-51).
+    Depends on the KalshiClient produced by auth.py.
 
 Notes:
     The normalize_title() approach avoids fuzzy matching entirely — it relies on
@@ -123,6 +126,7 @@ import calendar
 import itertools
 import logging
 import re
+import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -147,7 +151,6 @@ from .config import (
     MIN_ACTIVE_PRICE_DOLLARS,
     MVE_MAX_EMPTY_PAGES,
     MVE_SERIES_FAMILY_PREFIX,
-    ORDER_API_VERSION,
     POSITION_PAGE_SIZE,
     PRICE_EPSILON,
     SAME_TITLE_LEG_SIDES,
@@ -602,22 +605,17 @@ def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
 # config.V2_ROLLBACK_BID_PRICE_DOLLARS.
 _V2_MIN_PRICE = Decimal("0.0001")
 
-# Quantum applied to the scanned price BEFORE it is ceiled onto the tick grid —
-# the same round-before-ceil guard as _buy_max_cost_cents and
-# config.fee_leg_exact. No Kalshi grid point has a 7th decimal (the finest is
-# $0.0001), so quantizing can only remove binary float noise: it tightens or
-# keeps the cap, never loosens it (TS-03).
+# The scanned price is rounded to 6 decimals before it is rounded up onto the
+# tick grid, so float noise cannot push it up a whole extra tick (TS-03). No
+# Kalshi price has a 7th decimal, so this only removes noise.
 _SCANNED_PRICE_QUANTUM = Decimal("0.000001")
 
 def ceil_to_tick(price: Decimal, tick: Decimal) -> Decimal:
     """
     Round a price UP to the next point of a tick grid.
 
-    Ceiling, never nearest or floor: this is the first half of a buy leg's price
-    cap, and it mirrors the legacy _buy_max_cost_cents' math.ceil for exactly
-    the same reason — a cap rounded BELOW the scanned depth-weighted price could
-    never fill at the price we actually scanned, so a fill-or-kill order carrying
-    it would be structurally killed every time rather than protected.
+    Used by v2_limit_price for a buy leg's price cap. It rounds up, never
+    down, because a cap below the scanned price could never fill.
 
     Args:
         price (Decimal): Price in dollars to round. Range: [0, 1].
@@ -633,56 +631,20 @@ def ceil_to_tick(price: Decimal, tick: Decimal) -> Decimal:
 
 def v2_limit_price(leg_kind: str, scanned_price_dollars: float, market: Any) -> Decimal:
     """
-    Compute the fill-or-kill LIMIT price for one V2 buy leg, in dollars.
+    Compute the limit price for one V2 buy leg, in dollars.
 
-    V2 has no "market" order type, so a taker order is a marketable FoK limit
-    and this price IS the price protection that buy_max_cost provided on the
-    legacy path: the order fills at or better than the cap, or not at all.
-    The cap is the scanned price ceiled onto the market's own tick grid plus
-    BUY_SLIPPAGE_TICKS ticks of tolerance for a book that moved since the
-    pre-execution check.
+    A V2 buy leg is a fill-or-kill limit order (it fills in full at once or
+    not at all), so this price is its price protection: the order never pays
+    more than it. The price is the scanned price, rounded to 6 decimals and
+    then up onto the market's tick grid, plus BUY_SLIPPAGE_TICKS ticks for a
+    book that moved since the pre-execution check. A NO buy is sent as a YES
+    ask at 1 - that cap (see _V2_LEG_SIDE).
 
-    The scanned price is quantized to 6 decimals before that ceiling, the same
-    round-before-ceil guard the legacy cap applies in _buy_max_cost_cents (and
-    config.fee_leg_exact before it). Every scanned ask level is the complement
-    of a resting bid (1.0 - float(bid)), and 20 of the 99 whole-cent
-    complements land one ULP ABOVE the exact cent, which would otherwise ceil a
-    whole extra tick and hand the order 2 x BUY_SLIPPAGE_TICKS of tolerance.
-    No Kalshi grid point has a 7th decimal, so the quantize can only remove
-    float noise: it tightens or keeps the cap, never loosens it (TS-03).
-
-    Because the cap (or, for the NO leg, its complement 1 - cap) can land in a
-    DIFFERENT band of the market's grid than the scanned price — stepping up
-    across a band edge, or being mirrored to the other end of the book — the
-    final price is re-quantized onto the grid of the band that actually
-    contains it, rounding UP. Ceiling is chosen because a floor could round a
-    YES cap BELOW the scanned price and make the order structurally unfillable.
-    Kalshi's nested grids ($0.01 subset of $0.001 subset of $0.0001) mean a
-    price landing in a FINER band than it was computed on is already on that
-    band's grid, so the snap is then a no-op.
-
-    That re-quantization is NOT purely protective, and this docstring used to
-    claim it was. When the final price lands in a COARSER band than the one it
-    was computed on, ceiling moves it AWAY from the scanned price and LOOSENS
-    the cap by up to one destination-band tick. Reachable examples on the live
-    band layouts: scanned 0.10 on tapered_deci_cent submits 0.11 where 0.101
-    was intended ($0.0090/contract of extra tolerance), and scanned 0.01 on
-    center_deci_edge_centi_cent submits 0.011 where 0.0101 was intended
-    ($0.0009). The loosening is bounded by one tick of the destination band and
-    is a known, accepted cost of keeping the order fillable; it is a separate
-    finding from TS-10 and is deliberately not fixed here. TS-10 fixed the
-    other half — tick_size_for_price now resolves a boundary price to the
-    FINEST containing band, so the slippage allowance is no longer multiplied
-    by a 10x tick at a band's upper edge.
-
-    The clamp bounds are grid-aware for the same reason: the extreme tradeable
-    levels are one tick inside 0 and 1 ON THIS MARKET'S GRID (e.g. 0.99, not
-    0.9999, on a linear-cent market), so the bounds are derived from the tick
-    size at each end of the book rather than the global finest-grid constants.
-
-    This mapping (which side, and the complement for the NO leg) is the single
-    assumption most in need of verification at the first live submission; see
-    _V2_LEG_SIDE, which is where a correction would be made.
+    The final price is rounded up again onto the grid of the price band it
+    lands in (a market can have several bands with different tick sizes), so
+    it is always a valid level. When that band is coarser, this can loosen the
+    cap by up to one of its ticks. The result is then kept one tick inside 0
+    and 1 on this market's grid.
 
     Args:
         leg_kind (str): Which KIND of leg is being priced — "buy_yes" or
@@ -2158,6 +2120,88 @@ def time_series_group_key(combined_title: str, subtitle: Any) -> str:
     return f"{base} | {sub}" if sub else base
 
 
+# Words and marks that do not change which question a market asks
+_LADDER_FILLER_WORDS = re.compile(r"\b(?:the|a|an)\b")
+_LADDER_FILLER_MARKS = re.compile(r"[?!:;()\"'`\u2018\u2019\u201c\u201d]")
+
+
+def _ladder_question(question_key: str) -> str:
+    """
+    Return the form of a question key that ladder labels compare.
+
+    Two listings of one question can be worded a little differently ("vote
+    on the SAVE America Act?" and "vote on SAVE America Act?"). Letter case,
+    the words "the", "a" and "an", quote marks and ?!:;() are ignored, so
+    they still share a ladder. Numbers, $, %, commas, hyphens and full stops
+    are kept, so two strikes or two amounts never merge.
+
+    Args:
+        question_key (str): A question with its dates removed.
+
+    Returns:
+        str: The comparable form; empty if nothing is left.
+    """
+    text = unicodedata.normalize("NFKC", question_key).casefold()
+    text = _LADDER_FILLER_WORDS.sub(" ", _LADDER_FILLER_MARKS.sub(" ", text))
+    return " ".join(text.split())
+
+
+def ladder_keys(event_ticker: Any, question_key: Any) -> frozenset:
+    """
+    Return labels naming the ladders a market belongs to.
+
+    A ladder is one question asked at several deadlines: two markets are on
+    one ladder if they share an event, or ask the same question once the
+    dates are removed (compared through _ladder_question). Labels are tagged
+    with their kind, so an event can never match a question. Blank or
+    non-text values are ignored.
+
+    Args:
+        event_ticker (Any): The market's event ticker.
+        question_key (Any): The market's question with its dates removed.
+
+    Returns:
+        frozenset: Up to two labels, such as ("event", "KXSENATEREC-26MAY").
+    """
+    keys = set()
+    if isinstance(event_ticker, str) and event_ticker:
+        keys.add(("event", event_ticker))
+    question = _ladder_question(question_key) if isinstance(question_key, str) else ""
+    if question:
+        keys.add(("question", question))
+    return frozenset(keys)
+
+
+def market_ladder_keys(market: Any) -> frozenset:
+    """
+    Return one market's ladder labels; the question is the finder's group key.
+
+    Args:
+        market (Any): A market object with an event ticker and titles.
+
+    Returns:
+        frozenset: The market's event and question labels.
+    """
+    name = pair_key(market)
+    # A non-text name (a test's fake market) gives no question label
+    question = (time_series_group_key(name, getattr(market, "subtitle", "") or "")
+                if isinstance(name, str) else "")
+    return ladder_keys(getattr(market, "event_ticker", ""), question)
+
+
+def pair_ladder_keys(pair: Any) -> frozenset:
+    """
+    Return the ladder labels of both markets in a pair.
+
+    Args:
+        pair (Any): A pair with market_a and market_b.
+
+    Returns:
+        frozenset: Every label of either market.
+    """
+    return market_ladder_keys(pair.market_a) | market_ladder_keys(pair.market_b)
+
+
 def display_title(market: Any) -> str:
     """
     Human-readable label for console and Excel output.
@@ -2410,7 +2454,7 @@ def get_held_tickers(client: Any) -> set:
 @dataclass
 class ApiMarket:
     """
-    Lightweight market object parsed from a raw /events JSON dict.
+    Lightweight market object parsed from a raw market JSON dict.
 
     Stands in for the SDK's Market model, which can no longer deserialize live
     responses: as of 2026-07 the API stopped populating the legacy integer-cent
@@ -2442,11 +2486,9 @@ class ApiMarket:
             Also read by tick_size_for_price() — the authoritative grid.
         exchange_index (int): The exchange shard this market lives on (see
             _shard_index). Market data is cross-shard, so every shard's
-            markets are ingested and simply tagged with this; on the V2 order
-            path it routes the order, and while the legacy path is in use it
-            is trader._legacy_routable that refuses to submit an order for a
-            non-DEFAULT_EXCHANGE_INDEX market. DEFAULT_EXCHANGE_INDEX when the
-            payload omits the field (fail-safe).
+            markets are ingested and tagged with this. Each order is sent to
+            its own market's shard (see trader._build_no_order_v2).
+            DEFAULT_EXCHANGE_INDEX when the payload omits the field.
         _event_title (str): Parent event title attached for pair_key grouping.
     """
     ticker: str
@@ -2474,7 +2516,7 @@ def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
     handles the API's trailing-"Z" UTC format on Python >= 3.11.
 
     Args:
-        m (dict): One market object from a raw events-endpoint JSON payload.
+        m (dict): One market from a raw market or event reply.
         event_title (str): Parent event's title, attached as _event_title.
 
     Returns:
@@ -2503,12 +2545,132 @@ def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
         yes_bid_dollars=m.get("yes_bid_dollars"),
         price_level_structure=m.get("price_level_structure") or "",
         price_ranges=_parse_price_ranges(m.get("price_ranges")),
-        # Tag (never filter) the shard so downstream code — V2 order routing,
-        # trader._legacy_routable, the collateral planner — can decide what
-        # to do with it.
+        # Tag the shard, never filter on it: order routing and the collateral
+        # planner read it later
         exchange_index=_shard_index(m),
         _event_title=event_title,
     )
+
+
+def _error_text(exc: BaseException) -> str:
+    """
+    Describe a failed request in one short line.
+
+    The type plus the HTTP status and reason, or else the message's first
+    line. Never the whole message, which for an exchange error lists every
+    response header.
+
+    Args:
+        exc (BaseException): The error to describe.
+
+    Returns:
+        str: One line of at most 160 characters, such as
+            "NotFoundException (HTTP 404 Not Found)".
+    """
+    name = type(exc).__name__
+    try:
+        status = getattr(exc, "status", None)
+        if status is not None:
+            reason = getattr(exc, "reason", None)
+            detail = f"HTTP {status} {reason}" if reason else f"HTTP {status}"
+            return f"{name} ({detail})"[:160]
+        lines = str(exc).strip().splitlines()
+        first = lines[0].strip() if lines else ""
+        return f"{name}: {first}"[:160] if first else name
+    except Exception:
+        # A broken error object still gets named
+        return name
+
+
+def _fetch_held_market(client: Any, ticker: str, event_titles: dict) -> ApiMarket | None:
+    """
+    Ask the exchange for one held market and its event's title.
+
+    The event title is part of the question label, so without it the label
+    would not match the market's ladder-mates. `event_titles` caches titles
+    by event.
+
+    Args:
+        client (Any): An authenticated Kalshi client.
+        ticker (str): The held market's ticker.
+        event_titles (dict): Event titles already fetched, by event ticker.
+
+    Returns:
+        ApiMarket | None: The market, or None if it or its event can't be read.
+    """
+    try:
+        # Raw, retried read
+        data = api_call_with_retry(
+            fetch_json_page, client.get_market_without_preload_content, ticker=ticker
+        )
+        raw = data.get("market") if isinstance(data, dict) else None
+        if not isinstance(raw, dict):
+            logging.warning("Could not look up held market %s: the reply had no market", ticker)
+            return None
+        event_ticker = raw.get("event_ticker")
+        if not isinstance(event_ticker, str) or not event_ticker:
+            logging.warning("Could not look up held market %s: it has no event ticker", ticker)
+            return None
+        if event_ticker not in event_titles:
+            ev_data = api_call_with_retry(
+                fetch_json_page, client.get_event_without_preload_content,
+                event_ticker=event_ticker,
+            )
+            event = ev_data.get("event") if isinstance(ev_data, dict) else None
+            if not isinstance(event, dict):
+                logging.warning("Could not look up held market %s: the reply for its event "
+                                "%s had no event", ticker, event_ticker)
+                return None
+            # A title-less event reads as "", as in the market list
+            event_titles[event_ticker] = event.get("title") or ""
+        # Parsed like the market list, so its labels match its ladder-mates'
+        return _market_from_dict(raw, event_titles[event_ticker])
+    except Exception as exc:
+        logging.warning("Could not look up held market %s: %s", ticker, _error_text(exc))
+        return None
+
+
+def resolve_held_ladders(client: Any, markets: list, held_tickers: set) -> frozenset | None:
+    """
+    Return the ladder labels of every market we currently hold.
+
+    Reads this run's market list, and asks the exchange about any held
+    market missing from it (one closed but not yet paid out, say). Returns
+    None if a held market can't be identified: the caller must then make no
+    time-series trade.
+
+    Args:
+        client (Any): An authenticated Kalshi client.
+        markets (list): This run's markets, before held ones are removed.
+        held_tickers (set): Tickers the account holds a position in.
+
+    Returns:
+        frozenset | None: Every held market's labels, or None if one is unknown.
+    """
+    by_ticker = {m.ticker: m for m in markets}
+    event_titles: dict = {}
+    keys: set = set()
+    looked_up = 0
+    for ticker in sorted(held_tickers, key=str):
+        market = None
+        if isinstance(ticker, str) and ticker:
+            market = by_ticker.get(ticker)
+            if market is None:
+                market = _fetch_held_market(client, ticker, event_titles)
+                looked_up += 1
+        if market is None:
+            # Stop at the first: the answer is already None
+            logging.error(
+                "Could not look up held market %r, so no time-series trade will be "
+                "made this run (%d held market(s) in all)", ticker, len(held_tickers))
+            return None
+        keys |= market_ladder_keys(market)
+    logging.info(
+        "Open ladder exposure: %d held market(s) in %d event(s), asking %d question(s) "
+        "(%d looked up because this run's market list did not have them)",
+        len(held_tickers), sum(k[0] == "event" for k in keys),
+        sum(k[0] == "question" for k in keys), looked_up)
+    return frozenset(keys)
 
 
 def _shard_index(m: dict) -> int:
@@ -2951,10 +3113,8 @@ def fetch_open_events_with_markets(
     `exchange_index` (see _shard_index). The ONLY ingest-time shard exclusion
     is `inactive_shards`: nothing on a shard the exchange itself reports as
     not trading-active can be traded, nor should it be left to linger as a
-    stale candidate, so those markets are dropped here. Whether a
-    trading-active shard's market can actually be ordered is decided at
-    submission time (per-leg routing on the V2 path, trader._legacy_routable
-    on the legacy one), not here.
+    stale candidate, so those markets are dropped here. Each order is later
+    sent to its own market's shard (the exchange_index in the order body).
 
     Args:
         client (Any): An authenticated KalshiClient produced by auth.build_client().
@@ -3170,6 +3330,7 @@ def find_time_series_pairs(
     inactive_shards: set | None = None,
     *,
     settings: LiveSettings | None = None,
+    held_ladders: frozenset = frozenset(),
 ) -> list:
     """
     Find time-series candidate pairs (YES on the earlier contract, NO on the later).
@@ -3186,6 +3347,9 @@ def find_time_series_pairs(
     otherwise have paired the widest mismatch (DR-01).
 
     A pair is eligible when:
+      0. Neither market is on a ladder we already hold (held_ladders; see
+         ladder_keys). Checked first, so a refused group can still offer its
+         next best pair.
       1. Both markets are actively priced: ask price in [1%, 99%]
       2. Different event_tickers (which rules out an MVE event's multi-choice
          option labels) — UNLESS config.TIME_SERIES_SAME_EVENT_LADDERS is on
@@ -3251,8 +3415,8 @@ def find_time_series_pairs(
     preferred, then largest pB - pA). NOTE: since DR-01 that key carries the
     outcome label, so the rule no longer bounds one FAMILY to one pair — a
     daily family of N strikes now yields up to N pairs, every one on the same
-    underlying over the same window, and nothing downstream caps that
-    concentration (strategy.select_portfolio dedups tickers only).
+    underlying over the same window (two that share an event are one ladder,
+    so the bot never holds both).
 
     The legs are YES on A at pA and NO on B at nB, so tradeable=True when
     pA + nB < 1 - fee_per_pair_approx(pA, nB) AND pB > pA. A cumulative-deadline
@@ -3288,6 +3452,8 @@ def find_time_series_pairs(
             excludes no shard.
         settings (LiveSettings | None): Keyword-only. The run's toggles (items 6
             and 8). None resolves config.live_settings() once.
+        held_ladders (frozenset): Keyword-only. Ladder labels of the markets we
+            hold, from resolve_held_ladders (item 0). Empty refuses nothing.
 
     Returns:
         list: CandidatePair objects, one per normalized title+outcome group
@@ -3389,6 +3555,8 @@ def find_time_series_pairs(
                 stated_deadline(profile, "", "", ""),
             )
 
+    # Refused before every other check, so counted on no other line
+    held_ladder_skips = 0
     # Candidates refused because the two legs are not one question at two
     # cumulative deadlines, split by REASON (DR-72) rather than folded into
     # one counter: a snapshot leg, a leg naming no comparable deadline, and
@@ -3455,6 +3623,13 @@ def find_time_series_pairs(
         # instant or in the opposite order to their deadlines.
         members_sorted = sorted(members, key=lambda m: m.close_time)
         group_pairs: list = []
+        # Members on a held ladder: a held question blocks the whole group, a
+        # held event only its own members
+        on_held_ladder = (
+            {m.ticker for m in members_sorted
+             if ladder_keys(m.event_ticker, norm_title) & held_ladders}
+            if held_ladders else set()
+        )
 
         for i, m_outer in enumerate(members_sorted):
             for m_inner in members_sorted[i + 1:]:
@@ -3468,6 +3643,11 @@ def find_time_series_pairs(
                 # A same-event ladder's gap is its STATED deadline gap; None
                 # means "this pair is tiered on close_time" (pair_gap_days).
                 stated_gap = None
+
+                # Before the group contest, so the next best pair can win
+                if mA.ticker in on_held_ladder or mB.ticker in on_held_ladder:
+                    held_ladder_skips += 1
+                    continue
 
                 if mA.event_ticker == mB.event_ticker:
                     # DR-73: two markets of ONE event. Every previous version
@@ -3748,6 +3928,12 @@ def find_time_series_pairs(
         group_pairs.sort(key=lambda p: (p.tradeable, p.pB - p.pA), reverse=True)
         candidate_pairs.append(group_pairs[0])
 
+    if held_ladder_skips:
+        logging.info(
+            "Time-series candidates refused because one of their markets is on a "
+            "ladder we already hold (counted before every other check): %d",
+            held_ladder_skips,
+        )
     # The one-series conjunct's count (M10), silent at zero: the same line
     # backtester._extract_pairs logs for its sweep, whose parenthesis says
     # "within the deadline-gap window" instead, as its DR-72 lines do. The
@@ -5105,41 +5291,26 @@ def validate_pair_price(client: Any, spec: Any, *, settings: LiveSettings | None
                 pair.canonical_title, spread, settings.spread_band[1])
             return False
 
-    # Require enough depth to fill our full intended contract count via FoK.
-    # On the V2 path "enough depth" means depth the ORDER CAN REACH, not depth
-    # that merely clears the gap: the order is one fill-or-kill limit per leg,
-    # priced from this spec's own leg prices, and it buys nothing resting above
-    # that limit. Counting the whole qualifying book here would let a trade
-    # whose top levels sit above its cap pass the pre-execution check and then
-    # be killed on the wire, reported as "NO leg FoK not filled" — the same
-    # confusion between cap and size that TS-08 fixed on the sizing side.
-    #
-    # The caps come from leg_prices(spec.pair) — the price the trader is about
-    # to submit at — NOT from a freshly recomputed average of this book. That
-    # is the question that actually matters: will the order we are about to
-    # send fill against the book as it stands now?
-    if ORDER_API_VERSION == "v2":
-        side_a, side_b = leg_sides(pair.pair_type)
-        price_a, price_b = leg_prices(spec.pair)
-        cap_a = float(v2_effective_cap(f"buy_{side_a}", price_a, pair.market_a))
-        cap_b = float(v2_effective_cap(f"buy_{side_b}", price_b, pair.market_b))
-        # qualifying is in SIDE order (yes, no, qty); orient the caps to match
-        cap_yes, cap_no = (cap_b, cap_a) if side_a == "no" else (cap_a, cap_b)
-        total_qty = sum(
-            qty for yp, np_, qty in qualifying
-            if yp <= cap_yes + PRICE_EPSILON and np_ <= cap_no + PRICE_EPSILON
-        )
-        basis = "reachable at the FoK limit"
-    else:
-        # Legacy buy_max_cost is a TOTAL-cost cap and can sweep a ladder, so
-        # every qualifying contract is reachable on that path.
-        total_qty = sum(qty for _, _, qty in qualifying)
-        basis = "at gap"
+    # Require enough depth for the full contract count at or under each leg's
+    # limit price (TS-08): a fill-or-kill order buys nothing resting above its
+    # limit. The limits come from the prices the trader is about to send
+    # (leg_prices(spec.pair)), not from a new average of this book.
+    side_a, side_b = leg_sides(pair.pair_type)
+    price_a, price_b = leg_prices(spec.pair)
+    cap_a = float(v2_effective_cap(f"buy_{side_a}", price_a, pair.market_a))
+    cap_b = float(v2_effective_cap(f"buy_{side_b}", price_b, pair.market_b))
+    # qualifying is in SIDE order (yes, no, qty); orient the caps to match
+    cap_yes, cap_no = (cap_b, cap_a) if side_a == "no" else (cap_a, cap_b)
+    total_qty = sum(
+        qty for yp, np_, qty in qualifying
+        if yp <= cap_yes + PRICE_EPSILON and np_ <= cap_no + PRICE_EPSILON
+    )
 
     if total_qty < spec.x:
         logging.warning(
-            "Pre-execution check failed for '%s' — only %.1f contracts %s (need %d); dropping",
-            pair.canonical_title, total_qty, basis, spec.x,
+            "Pre-execution check failed for '%s' — only %.1f contracts reachable at the"
+            " FoK limit (need %d); dropping",
+            pair.canonical_title, total_qty, spec.x,
         )
         return False
 

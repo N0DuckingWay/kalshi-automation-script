@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kalshi_betting import backtester, config, dashboard, scanner, strategy
+from kalshi_betting import backtester, config, dashboard, main, scanner, strategy
 from kalshi_betting.config import (
     SAME_TITLE_CO_RESOLVE_PROB,
     LiveSettings,
@@ -557,6 +557,37 @@ def _function_calls(module, func_name: str, callee: str) -> bool:
                     if name == callee:
                         return True
             return False
+    raise AssertionError(f"{module.__name__}.{func_name} not found")
+
+
+def _keyword_values(module, func_name: str, callee: str, keyword: str, *,
+                    source: str | None = None) -> list:
+    """
+    The value passed as `keyword` in every call to `callee` inside a function.
+
+    Args:
+        module: The module to read.
+        func_name (str): The function whose calls are read.
+        callee (str): The called name, bare or as an attribute.
+        keyword (str): The keyword argument to read.
+        source (str | None): Source to read instead of the module's own.
+
+    Returns:
+        list: One AST node per call, in the order ast.walk visits them; None
+            for a call without the keyword.
+    """
+    tree = ast.parse(source if source is not None else inspect.getsource(module))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+            values = []
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call):
+                    fn = sub.func
+                    name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+                    if name == callee:
+                        values.append(next((k.value for k in sub.keywords if k.arg == keyword),
+                                           None))
+            return values
     raise AssertionError(f"{module.__name__}.{func_name} not found")
 
 
@@ -1401,6 +1432,45 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(config, "max_kelly_fraction", "pair_size_cap")
         assert _function_calls(backtester, "_simulate_at_discount", "pair_size_cap")
 
+    def test_ast_the_live_run_refuses_pairs_on_held_ladders(self):
+        # The production run finds the ladders it holds and hands them to both
+        # the finder and the portfolio step. A dropped keyword would silently
+        # refuse nothing, since both default to an empty set.
+        assert _function_calls(main, "_run_prod", "resolve_held_ladders")
+        [finder_value] = _keyword_values(main, "_run_prod", "find_time_series_pairs",
+                                         "held_ladders")
+        assert isinstance(finder_value, ast.Name) and finder_value.id == "held_ladders"
+        # The portfolio step gets the same labels, or an empty set when the
+        # lookup failed (the finder is not called then, so no time-series spec exists)
+        [portfolio_value] = _keyword_values(main, "_run_prod", "select_portfolio",
+                                            "held_ladders")
+        assert ast.unparse(portfolio_value) in {"held_ladders", "held_ladders or frozenset()"}
+        # Both rules read the ladder labels through the one definition
+        assert _function_calls(scanner, "find_time_series_pairs", "ladder_keys")
+        assert _function_calls(strategy, "select_portfolio", "pair_ladder_keys")
+        assert _function_calls(scanner, "pair_ladder_keys", "market_ladder_keys")
+        assert _function_calls(scanner, "market_ladder_keys", "ladder_keys")
+        assert _function_calls(scanner, "market_ladder_keys", "time_series_group_key")
+
+    def test_ast_the_backtest_reads_ladders_through_the_one_definition(self):
+        # The backtest's one-open-trade-per-ladder rule labels each market
+        # through the same scanner.ladder_keys the live rule reads, so the two
+        # paths cannot disagree about which markets share a ladder
+        assert _function_calls(backtester, "_simulate_at_discount", "_ladder_keys_dict")
+        assert _function_calls(backtester, "_ladder_keys_dict", "ladder_keys")
+        # ... and a question worked out from the market uses the grouping key
+        assert _function_calls(backtester, "_ladder_keys_dict", "_ts_group_key")
+
+    def test_keyword_values_finds_every_call(self):
+        # The helper the pin above reads: a call without the keyword is a None,
+        # so a second, unwired call cannot hide behind the first one
+        source = ("def f():\n"
+                  "    g(1, k=a)\n"
+                  "    g(2)\n")
+        module = SimpleNamespace(__name__="snippet")
+        values = _keyword_values(module, "f", "g", "k", source=source)
+        assert [ast.unparse(v) if v is not None else None for v in values] == ["a", None]
+
 
 # ── DR-62: Kelly's denominator is the dollars AT RISK, fee included ───────────
 
@@ -1706,6 +1776,123 @@ class TestSelectPortfolio:
         assert select_portfolio([spec_ok], 50_000) == [spec_ok]
 
 
+def _ladder_market(ticker: str, event_ticker: str, title: str) -> SimpleNamespace:
+    """A market with just the fields the ladder labels are built from."""
+    return SimpleNamespace(ticker=ticker, event_ticker=event_ticker, title=title, subtitle="")
+
+
+def _ladder_spec(market_a, market_b, *, pair_type: str | None = "time_series",
+                 ratio: float = 0.10, cost: float = 10.0) -> TradeSpec:
+    """A spec on two given markets, ranked by `ratio`, costing `cost` dollars."""
+    pair = SimpleNamespace(pair_type=pair_type, market_a=market_a, market_b=market_b)
+    return TradeSpec(pair=pair, x=1, y=1, total_cost=cost, total_cost_with_fees=cost,
+                     min_payoff=0.10, profit_ratio=0.05, days_to_close=30,
+                     monthly_profit_ratio=ratio, kelly_p=0.90, kelly_fraction=0.10)
+
+
+# One question asked at four deadlines, all listed in one event
+_STAR = "Will SpaceX launch another Starship by %s?"
+_R1, _R2, _R3, _R4 = (_ladder_market(f"STAR-{d}", "KXSTAR-14", _STAR % f"March {d}, 2026")
+                      for d in (1, 10, 20, 30))
+# A question on its own event, sharing no label with the Starship ladder
+_OTHER_A = _ladder_market("RAIN-1", "KXRAIN-1", "Will it rain in NYC by March 1, 2026?")
+_OTHER_B = _ladder_market("RAIN-2", "KXRAIN-2", "Will it rain in NYC by March 11, 2026?")
+
+
+class TestSelectPortfolioLadders:
+    """select_portfolio picks at most one time-series trade per ladder (one
+    question at several deadlines): two markets share a ladder when they share
+    an event or ask the same question once the dates are removed. Held
+    positions count, and so do specs picked earlier in the run."""
+
+    def test_two_time_series_specs_on_one_ladder_take_only_the_better(self, caplog):
+        best = _ladder_spec(_R1, _R3, ratio=0.20)
+        second = _ladder_spec(_R2, _R4, ratio=0.10)
+        # The two share no ticker, so only the ladder rule can stop the second
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([second, best], 100_000) == [best]
+        assert ("Time-series trades skipped because the account already holds, or "
+                "this run already picked, a trade on the same ladder: 1") in caplog.text
+
+    def test_specs_on_different_ladders_are_both_taken(self, caplog):
+        star = _ladder_spec(_R1, _R3, ratio=0.20)
+        rain = _ladder_spec(_OTHER_A, _OTHER_B, ratio=0.10)
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([rain, star], 100_000) == [star, rain]
+        # Silent at zero
+        assert "on the same ladder" not in caplog.text
+
+    def test_a_held_event_blocks_a_time_series_spec(self):
+        star = _ladder_spec(_R1, _R3, ratio=0.20)
+        rain = _ladder_spec(_OTHER_A, _OTHER_B, ratio=0.10)
+        held = frozenset({("event", "KXSTAR-14")})
+        assert select_portfolio([star, rain], 100_000, held_ladders=held) == [rain]
+
+    def test_a_held_event_of_market_b_alone_blocks_a_time_series_spec(self):
+        rain = _ladder_spec(_OTHER_A, _OTHER_B, ratio=0.10)
+        # Only the later market is in the held event
+        held = frozenset({("event", "KXRAIN-2")})
+        assert not held & scanner.market_ladder_keys(_OTHER_A)
+        assert select_portfolio([rain], 100_000, held_ladders=held) == []
+
+    def test_a_picked_spec_claims_the_ladders_of_its_market_b_too(self):
+        first = _ladder_spec(_OTHER_A, _OTHER_B, ratio=0.20)
+        # A different question whose later market shares the rain spec's later event
+        snow_a = _ladder_market("SNOW-1", "KXSNOW-1", "Will it snow in NYC by March 1, 2026?")
+        snow_b = _ladder_market("SNOW-2", "KXRAIN-2", "Will it snow in NYC by March 11, 2026?")
+        second = _ladder_spec(snow_a, snow_b, ratio=0.10)
+        shared = scanner.pair_ladder_keys(first.pair) & scanner.pair_ladder_keys(second.pair)
+        assert shared == frozenset({("event", "KXRAIN-2")})
+        assert select_portfolio([first, second], 100_000) == [first]
+
+    def test_a_spec_of_unknown_type_is_never_blocked(self):
+        # Only the exact type "time_series" is refused; anything else is
+        # treated as a same-title pair
+        ts = _ladder_spec(_R1, _R3, ratio=0.20)
+        odd = _ladder_spec(_R2, _R4, pair_type=None, ratio=0.10)
+        assert select_portfolio([ts, odd], 100_000) == [ts, odd]
+
+    def test_a_held_question_blocks_a_time_series_spec(self):
+        # The same question listed in another event, one we hold a position in
+        elsewhere = _ladder_market("STAR-APR", "KXSTAR-15", _STAR % "April 9, 2026")
+        held = scanner.market_ladder_keys(elsewhere)
+        assert ("event", "KXSTAR-14") not in held
+        star = _ladder_spec(_R1, _R3, ratio=0.20)
+        # The only label the two share is the question
+        assert {kind for kind, _ in held & scanner.pair_ladder_keys(star.pair)} == {"question"}
+        assert select_portfolio([star], 100_000, held_ladders=held) == []
+        # control: holding a position on an unrelated ladder blocks nothing
+        other = scanner.market_ladder_keys(_OTHER_A)
+        assert select_portfolio([star], 100_000, held_ladders=other) == [star]
+
+    def test_a_same_title_spec_is_never_blocked(self):
+        st = _ladder_spec(_R1, _R3, pair_type="same_title", ratio=0.20)
+        held = scanner.pair_ladder_keys(st.pair)
+        assert select_portfolio([st], 100_000, held_ladders=held) == [st]
+
+    def test_a_same_title_spec_picked_first_blocks_a_later_time_series_spec(self):
+        st = _ladder_spec(_R1, _R3, pair_type="same_title", ratio=0.20)
+        ts = _ladder_spec(_R2, _R4, ratio=0.10)
+        assert select_portfolio([ts, st], 100_000) == [st]
+
+    def test_a_time_series_spec_picked_first_does_not_block_a_same_title_spec(self):
+        ts = _ladder_spec(_R1, _R3, ratio=0.20)
+        st = _ladder_spec(_R2, _R4, pair_type="same_title", ratio=0.10)
+        assert select_portfolio([st, ts], 100_000) == [ts, st]
+
+    def test_a_spec_skipped_for_cash_leaves_its_ladder_free(self):
+        # The better spec does not fit the balance, so it never takes the ladder
+        too_dear = _ladder_spec(_R1, _R3, ratio=0.20, cost=600.0)
+        fits = _ladder_spec(_R2, _R4, ratio=0.10, cost=100.0)
+        assert select_portfolio([too_dear, fits], 50_000) == [fits]
+
+    def test_no_held_ladders_is_the_same_as_an_empty_set(self):
+        specs = [_ladder_spec(_R1, _R3, ratio=0.20), _ladder_spec(_R2, _R4, ratio=0.10),
+                 _ladder_spec(_OTHER_A, _OTHER_B, ratio=0.05)]
+        assert select_portfolio(specs, 100_000) == select_portfolio(
+            specs, 100_000, held_ladders=frozenset())
+
+
 class TestKellyOperandsShareOneSnapshot:
     """_kelly_p's two time-series operands (pair.pA and pair.pB) must both come
     from the enrichment snapshot.
@@ -1941,16 +2128,6 @@ class TestReachableDepthSizing:
                 if spec is None:
                     continue
                 assert self._reach(spec, levels) >= spec.x, (levels, balance, spec.x)
-
-    def test_legacy_path_keeps_the_whole_ladder(self, monkeypatch):
-        # The legacy cap is buy_max_cost, a TOTAL-cost cap that CAN sweep a
-        # ladder, so narrowing to reachable depth there would shrink sizes for
-        # no reason. Gated, not unconditional.
-        monkeypatch.setattr(strategy, "ORDER_API_VERSION", "legacy")
-        levels = [(0.32, 0.30, 300.0), (0.37, 0.30, 300.0)]
-        pair = make_booked_pair(levels, pair_type="same_title")
-        spec = compute_trade(pair, _AMPLE_BALANCE_CENTS)
-        assert spec.x == 600
 
 
 class TestPortfolioSummaryIsFeeInclusive:
