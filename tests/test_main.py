@@ -2856,6 +2856,75 @@ class TestRunProdExitCodes:
     @patch("kalshi_betting.main.fetch_open_events_with_markets")
     @patch("kalshi_betting.main.get_held_tickers")
     @patch("kalshi_betting.main.verify_auth")
+    def test_a_disproof_with_the_rest_of_the_run_stopped_returns_attention_code(
+        self,
+        mock_verify_auth,
+        mock_held,
+        mock_fetch,
+        mock_shard_statuses,
+        mock_filter_horizon,
+        mock_find_ts,
+        mock_find_st,
+        mock_enrich,
+        mock_compute,
+        mock_select,
+        mock_pre_exec,
+        mock_execute,
+        mock_append_log,
+        caplog,
+    ):
+        # After a V2 NO-leg mapping disproof, trader stops every later pair
+        # with status "failed" (nothing sent). The run still exits 20 through
+        # the disproving pair's manual_review, and the undetermined-fill count
+        # names only that one pair, not the pairs that sent nothing.
+        mock_verify_auth.side_effect = [
+            {DEFAULT_EXCHANGE_INDEX: 100_000},
+            {DEFAULT_EXCHANGE_INDEX: 100_000},
+        ]
+        mock_held.return_value = set()
+        mock_fetch.return_value = _stub_ingest()
+        mock_filter_horizon.side_effect = lambda markets, days: markets
+        mock_find_ts.return_value = []
+        spec = make_spec()
+        mock_find_st.return_value = [spec.pair]
+        mock_enrich.return_value = [spec.pair]
+        mock_compute.return_value = spec
+        mock_select.return_value = [spec]
+        mock_pre_exec.side_effect = lambda client, portfolio, *, settings: portfolio
+        stopped = (
+            "NO leg not sent: V2 NO-leg mapping disproven earlier in this run;"
+            " nothing submitted"
+        )
+        mock_execute.return_value = [
+            TradeResult(spec=spec, status="manual_review", error="V2 NO-leg mapping disproven"),
+            TradeResult(spec=spec, status="failed", error=stopped),
+            TradeResult(spec=spec, status="failed", error=stopped),
+        ]
+        mock_append_log.return_value = "trade_log.xlsx"
+
+        with caplog.at_level(logging.INFO, logger="root"):
+            code = main._run_prod(MagicMock(), _args(dry_run=False))
+
+        assert code == EXIT_TRADES_NEED_ATTENTION
+        assert any(
+            "0 pair(s) may have ORPHANED positions and 1 pair(s) have an UNDETERMINED"
+            in r.getMessage()
+            for r in caplog.records
+        )
+
+    @patch("kalshi_betting.main.append_to_prod_log")
+    @patch("kalshi_betting.main.execute_trades")
+    @patch("kalshi_betting.main.pre_execution_check")
+    @patch("kalshi_betting.main.select_portfolio")
+    @patch("kalshi_betting.main.compute_trade")
+    @patch("kalshi_betting.main.enrich_with_orderbook_prices")
+    @patch("kalshi_betting.main.find_same_title_pairs")
+    @patch("kalshi_betting.main.find_time_series_pairs")
+    @patch("kalshi_betting.main.filter_markets_within_horizon")
+    @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
+    @patch("kalshi_betting.main.fetch_open_events_with_markets")
+    @patch("kalshi_betting.main.get_held_tickers")
+    @patch("kalshi_betting.main.verify_auth")
     def test_clean_dry_run_returns_ok_code(
         self,
         mock_verify_auth,

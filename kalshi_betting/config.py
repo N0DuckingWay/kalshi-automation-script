@@ -716,6 +716,56 @@ V2_FOK_KILL_ERROR_CODE        = "fill_or_kill_insufficient_resting_volume"
 # tradeable level.
 V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
 
+# Pauses before each re-read, in seconds, when the V2 NO-leg mapping check
+# (trader._confirm_v2_no_mapping) finds the account position UNMOVED right
+# after a filled NO leg. The positions ledger lags a fill (a lag of about 1 s
+# was seen live on 2026-09-28), so an unmoved reading is most often lag. The
+# check re-reads after each pause in turn (up to 7 s in all) and judges the
+# mapping disproven only if every re-read is still unmoved, which stops the
+# rest of the run. A wrong side mapping moves the position the WRONG way
+# rather than not at all, and while pairs run one at a time (see
+# V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS below) no other pair sends anything
+# during the wait, so waiting longer on a zero risks no extra wrong-side
+# position then. The cost is that a filled NO leg checked while the mapping
+# is still unverified can wait up to 7 s unhedged — usually only the first of
+# a process, and only when the ledger lags.
+V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS = (1.0, 2.0, 4.0)
+
+# While the V2 NO-leg mapping is neither confirmed nor disproven in a process,
+# trader.execute_trades runs pairs one at a time, so a wrong mapping costs one
+# wrong-side position rather than one per pair already in flight. A pair can
+# finish without a verdict (its NO leg killed or ambiguous, or the check
+# unable to read the account), and when position reads keep failing every
+# pair would do so behind about two minutes of retried reads, so the phase is
+# bounded in TIME: once it has lasted this many seconds, the pair still
+# running is no longer waited for and the rest start together, each still
+# checking its own fill (operator decision, 2026-09-28). A time bound rather
+# than a count of pairs without a verdict, because killed NO legs cost one
+# round trip each and should not use up the protection: three kills in a row
+# under a 3-pair count let a wrong mapping open a wrong-side position on
+# every pair started together after them. The clock starts with the run, so
+# slow position reads spend it before any NO leg is checked: at 60 s, reads
+# that each succeed only after ~35 s (a 429 storm that clears) used the whole
+# budget during the first pair's two baseline reads, and a wrong mapping then
+# opened 7 wrong-side positions instead of 1 (review measurement,
+# 2026-09-28). Three hundred seconds covers a first pair behind such reads
+# (~105 s to a verdict) plus two or three killed legs at that speed, and
+# dozens of killed legs at normal speed (operator decision, 2026-09-28). When
+# every position read fails, pairs take ~2 min each, so about 3 run alone
+# before the rest start: 7 pairs take ~10-13 min instead of ~2, and 30
+# pairs ~15 min, inside the scheduler's one-hour
+# SCHEDULER_JOB_TIMEOUT_SECONDS. A stuck order POST holds the other pairs
+# back for at most this long; execute_trades itself still returns only when
+# that POST does, since order POSTs carry no request timeout.
+V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS = 300.0
+
+# How often, in seconds, trader.execute_trades looks at whether the pair
+# running alone has settled the V2 NO-leg mapping. The next pair starts as
+# soon as it has, without waiting for the rest of that pair (its YES leg, or
+# an unwind with its position reads). Short enough to add no noticeable delay,
+# long enough that the waiting thread costs nothing.
+V2_MAPPING_VERDICT_POLL_SECONDS = 0.05
+
 # The DEFAULT exchange shard. Kalshi splits the exchange into parallel shards,
 # numbered by `exchange_index` on markets and in the balance breakdown.
 # Orders do not use this constant: every V2 order carries its own market's
@@ -1310,7 +1360,10 @@ FLAT_RETURN_TOLERANCE: float = 1e-12
 # (ORDER_WRITES_PER_SECOND below), so more workers mean longer waits for a
 # pair's NO leg, never faster writes. A pair's YES leg never waits, and an
 # unwind waits only behind other unwinds, 1/ORDER_WRITES_PER_SECOND s each
-# (trader._PairWrites).
+# (trader._PairWrites). On the V2 path the execution pool runs pairs one at a
+# time until the process's NO-leg mapping check has given a verdict (for at
+# most V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS, above), and concurrently after
+# that.
 TRADER_MAX_WORKERS = 8
 
 # How fast trader.py sends order and collateral-transfer POSTs, across every

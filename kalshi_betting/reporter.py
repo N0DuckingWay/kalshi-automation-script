@@ -129,7 +129,9 @@ class TradeResult:
             "executed": both legs filled (confirmed by the order replies or
                 by the change in the account's position).
             "simulated": dry run or dev mode; nothing was sent.
-            "failed": the NO leg did not fill, so nothing is open.
+            "failed": the NO leg did not fill, or nothing was sent (a pair
+                stopped because the V2 NO-leg mapping was disproven earlier
+                in the run), so nothing is open.
             "rolled_back": the NO leg filled, the YES leg did not, and the NO
                 position was fully closed again.
             "rollback_failed": that closing order filled only partly or not
@@ -137,7 +139,8 @@ class TradeResult:
             "manual_review": the outcome of a leg could not be tied to this
                 order (the position read failed or moved by an unexplained
                 amount, the one-time check found that a NO buy did not open
-                a NO position, or the pair's worker raised), so no
+                a NO position, on this pair or on an earlier one, or the
+                pair's worker raised), so no
                 follow-up order was sent.
         error (Optional[str]): Error message when the leg(s) involved required
             explanation, worded as "NO leg …"/"YES leg …" — every

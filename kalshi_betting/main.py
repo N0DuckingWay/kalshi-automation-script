@@ -1079,7 +1079,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         # EXIT_TIME_SERIES_SKIPPED
         return clean_exit
 
-    # Submit orders sequentially per leg, concurrently across pairs
+    # Submit orders sequentially per leg, concurrently across pairs (on the V2
+    # path, one pair at a time until a NO fill has confirmed the order-side
+    # mapping, for at most config.V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS; a
+    # disproof stops every pair that starts after it)
     results = execute_trades(client, portfolio, dry_run=args.dry_run)
 
     # Read the post-trade balance for the Excel log separator row. Real orders
@@ -1133,7 +1136,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     n_orphaned = sum(1 for r in results if r.status == "rollback_failed")
     # "manual_review": the trader could not tell what a leg did (see
     # reporter.TradeResult) and sent no follow-up order. It needs a person as
-    # urgently as a failed rollback, so both are counted in one alert.
+    # urgently as a failed rollback, so both are counted in one alert. A
+    # pair stopped by a disproof of the V2 NO-leg mapping sent nothing and
+    # comes back "failed", so it is not counted here; the disproving pair's
+    # manual_review is what returns EXIT_TRADES_NEED_ATTENTION.
     n_unknown  = sum(1 for r in results if r.status == "manual_review")
     logging.info(
         "Submitted %d of %d order pair(s) successfully. %d rolled back, "
