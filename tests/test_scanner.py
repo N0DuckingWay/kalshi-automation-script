@@ -7038,9 +7038,8 @@ class TestInactiveShardIndexes:
 class TestFetchOpenEventsShardTagging:
     """Market data is cross-shard: every shard's markets are INGESTED and
     tagged with exchange_index. Only shards the exchange reports as
-    trading-inactive are dropped. (Routing is enforced at order submission —
-    per-leg on the V2 path, trader._legacy_routable on the legacy one — never
-    here.)"""
+    trading-inactive are dropped; each order is routed by its own market's
+    exchange_index later."""
 
     @staticmethod
     def _client(std_events, mve_events=()):
@@ -7922,10 +7921,15 @@ class TestValidatePairPriceReachableDepth:
             self._run(monkeypatch, 600)
         assert "reachable at the FoK limit" in caplog.text
 
-    def test_legacy_path_counts_the_whole_qualifying_book(self, monkeypatch):
-        # buy_max_cost is a TOTAL-cost cap and can sweep a ladder.
-        monkeypatch.setattr(scanner, "ORDER_API_VERSION", "legacy")
-        assert self._run(monkeypatch, 600) is True
+    def test_the_rejection_line_is_pinned_word_for_word(self, caplog, monkeypatch):
+        # The drop logs exactly one WARNING, word for word: 300 of the 600
+        # contracts rest at or below the caps
+        with caplog.at_level(logging.WARNING):
+            assert self._run(monkeypatch, 600) is False
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+            "Pre-execution check failed for 'reachability pair' — only 300.0 contracts"
+            " reachable at the FoK limit (need 600); dropping"
+        ]
 
 
 class TestCloseTimeWarningOncePerRun:
