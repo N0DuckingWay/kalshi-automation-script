@@ -1213,6 +1213,23 @@ LIVE_RUN_LOCK_FILE = pathlib.Path.home() / ".kalshi_betting" / "live_run.lock"
 LIVE_RUN_LOCK_WAIT_SECONDS = 2.0
 LIVE_RUN_LOCK_POLL_SECONDS = 0.1
 
+# ── Live run result ───────────────────────────────────────────────────────────
+
+# The "format" key of the JSON record `main.py --result-file` writes when a
+# production run ends (reporter.write_run_report), so a reader can tell this
+# layout from any later one.
+LIVE_RUN_RESULT_FORMAT = "live-run-result-v1"
+
+# The most WARNING lines a run result keeps (the rest are only counted), and
+# the most characters it keeps of each one's first line, the last of them "…"
+# when the line is cut (reporter.RunReportHandler). They keep the record small
+# enough to show on one page when a run logs a burst of retry warnings. They
+# never apply to an ERROR or CRITICAL line: those are few (at most a handful
+# per pair) and are the lines a person has to act on — a failed rollback, a
+# V2 mapping disproof naming every position to check — so each is kept whole.
+RUN_REPORT_MAX_WARNINGS = 50
+RUN_REPORT_LINE_MAX_CHARS = 500
+
 # ── API pagination ────────────────────────────────────────────────────────────
 
 # Number of items to request per page when paginating market/event endpoints.
@@ -2977,6 +2994,42 @@ def live_settings_changes(current: LiveSettings | None,
             old = getattr(current, name)
             rows.append((label, render(old), render(new), old != new))
     return rows
+
+
+def live_settings_argv(settings: LiveSettings) -> list[str]:
+    """
+    Spell a run's settings as main.py's toggle flags, all seven of them.
+
+    A program that starts main.py with these flags gets a run that trades
+    exactly these settings, whatever the saved live defaults say:
+    main._resolve_live_settings lays every flag over the saved defaults and
+    gets back settings equal to these (tests/test_main.py checks the round
+    trip). Caps are written as whole percents, which LiveSettings' 5% grid
+    makes exact. The other numbers are written as their repr, which float()
+    reads back exactly. Each category or tag is written as --category=NAME or
+    --tag=NAME, so a name that begins with "-" still reads as a name; no
+    filter is written as --any-category or --any-tag.
+
+    Args:
+        settings (LiveSettings): The settings to spell.
+
+    Returns:
+        list[str]: The flags, in the order main.py lists them: the tier-floor
+            switch, --spread-min, --spread-max, --interval-discount,
+            --size-cap, --same-title-size-cap, then the category flags and the
+            tag flags.
+    """
+    argv = ["--tier-floors" if settings.tier_floors else "--no-tier-floors",
+            f"--spread-min={settings.spread_band[0]!r}",
+            f"--spread-max={settings.spread_band[1]!r}",
+            f"--interval-discount={settings.interval_discount!r}",
+            f"--size-cap={round(settings.size_cap * 100)}",
+            f"--same-title-size-cap={round(settings.same_title_size_cap * 100)}"]
+    argv += ([f"--category={name}" for name in settings.categories]
+             if settings.categories is not None else ["--any-category"])
+    argv += ([f"--tag={name}" for name in settings.tags]
+             if settings.tags is not None else ["--any-tag"])
+    return argv
 
 
 def live_rule_warnings(settings: LiveSettings) -> list[str]:

@@ -3,8 +3,9 @@ fallback around append_to_prod_log() (BS-18), the run note (main._run_prod's
 live toggles) it appends to the separator row on both paths, plus the row/Notes/candidates
 sheet layout after the 2026-09 strategy change (side-neutral x/y headers, the
 "[<pair_type>: <SIDE_A> A / <SIDE_B> B[ nB=…]] " Notes prefix, and the "nB (NO
-ask)" candidates column). All tests run offline against tmp_path; no real
-Kalshi API interaction.
+ask)" candidates column), and the run result main.py --result-file writes
+(trade_record, report_trades, write_run_report and RunReportHandler). All
+tests run offline against tmp_path; no real Kalshi API interaction.
 
 The lock-timeout test pre-acquires the sidecar lock file from a *separate*
 open() call in the test itself. This genuinely conflicts with reporter's own
@@ -12,17 +13,22 @@ _acquire_lock() even though both run in the same process: flock() locks are
 scoped to the open file description, not the process, so two independent
 open() calls on the same path do contend for the lock.
 """
+import dataclasses
 import fcntl
+import json
 import logging
 import re
 from datetime import UTC, datetime
+from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import openpyxl
 import pytest
 
-from kalshi_betting import reporter
+from kalshi_betting import config, reporter
 from kalshi_betting.reporter import TradeResult
-from kalshi_betting.scanner import ApiMarket, CandidatePair
+from kalshi_betting.scanner import ApiMarket, CandidatePair, leg_prices, leg_sides
 from kalshi_betting.strategy import TradeSpec
 
 _STATUS_COL_INDEX = 16  # 0-based index of the "Status" column in a data row tuple
@@ -462,3 +468,407 @@ class TestOutputFilenameCollisions:
         assert second.name.endswith("-1.xlsx")
         assert first.exists()
         assert second.exists()
+
+
+# ─────────────────────────────────────────────
+# Run result (main.py --result-file)
+# ─────────────────────────────────────────────
+
+def _strict_json(path) -> dict:
+    """
+    Parse a run result file as strict JSON.
+
+    Args:
+        path (Path): The result file.
+
+    Returns:
+        dict: The parsed record.
+
+    Raises:
+        AssertionError: If the file holds NaN or an infinity.
+    """
+    def refuse(token):
+        """
+        Fail on a constant strict JSON has not.
+
+        Args:
+            token (str): "NaN", "Infinity" or "-Infinity".
+
+        Raises:
+            AssertionError: Always.
+        """
+        raise AssertionError(f"not strict JSON: {token}")
+
+    return json.loads(path.read_text(encoding="utf-8"), parse_constant=refuse)
+
+
+def _run_report(**changes) -> reporter.RunReport:
+    """
+    Build a filled-in RunReport for write_run_report.
+
+    Args:
+        **changes: Fields to set instead of the defaults here.
+
+    Returns:
+        reporter.RunReport: A report of a real-money run with one executed pair.
+    """
+    fields = {
+        "dry_run": False, "started_at": datetime(2026, 9, 28, 16, 0, 5, tzinfo=UTC),
+        "settings": "tier floors off | spread band 0-0.5",
+        "defaults": "live_defaults.json, saved …",
+        "message": "Submitted 1 of 1 order pair(s) successfully.",
+        "balance_before": 100.0, "balance_after": 99.5,
+        "trades": [reporter.trade_record(make_result("R"))],
+        "warnings": ["WARNING: Running in PRODUCTION mode — real money will be used!"],
+    }
+    fields.update(changes)
+    return reporter.RunReport(**fields)
+
+
+class TestTradeRecord:
+    """trade_record describes a pair in the trade log's terms: market A then
+    B, the side each leg bought (scanner.leg_sides) and the price it was sized
+    at (scanner.leg_prices)."""
+
+    @pytest.mark.parametrize("pair_type, sides, prices", [
+        ("time_series", ("yes", "no"), (0.30, 0.40)),
+        ("same_title", ("no", "yes"), (0.70, 0.60)),
+    ])
+    def test_each_leg_is_described_by_the_pair_type(self, pair_type, sides, prices):
+        result = make_result("X", status="rolled_back", pair_type=pair_type,
+                             error="YES leg FoK not filled")
+        pair = result.spec.pair
+        record = reporter.trade_record(result)
+        # The one source of truth for sides and prices, and what they give here
+        assert (record.a.side, record.b.side) == leg_sides(pair_type) == sides
+        assert (record.a.price, record.b.price) == tuple(
+            round(p, 4) for p in leg_prices(pair)) == prices
+        assert record == reporter.TradeRecord(
+            status="rolled_back", error="YES leg FoK not filled", pair_type=pair_type,
+            title="test pair",
+            a=reporter.LegRecord("TICK-A-X", "Will TICK-A-X happen?", sides[0], 5, prices[0]),
+            b=reporter.LegRecord("TICK-B-X", "Will TICK-B-X happen?", sides[1], 5, prices[1]),
+            cost_with_fees=4.85, profit_if_won=0.25)
+
+    def test_a_figure_that_is_not_finite_is_recorded_as_not_known(self, tmp_path):
+        result = make_result("N")
+        result.spec.total_cost_with_fees = float("nan")
+        result.spec.min_payoff = float("inf")
+        record = reporter.trade_record(result)
+        assert record.cost_with_fees is None and record.profit_if_won is None
+        # So the result can still be written as strict JSON
+        path = tmp_path / "result.json"
+        reporter.write_run_report(path, _run_report(trades=[record]), 0)
+        assert _strict_json(path)["trades"][0]["cost_with_fees"] is None
+
+    def test_records_are_frozen(self):
+        record = reporter.trade_record(make_result("F"))
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            record.status = "executed"
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            record.a.count = 0
+
+
+class TestReportTrades:
+    """report_trades never raises: a pair trade_record cannot describe is
+    logged as an ERROR and kept, in its place, as what could be read of it."""
+
+    def test_a_pair_that_cannot_be_described_is_logged_and_kept_in_order(self, caplog):
+        first = make_result("1")
+        last = make_result("3", status="failed", error="NO leg FoK not filled")
+        # leg_prices reads nB directly, so a pair without it cannot be priced
+        broken_pair = SimpleNamespace(
+            pair_type="time_series", canonical_title="broken pair", pA=0.3,
+            market_a=SimpleNamespace(ticker="TA"), market_b=SimpleNamespace(ticker="TB"))
+        broken = TradeResult(spec=SimpleNamespace(pair=broken_pair, x=3, y=4),
+                             status="manual_review", error="position lookup failed")
+        with caplog.at_level(logging.ERROR):
+            records = reporter.report_trades([first, broken, last])
+        assert [r.status for r in records] == ["executed", "manual_review", "failed"]
+        assert records[0] == reporter.trade_record(first)
+        assert records[2] == reporter.trade_record(last)
+        assert records[1] == reporter.TradeRecord(
+            status="manual_review", error="position lookup failed", pair_type="time_series",
+            title="broken pair", a=reporter.LegRecord("TA", None, None, 3, None),
+            b=reporter.LegRecord("TB", None, None, 4, None),
+            cost_with_fees=None, profit_if_won=None)
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert errors[0].getMessage().startswith("Could not describe a pair for the run result:")
+
+    def test_only_plain_values_are_kept_from_a_result_it_cannot_read(self, caplog):
+        # A result that is not a TradeResult at all, and one whose fields are
+        # mocks: neither raises, and nothing kept would stop the JSON
+        # A pair with no nB, so leg_prices raises; every other field is a mock
+        pair = MagicMock(spec=["pair_type", "pA", "canonical_title", "market_a", "market_b"])
+        pair.pair_type = "time_series"
+        mocked = TradeResult(spec=MagicMock(pair=pair), status="executed")
+        with caplog.at_level(logging.ERROR):
+            records = reporter.report_trades([object(), mocked])
+        assert records[0] == reporter.TradeRecord(
+            status="unknown", error=None, pair_type=None, title=None, a=None, b=None,
+            cost_with_fees=None, profit_if_won=None)
+        assert records[1].status == "executed" and records[1].pair_type == "time_series"
+        # A mock's ticker and counts are not text or ints, so no leg is kept
+        assert records[1].title is None and records[1].a is None and records[1].b is None
+        json.dumps([dataclasses.asdict(r) for r in records], allow_nan=False)
+        assert len([r for r in caplog.records if r.levelno == logging.ERROR]) == 2
+
+    def test_no_results_give_no_records(self):
+        assert reporter.report_trades([]) == []
+
+    def test_a_result_whose_fields_raise_when_read_keeps_its_place(self, caplog):
+        # getattr's default covers only a missing field; a field that raises
+        # anything else when read must not escape either, or the trade log
+        # after it would never be written
+        class Unreadable:
+            """A result whose every field raises when read."""
+
+            def __getattr__(self, name):
+                """
+                Fail on every field, the way a broken property would.
+
+                Args:
+                    name (str): The field read.
+
+                Raises:
+                    RuntimeError: Always.
+                """
+                raise RuntimeError(f"cannot read {name}")
+
+        first = make_result("1")
+        with caplog.at_level(logging.ERROR):
+            records = reporter.report_trades([first, Unreadable()])
+        assert records[0] == reporter.trade_record(first)
+        assert records[1] == reporter.TradeRecord(
+            status="unknown", error=None, pair_type=None, title=None, a=None, b=None,
+            cost_with_fees=None, profit_if_won=None)
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert errors == ["Could not describe a pair for the run result: cannot read spec"]
+
+
+class TestWriteRunReport:
+    """write_run_report writes the whole record as strict JSON, replacing the
+    file at once, and never raises: a failure is an ERROR and leaves no
+    staging file."""
+
+    def test_the_record_is_strict_json_with_every_field(self, tmp_path):
+        path = tmp_path / "result.json"
+        report = _run_report()
+        reporter.write_run_report(path, report, 20)
+        record = _strict_json(path)
+        assert record == {
+            "format": config.LIVE_RUN_RESULT_FORMAT, "mode": "prod", "dry_run": False,
+            "started_at": "2026-09-28T16:00:05Z", "finished_at": record["finished_at"],
+            "exit_code": 20, "settings": report.settings, "defaults": report.defaults,
+            "message": report.message, "balance_before": 100.0, "balance_after": 99.5,
+            "submission_started": False,
+            "trades": [dataclasses.asdict(t) for t in report.trades],
+            "warnings": report.warnings, "warnings_dropped": 0, "error": None,
+        }
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", record["finished_at"])
+        assert record["trades"][0]["a"]["ticker"] == "TICK-A-R"
+        # Only the result is left in its folder
+        assert list(tmp_path.iterdir()) == [path]
+
+    def test_an_exception_is_written_as_no_exit_code(self, tmp_path):
+        path = tmp_path / "result.json"
+        reporter.write_run_report(path, _run_report(error="RuntimeError: boom"), None)
+        record = _strict_json(path)
+        assert record["exit_code"] is None and record["error"] == "RuntimeError: boom"
+
+    def test_an_old_file_is_replaced_whole(self, tmp_path):
+        path = tmp_path / "result.json"
+        path.write_text("x" * 100_000, encoding="utf-8")
+        reporter.write_run_report(path, _run_report(trades=[]), 0)
+        assert _strict_json(path)["trades"] == []
+        assert list(tmp_path.iterdir()) == [path]
+
+    @pytest.mark.parametrize("folder", ["missing", "read-only"])
+    def test_an_unwritable_path_is_an_error_not_an_exception(self, tmp_path, caplog, folder):
+        where = tmp_path / folder
+        if folder == "read-only":
+            where.mkdir()
+            where.chmod(0o500)
+        path = where / "result.json"
+        try:
+            with caplog.at_level(logging.ERROR):
+                reporter.write_run_report(path, _run_report(), 0)
+        finally:
+            if where.exists():
+                where.chmod(0o700)
+        assert not path.exists()
+        assert [p for p in tmp_path.rglob("*") if p.name.endswith(".tmp")] == []
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1 and errors[0].startswith(
+            f"Could not write the run result to {path}")
+
+    @pytest.mark.parametrize("value", [Decimal("1.50"), float("nan")], ids=["decimal", "nan"])
+    def test_a_value_strict_json_cannot_hold_keeps_the_old_file(self, tmp_path, caplog, value):
+        path = tmp_path / "result.json"
+        path.write_text('{"old": true}', encoding="utf-8")
+        with caplog.at_level(logging.ERROR):
+            reporter.write_run_report(path, _run_report(balance_before=value), 0)
+        assert path.read_text(encoding="utf-8") == '{"old": true}'
+        assert list(tmp_path.iterdir()) == [path]
+        assert any(r.levelno == logging.ERROR and "Could not write the run result" in
+                   r.getMessage() for r in caplog.records)
+
+    def test_a_rename_that_fails_removes_its_staging_file(self, tmp_path, caplog):
+        # A folder where the file should be: the staging file is written, the
+        # rename over the folder fails, and the staging file is removed
+        path = tmp_path / "result.json"
+        path.mkdir()
+        with caplog.at_level(logging.ERROR):
+            reporter.write_run_report(path, _run_report(), 0)
+        assert path.is_dir() and list(tmp_path.iterdir()) == [path]
+        assert any("Could not write the run result" in r.getMessage() for r in caplog.records)
+
+    def test_a_report_that_cannot_be_read_is_an_error_not_an_exception(self, tmp_path, caplog):
+        path = tmp_path / "result.json"
+        with caplog.at_level(logging.ERROR):
+            reporter.write_run_report(path, _run_report(started_at="not a datetime",
+                                                        trades=[object()]), 0)
+        assert not path.exists()
+        assert any("Could not write the run result" in r.getMessage() for r in caplog.records)
+
+
+class TestRunReportHandler:
+    """RunReportHandler copies each WARNING-or-worse line into the report,
+    first line only: every ERROR and CRITICAL line whole, and the first
+    config.RUN_REPORT_MAX_WARNINGS WARNING lines, each cut at
+    config.RUN_REPORT_LINE_MAX_CHARS with "…" as its last character; the
+    WARNING lines left out are counted."""
+
+    @staticmethod
+    def _log(emit) -> reporter.RunReport:
+        """
+        Attach a handler to a logger of its own, log through it, and detach it.
+
+        Args:
+            emit (Callable[[logging.Logger], None]): Logs through the logger.
+
+        Returns:
+            reporter.RunReport: The report the handler filled.
+        """
+        report = reporter.RunReport(dry_run=True, started_at=datetime.now(UTC))
+        logger = logging.getLogger("test_reporter.run_report_handler")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        handler = reporter.RunReportHandler(report)
+        logger.addHandler(handler)
+        try:
+            emit(logger)
+        finally:
+            logger.removeHandler(handler)
+        return report
+
+    def test_it_keeps_warning_and_worse_only(self):
+        def emit(logger):
+            """
+            Log one line at each level.
+
+            Args:
+                logger (logging.Logger): The logger to log through.
+            """
+            logger.debug("debug")
+            logger.info("info")
+            logger.warning("warned %d", 1)
+            logger.error("errored")
+            logger.critical("critical")
+
+        report = self._log(emit)
+        assert report.warnings == ["WARNING: warned 1", "ERROR: errored", "CRITICAL: critical"]
+        assert report.warnings_dropped == 0
+
+    def test_a_warning_is_cut_to_length_and_marked(self):
+        limit = config.RUN_REPORT_LINE_MAX_CHARS
+        report = self._log(lambda logger: (
+            logger.warning("x" * (limit + 100) + "\nthe second line"),
+            logger.warning("y" * limit),
+            logger.error(""),
+            logger.error("short\nsecond")))
+        cut = "x" * (limit - 1) + "…"
+        assert len(cut) == limit
+        # A line of exactly the limit is not cut
+        assert report.warnings == ["WARNING: " + cut, "WARNING: " + "y" * limit,
+                                   "ERROR: ", "ERROR: short"]
+
+    @pytest.mark.parametrize("level", [logging.ERROR, logging.CRITICAL])
+    def test_an_error_or_critical_line_is_kept_whole(self, level):
+        long_line = "z" * (config.RUN_REPORT_LINE_MAX_CHARS * 3) + " END"
+        report = self._log(lambda logger: logger.log(level, "%s\nsecond line", long_line))
+        assert report.warnings == [f"{logging.getLevelName(level)}: {long_line}"]
+
+    def test_it_stops_at_the_cap_and_counts_the_rest(self):
+        cap = config.RUN_REPORT_MAX_WARNINGS
+        report = self._log(lambda logger: [logger.warning("line %d", i) for i in range(cap + 3)])
+        assert report.warnings == [f"WARNING: line {i}" for i in range(cap)]
+        assert report.warnings_dropped == 3
+
+    def test_the_cap_counts_warnings_only_and_never_drops_an_error_or_critical(self):
+        cap = config.RUN_REPORT_MAX_WARNINGS
+
+        def emit(logger):
+            """
+            Log two ERRORs among the WARNINGs, then a burst of WARNINGs past
+            the cap, then a CRITICAL and one more WARNING.
+
+            Args:
+                logger (logging.Logger): The logger to log through.
+            """
+            logger.error("early error")
+            for i in range(cap + 10):
+                logger.warning("retry %d", i)
+                if i == 5:
+                    logger.error("error among the retries")
+            logger.critical("late critical")
+            logger.warning("late warning")
+
+        report = self._log(emit)
+        assert [w for w in report.warnings if not w.startswith("WARNING: ")] == [
+            "ERROR: early error", "ERROR: error among the retries", "CRITICAL: late critical"]
+        # Oldest first, the WARNINGs capped at their own count
+        assert report.warnings[-1] == "CRITICAL: late critical"
+        assert sum(w.startswith("WARNING: ") for w in report.warnings) == cap
+        assert report.warnings_dropped == 11
+
+    def test_a_real_v2_disproof_critical_survives_a_burst_of_retry_warnings(self, monkeypatch):
+        # The disproof CRITICAL names every earlier pair that went ahead on the
+        # same mapping; those pairs are "executed" in the result, so this line
+        # is the only record of them. It is far longer than a WARNING's cut.
+        from kalshi_betting import trader
+
+        spec = make_result("D").spec
+        no_leg, _ = trader._ordered_legs(spec)
+        unchecked = [f"KXSENATEREC-26MAY-LONGTICKER{i:02d}" for i in range(12)]
+        monkeypatch.setattr(trader, "_V2_UNCHECKED_NO_LEGS", list(unchecked))
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", False)
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", False)
+        # The NO buy moved the position the wrong way: a disproof
+        monkeypatch.setattr(trader, "_position_count_once",
+                            lambda client, ticker: float(no_leg.count))
+        report = reporter.RunReport(dry_run=False, started_at=datetime.now(UTC))
+        handler = reporter.RunReportHandler(report)
+        root = logging.getLogger()
+        root.addHandler(handler)
+        try:
+            for i in range(60):
+                logging.warning("HTTP 429 on attempt %d, retrying", i)
+            outcome = trader._confirm_v2_no_mapping(MagicMock(), spec, no_leg, 0.0)
+        finally:
+            root.removeHandler(handler)
+        assert outcome.status == "manual_review"
+        critical = [w for w in report.warnings if w.startswith("CRITICAL: ")]
+        assert len(critical) == 1
+        assert len(critical[0]) > config.RUN_REPORT_LINE_MAX_CHARS
+        assert "flatten this position by hand in the Kalshi UI" in critical[0]
+        assert all(ticker in critical[0] for ticker in unchecked)
+        assert critical[0].endswith(" too.")
+        assert report.warnings_dropped == 60 - config.RUN_REPORT_MAX_WARNINGS
+
+    def test_a_line_that_cannot_be_formatted_does_not_raise(self, monkeypatch):
+        # logging's own handleError reports it (silenced here); the run goes on
+        monkeypatch.setattr(logging, "raiseExceptions", False)
+        report = self._log(lambda logger: logger.warning("%d", "not a number"))
+        assert report.warnings == [] and report.warnings_dropped == 0
