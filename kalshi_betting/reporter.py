@@ -122,31 +122,26 @@ class TradeResult:
 
     Attributes:
         spec (TradeSpec): The trade specification that was executed or simulated.
-        status (str): Execution outcome, described in terms of the two
-            SUBMISSION legs — the NO leg is submitted first and is the one that
-            gets unwound (market_a for a same-title pair, market_b for a
-            time-series pair), then the YES leg (see trader._ordered_legs).
-            "executed" for a real submitted order (NO leg and YES leg both
-            confirmed filled, OR the YES leg was ambiguous but a position-delta
-            check confirmed the fill — see error below), "simulated" for a
-            dry-run or dev-mode run, "failed" for a NO leg that is confirmed
-            unfilled (a clean FoK rejection, an error with an attributable zero
-            delta, or a spec refused before anything was submitted: on the
-            legacy order path because a leg sits off the routable shard, and
-            on the V2 path because the NO-leg side mapping was disproven
-            earlier in the process),
-            "rolled_back" if the NO leg filled but the YES leg is confirmed
-            unfilled and the NO leg's unwind filled in full, "rollback_failed"
-            if that unwind itself did not fill or closed only part of the
-            position (the V2 unwind is immediate-or-cancel and can stop
-            part-way), leaving an orphaned position that needs manual review,
-            or "manual_review" if a leg's fill state could not be
-            attributed to this order (the position lookup failed, the position
-            moved by an unexplained amount, the NO-leg side mapping was
-            disproven after the NO leg filled on the V2 path — by this pair's
-            own check or earlier in the process — or an unhandled
-            exception escaped the pair's worker thread in execute_trades) and
-            no automated order was submitted in response.
+        status (str): What happened. "NO leg" and "YES leg" are the two
+            orders in the order they are sent: the NO leg first (the one
+            undone if the pair cannot be completed), then the YES leg (see
+            trader._ordered_legs).
+            "executed": both legs filled (confirmed by the order replies or
+                by the change in the account's position).
+            "simulated": dry run or dev mode; nothing was sent.
+            "failed": the NO leg did not fill, or nothing was sent (a pair
+                stopped because the V2 NO-leg mapping was disproven earlier
+                in the run), so nothing is open.
+            "rolled_back": the NO leg filled, the YES leg did not, and the NO
+                position was fully closed again.
+            "rollback_failed": that closing order filled only partly or not
+                at all, so a NO position is left open for a person to handle.
+            "manual_review": the outcome of a leg could not be tied to this
+                order (the position read failed or moved by an unexplained
+                amount, the one-time check found that a NO buy did not open
+                a NO position, on this pair or on an earlier one, or the
+                pair's worker raised), so no
+                follow-up order was sent.
         error (Optional[str]): Error message when the leg(s) involved required
             explanation, worded as "NO leg …"/"YES leg …" — every
             non-"executed"/"simulated" status always sets this, and "executed"

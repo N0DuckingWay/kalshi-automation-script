@@ -91,7 +91,8 @@ def build_client(mode: str) -> KalshiClient:
 
     Returns:
         KalshiClient: An authenticated client object ready to call Kalshi API
-            methods such as get_markets(), get_balance(), batch_create_orders(), etc.
+            raw-response methods such as get_balance_without_preload_content()
+            and get_positions_without_preload_content().
 
     Raises:
         FileNotFoundError: If secrets.json or the PEM file do not exist at the

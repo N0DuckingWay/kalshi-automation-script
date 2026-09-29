@@ -2,7 +2,8 @@
 leg-side tuples, the deadline-gap tier (with the backtest's spread band and
 tier-floors switch), the live toggles (LiveSettings and its helpers), the
 values config.py ships, conftest's apply_pre_toggle_defaults, the V2 order
-path's self-trade-prevention value, the order-write pacer's budget, and
+path's self-trade-prevention value, the startup check that refuses any order
+path but "v2" (order_api_version_error), the order-write pacer's budget, and
 PROJECT_ROOT."""
 import ast
 import dataclasses
@@ -10,6 +11,7 @@ import importlib
 import logging
 import math
 import pathlib
+import re
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -230,6 +232,121 @@ class TestV2SelfTradePrevention:
         # accepts only these two values; any other is rejected with HTTP 400
         assert config.V2_SELF_TRADE_PREVENTION_TYPE in {"taker_at_cross", "maker"}
 
+
+class TestOrderApiVersionError:
+    """config.order_api_version_error, the startup check main.py and
+    v2_probe run: exactly the str "v2" passes, and any other value gets a
+    message that names it and points only at "v2"."""
+
+    # Values the check must refuse
+    _REFUSED = ["legacy", "V2", " v2", "v2 ", "", None, 2, b"v2"]
+
+    def test_the_shipped_value_is_v2_and_passes(self):
+        assert config.ORDER_API_VERSION == "v2"
+        assert config.order_api_version_error() is None
+
+    @pytest.mark.parametrize("value", _REFUSED, ids=repr)
+    def test_any_other_value_is_refused_by_name(self, monkeypatch, value):
+        monkeypatch.setattr(config, "ORDER_API_VERSION", value)
+        message = config.order_api_version_error()
+        assert isinstance(message, str) and message
+        assert "\n" not in message
+        assert repr(value) in message
+        assert '"v2"' in message
+        assert config.V2_ORDER_PATH in message
+
+    @pytest.mark.parametrize("value", _REFUSED, ids=repr)
+    def test_the_message_never_names_another_value_to_switch_to(self, monkeypatch, value):
+        monkeypatch.setattr(config, "ORDER_API_VERSION", value)
+        message = config.order_api_version_error()
+        # Apart from the refused value, the only quoted value and the only
+        # suggested setting in the message are "v2"
+        rest = message.replace(repr(value), "", 1)
+        assert re.findall(r'"([^"]*)"', rest) == ["v2", "v2"]
+        assert re.findall(r"ORDER_API_VERSION\s*=+\s*(\S+)", rest) == ['"v2"']
+        # "legacy" appears once, naming the retired endpoint, and the message
+        # ends on the fix
+        prefix = f"config.ORDER_API_VERSION is {value!r}, "
+        assert message.startswith(prefix)
+        assert message[len(prefix):].lower().count("legacy") == 1
+        assert message.endswith('Set ORDER_API_VERSION = "v2" in config.py.')
+
+    def test_it_reads_the_setting_at_call_time(self, monkeypatch):
+        monkeypatch.setattr(config, "ORDER_API_VERSION", "legacy")
+        assert "'legacy'" in config.order_api_version_error()
+        monkeypatch.setattr(config, "ORDER_API_VERSION", "v2")
+        assert config.order_api_version_error() is None
+
+    def test_a_str_subclass_equal_to_v2_is_refused(self, monkeypatch):
+        # Only the exact str type passes
+        class Named(str):
+            pass
+
+        monkeypatch.setattr(config, "ORDER_API_VERSION", Named("v2"))
+        assert config.order_api_version_error() is not None
+
+    # A source scan for text that sets ORDER_API_VERSION to "legacy".
+    # _JOIN_STRINGS joins string literals split across lines (and escaped
+    # quotes are read as plain quotes); _SETS_TO_LEGACY finds the name
+    # ORDER_API_VERSION followed within 60 characters by a quoted legacy
+    _JOIN_STRINGS = re.compile(r"""(["'])[ \t]*\n[ \t]*[rbfuRBFU]{0,2}\1""")
+    _SETS_TO_LEGACY = re.compile(r"""ORDER_API_VERSION\b[\s\S]{0,60}?["']legacy["']""",
+                                 re.IGNORECASE)
+
+    # Source-text shapes (comments, docstrings and split string literals)
+    # that the scan must catch
+    _REMEDY_SHAPES = (
+        '    FAILS, set config.ORDER_API_VERSION = "legacy" to hold the bot on the\n',
+        '    decision to keep ORDER_API_VERSION = "v2" (or to flip it to "legacy").\n',
+        r'            "*** CHECK THE ACCOUNT. *** Set config.ORDER_API_VERSION = \"legacy\" to hold "'
+        '\n            "the bot on the legacy order path."\n',
+        '            "would add to this exposure. *** FLATTEN THE POSITION MANUALLY. *** "\n'
+        """            'Set config.ORDER_API_VERSION = "legacy" to hold the bot on the legacy path.'\n""",
+        '            f"{final}; None means the lookup failed). *** CHECK THE ACCOUNT MANUALLY. *** "\n'
+        """            'Set config.ORDER_API_VERSION = "legacy" to hold the bot on the legacy path.'\n""",
+        '        print(\n'
+        """            'Set config.ORDER_API_VERSION = "legacy" to hold the bot on the legacy order '\n"""
+        '            "path. Both --step no-mapping and --step unfillable-ask have to PASS before "\n',
+        '        fully intact and unmodified so flipping ORDER_API_VERSION back to\n'
+        '        "legacy" is an instant, code-free rollback if the V2 mapping misbehaves\n',
+        '        automatically on a state we cannot model. Remedy: set\n'
+        '        config.ORDER_API_VERSION = "legacy", the instant rollback to the\n',
+        '        " must flatten this account position; set config.ORDER_API_VERSION ="\n'
+        r'        " \"legacy\" to revert to the proven order path.",'
+        '\n',
+        '            # path is in use (ORDER_API_VERSION="legacy") a pair spanning\n',
+    )
+
+    @classmethod
+    def _legacy_settings(cls, text: str) -> list[str]:
+        """Every place `text` names ORDER_API_VERSION and then, within 60
+        characters, a quoted legacy, after joining split string literals."""
+        joined = cls._JOIN_STRINGS.sub("", text).replace('\\"', '"').replace("\\'", "'")
+        return [m.group(0) for m in cls._SETS_TO_LEGACY.finditer(joined)]
+
+    def test_the_scan_catches_every_shape_the_package_has_used(self):
+        # Each sample is caught; an unquoted mention of the retired endpoint
+        # is not
+        for sample in self._REMEDY_SHAPES:
+            assert self._legacy_settings(sample), sample
+        for sample in ('ORDER_API_VERSION = "legacy"', "ORDER_API_VERSION='legacy'",
+                       'ORDER_API_VERSION == "legacy"', 'order_api_version = "LEGACY"',
+                       'flip ORDER_API_VERSION back to\n    "legacy"'):
+            assert self._legacy_settings(sample), sample
+        # The retired endpoint may still be named, unquoted, beside the switch
+        assert not self._legacy_settings(
+            'config.ORDER_API_VERSION is None: Kalshi retired the legacy endpoint'
+        )
+
+    def test_no_source_text_sets_the_switch_to_legacy(self):
+        # No file in the package, comments and docstrings included, tells
+        # anyone to set ORDER_API_VERSION to "legacy": that path does not exist
+        package = PROJECT_ROOT / "kalshi_betting"
+        hits = []
+        for path in sorted(package.rglob("*.py")):
+            hits += [f"{path.name}: {found!r}"
+                     for found in self._legacy_settings(path.read_text(encoding="utf-8"))]
+        assert hits == []
 
 class TestOrderWriteBudget:
     """trader's write pacer, built from ORDER_WRITES_PER_SECOND and

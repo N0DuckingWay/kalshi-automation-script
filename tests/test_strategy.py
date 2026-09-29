@@ -2129,16 +2129,6 @@ class TestReachableDepthSizing:
                     continue
                 assert self._reach(spec, levels) >= spec.x, (levels, balance, spec.x)
 
-    def test_legacy_path_keeps_the_whole_ladder(self, monkeypatch):
-        # The legacy cap is buy_max_cost, a TOTAL-cost cap that CAN sweep a
-        # ladder, so narrowing to reachable depth there would shrink sizes for
-        # no reason. Gated, not unconditional.
-        monkeypatch.setattr(strategy, "ORDER_API_VERSION", "legacy")
-        levels = [(0.32, 0.30, 300.0), (0.37, 0.30, 300.0)]
-        pair = make_booked_pair(levels, pair_type="same_title")
-        spec = compute_trade(pair, _AMPLE_BALANCE_CENTS)
-        assert spec.x == 600
-
 
 class TestPortfolioSummaryIsFeeInclusive:
     """

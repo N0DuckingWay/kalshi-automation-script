@@ -35,30 +35,23 @@ Notes:
     Raw-response variants bypass the models — but they also skip the SDK's
     status check, which fetch_json_page restores.
 
-    signed_request_json() generalizes that to routes with no SDK method at all —
-    notably the V2 order endpoint /portfolio/events/orders, which trader.py now
-    submits through by default. It shares fetch_json_page's status-check + parse
-    tail via _check_and_parse, so the non-2xx → ApiException contract is
-    single-sourced. It contains NO retry logic on purpose: order submission
-    calls it directly and retry-free, because a retried fill-or-kill leg can
-    double-fill (see trader._submit_order_v2 and the CLAUDE.md rule). Read-only
-    callers wrap it in api_call_with_retry themselves.
+    signed_request_json() does the same for routes the SDK has no method for:
+    trader.py sends every order to the V2 order endpoint
+    /portfolio/events/orders through it, and the collateral transfer to
+    config.TRANSFER_PATH. It shares fetch_json_page's status check and JSON
+    parse (_check_and_parse). It never retries: a resent order can fill twice
+    and a resent transfer moves the money twice. Read-only callers wrap it in
+    api_call_with_retry themselves.
 
-    Neither public helper narrows its return type. Every Kalshi endpoint
-    observed answers a 2xx with a JSON object, but _check_and_parse hands back
-    whatever the parser produced, so both are annotated `-> Any`: a body of
-    `"accepted"`, `[]`, `123`, `true` or a literal `null` (which parses to
-    None) reaches the caller unchanged. Callers that immediately `.get()` it
-    raise AttributeError on such a body, and callers that subscript it
-    (trader._submit_order's `data["order"]["status"]`) raise TypeError. Both
-    are deliberate loud failures at most call sites, order submission included:
-    there an exception is what routes trader._execute_one into its
-    ambiguous-submission path, which reconciles the outcome against the
-    account's position ledger. trader._execute_transfer is one exception —
-    an accepted transfer has no such ledger to reconcile it against and its
-    caller's generic handler would report a FAILED POST — so it guards with
-    isinstance(..., dict) instead (DR-05). A few read-only lookups also check
-    the type, as a failed read.
+    Neither helper checks the type of a 2xx body, so both return `Any`: a
+    body of `"accepted"`, `[]`, `123`, `true` or `null` (None) reaches the
+    caller as-is, and a caller that calls `.get()` on it or indexes it
+    raises. That loud failure is intended almost everywhere, orders
+    included: a buy leg that raises is settled from the account's positions
+    by trader._execute_one, and an unwind that raises is reported
+    rollback_failed. trader._execute_transfer is the
+    exception and checks the type itself, because nothing reconciles a
+    transfer afterwards (DR-05). A few read-only lookups also check it.
 """
 import json
 import logging
@@ -85,15 +78,10 @@ except ImportError:
 # 500 / 502 / 503 / 504 sometimes appear during Kalshi maintenance or upstream blips.
 _RETRYABLE_STATUS: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 
-# Transport-level failures that carry no HTTP status but are just as transient
-# as a 503 — the connection died before or during the response body. Observed
-# live on 2026-08-03: a multi-hour backtest fetch was killed outright by
-# `urllib3.exceptions.ProtocolError: Connection broken: IncompleteRead` raised
-# from resp.read() inside fetch_json_page, because the retry wrapper only knew
-# how to recognize status-carrying errors. Retrying is safe here: every caller
-# of api_call_with_retry is a read-only market-data GET (order submission
-# deliberately bypasses this wrapper on both paths — see trader._submit_order
-# and trader._submit_order_v2).
+# Connection failures that carry no HTTP status but are as temporary as a 503:
+# the connection dropped before or while the response body arrived.
+# api_call_with_retry retries them. That is safe because every caller of it is
+# a read-only GET; orders never go through it (see trader._submit_order_v2).
 _urllib3_transient: tuple[type[BaseException], ...]
 try:
     # urllib3 ships as a dependency of the Kalshi SDK's rest client, but guard
@@ -242,22 +230,9 @@ def fetch_json_page(fetch_fn: Any, **kwargs) -> Any:  # whatever the 2xx body pa
         **kwargs: Query parameters forwarded to the SDK method.
 
     Returns:
-        Any: The parsed JSON response body — a `dict` for every Kalshi endpoint
-            response observed in practice, but not narrowed: _check_and_parse
-            returns whatever the JSON parser produced, so a body of `"ok"`,
-            `[]`, `123`, `true` or a literal `null` (which parses to None)
-            reaches the caller as-is. Callers that immediately `.get()` the
-            result raise AttributeError on such a body, and callers that
-            subscript it (trader._submit_order's `data["order"]["status"]`)
-            raise TypeError. Both are deliberate loud failures: on the order
-            path, raising is what routes trader._execute_one into its
-            ambiguous-submission path, where the account position decides the
-            outcome. One call site that instead guards with
-            isinstance(..., dict) — because its 2xx has already moved money and
-            nothing reconciles a transfer after the fact — is
-            trader._execute_transfer, which reads signed_request_json rather
-            than this helper (DR-05). A few read-only lookups also check the
-            type, as a failed read.
+        Any: The parsed JSON body, not type-checked (see the module Notes).
+            Every caller is a read-only GET, so a body that makes the caller
+            raise has changed nothing on the account.
 
     Raises:
         ApiException: (or a status-specific subclass) when the HTTP status is

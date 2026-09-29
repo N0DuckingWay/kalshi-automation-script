@@ -38,10 +38,10 @@ Dependencies:
     never touched.
 
 Notes:
-    The V2 live-execution replays run with dry_run=False against the config
-    default ORDER_API_VERSION="v2" — deliberately not monkeypatched, so they
-    prove the default path. Order responses are generated from each request's
-    own submitted count, so the tests don't depend on exact Kelly sizing.
+    The V2 live-execution replays run with dry_run=False and
+    config.ORDER_API_VERSION left at its shipped "v2". Order responses are
+    generated from each request's own submitted count, so the tests don't
+    depend on exact Kelly sizing.
 
     verify_auth() returns dict[int, int] (exchange_index -> cents), never a
     scalar — every mock of it here must return a dict, and _run_prod sizes on
@@ -299,6 +299,34 @@ def _main_with(monkeypatch, argv: list, **patches) -> dict:
         main.main()
     seen["code"] = exc_info.value.code
     return seen
+
+
+class TestOrderApiVersionGate:
+    """main() exits 2 on any config.ORDER_API_VERSION but "v2", in either
+    mode, before the live settings are resolved, logging is configured, a
+    client is built or a run mode starts; "v2" reaches the run mode."""
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("value", ["legacy", "V2", "", None])
+    def test_a_non_v2_order_path_exits_2_before_anything_runs(
+        self, monkeypatch, capsys, mode, value,
+    ):
+        monkeypatch.setattr(config, "ORDER_API_VERSION", value)
+        seen = _main_with(
+            monkeypatch, ["--mode", mode],
+            _resolve_live_settings=lambda *a: pytest.fail("resolved settings first"),
+        )
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen and "mode" not in seen
+        err = capsys.readouterr().err
+        assert config.order_api_version_error() in err
+        assert repr(value) in err and '"v2"' in err
+
+    def test_the_shipped_value_reaches_the_run_mode(self, monkeypatch):
+        assert config.ORDER_API_VERSION == "v2"
+        seen = _main_with(monkeypatch, ["--mode", "dev"])
+        assert seen["code"] == EXIT_OK and seen["mode"] == "dev"
 
 
 @pytest.mark.usefixtures("pinned_config_toggles")
@@ -1422,7 +1450,7 @@ def _live_shape_client(
         side_effect=_orderbook_side_effect
     )
 
-    # Legacy order path must never be touched — ORDER_API_VERSION defaults to "v2".
+    # Never called: every order goes through signed_request_json
     client.create_order_without_preload_content = MagicMock()
 
     # V2 submission plumbing — signed_request_json reads these directly.
@@ -1907,11 +1935,10 @@ class TestRunProdDryRunLiveShapeReplay:
 
 
 class TestRunProdLiveV2Replay:
-    """dry_run=False replays against the default ORDER_API_VERSION="v2" path
-    (deliberately not monkeypatched, per the task — this proves the default
-    live-execution path end-to-end). Every test tunes the market set down to
-    exactly one tradeable, selectable pair (SAME-EXP / SAME-CHEAP) so order
-    counts are fully deterministic."""
+    """dry_run=False replays of the shipped V2 order path end to end.
+    Every test tunes the market set down to exactly one tradeable,
+    selectable pair (SAME-EXP / SAME-CHEAP) so order counts are fully
+    deterministic."""
 
     @pytest.fixture(autouse=True)
     def _fresh_v2_mapping_latch(self, monkeypatch):
@@ -1989,8 +2016,7 @@ class TestRunProdLiveV2Replay:
         return client, captured
 
     def test_run_prod_live_v2_all_filled_end_to_end(self, monkeypatch):
-        # Not monkeypatched anywhere in this class — proves the DEFAULT order
-        # path (not a forced-on "v2") is what gets exercised end-to-end.
+        # The replays run under the shipped setting
         assert ORDER_API_VERSION == "v2"
 
         client, captured = self._run(monkeypatch, ["full", "full"])
