@@ -172,9 +172,8 @@ Notes:
     pair of the run is then stopped before anything is read or sent
     (status "failed"). On the V2 path, until one of the two latches is set,
     execute_trades runs pairs one at a time (for at most
-    config.V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS pairs that give no verdict),
-    so a disproof costs one wrong-side position rather than one per pair
-    already in flight.
+    config.V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS), so a disproof costs one
+    wrong-side position rather than one per pair already in flight.
 
     Shard routing is per LEG, not per bot. Kalshi partitioned the exchange into
     shards and every market carries its own exchange_index; each V2 order body
@@ -231,7 +230,7 @@ from .config import (
     TRANSFER_SETTLE_TIMEOUT_SECONDS,
     V2_FOK_KILL_ERROR_CODE,
     V2_FOK_KILL_HTTP_STATUS,
-    V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS,
+    V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS,
     V2_MAPPING_VERDICT_POLL_SECONDS,
     V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS,
     V2_ORDER_PATH,
@@ -2763,9 +2762,9 @@ def _confirm_v2_no_mapping(
     judged; a re-read that fails is the unknown outcome above. A zero that
     survives every re-read is judged disproven like any other wrong delta,
     and sets the latch too: the ledger then contradicts the fill report, a
-    state the bot cannot model. The price is that this pair's filled NO leg
-    can wait up to 7 s unhedged, once per process, and only when the ledger
-    lags.
+    state the bot cannot model. The price is that a filled NO leg checked
+    while the mapping is unverified can wait up to 7 s unhedged — usually
+    only the first of a process, and only when the ledger lags.
 
     If the mapping was already disproven in this process when this runs —
     this pair's NO leg filled after another pair's disproof — no position is
@@ -2777,10 +2776,10 @@ def _confirm_v2_no_mapping(
     Concurrency: execute_trades() runs pairs one at a time until this check
     has confirmed or disproven the mapping, so while it does no two pairs
     reach the check together and no pair is past its NO leg when the
-    disproven latch is set. After config.V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS
-    pairs without a verdict it runs the rest together, and a caller could run
-    _execute_one concurrently some other way; then two pairs can be here at
-    once, which costs a duplicate positions read, and each pair still stops
+    disproven latch is set. Once that phase has lasted
+    config.V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS it runs the rest together,
+    and a caller could run _execute_one concurrently some other way; then two
+    pairs can be here at once, which costs a duplicate positions read, and each pair still stops
     on its own evidence or on the latch. A bool assignment is atomic under
     the GIL.
 
@@ -2981,8 +2980,8 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     no pair can be between the two points when the latch is set; checking
     first also spares each stopped pair its two baseline reads. A pair
     already past this check when another pair sets the latch — possible only
-    once execute_trades has stopped running pairs one at a time without a
-    verdict (config.V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS), or for a caller
+    once execute_trades has stopped running pairs one at a time
+    (config.V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS), or for a caller
     that runs pairs concurrently some other way — still sends its NO leg; if
     it fills, the pair stops at manual_review before its YES leg (see
     _confirm_v2_no_mapping).
@@ -3354,8 +3353,8 @@ def _v2_mapping_unverified() -> bool:
     """
     Whether this process has yet to settle the V2 NO-leg mapping.
 
-    execute_trades runs pairs one at a time while this is True, up to
-    config.V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS pairs without a verdict.
+    execute_trades runs pairs one at a time while this is True, for at most
+    config.V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS.
 
     Returns:
         bool: True while the V2 order path is selected and this process has
@@ -3402,16 +3401,20 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     A pair can also finish without a verdict: its NO leg killed, its NO POST
     raising (an ambiguous leg the check never reaches, unless its position
     moved in a way that disproves the mapping), its worker raising, or the
-    check unable to read the account. Such a pair proves nothing, and when
-    position reads keep failing every pair would finish that way behind about
-    two minutes of retried reads. So after
-    config.V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS (3) pairs have run alone
-    without a verdict, a WARNING is logged and the rest start together, each
-    still checking its own NO fill; a disproof after that stops only the
-    pairs that start after it. The cost is paid once per process: usually
-    the first pair's NO POST and mapping check (a few round trips, up to 7 s
-    more when the ledger lags), and at most three pairs run alone in full.
-    The legacy path has no mapping check and always runs pairs concurrently.
+    check unable to read the account; the next pair then runs alone in turn.
+    When position reads keep failing every pair would finish that way behind
+    about two minutes of retried reads, so the phase is bounded in time:
+    once it has lasted config.V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS, the
+    pair still running is no longer waited for, a WARNING is logged, and the
+    rest start together, each still checking its own NO fill; a disproof
+    after that stops only the pairs that start after it. The bound is time
+    rather than a count of such pairs because a killed NO leg costs only a
+    round trip and must not use up the protection. The cost is paid once
+    per process: usually the first pair's NO POST and mapping check (a few
+    round trips, up to 7 s more when the ledger lags), and never more than
+    the budget. A stuck order POST likewise holds the rest back for at most
+    the budget. The legacy path has no mapping check and always runs pairs
+    concurrently.
 
     In dry_run mode, no orders are submitted. The function logs the intended
     trade — both legs in SUBMISSION order (NO leg first), with each leg's own
@@ -3465,35 +3468,39 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
 
     with ThreadPoolExecutor(max_workers=min(TRADER_MAX_WORKERS, len(specs))) as pool:
         future_to_spec: dict = {}
-        # Pairs that ran alone and finished with the mapping still unsettled
-        without_verdict = 0
-        cap_logged = False
+        # The one-at-a-time phase ends when the mapping is settled or at this
+        # deadline, whichever comes first (see the docstring)
+        deadline = time.monotonic() + V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS
+        budget_logged = False
         for spec in specs:
             future = pool.submit(_execute_one, client, spec)
             future_to_spec[future] = spec
             # Checked after submitting: once the mapping is settled there is
-            # nothing to wait for (see the docstring)
+            # nothing to wait for
             if not _v2_mapping_unverified():
                 continue
-            if without_verdict >= V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS:
-                if not cap_logged:
+            if time.monotonic() >= deadline:
+                if not budget_logged:
                     logging.warning(
-                        "V2 NO-leg mapping still unverified after %d pair(s)"
-                        " ran one at a time without a verdict — starting the"
-                        " remaining pairs together; each still checks its own"
-                        " NO fill, but a disproof now stops only the pairs that"
-                        " start after it",
-                        without_verdict,
+                        "V2 NO-leg mapping still unverified after %gs of"
+                        " running pairs one at a time — starting the remaining"
+                        " pairs together; each still checks its own NO fill,"
+                        " but a disproof now stops only the pairs that start"
+                        " after it",
+                        V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS,
                     )
-                    cap_logged = True
+                    budget_logged = True
                 continue
-            # Hold the next pair back until this one settles the mapping or
-            # finishes. The wait never raises; a worker's exception is
-            # collected below.
+            # Hold the next pair back until this one settles the mapping,
+            # finishes, or the deadline passes. The wait never raises; a
+            # worker's exception is collected below.
             while _v2_mapping_unverified() and not future.done():
-                wait_for_futures([future], timeout=V2_MAPPING_VERDICT_POLL_SECONDS)
-            if _v2_mapping_unverified():
-                without_verdict += 1
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                wait_for_futures(
+                    [future], timeout=min(V2_MAPPING_VERDICT_POLL_SECONDS, remaining),
+                )
         results = []
         # Collect per-future so one worker's exception cannot discard every other
         # pair's TradeResult — including confirmed real fills. A list

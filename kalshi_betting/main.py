@@ -1089,8 +1089,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
 
     # Submit orders sequentially per leg, concurrently across pairs (on the V2
     # path, one pair at a time until a NO fill has confirmed the order-side
-    # mapping, for at most three pairs without a verdict; a disproof stops
-    # every later pair)
+    # mapping, for at most config.V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS; a
+    # disproof stops every pair that starts after it)
     results = execute_trades(client, portfolio, dry_run=args.dry_run)
 
     # Read the post-trade balance for the Excel log separator row. Real orders

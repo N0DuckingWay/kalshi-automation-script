@@ -3044,51 +3044,106 @@ class TestV2MappingDisproofStopsTheRun:
         assert [r.status for r in results] == ["executed", "executed"]
         assert yes_saw_pair1 == [True]
 
-    def test_after_three_pairs_without_a_verdict_the_rest_start_together(
+    def test_killed_no_legs_do_not_use_up_the_one_at_a_time_phase(self, monkeypatch):
+        # The first three NO legs are killed (no verdict, one round trip
+        # each) and the mapping is wrong. Pair 3 still runs alone, disproves
+        # the mapping, and the other eight send nothing: one wrong-side
+        # position, where a count of three pairs without a verdict started
+        # the rest together and opened one per pair in flight.
+        specs = self._specs(12)
+        killed = [_no_leg(spec).market.ticker for spec in specs[:3]]
+        pair3_no = _no_leg(specs[3]).market.ticker
+        index = {id(spec): i for i, spec in enumerate(specs)}
+        # Pair 3's NO leg waits a moment for a later pair to start. Run alone,
+        # none does; started together, they would send NO legs meanwhile.
+        later_started = threading.Event()
+        seen_during_pair3: list[bool] = []
+
+        def pair3_waits(body):
+            if body["ticker"] == pair3_no:
+                seen_during_pair3.append(later_started.wait(0.2))
+
+        exchange = _SharedLedgerExchange(ask_sign=+1, killed=killed, on_post=pair3_waits)
+        monkeypatch.setattr(trader, "signed_request_json", exchange.post)
+        real = trader._execute_one
+
+        def run(client, spec):
+            if index[id(spec)] > 3:
+                later_started.set()
+            return real(client, spec)
+
+        monkeypatch.setattr(trader, "_execute_one", run)
+        results = execute_trades(exchange.client(), specs, dry_run=False)
+        assert seen_during_pair3 == [False]
+        assert [r.status for r in results] == (
+            ["failed"] * 3 + ["manual_review"] + ["failed"] * 8
+        )
+        assert all("not sent" in r.error for r in results[4:])
+        assert [b["ticker"] for b in exchange.posts] == (
+            killed + [_no_leg(specs[3]).market.ticker]
+        )
+        wrong_side = [t for t, v in exchange.positions.items() if v]
+        assert wrong_side == [_no_leg(specs[3]).market.ticker]
+
+    def test_the_time_budget_ends_the_phase_even_while_a_pair_is_stuck(
         self, monkeypatch, caplog,
     ):
-        # Every mapping check fails to read the account, so no pair gives a
-        # verdict. Pairs 0-2 run alone (each waits a moment for the next and
-        # none starts); then a WARNING, and pairs 3-5 start together.
+        # Every check fails to read the account, so no pair gives a verdict.
+        # Pairs 0 and 1 run alone. Pair 2's NO POST hangs until another pair
+        # starts: once the (shortened) budget has passed, execute_trades stops
+        # waiting for it, logs one WARNING, and starts pairs 3-5 together.
+        monkeypatch.setattr(trader, "V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS", 0.5)
         specs = self._specs(6)
+        stuck = _no_leg(specs[2]).market.ticker
+        index = {id(spec): i for i, spec in enumerate(specs)}
+        pair3_started = threading.Event()
+        stuck_released: list[bool] = []
+
+        def hang_until_pair3(body):
+            if body["ticker"] == stuck:
+                stuck_released.append(pair3_started.wait(5))
+
         exchange = _SharedLedgerExchange(
             unreadable=[_no_leg(spec).market.ticker for spec in specs],
+            on_post=hang_until_pair3,
         )
         monkeypatch.setattr(trader, "signed_request_json", exchange.post)
         monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", trader._WritePacer(1000, 100))
-        index = {id(spec): i for i, spec in enumerate(specs)}
-        started = [threading.Event() for _ in specs]
-        next_started_early: dict[int, bool] = {}
+        events: list[tuple[str, int]] = []
+        lock = threading.Lock()
         together = threading.Barrier(3, timeout=5)
         real = trader._execute_one
 
         def run(client, spec):
             i = index[id(spec)]
-            started[i].set()
-            if i < 3:
-                next_started_early[i] = started[i + 1].wait(0.2)
-            else:
-                together.wait()
-            return real(client, spec)
+            with lock:
+                events.append(("start", i))
+            if i == 3:
+                pair3_started.set()
+            try:
+                if i >= 3:
+                    together.wait()
+                return real(client, spec)
+            finally:
+                with lock:
+                    events.append(("end", i))
 
         monkeypatch.setattr(trader, "_execute_one", run)
         with caplog.at_level(logging.INFO, logger="root"):
             results = execute_trades(exchange.client(), specs, dry_run=False)
 
-        assert config.V2_MAPPING_CHECK_MAX_UNVERIFIED_PAIRS == 3
         assert [r.status for r in results] == ["executed"] * 6
-        assert next_started_early == {0: False, 1: False, 2: False}
+        assert stuck_released == [True]
+        assert events[:5] == [("start", 0), ("end", 0), ("start", 1), ("end", 1), ("start", 2)]
+        # Pair 3 started while pair 2 was still stuck
+        assert events.index(("start", 3)) < events.index(("end", 2))
         warnings = [
             r.getMessage() for r in caplog.records
-            if "still unverified after 3 pair(s)" in r.getMessage()
+            if "still unverified after 0.5s of running pairs one at a time" in r.getMessage()
         ]
         assert len(warnings) == 1
         assert trader._V2_NO_MAPPING_CONFIRMED is False
         assert trader._V2_NO_MAPPING_DISPROVEN is False
-        # Every pair went ahead unchecked and is on record
-        assert sorted(trader._V2_UNCHECKED_NO_LEGS) == sorted(
-            _no_leg(spec).market.ticker for spec in specs
-        )
 
     def test_a_disproof_names_the_pairs_that_went_ahead_unchecked(self, monkeypatch, caplog):
         # Pair 0's check cannot read the account, so it sends its YES leg on
@@ -3112,6 +3167,36 @@ class TestV2MappingDisproofStopsTheRun:
         assert [b["ticker"] for b in exchange.posts] == [
             pair0_no, _yes_leg(specs[0]).market.ticker, _no_leg(specs[1]).market.ticker,
         ]
+
+    def test_an_ambiguous_disproof_names_the_pairs_that_went_ahead_unchecked(
+        self, monkeypatch, caplog,
+    ):
+        # Pair 0's check cannot read the account, so it goes ahead. Pair 1's
+        # NO POST raises after a wrong-way fill, and the CRITICAL of that
+        # ambiguous-leg disproof names pair 0's position as well.
+        specs = self._specs(3)
+        pair0_no = _no_leg(specs[0]).market.ticker
+        pair1_no = _no_leg(specs[1]).market.ticker
+        exchange = _SharedLedgerExchange(ask_sign=+1, unreadable=[pair0_no])
+        post = exchange.post
+
+        def raise_on_pair1(client, method, path, body):
+            reply = post(client, method, path, body)
+            if body["ticker"] == pair1_no:
+                raise ConnectionError("connection reset after the fill")
+            return reply
+
+        monkeypatch.setattr(trader, "signed_request_json", raise_on_pair1)
+        with caplog.at_level(logging.INFO, logger="root"):
+            results = execute_trades(exchange.client(), specs, dry_run=False)
+        assert [r.status for r in results] == ["executed", "manual_review", "failed"]
+        assert "treated as disproven" in results[1].error
+        stop = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.CRITICAL and "treated as disproven" in r.getMessage()
+        ]
+        assert len(stop) == 1
+        assert f"check the positions on {pair0_no} too" in stop[0]
 
     @pytest.mark.parametrize("ask_reply", ["raise", "no-fill-count"])
     def test_an_ambiguous_no_leg_that_moved_the_wrong_way_stops_the_run(
