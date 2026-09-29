@@ -2252,6 +2252,10 @@ class TestAttention:
                     "aaaaaaaaaaaaaaaa</a> of 2026-09-29 16:05 UTC) ended needing manual "
                     "attention (exit 20).") in body
             assert "stop trading and flatten by hand in the Kalshi UI" in body
+            # After a disproof it names every way a new real-money run starts
+            assert ("a new real-money run would open another wrong-side position, so "
+                    "stop the scheduler daemon if it is running, do not run main.py "
+                    "--mode prod, and do not press Confirm and trade.") in body
             assert html.escape(defaults_server._ACK_LABEL) in body
 
     def test_an_exit_20_scheduled_run_raises_the_banner(self):
@@ -2261,8 +2265,15 @@ class TestAttention:
             json.dumps(state), encoding="utf-8")
         notice = _app()._attention()
         assert notice is not None
-        assert notice.text.startswith(
-            "The last real-money run (the scheduled run of 2026-09-28 09:03) ended needing")
+        # A scheduled run has no run page, so the banner names the log its result is in,
+        # and after a disproof it names every way a new real-money run starts
+        assert notice.text == (
+            "The last real-money run (the scheduled run of 2026-09-28 09:03, logged in "
+            "kalshi_arb.log) ended needing manual attention (exit 20). Read its result "
+            "first. If it reports a V2 order-mapping disproof, stop trading and flatten by "
+            "hand in the Kalshi UI: a new real-money run would open another wrong-side "
+            "position, so stop the scheduler daemon if it is running, do not run main.py "
+            "--mode prod, and do not press Confirm and trade.")
 
     def test_a_newer_clean_run_clears_it(self):
         later = "2099-06-01T00:00:00"
@@ -2424,8 +2435,8 @@ class TestAttention:
         notice = _app()._attention()
         assert notice is not None
         assert notice.text.startswith(
-            "The last real-money run (the scheduled run of 2099-01-01 09:03) ended without "
-            "a clean result (")
+            "The last real-money run (the scheduled run of 2099-01-01 09:03, logged in "
+            "kalshi_arb.log) ended without a clean result (")
         assert why in notice.text
         assert defaults_server._CHECK_POSITIONS in notice.text
 

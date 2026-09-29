@@ -261,11 +261,50 @@ def assert_names_no_other_order_path(printed: str) -> None:
     assert "ORDER_API_VERSION" not in printed
 
 
+# The stop-trading words, spelled out rather than read back from v2_probe, so
+# a change to the probe's text fails here: the scheduler daemon and main.py by
+# hand, then the defaults server, whose Confirm and trade starts a new process
+# with its disproof latch clear.
+_STOP_SCHEDULER_AND_MAIN = (
+    "Stop trading until this is understood: stop the scheduler daemon if it is running, "
+    "and do not run main.py --mode prod."
+)
+_STOP_DEFAULTS_SERVER = (
+    "If the defaults server is running, stop it with Ctrl-C in the terminal running "
+    "./start_dashboard.sh or python3 -m kalshi_betting.defaults_server, and do not "
+    "press Confirm and trade."
+)
+_FLATTEN_BY_HAND = (
+    "Flatten any position on the probed ticker by hand in the Kalshi UI; there is no "
+    "other order path to fall back on."
+)
+
+
+def assert_names_stop_trading(printed: str) -> None:
+    """
+    Assert the output says to stop trading every way a real-money run starts.
+
+    Those ways are the scheduler daemon, main.py by hand and the defaults
+    server's Confirm and trade, each named in its own sentence.
+
+    Args:
+        printed (str): Everything the probe printed, or one closing line.
+
+    Raises:
+        AssertionError: When either sentence is missing.
+    """
+    assert _STOP_SCHEDULER_AND_MAIN in printed
+    assert _STOP_DEFAULTS_SERVER in printed
+
+
 def assert_names_the_remedy(printed: str) -> None:
     """Assert the output carries v2_probe._REMEDY (stop trading, flatten by
     hand in the Kalshi UI) and names no other order path."""
     assert v2_probe._REMEDY in printed
     assert "Kalshi UI" in printed
+    # Stopping trading names the defaults server as well as the scheduler
+    assert_names_stop_trading(printed)
+    assert _FLATTEN_BY_HAND in printed
     assert_names_no_other_order_path(printed)
 
 
@@ -1589,6 +1628,7 @@ class TestMainDispatch:
             monkeypatch, capsys, step, v2_probe._FAIL, ["--ticker", TICKER, "--step", step],
         )
         assert v2_probe._STOP_TRADING in closing
+        assert_names_stop_trading(closing)
         assert "Act only on the position warnings printed above" in closing
         assert v2_probe._FLATTEN not in closing
         assert "flatten any position" not in closing.lower()
@@ -1606,6 +1646,7 @@ class TestMainDispatch:
             ["--step", "transfer", "--ticker", TICKER],
         )
         assert v2_probe._STOP_TRADING in closing
+        assert_names_stop_trading(closing)
         assert "Check each shard's balance in the Kalshi UI" in closing
         assert "flatten" not in closing.lower()
         assert TICKER not in closing and "ticker" not in closing.lower()
@@ -1620,6 +1661,7 @@ class TestMainDispatch:
         closing = self._closing(monkeypatch, capsys, step, v2_probe._NEUTRAL, argv)
         assert "inconclusive" in closing
         assert "stop trading" not in closing.lower()
+        assert "defaults server" not in closing
         assert "flatten" not in closing.lower()
         assert ("Both --step no-mapping and --step unfillable-ask have to PASS before the "
                 "V2 order path should be trusted to run unsupervised") in closing
@@ -1658,7 +1700,20 @@ class TestMainDispatch:
         )
         assert "Record this output" in closing
         assert v2_probe._STOP_TRADING not in closing
+        assert "defaults server" not in closing
         assert "flatten" not in closing.lower()
+
+    def test_stop_trading_names_every_way_a_real_money_run_starts(self):
+        # The stop-trading sentence keeps its scheduler-and-main.py words and
+        # then names the defaults server, whose Confirm and trade starts a new
+        # process; the remedy and both FAIL closing lines start with it.
+        assert v2_probe._STOP_TRADING == f"{_STOP_SCHEDULER_AND_MAIN} {_STOP_DEFAULTS_SERVER}"
+        assert v2_probe._FLATTEN == _FLATTEN_BY_HAND
+        assert v2_probe._REMEDY == (
+            f"{_STOP_SCHEDULER_AND_MAIN} {_STOP_DEFAULTS_SERVER} {_FLATTEN_BY_HAND}"
+        )
+        assert v2_probe._ORDER_FAIL_CLOSING.startswith(v2_probe._STOP_TRADING)
+        assert v2_probe._TRANSFER_FAIL_CLOSING.startswith(v2_probe._STOP_TRADING)
 
 _PIPELINE_MODULES = [
     "main", "trader", "scanner", "auth", "strategy", "reporter", "scheduler",

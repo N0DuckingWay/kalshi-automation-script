@@ -362,6 +362,19 @@ def v2_mapping_confirmed(monkeypatch):
     monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", True)
 
 
+# How the stop-trading remedy names the ways a real-money run starts: the
+# scheduler daemon and main.py by hand, and the defaults server, whose Confirm
+# and trade starts a new process with its disproof latch clear.
+_REMEDY_SCHEDULER_AND_MAIN = (
+    "stop the scheduler daemon if it is running, and do not run main.py --mode prod"
+)
+_REMEDY_DEFAULTS_SERVER = (
+    "the defaults server is running, stop it with Ctrl-C in the terminal running"
+    " ./start_dashboard.sh or python3 -m kalshi_betting.defaults_server, and do not"
+    " press Confirm and trade"
+)
+
+
 def assert_disproof_names_the_remedy(caplog) -> None:
     """Assert the disproven-mapping CRITICAL says to stop trading and flatten
     by hand in the Kalshi UI, and names no other order path."""
@@ -371,8 +384,40 @@ def assert_disproof_names_the_remedy(caplog) -> None:
     assert "MAPPING DISPROVEN" in message
     assert "Stop trading" in message and "Kalshi UI" in message
     assert "no other order path to fall back on" in message
+    # Stopping trading names every way a real-money run starts: the scheduler
+    # daemon, main.py by hand and the defaults server's Confirm and trade
+    assert _REMEDY_SCHEDULER_AND_MAIN in message
+    assert _REMEDY_DEFAULTS_SERVER in message
+    assert (
+        f"Stop trading until this is understood ({_REMEDY_SCHEDULER_AND_MAIN}; if"
+        f" {_REMEDY_DEFAULTS_SERVER}), and flatten this position by hand in the Kalshi"
+        " UI; there is no other order path to fall back on."
+    ) in message
     assert "legacy" not in message.lower()
     assert "ORDER_API_VERSION" not in message
+
+
+def assert_ambiguous_stop_names_the_remedy(message: str) -> None:
+    """
+    Assert an ambiguous NO leg's run-stopping CRITICAL names the whole remedy.
+
+    It must say to stop the bot and flatten by hand in the Kalshi UI, and then
+    name every way a real-money run starts: the scheduler daemon, main.py by
+    hand, and the defaults server's Confirm and trade.
+
+    Args:
+        message (str): The run-stopping CRITICAL's message.
+
+    Raises:
+        AssertionError: When any of those words is missing.
+    """
+    assert "Stop the bot and flatten this position by hand in the Kalshi UI." in message
+    assert _REMEDY_SCHEDULER_AND_MAIN in message
+    assert _REMEDY_DEFAULTS_SERVER in message
+    assert (
+        "Stop the bot and flatten this position by hand in the Kalshi UI. To stop the"
+        f" bot, {_REMEDY_SCHEDULER_AND_MAIN}; if {_REMEDY_DEFAULTS_SERVER}."
+    ) in message
 
 
 class TestRollbackVerification:
@@ -2950,6 +2995,7 @@ class TestV2MappingDisproofStopsTheRun:
         ]
         assert len(stop) == 1
         assert f"check the positions on {pair0_no} too" in stop[0]
+        assert_ambiguous_stop_names_the_remedy(stop[0])
 
     @pytest.mark.parametrize("ask_reply", ["raise", "no-fill-count"])
     def test_an_ambiguous_no_leg_that_moved_the_wrong_way_stops_the_run(
@@ -2974,6 +3020,12 @@ class TestV2MappingDisproofStopsTheRun:
             and "the rest of this run is stopped" in r.getMessage()
             for r in caplog.records
         )
+        stops = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.CRITICAL
+            and "the rest of this run is stopped" in r.getMessage()
+        ]
+        assert_ambiguous_stop_names_the_remedy(stops[0])
 
     @pytest.mark.parametrize(
         "confirmed, after", [(True, ("TICK-A", 5)), (False, RuntimeError("down"))],

@@ -227,9 +227,15 @@ _EXIT_CODES = {_PASS: 0, _FAIL: 1, _NEUTRAL: 2}
 # What the operator is told to do when a step shows the V2 order path
 # misbehaving. _STOP_TRADING says to halt the bot; _REMEDY and every closing
 # line main() prints after a FAIL start with it.
+# It names every way a real-money run starts (the scheduler daemon, main.py by
+# hand, the defaults server's Confirm and trade), since each starts a new
+# process whose trader latches are clear.
 _STOP_TRADING = (
     "Stop trading until this is understood: stop the scheduler daemon if it is running, "
     "and do not run main.py --mode prod."
+    " If the defaults server is running, stop it with Ctrl-C in the terminal running "
+    "./start_dashboard.sh or python3 -m kalshi_betting.defaults_server, and do not "
+    "press Confirm and trade."
 )
 # _FLATTEN is printed only where the probe found the ticker flat before it
 # submitted, so any position there is the probe's own; elsewhere it could be

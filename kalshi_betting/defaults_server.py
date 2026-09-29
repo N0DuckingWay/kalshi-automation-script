@@ -403,11 +403,15 @@ _CLEAN_EXITS = frozenset({EXIT_OK, EXIT_TIME_SERIES_SKIPPED})
 
 # How the attention warning ends, after "The last real-money run (<which>)":
 # for a run that needed a person, and for one that ended without a clean
-# result ({why} says how it ended)
+# result ({why} says how it ended). After a V2 order-mapping disproof every new
+# real-money run is a new process that would open another wrong-side position,
+# so _ATTENTION_TAIL names every way one starts: the scheduler daemon, main.py
+# by hand and this page's Confirm and trade.
 _ATTENTION_TAIL = (" ended needing manual attention ({why}). Read its result first. If it "
                    "reports a V2 order-mapping disproof, stop trading and flatten by hand in "
                    "the Kalshi UI: a new real-money run would open another wrong-side "
-                   "position.")
+                   "position, so stop the scheduler daemon if it is running, do not run "
+                   "main.py --mode prod, and do not press Confirm and trade.")
 _UNCLEAN_TAIL = " ended without a clean result ({why}). " + _CHECK_POSITIONS
 
 # The attention warning when the runs' records could not be read at all: it
@@ -598,7 +602,8 @@ class _LastRun:
             check), "attention" (a pair needs a person) or "unclean" (it ended
             without a clean result, so orders may have been placed).
         why (str): How it ended, in words, e.g. "exit 20" or "it wrote no result".
-        where (str): Which run, as plain text.
+        where (str): Which run, as plain text; a scheduled run, which has no
+            page, also names the log its result is in.
         where_html (str): The same, escaped, linking to its page when it has one.
     """
     finished: datetime
@@ -1686,6 +1691,8 @@ def _scheduled_last_run() -> _LastRun | None:
     (_NO_ORDER_EXITS) are left out; a finished run with no readable exit code
     (stopped at the scheduler's time limit, not started, or a damaged record)
     is "unclean".
+    The run is named with its local finish time and kalshi_arb.log, where
+    its result is, since it writes no result file and has no run page.
 
     Returns:
         _LastRun | None: What it tells, or None when it is left out.
@@ -1704,7 +1711,9 @@ def _scheduled_last_run() -> _LastRun | None:
     why = verdict[1] if code is not None else (
         "the scheduler recorded no exit code: it was stopped at its time limit, could not "
         "be started, or its record is damaged")
-    when = f"the scheduled run of {finished:%Y-%m-%d %H:%M}"
+    # A scheduled run writes no result file and has no run page; its result,
+    # a disproof CRITICAL included, is in the log main.py writes
+    when = f"the scheduled run of {finished:%Y-%m-%d %H:%M}, logged in kalshi_arb.log"
     return _LastRun(finished, verdict[0], why, when, html.escape(when))
 
 
