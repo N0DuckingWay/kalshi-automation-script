@@ -1,7 +1,8 @@
 """Tests for config.py fee helpers, the time-series probability model, the
 leg-side tuples, the deadline-gap tier (with the backtest's spread band and
 tier-floors switch), the live toggles (LiveSettings and its helpers), the
-values config.py ships, conftest's apply_pre_toggle_defaults, the V2 order
+weekly run schedule (ScheduledRun), the values config.py ships, conftest's
+apply_pre_toggle_defaults, the V2 order
 path's self-trade-prevention value, the startup check that refuses any order
 path but "v2" (order_api_version_error), the order-write pacer's budget, and
 PROJECT_ROOT."""
@@ -12,8 +13,9 @@ import logging
 import math
 import pathlib
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
 
@@ -25,6 +27,7 @@ from kalshi_betting.config import (
     PRICE_EPSILON,
     PROJECT_ROOT,
     SAME_TITLE_LEG_SIDES,
+    SCHEDULED_RUN,
     SHORT_DEADLINE_GAP_DAYS,
     SPREAD_ABOVE_CEILING,
     SPREAD_BELOW_FLOOR,
@@ -32,6 +35,7 @@ from kalshi_betting.config import (
     TAKER_FEE_RATE,
     TIME_SERIES_LEG_SIDES,
     LiveSettings,
+    ScheduledRun,
     fee_leg_exact,
     fee_per_pair_approx,
     live_settings,
@@ -1466,3 +1470,147 @@ class TestPreToggleDefaults:
     def test_no_test_module_binds_a_toggle_by_value(self):
         # A by-value import would freeze the shipped value past every patch
         assert self._by_value_binders(pathlib.Path(__file__).parent) == []
+
+
+class TestScheduledRun:
+    """ScheduledRun, the weekly live run's schedule. The scheduler fires the
+    live run from it and the backtest enters every trade at instant(d), so
+    instant() must follow daylight-saving rules and date_problems() must flag
+    every run date that is not one UTC moment on that same date."""
+
+    def test_the_shipped_schedule_is_monday_0900_los_angeles(self):
+        # A change to the live run's time must fail a test, never pass silently
+        assert SCHEDULED_RUN == ScheduledRun(0, 9, 0, "America/Los_Angeles")
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"weekday": 7},
+            {"weekday": -1},
+            {"hour": 24},
+            {"minute": 60},
+            {"weekday": True},
+            {"hour": "9"},
+            {"minute": 0.0},
+            {"timezone": ""},
+            {"timezone": None},
+        ],
+        ids=lambda kw: "-".join(f"{k}={v!r}" for k, v in kw.items()),
+    )
+    def test_a_bad_field_is_refused(self, kwargs):
+        fields = {"weekday": 0, "hour": 9, "minute": 0, "timezone": "America/Los_Angeles"}
+        fields.update(kwargs)
+        with pytest.raises(ValueError, match=next(iter(kwargs))):
+            ScheduledRun(**fields)
+
+    def test_the_zone_is_resolved_only_on_use(self):
+        run = ScheduledRun(0, 9, 0, "No/Such_Zone")  # constructing never looks it up
+        with pytest.raises(ZoneInfoNotFoundError):
+            run.zone()
+
+    def test_frozen_and_compared_by_value(self):
+        run = ScheduledRun(0, 9, 0, "America/Los_Angeles")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            run.hour = 10
+        assert run == SCHEDULED_RUN
+        assert hash(run) == hash(SCHEDULED_RUN)
+        assert run != ScheduledRun(0, 9, 0, "UTC")
+
+    def test_accessors(self):
+        assert SCHEDULED_RUN.zone() == ZoneInfo("America/Los_Angeles")
+        assert SCHEDULED_RUN.weekday_name() == "monday"
+        assert SCHEDULED_RUN.at_time() == "09:00"
+        assert SCHEDULED_RUN.label() == "Monday 09:00 America/Los_Angeles"
+        assert SCHEDULED_RUN.cache_slug() == "mon0900-America-Los_Angeles"
+        other = ScheduledRun(6, 7, 5, "Etc/GMT+8")
+        assert other.weekday_name() == "sunday"
+        assert other.at_time() == "07:05"
+        assert other.label() == "Sunday 07:05 Etc/GMT+8"
+        assert other.cache_slug() == "sun0705-Etc-GMT+8"
+
+    def test_wall_time_is_the_zones_wall_clock(self):
+        wall = SCHEDULED_RUN.wall_time(date(2026, 9, 21))
+        assert wall.tzinfo == ZoneInfo("America/Los_Angeles")
+        assert (wall.year, wall.month, wall.day, wall.hour, wall.minute) == (2026, 9, 21, 9, 0)
+
+    @pytest.mark.parametrize(
+        ("d", "utc_hour"),
+        [
+            (date(2026, 9, 21), 16),   # daylight time
+            (date(2026, 10, 26), 16),  # the last Monday of daylight time
+            (date(2026, 11, 2), 17),   # the first Monday of standard time
+            (date(2027, 3, 8), 17),    # the last Monday of standard time
+            (date(2027, 3, 15), 16),   # the first Monday of daylight time
+            (date(2040, 7, 2), 16),    # zoneinfo keeps US daylight time past 2037
+        ],
+    )
+    def test_instant_follows_daylight_saving(self, d, utc_hour):
+        assert SCHEDULED_RUN.instant(d) == datetime(d.year, d.month, d.day, utc_hour, 0, tzinfo=UTC)
+
+    def test_the_shipped_schedule_has_no_date_problems(self):
+        assert SCHEDULED_RUN.date_problems(date(1990, 1, 1), date(2100, 12, 31)) == []
+
+    def test_a_skipped_wall_time_is_flagged(self):
+        # Sunday 02:30 does not exist in Los Angeles on the spring-forward day.
+        problems = ScheduledRun(6, 2, 30, "America/Los_Angeles").date_problems(
+            date(2026, 1, 1), date(2026, 12, 31))
+        assert len(problems) == 1
+        assert problems[0].startswith("2026-03-08: ") and "skipped" in problems[0]
+
+    def test_a_repeated_wall_time_is_flagged(self):
+        # Sunday 01:30 occurs twice in Los Angeles on the fall-back day.
+        problems = ScheduledRun(6, 1, 30, "America/Los_Angeles").date_problems(
+            date(2026, 1, 1), date(2026, 12, 31))
+        assert len(problems) == 1
+        assert problems[0].startswith("2026-11-01: ") and "repeated" in problems[0]
+
+    @pytest.mark.parametrize(
+        ("run", "d", "expected"),
+        [
+            # Spring forward: the clock jumps from 02:00 to 03:00.
+            (ScheduledRun(6, 2, 30, "America/Los_Angeles"), date(2026, 3, 8), "skipped"),
+            # Fall back: the clock repeats 01:00-02:00.
+            (ScheduledRun(6, 1, 30, "America/Los_Angeles"), date(2026, 11, 1), "repeated"),
+            # Either side of each change, and a wall time the change never reaches.
+            (ScheduledRun(6, 2, 30, "America/Los_Angeles"), date(2026, 3, 1), None),
+            (ScheduledRun(6, 1, 30, "America/Los_Angeles"), date(2026, 11, 8), None),
+            (ScheduledRun(6, 9, 0, "America/Los_Angeles"), date(2026, 3, 8), None),
+            # Southern hemisphere: Sydney springs forward in October, falls back in April.
+            (ScheduledRun(6, 2, 30, "Australia/Sydney"), date(2026, 10, 4), "skipped"),
+            (ScheduledRun(6, 2, 30, "Australia/Sydney"), date(2026, 4, 5), "repeated"),
+        ],
+        ids=["la-gap", "la-fold", "la-before-gap", "la-after-fold", "la-0900",
+             "sydney-gap", "sydney-fold"],
+    )
+    def test_clock_change_names_a_skipped_or_repeated_wall_time(self, run, d, expected):
+        assert run.clock_change(d) == expected
+
+    @pytest.mark.parametrize(
+        "run",
+        [
+            ScheduledRun(0, 20, 0, "America/Los_Angeles"),  # 03:00Z/04:00Z Tuesday
+            ScheduledRun(0, 8, 0, "Asia/Tokyo"),            # 23:00Z Sunday
+        ],
+        ids=["los-angeles-20h", "tokyo-08h"],
+    )
+    def test_a_date_shift_is_flagged_on_every_run_date(self, run):
+        problems = run.date_problems(date(2026, 9, 1), date(2026, 9, 30))
+        assert [p[:10] for p in problems] == ["2026-09-07", "2026-09-14", "2026-09-21", "2026-09-28"]
+        assert all("another date in UTC" in p for p in problems)
+
+    def test_midnight_utc_on_the_same_date_passes(self):
+        # Tokyo 09:00 is 00:00Z on the same calendar date.
+        assert ScheduledRun(0, 9, 0, "Asia/Tokyo").date_problems(
+            date(2026, 1, 1), date(2026, 12, 31)) == []
+
+    def test_out_of_range_dates_are_listed_not_raised(self):
+        # Tokyo 08:00 on year 1's first Monday is before datetime's range in UTC
+        run = ScheduledRun(0, 8, 0, "Asia/Tokyo")
+        first = run.date_problems(date(1, 1, 1), date(1, 1, 7))
+        assert len(first) == 1 and "outside datetime's range" in first[0]
+        last = run.date_problems(date(9999, 12, 20), date.max)
+        assert [p[:10] for p in last] == ["9999-12-20", "9999-12-27"]
+        assert SCHEDULED_RUN.date_problems(date(9999, 12, 20), date.max) == []
+        # No Monday is left before date.max: an empty list, never an overflow
+        assert SCHEDULED_RUN.date_problems(date(9999, 12, 28), date.max) == []
+        assert SCHEDULED_RUN.date_problems(date.max, date.max) == []

@@ -28,9 +28,11 @@ import math
 import numbers
 import pathlib
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 # ── API base URLs ─────────────────────────────────────────────────────────────
 
@@ -831,6 +833,217 @@ TRANSFER_SETTLE_TIMEOUT_SECONDS = 30
 # loop while money is in flight.
 TRANSFER_POLL_INTERVAL_SECONDS = 2
 
+# ── Weekly scheduler ──────────────────────────────────────────────────────────
+
+# Weekday names, index 0 = Monday, spelled as the `schedule` library's methods.
+_WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+@dataclass(frozen=True)
+class ScheduledRun:
+    """
+    When the weekly live run happens: a weekday, a wall-clock time and a time zone.
+
+    Wall-clock means what a clock in that zone reads, so the UTC moment moves
+    with daylight-saving time. scheduler.py fires the live run at
+    config.SCHEDULED_RUN's weekday and time on the host's clock, and the
+    backtest opens simulated trades only at its UTC moments (its ENTRY
+    CHECKPOINTS). A spring clock change SKIPS the wall times in its jump and
+    an autumn one REPEATS them (clock_change()). The zone is looked up only
+    in zone(), so importing config needs no tz database. Frozen, so it can
+    key backtester._checkpoint_floor's cache.
+
+    Attributes:
+        weekday (int): datetime.weekday() of the run, 0 = Monday.
+        hour (int): Wall-clock hour, 0-23.
+        minute (int): Wall-clock minute, 0-59.
+        timezone (str): IANA zone name, e.g. "America/Los_Angeles".
+    """
+    weekday: int
+    hour: int
+    minute: int
+    timezone: str
+
+    def __post_init__(self) -> None:
+        """
+        Check each field's type and range, so a bad schedule fails where it is built.
+
+        Raises:
+            ValueError: weekday, hour or minute is not an int in range (a bool
+                is refused), or timezone is not a non-empty str.
+        """
+        for name, value, top in (("weekday", self.weekday, 6), ("hour", self.hour, 23),
+                                 ("minute", self.minute, 59)):
+            if type(value) is not int or not 0 <= value <= top:
+                raise ValueError(f"ScheduledRun.{name} must be an int in [0, {top}], got {value!r}")
+        if type(self.timezone) is not str or not self.timezone:
+            raise ValueError(f"ScheduledRun.timezone must be an IANA zone name, got {self.timezone!r}")
+
+    def zone(self) -> ZoneInfo:
+        """
+        Look up the IANA time zone named by `timezone`.
+
+        Returns:
+            ZoneInfo: The zone.
+
+        Raises:
+            zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: The name is
+                unknown, malformed (a path) or not a zone file ("America").
+        """
+        return ZoneInfo(self.timezone)
+
+    def weekday_name(self) -> str:
+        """
+        Name the run weekday as the `schedule` library spells it (schedule.every().monday).
+
+        Returns:
+            str: Lower-case weekday, e.g. "monday".
+        """
+        return _WEEKDAY_NAMES[self.weekday]
+
+    def at_time(self) -> str:
+        """
+        Format the run time as "HH:MM", the form `schedule`'s Job.at() takes.
+
+        Returns:
+            str: e.g. "09:00".
+        """
+        return f"{self.hour:02d}:{self.minute:02d}"
+
+    def label(self) -> str:
+        """
+        Describe the schedule for log lines and the backtest dashboard's header.
+
+        Returns:
+            str: e.g. "Monday 09:00 America/Los_Angeles".
+        """
+        return f"{self.weekday_name().capitalize()} {self.at_time()} {self.timezone}"
+
+    def cache_slug(self) -> str:
+        """
+        Name the schedule in a file-name-safe form, for the backtest's cache tag.
+
+        Returns:
+            str: e.g. "mon0900-America-Los_Angeles".
+        """
+        return (f"{self.weekday_name()[:3]}{self.hour:02d}{self.minute:02d}"
+                f"-{self.timezone.replace('/', '-')}")
+
+    def wall_time(self, d: date) -> datetime:
+        """
+        Build the run's wall-clock time on date `d` as a datetime carrying the zone.
+
+        When a clock change skips or repeats that time, Python's default applies
+        (fold=0: the UTC offset before the change).
+
+        Args:
+            d (date): A date in the zone; any weekday.
+
+        Returns:
+            datetime: tz-aware, tzinfo = zone().
+
+        Raises:
+            zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: As zone().
+        """
+        return datetime(d.year, d.month, d.day, self.hour, self.minute, tzinfo=self.zone())
+
+    def instant(self, d: date) -> datetime:
+        """
+        Convert the run's wall-clock time on date `d` to the UTC moment it happens.
+
+        The one definition of when the run happens (date_problems() repeats it inline).
+
+        Args:
+            d (date): A date in the zone; any weekday.
+
+        Returns:
+            datetime: tz-aware, in UTC.
+
+        Raises:
+            zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: As zone().
+            OverflowError: The UTC moment is outside datetime's range.
+        """
+        return self.wall_time(d).astimezone(UTC)
+
+    def clock_change(self, d: date) -> str | None:
+        """
+        Say whether a clock change skips or repeats the run's wall time on date `d`.
+
+        It compares the UTC offsets before (fold=0) and after (fold=1) a
+        change: larger after means skipped, smaller means repeated.
+
+        Args:
+            d (date): A date in the zone; any weekday.
+
+        Returns:
+            str | None: "skipped", "repeated", or None when it occurs once.
+
+        Raises:
+            zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: As zone().
+        """
+        wall = self.wall_time(d)
+        before, after = wall.utcoffset(), wall.replace(fold=1).utcoffset()
+        if before == after:
+            return None
+        return "skipped" if before < after else "repeated"
+
+    def date_problems(self, first: date, last: date) -> list[str]:
+        """
+        List the run dates in [first, last] whose run is not one UTC moment on that same date.
+
+        The backtest works in UTC dates, so backtester._prepare_candidates()
+        refuses the schedule, before fetching, if this list is not empty. Only
+        run weekdays are checked; a bad one is listed once, with its first
+        problem: out of datetime's range, skipped or repeated by a clock
+        change, or on another UTC date. Never raises OverflowError: an
+        out-of-range date is listed, and the walk never steps past date.max.
+
+        Args:
+            first (date): First date, inclusive.
+            last (date): Last date, inclusive.
+
+        Returns:
+            list[str]: "YYYY-MM-DD: <problem>" entries in date order.
+
+        Raises:
+            zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: As zone().
+        """
+        zone = self.zone()
+        problems: list[str] = []
+        ahead = (self.weekday - first.weekday()) % 7
+        if (date.max - first).days < ahead:
+            return problems
+        d = first + timedelta(days=ahead)
+        where = f"{self.at_time()} {self.timezone}"
+        while d <= last:
+            wall = datetime(d.year, d.month, d.day, self.hour, self.minute, tzinfo=zone)
+            try:
+                utc = wall.astimezone(UTC)
+            except OverflowError:
+                problems.append(f"{d.isoformat()}: {where} falls outside datetime's range in UTC")
+            else:
+                change = self.clock_change(d)
+                if change is not None:
+                    problems.append(f"{d.isoformat()}: {where} is {change} by a clock change")
+                elif utc.date() != d:
+                    problems.append(
+                        f"{d.isoformat()}: {where} is {utc:%Y-%m-%d %H:%M} UTC, "
+                        f"on another date in UTC"
+                    )
+            if (date.max - d).days < 7:
+                break
+            d += timedelta(days=7)
+        return problems
+
+
+# The weekly live run: Monday 09:00 Los Angeles time (16:00 UTC under daylight
+# time, 17:00 under standard time). scheduler.py fires it on the host's clock;
+# the backtest opens simulated trades only at these moments, so a change here
+# moves every backtest entry and renames its cached market list. scheduler.py
+# and backtester.py bind this at import: tests patch scheduler.SCHEDULED_RUN /
+# backtester.SCHEDULED_RUN, never config.*.
+SCHEDULED_RUN = ScheduledRun(weekday=0, hour=9, minute=0, timezone="America/Los_Angeles")
+
 # Maximum seconds a scheduler-spawned bot run may take before being killed.
 # Prevents a hung run (e.g. a network stall inside the SDK) from blocking the
 # weekly scheduler daemon forever.
@@ -1178,50 +1391,17 @@ TRADER_MAX_WORKERS = 8
 ORDER_WRITES_PER_SECOND = 8
 ORDER_WRITE_BURST = 8
 
-# Names the SEMANTICS of backtester._can_ever_enter(), which run_backtest()
-# passes to historical.fetch_all_settled_markets() as a prefilter so ineligible
-# markets are dropped during assembly instead of being held in memory and
-# written to the assembled cache. The tag is part of that cache's filename
-# (settled_markets_<start_date>_<tag>[_nomve].jsonl.gz since SS-1, and the
-# same stem with .json for the legacy caches still served — the trailing
-# marker is INCLUDE_MVE_MARKETS=False's, DR-57) and of the streamed cache's
-# meta block, so a cache built under one filter can never be served to code
-# expecting another. Because that marker is a bare
-# suffix rather than a delimited field, a tag ending in "_nomve" would collide
-# with the same tag minus the suffix under the other flag setting; harmless
-# while the tag is this single hand-edited constant, worth a delimiter if tags
-# ever become caller-supplied. (A streamed cache would still be refused on
-# such a collision, because its meta block carries the tag and the flag
-# separately; a legacy .json has no meta block to check.)
-#
-# MUST be bumped whenever _can_ever_enter's behaviour changes — otherwise a
-# stale prefiltered cache is silently reused and the backtest sees a market set
-# the current predicate would not have produced. Since M9 (P3) half of that is
-# no longer silent: _prepare_candidates re-applies the predicate to every
-# fetched corpus, and a re-check that rejects anything on a corpus assembled
-# under this tag is a WARNING naming this constant
-# (backtester._log_corpus_prefilter) — which catches a TIGHTENED predicate. A
-# LOOSENED one is still invisible, since the records the old predicate dropped
-# are simply absent from the cache.
-#
-# History: "monday-eligibility-v1" read open_time as a DATE, so it kept every
-# market that opened later on the checkpoint Monday itself — 2,192,241 of the
-# 7,274,215 records of the 2026-09-17 window's assembled cache (30.1%, the
-# 2026-09-24 review's M8) and 336,750 of the 570,506 of the 2026-07-13 one
-# (59.0%, streamed for P5). "monday-checkpoint-v2" (P5) compares open_time with
-# the 09:00 UTC checkpoint INSTANT (backtester._can_ever_enter). v2 admits a
-# subset of what v1 admitted (for every real UTC offset) and drops only
-# markets that can never be entered, so the entries a backtest finds over the
-# same settled records are unchanged. The bump ORPHANS every assembled cache
-# written under v1: the name stem changed, so none of them is ever read
-# again, and a rebuild retires only a legacy file of its OWN stem, so none is
-# ever deleted either — remove
-# backtest_cache/settled_markets_*_monday-eligibility-v1.* by hand. The day
-# slices are not keyed by this tag and are unaffected. Every eligible-record
-# count quoted in this repo from before P5 — 7,274,215 and 7,260,952 for the
-# 2026-09-17 window (and its 184,255 groupable), the frontier's 7,190,452 of
-# 9,176,306, 570,506 for 2026-07-13 — was measured under v1.
-SETTLED_PREFILTER_CACHE_TAG = "monday-checkpoint-v2"
+# Version name of backtester._can_ever_enter(), the backtest's eligibility
+# PREFILTER (a per-market test that drops settled markets no simulated trade
+# could use). The backtest's market list is cached on disk under this name
+# plus SCHEDULED_RUN.cache_slug() (backtester._prefilter_cache_tag), in the
+# file name (settled_markets_<start_date>_<tag>[_nomve].jsonl.gz, or .json
+# when legacy) and meta block, so a list filtered one way is never served to
+# another. MUST get a new version name whenever _can_ever_enter's logic or
+# CANDLESTICK_PERIOD_INTERVAL_MINUTES changes, or a stale cache is served
+# (_prepare_candidates' re-check WARNs on a stricter prefilter, but a looser
+# one goes unnoticed). Past versions: CLAUDE.md's prefilter gotcha.
+SETTLED_PREFILTER_CACHE_TAG = "checkpoint-v3"
 
 # How young an EMPTY assembled settled-market cache must be to still be served
 # (DR-13, P2 of the 2026-09-24 review). An empty corpus is not a result: it
@@ -1412,14 +1592,12 @@ SCANNER_PROGRESS_LOG_EVERY_PAGES = 25
 # ── Backtest candlestick granularity ────────────────────────────────────────
 
 # Minutes per candle requested from /historical/markets/{ticker}/candlesticks.
-# Daily (1440) only emits a bar for a market whose lifespan crosses a UTC
-# midnight boundary — confirmed 2026-07 by direct API testing: a 2-hour-long
-# market entirely within one day returned 0 daily candles but 2 hourly ones.
-# Most Kalshi markets are single-game/few-hour windows within one calendar
-# day, so daily granularity structurally produced zero price data for most
-# markets regardless of liquidity, which silently zeroed out backtest entries.
-# 60 (hourly) is the finest granularity actually available — period_interval=1
-# (minute) returns HTTP 400.
+# 60 (hourly) is the finest the endpoint serves (period_interval=1 returns
+# HTTP 400). Daily (1440) will not do: it emits a bar only for a market open
+# across a UTC midnight, and most Kalshi markets open and close within one
+# day, so daily candles would leave most markets with no prices at all.
+# The backtest's prefilter reads this period too (backtester._checkpoint_floor):
+# changing it requires a new SETTLED_PREFILTER_CACHE_TAG.
 CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
 
 # The most candles /historical/markets/{ticker}/candlesticks serves in ONE
