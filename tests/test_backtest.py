@@ -24,7 +24,10 @@ the setting.
 
 And the echo's "live rule=" clause: the saved live defaults' rule (with their
 origin), "none saved" with no file, "not recorded" with a refused one — a read
-of its own, never a scenario of this run and never config.py's toggles.
+of its own, never a scenario of this run and never config.py's toggles. And the
+run's last line, after the one pointing at the dashboard: how the filter bar's
+scenario becomes the live defaults (the defaults server, then the page's save
+button).
 
 Fully offline: run_backtest_sweep, generate_dashboard, both client builders
 and load_risk_free_rates are monkeypatched, so no network call, no credential
@@ -784,7 +787,8 @@ class TestSpreadValidationPrecedesLogging:
 
 
 class TestDashboardHandoff:
-    """generate_dashboard gets the whole sweep plus the RESOLVED primary k."""
+    """generate_dashboard gets the whole sweep plus the RESOLVED primary k, and
+    the run closes by saying how the page's scenario becomes the live defaults."""
 
     def test_sweep_and_primary_k_are_passed(self, cli, monkeypatch):
         _run(monkeypatch, "--interval-discount", "0.62")
@@ -810,6 +814,21 @@ class TestDashboardHandoff:
         _run(monkeypatch)
         _, kwargs = cli["dashboard"]
         assert kwargs["risk_free"] is cli["risk_free"]
+
+    def test_the_run_closes_with_how_to_save_the_live_defaults(self, cli, monkeypatch, caplog):
+        # After pointing at the page, the run says how its filter bar's
+        # scenario becomes the live defaults: the defaults server, then the
+        # page's save button (the page itself cannot write a file)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        opened = messages.index("Open the HTML file in a browser to view the interactive "
+                                "charts.")
+        assert messages[opened + 1] == (
+            "To make the filter bar's scenario the live trading defaults: start python3 -m "
+            "kalshi_betting.defaults_server, then click the page's \"Save as live "
+            "defaults…\" button")
+        assert messages[opened + 1:] == [messages[opened + 1]]
 
 
 class TestSummaryBlock:

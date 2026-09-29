@@ -2,8 +2,11 @@
 the _max_drawdown empty/all-NaN guard (BS-30), the _sharpe/_sortino
 annualization base and its per-row use in the benchmark table (DR-56), the
 interval-discount (k) section, whose curve and per-k table follow the page-wide
-filter bar's k and size cap, and the risk-free rate every Sharpe and Sortino
-subtracts (the TestRiskFree* classes and TestCapitalDeployedParity).
+filter bar's k and size cap, the risk-free rate every Sharpe and Sortino
+subtracts (the TestRiskFree* classes and TestCapitalDeployedParity), and the
+filter bar's "Save as live defaults…" button (TestSaveLiveDefaultsButton), whose
+clicked address is read back through defaults_server's own request handler and
+proposal parser.
 
 generate_dashboard() pulls in yfinance (network) and Plotly's full HTML
 serialization; the escaping and drawdown fixes are exercised directly against
@@ -36,12 +39,13 @@ import warnings
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
+from urllib.parse import parse_qs
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from kalshi_betting import backtester, config, dashboard, historical
+from kalshi_betting import backtester, config, dashboard, defaults_server, historical
 from kalshi_betting.backtester import (
     BacktestSweep,
     BacktestTrade,
@@ -77,6 +81,7 @@ from kalshi_betting.treasury import (
 # here would be collected twice
 from . import dashboard_golden
 from . import test_backtester as _tb
+from .conftest import save_config_live_defaults
 
 _XSS_TITLE = "<script>alert(1)</script>Will BTC exceed $80k by December 2026 or later?"
 
@@ -3982,7 +3987,8 @@ class TestFilterGrid:
         _, base, chunks = _flt_walk(source, trades, curve, k_used=None)
         assert base["bands"] == [{"label": "not recorded",
                                   "option": "not recorded (primary)",
-                                  "where": "the primary spread band (not recorded)"}]
+                                  "where": "the primary spread band (not recorded)",
+                                  "value": None}]
         # No band recorded, so no tier-floors-off view either
         assert base["grid_off"] is base["bands_off"] is base["tier_binds"] is None
         assert base["ks"] == [{"label": "not recorded", "text": "k not recorded",
@@ -4875,17 +4881,24 @@ def _js_runtime() -> str | None:
 
 
 def _page_elements(page: str) -> dict:
-    """The selects (options, "selected", "disabled"), every chart (data and
-    layout, typed arrays decoded) and every element id of a rendered page —
-    the ids are the only elements a strict-mode run lets the script reach. A
-    select's id may be double-quoted (the filter bar's) or single-quoted (the
-    scenario explorer's)."""
+    """The selects (options, "selected", "disabled"), the buttons ("disabled"),
+    every chart (data and layout, typed arrays decoded) and every element id
+    of a rendered page — the ids are the only elements a strict-mode run lets
+    the script reach. A select's or button's id may be double-quoted (the
+    filter bar's) or single-quoted (the scenario explorer's); a button is
+    disabled when its tag carries the bare "disabled" attribute (attribute
+    values, such as its title, are not read for it)."""
     selects = {}
     for m in re.finditer(r"""<select id=(["'])([^"']+)\1([^>]*)>(.*?)</select>""", page, re.S):
         options = [{"value": value, "text": html.unescape(text), "selected": bool(chosen)}
                    for value, chosen, text in re.findall(
                        r'<option value="([^"]*)"( selected)?>(.*?)</option>', m.group(4))]
         selects[m.group(2)] = {"options": options, "disabled": " disabled" in m.group(3)}
+    buttons = {}
+    for m in re.finditer(r"""<button id=(["'])([^"']+)\1([^>]*)>""", page):
+        # The attribute values blanked, so a title's words never read as the attribute
+        attributes = re.sub(r'"[^"]*"', '""', m.group(3))
+        buttons[m.group(2)] = {"disabled": bool(re.search(r"\sdisabled(?=[\s/]|$)", attributes))}
     charts, decoder = {}, json.JSONDecoder()
     for m in re.finditer(r'Plotly\.newPlot\(\s*"([^"]+)",', page):
         i, args = m.end(), []
@@ -4898,7 +4911,7 @@ def _page_elements(page: str) -> dict:
             args.append(dashboard_golden._decode_typed_arrays(value))
         charts[m.group(1)] = {"data": args[0], "layout": args[1]}
     ids = sorted(set(re.findall(r"""\bid=["']([^"']+)["']""", page)))
-    return {"selects": selects, "charts": charts, "ids": ids}
+    return {"selects": selects, "buttons": buttons, "charts": charts, "ids": ids}
 
 
 def _script_body() -> str:
@@ -4945,7 +4958,11 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
             value], ["fire", id], ["zoom", id], ["hide", id], ["select", id],
             ["repair", id], ["resolve", id], ["reject", id], ["call", name,
             args] — a page script's window function called with args, as
-            another script would call it — and ["snap", name]).
+            another script would call it — ["click", id] — a reader clicking
+            that element, its click listeners run unless it is disabled —
+            and ["snap", name]; each snapshot also carries "buttons" (id ->
+            disabled) and "opened", the window.open calls since the last
+            snapshot as {url, target, features}).
         pre (tuple): (select id, value) pairs set BEFORE the scripts run — a
             browser restoring a reader's last choice.
         no_decompression (bool): Run as a browser without DecompressionStream.
@@ -6189,6 +6206,604 @@ class TestFilterKAndCap:
         assert snap["text"]["flt-summary"].startswith(
             "Showing Sports · Hockey within the run at the primary spread band (not "
             "recorded), k = 0.75, cap not recorded: 1 of its 5 trades.")
+
+
+# ─── The filter bar's "Save as live defaults…" button ────────────────────────
+
+# The defaults server's confirmation page, as the button's address names it
+_SAVE_URL = f"http://{config.DEFAULTS_SERVER_HOST}:{config.DEFAULTS_SERVER_PORT}/confirm"
+# The Host header a browser sends to that address
+_SAVE_HOST = f"{config.DEFAULTS_SERVER_HOST}:{config.DEFAULTS_SERVER_PORT}"
+
+
+class TestSaveLiveDefaultsButton:
+    """The filter bar's "Save as live defaults…" button: rendered disabled,
+    enabled by the script only while the bar's scenario on screen can become
+    the live settings, and opening the defaults server's confirmation page for
+    exactly that scenario — never the selects' choice while a chunk loads, and
+    never the Scenario Explorer's own selects. The address it opens is checked
+    against the server's own parser. Its script tests are skipped without a
+    JavaScript runtime; its render and _save_target tests are not."""
+
+    @staticmethod
+    def _page(monkeypatch, tmp_path, sweep=None, series=_FLT_SERIES, *,
+              same_title_size_cap: float | None = 0.5) -> str:
+        """
+        Render a whole page of the flt fixture, or of another sweep.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): The test's monkeypatch, which
+                points the page at tmp_path and keeps the benchmark offline.
+            tmp_path (Path): Where the page is written.
+            sweep (BacktestSweep | None): The sweep to render; None renders
+                _flt_sweep().
+            series (dict | None): The series listing the page files trades
+                by; None files them by ticker prefix.
+            same_title_size_cap (float | None): Keyword-only. The run's
+                same-title cap set on the sweep; None means not recorded.
+
+        Returns:
+            str: The page's HTML.
+        """
+        sweep = dataclasses.replace(sweep or _flt_sweep(),
+                                    same_title_size_cap=same_title_size_cap)
+        return TestFilterPage()._page(monkeypatch, tmp_path, sweep, series)
+
+    @staticmethod
+    def _kc(monkeypatch, tmp_path, sweep=None) -> str:
+        """
+        Render a whole page of the k and size-cap fixture, same-title cap 0.5.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): The test's monkeypatch.
+            tmp_path (Path): Where the page is written.
+            sweep (BacktestSweep | None): The sweep to render; None renders
+                _kc_sweep().
+
+        Returns:
+            str: The page's HTML.
+        """
+        sweep = dataclasses.replace(sweep or _kc_sweep(), same_title_size_cap=0.5)
+        return _kc_page(monkeypatch, tmp_path, sweep)
+
+    @staticmethod
+    def _query(data: dict, opened: dict) -> dict[str, str]:
+        """
+        Read one window.open call's address, checked against the page's save target.
+
+        The call must open a new tab with "noopener", the address before its
+        query must be the save target's (the defaults server's confirmation
+        page), and every field of the query must appear exactly once.
+
+        Args:
+            data (dict): The page's base block.
+            opened (dict): One recorded window.open call: url, target, features.
+
+        Returns:
+            dict[str, str]: The query's fields and their one value each.
+
+        Raises:
+            AssertionError: If the target, the features or the address differ
+                from those above, the query cannot be parsed strictly, or a
+                field repeats.
+        """
+        assert opened["target"] == "_blank" and opened["features"] == "noopener"
+        url = opened["url"]
+        base, _, query = url.partition("?")
+        assert base == data["save"]["url"] == _SAVE_URL
+        fields = parse_qs(query, keep_blank_values=True, strict_parsing=True)
+        assert all(len(values) == 1 for values in fields.values()), fields
+        return {name: values[0] for name, values in fields.items()}
+
+    @staticmethod
+    def _expected(data: dict, bi: int, ki: int, ci: int, tier: str = "on") -> dict:
+        """
+        Give the fields a click on scenario [bi, ki, ci] must send, from the base block.
+
+        Args:
+            data (dict): The page's base block.
+            bi (int): The band's index.
+            ki (int): The k's index.
+            ci (int): The size cap's index.
+            tier (str): The Tier floors choice on screen, "on" or "off".
+
+        Returns:
+            dict: tier_floors (the choice), spread_min and spread_max (the
+                band's bounds), k and size_cap (the axes' values).
+        """
+        band = data["bands"][bi]["value"]
+        return {"tier_floors": tier, "spread_min": band[0], "spread_max": band[1],
+                "k": data["ks"][ki]["value"], "size_cap": data["caps"][ci]["value"]}
+
+    def _assert_sends(self, data: dict, query: dict, bi: int, ki: int, ci: int,
+                      tier: str = "on", *, category: str | None = None,
+                      tag: str | None = None) -> None:
+        """
+        Check that a query names scenario [bi, ki, ci] exactly, and nothing else.
+
+        Each number must read back as the base block's own value, and the
+        query must carry the run's same-title cap, the source note and the
+        category and tag given, and no other field.
+
+        Args:
+            data (dict): The page's base block.
+            query (dict): The query, as _query read it.
+            bi (int): The band's index.
+            ki (int): The k's index.
+            ci (int): The size cap's index.
+            tier (str): The Tier floors choice on screen, "on" or "off".
+            category (str | None): Keyword-only. The category sent, or None
+                for none.
+            tag (str | None): Keyword-only. The tag sent, or None for none.
+
+        Raises:
+            AssertionError: If any field differs from the expected value, or
+                the query carries a field not listed above.
+        """
+        expected = self._expected(data, bi, ki, ci, tier)
+        assert query["tier_floors"] == expected.pop("tier_floors")
+        for name, value in expected.items():
+            assert float(query[name]) == value, name
+        assert float(query["same_title_size_cap"]) == data["save"]["same_title_size_cap"]
+        assert query["source"] == data["save"]["source"]
+        assert query.get("category") == category and query.get("tag") == tag
+        known = {"tier_floors", "spread_min", "spread_max", "k", "size_cap",
+                 "same_title_size_cap", "source", "category", "tag"}
+        assert set(query) <= known
+
+    def test_the_button_is_rendered_disabled_with_its_words(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path)
+        button = re.search(r'<button id="flt-save"([^>]*)>(.*?)</button>', page)
+        assert button is not None
+        assert button.group(2) == html.escape(dashboard._SAVE_LABEL)
+        assert f'title="{html.escape(dashboard._SAVE_TITLE)}"' in button.group(1)
+        assert _page_elements(page)["buttons"] == {"flt-save": {"disabled": True}}
+        assert html.escape(dashboard._SAVE_NOTE) in page
+        # After the Tag select, before the summary line
+        assert page.index('id="flt-tag"') < page.index('id="flt-save"') \
+            < page.index('id="flt-summary"')
+        data = TestFilterPage._data(page)
+        # Each band carries its bounds for the button's spread_min / spread_max
+        assert [b["value"] for b in data["bands"]] == [[0.0, 1.0], [0.3, 0.6], [0.3, 1.0]]
+        save = data["save"]
+        assert save["url"] == _SAVE_URL
+        assert save["same_title_size_cap"] == 0.5 and save["filed_by_listing"] is True
+        assert re.fullmatch(config.LIVE_DEFAULTS_SOURCE_PATTERN, save["source"], re.ASCII)
+        assert save["source"].startswith(f"backtest dashboard for {_FLT_START.isoformat()} to ")
+        # Every word about the button is Python's: the script writes none
+        for words in (dashboard._SAVE_LABEL, dashboard._SAVE_TITLE,
+                      dashboard._SAVE_TITLE_UNFILED, dashboard._SAVE_NOTE):
+            assert words not in dashboard._FILTER_JS
+        # ... and the address comes from config, never spelled on the page's side
+        assert config.DEFAULTS_SERVER_HOST not in dashboard._FILTER_JS
+        assert str(config.DEFAULTS_SERVER_PORT) not in dashboard._FILTER_JS
+
+    def test_once_loaded_a_click_opens_the_primary_scenario(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        snaps = _run_script(tmp_path, page, [
+            ["snap", "loaded"], ["wait"], ["snap", "ready"],
+            ["click", "flt-save"], ["snap", "clicked"]], strict=True)
+        assert snaps["loaded"]["buttons"]["flt-save"] is True
+        assert snaps["ready"]["buttons"]["flt-save"] is False
+        assert snaps["loaded"]["opened"] == snaps["ready"]["opened"] == []
+        [opened] = snaps["clicked"]["opened"]
+        self._assert_sends(data, self._query(data, opened), *data["primary"])
+        # A click draws nothing and changes no select
+        assert snaps["clicked"]["reacts"] == [] and snaps["clicked"]["updates"] == []
+        assert snaps["clicked"]["selects"] == snaps["ready"]["selects"]
+
+    def test_it_follows_the_band_k_and_size_cap_on_screen(self, monkeypatch, tmp_path):
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"],
+            ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"],
+            ["click", "flt-save"], ["snap", "cap"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
+            ["click", "flt-save"], ["snap", "k"],
+            ["set", "flt-k", "1"], ["fire", "flt-k"], ["settle"],
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+            ["click", "flt-save"], ["snap", "band"]], strict=True)
+        for name, (bi, ki, ci) in (("cap", (0, 1, 2)), ("k", (0, 0, 2)), ("band", (1, 1, 2))):
+            [opened] = snaps[name]["opened"]
+            self._assert_sends(data, self._query(data, opened), bi, ki, ci)
+        # The size cap sent is the cap on screen: "off (full Kelly)" is 1.0
+        [opened] = snaps["cap"]["opened"]
+        assert float(self._query(data, opened)["size_cap"]) == 1.0
+
+    def test_it_follows_a_category_and_a_tag_with_its_category(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        sports = data["categories"].index("Sports")
+        basketball = str(data["subcats"].index([sports, "Basketball"]))
+        snaps = _run_script(tmp_path, page, [
+            ["wait"],
+            ["set", "flt-cat", str(sports)], ["fire", "flt-cat"], ["settle"],
+            ["click", "flt-save"], ["snap", "category"],
+            ["set", "flt-cat", ""], ["fire", "flt-cat"], ["settle"],
+            # A "Category · Tag" chosen under "All" sets its category too
+            ["set", "flt-tag", basketball], ["fire", "flt-tag"], ["settle"],
+            ["click", "flt-save"], ["snap", "tag"],
+            ["set", "flt-cat", ""], ["fire", "flt-cat"], ["settle"],
+            ["click", "flt-save"], ["snap", "all"]], strict=True)
+        primary = data["primary"]
+        [opened] = snaps["category"]["opened"]
+        self._assert_sends(data, self._query(data, opened), *primary, category="Sports")
+        [opened] = snaps["tag"]["opened"]
+        self._assert_sends(data, self._query(data, opened), *primary, category="Sports",
+                           tag="Basketball")
+        [opened] = snaps["all"]["opened"]
+        self._assert_sends(data, self._query(data, opened), *primary)
+
+    def test_it_follows_the_tier_floors_choice(self, monkeypatch, tmp_path):
+        page = self._kc(monkeypatch, tmp_path, _kc_sweep_tiers())
+        data = TestFilterPage._data(page)
+        snaps = _run_script(tmp_path, page, [
+            ["wait"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
+            ["click", "flt-save"], ["snap", "off"],
+            ["set", "flt-tier", "on"], ["fire", "flt-tier"], ["settle"],
+            ["click", "flt-save"], ["snap", "on"]], strict=True)
+        [opened] = snaps["off"]["opened"]
+        self._assert_sends(data, self._query(data, opened), *data["primary"], tier="off")
+        [opened] = snaps["on"]["opened"]
+        self._assert_sends(data, self._query(data, opened), *data["primary"], tier="on")
+
+    def test_a_scenario_the_run_never_simulated_cannot_be_saved(self, monkeypatch, tmp_path):
+        # (0.3-0.6, k 0.60) was never simulated: the button is disabled and a
+        # click opens nothing; back on a simulated scenario it is enabled again
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        assert _KC_GRID[1][0] == [None, None, None]
+        snaps = _run_script(tmp_path, page, [
+            ["wait"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+            ["click", "flt-save"], ["snap", "missing"],
+            ["set", "flt-k", "1"], ["fire", "flt-k"], ["settle"],
+            ["click", "flt-save"], ["snap", "back"]], strict=True)
+        missing, back = snaps["missing"], snaps["back"]
+        assert missing["text"]["flt-summary"].startswith(
+            data["text"]["missing"].format(scenario=_phrase(data, 1, 0, 1)))
+        assert missing["buttons"]["flt-save"] is True and missing["opened"] == []
+        assert back["buttons"]["flt-save"] is False
+        [opened] = back["opened"]
+        self._assert_sends(data, self._query(data, opened), 1, 1, 1)
+
+    def test_while_a_chunk_loads_it_saves_nothing_then_the_scenario_on_screen(
+            self, monkeypatch, tmp_path):
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        assert _KC_GRID[1][1][1] == 4
+        steps = [["wait"], ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+                 ["click", "flt-save"], ["snap", "loading"]]
+        resolved = _run_script(tmp_path, page, steps + [
+            ["resolve", "dash-chunk-4"], ["snap", "drawn"],
+            ["click", "flt-save"], ["snap", "clicked"]],
+            strict=True, deferred=("dash-chunk-4",))
+        loading = resolved["loading"]
+        assert loading["pending"] == ["dash-chunk-4"]
+        assert loading["buttons"]["flt-save"] is True and loading["opened"] == []
+        # Once drawn: the new scenario
+        assert resolved["drawn"]["buttons"]["flt-save"] is False
+        [opened] = resolved["clicked"]["opened"]
+        self._assert_sends(data, self._query(data, opened), 1, 1, 1)
+        # A chunk that fails: the scenario still shown, which the selects go back to
+        failed = _run_script(tmp_path, page, steps + [
+            ["reject", "dash-chunk-4"], ["snap", "failed"],
+            ["click", "flt-save"], ["snap", "clicked"]],
+            strict=True, deferred=("dash-chunk-4",))
+        assert failed["loading"]["buttons"]["flt-save"] is True
+        assert failed["failed"]["selects"]["flt-band"]["value"] == "0"
+        assert failed["failed"]["buttons"]["flt-save"] is False
+        [opened] = failed["clicked"]["opened"]
+        self._assert_sends(data, self._query(data, opened), *data["primary"])
+
+    @pytest.mark.parametrize("damaged", ["dash-data", "dash-chunk-0"])
+    def test_a_block_that_cannot_be_loaded_keeps_it_disabled(
+            self, monkeypatch, tmp_path, damaged):
+        # The base block, or the primary scenario's chunk: the bar cannot
+        # work, and nothing can be saved from it
+        page = self._kc(monkeypatch, tmp_path)
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "s"]], damaged=(damaged,))["s"]
+        assert snap["buttons"]["flt-save"] is True and snap["opened"] == []
+        assert snap["selects"]["flt-band"]["disabled"]
+
+    def test_a_browser_that_cannot_inflate_keeps_it_disabled(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path)
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "s"]], no_decompression=True)["s"]
+        assert snap["buttons"]["flt-save"] is True and snap["opened"] == []
+
+    def test_without_a_series_listing_no_category_or_tag_is_saved(self, monkeypatch, tmp_path):
+        # Trades filed by ticker prefix: the live category filter files by
+        # Kalshi's listing, so a slice of this page is not one it can trade
+        page = self._page(monkeypatch, tmp_path, series=None)
+        data = TestFilterPage._data(page)
+        assert data["save"]["filed_by_listing"] is False and data["categories"]
+        title = re.search(r'<button id="flt-save"[^>]*title="([^"]*)"', page).group(1)
+        assert html.unescape(title) == dashboard._SAVE_TITLE + dashboard._SAVE_TITLE_UNFILED
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "all"],
+            ["set", "flt-cat", "0"], ["fire", "flt-cat"], ["settle"],
+            ["click", "flt-save"], ["snap", "category"],
+            ["set", "flt-cat", ""], ["fire", "flt-cat"], ["settle"], ["snap", "back"]],
+            strict=True)
+        [opened] = snaps["all"]["opened"]
+        self._assert_sends(data, self._query(data, opened), *data["primary"])
+        assert snaps["category"]["buttons"]["flt-save"] is True
+        assert snaps["category"]["opened"] == []
+        assert snaps["back"]["buttons"]["flt-save"] is False
+
+    def test_a_listing_page_s_title_has_no_unfiled_sentence(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path)
+        title = re.search(r'<button id="flt-save"[^>]*title="([^"]*)"', page).group(1)
+        assert html.unescape(title) == dashboard._SAVE_TITLE
+
+    def test_a_k_that_is_not_positive_cannot_be_saved(self, monkeypatch, tmp_path):
+        # The live settings need k in (0, 1]: a run's k of 0.0 is not one
+        sweep = _flt_sweep()
+        scenarios = [dataclasses.replace(p, k=0.0) if p.k == 0.60 else p
+                     for p in sweep.scenarios]
+        sweep = dataclasses.replace(sweep, scenarios=scenarios)
+        page = self._page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        zero = next(i for i, k in enumerate(data["ks"]) if k["value"] == 0.0)
+        assert data["grid"][0][zero][0] is not None
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-k", str(zero)], ["fire", "flt-k"], ["settle"],
+            ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
+        assert snap["buttons"]["flt-save"] is True and snap["opened"] == []
+
+    def test_a_k_of_many_decimals_is_sent_exactly(self, monkeypatch, tmp_path):
+        # A k such as backtest.py --interval-discount can name: the address
+        # carries the number that reads back as that very k (a two-decimal
+        # 0.33 would be another k), and the server reads it back as that k
+        third = 1 / 3
+        sweep = _flt_sweep()
+        scenarios = [dataclasses.replace(p, k=third) if p.k == 0.60 else p
+                     for p in sweep.scenarios]
+        sweep = dataclasses.replace(sweep, scenarios=scenarios)
+        page = self._page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        ki = next(i for i, k in enumerate(data["ks"]) if k["value"] == third)
+        assert data["grid"][0][ki][0] is not None
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-k", str(ki)], ["fire", "flt-k"], ["settle"],
+            ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
+        [opened] = snap["opened"]
+        query = self._query(data, opened)
+        self._assert_sends(data, query, 0, ki, 0)
+        assert float(query["k"]) == third
+        settings, _ = defaults_server._proposal(
+            defaults_server._params(opened["url"].partition("?")[2]), None)
+        assert settings.interval_discount == third
+
+    def test_a_page_without_a_sweep_cannot_be_saved(self, monkeypatch, tmp_path):
+        # No sweep: one "not recorded" band and cap (k is the page's own
+        # 0.75), so nothing to save
+        trades = _flt_trades()
+        curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        page = dashboard.generate_dashboard(
+            trades, curve, _FLT_START, 1000.0, interval_discount=0.75,
+            series_categories=_FLT_SERIES).read_text(encoding="utf-8")
+        data = TestFilterPage._data(page)
+        pb, pk, pc = data["primary"]
+        assert data["bands"][pb]["value"] is None and data["caps"][pc]["value"] is None
+        assert data["ks"][pk]["value"] == 0.75
+        assert data["save"]["same_title_size_cap"] is None
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
+        assert not snap["selects"]["flt-band"]["disabled"]
+        assert snap["buttons"]["flt-save"] is True and snap["opened"] == []
+
+    def test_a_band_the_run_did_not_record_cannot_be_saved(self, monkeypatch, tmp_path):
+        # A sweep whose primary records no band but does record its k and
+        # cap: the band alone is what keeps the button disabled, on load and
+        # on every redraw (a category change redraws at once, its chunk
+        # being the one on screen)
+        base = _flt_sweep()
+        primary = dataclasses.replace(base.primary, spread_band=None)
+        sweep = dataclasses.replace(base, primary=primary, points=[primary], scenarios=[])
+        page = self._page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        pb, pk, pc = data["primary"]
+        assert data["bands"][pb]["value"] is None
+        assert data["ks"][pk]["value"] == 0.75 and data["caps"][pc]["value"] == 0.2
+        assert data["save"]["same_title_size_cap"] == 0.5
+        sports = str(data["categories"].index("Sports"))
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "ready"],
+            ["set", "flt-cat", sports], ["fire", "flt-cat"], ["settle"],
+            ["click", "flt-save"], ["snap", "category"]], strict=True)
+        ready, category = snaps["ready"], snaps["category"]
+        assert not ready["selects"]["flt-band"]["disabled"]
+        assert ready["buttons"]["flt-save"] is True and ready["opened"] == []
+        # The category was drawn, and the button stayed disabled through it
+        assert category["selects"]["flt-cat"]["value"] == sports and category["reacts"]
+        assert category["buttons"]["flt-save"] is True and category["opened"] == []
+
+    def test_a_size_cap_the_run_did_not_record_cannot_be_saved(self, monkeypatch, tmp_path):
+        # A sweep whose points record their band and k but no size cap: the
+        # cap alone is what keeps the button disabled, on load and on every
+        # redraw (the server would refuse a size_cap of null, so the page
+        # must not offer it)
+        page = self._page(monkeypatch, tmp_path, _flt_sweep(size_cap=None))
+        data = TestFilterPage._data(page)
+        pb, pk, pc = data["primary"]
+        assert data["bands"][pb]["value"] == [0.0, 1.0]
+        assert data["ks"][pk]["value"] == 0.75 and data["caps"][pc]["value"] is None
+        assert data["save"]["same_title_size_cap"] == 0.5
+        sports = str(data["categories"].index("Sports"))
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "ready"],
+            ["set", "flt-cat", sports], ["fire", "flt-cat"], ["settle"],
+            ["click", "flt-save"], ["snap", "category"]], strict=True)
+        ready, category = snaps["ready"], snaps["category"]
+        assert not ready["selects"]["flt-band"]["disabled"]
+        assert ready["buttons"]["flt-save"] is True and ready["opened"] == []
+        # The category was drawn, and the button stayed disabled through it
+        assert category["selects"]["flt-cat"]["value"] == sports and category["reacts"]
+        assert category["buttons"]["flt-save"] is True and category["opened"] == []
+
+    def test_a_ladder_setting_that_departs_is_named_in_the_source(self, monkeypatch, tmp_path):
+        sweep = dataclasses.replace(_flt_sweep(), same_event_ladders=False,
+                                    config_same_event_ladders=True)
+        page = self._page(monkeypatch, tmp_path, sweep)
+        source = TestFilterPage._data(page)["save"]["source"]
+        assert source.endswith(" (same-event ladders off, config.py on: its pairs are not "
+                               "the live bot's)")
+        assert re.fullmatch(config.LIVE_DEFAULTS_SOURCE_PATTERN, source, re.ASCII)
+
+    def test_the_save_target_s_source_note(self):
+        today = date(2026, 9, 28)
+        sweep = _flt_sweep()
+        target = dashboard._save_target(sweep, _FLT_START, today, _FLT_SERIES)
+        assert target == {"url": _SAVE_URL, "same_title_size_cap": None,
+                          "filed_by_listing": True,
+                          "source": "backtest dashboard for 2026-01-05 to 2026-09-28"}
+        # Only a recorded setting that differs from a recorded switch is named
+        for ladders, configured in ((True, True), (False, None), (None, True)):
+            swept = dataclasses.replace(sweep, same_event_ladders=ladders,
+                                        config_same_event_ladders=configured)
+            assert dashboard._save_target(swept, _FLT_START, today, None)["source"] == \
+                "backtest dashboard for 2026-01-05 to 2026-09-28"
+        swept = dataclasses.replace(sweep, same_event_ladders=True,
+                                    config_same_event_ladders=False)
+        assert dashboard._save_target(swept, _FLT_START, today, {})["source"].endswith(
+            " (same-event ladders on, config.py off: its pairs are not the live bot's)")
+        # No sweep: nothing recorded; an empty listing files by ticker prefix
+        bare = dashboard._save_target(None, datetime(2026, 1, 5, 12, tzinfo=UTC), today, {})
+        assert bare["same_title_size_cap"] is None and bare["filed_by_listing"] is False
+        assert bare["source"] == "backtest dashboard for 2026-01-05 to 2026-09-28"
+
+    def test_a_note_the_server_would_refuse_is_left_out(self, monkeypatch, tmp_path):
+        # Should the note ever not fit the server's pattern, the button sends
+        # none (the save then keeps no note) rather than a refused one
+        monkeypatch.setattr(dashboard, "LIVE_DEFAULTS_SOURCE_PATTERN", "seed only")
+        assert dashboard._save_target(_flt_sweep(), _FLT_START, date(2026, 9, 28),
+                                      _FLT_SERIES)["source"] is None
+        page = self._page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
+        [opened] = snap["opened"]
+        assert "source" not in self._query(data, opened)
+
+    def test_an_unrecorded_same_title_cap_is_left_out(self, monkeypatch, tmp_path):
+        # The server then keeps the saved same-title cap, or the seed's when
+        # none is saved
+        page = self._page(monkeypatch, tmp_path, same_title_size_cap=None)
+        data = TestFilterPage._data(page)
+        assert data["save"]["same_title_size_cap"] is None
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
+        [opened] = snap["opened"]
+        assert "same_title_size_cap" not in self._query(data, opened)
+
+    def test_a_filter_that_cannot_be_built_leaves_no_button(self, monkeypatch, tmp_path):
+        def broken(*_a, **_k):
+            """
+            Stand in for _filter_payload: the filter's data cannot be built.
+
+            Args:
+                *_a: Ignored.
+                **_k: Ignored.
+
+            Raises:
+                ValueError: Always.
+            """
+            raise ValueError("boom")
+        monkeypatch.setattr(dashboard, "_filter_payload", broken)
+        page = self._page(monkeypatch, tmp_path)
+        assert 'id="flt-unavailable"' in page
+        assert 'id="flt-save"' not in page and "<button" not in page
+        assert html.escape(dashboard._SAVE_LABEL) not in page
+        assert _page_elements(page)["buttons"] == {}
+
+    def test_the_scenario_explorer_s_own_selects_are_not_saved(self, monkeypatch, tmp_path):
+        # The explorer's band select moves only the explorer: the button still
+        # sends the bar's scenario on screen
+        base = _Grid.sweep()
+        # Every point stamped with a size cap, so the bar's scenario can be saved
+        scenarios = [dataclasses.replace(p, size_cap=0.2) for p in base.scenarios]
+        primary = next(p for p in scenarios if p.population == "all"
+                       and (p.spread_band, p.k) == (base.primary.spread_band, base.primary.k))
+        sweep = dataclasses.replace(
+            base, primary=primary, points=[primary], scenarios=scenarios,
+            same_title_point=dataclasses.replace(base.same_title_point, size_cap=0.2),
+            same_title_size_cap=0.5)
+        page = TestScenarioExplorerScript._page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        pb = data["primary"][0]
+        other = str(next(i for i in range(len(data["bands"])) if i != pb))
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "scn-band-select", other], ["fire", "scn-band-select"],
+            ["click", "flt-save"], ["snap", "s"]], explorer=True)
+        snap = snaps["s"]
+        assert snap["selects"]["scn-band-select"]["value"] == other
+        assert snap["selects"]["flt-band"]["value"] == str(pb)
+        [opened] = snap["opened"]
+        query = self._query(data, opened)
+        assert [float(query["spread_min"]), float(query["spread_max"])] == \
+            data["bands"][pb]["value"]
+        assert query["source"] == data["save"]["source"]
+
+    @pytest.mark.parametrize("saved", [False, True])
+    def test_the_address_is_what_the_defaults_server_accepts(
+            self, monkeypatch, tmp_path, saved):
+        # The clicked address, handed to the server's own application as a
+        # browser would send it: it answers with the confirmation page, and its
+        # parser reads exactly the scenario on screen — tier floors off, k
+        # 0.60, a 20% cap, Sports · Hockey, the run's 0.5 same-title cap
+        page = self._kc(monkeypatch, tmp_path, _kc_sweep_tiers())
+        data = TestFilterPage._data(page)
+        sports = data["categories"].index("Sports")
+        hockey = str(data["subcats"].index([sports, "Hockey"]))
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "primary"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
+            ["set", "flt-tag", hockey], ["fire", "flt-tag"], ["settle"],
+            ["click", "flt-save"], ["snap", "chosen"]], strict=True)
+        if saved:
+            save_config_live_defaults()
+        current = config.read_saved_live_defaults()
+        assert (current is not None) is saved
+        app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
+        pb, pk, pc = data["primary"]
+        cases = (
+            ("primary", config.LiveSettings(
+                tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+                interval_discount=data["ks"][pk]["value"],
+                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5)),
+            ("chosen", config.LiveSettings(
+                tier_floors=False, spread_band=tuple(data["bands"][pb]["value"]),
+                interval_discount=data["ks"][0]["value"],
+                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
+                categories=("Sports",), tags=("Hockey",))),
+        )
+        for name, expected in cases:
+            [opened] = snaps[name]["opened"]
+            self._query(data, opened)
+            query = opened["url"].partition("?")[2]
+            response = app.handle(defaults_server._Request("GET", f"/confirm?{query}",
+                                                           _SAVE_HOST))
+            assert response.status == 200, response.body
+            settings, source = defaults_server._proposal(defaults_server._params(query),
+                                                         current)
+            assert settings == expected, name
+            # Every field, one by one (equality skips none of the seven)
+            for field in config.LIVE_TOGGLE_FIELDS:
+                assert getattr(settings, field) == getattr(expected, field), (name, field)
+            assert source == data["save"]["source"]
+        # Nothing was written by showing the page
+        assert config.read_saved_live_defaults() == current
 
 
 def _kpi_trades(snap: dict) -> list[tuple[str, str]]:

@@ -50,6 +50,24 @@ Purpose:
     by a small inline script (_FILTER_JS) that draws nothing of its own and
     inflates a scenario's chunk only when a reader chooses it.
 
+    The filter bar also carries a "Save as live defaults…" button. It opens
+    the defaults server's confirmation page (python3 -m
+    kalshi_betting.defaults_server, on config.DEFAULTS_SERVER_HOST and
+    DEFAULTS_SERVER_PORT) in a new tab, for the bar's scenario on screen —
+    its spread band, Tier floors choice, k, size cap and any category or
+    tag, with this run's same-title cap when the run recorded one — never
+    for the Scenario Explorer's own selects. That page compares the
+    proposal with the live defaults in force and saves it only when its
+    Confirm button is clicked; this page writes nothing. The button is
+    rendered disabled; the script enables it only while the scenario on
+    screen can become live settings (it was simulated, its band was
+    recorded, and its k and size cap were recorded and are above zero),
+    keeps it disabled while another scenario's
+    chunk loads, and, on a page that files trades by ticker prefix rather
+    than by Kalshi's series listing (which the live category and tag filter
+    reads), keeps it disabled for a category or tag. A page whose filter
+    bar could not be built has no button.
+
 Dependencies:
     Imports BacktestSweep, BacktestTrade, CorpusProvenance (historical.py's,
     re-exported by backtester.py), IntervalCalibration, OutcomeLabelCoverage
@@ -77,7 +95,10 @@ Dependencies:
     defaults) — and reads
     BacktestSweep.cap_sweep (a backtester.CapSweep) by its attributes — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
-    page's file name, which defaults_server also opens),
+    page's file name, which defaults_server also opens), DEFAULTS_SERVER_HOST
+    and DEFAULTS_SERVER_PORT (the address the filter bar's save button
+    opens), LIVE_DEFAULTS_SOURCE_PATTERN (the note shapes that server
+    accepts, which the button's note is checked against),
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
     RISK_FREE_BILL_TERM and RISK_FREE_RATE_FIELD (named in the header),
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS
@@ -335,6 +356,7 @@ import json
 import logging
 import math
 import os
+import re
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -375,7 +397,10 @@ from .config import (
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     CALENDAR_DAYS_PER_YEAR,
     DASHBOARD_FILENAME,
+    DEFAULTS_SERVER_HOST,
+    DEFAULTS_SERVER_PORT,
     FLAT_RETURN_TOLERANCE,
+    LIVE_DEFAULTS_SOURCE_PATTERN,
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
@@ -5690,6 +5715,93 @@ _FILTER_UNAVAILABLE_HTML = (
     "The page-wide filter could not be built for this run (the log names the error); "
     "every section shows the primary spread band's full run.</p>")
 
+# The filter bar's save button: its label, its hover text and the grey note
+# beside it. The button opens the defaults server's confirmation page for the
+# scenario the bar shows; the page script only enables it, disables it and
+# opens that page, so every word about it is here.
+_SAVE_LABEL = "Save as live defaults…"
+_SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter bar's "
+               "scenario on screen — its spread band, tier floors, k, size cap and any "
+               "category or tag, with this run's same-title cap when the run recorded one; "
+               "not the Scenario Explorer's own selects — with the live trading defaults, "
+               "and saves it only when Confirm is clicked there. It stays unavailable "
+               "while a scenario loads, and for a scenario the run never simulated, "
+               "whose band, k or size cap the run did not record, or whose k or size "
+               "cap is not above zero.")
+# Added to the hover text on a page that filed trades by ticker prefix, not by
+# Kalshi's series listing (which the live category and tag filter reads)
+_SAVE_TITLE_UNFILED = (" A category or tag can be saved only from a page built with "
+                       "Kalshi's series listing; this one files trades by ticker prefix.")
+_SAVE_NOTE = "(needs python3 -m kalshi_betting.defaults_server running)"
+
+
+def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
+                 series_categories: dict | None) -> dict:
+    """
+    What the filter bar's save button sends besides the scenario on screen.
+
+    The button opens the defaults server's confirmation page with the bar's
+    scenario in the address (its spread band, Tier floors choice, k and size
+    cap, and any category or tag); this is the rest of that address, fixed
+    when the page is built. The server accepts no source note but one of the
+    shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, so the note is checked
+    against that pattern here, as the server checks it (whole, ASCII digits
+    only), and left out should it ever not match.
+
+    Args:
+        sweep (BacktestSweep | None): The run's sweep: its same-title cap and
+            its same-event ladder setting beside the configured one; None for
+            a page built without one.
+        start_date (date): The backtest's first day (the Period line's).
+        today (date): The Period line's last day (UTC).
+        series_categories (dict | None): The series listing the page files
+            trades by; None or empty when the page files them by ticker
+            prefix.
+
+    Returns:
+        dict: "url" (the confirmation page's address, on
+            config.DEFAULTS_SERVER_HOST and DEFAULTS_SERVER_PORT);
+            "same_title_size_cap" (the extra same-title cap the run sized
+            under, or None when not recorded, so the address leaves it out
+            and the server keeps the saved same-title cap, or the seed's
+            when none is saved); "filed_by_listing" (whether this page files trades by
+            Kalshi's series listing, the rule the live category and tag
+            filter reads, so only then may a category or tag slice be saved);
+            "source" (the note the saved file keeps: "backtest dashboard for
+            <start> to <today>", plus a note when the run's same-event ladder
+            setting differed from config.py's, so its pairs are not the live
+            bot's; None if it would not match the pattern).
+    """
+
+    def day(value: date) -> str:
+        """
+        Write a date as YYYY-MM-DD.
+
+        Args:
+            value (date): A date, or a datetime (its calendar day is used).
+
+        Returns:
+            str: The ISO date.
+        """
+        return (value.date() if isinstance(value, datetime) else value).isoformat()
+
+    source = f"backtest dashboard for {day(start_date)} to {day(today)}"
+    ladders = None if sweep is None else sweep.same_event_ladders
+    configured = None if sweep is None else sweep.config_same_event_ladders
+    # Only a recorded setting that differs from a recorded configured switch
+    # is named: the pattern allows exactly this note
+    if type(ladders) is bool and type(configured) is bool and ladders != configured:
+        source += (f" (same-event ladders {'on' if ladders else 'off'}, config.py "
+                   f"{'on' if configured else 'off'}: its pairs are not the live bot's)")
+    if not re.fullmatch(LIVE_DEFAULTS_SOURCE_PATTERN, source, re.ASCII):
+        source = None
+    return {
+        "url": f"http://{DEFAULTS_SERVER_HOST}:{DEFAULTS_SERVER_PORT}/confirm",
+        "same_title_size_cap": None if sweep is None else sweep.same_title_size_cap,
+        "filed_by_listing": bool(series_categories),
+        "source": source,
+    }
+
 # Every field of a BacktestTrade, in declaration order: _list_key's identity
 # of a trade list is these values, trade by trade.
 _TRADE_FIELDS = tuple(f.name for f in dataclasses.fields(BacktestTrade))
@@ -8320,6 +8432,7 @@ def _filter_payload(
     explorer: bool = False,
     explorer_caps: bool = True,
     explorer_tiers: bool = True,
+    save: dict | None = None,
 ) -> dict:
     """
     Build the base data block the page's filter bar and script read on load.
@@ -8367,13 +8480,19 @@ def _filter_payload(
         explorer_tiers (bool): Keyword-only. Whether the explorer follows the
             bar's Tier floors choice; False says it does not (_bar_reach).
             True (default).
+        save (dict | None): Keyword-only. What the bar's save button sends
+            besides the scenario on screen (_save_target): the confirmation
+            page's address, the run's same-title cap, whether trades are filed
+            by Kalshi's series listing, and the source note. None (default)
+            ships null, and the script then keeps the button disabled.
 
     Returns:
         dict: "dates" (the shared axis, ISO dates), "bands" ([{label,
-            option, where}] — _band_option's label, the Spread band select's
-            option text (" (primary)" on the primary) and _band_where's
-            phrase), "bands_off" (null without a tier-floors-off family, else
-            [{label, option, where}] per band — backtester._band_label's bare
+            option, where, value}] — _band_option's label, the Spread band
+            select's option text (" (primary)" on the primary), _band_where's
+            phrase and the band itself as [floor, ceiling], null for a band
+            not recorded), "bands_off" (null without a tier-floors-off
+            family, else [{label, option, where}] per band — backtester._band_label's bare
             "floor-ceiling", its option text and _tier_off_where's phrase),
             "tier_binds" (null, or per band whether the tiers bind there),
             "grid_off" (null, or [band][k][cap] -> chunk id or null — the
@@ -8393,7 +8512,8 @@ def _filter_payload(
             order, every group carrying "delta" per k), "khat_off" (null, or
             the same per band with the tier floors off: a binding band's
             tier-off calibration, every other band's own), "khat_blank" (the
-            table cells of a group with no k-hat) and "kd" (above).
+            table cells of a group with no k-hat), "kd" and "save" (both
+            above).
     """
     axis = chunks.axis
     pb, pk, pc = source.primary
@@ -8410,7 +8530,9 @@ def _filter_payload(
         "dates": [d.date().isoformat() for d in axis],
         "bands": [{"label": _band_option(band),
                    "option": _band_option(band) + (" (primary)" if i == pb else ""),
-                   "where": _band_where(_band_option(band), i == pb, band is not None)}
+                   "where": _band_where(_band_option(band), i == pb, band is not None),
+                   # The band itself, for the save button's spread_min and spread_max
+                   "value": None if band is None else [band[0], band[1]]}
                   for i, band in enumerate(source.bands)],
         # Each band as the Tier floors choice "off" names it: with the tiers
         # off its floor alone gated it, so backtester's bare "floor-ceiling"
@@ -8474,6 +8596,8 @@ def _filter_payload(
         # is "dates" above, so the section's own copy of it is not shipped)
         "kd": None if kd is None else {key: value for key, value in kd.items()
                                        if key != "dates"},
+        # The save button's fixed part of the confirmation page's address
+        "save": save,
     }
 
 
@@ -8600,7 +8724,7 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
 
 def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     """
-    Render the sticky filter bar: six <select>s and a summary line.
+    Render the sticky filter bar: six <select>s, the save button and a summary line.
 
     Spread band, Tier floors, k and Size cap choose the scenario — each
     option one of the grid's axes, the run's own marked " (primary)" (a
@@ -8618,7 +8742,13 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     choice on reload: the script enables them once it has inflated the base
     block AND the primary scenario's chunk, so without it (or without a
     browser that can inflate them) they cannot promise a view the page will
-    not show.
+    not show. After the Tag select comes the save button with its note,
+    rendered disabled too: the script enables it whenever the scenario on
+    screen can become the live defaults, and a click opens the defaults
+    server's confirmation page for that scenario in a new tab. Its hover
+    text (_SAVE_TITLE) gains _SAVE_TITLE_UNFILED on a page that does not
+    file trades by Kalshi's series listing (payload "save"), where a
+    category or tag cannot be saved.
 
     Args:
         payload (dict): _filter_payload's base block.
@@ -8671,6 +8801,10 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                  "(not simulated for this run)</span>")
     # Escaped whole, quotes included, so the attribute can never end early
     tier_title = html.escape(_TIER_SELECT_TITLE)
+    # The save button's hover text: a page filed by ticker prefix says why a
+    # category or tag cannot be saved from it
+    save_filed = (payload.get("save") or {}).get("filed_by_listing", False)
+    save_title = html.escape(_SAVE_TITLE + ("" if save_filed else _SAVE_TITLE_UNFILED))
 
     cat_opts = '<option value="">All categories</option>' + "".join(
         f'<option value="{i}">{html.escape(c)} ({count(f"c{i}")})</option>'
@@ -8699,6 +8833,12 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         f'{cat_opts}</select></label>&nbsp;&nbsp;'
         f'<label>Tag: <select id="flt-tag" disabled autocomplete="off">'
         f'{tag_opts}</select></label>'
+        # The save button, disabled like the selects (autocomplete="off": a
+        # browser that restores a control's disabled state on reload must not)
+        f'&nbsp;&nbsp;<button id="flt-save" type="button" disabled autocomplete="off" '
+        f'title="{save_title}">{html.escape(_SAVE_LABEL)}</button>'
+        '<span id="flt-save-note" style="color:#9E9E9E; font-size:13px;">'
+        f'&nbsp;{html.escape(_SAVE_NOTE)}</span>'
         '<div id="flt-summary" style="color:#616161; font-size:13px; margin-top:6px;">'
         f'{summary}</div></div>'
     )
@@ -8845,7 +8985,12 @@ def _packed_text_script(element_id: str, raw: str) -> str:
 # the explorer's own script, _SCENARIO_EXPLORER_JS, only on a page carrying
 # its grid, and called only when it is — with the Tier floors choice as a
 # fourth argument; the explorer moves only the axes whose label changed, and
-# again any axis it refused on an earlier call). On load it inflates the base block and the primary scenario's
+# again any axis it refused on an earlier call). It enables the bar's "Save as
+# live defaults…" button whenever the scenario on screen (SHOWN, never the
+# selects' choice while a chunk loads) can become the live defaults, and a
+# click opens the defaults server's confirmation page for that scenario in a
+# new tab (saveHref: D.save's address and the axes' values; the button's words
+# are Python's). On load it inflates the base block and the primary scenario's
 # chunk, sets the bar back to the view Python rendered and enables it — it
 # redraws nothing until a <select> changes. A chunk is inflated when a scenario needs it and
 # kept while among the last KEEP drawn (the primary's always); a choice made
@@ -8862,6 +9007,10 @@ _FILTER_JS = r"""
   // deadline-gap tier floors not applied (off, D.grid_off)
   var tierSel = document.getElementById('flt-tier');
   if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !catSel || !tagSel) { return; }
+  // The bar's save button: a button, not a select, so never in SELECTS
+  // (whose reset reads .options); optional, since a page without it has
+  // nothing to save from
+  var saveBtn = document.getElementById('flt-save');
   var SELECTS = [bandSel, tierSel, kSel, capSel, catSel, tagSel];
   // The k-hat chart's own "Group by" select follows the bar's rules
   var khatGroup = document.getElementById('khat-group');
@@ -8906,6 +9055,44 @@ _FILTER_JS = r"""
   function cellChunk() { return chunkAt(bandIndex(), kIndex(), capIndex(), tierSel.value); }
   // The page as rendered: the primary scenario with the tier floors on
   function primaryChunk() { var p = D.primary; return D.grid[p[0]][p[1]][p[2]]; }
+  // The filter bar's scenario ON SCREEN (SHOWN) as the defaults server's
+  // confirmation-page address, or null when it cannot become live settings:
+  // nothing drawn yet, no save target on the page (D.save), a scenario the
+  // run never simulated, a band the run did not record, a k or size cap the
+  // run did not record or that is not above zero, or a category or tag on a
+  // page that does not file trades by Kalshi's series listing. A tag always goes with its category
+  // (the tag select sets the category too). The server refuses, with its
+  // reason, any other value the live settings reject. Each number is written
+  // by String(), whose shortest form reads back as the same number.
+  function saveHref() {
+    if (!D || !D.save || !SHOWN || C === null) { return null; }
+    if (chunkAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5]) === null) { return null; }
+    var band = D.bands[SHOWN[0]].value, k = D.ks[SHOWN[1]].value, cap = D.caps[SHOWN[2]].value;
+    if (!band || !(k > 0) || !(cap > 0)) { return null; }
+    var sliced = SHOWN[3] !== '' || SHOWN[4] !== '';
+    if (sliced && !D.save.filed_by_listing) { return null; }
+    var q = [['tier_floors', offAt(SHOWN[5]) ? 'off' : 'on'], ['spread_min', band[0]],
+             ['spread_max', band[1]], ['k', k], ['size_cap', cap]];
+    // Left out when the run recorded none: the server then keeps the saved
+    // same-title cap, or the seed's when none is saved
+    if (typeof D.save.same_title_size_cap === 'number') {
+      q.push(['same_title_size_cap', D.save.same_title_size_cap]);
+    }
+    if (SHOWN[4] !== '') {
+      var sc = D.subcats[parseInt(SHOWN[4], 10)];
+      q.push(['category', D.categories[sc[0]]], ['tag', sc[1]]);
+    } else if (SHOWN[3] !== '') {
+      q.push(['category', D.categories[parseInt(SHOWN[3], 10)]]);
+    }
+    if (typeof D.save.source === 'string' && D.save.source !== '') {
+      q.push(['source', D.save.source]);
+    }
+    return D.save.url + '?' + q.map(function(p) {
+      return encodeURIComponent(p[0]) + '=' + encodeURIComponent(String(p[1]));
+    }).join('&');
+  }
+  // The button is enabled exactly when the scenario on screen can be saved
+  function refreshSave() { if (saveBtn) { saveBtn.disabled = saveHref() === null; } }
   function isPrimaryCell() {
     var p = D.primary;
     return bandIndex() === p[0] && kIndex() === p[1] && capIndex() === p[2];
@@ -9376,6 +9563,7 @@ _FILTER_JS = r"""
     refreshOptions();
     SHOWN = [bandIndex(), kIndex(), capIndex(), catSel.value, tagSel.value, tierSel.value];
     render();
+    refreshSave();
   }
   // The selects changed: draw their scenario — at once when its chunk is
   // loaded (or it has none), else once it is; a later choice supersedes it
@@ -9384,6 +9572,10 @@ _FILTER_JS = r"""
     if (id === null) { C = null; draw(); return; }
     var entry = CHUNKS[id];
     if (entry && entry.data) { touch(id); C = entry.data; draw(); return; }
+    // While the chunk loads, the selects name a scenario the page does not
+    // show yet, so nothing can be saved until it is drawn (or the choice is
+    // put back)
+    if (saveBtn) { saveBtn.disabled = true; }
     setText('flt-summary', fill(D.text.loading, {scenario: scenario()}));
     load(id).then(function(chunk) {
       if (seq !== SEQ) { return; }
@@ -9410,6 +9602,8 @@ _FILTER_JS = r"""
       setText('flt-summary', fill(D.text.unavailable, {
         failed: tried, reason: String(err),
         scenario: scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5])}));
+      // The scenario still shown can be saved again
+      refreshSave();
     });
   }
   // The bar cannot work: the base block, or the primary scenario's chunk,
@@ -9418,6 +9612,7 @@ _FILTER_JS = r"""
   // which is where Python's templates are.
   function unavailable(reason) {
     SELECTS.forEach(function(s) { s.disabled = true; });
+    if (saveBtn) { saveBtn.disabled = true; }
     if (D) {
       var p = D.primary, here = scenarioAt(p[0], p[1], p[2], 'on');
       setText('flt-summary', fill(D.text.unavailable,
@@ -9457,6 +9652,7 @@ _FILTER_JS = r"""
     }
     // A run with no tier-off view keeps the Tier floors select disabled
     SELECTS.forEach(function(s) { s.disabled = s === tierSel && !D.grid_off; });
+    refreshSave();
   }, function(err) { unavailable(String(err)); });
 
   [bandSel, kSel, capSel].forEach(function(sel) {
@@ -9493,6 +9689,15 @@ _FILTER_JS = r"""
     }
     choose();
   });
+  // The save button opens the confirmation page for the scenario on screen
+  // in a new tab; the page saves nothing until Confirm is clicked there
+  if (saveBtn) {
+    saveBtn.addEventListener('click', function() {
+      var href = saveHref();
+      if (saveBtn.disabled || href === null) { return; }
+      window.open(href, '_blank', 'noopener');
+    });
+  }
 })();
 </script>
 """
@@ -9517,7 +9722,9 @@ def generate_dashboard(
     Calls each _section_*() builder in order and streams the resulting HTML
     fragments into a full page with an embedded Plotly CDN script tag — plus
     the page-wide filter: the sticky bar under the header lines
-    (_filter_bar_html), one packed chunk per distinct scenario trade list
+    (_filter_bar_html, with its "Save as live defaults…" button, whose
+    confirmation-page address, run's same-title cap and source note are
+    _save_target's), one packed chunk per distinct scenario trade list
     (tier-floors-off scenarios included, when the run carries that family) and
     the packed base block after the sections (_ChunkVisitor, _filter_payload,
     _packed_json_script), and the script that swaps a selection in
@@ -9779,7 +9986,11 @@ def generate_dashboard(
                 # Exactly whether the explorer renders a Tier floors select
                 # (it has a tier-floors-off view): only then does the line
                 # say its selects follow the bar's Tier floors choice
-                explorer_tiers=explorer_grid and explorer_data.tier_select)
+                explorer_tiers=explorer_grid and explorer_data.tier_select,
+                # The save button's fixed part of the defaults server's
+                # confirmation-page address: the run's same-title cap, whether
+                # trades are filed by Kalshi's series listing, the source note
+                save=_save_target(sweep, start_date, today, series_categories))
             filter_bar = _filter_bar_html(filter_data, chunker.primary_views or {})
             base_block = _packed_json_script("dash-data", filter_data)
             chunks = chunker.chunks

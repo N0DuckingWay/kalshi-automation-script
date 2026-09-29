@@ -16,6 +16,12 @@
 // does nothing here. ES5 plus Promise and Object.assign, which both runtimes
 // have.
 //
+// Buttons (page.buttons): each is created with the disabled state Python
+// rendered, a ["click", id] step calls its click listeners unless it is
+// disabled (as a browser ignores a click on a disabled button), and
+// window.open records each call — {url, target, features} — in __opened and
+// opens nothing (it returns null, as a "noopener" open does).
+//
 // Strict mode (page.strict): getElementById returns null for an id the page
 // does not hold, as a browser's does, so a script that dereferences a missing
 // element fails the run. Otherwise any id asked for is created on the fly.
@@ -41,6 +47,8 @@ var __DEFERRED = {};
 var __PENDING = {};
 // The element ids the script inflated, in order
 var __inflated = [];
+// Every window.open call since the last snapshot, in order
+var __opened = [];
 
 function __escape(text) {
   return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -207,7 +215,12 @@ var Plotly = {
   Plots: {resize: function() {}}
 };
 var window = {Plotly: Plotly, DecompressionStream: function() {}, Response: function() {},
-              Blob: function() {}};
+              Blob: function() {},
+              // A new tab the script asks for: recorded, never opened
+              open: function(url, target, features) {
+                __opened.push({url: url, target: target, features: features});
+                return null;
+              }};
 
 // The page scripts' inflate(el): the block of that element, already inflated
 // (a fresh copy each time, as a real inflate parses one). A missing element
@@ -226,14 +239,19 @@ function __inflate(el) {
   return Promise.resolve(JSON.parse(JSON.stringify(__BLOCKS[el.id])));
 }
 
-// The page as Python rendered it: its selects, the charts the scripts drive,
-// the text of any element a test sets (page.texts) and, in strict mode
-// (page.strict), which ids it holds at all
+// The page as Python rendered it: its selects, its buttons, the charts the
+// scripts drive, the text of any element a test sets (page.texts) and, in
+// strict mode (page.strict), which ids it holds at all
 function __setup(page) {
   __STRICT = !!page.strict;
   (page.ids || []).forEach(function(id) { __IDS[id] = true; });
   Object.keys(page.selects).forEach(function(id) {
     __elements[id] = __select(id, page.selects[id]);
+  });
+  Object.keys(page.buttons || {}).forEach(function(id) {
+    var button = __element(id, 'button');
+    button.disabled = !!page.buttons[id].disabled;
+    __elements[id] = button;
   });
   Object.keys(page.charts).forEach(function(id) {
     var gd = __element(id);
@@ -246,19 +264,21 @@ function __setup(page) {
   });
 }
 
-// Everything the scripts have drawn and changed since the last snapshot, and
-// the state of every element they have touched: its text, markup, display,
-// heights and colour, a select's value and options, a table body's rows
-// (each cell's text, and each cell's font weight where the script set one),
-// and a chart's layout copied as it stands now, since a later step can still
-// change it
+// Everything the scripts have drawn, changed and opened since the last
+// snapshot, and the state of every element they have touched: its text,
+// markup, display, heights and colour, a select's value and options, a
+// button's disabled state, a table body's rows (each cell's text, and each
+// cell's font weight where the script set one), and a chart's layout copied
+// as it stands now, since a later step can still change it
 function __snapshot() {
   var snap = {reacts: __reacts, updates: __updates, inflated: __inflated.slice(),
+              opened: __opened,
               text: {}, html: {}, display: {}, heights: {}, ownHeights: {},
-              colors: {}, selects: {}, rows: {}, weights: {}, layouts: {},
-              pending: Object.keys(__PENDING)};
+              colors: {}, selects: {}, buttons: {}, rows: {}, weights: {},
+              layouts: {}, pending: Object.keys(__PENDING)};
   __reacts = [];
   __updates = [];
+  __opened = [];
   Object.keys(__elements).forEach(function(id) {
     var el = __elements[id];
     if (el.layout) { snap.layouts[id] = JSON.parse(JSON.stringify(el.layout)); }
@@ -272,6 +292,7 @@ function __snapshot() {
       snap.selects[id] = {value: el.value, disabled: el.disabled,
                           options: el.options.map(function(o) { return [o.value, o.text]; })};
     }
+    if (el.tagName === 'button') { snap.buttons[id] = el.disabled; }
     if (el.children.length) {
       snap.rows[id] = el.children.map(function(tr) {
         return tr.children.map(function(td) { return td._text; });
@@ -333,8 +354,9 @@ function __spin(ticks, next) {
 // reached its inflate, and followed by one; nothing waiting is an error),
 // ["call", name, args] (a page script's window function, called as another
 // script would — the filter's window.dashScenarioSelect call, with any
-// labels), ["snap", name]. Emits every snapshot, as JSON, once the steps are
-// done.
+// labels), ["click", id] (a reader clicking that element: its click
+// listeners run unless it is disabled), ["snap", name]. Emits every
+// snapshot, as JSON, once the steps are done.
 function __step(steps, i) {
   if (i >= steps.length) {
     __emit(JSON.stringify(__snaps));
@@ -385,6 +407,11 @@ function __step(steps, i) {
     delete __DAMAGED[s[1]];
   } else if (s[0] === 'call') {
     window[s[1]].apply(null, s[2]);
+  } else if (s[0] === 'click') {
+    var clicked = document.getElementById(s[1]);
+    if (!clicked.disabled) {
+      (clicked._listeners.click || []).forEach(function(fn) { fn(); });
+    }
   } else if (s[0] === 'snap') {
     __snaps[s[1]] = __snapshot();
   }

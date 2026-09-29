@@ -137,7 +137,8 @@ Notes:
     that rule. Only the dashboard's "Save as live defaults…" button (or
     python3 -m kalshi_betting.defaults_server --seed), confirmed through
     defaults_server, sets the live defaults; nothing else chosen here reaches
-    live trading.
+    live trading. The run's last line says how: start the defaults server,
+    then click the button for the filter bar's scenario.
 """
 import argparse
 import logging
@@ -632,6 +633,11 @@ def main() -> None:
                        sweep=result, interval_discount=result.primary.k,
                        series_categories=series_categories, risk_free=risk_free)
     logging.info("Open the HTML file in a browser to view the interactive charts.")
+    # How a scenario on the page becomes the live defaults: the page cannot
+    # write files, so its button opens the defaults server's confirmation page
+    logging.info("To make the filter bar's scenario the live trading defaults: start python3 "
+                 "-m kalshi_betting.defaults_server, then click the page's \"Save as live "
+                 "defaults…\" button")
 
 
 if __name__ == "__main__":
