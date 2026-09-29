@@ -51,22 +51,29 @@ Purpose:
     inflates a scenario's chunk only when a reader chooses it.
 
     The filter bar also carries a "Save as live defaults…" button. It opens
-    the defaults server's confirmation page (python3 -m
-    kalshi_betting.defaults_server, on config.DEFAULTS_SERVER_HOST and
+    the defaults server's confirmation page (kalshi_betting.defaults_server,
+    started by ./start_dashboard.sh, on config.DEFAULTS_SERVER_HOST and
     DEFAULTS_SERVER_PORT) in a new tab, for the bar's scenario on screen —
     its spread band, Tier floors choice, k, size cap and any category or
     tag, with this run's same-title cap when the run recorded one — never
     for the Scenario Explorer's own selects. That page compares the
-    proposal with the live defaults in force and saves it only when its
-    Confirm button is clicked; this page writes nothing. The button is
+    proposal with the live defaults in force and acts only when one of its
+    buttons is pressed: Confirm and save saves it, Confirm and trade saves
+    it and then runs the live bot with it, and Dry run runs the bot with it
+    without placing orders; this page writes nothing. The button is
     rendered disabled; the script enables it only while the scenario on
     screen can become live settings (it was simulated, its band was
     recorded, and its k and size cap were recorded and are above zero),
     keeps it disabled while another scenario's
     chunk loads, and, on a page that files trades by ticker prefix rather
     than by Kalshi's series listing (which the live category and tag filter
-    reads), keeps it disabled for a category or tag. A page whose filter
-    bar could not be built has no button.
+    reads), keeps it disabled for a category or tag. Beside it, a plain
+    "Trade using defaults…" link opens the server's trade page (the saved
+    defaults, with Dry run and Confirm and trade) in a new tab; it needs no
+    script. A page whose filter bar could not be built has no save button,
+    but keeps the trade link under the notice that replaces the bar. The
+    link's id, flt-trade, is how the defaults server tells this page from
+    one built before these buttons.
 
 Dependencies:
     Imports BacktestSweep, BacktestTrade, CorpusProvenance (historical.py's,
@@ -96,8 +103,8 @@ Dependencies:
     BacktestSweep.cap_sweep (a backtester.CapSweep) by its attributes — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
     page's file name, which defaults_server also opens), DEFAULTS_SERVER_HOST
-    and DEFAULTS_SERVER_PORT (the address the filter bar's save button
-    opens), LIVE_DEFAULTS_SOURCE_PATTERN (the note shapes that server
+    and DEFAULTS_SERVER_PORT (the address the filter bar's save button and
+    trade link open), LIVE_DEFAULTS_SOURCE_PATTERN (the note shapes that server
     accepts, which the button's note is checked against),
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
     RISK_FREE_BILL_TERM and RISK_FREE_RATE_FIELD (named in the header),
@@ -5723,8 +5730,11 @@ _SAVE_LABEL = "Save as live defaults…"
 _SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter bar's "
                "scenario on screen — its spread band, tier floors, k, size cap and any "
                "category or tag, with this run's same-title cap when the run recorded one; "
-               "not the Scenario Explorer's own selects — with the live trading defaults, "
-               "and saves it only when Confirm is clicked there. It stays unavailable "
+               "not the Scenario Explorer's own selects — with the live trading defaults. "
+               "Nothing is saved until you press a button there: Confirm and save saves "
+               "it; Confirm and trade saves it and then runs the live bot with it, placing "
+               "real orders; Dry run runs the live bot with it without placing orders and "
+               "saves nothing. It stays unavailable "
                "while a scenario loads, and for a scenario the run never simulated, "
                "whose band, k or size cap the run did not record, or whose k or size "
                "cap is not above zero.")
@@ -5732,7 +5742,62 @@ _SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter
 # Kalshi's series listing (which the live category and tag filter reads)
 _SAVE_TITLE_UNFILED = (" A category or tag can be saved only from a page built with "
                        "Kalshi's series listing; this one files trades by ticker prefix.")
-_SAVE_NOTE = "(needs python3 -m kalshi_betting.defaults_server running)"
+_SAVE_NOTE = "(needs ./start_dashboard.sh running)"
+
+# The bar's "Trade using defaults…" link: its label and its hover text. It
+# opens the defaults server's trade page, which shows the saved live defaults
+# and runs the live bot with them only when a button there is pressed.
+_TRADE_LABEL = "Trade using defaults…"
+_TRADE_TITLE = ("Open a page, in a new tab, that shows the saved live defaults and runs "
+                "the live bot with them when you confirm there (real orders, or a dry run).")
+# A plain link drawn to look like the bar's button, so it reads as a control;
+# being a link, it works whatever state the page script is in
+_BUTTON_LINK_STYLE = ("display:inline-block; padding:1px 6px; border:1px solid #767676; "
+                      "border-radius:3px; background:#EFEFEF; color:#000000; "
+                      "text-decoration:none; font-size:13px;")
+
+
+def _trade_url() -> str:
+    """
+    The defaults server's trade page, on config.DEFAULTS_SERVER_HOST and DEFAULTS_SERVER_PORT.
+
+    Returns:
+        str: The page's address.
+    """
+    return f"http://{DEFAULTS_SERVER_HOST}:{DEFAULTS_SERVER_PORT}/trade"
+
+
+def _trade_link_html() -> str:
+    """
+    The "Trade using defaults…" link, opening the defaults server's trade page in a new tab.
+
+    The link's id, flt-trade, is also how the defaults server tells a
+    dashboard that has these buttons from one built before them, so it must
+    stay in the page's opening part (the filter bar, or the notice that
+    replaces it).
+
+    Returns:
+        str: The link's HTML, every attribute escaped.
+    """
+    return (f'<a id="flt-trade" href="{html.escape(_trade_url())}" target="_blank" '
+            f'rel="noopener" title="{html.escape(_TRADE_TITLE)}" '
+            f'style="{_BUTTON_LINK_STYLE}">{html.escape(_TRADE_LABEL)}</a>')
+
+
+def _trade_paragraph_html() -> str:
+    """
+    The trade link on its own line, for a page whose filter bar could not be built.
+
+    The save button needs the bar's data, so it is lost with the bar; the
+    trade link needs nothing from the page, so it stays, with the note that
+    the defaults server must be running.
+
+    Returns:
+        str: A paragraph holding the link and its note.
+    """
+    return ('<p id="live-trade" style="font-family:sans-serif; font-size:14px;">'
+            f'{_trade_link_html()}<span style="color:#9E9E9E; font-size:13px;">'
+            f'&nbsp;{html.escape(_SAVE_NOTE)}</span></p>')
 
 
 def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
@@ -8742,13 +8807,15 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     choice on reload: the script enables them once it has inflated the base
     block AND the primary scenario's chunk, so without it (or without a
     browser that can inflate them) they cannot promise a view the page will
-    not show. After the Tag select comes the save button with its note,
-    rendered disabled too: the script enables it whenever the scenario on
-    screen can become the live defaults, and a click opens the defaults
-    server's confirmation page for that scenario in a new tab. Its hover
-    text (_SAVE_TITLE) gains _SAVE_TITLE_UNFILED on a page that does not
-    file trades by Kalshi's series listing (payload "save"), where a
-    category or tag cannot be saved.
+    not show. After the Tag select comes the save button, rendered disabled
+    too: the script enables it whenever the scenario on screen can become
+    the live defaults, and a click opens the defaults server's confirmation
+    page for that scenario in a new tab. Its hover text (_SAVE_TITLE) gains
+    _SAVE_TITLE_UNFILED on a page that does not file trades by Kalshi's
+    series listing (payload "save"), where a category or tag cannot be
+    saved. Then the "Trade using defaults…" link (_trade_link_html), which
+    the script never touches, and the note that both need the defaults
+    server running.
 
     Args:
         payload (dict): _filter_payload's base block.
@@ -8837,6 +8904,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         # browser that restores a control's disabled state on reload must not)
         f'&nbsp;&nbsp;<button id="flt-save" type="button" disabled autocomplete="off" '
         f'title="{save_title}">{html.escape(_SAVE_LABEL)}</button>'
+        # The trade link: a plain link, so it works whatever the script's state
+        f'&nbsp;&nbsp;{_trade_link_html()}'
         '<span id="flt-save-note" style="color:#9E9E9E; font-size:13px;">'
         f'&nbsp;{html.escape(_SAVE_NOTE)}</span>'
         '<div id="flt-summary" style="color:#616161; font-size:13px; margin-top:6px;">'
@@ -9690,7 +9759,8 @@ _FILTER_JS = r"""
     choose();
   });
   // The save button opens the confirmation page for the scenario on screen
-  // in a new tab; the page saves nothing until Confirm is clicked there
+  // in a new tab; that page saves nothing until Confirm and save, or Confirm
+  // and trade, is clicked there
   if (saveBtn) {
     saveBtn.addEventListener('click', function() {
       var href = saveHref();
@@ -10000,7 +10070,9 @@ def generate_dashboard(
         filter_data = filter_bar = base_block = None
         chunks = []
     if filter_bar is None:
-        filter_data, filter_bar, chunks = None, _FILTER_UNAVAILABLE_HTML, []
+        # The notice in the bar's place, and the trade link, which needs no bar
+        filter_data, chunks = None, []
+        filter_bar = _FILTER_UNAVAILABLE_HTML + "\n" + _trade_paragraph_html()
         # Without the bar the section cannot follow it, whatever was built
         kd, kd_failed = None, False
     if explores and explorer_data is None and not explorer_failed:

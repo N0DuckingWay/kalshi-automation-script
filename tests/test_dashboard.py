@@ -6,7 +6,8 @@ filter bar's k and size cap, the risk-free rate every Sharpe and Sortino
 subtracts (the TestRiskFree* classes and TestCapitalDeployedParity), and the
 filter bar's "Save as live defaults…" button (TestSaveLiveDefaultsButton), whose
 clicked address is read back through defaults_server's own request handler and
-proposal parser.
+proposal parser, and its "Trade using defaults…" link (TestTradeUsingDefaultsLink),
+whose id defaults_server's own scan must find near the top of the page.
 
 generate_dashboard() pulls in yfinance (network) and Plotly's full HTML
 serialization; the escaping and drawdown fixes are exercised directly against
@@ -6804,6 +6805,130 @@ class TestSaveLiveDefaultsButton:
             assert source == data["save"]["source"]
         # Nothing was written by showing the page
         assert config.read_saved_live_defaults() == current
+
+
+# The defaults server's trade page, as the dashboard's link must name it
+_TRADE_URL = f"http://{config.DEFAULTS_SERVER_HOST}:{config.DEFAULTS_SERVER_PORT}/trade"
+
+
+class TestTradeUsingDefaultsLink:
+    """The filter bar's "Trade using defaults…" link: a plain link to the
+    defaults server's trade page, opened in a new tab, that needs no script;
+    it stays on a page whose filter bar could not be built; and its id is
+    what the defaults server looks for, early enough in the page for the
+    server's scan to find it."""
+
+    @staticmethod
+    def _link(page: str) -> tuple[dict, str]:
+        """
+        Read the one Trade link on a page.
+
+        Args:
+            page (str): The page's HTML.
+
+        Returns:
+            tuple[dict, str]: The link's attributes (unescaped) and its text.
+
+        Raises:
+            AssertionError: If the page does not hold exactly one such link.
+        """
+        links = re.findall(r'<a id="flt-trade" ([^>]*)>(.*?)</a>', page)
+        assert len(links) == 1, links
+        attributes, text = links[0]
+        return ({name: html.unescape(value)
+                 for name, value in re.findall(r'(\w+)="([^"]*)"', attributes)},
+                html.unescape(text))
+
+    def test_it_opens_the_trade_page_in_a_new_tab(self, monkeypatch, tmp_path):
+        page = TestSaveLiveDefaultsButton._page(monkeypatch, tmp_path)
+        attributes, text = self._link(page)
+        assert attributes["href"] == _TRADE_URL == dashboard._trade_url()
+        assert attributes["target"] == "_blank" and attributes["rel"] == "noopener"
+        assert attributes["title"] == dashboard._TRADE_TITLE
+        assert attributes["style"] == dashboard._BUTTON_LINK_STYLE
+        assert text == dashboard._TRADE_LABEL == "Trade using defaults…"
+        # Right after the save button, before its note and the summary line
+        assert page.index('id="flt-save"') < page.index('id="flt-trade"') \
+            < page.index('id="flt-save-note"') < page.index('id="flt-summary"')
+        # A plain link: the script neither names it nor words it, and it is no button
+        assert "flt-trade" not in dashboard._FILTER_JS
+        for words in (dashboard._TRADE_LABEL, dashboard._TRADE_TITLE):
+            assert words not in dashboard._FILTER_JS
+        assert _page_elements(page)["buttons"] == {"flt-save": {"disabled": True}}
+
+    def test_its_address_is_read_from_config(self, monkeypatch):
+        monkeypatch.setattr(dashboard, "DEFAULTS_SERVER_HOST", "127.0.0.9")
+        monkeypatch.setattr(dashboard, "DEFAULTS_SERVER_PORT", 9123)
+        assert dashboard._trade_url() == "http://127.0.0.9:9123/trade"
+        assert 'href="http://127.0.0.9:9123/trade"' in dashboard._trade_link_html()
+
+    def test_it_stays_when_the_filter_bar_cannot_be_built(self, monkeypatch, tmp_path):
+        def broken(*_a, **_k):
+            """
+            Stand in for _filter_payload: the filter's data cannot be built.
+
+            Args:
+                *_a: Ignored.
+                **_k: Ignored.
+
+            Raises:
+                ValueError: Always.
+            """
+            raise ValueError("boom")
+        monkeypatch.setattr(dashboard, "_filter_payload", broken)
+        page = TestSaveLiveDefaultsButton._page(monkeypatch, tmp_path)
+        attributes, text = self._link(page)
+        assert attributes["href"] == _TRADE_URL and text == dashboard._TRADE_LABEL
+        # Under the notice that replaces the bar, in a paragraph of its own
+        notice = page.index(dashboard._FILTER_UNAVAILABLE_HTML)
+        paragraph = page.index('<p id="live-trade"')
+        assert notice + len(dashboard._FILTER_UNAVAILABLE_HTML) < paragraph \
+            < page.index('id="flt-trade"')
+        assert html.escape(dashboard._SAVE_NOTE) in page[paragraph:]
+        # Still no button: the save button needs the bar's data
+        assert 'id="flt-save"' not in page and "<button" not in page
+
+    def test_the_note_and_the_save_button_s_words(self):
+        assert dashboard._SAVE_NOTE == "(needs ./start_dashboard.sh running)"
+        # The confirmation page's buttons, named as that page names them
+        for words in ("Confirm and save saves it", "Confirm and trade saves it and then "
+                      "runs the live bot with it, placing real orders", "Dry run runs the "
+                      "live bot with it without placing orders and saves nothing"):
+            assert words in dashboard._SAVE_TITLE, words
+        assert "when Confirm is clicked" not in dashboard._SAVE_TITLE
+        assert dashboard._TRADE_TITLE == (
+            "Open a page, in a new tab, that shows the saved live defaults and runs the live "
+            "bot with them when you confirm there (real orders, or a dry run).")
+
+    @pytest.mark.parametrize("bar", [True, False], ids=["bar", "no-bar"])
+    def test_the_defaults_server_finds_the_buttons_early_in_the_page(
+            self, monkeypatch, tmp_path, bar):
+        if not bar:
+            def broken(*_a, **_k):
+                """
+                Stand in for _filter_payload: the filter's data cannot be built.
+
+                Args:
+                    *_a: Ignored.
+                    **_k: Ignored.
+
+                Raises:
+                    ValueError: Always.
+                """
+                raise ValueError("boom")
+            monkeypatch.setattr(dashboard, "_filter_payload", broken)
+        TestSaveLiveDefaultsButton._page(monkeypatch, tmp_path)
+        path = tmp_path / config.DASHBOARD_FILENAME
+        data = path.read_bytes()
+        marker = defaults_server._DASHBOARD_MARKER
+        # In the page's opening part, before the first section (and so before
+        # every data block), well inside what the server reads
+        first_section = dashboard._SECTION_STYLE.format(title="Portfolio Performance")
+        assert data.count(marker) == 1
+        assert data.index(marker) < data.index(first_section.encode("utf-8"))
+        assert data.index(marker) + len(marker) <= config.DASHBOARD_MARKER_SCAN_BYTES
+        assert defaults_server._dashboard_state(path) == (defaults_server._DASHBOARD_READY,
+                                                          None)
 
 
 def _kpi_trades(snap: dict) -> list[tuple[str, str]]:

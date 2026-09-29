@@ -7,9 +7,20 @@ Purpose:
     A small local web server that saves the live trading defaults
     (config.LIVE_DEFAULTS_FILE, live_defaults.json), which every live run
     starts from, and starts live trading runs with them. Run by a person,
-    deliberately, from a terminal:
+    deliberately, from a terminal, through the launcher at the checkout's
+    root (./start_dashboard.sh [--seed], which first checks that its Python
+    can import the live bot) or directly:
 
         python3 -m kalshi_betting.defaults_server [--seed] [--no-browser]
+
+    On start it opens one page: with --seed the confirmation page proposing
+    the seed values; otherwise the backtest dashboard, or its own index when
+    there is no dashboard, the dashboard was built before its Save and Trade
+    buttons, or it cannot be read. When its port is already taken by this
+    checkout's own server, running this checkout's current code, it opens
+    that page from the running server and exits, starting nothing; when the
+    port is held by that server running older code, by another checkout's
+    server, or by anything else, it refuses (exit 2).
 
     Its pages:
       - /confirm, opened with the proposed settings in its address (by the
@@ -30,7 +41,9 @@ Purpose:
         run wrote (main.py --result-file) and the exit code.
       - / lists what the server is for and the newest runs; /saved shows the
         defaults just saved; /checkout answers which checkout this server
-        serves, as JSON.
+        serves and a fingerprint of the code it loaded, as JSON (a second
+        start in the same checkout reads it to find its own server on the
+        port).
 
     Each run is its own `python -m kalshi_betting.main --mode prod` process,
     started with all seven toggles as explicit flags (config.live_settings_argv)
@@ -48,8 +61,9 @@ Dependencies:
     live_defaults_source), live_settings_argv (a run's flags), the seed values
     and their source note, the source-note pattern, the exit codes, the run
     result's format tag and the DEFAULTS_SERVER_*, DASHBOARD_FILENAME,
-    SCHEDULER_* constants. From run_lock: held() and holder(), to refuse a
-    real-money run while another live trading run holds the machine's lock.
+    DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_* constants. From run_lock:
+    held() and holder(), to refuse a real-money run while another live
+    trading run holds the machine's lock.
     It reads config.LIVE_DEFAULTS_FILE, config.PROJECT_ROOT,
     config.LIVE_RUNS_DIR and config.LIVE_RUN_LOCK_FILE through the module at
     call time, so the tests' redirects reach it. Nothing imports this module:
@@ -110,6 +124,17 @@ Notes:
     config.EXIT_TRADES_NEED_ATTENTION) or without a clean result. The server
     never stops a run: killing one while it sends orders could leave half of
     a pair open.
+
+    The one request it makes itself is to its own port, when a start finds
+    that port taken: GET /checkout, with no proxy, no redirect followed, a
+    bounded wait and a bounded read. Only an answer naming this checkout
+    (config.PROJECT_ROOT, resolved) counts as its own server, and it is
+    reused only when the code it loaded matches this checkout's code now
+    (a SHA-256 over the package's .py files), so a server left running
+    across a code change is restarted rather than trusted with a run;
+    anything else gets a refusal. That answer is a claim, not proof: a local
+    program listening on the port could make it, as it could already serve
+    look-alike pages at the addresses the dashboard's buttons open.
 """
 import argparse
 import errno
@@ -117,6 +142,7 @@ import fcntl
 import hashlib
 import hmac
 import html
+import http.client
 import json
 import logging
 import logging.handlers
@@ -126,6 +152,7 @@ import re
 import secrets
 import subprocess
 import sys
+import urllib.request
 import webbrowser
 from base64 import b64encode
 from collections.abc import Callable
@@ -139,6 +166,9 @@ from urllib.parse import parse_qs, urlencode
 from . import config, run_lock
 from .config import (
     DASHBOARD_FILENAME,
+    DASHBOARD_MARKER_SCAN_BYTES,
+    DEFAULTS_SERVER_CHECKOUT_MAX_BYTES,
+    DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS,
     DEFAULTS_SERVER_CONFIRM_ARM_MS,
     DEFAULTS_SERVER_HOST,
     DEFAULTS_SERVER_INDEX_RUNS,
@@ -315,7 +345,16 @@ _ACK_LABEL = "I have read the last run's result and want to place real orders an
 # How to start a server that can run trades: its own main() hands _App the
 # process starter; an _App built without one refuses every run
 _NOT_STARTED_TO_TRADE = ("This server was not started to run trades — start it with "
-                         "python3 -m kalshi_betting.defaults_server")
+                         "./start_dashboard.sh")
+
+# What a dashboard file holds when it has the filter bar's Save and Trade
+# buttons: the Trade link's id, which dashboard.py writes in the page's
+# opening part (in the filter bar, or under the notice that replaces it)
+_DASHBOARD_MARKER = b'id="flt-trade"'
+
+# What _dashboard_state finds at the dashboard's path
+_DASHBOARD_MISSING, _DASHBOARD_UNREADABLE, _DASHBOARD_OLD, _DASHBOARD_READY = (
+    "missing", "unreadable", "old", "ready")
 
 # The reasons shown beside a button that does not apply
 _SAVE_FIRST = "A dry run needs saved defaults — save these first"
@@ -1956,6 +1995,32 @@ def _run_html(run: _Run) -> str:
     return _page("Live trading run", "\n".join(parts))
 
 
+def _dashboard_state(dashboard: Path) -> tuple[str, str | None]:
+    """
+    Tell whether the backtest dashboard exists and carries the filter bar's Save and Trade buttons.
+
+    The buttons sit in the page's opening part, so only the first
+    DASHBOARD_MARKER_SCAN_BYTES are read, looking for the Trade link's id
+    (_DASHBOARD_MARKER). A page built before the buttons existed lacks it.
+
+    Args:
+        dashboard (Path): The dashboard file.
+
+    Returns:
+        tuple[str, str | None]: The state — _DASHBOARD_MISSING,
+            _DASHBOARD_UNREADABLE, _DASHBOARD_OLD or _DASHBOARD_READY — and,
+            for an unreadable file only, why it could not be read (else None).
+    """
+    if not dashboard.exists():
+        return _DASHBOARD_MISSING, None
+    try:
+        with dashboard.open("rb") as page:
+            head = page.read(DASHBOARD_MARKER_SCAN_BYTES)
+    except OSError as exc:
+        return _DASHBOARD_UNREADABLE, f"{type(exc).__name__}: {exc}"
+    return (_DASHBOARD_READY if _DASHBOARD_MARKER in head else _DASHBOARD_OLD), None
+
+
 def _index_html() -> str:
     """
     Build the page at "/": what this server is for and the newest runs, with no form and no script.
@@ -1964,13 +2029,25 @@ def _index_html() -> str:
         str: The HTML page.
     """
     dashboard = config.PROJECT_ROOT / DASHBOARD_FILENAME
-    if dashboard.exists():
+    state, why = _dashboard_state(dashboard)
+    shown = html.escape(str(dashboard.absolute()))
+    if state == _DASHBOARD_READY:
         intro = ("<p>This server saves the live trading defaults and runs the live bot with "
-                 f"them. Open <code>{html.escape(str(dashboard.absolute()))}</code> and use "
-                 "its filter bar's Save as live defaults… button to save a scenario.</p>")
-    else:
+                 f"them. Open <code>{shown}</code> and use its filter bar's Save as live "
+                 "defaults… button to save a scenario, or its Trade using defaults… button to "
+                 "trade the saved ones.</p>")
+    elif state == _DASHBOARD_MISSING:
         intro = ("<p>No backtest dashboard yet: run <code>python3 -m kalshi_betting.backtest"
                  "</code> to build one.</p>")
+    elif state == _DASHBOARD_OLD:
+        intro = (f"<p>The backtest dashboard at <code>{shown}</code> was built before its "
+                 "Save as live defaults… and Trade using defaults… buttons: rebuild it with "
+                 "<code>python3 -m kalshi_betting.backtest</code> and the "
+                 "<code>--start-date</code> you built it from. Until then, use the links "
+                 "below.</p>")
+    else:
+        intro = (f"<p>The backtest dashboard at <code>{shown}</code> could not be read "
+                 f"({html.escape(why or 'no reason given')}). Use the links below.</p>")
     links = (f"<p><a href=\"{html.escape('/confirm?' + _seed_query())}\">Start from the seed "
              "values</a> · <a href=\"/trade\">Trade using defaults</a></p>")
     rows = []
@@ -2039,8 +2116,8 @@ class _App:
         the confirmation page and POST "/confirm" saves, trades or dry-runs;
         GET "/saved" shows the defaults in force; GET "/trade" shows the saved
         defaults and POST "/trade" trades or dry-runs them; GET "/runs/<id>"
-        shows a run; GET "/checkout" answers which checkout this is. Anything
-        else is 404.
+        shows a run; GET "/checkout" answers which checkout this is and the
+        fingerprint of the code this process loaded. Anything else is 404.
 
         Args:
             request (_Request): The request.
@@ -2063,7 +2140,7 @@ class _App:
                 return self._get_trade()
             if path == "/checkout":
                 return _Response(200, json.dumps(
-                    {"project_root": str(config.PROJECT_ROOT.resolve())}),
+                    {"project_root": str(config.PROJECT_ROOT.resolve()), "code": _LOADED_CODE}),
                     content_type=_JSON_TYPE)
             if path.startswith("/runs/"):
                 return self._get_run(path[len("/runs/"):])
@@ -2371,8 +2448,8 @@ class _App:
         return self._refuse(
             status, "No live defaults are saved",
             "No live defaults are saved, so there is nothing to trade. Save them first: "
-            "the backtest dashboard's Save as live defaults… button, or "
-            "python3 -m kalshi_betting.defaults_server --seed for the seed values.")
+            "the backtest dashboard's Save as live defaults… button, or run "
+            "./start_dashboard.sh --seed in this checkout for the seed values.")
 
     def _get_trade(self) -> _Response:
         """
@@ -2987,45 +3064,270 @@ class _Handler(BaseHTTPRequestHandler):
         logging.info("%s", _log_safe(f"{self.address_string()} {format % args}"))
 
 
-def _setup_logging(log_path: Path) -> None:
+def _setup_logging(log_path: Path | None) -> None:
     """
-    Log to the console and to a rotating file.
+    Log to the console and, when given one, to a rotating file.
 
     5 MB across 3 backups, like main.py's and scheduler.py's own logs; the
     file is only created on the first record.
 
     Args:
-        log_path (Path): The log file.
+        log_path (Path | None): The log file; None logs to the console only
+            (a start that found this checkout's server already running
+            leaves the log file to that server).
 
     Returns:
         None
     """
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_path is not None:
+        handlers.append(logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=5 * 1024 * 1024, backupCount=3, delay=True,
+        ))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.StreamHandler(),
-            logging.handlers.RotatingFileHandler(
-                log_path, maxBytes=5 * 1024 * 1024, backupCount=3, delay=True,
-            ),
-        ],
+        handlers=handlers,
     )
+
+
+def _code_fingerprint() -> str:
+    """
+    Fingerprint this package's Python code as it is on disk now.
+
+    A SHA-256 over every .py file in the package's own folder, in name
+    order, each as its name and then its length and bytes. Only the code
+    counts: a change to the docs, the tests or a saved file leaves it as it
+    is. A file that cannot be read counts as its name and the error's type,
+    and a folder that cannot be listed as no files, so it never raises.
+
+    Returns:
+        str: The fingerprint, 64 hex digits.
+    """
+    digest = hashlib.sha256()
+    folder = Path(__file__).resolve().parent
+    try:
+        files = sorted(folder.glob("*.py"))
+    except OSError:
+        files = []
+    for path in files:
+        digest.update(path.name.encode("utf-8") + b"\0")
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            data = f"unreadable: {type(exc).__name__}".encode()
+        digest.update(len(data).to_bytes(8, "big") + data)
+    return digest.hexdigest()
+
+
+# The fingerprint of the code this process loaded, taken when this module is
+# imported (for the server, as it starts). GET /checkout reports it, so a
+# second start can tell a server left running across a code change
+_LOADED_CODE = _code_fingerprint()
+
+
+@dataclass(frozen=True)
+class _RunningServer:
+    """
+    What the defaults server already on the port says about itself (GET /checkout).
+
+    Attributes:
+        project_root (str): The resolved checkout root it serves.
+        code (str | None): The fingerprint of the code it loaded
+            (_code_fingerprint); None when its answer carries none.
+    """
+    project_root: str
+    code: str | None
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """A redirect handler that follows none: an answer must come from the listener itself."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """
+        Refuse every redirect, so urllib raises HTTPError for the 3xx instead.
+
+        Args:
+            req (urllib.request.Request): The request that was answered.
+            fp: The answer's body.
+            code (int): The 3xx status.
+            msg (str): The status's reason.
+            headers: The answer's headers.
+            newurl (str): Where the answer points.
+
+        Returns:
+            None: Never a new request.
+        """
+        return None
+
+
+def _running_checkout(base: str) -> _RunningServer | None:
+    """
+    Ask the server listening at base which checkout it serves, or None when it gives no such answer.
+
+    One GET of base/checkout, through no proxy and following no redirect,
+    with a DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS timeout on the connection
+    and on each read, reading at most DEFAULTS_SERVER_CHECKOUT_MAX_BYTES.
+    Only a success status whose body is a JSON object with a non-empty
+    string "project_root" counts as an answer; anything else — no listener,
+    a timeout, an error or redirect status, a longer body, or a body that is
+    not that JSON (one nested too deeply to parse included) — is None. The
+    answer's "code" is kept when it is a string, else read as None. It never
+    raises.
+
+    Args:
+        base (str): The server's address, "http://host:port".
+
+    Returns:
+        _RunningServer | None: The resolved checkout root the server names
+            and the fingerprint of the code it loaded; None when the listener
+            is not a defaults server that answers.
+    """
+    # No proxy (the address is loopback) and no redirect followed
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects)
+    try:
+        with opener.open(f"{base}/checkout",
+                         timeout=DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS) as answer:
+            body = answer.read(DEFAULTS_SERVER_CHECKOUT_MAX_BYTES + 1)
+        if len(body) > DEFAULTS_SERVER_CHECKOUT_MAX_BYTES:
+            return None
+        record = json.loads(body.decode("utf-8"))
+    except (OSError, ValueError, RecursionError, http.client.HTTPException):
+        return None
+    if not isinstance(record, dict):
+        return None
+    root, code = record.get("project_root"), record.get("code")
+    if not isinstance(root, str) or not root:
+        return None
+    return _RunningServer(project_root=root, code=code if isinstance(code, str) else None)
+
+
+def _start_page(base: str, *, seed: bool) -> tuple[str, int, str]:
+    """
+    Choose the page a start opens, and what it logs about that page.
+
+    With seed, the confirmation page proposing LIVE_DEFAULTS_SEED. Otherwise
+    the backtest dashboard when it exists and has the Save and Trade buttons,
+    and this server's index when there is no dashboard, when it was built
+    before those buttons (a WARNING, naming the rebuild and the trade page)
+    or when it cannot be read (a WARNING with the reason).
+
+    Args:
+        base (str): The server's address, "http://host:port".
+        seed (bool): Whether this start was asked to propose the seed values.
+
+    Returns:
+        tuple[str, int, str]: The address to open, the log level and the
+            message to log about it.
+    """
+    if seed:
+        url = f"{base}/confirm?{_seed_query()}"
+        return url, logging.INFO, f"Seed values: open {url} to review and confirm them"
+    index = f"{base}/"
+    dashboard = config.PROJECT_ROOT / DASHBOARD_FILENAME
+    state, why = _dashboard_state(dashboard)
+    if state == _DASHBOARD_READY:
+        return (dashboard.as_uri(), logging.INFO,
+                f"Open {dashboard} and use its filter bar's Save as live defaults… or Trade "
+                "using defaults… button")
+    if state == _DASHBOARD_MISSING:
+        return (index, logging.INFO,
+                f"No backtest dashboard at {dashboard}: run python3 -m kalshi_betting.backtest "
+                f"to build one, or start from the seed values with --seed; opening {index}")
+    if state == _DASHBOARD_OLD:
+        return (index, logging.WARNING,
+                "This dashboard was built before the Save/Trade buttons: rebuild it with "
+                "python3 -m kalshi_betting.backtest and the --start-date you built it from; "
+                f"until then use {base}/trade (opening {index})")
+    return (index, logging.WARNING,
+            f"The backtest dashboard at {dashboard} could not be read ({why}); opening {index}")
+
+
+def _open_start_page(base: str, *, seed: bool, no_browser: bool) -> None:
+    """
+    Log the page this start is for and, unless told not to, open it in the browser.
+
+    Args:
+        base (str): The server's address, "http://host:port".
+        seed (bool): Whether this start was asked to propose the seed values.
+        no_browser (bool): Whether to open nothing and only log the address.
+
+    Returns:
+        None
+    """
+    url, level, message = _start_page(base, seed=seed)
+    logging.log(level, "%s", message)
+    if not no_browser:
+        webbrowser.open(url)
+
+
+def _reuse_running_server(parser: argparse.ArgumentParser, base: str, *, seed: bool,
+                          no_browser: bool) -> None:
+    """
+    Answer a start whose port is taken: reopen this checkout's running server's page, or refuse.
+
+    It binds nothing and starts nothing — no second server, no run. When the
+    listener answers GET /checkout with this checkout's resolved root and
+    the fingerprint of this checkout's code now (_code_fingerprint), it
+    logs that this checkout's server is already running and opens the page
+    this start asked for (the seed page with seed; else the dashboard, or the
+    server's index), unless no_browser. When the listener names another
+    checkout, names this one with other code (a server left running across
+    a code change, whose pages would check and start runs with that older
+    code) or gives no such answer, the start is refused.
+
+    Args:
+        parser (argparse.ArgumentParser): main()'s parser, for its error exit.
+        base (str): The server's address, "http://host:port".
+        seed (bool): Whether this start was asked to propose the seed values.
+        no_browser (bool): Whether to open nothing and only log the address.
+
+    Returns:
+        None: When this checkout's server is running (the caller then exits 0).
+
+    Raises:
+        SystemExit: Status 2 (parser.error) when the port is held by another
+            checkout's defaults server, by this checkout's server running
+            other code, or by something that is not a defaults server.
+    """
+    running = _running_checkout(base)
+    if running is None:
+        parser.error(f"port {DEFAULTS_SERVER_PORT} is in use — stop the other server, "
+                     "or change config.DEFAULTS_SERVER_PORT and rebuild the dashboard")
+    if running.project_root != str(config.PROJECT_ROOT.resolve()):
+        parser.error(f"port {DEFAULTS_SERVER_PORT} is served by the defaults server of "
+                     f"{_log_safe(running.project_root)} — stop it (Ctrl-C in its terminal) "
+                     "before starting this checkout's")
+    if running.code != _code_fingerprint():
+        parser.error(f"port {DEFAULTS_SERVER_PORT} is served by this checkout's defaults "
+                     "server, but it is running code from before a change to this "
+                     "checkout — stop it (Ctrl-C in its terminal) and start it again")
+    # The running server keeps its own log file; this short start logs to the terminal
+    _setup_logging(None)
+    logging.info("This checkout's defaults server is already running at %s/", base)
+    _open_start_page(base, seed=seed, no_browser=no_browser)
 
 
 def main(argv: list[str] | None = None) -> None:
     """
-    Run the defaults server until Ctrl-C.
+    Run the defaults server until Ctrl-C, or reopen this checkout's server's page.
 
-    It binds DEFAULTS_SERVER_HOST:DEFAULTS_SERVER_PORT first, so a busy port
-    exits 2 before anything is logged, then logs where it saves and the
-    live defaults in force. Its _App is built with subprocess.Popen as its
-    process starter, the one place that is given, so its pages can start
-    runs. With --seed it opens the confirmation page proposing
-    LIVE_DEFAULTS_SEED; otherwise it opens the backtest dashboard when one
-    has been written. --no-browser only logs the address. When it stops,
-    each run it started that is still going gets a WARNING: the run keeps
-    going on its own.
+    It binds DEFAULTS_SERVER_HOST:DEFAULTS_SERVER_PORT first. When the port
+    is taken it binds nothing and starts nothing: if the listener is this
+    checkout's own defaults server running this checkout's current code (its
+    GET /checkout names this resolved PROJECT_ROOT and this code's
+    fingerprint), it opens the page asked for and returns; if it is that
+    server running older code, another checkout's server, or not a defaults
+    server, it exits 2 before anything is logged. Otherwise it logs where it
+    saves and the live defaults in force. Its _App is built with
+    subprocess.Popen as its process starter, the one place that is given, so
+    its pages can start runs. With --seed it opens the confirmation page
+    proposing LIVE_DEFAULTS_SEED; otherwise it opens the backtest dashboard,
+    or its own index when there is no dashboard, the dashboard was built
+    before its Save and Trade buttons, or it cannot be read. --no-browser
+    only logs the address. When it stops, each run it started that is still
+    going gets a WARNING: the run keeps going on its own.
 
     Args:
         argv (list[str] | None): The arguments; None (default) reads the
@@ -3035,14 +3337,17 @@ def main(argv: list[str] | None = None) -> None:
         None
 
     Raises:
-        SystemExit: Status 2 when the port is in use or an argument is invalid.
+        SystemExit: Status 2 when the port is held by anything but this
+            checkout's defaults server running this checkout's current code,
+            or an argument is invalid.
         OSError: When the port cannot be bound for another reason.
     """
     parser = argparse.ArgumentParser(
         prog="python3 -m kalshi_betting.defaults_server",
         description="Serve the pages that save the live trading defaults "
                     "(live_defaults.json), which every live run starts from, and that run "
-                    "the live bot with them.",
+                    "the live bot with them. When this checkout's server is already "
+                    "running, open its page again instead.",
     )
     parser.add_argument(
         "--seed", action="store_true",
@@ -3054,21 +3359,22 @@ def main(argv: list[str] | None = None) -> None:
         help="Open nothing; only log the address to open",
     )
     args = parser.parse_args(argv)
+    base = f"http://{DEFAULTS_SERVER_HOST}:{DEFAULTS_SERVER_PORT}"
     try:
         # One request at a time, so two saves or two starts can never interleave
         server = HTTPServer((DEFAULTS_SERVER_HOST, DEFAULTS_SERVER_PORT), _Handler)
     except OSError as exc:
-        if exc.errno == errno.EADDRINUSE:
-            parser.error(f"port {DEFAULTS_SERVER_PORT} is in use — stop the other server, "
-                         "or change config.DEFAULTS_SERVER_PORT and rebuild the dashboard")
-        raise
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        _reuse_running_server(parser, base, seed=args.seed, no_browser=args.no_browser)
+        return
     # The one process starter any _App is given: this server's pages start runs
     app = _App(DEFAULTS_SERVER_PORT, start_process=subprocess.Popen)
     server.defaults_app = app
     _setup_logging(config.PROJECT_ROOT / _LOG_NAME)
-    base = f"http://{DEFAULTS_SERVER_HOST}:{DEFAULTS_SERVER_PORT}"
     logging.info("Defaults server at %s/ — it saves the live defaults to %s and trades them "
-                 "at %s/trade. Ctrl-C stops it.", base, config.LIVE_DEFAULTS_FILE, base)
+                 "at %s/trade. Ctrl-C stops it; stop it when you are done.", base,
+                 config.LIVE_DEFAULTS_FILE, base)
     try:
         settings = _current_defaults()
     except LiveDefaultsError as exc:
@@ -3081,21 +3387,7 @@ def main(argv: list[str] | None = None) -> None:
             # Every toggle, in the words a live run's "Live settings:" line uses
             logging.info("Live defaults in force: %s — %s", settings.origin,
                          describe_live_settings(settings))
-    if args.seed:
-        url = f"{base}/confirm?{_seed_query()}"
-        logging.info("Seed values: open %s to review and confirm them", url)
-        if not args.no_browser:
-            webbrowser.open(url)
-    else:
-        dashboard = config.PROJECT_ROOT / DASHBOARD_FILENAME
-        if not dashboard.exists():
-            logging.info("No backtest dashboard at %s: run a backtest to build one, or "
-                         "start from the seed values with --seed", dashboard)
-        else:
-            logging.info("Open %s and use its filter bar's Save as live defaults… button",
-                         dashboard)
-            if not args.no_browser:
-                webbrowser.open(dashboard.as_uri())
+    _open_start_page(base, seed=args.seed, no_browser=args.no_browser)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -440,6 +440,19 @@ class TestLiveRunLockSettings:
         assert shipped.LIVE_RUN_LOCK_WAIT_SECONDS * 100 < shipped.SCHEDULER_JOB_TIMEOUT_SECONDS
 
 
+class TestDefaultsServerCheckoutWait:
+    """How long a start that finds the defaults server's port taken waits for the answer."""
+
+    def test_the_wait_outlasts_two_idle_browser_connections(self):
+        # The running server answers one connection at a time and holds a
+        # connection that sends nothing for DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS,
+        # so the question must be able to wait behind two such connections
+        assert (config.DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS
+                > 2 * config.DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS)
+        # Short enough that a listener that never answers is refused promptly
+        assert config.DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS <= 30
+
+
 class TestMinPriceDiffForGap:
     def test_short_tier_from_zero_gap(self):
         # Same-day deadlines are the tightest correlation — short tier applies
@@ -2302,6 +2315,7 @@ class TestLiveDefaults:
         assert str(config.LIVE_DEFAULTS_FILE) in message
         assert "Save as live defaults…" in message
         assert "python3 -m kalshi_betting.defaults_server --seed" in message
+        assert "./start_dashboard.sh --seed" in message
         # It is also a LiveDefaultsError and a ValueError
         assert isinstance(err.value, config.LiveDefaultsError)
         assert isinstance(err.value, ValueError)

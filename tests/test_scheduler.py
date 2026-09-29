@@ -770,6 +770,7 @@ class TestCheckLiveDefaults:
                                 "(the checkout this daemon runs): every scheduled run will "
                                 "exit 2")
         assert "python3 -m kalshi_betting.defaults_server --seed" in error
+        assert "./start_dashboard.sh --seed" in error
         assert "Save as live defaults…" in error
 
     def test_a_refused_file_logs_the_refused_file_error(self, caplog):

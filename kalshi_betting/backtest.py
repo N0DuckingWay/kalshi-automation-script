@@ -135,10 +135,11 @@ Notes:
     main.py's per-run overrides), from a read of its own, failing soft;
     run_backtest_sweep reads them again and logs where THIS run's grid holds
     that rule. Only the dashboard's "Save as live defaults…" button (or
-    python3 -m kalshi_betting.defaults_server --seed), confirmed through
-    defaults_server, sets the live defaults; nothing else chosen here reaches
-    live trading. The run's last line says how: start the defaults server,
-    then click the button for the filter bar's scenario.
+    ./start_dashboard.sh --seed), confirmed through defaults_server, sets the
+    live defaults; nothing else chosen here reaches live trading. The run's
+    last line says how: run ./start_dashboard.sh (it starts the defaults
+    server and opens the page), then use the filter bar's Save as live
+    defaults… or Trade using defaults… button.
 """
 import argparse
 import logging
@@ -633,11 +634,13 @@ def main() -> None:
                        sweep=result, interval_discount=result.primary.k,
                        series_categories=series_categories, risk_free=risk_free)
     logging.info("Open the HTML file in a browser to view the interactive charts.")
-    # How a scenario on the page becomes the live defaults: the page cannot
-    # write files, so its button opens the defaults server's confirmation page
-    logging.info("To make the filter bar's scenario the live trading defaults: start python3 "
-                 "-m kalshi_betting.defaults_server, then click the page's \"Save as live "
-                 "defaults…\" button")
+    # How a scenario on the page becomes the live defaults, or is traded: the
+    # page cannot write files or start runs, so its buttons open the defaults
+    # server's pages (started by ./start_dashboard.sh)
+    logging.info("To save the filter bar's scenario as the live defaults, or to trade: run "
+                 "./start_dashboard.sh (it starts the defaults server and opens this page), "
+                 "then use the filter bar's Save as live defaults… or Trade using defaults… "
+                 "button.")
 
 
 if __name__ == "__main__":

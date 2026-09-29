@@ -784,6 +784,7 @@ class TestLiveDefaultsRequired:
         assert f"no live defaults are saved at {config.LIVE_DEFAULTS_FILE}" in err
         assert "\"Save as live defaults…\" button" in err
         assert "python3 -m kalshi_betting.defaults_server --seed" in err
+        assert "./start_dashboard.sh --seed" in err
         assert "live runs never fall back to config.py's toggles" in err
 
     @staticmethod
@@ -814,6 +815,7 @@ class TestLiveDefaultsRequired:
         assert "the saved live defaults are refused" in err
         assert str(config.LIVE_DEFAULTS_FILE) in err
         assert "python3 -m kalshi_betting.defaults_server" in err
+        assert "./start_dashboard.sh" in err
         # The server will not save over a refused file, so the stderr says to
         # fix it, or delete it first
         assert "fix the file, or delete it and then save new ones" in err

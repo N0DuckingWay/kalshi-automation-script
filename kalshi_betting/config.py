@@ -573,7 +573,8 @@ LIVE_DEFAULTS_SOURCE_PATTERN = (
 
 # Where defaults_server.py listens: the pages that save the live defaults and
 # start live runs with them. Loopback only. Changing the port needs a new
-# dashboard, since the page's save address is written into it when it is built.
+# dashboard, since the page's save and trade addresses are written into it when
+# it is built.
 DEFAULTS_SERVER_HOST = "127.0.0.1"
 DEFAULTS_SERVER_PORT = 8765
 
@@ -593,6 +594,23 @@ DEFAULTS_SERVER_CONFIRM_ARM_MS = 1000
 # The one dashboard file every backtest run writes (and overwrites) in
 # PROJECT_ROOT; defaults_server opens it when it starts.
 DASHBOARD_FILENAME = "backtest_dashboard.html"
+
+# How much of the dashboard file, from its start, defaults_server reads to tell
+# whether the page has the filter bar's Save and Trade buttons (it looks for
+# the Trade link's id). The bar sits in the page's opening part, before every
+# section and data block, so the first MiB holds it on any page, however large.
+DASHBOARD_MARKER_SCAN_BYTES = 1_048_576
+
+# When defaults_server finds its port taken, it asks the server already there
+# which checkout it serves (GET /checkout): how long it waits, in seconds, for
+# the connection and for each read of the answer, and the most of the answer it
+# reads (the real one is a short JSON object). The running server answers one
+# connection at a time, and a browser can leave connections to it open that
+# send nothing, each held for DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS before it
+# is dropped, so the wait leaves room for two of them ahead of the question;
+# a shorter wait would take this checkout's own busy server for a stranger.
+DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS = 2 * DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS + 2
+DEFAULTS_SERVER_CHECKOUT_MAX_BYTES = 65_536
 
 # Where defaults_server keeps each live trading run it starts: one folder per
 # run, named by its UTC start time and its id, holding run.json (what the run
@@ -2568,9 +2586,10 @@ def live_defaults() -> LiveSettings:
     if saved is None:
         raise LiveDefaultsMissing(
             f"no live defaults are saved at {LIVE_DEFAULTS_FILE}: save them from the backtest "
-            "dashboard's \"Save as live defaults…\" button, or start from the seed values "
-            "with python3 -m kalshi_betting.defaults_server --seed (live runs never fall "
-            "back to config.py's toggles)")
+            "dashboard's \"Save as live defaults…\" button (with ./start_dashboard.sh "
+            "running), or start from the seed values with ./start_dashboard.sh --seed (or "
+            "python3 -m kalshi_betting.defaults_server --seed) (live runs never fall back to "
+            "config.py's toggles)")
     return saved
 
 

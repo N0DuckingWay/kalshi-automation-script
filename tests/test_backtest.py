@@ -817,17 +817,17 @@ class TestDashboardHandoff:
 
     def test_the_run_closes_with_how_to_save_the_live_defaults(self, cli, monkeypatch, caplog):
         # After pointing at the page, the run says how its filter bar's
-        # scenario becomes the live defaults: the defaults server, then the
-        # page's save button (the page itself cannot write a file)
+        # scenario becomes the live defaults, or is traded: the launcher,
+        # then the page's buttons (the page itself cannot write a file)
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
         opened = messages.index("Open the HTML file in a browser to view the interactive "
                                 "charts.")
         assert messages[opened + 1] == (
-            "To make the filter bar's scenario the live trading defaults: start python3 -m "
-            "kalshi_betting.defaults_server, then click the page's \"Save as live "
-            "defaults…\" button")
+            "To save the filter bar's scenario as the live defaults, or to trade: run "
+            "./start_dashboard.sh (it starts the defaults server and opens this page), then "
+            "use the filter bar's Save as live defaults… or Trade using defaults… button.")
         assert messages[opened + 1:] == [messages[opened + 1]]
 
 

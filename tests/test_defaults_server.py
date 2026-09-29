@@ -27,8 +27,12 @@ Purpose:
     loopback socket (skipped only if the sandbox refuses to bind a port),
     including one round trip whose stand-in starts a tiny Python child in
     place of main.py, one runs main() with the server and the browser
-    replaced, and one checks what this module imports and where it starts a
-    process.
+    replaced (which page a start opens, the dashboard's Save/Trade marker
+    check, and what a start does when its port is taken), one runs main()
+    against real loopback listeners holding its port (this checkout's
+    server, another checkout's, and listeners that are not a defaults
+    server) without ever binding it, and one checks what this module imports
+    and where it starts a process.
 
 Dependencies:
     Imports kalshi_betting.config (the saved-defaults helpers and constants),
@@ -42,8 +46,11 @@ Dependencies:
 
 Notes:
     The socket tests bind 127.0.0.1 on a free port; under a sandbox that
-    forbids local binding they skip, and CI runs them. The page script's
-    tests skip when neither node nor jsc is present.
+    forbids local binding they skip, and CI runs them. No test asks the real
+    port (DEFAULTS_SERVER_PORT) anything: the tests of a taken port either
+    stand in for the /checkout question (run_main) or point the server's
+    port at a listener of their own (busy_port). The page script's tests
+    skip when neither node nor jsc is present.
 """
 import ast
 import errno
@@ -70,7 +77,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 from http import HTTPStatus
-from http.server import HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -107,6 +114,11 @@ _CONFIRM_LABELS = ["Dry run (no orders; defaults unchanged)", "Confirm and save"
 _TRADE_LABELS = ["Dry run (no orders)", "Confirm and trade"]
 # Each armed button's id and the action it posts
 _ID_ACTION = {"confirm-dry-run": "dry_run", "confirm": "save", "confirm-trade": "trade"}
+# A dashboard page with the filter bar's Save and Trade buttons (the Trade
+# link's id is what the server looks for), and one built before them
+_DASHBOARD_WITH_BUTTONS = ('<html><body><div id="flt-bar"><button id="flt-save">Save</button>'
+                           '<a id="flt-trade" href="x">Trade</a></div></body></html>')
+_DASHBOARD_BEFORE_BUTTONS = '<html><body><div id="flt-bar"></div></body></html>'
 
 
 @pytest.fixture(autouse=True)
@@ -667,16 +679,41 @@ class TestIndexPage:
 
     def test_with_a_dashboard_and_its_links(self):
         dashboard = config.PROJECT_ROOT / config.DASHBOARD_FILENAME
-        dashboard.write_text("<html></html>", encoding="utf-8")
+        dashboard.write_text(_DASHBOARD_WITH_BUTTONS, encoding="utf-8")
         response = _get(_app(), "/")
         page = _parse(response.body)
         assert str(dashboard.absolute()) in response.body
-        assert "Save as live defaults…" in response.body
+        assert ("use its filter bar's Save as live defaults… button to save a scenario, or "
+                "its Trade using defaults… button to trade the saved ones") in response.body
         assert page.links[:2] == [f"/confirm?{defaults_server._seed_query()}", "/trade"]
         assert "Start from the seed values" in response.body
         assert "Trade using defaults" in response.body
         # The page a save redirects to is never linked
         assert "/saved" not in page.links
+
+    def test_a_dashboard_built_before_the_buttons_says_to_rebuild_it(self):
+        dashboard = config.PROJECT_ROOT / config.DASHBOARD_FILENAME
+        dashboard.write_text(_DASHBOARD_BEFORE_BUTTONS, encoding="utf-8")
+        response = _get(_app(), "/")
+        assert response.status == 200
+        assert (f"The backtest dashboard at <code>{dashboard.absolute()}</code> was built "
+                "before its Save as live defaults… and Trade using defaults… buttons: rebuild "
+                "it with <code>python3 -m kalshi_betting.backtest</code> and the "
+                "<code>--start-date</code> you built it from. Until then, use the links "
+                "below.") in response.body
+        assert _parse(response.body).links[:2] == [
+            f"/confirm?{defaults_server._seed_query()}", "/trade"]
+
+    def test_a_dashboard_that_cannot_be_read_says_why(self):
+        # A folder where the file should be: it exists but cannot be read as one
+        dashboard = config.PROJECT_ROOT / config.DASHBOARD_FILENAME
+        dashboard.mkdir()
+        response = _get(_app(), "/")
+        assert response.status == 200
+        assert f"The backtest dashboard at <code>{dashboard.absolute()}</code> could not be " \
+               "read (IsADirectoryError" in response.body
+        assert _parse(response.body).links[:2] == [
+            f"/confirm?{defaults_server._seed_query()}", "/trade"]
 
     def test_the_newest_runs_are_listed_first_with_their_state(self):
         for day in range(1, 13):
@@ -704,16 +741,69 @@ class TestIndexPage:
 
 
 class TestCheckout:
-    """GET /checkout answers which checkout this server serves, as JSON."""
+    """GET /checkout answers which checkout this server serves, and the code it loaded, as JSON."""
 
     def test_it_names_the_resolved_project_root(self):
         response = _get(_app(), "/checkout")
         assert response.status == 200
         assert json.loads(response.body) == {
-            "project_root": str(config.PROJECT_ROOT.resolve())}
+            "project_root": str(config.PROJECT_ROOT.resolve()),
+            "code": defaults_server._LOADED_CODE}
         headers = dict(defaults_server._response_headers(response))
         assert headers["Content-Type"] == "application/json; charset=utf-8"
         assert headers["X-Frame-Options"] == "DENY"
+
+
+class TestCodeFingerprint:
+    """_code_fingerprint (a SHA-256 over the package's .py files) and _LOADED_CODE."""
+
+    def test_it_is_the_package_s_python_files_now(self):
+        folder = Path(defaults_server.__file__).resolve().parent
+        digest = hashlib.sha256()
+        for path in sorted(folder.glob("*.py")):
+            data = path.read_bytes()
+            digest.update(path.name.encode("utf-8") + b"\0")
+            digest.update(len(data).to_bytes(8, "big") + data)
+        assert defaults_server._code_fingerprint() == digest.hexdigest()
+
+    def test_the_loaded_code_is_the_package_as_this_process_imported_it(self):
+        # No test edits the package, so the fingerprint taken at import still matches
+        assert defaults_server._LOADED_CODE == defaults_server._code_fingerprint()
+        assert re.fullmatch(r"[0-9a-f]{64}", defaults_server._LOADED_CODE)
+
+    def test_a_change_to_a_python_file_changes_it_and_other_files_do_not(self, tmp_path,
+                                                                         monkeypatch):
+        package = tmp_path / "package"
+        package.mkdir()
+        (package / "a.py").write_text("x = 1\n", encoding="utf-8")
+        (package / "b.py").write_text("y = 2\n", encoding="utf-8")
+        monkeypatch.setattr(defaults_server, "__file__", str(package / "defaults_server.py"))
+        before = defaults_server._code_fingerprint()
+        (package / "notes.md").write_text("not code\n", encoding="utf-8")
+        assert defaults_server._code_fingerprint() == before
+        (package / "b.py").write_text("y = 3\n", encoding="utf-8")
+        assert defaults_server._code_fingerprint() != before
+
+    def test_moving_bytes_between_files_changes_it(self, tmp_path, monkeypatch):
+        # Each file is hashed with its name and length, so the same bytes split
+        # differently across files do not collide
+        package = tmp_path / "package"
+        package.mkdir()
+        monkeypatch.setattr(defaults_server, "__file__", str(package / "defaults_server.py"))
+        (package / "a.py").write_text("xy", encoding="utf-8")
+        (package / "b.py").write_text("z", encoding="utf-8")
+        first = defaults_server._code_fingerprint()
+        (package / "a.py").write_text("x", encoding="utf-8")
+        (package / "b.py").write_text("yz", encoding="utf-8")
+        assert defaults_server._code_fingerprint() != first
+
+    def test_an_unreadable_file_does_not_raise(self, tmp_path, monkeypatch):
+        package = tmp_path / "package"
+        package.mkdir()
+        # A folder named like a module cannot be read as a file
+        (package / "odd.py").mkdir()
+        monkeypatch.setattr(defaults_server, "__file__", str(package / "defaults_server.py"))
+        assert re.fullmatch(r"[0-9a-f]{64}", defaults_server._code_fingerprint())
 
 
 class TestConfirmPage:
@@ -893,7 +983,7 @@ class TestTradePage:
         response = _get(_app(), "/trade")
         assert response.status == 404
         assert "Save as live defaults…" in response.body
-        assert "python3 -m kalshi_betting.defaults_server --seed" in response.body
+        assert "./start_dashboard.sh --seed in this checkout" in response.body
         assert "<form" not in response.body
 
 
@@ -2908,7 +2998,8 @@ class TestOverASocket:
         port = live_server.server_address[1]
         status, headers, body = _request(port, "GET", "/checkout")
         assert status == 200
-        assert json.loads(body) == {"project_root": str(config.PROJECT_ROOT.resolve())}
+        assert json.loads(body) == {"project_root": str(config.PROJECT_ROOT.resolve()),
+                                    "code": defaults_server._LOADED_CODE}
         assert headers["Content-Type"] == "application/json; charset=utf-8"
         expected = dict(defaults_server._response_headers(defaults_server._Response(200, "")))
         for name in ("Cache-Control", "X-Content-Type-Options", "X-Frame-Options",
@@ -2993,10 +3084,17 @@ def run_main(tmp_path, monkeypatch):
             browser was asked to open), "fail" (set it to an exception for
             the bind to raise), "interrupt" (set it to True for
             serve_forever to raise KeyboardInterrupt), "during" (set it to a
-            function of the server, called while it serves) and "run" (call
-            it with the arguments to run main; see _run_main).
+            function of the server, called while it serves), "checkout"
+            (what the stand-in for _running_checkout answers a busy port
+            with: a root, or None, the default), "code" (the code
+            fingerprint that answer carries: this checkout's current one
+            by default), "asked" (each address it was asked about) and
+            "run" (call it with the arguments to run main; see _run_main).
+            The stand-in means no test here asks a real listener on the
+            real port anything.
     """
-    state = {"servers": [], "opened": [], "fail": None, "interrupt": False, "during": None}
+    state = {"servers": [], "opened": [], "fail": None, "interrupt": False, "during": None,
+             "checkout": None, "code": defaults_server._code_fingerprint(), "asked": []}
 
     class FakeServer:
         """Records how it was made and used; serves nothing."""
@@ -3043,8 +3141,26 @@ def run_main(tmp_path, monkeypatch):
             """
             self.closed = True
 
+    def running_checkout(base):
+        """
+        Stand in for _running_checkout: record the address, answer state["checkout"].
+
+        Args:
+            base (str): The address main asked about.
+
+        Returns:
+            defaults_server._RunningServer | None: state["checkout"] with
+                state["code"], or None when state["checkout"] is None.
+        """
+        state["asked"].append(base)
+        if state["checkout"] is None:
+            return None
+        return defaults_server._RunningServer(project_root=state["checkout"],
+                                              code=state["code"])
+
     monkeypatch.setattr(defaults_server, "HTTPServer", FakeServer)
     monkeypatch.setattr(defaults_server.webbrowser, "open", state["opened"].append)
+    monkeypatch.setattr(defaults_server, "_running_checkout", running_checkout)
     monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
     state["run"] = lambda argv: _run_main(argv, tmp_path)
     yield state
@@ -3103,6 +3219,9 @@ class TestMain:
         assert url in log
         assert "No live defaults are saved" in log
         assert f"trades them at http://127.0.0.1:{PORT}/trade" in log
+        assert "Ctrl-C stops it; stop it when you are done." in log
+        # A free port: nothing asked who holds it
+        assert run_main["asked"] == []
 
     def test_its_app_can_start_runs_through_popen(self, run_main):
         run_main["run"](["--no-browser"])
@@ -3140,13 +3259,57 @@ class TestMain:
         assert defaults_server._seed_query() in log
 
     def test_it_opens_the_dashboard_when_there_is_one(self, run_main, tmp_path):
+        index = f"http://127.0.0.1:{PORT}/"
         log = run_main["run"]([])
-        assert run_main["opened"] == []
+        # No dashboard: the server's own index
+        assert run_main["opened"] == [index]
         dashboard = tmp_path / config.DASHBOARD_FILENAME
-        assert f"No backtest dashboard at {dashboard}" in log
-        dashboard.write_text("<html></html>", encoding="utf-8")
+        assert (f"No backtest dashboard at {dashboard}: run python3 -m "
+                "kalshi_betting.backtest to build one, or start from the seed values with "
+                f"--seed; opening {index}") in log
+        dashboard.write_text(_DASHBOARD_WITH_BUTTONS, encoding="utf-8")
+        log = run_main["run"]([])
+        assert run_main["opened"] == [index, dashboard.as_uri()]
+        assert (f"Open {dashboard} and use its filter bar's Save as live defaults… or Trade "
+                "using defaults… button") in log
+        assert "WARNING" not in log
+
+    def test_a_dashboard_built_before_the_buttons_opens_the_index_with_a_warning(
+            self, run_main, tmp_path):
+        dashboard = tmp_path / config.DASHBOARD_FILENAME
+        dashboard.write_text(_DASHBOARD_BEFORE_BUTTONS, encoding="utf-8")
+        log = run_main["run"]([])
+        base = f"http://127.0.0.1:{PORT}"
+        assert run_main["opened"] == [f"{base}/"]
+        [line] = [line for line in log.splitlines() if "WARNING" in line]
+        assert line.endswith(
+            "This dashboard was built before the Save/Trade buttons: rebuild it with "
+            "python3 -m kalshi_betting.backtest and the --start-date you built it from; "
+            f"until then use {base}/trade (opening {base}/)")
+
+    def test_the_buttons_count_only_within_the_scanned_part(self, run_main, tmp_path,
+                                                             monkeypatch):
+        # Only the first DASHBOARD_MARKER_SCAN_BYTES are read: the Trade link's
+        # id past them reads as a page without the buttons
+        monkeypatch.setattr(defaults_server, "DASHBOARD_MARKER_SCAN_BYTES", 64)
+        dashboard = tmp_path / config.DASHBOARD_FILENAME
+        index = f"http://127.0.0.1:{PORT}/"
+        marker = defaults_server._DASHBOARD_MARKER
+        dashboard.write_bytes(b"x" * (64 - len(marker)) + marker)
         run_main["run"]([])
-        assert run_main["opened"] == [dashboard.as_uri()]
+        dashboard.write_bytes(b"x" * (65 - len(marker)) + marker)
+        run_main["run"]([])
+        assert run_main["opened"] == [dashboard.as_uri(), index]
+
+    def test_a_dashboard_that_cannot_be_read_opens_the_index_with_a_warning(
+            self, run_main, tmp_path):
+        dashboard = tmp_path / config.DASHBOARD_FILENAME
+        dashboard.mkdir()
+        log = run_main["run"]([])
+        assert run_main["opened"] == [f"http://127.0.0.1:{PORT}/"]
+        [line] = [line for line in log.splitlines() if "WARNING" in line]
+        assert f"The backtest dashboard at {dashboard} could not be read (IsADirectoryError" \
+            in line
 
     def test_it_logs_the_defaults_in_force(self, run_main):
         saved = _save(config.LIVE_DEFAULTS_SEED)
@@ -3159,12 +3322,67 @@ class TestMain:
         assert "The saved live defaults are refused" in log
 
     def test_a_busy_port_exits_2_before_logging(self, run_main, tmp_path, capsys):
+        # The listener gives no /checkout answer (run_main's stand-in says None)
         run_main["fail"] = OSError(errno.EADDRINUSE, "Address already in use")
         with pytest.raises(SystemExit) as exit_info:
             run_main["run"](["--seed"])
         assert exit_info.value.code == 2
-        assert f"port {PORT} is in use" in capsys.readouterr().err
-        assert run_main["opened"] == []
+        assert (f"port {PORT} is in use — stop the other server, or change "
+                "config.DEFAULTS_SERVER_PORT and rebuild the dashboard") in capsys.readouterr().err
+        assert run_main["asked"] == [f"http://127.0.0.1:{PORT}"]
+        assert run_main["opened"] == [] and run_main["servers"] == []
+        assert not (tmp_path / "kalshi_defaults_server.log").exists()
+
+    @pytest.mark.parametrize("argv, opened", [
+        (["--seed"], lambda base: [f"{base}/confirm?{defaults_server._seed_query()}"]),
+        ([], lambda base: [f"{base}/"]),
+        (["--no-browser"], lambda base: []),
+        (["--seed", "--no-browser"], lambda base: []),
+    ])
+    def test_this_checkout_s_running_server_has_its_page_opened_again(
+            self, run_main, tmp_path, capsys, argv, opened):
+        run_main["fail"] = OSError(errno.EADDRINUSE, "Address already in use")
+        run_main["checkout"] = str(tmp_path.resolve())
+        base = f"http://127.0.0.1:{PORT}"
+        # It returns (exit 0): nothing bound, no second server, no log file of its own
+        assert run_main["run"](argv) == ""
+        assert run_main["opened"] == opened(base)
+        assert run_main["servers"] == []
+        assert not (tmp_path / "kalshi_defaults_server.log").exists()
+        err = capsys.readouterr().err
+        assert f"This checkout's defaults server is already running at {base}/" in err
+        if "--seed" in argv:
+            assert f"Seed values: open {base}/confirm?" in err
+
+    def test_another_checkout_s_server_on_the_port_is_refused(self, run_main, tmp_path,
+                                                            capsys):
+        run_main["fail"] = OSError(errno.EADDRINUSE, "Address already in use")
+        run_main["checkout"] = "/elsewhere/other checkout\x1b[31m"
+        with pytest.raises(SystemExit) as exit_info:
+            run_main["run"]([])
+        assert exit_info.value.code == 2
+        # The other root is named, its control characters written as escapes
+        assert (f"port {PORT} is served by the defaults server of /elsewhere/other "
+                "checkout\\x1b[31m — stop it (Ctrl-C in its terminal) before starting this "
+                "checkout's") in capsys.readouterr().err
+        assert run_main["opened"] == [] and run_main["servers"] == []
+        assert not (tmp_path / "kalshi_defaults_server.log").exists()
+
+    @pytest.mark.parametrize("code", ["0" * 64, None], ids=["other-code", "no-code"])
+    def test_this_checkout_s_server_running_other_code_is_refused(self, run_main, tmp_path,
+                                                                  capsys, code):
+        # The running server loaded code that is not this checkout's code now
+        # (a pull or an edit since it started), or its answer carries none
+        run_main["fail"] = OSError(errno.EADDRINUSE, "Address already in use")
+        run_main["checkout"] = str(tmp_path.resolve())
+        run_main["code"] = code
+        with pytest.raises(SystemExit) as exit_info:
+            run_main["run"](["--seed"])
+        assert exit_info.value.code == 2
+        assert (f"port {PORT} is served by this checkout's defaults server, but it is running "
+                "code from before a change to this checkout — stop it (Ctrl-C in its "
+                "terminal) and start it again") in capsys.readouterr().err
+        assert run_main["opened"] == [] and run_main["servers"] == []
         assert not (tmp_path / "kalshi_defaults_server.log").exists()
 
     def test_another_bind_error_is_raised(self, run_main):
@@ -3178,6 +3396,313 @@ class TestMain:
         [server] = run_main["servers"]
         assert server.closed
         assert "Defaults server stopped" in log
+
+
+@pytest.fixture
+def busy_port(tmp_path, monkeypatch):
+    """
+    Run defaults_server.main on a port a real loopback listener holds, never binding it.
+
+    The server's port (defaults_server.DEFAULTS_SERVER_PORT) is patched to
+    the listener's; main's own bind is a guard that fails the test if it
+    ever succeeds; the browser is replaced.
+
+    Args:
+        tmp_path (Path): The test's directory (config.PROJECT_ROOT, by the
+            module's autouse fixture).
+        monkeypatch (pytest.MonkeyPatch): Patches the port, the bind and the
+            browser.
+
+    Yields:
+        dict: "hold" (call it with a listening server or socket to point the
+            port at it), "opened" (each address the browser was asked to
+            open) and "run" (call it with main's arguments; see _run_main).
+    """
+    state = {"opened": []}
+
+    def guarded_bind(address, handler):
+        """
+        Bind as main would; a bind that succeeds means the port was not held after all.
+
+        Args:
+            address (tuple[str, int]): Where main asked to listen.
+            handler (type): The request handler class.
+
+        Raises:
+            OSError: The real bind's error (EADDRINUSE while the port is held).
+            AssertionError: When the bind succeeded.
+        """
+        server = HTTPServer(address, handler)
+        server.server_close()
+        raise AssertionError(f"main bound {address} although the port was held")
+
+    def hold(port: int) -> None:
+        """
+        Point the server's port at a port something already listens on.
+
+        Args:
+            port (int): The held port.
+        """
+        monkeypatch.setattr(defaults_server, "DEFAULTS_SERVER_PORT", port)
+
+    monkeypatch.setattr(defaults_server, "HTTPServer", guarded_bind)
+    monkeypatch.setattr(defaults_server.webbrowser, "open", state["opened"].append)
+    # The listener answers on its own thread while _run_main has set the root
+    # logger's handlers aside, and logging.info() on a root with no handler
+    # configures logging itself (at WARNING), before main can: the listener's
+    # request line is not logged here, so main's own configuration stands
+    monkeypatch.setattr(defaults_server._Handler, "log_message", lambda self, *args: None)
+    state["hold"] = hold
+    state["run"] = lambda argv: _run_main(argv, tmp_path)
+    yield state
+
+
+@pytest.fixture
+def stub_listener():
+    """
+    Start stand-in HTTP listeners on free loopback ports, each answering from a table.
+
+    Skipped when the sandbox refuses to bind a port.
+
+    Yields:
+        Callable: start(replies) takes {path: (status, headers, body)} (a
+            path it lacks gets 404) and returns (port, requests), requests
+            being the list of (path, Host header) each request carried.
+    """
+    started = []
+
+    def start(replies: dict) -> tuple[int, list]:
+        """
+        Start one stand-in listener.
+
+        Args:
+            replies (dict): Each path's (status, headers, body bytes).
+
+        Returns:
+            tuple[int, list]: Its port, and the list its requests are recorded in.
+        """
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            """Answers each GET from the table and records it."""
+
+            def do_GET(self):
+                """
+                Record the request and send its reply from the table.
+
+                Returns:
+                    None
+                """
+                requests.append((self.path, self.headers.get("Host")))
+                status, headers, body = replies.get(self.path, (404, {}, b"not here"))
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                """
+                Log nothing.
+
+                Args:
+                    format (str): Ignored.
+                    *args: Ignored.
+                """
+
+        try:
+            server = HTTPServer(("127.0.0.1", 0), Handler)
+        except PermissionError as exc:
+            pytest.skip(f"this sandbox does not allow binding a local port: {exc}")
+        thread = threading.Thread(target=server.serve_forever,
+                                  kwargs={"poll_interval": 0.05}, daemon=True)
+        thread.start()
+        started.append((server, thread))
+        return server.server_address[1], requests
+
+    yield start
+    for server, thread in started:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+class TestBusyPortOverASocket:
+    """A start that finds the port held, against real listeners: reuse this
+    checkout's server, refuse anything else, and never bind or start anything."""
+
+    def test_this_checkout_s_server_has_the_seed_page_opened_again(self, live_server,
+                                                                   busy_port, capsys):
+        port = live_server.server_address[1]
+        live_server.defaults_app = defaults_server._App(port)
+        busy_port["hold"](port)
+        assert busy_port["run"](["--seed"]) == ""
+        base = f"http://127.0.0.1:{port}"
+        assert busy_port["opened"] == [f"{base}/confirm?{defaults_server._seed_query()}"]
+        assert (f"This checkout's defaults server is already running at {base}/"
+                in capsys.readouterr().err)
+        # Nothing started: no run, no run folder, no log file of its own
+        assert live_server.defaults_app._runs == {}
+        assert not config.LIVE_RUNS_DIR.exists()
+        assert not (config.PROJECT_ROOT / "kalshi_defaults_server.log").exists()
+
+    def test_without_seed_it_opens_the_dashboard_or_the_index(self, live_server, busy_port):
+        port = live_server.server_address[1]
+        live_server.defaults_app = defaults_server._App(port)
+        busy_port["hold"](port)
+        busy_port["run"]([])
+        dashboard = config.PROJECT_ROOT / config.DASHBOARD_FILENAME
+        dashboard.write_text(_DASHBOARD_WITH_BUTTONS, encoding="utf-8")
+        busy_port["run"]([])
+        dashboard.write_text(_DASHBOARD_BEFORE_BUTTONS, encoding="utf-8")
+        busy_port["run"]([])
+        index = f"http://127.0.0.1:{port}/"
+        assert busy_port["opened"] == [index, dashboard.as_uri(), index]
+
+    def test_no_browser_opens_nothing(self, live_server, busy_port, capsys):
+        port = live_server.server_address[1]
+        live_server.defaults_app = defaults_server._App(port)
+        busy_port["hold"](port)
+        busy_port["run"](["--seed", "--no-browser"])
+        assert busy_port["opened"] == []
+        assert defaults_server._seed_query() in capsys.readouterr().err
+
+    def test_another_checkout_s_server_is_refused(self, stub_listener, busy_port, capsys):
+        other = "/somewhere/else/other checkout"
+        port, requests = stub_listener({"/checkout": (
+            200, {"Content-Type": "application/json"},
+            json.dumps({"project_root": other}).encode("utf-8"))})
+        busy_port["hold"](port)
+        with pytest.raises(SystemExit) as exit_info:
+            busy_port["run"](["--seed"])
+        assert exit_info.value.code == 2
+        assert (f"port {port} is served by the defaults server of {other} — stop it (Ctrl-C "
+                "in its terminal) before starting this checkout's") in capsys.readouterr().err
+        assert busy_port["opened"] == []
+        # It asked once, naming the server as its Host check needs
+        assert requests == [("/checkout", f"127.0.0.1:{port}")]
+
+    @pytest.mark.parametrize("replies", [
+        {},                                                        # 404 everywhere
+        {"/checkout": (200, {}, b"hello")},                        # not JSON
+        {"/checkout": (200, {}, b'["/x"]')},                       # not a JSON object
+        {"/checkout": (200, {}, b'{"root": "/x"}')},               # no project_root
+        {"/checkout": (200, {}, b'{"project_root": ""}')},         # an empty one
+        {"/checkout": (200, {}, b'{"project_root": 5}')},          # not a string
+        {"/checkout": (500, {}, b"broken")},                       # an error status
+        {"/checkout": (200, {}, b"[" * 60_000)},                   # nested too deeply to parse
+    ], ids=["404", "not-json", "list", "no-root", "empty-root", "number-root", "500",
+            "deeply-nested"])
+    def test_a_listener_that_is_not_a_defaults_server_gives_the_port_in_use_error(
+            self, stub_listener, busy_port, capsys, replies):
+        port, requests = stub_listener(replies)
+        busy_port["hold"](port)
+        with pytest.raises(SystemExit) as exit_info:
+            busy_port["run"]([])
+        assert exit_info.value.code == 2
+        assert f"port {port} is in use — stop the other server" in capsys.readouterr().err
+        assert busy_port["opened"] == []
+        assert [path for path, _ in requests] == ["/checkout"]
+
+    @pytest.mark.parametrize("answer", [
+        {"code": "0" * 64},                                        # other code
+        {},                                                        # no code at all
+        {"code": 5},                                               # not a fingerprint
+    ], ids=["other-code", "no-code", "number-code"])
+    def test_this_checkout_s_server_running_other_code_is_refused(
+            self, stub_listener, busy_port, capsys, answer):
+        body = json.dumps({"project_root": str(config.PROJECT_ROOT.resolve()), **answer})
+        port, requests = stub_listener({"/checkout": (200, {}, body.encode("utf-8"))})
+        busy_port["hold"](port)
+        with pytest.raises(SystemExit) as exit_info:
+            busy_port["run"](["--seed"])
+        assert exit_info.value.code == 2
+        assert (f"port {port} is served by this checkout's defaults server, but it is "
+                "running code from before a change to this checkout — stop it (Ctrl-C in "
+                "its terminal) and start it again") in capsys.readouterr().err
+        assert busy_port["opened"] == []
+        assert [path for path, _ in requests] == ["/checkout"]
+
+    def test_a_browser_s_idle_connection_does_not_hide_this_checkout_s_server(
+            self, live_server, busy_port, capsys, monkeypatch):
+        # The running server answers one connection at a time, and drops a
+        # connection that sends nothing only after its handler's timeout, so
+        # the question waits behind a browser's idle connection. The wait is
+        # scaled from config's ratio of the question's timeout to the
+        # server's, so this fails if that ratio leaves no room for the wait
+        port = live_server.server_address[1]
+        live_server.defaults_app = defaults_server._App(port)
+        busy_port["hold"](port)
+        handler_timeout = defaults_server._Handler.timeout
+        monkeypatch.setattr(defaults_server, "DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS",
+                            handler_timeout * config.DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS
+                            / config.DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS)
+        idle = socket.create_connection(("127.0.0.1", port), timeout=10)
+        try:
+            started = time.monotonic()
+            assert busy_port["run"](["--no-browser"]) == ""
+            waited = time.monotonic() - started
+        finally:
+            idle.close()
+        assert (f"This checkout's defaults server is already running at "
+                f"http://127.0.0.1:{port}/") in capsys.readouterr().err
+        assert busy_port["opened"] == []
+        # The answer came only once the idle connection was dropped
+        assert waited >= handler_timeout * 0.8
+
+    def test_a_redirect_is_not_followed(self, stub_listener, busy_port, capsys):
+        # Followed, the redirect would reach an answer naming this checkout
+        mine = json.dumps({"project_root": str(config.PROJECT_ROOT.resolve()),
+                           "code": defaults_server._code_fingerprint()}).encode()
+        port, requests = stub_listener({
+            "/checkout": (302, {"Location": "/moved"}, b""),
+            "/moved": (200, {}, mine)})
+        busy_port["hold"](port)
+        with pytest.raises(SystemExit) as exit_info:
+            busy_port["run"]([])
+        assert exit_info.value.code == 2
+        assert f"port {port} is in use" in capsys.readouterr().err
+        assert [path for path, _ in requests] == ["/checkout"]
+        assert busy_port["opened"] == []
+
+    def test_an_answer_over_the_limit_is_not_read_as_one(self, stub_listener, busy_port,
+                                                         capsys, monkeypatch):
+        mine = json.dumps({"project_root": str(config.PROJECT_ROOT.resolve()),
+                           "code": defaults_server._code_fingerprint()}).encode()
+        monkeypatch.setattr(defaults_server, "DEFAULTS_SERVER_CHECKOUT_MAX_BYTES",
+                            len(mine) - 1)
+        port, _ = stub_listener({"/checkout": (200, {}, mine)})
+        busy_port["hold"](port)
+        with pytest.raises(SystemExit) as exit_info:
+            busy_port["run"]([])
+        assert exit_info.value.code == 2
+        assert f"port {port} is in use" in capsys.readouterr().err
+        # At exactly the limit it is an answer
+        monkeypatch.setattr(defaults_server, "DEFAULTS_SERVER_CHECKOUT_MAX_BYTES", len(mine))
+        busy_port["run"](["--no-browser"])
+        assert busy_port["opened"] == []
+
+    def test_a_silent_listener_gives_the_port_in_use_error(self, busy_port, capsys,
+                                                           monkeypatch):
+        monkeypatch.setattr(defaults_server, "DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS", 0.2)
+        silent = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            try:
+                silent.bind(("127.0.0.1", 0))
+            except PermissionError as exc:
+                pytest.skip(f"this sandbox does not allow binding a local port: {exc}")
+            silent.listen(1)
+            busy_port["hold"](silent.getsockname()[1])
+            started = time.monotonic()
+            with pytest.raises(SystemExit) as exit_info:
+                busy_port["run"]([])
+            assert time.monotonic() - started < 10
+        finally:
+            silent.close()
+        assert exit_info.value.code == 2
+        assert "is in use — stop the other server" in capsys.readouterr().err
+        assert busy_port["opened"] == []
 
 
 class TestIsolation:

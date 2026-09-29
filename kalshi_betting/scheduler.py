@@ -851,9 +851,9 @@ def _check_live_defaults() -> None:
         # defaults saved from any other checkout (a worktree, say) do not count
         logging.error("No live defaults are saved in %s (the checkout this daemon runs): "
                       "every scheduled run will exit 2 until they are — save them from "
-                      "that directory with python3 -m kalshi_betting.defaults_server "
-                      "--seed, or through that server and the backtest dashboard's Save "
-                      "as live defaults… button", PROJECT_ROOT)
+                      "that directory with ./start_dashboard.sh --seed (or python3 -m "
+                      "kalshi_betting.defaults_server --seed), or through that server and "
+                      "the backtest dashboard's Save as live defaults… button", PROJECT_ROOT)
 
 
 def _setup_logging(log_path: pathlib.Path) -> None:
