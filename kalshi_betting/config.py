@@ -14,9 +14,10 @@ Purpose:
 Dependencies:
     No project imports. Imported by auth.py, scanner.py, strategy.py, trader.py,
     reporter.py, historical.py, backtester.py, dashboard.py, backtest.py,
-    scheduler.py, treasury.py, and main.py — plus the standalone, human-run
-    verification CLI kept deliberately outside the pipeline's import graph
-    (see CLAUDE.md's pipeline-isolation rule).
+    scheduler.py, treasury.py, and main.py — plus two standalone, human-run
+    tools kept deliberately outside the pipeline's import graph: the
+    verification CLI (see CLAUDE.md's pipeline-isolation rule) and
+    defaults_server.py, the confirmation page that saves the live defaults.
 
 Notes:
     PROJECT_ROOT is derived from __file__ so the package works correctly on any
@@ -26,9 +27,9 @@ Notes:
     The saved live defaults (LIVE_DEFAULTS_FILE, live_defaults.json in the repo
     root), which every live run starts from, are read and written here too:
     read_saved_live_defaults and live_defaults read the file, and
-    save_live_defaults writes it. The toggle constants here are the backtest's
-    k and caps and the fallback live_settings() returns, never a live run's
-    defaults.
+    save_live_defaults writes it (on defaults_server's Confirm). The toggle
+    constants here are the backtest's k and caps and the fallback
+    live_settings() returns, never a live run's defaults.
 """
 import fcntl
 import json
@@ -516,11 +517,13 @@ LIVE_EXPOSURE_WARN_FRACTION = 0.20
 # ── Saved live defaults ───────────────────────────────────────────────────────
 
 # The live defaults every live run starts from: one JSON record of the seven
-# live toggles, which save_live_defaults writes and read_saved_live_defaults /
-# live_defaults read (LIVE_DEFAULTS_SEED holds the starting values for a first
-# save). A live run refuses to start without it; it never falls back to the
-# toggle constants above. main.py's flags still override it for one run. Read
-# at call time through this module's global, so tests can point it elsewhere
+# live toggles, saved through defaults_server's confirmation page
+# (python3 -m kalshi_betting.defaults_server; its --seed proposes
+# LIVE_DEFAULTS_SEED for a first save). save_live_defaults writes it, on that
+# page's Confirm, and read_saved_live_defaults / live_defaults read it. A live
+# run refuses to start without it; it never falls back to the toggle constants
+# above. main.py's flags still override it for one run. Read at call time
+# through this module's global, so tests can point it elsewhere
 # (tests/conftest.py). Operator state, like scheduler_state.json: gitignored,
 # in the checkout the scheduler runs from.
 LIVE_DEFAULTS_FILE = PROJECT_ROOT / "live_defaults.json"
@@ -540,11 +543,20 @@ LIVE_DEFAULTS_SOURCE_MAX_CHARS = 300
 # The source note written when the defaults are saved from LIVE_DEFAULTS_SEED.
 LIVE_DEFAULTS_SEED_SOURCE = "seed values (config.LIVE_DEFAULTS_SEED)"
 
-# The two shapes of source note a confirmation page proposes: the backtest
-# dashboard's own wording (with an optional note when that run's same-event
-# ladder switch differed from config.py's), or the seed's. It is meant for
-# re.fullmatch: re.match or re.search would also accept a valid note followed
-# by any other words. Nothing in this module checks a note against it:
+# The only two note shapes defaults_server's confirmation page accepts, besides
+# no note at all: the backtest dashboard's own wording (with an optional note
+# when that run's same-event ladder switch differed from config.py's), or the
+# seed's (which the page accepts only on the seed values themselves). So a
+# crafted link cannot choose the note's words, which the confirmation page
+# shows and every later live run logs in its "Live defaults:" line. This
+# restricts the note alone: the page checks a category or tag name for form
+# only (one printable name), so a link can still put words of its own there,
+# shown on the page as a highlighted change and logged by later runs once
+# saved; a name no Kalshi series is filed under matches no pair. It is meant
+# for re.fullmatch with re.ASCII, as defaults_server applies it: re.match or
+# re.search would also accept a valid note followed by any other words, and
+# without re.ASCII its \d would also read the digits of other scripts.
+# Nothing in this module checks a note against it:
 # save_live_defaults and read_saved_live_defaults accept any note
 # live_defaults_source allows, an empty one included.
 LIVE_DEFAULTS_SOURCE_PATTERN = (
@@ -552,6 +564,31 @@ LIVE_DEFAULTS_SOURCE_PATTERN = (
     r"( \(same-event ladders (on|off), config\.py (on|off): its pairs are not "
     r"the live bot's\))?"
     r"|seed values \(config\.LIVE_DEFAULTS_SEED\)")
+
+# ── Defaults server ───────────────────────────────────────────────────────────
+
+# Where defaults_server.py listens: the confirmation page that saves the live
+# defaults. Loopback only. Changing the port needs a new dashboard, since the
+# page's save address is written into it when it is built.
+DEFAULTS_SERVER_HOST = "127.0.0.1"
+DEFAULTS_SERVER_PORT = 8765
+
+# The longest request (path plus body) the server reads; its form is under 2 KB.
+DEFAULTS_SERVER_MAX_REQUEST_BYTES = 16_384
+
+# Seconds the server waits on a silent connection before dropping it: it
+# answers one request at a time, and a browser can hold a connection open
+# without sending anything.
+DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS = 5
+
+# How long, in milliseconds, the confirmation page must be visible before a
+# mouse move or key press enables its Confirm button: a click aimed at another
+# page cannot land on it (the DoubleClickjacking defence).
+DEFAULTS_SERVER_CONFIRM_ARM_MS = 1000
+
+# The one dashboard file every backtest run writes (and overwrites) in
+# PROJECT_ROOT; defaults_server opens it when it starts.
+DASHBOARD_FILENAME = "backtest_dashboard.html"
 
 # Which side each leg of a pair buys, as (side bought on market_a, side bought
 # on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
@@ -2143,12 +2180,14 @@ class LiveSettings:
 # The seven toggles by field name: every LiveSettings field except origin
 LIVE_TOGGLE_FIELDS = tuple(f.name for f in fields(LiveSettings) if f.compare)
 
-# The seed live defaults, the starting values for a first save: tier
-# floors off, spread band 0-0.5, k 0.80, a 10% per-trade cap, any category or
-# tag. One pair stakes at most 10% of the balance: a time-series pair under the
-# cap (1 - k is 0.20), a same-title pair under the lower of the cap and the 20%
-# same-title cap. Nothing reads it as the live defaults until it is saved to
-# LIVE_DEFAULTS_FILE (save_live_defaults, with LIVE_DEFAULTS_SEED_SOURCE).
+# The live defaults `python3 -m kalshi_betting.defaults_server --seed` offers to
+# save, the starting values for a first save: tier floors off, spread band
+# 0-0.5, k 0.80, a 10% per-trade cap, any category or tag. One pair stakes at
+# most 10% of the balance: a time-series pair under the cap (1 - k is 0.20), a
+# same-title pair under the lower of the cap and the 20% same-title cap.
+# Nothing trades on it until it is confirmed on the confirmation page and
+# written to LIVE_DEFAULTS_FILE (save_live_defaults, with
+# LIVE_DEFAULTS_SEED_SOURCE).
 LIVE_DEFAULTS_SEED = LiveSettings(
     tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.80,
     size_cap=0.10, same_title_size_cap=0.20, categories=None, tags=None)
@@ -2379,6 +2418,9 @@ def read_saved_live_defaults() -> LiveSettings | None:
     """
     Read the saved live defaults (LIVE_DEFAULTS_FILE), or None when none are saved.
 
+    live_defaults reads through it; scheduler._check_live_defaults and
+    defaults_server._current_defaults call it directly.
+
     Strict, because a live run trades what it returns. The file is one JSON
     object with these keys:
     - "format": LIVE_DEFAULTS_FORMAT;
@@ -2524,7 +2566,8 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
     """
     Write settings as the saved live defaults, and return them as read back.
 
-    The record's text is first parsed exactly as read_saved_live_defaults
+    defaults_server's Confirm is its one caller outside the tests. The
+    record's text is first parsed exactly as read_saved_live_defaults
     will parse it, and must equal settings, so a file the reader would refuse
     is never written. It is then written next to the file under a name holding
     this process id, flushed, and renamed over the file, so a reader at the

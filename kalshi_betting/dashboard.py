@@ -76,7 +76,8 @@ Dependencies:
     line's pieces, shared with the run's log line, which names the saved live
     defaults) — and reads
     BacktestSweep.cap_sweep (a backtester.CapSweep) by its attributes — and
-    BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT,
+    BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
+    page's file name, which defaults_server also opens),
     SAME_TITLE_CO_RESOLVE_PROB, CALENDAR_DAYS_PER_YEAR, TRADING_DAYS_PER_YEAR,
     RISK_FREE_BILL_TERM and RISK_FREE_RATE_FIELD (named in the header),
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS
@@ -373,6 +374,7 @@ from .backtester import (
 from .config import (
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     CALENDAR_DAYS_PER_YEAR,
+    DASHBOARD_FILENAME,
     FLAT_RETURN_TOLERANCE,
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
@@ -390,9 +392,6 @@ from .config import (
 from .historical import series_labels as _series_labels
 from .scanner import leg_sides
 from .treasury import SOURCE_CACHE, RiskFreeRates, day_numbers
-
-# The one dashboard file every backtest run writes (and overwrites) in PROJECT_ROOT.
-DASHBOARD_FILENAME = "backtest_dashboard.html"
 
 # ─── Metric computation ───────────────────────────────────────────────────────
 

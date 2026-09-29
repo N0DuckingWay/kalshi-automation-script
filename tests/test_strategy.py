@@ -1115,16 +1115,19 @@ class TestTimeSeriesKellyParity:
 
     # The readers of the SAVED live defaults, each called directly once, and
     # only in these functions: main._resolve_live_settings lays the flags over
-    # them for a run; scheduler._check_live_defaults warns at daemon start
+    # them for a run; scheduler._check_live_defaults warns at daemon start;
+    # defaults_server._current_defaults is the confirmation page's one read
     _DEFAULTS_READERS = {
         "live_defaults": frozenset({("main", "_resolve_live_settings")}),
-        "read_saved_live_defaults": frozenset({("scheduler", "_check_live_defaults")}),
+        "read_saved_live_defaults": frozenset({("scheduler", "_check_live_defaults"),
+                                               ("defaults_server", "_current_defaults")}),
     }
 
     # The writer of the saved live defaults and the functions that may call it,
-    # each exactly once: none in the walked modules
+    # each exactly once: the confirmation page's Confirm, and nothing else. In
+    # both tables a method is named with its class
     _DEFAULTS_WRITERS = {
-        "save_live_defaults": frozenset(),
+        "save_live_defaults": frozenset({("defaults_server", "_App._post_confirm")}),
     }
 
     # The saved file's path, config's private parse of it and the seed values: a
@@ -1138,6 +1141,55 @@ class TestTimeSeriesKellyParity:
         "_settings_from_bytes",
     })
 
+    # The one module that may name some of those internals, and which: the
+    # defaults server proposes the seed values, and prints the saved file's
+    # path on its pages and in its log. Each exempted name is importable or
+    # print-only (below); either way it may only be read, never assigned,
+    # deleted or taken as a parameter
+    _SAVED_FILE_EXEMPT = {
+        "defaults_server": frozenset({"LIVE_DEFAULTS_FILE", "LIVE_DEFAULTS_SEED"}),
+    }
+
+    # The exempted names a module may import by value (from .config import X)
+    # and then read freely: the seed is a value, not a way to the file
+    _SAVED_FILE_IMPORTABLE = frozenset({"LIVE_DEFAULTS_SEED"})
+
+    # The exempted names a module may only print, always as config.X (never
+    # imported by value): config.X as an argument of a logging message call
+    # (logging.info and its siblings), or its .name, or its .absolute(), as
+    # the one argument of str() or html.escape() or as an f-string field. And
+    # every call around the reference in its own statement must print or build
+    # text: str(), html.escape(), a logging message call, or one of the
+    # module's own functions or methods. So config.X.read_bytes(),
+    # Path(str(config.X.absolute())).write_text(...) and
+    # logging.FileHandler(config.X) all fail. The check stops at the
+    # statement: text of the path bound to a name, or handed to one of the
+    # module's own functions, is not followed, so it cannot prove the module
+    # never rebuilds the path from that text
+    _SAVED_FILE_PRINT_ONLY = frozenset({"LIVE_DEFAULTS_FILE"})
+
+    # The logging calls that write a message. A handler (logging.FileHandler)
+    # opens the file it is given, so it is not one of them
+    _LOG_MESSAGE_CALLS = frozenset({"debug", "info", "warning", "error", "critical",
+                                    "exception", "log"})
+
+    # Code appended to defaults_server's source for the print-only rule's
+    # mutant checks, by id: each reaches the saved file through its path
+    _PRINT_ONLY_MUTANTS = {
+        # text of the path turned back into a path, and written
+        "path-from-text": ("def _mutant():\n"
+                           "    Path(str(config.LIVE_DEFAULTS_FILE.absolute())).write_text('{}')\n"),
+        # the same through an f-string field
+        "open-f-string": ("def _mutant():\n"
+                          "    open(f'{config.LIVE_DEFAULTS_FILE.absolute()}', 'w')\n"),
+        # a logging call that is not a message: the handler opens the file
+        "log-file-handler": ("def _mutant():\n"
+                             "    logging.FileHandler(config.LIVE_DEFAULTS_FILE)\n"),
+        # the path used directly
+        "read-bytes": ("def _mutant():\n"
+                       "    config.LIVE_DEFAULTS_FILE.read_bytes()\n"),
+    }
+
     def test_ast_live_path_reads_toggles_only_through_live_settings(self):
         # ONE frozen config.LiveSettings per run carries every live toggle, so
         # no site applies a setting while another reads config.py. In every
@@ -1149,9 +1201,12 @@ class TestTimeSeriesKellyParity:
         #     resolving statement, and never called directly;
         #   - the saved live defaults are read only where _DEFAULTS_READERS
         #     allows, each allowed function calling its reader exactly once,
-        #     and written only where _DEFAULTS_WRITERS allows (nowhere here);
-        #     the saved file's path, config's private parse of it and the seed
-        #     (_SAVED_FILE_INTERNALS) are never named;
+        #     and written only where _DEFAULTS_WRITERS allows (the defaults
+        #     server's Confirm alone); the saved file's path, config's private
+        #     parse of it and the seed (_SAVED_FILE_INTERNALS) are never named,
+        #     but that the defaults server may read the seed and print the
+        #     path (_SAVED_FILE_EXEMPT, in the shapes _SAVED_FILE_IMPORTABLE
+        #     and _SAVED_FILE_PRINT_ONLY allow);
         #   - a def with a `settings` parameter is only ever called (pool.submit
         #     too), with the bare name `settings`, never None or the `reference`,
         #     and every whitelisted def, and only those, defaults it to None;
@@ -1169,9 +1224,17 @@ class TestTimeSeriesKellyParity:
         # A rename must fail here, not silently shrink the allowlist
         assert band_readers <= names, band_readers - names
         walked = sorted(names - band_readers)
-        # The live pipeline is in scope (the walk cannot pass by finding
-        # nothing to walk)
-        assert {"scanner", "strategy", "trader", "main"} <= set(walked), walked
+        # The live pipeline and the defaults server are in scope (the walk
+        # cannot pass by finding nothing to walk)
+        assert {"scanner", "strategy", "trader", "main", "defaults_server"} <= set(walked), walked
+        # An exemption names a walked module and only saved-file internals,
+        # each with a stated shape (importable or print-only, not both)
+        assert set(self._SAVED_FILE_EXEMPT) <= set(walked), self._SAVED_FILE_EXEMPT
+        assert not self._SAVED_FILE_IMPORTABLE & self._SAVED_FILE_PRINT_ONLY
+        for names_exempt in self._SAVED_FILE_EXEMPT.values():
+            assert names_exempt <= self._SAVED_FILE_INTERNALS, names_exempt
+            assert names_exempt <= self._SAVED_FILE_IMPORTABLE | self._SAVED_FILE_PRINT_ONLY, (
+                names_exempt)
         modules = [kalshi_betting] + [importlib.import_module(f"kalshi_betting.{n}") for n in walked]
         no_import = band_readers - {"config"}
 
@@ -1191,6 +1254,9 @@ class TestTimeSeriesKellyParity:
             "TRADE_TAGS",
         } | self._SAVED_FILE_INTERNALS
         resolver = "live_settings"
+        # (module, exempted name) -> references found, so no exemption outlives its use
+        exempt_uses = {(mod, name): 0 for mod, names in self._SAVED_FILE_EXEMPT.items()
+                       for name in names}
         # The saved live defaults' readers and writer: name -> the (module,
         # function) pairs that may call it, each exactly once
         tracked = {**self._DEFAULTS_READERS, **self._DEFAULTS_WRITERS}
@@ -1295,6 +1361,115 @@ class TestTimeSeriesKellyParity:
         def call_name(func):
             return func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
 
+        def text_function(func):
+            """
+            Whether a called expression is str or html.escape.
+
+            Args:
+                func (ast.AST): A call's func node.
+
+            Returns:
+                bool: True for the name str or the attribute html.escape.
+            """
+            return ((isinstance(func, ast.Name) and func.id == "str")
+                    or (isinstance(func, ast.Attribute) and func.attr == "escape"
+                        and isinstance(func.value, ast.Name) and func.value.id == "html"))
+
+        def log_message(func):
+            """
+            Whether a called expression is a logging call that writes a message.
+
+            Args:
+                func (ast.AST): A call's func node.
+
+            Returns:
+                bool: True for logging.info and its _LOG_MESSAGE_CALLS siblings.
+            """
+            return (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+                    and func.value.id == "logging" and func.attr in self._LOG_MESSAGE_CALLS)
+
+        def as_text(holder, value):
+            """
+            Whether a node turns an expression straight into text.
+
+            Args:
+                holder (ast.AST | None): The node around the expression.
+                value (ast.AST): The expression.
+
+            Returns:
+                bool: True when holder is an f-string field holding value, or a
+                    call of str() or html.escape() with value its one argument.
+            """
+            if isinstance(holder, ast.FormattedValue):
+                return holder.value is value
+            return (isinstance(holder, ast.Call) and len(holder.args) == 1
+                    and holder.args[0] is value and not holder.keywords
+                    and text_function(holder.func))
+
+        def prints_the_path(node, parents, own_functions, own_methods):
+            """
+            Whether a reference to a _SAVED_FILE_PRINT_ONLY name only prints the path.
+
+            The allowed shapes: config.X as a positional argument of a logging
+            message call (log_message); config.X.name, or config.X.absolute(),
+            turned straight into text (as_text). A read or write of the file,
+            or config.X under another name, is none of them. Then every call
+            around the reference, up to its statement, must print or build
+            text: str(), html.escape(), a logging message call, or one of the
+            module's own functions or methods, called by name or on self. So
+            text of the path handed to Path(), open() or anything else fails.
+            Text bound to a name, or handed to the module's own functions, is
+            not followed further.
+
+            Args:
+                node (ast.AST): The reference (a Name or an Attribute).
+                parents (dict): Each node of its module's tree's parent, by id.
+                own_functions (set[str]): The module's top-level function names.
+                own_methods (set[str]): The names of the methods its top-level
+                    classes define.
+
+            Returns:
+                bool: True when the reference has one of the allowed shapes and
+                    every call around it prints or builds text.
+            """
+            if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                    and node.value.id == "config"):
+                return False
+            parent = parents.get(id(node))
+            above = parents.get(id(parent))
+            if isinstance(parent, ast.Call) and any(a is node for a in parent.args):
+                # config.X handed to a logging message call, which prints it
+                shaped = log_message(parent.func)
+            elif not (isinstance(parent, ast.Attribute) and parent.value is node):
+                shaped = False
+            elif parent.attr == "name":
+                # config.X.name, as text
+                shaped = as_text(above, parent)
+            elif (parent.attr == "absolute" and isinstance(above, ast.Call)
+                    and above.func is parent and not above.args and not above.keywords):
+                # config.X.absolute(), as text
+                shaped = as_text(parents.get(id(above)), above)
+            else:
+                shaped = False
+            if not shaped:
+                return False
+            cur = parent
+            while cur is not None and not isinstance(cur, ast.stmt):
+                if isinstance(cur, ast.Call):
+                    func = cur.func
+                    allowed_call = (
+                        text_function(func) or log_message(func)
+                        # the shape's own .absolute()
+                        or (isinstance(func, ast.Attribute) and func.value is node
+                            and func.attr == "absolute")
+                        or (isinstance(func, ast.Name) and func.id in own_functions)
+                        or (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+                            and func.value.id == "self" and func.attr in own_methods))
+                    if not allowed_call:
+                        return False
+                cur = parents.get(id(cur))
+            return True
+
         resolutions: dict = {}
         direct_resolutions: dict = {}
         explicit_calls: dict = {}
@@ -1312,6 +1487,28 @@ class TestTimeSeriesKellyParity:
                         cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     cur = parents.get(id(cur))
                 return cur.name if cur is not None else None
+
+            def qualified(node, parents=parents):
+                """
+                Name the function a node sits in, with its class when it is a method.
+
+                Args:
+                    node (ast.AST): The node.
+                    parents (dict): Each node's parent, by id.
+
+                Returns:
+                    str | None: "Class.method" for a method, the function's own
+                        name otherwise (a nested function's is its own), or
+                        None at module level.
+                """
+                cur = parents.get(id(node))
+                while cur is not None and not isinstance(
+                        cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    cur = parents.get(id(cur))
+                if cur is None:
+                    return None
+                owner = parents.get(id(cur))
+                return f"{owner.name}.{cur.name}" if isinstance(owner, ast.ClassDef) else cur.name
 
             # The one allowed form, recorded by the id of its live_settings Name
             allowed = {}
@@ -1341,11 +1538,12 @@ class TestTimeSeriesKellyParity:
                     direct[id(node.func)] = enclosing(node)
 
             # A direct call of a saved-defaults reader or writer, recorded by the
-            # id of its called name, checked against its table below
+            # id of its called name with the function it sits in (a method
+            # with its class), checked against its table below
             tracked_calls = {}
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call) and call_name(node.func) in tracked:
-                    tracked_calls[id(node.func)] = enclosing(node)
+                    tracked_calls[id(node.func)] = qualified(node)
 
             # Callees handed as pool.submit's first argument, checked below
             submitted = set()
@@ -1375,6 +1573,19 @@ class TestTimeSeriesKellyParity:
             # An ImportFrom's alias nodes are checked with it, so skipped below
             from_aliases = {id(a) for n in ast.walk(tree)
                             if isinstance(n, ast.ImportFrom) for a in n.names}
+            # This module may refer to its own exempted internals, in their
+            # allowed shapes, import only the importable ones, and name nothing
+            # else forbidden; it may still spell or shadow none of them
+            exempt = self._SAVED_FILE_EXEMPT.get(mod, frozenset())
+            mod_forbidden = forbidden - exempt
+            import_forbidden = forbidden - (exempt & self._SAVED_FILE_IMPORTABLE)
+            # The module's own functions and methods: a call of one may carry
+            # text of a print-only path (a page or message builder)
+            own_functions = {n.name for n in tree.body
+                             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            own_methods = {m.name for c in tree.body if isinstance(c, ast.ClassDef)
+                           for m in c.body
+                           if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))}
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for a in node.names:
@@ -1385,7 +1596,10 @@ class TestTimeSeriesKellyParity:
                         f"{mod} imports {node.module}")
                     for a in node.names:
                         assert a.name not in no_import, f"{mod} imports {a.name}"
-                        assert a.name not in forbidden, f"{mod} imports {a.name}"
+                        assert a.name not in import_forbidden, f"{mod} imports {a.name}"
+                        # An exempted internal only under its own name
+                        assert not (a.name in exempt and a.asname), (
+                            f"{mod} imports {a.name} under another name")
                         # Only the plain import is exempt; an alias could call it
                         assert not (a.name == resolver and a.asname), mod
                         assert not (a.name in tracked and a.asname), (
@@ -1420,7 +1634,18 @@ class TestTimeSeriesKellyParity:
                 else:
                     continue
                 where = f"{mod}:{node.lineno}"
-                assert name not in forbidden, f"{where} references {name}"
+                assert name not in mod_forbidden, f"{where} references {name}"
+                if name in exempt:
+                    # Read only: never assigned, deleted or taken as a parameter
+                    assert isinstance(node, (ast.Name, ast.Attribute)) and isinstance(
+                        node.ctx, ast.Load), f"{where} binds, deletes or takes {name}"
+                    # A path it may only print (_SAVED_FILE_PRINT_ONLY's shapes)
+                    assert (name not in self._SAVED_FILE_PRINT_ONLY
+                            or prints_the_path(node, parents, own_functions, own_methods)), (
+                        f"{where} uses {name} other than to print it: only config.{name} "
+                        "in a logging message call, or its .name or .absolute() as text, "
+                        "with every call around it printing or building text")
+                    exempt_uses[(mod, name)] += 1
                 if name in tracked:
                     table = ("_DEFAULTS_READERS" if name in self._DEFAULTS_READERS
                              else "_DEFAULTS_WRITERS")
@@ -1473,8 +1698,10 @@ class TestTimeSeriesKellyParity:
         assert defaults_calls == expected, (
             f"_DEFAULTS_READERS / _DEFAULTS_WRITERS: expected {expected}, found "
             f"{defaults_calls}")
-        # The two readers are both in use (a table emptied by an edit fails here)
-        assert {name for name, _, _ in defaults_calls} == set(self._DEFAULTS_READERS)
+        # Both readers and the writer are in use (a table emptied by an edit fails here)
+        assert {name for name, _, _ in defaults_calls} == set(tracked)
+        # Every exemption is used, so an exemption the module no longer needs fails here
+        assert all(exempt_uses.values()), exempt_uses
         # main() hands both run modes the settings it resolved, positionally
         main_tree = trees["main"]
         main_fn = next(n for n in ast.walk(main_tree)
@@ -1498,6 +1725,54 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "_pair_max_sum", "live_time_series_floor")
         # ... which reaches the floor through the helper _find_entry uses
         assert _function_calls(config, "live_time_series_floor", "min_price_diff_for_gap")
+
+    def _pin_with_server_code(self, monkeypatch, code):
+        """
+        Run the live-settings pin with code appended to defaults_server's source.
+
+        Only the pin's reading of that one module's source changes; every
+        other module is read as it is.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): Replaces inspect.getsource for
+                the call.
+            code (str): Python source appended after the module's own.
+
+        Raises:
+            AssertionError: If the pin fails on the module with the code added.
+        """
+        from kalshi_betting import defaults_server
+
+        real_getsource = inspect.getsource
+
+        def getsource(obj):
+            text = real_getsource(obj)
+            return f"{text}\n\n{code}" if obj is defaults_server else text
+
+        monkeypatch.setattr(inspect, "getsource", getsource)
+        self.test_ast_live_path_reads_toggles_only_through_live_settings()
+
+    @pytest.mark.parametrize("mutant", sorted(_PRINT_ONLY_MUTANTS))
+    def test_ast_the_print_only_path_is_never_used_to_reach_the_file(self, monkeypatch,
+                                                                       mutant):
+        # Each mutant reaches the saved file through its path, directly or by
+        # turning printed text of it back into a path, so the pin refuses it
+        with pytest.raises(AssertionError,
+                           match="uses LIVE_DEFAULTS_FILE other than to print it"):
+            self._pin_with_server_code(monkeypatch, self._PRINT_ONLY_MUTANTS[mutant])
+
+    def test_ast_the_print_only_shapes_still_pass_when_appended(self, monkeypatch):
+        # control — every allowed shape, appended the same way, still passes,
+        # so the mutants above fail on the rule and not on the appending: a
+        # logging message, str() and html.escape() of .absolute() and .name,
+        # an f-string field, and text handed to the module's own page builder
+        code = ("def _allowed_shapes():\n"
+                "    logging.info('saved to %s', config.LIVE_DEFAULTS_FILE)\n"
+                "    return (html.escape(str(config.LIVE_DEFAULTS_FILE.absolute())),\n"
+                "            f'{config.LIVE_DEFAULTS_FILE.absolute()}',\n"
+                "            _message_html(500, 't',\n"
+                "                          html.escape(config.LIVE_DEFAULTS_FILE.name)))\n")
+        self._pin_with_server_code(monkeypatch, code)
 
     def test_ast_the_reports_never_write_the_saved_live_defaults(self):
         # The backtest, its CLI and the dashboard read the saved live defaults for
