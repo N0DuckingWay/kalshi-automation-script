@@ -3,6 +3,10 @@ missed-run catch-up, the weekly job (_weekly_job, _cron_line) and the startup
 host-clock check (_host_clock_realises_run). subprocess.run is mocked, and the
 autouse `_tmp_project_root` fixture sends run_job's scheduler_state.json
 writes to tmp_path instead of the repo root.
+
+TestRunInProgress covers exit 50, a run stopped because another live trading
+run held the live-run lock; tests/conftest.py points the lock's holder record
+at each test's own tmp_path.
 """
 import ast
 import contextlib
@@ -22,10 +26,11 @@ from zoneinfo import ZoneInfo
 import pytest
 import schedule
 
-from kalshi_betting import config, scheduler
+from kalshi_betting import config, run_lock, scheduler
 from kalshi_betting.config import (
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
+    EXIT_RUN_IN_PROGRESS,
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
@@ -140,6 +145,7 @@ class TestRunJobExitCodeMapping:
         codes = {name: getattr(config, name) for name in dir(config)
                  if name.startswith("EXIT_")}
         assert EXIT_TIME_SERIES_SKIPPED in codes.values()
+        assert EXIT_RUN_IN_PROGRESS in codes.values()
         assert len(set(codes.values())) == len(codes)
         assert not {1, 2} & set(codes.values())
         for name, code in codes.items():
@@ -170,6 +176,139 @@ class TestRunJobExitCodeMapping:
             scheduler.run_job()
 
         assert any("scan output here" in r.getMessage() for r in caplog.records)
+
+
+def _write_lock_holder(record) -> None:
+    """
+    Write a holder record (any JSON value) where run_lock.holder() reads it.
+
+    tests/conftest.py points config.LIVE_RUN_LOCK_FILE at the test's tmp_path,
+    so this never touches the real lock in the home folder.
+
+    Args:
+        record: The value to write as JSON.
+    """
+    config.LIVE_RUN_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    config.LIVE_RUN_LOCK_FILE.write_text(json.dumps(record), encoding="utf-8")
+
+
+def _utc_text(moment: datetime) -> str:
+    """
+    Write a time the way the run lock's holder record stores it.
+
+    Uses run_lock._TIME_FORMAT, the format LockHolder.age_seconds() reads
+    back, so a record built here is always one the scheduler can date.
+
+    Args:
+        moment (datetime): A timezone-aware time.
+
+    Returns:
+        str: The time in UTC, as run_lock._TIME_FORMAT text
+            (e.g. "2026-09-29T16:00:04Z").
+    """
+    return moment.astimezone(UTC).strftime(run_lock._TIME_FORMAT)
+
+
+class TestRunInProgress:
+    """Exit 50: another live trading run held the run lock, so the scheduled
+    run stopped before making any request. The slot counts as done and is
+    never retried; the message names the run in the way, and is an ERROR when
+    that run has held the lock for longer than any run should, or its start is
+    not recorded."""
+
+    _CHECKOUT = "/Users/me/Kalshi Betting App"
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_a_fresh_holder_is_a_warning_naming_it(self, mock_run, tmp_path, caplog):
+        _write_lock_holder({"pid": 4242, "checkout": self._CHECKOUT,
+                            "started_at": _utc_text(datetime.now(UTC) - timedelta(minutes=5))})
+        mock_run.return_value = _completed(EXIT_RUN_IN_PROGRESS, stderr="noise")
+
+        with caplog.at_level(logging.INFO):
+            scheduler.run_job()
+
+        matches = [r for r in caplog.records if "did not trade" in r.getMessage()]
+        assert len(matches) == 1
+        assert matches[0].levelno == logging.WARNING
+        message = matches[0].getMessage()
+        assert f"exit {EXIT_RUN_IN_PROGRESS}" in message
+        assert "another live trading run on this machine was in progress" in message
+        assert f"process 4242 in {self._CHECKOUT}, since" in message
+        assert "The weekly slot counts as done" in message
+        assert "not retried" in message
+        assert "noise" not in message
+        assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+        assert not any("Job failed" in r.getMessage() for r in caplog.records)
+        # Done, not reopened: finalized with its code and no retry registered
+        state = json.loads((tmp_path / "scheduler_state.json").read_text())
+        assert state["exit_code"] == EXIT_RUN_IN_PROGRESS
+        assert state["finished_at"] is not None
+        assert schedule.jobs == []
+
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_a_holder_older_than_the_job_timeout_is_an_error(self, mock_run, tmp_path, caplog):
+        started = datetime.now(UTC) - timedelta(seconds=SCHEDULER_JOB_TIMEOUT_SECONDS + 60)
+        _write_lock_holder({"pid": 4242, "checkout": self._CHECKOUT,
+                            "started_at": _utc_text(started)})
+        mock_run.return_value = _completed(EXIT_RUN_IN_PROGRESS)
+
+        with caplog.at_level(logging.INFO):
+            scheduler.run_job()
+
+        matches = [r for r in caplog.records if "did not trade" in r.getMessage()]
+        assert len(matches) == 1
+        assert matches[0].levelno == logging.ERROR
+        message = matches[0].getMessage()
+        assert f"exit {EXIT_RUN_IN_PROGRESS}" in message
+        assert "process 4242" in message
+        assert "may be hung or stopped" in message
+        assert "No trade was made for this weekly slot" in message
+        assert "every scheduled run will stop the same way until that run ends" in message
+        state = json.loads((tmp_path / "scheduler_state.json").read_text())
+        assert state["exit_code"] == EXIT_RUN_IN_PROGRESS
+        assert schedule.jobs == []
+
+    @pytest.mark.parametrize("record", [
+        None,
+        {"pid": 4242, "checkout": _CHECKOUT},
+        {"pid": 4242, "started_at": "not a time"},
+    ], ids=["no-record", "no-start-time", "unreadable-start-time"])
+    @patch("kalshi_betting.scheduler.subprocess.run")
+    def test_a_holder_whose_start_is_unknown_is_an_error(
+        self, mock_run, record, tmp_path, caplog,
+    ):
+        if record is not None:
+            _write_lock_holder(record)
+        mock_run.return_value = _completed(EXIT_RUN_IN_PROGRESS)
+
+        with caplog.at_level(logging.INFO):
+            scheduler.run_job()
+
+        matches = [r for r in caplog.records if "did not trade" in r.getMessage()]
+        assert len(matches) == 1
+        assert matches[0].levelno == logging.ERROR
+        assert "its start is not recorded" in matches[0].getMessage()
+        state = json.loads((tmp_path / "scheduler_state.json").read_text())
+        assert state["exit_code"] == EXIT_RUN_IN_PROGRESS
+        assert state["finished_at"] is not None
+        assert schedule.jobs == []
+
+    def test_a_slot_the_lock_stopped_is_not_caught_up(self, tmp_path):
+        # A real-money run was trading, so the slot is done: a restart does
+        # not re-run it
+        now = datetime(2026, 9, 2, 10, 0)
+        current_slot = scheduler._most_recent_slot(now)
+        _write_state(tmp_path, last_slot=current_slot.isoformat(),
+                     exit_code=EXIT_RUN_IN_PROGRESS)
+
+        with patch("kalshi_betting.scheduler.run_job") as mock_run_job:
+            scheduler._maybe_catch_up(now=now)
+
+        mock_run_job.assert_not_called()
+
+    def test_the_state_file_name_comes_from_config(self, tmp_path):
+        assert config.SCHEDULER_STATE_FILENAME == "scheduler_state.json"
+        assert scheduler._state_file_path() == tmp_path / config.SCHEDULER_STATE_FILENAME
 
 
 class TestDecode:

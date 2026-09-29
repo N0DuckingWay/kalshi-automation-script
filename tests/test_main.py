@@ -30,6 +30,13 @@ Purpose:
     runs main.main() saves config.py's toggles first (conftest's
     saved_live_defaults). TestCategoryFilter covers main._filter_by_category.
 
+    On the live-run lock: TestRunLock pins that a production run that sends
+    orders holds run_lock's machine-wide lock from before it builds a client
+    until main() ends, and stops with EXIT_RUN_IN_PROGRESS when another run
+    holds it; dry runs and dev runs neither take it nor wait for it.
+    tests/conftest.py's _isolate_live_runs points the lock at each test's own
+    tmp_path, so every production run here takes a lock of its own.
+
 Dependencies:
     Imports _run_dev/_run_prod and the pure helpers from kalshi_betting.main,
     plus config constants asserted against and conftest's
@@ -60,6 +67,7 @@ import inspect
 import json
 import logging
 import logging.handlers
+import os
 import pathlib
 import re
 import sys
@@ -70,7 +78,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kalshi_betting import config, dashboard, historical, main
+from kalshi_betting import config, dashboard, historical, main, run_lock
 from kalshi_betting import scanner as scanner_mod
 from kalshi_betting import strategy as strategy_mod
 from kalshi_betting import trader as trader_mod
@@ -79,6 +87,7 @@ from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
+    EXIT_RUN_IN_PROGRESS,
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
@@ -3676,6 +3685,134 @@ class TestMainEntryPoint:
 
         assert exc_info.value.code == EXIT_NO_TRADEABLE_SHARDS
         assert exc_info.value.code == 30
+
+
+@pytest.mark.usefixtures("saved_live_defaults")
+class TestRunLock:
+    """
+    main() holds the machine-wide live-run lock (run_lock) through a
+    production run that sends orders, from before it builds a client until the
+    run mode returns or raises, and stops with EXIT_RUN_IN_PROGRESS, before
+    building a client, when another run still holds it. A prod dry run and a
+    dev run neither take the lock nor wait for it. tests/conftest.py's
+    _isolate_live_runs points the lock at this test's tmp_path and shortens
+    the wait, so holding it here (run_lock.acquire on a second open of the
+    file, which an flock refuses even within one process) stands in for
+    another run on the machine.
+    """
+
+    def test_a_held_lock_stops_a_production_run_before_any_client(self, monkeypatch, caplog):
+        holder = run_lock.acquire()
+        try:
+            with caplog.at_level(logging.INFO):
+                seen = _main_with(monkeypatch, ["--mode", "prod"])
+        finally:
+            os.close(holder)
+        assert seen["code"] == EXIT_RUN_IN_PROGRESS == 50
+        # Logged (the WARNING lands in kalshi_arb.log), then stopped: no
+        # client, no run mode, no request
+        assert seen["logging_set_up"] is True
+        assert seen["client_built"] is False
+        assert "mode" not in seen
+        warned = [r for r in caplog.records if r.levelno == logging.WARNING
+                  and "Another live trading run is in progress" in r.getMessage()]
+        assert len(warned) == 1
+        message = warned[0].getMessage()
+        assert f"process {os.getpid()} in {config.PROJECT_ROOT}, since " in message
+        assert "without contacting Kalshi" in message
+        assert f"(exit {EXIT_RUN_IN_PROGRESS})" in message
+
+    def test_two_production_runs_in_one_process_each_take_the_lock(self, monkeypatch):
+        seen_during_run = []
+
+        def prod_run(client, args, settings, reference):
+            """
+            Record whether the lock is held while the run mode runs, and by whom.
+
+            Args:
+                client: The client main() built.
+                args (argparse.Namespace): The parsed flags.
+                settings (LiveSettings): The run's settings.
+                reference (LiveSettings): The saved defaults they were built from.
+
+            Returns:
+                int: EXIT_OK.
+            """
+            seen_during_run.append((run_lock.held(), run_lock.holder().pid))
+            return EXIT_OK
+
+        first = _main_with(monkeypatch, ["--mode", "prod"], _run_prod=prod_run)
+        second = _main_with(monkeypatch, ["--mode", "prod"], _run_prod=prod_run)
+        assert first["code"] == second["code"] == EXIT_OK
+        # Held through each run, by this process, and released after each
+        assert seen_during_run == [(True, os.getpid()), (True, os.getpid())]
+        assert run_lock.held() is False
+
+    def test_a_run_that_raises_still_releases_the_lock(self, monkeypatch):
+        def failing_run(client, args, settings, reference):
+            """
+            Fail the way an unhandled error in the run mode would.
+
+            Args:
+                client: The client main() built.
+                args (argparse.Namespace): The parsed flags.
+                settings (LiveSettings): The run's settings.
+                reference (LiveSettings): The saved defaults they were built from.
+
+            Raises:
+                RuntimeError: Always.
+            """
+            raise RuntimeError("run failed")
+
+        with pytest.raises(RuntimeError, match="run failed"):
+            _main_with(monkeypatch, ["--mode", "prod"], _run_prod=failing_run)
+        assert run_lock.held() is False
+
+    @pytest.mark.parametrize("argv", [["--mode", "prod", "--dry-run"], ["--mode", "dev"],
+                                      ["--mode", "dev", "--dry-run"]],
+                             ids=["prod-dry-run", "dev", "dev-dry-run"])
+    def test_a_run_that_sends_no_orders_neither_takes_nor_waits_for_the_lock(
+        self, monkeypatch, argv,
+    ):
+        # Another run holds the lock, and taking it would fail this test
+        holder = run_lock.acquire()
+
+        def no_acquire() -> int | None:
+            """
+            Stand in for run_lock.acquire, which a run that sends no orders never calls.
+
+            Returns:
+                int | None: Never returns.
+
+            Raises:
+                AssertionError: Always, so the test fails if the run takes the lock.
+            """
+            raise AssertionError("a run that sends no orders took the live-run lock")
+
+        monkeypatch.setattr(run_lock, "acquire", no_acquire)
+        try:
+            seen = _main_with(monkeypatch, argv)
+        finally:
+            os.close(holder)
+        assert seen["code"] == EXIT_OK
+        assert seen["client_built"] is True
+        assert seen["mode"] == argv[1]
+
+    def test_an_unwritable_lock_folder_stops_the_run_with_an_error(self, monkeypatch, tmp_path):
+        # Not EXIT_RUN_IN_PROGRESS, which the scheduler counts as a done slot:
+        # the error propagates and the interpreter exits 1
+        locked = tmp_path / "read-only"
+        locked.mkdir()
+        locked.chmod(0o500)
+        monkeypatch.setattr(config, "LIVE_RUN_LOCK_FILE", locked / "sub" / "live_run.lock")
+        built = []
+        try:
+            with pytest.raises(PermissionError):
+                _main_with(monkeypatch, ["--mode", "prod"],
+                           build_client=lambda mode: built.append(mode))
+        finally:
+            locked.chmod(0o700)
+        assert built == []
 
 
 def _fake_write_dev_simulation(results, candidate_pairs, balance_cents):

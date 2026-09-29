@@ -12,13 +12,16 @@ Purpose:
 
 Dependencies:
     Imports PROJECT_ROOT, SCHEDULED_RUN, SCHEDULER_JOB_TIMEOUT_SECONDS,
-    SCHEDULER_BLIND_RETRY_SECONDS / SCHEDULER_BLIND_MAX_RETRIES, and the
+    SCHEDULER_BLIND_RETRY_SECONDS / SCHEDULER_BLIND_MAX_RETRIES,
+    SCHEDULER_STATE_FILENAME (the slot record's file name), and the
     EXIT_OK / EXIT_SKIPPED_LOW_BALANCE / EXIT_TRADES_NEED_ATTENTION /
-    EXIT_NO_TRADEABLE_SHARDS / EXIT_TIME_SERIES_SKIPPED exit-code constants
-    from config.py — the EXIT_* imports are what let run_job() map the
+    EXIT_NO_TRADEABLE_SHARDS / EXIT_TIME_SERIES_SKIPPED / EXIT_RUN_IN_PROGRESS
+    exit-code constants from config.py — the EXIT_* imports are what let run_job() map the
     subprocess's exit code to a distinct log level/message rather than
     treating every nonzero code identically — and read_saved_live_defaults,
-    which _check_live_defaults reads once at daemon start. Spawns kalshi_betting.main as a
+    which _check_live_defaults reads once at daemon start. Imports run_lock,
+    whose holder record names the run that stopped a scheduled run with
+    EXIT_RUN_IN_PROGRESS. Spawns kalshi_betting.main as a
     subprocess (via sys.executable) rather than importing it directly, to
     isolate run-time errors and capture stdout/stderr separately. Entry point for
     `python3 -m kalshi_betting.scheduler`.
@@ -54,6 +57,14 @@ Notes:
     daemon) re-runs a slot with no recorded attempt; with no state file yet,
     the first start runs the bot.
 
+    Lock refusals: exit code EXIT_RUN_IN_PROGRESS (50) means another live
+    trading run on this machine held the live-run lock (run_lock), so the
+    scheduled run stopped before making any request. run_job() counts the
+    slot as done and never retries it, since a real-money run was already
+    trading; it logs a WARNING naming that run, or an ERROR when that run has
+    held the lock for over SCHEDULER_JOB_TIMEOUT_SECONDS, or its start is not
+    recorded, and so may be hung.
+
     Blind runs: exit code EXIT_NO_TRADEABLE_SHARDS (30) means nothing was
     scanned (kalshi_arb.log says why). run_job() then schedules a one-shot
     retry SCHEDULER_BLIND_RETRY_SECONDS later, which can schedule the next,
@@ -80,9 +91,11 @@ from typing import Any
 
 import schedule
 
+from . import run_lock
 from .config import (
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
+    EXIT_RUN_IN_PROGRESS,
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
@@ -91,6 +104,7 @@ from .config import (
     SCHEDULER_BLIND_MAX_RETRIES,
     SCHEDULER_BLIND_RETRY_SECONDS,
     SCHEDULER_JOB_TIMEOUT_SECONDS,
+    SCHEDULER_STATE_FILENAME,
     read_saved_live_defaults,
 )
 
@@ -123,9 +137,10 @@ def _state_file_path() -> Path:
     before any test patch could take effect.
 
     Returns:
-        Path: PROJECT_ROOT / "scheduler_state.json".
+        Path: PROJECT_ROOT / config.SCHEDULER_STATE_FILENAME
+            ("scheduler_state.json").
     """
-    return PROJECT_ROOT / "scheduler_state.json"
+    return PROJECT_ROOT / SCHEDULER_STATE_FILENAME
 
 
 def _decode(stream) -> str:
@@ -540,7 +555,12 @@ def run_job(retries: int = 0) -> None:
     needing manual review are no longer indistinguishable from a clean run in
     this log — previously the only signal was a WARNING inside kalshi_arb.log
     that this scheduler process never reads. EXIT_TIME_SERIES_SKIPPED is an
-    ERROR that still counts the slot as done.
+    ERROR that still counts the slot as done. EXIT_RUN_IN_PROGRESS (another
+    live trading run held the live-run lock) counts the slot as done too and
+    is never retried: a WARNING naming that run (run_lock.holder), or an
+    ERROR when it has held the lock for over SCHEDULER_JOB_TIMEOUT_SECONDS or
+    its start is not recorded, since it may then be hung and every scheduled
+    run stops the same way until it ends.
 
     A subprocess.TimeoutExpired's stdout/stderr are decoded before logging
     (BS-16 — see _decode()), and both streams are logged (stderr, the hung
@@ -644,6 +664,29 @@ def run_job(retries: int = 0) -> None:
             "as done — see the ERROR in kalshi_arb.log naming the market.",
             result.returncode,
         )
+    elif result.returncode == EXIT_RUN_IN_PROGRESS:
+        # Slot done: a real-money run was already trading on this machine, and
+        # a retry could stack a second same-title trade this week. The lock
+        # file's record names that run
+        holder = run_lock.holder()
+        age = holder.age_seconds()
+        if age is not None and age <= SCHEDULER_JOB_TIMEOUT_SECONDS:
+            logging.warning(
+                "Job did not trade (exit %d): another live trading run on this machine "
+                "was in progress (%s). The weekly slot counts as done — a real-money "
+                "run was already trading, so it is not retried.",
+                result.returncode, holder.describe(),
+            )
+        else:
+            logging.error(
+                "Job did not trade (exit %d): the run holding the live-run lock (%s) has "
+                "been running for over %d s, or its start is not recorded — it may be "
+                "hung or stopped. No trade was made for this weekly slot, and every "
+                "scheduled run will stop the same way until that run ends. Before "
+                "stopping it, check the account in the Kalshi UI: a run stopped "
+                "mid-trade can leave a leg unhedged.",
+                result.returncode, holder.describe(), SCHEDULER_JOB_TIMEOUT_SECONDS,
+            )
     elif result.returncode == EXIT_NO_TRADEABLE_SHARDS:
         # Not a satisfied slot: nothing was scanned (TS-01, VI-02). The exit
         # code does not say WHICH cause fired, so neither does this message —

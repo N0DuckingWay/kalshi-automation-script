@@ -5,17 +5,19 @@ live defaults (their file's reader and writer, the seed, and the comparison of
 two sets of defaults), the weekly run schedule (ScheduledRun), the values
 config.py ships, conftest's apply_pre_toggle_defaults, the V2 order path's
 self-trade-prevention value, the startup check that refuses any order path but
-"v2" (order_api_version_error), the order-write pacer's budget, and
-PROJECT_ROOT."""
+"v2" (order_api_version_error), the order-write pacer's budget, the live-run
+lock's exit code, file and waits, and PROJECT_ROOT."""
 import ast
 import dataclasses
 import importlib
+import importlib.util
 import json
 import logging
 import math
 import os
 import pathlib
 import re
+import sys
 import threading
 from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock
@@ -385,6 +387,57 @@ class TestOrderWriteBudget:
         # its YES leg), and trader._WritePacer refuses a smaller burst at import
         assert config.ORDER_WRITE_BURST >= 2
         assert config.ORDER_WRITES_PER_SECOND > 0
+
+
+class TestLiveRunLockSettings:
+    """The exit code a run stopped by the live-run lock returns, and where the
+    lock lives. tests/conftest.py points config.LIVE_RUN_LOCK_FILE and the
+    waits elsewhere for every test, so the shipped values are read from a
+    fresh load of config.py."""
+
+    @staticmethod
+    def _config_as_shipped(monkeypatch):
+        """
+        Load config.py afresh, under a name of its own, with no test's patches.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): Removes the fresh module from
+                sys.modules afterwards.
+
+        Returns:
+            module: A second copy of config.py, as it ships.
+        """
+        spec = importlib.util.spec_from_file_location("_config_as_shipped", config.__file__)
+        fresh = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, fresh)
+        spec.loader.exec_module(fresh)
+        return fresh
+
+    def test_run_in_progress_is_an_exit_code_of_its_own(self):
+        codes = {name: getattr(config, name) for name in dir(config)
+                 if name.startswith("EXIT_")}
+        assert config.EXIT_RUN_IN_PROGRESS == 50
+        assert list(codes.values()).count(config.EXIT_RUN_IN_PROGRESS) == 1
+        # Not the interpreter's crash code or argparse's usage-error code
+        assert config.EXIT_RUN_IN_PROGRESS not in (1, 2)
+
+    def test_the_shipped_lock_is_in_the_home_folder(self, monkeypatch):
+        shipped = self._config_as_shipped(monkeypatch)
+        # One lock for every checkout and worktree trading the account
+        assert shipped.LIVE_RUN_LOCK_FILE == (
+            pathlib.Path.home() / ".kalshi_betting" / "live_run.lock")
+        assert not shipped.LIVE_RUN_LOCK_FILE.is_relative_to(shipped.PROJECT_ROOT)
+        # Not vacuous: this test itself sees conftest's redirect
+        assert config.LIVE_RUN_LOCK_FILE != shipped.LIVE_RUN_LOCK_FILE
+
+    def test_the_shipped_wait_rides_out_a_check_and_is_far_shorter_than_a_run(
+        self, monkeypatch,
+    ):
+        shipped = self._config_as_shipped(monkeypatch)
+        assert 0 < shipped.LIVE_RUN_LOCK_POLL_SECONDS < shipped.LIVE_RUN_LOCK_WAIT_SECONDS
+        # Several tries within the wait, and a small part of the job timeout
+        assert shipped.LIVE_RUN_LOCK_WAIT_SECONDS >= 10 * shipped.LIVE_RUN_LOCK_POLL_SECONDS
+        assert shipped.LIVE_RUN_LOCK_WAIT_SECONDS * 100 < shipped.SCHEDULER_JOB_TIMEOUT_SECONDS
 
 
 class TestMinPriceDiffForGap:

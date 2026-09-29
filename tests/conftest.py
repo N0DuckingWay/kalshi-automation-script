@@ -4,7 +4,11 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Suite-wide pytest fixtures and two helpers. Six autouse guards: one points
+    Suite-wide pytest fixtures and two helpers. Seven autouse guards
+    (_isolate_event_title_accumulator, _isolate_treasury_rates,
+    _fresh_order_write_pacer, _fresh_v2_mapping_disproof_state,
+    _isolate_live_defaults_for_the_session, _isolate_live_defaults and
+    _isolate_live_runs, in the order described here): one points
     the event-title accumulator and Kalshi's cached /series listing at a
     per-test tmp_path, so no test can touch the operator's real event-title
     accumulators or series_categories.json; one keeps every test off the
@@ -12,11 +16,14 @@ Purpose:
     fresh order-write pacer, so no test waits on writes an earlier test made;
     one clears trader's disproven-mapping latch and its record of unchecked
     NO legs, so a test that disproves the V2 NO-leg mapping cannot stop every
-    later test's trades; and two point the saved live defaults file
+    later test's trades; two point the saved live defaults file
     (config.LIVE_DEFAULTS_FILE) away from the repo's live_defaults.json — at
     an empty session directory for the whole run, so class-scoped fixtures
     never see the real file, and at each test's own tmp_path, so a test that
-    saves defaults never leaks them into the next. pre_toggle_defaults pins
+    saves defaults never leaks them into the next; and one points the
+    live-run lock (config.LIVE_RUN_LOCK_FILE) at each test's own tmp_path and
+    shortens its waits, so no test takes or waits on the machine's real lock
+    in the home folder. pre_toggle_defaults pins
     the live toggles for a test whose figures assume fixed values (they pin
     arithmetic, not config.py's policy); its helper, apply_pre_toggle_defaults,
     also serves class-scoped fixtures. save_config_live_defaults (and the
@@ -29,7 +36,9 @@ Dependencies:
     kalshi_betting.trader (its _WritePacer, _ORDER_WRITE_PACER,
     _V2_NO_MAPPING_DISPROVEN and _V2_UNCHECKED_NO_LEGS), config (the toggle
     constants, the order-write rate and burst, LIVE_DEFAULTS_FILE,
-    live_settings and save_live_defaults), and backtester and backtest (the
+    live_settings and save_live_defaults, and the live-run lock's
+    LIVE_RUN_LOCK_FILE, LIVE_RUN_LOCK_WAIT_SECONDS and
+    LIVE_RUN_LOCK_POLL_SECONDS), and backtester and backtest (the
     by-value copies they bind). Imported by pytest, and by test modules for
     apply_pre_toggle_defaults and save_config_live_defaults.
 
@@ -215,6 +224,28 @@ def _isolate_live_defaults(tmp_path, monkeypatch):
         monkeypatch (pytest.MonkeyPatch): Restores the session path afterwards.
     """
     monkeypatch.setattr(config, "LIVE_DEFAULTS_FILE", tmp_path / "live_defaults.json")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_live_runs(tmp_path, monkeypatch):
+    """
+    Point the live-run lock at this test's tmp_path and shorten its waits.
+
+    config.LIVE_RUN_LOCK_FILE is read at call time (run_lock.py), so every
+    test that runs main.main() in production without --dry-run takes a lock
+    of its own, never the one in the home folder that real runs share. The
+    wait drops to 0.2 s and the retry interval to 0.01 s, so a test that
+    holds the lock sees a second run refused quickly. The folder under
+    tmp_path is not made here: run_lock.acquire() makes it, as it would the
+    real one.
+
+    Args:
+        tmp_path (Path): pytest's per-test temporary directory.
+        monkeypatch (pytest.MonkeyPatch): Restores the real path and waits afterwards.
+    """
+    monkeypatch.setattr(config, "LIVE_RUN_LOCK_FILE", tmp_path / "lock" / "live_run.lock")
+    monkeypatch.setattr(config, "LIVE_RUN_LOCK_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(config, "LIVE_RUN_LOCK_POLL_SECONDS", 0.01)
 
 
 def save_config_live_defaults() -> None:

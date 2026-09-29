@@ -14,8 +14,8 @@ Purpose:
 Dependencies:
     No project imports. Imported by auth.py, scanner.py, strategy.py, trader.py,
     reporter.py, historical.py, backtester.py, dashboard.py, backtest.py,
-    scheduler.py, treasury.py, and main.py — plus two standalone, human-run
-    tools kept deliberately outside the pipeline's import graph: the
+    scheduler.py, treasury.py, run_lock.py, and main.py — plus two standalone,
+    human-run tools kept deliberately outside the pipeline's import graph: the
     verification CLI (see CLAUDE.md's pipeline-isolation rule) and
     defaults_server.py, the confirmation page that saves the live defaults.
 
@@ -1146,6 +1146,11 @@ SCHEDULED_RUN = ScheduledRun(weekday=0, hour=9, minute=0, timezone="America/Los_
 # weekly scheduler daemon forever.
 SCHEDULER_JOB_TIMEOUT_SECONDS = 3600
 
+# The scheduler's record of its claimed weekly slot (scheduler.py), under
+# PROJECT_ROOT: the slot, when its run started and finished, its exit code and
+# the blind-run retries spent on it.
+SCHEDULER_STATE_FILENAME = "scheduler_state.json"
+
 # A run that exits EXIT_NO_TRADEABLE_SHARDS (exchange-wide halt) is retried
 # after this many seconds, at most SCHEDULER_BLIND_MAX_RETRIES times per
 # Monday slot, so a maintenance window overlapping the 09:00 fire no longer
@@ -1186,6 +1191,27 @@ EXIT_NO_TRADEABLE_SHARDS      = 30
 # Same-title still ran, so the scheduler logs an ERROR but counts the slot as
 # done (a retry would most likely fail the same lookup).
 EXIT_TIME_SERIES_SKIPPED      = 40
+# Another live trading run on this machine held the run lock (run_lock.py), so
+# this one stopped before building a client or making any request. Only a
+# production run that sends orders takes the lock, so the scheduler counts its
+# slot as done (logging an ERROR instead of a WARNING when the holder has run
+# for over SCHEDULER_JOB_TIMEOUT_SECONDS, or its start is not recorded, and may
+# be hung).
+EXIT_RUN_IN_PROGRESS          = 50
+
+# ── Live run lock ─────────────────────────────────────────────────────────────
+
+# The file a production run that sends orders keeps locked while it runs
+# (run_lock.py). It lives in the user's home, not the checkout, so every
+# checkout and worktree trading this account shares it. Read at call time, so
+# tests point it elsewhere (tests/conftest.py).
+LIVE_RUN_LOCK_FILE = pathlib.Path.home() / ".kalshi_betting" / "live_run.lock"
+
+# How long a run keeps trying a taken lock before it stops with
+# EXIT_RUN_IN_PROGRESS, and how often it tries. This is long enough to ride out
+# a momentary check of the lock (run_lock.held), and far shorter than any run.
+LIVE_RUN_LOCK_WAIT_SECONDS = 2.0
+LIVE_RUN_LOCK_POLL_SECONDS = 0.1
 
 # ── API pagination ────────────────────────────────────────────────────────────
 
@@ -1479,8 +1505,9 @@ TRADER_MAX_WORKERS = 8
 # for writes the bot does not see (another client on the account, a manual
 # order). Pacing sets when a request is sent, not when it arrives, so large
 # network jitter can still bunch arrivals, and the pacer is per process, so a
-# second process writing to the account (a manual run overlapping a scheduled
-# one, a probe's transfer) paces itself separately at the full rate. A higher
+# second process writing to the account (a probe's transfer, or a run on
+# another computer; run_lock keeps two real-money runs on one machine from
+# overlapping) paces itself separately at the full rate. A higher
 # usage tier (GET /account/limits names the account's own) allows more; these
 # are safe to raise only up to that tier's write budget divided by the order
 # cost (10 tokens). The burst must be at least 2: a pair's NO leg also holds

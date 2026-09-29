@@ -24,6 +24,13 @@ Purpose:
     config.ORDER_API_VERSION is not "v2" (config.order_api_version_error),
     before logging is configured.
 
+    A production run that sends orders (--mode prod without --dry-run) holds
+    the machine-wide live-run lock (run_lock) from before it builds a client
+    until main() ends, so two such runs never trade the account at once. When
+    another run holds it, this one exits config.EXIT_RUN_IN_PROGRESS (50)
+    without making any request. Dry runs and dev runs send no orders, so they
+    neither take the lock nor wait for it.
+
     The live toggles are the saved live defaults (config.LIVE_DEFAULTS_FILE,
     live_defaults.json, saved through python3 -m kalshi_betting.defaults_server),
     each overridable for one run by a flag of the "live trading toggles"
@@ -50,8 +57,10 @@ Dependencies:
     resolve_held_ladders, leg_sides — the only source of truth for which
     side each leg buys — and close_gap_bound_text, which renders that
     close-gap bound in the same words the finders' refusal lines use),
-    strategy.py (trade sizing and portfolio selection), and trader.py (order
-    execution). Entry point for `python3 -m kalshi_betting.main`.
+    strategy.py (trade sizing and portfolio selection), trader.py (order
+    execution), and run_lock.py (the lock that lets one real-money run trade
+    at a time, which main() takes before building a client). Entry point for
+    `python3 -m kalshi_betting.main`.
 
 Notes:
     Label rule for everything this module logs: "A"/"B" always mean
@@ -79,6 +88,7 @@ Notes:
 import argparse
 import logging
 import logging.handlers
+import os
 import pathlib
 import sys
 from collections import Counter
@@ -86,10 +96,12 @@ from dataclasses import replace as dc_replace
 
 from tabulate import tabulate
 
+from . import run_lock
 from .auth import build_client, verify_auth
 from .config import (
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
+    EXIT_RUN_IN_PROGRESS,
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
@@ -1260,6 +1272,17 @@ def main() -> None:
     constants in config.py), which the scheduler reads. An unhandled exception
     propagates and exits 1.
 
+    A production run that sends orders (--mode prod without --dry-run) first
+    takes the machine-wide live-run lock (run_lock.acquire), before it builds
+    the client, and holds it until the run mode returns or raises; the lock is
+    released in a finally, so a second call in the same process takes it
+    afresh. When another run still holds the lock after
+    config.LIVE_RUN_LOCK_WAIT_SECONDS, this run logs a WARNING naming the
+    holder and exits EXIT_RUN_IN_PROGRESS (50) without building a client or
+    making any request. An error making or opening the lock file propagates
+    (exit 1). Dry runs and dev runs send no orders, so they neither take the
+    lock nor wait for it.
+
     Returns:
         None: This function never returns to its caller — it always ends by
             calling sys.exit(code), which raises SystemExit.
@@ -1391,14 +1414,38 @@ def main() -> None:
             "account balance; use --dry-run to avoid submitting orders",
         )
 
-    client = build_client(args.mode)  # returns KalshiClient authenticated via RSA key from secrets.json
+    # One production run that sends orders at a time on this machine
+    # (run_lock); dry runs and dev runs send none, so they neither take the
+    # lock nor wait for it
+    lock_fd = None
+    code = None
+    try:
+        if args.mode == "prod" and not args.dry_run:
+            # The machine-wide lock every real-money run shares; None when
+            # another run still holds it after LIVE_RUN_LOCK_WAIT_SECONDS
+            lock_fd = run_lock.acquire()
+            if lock_fd is None:
+                # The record names the run in the way (run_lock.holder)
+                logging.warning(
+                    "Another live trading run is in progress (%s) — this run stops "
+                    "without contacting Kalshi, so nothing is sent (exit %d).",
+                    run_lock.holder().describe(), EXIT_RUN_IN_PROGRESS,
+                )
+                code = EXIT_RUN_IN_PROGRESS
+        if code is None:
+            client = build_client(args.mode)  # returns KalshiClient authenticated via RSA key from secrets.json
 
-    # Both run modes get the run's settings and the saved defaults they were
-    # built from
-    if args.mode == "dev":
-        code = _run_dev(client, args, settings, reference)
-    else:
-        code = _run_prod(client, args, settings, reference)
+            # Both run modes get the run's settings and the saved defaults they were
+            # built from
+            if args.mode == "dev":
+                code = _run_dev(client, args, settings, reference)
+            else:
+                code = _run_prod(client, args, settings, reference)
+    finally:
+        if lock_fd is not None:
+            # Released only once the run mode has returned or raised; nothing
+            # trades after this
+            os.close(lock_fd)
 
     # Only sys.exit() communicates the outcome to a subprocess caller (the
     # scheduler) — a bare return here would always look like exit 0.
