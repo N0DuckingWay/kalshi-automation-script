@@ -5556,7 +5556,7 @@ class TestFilterScript:
         snap = _run_script(tmp_path, page, [["wait"], ["snap", "s"]],
                            no_decompression=True)["s"]
         assert all(snap["selects"][i]["disabled"]
-                   for i in (*_FLT_SELECTS, "flt-tier", "khat-group"))
+                   for i in (*_FLT_SELECTS, "flt-tier", "flt-add", "khat-group"))
         assert snap["text"]["flt-summary"].startswith(
             "The filter could not load its data (this browser cannot decompress it)")
         assert snap["reacts"] == [] and snap["inflated"] == []
@@ -6349,7 +6349,7 @@ class TestSaveLiveDefaultsButton:
         assert query["source"] == data["save"]["source"]
         assert query.get("category") == category and query.get("tag") == tag
         known = {"tier_floors", "spread_min", "spread_max", "k", "size_cap",
-                 "same_title_size_cap", "source", "category", "tag"}
+                 "same_title_size_cap", "source", "category", "tag", "add_to_held_pairs"}
         assert set(query) <= known
 
     def test_the_button_is_rendered_disabled_with_its_words(self, monkeypatch, tmp_path):
@@ -9295,6 +9295,852 @@ class TestTierOffAtEveryCap:
         assert dashboard._run_settings_html(without, tier_off_cap_sweep_unused=True) == healthy
 
 
+# ─── Add to held pairs (C6) ──────────────────────────────────────────────────
+
+_ADD_WARNING = ("The Add to held pairs runs could not be simulated; the page offers that "
+                "choice off only")
+_ADD_MISMATCH = "The Add to held pairs runs do not match the page's grid"
+_ADD_MISMATCH_OFF = ("The Add to held pairs runs with the tier floors off do not match the "
+                     "page's grid; with the tier floors off, adding is not shown")
+
+
+def _ao_trade(t: BacktestTrade, n: int = 2, event: str | None = None) -> BacktestTrade:
+    """A trade that adds to a pair the run still holds: t at n contracts, marked
+    add_on (and, with event, filed under that event and its own ticker)."""
+    added = dataclasses.replace(_kc_resized(t, n), add_on=True)
+    if event is not None:
+        added = dataclasses.replace(added, event_ticker=event, ticker_a=f"{event}-A")
+    return added
+
+
+def _kc_sweep_add_on(base: BacktestSweep | None = None, *, raise_on=None, off_raise_on=None,
+                     event: str | None = None) -> BacktestSweep:
+    """
+    A size-cap sweep (_kc_sweep() unless `base`) plus the Add to held pairs family.
+
+    The family is a fake CapSweep over the base grid's own bands, ks and caps:
+    at k 0.60 no pair is held twice, so its points are the base points' own
+    lists (its chunks are the base ones); at k 0.75 every list gains one add-on
+    trade — the caps at or above the peak sharing one list, as CapSweep shares
+    them; and (0.3-0.6, 0.60) is never simulated, as in the base. With a
+    tier-floors-off family on `base` (_kc_sweep_tiers()), a tier-floors-off twin
+    over its one binding band holds that family's list plus an add-on trade.
+    `raise_on` and `off_raise_on` make one cell of the family's tier-on or tier-off
+    sweep raise when it is read; `event` files the (0.3-0.6, 0.75) add-on trade
+    under another event (a series no other scenario trades).
+    """
+    sweep = base or _kc_sweep()
+    # The base sweep's points: one "all" point per cell (a size-cap sweep with
+    # the band sweep's checks holds a dict of populations there)
+    points = {key: (p["all"] if isinstance(p, dict) else p)
+              for key, p in sweep.cap_sweep.points.items()}
+    curves: dict = {}
+
+    def added(band, k, cap, trades, *, tier_floors=True) -> SweepPoint:
+        if id(trades) not in curves:
+            curves[id(trades)] = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        return SweepPoint(k=k, trades=trades, equity_df=curves[id(trades)], spread_band=band,
+                          size_cap=cap, tier_floors=tier_floors, add_to_held=True)
+
+    b0 = [points[(_KC_B0, 0.75, cap)].trades for cap in (0.05, 0.2)]
+    small = [*b0[0], _ao_trade(b0[0][0])]
+    full = [*b0[1], _ao_trade(b0[1][0])]
+    b1 = points[(_KC_B1, 0.75, 0.2)].trades
+    other = [*b1, _ao_trade(b1[0], event=event)]
+    family = {}
+    for cap in (0.05, 0.2, 1.0):
+        family[(_KC_B0, 0.6, cap)] = dataclasses.replace(points[(_KC_B0, 0.6, cap)],
+                                                         add_to_held=True)
+        family[(_KC_B0, 0.75, cap)] = added(_KC_B0, 0.75, cap, small if cap == 0.05 else full)
+        family[(_KC_B1, 0.75, cap)] = added(_KC_B1, 0.75, cap, other)
+    twin = None
+    if sweep.tier_off_scenarios:
+        off = sweep.tier_off_scenarios[0].trades
+        off_added = [*off, _ao_trade(off[0])]
+        twin = _FakeCapSweep(
+            {(_KC_B0, k, cap): added(_KC_B0, k, cap, off_added, tier_floors=False)
+             for k in (0.6, 0.75) for cap in (0.05, 0.2, 1.0)},
+            bands=(_KC_B0,), raise_on=off_raise_on)
+    return dataclasses.replace(sweep, add_on_cap_sweep=_FakeCapSweep(family, raise_on=raise_on),
+                               add_on_tier_off_cap_sweep=twin)
+
+
+def _ao_page(monkeypatch, tmp_path, sweep, series=_FLT_SERIES_TIERS) -> str:
+    """A whole page of a sweep, its trades filed by `series`."""
+    return TestFilterPage()._page(monkeypatch, tmp_path, sweep, series)
+
+
+def _ao_payload(sweep: BacktestSweep, state: str = "not simulated") -> tuple:
+    """(the grid walked, the chunk visitor, the base block) as generate_dashboard
+    builds them for a sweep, with the add-on state the page would pass."""
+    trades, curve = sweep.primary.trades, sweep.primary.equity_df
+    source = dashboard._grid_source(sweep, trades, curve, 0.75)
+    walked, chunker, _, kd = dashboard._build_filter_grid(
+        source, trades, curve, 0.75, _FLT_START, 1000.0, _FLT_SERIES_TIERS)
+    base = dashboard._filter_payload(walked, chunker, _FLT_START, 1000.0, _FLT_SERIES_TIERS,
+                                     kd=kd.payload(), add_on_state=state)
+    return walked, chunker, base
+
+
+def _ao_ids(grid) -> set[int]:
+    """Every chunk id a [band][k][cap] grid names."""
+    return {c for band in grid for ks in band for c in ks if c is not None}
+
+
+def _ao_chunks(chunker) -> list:
+    """The chunks a chunk visitor packed, inflated, in id order."""
+    return [_unpack(block) for block in chunker.chunks]
+
+
+class TestAddOnView:
+    """The bar's "Add to held pairs" view: a lazy family of add-on runs joins the
+    page's one walk, every scenario of it is its own run (or the run as
+    simulated, when adding traded nothing), and a family that does not fit, or
+    cannot be simulated, costs that choice alone."""
+
+    def test_the_family_joins_a_grid_it_fits(self):
+        sweep = _kc_sweep_add_on()
+        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
+                                        0.75)
+        family = sweep.add_on_cap_sweep
+        assert source.add_cell == family.cell and source.add_cap_sweep is family
+        assert source.add_off_cell is None and source.add_off_cap_sweep is None
+        # The categories and tags of what it can trade are known before any
+        # cell is read, and attaching it simulates nothing
+        assert source.events >= frozenset(family.entry_events())
+        assert family.reads == []
+
+    def test_every_add_on_scenario_is_its_own_chunk_or_the_base_one(self):
+        sweep = _kc_sweep_add_on()
+        _, source, base, chunks = _flt_payload(sweep)
+        assert base["grid"] == _KC_GRID
+        # k 0.60: nothing to add to, so its lists are the run as simulated
+        # and its chunks the base ones; k 0.75 gains a trade, so a list of its
+        # own — the caps above the peak sharing one; (0.3-0.6, 0.60) was never
+        # simulated
+        assert base["grid_add"] == [[[3, 2, 2], [6, 5, 5]], [[None, None, None], [7, 7, 7]]]
+        assert base["add_state"] == "shown" and base["grid_add_off"] is None
+        assert len(chunks) == 8
+        assert [chunks[c]["list"]["views"]["all"]["n"] for c in (5, 6, 7)] == [4, 4, 3]
+        # Each is priced at its own k, on its own trades — never the page's
+        added = sweep.add_on_cap_sweep.points[(_KC_B0, 0.75, 0.2)].trades
+        assert chunks[5]["list"]["kx"] == pytest.approx(dashboard._kelly_points(added, 0.75)[0])
+        assert len(chunks[5]["list"]["kx"]) == 4 != len(chunks[1]["list"]["kx"])
+        # The family's cells were each read once, the page's own first
+        assert sweep.add_on_cap_sweep.reads == [(_KC_B0, 0.6), (_KC_B0, 0.75), (_KC_B1, 0.6),
+                                                (_KC_B1, 0.75)]
+
+    def test_the_grids_the_page_ships_are_the_base_ones_beside_the_add_on(self):
+        # Adding the family changes no chunk or grid the page had without it:
+        # the add-on chunks are appended after the base ones
+        _, clean_chunker, clean_base = _ao_payload(_kc_sweep())
+        _, chunker, base = _ao_payload(_kc_sweep_add_on())
+        assert base["grid"] == clean_base["grid"]
+        assert base["rows"][:len(clean_base["rows"])] == clean_base["rows"]
+        assert _ao_chunks(chunker)[:5] == _ao_chunks(clean_chunker)
+
+    def test_without_the_family_the_payload_says_so(self):
+        _, _, base = _ao_payload(_kc_sweep())
+        assert base["grid_add"] is None and base["grid_add_off"] is None
+        assert base["add_state"] == "not simulated"
+        # ... and a page that had one it could not use says that instead
+        _, _, base = _ao_payload(_kc_sweep(), "unavailable")
+        assert base["grid_add"] is None and base["add_state"] == "unavailable"
+        # A page with the view is "shown", whatever state it was handed
+        _, _, base = _ao_payload(_kc_sweep_add_on(), "unavailable")
+        assert base["add_state"] == "shown" and base["grid_add"] is not None
+
+    def test_a_grid_of_nothing_is_never_shown_as_a_view(self):
+        # A family none of whose cells holds a point ships no grid at all
+        sweep = dataclasses.replace(_kc_sweep(), add_on_cap_sweep=_FakeCapSweep({}))
+        walked, chunker, base = _ao_payload(sweep, "unavailable")
+        assert walked.add_cell is not None and chunker.add_grid() is None
+        assert base["grid_add"] is None and base["add_state"] == "unavailable"
+
+    def test_the_tier_off_twin_pairs_with_the_tier_off_view_only(self):
+        sweep = _kc_sweep_add_on(_kc_sweep_tiers())
+        walked, chunker, base = _ao_payload(sweep)
+        assert walked.tier_binds == (True, False) and walked.add_off_cap_sweep is not None
+        add, off = base["grid_add"], base["grid_add_off"]
+        assert base["add_state"] == "shown" and add is not None
+        # A binding band's row is its own add-on-with-the-tiers-off chunks ...
+        assert off[0] != add[0] and all(c is not None for row in off[0] for c in row)
+        assert _ao_ids(off[:1]).isdisjoint(_ao_ids(add))
+        # ... and a band the tiers never bind at reads its add-on tier-on row
+        assert off[1] == add[1]
+        # A tier-off twin with no tier-off view beside it ships no off grid
+        _, _, no_view = _ao_payload(dataclasses.replace(
+            sweep, tier_off_scenarios=[], tier_off_calibrations_by_band={}))
+        assert no_view["grid_add_off"] is None and no_view["grid_add"] is not None
+
+    def test_a_tier_off_view_without_its_twin_reads_missing_only_at_the_binding_band(self):
+        sweep = dataclasses.replace(_kc_sweep_add_on(_kc_sweep_tiers()),
+                                    add_on_tier_off_cap_sweep=None)
+        walked, chunker, base = _ao_payload(sweep)
+        assert walked.add_off_cell is None and base["add_state"] == "shown"
+        off = base["grid_add_off"]
+        assert off[0] == [[None] * 3, [None] * 3] and off[1] == base["grid_add"][1]
+
+    # ─── A family that does not fit ───────────────────────────────────────────
+
+    @pytest.mark.parametrize("axis, value", [("bands", (_KC_B0,)), ("ks", (0.75,)),
+                                             ("caps", (0.05, 0.2))])
+    def test_a_family_on_other_axes_gives_no_view(
+            self, monkeypatch, tmp_path, caplog, axis, value):
+        sweep = _kc_sweep_add_on()
+        setattr(sweep.add_on_cap_sweep, axis, value)
+        with caplog.at_level(logging.WARNING):
+            source = dashboard._grid_source(sweep, sweep.primary.trades,
+                                            sweep.primary.equity_df, 0.75)
+        assert source.add_cell is None and source.add_cap_sweep is None
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                and "Add to held" in r.getMessage()] == [
+                    f"{_ADD_MISMATCH} (its bands, ks or caps); the page offers that choice "
+                    "off only"]
+        # The page keeps every other choice and says why the select is shut
+        page = _ao_page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert data["grid_add"] is None and data["add_state"] == "unavailable"
+        assert 'id="flt-add-note"' in page and 'id="flt-bar"' in page
+        assert data["grid"] == _KC_GRID
+        assert sweep.add_on_cap_sweep.reads == []
+
+    def test_a_family_that_cannot_be_read_gives_no_view(self, caplog):
+        sweep = _kc_sweep_add_on()
+
+        def broken():
+            raise ZeroDivisionError("entry events")
+        sweep.add_on_cap_sweep.entry_events = broken
+        with caplog.at_level(logging.WARNING):
+            source = dashboard._grid_source(sweep, sweep.primary.trades,
+                                            sweep.primary.equity_df, 0.75)
+        assert source.add_cell is None and source.cap_sweep is sweep.cap_sweep
+        [warned] = [r for r in caplog.records if "Add to held" in r.getMessage()]
+        assert warned.exc_info is not None and "could not be read" in warned.getMessage()
+
+    def test_a_tier_off_twin_on_other_axes_costs_the_tier_off_choice_only(self, caplog):
+        sweep = _kc_sweep_add_on(_kc_sweep_tiers())
+        sweep.add_on_tier_off_cap_sweep.caps = (0.05, 0.2)
+        with caplog.at_level(logging.WARNING):
+            walked, _, base = _ao_payload(sweep)
+        assert [r.getMessage() for r in caplog.records if "Add to held" in r.getMessage()] == [
+            _ADD_MISMATCH_OFF]
+        assert walked.add_cell is not None and walked.add_off_cell is None
+        assert base["add_state"] == "shown" and base["grid_add"] is not None
+        # With the tiers off, adding reads "missing" at the band they bind at
+        assert base["grid_add_off"][0] == [[None] * 3, [None] * 3]
+
+    def test_the_cap_axis_fallback_grid_has_no_view_and_no_warning(self, caplog):
+        sweep = _kc_sweep_add_on()
+        with caplog.at_level(logging.WARNING):
+            fallback = dashboard._grid_source(sweep, sweep.primary.trades,
+                                              sweep.primary.equity_df, 0.75,
+                                              use_cap_sweep=False)
+        assert fallback.add_cell is None and fallback.cap_sweep is None
+        assert not [r for r in caplog.records if "Add to held" in r.getMessage()]
+        assert sweep.add_on_cap_sweep.reads == []
+
+    def test_a_lost_cap_axis_costs_the_add_on_view_too(self, monkeypatch, tmp_path, caplog):
+        # The size-cap sweep's last cell raises: the walk falls back to the
+        # eager grid, which never carries the family (its caps are the size-cap
+        # grid's); the page says the choice could not be built, and no add-on
+        # cell was ever simulated
+        sweep = _kc_sweep_add_on(_kc_sweep(raise_on=(_KC_B1, 0.75)))
+        with caplog.at_level(logging.WARNING):
+            page = _ao_page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert data["grid_add"] is None and data["add_state"] == "unavailable"
+        assert "(could not be built; see the log)" in page and 'id="flt-bar"' in page
+        assert sweep.add_on_cap_sweep.reads == []
+        assert sum("size-cap sweep could not be simulated" in r.getMessage()
+                   for r in caplog.records) == 1
+
+    def test_a_run_without_a_size_cap_sweep_offers_the_view_at_its_own_cap(self):
+        # The eager grid's caps are the run's own cap alone, and so are the
+        # family's: it fits, and only the cells it simulated hold a chunk
+        sweep = _flt_sweep()
+        primary = sweep.primary
+        added = dataclasses.replace(
+            primary, trades=[*primary.trades, _ao_trade(primary.trades[0])], add_to_held=True)
+        family = _FakeCapSweep({((0.0, 1.0), 0.75, 0.2): added},
+                               bands=((0.0, 1.0), (0.3, 0.6), (0.3, 1.0)),
+                               ks=(0.6, 0.75, 1.0), caps=(0.2,))
+        _, source, base, chunks = _flt_payload(dataclasses.replace(
+            sweep, add_on_cap_sweep=family))
+        assert source.cap_sweep is None and source.add_cell == family.cell
+        assert base["add_state"] == "shown"
+        assert base["grid_add"] == [[[None], [4], [None]], [[None]] * 3, [[None]] * 3]
+        assert chunks[4]["list"]["views"]["all"]["n"] == len(primary.trades) + 1
+
+    # ─── A cell that cannot be simulated ──────────────────────────────────────
+
+    def test_an_add_cell_that_raises_costs_only_the_add_on_view(
+            self, monkeypatch, tmp_path, caplog):
+        # The LAST add-on cell raises, after the earlier ones were packed: every
+        # add-on chunk and row head is dropped, and the page is the page it was
+        # without the family — chunk for chunk — beside the choice's own note
+        clean = _ao_page(monkeypatch, tmp_path, _kc_sweep())
+        sweep = _kc_sweep_add_on(raise_on=(_KC_B1, 0.75))
+        with caplog.at_level(logging.WARNING):
+            page = _ao_page(monkeypatch, tmp_path, sweep)
+        warned = [r for r in caplog.records if r.levelno == logging.WARNING
+                  and _ADD_WARNING in r.getMessage()]
+        assert len(warned) == 1 and warned[0].exc_info is not None
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        clean_data, clean_chunks = TestFilterPage._data(clean), TestFilterPage._chunks(clean)
+        assert data["grid_add"] is None and data["grid_add_off"] is None
+        assert data["add_state"] == "unavailable"
+        assert data["grid"] == clean_data["grid"] == _KC_GRID
+        assert data["rows"] == clean_data["rows"] and chunks == clean_chunks
+        assert data["text"] == clean_data["text"] and data["kd"] == clean_data["kd"]
+        assert 'id="flt-bar"' in page and "(could not be built; see the log)" in page
+        assert sweep.add_on_cap_sweep.reads == [
+            (_KC_B0, 0.6), (_KC_B0, 0.75), (_KC_B1, 0.6), (_KC_B1, 0.75)]
+
+    def test_a_tier_off_add_cell_that_raises_costs_only_the_add_on_view(
+            self, monkeypatch, tmp_path, caplog):
+        # The tier-floors-off twin's cell raises after the whole tier-on family
+        # was packed: both add-on grids go, the tier-off view stays
+        clean = _ao_page(monkeypatch, tmp_path, _kc_sweep_tiers())
+        sweep = _kc_sweep_add_on(_kc_sweep_tiers(), off_raise_on=(_KC_B0, 0.75))
+        with caplog.at_level(logging.WARNING):
+            page = _ao_page(monkeypatch, tmp_path, sweep)
+        assert len([r for r in caplog.records if _ADD_WARNING in r.getMessage()]) == 1
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        clean_data, clean_chunks = TestFilterPage._data(clean), TestFilterPage._chunks(clean)
+        assert data["grid_add"] is data["grid_add_off"] is None
+        assert data["add_state"] == "unavailable"
+        assert data["grid"] == clean_data["grid"] and data["grid_off"] == clean_data["grid_off"]
+        assert data["grid_off"] is not None
+        assert data["rows"] == clean_data["rows"] and chunks == clean_chunks
+
+    def test_a_failing_tier_off_size_cap_cell_keeps_the_add_on_view(
+            self, monkeypatch, tmp_path, caplog):
+        # The tier-floors-off SIZE-CAP sweep cannot simulate its cell: the walk
+        # swaps in the grid's eager tier-off lookup, which was built before the
+        # add-on family was attached — and must carry it, or the add-on phase
+        # would be skipped and no view shipped
+        sweep = _kc_sweep_add_on(_kc_sweep_tiers_capped(raise_on=(_KC_B0, 0.6)))
+        with caplog.at_level(logging.WARNING):
+            walked, chunker, base = _ao_payload(sweep)
+        assert any(_OFF_WARNING in r.getMessage() for r in caplog.records)
+        assert not any(_ADD_WARNING in r.getMessage() for r in caplog.records)
+        assert walked.off_cap_sweep is None            # the eager lookup was walked
+        assert walked.add_cell is not None and walked.add_off_cell is not None
+        assert base["add_state"] == "shown"
+        assert base["grid_add"] is not None and base["grid_add_off"] is not None
+        assert base["grid_off"] is not None
+
+    def test_a_walk_over_a_grid_with_a_missing_family_walks_nothing_extra(self):
+        sweep = _kc_sweep_add_on()
+        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
+                                        0.75)
+        stripped = dataclasses.replace(source, add_cell=None, add_off_cell=None,
+                                       add_cap_sweep=None, add_off_cap_sweep=None)
+        dashboard._build_filter_grid(stripped, sweep.primary.trades, sweep.primary.equity_df,
+                                     0.75, _FLT_START, 1000.0, _FLT_SERIES_TIERS)
+        assert sweep.add_on_cap_sweep.reads == []
+
+    # ─── The stale-cutoff verdict ─────────────────────────────────────────────
+
+    def test_the_busiest_scenario_counts_the_add_on_ones(self):
+        for sweep, most in ((_kc_sweep(), 3), (_kc_sweep_add_on(), 4)):
+            source = dashboard._grid_source(sweep, sweep.primary.trades,
+                                            sweep.primary.equity_df, 0.75)
+            _, _, counter, _ = dashboard._build_filter_grid(
+                source, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START,
+                1000.0, _FLT_SERIES_TIERS)
+            assert (counter.most, counter.failed) == (most, False)
+
+    def test_a_failed_add_on_cell_takes_its_count_back(self):
+        sweep = _kc_sweep_add_on(raise_on=(_KC_B1, 0.75))
+        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
+                                        0.75)
+        _, _, counter, _ = dashboard._build_filter_grid(
+            source, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START, 1000.0,
+            _FLT_SERIES_TIERS)
+        # The cells read before the raise held four trades; the page shows none
+        assert (counter.most, counter.failed) == (3, False)
+        assert counter._pre_add is None
+
+    def test_a_trade_only_an_add_on_scenario_made_makes_the_verdict_stale(
+            self, monkeypatch, tmp_path):
+        # A window stamped at or after the cutoff: no scenario of the run as
+        # simulated traded, but the add-on view's did — which disproves "no
+        # trade could be entered", so the header says that verdict is stale
+        empty = SweepPoint(k=0.75, trades=[], spread_band=_KC_B0, size_cap=0.2,
+                           equity_df=backtester._build_equity_curve([], _FLT_START, 1000.0))
+        traded = _kc_trades(5)
+        family = {(_KC_B0, 0.75, 0.2): SweepPoint(
+            k=0.75, trades=traded, spread_band=_KC_B0, size_cap=0.2, add_to_held=True,
+            equity_df=backtester._build_equity_curve(traded, _FLT_START, 1000.0))}
+        prov = CorpusProvenance(from_cache=True, assembled_at=datetime(2026, 9, 24, tzinfo=UTC),
+                                archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC),
+                                post_cutoff=True)
+        sweep = BacktestSweep(
+            primary=empty, points=[empty], calibration=None, label_coverage=_scn_coverage(),
+            corpus_provenance=prov,
+            cap_sweep=_FakeCapSweep({(_KC_B0, 0.75, 0.2): empty}, bands=(_KC_B0,), ks=(0.75,),
+                                    caps=(0.2,)),
+            add_on_cap_sweep=_FakeCapSweep(family, bands=(_KC_B0,), ks=(0.75,), caps=(0.2,)))
+        assert backtester.max_trades_simulated(sweep) == 0
+        page = _ao_page(monkeypatch, tmp_path, sweep)
+        assert ("this run entered trades (up to 3 in one simulated scenario), so that "
+                "verdict is stale") in page
+        assert "no trade could be entered in this window" not in page
+        # Without the family the eager points alone decide: the red banner
+        page = _ao_page(monkeypatch, tmp_path,
+                        dataclasses.replace(sweep, add_on_cap_sweep=None))
+        assert "no trade could be entered in this window whatever pairs formed" in page
+
+    # ─── What it never reaches ────────────────────────────────────────────────
+
+    def test_only_the_bar_s_visitors_take_the_add_on_cells(self):
+        assert hasattr(dashboard._ChunkVisitor, "add") and hasattr(dashboard._MaxTrades, "add")
+        assert not hasattr(dashboard._ExplorerVisitor, "add")
+        assert not hasattr(dashboard._KdVisitor, "add")
+
+    def test_the_explorer_and_the_interval_discount_are_the_same_with_the_family(
+            self, monkeypatch, tmp_path):
+        # The scenario explorer's blocks and the interval-discount section's
+        # data are those of the page without the family: neither follows the choice
+        clean = _ao_page(monkeypatch, tmp_path, _ex_sweep_tiers())
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on(_ex_sweep_tiers()))
+        assert _scn_blocks(_ex_section(page)) == _scn_blocks(_ex_section(clean))
+        assert len(_scn_blocks(_ex_section(page))) > 3
+        assert TestFilterPage._data(page)["kd"] == TestFilterPage._data(clean)["kd"]
+        # ... and so are the k-hat figures, which are measured before sizing
+        assert TestFilterPage._data(page)["khat"] == TestFilterPage._data(clean)["khat"]
+        assert TestFilterPage._data(page)["khat_off"] == TestFilterPage._data(clean)["khat_off"]
+
+    def test_the_bar_lists_a_series_only_an_add_on_run_traded(self, monkeypatch, tmp_path):
+        # Kelly on a bigger position can trade a pair no other scenario traded;
+        # the bar must list its category and tag before any cell is simulated,
+        # or that chunk fails and costs the whole bar
+        sweep = _kc_sweep_add_on(event="KXRAIN-1")
+        page = _ao_page(monkeypatch, tmp_path, sweep)
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        assert 'id="flt-bar"' in page and data["grid_add"] is not None
+        assert "Climate" in data["categories"]
+        # Its chunk holds that category's view
+        climate = _key(data, "Climate")
+        assert chunks[data["grid_add"][1][1][1]]["list"]["views"][climate]["n"] == 1
+        # The page without the family never offers it
+        clean = TestFilterPage._data(_ao_page(monkeypatch, tmp_path, _kc_sweep()))
+        assert "Climate" not in clean["categories"]
+
+    # ─── The bar, the words ───────────────────────────────────────────────────
+
+    def test_the_words_are_short_and_plain(self):
+        assert dashboard._ADD_ON_OPTION_OFF == "off"
+        assert dashboard._ADD_ON_OPTION_ON == "on (up to the size cap)"
+        assert dashboard._ADD_ON_NOTES == {"not simulated": "(not in this backtest)",
+                                           "unavailable": "(could not be built; see the log)"}
+        assert dashboard._ADD_ON_PHRASE == ", adding to held pairs"
+        assert dashboard._SUMMARY_TEMPLATES["add_on"] == dashboard._ADD_ON_PHRASE
+        # The detail lives in the tooltip
+        assert "Live trading uses the saved live defaults" in dashboard._ADD_ON_SELECT_TITLE
+        # The Tier floors note keeps its own words, which a test finds by them
+        assert "not simulated for this run" not in " ".join(dashboard._ADD_ON_NOTES.values())
+
+    def test_the_select_follows_the_size_cap_and_is_rendered_shut(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
+        bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
+        assert bar.index('id="flt-cap"') < bar.index('id="flt-add"') < bar.index('id="flt-cat"')
+        assert "<label>Add to held pairs: <select" in bar
+        select = _page_elements(page)["selects"]["flt-add"]
+        assert select == {"disabled": True, "options": [
+            {"value": "off", "text": "off", "selected": True},
+            {"value": "on", "text": "on (up to the size cap)", "selected": False}]}
+        title = re.search(r'<select id="flt-add"[^>]*title="([^"]*)"', bar).group(1)
+        assert html.unescape(title) == dashboard._ADD_ON_SELECT_TITLE
+        # A page with the view has no note beside it
+        assert 'id="flt-add-note"' not in page
+
+    @pytest.mark.parametrize("state, note", [
+        ("not simulated", "(not in this backtest)"),
+        ("unavailable", "(could not be built; see the log)"),
+        ("something else", "(not in this backtest)")])
+    def test_a_shut_select_says_why(self, state, note):
+        _, chunker, base = _ao_payload(_kc_sweep())
+        bar = dashboard._filter_bar_html({**base, "add_state": state}, {"all": {"n": 3}})
+        assert f'id="flt-add-note" style="color:#9E9E9E; font-size:13px;">{note}</span>' in bar
+        assert 'id="flt-add" disabled' in bar
+        shown = dashboard._filter_bar_html({**base, "add_state": "shown"}, {"all": {"n": 3}})
+        assert 'id="flt-add-note"' not in shown
+
+    def test_the_tier_floors_note_keeps_its_own_words(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
+        assert re.search(r'id="flt-tier-note"[^>]*>\(not simulated for this run\)</span>', page)
+        assert 'id="flt-add-note"' not in page
+        bare = _ao_page(monkeypatch, tmp_path, _kc_sweep())
+        assert re.search(r'id="flt-add-note"[^>]*>\(not in this backtest\)</span>', bare)
+
+    def test_the_reach_sentence_names_the_page_it_is_on(self, monkeypatch, tmp_path):
+        # Without an explorer grid (the payload built here has none) ...
+        _, _, base = _ao_payload(_kc_sweep_add_on())
+        assert base["text"]["unfiltered"].endswith(" " + dashboard._ADD_ON_REACH_NO_EXPLORER)
+        assert dashboard._ADD_ON_REACH not in base["text"]["unfiltered"]
+        # ... with one (a band sweep's populations, so the page carries its grid) ...
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on(_ex_sweep()))
+        data = TestFilterPage._data(page)
+        assert data["text"]["unfiltered"].endswith(" " + dashboard._ADD_ON_REACH)
+        assert html.escape(dashboard._ADD_ON_REACH) in page
+        # ... and a page without the view never claims it
+        _, _, clean = _ao_payload(_kc_sweep())
+        assert "Add to held pairs" not in clean["text"]["unfiltered"]
+        assert "Add to held pairs" not in TestFilterPage._data(
+            _ao_page(monkeypatch, tmp_path, _kc_sweep()))["text"]["unfiltered"]
+
+    def test_the_save_button_names_the_choice(self):
+        assert "Add to held pairs choice (when this page simulated it)" in dashboard._SAVE_TITLE
+
+    def test_every_element_the_script_reaches_exists(self, monkeypatch, tmp_path):
+        # The chunk-id check of TestFilterPage's, over the add-on grids too
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on(_kc_sweep_tiers()))
+        data = TestFilterPage._data(page)
+        ids = (_ao_ids(data["grid"]) | _ao_ids(data["grid_off"]) | _ao_ids(data["grid_add"])
+               | _ao_ids(data["grid_add_off"]))
+        assert _ao_ids(data["grid_add"]) - _ao_ids(data["grid"])
+        assert _ao_ids(data["grid_add_off"]) - _ao_ids(data["grid_add"])
+        missing = sorted(i for i in ids if f'id="dash-chunk-{i}"' not in page)
+        assert ids and not missing
+        # Every chunk on the page is named by some grid: none is left over
+        assert set(TestFilterPage._chunks(page)) == ids
+
+    # ─── The header line ──────────────────────────────────────────────────────
+
+    def test_the_live_rule_header_names_adding_where_the_page_shows_the_rule(self):
+        run = TestLiveRuleHeader
+        rule = config.describe_time_series_rule(True, (0.0, 1.0))
+        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — "
+        note = "; the live defaults add to held pairs, which this run's primary does not"
+        sweep = dataclasses.replace(run._sweep(), live_add_to_held_pairs=True)
+        shown = {**run._bar(), "grid_add": [[[1]]]}
+        # The rule is the page's primary and the bar has the view: choose it
+        assert run()._text(sweep, shown) == (
+            head + "this run's primary" + note
+            + " — choose Add to held pairs on in the filter bar to see it")
+        # ... a bar without the view, or none at all: say so
+        for bar in (run._bar(), {**run._bar(), "grid_add": None}, None):
+            assert run()._text(sweep, bar) == (
+                head + "this run's primary" + note + " — this page has no Add to held pairs view")
+        # ... a rule the page does not show: the note alone, no promise of a view
+        elsewhere = dataclasses.replace(sweep, live_spread_band=(0.3, 0.6),
+                                        calibrations_by_band={(0.0, 1.0): None})
+        assert run()._text(elsewhere, shown).endswith("— not simulated by this run" + note)
+        # Not adding (or not recorded): no note at all
+        for saved in (False, None):
+            plain = dataclasses.replace(sweep, live_add_to_held_pairs=saved)
+            assert "add to held pairs" not in run()._text(plain, shown)
+
+    def test_the_header_of_a_whole_page_points_at_the_select(self, monkeypatch, tmp_path):
+        sweep = dataclasses.replace(_kc_sweep_add_on(), live_add_to_held_pairs=True,
+                                    live_tier_floors=True, live_spread_band=_KC_B0)
+        page = _ao_page(monkeypatch, tmp_path, sweep)
+        assert ("the live defaults add to held pairs, which this run's primary does not — "
+                "choose Add to held pairs on in the filter bar to see it</p>") in page
+        page = _ao_page(monkeypatch, tmp_path, dataclasses.replace(sweep, add_on_cap_sweep=None))
+        assert ("the live defaults add to held pairs, which this run's primary does not — "
+                "this page has no Add to held pairs view</p>") in page
+
+
+class TestAddOnScript:
+    """The bar's Add to held pairs select under the page script (run outside a
+    browser): enabled only with the view, "on" loads the add-on scenario's chunk
+    and words it with Python's phrase, a chunk that cannot be loaded puts the
+    choice back, and the save address names the choice only where the page
+    simulated it. The explorer and the interval-discount section never follow
+    it. The harness's "wait" does not wait on flt-add (a page without the view
+    keeps it shut), so these tests ask for it: setup_js adds it to the wait
+    list. Skipped without a JavaScript runtime."""
+
+    WAIT = "__BAR.push('flt-add');"
+
+    @classmethod
+    def _run(cls, tmp_path, page, steps, **kwargs) -> dict:
+        return _run_script(tmp_path, page, steps, setup_js=cls.WAIT + kwargs.pop("js", ""),
+                           **kwargs)
+
+    def test_the_select_is_enabled_only_with_the_view(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
+        snaps = self._run(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
+                          strict=True)
+        assert snaps["loaded"]["selects"]["flt-add"]["disabled"] is True
+        ready = snaps["ready"]["selects"]["flt-add"]
+        assert ready["disabled"] is False and ready["value"] == "off"
+        assert ready["options"] == [["off", "off"], ["on", "on (up to the size cap)"]]
+        # A page without the view keeps it shut, whatever else is chosen —
+        # and reaches no element the page lacks
+        bare = _ao_page(monkeypatch, tmp_path, _kc_sweep())
+        snap = _run_script(tmp_path, bare, [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
+            ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], ["snap", "s"]],
+            strict=True)["s"]
+        assert snap["selects"]["flt-add"]["disabled"] is True
+        # The change event on the shut select drew nothing more than the k's did
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-chunk-2"]
+
+    def test_on_loads_the_add_on_chunk_and_words_the_scenario(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        cid = data["grid_add"][0][1][1]
+        scenario = _phrase(data, 0, 1, 1) + data["text"]["add_on"]
+        assert scenario.endswith("20% cap per trade, adding to held pairs")
+        steps = [["wait"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["snap", "loading"],
+                 ["settle"], ["snap", "on"], ["set", "flt-add", "off"], ["fire", "flt-add"],
+                 ["settle"], ["snap", "off"]]
+        snaps = self._run(tmp_path, page, steps, strict=True)
+        # While its chunk inflates, the line says so, in Python's words
+        assert snaps["loading"]["text"]["flt-summary"] == data["text"]["loading"].format(
+            scenario=scenario)
+        snap = snaps["on"]
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0", f"dash-chunk-{cid}"]
+        assert {r["id"] for r in snap["reacts"]} == _charts_redrawn()
+        view = chunks[cid]["list"]["views"]["all"]
+        # The primary cell with adding on is its own simulation, not a slice
+        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], scenario, False, None, view["n"], view["n"], note="other_run")
+        assert snap["text"]["hdr-trades"] == str(view["n"]) == "4"
+        # The add-on list's own Kelly scatter, never the page's
+        assert _last_react(snap, "risk-kelly")["data"][0]["x"] == pytest.approx(
+            chunks[cid]["list"]["kx"])
+        assert snap["selects"]["flt-add"]["value"] == "on"
+        # A slice of it is worded with the phrase too, its counts the add-on's own
+        sports = _key(data, "Sports")
+        snap = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"],
+            ["set", "flt-cat", sports[1:]], ["fire", "flt-cat"], ["settle"],
+            ["snap", "sports"]], strict=True)["sports"]
+        views = chunks[cid]["list"]["views"]
+        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], scenario, False, "Sports", views[sports]["n"], views["all"]["n"])
+        # Off again is the page as rendered: the primary's chunk, kept, loads nothing
+        off = snaps["off"]
+        assert off["inflated"] == snap["inflated"][:0] + snaps["on"]["inflated"]
+        assert off["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], _phrase(data, 0, 1, 1), True, None, 3, 3)
+        assert off["text"]["hdr-trades"] == "3"
+
+    def test_tier_floors_off_with_adding_on_reads_the_add_on_off_grid(
+            self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on(_kc_sweep_tiers()))
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        binding, plain = data["grid_add_off"][0][1][1], data["grid_add_off"][1][1][1]
+        assert binding not in _ao_ids(data["grid_add"]) and plain in _ao_ids(data["grid_add"])
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
+            ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], ["snap", "binding"],
+            # A band the tiers never bind at: its off view is its add-on tier-on run
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "plain"]],
+            strict=True)
+        add = data["text"]["add_on"]
+        view = chunks[binding]["list"]["views"]["all"]["n"]
+        assert f"dash-chunk-{binding}" in snaps["binding"]["inflated"]
+        assert snaps["binding"]["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], _phrase_off(data, 0, 1, 1) + add, False, None, view, view,
+            note="other_run")
+        view = chunks[plain]["list"]["views"]["all"]["n"]
+        assert snaps["plain"]["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], _phrase_off(data, 1, 1, 1) + add, False, None, view, view)
+        assert f"dash-chunk-{plain}" in snaps["plain"]["inflated"]
+
+    def test_a_scenario_the_family_never_simulated_reads_missing_and_cannot_be_saved(
+            self, monkeypatch, tmp_path):
+        # A tier-floors-off view with no add-on twin: adding "on" at a band the
+        # tiers bind at is a scenario the run never simulated
+        sweep = dataclasses.replace(_kc_sweep_add_on(_kc_sweep_tiers()),
+                                    add_on_tier_off_cap_sweep=None)
+        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
+            ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], ["snap", "missing"]],
+            strict=True)
+        snap = snaps["missing"]
+        scenario = _phrase_off(data, 0, 1, 1) + data["text"]["add_on"]
+        assert snap["text"]["flt-summary"] == data["text"]["missing"].format(
+            scenario=scenario) + data["text"]["unfiltered"]
+        assert snap["buttons"]["flt-save"] is True and snap["text"]["hdr-trades"] == "0"
+
+    def test_a_chunk_that_cannot_be_loaded_puts_the_choice_back(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        cid = data["grid_add"][0][1][1]
+        add = data["text"]["add_on"]
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], ["snap", "bad"],
+            ["repair", f"dash-chunk-{cid}"],
+            ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], ["snap", "good"]],
+            strict=True, damaged=(f"dash-chunk-{cid}",))
+        bad = snaps["bad"]
+        assert bad["selects"]["flt-add"]["value"] == "off" and bad["reacts"] == []
+        # The line names the scenario that failed, in the phrase adding uses,
+        # and the one still shown
+        assert bad["text"]["flt-summary"] == data["text"]["unavailable"].format(
+            failed=_phrase(data, 0, 1, 1) + add, reason=f"Error: damaged block dash-chunk-{cid}",
+            scenario=_phrase(data, 0, 1, 1))
+        # The scenario still shown can be saved again
+        assert bad["buttons"]["flt-save"] is False
+        # Repaired, choosing it again draws it
+        good = snaps["good"]
+        assert good["selects"]["flt-add"]["value"] == "on"
+        assert good["text"]["hdr-trades"] == str(
+            chunks[cid]["list"]["views"]["all"]["n"])
+
+    def test_the_bar_s_call_to_the_explorer_keeps_its_four_arguments(
+            self, monkeypatch, tmp_path):
+        # The explorer never follows the choice: the label call carries the band,
+        # k, size cap and Tier floors choice, whatever adding says
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
+        data = TestFilterPage._data(page)
+        spy = ("window.dashScenarioSelect = function() { var el = document.getElementById("
+               "'__spy'); var seen = el.textContent ? JSON.parse(el.textContent) : []; "
+               "seen.push(Array.prototype.slice.call(arguments)); "
+               "el.textContent = JSON.stringify(seen); };")
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"],
+            ["set", "flt-add", "off"], ["fire", "flt-add"], ["settle"], ["snap", "s"]], js=spy)
+        calls = json.loads(snaps["s"]["text"]["__spy"])
+        labels = [data["bands"][0]["label"], data["ks"][1]["label"], data["caps"][1]["label"],
+                  "on"]
+        assert calls == [labels, labels]
+        js = dashboard._FILTER_JS
+        [call] = re.findall(r"window\.dashScenarioSelect\(([^;]*)\);", js)
+        assert len(re.split(r",\s*(?![^\[]*\])", call)) == 4 and "SHOWN[6]" not in call
+
+    def test_the_explorer_s_selects_never_move_on_an_add_on_change(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on(_ex_sweep_tiers()))
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["snap", "before"], ["set", "flt-add", "on"], ["fire", "flt-add"],
+            ["settle"], ["snap", "on"], ["set", "flt-add", "off"], ["fire", "flt-add"],
+            ["settle"], ["snap", "off"]], strict=True, explorer=True)
+        before, on, off = snaps["before"], snaps["on"], snaps["off"]
+        assert _scn_values(on) == _scn_values(off) == _scn_values(before)
+        for snap in (on, off):
+            assert snap["selects"]["scn-tier-select"]["value"] == "on"
+            # ... and nothing of the explorer was redrawn
+            assert _explorer_calls(snap) == []
+        assert on["selects"]["flt-add"]["value"] == "on"
+
+    # ─── The save address ─────────────────────────────────────────────────────
+
+    def test_the_address_names_the_choice_only_from_a_page_that_simulated_it(
+            self, monkeypatch, tmp_path):
+        save = TestSaveLiveDefaultsButton()
+        page = save._kc(monkeypatch, tmp_path, _kc_sweep_add_on())
+        data = TestFilterPage._data(page)
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "off"], ["set", "flt-add", "on"],
+            ["fire", "flt-add"], ["settle"], ["click", "flt-save"], ["snap", "on"]],
+            strict=True)
+        for name, chosen in (("off", "off"), ("on", "on")):
+            [opened] = snaps[name]["opened"]
+            query = save._query(data, opened)
+            save._assert_sends(data, query, 0, 1, 1)
+            assert query["add_to_held_pairs"] == chosen
+        # A page without the view sends none: the server keeps the saved value
+        bare = save._kc(monkeypatch, tmp_path)
+        bare_data = TestFilterPage._data(bare)
+        [opened] = _run_script(tmp_path, bare, [["wait"], ["click", "flt-save"], ["snap", "s"]],
+                               strict=True)["s"]["opened"]
+        query = save._query(bare_data, opened)
+        save._assert_sends(bare_data, query, *bare_data["primary"])
+        assert "add_to_held_pairs" not in query
+
+    @pytest.mark.parametrize("saved", [False, True])
+    def test_the_address_is_what_the_defaults_server_reads(self, monkeypatch, tmp_path, saved):
+        # The clicked address, handed to the server's own application and parser:
+        # the settings it reads carry the choice on screen — off explicitly at
+        # the page as rendered (so the seed's "on" does not leak in), on when
+        # chosen — whatever is saved
+        save = TestSaveLiveDefaultsButton()
+        page = save._kc(monkeypatch, tmp_path, _kc_sweep_add_on(_kc_sweep_tiers()))
+        data = TestFilterPage._data(page)
+        sports = data["categories"].index("Sports")
+        hockey = str(data["subcats"].index([sports, "Hockey"]))
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "primary"],
+            ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
+            ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"],
+            ["set", "flt-tag", hockey], ["fire", "flt-tag"], ["settle"],
+            ["click", "flt-save"], ["snap", "chosen"]], strict=True)
+        if saved:
+            save_config_live_defaults()
+        current = config.read_saved_live_defaults()
+        app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
+        pb, pk, pc = data["primary"]
+        cases = (
+            ("primary", config.LiveSettings(
+                tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+                interval_discount=data["ks"][pk]["value"],
+                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
+                add_to_held_pairs=False)),
+            ("chosen", config.LiveSettings(
+                tier_floors=False, spread_band=tuple(data["bands"][pb]["value"]),
+                interval_discount=data["ks"][0]["value"],
+                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
+                categories=("Sports",), tags=("Hockey",), add_to_held_pairs=True)),
+        )
+        for name, expected in cases:
+            [opened] = snaps[name]["opened"]
+            save._query(data, opened)
+            query = opened["url"].partition("?")[2]
+            response = app.handle(defaults_server._Request("GET", f"/confirm?{query}",
+                                                           _SAVE_HOST))
+            assert response.status == 200, response.body
+            settings, source = defaults_server._proposal(defaults_server._params(query),
+                                                         current)
+            assert settings == expected, name
+            for field in config.LIVE_TOGGLE_FIELDS:
+                assert getattr(settings, field) == getattr(expected, field), (name, field)
+            assert source == data["save"]["source"]
+
+
+class TestAddOnEndToEnd:
+    """A real run_backtest_sweep with the add-on family, over the backtester's
+    golden fixture narrowed to one band and one k, rendered through
+    generate_dashboard: every cap's add-on chunk is the scenario a fresh
+    simulation with add_to_held at that cap produces, figure for figure."""
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_a_real_add_on_sweep_pages_every_cap_at_its_own_simulation(
+            self, monkeypatch, tmp_path):
+        golden = _tb.TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        run = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), golden._START, 10_000.0, same_event_ladders=True,
+            interval_discount=0.5, band_sweep=True, cap_sweep=True, add_on_sweep=True)
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        page = dashboard.generate_dashboard(
+            run.primary.trades, run.primary.equity_df, golden._START, 10_000.0,
+            sweep=run).read_text(encoding="utf-8")
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        caps = run.add_on_cap_sweep.caps
+        assert data["add_state"] == "shown" and data["grid_add"] is not None
+        assert [c["value"] for c in data["caps"]] == list(caps) and len(caps) == 20
+        band, end = (0.0, 1.0), run.primary.equity_df["date"].iloc[-1]
+        added = 0
+        for ci, cap in enumerate(caps):
+            fresh = backtester._simulate_at_discount(
+                run.add_on_cap_sweep.entries_by_band[band], golden._START, 10_000.0, k=0.5,
+                spread_band=band, size_cap=cap, quiet=True, end_date=end, add_to_held=True)
+            view = chunks[data["grid_add"][0][0][ci]]["list"]["views"]["all"]
+            kpis = dashboard._performance_kpis(fresh.equity_df, fresh.trades, 10_000.0)
+            assert view["kpi"] == {key: value for key, _, value, _ in kpis}, cap
+            assert view["n"] == len(fresh.trades), cap
+            added += sum(t.add_on for t in fresh.trades)
+        # Not vacuous: adding made trades of its own, and the run as simulated differs
+        assert added > 0
+        assert data["grid_add"] != data["grid"]
+
+
 class TestExplorerFullGrid:
     """
     A full size-cap grid — 36 bands x 13 ks x 20 caps (9,360 scenarios, the
@@ -9416,9 +10262,22 @@ class TestFilterPageSize:
     BUDGET = int(PAGE_BYTES_MEASURED * 1.2)
     PAGE_BYTES_MEASURED_FAMILY = 1_098_598
     BUDGET_FAMILY = int(PAGE_BYTES_MEASURED_FAMILY * 1.2)
+    # The Add to held pairs view, where every band's add-on run trades yet
+    # another list (a worst case: a real run's add-on lists mostly equal the
+    # run as simulated and share its chunks): on its own it takes the page
+    # from 815,777 to 1,274,895 bytes, and beside the tier-floors-off family
+    # (whose 18 binding bands each gain an add-on twin of their own) from
+    # 1,098,598 to 1,784,261. Each budget is its measurement + 20%.
+    PAGE_BYTES_MEASURED_ADD_ON = 1_274_895
+    BUDGET_ADD_ON = int(PAGE_BYTES_MEASURED_ADD_ON * 1.2)
+    PAGE_BYTES_MEASURED_ADD_ON_FAMILY = 1_784_261
+    BUDGET_ADD_ON_FAMILY = int(PAGE_BYTES_MEASURED_ADD_ON_FAMILY * 1.2)
 
-    @pytest.mark.parametrize("family", [False, True], ids=["tier-on-only", "tier-off-family"])
-    def test_distinct_band_lists_stay_under_budget(self, monkeypatch, tmp_path, family):
+    @pytest.mark.parametrize(
+        "family, add_on", [(False, False), (True, False), (False, True), (True, True)],
+        ids=["tier-on-only", "tier-off-family", "add-on", "add-on-and-tier-off-family"])
+    def test_distinct_band_lists_stay_under_budget(self, monkeypatch, tmp_path, family,
+                                                   add_on):
         import random
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
@@ -9466,18 +10325,39 @@ class TestFilterPageSize:
         for band in binding:
             off_scenarios.append(point(1000, band, tier_floors=False))
             off_cals[band] = calibration()
+        # The add-on family: one more list per band (and per binding band with
+        # the tiers off), each a run that added a trade of its own to the
+        # band's list, over the grid's one k and the run's own cap
+        add_points, add_off_points = {}, {}
+        if add_on:
+            def added(base: SweepPoint) -> SweepPoint:
+                extra = _ao_trade(base.trades[0], event=f"KXS00-{rng.randint(0, 10**9)}")
+                trades = sorted([*base.trades, extra], key=lambda t: t.entry_date)
+                return dataclasses.replace(
+                    base, trades=trades, add_to_held=True,
+                    equity_df=backtester._build_equity_curve(trades, start, 10_000.0))
+            add_points = {(p.spread_band, 0.75, 0.2): added(p) for p in scenarios}
+            add_off_points = {(p.spread_band, 0.75, 0.2): added(p) for p in off_scenarios}
         sweep = BacktestSweep(primary=scenarios[0], points=[scenarios[0]],
                               calibration=cals[bands[0]], label_coverage=_scn_coverage(),
                               scenarios=scenarios, calibrations_by_band=cals,
                               tier_off_scenarios=off_scenarios,
                               tier_off_calibrations_by_band=off_cals)
+        if add_on:
+            def fake_family(points: dict, band_list) -> _FakeCapSweep:
+                return _FakeCapSweep(points, bands=tuple(band_list), ks=(0.75,), caps=(0.2,))
+            sweep = dataclasses.replace(
+                sweep, add_on_cap_sweep=fake_family(add_points, bands),
+                add_on_tier_off_cap_sweep=(fake_family(add_off_points, binding)
+                                           if binding else None))
         out = dashboard.generate_dashboard(
             scenarios[0].trades, scenarios[0].equity_df, start, 10_000.0, sweep=sweep,
             interval_discount=0.75, series_categories=categories)
         page = out.read_text(encoding="utf-8")
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         # Nothing collapsed: every list is its own
-        assert len(chunks) == (54 if family else 36)
+        assert len(chunks) == (54 if family else 36) + (
+            (36 + (18 if family else 0)) if add_on else 0)
         assert all(band is not None for band in data["khat"])
         if family:
             assert len(binding) == 18 and len(data["bands_off"]) == 36
@@ -9491,7 +10371,18 @@ class TestFilterPageSize:
         else:
             assert data["bands_off"] is None and data["khat_off"] is None
             assert data["grid_off"] is None
-        budget = self.BUDGET_FAMILY if family else self.BUDGET
+        if add_on:
+            # The view is on the page, and each add-on list is a chunk of its own
+            assert data["add_state"] == "shown"
+            assert len(_ao_ids(data["grid_add"])) == 36
+            assert _ao_ids(data["grid_add"]).isdisjoint(_ao_ids(data["grid"]))
+            assert (data["grid_add_off"] is not None) is family
+        else:
+            assert data["grid_add"] is None and data["grid_add_off"] is None
+        if add_on:
+            budget = self.BUDGET_ADD_ON_FAMILY if family else self.BUDGET_ADD_ON
+        else:
+            budget = self.BUDGET_FAMILY if family else self.BUDGET
         assert out.stat().st_size <= budget, f"page was {out.stat().st_size} bytes"
 
 
