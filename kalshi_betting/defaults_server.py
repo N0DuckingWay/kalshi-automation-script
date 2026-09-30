@@ -406,10 +406,14 @@ _CLEAN_EXITS = frozenset({EXIT_OK, EXIT_TIME_SERIES_SKIPPED})
 # result ({why} says how it ended). After a V2 order-mapping disproof every new
 # real-money run is a new process that would open another wrong-side position,
 # so _ATTENTION_TAIL names every way one starts: the scheduler daemon, main.py
-# by hand and this page's Confirm and trade.
+# by hand and this page's Confirm and trade. What to undo by hand is what the
+# run's CRITICAL names: a market the account held before the run (a pair it
+# added to, or an earlier trade) goes back to what it held, never to 0.
 _ATTENTION_TAIL = (" ended needing manual attention ({why}). Read its result first. If it "
-                   "reports a V2 order-mapping disproof, stop trading and flatten by hand in "
-                   "the Kalshi UI: a new real-money run would open another wrong-side "
+                   "reports a V2 order-mapping disproof, stop trading and undo by hand in "
+                   "the Kalshi UI what its CRITICAL names — flatten a market the account "
+                   "did not hold before the run, and bring one it did hold back to what it "
+                   "held: a new real-money run would open another wrong-side "
                    "position, so stop the scheduler daemon if it is running, do not run "
                    "main.py --mode prod, and do not press Confirm and trade.")
 _UNCLEAN_TAIL = " ended without a clean result ({why}). " + _CHECK_POSITIONS
@@ -1396,7 +1400,8 @@ def _read_result(folder: Path) -> _Result:
                        "pair_type": _text(trade.get("pair_type")),
                        "a": _leg(trade.get("a")), "b": _leg(trade.get("b")),
                        "cost_with_fees": _finite(trade.get("cost_with_fees")),
-                       "profit_if_won": _finite(trade.get("profit_if_won"))})
+                       "profit_if_won": _finite(trade.get("profit_if_won")),
+                       "adds_to_held": _finite(trade.get("adds_to_held"))})
     warnings = raw.get("warnings") if isinstance(raw.get("warnings"), list) else []
     dropped = _int(raw.get("warnings_dropped"))
     return _Result("ok", {
@@ -1798,6 +1803,9 @@ def _trades_html(trades: list[dict]) -> str:
     """
     Show a run's pairs as tables: needs attention, completed, would have traded, not completed.
 
+    A pair's Note is the trader's error, if any, followed by "(adds to N
+    held)" for a trade that added to a pair the account already held.
+
     Args:
         trades (list[dict]): The run result's pairs (_read_result).
 
@@ -1820,10 +1828,14 @@ def _trades_html(trades: list[dict]) -> str:
             continue
         body = []
         for t in rows:
+            # A trade that added to a held pair says how much was held there
+            note = " ".join(part for part in (
+                t["error"] or "",
+                f"(adds to {t['adds_to_held']:g} held)" if (t["adds_to_held"] or 0) > 0 else "",
+            ) if part)
             cells = (t["status"], t["pair_type"] or "—", _market_text(t["a"]),
                      _leg_text(t["a"]), _market_text(t["b"]), _leg_text(t["b"]),
-                     _money(t["cost_with_fees"]), _money(t["profit_if_won"]),
-                     t["error"] or "")
+                     _money(t["cost_with_fees"]), _money(t["profit_if_won"]), note)
             body.append("<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in cells) + "</tr>")
         parts.append(f"<h2>{html.escape(label)}</h2>\n<table>{head}{''.join(body)}</table>")
     return "\n".join(parts)

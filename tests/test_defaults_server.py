@@ -2251,7 +2251,11 @@ class TestAttention:
             assert ("The last real-money run (<a href=\"/runs/aaaaaaaaaaaaaaaa\">run "
                     "aaaaaaaaaaaaaaaa</a> of 2026-09-29 16:05 UTC) ended needing manual "
                     "attention (exit 20).") in body
-            assert "stop trading and flatten by hand in the Kalshi UI" in body
+            # What to undo by hand is what the run's CRITICAL names: a market
+            # the account held before the run goes back to what it held
+            assert ("stop trading and undo by hand in the Kalshi UI what its CRITICAL "
+                    "names — flatten a market the account did not hold before the run, "
+                    "and bring one it did hold back to what it held") in body
             # After a disproof it names every way a new real-money run starts
             assert ("a new real-money run would open another wrong-side position, so "
                     "stop the scheduler daemon if it is running, do not run main.py "
@@ -2270,10 +2274,12 @@ class TestAttention:
         assert notice.text == (
             "The last real-money run (the scheduled run of 2026-09-28 09:03, logged in "
             "kalshi_arb.log) ended needing manual attention (exit 20). Read its result "
-            "first. If it reports a V2 order-mapping disproof, stop trading and flatten by "
-            "hand in the Kalshi UI: a new real-money run would open another wrong-side "
-            "position, so stop the scheduler daemon if it is running, do not run main.py "
-            "--mode prod, and do not press Confirm and trade.")
+            "first. If it reports a V2 order-mapping disproof, stop trading and undo by hand "
+            "in the Kalshi UI what its CRITICAL names — flatten a market the account did not "
+            "hold before the run, and bring one it did hold back to what it held: a new "
+            "real-money run would open another wrong-side position, so stop the scheduler "
+            "daemon if it is running, do not run main.py --mode prod, and do not press "
+            "Confirm and trade.")
 
     def test_a_newer_clean_run_clears_it(self):
         later = "2099-06-01T00:00:00"
@@ -2672,6 +2678,25 @@ class TestRunPage:
         assert "<td>30 × YES @ 0.2100</td>" in body and "<td>30 × NO @ 0.5000</td>" in body
         assert "<td>Rain by Oct 1 (RAIN-A)</td>" in body
         assert "<td>$21.90</td>" in body and "<td>orphan</td>" in body
+
+    def test_a_trade_that_added_to_a_held_pair_says_so_in_its_note(self):
+        # The run result's adds_to_held shows in the Note cell, after any
+        # error; a trade without it keeps its Note as it was
+        _disk_run(result=_result(exit_code=0, trades=[
+            _trade("executed", adds_to_held=30.0),
+            _trade("rolled_back", error="YES leg FoK not filled", adds_to_held=30.0),
+            _trade("failed", error="killed")]))
+        body = _get(_app(), "/runs/0123456789abcdef").body
+        assert "<td>(adds to 30 held)</td>" in body
+        assert "<td>YES leg FoK not filled (adds to 30 held)</td>" in body
+        assert "<td>killed</td>" in body
+
+    @pytest.mark.parametrize("value", [True, "30", 0, -5, None])
+    def test_an_unreadable_held_count_adds_no_note(self, value):
+        # Only a number above zero is shown; anything else is left out
+        _disk_run(result=_result(exit_code=0, trades=[_trade("executed", adds_to_held=value)]))
+        body = _get(_app(), "/runs/0123456789abcdef").body
+        assert "adds to" not in body
 
     def test_the_exit_code_a_process_returned_wins_over_its_result(self):
         app = _app()

@@ -71,8 +71,10 @@ Dependencies:
     (api_error_summary, the one-line description of the error that stopped
     a run, for its result), scanner.py (market fetching, pair detection,
     resolve_held_ladders, leg_sides — the only source of truth for which
-    side each leg buys — and close_gap_bound_text, which renders that
-    close-gap bound in the same words the finders' refusal lines use),
+    side each leg buys — pair_held, which names the held pair a trade adds
+    to in the pairs table and the portfolio lines, and close_gap_bound_text,
+    which renders that close-gap bound in the same words the finders'
+    refusal lines use),
     strategy.py (trade sizing and portfolio selection), trader.py (order
     execution), and run_lock.py (the lock that lets one real-money run trade
     at a time, which main() takes before building a client). Entry point for
@@ -163,6 +165,7 @@ from .scanner import (
     get_held_tickers,
     inactive_shard_indexes,
     leg_sides,
+    pair_held,
     resolve_held_ladders,
 )
 from .strategy import compute_trade, select_portfolio
@@ -242,7 +245,10 @@ def _print_portfolio(portfolio: list, label: str) -> None:
     log an identical line (DR-17). "profit if won" is
     spec.min_payoff: the guaranteed floor for a same-title pair, and the
     profit in either winning settlement of a time-series pair (event by A, or
-    never by B) — the in-between settlement loses the whole stake.
+    never by B) — the in-between settlement loses the whole stake. A trade
+    that adds to a pair the account already holds (scanner.pair_held) ends
+    " — adds to N held", N being the contracts held on each market; every
+    other line is unchanged.
 
     Args:
         portfolio (list): List of TradeSpec objects representing the trades
@@ -257,9 +263,11 @@ def _print_portfolio(portfolio: list, label: str) -> None:
     for spec in portfolio:
         # Which side each market's leg buys — the only source of truth for sides
         side_a, side_b = leg_sides(spec.pair.pair_type)
+        # Cross-module: the held pair this trade adds to, read by type
+        held = pair_held(spec.pair)
         logging.info(
             "  [%s] %s (%s / %s) — %d× %s(A) + %d× %s(B) — "
-            "cost $%.2f incl. fees, profit if won $%.2f (%.1f%% return)",
+            "cost $%.2f incl. fees, profit if won $%.2f (%.1f%% return)%s",
             spec.pair.pair_type,
             spec.pair.canonical_title[:55],
             # DR-17: the tickers identify the trade when the title cannot —
@@ -270,6 +278,7 @@ def _print_portfolio(portfolio: list, label: str) -> None:
             spec.x, side_a.upper(), spec.y, side_b.upper(),
             spec.total_cost_with_fees, spec.min_payoff,
             spec.profit_ratio * 100,
+            f" — adds to {held.count:g} held" if held is not None else "",
         )
 
 
@@ -475,9 +484,10 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
     pair's NO leg and reporting-only for a same-title pair —
     tradeability, and, for pairs selected in the portfolio, the computed trade
     (counts in MARKET order with the side bought on each market, from
-    scanner.leg_sides), the profit if won (spec.min_payoff: a guaranteed floor
-    for same-title, the profit in either winning settlement for time-series),
-    monthly return, and Kelly fraction.
+    scanner.leg_sides, followed by "(adds to N held)" for a trade that adds
+    to a pair the account already holds), the profit if won (spec.min_payoff:
+    a guaranteed floor for same-title, the profit in either winning
+    settlement for time-series), monthly return, and Kelly fraction.
 
     Args:
         candidate_pairs (list): All CandidatePair objects returned by the
@@ -501,6 +511,10 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
             # Sides rendered next to each count, in market order (A then B)
             side_a, side_b = leg_sides(pair.pair_type)
             trade_str   = f"{spec.x}× {side_a.upper()}(A) + {spec.y}× {side_b.upper()}(B)"
+            # Cross-module: a trade adding to a held pair says how much is held
+            held = pair_held(spec.pair)
+            if held is not None:
+                trade_str += f" (adds to {held.count:g} held)"
             profit_str  = f"${spec.min_payoff:.2f}"
             monthly_str = f"{spec.monthly_profit_ratio:.2%}/mo"
             kelly_str   = f"{spec.kelly_fraction:.1%} (p={spec.kelly_p:.2f})"

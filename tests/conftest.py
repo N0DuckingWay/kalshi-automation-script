@@ -36,7 +36,8 @@ Dependencies:
     Imports kalshi_betting.historical (the three cache paths),
     kalshi_betting.treasury (its _RATES_CACHE path and _get_json),
     kalshi_betting.trader (its _WritePacer, _ORDER_WRITE_PACER,
-    _V2_NO_MAPPING_DISPROVEN and _V2_UNCHECKED_NO_LEGS), config (the toggle
+    _V2_NO_MAPPING_DISPROVEN, _V2_UNCHECKED_NO_LEGS and
+    _V2_UNCHECKED_BASELINES), config (the toggle
     constants, the order-write rate and burst, LIVE_DEFAULTS_FILE,
     live_settings and save_live_defaults, the live-run lock's
     LIVE_RUN_LOCK_FILE, LIVE_RUN_LOCK_WAIT_SECONDS and
@@ -169,21 +170,24 @@ def _fresh_order_write_pacer(monkeypatch):
 def _fresh_v2_mapping_disproof_state(monkeypatch):
     """
     Start each test with trader's disproven-mapping latch clear and no
-    unchecked NO legs on record.
+    unchecked NO legs (or their earlier holdings) on record.
 
     trader._V2_NO_MAPPING_DISPROVEN lasts for the process, and once set,
     _execute_one sends nothing for any pair. A test anywhere in the suite that
     disproves the V2 NO-leg mapping would otherwise make every later test's
     trades come back "failed" with nothing sent. trader._V2_UNCHECKED_NO_LEGS
     also lasts for the process, and a later test's disproof CRITICAL would
-    name tickers an earlier test recorded. monkeypatch puts back the values
-    from before the test, so neither can carry over in either direction.
+    name tickers an earlier test recorded, and trader._V2_UNCHECKED_BASELINES
+    (what each of those markets held before its pair) likewise. monkeypatch
+    puts back the values from before the test, so none can carry over in
+    either direction.
 
     Args:
-        monkeypatch (pytest.MonkeyPatch): Restores both afterwards.
+        monkeypatch (pytest.MonkeyPatch): Restores all three afterwards.
     """
     monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", False)
     monkeypatch.setattr(trader, "_V2_UNCHECKED_NO_LEGS", [])
+    monkeypatch.setattr(trader, "_V2_UNCHECKED_BASELINES", {})
 
 
 @pytest.fixture(scope="session", autouse=True)

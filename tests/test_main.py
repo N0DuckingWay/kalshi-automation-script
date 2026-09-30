@@ -3205,6 +3205,61 @@ class TestPairsTableOutcomeColumns:
         assert cells["nB (NO)"] == "40.00%"
 
 
+class TestAddOnMarkers:
+    """A trade that adds to a pair the account already holds says so, in
+    plain words, in the pairs table's Recommended Trade cell and on its
+    portfolio line; an ordinary trade's cell and line are unchanged."""
+
+    @staticmethod
+    def _add_on(spec) -> SimpleNamespace:
+        """
+        Make make_spec()'s pair an add-on to a held pair of 30 a side.
+
+        Args:
+            spec (SimpleNamespace): A make_spec() stub.
+
+        Returns:
+            SimpleNamespace: The same stub, its pair carrying a HeldPair.
+        """
+        spec.pair.held = scanner_mod.HeldPair(
+            sides=(("TICK-A", "yes"), ("TICK-B", "no")), count=30.0,
+            cost_dollars=18.9, account_value_dollars=1000.0)
+        return spec
+
+    @staticmethod
+    def _trade_cell(caplog, spec) -> str:
+        """
+        Render one selected row of the pairs table and return its Recommended Trade cell.
+
+        Args:
+            caplog: pytest's log capture.
+            spec (SimpleNamespace): The row's spec.
+
+        Returns:
+            str: The cell's text.
+        """
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            main.print_pairs_table([spec.pair], {id(spec.pair): spec})
+        lines = [line for line in caplog.text.splitlines() if "\u2502" in line]
+        headers = [c.strip() for c in lines[0].split("\u2502")[1:-1]]
+        values = [c.strip() for c in lines[1].split("\u2502")[1:-1]]
+        return dict(zip(headers, values, strict=True))["Recommended Trade"]
+
+    def test_the_pairs_table_names_the_held_count(self, caplog):
+        assert self._trade_cell(caplog, make_spec()) == "5× YES(A) + 5× NO(B)"
+        assert self._trade_cell(caplog, self._add_on(make_spec())) == (
+            "5× YES(A) + 5× NO(B) (adds to 30 held)")
+
+    def test_the_portfolio_line_names_the_held_count(self, caplog):
+        with caplog.at_level(logging.INFO):
+            main._print_portfolio([make_spec(), self._add_on(make_spec())], "Executing")
+        ordinary, add_on = [r.getMessage() for r in caplog.records
+                            if r.getMessage().startswith("  [")]
+        assert ordinary.endswith("(10.0% return)")
+        assert add_on == ordinary + " — adds to 30 held"
+
+
 class TestRunProdExitCodes:
     @patch("kalshi_betting.main.verify_auth")
     def test_low_balance_returns_skip_code(self, mock_verify_auth):
@@ -3889,7 +3944,7 @@ _MAKE_SPEC_TRADE = {
     "pair_type": "time_series", "title": "Test pair",
     "a": {"ticker": "TICK-A", "market": "Market A", "side": "yes", "count": 5, "price": 0.3},
     "b": {"ticker": "TICK-B", "market": "Market B", "side": "no", "count": 5, "price": 0.4},
-    "cost_with_fees": 2.3, "profit_if_won": 0.5,
+    "cost_with_fees": 2.3, "profit_if_won": 0.5, "adds_to_held": None,
 }
 
 

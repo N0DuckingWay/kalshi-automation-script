@@ -54,7 +54,7 @@ from kalshi_betting.config import (
     V2_ORDER_PATH,
 )
 from kalshi_betting.reporter import TradeResult
-from kalshi_betting.scanner import PriceRange
+from kalshi_betting.scanner import HeldPair, PriceRange
 from kalshi_betting.trader import (
     _await_transfer_settlement,
     _build_no_order_v2,
@@ -375,9 +375,28 @@ _REMEDY_DEFAULTS_SERVER = (
 )
 
 
-def assert_disproof_names_the_remedy(caplog) -> None:
-    """Assert the disproven-mapping CRITICAL says to stop trading and flatten
-    by hand in the Kalshi UI, and names no other order path."""
+# What a disproof's CRITICAL says to do with the NO leg's position when the
+# account held nothing on that market before the pair
+_FLATTEN_REMEDY = "flatten this position by hand in the Kalshi UI"
+
+
+def assert_disproof_names_the_remedy(caplog, remedy: str = _FLATTEN_REMEDY) -> None:
+    """
+    Assert the disproven-mapping CRITICAL says to stop trading and names the remedy.
+
+    The remedy is to flatten the position by hand in the Kalshi UI when the
+    account held nothing on the NO leg's market before the pair, and to bring
+    it back to what it held otherwise (trader._restore_remedy). Either way the
+    CRITICAL names no other order path.
+
+    Args:
+        caplog: pytest's log capture.
+        remedy (str): The words expected between "and" and "; there is no
+            other order path".
+
+    Raises:
+        AssertionError: When any of those words is missing.
+    """
     criticals = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
     assert len(criticals) == 1, criticals
     message = criticals[0]
@@ -390,8 +409,8 @@ def assert_disproof_names_the_remedy(caplog) -> None:
     assert _REMEDY_DEFAULTS_SERVER in message
     assert (
         f"Stop trading until this is understood ({_REMEDY_SCHEDULER_AND_MAIN}; if"
-        f" {_REMEDY_DEFAULTS_SERVER}), and flatten this position by hand in the Kalshi"
-        " UI; there is no other order path to fall back on."
+        f" {_REMEDY_DEFAULTS_SERVER}), and {remedy}; there is no other order path to"
+        " fall back on."
     ) in message
     assert "legacy" not in message.lower()
     assert "ORDER_API_VERSION" not in message
@@ -545,6 +564,8 @@ class TestNoLegExceptionDisambiguation:
         # Exactly one submission attempt for the NO leg, plus the rollback
         assert post.call_count == 2
         assert post.call_args_list[1].kwargs["body"]["reduce_only"] is True
+        # The unwind is this pair's 5, never the 15 the account now holds
+        assert post.call_args_list[1].kwargs["body"]["count"] == "5.00"
 
     def test_unattributable_delta_is_manual_review(self, post):
         # An unexplained change: manual_review, no unwind
@@ -2396,7 +2417,8 @@ class TestV2NoMappingBackstop:
         # exposure). The reading is still negative in absolute terms, so the
         # old sign test would have CONFIRMED — and latched that false
         # confirmation for the rest of the process. The delta (+5, not -5)
-        # disproves.
+        # disproves. The remedy brings the position back to -100: flattening
+        # it would close the 95 contracts the account held before this pair.
         post.side_effect = [v2_resp(5), v2_resp(5)]
         client = MagicMock(get_positions_without_preload_content=positions_seq(
             ("TICK-A", -100),        # before_no: external short
@@ -2408,7 +2430,13 @@ class TestV2NoMappingBackstop:
         assert result.status == "manual_review"
         assert "mapping disproven" in result.error
         assert any(r.levelno == logging.CRITICAL for r in caplog.records)
-        assert_disproof_names_the_remedy(caplog)
+        assert_disproof_names_the_remedy(
+            caplog,
+            "bring the position on TICK-A back to -100 by hand in the Kalshi UI — what the"
+            " account held there before this pair (an earlier trade's), not to 0",
+        )
+        critical = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert "flatten" not in critical[0]
         assert trader._V2_NO_MAPPING_CONFIRMED is False
         # YES leg was never submitted, so a false confirmation cannot have latched
         assert post.call_count == 1
@@ -3212,6 +3240,500 @@ class TestV2MappingDisproofStopsTheRun:
         monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", False)
         monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", True)
         assert trader._v2_mapping_unverified() is False
+
+
+def make_add_on_spec(
+    x: int = 10, held: float = 30.0, pair_type: str = "time_series",
+    sides: tuple | None = None,
+) -> MagicMock:
+    """
+    A spec that adds to a held pair, built on make_spec.
+
+    By default a time-series pair (NO on TICK-B, YES on TICK-A) of x contracts
+    a side, adding to a held pair of `held` contracts a side: NO held on
+    TICK-B (reads -held) and YES held on TICK-A (reads +held), exactly the
+    two legs the spec buys.
+
+    Args:
+        x (int): This pair's contracts a side.
+        held (float): The contracts held on each market.
+        pair_type (str): The spec's pair type.
+        sides (tuple | None): The held pair's (ticker, side) pairs; None holds
+            exactly what the spec buys.
+
+    Returns:
+        MagicMock: The spec, its pair carrying a real scanner.HeldPair.
+    """
+    spec = make_spec(x=x, pair_type=pair_type)
+    no_leg, yes_leg = _ordered_legs(spec)
+    if sides is None:
+        sides = ((no_leg.market.ticker, "no"), (yes_leg.market.ticker, "yes"))
+    spec.pair.held = HeldPair(
+        sides=tuple(sorted(sides)), count=held, cost_dollars=18.9,
+        account_value_dollars=1000.0,
+    )
+    return spec
+
+
+# What a time-series add-on's alerts say about the NO market's earlier holding
+_HELD_NO_NOTE = (
+    " The account held -30 on TICK-B before this pair, an earlier trade's: close"
+    " only this pair's contracts, never those."
+)
+# What they say to do with that market after a disproof
+_RESTORE_NO = (
+    "bring the position on TICK-B back to -30 by hand in the Kalshi UI — what the"
+    " account held there before this pair (an earlier trade's), not to 0"
+)
+
+
+class TestAddOnRollbacksTouchOnlyTheNewTrade:
+    """A pair that adds to a held pair (30 held a side: NO on TICK-B, YES on
+    TICK-A) and buys 10 more a side. Every unwind is this pair's 10 NO
+    contracts, reduce-only, sent only after this pair's NO fill is confirmed,
+    so the 30 held before are never closed; every alert about a position the
+    pair may have moved names that earlier holding, and a disproof says to
+    bring the position back to it, never to flatten it (that would close the
+    30 too). Every TradeResult.error is what an ordinary pair gets."""
+
+    @pytest.fixture(autouse=True)
+    def _use_v2(self, v2_mapping_confirmed, monkeypatch):
+        """The NO-leg mapping is already confirmed, and pauses take no time."""
+        monkeypatch.setattr(trader.time, "sleep", lambda s: None)
+
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
+
+    @staticmethod
+    def _criticals(caplog) -> list[str]:
+        """Every CRITICAL line logged."""
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+
+    def test_a_killed_yes_leg_unwinds_only_this_pairs_contracts(self, post, caplog):
+        post.side_effect = [v2_resp(10, 10), fok_kill_error(), v2_resp(10, 10)]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            ("TICK-B", -30), ("TICK-A", 30),
+        ))
+        with caplog.at_level(logging.INFO):
+            result = _execute_one(client, make_add_on_spec())
+        assert result.status == "rolled_back"
+        assert result.error == "YES leg FoK not filled: status=canceled"
+        # One unwind, of this pair's 10 NO contracts: the account goes from
+        # -40 back to -30, the held pair untouched
+        assert post.call_count == 3
+        unwind = post.call_args_list[2].kwargs["body"]
+        assert (unwind["ticker"], unwind["side"], unwind["count"]) == ("TICK-B", "bid", "10.00")
+        assert unwind["reduce_only"] is True
+        assert unwind["time_in_force"] == "immediate_or_cancel"
+        # No position read after the two baselines: the unwind's size is
+        # never read off the account
+        assert client.get_positions_without_preload_content.call_count == 2
+        assert self._criticals(caplog) == []
+
+    @pytest.mark.parametrize(
+        "reply, head, tail, error_tail",
+        [
+            pytest.param(
+                v2_resp(4, 10), "ROLLBACK FAILED for 'test pair' — ORPHANED POSITION:"
+                " the unwind's response reports it closed 4 of the 10 NO contracts",
+                " Manual review required. Error: _UnclassifiableV2Response:",
+                "; 6 of 10 NO contracts still open", id="partial",
+            ),
+            pytest.param(
+                ConnectionError("reset"), "ROLLBACK FAILED for 'test pair' — ORPHANED"
+                " POSITION: up to 10 NO contracts on TICK-B",
+                " Manual review required. Error: ConnectionError: reset",
+                "; rollback error: ConnectionError: reset", id="unknown",
+            ),
+            pytest.param(
+                v2_resp(0, 10), "ROLLBACK NOT FILLED (status=canceled) for 'test pair' —"
+                " ORPHANED POSITION: 10 NO contracts on TICK-B.",
+                " Manual review required.",
+                "; rollback FoK not filled: status=canceled", id="zero-fill",
+            ),
+        ],
+    )
+    def test_every_orphan_alert_names_the_earlier_holding(
+        self, post, caplog, reply, head, tail, error_tail,
+    ):
+        post.side_effect = [v2_resp(10, 10), fok_kill_error(), reply]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            ("TICK-B", -30), ("TICK-A", 30),
+        ))
+        with caplog.at_level(logging.CRITICAL):
+            result = _execute_one(client, make_add_on_spec())
+        assert result.status == "rollback_failed"
+        assert result.error.endswith(error_tail)
+        (alert,) = [line for line in self._criticals(caplog) if "ORPHANED POSITION" in line]
+        assert alert.startswith(head)
+        # The earlier holding is named just before "Manual review required"
+        assert _HELD_NO_NOTE + tail in alert
+        assert "flatten" not in alert
+        assert post.call_count == 3
+        assert post.call_args_list[2].kwargs["body"]["count"] == "10.00"
+
+    @pytest.mark.parametrize(
+        "reply", [v2_resp(4, 10), ConnectionError("reset"), v2_resp(0, 10)],
+        ids=["partial", "unknown", "zero-fill"],
+    )
+    def test_the_error_is_what_an_ordinary_pair_gets(self, post, caplog, reply):
+        # Only the alerts name the earlier holding: the result's error, which
+        # the trade log and the run result record, is unchanged
+        errors = []
+        for spec, baselines in ((make_add_on_spec(), (("TICK-B", -30), ("TICK-A", 30))),
+                                (make_spec(x=10, pair_type="time_series"), (None, None))):
+            post.reset_mock()
+            post.side_effect = [v2_resp(10, 10), fok_kill_error(), reply]
+            client = MagicMock(get_positions_without_preload_content=positions_seq(*baselines))
+            errors.append(_execute_one(client, spec).error)
+        assert errors[0] == errors[1]
+
+    def test_a_flat_start_alert_is_unchanged(self, post, caplog):
+        # An ordinary pair on markets the account did not hold gets the alert
+        # it always had, with nothing added
+        post.side_effect = [v2_resp(10, 10), fok_kill_error(), v2_resp(0, 10)]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(None, None))
+        with caplog.at_level(logging.CRITICAL):
+            _execute_one(client, make_spec(x=10, pair_type="time_series"))
+        assert self._criticals(caplog) == [
+            "ROLLBACK NOT FILLED (status=canceled) for 'test pair' — ORPHANED POSITION: 10"
+            " NO contracts on TICK-B. Manual review required."
+        ]
+
+    def test_a_disproof_names_the_holding_to_restore(self, post, caplog, monkeypatch):
+        # The first NO fill of the process moves the position +10 (the ask
+        # closed 10 held NO rather than opening 10 more): a disproof. The
+        # remedy brings TICK-B back to -30; flattening would close the 30 too
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", False)
+        post.side_effect = [v2_resp(10, 10)]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            ("TICK-B", -30), ("TICK-A", 30), ("TICK-B", -20),
+        ))
+        with caplog.at_level(logging.INFO):
+            result = _execute_one(client, make_add_on_spec())
+        assert result.status == "manual_review"
+        assert result.error == (
+            "V2 NO-leg mapping disproven: position delta 10.0 after the NO-leg fill on"
+            " TICK-B, expected -10; YES leg not submitted and NO leg not unwound"
+        )
+        assert_disproof_names_the_remedy(caplog, _RESTORE_NO)
+        assert "flatten" not in self._criticals(caplog)[0]
+        assert post.call_count == 1
+
+    def test_the_ambiguous_no_leg_stop_names_the_holding_to_restore(
+        self, post, caplog, monkeypatch,
+    ):
+        # The NO POST raises and the position moved +10, which a NO buy
+        # cannot do: the run stops, and the CRITICAL says to bring TICK-B
+        # back to -30
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", False)
+        post.side_effect = [ConnectionError("reset after the fill")]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            ("TICK-B", -30), ("TICK-A", 30), ("TICK-B", -20),
+        ))
+        with caplog.at_level(logging.CRITICAL):
+            result = _execute_one(client, make_add_on_spec())
+        assert result.status == "manual_review"
+        assert result.error == (
+            "NO leg ambiguous, delta=10.0: ConnectionError: reset after the fill;"
+            " V2 NO-leg mapping treated as disproven, rest of run stopped"
+        )
+        (stop,) = self._criticals(caplog)
+        assert (" close an unrelated holding." + _HELD_NO_NOTE
+                + " Manual review required: ConnectionError:") in stop
+        assert f"Stop the bot and {_RESTORE_NO}. To stop the bot, " in stop
+        assert "flatten" not in stop
+        assert post.call_count == 1
+        assert trader._V2_NO_MAPPING_DISPROVEN is True
+
+    def test_an_ambiguous_no_leg_that_did_not_fill_sends_nothing_more(self, post):
+        # The NO POST raises and the position reads -30 twice: no fill, so
+        # no unwind — the 30 held before are left alone
+        post.side_effect = [TimeoutError("timeout")]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            ("TICK-B", -30), ("TICK-A", 30), ("TICK-B", -30), ("TICK-B", -30),
+        ))
+        result = _execute_one(client, make_add_on_spec())
+        assert result.status == "failed"
+        assert result.error == "NO leg error: TimeoutError: timeout"
+        assert post.call_count == 1
+
+    def test_an_ambiguous_no_leg_that_filled_unwinds_only_this_pairs_contracts(self, post):
+        # The NO POST raises after the fill (-30 -> -40): the unwind is this
+        # pair's 10, bringing the account back to -30
+        post.side_effect = [TimeoutError("timeout"), v2_resp(10, 10)]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            ("TICK-B", -30), ("TICK-A", 30), ("TICK-B", -40),
+        ))
+        result = _execute_one(client, make_add_on_spec())
+        assert result.status == "rolled_back"
+        unwind = post.call_args_list[1].kwargs["body"]
+        assert (unwind["ticker"], unwind["count"], unwind["reduce_only"]) == (
+            "TICK-B", "10.00", True)
+
+    def test_an_unattributable_no_leg_names_the_earlier_holding(self, post, caplog):
+        # Mapping confirmed, so an unexplained move is an unrelated trade:
+        # manual review, nothing sent, and the alert names the holding
+        post.side_effect = [TimeoutError("timeout")]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            ("TICK-B", -30), ("TICK-A", 30), ("TICK-B", -33),
+        ))
+        with caplog.at_level(logging.CRITICAL):
+            result = _execute_one(client, make_add_on_spec())
+        assert result.status == "manual_review"
+        assert result.error == "NO leg ambiguous, delta=-3.0: TimeoutError: timeout"
+        (alert,) = self._criticals(caplog)
+        assert alert.endswith(
+            " close an unrelated holding." + _HELD_NO_NOTE
+            + " Manual review required: TimeoutError: timeout"
+        )
+        assert post.call_count == 1
+
+    def test_the_yes_leg_manual_review_names_both_holdings(self, post, caplog):
+        post.side_effect = [v2_resp(10, 10), TimeoutError("timeout")]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            ("TICK-B", -30), ("TICK-A", 30), ("TICK-A", 33),
+        ))
+        with caplog.at_level(logging.CRITICAL):
+            result = _execute_one(client, make_add_on_spec())
+        assert result.status == "manual_review"
+        assert result.error == "YES leg ambiguous, delta=3.0: YES leg error: TimeoutError: timeout"
+        (alert,) = self._criticals(caplog)
+        assert alert.endswith(
+            " real fill." + _HELD_NO_NOTE
+            + " The account held 30 on TICK-A before this pair, an earlier trade's:"
+            " close only this pair's contracts, never those."
+            " Manual review required: YES leg error: TimeoutError: timeout"
+        )
+        # The NO leg is left in place: no unwind
+        assert post.call_count == 2
+
+    @pytest.mark.parametrize("before, remedy", [
+        (-30.0, f"A human must {_RESTORE_NO}."),
+        (0.0, "A human must flatten this account position too."),
+        (None, "A human must flatten this account position too."),
+    ], ids=["held", "flat", "unknown"])
+    def test_a_fill_after_an_earlier_disproof_names_the_remedy(
+        self, caplog, monkeypatch, before, remedy,
+    ):
+        # A NO leg that filled after another pair disproved the mapping: the
+        # text is unchanged when the market was flat (or unknown), and names
+        # the holding to restore when it was not
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", True)
+        spec = make_add_on_spec()
+        with caplog.at_level(logging.CRITICAL):
+            outcome = trader._confirm_v2_no_mapping(MagicMock(), spec, _no_leg(spec), before)
+        assert outcome.status == "manual_review"
+        (alert,) = self._criticals(caplog)
+        assert alert == (
+            "V2 NO leg on TICK-B filled after the NO-leg mapping was disproven earlier in"
+            f" this run — NOT submitting the YES leg and NOT auto-unwinding. {remedy}"
+        )
+
+    def test_the_worker_crash_names_the_held_count(self, monkeypatch, caplog):
+        specs = [make_add_on_spec(), make_spec(title="ordinary")]
+        specs[1].pair.market_a.ticker = "TICK-C"
+        specs[1].pair.market_b.ticker = "TICK-D"
+
+        def boom(client, spec):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(trader, "_execute_one", boom)
+        with caplog.at_level(logging.CRITICAL):
+            results = execute_trades(MagicMock(), specs, dry_run=False)
+        assert [r.status for r in results] == ["manual_review", "manual_review"]
+        # The error, which the trade log records, is the same for both
+        assert results[0].error == results[1].error == (
+            "Unhandled exception in _execute_one: RuntimeError: boom")
+        add_on, ordinary = self._criticals(caplog)
+        assert add_on == (
+            "Unhandled exception executing 'test pair' (A=TICK-A B=TICK-B) — fill state"
+            " UNKNOWN (this pair adds to 30 held on each market: close only this pair's"
+            " contracts), manual review required: RuntimeError: boom"
+        )
+        assert ordinary == (
+            "Unhandled exception executing 'ordinary' (A=TICK-C B=TICK-D) — fill state"
+            " UNKNOWN, manual review required: RuntimeError: boom"
+        )
+
+    def test_the_disproof_names_what_an_unchecked_market_held(self, post, caplog, monkeypatch):
+        # Pair 0 adds to a held pair and goes ahead unchecked (its mapping
+        # check cannot read the account). Pair 1 then disproves the mapping,
+        # and its CRITICAL names pair 0's market with what it held before
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_CONFIRMED", False)
+        post.side_effect = [v2_resp(10, 10), v2_resp(10, 10), v2_resp(5)]
+        first = make_add_on_spec()
+        second = make_spec(title="second")
+        second.pair.market_a.ticker = "TICK-C"
+        second.pair.market_b.ticker = "TICK-D"
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            ("TICK-B", -30), ("TICK-A", 30), RuntimeError("positions down"),
+            None, None, ("TICK-C", 5),
+        ))
+        assert _execute_one(client, first).status == "executed"
+        assert trader._V2_UNCHECKED_NO_LEGS == ["TICK-B"]
+        assert trader._V2_UNCHECKED_BASELINES == {"TICK-B": -30.0}
+        with caplog.at_level(logging.CRITICAL):
+            assert _execute_one(client, second).status == "manual_review"
+        (alert,) = self._criticals(caplog)
+        # Pair 1's own market was flat, so its remedy is to flatten it
+        assert_disproof_names_the_remedy(caplog)
+        assert alert.endswith(
+            " check the positions on TICK-B (held -30 before that pair) too."
+        )
+
+    def test_an_unchecked_market_that_was_flat_is_named_bare(self):
+        # Only a holding that was not zero is recorded beside the ticker
+        trader._note_unchecked_no_leg("TICK-X", 0.0)
+        trader._note_unchecked_no_leg("TICK-Y", None)
+        trader._note_unchecked_no_leg("TICK-Z", 12.0)
+        assert trader._V2_UNCHECKED_NO_LEGS == ["TICK-X", "TICK-Y", "TICK-Z"]
+        assert trader._V2_UNCHECKED_BASELINES == {"TICK-Z": 12.0}
+        assert trader._stop_run_on_v2_mapping_disproof() == (
+            " Earlier pairs of this run went ahead after their NO-leg fill could not be"
+            " checked, so they rest on the same mapping: check the positions on TICK-X,"
+            " TICK-Y, TICK-Z (held 12 before that pair) too."
+        )
+
+
+class TestAddOnIsSentOnlyOntoItsPair:
+    """The order-time check of an add-on (_add_on_mismatch). Just before the
+    NO leg is sent, each leg must buy the side held on its market and both
+    positions must still read the held count (-30 on the market held NO, +30
+    on the market held YES); otherwise nothing is sent — no POST, no pacer
+    place — and the pair is "failed". A failed read counts as a change. An
+    ordinary pair never reaches the refusal."""
+
+    @pytest.fixture(autouse=True)
+    def _use_v2(self, v2_mapping_confirmed):
+        """The NO-leg mapping is already confirmed, as on a second trade."""
+
+    @pytest.fixture
+    def post(self, monkeypatch):
+        """Mock of signed_request_json as imported into trader's namespace."""
+        mock = MagicMock()
+        monkeypatch.setattr(trader, "signed_request_json", mock)
+        return mock
+
+    @pytest.fixture
+    def pacer(self, monkeypatch):
+        """The shared write pacer, wrapped so every place taken is counted."""
+        spy = MagicMock(wraps=trader._ORDER_WRITE_PACER)
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", spy)
+        return spy
+
+    @pytest.mark.parametrize(
+        "spec_args, baselines, reason",
+        [
+            pytest.param({}, (RuntimeError("down"), ("TICK-A", 30)),
+                         "the position on TICK-B could not be read", id="no-read-fails"),
+            pytest.param({}, (("TICK-B", -30), RuntimeError("down")),
+                         "the position on TICK-A could not be read", id="yes-read-fails"),
+            pytest.param({}, (("TICK-B", -20), ("TICK-A", 30)),
+                         "the position on TICK-B is now -20, not -30", id="no-part-closed"),
+            pytest.param({}, (("TICK-B", 30), ("TICK-A", 30)),
+                         "the position on TICK-B is now 30, not -30", id="no-flipped"),
+            pytest.param({}, (("TICK-B", -30), None),
+                         "the position on TICK-A is now 0, not 30", id="yes-closed"),
+            pytest.param({}, (("TICK-B", -30), ("TICK-A", 40)),
+                         "the position on TICK-A is now 40, not 30", id="yes-grown"),
+            # The held pair holds NO on TICK-A and YES on TICK-B: this pair
+            # would buy the other way round
+            pytest.param({"sides": (("TICK-A", "no"), ("TICK-B", "yes"))},
+                         (("TICK-B", 30), ("TICK-A", -30)),
+                         "the NO leg is on TICK-B, which is not held NO", id="other-way-round"),
+            # A held pair on other markets entirely
+            pytest.param({"sides": (("TICK-C", "yes"), ("TICK-D", "no"))},
+                         (("TICK-B", -30), ("TICK-A", 30)),
+                         "the NO leg is on TICK-B, which is not held NO", id="other-markets"),
+            # The NO side matches, the YES leg is on a market held NO too
+            pytest.param({"sides": (("TICK-A", "no"), ("TICK-B", "no"))},
+                         (("TICK-B", -30), ("TICK-A", -30)),
+                         "the YES leg is on TICK-A, which is not held YES", id="yes-side-wrong"),
+        ],
+    )
+    def test_a_changed_held_pair_sends_nothing(
+        self, post, pacer, caplog, spec_args, baselines, reason,
+    ):
+        client = MagicMock(get_positions_without_preload_content=positions_seq(*baselines))
+        with caplog.at_level(logging.WARNING):
+            result = _execute_one(client, make_add_on_spec(**spec_args))
+        assert result.status == "failed"
+        assert result.error == f"not sent: the held pair changed ({reason}); nothing submitted"
+        # Nothing sent and no pacer place taken
+        post.assert_not_called()
+        assert pacer.acquire_with_hold.call_count == 0
+        assert pacer.acquire_hedge.call_count == 0
+        assert pacer.acquire.call_count == 0
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert (f"Not sending 'test pair' (A=TICK-A B=TICK-B): it adds to a held pair, and"
+                f" {reason}; nothing submitted") in warnings
+
+    @pytest.mark.parametrize("pair_type", ["time_series", "same_title"])
+    def test_an_exact_match_is_sent_as_usual(self, post, pacer, pair_type):
+        spec = make_add_on_spec(pair_type=pair_type)
+        no_leg, yes_leg = _ordered_legs(spec)
+        post.side_effect = [v2_resp(10, 10), v2_resp(10, 10)]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            (no_leg.market.ticker, -30), (yes_leg.market.ticker, 30),
+        ))
+        result = _execute_one(client, spec)
+        assert result.status == "executed"
+        bodies = [c.kwargs["body"] for c in post.call_args_list]
+        assert [(b["ticker"], b["side"], b["count"]) for b in bodies] == [
+            (no_leg.market.ticker, "ask", "10.00"), (yes_leg.market.ticker, "bid", "10.00")]
+        # The NO leg's place, held for the YES leg
+        assert pacer.acquire_with_hold.call_count == 1
+
+    def test_an_ordinary_pair_is_never_refused(self):
+        # Not an add-on: whatever the positions read, the check has nothing
+        # to say
+        spec = make_spec(x=10, pair_type="time_series")
+        no_leg, yes_leg = _ordered_legs(spec)
+        for before in ((None, None), (-7.0, 3.0), (0.0, 0.0)):
+            assert trader._add_on_mismatch(spec, no_leg, yes_leg, *before) is None
+
+    def test_the_check_runs_after_the_disproven_latch(self, post, monkeypatch):
+        # A disproof earlier in the run stops the pair first of all: no
+        # position is read, so the add-on check never runs
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", True)
+        client = MagicMock()
+        result = _execute_one(client, make_add_on_spec())
+        assert result.status == "failed"
+        assert result.error.startswith("NO leg not sent: V2 NO-leg mapping disproven")
+        client.get_positions_without_preload_content.assert_not_called()
+        post.assert_not_called()
+
+    def test_ast_the_check_sits_between_the_baselines_and_the_no_leg(self):
+        # By the syntax tree: _execute_legs calls _add_on_mismatch once,
+        # after both baseline reads and before its first order submission,
+        # and the check reads the held pair only through scanner.pair_held
+        tree = ast.parse(textwrap.dedent(inspect.getsource(trader._execute_legs)))
+        lines: dict[str, list[int]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                lines.setdefault(node.func.id, []).append(node.lineno)
+        (check,) = lines["_add_on_mismatch"]
+        assert len(lines["_position_count"]) >= 2
+        assert sorted(lines["_position_count"])[1] < check < min(lines["_submit_order_v2"])
+        mismatch = ast.parse(textwrap.dedent(inspect.getsource(trader._add_on_mismatch)))
+        assert any(isinstance(n, ast.Call) and getattr(n.func, "id", None) == "pair_held"
+                   for n in ast.walk(mismatch))
+
+    def test_the_dry_run_line_names_the_held_count(self, caplog):
+        specs = [make_add_on_spec(), make_spec()]
+        for spec in specs:
+            spec.total_cost_with_fees = 3.78
+            spec.min_payoff = 1.50
+        with caplog.at_level(logging.INFO):
+            execute_trades(MagicMock(), specs, dry_run=True)
+        lines = [r.getMessage() for r in caplog.records if "[DRY RUN]" in r.getMessage()]
+        assert lines[0].endswith(" | adds to 30 held")
+        assert "adds to" not in lines[1]
 
 
 class TestV2IsTheOnlyOrderPath:

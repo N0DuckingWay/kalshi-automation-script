@@ -800,7 +800,9 @@ PRICE_EPSILON                 = 1e-6
 # main.py and the human-run order-path probe check it at startup, before
 # logging is configured or any request is made, and exit 2 on any other
 # value (order_api_version_error). If the V2 path misbehaves, stop trading
-# and flatten positions by hand in the Kalshi UI; there is no other path.
+# and undo by hand in the Kalshi UI what the trader's CRITICAL names (flatten
+# a market the account did not hold before the run; bring one it did hold,
+# such as a pair it added to, back to what it held); there is no other path.
 ORDER_API_VERSION             = "v2"
 
 # Full API path of the V2 create-order endpoint, including the /trade-api/v2

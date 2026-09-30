@@ -28,7 +28,7 @@ import pytest
 
 from kalshi_betting import config, reporter
 from kalshi_betting.reporter import TradeResult
-from kalshi_betting.scanner import ApiMarket, CandidatePair, leg_prices, leg_sides
+from kalshi_betting.scanner import ApiMarket, CandidatePair, HeldPair, leg_prices, leg_sides
 from kalshi_betting.strategy import TradeSpec
 
 _STATUS_COL_INDEX = 16  # 0-based index of the "Status" column in a data row tuple
@@ -244,6 +244,23 @@ class TestResultToRow:
             make_result("1", pair_type="same_title"), datetime(2026, 9, 8),
         )
         assert row[17] == "[same_title: NO A / YES B fees=$0.10] "
+
+    @pytest.mark.parametrize("pair_type, prefix", [
+        ("time_series", "[time_series: YES A / NO B nB=0.4000 fees=$0.10 adds to 30 held] "),
+        ("same_title", "[same_title: NO A / YES B fees=$0.10 adds to 30 held] "),
+    ])
+    def test_an_add_on_row_names_the_held_count(self, pair_type, prefix):
+        # A trade adding to a held pair says so inside the Notes bracket; no
+        # column is added and every other cell is as for an ordinary row
+        result = make_result("1", pair_type=pair_type, error="YES leg FoK not filled")
+        ordinary = reporter._result_to_row(result, datetime(2026, 9, 8))
+        result.spec.pair.held = HeldPair(
+            sides=(("TICK-A-1", "yes"), ("TICK-B-1", "no")), count=30.0,
+            cost_dollars=18.9, account_value_dollars=1000.0)
+        row = reporter._result_to_row(result, datetime(2026, 9, 8))
+        assert len(row) == 18
+        assert row[17] == prefix + "YES leg FoK not filled"
+        assert row[:17] == ordinary[:17]
 
     def test_trade_column_headers_are_side_neutral(self):
         headers = [h for h, _ in reporter._TRADE_COLUMNS]
@@ -560,6 +577,22 @@ class TestTradeRecord:
         path = tmp_path / "result.json"
         reporter.write_run_report(path, _run_report(trades=[record]), 0)
         assert _strict_json(path)["trades"][0]["cost_with_fees"] is None
+
+    def test_an_add_on_records_the_held_count(self, tmp_path):
+        # A trade adding to a held pair records the count held on each
+        # market; any other trade records None, and both write as JSON
+        result = make_result("H")
+        assert reporter.trade_record(result).adds_to_held is None
+        result.spec.pair.held = HeldPair(
+            sides=(("TICK-A-H", "yes"), ("TICK-B-H", "no")), count=30.0,
+            cost_dollars=18.9, account_value_dollars=1000.0)
+        record = reporter.trade_record(result)
+        assert record.adds_to_held == 30.0
+        assert dataclasses.replace(record, adds_to_held=None) == reporter.trade_record(
+            make_result("H"))
+        path = tmp_path / "result.json"
+        reporter.write_run_report(path, _run_report(trades=[record]), 0)
+        assert _strict_json(path)["trades"][0]["adds_to_held"] == 30.0
 
     def test_records_are_frozen(self):
         record = reporter.trade_record(make_result("F"))
