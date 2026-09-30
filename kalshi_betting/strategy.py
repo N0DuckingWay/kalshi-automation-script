@@ -40,8 +40,12 @@ Notes:
     TradeSpec.cash_need_cents is never below what that funding asks for, so
     the cash a portfolio select_portfolio admitted always covers every
     shard's funding together. The extra it sets aside for the orders' limit
-    prices is held on the total only: a shard topped up by a transfer holds
-    its legs' cost at the fill prices.
+    prices is held on the total only. Per shard, the funder asks for the
+    legs' cost at the fill prices and no more: it tops a short shard up to
+    that cost, it can draw a shard that pays for a transfer down to it, and
+    it leaves alone a shard holding between that cost and the limit-price
+    reserve. So any shard, not only one a transfer tops up, can hold less
+    than its legs' reserve.
 
     k and the per-pair caps come from one config.LiveSettings per call, which
     compute_trade hands to both sizing paths: a live run's, built from the
@@ -186,7 +190,7 @@ def _kelly_p(pair: CandidatePair, settings: LiveSettings) -> float:
     return _kelly_p_at(pair, pair.pA, settings.interval_discount)
 
 
-def _kelly_p_at(pair: CandidatePair, yes_leg_price: float, k: float) -> float:
+def _kelly_p_at(pair: CandidatePair, yes_leg_price: float, k: float | None) -> float:
     """
     _kelly_p with the YES leg's price supplied, for sizing at a given count.
 
@@ -196,8 +200,12 @@ def _kelly_p_at(pair: CandidatePair, yes_leg_price: float, k: float) -> float:
     Args:
         pair (CandidatePair): Supplies pair_type and pB.
         yes_leg_price (float): pA at the size being evaluated, in (0, 1).
-        k (float): The run's interval discount, in (0, 1]. Never None, which
-            would read config's constant instead.
+        k (float | None): The run's interval discount, in (0, 1]. For a
+            time-series pair it must be a number: None there would price at
+            config's constant instead of the run's k. It may be None only for
+            a same-title pair, whose p is the fixed prior and never reads k
+            (_spec_at_count passes a same-title spec's interval_discount,
+            which is None).
 
     Returns:
         float: p in (0, 1].
@@ -447,8 +455,10 @@ def _order_cash_cents(pair: CandidatePair, n: int, price_a: float, price_b: floa
     leg's cost at its fill (TradeSpec.cost_with_fees_a/_b), which is what
     trader._required_cents_by_shard asks each shard for, so the cash a
     portfolio fits into always covers every shard's funding together. The
-    headroom above the fill is held on the total cash only: a shard topped
-    up by a transfer is funded to its legs' cost at the fill.
+    headroom above the fill is held on the total cash only: the funder asks
+    each shard for its legs' cost at the fill, so a shard a transfer tops up,
+    one a transfer draws from, and one no transfer touches can each end up
+    holding less than its legs' share of this reserve.
 
     Args:
         pair (CandidatePair): Supplies pair_type (which side each leg buys) and
@@ -468,6 +478,8 @@ def _order_cash_cents(pair: CandidatePair, n: int, price_a: float, price_b: floa
         low, high = min(cap, price), max(cap, price)
         # The fee at any price the leg can fill at between the two, at its highest
         fee = fee_leg_exact(n, min(max(0.5, low), high))
+        # Rounded up to the cent by the same rounding the shard funder uses,
+        # so this leg's share is never below what its shard is asked to hold
         total += leg_cash_cents(n * high + fee)
     return total
 
@@ -718,6 +730,8 @@ def _cash_need(spec: TradeSpec) -> int:
     # Read by type, as bool is an int
     if isinstance(need, int) and not isinstance(need, bool):
         return need
+    # Whole and leg by leg through the shard funder's own rounding, so the
+    # walk never takes less than trader._required_cents_by_shard asks for
     return max(leg_cash_cents(spec.total_cost_with_fees),
                leg_cash_cents(spec.cost_with_fees_a) + leg_cash_cents(spec.cost_with_fees_b))
 
@@ -783,6 +797,8 @@ def _spec_at_count(spec: TradeSpec, n: int) -> TradeSpec | None:
         return None
     levels = _depth_levels(pair)
     if levels:
+        # Each leg priced over the first n contracts of the book, the same
+        # prefix pricing compute_trade solves its size with
         fills = prefix_fill_prices(levels, n)
         if fills is None:
             # The book holds fewer than n contracts
@@ -834,10 +850,10 @@ def _shrink_to_cash(spec: TradeSpec, available_cents: int) -> TradeSpec | None:
     from its neighbours: the sizes a book supports can have holes (a count
     below a reachable one can be unreachable at its own, lower, limits), so a
     step down at one fixed price could stop at a hole and under-size. The
-    scan prices the book once per candidate, so its cost grows with the count
-    the cash could buy: a few milliseconds at this account's size, and
-    seconds per shrunk spec on cheap legs with hundreds of thousands of
-    dollars left.
+    scan prices the book once per candidate, so its cost grows in step with
+    the count the cash could buy: small when cash is short, and large for a
+    big cash balance on cheap legs, where one shrink can try hundreds of
+    thousands of counts.
 
     Args:
         spec (TradeSpec): A spec whose cash need exceeds the cash left.
@@ -852,6 +868,8 @@ def _shrink_to_cash(spec: TradeSpec, available_cents: int) -> TradeSpec | None:
         # Nothing smaller to try
         return None
     levels = _depth_levels(spec.pair)
+    # A contract pair's cheapest possible price: the book's first level, or,
+    # with no book, the pair's own two leg prices (leg_prices maps them)
     cheapest = (levels[0][0] + levels[0][1]) if levels else sum(leg_prices(spec.pair))
     if cheapest <= 0:
         return None
