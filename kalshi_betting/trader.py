@@ -89,8 +89,10 @@ Dependencies:
     V2_FOK_KILL_ERROR_CODE, V2_FOK_KILL_HTTP_STATUS,
     V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS, V2_MAPPING_VERDICT_POLL_SECONDS,
     V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS, V2_ORDER_PATH,
-    V2_ROLLBACK_BID_PRICE_DOLLARS, V2_SELF_TRADE_PREVENTION_TYPE, LiveSettings
-    and live_settings from config.py. Called by main.py after
+    V2_ROLLBACK_BID_PRICE_DOLLARS, V2_SELF_TRADE_PREVENTION_TYPE, LiveSettings,
+    leg_cash_cents (the one rounding of a leg's cost up to the whole cent,
+    shared with strategy.select_portfolio) and live_settings from config.py.
+    Called by main.py after
     select_portfolio() picks the trades. Uses the KalshiClient built by
     auth.py.
 
@@ -194,6 +196,7 @@ from .config import (
     V2_ROLLBACK_BID_PRICE_DOLLARS,
     V2_SELF_TRADE_PREVENTION_TYPE,
     LiveSettings,
+    leg_cash_cents,
     live_settings,
 )
 from .reporter import TradeResult
@@ -1670,12 +1673,11 @@ def _required_cents_by_shard(portfolio: list) -> dict[int, int]:
             (spec.pair.market_a, spec.cost_with_fees_a),
             (spec.pair.market_b, spec.cost_with_fees_b),
         ):
-            # Ceiling, never floor: under-funding a shard by even a fraction of
-            # a cent gets the order rejected for insufficient collateral, while
-            # over-funding it by one cent costs nothing. The round() first
-            # mirrors config.fee_leg_exact — it stops binary float noise (e.g.
-            # 7.000000000000001) from claiming a whole extra cent.
-            cents = math.ceil(round(cost_dollars * 100, 6))
+            # Rounded up to the cent, never down (an order a fraction of a cent
+            # short of collateral is rejected), by the one rounding
+            # strategy.select_portfolio budgets the cash with, so a portfolio
+            # it admitted never finds its shards a cent short
+            cents = leg_cash_cents(cost_dollars)
             required[market.exchange_index] = required.get(market.exchange_index, 0) + cents
     return required
 
@@ -1991,8 +1993,8 @@ def ensure_shard_collateral(
     """
     Move collateral onto the exchange shards the selected portfolio draws from.
 
-    Kelly sizing is portfolio-wide — it runs against the SUM of every shard's
-    balance — but an order settles against its own market's shard only. This
+    Sizing is portfolio-wide — strategy.select_portfolio spends the SUM of every
+    shard's cash — but an order settles against its own market's shard only. This
     function closes that gap: it totals each shard's cash requirement from the
     legs' cost_with_fees_* (_required_cents_by_shard), plans greedy transfers
     out of surplus shards (_plan_transfers), executes them, and confirms the

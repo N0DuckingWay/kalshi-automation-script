@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import pathlib
+import random
 import re
 import sys
 import threading
@@ -44,6 +45,8 @@ from kalshi_betting.config import (
     ScheduledRun,
     fee_leg_exact,
     fee_per_pair_approx,
+    kelly_budget,
+    leg_cash_cents,
     live_settings,
     max_affordable_pairs,
     max_kelly_fraction,
@@ -706,6 +709,35 @@ class TestMaxAffordablePairs:
     def test_budget_too_small_for_one_pair(self):
         assert max_affordable_pairs(100, 0.90, 0.20) == 0
 
+    def test_cash_cents_is_keyword_only(self):
+        # A fourth positional argument cannot be read as the cash by accident
+        with pytest.raises(TypeError):
+            max_affordable_pairs(100_000, 0.50, 0.20, 5_000)
+
+    def test_the_cash_bounds_the_budget(self):
+        # $1,000 x 50% = $500 at $0.50 a pair buys 1,000 pairs; $100 of cash
+        # buys 200, and cash above the $500 share changes nothing
+        assert max_affordable_pairs(100_000, 0.50, 0.50) == 1_000
+        assert max_affordable_pairs(100_000, 0.50, 0.50, cash_cents=10_000) == 200
+        assert max_affordable_pairs(100_000, 0.50, 0.50, cash_cents=50_000) == 1_000
+        assert max_affordable_pairs(100_000, 0.50, 0.50, cash_cents=900_000) == 1_000
+        assert max_affordable_pairs(100_000, 0.50, 0.50, cash_cents=0) == 0
+
+    def test_float_identity_with_the_expression_it_replaced(self):
+        # With no cash, or cash that does not bind, the count is exactly the one
+        # int((bankroll_cents / 100.0) * fraction / price_sum) gave, float for float
+        rng = random.Random(20260929)
+        grid = [0.05 * i for i in range(1, 21)] + [round(1 - 0.8, 12), 0.19999999999999996]
+        for _ in range(20_000):
+            bankroll = rng.choice([rng.randrange(0, 10_000), rng.randrange(0, 10**9)])
+            price_sum = rng.choice([rng.uniform(0.0001, 1.9999),
+                                    round(rng.randrange(1, 200) * 0.01, 2)])
+            fraction = rng.choice([rng.random(), rng.choice(grid)])
+            old = int((bankroll / 100.0) * fraction / price_sum)
+            assert max_affordable_pairs(bankroll, price_sum, fraction) == old
+            assert max_affordable_pairs(bankroll, price_sum, fraction,
+                                        cash_cents=bankroll) == old
+
     @pytest.mark.parametrize("k, cap, st_cap", [
         (0.75, 0.20, 1.0), (0.40, 1.0, 1.0), (0.80, 1.0, 1.0), (0.60, 0.35, 1.0),
         (0.80, 1.0, 0.20), (0.40, 0.35, 0.05),
@@ -746,8 +778,54 @@ class TestMaxAffordablePairs:
             assert spec.kelly_fraction <= bound, (p.canonical_title, spec.kelly_fraction, bound)
             # ... and so the scanner's count bounds the sizer's
             assert spec.x <= max_affordable_pairs(balance, sum(leg_prices(p)), bound)
+            # ... and still does when the cash binds both the same way
+            for cash in (500, 5_000, 50_000):
+                capped = compute_trade(p, balance, settings=settings, cash_cents=cash)
+                if capped is not None:
+                    assert capped.x <= max_affordable_pairs(
+                        balance, sum(leg_prices(p)), bound, cash_cents=cash)
+                    assert capped.total_cost_with_fees <= cash / 100 + 1e-9
         # Non-vacuous for both types at every setting
         assert sized["time_series"] > 0 and sized["same_title"] > 0, sized
+
+
+class TestKellyBudget:
+    """kelly_budget is the one rule for what a trade may spend: a fraction of
+    the portfolio value, never more than the cash on hand."""
+
+    def test_a_share_of_the_bankroll(self):
+        assert kelly_budget(1_000.0, 0.20) == pytest.approx(200.0)
+
+    def test_the_cash_binds_when_it_is_smaller(self):
+        assert kelly_budget(1_000.0, 0.20, 150.0) == pytest.approx(150.0)
+        assert kelly_budget(1_000.0, 0.20, 500.0) == pytest.approx(200.0)
+        assert kelly_budget(1_000.0, 0.20, 0.0) == 0.0
+
+    def test_no_cash_returns_the_product_exactly(self):
+        # The sizer's budget before the cash existed was bankroll * fraction;
+        # with no cash the float must be that product, bit for bit
+        rng = random.Random(7)
+        for _ in range(1_000):
+            bankroll, fraction = rng.uniform(0, 1e7), rng.random()
+            assert kelly_budget(bankroll, fraction) == bankroll * fraction
+
+    def test_units_in_are_units_out(self):
+        assert kelly_budget(100_000, 0.5, 20_000) == 20_000
+
+
+class TestLegCashCents:
+    """leg_cash_cents is the one dollars -> whole cents rounding for what an
+    order leg draws, shared by the shard funder and select_portfolio."""
+
+    def test_rounds_up_to_the_cent(self):
+        assert leg_cash_cents(1.001) == 101
+        assert leg_cash_cents(1.0) == 100
+        assert leg_cash_cents(0.0) == 0
+
+    def test_float_noise_does_not_claim_a_cent(self):
+        # 0.07 * 100 is 7.000000000000001
+        assert leg_cash_cents(0.07) == 7
+        assert leg_cash_cents(0.1 + 0.2) == 30
 
 
 class TestCreateNewOutput:
@@ -1359,10 +1437,10 @@ class TestLiveRuleWarnings:
         # --size-cap 60 --interval-discount 0.4: both types reach the cap
         out = config.live_rule_warnings(_settings(interval_discount=0.4, size_cap=0.6))
         assert out == [
-            "one time-series pair may stake up to 60% of the balance, above the 20% "
-            "this check accepts",
-            "one same-title pair may stake up to 60% of the balance, above the 20% "
-            "this check accepts",
+            "one time-series pair may stake up to 60% of the portfolio value, above the "
+            "20% this check accepts",
+            "one same-title pair may stake up to 60% of the portfolio value, above the "
+            "20% this check accepts",
         ]
 
     def test_no_cap_with_a_same_title_cap_of_50_warns_for_both_types(self):
@@ -1380,7 +1458,7 @@ class TestLiveRuleWarnings:
         # 1 - 0.7996 = 0.2004: over 20%, and never printed as 20%
         (text,) = config.live_rule_warnings(_settings(interval_discount=0.7996, size_cap=1.0,
                                                      same_title_size_cap=0.2))
-        assert "up to 20.04% of the balance" in text
+        assert "up to 20.04% of the portfolio value" in text
 
     def test_k_of_one_names_the_dead_time_series_leg(self):
         (text,) = config.live_rule_warnings(_settings(interval_discount=1.0))
