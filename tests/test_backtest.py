@@ -22,6 +22,13 @@ And --no-cap-sweep: the per-trade size-cap sweep is on by default
 (cap_sweep=True), the flag threads cap_sweep=False, and the echo line names
 the setting.
 
+And the echo's "live rule=" clause: the saved live defaults' rule (with their
+origin), "none saved" with no file, "not recorded" with a refused one — a read
+of its own, never a scenario of this run and never config.py's toggles. And the
+run's last line, after the one pointing at the dashboard: how the filter bar's
+scenario becomes the live defaults (the defaults server, then the page's save
+button).
+
 Fully offline: run_backtest_sweep, generate_dashboard, both client builders
 and load_risk_free_rates are monkeypatched, so no network call, no credential
 read and no real backtest happen. PROJECT_ROOT is redirected at tmp_path and
@@ -51,6 +58,8 @@ from kalshi_betting.config import (
     time_series_spread_too_wide,
 )
 from kalshi_betting.treasury import SOURCE_API, RiskFreeRates
+
+from .conftest import save_config_live_defaults
 
 
 def _equity(final_value: float = 10_691.38) -> pd.DataFrame:
@@ -480,56 +489,84 @@ class TestCapSweepArgument:
 
 
 class TestLiveRuleEcho:
-    """The pre-fetch echo's "| live rule=..." clause names config.py's OWN
-    live time-series rule — never a backtest scenario, and never main.py's
-    per-run overrides (a separate CLI this module cannot see)."""
+    """The pre-fetch echo's "| live rule=..." clause names the saved live
+    defaults' time-series rule and where they were saved — never a backtest
+    scenario, never config.py's toggles, and never main.py's per-run overrides
+    (a separate CLI this module cannot see). With none saved it says so, and
+    with a refused file it fails soft."""
 
-    def test_the_echo_names_the_configured_rule(self, cli, monkeypatch, caplog):
-        monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", False)
-        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.1, 0.6))
+    @staticmethod
+    def _save(monkeypatch, **constants) -> config.LiveSettings:
+        """
+        Patch config's toggle constants and save them as the live defaults.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
+            **constants: config toggle constants to patch, by name.
+
+        Returns:
+            config.LiveSettings: The saved defaults as read back.
+        """
+        for name, value in constants.items():
+            monkeypatch.setattr(config, name, value)
+        save_config_live_defaults()
+        return config.read_saved_live_defaults()
+
+    def test_the_echo_names_the_saved_rule(self, cli, monkeypatch, caplog):
+        saved = self._save(monkeypatch, TIME_SERIES_TIER_FLOORS=False,
+                           TIME_SERIES_SPREAD_BAND=(0.1, 0.6))
+        # config.py's own toggles move after the save: the echo does not follow them
+        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.0, 1.0))
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         rule = config.describe_time_series_rule(False, (0.1, 0.6))
-        assert f"| live rule={rule}" in caplog.text
+        assert f"| live rule={rule} ({saved.origin})" in caplog.text
         # With no category/tag filter set, the clause is the rule alone
         assert "category/tag filter" not in caplog.text
 
     def test_the_echo_names_a_set_filter(self, cli, monkeypatch, caplog):
-        monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", True)
-        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.0, 1.0))
-        monkeypatch.setattr(config, "TRADE_CATEGORIES", ("Economics", "Sports"))
-        monkeypatch.setattr(config, "TRADE_TAGS", ("Fed",))
+        saved = self._save(monkeypatch, TIME_SERIES_TIER_FLOORS=True,
+                           TIME_SERIES_SPREAD_BAND=(0.0, 1.0),
+                           TRADE_CATEGORIES=("Economics", "Sports"), TRADE_TAGS=("Fed",))
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
-        settings = config.live_settings()
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
         assert (f"| live rule={rule}; category/tag filter "
-                f"({config.describe_trade_filter(settings)})") in caplog.text
+                f"({config.describe_trade_filter(saved)}) ({saved.origin})") in caplog.text
         assert "categories Economics, Sports; tags Fed" in caplog.text
 
     def test_a_cli_argument_never_moves_it(self, cli, monkeypatch, caplog):
         # --spread-min/--spread-max/--interval-discount name a BACKTEST
-        # scenario; the live rule clause reads config.py alone
-        monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", True)
-        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.0, 1.0))
+        # scenario; the live rule clause reads the saved defaults alone
+        saved = self._save(monkeypatch, TIME_SERIES_TIER_FLOORS=True,
+                           TIME_SERIES_SPREAD_BAND=(0.0, 1.0))
         with caplog.at_level(logging.INFO):
             _run(monkeypatch, "--spread-min", "0.3", "--spread-max", "0.6",
                  "--interval-discount", "0.62")
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
         text = caplog.text
-        assert f"| live rule={rule}" in text
+        assert f"| live rule={rule} ({saved.origin})" in text
         # The scenario clauses moved as usual, right beside the unmoved rule
         assert "k=0.620" in text and "spread band=0.3-0.6" in text
 
-    def test_it_fails_soft_on_an_invalid_config(self, cli, monkeypatch, caplog):
-        # A floor above the ceiling makes live_settings() raise: a reporting
-        # clause fails soft, while an invalid --spread-min/--spread-max pair exits
-        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.9, 0.1))
+    def test_with_none_saved_it_says_so(self, cli, monkeypatch, caplog):
+        assert not config.LIVE_DEFAULTS_FILE.exists()
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         text = caplog.text
-        assert "live rule=not recorded" in text
-        assert "config.py's live toggles do not validate" in text
+        assert "| live rule=none saved (live runs refuse to start)" in text
+        # The run still went ahead
+        assert "sweep_kwargs" in cli
+
+    def test_it_fails_soft_on_a_refused_file(self, cli, monkeypatch, caplog):
+        # A refused file makes live_defaults() raise: a reporting clause fails
+        # soft, while an invalid --spread-min/--spread-max pair exits
+        config.LIVE_DEFAULTS_FILE.write_text("not json", encoding="utf-8")
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        text = caplog.text
+        assert "live rule=not recorded — the saved live defaults are refused (" in text
+        assert str(config.LIVE_DEFAULTS_FILE) in text
         # The run still went ahead
         assert "sweep_kwargs" in cli
 
@@ -750,7 +787,8 @@ class TestSpreadValidationPrecedesLogging:
 
 
 class TestDashboardHandoff:
-    """generate_dashboard gets the whole sweep plus the RESOLVED primary k."""
+    """generate_dashboard gets the whole sweep plus the RESOLVED primary k, and
+    the run closes by saying how the page's scenario becomes the live defaults."""
 
     def test_sweep_and_primary_k_are_passed(self, cli, monkeypatch):
         _run(monkeypatch, "--interval-discount", "0.62")
@@ -776,6 +814,21 @@ class TestDashboardHandoff:
         _run(monkeypatch)
         _, kwargs = cli["dashboard"]
         assert kwargs["risk_free"] is cli["risk_free"]
+
+    def test_the_run_closes_with_how_to_save_the_live_defaults(self, cli, monkeypatch, caplog):
+        # After pointing at the page, the run says how its filter bar's
+        # scenario becomes the live defaults, or is traded: the launcher,
+        # then the page's buttons (the page itself cannot write a file)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        opened = messages.index("Open the HTML file in a browser to view the interactive "
+                                "charts.")
+        assert messages[opened + 1] == (
+            "To save the filter bar's scenario as the live defaults, or to trade: run "
+            "./start_dashboard.sh (it starts the defaults server and opens this page), then "
+            "use the filter bar's Save as live defaults… or Trade using defaults… button.")
+        assert messages[opened + 1:] == [messages[opened + 1]]
 
 
 class TestSummaryBlock:

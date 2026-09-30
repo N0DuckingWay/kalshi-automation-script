@@ -14,20 +14,34 @@ Purpose:
 Dependencies:
     No project imports. Imported by auth.py, scanner.py, strategy.py, trader.py,
     reporter.py, historical.py, backtester.py, dashboard.py, backtest.py,
-    scheduler.py, treasury.py, and main.py — plus the standalone, human-run
-    verification CLI kept deliberately outside the pipeline's import graph
-    (see CLAUDE.md's pipeline-isolation rule).
+    scheduler.py, treasury.py, run_lock.py, and main.py — plus two standalone,
+    human-run tools kept deliberately outside the pipeline's import graph: the
+    verification CLI (see CLAUDE.md's pipeline-isolation rule) and
+    defaults_server.py, the local pages that save the live defaults and start
+    live trading runs with them.
 
 Notes:
     PROJECT_ROOT is derived from __file__ so the package works correctly on any
     machine regardless of where the repo is cloned.
     The sandbox URL (demo-api.kalshi.co) requires a completely separate account
     registered at demo.kalshi.co — the production API key will return 401 there.
+    The saved live defaults (LIVE_DEFAULTS_FILE, live_defaults.json in the repo
+    root), which every live run starts from, are read and written here too:
+    read_saved_live_defaults and live_defaults read the file, and
+    save_live_defaults writes it (on defaults_server's Confirm and save, or
+    Confirm and trade). The toggle constants here are the backtest's k and
+    caps and the fallback live_settings() returns, never a live run's
+    defaults. The runs defaults_server starts keep their files under
+    LIVE_RUNS_DIR, which the server reads at call time, so tests redirect it.
 """
+import fcntl
+import json
 import math
 import numbers
+import os
 import pathlib
-from dataclasses import dataclass
+import stat
+from dataclasses import dataclass, field, fields
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO
@@ -69,19 +83,20 @@ DEV_PEM_FILE = PROJECT_ROOT / "kalshi_demo_private_key.pem"
 
 # The per-trade Kelly cap for EVERY pair, as a fraction of the balance: a
 # multiple of SIZE_CAP_STEP from 5% to 100%, where 1.0 is no cap (f* <= p <= 1).
-# Live runs read it as LiveSettings.size_cap (main.py --size-cap PCT overrides it
-# for one run); backtester binds it by value at import for its eager points. At
-# 1.0, with the shipped k and SAME_TITLE_SIZE_CAP, one live pair still stakes at
-# most 20%: a time-series pair under 1 - k (max_kelly_fraction), a same-title
-# pair under SAME_TITLE_SIZE_CAP.
+# backtester binds it by value at import for its eager points, and
+# live_settings() reads it (see "Live trading toggles" below: a live run sizes
+# at the saved live defaults' size_cap instead). At 1.0, with this file's k and
+# SAME_TITLE_SIZE_CAP, one pair still stakes at most 20%: a time-series pair
+# under 1 - k (max_kelly_fraction), a same-title pair under SAME_TITLE_SIZE_CAP.
 BUDGET_FRACTION               = 1.0
 
 # An EXTRA per-trade cap on SAME-TITLE pairs, on the same grid: a same-title
 # pair is capped at min(BUDGET_FRACTION, this), a time-series pair never reads
 # it (pair_size_cap); 1.0 adds no cap. Under a BUDGET_FRACTION of 1.0 it bounds
-# a same-title pair, whose f* reaches about 0.89 on a wide divergence. Live runs
-# read it as LiveSettings.same_title_size_cap (main.py --same-title-size-cap PCT
-# overrides it); backtester binds it by value and caps through pair_size_cap.
+# a same-title pair, whose f* reaches about 0.89 on a wide divergence.
+# backtester binds it by value and caps through pair_size_cap, and
+# live_settings() reads it; a live run caps at the saved live defaults'
+# same_title_size_cap instead.
 SAME_TITLE_SIZE_CAP           = 0.20
 
 # Defensive ceiling on strategy.compute_trade's marginal-price descent. That
@@ -415,7 +430,7 @@ TIME_SERIES_SAME_EVENT_LADDERS = True
 # face value) the Kelly fraction is <= 0 for every candidate and the strategy
 # never fires; smaller values size more aggressively. Measure it against
 # settled history with `backtest.py --interval-discount K` (overrides k for
-# that backtest run only; live runs read LiveSettings.interval_discount, which
+# that backtest run only; live runs price at the saved live defaults' k, which
 # main.py --interval-discount K overrides for one run) and
 # read the dashboard's "Interval Discount (k) Calibration" section, or the
 # calibration block in kalshi_backtest.log — see CLAUDE.md, "Interval-discount
@@ -443,55 +458,178 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 #
 # Seven live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
 # TRADE_CATEGORIES and TRADE_TAGS below; k, BUDGET_FRACTION and
-# SAME_TITLE_SIZE_CAP above); no live module reads them but through LiveSettings
-# (see there). main.py's flags override them per run; scheduler.py passes none.
-# tests/test_config.py::TestShippedLiveToggles pins the values; see CLAUDE.md:
-# "The live defaults of 2026-09-27 — decision record".
+# SAME_TITLE_SIZE_CAP above). They are NOT the live defaults: a live run starts
+# only from the saved ones (LIVE_DEFAULTS_FILE, below) and never falls back to
+# these. They are the backtest's k and caps (backtester and backtest bind them
+# by value), and what live_settings() returns: the settings a live entry point
+# falls back to when a caller hands it none, which only tests and direct
+# library calls do. No live module reads them but through LiveSettings (see
+# there). tests/test_config.py::TestShippedLiveToggles pins the values; see
+# CLAUDE.md: "The live defaults of 2026-09-27 — decision record".
 
-# Whether the live time-series entry rule applies the deadline-gap tier floors
+# Whether the time-series entry rule applies the deadline-gap tier floors
 # (MIN_PRICE_DIFF_SHORT_GAP / MIN_PRICE_DIFF_LONG_GAP): True -> pB - pA must
 # clear max(tier, band floor); False -> the band floor alone, and pB - pA must
 # still be strictly positive. The floor also sets the leg-price-sum ceiling,
 # 1 - floor; at 1.0 scanner._levels_with_edge_after_fee is the edge check
 # (residual: a book that moves after validate_pair_price can still fill within
 # the FoK caps' tick of slippage per leg, and a spec whose edge is thinner than
-# that then loses in its win cells too). main.py --tier-floors /
-# --no-tier-floors overrides it for one run.
+# that then loses in its win cells too). A live run reads the saved live
+# defaults' tier_floors instead, which main.py --tier-floors / --no-tier-floors
+# overrides for one run.
 TIME_SERIES_TIER_FLOORS = False
 
-# The live time-series spread band (floor, ceiling) on pB - pA, validated like
+# The time-series spread band (floor, ceiling) on pB - pA, validated like
 # the backtest's (0 <= floor < ceiling <= 1); (0.0, 1.0) is no band. The floor
 # is layered on the tier, or stands alone with the tier floors off. A spread
 # above the ceiling is refused at scan time (the two YES asks), in enrichment
-# (the top of the refreshed book) and before submission (a fresh book).
-# main.py --spread-min / --spread-max overrides either bound for one run.
+# (the top of the refreshed book) and before submission (a fresh book). A live
+# run reads the saved live defaults' spread_band instead, and main.py
+# --spread-min / --spread-max overrides either bound of it for one run.
 TIME_SERIES_SPREAD_BAND = (0.0, 0.5)
 
-# Kalshi categories a live pair may trade in ("Economics", ...), or None for
+# Kalshi categories a pair may trade in ("Economics", ...), or None for
 # any: a non-empty tuple of names, matched case-insensitively against market A's
 # series category as the dashboard files it (historical.series_labels). Applied
 # by main._filter_by_category, which fails CLOSED (no listing to file by: no
-# trades). main.py --category NAME (repeatable) / --any-category overrides it.
+# trades). A live run reads the saved live defaults' categories instead, which
+# main.py --category NAME (repeatable) / --any-category overrides for one run.
 TRADE_CATEGORIES: tuple[str, ...] | None = None
 
-# Kalshi tags a live pair may trade in, or None for any: matched like
+# Kalshi tags a pair may trade in, or None for any: matched like
 # TRADE_CATEGORIES against the series' FIRST tag under every category, and ANDed
 # with it (so the dashboard's category-scoped Tag option "Sports · Basketball"
-# is both filters set). main.py --tag NAME (repeatable) / --any-tag overrides it.
+# is both filters set). A live run reads the saved live defaults' tags instead,
+# which main.py --tag NAME (repeatable) / --any-tag overrides for one run.
 TRADE_TAGS: tuple[str, ...] | None = None
 
-# The size caps' grid: BUDGET_FRACTION, SAME_TITLE_SIZE_CAP and main.py's
-# --size-cap / --same-title-size-cap (in percent) must each be a multiple of it
+# The size caps' grid: BUDGET_FRACTION, SAME_TITLE_SIZE_CAP, the saved live
+# defaults' two caps and main.py's --size-cap / --same-title-size-cap (in
+# percent) must each be a multiple of it
 # from 5% to 100%; LiveSettings normalises each onto a backtester.SIZE_CAP_SWEEP
 # cell (float-equal). Same value as SAME_TITLE_MIN_PRICE_DIFF, not the same
 # constant.
 SIZE_CAP_STEP = 0.05
 
 # The largest per-pair stake (max_kelly_fraction, a fraction of the balance)
-# live_rule_warnings accepts without a WARNING; this file's values stay within
-# it. It bounds no trade and is not the per-trade cap: it only decides when a
-# live run is warned.
+# live_rule_warnings accepts without a WARNING; this file's values and
+# LIVE_DEFAULTS_SEED stay within it. It bounds no trade and is not the per-trade
+# cap: it only decides when a live run is warned.
 LIVE_EXPOSURE_WARN_FRACTION = 0.20
+
+# ── Saved live defaults ───────────────────────────────────────────────────────
+
+# The live defaults every live run starts from: one JSON record of the seven
+# live toggles, saved through defaults_server's confirmation page
+# (python3 -m kalshi_betting.defaults_server; its --seed proposes
+# LIVE_DEFAULTS_SEED for a first save). save_live_defaults writes it, on that
+# page's Confirm and save (or Confirm and trade, which saves before it runs
+# the bot), and read_saved_live_defaults / live_defaults read it. A live
+# run refuses to start without it; it never falls back to the toggle constants
+# above. main.py's flags still override it for one run. Read at call time
+# through this module's global, so tests can point it elsewhere
+# (tests/conftest.py). Operator state, like scheduler_state.json: gitignored,
+# in the checkout the scheduler runs from.
+LIVE_DEFAULTS_FILE = PROJECT_ROOT / "live_defaults.json"
+
+# The format tag the saved file carries; a file with any other is refused.
+LIVE_DEFAULTS_FORMAT = "live-defaults-v1"
+
+# The largest saved file read; its record is well under 1 KB.
+LIVE_DEFAULTS_MAX_BYTES = 65_536
+
+# LiveSettings.origin for toggles built from this module's constants.
+LIVE_DEFAULTS_FROM_CONFIG = "config.py"
+
+# The longest note the saved file may keep about what it was saved from.
+LIVE_DEFAULTS_SOURCE_MAX_CHARS = 300
+
+# The source note written when the defaults are saved from LIVE_DEFAULTS_SEED.
+LIVE_DEFAULTS_SEED_SOURCE = "seed values (config.LIVE_DEFAULTS_SEED)"
+
+# The only two note shapes defaults_server's confirmation page accepts, besides
+# no note at all: the backtest dashboard's own wording (with an optional note
+# when that run's same-event ladder switch differed from config.py's), or the
+# seed's (which the page accepts only on the seed values themselves). So a
+# crafted link cannot choose the note's words, which the confirmation page
+# shows and every later live run logs in its "Live defaults:" line. This
+# restricts the note alone: the page checks a category or tag name for form
+# only (one printable name), so a link can still put words of its own there,
+# shown on the page as a highlighted change and logged by later runs once
+# saved; a name no Kalshi series is filed under matches no pair. It is meant
+# for re.fullmatch with re.ASCII, as defaults_server applies it: re.match or
+# re.search would also accept a valid note followed by any other words, and
+# without re.ASCII its \d would also read the digits of other scripts.
+# Nothing in this module checks a note against it:
+# save_live_defaults and read_saved_live_defaults accept any note
+# live_defaults_source allows, an empty one included.
+LIVE_DEFAULTS_SOURCE_PATTERN = (
+    r"backtest dashboard for \d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}"
+    r"( \(same-event ladders (on|off), config\.py (on|off): its pairs are not "
+    r"the live bot's\))?"
+    r"|seed values \(config\.LIVE_DEFAULTS_SEED\)")
+
+# ── Defaults server ───────────────────────────────────────────────────────────
+
+# Where defaults_server.py listens: the pages that save the live defaults and
+# start live runs with them. Loopback only. Changing the port needs a new
+# dashboard, since the page's save and trade addresses are written into it when
+# it is built.
+DEFAULTS_SERVER_HOST = "127.0.0.1"
+DEFAULTS_SERVER_PORT = 8765
+
+# The longest request (path plus body) the server reads; its form is under 2 KB.
+DEFAULTS_SERVER_MAX_REQUEST_BYTES = 16_384
+
+# Seconds the server waits on a silent connection before dropping it: it
+# answers one request at a time, and a browser can hold a connection open
+# without sending anything.
+DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS = 5
+
+# How long, in milliseconds, a page of the server must be visible before a
+# mouse move or key press enables its buttons: a click aimed at another page
+# cannot land on one (the DoubleClickjacking defence).
+DEFAULTS_SERVER_CONFIRM_ARM_MS = 1000
+
+# The one dashboard file every backtest run writes (and overwrites) in
+# PROJECT_ROOT; defaults_server opens it when it starts.
+DASHBOARD_FILENAME = "backtest_dashboard.html"
+
+# How much of the dashboard file, from its start, defaults_server reads to tell
+# whether the page has the filter bar's Save and Trade buttons (it looks for
+# the Trade link's id). The bar sits in the page's opening part, before every
+# section and data block, so the first MiB holds it on any page, however large.
+DASHBOARD_MARKER_SCAN_BYTES = 1_048_576
+
+# When defaults_server finds its port taken, it asks the server already there
+# which checkout it serves (GET /checkout): how long it waits, in seconds, for
+# the connection and for each read of the answer, and the most of the answer it
+# reads (the real one is a short JSON object). The running server answers one
+# connection at a time, and a browser can leave connections to it open that
+# send nothing, each held for DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS before it
+# is dropped, so the wait leaves room for two of them ahead of the question;
+# a shorter wait would take this checkout's own busy server for a stranger.
+DEFAULTS_SERVER_CHECKOUT_TIMEOUT_SECONDS = 2 * DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS + 2
+DEFAULTS_SERVER_CHECKOUT_MAX_BYTES = 65_536
+
+# Where defaults_server keeps each live trading run it starts: one folder per
+# run, named by its UTC start time and its id, holding run.json (what the run
+# is, written before it starts), output.log (everything it prints) and
+# result.json (what main.py --result-file writes when it ends). Operator state
+# like scheduler_state.json, so gitignored. Read at call time, so tests point
+# it elsewhere (tests/conftest.py).
+LIVE_RUNS_DIR = PROJECT_ROOT / "live_runs"
+
+# How often, in seconds, the page of a run that is still going reloads itself.
+DEFAULTS_SERVER_RUN_REFRESH_SECONDS = 2
+
+# How much of a run's output.log its page shows: the last this-many lines,
+# read from at most its last this-many bytes, so a long log is never read whole.
+DEFAULTS_SERVER_RUN_LOG_TAIL_LINES = 25
+DEFAULTS_SERVER_RUN_LOG_TAIL_BYTES = 65_536
+
+# How many of the newest run folders the server's index page lists.
+DEFAULTS_SERVER_INDEX_RUNS = 10
 
 # Which side each leg of a pair buys, as (side bought on market_a, side bought
 # on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
@@ -1049,6 +1187,11 @@ SCHEDULED_RUN = ScheduledRun(weekday=0, hour=9, minute=0, timezone="America/Los_
 # weekly scheduler daemon forever.
 SCHEDULER_JOB_TIMEOUT_SECONDS = 3600
 
+# The scheduler's record of its claimed weekly slot (scheduler.py), under
+# PROJECT_ROOT: the slot, when its run started and finished, its exit code and
+# the blind-run retries spent on it.
+SCHEDULER_STATE_FILENAME = "scheduler_state.json"
+
 # A run that exits EXIT_NO_TRADEABLE_SHARDS (exchange-wide halt) is retried
 # after this many seconds, at most SCHEDULER_BLIND_MAX_RETRIES times per
 # Monday slot, so a maintenance window overlapping the 09:00 fire no longer
@@ -1089,6 +1232,45 @@ EXIT_NO_TRADEABLE_SHARDS      = 30
 # Same-title still ran, so the scheduler logs an ERROR but counts the slot as
 # done (a retry would most likely fail the same lookup).
 EXIT_TIME_SERIES_SKIPPED      = 40
+# Another live trading run on this machine held the run lock (run_lock.py), so
+# this one stopped before building a client or making any request. Only a
+# production run that sends orders takes the lock, so the scheduler counts its
+# slot as done (logging an ERROR instead of a WARNING when the holder has run
+# for over SCHEDULER_JOB_TIMEOUT_SECONDS, or its start is not recorded, and may
+# be hung).
+EXIT_RUN_IN_PROGRESS          = 50
+
+# ── Live run lock ─────────────────────────────────────────────────────────────
+
+# The file a production run that sends orders keeps locked while it runs
+# (run_lock.py). It lives in the user's home, not the checkout, so every
+# checkout and worktree trading this account shares it. Read at call time, so
+# tests point it elsewhere (tests/conftest.py).
+LIVE_RUN_LOCK_FILE = pathlib.Path.home() / ".kalshi_betting" / "live_run.lock"
+
+# How long a run keeps trying a taken lock before it stops with
+# EXIT_RUN_IN_PROGRESS, and how often it tries. This is long enough to ride out
+# a momentary check of the lock (run_lock.held — the defaults server's check
+# before it offers a real-money run), and far shorter than any run.
+LIVE_RUN_LOCK_WAIT_SECONDS = 2.0
+LIVE_RUN_LOCK_POLL_SECONDS = 0.1
+
+# ── Live run result ───────────────────────────────────────────────────────────
+
+# The "format" key of the JSON record `main.py --result-file` writes when a
+# production run ends (reporter.write_run_report), so a reader can tell this
+# layout from any later one.
+LIVE_RUN_RESULT_FORMAT = "live-run-result-v1"
+
+# The most WARNING lines a run result keeps (the rest are only counted), and
+# the most characters it keeps of each one's first line, the last of them "…"
+# when the line is cut (reporter.RunReportHandler). They keep the record small
+# enough to show on one page when a run logs a burst of retry warnings. They
+# never apply to an ERROR or CRITICAL line: those are few (at most a handful
+# per pair) and are the lines a person has to act on — a failed rollback, a
+# V2 mapping disproof naming every position to check — so each is kept whole.
+RUN_REPORT_MAX_WARNINGS = 50
+RUN_REPORT_LINE_MAX_CHARS = 500
 
 # ── API pagination ────────────────────────────────────────────────────────────
 
@@ -1382,8 +1564,9 @@ TRADER_MAX_WORKERS = 8
 # for writes the bot does not see (another client on the account, a manual
 # order). Pacing sets when a request is sent, not when it arrives, so large
 # network jitter can still bunch arrivals, and the pacer is per process, so a
-# second process writing to the account (a manual run overlapping a scheduled
-# one, a probe's transfer) paces itself separately at the full rate. A higher
+# second process writing to the account (a probe's transfer, or a run on
+# another computer; run_lock keeps two real-money runs on one machine from
+# overlapping) paces itself separately at the full rate. A higher
 # usage tier (GET /account/limits names the account's own) allows more; these
 # are safe to raise only up to that tier's write budget divided by the order
 # cost (10 tokens). The burst must be at least 2: a pair's NO leg also holds
@@ -1964,7 +2147,8 @@ def _names(value, name: str) -> tuple[str, ...] | None:
     trade-log note).
 
     Args:
-        value: The filter (TRADE_CATEGORIES / TRADE_TAGS, main.py --category / --tag).
+        value: The filter (TRADE_CATEGORIES / TRADE_TAGS, main.py --category / --tag,
+            or the saved live defaults file's "categories" / "tags").
         name (str): The field's name, for the error message.
 
     Returns:
@@ -1987,7 +2171,8 @@ def _names(value, name: str) -> tuple[str, ...] | None:
         if item.strip().casefold() == "any":
             raise ValueError(
                 f"{name} cannot hold the name {item!r} (in {value!r}): any category or "
-                "tag is None in config.py, or --any-category / --any-tag on main.py")
+                f"tag is null in {LIVE_DEFAULTS_FILE.name}, --any-category / --any-tag on "
+                "main.py, or None in config.py")
         names.append(item.strip())
     return tuple(names)
 
@@ -1997,14 +2182,16 @@ class LiveSettings:
     """
     One live run's strategy toggles, validated and normalised on construction.
 
-    One per run: main._resolve_live_settings builds it from live_settings() and
-    lays main.py's toggle flags over it with dataclasses.replace (re-running
-    __post_init__), and each run mode hands it, always as the bare name
-    `settings` (never the config.py reference beside it), to every site that
-    reads a toggle. Internal helpers REQUIRE it; a live entry point handed
-    none resolves live_settings() once (pinned by
-    tests/test_strategy.py's test_ast_live_path_reads_toggles_only_through_live_settings
-    and tests/test_main.py::TestLiveSettingsReachEverySite).
+    One per run: main._resolve_live_settings builds it from the saved live
+    defaults (live_defaults()) and lays main.py's toggle flags over it with
+    dataclasses.replace (re-running __post_init__), and each run mode hands
+    it, always as the bare name `settings` (never the `reference` beside it,
+    the saved defaults themselves), to every site that reads a toggle.
+    Internal helpers REQUIRE it; a live entry point handed none resolves
+    live_settings() once, which only tests and direct library calls rely on
+    (pinned by tests/test_strategy.py's
+    test_ast_live_path_reads_toggles_only_through_live_settings and
+    tests/test_main.py::TestLiveSettingsReachEverySite).
 
     Attributes:
         tier_floors (bool): Whether the tier floors apply; a real bool, since
@@ -2019,6 +2206,11 @@ class LiveSettings:
             grid; default 1.0 (no extra cap).
         categories (tuple[str, ...] | None): Categories to trade; None (default) for any.
         tags (tuple[str, ...] | None): Series first tags, ANDed with categories; None for any.
+        origin (str): Where these toggles' defaults were read: the saved defaults
+            file with when (and from what) it was saved, or LIVE_DEFAULTS_FROM_CONFIG
+            for toggles built from this module's constants (the default).
+            Not compared: equal toggles are equal wherever they came from, and
+            main.py's flags laid over the defaults keep it.
 
     Raises:
         ValueError: If any field is out of range or of the wrong type.
@@ -2030,6 +2222,7 @@ class LiveSettings:
     same_title_size_cap: float = 1.0
     categories: tuple[str, ...] | None = None
     tags: tuple[str, ...] | None = None
+    origin: str = field(default=LIVE_DEFAULTS_FROM_CONFIG, compare=False)
 
     def __post_init__(self) -> None:
         """
@@ -2062,22 +2255,65 @@ class LiveSettings:
                            _step_cap(self.same_title_size_cap, "same_title_size_cap"))
         object.__setattr__(self, "categories", _names(self.categories, "categories"))
         object.__setattr__(self, "tags", _names(self.tags, "tags"))
+        # One printable line: no newline, control, zero-width or text-direction
+        # character, so it prints on one log line and cannot pass for other
+        # text. Printable is not HTML-safe: a web page must still escape it
+        if not isinstance(self.origin, str) or not self.origin.strip() \
+                or not self.origin.isprintable():
+            raise ValueError(f"origin must be a printable description, got {self.origin!r}")
+
+
+# The seven toggles by field name: every LiveSettings field except origin
+LIVE_TOGGLE_FIELDS = tuple(f.name for f in fields(LiveSettings) if f.compare)
+
+# The live defaults `python3 -m kalshi_betting.defaults_server --seed` offers to
+# save, the starting values for a first save: tier floors off, spread band
+# 0-0.5, k 0.80, a 10% per-trade cap, any category or tag. One pair stakes at
+# most 10% of the balance: a time-series pair under the cap (1 - k is 0.20), a
+# same-title pair under the lower of the cap and the 20% same-title cap.
+# Nothing trades on it until it is confirmed on the confirmation page and
+# written to LIVE_DEFAULTS_FILE (save_live_defaults, with
+# LIVE_DEFAULTS_SEED_SOURCE).
+LIVE_DEFAULTS_SEED = LiveSettings(
+    tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.80,
+    size_cap=0.10, same_title_size_cap=0.20, categories=None, tags=None)
+
+
+class LiveDefaultsError(ValueError):
+    """
+    The saved live defaults cannot be used, or could not be saved.
+
+    Reading: something exists at the path but is not a regular file (a link
+    to a file that does not exist included), is unreadable, too large, not
+    UTF-8, malformed or too deeply nested, or holds a value LiveSettings
+    refuses. Saving: the source note is refused, the settings would make a
+    file the reader refuses, the write fails, or the file does not read back
+    as what was written. The message names the file. It is a ValueError, so a
+    caller handling an invalid constant also stops on it.
+    """
+
+
+class LiveDefaultsMissing(LiveDefaultsError):
+    """No live defaults are saved (LIVE_DEFAULTS_FILE does not exist)."""
 
 
 def live_settings() -> LiveSettings:
     """
-    Return the live toggles exactly as this module sets them, validated.
+    Return config.py's own seven toggle constants as LiveSettings, validated.
 
-    Read at CALL time, so a test that monkeypatches a constant ON THIS MODULE
-    takes effect (unlike the by-value TIME_SERIES_SAME_EVENT_LADDERS). Its
-    live callers: see LiveSettings.
+    Read at call time, so a test that monkeypatches a constant here takes
+    effect. It is NOT the live defaults: a live run starts only from the saved
+    ones (live_defaults()). It is what a live entry point falls back to when a
+    caller hands it no settings — tests and direct library calls only, since
+    the AST pin makes every live call path hand the run's settings — and what
+    tests save as the defaults they run under (tests/conftest.py).
 
     Returns:
-        LiveSettings: Built from this module's toggle constants.
+        LiveSettings: Built from this module's toggle constants; its origin is
+            LIVE_DEFAULTS_FROM_CONFIG.
 
     Raises:
-        ValueError: If any constant is out of range; main.py reports it as a
-            usage error (exit 2) before logging is configured.
+        ValueError: If any constant is out of range.
     """
     return LiveSettings(
         tier_floors=TIME_SERIES_TIER_FLOORS,
@@ -2088,6 +2324,406 @@ def live_settings() -> LiveSettings:
         categories=TRADE_CATEGORIES,
         tags=TRADE_TAGS,
     )
+
+
+# The saved file's top-level keys, in the order save_live_defaults writes them
+_SAVED_KEYS = ("format", "saved_at", "source", "settings")
+# How the file stamps when it was saved: UTC, to the second
+_SAVED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def live_defaults_source(source) -> str:
+    """
+    Check the note the saved live defaults keep about what they were saved from.
+
+    The note becomes part of LiveSettings.origin, so it must be short and one
+    printable line (no newline, tab, zero-width or text-direction character):
+    it then prints on one log line and cannot pass for other text. Printable
+    is not HTML-safe, so a web page that shows it must still escape it.
+
+    Args:
+        source: The note; must be a str.
+
+    Returns:
+        str: The note with surrounding spaces removed; "" (no note) is allowed.
+
+    Raises:
+        ValueError: If it is not a str, is not printable, or is longer than
+            LIVE_DEFAULTS_SOURCE_MAX_CHARS once stripped.
+    """
+    if not isinstance(source, str):
+        raise ValueError(f'"source" must be a string, got {source!r}')
+    if not source.isprintable():
+        raise ValueError(f'"source" must be one printable line, got {source!r}')
+    stripped = source.strip()
+    if len(stripped) > LIVE_DEFAULTS_SOURCE_MAX_CHARS:
+        raise ValueError(f'"source" must be at most {LIVE_DEFAULTS_SOURCE_MAX_CHARS} '
+                         f"characters, got {len(stripped)}")
+    return stripped
+
+
+def _unique_keys(pairs: list) -> dict:
+    """
+    Build a JSON object for json.loads, refusing a key given twice.
+
+    json.loads' default keeps the last of two equal keys without a word; the
+    saved defaults must say one thing only.
+
+    Args:
+        pairs (list): The object's (key, value) pairs, in file order.
+
+    Returns:
+        dict: The object.
+
+    Raises:
+        ValueError: If a key appears more than once.
+    """
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"the key {key!r} is given twice")
+        out[key] = value
+    return out
+
+
+def _no_constant(name: str):
+    """
+    Refuse NaN, Infinity and -Infinity, which json.loads would otherwise read as floats.
+
+    Args:
+        name (str): The constant's spelling in the file.
+
+    Raises:
+        ValueError: Always.
+    """
+    raise ValueError(f"{name} is not a number the saved live defaults may hold")
+
+
+def _filter_names(value, name: str) -> None:
+    """
+    Refuse a category or tag name that is not printable, before LiveSettings strips it.
+
+    A zero-width or text-direction character would make two different
+    filters look alike on every line that prints them. None and anything that
+    is not a list pass through for LiveSettings to judge.
+
+    Args:
+        value: The filter as the file holds it (null or a list of names).
+        name (str): The field's name ("categories" or "tags"), for the message.
+
+    Raises:
+        ValueError: If a name in the list is a str that is not printable.
+    """
+    if not isinstance(value, list):
+        return
+    for item in value:
+        if isinstance(item, str) and not item.isprintable():
+            raise ValueError(f'"{name}" must hold printable names, got {item!r}')
+
+
+def _saved_settings(record) -> LiveSettings:
+    """
+    Turn a parsed saved-defaults record into LiveSettings, or refuse it.
+
+    Checks what LiveSettings cannot see in JSON: the file's keys and format, the
+    save time, the source note, exactly the seven toggle names, a spread band of
+    two real numbers (LiveSettings would read a JSON true as 1) and printable
+    filter names. LiveSettings then validates every value.
+
+    Args:
+        record: What json.loads returned for the file.
+
+    Returns:
+        LiveSettings: The toggles, their origin naming the file, when it was
+            saved and (when there is one) the source note.
+
+    Raises:
+        ValueError: Naming the first rule the record breaks.
+    """
+    if not isinstance(record, dict) or set(record) != set(_SAVED_KEYS):
+        raise ValueError(f"must be one JSON object with exactly the keys {', '.join(_SAVED_KEYS)}")
+    if record["format"] != LIVE_DEFAULTS_FORMAT:
+        raise ValueError(f'"format" must be {LIVE_DEFAULTS_FORMAT!r}, got {record["format"]!r}')
+    saved_at = record["saved_at"]
+    try:
+        # Written back in the same format, it must be the same text: strptime
+        # alone would take "2026-9-7T1:2:3Z"
+        exact = datetime.strptime(saved_at, _SAVED_AT_FORMAT).strftime(_SAVED_AT_FORMAT) == saved_at
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'"saved_at" must be a UTC time like 2026-09-27T21:05:13Z, '
+                         f"got {saved_at!r}") from exc
+    if not exact:
+        raise ValueError(f'"saved_at" must be a UTC time like 2026-09-27T21:05:13Z, '
+                         f"got {saved_at!r}")
+    source = live_defaults_source(record["source"])
+    raw = record["settings"]
+    if not isinstance(raw, dict) or set(raw) != set(LIVE_TOGGLE_FIELDS):
+        raise ValueError(f'"settings" must hold exactly {", ".join(LIVE_TOGGLE_FIELDS)}')
+    band = raw["spread_band"]
+    if not (isinstance(band, list) and len(band) == 2 and all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) for x in band)):
+        raise ValueError(f'"spread_band" must be [floor, ceiling], got {band!r}')
+    for name in ("categories", "tags"):
+        _filter_names(raw[name], name)
+    origin = f"{LIVE_DEFAULTS_FILE.name}, saved {saved_at}" + (f" from {source}" if source else "")
+    return LiveSettings(**{**raw, "spread_band": tuple(band)}, origin=origin)
+
+
+def _settings_from_bytes(data: bytes) -> LiveSettings:
+    """
+    Parse a saved live defaults file's bytes into LiveSettings, or refuse them.
+
+    The one parse read_saved_live_defaults applies to the file on disk and
+    save_live_defaults applies to the text it is about to write, so a save
+    can never put in place a file the reader refuses.
+
+    Args:
+        data (bytes): The file's bytes.
+
+    Returns:
+        LiveSettings: The toggles, their origin naming the file, when it was
+            saved and (when there is one) the source note.
+
+    Raises:
+        ValueError: The bytes are over LIVE_DEFAULTS_MAX_BYTES, are not UTF-8
+            or not JSON (UnicodeDecodeError and JSONDecodeError are
+            ValueErrors), hold a repeated key or NaN / Infinity, or break a
+            rule of _saved_settings or LiveSettings.
+        TypeError: A value's type trips a check that raises TypeError rather
+            than ValueError; both callers treat it as a refusal.
+        RecursionError: The document is nested too deeply to parse.
+    """
+    if len(data) > LIVE_DEFAULTS_MAX_BYTES:
+        raise ValueError(f"over {LIVE_DEFAULTS_MAX_BYTES} bytes")
+    record = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_keys,
+                        parse_constant=_no_constant)
+    return _saved_settings(record)
+
+
+def read_saved_live_defaults() -> LiveSettings | None:
+    """
+    Read the saved live defaults (LIVE_DEFAULTS_FILE), or None when none are saved.
+
+    live_defaults reads through it; scheduler._check_live_defaults and
+    defaults_server._current_defaults call it directly.
+
+    Strict, because a live run trades what it returns. The file is one JSON
+    object with these keys:
+    - "format": LIVE_DEFAULTS_FORMAT;
+    - "saved_at": UTC, e.g. 2026-09-27T21:05:13Z;
+    - "source": a note (live_defaults_source's rules);
+    - "settings": the seven toggles by LiveSettings field name. tier_floors is
+      true/false, spread_band is [floor, ceiling], interval_discount, size_cap
+      and same_title_size_cap are numbers (the caps as fractions), and
+      categories and tags are null (any) or a list of names.
+
+    Refused on top of that: a repeated key, NaN or Infinity, a file over
+    LIVE_DEFAULTS_MAX_BYTES, any value LiveSettings rejects, and anything at
+    the path that is not a regular file (a directory or a FIFO, say, which is
+    refused without waiting on it, or a link to a file that does not exist).
+    A link to a regular file is read through.
+
+    Returns:
+        LiveSettings | None: The toggles, their origin naming the file and when
+            they were saved; None when nothing is at the path.
+
+    Raises:
+        LiveDefaultsError: Something exists at the path but breaks a rule
+            above; the message names the file.
+    """
+    path = LIVE_DEFAULTS_FILE
+    try:
+        # O_NONBLOCK: a FIFO (named pipe) at the path opens at once instead of
+        # waiting for a writer, and is refused below; a regular file reads as usual
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError as exc:
+        # A link whose target does not exist is something at the path, so it
+        # is refused rather than read as "no defaults saved yet"
+        if os.path.islink(path):
+            raise LiveDefaultsError(
+                f"{path}: cannot be read (a link to a file that does not exist)") from exc
+        return None
+    except OSError as exc:
+        raise LiveDefaultsError(f"{path}: cannot be read ({exc})") from exc
+    try:
+        # A directory, FIFO or device at the path is not a saved file
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise LiveDefaultsError(f"{path}: cannot be read (not a regular file)")
+        with os.fdopen(fd, "rb") as handle:
+            # The file object now owns the descriptor and closes it
+            fd = None
+            data = handle.read(LIVE_DEFAULTS_MAX_BYTES + 1)
+    except OSError as exc:
+        raise LiveDefaultsError(f"{path}: cannot be read ({exc})") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+    try:
+        return _settings_from_bytes(data)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise LiveDefaultsError(f"{path}: {exc}") from exc
+
+
+def live_defaults() -> LiveSettings:
+    """
+    Return the live defaults a live run starts from: the saved ones, which must exist.
+
+    main._resolve_live_settings is its one live caller, so a live run never
+    falls back to this module's constants; the backtest's report
+    (backtester._live_settings_for_report) and backtest.py's pre-fetch echo
+    also read it, failing soft. With no file saved it raises, naming the two
+    ways to save one.
+
+    Returns:
+        LiveSettings: The saved defaults (read_saved_live_defaults).
+
+    Raises:
+        LiveDefaultsMissing: No file is saved; the message names the file and
+            the two ways to create it.
+        LiveDefaultsError: The file is refused.
+    """
+    saved = read_saved_live_defaults()
+    if saved is None:
+        raise LiveDefaultsMissing(
+            f"no live defaults are saved at {LIVE_DEFAULTS_FILE}: save them from the backtest "
+            "dashboard's \"Save as live defaults…\" button (with ./start_dashboard.sh "
+            "running), or start from the seed values with ./start_dashboard.sh --seed (or "
+            "python3 -m kalshi_betting.defaults_server --seed) (live runs never fall back to "
+            "config.py's toggles)")
+    return saved
+
+
+def _sync_directory(directory: Path) -> None:
+    """
+    Flush a directory's entries (a rename just made in it) to disk.
+
+    Uses F_FULLFSYNC where the platform has it (macOS, whose plain fsync does
+    not flush the drive's own cache), and plain fsync otherwise or when the
+    filesystem refuses F_FULLFSYNC.
+
+    Args:
+        directory (Path): The directory to flush.
+
+    Raises:
+        OSError: If the directory cannot be opened or flushed.
+    """
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        full_sync = getattr(fcntl, "F_FULLFSYNC", None)
+        if full_sync is not None:
+            try:
+                fcntl.fcntl(fd, full_sync)
+                return
+            except OSError:
+                # Some filesystems (network or FAT volumes) refuse it: fall
+                # back to fsync below
+                pass
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _saved_text(record: dict) -> str:
+    """
+    Render a saved-defaults record as the file's text.
+
+    Valid JSON, laid out for a person to read: one key per line, and each
+    toggle's value (the spread band and any names too) on its own key's line.
+
+    Args:
+        record (dict): The record, with _SAVED_KEYS in that order and
+            "settings" holding the seven toggles as JSON values.
+
+    Returns:
+        str: The text, ending in a newline.
+
+    Raises:
+        ValueError: If a value is NaN or infinite (never true of a LiveSettings').
+    """
+    # json.dumps prints each value (a list included) on one line
+    toggles = ",\n".join(f"    {json.dumps(name)}: {json.dumps(v, allow_nan=False)}"
+                         for name, v in record["settings"].items())
+    top = [f"  {json.dumps(key)}: {json.dumps(record[key], allow_nan=False)}"
+           for key in _SAVED_KEYS if key != "settings"]
+    top.append(f'  "settings": {{\n{toggles}\n  }}')
+    return "{\n" + ",\n".join(top) + "\n}\n"
+
+
+def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
+    """
+    Write settings as the saved live defaults, and return them as read back.
+
+    Its one caller outside the tests is defaults_server's
+    _App._post_confirm, on Confirm and save and on Confirm and trade. The
+    record's text is first parsed exactly as read_saved_live_defaults
+    will parse it, and must equal settings, so a file the reader would refuse
+    is never written. It is then written next to the file under a name holding
+    this process id, flushed, and renamed over the file, so a reader at the
+    same moment sees the old file or the new one, never part of one. The
+    directory is flushed too, so the rename survives a power cut. The file is
+    then read back from disk and must equal settings (the seven toggles;
+    origin is not compared).
+
+    Args:
+        settings (LiveSettings): The new defaults.
+        source (str): What they were saved from (live_defaults_source's rules).
+
+    Returns:
+        LiveSettings: The saved defaults as read back (origin names the file).
+
+    Raises:
+        LiveDefaultsError: source is refused, or settings would make a file
+            read_saved_live_defaults refuses or reads differently (nothing is
+            written in either case); the write fails; or the file on disk does
+            not read back as settings.
+    """
+    path = LIVE_DEFAULTS_FILE
+    try:
+        source = live_defaults_source(source)
+    except ValueError as exc:
+        raise LiveDefaultsError(f"{path}: not saved: {exc}") from exc
+    values = {name: getattr(settings, name) for name in LIVE_TOGGLE_FIELDS}
+    record = {
+        "format": LIVE_DEFAULTS_FORMAT,
+        "saved_at": datetime.now(UTC).strftime(_SAVED_AT_FORMAT),
+        "source": source,
+        # JSON has no tuples: the band and any names as lists
+        "settings": {k: list(v) if isinstance(v, tuple) else v for k, v in values.items()},
+    }
+    # Parse the text exactly as the reader will before anything is written:
+    # LiveSettings takes some values the file's rules refuse (a name that is
+    # not printable, a filter too long for LIVE_DEFAULTS_MAX_BYTES), and such a
+    # file must never replace the one in place
+    try:
+        text = _saved_text(record)
+        staged = _settings_from_bytes(text.encode("utf-8"))
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise LiveDefaultsError(f"{path}: not saved: {exc}") from exc
+    if staged != settings:
+        raise LiveDefaultsError(
+            f"{path}: not saved: it would read back as {staged!r}, not the settings given")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    replaced = False
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        replaced = True
+        _sync_directory(path.parent)
+    except OSError as exc:
+        if replaced:
+            raise LiveDefaultsError(
+                f"{path}: written, but its directory could not be flushed to disk ({exc}), "
+                "so a power cut could still undo the save") from exc
+        raise LiveDefaultsError(f"{path}: could not be written ({exc})") from exc
+    finally:
+        tmp.unlink(missing_ok=True)
+    saved = read_saved_live_defaults()
+    if saved != settings:
+        raise LiveDefaultsError(f"{path}: read back as {saved!r}, not the settings written")
+    return saved
 
 
 def live_time_series_floor(gap_days: int, settings: LiveSettings) -> float:
@@ -2308,6 +2944,21 @@ def _names_text(names: tuple[str, ...] | None) -> str:
     return ", ".join(names)
 
 
+# Every live toggle as the "Live settings:" line (describe_live_settings) and
+# the comparison of two sets of defaults (live_settings_changes) name it:
+# (label, field, renderer), each exact where a short form would print two
+# values alike.
+_LIVE_SETTING_FIELDS = (
+    ("tier floors", "tier_floors", lambda v: "on" if v else "off"),
+    ("spread band", "spread_band", _band_text),
+    ("k", "interval_discount", repr),
+    ("per-trade cap", "size_cap", lambda v: _cap_text(v, "no cap")),
+    ("same-title cap", "same_title_size_cap", lambda v: _cap_text(v, "no extra cap")),
+    ("categories", "categories", _names_text),
+    ("tags", "tags", _names_text),
+)
+
+
 def describe_trade_filter(settings: LiveSettings) -> str:
     """
     Name a run's category/tag filter, as describe_live_settings renders it.
@@ -2329,7 +2980,7 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
     Name every live toggle on one line, marking each that departs from reference.
 
     main._log_live_settings logs it on every live run and main._run_prod hands
-    it to the prod trade log's separator row, both against config.py's
+    it to the prod trade log's separator row, both against the run's reference
     toggles. A field departs when its RAW value differs, and every renderer is
     exact where a short form would print two values alike. The same-title cap
     reads "100% (no extra cap)" at 1.0: the per-trade cap still applies.
@@ -2342,25 +2993,87 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
     Returns:
         str: e.g. "tier floors off | spread band 0-0.5 | k 0.8 | per-trade cap
             100% (no cap) | same-title cap 20% | categories any | tags any",
-            with " (config: X)" after each field that differs from reference's.
+            with " (default: X)" after each field that differs from reference's
+            when reference is the saved live defaults (its origin is anything
+            but LIVE_DEFAULTS_FROM_CONFIG), " (config: X)" when it was built
+            from config.py's constants.
     """
-    fields = (
-        ("tier floors", "tier_floors", lambda v: "on" if v else "off"),
-        ("spread band", "spread_band", _band_text),
-        ("k", "interval_discount", repr),
-        ("per-trade cap", "size_cap", lambda v: _cap_text(v, "no cap")),
-        ("same-title cap", "same_title_size_cap", lambda v: _cap_text(v, "no extra cap")),
-        ("categories", "categories", _names_text),
-        ("tags", "tags", _names_text),
-    )
+    # The mark names what the reference is: the saved defaults, or config.py
+    mark = ("config" if reference is None or reference.origin == LIVE_DEFAULTS_FROM_CONFIG
+            else "default")
     parts = []
-    for label, name, render in fields:
+    for label, name, render in _LIVE_SETTING_FIELDS:
         value = getattr(settings, name)
         text = f"{label} {render(value)}"
         if reference is not None and getattr(reference, name) != value:
-            text += f" (config: {render(getattr(reference, name))})"
+            text += f" ({mark}: {render(getattr(reference, name))})"
         parts.append(text)
     return " | ".join(parts)
+
+
+def live_settings_changes(current: LiveSettings | None,
+                          proposed: LiveSettings) -> list[tuple[str, str, str, bool]]:
+    """
+    Compare the live defaults in force with proposed ones, toggle by toggle.
+
+    For a page that asks before new defaults are saved: in the "Live settings:"
+    line's order and words (_LIVE_SETTING_FIELDS), and, like that line's marks,
+    a toggle changes when its RAW value differs.
+
+    Args:
+        current (LiveSettings | None): The saved defaults, or None when none are saved.
+        proposed (LiveSettings): What a save would write.
+
+    Returns:
+        list[tuple[str, str, str, bool]]: (label, current value, proposed value,
+            changed), one per toggle. With no current defaults, every current
+            value is "—" and every row is changed.
+    """
+    rows = []
+    for label, name, render in _LIVE_SETTING_FIELDS:
+        new = getattr(proposed, name)
+        if current is None:
+            rows.append((label, "—", render(new), True))
+        else:
+            old = getattr(current, name)
+            rows.append((label, render(old), render(new), old != new))
+    return rows
+
+
+def live_settings_argv(settings: LiveSettings) -> list[str]:
+    """
+    Spell a run's settings as main.py's toggle flags, all seven of them.
+
+    A program that starts main.py with these flags gets a run that trades
+    exactly these settings, whatever the saved live defaults say:
+    main._resolve_live_settings lays every flag over the saved defaults and
+    gets back settings equal to these (tests/test_main.py checks the round
+    trip). Caps are written as whole percents, which LiveSettings' 5% grid
+    makes exact. The other numbers are written as their repr, which float()
+    reads back exactly. Each category or tag is written as --category=NAME or
+    --tag=NAME, so a name that begins with "-" still reads as a name; no
+    filter is written as --any-category or --any-tag.
+
+    Args:
+        settings (LiveSettings): The settings to spell.
+
+    Returns:
+        list[str]: The flags, in the order main.py lists them: the tier-floor
+            switch, --spread-min, --spread-max, --interval-discount,
+            --size-cap, --same-title-size-cap, then the category flags and the
+            tag flags.
+    """
+    argv = ["--tier-floors" if settings.tier_floors else "--no-tier-floors",
+            f"--spread-min={settings.spread_band[0]!r}",
+            f"--spread-max={settings.spread_band[1]!r}",
+            f"--interval-discount={settings.interval_discount!r}",
+            f"--size-cap={round(settings.size_cap * 100)}",
+            f"--same-title-size-cap={round(settings.same_title_size_cap * 100)}"]
+    argv += ([f"--category={name}" for name in settings.categories]
+             if settings.categories is not None else ["--any-category"])
+    argv += ([f"--tag={name}" for name in settings.tags]
+             if settings.tags is not None else ["--any-tag"])
+    return argv
 
 
 def live_rule_warnings(settings: LiveSettings) -> list[str]:

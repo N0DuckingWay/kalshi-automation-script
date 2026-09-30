@@ -14,6 +14,8 @@ Purpose:
     import. It also describes failed requests: api_error_payload() reads the
     error details Kalshi sends back, and api_error_summary() turns a failed
     request into one short line of text for trader.py and scanner.py to log.
+    main.py records one the same way: the exception that stopped a production
+    run started with --result-file, in that run's result.
 
 Dependencies:
     No project imports — this module is a leaf so auth.py, scanner.py,
@@ -304,6 +306,8 @@ def api_error_summary(exc: BaseException, limit: int = _ERROR_SUMMARY_MAX_CHARS)
     this way, and scanner.py failed order-book reads, instead of the
     exception's own text, which runs over several lines and lists every
     response header.
+    main.py records the exception that stopped a production run this way
+    too, in the result that --result-file writes.
 
     Args:
         exc (BaseException): The exception to describe.

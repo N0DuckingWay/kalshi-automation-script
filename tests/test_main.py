@@ -19,16 +19,37 @@ Purpose:
     subprocess, see scheduler.run_job) can distinguish a clean run from a
     low-balance skip or a run whose trades need manual review.
 
-    On the live toggles: TestLiveSettingsFlags, TestLogLiveSettings and
+    On the live toggles: a live run starts only from the saved live defaults
+    (config.LIVE_DEFAULTS_FILE, each test's own tmp_path under conftest's
+    _isolate_live_defaults). TestLiveDefaultsRequired pins that it exits 2
+    with none saved or a refused file; TestSavedLiveDefaults that it reads
+    them once and names them. TestLiveSettingsFlags, TestLogLiveSettings and
     TestLiveSettingsReachEverySite (the runtime half of test_strategy.py's
-    live-toggle AST pin) run under pinned_config_toggles; TestCategoryFilter
-    covers main._filter_by_category.
+    live-toggle AST pin) run under pinned_config_toggles, which pins config's
+    toggles and saves them as the test's live defaults; every other test that
+    runs main.main() saves config.py's toggles first (conftest's
+    saved_live_defaults). TestCategoryFilter covers main._filter_by_category.
+
+    On the live-run lock: TestRunLock pins that a production run that sends
+    orders holds run_lock's machine-wide lock from before it builds a client
+    until main() ends, and stops with EXIT_RUN_IN_PROGRESS when another run
+    holds it; dry runs and dev runs neither take it nor wait for it.
+    tests/conftest.py's _isolate_live_runs points the lock at each test's own
+    tmp_path, so every production run here takes a lock of its own.
+
+    On the run result: TestResultFile runs main() with --result-file PATH
+    (in each test's tmp_path) down every way a production run ends and reads
+    the JSON back; TestLiveSettingsArgv pins config.live_settings_argv's round
+    trip through main._build_parser and _resolve_live_settings. Every stand-in
+    for _run_prod takes the keyword report=None, since main() passes one to
+    a production run.
 
 Dependencies:
     Imports _run_dev/_run_prod and the pure helpers from kalshi_betting.main,
     plus config constants asserted against and conftest's
-    apply_pre_toggle_defaults; for the category/tag filter, historical,
-    dashboard and backtester.BacktestTrade. The live-shape replays mock all
+    apply_pre_toggle_defaults and save_config_live_defaults; for the
+    category/tag filter, historical, dashboard and backtester.BacktestTrade.
+    The live-shape replays mock all
     Kalshi API interaction at the HTTP boundary (raw-response mocks and
     rest_client.request); the exit-code tests mock the heavy collaborators
     (auth, scanner, strategy, trader, reporter) at their main-module import
@@ -53,6 +74,7 @@ import inspect
 import json
 import logging
 import logging.handlers
+import os
 import pathlib
 import re
 import sys
@@ -63,7 +85,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kalshi_betting import config, dashboard, historical, main
+from kalshi_betting import config, dashboard, historical, main, reporter, run_lock
 from kalshi_betting import scanner as scanner_mod
 from kalshi_betting import strategy as strategy_mod
 from kalshi_betting import trader as trader_mod
@@ -72,6 +94,7 @@ from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
+    EXIT_RUN_IN_PROGRESS,
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
@@ -90,7 +113,7 @@ from kalshi_betting.config import (
 from kalshi_betting.historical import infer_category
 from kalshi_betting.reporter import TradeResult
 
-from .conftest import apply_pre_toggle_defaults
+from .conftest import apply_pre_toggle_defaults, save_config_live_defaults
 
 
 def make_pair(ticker_a: str, ticker_b: str, pair_type: str = "time_series"):
@@ -245,11 +268,37 @@ class TestNoPairsMsg:
 
 
 @pytest.fixture
-def pinned_config_toggles(monkeypatch):
-    """Pin the seven live toggles through conftest's apply_pre_toggle_defaults, the
-    one definition of their values, so every "(config: X)" mark reads the same
-    whatever config.py ships."""
+def pinned_config_toggles(monkeypatch, _isolate_live_defaults):
+    """
+    Pin the seven live toggles and save them as this test's live defaults.
+
+    Through conftest's apply_pre_toggle_defaults, the one definition of their
+    values, then save_config_live_defaults into the test's own path (requested
+    by name, so the save lands after conftest's per-test redirect): a run
+    through main.main() starts from those values, and every "(default: X)"
+    mark reads the same whatever config.py ships. config.live_settings()
+    returns the same toggles, so a run mode handed none reads them too.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
+        _isolate_live_defaults (None): conftest's per-test redirect, set up first.
+    """
     apply_pre_toggle_defaults(monkeypatch)
+    save_config_live_defaults()
+
+
+def _save_live_defaults(**changes) -> LiveSettings:
+    """
+    Save config.py's toggles with these fields replaced as this test's live defaults.
+
+    Args:
+        **changes: LiveSettings fields to replace in config.live_settings().
+
+    Returns:
+        LiveSettings: The saved defaults as read back (their origin names the file).
+    """
+    return config.save_live_defaults(dataclasses.replace(live_settings(), **changes),
+                                     source="")
 
 
 def _seed_series_listing(series: dict, fetched_at: datetime | None = None) -> None:
@@ -272,12 +321,14 @@ def _main_with(monkeypatch, argv: list, **patches) -> dict:
 
     _run_dev/_run_prod (unless `patches` supplies them), build_client and
     _setup_logging are recorders. The dict holds "code", "logging_set_up",
-    "client_built" and, when a run-mode recorder ran, "settings", "reference", "mode".
+    "client_built" and, when a run-mode recorder ran, "settings", "reference",
+    "mode" and "report" (the run report main() handed a production run, None
+    for dev or without --result-file).
     """
     seen: dict = {"logging_set_up": False, "client_built": False}
 
-    def record_run(client, args, settings, reference):
-        seen.update(settings=settings, reference=reference, mode=args.mode)
+    def record_run(client, args, settings, reference, report=None):
+        seen.update(settings=settings, reference=reference, mode=args.mode, report=report)
         return EXIT_OK
 
     def record_client(mode):
@@ -323,7 +374,26 @@ class TestOrderApiVersionGate:
         assert config.order_api_version_error() in err
         assert repr(value) in err and '"v2"' in err
 
+    def test_the_gate_comes_before_the_result_file_check(self, monkeypatch, capsys, tmp_path):
+        # --result-file in dev is itself refused, but the order-path check
+        # runs first, and nothing touches the file before it
+        path = tmp_path / "result.json"
+        path.write_text("an older result", encoding="utf-8")
+        monkeypatch.setattr(config, "ORDER_API_VERSION", "legacy")
+        seen = _main_with(
+            monkeypatch, ["--mode", "dev", "--result-file", str(path)],
+            _resolve_live_settings=lambda *a: pytest.fail("resolved settings first"),
+        )
+        assert seen["code"] == 2
+        err = capsys.readouterr().err
+        assert config.order_api_version_error() in err
+        assert "--result-file is for --mode prod only" not in err
+        assert path.read_text(encoding="utf-8") == "an older result"
+
+    @pytest.mark.usefixtures("saved_live_defaults")
     def test_the_shipped_value_reaches_the_run_mode(self, monkeypatch):
+        # Saved live defaults too: with none saved, the run exits 2 before
+        # its run mode (TestLiveDefaultsRequired)
         assert config.ORDER_API_VERSION == "v2"
         seen = _main_with(monkeypatch, ["--mode", "dev"])
         assert seen["code"] == EXIT_OK and seen["mode"] == "dev"
@@ -331,9 +401,9 @@ class TestOrderApiVersionGate:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestLiveSettingsFlags:
-    """Each live-toggle flag overrides ONE config.py toggle for one run, over
-    config.live_settings() read at call time; a value LiveSettings refuses is a
-    usage error (exit 2) before logging is configured (TS-20) or a client built."""
+    """Each live-toggle flag overrides ONE saved live default for one run, over
+    the saved file read at call time; a value LiveSettings refuses is a usage
+    error (exit 2) before logging is configured (TS-20) or a client built."""
 
     @pytest.mark.parametrize("mode", ["dev", "prod"])
     @pytest.mark.parametrize("argv, field, value", [
@@ -355,30 +425,34 @@ class TestLiveSettingsFlags:
         assert reference == live_settings()
         assert getattr(settings, field) == value
         assert getattr(settings, field) != getattr(reference, field)
-        for other in dataclasses.fields(LiveSettings):
-            if other.name != field:
-                assert getattr(settings, other.name) == getattr(reference, other.name), other.name
+        for other in config.LIVE_TOGGLE_FIELDS:
+            if other != field:
+                assert getattr(settings, other) == getattr(reference, other), other
 
-    def test_no_flag_hands_the_run_config_py_itself(self, monkeypatch):
+    def test_no_flag_hands_the_run_the_saved_defaults_themselves(self, monkeypatch):
         # The scheduler's exact argv (tests/test_scheduler.py pins it)
         seen = _main_with(monkeypatch, ["--mode", "prod"])
-        assert seen["settings"] == seen["reference"] == live_settings()
+        assert seen["settings"] == seen["reference"] == config.read_saved_live_defaults()
+        # ... which the fixture saved from the pinned constants
+        assert seen["reference"] == live_settings()
+        assert seen["settings"].origin == seen["reference"].origin
+        assert seen["reference"].origin.startswith("live_defaults.json, saved ")
 
-    def test_a_flag_equal_to_config_departs_nothing(self, monkeypatch):
-        cfg = live_settings()
+    def test_a_flag_equal_to_the_saved_default_departs_nothing(self, monkeypatch):
+        saved = config.read_saved_live_defaults()
         seen = _main_with(monkeypatch, [
-            "--mode", "prod", "--tier-floors" if cfg.tier_floors else "--no-tier-floors",
-            "--interval-discount", repr(cfg.interval_discount),
-            "--size-cap", str(round(cfg.size_cap * 100)),
+            "--mode", "prod", "--tier-floors" if saved.tier_floors else "--no-tier-floors",
+            "--interval-discount", repr(saved.interval_discount),
+            "--size-cap", str(round(saved.size_cap * 100)),
         ])
         assert seen["settings"] == seen["reference"]
 
-    def test_one_band_flag_keeps_config_pys_other_bound(self, monkeypatch):
-        # Read at call time from config.py, never bound at import
-        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.1, 0.8))
+    def test_one_band_flag_keeps_the_saved_other_bound(self, monkeypatch):
+        # Read at call time from the saved file, never bound at import
+        _save_live_defaults(spread_band=(0.1, 0.8))
         assert _main_with(monkeypatch, ["--spread-max", "0.5"])["settings"].spread_band == (0.1, 0.5)
         assert _main_with(monkeypatch, ["--spread-min", "0.2"])["settings"].spread_band == (0.2, 0.8)
-        # 0 is a value, not "not given": it lowers config.py's floor to 0
+        # 0 is a value, not "not given": it lowers the saved floor to 0
         assert _main_with(monkeypatch, ["--spread-min", "0"])["settings"].spread_band == (0.0, 0.8)
         both = _main_with(monkeypatch, ["--spread-min", "0.05", "--spread-max", "0.9"])
         assert both["settings"].spread_band == (0.05, 0.9)
@@ -395,7 +469,7 @@ class TestLiveSettingsFlags:
         (["--size-cap", "150"], ["--size-cap", "size_cap", "(0, 1]"], True),
         (["--same-title-size-cap", "105"], ["--same-title-size-cap", "same_title_size_cap"],
          True),
-        # 0 is a value, not "not given": refused, never silently config.py's
+        # 0 is a value, not "not given": refused, never silently the saved one
         (["--same-title-size-cap", "0"],
          ["--same-title-size-cap", "same_title_size_cap", "(0, 1]"], True),
         (["--interval-discount", "0"], ["--interval-discount", "interval_discount"], False),
@@ -434,20 +508,18 @@ class TestLiveSettingsFlags:
         else:
             assert "whole percent" not in err, err
 
-    @pytest.mark.parametrize("field, constant, flag", [
-        ("categories", "TRADE_CATEGORIES", "--any-category"),
-        ("tags", "TRADE_TAGS", "--any-tag"),
+    @pytest.mark.parametrize("field, flag", [
+        ("categories", "--any-category"),
+        ("tags", "--any-tag"),
     ])
-    def test_an_any_flag_clears_config_pys_filter_for_one_run(
-        self, monkeypatch, field, constant, flag,
-    ):
-        monkeypatch.setattr(config, constant, ("Sports",))
+    def test_an_any_flag_clears_the_saved_filter_for_one_run(self, monkeypatch, field, flag):
+        _save_live_defaults(**{field: ("Sports",)})
         seen = _main_with(monkeypatch, ["--mode", "prod", flag])
         assert getattr(seen["reference"], field) == ("Sports",)
         assert getattr(seen["settings"], field) is None
         line = describe_live_settings(seen["settings"], seen["reference"])
-        assert f"{field} any (config: Sports)" in line and line.count("(config:") == 1
-        # No flag keeps config.py's filter
+        assert f"{field} any (default: Sports)" in line and line.count("(default:") == 1
+        # No flag keeps the saved filter
         seen = _main_with(monkeypatch, ["--mode", "prod"])
         assert getattr(seen["settings"], field) == ("Sports",)
 
@@ -473,14 +545,6 @@ class TestLiveSettingsFlags:
         err = capsys.readouterr().err
         assert f"--size-cap and --same-title-size-cap take {self._PERCENT}" in err, err
 
-    def test_an_invalid_config_value_is_a_usage_error(self, monkeypatch, capsys):
-        monkeypatch.setattr(config, "BUDGET_FRACTION", 0.37)
-        seen = _main_with(monkeypatch, ["--mode", "prod"])
-        assert seen["code"] == 2
-        assert not seen["logging_set_up"] and not seen["client_built"]
-        err = capsys.readouterr().err
-        assert "config.py's live settings are invalid" in err and "size_cap" in err
-
     def test_help_names_every_flag_and_the_grid(self, monkeypatch, capsys):
         # argparse %-formats help: a bare "%" would raise here, so "%%" is pinned
         monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--help"])
@@ -493,7 +557,16 @@ class TestLiveSettingsFlags:
                      "--interval-discount", "--size-cap", "--same-title-size-cap",
                      "--category", "--any-category", "--tag", "--any-tag"):
             assert flag in out, flag
-        assert "config.TRADE_CATEGORIES" in out and "config.TRADE_TAGS" in out
+        # Every value flag defaults to the saved live defaults, never a config.py constant
+        assert out.count("default: the saved live defaults") == 8
+        assert out.count("whatever the saved live defaults say") == 2
+        assert "config.TIME_SERIES" not in out and "config.TRADE" not in out
+        assert "config.BUDGET_FRACTION" not in out and "config.SAME_TITLE" not in out
+        assert ("Override one live default for THIS run only, in either mode. The live "
+                "defaults are the ones saved through python3 -m "
+                "kalshi_betting.defaults_server (live_defaults.json); a run refuses to "
+                "start without them. The weekly scheduler passes none of these flags, so "
+                "a scheduled run trades exactly the saved defaults.") in out
         assert out.count(f"in {config.SIZE_CAP_STEP * 100:g}% steps") == 2
         assert "100 = no cap" in out
         assert "100 = no extra cap beyond --size-cap" in out
@@ -502,17 +575,17 @@ class TestLiveSettingsFlags:
     def test_the_echo_marks_exactly_the_departing_fields(self, monkeypatch):
         seen = _main_with(monkeypatch, ["--interval-discount", "0.751"])
         line = describe_live_settings(seen["settings"], seen["reference"])
-        # k renders exactly, so 0.751 never prints as config.py's 0.75
-        assert "k 0.751 (config: 0.75)" in line
-        assert line.count("(config:") == 1
+        # k renders exactly, so 0.751 never prints as the saved 0.75
+        assert "k 0.751 (default: 0.75)" in line
+        assert line.count("(default:") == 1 and "(config:" not in line
 
         seen = _main_with(monkeypatch, [
             "--no-tier-floors", "--spread-max", "0.5", "--size-cap", "35"])
         line = describe_live_settings(seen["settings"], seen["reference"])
-        assert "tier floors off (config: on)" in line
-        assert "spread band 0-0.5 (config: none)" in line
-        assert "per-trade cap 35% (config: 20%)" in line
-        assert line.count("(config:") == 3
+        assert "tier floors off (default: on)" in line
+        assert "spread band 0-0.5 (default: none)" in line
+        assert "per-trade cap 35% (default: 20%)" in line
+        assert line.count("(default:") == 3
 
 
 def _prod_until_the_balance_gate(monkeypatch, argv: list, caplog) -> int:
@@ -529,13 +602,17 @@ def _prod_until_the_balance_gate(monkeypatch, argv: list, caplog) -> int:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestLogLiveSettings:
-    """Each live run logs its toggles on one INFO line, marking each departure from
-    config.py; it WARNS on every live_rule_warnings sentence and, when a prod run
-    that submits orders departs, on that."""
+    """Each live run logs where its defaults came from and its toggles on INFO
+    lines, marking each departure from the saved live defaults; it WARNS on
+    every live_rule_warnings sentence and, when a prod run that submits orders
+    departs, on that."""
 
-    _DEPARTURE = "This PRODUCTION run overrides config.py's live settings"
+    _DEPARTURE = "This PRODUCTION run overrides the saved live defaults"
+    # The same WARNING for a reference built from config.py's constants (one a
+    # test hands a run mode explicitly, or builds by hand)
+    _CONFIG_DEPARTURE = "This PRODUCTION run overrides config.py's live settings"
 
-    def test_a_scheduled_run_logs_config_py_with_no_mark_and_no_warning(
+    def test_a_scheduled_run_logs_the_saved_defaults_with_no_mark_and_no_warning(
         self, monkeypatch, caplog,
     ):
         code = _prod_until_the_balance_gate(monkeypatch, [], caplog)
@@ -543,26 +620,30 @@ class TestLogLiveSettings:
         lines = [r.getMessage() for r in caplog.records
                  if r.getMessage().startswith("Live settings:")]
         assert lines == [f"Live settings: {describe_live_settings(live_settings())}"]
-        assert "(config:" not in lines[0]
+        assert "(default:" not in lines[0] and "(config:" not in lines[0]
+        # The line before it names the saved file the run started from
+        saved = config.read_saved_live_defaults()
+        assert f"Live defaults: {saved.origin}" in caplog.text
         assert self._DEPARTURE not in caplog.text
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING
                     and r.getMessage().startswith("Live settings:")]
 
-    # One departing flag per LiveSettings field, with the mark its line must carry
+    # One departing flag per live toggle (config.LIVE_TOGGLE_FIELDS), with the
+    # mark its line must carry
     _ONE_FLAG_PER_FIELD = {
-        "tier_floors": (["--no-tier-floors"], "tier floors off (config: on)"),
-        "spread_band": (["--spread-max", "0.5"], "spread band 0-0.5 (config: none)"),
-        "interval_discount": (["--interval-discount", "0.6"], "k 0.6 (config: 0.75)"),
-        "size_cap": (["--size-cap", "35"], "per-trade cap 35% (config: 20%)"),
+        "tier_floors": (["--no-tier-floors"], "tier floors off (default: on)"),
+        "spread_band": (["--spread-max", "0.5"], "spread band 0-0.5 (default: none)"),
+        "interval_discount": (["--interval-discount", "0.6"], "k 0.6 (default: 0.75)"),
+        "size_cap": (["--size-cap", "35"], "per-trade cap 35% (default: 20%)"),
         "same_title_size_cap": (["--same-title-size-cap", "15"],
-                                "same-title cap 15% (config: 100% (no extra cap))"),
-        "categories": (["--category", "Economics"], "categories Economics (config: any)"),
-        "tags": (["--tag", "Oil & Gas"], "tags Oil & Gas (config: any)"),
+                                "same-title cap 15% (default: 100% (no extra cap))"),
+        "categories": (["--category", "Economics"], "categories Economics (default: any)"),
+        "tags": (["--tag", "Oil & Gas"], "tags Oil & Gas (default: any)"),
     }
 
     def test_every_field_has_a_departing_flag(self):
-        # A new LiveSettings field needs a row, so its departure WARNING is tested
-        assert set(self._ONE_FLAG_PER_FIELD) == {f.name for f in dataclasses.fields(LiveSettings)}
+        # A new toggle needs a row, so its departure WARNING is tested
+        assert set(self._ONE_FLAG_PER_FIELD) == set(config.LIVE_TOGGLE_FIELDS)
 
     @pytest.mark.parametrize("field", sorted(_ONE_FLAG_PER_FIELD))
     def test_a_departing_production_run_warns(self, monkeypatch, caplog, field):
@@ -571,15 +652,16 @@ class TestLogLiveSettings:
         assert code == EXIT_SKIPPED_LOW_BALANCE
         (line,) = [r.getMessage() for r in caplog.records
                    if r.getMessage().startswith("Live settings: tier floors")]
-        assert mark in line and line.count("(config:") == 1, line
+        assert mark in line and line.count("(default:") == 1, line
         warnings = [r for r in caplog.records
                     if r.levelno == logging.WARNING and self._DEPARTURE in r.getMessage()]
         assert len(warnings) == 1
+        assert self._CONFIG_DEPARTURE not in caplog.text
 
     def test_a_departing_dry_run_marks_but_does_not_warn(self, monkeypatch, caplog):
         _prod_until_the_balance_gate(
             monkeypatch, ["--dry-run", "--interval-discount", "0.6"], caplog)
-        assert "k 0.6 (config: 0.75)" in caplog.text
+        assert "k 0.6 (default: 0.75)" in caplog.text
         assert self._DEPARTURE not in caplog.text
 
     def test_a_departing_dev_run_marks_but_does_not_warn(self, caplog):
@@ -595,7 +677,8 @@ class TestLogLiveSettings:
             )
         assert code == EXIT_NO_TRADEABLE_SHARDS
         assert "k 0.6 (config: 0.75)" in caplog.text
-        assert self._DEPARTURE not in caplog.text
+        # Neither wording: this reference is config.py's, so a WARNING would name it
+        assert "This PRODUCTION run overrides" not in caplog.text
 
     def test_every_rule_warning_is_logged(self, monkeypatch, caplog):
         _prod_until_the_balance_gate(
@@ -610,17 +693,145 @@ class TestLogLiveSettings:
         ]
         assert any("one time-series pair may stake up to 60%" in w for w in warned)
 
-    def test_it_never_resolves_config_py_itself(self, monkeypatch, caplog):
+    def test_it_never_resolves_config_py_or_the_saved_defaults_itself(
+        self, monkeypatch, caplog,
+    ):
         def tripwire():
-            raise AssertionError("_log_live_settings resolved config.py's settings")
+            raise AssertionError("_log_live_settings read settings of its own")
         s = LiveSettings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
-        r = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
-        monkeypatch.setattr(main, "live_settings", tripwire)
-        monkeypatch.setattr(config, "live_settings", tripwire)
+        r = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, origin=self._ORIGIN)
+        for name in ("live_settings", "live_defaults"):
+            monkeypatch.setattr(main, name, tripwire)
+        for name in ("live_settings", "live_defaults", "read_saved_live_defaults"):
+            monkeypatch.setattr(config, name, tripwire)
         with caplog.at_level(logging.INFO):
             main._log_live_settings(s, r, real_money=True)
+        assert f"Live defaults: {self._ORIGIN}" in caplog.text
         assert f"Live settings: {describe_live_settings(s, r)}" in caplog.text
+        assert "(default: on)" in caplog.text
         assert self._DEPARTURE in caplog.text
+
+    # An origin as config.read_saved_live_defaults writes it
+    _ORIGIN = "live_defaults.json, saved 2026-09-27T21:05:13Z from a note"
+
+    def test_a_config_reference_keeps_the_config_mark_and_warning(self, caplog):
+        # A reference built from config.py's constants (origin "config.py"):
+        # marked "(config: X)", and the WARNING names config.py
+        s = LiveSettings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
+        r = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
+        with caplog.at_level(logging.INFO):
+            main._log_live_settings(s, r, real_money=True)
+        assert f"Live defaults: {config.LIVE_DEFAULTS_FROM_CONFIG}" in caplog.text
+        assert "tier floors off (config: on)" in caplog.text
+        assert "(default:" not in caplog.text
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                  and "PRODUCTION run overrides" in r.getMessage()]
+        assert warned == [
+            "This PRODUCTION run overrides config.py's live settings (see the \"(config: …)\" "
+            "marks on the line above): its trades follow the flags, not the committed "
+            "configuration"]
+
+    def test_the_saved_warning_is_worded_for_the_saved_defaults(self, caplog):
+        s = LiveSettings(False, (0.0, 0.5), 0.8, 1.0, 0.2)
+        r = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, origin=self._ORIGIN)
+        with caplog.at_level(logging.INFO):
+            main._log_live_settings(s, r, real_money=True)
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                  and "PRODUCTION run overrides" in r.getMessage()]
+        assert warned == [
+            "This PRODUCTION run overrides the saved live defaults (see the \"(default: …)\" "
+            "marks on the line above): its trades follow the flags, not the saved defaults"]
+
+
+def _saved_record(**toggles) -> str:
+    """
+    A saved live defaults file's text: config.py's toggles with these replaced.
+
+    Built as the file's JSON record by hand, so a test can hold a value
+    save_live_defaults itself would refuse to write.
+
+    Args:
+        **toggles: Raw JSON values for the "settings" block's fields.
+
+    Returns:
+        str: The file's text.
+    """
+    cfg = live_settings()
+    settings = {name: getattr(cfg, name) for name in config.LIVE_TOGGLE_FIELDS}
+    settings["spread_band"] = list(settings["spread_band"])
+    settings.update(toggles)
+    return json.dumps({"format": config.LIVE_DEFAULTS_FORMAT,
+                       "saved_at": "2026-09-27T21:05:13Z", "source": "",
+                       "settings": settings})
+
+
+class TestLiveDefaultsRequired:
+    """A live run starts only from the saved live defaults: with none saved, or
+    a saved file refused, main() exits 2 (parser.error) in either mode, with or
+    without a toggle flag, before logging is configured, any client is built or
+    either run mode runs — and never falls back to config.py's toggles."""
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("flags", [[], ["--interval-discount", "0.6"], ["--any-tag"]])
+    def test_no_saved_file_exits_2_before_anything_runs(self, monkeypatch, capsys, mode,
+                                                        flags):
+        assert not config.LIVE_DEFAULTS_FILE.exists()
+        seen = _main_with(monkeypatch, ["--mode", mode, *flags])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = " ".join(capsys.readouterr().err.split())
+        assert f"no live defaults are saved at {config.LIVE_DEFAULTS_FILE}" in err
+        assert "\"Save as live defaults…\" button" in err
+        assert "python3 -m kalshi_betting.defaults_server --seed" in err
+        assert "./start_dashboard.sh --seed" in err
+        assert "live runs never fall back to config.py's toggles" in err
+
+    @staticmethod
+    def _recursion_bomb(path) -> None:
+        """
+        Write a saved-defaults file nested too deeply to parse.
+
+        Args:
+            path (pathlib.Path): Where to write it (config.LIVE_DEFAULTS_FILE).
+        """
+        path.write_text("[" * 200_000, encoding="utf-8")
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("write", [
+        pytest.param(lambda path: path.write_text("not json", encoding="utf-8"), id="not-json"),
+        pytest.param(lambda path: path.write_text(_saved_record(size_cap=0.33),
+                                                  encoding="utf-8"), id="cap-0.33"),
+        pytest.param(lambda path: path.mkdir(), id="directory"),
+        pytest.param(_recursion_bomb, id="recursion-bomb"),
+    ])
+    def test_a_refused_file_exits_2_naming_it(self, monkeypatch, capsys, mode, write):
+        write(config.LIVE_DEFAULTS_FILE)
+        seen = _main_with(monkeypatch, ["--mode", mode])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = " ".join(capsys.readouterr().err.split())
+        assert "the saved live defaults are refused" in err
+        assert str(config.LIVE_DEFAULTS_FILE) in err
+        assert "python3 -m kalshi_betting.defaults_server" in err
+        assert "./start_dashboard.sh" in err
+        # The server will not save over a refused file, so the stderr says to
+        # fix it, or delete it first
+        assert "fix the file, or delete it and then save new ones" in err
+        assert "the server will not save over a file it refuses" in err
+
+    def test_an_invalid_config_constant_does_not_stop_a_run_with_a_saved_file(
+        self, monkeypatch, saved_live_defaults,
+    ):
+        # config.py's toggles are no live run's defaults: an invalid one only
+        # breaks a caller that hands no settings, never main()
+        monkeypatch.setattr(config, "BUDGET_FRACTION", 0.37)
+        with pytest.raises(ValueError):
+            live_settings()
+        seen = _main_with(monkeypatch, ["--mode", "prod"])
+        assert seen["code"] == EXIT_OK
+        assert seen["settings"] == seen["reference"] == config.read_saved_live_defaults()
 
 
 def _filter_pair(event_ticker: str) -> SimpleNamespace:
@@ -2270,11 +2481,13 @@ class TestRunProdLiveV2Replay:
 class TestLiveSettingsReachEverySite:
     """The runtime tripwire behind test_strategy.py's
     test_ast_live_path_reads_toggles_only_through_live_settings: a prod dry run and a
-    dev run handed _SETTINGS (every field departing from the pinned config) and an
-    explicit reference while live_settings raises in config, scanner, strategy, trader
-    and main, so a site reading config.py or the reference raises or hands a spy the
-    wrong value. _SETTINGS keeps both pairs trading, the time-series f* between the
-    0.25 same-title and 0.35 per-trade caps."""
+    dev run handed _SETTINGS (every toggle departing from the pinned config) and an
+    explicit reference while live_settings, live_defaults and read_saved_live_defaults
+    raise in config, scanner, strategy, trader and main, so a site reading config.py,
+    the saved file or the reference raises or hands a spy the wrong value. It runs
+    twice: with config.py's toggles as the reference, and with _SETTINGS saved as the
+    live defaults and resolved as main() resolves them. _SETTINGS keeps both pairs
+    trading, the time-series f* between the 0.25 same-title and 0.35 per-trade caps."""
 
     _SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.05, 0.9),
                              interval_discount=0.6, size_cap=0.35, same_title_size_cap=0.25,
@@ -2297,9 +2510,22 @@ class TestLiveSettingsReachEverySite:
         (config, ("live_time_series_floor", "pair_size_cap")),
     )
 
-    def _run_under_the_tripwire(self, monkeypatch, caplog, mode: str):
+    def _run_under_the_tripwire(self, monkeypatch, caplog, mode: str, *,
+                                settings: LiveSettings | None = None,
+                                reference: LiveSettings | None = None):
         """
-        Run one mode on _SETTINGS under the tripwire, recording every _SPIED call.
+        Run one mode under the tripwire, recording every _SPIED call.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
+            caplog (pytest.LogCaptureFixture): Captures the run's log.
+            mode (str): "prod" (a dry run) or "dev".
+            settings (LiveSettings | None): Keyword-only. The run's toggles;
+                None hands _SETTINGS.
+            reference (LiveSettings | None): Keyword-only. The defaults the
+                run's toggles depart from; None reads config.py's toggles
+                (live_settings()) before the tripwire, and every toggle must
+                then differ from settings'.
 
         Returns:
             tuple: (settings, reference, calls, captured) — calls maps (module
@@ -2307,11 +2533,12 @@ class TestLiveSettingsReachEverySite:
                 captured holds "results", "filter", "enriched" and, in prod,
                 "run_note".
         """
-        settings = self._SETTINGS
-        # config.py's toggles, read before the tripwire; every field must differ
-        reference = live_settings()
-        for field in dataclasses.fields(LiveSettings):
-            assert getattr(settings, field.name) != getattr(reference, field.name), field.name
+        settings = self._SETTINGS if settings is None else settings
+        if reference is None:
+            # config.py's toggles, read before the tripwire; every toggle must differ
+            reference = live_settings()
+            for name in config.LIVE_TOGGLE_FIELDS:
+                assert getattr(settings, name) != getattr(reference, name), name
 
         client = _live_shape_client(
             monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True,
@@ -2360,12 +2587,16 @@ class TestLiveSettingsReachEverySite:
 
         monkeypatch.setattr(main, "execute_trades", execute_spy)
 
-        # The tripwire: no module may resolve config.py's settings this run
+        # The tripwire: no module may resolve config.py's settings, or read the
+        # saved defaults, this run
         def tripwire(*args, **kwargs):
-            raise AssertionError("live_settings() read during a run handed its settings")
+            raise AssertionError("settings read during a run handed its settings")
 
         for module in (config, scanner_mod, strategy_mod, trader_mod, main):
             monkeypatch.setattr(module, "live_settings", tripwire)
+        for module, name in ((config, "live_defaults"), (config, "read_saved_live_defaults"),
+                             (main, "live_defaults")):
+            monkeypatch.setattr(module, name, tripwire)
 
         calls: dict = {}
 
@@ -2499,6 +2730,52 @@ class TestLiveSettingsReachEverySite:
         # Dev never submits an order, so never the production WARNING
         assert "This PRODUCTION run overrides" not in caplog.text
 
+    def _saved_and_resolved(self) -> tuple[LiveSettings, LiveSettings]:
+        """
+        Save _SETTINGS as the live defaults and resolve them as main() does.
+
+        Through main._resolve_live_settings, with the scheduler's argv plus
+        --dry-run (no toggle flag), before any tripwire is in place.
+
+        Returns:
+            tuple[LiveSettings, LiveSettings]: (the run's settings, the saved
+                defaults they were built from).
+        """
+        cfg = live_settings()
+        # Every toggle of the saved defaults differs from config.py's
+        for name in config.LIVE_TOGGLE_FIELDS:
+            assert getattr(self._SETTINGS, name) != getattr(cfg, name), name
+        config.save_live_defaults(self._SETTINGS, source="a note")
+        args = SimpleNamespace(mode="prod", dry_run=True)
+        settings, reference = main._resolve_live_settings(args, MagicMock())
+        assert settings == reference == self._SETTINGS
+        assert reference.origin.startswith("live_defaults.json, saved ")
+        assert reference.origin.endswith(" from a note")
+        return settings, reference
+
+    @pytest.mark.parametrize("mode", ["prod", "dev"])
+    def test_a_run_from_saved_defaults_reads_them_at_every_site(
+        self, monkeypatch, caplog, mode,
+    ):
+        settings, reference = self._saved_and_resolved()
+        settings, reference, calls, captured = self._run_under_the_tripwire(
+            monkeypatch, caplog, mode, settings=settings, reference=reference)
+        self._assert_every_site_read_the_runs_settings(settings, calls)
+        results = captured["results"]
+        assert {r.status for r in results} == {"simulated"}
+        assert {r.spec.pair.pair_type for r in results} == {"time_series", "same_title"}
+        # The run names the saved file, and its settings carry no mark: no flag moved one
+        assert f"Live defaults: {reference.origin}" in caplog.text
+        echo = f"Live settings: {describe_live_settings(settings, reference)}"
+        assert echo in caplog.text
+        assert "(default:" not in echo and "(config:" not in echo
+        assert "This PRODUCTION run overrides" not in caplog.text
+        if mode == "prod":
+            # The workbook's separator row names the saved file too
+            assert captured["run_note"] == (
+                f"settings: {describe_live_settings(settings, reference)} | defaults: "
+                f"{reference.origin}")
+
     @pytest.mark.parametrize("mode", ["prod", "dev"])
     def test_a_run_with_no_pairs_names_its_own_rule(self, monkeypatch, caplog, mode):
         settings = dataclasses.replace(live_settings(), tier_floors=False,
@@ -2522,6 +2799,160 @@ class TestLiveSettingsReachEverySite:
         assert config.describe_time_series_rule(False, (0.0, 0.5)) in line, line
         assert config.describe_time_series_rule(True, (0.0, 1.0)) not in line, line
         assert ("in sandbox" in line) is (mode == "dev")
+
+
+@pytest.mark.usefixtures("pinned_config_toggles")
+class TestSavedLiveDefaults:
+    """A live run through main() starts from the saved live defaults: one read of
+    the file per run (a counting spy), the file named on a "Live defaults:" line,
+    each field a flag moves marked "(default: X)" (plus the production WARNING
+    when orders go out), and the trade log's separator note naming the file. The
+    saved values differ from the pinned config.py toggles in every field, so a
+    site that read config.py instead would show."""
+
+    # Every toggle differs from the pinned constants; both pairs of the
+    # live-shape replay trade under it
+    _SAVED = TestLiveSettingsReachEverySite._SETTINGS
+
+    def _save(self) -> LiveSettings:
+        """
+        Save _SAVED as this test's live defaults.
+
+        Returns:
+            LiveSettings: The saved defaults as read back (their origin names the
+                file and the "a note" source).
+        """
+        cfg = live_settings()
+        for name in config.LIVE_TOGGLE_FIELDS:
+            assert getattr(self._SAVED, name) != getattr(cfg, name), name
+        return config.save_live_defaults(self._SAVED, source="a note")
+
+    def test_the_schedulers_argv_runs_on_the_saved_defaults_read_once(
+        self, monkeypatch, caplog,
+    ):
+        saved = self._save()
+        reads: list = []
+        real_read = config.read_saved_live_defaults
+
+        def counting_read():
+            """
+            Count one read of the saved file, then read it.
+
+            Returns:
+                LiveSettings | None: What config.read_saved_live_defaults returns.
+            """
+            reads.append(1)
+            return real_read()
+
+        monkeypatch.setattr(config, "read_saved_live_defaults", counting_read)
+        # Every parse of the file's bytes too, so a second read that bypasses the
+        # reader would still be counted
+        parses: list = []
+        real_parse = config._settings_from_bytes
+
+        def counting_parse(data: bytes) -> LiveSettings:
+            """
+            Count one parse of saved-defaults bytes, then parse them.
+
+            Args:
+                data (bytes): The file's bytes.
+
+            Returns:
+                LiveSettings: What config._settings_from_bytes returns.
+            """
+            parses.append(1)
+            return real_parse(data)
+
+        monkeypatch.setattr(config, "_settings_from_bytes", counting_parse)
+        seen: dict = {}
+        real_prod = main._run_prod
+
+        def prod_spy(client, args, settings, reference, report=None):
+            """
+            Record what main() hands the production run mode, then run it.
+
+            Args:
+                client: The client main() built.
+                args (argparse.Namespace): The parsed flags.
+                settings (LiveSettings): The run's settings.
+                reference (LiveSettings): The saved defaults they were built from.
+                report (reporter.RunReport | None): The run report, passed on.
+
+            Returns:
+                int: What main._run_prod returns.
+            """
+            seen.update(settings=settings, reference=reference)
+            return real_prod(client, args, settings, reference, report=report)
+
+        with caplog.at_level(logging.INFO):
+            out = _main_with(
+                monkeypatch, ["--mode", "prod"], _run_prod=prod_spy,
+                verify_auth=lambda client: {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1},
+            )
+        assert out["code"] == EXIT_SKIPPED_LOW_BALANCE
+        # One read for the whole run, before logging, the client and the run mode
+        assert len(reads) == 1 and len(parses) == 1
+        assert seen["settings"] == seen["reference"] == self._SAVED
+        assert seen["settings"].origin == seen["reference"].origin == saved.origin
+        assert saved.origin.startswith("live_defaults.json, saved ")
+        assert saved.origin.endswith(" from a note")
+        # The file is named, and the settings line carries no mark
+        info = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert f"Live defaults: {saved.origin}" in info
+        (line,) = [m for m in info if m.startswith("Live settings:")]
+        assert line == f"Live settings: {describe_live_settings(self._SAVED)}"
+        assert "(default:" not in line and "(config:" not in line
+        assert "PRODUCTION run overrides" not in caplog.text
+
+    def test_a_flag_marks_the_saved_default_and_warns(self, monkeypatch, caplog):
+        self._save()
+        code = _prod_until_the_balance_gate(
+            monkeypatch, ["--interval-discount", "0.7"], caplog)
+        assert code == EXIT_SKIPPED_LOW_BALANCE
+        (line,) = [r.getMessage() for r in caplog.records
+                   if r.levelno == logging.INFO and r.getMessage().startswith("Live settings:")]
+        assert "k 0.7 (default: 0.6)" in line
+        assert line.count("(default:") == 1 and "(config:" not in line
+        warned = [r for r in caplog.records if r.levelno == logging.WARNING
+                  and "This PRODUCTION run overrides the saved live defaults" in r.getMessage()]
+        assert len(warned) == 1
+
+    def test_the_separator_note_names_the_saved_defaults(self, monkeypatch, caplog):
+        saved = self._save()
+        client = _live_shape_client(
+            monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True)
+        # A fresh cached listing for the saved category/tag filter: no request
+        _seed_series_listing(TestLiveSettingsReachEverySite._LISTING)
+        captured: dict = {}
+
+        def fake_append_to_prod_log(results, balance_before, balance_after, *, run_note=""):
+            """
+            Record the run's results and separator note instead of writing a workbook.
+
+            Args:
+                results (list[TradeResult]): The run's trade results.
+                balance_before (float): The balance before the run, in dollars.
+                balance_after (float | None): The balance after it, in dollars.
+                run_note (str): Keyword-only. The separator row's note.
+
+            Returns:
+                pathlib.Path: A path standing in for the workbook.
+            """
+            captured["results"] = results
+            captured["run_note"] = run_note
+            return pathlib.Path("/fake/trade_log.xlsx")
+
+        monkeypatch.setattr(main, "append_to_prod_log", fake_append_to_prod_log)
+        with caplog.at_level(logging.INFO):
+            out = _main_with(monkeypatch, ["--mode", "prod", "--dry-run",
+                                           "--same-title-size-cap", "20"],
+                             _run_prod=main._run_prod, build_client=lambda mode: client)
+        assert out["code"] == EXIT_OK
+        assert {r.status for r in captured["results"]} == {"simulated"}
+        note = captured["run_note"]
+        assert note.startswith("settings: ")
+        assert "same-title cap 20% (default: 25%)" in note
+        assert note.endswith(f" | defaults: {saved.origin}")
 
 
 # A third deadline of the TS-EARLY / TS-LATE question, in an event of its own
@@ -3190,6 +3621,8 @@ class TestRunDevExitCode:
         assert code == EXIT_OK
 
 
+# main.main() starts only from saved live defaults: config.py's, saved first
+@pytest.mark.usefixtures("saved_live_defaults")
 class TestMainEntryPoint:
     @patch("kalshi_betting.main.write_dev_simulation")
     @patch("kalshi_betting.main.enrich_with_orderbook_prices")
@@ -3280,6 +3713,851 @@ class TestMainEntryPoint:
 
         assert exc_info.value.code == EXIT_NO_TRADEABLE_SHARDS
         assert exc_info.value.code == 30
+
+
+@pytest.mark.usefixtures("saved_live_defaults")
+class TestRunLock:
+    """
+    main() holds the machine-wide live-run lock (run_lock) through a
+    production run that sends orders, from before it builds a client until the
+    run mode returns or raises, and stops with EXIT_RUN_IN_PROGRESS, before
+    building a client, when another run still holds it. A prod dry run and a
+    dev run neither take the lock nor wait for it. tests/conftest.py's
+    _isolate_live_runs points the lock at this test's tmp_path and shortens
+    the wait, so holding it here (run_lock.acquire on a second open of the
+    file, which an flock refuses even within one process) stands in for
+    another run on the machine.
+    """
+
+    def test_a_held_lock_stops_a_production_run_before_any_client(self, monkeypatch, caplog):
+        holder = run_lock.acquire()
+        try:
+            with caplog.at_level(logging.INFO):
+                seen = _main_with(monkeypatch, ["--mode", "prod"])
+        finally:
+            os.close(holder)
+        assert seen["code"] == EXIT_RUN_IN_PROGRESS == 50
+        # Logged (the WARNING lands in kalshi_arb.log), then stopped: no
+        # client, no run mode, no request
+        assert seen["logging_set_up"] is True
+        assert seen["client_built"] is False
+        assert "mode" not in seen
+        warned = [r for r in caplog.records if r.levelno == logging.WARNING
+                  and "Another live trading run is in progress" in r.getMessage()]
+        assert len(warned) == 1
+        message = warned[0].getMessage()
+        assert f"process {os.getpid()} in {config.PROJECT_ROOT}, since " in message
+        assert "without contacting Kalshi" in message
+        assert f"(exit {EXIT_RUN_IN_PROGRESS})" in message
+
+    def test_two_production_runs_in_one_process_each_take_the_lock(self, monkeypatch):
+        seen_during_run = []
+
+        def prod_run(client, args, settings, reference, report=None):
+            """
+            Record whether the lock is held while the run mode runs, and by whom.
+
+            Args:
+                client: The client main() built.
+                args (argparse.Namespace): The parsed flags.
+                settings (LiveSettings): The run's settings.
+                reference (LiveSettings): The saved defaults they were built from.
+                report (reporter.RunReport | None): The run report (unused).
+
+            Returns:
+                int: EXIT_OK.
+            """
+            seen_during_run.append((run_lock.held(), run_lock.holder().pid))
+            return EXIT_OK
+
+        first = _main_with(monkeypatch, ["--mode", "prod"], _run_prod=prod_run)
+        second = _main_with(monkeypatch, ["--mode", "prod"], _run_prod=prod_run)
+        assert first["code"] == second["code"] == EXIT_OK
+        # Held through each run, by this process, and released after each
+        assert seen_during_run == [(True, os.getpid()), (True, os.getpid())]
+        assert run_lock.held() is False
+
+    def test_a_run_that_raises_still_releases_the_lock(self, monkeypatch):
+        def failing_run(client, args, settings, reference, report=None):
+            """
+            Fail the way an unhandled error in the run mode would.
+
+            Args:
+                client: The client main() built.
+                args (argparse.Namespace): The parsed flags.
+                settings (LiveSettings): The run's settings.
+                reference (LiveSettings): The saved defaults they were built from.
+                report (reporter.RunReport | None): The run report (unused).
+
+            Raises:
+                RuntimeError: Always.
+            """
+            raise RuntimeError("run failed")
+
+        with pytest.raises(RuntimeError, match="run failed"):
+            _main_with(monkeypatch, ["--mode", "prod"], _run_prod=failing_run)
+        assert run_lock.held() is False
+
+    @pytest.mark.parametrize("argv", [["--mode", "prod", "--dry-run"], ["--mode", "dev"],
+                                      ["--mode", "dev", "--dry-run"]],
+                             ids=["prod-dry-run", "dev", "dev-dry-run"])
+    def test_a_run_that_sends_no_orders_neither_takes_nor_waits_for_the_lock(
+        self, monkeypatch, argv,
+    ):
+        # Another run holds the lock, and taking it would fail this test
+        holder = run_lock.acquire()
+
+        def no_acquire() -> int | None:
+            """
+            Stand in for run_lock.acquire, which a run that sends no orders never calls.
+
+            Returns:
+                int | None: Never returns.
+
+            Raises:
+                AssertionError: Always, so the test fails if the run takes the lock.
+            """
+            raise AssertionError("a run that sends no orders took the live-run lock")
+
+        monkeypatch.setattr(run_lock, "acquire", no_acquire)
+        try:
+            seen = _main_with(monkeypatch, argv)
+        finally:
+            os.close(holder)
+        assert seen["code"] == EXIT_OK
+        assert seen["client_built"] is True
+        assert seen["mode"] == argv[1]
+
+    def test_an_unwritable_lock_folder_stops_the_run_with_an_error(self, monkeypatch, tmp_path):
+        # Not EXIT_RUN_IN_PROGRESS, which the scheduler counts as a done slot:
+        # the error propagates and the interpreter exits 1
+        locked = tmp_path / "read-only"
+        locked.mkdir()
+        locked.chmod(0o500)
+        monkeypatch.setattr(config, "LIVE_RUN_LOCK_FILE", locked / "sub" / "live_run.lock")
+        built = []
+        try:
+            with pytest.raises(PermissionError):
+                _main_with(monkeypatch, ["--mode", "prod"],
+                           build_client=lambda mode: built.append(mode))
+        finally:
+            locked.chmod(0o700)
+        assert built == []
+
+
+def _read_result(path: pathlib.Path) -> dict:
+    """
+    Parse a run result file as strict JSON.
+
+    Args:
+        path (pathlib.Path): The result file.
+
+    Returns:
+        dict: The parsed record.
+
+    Raises:
+        AssertionError: If the file holds NaN or an infinity, which strict JSON has not.
+    """
+    def refuse(token):
+        """
+        Fail on a constant strict JSON has not.
+
+        Args:
+            token (str): "NaN", "Infinity" or "-Infinity".
+
+        Raises:
+            AssertionError: Always.
+        """
+        raise AssertionError(f"the run result is not strict JSON: {token}")
+
+    return json.loads(path.read_text(encoding="utf-8"), parse_constant=refuse)
+
+
+def _no_report_handler() -> bool:
+    """
+    Whether the root logger carries no run-report handler.
+
+    Returns:
+        bool: True when no reporter.RunReportHandler is attached to the root logger.
+    """
+    return not any(isinstance(h, main.RunReportHandler) for h in logging.getLogger().handlers)
+
+
+# The record make_spec()'s pair gives in a run result: a time-series pair
+# buying YES on A at pA and NO on B at nB, five contracts a side
+_MAKE_SPEC_TRADE = {
+    "pair_type": "time_series", "title": "Test pair",
+    "a": {"ticker": "TICK-A", "market": "Market A", "side": "yes", "count": 5, "price": 0.3},
+    "b": {"ticker": "TICK-B", "market": "Market B", "side": "no", "count": 5, "price": 0.4},
+    "cost_with_fees": 2.3, "profit_if_won": 0.5,
+}
+
+
+@pytest.mark.usefixtures("saved_live_defaults")
+class TestResultFile:
+    """
+    main.py --result-file writes what a production run did as JSON, however
+    it ends once logging is set up: one test per way _run_prod ends, each
+    checking the exit code, the message (the line the run logged, word for
+    word), the trades and the balances; then an exception, a run stopped
+    while sending orders, an undescribable pair, a lock refusal, a usage
+    error (exit 2, no file, an older one removed), the flag in dev, no flag,
+    and the handler's removal.
+    """
+
+    # The balance before trading and after it, in cents
+    _BEFORE = 100_000
+    _AFTER = 99_000
+
+    def _run(self, monkeypatch, tmp_path, caplog, *, dry_run=False, status="executed",
+             **stubs) -> tuple[dict, dict, list]:
+        """
+        Run main.main() in production with --result-file and every request stubbed.
+
+        By default one same-title-found pair (make_spec's) is sized, passes
+        every check and ends with the given status. Each keyword in stubs
+        replaces one of main's names for this run.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): For the stubs.
+            tmp_path (pathlib.Path): Where the result file goes.
+            caplog (pytest.LogCaptureFixture): Captures the run's log lines.
+            dry_run (bool): Pass --dry-run.
+            status (str): The status execute_trades gives each pair.
+            **stubs: main's names to replace, e.g. verify_auth=...
+
+        Returns:
+            tuple[dict, dict, list]: What _main_with saw, the parsed result
+                file, and the run's log records.
+        """
+        spec = make_spec()
+        path = tmp_path / "result.json"
+        balances = iter([{DEFAULT_EXCHANGE_INDEX: self._BEFORE},
+                         {DEFAULT_EXCHANGE_INDEX: self._AFTER}])
+        logged = []
+        patches = {
+            "_run_prod": main._run_prod,
+            "verify_auth": lambda client: next(balances),
+            "get_held_tickers": lambda client: set(),
+            "fetch_shard_statuses": lambda client: None,
+            "fetch_open_events_with_markets": lambda client, inactive_shards: _stub_ingest(),
+            "resolve_held_ladders": lambda client, markets, held: frozenset(),
+            "filter_markets_within_horizon": lambda markets, days: markets,
+            "find_time_series_pairs": lambda *a, **k: [],
+            "find_same_title_pairs": lambda markets, held: [spec.pair],
+            "enrich_with_orderbook_prices": lambda client, pairs, balance, *, settings: pairs,
+            "compute_trade": lambda pair, balance, *, settings: spec,
+            "select_portfolio": lambda specs, balance, *, held_ladders: specs,
+            "pre_execution_check": lambda client, portfolio, *, settings: portfolio,
+            "ensure_shard_collateral":
+                lambda client, portfolio, balances, statuses, *, dry_run: portfolio,
+            "execute_trades": lambda client, portfolio, *, dry_run: [
+                TradeResult(spec=s, status=status) for s in portfolio],
+            "append_to_prod_log": lambda *a, **k: logged.append(a) or pathlib.Path("/fake"),
+        }
+        patches.update(stubs)
+        argv = ["--mode", "prod", "--result-file", str(path)] + (["--dry-run"] if dry_run else [])
+        with caplog.at_level(logging.INFO):
+            seen = _main_with(monkeypatch, argv, **patches)
+        assert _no_report_handler()
+        seen["trade_log_calls"] = logged
+        return seen, _read_result(path), list(caplog.records)
+
+    @staticmethod
+    def _logged_once(records, message: str, level: int) -> None:
+        """
+        Assert the result's message is exactly one line the run logged, at that level.
+
+        Args:
+            records (list[logging.LogRecord]): The run's log records.
+            message (str): The result's message.
+            level (int): The level it must have been logged at.
+        """
+        matches = [r for r in records if r.getMessage() == message]
+        assert len(matches) == 1, message
+        assert matches[0].levelno == level
+
+    @staticmethod
+    def _trade(status: str, error=None) -> dict:
+        """
+        The run result's record of make_spec()'s pair with this outcome.
+
+        Args:
+            status (str): The trader's status.
+            error (str | None): The trader's error.
+
+        Returns:
+            dict: The trade as the result file holds it.
+        """
+        return {"status": status, "error": error, **_MAKE_SPEC_TRADE}
+
+    def test_the_record_names_the_run(self, monkeypatch, tmp_path, caplog):
+        seen, result, _ = self._run(monkeypatch, tmp_path, caplog)
+        saved = config.read_saved_live_defaults()
+        assert set(result) == {
+            "format", "mode", "dry_run", "started_at", "finished_at", "exit_code",
+            "settings", "defaults", "message", "balance_before", "balance_after",
+            "submission_started", "trades", "warnings", "warnings_dropped", "error"}
+        assert result["format"] == config.LIVE_RUN_RESULT_FORMAT
+        assert result["mode"] == "prod" and result["dry_run"] is False
+        assert result["settings"] == describe_live_settings(saved, saved)
+        assert result["defaults"] == saved.origin
+        for key in ("started_at", "finished_at"):
+            assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", result[key]), result[key]
+        assert result["started_at"] <= result["finished_at"]
+        assert result["error"] is None
+        # The result's exit code is the one main() exited with
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+
+    def test_low_balance(self, monkeypatch, tmp_path, caplog):
+        seen, result, records = self._run(
+            monkeypatch, tmp_path, caplog,
+            verify_auth=lambda client: {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1})
+        assert seen["code"] == result["exit_code"] == EXIT_SKIPPED_LOW_BALANCE
+        assert result["message"] == (
+            f"Balance ${(MIN_BALANCE_CENTS - 1) / 100:.2f} is below minimum "
+            f"${MIN_BALANCE_CENTS / 100:.2f} — skipping run.")
+        self._logged_once(records, result["message"], logging.WARNING)
+        assert result["trades"] == []
+        assert result["balance_before"] == (MIN_BALANCE_CENTS - 1) / 100
+        assert result["balance_after"] is None
+        assert result["submission_started"] is False
+        assert f"WARNING: {result['message']}" in result["warnings"]
+
+    def test_blind_run(self, monkeypatch, tmp_path, caplog):
+        seen, result, records = self._run(
+            monkeypatch, tmp_path, caplog,
+            fetch_open_events_with_markets=lambda client, inactive_shards: [])
+        assert seen["code"] == result["exit_code"] == EXIT_NO_TRADEABLE_SHARDS
+        assert result["message"] == main._blind_run_reason([], None, set())
+        self._logged_once(records, result["message"], logging.WARNING)
+        assert result["trades"] == []
+        assert result["balance_before"] == self._BEFORE / 100
+        assert result["balance_after"] is None
+
+    def test_no_pairs(self, monkeypatch, tmp_path, caplog):
+        seen, result, records = self._run(
+            monkeypatch, tmp_path, caplog, find_same_title_pairs=lambda markets, held: [])
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        assert result["message"].startswith("No qualifying pairs found (")
+        self._logged_once(records, result["message"], logging.INFO)
+        assert result["trades"] == []
+        assert result["balance_before"] == self._BEFORE / 100
+        assert result["balance_after"] is None
+
+    def test_empty_portfolio(self, monkeypatch, tmp_path, caplog):
+        seen, result, records = self._run(
+            monkeypatch, tmp_path, caplog,
+            select_portfolio=lambda specs, balance, *, held_ladders: [])
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        assert result["message"] == "No executable trades found."
+        self._logged_once(records, result["message"], logging.INFO)
+        assert result["trades"] == [] and result["balance_after"] is None
+
+    def test_failed_pre_execution_check(self, monkeypatch, tmp_path, caplog):
+        seen, result, records = self._run(
+            monkeypatch, tmp_path, caplog,
+            pre_execution_check=lambda client, portfolio, *, settings: [])
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        assert result["message"] == (
+            "All selected pairs failed pre-execution price check — no trades submitted.")
+        self._logged_once(records, result["message"], logging.INFO)
+        assert result["trades"] == [] and result["balance_after"] is None
+
+    def test_collateral(self, monkeypatch, tmp_path, caplog):
+        seen, result, records = self._run(
+            monkeypatch, tmp_path, caplog,
+            ensure_shard_collateral=lambda client, portfolio, balances, statuses, *, dry_run: [])
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        assert result["message"] == (
+            "No selected pair could be funded on its exchange shard — no trades submitted.")
+        self._logged_once(records, result["message"], logging.INFO)
+        assert result["trades"] == [] and result["balance_after"] is None
+        # Stopped before any order was sent
+        assert result["submission_started"] is False
+
+    def test_dry_run(self, monkeypatch, tmp_path, caplog):
+        seen, result, records = self._run(
+            monkeypatch, tmp_path, caplog, dry_run=True, status="simulated")
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        assert result["dry_run"] is True
+        # A dry run sends no orders, so it never records starting to
+        assert result["submission_started"] is False
+        assert result["message"] == "[DRY RUN] No orders were actually submitted."
+        self._logged_once(records, result["message"], logging.INFO)
+        assert result["trades"] == [self._trade("simulated")]
+        assert result["balance_before"] == self._BEFORE / 100
+        assert result["balance_after"] == self._AFTER / 100
+        # The trade log is still written
+        assert len(seen["trade_log_calls"]) == 1
+
+    def test_executed(self, monkeypatch, tmp_path, caplog):
+        seen, result, records = self._run(monkeypatch, tmp_path, caplog)
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        assert result["message"] == (
+            "Submitted 1 of 1 order pair(s) successfully. 0 rolled back, "
+            "0 rollback failure(s), 0 unknown fill state(s).")
+        self._logged_once(records, result["message"], logging.INFO)
+        assert result["trades"] == [self._trade("executed")]
+        assert result["balance_before"] == self._BEFORE / 100
+        assert result["balance_after"] == self._AFTER / 100
+        assert result["submission_started"] is True
+        # A real-money run's first WARNING, copied in as it was logged
+        assert result["warnings"][0] == (
+            "WARNING: Running in PRODUCTION mode — real money will be used!")
+        assert result["warnings_dropped"] == 0
+
+    def test_needs_attention(self, monkeypatch, tmp_path, caplog):
+        seen, result, records = self._run(monkeypatch, tmp_path, caplog, status="manual_review")
+        assert seen["code"] == result["exit_code"] == EXIT_TRADES_NEED_ATTENTION
+        assert result["message"] == (
+            "Submitted 0 of 1 order pair(s) successfully. 0 rolled back, "
+            "0 rollback failure(s), 1 unknown fill state(s).")
+        self._logged_once(records, result["message"], logging.INFO)
+        assert result["trades"] == [self._trade("manual_review")]
+        assert result["balance_after"] == self._AFTER / 100
+        assert ("CRITICAL: 0 pair(s) may have ORPHANED positions and 1 pair(s) have an "
+                "UNDETERMINED fill state — manual review required (see trade log)."
+                ) in result["warnings"]
+
+    def test_time_series_skipped(self, monkeypatch, tmp_path, caplog):
+        seen, result, records = self._run(
+            monkeypatch, tmp_path, caplog,
+            resolve_held_ladders=lambda client, markets, held: None)
+        assert seen["code"] == result["exit_code"] == EXIT_TIME_SERIES_SKIPPED
+        assert result["message"] == (
+            "Submitted 1 of 1 order pair(s) successfully. 0 rolled back, "
+            "0 rollback failure(s), 0 unknown fill state(s).")
+        self._logged_once(records, result["message"], logging.INFO)
+        assert result["trades"] == [self._trade("executed")]
+        assert result["balance_after"] == self._AFTER / 100
+
+    def test_a_failed_balance_read_after_trading_is_not_known(self, monkeypatch, tmp_path,
+                                                              caplog):
+        reads = []
+
+        def verify_auth(client):
+            """
+            Read the balance once, then fail as a lost connection would.
+
+            Args:
+                client: The run's client.
+
+            Returns:
+                dict: The balance before trading, on the first read.
+
+            Raises:
+                ConnectionError: On every later read.
+            """
+            reads.append(1)
+            if len(reads) > 1:
+                raise ConnectionError("connection reset")
+            return {DEFAULT_EXCHANGE_INDEX: self._BEFORE}
+
+        seen, result, _ = self._run(monkeypatch, tmp_path, caplog, verify_auth=verify_auth)
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        # The trade log falls back to the balance before trading; the result
+        # does not claim one it never read
+        assert seen["trade_log_calls"][0][1:] == (self._BEFORE / 100, self._BEFORE / 100)
+        assert result["balance_before"] == self._BEFORE / 100
+        assert result["balance_after"] is None
+        assert any(w.startswith("ERROR: Post-trade balance fetch failed")
+                   for w in result["warnings"])
+
+    @pytest.mark.parametrize("error, text", [
+        (RuntimeError("run failed\nsecond line"), "RuntimeError: run failed"),
+        (KeyboardInterrupt(), "KeyboardInterrupt"),
+    ], ids=["error", "ctrl-c"])
+    def test_a_run_that_raises_writes_no_exit_code_and_one_line(self, monkeypatch, tmp_path,
+                                                                error, text):
+        path = tmp_path / "result.json"
+
+        def failing_run(client, args, settings, reference, report=None):
+            """
+            Stop the way an unhandled error or a Ctrl-C in the run mode would.
+
+            Args:
+                client: The client main() built.
+                args (argparse.Namespace): The parsed flags.
+                settings (LiveSettings): The run's settings.
+                reference (LiveSettings): The saved defaults they were built from.
+                report (reporter.RunReport | None): The run report main() handed over.
+
+            Raises:
+                BaseException: Always, the test's error.
+            """
+            assert report is not None
+            report.balance_before = 12.5
+            raise error
+
+        with pytest.raises(type(error)):
+            _main_with(monkeypatch, ["--mode", "prod", "--result-file", str(path)],
+                       _run_prod=failing_run)
+        result = _read_result(path)
+        assert result["exit_code"] is None
+        assert result["error"] == text
+        assert result["balance_before"] == 12.5
+        assert _no_report_handler()
+        assert run_lock.held() is False
+
+    @pytest.mark.parametrize("error, text", [
+        (KeyboardInterrupt(), "KeyboardInterrupt"),
+        (RuntimeError("worker crashed"), "RuntimeError: worker crashed"),
+    ], ids=["ctrl-c", "error"])
+    def test_a_run_stopped_while_sending_says_orders_may_have_been_placed(
+        self, monkeypatch, tmp_path, caplog, error, text,
+    ):
+        def stopped_while_sending(client, portfolio, *, dry_run):
+            """
+            Stop the way a Ctrl-C or a crash inside execute_trades would.
+
+            Args:
+                client: The run's client.
+                portfolio (list): The selected specs.
+                dry_run (bool): False here.
+
+            Raises:
+                BaseException: Always, the test's error.
+            """
+            raise error
+
+        path = tmp_path / "result.json"
+        with pytest.raises(type(error)):
+            self._run(monkeypatch, tmp_path, caplog, execute_trades=stopped_while_sending)
+        result = _read_result(path)
+        assert result["exit_code"] is None and result["error"] == text
+        # No trade is recorded, yet the record says sending had begun
+        assert result["trades"] == [] and result["message"] == ""
+        assert result["submission_started"] is True
+        assert run_lock.held() is False
+
+    def test_a_dry_run_stopped_while_simulating_records_no_sending(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        def stopped(client, portfolio, *, dry_run):
+            """
+            Stop inside execute_trades on a dry run.
+
+            Args:
+                client: The run's client.
+                portfolio (list): The selected specs.
+                dry_run (bool): True here.
+
+            Raises:
+                KeyboardInterrupt: Always.
+            """
+            raise KeyboardInterrupt
+
+        path = tmp_path / "result.json"
+        with pytest.raises(KeyboardInterrupt):
+            self._run(monkeypatch, tmp_path, caplog, dry_run=True, execute_trades=stopped)
+        assert _read_result(path)["submission_started"] is False
+
+    @pytest.mark.parametrize("argv, remove_saved, reason", [
+        (["--size-cap", "7"], False, "invalid live setting for this run (--size-cap)"),
+        ([], True, "live_defaults.json"),
+        (["--max-horizon-days", "0"], False, "--max-horizon-days must be a positive integer"),
+    ], ids=["bad-flag", "no-saved-defaults", "bad-horizon"])
+    def test_a_usage_error_leaves_no_file_not_an_older_one(
+        self, monkeypatch, tmp_path, capsys, argv, remove_saved, reason,
+    ):
+        # Exit 2 before logging is set up writes no result; an older result
+        # already at the path is removed first, so it cannot pass for this run's
+        path = tmp_path / "result.json"
+        path.write_text('{"exit_code": 0, "trades": []}', encoding="utf-8")
+        if remove_saved:
+            config.LIVE_DEFAULTS_FILE.unlink()
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--result-file", str(path), *argv])
+        assert seen["code"] == 2
+        assert seen["logging_set_up"] is False and "mode" not in seen
+        assert reason in capsys.readouterr().err
+        assert not path.exists()
+        assert _no_report_handler()
+
+    def test_an_older_result_is_replaced_by_this_runs(self, monkeypatch, tmp_path):
+        path = tmp_path / "result.json"
+        path.write_text('{"exit_code": 20, "trades": ["old"]}', encoding="utf-8")
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--dry-run", "--result-file", str(path)])
+        result = _read_result(path)
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        assert result["trades"] == [] and result["dry_run"] is True
+
+    def test_a_folder_at_the_path_is_not_removed_and_the_run_goes_on(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        # What cannot be removed is left to the final write, which logs why
+        path = tmp_path / "result.json"
+        path.mkdir()
+        with caplog.at_level(logging.INFO):
+            seen = _main_with(
+                monkeypatch, ["--mode", "prod", "--dry-run", "--result-file", str(path)])
+        assert seen["code"] == EXIT_OK
+        assert path.is_dir()
+        assert any(r.levelno == logging.ERROR
+                   and r.getMessage().startswith(f"Could not write the run result to {path}")
+                   for r in caplog.records)
+
+    def test_the_result_is_written_before_the_lock_is_released(self, monkeypatch, tmp_path):
+        path = tmp_path / "result.json"
+        at_write = []
+
+        def spy(where, report, exit_code):
+            """
+            Record the lock and the handler as the result is written, then write it.
+
+            Args:
+                where (pathlib.Path): The result file.
+                report (reporter.RunReport): The report.
+                exit_code (int | None): The run's exit code.
+            """
+            at_write.append((run_lock.held(), _no_report_handler(), exit_code))
+            reporter.write_run_report(where, report, exit_code)
+
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--result-file", str(path)],
+                          write_run_report=spy)
+        assert seen["code"] == EXIT_OK
+        # Written once, while this run still held the lock and the handler was attached
+        assert at_write == [(True, False, EXIT_OK)]
+        assert run_lock.held() is False and _no_report_handler()
+        assert _read_result(path)["exit_code"] == EXIT_OK
+
+    def test_a_trade_log_that_cannot_be_written_still_leaves_a_result(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        def failing_log(*args, **kwargs):
+            """
+            Fail the way a trade log open in another program would.
+
+            Args:
+                *args: append_to_prod_log's positional arguments.
+                **kwargs: Its keyword arguments.
+
+            Raises:
+                PermissionError: Always.
+            """
+            raise PermissionError("trade_log.xlsx is open elsewhere")
+
+        path = tmp_path / "result.json"
+        with pytest.raises(PermissionError):
+            self._run(monkeypatch, tmp_path, caplog, append_to_prod_log=failing_log)
+        result = _read_result(path)
+        # The trades were recorded before the trade log, and the rescue dump ran
+        assert result["exit_code"] is None
+        assert result["error"] == "PermissionError: trade_log.xlsx is open elsewhere"
+        assert result["trades"] == [self._trade("executed")]
+        assert result["balance_after"] == self._AFTER / 100
+        assert result["message"] == ""
+        assert any(w.startswith("CRITICAL:   RESCUE | executed | Test pair")
+                   for w in result["warnings"])
+        assert _no_report_handler()
+
+    def test_a_pair_that_cannot_be_described_still_reaches_the_trade_log(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        def fail(result):
+            """
+            Stand in for reporter.trade_record, failing on every pair.
+
+            Args:
+                result (TradeResult): A pair's outcome.
+
+            Raises:
+                KeyError: Always.
+            """
+            raise KeyError("no such field")
+
+        first, second = make_spec(), make_spec()
+        second.pair.market_a.ticker, second.pair.market_b.ticker = "TICK-C", "TICK-D"
+        monkeypatch.setattr(reporter, "trade_record", fail)
+        seen, result, records = self._run(
+            monkeypatch, tmp_path, caplog,
+            execute_trades=lambda client, portfolio, *, dry_run: [
+                TradeResult(spec=first, status="manual_review", error="lookup failed"),
+                TradeResult(spec=second, status="executed")])
+        # The run went on: the trade log was written, and the exit code is the run's
+        assert len(seen["trade_log_calls"]) == 1
+        assert [r.status for r in seen["trade_log_calls"][0][0]] == ["manual_review",
+                                                                     "executed"]
+        assert seen["code"] == result["exit_code"] == EXIT_TRADES_NEED_ATTENTION
+        # Each pair is still listed, with what could be read of it
+        assert [(t["status"], t["error"], t["a"]["ticker"], t["b"]["ticker"],
+                 t["a"]["count"], t["b"]["count"]) for t in result["trades"]] == [
+            ("manual_review", "lookup failed", "TICK-A", "TICK-B", 5, 5),
+            ("executed", None, "TICK-C", "TICK-D", 5, 5)]
+        assert all(t["cost_with_fees"] is None and t["a"]["price"] is None
+                   for t in result["trades"])
+        errors = [r for r in records if r.levelno == logging.ERROR
+                  and r.getMessage().startswith("Could not describe a pair for the run result")]
+        assert len(errors) == 2
+
+    def test_a_lock_refusal_writes_50_and_its_message(self, monkeypatch, tmp_path, caplog):
+        path = tmp_path / "result.json"
+        holder = run_lock.acquire()
+        try:
+            with caplog.at_level(logging.INFO):
+                seen = _main_with(monkeypatch, ["--mode", "prod", "--result-file", str(path)])
+        finally:
+            os.close(holder)
+        result = _read_result(path)
+        assert seen["code"] == result["exit_code"] == EXIT_RUN_IN_PROGRESS
+        assert "mode" not in seen and seen["client_built"] is False
+        assert result["message"].startswith("Another live trading run is in progress (process ")
+        assert result["message"].endswith(
+            f"— this run stops without contacting Kalshi, so nothing is sent "
+            f"(exit {EXIT_RUN_IN_PROGRESS}).")
+        self._logged_once(caplog.records, result["message"], logging.WARNING)
+        assert result["warnings"] == [f"WARNING: {result['message']}"]
+        assert result["trades"] == [] and result["balance_before"] is None
+        assert _no_report_handler()
+
+    def test_the_flag_is_refused_in_dev(self, monkeypatch, tmp_path, capsys):
+        path = tmp_path / "result.json"
+        seen = _main_with(monkeypatch, ["--mode", "dev", "--result-file", str(path)])
+        assert seen["code"] == 2
+        assert "--result-file is for --mode prod only" in capsys.readouterr().err
+        # Refused before logging, the client or the run mode
+        assert seen["logging_set_up"] is False and "mode" not in seen
+        assert not path.exists()
+
+    def test_the_dev_refusal_leaves_a_file_at_the_path_alone(self, monkeypatch, tmp_path):
+        path = tmp_path / "result.json"
+        path.write_text("not this run's", encoding="utf-8")
+        seen = _main_with(monkeypatch, ["--mode", "dev", "--result-file", str(path)])
+        assert seen["code"] == 2
+        assert path.read_text(encoding="utf-8") == "not this run's"
+
+    def test_without_the_flag_nothing_is_written(self, monkeypatch):
+        def no_write(path, report, exit_code):
+            """
+            Stand in for write_run_report, which a run without --result-file never calls.
+
+            Args:
+                path (pathlib.Path): The result file.
+                report (reporter.RunReport): The report.
+                exit_code (int | None): The exit code.
+
+            Raises:
+                AssertionError: Always.
+            """
+            raise AssertionError("a run without --result-file wrote a result")
+
+        for argv in (["--mode", "prod"], ["--mode", "prod", "--dry-run"]):
+            seen = _main_with(monkeypatch, argv, write_run_report=no_write)
+            assert seen["code"] == EXIT_OK
+            assert seen["mode"] == "prod" and seen["report"] is None
+            assert _no_report_handler()
+
+    def test_the_report_reaches_the_run_mode_and_its_warnings_stop_at_the_end(
+        self, monkeypatch, tmp_path,
+    ):
+        path = tmp_path / "result.json"
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--dry-run", "--result-file", str(path)])
+        report = seen["report"]
+        assert isinstance(report, main.RunReport) and report.dry_run is True
+        assert _no_report_handler()
+        # A line logged after main() returns is not the run's
+        logging.getLogger().warning("after the run")
+        assert "WARNING: after the run" not in report.warnings
+        assert _read_result(path)["exit_code"] == EXIT_OK
+
+
+def _other_toggles(target: LiveSettings) -> LiveSettings:
+    """
+    Build live defaults that differ from target in every one of the seven toggles.
+
+    Args:
+        target (LiveSettings): The settings a run should trade.
+
+    Returns:
+        LiveSettings: Saved defaults under which every one of target's flags
+            has to take effect for the run to trade target.
+    """
+    band = (0.2, 0.3) if target.spread_band != (0.2, 0.3) else (0.25, 0.4)
+    other = LiveSettings(
+        tier_floors=not target.tier_floors,
+        spread_band=band,
+        interval_discount=0.55 if target.interval_discount != 0.55 else 0.65,
+        size_cap=0.5 if target.size_cap != 0.5 else 0.6,
+        same_title_size_cap=0.25 if target.same_title_size_cap != 0.25 else 0.3,
+        categories=None if target.categories is not None else ("Saved",),
+        tags=None if target.tags is not None else ("Saved",),
+    )
+    for name in config.LIVE_TOGGLE_FIELDS:
+        assert getattr(other, name) != getattr(target, name), name
+    assert other.spread_band[0] != target.spread_band[0]
+    assert other.spread_band[1] != target.spread_band[1]
+    return other
+
+
+# Settings config.live_settings_argv must spell so a run trades them exactly
+_ARGV_TARGETS = {
+    "seed": config.LIVE_DEFAULTS_SEED,
+    "k-with-many-decimals-tier-floors-on": LiveSettings(
+        tier_floors=True, spread_band=(0.15, 0.85), interval_discount=0.7123456789012345,
+        size_cap=0.05, same_title_size_cap=1.0, categories=("Economics",), tags=None),
+    "tier-floors-off-caps-100-and-5": LiveSettings(
+        tier_floors=False, spread_band=(0.0, 1.0), interval_discount=1.0,
+        size_cap=1.0, same_title_size_cap=0.05,
+        categories=("Economics", "Sports", "Climate and Weather"), tags=("Soccer",)),
+    "names-starting-with-a-dash": LiveSettings(
+        tier_floors=True, spread_band=(0.1234567, 0.6543210987654321),
+        interval_discount=1 / 3, size_cap=0.35, same_title_size_cap=0.45,
+        categories=("-Minus", "Politics"), tags=("-Dash", "Basketball", "Pro Football")),
+    "several-tags-any-category": LiveSettings(
+        tier_floors=False, spread_band=(0.05, 0.5), interval_discount=0.8,
+        size_cap=0.2, same_title_size_cap=0.2, categories=None,
+        tags=("Soccer", "Basketball", "--double dash")),
+}
+
+
+class TestLiveSettingsArgv:
+    """
+    config.live_settings_argv spells settings as main.py's toggle flags so a
+    run trades exactly them: parsed by main._build_parser and laid over saved
+    defaults that differ in every toggle by main._resolve_live_settings, they
+    give back the same settings.
+    """
+
+    @pytest.mark.parametrize("target", _ARGV_TARGETS.values(), ids=_ARGV_TARGETS.keys())
+    def test_the_flags_round_trip_over_different_saved_defaults(self, target):
+        saved = config.save_live_defaults(_other_toggles(target), source="")
+        parser = main._build_parser()
+        args = parser.parse_args(["--mode", "prod", *config.live_settings_argv(target)])
+        settings, reference = main._resolve_live_settings(args, parser)
+        assert settings == target
+        for name in config.LIVE_TOGGLE_FIELDS:
+            assert getattr(settings, name) == getattr(target, name), name
+        # The reference is still the saved file, which the run names
+        assert reference == saved and settings.origin == saved.origin
+        # Every toggle was given as a flag
+        assert args.tier_floors is target.tier_floors
+        assert args.spread_min is not None and args.spread_max is not None
+        assert args.interval_discount is not None
+        assert args.size_cap is not None and args.same_title_size_cap is not None
+        assert (args.category is not None) or args.any_category
+        assert (args.tag is not None) or args.any_tag
+
+    def test_the_seed_is_spelled_flag_by_flag(self):
+        assert config.live_settings_argv(config.LIVE_DEFAULTS_SEED) == [
+            "--no-tier-floors", "--spread-min=0.0", "--spread-max=0.5",
+            "--interval-discount=0.8", "--size-cap=10", "--same-title-size-cap=20",
+            "--any-category", "--any-tag"]
+
+    def test_a_name_that_begins_with_a_dash_is_read_as_a_name(self):
+        target = _ARGV_TARGETS["names-starting-with-a-dash"]
+        argv = config.live_settings_argv(target)
+        assert "--category=-Minus" in argv and "--tag=-Dash" in argv
+        args = main._build_parser().parse_args(["--mode", "prod", *argv])
+        assert args.category == ["-Minus", "Politics"]
+        assert args.tag == ["-Dash", "Basketball", "Pro Football"]
+
+    def test_main_trades_the_spelled_settings(self, monkeypatch):
+        target = _ARGV_TARGETS["k-with-many-decimals-tier-floors-on"]
+        saved = config.save_live_defaults(_other_toggles(target), source="")
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--dry-run",
+                                        *config.live_settings_argv(target)])
+        assert seen["code"] == EXIT_OK
+        assert seen["settings"] == target and seen["reference"] == saved
 
 
 def _fake_write_dev_simulation(results, candidate_pairs, balance_cents):
@@ -3404,6 +4682,7 @@ class TestLoggingRotation:
             root.handlers = saved_handlers
             root.level = saved_level
 
+    @pytest.mark.usefixtures("saved_live_defaults")
     def test_main_installs_the_rotating_handler(self, tmp_path, monkeypatch):
         # End-to-end: main() must route through _setup_logging, so the
         # rotating handler is what a real run actually gets.
@@ -3449,6 +4728,7 @@ class TestLoggingRotation:
             root.setLevel(saved_level)
 
 
+@pytest.mark.usefixtures("saved_live_defaults")
 class TestDryRunInertInDev:
     """BS-32: --dry-run has no effect in dev mode (dev always simulates), so
     main() logs a warning naming that rather than leaving it silently
@@ -3509,6 +4789,7 @@ def test_exit_code_constants_distinct():
     }) == 4
 
 
+@pytest.mark.usefixtures("saved_live_defaults")
 class TestSandboxBalanceInertInProd:
     """
     TS-19: --sandbox-balance is read only by _run_dev. Passing it in prod

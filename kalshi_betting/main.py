@@ -24,28 +24,59 @@ Purpose:
     config.ORDER_API_VERSION is not "v2" (config.order_api_version_error),
     before logging is configured.
 
-    The live toggles are config.py's, each overridable for one run by a flag
-    of the "live trading toggles" group. _resolve_live_settings builds the
-    run's one config.LiveSettings before logging is configured (a bad value
-    exits 2); each run mode logs it (_log_live_settings) and hands it to
-    every live site. The scheduler passes no toggle flag. Two pair-list
-    filters run between the finders and enrichment: _dedup_pairs and
-    _filter_by_category.
+    A production run that sends orders (--mode prod without --dry-run) holds
+    the machine-wide live-run lock (run_lock) from before it builds a client
+    until main() ends, so two such runs never trade the account at once. When
+    another run holds it, this one exits config.EXIT_RUN_IN_PROGRESS (50)
+    without making any request. Dry runs and dev runs send no orders, so they
+    neither take the lock nor wait for it.
+
+    A production run started with --result-file PATH (the flag is refused in
+    dev, right after the order-path check) first removes any file already at
+    PATH, then writes what it did there as JSON in a finally once logging is
+    set up, so however the run ends from that point: the exit code, the line
+    it logged when it stopped or finished, its balances, whether it began
+    sending orders, each pair's outcome, its WARNING-or-worse log lines and
+    any error (reporter.RunReport, written by reporter.write_run_report).
+    Two endings leave no file: a usage error that exits 2 before logging is
+    set up (a bad flag, no or refused saved live defaults, a non-v2 order
+    path), whose reason is on stderr, and a kill signal. A caller therefore
+    reads the exit code first. The file is written before the lock is
+    released, and neither filling nor writing it changes the exit code.
+
+    The live toggles are the saved live defaults (config.LIVE_DEFAULTS_FILE,
+    live_defaults.json, saved through python3 -m kalshi_betting.defaults_server),
+    each overridable for one run by a flag of the "live trading toggles"
+    group. _resolve_live_settings reads them once and builds the run's one
+    config.LiveSettings before logging is configured: with no file saved, a
+    refused file or a bad flag, the run exits 2 before anything is logged or
+    requested, and it never falls back to config.py's toggle constants. Each
+    run mode logs where the defaults came from and the run's settings
+    (_log_live_settings) and hands them to every live site. The scheduler
+    passes no toggle flag. Two pair-list filters run between the finders and
+    enrichment: _dedup_pairs and _filter_by_category.
 
 Dependencies:
     Imports from auth.py (client construction and auth verification), config.py
     (balance threshold, exit-code contract, the order-path check
     order_api_version_error, the same-title threshold and
     close-gap bound, file paths, and the live toggles: LiveSettings,
-    live_settings, the describe_* helpers, live_rule_warnings, SIZE_CAP_STEP),
+    live_defaults with its LiveDefaultsError / LiveDefaultsMissing refusals
+    and LIVE_DEFAULTS_FROM_CONFIG, live_settings (the no-settings fallback),
+    the describe_* helpers, live_rule_warnings, SIZE_CAP_STEP),
     historical.py (load_series_categories, series_labels, infer_category —
     the dashboard's filing rule, which _filter_by_category shares),
-    reporter.py (Excel output), scanner.py (market fetching, pair detection,
+    reporter.py (Excel output, and the run result: RunReport,
+    RunReportHandler, report_trades, write_run_report), _http.py
+    (api_error_summary, the one-line description of the error that stopped
+    a run, for its result), scanner.py (market fetching, pair detection,
     resolve_held_ladders, leg_sides — the only source of truth for which
     side each leg buys — and close_gap_bound_text, which renders that
     close-gap bound in the same words the finders' refusal lines use),
-    strategy.py (trade sizing and portfolio selection), and trader.py (order
-    execution). Entry point for `python3 -m kalshi_betting.main`.
+    strategy.py (trade sizing and portfolio selection), trader.py (order
+    execution), and run_lock.py (the lock that lets one real-money run trade
+    at a time, which main() takes before building a client). Entry point for
+    `python3 -m kalshi_betting.main`.
 
 Notes:
     Label rule for everything this module logs: "A"/"B" always mean
@@ -71,37 +102,54 @@ Notes:
     wrong; the run always continues regardless of what the check finds.
 """
 import argparse
+import contextlib
 import logging
 import logging.handlers
+import os
 import pathlib
 import sys
 from collections import Counter
 from dataclasses import replace as dc_replace
+from datetime import UTC, datetime
 
 from tabulate import tabulate
 
+from . import run_lock
+from ._http import api_error_summary
 from .auth import build_client, verify_auth
 from .config import (
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
+    EXIT_RUN_IN_PROGRESS,
     EXIT_SKIPPED_LOW_BALANCE,
     EXIT_TIME_SERIES_SKIPPED,
     EXIT_TRADES_NEED_ATTENTION,
+    LIVE_DEFAULTS_FROM_CONFIG,
     MIN_BALANCE_CENTS,
     PROJECT_ROOT,
     SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
     SAME_TITLE_MIN_PRICE_DIFF,
     SIZE_CAP_STEP,
+    LiveDefaultsError,
+    LiveDefaultsMissing,
     LiveSettings,
     describe_live_settings,
     describe_time_series_rule,
     describe_trade_filter,
+    live_defaults,
     live_rule_warnings,
     live_settings,
     order_api_version_error,
 )
 from .historical import infer_category, load_series_categories, series_labels
-from .reporter import append_to_prod_log, write_dev_simulation
+from .reporter import (
+    RunReport,
+    RunReportHandler,
+    append_to_prod_log,
+    report_trades,
+    write_dev_simulation,
+    write_run_report,
+)
 from .scanner import (
     check_shard_coverage,
     close_gap_bound_text,
@@ -643,32 +691,44 @@ _LIVE_PERCENT_FLAGS = frozenset({"size_cap", "same_title_size_cap"})
 
 def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     """
-    Resolve this run's LiveSettings, and config.py's to compare it against.
+    Resolve this run's LiveSettings: the saved live defaults, with each given flag laid over.
 
-    The run's settings are config.py's (read at call time) with each GIVEN
-    toggle flag replacing its field; LiveSettings validates the result
-    (dataclasses.replace re-runs __post_init__), so a flag meets config.py's
-    rule. Called before logging is configured (TS-20); the one live function
-    that calls config.live_settings() unconditionally (the AST pin
-    test_ast_live_path_reads_toggles_only_through_live_settings).
+    The run's one read of the defaults (config.live_defaults, the one caller
+    the AST pin test_ast_live_path_reads_toggles_only_through_live_settings
+    allows); exits 2 when none are saved or the file is refused. There is no
+    fallback to config.py's toggle constants. LiveSettings validates the
+    result (dataclasses.replace re-runs __post_init__), so a flag meets the
+    same rule a saved value does; the result keeps the defaults' origin.
+    Called before logging is configured, so a refusal logs nothing and makes
+    no request.
 
     Args:
         args (argparse.Namespace): The parsed flags; a missing attribute reads
             as not given.
-        parser (argparse.ArgumentParser): Used to report an invalid value.
+        parser (argparse.ArgumentParser): Used to report a refusal.
 
     Returns:
-        tuple[LiveSettings, LiveSettings]: (this run's settings, config.py's),
-            equal when no toggle flag was given.
+        tuple[LiveSettings, LiveSettings]: (this run's settings, the saved
+            defaults they were built from), equal when no toggle flag was given.
 
     Raises:
-        SystemExit: Status 2 (parser.error) on an invalid config.py value or flag.
+        SystemExit: Status 2 (parser.error) when no live defaults are saved,
+            the saved file is refused, or a flag's value is invalid.
     """
     try:
-        # config.py's toggles: the reference, and the base the flags lay over
-        reference = live_settings()
-    except ValueError as exc:
-        parser.error(f"config.py's live settings are invalid: {exc}")
+        # The saved live defaults: the reference, and the base the flags lay over.
+        # There is no fallback: with none saved, the run does not start
+        reference = live_defaults()
+    except LiveDefaultsMissing as exc:
+        parser.error(str(exc))
+    except LiveDefaultsError as exc:
+        # The defaults server will not save over a file it refuses, so the
+        # remedy is to fix the file, or to delete it before saving new ones
+        parser.error(f"the saved live defaults are refused ({exc}): fix the file, or delete "
+                     f"it and then save new ones through the defaults server, "
+                     f"./start_dashboard.sh (or python3 -m kalshi_betting.defaults_server): "
+                     f"its --seed, or the backtest dashboard's \"Save as live defaults…\" "
+                     f"button — the server will not save over a file it refuses")
     overrides: dict = {}
     if getattr(args, "tier_floors", None) is not None:
         overrides["tier_floors"] = args.tier_floors
@@ -683,7 +743,7 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     if getattr(args, "same_title_size_cap", None) is not None:
         overrides["same_title_size_cap"] = args.same_title_size_cap / 100
     # --category / --tag (repeatable) set the filter; --any-category / --any-tag
-    # clear config.py's (argparse keeps each pair mutually exclusive)
+    # clear the saved one (argparse keeps each pair mutually exclusive)
     if getattr(args, "category", None) is not None:
         overrides["categories"] = tuple(args.category)
     elif getattr(args, "any_category", None):
@@ -715,25 +775,39 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
 def _log_live_settings(settings: LiveSettings, reference: LiveSettings, *,
                        real_money: bool) -> None:
     """
-    Log the run's toggles, any departure from config.py, and every live_rule_warnings line.
+    Log the run's defaults' origin, its toggles, any departure, and every rule warning.
 
-    One INFO line marks each field that departs from reference "(config: X)";
-    only a real-money run WARNs on a departure. Resolves neither object itself
-    (TestLiveSettingsReachEverySite).
+    One INFO line names the defaults' origin (the saved file, when and from
+    what it was saved). One INFO line marks each field that departs from
+    reference: "(default: X)" when reference is the saved live defaults, as a
+    live run's always is, "(config: X)" when it was built from config.py's
+    constants (a reference a test or direct call builds, e.g. with
+    config.live_settings()). Only a real-money run WARNs on a departure.
+    Resolves neither object itself (TestLiveSettingsReachEverySite).
 
     Args:
         settings (LiveSettings): The run's toggles.
-        reference (LiveSettings): config.py's toggles (the run's own when a
-            run mode was handed none, which marks nothing).
+        reference (LiveSettings): The defaults the run's toggles were built
+            from (the run's own when a run mode was handed none, which marks
+            nothing).
         real_money (bool): True for a prod run that submits orders.
     """
-    # Every field, with a "(config: X)" mark on each one a flag moved
+    # Where the defaults came from: the saved file, when and from what
+    logging.info("Live defaults: %s", reference.origin)
+    # Every field, with a mark on each one a flag moved: "(default: X)" (the
+    # saved defaults), or "(config: X)" for a reference built from config.py
     logging.info("Live settings: %s", describe_live_settings(settings, reference))
     if real_money and settings != reference:
-        logging.warning(
-            "This PRODUCTION run overrides config.py's live settings (see the "
-            "\"(config: …)\" marks on the line above): its trades follow the "
-            "flags, not the committed configuration")
+        if reference.origin == LIVE_DEFAULTS_FROM_CONFIG:
+            logging.warning(
+                "This PRODUCTION run overrides config.py's live settings (see the "
+                "\"(config: …)\" marks on the line above): its trades follow the "
+                "flags, not the committed configuration")
+        else:
+            logging.warning(
+                "This PRODUCTION run overrides the saved live defaults (see the "
+                "\"(default: …)\" marks on the line above): its trades follow the "
+                "flags, not the saved defaults")
     # A setting that empties part of the strategy or lifts one pair's stake
     for text in live_rule_warnings(settings):
         logging.warning("Live settings: %s", text)
@@ -755,8 +829,11 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
             auth.build_client("dev").
         args: Parsed argparse Namespace with sandbox_balance and
             max_horizon_days attributes.
-        settings (LiveSettings | None): The run's toggles; None resolves config.py's.
-        reference (LiveSettings | None): config.py's toggles; None means the run's own.
+        settings (LiveSettings | None): The run's toggles; None resolves
+            config.py's (tests and direct calls only: main() always hands the
+            run's, built from the saved live defaults).
+        reference (LiveSettings | None): The saved live defaults the run's
+            toggles were built from; None means the run's own.
 
     Returns:
         int: EXIT_NO_TRADEABLE_SHARDS when the run was blind — every
@@ -889,7 +966,8 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
 
 
 def _run_prod(client, args, settings: LiveSettings | None = None,
-              reference: LiveSettings | None = None) -> int:
+              reference: LiveSettings | None = None, *,
+              report: RunReport | None = None) -> int:
     """
     Execute a full production run using the real Kalshi account.
 
@@ -901,7 +979,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     trader.execute_trades). Results are appended to the persistent
     trade_log.xlsx file. In dry_run mode (--dry-run flag), all steps run
     normally except order submission — the log still records rows with
-    status="simulated".
+    status="simulated". Along the way it fills in the run report it is
+    handed (see report below); every return value is the same with or
+    without one.
 
     It makes no new time-series trade on a ladder the account holds (a ladder
     is one question asked at several deadlines), and none at all if a held
@@ -912,9 +992,21 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             auth.build_client("prod").
         args: Parsed argparse Namespace with dry_run and max_horizon_days
             attributes.
-        settings (LiveSettings | None): The run's toggles; None resolves config.py's.
-        reference (LiveSettings | None): config.py's toggles, which departures
-            are marked against; None means the run's own.
+        settings (LiveSettings | None): The run's toggles; None resolves
+            config.py's (tests and direct calls only: main() always hands the
+            run's, built from the saved live defaults).
+        reference (LiveSettings | None): The saved live defaults the run's
+            toggles were built from, which departures are marked against;
+            None means the run's own.
+        report (RunReport | None): Keyword-only. The run result main() writes
+            for --result-file, filled in as the run goes: the balance before
+            and after trading, that it began sending orders (set just before
+            execute_trades on a run that is not a dry run), one record per
+            pair (reporter.report_trades, which never raises, so the trade log
+            is still written), and the message — the line the run logged when
+            it stopped without trading, or its closing summary line, word for
+            word. None (no --result-file) fills a report nobody reads, so the
+            run is the same either way.
 
     Returns:
         int: EXIT_SKIPPED_LOW_BALANCE if the run was skipped because the
@@ -938,6 +1030,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     Raises:
         ValueError: When settings is None and a config.py toggle is invalid.
     """
+    # What the run did, for main.py --result-file; without it nothing reads this one
+    report = RunReport(dry_run=args.dry_run, started_at=datetime.now(UTC)) if report is None else report
     # Resolved ONCE, before any request, and handed to every site below that reads a toggle
     settings = live_settings() if settings is None else settings
     reference = settings if reference is None else reference
@@ -953,13 +1047,13 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # shard_balances itself stays a live local — the coverage check and the
     # transfer planner below both consume the full per-shard picture.
     balance_cents = sum(shard_balances.values())
+    report.balance_before = balance_cents / 100
     if balance_cents < MIN_BALANCE_CENTS:
         # Don't waste API calls scanning when there's insufficient capital to trade
-        logging.warning(
-            "Balance $%.2f is below minimum $%.2f — skipping run.",
-            balance_cents / 100,
-            MIN_BALANCE_CENTS / 100,
-        )
+        message = (f"Balance ${balance_cents / 100:.2f} is below minimum "
+                   f"${MIN_BALANCE_CENTS / 100:.2f} — skipping run.")
+        logging.warning("%s", message)
+        report.message = message
         return EXIT_SKIPPED_LOW_BALANCE
 
     # Get current open positions so we don't re-enter markets we already hold
@@ -998,6 +1092,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     blind_reason = _blind_run_reason(markets, shard_statuses, inactive_shards)
     if blind_reason:
         logging.warning("%s", blind_reason)
+        report.message = blind_reason
         return EXIT_NO_TRADEABLE_SHARDS
 
     # Our positions' ladders, read before held markets are dropped; None
@@ -1032,8 +1127,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
 
     if not candidate_pairs:
         # Names the run's entry rule, or says time-series was not searched
-        logging.info(_no_pairs_msg(settings=settings,
-                                   time_series_searched=held_ladders is not None))
+        message = _no_pairs_msg(settings=settings, time_series_searched=held_ladders is not None)
+        logging.info("%s", message)
+        report.message = message
         return clean_exit
 
     # Apply Kelly sizing to each candidate pair using the real account balance
@@ -1053,7 +1149,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     print_pairs_table(candidate_pairs, display_specs)
 
     if not portfolio:
-        logging.info("No executable trades found.")
+        message = "No executable trades found."
+        logging.info("%s", message)
+        report.message = message
         return clean_exit
 
     _print_portfolio(portfolio, "Selected")
@@ -1061,7 +1159,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # Re-fetch each pair's books and drop any that moved, under the run's rule
     portfolio = pre_execution_check(client, portfolio, settings=settings)
     if not portfolio:
-        logging.info("All selected pairs failed pre-execution price check — no trades submitted.")
+        message = "All selected pairs failed pre-execution price check — no trades submitted."
+        logging.info("%s", message)
+        report.message = message
         return clean_exit
 
     # Move collateral to the shards the selected trades draw from — sizing is
@@ -1072,24 +1172,37 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         client, portfolio, shard_balances, shard_statuses, dry_run=args.dry_run,
     )
     if not portfolio:
-        logging.info(
+        message = (
             "No selected pair could be funded on its exchange shard — no trades submitted."
         )
+        logging.info("%s", message)
+        report.message = message
         # Never a bare return: sys.exit(None) exits 0, which would hide
         # EXIT_TIME_SERIES_SKIPPED
         return clean_exit
+
+    # Recorded before the first order is sent, so a result written after an
+    # exception or Ctrl-C during execute_trades (whose trades are not yet
+    # recorded) still says orders may have been placed
+    if not args.dry_run:
+        report.submission_started = True
 
     # Submit orders sequentially per leg, concurrently across pairs (on the V2
     # path, one pair at a time until a NO fill has confirmed the order-side
     # mapping, for at most config.V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS; a
     # disproof stops every pair that starts after it)
     results = execute_trades(client, portfolio, dry_run=args.dry_run)
+    # Each pair's outcome for the run result, before the trade log is written;
+    # it never raises, so the trade log and its rescue dump are always reached
+    report.trades = report_trades(results)
 
     # Read the post-trade balance for the Excel log separator row. Real orders
     # may already have filled at this point, so a failure here must not lose the
     # trade records — fall back to the pre-trade balance and keep going.
     try:
         balance_after = sum(verify_auth(client).values()) / 100
+        # Only a balance actually read goes into the run result
+        report.balance_after = balance_after
     except Exception as exc:
         logging.error(
             "Post-trade balance fetch failed: %s — logging with pre-trade balance", exc,
@@ -1102,11 +1215,14 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     try:
         # append_to_prod_log() already logs "Trade log updated: %s (%d new row(s))"
         # itself (BS-26) — don't duplicate that line here. The note marks the
-        # toggles a flag moved, so the workbook tells rows traded under a flag
-        # from rows traded under config.py's values
+        # toggles a flag moved and names the saved defaults the run started
+        # from, so the workbook tells rows traded under a flag from rows traded
+        # under the defaults, and one set of saved defaults from the next
         append_to_prod_log(
             results, balance_cents / 100, balance_after,
-            run_note=f"settings: {describe_live_settings(settings, reference)}",
+            run_note=(f"settings: {describe_live_settings(settings, reference)}"
+                      + ("" if reference.origin == LIVE_DEFAULTS_FROM_CONFIG
+                         else f" | defaults: {reference.origin}")),
         )
     except Exception as exc:
         logging.critical("Failed to write trade log: %s — rescue dump follows", exc)
@@ -1128,7 +1244,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         raise
 
     if args.dry_run:
-        logging.info("[DRY RUN] No orders were actually submitted.")
+        message = "[DRY RUN] No orders were actually submitted."
+        logging.info("%s", message)
+        report.message = message
         return clean_exit
 
     n_ok       = sum(1 for r in results if r.status == "executed")
@@ -1141,11 +1259,11 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # comes back "failed", so it is not counted here; the disproving pair's
     # manual_review is what returns EXIT_TRADES_NEED_ATTENTION.
     n_unknown  = sum(1 for r in results if r.status == "manual_review")
-    logging.info(
-        "Submitted %d of %d order pair(s) successfully. %d rolled back, "
-        "%d rollback failure(s), %d unknown fill state(s).",
-        n_ok, len(results), n_rolled, n_orphaned, n_unknown,
-    )
+    message = (f"Submitted {n_ok} of {len(results)} order pair(s) successfully. "
+               f"{n_rolled} rolled back, {n_orphaned} rollback failure(s), "
+               f"{n_unknown} unknown fill state(s).")
+    logging.info("%s", message)
+    report.message = message
     if n_orphaned or n_unknown:
         logging.critical(
             "%d pair(s) may have ORPHANED positions and %d pair(s) have an "
@@ -1158,6 +1276,116 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         return EXIT_TRADES_NEED_ATTENTION
 
     return clean_exit
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """
+    Build main.py's command-line parser: every flag, with the "live trading toggles" group.
+
+    main() parses sys.argv with it. A test builds it to parse a list of flags,
+    such as config.live_settings_argv's, the way main() would.
+
+    Returns:
+        argparse.ArgumentParser: The parser, with nothing parsed yet.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Kalshi Arbitrage Bot — scans for two kinds of mispriced contract "
+            "pairs (same-title near-arbitrage pairs, and directional "
+            "time-series pairs betting against the market's implied chance "
+            "that an event first happens between two deadlines), sizes them "
+            "with the Kelly criterion, and submits fill-or-kill orders."
+        ),
+    )
+    parser.add_argument(
+        "--mode", choices=["dev", "prod"], default="dev",
+        help="'dev' scans real sandbox markets and simulates; 'prod' uses real account",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="(prod only) Discover and size trades but do not submit orders",
+    )
+    parser.add_argument(
+        "--sandbox-balance", type=float, default=1000.0, metavar="DOLLARS",
+        help="Virtual balance in dollars used for trade sizing in dev mode (default: 1000)",
+    )
+    parser.add_argument(
+        "--max-horizon-days", type=int, default=None, metavar="DAYS",
+        help="Only consider markets closing within DAYS from now (both modes; default: no limit)",
+    )
+    parser.add_argument(
+        "--result-file", type=pathlib.Path, default=None, metavar="PATH",
+        help="(prod only) When the run ends, write what it did (outcome, trades, "
+             "warnings) to PATH as JSON, replacing any file there; a usage error "
+             "(exit 2, reason on stderr) or a kill signal leaves no file",
+    )
+    # Every flag defaults to None (not given); LiveSettings alone validates the
+    # values — no choices, range check or literal here
+    live = parser.add_argument_group(
+        "live trading toggles",
+        "Override one live default for THIS run only, in either mode. The live defaults "
+        "are the ones saved through python3 -m kalshi_betting.defaults_server "
+        "(live_defaults.json); a run refuses to start without them. The weekly scheduler "
+        "passes none of these flags, so a scheduled run trades exactly the saved defaults.",
+    )
+    live.add_argument(
+        "--tier-floors", action=argparse.BooleanOptionalAction, default=None,
+        help="Apply (or, with --no-tier-floors, drop) the deadline-gap tier floors on "
+             "time-series pairs (default: the saved live defaults)",
+    )
+    live.add_argument(
+        "--spread-min", type=float, default=None, metavar="X",
+        help="Time-series spread-band FLOOR on pB - pA, 0-1 "
+             "(default: the saved live defaults)",
+    )
+    live.add_argument(
+        "--spread-max", type=float, default=None, metavar="Y",
+        help="Time-series spread-band CEILING on pB - pA, 0-1 "
+             "(default: the saved live defaults)",
+    )
+    live.add_argument(
+        "--interval-discount", type=float, default=None, metavar="K",
+        help="Time-series interval discount k, in (0, 1] "
+             "(default: the saved live defaults)",
+    )
+    # The caps' grid step in percent (SIZE_CAP_STEP); argparse %-formats help, hence "%%"
+    cap_step = f"{SIZE_CAP_STEP * 100:g}"
+    live.add_argument(
+        "--size-cap", type=int, default=None, metavar="PCT",
+        help=f"Per-trade Kelly cap for every pair, in whole percent, in {cap_step}%% "
+             "steps; 100 = no cap (default: the saved live defaults)",
+    )
+    live.add_argument(
+        "--same-title-size-cap", type=int, default=None, metavar="PCT",
+        help=f"Extra per-trade cap on same-title pairs, in whole percent, in {cap_step}%% "
+             "steps; 100 = no extra cap beyond --size-cap "
+             "(default: the saved live defaults)",
+    )
+    # Filed as the backtest dashboard files a trade (_filter_by_category)
+    categories = live.add_mutually_exclusive_group()
+    categories.add_argument(
+        "--category", action="append", default=None, metavar="NAME",
+        help="Trade only pairs filed under this Kalshi category, as the backtest "
+             "dashboard's Category select names it (repeatable; case-insensitive; "
+             "default: the saved live defaults)",
+    )
+    categories.add_argument(
+        "--any-category", action="store_true", default=None,
+        help="Trade any category this run, whatever the saved live defaults say",
+    )
+    tags = live.add_mutually_exclusive_group()
+    tags.add_argument(
+        "--tag", action="append", default=None, metavar="NAME",
+        help="Trade only pairs whose series' FIRST Kalshi tag is NAME, under ANY "
+             "category unless --category narrows it: the backtest dashboard's Tag "
+             "option \"C · T\" is --category C --tag T (repeatable; case-insensitive; "
+             "combined with --category by AND; default: the saved live defaults)",
+    )
+    tags.add_argument(
+        "--any-tag", action="store_true", default=None,
+        help="Trade any tag this run, whatever the saved live defaults say",
+    )
+    return parser
 
 
 def _setup_logging(log_path: pathlib.Path) -> None:
@@ -1206,150 +1434,151 @@ def main() -> None:
     Parses command-line arguments (--mode, --dry-run, --sandbox-balance,
     --max-horizon-days, and the "live trading toggles" group), exits 2 if
     config.ORDER_API_VERSION is not "v2" (config.order_api_version_error),
-    checks --max-horizon-days, resolves the run's settings and config.py's
-    reference (_resolve_live_settings) — all before logging is configured or
-    any request is made — then configures logging, builds the Kalshi client
-    and runs _run_dev (sandbox simulation) or _run_prod (real trading). Ends
-    with sys.exit() and the run's return code (the EXIT_* constants in
-    config.py), which the scheduler reads. An unhandled exception propagates
-    and exits 1.
+    checks --max-horizon-days, resolves the run's settings and the saved live
+    defaults they were built from (_resolve_live_settings: with no defaults
+    saved, a refused file or a bad flag it exits 2) — all before logging is
+    configured or any request is made — then configures logging, builds the
+    Kalshi client and runs _run_dev (sandbox simulation) or _run_prod (real
+    trading). Ends with sys.exit() and the run's return code (the EXIT_*
+    constants in config.py), which the scheduler reads. An unhandled exception
+    propagates and exits 1.
+
+    A production run that sends orders (--mode prod without --dry-run) first
+    takes the machine-wide live-run lock (run_lock.acquire), before it builds
+    the client, and holds it until the run mode returns or raises; the lock is
+    released in a finally, so a second call in the same process takes it
+    afresh. When another run still holds the lock after
+    config.LIVE_RUN_LOCK_WAIT_SECONDS, this run logs a WARNING naming the
+    holder and exits EXIT_RUN_IN_PROGRESS (50) without building a client or
+    making any request. An error making or opening the lock file propagates
+    (exit 1). Dry runs and dev runs send no orders, so they neither take the
+    lock nor wait for it.
+
+    With --result-file PATH (--mode prod only: in dev it exits 2 right after
+    the order-path check, before logging is configured, a client is built or
+    any request is made), any file already at PATH is removed right after
+    that check, and a reporter.RunReport is filled in as the run goes: the
+    run's settings and where its defaults came from, every WARNING-or-worse
+    line logged after logging is configured (reporter.RunReportHandler, on
+    the root logger), and what _run_prod records. It is written to PATH as
+    JSON (reporter.write_run_report) in a finally, so however the run ends
+    once logging is configured — with the exit code, or with no exit code
+    and a one-line error (_http.api_error_summary) when an exception stops
+    it, which still propagates — before the handler is removed and the lock
+    released. A usage error that exits 2 before logging is configured (a bad
+    flag, no or refused saved live defaults, a non-v2 order path) and a kill
+    signal leave no file, so a caller reads the exit code first. Neither
+    filling nor writing it changes the exit code.
 
     Returns:
         None: This function never returns to its caller — it always ends by
             calling sys.exit(code), which raises SystemExit.
     """
-    parser = argparse.ArgumentParser(
-        description=(
-            "Kalshi Arbitrage Bot — scans for two kinds of mispriced contract "
-            "pairs (same-title near-arbitrage pairs, and directional "
-            "time-series pairs betting against the market's implied chance "
-            "that an event first happens between two deadlines), sizes them "
-            "with the Kelly criterion, and submits fill-or-kill orders."
-        ),
-    )
-    parser.add_argument(
-        "--mode", choices=["dev", "prod"], default="dev",
-        help="'dev' scans real sandbox markets and simulates; 'prod' uses real account",
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="(prod only) Discover and size trades but do not submit orders",
-    )
-    parser.add_argument(
-        "--sandbox-balance", type=float, default=1000.0, metavar="DOLLARS",
-        help="Virtual balance in dollars used for trade sizing in dev mode (default: 1000)",
-    )
-    parser.add_argument(
-        "--max-horizon-days", type=int, default=None, metavar="DAYS",
-        help="Only consider markets closing within DAYS from now (both modes; default: no limit)",
-    )
-    # Every flag defaults to None (not given); LiveSettings alone validates the
-    # values — no choices, range check or literal here
-    live = parser.add_argument_group(
-        "live trading toggles",
-        "Override one config.py setting for THIS run only, in either mode. The weekly "
-        "scheduler passes none of these, so a scheduled run trades exactly config.py.",
-    )
-    live.add_argument(
-        "--tier-floors", action=argparse.BooleanOptionalAction, default=None,
-        help="Apply (or, with --no-tier-floors, drop) the deadline-gap tier floors on "
-             "time-series pairs (default: config.TIME_SERIES_TIER_FLOORS)",
-    )
-    live.add_argument(
-        "--spread-min", type=float, default=None, metavar="X",
-        help="Time-series spread-band FLOOR on pB - pA, 0-1 "
-             "(default: config.TIME_SERIES_SPREAD_BAND's floor)",
-    )
-    live.add_argument(
-        "--spread-max", type=float, default=None, metavar="Y",
-        help="Time-series spread-band CEILING on pB - pA, 0-1 "
-             "(default: config.TIME_SERIES_SPREAD_BAND's ceiling)",
-    )
-    live.add_argument(
-        "--interval-discount", type=float, default=None, metavar="K",
-        help="Time-series interval discount k, in (0, 1] "
-             "(default: config.TIME_SERIES_INTERVAL_PROB_DISCOUNT)",
-    )
-    # The caps' grid step in percent (SIZE_CAP_STEP); argparse %-formats help, hence "%%"
-    cap_step = f"{SIZE_CAP_STEP * 100:g}"
-    live.add_argument(
-        "--size-cap", type=int, default=None, metavar="PCT",
-        help=f"Per-trade Kelly cap for every pair, in whole percent, in {cap_step}%% "
-             "steps; 100 = no cap (default: config.BUDGET_FRACTION)",
-    )
-    live.add_argument(
-        "--same-title-size-cap", type=int, default=None, metavar="PCT",
-        help=f"Extra per-trade cap on same-title pairs, in whole percent, in {cap_step}%% "
-             "steps; 100 = no extra cap beyond --size-cap "
-             "(default: config.SAME_TITLE_SIZE_CAP)",
-    )
-    # Filed as the backtest dashboard files a trade (_filter_by_category)
-    categories = live.add_mutually_exclusive_group()
-    categories.add_argument(
-        "--category", action="append", default=None, metavar="NAME",
-        help="Trade only pairs filed under this Kalshi category, as the backtest "
-             "dashboard's Category select names it (repeatable; case-insensitive; "
-             "default: config.TRADE_CATEGORIES)",
-    )
-    categories.add_argument(
-        "--any-category", action="store_true", default=None,
-        help="Trade any category this run, whatever config.TRADE_CATEGORIES says",
-    )
-    tags = live.add_mutually_exclusive_group()
-    tags.add_argument(
-        "--tag", action="append", default=None, metavar="NAME",
-        help="Trade only pairs whose series' FIRST Kalshi tag is NAME, under ANY "
-             "category unless --category narrows it: the backtest dashboard's Tag "
-             "option \"C · T\" is --category C --tag T (repeatable; case-insensitive; "
-             "combined with --category by AND; default: config.TRADE_TAGS)",
-    )
-    tags.add_argument(
-        "--any-tag", action="store_true", default=None,
-        help="Trade any tag this run, whatever config.TRADE_TAGS says",
-    )
+    # Every flag, their help and the live-toggle group (_build_parser)
+    parser = _build_parser()
     args = parser.parse_args()
     # Exit 2 unless ORDER_API_VERSION is "v2", before anything is logged, a
     # client is built or an order could be sent
     problem = order_api_version_error()
     if problem:
         parser.error(problem)
+    # The run result describes a production run only; refused right after the
+    # order-path check, before logging, a client or any request
+    if args.result_file is not None and args.mode != "prod":
+        parser.error("--result-file is for --mode prod only")
+    if args.result_file is not None:
+        # An older result at PATH must never pass for this run's: whatever is
+        # there when main() ends was written by this run, or nothing is (a
+        # usage error below, or a kill signal). A file that cannot be removed
+        # is left to the final write, which logs why it cannot replace it.
+        with contextlib.suppress(OSError):
+            args.result_file.unlink(missing_ok=True)
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
         parser.error("--max-horizon-days must be a positive integer")
-    # Validated BEFORE logging is configured (TS-20): a bad flag or config.py
-    # value exits 2 with nothing logged or requested
+    # Read and validated BEFORE logging is configured: no saved live defaults,
+    # a refused file or a bad flag exits 2 with nothing logged or requested
     settings, reference = _resolve_live_settings(args, parser)
 
     # Echo to the console (foreground/interactive runs) as well as the
     # persistent log file (later inspection, scheduler-spawned runs)
     _setup_logging(PROJECT_ROOT / "kalshi_arb.log")
 
-    if args.mode == "dev" and args.dry_run:
-        # _run_dev always calls execute_trades(dry_run=True) regardless of
-        # args.dry_run (dev never submits real orders), so --dry-run has no
-        # effect in dev mode. Logged (not parser.error'd) after basicConfig so
-        # it lands in kalshi_arb.log for anyone diagnosing "why didn't
-        # --dry-run change anything" after the fact.
-        logging.warning("--dry-run is inert in dev mode — dev never submits orders")
+    # With --result-file (prod only): what the run did, filled in as it goes
+    # and written in the finally below, however the run ends from here on; the
+    # handler copies in every WARNING-or-worse line logged from here on
+    report = handler = None
+    if args.result_file is not None:
+        report = RunReport(dry_run=args.dry_run, started_at=datetime.now(UTC),
+                           settings=describe_live_settings(settings, reference),
+                           defaults=reference.origin)
+        handler = RunReportHandler(report)
+        logging.getLogger().addHandler(handler)
+    # One production run that sends orders at a time on this machine
+    # (run_lock); dry runs and dev runs send none, so they neither take the
+    # lock nor wait for it
+    lock_fd = None
+    code = None
+    try:
+        if args.mode == "dev" and args.dry_run:
+            # _run_dev always calls execute_trades(dry_run=True) regardless of
+            # args.dry_run (dev never submits real orders), so --dry-run has no
+            # effect in dev mode. Logged (not parser.error'd) after basicConfig so
+            # it lands in kalshi_arb.log for anyone diagnosing "why didn't
+            # --dry-run change anything" after the fact.
+            logging.warning("--dry-run is inert in dev mode — dev never submits orders")
 
-    if args.mode == "prod" and args.sandbox_balance != parser.get_default("sandbox_balance"):
-        # Mirror of the --dry-run-in-dev twin above. _run_prod sizes on the
-        # REAL per-shard balance from verify_auth and never reads
-        # sandbox_balance, so passing it in prod silently does nothing — an
-        # operator who meant to cap their exposure would get full-size live
-        # orders instead. Logged rather than parser.error'd, same as the twin,
-        # so it lands in kalshi_arb.log for later diagnosis (TS-19).
-        logging.warning(
-            "--sandbox-balance is inert in prod mode — prod sizes on the real "
-            "account balance; use --dry-run to avoid submitting orders",
-        )
+        if args.mode == "prod" and args.sandbox_balance != parser.get_default("sandbox_balance"):
+            # Mirror of the --dry-run-in-dev twin above. _run_prod sizes on the
+            # REAL per-shard balance from verify_auth and never reads
+            # sandbox_balance, so passing it in prod silently does nothing — an
+            # operator who meant to cap their exposure would get full-size live
+            # orders instead. Logged rather than parser.error'd, same as the twin,
+            # so it lands in kalshi_arb.log for later diagnosis (TS-19).
+            logging.warning(
+                "--sandbox-balance is inert in prod mode — prod sizes on the real "
+                "account balance; use --dry-run to avoid submitting orders",
+            )
 
-    client = build_client(args.mode)  # returns KalshiClient authenticated via RSA key from secrets.json
+        if args.mode == "prod" and not args.dry_run:
+            # The machine-wide lock every real-money run shares; None when
+            # another run still holds it after LIVE_RUN_LOCK_WAIT_SECONDS
+            lock_fd = run_lock.acquire()
+            if lock_fd is None:
+                # The record names the run in the way (run_lock.holder)
+                message = (f"Another live trading run is in progress "
+                           f"({run_lock.holder().describe()}) — this run stops "
+                           f"without contacting Kalshi, so nothing is sent "
+                           f"(exit {EXIT_RUN_IN_PROGRESS}).")
+                logging.warning("%s", message)
+                if report is not None:
+                    report.message = message
+                code = EXIT_RUN_IN_PROGRESS
+        if code is None:
+            client = build_client(args.mode)  # returns KalshiClient authenticated via RSA key from secrets.json
 
-    # Both run modes get the run's settings and config.py's reference
-    if args.mode == "dev":
-        code = _run_dev(client, args, settings, reference)
-    else:
-        code = _run_prod(client, args, settings, reference)
+            # Both run modes get the run's settings and the saved defaults they were
+            # built from; a production run also gets the report to fill (None
+            # without --result-file)
+            if args.mode == "dev":
+                code = _run_dev(client, args, settings, reference)
+            else:
+                code = _run_prod(client, args, settings, reference, report=report)
+    except BaseException as exc:
+        if report is not None:
+            # One line, as the trade log records a failed order, never a traceback
+            report.error = api_error_summary(exc)
+        raise
+    finally:
+        if report is not None:
+            # Written before the lock is released, with the exit code, or None
+            # when an exception is on its way out (report.error names it);
+            # never raises
+            write_run_report(args.result_file, report, code)
+            logging.getLogger().removeHandler(handler)
+        if lock_fd is not None:
+            # Released only once the run mode has returned or raised and its
+            # result is written; nothing trades after this
+            os.close(lock_fd)
 
     # Only sys.exit() communicates the outcome to a subprocess caller (the
     # scheduler) — a bare return here would always look like exit 0.

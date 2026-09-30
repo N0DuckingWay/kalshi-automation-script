@@ -13,6 +13,7 @@ import weakref
 from array import array
 from collections import defaultdict
 from dataclasses import astuple
+from dataclasses import replace as dc_replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from fractions import Fraction
@@ -64,7 +65,7 @@ from kalshi_betting.config import (
 from kalshi_betting.scanner import CandidatePair
 from kalshi_betting.strategy import compute_trade
 
-from .conftest import apply_pre_toggle_defaults
+from .conftest import apply_pre_toggle_defaults, save_config_live_defaults
 from .test_scheduler import _host_zone
 
 
@@ -10600,13 +10601,25 @@ def _completion_prefixes(messages: list[str]) -> list[str]:
 
 
 @pytest.fixture(scope="class")
-def golden_band_sweep():
+def golden_band_sweep(tmp_path_factory):
     """ONE full band sweep (36 bands x 13 k, ladders on) over the
     TestPrepareEntriesGolden fixture, with spies on every seam the tests
     below read, plus a band_sweep=False run of the same fixture. Class-scoped
     so the whole class pays for one sweep, not one per test. Pins
     apply_pre_toggle_defaults on its own MonkeyPatch, held through both runs
-    and the class's tests, which re-simulate at call time."""
+    and the class's tests, which re-simulate at call time. Takes pytest's
+    session temporary-directory maker (tmp_path_factory) only to check where
+    the saved live defaults file points during class setup."""
+    from kalshi_betting import config
+    # Class setup runs before any function-scoped fixture: conftest's session
+    # redirect of the saved live defaults file (a directory it made with
+    # tmp_path_factory.mktemp, directly under the session's base temporary
+    # directory) is what is in force here, never the checkout's own
+    # live_defaults.json
+    assert config.LIVE_DEFAULTS_FILE != config.PROJECT_ROOT / "live_defaults.json", \
+        config.LIVE_DEFAULTS_FILE
+    assert config.LIVE_DEFAULTS_FILE.parent.parent == tmp_path_factory.getbasetemp(), \
+        config.LIVE_DEFAULTS_FILE
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     handler = _LogCapture()
@@ -13060,18 +13073,22 @@ class TestCapSweepLogging:
 
 
 class TestLiveRuleLine:
-    """"Live time-series rule (config.py): ..." — config.py's live rule and
-    filter, read once before the fetch, recorded on BacktestSweep.live_* and
-    logged once the sweep exists with where its grid holds the rule
-    (backtester._live_rule_view, the one verdict the dashboard renders too)."""
+    """"Live time-series rule (saved live defaults): ..." — the saved live
+    defaults' rule and filter, read once before the fetch, recorded on
+    BacktestSweep.live_* and logged once the sweep exists with where its grid
+    holds the rule (backtester._live_rule_view, the one verdict the dashboard
+    renders too). With no usable defaults saved the line still appears, saying
+    none are recorded."""
 
     # A narrowed 4-band grid and one k keep the golden band sweep small
     _FLOORS, _CEILINGS = (0.0, 0.35), (0.5, 1.0)
 
+    _PREFIX = "Live time-series rule (saved live defaults): "
+
     @staticmethod
     def _lines(caplog) -> list[str]:
         return [r.getMessage() for r in caplog.records
-                if r.getMessage().startswith("Live time-series rule (config.py):")]
+                if r.getMessage().startswith("Live time-series rule")]
 
     def _line(self, caplog) -> str:
         lines = self._lines(caplog)
@@ -13080,11 +13097,13 @@ class TestLiveRuleLine:
 
     @staticmethod
     def _live(monkeypatch, tier_floors, band, categories=None, tags=None):
+        """Save config.py's toggles with this rule and filter as the live defaults."""
         from kalshi_betting import config
         monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", tier_floors)
         monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", band)
         monkeypatch.setattr(config, "TRADE_CATEGORIES", categories)
         monkeypatch.setattr(config, "TRADE_TAGS", tags)
+        save_config_live_defaults()
         return config.describe_time_series_rule(tier_floors, band)
 
     def _feasible(self, monkeypatch, caplog, **kw):
@@ -13114,7 +13133,7 @@ class TestLiveRuleLine:
             cap = next(i for i, m in enumerate(messages) if m.startswith("Per-trade size cap"))
             line = self._line(caplog)
             assert messages.index(line) > cap
-            assert line == (f"Live time-series rule (config.py): {rule} — this run's "
+            assert line == (f"Live time-series rule (saved live defaults): {rule} — this run's "
                             "primary scenario applies it")
 
     def test_the_feasible_line_is_the_last_the_sweep_logs(self, monkeypatch, caplog):
@@ -13122,28 +13141,84 @@ class TestLiveRuleLine:
         self._live(monkeypatch, True, (0.0, 1.0))
         self._feasible(monkeypatch, caplog, band_sweep=True, cap_sweep=True)
         messages = [r.getMessage() for r in caplog.records]
-        assert messages[-1].startswith("Live time-series rule (config.py):")
+        assert messages[-1].startswith(self._PREFIX)
         assert any(m.startswith("Size-cap sweep:") for m in messages[:-1])
 
+    # The eight fields a saved-defaults read records, all or none
+    _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_categories", "live_tags",
+                    "live_origin", "live_interval_discount", "live_size_cap",
+                    "live_same_title_size_cap")
+
     @pytest.mark.parametrize("feasible", [False, True])
-    def test_an_invalid_live_config_records_none_and_warns_once(
-        self, monkeypatch, caplog, feasible,
-    ):
+    def test_a_refused_file_records_none_and_warns_once(self, monkeypatch, caplog, feasible):
         from kalshi_betting import config
-        # A floor above the ceiling fails LiveSettings' validation, so
-        # live_settings() raises, read once per run: _sweep_from_candidates is
-        # handed that read (None) rather than reading again
-        monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", (0.9, 0.1))
+        # A refused file makes live_defaults() raise, read once per run:
+        # _sweep_from_candidates is handed that read (None) rather than reading again
+        config.LIVE_DEFAULTS_FILE.write_text("not json", encoding="utf-8")
         res = (self._feasible if feasible else self._infeasible)(monkeypatch, caplog)
-        assert (res.live_tier_floors, res.live_spread_band, res.live_categories,
-                res.live_tags) == (None, None, None, None)
-        assert not self._lines(caplog)
-        warned = [r.getMessage() for r in caplog.records
-                  if r.levelno == logging.WARNING and "do not validate" in r.getMessage()]
+        assert all(getattr(res, name) is None for name in self._LIVE_FIELDS)
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                  and "saved live defaults are refused" in r.getMessage()]
         assert len(warned) == 1
-        assert warned[0].startswith("config.py's live toggles do not validate (")
+        assert warned[0].startswith("The saved live defaults are refused (")
+        assert str(config.LIVE_DEFAULTS_FILE) in warned[0]
+        assert not [r for r in caplog.records if "do not validate" in r.getMessage()]
+        # The line still says what the report holds: none recorded
+        assert self._line(caplog) == f"Live time-series rule: {backtester._LIVE_RULE_NONE}"
         # The run itself went ahead: a feasible one simulated its band
         assert bool(res.calibrations_by_band) is feasible
+
+    @pytest.mark.parametrize("feasible", [False, True])
+    def test_no_saved_file_records_none_with_one_info_line(self, monkeypatch, caplog, feasible):
+        from kalshi_betting import config
+        assert not config.LIVE_DEFAULTS_FILE.exists()
+        res = (self._feasible if feasible else self._infeasible)(monkeypatch, caplog)
+        assert all(getattr(res, name) is None for name in self._LIVE_FIELDS)
+        said = [r for r in caplog.records if r.getMessage().startswith(
+            "No live defaults are saved, so live runs refuse to start")]
+        assert len(said) == 1 and said[0].levelno == logging.INFO
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING
+                    and "live defaults" in r.getMessage()]
+        assert self._line(caplog) == (
+            "Live time-series rule: none recorded — no usable live defaults were saved "
+            "when this run started, and live runs refuse to start without them")
+        assert bool(res.calibrations_by_band) is feasible
+
+    def test_the_eight_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
+        from kalshi_betting import config
+        saved = config.save_live_defaults(
+            config.LiveSettings(False, (0.1, 0.8), 0.6, 0.35, 0.25, ("Economics",), ("Fed",)),
+            source="a note")
+        reads: list = []
+        real = config.read_saved_live_defaults
+
+        def counting():
+            """
+            Count one read of the saved file, then read it.
+
+            Returns:
+                config.LiveSettings | None: What config.read_saved_live_defaults
+                    returns.
+            """
+            reads.append(1)
+            return real()
+
+        monkeypatch.setattr(config, "read_saved_live_defaults", counting)
+        res = self._infeasible(monkeypatch, caplog)
+        assert len(reads) == 1
+        assert {name: getattr(res, name) for name in self._LIVE_FIELDS} == {
+            "live_tier_floors": False, "live_spread_band": (0.1, 0.8),
+            "live_categories": ("Economics",), "live_tags": ("Fed",),
+            "live_origin": saved.origin, "live_interval_discount": 0.6,
+            "live_size_cap": 0.35, "live_same_title_size_cap": 0.25}
+
+    def test_the_live_rule_fields_are_eight_keys_or_none(self):
+        from kalshi_betting import config
+        assert backtester._live_rule_fields(None) == {}
+        fields = backtester._live_rule_fields(config.LIVE_DEFAULTS_SEED)
+        assert tuple(fields) == self._LIVE_FIELDS
+        assert fields["live_origin"] == config.LIVE_DEFAULTS_SEED.origin
+        assert fields["live_size_cap"] == 0.10
 
     def test_a_direct_sweep_from_candidates_reads_the_toggles_itself(self, monkeypatch):
         # Handed nothing, _sweep_from_candidates takes one read of its own
@@ -13173,7 +13248,7 @@ class TestLiveRuleLine:
         rule = self._live(monkeypatch, True, (0.0, 1.0))
         res = self._infeasible(monkeypatch, caplog)
         assert self._line(caplog) == (
-            f"Live time-series rule (config.py): {rule} — this run's primary scenario "
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary scenario "
             "applies it")
         assert (res.live_tier_floors, res.live_spread_band) == (True, (0.0, 1.0))
         assert (res.live_categories, res.live_tags) == (None, None)
@@ -13183,13 +13258,13 @@ class TestLiveRuleLine:
         rule = self._live(monkeypatch, True, (0.35, 0.5))
         self._feasible(monkeypatch, caplog, spread_band=(0.35, 0.5))
         assert self._line(caplog) == (
-            f"Live time-series rule (config.py): {rule} — this run's primary scenario "
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary scenario "
             "applies it")
         # ... and a live band equal to the DEFAULT band is then elsewhere
         rule = self._live(monkeypatch, True, (0.0, 1.0))
         self._feasible(monkeypatch, caplog, spread_band=(0.35, 0.5), band_sweep=True)
         assert self._line(caplog) == (
-            f"Live time-series rule (config.py): {rule} — this run's primary scenario does "
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary scenario does "
             "not (tier floors on, band 0.35-0.5); its grid simulated the live rule as band "
             "0-1 with the tier floors on, which the dashboard's filter bar shows")
 
@@ -13202,7 +13277,7 @@ class TestLiveRuleLine:
                              tier_off_sweep=True)
         assert (0.1, 0.6) in res.tier_off_calibrations_by_band
         assert self._line(caplog) == (
-            f"Live time-series rule (config.py): {rule} — this run's primary scenario does "
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary scenario does "
             "not (tier floors on, band 0.1-0.6); its grid simulated the live rule as band "
             "0.1-0.6 with the tier floors off, which the dashboard's filter bar shows")
 
@@ -13212,29 +13287,29 @@ class TestLiveRuleLine:
         rule = self._live(monkeypatch, True, (0.35, 0.5))
         self._feasible(monkeypatch, caplog, band_sweep=True)
         assert self._line(caplog) == (
-            f"Live time-series rule (config.py): {rule} — this run's primary scenario does "
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary scenario does "
             "not (tier floors on, band 0-1); its grid simulated the live rule as band "
             "0.35-0.5 with the tier floors on, which the dashboard's filter bar shows")
         # Without the band sweep only the primary band was simulated
         self._feasible(monkeypatch, caplog, band_sweep=False)
         assert self._line(caplog) == (
-            f"Live time-series rule (config.py): {rule} — not simulated by this run")
+            f"Live time-series rule (saved live defaults): {rule} — not simulated by this run")
         # A band the (narrowed) grid never held
         rule = self._live(monkeypatch, True, (0.2, 0.6))
         self._feasible(monkeypatch, caplog, band_sweep=True)
         assert self._line(caplog) == (
-            f"Live time-series rule (config.py): {rule} — not simulated by this run")
+            f"Live time-series rule (saved live defaults): {rule} — not simulated by this run")
 
     def test_tier_floors_off_needs_the_tier_off_family(self, monkeypatch, caplog):
         rule = self._live(monkeypatch, False, (0.0, 0.5))
         self._feasible(monkeypatch, caplog, band_sweep=True, tier_off_sweep=True)
         assert self._line(caplog) == (
-            f"Live time-series rule (config.py): {rule} — this run's primary scenario does "
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary scenario does "
             "not (tier floors on, band 0-1); its grid simulated the live rule as band "
             "0-0.5 with the tier floors off, which the dashboard's filter bar shows")
         self._feasible(monkeypatch, caplog, band_sweep=True, tier_off_sweep=False)
         assert self._line(caplog) == (
-            f"Live time-series rule (config.py): {rule} — not simulated by this run")
+            f"Live time-series rule (saved live defaults): {rule} — not simulated by this run")
 
     def test_tier_floors_off_where_no_tier_binds_is_the_tier_on_rule(
         self, monkeypatch, caplog,
@@ -13244,11 +13319,11 @@ class TestLiveRuleLine:
         rule = self._live(monkeypatch, False, (0.35, 0.5))
         self._feasible(monkeypatch, caplog, spread_band=(0.35, 0.5))
         assert self._line(caplog) == (
-            f"Live time-series rule (config.py): {rule} — this run's primary scenario "
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary scenario "
             "applies it (no tier floor binds at this band, so off and on are one rule)")
         self._feasible(monkeypatch, caplog, band_sweep=True, tier_off_sweep=False)
         assert self._line(caplog) == (
-            f"Live time-series rule (config.py): {rule} — this run's primary scenario does "
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary scenario does "
             "not (tier floors on, band 0-1); its grid simulated the live rule as band "
             "0.35-0.5 with the tier floors on (no tier floor binds at this band, so off and "
             "on are one rule), which the dashboard's filter bar shows")
@@ -13261,7 +13336,7 @@ class TestLiveRuleLine:
             res = self._infeasible(monkeypatch, caplog, band_sweep=True, tier_off_sweep=True,
                                    cap_sweep=True)
             assert self._line(caplog) == (
-                f"Live time-series rule (config.py): {rule} — not simulated by this run")
+                f"Live time-series rule (saved live defaults): {rule} — not simulated by this run")
             assert dashboard._live_rule_html(res, bar=None).endswith(
                 "— not simulated by this run</p>")
 
@@ -13294,7 +13369,7 @@ class TestLiveRuleLine:
         page = dashboard.generate_dashboard(
             res.primary.trades, res.primary.equity_df, TestPrepareEntriesGolden._START,
             10_000.0, sweep=res).read_text(encoding="utf-8")
-        found = re.findall(r"Live rule \(config\.py\): ([^<]*)</p>", page)
+        found = re.findall(r"Live rule \(saved live defaults\): ([^<]*)</p>", page)
         assert len(found) == 1
         assert found[0].startswith(html.escape(rule, quote=False) + "; ")
         assert found[0].endswith(" — " + page_tail)
@@ -13312,6 +13387,44 @@ class TestLiveRuleLine:
         if page_tail.startswith("choose Tier floors off"):
             assert payload["grid_off"] is not None
             assert "0-0.5" in [b["option"] for b in payload["bands_off"]]
+
+    # ── The saved defaults' own sizing ──────────────────────────────────────
+
+    def test_the_sizing_note_names_saved_sizing_the_primary_did_not_use(
+        self, monkeypatch, caplog,
+    ):
+        from kalshi_betting import config
+        # The seed's 10% per-trade cap against this run's own cap (config.py's)
+        config.save_live_defaults(config.LIVE_DEFAULTS_SEED, source="")
+        res = self._infeasible(monkeypatch, caplog)
+        assert res.live_size_cap == 0.10 and res.primary.size_cap != 0.10
+        run = (f"k {config._exact_number(res.primary.k)}, per-trade cap "
+               f"{config._cap_text(res.primary.size_cap, 'no cap')} and same-title cap "
+               f"{config._cap_text(res.same_title_size_cap, 'no extra cap')}")
+        assert self._line(caplog).endswith(
+            "; the live defaults size at k 0.8, per-trade cap 10% and same-title cap 20%, "
+            f"where this run's primary sized at {run}")
+
+    def test_no_sizing_note_when_the_saved_sizing_is_the_runs(self, monkeypatch, caplog):
+        # _live saves config.py's own k and caps, which this run sized at too
+        self._live(monkeypatch, True, (0.0, 1.0))
+        res = self._infeasible(monkeypatch, caplog)
+        assert (res.live_interval_discount, res.live_size_cap,
+                res.live_same_title_size_cap) == (res.primary.k, res.primary.size_cap,
+                                                  res.same_title_size_cap)
+        assert "the live defaults size at" not in self._line(caplog)
+
+    def test_the_sizing_note_needs_every_value_recorded(self):
+        from kalshi_betting import config
+        point = backtester._simulate_at_discount([], date(2026, 1, 5), 1000.0)
+        sweep = backtester.BacktestSweep(
+            primary=point, points=[point], calibration=None, same_title_size_cap=0.2,
+            **backtester._live_rule_fields(config.LIVE_DEFAULTS_SEED))
+        assert backtester._live_sizing_note(sweep).startswith("; the live defaults size at ")
+        # One unrecorded value on either side: nothing to compare
+        for changes in ({"live_size_cap": None}, {"same_title_size_cap": None},
+                        {"primary": dc_replace(point, size_cap=None)}):
+            assert backtester._live_sizing_note(dc_replace(sweep, **changes)) == ""
 
     # ── The category/tag filter ─────────────────────────────────────────────
 
@@ -13341,7 +13454,7 @@ class TestLiveRuleLine:
                   "Category or Tag option of it at a time (each offered where this run filed "
                   "a pair under it), never as their union")
         assert self._line(caplog) == (
-            f"Live time-series rule (config.py): {rule}; category/tag filter ({words}) — "
+            f"Live time-series rule (saved live defaults): {rule}; category/tag filter ({words}) — "
             f"this run's primary scenario applies its time-series rule{slices}")
         assert (res.live_categories, res.live_tags) == (categories, tags)
 
@@ -13361,7 +13474,7 @@ class TestLiveRuleLine:
         configured = backtester.TIME_SERIES_SAME_EVENT_LADDERS
         self._infeasible(monkeypatch, caplog, same_event_ladders=not configured)
         assert self._line(caplog) == (
-            f"Live time-series rule (config.py): {rule} — this run's primary scenario "
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary scenario "
             f"applies it; this run's same-event ladders are {'off' if configured else 'on'} "
             f"and config.py's {'on' if configured else 'off'}, so its pairs are not the "
             "live bot's")

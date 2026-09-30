@@ -29,6 +29,25 @@ backtest_cache/
 dashboard.html
 backtest_dashboard*.html
 
+# Saved live trading defaults (operator state, written by
+# config.save_live_defaults when defaults_server's confirmation page is
+# confirmed) and the file its atomic save stages beside it; the server's log,
+# kalshi_defaults_server.log, is covered by *.log above
+live_defaults.json
+.live_defaults.json.*.tmp
+
+# A production run's result file (main.py --result-file PATH writes it where
+# its caller says, through a staging file beside it). It holds balances and
+# trades, so the name the docs use is ignored in case it is written here.
+run_result.json
+.run_result.json.*.tmp
+
+# The runs defaults_server starts (config.LIVE_RUNS_DIR): one folder per run,
+# holding what it is, everything it printed and its result (balances and
+# trades). It is operator state, like scheduler_state.json, so it stays out
+# of git
+/live_runs/
+
 # Python
 __pycache__/
 *.py[cod]

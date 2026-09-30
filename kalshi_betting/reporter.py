@@ -12,11 +12,22 @@ Purpose:
     All Excel formatting — column widths, color-coded status rows, number formats,
     frozen header rows — is applied via openpyxl.
 
+    It also writes the run result of a production run started with
+    `main.py --result-file`: a RunReport that main.py fills in as the run goes
+    (its outcome, balances, whether it began sending orders, one TradeRecord
+    per pair and the run's WARNING-or-worse log lines, which RunReportHandler
+    copies in) and write_run_report writes as one JSON file when the run ends.
+
 Dependencies:
-    Imports display_title and leg_sides (which side each leg buys, rendered
-    into the Notes prefix) from scanner.py and TradeSpec from strategy.py.
-    Imports PROJECT_ROOT and create_new_output from config.py. Exports the TradeResult dataclass
-    (consumed by trader.py) and the two public write functions (consumed by
+    Imports display_title, leg_sides (which side each leg buys, rendered
+    into the Notes prefix) and leg_prices (the price each leg was sized at,
+    for the run result) from scanner.py and TradeSpec from strategy.py.
+    Imports PROJECT_ROOT, create_new_output and the run result's constants
+    (LIVE_RUN_RESULT_FORMAT, RUN_REPORT_MAX_WARNINGS,
+    RUN_REPORT_LINE_MAX_CHARS) from config.py. Exports the TradeResult
+    dataclass (consumed by trader.py), the two public write functions, and
+    the run result's RunReport, TradeRecord, LegRecord, RunReportHandler,
+    trade_record, report_trades and write_run_report (all consumed by
     main.py).
 
 Notes:
@@ -46,14 +57,27 @@ Notes:
 
     append_to_prod_log's keyword-only run_note goes on the run's separator
     banner, never in a column; main._run_prod passes the run's live toggles
-    (config.describe_live_settings), with "(config: X)" after each toggle a
-    flag moved.
+    (config.describe_live_settings), with "(default: X)" after each toggle a
+    flag moved away from the saved live defaults, ending " | defaults:
+    <origin>" (which saved file, when and from what it was saved).
+
+    Neither filling nor writing a run result may stop a run or change its exit
+    code: report_trades never raises (a pair it cannot describe is logged and
+    kept as a record of what could be read), and write_run_report catches
+    every error, since main() calls it in a finally. The result is replaced
+    whole (a staging file renamed over it), and is strict JSON.
+    RunReportHandler keeps every ERROR and CRITICAL line whole, since those
+    are the lines a person has to act on; only WARNING lines are cut and
+    capped.
 """
+import contextlib
 import fcntl
+import json
 import logging
+import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO
@@ -62,8 +86,14 @@ import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from .config import PROJECT_ROOT, create_new_output
-from .scanner import display_title, leg_sides
+from .config import (
+    LIVE_RUN_RESULT_FORMAT,
+    PROJECT_ROOT,
+    RUN_REPORT_LINE_MAX_CHARS,
+    RUN_REPORT_MAX_WARNINGS,
+    create_new_output,
+)
+from .scanner import display_title, leg_prices, leg_sides
 from .strategy import TradeSpec
 
 PROD_LOG_PATH = PROJECT_ROOT / "trade_log.xlsx"
@@ -681,3 +711,351 @@ def write_dev_simulation(
         wb.save(fh)
     logging.info("Dev simulation written: %s", out_path)
     return out_path
+
+
+# ─────────────────────────────────────────────
+# Run result (main.py --result-file)
+# ─────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class LegRecord:
+    """
+    One leg of a pair as a run result records it.
+
+    None means "not known": every field but ticker is None in the record
+    report_trades keeps for a pair it could not describe, and price is also
+    None when the leg's price is not a finite number.
+
+    Attributes:
+        ticker (str): The market's ticker.
+        market (str | None): The market's title with its outcome label
+            (scanner.display_title).
+        side (str | None): "yes" or "no", the side this leg buys (scanner.leg_sides).
+        count (int | None): The contracts this leg was sized and ordered at.
+            How many were actually bought depends on the pair's status: none
+            on a pair that failed or was simulated, and a rolled-back leg was
+            sold again.
+        price (float | None): The per-contract price this leg was sized at, in
+            dollars (scanner.leg_prices).
+    """
+    ticker: str
+    market: str | None
+    side: str | None
+    count: int | None
+    price: float | None
+
+
+@dataclass(frozen=True)
+class TradeRecord:
+    """
+    One pair's outcome as a run result records it.
+
+    Attributes:
+        status (str): The trader's status ("executed", "simulated", "failed",
+            "rolled_back", "rollback_failed" or "manual_review"; see
+            TradeResult), or "unknown" when it could not be read.
+        error (str | None): The trader's one-line error, if any.
+        pair_type (str | None): "same_title" or "time_series".
+        title (str | None): The pair's title.
+        a (LegRecord | None): Market A's leg; None only when it could not be described.
+        b (LegRecord | None): Market B's leg; None only when it could not be described.
+        cost_with_fees (float | None): What the pair was sized to cost, fees
+            included, in dollars; None when not known.
+        profit_if_won (float | None): Its profit if it wins, in dollars; None
+            when not known.
+    """
+    status: str
+    error: str | None
+    pair_type: str | None
+    title: str | None
+    a: LegRecord | None
+    b: LegRecord | None
+    cost_with_fees: float | None
+    profit_if_won: float | None
+
+
+@dataclass
+class RunReport:
+    """
+    What one production run did, for the program that started it.
+
+    main.py fills it in as the run goes when it is started with --result-file
+    (the defaults server passes that flag for every run it starts), and
+    writes it as JSON (write_run_report) in a finally once logging is set
+    up, so however the run ends from there. Nothing is written when main.py
+    stops before that — a usage error, which exits 2 with its reason on
+    stderr — or when a kill signal stops the process.
+
+    Attributes:
+        dry_run (bool): True when no orders were sent.
+        started_at (datetime): When the run started, in UTC.
+        settings (str): The run's settings in the "Live settings:" line's words.
+        defaults (str): Where the saved live defaults the run started from came from.
+        message (str): Why the run stopped without trading, or its closing
+            summary line, exactly as logged; "" until one is set.
+        balance_before (float | None): Cash across every shard before trading,
+            in dollars; None if the run stopped before reading it.
+        balance_after (float | None): The same after trading; None if the run
+            stopped before trading or the read after trading failed.
+        submission_started (bool): True from just before a run that is not a
+            dry run starts sending orders (trader.execute_trades). With no
+            trades recorded, it means the run stopped while sending, so orders
+            may have been placed that trades does not list.
+        trades (list[TradeRecord]): One per pair submitted or simulated, in
+            submission order. Filled in when trader.execute_trades returns, so
+            empty until then.
+        warnings (list[str]): Each WARNING, ERROR or CRITICAL line the run
+            logged while the report was attached ("LEVEL: text", first line
+            only), oldest first. Every ERROR and CRITICAL line is kept whole;
+            WARNING lines are cut at config.RUN_REPORT_LINE_MAX_CHARS
+            (ending in "…") and at most config.RUN_REPORT_MAX_WARNINGS of
+            them are kept.
+        warnings_dropped (int): How many WARNING lines were left out after
+            that many were kept.
+        error (str | None): The exception that stopped the run, on one line.
+    """
+    dry_run: bool
+    started_at: datetime
+    settings: str = ""
+    defaults: str = ""
+    message: str = ""
+    balance_before: float | None = None
+    balance_after: float | None = None
+    submission_started: bool = False
+    trades: list[TradeRecord] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    warnings_dropped: int = 0
+    error: str | None = None
+
+
+class RunReportHandler(logging.Handler):
+    """
+    A logging handler that copies each WARNING-or-worse line a run logs into its RunReport.
+
+    main() adds it to the root logger for a run started with --result-file and
+    removes it once the result is written. Each record keeps only its first
+    line. An ERROR or CRITICAL line is always kept whole: those are the lines
+    a person has to act on (a failed rollback, a V2 mapping disproof that
+    names every other position to check), and a run logs only a few of them.
+    A WARNING line is cut at config.RUN_REPORT_LINE_MAX_CHARS, its last
+    character then "…", and once config.RUN_REPORT_MAX_WARNINGS WARNING lines
+    are kept the rest are only counted, so a burst of retry warnings neither
+    fills the record nor pushes out a later CRITICAL.
+    """
+
+    def __init__(self, report: RunReport) -> None:
+        """
+        Attach the handler to one report.
+
+        Args:
+            report (RunReport): The report the lines go into.
+        """
+        super().__init__(level=logging.WARNING)
+        self.report = report
+        self._warnings_kept = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """
+        Add one log record's first line to the report, or count it when no more WARNING lines fit.
+
+        Args:
+            record (logging.LogRecord): The record; its level is WARNING or
+                worse (the handler's own level filters the rest).
+        """
+        try:
+            first = (record.getMessage().splitlines() or [""])[0]
+            if record.levelno < logging.ERROR:
+                if self._warnings_kept >= RUN_REPORT_MAX_WARNINGS:
+                    self.report.warnings_dropped += 1
+                    return
+                if len(first) > RUN_REPORT_LINE_MAX_CHARS:
+                    first = first[:RUN_REPORT_LINE_MAX_CHARS - 1] + "…"
+                self._warnings_kept += 1
+            self.report.warnings.append(f"{record.levelname}: {first}")
+        except Exception:
+            # logging's own reporting of a handler that failed; never raises
+            self.handleError(record)
+
+
+def _json_number(value, digits: int) -> float | None:
+    """
+    Round a money figure for the run result, or None when it is not a finite number.
+
+    The result is written as strict JSON, which has no NaN or infinity, so a
+    figure that is not finite is recorded as not known rather than losing the
+    whole result.
+
+    Args:
+        value: The figure (a float in practice).
+        digits (int): Decimal places to keep.
+
+    Returns:
+        float | None: The figure as a float, rounded; None if it is not finite.
+
+    Raises:
+        TypeError, ValueError: When value is not a number (float() refuses it);
+            trade_record lets this through, and report_trades catches it.
+    """
+    number = float(value)
+    return round(number, digits) if math.isfinite(number) else None
+
+
+def _text_or_none(value) -> str | None:
+    """
+    Keep a value for a run result only if it is text.
+
+    Args:
+        value: Any value read off a trade result.
+
+    Returns:
+        str | None: The value if it is a str, else None.
+    """
+    return value if isinstance(value, str) else None
+
+
+def trade_record(result: TradeResult) -> TradeRecord:
+    """
+    Describe one pair's outcome for a RunReport, in the trade log's terms.
+
+    Every value is a plain str, int, float or None (a figure that is not a
+    finite number is None), so the record can always be written as JSON.
+
+    Args:
+        result (TradeResult): The trader's result for one pair.
+
+    Returns:
+        TradeRecord: Its markets (A then B, as the trade log lists them), the
+            side each leg buys and the count and price it was sized at, its
+            cost with fees and its profit if it wins.
+
+    Raises:
+        Exception: Whatever reading the result raises when its spec, pair or
+            figures cannot be read (an AttributeError, TypeError, ValueError
+            or KeyError in practice); report_trades catches it and keeps a
+            record of what could be read instead.
+    """
+    spec = result.spec
+    pair = spec.pair
+    # Which side each market's leg bought, and at what price: the one source of truth
+    side_a, side_b = leg_sides(pair.pair_type)
+    price_a, price_b = leg_prices(pair)
+    return TradeRecord(
+        status=str(result.status),
+        error=None if result.error is None else str(result.error),
+        pair_type=_text_or_none(pair.pair_type),
+        title=_text_or_none(pair.canonical_title),
+        a=LegRecord(str(pair.market_a.ticker), display_title(pair.market_a), side_a,
+                    int(spec.x), _json_number(price_a, 4)),
+        b=LegRecord(str(pair.market_b.ticker), display_title(pair.market_b), side_b,
+                    int(spec.y), _json_number(price_b, 4)),
+        cost_with_fees=_json_number(spec.total_cost_with_fees, 2),
+        profit_if_won=_json_number(spec.min_payoff, 2),
+    )
+
+
+def _fallback_leg(market, count) -> LegRecord | None:
+    """
+    Record what can be read of one leg of a pair trade_record could not describe.
+
+    Args:
+        market: The leg's market, or None.
+        count: The contracts it was sized at, or None.
+
+    Returns:
+        LegRecord | None: The ticker and count (None where not an int), the
+            rest not known; None when the ticker cannot be read.
+
+    Raises:
+        Exception: Whatever reading market.ticker raises other than
+            AttributeError; report_trades catches it.
+    """
+    ticker = _text_or_none(getattr(market, "ticker", None))
+    if not ticker:
+        return None
+    return LegRecord(ticker, None, None,
+                     count if type(count) is int else None, None)
+
+
+def report_trades(results: list) -> list[TradeRecord]:
+    """
+    Describe every pair's outcome for a RunReport; never raises.
+
+    A pair that cannot be described is logged as an ERROR and kept as a record
+    holding what the trade log's rescue lines read of it (status, error, title
+    and both tickers and counts, each only if it can be read), so the run goes
+    on to write the trade log after it. If even that cannot be read, the
+    record says only that its status is "unknown".
+
+    Args:
+        results (list[TradeResult]): The trader's results, in submission order.
+
+    Returns:
+        list[TradeRecord]: One record per result, in the same order.
+    """
+    records = []
+    for result in results:
+        try:
+            records.append(trade_record(result))
+            continue
+        except Exception as exc:
+            logging.error("Could not describe a pair for the run result: %s", exc)
+        try:
+            spec = getattr(result, "spec", None)
+            pair = getattr(spec, "pair", None)
+            records.append(TradeRecord(
+                status=_text_or_none(getattr(result, "status", None)) or "unknown",
+                error=_text_or_none(getattr(result, "error", None)),
+                pair_type=_text_or_none(getattr(pair, "pair_type", None)),
+                title=_text_or_none(getattr(pair, "canonical_title", None)),
+                a=_fallback_leg(getattr(pair, "market_a", None), getattr(spec, "x", None)),
+                b=_fallback_leg(getattr(pair, "market_b", None), getattr(spec, "y", None)),
+                cost_with_fees=None, profit_if_won=None))
+        except Exception:
+            # A field that raises when read (not merely missing): keep the
+            # pair's place in the list with nothing but an unknown status
+            records.append(TradeRecord(
+                status="unknown", error=None, pair_type=None, title=None, a=None, b=None,
+                cost_with_fees=None, profit_if_won=None))
+    return records
+
+
+def write_run_report(path: Path, report: RunReport, exit_code: int | None) -> None:
+    """
+    Write a run's result as JSON, replacing the file whole; never raises.
+
+    The record is written to a hidden staging file beside path and renamed
+    over it, so a reader sees the old file or the whole new one, never part
+    of one. It is strict JSON (no NaN). Anything that goes wrong is logged as
+    an ERROR and leaves no staging file; main() calls this in its finally, so
+    it must not raise.
+
+    Args:
+        path (Path): The result file.
+        report (RunReport): What the run did.
+        exit_code (int | None): The run's exit code; None when an exception
+            stopped it (report.error says which).
+    """
+    staging = None
+    try:
+        record = {
+            "format": LIVE_RUN_RESULT_FORMAT, "mode": "prod", "dry_run": report.dry_run,
+            "started_at": report.started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "finished_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "exit_code": exit_code, "settings": report.settings, "defaults": report.defaults,
+            "message": report.message, "balance_before": report.balance_before,
+            "balance_after": report.balance_after,
+            "submission_started": report.submission_started,
+            "trades": [asdict(t) for t in report.trades],
+            "warnings": list(report.warnings), "warnings_dropped": report.warnings_dropped,
+            "error": report.error,
+        }
+        text = json.dumps(record, allow_nan=False, indent=1)
+        staging = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        staging.write_text(text, encoding="utf-8")
+        os.replace(staging, path)
+        logging.info("Run result written: %s", path)
+    except Exception as exc:  # it runs in main()'s finally: it must never raise
+        logging.error("Could not write the run result to %s: %s", path, exc)
+        if staging is not None:
+            with contextlib.suppress(OSError):
+                staging.unlink(missing_ok=True)

@@ -351,6 +351,10 @@ _V2_NO_MAPPING_CONFIRMED = False
 # mapping for the rest of the run. Only a new process clears it; like the
 # confirmation latch it is never persisted, so a scheduled run the next week
 # starts clear.
+# Each run the defaults server's Confirm and trade starts is a new process too,
+# so both disproof CRITICALs (the mapping check's and the ambiguous NO leg's)
+# name every way a real-money run starts: the scheduler daemon, main.py by
+# hand, and that server's button.
 _V2_NO_MAPPING_DISPROVEN = False
 
 # NO-leg tickers of pairs that went ahead in this process although the mapping
@@ -1565,7 +1569,9 @@ def pre_execution_check(client: Any, portfolio: list, *,
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         portfolio (list): List of TradeSpec objects selected by select_portfolio().
-        settings (LiveSettings | None): Keyword-only; the run's toggles. None reads config.py's.
+        settings (LiveSettings | None): Keyword-only; the run's toggles. None
+            reads config.py's (tests and direct calls only: a live run always
+            hands the run's, built from the saved live defaults).
 
     Returns:
         list: Filtered list of TradeSpec objects that still pass the price check.
@@ -1577,7 +1583,8 @@ def pre_execution_check(client: Any, portfolio: list, *,
     if not portfolio:
         return []
 
-    # One rule for every spec's re-check: the run's LiveSettings, or config's
+    # One rule for every spec's re-check: the run's LiveSettings, or config.py's
+    # for a caller that hands none
     settings = live_settings() if settings is None else settings
 
     valid = []
@@ -2365,7 +2372,10 @@ def _confirm_v2_no_mapping(
         " same disproven hypothesis, so it could double the error). The rest"
         " of this run is stopped: no later pair sends any order. Stop"
         " trading until this is understood (stop the scheduler daemon if it is"
-        " running, and do not run main.py --mode prod), and flatten this"
+        " running, and do not run main.py --mode prod; if the defaults server"
+        " is running, stop it with Ctrl-C in the terminal running"
+        " ./start_dashboard.sh or python3 -m kalshi_betting.defaults_server,"
+        " and do not press Confirm and trade), and flatten this"
         " position by hand in the Kalshi UI; there is no other order path to"
         " fall back on.%s",
         ticker, -no_leg.count, delta, unchecked,
@@ -2612,6 +2622,11 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
                 " treated as disproven: the rest of this run is stopped and no"
                 " later pair sends any order. Stop the bot and flatten this"
                 " position by hand in the Kalshi UI."
+                " To stop the bot, stop the scheduler daemon if it is running,"
+                " and do not run main.py --mode prod; if the defaults server is"
+                " running, stop it with Ctrl-C in the terminal running"
+                " ./start_dashboard.sh or python3 -m kalshi_betting.defaults_server,"
+                " and do not press Confirm and trade."
                 + _stop_run_on_v2_mapping_disproof()
             )
         logging.critical(

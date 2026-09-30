@@ -49,8 +49,10 @@ Dependencies:
     TestLiveBacktestSpreadParity pins _find_entry to the live spread rule),
     plus BUDGET_FRACTION and SAME_TITLE_SIZE_CAP (bound by value),
     pair_size_cap (one definition, shared with live sizing), LiveSettings,
-    live_settings, describe_time_series_rule and _names_text (the
-    reporting-only "Live time-series rule" line),
+    live_defaults with its LiveDefaultsError / LiveDefaultsMissing refusals,
+    describe_time_series_rule, _names_text, _exact_number and _cap_text (the
+    reporting-only "Live time-series rule" line, which names the saved live
+    defaults),
     CANDLESTICK_FETCH_MAX_WORKERS, CANDLESTICK_PERIOD_INTERVAL_MINUTES (the
     candle length, the grid _candle_window_open and _checkpoint_floor round
     down to),
@@ -87,11 +89,17 @@ Dependencies:
     curve, which its page-wide filter runs over a category's or tag's trades
     for that slice's curve — _calibration_bucket, _band_label (the bare
     "floor-ceiling" its filter bar and scenario explorer name a band's
-    tier-floors-off run with, so the page and the log spell that run alike)
-    and _tier_floors_bind (the one test of whether a deadline-gap tier binds
+    tier-floors-off run with, so the page and the log spell that run alike),
+    _tier_floors_bind (the one test of whether a deadline-gap tier binds
     at a band, which the page's Tier floors views — the filter bar's and the
     scenario explorer's — read to decide whether a band absent from the
-    tier-off family may show its tier-on run, or no off view is shown); an
+    tier-off family may show its tier-on run, or no off view is shown),
+    _cap_percent (the size-cap option formatter), and the pieces of the live
+    rule's report that dashboard._live_rule_html shares with this module's
+    log line — _live_rule_view with its _LIVE_RULE_PRIMARY and
+    _LIVE_RULE_NOT_SIMULATED verdicts, _live_rule_ladder_note,
+    _live_filter_text, _live_sizing_note, _LIVE_RULE_LABEL and
+    _LIVE_RULE_NONE; an
     IntervalCalibration carries the CalibrationObservations its pooled row
     was reduced from, so a report can regroup that population through
     _calibration_bucket, the one definition of the k-hat arithmetic, as
@@ -148,8 +156,9 @@ Notes:
     _log_interval_calibration() reports it. Because it reads the prepared
     entries rather than _simulate_at_discount(), it is never filtered by the
     Kelly gate, which is what stops the estimate confirming whatever k
-    produced it. It is a RECOMMENDATION ONLY: nothing here writes config.py,
-    and live sizing reads its k from its run's config.LiveSettings.
+    produced it. It is a RECOMMENDATION ONLY: nothing here writes config.py
+    or the saved live defaults, and live sizing reads its k from its run's
+    config.LiveSettings, built from the saved live defaults.
 
     run_backtest_sweep() is the entry point that exposes all of that:
     _prepare_candidates() once, then _sweep_from_candidates() — one
@@ -294,13 +303,17 @@ from .config import (
     SPREAD_BAND_SWEEP_FLOORS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     TIME_SERIES_SAME_EVENT_LADDERS,
+    LiveDefaultsError,
+    LiveDefaultsMissing,
     LiveSettings,
     ScheduledRun,
+    _cap_text,
+    _exact_number,
     _names_text,
     describe_time_series_rule,
     fee_leg_exact,
     fee_per_pair_approx,
-    live_settings,
+    live_defaults,
     min_price_diff_for_gap,
     pair_size_cap,
     time_series_profit_prob,
@@ -832,8 +845,9 @@ class SweepPoint:
             — never None. When _simulate_at_discount() was called with k=None
             (the "no override" sentinel, which config.time_series_profit_prob
             resolves at call time), this is
-            config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, the value the live
-            sizer reads.
+            config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.py's k, which the
+            backtest defaults to (a live run prices at the saved live
+            defaults' k instead).
         trades (list[BacktestTrade]): One record per entered pair, in
             entry-date order; empty if nothing was ever entered.
         equity_df (pd.DataFrame): Daily equity curve with columns
@@ -1734,16 +1748,31 @@ class BacktestSweep:
         same_title_size_cap (float | None): The extra cap every same-title
             candidate was sized under (this module's SAME_TITLE_SIZE_CAP).
             None only on a hand-built sweep.
-        live_tier_floors (bool | None): config.py's TIME_SERIES_TIER_FLOORS,
+        live_tier_floors (bool | None): The saved live defaults' tier_floors,
             from run_backtest_sweep's one fail-soft pre-fetch read
             (_live_settings_for_report); reporting only, blind to main.py's
-            per-run overrides. None, with the other live_* fields, when the
-            toggles do not validate or on a hand-built sweep.
-        live_spread_band (tuple[float, float] | None): config.py's resolved
-            TIME_SERIES_SPREAD_BAND.
-        live_categories (tuple[str, ...] | None): config.py's TRADE_CATEGORIES;
-            None means any category when live_tier_floors is recorded.
-        live_tags (tuple[str, ...] | None): config.py's TRADE_TAGS, likewise.
+            per-run overrides. None, with the other live_* fields, when no
+            live defaults are saved, the saved file is refused, or on a
+            hand-built sweep.
+        live_spread_band (tuple[float, float] | None): The saved live
+            defaults' spread_band.
+        live_categories (tuple[str, ...] | None): The saved live defaults'
+            categories; None means any category when live_tier_floors is
+            recorded.
+        live_tags (tuple[str, ...] | None): The saved live defaults' tags,
+            likewise.
+        live_origin (str | None): Where the saved live defaults were read
+            (LiveSettings.origin: the file, when and from what it was saved),
+            from the same read; reporting only.
+        live_interval_discount (float | None): The saved live defaults' k,
+            from the same read; reporting only (this run sized at its own k,
+            primary.k).
+        live_size_cap (float | None): The saved live defaults' per-trade cap,
+            from the same read; reporting only (this run sized at its own,
+            primary.size_cap).
+        live_same_title_size_cap (float | None): The saved live defaults'
+            same-title cap, from the same read; reporting only (this run sized
+            under same_title_size_cap).
         entry_checkpoint (str | None): SCHEDULED_RUN.label() of the schedule
             the entry checkpoints were placed by (e.g. "Monday 09:00
             America/Los_Angeles"), for the dashboard header. None = not
@@ -1772,6 +1801,10 @@ class BacktestSweep:
     live_categories: tuple[str, ...] | None = None
     live_tags: tuple[str, ...] | None = None
     entry_checkpoint: str | None = None
+    live_origin: str | None = None
+    live_interval_discount: float | None = None
+    live_size_cap: float | None = None
+    live_same_title_size_cap: float | None = None
 
 
 def max_trades_simulated(sweep: BacktestSweep) -> int:
@@ -5239,48 +5272,114 @@ def _band_label(band: tuple[float, float]) -> str:
     return f"{_exact_label(lo, 'g')}-{_exact_label(hi, 'g')}"
 
 
-# _sweep_from_candidates' default for live: read config.py's toggles there (a
-# direct caller); None is a read run_backtest_sweep took and found invalid.
+# _sweep_from_candidates' default for live: read the saved live defaults there
+# (a direct caller); None is a read run_backtest_sweep took that found none
+# usable.
 _LIVE_NOT_READ = object()
 
 
 def _live_settings_for_report() -> LiveSettings | None:
     """
-    Read config.py's live toggles for this run's report, failing soft.
+    Read the saved live defaults for this run's report, failing soft.
 
-    Reporting only: invalid toggles log one WARNING instead of aborting.
-    config.live_settings() reads config's constants, not this module's copies.
+    Reporting only: the backtest itself sizes at this module's own k and caps
+    (config.py's, bound by value), never the saved defaults'. With none saved
+    it logs one INFO line, and with a refused file one WARNING, instead of
+    aborting the run.
 
     Returns:
-        LiveSettings | None: The toggles; None when they do not validate.
+        LiveSettings | None: The saved defaults; None when none are saved or
+            the saved file is refused.
     """
     try:
-        return live_settings()
-    except ValueError as e:
-        logging.warning(
-            "config.py's live toggles do not validate (%s) — the live rule is not "
-            "recorded on this run's report", e)
+        # The file a live run starts from (config.LIVE_DEFAULTS_FILE)
+        return live_defaults()
+    except LiveDefaultsMissing:
+        logging.info("No live defaults are saved, so live runs refuse to start — the "
+                     "live rule is not recorded on this run's report")
+        return None
+    except LiveDefaultsError as e:
+        logging.warning("The saved live defaults are refused (%s) — the live rule is "
+                        "not recorded on this run's report", e)
         return None
 
 
 def _live_rule_fields(live: LiveSettings | None) -> dict:
     """
-    Name the BacktestSweep keywords that record config.py's live rule.
+    Name the BacktestSweep keywords that record the saved live defaults.
 
     Both production BacktestSweep constructions spread this (beside
-    same_title_size_cap), so the four fields are recorded together from one
+    same_title_size_cap), so the eight fields are recorded together from one
     read or not at all.
 
     Args:
         live (LiveSettings | None): _live_settings_for_report()'s result.
 
     Returns:
-        dict: The four live_* keywords from live; {} when live is None.
+        dict: The eight live_* keywords from live; {} when live is None.
     """
     if live is None:
         return {}
     return {"live_tier_floors": live.tier_floors, "live_spread_band": live.spread_band,
-            "live_categories": live.categories, "live_tags": live.tags}
+            "live_categories": live.categories, "live_tags": live.tags,
+            "live_origin": live.origin, "live_interval_discount": live.interval_discount,
+            "live_size_cap": live.size_cap,
+            "live_same_title_size_cap": live.same_title_size_cap}
+
+
+# The label a recorded live rule is named with, in the log line and page header
+_LIVE_RULE_LABEL = "saved live defaults"
+# The line and header when the run recorded none
+_LIVE_RULE_NONE = ("none recorded — no usable live defaults were saved when this run "
+                   "started, and live runs refuse to start without them")
+
+
+def _live_sizing_note(sweep: BacktestSweep) -> str:
+    """
+    State the saved defaults' k and caps when this run's primary sized at others.
+
+    A backtest sizes at config.py's k and caps (this module's by-value
+    bindings), not the saved defaults', so its primary scenario can hold the
+    live rule's band but not its sizing. The page adds where its filter bar
+    shows the live sizing (dashboard._live_rule_html); the log line cannot
+    know.
+
+    Args:
+        sweep (BacktestSweep): The run's sweep.
+
+    Returns:
+        str: A "; ..." clause, or "" when a value is unrecorded or all three agree.
+
+    Raises:
+        Nothing. It only formats values the sweep already holds.
+    """
+    live = (sweep.live_interval_discount, sweep.live_size_cap, sweep.live_same_title_size_cap)
+    run = (sweep.primary.k, sweep.primary.size_cap, sweep.same_title_size_cap)
+    if None in live or None in run or live == run:
+        return ""
+
+    def sizing(k: float, cap: float, same_title: float) -> str:
+        """
+        Name one k and pair of caps as the note words them.
+
+        Args:
+            k (float): An interval discount, printed exactly.
+            cap (float): A per-trade cap as a fraction; 1.0 reads
+                "100% (no cap)".
+            same_title (float): A same-title cap as a fraction; 1.0 reads
+                "100% (no extra cap)".
+
+        Returns:
+            str: "k X, per-trade cap Y and same-title cap Z".
+
+        Raises:
+            Nothing.
+        """
+        return (f"k {_exact_number(k)}, per-trade cap {_cap_text(cap, 'no cap')} and "
+                f"same-title cap {_cap_text(same_title, 'no extra cap')}")
+
+    return (f"; the live defaults size at {sizing(*live)}, where this run's primary sized "
+            f"at {sizing(*run)}")
 
 
 def _live_filter_text(categories: tuple[str, ...] | None,
@@ -5320,8 +5419,8 @@ def _live_filter_is_one_slice(categories: tuple[str, ...] | None,
     return categories is not None and len(categories) == 1 and len(tags or ()) <= 1
 
 
-# _LiveRuleView.where: this run's primary scenario holds config.py's live
-# time-series rule, another cell of its grid does, or none does.
+# _LiveRuleView.where: this run's primary scenario holds the saved live
+# defaults' time-series rule, another cell of its grid does, or none does.
 _LIVE_RULE_PRIMARY = "primary"
 _LIVE_RULE_GRID = "grid"
 _LIVE_RULE_NOT_SIMULATED = "not simulated"
@@ -5330,7 +5429,7 @@ _LIVE_RULE_NOT_SIMULATED = "not simulated"
 @dataclass(frozen=True)
 class _LiveRuleView:
     """
-    Where a run's own grid holds config.py's live time-series rule.
+    Where a run's own grid holds the saved live defaults' time-series rule.
 
     Attributes:
         where (str): One of the three _LIVE_RULE_* constants.
@@ -5343,7 +5442,7 @@ class _LiveRuleView:
 
 def _live_rule_view(sweep: BacktestSweep) -> _LiveRuleView | None:
     """
-    Say where a run's own grid holds config.py's live time-series rule.
+    Say where a run's own grid holds the saved live defaults' time-series rule.
 
     The one definition, shared by _live_rule_line and dashboard._live_rule_html
     and judged only on what the sweep RECORDED: the primary scenario when its
@@ -5397,26 +5496,32 @@ def _live_rule_ladder_note(sweep: BacktestSweep) -> str:
             "live bot's")
 
 
-def _live_rule_line(sweep: BacktestSweep) -> str | None:
+def _live_rule_line(sweep: BacktestSweep) -> str:
     """
-    Word the "Live time-series rule (config.py): ..." log line from a built sweep.
+    Word the "Live time-series rule (saved live defaults): ..." log line from a built sweep.
+
+    Always a line, so a report never silently omits the live rule: with none
+    recorded it says so (_LIVE_RULE_NONE). A recorded rule's line ends with
+    _live_sizing_note when the saved defaults size differently from this
+    run's primary.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
 
     Returns:
-        str | None: The line; None when the sweep records no live rule.
+        str: The line.
     """
     view = _live_rule_view(sweep)
     if view is None:
-        return None
+        return f"Live time-series rule: {_LIVE_RULE_NONE}"
+    prefix = f"Live time-series rule ({_LIVE_RULE_LABEL}): "
     rule = describe_time_series_rule(sweep.live_tier_floors, sweep.live_spread_band)
     categories, tags = sweep.live_categories, sweep.live_tags
     filtered = categories is not None or tags is not None
     if filtered:
         rule += f"; category/tag filter ({_live_filter_text(categories, tags)})"
     if view.where == _LIVE_RULE_NOT_SIMULATED:
-        return f"Live time-series rule (config.py): {rule} — not simulated by this run"
+        return f"{prefix}{rule} — not simulated by this run{_live_sizing_note(sweep)}"
     # Tier floors off at a band no tier binds at: the tier-on cell holds it
     never_binds = ("" if sweep.live_tier_floors or not view.tier_floors else
                    " (no tier floor binds at this band, so off and on are one rule)")
@@ -5441,7 +5546,7 @@ def _live_rule_line(sweep: BacktestSweep) -> str | None:
                  "; the dashboard's filter bar shows the live category/tag filter one "
                  f"Category or Tag option of {subject} at a time (each offered where this "
                  "run filed a pair under it), never as their union")
-    return f"Live time-series rule (config.py): {rule} — {tail}{_live_rule_ladder_note(sweep)}"
+    return f"{prefix}{rule} — {tail}{_live_rule_ladder_note(sweep)}{_live_sizing_note(sweep)}"
 
 
 def _tier_floors_bind(band: tuple[float, float]) -> bool:
@@ -5835,8 +5940,8 @@ def _simulate_at_discount(
         k (float | None): Interval-discount override in [0, 1], handed to
             config.time_series_profit_prob for every time-series candidate.
             None (default) means "no override", which that helper resolves at
-            call time to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the value
-            live sizing reads on a run without main.py's --interval-discount.
+            call time to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (config.py's
+            k, not necessarily the saved live defaults' k live sizing reads).
         spread_band (tuple[float, float] | None): The spread band the entries
             were detected under — a label, never applied here. None (default)
             renders on the completion line as the resolved default band
@@ -5970,8 +6075,9 @@ def _simulate_at_discount(
             # a test pins the two-link chain run_backtest -> _simulate_at_discount
             # -> the helper). k is this function's override, and None — what
             # run_backtest passes — is the sentinel the helper resolves to
-            # config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, so the default path prices
-            # exactly as live sizing does. same_title: the fixed co-resolution prior.
+            # config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.py's k (live sizing
+            # prices through the same helper at the saved live defaults' k).
+            # same_title: the fixed co-resolution prior.
             p = (time_series_profit_prob(pA, pB, k=k)
                  if pair_type == "time_series" else SAME_TITLE_CO_RESOLVE_PROB)
             q = 1.0 - p
@@ -6699,9 +6805,9 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
     stated explicitly rather than implied by silence.
 
     The report is a RECOMMENDATION ONLY. Nothing in the backtester writes
-    config.py, and the live sizer keeps reading
-    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (or main.py's --interval-discount)
-    whatever this prints.
+    config.py or the saved live defaults, and the live sizer keeps reading
+    the saved live defaults' k (or main.py's --interval-discount) whatever
+    this prints.
 
     Args:
         calibration (IntervalCalibration | None): _interval_calibration()'s
@@ -6739,7 +6845,8 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
         "  Configured k = %.3f (config.TIME_SERIES_INTERVAL_PROB_DISCOUNT) | "
         "pooled empirical k_hat = %s",
         # The CONFIG constant, not any sweep point's override: this line
-        # compares the measurement against the k a scheduled live run sizes at
+        # compares the measurement against config.py's k, the one this
+        # backtest defaults to (a live run sizes at the saved live defaults' k)
         TIME_SERIES_INTERVAL_PROB_DISCOUNT,
         "-" if pooled_k is None else f"{pooled_k:.3f}",
     )
@@ -6766,8 +6873,9 @@ def run_backtest(
     Replay both pair strategies on all settled Kalshi markets from start_date.
 
     Thin composition of the backtest's two halves, at the interval discount
-    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (i.e. exactly what the live sizer
-    uses by default): _prepare_entries() does the k-independent work and
+    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (config.py's k, the backtest's
+    default; a live run prices at the saved live defaults' k):
+    _prepare_entries() does the k-independent work and
     _simulate_at_discount(..., k=None) does the k-dependent work.
 
     Algorithm (the step split between the two helpers is noted):
@@ -6868,8 +6976,8 @@ def run_backtest(
 
     # The k-dependent half, at the config discount: k=None is the "no override"
     # sentinel config.time_series_profit_prob resolves to
-    # TIME_SERIES_INTERVAL_PROB_DISCOUNT, so this prices exactly as the live
-    # sizer does.
+    # TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.py's k, the one this backtest
+    # defaults to
     point = _simulate_at_discount(raw_entries, start_date, initial_balance, k=None)
     return point.trades, point.equity_df
 
@@ -7442,7 +7550,8 @@ def _sweep_from_candidates(
             points only and keeping its entries alive. False (default)
             returns cap_sweep=None and tier_off_cap_sweep=None.
         live (LiveSettings | None): Keyword-only. run_backtest_sweep's read of
-            config.py's live toggles (None: invalid); left out, read here.
+            the saved live defaults (None: none saved, or the file refused);
+            left out, read here.
 
     Returns:
         BacktestSweep: primary, points (the primary band's k sweep),
@@ -7452,7 +7561,7 @@ def _sweep_from_candidates(
             (carried from candidates), config_same_event_ladders (the
             configured switch, read beside same_event_ladders's
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
-            cap_sweep, tier_off_cap_sweep, same_title_size_cap, the four
+            cap_sweep, tier_off_cap_sweep, same_title_size_cap, the eight
             live_* fields and entry_checkpoint — see BacktestSweep.
 
     Raises:
@@ -7470,7 +7579,7 @@ def _sweep_from_candidates(
                          "re-runs the band sweep's binding bands")
     start_date = candidates.start_date
     primary_band = time_series_spread_band(spread_band)
-    # config.py's live toggles: run_backtest_sweep's read, or our own for a
+    # The saved live defaults: run_backtest_sweep's read, or our own for a
     # direct caller
     if live is _LIVE_NOT_READ:
         live = _live_settings_for_report()
@@ -7866,7 +7975,7 @@ def _sweep_from_candidates(
         tier_off_cap_sweep=off_capped,
         # Resolved as every simulation, lazy cap cells included, resolves it
         same_title_size_cap=_resolve_same_title_size_cap(),
-        # config.py's live rule and filter, from the one read above
+        # The saved live defaults' rule, filter, k and caps, from the one read above
         **_live_rule_fields(live),
         # For the dashboard header: the schedule every entry pass scanned at
         entry_checkpoint=SCHEDULED_RUN.label(),
@@ -7939,14 +8048,16 @@ def run_backtest_sweep(
     without it. It is opt-in here (False by default, the band_sweep
     pattern); backtest.py turns it on together with the band sweep.
 
-    This function never writes config.py. The calibration it reports is a
-    recommendation for a human to act on, live sizing keeps reading
-    config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (or main.py's --interval-discount)
-    whatever is passed here; no band or tier setting here reaches live.
+    This function never writes config.py or the saved live defaults. The
+    calibration it reports is a recommendation for a human to act on: live
+    sizing keeps reading the saved live defaults' k (or main.py's
+    --interval-discount) whatever is passed here; no band or tier setting
+    here reaches live.
 
-    It reports config.py's live time-series rule and category/tag filter: one
-    fail-soft read before the fetch, recorded on the four live_* fields and,
-    worded by _live_rule_line, logged last.
+    It reports the saved live defaults' time-series rule, category/tag filter,
+    k and caps: one fail-soft read before the fetch, recorded on the eight
+    live_* fields and, worded by _live_rule_line, logged last ("none
+    recorded" when no usable defaults are saved).
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -7959,8 +8070,8 @@ def run_backtest_sweep(
             every entry pass. None applies no cap.
         interval_discount (float | None): Interval discount for the primary
             point, in [0, 1]. None (default) means "no override", which
-            resolves to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT — the value
-            live sizing reads on a run without main.py's --interval-discount.
+            resolves to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (config.py's
+            k, not necessarily the saved live defaults' k live sizing reads).
         sweep (bool): When True (default), also simulate every discount in
             config.INTERVAL_DISCOUNT_SWEEP. When False, points holds the
             primary alone (and a band sweep simulates each band at the
@@ -8051,8 +8162,9 @@ def run_backtest_sweep(
         calibrations_by_band={}, an empty tier-off family and the resolved
         same_event_ladders, with the configured switch
         (config_same_event_ladders), same_title_size_cap, the entry checkpoint
-        and, when config.py's toggles validate, the live_* fields recorded and
-        the live-rule line logged, so callers need no special case.
+        and, when usable live defaults are saved, the live_* fields recorded,
+        and the live-rule line logged either way, so callers need no special
+        case.
 
         Before the fetch, one INFO line names the entry checkpoint and its UTC
         times over [start_date, today]; it never raises. _prepare_candidates
@@ -8136,8 +8248,8 @@ def run_backtest_sweep(
         "run time): %s",
         SCHEDULED_RUN.label(), where,
     )
-    # config.py's own live toggles (never main.py's per-run overrides), read
-    # ONCE before the fetch so an invalid config.py warns at the top of the run
+    # The saved live defaults (never main.py's per-run overrides), read ONCE
+    # before the fetch, so a refused file warns at the top of the run
     live = _live_settings_for_report()
 
     # The band- and k-independent half — one fetch, one pairing, one candle
@@ -8182,10 +8294,8 @@ def run_backtest_sweep(
             spread_band=primary_band, band_sweep=band_sweep,
             tier_off_sweep=tier_off_sweep, cap_sweep=cap_sweep, live=live,
         )
-    # On every path; None when config.py's toggles did not validate
-    line = _live_rule_line(result)
-    if line is not None:
-        logging.info("%s", line)
+    # On every path, "none recorded" included, so the report never omits it
+    logging.info("%s", _live_rule_line(result))
     return result
 
 
