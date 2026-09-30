@@ -2870,7 +2870,8 @@ def held_pair_fraction(fraction: float, held_cost: float, account_value: float,
     (min(Kelly f*, the pair's cap)). The add-on buys what is missing, and
     never more in one run than a new pair would stake of the cash, so
     max_kelly_fraction still bounds every size the sizer returns. The one
-    definition, read by strategy._evaluate_size.
+    definition, read by strategy._evaluate_size and
+    backtester._simulate_at_discount.
 
     Args:
         fraction (float): The fraction of the cash a new pair would stake:

@@ -1953,6 +1953,8 @@ class TestTimeSeriesKellyParity:
         # scanner.pair_held names (by type, never truthiness)
         assert _function_calls(strategy, "_evaluate_size", "held_pair_fraction")
         assert _function_calls(strategy, "_evaluate_size", "pair_held")
+        # ... and the backtest sizes its add-ons through the same definition
+        assert _function_calls(backtester, "_simulate_at_discount", "held_pair_fraction")
         # The portfolio step tells an add-on by the same reader, and only one
         # whose held pair is the spec's own markets and sides ...
         assert _function_calls(strategy, "select_portfolio", "pair_held")

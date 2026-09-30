@@ -48,7 +48,9 @@ Dependencies:
     live module calls either except through config's own live helpers, and
     TestLiveBacktestSpreadParity pins _find_entry to the live spread rule),
     plus BUDGET_FRACTION and SAME_TITLE_SIZE_CAP (bound by value),
-    pair_size_cap (one definition, shared with live sizing), LiveSettings,
+    pair_size_cap (one definition, shared with live sizing),
+    held_pair_fraction (the one definition of an add-on's size, shared with
+    live sizing), LiveSettings,
     live_defaults with its LiveDefaultsError / LiveDefaultsMissing refusals,
     describe_time_series_rule, _names_text, _exact_number and _cap_text (the
     reporting-only "Live time-series rule" line, which names the saved live
@@ -111,7 +113,8 @@ Notes:
     on several Mondays (its qualifying Mondays). Pass 1 scores each of them
     (prices, dates, Kelly fraction — no sizing) at the simulated interval
     discount k. A time-series pair keeps every Monday whose Kelly fraction is
-    positive; a same-title pair keeps its first, and only the best same-title
+    positive; a same-title pair keeps its first (with add_to_held, also its
+    later same-legs Mondays, as add-ons), and only the best same-title
     pair per title group is kept (the live one-pair-per-group rule). Pass 1
     then drops any time-series candidate whose ticker pair was also found as
     a same-title candidate, as main._dedup_pairs does live. Pass 2 walks
@@ -121,18 +124,29 @@ Notes:
     balance — sizing every candidate of an entry date against that checkpoint's
     opening balance, admitting them greedily against the running cash (mirroring
     main._run_prod + strategy.select_portfolio) and releasing settlement receipts
-    on exit dates — and applies a greedy ticker-conflict filter
-    so each market ticker appears in at most one OPEN trade at a time (the ticker
-    is released on its trade's exit date, alongside the cash). This mirrors the
+    on exit dates — and applies a greedy ticker-conflict filter so each market
+    ticker is in the open trades of at most one pair (an add-on to a held pair
+    is another trade of that pair, and shares its exit date; the ticker is
+    released on that exit date, alongside the cash). This mirrors the
     live bot's Kelly sizing against one per-run balance snapshot and its
     one-active-position-per-ticker rule: get_held_tickers() reads positions with
     count_filter="position", so a settled ticker leaves the blocked set live too.
-    Pass 2 trades each pair at most once; a time-series pair it cannot take
+    Pass 2 opens each pair at most once; a time-series pair it cannot take
     one Monday is tried again on its next passing Monday. Like the live run,
-    it holds at most one open time-series trade per ladder. A ladder is one
+    it holds at most one open time-series pair per ladder. A ladder is one
     question asked at several deadlines: two markets are on one ladder when
     they share an event or ask the same question once the dates are removed.
     A market's ladders are free again on the day it pays out.
+
+    A simulation run with add_to_held (off unless a caller asks) may also add
+    to a pair it still holds, as the live sizer does for a held pair: on a
+    later passing Monday, while both of its markets are unpaid, the pair
+    trades again as a new trade of its own, sized through
+    config.held_pair_fraction (the live sizer's rule: Kelly sizes the whole
+    position, as a share of the account value, and an add-on never stakes
+    more than a new pair would). It is refused while any other open trade
+    shares one of its ladders, as live adds only to a held pair no other held
+    market shares a ladder with.
 
     The work is split at two boundaries. _prepare_candidates() is the half
     that depends on neither the backtest's time-series spread band nor the
@@ -270,7 +284,7 @@ import resource
 import statistics
 import sys
 from array import array
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
@@ -313,6 +327,7 @@ from .config import (
     describe_time_series_rule,
     fee_leg_exact,
     fee_per_pair_approx,
+    held_pair_fraction,
     live_defaults,
     min_price_diff_for_gap,
     pair_size_cap,
@@ -528,7 +543,8 @@ def _cap_label(cap: float) -> str:
 
 def _sim_options(size_cap: float | None, quiet: bool, *,
                  end_date: date | None = None,
-                 tier_floors: bool = True) -> dict:
+                 tier_floors: bool = True,
+                 add_to_held: bool = False) -> dict:
     """
     Build the keyword arguments a sweep helper forwards to _simulate_at_discount.
 
@@ -560,7 +576,8 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
     would change the keywords TestCapSweepSeeding's stand-ins record. So a
     tier-on CapSweep calls the simulator with exactly the keywords it always
     did (size_cap, quiet, and end_date when pinned), and a tier-off one adds
-    tier_floors=False.
+    tier_floors=False. add_to_held is forwarded only when it is exactly True
+    (a CapSweep that adds to held pairs), so every other call is unchanged.
 
     Args:
         size_cap (float | None): The cap the caller simulates under; None or
@@ -574,10 +591,14 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
         tier_floors (bool): Keyword-only. Whether the entries were detected
             with the deadline-gap tier floors applied; forwarded (as False)
             only when it is exactly False. Default True, not forwarded.
+        add_to_held (bool): Keyword-only. Whether the simulation may add to a
+            pair it still holds (see _simulate_at_discount); forwarded (as
+            True) only when it is exactly True. Default False, not forwarded.
 
     Returns:
         dict: {} on a default call; otherwise "size_cap", "quiet",
-            "end_date" and/or "tier_floors" (always False when present).
+            "end_date", "tier_floors" (always False when present) and/or
+            "add_to_held" (always True when present).
     """
     out: dict = {}
     if size_cap is not None and size_cap != BUDGET_FRACTION:
@@ -588,6 +609,9 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
         out["end_date"] = end_date
     if tier_floors is False:
         out["tier_floors"] = False
+    # Only when on, so an ordinary call carries no extra keyword
+    if add_to_held is True:
+        out["add_to_held"] = True
     return out
 
 # ─── Data structures ──────────────────────────────────────────────────────────
@@ -653,8 +677,9 @@ class BacktestTrade:
             ranked on an expected ratio computed at entry, which never reads
             how the markets settled (though its horizon ends at whichever
             leg actually closed last).
-        kelly_fraction (float): Capped Kelly fraction used for sizing, <= the
-            size cap it was simulated under — config.BUDGET_FRACTION unless a
+        kelly_fraction (float): Capped Kelly fraction used for sizing (on an
+            add-on, the share of cash held_pair_fraction allowed); <= the size
+            cap it was simulated under — config.BUDGET_FRACTION unless a
             size-cap sweep (CapSweep) simulated another.
         expected_payoff (float): NET profit in a win scenario after exact fees:
             n * (1 − price_a − price_b) − fees on the leg prices above. For
@@ -707,6 +732,13 @@ class BacktestTrade:
         settled_date_b (date | None): The date market B settled. All six are
             reporting only, read by the dashboard's best/worst trade tables;
             None/"" on a trade constructed without them.
+        add_on (bool): True when this trade added to a pair the simulation
+            still held — the same two markets, bought the same way round, while
+            an earlier trade of the pair was open (only a simulation run with
+            add_to_held makes one). It is a trade of its own, with its own
+            count, cost, fees and payout; the earlier trade is never changed.
+            Reporting only. False by default, so every other construction
+            still builds.
     """
     pair_type: str       # "time_series" | "same_title"
     ticker_a: str
@@ -729,7 +761,9 @@ class BacktestTrade:
     profit: float
     profit_ratio: float
     monthly_profit_ratio: float  # realized profit_ratio * 30 / holding_days (reporting only)
-    kelly_fraction: float        # capped Kelly fraction used for sizing (<= the run's size cap)
+    # Capped Kelly fraction used for sizing (on an add-on, the share of cash
+    # held_pair_fraction allowed); <= the run's size cap
+    kelly_fraction: float
     expected_payoff: float  # n * (1 - price_a - price_b) minus fees — same_title floor / time_series win-cell profit
     slippage: float         # profit - expected_payoff
     holding_days: int
@@ -763,6 +797,9 @@ class BacktestTrade:
     close_date_b: date | None = None
     settled_date_a: date | None = None
     settled_date_b: date | None = None
+    # Whether this trade added to a pair the simulation still held (only with
+    # _simulate_at_discount(add_to_held=True)); reporting only
+    add_on: bool = False
 
 
 @dataclass(frozen=True)
@@ -906,14 +943,24 @@ class SweepPoint:
             sweep simulated another; 1.0 means no per-trade cap (full Kelly),
             same-title pairs still under SAME_TITLE_SIZE_CAP. None only on a
             hand-built point, which a report labels "not recorded".
-            Appended with a default, like the two fields below it, so no
+            Appended with a default, like the fields below it, so no
             existing construction moves.
         peak_kelly_fraction (float | None): The largest uncapped Kelly
             fraction f* over every Monday a pair may be traded on (every
-            passing Monday of a time-series pair, a same-title pair's first);
-            0.0 when none passed, None only on a hand-built point. It does not
-            depend on the cap, and every cap at or above it sizes the point
-            the same way, so CapSweep reuses one simulation for all of them.
+            passing Monday of a time-series pair; a same-title pair's first,
+            and with add_to_held also its later passing Mondays that keep the
+            first one's legs the same way round); 0.0 when none passed, None
+            only on a hand-built point. It does not depend on the cap, and
+            every cap at or above it sizes the point the same way — an
+            add-on's size included, since the cap reaches it only through
+            min(pair cap, f*) — so CapSweep reuses one simulation for all of
+            them.
+        add_to_held (bool): True when the simulation could add to a pair it
+            still held (_simulate_at_discount(add_to_held=True)). Not only a
+            label: _ex_top_event re-simulates the point at this setting, so its
+            excluding-top-event run adds to held pairs exactly when the point
+            did. Appended with a default of False, so every existing
+            construction still builds as a point that never adds.
     """
     k: float
     trades: list[BacktestTrade]
@@ -925,6 +972,7 @@ class SweepPoint:
     tier_floors: bool = True
     size_cap: float | None = None
     peak_kelly_fraction: float | None = None
+    add_to_held: bool = False
 
 
 @dataclass(frozen=True)
@@ -1362,6 +1410,18 @@ class CapSweep:
     tier-on sweep's same_title() serves both) and runs the band sweep's
     checks (its family exists only on a band sweep).
 
+    A CapSweep with add_to_held runs every simulation, and its checks, with
+    _simulate_at_discount(add_to_held=True). No eager run adds to held pairs,
+    so such a sweep has no eager point to seed from: it refuses to be built
+    with any (eager must be {} and same_title_eager None), since an eager
+    point would be handed back as one of its own. Each cap is simulated in
+    turn until one reaches the peak of the point it simulated, and every
+    larger cap shares that point; each cell's curves end on the day end_dates
+    gives it, and a cell end_dates has no day for is refused rather than ended
+    on today. Sharing stays exact, because the cap reaches an add-on's size
+    only through min(pair cap, f*), as it reaches any trade's, and the peak
+    covers every Monday an add-on may be made on.
+
     Retention of the tier-off one, declared the same way: it keeps the
     family's entries_by_band — one entry dict per binding band per tier-off
     entry, each band's tier-off time-series entries followed by the shared
@@ -1414,14 +1474,26 @@ class CapSweep:
             repr.
         eager (dict): (band, k, population) -> the eager primary-cap point
             of that cell, recorded by _sweep_from_candidates — always a point
-            of this sweep's own Tier floors setting (tier_floors). Not in
-            repr.
+            of this sweep's own Tier floors setting (tier_floors) and add-on
+            setting, so {} when add_to_held. Not in repr.
         same_title_eager (SweepPoint | None): BacktestSweep.same_title_point
-            (None on the tier-off sweep). Not in repr.
+            (None on the tier-off sweep and on an add-to-held sweep). Not in
+            repr.
         tier_floors (bool): Whether this sweep's entries were detected with
             the deadline-gap tier floors applied (True, default) or not
             (False: the tier-floors-off family's). Forwarded to every
             simulation and check it runs, only when False.
+        add_to_held (bool): Whether every simulation it runs, and its checks,
+            may add to a pair still held (_simulate_at_discount's add_to_held).
+            Forwarded only when True. Default False.
+        end_dates (dict): (band, k, population) -> the day that population's
+            curves end on, for a cell with no eager point (the eager map is
+            empty for a sweep whose setting no eager run shares, such as one
+            that adds to held pairs); a cell with an eager point ends where
+            that point's curve ended. A cell in neither map ends on today
+            (UTC) on a sweep that does not add to held pairs, and is refused
+            (ValueError) on one that does. The keys must be the exact band
+            and k objects the cells are read with. Not in repr.
         simulated (int): Simulations this object has run (each cap point
             counts once; its halves and top-event re-simulations are not
             counted separately).
@@ -1442,8 +1514,31 @@ class CapSweep:
     eager: dict = field(repr=False)               # (band, k, population) -> primary-cap point
     same_title_eager: SweepPoint | None = field(default=None, repr=False)
     tier_floors: bool = True
+    # Whether every simulation adds to held pairs, forwarded like tier_floors
+    add_to_held: bool = False
+    # (band, k, population) -> the day a cell's curves end when it has no
+    # eager point to take it from
+    end_dates: dict = field(default_factory=dict, repr=False)
     simulated: int = 0
     reused: int = 0
+
+    def __post_init__(self) -> None:
+        """
+        Refuse an add-to-held sweep that was handed eager points.
+
+        Every eager point was simulated without adding to held pairs, and
+        _by_cap returns the eager point itself at the primary cap (and copies
+        of it above its peak), so a sweep that adds to held pairs and holds
+        one would hand back points that never added, stamped as if they had.
+
+        Raises:
+            ValueError: If add_to_held is set and eager is not empty or
+                same_title_eager is not None.
+        """
+        if self.add_to_held and (self.eager or self.same_title_eager is not None):
+            raise ValueError(
+                "a CapSweep that adds to held pairs simulates every cap itself: "
+                "it takes no eager points (eager must be {} and same_title_eager None)")
 
     def _by_cap(
         self,
@@ -1460,10 +1555,11 @@ class CapSweep:
         eager object itself; then the eager seed (only when the primary cap
         is at or above the eager point's peak — see the class docstring);
         then a point this call simulated at a cap at or above its own peak;
-        else a quiet simulation, pinned to the eager point's end date and run
-        at this sweep's Tier floors setting (tier_floors), with the
-        split-half and top-event checks — at that setting too — when the
-        band sweep ran and the population carries them.
+        else a quiet simulation, pinned to the eager point's end date (with
+        no eager point, to end_dates' day for this cell) and run at this
+        sweep's Tier floors and add-on settings (tier_floors, add_to_held),
+        with the split-half and top-event checks — at those settings too —
+        when the band sweep ran and the population carries them.
 
         Args:
             subset (list[dict]): The population's entries.
@@ -1473,19 +1569,35 @@ class CapSweep:
             population (str): The population label.
             eager_point (SweepPoint | None): The eager primary-cap point of
                 this (band, k, population), or None when the sweep recorded
-                none (a hand-built CapSweep — never a production one).
+                none (a hand-built CapSweep, or one that adds to held pairs,
+                which holds no eager points).
 
         Returns:
             dict[float, SweepPoint]: cap -> point, one per self.caps entry,
                 each stamped with its own size_cap (and, simulated or copied,
-                with this sweep's tier_floors).
+                with this sweep's tier_floors and add_to_held).
+
+        Raises:
+            ValueError: If this sweep adds to held pairs and end_dates has no
+                day for (band, k, population): its curves would otherwise end
+                on whatever day (UTC) the cell happens to be read.
         """
         out: dict[float, SweepPoint] = {}
         # The peak is cap-independent, so the eager point's is this subset's
         seed = eager_point.peak_kelly_fraction if eager_point is not None else None
         # Every simulated cap ends its curve where the eager point's ended, not
-        # on whatever day (UTC) this cell happens to be read
-        end_date = _curve_end_date(eager_point)
+        # on whatever day (UTC) this cell happens to be read; a cell with no
+        # eager point takes its day from end_dates
+        if eager_point is not None:
+            end_date = _curve_end_date(eager_point)
+        else:
+            end_date = self.end_dates.get((band, k, population))
+            if end_date is None and self.add_to_held:
+                # An add-on sweep has no eager point to fall back on, so a
+                # missing day (a key off by float noise included) is refused
+                raise ValueError(
+                    f"CapSweep adds to held pairs but end_dates has no day for "
+                    f"(band, k, population) = {(band, k, population)!r}")
         # The eager point sizes as every cap at or above the seed ONLY if its
         # own cap is at or above it too — a capped eager point does not
         eager_seeds = seed is not None and self.primary_cap >= seed
@@ -1504,20 +1616,22 @@ class CapSweep:
             else:
                 # size_cap explicit (see _sim_options: a cap equal to
                 # BUDGET_FRACTION must still name itself); quiet, the pinned
-                # end date and this sweep's tier setting through _sim_options,
-                # so a tier-on sweep forwards no tier_floors at all
+                # end date, this sweep's tier setting and its add-on setting
+                # through _sim_options, so a tier-on sweep that never adds
+                # forwards neither
                 point = _simulate_at_discount(
                     subset, self.start_date, self.initial_balance, k=k, spread_band=band,
                     population=population, size_cap=cap,
                     **_sim_options(None, True, end_date=end_date,
-                                   tier_floors=self.tier_floors))
+                                   tier_floors=self.tier_floors,
+                                   add_to_held=self.add_to_held))
                 self.simulated += 1
                 if self.checks and population in _CHECKED_POPULATIONS:
                     point.halves = _half_split(
                         _split_halves(subset, self.split_date), self.start_date,
                         self.initial_balance, k, band, population=population,
                         tier_floors=self.tier_floors, size_cap=cap, quiet=True,
-                        end_date=end_date)
+                        end_date=end_date, add_to_held=self.add_to_held)
                     point.ex_top_event = _ex_top_event(
                         point, subset, self.start_date, self.initial_balance, band,
                         population=population, tier_floors=self.tier_floors, quiet=True,
@@ -1544,10 +1658,13 @@ class CapSweep:
                 "all" always; with checks, also "time_series", "ladder" and
                 "cross", each only when non-empty at this band — the eager
                 loop's rule, through the same _population_subsets. The
-                primary cap's points are the eager objects themselves.
+                primary cap's points are the eager objects themselves, where
+                the sweep has an eager point.
 
         Raises:
             KeyError: If band is not one of self.bands.
+            ValueError: If this sweep adds to held pairs and end_dates has no
+                day for one of the cell's populations (see _by_cap).
         """
         entries = self.entries_by_band[band]
         subsets = [("all", entries)]
@@ -1566,12 +1683,18 @@ class CapSweep:
         The same-title entries simulated alone, at every cap.
 
         Band- and k-independent like BacktestSweep.same_title_point (simulated
-        at the primary k, with no band), which is the primary cap's point.
+        at the primary k, with no band), which is the primary cap's point when
+        the sweep holds it (same_title_eager); a sweep that adds to held pairs
+        holds none and simulates every cap.
 
         Returns:
             dict[float, SweepPoint]: cap -> point; {} without checks (no band
                 sweep) or without same-title entries, when the eager sweep
                 had no same-title population either.
+
+        Raises:
+            ValueError: If this sweep adds to held pairs and end_dates has no
+                day for (None, primary_k, "same_title") (see _by_cap).
         """
         if not (self.checks and self.st_entries):
             return {}
@@ -5884,6 +6007,7 @@ def _simulate_at_discount(
     size_cap: float | None = None,
     quiet: bool = False,
     end_date: date | None = None,
+    add_to_held: bool = False,
 ) -> SweepPoint:
     """
     Size, select and settle prepared entries at one interval discount.
@@ -5905,13 +6029,15 @@ def _simulate_at_discount(
     A time-series pair becomes one candidate per Monday its Kelly fraction is
     positive, and Pass 2 trades it on the first it can take (not blocked by
     a busy ladder, short cash, a market in an open trade, or fees eating the
-    profit). A same-title pair keeps only its first passing Monday, is not
-    retried, and only the best one per title group survives.
+    profit). A same-title pair keeps only its first passing Monday (with
+    add_to_held, also the later ones that can only add to it — see below),
+    is not retried, and only the best one per title group survives.
 
-    Pass 2 holds at most one open time-series trade per ladder (see the
+    Pass 2 holds at most one open time-series pair per ladder (see the
     module Notes). A time-series candidate is skipped while an open trade of
     either kind has a market on one of its markets' ladders; a same-title
-    trade holds ladders but is never skipped for them. A pair dropped for
+    pair that is opening a trade is never skipped for them (an add-on to a
+    held pair can be; see add_to_held below). A pair dropped for
     how it paid out (no yes/no result, the impossible result, no pay-out
     date) never holds a ladder, though a live run might have held it.
 
@@ -5929,6 +6055,32 @@ def _simulate_at_discount(
     neither cap moves which Mondays pass the Kelly gate, the premise count or
     peak_kelly_fraction — only trade sizes, and so which trades fit and when.
     quiet sends this run's log lines to DEBUG, for the lazy size-cap runs.
+
+    add_to_held lets the walk add to a pair it still holds, as the live
+    sizer does for a held pair. A candidate whose pair has an open trade,
+    with both of its markets not yet paid out on that Monday, may trade
+    again: the same two markets, bought the same way round, recorded as a
+    new trade (BacktestTrade.add_on) — the open trade is never changed. It
+    is refused when another open trade holds one of its markets' ladder
+    labels, or when its two markets share no label (live, scanner.held_pairs
+    adds only to two held markets that share a label and that no other held
+    market shares); those refusals, and the skip for a full-size pair, are
+    counted on their own lines. It is sized through
+    config.held_pair_fraction — the live sizer's own rule: Kelly sizes the
+    whole position, so the add-on stakes what the pair is missing of
+    min(pair cap, f*) of the account value (the checkpoint's cash plus every
+    open trade's contract cost, fees excluded, as the equity curve carries
+    it), and never more than a new pair would stake of the cash; a pair that
+    already holds that share (a full-size pair) is skipped. A
+    same-title pair then also keeps its later passing Mondays that have the
+    first one's legs the same way round (its pricier side is decided again
+    every Monday, and the other way round is the opposite trade); those can
+    only add to its open trade, and only the group winner's are kept. The cap
+    reaches an add-on only through min(pair cap, f*), exactly as it reaches
+    any trade, so peak_kelly_fraction — which covers those Mondays too —
+    still marks the cap above which the whole walk is the same. With
+    add_to_held off (the default) none of this runs: no add-on state is kept
+    and no add-on line is logged.
 
     Args:
         raw_entries (list[dict]): Prepared entries — _prepare_entries()
@@ -5973,14 +6125,18 @@ def _simulate_at_discount(
             size-cap run passes the day its eager point's curve ended, so
             the caps of one population share one span even when a cell is
             read after UTC midnight (CapSweep).
+        add_to_held (bool): Keyword-only. Whether a pair still held may
+            trade again (see above). True names the run ", adding to held
+            pairs" after the cap on its completion line, so the two families
+            never share a prefix. Default False.
 
     Returns:
         SweepPoint: The trades (in entry-date order, empty if none entered) and
             the daily equity curve produced at this discount, stamped with the
             RESOLVED k — never None — the resolved spread_band (None when None
             was passed), the population, tier_floors (False only when False
-            was passed), the resolved size_cap and the peak_kelly_fraction
-            (0.0 when no candidate passed the Kelly gate).
+            was passed), the resolved size_cap, the peak_kelly_fraction (0.0
+            when no candidate passed the Kelly gate) and add_to_held.
 
     Raises:
         ValueError: If population is not one of the labels above (a typo would
@@ -6038,7 +6194,7 @@ def _simulate_at_discount(
 
         # The pair's qualifying Mondays with a positive Kelly fraction at this
         # k, in date order: all of them for a time-series pair, the first for
-        # a same-title pair.
+        # a same-title pair (all of them too when adding to held pairs).
         passing = []
         for monday in _entry_mondays(entry):
             # Unpack this Monday — mA/mB may have been swapped inside _find_entry to canonicalize
@@ -6087,19 +6243,30 @@ def _simulate_at_discount(
             kelly_f = (p - q / kelly_b_entry) if kelly_b_entry > 0 else -1.0
             if kelly_f > 0:
                 passing.append((monday, kelly_f, price_a, price_b, profit_ratio_entry))
-                if pair_type != "time_series":
+                if pair_type != "time_series" and not add_to_held:
                     # A same-title pair is tried on its first passing Monday only
                     break
         if not passing:
             # No qualifying Monday has positive expected value at this k
             continue
-        # Any passing Monday may be the one traded
+        if pair_type != "time_series" and len(passing) > 1:
+            # Adding to held pairs: a same-title pair's later passing Mondays
+            # can only add to its first one's trade, so only those with the
+            # first's legs the same way round are kept (its pricier side is
+            # decided again every Monday, and the other way round is the
+            # opposite trade)
+            legs = (passing[0][0]["mA"]["ticker"], passing[0][0]["mB"]["ticker"])
+            passing = [passing[0]] + [row for row in passing[1:]
+                                      if (row[0]["mA"]["ticker"], row[0]["mB"]["ticker"]) == legs]
+        # Any passing Monday may be the one traded (or, for a same-title pair
+        # adding to held pairs, added on)
         peak_kelly = max(peak_kelly, *(kelly_f for _m, kelly_f, *_prices in passing))
         # config.pair_size_cap: the one definition live sizing caps through
         size_cap_for_pair = pair_size_cap(pair_type, cap, st_cap)
 
         # Checked once per pair: a time-series pair's markets are the same on
-        # every Monday, and a same-title pair has one Monday
+        # every Monday, and a same-title pair's kept Mondays all have its
+        # first one's legs
         mA, mB = passing[0][0]["mA"], passing[0][0]["mB"]
 
         # Skip pairs where the settlement result is missing or non-binary
@@ -6163,7 +6330,7 @@ def _simulate_at_discount(
             ladders_a, ladders_b = same_title_ladders[id(mA)], same_title_ladders[id(mB)]
 
         # One candidate per passing Monday, priced and ranked on that Monday
-        for monday, kelly_f, price_a, price_b, profit_ratio_entry in passing:
+        for index, (monday, kelly_f, price_a, price_b, profit_ratio_entry) in enumerate(passing):
             entry_date = monday["entry_date"]
             holding_days = max(1, (exit_date - entry_date).days)
 
@@ -6188,6 +6355,9 @@ def _simulate_at_discount(
                 "outcome_a": outcome_a,
                 "outcome_b": outcome_b,
                 "kelly_f_capped": min(size_cap_for_pair, kelly_f),
+                # A same-title pair's later Monday: it can only add to the
+                # pair's open trade (never with add_to_held off: there is none)
+                "add_on_only": pair_type != "time_series" and index > 0,
                 "entry_monthly_ratio": entry_monthly_ratio,
                 "holding_days": holding_days,
                 "title_a": title_a,
@@ -6198,7 +6368,8 @@ def _simulate_at_discount(
                 # Carried straight from _find_entry (None for same_title) so the
                 # recorded trade reports the same gap the tier was chosen from
                 "gap_days": entry["gap_days"],
-                # So Pass 2 trades the pair at most once
+                # So Pass 2 opens the pair at most once (and, adding to held
+                # pairs, knows which open trade a later Monday adds to)
                 "pair_id": pair_id,
                 "ladder_keys_a": ladders_a, "ladder_keys_b": ladders_b,
             })
@@ -6250,17 +6421,23 @@ def _simulate_at_discount(
     # the event title, so one option label in two events stays two groups.
     # The winner can be dated after a group-mate that passed the gate earlier,
     # which the live bot could not have known. Time-series candidates skip
-    # this: the ladder rule in Pass 2 decides which rung trades.
+    # this: the ladder rule in Pass 2 decides which rung trades. A same-title
+    # pair's add-on-only Mondays never contest; the winner's are kept after
+    # it, and a loser's are dropped with it.
     best_by_group: dict = {}
     for c in candidates:
-        if c["pair_type"] == "time_series":
+        if c["pair_type"] == "time_series" or c["add_on_only"]:
             continue
         key = (c["pair_type"], c["group_key"])
         cur = best_by_group.get(key)
         if cur is None or c["entry_monthly_ratio"] > cur["entry_monthly_ratio"]:
             best_by_group[key] = c
+    winners = {c["pair_id"] for c in best_by_group.values()}
     candidates = ([c for c in candidates if c["pair_type"] == "time_series"]
-                  + list(best_by_group.values()))
+                  + list(best_by_group.values())
+                  # Empty unless add_to_held is on (only then does a same-title
+                  # pair keep a later Monday)
+                  + [c for c in candidates if c["add_on_only"] and c["pair_id"] in winners])
 
     # Cross-type dedup, mirroring main._dedup_pairs on the live path: the same
     # two tickers can be discovered by BOTH groupings, and the live pipeline
@@ -6291,7 +6468,8 @@ def _simulate_at_discount(
     # than live would make it. Settlement receipts return to cash on their
     # exit dates. A ticker-conflict
     # filter mirrors the live
-    # bot's rule precisely: at most one ACTIVE position per ticker. Live, that
+    # bot's rule precisely: at most one held pair per ticker (with add_to_held,
+    # a pair may hold several trades). Live, that
     # rule comes from scanner.get_held_tickers(), which queries positions with
     # count_filter="position" — so a ticker leaves the held set once its market
     # settles and may be entered again. The backtest therefore holds a ticker
@@ -6299,8 +6477,9 @@ def _simulate_at_discount(
     # the settlement receipts.
     #
     # The backtest never sells before pay-out, and holds at most one open
-    # time-series trade per ladder; a market's ladders are freed the day it
-    # pays out, with its cash.
+    # time-series pair per ladder; a market's ladders are freed the day it
+    # pays out, with its cash. Adding to held pairs, a pair still held may
+    # trade again as a new trade of its own (see the docstring).
     trades: list[BacktestTrade] = []
     active_tickers: set[str] = set()
     cash = initial_balance
@@ -6318,6 +6497,17 @@ def _simulate_at_discount(
     open_ladders: dict = {}
     ladders_until: list[tuple[date, frozenset]] = []
     ladder_refusals = 0
+    # Adding to held pairs (kept only when add_to_held, so the off path holds
+    # no new state): each open pair's stake so far (contracts plus fees), the
+    # day it pays out, and how many ladder holds its own trades have taken
+    open_pairs: dict[int, dict] = {}
+    # Every open trade's contract cost (fees excluded, as the equity curve
+    # carries it) with the day it pays out: with the checkpoint's cash, the
+    # account value an add-on's Kelly share is a fraction of
+    open_cost = 0.0
+    open_cost_until: list[tuple[date, float]] = []
+    checkpoint_value = cash
+    add_ons = add_on_cap_skips = add_on_ladder_skips = 0
 
     for c in candidates:
         d = c["entry_date"]
@@ -6327,7 +6517,7 @@ def _simulate_at_discount(
         # Release the tickers of those same settled trades — the position is
         # closed, so (as live) the ticker is no longer blocked. Set difference
         # is safe because the conflict filter below guarantees a ticker is in
-        # at most one open trade at a time.
+        # the open trades of at most one pair, which share one exit date.
         # NOTE the `<= d` (not `< d`): a trade exiting ON date d frees its
         # tickers for a later candidate entering that same date d. This is a
         # deliberate symmetry with the cash rule directly above, which likewise
@@ -6348,6 +6538,13 @@ def _simulate_at_discount(
                     if not open_ladders[key]:
                         del open_ladders[key]
             ladders_until = still_held
+        if add_to_held:
+            # Release the contract cost and the open-pair record of trades
+            # paid out by this day, on the same schedule as their cash
+            open_cost -= sum(amount for ed, amount in open_cost_until if ed <= d)
+            open_cost_until = [(ed, amount) for ed, amount in open_cost_until if ed > d]
+            for pid in [pid for pid, rec in open_pairs.items() if rec["until"] <= d]:
+                del open_pairs[pid]
 
         if d != checkpoint_date:
             # First candidate of a new checkpoint: receipts for this date have
@@ -6355,19 +6552,51 @@ def _simulate_at_discount(
             # starting today would read and size everything against.
             checkpoint_date = d
             checkpoint_cash = cash
+            if add_to_held:
+                # ... and the account value it would read: cash plus every
+                # open position at cost
+                checkpoint_value = cash + open_cost
 
+        held = None
         if c["pair_id"] in traded_pairs:
+            # Traded before: only an add-on to its still-open trade may follow,
+            # and only while neither of its markets has paid out (live finds a
+            # held pair only while it holds both)
+            held = open_pairs.get(c["pair_id"]) if add_to_held else None
+            if held is None or not (c["settled_date_a"] > d and c["settled_date_b"] > d):
+                continue
+        elif c["add_on_only"]:
+            # A same-title pair's later Monday with nothing to add to
             continue
 
         mA, mB = c["mA"], c["mB"]
-        # Skip if either ticker is still committed to a trade that hasn't settled
-        if mA["ticker"] in active_tickers or mB["ticker"] in active_tickers:
+        # Skip if either ticker is still committed to a trade that hasn't
+        # settled; an add-on's own trade holds its tickers, and the conflict
+        # filter kept every other trade off them while it is open
+        if held is None and (mA["ticker"] in active_tickers
+                             or mB["ticker"] in active_tickers):
             continue
 
-        # At most one open time-series trade per ladder
         ladders_a, ladders_b = c["ladder_keys_a"], c["ladder_keys_b"]
-        if c["pair_type"] == "time_series" and any(
+        if held is not None:
+            # An add-on holds only its own ladders: its two markets must share
+            # one (live, scanner.held_pairs joins held markets by a shared
+            # label, so a pair sharing none is never added to there), and any
+            # other open trade holding one of them refuses it (live adds only
+            # to a held pair no other held market shares a ladder with).
+            # Counted on its own line, since the ladder line counts
+            # time-series pairs held back from opening. Its own trades' ladder
+            # holds are all still open here (both its markets are unpaid), so
+            # they are exactly held["ladders"]; any excess belongs to another
+            # trade.
+            if not (ladders_a & ladders_b) or any(
+                    open_ladders.get(key, 0) > held["ladders"][key]
+                    for key in (*ladders_a, *ladders_b)):
+                add_on_ladder_skips += 1
+                continue
+        elif c["pair_type"] == "time_series" and any(
                 key in open_ladders for key in (*ladders_a, *ladders_b)):
+            # At most one open time-series pair per ladder
             ladder_refusals += 1
             continue
 
@@ -6375,9 +6604,20 @@ def _simulate_at_discount(
         # below is computed on these, never on the reporting-only quotes
         price_a, price_b = c["price_a"], c["price_b"]
 
+        fraction = c["kelly_f_capped"]
+        if held is not None:
+            # Kelly sizes the whole position: buy what the pair is missing of
+            # its Kelly share of the account value, and never more than a new
+            # pair would (config.held_pair_fraction, the live sizer's own rule)
+            fraction = held_pair_fraction(fraction, held["cost"], checkpoint_value,
+                                          checkpoint_cash)
+            if fraction <= 0:
+                add_on_cap_skips += 1
+                continue
+
         # Kelly sizing against the checkpoint's opening balance (live:
         # compute_trade(pair, balance_cents) with one balance for the run)
-        budget = checkpoint_cash * c["kelly_f_capped"]
+        budget = checkpoint_cash * fraction
         n = int(budget / (price_a + price_b))
         if n < 1:
             # Kelly budget can't afford one contract — live compute_trade skips too
@@ -6456,7 +6696,9 @@ def _simulate_at_discount(
             profit=profit,
             profit_ratio=profit_ratio,
             monthly_profit_ratio=monthly_profit_ratio,
-            kelly_fraction=c["kelly_f_capped"],
+            # The capped Kelly fraction; on an add-on, the share of cash
+            # held_pair_fraction allowed
+            kelly_fraction=fraction,
             expected_payoff=expected_payoff,
             slippage=slippage,
             holding_days=c["holding_days"],
@@ -6470,6 +6712,7 @@ def _simulate_at_discount(
             close_date_b=c["close_date_b"],
             settled_date_a=c["settled_date_a"],
             settled_date_b=c["settled_date_b"],
+            add_on=held is not None,
         ))
 
         # Cash out the door: contracts plus fees; the receipt comes back at exit
@@ -6482,6 +6725,19 @@ def _simulate_at_discount(
         active_tickers.add(mB["ticker"])
         active_until.append((c["exit_date"], mA["ticker"]))
         active_until.append((c["exit_date"], mB["ticker"]))
+
+        if add_to_held:
+            # Carry the contracts at cost until the trade pays out, and add
+            # this trade's stake and ladder holds to its pair's record
+            open_cost += total_cost
+            open_cost_until.append((c["exit_date"], total_cost))
+            if held is None:
+                held = open_pairs[c["pair_id"]] = {"cost": 0.0, "until": c["exit_date"],
+                                                   "ladders": Counter()}
+            held["cost"] += invested
+            held["ladders"].update((*ladders_a, *ladders_b))
+            if c["pair_id"] in traded_pairs:
+                add_ons += 1
 
         # Each market holds its ladders until it pays out
         traded_pairs.add(c["pair_id"])
@@ -6506,13 +6762,17 @@ def _simulate_at_discount(
     # the colon (", cap 35%" / ", no cap" — injective, so the prefix stays
     # unique across caps too); the default cap adds nothing, so every pre-cap
     # line is byte-identical and the population stays the last ", "-separated
-    # field of a default-cap prefix. The lazy size-cap runs are quiet (DEBUG).
-    run_label = "k={}, band {}{}, {}{}".format(
+    # field of a default-cap prefix that does not add to held pairs. A run
+    # that adds to held pairs ends its prefix on ", adding to held pairs",
+    # after the cap, so it never shares a prefix with one that does not. The
+    # lazy size-cap runs are quiet (DEBUG).
+    run_label = "k={}, band {}{}, {}{}{}".format(
         _exact_label(effective_k, ".3f"),
         _band_label((band_lo, band_hi)),
         " with the tier floors off" if tier_floors is False else "",
         population,
         "" if cap == BUDGET_FRACTION else f", {_cap_label(cap)}",
+        ", adding to held pairs" if add_to_held else "",
     )
     # Once per pair per Monday a busy ladder held it back (silent at zero)
     if ladder_refusals:
@@ -6521,6 +6781,27 @@ def _simulate_at_discount(
             "Time-series pairs skipped on a Monday because we still held a trade on "
             "the same ladder (%s): %d",
             run_label, ladder_refusals,
+        )
+    # Adding to held pairs: what was added, and why an add was refused (each
+    # silent at zero, and never logged with add_to_held off)
+    if add_ons:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Trades that added to a held pair (%s): %d",
+            run_label, add_ons,
+        )
+    if add_on_cap_skips:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Adds skipped because the held pair is already at its target size (%s): %d",
+            run_label, add_on_cap_skips,
+        )
+    if add_on_ladder_skips:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Adds skipped because another open trade is on the same ladder, or the "
+            "two markets share no ladder (%s): %d",
+            run_label, add_on_ladder_skips,
         )
     logging.log(
         logging.DEBUG if quiet else logging.INFO,
@@ -6542,6 +6823,7 @@ def _simulate_at_discount(
         # A label, like the band: only an explicit False marks a tier-off point
         tier_floors=tier_floors is not False,
         size_cap=cap, peak_kelly_fraction=peak_kelly,
+        add_to_held=bool(add_to_held),
     )
 
 
@@ -7105,14 +7387,15 @@ def _half_split(
     size_cap: float | None = None,
     quiet: bool = False,
     end_date: date | None = None,
+    add_to_held: bool = False,
 ) -> HalfSplit:
     """
     Simulate each half of one scenario's entries alone and keep three numbers each.
 
-    Both halves are simulated at the scenario's own size cap and tier-floor
-    setting, forwarded through _sim_options — which forwards NOTHING on a
-    default call, so the eager tier-on band sweep calls _simulate_at_discount
-    with exactly the keywords it always did.
+    Both halves are simulated at the scenario's own size cap, tier-floor
+    setting and add-on setting, forwarded through _sim_options — which
+    forwards NOTHING on a default call, so the eager tier-on band sweep calls
+    _simulate_at_discount with exactly the keywords it always did.
 
     Args:
         halves (tuple[list[dict], list[dict]]): The scenario's entries as
@@ -7140,6 +7423,9 @@ def _half_split(
         end_date (date | None): Keyword-only. The day both halves' equity
             curves end on (a lazy size-cap run pins its eager point's); None
             (default) for today (UTC), forwarded only when given.
+        add_to_held (bool): Keyword-only. Whether both halves may add to a
+            pair they still hold, as the scenario did; forwarded only when
+            True. Default False.
 
     Returns:
         HalfSplit: Each half's total return, trade count and entry count. The
@@ -7149,7 +7435,8 @@ def _half_split(
     first, second = halves
     # Only the options that differ from the defaults, so a default call is
     # byte-for-byte the call it always was
-    options = _sim_options(size_cap, quiet, end_date=end_date, tier_floors=tier_floors)
+    options = _sim_options(size_cap, quiet, end_date=end_date, tier_floors=tier_floors,
+                           add_to_held=add_to_held)
     h1 = _simulate_at_discount(first, start_date, initial_balance, k=k,
                                spread_band=band, population=f"{population}/H1", **options)
     h2 = _simulate_at_discount(second, start_date, initial_balance, k=k,
@@ -7200,9 +7487,10 @@ def _ex_top_event(
     fraction.
 
     The re-simulation runs at the point's own size cap (point.size_cap) and
-    the caller's tier_floors, forwarded through _sim_options — nothing extra
-    on the run's own cap with the tiers on, so the eager tier-on band sweep's
-    call is unchanged.
+    add-on setting (point.add_to_held), and the caller's tier_floors,
+    forwarded through _sim_options — nothing extra on the run's own cap with
+    the tiers on and no adding to held pairs, so the eager tier-on band
+    sweep's call is unchanged.
 
     Args:
         point (SweepPoint): The scenario's "all" or "time_series" point.
@@ -7245,7 +7533,8 @@ def _ex_top_event(
                                     spread_band=band, population=f"{population}/ex-top",
                                     **_sim_options(point.size_cap, quiet,
                                                    end_date=end_date,
-                                                   tier_floors=tier_floors))
+                                                   tier_floors=tier_floors,
+                                                   add_to_held=point.add_to_held))
     return top, _total_return(without, initial_balance)
 
 
