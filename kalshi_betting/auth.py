@@ -23,12 +23,13 @@ Dependencies:
     Imports PROD_URL, SANDBOX_URL, SECRETS_FILE, PEM_FILE, DEV_PEM_FILE, and
     DEFAULT_EXCHANGE_INDEX from config.py, and api_call_with_retry /
     fetch_json_page from _http.py. build_client() is called by main.py,
-    historical.py, and (indirectly) backtest.py. verify_auth() is called by
-    main.py (the balance before and after trading) and read_shard_balances()
-    by trader.py (the collateral-transfer settle poll).
-    read_account_balance() is the read verify_auth() makes. (The standalone,
-    human-run verification CLI kept deliberately outside the pipeline's
-    import graph also calls build_client() and verify_auth() — see
+    historical.py, and (indirectly) backtest.py. read_account_balance() is
+    called by main.py (the balance before trading, whose cash plus positions
+    value the run sizes on, and the cash after trading) and
+    read_shard_balances() by trader.py (the collateral-transfer settle poll).
+    verify_auth() is read_account_balance() returning only the cash. (The
+    standalone, human-run verification CLI kept deliberately outside the
+    pipeline's import graph calls build_client() and verify_auth() — see
     CLAUDE.md's pipeline-isolation rule.)
 
 Notes:
@@ -408,8 +409,10 @@ def read_account_balance(client: KalshiClient) -> AccountBalance:
     CLAUDE.md API-drift gotcha). The body is parsed here instead — the cash
     by _balance_cents_by_shard, the positions value by _positions_value_cents.
 
-    verify_auth() is this read returning only the cash; a caller that also
-    needs the positions value calls this function.
+    main._run_prod calls it before trading (it sizes on the cash plus the
+    positions' value, and spends only the cash) and again after trading (the
+    cash for the trade log). verify_auth() is this read returning only the
+    cash.
 
     Args:
         client (KalshiClient): An authenticated client produced by build_client().
@@ -448,9 +451,9 @@ def verify_auth(client: KalshiClient) -> dict[int, int]:
 
     Makes exactly the read read_account_balance() makes — one retried
     GET /portfolio/balance and the same "Auth OK" log line — and returns only
-    its per-shard cash. main.py reads the balance before and after trading
-    through it, and the human-run verification CLI reads each shard's cash
-    with it.
+    its per-shard cash. The human-run verification CLI reads each shard's
+    cash with it; main.py calls read_account_balance() instead, since it
+    also needs the positions' value.
 
     There is deliberately no scalar-returning variant: the dict is the single
     source of truth, and a caller that needs one number sums it explicitly.

@@ -20,6 +20,16 @@ Purpose:
     subprocess) — see the EXIT_* constants in config.py (BS-14): an unhandled
     exception still propagates to exit 1, same as always.
 
+    A production run sizes on the account's portfolio value — the cash on
+    every exchange shard plus what Kalshi says the open positions are worth
+    (_bankroll_cents) — and spends only the cash: each trade's Kelly budget
+    is a fraction of the portfolio value, never more than the cash on hand
+    (enrichment and strategy.compute_trade are handed both numbers), and
+    strategy.select_portfolio shrinks a trade that no longer fits the cash
+    left. The MIN_BALANCE_CENTS gate reads the portfolio value; cash alone
+    below it draws a WARNING and the run goes on. Dev mode holds nothing, so
+    its virtual --sandbox-balance is both the portfolio value and the cash.
+
     Right after parsing its arguments, main() exits 2 if
     config.ORDER_API_VERSION is not "v2" (config.order_api_version_error),
     before logging is configured.
@@ -35,7 +45,8 @@ Purpose:
     dev, right after the order-path check) first removes any file already at
     PATH, then writes what it did there as JSON in a finally once logging is
     set up, so however the run ends from that point: the exit code, the line
-    it logged when it stopped or finished, its balances, whether it began
+    it logged when it stopped or finished, its cash before and after trading
+    and the portfolio value it sized on, whether it began
     sending orders, each pair's outcome, its WARNING-or-worse log lines and
     any error (reporter.RunReport, written by reporter.write_run_report).
     Two endings leave no file: a usage error that exits 2 before logging is
@@ -57,8 +68,10 @@ Purpose:
     enrichment: _dedup_pairs and _filter_by_category.
 
 Dependencies:
-    Imports from auth.py (client construction and auth verification), config.py
-    (balance threshold, exit-code contract, the order-path check
+    Imports from auth.py (client construction, and read_account_balance: the
+    one balance read, which also checks the credentials, returning each
+    shard's cash and Kalshi's value of the open positions), config.py
+    (the minimum portfolio value, exit-code contract, the order-path check
     order_api_version_error, the same-title threshold and
     close-gap bound, file paths, and the live toggles: LiveSettings,
     live_defaults with its LiveDefaultsError / LiveDefaultsMissing refusals
@@ -116,7 +129,7 @@ from tabulate import tabulate
 
 from . import run_lock
 from ._http import api_error_summary
-from .auth import build_client, verify_auth
+from .auth import build_client, read_account_balance
 from .config import (
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
@@ -201,18 +214,94 @@ def _format_deadline(dt) -> str:
     return dt.strftime("%Y-%m-%d") if dt else "?"
 
 
+def _bankroll_cents(cash_cents: int, positions_value_cents: int | None) -> int:
+    """
+    The run's portfolio value: the cash on every shard plus Kalshi's value of
+    the open positions, in whole cents.
+
+    _run_prod sizes on it: every Kelly fraction is taken of this value, while
+    only the cash is spent (strategy.compute_trade's budget never exceeds the
+    cash, and strategy.select_portfolio shrinks a trade to the cash left). The
+    MIN_BALANCE_CENTS gate reads it too.
+
+    When the balance reply carried no readable positions value
+    (auth.read_account_balance returned None for it), the cash alone is
+    returned with a WARNING: sizing then reads as if no position were held,
+    which can only make each trade smaller, never larger.
+
+    Args:
+        cash_cents (int): The cash on every shard together, in whole cents.
+        positions_value_cents (int | None): What Kalshi says the open
+            positions are worth, in whole cents (it does not include cash);
+            None when the reply carried no readable value.
+
+    Returns:
+        int: cash_cents + positions_value_cents, or cash_cents when the
+            positions value is None.
+    """
+    if positions_value_cents is None:
+        logging.warning(
+            "Kalshi's balance reply carried no readable portfolio_value — sizing on "
+            "cash alone ($%.2f) this run, as if no position were held",
+            cash_cents / 100,
+        )
+        return cash_cents
+    return cash_cents + positions_value_cents
+
+
+def _display_specs(trade_specs: dict, portfolio: list) -> dict:
+    """
+    Map each candidate pair to the spec the pairs table shows for it: the
+    spec select_portfolio SELECTED.
+
+    trade_specs is keyed by the id of the candidate pair each spec was sized
+    from (_compute_trade_specs), because compute_trade returns a re-priced
+    copy of the pair and id(spec.pair) matches no candidate. The selected
+    spec is matched back to its candidate by the pair's two tickers, not by
+    identity: select_portfolio returns a spec it shrank to fit the cash as a
+    new, smaller spec, and the table must show the size that trades. The
+    tickers identify one candidate: each finder keeps one best pair per group
+    and a market sits in one group, so neither finder returns two pairs on
+    one pair of tickers; _dedup_pairs drops a time-series pair whose tickers a
+    same-title pair already has; and select_portfolio never uses a ticker
+    twice.
+
+    Args:
+        trade_specs (dict): id(candidate pair) -> TradeSpec, from _compute_trade_specs.
+        portfolio (list): The TradeSpecs select_portfolio returned.
+
+    Returns:
+        dict: id(candidate pair) -> the selected TradeSpec, for the selected
+            pairs only; print_pairs_table shows "—" for every other pair.
+    """
+    selected = {frozenset((s.pair.market_a.ticker, s.pair.market_b.ticker)): s
+                for s in portfolio}
+    shown: dict = {}
+    for pid, spec in trade_specs.items():
+        chosen = selected.get(frozenset((spec.pair.market_a.ticker,
+                                         spec.pair.market_b.ticker)))
+        if chosen is not None:
+            shown[pid] = chosen
+    return shown
+
+
 def _compute_trade_specs(
-    candidate_pairs: list, balance_cents: int, settings: LiveSettings,
+    candidate_pairs: list, portfolio_value_cents: int, settings: LiveSettings, *,
+    cash_cents: int,
 ) -> dict:
     """
     Compute trade specifications for all qualifying candidate pairs.
 
     Args:
         candidate_pairs (list): List of CandidatePair objects to evaluate.
-        balance_cents (int): Current account balance in cents, used to size
-            each trade via Kelly criterion in compute_trade().
+        portfolio_value_cents (int): The value Kelly fractions are taken of,
+            in whole cents — the cash plus the open positions' value in prod
+            (_bankroll_cents), the virtual balance in dev.
         settings (LiveSettings): The run's toggles — the object enrichment
             bounded the depth with (strategy.compute_trade).
+        cash_cents (int): Keyword-only and required. The cash on hand, in
+            whole cents: no trade's budget exceeds it. Enrichment is handed
+            the same two numbers, so its depth bound still bounds the size.
 
     Returns:
         dict: Mapping of id(pair) -> TradeSpec for each pair that produced
@@ -221,8 +310,10 @@ def _compute_trade_specs(
     """
     specs: dict = {}
     for pair in candidate_pairs:
-        # Kelly-size under the run's k and caps; None when the pair does not qualify
-        spec = compute_trade(pair, balance_cents, settings=settings)
+        # Kelly-size under the run's k and caps, a fraction of the portfolio
+        # value capped at the cash; None when the pair does not qualify
+        spec = compute_trade(pair, portfolio_value_cents, settings=settings,
+                             cash_cents=cash_cents)
         if spec is not None:
             specs[id(pair)] = spec
     return specs
@@ -483,8 +574,10 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
         candidate_pairs (list): All CandidatePair objects returned by the
             scanner, regardless of whether they were selected for trading.
         display_specs (dict): Mapping of id(pair) -> TradeSpec for pairs
-            selected by select_portfolio(). Pairs absent from this dict are
-            shown with "—" in trade columns.
+            selected by select_portfolio() (_display_specs), at the size that
+            trades — a spec shrunk to fit the cash shows its shrunk count and
+            prices. Pairs absent from this dict are shown with "—" in trade
+            columns.
 
     Returns:
         None
@@ -822,6 +915,8 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
     submits real orders. The held-positions check and real balance lookup are
     skipped because the production API key is not accepted by the sandbox
     endpoint. Instead, a virtual balance is supplied via --sandbox-balance.
+    Dev holds nothing, so that balance is all cash: it is both the portfolio
+    value every Kelly fraction is taken of and the cash the portfolio spends.
     All results are written to a timestamped dev simulation Excel file.
 
     Args:
@@ -859,6 +954,9 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
     settings = live_settings() if settings is None else settings
     reference = settings if reference is None else reference
     sandbox_balance_cents = int(args.sandbox_balance * 100)
+    # Dev holds nothing: the virtual balance is all cash, so it is both the
+    # portfolio value Kelly fractions are taken of and the cash that is spent
+    portfolio_value_cents = cash_cents = sandbox_balance_cents
     logging.info(
         "DEV mode: using real sandbox market data | virtual balance $%.2f",
         args.sandbox_balance,
@@ -908,10 +1006,11 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
     # Category/tag filter; no listing client, so the sandbox key never signs a prod request
     candidate_pairs   = _filter_by_category(candidate_pairs, settings, None)
-    # Replace best-ask prices with order book averages over the depth this
-    # balance could actually buy, and validate liquidity under the run's rule
+    # Replace best-ask prices with order book averages over the depth one
+    # trade's budget could buy, and validate liquidity under the run's rule
     candidate_pairs   = enrich_with_orderbook_prices(
-        client, candidate_pairs, sandbox_balance_cents, settings=settings,
+        client, candidate_pairs, portfolio_value_cents, settings=settings,
+        cash_cents=cash_cents,
     )
 
     if not candidate_pairs:
@@ -928,16 +1027,13 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
         return EXIT_OK
 
     # Apply Kelly sizing to each candidate pair using the virtual balance
-    trade_specs   = _compute_trade_specs(candidate_pairs, sandbox_balance_cents, settings)
-    # Greedy portfolio selection ranked by monthly_profit_ratio descending
-    portfolio     = select_portfolio(list(trade_specs.values()), sandbox_balance_cents)
-    # Map pair id → TradeSpec for fast lookup in the pairs table display.
-    # Keyed off the CANDIDATE each spec was built from, not off spec.pair:
-    # compute_trade returns a re-priced copy of the pair (the marginal fill
-    # price for the size it settled on), so id(spec.pair) no longer matches any
-    # entry in candidate_pairs and every selected row would render as "—".
-    chosen = {id(s) for s in portfolio}
-    display_specs = {pid: s for pid, s in trade_specs.items() if id(s) in chosen}
+    trade_specs   = _compute_trade_specs(candidate_pairs, portfolio_value_cents, settings,
+                                         cash_cents=cash_cents)
+    # Greedy portfolio selection ranked by monthly_profit_ratio descending,
+    # spending the cash (a trade over the cash left is shrunk to fit)
+    portfolio     = select_portfolio(list(trade_specs.values()), cash_cents)
+    # Candidate pair id -> the selected spec, shrunk ones included, for the pairs table
+    display_specs = _display_specs(trade_specs, portfolio)
 
     logging.info("Kalshi Sandbox Scan — Virtual Balance: $%.2f | Mode: DEV", args.sandbox_balance)
     print_pairs_table(candidate_pairs, display_specs)
@@ -983,6 +1079,19 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     handed (see report below); every return value is the same with or
     without one.
 
+    Sizing reads one balance (auth.read_account_balance): each shard's cash
+    and Kalshi's value of the open positions. Every Kelly fraction is taken
+    of the portfolio value, the two together (_bankroll_cents, which falls
+    back to the cash alone, with a WARNING, when the positions value cannot
+    be read), and only the cash is spent: enrichment and compute_trade never
+    budget a trade above the cash, and select_portfolio walks the cash,
+    shrinking a trade that no longer fits what is left. The run logs all
+    three numbers on one "Sizing on portfolio value" line. The
+    MIN_BALANCE_CENTS gate reads the portfolio value; cash alone below it
+    draws a WARNING and the run goes on, no trade spending more than the
+    cash left. The trade log's balance columns and the collateral planner
+    stay on cash.
+
     It makes no new time-series trade on a ladder the account holds (a ladder
     is one question asked at several deadlines), and none at all if a held
     market cannot be identified; same-title trades still go ahead.
@@ -999,8 +1108,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             toggles were built from, which departures are marked against;
             None means the run's own.
         report (RunReport | None): Keyword-only. The run result main() writes
-            for --result-file, filled in as the run goes: the balance before
-            and after trading, that it began sending orders (set just before
+            for --result-file, filled in as the run goes: the cash before
+            and after trading, the portfolio value read before trading (what
+            it sizes on, set before the minimum is checked), that it
+            began sending orders (set just before
             execute_trades on a run that is not a dry run), one record per
             pair (reporter.report_trades, which never raises, so the trade log
             is still written), and the message — the line the run logged when
@@ -1010,7 +1121,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
 
     Returns:
         int: EXIT_SKIPPED_LOW_BALANCE if the run was skipped because the
-            account balance is below MIN_BALANCE_CENTS (no scan attempted).
+            portfolio value (cash plus the open positions' value) is below
+            MIN_BALANCE_CENTS (no scan attempted).
             EXIT_NO_TRADEABLE_SHARDS if the run was blind — every advertised
             exchange shard trading-inactive so ingest dropped every market
             (TS-01), or an ingest that produced zero markets for any other
@@ -1039,22 +1151,47 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # Log the run's toggles; a departure is a WARNING when orders go out
     _log_live_settings(settings, reference, real_money=not args.dry_run)
 
-    # Confirm auth works and read the pre-trade balance broken out by shard
-    shard_balances = verify_auth(client)
-    # Sizing is portfolio-wide, not per-shard: collateral is made fungible
-    # across shards by the pre-execution transfers in ensure_shard_collateral,
-    # so Kelly sizing runs on the sum here, not any single shard's balance.
-    # shard_balances itself stays a live local — the coverage check and the
-    # transfer planner below both consume the full per-shard picture.
-    balance_cents = sum(shard_balances.values())
-    report.balance_before = balance_cents / 100
-    if balance_cents < MIN_BALANCE_CENTS:
+    # One balance read, which also confirms auth works: each shard's cash, and
+    # what Kalshi says the open positions are worth
+    account = read_account_balance(client)
+    # Per-shard cash stays a live local: the coverage check and the transfer
+    # planner below both read the full per-shard picture
+    shard_balances = account.shard_cash_cents
+    # What this run can spend: the cash on every shard together. It is not
+    # tied to one shard, because ensure_shard_collateral moves cash onto the
+    # shards the selected trades draw from before any order is sent
+    cash_cents = sum(shard_balances.values())
+    # What every Kelly fraction is taken of: the cash plus the open positions'
+    # value (the cash alone, with a WARNING, when that value cannot be read)
+    positions_value_cents = account.positions_value_cents
+    portfolio_value_cents = _bankroll_cents(cash_cents, positions_value_cents)
+    # All three numbers on one line, every run. A value Kalshi did not send is
+    # said to be unread rather than printed as a measured $0.00
+    logging.info(
+        "Sizing on portfolio value $%.2f = cash $%.2f + open positions %s",
+        portfolio_value_cents / 100, cash_cents / 100,
+        ("not read (counted as $0.00)" if positions_value_cents is None
+         else f"${positions_value_cents / 100:.2f}"),
+    )
+    report.balance_before = cash_cents / 100
+    report.portfolio_value_before = portfolio_value_cents / 100
+    if portfolio_value_cents < MIN_BALANCE_CENTS:
         # Don't waste API calls scanning when there's insufficient capital to trade
-        message = (f"Balance ${balance_cents / 100:.2f} is below minimum "
+        message = (f"Portfolio value ${portfolio_value_cents / 100:.2f} (cash "
+                   f"${cash_cents / 100:.2f}) is below minimum "
                    f"${MIN_BALANCE_CENTS / 100:.2f} — skipping run.")
         logging.warning("%s", message)
         report.message = message
         return EXIT_SKIPPED_LOW_BALANCE
+    if cash_cents < MIN_BALANCE_CENTS:
+        # The open positions carry the portfolio value over the minimum, so the
+        # run scans; no trade spends more than the cash left (compute_trade's
+        # budget and select_portfolio's shrink both stop at the cash)
+        logging.warning(
+            "Cash $%.2f is below the $%.2f minimum but the portfolio value is not: "
+            "the run goes on, and no trade spends more than the cash left",
+            cash_cents / 100, MIN_BALANCE_CENTS / 100,
+        )
 
     # Get current open positions so we don't re-enter markets we already hold
     held_tickers      = get_held_tickers(client)
@@ -1119,10 +1256,12 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
     # Category/tag filter, before enrichment so a dropped pair costs no book request
     candidate_pairs   = _filter_by_category(candidate_pairs, settings, client)
-    # Replace best-ask prices with order book averages over the depth this
-    # balance could actually buy, and validate liquidity under the run's rule
+    # Replace best-ask prices with order book averages over the depth one
+    # trade's budget (its share of the portfolio value, never more than the
+    # cash) could buy, and validate liquidity under the run's rule
     candidate_pairs   = enrich_with_orderbook_prices(
-        client, candidate_pairs, balance_cents, settings=settings,
+        client, candidate_pairs, portfolio_value_cents, settings=settings,
+        cash_cents=cash_cents,
     )
 
     if not candidate_pairs:
@@ -1132,20 +1271,18 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         report.message = message
         return clean_exit
 
-    # Apply Kelly sizing to each candidate pair using the real account balance
-    trade_specs   = _compute_trade_specs(candidate_pairs, balance_cents, settings)
-    # Greedy selection by monthly_profit_ratio, one time-series trade per ladder
-    portfolio     = select_portfolio(list(trade_specs.values()), balance_cents,
+    # Kelly-size each candidate pair on the portfolio value, capped at the cash
+    trade_specs   = _compute_trade_specs(candidate_pairs, portfolio_value_cents, settings,
+                                         cash_cents=cash_cents)
+    # Greedy selection by monthly_profit_ratio, one time-series trade per
+    # ladder; only cash is spent, so a trade over the cash left is shrunk to fit
+    portfolio     = select_portfolio(list(trade_specs.values()), cash_cents,
                                      held_ladders=held_ladders or frozenset())
-    # Map pair id → TradeSpec for fast lookup in the pairs table display.
-    # Keyed off the CANDIDATE each spec was built from, not off spec.pair:
-    # compute_trade returns a re-priced copy of the pair (the marginal fill
-    # price for the size it settled on), so id(spec.pair) no longer matches any
-    # entry in candidate_pairs and every selected row would render as "—".
-    chosen = {id(s) for s in portfolio}
-    display_specs = {pid: s for pid, s in trade_specs.items() if id(s) in chosen}
+    # Candidate pair id -> the selected spec, shrunk ones included, for the pairs table
+    display_specs = _display_specs(trade_specs, portfolio)
 
-    logging.info("Kalshi Pair Scan — Balance: $%.2f | Mode: PROD", balance_cents / 100)
+    logging.info("Kalshi Pair Scan — Portfolio value: $%.2f (cash $%.2f) | Mode: PROD",
+                 portfolio_value_cents / 100, cash_cents / 100)
     print_pairs_table(candidate_pairs, display_specs)
 
     if not portfolio:
@@ -1164,8 +1301,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         report.message = message
         return clean_exit
 
-    # Move collateral to the shards the selected trades draw from — sizing is
-    # portfolio-wide, but each order settles against its own shard's balance.
+    # Move collateral to the shards the selected trades draw from — the run
+    # spends the cash on every shard together, but each order settles against
+    # its own shard's cash.
     # Trades whose shard could not be funded (transfer blocked, failed, or not
     # settled in time) are dropped here rather than submitted underfunded.
     portfolio = ensure_shard_collateral(
@@ -1196,18 +1334,18 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # it never raises, so the trade log and its rescue dump are always reached
     report.trades = report_trades(results)
 
-    # Read the post-trade balance for the Excel log separator row. Real orders
+    # Read the post-trade cash for the Excel log separator row. Real orders
     # may already have filled at this point, so a failure here must not lose the
-    # trade records — fall back to the pre-trade balance and keep going.
+    # trade records — fall back to the pre-trade cash and keep going.
     try:
-        balance_after = sum(verify_auth(client).values()) / 100
+        balance_after = sum(read_account_balance(client).shard_cash_cents.values()) / 100
         # Only a balance actually read goes into the run result
         report.balance_after = balance_after
     except Exception as exc:
         logging.error(
             "Post-trade balance fetch failed: %s — logging with pre-trade balance", exc,
         )
-        balance_after = balance_cents / 100
+        balance_after = cash_cents / 100
 
     # Append this run's results to the cumulative trade_log.xlsx file. If the
     # write fails (e.g. the file is open in Excel), dump every result to the log
@@ -1218,8 +1356,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         # toggles a flag moved and names the saved defaults the run started
         # from, so the workbook tells rows traded under a flag from rows traded
         # under the defaults, and one set of saved defaults from the next
+        # The separator row's balances are cash, before and after
         append_to_prod_log(
-            results, balance_cents / 100, balance_after,
+            results, cash_cents / 100, balance_after,
             run_note=(f"settings: {describe_live_settings(settings, reference)}"
                       + ("" if reference.origin == LIVE_DEFAULTS_FROM_CONFIG
                          else f" | defaults: {reference.origin}")),
@@ -1529,14 +1668,15 @@ def main() -> None:
 
         if args.mode == "prod" and args.sandbox_balance != parser.get_default("sandbox_balance"):
             # Mirror of the --dry-run-in-dev twin above. _run_prod sizes on the
-            # REAL per-shard balance from verify_auth and never reads
+            # REAL account (read_account_balance) and never reads
             # sandbox_balance, so passing it in prod silently does nothing — an
             # operator who meant to cap their exposure would get full-size live
             # orders instead. Logged rather than parser.error'd, same as the twin,
             # so it lands in kalshi_arb.log for later diagnosis (TS-19).
             logging.warning(
-                "--sandbox-balance is inert in prod mode — prod sizes on the real "
-                "account balance; use --dry-run to avoid submitting orders",
+                "--sandbox-balance is inert in prod mode — prod sizes on the account's "
+                "portfolio value (its cash plus its open positions' value) and spends "
+                "only its cash; use --dry-run to avoid submitting orders",
             )
 
         if args.mode == "prod" and not args.dry_run:

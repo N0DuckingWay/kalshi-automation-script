@@ -306,8 +306,9 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #   product). Each loses its full stake in that cell. At the account's real
 #   balance ($64.44 at the 2026-09-25 prod dry run) the same snapshot selects
 #   6 trades deploying $63.84 — 99% of it — at a market-implied EV of -$19.58,
-#   leaving the cash under MIN_BALANCE_CENTS, so later runs exit 10 until those
-#   positions settle.
+#   leaving the cash under MIN_BALANCE_CENTS. The $50 gate reads the portfolio
+#   value (cash plus the open positions' value), so later runs still scan, but
+#   none spends more than the cash left until those positions settle.
 #
 #   Selection effect. The one-best-pair-per-group rule picks the LARGEST
 #   pB - pA in a group, and a stale quote is by definition one out of line
@@ -642,8 +643,13 @@ DEFAULTS_SERVER_INDEX_RUNS = 10
 SAME_TITLE_LEG_SIDES  = ("no", "yes")
 TIME_SERIES_LEG_SIDES = ("yes", "no")
 
-# Minimum account balance in cents required to run the bot. Below $50 the bot
-# aborts to avoid wasting API calls when there is insufficient capital to trade.
+# Minimum portfolio value in cents a production run needs before it scans:
+# the cash on every shard plus Kalshi's value of the open positions
+# (main._bankroll_cents, the value every Kelly fraction is taken of). Below $50
+# the run stops before any scan (EXIT_SKIPPED_LOW_BALANCE), so it spends no
+# API calls when there is too little capital to trade. Cash alone below it
+# only draws a WARNING: the run goes on, and no trade spends more than the
+# cash left.
 MIN_BALANCE_CENTS             = 5000
 
 # Warn (never cap/drop) when a backtester pair-extraction group still has more
@@ -1217,6 +1223,8 @@ SCHEDULER_BLIND_MAX_RETRIES   = 4
 # main.py is NOT covered here: it still propagates and the interpreter exits
 # 1, same as always.
 EXIT_OK                       = 0
+# The portfolio value (cash on every shard plus Kalshi's value of the open
+# positions) was below MIN_BALANCE_CENTS, so the run stopped before any scan.
 EXIT_SKIPPED_LOW_BALANCE      = 10
 EXIT_TRADES_NEED_ATTENTION    = 20
 # NOTHING was scanned this run. Two causes, both reported with this code

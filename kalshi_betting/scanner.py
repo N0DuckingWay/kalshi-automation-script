@@ -4961,9 +4961,10 @@ def enrich_with_orderbook_prices(
         pairs (list): CandidatePair objects to enrich. A pair already marked
             tradeable=False is passed through unchanged.
         portfolio_value_cents (int): The value Kelly fractions are taken of,
-            in integer cents — cash plus the open positions' value, or the cash
-            alone for a caller that holds nothing (the virtual
-            --sandbox-balance in dev). Bounds how much book depth is averaged
+            in integer cents — cash plus the open positions' value (a
+            production run's main._bankroll_cents), or the cash alone for a
+            caller that holds nothing (the virtual --sandbox-balance in dev).
+            Bounds how much book depth is averaged
             into each pair's fill price. Required rather than defaulted: a
             default would silently restore whole-book pricing on a real-money
             path with no signal that it had.
@@ -4974,7 +4975,8 @@ def enrich_with_orderbook_prices(
         cash_cents (int | None): Keyword-only. The cash on hand, in integer
             cents: no pair's budget exceeds it. None means the portfolio value
             is all cash. Hand compute_trade the same value, or this bound no
-            longer bounds its size.
+            longer bounds its size; both of main's run modes pass the run's
+            cash to both (in dev, the virtual balance).
 
     Returns:
         list: One CandidatePair per input pair, in the same order, with the

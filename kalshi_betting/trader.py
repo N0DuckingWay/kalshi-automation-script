@@ -2038,8 +2038,9 @@ def ensure_shard_collateral(
         client (Any): Authenticated KalshiClient from auth.build_client().
         portfolio (list): TradeSpec objects selected for execution, each
             carrying cost_with_fees_a / cost_with_fees_b.
-        shard_balances (dict[int, int]): exchange_index -> cents, as returned
-            by auth.verify_auth() before this run's orders.
+        shard_balances (dict[int, int]): exchange_index -> cash in cents, the
+            shard_cash_cents of the auth.read_account_balance() read
+            main._run_prod made before this run's orders.
         shard_statuses (dict | None): scanner.fetch_shard_statuses() output,
             used to skip shards whose intra_exchange_transfers_active is false.
             None (breakdown unavailable) means transfers are attempted anyway

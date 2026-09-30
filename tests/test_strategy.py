@@ -702,6 +702,27 @@ def _keyword_values(module, func_name: str, callee: str, keyword: str, *,
     raise AssertionError(f"{module.__name__}.{func_name} not found")
 
 
+def _call_nodes(module, func_name: str, callee: str) -> list:
+    """
+    Every call to `callee` inside a function, as AST nodes.
+
+    Args:
+        module: The module to read.
+        func_name (str): The function whose calls are read.
+        callee (str): The called name, bare or as an attribute.
+
+    Returns:
+        list[ast.Call]: One node per call, in the order ast.walk visits them.
+    """
+    tree = ast.parse(inspect.getsource(module))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+            return [sub for sub in ast.walk(node) if isinstance(sub, ast.Call)
+                    and (sub.func.id if isinstance(sub.func, ast.Name)
+                         else getattr(sub.func, "attr", None)) == callee]
+    raise AssertionError(f"{module.__name__}.{func_name} not found")
+
+
 def _key_homes(tree: ast.AST, key: str) -> list[tuple[str | None, int]]:
     """Every place `key` is written in `tree`, as a string or as a keyword
     argument: each string constant EQUAL to it (a dict key, a subscript, a
@@ -1963,6 +1984,34 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(strategy, "_spec_at_count", "_kelly_p_at")
         assert _function_calls(strategy, "_spec_at_count", "_priced_pair")
         assert _function_calls(strategy, "compute_trade", "_priced_pair")
+
+    def test_ast_the_live_run_sizes_on_portfolio_value_and_spends_cash(self):
+        # Both run modes hand enrichment and the sizer the portfolio value AND
+        # the cash, and the portfolio walk the cash alone. A dropped cash_cents
+        # would budget every trade as if the whole portfolio value were cash,
+        # and a swapped pair would size on the cash and spend the value
+        for func in ("_run_prod", "_run_dev"):
+            for callee, index in (("enrich_with_orderbook_prices", 2),
+                                  ("_compute_trade_specs", 1)):
+                [call] = _call_nodes(main, func, callee)
+                bankroll = call.args[index]
+                assert isinstance(bankroll, ast.Name), (func, callee)
+                assert bankroll.id == "portfolio_value_cents", (func, callee)
+                [cash] = [k.value for k in call.keywords if k.arg == "cash_cents"]
+                assert isinstance(cash, ast.Name) and cash.id == "cash_cents", (func, callee)
+            [walk] = _call_nodes(main, func, "select_portfolio")
+            assert isinstance(walk.args[1], ast.Name), func
+            assert walk.args[1].id == "cash_cents", func
+            # The pairs table shows the selected spec, a shrunk one included
+            assert _function_calls(main, func, "_display_specs"), func
+        # The sizer passes the cash on to every trade it sizes
+        [value] = _keyword_values(main, "_compute_trade_specs", "compute_trade", "cash_cents")
+        assert isinstance(value, ast.Name) and value.id == "cash_cents"
+        # Production reads its portfolio value from the one balance read, never
+        # from the cash-only variant
+        assert _function_calls(main, "_run_prod", "read_account_balance")
+        assert _function_calls(main, "_run_prod", "_bankroll_cents")
+        assert not _function_calls(main, "_run_prod", "verify_auth")
 
     def test_ast_the_live_run_refuses_pairs_on_held_ladders(self):
         # The production run finds the ladders it holds and hands them to both

@@ -14,7 +14,8 @@ Purpose:
 
     It also writes the run result of a production run started with
     `main.py --result-file`: a RunReport that main.py fills in as the run goes
-    (its outcome, balances, whether it began sending orders, one TradeRecord
+    (its outcome, its cash before and after trading, the portfolio value it
+    sized on, whether it began sending orders, one TradeRecord
     per pair and the run's WARNING-or-worse log lines, which RunReportHandler
     copies in) and write_run_report writes as one JSON file when the run ends.
 
@@ -341,8 +342,8 @@ def _write_separator_row(
     Args:
         ws: The openpyxl Worksheet to append to.
         run_ts (datetime): Timestamp of this run.
-        balance_before (float): Account balance in dollars before this run's trades.
-        balance_after (float): Account balance in dollars after this run's trades.
+        balance_before (float): Cash on every shard together, in dollars, before this run's trades.
+        balance_after (float): The same after this run's trades.
         n_results (int): Number of trade results in this run, shown in the banner.
         run_note (str): Keyword-only banner text; empty (default) adds nothing.
     """
@@ -452,8 +453,8 @@ def _append_locked(results: list, balance_before: float, balance_after: float, *
 
     Args:
         results (list): List of TradeResult objects from this run.
-        balance_before (float): Account balance in dollars before this run's trades.
-        balance_after (float): Account balance in dollars after this run's trades.
+        balance_before (float): Cash on every shard together, in dollars, before this run's trades.
+        balance_after (float): The same after this run's trades.
         run_note (str): Keyword-only separator-row note; empty adds nothing.
 
     Returns:
@@ -500,8 +501,8 @@ def _write_fallback_log(results: list, balance_before: float, balance_after: flo
 
     Args:
         results (list): List of TradeResult objects from this run.
-        balance_before (float): Account balance in dollars before this run's trades.
-        balance_after (float): Account balance in dollars after this run's trades.
+        balance_before (float): Cash on every shard together, in dollars, before this run's trades.
+        balance_after (float): The same after this run's trades.
         run_note (str): Keyword-only separator-row note, as the shared log's.
 
     Returns:
@@ -559,8 +560,8 @@ def append_to_prod_log(results: list, balance_before: float, balance_after: floa
     Args:
         results (list): List of TradeResult objects from trader.execute_trades().
             May be empty if no trades were executed this run.
-        balance_before (float): Account balance in dollars before this run's trades.
-        balance_after (float): Account balance in dollars after this run's trades.
+        balance_before (float): Cash on every shard together, in dollars, before this run's trades.
+        balance_after (float): The same after this run's trades.
         run_note (str): Keyword-only separator-row note, on either path; "" adds nothing.
 
     Returns:
@@ -797,6 +798,13 @@ class RunReport:
             in dollars; None if the run stopped before reading it.
         balance_after (float | None): The same after trading; None if the run
             stopped before trading or the read after trading failed.
+        portfolio_value_before (float | None): The portfolio value read
+            before trading, in dollars — what the run's Kelly fractions are
+            taken of and what the MIN_BALANCE_CENTS gate reads: the cash
+            before trading plus Kalshi's value of the open positions
+            (main._bankroll_cents), or the cash alone when that value could
+            not be read. Set on a run the gate stopped too. None if the run
+            stopped before reading the balance.
         submission_started (bool): True from just before a run that is not a
             dry run starts sending orders (trader.execute_trades). With no
             trades recorded, it means the run stopped while sending, so orders
@@ -821,6 +829,7 @@ class RunReport:
     message: str = ""
     balance_before: float | None = None
     balance_after: float | None = None
+    portfolio_value_before: float | None = None
     submission_started: bool = False
     trades: list[TradeRecord] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -1044,6 +1053,7 @@ def write_run_report(path: Path, report: RunReport, exit_code: int | None) -> No
             "exit_code": exit_code, "settings": report.settings, "defaults": report.defaults,
             "message": report.message, "balance_before": report.balance_before,
             "balance_after": report.balance_after,
+            "portfolio_value_before": report.portfolio_value_before,
             "submission_started": report.submission_started,
             "trades": [asdict(t) for t in report.trades],
             "warnings": list(report.warnings), "warnings_dropped": report.warnings_dropped,
