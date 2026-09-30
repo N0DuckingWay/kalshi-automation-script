@@ -428,8 +428,9 @@ def compute_trade(
     With a book, the count and its price are found together (_solve_marginal_size);
     without one, the pair's stored prices are used. The count is then lowered
     until the cost plus fees fits the trade's budget: its Kelly share of the
-    portfolio value, never more than the cash on hand. Fees count as money at
-    risk when sizing. Pass the same value, cash and settings enrichment got, or
+    portfolio value, never more than the cash on hand. With a book, a lowered
+    count is priced again at its own fill and lowered again until it fits at
+    those prices. Fees count as money at risk when sizing. Pass the same value, cash and settings enrichment got, or
     enrichment's depth limit no longer bounds the size.
 
     Args:
@@ -475,18 +476,23 @@ def compute_trade(
     kelly_fraction_capped = sized.kelly_fraction
     budget_dollars   = sized.budget_dollars
 
-    # budget_dollars covers contracts only; shrink n until the fees fit too
-    fee_a = fee_leg_exact(n, price_a)
-    fee_b = fee_leg_exact(n, price_b)
-    while n > 0 and n * (price_a + price_b) + fee_a + fee_b > budget_dollars:
-        n -= 1
+    # The count the current leg prices are the fill for (unused with no book)
+    priced_n = n
+    while True:
+        # budget_dollars covers contracts only; shrink n until the fees fit too
         fee_a = fee_leg_exact(n, price_a)
         fee_b = fee_leg_exact(n, price_b)
-    if n < 1:
-        # Fees ate the entire Kelly budget — no contract count fits
-        return None
+        while n > 0 and n * (price_a + price_b) + fee_a + fee_b > budget_dollars:
+            n -= 1
+            fee_a = fee_leg_exact(n, price_a)
+            fee_b = fee_leg_exact(n, price_b)
+        if n < 1:
+            # Fees ate the entire Kelly budget — no contract count fits
+            return None
+        if not levels or n == priced_n:
+            # The cost at the prices n is actually filled at fits the budget
+            break
 
-    if levels and n != sized.n:
         # n moved: re-price at the count actually submitted (trader reads this
         # price for the FoK limit and rollback floor). p, profit_ratio and the
         # Kelly fraction stay at pre-shrink values — reporting/ranking only.
@@ -516,6 +522,10 @@ def compute_trade(
         if n < 1:
             # Nothing the cap can reach
             return None
+        # A cheaper leg can cost a cent more in exact fee (p(1 - p) grows
+        # toward 0.5), so the re-priced cost can overrun the budget again:
+        # shrink once more at these prices. n only falls, so this ends.
+        priced_n = n
 
     # Exact-fee win payoff; ceiling rounding can erase it at small n
     min_payoff = n * (1.0 - price_a - price_b) - fee_a - fee_b
