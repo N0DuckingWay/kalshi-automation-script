@@ -4,53 +4,28 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Turns scanner CandidatePairs into Kelly-sized TradeSpecs and selects the
-    portfolio the cash buys. Same-title pairs are priced on the fixed
-    SAME_TITLE_CO_RESOLVE_PROB co-resolution prior; time-series pairs are a
-    directional bet priced on config.time_series_profit_prob.
-
-    Kelly fractions are taken of the portfolio value (cash plus what the open
-    positions are worth), but only cash buys contracts: each trade's budget is
-    config.kelly_budget, min(portfolio value x capped fraction, cash).
-    select_portfolio then spends the cash itself, trade by trade in whole
-    cents, and shrinks a trade that no longer fits the cash left to the
-    largest size that does, skipping it only when not one contract pair fits.
+    Decides how many contracts to buy for each candidate pair, and which
+    trades to take. Each trade is sized with the Kelly rule (a formula that
+    turns a trade's edge and its chance of paying into the share of the money
+    to bet). That share is taken of the portfolio value, meaning cash plus
+    what the open positions are worth, but only cash buys contracts, so no
+    trade's budget is more than the cash on hand. select_portfolio then picks
+    trades best-first and shrinks any trade that no longer fits the cash left.
 
 Dependencies:
-    config (constants, fee helpers, the probability model, LiveSettings,
-    live_settings, pair_size_cap, kelly_budget, leg_cash_cents) and scanner
-    (CandidatePair, leg_prices/leg_sides, book-pricing helpers,
-    pair_ladder_keys). TradeSpec is consumed by trader and reporter; main
-    calls compute_trade and select_portfolio. backtester and dashboard do NOT
-    import this module: they share config's probability model, fee helpers
-    and constants, but re-implement the Kelly formula (net spread, b with the
-    fee in its denominator, f* = p - q/b), and backtester also re-implements
-    select_portfolio's ticker and ladder rules. A change to either must be
-    made in every copy. The backtester budgets through the same
-    config.kelly_budget — each simulated Monday's cash plus its open trades
-    at cost, never more than the cash left — so it too shrinks a trade to the
-    cash left, but it spends a trade's fee-inclusive cost at its entry prices
-    (candle quotes, with no cash_need_cents reserve) and does not repeat
-    _spec_at_count's expected-value check on a shrunk trade.
+    Imports config (fees, budget and size-cap rules, the chance-of-profit
+    model, LiveSettings) and scanner (CandidatePair and order-book pricing
+    helpers). main calls compute_trade and select_portfolio; trader and
+    reporter read TradeSpec.
 
 Notes:
-    All prices here are LEG prices from scanner.leg_prices(pair): (nA, pB) for
-    same_title, (pA, nB) for time_series. cost_with_fees_a/_b are per MARKET,
-    not per side — trader funds each market's exchange shard from them.
-    TradeSpec.cash_need_cents is never below what that funding asks for, so
-    the cash a portfolio select_portfolio admitted always covers every
-    shard's funding together. The extra it sets aside for the orders' limit
-    prices is held on the total only. Per shard, the funder asks for the
-    legs' cost at the fill prices and no more: it tops a short shard up to
-    that cost, it can draw a shard that pays for a transfer down to it, and
-    it leaves alone a shard holding between that cost and the limit-price
-    reserve. So any shard, not only one a transfer tops up, can hold less
-    than its legs' reserve.
-
-    k and the per-pair caps come from one config.LiveSettings per call, which
-    compute_trade hands to both sizing paths: a live run's, built from the
-    saved live defaults, or config.py's toggles for a caller that hands none
-    (tests and direct calls).
+    Prices here are leg prices (scanner.leg_prices): (nA, pB) same-title, (pA, nB) time-series.
+    cost_with_fees_a/_b are per market, not per side; trader funds each market's shard from them.
+    cash_need_cents is never below what shard funding asks for, so the cash set aside covers it in total.
+    backtester and dashboard copy the Kelly formula, and backtester the ticker and ladder rules.
+    Change every copy together.
+    k (the time-series model's discount) and the size caps come from the LiveSettings
+    each call is handed, or config.py's when none is.
 """
 import logging
 from dataclasses import dataclass
@@ -85,45 +60,25 @@ from .scanner import (
 @dataclass
 class TradeSpec:
     """
-    A sized trade for one candidate pair, ready for execution.
+    One sized trade for a candidate pair, ready to send to the exchange.
 
     Attributes:
-        pair (CandidatePair): The candidate, re-priced at the solved size when
-            it carried a book.
-        x (int): Contracts on market_a. Always equals y.
-        y (int): Contracts on market_b.
-        total_cost (float): x * (price_a + price_b), excluding fees. Reporting.
-        total_cost_with_fees (float): total_cost plus both legs' exact fees —
-            the cash the trade consumes at its fill prices. The prod log and
-            the portfolio summary report it; select_portfolio spends
-            cash_need_cents instead.
-        min_payoff (float): Profit in a win cell after exact fees; > 0 on every
-            returned spec. For time_series the in-between cell instead loses
-            total_cost_with_fees.
-        profit_ratio (float): Net win return on contract cost,
-            net_spread / (price_a + price_b). Ranking and reporting only — NOT
-            Kelly's b, whose denominator also includes the fee (DR-62).
-        days_to_close (int): Days until the later market closes, >= 1.
-        monthly_profit_ratio (float): profit_ratio scaled to 30 days; the
-            portfolio ranking key.
-        kelly_p (float): Probability of profit, in (0, 1].
-        kelly_fraction (float): Kelly fraction, capped by config.pair_size_cap.
-        cost_with_fees_a (float): market_a's leg cost including its exact fee.
-        cost_with_fees_b (float): market_b's leg cost including its exact fee.
-            The two sum to total_cost_with_fees; both default to 0.0.
-        cash_need_cents (int | None): Whole cents the two fill-or-kill orders
-            can draw from the cash at worst (_order_cash_cents: per leg, the
-            count at the higher of its limit and its fill, plus the fee at
-            the dearest price between the two, rounded up) — what
-            select_portfolio takes from the cash left. compute_trade always
-            sets it; None (a spec built by hand) is read as the fee-inclusive
-            cost rounded up per leg (_cash_need).
-        interval_discount (float | None): The k a time-series spec was sized
-            at (the run's LiveSettings.interval_discount); _spec_at_count
-            prices its probability of profit at a smaller size with it.
-            compute_trade sets it on every time-series spec and leaves it None
-            on a same-title one, whose p is the fixed prior. A time-series
-            spec without it (one built by hand) is never shrunk.
+        pair (CandidatePair): The candidate, re-priced at the chosen size when it has a book.
+        x (int): Contracts bought on market_a. Always equals y.
+        y (int): Contracts bought on market_b.
+        total_cost (float): What the contracts cost in dollars, fees left out.
+        total_cost_with_fees (float): total_cost plus both legs' fees, at the fill prices.
+        min_payoff (float): Profit if the trade wins, after fees; above 0 on every spec returned.
+        profit_ratio (float): Win profit over contract cost; used to rank trades, not to size them.
+        days_to_close (int): Days until the later market closes, at least 1.
+        monthly_profit_ratio (float): profit_ratio scaled to 30 days; the ranking key.
+        kelly_p (float): The model's chance the trade pays, in (0, 1].
+        kelly_fraction (float): The share of the portfolio value Kelly calls for, after the
+            size cap; the trade may spend less when cash is short.
+        cost_with_fees_a (float): market_a's leg cost with its fee; trader funds that market's shard from it.
+        cost_with_fees_b (float): market_b's leg cost with its fee. Both default to 0.0.
+        cash_need_cents (int | None): Most cash the two orders can take, in whole cents; None if built by hand.
+        interval_discount (float | None): The k (time-series discount) the spec was sized at; None for same-title.
     """
     pair: CandidatePair
     x: int
@@ -192,23 +147,18 @@ def _kelly_p(pair: CandidatePair, settings: LiveSettings) -> float:
 
 def _kelly_p_at(pair: CandidatePair, yes_leg_price: float, k: float | None) -> float:
     """
-    _kelly_p with the YES leg's price supplied, for sizing at a given count.
+    The pair's chance of profit, priced at a given YES-leg price.
 
-    pA is a leg price, so it moves with the number of contracts; pB is a
-    reference quote and does not. The price and k are ignored for same_title.
+    Used when sizing a given count, since the YES leg's price changes with the
+    count. A same-title pair ignores the price and k and gets the fixed prior.
 
     Args:
         pair (CandidatePair): Supplies pair_type and pB.
-        yes_leg_price (float): pA at the size being evaluated, in (0, 1).
-        k (float | None): The run's interval discount, in (0, 1]. For a
-            time-series pair it must be a number: None there would price at
-            config's constant instead of the run's k. It may be None only for
-            a same-title pair, whose p is the fixed prior and never reads k
-            (_spec_at_count passes a same-title spec's interval_discount,
-            which is None).
+        yes_leg_price (float): pA at the size being tested, in (0, 1).
+        k (float | None): The run's time-series discount; None reads config's value, so only same-title may pass None.
 
     Returns:
-        float: p in (0, 1].
+        float: The chance of profit, in (0, 1].
     """
     if pair.pair_type == "time_series":
         # Single shared definition of the time-series model — backtester and
@@ -219,24 +169,17 @@ def _kelly_p_at(pair: CandidatePair, yes_leg_price: float, k: float | None) -> f
 
 class _Sizing(NamedTuple):
     """
-    One candidate contract count, priced and Kelly-evaluated at its OWN fill price.
+    One contract count, priced and checked at its own fill price.
 
     Attributes:
-        n (int): The contract count this was evaluated AT. 0 on the no-book
-            path, where there is no size-dependent price to evaluate at.
-        target (int): The count the capped Kelly budget affords at that price,
-            already clamped to the pair's depth. n is "supported" when
-            target >= n.
-        price_a (float): market_a's leg price at n, dollars in (0, 1).
-        price_b (float): market_b's leg price at n, dollars in (0, 1).
-        p (float): Probability of profit at that price.
-        profit_ratio (float): Reported return on contract cost at that price;
-            not Kelly's b (see _evaluate_size).
-        kelly_fraction (float): Kelly fraction, capped by config.pair_size_cap.
-        budget_dollars (float): What this trade may spend, in dollars
-            (config.kelly_budget: the capped fraction of the portfolio value,
-            never more than the cash). compute_trade's fee shrink fits the
-            contracts plus their fees under it.
+        n (int): The count this was checked at; 0 when the pair has no book.
+        target (int): How many the budget buys at that price, capped at the book's depth.
+        price_a (float): market_a's leg price at n, in dollars.
+        price_b (float): market_b's leg price at n, in dollars.
+        p (float): The chance of profit at that price.
+        profit_ratio (float): Win profit over contract cost; for ranking, not sizing.
+        kelly_fraction (float): Kelly fraction after the size cap.
+        budget_dollars (float): What the trade may spend: its share of the portfolio value, at most the cash.
     """
     n: int
     target: int
@@ -285,31 +228,21 @@ def _evaluate_size(
     settings: LiveSettings, *, cash_cents: int | None = None,
 ) -> _Sizing | None:
     """
-    Price n contract pairs off the pair's book and return what Kelly then affords.
+    Price n contract pairs off the book and return how many the budget then buys.
 
-    Every gate compute_trade applies lives here, so each candidate size is judged
-    entirely at ITS OWN fill price rather than at one scalar average computed
-    over depth the trade may never reach. With no levels the pair's stored leg
-    prices are used and n is ignored — the single-shot path.
+    Every sizing check runs here, at n's own price. With no book, the pair's
+    stored leg prices are used and n is ignored.
 
     Args:
-        pair (CandidatePair): The pair being sized. Supplies pair_type and pB
-            for the probability model and max_contracts for the depth clamp.
-        levels (tuple): The pair's qualifying depth from _depth_levels(); ()
-            means price on the stored scalars instead.
-        n (int): Contract count to price at. Ignored when levels is empty.
-        portfolio_value_cents (int): The value Kelly fractions are taken of,
-            in integer cents.
-        settings (LiveSettings): The run's toggles (k and the per-pair caps).
-        cash_cents (int | None): Keyword-only. The cash on hand, in integer
-            cents; the budget never exceeds it. None means the portfolio value
-            is all cash.
+        pair (CandidatePair): The pair being sized.
+        levels (tuple): The pair's book levels; () means use the stored prices.
+        n (int): Contract pairs to price; ignored when levels is empty.
+        portfolio_value_cents (int): The value the Kelly share is taken of, in cents.
+        settings (LiveSettings): The run's settings (k and the size caps).
+        cash_cents (int | None): Keyword-only. The cash on hand in cents; None means it is all cash.
 
     Returns:
-        _Sizing | None: The priced, Kelly-evaluated candidate, or None when any
-            gate fails — leg price outside (0, 1), no net spread after the fee
-            approximation, a nonpositive Kelly fraction, a budget that cannot
-            afford one contract pair, or a book too thin to fill n.
+        _Sizing | None: The result, or None if any check fails (such as no edge after fees, or too little budget or depth).
     """
     if levels:
         fills = prefix_fill_prices(levels, n)
@@ -363,8 +296,7 @@ def _evaluate_size(
         kelly_fraction)
 
     cash = None if cash_cents is None else cash_cents / 100.0
-    # A share of the portfolio value, never more than the cash on hand — the
-    # one budget rule, shared with enrichment's depth bound
+    # The trade's budget: its share of the portfolio value, at most the cash
     budget_dollars = kelly_budget(portfolio_value_cents / 100.0, kelly_fraction_capped, cash)
     # Same budget -> contracts helper the scanner's depth cap uses, so that cap bounds this count
     target = max_affordable_pairs(portfolio_value_cents, price_a + price_b,
@@ -389,31 +321,20 @@ def _solve_marginal_size(
     *, cash_cents: int | None = None,
 ) -> _Sizing | None:
     """
-    Largest contract count whose own fill price still justifies it.
+    Find the largest contract count whose own fill price still justifies buying it.
 
-    n is SUPPORTED when every gate passes at the price of n and Kelly at that
-    price affords at least n. This bisects [1, pair.max_contracts]; the upper
-    bound is enrichment's affordability cap, so nothing above it can be
-    supported.
-
-    The supported set is not downward-closed (a larger n can raise p for a
-    time-series pair, and reachability can leave holes), so the search may
-    under-size. It never mis-prices: a count is only returned after
-    _evaluate_size verified it. It searches rather than checking only the top
-    because the gates bite hardest at full depth.
+    Searches 1 to pair.max_contracts by repeatedly halving the range. It can
+    land low, but every count it returns has been checked by _evaluate_size.
 
     Args:
         pair (CandidatePair): The pair being sized; max_contracts bounds the search.
-        levels (tuple): The pair's qualifying depth (non-empty).
-        portfolio_value_cents (int): The value Kelly fractions are taken of,
-            in integer cents.
-        settings (LiveSettings): The run's toggles.
-        cash_cents (int | None): Keyword-only. The cash on hand, in integer
-            cents, handed to every _evaluate_size. None means the portfolio
-            value is all cash.
+        levels (tuple): The pair's book levels (not empty).
+        portfolio_value_cents (int): The value the Kelly share is taken of, in cents.
+        settings (LiveSettings): The run's settings.
+        cash_cents (int | None): Keyword-only. The cash on hand in cents; None means it is all cash.
 
     Returns:
-        _Sizing | None: The largest verified count, or None if none is supported.
+        _Sizing | None: The largest checked count, or None if no count works.
     """
     lo, hi = 1, pair.max_contracts
     best: _Sizing | None = None
@@ -440,69 +361,54 @@ def _solve_marginal_size(
 
 def _order_cash_cents(pair: CandidatePair, n: int, price_a: float, price_b: float) -> int:
     """
-    Whole cents a pair's two fill-or-kill orders can draw from the cash, at worst.
+    Return the most cash, in whole cents, a pair's two orders can take.
 
-    Each leg is one fill-or-kill order for n contracts whose limit price is
-    scanner.v2_effective_cap of its leg price — the price the order body
-    carries, in the leg's own side terms — so it can pay up to that limit on
-    every contract, plus the taker fee. Per leg this takes n times the higher
-    of the limit and the leg price, plus the fee at the price between the two
-    that is nearest 50c (the fee is proportional to p(1-p), which peaks
-    there), rounded up to the cent by config.leg_cash_cents; the two legs are
-    summed. Kalshi may hold cash at the limit rather than at the fill, so
-    this, not the fee-inclusive cost at the fill, is what select_portfolio
-    fits into the cash left. Per leg it is never below leg_cash_cents of that
-    leg's cost at its fill (TradeSpec.cost_with_fees_a/_b), which is what
-    trader._required_cents_by_shard asks each shard for, so the cash a
-    portfolio fits into always covers every shard's funding together. The
-    headroom above the fill is held on the total cash only: the funder asks
-    each shard for its legs' cost at the fill, so a shard a transfer tops up,
-    one a transfer draws from, and one no transfer touches can each end up
-    holding less than its legs' share of this reserve.
+    Each leg's order may pay up to its limit price (the highest price the order
+    will pay) on every contract, plus the exchange fee. Per leg this takes n
+    times the higher of the limit and the fill price, plus the largest fee at
+    any price between the two, rounded up to the cent as shard funding rounds
+    it. So it is never less than what trader asks the shards to hold for these legs.
+    The reserve is checked against the account's total cash, not each shard's.
 
     Args:
-        pair (CandidatePair): Supplies pair_type (which side each leg buys) and
-            both markets' tick grids.
-        n (int): Contract pairs; each leg buys n. Range: >= 1.
-        price_a (float): market_a's leg price, dollars in (0, 1).
-        price_b (float): market_b's leg price, dollars in (0, 1).
+        pair (CandidatePair): Supplies which side each leg buys and each market's price grid.
+        n (int): Contract pairs; each leg buys n. At least 1.
+        price_a (float): market_a's leg price, in dollars.
+        price_b (float): market_b's leg price, in dollars.
 
     Returns:
-        int: Whole cents both orders can draw together.
+        int: Whole cents both orders can take together.
     """
     total = 0
+    # Each leg: the side it buys, its fill price and its market
     for side, price, market in zip(leg_sides(pair.pair_type), (price_a, price_b),
                                    (pair.market_a, pair.market_b), strict=True):
-        # The one definition of a leg's limit, never re-derived here (TS-08)
+        # The leg's limit price, from the same function the order itself uses
         cap = float(v2_effective_cap(f"buy_{side}", price, market))
         low, high = min(cap, price), max(cap, price)
-        # The fee at any price the leg can fill at between the two, at its highest
+        # The fee at the price between the two nearest 50c, where the fee is largest
         fee = fee_leg_exact(n, min(max(0.5, low), high))
-        # Rounded up to the cent by the same rounding the shard funder uses,
-        # so this leg's share is never below what its shard is asked to hold
+        # Rounded up to the cent, as shard funding rounds it
         total += leg_cash_cents(n * high + fee)
     return total
 
 
 def _priced_pair(pair: CandidatePair, n: int, price_a: float, price_b: float) -> CandidatePair:
     """
-    A copy of a booked pair priced at n contract pairs.
+    Return a copy of a pair with its leg prices set for n contract pairs.
 
-    The two leg prices are written back through leg_sides, so every reader of
-    leg_prices(spec.pair) — trader's order limits and rollback floor, the
-    prod log — gets the price of the n actually submitted, and max_contracts
-    becomes n, the count those prices are valid for. The book (depth_levels)
-    and the quotes that are not leg prices are kept. compute_trade calls it
-    for the size it solves, and _spec_at_count for a smaller size.
+    Anything that later reads the pair's leg prices (the trader's order
+    prices, the trade log) gets the price of the n actually sent.
+    max_contracts becomes n; the book and the other quotes are kept.
 
     Args:
-        pair (CandidatePair): A pair carrying depth_levels.
+        pair (CandidatePair): A pair with a book.
         n (int): The contract pairs the prices are for.
-        price_a (float): market_a's leg price at n, dollars.
-        price_b (float): market_b's leg price at n, dollars.
+        price_a (float): market_a's leg price at n, in dollars.
+        price_b (float): market_b's leg price at n, in dollars.
 
     Returns:
-        CandidatePair: The re-priced copy; the input is not modified.
+        CandidatePair: The re-priced copy; the input is unchanged.
     """
     side_a, _side_b = leg_sides(pair.pair_type)
     leg_updates = (
@@ -517,54 +423,27 @@ def compute_trade(
     cash_cents: int | None = None,
 ) -> TradeSpec | None:
     """
-    Kelly-size a candidate pair into a TradeSpec.
+    Size a candidate pair into a TradeSpec, or return None if it is not worth trading.
 
-    With a book (depth_levels), size and price are solved together by
-    _solve_marginal_size; without one, the pair's scalar leg prices are used.
-    n is then shrunk until the fee-inclusive cost fits the Kelly budget —
-    config.kelly_budget: the capped fraction of the portfolio value, never
-    more than the cash on hand. The spec also carries cash_need_cents, what
-    its two orders can draw at their limit prices, which select_portfolio
-    fits into the cash left (shrinking the trade when it no longer fits).
-
-    Kelly, on leg prices:
-        fee        = fee_per_pair_approx(price_a, price_b)
-        net_spread = (1 - price_a - price_b) - fee
-        b          = net_spread / (price_a + price_b + fee)   # dollars at risk
-        f*         = p - (1 - p) / b, capped by config.pair_size_cap
-    with a time-series p priced at settings.interval_discount.
-
-    The fee is in b's denominator because a losing pair loses its fees too
-    (DR-62). f* > 0 means positive EV under the continuous fee approximation
-    only: exact ceiling-rounded fees can still leave a boundary spec slightly
-    EV-negative at small n, which the min_payoff > 0 check bounds but does not
-    remove.
+    With a book, the count and its price are found together (_solve_marginal_size);
+    without one, the pair's stored prices are used. The count is then lowered
+    until the cost plus fees fits the trade's budget: its Kelly share of the
+    portfolio value, never more than the cash on hand. Fees count as money at
+    risk when sizing. Pass the same value, cash and settings enrichment got, or
+    enrichment's depth limit no longer bounds the size.
 
     Args:
-        pair (CandidatePair): Must be tradeable. max_contracts 0 means not
-            enriched (no depth cap).
-        portfolio_value_cents (int): The value Kelly fractions are taken of,
-            in cents — cash plus the open positions' value, or the cash alone
-            for a caller that holds nothing.
-        settings (LiveSettings | None): Keyword-only. The run's toggles; pass
-            the object enrichment's affordability bound read. None resolves
-            config.live_settings() once (tests and direct calls only).
-        cash_cents (int | None): Keyword-only. The cash on hand, in cents; the
-            Kelly budget never exceeds it. Pass what enrichment was handed.
-            None means the portfolio value is all cash, which sizes exactly as
-            a budget of portfolio value x fraction.
+        pair (CandidatePair): Must be tradeable; max_contracts 0 means no depth limit.
+        portfolio_value_cents (int): Cash plus open positions' value, in cents (the cash alone if nothing is held).
+        settings (LiveSettings | None): Keyword-only. The run's settings; None reads config.py's (tests only).
+        cash_cents (int | None): Keyword-only. The cash on hand in cents; None means it is all cash.
 
     Returns:
-        TradeSpec | None: None if the pair is not tradeable, a leg price is
-            outside (0, 1), no net spread remains after fees, Kelly is <= 0,
-            the budget cannot afford one contract pair, or the exact win
-            payoff is <= 0.
+        TradeSpec | None: The sized trade, or None if the pair is not tradeable or no size is worth buying.
 
     Raises:
-        AttributeError/TypeError: If a market's close_time is None. Scanner
-            pairs never have one (scanner._filter_active_markets drops them);
-            only a hand-built pair can.
-        ValueError: If settings is None and a config.py toggle is invalid.
+        AttributeError/TypeError: If a market's close_time is None (only a hand-built pair can have one).
+        ValueError: If settings is None and a config.py setting is invalid.
     """
     # Resolved once, so every size this call evaluates reads one k and cap
     settings = live_settings() if settings is None else settings
@@ -650,8 +529,7 @@ def compute_trade(
     # Per-MARKET costs, for trader.ensure_shard_collateral's per-shard funding
     cost_with_fees_a = n * price_a + fee_a
     cost_with_fees_b = n * price_b + fee_b
-    # What the two orders can draw at worst, at the higher of each leg's limit
-    # and fill: the cash select_portfolio sets aside for this trade
+    # The most cash the two orders can take; select_portfolio sets this aside
     cash_need_cents = _order_cash_cents(pair, n, price_a, price_b)
 
     # Days until the LATER close (capital is tied up until both resolve); naive datetimes are treated as UTC
@@ -704,7 +582,7 @@ def compute_trade(
         cost_with_fees_a=cost_with_fees_a,
         cost_with_fees_b=cost_with_fees_b,
         cash_need_cents=cash_need_cents,
-        # A same-title spec's model does not read k (its p is the fixed prior)
+        # Only time-series pricing uses k
         interval_discount=(settings.interval_discount
                            if pair.pair_type == "time_series" else None),
     )
@@ -712,118 +590,80 @@ def compute_trade(
 
 def _cash_need(spec: TradeSpec) -> int:
     """
-    Whole cents select_portfolio takes from the cash left for one spec.
+    Return the whole cents select_portfolio takes from the cash for one spec.
 
-    A spec from compute_trade (or _spec_at_count) carries it as
-    cash_need_cents, what its two orders can draw at their limit prices. A
-    spec built by hand carries None, and its fee-inclusive cost stands in,
-    rounded up to the cent both as a whole and leg by leg (the rounding the
-    shard funder uses), whichever is more.
+    Uses the spec's cash_need_cents. A spec built by hand without it falls
+    back to its cost with fees, rounded up to the cent both as a whole and
+    leg by leg, whichever is more.
 
     Args:
         spec (TradeSpec): The spec to price.
 
     Returns:
-        int: Whole cents, >= 0.
+        int: Whole cents, 0 or more.
     """
     need = spec.cash_need_cents
-    # Read by type, as bool is an int
+    # A real int only (Python counts True and False as ints)
     if isinstance(need, int) and not isinstance(need, bool):
         return need
-    # Whole and leg by leg through the shard funder's own rounding, so the
-    # walk never takes less than trader._required_cents_by_shard asks for
+    # Round up as shard funding does, so this never takes less than it asks for
     return max(leg_cash_cents(spec.total_cost_with_fees),
                leg_cash_cents(spec.cost_with_fees_a) + leg_cash_cents(spec.cost_with_fees_b))
 
 
 def _spec_at_count(spec: TradeSpec, n: int) -> TradeSpec | None:
     """
-    The same trade at n contract pairs, priced at n's own fill.
+    Return the same trade at n contract pairs, priced at n's own fill price.
 
-    With a book (depth_levels) the legs are priced over the first n contracts
-    (scanner.prefix_fill_prices) and the pair is re-priced (_priced_pair);
-    without one, the pair's scalar leg prices stand. Every figure that
-    depends on n is recomputed exactly as compute_trade computes it — the two
-    exact fees, total_cost, total_cost_with_fees, min_payoff, the per-market
-    costs and cash_need_cents — while kelly_p, kelly_fraction, profit_ratio,
-    monthly_profit_ratio and days_to_close keep the spec's values: they are
-    reporting and ranking figures, as they are after compute_trade's own fee
-    shrink.
-
-    No Kelly, spread or edge check is repeated at a smaller n, because on a
-    book enrichment built both legs' prices only fall as n falls (each leg's
-    levels ascend), and a lower price never undoes a check the larger size
-    passed. Kelly: with c the cost of a contract pair plus its fee, a
-    same-title b = 1/c - 1 rises as c falls, and a time-series
-    f* = 1 - k(pB - pA)/(1 - c) rises as pA and nB fall (pB at or above the
-    later market's YES bid, which enrichment checks, makes (pB - pA)/(1 - c)
-    fall with them); the count Kelly affords at the lower price is therefore
-    at least the one it afforded before, which was more than n. Spread:
-    pB - pA only widens, so it stays above the entry floor, and the band's
-    ceiling was tested at the top of the qualifying book, which no prefix
-    exceeds. Edge after the fee: enrichment kept only levels that each keep
-    one.
-
-    What is checked, since it can fail at a smaller n: that the book holds n
-    contracts; that the n are reachable at their own fill-or-kill limits
-    (_reachable_contracts — the supported sizes can have holes); that a win
-    still pays after the exact fees; and that the trade's expected value is
-    still positive at the exact fees, p x win payoff > (1 - p) x the
-    fee-inclusive cost, with p the model's probability of profit at n's own
-    price (_kelly_p_at, at the spec's interval_discount for a time-series
-    pair). Kelly prices the fee with the continuous approximation, which
-    the exact fees, each rounded up to the cent, exceed by up to a cent per
-    leg; at the small counts a shrink often lands on, that rounding alone
-    can turn a trade the model rates positive into one it rates negative.
-    compute_trade's own spec is held only to a positive win payoff, so a
-    shrunk spec meets a stricter test than the one it came from.
+    Costs, fees and the win payoff are worked out again for n; the ranking
+    figures (kelly_p, kelly_fraction, the profit ratios, days_to_close) keep
+    the spec's values. The Kelly, spread and edge checks are not repeated,
+    since buying fewer contracts never raises the price per contract. What can
+    fail at a smaller n is checked: the book must hold n, each order must reach
+    n at its own limit price, a win must still pay after fees, and the expected
+    profit must stay positive with the real, rounded-up fees.
 
     Args:
         spec (TradeSpec): A spec from compute_trade.
-        n (int): The contract pairs wanted. Range: >= 1.
+        n (int): The contract pairs wanted. At least 1.
 
     Returns:
-        TradeSpec | None: A new spec at n, or None if the book holds fewer
-            than n contracts, n is not reachable at its own limits, a win no
-            longer pays after the exact fees, the expected value at the exact
-            fees is not positive, or the spec is a time-series one that does
-            not carry its interval_discount. The input is not modified.
+        TradeSpec | None: A new spec at n, or None if a check fails or a time-series spec has no interval_discount.
     """
     pair = spec.pair
     k = spec.interval_discount
     if pair.pair_type == "time_series" and (
             not isinstance(k, (int, float)) or isinstance(k, bool)):
-        # Its probability of profit at n cannot be priced without its k
+        # Without its k, a time-series spec cannot be re-priced
         return None
     levels = _depth_levels(pair)
     if levels:
-        # Each leg priced over the first n contracts of the book, the same
-        # prefix pricing compute_trade solves its size with
+        # Each leg's average price over the first n contracts of the book
         fills = prefix_fill_prices(levels, n)
         if fills is None:
             # The book holds fewer than n contracts
             return None
         price_a, price_b = fills
-        # A fill-or-kill only buys depth at or under its own limit (TS-08)
+        # Each order only buys contracts priced at or under its limit
         if _reachable_contracts(pair, levels, price_a, price_b) < n:
             return None
     else:
-        # No book: the pair's stored leg prices (leg_prices maps them)
+        # No book: use the pair's stored leg prices
         price_a, price_b = leg_prices(pair)
 
+    # Each leg's fee, rounded up to the cent
     fee_a = fee_leg_exact(n, price_a)
     fee_b = fee_leg_exact(n, price_b)
-    # Exact-fee win payoff. PRICE_EPSILON: a payoff that is exactly zero (one
-    # pair at 0.01 + 0.97 with two one-cent fees) evaluates a hair above it
+    # Win profit after fees; the tiny tolerance treats float noise above 0 as 0
     min_payoff = n * (1.0 - price_a - price_b) - fee_a - fee_b
     if min_payoff <= PRICE_EPSILON:
         return None
     total_cost = n * (price_a + price_b)
     total_cost_with_fees = total_cost + fee_a + fee_b
-    # The model's p at n's own YES price (the same helper the sizer prices with)
+    # The chance of profit at n's own YES price
     p = _kelly_p_at(pair, price_a, k)
     if p * min_payoff <= (1.0 - p) * total_cost_with_fees:
-        # Not a positive expected value once the fees are rounded up
+        # Expected profit is not positive with the real, rounded-up fees
         return None
     return dc_replace(
         spec,
@@ -841,39 +681,29 @@ def _spec_at_count(spec: TradeSpec, n: int) -> TradeSpec | None:
 
 def _shrink_to_cash(spec: TradeSpec, available_cents: int) -> TradeSpec | None:
     """
-    The largest smaller size of a spec whose orders fit the cash left.
+    Return the largest smaller version of a spec whose orders fit the cash left.
 
-    Scans down from the most contract pairs the cash could possibly buy — at
-    the book's cheapest level, fees aside, so no larger count can fit — and
-    returns the first count whose own spec (_spec_at_count) exists and whose
-    cash_need_cents fits. Every candidate is verified rather than inferred
-    from its neighbours: the sizes a book supports can have holes (a count
-    below a reachable one can be unreachable at its own, lower, limits), so a
-    step down at one fixed price could stop at a hole and under-size. The
-    scan prices the book once per candidate, so its cost grows in step with
-    the count the cash could buy: small when cash is short, and large for a
-    big cash balance on cheap legs, where one shrink can try hundreds of
-    thousands of counts.
+    Tries each count downward from the most the cash could buy at the book's
+    cheapest price, and returns the first one that _spec_at_count accepts and
+    whose cash need fits. Each count is checked on its own, since a smaller
+    count can fail where a larger one passed.
 
     Args:
-        spec (TradeSpec): A spec whose cash need exceeds the cash left.
+        spec (TradeSpec): A spec that needs more cash than is left.
         available_cents (int): The cash left, in whole cents.
 
     Returns:
-        TradeSpec | None: The spec at the largest count below spec.x that
-            fits, or None when not one contract pair does (a spec of one
-            contract pair has nothing smaller, and no price is read for it).
+        TradeSpec | None: The spec at the largest count below spec.x that fits, or None if none does.
     """
     if spec.x <= 1:
         # Nothing smaller to try
         return None
     levels = _depth_levels(spec.pair)
-    # A contract pair's cheapest possible price: the book's first level, or,
-    # with no book, the pair's own two leg prices (leg_prices maps them)
+    # Cheapest price of one contract pair: the book's best level, or the stored prices
     cheapest = (levels[0][0] + levels[0][1]) if levels else sum(leg_prices(spec.pair))
     if cheapest <= 0:
         return None
-    # No count above this can fit: even the cheapest level costs more than the cash
+    # More than this would cost more than the cash even at the cheapest price
     upper = min(spec.x - 1, int((available_cents / 100.0) / cheapest))
     for n in range(upper, 0, -1):
         shrunk = _spec_at_count(spec, n)
@@ -885,47 +715,26 @@ def _shrink_to_cash(spec: TradeSpec, available_cents: int) -> TradeSpec | None:
 def select_portfolio(specs: list, cash_cents: int, *,
                      held_ladders: frozenset = frozenset()) -> list:
     """
-    Greedy portfolio: best monthly return first, within the cash, no reused
-    tickers, and at most one time-series trade per ladder.
+    Pick trades best-first without spending more than the cash.
 
-    Walks specs by monthly_profit_ratio descending (same_title before
-    time_series on ties — it is the near-arbitrage), spending the cash in
-    whole cents. A spec is taken if neither ticker is already used this run;
-    it takes its cash_need_cents from the cash left (_cash_need: what its two
-    orders can draw at their limit prices, rounded up per leg the way the
-    shard funder rounds it, so trader._required_cents_by_shard never finds
-    the selected portfolio short). A spec whose need exceeds the cash left is
-    shrunk to the largest size that fits (_shrink_to_cash) and taken at that
-    size, logged on its own line; it is skipped only when not one contract
-    pair fits, and a skipped spec is not a stop, so a cheaper one further
-    down can still be taken. Open positions from earlier runs are excluded
-    upstream by scanner.get_held_tickers (prod only).
-
-    A time-series spec is also skipped when one of its markets is on a ladder
-    the account holds, or on the ladder of a spec picked earlier (a ladder is
-    one question asked at several deadlines; see scanner.ladder_keys). A
-    same-title spec is never skipped this way, but its ladders count once
-    picked, and so do a shrunk spec's. A skipped spec spends no cash and
-    claims no ladder, so a later spec may then be taken, or taken at a larger
-    size. The backtester repeats the ticker and ladder rules (change both
-    together) and budgets through the same config.kelly_budget, so it too
-    shrinks a trade to the cash left; it spends a trade's fee-inclusive cost
-    at its entry prices (candle quotes, with no cash_need_cents reserve) and
-    does not repeat _spec_at_count's expected-value check on a shrunk trade.
+    Specs are taken in order of monthly return (same-title first on ties). A
+    spec is skipped if it reuses a ticker already picked, or, for a
+    time-series spec, if it is on a ladder (one question asked at several
+    deadlines) the account holds or this run already picked. Each spec takes
+    its cash_need_cents from the cash left; one that no longer fits is shrunk
+    to the largest size that does, or skipped if not even one contract pair
+    fits, and the walk goes on. The backtester copies the ticker and ladder
+    rules; change both together.
 
     Args:
         specs (list): TradeSpecs from compute_trade.
-        cash_cents (int): The cash the portfolio may spend, in whole cents
-            (every shard's together).
-        held_ladders (frozenset): Keyword-only. Ladder labels of the markets we
-            hold. Empty means none.
+        cash_cents (int): The cash to spend, in whole cents, all shards together.
+        held_ladders (frozenset): Keyword-only. Ladder labels of the markets we hold; empty for none.
 
     Returns:
-        list: The selected specs in ranking order — a shrunk spec as the new,
-            smaller spec in its place; may be empty.
+        list: The picked specs in ranking order, a shrunk spec in place of the original; may be empty.
     """
-    # Whole cents, at what the orders can draw at worst, so the shard funder
-    # (trader._required_cents_by_shard) never finds the portfolio short
+    # Cash left to spend, in whole cents
     available = cash_cents
 
     # Primary sort: monthly_profit_ratio descending (best capital efficiency first).
@@ -954,7 +763,7 @@ def select_portfolio(specs: list, cash_cents: int, *,
             continue
         need = _cash_need(spec)
         if need > available:
-            # Shrink to the cash left; skip only when not one contract pair fits
+            # Too big for the cash left: shrink it, or skip it if nothing fits
             shrunk = _shrink_to_cash(spec, available)
             if shrunk is None:
                 continue
@@ -978,8 +787,7 @@ def select_portfolio(specs: list, cash_cents: int, *,
     if shrinks:
         logging.info("Trades shrunk to fit the cash left: %d", shrinks)
     logging.info(
-        # The cost at the fill prices, fees included (TS-12), and the cash the
-        # walk set aside for the orders at their limit prices
+        # Cost with fees at the fill prices, and the cash set aside at the limit prices
         "Portfolio: %d trades selected, total cost $%.2f incl. fees "
         "(up to $%.2f of cash at the orders' limit prices)",
         len(selected),

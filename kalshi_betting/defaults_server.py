@@ -390,10 +390,9 @@ _USAGE_EXIT = 2
 # The exit code Python gives an exception nothing caught
 _ERROR_EXIT = 1
 
-# The exit codes of a real-money run that stopped before it could send an
-# order: a refused command line, a portfolio value below the minimum, nothing to scan,
-# or another run holding the lock. Such a run says nothing about the account,
-# so the attention warning passes over it
+# Exit codes of a real-money run that stopped before sending any order: a bad
+# command line, too little money, nothing to scan, or another run in progress.
+# The attention warning skips them, since they say nothing about the account
 _NO_ORDER_EXITS = frozenset({_USAGE_EXIT, EXIT_SKIPPED_LOW_BALANCE, EXIT_NO_TRADEABLE_SHARDS,
                              EXIT_RUN_IN_PROGRESS})
 
@@ -565,15 +564,10 @@ class _Result:
 
     Attributes:
         state (str): "ok", "missing" or "unreadable".
-        record (dict): The record's fields, each checked for its type (empty
-            unless state is "ok"): dry_run (bool), exit_code (int | None),
-            finished_at (datetime | None), message (str), error (str | None),
-            submission_started (bool), balance_before / balance_after (float |
-            None: the cash before and after trading), portfolio_value_before
-            (float | None: the portfolio value read before trading, what the
-            run's Kelly fractions are taken of — its cash plus Kalshi's value
-            of the open positions), trades (list[dict]), warnings (list[str]),
-            warnings_dropped (int).
+        record (dict): The file's fields, each type-checked; empty unless state is "ok":
+            dry_run, exit_code, finished_at, message, error, submission_started,
+            balance_before and balance_after (cash), portfolio_value_before (cash plus
+            open positions), trades, warnings and warnings_dropped.
     """
     state: str
     record: dict
@@ -1995,9 +1989,8 @@ def _run_html(run: _Run) -> str:
         parts.append(f"<p>Balance before {_money(record['balance_before'])} → after "
                      f"{_money(record['balance_after'])}</p>")
     if record.get("portfolio_value_before") is not None:
-        # The value the run's Kelly fractions are taken of: the cash plus the
-        # open positions' value, read before trading. Worded to hold on every
-        # outcome, a run stopped at the minimum included, which sized nothing
+        # Cash plus open positions, read before trading: what the run sizes on
+        # (worded so it also fits a run that stopped at the minimum)
         parts.append(f"<p>Portfolio value {_money(record['portfolio_value_before'])} "
                      f"(cash {_money(record.get('balance_before'))}) — what Kelly sizes on</p>")
     trades = _trades_html(record.get("trades", []))
