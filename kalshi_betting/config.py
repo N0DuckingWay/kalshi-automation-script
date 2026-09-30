@@ -755,9 +755,10 @@ DEFAULT_TICK_SIZE_DOLLARS     = "0.01"
 
 # The extreme tradeable price levels on Kalshi's FINEST grid ($0.0001 ticks,
 # the center_deci_edge_centi_cent edge bands). Used by
-# scanner._bids_to_ask_levels to decide which ORDER-BOOK LEVELS are real
-# quotes: a level's complement outside this range is a settled or nonsensical
-# price, not depth.
+# scanner._bids_to_ask_levels (and, for the minimum, scanner.held_pairs — see
+# below). _bids_to_ask_levels decides with them which ORDER-BOOK LEVELS are
+# real quotes: a level's complement outside this range is a settled or
+# nonsensical price, not depth.
 #
 # Deliberately NOT the same bound as scanner's market-eligibility check
 # (_MIN_ACTIVE_PRICE/_MAX_ACTIVE_PRICE, still 0.01/0.99), and the two must not
@@ -767,6 +768,10 @@ DEFAULT_TICK_SIZE_DOLLARS     = "0.01"
 # quote on a market we already accepted" — and on the deci-cent and
 # centi-cent regimes, whose entire point is sub-cent ticks, the old 0.01/0.99
 # level bound silently discarded genuine depth (TS-14).
+#
+# MIN_ACTIVE_PRICE_DOLLARS is also read by scanner.held_pairs: a held contract
+# costs at least this much, so a held market whose reported exposure is below
+# MIN_ACTIVE_PRICE_DOLLARS x its count has no cost an add-on can be sized on.
 MIN_ACTIVE_PRICE_DOLLARS      = 0.0001
 MAX_ACTIVE_PRICE_DOLLARS      = 0.9999
 
@@ -1765,7 +1770,7 @@ ARCHIVE_TAIL_MAX_RECORDS = 500_000
 
 # Emit a progress log line every this many pages in scanner.py's three
 # pagination loops (fetch_open_events_with_markets's standard-events and MVE
-# loops, get_held_tickers). A live dev-mode run paged 125,538 sandbox markets
+# loops, get_held_positions). A live dev-mode run paged 125,538 sandbox markets
 # in 13m27s with zero log lines in kalshi_arb.log — indistinguishable from a
 # hang, the exact misdiagnosis class the sharded historical fetcher's
 # "[sharded]"/"[windowed]" progress labels exist to prevent (see the
@@ -2795,6 +2800,42 @@ def pair_size_cap(pair_type: str, size_cap: float, same_title_size_cap: float) -
     if pair_type == "time_series":
         return size_cap
     return min(size_cap, same_title_size_cap)
+
+
+def held_pair_fraction(fraction: float, held_cost: float, account_value: float,
+                       balance: float) -> float:
+    """
+    Return the fraction of the cash an add-on to a held pair may stake.
+
+    An add-on buys more of a pair the account already holds: the same two
+    markets, the same side on each (scanner.HeldPair). Kelly sizes the whole
+    position: at today's prices the pair should hold `fraction` of the
+    account value in all, where `fraction` is what a new pair would get
+    (min(Kelly f*, the pair's cap)). The add-on buys what is missing, and
+    never more in one run than a new pair would stake of the cash, so
+    max_kelly_fraction still bounds every size the sizer returns. The one
+    definition, read by strategy._evaluate_size.
+
+    Args:
+        fraction (float): The fraction of the cash a new pair would stake:
+            min(f*, pair_size_cap(...)), in (0, 1].
+        held_cost (float): What the held pair already stakes, in dollars
+            (contracts plus fees paid).
+        account_value (float): Cash plus every open position at cost, in dollars.
+        balance (float): The cash the run sizes on, in dollars.
+
+    Returns:
+        float: min(fraction, (fraction x account_value - held_cost) / balance);
+            0.0 or less when the pair already holds at least its Kelly size,
+            and 0.0 with no cash or when the result is not a finite number
+            (min(fraction, nan) would read as the full fraction).
+    """
+    if not balance > 0:
+        return 0.0
+    whole = (fraction * account_value - held_cost) / balance
+    if not math.isfinite(whole):
+        return 0.0
+    return min(fraction, whole)
 
 
 def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:

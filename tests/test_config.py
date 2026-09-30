@@ -44,6 +44,7 @@ from kalshi_betting.config import (
     ScheduledRun,
     fee_leg_exact,
     fee_per_pair_approx,
+    held_pair_fraction,
     live_settings,
     max_affordable_pairs,
     max_kelly_fraction,
@@ -1125,6 +1126,52 @@ class TestPairSizeCap:
         s = live_settings()
         assert s.size_cap == config.BUDGET_FRACTION
         assert s.same_title_size_cap == config.SAME_TITLE_SIZE_CAP
+
+
+class TestHeldPairFraction:
+    """config.held_pair_fraction, the one definition of an add-on's size.
+
+    Kelly sizes the whole position: a held pair holds at most `fraction` of
+    the account value in all, and an add-on never stakes more of the cash than
+    a new pair would. A wrong answer here stakes real money on a pair the
+    account already holds.
+    """
+
+    def test_a_pair_holding_little_sizes_as_a_new_pair(self):
+        # Nothing held and plenty of account value: the new-pair fraction binds
+        assert held_pair_fraction(0.10, 0.0, 10_000.0, 150.0) == 0.10
+
+    def test_the_whole_position_binds_when_the_pair_holds_part_of_its_share(self):
+        # 10% of a $211 account is $21.10; $8 is held, so $13.10 of $150 cash
+        assert held_pair_fraction(0.10, 8.0, 211.0, 150.0) == pytest.approx(
+            (21.1 - 8.0) / 150.0)
+
+    @pytest.mark.parametrize("held_cost", [21.1000001, 25.0, 211.0])
+    def test_a_pair_above_its_kelly_share_adds_nothing(self, held_cost):
+        # Just above 10% of $211 (a held cost of exactly $21.10 would rest on
+        # 0.10 x 211.0 rounding to exactly 21.1 in floating point), and well above
+        assert held_pair_fraction(0.10, held_cost, 211.0, 150.0) <= 0
+
+    @pytest.mark.parametrize("balance", [0.0, -5.0, math.nan])
+    def test_no_cash_adds_nothing(self, balance):
+        assert held_pair_fraction(0.10, 0.0, 211.0, balance) == 0.0
+
+    @pytest.mark.parametrize("fraction, held_cost, account_value", [
+        (math.nan, 8.0, 211.0),
+        (0.10, math.nan, 211.0),
+        (0.10, 8.0, math.nan),
+        (0.10, math.inf, 211.0),
+        (0.10, 8.0, math.inf),
+        (0.10, math.inf, math.inf),
+    ])
+    def test_a_result_that_is_not_a_number_adds_nothing(self, fraction, held_cost,
+                                                         account_value):
+        # min(fraction, nan) is fraction, which would read garbage as a full share
+        assert held_pair_fraction(fraction, held_cost, account_value, 150.0) == 0.0
+
+    @pytest.mark.parametrize("fraction", [0.05, 0.10, 0.25, 1.0])
+    def test_nothing_held_and_no_other_position_is_exactly_a_new_pair(self, fraction):
+        assert held_pair_fraction(fraction, 0.0, 200.0, 200.0) == fraction
 
 
 class TestDescribeTimeSeriesRule:

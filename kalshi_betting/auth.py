@@ -290,7 +290,7 @@ def verify_auth(client: KalshiClient) -> dict[int, int]:
     balance instead of the portfolio-wide total.
 
     Uses the raw-response variant + JSON parsing, same as trader._position_count
-    and scanner.get_held_tickers: the pinned SDK's GetBalanceResponse model
+    and scanner.get_held_positions: the pinned SDK's GetBalanceResponse model
     types balance/portfolio_value/updated_ts as legacy StrictInt fields, which
     is the same field class that already drifted away for markets, positions,
     and orders (see the CLAUDE.md API-drift gotcha) — the modeled get_balance

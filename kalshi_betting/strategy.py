@@ -11,15 +11,15 @@ Purpose:
 
 Dependencies:
     config (constants, fee helpers, the probability model, LiveSettings,
-    live_settings, pair_size_cap) and scanner (CandidatePair,
-    leg_prices/leg_sides, book-pricing helpers, pair_ladder_keys). TradeSpec
-    is consumed by trader and reporter; main calls compute_trade and
-    select_portfolio. backtester and dashboard do NOT import this module: they
-    share config's probability model, fee helpers and constants, but
-    re-implement the Kelly formula (net spread, b with the fee in its
-    denominator, f* = p - q/b), and backtester also re-implements
-    select_portfolio's ticker, cash and ladder rules. A change to either must
-    be made in every copy.
+    live_settings, pair_size_cap, held_pair_fraction) and scanner
+    (CandidatePair, leg_prices/leg_sides, book-pricing helpers,
+    pair_ladder_keys, pair_held). TradeSpec is consumed by trader and
+    reporter; main calls compute_trade and select_portfolio. backtester and
+    dashboard do NOT import this module: they share config's probability
+    model, fee helpers and constants, but re-implement the Kelly formula (net
+    spread, b with the fee in its denominator, f* = p - q/b), and backtester
+    also re-implements select_portfolio's ticker, cash and ladder rules. A
+    change to either must be made in every copy.
 
 Notes:
     All prices here are LEG prices from scanner.leg_prices(pair): (nA, pB) for
@@ -30,6 +30,13 @@ Notes:
     compute_trade hands to both sizing paths: a live run's, built from the
     saved live defaults, or config.py's toggles for a caller that hands none
     (tests and direct calls).
+
+    An add-on is a candidate that buys more of a pair the account already
+    holds (CandidatePair.held, read through scanner.pair_held). Kelly sizes
+    its whole position: it stakes only what the held pair is missing of its
+    Kelly share of the account value, and never more than a new pair would
+    (config.held_pair_fraction) — to within a cent or two, as every trade's
+    budget holds (see compute_trade).
 """
 import logging
 from dataclasses import dataclass
@@ -44,6 +51,7 @@ from .config import (
     LiveSettings,
     fee_leg_exact,
     fee_per_pair_approx,
+    held_pair_fraction,
     live_settings,
     max_affordable_pairs,
     pair_size_cap,
@@ -53,6 +61,7 @@ from .scanner import (
     CandidatePair,
     leg_prices,
     leg_sides,
+    pair_held,
     pair_ladder_keys,
     prefix_fill_prices,
     v2_effective_cap,
@@ -82,7 +91,10 @@ class TradeSpec:
         monthly_profit_ratio (float): profit_ratio scaled to 30 days; the
             portfolio ranking key.
         kelly_p (float): Probability of profit, in (0, 1].
-        kelly_fraction (float): Kelly fraction, capped by config.pair_size_cap.
+        kelly_fraction (float): The fraction of the cash this trade may
+            stake: Kelly's, capped by config.pair_size_cap, and for an add-on
+            reduced by config.held_pair_fraction to what the whole position is
+            missing.
         cost_with_fees_a (float): market_a's leg cost including its exact fee.
         cost_with_fees_b (float): market_b's leg cost including its exact fee.
             The two sum to total_cost_with_fees; both default to 0.0.
@@ -188,7 +200,9 @@ class _Sizing(NamedTuple):
         p (float): Probability of profit at that price.
         profit_ratio (float): Reported return on contract cost at that price;
             not Kelly's b (see _evaluate_size).
-        kelly_fraction (float): Kelly fraction, capped by config.pair_size_cap.
+        kelly_fraction (float): The fraction of the cash the trade may stake:
+            Kelly's, capped by config.pair_size_cap, and for an add-on reduced
+            by config.held_pair_fraction.
         budget_dollars (float): Contract-only budget the fee shrink measures against.
     """
     n: int
@@ -235,7 +249,7 @@ def _reachable_contracts(
 
 def _evaluate_size(
     pair: CandidatePair, levels: tuple, n: int, balance_cents: int,
-    settings: LiveSettings,
+    settings: LiveSettings, *, refusal_out: dict | None = None,
 ) -> _Sizing | None:
     """
     Price n contract pairs off the pair's book and return what Kelly then affords.
@@ -245,6 +259,10 @@ def _evaluate_size(
     over depth the trade may never reach. With no levels the pair's stored leg
     prices are used and n is ignored — the single-shot path.
 
+    For an add-on (scanner.pair_held), Kelly sizes the whole position: the
+    capped fraction is replaced by config.held_pair_fraction's, what the held
+    pair is missing of that fraction of the account value.
+
     Args:
         pair (CandidatePair): The pair being sized. Supplies pair_type and pB
             for the probability model and max_contracts for the depth clamp.
@@ -253,12 +271,17 @@ def _evaluate_size(
         n (int): Contract count to price at. Ignored when levels is empty.
         balance_cents (int): Account balance in integer cents.
         settings (LiveSettings): The run's toggles (k and the per-pair caps).
+        refusal_out (dict | None): Keyword-only. When given, its
+            "holds_kelly_share" key is set True if an add-on's held pair
+            already holds its Kelly share at this price (the refusal
+            compute_trade's log line names); nothing else sets it.
 
     Returns:
         _Sizing | None: The priced, Kelly-evaluated candidate, or None when any
             gate fails — leg price outside (0, 1), no net spread after the fee
-            approximation, a nonpositive Kelly fraction, a budget that cannot
-            afford one contract pair, or a book too thin to fill n.
+            approximation, a nonpositive Kelly fraction, an add-on whose held
+            pair already holds its Kelly share, a budget that cannot afford
+            one contract pair, or a book too thin to fill n.
     """
     if levels:
         fills = prefix_fill_prices(levels, n)
@@ -310,6 +333,19 @@ def _evaluate_size(
     kelly_fraction_capped = min(
         pair_size_cap(pair.pair_type, settings.size_cap, settings.same_title_size_cap),
         kelly_fraction)
+    held = pair_held(pair)
+    if held is not None:
+        # An add-on: Kelly sizes the whole position, so this trade buys only
+        # what the pair is missing of that fraction of the account value, and
+        # never more than a new pair would (the one definition)
+        kelly_fraction_capped = held_pair_fraction(
+            kelly_fraction_capped, held.cost_dollars, held.account_value_dollars,
+            balance_cents / 100.0)
+        if kelly_fraction_capped <= 0:
+            # The held pair already holds its Kelly share at this price
+            if refusal_out is not None:
+                refusal_out["holds_kelly_share"] = True
+            return None
 
     budget_dollars = (balance_cents / 100.0) * kelly_fraction_capped
     # Same budget -> contracts helper the scanner's depth cap uses, so that cap bounds this count
@@ -377,6 +413,69 @@ def _solve_marginal_size(
     return best
 
 
+def _holds_kelly_share(
+    pair: CandidatePair, levels: tuple, balance_cents: int, settings: LiveSettings,
+) -> bool:
+    """
+    Say whether an add-on is refused because its held pair already holds its Kelly share.
+
+    Prices the smallest size (one contract pair off the book, or the pair's
+    scalar prices with no book) through _evaluate_size, the one set of
+    gates, and reports whether config.held_pair_fraction is what refused it
+    there. A book search that refuses every size ends on that smallest size,
+    so this names the reason it met last. Ordinary pairs answer False
+    without pricing anything.
+
+    Args:
+        pair (CandidatePair): The pair compute_trade could not size.
+        levels (tuple): The pair's qualifying depth from _depth_levels(); ()
+            for the scalar prices.
+        balance_cents (int): Account balance in integer cents.
+        settings (LiveSettings): The run's toggles (k and the per-pair caps).
+
+    Returns:
+        bool: True only for an add-on whose held pair holds at least its
+            Kelly share of the account value at the smallest size's price.
+    """
+    if pair_held(pair) is None:
+        return False
+    refusal: dict = {}
+    _evaluate_size(pair, levels, 1 if levels else 0, balance_cents, settings,
+                   refusal_out=refusal)
+    return refusal.get("holds_kelly_share", False)
+
+
+def _log_no_add_on(pair: CandidatePair, holds_kelly_share: bool) -> None:
+    """
+    Log why compute_trade adds nothing to a held pair; an ordinary pair logs nothing.
+
+    An add-on to a held pair (scanner.pair_held) that sizes to nothing gets
+    one INFO line, so a run that found a held pair and added nothing says
+    why. compute_trade calls this once, at the return that refuses the pair;
+    the sizes its search tries on the way are never logged.
+
+    Args:
+        pair (CandidatePair): The pair compute_trade was asked to size.
+        holds_kelly_share (bool): True when the held pair already holds its
+            Kelly share (_holds_kelly_share); any other refusal (not
+            tradeable, a book no order can reach, fees that eat the budget, no
+            profit after exact fees) is "no size fits this run".
+    """
+    held = pair_held(pair)
+    if held is None:
+        return
+    if holds_kelly_share:
+        logging.info(
+            "Not adding to held pair '%s': it already holds its Kelly share "
+            "(%g contracts each, $%.2f staked, account value $%.2f)",
+            pair.canonical_title, held.count, held.cost_dollars,
+            held.account_value_dollars,
+        )
+    else:
+        logging.info("Not adding to held pair '%s': no size fits this run",
+                     pair.canonical_title)
+
+
 def compute_trade(
     pair: CandidatePair, balance_cents: int, *, settings: LiveSettings | None = None,
 ) -> TradeSpec | None:
@@ -385,7 +484,10 @@ def compute_trade(
 
     With a book (depth_levels), size and price are solved together by
     _solve_marginal_size; without one, the pair's scalar leg prices are used.
-    n is then shrunk until the fee-inclusive cost fits the Kelly budget.
+    n is then shrunk until the fee-inclusive cost fits the Kelly budget. With
+    a book, the leg prices are then re-derived at the smaller count, which
+    can round a leg's fee up a cent, so the cost holds to the budget to
+    within a cent or two.
 
     Kelly, on leg prices:
         fee        = fee_per_pair_approx(price_a, price_b)
@@ -400,6 +502,13 @@ def compute_trade(
     EV-negative at small n, which the min_payoff > 0 check bounds but does not
     remove.
 
+    An add-on to a held pair (pair.held, read through scanner.pair_held) is
+    sized on its whole position: the capped f* becomes
+    config.held_pair_fraction's, what the held pair is missing of that
+    fraction of the account value, never more than a new pair would stake
+    (each to within the cent or two above). When compute_trade returns None
+    for an add-on it logs one INFO line saying why.
+
     Args:
         pair (CandidatePair): Must be tradeable. max_contracts 0 means not
             enriched (no depth cap).
@@ -411,8 +520,8 @@ def compute_trade(
     Returns:
         TradeSpec | None: None if the pair is not tradeable, a leg price is
             outside (0, 1), no net spread remains after fees, Kelly is <= 0,
-            the budget cannot afford one contract pair, or the exact win
-            payoff is <= 0.
+            an add-on's held pair already holds its Kelly share, the budget
+            cannot afford one contract pair, or the exact win payoff is <= 0.
 
     Raises:
         AttributeError/TypeError: If a market's close_time is None. Scanner
@@ -423,6 +532,7 @@ def compute_trade(
     # Resolved once, so every size this call evaluates reads one k and cap
     settings = live_settings() if settings is None else settings
     if not pair.tradeable:
+        _log_no_add_on(pair, holds_kelly_share=False)
         return None
 
     # Book levels from enrichment; () means size on the scalar leg prices
@@ -431,12 +541,16 @@ def compute_trade(
     if levels:
         sized = _solve_marginal_size(pair, levels, balance_cents, settings)
         if sized is None:
+            # For an add-on, say whether its Kelly share or something else refused it
+            _log_no_add_on(pair, _holds_kelly_share(pair, levels, balance_cents, settings))
             return None
         # The size whose OWN fill price justifies it, and that price
         n = sized.n
     else:
         sized = _evaluate_size(pair, levels, 0, balance_cents, settings)
         if sized is None:
+            # For an add-on, say whether its Kelly share or something else refused it
+            _log_no_add_on(pair, _holds_kelly_share(pair, levels, balance_cents, settings))
             return None
         # No book (e.g. the bare pair the backtester's Kelly-parity test builds):
         # the single-shot sizing, which must stay unchanged
@@ -457,12 +571,15 @@ def compute_trade(
         fee_b = fee_leg_exact(n, price_b)
     if n < 1:
         # Fees ate the entire Kelly budget — no contract count fits
+        _log_no_add_on(pair, holds_kelly_share=False)
         return None
 
     if levels and n != sized.n:
         # n moved: re-price at the count actually submitted (trader reads this
         # price for the FoK limit and rollback floor). p, profit_ratio and the
-        # Kelly fraction stay at pre-shrink values — reporting/ranking only.
+        # Kelly fraction stay at pre-shrink values — reporting/ranking only. A
+        # leg whose price moves toward 0.5 here can round its fee up a cent,
+        # so the cost holds to the budget within a cent or two
         fills = prefix_fill_prices(levels, n)
         if fills is not None:
             price_a, price_b = fills
@@ -488,11 +605,13 @@ def compute_trade(
             fee_b = fee_leg_exact(n, price_b)
         if n < 1:
             # Nothing the cap can reach
+            _log_no_add_on(pair, holds_kelly_share=False)
             return None
 
     # Exact-fee win payoff; ceiling rounding can erase it at small n
     min_payoff = n * (1.0 - price_a - price_b) - fee_a - fee_b
     if min_payoff <= 0:
+        _log_no_add_on(pair, holds_kelly_share=False)
         return None
 
     total_cost = n * (price_a + price_b)
@@ -517,9 +636,12 @@ def compute_trade(
 
     # Name the sides so a time-series line isn't read as the same-title layout
     side_a, side_b = leg_sides(pair.pair_type)
+    # The held pair this trade adds to, if any; the dc_replace copy below
+    # keeps it, so it reaches spec.pair
+    held = pair_held(pair)
     logging.info(
         "Trade computed: %s [%s] | %s(A)@%.2f + %s(B)@%.2f | p=%.2f kelly=%.1f%% n=%d "
-        "cost=$%.2f profit_ratio=%.2f%% monthly=%.2f%%",
+        "cost=$%.2f profit_ratio=%.2f%% monthly=%.2f%%%s",
         pair.canonical_title,
         pair.pair_type,
         side_a.upper(),
@@ -532,6 +654,8 @@ def compute_trade(
         total_cost,
         profit_ratio * 100,
         monthly_profit_ratio * 100,
+        # Only an add-on's line gains this, so every other line reads as before
+        f" | adds to {held.count:g} held" if held is not None else "",
     )
     if levels:
         # Write the solved prices back through leg_sides, so every reader of
@@ -580,6 +704,12 @@ def select_portfolio(specs: list, balance_cents: int, *,
     backtester repeats the ticker, cash and ladder rules; change both
     together.
 
+    An add-on to a held pair (spec.pair.held, read through scanner.pair_held,
+    whose tickers and sides are the spec's own: HeldPair.matches) is blocked
+    only by the ladders of specs picked earlier in this run: the held ladders
+    it meets are its own, since scanner.held_pairs lets a run add only to a
+    pair no other held market shares a ladder with.
+
     Args:
         specs (list): TradeSpecs from compute_trade.
         balance_cents (int): Available balance in cents.
@@ -601,8 +731,11 @@ def select_portfolio(specs: list, balance_cents: int, *,
     )
     selected = []
     used_tickers: set[str] = set()
-    # Ladders we already hold, plus those of the specs picked earlier in this run
+    # Ladders we already hold, plus those of the specs picked earlier in this
+    # run; an add-on to a held pair is blocked by the picks alone (the held
+    # ladders it meets are the ones it adds to)
     used_ladders: set = set(held_ladders)
+    picked_ladders: set = set()
     ladder_skips = 0
     for spec in specs_sorted:
         ta = spec.pair.market_a.ticker
@@ -611,8 +744,14 @@ def select_portfolio(specs: list, balance_cents: int, *,
         if ta in used_tickers or tb in used_tickers:
             continue
         keys = pair_ladder_keys(spec.pair)
-        # At most one open time-series trade per ladder
-        if spec.pair.pair_type == "time_series" and keys & used_ladders:
+        # At most one open time-series trade per ladder; an add-on meets only
+        # this run's earlier picks, and only when the held pair it carries is
+        # the spec's own two markets, each bought on its held side
+        held = pair_held(spec.pair)
+        is_add_on = held is not None and held.matches(
+            spec.pair.market_a, spec.pair.market_b, spec.pair.pair_type)
+        blocking = picked_ladders if is_add_on else used_ladders
+        if spec.pair.pair_type == "time_series" and keys & blocking:
             ladder_skips += 1
             continue
         # Skip this trade if its full cash requirement (contracts + taker fees)
@@ -624,6 +763,7 @@ def select_portfolio(specs: list, balance_cents: int, *,
         used_tickers.add(ta)
         used_tickers.add(tb)
         used_ladders |= keys
+        picked_ladders |= keys
     if ladder_skips:
         logging.info(
             "Time-series trades skipped because the account already holds, or this "

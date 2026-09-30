@@ -6,6 +6,7 @@ YES on market_b (pB). Every fixture therefore carries a REAL float nB — a
 MagicMock auto-attribute would TypeError inside compute_trade's arithmetic.
 """
 import ast
+import dataclasses
 import inspect
 import json
 import logging
@@ -28,9 +29,11 @@ from kalshi_betting.config import (
 )
 from kalshi_betting.scanner import (
     CandidatePair,
+    HeldPair,
     enrich_with_orderbook_prices,
     leg_prices,
     leg_sides,
+    pair_held,
     prefix_fill_prices,
 )
 from kalshi_betting.strategy import TradeSpec, _kelly_p, compute_trade, select_portfolio
@@ -542,6 +545,137 @@ class TestComputeTradeSettings:
                     assert spec.kelly_fraction <= bound, (k, levels, pB)
             # Non-vacuous at every k, the 0.9 extreme included
             assert sized > 0, k
+
+
+def _held_pair(cost: float, account_value: float, count: float = 30.0) -> HeldPair:
+    """A held pair the account holds on A1 (YES) / B1 (NO), for the sizer."""
+    return HeldPair(sides=(("A1", "yes"), ("B1", "no")), count=count,
+                    cost_dollars=cost, account_value_dollars=account_value)
+
+
+class TestComputeTradeAddsToHeldPair:
+    """An add-on to a held pair (CandidatePair.held) is sized on its whole
+    position: the held stake plus the new one stays within min(f*, cap) of
+    the account value, and the new stake alone within what a new pair would
+    stake of the cash. Both sizing paths, the bookless one and the book
+    search, read it through config.held_pair_fraction. (A book deep enough
+    that the fee shrink re-prices at a smaller count can round a leg's fee up
+    a cent, so there the bounds hold to within a cent or two, as for every
+    trade; these fixtures' one-level book never re-prices.)"""
+
+    # k 0.75, a 10% cap: the time-series fixture's f* (about 0.16) is capped
+    _SETTINGS = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
+                             interval_discount=0.75, size_cap=0.10)
+    _BALANCE_CENTS = 15_000
+
+    def _bookless(self, held):
+        """The flow-through time-series fixture, bookless, adding to `held`."""
+        pair = make_pair(pA=_TS_PA, pB=_TS_PB, nA=_TS_NA, nB=_TS_NB, pair_type="time_series")
+        pair.held = held
+        return pair
+
+    @staticmethod
+    def _booked(held, qty: float = 100):
+        """The same pair with one level of book, adding to `held`."""
+        pair = make_booked_pair([(_TS_PA, _TS_NB, qty)], pair_type="time_series", pB=_TS_PB)
+        return dataclasses.replace(pair, held=held)
+
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_the_whole_position_stays_within_its_kelly_share(self, path):
+        held = _held_pair(cost=8.0, account_value=211.0)
+        build = self._bookless if path == "bookless" else self._booked
+        spec = compute_trade(build(held), self._BALANCE_CENTS, settings=self._SETTINGS)
+        plain = compute_trade(build(None), self._BALANCE_CENTS, settings=self._SETTINGS)
+        assert spec is not None and plain is not None
+        fraction = config.held_pair_fraction(0.10, 8.0, 211.0, 150.0)
+        assert spec.kelly_fraction == pytest.approx(fraction)
+        # Old and new together within 10% of the account value ...
+        assert 8.0 + spec.total_cost_with_fees <= 0.10 * 211.0 + 1e-9
+        # ... the new stake within what the add-on may stake ...
+        assert spec.total_cost_with_fees <= fraction * 150.0 + 1e-9
+        # ... and never more than a new pair would stake of the cash
+        assert spec.total_cost_with_fees <= 0.10 * 150.0 + 1e-9
+        # Non-vacuous: the same pair without the held stake buys more
+        assert plain.x > spec.x
+        # The held pair reaches the spec the trader and the reports read
+        assert pair_held(spec.pair) is held
+
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_a_pair_holding_little_sizes_as_a_new_pair(self, path):
+        settings = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
+                                interval_discount=0.75, size_cap=1.0)
+        build = self._bookless if path == "bookless" else self._booked
+        spec = compute_trade(build(_held_pair(cost=1.0, account_value=10_000.0)),
+                             self._BALANCE_CENTS, settings=settings)
+        plain = compute_trade(build(None), self._BALANCE_CENTS, settings=settings)
+        assert spec is not None and plain is not None
+        assert (spec.x, spec.total_cost_with_fees, spec.kelly_fraction) == (
+            plain.x, plain.total_cost_with_fees, plain.kelly_fraction)
+
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_a_pair_at_its_kelly_share_adds_nothing_and_says_so_once(self, path, caplog):
+        # $30 held against 10% of a $211 account: nothing is missing
+        held = _held_pair(cost=30.0, account_value=211.0)
+        pair = self._bookless(held) if path == "bookless" else self._booked(held, qty=1000)
+        with caplog.at_level(logging.INFO):
+            assert compute_trade(pair, self._BALANCE_CENTS, settings=self._SETTINGS) is None
+        lines = [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith("Not adding to held pair")]
+        # One line, however many sizes the book search tried
+        assert lines == [
+            f"Not adding to held pair '{pair.canonical_title}': it already holds its "
+            "Kelly share (30 contracts each, $30.00 staked, account value $211.00)"]
+
+    @pytest.mark.parametrize("case", ["untradeable", "unreachable-book"])
+    def test_any_other_refusal_says_no_size_fits(self, case, caplog):
+        # The held pair holds $1 of a 10% share of $10,000, so Kelly would add;
+        # what refuses it is something else, and the line must not blame Kelly
+        held = _held_pair(cost=1.0, account_value=10_000.0)
+        if case == "untradeable":
+            pair = dataclasses.replace(self._booked(held), tradeable=False)
+        else:
+            # No fill-or-kill order can buy one contract pair from half a contract
+            pair = dataclasses.replace(
+                make_booked_pair([(_TS_PA, _TS_NB, 0.5)], pair_type="time_series",
+                                 pB=_TS_PB, max_contracts=1), held=held)
+        with caplog.at_level(logging.INFO):
+            assert compute_trade(pair, 1_000_000, settings=self._SETTINGS) is None
+        lines = [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith("Not adding to held pair")]
+        assert lines == [f"Not adding to held pair '{pair.canonical_title}': "
+                         "no size fits this run"]
+
+    def test_an_ordinary_pair_it_refuses_logs_nothing_new(self, caplog):
+        with caplog.at_level(logging.INFO):
+            assert compute_trade(make_pair(tradeable=False), self._BALANCE_CENTS,
+                                 settings=self._SETTINGS) is None
+        assert "Not adding to held pair" not in caplog.text
+
+    def test_the_trade_line_names_the_held_count(self, caplog):
+        with caplog.at_level(logging.INFO):
+            compute_trade(self._bookless(_held_pair(cost=8.0, account_value=211.0)),
+                          self._BALANCE_CENTS, settings=self._SETTINGS)
+            [added] = [r.getMessage() for r in caplog.records
+                       if r.getMessage().startswith("Trade computed")]
+            caplog.clear()
+            compute_trade(self._bookless(None), self._BALANCE_CENTS, settings=self._SETTINGS)
+            [plain] = [r.getMessage() for r in caplog.records
+                       if r.getMessage().startswith("Trade computed")]
+        assert added.endswith(" | adds to 30 held")
+        # An ordinary line ends where it always did
+        assert plain.endswith("%") and "adds to" not in plain
+
+    def test_a_mock_pairs_truthy_held_attribute_is_not_an_add_on(self, caplog):
+        mock_pair = make_pair(pA=_TS_PA, pB=_TS_PB, nA=_TS_NA, nB=_TS_NB,
+                              pair_type="time_series")
+        # MagicMock answers pair.held with a truthy auto-attribute
+        assert mock_pair.held
+        with caplog.at_level(logging.INFO):
+            spec = compute_trade(mock_pair, self._BALANCE_CENTS, settings=self._SETTINGS)
+        plain = compute_trade(self._bookless(None), self._BALANCE_CENTS,
+                              settings=self._SETTINGS)
+        assert spec is not None and spec.x == plain.x
+        assert "adds to" not in caplog.text
 
 
 def _function_calls(module, func_name: str, callee: str) -> bool:
@@ -1812,6 +1946,20 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(config, "max_kelly_fraction", "pair_size_cap")
         assert _function_calls(backtester, "_simulate_at_discount", "pair_size_cap")
 
+    def test_ast_add_ons_size_through_held_pair_fraction(self):
+        # config.held_pair_fraction is the ONE definition of an add-on's size,
+        # read by the sizer where every other gate is, for the pair
+        # scanner.pair_held names (by type, never truthiness)
+        assert _function_calls(strategy, "_evaluate_size", "held_pair_fraction")
+        assert _function_calls(strategy, "_evaluate_size", "pair_held")
+        # The portfolio step tells an add-on by the same reader, and only one
+        # whose held pair is the spec's own markets and sides ...
+        assert _function_calls(strategy, "select_portfolio", "pair_held")
+        assert _function_calls(strategy, "select_portfolio", "matches")
+        # ... and both finders check an add-on's sides through HeldPair.matches
+        assert _function_calls(scanner, "find_time_series_pairs", "matches")
+        assert _function_calls(scanner, "find_same_title_pairs", "matches")
+
     def test_ast_the_live_run_refuses_pairs_on_held_ladders(self):
         # The production run finds the ladders it holds and hands them to both
         # the finder and the portfolio step. A dropped keyword would silently
@@ -2271,6 +2419,77 @@ class TestSelectPortfolioLadders:
                  _ladder_spec(_OTHER_A, _OTHER_B, ratio=0.05)]
         assert select_portfolio(specs, 100_000) == select_portfolio(
             specs, 100_000, held_ladders=frozenset())
+
+
+def _add_on_spec(market_a, market_b, *, ratio: float = 0.10) -> TradeSpec:
+    """A time-series spec that adds to the pair the account holds on these markets."""
+    spec = _ladder_spec(market_a, market_b, ratio=ratio)
+    spec.pair.held = HeldPair(sides=tuple(sorted(((market_a.ticker, "yes"),
+                                                  (market_b.ticker, "no")))),
+                              count=30.0, cost_dollars=18.9, account_value_dollars=168.0)
+    return spec
+
+
+class TestSelectPortfolioAddOns:
+    """An add-on to a held pair is exempt from the held ladders (they are its
+    own: scanner.held_pairs adds only to a pair no other held market shares a
+    ladder with) but not from the picks of this run. Every ordinary
+    time-series spec on a held ladder is still refused."""
+
+    _LADDER_LINE = ("Time-series trades skipped because the account already holds, or "
+                    "this run already picked, a trade on the same ladder: ")
+
+    def test_an_add_on_on_its_own_held_ladder_is_taken(self, caplog):
+        add_on = _add_on_spec(_R1, _R3)
+        held = scanner.pair_ladder_keys(add_on.pair)
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([add_on], 100_000, held_ladders=held) == [add_on]
+        assert "on the same ladder" not in caplog.text
+
+    def test_a_same_title_pick_earlier_in_the_run_blocks_an_add_on(self, caplog):
+        st = _ladder_spec(_R2, _R4, pair_type="same_title", ratio=0.20)
+        add_on = _add_on_spec(_R1, _R3, ratio=0.10)
+        held = scanner.pair_ladder_keys(add_on.pair)
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([add_on, st], 100_000, held_ladders=held) == [st]
+        assert self._LADDER_LINE + "1" in caplog.text
+
+    def test_an_ordinary_spec_on_a_held_ladder_is_still_refused(self, caplog):
+        add_on = _add_on_spec(_R1, _R3, ratio=0.10)
+        ordinary = _ladder_spec(_R2, _R4, ratio=0.20)
+        held = scanner.pair_ladder_keys(add_on.pair)
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([ordinary, add_on], 100_000,
+                                    held_ladders=held) == [add_on]
+        assert self._LADDER_LINE + "1" in caplog.text
+
+    def test_a_held_pair_naming_other_markets_is_no_exemption(self, caplog):
+        # A spec on the held Starship ladder carrying a HeldPair of two other
+        # markets is not an add-on to it, so the held ladders still refuse it
+        spec = _ladder_spec(_R1, _R3, ratio=0.10)
+        spec.pair.held = HeldPair(sides=(("ZZ-1", "yes"), ("ZZ-2", "no")), count=1.0,
+                                  cost_dollars=1.0, account_value_dollars=100.0)
+        held = scanner.pair_ladder_keys(spec.pair)
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([spec], 100_000, held_ladders=held) == []
+        assert self._LADDER_LINE + "1" in caplog.text
+
+    def test_a_held_pair_bought_the_other_way_round_is_no_exemption(self):
+        # The spec's own two markets, but held NO on market A and YES on B:
+        # buying it would close the held pair, not add to it
+        spec = _ladder_spec(_R1, _R3, ratio=0.10)
+        spec.pair.held = HeldPair(sides=((_R1.ticker, "no"), (_R3.ticker, "yes")),
+                                  count=30.0, cost_dollars=18.9, account_value_dollars=168.0)
+        held = scanner.pair_ladder_keys(spec.pair)
+        assert select_portfolio([spec], 100_000, held_ladders=held) == []
+
+    def test_an_add_on_picked_first_claims_its_ladder(self):
+        # Two add-ons on one ladder: held_pairs never builds this, but the
+        # second must still wait behind the first's pick
+        first = _add_on_spec(_R1, _R3, ratio=0.20)
+        second = _add_on_spec(_R2, _R4, ratio=0.10)
+        held = scanner.pair_ladder_keys(first.pair) | scanner.pair_ladder_keys(second.pair)
+        assert select_portfolio([second, first], 100_000, held_ladders=held) == [first]
 
 
 class TestKellyOperandsShareOneSnapshot:
