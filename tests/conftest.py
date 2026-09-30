@@ -87,10 +87,12 @@ def _isolate_event_title_accumulator(tmp_path, monkeypatch):
 
 def apply_pre_toggle_defaults(mp) -> None:
     """
-    Pin every binding of the seven live toggles to fixed values.
+    Pin every binding of the eight live toggles to fixed values.
 
     Tier floors on, no spread band, k 0.75, a 20% per-trade cap, no extra
-    same-title cap, no category or tag filter. Patches config's constants,
+    same-title cap, no category or tag filter, and no adding to held pairs
+    (so a saved file of these values is the seven-toggle file a save wrote
+    before that toggle existed). Patches config's constants,
     read at call time, AND the by-value copies backtester and backtest bind at
     import, or a test would price with one value and size with another; no
     other module binds one by value (pinned by test_config.py's
@@ -108,6 +110,7 @@ def apply_pre_toggle_defaults(mp) -> None:
     mp.setattr(config, "SAME_TITLE_SIZE_CAP", 1.0)
     mp.setattr(config, "TRADE_CATEGORIES", None)
     mp.setattr(config, "TRADE_TAGS", None)
+    mp.setattr(config, "ADD_TO_HELD_PAIRS", False)
     mp.setattr(backtester, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.75)
     mp.setattr(backtester, "BUDGET_FRACTION", 0.20)
     mp.setattr(backtester, "SAME_TITLE_SIZE_CAP", 1.0)

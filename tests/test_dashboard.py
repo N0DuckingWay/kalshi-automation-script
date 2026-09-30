@@ -6778,16 +6778,21 @@ class TestSaveLiveDefaultsButton:
         assert (current is not None) is saved
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         pb, pk, pc = data["primary"]
+        # The page names no add-to-held-pairs choice, so the server keeps the
+        # saved one, or the seed's with none saved
+        add_on = (current.add_to_held_pairs if current is not None
+                  else config.LIVE_DEFAULTS_SEED.add_to_held_pairs)
         cases = (
             ("primary", config.LiveSettings(
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
-                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5)),
+                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
+                add_to_held_pairs=add_on)),
             ("chosen", config.LiveSettings(
                 tier_floors=False, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][0]["value"],
                 size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
-                categories=("Sports",), tags=("Hockey",))),
+                categories=("Sports",), tags=("Hockey",), add_to_held_pairs=add_on)),
         )
         for name, expected in cases:
             [opened] = snaps[name]["opened"]
@@ -6799,7 +6804,7 @@ class TestSaveLiveDefaultsButton:
             settings, source = defaults_server._proposal(defaults_server._params(query),
                                                          current)
             assert settings == expected, name
-            # Every field, one by one (equality skips none of the seven)
+            # Every field, one by one (equality skips none of the eight)
             for field in config.LIVE_TOGGLE_FIELDS:
                 assert getattr(settings, field) == getattr(expected, field), (name, field)
             assert source == data["save"]["source"]

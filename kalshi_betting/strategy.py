@@ -693,8 +693,9 @@ def select_portfolio(specs: list, balance_cents: int, *,
     time_series on ties — it is the near-arbitrage). A spec is taken if neither
     ticker is already used this run and its total_cost_with_fees fits the
     remaining balance; a spec that doesn't fit is skipped, not a stop, so a
-    cheaper one further down can still be taken. Open positions from earlier
-    runs are excluded upstream by scanner.get_held_tickers (prod only).
+    cheaper one further down can still be taken. Markets the account holds
+    from earlier runs are kept out upstream (main._run_prod, prod only),
+    except the two markets of an exact held pair the run adds to.
 
     A time-series spec is also skipped when one of its markets is on a ladder
     the account holds, or on the ladder of a spec picked earlier (a ladder is

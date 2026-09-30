@@ -46,7 +46,7 @@ Purpose:
         port).
 
     Each run is its own `python -m kalshi_betting.main --mode prod` process,
-    started with all seven toggles as explicit flags (config.live_settings_argv)
+    started with all eight toggles as explicit flags (config.live_settings_argv)
     so it trades exactly what its page showed, in a new session (so Ctrl-C on
     this server, or closing its terminal, never reaches it), from
     config.PROJECT_ROOT, writing everything it prints to its own folder under
@@ -54,7 +54,7 @@ Purpose:
 
 Dependencies:
     Imports config and run_lock only (besides the standard library). From
-    config: LiveSettings, LIVE_TOGGLE_FIELDS (the seven toggle names the
+    config: LiveSettings, LIVE_TOGGLE_FIELDS (the eight toggle names the
     fingerprint reads), LiveDefaultsError (a refused saved file) and the
     saved-defaults helpers (read_saved_live_defaults, save_live_defaults,
     live_settings_changes, describe_live_settings, live_rule_warnings,
@@ -205,10 +205,10 @@ from .config import (
 # The fields a confirmation request carries, in the GET query and repeated in
 # the POST body; the signed text is built from exactly these, as raw strings
 _FIELDS = ("tier_floors", "spread_min", "spread_max", "k", "size_cap",
-           "same_title_size_cap", "category", "tag", "source")
+           "same_title_size_cap", "add_to_held_pairs", "category", "tag", "source")
 # The fields a proposal must carry; every other one may be left out
 _REQUIRED = ("tier_floors", "spread_min", "spread_max", "k", "size_cap")
-# The largest number of fields a query or form may hold (its nine fields plus
+# The largest number of fields a query or form may hold (its ten fields plus
 # the fingerprint, nonce, token, action and acknowledgement, with room to
 # spare); more is refused unread
 _MAX_FIELDS = 20
@@ -751,10 +751,12 @@ def _proposal(params: dict[str, list[str]],
     Turn a confirmation request's fields into the proposed live defaults.
 
     tier_floors ("on" / "off"), spread_min, spread_max, k and size_cap (a
-    fraction, e.g. 0.2) are required. same_title_size_cap may be left out,
-    and then keeps the saved value (or the seed's when none is saved); it is
-    the only field that falls back to what is saved. A missing category or
-    tag means any, whatever is saved; a tag needs its category. source is
+    fraction, e.g. 0.2) are required. same_title_size_cap and
+    add_to_held_pairs ("on" / "off") may be left out, and each then keeps the
+    saved value (or the seed's when none is saved); they are the only two
+    fields that fall back to what is saved, so a link that names neither (a
+    dashboard built before them, say) leaves both as they are. A missing
+    category or tag means any, whatever is saved; a tag needs its category. source is
     the note the saved file will keep: left out, it is empty; given, it must
     be one of the two shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows,
     with ASCII digits only, and the seed's note (LIVE_DEFAULTS_SEED_SOURCE)
@@ -771,7 +773,8 @@ def _proposal(params: dict[str, list[str]],
     Raises:
         ValueError: Naming the first rule the request breaks: an unknown,
             repeated, blank or missing field, a value that is not a plain
-            number or a printable name, a tag without a category, a source
+            number or a printable name, a tier_floors or add_to_held_pairs
+            other than on or off, a tag without a category, a source
             of another shape, any value LiveSettings refuses, or the seed's
             note on other values.
     """
@@ -795,6 +798,15 @@ def _proposal(params: dict[str, list[str]],
         same_title = current.same_title_size_cap
     else:
         same_title = LIVE_DEFAULTS_SEED.same_title_size_cap
+    if "add_to_held_pairs" in value:
+        if value["add_to_held_pairs"] not in ("on", "off"):
+            raise ValueError("add_to_held_pairs must be on or off, got "
+                             f"{value['add_to_held_pairs']!r}")
+        add_on = value["add_to_held_pairs"] == "on"
+    elif current is not None:
+        add_on = current.add_to_held_pairs
+    else:
+        add_on = LIVE_DEFAULTS_SEED.add_to_held_pairs
     if "tag" in value and "category" not in value:
         raise ValueError("a tag needs its category")
     categories = (_name(value["category"], "category"),) if "category" in value else None
@@ -820,6 +832,7 @@ def _proposal(params: dict[str, list[str]],
         same_title_size_cap=same_title,
         categories=categories,
         tags=tags,
+        add_to_held_pairs=add_on,
     )
     # The seed's note names the seed values, so it may label nothing else
     if source == LIVE_DEFAULTS_SEED_SOURCE and settings != LIVE_DEFAULTS_SEED:
@@ -832,9 +845,9 @@ def _seed_query() -> str:
     """
     Build the confirmation page's query that proposes LIVE_DEFAULTS_SEED.
 
-    Each number is written as its repr (the exact float), the source note is
-    LIVE_DEFAULTS_SEED_SOURCE, and a category or tag is added only when the
-    seed sets one (it sets none: any).
+    Each number is written as its repr (the exact float), adding to held
+    pairs as on or off, the source note is LIVE_DEFAULTS_SEED_SOURCE, and a
+    category or tag is added only when the seed sets one (it sets none: any).
 
     Returns:
         str: The query string, without the "?".
@@ -847,6 +860,7 @@ def _seed_query() -> str:
         ("k", repr(seed.interval_discount)),
         ("size_cap", repr(seed.size_cap)),
         ("same_title_size_cap", repr(seed.same_title_size_cap)),
+        ("add_to_held_pairs", "on" if seed.add_to_held_pairs else "off"),
     ]
     pairs += [("category", name) for name in seed.categories or ()]
     pairs += [("tag", name) for name in seed.tags or ()]
@@ -882,7 +896,7 @@ def _fingerprint(current: LiveSettings | None) -> str:
         current (LiveSettings | None): The saved defaults, or None when none are saved.
 
     Returns:
-        str: The SHA-256 hex digest of "none", or of the origin and the seven
+        str: The SHA-256 hex digest of "none", or of the origin and the eight
             toggles as JSON.
     """
     if current is None:
@@ -2801,7 +2815,7 @@ class _App:
         The one place the server starts a process. It makes the run's folder
         under config.LIVE_RUNS_DIR, writes run.json (what the run is) before
         anything starts, locks output.log and starts
-        `python -m kalshi_betting.main --mode prod` with all seven toggles as
+        `python -m kalshi_betting.main --mode prod` with all eight toggles as
         flags (config.live_settings_argv), --result-file in the folder and,
         for a dry run, --dry-run, from config.PROJECT_ROOT, its output going
         to output.log. The process inherits the lock through its output, so
@@ -2830,7 +2844,7 @@ class _App:
         started = datetime.now(UTC)
         folder = config.LIVE_RUNS_DIR / f"{started.strftime(_FOLDER_TIME)}-{run_id}"
         folder.mkdir(parents=True)
-        # All seven toggles as flags, so the run trades exactly these settings
+        # All eight toggles as flags, so the run trades exactly these settings
         argv = [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
                 *live_settings_argv(settings), "--result-file", str(folder / _RESULT_NAME)]
         if dry_run:

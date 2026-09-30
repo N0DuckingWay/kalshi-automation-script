@@ -56,6 +56,11 @@ Purpose:
     passes no toggle flag. Two pair-list filters run between the finders and
     enrichment: _dedup_pairs and _filter_by_category.
 
+    A production run keeps every market the account holds out of new trades,
+    except, when the run's add_to_held_pairs setting is on, the two markets
+    of an exact held pair it may add to (scanner.held_pairs), which each
+    finder lets through only as that same pair (add_on_pairs).
+
 Dependencies:
     Imports from auth.py (client construction and auth verification), config.py
     (balance threshold, exit-code contract, the order-path check
@@ -63,15 +68,19 @@ Dependencies:
     close-gap bound, file paths, and the live toggles: LiveSettings,
     live_defaults with its LiveDefaultsError / LiveDefaultsMissing refusals
     and LIVE_DEFAULTS_FROM_CONFIG, live_settings (the no-settings fallback),
-    the describe_* helpers, live_rule_warnings, SIZE_CAP_STEP),
+    the describe_* helpers, live_rule_warnings, SIZE_CAP_STEP, and
+    held_pair_fraction, the one definition of an add-on's size, which
+    _run_prod reads to leave out a held pair with no room left),
     historical.py (load_series_categories, series_labels, infer_category —
     the dashboard's filing rule, which _filter_by_category shares),
     reporter.py (Excel output, and the run result: RunReport,
     RunReportHandler, report_trades, write_run_report), _http.py
     (api_error_summary, the one-line description of the error that stopped
     a run, for its result), scanner.py (market fetching, pair detection,
-    resolve_held_ladders, leg_sides — the only source of truth for which
-    side each leg buys — pair_held, which names the held pair a trade adds
+    get_held_positions, resolve_held_ladders and held_pairs — the positions,
+    their ladders and the exact held pairs a run may add to — leg_sides,
+    the only source of truth for which side each leg buys, and pair_held,
+    which names the held pair a trade adds
     to in the pairs table and the portfolio lines, and close_gap_bound_text,
     which renders that close-gap bound in the same words the finders'
     refusal lines use),
@@ -138,6 +147,7 @@ from .config import (
     describe_live_settings,
     describe_time_series_rule,
     describe_trade_filter,
+    held_pair_fraction,
     live_defaults,
     live_rule_warnings,
     live_settings,
@@ -162,7 +172,8 @@ from .scanner import (
     filter_markets_within_horizon,
     find_same_title_pairs,
     find_time_series_pairs,
-    get_held_tickers,
+    get_held_positions,
+    held_pairs,
     inactive_shard_indexes,
     leg_sides,
     pair_held,
@@ -693,6 +704,7 @@ _LIVE_FLAGS = (
     ("interval_discount", "--interval-discount"),
     ("size_cap", "--size-cap"),
     ("same_title_size_cap", "--same-title-size-cap"),
+    ("add_to_held_pairs", "--add-to-held-pairs/--no-add-to-held-pairs"),
     ("category", "--category"),
     ("any_category", "--any-category"),
     ("tag", "--tag"),
@@ -756,6 +768,8 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["size_cap"] = args.size_cap / 100
     if getattr(args, "same_title_size_cap", None) is not None:
         overrides["same_title_size_cap"] = args.same_title_size_cap / 100
+    if getattr(args, "add_to_held_pairs", None) is not None:
+        overrides["add_to_held_pairs"] = args.add_to_held_pairs
     # --category / --tag (repeatable) set the filter; --any-category / --any-tag
     # clear the saved one (argparse keeps each pair mutually exclusive)
     if getattr(args, "category", None) is not None:
@@ -986,7 +1000,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     Execute a full production run using the real Kalshi account.
 
     Verifies authentication, reads the live account balance, fetches currently
-    held positions to exclude them from scanning, discovers candidate pairs
+    held positions to keep them out of new trades, discovers candidate pairs
     under both strategies (same-title near-arbitrage pairs and directional
     time-series pairs), sizes trades using the Kelly criterion, and submits
     fill-or-kill orders leg-by-leg (the NO leg first, then the YES leg — see
@@ -999,7 +1013,13 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
 
     It makes no new time-series trade on a ladder the account holds (a ladder
     is one question asked at several deadlines), and none at all if a held
-    market cannot be identified; same-title trades still go ahead.
+    market cannot be identified; same-title trades still go ahead. With
+    settings.add_to_held_pairs on, it may add to an exact held pair
+    (scanner.held_pairs: the same two markets, the same side on each), sized
+    on the whole position (config.held_pair_fraction); only when the
+    positions listing was read to its end and every held market was
+    identified, and never to a pair already holding its per-trade cap of the
+    account value.
 
     Args:
         client: KalshiClient pointed at the production endpoint, produced by
@@ -1070,8 +1090,12 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         report.message = message
         return EXIT_SKIPPED_LOW_BALANCE
 
-    # Get current open positions so we don't re-enter markets we already hold
-    held_tickers      = get_held_tickers(client)
+    # Current open positions, each with its side and cost. A held market is
+    # never traded again, except an exact held pair this run's settings add to;
+    # held_listing["complete"] says whether the listing was read to its end
+    held_listing: dict = {}
+    held_positions    = get_held_positions(client, complete_out=held_listing)
+    held_tickers      = set(held_positions)
 
     # Read the exchange's per-shard status breakdown so ingest can drop shards
     # that aren't trading. Returns None on the pre-sharding shape, which
@@ -1110,25 +1134,62 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         return EXIT_NO_TRADEABLE_SHARDS
 
     # Our positions' ladders, read before held markets are dropped; None
-    # means one could not be identified, so no time-series trade this run
-    held_ladders      = resolve_held_ladders(client, markets, held_tickers)
+    # means one could not be identified, so no time-series trade this run.
+    # Each identified market's own labels land in held_labels, for held_pairs
+    held_labels: dict = {}
+    held_ladders      = resolve_held_ladders(client, markets, held_tickers,
+                                             labels_out=held_labels)
     # The exit code of every clean return below
     clean_exit        = EXIT_OK if held_ladders is not None else EXIT_TIME_SERIES_SKIPPED
-    markets           = [m for m in markets if m.ticker not in held_tickers]
+    # The exact held pairs this run may add to: only with the setting on, and
+    # only when every held market was listed and identified, since an unknown
+    # one could share a pair's ladder, and being alone on its ladder is what
+    # makes adding to a pair safe
+    add_on_pairs: dict = {}
+    if settings.add_to_held_pairs:
+        if held_ladders is None or held_listing.get("complete") is not True:
+            logging.warning("Not adding to held pairs this run: %s",
+                            "a held market could not be identified" if held_ladders is None
+                            else "the positions listing stopped early")
+        else:
+            # Cross-module: the one definition of an exact held pair (both
+            # markets alone on one ladder, one YES and one NO of equal size)
+            add_on_pairs = held_pairs(held_positions, held_labels, balance_cents)
+            # A pair that already holds its per-trade cap of the account value
+            # can add nothing whatever Kelly says: it would only take its
+            # group's one slot and size to nothing, so its markets stay
+            # blocked like any other held market's
+            full = {key for key, pair in add_on_pairs.items()
+                    if held_pair_fraction(settings.size_cap, pair.cost_dollars,
+                                          pair.account_value_dollars,
+                                          balance_cents / 100) <= 0}
+            if full:
+                logging.info("Held pairs already at their size cap, not added to this "
+                             "run: %d", len(full))
+                add_on_pairs = {key: pair for key, pair in add_on_pairs.items()
+                                if key not in full}
+    # The markets of those pairs stay in (each pairs only with its own
+    # partner); every other held market is dropped
+    add_on_tickers    = {ticker for key in add_on_pairs for ticker in key}
+    blocked_tickers   = held_tickers - add_on_tickers
+    markets           = [m for m in markets if m.ticker not in blocked_tickers]
 
     # Optional opt-in cap so both bet types only see markets closing within
     # the requested window — a no-op (returns markets unchanged) when unset
     markets           = filter_markets_within_horizon(markets, args.max_horizon_days)
 
     # Run both pair detection paths: time-series (the run's entry rule, and no
-    # pair on a ladder we hold) and same-title
+    # pair on a ladder we hold but an exact held pair it adds to) and
+    # same-title (a held pair's markets pair only with each other)
     if held_ladders is None:
         time_series_pairs = []
     else:
         time_series_pairs = find_time_series_pairs(
-            client, held_tickers, markets, settings=settings, held_ladders=held_ladders,
+            client, blocked_tickers, markets, settings=settings, held_ladders=held_ladders,
+            add_on_pairs=add_on_pairs,
         )
-    same_title_pairs  = find_same_title_pairs(markets, held_tickers)
+    same_title_pairs  = find_same_title_pairs(markets, blocked_tickers,
+                                              add_on_pairs=add_on_pairs)
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
     # Category/tag filter, before enrichment so a dropped pair costs no book request
@@ -1373,6 +1434,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--same-title-size-cap", type=int, default=None, metavar="PCT",
         help=f"Extra per-trade cap on same-title pairs, in whole percent, in {cap_step}%% "
              "steps; 100 = no extra cap beyond --size-cap "
+             "(default: the saved live defaults)",
+    )
+    live.add_argument(
+        "--add-to-held-pairs", action=argparse.BooleanOptionalAction, default=None,
+        help="Let this run add to a pair the account already holds (exactly the same "
+             "two markets, the same side on each), with Kelly sizing the old and new "
+             "trade together as a share of the account value; --no-add-to-held-pairs "
+             "never trades a held market. Production runs only: a dev run holds nothing "
              "(default: the saved live defaults)",
     )
     # Filed as the backtest dashboard files a trade (_filter_by_category)

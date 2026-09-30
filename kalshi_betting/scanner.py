@@ -48,11 +48,13 @@ Dependencies:
     pair_gap_days() is the single reader of that gap for everything
     downstream of pair formation. resolve_held_ladders() finds the ladders
     of the markets the account holds, and find_time_series_pairs refuses any
-    candidate with a market on one of them. get_held_positions() reads each
-    held market's side and cost (get_held_tickers() is its tickers), and
-    held_pairs() finds the exact held pairs a run may add to (HeldPosition,
-    HeldPair, pair_held): each finder's keyword-only add_on_pairs lets such
-    a pair through, and only with the side already held on each market.
+    candidate with a market on one of them, except an exact held pair it is
+    told to add to. get_held_positions() reads each held market's side and
+    cost (get_held_tickers() is its tickers), and held_pairs() finds the
+    exact held pairs a run may add to (HeldPosition, HeldPair, pair_held):
+    main._run_prod passes them as each finder's keyword-only add_on_pairs
+    when the run's add_to_held_pairs setting is on, which lets such a pair
+    through, and only with the side already held on each market.
     historical.py imports event_series too, so the backtest's event-title
     lookup budget tells a combo ticker from any other exactly as the
     one-series rule does (DR-51).
@@ -2644,8 +2646,9 @@ def get_held_tickers(client: Any) -> set:
 
     The tickers of get_held_positions, the one reader of the positions
     listing (see it for the paging, the cursor bounds and the parsing rules).
-    These tickers are excluded from new trades to avoid doubling up on an
-    existing position. An unreadable count is treated as held.
+    An unreadable count is treated as held. main._run_prod reads
+    get_held_positions itself: it keeps every held market out of new trades
+    except the two markets of an exact held pair its settings let it add to.
 
     Args:
         client (Any): An authenticated KalshiClient produced by auth.build_client().
@@ -3767,8 +3770,10 @@ def find_time_series_pairs(
 
     Args:
         client (Any): Authenticated KalshiClient, used only when markets is None.
-        held_tickers (set | None): Tickers to exclude (currently-held positions).
-            None or empty means exclude nothing.
+        held_tickers (set | None): Tickers to exclude: the held positions,
+            less the two markets of each held pair in add_on_pairs (which
+            must stay in for that pair to form). None or empty means exclude
+            nothing.
         markets (list | None): Pre-fetched ApiMarket list to scan. When None,
             fetches all open markets via fetch_open_events_with_markets(client).
         inactive_shards (set | None): exchange_index values the exchange
@@ -4551,8 +4556,10 @@ def find_same_title_pairs(
         markets (list): ApiMarket objects to scan (already fetched by the
             caller — unlike find_time_series_pairs, this function never
             fetches).
-        held_tickers (set | None): Tickers to exclude (currently-held
-            positions). None or empty means exclude nothing.
+        held_tickers (set | None): Tickers to exclude: the held positions,
+            less the two markets of each held pair in add_on_pairs (which
+            must stay in for that pair to form). None or empty means exclude
+            nothing.
         add_on_pairs (dict | None): Keyword-only. The exact held pairs this run
             may add to, from held_pairs: {frozenset of two tickers: HeldPair}.
             None or empty adds to nothing.

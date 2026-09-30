@@ -456,9 +456,9 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
-# Seven live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
-# TRADE_CATEGORIES and TRADE_TAGS below; k, BUDGET_FRACTION and
-# SAME_TITLE_SIZE_CAP above). They are NOT the live defaults: a live run starts
+# Eight live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
+# TRADE_CATEGORIES, TRADE_TAGS and ADD_TO_HELD_PAIRS below; k, BUDGET_FRACTION
+# and SAME_TITLE_SIZE_CAP above). They are NOT the live defaults: a live run starts
 # only from the saved ones (LIVE_DEFAULTS_FILE, below) and never falls back to
 # these. They are the backtest's k and caps (backtester and backtest bind them
 # by value), and what live_settings() returns: the settings a live entry point
@@ -503,6 +503,19 @@ TRADE_CATEGORIES: tuple[str, ...] | None = None
 # which main.py --tag NAME (repeatable) / --any-tag overrides for one run.
 TRADE_TAGS: tuple[str, ...] | None = None
 
+# Whether a live run may add to a pair the account already holds: exactly the
+# same two markets, buying the same side on each (scanner.held_pairs: two held
+# markets alone on one ladder, one YES and one NO of equal size, both costs
+# readable). The add-on is judged by every rule a new pair is. Kelly sizes the
+# whole position: old and new together stake at most min(f*, the pair's cap)
+# of the account value (cash plus held positions at cost), and the new stake
+# is never more than a new pair would stake (held_pair_fraction). False: a held
+# market is never traded again (DR-76). A live run reads the saved live
+# defaults' add_to_held_pairs instead (a file saved before this toggle existed
+# reads it as off), which main.py --add-to-held-pairs / --no-add-to-held-pairs
+# overrides for one run. The backtest never reads this constant.
+ADD_TO_HELD_PAIRS = True
+
 # The size caps' grid: BUDGET_FRACTION, SAME_TITLE_SIZE_CAP, the saved live
 # defaults' two caps and main.py's --size-cap / --same-title-size-cap (in
 # percent) must each be a multiple of it
@@ -519,8 +532,9 @@ LIVE_EXPOSURE_WARN_FRACTION = 0.20
 
 # ── Saved live defaults ───────────────────────────────────────────────────────
 
-# The live defaults every live run starts from: one JSON record of the seven
-# live toggles, saved through defaults_server's confirmation page
+# The live defaults every live run starts from: one JSON record of the eight
+# live toggles (add_to_held_pairs may be left out, and then reads as off),
+# saved through defaults_server's confirmation page
 # (python3 -m kalshi_betting.defaults_server; its --seed proposes
 # LIVE_DEFAULTS_SEED for a first save). save_live_defaults writes it, on that
 # page's Confirm and save (or Confirm and trade, which saves before it runs
@@ -2213,6 +2227,11 @@ class LiveSettings:
             grid; default 1.0 (no extra cap).
         categories (tuple[str, ...] | None): Categories to trade; None (default) for any.
         tags (tuple[str, ...] | None): Series first tags, ANDed with categories; None for any.
+        add_to_held_pairs (bool): Whether a production run may add to a pair
+            the account already holds (exactly the same two markets, the same
+            side on each), with Kelly sizing the whole position; a real bool.
+            Default False, which is also what a saved file that leaves it out
+            reads as.
         origin (str): Where these toggles' defaults were read: the saved defaults
             file with when (and from what) it was saved, or LIVE_DEFAULTS_FROM_CONFIG
             for toggles built from this module's constants (the default).
@@ -2229,6 +2248,7 @@ class LiveSettings:
     same_title_size_cap: float = 1.0
     categories: tuple[str, ...] | None = None
     tags: tuple[str, ...] | None = None
+    add_to_held_pairs: bool = False
     origin: str = field(default=LIVE_DEFAULTS_FROM_CONFIG, compare=False)
 
     def __post_init__(self) -> None:
@@ -2262,6 +2282,10 @@ class LiveSettings:
                            _step_cap(self.same_title_size_cap, "same_title_size_cap"))
         object.__setattr__(self, "categories", _names(self.categories, "categories"))
         object.__setattr__(self, "tags", _names(self.tags, "tags"))
+        # A real bool, as tier_floors: a saved file's JSON 1 must be refused
+        if type(self.add_to_held_pairs) is not bool:
+            raise ValueError(
+                f"add_to_held_pairs must be True or False, got {self.add_to_held_pairs!r}")
         # One printable line: no newline, control, zero-width or text-direction
         # character, so it prints on one log line and cannot pass for other
         # text. Printable is not HTML-safe: a web page must still escape it
@@ -2270,20 +2294,33 @@ class LiveSettings:
             raise ValueError(f"origin must be a printable description, got {self.origin!r}")
 
 
-# The seven toggles by field name: every LiveSettings field except origin
+# The eight toggles by field name: every LiveSettings field except origin
 LIVE_TOGGLE_FIELDS = tuple(f.name for f in fields(LiveSettings) if f.compare)
+
+# Toggles added after live_defaults.json files were first written. A saved file
+# may leave one out, and it then reads as its LiveSettings default (off), since
+# nobody confirmed a value for it in that file: a file saved before it existed
+# starts every live run exactly as it did. save_live_defaults leaves it out
+# while it is at its default, so such a file is also still readable by code
+# from before the toggle existed.
+_TOGGLES_ADDED_LATER = ("add_to_held_pairs",)
+# Each of those toggles' LiveSettings default
+_TOGGLE_DEFAULTS = {f.name: f.default for f in fields(LiveSettings)
+                    if f.name in _TOGGLES_ADDED_LATER}
 
 # The live defaults `python3 -m kalshi_betting.defaults_server --seed` offers to
 # save, the starting values for a first save: tier floors off, spread band
-# 0-0.5, k 0.80, a 10% per-trade cap, any category or tag. One pair stakes at
-# most 10% of the balance: a time-series pair under the cap (1 - k is 0.20), a
-# same-title pair under the lower of the cap and the 20% same-title cap.
-# Nothing trades on it until it is confirmed on the confirmation page and
-# written to LIVE_DEFAULTS_FILE (save_live_defaults, with
-# LIVE_DEFAULTS_SEED_SOURCE).
+# 0-0.5, k 0.80, a 10% per-trade cap, any category or tag, adding to held
+# pairs on. One new pair stakes at most 10% of the balance: a time-series pair
+# under the cap (1 - k is 0.20), a same-title pair under the lower of the cap
+# and the 20% same-title cap; an add-on to a held pair no more than that, with
+# the whole position within the cap of the account value. Nothing trades on it
+# until it is confirmed on the confirmation page and written to
+# LIVE_DEFAULTS_FILE (save_live_defaults, with LIVE_DEFAULTS_SEED_SOURCE).
 LIVE_DEFAULTS_SEED = LiveSettings(
     tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.80,
-    size_cap=0.10, same_title_size_cap=0.20, categories=None, tags=None)
+    size_cap=0.10, same_title_size_cap=0.20, categories=None, tags=None,
+    add_to_held_pairs=True)
 
 
 class LiveDefaultsError(ValueError):
@@ -2306,7 +2343,7 @@ class LiveDefaultsMissing(LiveDefaultsError):
 
 def live_settings() -> LiveSettings:
     """
-    Return config.py's own seven toggle constants as LiveSettings, validated.
+    Return config.py's own eight toggle constants as LiveSettings, validated.
 
     Read at call time, so a test that monkeypatches a constant here takes
     effect. It is NOT the live defaults: a live run starts only from the saved
@@ -2330,6 +2367,7 @@ def live_settings() -> LiveSettings:
         same_title_size_cap=SAME_TITLE_SIZE_CAP,
         categories=TRADE_CATEGORIES,
         tags=TRADE_TAGS,
+        add_to_held_pairs=ADD_TO_HELD_PAIRS,
     )
 
 
@@ -2433,9 +2471,11 @@ def _saved_settings(record) -> LiveSettings:
     Turn a parsed saved-defaults record into LiveSettings, or refuse it.
 
     Checks what LiveSettings cannot see in JSON: the file's keys and format, the
-    save time, the source note, exactly the seven toggle names, a spread band of
-    two real numbers (LiveSettings would read a JSON true as 1) and printable
-    filter names. LiveSettings then validates every value.
+    save time, the source note, exactly the eight toggle names (a toggle in
+    _TOGGLES_ADDED_LATER may be left out, and then takes its LiveSettings
+    default, off), a spread band of two real numbers (LiveSettings would read
+    a JSON true as 1) and printable filter names. LiveSettings then validates
+    every value.
 
     Args:
         record: What json.loads returned for the file.
@@ -2464,8 +2504,12 @@ def _saved_settings(record) -> LiveSettings:
                          f"got {saved_at!r}")
     source = live_defaults_source(record["source"])
     raw = record["settings"]
-    if not isinstance(raw, dict) or set(raw) != set(LIVE_TOGGLE_FIELDS):
-        raise ValueError(f'"settings" must hold exactly {", ".join(LIVE_TOGGLE_FIELDS)}')
+    # Every toggle but the ones added later is required; nothing else is allowed
+    required = set(LIVE_TOGGLE_FIELDS) - set(_TOGGLES_ADDED_LATER)
+    if not isinstance(raw, dict) or not required <= set(raw) <= set(LIVE_TOGGLE_FIELDS):
+        raise ValueError(f'"settings" must hold exactly {", ".join(LIVE_TOGGLE_FIELDS)} '
+                         f'(a file saved before {", ".join(_TOGGLES_ADDED_LATER)} existed '
+                         "may leave it out)")
     band = raw["spread_band"]
     if not (isinstance(band, list) and len(band) == 2 and all(
             isinstance(x, (int, float)) and not isinstance(x, bool) for x in band)):
@@ -2519,10 +2563,12 @@ def read_saved_live_defaults() -> LiveSettings | None:
     - "format": LIVE_DEFAULTS_FORMAT;
     - "saved_at": UTC, e.g. 2026-09-27T21:05:13Z;
     - "source": a note (live_defaults_source's rules);
-    - "settings": the seven toggles by LiveSettings field name. tier_floors is
+    - "settings": the eight toggles by LiveSettings field name. tier_floors is
       true/false, spread_band is [floor, ceiling], interval_discount, size_cap
-      and same_title_size_cap are numbers (the caps as fractions), and
-      categories and tags are null (any) or a list of names.
+      and same_title_size_cap are numbers (the caps as fractions),
+      categories and tags are null (any) or a list of names, and
+      add_to_held_pairs is true/false or left out (off: a file saved before
+      that toggle existed has seven).
 
     Refused on top of that: a repeated key, NaN or Infinity, a file over
     LIVE_DEFAULTS_MAX_BYTES, any value LiveSettings rejects, and anything at
@@ -2639,7 +2685,7 @@ def _saved_text(record: dict) -> str:
 
     Args:
         record (dict): The record, with _SAVED_KEYS in that order and
-            "settings" holding the seven toggles as JSON values.
+            "settings" holding the toggles as JSON values.
 
     Returns:
         str: The text, ending in a newline.
@@ -2668,8 +2714,11 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
     this process id, flushed, and renamed over the file, so a reader at the
     same moment sees the old file or the new one, never part of one. The
     directory is flushed too, so the rename survives a power cut. The file is
-    then read back from disk and must equal settings (the seven toggles;
-    origin is not compared).
+    then read back from disk and must equal settings (the eight toggles;
+    origin is not compared). A toggle in _TOGGLES_ADDED_LATER is written only
+    when it is not at its default, so a file with add_to_held_pairs off holds
+    the same seven toggles, byte for byte, as one saved before that toggle
+    existed, and code from before it still reads the file.
 
     Args:
         settings (LiveSettings): The new defaults.
@@ -2690,6 +2739,11 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
     except ValueError as exc:
         raise LiveDefaultsError(f"{path}: not saved: {exc}") from exc
     values = {name: getattr(settings, name) for name in LIVE_TOGGLE_FIELDS}
+    # A toggle added later is written only when it departs from its default,
+    # so a file that does not use it reads the same to code from before it existed
+    for name in _TOGGLES_ADDED_LATER:
+        if values[name] == _TOGGLE_DEFAULTS[name]:
+            del values[name]
     record = {
         "format": LIVE_DEFAULTS_FORMAT,
         "saved_at": datetime.now(UTC).strftime(_SAVED_AT_FORMAT),
@@ -2860,6 +2914,12 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
         and no time-series trade can size.
     same_title: f* = (p - c)/(1 - c) < p = SAME_TITLE_CO_RESOLVE_PROB.
 
+    It bounds an add-on to a held pair too (settings.add_to_held_pairs):
+    held_pair_fraction never stakes more of the cash than a new pair would,
+    and keeps the held pair's whole position, old and new together, within
+    that same fraction of the account value (cash plus held positions at
+    cost).
+
     Args:
         pair_type (str): The pair's type.
         settings (LiveSettings): The run's toggles.
@@ -2999,6 +3059,7 @@ _LIVE_SETTING_FIELDS = (
     ("same-title cap", "same_title_size_cap", lambda v: _cap_text(v, "no extra cap")),
     ("categories", "categories", _names_text),
     ("tags", "tags", _names_text),
+    ("add to held pairs", "add_to_held_pairs", lambda v: "on" if v else "off"),
 )
 
 
@@ -3035,7 +3096,8 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
 
     Returns:
         str: e.g. "tier floors off | spread band 0-0.5 | k 0.8 | per-trade cap
-            100% (no cap) | same-title cap 20% | categories any | tags any",
+            100% (no cap) | same-title cap 20% | categories any | tags any |
+            add to held pairs on",
             with " (default: X)" after each field that differs from reference's
             when reference is the saved live defaults (its origin is anything
             but LIVE_DEFAULTS_FROM_CONFIG), " (config: X)" when it was built
@@ -3085,7 +3147,7 @@ def live_settings_changes(current: LiveSettings | None,
 
 def live_settings_argv(settings: LiveSettings) -> list[str]:
     """
-    Spell a run's settings as main.py's toggle flags, all seven of them.
+    Spell a run's settings as main.py's toggle flags, all eight of them.
 
     A program that starts main.py with these flags gets a run that trades
     exactly these settings, whatever the saved live defaults say:
@@ -3095,7 +3157,9 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
     makes exact. The other numbers are written as their repr, which float()
     reads back exactly. Each category or tag is written as --category=NAME or
     --tag=NAME, so a name that begins with "-" still reads as a name; no
-    filter is written as --any-category or --any-tag.
+    filter is written as --any-category or --any-tag. Adding to held pairs is
+    written either way (--add-to-held-pairs / --no-add-to-held-pairs), so a
+    saved value never decides it.
 
     Args:
         settings (LiveSettings): The settings to spell.
@@ -3103,15 +3167,17 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
     Returns:
         list[str]: The flags, in the order main.py lists them: the tier-floor
             switch, --spread-min, --spread-max, --interval-discount,
-            --size-cap, --same-title-size-cap, then the category flags and the
-            tag flags.
+            --size-cap, --same-title-size-cap, the add-to-held-pairs switch,
+            then the category flags and the tag flags.
     """
     argv = ["--tier-floors" if settings.tier_floors else "--no-tier-floors",
             f"--spread-min={settings.spread_band[0]!r}",
             f"--spread-max={settings.spread_band[1]!r}",
             f"--interval-discount={settings.interval_discount!r}",
             f"--size-cap={round(settings.size_cap * 100)}",
-            f"--same-title-size-cap={round(settings.same_title_size_cap * 100)}"]
+            f"--same-title-size-cap={round(settings.same_title_size_cap * 100)}",
+            "--add-to-held-pairs" if settings.add_to_held_pairs
+            else "--no-add-to-held-pairs"]
     argv += ([f"--category={name}" for name in settings.categories]
              if settings.categories is not None else ["--any-category"])
     argv += ([f"--tag={name}" for name in settings.tags]
@@ -3134,8 +3200,15 @@ def live_rule_warnings(settings: LiveSettings) -> list[str]:
           spreads on it can trade — none on a floor within PRICE_EPSILON of
           0, where such a spread is not positive.
       EXPOSURE: max_kelly_fraction of a pair type exceeds
-          LIVE_EXPOSURE_WARN_FRACTION.
+          LIVE_EXPOSURE_WARN_FRACTION: one pair's stake as a share of the
+          cash, or a held pair's whole position as a share of the account
+          value.
       k = 1: max_kelly_fraction("time_series") is 0, so no time-series trade sizes.
+
+    Adding to held pairs (add_to_held_pairs) adds no sentence: Kelly sizes an
+    add-on on the held pair's whole position, which stays within
+    max_kelly_fraction of the account value, the bound EXPOSURE already
+    checks, and the add-on itself never stakes more than a new pair would.
 
     Args:
         settings (LiveSettings): The run's toggles.

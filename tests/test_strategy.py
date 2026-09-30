@@ -1386,6 +1386,7 @@ class TestTimeSeriesKellyParity:
             "SAME_TITLE_SIZE_CAP",
             "TRADE_CATEGORIES",
             "TRADE_TAGS",
+            "ADD_TO_HELD_PAIRS",
         } | self._SAVED_FILE_INTERNALS
         resolver = "live_settings"
         # (module, exempted name) -> references found, so no exemption outlives its use
@@ -1973,6 +1974,20 @@ class TestTimeSeriesKellyParity:
         [portfolio_value] = _keyword_values(main, "_run_prod", "select_portfolio",
                                             "held_ladders")
         assert ast.unparse(portfolio_value) in {"held_ladders", "held_ladders or frozenset()"}
+        # The run reads its positions with their sides and costs, finds the
+        # exact held pairs it may add to through the one definition, and hands
+        # them to BOTH finders under their own name: a dropped or renamed
+        # keyword would silently add to nothing, since both default to none
+        assert _function_calls(main, "_run_prod", "get_held_positions")
+        assert _function_calls(main, "_run_prod", "held_pairs")
+        assert not _function_calls(main, "_run_prod", "get_held_tickers")
+        for finder in ("find_time_series_pairs", "find_same_title_pairs"):
+            [value] = _keyword_values(main, "_run_prod", finder, "add_on_pairs")
+            assert isinstance(value, ast.Name) and value.id == "add_on_pairs", finder
+            # ... and each finder reads the pairs it is handed
+            tree = ast.parse(inspect.getsource(getattr(scanner, finder)))
+            assert any(isinstance(n, ast.Name) and n.id == "add_on_pairs"
+                       and isinstance(n.ctx, ast.Load) for n in ast.walk(tree)), finder
         # Both rules read the ladder labels through the one definition
         assert _function_calls(scanner, "find_time_series_pairs", "ladder_keys")
         assert _function_calls(strategy, "select_portfolio", "pair_ladder_keys")

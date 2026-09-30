@@ -63,13 +63,14 @@ from .conftest import apply_pre_toggle_defaults
 
 
 def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
-              same_title_size_cap=1.0, categories=None, tags=None):
+              same_title_size_cap=1.0, categories=None, tags=None, add_to_held_pairs=False):
     """A LiveSettings with every toggle named, defaulting to the pre-toggle
     values conftest's apply_pre_toggle_defaults pins."""
     return LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
                         interval_discount=interval_discount, size_cap=size_cap,
                         same_title_size_cap=same_title_size_cap,
-                        categories=categories, tags=tags)
+                        categories=categories, tags=tags,
+                        add_to_held_pairs=add_to_held_pairs)
 
 
 # An origin as read_saved_live_defaults writes it: any origin but config.py's
@@ -827,6 +828,20 @@ class TestLiveSettings:
         with pytest.raises(ValueError, match="tier_floors"):
             _settings(tier_floors=bad)
 
+    @pytest.mark.parametrize("bad", [1, 0, None, "True", 1.0])
+    def test_add_to_held_pairs_must_be_exactly_a_bool(self, bad):
+        # A saved file's JSON 1 or "true" must never read as on
+        with pytest.raises(ValueError, match="add_to_held_pairs"):
+            _settings(add_to_held_pairs=bad)
+        with pytest.raises(ValueError, match="add_to_held_pairs"):
+            dataclasses.replace(_settings(), add_to_held_pairs=bad)
+
+    def test_add_to_held_pairs_defaults_to_off(self):
+        # A construction that does not name it, and a saved file that leaves
+        # it out, both read it as off
+        assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2).add_to_held_pairs is False
+        assert _settings(add_to_held_pairs=True).add_to_held_pairs is True
+
     @pytest.mark.parametrize("band", [
         (0.5, 0.5), (0.6, 0.5), (-0.1, 0.5), (0.2, 1.1), (float("nan"), 0.5),
         (0.1,), (0.1, 0.2, 0.3), "ab", 0.5, None,
@@ -902,8 +917,10 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "SAME_TITLE_SIZE_CAP", 0.25)
         monkeypatch.setattr(config, "TRADE_CATEGORIES", ("Economics",))
         monkeypatch.setattr(config, "TRADE_TAGS", ["Oil & Gas"])
+        monkeypatch.setattr(config, "ADD_TO_HELD_PAIRS", not config.ADD_TO_HELD_PAIRS)
         expected = _settings(True, (0.1, 0.6), 0.6, 0.35, 0.25,
-                             ("Economics",), ("Oil & Gas",))
+                             ("Economics",), ("Oil & Gas",),
+                             add_to_held_pairs=not shipped.add_to_held_pairs)
         assert live_settings() == expected
         assert all(getattr(expected, name) != getattr(shipped, name)
                    for name in config.LIVE_TOGGLE_FIELDS)
@@ -928,8 +945,9 @@ class TestLiveSettings:
             same_title_size_cap=config.SAME_TITLE_SIZE_CAP,
             categories=config.TRADE_CATEGORIES,
             tags=config.TRADE_TAGS,
+            add_to_held_pairs=config.ADD_TO_HELD_PAIRS,
         )
-        assert type(s.tier_floors) is bool
+        assert type(s.tier_floors) is bool and type(s.add_to_held_pairs) is bool
 
     @pytest.mark.parametrize("cap", [0, 0.37, 1.01, float("nan"), True, "0.2", None, 1e-7])
     def test_same_title_cap_off_the_grid_or_out_of_range_is_refused(self, cap):
@@ -976,10 +994,15 @@ class TestLiveSettings:
     def test_a_construction_without_the_filters_filters_nothing(self):
         s = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
         assert s.categories is None and s.tags is None
+        assert s.add_to_held_pairs is False
         # Defaulted and last of the toggles: the first five fields keep their
-        # positions; origin, not a toggle, comes after them
-        assert list(config.LIVE_TOGGLE_FIELDS)[-2:] == ["categories", "tags"]
+        # positions, so a positional construction of up to seven still builds;
+        # origin, not a toggle, comes after them
+        assert list(config.LIVE_TOGGLE_FIELDS)[-3:] == [
+            "categories", "tags", "add_to_held_pairs"]
         assert [f.name for f in dataclasses.fields(LiveSettings)][-1] == "origin"
+        assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, ("Sports",),
+                            ("Hockey",)).tags == ("Hockey",)
 
     @pytest.mark.parametrize("name, value", [("TRADE_CATEGORIES", "Sports"),
                                              ("TRADE_TAGS", ())])
@@ -1217,7 +1240,8 @@ class TestDescribeLiveSettings:
         s = _settings()
         assert config.describe_live_settings(s, s) == (
             "tier floors on | spread band none | k 0.75 | per-trade cap 20% | "
-            "same-title cap 100% (no extra cap) | categories any | tags any")
+            "same-title cap 100% (no extra cap) | categories any | tags any | "
+            "add to held pairs off")
         assert config.describe_live_settings(s) == config.describe_live_settings(s, s)
 
     def test_the_shipped_values_render_with_no_mark(self):
@@ -1235,6 +1259,7 @@ class TestDescribeLiveSettings:
         "same_title_size_cap": (0.25, "same-title cap 25% (config: 100% (no extra cap))"),
         "categories": (("Economics",), "categories Economics (config: any)"),
         "tags": (("Oil & Gas", "Energy"), "tags Oil & Gas, Energy (config: any)"),
+        "add_to_held_pairs": (True, "add to held pairs on (config: off)"),
     }
 
     def test_every_field_has_a_departure_row(self):
@@ -1246,7 +1271,8 @@ class TestDescribeLiveSettings:
         assert config.describe_live_settings(s, ref) == (
             "tier floors off (config: on) | spread band 0-0.5 (config: none) | "
             "k 0.8 (config: 0.75) | per-trade cap 100% (no cap) (config: 20%) | "
-            "same-title cap 20% (config: 100% (no extra cap)) | categories any | tags any")
+            "same-title cap 20% (config: 100% (no extra cap)) | categories any | tags any | "
+            "add to held pairs off")
         for name in config.LIVE_TOGGLE_FIELDS:
             value, mark = self._DEPARTURES[name]
             line = config.describe_live_settings(
@@ -1272,7 +1298,7 @@ class TestDescribeLiveSettings:
         assert "(config:" not in line
         assert line == ("tier floors off | spread band 0-0.5 | k 0.8 | "
                         "per-trade cap 100% (no cap) | same-title cap 20% | "
-                        "categories any | tags any")
+                        "categories any | tags any | add to held pairs off")
 
     def test_a_filter_renders_its_names_and_any_for_none(self):
         # Each field renders the run's value, then config's in the mark; None is "any"
@@ -1311,7 +1337,8 @@ class TestDescribeLiveSettings:
         assert line == (
             "tier floors off (default: on) | spread band 0-0.5 (default: none) | "
             "k 0.8 (default: 0.75) | per-trade cap 100% (no cap) (default: 20%) | "
-            "same-title cap 20% (default: 100% (no extra cap)) | categories any | tags any")
+            "same-title cap 20% (default: 100% (no extra cap)) | categories any | tags any | "
+            "add to held pairs off")
         assert "(config:" not in line
         # Every field's mark follows the reference's origin, one mark per departure
         for name in config.LIVE_TOGGLE_FIELDS:
@@ -1433,6 +1460,16 @@ class TestLiveRuleWarnings:
         (text,) = config.live_rule_warnings(_settings(interval_discount=1.0))
         assert text.startswith("k = 1.0: ") and "no time-series trade can size" in text
 
+    @pytest.mark.parametrize("cap", [0.05, 0.10, 0.20, 0.35, 0.60, 1.0])
+    @pytest.mark.parametrize("k", [0.4, 0.75, 0.8, 1.0])
+    def test_add_on_adds_no_sentence(self, cap, k):
+        # Kelly on the whole position keeps a held pair within max_kelly_fraction
+        # of the account value, the bound the EXPOSURE sentence already names,
+        # so the toggle changes no sentence at any cap or k
+        off = _settings(interval_discount=k, size_cap=cap)
+        on = dataclasses.replace(off, add_to_held_pairs=True)
+        assert config.live_rule_warnings(on) == config.live_rule_warnings(off)
+
     def test_the_threshold_is_the_constant(self, monkeypatch):
         monkeypatch.setattr(config, "LIVE_EXPOSURE_WARN_FRACTION", 0.10)
         out = config.live_rule_warnings(_settings())
@@ -1447,7 +1484,8 @@ class TestShippedLiveToggles:
     means re-pinning this class."""
 
     _SHIPPED = LiveSettings(tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
-                            size_cap=1.0, same_title_size_cap=0.2, categories=None, tags=None)
+                            size_cap=1.0, same_title_size_cap=0.2, categories=None, tags=None,
+                            add_to_held_pairs=True)
     # The values conftest's apply_pre_toggle_defaults pins, for the controls
     _BEFORE = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
                            size_cap=0.2, same_title_size_cap=1.0)
@@ -1456,8 +1494,11 @@ class TestShippedLiveToggles:
         assert live_settings() == self._SHIPPED
         assert (config.TIME_SERIES_TIER_FLOORS, config.TIME_SERIES_SPREAD_BAND,
                 config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.BUDGET_FRACTION,
-                config.SAME_TITLE_SIZE_CAP, config.TRADE_CATEGORIES, config.TRADE_TAGS) == (
-            False, (0.0, 0.5), 0.80, 1.0, 0.20, None, None)
+                config.SAME_TITLE_SIZE_CAP, config.TRADE_CATEGORIES, config.TRADE_TAGS,
+                config.ADD_TO_HELD_PAIRS) == (
+            False, (0.0, 0.5), 0.80, 1.0, 0.20, None, None, True)
+        # ... and the seed proposes adding to held pairs too
+        assert config.LIVE_DEFAULTS_SEED.add_to_held_pairs is True
 
     def test_the_finder_admits_any_positive_spread_up_to_the_ceiling(self, caplog):
         # 0.10 at 10 days and 0.20 at 20 days sit under their tiers and are
@@ -1537,6 +1578,8 @@ class TestShippedLiveToggles:
         assert sized > 0
 
     def test_no_live_rule_warning_fires(self):
+        # Adding to held pairs on (as shipped) included
+        assert live_settings().add_to_held_pairs is True
         assert config.live_rule_warnings(live_settings()) == []
 
     def test_a_default_backtest_departs_from_the_live_rule(self, monkeypatch, caplog,
@@ -1594,7 +1637,7 @@ class TestPreToggleDefaults:
     _TOGGLES = frozenset({
         "TIME_SERIES_TIER_FLOORS", "TIME_SERIES_SPREAD_BAND",
         "TIME_SERIES_INTERVAL_PROB_DISCOUNT", "BUDGET_FRACTION", "SAME_TITLE_SIZE_CAP",
-        "TRADE_CATEGORIES", "TRADE_TAGS"})
+        "TRADE_CATEGORIES", "TRADE_TAGS", "ADD_TO_HELD_PAIRS"})
 
     @classmethod
     def _by_value_binders(cls, directory: pathlib.Path) -> list[tuple[str, str, str]]:
@@ -1618,7 +1661,7 @@ class TestPreToggleDefaults:
         apply_pre_toggle_defaults(monkeypatch)
         assert live_settings() == LiveSettings(
             tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
-            same_title_size_cap=1.0, categories=None, tags=None)
+            same_title_size_cap=1.0, categories=None, tags=None, add_to_held_pairs=False)
         for module, bound, toggle in binders:
             assert getattr(importlib.import_module(f"kalshi_betting.{module}"), bound) == (
                 getattr(config, toggle)), (module, toggle)
@@ -1804,10 +1847,10 @@ class TestLiveSettingsOrigin:
         assert dataclasses.replace(s, size_cap=0.35).origin == _SAVED_ORIGIN
         assert dataclasses.replace(s, categories=("Sports",)).origin == _SAVED_ORIGIN
 
-    def test_the_toggle_fields_are_the_seven(self):
+    def test_the_toggle_fields_are_the_eight(self):
         assert config.LIVE_TOGGLE_FIELDS == (
             "tier_floors", "spread_band", "interval_discount", "size_cap",
-            "same_title_size_cap", "categories", "tags")
+            "same_title_size_cap", "categories", "tags", "add_to_held_pairs")
         assert [f.name for f in dataclasses.fields(LiveSettings)] == [
             *config.LIVE_TOGGLE_FIELDS, "origin"]
 
@@ -1835,7 +1878,8 @@ def _valid_record(**changes) -> dict:
     Build a saved-defaults record the reader accepts, then apply changes.
 
     Its toggles are LIVE_DEFAULTS_SEED's, saved at 2026-09-27T21:05:13Z with
-    no source note.
+    no source note, with add_to_held_pairs left out: the seven-toggle shape a
+    file saved before that toggle existed has, which reads as _SEED_ADD_ON_OFF.
 
     Args:
         **changes: Top-level keys to replace; a value of _DROP removes the key.
@@ -1881,6 +1925,30 @@ def _with_toggles(**changes) -> dict:
 
 # Marks a key _valid_record / _with_toggles should remove
 _DROP = object()
+
+# LIVE_DEFAULTS_SEED with adding to held pairs off: what _valid_record's
+# seven-toggle file reads as, and what a save of it writes as seven toggles
+_SEED_ADD_ON_OFF = dataclasses.replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False)
+
+# The exact bytes a save of _SEED_ADD_ON_OFF writes, with the seed's note, at
+# _FrozenDatetime's instant: the same bytes a save wrote before
+# add_to_held_pairs existed, so a file saved with it off reads the same to
+# code from before it
+_SEVEN_TOGGLE_BYTES = (
+    b'{\n'
+    b'  "format": "live-defaults-v1",\n'
+    b'  "saved_at": "2026-09-27T21:05:13Z",\n'
+    b'  "source": "seed values (config.LIVE_DEFAULTS_SEED)",\n'
+    b'  "settings": {\n'
+    b'    "tier_floors": false,\n'
+    b'    "spread_band": [0.0, 0.5],\n'
+    b'    "interval_discount": 0.8,\n'
+    b'    "size_cap": 0.1,\n'
+    b'    "same_title_size_cap": 0.2,\n'
+    b'    "categories": null,\n'
+    b'    "tags": null\n'
+    b'  }\n'
+    b'}\n')
 
 
 def _text(record) -> bytes:
@@ -1949,24 +2017,41 @@ class TestSavedLiveDefaults:
         assert '"categories": ["Sports"],' in text and '"tags": ["Basketball"]\n' in text
 
     def test_the_written_text_is_pinned(self, monkeypatch):
+        # With adding to held pairs off, the file is the seven-toggle one a
+        # save wrote before that toggle existed, byte for byte
+        monkeypatch.setattr(config, "datetime", _FrozenDatetime)
+        config.save_live_defaults(_SEED_ADD_ON_OFF, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES
+
+    def test_an_on_save_writes_the_key_last(self, monkeypatch):
+        # The seed (adding to held pairs on) writes the toggle, after the
+        # seven that were there before it
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
         config.save_live_defaults(config.LIVE_DEFAULTS_SEED,
                                   source=config.LIVE_DEFAULTS_SEED_SOURCE)
-        assert config.LIVE_DEFAULTS_FILE.read_bytes() == (
-            b'{\n'
-            b'  "format": "live-defaults-v1",\n'
-            b'  "saved_at": "2026-09-27T21:05:13Z",\n'
-            b'  "source": "seed values (config.LIVE_DEFAULTS_SEED)",\n'
-            b'  "settings": {\n'
-            b'    "tier_floors": false,\n'
-            b'    "spread_band": [0.0, 0.5],\n'
-            b'    "interval_discount": 0.8,\n'
-            b'    "size_cap": 0.1,\n'
-            b'    "same_title_size_cap": 0.2,\n'
-            b'    "categories": null,\n'
-            b'    "tags": null\n'
-            b'  }\n'
-            b'}\n')
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+            b'    "tags": null\n',
+            b'    "tags": null,\n    "add_to_held_pairs": true\n')
+        assert config.read_saved_live_defaults() == config.LIVE_DEFAULTS_SEED
+
+    def test_a_seven_toggle_file_reads_with_add_on_off(self):
+        # A file saved before add_to_held_pairs existed: the exact bytes that
+        # save wrote read as the same settings, adding to held pairs off
+        # (nobody confirmed a value for it), whatever config.py or the seed ship
+        config.LIVE_DEFAULTS_FILE.write_bytes(_SEVEN_TOGGLE_BYTES)
+        saved = config.read_saved_live_defaults()
+        assert saved == _SEED_ADD_ON_OFF and saved.add_to_held_pairs is False
+        assert config.ADD_TO_HELD_PAIRS is True
+        assert config.LIVE_DEFAULTS_SEED.add_to_held_pairs is True
+        assert saved.origin == ("live_defaults.json, saved 2026-09-27T21:05:13Z from "
+                                "seed values (config.LIVE_DEFAULTS_SEED)")
+
+    @pytest.mark.parametrize("value", [False, True])
+    def test_a_file_naming_the_toggle_reads_it(self, value):
+        # Written either way by hand, the toggle reads as written
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(add_to_held_pairs=value)))
+        assert config.read_saved_live_defaults() == dataclasses.replace(
+            _SEED_ADD_ON_OFF, add_to_held_pairs=value)
 
     def test_the_origin_names_the_file_the_time_and_the_source(self, monkeypatch):
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
@@ -2212,8 +2297,14 @@ class TestSavedLiveDefaults:
         ("a two-line source", _text(_valid_record(source="two\nlines"))),
         ("settings that are a list", _text(_valid_record(settings=[]))),
         # The settings block
+        # A toggle that was always there may not be left out; only one added
+        # later (add_to_held_pairs) may
         ("a missing toggle", _text(_with_toggles(tags=_DROP))),
+        ("a missing toggle beside the later one",
+         _text(_with_toggles(tags=_DROP, add_to_held_pairs=False))),
         ("an extra toggle", _text(_with_toggles(origin="config.py"))),
+        ("an extra toggle beside the later one",
+         _text(_with_toggles(add_to_held_pairs=True, sell_held_pairs=True))),
         # Values
         # LiveSettings alone would read these two as the band (0.0, 1.0): only the
         # reader's own spread_band rule refuses them
@@ -2229,6 +2320,9 @@ class TestSavedLiveDefaults:
         ("k of 0", _text(_with_toggles(interval_discount=0))),
         ("a cap off the grid", _text(_with_toggles(size_cap=0.33))),
         ("tier floors as 1", _text(_with_toggles(tier_floors=1))),
+        ("add to held pairs as 1", _text(_with_toggles(add_to_held_pairs=1))),
+        ("add to held pairs as a string", _text(_with_toggles(add_to_held_pairs="true"))),
+        ("add to held pairs as null", _text(_with_toggles(add_to_held_pairs=None))),
         # Category and tag names
         ("the name any", _text(_with_toggles(categories=["any"]))),
         ("an empty name", _text(_with_toggles(tags=[""]))),
@@ -2261,6 +2355,9 @@ class TestSavedLiveDefaults:
              '"spread_band" must be [floor, ceiling]'),
             (_text(_with_toggles(spread_band=[0.0, True])),
              '"spread_band" must be [floor, ceiling]'),
+            (_text(_with_toggles(add_to_held_pairs=1)), "add_to_held_pairs must be True or False"),
+            (_text(_with_toggles(tags=_DROP)),
+             "(a file saved before add_to_held_pairs existed may leave it out)"),
         ]:
             path.write_bytes(data)
             with pytest.raises(config.LiveDefaultsError, match=re.escape(words)):
@@ -2291,7 +2388,7 @@ class TestSavedLiveDefaults:
         assert not isinstance(err.value, config.LiveDefaultsMissing)
         # Control: the same link, once its target exists, reads as the saved defaults
         target.write_bytes(_text(_valid_record()))
-        assert config.read_saved_live_defaults() == config.LIVE_DEFAULTS_SEED
+        assert config.read_saved_live_defaults() == _SEED_ADD_ON_OFF
 
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no named pipes on this platform")
     def test_a_fifo_at_the_path_is_refused_without_waiting(self):
@@ -2333,7 +2430,7 @@ class TestSavedLiveDefaults:
         data = _text(_valid_record())
         config.LIVE_DEFAULTS_FILE.write_bytes(
             data + b" " * (config.LIVE_DEFAULTS_MAX_BYTES - len(data)))
-        assert config.read_saved_live_defaults() == config.LIVE_DEFAULTS_SEED
+        assert config.read_saved_live_defaults() == _SEED_ADD_ON_OFF
 
     def test_a_hand_written_record_reads_as_its_toggles(self):
         # Whole numbers and names with surrounding spaces are normalised by LiveSettings
@@ -2377,7 +2474,7 @@ class TestLiveDefaults:
         # An invalid constant does not reach it, and a valid file is read as saved
         monkeypatch.setattr(config, "BUDGET_FRACTION", 0.37)
         config.LIVE_DEFAULTS_FILE.write_bytes(_text(_valid_record()))
-        assert config.live_defaults() == config.LIVE_DEFAULTS_SEED
+        assert config.live_defaults() == _SEED_ADD_ON_OFF
 
 
 class TestLiveDefaultsSeed:
@@ -2385,7 +2482,8 @@ class TestLiveDefaultsSeed:
 
     def test_the_seed_values(self):
         seed = config.LIVE_DEFAULTS_SEED
-        assert seed == LiveSettings(False, (0.0, 0.5), 0.8, 0.10, 0.20)
+        assert seed == LiveSettings(False, (0.0, 0.5), 0.8, 0.10, 0.20,
+                                    add_to_held_pairs=True)
         assert seed.categories is None and seed.tags is None
         assert seed.origin == config.LIVE_DEFAULTS_FROM_CONFIG
 
@@ -2466,6 +2564,7 @@ class TestLiveSettingsChanges:
             ("same-title cap", "100% (no extra cap)", "20%", True),
             ("categories", "Sports", "any", True),
             ("tags", "Basketball", "any", True),
+            ("add to held pairs", "off", "off", False),
         ]
 
     def test_changed_flags_exactly_the_fields_that_differ(self):
@@ -2485,7 +2584,12 @@ class TestLiveSettingsChanges:
 
     def test_no_current_defaults_changes_every_row(self):
         rows = config.live_settings_changes(None, config.LIVE_DEFAULTS_SEED)
-        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 7
+        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 8
         assert all(old == "—" and changed for _, old, _, changed in rows)
         assert [new for _, _, new, _ in rows] == [
-            "off", "0-0.5", "0.8", "10%", "20%", "any", "any"]
+            "off", "0-0.5", "0.8", "10%", "20%", "any", "any", "on"]
+
+    def test_a_seven_toggle_file_shows_turning_add_on_on_as_a_change(self):
+        # Defaults saved before the toggle read it as off; the seed proposes on
+        rows = config.live_settings_changes(_SEED_ADD_ON_OFF, config.LIVE_DEFAULTS_SEED)
+        assert [row for row in rows if row[3]] == [("add to held pairs", "off", "on", True)]
