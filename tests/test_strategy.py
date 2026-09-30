@@ -1953,6 +1953,19 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(strategy, "_evaluate_size", "kelly_budget")
         assert _function_calls(config, "max_affordable_pairs", "kelly_budget")
         assert _function_calls(scanner, "enrich_with_orderbook_prices", "kelly_budget")
+        # The backtest budgets the same way: each Monday's portfolio value
+        # (cash plus open trades at cost), never more than the running cash
+        assert _function_calls(backtester, "_simulate_at_discount", "kelly_budget")
+        [budget_call] = [
+            sub for node in ast.walk(ast.parse(inspect.getsource(backtester)))
+            if isinstance(node, ast.FunctionDef) and node.name == "_simulate_at_discount"
+            for sub in ast.walk(node)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+            and sub.func.id == "kelly_budget"
+        ]
+        value_arg, _fraction_arg, cash_arg = budget_call.args
+        assert isinstance(value_arg, ast.Name) and value_arg.id == "checkpoint_value"
+        assert isinstance(cash_arg, ast.Name) and cash_arg.id == "cash"
         # The sizer and enrichment hand the cash on to the one count helper
         for module, func in ((strategy, "_evaluate_size"),
                              (scanner, "enrich_with_orderbook_prices")):

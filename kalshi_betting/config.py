@@ -2072,8 +2072,10 @@ def kelly_budget(bankroll: float, fraction: float, cash: float | None = None) ->
     plus what the open positions are worth — but only cash buys contracts, so
     the budget is min(bankroll * fraction, cash). The one definition of that
     rule: max_affordable_pairs turns it into a contract count for enrichment's
-    depth bound and for the sizer, and strategy._evaluate_size reads it as the
-    budget compute_trade's fee shrink fits the trade into.
+    depth bound and for the sizer, strategy._evaluate_size reads it as the
+    budget compute_trade's fee shrink fits the trade into, and
+    backtester._simulate_at_discount sizes each simulated Monday with it (the
+    checkpoint's cash plus its open trades at cost, and the cash left).
 
     Units in are units out: pass dollars and get dollars, or cents and get
     cents.

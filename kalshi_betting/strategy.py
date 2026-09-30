@@ -26,9 +26,12 @@ Dependencies:
     and constants, but re-implement the Kelly formula (net spread, b with the
     fee in its denominator, f* = p - q/b), and backtester also re-implements
     select_portfolio's ticker and ladder rules. A change to either must be
-    made in every copy. The backtester's cash rule is its own and differs:
-    it skips a trade the running cash cannot afford whole, at its fill
-    prices, where select_portfolio shrinks it.
+    made in every copy. The backtester budgets through the same
+    config.kelly_budget — each simulated Monday's cash plus its open trades
+    at cost, never more than the cash left — so it too shrinks a trade to the
+    cash left, but it spends a trade's fee-inclusive cost at its entry prices
+    (candle quotes, with no cash_need_cents reserve) and does not repeat
+    _spec_at_count's expected-value check on a shrunk trade.
 
 Notes:
     All prices here are LEG prices from scanner.leg_prices(pair): (nA, pB) for
@@ -887,8 +890,10 @@ def select_portfolio(specs: list, cash_cents: int, *,
     picked, and so do a shrunk spec's. A skipped spec spends no cash and
     claims no ladder, so a later spec may then be taken, or taken at a larger
     size. The backtester repeats the ticker and ladder rules (change both
-    together); its cash rule differs, skipping a trade the running cash
-    cannot afford whole at its fill prices.
+    together) and budgets through the same config.kelly_budget, so it too
+    shrinks a trade to the cash left; it spends a trade's fee-inclusive cost
+    at its entry prices (candle quotes, with no cash_need_cents reserve) and
+    does not repeat _spec_at_count's expected-value check on a shrunk trade.
 
     Args:
         specs (list): TradeSpecs from compute_trade.
