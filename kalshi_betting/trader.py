@@ -52,12 +52,17 @@ Purpose:
     A pair can add to a pair the account already holds (scanner.pair_held:
     the same two tickers, the same side on each). Just before its NO leg is
     sent, the trader checks that each leg buys the side held on its market
-    and that both positions still read exactly the held count; otherwise it
-    sends nothing (_add_on_mismatch). Every alert about a position a pair may
-    have moved names what the account held there before the pair, when that
-    was not zero, and says to bring the position back to it rather than to
-    flatten it (_pre_pair_note, _restore_remedy): flattening would close the
-    older contracts too.
+    and that both positions still read exactly the held count; otherwise (a
+    position that could not be read included) it sends nothing
+    (_add_on_mismatch). Every alert that has the position read before the
+    pair — the ORPHANED POSITION and "could NOT be attributed" CRITICALs,
+    both disproof CRITICALs and their list of earlier unchecked pairs — names
+    what the account held there when that was not zero, in plain words ("30
+    NO contracts", _held_words), and says to put the position back to it
+    rather than close it out (_pre_pair_note, _restore_remedy): closing it
+    out would close the older contracts too. The worker-crash CRITICAL in
+    execute_trades has no such reading; for an add-on it names the held
+    pair's count instead.
 
     An exception from a submission does not prove the order failed (a
     timeout can arrive after the fill), so the outcome is then judged from
@@ -103,8 +108,9 @@ Dependencies:
     V2_FOK_KILL_ERROR_CODE, V2_FOK_KILL_HTTP_STATUS,
     V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS, V2_MAPPING_VERDICT_POLL_SECONDS,
     V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS, V2_ORDER_PATH,
-    V2_ROLLBACK_BID_PRICE_DOLLARS, V2_SELF_TRADE_PREVENTION_TYPE, LiveSettings
-    and live_settings from config.py. Called by main.py after
+    V2_ROLLBACK_BID_PRICE_DOLLARS, V2_SELF_TRADE_PREVENTION_TYPE, LiveSettings,
+    live_settings and count_text (writes a contract count exactly in an
+    alert or a marker) from config.py. Called by main.py after
     select_portfolio() picks the trades. Uses the KalshiClient built by
     auth.py.
 
@@ -208,6 +214,7 @@ from .config import (
     V2_ROLLBACK_BID_PRICE_DOLLARS,
     V2_SELF_TRADE_PREVENTION_TYPE,
     LiveSettings,
+    count_text,
     live_settings,
 )
 from .reporter import TradeResult
@@ -383,11 +390,11 @@ _V2_NO_MAPPING_DISPROVEN = False
 _V2_UNCHECKED_NO_LEGS: list[str] = []
 
 # Beside _V2_UNCHECKED_NO_LEGS: for each of those tickers whose position read
-# before its pair was not zero (an earlier trade's contracts, or the held pair
-# an add-on adds to), that reading. The disproof's CRITICAL names it, so a
-# human brings the position back to it rather than flattening the older
-# contracts too. Filled from worker threads (a dict assignment is atomic under
-# the GIL) and cleared only with the process.
+# before its pair was a number other than zero (an earlier trade's contracts,
+# or the held pair an add-on adds to), that reading. The disproof's CRITICAL
+# names it, so a human puts the position back to it rather than flattening the
+# older contracts too. Filled from worker threads (a dict assignment is atomic
+# under the GIL) and cleared only with the process.
 _V2_UNCHECKED_BASELINES: dict[str, float] = {}
 
 # Pause before re-reading a ZERO position delta in _execute_one's two
@@ -1437,17 +1444,47 @@ def _flat_before(before: float | None) -> bool:
     """
     Say whether a market read flat before this pair, or could not be read.
 
-    The remedy texts treat an unknown reading like a flat one, so their words
-    are exactly what they are for a pair on a market the account did not hold.
+    A reading that is not a finite number (the positions listing sent
+    something like "nan") counts as unread. The remedy texts treat an unread
+    reading like a flat one, so their words are exactly what they are for a
+    pair on a market the account did not hold.
 
     Args:
         before (float | None): The market's signed position read before this
             pair's first order, or None when that read failed.
 
     Returns:
-        bool: True when the reading is None or zero.
+        bool: True when the reading is None, not a finite number, or within
+            _DELTA_EPS of zero.
     """
-    return before is None or abs(before) < _DELTA_EPS
+    return before is None or not math.isfinite(before) or abs(before) < _DELTA_EPS
+
+
+def _held_words(position: float | None) -> str:
+    """
+    Say a signed position in plain words, as the Kalshi UI shows it.
+
+    Kalshi signs a position: NO contracts read negative and YES contracts
+    positive. So -30 reads "30 NO contracts" and 12 reads "12 YES contracts",
+    the numbers written exactly (config.count_text).
+
+    Args:
+        position (float | None): A signed position, or None when it could not
+            be read.
+
+    Returns:
+        str: "nothing" within _DELTA_EPS of zero; "N NO contracts" or "N YES
+            contracts" ("1 NO contract" for one) otherwise; "an unreadable
+            position" for None or a reading that is not a finite number.
+    """
+    if position is None or not math.isfinite(position):
+        return "an unreadable position"
+    if abs(position) < _DELTA_EPS:
+        return "nothing"
+    # Cross-module: the count written exactly, never rounded as %g does
+    count = count_text(abs(position))
+    side = "NO" if position < 0 else "YES"
+    return f"{count} {side} {'contract' if count == '1' else 'contracts'}"
 
 
 def _pre_pair_note(ticker: str, before: float | None) -> str:
@@ -1466,13 +1503,17 @@ def _pre_pair_note(ticker: str, before: float | None) -> str:
             first order, or None when that read failed.
 
     Returns:
-        str: "" when the account held nothing there (or that is not known);
-            else a sentence that starts with a space.
+        str: "" when the account held nothing there (or that is not known,
+            _flat_before); else a sentence that starts with a space, e.g.
+            " Before this pair the account already held 30 NO contracts
+            (position -30) on KX-B. Those are not this pair's: close only this
+            pair's contracts and leave those alone."
     """
     if _flat_before(before):
         return ""
-    return (f" The account held {before:g} on {ticker} before this pair, an earlier"
-            " trade's: close only this pair's contracts, never those.")
+    return (f" Before this pair the account already held {_held_words(before)}"
+            f" (position {count_text(before)}) on {ticker}. Those are not this"
+            " pair's: close only this pair's contracts and leave those alone.")
 
 
 def _restore_remedy(ticker: str, before: float | None) -> str:
@@ -1480,8 +1521,9 @@ def _restore_remedy(ticker: str, before: float | None) -> str:
     Say what a person should do by hand with a position this pair may have moved.
 
     With nothing held there before the pair, the remedy is to flatten the
-    position. With an earlier holding, flattening would close those older
-    contracts too, so the remedy is to bring the position back to what it was.
+    position. With an earlier holding, closing the position out would close
+    those older contracts too, so the remedy is to put it back to what it
+    was.
 
     Args:
         ticker (str): The market's ticker.
@@ -1490,16 +1532,16 @@ def _restore_remedy(ticker: str, before: float | None) -> str:
 
     Returns:
         str: "flatten this position by hand in the Kalshi UI" when the account
-            held nothing there before this pair (or that is not known); else
-            "bring the position on <ticker> back to <before> by hand in the
-            Kalshi UI — what the account held there before this pair (an
-            earlier trade's), not to 0".
+            held nothing there before this pair (or that is not known,
+            _flat_before); else, e.g., "put the position on KX-B back to 30 NO
+            contracts (-30) by hand in the Kalshi UI (that is what the account
+            held there before this pair; do not close it to 0)".
     """
     if _flat_before(before):
         return "flatten this position by hand in the Kalshi UI"
-    return (f"bring the position on {ticker} back to {before:g} by hand in the Kalshi UI"
-            " — what the account held there before this pair (an earlier trade's),"
-            " not to 0")
+    return (f"put the position on {ticker} back to {_held_words(before)}"
+            f" ({count_text(before)}) by hand in the Kalshi UI (that is what the"
+            " account held there before this pair; do not close it to 0)")
 
 
 def _partial_unwind_counts(exc: BaseException, count: int) -> tuple[str, str] | None:
@@ -2328,16 +2370,17 @@ def _stop_run_on_v2_mapping_disproof() -> str:
             check could not read the account (_V2_UNCHECKED_NO_LEGS). Those
             pairs went ahead as if the mapping held, so their positions rest
             on the same wrong mapping. A ticker the account already held
-            before its pair reads "<ticker> (held <X> before that pair)"
-            (_V2_UNCHECKED_BASELINES), so a person restores that holding
-            rather than closing it. An empty string when there are none.
+            before its pair reads, e.g., "KX-B (held 30 NO contracts before
+            that pair)" (_V2_UNCHECKED_BASELINES, in _held_words' words), so a
+            person restores that holding rather than closing it. An empty
+            string when there are none.
     """
     global _V2_NO_MAPPING_DISPROVEN
     _V2_NO_MAPPING_DISPROVEN = True
     if not _V2_UNCHECKED_NO_LEGS:
         return ""
     named = ", ".join(
-        f"{ticker} (held {_V2_UNCHECKED_BASELINES[ticker]:g} before that pair)"
+        f"{ticker} (held {_held_words(_V2_UNCHECKED_BASELINES[ticker])} before that pair)"
         if ticker in _V2_UNCHECKED_BASELINES else ticker
         for ticker in _V2_UNCHECKED_NO_LEGS
     )
@@ -2354,9 +2397,9 @@ def _note_unchecked_no_leg(ticker: str, before_no: float | None) -> None:
 
     Called by _confirm_v2_no_mapping when it cannot read the account after the
     NO fill. The ticker joins _V2_UNCHECKED_NO_LEGS; when the position read
-    before the pair was not zero it also goes into _V2_UNCHECKED_BASELINES,
-    keeping the first reading (a ticker is traded by at most one pair of a
-    run, since select_portfolio never picks one twice).
+    before the pair was not flat or unknown (_flat_before) it also goes into
+    _V2_UNCHECKED_BASELINES, keeping the first reading (a ticker is traded by
+    at most one pair of a run, since select_portfolio never picks one twice).
 
     Args:
         ticker (str): The NO leg's market's ticker.
@@ -2392,8 +2435,10 @@ def _confirm_v2_no_mapping(
         run and go on to the YES leg.
       * change unknown (a read failed): warn and go on without remembering
         it, so the next NO fill checks again. The NO leg's ticker is
-        recorded (_V2_UNCHECKED_NO_LEGS), so that if a later pair disproves
-        the mapping its CRITICAL names this position too.
+        recorded (_V2_UNCHECKED_NO_LEGS), with what that market held before
+        this pair when that was not zero (_V2_UNCHECKED_BASELINES), so that
+        if a later pair disproves the mapping its CRITICAL names this
+        position and that holding too.
       * change of zero: read again after each pause in
         config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS (1, 2 and 4 s, so up
         to 7 s), since the ledger can lag behind a fill (about 1 s was seen
@@ -2409,9 +2454,10 @@ def _confirm_v2_no_mapping(
         unwound, since the unwind relies on the same side mapping. The
         CRITICAL log says the rest of the run is stopped, and to stop
         trading and undo the position by hand in the Kalshi UI: flatten it
-        when the account held nothing on that market before the pair, else
-        bring it back to what it held (_restore_remedy), since flattening
-        would close the older contracts too.
+        when the account held nothing on that market before the pair (or
+        that reading is unknown), else put it back to what it held
+        (_restore_remedy), since closing it out would close the older
+        contracts too.
 
     If the mapping was already disproven in this process when this runs —
     this pair's NO leg filled after another pair's disproof — nothing is
@@ -2548,8 +2594,9 @@ def _add_on_mismatch(spec: TradeSpec, no_leg: _Leg, yes_leg: _Leg,
     NO on and YES on the ticker it holds YES on, and only while each market
     still holds exactly the held pair's count (-count on the NO market,
     +count on the YES market), read just before the NO leg is sent. A
-    position that could not be read counts as changed. An ordinary pair
-    (pair_held is None) is never refused here.
+    position that could not be read, or that did not read as a finite number
+    (the positions listing sent something like "nan"), counts as changed. An
+    ordinary pair (pair_held is None) is never refused here.
 
     Args:
         spec (TradeSpec): The trade about to be sent; its pair says which held
@@ -2561,10 +2608,10 @@ def _add_on_mismatch(spec: TradeSpec, no_leg: _Leg, yes_leg: _Leg,
         before_yes (float | None): The YES leg's market's position, likewise.
 
     Returns:
-        str | None: A short reason, such as "the NO leg is on KX-B, which is
-            not held NO", "the position on KX-B is now -20, not -30" or "the
-            position on KX-A could not be read"; None when the pair may be
-            sent.
+        str | None: A short reason, such as "the account does not hold NO on
+            KX-B", "KX-B now holds 20 NO contracts; the held pair had 30 NO
+            contracts" or "the position on KX-A could not be read"; None when
+            the pair may be sent.
     """
     # Cross-module: the held pair this trade adds to, read by type
     held = pair_held(spec.pair)
@@ -2573,16 +2620,17 @@ def _add_on_mismatch(spec: TradeSpec, no_leg: _Leg, yes_leg: _Leg,
     held_sides = dict(held.sides)
     for leg in (no_leg, yes_leg):
         if held_sides.get(leg.market.ticker) != leg.side:
-            return (f"the {leg.side.upper()} leg is on {leg.market.ticker}, which is"
-                    f" not held {leg.side.upper()}")
-    # What each market must still hold: NO contracts read negative
+            return f"the account does not hold {leg.side.upper()} on {leg.market.ticker}"
+    # What each market must still hold: NO contracts read negative. A reading
+    # that is not a finite number compares unequal to nothing, so it is
+    # refused here as unread rather than let through by the test below
     for leg, before, expected in ((no_leg, before_no, -held.count),
                                   (yes_leg, before_yes, held.count)):
-        if before is None:
+        if before is None or not math.isfinite(before):
             return f"the position on {leg.market.ticker} could not be read"
         if abs(before - expected) >= _DELTA_EPS:
-            return (f"the position on {leg.market.ticker} is now {before:g},"
-                    f" not {expected:g}")
+            return (f"{leg.market.ticker} now holds {_held_words(before)};"
+                    f" the held pair had {_held_words(expected)}")
     return None
 
 
@@ -2611,8 +2659,9 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     A pair that adds to a held pair (scanner.pair_held) is checked after
     those two reads and before anything is sent (_add_on_mismatch): unless
     each leg buys the side held on its market and both positions still read
-    the held count, nothing is sent and the pair is "failed", "not sent: the
-    held pair changed (...)". An ordinary pair is never refused there.
+    the held count, nothing is sent and the pair is "failed", "not sent:
+    this does not match the held pair it adds to (...)". An ordinary pair is
+    never refused there.
 
     NO leg uncertain: zero change on both readings → "failed"; exactly
     -no_leg.count (a held NO reads negative) → unwind; anything else →
@@ -2661,9 +2710,9 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     Returns:
         TradeResult: status "executed", "failed" (including a pair stopped,
             with nothing sent, because the V2 NO-leg mapping was disproven
-            earlier in this process, or an add-on whose held pair changed),
-            "rolled_back", "rollback_failed" or "manual_review" (see
-            reporter.TradeResult).
+            earlier in this process, or an add-on that no longer matched the
+            held pair it adds to), "rolled_back", "rollback_failed" or
+            "manual_review" (see reporter.TradeResult).
     """
     # However the pair ends, an unsent held place goes back to the pacer
     writes = _PairWrites(_ORDER_WRITE_PACER)
@@ -2726,18 +2775,19 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
     # An add-on buys only the pair it adds to: the NO leg on the market held
     # NO, the YES leg on the market held YES, and each market still holding
     # what the run read at its start. Anything else sends nothing (a failed
-    # read included); an ordinary pair is never refused here
-    changed = _add_on_mismatch(spec, no_leg, yes_leg, before_no, before_yes)
-    if changed is not None:
+    # or unreadable read included); an ordinary pair is never refused here
+    mismatch = _add_on_mismatch(spec, no_leg, yes_leg, before_no, before_yes)
+    if mismatch is not None:
         logging.warning(
-            "Not sending '%s' (A=%s B=%s): it adds to a held pair, and %s;"
-            " nothing submitted",
+            "Not sending '%s' (A=%s B=%s): it adds to a pair the account holds,"
+            " but %s. Nothing was sent.",
             spec.pair.canonical_title, spec.pair.market_a.ticker,
-            spec.pair.market_b.ticker, changed,
+            spec.pair.market_b.ticker, mismatch,
         )
         return TradeResult(
             spec=spec, status="failed",
-            error=f"not sent: the held pair changed ({changed}); nothing submitted",
+            error=(f"not sent: this does not match the held pair it adds to"
+                   f" ({mismatch}); nothing submitted"),
         )
 
     # Submit the NO leg (single-shot; see _submit_order_v2)
@@ -3065,7 +3115,8 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
             result has status="executed" (both legs filled), "simulated" (dry
             run), "failed" (NO leg confirmed unfilled, or nothing sent — a
             pair stopped after the V2 NO-leg mapping was disproven, or an
-            add-on whose held pair changed), "rolled_back" (YES leg
+            add-on that no longer matched the held pair it adds to),
+            "rolled_back" (YES leg
             confirmed unfilled, this pair's NO contracts sold back),
             "rollback_failed" (NO-leg unwind did not fill, or closed only
             part of this pair's NO contracts — orphaned position), or
@@ -3095,7 +3146,7 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
                 no_leg.count, no_leg.label, no_leg.price_dollars * 100,
                 yes_leg.count, yes_leg.label, yes_leg.price_dollars * 100,
                 spec.total_cost_with_fees, spec.min_payoff,
-                f" | adds to {held.count:g} held" if held is not None else "",
+                f" | adds to {count_text(held.count)} held" if held is not None else "",
             )
             results.append(TradeResult(spec=spec, status="simulated"))
         return results
@@ -3158,12 +3209,13 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
                 # other manual_review case in _execute_one. "A"/"B" are MARKET
                 # labels (market_a / market_b), not submission legs.
                 # An add-on's markets hold older contracts too: name them, so
-                # a person closes only this pair's (read off the spec, never
+                # a person undoes only this pair's (read off the spec, never
                 # off the exception)
                 held = pair_held(spec.pair)
                 held_note = (
-                    f" (this pair adds to {held.count:g} held on each market:"
-                    " close only this pair's contracts)"
+                    f" (this pair adds to a held pair of {count_text(held.count)}"
+                    " contracts on each market: check both positions and undo"
+                    " only what this pair added)"
                     if held is not None else ""
                 )
                 # One-line description in the message and the result;

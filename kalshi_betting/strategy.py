@@ -11,7 +11,8 @@ Purpose:
 
 Dependencies:
     config (constants, fee helpers, the probability model, LiveSettings,
-    live_settings, pair_size_cap, held_pair_fraction) and scanner
+    live_settings, pair_size_cap, held_pair_fraction, count_text for the
+    "adds to N held" marker) and scanner
     (CandidatePair, leg_prices/leg_sides, book-pricing helpers,
     pair_ladder_keys, pair_held). TradeSpec is consumed by trader and
     reporter; main calls compute_trade and select_portfolio. backtester and
@@ -49,6 +50,7 @@ from .config import (
     SAME_TITLE_CO_RESOLVE_PROB,
     SIZE_SOLVE_MAX_ITERATIONS,
     LiveSettings,
+    count_text,
     fee_leg_exact,
     fee_per_pair_approx,
     held_pair_fraction,
@@ -655,7 +657,7 @@ def compute_trade(
         profit_ratio * 100,
         monthly_profit_ratio * 100,
         # Only an add-on's line gains this, so every other line reads as before
-        f" | adds to {held.count:g} held" if held is not None else "",
+        f" | adds to {count_text(held.count)} held" if held is not None else "",
     )
     if levels:
         # Write the solved prices back through leg_sides, so every reader of

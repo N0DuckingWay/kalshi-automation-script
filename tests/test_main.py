@@ -3558,11 +3558,15 @@ class TestAddOnMarkers:
         return dict(zip(headers, values, strict=True))["Recommended Trade"]
 
     def test_the_pairs_table_names_the_held_count(self, caplog):
+        """Pins the Recommended Trade cell's "(adds to 30 held)" for an add-on
+        and an ordinary trade's cell left exactly as it was."""
         assert self._trade_cell(caplog, make_spec()) == "5× YES(A) + 5× NO(B)"
         assert self._trade_cell(caplog, self._add_on(make_spec())) == (
             "5× YES(A) + 5× NO(B) (adds to 30 held)")
 
     def test_the_portfolio_line_names_the_held_count(self, caplog):
+        """Pins that an add-on's portfolio line is an ordinary trade's line
+        followed by " — adds to 30 held", and nothing else changes."""
         with caplog.at_level(logging.INFO):
             main._print_portfolio([make_spec(), self._add_on(make_spec())], "Executing")
         ordinary, add_on = [r.getMessage() for r in caplog.records
@@ -4720,6 +4724,53 @@ class TestResultFile:
         assert any(w.startswith("CRITICAL:   RESCUE | executed | Test pair")
                    for w in result["warnings"])
         assert _no_report_handler()
+
+    def test_the_rescue_dump_names_an_add_ons_held_count(self, monkeypatch, tmp_path, caplog):
+        """Pins that the trade log's rescue dump marks a trade that added to a
+        held pair "(adds to 30 held)" right after its counts, so x=5 y=5 is
+        never read as the whole position, and leaves an ordinary line as it was."""
+        add_on = make_spec()
+        add_on.pair.held = scanner_mod.HeldPair(
+            sides=(("TICK-A", "yes"), ("TICK-B", "no")), count=30.0,
+            cost_dollars=18.9, account_value_dollars=1000.0)
+
+        def executed(client, portfolio, *, dry_run):
+            """
+            Stand in for trader.execute_trades: the run's pair, then an add-on, both executed.
+
+            Args:
+                client: The run's client (unused).
+                portfolio (list): The run's selected specs.
+                dry_run (bool): Whether the run is a dry run (unused).
+
+            Returns:
+                list[TradeResult]: One executed result per spec.
+            """
+            return [TradeResult(spec=s, status="executed") for s in (*portfolio, add_on)]
+
+        def failing_log(*args, **kwargs):
+            """
+            Fail the way a trade log open in another program would.
+
+            Args:
+                *args: append_to_prod_log's positional arguments.
+                **kwargs: Its keyword arguments.
+
+            Raises:
+                PermissionError: Always.
+            """
+            raise PermissionError("trade_log.xlsx is open elsewhere")
+
+        with pytest.raises(PermissionError):
+            self._run(monkeypatch, tmp_path, caplog, execute_trades=executed,
+                      append_to_prod_log=failing_log)
+        rescue = [r.getMessage() for r in caplog.records if "RESCUE |" in r.getMessage()]
+        assert rescue == [
+            "  RESCUE | executed | Test pair | A=TICK-A B=TICK-B | x=5 y=5 cost=$2.30 incl."
+            " fees | ",
+            "  RESCUE | executed | Test pair | A=TICK-A B=TICK-B | x=5 y=5 (adds to 30 held)"
+            " cost=$2.30 incl. fees | ",
+        ]
 
     def test_a_pair_that_cannot_be_described_still_reaches_the_trade_log(
         self, monkeypatch, tmp_path, caplog,

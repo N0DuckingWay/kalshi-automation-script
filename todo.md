@@ -58,6 +58,9 @@ data or the operator's machine · **[decision]** needs an operator call before a
 - [ ] **`TRADER_MAX_WORKERS` never exercised at scale** against the live API (`config.py:1351-1358`).
 - [ ] **Existing `trade_log.xlsx` keeps its old header row** (no migration; `reporter.py:213-216,
   432-434`). Decide whether to rewrite headers once.
+- [ ] **Reduce-only unwind and NO buy against an existing, larger NO position.** Never observed live
+  (the probe only closes from flat); watch the first add-on rollback, and the case where a
+  process's first NO fill is an add-on (`trader.py`, `_add_on_mismatch`/`_rollback_no_leg`).
 
 ## 3. Pending operator decisions  [decision]
 

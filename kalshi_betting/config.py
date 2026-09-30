@@ -2951,6 +2951,31 @@ def _exact_number(value: float) -> str:
     return short if float(short) == value else repr(value)
 
 
+def count_text(value: float) -> str:
+    """
+    Write a number of contracts, or a signed position, exactly for a person to read.
+
+    Kalshi sends counts and positions with at most two decimals ("-30.00").
+    This writes the number to six decimal places and drops the trailing
+    zeros, so every such number prints as it is ("30", "-30", "12.5",
+    "1234567") and two numbers a millionth of a contract or more apart never
+    print alike. The %g format would keep only six significant digits, so
+    1234567 would print as "1.23457e+06". Every add-on marker ("adds to N
+    held") and every alert naming what the account held before a pair
+    (trader._held_words) writes its numbers through this.
+
+    Args:
+        value (float): The count or signed position.
+
+    Returns:
+        str: The number, e.g. "30", "-30", "12.5" or "0.000001"; "0" for
+            anything that rounds to zero (never "-0"); "nan", "inf" or
+            "-inf" for a value that is not a finite number.
+    """
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return "0" if text == "-0" else text
+
+
 def describe_time_series_rule(tier_floors: bool, spread_band: tuple[float, float]) -> str:
     """
     Describe the time-series entry rule in words.

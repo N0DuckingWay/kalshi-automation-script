@@ -61,7 +61,8 @@ Dependencies:
     live_defaults_source), live_settings_argv (a run's flags), the seed values
     and their source note, the source-note pattern, the exit codes, the run
     result's format tag and the DEFAULTS_SERVER_*, DASHBOARD_FILENAME,
-    DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_* constants. From run_lock:
+    DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_* constants, and count_text
+    (a run page writes an add-on's held count exactly). From run_lock:
     held() and holder(), to refuse a real-money run while another live
     trading run holds the machine's lock.
     It reads config.LIVE_DEFAULTS_FILE, config.PROJECT_ROOT,
@@ -193,6 +194,7 @@ from .config import (
     SCHEDULER_STATE_FILENAME,
     LiveDefaultsError,
     LiveSettings,
+    count_text,
     describe_live_settings,
     live_defaults_source,
     live_rule_warnings,
@@ -410,12 +412,12 @@ _CLEAN_EXITS = frozenset({EXIT_OK, EXIT_TIME_SERIES_SKIPPED})
 # run's CRITICAL names: a market the account held before the run (a pair it
 # added to, or an earlier trade) goes back to what it held, never to 0.
 _ATTENTION_TAIL = (" ended needing manual attention ({why}). Read its result first. If it "
-                   "reports a V2 order-mapping disproof, stop trading and undo by hand in "
-                   "the Kalshi UI what its CRITICAL names — flatten a market the account "
-                   "did not hold before the run, and bring one it did hold back to what it "
-                   "held: a new real-money run would open another wrong-side "
-                   "position, so stop the scheduler daemon if it is running, do not run "
-                   "main.py --mode prod, and do not press Confirm and trade.")
+                   "reports a V2 order-mapping disproof, stop trading (a new real-money run "
+                   "would open another wrong-side position, so stop the scheduler daemon if "
+                   "it is running, do not run main.py --mode prod, and do not press Confirm "
+                   "and trade), then undo by hand in the Kalshi UI what its CRITICAL names: "
+                   "close out a market the account did not hold before the run, and put one "
+                   "it did hold back to what it held.")
 _UNCLEAN_TAIL = " ended without a clean result ({why}). " + _CHECK_POSITIONS
 
 # The attention warning when the runs' records could not be read at all: it
@@ -1845,7 +1847,8 @@ def _trades_html(trades: list[dict]) -> str:
             # A trade that added to a held pair says how much was held there
             note = " ".join(part for part in (
                 t["error"] or "",
-                f"(adds to {t['adds_to_held']:g} held)" if (t["adds_to_held"] or 0) > 0 else "",
+                f"(adds to {count_text(t['adds_to_held'])} held)"
+                if (t["adds_to_held"] or 0) > 0 else "",
             ) if part)
             cells = (t["status"], t["pair_type"] or "—", _market_text(t["a"]),
                      _leg_text(t["a"]), _market_text(t["b"]), _leg_text(t["b"]),

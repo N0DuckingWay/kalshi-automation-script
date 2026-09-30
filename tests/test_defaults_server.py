@@ -2295,15 +2295,16 @@ class TestAttention:
             assert ("The last real-money run (<a href=\"/runs/aaaaaaaaaaaaaaaa\">run "
                     "aaaaaaaaaaaaaaaa</a> of 2026-09-29 16:05 UTC) ended needing manual "
                     "attention (exit 20).") in body
+            # After a disproof it names every way a new real-money run starts,
+            # in brackets after "stop trading"
+            assert ("stop trading (a new real-money run would open another wrong-side "
+                    "position, so stop the scheduler daemon if it is running, do not run "
+                    "main.py --mode prod, and do not press Confirm and trade)") in body
             # What to undo by hand is what the run's CRITICAL names: a market
             # the account held before the run goes back to what it held
-            assert ("stop trading and undo by hand in the Kalshi UI what its CRITICAL "
-                    "names — flatten a market the account did not hold before the run, "
-                    "and bring one it did hold back to what it held") in body
-            # After a disproof it names every way a new real-money run starts
-            assert ("a new real-money run would open another wrong-side position, so "
-                    "stop the scheduler daemon if it is running, do not run main.py "
-                    "--mode prod, and do not press Confirm and trade.") in body
+            assert ("then undo by hand in the Kalshi UI what its CRITICAL names: close "
+                    "out a market the account did not hold before the run, and put one "
+                    "it did hold back to what it held.") in body
             assert html.escape(defaults_server._ACK_LABEL) in body
 
     def test_an_exit_20_scheduled_run_raises_the_banner(self):
@@ -2318,12 +2319,12 @@ class TestAttention:
         assert notice.text == (
             "The last real-money run (the scheduled run of 2026-09-28 09:03, logged in "
             "kalshi_arb.log) ended needing manual attention (exit 20). Read its result "
-            "first. If it reports a V2 order-mapping disproof, stop trading and undo by hand "
-            "in the Kalshi UI what its CRITICAL names — flatten a market the account did not "
-            "hold before the run, and bring one it did hold back to what it held: a new "
+            "first. If it reports a V2 order-mapping disproof, stop trading (a new "
             "real-money run would open another wrong-side position, so stop the scheduler "
             "daemon if it is running, do not run main.py --mode prod, and do not press "
-            "Confirm and trade.")
+            "Confirm and trade), then undo by hand in the Kalshi UI what its CRITICAL "
+            "names: close out a market the account did not hold before the run, and put "
+            "one it did hold back to what it held.")
 
     def test_a_newer_clean_run_clears_it(self):
         later = "2099-06-01T00:00:00"

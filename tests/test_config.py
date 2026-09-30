@@ -2593,3 +2593,29 @@ class TestLiveSettingsChanges:
         # Defaults saved before the toggle read it as off; the seed proposes on
         rows = config.live_settings_changes(_SEED_ADD_ON_OFF, config.LIVE_DEFAULTS_SEED)
         assert [row for row in rows if row[3]] == [("add to held pairs", "off", "on", True)]
+
+
+class TestCountText:
+    """config.count_text writes a contract count or signed position exactly,
+    for every add-on marker and every alert that names what the account held
+    before a pair: never in %g's six significant digits."""
+
+    @pytest.mark.parametrize("value, text", [
+        (30.0, "30"), (-30.0, "-30"), (12.5, "12.5"), (0.01, "0.01"),
+        (1234567.0, "1234567"), (-1234567.0, "-1234567"), (-100000.5, "-100000.5"),
+        (12345.67, "12345.67"), (1e-6, "0.000001"), (0.0, "0"), (-0.0, "0"),
+        (1e-7, "0"), (-1e-7, "0"), (float("nan"), "nan"), (float("inf"), "inf"),
+        (float("-inf"), "-inf"),
+    ])
+    def test_it_writes_the_number(self, value, text):
+        """Pins the exact text for whole, fractional, large, tiny and
+        non-finite numbers, and that nothing reads "-0"."""
+        assert config.count_text(value) == text
+
+    def test_every_two_decimal_count_reads_back_as_itself(self):
+        """Pins that every count the exchange can send (a fixed-point string
+        with two decimals, as position_fp is) prints as a number that reads
+        back as the same float, however large: no count is ever rounded."""
+        for cents in (*range(-100_000, 100_001, 7), 123_456_789, -98_765_432_105):
+            value = float(f"{cents / 100:.2f}")
+            assert float(config.count_text(value)) == value, cents

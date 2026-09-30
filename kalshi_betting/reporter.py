@@ -24,7 +24,8 @@ Dependencies:
     for the run result) and pair_held (the held pair an add-on adds to, for
     the "adds to N held" marker) from scanner.py and TradeSpec from
     strategy.py.
-    Imports PROJECT_ROOT, create_new_output and the run result's constants
+    Imports PROJECT_ROOT, create_new_output, count_text (writes the held
+    count of an add-on exactly) and the run result's constants
     (LIVE_RUN_RESULT_FORMAT, RUN_REPORT_MAX_WARNINGS,
     RUN_REPORT_LINE_MAX_CHARS) from config.py. Exports the TradeResult
     dataclass (consumed by trader.py), the two public write functions, and
@@ -95,6 +96,7 @@ from .config import (
     PROJECT_ROOT,
     RUN_REPORT_LINE_MAX_CHARS,
     RUN_REPORT_MAX_WARNINGS,
+    count_text,
     create_new_output,
 )
 from .scanner import display_title, leg_prices, leg_sides, pair_held
@@ -259,7 +261,7 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
     fees = spec.total_cost_with_fees - spec.total_cost
     # Cross-module: a trade adding to a held pair names the count held a side
     held = pair_held(pair)
-    held_note = f" adds to {held.count:g} held" if held is not None else ""
+    held_note = f" adds to {count_text(held.count)} held" if held is not None else ""
     notes = (
         f"[{pair.pair_type}: {side_a.upper()} A / {side_b.upper()} B{nb_note}"
         f" fees=${fees:.2f}{held_note}] "

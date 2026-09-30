@@ -70,7 +70,8 @@ Dependencies:
     and LIVE_DEFAULTS_FROM_CONFIG, live_settings (the no-settings fallback),
     the describe_* helpers, live_rule_warnings, SIZE_CAP_STEP, and
     held_pair_fraction, the one definition of an add-on's size, which
-    _run_prod reads to leave out a held pair with no room left),
+    _run_prod reads to leave out a held pair with no room left, and
+    count_text, which writes an add-on's held count exactly),
     historical.py (load_series_categories, series_labels, infer_category —
     the dashboard's filing rule, which _filter_by_category shares),
     reporter.py (Excel output, and the run result: RunReport,
@@ -80,8 +81,8 @@ Dependencies:
     get_held_positions, resolve_held_ladders and held_pairs — the positions,
     their ladders and the exact held pairs a run may add to — leg_sides,
     the only source of truth for which side each leg buys, and pair_held,
-    which names the held pair a trade adds
-    to in the pairs table and the portfolio lines, and close_gap_bound_text,
+    which names the held pair a trade adds to in the pairs table, the
+    portfolio lines and the trade log's rescue dump, and close_gap_bound_text,
     which renders that close-gap bound in the same words the finders'
     refusal lines use),
     strategy.py (trade sizing and portfolio selection), trader.py (order
@@ -144,6 +145,7 @@ from .config import (
     LiveDefaultsError,
     LiveDefaultsMissing,
     LiveSettings,
+    count_text,
     describe_live_settings,
     describe_time_series_rule,
     describe_trade_filter,
@@ -289,7 +291,7 @@ def _print_portfolio(portfolio: list, label: str) -> None:
             spec.x, side_a.upper(), spec.y, side_b.upper(),
             spec.total_cost_with_fees, spec.min_payoff,
             spec.profit_ratio * 100,
-            f" — adds to {held.count:g} held" if held is not None else "",
+            f" — adds to {count_text(held.count)} held" if held is not None else "",
         )
 
 
@@ -525,7 +527,7 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
             # Cross-module: a trade adding to a held pair says how much is held
             held = pair_held(spec.pair)
             if held is not None:
-                trade_str += f" (adds to {held.count:g} held)"
+                trade_str += f" (adds to {count_text(held.count)} held)"
             profit_str  = f"${spec.min_payoff:.2f}"
             monthly_str = f"{spec.monthly_profit_ratio:.2%}/mo"
             kelly_str   = f"{spec.kelly_fraction:.1%} (p={spec.kelly_p:.2f})"
@@ -1302,17 +1304,21 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     except Exception as exc:
         logging.critical("Failed to write trade log: %s — rescue dump follows", exc)
         for r in results:
+            # Cross-module: an add-on's counts sit on top of what the pair
+            # already held, so its line names that held count too
+            held = pair_held(r.spec.pair)
             # Both counts are printed: x is market A's leg and y is market B's,
             # and for a time-series pair the NO leg (the one that gets unwound)
             # is market B's, so y is the count a human must reconcile first.
             logging.critical(
-                "  RESCUE | %s | %s | A=%s B=%s | x=%d y=%d cost=$%.2f incl. fees | %s",
+                "  RESCUE | %s | %s | A=%s B=%s | x=%d y=%d%s cost=$%.2f incl. fees | %s",
                 r.status,
                 r.spec.pair.canonical_title,
                 r.spec.pair.market_a.ticker,
                 r.spec.pair.market_b.ticker,
                 r.spec.x,
                 r.spec.y,
+                f" (adds to {count_text(held.count)} held)" if held is not None else "",
                 r.spec.total_cost_with_fees,
                 r.error or "",
             )
