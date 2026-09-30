@@ -39,7 +39,8 @@ Dependencies:
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap — whose
     spread_min and tier_floors keywords apply this module's bands and
-    tier-floors-off family — and time_series_profit_prob), the
+    tier-floors-off family — and time_series_profit_prob), kelly_budget
+    (the most one trade may spend, the same rule live sizing uses), the
     spread-band helpers
     time_series_spread_band and time_series_spread_too_wide (which
     _find_entry applies to time-series candidates; the first also validates
@@ -107,32 +108,27 @@ Dependencies:
     plus run_backtest() and run_backtest_sweep() (called by backtest.py).
 
 Notes:
-    The backtester uses a two-pass approach. A pair can pass the entry checks
-    on several Mondays (its qualifying Mondays). Pass 1 scores each of them
-    (prices, dates, Kelly fraction — no sizing) at the simulated interval
-    discount k. A time-series pair keeps every Monday whose Kelly fraction is
-    positive; a same-title pair keeps its first, and only the best same-title
-    pair per title group is kept (the live one-pair-per-group rule). Pass 1
-    then drops any time-series candidate whose ticker pair was also found as
-    a same-title candidate, as main._dedup_pairs does live. Pass 2 walks
-    entries in chronological order (within one date, ordered by the expected
-    return at entry; that never reads how the markets settled, though its
-    horizon ends at whichever leg actually closed last), maintains a running cash
-    balance — sizing every candidate of an entry date against that checkpoint's
-    opening balance, admitting them greedily against the running cash (mirroring
-    main._run_prod + strategy.select_portfolio) and releasing settlement receipts
-    on exit dates — and applies a greedy ticker-conflict filter
-    so each market ticker appears in at most one OPEN trade at a time (the ticker
-    is released on its trade's exit date, alongside the cash). This mirrors the
-    live bot's Kelly sizing against one per-run balance snapshot and its
-    one-active-position-per-ticker rule: get_held_tickers() reads positions with
-    count_filter="position", so a settled ticker leaves the blocked set live too.
-    Pass 2 trades each pair at most once; a time-series pair it cannot take
-    one Monday is tried again on its next passing Monday. Like the live run,
-    it holds at most one open time-series trade per ladder. A ladder is one
-    question asked at several deadlines: two markets are on one ladder when
-    they share an event or ask the same question once the dates are removed.
-    A market's ladders are free again on the day it pays out.
+    The backtester works in two passes. A pair can pass the entry checks on
+    several Mondays. Pass 1 scores each of them with the Kelly rule (the
+    formula that sets how much to bet) at the simulated interval discount k:
+    a time-series pair keeps every Monday with a positive Kelly fraction, a
+    same-title pair only its first, and only the best same-title pair per
+    title group survives. Pass 1 also drops a time-series candidate whose
+    tickers were found as a same-title pair, as the live run does.
+
+    Pass 2 walks the candidates in date order, best expected return first
+    within a date, with a running cash balance. Each trade bets a share of
+    that Monday's opening portfolio value (the cash after that day's pay-outs
+    plus every open trade at cost) but never spends more than the cash left
+    (config.kelly_budget, as live sizing does). A candidate the cash cannot
+    fully buy is shrunk to fit, and skipped if not one contract pair fits or
+    a win no longer pays after fees. A market is in at most one open trade at
+    a time (freed when that trade pays out), and at most one time-series
+    trade is open per ladder (one question at several deadlines; a market's
+    ladders are freed on the day it pays out). Each pair trades at most once;
+    a time-series pair that cannot be taken one Monday is tried again on its
+    next passing Monday. The live run values open positions at Kalshi's
+    price rather than at cost.
 
     The work is split at two boundaries. _prepare_candidates() is the half
     that depends on neither the backtest's time-series spread band nor the
@@ -313,6 +309,7 @@ from .config import (
     describe_time_series_rule,
     fee_leg_exact,
     fee_per_pair_approx,
+    kelly_budget,
     live_defaults,
     min_price_diff_for_gap,
     pair_size_cap,
@@ -410,22 +407,14 @@ SIZE_CAP_SWEEP: tuple[float, ...] = tuple(round(0.05 * i, 2) for i in range(1, 2
 
 def _validated_cap(value: Any, name: str) -> float:
     """
-    Validate one per-trade Kelly cap and return it as a builtin float.
+    Check one per-trade size cap and return it as a builtin float.
 
-    Shared by both cap resolvers. Any real number is accepted — a
-    numbers.Real, so numpy's float64/float32/int64 and a Fraction as well as
-    int and float — and returned as a builtin float. A cap outside (0, 1] is
-    refused: 0 sizes nothing, and above 1 means nothing because Kelly's f*
-    never exceeds 1 for k in [0, 1] (see SIZE_CAP_SWEEP); NaN fails that
-    range test too (every comparison is False). A bool (or numpy bool) is
-    refused although Python counts it as an int (True would silently read as
-    "no cap"), and so is anything that is not a numbers.Real, e.g. the string
-    "0.2" or a Decimal — each with a message naming the type rather than the
-    range, so a type bug is not reported as an out-of-range value. No
-    config.SIZE_CAP_STEP grid applies: a sweep simulates any cap in (0, 1].
+    The cap must be a real number in (0, 1] (numpy numbers included). NaN, a
+    bool and anything that is not a real-number type (e.g. a string or a
+    Decimal) are refused; a wrong type gets a message naming the type.
 
     Args:
-        value (Any): The cap, a fraction of the checkpoint's opening balance.
+        value (Any): The cap, the largest share of the portfolio value one trade may bet.
         name (str): The cap's name, for the error message.
 
     Returns:
@@ -446,23 +435,19 @@ def _validated_cap(value: Any, name: str) -> float:
 
 def _resolve_size_cap(size_cap: float | None) -> float:
     """
-    Resolve and validate the per-trade Kelly size cap one simulation sizes under.
+    Return the checked per-trade size cap one simulation sizes under.
 
-    None resolves this module's BUDGET_FRACTION at CALL time, never as a
-    def-time default, so a monkeypatch of backtester.BUDGET_FRACTION binds.
-    The result is held to _validated_cap's rule.
+    None reads this module's BUDGET_FRACTION when called, not when defined,
+    so a test that patches backtester.BUDGET_FRACTION takes effect.
 
     Args:
-        size_cap (float | None): The cap as a fraction of the checkpoint's
-            opening balance, in (0, 1]; None for config.BUDGET_FRACTION.
+        size_cap (float | None): The cap, a share in (0, 1]; None for BUDGET_FRACTION.
 
     Returns:
         float: The resolved cap, as a builtin float.
 
     Raises:
-        ValueError: If the resolved cap is a bool, not a numbers.Real, NaN,
-            or outside (0, 1] — a caller bug, raised before any entry is
-            scored.
+        ValueError: If the resolved cap is a bool, not a numbers.Real, NaN or outside (0, 1].
     """
     return _validated_cap(BUDGET_FRACTION if size_cap is None else size_cap, "size_cap")
 
@@ -667,10 +652,10 @@ class BacktestTrade:
             negative only in the loss cell. time_series: zero in both win cells
             and negative in the loss cell — there is no positive-slippage cell.
         holding_days (int): Calendar days between entry_date and exit_date. Always >= 1.
-        balance_at_entry (float): Simulated cash balance in dollars at the OPEN
-            of this trade's entry-date checkpoint — the base the Kelly budget
-            was sized against, shared by every trade entering that same date
-            (mirroring the single balance read at the top of a live run).
+        balance_at_entry (float): Portfolio value in dollars (cash plus open
+            trades at cost) at the start of the entry Monday, after that day's
+            pay-outs and before its trades. The Kelly share is taken of it; the
+            trade can cost less when the cash left was smaller.
         deadline_gap_days (int | None): Calendar days between the two legs'
             deadlines — their close_times for a cross-event pair, their two
             STATED deadlines for a same-event ladder (DR-73), which is also
@@ -733,7 +718,7 @@ class BacktestTrade:
     expected_payoff: float  # n * (1 - price_a - price_b) minus fees — same_title floor / time_series win-cell profit
     slippage: float         # profit - expected_payoff
     holding_days: int
-    balance_at_entry: float  # checkpoint opening balance the Kelly budget used
+    balance_at_entry: float  # portfolio value on the entry Monday (cash + open trades at cost)
     # Calendar days between the two legs' deadlines — their close_times for a
     # cross-event pair, their two STATED deadlines for a same-event ladder
     # (DR-73) — carried out of _find_entry rather than recomputed, so it is
@@ -882,19 +867,11 @@ class SweepPoint:
             point's entries, split at BacktestSweep.split_date, simulated
             alone from the initial balance. Set only on the "all" and
             "time_series" points of a band sweep; None everywhere else.
-        ex_top_event (tuple[str, float] | None): The concentration check:
-            (event ticker, total return) — the event whose trades made the
-            largest summed profit on this point (by BacktestTrade.event_ticker,
-            ignoring trades with no event ticker, ties to the alphabetically
-            first) and the return of ONE re-simulation of this point's entries
-            without every pair whose market A belongs to that event on any of
-            its qualifying Mondays (see _ex_top_event). A
-            re-simulation, never a subtraction of that event's P&L from this
-            point's return: the survivors are re-sized against the cash the
-            removed trades no longer consume, and a subtraction is not bounded
-            below by −100%. Set only on the "all" and "time_series" points of
-            a band sweep, and None there too when no trade names an event
-            (there is no event to drop).
+        ex_top_event (tuple[str, float] | None): (event ticker, total return):
+            the event whose trades made the most profit here, and the return
+            of a re-run of this point's entries without that event's pairs
+            (see _ex_top_event). Set only on a band sweep's "all" and
+            "time_series" points; None when no trade names an event.
         tier_floors (bool): False only for a tier-off sweep's points
             (BacktestSweep.tier_off_scenarios), whose entries were detected at
             the band floor alone with the deadline-gap tier floors not
@@ -5886,110 +5863,46 @@ def _simulate_at_discount(
     end_date: date | None = None,
 ) -> SweepPoint:
     """
-    Size, select and settle prepared entries at one interval discount.
+    Choose, size and settle trades from prepared entries at one interval
+    discount k (the share of the market's implied in-between chance the model
+    believes), and build the equity curve.
 
-    This is the half of the backtest that depends on k, the time-series
-    interval discount: the Kelly gate, the settlement-outcome and
-    cumulative-deadline-premise checks, the one-pair-per-group contest for
-    same-title pairs, the cross-type dedup, and the chronological
-    cash-constrained Pass 2 that produces the trades and the equity curve.
-    Same-title candidates are unaffected by k — they price on the fixed
-    co-resolution prior — but they still share the cash, the ticker-conflict
-    filter and the ladders with the time-series ones, so the whole selection
-    has to be replayed per discount rather than merely re-scored.
+    Scores each entry's Mondays with the Kelly rule (the formula that sets how
+    much to bet), drops pairs with no usable pay-out, then walks the Mondays
+    in date order. Each trade bets a share of that Monday's opening portfolio
+    value (cash plus open trades at cost) but never spends more than the cash
+    left; a trade the cash cannot fully buy is shrunk to fit. A time-series
+    pair that cannot be taken is tried again on its next passing Monday; a
+    same-title pair is not, and only the best one per title group is kept. At
+    most one time-series trade is open per ladder (one question at several
+    deadlines). The Kelly check runs before the pay-out checks, so keep that
+    order: the count of impossible pay-outs covers only pairs that passed it.
 
-    The Kelly gate runs before the pay-out checks, so the count of pairs
-    that paid out the impossible way (earlier YES, later NO) covers only
-    pairs that passed the gate, and depends on k. Keep that order.
-
-    A time-series pair becomes one candidate per Monday its Kelly fraction is
-    positive, and Pass 2 trades it on the first it can take (not blocked by
-    a busy ladder, short cash, a market in an open trade, or fees eating the
-    profit). A same-title pair keeps only its first passing Monday, is not
-    retried, and only the best one per title group survives.
-
-    Pass 2 holds at most one open time-series trade per ladder (see the
-    module Notes). A time-series candidate is skipped while an open trade of
-    either kind has a market on one of its markets' ladders; a same-title
-    trade holds ladders but is never skipped for them. A pair dropped for
-    how it paid out (no yes/no result, the impossible result, no pay-out
-    date) never holds a ladder, though a live run might have held it.
-
-    spread_band, population and tier_floors change NOTHING about the
-    simulation: the band and the tier floors have already acted by the time
-    entries reach here (inside _find_entry, through _entries_for_band), and
-    the population is whichever subset of entries the caller chose to hand
-    over. All three only label the log lines — so each of a band sweep's
-    thousands of simulations is distinguishable — and stamp the returned
-    point.
-
-    size_cap DOES change the simulation: every candidate is sized at
-    `min(config.pair_size_cap(pair_type, cap, SAME_TITLE_SIZE_CAP), kelly_f)`
-    (cap: the resolved size_cap). Pass 1b scores every entry before sizing, so
-    neither cap moves which Mondays pass the Kelly gate, the premise count or
-    peak_kelly_fraction — only trade sizes, and so which trades fit and when.
-    quiet sends this run's log lines to DEBUG, for the lazy size-cap runs.
+    spread_band, population and tier_floors only label the log lines and the
+    returned point. size_cap changes trade sizes, and so which trades find cash,
+    but never which Mondays pass the Kelly check or peak_kelly_fraction
+    (CapSweep relies on this).
 
     Args:
-        raw_entries (list[dict]): Prepared entries — _prepare_entries()
-            output, or (inside a sweep) one band's _entries_for_band() output
-            or a subset of it — one record per pair that produced an entry.
-        start_date (date): First trading date of the window; the equity curve
-            _build_equity_curve returns opens one row earlier than this.
-        initial_balance (float): Simulated starting cash balance in dollars.
-        k (float | None): Interval-discount override in [0, 1], handed to
-            config.time_series_profit_prob for every time-series candidate.
-            None (default) means "no override", which that helper resolves at
-            call time to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (config.py's
-            k, not necessarily the saved live defaults' k live sizing reads).
-        spread_band (tuple[float, float] | None): The spread band the entries
-            were detected under — a label, never applied here. None (default)
-            renders on the completion line as the resolved default band
-            (config.time_series_spread_band(None)) and is stamped as None.
-        population (str): Which entries these are, for the completion line
-            and the stamp: one of "all" (default), "time_series", "ladder",
-            "cross", "same_title", or the run labels "all/H1", "all/H2",
-            "all/ex-top", "time_series/H1", "time_series/H2" and
-            "time_series/ex-top" a band sweep gives its split-half and
-            excluding-top-event runs.
-        tier_floors (bool): Keyword-only. Whether the entries were detected
-            with the deadline-gap tier floors applied — a label, never
-            applied here. False (a tier-off sweep's simulations) appends
-            " with the tier floors off" to the band on the completion line, so
-            the two families never share a prefix, and " [tier floors off]"
-            to the premise-violation WARNING; True (default) adds nothing.
-        size_cap (float | None): Keyword-only. The per-trade Kelly cap for
-            every pair, in (0, 1] (1.0: no per-trade cap; a same-title
-            candidate still stays under SAME_TITLE_SIZE_CAP). None (default)
-            resolves this module's BUDGET_FRACTION at call time.
-            Any cap other than BUDGET_FRACTION is named on the completion
-            line (", cap 35%" / ", no cap" before the colon); the default
-            cap's line is byte-identical to the pre-cap one.
-        quiet (bool): Keyword-only. True logs this run's lines at DEBUG,
-            text unchanged. Default False.
-        end_date (date | None): Keyword-only. Handed to _build_equity_curve:
-            the last day of the equity curve. None (default) reads today
-            (UTC) at call time, as every eager simulation does; a lazy
-            size-cap run passes the day its eager point's curve ended, so
-            the caps of one population share one span even when a cell is
-            read after UTC midnight (CapSweep).
+        raw_entries (list[dict]): Prepared entries, one record per pair.
+        start_date (date): First trading date of the window.
+        initial_balance (float): Starting cash in dollars.
+        k (float | None): The interval discount, in [0, 1]; None means config.py's.
+        spread_band (tuple[float, float] | None): The band the entries were found under; a label.
+        population (str): Which entries these are (e.g. "all", "time_series"); a label.
+        tier_floors (bool): Keyword-only. Whether the tier floors were applied; a label.
+        size_cap (float | None): Keyword-only. Per-trade cap in (0, 1]; None for BUDGET_FRACTION.
+        quiet (bool): Keyword-only. True logs this run's lines at DEBUG.
+        end_date (date | None): Keyword-only. Last day of the equity curve; None for today (UTC).
 
     Returns:
-        SweepPoint: The trades (in entry-date order, empty if none entered) and
-            the daily equity curve produced at this discount, stamped with the
-            RESOLVED k — never None — the resolved spread_band (None when None
-            was passed), the population, tier_floors (False only when False
-            was passed), the resolved size_cap and the peak_kelly_fraction
-            (0.0 when no candidate passed the Kelly gate).
+        SweepPoint: The trades and daily equity curve, stamped with the resolved
+            k and size cap, the band, population, tier setting and the largest
+            Kelly fraction seen.
 
     Raises:
-        ValueError: If population is not one of the labels above (a typo would
-            otherwise mislabel a scenario silently), from
-            config.time_series_spread_band if spread_band is not a valid
-            band, or from _resolve_size_cap / _resolve_same_title_size_cap
-            for a bad cap — all checked before any entry is scored.
-        TypeError: From config.time_series_spread_band, for a band that is not
-            a pair of numbers.
+        ValueError: For an unknown population, a bad spread band or a bad size cap.
+        TypeError: For a spread band that is not a pair of numbers.
     """
     if population not in _SIMULATION_LABELS:
         raise ValueError(
@@ -6278,37 +6191,30 @@ def _simulate_at_discount(
     )
 
     # ── Pass 2: chronological cash-constrained greedy selection ───────────────
-    # Walk entries in date order, maintaining a running cash balance. Sizing
-    # mirrors main._run_prod exactly: every candidate on a given entry date
-    # (one Monday checkpoint = one live run) is Kelly-sized against that
-    # checkpoint's OPENING balance — the cash after that day's settlement
-    # receipts have returned, i.e. what verify_auth would report at the top
-    # of the run — and then admitted greedily, in the same order
-    # select_portfolio uses, only while its fee-inclusive cost still fits the
-    # RUNNING cash (select_portfolio's `total_cost_with_fees > available`).
-    # Sizing later same-day trades off the running cash instead (the old
-    # behaviour) made every trade after the first on a busy Monday smaller
-    # than live would make it. Settlement receipts return to cash on their
-    # exit dates. A ticker-conflict
-    # filter mirrors the live
-    # bot's rule precisely: at most one ACTIVE position per ticker. Live, that
-    # rule comes from scanner.get_held_tickers(), which queries positions with
-    # count_filter="position" — so a ticker leaves the held set once its market
-    # settles and may be entered again. The backtest therefore holds a ticker
-    # only until its trade's exit date, released below on the same schedule as
-    # the settlement receipts.
+    # Walk the candidates in date order with a running cash balance. Each date
+    # is one checkpoint (the Monday-morning moment trades are entered, like one
+    # live run). A candidate's budget is a share of the checkpoint's opening
+    # portfolio value (cash after that day's pay-outs plus open trades at
+    # cost), never more than the cash left (config.kelly_budget, as live). A
+    # candidate the cash cannot fully buy is shrunk to fit, and skipped if not
+    # one contract pair fits or a win no longer pays after fees.
     #
-    # The backtest never sells before pay-out, and holds at most one open
-    # time-series trade per ladder; a market's ladders are freed the day it
-    # pays out, with its cash.
+    # Unlike a live run, open trades count at cost rather than at Kalshi's
+    # price, no extra cash is held back for the orders' worst-case prices, and
+    # a shrunk trade is not re-checked for a positive expected value.
+    #
+    # As live, a market is in at most one open trade (freed when that trade
+    # pays out) and at most one time-series trade is open per ladder (freed
+    # the day each market pays out). Nothing is sold before it pays out.
     trades: list[BacktestTrade] = []
     active_tickers: set[str] = set()
     cash = initial_balance
-    # Opening balance of the checkpoint currently being walked — the Kelly
-    # base for every candidate entering on that date (see comment above).
+    # Portfolio value at the current checkpoint; each trade that day bets a share of it
     checkpoint_date: date | None = None
-    checkpoint_cash = cash
+    checkpoint_value = cash
     pending_exits: list[tuple[date, float]] = []  # (exit_date, settlement receipt)
+    # (exit_date, cost) of each open trade, counted in the portfolio value until it pays out
+    open_costs: list[tuple[date, float]] = []
     # (exit_date, ticker) for every leg of a still-open trade — the release
     # ledger for active_tickers, kept alongside pending_exits so cash and
     # ticker availability are always freed on exactly the same day.
@@ -6324,6 +6230,8 @@ def _simulate_at_discount(
         # Release settlement receipts from trades that exited on or before this entry
         cash += sum(amt for ed, amt in pending_exits if ed <= d)
         pending_exits = [(ed, amt) for ed, amt in pending_exits if ed > d]
+        # ...and stop counting their cost in the portfolio value
+        open_costs = [(ed, cost) for ed, cost in open_costs if ed > d]
         # Release the tickers of those same settled trades — the position is
         # closed, so (as live) the ticker is no longer blocked. Set difference
         # is safe because the conflict filter below guarantees a ticker is in
@@ -6350,11 +6258,9 @@ def _simulate_at_discount(
             ladders_until = still_held
 
         if d != checkpoint_date:
-            # First candidate of a new checkpoint: receipts for this date have
-            # just been returned above, so this is the balance a live run
-            # starting today would read and size everything against.
+            # New checkpoint: value the portfolio as cash plus open trades at cost
             checkpoint_date = d
-            checkpoint_cash = cash
+            checkpoint_value = cash + sum(cost for _ed, cost in open_costs)
 
         if c["pair_id"] in traded_pairs:
             continue
@@ -6375,31 +6281,28 @@ def _simulate_at_discount(
         # below is computed on these, never on the reporting-only quotes
         price_a, price_b = c["price_a"], c["price_b"]
 
-        # Kelly sizing against the checkpoint's opening balance (live:
-        # compute_trade(pair, balance_cents) with one balance for the run)
-        budget = checkpoint_cash * c["kelly_f_capped"]
+        # Budget: a share of the portfolio value, never more than the cash left (as live)
+        budget = kelly_budget(checkpoint_value, c["kelly_f_capped"], cash)
         n = int(budget / (price_a + price_b))
         if n < 1:
-            # Kelly budget can't afford one contract — live compute_trade skips too
+            # The budget can't buy one contract pair — skipped live too
             continue
 
-        # Mirror live compute_trade's shrink loop exactly (strategy.py): the
-        # budget above covers the CONTRACTS only, while the exact ceiling-rounded
-        # fees ride on top — so the raw n systematically overshoots the Kelly cap.
-        # Shrink until the fee-inclusive cost actually fits the Kelly budget.
-        # (No max_contracts analog here: the backtest has no orderbook depth to
-        # cap against, only candle closes.)
+        # Lower n until contracts plus exact fees fit the budget, as live compute_trade
+        # does; this is also what shrinks a trade to the cash left
         fee_a, fee_b = fee_leg_exact(n, price_a), fee_leg_exact(n, price_b)
         while n > 0 and n * (price_a + price_b) + fee_a + fee_b > budget:
             n -= 1
             fee_a, fee_b = fee_leg_exact(n, price_a), fee_leg_exact(n, price_b)
         if n < 1:
-            # Fees ate the entire Kelly budget — no contract count fits
+            # Fees ate the whole budget — no contract count fits
             continue
 
         total_cost = n * (price_a + price_b)
         # Exact ceiling-rounded taker fees for both legs, charged at entry
         fees = fee_a + fee_b
+        # Cash spent, summed in the fee loop's order so it equals what fitted the budget
+        invested = total_cost + fee_a + fee_b
         # Win-scenario NET profit after exact fees (same_title: the floor every
         # co-resolution outcome clears; time_series: the profit of either win
         # cell) — reject if the ceiling rounding ate the margin (mirrors live
@@ -6407,17 +6310,14 @@ def _simulate_at_discount(
         expected_payoff = n * (1.0 - price_a - price_b) - fees
         if expected_payoff <= 0:
             continue
-        # Greedy fit against the RUNNING cash — select_portfolio's admission
-        # rule; a spec that no longer fits is skipped, later cheaper ones may
-        # still be admitted.
-        if total_cost + fees > cash:
+        # Safety check only: a trade that fits the budget always fits the cash
+        if invested > cash:
             continue
 
         # Realized P&L from the settlement outcomes — n per leg whose market
         # resolved to the side bought (sides depend on the pair type)
         receipt      = _settlement_receipt(n, c["outcome_a"], c["outcome_b"], c["pair_type"])
         profit       = receipt - total_cost - fees
-        invested     = total_cost + fees
         profit_ratio = profit / invested if invested > 0 else 0.0
         # Normalize realized return to a 30-day equivalent (reporting only)
         monthly_profit_ratio = profit_ratio * 30.0 / c["holding_days"]
@@ -6460,7 +6360,7 @@ def _simulate_at_discount(
             expected_payoff=expected_payoff,
             slippage=slippage,
             holding_days=c["holding_days"],
-            balance_at_entry=checkpoint_cash,
+            balance_at_entry=checkpoint_value,
             deadline_gap_days=c["gap_days"],
             event_ticker=event_a,
             same_event_ladder=is_ladder,
@@ -6475,6 +6375,8 @@ def _simulate_at_discount(
         # Cash out the door: contracts plus fees; the receipt comes back at exit
         cash -= invested
         pending_exits.append((c["exit_date"], receipt))
+        # Counted in the portfolio value at cost until it pays out
+        open_costs.append((c["exit_date"], total_cost))
 
         # Mark both tickers as active so no OVERLAPPING pair is added later;
         # the release ledger frees them again on this trade's exit date.
@@ -6896,14 +6798,11 @@ def run_backtest(
          one-pair-per-group rule), then drop any time-series candidate whose
          ticker pair was also found as a same-title candidate (live
          main._dedup_pairs rule).                                  [simulate]
-      7. Walk entries chronologically with a running cash balance: Kelly-size
-         every candidate of an entry date against that checkpoint's opening
-         balance, admit it only while its fee-inclusive cost still fits the
-         running cash (mirroring main._run_prod + strategy.select_portfolio)
-         and, for a time-series pair, while no open trade holds a market on
-         its ladders; trade each pair at most once, a time-series pair on the
-         first of its passing Mondays it can take; and record actual P&L
-         from settlement outcomes.                                  [simulate]
+      7. Walk the entries in date order with a running cash balance: each
+         trade bets a share of that Monday's portfolio value (cash plus open
+         trades at cost) but spends at most the cash left, shrinking to fit;
+         at most one open time-series trade per ladder; each pair trades at
+         most once; record the actual profit or loss.               [simulate]
       8. Build an equity curve from the trade timeline.             [simulate]
 
     Args:
@@ -7179,54 +7078,28 @@ def _ex_top_event(
     """
     Measure how much of one scenario's result a single event carried.
 
-    Finds the event whose trades made the largest summed profit on the point
-    (by BacktestTrade.event_ticker — market A's event as traded — ignoring
-    trades with no event ticker, since an unknown event cannot be shown to be
-    one event; ties go to the alphabetically first ticker so the choice is
-    deterministic), then RE-SIMULATES the point's entries without every pair
-    whose market A belongs to that event on any of its qualifying Mondays (a
-    trade records market A of the Monday it entered on, and for a same-title
-    pair that can differ from Monday to Monday — DR-75), from the same
-    initial balance at the same k and band. A re-simulation rather than a
-    subtraction of that event's P&L: the remaining trades are re-sized against
-    the cash the removed ones no longer tie up, and a subtraction is not even
-    bounded below by −100%.
-
-    Checking every Monday can drop more than that event's trades: a
-    same-title pair that traded under another event but names this one on a
-    different Monday is dropped too, which can move the result either way.
-    The pairs left are still a subset of the point's, so CapSweep can still
-    reuse the result at every size cap at or above the point's peak Kelly
-    fraction.
-
-    The re-simulation runs at the point's own size cap (point.size_cap) and
-    the caller's tier_floors, forwarded through _sim_options — nothing extra
-    on the run's own cap with the tiers on, so the eager tier-on band sweep's
-    call is unchanged.
+    Finds the event whose trades made the most profit on the point (by market
+    A's event ticker, skipping trades without one; ties go to the
+    alphabetically first), then re-runs the simulation without every pair
+    whose market A is in that event on any of its qualifying Mondays, at the
+    same starting balance, k, band and size cap. It re-runs rather than
+    subtracting that event's profit, because the other trades would have been
+    sized differently without it.
 
     Args:
         point (SweepPoint): The scenario's "all" or "time_series" point.
         entries (list[dict]): The entries that point was simulated from.
         start_date (date): The backtest's start date.
-        initial_balance (float): The balance the re-simulation starts from.
-        band (tuple[float, float]): The scenario's resolved band (a label).
-        population (str): The point's population — "all" (default) or
-            "time_series" — naming the re-simulation "<population>/ex-top" on
-            its completion line.
-        tier_floors (bool): Keyword-only. The point's tier-floor setting (a
-            label, like band), handed to the re-simulation so a tier-off
-            point's ex-top run is named as a tier-off run.
-        quiet (bool): Keyword-only. Log the re-simulation's completion line
-            (and any premise WARNING) at DEBUG — the lazy size-cap runs.
-        end_date (date | None): Keyword-only. The day the re-simulation's
-            equity curve ends on (a lazy size-cap run pins its eager
-            point's); None (default) for today (UTC), forwarded only when
-            given.
+        initial_balance (float): The balance the re-run starts from.
+        band (tuple[float, float]): The scenario's band (a label).
+        population (str): The point's population, used to name the re-run's log line.
+        tier_floors (bool): Keyword-only. The point's tier-floor setting (a label).
+        quiet (bool): Keyword-only. Log the re-run's lines at DEBUG.
+        end_date (date | None): Keyword-only. Last day of the re-run's equity curve; None for today.
 
     Returns:
-        tuple[str, float] | None: (event ticker, total return without it).
-            None when no trade on the point names an event — there is no
-            event to drop, so no re-simulation runs.
+        tuple[str, float] | None: (event ticker, total return without it); None when no trade
+            names an event.
     """
     pnl_by_event: dict[str, float] = defaultdict(float)
     for t in point.trades:

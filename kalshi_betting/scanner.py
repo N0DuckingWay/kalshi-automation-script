@@ -167,6 +167,7 @@ from .config import (
     LiveSettings,
     describe_time_series_rule,
     fee_per_pair_approx,
+    kelly_budget,
     live_settings,
     live_time_series_floor,
     max_affordable_pairs,
@@ -588,8 +589,9 @@ def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
     if finest is not None:
         return finest
 
-    # Only reached on a malformed or non-covering band list; called once per
-    # order leg at build time, so a warning here cannot spam the log.
+    # Only reached when no readable band with a positive step covers this price.
+    # This runs for each order leg and each size the sizer tries, so one market
+    # can warn many times a run.
     logging.warning(
         "No usable tick band for %s at price %.4f (structure=%r) — falling back to $%s",
         getattr(market, "ticker", "<unknown>"), price_dollars, structure, DEFAULT_TICK_SIZE_DOLLARS,
@@ -4921,57 +4923,33 @@ def _levels_with_edge_after_fee(qualifying: list) -> list:
 
 
 def enrich_with_orderbook_prices(
-    client: Any, pairs: list, balance_cents: int, *,
-    settings: LiveSettings | None = None,
+    client: Any, pairs: list, portfolio_value_cents: int, *,
+    settings: LiveSettings | None = None, cash_cents: int | None = None,
 ) -> list:
     """
-    For each tradeable pair, fetch both order books, pair the NO leg's asks
-    with the YES leg's asks using a merge sweep (the legs' markets and sides
-    come from _leg_ask_levels), then filter to only contract pairs whose
-    combined LEG price meets the pair's gap threshold (see _pair_max_sum):
+    Check each pair against its live order books and price it at what the account could really pay.
 
-      same_title:  yes_price + no_price <= 1 - SAME_TITLE_MIN_PRICE_DIFF
-      time_series: yes_price + no_price <= 1 - the run's entry floor
-
-    The qualifying levels are then cut at the first with no edge after the fee
-    (_levels_with_edge_after_fee).
-
-    The two leg prices are replaced with weighted-average fill prices over the
-    contracts this account could actually BUY — not over the whole qualifying
-    book (#51). The averaged count is capped at config.max_affordable_pairs
-    over the best level's price sum at config.max_kelly_fraction(pair type,
-    settings), an upper bound on what strategy.compute_trade sizes under the
-    same settings, so the price written here is never below the traded one. The
-    qualifying levels themselves are kept on the pair (depth_levels) so
-    compute_trade can re-price at the exact n it settles on; max_contracts is
-    that capped count. nA and nB stay as scanned where they are not leg prices;
-    the reference quote comes from _reference_yes_ask.
-
-    A failing pair is marked tradeable=False; the time-series checks include a
-    later book with no YES ask (fail closed), a crossed one, and the spread rule.
+    For each tradeable pair, fetches both order books, matches the two legs'
+    asks level by level, keeps the levels whose combined price leaves the
+    required gap, and stops at the first level with no edge left after the fee.
+    The leg prices become the average fill price over the contracts this trade
+    could afford: at most what the largest possible Kelly share of the
+    portfolio value buys at the book's best price, and never more than the
+    cash. The kept levels are stored on the pair (depth_levels) so
+    compute_trade can price any count, and max_contracts is the number of
+    contracts the prices are for. A time-series pair also fails when the later
+    market shows no YES ask, its YES ask sits below its own YES bid, or the
+    spread rule refuses it. A pair that fails a check is marked tradeable=False.
 
     Args:
-        client (Any): Authenticated KalshiClient used to fetch each pair's
-            order books (cached per ticker across the whole call).
-        pairs (list): CandidatePair objects to enrich. A pair already marked
-            tradeable=False is passed through unchanged.
-        balance_cents (int): Account balance in integer cents — the real
-            per-shard sum in prod, the virtual --sandbox-balance in dev. Bounds
-            how much book depth is averaged into each pair's fill price.
-            Required rather than defaulted: both call sites already hold it,
-            and a default would silently restore whole-book pricing on a
-            real-money path with no signal that it had.
-        settings (LiveSettings | None): Keyword-only. The run's toggles (the
-            price-sum ceiling, the spread rule, the affordability bound). None
-            resolves config.live_settings() once (tests and direct calls only:
-            a live run hands the run's settings).
+        client (Any): Kalshi client used to fetch order books (each fetched once per call).
+        pairs (list): CandidatePairs; one already marked tradeable=False is passed through unchanged.
+        portfolio_value_cents (int): Cash plus open positions' value, in cents; required, as it limits how much of the book is averaged.
+        settings (LiveSettings | None): Keyword-only. The run's settings; None reads config.py's (tests only).
+        cash_cents (int | None): Keyword-only. The cash on hand in cents; None means it is all cash. Hand compute_trade the same value.
 
     Returns:
-        list: One CandidatePair per input pair, in the same order, with the
-            leg prices (nA/pB for same_title, pA/nB for time_series), the
-            reference quote (pB for time_series, pA for same_title, refreshed
-            only when the reference book side had resting bids), tradeable,
-            max_contracts and depth_levels replaced by depth-validated values.
+        list: One CandidatePair per input, in order, with prices, tradeable, max_contracts and depth_levels set from the books.
     """
     # Resolved once, so every pair below is judged under one rule
     settings = live_settings() if settings is None else settings
@@ -5058,14 +5036,14 @@ def enrich_with_orderbook_prices(
         )
 
         total_qty = sum(qty for _, _, qty in qualifying)
-        # Bound the average at the most contracts any Kelly result could ever
-        # afford, rather than averaging the whole book. Levels ascend by
-        # combined price, so the largest capped fraction over the BEST level's
-        # sum (the cheapest any prefix average can be) bounds the n compute_trade
-        # sizes. The time-series bound, 1 - k, holds only through the checks below.
+        # Average only over the most contracts the largest possible Kelly share
+        # could buy at the book's best price (never more than the cash), not the
+        # whole book. For time-series pairs this limit holds only because of the
+        # checks below.
         best_a, best_b, _ = depth_levels[0]
         bound = max_kelly_fraction(pair.pair_type, settings)
-        affordable = max_affordable_pairs(balance_cents, best_a + best_b, bound)
+        affordable = max_affordable_pairs(portfolio_value_cents, best_a + best_b, bound,
+                                          cash_cents=cash_cents)
         cap = min(int(total_qty), affordable)
         fills = prefix_fill_prices(depth_levels, cap)
 
@@ -5078,16 +5056,21 @@ def enrich_with_orderbook_prices(
             # different fixes (add funds vs. the book is too thin), and the
             # binding one is whichever is smaller. A bound of 0 gets its own wording: only
             # a time-series 1 - k rounding to 0 (k = 1) makes one (no cap can be 0).
-            zero_bound = ""
+            why = ""
             if bound == 0 and pair.pair_type == "time_series":
-                zero_bound = (
+                why = (
                     f"; the per-trade bound is 0 (k = {settings.interval_discount:.2f}: "
                     "time-series Kelly cannot be positive)"
                 )
+            # If the cash, not the portfolio share, limited the budget, say so
+            if (affordable < 1 and cash_cents is not None
+                    and kelly_budget(portfolio_value_cents / 100.0, bound)
+                    > cash_cents / 100.0):
+                why += f"; the ${cash_cents / 100:.2f} of cash binds"
             logging.info(
                 "No affordable contract pairs for '%s' — %.2f contract(s) rest at "
                 "the gap and the budget affords %d%s; skipping",
-                pair.canonical_title, total_qty, affordable, zero_bound,
+                pair.canonical_title, total_qty, affordable, why,
             )
             enriched.append(dc_replace(pair, tradeable=False))
             continue

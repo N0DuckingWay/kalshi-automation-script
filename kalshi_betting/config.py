@@ -81,13 +81,11 @@ DEV_PEM_FILE = PROJECT_ROOT / "kalshi_demo_private_key.pem"
 
 # ── Trading parameters ────────────────────────────────────────────────────────
 
-# The per-trade Kelly cap for EVERY pair, as a fraction of the balance: a
-# multiple of SIZE_CAP_STEP from 5% to 100%, where 1.0 is no cap (f* <= p <= 1).
-# backtester binds it by value at import for its eager points, and
-# live_settings() reads it (see "Live trading toggles" below: a live run sizes
-# at the saved live defaults' size_cap instead). At 1.0, with this file's k and
-# SAME_TITLE_SIZE_CAP, one pair still stakes at most 20%: a time-series pair
-# under 1 - k (max_kelly_fraction), a same-title pair under SAME_TITLE_SIZE_CAP.
+# The largest share of the portfolio value (cash plus open positions) one trade
+# may stake, for every pair: a multiple of SIZE_CAP_STEP from 5% to 100%, where
+# 1.0 means no cap. The backtest sizes with it (backtester copies it at import);
+# a live run uses the saved live defaults' size_cap instead. At 1.0, with this
+# file's k and SAME_TITLE_SIZE_CAP, one pair still stakes at most 20%.
 BUDGET_FRACTION               = 1.0
 
 # An EXTRA per-trade cap on SAME-TITLE pairs, on the same grid: a same-title
@@ -304,8 +302,8 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #   product). Each loses its full stake in that cell. At the account's real
 #   balance ($64.44 at the 2026-09-25 prod dry run) the same snapshot selects
 #   6 trades deploying $63.84 — 99% of it — at a market-implied EV of -$19.58,
-#   leaving the cash under MIN_BALANCE_CENTS, so later runs exit 10 until those
-#   positions settle.
+#   leaving the cash under MIN_BALANCE_CENTS: later runs still scan (that
+#   minimum reads the portfolio value) but spend only the cash left.
 #
 #   Selection effect. The one-best-pair-per-group rule picks the LARGEST
 #   pB - pA in a group, and a stale quote is by definition one out of line
@@ -511,10 +509,9 @@ TRADE_TAGS: tuple[str, ...] | None = None
 # constant.
 SIZE_CAP_STEP = 0.05
 
-# The largest per-pair stake (max_kelly_fraction, a fraction of the balance)
-# live_rule_warnings accepts without a WARNING; this file's values and
-# LIVE_DEFAULTS_SEED stay within it. It bounds no trade and is not the per-trade
-# cap: it only decides when a live run is warned.
+# The largest share of the portfolio value one pair may stake before
+# live_rule_warnings warns. It limits no trade; this file's values and
+# LIVE_DEFAULTS_SEED stay within it.
 LIVE_EXPOSURE_WARN_FRACTION = 0.20
 
 # ── Saved live defaults ───────────────────────────────────────────────────────
@@ -640,8 +637,10 @@ DEFAULTS_SERVER_INDEX_RUNS = 10
 SAME_TITLE_LEG_SIDES  = ("no", "yes")
 TIME_SERIES_LEG_SIDES = ("yes", "no")
 
-# Minimum account balance in cents required to run the bot. Below $50 the bot
-# aborts to avoid wasting API calls when there is insufficient capital to trade.
+# The smallest portfolio value (cash plus open positions), in cents, a
+# production run needs. Below $50 the run stops before scanning
+# (EXIT_SKIPPED_LOW_BALANCE). Cash alone below $50 only draws a WARNING, and
+# the run goes on spending only the cash it has.
 MIN_BALANCE_CENTS             = 5000
 
 # Warn (never cap/drop) when a backtester pair-extraction group still has more
@@ -1215,6 +1214,8 @@ SCHEDULER_BLIND_MAX_RETRIES   = 4
 # main.py is NOT covered here: it still propagates and the interpreter exits
 # 1, same as always.
 EXIT_OK                       = 0
+# The portfolio value (cash plus open positions) was under MIN_BALANCE_CENTS,
+# so the run stopped before scanning.
 EXIT_SKIPPED_LOW_BALANCE      = 10
 EXIT_TRADES_NEED_ATTENTION    = 20
 # NOTHING was scanned this run. Two causes, both reported with this code
@@ -2054,50 +2055,76 @@ def fee_leg_exact(n: int, p: float) -> float:
     return math.ceil(round(TAKER_FEE_RATE * n * p * (1.0 - p) * 100, 6)) / 100
 
 
-def max_affordable_pairs(
-    balance_cents: int, price_sum: float, fraction: float | None = None,
-) -> int:
+def kelly_budget(bankroll: float, fraction: float, cash: float | None = None) -> float:
     """
-    Return the largest whole contract-pair count a fraction of the balance buys.
+    Return what one trade may spend: a share of the portfolio value, never more than the cash.
 
-    The single definition of the budget -> contracts step, called from both ends
-    of the sizing pipeline so the two can never drift:
-
-      * scanner.enrich_with_orderbook_prices() passes max_kelly_fraction and
-        the BEST qualifying level's price sum, to bound the depth it averages.
-      * strategy.compute_trade() passes the capped Kelly fraction and the actual
-        prefix-average price sum, to size the trade itself.
-
-    The scanner's call is therefore an UPPER BOUND on the sizer's: its fraction
-    is the largest the sizer can return under the same settings, and its price
-    sum the minimum any prefix average can reach (levels ascend).
-
-    Both live callers pass fraction, since None reads BUDGET_FRACTION rather
-    than the run's own per-trade cap. None is resolved at CALL time,
-    so a test that monkeypatches BUDGET_FRACTION still takes effect — the same
-    rule, for the same reason, as time_series_profit_prob's k.
+    The share is taken of the whole portfolio value (cash plus open positions),
+    but only cash buys contracts. This is the one place that rule is written;
+    live sizing and the backtest both use it. Pass dollars to get dollars, or
+    cents to get cents.
 
     Args:
-        balance_cents (int): Account balance in integer cents. Range: >= 0.
-        price_sum (float): Combined per-contract cost of the two legs, in
-            dollars. Range: (0, 2); a nonpositive value returns 0 rather than
-            raising, since it means the book carried no usable level.
-        fraction (float | None): Fraction of the balance to spend. None (the
-            default) reads BUDGET_FRACTION. Range: [0, 1].
+        bankroll (float): The portfolio value the share is taken of. >= 0.
+        fraction (float): The capped Kelly fraction, the share to spend. In [0, 1].
+        cash (float | None): The cash on hand; None means the bankroll is all cash.
 
     Returns:
-        int: Floor of (balance_dollars * fraction / price_sum). 0 when the
-            budget cannot afford a single contract pair, or when price_sum is
-            nonpositive.
+        float: bankroll * fraction, or the cash if that is smaller.
+    """
+    budget = bankroll * fraction
+    return budget if cash is None else min(budget, cash)
+
+
+def leg_cash_cents(cost_dollars: float) -> int:
+    """
+    Return the whole cents one order leg needs: its dollar cost rounded up to the cent.
+
+    Rounds up, never down, since an order a fraction of a cent short of cash is
+    rejected. Rounding to 6 decimals first stops float noise from adding a cent.
+    Shard funding and portfolio selection share this rounding, so they never
+    disagree by a cent.
+
+    Args:
+        cost_dollars (float): One leg's cost including fees, in dollars. >= 0.
+
+    Returns:
+        int: The smallest whole number of cents that covers it.
+    """
+    return math.ceil(round(cost_dollars * 100, 6))
+
+
+def max_affordable_pairs(
+    bankroll_cents: int, price_sum: float, fraction: float | None = None, *,
+    cash_cents: int | None = None,
+) -> int:
+    """
+    Return how many whole contract pairs one trade's budget can buy.
+
+    The budget is kelly_budget's: a share of the portfolio value, never more
+    than the cash. Enrichment calls this to cap how deep it prices a book, and
+    the sizer to size the trade, so the two never disagree; enrichment's count
+    is an upper bound on the sizer's when both get the same value and cash.
+    Live callers must pass fraction, since None reads BUDGET_FRACTION rather
+    than the run's own cap.
+
+    Args:
+        bankroll_cents (int): The portfolio value, in whole cents. >= 0.
+        price_sum (float): The two legs' combined price per contract pair, in dollars.
+        fraction (float | None): The share to spend; None reads BUDGET_FRACTION at call time.
+        cash_cents (int | None): Keyword-only. The cash on hand in cents; None means it is all cash.
+
+    Returns:
+        int: The contract pairs the budget buys; 0 if it buys none or price_sum is 0 or less.
     """
     f = BUDGET_FRACTION if fraction is None else fraction
     if price_sum <= 0:
         # A nonpositive sum means no usable level; "affords nothing" is the
         # right answer and keeps every caller free of a ZeroDivisionError guard
         return 0
-    # Same expression order as the sizing this replaced, so the float result is
-    # identical: dollars first, then the fraction, then the division.
-    return int((balance_cents / 100.0) * f / price_sum)
+    cash = None if cash_cents is None else cash_cents / 100.0
+    # The budget in dollars, divided by the price of one contract pair
+    return int(kelly_budget(bankroll_cents / 100.0, f, cash) / price_sum)
 
 
 # Why time_series_spread_refusal refused a spread (None: admitted). Compare
@@ -2266,14 +2293,11 @@ class LiveSettings:
 # The seven toggles by field name: every LiveSettings field except origin
 LIVE_TOGGLE_FIELDS = tuple(f.name for f in fields(LiveSettings) if f.compare)
 
-# The live defaults `python3 -m kalshi_betting.defaults_server --seed` offers to
-# save, the starting values for a first save: tier floors off, spread band
-# 0-0.5, k 0.80, a 10% per-trade cap, any category or tag. One pair stakes at
-# most 10% of the balance: a time-series pair under the cap (1 - k is 0.20), a
-# same-title pair under the lower of the cap and the 20% same-title cap.
-# Nothing trades on it until it is confirmed on the confirmation page and
-# written to LIVE_DEFAULTS_FILE (save_live_defaults, with
-# LIVE_DEFAULTS_SEED_SOURCE).
+# The values `python3 -m kalshi_betting.defaults_server --seed` offers for a
+# first save of the live defaults: tier floors off, spread band 0-0.5, k 0.80,
+# a 10% per-trade cap, a 20% same-title cap and any category or tag. One pair
+# stakes at most 10% of the portfolio value. Nothing trades on them until they
+# are confirmed and saved to LIVE_DEFAULTS_FILE.
 LIVE_DEFAULTS_SEED = LiveSettings(
     tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.80,
     size_cap=0.10, same_title_size_cap=0.20, categories=None, tags=None)
@@ -2895,14 +2919,13 @@ def _band_text(spread_band: tuple[float, float]) -> str:
 
 def _percent_text(fraction: float) -> str:
     """
-    Render a fraction of the balance as a percentage, to six significant digits (%g).
+    Show a fraction as a percentage, to six significant digits.
 
     Args:
         fraction (float): A fraction in [0, 1].
 
     Returns:
-        str: e.g. "20%" or "24.9%"; a bound live_rule_warnings flags (above
-            the threshold by more than PRICE_EPSILON) never prints as the threshold.
+        str: e.g. "20%" or "24.9%"; a bound live_rule_warnings flags never prints as the threshold.
     """
     return f"{fraction * 100:g}%"
 
@@ -3135,8 +3158,9 @@ def live_rule_warnings(settings: LiveSettings) -> list[str]:
         bound = max_kelly_fraction(pair_type, settings)
         if bound > LIVE_EXPOSURE_WARN_FRACTION + PRICE_EPSILON:
             out.append(
-                f"one {label} pair may stake up to {_percent_text(bound)} of the balance, "
-                f"above the {_percent_text(LIVE_EXPOSURE_WARN_FRACTION)} this check accepts")
+                f"one {label} pair may stake up to {_percent_text(bound)} of the portfolio "
+                f"value, above the {_percent_text(LIVE_EXPOSURE_WARN_FRACTION)} this check "
+                "accepts")
     if max_kelly_fraction("time_series", settings) == 0:
         out.append(f"k = {settings.interval_discount!r}: time-series Kelly cannot be "
                    "positive, so no time-series trade can size")

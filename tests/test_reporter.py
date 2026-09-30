@@ -517,7 +517,7 @@ def _run_report(**changes) -> reporter.RunReport:
         "settings": "tier floors off | spread band 0-0.5",
         "defaults": "live_defaults.json, saved …",
         "message": "Submitted 1 of 1 order pair(s) successfully.",
-        "balance_before": 100.0, "balance_after": 99.5,
+        "balance_before": 100.0, "balance_after": 99.5, "portfolio_value_before": 180.25,
         "trades": [reporter.trade_record(make_result("R"))],
         "warnings": ["WARNING: Running in PRODUCTION mode — real money will be used!"],
     }
@@ -662,7 +662,7 @@ class TestWriteRunReport:
             "started_at": "2026-09-28T16:00:05Z", "finished_at": record["finished_at"],
             "exit_code": 20, "settings": report.settings, "defaults": report.defaults,
             "message": report.message, "balance_before": 100.0, "balance_after": 99.5,
-            "submission_started": False,
+            "portfolio_value_before": 180.25, "submission_started": False,
             "trades": [dataclasses.asdict(t) for t in report.trades],
             "warnings": report.warnings, "warnings_dropped": 0, "error": None,
         }
@@ -670,6 +670,17 @@ class TestWriteRunReport:
         assert record["trades"][0]["a"]["ticker"] == "TICK-A-R"
         # Only the result is left in its folder
         assert list(tmp_path.iterdir()) == [path]
+
+    def test_a_run_that_never_read_the_balance_records_no_portfolio_value(self, tmp_path):
+        # The field defaults to None, written as null, never as 0: a run that
+        # stopped before its balance read sized on nothing
+        path = tmp_path / "result.json"
+        report = reporter.RunReport(dry_run=True,
+                                    started_at=datetime(2026, 9, 28, 16, 0, 5, tzinfo=UTC))
+        reporter.write_run_report(path, report, 0)
+        record = _strict_json(path)
+        assert record["portfolio_value_before"] is None
+        assert record["balance_before"] is None
 
     def test_an_exception_is_written_as_no_exit_code(self, tmp_path):
         path = tmp_path / "result.json"

@@ -4,19 +4,16 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Handles all Excel output for the bot. In production mode, appends a run-
-    separator row followed by per-trade rows to a persistent trade_log.xlsx file
-    so the full trading history accumulates across runs. In dev/sandbox mode,
-    writes a fresh timestamped simulation file containing two sheets: one for
-    simulated trades and one for all candidate pairs discovered (tradeable or not).
-    All Excel formatting — column widths, color-coded status rows, number formats,
-    frozen header rows — is applied via openpyxl.
+    Writes the bot's Excel files. A production run adds a banner row and one
+    row per trade to the shared trade_log.xlsx, which keeps every run's history.
+    A dev run writes a new timestamped file with two sheets: the simulated
+    trades and every candidate pair found.
 
     It also writes the run result of a production run started with
     `main.py --result-file`: a RunReport that main.py fills in as the run goes
-    (its outcome, balances, whether it began sending orders, one TradeRecord
-    per pair and the run's WARNING-or-worse log lines, which RunReportHandler
-    copies in) and write_run_report writes as one JSON file when the run ends.
+    (its outcome, its cash before and after trading, the portfolio value it
+    sized on, whether it began sending orders, one record per pair and its
+    WARNING-or-worse log lines), saved as one JSON file when the run ends.
 
 Dependencies:
     Imports display_title, leg_sides (which side each leg buys, rendered
@@ -332,19 +329,17 @@ def _write_separator_row(
     *, run_note: str = "",
 ) -> None:
     """
-    Append a styled run-separator row summarizing this run's balance change.
+    Add one grey banner row for this run: its time, cash before and after, and trade count.
 
-    Shared by the normal prod-log append path and the lock-timeout fallback path
-    so both files carry the same run-summary banner; a non-empty run_note
-    follows one more "  |  " separator.
+    The shared trade log and the fallback file both use it; a non-empty run_note goes at the end.
 
     Args:
-        ws: The openpyxl Worksheet to append to.
-        run_ts (datetime): Timestamp of this run.
-        balance_before (float): Account balance in dollars before this run's trades.
-        balance_after (float): Account balance in dollars after this run's trades.
-        n_results (int): Number of trade results in this run, shown in the banner.
-        run_note (str): Keyword-only banner text; empty (default) adds nothing.
+        ws: The worksheet to add the row to.
+        run_ts (datetime): When this run happened.
+        balance_before (float): Cash on all shards together before this run's trades, in dollars.
+        balance_after (float): The same after this run's trades.
+        n_results (int): How many trade results this run has.
+        run_note (str): Keyword-only text for the end of the banner; empty adds nothing.
     """
     sep_row = ws.max_row + 1
     sep_cell = ws.cell(row=sep_row, column=1,
@@ -447,17 +442,18 @@ def _release_lock(lock_fh) -> None:
 def _append_locked(results: list, balance_before: float, balance_after: float, *,
                    run_note: str = "") -> Path:
     """
-    Load, append, and atomically save PROD_LOG_PATH. Must only be called while
-    holding the sidecar lock (see append_to_prod_log).
+    Add this run's rows to the shared trade log (creating it if needed) and save it.
+
+    Call it only while holding the log's lock (see append_to_prod_log).
 
     Args:
-        results (list): List of TradeResult objects from this run.
-        balance_before (float): Account balance in dollars before this run's trades.
-        balance_after (float): Account balance in dollars after this run's trades.
-        run_note (str): Keyword-only separator-row note; empty adds nothing.
+        results (list): This run's TradeResult objects.
+        balance_before (float): Cash on all shards together before this run's trades, in dollars.
+        balance_after (float): The same after this run's trades.
+        run_note (str): Keyword-only note for the banner row; empty adds nothing.
 
     Returns:
-        Path: Absolute path to the trade log file (PROD_LOG_PATH).
+        Path: The trade log's path (PROD_LOG_PATH).
     """
     if PROD_LOG_PATH.exists():
         wb = openpyxl.load_workbook(PROD_LOG_PATH)
@@ -490,25 +486,19 @@ def _append_locked(results: list, balance_before: float, balance_after: float, *
 def _write_fallback_log(results: list, balance_before: float, balance_after: float, *,
                         run_note: str = "") -> Path:
     """
-    Write this run's trade rows to a standalone timestamped file instead of the
-    shared trade_log.xlsx.
+    Write this run's rows to a new timestamped file instead of the shared trade log.
 
-    Called only when the sidecar lock could not be acquired within
-    _LOCK_TIMEOUT_SECONDS — guarantees this run's rows are never silently lost,
-    at the cost of splitting the trade history across an extra file the operator
-    must merge in by hand (or simply keep alongside the main log).
+    Used only when the shared log's lock could not be taken in time, so this run's
+    rows are never lost.
 
     Args:
-        results (list): List of TradeResult objects from this run.
-        balance_before (float): Account balance in dollars before this run's trades.
-        balance_after (float): Account balance in dollars after this run's trades.
-        run_note (str): Keyword-only separator-row note, as the shared log's.
+        results (list): This run's TradeResult objects.
+        balance_before (float): Cash on all shards together before this run's trades, in dollars.
+        balance_after (float): The same after this run's trades.
+        run_note (str): Keyword-only note for the banner row, as in the shared log.
 
     Returns:
-        Path: Absolute path to the fallback file actually created
-            (PROJECT_ROOT / "trade_log_YYYY-MM-DD_HHMMSS_ffffff.xlsx", with a
-            "-1", "-2", … stem suffix in the vanishingly rare case that exact
-            name is already taken — see config.create_new_output).
+        Path: The new file, trade_log_<date>_<time>.xlsx in the project folder.
     """
     run_ts = datetime.now(UTC).astimezone()
     # Microseconds keep two near-simultaneous fallbacks off the collision path at
@@ -541,31 +531,21 @@ def _write_fallback_log(results: list, balance_before: float, balance_after: flo
 def append_to_prod_log(results: list, balance_before: float, balance_after: float, *,
                        run_note: str = "") -> Path:
     """
-    Append executed trade results to the persistent production trade log Excel file.
+    Add this run's trades to the shared production trade log, trade_log.xlsx.
 
-    If the file does not yet exist, creates it with a styled dark-blue header row.
-    Each call appends a run-separator row (timestamp, balance change and any
-    run_note) followed by one data row per trade result, color-coded by
-    status. The file is designed to accumulate all runs over the life of the bot.
-
-    Concurrent callers (e.g. the scheduler and a manual run racing) are
-    coordinated via a sidecar advisory lock (PROD_LOG_PATH + ".lock") so a
-    load -> append -> save race can't silently clobber rows from another run,
-    and the save itself is atomic (tmp file + os.replace) so a crash mid-save
-    can't truncate the accumulated history. If the lock can't be acquired within
-    _LOCK_TIMEOUT_SECONDS, this run's rows are never dropped — they're written
-    to a separate timestamped fallback file instead (see _write_fallback_log).
+    Creates the file with a header row the first time. Each run adds a banner
+    row, then one colour-coded row per trade. A lock stops two runs writing at
+    once; if it cannot be taken in time, the rows go to a separate timestamped
+    file instead, so they are never lost.
 
     Args:
-        results (list): List of TradeResult objects from trader.execute_trades().
-            May be empty if no trades were executed this run.
-        balance_before (float): Account balance in dollars before this run's trades.
-        balance_after (float): Account balance in dollars after this run's trades.
-        run_note (str): Keyword-only separator-row note, on either path; "" adds nothing.
+        results (list): TradeResult objects from trader.execute_trades(); may be empty.
+        balance_before (float): Cash on all shards together before this run's trades, in dollars.
+        balance_after (float): The same after this run's trades.
+        run_note (str): Keyword-only note for the banner row; empty adds nothing.
 
     Returns:
-        Path: Absolute path to the file actually written — either PROD_LOG_PATH
-            on the normal path, or a standalone fallback file if the lock timed out.
+        Path: The file written: the shared log, or the fallback file if the lock timed out.
     """
     lock_fh = _acquire_lock(_LOCK_PATH)
     if lock_fh is None:
@@ -777,41 +757,27 @@ class TradeRecord:
 @dataclass
 class RunReport:
     """
-    What one production run did, for the program that started it.
+    What one production run did, saved as JSON for the program that started it.
 
-    main.py fills it in as the run goes when it is started with --result-file
-    (the defaults server passes that flag for every run it starts), and
-    writes it as JSON (write_run_report) in a finally once logging is set
-    up, so however the run ends from there. Nothing is written when main.py
-    stops before that — a usage error, which exits 2 with its reason on
-    stderr — or when a kill signal stops the process.
+    main.py fills it in as the run goes when started with --result-file, and
+    writes it when the run ends. Nothing is written if the run stops before
+    logging is set up (a usage error) or is killed.
 
     Attributes:
         dry_run (bool): True when no orders were sent.
         started_at (datetime): When the run started, in UTC.
-        settings (str): The run's settings in the "Live settings:" line's words.
+        settings (str): The run's settings, as the "Live settings:" line words them.
         defaults (str): Where the saved live defaults the run started from came from.
-        message (str): Why the run stopped without trading, or its closing
-            summary line, exactly as logged; "" until one is set.
-        balance_before (float | None): Cash across every shard before trading,
-            in dollars; None if the run stopped before reading it.
-        balance_after (float | None): The same after trading; None if the run
-            stopped before trading or the read after trading failed.
-        submission_started (bool): True from just before a run that is not a
-            dry run starts sending orders (trader.execute_trades). With no
-            trades recorded, it means the run stopped while sending, so orders
-            may have been placed that trades does not list.
-        trades (list[TradeRecord]): One per pair submitted or simulated, in
-            submission order. Filled in when trader.execute_trades returns, so
-            empty until then.
-        warnings (list[str]): Each WARNING, ERROR or CRITICAL line the run
-            logged while the report was attached ("LEVEL: text", first line
-            only), oldest first. Every ERROR and CRITICAL line is kept whole;
-            WARNING lines are cut at config.RUN_REPORT_LINE_MAX_CHARS
-            (ending in "…") and at most config.RUN_REPORT_MAX_WARNINGS of
-            them are kept.
-        warnings_dropped (int): How many WARNING lines were left out after
-            that many were kept.
+        message (str): The line the run stopped or finished on, exactly as logged; "" until set.
+        balance_before (float | None): Cash on all shards before trading, in dollars; None if not read.
+        balance_after (float | None): The same after trading; None if not read.
+        portfolio_value_before (float | None): Cash plus the open positions' value before trading,
+            in dollars (cash alone if that value was unreadable); None if not read.
+        submission_started (bool): True once a real-money run starts sending orders; with no
+            trades listed, some orders may still have gone out.
+        trades (list[TradeRecord]): One per pair sent or simulated, in order; filled in when trading ends.
+        warnings (list[str]): Each WARNING, ERROR or CRITICAL line logged, oldest first; long WARNINGs are cut.
+        warnings_dropped (int): How many WARNING lines were left out once the cap was reached.
         error (str | None): The exception that stopped the run, on one line.
     """
     dry_run: bool
@@ -821,6 +787,7 @@ class RunReport:
     message: str = ""
     balance_before: float | None = None
     balance_after: float | None = None
+    portfolio_value_before: float | None = None
     submission_started: bool = False
     trades: list[TradeRecord] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -1044,6 +1011,7 @@ def write_run_report(path: Path, report: RunReport, exit_code: int | None) -> No
             "exit_code": exit_code, "settings": report.settings, "defaults": report.defaults,
             "message": report.message, "balance_before": report.balance_before,
             "balance_after": report.balance_after,
+            "portfolio_value_before": report.portfolio_value_before,
             "submission_started": report.submission_started,
             "trades": [asdict(t) for t in report.trades],
             "warnings": list(report.warnings), "warnings_dropped": report.warnings_dropped,

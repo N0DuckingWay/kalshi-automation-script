@@ -64,9 +64,11 @@ Notes:
     generated from each request's own submitted count, so the tests don't
     depend on exact Kelly sizing.
 
-    verify_auth() returns dict[int, int] (exchange_index -> cents), never a
-    scalar — every mock of it here must return a dict, and _run_prod sizes on
-    sum(...) of it.
+    _run_prod reads the balance through main.read_account_balance, which
+    returns an auth.AccountBalance: each shard's cash (a dict, never a
+    scalar) and Kalshi's value of the open positions. Every stand-in for it
+    here returns one (_account builds it); _run_prod spends the cash summed
+    over the shards and sizes on that sum plus the positions' value.
 """
 import ast
 import dataclasses
@@ -89,6 +91,7 @@ from kalshi_betting import config, dashboard, historical, main, reporter, run_lo
 from kalshi_betting import scanner as scanner_mod
 from kalshi_betting import strategy as strategy_mod
 from kalshi_betting import trader as trader_mod
+from kalshi_betting.auth import AccountBalance
 from kalshi_betting.backtester import BacktestTrade
 from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
@@ -124,6 +127,26 @@ def make_pair(ticker_a: str, ticker_b: str, pair_type: str = "time_series"):
         market_b=SimpleNamespace(ticker=ticker_b),
         pair_type=pair_type,
     )
+
+
+def _account(cash_cents: int, positions_value_cents: int | None = 0) -> AccountBalance:
+    """
+    One balance read, as main.read_account_balance returns it.
+
+    The cash sits on the default shard. The positions value defaults to 0 (an
+    account that holds nothing), so the run's portfolio value is its cash and
+    no "no readable portfolio_value" WARNING is logged; pass None to model a
+    reply that carried no readable value.
+
+    Args:
+        cash_cents (int): The cash, in whole cents.
+        positions_value_cents (int | None): Kalshi's value of the open
+            positions, in whole cents; None when the reply had none.
+
+    Returns:
+        AccountBalance: The read.
+    """
+    return AccountBalance({DEFAULT_EXCHANGE_INDEX: cash_cents}, positions_value_cents)
 
 
 class TestTruncate:
@@ -178,22 +201,31 @@ class TestComputeTradeSpecs:
         settings = live_settings()
         seen = []
 
-        def fake_compute_trade(pair, balance_cents, *, settings):
+        def fake_compute_trade(pair, portfolio_value_cents, *, settings, cash_cents):
             # Only pair_ok produces a spec — pair_none has no edge (returns None)
-            seen.append(settings)
+            seen.append((settings, portfolio_value_cents, cash_cents))
             if pair is pair_ok:
                 return SimpleNamespace(pair=pair)
             return None
 
         monkeypatch.setattr(main, "compute_trade", fake_compute_trade)
 
-        specs = main._compute_trade_specs([pair_ok, pair_none], balance_cents=100_000,
-                                          settings=settings)
+        specs = main._compute_trade_specs([pair_ok, pair_none], 100_000, settings,
+                                          cash_cents=40_000)
 
         assert list(specs.keys()) == [id(pair_ok)]
         assert specs[id(pair_ok)].pair is pair_ok
-        # Every pair is sized under the ONE settings object the run handed in
-        assert len(seen) == 2 and all(s is settings for s in seen)
+        # Every pair is sized under the ONE settings object the run handed in,
+        # on the portfolio value, with the cash as the budget's ceiling
+        assert len(seen) == 2
+        assert all(s is settings and value == 100_000 and cash == 40_000
+                   for s, value, cash in seen)
+
+    def test_the_cash_is_required(self):
+        # No default: a caller that forgot it would size every trade as if
+        # the whole portfolio value were cash
+        with pytest.raises(TypeError):
+            main._compute_trade_specs([], 100_000, live_settings())
 
 
 class TestNoPairsMsg:
@@ -595,7 +627,7 @@ def _prod_until_the_balance_gate(monkeypatch, argv: list, caplog) -> int:
         seen = _main_with(
             monkeypatch, ["--mode", "prod", *argv],
             _run_prod=main._run_prod,
-            verify_auth=lambda client: {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1},
+            read_account_balance=lambda client: _account(MIN_BALANCE_CENTS - 1),
         )
     return seen["code"]
 
@@ -1186,10 +1218,14 @@ _TICK_PRICE_RANGES = [
 ]
 
 # Live-shape balance payload (2026-08-14 shard scoping): shard 0 holds
-# $250.00 and shard 1 holds $9,999.00 — sizing sums the BREAKDOWN
-# (1024900 cents = $10,249.00), deliberately != the $10,250.00 top-level
-# balance_dollars aggregate, so the replay proves the breakdown sum is what
-# Kelly sizing sees, not the top-level field.
+# $250.00 and shard 1 holds $9,999.00 of cash. The run's cash is the
+# BREAKDOWN's sum (1024900 cents = $10,249.00), deliberately != the
+# $10,250.00 top-level balance_dollars aggregate, so the replay proves the
+# breakdown sum is the cash the run spends, not the top-level field. Kelly
+# sizes on that cash plus portfolio_value, Kalshi's value of the open
+# positions — 0 here, as a live reply carries it, so the portfolio value is
+# the cash and the run takes the normal path; the reply without the field,
+# which sizes on the cash with a WARNING, has a test of its own.
 _LIVE_BALANCE_PAYLOAD = {
     "balance": 114,
     "balance_dollars": "10250.0000",
@@ -1197,13 +1233,16 @@ _LIVE_BALANCE_PAYLOAD = {
         {"exchange_index": 0, "balance": "250.0000"},
         {"exchange_index": 1, "balance": "9999.0000"},
     ],
+    "portfolio_value": 0,
 }
 
-# Same shape, but the breakdown SUM is below MIN_BALANCE_CENTS ($50 = 5000
-# cents): shard0 $5.00 + shard1 $3.00 = 800 cents. Under multi-shard
-# semantics an account with money parked on shard 1 must still be summed in
-# — it's the total across shards that must clear the floor, not any single
-# shard — so this fixture only aborts because the TOTAL is sub-minimum.
+# Same shape, but the portfolio value is below MIN_BALANCE_CENTS ($50 = 5000
+# cents): cash shard0 $5.00 + shard1 $3.00 = 800 cents, and no open
+# positions (portfolio_value 0). Cash on shard 1 is still summed in — the
+# gate reads the cash on every shard together plus the positions' value, never
+# one shard — so this fixture aborts only because that TOTAL is under the
+# minimum; the same cash beside enough positions scans (see
+# TestSizesOnPortfolioValue).
 _LOW_BALANCE_PAYLOAD = {
     "balance": 1,
     "balance_dollars": "8.0000",
@@ -1211,6 +1250,7 @@ _LOW_BALANCE_PAYLOAD = {
         {"exchange_index": 0, "balance": "5.0000"},
         {"exchange_index": 1, "balance": "3.0000"},
     ],
+    "portfolio_value": 0,
 }
 
 # Everything on shard 0, nothing on shard 1 — the collateral-transfer replays
@@ -1226,7 +1266,7 @@ _SHARD1_EMPTY_BALANCE = {
 }
 
 # What the account reads back AFTER a transfer settles — trader's settlement
-# poll re-reads the balance through auth.verify_auth, so this is how the
+# poll re-reads the balance through auth.read_shard_balances, so this is how the
 # replay proves the money landed before any order relies on it.
 _SHARD1_SETTLED_BALANCE = {
     "balance": 114,
@@ -2887,7 +2927,7 @@ class TestSavedLiveDefaults:
         with caplog.at_level(logging.INFO):
             out = _main_with(
                 monkeypatch, ["--mode", "prod"], _run_prod=prod_spy,
-                verify_auth=lambda client: {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1},
+                read_account_balance=lambda client: _account(MIN_BALANCE_CENTS - 1),
             )
         assert out["code"] == EXIT_SKIPPED_LOW_BALANCE
         # One read for the whole run, before logging, the client and the run mode
@@ -3206,11 +3246,11 @@ class TestPairsTableOutcomeColumns:
 
 
 class TestRunProdExitCodes:
-    @patch("kalshi_betting.main.verify_auth")
-    def test_low_balance_returns_skip_code(self, mock_verify_auth):
+    @patch("kalshi_betting.main.read_account_balance")
+    def test_low_balance_returns_skip_code(self, mock_read_balance):
         # Balance below MIN_BALANCE_CENTS must short-circuit before any scan —
         # the bare `return` this used to be silently exited 0.
-        mock_verify_auth.return_value = {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1}
+        mock_read_balance.return_value = _account(MIN_BALANCE_CENTS - 1)
         client = MagicMock()
 
         code = main._run_prod(client, _args())
@@ -3230,10 +3270,10 @@ class TestRunProdExitCodes:
     @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
     @patch("kalshi_betting.main.fetch_open_events_with_markets")
     @patch("kalshi_betting.main.get_held_tickers")
-    @patch("kalshi_betting.main.verify_auth")
+    @patch("kalshi_betting.main.read_account_balance")
     def test_manual_review_result_returns_attention_code(
         self,
-        mock_verify_auth,
+        mock_read_balance,
         mock_held,
         mock_fetch,
         mock_shard_statuses,
@@ -3247,12 +3287,9 @@ class TestRunProdExitCodes:
         mock_execute,
         mock_append_log,
     ):
-        # Two verify_auth calls: pre-trade balance, then post-trade balance
+        # Two balance reads: pre-trade balance, then post-trade balance
         # for the log's separator row.
-        mock_verify_auth.side_effect = [
-            {DEFAULT_EXCHANGE_INDEX: 100_000},
-            {DEFAULT_EXCHANGE_INDEX: 100_000},
-        ]
+        mock_read_balance.side_effect = [_account(100_000), _account(100_000)]
         mock_held.return_value = set()
         mock_fetch.return_value = _stub_ingest()
         mock_filter_horizon.side_effect = lambda markets, days: markets
@@ -3286,10 +3323,10 @@ class TestRunProdExitCodes:
     @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
     @patch("kalshi_betting.main.fetch_open_events_with_markets")
     @patch("kalshi_betting.main.get_held_tickers")
-    @patch("kalshi_betting.main.verify_auth")
+    @patch("kalshi_betting.main.read_account_balance")
     def test_a_disproof_with_the_rest_of_the_run_stopped_returns_attention_code(
         self,
-        mock_verify_auth,
+        mock_read_balance,
         mock_held,
         mock_fetch,
         mock_shard_statuses,
@@ -3308,10 +3345,7 @@ class TestRunProdExitCodes:
         # with status "failed" (nothing sent). The run still exits 20 through
         # the disproving pair's manual_review, and the undetermined-fill count
         # names only that one pair, not the pairs that sent nothing.
-        mock_verify_auth.side_effect = [
-            {DEFAULT_EXCHANGE_INDEX: 100_000},
-            {DEFAULT_EXCHANGE_INDEX: 100_000},
-        ]
+        mock_read_balance.side_effect = [_account(100_000), _account(100_000)]
         mock_held.return_value = set()
         mock_fetch.return_value = _stub_ingest()
         mock_filter_horizon.side_effect = lambda markets, days: markets
@@ -3355,10 +3389,10 @@ class TestRunProdExitCodes:
     @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
     @patch("kalshi_betting.main.fetch_open_events_with_markets")
     @patch("kalshi_betting.main.get_held_tickers")
-    @patch("kalshi_betting.main.verify_auth")
+    @patch("kalshi_betting.main.read_account_balance")
     def test_clean_dry_run_returns_ok_code(
         self,
-        mock_verify_auth,
+        mock_read_balance,
         mock_held,
         mock_fetch,
         mock_shard_statuses,
@@ -3372,10 +3406,7 @@ class TestRunProdExitCodes:
         mock_execute,
         mock_append_log,
     ):
-        mock_verify_auth.side_effect = [
-            {DEFAULT_EXCHANGE_INDEX: 100_000},
-            {DEFAULT_EXCHANGE_INDEX: 100_000},
-        ]
+        mock_read_balance.side_effect = [_account(100_000), _account(100_000)]
         mock_held.return_value = set()
         mock_fetch.return_value = _stub_ingest()
         mock_filter_horizon.side_effect = lambda markets, days: markets
@@ -3395,11 +3426,11 @@ class TestRunProdExitCodes:
         assert code == EXIT_OK
         assert code == 0
 
-    @patch("kalshi_betting.main.verify_auth")
-    def test_no_qualifying_pairs_returns_ok_code(self, mock_verify_auth):
+    @patch("kalshi_betting.main.read_account_balance")
+    def test_no_qualifying_pairs_returns_ok_code(self, mock_read_balance):
         # No-pairs / no-executable-trades paths must also resolve to EXIT_OK,
         # not just the low-balance and post-execution paths.
-        mock_verify_auth.return_value = {DEFAULT_EXCHANGE_INDEX: 100_000}
+        mock_read_balance.return_value = _account(100_000)
         with (
             patch("kalshi_betting.main.get_held_tickers", return_value=set()),
             patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
@@ -3428,8 +3459,8 @@ class TestRunProdTimeSeriesSkippedCode:
         return (exit code, the time-series finder's calls)."""
         spec = make_spec()
         ts_calls = []
-        monkeypatch.setattr(main, "verify_auth",
-                            lambda client: {DEFAULT_EXCHANGE_INDEX: 100_000})
+        monkeypatch.setattr(main, "read_account_balance",
+                            lambda client: _account(100_000))
         monkeypatch.setattr(main, "get_held_tickers", lambda client: {"HELD-X"})
         monkeypatch.setattr(main, "fetch_shard_statuses", lambda client: None)
         monkeypatch.setattr(main, "fetch_open_events_with_markets",
@@ -3442,10 +3473,11 @@ class TestRunProdTimeSeriesSkippedCode:
         monkeypatch.setattr(main, "find_same_title_pairs",
                             lambda markets, held: [spec.pair] if same_title else [])
         monkeypatch.setattr(main, "enrich_with_orderbook_prices",
-                            lambda client, pairs, balance, *, settings: pairs)
-        monkeypatch.setattr(main, "compute_trade", lambda pair, balance, *, settings: spec)
+                            lambda client, pairs, value, *, settings, cash_cents: pairs)
+        monkeypatch.setattr(main, "compute_trade",
+                            lambda pair, value, *, settings, cash_cents: spec)
         monkeypatch.setattr(main, "select_portfolio",
-                            lambda specs, balance, *, held_ladders: specs)
+                            lambda specs, cash, *, held_ladders: specs)
         monkeypatch.setattr(main, "pre_execution_check",
                             lambda client, portfolio, *, settings: portfolio)
         monkeypatch.setattr(main, "execute_trades", lambda client, portfolio, *, dry_run: [
@@ -3490,6 +3522,351 @@ class TestRunProdTimeSeriesSkippedCode:
         for ret in returns:
             assert isinstance(ret.value, ast.Name), ast.dump(ret)
             assert ret.value.id in {"clean_exit", "EXIT_TRADES_NEED_ATTENTION"}, ret.value.id
+
+
+class TestSizesOnPortfolioValue:
+    """
+    A production run sizes every Kelly fraction on the portfolio value — the
+    cash on every shard plus Kalshi's value of the open positions — and
+    spends only the cash: enrichment and compute_trade get both numbers,
+    select_portfolio gets the cash, the MIN_BALANCE_CENTS gate reads the
+    portfolio value, and the pairs table shows the size that trades, a spec
+    select_portfolio shrank included. A dev run spends its virtual balance as
+    both.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, caplog, account, *, dry_run=True, portfolio=None, report=None):
+        """
+        Run _run_prod with every request stubbed and one same-title-found pair.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): For the stubs.
+            caplog (pytest.LogCaptureFixture): Captures the run's log.
+            account (AccountBalance): What the one balance read before trading
+                returns. The read after trading returns the same cash beside a
+                different positions value, so a figure that wrongly added the
+                positions to the cash after trading would show.
+            dry_run (bool): Keyword-only. Run as --dry-run.
+            portfolio (Callable | None): Keyword-only. Maps select_portfolio's
+                specs to the portfolio it returns; None keeps them all.
+            report (RunReport | None): Keyword-only. The report to fill.
+
+        Returns:
+            tuple[int, dict]: The exit code, and what the stand-ins saw, by
+                name: "enrich" and "compute_trade" (the portfolio value and
+                cash each was handed), "select_portfolio" (the cash),
+                "trade_log" (append_to_prod_log's positional arguments) and
+                "held" (whether held tickers were read).
+        """
+        spec = make_spec()
+        seen: dict = {"held": False}
+
+        def held(client):
+            seen["held"] = True
+            return set()
+
+        def enrich(client, pairs, value, *, settings, cash_cents):
+            seen["enrich"] = (value, cash_cents)
+            return pairs
+
+        def sized(pair, value, *, settings, cash_cents):
+            seen["compute_trade"] = (value, cash_cents)
+            return spec
+
+        def select(specs, cash, *, held_ladders):
+            seen["select_portfolio"] = cash
+            return specs if portfolio is None else portfolio(specs)
+
+        def trade_log(*args, **kwargs):
+            seen["trade_log"] = args
+            return pathlib.Path("/fake/trade_log.xlsx")
+
+        reads = iter([account, _account(sum(account.shard_cash_cents.values()), 7_000)])
+        monkeypatch.setattr(main, "read_account_balance", lambda client: next(reads))
+        monkeypatch.setattr(main, "get_held_tickers", held)
+        monkeypatch.setattr(main, "fetch_shard_statuses", lambda client: None)
+        monkeypatch.setattr(main, "fetch_open_events_with_markets",
+                            lambda client, inactive_shards: _stub_ingest())
+        monkeypatch.setattr(main, "resolve_held_ladders",
+                            lambda client, markets, held: frozenset())
+        monkeypatch.setattr(main, "filter_markets_within_horizon", lambda m, d: m)
+        monkeypatch.setattr(main, "find_time_series_pairs", lambda *a, **k: [])
+        monkeypatch.setattr(main, "find_same_title_pairs", lambda markets, held: [spec.pair])
+        monkeypatch.setattr(main, "enrich_with_orderbook_prices", enrich)
+        monkeypatch.setattr(main, "compute_trade", sized)
+        monkeypatch.setattr(main, "select_portfolio", select)
+        monkeypatch.setattr(main, "pre_execution_check",
+                            lambda client, portfolio, *, settings: portfolio)
+        monkeypatch.setattr(main, "ensure_shard_collateral",
+                            lambda client, portfolio, balances, statuses, *, dry_run: portfolio)
+        monkeypatch.setattr(main, "execute_trades", lambda client, portfolio, *, dry_run: [
+            TradeResult(spec=s, status="simulated" if dry_run else "executed")
+            for s in portfolio])
+        monkeypatch.setattr(main, "append_to_prod_log", trade_log)
+        with caplog.at_level(logging.INFO):
+            code = main._run_prod(MagicMock(), _args(dry_run=dry_run), report=report)
+        return code, seen
+
+    @staticmethod
+    def _warnings(caplog) -> list:
+        """The run's WARNING lines, as logged."""
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+    @staticmethod
+    def _table_row(caplog) -> str:
+        """The pairs table's one data row: the table's lines carry cell separators."""
+        (row,) = [line for line in caplog.text.splitlines()
+                  if "\u2502" in line and "Market A" in line and "Type" not in line]
+        return row
+
+    def test_the_portfolio_value_is_the_cash_plus_the_open_positions(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert main._bankroll_cents(1_000, 10_000) == 11_000
+            assert main._bankroll_cents(1_000, 0) == 1_000
+        # A value that was read, zero included, draws no WARNING
+        assert not caplog.records
+
+    def test_an_unreadable_positions_value_sizes_on_the_cash_alone(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert main._bankroll_cents(1_000, None) == 1_000
+        assert [r.getMessage() for r in caplog.records] == [
+            "Kalshi's balance reply carried no readable portfolio_value — sizing on "
+            "cash alone ($10.00) this run, as if no position were held"]
+
+    def test_the_positions_carry_a_small_cash_balance_over_the_minimum(
+        self, monkeypatch, caplog,
+    ):
+        # Cash $10 is under the $50 minimum; with $100 of positions the
+        # portfolio value is $110, so the run scans, WARNS that only the cash
+        # is spent, and sizes on $110 while spending at most $10
+        report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
+        code, seen = self._run(monkeypatch, caplog, _account(1_000, 10_000), report=report)
+        assert code == EXIT_OK
+        assert seen["held"] is True
+        assert seen["enrich"] == (11_000, 1_000)
+        assert seen["compute_trade"] == (11_000, 1_000)
+        assert seen["select_portfolio"] == 1_000
+        assert ("Cash $10.00 is below the $50.00 minimum but the portfolio value is not: "
+                "the run goes on, and no trade spends more than the cash left"
+                ) in self._warnings(caplog)
+        assert ("Sizing on portfolio value $110.00 = cash $10.00 + open positions $100.00"
+                in caplog.text)
+        assert ("Kalshi Pair Scan — Portfolio value: $110.00 (cash $10.00) | Mode: PROD"
+                in caplog.text)
+        # The run result names both: the cash before, and what was sized on
+        assert report.balance_before == 10.0
+        assert report.portfolio_value_before == 110.0
+
+    def test_the_gate_reads_the_portfolio_value(self, monkeypatch, caplog):
+        # $10 of cash and $39.99 of positions: $49.99 in all, one cent short
+        report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
+        code, seen = self._run(monkeypatch, caplog, _account(1_000, 3_999), report=report)
+        assert code == EXIT_SKIPPED_LOW_BALANCE
+        # Stopped before any scan
+        assert seen["held"] is False and "enrich" not in seen
+        message = ("Portfolio value $49.99 (cash $10.00) is below minimum $50.00 "
+                   "— skipping run.")
+        assert message in self._warnings(caplog)
+        assert report.message == message
+        assert report.balance_before == 10.0
+        assert report.portfolio_value_before == 49.99
+        # The cash WARNING belongs to a run that goes on, and this one did not
+        assert not any(w.startswith("Cash $") for w in self._warnings(caplog))
+        # The sizing line is logged on every production run, a skipped one too
+        assert ("Sizing on portfolio value $49.99 = cash $10.00 + open positions $39.99"
+                in caplog.text)
+
+    def test_with_no_readable_positions_value_the_gate_reads_the_cash(
+        self, monkeypatch, caplog,
+    ):
+        # Kalshi's value of the positions could not be read: $10 of cash alone
+        # is under the minimum, so the run stops, saying why it sized on cash
+        code, seen = self._run(monkeypatch, caplog, _account(1_000, None))
+        assert code == EXIT_SKIPPED_LOW_BALANCE
+        assert seen["held"] is False
+        warnings = self._warnings(caplog)
+        assert any("no readable portfolio_value" in w for w in warnings)
+        assert ("Portfolio value $10.00 (cash $10.00) is below minimum $50.00 "
+                "— skipping run.") in warnings
+
+    def test_a_portfolio_value_of_exactly_the_minimum_is_traded(self, monkeypatch, caplog):
+        code, seen = self._run(monkeypatch, caplog, _account(MIN_BALANCE_CENTS - 1, 1))
+        assert code == EXIT_OK
+        assert seen["enrich"] == (MIN_BALANCE_CENTS, MIN_BALANCE_CENTS - 1)
+
+    def test_the_trade_log_and_the_run_result_balances_stay_on_cash(
+        self, monkeypatch, caplog,
+    ):
+        # The workbook's separator row and the run result's before and after
+        # figures are cash, as they always were; only sizing reads the
+        # portfolio value. Both reads carry open positions, so a figure that
+        # added them in, before or after trading, would not equal the cash
+        report = main.RunReport(dry_run=False, started_at=datetime.now(UTC))
+        code, seen = self._run(monkeypatch, caplog, _account(100_000, 50_000),
+                               dry_run=False, report=report)
+        assert code == EXIT_OK
+        assert seen["trade_log"][1:] == (1_000.0, 1_000.0)
+        assert report.balance_before == 1_000.0
+        assert report.balance_after == 1_000.0
+        assert report.portfolio_value_before == 1_500.0
+
+    def test_a_shrunk_spec_shows_in_the_pairs_table(self, monkeypatch, caplog):
+        # select_portfolio hands back a spec it shrank to fit the cash as a new,
+        # smaller spec; the table shows that size, not "—" and not the old one
+        def shrink(specs):
+            [spec] = specs
+            return [SimpleNamespace(**{**vars(spec), "x": 2, "y": 2})]
+
+        code, _ = self._run(monkeypatch, caplog, _account(100_000), portfolio=shrink)
+        assert code == EXIT_OK
+        row = self._table_row(caplog)
+        assert "2× YES(A) + 2× NO(B)" in row and "5×" not in row, row
+
+    def test_display_specs_matches_the_selected_spec_to_its_candidate_by_tickers(self):
+        candidate_1, candidate_2 = make_spec().pair, make_spec().pair
+        candidate_2.market_a.ticker, candidate_2.market_b.ticker = "TICK-C", "TICK-D"
+        # compute_trade returns a re-priced copy of each candidate, never the candidate
+        spec_1 = SimpleNamespace(pair=SimpleNamespace(**vars(candidate_1)), x=5)
+        spec_2 = SimpleNamespace(pair=SimpleNamespace(**vars(candidate_2)), x=7)
+        trade_specs = {id(candidate_1): spec_1, id(candidate_2): spec_2}
+        # Unshrunk: the very spec compute_trade returned, and only it
+        shown = main._display_specs(trade_specs, [spec_2])
+        assert list(shown) == [id(candidate_2)] and shown[id(candidate_2)] is spec_2
+        # Shrunk into a new object with the same two tickers: the new one shows
+        shrunk = SimpleNamespace(pair=SimpleNamespace(**vars(spec_1.pair)), x=2)
+        shown = main._display_specs(trade_specs, [shrunk, spec_2])
+        assert set(shown) == {id(candidate_1), id(candidate_2)}
+        assert shown[id(candidate_1)] is shrunk and shown[id(candidate_2)] is spec_2
+        # Nothing selected, nothing shown
+        assert main._display_specs(trade_specs, []) == {}
+
+    def test_a_live_shape_balance_with_a_portfolio_value_sizes_on_both(
+        self, monkeypatch, caplog,
+    ):
+        # The balance reply carries portfolio_value as Kalshi sends it: integer
+        # cents, the positions alone. $50.00 of positions beside $10,249.00 of
+        # cash (the breakdown's sum) is a $10,299.00 portfolio value
+        client = _live_shape_client(
+            monkeypatch, balance_payload={**_LIVE_BALANCE_PAYLOAD, "portfolio_value": 5_000})
+        monkeypatch.setattr(main, "append_to_prod_log",
+                            lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"))
+        seen: dict = {"enrich": [], "compute_trade": []}
+        real_enrich, real_compute = main.enrich_with_orderbook_prices, main.compute_trade
+
+        def enrich(client_, pairs, value, *, settings, cash_cents):
+            seen["enrich"].append((value, cash_cents))
+            return real_enrich(client_, pairs, value, settings=settings, cash_cents=cash_cents)
+
+        def sized(pair, value, *, settings, cash_cents):
+            seen["compute_trade"].append((value, cash_cents))
+            return real_compute(pair, value, settings=settings, cash_cents=cash_cents)
+
+        monkeypatch.setattr(main, "enrich_with_orderbook_prices", enrich)
+        monkeypatch.setattr(main, "compute_trade", sized)
+        report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
+        with caplog.at_level(logging.INFO):
+            code = main._run_prod(client, SimpleNamespace(dry_run=True, max_horizon_days=None),
+                                  report=report)
+        assert code == EXIT_OK
+        assert ("Sizing on portfolio value $10299.00 = cash $10249.00 + open positions $50.00"
+                in caplog.text)
+        assert "no readable portfolio_value" not in caplog.text
+        assert seen["enrich"] == [(1_029_900, 1_024_900)]
+        assert seen["compute_trade"]
+        assert set(seen["compute_trade"]) == {(1_029_900, 1_024_900)}
+        assert report.balance_before == 10_249.0
+        assert report.portfolio_value_before == 10_299.0
+        # The read after trading reports the cash, never the positions
+        assert report.balance_after == 10_249.0
+        assert report.trades and {t.status for t in report.trades} == {"simulated"}
+
+    def test_a_live_shape_balance_without_a_portfolio_value_sizes_on_cash(
+        self, monkeypatch, caplog,
+    ):
+        # The same reply with no portfolio_value: the run sizes on its cash,
+        # says so, and trades as it did before the positions were counted
+        payload = {key: value for key, value in _LIVE_BALANCE_PAYLOAD.items()
+                   if key != "portfolio_value"}
+        client = _live_shape_client(monkeypatch, balance_payload=payload)
+        monkeypatch.setattr(main, "append_to_prod_log",
+                            lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"))
+        report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
+        with caplog.at_level(logging.INFO):
+            code = main._run_prod(client, SimpleNamespace(dry_run=True, max_horizon_days=None),
+                                  report=report)
+        assert code == EXIT_OK
+        assert any("no readable portfolio_value" in r.getMessage()
+                   for r in caplog.records if r.levelno == logging.WARNING)
+        # The unread value is said to be unread, never printed as a measured $0.00
+        assert ("Sizing on portfolio value $10249.00 = cash $10249.00 + open positions "
+                "not read (counted as $0.00)" in caplog.text)
+        assert report.portfolio_value_before == report.balance_before == 10_249.0
+
+    def test_a_live_shape_account_short_of_cash_but_not_of_value_scans(
+        self, monkeypatch, caplog,
+    ):
+        # $8.00 of cash, under the minimum, beside $100.00 of positions
+        client = _live_shape_client(
+            monkeypatch, balance_payload={**_LOW_BALANCE_PAYLOAD, "portfolio_value": 10_000})
+        monkeypatch.setattr(main, "append_to_prod_log",
+                            lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"))
+        with caplog.at_level(logging.INFO):
+            code = main._run_prod(client, SimpleNamespace(dry_run=True, max_horizon_days=None))
+        assert code == EXIT_OK
+        assert "below minimum" not in caplog.text
+        assert ("Cash $8.00 is below the $50.00 minimum but the portfolio value is not"
+                in caplog.text)
+        client.get_events_without_preload_content.assert_called()
+        # No trade spends more than the cash: at most $8.00 in all, at the
+        # orders' limit prices
+        (portfolio_line,) = [r.getMessage() for r in caplog.records
+                             if r.getMessage().startswith("Portfolio: ")]
+        spent = float(portfolio_line.rsplit("up to $", 1)[1].split(" ", 1)[0])
+        assert spent <= 8.00, portfolio_line
+
+    def test_a_dev_run_spends_its_virtual_balance_as_cash(self, monkeypatch, caplog):
+        # Dev holds nothing: the virtual balance is both the portfolio value
+        # and the cash, for enrichment, the sizer and the portfolio walk
+        spec = make_spec()
+        seen: dict = {}
+
+        def enrich(client, pairs, value, *, settings, cash_cents):
+            seen["enrich"] = (value, cash_cents)
+            return pairs
+
+        def sized(pair, value, *, settings, cash_cents):
+            seen["compute_trade"] = (value, cash_cents)
+            return spec
+
+        def select(specs, cash, **kwargs):
+            seen["select_portfolio"] = (cash, kwargs)
+            return [SimpleNamespace(**{**vars(specs[0]), "x": 3, "y": 3})]
+
+        monkeypatch.setattr(main, "fetch_shard_statuses", lambda client: None)
+        monkeypatch.setattr(main, "fetch_open_events_with_markets",
+                            lambda client, inactive_shards: _stub_ingest())
+        monkeypatch.setattr(main, "filter_markets_within_horizon", lambda m, d: m)
+        monkeypatch.setattr(main, "find_time_series_pairs", lambda *a, **k: [])
+        monkeypatch.setattr(main, "find_same_title_pairs",
+                            lambda markets, held_tickers: [spec.pair])
+        monkeypatch.setattr(main, "enrich_with_orderbook_prices", enrich)
+        monkeypatch.setattr(main, "compute_trade", sized)
+        monkeypatch.setattr(main, "select_portfolio", select)
+        monkeypatch.setattr(main, "execute_trades", lambda client, portfolio, *, dry_run: [
+            TradeResult(spec=s, status="simulated") for s in portfolio])
+        monkeypatch.setattr(main, "write_dev_simulation", lambda *a, **k: pathlib.Path("/f"))
+        with caplog.at_level(logging.INFO):
+            code = main._run_dev(
+                MagicMock(), SimpleNamespace(sandbox_balance=1234.5, max_horizon_days=None))
+        assert code == EXIT_OK
+        assert seen["enrich"] == (123_450, 123_450)
+        assert seen["compute_trade"] == (123_450, 123_450)
+        # Dev holds nothing, so no held ladders are passed
+        assert seen["select_portfolio"] == (123_450, {})
+        # The shrunk spec is what the pairs table shows
+        row = self._table_row(caplog)
+        assert "3× YES(A) + 3× NO(B)" in row, row
 
 
 class TestBlindRunReason:
@@ -3562,8 +3939,8 @@ class TestBlindRunCensusEndToEnd:
         # all-halted disjunct cannot fire, so only the census catches it.
         with (
             patch(
-                "kalshi_betting.main.verify_auth",
-                return_value={DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS * 10},
+                "kalshi_betting.main.read_account_balance",
+                return_value=_account(MIN_BALANCE_CENTS * 10),
             ),
             patch("kalshi_betting.main.get_held_tickers", return_value=set()),
             patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
@@ -3664,13 +4041,13 @@ class TestMainEntryPoint:
 
         assert exc_info.value.code == EXIT_OK
 
-    @patch("kalshi_betting.main.verify_auth")
+    @patch("kalshi_betting.main.read_account_balance")
     @patch("kalshi_betting.main.build_client")
     def test_main_prod_mode_low_balance_exits_skip_code(
-        self, mock_build_client, mock_verify_auth, tmp_path, monkeypatch,
+        self, mock_build_client, mock_read_balance, tmp_path, monkeypatch,
     ):
         mock_build_client.return_value = MagicMock()
-        mock_verify_auth.return_value = {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1}
+        mock_read_balance.return_value = _account(MIN_BALANCE_CENTS - 1)
 
         monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--mode", "prod"])
@@ -3684,10 +4061,10 @@ class TestMainEntryPoint:
     @patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[])
     @patch("kalshi_betting.main.fetch_shard_statuses")
     @patch("kalshi_betting.main.get_held_tickers", return_value=set())
-    @patch("kalshi_betting.main.verify_auth")
+    @patch("kalshi_betting.main.read_account_balance")
     @patch("kalshi_betting.main.build_client")
     def test_main_prod_mode_blind_run_exits_no_tradeable_shards_code(
-        self, mock_build_client, mock_verify_auth, mock_held, mock_shard_statuses,
+        self, mock_build_client, mock_read_balance, mock_held, mock_shard_statuses,
         mock_fetch, tmp_path, monkeypatch,
     ):
         # _run_prod's exit-30 return is covered directly elsewhere, but nothing
@@ -3695,7 +4072,7 @@ class TestMainEntryPoint:
         # process code is the ONLY signal scheduler.run_job has that the weekly
         # slot went unscanned rather than merely finding no edge (TS-01).
         mock_build_client.return_value = MagicMock()
-        mock_verify_auth.return_value = {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS * 10}
+        mock_read_balance.return_value = _account(MIN_BALANCE_CENTS * 10)
         # Every advertised shard halted: ingest drops every market, so nothing
         # could be scanned this run.
         mock_shard_statuses.return_value = {
@@ -3924,7 +4301,7 @@ class TestResultFile:
             caplog (pytest.LogCaptureFixture): Captures the run's log lines.
             dry_run (bool): Pass --dry-run.
             status (str): The status execute_trades gives each pair.
-            **stubs: main's names to replace, e.g. verify_auth=...
+            **stubs: main's names to replace, e.g. read_account_balance=...
 
         Returns:
             tuple[dict, dict, list]: What _main_with saw, the parsed result
@@ -3932,12 +4309,11 @@ class TestResultFile:
         """
         spec = make_spec()
         path = tmp_path / "result.json"
-        balances = iter([{DEFAULT_EXCHANGE_INDEX: self._BEFORE},
-                         {DEFAULT_EXCHANGE_INDEX: self._AFTER}])
+        balances = iter([_account(self._BEFORE), _account(self._AFTER)])
         logged = []
         patches = {
             "_run_prod": main._run_prod,
-            "verify_auth": lambda client: next(balances),
+            "read_account_balance": lambda client: next(balances),
             "get_held_tickers": lambda client: set(),
             "fetch_shard_statuses": lambda client: None,
             "fetch_open_events_with_markets": lambda client, inactive_shards: _stub_ingest(),
@@ -3945,9 +4321,10 @@ class TestResultFile:
             "filter_markets_within_horizon": lambda markets, days: markets,
             "find_time_series_pairs": lambda *a, **k: [],
             "find_same_title_pairs": lambda markets, held: [spec.pair],
-            "enrich_with_orderbook_prices": lambda client, pairs, balance, *, settings: pairs,
-            "compute_trade": lambda pair, balance, *, settings: spec,
-            "select_portfolio": lambda specs, balance, *, held_ladders: specs,
+            "enrich_with_orderbook_prices":
+                lambda client, pairs, value, *, settings, cash_cents: pairs,
+            "compute_trade": lambda pair, value, *, settings, cash_cents: spec,
+            "select_portfolio": lambda specs, cash, *, held_ladders: specs,
             "pre_execution_check": lambda client, portfolio, *, settings: portfolio,
             "ensure_shard_collateral":
                 lambda client, portfolio, balances, statuses, *, dry_run: portfolio,
@@ -3997,7 +4374,8 @@ class TestResultFile:
         assert set(result) == {
             "format", "mode", "dry_run", "started_at", "finished_at", "exit_code",
             "settings", "defaults", "message", "balance_before", "balance_after",
-            "submission_started", "trades", "warnings", "warnings_dropped", "error"}
+            "portfolio_value_before", "submission_started", "trades", "warnings",
+            "warnings_dropped", "error"}
         assert result["format"] == config.LIVE_RUN_RESULT_FORMAT
         assert result["mode"] == "prod" and result["dry_run"] is False
         assert result["settings"] == describe_live_settings(saved, saved)
@@ -4006,23 +4384,39 @@ class TestResultFile:
             assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", result[key]), result[key]
         assert result["started_at"] <= result["finished_at"]
         assert result["error"] is None
+        # The portfolio value the run sized on: its cash, since it holds nothing
+        assert result["portfolio_value_before"] == self._BEFORE / 100
         # The result's exit code is the one main() exited with
         assert seen["code"] == result["exit_code"] == EXIT_OK
 
     def test_low_balance(self, monkeypatch, tmp_path, caplog):
         seen, result, records = self._run(
             monkeypatch, tmp_path, caplog,
-            verify_auth=lambda client: {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1})
+            read_account_balance=lambda client: _account(MIN_BALANCE_CENTS - 1))
         assert seen["code"] == result["exit_code"] == EXIT_SKIPPED_LOW_BALANCE
         assert result["message"] == (
-            f"Balance ${(MIN_BALANCE_CENTS - 1) / 100:.2f} is below minimum "
+            f"Portfolio value ${(MIN_BALANCE_CENTS - 1) / 100:.2f} (cash "
+            f"${(MIN_BALANCE_CENTS - 1) / 100:.2f}) is below minimum "
             f"${MIN_BALANCE_CENTS / 100:.2f} — skipping run.")
         self._logged_once(records, result["message"], logging.WARNING)
         assert result["trades"] == []
         assert result["balance_before"] == (MIN_BALANCE_CENTS - 1) / 100
+        assert result["portfolio_value_before"] == (MIN_BALANCE_CENTS - 1) / 100
         assert result["balance_after"] is None
         assert result["submission_started"] is False
         assert f"WARNING: {result['message']}" in result["warnings"]
+
+    def test_the_portfolio_value_names_the_open_positions(self, monkeypatch, tmp_path, caplog):
+        # With positions held, the result names the cash and, beside it, the
+        # cash plus Kalshi's value of the positions: what Kelly was sized on
+        reads = iter([_account(self._BEFORE, 25_000), _account(self._AFTER, 26_000)])
+        seen, result, _ = self._run(monkeypatch, tmp_path, caplog,
+                                    read_account_balance=lambda client: next(reads))
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        assert result["balance_before"] == self._BEFORE / 100
+        assert result["portfolio_value_before"] == (self._BEFORE + 25_000) / 100
+        # The balance after trading is the cash alone
+        assert result["balance_after"] == self._AFTER / 100
 
     def test_blind_run(self, monkeypatch, tmp_path, caplog):
         seen, result, records = self._run(
@@ -4048,7 +4442,7 @@ class TestResultFile:
     def test_empty_portfolio(self, monkeypatch, tmp_path, caplog):
         seen, result, records = self._run(
             monkeypatch, tmp_path, caplog,
-            select_portfolio=lambda specs, balance, *, held_ladders: [])
+            select_portfolio=lambda specs, cash, *, held_ladders: [])
         assert seen["code"] == result["exit_code"] == EXIT_OK
         assert result["message"] == "No executable trades found."
         self._logged_once(records, result["message"], logging.INFO)
@@ -4136,7 +4530,7 @@ class TestResultFile:
                                                               caplog):
         reads = []
 
-        def verify_auth(client):
+        def read_account_balance(client):
             """
             Read the balance once, then fail as a lost connection would.
 
@@ -4144,7 +4538,7 @@ class TestResultFile:
                 client: The run's client.
 
             Returns:
-                dict: The balance before trading, on the first read.
+                AccountBalance: The balance before trading, on the first read.
 
             Raises:
                 ConnectionError: On every later read.
@@ -4152,12 +4546,15 @@ class TestResultFile:
             reads.append(1)
             if len(reads) > 1:
                 raise ConnectionError("connection reset")
-            return {DEFAULT_EXCHANGE_INDEX: self._BEFORE}
+            # Open positions beside the cash, so a fallback to the portfolio
+            # value rather than the cash would show in the trade log
+            return _account(self._BEFORE, 25_000)
 
-        seen, result, _ = self._run(monkeypatch, tmp_path, caplog, verify_auth=verify_auth)
+        seen, result, _ = self._run(monkeypatch, tmp_path, caplog,
+                                    read_account_balance=read_account_balance)
         assert seen["code"] == result["exit_code"] == EXIT_OK
-        # The trade log falls back to the balance before trading; the result
-        # does not claim one it never read
+        # The trade log falls back to the cash before trading (never the
+        # portfolio value); the result does not claim a balance it never read
         assert seen["trade_log_calls"][0][1:] == (self._BEFORE / 100, self._BEFORE / 100)
         assert result["balance_before"] == self._BEFORE / 100
         assert result["balance_after"] is None
@@ -4767,8 +5164,8 @@ class TestDryRunInertInDev:
         with (
             patch("kalshi_betting.main.build_client", return_value=MagicMock()),
             patch(
-                "kalshi_betting.main.verify_auth",
-                return_value={DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1},
+                "kalshi_betting.main.read_account_balance",
+                return_value=_account(MIN_BALANCE_CENTS - 1),
             ),
         ):
             with pytest.raises(SystemExit):
@@ -4813,6 +5210,9 @@ class TestSandboxBalanceInertInProd:
         text = self._run(
             ["main", "--mode", "prod", "--sandbox-balance", "50"], caplog)
         assert "--sandbox-balance is inert in prod mode" in text
+        # It says what prod sizes on instead: the account's own portfolio value
+        assert ("prod sizes on the account's portfolio value (its cash plus its open "
+                "positions' value) and spends only its cash") in text
 
     def test_silent_when_not_passed_in_prod(self, caplog):
         text = self._run(["main", "--mode", "prod"], caplog)

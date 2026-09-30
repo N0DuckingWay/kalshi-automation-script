@@ -514,6 +514,7 @@ def _result(**changes) -> dict:
         "started_at": "2026-09-29T16:00:00Z", "finished_at": "2026-09-29T16:05:00Z",
         "exit_code": 0, "settings": "tier floors off", "defaults": "live_defaults.json",
         "message": "", "balance_before": 100.0, "balance_after": 100.0,
+        "portfolio_value_before": 100.0,
         "submission_started": False, "trades": [], "warnings": [], "warnings_dropped": 0,
         "error": None,
     }
@@ -2639,8 +2640,10 @@ class TestRunPage:
          "No trades to complete", "No time-series pair was searched"),
         (_result(exit_code=40, trades=[_trade("executed")]),
          "Trades completed", "No time-series pair was searched"),
-        (_result(exit_code=10, message="Balance $10.00 is below the minimum"),
-         "Not traded: the balance is below the minimum", "Balance $10.00 is below"),
+        (_result(exit_code=10, message="Portfolio value $10.00 (cash $10.00) is below minimum "
+                                       "$50.00 — skipping run."),
+         "Not traded: the portfolio value is below the minimum",
+         "Portfolio value $10.00 (cash $10.00) is below minimum"),
         (_result(exit_code=30, message="Every shard is closed"),
          "Not traded: nothing could be scanned (every exchange shard was closed, or no market "
          "was read)", "Every shard is closed"),
@@ -2698,6 +2701,43 @@ class TestRunPage:
         assert "<li>WARNING: one</li><li>CRITICAL: two</li>" in body
         assert "3 more warning lines were not kept." in body
         assert "Finished 2026-09-29 16:05:00 UTC, exit code 0." in body
+
+    def test_the_portfolio_value_kelly_sizes_on_is_shown_with_its_cash(self):
+        _disk_run(result=_result(balance_before=1000.5, balance_after=990.25,
+                                 portfolio_value_before=1850.75))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert "Portfolio value $1,850.75 (cash $1,000.50) — what Kelly sizes on" in body
+        # Beside the cash before and after, not in place of it
+        assert "Balance before $1,000.50 → after $990.25" in body
+
+    def test_a_skipped_run_still_shows_the_portfolio_value_it_gated_on(self):
+        # A run stopped by the minimum never reads the balance after trading,
+        # but it read the one it gated on; the line claims no sizing took place
+        _disk_run(result=_result(exit_code=10, balance_before=10.0, balance_after=None,
+                                 portfolio_value_before=40.0))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert "Portfolio value $40.00 (cash $10.00) — what Kelly sizes on" in body
+        assert "Sized on" not in body
+        assert "Balance before" not in body
+
+    @pytest.mark.parametrize("value", [None, "1850.75", True, float("nan")],
+                             ids=["null", "text", "bool", "nan"])
+    def test_a_portfolio_value_that_is_not_a_number_is_left_out(self, value):
+        # A result without the key (a run started before it existed) or with
+        # a damaged one shows no line rather than a wrong one
+        _disk_run(result=_result(portfolio_value_before=value))
+        body = _get(_app(), "/runs/0123456789abcdef").body
+        # The rest of the record is still read
+        assert self._headline(body) == "No trades to complete"
+        assert "what Kelly sizes on" not in body
+
+    def test_a_result_without_the_key_is_still_read(self):
+        record = _result()
+        del record["portfolio_value_before"]
+        _disk_run(result=record)
+        body = _get(_app(), "/runs/0123456789abcdef").body
+        assert self._headline(body) == "No trades to complete"
+        assert "what Kelly sizes on" not in body
 
     def test_one_balance_alone_is_not_shown(self):
         _disk_run(result=_result(balance_after=None))

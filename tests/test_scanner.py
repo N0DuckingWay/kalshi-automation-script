@@ -4307,12 +4307,13 @@ def _st_candidate(*, pA: float, pB: float, nA: float, nB: float = 0.70) -> Candi
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestEnrichmentBoundsDepthByAffordability:
-    """Enrichment must average only the depth this balance could actually buy.
+    """Enrichment must average only the depth this account could actually buy.
 
-    One pair is capped at BUDGET_FRACTION of the balance, so averaging a liquid
-    market's full book priced every pair against levels no single trade can
-    reach — inflating the fill price and killing pairs at the profitability gate
-    on contracts we would never have bought.
+    One pair's budget is its capped Kelly fraction of the portfolio value, never
+    more than the cash on hand, so averaging a liquid market's full book priced
+    every pair against levels no single trade can reach — inflating the fill
+    price and killing pairs at the profitability gate on contracts we would
+    never have bought.
 
     Worked under pre_toggle_defaults (tier floors on, a 20% cap); the shipped
     rule is pinned by test_config.py's TestShippedLiveToggles.
@@ -4393,6 +4394,51 @@ class TestEnrichmentBoundsDepthByAffordability:
                   if "No affordable contract pairs" in r.getMessage()]
         assert "0.40 contract(s) rest at the gap" in line, line
         assert "budget affords 0" not in line, line
+
+    def test_the_cash_bounds_the_depth_averaged(self):
+        # $1,000 x 20% = $200 would reach all 100 qualifying contracts, but
+        # $8.00 of cash buys only the 10 at the best 0.75 level — the same
+        # count a $40 portfolio value affords
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.45)
+        client = _ts_multilevel_client(self.LEVELS)
+        [enriched] = enrich_with_orderbook_prices(client, [pair], 100_000, cash_cents=800)
+        assert enriched.tradeable is True
+        assert enriched.max_contracts == 10
+        assert enriched.pA == pytest.approx(0.30)
+        assert enriched.nB == pytest.approx(0.45)
+        # Cash above the Kelly share changes nothing
+        [ample] = enrich_with_orderbook_prices(
+            _ts_multilevel_client(self.LEVELS), [pair], 100_000, cash_cents=1_000_000)
+        assert ample.max_contracts == self._enrich(100_000).max_contracts == 100
+
+    def test_the_unaffordable_line_says_when_the_cash_binds(self, caplog):
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.45)
+        with caplog.at_level(logging.INFO, logger=""):
+            [enriched] = enrich_with_orderbook_prices(
+                _ts_multilevel_client(self.LEVELS), [pair], 100_000, cash_cents=50)
+        assert enriched.tradeable is False
+        [line] = [r.getMessage() for r in caplog.records
+                  if "No affordable contract pairs" in r.getMessage()]
+        assert "budget affords 0; the $0.50 of cash binds" in line, line
+        # A budget the portfolio value's share limits says nothing about cash
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=""):
+            enrich_with_orderbook_prices(
+                _ts_multilevel_client(self.LEVELS), [pair], 100, cash_cents=1_000_000)
+        [line] = [r.getMessage() for r in caplog.records
+                  if "No affordable contract pairs" in r.getMessage()]
+        assert "cash binds" not in line, line
+        # Nor does a thin book, even when the cash is below the share: $100 of
+        # cash affords 133 pairs, and only the 0.4 contracts on the book stop it
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=""):
+            enrich_with_orderbook_prices(
+                _ts_multilevel_client([(0.30, 0.45, 0.4)]), [pair], 100_000_000,
+                cash_cents=10_000)
+        [line] = [r.getMessage() for r in caplog.records
+                  if "No affordable contract pairs" in r.getMessage()]
+        assert "budget affords 133" in line, line
+        assert "cash binds" not in line, line
 
     def test_max_contracts_is_what_the_written_price_covers(self):
         # The invariant compute_trade's depth clamp relies on: the price written

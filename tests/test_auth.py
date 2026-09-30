@@ -12,11 +12,18 @@ Purpose:
     live 2026-07+ responses, so it reads the raw body instead), the
     dollar-string -> floored-cents converter, the tiered fallback chain in
     _balance_cents_by_shard (full breakdown -> aggregate balance_dollars ->
-    legacy integer cents), and verify_auth end-to-end against a faked raw
-    response.
+    legacy integer cents), verify_auth end-to-end against a faked raw
+    response, and read_account_balance — the same one read returning each
+    shard's cash together with Kalshi's value of the open positions
+    (_positions_value_cents: integer cents, or a dollar string by presence,
+    None whenever the reply carries nothing readable or a value outside
+    0 to 2**53 cents).
 
 Dependencies:
-    Imports build_client, verify_auth, _balance_cents_by_shard and
+    Imports the kalshi_betting.auth and kalshi_betting._http modules
+    (build_client is called as auth.build_client; _http.time.sleep is
+    patched in the retry tests), the names verify_auth, read_account_balance,
+    AccountBalance, _balance_cents_by_shard, _positions_value_cents and
     _dollar_str_to_cents from kalshi_betting.auth, and DEFAULT_EXCHANGE_INDEX
     from kalshi_betting.config. Patches kalshi_betting.auth.SECRETS_FILE /
     PEM_FILE / DEV_PEM_FILE (module-level names, imported directly from
@@ -42,7 +49,15 @@ Notes:
     funds are now visible in the result, not excluded from it. Sizing is
     portfolio-wide and lives in main.py (sum(shard_balances.values())), which
     is exercised in test_main.py, not here.
+
+    The balance reply's top-level portfolio_value is integer cents and is the
+    open positions' value alone — it never includes cash. The two
+    HOLDING_PAYLOADS replies below, taken while positions were held, show it
+    sitting under the cash balance, which a figure that included cash could
+    not do; the pinned SDK's model describes it as "the current value of all
+    positions held".
 """
+import dataclasses
 import json
 import logging
 from types import SimpleNamespace
@@ -53,8 +68,11 @@ from kalshi_python_sync.exceptions import ApiException
 
 from kalshi_betting import _http, auth
 from kalshi_betting.auth import (
+    AccountBalance,
     _balance_cents_by_shard,
     _dollar_str_to_cents,
+    _positions_value_cents,
+    read_account_balance,
     verify_auth,
 )
 from kalshi_betting.config import DEFAULT_EXCHANGE_INDEX
@@ -505,3 +523,244 @@ class TestBalanceFieldChosenByPresence:
         assert _dollar_str_to_cents(0) == 0
         assert _dollar_str_to_cents(0.0) == 0
         assert _dollar_str_to_cents("") is None
+
+
+# The top-level fields of two live balance replies from this account while it
+# held open positions. Their balance_breakdown was left out when they were
+# printed, so here the cash comes from the balance_dollars aggregate on the
+# default shard. portfolio_value sits below the cash: it is the positions'
+# value alone.
+HOLDING_PAYLOADS = [
+    (
+        {"balance": 13245, "balance_dollars": "132.4521",
+         "portfolio_value": 7850, "updated_ts": 1790587734},
+        13245, 7850,
+    ),
+    (
+        {"balance": 11615, "balance_dollars": "116.1584",
+         "portfolio_value": 9527, "updated_ts": 1790613502},
+        11615, 9527,
+    ),
+]
+
+
+def _balance_client(payload: dict) -> MagicMock:
+    """
+    Build a client stand-in whose raw balance call answers `payload` with 200.
+
+    Args:
+        payload (dict): The JSON body the balance read returns.
+
+    Returns:
+        MagicMock: A client whose get_balance_without_preload_content returns
+            a raw 200 response carrying `payload`.
+    """
+    client = MagicMock()
+    client.get_balance_without_preload_content = MagicMock(
+        return_value=_raw_balance_response(payload)
+    )
+    return client
+
+
+class TestReadAccountBalance:
+    """read_account_balance: one retried GET /portfolio/balance that returns
+    each shard's cash and Kalshi's value of the open positions.
+
+    The value is meant to be added to the cash to get the amount trades are
+    sized on, so it must be read in the right unit (integer cents, or a
+    dollar string floored like every balance), must never be mistaken for a
+    cash figure, and must come back None — never 0, never an error, never a
+    slow conversion — when the reply carries nothing readable, so the caller
+    can fall back to cash alone.
+    verify_auth makes this same read and returns only the cash, so both keep
+    one log line and one request."""
+
+    def test_the_live_reply_gives_cash_by_shard_and_the_positions_value(self):
+        # The cash parse is unchanged; portfolio_value comes back as is, in cents
+        client = _balance_client(LIVE_PAYLOAD)
+        assert read_account_balance(client) == AccountBalance({0: 114, 1: 0}, 39796)
+
+    @pytest.mark.parametrize("payload, cash, positions", HOLDING_PAYLOADS)
+    def test_replies_holding_positions_read_the_value_as_sent(
+        self, payload, cash, positions,
+    ):
+        # The value sits below the cash, so it cannot include it: it is read
+        # as sent and never added to or taken from the cash
+        result = read_account_balance(_balance_client(payload))
+        assert result.shard_cash_cents == {DEFAULT_EXCHANGE_INDEX: cash}
+        assert result.positions_value_cents == positions
+        assert positions < cash
+
+    def test_one_get_on_the_raw_variant(self):
+        # The modeled get_balance deserializes through the SDK's strict model
+        client = _balance_client(LIVE_PAYLOAD)
+        read_account_balance(client)
+        client.get_balance_without_preload_content.assert_called_once()
+        client.get_balance.assert_not_called()
+
+    def test_the_auth_ok_line_is_unchanged_and_logged_once(self, caplog):
+        with caplog.at_level(logging.INFO):
+            read_account_balance(_balance_client(LIVE_PAYLOAD))
+        lines = [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith("Auth OK")]
+        assert lines == ["Auth OK — balance by shard: {0: 114, 1: 0} (total $1.14)"]
+
+    def test_verify_auth_is_the_same_read_returning_only_the_cash(self, caplog):
+        # One request and one "Auth OK" line, whichever function is called
+        client = _balance_client(LIVE_PAYLOAD)
+        with caplog.at_level(logging.INFO):
+            assert verify_auth(client) == {0: 114, 1: 0}
+        client.get_balance_without_preload_content.assert_called_once()
+        lines = [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith("Auth OK")]
+        assert lines == ["Auth OK — balance by shard: {0: 114, 1: 0} (total $1.14)"]
+
+    def test_verify_auth_returns_the_cash_of_read_account_balance(self, monkeypatch):
+        # One definition of the read: verify_auth hands back exactly the cash
+        # dict read_account_balance built, not a second parse of its own
+        cash = {0: 1, 3: 2}
+        monkeypatch.setattr(auth, "read_account_balance",
+                            lambda client: AccountBalance(cash, 5))
+        assert verify_auth(MagicMock()) is cash
+
+    def test_a_429_is_retried(self):
+        # A read-only GET: a transient 429 must not end the run before it scans
+        client = MagicMock()
+        client.get_balance_without_preload_content = MagicMock(
+            side_effect=[
+                balance_resp(429, {"error": "slow down"}),
+                balance_resp(200, LIVE_PAYLOAD),
+            ]
+        )
+        with patch.object(_http.time, "sleep") as sleep:
+            assert read_account_balance(client) == AccountBalance({0: 114, 1: 0}, 39796)
+        assert client.get_balance_without_preload_content.call_count == 2
+        sleep.assert_called_once_with(2.0)
+
+    def test_bad_credentials_raise(self):
+        client = MagicMock()
+        client.get_balance_without_preload_content = MagicMock(
+            return_value=_raw_balance_response({"error": "unauthorized"}, status=401)
+        )
+        with pytest.raises(ApiException):
+            read_account_balance(client)
+
+    def test_unparseable_cash_raises_whatever_the_positions_value(self):
+        # Sizing on an unknown cash balance is worse than stopping the run
+        client = _balance_client({"portfolio_value": 500, "nonsense": 1})
+        with pytest.raises(ValueError):
+            read_account_balance(client)
+
+    def test_an_unreadable_positions_value_does_not_fail_the_read(self, caplog):
+        # The cash parsed, so the read succeeds with no value and no WARNING:
+        # the caller decides what sizing on cash alone means
+        client = _balance_client({"balance": 100, "portfolio_value_dollars": "Infinity"})
+        with caplog.at_level(logging.INFO):
+            result = read_account_balance(client)
+        assert result == AccountBalance({DEFAULT_EXCHANGE_INDEX: 100}, None)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_the_result_is_frozen(self):
+        result = read_account_balance(_balance_client(LIVE_PAYLOAD))
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            result.positions_value_cents = 0
+
+    def test_integer_cents_are_read_as_is_and_zero_is_an_answer(self):
+        assert _positions_value_cents({"portfolio_value": 39796}) == 39796
+        # Nothing held reads 0, not None: a real answer, not a missing one
+        assert _positions_value_cents({"portfolio_value": 0}) == 0
+
+    @pytest.mark.parametrize("dollars, cents", [
+        ("78.5099", 7850),   # floored, never rounded up to 7851
+        ("0", 0),
+        ("0.0000", 0),
+        (0, 0),              # a falsy answer is still an answer
+        ("132.4521", 13245),
+    ])
+    def test_the_dollar_string_wins_by_presence(self, dollars, cents):
+        # The integer field beside it is ignored whenever the dollar key is present
+        payload = {"portfolio_value_dollars": dollars, "portfolio_value": 1}
+        assert _positions_value_cents(payload) == cents
+
+    @pytest.mark.parametrize("dollars", [
+        "", None, "garbage", "-1.00", "-0.01", True, False, "NaN", "sNaN",
+        "Infinity", "-Infinity", "1e999999", "-1e999999", float("inf"),
+        float("nan"), [7850], {"v": "78.50"},
+        "1e400", 1e308,            # finite, but beyond the bound
+        "1e999990",                # far beyond it: no million-digit integer is built
+        "90071992547409.93",       # one cent above 2**53 cents
+    ])
+    def test_an_unreadable_dollar_string_is_none_and_never_falls_back(self, dollars):
+        # Chosen by presence: an unreadable dollar value is no value, and the
+        # integer field is not consulted, so one reply's two spellings are
+        # never mixed; a non-finite, overflowing or out-of-range value, or
+        # one that is not a string or a plain number, raises nothing
+        payload = {"portfolio_value_dollars": dollars, "portfolio_value": 500}
+        assert _positions_value_cents(payload) is None
+
+    def test_the_bound_is_2_to_the_53_cents_on_both_spellings(self):
+        # Every whole number of cents up to 2**53 is exact in a float; the
+        # bound itself is accepted and one cent more is not
+        bound = 2 ** 53
+        assert _positions_value_cents({"portfolio_value": bound}) == bound
+        assert _positions_value_cents({"portfolio_value": bound + 1}) is None
+        assert _positions_value_cents({"portfolio_value": 10 ** 400}) is None
+        assert _positions_value_cents(
+            {"portfolio_value_dollars": "90071992547409.92"}) == bound
+        # Negative zero is zero, and a whole dollar amount spelled as a number reads
+        assert _positions_value_cents({"portfolio_value_dollars": "-0.00"}) == 0
+        assert _positions_value_cents({"portfolio_value_dollars": 78}) == 7800
+
+    @pytest.mark.parametrize("dollars", ["1e999990", "1e400", "-1e999999", "Infinity"])
+    def test_an_out_of_range_dollar_value_is_refused_before_any_conversion(
+        self, dollars, monkeypatch,
+    ):
+        # Converting "1e999990" to cents would build an integer of a million
+        # digits, which takes many seconds; the range check comes first, so
+        # the converter is never reached
+        def must_not_convert(value):
+            raise AssertionError(f"converted {value!r}")
+        monkeypatch.setattr(auth, "_dollar_str_to_cents", must_not_convert)
+        assert _positions_value_cents({"portfolio_value_dollars": dollars}) is None
+
+    def test_a_deeply_nested_dollar_value_is_never_turned_into_text(self):
+        # Turning a deeply nested list into text raises RecursionError; the
+        # reader refuses a list by its type first, so the value is None and the
+        # balance read around it still returns the cash
+        nested: list = []
+        for _ in range(100_000):
+            nested = [nested]
+        assert _positions_value_cents({"portfolio_value_dollars": nested}) is None
+        # The body is handed over already parsed: no JSON text can nest this deep
+        client = MagicMock()
+        with patch.object(auth, "fetch_json_page", return_value={
+            "balance": 100, "portfolio_value_dollars": nested,
+        }):
+            assert verify_auth(client) == {DEFAULT_EXCHANGE_INDEX: 100}
+            assert read_account_balance(client) == AccountBalance(
+                {DEFAULT_EXCHANGE_INDEX: 100}, None)
+
+    @pytest.mark.parametrize("body", [
+        {"balance": 100, "portfolio_value_dollars": "1e999990"},
+        {"balance": 100, "portfolio_value_dollars": "Infinity"},
+        {"balance": 100, "portfolio_value": 2 ** 60},   # a whole number past the bound
+    ])
+    def test_verify_auth_returns_the_cash_whatever_the_positions_value(self, body):
+        # verify_auth reads the positions value only to discard it, so no
+        # value in that field can fail or slow down the cash it returns
+        assert verify_auth(_balance_client(body)) == {DEFAULT_EXCHANGE_INDEX: 100}
+
+    @pytest.mark.parametrize("payload", [
+        {},
+        {"portfolio_value": None},
+        {"portfolio_value": "397.96"},   # a string where integer cents belong
+        {"portfolio_value": "7850"},
+        {"portfolio_value": 7850.0},
+        {"portfolio_value": True},       # an int subclass, not one cent
+        {"portfolio_value": False},
+        {"portfolio_value": -1},
+        {"portfolio_value": [7850]},
+        {"portfolio_value": {}},
+    ])
+    def test_an_unreadable_integer_field_is_none(self, payload):
+        assert _positions_value_cents(payload) is None
