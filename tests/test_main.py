@@ -64,9 +64,18 @@ Notes:
     generated from each request's own submitted count, so the tests don't
     depend on exact Kelly sizing.
 
-    verify_auth() returns dict[int, int] (exchange_index -> cents), never a
-    scalar — every mock of it here must return a dict, and _run_prod sizes on
-    sum(...) of it.
+    _run_prod reads the balance through main.read_account_balance, which
+    returns an auth.AccountBalance: each shard's cash (a dict, never a
+    scalar) and Kalshi's value of the open positions. Every stand-in for it
+    here returns one (_account builds it); _run_prod spends the cash summed
+    over the shards and sizes on that sum plus the positions' value.
+
+    That value counts only when the contracts held can back it: a contract
+    pays at most $1, so main._checked_positions_value refuses a larger value
+    and the run sizes on the cash alone (TestPositionsValueCheck). A test
+    whose balance carries a positions value above 0 therefore holds enough
+    contracts (_held_positions' count, or the positions rows of the
+    live-shape client).
 """
 import ast
 import dataclasses
@@ -74,6 +83,7 @@ import inspect
 import json
 import logging
 import logging.handlers
+import math
 import os
 import pathlib
 import re
@@ -89,6 +99,7 @@ from kalshi_betting import config, dashboard, historical, main, reporter, run_lo
 from kalshi_betting import scanner as scanner_mod
 from kalshi_betting import strategy as strategy_mod
 from kalshi_betting import trader as trader_mod
+from kalshi_betting.auth import AccountBalance
 from kalshi_betting.backtester import BacktestTrade
 from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
@@ -116,16 +127,20 @@ from kalshi_betting.reporter import TradeResult
 from .conftest import apply_pre_toggle_defaults, save_config_live_defaults
 
 
-def _held_positions(*tickers: str):
+def _held_positions(*tickers: str, count: float = 1.0):
     """
     Build a stand-in for scanner.get_held_positions that holds these tickers.
 
-    Each is held with one YES contract and no readable cost, and the listing
-    reads as complete (complete_out["complete"] is set True), as a real walk
-    that reached its last page does.
+    Each is held with `count` YES contracts (one by default) and no readable
+    cost, and the listing reads as complete (complete_out["complete"] is set
+    True), as a real walk that reached its last page does. A contract pays at
+    most $1, so a production run counts Kalshi's value of the open positions
+    only when the contracts held can back it (main._checked_positions_value):
+    a test whose balance carries a positions value holds enough of them.
 
     Args:
         *tickers (str): The tickers held.
+        count (float): Keyword-only. The YES contracts held on each.
 
     Returns:
         callable: (client, *, complete_out=None) -> {ticker: HeldPosition}.
@@ -133,7 +148,7 @@ def _held_positions(*tickers: str):
     def fake(client, *, complete_out=None):
         if complete_out is not None:
             complete_out["complete"] = True
-        return {t: scanner_mod.HeldPosition(t, 1.0, None, None) for t in tickers}
+        return {t: scanner_mod.HeldPosition(t, count, None, None) for t in tickers}
     return fake
 
 
@@ -145,6 +160,26 @@ def make_pair(ticker_a: str, ticker_b: str, pair_type: str = "time_series"):
         market_b=SimpleNamespace(ticker=ticker_b),
         pair_type=pair_type,
     )
+
+
+def _account(cash_cents: int, positions_value_cents: int | None = 0) -> AccountBalance:
+    """
+    One balance read, as main.read_account_balance returns it.
+
+    The cash sits on the default shard. The positions value defaults to 0 (an
+    account that holds nothing), so the run's portfolio value is its cash and
+    no "no readable portfolio_value" WARNING is logged; pass None to model a
+    reply that carried no readable value.
+
+    Args:
+        cash_cents (int): The cash, in whole cents.
+        positions_value_cents (int | None): Kalshi's value of the open
+            positions, in whole cents; None when the reply had none.
+
+    Returns:
+        AccountBalance: The read.
+    """
+    return AccountBalance({DEFAULT_EXCHANGE_INDEX: cash_cents}, positions_value_cents)
 
 
 class TestTruncate:
@@ -199,22 +234,31 @@ class TestComputeTradeSpecs:
         settings = live_settings()
         seen = []
 
-        def fake_compute_trade(pair, balance_cents, *, settings):
+        def fake_compute_trade(pair, portfolio_value_cents, *, settings, cash_cents):
             # Only pair_ok produces a spec — pair_none has no edge (returns None)
-            seen.append(settings)
+            seen.append((settings, portfolio_value_cents, cash_cents))
             if pair is pair_ok:
                 return SimpleNamespace(pair=pair)
             return None
 
         monkeypatch.setattr(main, "compute_trade", fake_compute_trade)
 
-        specs = main._compute_trade_specs([pair_ok, pair_none], balance_cents=100_000,
-                                          settings=settings)
+        specs = main._compute_trade_specs([pair_ok, pair_none], 100_000, settings,
+                                          cash_cents=40_000)
 
         assert list(specs.keys()) == [id(pair_ok)]
         assert specs[id(pair_ok)].pair is pair_ok
-        # Every pair is sized under the ONE settings object the run handed in
-        assert len(seen) == 2 and all(s is settings for s in seen)
+        # Every pair is sized under the ONE settings object the run handed in,
+        # on the portfolio value, with the cash as the budget's ceiling
+        assert len(seen) == 2
+        assert all(s is settings and value == 100_000 and cash == 40_000
+                   for s, value, cash in seen)
+
+    def test_the_cash_is_required(self):
+        # No default: a caller that forgot it would size every trade as if
+        # the whole portfolio value were cash
+        with pytest.raises(TypeError):
+            main._compute_trade_specs([], 100_000, live_settings())
 
 
 class TestNoPairsMsg:
@@ -634,7 +678,7 @@ def _prod_until_the_balance_gate(monkeypatch, argv: list, caplog) -> int:
         seen = _main_with(
             monkeypatch, ["--mode", "prod", *argv],
             _run_prod=main._run_prod,
-            verify_auth=lambda client: {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1},
+            read_account_balance=lambda client: _account(MIN_BALANCE_CENTS - 1),
         )
     return seen["code"]
 
@@ -1226,10 +1270,14 @@ _TICK_PRICE_RANGES = [
 ]
 
 # Live-shape balance payload (2026-08-14 shard scoping): shard 0 holds
-# $250.00 and shard 1 holds $9,999.00 — sizing sums the BREAKDOWN
-# (1024900 cents = $10,249.00), deliberately != the $10,250.00 top-level
-# balance_dollars aggregate, so the replay proves the breakdown sum is what
-# Kelly sizing sees, not the top-level field.
+# $250.00 and shard 1 holds $9,999.00 of cash. The run's cash is the
+# BREAKDOWN's sum (1024900 cents = $10,249.00), deliberately != the
+# $10,250.00 top-level balance_dollars aggregate, so the replay proves the
+# breakdown sum is the cash the run spends, not the top-level field. Kelly
+# sizes on that cash plus portfolio_value, Kalshi's value of the open
+# positions — 0 here, as a live reply carries it, so the portfolio value is
+# the cash and the run takes the normal path; the reply without the field,
+# which sizes on the cash with a WARNING, has a test of its own.
 _LIVE_BALANCE_PAYLOAD = {
     "balance": 114,
     "balance_dollars": "10250.0000",
@@ -1237,13 +1285,16 @@ _LIVE_BALANCE_PAYLOAD = {
         {"exchange_index": 0, "balance": "250.0000"},
         {"exchange_index": 1, "balance": "9999.0000"},
     ],
+    "portfolio_value": 0,
 }
 
-# Same shape, but the breakdown SUM is below MIN_BALANCE_CENTS ($50 = 5000
-# cents): shard0 $5.00 + shard1 $3.00 = 800 cents. Under multi-shard
-# semantics an account with money parked on shard 1 must still be summed in
-# — it's the total across shards that must clear the floor, not any single
-# shard — so this fixture only aborts because the TOTAL is sub-minimum.
+# Same shape, but the portfolio value is below MIN_BALANCE_CENTS ($50 = 5000
+# cents): cash shard0 $5.00 + shard1 $3.00 = 800 cents, and no open
+# positions (portfolio_value 0). Cash on shard 1 is still summed in — the
+# gate reads the cash on every shard together plus the positions' value, never
+# one shard — so this fixture aborts only because that TOTAL is under the
+# minimum; the same cash beside enough positions scans (see
+# TestSizesOnPortfolioValue).
 _LOW_BALANCE_PAYLOAD = {
     "balance": 1,
     "balance_dollars": "8.0000",
@@ -1251,6 +1302,7 @@ _LOW_BALANCE_PAYLOAD = {
         {"exchange_index": 0, "balance": "5.0000"},
         {"exchange_index": 1, "balance": "3.0000"},
     ],
+    "portfolio_value": 0,
 }
 
 # Everything on shard 0, nothing on shard 1 — the collateral-transfer replays
@@ -1266,7 +1318,7 @@ _SHARD1_EMPTY_BALANCE = {
 }
 
 # What the account reads back AFTER a transfer settles — trader's settlement
-# poll re-reads the balance through auth.verify_auth, so this is how the
+# poll re-reads the balance through auth.read_shard_balances, so this is how the
 # replay proves the money landed before any order relies on it.
 _SHARD1_SETTLED_BALANCE = {
     "balance": 114,
@@ -2932,7 +2984,7 @@ class TestSavedLiveDefaults:
         with caplog.at_level(logging.INFO):
             out = _main_with(
                 monkeypatch, ["--mode", "prod"], _run_prod=prod_spy,
-                verify_auth=lambda client: {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1},
+                read_account_balance=lambda client: _account(MIN_BALANCE_CENTS - 1),
             )
         assert out["code"] == EXIT_SKIPPED_LOW_BALANCE
         # One read for the whole run, before logging, the client and the run mode
@@ -3170,7 +3222,11 @@ class TestRunProdAddsToHeldPairs:
     whole position; off, a held market is refused exactly as before. Any
     listing or lookup it cannot trust means no add-on and one WARNING naming
     why; a held pair with no room even at the per-trade cap is left out, so
-    its group's other pair can still trade."""
+    its group's other pair can still trade. The whole position is the held
+    pair's stake (its worth at today's prices plus the fees paid for it) plus
+    the new stake, weighed against the portfolio value (the cash plus
+    Kalshi's value of the open positions), so a run that could not count that
+    value adds to nothing either."""
 
     @staticmethod
     def _dry_run(client, monkeypatch, caplog, *, add_on: bool,
@@ -3188,16 +3244,18 @@ class TestRunProdAddsToHeldPairs:
 
         Returns:
             tuple[list, dict]: The simulated results, and what the run handed
-                on: "held_pairs" (each call's positions), "ts" and "st" (the
+                on: "held_pairs" (each call's positions), "markets" (the
+                tickers of each call's market map), "ts" and "st" (the
                 add_on_pairs each finder was handed, per call).
         """
-        seen: dict = {"held_pairs": [], "ts": [], "st": []}
+        seen: dict = {"held_pairs": [], "markets": [], "ts": [], "st": []}
         real_held_pairs = main.held_pairs
         real_ts, real_st = main.find_time_series_pairs, main.find_same_title_pairs
 
-        def held_pairs_spy(positions, labels, cash_cents):
+        def held_pairs_spy(positions, labels, markets_by_ticker):
             seen["held_pairs"].append(dict(positions))
-            return real_held_pairs(positions, labels, cash_cents)
+            seen["markets"].append(set(markets_by_ticker))
+            return real_held_pairs(positions, labels, markets_by_ticker)
 
         def ts_spy(*args, add_on_pairs=None, **kwargs):
             seen["ts"].append(add_on_pairs)
@@ -3239,10 +3297,30 @@ class TestRunProdAddsToHeldPairs:
         return [r.getMessage() for r in caplog.records
                 if r.levelno == logging.WARNING and "adding to held pairs" in r.getMessage()]
 
-    def _client(self, monkeypatch, **kwargs):
-        """The live-shape client holding HELD-A and the TS pair (unless replaced)."""
+    def _client(self, monkeypatch, *, positions_value=2_250, **kwargs):
+        """
+        The live-shape client holding HELD-A and the TS pair (unless replaced).
+
+        Kalshi's value of the open positions defaults to $22.50, what they are
+        worth at the fixture's asks: 3 YES on HELD-A at 0.50, 30 YES on
+        TS-EARLY at 0.30 and 30 NO on TS-LATE at 0.40. The 63 contracts held
+        back it (a contract pays at most $1), so the run counts it and sizes
+        on the cash plus it.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
+            positions_value (int | None): Keyword-only. The balance reply's
+                portfolio_value, in cents; None leaves the field out.
+            **kwargs: More _live_shape_client arguments.
+
+        Returns:
+            MagicMock: The client.
+        """
         kwargs.setdefault("held_rows", _HELD_TS_PAIR)
-        return _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD,
+        payload = {**_LIVE_BALANCE_PAYLOAD, "portfolio_value": positions_value}
+        if positions_value is None:
+            del payload["portfolio_value"]
+        return _live_shape_client(monkeypatch, balance_payload=payload,
                                   include_time_series=True, **kwargs)
 
     def test_with_it_on_the_held_pair_is_added_to_on_its_whole_position(
@@ -3256,27 +3334,46 @@ class TestRunProdAddsToHeldPairs:
         assert held.sides == ((_TICKER_TS_EARLY, "yes"), (_TICKER_TS_LATE, "no"))
         assert held.count == 30.0
         assert held.cost_dollars == pytest.approx(21.95)
-        assert held.account_value_dollars == pytest.approx(10_270.0)
+        # Worth at today's prices: 30 YES at TS-EARLY's 0.30 ask, 30 NO at TS-LATE's 0.40
+        assert held.value_dollars == 30 * 0.30 + 30 * 0.40
+        # The stake counts the fees paid for the pair too ($0.45 + $0.50)
+        assert held.fees_dollars == pytest.approx(0.95)
+        assert held.stake_dollars == pytest.approx(21.95)
         assert add_on.spec.pair.market_b.ticker == _TICKER_TS_LATE
-        # Sized on the whole position: the add-on's fraction is held_pair_fraction's,
-        # the old and new stake together within the 20% cap of the account value,
-        # and the new stake no more than a new pair's
-        cash = 10_249.0
+        # The portfolio value: the cash plus Kalshi's value of the open positions
+        value, cash = 10_271.50, 10_249.0
+        assert ("Sizing on portfolio value $10271.50 = cash $10249.00 + open positions "
+                "$22.50") in caplog.text
+        # Sized on the whole position. The pair's own Kelly fraction at its
+        # prices (pA 0.30, pB 0.60, NO ask 0.40, k 0.75): p = 1 - 0.75 x 0.30 =
+        # 0.775 and b = 0.2685 / 0.7315 after the $0.0315 fee, so f* = 0.775 -
+        # 0.225 / b = 0.16201, under the 20% cap. The add-on takes f* less the
+        # stake's share of the portfolio value ($21.95 of $10,271.50), and its
+        # cost stays within that share (and the cash); the stake and the new
+        # cost together stay within 20% of the portfolio value
+        f_star = 0.775 - 0.225 * 0.7315 / 0.2685
+        assert add_on.spec.kelly_fraction == pytest.approx(f_star - 21.95 / value)
         assert add_on.spec.kelly_fraction <= 0.20
-        assert add_on.spec.total_cost_with_fees <= add_on.spec.kelly_fraction * cash + 0.02
-        assert held.cost_dollars + add_on.spec.total_cost_with_fees <= (
-            0.20 * held.account_value_dollars + 0.02)
+        assert add_on.spec.total_cost_with_fees <= config.kelly_budget(
+            value, add_on.spec.kelly_fraction, cash)
+        assert held.stake_dollars + add_on.spec.total_cost_with_fees <= 0.20 * value + 1e-9
+        # The book's 100 contracts a level bind, not the $1,642.15 budget: 100
+        # pairs at 0.30 + 0.40 plus $1.47 + $1.68 of fees
+        assert (add_on.spec.x, add_on.spec.y) == (100, 100)
+        assert add_on.spec.total_cost_with_fees == pytest.approx(73.15)
         # One held_pairs call over every held market, and both finders handed its pair
         assert [sorted(positions) for positions in seen["held_pairs"]] == [
             [_TICKER_HELD_A, _TICKER_TS_EARLY, _TICKER_TS_LATE]]
+        # ... valued from the whole market list, read before held markets are dropped
+        [markets] = seen["markets"]
+        assert {_TICKER_HELD_A, _TICKER_TS_EARLY, _TICKER_TS_LATE} <= markets
         key = frozenset((_TICKER_TS_EARLY, _TICKER_TS_LATE))
         assert [set(pairs) for pairs in seen["ts"]] == [{key}]
         assert seen["st"] == seen["ts"]
-        # The log names the account value, the held pair and the add-on
-        assert ("Account value for sizing held pairs: $10270.00 (cash $10249.00 + held "
-                "positions at cost $21.00)") in caplog.text
+        # The log names the held pair, its cost and fees, its worth at today's
+        # prices and the add-on
         assert ("Held pair to add to: YES TS-EARLY / NO TS-LATE, 30 contracts each, "
-                "cost $21.95") in caplog.text
+                "cost $21.95 (fees $0.95), worth $21.00 at today's prices") in caplog.text
         assert "Held pairs to add to: 1 (other held markets, never added to: 1)" in caplog.text
         assert "Time-series pairs that add to a held pair: 1" in caplog.text
         assert "adds to 30 held" in caplog.text
@@ -3291,7 +3388,7 @@ class TestRunProdAddsToHeldPairs:
         assert seen["ts"] == seen["st"] == [{}]
         for text in ("Account value for sizing held pairs", "Held pair",
                      "Time-series pairs that add to a held pair", "adds to",
-                     "Not adding to held pairs"):
+                     "Not adding to held pairs", "at today's prices"):
             assert text not in caplog.text, text
         # Both held markets were dropped before either finder saw them, as before
         assert "Open ladder exposure: 3 held market(s)" in caplog.text
@@ -3385,11 +3482,15 @@ class TestRunProdAddsToHeldPairs:
 
     def test_a_pair_at_its_cap_is_left_out_so_its_group_can_trade(self, monkeypatch, caplog):
         # A held same-title pair (NO on HELD-A, the pricier YES; YES on
-        # HELD-B) that already stakes over 5% of the account value, at a 5%
-        # cap: its markets stay blocked, so the group's unheld pair trades.
-        # Every market of the group has a book, so an ordinary pair on a held
-        # market (HELD-C against HELD-B is the group's widest) would trade if
-        # the run let one through
+        # HELD-B) whose stake is already over 5% of the portfolio value, at a
+        # 5% cap: its markets stay blocked, so the group's unheld pair trades.
+        # It is worth $1,950.00 at today's asks (3000 NO at 0.45, 3000 YES at
+        # 0.20), Kalshi's value of the positions too, so the portfolio value
+        # is $12,199.00; with the $30.00 of fees paid for it, its stake is
+        # $1,980.00, over the $609.95 that 5% allows and under the $2,439.80
+        # of 20%. Every market of the group has a book, so an ordinary pair
+        # on a held market (HELD-C against HELD-B is the group's widest) would
+        # trade if the run let one through
         held_rows = (
             {"ticker": _TICKER_HELD_A, "position_fp": "-3000.00",
              "market_exposure_dollars": "1350.00", "fees_paid_dollars": "15.00"},
@@ -3397,14 +3498,19 @@ class TestRunProdAddsToHeldPairs:
              "market_exposure_dollars": "600.00", "fees_paid_dollars": "15.00"},
         )
         client = self._client(monkeypatch, include_held_position=False, held_rows=held_rows,
-                              extra_events=_HELD_RUNNER_UP_EVENTS)
+                              extra_events=_HELD_RUNNER_UP_EVENTS, positions_value=195_000)
         books = {**_ORDERBOOK_PAYLOADS, **_HELD_GROUP_BOOKS}
         client.get_market_orderbook_without_preload_content = MagicMock(
             side_effect=lambda ticker: _raw_json_response(books.get(
                 ticker, {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}})))
         results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True,
                                       size_cap=0.05)
-        # held_pairs found it, then the run left it out as full
+        assert ("Sizing on portfolio value $12199.00 = cash $10249.00 + open positions "
+                "$1950.00") in caplog.text
+        # held_pairs found it (its stake's two parts: $1,950.00 of worth and
+        # $30.00 of fees), then the run left it out as full
+        assert ("Held pair to add to: NO HELD-A / YES HELD-B, 3000 contracts each, "
+                "cost $1980.00 (fees $30.00), worth $1950.00 at today's prices") in caplog.text
         assert "Held pairs to add to: 1 (other held markets, never added to: 0)" in caplog.text
         assert "Held pairs already at their size cap, not added to this run: 1" in caplog.text
         assert seen["ts"] == seen["st"] == [{}]
@@ -3414,10 +3520,172 @@ class TestRunProdAddsToHeldPairs:
         legs = {ticker for _, a, b in traded for ticker in (a, b)}
         assert not legs & {_TICKER_HELD_A, _TICKER_HELD_B}, traded
         assert "adds to" not in caplog.text
-        # Control: with room left at the cap, the same pair is handed on
+        # Control: at the run's own 20% cap the stake leaves $459.80 of room,
+        # so the same pair is handed on
         results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True)
         assert [set(pairs) for pairs in seen["st"]][-1] == {
             frozenset((_TICKER_HELD_A, _TICKER_HELD_B))}
+
+    def test_the_cap_check_counts_the_fees_paid_for_the_pair(self, monkeypatch, caplog):
+        """
+        Pins that the at-cap check reads the held pair's stake, its worth at
+        today's prices plus the fees paid for it, and not its worth alone.
+
+        The pair (NO on HELD-A, YES on HELD-B, 3900 contracts each) is worth
+        $2,535.00 at today's asks (0.45 and 0.20), which is Kalshi's value of
+        the positions too, so the portfolio value is $12,784.00 and the run's
+        20% cap allows $2,556.80. Its worth alone would leave $21.80 of room,
+        but with the $30.00 of fees paid for it the stake is $2,565.00, over
+        the cap, so the pair is left out as full and its group's unheld pair
+        trades. A check that left the fees out would hand the pair on.
+        """
+        held_rows = (
+            {"ticker": _TICKER_HELD_A, "position_fp": "-3900.00",
+             "market_exposure_dollars": "1755.00", "fees_paid_dollars": "15.00"},
+            {"ticker": _TICKER_HELD_B, "position_fp": "3900.00",
+             "market_exposure_dollars": "780.00", "fees_paid_dollars": "15.00"},
+        )
+        client = self._client(monkeypatch, include_held_position=False, held_rows=held_rows,
+                              extra_events=_HELD_RUNNER_UP_EVENTS, positions_value=253_500)
+        books = {**_ORDERBOOK_PAYLOADS, **_HELD_GROUP_BOOKS}
+        client.get_market_orderbook_without_preload_content = MagicMock(
+            side_effect=lambda ticker: _raw_json_response(books.get(
+                ticker, {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}})))
+        results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True)
+        value = 12_784.0
+        assert ("Sizing on portfolio value $12784.00 = cash $10249.00 + open positions "
+                "$2535.00") in caplog.text
+        assert ("Held pair to add to: NO HELD-A / YES HELD-B, 3900 contracts each, "
+                "cost $2565.00 (fees $30.00), worth $2535.00 at today's prices") in caplog.text
+        # Its worth alone leaves room at the 20% cap; its worth plus its fees does not
+        assert config.held_pair_fraction(0.20, 2_535.0, value) > 0
+        assert config.held_pair_fraction(0.20, 2_535.0 + 30.0, value) <= 0
+        # So the run leaves it out as full: nothing handed on, the unheld pair
+        # trades, and neither held market is traded as either leg
+        assert "Held pairs already at their size cap, not added to this run: 1" in caplog.text
+        assert seen["ts"] == seen["st"] == [{}]
+        traded = self._traded(results)
+        assert ("same_title", _TICKER_HELD_C, _TICKER_HELD_D) in traded
+        legs = {ticker for _, a, b in traded for ticker in (a, b)}
+        assert not legs & {_TICKER_HELD_A, _TICKER_HELD_B}, traded
+        assert "adds to" not in caplog.text
+
+    def test_the_cap_check_reads_the_portfolio_value_and_the_worth_at_todays_prices(
+            self, monkeypatch, caplog):
+        """
+        Pins that the at-cap check weighs the held pair's stake (its worth at
+        today's prices plus the fees paid for it) against the portfolio value
+        (cash plus Kalshi's value of the open positions), not its cost and not
+        the cash alone.
+
+        The pair (NO on HELD-A, YES on HELD-B, 1700 contracts each, the only
+        two markets of their group) cost $1,200.00, $20.00 of it fees, but is
+        worth $1,105.00 at today's asks (0.45 and 0.20), which is Kalshi's
+        value of the positions too, so the portfolio value is $11,354.00 and
+        the pair's stake $1,125.00. At a 10% cap it has $10.40 of room
+        ($1,135.40 less its stake), so it is handed on and added to within
+        that room. Weighed at its cost ($1,200.00) against the same value, or
+        at its stake against the cash alone ($1,024.90), it would have been
+        left out as full.
+        """
+        held_rows = (
+            {"ticker": _TICKER_HELD_A, "position_fp": "-1700.00",
+             "market_exposure_dollars": "800.00", "fees_paid_dollars": "10.00"},
+            {"ticker": _TICKER_HELD_B, "position_fp": "1700.00",
+             "market_exposure_dollars": "380.00", "fees_paid_dollars": "10.00"},
+        )
+        client = self._client(monkeypatch, include_held_position=False, held_rows=held_rows,
+                              positions_value=110_500)
+        books = {**_ORDERBOOK_PAYLOADS, **_HELD_GROUP_BOOKS}
+        client.get_market_orderbook_without_preload_content = MagicMock(
+            side_effect=lambda ticker: _raw_json_response(books.get(
+                ticker, {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}})))
+        results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True,
+                                      size_cap=0.10)
+        value = 11_354.0
+        assert ("Sizing on portfolio value $11354.00 = cash $10249.00 + open positions "
+                "$1105.00") in caplog.text
+        assert ("Held pair to add to: NO HELD-A / YES HELD-B, 1700 contracts each, "
+                "cost $1200.00 (fees $20.00), worth $1105.00 at today's prices") in caplog.text
+        assert "Held pairs already at their size cap" not in caplog.text
+        key = frozenset((_TICKER_HELD_A, _TICKER_HELD_B))
+        assert [set(pairs) for pairs in seen["st"]] == [{key}]
+        # By cost, or its stake on the cash alone, the same pair has no room at 10%
+        assert config.held_pair_fraction(0.10, 1_200.0, value) <= 0
+        assert config.held_pair_fraction(0.10, 1_125.0, 10_249.0) <= 0
+        # The add-on takes at most the room left: the stake and the new cost
+        # within 10% of the portfolio value
+        [add_on] = [r for r in results
+                    if {r.spec.pair.market_a.ticker, r.spec.pair.market_b.ticker}
+                    == {_TICKER_HELD_A, _TICKER_HELD_B}]
+        held = scanner_mod.pair_held(add_on.spec.pair)
+        assert held.value_dollars == 1700 * 0.45 + 1700 * 0.20
+        assert held.fees_dollars == pytest.approx(20.0)
+        assert held.stake_dollars == pytest.approx(1_125.0)
+        assert add_on.spec.kelly_fraction == config.held_pair_fraction(
+            0.10, held.stake_dollars, value)
+        # That leaves $10.40 to spend, where the worth alone, without the
+        # fees, would have left $30.40
+        budget = config.kelly_budget(value, add_on.spec.kelly_fraction, 10_249.0)
+        assert budget == pytest.approx(10.40)
+        assert config.kelly_budget(value, config.held_pair_fraction(
+            0.10, held.value_dollars, value), 10_249.0) == pytest.approx(30.40)
+        assert add_on.spec.total_cost_with_fees <= budget
+        assert held.stake_dollars + add_on.spec.total_cost_with_fees <= 0.10 * value + 1e-9
+        # The $10.40 of room buys 15 pairs at 0.45 + 0.20 with $0.26 + $0.17
+        # of fees ($10.18 in all); 16 would cost $10.86
+        assert (add_on.spec.x, add_on.spec.y) == (15, 15)
+        assert add_on.spec.total_cost_with_fees == pytest.approx(10.18)
+
+    @pytest.mark.parametrize("positions_value, why, cause", [
+        (None, "Kalshi's balance reply carried no readable portfolio_value — sizing on "
+               "cash alone ($10249.00) this run, as if no position were held",
+         "Kalshi's value of the open positions could not be read, so the portfolio "
+         "value counts only the cash"),
+        (1_000_000, "Kalshi's value of the open positions ($10000.00) is not used: that "
+                    "is more than the 63 contract(s) held can be worth at $1.00 each — "
+                    "sizing on cash alone ($10249.00) this run, as if no position were held",
+         "Kalshi's value of the open positions was refused, so the portfolio value "
+         "counts only the cash"),
+    ], ids=["not read", "refused"])
+    def test_an_unread_or_refused_positions_value_means_no_add_on(
+            self, monkeypatch, caplog, positions_value, why, cause):
+        """
+        Pins that a run which holds positions but could not count Kalshi's
+        value of them (not read, or refused as more than the 63 contracts held
+        can be worth) adds to no held pair: an add-on is sized on the
+        portfolio value, which then leaves out what the account holds. One
+        WARNING names the cause, held_pairs is never called, neither finder
+        is handed a pair, and the same-title pair still trades on the cash.
+        """
+        results, seen = self._dry_run(
+            self._client(monkeypatch, positions_value=positions_value), monkeypatch, caplog,
+            add_on=True)
+        assert self._traded(results) == {self._SAME_TITLE}
+        assert seen["held_pairs"] == [] and seen["ts"] == seen["st"] == [{}]
+        assert self._warned(caplog) == [f"Not adding to held pairs this run: {cause}"]
+        # The one WARNING that says why the run sizes on the cash alone
+        assert why in [r.getMessage() for r in caplog.records
+                       if r.levelno == logging.WARNING]
+        assert ("Kalshi Pair Scan — Portfolio value: $10249.00 (cash $10249.00) | Mode: PROD"
+                in caplog.text)
+        assert "adds to" not in caplog.text
+
+    @pytest.mark.parametrize("positions_value", [None, 1_000_000], ids=["not read", "refused"])
+    def test_holding_nothing_the_add_on_check_says_nothing(self, monkeypatch, caplog,
+                                                           positions_value):
+        """
+        Pins that a run holding nothing logs no "Not adding to held pairs"
+        WARNING when Kalshi's value of the positions was not read or refused:
+        there is no held pair to leave out, so held_pairs runs over nothing.
+        """
+        client = self._client(monkeypatch, positions_value=positions_value,
+                              include_held_position=False, held_rows=())
+        results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True)
+        assert self._warned(caplog) == []
+        assert seen["held_pairs"] == [{}]
+        assert "Held pairs to add to: 0 (other held markets, never added to: 0)" in caplog.text
+        assert self._SAME_TITLE in self._traded(results)
 
     def test_a_dev_run_reads_no_positions_even_with_it_on(self, monkeypatch, caplog):
         # A dev run trades the sandbox account, which holds nothing of
@@ -3496,7 +3764,9 @@ class TestRunProdAddsToHeldPairsLive:
 
     The account holds the ladder above: YES on the Dec 13 rung and NO on the
     Dec 20 rung, 30 contracts each (the user's own example); the Dec 27 rung
-    is not held."""
+    is not held. Kalshi's value of those positions is $24.00, what they are
+    worth at the rungs' asks (30 YES at 0.20 and 30 NO at 0.60), so the
+    portfolio value is $10,273.00: the cash plus that."""
 
     @staticmethod
     def _run(monkeypatch, caplog, *, add_on: bool, held, killed=frozenset(),
@@ -3516,7 +3786,8 @@ class TestRunProdAddsToHeldPairsLive:
             add_on (bool): Keyword-only. The run's add_to_held_pairs.
             held (tuple[str, str] | None): Keyword-only. The ticker held YES
                 and the ticker held NO, 30 contracts each, or None for an
-                account that holds nothing.
+                account that holds nothing. The balance reply values the
+                positions at $24.00 when a pair is held, else at $0.
             killed (frozenset): Keyword-only. (ticker, side) of each opening
                 order the exchange kills.
             mapping_confirmed (bool): Keyword-only. Whether this process has
@@ -3562,7 +3833,9 @@ class TestRunProdAddsToHeldPairsLive:
                 {"ticker": ticker, "position_fp": f"{positions[ticker]:.2f}"}]}
 
         client = _live_shape_client(
-            monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD,
+            monkeypatch,
+            balance_payload={**_LIVE_BALANCE_PAYLOAD,
+                             "portfolio_value": 2_400 if held is not None else 0},
             include_held_position=False, extra_events=_LADDER_EVENTS,
             held_rows=held_rows, order_side_effect=orders,
             position_lookup_responses={t: reader(t) for t in positions})
@@ -3633,14 +3906,34 @@ class TestRunProdAddsToHeldPairsLive:
             Decimal(new), Decimal(new)]
         assert positions[l13] == 30 + new and positions[l20] == -30 - new
         assert positions[l27] == 0
-        # Kelly sizes the whole position: old and new within the 20% cap of the
-        # account value
+        # Kelly sizes the whole position. The held pair's stake is its worth
+        # at today's prices plus the fees paid for it ($0.30 + $0.50)
         held = scanner_mod.pair_held(add_on.spec.pair)
         assert held.count == 30.0
-        assert held.cost_dollars + add_on.spec.total_cost_with_fees <= (
-            0.20 * held.account_value_dollars + 1e-9)
+        assert held.value_dollars == 30 * 0.20 + 30 * 0.60
+        assert held.fees_dollars == pytest.approx(0.80)
+        assert held.stake_dollars == pytest.approx(24.80)
+        value, cash = 10_273.0, 10_249.0
+        assert ("Sizing on portfolio value $10273.00 = cash $10249.00 + open positions "
+                "$24.00") in caplog.text
+        # The pair's own Kelly fraction at its prices (pA 0.20, pB 0.40, NO ask
+        # 0.60, k 0.75): p = 1 - 0.75 x 0.20 = 0.85 and b = 0.172 / 0.828
+        # after the $0.028 fee, so f* = 0.85 - 0.15 / b = 0.12791, under the
+        # 20% cap. The add-on takes f* less the stake's share of the portfolio
+        # value ($24.80 of $10,273.00), its cost stays within that share (at
+        # most the cash), and the stake and the new cost together stay within
+        # 20% of the portfolio value
+        f_star = 0.85 - 0.15 * 0.828 / 0.172
+        assert add_on.spec.kelly_fraction == pytest.approx(f_star - 24.80 / value)
+        assert add_on.spec.total_cost_with_fees <= config.kelly_budget(
+            value, add_on.spec.kelly_fraction, cash)
+        assert held.stake_dollars + add_on.spec.total_cost_with_fees <= 0.20 * value + 1e-9
+        # The rungs' 100 contracts a level bind, not the $1,289.19 budget: 100
+        # pairs at 0.20 + 0.60 plus $1.12 + $1.68 of fees
+        assert new == 100
+        assert add_on.spec.total_cost_with_fees == pytest.approx(82.80)
         assert ("Held pair to add to: YES LAD-13 / NO LAD-20, 30 contracts each, "
-                "cost $24.80") in caplog.text
+                "cost $24.80 (fees $0.80), worth $24.00 at today's prices") in caplog.text
         assert "adds to 30 held" in caplog.text
         # Dec 13 / Dec 27 and Dec 20 / Dec 27 touch the held pair's markets
         assert ("Time-series candidates refused because one of their markets is on a "
@@ -3846,7 +4139,7 @@ class TestAddOnMarkers:
         """
         spec.pair.held = scanner_mod.HeldPair(
             sides=(("TICK-A", "yes"), ("TICK-B", "no")), count=30.0,
-            cost_dollars=18.9, account_value_dollars=1000.0)
+            cost_dollars=18.9, value_dollars=18.0, fees_dollars=0.9)
         return spec
 
     @staticmethod
@@ -3886,13 +4179,36 @@ class TestAddOnMarkers:
         assert ordinary.endswith("(10.0% return)")
         assert add_on == ordinary + " — adds to 30 held"
 
+    def test_a_shrunk_add_on_shows_its_own_count_and_the_held_count(self, caplog):
+        """Pins that an add-on select_portfolio shrank to 2 contract pairs to fit
+        the cash shows in the pairs table at that count and still says
+        "(adds to 30 held)": the shrunk spec is a new copy on a copy of the
+        pair, which keeps the held pair, and _display_specs finds it by its
+        tickers."""
+        candidate = self._add_on(make_spec()).pair
+        # compute_trade returns a re-priced copy of the candidate, never the candidate
+        spec = SimpleNamespace(**{**vars(make_spec()), "pair": SimpleNamespace(**vars(candidate))})
+        # select_portfolio's shrink is a new, smaller spec on another copy of the pair
+        shrunk = SimpleNamespace(**{**vars(spec), "x": 2, "y": 2,
+                                    "pair": SimpleNamespace(**vars(spec.pair))})
+        shown = main._display_specs({id(candidate): spec}, [shrunk])
+        assert shown == {id(candidate): shrunk}
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            main.print_pairs_table([candidate], shown)
+        lines = [line for line in caplog.text.splitlines() if "\u2502" in line]
+        headers = [c.strip() for c in lines[0].split("\u2502")[1:-1]]
+        values = [c.strip() for c in lines[1].split("\u2502")[1:-1]]
+        cell = dict(zip(headers, values, strict=True))["Recommended Trade"]
+        assert cell == "2× YES(A) + 2× NO(B) (adds to 30 held)"
+
 
 class TestRunProdExitCodes:
-    @patch("kalshi_betting.main.verify_auth")
-    def test_low_balance_returns_skip_code(self, mock_verify_auth):
+    @patch("kalshi_betting.main.read_account_balance")
+    def test_low_balance_returns_skip_code(self, mock_read_balance):
         # Balance below MIN_BALANCE_CENTS must short-circuit before any scan —
         # the bare `return` this used to be silently exited 0.
-        mock_verify_auth.return_value = {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1}
+        mock_read_balance.return_value = _account(MIN_BALANCE_CENTS - 1)
         client = MagicMock()
 
         code = main._run_prod(client, _args())
@@ -3912,10 +4228,10 @@ class TestRunProdExitCodes:
     @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
     @patch("kalshi_betting.main.fetch_open_events_with_markets")
     @patch("kalshi_betting.main.get_held_positions")
-    @patch("kalshi_betting.main.verify_auth")
+    @patch("kalshi_betting.main.read_account_balance")
     def test_manual_review_result_returns_attention_code(
         self,
-        mock_verify_auth,
+        mock_read_balance,
         mock_held,
         mock_fetch,
         mock_shard_statuses,
@@ -3929,12 +4245,9 @@ class TestRunProdExitCodes:
         mock_execute,
         mock_append_log,
     ):
-        # Two verify_auth calls: pre-trade balance, then post-trade balance
+        # Two balance reads: pre-trade balance, then post-trade balance
         # for the log's separator row.
-        mock_verify_auth.side_effect = [
-            {DEFAULT_EXCHANGE_INDEX: 100_000},
-            {DEFAULT_EXCHANGE_INDEX: 100_000},
-        ]
+        mock_read_balance.side_effect = [_account(100_000), _account(100_000)]
         mock_held.side_effect = _held_positions()
         mock_fetch.return_value = _stub_ingest()
         mock_filter_horizon.side_effect = lambda markets, days: markets
@@ -3968,10 +4281,10 @@ class TestRunProdExitCodes:
     @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
     @patch("kalshi_betting.main.fetch_open_events_with_markets")
     @patch("kalshi_betting.main.get_held_positions")
-    @patch("kalshi_betting.main.verify_auth")
+    @patch("kalshi_betting.main.read_account_balance")
     def test_a_disproof_with_the_rest_of_the_run_stopped_returns_attention_code(
         self,
-        mock_verify_auth,
+        mock_read_balance,
         mock_held,
         mock_fetch,
         mock_shard_statuses,
@@ -3990,10 +4303,7 @@ class TestRunProdExitCodes:
         # with status "failed" (nothing sent). The run still exits 20 through
         # the disproving pair's manual_review, and the undetermined-fill count
         # names only that one pair, not the pairs that sent nothing.
-        mock_verify_auth.side_effect = [
-            {DEFAULT_EXCHANGE_INDEX: 100_000},
-            {DEFAULT_EXCHANGE_INDEX: 100_000},
-        ]
+        mock_read_balance.side_effect = [_account(100_000), _account(100_000)]
         mock_held.side_effect = _held_positions()
         mock_fetch.return_value = _stub_ingest()
         mock_filter_horizon.side_effect = lambda markets, days: markets
@@ -4037,10 +4347,10 @@ class TestRunProdExitCodes:
     @patch("kalshi_betting.main.fetch_shard_statuses", return_value=None)
     @patch("kalshi_betting.main.fetch_open_events_with_markets")
     @patch("kalshi_betting.main.get_held_positions")
-    @patch("kalshi_betting.main.verify_auth")
+    @patch("kalshi_betting.main.read_account_balance")
     def test_clean_dry_run_returns_ok_code(
         self,
-        mock_verify_auth,
+        mock_read_balance,
         mock_held,
         mock_fetch,
         mock_shard_statuses,
@@ -4054,10 +4364,7 @@ class TestRunProdExitCodes:
         mock_execute,
         mock_append_log,
     ):
-        mock_verify_auth.side_effect = [
-            {DEFAULT_EXCHANGE_INDEX: 100_000},
-            {DEFAULT_EXCHANGE_INDEX: 100_000},
-        ]
+        mock_read_balance.side_effect = [_account(100_000), _account(100_000)]
         mock_held.side_effect = _held_positions()
         mock_fetch.return_value = _stub_ingest()
         mock_filter_horizon.side_effect = lambda markets, days: markets
@@ -4077,11 +4384,11 @@ class TestRunProdExitCodes:
         assert code == EXIT_OK
         assert code == 0
 
-    @patch("kalshi_betting.main.verify_auth")
-    def test_no_qualifying_pairs_returns_ok_code(self, mock_verify_auth):
+    @patch("kalshi_betting.main.read_account_balance")
+    def test_no_qualifying_pairs_returns_ok_code(self, mock_read_balance):
         # No-pairs / no-executable-trades paths must also resolve to EXIT_OK,
         # not just the low-balance and post-execution paths.
-        mock_verify_auth.return_value = {DEFAULT_EXCHANGE_INDEX: 100_000}
+        mock_read_balance.return_value = _account(100_000)
         with (
             patch("kalshi_betting.main.get_held_positions", side_effect=_held_positions()),
             patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
@@ -4110,8 +4417,8 @@ class TestRunProdTimeSeriesSkippedCode:
         return (exit code, the time-series finder's calls)."""
         spec = make_spec()
         ts_calls = []
-        monkeypatch.setattr(main, "verify_auth",
-                            lambda client: {DEFAULT_EXCHANGE_INDEX: 100_000})
+        monkeypatch.setattr(main, "read_account_balance",
+                            lambda client: _account(100_000))
         monkeypatch.setattr(main, "get_held_positions", _held_positions("HELD-X"))
         monkeypatch.setattr(main, "fetch_shard_statuses", lambda client: None)
         monkeypatch.setattr(main, "fetch_open_events_with_markets",
@@ -4125,10 +4432,11 @@ class TestRunProdTimeSeriesSkippedCode:
                             lambda markets, held, *, add_on_pairs=None:
                             [spec.pair] if same_title else [])
         monkeypatch.setattr(main, "enrich_with_orderbook_prices",
-                            lambda client, pairs, balance, *, settings: pairs)
-        monkeypatch.setattr(main, "compute_trade", lambda pair, balance, *, settings: spec)
+                            lambda client, pairs, value, *, settings, cash_cents: pairs)
+        monkeypatch.setattr(main, "compute_trade",
+                            lambda pair, value, *, settings, cash_cents: spec)
         monkeypatch.setattr(main, "select_portfolio",
-                            lambda specs, balance, *, held_ladders: specs)
+                            lambda specs, cash, *, held_ladders: specs)
         monkeypatch.setattr(main, "pre_execution_check",
                             lambda client, portfolio, *, settings: portfolio)
         monkeypatch.setattr(main, "execute_trades", lambda client, portfolio, *, dry_run: [
@@ -4173,6 +4481,600 @@ class TestRunProdTimeSeriesSkippedCode:
         for ret in returns:
             assert isinstance(ret.value, ast.Name), ast.dump(ret)
             assert ret.value.id in {"clean_exit", "EXIT_TRADES_NEED_ATTENTION"}, ret.value.id
+
+
+class TestSizesOnPortfolioValue:
+    """
+    A production run sizes every Kelly fraction on the portfolio value — the
+    cash on every shard plus Kalshi's value of the open positions — and
+    spends only the cash: enrichment and compute_trade get both numbers,
+    select_portfolio gets the cash, the MIN_BALANCE_CENTS gate reads the
+    portfolio value, and the pairs table shows the size that trades, a spec
+    select_portfolio shrank included. A dev run spends its virtual balance as
+    both.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, caplog, account, *, dry_run=True, portfolio=None, report=None,
+             positions=None):
+        """
+        Run _run_prod with every request stubbed and one same-title-found pair.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): For the stubs.
+            caplog (pytest.LogCaptureFixture): Captures the run's log.
+            account (AccountBalance): What the one balance read before trading
+                returns. The read after trading returns the same cash beside a
+                different positions value, so a figure that wrongly added the
+                positions to the cash after trading would show.
+            dry_run (bool): Keyword-only. Run as --dry-run.
+            portfolio (Callable | None): Keyword-only. Maps select_portfolio's
+                specs to the portfolio it returns; None keeps them all.
+            report (RunReport | None): Keyword-only. The report to fill.
+            positions (Callable | None): Keyword-only. The stand-in for
+                get_held_positions; None holds just enough contracts on one
+                market to back the account's positions value (a contract
+                pays at most $1), so the run counts that value.
+
+        Returns:
+            tuple[int, dict]: The exit code, and what the stand-ins saw, by
+                name: "enrich" and "compute_trade" (the portfolio value and
+                cash each was handed), "select_portfolio" (the cash),
+                "trade_log" (append_to_prod_log's positional arguments),
+                "held" (whether the positions were read) and "held_at" (how
+                many log records the run had written when it read them).
+        """
+        spec = make_spec()
+        seen: dict = {"held": False}
+        if positions is None:
+            contracts = math.ceil((account.positions_value_cents or 0) / 100)
+            positions = _held_positions(*(["HELD-X"] if contracts else []),
+                                        count=float(contracts))
+
+        def held(client, *, complete_out=None):
+            seen["held"] = True
+            seen["held_at"] = len(caplog.records)
+            return positions(client, complete_out=complete_out)
+
+        def enrich(client, pairs, value, *, settings, cash_cents):
+            seen["enrich"] = (value, cash_cents)
+            return pairs
+
+        def sized(pair, value, *, settings, cash_cents):
+            seen["compute_trade"] = (value, cash_cents)
+            return spec
+
+        def select(specs, cash, *, held_ladders):
+            seen["select_portfolio"] = cash
+            return specs if portfolio is None else portfolio(specs)
+
+        def trade_log(*args, **kwargs):
+            seen["trade_log"] = args
+            return pathlib.Path("/fake/trade_log.xlsx")
+
+        reads = iter([account, _account(sum(account.shard_cash_cents.values()), 7_000)])
+        monkeypatch.setattr(main, "read_account_balance", lambda client: next(reads))
+        monkeypatch.setattr(main, "get_held_positions", held)
+        monkeypatch.setattr(main, "fetch_shard_statuses", lambda client: None)
+        monkeypatch.setattr(main, "fetch_open_events_with_markets",
+                            lambda client, inactive_shards: _stub_ingest())
+        monkeypatch.setattr(main, "resolve_held_ladders",
+                            lambda client, markets, held, *, labels_out=None: frozenset())
+        monkeypatch.setattr(main, "filter_markets_within_horizon", lambda m, d: m)
+        monkeypatch.setattr(main, "find_time_series_pairs", lambda *a, **k: [])
+        monkeypatch.setattr(main, "find_same_title_pairs",
+                            lambda markets, held, *, add_on_pairs=None: [spec.pair])
+        monkeypatch.setattr(main, "enrich_with_orderbook_prices", enrich)
+        monkeypatch.setattr(main, "compute_trade", sized)
+        monkeypatch.setattr(main, "select_portfolio", select)
+        monkeypatch.setattr(main, "pre_execution_check",
+                            lambda client, portfolio, *, settings: portfolio)
+        monkeypatch.setattr(main, "ensure_shard_collateral",
+                            lambda client, portfolio, balances, statuses, *, dry_run: portfolio)
+        monkeypatch.setattr(main, "execute_trades", lambda client, portfolio, *, dry_run: [
+            TradeResult(spec=s, status="simulated" if dry_run else "executed")
+            for s in portfolio])
+        monkeypatch.setattr(main, "append_to_prod_log", trade_log)
+        with caplog.at_level(logging.INFO):
+            code = main._run_prod(MagicMock(), _args(dry_run=dry_run), report=report)
+        return code, seen
+
+    @staticmethod
+    def _warnings(caplog) -> list:
+        """The run's WARNING lines, as logged."""
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+    @staticmethod
+    def _table_row(caplog) -> str:
+        """The pairs table's one data row: the table's lines carry cell separators."""
+        (row,) = [line for line in caplog.text.splitlines()
+                  if "\u2502" in line and "Market A" in line and "Type" not in line]
+        return row
+
+    def test_the_portfolio_value_is_the_cash_plus_the_open_positions(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert main._bankroll_cents(1_000, 10_000) == 11_000
+            assert main._bankroll_cents(1_000, 0) == 1_000
+        # A value that was read, zero included, draws no WARNING
+        assert not caplog.records
+
+    def test_an_unreadable_positions_value_sizes_on_the_cash_alone(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert main._bankroll_cents(1_000, None) == 1_000
+        assert [r.getMessage() for r in caplog.records] == [
+            "Kalshi's balance reply carried no readable portfolio_value — sizing on "
+            "cash alone ($10.00) this run, as if no position were held"]
+
+    def test_the_positions_carry_a_small_cash_balance_over_the_minimum(
+        self, monkeypatch, caplog,
+    ):
+        # Cash $10 is under the $50 minimum; with $100 of positions the
+        # portfolio value is $110, so the run scans, WARNS that only the cash
+        # is spent, and sizes on $110 while spending at most $10
+        report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
+        code, seen = self._run(monkeypatch, caplog, _account(1_000, 10_000), report=report)
+        assert code == EXIT_OK
+        assert seen["held"] is True
+        assert seen["enrich"] == (11_000, 1_000)
+        assert seen["compute_trade"] == (11_000, 1_000)
+        assert seen["select_portfolio"] == 1_000
+        assert ("Cash $10.00 is below the $50.00 minimum but the portfolio value is not: "
+                "the run goes on, and no trade spends more than the cash left"
+                ) in self._warnings(caplog)
+        assert ("Sizing on portfolio value $110.00 = cash $10.00 + open positions $100.00"
+                in caplog.text)
+        assert ("Kalshi Pair Scan — Portfolio value: $110.00 (cash $10.00) | Mode: PROD"
+                in caplog.text)
+        # The run result names both: the cash before, and what was sized on
+        assert report.balance_before == 10.0
+        assert report.portfolio_value_before == 110.0
+
+    def test_the_gate_reads_the_portfolio_value(self, monkeypatch, caplog):
+        # $10 of cash and $39.99 of positions: $49.99 in all, one cent short
+        report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
+        code, seen = self._run(monkeypatch, caplog, _account(1_000, 3_999), report=report)
+        assert code == EXIT_SKIPPED_LOW_BALANCE
+        # Stopped before any scan
+        assert seen["held"] is False and "enrich" not in seen
+        message = ("Portfolio value $49.99 (cash $10.00) is below minimum $50.00 "
+                   "— skipping run.")
+        assert message in self._warnings(caplog)
+        assert report.message == message
+        assert report.balance_before == 10.0
+        assert report.portfolio_value_before == 49.99
+        # The cash WARNING belongs to a run that goes on, and this one did not
+        assert not any(w.startswith("Cash $") for w in self._warnings(caplog))
+        # The sizing line is logged on every production run, a skipped one too
+        assert ("Sizing on portfolio value $49.99 = cash $10.00 + open positions $39.99"
+                in caplog.text)
+
+    def test_with_no_readable_positions_value_the_gate_reads_the_cash(
+        self, monkeypatch, caplog,
+    ):
+        # Kalshi's value of the positions could not be read: $10 of cash alone
+        # is under the minimum, so the run stops, saying why it sized on cash
+        code, seen = self._run(monkeypatch, caplog, _account(1_000, None))
+        assert code == EXIT_SKIPPED_LOW_BALANCE
+        assert seen["held"] is False
+        warnings = self._warnings(caplog)
+        assert any("no readable portfolio_value" in w for w in warnings)
+        assert ("Portfolio value $10.00 (cash $10.00) is below minimum $50.00 "
+                "— skipping run.") in warnings
+
+    def test_a_portfolio_value_of_exactly_the_minimum_is_traded(self, monkeypatch, caplog):
+        code, seen = self._run(monkeypatch, caplog, _account(MIN_BALANCE_CENTS - 1, 1))
+        assert code == EXIT_OK
+        assert seen["enrich"] == (MIN_BALANCE_CENTS, MIN_BALANCE_CENTS - 1)
+
+    def test_the_trade_log_and_the_run_result_balances_stay_on_cash(
+        self, monkeypatch, caplog,
+    ):
+        # The workbook's separator row and the run result's before and after
+        # figures are cash, as they always were; only sizing reads the
+        # portfolio value. Both reads carry open positions, so a figure that
+        # added them in, before or after trading, would not equal the cash
+        report = main.RunReport(dry_run=False, started_at=datetime.now(UTC))
+        code, seen = self._run(monkeypatch, caplog, _account(100_000, 50_000),
+                               dry_run=False, report=report)
+        assert code == EXIT_OK
+        assert seen["trade_log"][1:] == (1_000.0, 1_000.0)
+        assert report.balance_before == 1_000.0
+        assert report.balance_after == 1_000.0
+        assert report.portfolio_value_before == 1_500.0
+
+    def test_a_shrunk_spec_shows_in_the_pairs_table(self, monkeypatch, caplog):
+        # select_portfolio hands back a spec it shrank to fit the cash as a new,
+        # smaller spec; the table shows that size, not "—" and not the old one
+        def shrink(specs):
+            [spec] = specs
+            return [SimpleNamespace(**{**vars(spec), "x": 2, "y": 2})]
+
+        code, _ = self._run(monkeypatch, caplog, _account(100_000), portfolio=shrink)
+        assert code == EXIT_OK
+        row = self._table_row(caplog)
+        assert "2× YES(A) + 2× NO(B)" in row and "5×" not in row, row
+
+    def test_display_specs_matches_the_selected_spec_to_its_candidate_by_tickers(self):
+        candidate_1, candidate_2 = make_spec().pair, make_spec().pair
+        candidate_2.market_a.ticker, candidate_2.market_b.ticker = "TICK-C", "TICK-D"
+        # compute_trade returns a re-priced copy of each candidate, never the candidate
+        spec_1 = SimpleNamespace(pair=SimpleNamespace(**vars(candidate_1)), x=5)
+        spec_2 = SimpleNamespace(pair=SimpleNamespace(**vars(candidate_2)), x=7)
+        trade_specs = {id(candidate_1): spec_1, id(candidate_2): spec_2}
+        # Unshrunk: the very spec compute_trade returned, and only it
+        shown = main._display_specs(trade_specs, [spec_2])
+        assert list(shown) == [id(candidate_2)] and shown[id(candidate_2)] is spec_2
+        # Shrunk into a new object with the same two tickers: the new one shows
+        shrunk = SimpleNamespace(pair=SimpleNamespace(**vars(spec_1.pair)), x=2)
+        shown = main._display_specs(trade_specs, [shrunk, spec_2])
+        assert set(shown) == {id(candidate_1), id(candidate_2)}
+        assert shown[id(candidate_1)] is shrunk and shown[id(candidate_2)] is spec_2
+        # Nothing selected, nothing shown
+        assert main._display_specs(trade_specs, []) == {}
+
+    def test_a_live_shape_balance_with_a_portfolio_value_sizes_on_both(
+        self, monkeypatch, caplog,
+    ):
+        # The balance reply carries portfolio_value as Kalshi sends it: integer
+        # cents, the positions alone. $50.00 of positions beside $10,249.00 of
+        # cash (the breakdown's sum) is a $10,299.00 portfolio value. The
+        # account holds 100 YES on HELD-A, worth $50.00 at its 0.50 ask: a
+        # contract pays at most $1, so the run counts the value only when that
+        # many contracts back it
+        client = _live_shape_client(
+            monkeypatch, balance_payload={**_LIVE_BALANCE_PAYLOAD, "portfolio_value": 5_000},
+            include_held_position=False,
+            held_rows=({"ticker": _TICKER_HELD_A, "position_fp": "100.00"},))
+        monkeypatch.setattr(main, "append_to_prod_log",
+                            lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"))
+        seen: dict = {"enrich": [], "compute_trade": []}
+        real_enrich, real_compute = main.enrich_with_orderbook_prices, main.compute_trade
+
+        def enrich(client_, pairs, value, *, settings, cash_cents):
+            seen["enrich"].append((value, cash_cents))
+            return real_enrich(client_, pairs, value, settings=settings, cash_cents=cash_cents)
+
+        def sized(pair, value, *, settings, cash_cents):
+            seen["compute_trade"].append((value, cash_cents))
+            return real_compute(pair, value, settings=settings, cash_cents=cash_cents)
+
+        monkeypatch.setattr(main, "enrich_with_orderbook_prices", enrich)
+        monkeypatch.setattr(main, "compute_trade", sized)
+        report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
+        with caplog.at_level(logging.INFO):
+            code = main._run_prod(client, SimpleNamespace(dry_run=True, max_horizon_days=None),
+                                  report=report)
+        assert code == EXIT_OK
+        assert ("Sizing on portfolio value $10299.00 = cash $10249.00 + open positions $50.00"
+                in caplog.text)
+        assert "no readable portfolio_value" not in caplog.text
+        assert seen["enrich"] == [(1_029_900, 1_024_900)]
+        assert seen["compute_trade"]
+        assert set(seen["compute_trade"]) == {(1_029_900, 1_024_900)}
+        assert report.balance_before == 10_249.0
+        assert report.portfolio_value_before == 10_299.0
+        # The read after trading reports the cash, never the positions
+        assert report.balance_after == 10_249.0
+        assert report.trades and {t.status for t in report.trades} == {"simulated"}
+
+    def test_a_live_shape_balance_without_a_portfolio_value_sizes_on_cash(
+        self, monkeypatch, caplog,
+    ):
+        # The same reply with no portfolio_value: the run sizes on its cash,
+        # says so, and trades as it did before the positions were counted
+        payload = {key: value for key, value in _LIVE_BALANCE_PAYLOAD.items()
+                   if key != "portfolio_value"}
+        client = _live_shape_client(monkeypatch, balance_payload=payload)
+        monkeypatch.setattr(main, "append_to_prod_log",
+                            lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"))
+        report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
+        with caplog.at_level(logging.INFO):
+            code = main._run_prod(client, SimpleNamespace(dry_run=True, max_horizon_days=None),
+                                  report=report)
+        assert code == EXIT_OK
+        assert any("no readable portfolio_value" in r.getMessage()
+                   for r in caplog.records if r.levelno == logging.WARNING)
+        # The unread value is said to be unread, never printed as a measured $0.00
+        assert ("Sizing on portfolio value $10249.00 = cash $10249.00 + open positions "
+                "not read (counted as $0.00)" in caplog.text)
+        assert report.portfolio_value_before == report.balance_before == 10_249.0
+
+    def test_a_live_shape_account_short_of_cash_but_not_of_value_scans(
+        self, monkeypatch, caplog,
+    ):
+        # $8.00 of cash, under the minimum, beside $100.00 of positions: 200
+        # YES on HELD-A, worth $100.00 at its 0.50 ask, which the contracts
+        # held can back (a contract pays at most $1)
+        client = _live_shape_client(
+            monkeypatch, balance_payload={**_LOW_BALANCE_PAYLOAD, "portfolio_value": 10_000},
+            include_held_position=False,
+            held_rows=({"ticker": _TICKER_HELD_A, "position_fp": "200.00"},))
+        monkeypatch.setattr(main, "append_to_prod_log",
+                            lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"))
+        with caplog.at_level(logging.INFO):
+            code = main._run_prod(client, SimpleNamespace(dry_run=True, max_horizon_days=None))
+        assert code == EXIT_OK
+        assert "below minimum" not in caplog.text
+        assert ("Cash $8.00 is below the $50.00 minimum but the portfolio value is not"
+                in caplog.text)
+        client.get_events_without_preload_content.assert_called()
+        # No trade spends more than the cash: at most $8.00 in all, at the
+        # orders' limit prices
+        (portfolio_line,) = [r.getMessage() for r in caplog.records
+                             if r.getMessage().startswith("Portfolio: ")]
+        spent = float(portfolio_line.rsplit("up to $", 1)[1].split(" ", 1)[0])
+        assert spent <= 8.00, portfolio_line
+
+    def test_a_dev_run_spends_its_virtual_balance_as_cash(self, monkeypatch, caplog):
+        # Dev holds nothing: the virtual balance is both the portfolio value
+        # and the cash, for enrichment, the sizer and the portfolio walk
+        spec = make_spec()
+        seen: dict = {}
+
+        def enrich(client, pairs, value, *, settings, cash_cents):
+            seen["enrich"] = (value, cash_cents)
+            return pairs
+
+        def sized(pair, value, *, settings, cash_cents):
+            seen["compute_trade"] = (value, cash_cents)
+            return spec
+
+        def select(specs, cash, **kwargs):
+            seen["select_portfolio"] = (cash, kwargs)
+            return [SimpleNamespace(**{**vars(specs[0]), "x": 3, "y": 3})]
+
+        monkeypatch.setattr(main, "fetch_shard_statuses", lambda client: None)
+        monkeypatch.setattr(main, "fetch_open_events_with_markets",
+                            lambda client, inactive_shards: _stub_ingest())
+        monkeypatch.setattr(main, "filter_markets_within_horizon", lambda m, d: m)
+        monkeypatch.setattr(main, "find_time_series_pairs", lambda *a, **k: [])
+        monkeypatch.setattr(main, "find_same_title_pairs",
+                            lambda markets, held_tickers: [spec.pair])
+        monkeypatch.setattr(main, "enrich_with_orderbook_prices", enrich)
+        monkeypatch.setattr(main, "compute_trade", sized)
+        monkeypatch.setattr(main, "select_portfolio", select)
+        monkeypatch.setattr(main, "execute_trades", lambda client, portfolio, *, dry_run: [
+            TradeResult(spec=s, status="simulated") for s in portfolio])
+        monkeypatch.setattr(main, "write_dev_simulation", lambda *a, **k: pathlib.Path("/f"))
+        with caplog.at_level(logging.INFO):
+            code = main._run_dev(
+                MagicMock(), SimpleNamespace(sandbox_balance=1234.5, max_horizon_days=None))
+        assert code == EXIT_OK
+        assert seen["enrich"] == (123_450, 123_450)
+        assert seen["compute_trade"] == (123_450, 123_450)
+        # Dev holds nothing, so no held ladders are passed
+        assert seen["select_portfolio"] == (123_450, {})
+        # The shrunk spec is what the pairs table shows
+        row = self._table_row(caplog)
+        assert "3× YES(A) + 3× NO(B)" in row, row
+
+
+class TestPositionsValueCheck:
+    """
+    Kalshi's value of the open positions counts in the portfolio value only
+    when the contracts held can back it: a contract pays at most
+    config.CONTRACT_PAYOUT_DOLLARS ($1), so the value may be at most that
+    much per contract held, counted over a positions listing read to its end
+    whose every count can be read (main._checked_positions_value). A refused
+    value draws one WARNING, and the run sizes on the cash alone, records the
+    cash as its portfolio value and applies the $50 minimum to it again. The
+    check runs once the positions are read, after the first minimum, and
+    #86's low-cash WARNING comes after it.
+    """
+
+    @staticmethod
+    def _positions(*counts, complete=True):
+        """
+        Build a stand-in for get_held_positions holding one market per count.
+
+        Args:
+            *counts (float | None): Each market's signed contract count (None: unreadable).
+            complete (bool): Keyword-only. Whether the listing reads as read to its end.
+
+        Returns:
+            callable: (client, *, complete_out=None) -> {ticker: HeldPosition}.
+        """
+        def fake(client, *, complete_out=None):
+            if complete_out is not None:
+                complete_out["complete"] = complete
+            return {f"HELD-{i}": scanner_mod.HeldPosition(f"HELD-{i}", count, None, None)
+                    for i, count in enumerate(counts)}
+        return fake
+
+    @staticmethod
+    def _check(value, *counts, complete=True, cash=10_000):
+        """
+        Call main._checked_positions_value on markets held with these counts.
+
+        Args:
+            value (int | None): Kalshi's value of the open positions, in cents.
+            *counts (float | None): Each held market's signed contract count.
+            complete (bool): Keyword-only. Whether the listing was read to its end.
+            cash (int): Keyword-only. The cash, in cents, named in the WARNING.
+
+        Returns:
+            int | None: What the check returns.
+        """
+        held = {f"HELD-{i}": scanner_mod.HeldPosition(f"HELD-{i}", count, None, None)
+                for i, count in enumerate(counts)}
+        return main._checked_positions_value(cash, value, held, complete)
+
+    @staticmethod
+    def _warnings(caplog) -> list:
+        """The WARNING lines logged, as written."""
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_a_value_the_contracts_can_back_is_kept(self, caplog):
+        # 30 YES and 30 NO held: 60 contracts can be worth at most $60.00
+        with caplog.at_level(logging.WARNING):
+            assert self._check(2_250, 30.0, -30.0) == 2_250
+            assert self._check(6_000, 30.0, -30.0) == 6_000
+        assert not caplog.records
+
+    def test_a_value_above_what_the_contracts_can_pay_is_refused(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert self._check(6_001, 30.0, -30.0) is None
+        assert self._warnings(caplog) == [
+            "Kalshi's value of the open positions ($60.01) is not used: that is more than "
+            "the 60 contract(s) held can be worth at $1.00 each — sizing on cash alone "
+            "($100.00) this run, as if no position were held"]
+
+    def test_fractional_counts_are_summed_without_float_noise(self, caplog):
+        # 0.7 + 0.1 contracts sums to 0.7999999999999999 in floating point;
+        # exactly 80 cents is still within what they can pay, and 81 is not
+        with caplog.at_level(logging.WARNING):
+            assert self._check(80, 0.7, 0.1) == 80
+            assert not caplog.records
+            assert self._check(81, 0.7, 0.1) is None
+        assert self._warnings(caplog) == [
+            "Kalshi's value of the open positions ($0.81) is not used: that is more than "
+            "the 0.8 contract(s) held can be worth at $1.00 each — sizing on cash alone "
+            "($100.00) this run, as if no position were held"]
+
+    def test_holding_nothing_keeps_a_zero_value_and_refuses_any_other(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert self._check(0) == 0
+            assert not caplog.records
+            assert self._check(1) is None
+        assert self._warnings(caplog) == [
+            "Kalshi's value of the open positions ($0.01) is not used: that is more than "
+            "the 0 contract(s) held can be worth at $1.00 each — sizing on cash alone "
+            "($100.00) this run, as if no position were held"]
+
+    def test_an_unread_value_is_left_to_the_balance_read_s_own_warning(self, caplog):
+        # _bankroll_cents already counted it as $0 and said so; nothing to check
+        with caplog.at_level(logging.WARNING):
+            assert self._check(None, 30.0, None, complete=False) is None
+        assert not caplog.records
+
+    def test_a_cut_short_listing_refuses_any_value_but_zero(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert self._check(0, 30.0, complete=False) == 0
+            assert not caplog.records
+            assert self._check(100, 300.0, complete=False) is None
+        assert self._warnings(caplog) == [
+            "Kalshi's value of the open positions ($1.00) is not used: the list of the "
+            "account's positions was cut short, so not every contract held is known — "
+            "sizing on cash alone ($100.00) this run, as if no position were held"]
+
+    def test_an_unreadable_count_refuses_the_value(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert self._check(100, 300.0, None) is None
+        assert self._warnings(caplog) == [
+            "Kalshi's value of the open positions ($1.00) is not used: the contract count "
+            "of 1 held market(s) could not be read — sizing on cash alone ($100.00) this "
+            "run, as if no position were held"]
+
+    def test_a_refused_value_sizes_on_the_cash_alone(self, monkeypatch, caplog):
+        # $500.00 of positions beside $1,000.00 of cash, but only 400 contracts held
+        report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
+        code, seen = TestSizesOnPortfolioValue._run(
+            monkeypatch, caplog, _account(100_000, 50_000), report=report,
+            positions=self._positions(400.0))
+        assert code == EXIT_OK
+        assert seen["enrich"] == seen["compute_trade"] == (100_000, 100_000)
+        assert seen["select_portfolio"] == 100_000
+        # The one WARNING that says why, after the line that read the value
+        assert ("Sizing on portfolio value $1500.00 = cash $1000.00 + open positions $500.00"
+                in caplog.text)
+        assert [w for w in self._warnings(caplog) if "is not used" in w] == [
+            "Kalshi's value of the open positions ($500.00) is not used: that is more than "
+            "the 400 contract(s) held can be worth at $1.00 each — sizing on cash alone "
+            "($1000.00) this run, as if no position were held"]
+        # ... and it comes after that line and after the positions were read,
+        # since the check needs the contracts the account holds
+        messages = [r.getMessage() for r in caplog.records]
+        sizing = messages.index("Sizing on portfolio value $1500.00 = cash $1000.00 + "
+                                "open positions $500.00")
+        [refused] = [i for i, m in enumerate(messages) if "is not used" in m]
+        assert sizing < seen["held_at"] <= refused
+        assert ("Kalshi Pair Scan — Portfolio value: $1000.00 (cash $1000.00) | Mode: PROD"
+                in caplog.text)
+        # The run result records the cash as what the run sized on
+        assert report.balance_before == 1_000.0
+        assert report.portfolio_value_before == 1_000.0
+
+    def test_a_value_the_contracts_back_is_counted(self, monkeypatch, caplog):
+        # The same account holding 500 contracts: the value is counted
+        report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
+        code, seen = TestSizesOnPortfolioValue._run(
+            monkeypatch, caplog, _account(100_000, 50_000), report=report,
+            positions=self._positions(250.0, -250.0))
+        assert code == EXIT_OK
+        assert seen["enrich"] == seen["compute_trade"] == (150_000, 100_000)
+        assert not [w for w in self._warnings(caplog) if "is not used" in w]
+        assert report.portfolio_value_before == 1_500.0
+
+    @pytest.mark.parametrize("positions", [
+        _positions(1_000.0, complete=False),
+        _positions(1_000.0, None),
+    ], ids=["cut short", "unreadable count"])
+    def test_a_cut_short_listing_or_an_unreadable_count_refuses_the_value(
+            self, monkeypatch, caplog, positions):
+        # 1,000 contracts would back the $500.00, but the listing stopped
+        # early or a count could not be read, so the check cannot count them
+        report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
+        code, seen = TestSizesOnPortfolioValue._run(
+            monkeypatch, caplog, _account(100_000, 50_000), report=report,
+            positions=positions)
+        assert code == EXIT_OK
+        assert seen["enrich"] == seen["compute_trade"] == (100_000, 100_000)
+        assert len([w for w in self._warnings(caplog) if "is not used" in w]) == 1
+        assert report.portfolio_value_before == report.balance_before == 1_000.0
+
+    def test_holding_nothing_a_value_above_zero_is_refused(self, monkeypatch, caplog):
+        code, seen = TestSizesOnPortfolioValue._run(
+            monkeypatch, caplog, _account(100_000, 1), positions=self._positions())
+        assert code == EXIT_OK
+        assert seen["enrich"] == (100_000, 100_000)
+        assert len([w for w in self._warnings(caplog) if "is not used" in w]) == 1
+        # ... while a value of 0 holding nothing is counted as it is, silently
+        caplog.clear()
+        code, seen = TestSizesOnPortfolioValue._run(
+            monkeypatch, caplog, _account(100_000, 0), positions=self._positions())
+        assert code == EXIT_OK
+        assert seen["enrich"] == (100_000, 100_000)
+        assert self._warnings(caplog) == ["Running in PRODUCTION mode — real money will be used!"]
+
+    def test_a_refused_value_with_the_cash_under_the_minimum_skips_the_run(
+            self, monkeypatch, caplog):
+        # $10.00 of cash and $100.00 of positions pass the first minimum, but
+        # only 50 contracts are held: on the cash alone the run is under $50
+        report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
+        code, seen = TestSizesOnPortfolioValue._run(
+            monkeypatch, caplog, _account(1_000, 10_000), report=report,
+            positions=self._positions(50.0))
+        assert code == EXIT_SKIPPED_LOW_BALANCE
+        # The positions were read, then the run stopped before any scan
+        assert seen["held"] is True and "enrich" not in seen
+        message = ("Portfolio value $10.00 (cash $10.00) is below minimum $50.00 "
+                   "— skipping run.")
+        assert self._warnings(caplog)[-1] == message
+        assert report.message == message
+        assert report.balance_before == report.portfolio_value_before == 10.0
+        # The low-cash WARNING comes after the check, so a run the check
+        # stopped never logs it
+        assert not any(w.startswith("Cash $") for w in self._warnings(caplog))
+
+    def test_a_run_stopped_by_the_first_minimum_reads_no_positions(self, monkeypatch, caplog):
+        # $49.99 in all, holding nothing that could back the $39.99: the run
+        # stops at the first minimum, before the positions or the check
+        code, seen = TestSizesOnPortfolioValue._run(
+            monkeypatch, caplog, _account(1_000, 3_999), positions=self._positions())
+        assert code == EXIT_SKIPPED_LOW_BALANCE
+        assert seen["held"] is False
+        assert not [w for w in self._warnings(caplog) if "is not used" in w]
+
+    def test_the_low_cash_warning_comes_after_the_check(self, monkeypatch, caplog):
+        # $10.00 of cash under the minimum beside $100.00 of positions the 100
+        # contracts held back: the run goes on, and says so once the check has run
+        code, seen = TestSizesOnPortfolioValue._run(
+            monkeypatch, caplog, _account(1_000, 10_000), positions=self._positions(100.0))
+        assert code == EXIT_OK
+        assert seen["enrich"] == (11_000, 1_000)
+        [index] = [i for i, r in enumerate(caplog.records)
+                   if r.getMessage().startswith("Cash $10.00 is below the $50.00 minimum")]
+        assert index >= seen["held_at"]
 
 
 class TestBlindRunReason:
@@ -4245,8 +5147,8 @@ class TestBlindRunCensusEndToEnd:
         # all-halted disjunct cannot fire, so only the census catches it.
         with (
             patch(
-                "kalshi_betting.main.verify_auth",
-                return_value={DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS * 10},
+                "kalshi_betting.main.read_account_balance",
+                return_value=_account(MIN_BALANCE_CENTS * 10),
             ),
             patch("kalshi_betting.main.get_held_positions", side_effect=_held_positions()),
             patch("kalshi_betting.main.fetch_shard_statuses", return_value=None),
@@ -4347,13 +5249,13 @@ class TestMainEntryPoint:
 
         assert exc_info.value.code == EXIT_OK
 
-    @patch("kalshi_betting.main.verify_auth")
+    @patch("kalshi_betting.main.read_account_balance")
     @patch("kalshi_betting.main.build_client")
     def test_main_prod_mode_low_balance_exits_skip_code(
-        self, mock_build_client, mock_verify_auth, tmp_path, monkeypatch,
+        self, mock_build_client, mock_read_balance, tmp_path, monkeypatch,
     ):
         mock_build_client.return_value = MagicMock()
-        mock_verify_auth.return_value = {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1}
+        mock_read_balance.return_value = _account(MIN_BALANCE_CENTS - 1)
 
         monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(sys, "argv", ["kalshi_betting.main", "--mode", "prod"])
@@ -4367,10 +5269,10 @@ class TestMainEntryPoint:
     @patch("kalshi_betting.main.fetch_open_events_with_markets", return_value=[])
     @patch("kalshi_betting.main.fetch_shard_statuses")
     @patch("kalshi_betting.main.get_held_positions", side_effect=_held_positions())
-    @patch("kalshi_betting.main.verify_auth")
+    @patch("kalshi_betting.main.read_account_balance")
     @patch("kalshi_betting.main.build_client")
     def test_main_prod_mode_blind_run_exits_no_tradeable_shards_code(
-        self, mock_build_client, mock_verify_auth, mock_held, mock_shard_statuses,
+        self, mock_build_client, mock_read_balance, mock_held, mock_shard_statuses,
         mock_fetch, tmp_path, monkeypatch,
     ):
         # _run_prod's exit-30 return is covered directly elsewhere, but nothing
@@ -4378,7 +5280,7 @@ class TestMainEntryPoint:
         # process code is the ONLY signal scheduler.run_job has that the weekly
         # slot went unscanned rather than merely finding no edge (TS-01).
         mock_build_client.return_value = MagicMock()
-        mock_verify_auth.return_value = {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS * 10}
+        mock_read_balance.return_value = _account(MIN_BALANCE_CENTS * 10)
         # Every advertised shard halted: ingest drops every market, so nothing
         # could be scanned this run.
         mock_shard_statuses.return_value = {
@@ -4607,7 +5509,7 @@ class TestResultFile:
             caplog (pytest.LogCaptureFixture): Captures the run's log lines.
             dry_run (bool): Pass --dry-run.
             status (str): The status execute_trades gives each pair.
-            **stubs: main's names to replace, e.g. verify_auth=...
+            **stubs: main's names to replace, e.g. read_account_balance=...
 
         Returns:
             tuple[dict, dict, list]: What _main_with saw, the parsed result
@@ -4615,12 +5517,11 @@ class TestResultFile:
         """
         spec = make_spec()
         path = tmp_path / "result.json"
-        balances = iter([{DEFAULT_EXCHANGE_INDEX: self._BEFORE},
-                         {DEFAULT_EXCHANGE_INDEX: self._AFTER}])
+        balances = iter([_account(self._BEFORE), _account(self._AFTER)])
         logged = []
         patches = {
             "_run_prod": main._run_prod,
-            "verify_auth": lambda client: next(balances),
+            "read_account_balance": lambda client: next(balances),
             "get_held_positions": _held_positions(),
             "fetch_shard_statuses": lambda client: None,
             "fetch_open_events_with_markets": lambda client, inactive_shards: _stub_ingest(),
@@ -4630,9 +5531,10 @@ class TestResultFile:
             "find_time_series_pairs": lambda *a, **k: [],
             "find_same_title_pairs":
                 lambda markets, held, *, add_on_pairs=None: [spec.pair],
-            "enrich_with_orderbook_prices": lambda client, pairs, balance, *, settings: pairs,
-            "compute_trade": lambda pair, balance, *, settings: spec,
-            "select_portfolio": lambda specs, balance, *, held_ladders: specs,
+            "enrich_with_orderbook_prices":
+                lambda client, pairs, value, *, settings, cash_cents: pairs,
+            "compute_trade": lambda pair, value, *, settings, cash_cents: spec,
+            "select_portfolio": lambda specs, cash, *, held_ladders: specs,
             "pre_execution_check": lambda client, portfolio, *, settings: portfolio,
             "ensure_shard_collateral":
                 lambda client, portfolio, balances, statuses, *, dry_run: portfolio,
@@ -4682,7 +5584,8 @@ class TestResultFile:
         assert set(result) == {
             "format", "mode", "dry_run", "started_at", "finished_at", "exit_code",
             "settings", "defaults", "message", "balance_before", "balance_after",
-            "submission_started", "trades", "warnings", "warnings_dropped", "error"}
+            "portfolio_value_before", "submission_started", "trades", "warnings",
+            "warnings_dropped", "error"}
         assert result["format"] == config.LIVE_RUN_RESULT_FORMAT
         assert result["mode"] == "prod" and result["dry_run"] is False
         assert result["settings"] == describe_live_settings(saved, saved)
@@ -4691,23 +5594,41 @@ class TestResultFile:
             assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", result[key]), result[key]
         assert result["started_at"] <= result["finished_at"]
         assert result["error"] is None
+        # The portfolio value the run sized on: its cash, since it holds nothing
+        assert result["portfolio_value_before"] == self._BEFORE / 100
         # The result's exit code is the one main() exited with
         assert seen["code"] == result["exit_code"] == EXIT_OK
 
     def test_low_balance(self, monkeypatch, tmp_path, caplog):
         seen, result, records = self._run(
             monkeypatch, tmp_path, caplog,
-            verify_auth=lambda client: {DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1})
+            read_account_balance=lambda client: _account(MIN_BALANCE_CENTS - 1))
         assert seen["code"] == result["exit_code"] == EXIT_SKIPPED_LOW_BALANCE
         assert result["message"] == (
-            f"Balance ${(MIN_BALANCE_CENTS - 1) / 100:.2f} is below minimum "
+            f"Portfolio value ${(MIN_BALANCE_CENTS - 1) / 100:.2f} (cash "
+            f"${(MIN_BALANCE_CENTS - 1) / 100:.2f}) is below minimum "
             f"${MIN_BALANCE_CENTS / 100:.2f} — skipping run.")
         self._logged_once(records, result["message"], logging.WARNING)
         assert result["trades"] == []
         assert result["balance_before"] == (MIN_BALANCE_CENTS - 1) / 100
+        assert result["portfolio_value_before"] == (MIN_BALANCE_CENTS - 1) / 100
         assert result["balance_after"] is None
         assert result["submission_started"] is False
         assert f"WARNING: {result['message']}" in result["warnings"]
+
+    def test_the_portfolio_value_names_the_open_positions(self, monkeypatch, tmp_path, caplog):
+        # With positions held, the result names the cash and, beside it, the
+        # cash plus Kalshi's value of the positions: what Kelly was sized on.
+        # The 250 contracts held back the $250.00 (a contract pays at most $1)
+        reads = iter([_account(self._BEFORE, 25_000), _account(self._AFTER, 26_000)])
+        seen, result, _ = self._run(monkeypatch, tmp_path, caplog,
+                                    read_account_balance=lambda client: next(reads),
+                                    get_held_positions=_held_positions("HELD-X", count=250.0))
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        assert result["balance_before"] == self._BEFORE / 100
+        assert result["portfolio_value_before"] == (self._BEFORE + 25_000) / 100
+        # The balance after trading is the cash alone
+        assert result["balance_after"] == self._AFTER / 100
 
     def test_blind_run(self, monkeypatch, tmp_path, caplog):
         seen, result, records = self._run(
@@ -4734,7 +5655,7 @@ class TestResultFile:
     def test_empty_portfolio(self, monkeypatch, tmp_path, caplog):
         seen, result, records = self._run(
             monkeypatch, tmp_path, caplog,
-            select_portfolio=lambda specs, balance, *, held_ladders: [])
+            select_portfolio=lambda specs, cash, *, held_ladders: [])
         assert seen["code"] == result["exit_code"] == EXIT_OK
         assert result["message"] == "No executable trades found."
         self._logged_once(records, result["message"], logging.INFO)
@@ -4822,7 +5743,7 @@ class TestResultFile:
                                                               caplog):
         reads = []
 
-        def verify_auth(client):
+        def read_account_balance(client):
             """
             Read the balance once, then fail as a lost connection would.
 
@@ -4830,7 +5751,7 @@ class TestResultFile:
                 client: The run's client.
 
             Returns:
-                dict: The balance before trading, on the first read.
+                AccountBalance: The balance before trading, on the first read.
 
             Raises:
                 ConnectionError: On every later read.
@@ -4838,12 +5759,19 @@ class TestResultFile:
             reads.append(1)
             if len(reads) > 1:
                 raise ConnectionError("connection reset")
-            return {DEFAULT_EXCHANGE_INDEX: self._BEFORE}
+            # Open positions beside the cash, so a fallback to the portfolio
+            # value rather than the cash would show in the trade log
+            return _account(self._BEFORE, 25_000)
 
-        seen, result, _ = self._run(monkeypatch, tmp_path, caplog, verify_auth=verify_auth)
+        # The 250 contracts held back the $250.00 of positions, so the run
+        # sizes on the cash plus them, and the two figures differ
+        seen, result, _ = self._run(monkeypatch, tmp_path, caplog,
+                                    read_account_balance=read_account_balance,
+                                    get_held_positions=_held_positions("HELD-X", count=250.0))
         assert seen["code"] == result["exit_code"] == EXIT_OK
-        # The trade log falls back to the balance before trading; the result
-        # does not claim one it never read
+        assert result["portfolio_value_before"] == (self._BEFORE + 25_000) / 100
+        # The trade log falls back to the cash before trading (never the
+        # portfolio value); the result does not claim a balance it never read
         assert seen["trade_log_calls"][0][1:] == (self._BEFORE / 100, self._BEFORE / 100)
         assert result["balance_before"] == self._BEFORE / 100
         assert result["balance_after"] is None
@@ -5044,7 +5972,7 @@ class TestResultFile:
         add_on = make_spec()
         add_on.pair.held = scanner_mod.HeldPair(
             sides=(("TICK-A", "yes"), ("TICK-B", "no")), count=30.0,
-            cost_dollars=18.9, account_value_dollars=1000.0)
+            cost_dollars=18.9, value_dollars=18.0, fees_dollars=0.9)
 
         def executed(client, portfolio, *, dry_run):
             """
@@ -5503,8 +6431,8 @@ class TestDryRunInertInDev:
         with (
             patch("kalshi_betting.main.build_client", return_value=MagicMock()),
             patch(
-                "kalshi_betting.main.verify_auth",
-                return_value={DEFAULT_EXCHANGE_INDEX: MIN_BALANCE_CENTS - 1},
+                "kalshi_betting.main.read_account_balance",
+                return_value=_account(MIN_BALANCE_CENTS - 1),
             ),
         ):
             with pytest.raises(SystemExit):
@@ -5549,6 +6477,9 @@ class TestSandboxBalanceInertInProd:
         text = self._run(
             ["main", "--mode", "prod", "--sandbox-balance", "50"], caplog)
         assert "--sandbox-balance is inert in prod mode" in text
+        # It says what prod sizes on instead: the account's own portfolio value
+        assert ("prod sizes on the account's portfolio value (its cash plus its open "
+                "positions' value) and spends only its cash") in text
 
     def test_silent_when_not_passed_in_prod(self, caplog):
         text = self._run(["main", "--mode", "prod"], caplog)

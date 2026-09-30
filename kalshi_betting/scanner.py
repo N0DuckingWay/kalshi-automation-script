@@ -175,6 +175,7 @@ from .config import (
     LiveSettings,
     describe_time_series_rule,
     fee_per_pair_approx,
+    kelly_budget,
     live_settings,
     live_time_series_floor,
     max_affordable_pairs,
@@ -596,8 +597,9 @@ def tick_size_for_price(market: Any, price_dollars: float) -> Decimal:
     if finest is not None:
         return finest
 
-    # Only reached on a malformed or non-covering band list; called once per
-    # order leg at build time, so a warning here cannot spam the log.
+    # Only reached when no readable band with a positive step covers this price.
+    # This runs for each order leg and each size the sizer tries, so one market
+    # can warn many times a run.
     logging.warning(
         "No usable tick band for %s at price %.4f (structure=%r) — falling back to $%s",
         getattr(market, "ticker", "<unknown>"), price_dollars, structure, DEFAULT_TICK_SIZE_DOLLARS,
@@ -764,22 +766,42 @@ class HeldPair:
     held market shares a ladder label with either, and every held market's
     ladder is known), one held YES and one held NO, of equal size, both costs
     readable. A candidate adds to it only when it names the same two tickers
-    with the same side on each (matches).
+    with the same side on each (matches). Its stake (stake_dollars, the
+    worth plus the fees) is what sizing and the at-cap check subtract.
 
     Attributes:
         sides (tuple[tuple[str, str], tuple[str, str]]): (ticker, "yes" | "no")
             per market, sorted by ticker.
         count (float): Contracts held on each market.
-        cost_dollars (float): Both markets' exposure plus fees paid: the stake
-            the pair already holds, which an add-on tops up to its Kelly share.
-        account_value_dollars (float): Cash plus every held position's
-            exposure, as read at the start of the run; the Kelly share is a
-            fraction of this.
+        cost_dollars (float): Both markets' exposure plus fees paid: what the
+            account paid for the pair, named in the logs.
+        value_dollars (float): The pair's worth at today's prices, fees left
+            out: each market's contracts times the ask of the side held there
+            (its exposure when the market has no usable ask this run). Named
+            in the logs.
+        fees_dollars (float): Both markets' fees paid (HeldPosition.fees_dollars).
     """
     sides: tuple[tuple[str, str], tuple[str, str]]
     count: float
     cost_dollars: float
-    account_value_dollars: float
+    value_dollars: float
+    fees_dollars: float
+
+    @property
+    def stake_dollars(self) -> float:
+        """
+        Return what the pair already stakes: its worth at today's prices plus the fees paid.
+
+        What sizing and the at-cap check subtract from the pair's Kelly share
+        (config.held_pair_fraction): an add-on tops the pair up to that share
+        of the portfolio value. The fees count because they were spent on the
+        pair and the portfolio value no longer holds them, so a pair that
+        bought its whole share adds nothing more at unchanged prices.
+
+        Returns:
+            float: value_dollars plus fees_dollars.
+        """
+        return self.value_dollars + self.fees_dollars
 
     def matches(self, market_a: Any, market_b: Any, pair_type: str) -> bool:
         """
@@ -2894,7 +2916,43 @@ def resolve_held_ladders(client: Any, markets: list, held_tickers: set, *,
     return frozenset(keys)
 
 
-def held_pairs(positions: dict, labels_by_ticker: dict, cash_cents: int) -> dict:
+def _held_leg_worth(position: HeldPosition, side: str, market: Any) -> float:
+    """
+    Return what one held market's contracts are worth at today's prices, in dollars.
+
+    The contracts times the ask of the side held there (yes_ask_dollars for
+    YES, no_ask_dollars for NO): the price an add-on pays for more of the
+    same contracts, so the old and new ones are counted alike. When the
+    market is not in this run's market list, or its ask is missing, not a
+    number, or not strictly between 0 and 1, the contracts count at what they
+    cost instead (the listing's exposure, fees left out).
+
+    Args:
+        position (HeldPosition): One market of a held pair; its count and
+            exposure are readable (held_pairs checks both).
+        side (str): The side held there, "yes" or "no".
+        market (Any): The market from this run's market list, or None when
+            the list does not have it.
+
+    Returns:
+        float: The worth in dollars.
+    """
+    raw = getattr(market, f"{side}_ask_dollars", None) if market is not None else None
+    price = None
+    # A dollar string or a plain number only (Python counts True as the number 1)
+    if isinstance(raw, (str, int, float)) and not isinstance(raw, bool):
+        try:
+            price = float(raw)
+        except (ValueError, OverflowError):
+            # Not a number, or an integer too large for a float
+            price = None
+    # Strictly inside (0, 1): 0 or 1 is a settled market, and NaN fails both tests
+    if price is not None and 0.0 < price < 1.0:
+        return abs(position.count) * price
+    return position.exposure_dollars
+
+
+def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict) -> dict:
     """
     Find the held pairs a run may add to: two held markets forming one exact, isolated pair.
 
@@ -2905,9 +2963,12 @@ def held_pairs(positions: dict, labels_by_ticker: dict, cash_cents: int) -> dict
     to and stays blocked as any held market is: one leg alone (the other paid
     out or was closed), three or more held markets on one ladder, unequal
     counts (after a partial unwind), one side held twice, an unreadable count
-    or cost, or an exposure below the finest price times the count. The
-    account value is the cash plus every held position's exposure; an
-    unreadable exposure counts 0, which only lowers what an add-on may stake.
+    or cost, or an exposure below the finest price times the count. Each
+    pair is valued at today's prices (_held_leg_worth): each market's
+    contracts at the ask of the side held there, or at their exposure when
+    the market has no usable ask this run. Its stake, what sizing
+    subtracts, is that worth plus both markets' fees paid
+    (HeldPair.stake_dollars).
 
     The ladder of every held market must be known. When any held market is
     missing from labels_by_ticker, or has no labels, no pair is returned: a
@@ -2918,19 +2979,15 @@ def held_pairs(positions: dict, labels_by_ticker: dict, cash_cents: int) -> dict
         positions (dict): get_held_positions' result, ticker -> HeldPosition.
         labels_by_ticker (dict): ticker -> ladder labels for every held market
             (resolve_held_ladders' labels_out, after it returned labels).
-        cash_cents (int): The cash the run sizes on, in cents.
+        markets_by_ticker (dict): ticker -> market for this run's whole market
+            list, read before held markets are dropped from it; supplies
+            each held market's ask.
 
     Returns:
         dict: frozenset({ticker_a, ticker_b}) -> HeldPair, empty when no held
             market is part of an exact pair or a held market's ladder is
             unknown.
     """
-    open_cost = sum(p.exposure_dollars or 0.0 for p in positions.values())
-    account_value = cash_cents / 100.0 + open_cost
-    # Always logged, even when nothing qualifies: what the run may add to, and
-    # at what cost
-    logging.info("Account value for sizing held pairs: $%.2f (cash $%.2f + held "
-                 "positions at cost $%.2f)", account_value, cash_cents / 100.0, open_cost)
     # A held market with no known ladder could share one with a pair, so no
     # pair can be shown to be alone on its ladder
     if any(not labels_by_ticker.get(ticker) for ticker in positions):
@@ -2983,18 +3040,25 @@ def held_pairs(positions: dict, labels_by_ticker: dict, cash_cents: int) -> dict
                 or a.exposure_dollars < MIN_ACTIVE_PRICE_DOLLARS * abs(a.count)
                 or b.exposure_dollars < MIN_ACTIVE_PRICE_DOLLARS * abs(b.count)):
             continue
+        side_a = "yes" if a.count > 0 else "no"
+        side_b = "yes" if b.count > 0 else "no"
+        # Each market at today's price of the side held there
+        value = (_held_leg_worth(a, side_a, markets_by_ticker.get(a.ticker))
+                 + _held_leg_worth(b, side_b, markets_by_ticker.get(b.ticker)))
+        # Both fees are readable here (checked above), whatever the asks
+        # read, so the stake always counts them
         pairs[frozenset((a.ticker, b.ticker))] = HeldPair(
-            sides=((a.ticker, "yes" if a.count > 0 else "no"),
-                   (b.ticker, "yes" if b.count > 0 else "no")),
-            count=abs(a.count), cost_dollars=sum(costs),
-            account_value_dollars=account_value)
+            sides=((a.ticker, side_a), (b.ticker, side_b)),
+            count=abs(a.count), cost_dollars=sum(costs), value_dollars=value,
+            fees_dollars=a.fees_dollars + b.fees_dollars)
 
     # Each pair, then the count, zero included
     for key in sorted(pairs, key=sorted):
         pair = pairs[key]
-        logging.info("Held pair to add to: %s, %g contracts each, cost $%.2f",
+        logging.info("Held pair to add to: %s, %g contracts each, cost $%.2f (fees $%.2f), "
+                     "worth $%.2f at today's prices",
                      " / ".join(f"{side.upper()} {ticker}" for ticker, side in pair.sides),
-                     pair.count, pair.cost_dollars)
+                     pair.count, pair.cost_dollars, pair.fees_dollars, pair.value_dollars)
     logging.info("Held pairs to add to: %d (other held markets, never added to: %d)",
                  len(pairs), len(positions) - 2 * len(pairs))
     return pairs
@@ -5349,57 +5413,33 @@ def _levels_with_edge_after_fee(qualifying: list) -> list:
 
 
 def enrich_with_orderbook_prices(
-    client: Any, pairs: list, balance_cents: int, *,
-    settings: LiveSettings | None = None,
+    client: Any, pairs: list, portfolio_value_cents: int, *,
+    settings: LiveSettings | None = None, cash_cents: int | None = None,
 ) -> list:
     """
-    For each tradeable pair, fetch both order books, pair the NO leg's asks
-    with the YES leg's asks using a merge sweep (the legs' markets and sides
-    come from _leg_ask_levels), then filter to only contract pairs whose
-    combined LEG price meets the pair's gap threshold (see _pair_max_sum):
+    Check each pair against its live order books and price it at what the account could really pay.
 
-      same_title:  yes_price + no_price <= 1 - SAME_TITLE_MIN_PRICE_DIFF
-      time_series: yes_price + no_price <= 1 - the run's entry floor
-
-    The qualifying levels are then cut at the first with no edge after the fee
-    (_levels_with_edge_after_fee).
-
-    The two leg prices are replaced with weighted-average fill prices over the
-    contracts this account could actually BUY — not over the whole qualifying
-    book (#51). The averaged count is capped at config.max_affordable_pairs
-    over the best level's price sum at config.max_kelly_fraction(pair type,
-    settings), an upper bound on what strategy.compute_trade sizes under the
-    same settings, so the price written here is never below the traded one. The
-    qualifying levels themselves are kept on the pair (depth_levels) so
-    compute_trade can re-price at the exact n it settles on; max_contracts is
-    that capped count. nA and nB stay as scanned where they are not leg prices;
-    the reference quote comes from _reference_yes_ask.
-
-    A failing pair is marked tradeable=False; the time-series checks include a
-    later book with no YES ask (fail closed), a crossed one, and the spread rule.
+    For each tradeable pair, fetches both order books, matches the two legs'
+    asks level by level, keeps the levels whose combined price leaves the
+    required gap, and stops at the first level with no edge left after the fee.
+    The leg prices become the average fill price over the contracts this trade
+    could afford: at most what the largest possible Kelly share of the
+    portfolio value buys at the book's best price, and never more than the
+    cash. The kept levels are stored on the pair (depth_levels) so
+    compute_trade can price any count, and max_contracts is the number of
+    contracts the prices are for. A time-series pair also fails when the later
+    market shows no YES ask, its YES ask sits below its own YES bid, or the
+    spread rule refuses it. A pair that fails a check is marked tradeable=False.
 
     Args:
-        client (Any): Authenticated KalshiClient used to fetch each pair's
-            order books (cached per ticker across the whole call).
-        pairs (list): CandidatePair objects to enrich. A pair already marked
-            tradeable=False is passed through unchanged.
-        balance_cents (int): Account balance in integer cents — the real
-            per-shard sum in prod, the virtual --sandbox-balance in dev. Bounds
-            how much book depth is averaged into each pair's fill price.
-            Required rather than defaulted: both call sites already hold it,
-            and a default would silently restore whole-book pricing on a
-            real-money path with no signal that it had.
-        settings (LiveSettings | None): Keyword-only. The run's toggles (the
-            price-sum ceiling, the spread rule, the affordability bound). None
-            resolves config.live_settings() once (tests and direct calls only:
-            a live run hands the run's settings).
+        client (Any): Kalshi client used to fetch order books (each fetched once per call).
+        pairs (list): CandidatePairs; one already marked tradeable=False is passed through unchanged.
+        portfolio_value_cents (int): Cash plus open positions' value, in cents; required, as it limits how much of the book is averaged.
+        settings (LiveSettings | None): Keyword-only. The run's settings; None reads config.py's (tests only).
+        cash_cents (int | None): Keyword-only. The cash on hand in cents; None means it is all cash. Hand compute_trade the same value.
 
     Returns:
-        list: One CandidatePair per input pair, in the same order, with the
-            leg prices (nA/pB for same_title, pA/nB for time_series), the
-            reference quote (pB for time_series, pA for same_title, refreshed
-            only when the reference book side had resting bids), tradeable,
-            max_contracts and depth_levels replaced by depth-validated values.
+        list: One CandidatePair per input, in order, with prices, tradeable, max_contracts and depth_levels set from the books.
     """
     # Resolved once, so every pair below is judged under one rule
     settings = live_settings() if settings is None else settings
@@ -5486,14 +5526,14 @@ def enrich_with_orderbook_prices(
         )
 
         total_qty = sum(qty for _, _, qty in qualifying)
-        # Bound the average at the most contracts any Kelly result could ever
-        # afford, rather than averaging the whole book. Levels ascend by
-        # combined price, so the largest capped fraction over the BEST level's
-        # sum (the cheapest any prefix average can be) bounds the n compute_trade
-        # sizes. The time-series bound, 1 - k, holds only through the checks below.
+        # Average only over the most contracts the largest possible Kelly share
+        # could buy at the book's best price (never more than the cash), not the
+        # whole book. For time-series pairs this limit holds only because of the
+        # checks below.
         best_a, best_b, _ = depth_levels[0]
         bound = max_kelly_fraction(pair.pair_type, settings)
-        affordable = max_affordable_pairs(balance_cents, best_a + best_b, bound)
+        affordable = max_affordable_pairs(portfolio_value_cents, best_a + best_b, bound,
+                                          cash_cents=cash_cents)
         cap = min(int(total_qty), affordable)
         fills = prefix_fill_prices(depth_levels, cap)
 
@@ -5506,16 +5546,21 @@ def enrich_with_orderbook_prices(
             # different fixes (add funds vs. the book is too thin), and the
             # binding one is whichever is smaller. A bound of 0 gets its own wording: only
             # a time-series 1 - k rounding to 0 (k = 1) makes one (no cap can be 0).
-            zero_bound = ""
+            why = ""
             if bound == 0 and pair.pair_type == "time_series":
-                zero_bound = (
+                why = (
                     f"; the per-trade bound is 0 (k = {settings.interval_discount:.2f}: "
                     "time-series Kelly cannot be positive)"
                 )
+            # If the cash, not the portfolio share, limited the budget, say so
+            if (affordable < 1 and cash_cents is not None
+                    and kelly_budget(portfolio_value_cents / 100.0, bound)
+                    > cash_cents / 100.0):
+                why += f"; the ${cash_cents / 100:.2f} of cash binds"
             logging.info(
                 "No affordable contract pairs for '%s' — %.2f contract(s) rest at "
                 "the gap and the budget affords %d%s; skipping",
-                pair.canonical_title, total_qty, affordable, zero_bound,
+                pair.canonical_title, total_qty, affordable, why,
             )
             enriched.append(dc_replace(pair, tradeable=False))
             continue

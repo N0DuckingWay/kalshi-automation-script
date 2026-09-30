@@ -82,37 +82,24 @@ Purpose:
     the chance of submitting orders against a stale price.
 
     ensure_shard_collateral() moves cash between shards before trading:
-    sizing uses the whole balance, but each order is paid from its own
+    sizing counts every shard's cash, but each order is paid from its own
     market's shard. It totals what each shard needs, plans transfers from
     shards with spare cash, sends each transfer once to config.TRANSFER_PATH,
     and waits until the money has arrived; trades on a shard it could not
     fund are dropped. main._run_prod calls it right after pre_execution_check.
 
 Dependencies:
-    Imports TradeResult from reporter.py and TradeSpec from strategy.py;
-    ApiException (to recognise the V2 kill reply) from the kalshi_python_sync
-    SDK; fetch_json_page (position reads), signed_request_json and
-    api_call_with_retry (position reads only, never orders or transfers) from
-    _http.py, with api_error_payload (reads the error details Kalshi sends
-    back; _is_fok_kill checks their code) and api_error_summary (the one-line
-    description every failed request is logged and recorded with here);
-    ceil_to_tick, leg_prices, leg_sides, pair_held, tick_size_for_price,
-    v2_limit_price and validate_pair_price from scanner.py (leg_sides and
-    leg_prices decide which market gets which side; pair_held says which held
-    pair, if any, a pair adds to; ceil_to_tick and v2_limit_price are
-    re-exported here as _ceil_to_tick and _v2_limit_price);
-    read_shard_balances from auth.py (the balance re-read while waiting for a
-    transfer); and ORDER_WRITES_PER_SECOND, ORDER_WRITE_BURST,
-    ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, TRADER_MAX_WORKERS, TRANSFER_PATH,
-    TRANSFER_POLL_INTERVAL_SECONDS, TRANSFER_SETTLE_TIMEOUT_SECONDS,
-    V2_FOK_KILL_ERROR_CODE, V2_FOK_KILL_HTTP_STATUS,
-    V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS, V2_MAPPING_VERDICT_POLL_SECONDS,
-    V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS, V2_ORDER_PATH,
-    V2_ROLLBACK_BID_PRICE_DOLLARS, V2_SELF_TRADE_PREVENTION_TYPE, LiveSettings,
-    live_settings and count_text (writes a contract count exactly in an
-    alert or a marker) from config.py. Called by main.py after
-    select_portfolio() picks the trades. Uses the KalshiClient built by
-    auth.py.
+    Imports from config.py (the order, transfer and write-pacing settings,
+    LiveSettings, live_settings, leg_cash_cents, which rounds a leg's cost up
+    to the cent, and count_text, which writes a contract count exactly in an
+    alert or a marker); scanner.py (each leg's side and price, pair_held,
+    which says which held pair, if any, a pair adds to, the price-grid math,
+    validate_pair_price); _http.py (signed requests, retried position reads
+    and readers for error replies); auth.py (read_shard_balances);
+    reporter.py (TradeResult); strategy.py (TradeSpec); and ApiException from
+    the kalshi_python_sync SDK. scanner's ceil_to_tick and v2_limit_price are
+    re-exported here as _ceil_to_tick and _v2_limit_price. Called by main.py
+    after select_portfolio() picks the trades.
 
 Notes:
     Never retry an order or a collateral transfer: a resent order can fill
@@ -215,6 +202,7 @@ from .config import (
     V2_SELF_TRADE_PREVENTION_TYPE,
     LiveSettings,
     count_text,
+    leg_cash_cents,
     live_settings,
 )
 from .reporter import TradeResult
@@ -1823,12 +1811,9 @@ def _required_cents_by_shard(portfolio: list) -> dict[int, int]:
             (spec.pair.market_a, spec.cost_with_fees_a),
             (spec.pair.market_b, spec.cost_with_fees_b),
         ):
-            # Ceiling, never floor: under-funding a shard by even a fraction of
-            # a cent gets the order rejected for insufficient collateral, while
-            # over-funding it by one cent costs nothing. The round() first
-            # mirrors config.fee_leg_exact — it stops binary float noise (e.g.
-            # 7.000000000000001) from claiming a whole extra cent.
-            cents = math.ceil(round(cost_dollars * 100, 6))
+            # Round up to the cent, as portfolio selection does: an order short
+            # of cash by even a fraction of a cent is rejected
+            cents = leg_cash_cents(cost_dollars)
             required[market.exchange_index] = required.get(market.exchange_index, 0) + cents
     return required
 
@@ -2142,66 +2127,26 @@ def ensure_shard_collateral(
     dry_run: bool = False,
 ) -> list:
     """
-    Move collateral onto the exchange shards the selected portfolio draws from.
+    Move cash onto the shards the selected trades will draw from.
 
-    Kelly sizing is portfolio-wide — it runs against the SUM of every shard's
-    balance — but an order settles against its own market's shard only. This
-    function closes that gap: it totals each shard's cash requirement from the
-    legs' cost_with_fees_* (_required_cents_by_shard), plans greedy transfers
-    out of surplus shards (_plan_transfers), executes them, and confirms the
-    asynchronous funds have actually landed before letting execution proceed.
-
-    Failure is always degradation, never an abort: a blocked, failed, or
-    unsettled transfer results in the affected trades being dropped from the
-    returned portfolio while the rest execute normally. Specifically:
-
-      * No shard is short  -> returns the portfolio unchanged, no API calls.
-      * dry_run            -> logs the planned transfers and returns the
-                              portfolio unchanged. NEVER POSTs.
-      * Transfers inactive on either endpoint shard (per shard_statuses) ->
-        that transfer is not attempted; a warning tells the operator to move
-        the funds manually in the Kalshi UI.
-      * A transfer POST raises -> logged as an error and NOT retried (the
-        endpoint is not idempotent); its shard simply stays unfunded.
-      * Transfers accepted but NOT OBSERVED to land within
-        config.TRANSFER_SETTLE_TIMEOUT_SECONDS -> logged CRITICAL with the
-        in-flight transfer ids ("money is in flight"), and only the trades
-        needing a still-unfunded shard are dropped. The verdict is the
-        settlement OBSERVATION, not the fact that a transfer was headed there:
-        a shard whose accepted transfers were all observed to land and merely
-        fell short of its deficit gets a WARNING naming the shortfall instead.
-        That warning states only what was observed and asserts no cause — the
-        shard may be short because a leg was blocked, because a POST raised,
-        or because there was no surplus left, and this function cannot tell
-        which.
-
-    This is genuinely live, not a placeholder for a future migration: Kalshi
-    moved all combo/MVE markets to shard 1, crypto to shard 2, and
-    tennis/baseball to shard 3 (see the exchange-sharding gotcha in
-    CLAUDE.md), so a selected portfolio spanning shards — and an account
-    balance concentrated on one shard — is the normal case today, not an
-    edge case. The zero-deficit fast path still returns immediately with no
-    API calls whenever a run's selected legs happen to already sit on a
-    funded shard; it is a fast path for that case, not evidence collateral
-    movement is inactive in general.
+    The trades are paid for from the cash on all shards together, but each order
+    is paid from its own market's shard. This works out what each shard needs,
+    moves cash over from shards with spare cash, and waits, up to a time limit,
+    until it arrives. It never aborts the run: a trade with a leg on a shard it
+    could not fund is dropped and the rest go ahead. A transfer is sent once and
+    never retried, since a resent transfer moves the money twice. A sent transfer
+    not seen to arrive in time is logged as CRITICAL, naming its transfer IDs.
 
     Args:
-        client (Any): Authenticated KalshiClient from auth.build_client().
-        portfolio (list): TradeSpec objects selected for execution, each
-            carrying cost_with_fees_a / cost_with_fees_b.
-        shard_balances (dict[int, int]): exchange_index -> cents, as returned
-            by auth.verify_auth() before this run's orders.
-        shard_statuses (dict | None): scanner.fetch_shard_statuses() output,
-            used to skip shards whose intra_exchange_transfers_active is false.
-            None (breakdown unavailable) means transfers are attempted anyway
-            and the POST is allowed to fail loudly.
-        dry_run (bool): When True, plan and log but never POST. Defaults to False.
+        client (Any): A client made by auth.build_client().
+        portfolio (list): The TradeSpec objects selected to trade.
+        shard_balances (dict[int, int]): Each shard's cash in cents, read before this run's orders.
+        shard_statuses (dict | None): scanner.fetch_shard_statuses() output; None tries every transfer.
+        dry_run (bool): When True, log the plan but never send a transfer. Defaults to False.
 
     Returns:
-        list: The subset of `portfolio` whose every leg sits on a shard
-            confirmed to hold its required cash, in the input order. Equal to
-            `portfolio` whenever nothing needed funding or every transfer
-            settled; possibly empty when nothing could be funded.
+        list: The trades whose shards all hold their cash, in input order (possibly
+            empty); a dry run returns the portfolio unchanged.
     """
     if not portfolio:
         return []

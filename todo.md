@@ -64,11 +64,15 @@ data or the operator's machine · **[decision]** needs an operator call before a
 - [ ] **First `--add-to-held-pairs` dry run.** Before adding to held pairs goes on for every run,
   follow the first-run order (README "Save the live defaults"; the deploy steps in `CLAUDE.md`'s
   saved-live-defaults paragraph): save the seed values with adding off, run
-  `python3 -m kalshi_betting.main --mode prod --dry-run --add-to-held-pairs`, check each
-  `Held pair to add to: …` line's cost against its fills in the Kalshi UI, then turn adding on. That
+  `python3 -m kalshi_betting.main --mode prod --dry-run --add-to-held-pairs`, check that its
+  `Sizing on portfolio value` line shows the open positions as a dollar figure (not `not read`) with
+  no WARNING refusing them, check each `Held pair to add to: …` line's cost and fees against its fills
+  in the Kalshi UI and its `worth $W at today's prices` against the asks there, then turn adding on. That
   `market_exposure_dollars` is the cost without fees, positive for a NO position, and falls with a
   partial close is inferred from the API reference's one-line description, not observed
-  (`scanner.get_held_positions`, `scanner.held_pairs`; DR-77 in `CLAUDE.md`).
+  (`scanner.get_held_positions`, `scanner.held_pairs`; DR-77 in `CLAUDE.md`). Nor has a live
+  `portfolio_value` been checked against `main._checked_positions_value`'s $1-a-contract bound, or
+  compared with the held pairs' worth at the asks (Kalshi's own valuation; the two need not agree).
 
 ## 3. Pending operator decisions  [decision]
 
@@ -94,6 +98,11 @@ data or the operator's machine · **[decision]** needs an operator call before a
 - [ ] **Re-measure the headline numbers after DR-75/DR-76 and the v3 checkpoint prefilter.** Ladder
   backtest figures and RAM-warning eligible counts in `config.py` are marked "not re-measured"
   (`config.py:352-355, 1176-1179`).
+- [ ] **Re-measure the add-on figures now that a held pair's stake counts its fees** (operator
+  decision 2026-09-30) and trades are sized on the portfolio value: the Kelly chart's smallest
+  add-on y/x (0.002, CLAUDE.md's add-on select paragraph), and the add-on family's times and page
+  sizes (CLAUDE.md's add-on family paragraph, README's "Cost of the family"). The golden fixture's
+  add-on counts and sizes were re-measured on 2026-09-30 (CLAUDE.md's backtest add-on paragraph).
 - [ ] **No candle-staleness bound and no crossed-book guard in `_find_entry`**, while live fails
   closed on both (`backtester.py:3826-3834, 3852-3945`; `scanner.py:5111-5115`). Will move every
   result when fixed.

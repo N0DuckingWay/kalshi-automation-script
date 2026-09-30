@@ -5646,8 +5646,8 @@ _ADD_ON_OPTION_ON = "on (up to the size cap)"
 _ADD_ON_SELECT_TITLE = (
     "off: a pair is bought once and not again while it is held. on: a pair still held "
     "can be bought again on a later Monday (the same two markets, the same side on "
-    "each), sized so the old and new contracts together stay within the size cap's "
-    "share of the account value (cash plus open trades at cost). Live trading follows "
+    "each), sized so old and new together, with the fees paid, stay within the size "
+    "cap's share of the portfolio value (cash plus open trades at cost). Live trading follows "
     "the saved live defaults, not this choice. The Scenario Explorer and Interval "
     "Discount sections always show it off. In the Risk section's Kelly chart an added "
     "trade plots only what it added, so it sits below the 1:1 line.")

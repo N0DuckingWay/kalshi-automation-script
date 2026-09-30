@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import pathlib
+import random
 import re
 import sys
 import threading
@@ -45,6 +46,8 @@ from kalshi_betting.config import (
     fee_leg_exact,
     fee_per_pair_approx,
     held_pair_fraction,
+    kelly_budget,
+    leg_cash_cents,
     live_settings,
     max_affordable_pairs,
     max_kelly_fraction,
@@ -708,6 +711,35 @@ class TestMaxAffordablePairs:
     def test_budget_too_small_for_one_pair(self):
         assert max_affordable_pairs(100, 0.90, 0.20) == 0
 
+    def test_cash_cents_is_keyword_only(self):
+        # A fourth positional argument cannot be read as the cash by accident
+        with pytest.raises(TypeError):
+            max_affordable_pairs(100_000, 0.50, 0.20, 5_000)
+
+    def test_the_cash_bounds_the_budget(self):
+        # $1,000 x 50% = $500 at $0.50 a pair buys 1,000 pairs; $100 of cash
+        # buys 200, and cash above the $500 share changes nothing
+        assert max_affordable_pairs(100_000, 0.50, 0.50) == 1_000
+        assert max_affordable_pairs(100_000, 0.50, 0.50, cash_cents=10_000) == 200
+        assert max_affordable_pairs(100_000, 0.50, 0.50, cash_cents=50_000) == 1_000
+        assert max_affordable_pairs(100_000, 0.50, 0.50, cash_cents=900_000) == 1_000
+        assert max_affordable_pairs(100_000, 0.50, 0.50, cash_cents=0) == 0
+
+    def test_float_identity_with_the_expression_it_replaced(self):
+        # With no cash, or cash that does not bind, the count is exactly the one
+        # int((bankroll_cents / 100.0) * fraction / price_sum) gave, float for float
+        rng = random.Random(20260929)
+        grid = [0.05 * i for i in range(1, 21)] + [round(1 - 0.8, 12), 0.19999999999999996]
+        for _ in range(20_000):
+            bankroll = rng.choice([rng.randrange(0, 10_000), rng.randrange(0, 10**9)])
+            price_sum = rng.choice([rng.uniform(0.0001, 1.9999),
+                                    round(rng.randrange(1, 200) * 0.01, 2)])
+            fraction = rng.choice([rng.random(), rng.choice(grid)])
+            old = int((bankroll / 100.0) * fraction / price_sum)
+            assert max_affordable_pairs(bankroll, price_sum, fraction) == old
+            assert max_affordable_pairs(bankroll, price_sum, fraction,
+                                        cash_cents=bankroll) == old
+
     @pytest.mark.parametrize("k, cap, st_cap", [
         (0.75, 0.20, 1.0), (0.40, 1.0, 1.0), (0.80, 1.0, 1.0), (0.60, 0.35, 1.0),
         (0.80, 1.0, 0.20), (0.40, 0.35, 0.05),
@@ -748,8 +780,54 @@ class TestMaxAffordablePairs:
             assert spec.kelly_fraction <= bound, (p.canonical_title, spec.kelly_fraction, bound)
             # ... and so the scanner's count bounds the sizer's
             assert spec.x <= max_affordable_pairs(balance, sum(leg_prices(p)), bound)
+            # ... and still does when the cash binds both the same way
+            for cash in (500, 5_000, 50_000):
+                capped = compute_trade(p, balance, settings=settings, cash_cents=cash)
+                if capped is not None:
+                    assert capped.x <= max_affordable_pairs(
+                        balance, sum(leg_prices(p)), bound, cash_cents=cash)
+                    assert capped.total_cost_with_fees <= cash / 100 + 1e-9
         # Non-vacuous for both types at every setting
         assert sized["time_series"] > 0 and sized["same_title"] > 0, sized
+
+
+class TestKellyBudget:
+    """kelly_budget is the one rule for what a trade may spend: a fraction of
+    the portfolio value, never more than the cash on hand."""
+
+    def test_a_share_of_the_bankroll(self):
+        assert kelly_budget(1_000.0, 0.20) == pytest.approx(200.0)
+
+    def test_the_cash_binds_when_it_is_smaller(self):
+        assert kelly_budget(1_000.0, 0.20, 150.0) == pytest.approx(150.0)
+        assert kelly_budget(1_000.0, 0.20, 500.0) == pytest.approx(200.0)
+        assert kelly_budget(1_000.0, 0.20, 0.0) == 0.0
+
+    def test_no_cash_returns_the_product_exactly(self):
+        # The sizer's budget before the cash existed was bankroll * fraction;
+        # with no cash the float must be that product, bit for bit
+        rng = random.Random(7)
+        for _ in range(1_000):
+            bankroll, fraction = rng.uniform(0, 1e7), rng.random()
+            assert kelly_budget(bankroll, fraction) == bankroll * fraction
+
+    def test_units_in_are_units_out(self):
+        assert kelly_budget(100_000, 0.5, 20_000) == 20_000
+
+
+class TestLegCashCents:
+    """leg_cash_cents is the one dollars -> whole cents rounding for what an
+    order leg draws, shared by the shard funder and select_portfolio."""
+
+    def test_rounds_up_to_the_cent(self):
+        assert leg_cash_cents(1.001) == 101
+        assert leg_cash_cents(1.0) == 100
+        assert leg_cash_cents(0.0) == 0
+
+    def test_float_noise_does_not_claim_a_cent(self):
+        # 0.07 * 100 is 7.000000000000001
+        assert leg_cash_cents(0.07) == 7
+        assert leg_cash_cents(0.1 + 0.2) == 30
 
 
 class TestCreateNewOutput:
@@ -1167,32 +1245,59 @@ class TestPairSizeCap:
 class TestHeldPairFraction:
     """config.held_pair_fraction, the one definition of an add-on's size.
 
-    Kelly sizes the whole position: a held pair holds at most `fraction` of
-    the account value in all, and an add-on never stakes more of the cash than
-    a new pair would. A wrong answer here stakes real money on a pair the
-    account already holds.
+    Kelly sizes the whole position: a held pair (its held stake, the worth
+    plus the fees paid for it) holds at most `fraction` of the portfolio
+    value in all, and an add-on never takes a bigger share than a new pair
+    would. Its budget is then kelly_budget(portfolio value, that share,
+    cash), so it never spends more than the cash either. A wrong answer here
+    stakes real money on a pair the account already holds.
     """
 
     def test_a_pair_holding_little_sizes_as_a_new_pair(self):
-        # Nothing held and plenty of account value: the new-pair fraction binds
-        assert held_pair_fraction(0.10, 0.0, 10_000.0, 150.0) == 0.10
+        # Nothing held: exactly the new-pair share
+        assert held_pair_fraction(0.10, 0.0, 10_000.0) == 0.10
+        # A little held and the cash binding: the add-on's budget is exactly a
+        # new pair's, all $150 of the cash (10% of $10,000 less $1 is $999)
+        little = held_pair_fraction(0.10, 1.0, 10_000.0)
+        assert little == 0.10 - 1.0 / 10_000.0
+        assert (kelly_budget(10_000.0, little, 150.0)
+                == kelly_budget(10_000.0, 0.10, 150.0) == 150.0)
 
     def test_the_whole_position_binds_when_the_pair_holds_part_of_its_share(self):
-        # 10% of a $211 account is $21.10; $8 is held, so $13.10 of $150 cash
-        assert held_pair_fraction(0.10, 8.0, 211.0, 150.0) == pytest.approx(
-            (21.1 - 8.0) / 150.0)
+        # 10% of a $211 portfolio is $21.10; the pair stakes $8, so the add-on
+        # may take $13.10, and $150 of cash does not bind
+        share = held_pair_fraction(0.10, 8.0, 211.0)
+        assert share == 0.10 - 8.0 / 211.0
+        assert kelly_budget(211.0, share, 150.0) == pytest.approx(13.10, abs=1e-12)
+        # With $10 of cash the cash binds instead, as it does for any trade
+        assert kelly_budget(211.0, share, 10.0) == 10.0
 
-    @pytest.mark.parametrize("held_cost", [21.1000001, 25.0, 211.0])
-    def test_a_pair_above_its_kelly_share_adds_nothing(self, held_cost):
-        # Just above 10% of $211 (a held cost of exactly $21.10 would rest on
-        # 0.10 x 211.0 rounding to exactly 21.1 in floating point), and well above
-        assert held_pair_fraction(0.10, held_cost, 211.0, 150.0) <= 0
+    def test_a_stake_with_its_fees_leans_safe_at_unchanged_prices(self):
+        # A pair bought its whole 10% share of $205.00: $19.60 of contracts
+        # and $0.90 of fees. At unchanged prices the portfolio value is
+        # $204.10, the fees being spent. Its stake with the fees, $20.50, is
+        # above 10% of $204.10 ($20.41): nothing is missing
+        assert held_pair_fraction(0.10, 19.60 + 0.90, 204.10) < 0
+        # With the fees left out of the stake, $0.81 would read as missing,
+        # enough for one more contract pair at these prices every run
+        share = held_pair_fraction(0.10, 19.60, 204.10)
+        assert share > 0
+        assert kelly_budget(204.10, share, 184.50) == pytest.approx(0.81, abs=1e-9)
 
-    @pytest.mark.parametrize("balance", [0.0, -5.0, math.nan])
-    def test_no_cash_adds_nothing(self, balance):
-        assert held_pair_fraction(0.10, 0.0, 211.0, balance) == 0.0
+    @pytest.mark.parametrize("held_stake", [21.1000001, 25.0, 211.0])
+    def test_a_pair_above_its_kelly_share_adds_nothing(self, held_stake):
+        # Just above 10% of $211 (a stake of exactly $21.10 would rest on
+        # 21.1 / 211.0 rounding to exactly 0.1 in floating point), and well above
+        assert held_pair_fraction(0.10, held_stake, 211.0) <= 0
 
-    @pytest.mark.parametrize("fraction, held_cost, account_value", [
+    @pytest.mark.parametrize("portfolio_value", [0.0, -5.0, math.nan, math.inf])
+    def test_no_portfolio_value_adds_nothing(self, portfolio_value):
+        # Not a positive, finite value: at +inf the held pair would read as
+        # holding none of its share, and the add-on would take all of it
+        assert held_pair_fraction(0.10, 0.0, portfolio_value) == 0.0
+        assert held_pair_fraction(0.10, 8.0, portfolio_value) == 0.0
+
+    @pytest.mark.parametrize("fraction, held_stake, portfolio_value", [
         (math.nan, 8.0, 211.0),
         (0.10, math.nan, 211.0),
         (0.10, 8.0, math.nan),
@@ -1200,14 +1305,38 @@ class TestHeldPairFraction:
         (0.10, 8.0, math.inf),
         (0.10, math.inf, math.inf),
     ])
-    def test_a_result_that_is_not_a_number_adds_nothing(self, fraction, held_cost,
-                                                         account_value):
-        # min(fraction, nan) is fraction, which would read garbage as a full share
-        assert held_pair_fraction(fraction, held_cost, account_value, 150.0) == 0.0
+    def test_a_result_that_is_not_a_number_adds_nothing(self, fraction, held_stake,
+                                                         portfolio_value):
+        # min(fraction, nan) is fraction, which would read garbage as a full
+        # share, so the difference is tested before min
+        assert held_pair_fraction(fraction, held_stake, portfolio_value) == 0.0
+
+    @pytest.mark.parametrize("fraction, held_stake", [
+        (math.inf, 8.0),
+        (0.10, -math.inf),
+    ])
+    def test_an_infinite_share_adds_nothing(self, fraction, held_stake):
+        # Each makes the difference +inf, and min would then return the whole
+        # fraction (0.10 for the stake, inf for the share): refused before min
+        assert held_pair_fraction(fraction, held_stake, 211.0) == 0.0
 
     @pytest.mark.parametrize("fraction", [0.05, 0.10, 0.25, 1.0])
     def test_nothing_held_and_no_other_position_is_exactly_a_new_pair(self, fraction):
-        assert held_pair_fraction(fraction, 0.0, 200.0, 200.0) == fraction
+        assert held_pair_fraction(fraction, 0.0, 200.0) == fraction
+
+
+class TestContractPayout:
+    """CONTRACT_PAYOUT_DOLLARS: what one winning contract pays.
+
+    A contract pays $1 if it wins and nothing if it loses, so an open
+    position is worth at most $1 per contract held. A production run refuses
+    Kalshi's value of the open positions above that bound; a wrong constant
+    would let a value in the wrong units size every trade.
+    """
+
+    def test_a_contract_pays_one_dollar(self):
+        assert config.CONTRACT_PAYOUT_DOLLARS == 1.0
+        assert type(config.CONTRACT_PAYOUT_DOLLARS) is float
 
 
 class TestDescribeTimeSeriesRule:
@@ -1446,10 +1575,10 @@ class TestLiveRuleWarnings:
         # --size-cap 60 --interval-discount 0.4: both types reach the cap
         out = config.live_rule_warnings(_settings(interval_discount=0.4, size_cap=0.6))
         assert out == [
-            "one time-series pair may stake up to 60% of the balance, above the 20% "
-            "this check accepts",
-            "one same-title pair may stake up to 60% of the balance, above the 20% "
-            "this check accepts",
+            "one time-series pair may stake up to 60% of the portfolio value, above the "
+            "20% this check accepts",
+            "one same-title pair may stake up to 60% of the portfolio value, above the "
+            "20% this check accepts",
         ]
 
     def test_no_cap_with_a_same_title_cap_of_50_warns_for_both_types(self):
@@ -1467,7 +1596,7 @@ class TestLiveRuleWarnings:
         # 1 - 0.7996 = 0.2004: over 20%, and never printed as 20%
         (text,) = config.live_rule_warnings(_settings(interval_discount=0.7996, size_cap=1.0,
                                                      same_title_size_cap=0.2))
-        assert "up to 20.04% of the balance" in text
+        assert "up to 20.04% of the portfolio value" in text
 
     def test_k_of_one_names_the_dead_time_series_leg(self):
         (text,) = config.live_rule_warnings(_settings(interval_discount=1.0))
@@ -1477,7 +1606,7 @@ class TestLiveRuleWarnings:
     @pytest.mark.parametrize("k", [0.4, 0.75, 0.8, 1.0])
     def test_add_on_adds_no_sentence(self, cap, k):
         # Kelly on the whole position keeps a held pair within max_kelly_fraction
-        # of the account value, the bound the EXPOSURE sentence already names,
+        # of the portfolio value, the bound the EXPOSURE sentence already names,
         # so the toggle changes no sentence at any cap or k
         off = _settings(interval_discount=k, size_cap=cap)
         on = dataclasses.replace(off, add_to_held_pairs=True)

@@ -4312,12 +4312,13 @@ def _st_candidate(*, pA: float, pB: float, nA: float, nB: float = 0.70) -> Candi
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestEnrichmentBoundsDepthByAffordability:
-    """Enrichment must average only the depth this balance could actually buy.
+    """Enrichment must average only the depth this account could actually buy.
 
-    One pair is capped at BUDGET_FRACTION of the balance, so averaging a liquid
-    market's full book priced every pair against levels no single trade can
-    reach — inflating the fill price and killing pairs at the profitability gate
-    on contracts we would never have bought.
+    One pair's budget is its capped Kelly fraction of the portfolio value, never
+    more than the cash on hand, so averaging a liquid market's full book priced
+    every pair against levels no single trade can reach — inflating the fill
+    price and killing pairs at the profitability gate on contracts we would
+    never have bought.
 
     Worked under pre_toggle_defaults (tier floors on, a 20% cap); the shipped
     rule is pinned by test_config.py's TestShippedLiveToggles.
@@ -4398,6 +4399,51 @@ class TestEnrichmentBoundsDepthByAffordability:
                   if "No affordable contract pairs" in r.getMessage()]
         assert "0.40 contract(s) rest at the gap" in line, line
         assert "budget affords 0" not in line, line
+
+    def test_the_cash_bounds_the_depth_averaged(self):
+        # $1,000 x 20% = $200 would reach all 100 qualifying contracts, but
+        # $8.00 of cash buys only the 10 at the best 0.75 level — the same
+        # count a $40 portfolio value affords
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.45)
+        client = _ts_multilevel_client(self.LEVELS)
+        [enriched] = enrich_with_orderbook_prices(client, [pair], 100_000, cash_cents=800)
+        assert enriched.tradeable is True
+        assert enriched.max_contracts == 10
+        assert enriched.pA == pytest.approx(0.30)
+        assert enriched.nB == pytest.approx(0.45)
+        # Cash above the Kelly share changes nothing
+        [ample] = enrich_with_orderbook_prices(
+            _ts_multilevel_client(self.LEVELS), [pair], 100_000, cash_cents=1_000_000)
+        assert ample.max_contracts == self._enrich(100_000).max_contracts == 100
+
+    def test_the_unaffordable_line_says_when_the_cash_binds(self, caplog):
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.62, nB=0.45)
+        with caplog.at_level(logging.INFO, logger=""):
+            [enriched] = enrich_with_orderbook_prices(
+                _ts_multilevel_client(self.LEVELS), [pair], 100_000, cash_cents=50)
+        assert enriched.tradeable is False
+        [line] = [r.getMessage() for r in caplog.records
+                  if "No affordable contract pairs" in r.getMessage()]
+        assert "budget affords 0; the $0.50 of cash binds" in line, line
+        # A budget the portfolio value's share limits says nothing about cash
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=""):
+            enrich_with_orderbook_prices(
+                _ts_multilevel_client(self.LEVELS), [pair], 100, cash_cents=1_000_000)
+        [line] = [r.getMessage() for r in caplog.records
+                  if "No affordable contract pairs" in r.getMessage()]
+        assert "cash binds" not in line, line
+        # Nor does a thin book, even when the cash is below the share: $100 of
+        # cash affords 133 pairs, and only the 0.4 contracts on the book stop it
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=""):
+            enrich_with_orderbook_prices(
+                _ts_multilevel_client([(0.30, 0.45, 0.4)]), [pair], 100_000_000,
+                cash_cents=10_000)
+        [line] = [r.getMessage() for r in caplog.records
+                  if "No affordable contract pairs" in r.getMessage()]
+        assert "budget affords 133" in line, line
+        assert "cash binds" not in line, line
 
     def test_max_contracts_is_what_the_written_price_covers(self):
         # The invariant compute_trade's depth clamp relies on: the price written
@@ -5525,7 +5571,7 @@ _ADD_ON_LINE = "Time-series pairs that add to a held pair: "
 def _add_on(*sides: tuple, count: float = 30.0) -> HeldPair:
     """A held pair the run may add to, holding `sides` ((ticker, side) each)."""
     return HeldPair(sides=tuple(sorted(sides)), count=count, cost_dollars=18.9,
-                    account_value_dollars=168.0)
+                    value_dollars=18.0, fees_dollars=0.9)
 
 
 class TestFinderAddsToHeldPairs:
@@ -7146,44 +7192,79 @@ def _held(ticker: str, count, exposure=None, fees=None) -> HeldPosition:
     return HeldPosition(ticker, count, exposure, fees)
 
 
+def _priced_rung(ticker: str, deadline: str, *, yes_ask, no_ask):
+    """A listed rung of the Starship ladder with these asks (raw values, as sent)."""
+    return _ingest_market(ticker, _STAR_EVENT,
+                          f"Will SpaceX launch another Starship before {deadline}?",
+                          _STAR_TITLE, yes_ask=yes_ask, no_ask=no_ask)
+
+
 class TestHeldPairs:
     """held_pairs finds the held pairs a run may add to: exactly two held
     markets on one ladder, one YES and one NO of equal size, both costs
     readable. Every other shape is never added to. An add-on is exempt from
     the one-trade-per-ladder rule only because this isolation holds, so a
-    shape it lets through by mistake is a real-money stacking bug."""
+    shape it lets through by mistake is a real-money stacking bug. Each pair
+    is valued at today's prices, and its stake, the figure sizing reads, is
+    that worth plus both markets' fees paid: a wrong stake sizes a real
+    add-on too big or too small."""
 
     @staticmethod
     def _labels(*markets) -> dict:
         """Each market's ladder labels, as resolve_held_ladders' labels_out gives them."""
         return {m.ticker: market_ladder_keys(m) for m in markets}
 
+    @staticmethod
+    def _listed(*markets) -> dict:
+        """This run's market list as held_pairs reads it: ticker -> market."""
+        return {m.ticker: m for m in markets}
+
     def _ladder(self) -> dict:
         """The two rungs' labels: one event and one question."""
         return self._labels(_star_rung(_RUNG_EARLY, "Mar 1, 2026"),
                             _star_rung(_RUNG_LATE, "Mar 20, 2026"))
 
+    @staticmethod
+    def _rung_markets(late_no="0.45") -> dict:
+        """The two rungs as this run lists them: early YES asked at 0.30, late NO at late_no."""
+        early = _priced_rung(_RUNG_EARLY, "Mar 1, 2026", yes_ask="0.30", no_ask="0.71")
+        late = _priced_rung(_RUNG_LATE, "Mar 20, 2026", yes_ask="0.56", no_ask="0.45")
+        # Set as sent, so a quote no market dict could be built from still reaches held_pairs
+        late.no_ask_dollars = late_no
+        return TestHeldPairs._listed(early, late)
+
     def test_an_exact_time_series_pair(self):
         positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 6.00, 0.40),
                      _RUNG_LATE: _held(_RUNG_LATE, -30.0, 12.00, 0.50)}
-        [(key, pair)] = held_pairs(positions, self._ladder(), 15_000).items()
+        [(key, pair)] = held_pairs(positions, self._ladder(), self._rung_markets()).items()
         assert key == frozenset({_RUNG_EARLY, _RUNG_LATE})
         assert pair.sides == ((_RUNG_EARLY, "yes"), (_RUNG_LATE, "no"))
         assert pair.count == 30.0
         assert pair.cost_dollars == pytest.approx(18.90)
-        # Cash plus every held position's exposure
-        assert pair.account_value_dollars == pytest.approx(150.0 + 18.0)
+        # Each market at the ask of the side held there: YES at 0.30, NO at 0.45
+        assert pair.value_dollars == 30.0 * 0.30 + 30.0 * 0.45 == 22.5
+        # Both markets' fees paid, $0.40 and $0.50, and the stake sizing
+        # subtracts: the worth plus those fees
+        assert pair.fees_dollars == 0.40 + 0.50
+        assert pair.stake_dollars == 22.5 + (0.40 + 0.50) == pytest.approx(23.40)
 
     def test_a_same_title_pair_is_joined_by_its_shared_question(self):
         # Two events of two series asking one question
-        x = _ingest_market("KXA-1-Y", "KXA-1", "Who wins the game?", "Game", subtitle="Team A")
-        y = _ingest_market("KXB-1-Y", "KXB-1", "Who wins the game?", "Game", subtitle="Team A")
+        x = _ingest_market("KXA-1-Y", "KXA-1", "Who wins the game?", "Game", subtitle="Team A",
+                           yes_ask="0.45", no_ask="0.56")
+        y = _ingest_market("KXB-1-Y", "KXB-1", "Who wins the game?", "Game", subtitle="Team A",
+                           yes_ask="0.47", no_ask="0.54")
         labels = self._labels(x, y)
         assert {kind for kind, _ in labels[x.ticker] & labels[y.ticker]} == {"question"}
         positions = {x.ticker: _held(x.ticker, -10.0, 4.00, 0.20),
                      y.ticker: _held(y.ticker, 10.0, 5.00, 0.20)}
-        [pair] = held_pairs(positions, labels, 10_000).values()
+        [pair] = held_pairs(positions, labels, self._listed(x, y)).values()
         assert pair.sides == ((x.ticker, "no"), (y.ticker, "yes"))
+        # NO held on x at its NO ask, YES held on y at its YES ask (the other
+        # way round would read 10 x 0.45 + 10 x 0.54)
+        assert pair.value_dollars == 10.0 * 0.56 + 10.0 * 0.47
+        # Both markets' fees ($0.20 each) count into the stake
+        assert pair.stake_dollars == 10.0 * 0.56 + 10.0 * 0.47 + (0.20 + 0.20)
 
     @pytest.mark.parametrize("early, late", [
         # Unequal counts, as after a partial unwind: exact, never within a tolerance
@@ -7203,7 +7284,7 @@ class TestHeldPairs:
             "zero-exposure", "exposure-below-floor"])
     def test_a_shape_that_is_not_an_exact_pair_is_never_added_to(self, early, late):
         positions = {early.ticker: early, late.ticker: late}
-        assert held_pairs(positions, self._ladder(), 15_000) == {}
+        assert held_pairs(positions, self._ladder(), self._rung_markets()) == {}
 
     def test_a_third_held_market_on_the_ladder_leaves_no_pair(self):
         mid = _star_rung("KXSTAR-14-MAR10", "Mar 10, 2026")
@@ -7211,18 +7292,18 @@ class TestHeldPairs:
         positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 6.0, 0.4),
                      _RUNG_LATE: _held(_RUNG_LATE, -30.0, 12.0, 0.5),
                      mid.ticker: _held(mid.ticker, 5.0, 2.0, 0.1)}
-        assert held_pairs(positions, labels, 15_000) == {}
+        assert held_pairs(positions, labels, {**self._rung_markets(), **self._listed(mid)}) == {}
 
     def test_one_leg_alone_is_never_added_to(self):
         positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 6.0, 0.4)}
-        assert held_pairs(positions, self._ladder(), 15_000) == {}
+        assert held_pairs(positions, self._ladder(), self._rung_markets()) == {}
 
     def test_a_market_without_labels_joins_nothing(self):
         positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 6.0, 0.4),
                      _RUNG_LATE: _held(_RUNG_LATE, -30.0, 12.0, 0.5)}
         labels = self._ladder()
         del labels[_RUNG_LATE]
-        assert held_pairs(positions, labels, 15_000) == {}
+        assert held_pairs(positions, labels, self._rung_markets()) == {}
 
     @pytest.mark.parametrize("unknown", ["missing", "empty"])
     def test_a_third_held_market_with_no_known_ladder_leaves_no_pair(self, caplog, unknown):
@@ -7237,25 +7318,85 @@ class TestHeldPairs:
         if unknown == "empty":
             labels[mid.ticker] = frozenset()
         # Non-vacuous: without the Mar 10 rung the other two are an exact pair
+        markets = {**self._rung_markets(), **self._listed(mid)}
         assert held_pairs({t: positions[t] for t in (_RUNG_EARLY, _RUNG_LATE)},
-                          labels, 15_000)
+                          labels, markets)
         caplog.clear()
         with caplog.at_level(logging.INFO):
-            assert held_pairs(positions, labels, 15_000) == {}
-        assert "Held pairs to add to: none (a held market's ladder is unknown)" in caplog.text
-        # The account value is still reported
-        assert "Account value for sizing held pairs: $170.00" in caplog.text
-        assert "Held pair to add to:" not in caplog.text
+            assert held_pairs(positions, labels, markets) == {}
+        # The one line, and nothing else: no pair, and no sizing figure of its own
+        assert [r.getMessage() for r in caplog.records] == [
+            "Held pairs to add to: none (a held market's ladder is unknown)"]
 
-    def test_the_account_value_counts_every_exposure_and_an_unreadable_one_as_zero(self):
+    def test_the_value_counts_only_the_pair_s_own_markets(self):
+        # Other held markets (one unreadable) never count into the pair's
+        # worth or its stake: the worth is the pair alone at today's prices,
+        # fees left out, and the stake adds only the pair's own two fees
         positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 6.0, 0.4),
                      _RUNG_LATE: _held(_RUNG_LATE, -30.0, 12.0, 0.5),
                      "KXRAIN-1": _held("KXRAIN-1", 7.0, 5.0, 0.2),
                      "KXSNOW-1": _held("KXSNOW-1", None, None, None)}
         labels = {**self._ladder(), "KXRAIN-1": frozenset({("event", "KXRAIN")}),
                   "KXSNOW-1": frozenset({("event", "KXSNOW")})}
-        [pair] = held_pairs(positions, labels, 15_000).values()
-        assert pair.account_value_dollars == pytest.approx(150.0 + 6.0 + 12.0 + 5.0)
+        [pair] = held_pairs(positions, labels, self._rung_markets()).values()
+        assert pair.value_dollars == 22.5
+        assert pair.fees_dollars == 0.4 + 0.5
+        assert pair.stake_dollars == 22.5 + (0.4 + 0.5)
+
+    @pytest.mark.parametrize("raw", [
+        None, "", "abc", "0", "0.00", "1", "1.00", "1.5", "-0.20", "nan", "inf", True,
+        10 ** 400, [], {"ask": "0.45"},
+    ], ids=["none", "empty", "text", "zero", "zero-dollars", "one", "one-dollar",
+            "above-one", "negative", "nan", "inf", "bool", "huge-int", "list", "dict"])
+    def test_a_side_with_no_usable_ask_counts_at_its_exposure(self, raw):
+        # Only a number strictly between 0 and 1 is a price: anything else is
+        # a settled, unread or broken quote, and the contracts count at what
+        # they cost (the listing's exposure, fees left out); the other market
+        # keeps its ask
+        positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 6.0, 0.4),
+                     _RUNG_LATE: _held(_RUNG_LATE, -30.0, 12.0, 0.5)}
+        [pair] = held_pairs(positions, self._ladder(), self._rung_markets(late_no=raw)).values()
+        assert pair.value_dollars == 30.0 * 0.30 + 12.0 == 21.0
+        # The fees still count into the stake
+        assert pair.stake_dollars == 21.0 + (0.4 + 0.5)
+
+    def test_a_market_missing_from_the_list_counts_at_its_exposure(self):
+        # A held market this run does not list (closed but not yet paid out,
+        # or looked up by resolve_held_ladders) has no ask to value it at
+        positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 6.0, 0.4),
+                     _RUNG_LATE: _held(_RUNG_LATE, -30.0, 12.0, 0.5)}
+        markets = self._rung_markets()
+        del markets[_RUNG_EARLY]
+        [pair] = held_pairs(positions, self._ladder(), markets).values()
+        assert pair.value_dollars == 6.0 + 30.0 * 0.45 == 19.5
+        assert pair.stake_dollars == 19.5 + (0.4 + 0.5)
+        # Neither listed: both at their exposure, fees left out of the $18.90 cost
+        [pair] = held_pairs(positions, self._ladder(), {}).values()
+        assert pair.value_dollars == 6.0 + 12.0
+        assert pair.cost_dollars == pytest.approx(18.90)
+        # ... and the stake is then exactly what the pair cost, fees included
+        assert pair.stake_dollars == 6.0 + 12.0 + (0.4 + 0.5) == pytest.approx(18.90)
+
+    @pytest.mark.parametrize("unusable", ["no-ask", "settled", "unlisted"])
+    def test_a_leg_with_no_usable_ask_still_counts_its_fees_in_the_stake(self, unusable):
+        # The fees were paid whatever the market quotes today: a leg valued at
+        # its exposure (no ask, a settled price, or not listed this run) still
+        # adds its fees to the stake, so its add-on is never sized as if they
+        # were not spent
+        positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 6.0, 0.4),
+                     _RUNG_LATE: _held(_RUNG_LATE, -30.0, 12.0, 0.5)}
+        if unusable == "unlisted":
+            markets = self._rung_markets()
+            del markets[_RUNG_LATE]
+        else:
+            markets = self._rung_markets(late_no=None if unusable == "no-ask" else "1.00")
+        [pair] = held_pairs(positions, self._ladder(), markets).values()
+        # The late leg at its $12.00 exposure, the early one at its 0.30 ask
+        assert pair.value_dollars == 30.0 * 0.30 + 12.0 == 21.0
+        assert pair.fees_dollars == 0.4 + 0.5
+        assert pair.stake_dollars == 21.0 + (0.4 + 0.5) == pytest.approx(21.90)
+        # The late leg's own $0.50 fee is in it, not only the early leg's
+        assert pair.stake_dollars > pair.value_dollars + 0.4 + 1e-9
 
     def test_the_run_says_what_it_may_add_to(self, caplog):
         positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 6.0, 0.4),
@@ -7263,19 +7404,20 @@ class TestHeldPairs:
                      "KXRAIN-1": _held("KXRAIN-1", 7.0, 5.0, 0.2)}
         labels = {**self._ladder(), "KXRAIN-1": frozenset({("event", "KXRAIN")})}
         with caplog.at_level(logging.INFO):
-            held_pairs(positions, labels, 15_000)
-        assert ("Account value for sizing held pairs: $173.00 (cash $150.00 + held "
-                "positions at cost $23.00)") in caplog.text
-        assert (f"Held pair to add to: YES {_RUNG_EARLY} / NO {_RUNG_LATE}, 30 "
-                "contracts each, cost $18.90") in caplog.text
-        assert "Held pairs to add to: 1 (other held markets, never added to: 1)" in caplog.text
+            held_pairs(positions, labels, self._rung_markets())
+        # Exactly these lines: the pair with its cost (and the fees in it)
+        # and its worth today, then the count, and no sizing figure of
+        # held_pairs' own
+        assert [r.getMessage() for r in caplog.records] == [
+            f"Held pair to add to: YES {_RUNG_EARLY} / NO {_RUNG_LATE}, 30 contracts each, "
+            "cost $18.90 (fees $0.90), worth $22.50 at today's prices",
+            "Held pairs to add to: 1 (other held markets, never added to: 1)"]
 
-    def test_the_account_line_is_logged_with_no_pair_too(self, caplog):
+    def test_the_count_line_is_logged_with_no_pair_too(self, caplog):
         with caplog.at_level(logging.INFO):
-            assert held_pairs({}, {}, 15_000) == {}
-        assert ("Account value for sizing held pairs: $150.00 (cash $150.00 + held "
-                "positions at cost $0.00)") in caplog.text
-        assert "Held pairs to add to: 0 (other held markets, never added to: 0)" in caplog.text
+            assert held_pairs({}, {}, {}) == {}
+        assert [r.getMessage() for r in caplog.records] == [
+            "Held pairs to add to: 0 (other held markets, never added to: 0)"]
 
 
 def _named(ticker: str) -> SimpleNamespace:
@@ -7289,7 +7431,7 @@ class TestHeldPairMatches:
     other way round would close the held pair rather than add to it."""
 
     _PAIR = HeldPair(sides=(("KX-A", "yes"), ("KX-C", "no")), count=30.0,
-                     cost_dollars=18.9, account_value_dollars=168.0)
+                     cost_dollars=18.9, value_dollars=18.0, fees_dollars=0.9)
 
     def test_the_held_sides_match(self):
         # Time-series: YES on market A, NO on market B

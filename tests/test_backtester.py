@@ -60,10 +60,11 @@ from kalshi_betting.config import (
     fee_leg_exact,
     fee_per_pair_approx,
     held_pair_fraction,
+    kelly_budget,
     min_price_diff_for_gap,
     time_series_profit_prob,
 )
-from kalshi_betting.scanner import CandidatePair
+from kalshi_betting.scanner import CandidatePair, HeldPair, pair_held
 from kalshi_betting.strategy import compute_trade
 
 from .conftest import apply_pre_toggle_defaults, save_config_live_defaults
@@ -2121,11 +2122,16 @@ class TestKellyShrinkParity:
     (CLAUDE.md forbids removing that loop); the backtest skipped the shrink
     entirely and only rejected trades that didn't fit the whole CASH balance, so
     every simulated trade was sized slightly above the Kelly fraction it reported.
+
+    With a trade still open, Pass 2 sizes on the portfolio value (the cash plus
+    that trade's cost) and the cash, as compute_trade sizes on the run's
+    portfolio value and cash_cents; the last test pins the two counts equal.
     """
 
     @staticmethod
-    def _live_n(balance_cents: int) -> int:
-        """The contract count live compute_trade picks for the same inputs."""
+    def _live_n(portfolio_value_cents: int, cash_cents: int | None = None) -> int:
+        """The contract count live compute_trade picks for the same inputs:
+        a portfolio value, and the cash on hand (None: the value is all cash)."""
         def _market(ticker):
             # compute_trade only reads .close_time (for days_to_close, which
             # doesn't affect n) and .ticker
@@ -2141,9 +2147,23 @@ class TestKellyShrinkParity:
             # model (a backtest has candle closes, no orderbook)
             max_contracts=0,
         )
-        spec = compute_trade(pair, balance_cents)
+        spec = compute_trade(pair, portfolio_value_cents, cash_cents=cash_cents)
         assert spec is not None
         return spec.x
+
+    @staticmethod
+    def _record(tickers: tuple[str, str], events: tuple[str, str], monday: date) -> dict:
+        """A prepared same-title record at the parity quotes, entering on one
+        Monday; both markets resolve YES on 2026-02-01, like the fixture's."""
+        mA, mB = ({"ticker": ticker, "event_ticker": event, "event_title": "EV",
+                   "title": "Q", "subtitle": "", "result": "yes",
+                   "close_time": "2026-02-01T00:00:00+00:00",
+                   "settlement_ts": "2026-02-01T12:00:00+00:00"}
+                  for ticker, event in zip(tickers, events, strict=True))
+        return {"pair_type": "same_title", "canon": "Q", "group_key": ("EV", "Q", tickers[0]),
+                "entry": {"entry_date": monday, "pA": _PARITY_PA, "pB": _PARITY_PB,
+                          "nA": _PARITY_NA, "nB": 0.47, "mA": mA, "mB": mB,
+                          "gap_days": None, "later": ()}}
 
     def test_backtest_n_matches_compute_trade_n(self, monkeypatch):
         candles = {
@@ -2197,6 +2217,25 @@ class TestKellyShrinkParity:
         t = trades[0]
         assert t.n == self._live_n(25_000)
         assert t.total_cost + t.fees <= 250.0 * t.kelly_fraction + 1e-9
+
+    def test_with_an_open_trade_n_matches_compute_trade_on_value_and_cash(self):
+        # An opener entering on Monday 1 at the same quotes is still open on
+        # Monday 2 (it pays out on 02-01), so Monday 2's portfolio value is
+        # the cash plus the opener's cost. The parity pair entering then must
+        # get the count live compute_trade gives for that value and that cash.
+        opener = self._record(("OA", "OB"), ("EOA", "EOB"), date(2026, 1, 5))
+        pair = self._record(("SA", "SB"), ("EA", "EB"), date(2026, 1, 12))
+        point = backtester._simulate_at_discount([opener, pair], date(2026, 1, 1), 1000.0,
+                                                 end_date=date(2026, 3, 1))
+        assert [(t.ticker_a, t.entry_date) for t in point.trades] == [
+            ("OA", date(2026, 1, 5)), ("SA", date(2026, 1, 12))]
+        first, t = point.trades
+        cash = 1000.0 - (first.total_cost + first.fees)
+        value = cash + first.total_cost
+        assert t.balance_at_entry == pytest.approx(value)
+        assert t.n == self._live_n(round(value * 100), cash_cents=round(cash * 100))
+        # Not vacuous: sized on the cash alone it would buy fewer
+        assert t.n > self._live_n(round(cash * 100))
 
 
 class TestRunBacktestMalformedTimestamps:
@@ -6233,10 +6272,12 @@ class TestRunBacktestCrossTypeDedup:
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestCheckpointOpeningBalanceSizing:
     """Pass 2 must size every candidate of one entry date against that
-    checkpoint's OPENING balance (live: one verify_auth read per run feeding
-    every compute_trade call), then admit greedily against the running cash
-    (live: strategy.select_portfolio's decrementing budget). Sizes are at
-    pre_toggle_defaults' 20% cap for every pair, with no extra same-title cap."""
+    checkpoint's OPENING portfolio value (live: one balance read per run
+    feeding every compute_trade call), and never spend more than the running
+    cash (live: strategy.select_portfolio shrinks a spec to the cash left).
+    Nothing is open here, so the opening value is the opening cash. Sizes are
+    at pre_toggle_defaults' 20% cap for every pair, with no extra same-title
+    cap."""
 
     # Two same-title pairs whose only qualifying Monday is 2026-01-05. Distinct
     # event_titles ("EV1"/"EV2") keep them in separate (event_title, title,
@@ -6277,8 +6318,9 @@ class TestCheckpointOpeningBalanceSizing:
     def test_same_day_trades_are_sized_off_the_checkpoint_opening_balance(self, monkeypatch):
         # Both pairs enter on the same Monday. Live would size BOTH against the
         # one balance read at the top of the run, so both must get the same n
-        # and record the same balance_at_entry — the second must not be shrunk
-        # by the first's cost.
+        # and record the same balance_at_entry: the first's cost must not
+        # lower the second's base. The cash left never binds here (20% + 20%
+        # of $1,000 fits); the next test is the case where it does.
         self._patch(monkeypatch)
 
         trades, _ = run_backtest(
@@ -6295,13 +6337,22 @@ class TestCheckpointOpeningBalanceSizing:
             # the CHECKPOINT balance, not off whatever cash was left.
             assert t.total_cost + t.fees <= 1000.0 * t.kelly_fraction + 1e-9
 
-    def test_greedy_fit_skips_rather_than_shrinks(self, monkeypatch):
-        # With BUDGET_FRACTION at 0.20 (pre_toggle_defaults) two same-day trades always fit
-        # (0.2 + 0.2 < 1), so the greedy-skip branch is unreachable. Raise the
-        # cap to 0.60 for this test only — backtester imports the constant by
-        # value (`from .config import BUDGET_FRACTION`), so patching the module
-        # attribute is what `_resolve_size_cap(None)` reads at call time, and
-        # Pass 1 sizes at `min(cap, kelly_f)` with that cap.
+    def test_greedy_fit_shrinks_to_the_cash_left(self, monkeypatch):
+        # With BUDGET_FRACTION at 0.20 (pre_toggle_defaults) two same-day
+        # trades always fit (0.2 + 0.2 < 1), so the cash never binds. Raise
+        # the cap to 0.60 for this test only — backtester imports the constant
+        # by value (`from .config import BUDGET_FRACTION`), so patching the
+        # module attribute is what `_resolve_size_cap(None)` reads at call
+        # time, and Pass 1b sizes at `min(cap, kelly_f)` with that cap.
+        #
+        # Worked by hand. Each pair's legs are NO on A at 0.40 and YES on B at
+        # 0.35, $0.75 a contract pair; its Kelly fraction (p 0.95, about 0.77)
+        # is capped at 0.60. The first pair's budget is 0.60 x $1,000 = $600:
+        # 766 pairs cost $574.50 plus fees of $12.87 + $12.20 = $599.57, and
+        # 767 would cost $575.25 + $12.89 + $12.22 = $600.36. That leaves
+        # $400.43 of cash, under the second pair's $600 budget, so the second
+        # pair is sized on the cash: 511 pairs cost $383.25 + $8.59 + $8.14 =
+        # $399.98, and 512 would cost $384.00 + $8.61 + $8.16 = $400.77.
         monkeypatch.setattr(backtester, "BUDGET_FRACTION", 0.60)
         self._patch(monkeypatch)
 
@@ -6310,16 +6361,17 @@ class TestCheckpointOpeningBalanceSizing:
             start_date=date(2026, 1, 1), initial_balance=1000.0,
         )
 
-        # The first trade takes ~60% of the balance; the second, sized off the
-        # same checkpoint balance, no longer fits the ~40% left. select_portfolio
-        # SKIPS such a spec — it never shrinks it to fit.
-        assert len(trades) == 1
-        t = trades[0]
-        assert t.kelly_fraction == pytest.approx(0.60)
-        assert t.balance_at_entry == pytest.approx(1000.0)
-        assert t.total_cost + t.fees <= 1000.0 * 0.60 + 1e-9
-        # Not shrunk: it is still the full-size trade the checkpoint budget buys.
-        assert t.total_cost + t.fees > 1000.0 * 0.50
+        # Both trade: the second is shrunk to the cash the first left, as
+        # select_portfolio shrinks a spec that no longer fits
+        assert [t.n for t in trades] == [766, 511]
+        assert [t.total_cost + t.fees for t in trades] == [
+            pytest.approx(599.57), pytest.approx(399.98)]
+        for t in trades:
+            assert t.kelly_fraction == pytest.approx(0.60)
+            # Both are sized on the same checkpoint value
+            assert t.balance_at_entry == pytest.approx(1000.0)
+        # The cash is never overdrawn
+        assert sum(t.total_cost + t.fees for t in trades) <= 1000.0
 
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
@@ -8973,8 +9025,8 @@ class TestOpenLadderExposure:
 
     _START = date(2026, 1, 1)
 
-    def _sim(self, records, **kw):
-        return backtester._simulate_at_discount(records, self._START, 10_000.0,
+    def _sim(self, records, balance=10_000.0, **kw):
+        return backtester._simulate_at_discount(records, self._START, balance,
                                                  end_date=date(2026, 4, 1), **kw)
 
     @staticmethod
@@ -9116,9 +9168,25 @@ class TestOpenLadderExposure:
             assert self._ladder_lines(caplog) == [_LADDER_LINE + "1"]
 
     def test_a_time_series_pair_short_of_cash_is_tried_again_and_a_same_title_one_is_not(self):
-        # At k 0.40 with no size cap each pair takes over half the balance, so
-        # once X (ranked first, paying out on 01-11) trades on Monday 1,
-        # neither Y nor S fits beside it. Each pair is on its own ladder.
+        # A trade is shrunk to the cash left, so a pair is short of cash only
+        # when the cash left cannot buy ONE contract pair that still pays in a
+        # win after the exact fees (every pair here does at one pair). The
+        # balance is tiny for that reason. Each pair is on its own ladder, and X ranks
+        # first on Monday 1 (it pays out soonest, on 01-11).
+        #
+        # Worked by hand, at k 0.40 with no size cap (and no same-title cap
+        # under pre_toggle_defaults). X and Y buy YES at 0.20 and NO at 0.40:
+        # Kelly about 0.570, and one contract pair costs $0.60 plus $0.02 +
+        # $0.02 of fees = $0.64 (two cost $1.27). S buys NO at 0.30 and YES
+        # at 0.40: Kelly about 0.814, one pair $0.70 + $0.02 + $0.02 = $0.74.
+        # X trades one pair on Monday 1 once 0.570 x the balance reaches
+        # $0.64, i.e. from $1.13. Neither Y nor S can buy a pair from the
+        # cash X leaves (the balance less $0.64) while that is under $0.64,
+        # i.e. below $1.28. So every assertion below holds from $1.13 to just
+        # under $1.28; at $1.20: X leaves $0.56; Y alone budgets 0.570 x
+        # $1.20 = $0.68 and S alone 0.814 x $1.20 = $0.98, one pair each;
+        # X pays $1 on 01-11, so Monday 2 has $1.56 of cash and nothing open,
+        # and Y budgets $0.89 and S $1.27 — one pair each.
         x = _ladder_record(_ladder_market("XA", "EVX-1", "2026-01-11"),
                            _ladder_market("XB", "EVX-2", "2026-01-11"), "x", [_LADDER_M1])
         y = _ladder_record(_ladder_market("YA", "EVY-1", "2026-03-20"),
@@ -9127,10 +9195,20 @@ class TestOpenLadderExposure:
         s = _ladder_same_title(_ladder_market("SA", "EVS-1", "2026-03-20"),
                                _ladder_market("SB", "EVS-2", "2026-03-20", result="yes"),
                                [_LADDER_M1, _LADDER_M2])
-        run = {"k": 0.40, "size_cap": 1.0}
+        run = {"balance": 1.20, "k": 0.40, "size_cap": 1.0}
+        assert [t.n for t in self._sim([x], **run).trades] == [1]
         # Y is skipped for cash on Monday 1 and taken on Monday 2
         assert _traded(self._sim([x, y], **run)) == [("XA", _LADDER_M1), ("YA", _LADDER_M2)]
         assert _traded(self._sim([y], **run)) == [("YA", _LADDER_M1)]
+        # CONTROL: when the cash X leaves buys more than one pair, Y is not
+        # retried — it is shrunk to that cash and trades beside X on Monday 1
+        wide = {**run, "balance": 10_000.0}
+        point = self._sim([x, y], **wide)
+        assert _traded(point) == [("XA", _LADDER_M1), ("YA", _LADDER_M1)]
+        x_trade, y_trade = point.trades
+        assert y_trade.n < x_trade.n
+        assert (y_trade.total_cost + y_trade.fees
+                <= 10_000.0 - (x_trade.total_cost + x_trade.fees) + 1e-9)
         # S is skipped on Monday 1 and never tried again ...
         assert _traded(self._sim([x, s], **run)) == [("XA", _LADDER_M1)]
         assert _traded(self._sim([s], **run)) == [("SA", _LADDER_M1)]
@@ -9428,12 +9506,209 @@ class TestOpenLadderExposure:
         assert self._sim(h1, k=0.5).peak_kelly_fraction < full.peak_kelly_fraction
 
 
+class TestSizesOnPortfolioValue:
+    """Pass 2 sizes each Monday's candidates on that Monday's opening
+    portfolio value — the cash after the day's pay-outs plus every open trade
+    at its cost, the valuation the equity curve uses — and never spends more
+    than the cash left (config.kelly_budget), as a live run sizes on its cash
+    plus Kalshi's value of its open positions. Every simulation is handed k
+    and a size cap of 1.0, and only time-series pairs trade, so no figure
+    here depends on a toggle.
+
+    The opener trades on Monday 1 and pays out on 01-15: it is open on
+    Monday 2 (01-12) and paid out by Monday 3 (01-19); one test has it pay
+    out on Monday 2 itself. The follower asks another question in other
+    events and enters on the Monday a test names. Both buy YES at 0.20 and NO
+    at 0.40 (the _ladder_record quotes)."""
+
+    _START = date(2026, 1, 1)
+    _BALANCE = 10_000.0
+    _LEGS = (0.20, 0.40)
+
+    def _sim(self, records, *, k):
+        return backtester._simulate_at_discount(records, self._START, self._BALANCE,
+                                                 k=k, size_cap=1.0, end_date=date(2026, 4, 1))
+
+    @classmethod
+    def _cost(cls, n: int) -> float:
+        """What n contract pairs spend: the contracts plus both legs' exact fees."""
+        price_a, price_b = cls._LEGS
+        return n * (price_a + price_b) + fee_leg_exact(n, price_a) + fee_leg_exact(n, price_b)
+
+    @staticmethod
+    def _opener() -> dict:
+        return _ladder_record(_ladder_market("OA", "EVO-1", "2026-01-15"),
+                              _ladder_market("OB", "EVO-2", "2026-01-15"), "o", [_LADDER_M1])
+
+    @staticmethod
+    def _follower(monday: date) -> dict:
+        return _ladder_record(_ladder_market("FA", "EVF-1", "2026-03-20"),
+                              _ladder_market("FB", "EVF-2", "2026-03-20"), "f", [monday])
+
+    @staticmethod
+    def _live_n(value: float, cash: float, k: float) -> int:
+        """The count live compute_trade sizes the follower's quotes at, on a
+        portfolio value and a cash in dollars (both whole cents here)."""
+        from kalshi_betting import config
+
+        def _market(ticker):
+            return SimpleNamespace(ticker=ticker,
+                                   close_time=datetime.now(UTC) + timedelta(days=60))
+
+        pair = CandidatePair(
+            market_a=_market("FA"), market_b=_market("FB"),
+            pA=0.20, pB=0.60, nA=0.80, nB=0.40, tradeable=True,
+            canonical_title="f", pair_type="time_series", max_contracts=0,
+        )
+        settings = dc_replace(config.live_settings(), interval_discount=k, size_cap=1.0)
+        spec = compute_trade(pair, round(value * 100), settings=settings,
+                             cash_cents=round(cash * 100))
+        assert spec is not None
+        return spec.x
+
+    def test_an_open_trade_raises_the_next_mondays_size(self):
+        point = self._sim([self._opener(), self._follower(_LADDER_M2)], k=0.75)
+        assert _traded(point) == [("OA", _LADDER_M1), ("FA", _LADDER_M2)]
+        opener, follower = point.trades
+        assert opener.balance_at_entry == pytest.approx(self._BALANCE)
+        # On Monday 2 the opener's contracts still count at their cost; only
+        # its fees have left the portfolio
+        cash = self._BALANCE - (opener.total_cost + opener.fees)
+        value = cash + opener.total_cost
+        assert follower.balance_at_entry == pytest.approx(value)
+        assert value == pytest.approx(self._BALANCE - opener.fees)
+        # ... which is the equity curve's value at the close before Monday 2
+        curve = point.equity_df.set_index("date")["portfolio_value"]
+        assert curve[date(2026, 1, 11)] == pytest.approx(value)
+        # Sized on the value: the largest count whose cost fits f x the value
+        f = follower.kelly_fraction
+        assert f == pytest.approx(_uncapped_kelly(self._follower(_LADDER_M2), 0.75))
+        assert f * value < cash  # the cash does not bind
+        assert self._cost(follower.n) <= f * value + 1e-9
+        assert self._cost(follower.n + 1) > f * value
+        # ... more than f x the cash alone would have bought
+        assert self._cost(follower.n) > f * cash
+        # ... and what live compute_trade sizes on that value and cash
+        assert follower.n == self._live_n(value, cash, 0.75)
+
+    def test_the_cash_left_still_caps_the_size(self):
+        # At k 0.40 each pair's Kelly fraction is about 0.570: the opener
+        # spends about 57% of the balance, and 57% of Monday 2's value is more
+        # than the cash left, so the cash sets the follower's size
+        point = self._sim([self._opener(), self._follower(_LADDER_M2)], k=0.40)
+        assert _traded(point) == [("OA", _LADDER_M1), ("FA", _LADDER_M2)]
+        opener, follower = point.trades
+        cash = self._BALANCE - (opener.total_cost + opener.fees)
+        value = cash + opener.total_cost
+        assert follower.balance_at_entry == pytest.approx(value)
+        f = follower.kelly_fraction
+        assert f == pytest.approx(0.570, abs=1e-3)
+        assert f * value > cash
+        # The largest count whose cost fits the cash left
+        assert self._cost(follower.n) <= cash + 1e-9
+        assert self._cost(follower.n + 1) > cash
+        # ... which is less than the Kelly share of the value
+        assert follower.total_cost + follower.fees < f * follower.balance_at_entry
+        # ... and what live compute_trade sizes on that value and cash
+        assert follower.n == self._live_n(value, cash, 0.40)
+
+    def test_after_the_pay_out_the_value_is_the_cash_again(self):
+        # The opener pays out on 01-15, before Monday 3: nothing is open then,
+        # so the follower is sized on the cash, which the pay-out refilled
+        point = self._sim([self._opener(), self._follower(_LADDER_M3)], k=0.75)
+        assert _traded(point) == [("OA", _LADDER_M1), ("FA", _LADDER_M3)]
+        opener, follower = point.trades
+        assert opener.actual_payoff == pytest.approx(opener.n)  # NO on B pays
+        cash = self._BALANCE - (opener.total_cost + opener.fees) + opener.actual_payoff
+        assert follower.balance_at_entry == pytest.approx(cash)
+        assert follower.balance_at_entry == pytest.approx(self._BALANCE + opener.profit)
+        f = follower.kelly_fraction
+        assert self._cost(follower.n) <= f * cash + 1e-9
+        assert self._cost(follower.n + 1) > f * cash
+        # ... and what live compute_trade sizes when the value is all cash
+        assert follower.n == self._live_n(cash, cash, 0.75)
+
+    def test_a_trade_paying_out_on_the_monday_counts_once(self):
+        # The opener pays out on 01-12, Monday 2 itself. Its receipt is back
+        # in the cash before the follower is sized there, and its cost no
+        # longer counts as open, so the follower is sized on the cash alone:
+        # the paid-out trade counts once, never as its receipt AND its cost.
+        #
+        # Worked by hand at k 0.75 with no cap. Net spread 1 - 0.60 - 0.028 =
+        # 0.372, b = 0.372 / 0.628, p = 0.70, so f = 0.70 - 0.30 / b = 6/31
+        # (about 0.1935). The opener's budget is $10,000 x 6/31 = $1,935.48:
+        # 3,081 pairs cost $1,848.60 + $34.51 + $51.77 = $1,934.88, and 3,082
+        # would cost $1,849.20 + $34.52 + $51.78 = $1,935.50. Its NO on B pays
+        # $3,081 on 01-12, so Monday 2 has $10,000 - $1,934.88 + $3,081 =
+        # $11,146.12 of cash and nothing open. The follower's budget is
+        # $11,146.12 x 6/31 = $2,157.31: 3,435 pairs cost $2,061.00 + $38.48 +
+        # $57.71 = $2,157.19, and 3,436 would cost $2,061.60 + $38.49 +
+        # $57.73 = $2,157.82. Counting the opener's $1,848.60 cost as still
+        # open would size the follower on $12,994.72, about 4,000 pairs.
+        opener = _ladder_record(_ladder_market("OA", "EVO-1", "2026-01-12"),
+                                _ladder_market("OB", "EVO-2", "2026-01-12"), "o",
+                                [_LADDER_M1])
+        point = self._sim([opener, self._follower(_LADDER_M2)], k=0.75)
+        assert _traded(point) == [("OA", _LADDER_M1), ("FA", _LADDER_M2)]
+        opener_trade, follower = point.trades
+        assert opener_trade.n == 3081
+        assert opener_trade.exit_date == _LADDER_M2
+        assert opener_trade.actual_payoff == pytest.approx(3081)
+        cash = self._BALANCE + opener_trade.profit
+        assert cash == pytest.approx(11_146.12)
+        assert follower.balance_at_entry == pytest.approx(cash)
+        assert follower.balance_at_entry < cash + opener_trade.total_cost - 1.0
+        assert follower.n == 3435
+        assert self._cost(follower.n) == pytest.approx(2_157.19)
+        # ... and what live compute_trade sizes when the value is all cash
+        assert follower.n == self._live_n(cash, cash, 0.75)
+
+
 # ─── Adding to held pairs, in the backtest ──────────────────────────────────
 
 def _worded_market(ticker: str, event: str, title: str, paid_out: str, *,
                    result: str = "no") -> dict:
     """A _ladder_market with its own title, so markets can ask one question."""
     return {**_ladder_market(ticker, event, paid_out, result=result), "title": title}
+
+
+def _pair_cost(n: int, price_a: float, price_b: float) -> float:
+    """What n contract pairs spend at these leg prices: the contracts plus both
+    legs' exact fees, added in the order Pass 2's fee loop adds them, so a
+    comparison with a budget is exact."""
+    return n * (price_a + price_b) + fee_leg_exact(n, price_a) + fee_leg_exact(n, price_b)
+
+
+def _live_add_on(first, value: float, cash: float, *, k: float, size_cap: float,
+                 quotes: tuple[float, float, float]):
+    """The spec live compute_trade sizes for an add-on to the PA/PB pair whose
+    first trade was `first`, on a portfolio value and a cash in dollars (whole
+    cents here), with the backtest's own stake: the pair's contracts at cost
+    (HeldPair.value_dollars) plus the fees paid for them
+    (HeldPair.fees_dollars), which together are HeldPair.stake_dollars. The
+    pair's time-series quotes are (pA, pB, nB). No book, so the stored leg
+    prices are used."""
+    from kalshi_betting import config
+
+    def _market(ticker):
+        return SimpleNamespace(ticker=ticker,
+                               close_time=datetime.now(UTC) + timedelta(days=60))
+
+    pA, pB, nB = quotes
+    held = HeldPair(sides=(("PA", "yes"), ("PB", "no")), count=float(first.n),
+                    cost_dollars=first.total_cost + first.fees,
+                    value_dollars=first.total_cost, fees_dollars=first.fees)
+    assert held.stake_dollars == pytest.approx(first.total_cost + first.fees, abs=1e-9)
+    pair = CandidatePair(
+        market_a=_market("PA"), market_b=_market("PB"), pA=pA, pB=pB,
+        nA=round(1.0 - pA, 4), nB=nB, tradeable=True, canonical_title="q",
+        pair_type="time_series", max_contracts=0, held=held,
+    )
+    settings = dc_replace(config.live_settings(), interval_discount=k, size_cap=size_cap)
+    spec = compute_trade(pair, round(value * 100), settings=settings,
+                         cash_cents=round(cash * 100))
+    assert spec is not None and pair_held(spec.pair) == held
+    return spec
 
 
 def _same_title_record(rows, group_key=("", "Will it rain by March 1, 2026?", "")) -> dict:
@@ -9459,10 +9734,13 @@ class TestAddToHeldPairs:
     """_simulate_at_discount(add_to_held=True) lets the walk add to a pair it
     still holds, as the live sizer does for a held pair: the same two
     markets, bought the same way round, recorded as a new trade and sized so
-    the whole position is Kelly's share of the account value
-    (config.held_pair_fraction, the live sizer's rule) — never more than a new
-    pair would stake. Figures are at pre_toggle_defaults (k 0.75, a 20% cap,
-    no extra same-title cap)."""
+    the whole position is Kelly's share of the portfolio value (the
+    checkpoint's cash plus its open trades at contract cost, fees excluded;
+    config.held_pair_fraction, the live sizer's rule) — never more than a new
+    pair would stake, and never more than the cash left. The pair's stake is
+    what its open trades cost: their contracts plus the fees paid for them,
+    which the portfolio value leaves out. Figures are at pre_toggle_defaults
+    (k 0.75, a 20% cap, no extra same-title cap)."""
 
     _START = date(2026, 1, 1)
     # At k 0.85 these time-series quotes (pA, pB, nB) pass the Kelly gate at
@@ -9516,20 +9794,33 @@ class TestAddToHeldPairs:
         assert add.exit_date == first.exit_date
         assert (first.actual_payoff, add.actual_payoff) == (first.n, add.n)
         assert add.n > 0 and add.profit > 0
-        # Sized on the whole position: the checkpoint's cash, the account
-        # value (that cash plus the open trade at cost) and what the pair
-        # already stakes (contracts plus fees)
-        cash = add.balance_at_entry
-        value = cash + first.total_cost
+        # Sized on the whole position: the portfolio value it records (the
+        # checkpoint's cash plus the open trade at contract cost) and what the
+        # pair already stakes (its contracts plus the fees paid for them)
+        value = add.balance_at_entry
+        cash = 10_000.0 - (first.total_cost + first.fees)
+        assert value == pytest.approx(cash + first.total_cost, abs=1e-9)
         held = first.total_cost + first.fees
         assert add.kelly_fraction == pytest.approx(
-            held_pair_fraction(f2, held, value, cash), abs=1e-12)
-        # The whole position stays within Kelly's share of the account value,
-        # and the add-on within what a new pair would stake of the cash ...
+            held_pair_fraction(f2, held, value), abs=1e-12)
+        # Its budget is min(f2 x value - held, cash); the cash does not bind here
+        budget = kelly_budget(value, add.kelly_fraction, cash)
+        assert budget == pytest.approx(f2 * value - held, abs=1e-9)
+        assert budget < cash
+        # The largest count whose contracts and exact fees fit that budget. By
+        # hand: 520 pairs cost $390.00 + $14.84 on Monday 1, so the value is
+        # $9,985.16 and f2 of it is $1,034.11; less the $404.84 stake that
+        # leaves $629.27, which buys 1,196 pairs ($598.00 + $30.99); 1,197
+        # would cost $629.51
+        legs = (add.entry_pA, add.entry_nB)
+        assert (first.n, add.n) == (520, 1196)
+        assert budget == pytest.approx(629.27, abs=0.005)
+        assert _pair_cost(add.n, *legs) == pytest.approx(add.total_cost + add.fees, abs=1e-9)
+        assert _pair_cost(add.n, *legs) <= budget < _pair_cost(add.n + 1, *legs)
+        # So the whole position, fees included, stays within Kelly's share of
+        # the portfolio value, and the add-on within what a new pair would stake
         assert held + add.total_cost + add.fees <= f2 * value + 1e-9
-        assert add.total_cost + add.fees <= f2 * cash + 1e-9
-        # ... and reaches that share to within one contract pair and its fees
-        assert f2 * value - (held + add.total_cost + add.fees) < 1.0
+        assert add.total_cost + add.fees <= min(f2 * value, cash) + 1e-9
         # The equity curve carries both trades: fees on entry, pay-out on exit
         final = float(on.equity_df["portfolio_value"].iloc[-1])
         assert final == pytest.approx(10_000.0 + first.profit + add.profit, abs=1e-9)
@@ -9540,12 +9831,12 @@ class TestAddToHeldPairs:
             _ADD_ON_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
 
     def test_the_account_value_is_the_equity_curve_s(self):
-        """The account value an add-on is sized on is the equity curve's
-        portfolio value at the close before its Monday, read off the curve
-        rather than rebuilt from the trades' fields. Pass 2 and the curve each
-        carry open trades at cost, fees excluded; this pins the two to one
-        figure, so a change to one that the other does not follow fails
-        here."""
+        """The portfolio value an add-on is sized on (its balance_at_entry)
+        is the equity curve's portfolio value at the close before its Monday,
+        read off the curve rather than rebuilt from the trades' fields. Pass 2
+        and the curve each carry open trades at cost, fees excluded; this pins
+        the two to one figure, so a change to one that the other does not
+        follow fails here. The stake beside it counts the fees."""
         p = self._widening_pair()
         f2 = _uncapped_kelly({"pair_type": "time_series", "entry": p["entry"]["later"][0]}, 0.85)
         on = self._sim([p], k=0.85, add_to_held=True)
@@ -9556,17 +9847,23 @@ class TestAddToHeldPairs:
         # Nothing pays out between the Mondays, so the curve has lost only
         # the first trade's fees
         assert value == pytest.approx(10_000.0 - first.fees, abs=1e-9)
+        assert add.balance_at_entry == pytest.approx(value, abs=1e-9)
         assert add.kelly_fraction == pytest.approx(held_pair_fraction(
-            f2, first.total_cost + first.fees, value, add.balance_at_entry), abs=1e-12)
+            f2, first.total_cost + first.fees, value), abs=1e-12)
 
     def test_a_pair_already_at_its_kelly_share_is_skipped_and_counted(self, caplog):
         # The same quotes on both Mondays: the pair already holds its share
         p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-03-20"),
                            _ladder_market("PB", "EVB-1", "2026-03-20"), "q",
                            [_LADDER_M1, _LADDER_M2])
+        f = _uncapped_kelly(p, 0.75)
         with caplog.at_level(logging.INFO):
             on = self._sim([p], add_to_held=True)
         assert _traded(on) == [("PA", _LADDER_M1)]
+        (first,) = on.trades
+        # Nothing pays out between the Mondays, so Monday 2's value has lost
+        # only the first trade's fees, which the stake counts
+        assert held_pair_fraction(f, first.total_cost + first.fees, 10_000.0 - first.fees) <= 0
         assert self._lines(caplog, _ADD_ON_CAP_LINE) == [
             _ADD_ON_CAP_LINE + "k=0.750, band 0-1, all, adding to held pairs): 1"]
         assert self._lines(caplog, _ADD_ON_LINE) == []
@@ -9576,6 +9873,130 @@ class TestAddToHeldPairs:
             self._sim([p], add_to_held=True, quiet=True)
         (record,) = [r for r in caplog.records if r.getMessage().startswith(_ADD_ON_CAP_LINE)]
         assert record.levelno == logging.DEBUG
+        # Quotes that narrow on Monday 2 shrink the share below the stake too
+        narrowing = _ladder_record(_ladder_market("PA", "EVA-1", "2026-03-20"),
+                                   _ladder_market("PB", "EVB-1", "2026-03-20"), "q",
+                                   [(_LADDER_M1, *self._WIDE), (_LADDER_M2, *self._NARROW)])
+        f1, f2 = (_uncapped_kelly({"pair_type": "time_series", "entry": m}, 0.85)
+                  for m in backtester._entry_mondays(narrowing["entry"]))
+        assert 0 < f2 < f1 < 0.20
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            on = self._sim([narrowing], k=0.85, add_to_held=True)
+        assert _traded(on) == [("PA", _LADDER_M1)]
+        assert self._lines(caplog, _ADD_ON_CAP_LINE) == [
+            _ADD_ON_CAP_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
+
+    def test_a_held_pair_at_unchanged_quotes_adds_nothing(self, caplog):
+        """A held pair's stake counts the fees paid for it, while the
+        portfolio value leaves them out (they are spent), so a pair that
+        bought its whole Kelly share adds nothing on later Mondays at the
+        same quotes: no small top-up every week, each paying its own
+        rounded-up fee.
+
+        Worked by hand at k 0.75 (pre_toggle_defaults), where these quotes'
+        Kelly fraction is 6/31 (see TestSizesOnPortfolioValue). Monday 1's
+        share is $1,935.48: 3,081 pairs cost $1,848.60 plus $86.28 of fees,
+        $1,934.88, and 3,082 would cost $1,935.50. Nothing pays out before
+        Monday 3, so Mondays 2 and 3 both value the portfolio at $9,913.72,
+        and 6/31 of it is $1,918.78, $16.10 below the stake: both are skipped
+        as already at the share. A stake without the fees ($1,848.60) would
+        leave the pair $70.18 short each time, enough for 111 more pairs."""
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-03-20"),
+                           _ladder_market("PB", "EVB-1", "2026-03-20"), "q",
+                           [_LADDER_M1, _LADDER_M2, _LADDER_M3])
+        f = _uncapped_kelly(p, 0.75)
+        assert f == pytest.approx(6 / 31, abs=1e-12)
+        with caplog.at_level(logging.INFO):
+            on = self._sim([p], add_to_held=True)
+        # One trade on Monday 1, and nothing added on Monday 2 or 3
+        assert _traded(on) == [("PA", _LADDER_M1)]
+        (first,) = on.trades
+        assert first.n == 3081
+        legs = (first.entry_pA, first.entry_nB)
+        stake = first.total_cost + first.fees
+        assert stake == pytest.approx(1_934.88, abs=1e-9)
+        # Monday 1 bought its whole share: one more pair would not have fit
+        assert _pair_cost(first.n, *legs) <= f * 10_000.0 < _pair_cost(first.n + 1, *legs)
+        # On Mondays 2 and 3 the value has lost only the fees, and its share
+        # is below the stake
+        value = 10_000.0 - first.fees
+        assert f * value == pytest.approx(1_918.78, abs=0.005)
+        assert f * value - stake == pytest.approx(-16.10, abs=0.005)
+        assert held_pair_fraction(f, stake, value) < 0
+        assert self._lines(caplog, _ADD_ON_CAP_LINE) == [
+            _ADD_ON_CAP_LINE + "k=0.750, band 0-1, all, adding to held pairs): 2"]
+        assert self._lines(caplog, _ADD_ON_LINE) == []
+        # Counting the fees is what decides it: without them the pair would
+        # be $70.18 short on each of those Mondays, and 111 pairs would fit
+        short = f * value - first.total_cost
+        assert short == pytest.approx(70.18, abs=0.005)
+        assert _pair_cost(111, *legs) <= short < _pair_cost(112, *legs)
+
+    def test_an_add_on_sizes_as_live_compute_trade_does(self):
+        """An add-on sizes as live compute_trade sizes it on the same
+        portfolio value, cash and stake: the backtest's value (cash plus open
+        trades at contract cost), its cash, and the pair's contracts plus the
+        fees paid for them as HeldPair.stake_dollars. Here the cash does not
+        bind."""
+        p = self._widening_pair()
+        on = self._sim([p], k=0.85, size_cap=0.20, add_to_held=True)
+        first, add = on.trades
+        assert add.add_on
+        value = add.balance_at_entry
+        cash = 10_000.0 - (first.total_cost + first.fees)
+        assert value * add.kelly_fraction < cash  # the cash does not bind
+        spec = _live_add_on(first, value, cash, k=0.85, size_cap=0.20, quotes=(0.20, 0.70, 0.30))
+        assert spec.x == add.n
+        assert spec.kelly_fraction == pytest.approx(add.kelly_fraction, abs=1e-12)
+        assert spec.total_cost_with_fees == pytest.approx(add.total_cost + add.fees, abs=1e-9)
+
+    def _cash_bound_fixture(self):
+        """The widening pair P and a same-title pair R that asks another
+        question, both opening on Monday 1; R pays out on 2026-02-20, after
+        Monday 2. Run with no per-trade cap, R's Kelly fraction (about 0.93)
+        leaves P too little cash on Monday 2 to buy what it is missing of its
+        Kelly share: on the pair alone the cash can never bind, since
+        f x value - stake is at most the cash when f is at most 1."""
+        title = "Will it hail by March 1, 2026?"
+        ra = _worded_market("RA", "EVR-1", title, "2026-02-20")
+        rb = _worded_market("RB", "EVS-1", title, "2026-02-20", result="yes")
+        r = _same_title_record([(_LADDER_M1, ra, rb, 0.85, 0.15)], group_key=("", title, ""))
+        return [self._widening_pair(), r]
+
+    def test_the_cash_left_limits_an_add_on_as_it_limits_live(self):
+        entries = self._cash_bound_fixture()
+        p, r = entries
+        fr = _uncapped_kelly({"pair_type": "same_title", "entry": r["entry"]}, 0.85)
+        f2 = _uncapped_kelly({"pair_type": "time_series", "entry": p["entry"]["later"][0]}, 0.85)
+        assert 0.90 < fr < 0.95 and 0 < f2 < 0.20
+        on = self._sim(entries, k=0.85, size_cap=1.0, add_to_held=True)
+        # R ranks first on Monday 1 (its monthly return is the larger)
+        assert _traded(on) == [("RA", _LADDER_M1), ("PA", _LADDER_M1), ("PA", _LADDER_M2)]
+        r_trade, first, add = on.trades
+        assert (r_trade.add_on, first.add_on, add.add_on) == (False, False, True)
+        # Monday 2: R and P's first trade are both open at contract cost
+        cash = 10_000.0 - (r_trade.total_cost + r_trade.fees) - (first.total_cost + first.fees)
+        value = add.balance_at_entry
+        assert value == pytest.approx(cash + r_trade.total_cost + first.total_cost, abs=1e-9)
+        stake = first.total_cost + first.fees
+        assert add.kelly_fraction == pytest.approx(
+            held_pair_fraction(f2, stake, value), abs=1e-12)
+        # The cash binds: the pair is missing more of its Kelly share than
+        # the cash left can buy (by hand, $575.37 of it against $328.24 of
+        # cash, the stake counting the first trade's $14.84 of fees)
+        assert cash < f2 * value - stake - 100.0
+        assert kelly_budget(value, add.kelly_fraction, cash) == cash
+        # The largest count whose contracts and exact fees fit the cash left
+        legs = (add.entry_pA, add.entry_nB)
+        assert _pair_cost(add.n, *legs) <= cash + 1e-9 < _pair_cost(add.n + 1, *legs)
+        # ... and what live compute_trade sizes on that value, cash and stake
+        spec = _live_add_on(first, value, cash, k=0.85, size_cap=1.0, quotes=(0.20, 0.70, 0.30))
+        assert spec.x == add.n
+        assert spec.total_cost_with_fees == pytest.approx(add.total_cost + add.fees, abs=1e-9)
+        # CONTROL: without R the same add-on is not limited by the cash
+        alone = self._sim([self._widening_pair()], k=0.85, size_cap=1.0, add_to_held=True)
+        assert alone.trades[1].add_on and alone.trades[1].n > add.n
 
     def test_another_open_trade_on_its_ladder_refuses_the_add_on(self, caplog):
         # P asks "will it snow by ...?" at two deadlines, narrow on Monday 1
@@ -9724,10 +10145,12 @@ class TestAddToHeldCapParity:
     it. That sharing is exact only because the cap reaches an add-on's size
     through min(pair cap, f*) alone, as it reaches any trade's, and because
     the peak covers every Monday an add-on may be made on; a rule that
-    multiplied the account value by the cap, or a peak that skipped a
-    same-title pair's later Mondays, would break it. The gate: every cap of
-    SIZE_CAP_SWEEP equals a fresh _simulate_at_discount(..., add_to_held=True,
-    size_cap=cap) on trades and equity."""
+    multiplied the portfolio value by the cap, or a peak that skipped a
+    same-title pair's later Mondays, would break it. The portfolio value, the
+    cash left and a pair's stake are walk state that every cap at or above
+    the peak shares. The gate: every cap of SIZE_CAP_SWEEP equals a fresh
+    _simulate_at_discount(..., add_to_held=True, size_cap=cap) on trades and
+    equity."""
 
     _START = date(2026, 1, 1)
     _END = date(2026, 4, 1)
@@ -9819,12 +10242,31 @@ class TestAddToHeldCapParity:
         assert fractions[0.05] < fractions[0.10] < fractions[0.15]
         assert fractions[0.15] == fractions[0.5] == fractions[1.0]
         for cap in (0.05, 0.10):
-            first = next(t for t in cell[cap]["all"].trades if t.ticker_a == "PA")
+            trades = cell[cap]["all"].trades
+            first = next(t for t in trades if t.ticker_a == "PA")
             t = add_on(cap)
-            value = t.balance_at_entry + sum(
-                o.total_cost for o in cell[cap]["all"].trades if o.entry_date < t.entry_date)
+            # The portfolio value the add-on records: the checkpoint's cash
+            # plus every earlier trade (none has paid out) at contract cost
+            earlier = [o for o in trades if o.entry_date < t.entry_date]
+            cash = 10_000.0 - sum(o.total_cost + o.fees for o in earlier)
+            value = t.balance_at_entry
+            assert value == pytest.approx(cash + sum(o.total_cost for o in earlier), abs=1e-9)
+            # The cap is P's capped fraction on Monday 2, and its stake is its
+            # first trade's contracts plus the fees paid for them
             assert t.kelly_fraction == pytest.approx(held_pair_fraction(
-                cap, first.total_cost + first.fees, value, t.balance_at_entry), abs=1e-12)
+                cap, first.total_cost + first.fees, value), abs=1e-12)
+            legs = (t.entry_pA, t.entry_nB)
+            budget = kelly_budget(value, t.kelly_fraction, cash)
+            assert budget < cash
+            assert _pair_cost(t.n, *legs) <= budget < _pair_cost(t.n + 1, *legs)
+        # By hand: P's first trade is 520 pairs, a $404.84 stake with its
+        # fees. At a 5% cap Monday 2's value is $9,962.86, 5% of it $498.14,
+        # so $93.30 is missing: 177 pairs ($93.10; 178 would cost $93.62).
+        # At 10% the value is $9,946.82: $994.68 - $404.84 = $589.84, so
+        # 1,121 pairs ($589.54; 1,122 would cost $590.07). From 15% up the
+        # cap no longer binds and every cap adds 1,188
+        assert [add_on(cap).n for cap in (0.05, 0.10, 0.15, 0.5, 1.0)] == [
+            177, 1121, 1188, 1188, 1188]
         # The same-title add-on: its later Monday's fraction, not its first
         # one's, is the cell's peak, so the caps between the two are each
         # simulated rather than shared (a peak read off a same-title pair's
@@ -9838,6 +10280,20 @@ class TestAddToHeldCapParity:
         assert (st[0.25].kelly_fraction < st[0.30].kelly_fraction
                 < st[0.40].kelly_fraction < st[0.50].kelly_fraction
                 < st[0.55].kelly_fraction == st[1.0].kelly_fraction)
+
+    def test_every_cap_of_a_cash_bound_add_on_equals_a_fresh_simulation(self):
+        # TestAddToHeldPairs' cash-bound fixture: with no cap, R leaves P too
+        # little cash on Monday 2 to buy what it is missing of its share
+        entries = TestAddToHeldPairs()._cash_bound_fixture()
+        cs = self._sweep(entries, (0.85,))
+        assert self._assert_every_cap_is_fresh(cs, entries) > 0
+        # Not vacuous: the cash binds P's add-on at the uncapped cell
+        trades = cs.cell(self._BAND, 0.85)[1.0]["all"].trades
+        (add,) = [t for t in trades if t.add_on]
+        cash = 10_000.0 - sum(o.total_cost + o.fees for o in trades if o.entry_date < add.entry_date)
+        assert kelly_budget(add.balance_at_entry, add.kelly_fraction, cash) == cash
+        legs = (add.entry_pA, add.entry_nB)
+        assert _pair_cost(add.n, *legs) <= cash + 1e-9 < _pair_cost(add.n + 1, *legs)
 
     def test_every_cap_of_the_multi_rung_fixture_equals_a_fresh_simulation(self, monkeypatch):
         # TestOpenLadderExposure's fixture: P is refused on Monday 1 (its

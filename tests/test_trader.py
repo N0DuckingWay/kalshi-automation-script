@@ -1018,6 +1018,19 @@ class TestRequiredCentsByShard:
         ]
         assert _required_cents_by_shard(specs) == {0: 600, 1: 400}
 
+    def test_each_leg_rounds_through_the_shared_helper(self):
+        # config.leg_cash_cents is the rounding strategy.select_portfolio spends
+        # the cash with; every leg's cents are its value, whatever the cost
+        rng = random.Random(3)
+        for _ in range(2_000):
+            cost_a = rng.choice([rng.uniform(0, 500), round(rng.uniform(0, 500), 2),
+                                 round(rng.uniform(0, 500), 4)])
+            cost_b = rng.choice([rng.uniform(0, 500), round(rng.uniform(0, 500), 2)])
+            spec = make_spec(shard_a=0, shard_b=1, cost_a=cost_a, cost_b=cost_b)
+            assert _required_cents_by_shard([spec]) == {
+                0: config.leg_cash_cents(cost_a), 1: config.leg_cash_cents(cost_b)}
+            assert config.leg_cash_cents(cost_a) == math.ceil(round(cost_a * 100, 6))
+
 
 class TestUnfundedShardsAndPartitioning:
     """The two pure helpers that decide which trades survive a funding
@@ -3270,7 +3283,7 @@ def make_add_on_spec(
         sides = ((no_leg.market.ticker, "no"), (yes_leg.market.ticker, "yes"))
     spec.pair.held = HeldPair(
         sides=tuple(sorted(sides)), count=held, cost_dollars=18.9,
-        account_value_dollars=1000.0,
+        value_dollars=18.0, fees_dollars=0.9,
     )
     return spec
 
