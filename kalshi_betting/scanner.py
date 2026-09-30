@@ -2644,11 +2644,13 @@ def get_held_tickers(client: Any) -> set:
     """
     Fetch all tickers where the account currently holds a non-zero position.
 
-    The tickers of get_held_positions, the one reader of the positions
-    listing (see it for the paging, the cursor bounds and the parsing rules).
-    An unreadable count is treated as held. main._run_prod reads
-    get_held_positions itself: it keeps every held market out of new trades
-    except the two markets of an exact held pair its settings let it add to.
+    A view of get_held_positions' keys: that function is the one reader of
+    the positions listing (see it for the paging, the cursor bounds and the
+    parsing rules), and an unreadable count is treated as held there. Nothing
+    in the live run calls this: the production run (main._run_prod) reads
+    get_held_positions itself, since it needs each held market's count and
+    costs as well as its ticker. This is kept for callers that need only the
+    held set.
 
     Args:
         client (Any): An authenticated KalshiClient produced by auth.build_client().

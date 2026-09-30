@@ -3457,6 +3457,257 @@ class TestRunProdAddsToHeldPairs:
             assert text not in caplog.text, text
 
 
+# One question at three deadlines, as three rungs of one event (a same-event
+# ladder): will L happen by Dec 13, by Dec 20, by Dec 27. Their YES asks are
+# 0.20, 0.40 and 0.70, so with nothing held the group's widest pair is
+# Dec 13 / Dec 27
+_TICKER_LAD_13, _TICKER_LAD_20, _TICKER_LAD_27 = "LAD-13", "LAD-20", "LAD-27"
+_LADDER_TICKERS = (_TICKER_LAD_13, _TICKER_LAD_20, _TICKER_LAD_27)
+_LADDER_EVENTS = (
+    {"title": "Ladder Question", "markets": [
+        _mk_market(_TICKER_LAD_13, "KXLAD-26", "Will L happen by Dec 13, 2026?", "Outcome",
+                   "0.20", "0.80", price_level_structure="linear_cent",
+                   close_time="2026-12-13T00:00:00Z"),
+        _mk_market(_TICKER_LAD_20, "KXLAD-26", "Will L happen by Dec 20, 2026?", "Outcome",
+                   "0.40", "0.60", price_level_structure="linear_cent",
+                   close_time="2026-12-20T00:00:00Z"),
+        _mk_market(_TICKER_LAD_27, "KXLAD-26", "Will L happen by Dec 27, 2026?", "Outcome",
+                   "0.70", "0.30", price_level_structure="linear_cent",
+                   close_time="2026-12-27T00:00:00Z"),
+    ]},
+)
+# Each rung's book, 100 contracts a level: its NO bids give the YES asks
+# above, and its YES bids the NO asks
+_LADDER_BOOKS = {
+    _TICKER_LAD_13: {"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.80", "100"]]}},
+    _TICKER_LAD_20: {"orderbook_fp": {"yes_dollars": [["0.40", "100"]],
+                                      "no_dollars": [["0.60", "100"]]}},
+    _TICKER_LAD_27: {"orderbook_fp": {"yes_dollars": [["0.70", "100"]],
+                                      "no_dollars": [["0.30", "100"]]}},
+}
+
+
+@pytest.mark.usefixtures("pinned_config_toggles")
+class TestRunProdAddsToHeldPairsLive:
+    """Live (not dry-run) production runs that add to a held pair, with every
+    order body the run sends. The dry runs above send nothing, so they cannot
+    show which orders go out, the check just before the NO leg, the V2
+    NO-leg mapping check on an add-on's fill, or what an unwind touches.
+
+    The account holds the ladder above: YES on the Dec 13 rung and NO on the
+    Dec 20 rung, 30 contracts each (the user's own example); the Dec 27 rung
+    is not held."""
+
+    @staticmethod
+    def _run(monkeypatch, caplog, *, add_on: bool, held, killed=frozenset(),
+             mapping_confirmed: bool = True, same_title: bool = True):
+        """
+        Run one live production run against a stand-in exchange that keeps a ledger.
+
+        Every order fills in full, except one whose (ticker, side) is in
+        killed, which gets the exchange's HTTP 409 fill-or-kill kill. A fill
+        moves its market's position from what the account held at the start
+        (a bid by +count, an ask by -count), and every position read returns
+        that running position, so each read after a fill sees the fill.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
+            caplog (pytest.LogCaptureFixture): Captures the run's log.
+            add_on (bool): Keyword-only. The run's add_to_held_pairs.
+            held (tuple[str, str] | None): Keyword-only. The ticker held YES
+                and the ticker held NO, 30 contracts each, or None for an
+                account that holds nothing.
+            killed (frozenset): Keyword-only. (ticker, side) of each opening
+                order the exchange kills.
+            mapping_confirmed (bool): Keyword-only. Whether this process has
+                already confirmed the V2 NO-leg mapping (False: the run's first
+                NO fill is checked).
+            same_title (bool): Keyword-only. False leaves out the run's one
+                same-title pair, so the ladder pair is the only one sent.
+
+        Returns:
+            tuple[int, list, list, dict]: The exit code, the run's results,
+                every order body sent (in order) and each market's position at
+                the end.
+        """
+        positions = {t: Decimal(0) for t in (*_LADDER_TICKERS, _TICKER_SAME_EXP,
+                                             _TICKER_SAME_CHEAP)}
+        held_rows = ()
+        if held is not None:
+            yes_ticker, no_ticker = held
+            positions[yes_ticker], positions[no_ticker] = Decimal(30), Decimal(-30)
+            held_rows = (
+                {"ticker": yes_ticker, "position_fp": "30.00",
+                 "market_exposure_dollars": "6.00", "fees_paid_dollars": "0.30"},
+                {"ticker": no_ticker, "position_fp": "-30.00",
+                 "market_exposure_dollars": "18.00", "fees_paid_dollars": "0.50"},
+            )
+        sent: list = []
+
+        def orders(verb, url, headers=None, body=None):
+            sent.append(dict(body))
+            if (body["ticker"], body["side"]) in killed and not body.get("reduce_only"):
+                return _raw_json_response(
+                    {"error": {"code": "fill_or_kill_insufficient_resting_volume",
+                               "message": "fill or kill insufficient resting volume"}},
+                    status=409, reason="Conflict")
+            count = Decimal(body["count"])
+            positions[body["ticker"]] += count if body["side"] == "bid" else -count
+            return _raw_json_response({"order": {"order_id": f"ord-{len(sent)}",
+                                                 "fill_count": int(count),
+                                                 "remaining_count": 0}})
+
+        def reader(ticker):
+            return lambda: {"market_positions": [
+                {"ticker": ticker, "position_fp": f"{positions[ticker]:.2f}"}]}
+
+        client = _live_shape_client(
+            monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD,
+            include_held_position=False, extra_events=_LADDER_EVENTS,
+            held_rows=held_rows, order_side_effect=orders,
+            position_lookup_responses={t: reader(t) for t in positions})
+        books = {**_ORDERBOOK_PAYLOADS, **_LADDER_BOOKS}
+        client.get_market_orderbook_without_preload_content = MagicMock(
+            side_effect=lambda ticker: _raw_json_response(books.get(
+                ticker, {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}})))
+        monkeypatch.setattr(trader_mod, "_V2_NO_MAPPING_CONFIRMED", mapping_confirmed)
+        if not same_title:
+            monkeypatch.setattr(main, "find_same_title_pairs",
+                                lambda markets, held, *, add_on_pairs=None: [])
+        captured: dict = {}
+
+        def fake_append_to_prod_log(results, balance_before, balance_after, *, run_note=""):
+            captured["results"] = results
+            return pathlib.Path("/fake/trade_log.xlsx")
+
+        monkeypatch.setattr(main, "append_to_prod_log", fake_append_to_prod_log)
+        reference = live_settings()
+        settings = dataclasses.replace(reference, add_to_held_pairs=add_on)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            code = main._run_prod(client, _args(dry_run=False), settings, reference)
+        return code, captured.get("results", []), sent, positions
+
+    @staticmethod
+    def _ladder(results) -> list:
+        """The run's results on the ladder, either leg on one of its rungs."""
+        return [r for r in results
+                if {r.spec.pair.market_a.ticker, r.spec.pair.market_b.ticker}
+                & set(_LADDER_TICKERS)]
+
+    @staticmethod
+    def _ladder_orders(sent) -> list:
+        """(ticker, side, reduce_only) of every order sent on the ladder, in order."""
+        return [(b["ticker"], b["side"], b["reduce_only"]) for b in sent
+                if b["ticker"] in _LADDER_TICKERS]
+
+    def test_on_trades_only_yes_13_and_no_20(self, monkeypatch, caplog):
+        """
+        The user's own example, live: with YES held on Dec 13 and NO on Dec
+        20, adding on trades only that exact pair, buying YES on Dec 13 and NO
+        on Dec 20, each order for the new contracts only; it never touches
+        Dec 27, though with nothing held Dec 13 / Dec 27 is the pair the run
+        would trade. With adding off no ladder order is sent, and with the
+        holding the other way round (NO on Dec 13, YES on Dec 20) none is
+        either, since buying YES 13 / NO 20 would reverse the held pair.
+        """
+        l13, l20, l27 = _LADDER_TICKERS
+        # Control: holding nothing, the run trades the group's widest pair, so
+        # Dec 27 is a rung the run would trade if it were let
+        code, results, sent, _ = self._run(monkeypatch, caplog, add_on=True, held=None)
+        assert code == EXIT_OK
+        assert [(r.spec.pair.market_a.ticker, r.spec.pair.market_b.ticker)
+                for r in self._ladder(results)] == [(l13, l27)]
+
+        # Held YES 13 / NO 20, adding on: that pair alone, NO leg first
+        code, results, sent, positions = self._run(monkeypatch, caplog, add_on=True,
+                                                   held=(l13, l20))
+        assert code == EXIT_OK, caplog.text[-3000:]
+        [add_on] = self._ladder(results)
+        assert add_on.status == "executed", add_on.error
+        assert (add_on.spec.pair.market_a.ticker, add_on.spec.pair.market_b.ticker) == (l13, l20)
+        # An ask on Dec 20 buys NO, a bid on Dec 13 buys YES; nothing reduce-only
+        assert self._ladder_orders(sent) == [(l20, "ask", False), (l13, "bid", False)]
+        new = add_on.spec.x
+        assert [Decimal(b["count"]) for b in sent if b["ticker"] in _LADDER_TICKERS] == [
+            Decimal(new), Decimal(new)]
+        assert positions[l13] == 30 + new and positions[l20] == -30 - new
+        assert positions[l27] == 0
+        # Kelly sizes the whole position: old and new within the 20% cap of the
+        # account value, to within the cent or two every budget holds to
+        held = scanner_mod.pair_held(add_on.spec.pair)
+        assert held.count == 30.0
+        assert held.cost_dollars + add_on.spec.total_cost_with_fees <= (
+            0.20 * held.account_value_dollars + 0.02)
+        assert ("Held pair to add to: YES LAD-13 / NO LAD-20, 30 contracts each, "
+                "cost $24.80") in caplog.text
+        assert "adds to 30 held" in caplog.text
+        # Dec 13 / Dec 27 and Dec 20 / Dec 27 touch the held pair's markets
+        assert ("Time-series candidates refused because one of their markets is on a "
+                "ladder we already hold") in caplog.text
+
+        # Adding off: every held market is blocked, so nothing on the ladder
+        code, results, sent, positions = self._run(monkeypatch, caplog, add_on=False,
+                                                   held=(l13, l20))
+        assert code == EXIT_OK
+        assert self._ladder(results) == [] and self._ladder_orders(sent) == []
+        assert (positions[l13], positions[l20]) == (30, -30)
+
+        # Held the other way round: the pair is found, but buying YES 13 /
+        # NO 20 would reverse it, so nothing on the ladder either
+        code, results, sent, positions = self._run(monkeypatch, caplog, add_on=True,
+                                                   held=(l20, l13))
+        assert code == EXIT_OK
+        assert "Held pairs to add to: 1 (other held markets, never added to: 0)" in (
+            caplog.text)
+        assert self._ladder(results) == [] and self._ladder_orders(sent) == []
+        assert (positions[l20], positions[l13]) == (30, -30)
+
+    def test_the_first_no_fill_of_the_process_is_an_add_on(self, monkeypatch, caplog):
+        """
+        When an add-on's NO leg is the first NO fill of the process, the V2
+        NO-leg mapping check judges the change across that fill (-30 to
+        -30 - n), not the position itself, which already read -30 before the
+        pair: it confirms the mapping, the YES leg is sent and no alert fires.
+        A check that read the older holding as this order's fill would stop a
+        sound pair and tell the operator the mapping is wrong.
+        """
+        l13, l20, _ = _LADDER_TICKERS
+        code, results, sent, positions = self._run(
+            monkeypatch, caplog, add_on=True, held=(l13, l20),
+            mapping_confirmed=False, same_title=False)
+        assert code == EXIT_OK, caplog.text[-3000:]
+        [add_on] = results
+        assert add_on.status == "executed", add_on.error
+        assert self._ladder_orders(sent) == [(l20, "ask", False), (l13, "bid", False)]
+        new = add_on.spec.x
+        assert positions[l20] == -30 - new and positions[l13] == 30 + new
+        assert trader_mod._V2_NO_MAPPING_CONFIRMED is True
+        assert f"moved the position on {l20} by -{new}" in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.CRITICAL]
+
+    def test_a_killed_yes_leg_unwinds_only_the_new_contracts(self, monkeypatch, caplog):
+        """
+        When an add-on's YES leg is killed after its NO leg filled, the unwind
+        is a reduce-only bid for this pair's NO contracts only (the NO leg's
+        count, never a position read), so Dec 20 goes from -30 to -30 - n and
+        back to -30: the 30 contracts held before the pair stay open, and the
+        Dec 13 holding is untouched.
+        """
+        l13, l20, _ = _LADDER_TICKERS
+        code, results, sent, positions = self._run(
+            monkeypatch, caplog, add_on=True, held=(l13, l20), killed={(l13, "bid")})
+        assert code == EXIT_OK, caplog.text[-3000:]
+        [add_on] = self._ladder(results)
+        assert add_on.status == "rolled_back", add_on.error
+        assert self._ladder_orders(sent) == [
+            (l20, "ask", False), (l13, "bid", False), (l20, "bid", True)]
+        new = add_on.spec.x
+        ladder_counts = [Decimal(b["count"]) for b in sent if b["ticker"] in _LADDER_TICKERS]
+        assert ladder_counts == [Decimal(new)] * 3
+        assert positions[l20] == -30 and positions[l13] == 30
+
+
 def _args(dry_run: bool = False, max_horizon_days=None) -> SimpleNamespace:
     """Minimal stand-in for the argparse.Namespace _run_prod/_run_dev read."""
     return SimpleNamespace(dry_run=dry_run, max_horizon_days=max_horizon_days)

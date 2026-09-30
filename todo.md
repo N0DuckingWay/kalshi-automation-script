@@ -62,8 +62,10 @@ data or the operator's machine · **[decision]** needs an operator call before a
   (the probe only closes from flat); watch the first add-on rollback, and the case where a
   process's first NO fill is an add-on (`trader.py`, `_add_on_mismatch`/`_rollback_no_leg`).
 - [ ] **First `--add-to-held-pairs` dry run.** Before adding to held pairs goes on for every run,
-  run `python3 -m kalshi_betting.main --mode prod --dry-run --add-to-held-pairs` and check each
-  `Held pair to add to: …` line's cost against its fills in the Kalshi UI. That
+  follow the first-run order (README "Save the live defaults"; the deploy steps in `CLAUDE.md`'s
+  saved-live-defaults paragraph): save the seed values with adding off, run
+  `python3 -m kalshi_betting.main --mode prod --dry-run --add-to-held-pairs`, check each
+  `Held pair to add to: …` line's cost against its fills in the Kalshi UI, then turn adding on. That
   `market_exposure_dollars` is the cost without fees, positive for a NO position, and falls with a
   partial close is inferred from the API reference's one-line description, not observed
   (`scanner.get_held_positions`, `scanner.held_pairs`; DR-77 in `CLAUDE.md`).

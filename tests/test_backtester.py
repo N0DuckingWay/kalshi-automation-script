@@ -2272,7 +2272,7 @@ class TestRunBacktestMalformedTimestamps:
 class TestActiveTickerRelease:
     """A ticker is blocked only while its position is OPEN (BS-24).
 
-    Live, scanner.get_held_tickers() reads positions with count_filter="position",
+    Live, scanner.get_held_positions() reads positions with count_filter="position",
     so a ticker leaves the blocked set the moment its market settles. The
     backtest used to add tickers to active_tickers and never remove them, so one
     early trade blocked that ticker for the entire remaining simulation.

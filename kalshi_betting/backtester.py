@@ -129,8 +129,9 @@ Notes:
     is another trade of that pair, and shares its exit date; the ticker is
     released on that exit date, alongside the cash). This mirrors the
     live bot's Kelly sizing against one per-run balance snapshot and its
-    one-active-position-per-ticker rule: get_held_tickers() reads positions with
-    count_filter="position", so a settled ticker leaves the blocked set live too.
+    one-active-position-per-ticker rule: scanner.get_held_positions() reads
+    positions with count_filter="position", so a settled ticker leaves the
+    blocked set live too.
     Pass 2 opens each pair at most once; a time-series pair it cannot take
     one Monday is tried again on its next passing Monday. Like the live run,
     it holds at most one open time-series pair per ladder. A ladder is one
@@ -6530,7 +6531,7 @@ def _simulate_at_discount(
     # filter mirrors the live
     # bot's rule precisely: at most one held pair per ticker (with add_to_held,
     # a pair may hold several trades). Live, that
-    # rule comes from scanner.get_held_tickers(), which queries positions with
+    # rule comes from scanner.get_held_positions(), which queries positions with
     # count_filter="position" — so a ticker leaves the held set once its market
     # settles and may be entered again. The backtest therefore holds a ticker
     # only until its trade's exit date, released below on the same schedule as
