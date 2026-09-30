@@ -36,8 +36,7 @@ Notes:
     holds (CandidatePair.held, read through scanner.pair_held). Kelly sizes
     its whole position: it stakes only what the held pair is missing of its
     Kelly share of the account value, and never more than a new pair would
-    (config.held_pair_fraction) — to within a cent or two, as every trade's
-    budget holds (see compute_trade).
+    (config.held_pair_fraction).
 """
 import logging
 from dataclasses import dataclass
@@ -486,10 +485,10 @@ def compute_trade(
 
     With a book (depth_levels), size and price are solved together by
     _solve_marginal_size; without one, the pair's scalar leg prices are used.
-    n is then shrunk until the fee-inclusive cost fits the Kelly budget. With
-    a book, the leg prices are then re-derived at the smaller count, which
-    can round a leg's fee up a cent, so the cost holds to the budget to
-    within a cent or two.
+    n is then shrunk until the fee-inclusive cost fits the Kelly budget. With a
+    book, a shrunk n is re-priced (and re-checked for reachability) and the
+    shrink repeated at the new prices until n stops moving, so the returned
+    total_cost_with_fees never exceeds the budget.
 
     Kelly, on leg prices:
         fee        = fee_per_pair_approx(price_a, price_b)
@@ -507,9 +506,9 @@ def compute_trade(
     An add-on to a held pair (pair.held, read through scanner.pair_held) is
     sized on its whole position: the capped f* becomes
     config.held_pair_fraction's, what the held pair is missing of that
-    fraction of the account value, never more than a new pair would stake
-    (each to within the cent or two above). When compute_trade returns None
-    for an add-on it logs one INFO line saying why.
+    fraction of the account value, never more than a new pair would stake.
+    When compute_trade returns None for an add-on it logs one INFO line
+    saying why.
 
     Args:
         pair (CandidatePair): Must be tradeable. max_contracts 0 means not
@@ -564,24 +563,27 @@ def compute_trade(
     kelly_fraction_capped = sized.kelly_fraction
     budget_dollars   = sized.budget_dollars
 
-    # budget_dollars covers contracts only; shrink n until the fees fit too
-    fee_a = fee_leg_exact(n, price_a)
-    fee_b = fee_leg_exact(n, price_b)
-    while n > 0 and n * (price_a + price_b) + fee_a + fee_b > budget_dollars:
-        n -= 1
+    # The count the current leg prices are the fill for (unused with no book)
+    priced_n = n
+    while True:
+        # budget_dollars covers contracts only; shrink n until the fees fit too
         fee_a = fee_leg_exact(n, price_a)
         fee_b = fee_leg_exact(n, price_b)
-    if n < 1:
-        # Fees ate the entire Kelly budget — no contract count fits
-        _log_no_add_on(pair, holds_kelly_share=False)
-        return None
+        while n > 0 and n * (price_a + price_b) + fee_a + fee_b > budget_dollars:
+            n -= 1
+            fee_a = fee_leg_exact(n, price_a)
+            fee_b = fee_leg_exact(n, price_b)
+        if n < 1:
+            # Fees ate the entire Kelly budget — no contract count fits
+            _log_no_add_on(pair, holds_kelly_share=False)
+            return None
+        if not levels or n == priced_n:
+            # The cost at the prices n is actually filled at fits the budget
+            break
 
-    if levels and n != sized.n:
         # n moved: re-price at the count actually submitted (trader reads this
         # price for the FoK limit and rollback floor). p, profit_ratio and the
-        # Kelly fraction stay at pre-shrink values — reporting/ranking only. A
-        # leg whose price moves toward 0.5 here can round its fee up a cent,
-        # so the cost holds to the budget within a cent or two
+        # Kelly fraction stay at pre-shrink values — reporting/ranking only.
         fills = prefix_fill_prices(levels, n)
         if fills is not None:
             price_a, price_b = fills
@@ -609,6 +611,10 @@ def compute_trade(
             # Nothing the cap can reach
             _log_no_add_on(pair, holds_kelly_share=False)
             return None
+        # A cheaper leg can cost a cent more in exact fee (p(1 - p) grows
+        # toward 0.5), so the re-priced cost can overrun the budget again:
+        # shrink once more at these prices. n only falls, so this ends.
+        priced_n = n
 
     # Exact-fee win payoff; ceiling rounding can erase it at small n
     min_payoff = n * (1.0 - price_a - price_b) - fee_a - fee_b

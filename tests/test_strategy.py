@@ -558,10 +558,7 @@ class TestComputeTradeAddsToHeldPair:
     position: the held stake plus the new one stays within min(f*, cap) of
     the account value, and the new stake alone within what a new pair would
     stake of the cash. Both sizing paths, the bookless one and the book
-    search, read it through config.held_pair_fraction. (A book deep enough
-    that the fee shrink re-prices at a smaller count can round a leg's fee up
-    a cent, so there the bounds hold to within a cent or two, as for every
-    trade; these fixtures' one-level book never re-prices.)"""
+    search, read it through config.held_pair_fraction."""
 
     # k 0.75, a 10% cap: the time-series fixture's f* (about 0.16) is capped
     _SETTINGS = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
@@ -866,7 +863,9 @@ class TestMarginalFillPricing:
 
     def test_fee_inclusive_cost_still_fits_the_kelly_budget(self):
         # Re-pricing after the fee shrink must not push the trade back over
-        # budget — a smaller n can only reach cheaper levels.
+        # budget. A smaller n reaches cheaper levels, but a cheaper leg above
+        # 0.5 can round its exact fee up a cent, so compute_trade shrinks
+        # again at the new prices (TestRepricedCostFitsTheBudget).
         spec = compute_trade(make_booked_pair(self.LEVELS), 200_000)
         assert spec is not None
         assert spec.total_cost_with_fees <= (200_000 / 100.0) * spec.kelly_fraction
@@ -972,6 +971,78 @@ class TestMarginalFillPricing:
             assert leg_prices(spec.pair) == pytest.approx(
                 prefix_fill_prices(tuple(levels), spec.x)
             )
+
+
+class TestRepricedCostFitsTheBudget:
+    """
+    After the fee shrink moves n, compute_trade re-prices the legs at the
+    smaller n. A leg above 0.5 that gets cheaper has a LARGER p(1 - p), so its
+    ceiling-rounded exact fee can rise a cent, and the re-priced cost can
+    overrun the budget the shrink had just met. compute_trade must shrink
+    again at the new prices until n stops moving.
+
+    The book is a reviewer's (2026-09-30), same-title, so levels are
+    (market_a NO price, market_b YES price, qty). The review quoted a balance
+    of 4738 cents; in this code that balance overruns at no cap on the 5% grid,
+    while 4082 cents with no caps reproduces its 41 contracts, $31.7644 at the
+    solved prices, re-priced NO leg 0.641463 and $0.67 fee exactly.
+    """
+
+    LEVELS = ((0.64, 0.11, 31.0), (0.646, 0.11, 25.0), (0.653, 0.106, 32.0))
+    BALANCE_CENTS = 4_082
+    # No per-trade or same-title cap, so the budget is the uncapped Kelly
+    # fraction of the balance; k does not reach a same-title pair
+    SETTINGS = _live(cap=1.0, st_cap=1.0)
+
+    @staticmethod
+    def _cost(n: int, price_a: float, price_b: float) -> float:
+        """Fee-inclusive cost of n contract pairs, as compute_trade sums it."""
+        return n * (price_a + price_b) + fee_leg_exact(n, price_a) + fee_leg_exact(n, price_b)
+
+    def test_the_re_priced_count_is_shrunk_again(self):
+        pair = make_booked_pair(list(self.LEVELS), pair_type="same_title")
+        sized = strategy._solve_marginal_size(
+            pair, pair.depth_levels, self.BALANCE_CENTS, self.SETTINGS)
+        assert sized.n == 42
+        budget = sized.budget_dollars
+        assert budget == pytest.approx(31.768141, abs=1e-6)
+
+        # Premise: at the solved (42-contract) prices, 41 contracts fit...
+        assert self._cost(41, sized.price_a, sized.price_b) == pytest.approx(31.7644, abs=1e-4)
+        assert self._cost(41, sized.price_a, sized.price_b) <= budget
+        # ...but re-priced at 41 the cheaper NO leg's fee rounds up a cent
+        price_a_41, price_b_41 = prefix_fill_prices(pair.depth_levels, 41)
+        assert price_a_41 == pytest.approx(0.641463, abs=1e-6)
+        assert fee_leg_exact(41, sized.price_a) == pytest.approx(0.66)
+        assert fee_leg_exact(41, price_a_41) == pytest.approx(0.67)
+        assert self._cost(41, price_a_41, price_b_41) == pytest.approx(31.77)
+        assert self._cost(41, price_a_41, price_b_41) > budget
+
+        spec = compute_trade(pair, self.BALANCE_CENTS, settings=self.SETTINGS)
+        assert spec is not None
+        assert spec.x == 40
+        assert spec.total_cost_with_fees == pytest.approx(30.984)
+        assert spec.total_cost_with_fees <= budget
+        # Priced at exactly the 40 it submits
+        assert leg_prices(spec.pair) == pytest.approx(prefix_fill_prices(pair.depth_levels, 40))
+        # p, profit_ratio and the Kelly fraction stay at the solved size's values
+        assert spec.kelly_p == sized.p
+        assert spec.profit_ratio == sized.profit_ratio
+        assert spec.kelly_fraction == sized.kelly_fraction
+
+    def test_no_balance_overruns_the_budget_on_this_book(self):
+        # Before the fix 3578, 4082 and 5591 cents all overran on this book.
+        # The shrink compares n * (price_a + price_b) + fee_a + fee_b with the
+        # budget in the same order total_cost_with_fees is summed, so no
+        # tolerance is needed.
+        for balance in range(100, 8_001):
+            pair = make_booked_pair(list(self.LEVELS), pair_type="same_title")
+            spec = compute_trade(pair, balance, settings=self.SETTINGS)
+            if spec is None:
+                continue
+            assert spec.total_cost_with_fees <= (balance / 100.0) * spec.kelly_fraction, balance
+            assert leg_prices(spec.pair) == pytest.approx(
+                prefix_fill_prices(pair.depth_levels, spec.x)), balance
 
 
 class TestTimeSeriesKellyParity:
@@ -2819,6 +2890,30 @@ class TestReachableDepthSizing:
         # The fee shrink alone would land in [1001, 1500] — unreachable. The
         # backstop snaps to the reachable prefix instead.
         assert spec.x == 1000
+        assert self._reach(spec, levels) >= spec.x
+
+    def test_the_budget_is_checked_again_after_the_backstop_snaps(self, monkeypatch):
+        # The snapped count's own cost must fit the budget too. On a real book
+        # a snap drops n by at least one contract pair, which outweighs the
+        # cent a fee can round up, so this hands the solver's result prices
+        # CHEAPER than the book's at 1600 — the one way to make the snapped
+        # count overrun. Shrinking at 0.25 / 0.25 lands on 1140, in the hole;
+        # re-priced there it is unreachable, the backstop snaps to 1000, and
+        # 1000 at 0.30 / 0.30 costs $629.40 against a $600 budget.
+        levels = [(0.30, 0.30, 1000.0), (0.33, 0.30, 600.0)]
+        pair = make_booked_pair(levels, pair_type="same_title")
+        forced = strategy._Sizing(
+            n=1600, target=1600, price_a=0.25, price_b=0.25,
+            p=SAME_TITLE_CO_RESOLVE_PROB, profit_ratio=0.05,
+            kelly_fraction=0.20, budget_dollars=600.0,
+        )
+        monkeypatch.setattr(strategy, "_solve_marginal_size",
+                            lambda *a, **k: forced)
+        spec = compute_trade(pair, _AMPLE_BALANCE_CENTS)
+        # A second shrink at the snapped prices: 953 costs $599.82, 954 $600.46
+        assert spec.x == 953
+        assert spec.total_cost_with_fees <= 600.0
+        assert leg_prices(spec.pair) == pytest.approx((0.30, 0.30))
         assert self._reach(spec, levels) >= spec.x
 
     def test_reachability_holds_for_every_ladder_and_balance(self):

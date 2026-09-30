@@ -3634,11 +3634,11 @@ class TestRunProdAddsToHeldPairsLive:
         assert positions[l13] == 30 + new and positions[l20] == -30 - new
         assert positions[l27] == 0
         # Kelly sizes the whole position: old and new within the 20% cap of the
-        # account value, to within the cent or two every budget holds to
+        # account value
         held = scanner_mod.pair_held(add_on.spec.pair)
         assert held.count == 30.0
         assert held.cost_dollars + add_on.spec.total_cost_with_fees <= (
-            0.20 * held.account_value_dollars + 0.02)
+            0.20 * held.account_value_dollars + 1e-9)
         assert ("Held pair to add to: YES LAD-13 / NO LAD-20, 30 contracts each, "
                 "cost $24.80") in caplog.text
         assert "adds to 30 held" in caplog.text
