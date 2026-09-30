@@ -61,6 +61,12 @@ data or the operator's machine · **[decision]** needs an operator call before a
 - [ ] **Reduce-only unwind and NO buy against an existing, larger NO position.** Never observed live
   (the probe only closes from flat); watch the first add-on rollback, and the case where a
   process's first NO fill is an add-on (`trader.py`, `_add_on_mismatch`/`_rollback_no_leg`).
+- [ ] **First `--add-to-held-pairs` dry run.** Before adding to held pairs goes on for every run,
+  run `python3 -m kalshi_betting.main --mode prod --dry-run --add-to-held-pairs` and check each
+  `Held pair to add to: …` line's cost against its fills in the Kalshi UI. That
+  `market_exposure_dollars` is the cost without fees, positive for a NO position, and falls with a
+  partial close is inferred from the API reference's one-line description, not observed
+  (`scanner.get_held_positions`, `scanner.held_pairs`; DR-77 in `CLAUDE.md`).
 
 ## 3. Pending operator decisions  [decision]
 
@@ -76,8 +82,10 @@ data or the operator's machine · **[decision]** needs an operator call before a
 - [ ] **Same-title close-gate bound: 1 h vs 15 min.** 15 min gives the same result on the 365-day
   corpus with ~1 h more margin (CLAUDE.md DR-74 table; `config.py:219`).
 - [ ] **Widen market-eligibility bounds (0.01/0.99)?** Deliberately held (`scanner.py:458-464`).
-- [ ] **Same-title stacking across weeks** is out of scope of DR-76 (`main.py:1022` passes no
-  `held_ladders` to the same-title finder). Confirm that's still the intent.
+- [ ] **Same-title stacking across weeks** is out of scope of DR-76: its held-ladder rule refuses
+  time-series pairs only (in `find_time_series_pairs` and `select_portfolio`), so a later run can
+  trade another same-title pair of a question it already holds one on; and with `add_to_held_pairs` on it may also add to the
+  exact same-title pair it holds (DR-77). Confirm that's still the intent.
 
 ## 4. Backtest fidelity  [bt]
 

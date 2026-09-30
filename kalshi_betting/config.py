@@ -511,7 +511,7 @@ TRADE_TAGS: tuple[str, ...] | None = None
 # of the account value (cash plus held positions at cost), and the new stake
 # is never more than a new pair would stake (held_pair_fraction). False: a held
 # market is never traded again (DR-76). A live run reads the saved live
-# defaults' add_to_held_pairs instead (a file saved before this toggle existed
+# defaults' add_to_held_pairs instead (a saved file that leaves the key out
 # reads it as off), which main.py --add-to-held-pairs / --no-add-to-held-pairs
 # overrides for one run. The backtest never reads this constant.
 ADD_TO_HELD_PAIRS = True
@@ -2297,16 +2297,15 @@ class LiveSettings:
 # The eight toggles by field name: every LiveSettings field except origin
 LIVE_TOGGLE_FIELDS = tuple(f.name for f in fields(LiveSettings) if f.compare)
 
-# Toggles added after live_defaults.json files were first written. A saved file
-# may leave one out, and it then reads as its LiveSettings default (off), since
-# nobody confirmed a value for it in that file: a file saved before it existed
-# starts every live run exactly as it did. save_live_defaults leaves it out
-# while it is at its default, so such a file is also still readable by code
-# from before the toggle existed.
-_TOGGLES_ADDED_LATER = ("add_to_held_pairs",)
+# Toggles a saved file may leave out. A missing one reads as its LiveSettings
+# default (add_to_held_pairs: off, whatever config.py ships), because nobody
+# confirmed a value for it in that file. save_live_defaults leaves one out
+# while it is at its default, so such a file can still be read by code that
+# does not know the toggle.
+_OPTIONAL_TOGGLES = ("add_to_held_pairs",)
 # Each of those toggles' LiveSettings default
 _TOGGLE_DEFAULTS = {f.name: f.default for f in fields(LiveSettings)
-                    if f.name in _TOGGLES_ADDED_LATER}
+                    if f.name in _OPTIONAL_TOGGLES}
 
 # The live defaults `python3 -m kalshi_betting.defaults_server --seed` offers to
 # save, the starting values for a first save: tier floors off, spread band
@@ -2472,7 +2471,7 @@ def _saved_settings(record) -> LiveSettings:
 
     Checks what LiveSettings cannot see in JSON: the file's keys and format, the
     save time, the source note, exactly the eight toggle names (a toggle in
-    _TOGGLES_ADDED_LATER may be left out, and then takes its LiveSettings
+    _OPTIONAL_TOGGLES may be left out, and then takes its LiveSettings
     default, off), a spread band of two real numbers (LiveSettings would read
     a JSON true as 1) and printable filter names. LiveSettings then validates
     every value.
@@ -2504,12 +2503,12 @@ def _saved_settings(record) -> LiveSettings:
                          f"got {saved_at!r}")
     source = live_defaults_source(record["source"])
     raw = record["settings"]
-    # Every toggle but the ones added later is required; nothing else is allowed
-    required = set(LIVE_TOGGLE_FIELDS) - set(_TOGGLES_ADDED_LATER)
+    # Every toggle but the optional ones is required; nothing else is allowed
+    required = set(LIVE_TOGGLE_FIELDS) - set(_OPTIONAL_TOGGLES)
     if not isinstance(raw, dict) or not required <= set(raw) <= set(LIVE_TOGGLE_FIELDS):
         raise ValueError(f'"settings" must hold exactly {", ".join(LIVE_TOGGLE_FIELDS)} '
-                         f'(a file saved before {", ".join(_TOGGLES_ADDED_LATER)} existed '
-                         "may leave it out)")
+                         f'({", ".join(_OPTIONAL_TOGGLES)} may be left out, and then '
+                         "reads as off)")
     band = raw["spread_band"]
     if not (isinstance(band, list) and len(band) == 2 and all(
             isinstance(x, (int, float)) and not isinstance(x, bool) for x in band)):
@@ -2567,8 +2566,7 @@ def read_saved_live_defaults() -> LiveSettings | None:
       true/false, spread_band is [floor, ceiling], interval_discount, size_cap
       and same_title_size_cap are numbers (the caps as fractions),
       categories and tags are null (any) or a list of names, and
-      add_to_held_pairs is true/false or left out (off: a file saved before
-      that toggle existed has seven).
+      add_to_held_pairs is true/false or left out, which reads as off.
 
     Refused on top of that: a repeated key, NaN or Infinity, a file over
     LIVE_DEFAULTS_MAX_BYTES, any value LiveSettings rejects, and anything at
@@ -2715,10 +2713,10 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
     same moment sees the old file or the new one, never part of one. The
     directory is flushed too, so the rename survives a power cut. The file is
     then read back from disk and must equal settings (the eight toggles;
-    origin is not compared). A toggle in _TOGGLES_ADDED_LATER is written only
+    origin is not compared). A toggle in _OPTIONAL_TOGGLES is written only
     when it is not at its default, so a file with add_to_held_pairs off holds
-    the same seven toggles, byte for byte, as one saved before that toggle
-    existed, and code from before it still reads the file.
+    only the seven other toggles, and code that does not know
+    add_to_held_pairs can still read it.
 
     Args:
         settings (LiveSettings): The new defaults.
@@ -2739,9 +2737,10 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
     except ValueError as exc:
         raise LiveDefaultsError(f"{path}: not saved: {exc}") from exc
     values = {name: getattr(settings, name) for name in LIVE_TOGGLE_FIELDS}
-    # A toggle added later is written only when it departs from its default,
-    # so a file that does not use it reads the same to code from before it existed
-    for name in _TOGGLES_ADDED_LATER:
+    # An optional toggle is written only when it differs from its default, so
+    # a file that keeps it at its default can still be read by code that does
+    # not know it
+    for name in _OPTIONAL_TOGGLES:
         if values[name] == _TOGGLE_DEFAULTS[name]:
             del values[name]
     record = {

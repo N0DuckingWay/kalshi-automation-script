@@ -725,6 +725,67 @@ def _keyword_values(module, func_name: str, callee: str, keyword: str, *,
     raise AssertionError(f"{module.__name__}.{func_name} not found")
 
 
+def _add_on_unblocking_problems(source: str) -> list[str]:
+    """
+    Check how main._run_prod decides which held markets the finders may see.
+
+    A held market is kept out of both finders only by blocked_tickers (the
+    same-title finder has no ladder refusal of its own), so the markets the
+    run lets back in must be exactly those of the add_on_pairs it hands the
+    finders, as that dict stands after its last change (the drop of pairs
+    already at their size cap). A set built from held_pairs' own result, or
+    before the drop, lets a full pair's markets back in with nothing to
+    protect them: an ordinary pair could then buy more of a held market.
+
+    Args:
+        source (str): Source text holding a def _run_prod (main.py's own, or
+            a changed copy).
+
+    Returns:
+        list[str]: One short sentence per rule the function breaks; empty
+            when it keeps them all.
+    """
+    tree = ast.parse(source)
+    [func] = [n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_run_prod"]
+    assigned: dict[str, list[tuple[int, ast.AST]]] = {}
+    for node in ast.walk(func):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    assigned.setdefault(target.id, []).append((node.lineno, node.value))
+    problems = []
+    tickers = assigned.get("add_on_tickers", [])
+    if len(tickers) != 1:
+        return ["add_on_tickers is not assigned exactly once"]
+    [(tickers_line, tickers_value)] = tickers
+    # The names the value reads, bar the ones its own comprehension binds
+    bound = {n.id for n in ast.walk(tickers_value)
+             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    read = {n.id for n in ast.walk(tickers_value)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)} - bound
+    if read != {"add_on_pairs"}:
+        problems.append(f"add_on_tickers is built from {sorted(read)}, not add_on_pairs")
+    if any(line > tickers_line for line, _ in assigned.get("add_on_pairs", [])):
+        problems.append("add_on_pairs changes after add_on_tickers is built")
+    blocked = assigned.get("blocked_tickers", [])
+    if [ast.unparse(value) for _, value in blocked] != ["held_tickers - add_on_tickers"]:
+        problems.append("blocked_tickers is not held_tickers - add_on_tickers")
+    # Both finders take the blocked set as their held-markets argument, and
+    # the market list they read is filtered by it
+    for finder in ("find_time_series_pairs", "find_same_title_pairs"):
+        calls = [n for n in ast.walk(func) if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", getattr(n.func, "attr", None)) == finder]
+        if not calls or any(len(c.args) < 2 or not isinstance(c.args[1], ast.Name)
+                            or c.args[1].id != "blocked_tickers" for c in calls):
+            problems.append(f"{finder} is not handed blocked_tickers")
+    if not any("blocked_tickers" in ast.unparse(value)
+               for _, value in assigned.get("markets", [])):
+        problems.append("the market list is not filtered by blocked_tickers")
+    return problems
+
+
 def _key_homes(tree: ast.AST, key: str) -> list[tuple[str | None, int]]:
     """Every place `key` is written in `tree`, as a string or as a keyword
     argument: each string constant EQUAL to it (a dict key, a subscript, a
@@ -1996,6 +2057,39 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "pair_ladder_keys", "market_ladder_keys")
         assert _function_calls(scanner, "market_ladder_keys", "ladder_keys")
         assert _function_calls(scanner, "market_ladder_keys", "time_series_group_key")
+
+    def test_ast_the_run_lets_back_in_only_the_pairs_it_hands_the_finders(self):
+        # main._run_prod lets back into the market list exactly the markets of
+        # the add_on_pairs it hands both finders, after the at-cap drop, and
+        # blocks every other held market from both finders
+        source = inspect.getsource(main)
+        assert _add_on_unblocking_problems(source) == []
+        # The check itself: each of these changed copies of _run_prod is caught
+        real = "add_on_tickers    = {ticker for key in add_on_pairs for ticker in key}"
+        assert source.count(real) == 1
+        mutants = {
+            # Built from held_pairs' result, before the at-cap drop
+            "from held_pairs": source.replace(
+                "add_on_pairs = held_pairs(held_positions, held_labels, balance_cents)",
+                "add_on_pairs = found = held_pairs(held_positions, held_labels, "
+                "balance_cents)").replace(
+                real, "add_on_tickers    = {ticker for key in found for ticker in key}"),
+            # The drop moved after the markets are let back in
+            "drop after": source.replace(
+                real, real + "\n    add_on_pairs = {key: pair for key, pair in "
+                "add_on_pairs.items() if key}"),
+            # Every held market let back in
+            "all held": source.replace(
+                "blocked_tickers   = held_tickers - add_on_tickers",
+                "blocked_tickers   = held_tickers - held_tickers"),
+            # One finder handed the full held set instead of the blocked one
+            "finder held set": source.replace(
+                "find_same_title_pairs(markets, blocked_tickers,",
+                "find_same_title_pairs(markets, held_tickers,"),
+        }
+        for name, mutant in mutants.items():
+            assert mutant != source, name
+            assert _add_on_unblocking_problems(mutant), name
 
     def test_ast_the_backtest_reads_ladders_through_the_one_definition(self):
         # The backtest's one-open-trade-per-ladder rule labels each market

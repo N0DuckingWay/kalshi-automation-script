@@ -1151,8 +1151,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     if settings.add_to_held_pairs:
         if held_ladders is None or held_listing.get("complete") is not True:
             logging.warning("Not adding to held pairs this run: %s",
-                            "a held market could not be identified" if held_ladders is None
-                            else "the positions listing stopped early")
+                            "a market the account holds could not be looked up"
+                            if held_ladders is None
+                            else "the list of the account's positions was cut short, "
+                                 "so a held market may be missing from it")
         else:
             # Cross-module: the one definition of an exact held pair (both
             # markets alone on one ladder, one YES and one NO of equal size)
@@ -1160,7 +1162,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             # A pair that already holds its per-trade cap of the account value
             # can add nothing whatever Kelly says: it would only take its
             # group's one slot and size to nothing, so its markets stay
-            # blocked like any other held market's
+            # blocked like any other held market's (the last argument is the
+            # cash in dollars, as held_pair_fraction takes it)
             full = {key for key, pair in add_on_pairs.items()
                     if held_pair_fraction(settings.size_cap, pair.cost_dollars,
                                           pair.account_value_dollars,
@@ -1404,7 +1407,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # values — no choices, range check or literal here
     live = parser.add_argument_group(
         "live trading toggles",
-        "Override one live default for THIS run only, in either mode. The live defaults "
+        "Override one live default for THIS run only, in either mode "
+        "(adding to held pairs: production runs only). The live defaults "
         "are the ones saved through python3 -m kalshi_betting.defaults_server "
         "(live_defaults.json); a run refuses to start without them. The weekly scheduler "
         "passes none of these flags, so a scheduled run trades exactly the saved defaults.",
@@ -1445,9 +1449,9 @@ def _build_parser() -> argparse.ArgumentParser:
     live.add_argument(
         "--add-to-held-pairs", action=argparse.BooleanOptionalAction, default=None,
         help="Let this run add to a pair the account already holds (exactly the same "
-             "two markets, the same side on each), with Kelly sizing the old and new "
-             "trade together as a share of the account value; --no-add-to-held-pairs "
-             "never trades a held market. Production runs only: a dev run holds nothing "
+             "two markets, the same side on each), sizing the old and new contracts "
+             "together as a share of the account value. --no-add-to-held-pairs never "
+             "trades a held market. Production runs only: a dev run holds nothing "
              "(default: the saved live defaults)",
     )
     # Filed as the backtest dashboard files a trade (_filter_by_category)

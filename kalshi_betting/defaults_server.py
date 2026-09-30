@@ -756,13 +756,18 @@ def _proposal(params: dict[str, list[str]],
     fraction, e.g. 0.2) are required. same_title_size_cap and
     add_to_held_pairs ("on" / "off") may be left out, and each then keeps the
     saved value (or the seed's when none is saved); they are the only two
-    fields that fall back to what is saved, so a link that names neither (a
-    dashboard built before them, say) leaves both as they are. A missing
-    category or tag means any, whatever is saved; a tag needs its category. source is
-    the note the saved file will keep: left out, it is empty; given, it must
-    be one of the two shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows,
-    with ASCII digits only, and the seed's note (LIVE_DEFAULTS_SEED_SOURCE)
-    may label only the seed values themselves.
+    fields that fall back to what is saved, so a link that leaves one out
+    keeps it as it is (the dashboard's save button leaves the same-title cap
+    out when its run recorded none, and the add-to-held choice out on a page
+    that does not show it). One exception: a link carrying the seed's note
+    that leaves add_to_held_pairs out takes the seed's value, so it still
+    proposes exactly the seed, and the page shows the change against what is
+    saved. A missing category or tag means any, whatever is saved; a tag needs
+    its category. source is the note the saved file will keep: left out, it
+    is empty; given, it must be one of the two shapes
+    config.LIVE_DEFAULTS_SOURCE_PATTERN allows, with ASCII digits only, and
+    the seed's note (LIVE_DEFAULTS_SEED_SOURCE) may label only the seed
+    values themselves.
 
     Args:
         params (dict[str, list[str]]): The request's fields (_params).
@@ -805,9 +810,11 @@ def _proposal(params: dict[str, list[str]],
             raise ValueError("add_to_held_pairs must be on or off, got "
                              f"{value['add_to_held_pairs']!r}")
         add_on = value["add_to_held_pairs"] == "on"
-    elif current is not None:
+    elif current is not None and value.get("source") != LIVE_DEFAULTS_SEED_SOURCE:
         add_on = current.add_to_held_pairs
     else:
+        # No defaults saved, or a seed link: the seed's value, so a seed link
+        # that leaves the field out still proposes exactly the seed
         add_on = LIVE_DEFAULTS_SEED.add_to_held_pairs
     if "tag" in value and "category" not in value:
         raise ValueError("a tag needs its category")

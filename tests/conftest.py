@@ -91,8 +91,8 @@ def apply_pre_toggle_defaults(mp) -> None:
 
     Tier floors on, no spread band, k 0.75, a 20% per-trade cap, no extra
     same-title cap, no category or tag filter, and no adding to held pairs
-    (so a saved file of these values is the seven-toggle file a save wrote
-    before that toggle existed). Patches config's constants,
+    (the writer leaves that key out while it is off, so a file saved from
+    these values holds only the other seven toggles). Patches config's constants,
     read at call time, AND the by-value copies backtester and backtest bind at
     import, or a test would price with one value and size with another; no
     other module binds one by value (pinned by test_config.py's

@@ -870,8 +870,9 @@ class TestConfirmPage:
 
     @pytest.mark.parametrize("saved_on", [False, True])
     def test_a_missing_add_to_held_pairs_keeps_the_saved_value(self, saved_on):
-        # A link that does not name it (a dashboard built before the toggle)
-        # leaves it as saved, either way, shown as no change
+        # A link that does not name it (the dashboard's save button, on a page
+        # that does not show the choice) leaves it as saved, either way, shown
+        # as no change
         saved = LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, add_to_held_pairs=saved_on)
         _save(saved)
         page = _parse(_get(_app(), "/confirm?" + _query()).body)
@@ -1586,7 +1587,7 @@ class TestSeed:
         assert defaults_server._proposal(params, saved)[0] == config.LIVE_DEFAULTS_SEED
 
     def test_a_seven_toggle_file_is_proposed_the_seed_with_adding_on(self):
-        # Defaults saved before the toggle existed read it as off; the seed
+        # A saved file that leaves the toggle out reads it as off; the seed
         # page proposes it on, a change shown in its row
         _save(replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False))
         assert '"add_to_held_pairs"' not in config.LIVE_DEFAULTS_FILE.read_text()
@@ -1596,6 +1597,35 @@ class TestSeed:
             "add to held pairs"]
         assert page.cells["add to held pairs"][1:3] == ["off", "on"]
         assert "1 of 8 settings change." in response.body
+
+    def test_a_seed_link_that_leaves_out_adding_to_held_pairs_still_proposes_the_seed(self):
+        # A seed link without the add_to_held_pairs field, opened while a file
+        # with it off is saved: it proposes exactly the seed (the choice on),
+        # shown as a change, and saves it; it is never refused for putting the
+        # seed's note on other values
+        _save(replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False))
+        query = defaults_server._seed_query()
+        stale = "&".join(part for part in query.split("&")
+                         if not part.startswith("add_to_held_pairs="))
+        assert stale != query
+        params = defaults_server._params(stale)
+        assert defaults_server._proposal(params, config.read_saved_live_defaults()) == (
+            config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED_SOURCE)
+        app = _app()
+        response = _get(app, "/confirm?" + stale)
+        assert response.status == 200
+        page = _parse(response.body)
+        assert [label for label, css in page.rows.items() if css == "changed"] == [
+            "add to held pairs"]
+        assert page.cells["add to held pairs"][1:3] == ["off", "on"]
+        assert _post(app, _click(response.body, "confirm")).status == 303
+        assert config.live_defaults() == config.LIVE_DEFAULTS_SEED
+        # Control: the same link without the seed's note keeps what is saved
+        plain = "&".join(part for part in stale.split("&") if not part.startswith("source="))
+        assert defaults_server._proposal(
+            defaults_server._params(plain),
+            replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False),
+        )[0].add_to_held_pairs is False
 
     def test_confirming_the_seed_saves_it(self):
         app = _app()

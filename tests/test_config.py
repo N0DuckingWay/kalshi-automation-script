@@ -837,10 +837,23 @@ class TestLiveSettings:
             dataclasses.replace(_settings(), add_to_held_pairs=bad)
 
     def test_add_to_held_pairs_defaults_to_off(self):
-        # A construction that does not name it, and a saved file that leaves
-        # it out, both read it as off
+        # A construction that does not name it reads it as off (a saved file
+        # that leaves it out: TestSavedLiveDefaults)
         assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2).add_to_held_pairs is False
         assert _settings(add_to_held_pairs=True).add_to_held_pairs is True
+
+    def test_every_optional_toggle_is_a_field_with_a_default_at_the_end(self):
+        # A toggle a saved file may leave out must have a default to read as,
+        # and sit after every required toggle, so a positional construction
+        # of the required ones still builds
+        names = [f.name for f in dataclasses.fields(LiveSettings) if f.compare]
+        assert list(config.LIVE_TOGGLE_FIELDS) == names
+        optional = list(config._OPTIONAL_TOGGLES)
+        assert optional and names[-len(optional):] == optional
+        for f in dataclasses.fields(LiveSettings):
+            if f.name in optional:
+                assert f.default is not dataclasses.MISSING, f.name
+                assert config._TOGGLE_DEFAULTS[f.name] == f.default
 
     @pytest.mark.parametrize("band", [
         (0.5, 0.5), (0.6, 0.5), (-0.1, 0.5), (0.2, 1.1), (float("nan"), 0.5),
@@ -1878,8 +1891,8 @@ def _valid_record(**changes) -> dict:
     Build a saved-defaults record the reader accepts, then apply changes.
 
     Its toggles are LIVE_DEFAULTS_SEED's, saved at 2026-09-27T21:05:13Z with
-    no source note, with add_to_held_pairs left out: the seven-toggle shape a
-    file saved before that toggle existed has, which reads as _SEED_ADD_ON_OFF.
+    no source note, with add_to_held_pairs left out (the seven-toggle shape),
+    which reads as _SEED_ADD_ON_OFF.
 
     Args:
         **changes: Top-level keys to replace; a value of _DROP removes the key.
@@ -1931,9 +1944,8 @@ _DROP = object()
 _SEED_ADD_ON_OFF = dataclasses.replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False)
 
 # The exact bytes a save of _SEED_ADD_ON_OFF writes, with the seed's note, at
-# _FrozenDatetime's instant: the same bytes a save wrote before
-# add_to_held_pairs existed, so a file saved with it off reads the same to
-# code from before it
+# _FrozenDatetime's instant: add_to_held_pairs is left out, so code that does
+# not know the toggle can read a file saved with it off
 _SEVEN_TOGGLE_BYTES = (
     b'{\n'
     b'  "format": "live-defaults-v1",\n'
@@ -2017,15 +2029,15 @@ class TestSavedLiveDefaults:
         assert '"categories": ["Sports"],' in text and '"tags": ["Basketball"]\n' in text
 
     def test_the_written_text_is_pinned(self, monkeypatch):
-        # With adding to held pairs off, the file is the seven-toggle one a
-        # save wrote before that toggle existed, byte for byte
+        # With adding to held pairs off, the key is left out, byte for byte,
+        # so code that does not know the toggle can read a file saved with it off
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
         config.save_live_defaults(_SEED_ADD_ON_OFF, source=config.LIVE_DEFAULTS_SEED_SOURCE)
         assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES
 
     def test_an_on_save_writes_the_key_last(self, monkeypatch):
         # The seed (adding to held pairs on) writes the toggle, after the
-        # seven that were there before it
+        # other seven
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
         config.save_live_defaults(config.LIVE_DEFAULTS_SEED,
                                   source=config.LIVE_DEFAULTS_SEED_SOURCE)
@@ -2035,9 +2047,9 @@ class TestSavedLiveDefaults:
         assert config.read_saved_live_defaults() == config.LIVE_DEFAULTS_SEED
 
     def test_a_seven_toggle_file_reads_with_add_on_off(self):
-        # A file saved before add_to_held_pairs existed: the exact bytes that
-        # save wrote read as the same settings, adding to held pairs off
-        # (nobody confirmed a value for it), whatever config.py or the seed ship
+        # A file that leaves add_to_held_pairs out reads as the same
+        # settings, adding to held pairs off (nobody confirmed a value for
+        # it), whatever config.py or the seed ship
         config.LIVE_DEFAULTS_FILE.write_bytes(_SEVEN_TOGGLE_BYTES)
         saved = config.read_saved_live_defaults()
         assert saved == _SEED_ADD_ON_OFF and saved.add_to_held_pairs is False
@@ -2357,7 +2369,7 @@ class TestSavedLiveDefaults:
              '"spread_band" must be [floor, ceiling]'),
             (_text(_with_toggles(add_to_held_pairs=1)), "add_to_held_pairs must be True or False"),
             (_text(_with_toggles(tags=_DROP)),
-             "(a file saved before add_to_held_pairs existed may leave it out)"),
+             "(add_to_held_pairs may be left out, and then reads as off)"),
         ]:
             path.write_bytes(data)
             with pytest.raises(config.LiveDefaultsError, match=re.escape(words)):
@@ -2590,7 +2602,7 @@ class TestLiveSettingsChanges:
             "off", "0-0.5", "0.8", "10%", "20%", "any", "any", "on"]
 
     def test_a_seven_toggle_file_shows_turning_add_on_on_as_a_change(self):
-        # Defaults saved before the toggle read it as off; the seed proposes on
+        # A file that leaves the toggle out reads it as off; the seed proposes on
         rows = config.live_settings_changes(_SEED_ADD_ON_OFF, config.LIVE_DEFAULTS_SEED)
         assert [row for row in rows if row[3]] == [("add to held pairs", "off", "on", True)]
 

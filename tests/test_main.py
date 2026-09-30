@@ -598,7 +598,8 @@ class TestLiveSettingsFlags:
         assert out.count("whatever the saved live defaults say") == 2
         assert "config.TIME_SERIES" not in out and "config.TRADE" not in out
         assert "config.BUDGET_FRACTION" not in out and "config.SAME_TITLE" not in out
-        assert ("Override one live default for THIS run only, in either mode. The live "
+        assert ("Override one live default for THIS run only, in either mode "
+                "(adding to held pairs: production runs only). The live "
                 "defaults are the ones saved through python3 -m "
                 "kalshi_betting.defaults_server (live_defaults.json); a run refuses to "
                 "start without them. The weekly scheduler passes none of these flags, so "
@@ -3150,7 +3151,13 @@ _HELD_RUNNER_UP_EVENTS = (
     _ev("Held Event", _mk_market(_TICKER_HELD_D, "HELDDEVT-1", "Held Question", "Outcome",
                                  "0.25", "0.70", price_level_structure="linear_cent")),
 )
-_HELD_RUNNER_UP_BOOKS = {
+# Books for the whole Held Question group. HELD-A's YES bids give its NO ask
+# of 0.45 and HELD-B's NO bids its YES ask of 0.20, so an ordinary pair on
+# either held market would trade if the run let one through; HELD-C's and
+# HELD-D's give the asks above
+_HELD_GROUP_BOOKS = {
+    _TICKER_HELD_A: {"orderbook_fp": {"yes_dollars": [["0.55", "100"]], "no_dollars": []}},
+    _TICKER_HELD_B: {"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.80", "100"]]}},
     _TICKER_HELD_C: {"orderbook_fp": {"yes_dollars": [["0.60", "100"]], "no_dollars": []}},
     _TICKER_HELD_D: {"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.75", "100"]]}},
 }
@@ -3217,9 +3224,15 @@ class TestRunProdAddsToHeldPairs:
         assert code == expected_code
         return captured.get("results", []), seen
 
+    # The one same-title pair of the live-shape client, which trades in every run
+    _SAME_TITLE = ("same_title", _TICKER_SAME_EXP, _TICKER_SAME_CHEAP)
+
     @staticmethod
     def _traded(results) -> set:
-        return {(r.spec.pair.pair_type, r.spec.pair.market_a.ticker) for r in results}
+        """Each trade as (pair type, market A, market B): both legs, so a held
+        market traded as either leg shows."""
+        return {(r.spec.pair.pair_type, r.spec.pair.market_a.ticker,
+                 r.spec.pair.market_b.ticker) for r in results}
 
     @staticmethod
     def _warned(caplog) -> list:
@@ -3236,8 +3249,8 @@ class TestRunProdAddsToHeldPairs:
             self, monkeypatch, caplog):
         results, seen = self._dry_run(self._client(monkeypatch), monkeypatch, caplog,
                                       add_on=True)
-        assert self._traded(results) == {("time_series", _TICKER_TS_EARLY),
-                                         ("same_title", _TICKER_SAME_EXP)}
+        assert self._traded(results) == {
+            ("time_series", _TICKER_TS_EARLY, _TICKER_TS_LATE), self._SAME_TITLE}
         [add_on] = [r for r in results if r.spec.pair.pair_type == "time_series"]
         held = scanner_mod.pair_held(add_on.spec.pair)
         assert held.sides == ((_TICKER_TS_EARLY, "yes"), (_TICKER_TS_LATE, "no"))
@@ -3272,7 +3285,7 @@ class TestRunProdAddsToHeldPairs:
     def test_with_it_off_a_held_pair_is_refused_as_before(self, monkeypatch, caplog):
         results, seen = self._dry_run(self._client(monkeypatch), monkeypatch, caplog,
                                       add_on=False)
-        assert self._traded(results) == {("same_title", _TICKER_SAME_EXP)}
+        assert self._traded(results) == {self._SAME_TITLE}
         # No held_pairs call, nothing handed on, no line of the add-on's own
         assert seen["held_pairs"] == []
         assert seen["ts"] == seen["st"] == [{}]
@@ -3302,7 +3315,7 @@ class TestRunProdAddsToHeldPairs:
                               append_to_prod_log=fake_append_to_prod_log)
         assert seen["code"] == EXIT_OK
         assert held_pairs_calls == []
-        assert self._traded(captured["results"]) == {("same_title", _TICKER_SAME_EXP)}
+        assert self._traded(captured["results"]) == {self._SAME_TITLE}
         assert "add to held pairs off (default: on)" in captured["run_note"]
 
     @pytest.mark.parametrize("held_rows, others", [
@@ -3318,34 +3331,39 @@ class TestRunProdAddsToHeldPairs:
                                                           held_rows, others):
         results, seen = self._dry_run(self._client(monkeypatch, held_rows=held_rows),
                                       monkeypatch, caplog, add_on=True)
-        assert self._traded(results) == {("same_title", _TICKER_SAME_EXP)}
+        assert self._traded(results) == {self._SAME_TITLE}
         assert seen["ts"] == seen["st"] == [{}]
         assert f"Held pairs to add to: 0 (other held markets, never added to: {others})" in (
             caplog.text)
         assert self._warned(caplog) == []
 
     def test_a_third_held_market_on_the_ladder_means_no_add_on(self, monkeypatch, caplog):
+        # A third held market on the pair's ladder: the pair is no longer alone
+        # there, so the held position is not one exact pair and is not added to
         client = self._client(
             monkeypatch, extra_events=(_ev("TS Event", _TS_MID_MARKET),),
             held_rows=(*_HELD_TS_PAIR, {"ticker": _TICKER_TS_MID, "position_fp": "2.00",
                                         "market_exposure_dollars": "0.90",
                                         "fees_paid_dollars": "0.05"}))
         results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True)
-        assert self._traded(results) == {("same_title", _TICKER_SAME_EXP)}
+        assert self._traded(results) == {self._SAME_TITLE}
         assert seen["ts"] == seen["st"] == [{}]
         assert "Held pairs to add to: 0 (other held markets, never added to: 4)" in caplog.text
 
     def test_a_failed_held_market_lookup_means_no_add_on(self, monkeypatch, caplog):
+        # A held market that cannot be looked up could share the pair's
+        # ladder, so the run adds to nothing (and makes no time-series pair)
         client = self._client(monkeypatch, extra_held=("TS-GONE",))
         client.get_market_without_preload_content = MagicMock(
             return_value=_raw_json_response({"error": "not found"}, status=404,
                                             reason="Not Found"))
         results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True,
                                       expected_code=EXIT_TIME_SERIES_SKIPPED)
-        assert self._traded(results) == {("same_title", _TICKER_SAME_EXP)}
+        assert self._traded(results) == {self._SAME_TITLE}
         assert seen["held_pairs"] == [] and seen["ts"] == [] and seen["st"] == [{}]
         assert self._warned(caplog) == [
-            "Not adding to held pairs this run: a held market could not be identified"]
+            "Not adding to held pairs this run: a market the account holds could not "
+            "be looked up"]
 
     def test_a_listing_that_stopped_early_means_no_add_on(self, monkeypatch, caplog):
         real = main.get_held_positions
@@ -3359,15 +3377,19 @@ class TestRunProdAddsToHeldPairs:
         monkeypatch.setattr(main, "get_held_positions", cut_short)
         results, seen = self._dry_run(self._client(monkeypatch), monkeypatch, caplog,
                                       add_on=True)
-        assert self._traded(results) == {("same_title", _TICKER_SAME_EXP)}
+        assert self._traded(results) == {self._SAME_TITLE}
         assert seen["held_pairs"] == [] and seen["ts"] == seen["st"] == [{}]
         assert self._warned(caplog) == [
-            "Not adding to held pairs this run: the positions listing stopped early"]
+            "Not adding to held pairs this run: the list of the account's positions was "
+            "cut short, so a held market may be missing from it"]
 
     def test_a_pair_at_its_cap_is_left_out_so_its_group_can_trade(self, monkeypatch, caplog):
         # A held same-title pair (NO on HELD-A, the pricier YES; YES on
         # HELD-B) that already stakes over 5% of the account value, at a 5%
-        # cap: its markets stay blocked, so the group's unheld pair trades
+        # cap: its markets stay blocked, so the group's unheld pair trades.
+        # Every market of the group has a book, so an ordinary pair on a held
+        # market (HELD-C against HELD-B is the group's widest) would trade if
+        # the run let one through
         held_rows = (
             {"ticker": _TICKER_HELD_A, "position_fp": "-3000.00",
              "market_exposure_dollars": "1350.00", "fees_paid_dollars": "15.00"},
@@ -3376,7 +3398,7 @@ class TestRunProdAddsToHeldPairs:
         )
         client = self._client(monkeypatch, include_held_position=False, held_rows=held_rows,
                               extra_events=_HELD_RUNNER_UP_EVENTS)
-        books = {**_ORDERBOOK_PAYLOADS, **_HELD_RUNNER_UP_BOOKS}
+        books = {**_ORDERBOOK_PAYLOADS, **_HELD_GROUP_BOOKS}
         client.get_market_orderbook_without_preload_content = MagicMock(
             side_effect=lambda ticker: _raw_json_response(books.get(
                 ticker, {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}})))
@@ -3387,13 +3409,52 @@ class TestRunProdAddsToHeldPairs:
         assert "Held pairs already at their size cap, not added to this run: 1" in caplog.text
         assert seen["ts"] == seen["st"] == [{}]
         traded = self._traded(results)
-        assert ("same_title", _TICKER_HELD_C) in traded
-        assert not any(ticker in (_TICKER_HELD_A, _TICKER_HELD_B) for _, ticker in traded)
+        assert ("same_title", _TICKER_HELD_C, _TICKER_HELD_D) in traded
+        # Neither held market is traded as either leg of any pair
+        legs = {ticker for _, a, b in traded for ticker in (a, b)}
+        assert not legs & {_TICKER_HELD_A, _TICKER_HELD_B}, traded
         assert "adds to" not in caplog.text
         # Control: with room left at the cap, the same pair is handed on
         results, seen = self._dry_run(client, monkeypatch, caplog, add_on=True)
         assert [set(pairs) for pairs in seen["st"]][-1] == {
             frozenset((_TICKER_HELD_A, _TICKER_HELD_B))}
+
+    def test_a_dev_run_reads_no_positions_even_with_it_on(self, monkeypatch, caplog):
+        # A dev run trades the sandbox account, which holds nothing of
+        # production's: with the setting on it still reads no positions, looks
+        # up no held market and hands neither finder a held pair
+        calls: list = []
+        for name in ("get_held_positions", "resolve_held_ladders", "held_pairs"):
+            monkeypatch.setattr(main, name,
+                                lambda *a, _name=name, **k: calls.append(_name))
+        seen: dict = {"ts": [], "st": []}
+        real_ts, real_st = main.find_time_series_pairs, main.find_same_title_pairs
+
+        def ts_spy(*args, add_on_pairs=None, **kwargs):
+            seen["ts"].append(add_on_pairs)
+            return real_ts(*args, add_on_pairs=add_on_pairs, **kwargs)
+
+        def st_spy(*args, add_on_pairs=None, **kwargs):
+            seen["st"].append(add_on_pairs)
+            return real_st(*args, add_on_pairs=add_on_pairs, **kwargs)
+
+        monkeypatch.setattr(main, "find_time_series_pairs", ts_spy)
+        monkeypatch.setattr(main, "find_same_title_pairs", st_spy)
+        captured = _capture_dev_simulation(monkeypatch)
+        reference = live_settings()
+        settings = dataclasses.replace(reference, add_to_held_pairs=True)
+        with caplog.at_level(logging.INFO):
+            code = main._run_dev(self._client(monkeypatch),
+                                 SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None),
+                                 settings, reference)
+        assert code == EXIT_OK
+        assert calls == []
+        assert len(seen["ts"]) == len(seen["st"]) == 1
+        assert not seen["ts"][0] and not seen["st"][0]
+        # The run still trades as a dev run does, and says nothing of held pairs
+        assert captured["results"]
+        for text in ("Not adding to held pairs", "Held pair", "adds to"):
+            assert text not in caplog.text, text
 
 
 def _args(dry_run: bool = False, max_horizon_days=None) -> SimpleNamespace:
