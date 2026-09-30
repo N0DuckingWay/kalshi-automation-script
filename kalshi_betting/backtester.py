@@ -215,6 +215,16 @@ Notes:
     points only and the tier-off one from tier-off points only. Live sizing
     never reads any of it.
 
+    With add_on_sweep, run_backtest_sweep also returns the dashboard's "Add to
+    held pairs" family: two more lazy CapSweeps (BacktestSweep.add_on_cap_sweep
+    over the tier-on entries and add_on_tier_off_cap_sweep over the
+    tier-floors-off family's binding bands) whose every simulation adds to
+    held pairs, for the "all" population only and at every cap of the grid.
+    No run of this module adds to held pairs, so they have no eager point to
+    start from: every cell is simulated when a report reads it, ending its
+    curves on the day its eager twin's curve ended. The run itself simulates
+    nothing extra, and every figure it reports is unchanged by the flag.
+
     An ENTRY CHECKPOINT is a moment at which the backtest may open a
     simulated trade: the live bot's weekly run time (config.SCHEDULED_RUN,
     Monday 09:00 America/Los_Angeles) on each run weekday. The backtest keeps
@@ -1868,6 +1878,19 @@ class BacktestSweep:
             cap_sweep it simulates nothing during the run. Its primary-cap
             points ARE the tier_off_scenarios objects. Appended with a
             default, so no construction moves.
+        add_on_cap_sweep (CapSweep | None): The "Add to held pairs" family
+            the dashboard's filter bar shows: every band x k x cap of the
+            run's grid simulated with add_to_held, the "all" population
+            only (no split-half or top-event checks), lazily, by whoever
+            reads it. It has no eager point — nothing the run simulates adds
+            to held pairs — so every cell is simulated when read, ending its
+            curves on the day its eager twin's ended. None unless
+            run_backtest_sweep(add_on_sweep=True) ran on a feasible window.
+            Appended with a default, so no construction moves.
+        add_on_tier_off_cap_sweep (CapSweep | None): The same over the
+            tier-floors-off family's binding bands (tier_floors False). None
+            unless add_on_sweep ran on a feasible window with at least one
+            binding band.
         same_title_size_cap (float | None): The extra cap every same-title
             candidate was sized under (this module's SAME_TITLE_SIZE_CAP).
             None only on a hand-built sweep.
@@ -1896,6 +1919,9 @@ class BacktestSweep:
         live_same_title_size_cap (float | None): The saved live defaults'
             same-title cap, from the same read; reporting only (this run sized
             under same_title_size_cap).
+        live_add_to_held_pairs (bool | None): Whether the saved live defaults
+            add to held pairs, from the same read; reporting only (this run's
+            own points never do).
         entry_checkpoint (str | None): SCHEDULED_RUN.label() of the schedule
             the entry checkpoints were placed by (e.g. "Monday 09:00
             America/Los_Angeles"), for the dashboard header. None = not
@@ -1928,6 +1954,14 @@ class BacktestSweep:
     live_interval_discount: float | None = None
     live_size_cap: float | None = None
     live_same_title_size_cap: float | None = None
+    # The "Add to held pairs" family the dashboard's filter bar shows: every
+    # band x k x cap of the run's grid simulated with add_to_held, the "all"
+    # population only, lazily (None unless run_backtest_sweep(add_on_sweep=True));
+    # and the same over the tier-floors-off family's binding bands
+    add_on_cap_sweep: CapSweep | None = None
+    add_on_tier_off_cap_sweep: CapSweep | None = None
+    # The saved live defaults' add_to_held_pairs, recorded with the other live_* fields
+    live_add_to_held_pairs: bool | None = None
 
 
 def max_trades_simulated(sweep: BacktestSweep) -> int:
@@ -5432,14 +5466,14 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
     Name the BacktestSweep keywords that record the saved live defaults.
 
     Both production BacktestSweep constructions spread this (beside
-    same_title_size_cap), so the eight fields are recorded together from one
+    same_title_size_cap), so the nine fields are recorded together from one
     read or not at all.
 
     Args:
         live (LiveSettings | None): _live_settings_for_report()'s result.
 
     Returns:
-        dict: The eight live_* keywords from live; {} when live is None.
+        dict: The nine live_* keywords from live; {} when live is None.
     """
     if live is None:
         return {}
@@ -5447,7 +5481,8 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
             "live_categories": live.categories, "live_tags": live.tags,
             "live_origin": live.origin, "live_interval_discount": live.interval_discount,
             "live_size_cap": live.size_cap,
-            "live_same_title_size_cap": live.same_title_size_cap}
+            "live_same_title_size_cap": live.same_title_size_cap,
+            "live_add_to_held_pairs": live.add_to_held_pairs}
 
 
 # The label a recorded live rule is named with, in the log line and page header
@@ -5503,6 +5538,28 @@ def _live_sizing_note(sweep: BacktestSweep) -> str:
 
     return (f"; the live defaults size at {sizing(*live)}, where this run's primary sized "
             f"at {sizing(*run)}")
+
+
+def _live_add_on_note(sweep: BacktestSweep) -> str:
+    """
+    Say when the saved live defaults add to held pairs, which a run's primary never does.
+
+    No point a backtest run keeps adds to a pair it still holds, so a report
+    that names the live rule must say so when the saved defaults do. The log
+    line ends with this clause; it says nothing about where a report shows
+    adding to held pairs.
+
+    Args:
+        sweep (BacktestSweep): The run's sweep.
+
+    Returns:
+        str: "; the live defaults add to held pairs, which this run's primary
+            does not" when live_add_to_held_pairs is True, else "" (off, or
+            not recorded).
+    """
+    if sweep.live_add_to_held_pairs is not True:
+        return ""
+    return "; the live defaults add to held pairs, which this run's primary does not"
 
 
 def _live_filter_text(categories: tuple[str, ...] | None,
@@ -5626,7 +5683,7 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
     Always a line, so a report never silently omits the live rule: with none
     recorded it says so (_LIVE_RULE_NONE). A recorded rule's line ends with
     _live_sizing_note when the saved defaults size differently from this
-    run's primary.
+    run's primary, then _live_add_on_note when they add to held pairs.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
@@ -5644,7 +5701,8 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
     if filtered:
         rule += f"; category/tag filter ({_live_filter_text(categories, tags)})"
     if view.where == _LIVE_RULE_NOT_SIMULATED:
-        return f"{prefix}{rule} — not simulated by this run{_live_sizing_note(sweep)}"
+        return (f"{prefix}{rule} — not simulated by this run{_live_sizing_note(sweep)}"
+                f"{_live_add_on_note(sweep)}")
     # Tier floors off at a band no tier binds at: the tier-on cell holds it
     never_binds = ("" if sweep.live_tier_floors or not view.tier_floors else
                    " (no tier floor binds at this band, so off and on are one rule)")
@@ -5669,7 +5727,8 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
                  "; the dashboard's filter bar shows the live category/tag filter one "
                  f"Category or Tag option of {subject} at a time (each offered where this "
                  "run filed a pair under it), never as their union")
-    return f"{prefix}{rule} — {tail}{_live_rule_ladder_note(sweep)}{_live_sizing_note(sweep)}"
+    return (f"{prefix}{rule} — {tail}{_live_rule_ladder_note(sweep)}"
+            f"{_live_sizing_note(sweep)}{_live_add_on_note(sweep)}")
 
 
 def _tier_floors_bind(band: tuple[float, float]) -> bool:
@@ -7183,7 +7242,9 @@ def run_backtest(
          balance, admit it only while its fee-inclusive cost still fits the
          running cash (mirroring main._run_prod + strategy.select_portfolio)
          and, for a time-series pair, while no open trade holds a market on
-         its ladders; trade each pair at most once, a time-series pair on the
+         its ladders; trade each pair at most once (only the add-on family
+         of run_backtest_sweep, _simulate_at_discount(add_to_held=True),
+         adds to a pair it still holds), a time-series pair on the
          first of its passing Mondays it can take; and record actual P&L
          from settlement outcomes.                                  [simulate]
       8. Build an equity curve from the trade timeline.             [simulate]
@@ -7697,6 +7758,7 @@ def _sweep_from_candidates(
     band_sweep: bool,
     tier_off_sweep: bool = False,
     cap_sweep: bool = False,
+    add_on_sweep: bool = False,
     live: LiveSettings | None | object = _LIVE_NOT_READ,
 ) -> BacktestSweep:
     """
@@ -7800,6 +7862,19 @@ def _sweep_from_candidates(
     scenario is a real simulation, and neither sweep ever holds the other's
     seeds. It too simulates nothing here.
 
+    With add_on_sweep, two more CapSweeps are returned (add_on_cap_sweep over
+    the tier-on entries, and add_on_tier_off_cap_sweep over the tier-floors-off
+    family's binding bands when there are any): every simulation they run adds
+    to held pairs, and only the "all" population is read (checks off). No
+    eager run adds to held pairs, so they hold no eager point; each cell ends
+    its curves on the day its eager twin's ended, which is recorded here as
+    each eager "all" point is simulated (the tier-on loop's and the tier-off
+    loop's, in separate maps). They simulate nothing here either: the run's
+    simulations, log lines and every figure are those of a run without the
+    flag, and max_trades_simulated does not count their cells. They keep
+    entries_by_band and tier_off_entries alive for the reader, as the size-cap
+    sweeps do.
+
     Args:
         candidates (_Candidates): _prepare_candidates() output. CONSUMED: its
             candles_by_ticker and all_pairs attributes are deleted after
@@ -7838,6 +7913,11 @@ def _sweep_from_candidates(
             BacktestSweep.tier_off_cap_sweep, seeded from the family's own
             points only and keeping its entries alive. False (default)
             returns cap_sweep=None and tier_off_cap_sweep=None.
+        add_on_sweep (bool): When True, also return the add-on family
+            described above on BacktestSweep.add_on_cap_sweep and
+            add_on_tier_off_cap_sweep (the caps of the size-cap grid with
+            cap_sweep, the run's own cap alone without). False (default)
+            returns both as None.
         live (LiveSettings | None): Keyword-only. run_backtest_sweep's read of
             the saved live defaults (None: none saved, or the file refused);
             left out, read here.
@@ -7850,8 +7930,9 @@ def _sweep_from_candidates(
             (carried from candidates), config_same_event_ladders (the
             configured switch, read beside same_event_ladders's
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
-            cap_sweep, tier_off_cap_sweep, same_title_size_cap, the eight
-            live_* fields and entry_checkpoint — see BacktestSweep.
+            cap_sweep, tier_off_cap_sweep, add_on_cap_sweep,
+            add_on_tier_off_cap_sweep, same_title_size_cap, the nine live_*
+            fields and entry_checkpoint — see BacktestSweep.
 
     Raises:
         ValueError: If tier_off_sweep is set without band_sweep (the tier-off
@@ -8100,6 +8181,12 @@ def _sweep_from_candidates(
     # the seed a size-cap sweep reuses (CapSweep). Filled only with cap_sweep;
     # it holds references to points already kept above, never a copy.
     eager: dict[tuple, SweepPoint] = {}
+    # (band, k, "all") -> the last day the eager "all" point's curve ends on.
+    # The add-on sweeps end every cell's curves there too, so a cell and its
+    # eager twin cover one span. Filled only with add_on_sweep (the tier-off
+    # loop fills its own map, since the two share keys).
+    add_on_end_dates: dict[tuple, date | None] = {}
+    add_on_off_end_dates: dict[tuple, date | None] = {}
     for bi, band in enumerate(bands, start=1):
         entries = entries_by_band[band]
         # The primary's is the object already measured and logged above.
@@ -8142,6 +8229,10 @@ def _sweep_from_candidates(
                 # Recorded BEFORE the band-sweep-only work below, so a
                 # single-band run (band_sweep False) still seeds its cells
                 eager[(band, point_k, "all")] = point
+            if add_on_sweep:
+                # Keyed by the exact band and k objects the add-on cells are
+                # read with (the tuples this loop and CapSweep.bands/.ks hold)
+                add_on_end_dates[(band, point_k, "all")] = _curve_end_date(point)
             if not band_sweep:
                 continue
 
@@ -8193,6 +8284,8 @@ def _sweep_from_candidates(
         for point_k in grid:
             point = _simulate_at_discount(entries, start_date, initial_balance, k=point_k,
                                           spread_band=band, population="all", tier_floors=False)
+            if add_on_sweep:
+                add_on_off_end_dates[(band, point_k, "all")] = _curve_end_date(point)
             # Never recorded in eager: the tier-on CapSweep below re-simulates
             # the TIER-ON entries_by_band, so a tier-off seed would stand in
             # for a simulation of different entries. Recorded in off_eager
@@ -8207,15 +8300,18 @@ def _sweep_from_candidates(
                 for off_point in cell:
                     off_eager[(band, point_k, off_point.population)] = off_point
 
+    # The size caps the grid offers: the run's own cap (every point above
+    # carries it, resolved at simulation time) unioned into SIZE_CAP_SWEEP, as
+    # the k grid unions its primary, so the eager points are always exact
+    # members. Read by the size-cap sweeps and by the add-on sweeps, so a run
+    # with neither never reads a point's stamped cap here.
+    caps = (tuple(sorted(set(SIZE_CAP_SWEEP) | {primary.size_cap}))
+            if cap_sweep or add_on_sweep else ())
     capped = None
     if cap_sweep:
-        # Every other cap, simulated only when a reader asks for a cell. The
-        # run's own cap (every point above carries it, resolved at simulation
-        # time) is unioned in, as the k grid unions its primary, so the eager
-        # points are always exact members. Built after the tier-off family
-        # and over the tier-on entries and seeds alone (the family gets its
-        # own, below).
-        caps = tuple(sorted(set(SIZE_CAP_SWEEP) | {primary.size_cap}))
+        # Every other cap, simulated only when a reader asks for a cell. Built
+        # after the tier-off family and over the tier-on entries and seeds
+        # alone (the family gets its own, below).
         capped = CapSweep(caps=caps, primary_cap=primary.size_cap, bands=tuple(bands),
                           ks=tuple(grid), primary_k=effective_k, start_date=start_date,
                           initial_balance=initial_balance, split_date=split_date,
@@ -8246,6 +8342,35 @@ def _sweep_from_candidates(
                      "simulated on demand, one (band, k) cell at a time, when a report "
                      "reads them", len(caps), len(tier_off_bands), len(grid))
 
+    add_on_capped = add_on_off_capped = None
+    if add_on_sweep:
+        # The same grid with every simulation adding to held pairs: the size
+        # cap sweep's caps when it ran, else the run's own cap. Only the "all"
+        # population is read (checks off, no same-title population of its
+        # own, since "all" already holds the same-title entries), and no eager
+        # point exists to start from, so eager is empty and each cell takes
+        # its curves' last day from the end-date map built above.
+        add_on_caps = caps if cap_sweep else (primary.size_cap,)
+        add_on_capped = CapSweep(
+            caps=add_on_caps, primary_cap=primary.size_cap, bands=tuple(bands),
+            ks=tuple(grid), primary_k=effective_k, start_date=start_date,
+            initial_balance=initial_balance, split_date=None, checks=False,
+            entries_by_band=entries_by_band, st_entries=[], eager={},
+            add_to_held=True, end_dates=add_on_end_dates)
+        logging.info("Adding to held pairs: size-cap sweep: %d cap(s) x %d band(s) x %d k, "
+                     "the \"all\" population only, simulated on demand when a report "
+                     "reads it", len(add_on_caps), len(bands), len(grid))
+        if tier_off_bands:
+            add_on_off_capped = CapSweep(
+                caps=add_on_caps, primary_cap=primary.size_cap,
+                bands=tuple(tier_off_bands), ks=tuple(grid), primary_k=effective_k,
+                start_date=start_date, initial_balance=initial_balance, split_date=None,
+                checks=False, entries_by_band=tier_off_entries, st_entries=[], eager={},
+                tier_floors=False, add_to_held=True, end_dates=add_on_off_end_dates)
+            logging.info("Adding to held pairs, tier floors off: size-cap sweep: %d cap(s) "
+                         "x %d binding band(s) x %d k, simulated on demand",
+                         len(add_on_caps), len(tier_off_bands), len(grid))
+
     return BacktestSweep(
         primary=primary, points=points, calibration=calibration,
         label_coverage=candidates.label_coverage,
@@ -8262,6 +8387,8 @@ def _sweep_from_candidates(
         tier_off_calibrations_by_band=tier_off_calibrations,
         cap_sweep=capped,
         tier_off_cap_sweep=off_capped,
+        add_on_cap_sweep=add_on_capped,
+        add_on_tier_off_cap_sweep=add_on_off_capped,
         # Resolved as every simulation, lazy cap cells included, resolves it
         same_title_size_cap=_resolve_same_title_size_cap(),
         # The saved live defaults' rule, filter, k and caps, from the one read above
@@ -8285,6 +8412,7 @@ def run_backtest_sweep(
     band_sweep: bool = False,
     tier_off_sweep: bool = False,
     cap_sweep: bool = False,
+    add_on_sweep: bool = False,
 ) -> BacktestSweep:
     """
     Replay both pair strategies at one interval discount, or at a grid of them —
@@ -8344,9 +8472,18 @@ def run_backtest_sweep(
     here reaches live.
 
     It reports the saved live defaults' time-series rule, category/tag filter,
-    k and caps: one fail-soft read before the fetch, recorded on the eight
+    k and caps: one fail-soft read before the fetch, recorded on the nine
     live_* fields and, worded by _live_rule_line, logged last ("none
     recorded" when no usable defaults are saved).
+
+    With add_on_sweep, the result also carries the dashboard's "Add to held
+    pairs" family (BacktestSweep.add_on_cap_sweep, and
+    add_on_tier_off_cap_sweep over the tier-floors-off family): lazy CapSweeps
+    over the run's grid whose every simulation adds to held pairs, for the
+    "all" population only. Nothing is simulated during the run, so every
+    point, figure and completion line is what the run reports without the
+    flag; the run logs one setting line for it and, from
+    _sweep_from_candidates, one summary line per sweep.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -8412,6 +8549,16 @@ def run_backtest_sweep(
             (default) returns cap_sweep=None and tier_off_cap_sweep=None, as
             does the infeasible window. Backtest-only: live sizing never reads
             either.
+        add_on_sweep (bool): When True, also return
+            BacktestSweep.add_on_cap_sweep — the "Add to held pairs" family:
+            a lazy CapSweep over the run's grid (every cap of SIZE_CAP_SWEEP
+            with cap_sweep, the run's own cap alone without) whose every
+            simulation adds to held pairs, for the "all" population only —
+            and, with tier_off_sweep too, add_on_tier_off_cap_sweep over the
+            tier-floors-off family's binding bands. The flag adds no
+            simulation to the run itself. False (default) returns both as
+            None, as does the infeasible window. Backtest-only: live sizing
+            never reads either.
 
     Returns:
         BacktestSweep: primary (the effective-discount, primary-band result),
@@ -8424,9 +8571,10 @@ def run_backtest_sweep(
             resolved same_event_ladders, the configured switch it is judged
             against (config_same_event_ladders), the corpus's provenance,
             None when not recorded, the tier-off family, empty unless
-            tier_off_sweep, the lazy cap_sweep and tier_off_cap_sweep,
-            same_title_size_cap, the live_* fields and entry_checkpoint — see
-            BacktestSweep.
+            tier_off_sweep, the lazy cap_sweep and tier_off_cap_sweep, the
+            lazy add-on family (add_on_cap_sweep and
+            add_on_tier_off_cap_sweep), same_title_size_cap, the live_*
+            fields and entry_checkpoint — see BacktestSweep.
 
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
@@ -8453,7 +8601,7 @@ def run_backtest_sweep(
         (config_same_event_ladders), same_title_size_cap, the entry checkpoint
         and, when usable live defaults are saved, the live_* fields recorded,
         and the live-rule line logged either way, so callers need no special
-        case.
+        case. No add-on family is built there (both sweeps are None).
 
         Before the fetch, one INFO line names the entry checkpoint and its UTC
         times over [start_date, today]; it never raises. _prepare_candidates
@@ -8537,6 +8685,13 @@ def run_backtest_sweep(
         "run time): %s",
         SCHEDULED_RUN.label(), where,
     )
+    # And for the add-on family: it is simulated when a report reads it, never
+    # during the run, so the line says whether it rides the result
+    logging.info(
+        "Adding to held pairs (backtest): simulated on demand for the dashboard's "
+        "Add to held pairs select; add-on sweep %s",
+        "on" if add_on_sweep else "off",
+    )
     # The saved live defaults (never main.py's per-run overrides), read ONCE
     # before the fetch, so a refused file warns at the top of the run
     live = _live_settings_for_report()
@@ -8581,7 +8736,8 @@ def run_backtest_sweep(
             candidates, initial_balance,
             interval_discount=interval_discount, sweep=sweep,
             spread_band=primary_band, band_sweep=band_sweep,
-            tier_off_sweep=tier_off_sweep, cap_sweep=cap_sweep, live=live,
+            tier_off_sweep=tier_off_sweep, cap_sweep=cap_sweep,
+            add_on_sweep=add_on_sweep, live=live,
         )
     # On every path, "none recorded" included, so the report never omits it
     logging.info("%s", _live_rule_line(result))

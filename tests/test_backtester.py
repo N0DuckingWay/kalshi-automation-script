@@ -13627,6 +13627,345 @@ class TestCapSweepLogging:
         assert not [r for r in caplog.records if r.levelno >= logging.INFO]
 
 
+@pytest.fixture(scope="class")
+def add_on_run():
+    """The golden band sweep with the add-on family beside the size-cap sweeps,
+    over cap_sweep_run's NARROWED grid — floors (0, 0.35) x ceilings (0.5, 1.0)
+    x k (0.5, 1.0) plus the primary 0.75, so the two floor-0 bands bind at the
+    tiers: 4 bands x 3 k for the tier-on add-on sweep and 2 x 3 for the
+    tier-floors-off one. Beside it: the same run with the flag off and with
+    it left out, a run without the size-cap sweep, one without the tier-floors-off
+    family and one without the band sweep. Every simulation DURING the runs
+    goes through a spy that records its keywords, and every run's INFO log is
+    kept; the spy is undone before any cell is read, so the cells run the real
+    function. Pins apply_pre_toggle_defaults on its own MonkeyPatch, as
+    cap_sweep_run does."""
+    toggles = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
+        apply_pre_toggle_defaults(toggles)
+        golden = TestPrepareEntriesGolden()
+        golden._patch(mp)
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
+        sims: list = []
+        real = backtester._simulate_at_discount
+
+        def simulate_spy(raw_entries, start_date, initial_balance, k=None,
+                         spread_band=None, population="all", **kw):
+            sims.append((spread_band, k, population, len(raw_entries), tuple(sorted(kw))))
+            return real(raw_entries, start_date, initial_balance, k=k,
+                        spread_band=spread_band, population=population, **kw)
+
+        mp.setattr(backtester, "_simulate_at_discount", simulate_spy)
+
+        def run(**kw):
+            sims.clear()
+            handler = _LogCapture()
+            root = logging.getLogger()
+            old_level = root.level
+            root.setLevel(logging.INFO)
+            root.addHandler(handler)
+            try:
+                res = run_backtest_sweep(
+                    hist_client=MagicMock(), live_client=MagicMock(),
+                    start_date=golden._START, initial_balance=10_000.0,
+                    same_event_ladders=True, **kw)
+            finally:
+                root.removeHandler(handler)
+                root.setLevel(old_level)
+            return res, list(sims), list(handler.messages)
+
+        every = {"band_sweep": True, "tier_off_sweep": True, "cap_sweep": True}
+        on, sims_on, msgs_on = run(add_on_sweep=True, **every)
+        off, sims_off, msgs_off = run(add_on_sweep=False, **every)
+        default, sims_default, _ = run(**every)
+        no_cap, _, msgs_no_cap = run(band_sweep=True, tier_off_sweep=True, add_on_sweep=True)
+        no_off, _, msgs_no_off = run(band_sweep=True, cap_sweep=True, add_on_sweep=True)
+        single, _, msgs_single = run(band_sweep=False, add_on_sweep=True)
+        mp.undo()
+        # How many cells the two sweeps had simulated once the run was over,
+        # before any test reads one (a read simulates each cap, with no memo)
+        built = (on.add_on_cap_sweep.simulated, on.add_on_tier_off_cap_sweep.simulated)
+        yield SimpleNamespace(
+            on=on, off=off, default=default, no_cap=no_cap, no_off=no_off, single=single,
+            built=built, sims_on=sims_on, sims_off=sims_off, sims_default=sims_default,
+            msgs_on=msgs_on, msgs_off=msgs_off, msgs_no_cap=msgs_no_cap,
+            msgs_no_off=msgs_no_off, msgs_single=msgs_single, start=golden._START)
+    finally:
+        mp.undo()
+        toggles.undo()
+
+
+@pytest.mark.usefixtures("add_on_run")
+class TestAddOnSweep:
+    """run_backtest_sweep(add_on_sweep=True): the dashboard's "Add to held
+    pairs" family — two lazy CapSweeps (tier floors on, and off at the bands
+    they bind at) whose every simulation adds to held pairs, the "all"
+    population only. The run itself simulates nothing extra: its points, its
+    simulations and its INFO log are those of a run without the flag, but for
+    the setting line and the two summary lines. Each cell ends its curves on
+    the day its eager twin's ended."""
+
+    _ADDING = "Adding to held pairs"
+
+    @staticmethod
+    def _eager(points) -> dict:
+        """(band, k, population) -> point of a run's eager scenarios."""
+        return {(p.spread_band, p.k, p.population): p for p in points}
+
+    @staticmethod
+    def _trades(point) -> list:
+        return [astuple(t) for t in point.trades]
+
+    @classmethod
+    def _others(cls, messages) -> list:
+        """A run's INFO lines but for the add-on ones and the two that report
+        the process's peak memory, which differ from one run to the next."""
+        return [m for m in messages
+                if not m.startswith((cls._ADDING, "Peak RSS"))]
+
+    def test_off_is_the_default_and_builds_nothing(self, add_on_run):
+        assert inspect.signature(run_backtest_sweep).parameters[
+            "add_on_sweep"].default is False
+        for res in (add_on_run.off, add_on_run.default):
+            assert res.add_on_cap_sweep is None
+            assert res.add_on_tier_off_cap_sweep is None
+
+    def test_on_adds_no_simulation_and_no_run_figure(self, add_on_run):
+        # The same simulations, in the same order and with the same keywords
+        assert add_on_run.sims_on == add_on_run.sims_off == add_on_run.sims_default
+        on, off = add_on_run.on, add_on_run.off
+        assert self._trades(on.primary) == self._trades(off.primary)
+        pd.testing.assert_frame_equal(on.primary.equity_df, off.primary.equity_df)
+        for mine, theirs in ((on.points, off.points), (on.scenarios, off.scenarios),
+                             (on.tier_off_scenarios, off.tier_off_scenarios)):
+            assert len(mine) == len(theirs) > 0
+            for a, b in zip(mine, theirs, strict=True):
+                assert (a.k, a.spread_band, a.population) == (b.k, b.spread_band, b.population)
+                assert self._trades(a) == self._trades(b)
+                assert a.add_to_held is False
+        # The trade count the stale-verdict check reads counts eager points only
+        assert backtester.max_trades_simulated(on) == backtester.max_trades_simulated(off)
+        # Nothing was simulated by building the two sweeps
+        assert add_on_run.built == (0, 0)
+
+    def test_on_adds_no_info_line_but_its_own(self, add_on_run):
+        # Every line but the setting line and the two summary lines is the
+        # flag-off run's, in the same order — no completion line among them
+        adding = [m for m in add_on_run.msgs_on if m.startswith(self._ADDING)]
+        assert len(adding) == 3
+        assert self._others(add_on_run.msgs_on) == self._others(add_on_run.msgs_off)
+        assert len(self._others(add_on_run.msgs_on)) > 20
+        assert [m for m in add_on_run.msgs_off if m.startswith(self._ADDING)] == [
+            f"{self._ADDING} (backtest): simulated on demand for the dashboard's Add to "
+            "held pairs select; add-on sweep off"]
+
+    def test_the_sweeps_axes_are_the_grids(self, add_on_run):
+        on = add_on_run.on
+        cs, off_cs = on.add_on_cap_sweep, on.add_on_tier_off_cap_sweep
+        # The tier-on family: the size-cap sweep's caps, bands and k grid
+        assert cs.caps == on.cap_sweep.caps and len(cs.caps) == 20
+        assert cs.bands == on.cap_sweep.bands
+        assert len(cs.bands) == 4 and cs.ks == on.cap_sweep.ks == (0.5, 0.75, 1.0)
+        assert cs.primary_cap == on.primary.size_cap and cs.primary_k == on.primary.k
+        assert (cs.tier_floors, cs.add_to_held, cs.checks) == (True, True, False)
+        assert cs.split_date is None and cs.st_entries == []
+        assert cs.eager == {} and cs.same_title_eager is None
+        # ... over the very entries the size-cap sweep keeps (one retention)
+        assert cs.entries_by_band is on.cap_sweep.entries_by_band
+        # The tier-floors-off family: the binding bands, likewise
+        binding = tuple(b for b in cs.bands if backtester._tier_floors_bind(b))
+        assert len(binding) == 2
+        assert off_cs.bands == on.tier_off_cap_sweep.bands == binding
+        assert off_cs.caps == cs.caps and off_cs.ks == cs.ks
+        assert (off_cs.tier_floors, off_cs.add_to_held, off_cs.checks) == (False, True, False)
+        assert off_cs.eager == {} and off_cs.same_title_eager is None
+        assert off_cs.entries_by_band is on.tier_off_cap_sweep.entries_by_band
+
+    def test_without_the_size_cap_sweep_the_run_s_own_cap_is_the_axis(self, add_on_run):
+        res = add_on_run.no_cap
+        assert res.cap_sweep is None
+        assert res.add_on_cap_sweep.caps == (res.primary.size_cap,)
+        assert res.add_on_tier_off_cap_sweep.caps == (res.primary.size_cap,)
+        assert res.add_on_cap_sweep.bands == tuple(sorted(
+            {(0.0, 0.5), (0.0, 1.0), (0.35, 0.5), (0.35, 1.0)}))
+
+    def test_without_the_tier_floors_off_family_there_is_only_the_tier_on_sweep(
+        self, add_on_run,
+    ):
+        assert add_on_run.no_off.add_on_cap_sweep is not None
+        assert add_on_run.no_off.add_on_tier_off_cap_sweep is None
+        assert not [m for m in add_on_run.msgs_no_off if m.startswith(
+            f"{self._ADDING}, tier floors off")]
+
+    def test_a_single_band_run_has_one_band_and_no_tier_off_sweep(self, add_on_run):
+        res = add_on_run.single
+        cs = res.add_on_cap_sweep
+        assert cs.bands == (BACKTEST_DEFAULT_SPREAD_BAND,) and cs.checks is False
+        assert res.add_on_tier_off_cap_sweep is None
+        assert cs.ks == tuple(p.k for p in res.points)
+
+    def test_each_cell_has_the_day_its_eager_twin_ended_on(self, add_on_run):
+        on = add_on_run.on
+        for cs, scenarios in ((on.add_on_cap_sweep, on.scenarios),
+                              (on.add_on_tier_off_cap_sweep, on.tier_off_scenarios)):
+            eager = self._eager(scenarios)
+            # One day per (band, k) cell, keyed by the exact objects it is read with
+            assert set(cs.end_dates) == {(b, k, "all") for b in cs.bands for k in cs.ks}
+            for (band, k, pop), day in cs.end_dates.items():
+                assert day == backtester._curve_end_date(eager[(band, k, pop)])
+                assert type(day) is date
+
+    def test_every_cell_is_an_all_point_stamped_add_to_held(self, add_on_run):
+        on = add_on_run.on
+        for cs, scenarios, tier_floors in ((on.add_on_cap_sweep, on.scenarios, True),
+                                           (on.add_on_tier_off_cap_sweep,
+                                            on.tier_off_scenarios, False)):
+            eager = self._eager(scenarios)
+            add_ons = 0
+            for band in cs.bands:
+                for k in cs.ks:
+                    cell = cs.cell(band, k)
+                    day = backtester._curve_end_date(eager[(band, k, "all")])
+                    assert tuple(cell) == cs.caps
+                    for cap, by_pop in cell.items():
+                        assert set(by_pop) == {"all"}
+                        point = by_pop["all"]
+                        assert (point.k, point.spread_band, point.size_cap) == (k, band, cap)
+                        assert point.population == "all"
+                        assert point.add_to_held is True
+                        assert point.tier_floors is tier_floors
+                        # No checks: the bar reads the "all" point alone
+                        assert point.halves is None and point.ex_top_event is None
+                        # The eager twin's last day, and so its row count
+                        assert point.equity_df["date"].iloc[-1] == day
+                        assert len(point.equity_df) == len(
+                            eager[(band, k, "all")].equity_df)
+                        add_ons += sum(t.add_on for t in point.trades)
+            # Not vacuous: the golden pairs add on in this family
+            assert add_ons > 0 and cs.simulated > 0
+
+    def test_a_cell_is_a_fresh_add_on_simulation(self, add_on_run):
+        # One cell, every cap, against the simulator called as the sweep does
+        cs = add_on_run.on.add_on_cap_sweep
+        band, k = (0.0, 1.0), 0.5
+        cell = cs.cell(band, k)
+        day = cs.end_dates[(band, k, "all")]
+        for cap in cs.caps:
+            fresh = backtester._simulate_at_discount(
+                cs.entries_by_band[band], cs.start_date, cs.initial_balance, k=k,
+                spread_band=band, population="all", size_cap=cap, quiet=True,
+                end_date=day, add_to_held=True)
+            got = cell[cap]["all"]
+            assert self._trades(got) == self._trades(fresh), cap
+            pd.testing.assert_frame_equal(got.equity_df, fresh.equity_df)
+        # ... and the family differs from a run that never adds, somewhere in it
+        plain = add_on_run.on.cap_sweep.cell(band, k)
+        assert any(self._trades(cell[cap]["all"]) != self._trades(plain[cap]["all"])
+                   for cap in cs.caps)
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_a_cell_read_after_utc_midnight_ends_every_cap_on_the_eager_day(
+        self, monkeypatch,
+    ):
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (1.0,))
+        clock = type("Clock", (TestCapSweepEndDate._Clock,),
+                     {"moment": datetime(2026, 9, 26, 23, 58, tzinfo=UTC)})
+        monkeypatch.setattr(backtester, "datetime", clock)
+        run = run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                                 tier_off_sweep=True, add_on_sweep=True)
+        band, k = (0.0, 1.0), run.primary.k
+        # The report reads the cells four minutes later, on the next UTC day
+        clock.moment = datetime(2026, 9, 27, 0, 2, tzinfo=UTC)
+        for cs, eager in ((run.add_on_cap_sweep, run.primary),
+                          (run.add_on_tier_off_cap_sweep,
+                           self._eager(run.tier_off_scenarios)[(band, k, "all")])):
+            before = cs.simulated
+            cell = cs.cell(band, k)
+            # Not vacuous: caps were simulated after midnight
+            assert cs.simulated > before
+            assert eager.equity_df["date"].iloc[-1] == date(2026, 9, 26)
+            for cap, by_pop in cell.items():
+                point = by_pop["all"]
+                assert point.equity_df["date"].iloc[-1] == date(2026, 9, 26), cap
+                assert len(point.equity_df) == len(eager.equity_df), cap
+        # ... while the clock really did move: an unpinned simulation now runs
+        # one day further
+        fresh = backtester._simulate_at_discount(
+            run.add_on_cap_sweep.entries_by_band[band], golden._START, 10_000.0, k=k,
+            size_cap=0.05, quiet=True, add_to_held=True)
+        assert fresh.equity_df["date"].iloc[-1] == date(2026, 9, 27)
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_the_summary_lines_name_the_grid(self, monkeypatch, caplog):
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
+        with caplog.at_level(logging.INFO):
+            run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                               same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                               tier_off_sweep=True, add_on_sweep=True)
+        adding = [r.getMessage() for r in caplog.records
+                  if r.getMessage().startswith("Adding to held pairs")]
+        assert adding == [
+            "Adding to held pairs (backtest): simulated on demand for the dashboard's Add "
+            "to held pairs select; add-on sweep on",
+            "Adding to held pairs: size-cap sweep: 20 cap(s) x 4 band(s) x 3 k, the \"all\" "
+            "population only, simulated on demand when a report reads it",
+            "Adding to held pairs, tier floors off: size-cap sweep: 20 cap(s) x 2 binding "
+            "band(s) x 3 k, simulated on demand"]
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_the_setting_line_follows_the_checkpoint_line_and_the_cap_line_still_precedes_it(
+        self, monkeypatch, caplog,
+    ):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        for flag in (True, False):
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                                   add_on_sweep=flag)
+            messages = [r.getMessage() for r in caplog.records]
+            cap = next(i for i, m in enumerate(messages)
+                       if m.startswith("Per-trade size cap"))
+            assert messages[cap + 1].startswith("Entry checkpoint (backtest):")
+            assert messages[cap + 2] == (
+                "Adding to held pairs (backtest): simulated on demand for the dashboard's "
+                f"Add to held pairs select; add-on sweep {'on' if flag else 'off'}")
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_the_infeasible_window_records_no_sweep(self, monkeypatch, caplog):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                                     band_sweep=True, tier_off_sweep=True, cap_sweep=True,
+                                     add_on_sweep=True)
+        assert res.add_on_cap_sweep is None and res.add_on_tier_off_cap_sweep is None
+        assert res.cap_sweep is None
+        # No summary line is logged for a sweep that was not built
+        assert not [r for r in caplog.records
+                    if r.getMessage().startswith("Adding to held pairs:")]
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_the_infeasible_window_records_what_the_saved_defaults_say(self, monkeypatch):
+        from kalshi_betting import config
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        for saved in (True, False):
+            config.save_live_defaults(
+                dc_replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=saved), source="")
+            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0)
+            assert res.live_add_to_held_pairs is saved
+
+
 class TestLiveRuleLine:
     """"Live time-series rule (saved live defaults): ..." — the saved live
     defaults' rule and filter, read once before the fetch, recorded on
@@ -13651,13 +13990,17 @@ class TestLiveRuleLine:
         return lines[0]
 
     @staticmethod
-    def _live(monkeypatch, tier_floors, band, categories=None, tags=None):
-        """Save config.py's toggles with this rule and filter as the live defaults."""
+    def _live(monkeypatch, tier_floors, band, categories=None, tags=None, *,
+              add_to_held=False):
+        """Save config.py's toggles with this rule and filter as the live
+        defaults. Adding to held pairs is saved off unless asked for, so a
+        line's note about it appears only in the tests that name it."""
         from kalshi_betting import config
         monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", tier_floors)
         monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", band)
         monkeypatch.setattr(config, "TRADE_CATEGORIES", categories)
         monkeypatch.setattr(config, "TRADE_TAGS", tags)
+        monkeypatch.setattr(config, "ADD_TO_HELD_PAIRS", add_to_held)
         save_config_live_defaults()
         return config.describe_time_series_rule(tier_floors, band)
 
@@ -13699,10 +14042,10 @@ class TestLiveRuleLine:
         assert messages[-1].startswith(self._PREFIX)
         assert any(m.startswith("Size-cap sweep:") for m in messages[:-1])
 
-    # The eight fields a saved-defaults read records, all or none
+    # The nine fields a saved-defaults read records, all or none
     _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_categories", "live_tags",
                     "live_origin", "live_interval_discount", "live_size_cap",
-                    "live_same_title_size_cap")
+                    "live_same_title_size_cap", "live_add_to_held_pairs")
 
     @pytest.mark.parametrize("feasible", [False, True])
     def test_a_refused_file_records_none_and_warns_once(self, monkeypatch, caplog, feasible):
@@ -13739,7 +14082,7 @@ class TestLiveRuleLine:
             "when this run started, and live runs refuse to start without them")
         assert bool(res.calibrations_by_band) is feasible
 
-    def test_the_eight_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
+    def test_the_nine_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
         from kalshi_betting import config
         saved = config.save_live_defaults(
             config.LiveSettings(False, (0.1, 0.8), 0.6, 0.35, 0.25, ("Economics",), ("Fed",)),
@@ -13765,15 +14108,21 @@ class TestLiveRuleLine:
             "live_tier_floors": False, "live_spread_band": (0.1, 0.8),
             "live_categories": ("Economics",), "live_tags": ("Fed",),
             "live_origin": saved.origin, "live_interval_discount": 0.6,
-            "live_size_cap": 0.35, "live_same_title_size_cap": 0.25}
+            "live_size_cap": 0.35, "live_same_title_size_cap": 0.25,
+            "live_add_to_held_pairs": False}
 
-    def test_the_live_rule_fields_are_eight_keys_or_none(self):
+    def test_the_live_rule_fields_are_nine_keys_or_none(self):
         from kalshi_betting import config
         assert backtester._live_rule_fields(None) == {}
         fields = backtester._live_rule_fields(config.LIVE_DEFAULTS_SEED)
         assert tuple(fields) == self._LIVE_FIELDS
         assert fields["live_origin"] == config.LIVE_DEFAULTS_SEED.origin
         assert fields["live_size_cap"] == 0.10
+        # The seed proposes adding to held pairs on, and the field says so
+        assert fields["live_add_to_held_pairs"] is True
+        off = backtester._live_rule_fields(dc_replace(config.LIVE_DEFAULTS_SEED,
+                                                      add_to_held_pairs=False))
+        assert off["live_add_to_held_pairs"] is False
 
     def test_a_direct_sweep_from_candidates_reads_the_toggles_itself(self, monkeypatch):
         # Handed nothing, _sweep_from_candidates takes one read of its own
@@ -13956,9 +14305,11 @@ class TestLiveRuleLine:
         run = (f"k {config._exact_number(res.primary.k)}, per-trade cap "
                f"{config._cap_text(res.primary.size_cap, 'no cap')} and same-title cap "
                f"{config._cap_text(res.same_title_size_cap, 'no extra cap')}")
+        # The seed also adds to held pairs, so its note follows the sizing note
         assert self._line(caplog).endswith(
             "; the live defaults size at k 0.8, per-trade cap 10% and same-title cap 20%, "
-            f"where this run's primary sized at {run}")
+            f"where this run's primary sized at {run}"
+            "; the live defaults add to held pairs, which this run's primary does not")
 
     def test_no_sizing_note_when_the_saved_sizing_is_the_runs(self, monkeypatch, caplog):
         # _live saves config.py's own k and caps, which this run sized at too
@@ -13980,6 +14331,52 @@ class TestLiveRuleLine:
         for changes in ({"live_size_cap": None}, {"same_title_size_cap": None},
                         {"primary": dc_replace(point, size_cap=None)}):
             assert backtester._live_sizing_note(dc_replace(sweep, **changes)) == ""
+
+    # ── Adding to held pairs ────────────────────────────────────────────────
+
+    _ADD_ON_NOTE = "; the live defaults add to held pairs, which this run's primary does not"
+
+    def test_the_add_on_note_is_named_when_the_saved_defaults_add_to_held_pairs(
+        self, monkeypatch, caplog,
+    ):
+        rule = self._live(monkeypatch, True, (0.0, 1.0), add_to_held=True)
+        res = self._infeasible(monkeypatch, caplog)
+        assert res.live_add_to_held_pairs is True
+        assert self._line(caplog) == (
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary "
+            f"scenario applies it{self._ADD_ON_NOTE}")
+        # ... on the line that says the rule was not simulated too
+        rule = self._live(monkeypatch, True, (0.35, 0.5), add_to_held=True)
+        self._feasible(monkeypatch, caplog, band_sweep=False)
+        assert self._line(caplog) == (
+            f"Live time-series rule (saved live defaults): {rule} — not simulated by this "
+            f"run{self._ADD_ON_NOTE}")
+
+    def test_no_add_on_note_when_the_saved_defaults_do_not_add(self, monkeypatch, caplog):
+        self._live(monkeypatch, True, (0.0, 1.0))
+        res = self._infeasible(monkeypatch, caplog)
+        assert res.live_add_to_held_pairs is False
+        assert "held" not in self._line(caplog)
+
+    def test_the_add_on_note_comes_last(self, monkeypatch, caplog):
+        # After the ladder departure's clause and after the sizing clause
+        rule = self._live(monkeypatch, True, (0.0, 1.0), add_to_held=True)
+        configured = backtester.TIME_SERIES_SAME_EVENT_LADDERS
+        res = self._infeasible(monkeypatch, caplog, same_event_ladders=not configured)
+        assert self._line(caplog) == (
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary "
+            f"scenario applies it; this run's same-event ladders are "
+            f"{'off' if configured else 'on'} and config.py's {'on' if configured else 'off'}, "
+            f"so its pairs are not the live bot's{self._ADD_ON_NOTE}")
+        assert res.live_add_to_held_pairs is True
+
+    def test_the_add_on_note_needs_a_recorded_true(self):
+        point = backtester._simulate_at_discount([], date(2026, 1, 5), 1000.0)
+        sweep = backtester.BacktestSweep(primary=point, points=[point], calibration=None)
+        assert sweep.live_add_to_held_pairs is None
+        for recorded, note in ((None, ""), (False, ""), (True, self._ADD_ON_NOTE)):
+            changed = dc_replace(sweep, live_add_to_held_pairs=recorded)
+            assert backtester._live_add_on_note(changed) == note, recorded
 
     # ── The category/tag filter ─────────────────────────────────────────────
 

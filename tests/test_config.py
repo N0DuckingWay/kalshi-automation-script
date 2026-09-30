@@ -1600,7 +1600,9 @@ class TestShippedLiveToggles:
         # The shipped toggles saved as the live defaults: the primary follows k
         # and both caps but keeps band (0, 1) with the tiers on, so the live
         # rule is a grid cell, and the last line says so (no sizing note: the
-        # saved k and caps are the run's own)
+        # saved k and caps are the run's own). The shipped defaults add to held
+        # pairs, which no point of a backtest run does, so the line ends with
+        # that note.
         golden = _tb.TestPrepareEntriesGolden()
         golden._patch(monkeypatch)
         monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
@@ -1614,13 +1616,15 @@ class TestShippedLiveToggles:
             0.8, 1.0, (0.0, 1.0), True)
         assert res.same_title_size_cap == 0.2
         assert (res.live_tier_floors, res.live_spread_band) == (False, (0.0, 0.5))
+        assert res.live_add_to_held_pairs is True
         rule = config.describe_time_series_rule(False, (0.0, 0.5))
         lines = [r.getMessage() for r in caplog.records
                  if r.getMessage().startswith("Live time-series rule")]
         assert lines == [
             f"Live time-series rule (saved live defaults): {rule} — this run's primary "
             "scenario does not (tier floors on, band 0-1); its grid simulated the live rule "
-            "as band 0-0.5 with the tier floors off, which the dashboard's filter bar shows"]
+            "as band 0-0.5 with the tier floors off, which the dashboard's filter bar shows; "
+            "the live defaults add to held pairs, which this run's primary does not"]
 
     def test_validate_re_checks_the_edge_after_the_fee(self, caplog):
         # At a 1.0 ceiling the fee cut is the one pre-submission edge check: a
