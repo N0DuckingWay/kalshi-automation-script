@@ -100,8 +100,8 @@ Dependencies:
     rule's report that dashboard._live_rule_html shares with this module's
     log line — _live_rule_view with its _LIVE_RULE_PRIMARY and
     _LIVE_RULE_NOT_SIMULATED verdicts, _live_rule_ladder_note,
-    _live_filter_text, _live_sizing_note, _LIVE_RULE_LABEL and
-    _LIVE_RULE_NONE; an
+    _live_filter_text, _live_sizing_note, _live_add_on_note,
+    _LIVE_RULE_LABEL and _LIVE_RULE_NONE; an
     IntervalCalibration carries the CalibrationObservations its pooled row
     was reduced from, so a report can regroup that population through
     _calibration_bucket, the one definition of the k-hat arithmetic, as
@@ -220,10 +220,11 @@ Notes:
     over the tier-on entries and add_on_tier_off_cap_sweep over the
     tier-floors-off family's binding bands) whose every simulation adds to
     held pairs, for the "all" population only and at every cap of the grid.
-    No run of this module adds to held pairs, so they have no eager point to
-    start from: every cell is simulated when a report reads it, ending its
-    curves on the day its eager twin's curve ended. The run itself simulates
-    nothing extra, and every figure it reports is unchanged by the flag.
+    No eager run of this module adds to held pairs, so they have no eager
+    point to start from: every cell is simulated when a report reads it,
+    ending its curves on the day its eager twin's curve ended. The run itself
+    simulates nothing extra, and every figure it reports is unchanged by the
+    flag.
 
     An ENTRY CHECKPOINT is a moment at which the backtest may open a
     simulated trade: the live bot's weekly run time (config.SCHEDULED_RUN,
@@ -8303,10 +8304,11 @@ def _sweep_from_candidates(
     # The size caps the grid offers: the run's own cap (every point above
     # carries it, resolved at simulation time) unioned into SIZE_CAP_SWEEP, as
     # the k grid unions its primary, so the eager points are always exact
-    # members. Read by the size-cap sweeps and by the add-on sweeps, so a run
-    # with neither never reads a point's stamped cap here.
+    # members. Read by the size-cap sweeps and, with the size-cap sweep on, by
+    # the add-on sweeps; a run without the size-cap sweep never reads a
+    # point's stamped cap here.
     caps = (tuple(sorted(set(SIZE_CAP_SWEEP) | {primary.size_cap}))
-            if cap_sweep or add_on_sweep else ())
+            if cap_sweep else ())
     capped = None
     if cap_sweep:
         # Every other cap, simulated only when a reader asks for a cell. Built
@@ -8357,9 +8359,9 @@ def _sweep_from_candidates(
             initial_balance=initial_balance, split_date=None, checks=False,
             entries_by_band=entries_by_band, st_entries=[], eager={},
             add_to_held=True, end_dates=add_on_end_dates)
-        logging.info("Adding to held pairs: size-cap sweep: %d cap(s) x %d band(s) x %d k, "
-                     "the \"all\" population only, simulated on demand when a report "
-                     "reads it", len(add_on_caps), len(bands), len(grid))
+        logging.info("Adding to held pairs: %d size cap(s) x %d band(s) x %d k, all trades "
+                     "together, each simulated when the dashboard reads it",
+                     len(add_on_caps), len(bands), len(grid))
         if tier_off_bands:
             add_on_off_capped = CapSweep(
                 caps=add_on_caps, primary_cap=primary.size_cap,
@@ -8367,9 +8369,9 @@ def _sweep_from_candidates(
                 start_date=start_date, initial_balance=initial_balance, split_date=None,
                 checks=False, entries_by_band=tier_off_entries, st_entries=[], eager={},
                 tier_floors=False, add_to_held=True, end_dates=add_on_off_end_dates)
-            logging.info("Adding to held pairs, tier floors off: size-cap sweep: %d cap(s) "
-                         "x %d binding band(s) x %d k, simulated on demand",
-                         len(add_on_caps), len(tier_off_bands), len(grid))
+            logging.info("Adding to held pairs, tier floors off: %d size cap(s) x %d band(s) "
+                         "the tiers bind at x %d k, each simulated when the dashboard "
+                         "reads it", len(add_on_caps), len(tier_off_bands), len(grid))
 
     return BacktestSweep(
         primary=primary, points=points, calibration=calibration,
@@ -8685,12 +8687,13 @@ def run_backtest_sweep(
         "run time): %s",
         SCHEDULED_RUN.label(), where,
     )
-    # And for the add-on family: it is simulated when a report reads it, never
-    # during the run, so the line says whether it rides the result
+    # And for the add-on family: it is simulated when the dashboard reads it,
+    # never during the run, so the line says whether it rides the result
     logging.info(
-        "Adding to held pairs (backtest): simulated on demand for the dashboard's "
-        "Add to held pairs select; add-on sweep %s",
-        "on" if add_on_sweep else "off",
+        "Adding to held pairs (backtest): %s",
+        "on — the dashboard's Add to held pairs select is simulated when the "
+        "dashboard is built" if add_on_sweep else
+        "off — the dashboard's Add to held pairs select stays disabled",
     )
     # The saved live defaults (never main.py's per-run overrides), read ONCE
     # before the fetch, so a refused file warns at the top of the run

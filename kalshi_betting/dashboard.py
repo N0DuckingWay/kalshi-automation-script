@@ -32,13 +32,12 @@ Purpose:
 
     A sticky filter bar at the top of the page — Spread band, Tier floors, k,
     Size cap, Add to held pairs, Category, Tag — re-scopes every
-    trade-derived section
-    (performance, decomposition, calibration, diagnostics, risk, the
-    benchmark's strategy row) to the run at another spread band, with the
-    deadline-gap tier floors on (the run as simulated) or off (the band
-    sweep's tier-floors-off run of that band), interval discount k and
-    per-trade size cap, with or without adding to pairs the run still holds,
-    and/or one Kalshi category or category · tag of it,
+    trade-derived section (performance, decomposition, calibration,
+    diagnostics, risk, the benchmark's strategy row) to the run at another
+    spread band, with the deadline-gap tier floors on (the run as simulated)
+    or off (the band sweep's tier-floors-off run of that band), interval
+    discount k and per-trade size cap, with or without adding to pairs the
+    run still holds, and/or one Kalshi category or category · tag of it,
     and moves the k-hat breakdown and the performance section's k-hat cards
     to the same band, tier setting and selection (the breakdown's reference
     line to the same k), the interval-discount section to the same k and
@@ -55,8 +54,8 @@ Purpose:
     The bar's Add to held pairs choice is "off" (the page as rendered) or
     "on (up to the size cap)": the same scenario re-simulated with every pair
     the simulation still holds bought again on a later Monday, sized on the
-    whole position (backtester._simulate_at_discount's add_to_held). No
-    backtest run makes those simulations. The sweep carries them as two lazy
+    whole position (backtester._simulate_at_discount's add_to_held). The run
+    itself simulates none of them. The sweep carries them as two lazy
     size-cap sweeps (BacktestSweep.add_on_cap_sweep, and
     add_on_tier_off_cap_sweep over the tier-floors-off family), and this
     module simulates every cell as the page is built, the "all" population
@@ -117,10 +116,11 @@ Dependencies:
     test, decide which bands were simulated again), _live_rule_view() with
     its _LIVE_RULE_* verdicts, _live_rule_ladder_note(), _live_filter_text(),
     _live_sizing_note(), _live_add_on_note(), _LIVE_RULE_LABEL and
-    _LIVE_RULE_NONE (the live-rule
-    line's pieces, shared with the run's log line, which names the saved live
-    defaults) — and reads
-    BacktestSweep.cap_sweep (a backtester.CapSweep) by its attributes — and
+    _LIVE_RULE_NONE (the live-rule line's pieces, shared with the run's log
+    line, which names the saved live defaults) — and reads
+    BacktestSweep.cap_sweep, tier_off_cap_sweep, add_on_cap_sweep and
+    add_on_tier_off_cap_sweep (each a backtester.CapSweep) by their
+    attributes — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
     page's file name, which defaults_server also opens), DEFAULTS_SERVER_HOST
     and DEFAULTS_SERVER_PORT (the address the filter bar's save button and
@@ -221,29 +221,29 @@ Notes:
     selection too. A tag is Kalshi's FIRST tag of the series (_series_labels),
     so every breakdown partitions. Its k and size cap also move the
     interval-discount section (at the primary spread band, always with the
-    tier floors on); its band, Tier floors choice, category and tag never
-    do. Its band, Tier floors choice, k and size cap move the scenario
-    explorer's selects (window.dashScenarioSelect(band, k, cap, tier), which
-    the explorer's own script defines and the bar's calls after every
-    redraw, matched by option label and, for the tier, by "on" / "off") —
-    each axis only when the bar's label on it changes, so a choice made in
-    the explorer survives a bar change on another axis, and an axis the
-    explorer refused (a size cap it holds no tier-floors-off block for, or
-    a block it could not unpack) is applied again on the bar's next change
-    to any axis; its category and tag never do. The bar's summary line says what it reaches on THIS
-    page (_bar_reach: _BAR_REACH when both follow it, a band-and-k variant
-    when the explorer shows the run's own size cap only, _BAR_REACH_NO_
-    EXPLORER_TIERS' sentences when the explorer renders no Tier floors
-    select of its own — every page whose run carries no complete
+    tier floors on); its band, Tier floors choice, Add to held pairs choice,
+    category and tag never do. Its band, Tier floors choice, k and size cap
+    move the scenario explorer's selects (window.dashScenarioSelect(band, k,
+    cap, tier), which the explorer's own script defines and the bar's calls
+    after every redraw, matched by option label and, for the tier, by "on" /
+    "off") — each axis only when the bar's label on it changes, so a choice
+    made in the explorer survives a bar change on another axis, and an axis
+    the explorer refused (a size cap it holds no tier-floors-off block for,
+    or a block it could not unpack) is applied again on the bar's next
+    change to any axis; its Add to held pairs choice, category and tag never
+    do. The bar's summary line says what it reaches on THIS page
+    (_bar_reach: _BAR_REACH when both follow it, a band-and-k variant when
+    the explorer shows the run's own size cap only,
+    _BAR_REACH_NO_EXPLORER_TIERS' sentences when the explorer renders no
+    Tier floors select of its own — every page whose run carries no complete
     tier-floors-off family — and other sentences when the interval-discount
-    section cannot follow
-    the bar or the page has no explorer grid — each saying that the Interval
-    Discount section does not follow the Tier floors choice). The performance section's two k-hat
-    cards (_khat_kpis) follow the bar's band, Tier floors choice, category
-    or tag and k: they read the k-hat breakdown's own group for the
-    selection, and the card rendered for the primary view comes from the
-    primary calibration itself, so it is there even when the bar cannot be
-    built. Every view is computed
+    section cannot follow the bar or the page has no explorer grid — each
+    saying that the Interval Discount section does not follow the Tier
+    floors choice). The performance section's two k-hat cards (_khat_kpis)
+    follow the bar's band, Tier floors choice, category or tag and k: they
+    read the k-hat breakdown's own group for the selection, and the card
+    rendered for the primary view comes from the primary calibration itself,
+    so it is there even when the bar cannot be built. Every view is computed
     by the same helpers the sections render with (_performance_kpis,
     _performance_series, _decomposition_aggregates, _category_table,
     _reliability, _best_and_worst, _kelly_points, _capital_deployed,
@@ -4124,6 +4124,39 @@ def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
     return "; " + ", and ".join(parts)
 
 
+def _add_on_shown_at(bar: dict | None, band_index: int | None, tier_on: bool) -> bool:
+    """
+    Say whether the filter bar's Add to held pairs view holds a scenario at one band.
+
+    The live-rule line names where the bar shows the saved defaults' rule (a
+    band and a Tier floors setting) and, when they add to held pairs, tells
+    the reader to choose Add to held pairs on there. That is true only where
+    the bar's add-on grid has chunks for the band: a page whose add-on runs
+    did not cover it (no add-on view at all, or a band the tiers bind at whose
+    tier-floors-off add-on runs are missing) shows "not simulated" instead.
+
+    Args:
+        bar (dict | None): _filter_payload's base block ("grid_add" and
+            "grid_add_off", each [band][k][cap] -> chunk id or null, or null
+            when the page has no such view), or None without a filter bar.
+        band_index (int | None): The band's index in the bar (None with no bar).
+        tier_on (bool): True for the Tier floors on grid, False for the off one.
+
+    Returns:
+        bool: True when at least one k and cap of that band has a chunk in the
+            grid the Tier floors setting reads; False otherwise.
+
+    Raises:
+        Nothing. It only reads the bar's entries.
+    """
+    if bar is None or band_index is None:
+        return False
+    grid = bar.get("grid_add" if tier_on else "grid_add_off")
+    if grid is None or not 0 <= band_index < len(grid):
+        return False
+    return any(cid is not None for row in grid[band_index] for cid in row)
+
+
 def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     """
     Render the page-header line naming the saved live defaults' rule, and where this page shows it.
@@ -4138,7 +4171,8 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     its filter bar shows it at that sizing (_live_sizing_bar_clause). When
     the saved defaults add to held pairs, which no primary does, it says so
     too (backtester._live_add_on_note) and, where the page shows the rule,
-    whether the filter bar's Add to held pairs choice shows it.
+    whether the filter bar's Add to held pairs choice shows it at that band
+    and Tier floors setting (_add_on_shown_at).
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
@@ -4231,13 +4265,10 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     # defaults do it, with where the bar shows it only where the line shows
     # the rule at all
     add_note = _live_add_on_note(sweep)
-    if add_note:
-        if shown is None:
-            pass
-        elif bar is not None and bar.get("grid_add") is not None:
-            add_note += " — choose Add to held pairs on in the filter bar to see it"
-        else:
-            add_note += " — this page has no Add to held pairs view"
+    if add_note and shown is not None:
+        add_note += (" — choose Add to held pairs on in the filter bar to see it"
+                     if _add_on_shown_at(bar, *shown)
+                     else " — this page has no Add to held pairs view")
     text = f"Live rule ({_LIVE_RULE_LABEL}): {rule}; {cap_clause} — {tail}{sizing}{add_note}"
     return f"{style}{html.escape(text, quote=False)}</p>"
 
@@ -5579,7 +5610,8 @@ def _section_benchmark(equity_df: pd.DataFrame, start_date: date,
     )
 
 
-# ─── Page-wide filter: spread band x tier floors x k x size cap x Kalshi category x tag ───
+# ─── Page-wide filter: spread band x tier floors x k x size cap x add to held pairs
+#     x Kalshi category x tag ───
 
 # The view every trade list carries: all of its trades, no category or tag.
 _ALL_VIEW = "all"
@@ -5614,25 +5646,37 @@ _ADD_ON_OPTION_ON = "on (up to the size cap)"
 _ADD_ON_SELECT_TITLE = (
     "off: a pair is bought once and not again while it is held. on: a pair still held "
     "can be bought again on a later Monday (the same two markets, the same side on "
-    "each), sized like any trade but on the whole position, so old and new together "
-    "stay within the size cap of the account value (cash plus open trades at cost). "
-    "Live trading uses the saved live defaults. The Scenario Explorer and Interval "
-    "Discount sections always show it off.")
+    "each), sized so the old and new contracts together stay within the size cap's "
+    "share of the account value (cash plus open trades at cost). Live trading follows "
+    "the saved live defaults, not this choice. The Scenario Explorer and Interval "
+    "Discount sections always show it off. In the Risk section's Kelly chart an added "
+    "trade plots only what it added, so it sits below the 1:1 line.")
 # Appended to a scenario's summary phrase when adding is on
 _ADD_ON_PHRASE = ", adding to held pairs"
+# Added to the summary line while adding is on: the trade counts and the Kelly
+# chart read an added purchase as a trade of its own
+_ADD_ON_SUMMARY_NOTE = (" Each purchase that adds to a held pair counts as a trade of its "
+                        "own; in the Kelly chart it shows only what it added.")
 # Closes the summary line's reach sentence on a page that has the add-on view;
 # the second is for a page with no Scenario Explorer grid (never claim a reach
 # the page lacks)
-_ADD_ON_REACH = ("Add to held pairs changes only the sections this bar filters; the Scenario "
-                 "Explorer and Interval Discount sections always show it off.")
-_ADD_ON_REACH_NO_EXPLORER = ("Add to held pairs changes only the sections this bar filters; "
-                             "the Interval Discount section always shows it off.")
+_ADD_ON_REACH = ("Add to held pairs changes the trade sections only; the k̂ figures do not "
+                 "depend on it, and the Scenario Explorer and Interval Discount sections "
+                 "always show it off.")
+_ADD_ON_REACH_NO_EXPLORER = ("Add to held pairs changes the trade sections only; the k̂ "
+                             "figures do not depend on it, and the Interval Discount "
+                             "section always shows it off.")
 # Beside the select when the page keeps it shut, by the payload's "add_state"
 # (worded apart from the Tier floors note, "(not simulated for this run)")
 _ADD_ON_NOTES = {
-    "not simulated": "(not in this backtest)",
-    "unavailable": "(could not be built; see the log)",
+    "not simulated": "(not simulated in this backtest)",
+    "unavailable": "(not available on this page; see the log)",
 }
+# Beside the save button on a page with the add-on view, when the saved live
+# defaults add to held pairs: saving from the bar sends the choice shown, and
+# "off" turns adding off in the defaults
+_ADD_ON_SAVE_NOTE = ("The live defaults add to held pairs; saving with Add to held pairs "
+                     "off here turns that off.")
 
 # What the filter bar reaches beyond the seven sections it re-scopes whole,
 # said once, for the bar's summary line and its tests: the interval-discount
@@ -5772,6 +5816,7 @@ _SUMMARY_TEMPLATES = {
                        "not a slice of the primary run."),
     "other_run": " This is its own simulation, not a slice of the primary run.",
     "add_on": _ADD_ON_PHRASE,
+    "add_on_note": _ADD_ON_SUMMARY_NOTE,
     "missing": "Showing nothing: {scenario} was not simulated by this run.",
     "loading": "Loading {scenario}…",
     "unavailable": ("The filter could not load the data for {failed} ({reason}); "
@@ -5881,9 +5926,9 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
     What the filter bar's save button sends besides the scenario on screen.
 
     The button opens the defaults server's confirmation page with the bar's
-    scenario in the address (its spread band, Tier floors choice, k and size
-    cap, and any category or tag); this is the rest of that address, fixed
-    when the page is built. The server accepts no source note but one of the
+    scenario in the address (its spread band, Tier floors choice, k, size cap
+    and Add to held pairs choice, and any category or tag); this is the rest
+    of that address, fixed when the page is built. The server accepts no source note but one of the
     shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, so the note is checked
     against that pattern here, as the server checks it (whole, ASCII digits
     only), and left out should it ever not match.
@@ -5910,7 +5955,10 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
             "source" (the note the saved file keeps: "backtest dashboard for
             <start> to <today>", plus a note when the run's same-event ladder
             setting differed from config.py's, so its pairs are not the live
-            bot's; None if it would not match the pattern).
+            bot's; None if it would not match the pattern);
+            "live_adds_to_held_pairs" (whether the saved live defaults add to
+            held pairs, as the run recorded them; the note beside the save
+            button says so on a page with the Add to held pairs view).
     """
 
     def day(value: date) -> str:
@@ -5940,6 +5988,7 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
         "same_title_size_cap": None if sweep is None else sweep.same_title_size_cap,
         "filed_by_listing": bool(series_categories),
         "source": source,
+        "live_adds_to_held_pairs": getattr(sweep, "live_add_to_held_pairs", None) is True,
     }
 
 # Every field of a BacktestTrade, in declaration order: _list_key's identity
@@ -6300,6 +6349,22 @@ def _with_tier_off(source: "_GridSource", sweep: BacktestSweep | None) -> "_Grid
             capped, off_cell=eager_off_cell, off_cap_sweep=None, off_fallback=None))
 
 
+def _warn_add_on_lost_with_the_cap_sweep() -> None:
+    """
+    Log why the Add to held pairs select stays disabled when the size-cap sweep is set aside.
+
+    The add-on simulations are read on the size-cap sweep's own grid, so a page
+    that falls back to the eager points (the cap sweep could not be read, does
+    not hold the run's primary scenario, or failed to simulate a cell) has no
+    add-on view either. The size-cap sweep's own WARNING names its failure;
+    this one says what that costs the select, so the note beside the select
+    ("see the log") is true.
+    """
+    logging.warning("The Add to held pairs simulations are not shown, because the size-cap "
+                    "sweep they are read with could not be used; the filter bar's Add to "
+                    "held pairs select stays disabled")
+
+
 def _with_add_on(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSource":
     """
     Attach a sweep's Add to held pairs family to a grid, when it fits.
@@ -6341,12 +6406,13 @@ def _with_add_on(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSo
         # must list its category and tag before any cell is simulated
         events = source.events | frozenset(add.entry_events()) if usable else None
     except Exception:
-        logging.warning("The Add to held pairs runs could not be read; the page offers that "
-                        "choice off only", exc_info=True)
+        logging.warning("The Add to held pairs simulations could not be read; the filter "
+                        "bar's Add to held pairs select stays disabled", exc_info=True)
         return source
     if not usable:
-        logging.warning("The Add to held pairs runs do not match the page's grid (its bands, "
-                        "ks or caps); the page offers that choice off only")
+        logging.warning("The Add to held pairs simulations do not match the page's grid (its "
+                        "bands, ks or caps); the filter bar's Add to held pairs select stays "
+                        "disabled")
         return source
     off = getattr(sweep, "add_on_tier_off_cap_sweep", None)
     add_off_cell = add_off = None
@@ -6379,8 +6445,9 @@ def _with_add_on(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSo
                 """
                 return off.cell(band, k) if band in binding else {}
         else:
-            logging.warning("The Add to held pairs runs with the tier floors off do not match "
-                            "the page's grid; with the tier floors off, adding is not shown")
+            logging.warning("The Add to held pairs simulations with the tier floors off do "
+                            "not match the page's grid; with the tier floors off, adding "
+                            "is not shown")
     fields = {"add_cell": add.cell, "add_off_cell": add_off_cell, "add_cap_sweep": add,
               "add_off_cap_sweep": add_off, "events": events, "off_events": off_events}
     attached = dataclasses.replace(source, **fields)
@@ -6556,9 +6623,11 @@ def _grid_source(
     the sweep's tier-floors-off family when the page can show it
     (_with_tier_off: its binding bands' off cells at the run's own cap), so
     the walk's fallback keeps the Tier floors choice too. It carries the Add
-    to held pairs family (_with_add_on) only when use_cap_sweep is True, and
-    only if the family's bands, ks and caps are the grid's: the walk's
-    cap-axis fallback never has that view.
+    to held pairs family (_with_add_on) only when use_cap_sweep is True and the
+    size-cap sweep (when the run has one) was usable, and only if the family's
+    bands, ks and caps are the grid's: a grid that set the size-cap sweep aside,
+    and the walk's cap-axis fallback, never have that view, and each logs a
+    WARNING saying so (_warn_add_on_lost_with_the_cap_sweep).
 
     The k axis is the sweep's own: its primary entry is sweep.primary.k,
     never k_used, which names the one k only without a sweep. An
@@ -6584,9 +6653,9 @@ def _grid_source(
             logging.warning("The size-cap sweep cannot be placed on a run whose primary "
                             "records no spread band; the page offers the run's own cap only")
         if use_cap_sweep and getattr(sweep, "add_on_cap_sweep", None) is not None:
-            logging.warning("The Add to held pairs runs cannot be placed on a run whose "
-                            "primary records no spread band; the page offers that choice "
-                            "off only")
+            logging.warning("The Add to held pairs simulations cannot be placed on a run "
+                            "whose primary records no spread band; the filter bar's Add to "
+                            "held pairs select stays disabled")
         return _unbanded_source(sweep, trades, equity_df, k_used)
     capped = sweep.cap_sweep
     if use_cap_sweep and capped is not None:
@@ -6615,16 +6684,20 @@ def _grid_source(
             # in the walk: the eager points still give the bar every band and k
             logging.warning("The size-cap sweep could not be simulated; the page offers "
                             "the run's own cap only", exc_info=True)
-            return _with_add_on(_with_tier_off(_eager_source(sweep), sweep), sweep)
+            if getattr(sweep, "add_on_cap_sweep", None) is not None:
+                _warn_add_on_lost_with_the_cap_sweep()
+            return _with_tier_off(_eager_source(sweep), sweep)
         logging.warning(
             "The size-cap sweep does not hold this run's primary scenario (band %s, "
             "k %s, cap %s); the dashboard offers the run's own cap only",
             primary.spread_band, primary.k, capped.primary_cap)
-        return _with_add_on(_with_tier_off(_eager_source(sweep), sweep), sweep)
+        if getattr(sweep, "add_on_cap_sweep", None) is not None:
+            _warn_add_on_lost_with_the_cap_sweep()
+        return _with_tier_off(_eager_source(sweep), sweep)
     source = _with_tier_off(_eager_source(sweep), sweep)
     # The walk's cap-axis fallback (use_cap_sweep False) never carries the
     # Add to held pairs view: the family's caps are the size-cap grid's, and
-    # the walk has already said why the cap axis was lost
+    # the walk logs both the lost cap axis and the lost view
     return _with_add_on(source, sweep) if use_cap_sweep else source
 
 
@@ -7001,10 +7074,11 @@ def _walk_add_cells(source: _GridSource, add_takers: list,
                         visit.add(bi, ki, ci, pops, off=off)
             del by_cap
             if done % every == 0 or done == len(cells):
-                logging.info("Dashboard: %d/%d band x k cells read from the Add to held "
-                             "pairs size-cap sweep%s (%d cap points simulated, %d shared "
+                logging.info("Dashboard: %d/%d %s (%d cap points simulated, %d shared "
                              "so far)", done, len(cells),
-                             ", tier floors off" if off else "",
+                             "binding band x k cells read from the tier-floors-off Add to "
+                             "held pairs size-cap sweep" if off else
+                             "band x k cells read from the Add to held pairs size-cap sweep",
                              getattr(capped, "simulated", 0), getattr(capped, "reused", 0))
     return None
 
@@ -7093,8 +7167,8 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
         error = _walk_add_cells(source, add_takers, axis_end)
         if error is not None:
             # Costs the add-on view alone: every other choice keeps what it built
-            logging.warning("The Add to held pairs runs could not be simulated; the page "
-                            "offers that choice off only", exc_info=error)
+            logging.warning("An Add to held pairs simulation failed; the filter bar's Add "
+                            "to held pairs select stays disabled", exc_info=error)
             source = dataclasses.replace(source, add_cell=None, add_off_cell=None,
                                          add_cap_sweep=None, add_off_cap_sweep=None)
             for visit in add_takers:
@@ -7121,8 +7195,10 @@ def _walk_grid(source: _GridSource, visitors: list,
     Two layers keep a failure from costing more than the filter bar did
     before the size cap existed. This one: a size-cap cell that raises while
     it is simulated costs the cap axis only — ONE WARNING (with the
-    traceback), every visitor reset for the fallback grid, and a second walk
-    over the eager points alone (source.fallback), whose cells are lookups.
+    traceback; a second says the Add to held pairs view is lost with it, when
+    the grid carried that family), every visitor reset for the fallback grid,
+    and a second walk over the eager points alone (source.fallback), whose
+    cells are lookups.
     A tier-floors-off size-cap cell that raises costs less: only the off
     view's other caps, recovered inside the walk (_walk_once, off_fallback),
     with the tier-on cap axis kept. (The size-cap sweep's same-title
@@ -7153,6 +7229,8 @@ def _walk_grid(source: _GridSource, visitors: list,
         raise error
     logging.warning("The size-cap sweep could not be simulated; the page offers the "
                     "run's own cap only", exc_info=error)
+    if source.add_cell is not None:
+        _warn_add_on_lost_with_the_cap_sweep()
     fallback = source.fallback()
     for visitor in visitors:
         visitor.reset(fallback)
@@ -8979,14 +9057,16 @@ def _filter_payload(
         save (dict | None): Keyword-only. What the bar's save button sends
             besides the scenario on screen (_save_target): the confirmation
             page's address, the run's same-title cap, whether trades are filed
-            by Kalshi's series listing, and the source note. None (default)
-            ships null, and the script then keeps the button disabled.
+            by Kalshi's series listing, the source note and whether the saved
+            defaults add to held pairs. None (default) ships null, and the
+            script then keeps the button disabled.
         add_on_state (str): Keyword-only. Why the page has no Add to held
             pairs view when it has none: "not simulated" (the run carried no
-            such family: the note reads "(not in this backtest)") or
-            "unavailable" (it carried one the page could not use or build:
-            "(could not be built; see the log)"). Ignored when the page has
-            the view, whose state is then "shown". "not simulated" (default).
+            such family: the note reads "(not simulated in this backtest)")
+            or "unavailable" (it carried one the page could not use or build:
+            "(not available on this page; see the log)"). Ignored when the
+            page has the view, whose state is then "shown". "not simulated"
+            (default).
 
     Returns:
         dict: "dates" (the shared axis, ISO dates), "bands" ([{label,
@@ -9198,7 +9278,7 @@ def _tier_off_where(label: str, primary: bool, same_as_tier_on: bool) -> str:
 
 def _filter_summary_text(text: dict, scenario: str, primary: bool,
                          selection: str | None, n: int, n_band: int, *,
-                         note: str | None = None) -> str:
+                         note: str | None = None, add_on: bool = False) -> str:
     """
     Say, under the filter bar, what the page is showing.
 
@@ -9225,6 +9305,10 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
             band, k and cap with the tier floors off where they bind. None
             (default) applies the tier-on rule: "other_scenario" on every
             scenario but the primary, nothing on it.
+        add_on (bool): Keyword-only. Whether the Add to held pairs choice is
+            on: the line then gains the "add_on_note" template (what an added
+            purchase counts as) before its closing reach sentence, as the
+            script adds it. False (default).
 
     Returns:
         str: Plain text — escape it before putting it in HTML.
@@ -9237,7 +9321,7 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
     else:
         out = text["slice"].format(scenario=scenario, selection=selection, n=n,
                                    band_count=_trade_count(n_band))
-    return out + text["unfiltered"]
+    return out + (text["add_on_note"] if add_on else "") + text["unfiltered"]
 
 
 def _filter_bar_html(payload: dict, primary_views: dict) -> str:
@@ -9272,9 +9356,12 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     page for that scenario in a new tab. Its hover text (_SAVE_TITLE) gains
     _SAVE_TITLE_UNFILED on a page that does not file trades by Kalshi's
     series listing (payload "save"), where a category or tag cannot be
-    saved. Then the "Trade using defaults…" link (_trade_link_html), which
-    the script never touches, and the note that both need the defaults
-    server running.
+    saved. On a page with the add-on view whose saved live defaults add to
+    held pairs (save["live_adds_to_held_pairs"]), a grey note
+    (_ADD_ON_SAVE_NOTE) follows the button: saving with the Add to held
+    pairs choice off turns that off. Then the "Trade using defaults…" link
+    (_trade_link_html), which the script never touches, and the note that
+    both need the defaults server running.
 
     Args:
         payload (dict): _filter_payload's base block.
@@ -9341,6 +9428,13 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     # category or tag cannot be saved from it
     save_filed = (payload.get("save") or {}).get("filed_by_listing", False)
     save_title = html.escape(_SAVE_TITLE + ("" if save_filed else _SAVE_TITLE_UNFILED))
+    # Saving from a page with the add-on view sends the choice shown, so when
+    # the saved live defaults add to held pairs, leaving it "off" would turn
+    # that off; the grey note beside the button says so
+    save_adds = (add_state == "shown"
+                 and (payload.get("save") or {}).get("live_adds_to_held_pairs") is True)
+    save_note = ('&nbsp;<span id="flt-add-save-note" style="color:#9E9E9E; font-size:13px;">'
+                 f"{html.escape(_ADD_ON_SAVE_NOTE)}</span>" if save_adds else "")
 
     cat_opts = '<option value="">All categories</option>' + "".join(
         f'<option value="{i}">{html.escape(c)} ({count(f"c{i}")})</option>'
@@ -9374,7 +9468,7 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         # The save button, disabled like the selects (autocomplete="off": a
         # browser that restores a control's disabled state on reload must not)
         f'&nbsp;&nbsp;<button id="flt-save" type="button" disabled autocomplete="off" '
-        f'title="{save_title}">{html.escape(_SAVE_LABEL)}</button>'
+        f'title="{save_title}">{html.escape(_SAVE_LABEL)}</button>{save_note}'
         # The trade link: a plain link, so it works whatever the script's state
         f'&nbsp;&nbsp;{_trade_link_html()}'
         '<span id="flt-save-note" style="color:#9E9E9E; font-size:13px;">'
@@ -9519,13 +9613,13 @@ def _packed_text_script(element_id: str, raw: str) -> str:
 # select, appended after the others (SHOWN[6]), picks between the grid as
 # simulated (D.grid) and the same scenario with pairs still held bought again
 # (D.grid_add, or D.grid_add_off with the tier floors off); it is enabled only
-# when the base block carries an add-on grid, its phrase is Python's
-# (D.text.add_on), and neither the k-hat figures, the interval-discount
-# section nor the scenario explorer follow it (renderKhat, renderKhatCards and
-# renderKd read no part of it, and window.dashScenarioSelect still gets four
-# arguments). It
-# also rewrites the performance section's two k-hat cards (renderKhatCards,
-# from the k-hat breakdown's group for the selection) and the
+# when the base block carries an add-on grid, its phrase and the summary
+# line's note while it is on are Python's (D.text.add_on, D.text.add_on_note),
+# and neither the k-hat figures, the interval-discount section nor the
+# scenario explorer follow it (renderKhat, renderKhatCards and renderKd read
+# no part of it, and window.dashScenarioSelect still gets four arguments).
+# The script also rewrites the performance section's two k-hat cards
+# (renderKhatCards, from the k-hat breakdown's group for the selection) and the
 # interval-discount section at the bar's k and size cap (renderKd, from
 # D.kd), both for the scenario on screen and both returning at once on a page
 # without them, and after each redraw hands the scenario on screen to the
@@ -9537,13 +9631,15 @@ def _packed_text_script(element_id: str, raw: str) -> str:
 # live defaults…" button whenever the scenario on screen (SHOWN, never the
 # selects' choice while a chunk loads) can become the live defaults, and a
 # click opens the defaults server's confirmation page for that scenario in a
-# new tab (saveHref: D.save's address and the axes' values; the button's words
-# are Python's). On load it inflates the base block and the primary scenario's
+# new tab (saveHref: D.save's address and the axes' values — on a page with
+# the add-on view, adding to held pairs off among them; the button's words are
+# Python's). On load it inflates the base block and the primary scenario's
 # chunk, sets the bar back to the view Python rendered and enables it — it
-# redraws nothing until a <select> changes. A chunk is inflated when a scenario needs it and
-# kept while among the last KEEP drawn (the primary's always); a choice made
-# while a chunk is still inflating supersedes it (SEQ), and a chunk that cannot
-# be loaded puts every select back on the scenario still shown (SHOWN).
+# redraws nothing until a <select> changes. A chunk is inflated when a
+# scenario needs it and kept while among the last KEEP drawn (the primary's
+# always); a choice made while a chunk is still inflating supersedes it (SEQ),
+# and a chunk that cannot be loaded puts every select back on the scenario
+# still shown (SHOWN).
 _FILTER_JS = r"""
 <script>
 (function() {
@@ -9619,7 +9715,8 @@ _FILTER_JS = r"""
   function cellChunk() {
     return chunkAt(bandIndex(), kIndex(), capIndex(), tierSel.value, addSel.value);
   }
-  // The page as rendered: the primary scenario with the tier floors on
+  // The page as rendered: the primary scenario with the tier floors on and
+  // adding to held pairs off
   function primaryChunk() { var p = D.primary; return D.grid[p[0]][p[1]][p[2]]; }
   // The filter bar's scenario ON SCREEN (SHOWN) as the defaults server's
   // confirmation-page address, or null when it cannot become live settings:
@@ -9724,7 +9821,9 @@ _FILTER_JS = r"""
       text = fill(T.slice, {scenario: scenario(), selection: selectionName(key),
                             n: v.n, band_count: trades(count('all'))});
     }
-    setText('flt-summary', text + T.unfiltered);
+    // While adding is on, Python's note on what an added purchase counts as
+    setText('flt-summary', text + (addOn(addSel.value) && cellChunk() !== null
+                                    ? T.add_on_note : '') + T.unfiltered);
   }
 
   // Trace i of a figure Python drew, with new data: its styling (colours,
@@ -10008,10 +10107,10 @@ _FILTER_JS = r"""
   // The interval-discount section, at the primary spread band, for the k and
   // size cap ON SCREEN (SHOWN): its two cards, its equity curve and title,
   // and its per-k table at that cap — all from D.kd, which Python built
-  // (_KdVisitor). Its band, Tier floors choice, category and tag never
-  // reach it: it is the primary band's run with the tier floors on. A page whose
-  // section is static (no kd: no recorded band, or its data could not be
-  // built) is left as Python drew it.
+  // (_KdVisitor). Its band, Tier floors choice, Add to held pairs choice,
+  // category and tag never reach it: it is the primary band's run with the
+  // tier floors on. A page whose section is static (no kd: no recorded band,
+  // or its data could not be built) is left as Python drew it.
   function renderKd() {
     var K = D.kd;
     if (!K || !byId('kd-equity')) { return; }
@@ -10200,10 +10299,11 @@ _FILTER_JS = r"""
   }
   // A browser can restore a <select>'s last choice on a reload, or on going
   // back; the page as rendered is the primary scenario's unfiltered view with
-  // the tier floors on, so the bar is set back to it. Python renders the selects disabled: they are
-  // enabled once the base block and the primary scenario's chunk are
-  // inflated, so no choice can be made (or lost) before it can be drawn — and
-  // a category or tag change never meets an unloaded chunk.
+  // the tier floors on and adding to held pairs off, so the bar is set back
+  // to it. Python renders the selects disabled: they are enabled once the
+  // base block and the primary scenario's chunk are inflated, so no choice
+  // can be made (or lost) before it can be drawn — and a category or tag
+  // change never meets an unloaded chunk.
   SELECTS.forEach(function(s) {
     s.selectedIndex = 0;
     for (var i = 0; i < s.options.length; i++) {

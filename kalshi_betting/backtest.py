@@ -8,10 +8,11 @@ Purpose:
     arguments (--start-date, --balance, --no-cache, --max-horizon-days,
     --interval-discount, --no-sweep, --same-event-ladders /
     --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
-    --no-cap-sweep, --no-add-on-sweep), configures logging to kalshi_backtest.log, constructs the necessary API
-    clients, delegates the full backtest simulation to
-    backtester.run_backtest_sweep(), and then calls
-    dashboard.generate_dashboard() to produce the interactive HTML report.
+    --no-cap-sweep, --no-add-on-sweep), configures logging to
+    kalshi_backtest.log, constructs the necessary API clients, delegates the
+    full backtest simulation to backtester.run_backtest_sweep(), and then
+    calls dashboard.generate_dashboard() to produce the interactive HTML
+    report.
     Prints a summary of key metrics (trade count, win rate, total return) to
     the log on completion, closed on every run by what settled-market corpus
     the run read (its assembly time, whether it was cached, and the archive
@@ -271,10 +272,10 @@ def main() -> None:
     --max-horizon-days, --interval-discount, --no-sweep,
     --same-event-ladders / --no-same-event-ladders, --spread-min,
     --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep),
-    configures logging, constructs
-    historical and live Kalshi API clients, runs the full backtest
-    simulation via run_backtest_sweep(), and generates an interactive HTML
-    dashboard via generate_dashboard(). Logs a summary table of key metrics to
+    configures logging, constructs historical and live Kalshi API clients,
+    runs the full backtest simulation via run_backtest_sweep(), and generates
+    an interactive HTML dashboard via generate_dashboard(). Logs a summary
+    table of key metrics to
     kalshi_backtest.log on completion (this module installs only a
     RotatingFileHandler, no console handler, so nothing reaches stdout).
 
@@ -382,11 +383,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--no-add-on-sweep", action="store_true",
-        help="Skip the dashboard's Add to held pairs view (the add-on runs are "
-             "simulated only when the dashboard is built; skipping them makes that "
-             "step faster). Backtest only — live runs add to held pairs when the "
-             "saved live defaults say so, or main.py's own --add-to-held-pairs / "
-             "--no-add-to-held-pairs for one live run",
+        help="Skip the dashboard's Add to held pairs choice: its simulations run "
+             "only while the dashboard is built, so skipping them makes that step "
+             "faster and leaves the choice disabled. Backtest only — live runs add "
+             "to held pairs when the saved live defaults say so, or main.py's own "
+             "--add-to-held-pairs / --no-add-to-held-pairs for one live run",
     )
     args = parser.parse_args()
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
@@ -647,8 +648,7 @@ def main() -> None:
     # (cap_sweep and tier_off_cap_sweep, None under --no-cap-sweep — every
     # cell of them is simulated here, in the page's one grid walk), the lazy
     # add-on sweeps (add_on_cap_sweep and add_on_tier_off_cap_sweep, None
-    # under --no-add-on-sweep) and the
-    # header's run-settings line;
+    # under --no-add-on-sweep) and the header's run-settings line;
     # interval_discount is the resolved k these trades were sized at, which
     # the Risk section's Kelly scatter must price on
     #

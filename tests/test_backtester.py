@@ -13638,8 +13638,9 @@ def add_on_run():
     family and one without the band sweep. Every simulation DURING the runs
     goes through a spy that records its keywords, and every run's INFO log is
     kept; the spy is undone before any cell is read, so the cells run the real
-    function. Pins apply_pre_toggle_defaults on its own MonkeyPatch, as
-    cap_sweep_run does."""
+    function. The clock is frozen while the runs go, so every equity frame the
+    tests compare across runs ends on one day. Pins apply_pre_toggle_defaults
+    on its own MonkeyPatch, as cap_sweep_run does."""
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     try:
@@ -13649,6 +13650,9 @@ def add_on_run():
         mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
         mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
         mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
+        mp.setattr(backtester, "datetime", type(
+            "Clock", (TestCapSweepEndDate._Clock,),
+            {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC)}))
         sims: list = []
         real = backtester._simulate_at_discount
 
@@ -13717,6 +13721,7 @@ class TestAddOnSweep:
 
     @staticmethod
     def _trades(point) -> list:
+        """A point's trades as plain tuples, for comparing two runs."""
         return [astuple(t) for t in point.trades]
 
     @classmethod
@@ -13759,8 +13764,8 @@ class TestAddOnSweep:
         assert self._others(add_on_run.msgs_on) == self._others(add_on_run.msgs_off)
         assert len(self._others(add_on_run.msgs_on)) > 20
         assert [m for m in add_on_run.msgs_off if m.startswith(self._ADDING)] == [
-            f"{self._ADDING} (backtest): simulated on demand for the dashboard's Add to "
-            "held pairs select; add-on sweep off"]
+            f"{self._ADDING} (backtest): off — the dashboard's Add to held pairs select "
+            "stays disabled"]
 
     def test_the_sweeps_axes_are_the_grids(self, add_on_run):
         on = add_on_run.on
@@ -13903,6 +13908,61 @@ class TestAddOnSweep:
             size_cap=0.05, quiet=True, add_to_held=True)
         assert fresh.equity_df["date"].iloc[-1] == date(2026, 9, 27)
 
+    class _DailyClock(TestCapSweepEndDate._Clock):
+        """A clock one day later on every now() call, so each eager point
+        ends its curve on a day of its own."""
+
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls += 1
+            moment = cls.moment + timedelta(days=cls.calls)
+            return moment if tz is None else moment.astimezone(tz)
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_every_cap_of_every_cell_ends_on_its_own_twin_s_day(self, monkeypatch):
+        """With a clock that moves on every read, each eager "all" point of
+        both families ends on a different day. Every cap of every cell must
+        still end on the day of its own (band, k) twin in ITS family: a cell
+        given the primary's day, or a tier-off cell the tier-on twin's, is
+        caught here. Reading cells never reads the clock."""
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
+        clock = type("Clock", (self._DailyClock,),
+                     {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC), "calls": 0})
+        monkeypatch.setattr(backtester, "datetime", clock)
+        run = run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                                 tier_off_sweep=True, add_on_sweep=True)
+        calls_after_the_run = clock.calls
+        families = []
+        for cs, scenarios in ((run.add_on_cap_sweep, run.scenarios),
+                              (run.add_on_tier_off_cap_sweep, run.tier_off_scenarios)):
+            twins = {key: point for key, point in self._eager(scenarios).items()
+                     if key[2] == "all"}
+            families.append((cs, twins, {key: backtester._curve_end_date(point)
+                                         for key, point in twins.items()}))
+        # Not vacuous: no two eager "all" points, tier-off twins included, end
+        # on the same day
+        every_day = [day for _cs, _twins, days in families for day in days.values()]
+        assert len(every_day) == len(set(every_day)) > 6
+        for cs, twins, days in families:
+            assert set(cs.end_dates) == {(b, k, "all") for b in cs.bands for k in cs.ks}
+            for band in cs.bands:
+                for k in cs.ks:
+                    assert cs.end_dates[(band, k, "all")] == days[(band, k, "all")]
+                    for cap, by_pop in cs.cell(band, k).items():
+                        point = by_pop["all"]
+                        assert point.equity_df["date"].iloc[-1] == days[(band, k, "all")], (
+                            band, k, cap)
+                        assert len(point.equity_df) == len(twins[(band, k, "all")].equity_df)
+            assert cs.simulated > 0
+        assert clock.calls == calls_after_the_run
+
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_the_summary_lines_name_the_grid(self, monkeypatch, caplog):
         golden = TestPrepareEntriesGolden()
@@ -13917,12 +13977,12 @@ class TestAddOnSweep:
         adding = [r.getMessage() for r in caplog.records
                   if r.getMessage().startswith("Adding to held pairs")]
         assert adding == [
-            "Adding to held pairs (backtest): simulated on demand for the dashboard's Add "
-            "to held pairs select; add-on sweep on",
-            "Adding to held pairs: size-cap sweep: 20 cap(s) x 4 band(s) x 3 k, the \"all\" "
-            "population only, simulated on demand when a report reads it",
-            "Adding to held pairs, tier floors off: size-cap sweep: 20 cap(s) x 2 binding "
-            "band(s) x 3 k, simulated on demand"]
+            "Adding to held pairs (backtest): on — the dashboard's Add to held pairs select "
+            "is simulated when the dashboard is built",
+            "Adding to held pairs: 20 size cap(s) x 4 band(s) x 3 k, all trades together, "
+            "each simulated when the dashboard reads it",
+            "Adding to held pairs, tier floors off: 20 size cap(s) x 2 band(s) the tiers "
+            "bind at x 3 k, each simulated when the dashboard reads it"]
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_the_setting_line_follows_the_checkpoint_line_and_the_cap_line_still_precedes_it(
@@ -13939,8 +13999,10 @@ class TestAddOnSweep:
                        if m.startswith("Per-trade size cap"))
             assert messages[cap + 1].startswith("Entry checkpoint (backtest):")
             assert messages[cap + 2] == (
-                "Adding to held pairs (backtest): simulated on demand for the dashboard's "
-                f"Add to held pairs select; add-on sweep {'on' if flag else 'off'}")
+                "Adding to held pairs (backtest): "
+                + ("on — the dashboard's Add to held pairs select is simulated when the "
+                   "dashboard is built" if flag else
+                   "off — the dashboard's Add to held pairs select stays disabled"))
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_the_infeasible_window_records_no_sweep(self, monkeypatch, caplog):
