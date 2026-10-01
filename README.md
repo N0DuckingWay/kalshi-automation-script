@@ -1370,7 +1370,7 @@ is *not* free: it is never slice-cached, so it is a sequential, one-page-at-a-
 time walk down created-time history that is re-paid on **every** run, rebuild or
 not. It stops after `ARCHIVE_MAX_BARREN_PAGES` (50) consecutive pages with no
 in-window settlement, and — because a single long-dated settler resets that
-counter — is hard-capped at `ARCHIVE_TAIL_MAX_PAGES` (2000) pages total, which
+counter — is hard-capped at `ARCHIVE_TAIL_MAX_PAGES` (10,000) pages total, which
 logs a WARNING when hit (markets created deeper than that may be missed; raise
 the constant if a run needs them).
 

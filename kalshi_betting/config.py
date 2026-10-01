@@ -1764,17 +1764,24 @@ ARCHIVE_MAX_BARREN_PAGES = 50
 
 # Absolute ceiling on how many pages the archive TAIL walk (the sequential
 # downward walk below created_time == start_date, historical._fetch_archive_tail)
-# may request — roughly 2M records of created-time depth below start_date at the
-# archive's 1000-record page cap. ARCHIVE_MAX_BARREN_PAGES above is the PRIMARY
-# stop rule; this is the backstop, because that rule only bounds depth PAST the
-# last productive page: a single long-dated in-window settlement resets the
-# barren counter, so without a ceiling the tail can crawl most of created-time
-# history one serial request at a time, uncached, on every run. When the cap is
-# hit, a WARNING names how many pages were walked and that very-long-lived
-# pre-start markets beyond it may be missed — the same bounded-scan idiom as
-# EVENT_TITLE_FALLBACK_MAX_LOOKUPS (bound the work, then say loudly what the
-# bound cost).
-ARCHIVE_TAIL_MAX_PAGES = 2000
+# may request — roughly 10M records of created-time depth below start_date at
+# the archive's 1000-record page cap. ARCHIVE_MAX_BARREN_PAGES above is the
+# PRIMARY stop rule; this is the backstop, because that rule only bounds depth
+# PAST the last productive page: a single long-dated in-window settlement resets
+# the barren counter, so without a ceiling the tail can crawl most of
+# created-time history one serial request at a time, uncached, on every run.
+# When the cap is hit, a WARNING names how many pages were walked and that
+# very-long-lived pre-start markets beyond it may be missed — the same
+# bounded-scan idiom as EVENT_TITLE_FALLBACK_MAX_LOOKUPS (bound the work, then
+# say loudly what the bound cost). It was 2000 until 2026-10-01, when a 365-day
+# run (start 2025-10-01) hit that cap while still finding about 340 in-window
+# markets per 100 pages (28,302 kept by page 2000). The walk took about 0.29 s
+# a page, so 10,000 pages is about 48 minutes, paid on every run that is not an
+# assembled-cache hit (a hit never walks the tail). Re-run the same day at
+# 10,000, the tail ended on the barren rule above at about page 2,800 (11
+# minutes) with 30,584 kept; every trade and entry count of that run matched
+# the 2000-page run's.
+ARCHIVE_TAIL_MAX_PAGES = 10_000
 
 # Hard ceiling on RECORDS the archive tail accumulates in memory, independent of
 # the page cap above. The tail and the two sequential fallbacks are the fetch
@@ -1783,12 +1790,13 @@ ARCHIVE_TAIL_MAX_PAGES = 2000
 # anonymous temporary spool file, historical._FrontierSpool), and
 # the tail is the one of them that applies no prefilter either, so its whole
 # unfiltered result is resident at once. ARCHIVE_TAIL_MAX_PAGES alone bounds
-# that at 2000 x 1000 x ~BACKTEST_RECORD_BYTES_ESTIMATE, i.e. roughly 5 GB,
+# that at 10,000 x 1000 x ~BACKTEST_RECORD_BYTES_ESTIMATE, i.e. roughly 27 GB,
 # which is the same OOM shape the sharded fetch was rewritten to avoid
 # (BS-15). The two caps COMPOSE: whichever binds first stops the walk, so the
 # real bound is min(pages x 1000, this) records. 500k at ~2.7 KB each is about
-# 1.3 GB — large enough that no realistic window reaches it, small enough that
-# a pathological one cannot take the host down. Hitting it logs a WARNING
+# 1.3 GB — large enough that no realistic window reaches it (the 2026-10-01
+# 365-day run kept 28,302 by page 2000), small enough that a pathological one
+# cannot take the host down. Hitting it logs a WARNING
 # naming the count, the same bound-the-work-then-say-so idiom as the page cap
 # and EVENT_TITLE_FALLBACK_MAX_LOOKUPS (TS-15).
 ARCHIVE_TAIL_MAX_RECORDS = 500_000

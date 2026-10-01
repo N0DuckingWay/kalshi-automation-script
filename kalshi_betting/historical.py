@@ -2737,8 +2737,8 @@ def _fetch_archive_tail(
         # binds first stops the walk. Like the two sequential fallbacks, this
         # walk has no chunked emit sink, so its whole result stays resident;
         # unlike them it is not `keep`-filtered, so this cap counts every
-        # in-window record. The page cap alone allows ~2M records (roughly
-        # 5 GB), the same OOM shape the sharded fetch exists to avoid (TS-15).
+        # in-window record. The page cap alone allows ~10M records (roughly
+        # 27 GB), the same OOM shape the sharded fetch exists to avoid (TS-15).
         if len(kept) >= ARCHIVE_TAIL_MAX_RECORDS:
             logging.warning(
                 "Historical archive tail: reached the %d-record cap "
