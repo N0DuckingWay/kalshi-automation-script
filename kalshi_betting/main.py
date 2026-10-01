@@ -1078,7 +1078,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     minimum-balance check is applied to it again.
 
     With settings.add_to_held_pairs on, it may add to an exact held pair
-    (scanner.held_pairs: the same two markets, the same side on each), sized
+    (scanner.held_pairs: the same two markets, the same side on each) or to a
+    lone held leg whose partner has paid out (a new pair buying that market
+    on its held side, beside a market not held), sized
     on the whole position (config.held_pair_fraction); only when the
     positions listing was read to its end, every held market was identified
     and Kalshi's value of the open positions was read and kept, and never to
@@ -1140,8 +1142,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         return EXIT_SKIPPED_LOW_BALANCE
 
     # Current open positions, each with its side and cost. A held market is
-    # never traded again, except an exact held pair this run's settings add to;
-    # held_listing["complete"] says whether the listing was read to its end
+    # never traded again, except an exact held pair or a lone held leg (its
+    # partner paid out) this run's settings add to; held_listing["complete"]
+    # says whether the listing was read to its end
     held_listing: dict = {}
     held_positions    = get_held_positions(client, complete_out=held_listing)
     held_tickers      = set(held_positions)
@@ -1270,8 +1273,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     markets           = filter_markets_within_horizon(markets, args.max_horizon_days)
 
     # Run both pair detection paths: time-series (the run's entry rule, and no
-    # pair on a ladder we hold but an exact held pair it adds to) and
-    # same-title (a held pair's markets pair only with each other)
+    # pair on a ladder we hold but one adding to an exact held pair or a lone
+    # held leg) and same-title (a held pair's markets pair only with each
+    # other, a lone leg only with a market not held)
     if held_ladders is None:
         time_series_pairs = []
     else:

@@ -4763,8 +4763,8 @@ def find_same_title_pairs(
     # CLAUDE.md specifies — not one per finder. The markets are still dropped
     # here either way; only the report is suppressed (TS-22).
     active = _filter_active_markets(markets, held_tickers, warn_missing_close=False)
-    # The exact held pairs the run may add to, and their markets, each of
-    # which may pair only with its own partner
+    # What the run may add to, and its markets: one of an exact pair pairs only
+    # with its own partner, a lone leg only with a market not held
     add_on_pairs = add_on_pairs or {}
     add_on_tickers = {ticker for key in add_on_pairs for ticker in key}
 

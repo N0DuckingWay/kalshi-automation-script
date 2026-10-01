@@ -671,40 +671,25 @@ def _carried_forward(values: Any) -> np.ndarray:
 
 class LegQuotes:
     """
-    One market's prices over the days a backtest trade in it can be open.
+    One market's asks over the days a backtest trade in it can be open.
 
-    The backtest values an open trade at market: each leg at the ask of the
-    side it holds (a YES leg at the YES ask, a NO leg at the NO ask), the
-    price live pays to add to a held pair. This object holds those asks for
-    one market, sampled at two kinds of moment, both from the candles the
-    backtest already fetched (_leg_quotes builds it; no candle list is kept):
-      * DAY-END samples, one per UTC day from first_day on: each side's
-        latest usable ask on a candle ending at or before the next UTC
-        midnight. The equity curve reads them (backtester._open_value_path).
-      * CHECKPOINT samples, one per entry checkpoint (the live run's weekly
-        moment, _checkpoint_datetime) from first_checkpoint on: each side's
-        latest usable ask on a candle ending at or before that moment. Pass 2
-        sizes on them (backtester._open_value).
-    A usable ask is a number strictly between 0 and 1 (a NO ask also below
-    _CANDLE_NO_ASK_CEILING, which may be an empty book; _usable_ask). So a
-    side keeps its last usable ask through an empty book (a YES ask of 1.00),
-    an unreadable candle, or the time between its last candle and its payout.
-    A sample at or after the market's settlement_ts is its payout, when the
-    result is known: 1.0 on the side that won and 0.0 on the other. A sample
-    before the side's first usable ask is NaN, and a lookup returns the leg's
-    entry price in its place. A day or checkpoint past the end of the arrays
-    (they end on the settlement date) reads the payout, or the last day-end
-    sample when the payout is unknown. There is no age limit: a leg that
-    stops trading keeps its last usable ask until it pays out.
+    The backtest values each open leg at the ask of the side it holds. This
+    holds one market's asks, from candles already fetched (_leg_quotes
+    builds it), sampled two ways:
+      * day-end, one per UTC day: the equity curve reads these
+        (_open_value_path);
+      * checkpoint, one per weekly entry checkpoint: Pass 2 sizes on these
+        (_leg_mark).
+    Each sample is the latest usable ask (_usable_ask) at or before that
+    moment, kept with no age limit; from settlement on it is the payout (1.0
+    or 0.0), and before the first usable ask it is NaN, read as the leg's
+    entry price. Past the arrays' end it reads the payout (or the last
+    day-end sample when the payout is unknown).
 
-    A plain class with __slots__ rather than a dataclass, so
-    dataclasses.astuple does not walk into it, and copying returns the
-    object itself: every trade of one run that holds a market shares one
-    LegQuotes. Two built from the same candles compare equal (ticker, grid
-    starts, arrays with NaN equal, payouts), so two runs' trades still
-    compare equal through astuple, and they share one `fingerprint`, which
-    the dashboard reads to tell two trade lists apart by their prices
-    (dashboard._list_key). The arrays are read-only.
+    A plain __slots__ class, not a dataclass, so astuple does not walk into
+    it and a copy is the object itself. Two built from the same candles
+    compare equal and share a `fingerprint` (read by dashboard._list_key).
+    The arrays are read-only.
 
     Attributes:
         ticker (str): The market's ticker.
@@ -1890,7 +1875,9 @@ class CapSweep:
                 on whatever day (UTC) the cell happens to be read.
         """
         out: dict[float, SweepPoint] = {}
-        # The peak is cap-independent, so the eager point's is this subset's
+        # The eager point is the one the backtest simulated during the run, at
+        # its own cap; its peak does not depend on the cap, so it is this
+        # subset's peak too
         seed = eager_point.peak_kelly_fraction if eager_point is not None else None
         # Every simulated cap ends its curve where the eager point's ended, not
         # on whatever day (UTC) this cell happens to be read; a cell with no
@@ -6119,12 +6106,13 @@ def _live_sizing_note(sweep: BacktestSweep) -> str:
 
 def _live_add_on_note(sweep: BacktestSweep) -> str:
     """
-    Say when the saved live defaults add to held pairs, which a run's primary never does.
+    Say when the saved live defaults add to held pairs and this run's headline figures do not.
 
-    No point a backtest run keeps adds to a pair it still holds, so a report
-    that names the live rule must say so when the saved defaults do. The log
-    line ends with this clause; it says nothing about where a report shows
-    adding to held pairs.
+    The backtest's own simulations (its primary scenario and every scenario
+    it runs) never add to held pairs. Only the dashboard's "Add to held
+    pairs: on" view does, simulated when the page is built. So when the
+    saved live defaults add to held pairs, the live-rule log line ends with
+    this clause, saying the primary differs from live there.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
@@ -6708,41 +6696,23 @@ def _simulate_at_discount(
     but never which Mondays pass the Kelly check or peak_kelly_fraction
     (CapSweep relies on this).
 
-    add_to_held lets the walk add to a pair it still holds, as the live
-    sizer does for a held pair. A candidate whose pair has an open trade,
-    with both of its markets not yet paid out on that Monday, may trade
-    again: the same two markets, bought the same way round, recorded as a
-    new trade (BacktestTrade.add_on) — the open trade is never changed. It
-    is refused when another open trade holds one of its markets' ladder
-    labels, or when its two markets share no label (live, scanner.held_pairs
-    adds only to two held markets that share a label and that no other held
-    market shares); those refusals, and the skip for a full-size pair, are
-    counted on their own lines. It is sized through
-    config.held_pair_fraction — the live sizer's own rule: Kelly sizes the
-    whole position, so the add-on stakes what the pair is missing of
-    min(pair cap, f*) of the portfolio value, the pair's open trades counted
-    at market (_open_value) plus the fees paid for them. The portfolio value
-    leaves those fees out, since they are spent, so a pair that took its
-    full share adds nothing at unchanged quotes unless the portfolio value
-    grows; a pair whose value has risen gets a smaller add-on, one whose
-    value has fallen a larger one. Like every trade it spends at most the cash left, so it never
-    stakes more than a new pair would. A pair that already holds that share
-    (a full-size pair) is skipped. Once an open trade's other market has paid
-    out, its remaining leg is a lone leg (live, scanner.held_pairs finds it
-    alone on its ladder): a new pair that buys the side held on that market,
-    beside a market no open trade holds, may add to it
-    (_lone_leg_records), refused when another open trade holds a ladder
-    label of either market, and sized by the same rule with that leg alone
-    as the stake (_open_leg_stake: its value at market plus its fee). A same-title pair then also keeps its
-    later passing Mondays that have the first one's legs the same way round
-    (its pricier side is decided again every Monday, and the other way round
-    is the opposite trade); those can only add to its open trade, and only
-    the group winner's are kept. The cap reaches an add-on only through
-    min(pair cap, f*), exactly as it reaches any trade, so
-    peak_kelly_fraction — which covers those Mondays too — still marks the
-    cap above which the whole walk is the same. With add_to_held off (the
-    default) none of this runs: no add-on state is kept and no add-on line
-    is logged.
+    add_to_held lets the walk add to what it still holds, as live does, each
+    add-on a new trade (BacktestTrade.add_on):
+      * a pair with an open trade, neither market paid out, may trade again
+        the same way round;
+      * once one market of an open trade has paid out, a new pair may add to
+        the other (a lone leg, _lone_leg_records) on its held side, beside a
+        market no open trade holds;
+      * a same-title pair also keeps its later passing Mondays with the same
+        legs the same way round, which can only add to its open trade.
+    An add-on is refused when its markets share no ladder label or another
+    open trade holds one, and sized by config.held_pair_fraction on what is
+    held (open trades at market plus their fees; a lone leg alone,
+    _open_leg_stake), so it never stakes more than a new pair would, and is
+    skipped when that is already a full share. The cap reaches it only
+    through min(pair cap, f*), so peak_kelly_fraction still marks the cap
+    above which the walk is the same. Off by default: no add-on state is
+    kept and no add-on line is logged.
 
     Args:
         raw_entries (list[dict]): Prepared entries, one record per pair.
@@ -7222,16 +7192,9 @@ def _simulate_at_discount(
                 add_on_ladder_skips += 1
                 continue
         elif held is not None:
-            # An add-on holds only its own ladders: its two markets must share
-            # one (live, scanner.held_pairs joins held markets by a shared
-            # label, so a pair sharing none is never added to there), and any
-            # other open trade holding one of them refuses it (live adds only
-            # to a held pair no other held market shares a ladder with).
-            # Counted on its own line, since the ladder line counts
-            # time-series pairs held back from opening. Its own trades' ladder
-            # holds are all still open here (both its markets are unpaid), so
-            # they are exactly held["ladders"]; any excess belongs to another
-            # trade.
+            # As live: its two markets must share a ladder, and a hold by any
+            # other open trade (beyond its own, held["ladders"]) refuses it,
+            # counted on its own line
             if not (ladders_a & ladders_b) or any(
                     open_ladders.get(key, 0) > held["ladders"][key]
                     for key in (*ladders_a, *ladders_b)):
