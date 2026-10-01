@@ -46,7 +46,7 @@ Purpose:
         port).
 
     Each run is its own `python -m kalshi_betting.main --mode prod` process,
-    started with all seven toggles as explicit flags (config.live_settings_argv)
+    started with all eight toggles as explicit flags (config.live_settings_argv)
     so it trades exactly what its page showed, in a new session (so Ctrl-C on
     this server, or closing its terminal, never reaches it), from
     config.PROJECT_ROOT, writing everything it prints to its own folder under
@@ -54,14 +54,15 @@ Purpose:
 
 Dependencies:
     Imports config and run_lock only (besides the standard library). From
-    config: LiveSettings, LIVE_TOGGLE_FIELDS (the seven toggle names the
+    config: LiveSettings, LIVE_TOGGLE_FIELDS (the eight toggle names the
     fingerprint reads), LiveDefaultsError (a refused saved file) and the
     saved-defaults helpers (read_saved_live_defaults, save_live_defaults,
     live_settings_changes, describe_live_settings, live_rule_warnings,
     live_defaults_source), live_settings_argv (a run's flags), the seed values
     and their source note, the source-note pattern, the exit codes, the run
     result's format tag and the DEFAULTS_SERVER_*, DASHBOARD_FILENAME,
-    DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_* constants. From run_lock:
+    DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_* constants, and count_text
+    (a run page writes an add-on's held count exactly). From run_lock:
     held() and holder(), to refuse a real-money run while another live
     trading run holds the machine's lock.
     It reads config.LIVE_DEFAULTS_FILE, config.PROJECT_ROOT,
@@ -193,6 +194,7 @@ from .config import (
     SCHEDULER_STATE_FILENAME,
     LiveDefaultsError,
     LiveSettings,
+    count_text,
     describe_live_settings,
     live_defaults_source,
     live_rule_warnings,
@@ -205,10 +207,10 @@ from .config import (
 # The fields a confirmation request carries, in the GET query and repeated in
 # the POST body; the signed text is built from exactly these, as raw strings
 _FIELDS = ("tier_floors", "spread_min", "spread_max", "k", "size_cap",
-           "same_title_size_cap", "category", "tag", "source")
+           "same_title_size_cap", "add_to_held_pairs", "category", "tag", "source")
 # The fields a proposal must carry; every other one may be left out
 _REQUIRED = ("tier_floors", "spread_min", "spread_max", "k", "size_cap")
-# The largest number of fields a query or form may hold (its nine fields plus
+# The largest number of fields a query or form may hold (its ten fields plus
 # the fingerprint, nonce, token, action and acknowledgement, with room to
 # spare); more is refused unread
 _MAX_FIELDS = 20
@@ -405,12 +407,16 @@ _CLEAN_EXITS = frozenset({EXIT_OK, EXIT_TIME_SERIES_SKIPPED})
 # result ({why} says how it ended). After a V2 order-mapping disproof every new
 # real-money run is a new process that would open another wrong-side position,
 # so _ATTENTION_TAIL names every way one starts: the scheduler daemon, main.py
-# by hand and this page's Confirm and trade.
+# by hand and this page's Confirm and trade. What to undo by hand is what the
+# run's CRITICAL names: a market the account held before the run (a pair it
+# added to, or an earlier trade) goes back to what it held, never to 0.
 _ATTENTION_TAIL = (" ended needing manual attention ({why}). Read its result first. If it "
-                   "reports a V2 order-mapping disproof, stop trading and flatten by hand in "
-                   "the Kalshi UI: a new real-money run would open another wrong-side "
-                   "position, so stop the scheduler daemon if it is running, do not run "
-                   "main.py --mode prod, and do not press Confirm and trade.")
+                   "reports a V2 order-mapping disproof, stop trading (a new real-money run "
+                   "would open another wrong-side position, so stop the scheduler daemon if "
+                   "it is running, do not run main.py --mode prod, and do not press Confirm "
+                   "and trade), then undo by hand in the Kalshi UI what its CRITICAL names: "
+                   "close out a market the account did not hold before the run, and put one "
+                   "it did hold back to what it held.")
 _UNCLEAN_TAIL = " ended without a clean result ({why}). " + _CHECK_POSITIONS
 
 # The attention warning when the runs' records could not be read at all: it
@@ -744,14 +750,21 @@ def _proposal(params: dict[str, list[str]],
     Turn a confirmation request's fields into the proposed live defaults.
 
     tier_floors ("on" / "off"), spread_min, spread_max, k and size_cap (a
-    fraction, e.g. 0.2) are required. same_title_size_cap may be left out,
-    and then keeps the saved value (or the seed's when none is saved); it is
-    the only field that falls back to what is saved. A missing category or
-    tag means any, whatever is saved; a tag needs its category. source is
-    the note the saved file will keep: left out, it is empty; given, it must
-    be one of the two shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows,
-    with ASCII digits only, and the seed's note (LIVE_DEFAULTS_SEED_SOURCE)
-    may label only the seed values themselves.
+    fraction, e.g. 0.2) are required. same_title_size_cap and
+    add_to_held_pairs ("on" / "off") may be left out, and each then keeps the
+    saved value (or the seed's when none is saved); they are the only two
+    fields that fall back to what is saved, so a link that leaves one out
+    keeps it as it is (the dashboard's save button leaves the same-title cap
+    out when its run recorded none, and the add-to-held choice out on a page
+    that does not show it). One exception: a link carrying the seed's note
+    that leaves add_to_held_pairs out takes the seed's value, so it still
+    proposes exactly the seed, and the page shows the change against what is
+    saved. A missing category or tag means any, whatever is saved; a tag needs
+    its category. source is the note the saved file will keep: left out, it
+    is empty; given, it must be one of the two shapes
+    config.LIVE_DEFAULTS_SOURCE_PATTERN allows, with ASCII digits only, and
+    the seed's note (LIVE_DEFAULTS_SEED_SOURCE) may label only the seed
+    values themselves.
 
     Args:
         params (dict[str, list[str]]): The request's fields (_params).
@@ -764,7 +777,8 @@ def _proposal(params: dict[str, list[str]],
     Raises:
         ValueError: Naming the first rule the request breaks: an unknown,
             repeated, blank or missing field, a value that is not a plain
-            number or a printable name, a tag without a category, a source
+            number or a printable name, a tier_floors or add_to_held_pairs
+            other than on or off, a tag without a category, a source
             of another shape, any value LiveSettings refuses, or the seed's
             note on other values.
     """
@@ -788,6 +802,17 @@ def _proposal(params: dict[str, list[str]],
         same_title = current.same_title_size_cap
     else:
         same_title = LIVE_DEFAULTS_SEED.same_title_size_cap
+    if "add_to_held_pairs" in value:
+        if value["add_to_held_pairs"] not in ("on", "off"):
+            raise ValueError("add_to_held_pairs must be on or off, got "
+                             f"{value['add_to_held_pairs']!r}")
+        add_on = value["add_to_held_pairs"] == "on"
+    elif current is not None and value.get("source") != LIVE_DEFAULTS_SEED_SOURCE:
+        add_on = current.add_to_held_pairs
+    else:
+        # No defaults saved, or a seed link: the seed's value, so a seed link
+        # that leaves the field out still proposes exactly the seed
+        add_on = LIVE_DEFAULTS_SEED.add_to_held_pairs
     if "tag" in value and "category" not in value:
         raise ValueError("a tag needs its category")
     categories = (_name(value["category"], "category"),) if "category" in value else None
@@ -813,6 +838,7 @@ def _proposal(params: dict[str, list[str]],
         same_title_size_cap=same_title,
         categories=categories,
         tags=tags,
+        add_to_held_pairs=add_on,
     )
     # The seed's note names the seed values, so it may label nothing else
     if source == LIVE_DEFAULTS_SEED_SOURCE and settings != LIVE_DEFAULTS_SEED:
@@ -825,9 +851,9 @@ def _seed_query() -> str:
     """
     Build the confirmation page's query that proposes LIVE_DEFAULTS_SEED.
 
-    Each number is written as its repr (the exact float), the source note is
-    LIVE_DEFAULTS_SEED_SOURCE, and a category or tag is added only when the
-    seed sets one (it sets none: any).
+    Each number is written as its repr (the exact float), adding to held
+    pairs as on or off, the source note is LIVE_DEFAULTS_SEED_SOURCE, and a
+    category or tag is added only when the seed sets one (it sets none: any).
 
     Returns:
         str: The query string, without the "?".
@@ -840,6 +866,7 @@ def _seed_query() -> str:
         ("k", repr(seed.interval_discount)),
         ("size_cap", repr(seed.size_cap)),
         ("same_title_size_cap", repr(seed.same_title_size_cap)),
+        ("add_to_held_pairs", "on" if seed.add_to_held_pairs else "off"),
     ]
     pairs += [("category", name) for name in seed.categories or ()]
     pairs += [("tag", name) for name in seed.tags or ()]
@@ -875,7 +902,7 @@ def _fingerprint(current: LiveSettings | None) -> str:
         current (LiveSettings | None): The saved defaults, or None when none are saved.
 
     Returns:
-        str: The SHA-256 hex digest of "none", or of the origin and the seven
+        str: The SHA-256 hex digest of "none", or of the origin and the eight
             toggles as JSON.
     """
     if current is None:
@@ -1393,7 +1420,8 @@ def _read_result(folder: Path) -> _Result:
                        "pair_type": _text(trade.get("pair_type")),
                        "a": _leg(trade.get("a")), "b": _leg(trade.get("b")),
                        "cost_with_fees": _finite(trade.get("cost_with_fees")),
-                       "profit_if_won": _finite(trade.get("profit_if_won"))})
+                       "profit_if_won": _finite(trade.get("profit_if_won")),
+                       "adds_to_held": _finite(trade.get("adds_to_held"))})
     warnings = raw.get("warnings") if isinstance(raw.get("warnings"), list) else []
     dropped = _int(raw.get("warnings_dropped"))
     return _Result("ok", {
@@ -1796,6 +1824,9 @@ def _trades_html(trades: list[dict]) -> str:
     """
     Show a run's pairs as tables: needs attention, completed, would have traded, not completed.
 
+    A pair's Note is the trader's error, if any, followed by "(adds to N
+    held)" for a trade that added to a pair the account already held.
+
     Args:
         trades (list[dict]): The run result's pairs (_read_result).
 
@@ -1818,10 +1849,15 @@ def _trades_html(trades: list[dict]) -> str:
             continue
         body = []
         for t in rows:
+            # A trade that added to a held pair says how much was held there
+            note = " ".join(part for part in (
+                t["error"] or "",
+                f"(adds to {count_text(t['adds_to_held'])} held)"
+                if (t["adds_to_held"] or 0) > 0 else "",
+            ) if part)
             cells = (t["status"], t["pair_type"] or "—", _market_text(t["a"]),
                      _leg_text(t["a"]), _market_text(t["b"]), _leg_text(t["b"]),
-                     _money(t["cost_with_fees"]), _money(t["profit_if_won"]),
-                     t["error"] or "")
+                     _money(t["cost_with_fees"]), _money(t["profit_if_won"]), note)
             body.append("<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in cells) + "</tr>")
         parts.append(f"<h2>{html.escape(label)}</h2>\n<table>{head}{''.join(body)}</table>")
     return "\n".join(parts)
@@ -2792,7 +2828,7 @@ class _App:
         The one place the server starts a process. It makes the run's folder
         under config.LIVE_RUNS_DIR, writes run.json (what the run is) before
         anything starts, locks output.log and starts
-        `python -m kalshi_betting.main --mode prod` with all seven toggles as
+        `python -m kalshi_betting.main --mode prod` with all eight toggles as
         flags (config.live_settings_argv), --result-file in the folder and,
         for a dry run, --dry-run, from config.PROJECT_ROOT, its output going
         to output.log. The process inherits the lock through its output, so
@@ -2821,7 +2857,7 @@ class _App:
         started = datetime.now(UTC)
         folder = config.LIVE_RUNS_DIR / f"{started.strftime(_FOLDER_TIME)}-{run_id}"
         folder.mkdir(parents=True)
-        # All seven toggles as flags, so the run trades exactly these settings
+        # All eight toggles as flags, so the run trades exactly these settings
         argv = [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
                 *live_settings_argv(settings), "--result-file", str(folder / _RESULT_NAME)]
         if dry_run:

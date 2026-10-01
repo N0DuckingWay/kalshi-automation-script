@@ -58,6 +58,21 @@ data or the operator's machine · **[decision]** needs an operator call before a
 - [ ] **`TRADER_MAX_WORKERS` never exercised at scale** against the live API (`config.py:1351-1358`).
 - [ ] **Existing `trade_log.xlsx` keeps its old header row** (no migration; `reporter.py:213-216,
   432-434`). Decide whether to rewrite headers once.
+- [ ] **Reduce-only unwind and NO buy against an existing, larger NO position.** Never observed live
+  (the probe only closes from flat); watch the first add-on rollback, and the case where a
+  process's first NO fill is an add-on (`trader.py`, `_add_on_mismatch`/`_rollback_no_leg`).
+- [ ] **First `--add-to-held-pairs` dry run.** Before adding to held pairs goes on for every run,
+  follow the first-run order (README "Save the live defaults"; the deploy steps in `CLAUDE.md`'s
+  saved-live-defaults paragraph): save the seed values with adding off, run
+  `python3 -m kalshi_betting.main --mode prod --dry-run --add-to-held-pairs`, check that its
+  `Sizing on portfolio value` line shows the open positions as a dollar figure (not `not read`) with
+  no WARNING refusing them, check each `Held pair to add to: …` line's cost and fees against its fills
+  in the Kalshi UI and its `worth $W at today's prices` against the asks there, then turn adding on. That
+  `market_exposure_dollars` is the cost without fees, positive for a NO position, and falls with a
+  partial close is inferred from the API reference's one-line description, not observed
+  (`scanner.get_held_positions`, `scanner.held_pairs`; DR-77 in `CLAUDE.md`). Nor has a live
+  `portfolio_value` been checked against `main._checked_positions_value`'s $1-a-contract bound, or
+  compared with the held pairs' worth at the asks (Kalshi's own valuation; the two need not agree).
 
 ## 3. Pending operator decisions  [decision]
 
@@ -73,14 +88,21 @@ data or the operator's machine · **[decision]** needs an operator call before a
 - [ ] **Same-title close-gate bound: 1 h vs 15 min.** 15 min gives the same result on the 365-day
   corpus with ~1 h more margin (CLAUDE.md DR-74 table; `config.py:219`).
 - [ ] **Widen market-eligibility bounds (0.01/0.99)?** Deliberately held (`scanner.py:458-464`).
-- [ ] **Same-title stacking across weeks** is out of scope of DR-76 (`main.py:1022` passes no
-  `held_ladders` to the same-title finder). Confirm that's still the intent.
+- [ ] **Same-title stacking across weeks** is out of scope of DR-76: its held-ladder rule refuses
+  time-series pairs only (in `find_time_series_pairs` and `select_portfolio`), so a later run can
+  trade another same-title pair of a question it already holds one on; and with `add_to_held_pairs` on it may also add to the
+  exact same-title pair it holds (DR-77). Confirm that's still the intent.
 
 ## 4. Backtest fidelity  [bt]
 
 - [ ] **Re-measure the headline numbers after DR-75/DR-76 and the v3 checkpoint prefilter.** Ladder
   backtest figures and RAM-warning eligible counts in `config.py` are marked "not re-measured"
   (`config.py:352-355, 1176-1179`).
+- [ ] **Re-measure the add-on figures now that a held pair's stake counts its fees** (operator
+  decision 2026-09-30) and trades are sized on the portfolio value: the Kelly chart's smallest
+  add-on y/x (0.002, CLAUDE.md's add-on select paragraph), and the add-on family's times and page
+  sizes (CLAUDE.md's add-on family paragraph, README's "Cost of the family"). The golden fixture's
+  add-on counts and sizes were re-measured on 2026-09-30 (CLAUDE.md's backtest add-on paragraph).
 - [ ] **No candle-staleness bound and no crossed-book guard in `_find_entry`**, while live fails
   closed on both (`backtester.py:3826-3834, 3852-3945`; `scanner.py:5111-5115`). Will move every
   result when fixed.

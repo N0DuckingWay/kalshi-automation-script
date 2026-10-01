@@ -22,6 +22,10 @@ And --no-cap-sweep: the per-trade size-cap sweep is on by default
 (cap_sweep=True), the flag threads cap_sweep=False, and the echo line names
 the setting.
 
+And --no-add-on-sweep: the dashboard's Add to held pairs family is on by
+default (add_on_sweep=True), the flag threads add_on_sweep=False, and the echo
+line names the setting right after the cap sweep's.
+
 And the echo's "live rule=" clause: the saved live defaults' rule (with their
 origin), "none saved" with no file, "not recorded" with a refused one — a read
 of its own, never a scenario of this run and never config.py's toggles. And the
@@ -486,6 +490,40 @@ class TestCapSweepArgument:
         assert "cap sweep=off" in text
         # The earlier fields other tests and tooling grep for are unchanged
         assert "k=0.620" in text and "spread band=0-1" in text and "band sweep=on" in text
+
+
+class TestAddOnSweepArgument:
+    """--no-add-on-sweep: the "Add to held pairs" family is ON by default, like
+    the cap sweep, and the flag threads add_on_sweep=False into
+    run_backtest_sweep."""
+
+    def test_add_on_sweep_is_on_by_default(self, cli, monkeypatch):
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["add_on_sweep"] is True
+
+    def test_no_add_on_sweep_turns_it_off(self, cli, monkeypatch):
+        _run(monkeypatch, "--no-add-on-sweep")
+        assert cli["sweep_kwargs"]["add_on_sweep"] is False
+
+    def test_it_is_independent_of_the_other_sweeps(self, cli, monkeypatch):
+        _run(monkeypatch, "--no-band-sweep", "--no-cap-sweep", "--no-sweep")
+        kwargs = cli["sweep_kwargs"]
+        assert (kwargs["add_on_sweep"], kwargs["band_sweep"], kwargs["cap_sweep"],
+                kwargs["sweep"]) == (True, False, False, False)
+        _run(monkeypatch, "--no-add-on-sweep")
+        kwargs = cli["sweep_kwargs"]
+        assert (kwargs["add_on_sweep"], kwargs["band_sweep"], kwargs["cap_sweep"],
+                kwargs["sweep"]) == (False, True, True, True)
+
+    def test_the_echo_names_the_setting_after_the_cap_sweep(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        # The band and cap sweeps' substrings other tests read stay a prefix
+        assert "| band sweep=on | cap sweep=on | add-on sweep=on | live rule=" in caplog.text
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--no-add-on-sweep", "--no-cap-sweep")
+        assert "| cap sweep=off | add-on sweep=off | live rule=" in caplog.text
 
 
 class TestLiveRuleEcho:

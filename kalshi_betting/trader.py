@@ -18,16 +18,19 @@ Purpose:
     since the pre-execution check is killed instead of filling at a loss. If
     the YES leg does not fill, the NO leg is undone at once (the "rollback"
     or "unwind") by an order whose price is capped at the NO leg's entry less
-    config.ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, never an unpriced order. An
-    unwind that does not close the whole position is reported as
-    "rollback_failed", naming how many NO contracts are still open when the
-    reply says. Pairs run in parallel threads (ThreadPoolExecutor) — except
-    that until this process has confirmed or disproven the NO-leg side
-    mapping they run one at a time (see execute_trades) — and every
-    order and collateral-transfer POST first waits its turn on
-    _ORDER_WRITE_PACER, a shared rate limiter (config.ORDER_WRITES_PER_SECOND,
-    bursts of config.ORDER_WRITE_BURST), so the account stays under Kalshi's
-    write limit.
+    config.ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, never an unpriced order. The
+    unwind's count is always this pair's NO count, and it is sent only once
+    this pair's NO order is known to have filled, so on a market the account
+    already held it closes only this pair's contracts (Kalshi nets every trade
+    on a market into one position). An unwind that does not close all of this
+    pair's NO contracts is reported as "rollback_failed", naming how many are
+    still open when the reply says. Pairs run in parallel threads
+    (ThreadPoolExecutor) — except that until this process has confirmed or
+    disproven the NO-leg side mapping they run one at a time (see
+    execute_trades) — and every order and collateral-transfer POST first
+    waits its turn on _ORDER_WRITE_PACER, a shared rate limiter
+    (config.ORDER_WRITES_PER_SECOND, bursts of config.ORDER_WRITE_BURST), so
+    the account stays under Kalshi's write limit.
 
     Every order goes to Kalshi's V2 create-order endpoint, POST
     config.V2_ORDER_PATH (/portfolio/events/orders), the bot's only order
@@ -45,6 +48,21 @@ Purpose:
     reduce_only. Kalshi answers a fill_or_kill order it could not fill with
     an HTTP 409 error, which _submit_order_v2 returns as "canceled"
     (_is_fok_kill).
+
+    A pair can add to a pair the account already holds (scanner.pair_held:
+    the same two tickers, the same side on each). Just before its NO leg is
+    sent, the trader checks that each leg buys the side held on its market
+    and that both positions still read exactly the held count; otherwise (a
+    position that could not be read included) it sends nothing
+    (_add_on_mismatch). Every alert that has the position read before the
+    pair — the ORPHANED POSITION and "could NOT be attributed" CRITICALs,
+    both disproof CRITICALs and their list of earlier unchecked pairs — names
+    what the account held there when that was not zero, in plain words ("30
+    NO contracts", _held_words), and says to put the position back to it
+    rather than close it out (_pre_pair_note, _restore_remedy): closing it
+    out would close the older contracts too. The worker-crash CRITICAL in
+    execute_trades has no such reading; for an add-on it names the held
+    pair's count instead.
 
     An exception from a submission does not prove the order failed (a
     timeout can arrive after the fill), so the outcome is then judged from
@@ -64,7 +82,7 @@ Purpose:
     the chance of submitting orders against a stale price.
 
     ensure_shard_collateral() moves cash between shards before trading:
-    sizing uses the whole balance, but each order is paid from its own
+    sizing counts every shard's cash, but each order is paid from its own
     market's shard. It totals what each shard needs, plans transfers from
     shards with spare cash, sends each transfer once to config.TRANSFER_PATH,
     and waits until the money has arrived; trades on a shard it could not
@@ -72,10 +90,12 @@ Purpose:
 
 Dependencies:
     Imports from config.py (the order, transfer and write-pacing settings,
-    LiveSettings, live_settings, and leg_cash_cents, which rounds a leg's cost
-    up to the cent); scanner.py (each leg's side and price, the price-grid
-    math, validate_pair_price); _http.py (signed requests, retried position
-    reads and readers for error replies); auth.py (read_shard_balances);
+    LiveSettings, live_settings, leg_cash_cents, which rounds a leg's cost up
+    to the cent, and count_text, which writes a contract count exactly in an
+    alert or a marker); scanner.py (each leg's side and price, pair_held,
+    which says which held pair, if any, a pair adds to, the price-grid math,
+    validate_pair_price); _http.py (signed requests, retried position reads
+    and readers for error replies); auth.py (read_shard_balances);
     reporter.py (TradeResult); strategy.py (TradeSpec); and ApiException from
     the kalshi_python_sync SDK. scanner's ceil_to_tick and v2_limit_price are
     re-exported here as _ceil_to_tick and _v2_limit_price. Called by main.py
@@ -181,6 +201,7 @@ from .config import (
     V2_ROLLBACK_BID_PRICE_DOLLARS,
     V2_SELF_TRADE_PREVENTION_TYPE,
     LiveSettings,
+    count_text,
     leg_cash_cents,
     live_settings,
 )
@@ -189,6 +210,7 @@ from .scanner import (
     ceil_to_tick,
     leg_prices,
     leg_sides,
+    pair_held,
     tick_size_for_price,
     v2_limit_price,
     validate_pair_price,
@@ -334,11 +356,12 @@ _V2_NO_MAPPING_CONFIRMED = False
 # _execute_one stops each later pair before it reads a position or builds an
 # order (status "failed", nothing submitted), and a pair whose NO leg filled
 # before the stop reached it stops at manual_review before its YES leg. The
-# CRITICAL logged at the disproof tells the operator to stop trading and
-# flatten by hand, so the bot must not keep opening positions on the same
-# mapping for the rest of the run. Only a new process clears it; like the
-# confirmation latch it is never persisted, so a scheduled run the next week
-# starts clear.
+# CRITICAL logged at the disproof tells the operator to stop trading and undo
+# the position by hand (flatten it, or bring it back to what the account held
+# there before the pair — _restore_remedy), so the bot must not keep opening
+# positions on the same mapping for the rest of the run. Only a new process
+# clears it; like the confirmation latch it is never persisted, so a
+# scheduled run the next week starts clear.
 # Each run the defaults server's Confirm and trade starts is a new process too,
 # so both disproof CRITICALs (the mapping check's and the ambiguous NO leg's)
 # name every way a real-money run starts: the scheduler daemon, main.py by
@@ -353,6 +376,14 @@ _V2_NO_MAPPING_DISPROVEN = False
 # them so a human checks them too. Appended to from worker threads (a list
 # append is atomic under the GIL) and cleared only with the process.
 _V2_UNCHECKED_NO_LEGS: list[str] = []
+
+# Beside _V2_UNCHECKED_NO_LEGS: for each of those tickers whose position read
+# before its pair was a number other than zero (an earlier trade's contracts,
+# or the held pair an add-on adds to), that reading. The disproof's CRITICAL
+# names it, so a human puts the position back to it rather than flattening the
+# older contracts too. Filled from worker threads (a dict assignment is atomic
+# under the GIL) and cleared only with the process.
+_V2_UNCHECKED_BASELINES: dict[str, float] = {}
 
 # Pause before re-reading a ZERO position delta in _execute_one's two
 # ambiguous-leg branches (the human-run V2 probe reads it too): a position
@@ -972,13 +1003,16 @@ def _build_rollback_order_v2(no_leg: _Leg) -> dict:
     Build the V2 order body that unwinds (closes) a filled NO leg.
 
     Holding NO is being short YES, so the unwind is a YES bid ("close_no" in
-    _V2_LEG_SIDE). reduce_only means it can only shrink an existing position,
-    so it is safe even when it is unclear whether the NO leg filled. Its
-    price is the loss-capped bid from _v2_rollback_price. It is
-    immediate_or_cancel (fills what it can at once and cancels the rest), the
-    only time-in-force the endpoint accepts with reduce_only, so it may close
-    only part of the position; _rollback_no_leg reports anything short of a
-    full close as rollback_failed.
+    _V2_LEG_SIDE). Its count is this pair's NO count, never a position read.
+    reduce_only means it can only shrink an existing position, never open
+    one, but on a market the account already held it would shrink the older
+    contracts just as readily: that is why _execute_one sends it only after
+    this pair's NO order is known to have filled. Its price is the
+    loss-capped bid from _v2_rollback_price. It is immediate_or_cancel (fills
+    what it can at once and cancels the rest), the only time-in-force the
+    endpoint accepts with reduce_only, so it may close only part of this
+    pair's NO contracts; _rollback_no_leg reports anything short of a full
+    close as rollback_failed.
 
     Args:
         no_leg (_Leg): The NO leg to unwind (market_a for a same_title pair,
@@ -999,9 +1033,9 @@ def _build_rollback_order_v2(no_leg: _Leg) -> dict:
         # immediate_or_cancel, not fill_or_kill: the exchange rejects a
         # reduce_only order with any other time in force. It fills what rests
         # at or under the loss-floored cap and cancels the rest (nothing is
-        # left resting), so it can close only part of the position;
-        # _rollback_no_leg reports anything short of a full close as
-        # rollback_failed.
+        # left resting), so it can close only part of this pair's NO
+        # contracts; _rollback_no_leg reports anything short of a full close
+        # as rollback_failed.
         "time_in_force": "immediate_or_cancel",
         # Required by the V2 endpoint — see config.V2_SELF_TRADE_PREVENTION_TYPE
         "self_trade_prevention_type": V2_SELF_TRADE_PREVENTION_TYPE,
@@ -1009,8 +1043,9 @@ def _build_rollback_order_v2(no_leg: _Leg) -> dict:
         # shard the NO-leg order opened the position on. Explicit, never -1
         # auto-route — see _build_no_order_v2
         "exchange_index": no_leg.market.exchange_index,
-        # Can only reduce an existing position — never opens exposure even if
-        # the NO leg turns out not to have filled after all
+        # Can only reduce an existing position, never open one. On a market
+        # the account already held it would reduce the older contracts too,
+        # so it is sent only after this pair's NO fill is confirmed
         "reduce_only": True,
         "post_only": False,
     }
@@ -1393,6 +1428,110 @@ def _fill_delta(before: float | None, after: float | None) -> float | None:
     return after - before
 
 
+def _flat_before(before: float | None) -> bool:
+    """
+    Say whether a market read flat before this pair, or could not be read.
+
+    A reading that is not a finite number (the positions listing sent
+    something like "nan") counts as unread. The remedy texts treat an unread
+    reading like a flat one, so their words are exactly what they are for a
+    pair on a market the account did not hold.
+
+    Args:
+        before (float | None): The market's signed position read before this
+            pair's first order, or None when that read failed.
+
+    Returns:
+        bool: True when the reading is None, not a finite number, or within
+            _DELTA_EPS of zero.
+    """
+    return before is None or not math.isfinite(before) or abs(before) < _DELTA_EPS
+
+
+def _held_words(position: float | None) -> str:
+    """
+    Say a signed position in plain words, as the Kalshi UI shows it.
+
+    Kalshi signs a position: NO contracts read negative and YES contracts
+    positive. So -30 reads "30 NO contracts" and 12 reads "12 YES contracts",
+    the numbers written exactly (config.count_text).
+
+    Args:
+        position (float | None): A signed position, or None when it could not
+            be read.
+
+    Returns:
+        str: "nothing" within _DELTA_EPS of zero; "N NO contracts" or "N YES
+            contracts" ("1 NO contract" for one) otherwise; "an unreadable
+            position" for None or a reading that is not a finite number.
+    """
+    if position is None or not math.isfinite(position):
+        return "an unreadable position"
+    if abs(position) < _DELTA_EPS:
+        return "nothing"
+    # Cross-module: the count written exactly, never rounded as %g does
+    count = count_text(abs(position))
+    side = "NO" if position < 0 else "YES"
+    return f"{count} {side} {'contract' if count == '1' else 'contracts'}"
+
+
+def _pre_pair_note(ticker: str, before: float | None) -> str:
+    """
+    Name what the account held on a ticker before this pair, when it was not zero.
+
+    Kalshi nets every trade on a market into one position, so when the account
+    already held a market (an earlier trade's contracts, or the held pair an
+    add-on adds to), a person handling this pair's alert must close or restore
+    only this pair's contracts there, never the older ones. The alerts that
+    name a position this pair may have moved carry this sentence.
+
+    Args:
+        ticker (str): The market's ticker.
+        before (float | None): Its signed position read before this pair's
+            first order, or None when that read failed.
+
+    Returns:
+        str: "" when the account held nothing there (or that is not known,
+            _flat_before); else a sentence that starts with a space, e.g.
+            " Before this pair the account already held 30 NO contracts
+            (position -30) on KX-B. Those are not this pair's: close only this
+            pair's contracts and leave those alone."
+    """
+    if _flat_before(before):
+        return ""
+    return (f" Before this pair the account already held {_held_words(before)}"
+            f" (position {count_text(before)}) on {ticker}. Those are not this"
+            " pair's: close only this pair's contracts and leave those alone.")
+
+
+def _restore_remedy(ticker: str, before: float | None) -> str:
+    """
+    Say what a person should do by hand with a position this pair may have moved.
+
+    With nothing held there before the pair, the remedy is to flatten the
+    position. With an earlier holding, closing the position out would close
+    those older contracts too, so the remedy is to put it back to what it
+    was.
+
+    Args:
+        ticker (str): The market's ticker.
+        before (float | None): Its signed position read before this pair's
+            first order, or None when that read failed.
+
+    Returns:
+        str: "flatten this position by hand in the Kalshi UI" when the account
+            held nothing there before this pair (or that is not known,
+            _flat_before); else, e.g., "put the position on KX-B back to 30 NO
+            contracts (-30) by hand in the Kalshi UI (that is what the account
+            held there before this pair; do not close it to 0)".
+    """
+    if _flat_before(before):
+        return "flatten this position by hand in the Kalshi UI"
+    return (f"put the position on {ticker} back to {_held_words(before)}"
+            f" ({count_text(before)}) by hand in the Kalshi UI (that is what the"
+            " account held there before this pair; do not close it to 0)")
+
+
 def _partial_unwind_counts(exc: BaseException, count: int) -> tuple[str, str] | None:
     """
     Return how many NO contracts a partial unwind closed and how many are
@@ -1440,6 +1579,7 @@ def _partial_unwind_counts(exc: BaseException, count: int) -> tuple[str, str] | 
 def _rollback_no_leg(
     client: Any, spec: TradeSpec, no_leg: _Leg, reason: str, *,
     pace: Callable[[], float] | None = None,
+    before: float | None = None,
 ) -> TradeResult:
     """
     Close a filled NO leg after the YES leg failed, and check that it closed.
@@ -1448,7 +1588,9 @@ def _rollback_no_leg(
     the YES leg fails. The unwind is the reduce-only immediate-or-cancel bid
     from _build_rollback_order_v2, price-capped by
     ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT, never an unpriced order. Being
-    reduce-only, it cannot open a new position.
+    reduce-only, it cannot open a new position, and its count is this pair's
+    NO count, so on a market the account already held (before) it can close
+    only this pair's contracts and leaves the older ones as they were.
 
     Its own result is checked: a full close is "rolled_back"; no fill, a part
     fill or an error is "rollback_failed", and no second order is sent. For a
@@ -1457,7 +1599,9 @@ def _rollback_no_leg(
     _partial_unwind_counts); when that count cannot be read, or the unwind
     raised for any other reason, it says "up to" the NO count. Both of those
     alerts say to check the account. An unwind that filled nothing logs
-    ROLLBACK NOT FILLED with the full NO count.
+    ROLLBACK NOT FILLED with the full NO count. When the account held the
+    market before this pair, every one of those alerts also names that
+    holding (_pre_pair_note), which must stay open.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -1471,6 +1615,10 @@ def _rollback_no_leg(
             _PairWrites.hedge). None takes the hedge lane
             (_ORDER_WRITE_PACER.acquire_hedge), ahead of writes waiting in
             turn.
+        before (float | None): Keyword-only. The NO leg's market's position
+            read before this pair's NO order, for the alerts only (the
+            unwind's size is always no_leg.count); None (the default) or 0
+            adds nothing to them.
 
     Returns:
         TradeResult: status="rolled_back" when the unwind filled in full;
@@ -1479,8 +1627,11 @@ def _rollback_no_leg(
             many NO contracts are still open, when known).
     """
     # A reduce-only bid capped at the ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT loss
-    # floor, closing the NO-leg position
+    # floor, for this pair's NO contracts
     rollback = _build_rollback_order_v2(no_leg)
+    # For the alerts only: what the market held before this pair, which the
+    # unwind never touches (its count is this pair's)
+    held_note = _pre_pair_note(no_leg.market.ticker, before)
     try:
         # Signed, single-shot submission (see _submit_order_v2), in the
         # pacer's hedge lane unless the caller hands in the pair's own place
@@ -1501,9 +1652,9 @@ def _rollback_no_leg(
                 " response reports it closed %s of the %d NO contracts this"
                 " pair bought on %s, so %s of them are still open (an"
                 " immediate-or-cancel order leaves nothing resting) — check the"
-                " account. Manual review required. Error: %s",
+                " account.%s Manual review required. Error: %s",
                 spec.pair.canonical_title, closed_text, no_leg.count,
-                no_leg.market.ticker, open_text, rb_error,
+                no_leg.market.ticker, open_text, held_note, rb_error,
             )
             return TradeResult(
                 spec=spec, status="rollback_failed",
@@ -1515,8 +1666,9 @@ def _rollback_no_leg(
         logging.critical(
             "ROLLBACK FAILED for '%s' — ORPHANED POSITION: up to %d NO contracts"
             " on %s (the unwind can close part of the position before it stops —"
-            " check the account). Manual review required. Error: %s",
-            spec.pair.canonical_title, no_leg.count, no_leg.market.ticker, rb_error,
+            " check the account).%s Manual review required. Error: %s",
+            spec.pair.canonical_title, no_leg.count, no_leg.market.ticker, held_note,
+            rb_error,
         )
         return TradeResult(
             spec=spec, status="rollback_failed",
@@ -1525,8 +1677,9 @@ def _rollback_no_leg(
     if rb_status != "executed":
         logging.critical(
             "ROLLBACK NOT FILLED (status=%s) for '%s' — ORPHANED POSITION: %d NO"
-            " contracts on %s. Manual review required.",
+            " contracts on %s.%s Manual review required.",
             rb_status, spec.pair.canonical_title, no_leg.count, no_leg.market.ticker,
+            held_note,
         )
         return TradeResult(
             spec=spec, status="rollback_failed",
@@ -2161,17 +2314,46 @@ def _stop_run_on_v2_mapping_disproof() -> str:
             legs that earlier pairs of this process sent while the mapping
             check could not read the account (_V2_UNCHECKED_NO_LEGS). Those
             pairs went ahead as if the mapping held, so their positions rest
-            on the same wrong mapping. An empty string when there are none.
+            on the same wrong mapping. A ticker the account already held
+            before its pair reads, e.g., "KX-B (held 30 NO contracts before
+            that pair)" (_V2_UNCHECKED_BASELINES, in _held_words' words), so a
+            person restores that holding rather than closing it. An empty
+            string when there are none.
     """
     global _V2_NO_MAPPING_DISPROVEN
     _V2_NO_MAPPING_DISPROVEN = True
     if not _V2_UNCHECKED_NO_LEGS:
         return ""
+    named = ", ".join(
+        f"{ticker} (held {_held_words(_V2_UNCHECKED_BASELINES[ticker])} before that pair)"
+        if ticker in _V2_UNCHECKED_BASELINES else ticker
+        for ticker in _V2_UNCHECKED_NO_LEGS
+    )
     return (
         " Earlier pairs of this run went ahead after their NO-leg fill could"
         " not be checked, so they rest on the same mapping: check the"
-        f" positions on {', '.join(_V2_UNCHECKED_NO_LEGS)} too."
+        f" positions on {named} too."
     )
+
+
+def _note_unchecked_no_leg(ticker: str, before_no: float | None) -> None:
+    """
+    Record a NO leg that went ahead without its mapping check, for a later disproof.
+
+    Called by _confirm_v2_no_mapping when it cannot read the account after the
+    NO fill. The ticker joins _V2_UNCHECKED_NO_LEGS; when the position read
+    before the pair was not flat or unknown (_flat_before) it also goes into
+    _V2_UNCHECKED_BASELINES, keeping the first reading (a ticker is traded by
+    at most one pair of a run, since select_portfolio never picks one twice).
+
+    Args:
+        ticker (str): The NO leg's market's ticker.
+        before_no (float | None): That market's position read before the
+            pair's NO order, or None when the read failed.
+    """
+    _V2_UNCHECKED_NO_LEGS.append(ticker)
+    if not _flat_before(before_no):
+        _V2_UNCHECKED_BASELINES.setdefault(ticker, before_no)
 
 
 def _confirm_v2_no_mapping(
@@ -2198,8 +2380,10 @@ def _confirm_v2_no_mapping(
         run and go on to the YES leg.
       * change unknown (a read failed): warn and go on without remembering
         it, so the next NO fill checks again. The NO leg's ticker is
-        recorded (_V2_UNCHECKED_NO_LEGS), so that if a later pair disproves
-        the mapping its CRITICAL names this position too.
+        recorded (_V2_UNCHECKED_NO_LEGS), with what that market held before
+        this pair when that was not zero (_V2_UNCHECKED_BASELINES), so that
+        if a later pair disproves the mapping its CRITICAL names this
+        position and that holding too.
       * change of zero: read again after each pause in
         config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS (1, 2 and 4 s, so up
         to 7 s), since the ledger can lag behind a fill (about 1 s was seen
@@ -2214,7 +2398,11 @@ def _confirm_v2_no_mapping(
         return manual_review: the YES leg is not sent and the NO leg is not
         unwound, since the unwind relies on the same side mapping. The
         CRITICAL log says the rest of the run is stopped, and to stop
-        trading and flatten the position by hand in the Kalshi UI.
+        trading and undo the position by hand in the Kalshi UI: flatten it
+        when the account held nothing on that market before the pair (or
+        that reading is unknown), else put it back to what it held
+        (_restore_remedy), since closing it out would close the older
+        contracts too.
 
     If the mapping was already disproven in this process when this runs —
     this pair's NO leg filled after another pair's disproof — nothing is
@@ -2251,11 +2439,18 @@ def _confirm_v2_no_mapping(
         # filled anyway (it was past _execute_one's stop when the latch was
         # set). Treat it like the disproving pair: its YES leg and any unwind
         # would rest on the same disproven mapping.
+        # Held before this pair: name what to restore, since flattening
+        # would close those older contracts too
+        remedy = (
+            "A human must flatten this account position too."
+            if _flat_before(before_no)
+            else f"A human must {_restore_remedy(ticker, before_no)}."
+        )
         logging.critical(
             "V2 NO leg on %s filled after the NO-leg mapping was disproven"
             " earlier in this run — NOT submitting the YES leg and NOT"
-            " auto-unwinding. A human must flatten this account position too.",
-            ticker,
+            " auto-unwinding. %s",
+            ticker, remedy,
         )
         return TradeResult(
             spec=spec, status="manual_review",
@@ -2277,7 +2472,7 @@ def _confirm_v2_no_mapping(
             ticker,
         )
         # Named in the CRITICAL if a later pair disproves the mapping
-        _V2_UNCHECKED_NO_LEGS.append(ticker)
+        _note_unchecked_no_leg(ticker, before_no)
         return None
     if abs(delta) < _DELTA_EPS:
         # A delta of exactly zero right after a confirmed fill is ambiguous:
@@ -2295,7 +2490,7 @@ def _confirm_v2_no_mapping(
                     " proceeding unlatched; the check re-arms on the next fill",
                     ticker,
                 )
-                _V2_UNCHECKED_NO_LEGS.append(ticker)
+                _note_unchecked_no_leg(ticker, before_no)
                 return None
             if abs(delta) >= _DELTA_EPS:
                 break
@@ -2320,10 +2515,9 @@ def _confirm_v2_no_mapping(
         " running, and do not run main.py --mode prod; if the defaults server"
         " is running, stop it with Ctrl-C in the terminal running"
         " ./start_dashboard.sh or python3 -m kalshi_betting.defaults_server,"
-        " and do not press Confirm and trade), and flatten this"
-        " position by hand in the Kalshi UI; there is no other order path to"
-        " fall back on.%s",
-        ticker, -no_leg.count, delta, unchecked,
+        " and do not press Confirm and trade), and %s; there is no other order"
+        " path to fall back on.%s",
+        ticker, -no_leg.count, delta, _restore_remedy(ticker, before_no), unchecked,
     )
     return TradeResult(
         spec=spec, status="manual_review",
@@ -2333,6 +2527,71 @@ def _confirm_v2_no_mapping(
             f" submitted and NO leg not unwound"
         ),
     )
+
+
+def _add_on_mismatch(spec: TradeSpec, no_leg: _Leg, yes_leg: _Leg,
+                     before_no: float | None, before_yes: float | None) -> str | None:
+    """
+    Say why an add-on must not be sent, or None when it may (or adds to nothing).
+
+    An add-on is a pair that adds to what the account already holds
+    (scanner.pair_held): an exact held pair, or a lone held leg whose partner
+    has paid out. On each held market it may buy only the side held there
+    (NO on the ticker held NO, YES on the ticker held YES), and only while
+    that market still holds exactly the held count (-count on a NO market,
+    +count on a YES market), read just before the NO leg is sent. Beside a
+    lone leg, the other market is new and must still hold nothing. A
+    position that could not be read, or that did not read as a finite number
+    (the positions listing sent something like "nan"), counts as changed. An
+    ordinary pair (pair_held is None) is never refused here.
+
+    Args:
+        spec (TradeSpec): The trade about to be sent; its pair says which held
+            pair, if any, it adds to.
+        no_leg (_Leg): Its NO leg (_ordered_legs).
+        yes_leg (_Leg): Its YES leg.
+        before_no (float | None): The NO leg's market's position read just
+            now, or None when the read failed.
+        before_yes (float | None): The YES leg's market's position, likewise.
+
+    Returns:
+        str | None: A short reason, such as "the account does not hold NO on
+            KX-B", "KX-B now holds 20 NO contracts; the held pair had 30 NO
+            contracts" or "the position on KX-A could not be read"; None when
+            the pair may be sent.
+    """
+    # Cross-module: the held pair this trade adds to, read by type
+    held = pair_held(spec.pair)
+    if held is None:
+        return None
+    held_sides = dict(held.sides)
+    for leg in (no_leg, yes_leg):
+        # Beside a lone leg, one market is new and holds no side
+        if held.lone and leg.market.ticker not in held_sides:
+            continue
+        if held_sides.get(leg.market.ticker) != leg.side:
+            return f"the account does not hold {leg.side.upper()} on {leg.market.ticker}"
+    # A lone leg's own market must be one of the two bought
+    if not held_sides.keys() & {no_leg.market.ticker, yes_leg.market.ticker}:
+        return f"the pair does not buy the held market {held.sides[0][0]}"
+    # What each market must still hold: NO contracts read negative, and a new
+    # market beside a lone leg nothing. A reading that is not a finite number
+    # compares unequal to nothing, so it is refused here as unread rather
+    # than let through by the test below
+    for leg, before in ((no_leg, before_no), (yes_leg, before_yes)):
+        if leg.market.ticker in held_sides:
+            expected = -held.count if leg.side == "no" else held.count
+        else:
+            expected = 0.0
+        if before is None or not math.isfinite(before):
+            return f"the position on {leg.market.ticker} could not be read"
+        if abs(before - expected) >= _DELTA_EPS:
+            if leg.market.ticker not in held_sides:
+                return (f"{leg.market.ticker} now holds {_held_words(before)};"
+                        " it was not held")
+            return (f"{leg.market.ticker} now holds {_held_words(before)};"
+                    f" the held pair had {_held_words(expected)}")
+    return None
 
 
 def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
@@ -2357,10 +2616,21 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     is single-shot (_position_count_once); the YES leg's is retried like the
     read beside it, since a failed re-read would leave the NO leg unhedged.
 
+    A pair that adds to a held pair or a lone held leg (scanner.pair_held) is
+    checked after those two reads and before anything is sent
+    (_add_on_mismatch): unless each held market is bought on its held side
+    and still reads the held count (and a new market beside a lone leg reads
+    nothing), nothing is sent and the pair is "failed", "not sent:
+    this does not match the held pair it adds to (...)". An ordinary pair is
+    never refused there.
+
     NO leg uncertain: zero change on both readings → "failed"; exactly
     -no_leg.count (a held NO reads negative) → unwind; anything else →
     "manual_review" with no order sent, since an unwind could close a
-    holding this order does not own.
+    holding this order does not own. Every unwind is this pair's NO count,
+    so on a market the account already held it leaves the older contracts
+    as they were, and every alert about such a market names what it held
+    before the pair (_pre_pair_note, _restore_remedy).
 
     YES leg uncertain: exactly +yes_leg.count → "executed"; zero on both
     readings → unwind the NO leg; anything else, including a failed read →
@@ -2401,7 +2671,8 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     Returns:
         TradeResult: status "executed", "failed" (including a pair stopped,
             with nothing sent, because the V2 NO-leg mapping was disproven
-            earlier in this process), "rolled_back", "rollback_failed" or
+            earlier in this process, or an add-on that no longer matched the
+            held pair it adds to), "rolled_back", "rollback_failed" or
             "manual_review" (see reporter.TradeResult).
     """
     # However the pair ends, an unsent held place goes back to the pacer
@@ -2461,6 +2732,24 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
     # _PairWrites).
     before_no = _position_count(client, no_leg.market.ticker)
     before_yes = _position_count(client, yes_leg.market.ticker)
+
+    # An add-on buys only the pair it adds to: the NO leg on the market held
+    # NO, the YES leg on the market held YES, and each market still holding
+    # what the run read at its start. Anything else sends nothing (a failed
+    # or unreadable read included); an ordinary pair is never refused here
+    mismatch = _add_on_mismatch(spec, no_leg, yes_leg, before_no, before_yes)
+    if mismatch is not None:
+        logging.warning(
+            "Not sending '%s' (A=%s B=%s): it adds to a pair the account holds,"
+            " but %s. Nothing was sent.",
+            spec.pair.canonical_title, spec.pair.market_a.ticker,
+            spec.pair.market_b.ticker, mismatch,
+        )
+        return TradeResult(
+            spec=spec, status="failed",
+            error=(f"not sent: this does not match the held pair it adds to"
+                   f" ({mismatch}); nothing submitted"),
+        )
 
     # Submit the NO leg (single-shot; see _submit_order_v2)
     no_leg_error: str | None = None
@@ -2544,7 +2833,7 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
             )
             return _rollback_no_leg(
                 client, spec, no_leg, f"NO leg ambiguous error: {no_leg_error}",
-                pace=writes.hedge,
+                pace=writes.hedge, before=before_no,
             )
         # Unknown or unexplained change (e.g. an unrelated trade landed in
         # between): send nothing, since an unwind could close a holding this
@@ -2565,8 +2854,8 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
                 " The V2 NO-leg mapping is not yet confirmed in this process and"
                 " a NO buy cannot move the position this way, so the mapping is"
                 " treated as disproven: the rest of this run is stopped and no"
-                " later pair sends any order. Stop the bot and flatten this"
-                " position by hand in the Kalshi UI."
+                " later pair sends any order. Stop the bot and "
+                + _restore_remedy(no_leg.market.ticker, before_no) + "."
                 " To stop the bot, stop the scheduler daemon if it is running,"
                 " and do not run main.py --mode prod; if the defaults server is"
                 " running, stop it with Ctrl-C in the terminal running"
@@ -2578,9 +2867,9 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
             "NO leg (%s) raised for '%s' and the fill could NOT be attributed"
             " (position delta=%s, expected 0 or %d) — NOT unwinding, since a"
             " reduce-only unwind of a position this order may not own could"
-            " close an unrelated holding. Manual review required: %s%s",
+            " close an unrelated holding.%s Manual review required: %s%s",
             no_leg.label, spec.pair.canonical_title, delta, -no_leg.count,
-            no_leg_error, stop_note,
+            _pre_pair_note(no_leg.market.ticker, before_no), no_leg_error, stop_note,
         )
         error = f"NO leg ambiguous, delta={delta}: {no_leg_error}"
         if stops_run:
@@ -2625,7 +2914,8 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
                 # identical to a clean non-fill and sent the reduce-only unwind
                 # of a NO leg that was, in truth, hedging a real YES fill. That
                 # sold the hedge, left a full-size naked YES position open, and
-                # reported it as "rolled_back", which means flat.
+                # reported it as "rolled_back", which means this pair's NO
+                # contracts were sold back and nothing of it is open.
                 #
                 # Retried (_position_count), unlike the NO-leg re-read above:
                 # this read's immediate neighbour is already retried, and the
@@ -2673,15 +2963,17 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
                 # Rolling the NO leg back here would be wrong if the YES leg
                 # actually did fill (we'd sell the hedge and be left with a
                 # naked YES position while the log says "rolled_back",
-                # implying flat). Do NOT auto-rollback; surface for manual
-                # review instead.
+                # implying nothing of this pair is open). Do NOT
+                # auto-rollback; surface for manual review instead.
                 logging.critical(
                     "YES leg (%s) raised for '%s' and the fill could NOT be"
                     " attributed (position delta=%s, expected 0 or %d) — NOT"
                     " auto-rolling-back the NO leg to avoid reversing a possible"
-                    " real fill. Manual review required: %s",
-                    yes_leg.label, spec.pair.canonical_title, delta,
-                    yes_leg.count, yes_leg_error,
+                    " real fill.%s Manual review required: %s",
+                    yes_leg.label, spec.pair.canonical_title, delta, yes_leg.count,
+                    _pre_pair_note(no_leg.market.ticker, before_no)
+                    + _pre_pair_note(yes_leg.market.ticker, before_yes),
+                    yes_leg_error,
                 )
                 return TradeResult(
                     spec=spec, status="manual_review",
@@ -2692,7 +2984,9 @@ def _execute_legs(client: Any, spec: TradeSpec, writes: _PairWrites) -> TradeRes
             "YES leg (%s) failed after the NO leg filled — attempting rollback: %s",
             yes_leg.label, yes_leg_error,
         )
-        return _rollback_no_leg(client, spec, no_leg, yes_leg_error, pace=writes.hedge)
+        return _rollback_no_leg(
+            client, spec, no_leg, yes_leg_error, pace=writes.hedge, before=before_no,
+        )
 
     logging.info(
         "Both legs filled: '%s'  %dx %s, then %dx %s",
@@ -2765,8 +3059,9 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
     In dry_run mode, no orders are submitted. The function logs the intended
     trade — both legs in SUBMISSION order (NO leg first), with each leg's own
     count and traded price, which for a time_series pair are NOT the pair's
-    nA/pB — and returns TradeResult objects with status="simulated", which are
-    still written to the dev simulation Excel file by reporter.py.
+    nA/pB, ending " | adds to N held" for an add-on — and returns TradeResult
+    objects with status="simulated", which are still written to the dev
+    simulation Excel file by reporter.py.
 
     Args:
         client (Any): An authenticated KalshiClient produced by auth.build_client().
@@ -2780,11 +3075,13 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
         list: List of TradeResult objects (from reporter.py), one per spec. Each
             result has status="executed" (both legs filled), "simulated" (dry
             run), "failed" (NO leg confirmed unfilled, or nothing sent — a
-            pair stopped after the V2 NO-leg mapping was disproven),
+            pair stopped after the V2 NO-leg mapping was disproven, or an
+            add-on that no longer matched the held pair it adds to),
             "rolled_back" (YES leg
-            confirmed unfilled, NO leg unwound), "rollback_failed" (NO-leg
-            unwind did not fill, or closed only part of the position —
-            orphaned position), or "manual_review" (a
+            confirmed unfilled, this pair's NO contracts sold back),
+            "rollback_failed" (NO-leg unwind did not fill, or closed only
+            part of this pair's NO contracts — orphaned position), or
+            "manual_review" (a
             leg's fill state could not be attributed to this order, or an
             exception escaped the worker — no automated order was submitted in
             response). The list is in SUBMISSION order: results[i] corresponds
@@ -2801,13 +3098,16 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
             # exactly the legs (sides, counts, prices) that WOULD be submitted,
             # NO leg first
             no_leg, yes_leg = _ordered_legs(spec)
+            # Cross-module: an add-on names the held count it adds to
+            held = pair_held(spec.pair)
             logging.info(
                 "[DRY RUN] Pair order (NO leg first, then YES — there is no batch "
                 "endpoint): Buy %dx %s @ %.2f%% | Buy %dx %s @ %.2f%% | "
-                "Total cost: $%.2f incl. fees | Profit if won: $%.2f",
+                "Total cost: $%.2f incl. fees | Profit if won: $%.2f%s",
                 no_leg.count, no_leg.label, no_leg.price_dollars * 100,
                 yes_leg.count, yes_leg.label, yes_leg.price_dollars * 100,
                 spec.total_cost_with_fees, spec.min_payoff,
+                f" | adds to {count_text(held.count)} held" if held is not None else "",
             )
             results.append(TradeResult(spec=spec, status="simulated"))
         return results
@@ -2869,14 +3169,25 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
                 # could reverse a real fill, the same reasoning behind every
                 # other manual_review case in _execute_one. "A"/"B" are MARKET
                 # labels (market_a / market_b), not submission legs.
+                # An add-on's markets hold older contracts too: name them, so
+                # a person undoes only this pair's (read off the spec, never
+                # off the exception)
+                held = pair_held(spec.pair)
+                held_note = (
+                    f" (this pair adds to a held pair of {count_text(held.count)}"
+                    " contracts on each market: check both positions and undo"
+                    " only what this pair added)"
+                    if held is not None else ""
+                )
                 # One-line description in the message and the result;
                 # exc_info adds the traceback
                 logging.critical(
                     "Unhandled exception executing '%s' (A=%s B=%s) — fill state "
-                    "UNKNOWN, manual review required: %s",
+                    "UNKNOWN%s, manual review required: %s",
                     spec.pair.canonical_title,
                     spec.pair.market_a.ticker,
                     spec.pair.market_b.ticker,
+                    held_note,
                     api_error_summary(exc),
                     exc_info=True,
                 )

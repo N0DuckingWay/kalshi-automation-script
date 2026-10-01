@@ -97,14 +97,15 @@ KEY = b"k" * 32
 _REAL_POPEN = subprocess.Popen
 # A source note of the dashboard's shape
 DASHBOARD_NOTE = "backtest dashboard for 2025-09-24 to 2026-09-27"
-# The seven rows of a comparison, in their order on the page
+# The eight rows of a comparison, in their order on the page
 LABELS = ["tier floors", "spread band", "k", "per-trade cap", "same-title cap",
-          "categories", "tags"]
+          "categories", "tags", "add to held pairs"]
 # A proposal's fields: the seed's values, spelled as the dashboard spells them
 _BASE = {"tier_floors": "off", "spread_min": "0", "spread_max": "0.5", "k": "0.8",
          "size_cap": "0.1"}
-# The settings _BASE proposes when no same-title cap is saved (the seed's)
-_BASE_SETTINGS = LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2)
+# The settings _BASE proposes when nothing is saved: the seed's (its same-title
+# cap, and adding to held pairs on, the two fields a proposal may leave out)
+_BASE_SETTINGS = LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, add_to_held_pairs=True)
 # The ASCII digits as Arabic-Indic and as full-width digits (str.translate tables)
 _ARABIC_INDIC = str.maketrans("0123456789", "".join(chr(0x0660 + i) for i in range(10)))
 _FULL_WIDTH = str.maketrans("0123456789", "".join(chr(0xFF10 + i) for i in range(10)))
@@ -821,7 +822,7 @@ class TestConfirmPage:
         assert changed == {"tier floors", "spread band"}
         assert all(css == "same" for label, css in page.rows.items() if label not in changed)
         assert response.body.count('<span class="tag">changed</span>') == 2
-        assert "2 of 7 settings change." in response.body
+        assert "2 of 8 settings change." in response.body
         assert "Overwrite the live trading defaults?" in response.body
         assert f"This writes <code>{config.LIVE_DEFAULTS_FILE.absolute()}</code>" \
             in response.body
@@ -847,9 +848,10 @@ class TestConfirmPage:
         assert "none saved — live runs refuse to start until defaults are saved" in response.body
         assert set(page.rows.values()) == {"changed"}
         assert all(cells[1] == "—" for cells in page.cells.values())
-        assert "7 of 7 settings change." in response.body
-        # The same-title cap falls back to the seed's
+        assert "8 of 8 settings change." in response.body
+        # The same-title cap and adding to held pairs fall back to the seed's
         assert page.cells["same-title cap"][2] == "20%"
+        assert page.cells["add to held pairs"][2] == "on"
 
     def test_the_exposure_warning_shows(self):
         response = _get(_app(), "/confirm?" + _query(k="0.4", size_cap="1"))
@@ -866,6 +868,31 @@ class TestConfirmPage:
         page = _parse(_get(_app(), "/confirm?" + _query()).body)
         assert page.rows["same-title cap"] == "same"
         assert page.cells["same-title cap"][1:3] == ["50%", "50%"]
+
+    @pytest.mark.parametrize("saved_on", [False, True])
+    def test_a_missing_add_to_held_pairs_keeps_the_saved_value(self, saved_on):
+        # A link that does not name it (the dashboard's save button, on a page
+        # that does not show the choice) leaves it as saved, either way, shown
+        # as no change
+        saved = LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, add_to_held_pairs=saved_on)
+        _save(saved)
+        page = _parse(_get(_app(), "/confirm?" + _query()).body)
+        assert page.rows["add to held pairs"] == "same"
+        word = "on" if saved_on else "off"
+        assert page.cells["add to held pairs"][1:3] == [word, word]
+        assert defaults_server._proposal(defaults_server._params(_query()),
+                                         config.read_saved_live_defaults())[0] == saved
+
+    @pytest.mark.parametrize("given, saved_on", [("on", False), ("off", True)])
+    def test_a_named_add_to_held_pairs_is_proposed(self, given, saved_on):
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, add_to_held_pairs=saved_on))
+        page = _parse(_get(_app(), "/confirm?" + _query(add_to_held_pairs=given)).body)
+        assert page.rows["add to held pairs"] == "changed"
+        assert page.cells["add to held pairs"][1:3] == ["on" if saved_on else "off", given]
+
+    def test_a_missing_add_to_held_pairs_with_none_saved_is_the_seed_s(self):
+        settings, _ = defaults_server._proposal(defaults_server._params(_query()), None)
+        assert settings.add_to_held_pairs is config.LIVE_DEFAULTS_SEED.add_to_held_pairs
 
     def test_a_missing_category_or_tag_proposes_any(self):
         _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, ("Sports",), ("Basketball",)))
@@ -906,7 +933,7 @@ class TestConfirmPage:
         assert page.buttons[1] == {"type": "button", "disabled": None}
         assert html.escape(defaults_server._NOTHING_TO_SAVE) in response.body
         assert "These are already the live defaults — nothing to save." in response.body
-        assert "0 of 7 settings change." in response.body
+        assert "0 of 8 settings change." in response.body
         # With nothing to save, the page does not say it writes
         assert "This writes" not in response.body
         assert str(config.LIVE_DEFAULTS_FILE.absolute()) in response.body
@@ -1215,6 +1242,8 @@ class TestConfirmRefusals:
         _query(k=""),                                     # blank
         _query(source=""),                                # a blank source
         _query(tier_floors="maybe"),
+        _query(add_to_held_pairs="maybe"), _query(add_to_held_pairs="true"),
+        _query(add_to_held_pairs="1"), _query(add_to_held_pairs="On"),
         _query(k="nan"), _query(k="inf"), _query(k="0_8"), _query(k="1e-400"),
         _query(k="1e400"), _query(k="０.8"), _query(k=" 0.8"), _query(k="0"),
         _query(k="1.5"), _query(k="0x1"),
@@ -1557,6 +1586,47 @@ class TestSeed:
         # It names every field, so what is saved does not change it
         saved = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
         assert defaults_server._proposal(params, saved)[0] == config.LIVE_DEFAULTS_SEED
+
+    def test_a_seven_toggle_file_is_proposed_the_seed_with_adding_on(self):
+        # A saved file that leaves the toggle out reads it as off; the seed
+        # page proposes it on, a change shown in its row
+        _save(replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False))
+        assert '"add_to_held_pairs"' not in config.LIVE_DEFAULTS_FILE.read_text()
+        response = _get(_app(), "/confirm?" + defaults_server._seed_query())
+        page = _parse(response.body)
+        assert [label for label, css in page.rows.items() if css == "changed"] == [
+            "add to held pairs"]
+        assert page.cells["add to held pairs"][1:3] == ["off", "on"]
+        assert "1 of 8 settings change." in response.body
+
+    def test_a_seed_link_that_leaves_out_adding_to_held_pairs_still_proposes_the_seed(self):
+        # A seed link without the add_to_held_pairs field, opened while a file
+        # with it off is saved: it proposes exactly the seed (the choice on),
+        # shown as a change, and saves it; it is never refused for putting the
+        # seed's note on other values
+        _save(replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False))
+        query = defaults_server._seed_query()
+        stale = "&".join(part for part in query.split("&")
+                         if not part.startswith("add_to_held_pairs="))
+        assert stale != query
+        params = defaults_server._params(stale)
+        assert defaults_server._proposal(params, config.read_saved_live_defaults()) == (
+            config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED_SOURCE)
+        app = _app()
+        response = _get(app, "/confirm?" + stale)
+        assert response.status == 200
+        page = _parse(response.body)
+        assert [label for label, css in page.rows.items() if css == "changed"] == [
+            "add to held pairs"]
+        assert page.cells["add to held pairs"][1:3] == ["off", "on"]
+        assert _post(app, _click(response.body, "confirm")).status == 303
+        assert config.live_defaults() == config.LIVE_DEFAULTS_SEED
+        # Control: the same link without the seed's note keeps what is saved
+        plain = "&".join(part for part in stale.split("&") if not part.startswith("source="))
+        assert defaults_server._proposal(
+            defaults_server._params(plain),
+            replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False),
+        )[0].add_to_held_pairs is False
 
     def test_confirming_the_seed_saves_it(self):
         app = _app()
@@ -1953,12 +2023,16 @@ class TestActions:
         form = _page_form(app, _query(k="0.75", category="Sports"), "confirm-trade")
         run_id = _run_id(_post(app, form))
         saved = config.read_saved_live_defaults()
-        assert saved == LiveSettings(False, (0.0, 0.5), 0.75, 0.1, 0.2, ("Sports",))
+        # Nothing was saved before, so adding to held pairs is the seed's (on)
+        assert saved == LiveSettings(False, (0.0, 0.5), 0.75, 0.1, 0.2, ("Sports",),
+                                     add_to_held_pairs=True)
         folder = _run_folder(run_id)
         [(argv, kwargs)] = starter.calls
         assert argv == [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
                         *config.live_settings_argv(saved), "--result-file",
                         str(folder / "result.json")]
+        # Adding to held pairs is spelled out, so the saved file never decides it
+        assert "--add-to-held-pairs" in argv
         assert kwargs["cwd"] == config.PROJECT_ROOT
         assert kwargs["start_new_session"] is True
         assert kwargs["stdin"] is subprocess.DEVNULL
@@ -2252,11 +2326,16 @@ class TestAttention:
             assert ("The last real-money run (<a href=\"/runs/aaaaaaaaaaaaaaaa\">run "
                     "aaaaaaaaaaaaaaaa</a> of 2026-09-29 16:05 UTC) ended needing manual "
                     "attention (exit 20).") in body
-            assert "stop trading and flatten by hand in the Kalshi UI" in body
-            # After a disproof it names every way a new real-money run starts
-            assert ("a new real-money run would open another wrong-side position, so "
-                    "stop the scheduler daemon if it is running, do not run main.py "
-                    "--mode prod, and do not press Confirm and trade.") in body
+            # After a disproof it names every way a new real-money run starts,
+            # in brackets after "stop trading"
+            assert ("stop trading (a new real-money run would open another wrong-side "
+                    "position, so stop the scheduler daemon if it is running, do not run "
+                    "main.py --mode prod, and do not press Confirm and trade)") in body
+            # What to undo by hand is what the run's CRITICAL names: a market
+            # the account held before the run goes back to what it held
+            assert ("then undo by hand in the Kalshi UI what its CRITICAL names: close "
+                    "out a market the account did not hold before the run, and put one "
+                    "it did hold back to what it held.") in body
             assert html.escape(defaults_server._ACK_LABEL) in body
 
     def test_an_exit_20_scheduled_run_raises_the_banner(self):
@@ -2271,10 +2350,12 @@ class TestAttention:
         assert notice.text == (
             "The last real-money run (the scheduled run of 2026-09-28 09:03, logged in "
             "kalshi_arb.log) ended needing manual attention (exit 20). Read its result "
-            "first. If it reports a V2 order-mapping disproof, stop trading and flatten by "
-            "hand in the Kalshi UI: a new real-money run would open another wrong-side "
-            "position, so stop the scheduler daemon if it is running, do not run main.py "
-            "--mode prod, and do not press Confirm and trade.")
+            "first. If it reports a V2 order-mapping disproof, stop trading (a new "
+            "real-money run would open another wrong-side position, so stop the scheduler "
+            "daemon if it is running, do not run main.py --mode prod, and do not press "
+            "Confirm and trade), then undo by hand in the Kalshi UI what its CRITICAL "
+            "names: close out a market the account did not hold before the run, and put "
+            "one it did hold back to what it held.")
 
     def test_a_newer_clean_run_clears_it(self):
         later = "2099-06-01T00:00:00"
@@ -2675,6 +2756,25 @@ class TestRunPage:
         assert "<td>30 × YES @ 0.2100</td>" in body and "<td>30 × NO @ 0.5000</td>" in body
         assert "<td>Rain by Oct 1 (RAIN-A)</td>" in body
         assert "<td>$21.90</td>" in body and "<td>orphan</td>" in body
+
+    def test_a_trade_that_added_to_a_held_pair_says_so_in_its_note(self):
+        # The run result's adds_to_held shows in the Note cell, after any
+        # error; a trade without it keeps its Note as it was
+        _disk_run(result=_result(exit_code=0, trades=[
+            _trade("executed", adds_to_held=30.0),
+            _trade("rolled_back", error="YES leg FoK not filled", adds_to_held=30.0),
+            _trade("failed", error="killed")]))
+        body = _get(_app(), "/runs/0123456789abcdef").body
+        assert "<td>(adds to 30 held)</td>" in body
+        assert "<td>YES leg FoK not filled (adds to 30 held)</td>" in body
+        assert "<td>killed</td>" in body
+
+    @pytest.mark.parametrize("value", [True, "30", 0, -5, None])
+    def test_an_unreadable_held_count_adds_no_note(self, value):
+        # Only a number above zero is shown; anything else is left out
+        _disk_run(result=_result(exit_code=0, trades=[_trade("executed", adds_to_held=value)]))
+        body = _get(_app(), "/runs/0123456789abcdef").body
+        assert "adds to" not in body
 
     def test_the_exit_code_a_process_returned_wins_over_its_result(self):
         app = _app()

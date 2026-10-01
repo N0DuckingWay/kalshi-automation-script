@@ -17,9 +17,12 @@ Purpose:
 
 Dependencies:
     Imports display_title, leg_sides (which side each leg buys, rendered
-    into the Notes prefix) and leg_prices (the price each leg was sized at,
-    for the run result) from scanner.py and TradeSpec from strategy.py.
-    Imports PROJECT_ROOT, create_new_output and the run result's constants
+    into the Notes prefix), leg_prices (the price each leg was sized at,
+    for the run result) and pair_held (the held pair an add-on adds to, for
+    the "adds to N held" marker) from scanner.py and TradeSpec from
+    strategy.py.
+    Imports PROJECT_ROOT, create_new_output, count_text (writes the held
+    count of an add-on exactly) and the run result's constants
     (LIVE_RUN_RESULT_FORMAT, RUN_REPORT_MAX_WARNINGS,
     RUN_REPORT_LINE_MAX_CHARS) from config.py. Exports the TradeResult
     dataclass (consumed by trader.py), the two public write functions, and
@@ -48,9 +51,11 @@ Notes:
     an existing shared trade_log.xlsx keeps
     its old header row untouched. Column COUNT and order are unchanged (18), so
     old and new rows line up; the per-row Notes prefix
-    ("[<pair_type>: <SIDE_A> A / <SIDE_B> B[ nB=0.xxxx]] ") is what tells a
-    reader which side each count bought and, for a time-series row, the traded
-    NO-leg price — the retained "nA (NO ask)" column is reporting-only there.
+    ("[<pair_type>: <SIDE_A> A / <SIDE_B> B[ nB=0.xxxx] fees=$x.xx[ adds to N
+    held]] ") is what tells a reader which side each count bought, for a
+    time-series row the traded NO-leg price — the retained "nA (NO ask)"
+    column is reporting-only there — and, for a trade that adds to a pair the
+    account already held, how many contracts a side it held.
 
     append_to_prod_log's keyword-only run_note goes on the run's separator
     banner, never in a column; main._run_prod passes the run's live toggles
@@ -88,9 +93,10 @@ from .config import (
     PROJECT_ROOT,
     RUN_REPORT_LINE_MAX_CHARS,
     RUN_REPORT_MAX_WARNINGS,
+    count_text,
     create_new_output,
 )
-from .scanner import display_title, leg_prices, leg_sides
+from .scanner import display_title, leg_prices, leg_sides, pair_held
 from .strategy import TradeSpec
 
 PROD_LOG_PATH = PROJECT_ROOT / "trade_log.xlsx"
@@ -158,11 +164,15 @@ class TradeResult:
             "simulated": dry run or dev mode; nothing was sent.
             "failed": the NO leg did not fill, or nothing was sent (a pair
                 stopped because the V2 NO-leg mapping was disproven earlier
-                in the run), so nothing is open.
-            "rolled_back": the NO leg filled, the YES leg did not, and the NO
-                position was fully closed again.
+                in the run, or a pair adding to a held pair whose held
+                positions no longer matched it), so nothing of this pair is
+                open.
+            "rolled_back": the NO leg filled, the YES leg did not, and this
+                pair's NO contracts were all sold back. Anything the account
+                held on that market before the pair is left as it was.
             "rollback_failed": that closing order filled only partly or not
-                at all, so a NO position is left open for a person to handle.
+                at all, so some of this pair's NO contracts are left open for
+                a person to handle.
             "manual_review": the outcome of a leg could not be tied to this
                 order (the position read failed or moved by an unexplained
                 amount, the one-time check found that a NO buy did not open
@@ -214,11 +224,15 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
     (A then B): x is market A's count and y is market B's, whatever side each
     bought. The Notes cell carries a prefix naming the pair type, the side
     bought on each market (from scanner.leg_sides) and, for a time-series pair,
-    the traded NO-leg price nB — "[time_series: YES A / NO B nB=0.4000] " or
-    "[same_title: NO A / YES B] " — followed by result.error (if any). That
-    prefix is what disambiguates rows in a workbook whose header row predates
-    the side-neutral x/y headers, and it is the only place nB is recorded (the
-    "nA (NO ask)" column is reporting-only for a time-series row).
+    the traded NO-leg price nB, the fees, and, for a trade that adds to a
+    pair the account already held (scanner.pair_held), how many contracts a
+    side it held — "[time_series: YES A / NO B nB=0.4000 fees=$0.10] ",
+    "[same_title: NO A / YES B fees=$0.10] " or "[time_series: YES A / NO B
+    nB=0.4000 fees=$0.10 adds to 30 held] " — followed by result.error (if
+    any). That prefix is what disambiguates rows in a workbook whose header
+    row predates the side-neutral x/y headers, and it is the only place nB is
+    recorded (the "nA (NO ask)" column is reporting-only for a time-series
+    row). No column is added for an add-on: every other row is unchanged.
 
     Args:
         result (TradeResult): The trade result to serialize.
@@ -242,9 +256,12 @@ def _result_to_row(result: TradeResult, run_ts: datetime) -> list:
     # old "Total Cost ($)" header above a column whose values are now
     # fee-inclusive. The suffix is what tells a reader which basis a row is on.
     fees = spec.total_cost_with_fees - spec.total_cost
+    # Cross-module: a trade adding to a held pair names the count held a side
+    held = pair_held(pair)
+    held_note = f" adds to {count_text(held.count)} held" if held is not None else ""
     notes = (
         f"[{pair.pair_type}: {side_a.upper()} A / {side_b.upper()} B{nb_note}"
-        f" fees=${fees:.2f}] "
+        f" fees=${fees:.2f}{held_note}] "
         + (result.error or "")
     )
 
@@ -291,7 +308,7 @@ def _apply_data_row_styles(ws, row_idx: int, status: str) -> None:
         "executed":        "E2EFDA",   # light green
         "simulated":       "EBF3FB",   # light blue
         "failed":          "FCE4D6",   # light red/orange
-        "rolled_back":     "FFF2CC",   # light yellow — NO leg unwound, no net position
+        "rolled_back":     "FFF2CC",   # light yellow — this pair's NO leg unwound
         "rollback_failed": "F4B7B4",   # strong red — orphaned position, manual review
         "manual_review":   "F4B7B4",   # strong red — fill state unknown, manual review
     }
@@ -743,6 +760,10 @@ class TradeRecord:
             included, in dollars; None when not known.
         profit_if_won (float | None): Its profit if it wins, in dollars; None
             when not known.
+        adds_to_held (float | None): For a trade that adds to a pair the
+            account already held (scanner.pair_held), the contracts it held
+            on each market; None for any other trade. The defaults server's
+            run page shows it as "(adds to N held)".
     """
     status: str
     error: str | None
@@ -752,6 +773,7 @@ class TradeRecord:
     b: LegRecord | None
     cost_with_fees: float | None
     profit_if_won: float | None
+    adds_to_held: float | None = None
 
 
 @dataclass
@@ -893,7 +915,8 @@ def trade_record(result: TradeResult) -> TradeRecord:
     Returns:
         TradeRecord: Its markets (A then B, as the trade log lists them), the
             side each leg buys and the count and price it was sized at, its
-            cost with fees and its profit if it wins.
+            cost with fees, its profit if it wins, and, for a trade that adds
+            to a held pair, the count held on each market.
 
     Raises:
         Exception: Whatever reading the result raises when its spec, pair or
@@ -906,6 +929,8 @@ def trade_record(result: TradeResult) -> TradeRecord:
     # Which side each market's leg bought, and at what price: the one source of truth
     side_a, side_b = leg_sides(pair.pair_type)
     price_a, price_b = leg_prices(pair)
+    # Cross-module: the held pair this trade adds to, read by type
+    held = pair_held(pair)
     return TradeRecord(
         status=str(result.status),
         error=None if result.error is None else str(result.error),
@@ -917,6 +942,7 @@ def trade_record(result: TradeResult) -> TradeRecord:
                     int(spec.y), _json_number(price_b, 4)),
         cost_with_fees=_json_number(spec.total_cost_with_fees, 2),
         profit_if_won=_json_number(spec.min_payoff, 2),
+        adds_to_held=None if held is None else _json_number(held.count, 2),
     )
 
 

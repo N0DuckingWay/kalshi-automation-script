@@ -1,5 +1,6 @@
 """Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
 import ast
+import copy
 import gc
 import inspect
 import logging
@@ -59,10 +60,12 @@ from kalshi_betting.config import (
     ScheduledRun,
     fee_leg_exact,
     fee_per_pair_approx,
+    held_pair_fraction,
+    kelly_budget,
     min_price_diff_for_gap,
     time_series_profit_prob,
 )
-from kalshi_betting.scanner import CandidatePair
+from kalshi_betting.scanner import CandidatePair, HeldPair, pair_held
 from kalshi_betting.strategy import compute_trade
 
 from .conftest import apply_pre_toggle_defaults, save_config_live_defaults
@@ -2309,7 +2312,7 @@ class TestRunBacktestMalformedTimestamps:
 class TestActiveTickerRelease:
     """A ticker is blocked only while its position is OPEN (BS-24).
 
-    Live, scanner.get_held_tickers() reads positions with count_filter="position",
+    Live, scanner.get_held_positions() reads positions with count_filter="position",
     so a ticker leaves the blocked set the moment its market settles. The
     backtest used to add tickers to active_tickers and never remove them, so one
     early trade blocked that ticker for the entire remaining simulation.
@@ -7731,8 +7734,16 @@ class TestPrepareEntriesGolden:
         monday_keys = {"entry_date", "pA", "pB", "nA", "nB", "mA", "mB", "gap_days"}
         rows = []
         for rec in entries:
-            # The record and entry shapes are part of the contract too.
-            assert set(rec) == {"pair_type", "canon", "group_key", "entry"}
+            # The record and entry shapes are part of the contract too. A
+            # record may also carry the prices that value its trades at market
+            # ("leg_quotes", written by _attach_leg_quotes), keyed by exactly
+            # the pair's two tickers
+            assert set(rec) - {"leg_quotes"} == {"pair_type", "canon", "group_key", "entry"}
+            if "leg_quotes" in rec:
+                assert set(rec["leg_quotes"]) == {rec["entry"]["mA"]["ticker"],
+                                                  rec["entry"]["mB"]["ticker"]}
+                assert all(isinstance(q, backtester.LegQuotes)
+                           for q in rec["leg_quotes"].values())
             e = rec["entry"]
             assert set(e) == monday_keys | {"later"}
             # Every later qualifying Monday carries every key but "later"
@@ -7758,6 +7769,9 @@ class TestPrepareEntriesGolden:
         # passed through untouched, never arithmetic.
         assert self._rows(entries) == self._GOLDEN[ladders]
         assert coverage.total == self._GOLDEN_CENSUS_TOTAL
+        # Every record _prepare_entries returns carries its markets' quotes
+        # (every ticker here has candles), so its trades are valued at market
+        assert all("leg_quotes" in rec for rec in entries)
 
     @pytest.mark.parametrize("ladders", [True, False])
     def test_the_two_halves_compose_to_the_capture(self, monkeypatch, ladders):
@@ -9507,11 +9521,13 @@ class TestOpenLadderExposure:
 class TestSizesOnPortfolioValue:
     """Pass 2 sizes each Monday's candidates on that Monday's opening
     portfolio value — the cash after the day's pay-outs plus every open trade
-    at its cost, the valuation the equity curve uses — and never spends more
-    than the cash left (config.kelly_budget), as a live run sizes on its cash
-    plus Kalshi's value of its open positions. Every simulation is handed k
-    and a size cap of 1.0, and only time-series pairs trade, so no figure
-    here depends on a toggle.
+    at its value, the valuation the equity curve uses (these hand-built
+    records carry no quotes, so at its cost; TestSizesAtMarket has the
+    quoted case) — and never spends more than the cash left
+    (config.kelly_budget), as a live run sizes on its cash plus Kalshi's
+    value of its open positions. Every simulation is handed k and a size cap
+    of 1.0, and only time-series pairs trade, so no figure here depends on a
+    toggle.
 
     The opener trades on Monday 1 and pays out on 01-15: it is open on
     Monday 2 (01-12) and paid out by Monday 3 (01-19); one test has it pay
@@ -9660,6 +9676,844 @@ class TestSizesOnPortfolioValue:
         assert self._cost(follower.n) == pytest.approx(2_157.19)
         # ... and what live compute_trade sizes when the value is all cash
         assert follower.n == self._live_n(cash, cash, 0.75)
+
+
+# ─── Adding to held pairs, in the backtest ──────────────────────────────────
+
+def _worded_market(ticker: str, event: str, title: str, paid_out: str, *,
+                   result: str = "no") -> dict:
+    """A _ladder_market with its own title, so markets can ask one question."""
+    return {**_ladder_market(ticker, event, paid_out, result=result), "title": title}
+
+
+def _pair_cost(n: int, price_a: float, price_b: float) -> float:
+    """What n contract pairs spend at these leg prices: the contracts plus both
+    legs' exact fees, added in the order Pass 2's fee loop adds them, so a
+    comparison with a budget is exact."""
+    return n * (price_a + price_b) + fee_leg_exact(n, price_a) + fee_leg_exact(n, price_b)
+
+
+def _live_add_on(first, value: float, cash: float, *, k: float, size_cap: float,
+                 quotes: tuple[float, float, float]):
+    """The spec live compute_trade sizes for an add-on to the PA/PB pair whose
+    first trade was `first`, on a portfolio value and a cash in dollars (whole
+    cents here), with the backtest's own stake: the pair's contracts at cost
+    (HeldPair.value_dollars) plus the fees paid for them
+    (HeldPair.fees_dollars), which together are HeldPair.stake_dollars. The
+    pair's time-series quotes are (pA, pB, nB). No book, so the stored leg
+    prices are used."""
+    from kalshi_betting import config
+
+    def _market(ticker):
+        return SimpleNamespace(ticker=ticker,
+                               close_time=datetime.now(UTC) + timedelta(days=60))
+
+    pA, pB, nB = quotes
+    held = HeldPair(sides=(("PA", "yes"), ("PB", "no")), count=float(first.n),
+                    cost_dollars=first.total_cost + first.fees,
+                    value_dollars=first.total_cost, fees_dollars=first.fees)
+    assert held.stake_dollars == pytest.approx(first.total_cost + first.fees, abs=1e-9)
+    pair = CandidatePair(
+        market_a=_market("PA"), market_b=_market("PB"), pA=pA, pB=pB,
+        nA=round(1.0 - pA, 4), nB=nB, tradeable=True, canonical_title="q",
+        pair_type="time_series", max_contracts=0, held=held,
+    )
+    settings = dc_replace(config.live_settings(), interval_discount=k, size_cap=size_cap)
+    spec = compute_trade(pair, round(value * 100), settings=settings,
+                         cash_cents=round(cash * 100))
+    assert spec is not None and pair_held(spec.pair) == held
+    return spec
+
+
+def _same_title_record(rows, group_key=("", "Will it rain by March 1, 2026?", "")) -> dict:
+    """A same-title record from (date, market A, market B, pA, pB) rows, one per
+    qualifying Monday. Market A is that Monday's pricier side by YES ask."""
+    built = [{"entry_date": day, "pA": pA, "pB": pB, "nA": round(1.0 - pA, 4),
+              "nB": round(1.0 - pB, 4), "mA": mA, "mB": mB, "gap_days": None}
+             for day, mA, mB, pA, pB in rows]
+    first, *rest = built
+    return {"pair_type": "same_title", "canon": "Q", "group_key": group_key,
+            "entry": {**first, "later": tuple(rest)}}
+
+
+_RAIN = "Will it rain by March 1, 2026?"
+_ADD_ON_LINE = "Trades that added to a held pair ("
+_ADD_ON_CAP_LINE = "Adds skipped because the held pair is already at its target size ("
+_ADD_ON_LADDER_LINE = ("Adds skipped because another open trade is on the same ladder, or the "
+                       "two markets share no ladder (")
+
+
+@pytest.mark.usefixtures("pre_toggle_defaults")
+class TestAddToHeldPairs:
+    """_simulate_at_discount(add_to_held=True) lets the walk add to a pair it
+    still holds, as the live sizer does for a held pair: the same two
+    markets, bought the same way round, recorded as a new trade and sized so
+    the whole position is Kelly's share of the portfolio value (the
+    checkpoint's cash plus its open trades at contract cost, fees excluded;
+    config.held_pair_fraction, the live sizer's rule) — never more than a new
+    pair would stake, and never more than the cash left. The pair's stake is
+    what its open trades cost: their contracts plus the fees paid for them,
+    which the portfolio value leaves out. Figures are at pre_toggle_defaults
+    (k 0.75, a 20% cap, no extra same-title cap)."""
+
+    _START = date(2026, 1, 1)
+    # At k 0.85 these time-series quotes (pA, pB, nB) pass the Kelly gate at
+    # about +0.041 and +0.104: a later Monday that wants a bigger position
+    _NARROW, _WIDE = (0.20, 0.45, 0.55), (0.20, 0.70, 0.30)
+
+    def _sim(self, records, **kw):
+        return backtester._simulate_at_discount(records, self._START, 10_000.0,
+                                                 end_date=date(2026, 4, 1), **kw)
+
+    @staticmethod
+    def _lines(caplog, prefix: str) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.getMessage().startswith(prefix)]
+
+    def _widening_pair(self, a="PA", b="PB", events=("EVA-1", "EVB-1"), question="q",
+                       mondays=(_LADDER_M1, _LADDER_M2)):
+        """A time-series pair quoted narrow on its first Monday and wide after."""
+        rows = [(mondays[0], *self._NARROW)] + [(m, *self._WIDE) for m in mondays[1:]]
+        return _ladder_record(_ladder_market(a, events[0], "2026-03-20"),
+                              _ladder_market(b, events[1], "2026-03-20"), question, rows)
+
+    def test_off_is_the_default(self):
+        """Without the flag the walk is unchanged: default False, and an
+        explicit False gives the same trades and curve."""
+        params = inspect.signature(backtester._simulate_at_discount).parameters
+        assert params["add_to_held"].default is False
+        p = self._widening_pair()
+        default, off = self._sim([p], k=0.85), self._sim([p], k=0.85, add_to_held=False)
+        assert [astuple(t) for t in default.trades] == [astuple(t) for t in off.trades]
+        pd.testing.assert_frame_equal(default.equity_df, off.equity_df)
+        assert default.add_to_held is off.add_to_held is False
+        assert not any(t.add_on for t in default.trades)
+
+    def test_a_pair_passing_on_two_mondays_adds_on_the_second(self, caplog):
+        p = self._widening_pair()
+        f1, f2 = (_uncapped_kelly({"pair_type": "time_series", "entry": m}, 0.85)
+                  for m in backtester._entry_mondays(p["entry"]))
+        # Neither Monday's fraction reaches the 20% cap
+        assert 0 < f1 < f2 < 0.20
+        off = self._sim([p], k=0.85)
+        assert _traded(off) == [("PA", _LADDER_M1)]
+        with caplog.at_level(logging.INFO):
+            on = self._sim([p], k=0.85, add_to_held=True)
+        assert _traded(on) == [("PA", _LADDER_M1), ("PA", _LADDER_M2)]
+        first, add = on.trades
+        assert (first.add_on, add.add_on) == (False, True)
+        # The first trade is exactly the one the walk makes without adding
+        assert astuple(first) == astuple(off.trades[0])
+        # A trade of its own, paid out with the first: both markets settled
+        # NO, so the NO on market B pays each trade's own count
+        assert add.exit_date == first.exit_date
+        assert (first.actual_payoff, add.actual_payoff) == (first.n, add.n)
+        assert add.n > 0 and add.profit > 0
+        # Sized on the whole position: the portfolio value it records (the
+        # checkpoint's cash plus the open trade at contract cost) and what the
+        # pair already stakes (its contracts plus the fees paid for them)
+        value = add.balance_at_entry
+        cash = 10_000.0 - (first.total_cost + first.fees)
+        assert value == pytest.approx(cash + first.total_cost, abs=1e-9)
+        held = first.total_cost + first.fees
+        assert add.kelly_fraction == pytest.approx(
+            held_pair_fraction(f2, held, value), abs=1e-12)
+        # Its budget is min(f2 x value - held, cash); the cash does not bind here
+        budget = kelly_budget(value, add.kelly_fraction, cash)
+        assert budget == pytest.approx(f2 * value - held, abs=1e-9)
+        assert budget < cash
+        # The largest count whose contracts and exact fees fit that budget. By
+        # hand: 520 pairs cost $390.00 + $14.84 on Monday 1, so the value is
+        # $9,985.16 and f2 of it is $1,034.11; less the $404.84 stake that
+        # leaves $629.27, which buys 1,196 pairs ($598.00 + $30.99); 1,197
+        # would cost $629.51
+        legs = (add.entry_pA, add.entry_nB)
+        assert (first.n, add.n) == (520, 1196)
+        assert budget == pytest.approx(629.27, abs=0.005)
+        assert _pair_cost(add.n, *legs) == pytest.approx(add.total_cost + add.fees, abs=1e-9)
+        assert _pair_cost(add.n, *legs) <= budget < _pair_cost(add.n + 1, *legs)
+        # So the whole position, fees included, stays within Kelly's share of
+        # the portfolio value, and the add-on within what a new pair would stake
+        assert held + add.total_cost + add.fees <= f2 * value + 1e-9
+        assert add.total_cost + add.fees <= min(f2 * value, cash) + 1e-9
+        # The equity curve carries both trades: fees on entry, pay-out on exit
+        final = float(on.equity_df["portfolio_value"].iloc[-1])
+        assert final == pytest.approx(10_000.0 + first.profit + add.profit, abs=1e-9)
+        assert on.add_to_held is True and off.add_to_held is False
+        # The peak is the second Monday's fraction either way
+        assert on.peak_kelly_fraction == off.peak_kelly_fraction == pytest.approx(f2, abs=1e-12)
+        assert self._lines(caplog, _ADD_ON_LINE) == [
+            _ADD_ON_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
+
+    def test_the_account_value_is_the_equity_curve_s(self):
+        """The portfolio value an add-on is sized on (its balance_at_entry)
+        is the equity curve's portfolio value at the close before its Monday,
+        read off the curve rather than rebuilt from the trades' fields. Pass 2
+        and the curve value open trades the same way, fees excluded (this
+        hand-built record has no quotes, so both at cost); this pins the two
+        to one figure, so a change to one that the other does not follow
+        fails here. The stake beside it counts the fees."""
+        p = self._widening_pair()
+        f2 = _uncapped_kelly({"pair_type": "time_series", "entry": p["entry"]["later"][0]}, 0.85)
+        on = self._sim([p], k=0.85, add_to_held=True)
+        first, add = on.trades
+        assert add.entry_date == _LADDER_M2
+        curve = on.equity_df.set_index("date")["portfolio_value"]
+        value = float(curve[_LADDER_M2 - timedelta(days=1)])
+        # Nothing pays out between the Mondays, so the curve has lost only
+        # the first trade's fees
+        assert value == pytest.approx(10_000.0 - first.fees, abs=1e-9)
+        assert add.balance_at_entry == pytest.approx(value, abs=1e-9)
+        assert add.kelly_fraction == pytest.approx(held_pair_fraction(
+            f2, first.total_cost + first.fees, value), abs=1e-12)
+
+    def test_a_pair_already_at_its_kelly_share_is_skipped_and_counted(self, caplog):
+        # The same quotes on both Mondays: the pair already holds its share
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-03-20"),
+                           _ladder_market("PB", "EVB-1", "2026-03-20"), "q",
+                           [_LADDER_M1, _LADDER_M2])
+        f = _uncapped_kelly(p, 0.75)
+        with caplog.at_level(logging.INFO):
+            on = self._sim([p], add_to_held=True)
+        assert _traded(on) == [("PA", _LADDER_M1)]
+        (first,) = on.trades
+        # Nothing pays out between the Mondays, so Monday 2's value has lost
+        # only the first trade's fees, which the stake counts
+        assert held_pair_fraction(f, first.total_cost + first.fees, 10_000.0 - first.fees) <= 0
+        assert self._lines(caplog, _ADD_ON_CAP_LINE) == [
+            _ADD_ON_CAP_LINE + "k=0.750, band 0-1, all, adding to held pairs): 1"]
+        assert self._lines(caplog, _ADD_ON_LINE) == []
+        # A quiet run logs it at DEBUG only
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            self._sim([p], add_to_held=True, quiet=True)
+        (record,) = [r for r in caplog.records if r.getMessage().startswith(_ADD_ON_CAP_LINE)]
+        assert record.levelno == logging.DEBUG
+        # Quotes that narrow on Monday 2 shrink the share below the stake too
+        narrowing = _ladder_record(_ladder_market("PA", "EVA-1", "2026-03-20"),
+                                   _ladder_market("PB", "EVB-1", "2026-03-20"), "q",
+                                   [(_LADDER_M1, *self._WIDE), (_LADDER_M2, *self._NARROW)])
+        f1, f2 = (_uncapped_kelly({"pair_type": "time_series", "entry": m}, 0.85)
+                  for m in backtester._entry_mondays(narrowing["entry"]))
+        assert 0 < f2 < f1 < 0.20
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            on = self._sim([narrowing], k=0.85, add_to_held=True)
+        assert _traded(on) == [("PA", _LADDER_M1)]
+        assert self._lines(caplog, _ADD_ON_CAP_LINE) == [
+            _ADD_ON_CAP_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
+
+    def test_a_held_pair_at_unchanged_quotes_adds_nothing(self, caplog):
+        """A held pair's stake counts the fees paid for it, while the
+        portfolio value leaves them out (they are spent), so a pair that
+        bought its whole Kelly share adds nothing on later Mondays at the
+        same quotes: no small top-up every week, each paying its own
+        rounded-up fee.
+
+        Worked by hand at k 0.75 (pre_toggle_defaults), where these quotes'
+        Kelly fraction is 6/31 (see TestSizesOnPortfolioValue). Monday 1's
+        share is $1,935.48: 3,081 pairs cost $1,848.60 plus $86.28 of fees,
+        $1,934.88, and 3,082 would cost $1,935.50. Nothing pays out before
+        Monday 3, so Mondays 2 and 3 both value the portfolio at $9,913.72,
+        and 6/31 of it is $1,918.78, $16.10 below the stake: both are skipped
+        as already at the share. A stake without the fees ($1,848.60) would
+        leave the pair $70.18 short each time, enough for 111 more pairs."""
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-03-20"),
+                           _ladder_market("PB", "EVB-1", "2026-03-20"), "q",
+                           [_LADDER_M1, _LADDER_M2, _LADDER_M3])
+        f = _uncapped_kelly(p, 0.75)
+        assert f == pytest.approx(6 / 31, abs=1e-12)
+        with caplog.at_level(logging.INFO):
+            on = self._sim([p], add_to_held=True)
+        # One trade on Monday 1, and nothing added on Monday 2 or 3
+        assert _traded(on) == [("PA", _LADDER_M1)]
+        (first,) = on.trades
+        assert first.n == 3081
+        legs = (first.entry_pA, first.entry_nB)
+        stake = first.total_cost + first.fees
+        assert stake == pytest.approx(1_934.88, abs=1e-9)
+        # Monday 1 bought its whole share: one more pair would not have fit
+        assert _pair_cost(first.n, *legs) <= f * 10_000.0 < _pair_cost(first.n + 1, *legs)
+        # On Mondays 2 and 3 the value has lost only the fees, and its share
+        # is below the stake
+        value = 10_000.0 - first.fees
+        assert f * value == pytest.approx(1_918.78, abs=0.005)
+        assert f * value - stake == pytest.approx(-16.10, abs=0.005)
+        assert held_pair_fraction(f, stake, value) < 0
+        assert self._lines(caplog, _ADD_ON_CAP_LINE) == [
+            _ADD_ON_CAP_LINE + "k=0.750, band 0-1, all, adding to held pairs): 2"]
+        assert self._lines(caplog, _ADD_ON_LINE) == []
+        # Counting the fees is what decides it: without them the pair would
+        # be $70.18 short on each of those Mondays, and 111 pairs would fit
+        short = f * value - first.total_cost
+        assert short == pytest.approx(70.18, abs=0.005)
+        assert _pair_cost(111, *legs) <= short < _pair_cost(112, *legs)
+
+    def test_an_add_on_sizes_as_live_compute_trade_does(self):
+        """An add-on sizes as live compute_trade sizes it on the same
+        portfolio value, cash and stake: the backtest's value (cash plus open
+        trades at contract cost), its cash, and the pair's contracts plus the
+        fees paid for them as HeldPair.stake_dollars. Here the cash does not
+        bind."""
+        p = self._widening_pair()
+        on = self._sim([p], k=0.85, size_cap=0.20, add_to_held=True)
+        first, add = on.trades
+        assert add.add_on
+        value = add.balance_at_entry
+        cash = 10_000.0 - (first.total_cost + first.fees)
+        assert value * add.kelly_fraction < cash  # the cash does not bind
+        spec = _live_add_on(first, value, cash, k=0.85, size_cap=0.20, quotes=(0.20, 0.70, 0.30))
+        assert spec.x == add.n
+        assert spec.kelly_fraction == pytest.approx(add.kelly_fraction, abs=1e-12)
+        assert spec.total_cost_with_fees == pytest.approx(add.total_cost + add.fees, abs=1e-9)
+
+    def _cash_bound_fixture(self):
+        """The widening pair P and a same-title pair R that asks another
+        question, both opening on Monday 1; R pays out on 2026-02-20, after
+        Monday 2. Run with no per-trade cap, R's Kelly fraction (about 0.93)
+        leaves P too little cash on Monday 2 to buy what it is missing of its
+        Kelly share: on the pair alone the cash can never bind, since
+        f x value - stake is at most the cash when f is at most 1."""
+        title = "Will it hail by March 1, 2026?"
+        ra = _worded_market("RA", "EVR-1", title, "2026-02-20")
+        rb = _worded_market("RB", "EVS-1", title, "2026-02-20", result="yes")
+        r = _same_title_record([(_LADDER_M1, ra, rb, 0.85, 0.15)], group_key=("", title, ""))
+        return [self._widening_pair(), r]
+
+    def test_the_cash_left_limits_an_add_on_as_it_limits_live(self):
+        entries = self._cash_bound_fixture()
+        p, r = entries
+        fr = _uncapped_kelly({"pair_type": "same_title", "entry": r["entry"]}, 0.85)
+        f2 = _uncapped_kelly({"pair_type": "time_series", "entry": p["entry"]["later"][0]}, 0.85)
+        assert 0.90 < fr < 0.95 and 0 < f2 < 0.20
+        on = self._sim(entries, k=0.85, size_cap=1.0, add_to_held=True)
+        # R ranks first on Monday 1 (its monthly return is the larger)
+        assert _traded(on) == [("RA", _LADDER_M1), ("PA", _LADDER_M1), ("PA", _LADDER_M2)]
+        r_trade, first, add = on.trades
+        assert (r_trade.add_on, first.add_on, add.add_on) == (False, False, True)
+        # Monday 2: R and P's first trade are both open at contract cost
+        cash = 10_000.0 - (r_trade.total_cost + r_trade.fees) - (first.total_cost + first.fees)
+        value = add.balance_at_entry
+        assert value == pytest.approx(cash + r_trade.total_cost + first.total_cost, abs=1e-9)
+        stake = first.total_cost + first.fees
+        assert add.kelly_fraction == pytest.approx(
+            held_pair_fraction(f2, stake, value), abs=1e-12)
+        # The cash binds: the pair is missing more of its Kelly share than
+        # the cash left can buy (by hand, $575.37 of it against $328.24 of
+        # cash, the stake counting the first trade's $14.84 of fees)
+        assert cash < f2 * value - stake - 100.0
+        assert kelly_budget(value, add.kelly_fraction, cash) == cash
+        # The largest count whose contracts and exact fees fit the cash left
+        legs = (add.entry_pA, add.entry_nB)
+        assert _pair_cost(add.n, *legs) <= cash + 1e-9 < _pair_cost(add.n + 1, *legs)
+        # ... and what live compute_trade sizes on that value, cash and stake
+        spec = _live_add_on(first, value, cash, k=0.85, size_cap=1.0, quotes=(0.20, 0.70, 0.30))
+        assert spec.x == add.n
+        assert spec.total_cost_with_fees == pytest.approx(add.total_cost + add.fees, abs=1e-9)
+        # CONTROL: without R the same add-on is not limited by the cash
+        alone = self._sim([self._widening_pair()], k=0.85, size_cap=1.0, add_to_held=True)
+        assert alone.trades[1].add_on and alone.trades[1].n > add.n
+
+    def test_another_open_trade_on_its_ladder_refuses_the_add_on(self, caplog):
+        # P asks "will it snow by ...?" at two deadlines, narrow on Monday 1
+        # and wide on Monday 3. S, a same-title pair asking the same question
+        # in two more events, opens on Monday 2 (an open time-series trade
+        # never holds a same-title pair back) and is still open on Monday 3.
+        tqa = _worded_market("TQA", "EVR-1", "Will it snow by February 20, 2026?", "2026-03-20")
+        tqb = _worded_market("TQB", "EVR-2", "Will it snow by March 5, 2026?", "2026-03-20")
+        question = backtester._ts_group_key(tqa)
+        p = _ladder_record(tqa, tqb, question,
+                           [(_LADDER_M1, *self._NARROW), (_LADDER_M3, *self._WIDE)])
+        title = "Will it snow by January 30, 2026?"
+        s = _same_title_record(
+            [(_LADDER_M2, _worded_market("QA", "EVQ-1", title, "2026-02-10"),
+              _worded_market("QB", "EVQ-2", title, "2026-02-10", result="yes"), 0.70, 0.40)],
+            group_key=("", title, ""))
+        assert question and all(backtester._ts_group_key(m) == question
+                                for m in (tqb, s["entry"]["mA"], s["entry"]["mB"]))
+        # CONTROL: alone, P adds on Monday 3
+        assert _traded(self._sim([p], k=0.85, add_to_held=True)) == [
+            ("TQA", _LADDER_M1), ("TQA", _LADDER_M3)]
+        with caplog.at_level(logging.INFO):
+            on = self._sim([p, s], k=0.85, add_to_held=True)
+        assert _traded(on) == [("TQA", _LADDER_M1), ("QA", _LADDER_M2)]
+        # Counted on the add-on line, not the line for pairs held back from
+        # opening
+        assert self._lines(caplog, _ADD_ON_LADDER_LINE) == [
+            _ADD_ON_LADDER_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
+        assert self._lines(caplog, "Time-series pairs skipped on a Monday") == []
+
+    def test_an_add_on_needs_both_markets_unpaid(self):
+        # PA pays out on 01-10, before Monday 2; PB stays open. The same pair
+        # cannot be bought again once PA has paid out (a new pair may still
+        # add to PB alone: TestAddToALoneLeg)
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-01-10"),
+                           _ladder_market("PB", "EVB-1", "2026-03-20"), "q",
+                           [(_LADDER_M1, *self._NARROW), (_LADDER_M2, *self._WIDE)])
+        assert _traded(self._sim([p], k=0.85, add_to_held=True)) == [("PA", _LADDER_M1)]
+        # CONTROL: with PA paying out with PB, Monday 2 adds on
+        assert _traded(self._sim([self._widening_pair()], k=0.85, add_to_held=True)) == [
+            ("PA", _LADDER_M1), ("PA", _LADDER_M2)]
+
+    def test_a_second_pair_on_the_same_ladder_is_still_refused(self, caplog):
+        # P2 asks P's question and first passes on Monday 2, while P is open:
+        # it is refused as before, and P adds on
+        p = self._widening_pair()
+        p2 = _ladder_record(_ladder_market("P2A", "EVC-1", "2026-03-20"),
+                            _ladder_market("P2B", "EVD-1", "2026-03-20"), "q",
+                            [(_LADDER_M2, *self._WIDE)])
+        with caplog.at_level(logging.INFO):
+            on = self._sim([p, p2], k=0.85, add_to_held=True)
+        assert _traded(on) == [("PA", _LADDER_M1), ("PA", _LADDER_M2)]
+        assert on.trades[1].add_on
+        assert self._lines(caplog, "Time-series pairs skipped on a Monday") == [
+            "Time-series pairs skipped on a Monday because we still held a trade on the "
+            "same ladder (k=0.850, band 0-1, all, adding to held pairs): 1"]
+        assert self._lines(caplog, _ADD_ON_LADDER_LINE) == []
+
+    def test_an_add_on_whose_markets_share_no_ladder_is_refused(self, caplog):
+        # SA and SB sit in two events and are worded differently, so they
+        # share no ladder label: live would never find them as a held pair
+        sa = _ladder_market("SA", "EVS-1", "2026-03-01")
+        sb = _ladder_market("SB", "EVT-1", "2026-03-01", result="yes")
+        assert not (backtester._ladder_keys_dict(sa) & backtester._ladder_keys_dict(sb))
+        rows = [(_LADDER_M1, sa, sb, 0.70, 0.40), (_LADDER_M3, sa, sb, 0.80, 0.30)]
+        with caplog.at_level(logging.INFO):
+            on = self._sim([_same_title_record(rows, group_key=("", "Q", ""))],
+                           size_cap=1.0, add_to_held=True)
+        assert _traded(on) == [("SA", _LADDER_M1)]
+        assert self._lines(caplog, _ADD_ON_LADDER_LINE) == [
+            _ADD_ON_LADDER_LINE + "k=0.750, band 0-1, all, no cap, adding to held pairs): 1"]
+        # CONTROL: worded alike, the same quotes add on Monday 3
+        xa = _worded_market("XA", "EVX-1", _RAIN, "2026-03-01")
+        xb = _worded_market("XB", "EVY-1", _RAIN, "2026-03-01", result="yes")
+        rows = [(_LADDER_M1, xa, xb, 0.70, 0.40), (_LADDER_M3, xa, xb, 0.80, 0.30)]
+        assert _traded(self._sim([_same_title_record(rows)], size_cap=1.0,
+                                 add_to_held=True)) == [("XA", _LADDER_M1),
+                                                        ("XA", _LADDER_M3)]
+
+    def test_a_same_title_pair_adds_on_only_with_the_same_legs(self):
+        # XA and XB ask one question on two series. On Monday 2 XB is the
+        # pricier side, so that Monday is the opposite trade and is never an
+        # add-on, though its Kelly fraction is the largest; Monday 3 has
+        # Monday 1's legs and a wider divergence, so it adds on. No per-trade
+        # cap, so the fractions are Kelly's own.
+        xa = _worded_market("XA", "EVX-1", _RAIN, "2026-03-01")
+        xb = _worded_market("XB", "EVY-1", _RAIN, "2026-03-01", result="yes")
+        rec = _same_title_record([(_LADDER_M1, xa, xb, 0.70, 0.40),
+                                  (_LADDER_M2, xb, xa, 0.90, 0.10),
+                                  (_LADDER_M3, xa, xb, 0.80, 0.30)])
+        f1, f2, f3 = (_uncapped_kelly({"pair_type": "same_title", "entry": m}, 0.75)
+                      for m in backtester._entry_mondays(rec["entry"]))
+        assert 0 < f1 < f3 < f2
+        off = self._sim([rec], size_cap=1.0)
+        on = self._sim([rec], size_cap=1.0, add_to_held=True)
+        assert _traded(off) == [("XA", _LADDER_M1)]
+        assert _traded(on) == [("XA", _LADDER_M1), ("XA", _LADDER_M3)]
+        assert [(t.ticker_b, t.add_on) for t in on.trades] == [("XB", False), ("XB", True)]
+        assert astuple(on.trades[0]) == astuple(off.trades[0])
+        # The peak covers the Mondays a trade may be made on — Monday 3 when
+        # adding, never the opposite trade of Monday 2
+        assert off.peak_kelly_fraction == pytest.approx(f1, abs=1e-12)
+        assert on.peak_kelly_fraction == pytest.approx(f3, abs=1e-12)
+
+    def test_a_same_title_group_loser_never_trades(self):
+        # W and L are one title group; W closes sooner, so its monthly ratio
+        # is larger and it wins the group. L's later Monday could only add to
+        # a trade L never made.
+        def pair(a, b, a_event, b_event, paid_out):
+            ma = _worded_market(a, a_event, _RAIN, paid_out)
+            mb = _worded_market(b, b_event, _RAIN, paid_out, result="yes")
+            return _same_title_record([(_LADDER_M1, ma, mb, 0.70, 0.40),
+                                       (_LADDER_M3, ma, mb, 0.80, 0.30)])
+
+        w = pair("WA", "WB", "EVW-1", "EVW-2", "2026-02-20")
+        loser = pair("LA", "LB", "EVL-1", "EVL-2", "2026-03-20")
+        assert _traded(self._sim([loser, w], size_cap=1.0, add_to_held=True)) == [
+            ("WA", _LADDER_M1), ("WA", _LADDER_M3)]
+        # CONTROL: alone, L trades and adds on
+        assert _traded(self._sim([loser], size_cap=1.0, add_to_held=True)) == [
+            ("LA", _LADDER_M1), ("LA", _LADDER_M3)]
+
+    def test_the_completion_line_names_an_add_on_run(self, caplog):
+        p = self._widening_pair()
+        with caplog.at_level(logging.INFO):
+            for kw in ({}, {"add_to_held": True}, {"size_cap": 0.35},
+                       {"size_cap": 0.35, "add_to_held": True},
+                       {"tier_floors": False, "add_to_held": True}):
+                self._sim([p], **kw)
+        lines = _completion_lines(caplog)
+        assert lines[0].startswith("Backtest complete at k=0.750, band 0-1, all:")
+        assert lines[1].startswith(
+            "Backtest complete at k=0.750, band 0-1, all, adding to held pairs:")
+        assert lines[3].startswith(
+            "Backtest complete at k=0.750, band 0-1, all, cap 35%, adding to held pairs:")
+        assert lines[4].startswith("Backtest complete at k=0.750, band 0-1 with the tier "
+                                   "floors off, all, adding to held pairs:")
+        prefixes = _completion_prefixes(lines)
+        assert len(prefixes) == len(set(prefixes)) == 5
+
+
+@pytest.mark.usefixtures("pre_toggle_defaults")
+class TestAddToALoneLeg:
+    """With add_to_held, once an open trade's other market has paid out its
+    remaining leg is a lone leg, as live's scanner.held_pairs finds it: a new
+    pair buying the side held on that market, beside a market no open trade
+    holds, may add to it, sized by config.held_pair_fraction with that leg
+    alone as the stake (its value plus its fee). Another open trade on a
+    ladder of either market refuses it, and so does buying the held market
+    on its other side. Figures are at pre_toggle_defaults."""
+
+    _START = TestAddToHeldPairs._START
+    _sim = TestAddToHeldPairs._sim
+    _lines = staticmethod(TestAddToHeldPairs._lines)
+    _NARROW, _WIDE = TestAddToHeldPairs._NARROW, TestAddToHeldPairs._WIDE
+
+    @staticmethod
+    def _held_and_new(*, new_event="EVQ-1"):
+        """P (YES PA / NO PB) on Monday 1, PA paying out on 01-10; Q (YES QA / NO PB) on Monday 2."""
+        pb = _ladder_market("PB", "EVB-1", "2026-03-20")
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-01-10"), pb, "q",
+                           [(_LADDER_M1, *TestAddToALoneLeg._NARROW)])
+        q = _ladder_record(_ladder_market("QA", new_event, "2026-03-20"), pb, "q",
+                           [(_LADDER_M2, *TestAddToALoneLeg._WIDE)])
+        return p, q
+
+    def test_a_new_pair_adds_to_the_leg_left_open(self, caplog):
+        p, q = self._held_and_new()
+        # CONTROL: without adding, PB is still held, so Q never trades
+        assert _traded(self._sim([p, q], k=0.85)) == [("PA", _LADDER_M1)]
+        with caplog.at_level(logging.INFO):
+            on = self._sim([p, q], k=0.85, add_to_held=True)
+        assert _traded(on) == [("PA", _LADDER_M1), ("QA", _LADDER_M2)]
+        first, add = on.trades
+        assert (first.add_on, add.add_on) == (False, True)
+        # The stake is PB's leg alone: its contracts at the NO price paid
+        # (the record carries no quotes) plus the fee paid on that leg
+        stake = first.n * first.entry_nB + fee_leg_exact(first.n, first.entry_nB)
+        f_q = _uncapped_kelly({"pair_type": "time_series", "entry": q["entry"]}, 0.85)
+        assert add.kelly_fraction == pytest.approx(
+            held_pair_fraction(f_q, stake, add.balance_at_entry), abs=1e-12)
+        # Less than the whole first trade's stake, which still counts PA
+        assert stake < first.total_cost + first.fees
+        assert self._lines(caplog, _ADD_ON_LINE) == [
+            _ADD_ON_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
+
+    def test_the_leg_is_not_lone_while_its_partner_is_open(self):
+        # PA pays out with PB: on Monday 2 the pair is still whole, so Q,
+        # which shares PB, is refused
+        pb = _ladder_market("PB", "EVB-1", "2026-03-20")
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-03-20"), pb, "q",
+                           [(_LADDER_M1, *self._NARROW)])
+        q = _ladder_record(_ladder_market("QA", "EVQ-1", "2026-03-20"), pb, "q",
+                           [(_LADDER_M2, *self._WIDE)])
+        assert _traded(self._sim([p, q], k=0.85, add_to_held=True)) == [("PA", _LADDER_M1)]
+
+    def test_buying_the_held_market_on_its_other_side_is_refused(self):
+        # R buys YES on PB, which the open trade holds NO on
+        p, _q = self._held_and_new()
+        r = _ladder_record(p["entry"]["mB"], _ladder_market("RB", "EVR-1", "2026-03-25"), "q",
+                           [(_LADDER_M2, *self._WIDE)])
+        assert _traded(self._sim([p, r], k=0.85, add_to_held=True)) == [("PA", _LADDER_M1)]
+
+    def test_another_open_trade_on_the_new_markets_ladder_refuses_it(self, caplog):
+        # S, open since Monday 1, holds QA's event: adding there would stack beside S
+        p, q = self._held_and_new(new_event="EVS-1")
+        s = _ladder_record(_ladder_market("SA", "EVS-1", "2026-03-20"),
+                           _ladder_market("SB", "EVT-1", "2026-03-20"), "s",
+                           [(_LADDER_M1, *self._NARROW)])
+        with caplog.at_level(logging.INFO):
+            on = self._sim([p, s, q], k=0.85, add_to_held=True)
+        assert sorted(_traded(on)) == [("PA", _LADDER_M1), ("SA", _LADDER_M1)]
+        assert self._lines(caplog, _ADD_ON_LADDER_LINE) == [
+            _ADD_ON_LADDER_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
+
+
+@pytest.mark.usefixtures("pre_toggle_defaults")
+class TestAddToHeldCapParity:
+    """A CapSweep that adds to held pairs (add_to_held=True) has no eager
+    point to seed from (it refuses any), so every cap is simulated but for
+    the caps at or above a simulated point's peak Kelly fraction, which share
+    it. That sharing is exact only because the cap reaches an add-on's size
+    through min(pair cap, f*) alone, as it reaches any trade's, and because
+    the peak covers every Monday an add-on may be made on; a rule that
+    multiplied the portfolio value by the cap, or a peak that skipped a
+    same-title pair's later Mondays, would break it. The portfolio value, the
+    cash left and a pair's stake are walk state that every cap at or above
+    the peak shares. The gate: every cap of SIZE_CAP_SWEEP equals a fresh
+    _simulate_at_discount(..., add_to_held=True, size_cap=cap) on trades and
+    equity."""
+
+    _START = date(2026, 1, 1)
+    _END = date(2026, 4, 1)
+    _BAND = (0.0, 1.0)
+    _POPS = ("all", "time_series", "ladder", "cross")
+
+    def _sweep(self, entries, ks, *, checks=False, split_date=None):
+        return backtester.CapSweep(
+            caps=backtester.SIZE_CAP_SWEEP, primary_cap=0.20, bands=(self._BAND,),
+            ks=tuple(ks), primary_k=ks[0], start_date=self._START,
+            initial_balance=10_000.0, split_date=split_date, checks=checks,
+            entries_by_band={self._BAND: entries}, st_entries=[], eager={},
+            add_to_held=True,
+            end_dates={(self._BAND, k, pop): self._END for k in ks for pop in self._POPS})
+
+    def _fresh(self, subset, k, cap, population="all"):
+        return backtester._simulate_at_discount(
+            subset, self._START, 10_000.0, k=k, spread_band=self._BAND,
+            population=population, size_cap=cap, quiet=True, end_date=self._END,
+            add_to_held=True)
+
+    def _assert_every_cap_is_fresh(self, cs, entries) -> int:
+        """Check every cap of every k of the "all" population; return how many
+        add-on trades the cells made."""
+        add_ons = 0
+        for k in cs.ks:
+            cell = cs.cell(self._BAND, k)
+            points = {cap: cell[cap]["all"] for cap in cs.caps}
+            assert all(set(cell[cap]) == {"all"} for cap in cs.caps)
+            for cap, point in points.items():
+                fresh = self._fresh(entries, k, cap)
+                assert (point.k, point.spread_band, point.population) == (k, self._BAND, "all")
+                assert point.size_cap == cap and point.add_to_held is True
+                assert [astuple(t) for t in point.trades] == [
+                    astuple(t) for t in fresh.trades], (k, cap)
+                pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df)
+                assert point.peak_kelly_fraction == fresh.peak_kelly_fraction
+                add_ons += sum(t.add_on for t in point.trades)
+            # A cap below the peak is its own simulation; every cap at or
+            # above the first simulated one there shares it
+            peak = points[cs.caps[0]].peak_kelly_fraction
+            below = [points[c] for c in cs.caps if c < peak]
+            above = [points[c] for c in cs.caps if c >= peak]
+            assert len({id(p.trades) for p in below}) == len(below)
+            assert len({id(p.trades) for p in above}) == 1
+            assert all(id(p.trades) != id(above[0].trades) for p in below)
+        return add_ons
+
+    # The same-title pair's second Monday, after P's and R's trades
+    _ST_M2 = date(2026, 2, 2)
+
+    def _cap_bound_fixture(self):
+        """P passes at about +0.041 (Monday 1) and +0.104 (Monday 2) at k 0.85,
+        so its add-on is bound by a cap of 5% or 10% and by nothing from 15%
+        up; R, on its own ladder, competes for the cash on Monday 1. U, a
+        same-title pair (whose Kelly fraction does not depend on k), opens on
+        Monday 3 at about +0.235 and adds on 2026-02-02, with the same legs, at
+        about +0.527: the caps from 25% to 50%, above its first Monday's
+        fraction and below its later one's, still bind its add-on, so only the
+        later Monday's fraction marks where the caps stop mattering. Under the
+        class's pre_toggle_defaults the extra same-title cap is 100%, so the
+        sweep's cap is U's only cap."""
+        p = TestAddToHeldPairs()._widening_pair()
+        r = _ladder_record(_ladder_market("RA", "EVR-1", "2026-02-20"),
+                           _ladder_market("RB", "EVS-1", "2026-02-20"), "r", [_LADDER_M1])
+        ua = _worded_market("UA", "EVU-1", _RAIN, "2026-03-01")
+        ub = _worded_market("UB", "EVV-1", _RAIN, "2026-03-01", result="yes")
+        u = _same_title_record([(_LADDER_M3, ua, ub, 0.55, 0.45),
+                                (self._ST_M2, ua, ub, 0.57, 0.43)])
+        return [p, r, u]
+
+    def test_every_cap_of_a_cap_bound_add_on_equals_a_fresh_simulation(self):
+        entries = self._cap_bound_fixture()
+        p, _r, u = entries
+        cs = self._sweep(entries, (0.75, 0.85))
+        assert self._assert_every_cap_is_fresh(cs, entries) > 0
+        assert cs.simulated > 0 and cs.reused > 0
+        # Not vacuous: at k 0.85 the cap binds P's add-on at 5% and 10% and
+        # not from 15%, where every cap sizes it alike
+        cell = cs.cell(self._BAND, 0.85)
+
+        def add_on(cap, ticker="PA"):
+            (t,) = [t for t in cell[cap]["all"].trades if t.add_on and t.ticker_a == ticker]
+            return t
+
+        f2 = _uncapped_kelly({"pair_type": "time_series", "entry": p["entry"]["later"][0]}, 0.85)
+        assert 0.10 < f2 < 0.15
+        fractions = {cap: add_on(cap).kelly_fraction for cap in (0.05, 0.10, 0.15, 0.5, 1.0)}
+        assert fractions[0.05] < fractions[0.10] < fractions[0.15]
+        assert fractions[0.15] == fractions[0.5] == fractions[1.0]
+        for cap in (0.05, 0.10):
+            trades = cell[cap]["all"].trades
+            first = next(t for t in trades if t.ticker_a == "PA")
+            t = add_on(cap)
+            # The portfolio value the add-on records: the checkpoint's cash
+            # plus every earlier trade (none has paid out) at contract cost
+            earlier = [o for o in trades if o.entry_date < t.entry_date]
+            cash = 10_000.0 - sum(o.total_cost + o.fees for o in earlier)
+            value = t.balance_at_entry
+            assert value == pytest.approx(cash + sum(o.total_cost for o in earlier), abs=1e-9)
+            # The cap is P's capped fraction on Monday 2, and its stake is its
+            # first trade's contracts plus the fees paid for them
+            assert t.kelly_fraction == pytest.approx(held_pair_fraction(
+                cap, first.total_cost + first.fees, value), abs=1e-12)
+            legs = (t.entry_pA, t.entry_nB)
+            budget = kelly_budget(value, t.kelly_fraction, cash)
+            assert budget < cash
+            assert _pair_cost(t.n, *legs) <= budget < _pair_cost(t.n + 1, *legs)
+        # By hand: P's first trade is 520 pairs, a $404.84 stake with its
+        # fees. At a 5% cap Monday 2's value is $9,962.86, 5% of it $498.14,
+        # so $93.30 is missing: 177 pairs ($93.10; 178 would cost $93.62).
+        # At 10% the value is $9,946.82: $994.68 - $404.84 = $589.84, so
+        # 1,121 pairs ($589.54; 1,122 would cost $590.07). From 15% up the
+        # cap no longer binds and every cap adds 1,188
+        assert [add_on(cap).n for cap in (0.05, 0.10, 0.15, 0.5, 1.0)] == [
+            177, 1121, 1188, 1188, 1188]
+        # The same-title add-on: its later Monday's fraction, not its first
+        # one's, is the cell's peak, so the caps between the two are each
+        # simulated rather than shared (a peak read off a same-title pair's
+        # first Monday alone would share them, and differ from a fresh run)
+        u1, u2 = (_uncapped_kelly({"pair_type": "same_title", "entry": m}, 0.85)
+                  for m in backtester._entry_mondays(u["entry"]))
+        assert 0.20 < u1 < 0.25 < 0.50 < u2 < 0.55
+        assert cell[1.0]["all"].peak_kelly_fraction == pytest.approx(u2, abs=1e-12)
+        st = {cap: add_on(cap, "UA") for cap in (0.25, 0.30, 0.40, 0.50, 0.55, 1.0)}
+        assert all(t.entry_date == self._ST_M2 for t in st.values())
+        assert (st[0.25].kelly_fraction < st[0.30].kelly_fraction
+                < st[0.40].kelly_fraction < st[0.50].kelly_fraction
+                < st[0.55].kelly_fraction == st[1.0].kelly_fraction)
+
+    def test_every_cap_of_a_cash_bound_add_on_equals_a_fresh_simulation(self):
+        # TestAddToHeldPairs' cash-bound fixture: with no cap, R leaves P too
+        # little cash on Monday 2 to buy what it is missing of its share
+        entries = TestAddToHeldPairs()._cash_bound_fixture()
+        cs = self._sweep(entries, (0.85,))
+        assert self._assert_every_cap_is_fresh(cs, entries) > 0
+        # Not vacuous: the cash binds P's add-on at the uncapped cell
+        trades = cs.cell(self._BAND, 0.85)[1.0]["all"].trades
+        (add,) = [t for t in trades if t.add_on]
+        cash = 10_000.0 - sum(o.total_cost + o.fees for o in trades if o.entry_date < add.entry_date)
+        assert kelly_budget(add.balance_at_entry, add.kelly_fraction, cash) == cash
+        legs = (add.entry_pA, add.entry_nB)
+        assert _pair_cost(add.n, *legs) <= cash + 1e-9 < _pair_cost(add.n + 1, *legs)
+
+    def test_every_cap_of_the_multi_rung_fixture_equals_a_fresh_simulation(self, monkeypatch):
+        # TestOpenLadderExposure's fixture: P is refused on Monday 1 (its
+        # ladder is busy) and trades on Monday 2, beside R, S and T
+        res = TestOpenLadderExposure()._parity_run(monkeypatch)
+        entries = res.cap_sweep.entries_by_band[self._BAND]
+        self._assert_every_cap_is_fresh(self._sweep(entries, res.cap_sweep.ks), entries)
+
+    def test_every_cap_of_the_golden_fixture_equals_a_fresh_simulation(self, monkeypatch):
+        entries, _ = TestPrepareEntriesGolden()._prepare(monkeypatch, True)
+        cs = self._sweep(entries, (0.5, 0.75, 1.0))
+        # Not vacuous: the golden pairs add on at several caps
+        assert self._assert_every_cap_is_fresh(cs, entries) > 20
+
+    def test_the_checks_run_at_the_sweep_s_add_on_setting(self):
+        # With checks (a sweep that reads only the "all" point leaves checks
+        # off), the halves and the excluding-top-event run add to
+        # held pairs too. Split on Monday 3, the first half keeps P's two
+        # Mondays, so it adds on.
+        entries = self._cap_bound_fixture()
+        cs = self._sweep(entries, (0.85,), checks=True, split_date=_LADDER_M3)
+        cell = cs.cell(self._BAND, 0.85)
+        subsets = _cap_sweep_subsets(entries)
+        differs = 0
+        for cap in cs.caps:
+            for pop in ("all", "time_series"):
+                point = cell[cap][pop]
+                halves = backtester._split_halves(subsets[pop], _LADDER_M3)
+                assert point.halves == backtester._half_split(
+                    halves, self._START, 10_000.0, 0.85, self._BAND, population=pop,
+                    size_cap=cap, quiet=True, end_date=self._END, add_to_held=True)
+                fresh = self._fresh(subsets[pop], 0.85, cap, pop)
+                assert point.ex_top_event == backtester._ex_top_event(
+                    fresh, subsets[pop], self._START, 10_000.0, self._BAND,
+                    population=pop, quiet=True, end_date=self._END)
+                differs += point.halves != backtester._half_split(
+                    halves, self._START, 10_000.0, 0.85, self._BAND, population=pop,
+                    size_cap=cap, quiet=True, end_date=self._END)
+        assert differs > 0
+
+    def test_the_checks_forward_the_add_on_setting(self, monkeypatch):
+        """The halves and the top-event run take the add-on setting from the
+        sweep (halves) or the point (top event); a mutant that drops either
+        passes the fresh-simulation comparison, which uses the same helpers
+        on both sides."""
+        seen: list = []
+
+        def _fake(raw_entries, *a, **k):
+            seen.append(k)
+            return SimpleNamespace(equity_df=pd.DataFrame({"portfolio_value": [100.0]}),
+                                   trades=[])
+
+        monkeypatch.setattr(backtester, "_simulate_at_discount", _fake)
+        backtester._half_split(([], []), date(2026, 1, 1), 100.0, 0.6, (0.3, 0.6),
+                               add_to_held=True)
+        trades = [TestSweepHelpers._trade("E1", 5.0)]
+        entries = [{"entry": {"mA": {"event_ticker": "E1"}}}]
+        for flag in (True, False):
+            point = backtester.SweepPoint(k=0.6, equity_df=pd.DataFrame(), trades=trades,
+                                          add_to_held=flag)
+            backtester._ex_top_event(point, entries, date(2026, 1, 1), 100.0, (0.3, 0.6))
+        base = {"k": 0.6, "spread_band": (0.3, 0.6)}
+        assert seen == [{**base, "population": "all/H1", "add_to_held": True},
+                        {**base, "population": "all/H2", "add_to_held": True},
+                        {**base, "population": "all/ex-top", "add_to_held": True},
+                        {**base, "population": "all/ex-top"}]
+
+    def _plain_sweep(self, entries, **kw):
+        """A one-cell CapSweep over entries at k 0.85, the rest from kw (no
+        split date unless kw gives one)."""
+        kw.setdefault("split_date", None)
+        return backtester.CapSweep(
+            caps=backtester.SIZE_CAP_SWEEP, primary_cap=0.20, bands=(self._BAND,),
+            ks=(0.85,), primary_k=0.85, start_date=self._START, initial_balance=10_000.0,
+            entries_by_band={self._BAND: entries}, **kw)
+
+    def test_an_add_on_sweep_takes_no_eager_points(self):
+        """Every eager point was simulated without adding to held pairs, and a
+        sweep hands its eager point back at the primary cap (and copies of it
+        above its peak), so an add-on sweep given one would return points that
+        never added, stamped as if they had. It is refused when built."""
+        entries = [TestAddToHeldPairs()._widening_pair()]
+        eager = backtester._simulate_at_discount(
+            entries, self._START, 10_000.0, k=0.85, spread_band=self._BAND,
+            size_cap=0.20, quiet=True, end_date=self._END)
+        with pytest.raises(ValueError, match="takes no eager points"):
+            self._plain_sweep(entries, checks=False, st_entries=[],
+                              eager={(self._BAND, 0.85, "all"): eager}, add_to_held=True)
+        with pytest.raises(ValueError, match="takes no eager points"):
+            self._plain_sweep(entries, checks=False, st_entries=[], eager={},
+                              same_title_eager=eager, add_to_held=True)
+        # CONTROL: the same eager points are a plain sweep's seeds, and an
+        # add-on sweep with none builds
+        self._plain_sweep(entries, checks=False, st_entries=[],
+                          eager={(self._BAND, 0.85, "all"): eager}, same_title_eager=eager)
+        self._plain_sweep(entries, checks=False, st_entries=[], eager={}, add_to_held=True)
+
+    def test_an_add_on_cell_with_no_end_day_is_refused(self):
+        """An add-on sweep has no eager point to end a cell's curves where the
+        eager run's ended, so a cell end_dates gives no day — a k that differs
+        only by float noise included — is refused rather than ended on
+        whatever day the cell happens to be read, before anything is
+        simulated."""
+        entries = [TestAddToHeldPairs()._widening_pair()]
+        noisy = self._plain_sweep(entries, checks=False, st_entries=[], eager={},
+                                  add_to_held=True,
+                                  end_dates={(self._BAND, 0.85000001, "all"): self._END})
+        with pytest.raises(ValueError, match=r"end_dates has no day for .*0\.85, 'all'"):
+            noisy.cell(self._BAND, 0.85)
+        assert noisy.simulated == 0
+        # The same-title population needs its own day too
+        ua = _worded_market("UA", "EVU-1", _RAIN, "2026-03-01")
+        ub = _worded_market("UB", "EVV-1", _RAIN, "2026-03-01", result="yes")
+        st = [_same_title_record([(_LADDER_M3, ua, ub, 0.55, 0.45)])]
+        cells_only = self._plain_sweep(
+            entries + st, checks=True, split_date=_LADDER_M3, st_entries=st, eager={},
+            add_to_held=True, end_dates={(self._BAND, 0.85, pop): self._END
+                       for pop in ("all", "time_series", "ladder", "cross")})
+        with pytest.raises(ValueError, match=r"end_dates has no day for .*'same_title'"):
+            cells_only.same_title()
+        # CONTROL: the exact keys end every curve on the day given
+        exact = self._plain_sweep(
+            entries + st, checks=True, split_date=_LADDER_M3, st_entries=st, eager={},
+            add_to_held=True, end_dates={**{(self._BAND, 0.85, pop): self._END
+                          for pop in ("all", "time_series", "ladder", "cross")},
+                       (None, 0.85, "same_title"): self._END})
+        points = [p for by_pop in exact.cell(self._BAND, 0.85).values() for p in by_pop.values()]
+        points += list(exact.same_title().values())
+        assert points and all(p.equity_df["date"].iloc[-1] == self._END for p in points)
 
 
 class TestPrepareCandidates:
@@ -12486,6 +13340,19 @@ class TestSizeCap:
         assert backtester._sim_options(0.35, True, tier_floors=False) == {
             "size_cap": 0.35, "quiet": True, "tier_floors": False}
 
+    def test_sim_options_forwards_add_to_held_only_when_true(self):
+        # The add-on family's one forwarded keyword: every other call (the
+        # default, and an explicit False) carries none, so a fixed-signature
+        # stand-in for _simulate_at_discount never meets it
+        day = date(2026, 9, 26)
+        assert backtester._sim_options(None, False) == {}
+        assert backtester._sim_options(None, False, add_to_held=False) == {}
+        assert backtester._sim_options(None, False, add_to_held=True) == {"add_to_held": True}
+        assert backtester._sim_options(0.35, True, end_date=day, tier_floors=False,
+                                       add_to_held=True) == {
+            "size_cap": 0.35, "quiet": True, "end_date": day, "tier_floors": False,
+            "add_to_held": True}
+
     @pytest.mark.parametrize("cap,text", [
         (0.55, "55"), (0.2, "20"), (0.05, "5"), (1.0, "100"),
         (0.19999999999999998, "19.999999999999998"),
@@ -13307,6 +14174,407 @@ class TestCapSweepLogging:
         assert not [r for r in caplog.records if r.levelno >= logging.INFO]
 
 
+@pytest.fixture(scope="class")
+def add_on_run():
+    """The golden band sweep with the add-on family beside the size-cap sweeps,
+    over cap_sweep_run's NARROWED grid — floors (0, 0.35) x ceilings (0.5, 1.0)
+    x k (0.5, 1.0) plus the primary 0.75, so the two floor-0 bands bind at the
+    tiers: 4 bands x 3 k for the tier-on add-on sweep and 2 x 3 for the
+    tier-floors-off one. Beside it: the same run with the flag off and with
+    it left out, a run without the size-cap sweep, one without the tier-floors-off
+    family and one without the band sweep. Every simulation DURING the runs
+    goes through a spy that records its keywords, and every run's INFO log is
+    kept; the spy is undone before any cell is read, so the cells run the real
+    function. The clock is frozen while the runs go, so every equity frame the
+    tests compare across runs ends on one day. Pins apply_pre_toggle_defaults
+    on its own MonkeyPatch, as cap_sweep_run does."""
+    toggles = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
+        apply_pre_toggle_defaults(toggles)
+        golden = TestPrepareEntriesGolden()
+        golden._patch(mp)
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
+        mp.setattr(backtester, "datetime", type(
+            "Clock", (TestCapSweepEndDate._Clock,),
+            {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC)}))
+        sims: list = []
+        real = backtester._simulate_at_discount
+
+        def simulate_spy(raw_entries, start_date, initial_balance, k=None,
+                         spread_band=None, population="all", **kw):
+            sims.append((spread_band, k, population, len(raw_entries), tuple(sorted(kw))))
+            return real(raw_entries, start_date, initial_balance, k=k,
+                        spread_band=spread_band, population=population, **kw)
+
+        mp.setattr(backtester, "_simulate_at_discount", simulate_spy)
+
+        def run(**kw):
+            sims.clear()
+            handler = _LogCapture()
+            root = logging.getLogger()
+            old_level = root.level
+            root.setLevel(logging.INFO)
+            root.addHandler(handler)
+            try:
+                res = run_backtest_sweep(
+                    hist_client=MagicMock(), live_client=MagicMock(),
+                    start_date=golden._START, initial_balance=10_000.0,
+                    same_event_ladders=True, **kw)
+            finally:
+                root.removeHandler(handler)
+                root.setLevel(old_level)
+            return res, list(sims), list(handler.messages)
+
+        every = {"band_sweep": True, "tier_off_sweep": True, "cap_sweep": True}
+        on, sims_on, msgs_on = run(add_on_sweep=True, **every)
+        off, sims_off, msgs_off = run(add_on_sweep=False, **every)
+        default, sims_default, _ = run(**every)
+        no_cap, _, msgs_no_cap = run(band_sweep=True, tier_off_sweep=True, add_on_sweep=True)
+        no_off, _, msgs_no_off = run(band_sweep=True, cap_sweep=True, add_on_sweep=True)
+        single, _, msgs_single = run(band_sweep=False, add_on_sweep=True)
+        mp.undo()
+        # How many cells the two sweeps had simulated once the run was over,
+        # before any test reads one (a read simulates each cap, with no memo)
+        built = (on.add_on_cap_sweep.simulated, on.add_on_tier_off_cap_sweep.simulated)
+        yield SimpleNamespace(
+            on=on, off=off, default=default, no_cap=no_cap, no_off=no_off, single=single,
+            built=built, sims_on=sims_on, sims_off=sims_off, sims_default=sims_default,
+            msgs_on=msgs_on, msgs_off=msgs_off, msgs_no_cap=msgs_no_cap,
+            msgs_no_off=msgs_no_off, msgs_single=msgs_single, start=golden._START)
+    finally:
+        mp.undo()
+        toggles.undo()
+
+
+@pytest.mark.usefixtures("add_on_run")
+class TestAddOnSweep:
+    """run_backtest_sweep(add_on_sweep=True): the dashboard's "Add to held
+    pairs" family — two lazy CapSweeps (tier floors on, and off at the bands
+    they bind at) whose every simulation adds to held pairs, the "all"
+    population only. The run itself simulates nothing extra: its points, its
+    simulations and its INFO log are those of a run without the flag, but for
+    the setting line and the two summary lines. Each cell ends its curves on
+    the day its eager twin's ended."""
+
+    _ADDING = "Adding to held pairs"
+
+    @staticmethod
+    def _eager(points) -> dict:
+        """(band, k, population) -> point of a run's eager scenarios."""
+        return {(p.spread_band, p.k, p.population): p for p in points}
+
+    @staticmethod
+    def _trades(point) -> list:
+        """A point's trades as plain tuples, for comparing two runs."""
+        return [astuple(t) for t in point.trades]
+
+    @classmethod
+    def _others(cls, messages) -> list:
+        """A run's INFO lines but for the add-on ones and the two that report
+        the process's peak memory, which differ from one run to the next."""
+        return [m for m in messages
+                if not m.startswith((cls._ADDING, "Peak RSS"))]
+
+    def test_off_is_the_default_and_builds_nothing(self, add_on_run):
+        assert inspect.signature(run_backtest_sweep).parameters[
+            "add_on_sweep"].default is False
+        for res in (add_on_run.off, add_on_run.default):
+            assert res.add_on_cap_sweep is None
+            assert res.add_on_tier_off_cap_sweep is None
+
+    def test_on_adds_no_simulation_and_no_run_figure(self, add_on_run):
+        # The same simulations, in the same order and with the same keywords
+        assert add_on_run.sims_on == add_on_run.sims_off == add_on_run.sims_default
+        on, off = add_on_run.on, add_on_run.off
+        assert self._trades(on.primary) == self._trades(off.primary)
+        pd.testing.assert_frame_equal(on.primary.equity_df, off.primary.equity_df)
+        for mine, theirs in ((on.points, off.points), (on.scenarios, off.scenarios),
+                             (on.tier_off_scenarios, off.tier_off_scenarios)):
+            assert len(mine) == len(theirs) > 0
+            for a, b in zip(mine, theirs, strict=True):
+                assert (a.k, a.spread_band, a.population) == (b.k, b.spread_band, b.population)
+                assert self._trades(a) == self._trades(b)
+                assert a.add_to_held is False
+        # The trade count the stale-verdict check reads counts eager points only
+        assert backtester.max_trades_simulated(on) == backtester.max_trades_simulated(off)
+        # Nothing was simulated by building the two sweeps
+        assert add_on_run.built == (0, 0)
+
+    def test_on_adds_no_info_line_but_its_own(self, add_on_run):
+        # Every line but the setting line and the two summary lines is the
+        # flag-off run's, in the same order — no completion line among them
+        adding = [m for m in add_on_run.msgs_on if m.startswith(self._ADDING)]
+        assert len(adding) == 3
+        assert self._others(add_on_run.msgs_on) == self._others(add_on_run.msgs_off)
+        assert len(self._others(add_on_run.msgs_on)) > 20
+        assert [m for m in add_on_run.msgs_off if m.startswith(self._ADDING)] == [
+            f"{self._ADDING} (backtest): off — the dashboard's Add to held pairs select "
+            "stays disabled"]
+
+    def test_the_sweeps_axes_are_the_grids(self, add_on_run):
+        on = add_on_run.on
+        cs, off_cs = on.add_on_cap_sweep, on.add_on_tier_off_cap_sweep
+        # The tier-on family: the size-cap sweep's caps, bands and k grid
+        assert cs.caps == on.cap_sweep.caps and len(cs.caps) == 20
+        assert cs.bands == on.cap_sweep.bands
+        assert len(cs.bands) == 4 and cs.ks == on.cap_sweep.ks == (0.5, 0.75, 1.0)
+        assert cs.primary_cap == on.primary.size_cap and cs.primary_k == on.primary.k
+        assert (cs.tier_floors, cs.add_to_held, cs.checks) == (True, True, False)
+        assert cs.split_date is None and cs.st_entries == []
+        assert cs.eager == {} and cs.same_title_eager is None
+        # ... over the very entries the size-cap sweep keeps (one retention)
+        assert cs.entries_by_band is on.cap_sweep.entries_by_band
+        # The tier-floors-off family: the binding bands, likewise
+        binding = tuple(b for b in cs.bands if backtester._tier_floors_bind(b))
+        assert len(binding) == 2
+        assert off_cs.bands == on.tier_off_cap_sweep.bands == binding
+        assert off_cs.caps == cs.caps and off_cs.ks == cs.ks
+        assert (off_cs.tier_floors, off_cs.add_to_held, off_cs.checks) == (False, True, False)
+        assert off_cs.eager == {} and off_cs.same_title_eager is None
+        assert off_cs.entries_by_band is on.tier_off_cap_sweep.entries_by_band
+
+    def test_without_the_size_cap_sweep_the_run_s_own_cap_is_the_axis(self, add_on_run):
+        res = add_on_run.no_cap
+        assert res.cap_sweep is None
+        assert res.add_on_cap_sweep.caps == (res.primary.size_cap,)
+        assert res.add_on_tier_off_cap_sweep.caps == (res.primary.size_cap,)
+        assert res.add_on_cap_sweep.bands == tuple(sorted(
+            {(0.0, 0.5), (0.0, 1.0), (0.35, 0.5), (0.35, 1.0)}))
+
+    def test_without_the_tier_floors_off_family_there_is_only_the_tier_on_sweep(
+        self, add_on_run,
+    ):
+        assert add_on_run.no_off.add_on_cap_sweep is not None
+        assert add_on_run.no_off.add_on_tier_off_cap_sweep is None
+        assert not [m for m in add_on_run.msgs_no_off if m.startswith(
+            f"{self._ADDING}, tier floors off")]
+
+    def test_a_single_band_run_has_one_band_and_no_tier_off_sweep(self, add_on_run):
+        res = add_on_run.single
+        cs = res.add_on_cap_sweep
+        assert cs.bands == (BACKTEST_DEFAULT_SPREAD_BAND,) and cs.checks is False
+        assert res.add_on_tier_off_cap_sweep is None
+        assert cs.ks == tuple(p.k for p in res.points)
+
+    def test_each_cell_has_the_day_its_eager_twin_ended_on(self, add_on_run):
+        on = add_on_run.on
+        for cs, scenarios in ((on.add_on_cap_sweep, on.scenarios),
+                              (on.add_on_tier_off_cap_sweep, on.tier_off_scenarios)):
+            eager = self._eager(scenarios)
+            # One day per (band, k) cell, keyed by the exact objects it is read with
+            assert set(cs.end_dates) == {(b, k, "all") for b in cs.bands for k in cs.ks}
+            for (band, k, pop), day in cs.end_dates.items():
+                assert day == backtester._curve_end_date(eager[(band, k, pop)])
+                assert type(day) is date
+
+    def test_every_cell_is_an_all_point_stamped_add_to_held(self, add_on_run):
+        on = add_on_run.on
+        for cs, scenarios, tier_floors in ((on.add_on_cap_sweep, on.scenarios, True),
+                                           (on.add_on_tier_off_cap_sweep,
+                                            on.tier_off_scenarios, False)):
+            eager = self._eager(scenarios)
+            add_ons = 0
+            for band in cs.bands:
+                for k in cs.ks:
+                    cell = cs.cell(band, k)
+                    day = backtester._curve_end_date(eager[(band, k, "all")])
+                    assert tuple(cell) == cs.caps
+                    for cap, by_pop in cell.items():
+                        assert set(by_pop) == {"all"}
+                        point = by_pop["all"]
+                        assert (point.k, point.spread_band, point.size_cap) == (k, band, cap)
+                        assert point.population == "all"
+                        assert point.add_to_held is True
+                        assert point.tier_floors is tier_floors
+                        # No checks: the bar reads the "all" point alone
+                        assert point.halves is None and point.ex_top_event is None
+                        # The eager twin's last day, and so its row count
+                        assert point.equity_df["date"].iloc[-1] == day
+                        assert len(point.equity_df) == len(
+                            eager[(band, k, "all")].equity_df)
+                        add_ons += sum(t.add_on for t in point.trades)
+            # Not vacuous: the golden pairs add on in this family
+            assert add_ons > 0 and cs.simulated > 0
+
+    def test_a_cell_is_a_fresh_add_on_simulation(self, add_on_run):
+        # One cell, every cap, against the simulator called as the sweep does
+        cs = add_on_run.on.add_on_cap_sweep
+        band, k = (0.0, 1.0), 0.5
+        cell = cs.cell(band, k)
+        day = cs.end_dates[(band, k, "all")]
+        for cap in cs.caps:
+            fresh = backtester._simulate_at_discount(
+                cs.entries_by_band[band], cs.start_date, cs.initial_balance, k=k,
+                spread_band=band, population="all", size_cap=cap, quiet=True,
+                end_date=day, add_to_held=True)
+            got = cell[cap]["all"]
+            assert self._trades(got) == self._trades(fresh), cap
+            pd.testing.assert_frame_equal(got.equity_df, fresh.equity_df)
+        # ... and the family differs from a run that never adds, somewhere in it
+        plain = add_on_run.on.cap_sweep.cell(band, k)
+        assert any(self._trades(cell[cap]["all"]) != self._trades(plain[cap]["all"])
+                   for cap in cs.caps)
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_a_cell_read_after_utc_midnight_ends_every_cap_on_the_eager_day(
+        self, monkeypatch,
+    ):
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (1.0,))
+        clock = type("Clock", (TestCapSweepEndDate._Clock,),
+                     {"moment": datetime(2026, 9, 26, 23, 58, tzinfo=UTC)})
+        monkeypatch.setattr(backtester, "datetime", clock)
+        run = run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                                 tier_off_sweep=True, add_on_sweep=True)
+        band, k = (0.0, 1.0), run.primary.k
+        # The report reads the cells four minutes later, on the next UTC day
+        clock.moment = datetime(2026, 9, 27, 0, 2, tzinfo=UTC)
+        for cs, eager in ((run.add_on_cap_sweep, run.primary),
+                          (run.add_on_tier_off_cap_sweep,
+                           self._eager(run.tier_off_scenarios)[(band, k, "all")])):
+            before = cs.simulated
+            cell = cs.cell(band, k)
+            # Not vacuous: caps were simulated after midnight
+            assert cs.simulated > before
+            assert eager.equity_df["date"].iloc[-1] == date(2026, 9, 26)
+            for cap, by_pop in cell.items():
+                point = by_pop["all"]
+                assert point.equity_df["date"].iloc[-1] == date(2026, 9, 26), cap
+                assert len(point.equity_df) == len(eager.equity_df), cap
+        # ... while the clock really did move: an unpinned simulation now runs
+        # one day further
+        fresh = backtester._simulate_at_discount(
+            run.add_on_cap_sweep.entries_by_band[band], golden._START, 10_000.0, k=k,
+            size_cap=0.05, quiet=True, add_to_held=True)
+        assert fresh.equity_df["date"].iloc[-1] == date(2026, 9, 27)
+
+    class _DailyClock(TestCapSweepEndDate._Clock):
+        """A clock one day later on every now() call, so each eager point
+        ends its curve on a day of its own."""
+
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls += 1
+            moment = cls.moment + timedelta(days=cls.calls)
+            return moment if tz is None else moment.astimezone(tz)
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_every_cap_of_every_cell_ends_on_its_own_twin_s_day(self, monkeypatch):
+        """With a clock that moves on every read, each eager "all" point of
+        both families ends on a different day. Every cap of every cell must
+        still end on the day of its own (band, k) twin in ITS family: a cell
+        given the primary's day, or a tier-off cell the tier-on twin's, is
+        caught here. Reading cells never reads the clock."""
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
+        clock = type("Clock", (self._DailyClock,),
+                     {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC), "calls": 0})
+        monkeypatch.setattr(backtester, "datetime", clock)
+        run = run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                                 tier_off_sweep=True, add_on_sweep=True)
+        calls_after_the_run = clock.calls
+        families = []
+        for cs, scenarios in ((run.add_on_cap_sweep, run.scenarios),
+                              (run.add_on_tier_off_cap_sweep, run.tier_off_scenarios)):
+            twins = {key: point for key, point in self._eager(scenarios).items()
+                     if key[2] == "all"}
+            families.append((cs, twins, {key: backtester._curve_end_date(point)
+                                         for key, point in twins.items()}))
+        # Not vacuous: no two eager "all" points, tier-off twins included, end
+        # on the same day
+        every_day = [day for _cs, _twins, days in families for day in days.values()]
+        assert len(every_day) == len(set(every_day)) > 6
+        for cs, twins, days in families:
+            assert set(cs.end_dates) == {(b, k, "all") for b in cs.bands for k in cs.ks}
+            for band in cs.bands:
+                for k in cs.ks:
+                    assert cs.end_dates[(band, k, "all")] == days[(band, k, "all")]
+                    for cap, by_pop in cs.cell(band, k).items():
+                        point = by_pop["all"]
+                        assert point.equity_df["date"].iloc[-1] == days[(band, k, "all")], (
+                            band, k, cap)
+                        assert len(point.equity_df) == len(twins[(band, k, "all")].equity_df)
+            assert cs.simulated > 0
+        assert clock.calls == calls_after_the_run
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_the_summary_lines_name_the_grid(self, monkeypatch, caplog):
+        golden = TestPrepareEntriesGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
+        with caplog.at_level(logging.INFO):
+            run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                               same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                               tier_off_sweep=True, add_on_sweep=True)
+        adding = [r.getMessage() for r in caplog.records
+                  if r.getMessage().startswith("Adding to held pairs")]
+        assert adding == [
+            "Adding to held pairs (backtest): on — the dashboard's Add to held pairs select "
+            "is simulated when the dashboard is built",
+            "Adding to held pairs: 20 size cap(s) x 4 band(s) x 3 k, all trades together, "
+            "each simulated when the dashboard reads it",
+            "Adding to held pairs, tier floors off: 20 size cap(s) x 2 band(s) the tiers "
+            "bind at x 3 k, each simulated when the dashboard reads it"]
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_the_setting_line_follows_the_checkpoint_line_and_the_cap_line_still_precedes_it(
+        self, monkeypatch, caplog,
+    ):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        for flag in (True, False):
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                                   add_on_sweep=flag)
+            messages = [r.getMessage() for r in caplog.records]
+            cap = next(i for i, m in enumerate(messages)
+                       if m.startswith("Per-trade size cap"))
+            assert messages[cap + 1].startswith("Entry checkpoint (backtest):")
+            assert messages[cap + 2] == (
+                "Adding to held pairs (backtest): "
+                + ("on — the dashboard's Add to held pairs select is simulated when the "
+                   "dashboard is built" if flag else
+                   "off — the dashboard's Add to held pairs select stays disabled"))
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_the_infeasible_window_records_no_sweep(self, monkeypatch, caplog):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                                     band_sweep=True, tier_off_sweep=True, cap_sweep=True,
+                                     add_on_sweep=True)
+        assert res.add_on_cap_sweep is None and res.add_on_tier_off_cap_sweep is None
+        assert res.cap_sweep is None
+        # No summary line is logged for a sweep that was not built
+        assert not [r for r in caplog.records
+                    if r.getMessage().startswith("Adding to held pairs:")]
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_the_infeasible_window_records_what_the_saved_defaults_say(self, monkeypatch):
+        from kalshi_betting import config
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        for saved in (True, False):
+            config.save_live_defaults(
+                dc_replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=saved), source="")
+            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0)
+            assert res.live_add_to_held_pairs is saved
+
+
 class TestLiveRuleLine:
     """"Live time-series rule (saved live defaults): ..." — the saved live
     defaults' rule and filter, read once before the fetch, recorded on
@@ -13331,13 +14599,17 @@ class TestLiveRuleLine:
         return lines[0]
 
     @staticmethod
-    def _live(monkeypatch, tier_floors, band, categories=None, tags=None):
-        """Save config.py's toggles with this rule and filter as the live defaults."""
+    def _live(monkeypatch, tier_floors, band, categories=None, tags=None, *,
+              add_to_held=False):
+        """Save config.py's toggles with this rule and filter as the live
+        defaults. Adding to held pairs is saved off unless asked for, so a
+        line's note about it appears only in the tests that name it."""
         from kalshi_betting import config
         monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", tier_floors)
         monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", band)
         monkeypatch.setattr(config, "TRADE_CATEGORIES", categories)
         monkeypatch.setattr(config, "TRADE_TAGS", tags)
+        monkeypatch.setattr(config, "ADD_TO_HELD_PAIRS", add_to_held)
         save_config_live_defaults()
         return config.describe_time_series_rule(tier_floors, band)
 
@@ -13379,10 +14651,10 @@ class TestLiveRuleLine:
         assert messages[-1].startswith(self._PREFIX)
         assert any(m.startswith("Size-cap sweep:") for m in messages[:-1])
 
-    # The eight fields a saved-defaults read records, all or none
+    # The nine fields a saved-defaults read records, all or none
     _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_categories", "live_tags",
                     "live_origin", "live_interval_discount", "live_size_cap",
-                    "live_same_title_size_cap")
+                    "live_same_title_size_cap", "live_add_to_held_pairs")
 
     @pytest.mark.parametrize("feasible", [False, True])
     def test_a_refused_file_records_none_and_warns_once(self, monkeypatch, caplog, feasible):
@@ -13419,7 +14691,7 @@ class TestLiveRuleLine:
             "when this run started, and live runs refuse to start without them")
         assert bool(res.calibrations_by_band) is feasible
 
-    def test_the_eight_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
+    def test_the_nine_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
         from kalshi_betting import config
         saved = config.save_live_defaults(
             config.LiveSettings(False, (0.1, 0.8), 0.6, 0.35, 0.25, ("Economics",), ("Fed",)),
@@ -13445,15 +14717,21 @@ class TestLiveRuleLine:
             "live_tier_floors": False, "live_spread_band": (0.1, 0.8),
             "live_categories": ("Economics",), "live_tags": ("Fed",),
             "live_origin": saved.origin, "live_interval_discount": 0.6,
-            "live_size_cap": 0.35, "live_same_title_size_cap": 0.25}
+            "live_size_cap": 0.35, "live_same_title_size_cap": 0.25,
+            "live_add_to_held_pairs": False}
 
-    def test_the_live_rule_fields_are_eight_keys_or_none(self):
+    def test_the_live_rule_fields_are_nine_keys_or_none(self):
         from kalshi_betting import config
         assert backtester._live_rule_fields(None) == {}
         fields = backtester._live_rule_fields(config.LIVE_DEFAULTS_SEED)
         assert tuple(fields) == self._LIVE_FIELDS
         assert fields["live_origin"] == config.LIVE_DEFAULTS_SEED.origin
         assert fields["live_size_cap"] == 0.10
+        # The seed proposes adding to held pairs on, and the field says so
+        assert fields["live_add_to_held_pairs"] is True
+        off = backtester._live_rule_fields(dc_replace(config.LIVE_DEFAULTS_SEED,
+                                                      add_to_held_pairs=False))
+        assert off["live_add_to_held_pairs"] is False
 
     def test_a_direct_sweep_from_candidates_reads_the_toggles_itself(self, monkeypatch):
         # Handed nothing, _sweep_from_candidates takes one read of its own
@@ -13636,9 +14914,11 @@ class TestLiveRuleLine:
         run = (f"k {config._exact_number(res.primary.k)}, per-trade cap "
                f"{config._cap_text(res.primary.size_cap, 'no cap')} and same-title cap "
                f"{config._cap_text(res.same_title_size_cap, 'no extra cap')}")
+        # The seed also adds to held pairs, so its note follows the sizing note
         assert self._line(caplog).endswith(
             "; the live defaults size at k 0.8, per-trade cap 10% and same-title cap 20%, "
-            f"where this run's primary sized at {run}")
+            f"where this run's primary sized at {run}"
+            "; the live defaults add to held pairs, which this run's primary does not")
 
     def test_no_sizing_note_when_the_saved_sizing_is_the_runs(self, monkeypatch, caplog):
         # _live saves config.py's own k and caps, which this run sized at too
@@ -13660,6 +14940,52 @@ class TestLiveRuleLine:
         for changes in ({"live_size_cap": None}, {"same_title_size_cap": None},
                         {"primary": dc_replace(point, size_cap=None)}):
             assert backtester._live_sizing_note(dc_replace(sweep, **changes)) == ""
+
+    # ── Adding to held pairs ────────────────────────────────────────────────
+
+    _ADD_ON_NOTE = "; the live defaults add to held pairs, which this run's primary does not"
+
+    def test_the_add_on_note_is_named_when_the_saved_defaults_add_to_held_pairs(
+        self, monkeypatch, caplog,
+    ):
+        rule = self._live(monkeypatch, True, (0.0, 1.0), add_to_held=True)
+        res = self._infeasible(monkeypatch, caplog)
+        assert res.live_add_to_held_pairs is True
+        assert self._line(caplog) == (
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary "
+            f"scenario applies it{self._ADD_ON_NOTE}")
+        # ... on the line that says the rule was not simulated too
+        rule = self._live(monkeypatch, True, (0.35, 0.5), add_to_held=True)
+        self._feasible(monkeypatch, caplog, band_sweep=False)
+        assert self._line(caplog) == (
+            f"Live time-series rule (saved live defaults): {rule} — not simulated by this "
+            f"run{self._ADD_ON_NOTE}")
+
+    def test_no_add_on_note_when_the_saved_defaults_do_not_add(self, monkeypatch, caplog):
+        self._live(monkeypatch, True, (0.0, 1.0))
+        res = self._infeasible(monkeypatch, caplog)
+        assert res.live_add_to_held_pairs is False
+        assert "held" not in self._line(caplog)
+
+    def test_the_add_on_note_comes_last(self, monkeypatch, caplog):
+        # After the ladder departure's clause and after the sizing clause
+        rule = self._live(monkeypatch, True, (0.0, 1.0), add_to_held=True)
+        configured = backtester.TIME_SERIES_SAME_EVENT_LADDERS
+        res = self._infeasible(monkeypatch, caplog, same_event_ladders=not configured)
+        assert self._line(caplog) == (
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary "
+            f"scenario applies it; this run's same-event ladders are "
+            f"{'off' if configured else 'on'} and config.py's {'on' if configured else 'off'}, "
+            f"so its pairs are not the live bot's{self._ADD_ON_NOTE}")
+        assert res.live_add_to_held_pairs is True
+
+    def test_the_add_on_note_needs_a_recorded_true(self):
+        point = backtester._simulate_at_discount([], date(2026, 1, 5), 1000.0)
+        sweep = backtester.BacktestSweep(primary=point, points=[point], calibration=None)
+        assert sweep.live_add_to_held_pairs is None
+        for recorded, note in ((None, ""), (False, ""), (True, self._ADD_ON_NOTE)):
+            changed = dc_replace(sweep, live_add_to_held_pairs=recorded)
+            assert backtester._live_add_on_note(changed) == note, recorded
 
     # ── The category/tag filter ─────────────────────────────────────────────
 
@@ -14833,3 +16159,707 @@ class TestCapSweepTierSetting:
         assert [kw for _pop, kw in seen] == [
             {"size_cap": cap, "quiet": True, "tier_floors": False}
             for cap in (0.1, backtester.BUDGET_FRACTION, 1.0)]
+
+
+# ─── Open trades valued at market: the sizing base and the equity curve ──────
+
+def _at(day: date, hour: int) -> int:
+    """Unix time of `hour`:00 UTC on `day`: a candle's end."""
+    return int(datetime(day.year, day.month, day.day, hour, tzinfo=UTC).timestamp())
+
+
+def _quoted(records: list[dict], candles: dict, start: date = date(2026, 1, 1)) -> list[dict]:
+    """The records, each given its markets' quotes by the one writer."""
+    backtester._attach_leg_quotes(records, candles, start)
+    return records
+
+
+def _unquoted(records: list[dict]) -> list[dict]:
+    """The same records without their quotes, so every trade is valued at cost."""
+    return [{key: value for key, value in rec.items() if key != "leg_quotes"}
+            for rec in records]
+
+
+class TestLegQuotes:
+    """LegQuotes holds one market's asks at each UTC day's end and at each
+    entry checkpoint: each side's latest usable ask (strictly between 0 and 1,
+    a NO ask also below the 0.99 the candle clamps an empty YES-bid book to),
+    read from its candles by _candles_at_or_before (the lookup _find_entry
+    uses), its payout from its settlement time on, and NaN before a side's
+    first usable ask, which a lookup returns as the leg's entry price. These
+    are the prices every open trade is valued at, so each rule here moves
+    sizing and the equity curve."""
+
+    _START = date(2026, 1, 1)
+    _MARKET = {"ticker": "Q", "settlement_ts": "2026-01-21T12:00:00Z", "result": "yes"}
+
+    @staticmethod
+    def _candles() -> list[dict]:
+        # One candle ends exactly at a UTC midnight (01-08 00:00) and one
+        # exactly at the 01-12 entry checkpoint
+        checkpoint = int(backtester._checkpoint_datetime(date(2026, 1, 12)).timestamp())
+        return [_candle(_at(date(2026, 1, 5), 9), 0.30, 0.70),
+                _candle(_at(date(2026, 1, 8), 0), 0.35, 0.66),
+                _candle(checkpoint, 0.40, 0.61),
+                _candle(_at(date(2026, 1, 14), 23), 0.45, 0.56)]
+
+    def _quotes(self, market=None, candles=None):
+        quotes, _stale = backtester._leg_quotes(market or self._MARKET,
+                                                self._candles() if candles is None else candles,
+                                                self._START)
+        return quotes
+
+    def test_samples_equal_a_brute_force_lookup(self):
+        candles = self._candles()
+        q = self._quotes(candles=candles)
+        settle = datetime(2026, 1, 21, 12, tzinfo=UTC).timestamp()
+        assert q.first_day == date(2026, 1, 5) and q.first_checkpoint == date(2026, 1, 5)
+        day = q.first_day
+        while day <= date(2026, 1, 28):
+            end = _at(day + timedelta(days=1), 0)
+            sample = (q.day_values(day, day, "yes", -1.0).tolist(),
+                      q.day_values(day, day, "no", -1.0).tolist())
+            if end >= settle:
+                assert sample == ([1.0], [0.0]), day
+            else:
+                c = backtester._candle_at_or_before(candles, end)
+                assert sample == ([c["yes_ask_close"]], [c["no_ask_close"]]), day
+            day += timedelta(days=1)
+        for monday in (date(2026, 1, 5), date(2026, 1, 12), date(2026, 1, 19),
+                       date(2026, 1, 26)):
+            moment = int(backtester._checkpoint_datetime(monday).timestamp())
+            got = (q.at_checkpoint(monday, "yes", -1.0), q.at_checkpoint(monday, "no", -1.0))
+            if moment >= settle:
+                assert got == (1.0, 0.0), monday
+            else:
+                c = backtester._candle_at_or_before(candles, moment)
+                assert got == (c["yes_ask_close"], c["no_ask_close"]), monday
+        # The candle ending AT the checkpoint counts there, and the one ending
+        # at midnight counts at the end of the day before
+        assert q.at_checkpoint(date(2026, 1, 12), "yes", -1.0) == 0.40
+        assert q.day_values(date(2026, 1, 7), date(2026, 1, 7), "yes", -1.0).tolist() == [0.35]
+        # A range of days is the same samples in order
+        assert q.day_values(date(2026, 1, 6), date(2026, 1, 9), "no", -1.0).tolist() == [
+            0.70, 0.66, 0.66, 0.66]
+
+    @pytest.mark.parametrize("yes, no, no_value", [
+        (1.00, 0.00, 0.33), (0.00, 1.00, 0.33), ("x", None, 0.33), (float("nan"), 0.50, 0.50),
+        (1.00, 0.99, 0.33)])
+    def test_a_side_with_no_usable_ask_yet_reads_the_entry_price(self, yes, no, no_value):
+        # One candle whose YES ask is no price (an empty book's 1.00, 0, an
+        # unreadable value): the YES side has had no usable ask, so it reads
+        # the entry price; a NO ask at the 0.99 clamp is no price either
+        q = self._quotes(candles=[_candle(_at(date(2026, 1, 5), 9), yes, no)])
+        assert q.at_checkpoint(date(2026, 1, 12), "yes", 0.31) == 0.31
+        assert q.day_values(date(2026, 1, 6), date(2026, 1, 6), "yes", 0.31).tolist() == [0.31]
+        assert q.at_checkpoint(date(2026, 1, 12), "no", 0.33) == no_value
+
+    def test_a_side_keeps_its_last_usable_ask(self):
+        # 01-09: a real quote. 01-10: the YES ask book empties (1.00) while
+        # the NO ask reads 0.02. 01-11: an unreadable YES ask and a NO ask at
+        # the 0.99 clamp. Each side keeps its last usable ask through both,
+        # at each day's end and at the 01-12 checkpoint, until the payout
+        candles = [_candle(_at(date(2026, 1, 5), 9), 0.20, 0.80),
+                   _candle(_at(date(2026, 1, 9), 15), 0.97, 0.04),
+                   _candle(_at(date(2026, 1, 10), 15), 1.00, 0.02),
+                   _candle(_at(date(2026, 1, 11), 15), "x", 0.99)]
+        q = self._quotes(candles=candles)
+        first, last = date(2026, 1, 9), date(2026, 1, 20)
+        assert q.day_values(first, last, "yes", -1.0).tolist() == [0.97] * 12
+        assert q.day_values(first, last, "no", -1.0).tolist() == [0.04] + [0.02] * 11
+        assert q.at_checkpoint(date(2026, 1, 12), "yes", -1.0) == 0.97
+        assert q.at_checkpoint(date(2026, 1, 12), "no", -1.0) == 0.02
+        # The payout from settlement on (01-21 12:00, result yes)
+        assert q.day_values(date(2026, 1, 21), date(2026, 1, 21), "yes", -1.0).tolist() == [1.0]
+
+    def test_a_gap_in_hand_built_samples_keeps_the_last_ask(self):
+        # LegQuotes carries its own samples forward, so a NaN after a usable
+        # ask reads that ask; a NaN before any usable ask reads the entry price
+        q = backtester.LegQuotes("Q", date(2026, 1, 5), [np.nan, 0.30, np.nan, 0.35, np.nan],
+                                 [0.70, np.nan, np.nan, 0.65, np.nan], date(2026, 1, 5),
+                                 [np.nan, 0.31], [0.69, np.nan], float("nan"), float("nan"))
+        days = (date(2026, 1, 5), date(2026, 1, 9))
+        assert q.day_values(*days, "yes", 0.2).tolist() == [0.2, 0.30, 0.30, 0.35, 0.35]
+        assert q.day_values(*days, "no", 0.8).tolist() == [0.70, 0.70, 0.70, 0.65, 0.65]
+        assert q.at_checkpoint(date(2026, 1, 5), "yes", 0.2) == 0.2
+        assert q.at_checkpoint(date(2026, 1, 12), "no", 0.8) == 0.69
+        # An unknown payout: past the samples the last day-end ask stands
+        assert q.day_values(date(2026, 1, 20), date(2026, 1, 20), "yes", 0.2).tolist() == [0.35]
+        assert q.at_checkpoint(date(2026, 1, 26), "no", 0.8) == 0.65
+        assert np.isnan(q.yes_days[0]) and not np.isnan(q.yes_days[2])
+
+    def test_a_sub_cent_ask_is_a_price(self):
+        # A YES ask under a cent on a fine grid is a real price (a losing YES
+        # leg), not "no quote": it reads as itself
+        q = self._quotes(candles=[_candle(_at(date(2026, 1, 5), 9), 0.20, 0.80),
+                                  _candle(_at(date(2026, 1, 8), 9), 0.008, 0.99)])
+        assert q.day_values(date(2026, 1, 8), date(2026, 1, 8), "yes", 0.20).tolist() == [0.008]
+        assert q.at_checkpoint(date(2026, 1, 12), "yes", 0.20) == 0.008
+        # ... while its NO ask, at the 0.99 clamp, keeps the last usable one
+        assert q.at_checkpoint(date(2026, 1, 12), "no", 0.80) == 0.80
+
+    @pytest.mark.parametrize("raw, side, usable", [
+        (0.5, "yes", True), (0.0001, "yes", True), (0.9999, "yes", True), ("0.42", "yes", True),
+        (1.0, "yes", False), (0.0, "yes", False), (-0.1, "yes", False), (1.5, "yes", False),
+        (float("nan"), "yes", False), ("x", "yes", False), (None, "yes", False),
+        (0.98, "no", True), (0.01, "no", True), (0.99, "no", False),
+        (0.99 - 1e-9, "no", False), (1.0, "no", False), (0.0, "no", False)])
+    def test_which_asks_are_usable(self, raw, side, usable):
+        value = backtester._usable_ask(raw, side)
+        assert (value == value) is usable
+        if usable:
+            assert value == float(raw)
+
+    def test_before_the_first_candle_reads_the_entry_price(self):
+        q = self._quotes(candles=[_candle(_at(date(2026, 1, 13), 9), 0.40, 0.61)])
+        assert q.first_day == date(2026, 1, 13)
+        assert q.day_values(date(2026, 1, 11), date(2026, 1, 13), "yes", 0.2).tolist() == [
+            0.2, 0.2, 0.40]
+
+    @pytest.mark.parametrize("result, yes, no", [("yes", 1.0, 0.0), ("no", 0.0, 1.0)])
+    def test_the_payout_from_settlement_on(self, result, yes, no):
+        q = self._quotes(market=dict(self._MARKET, result=result))
+        for day in (date(2026, 1, 21), date(2026, 6, 1)):
+            assert q.day_values(day, day, "yes", 0.5).tolist() == [yes]
+            assert q.day_values(day, day, "no", 0.5).tolist() == [no]
+        assert q.at_checkpoint(date(2026, 3, 2), "yes", 0.5) == yes
+        assert q.at_checkpoint(date(2026, 3, 2), "no", 0.5) == no
+        # The day before it reads the last candle
+        assert q.day_values(date(2026, 1, 20), date(2026, 1, 20), "yes", 0.5).tolist() == [0.45]
+
+    def test_an_unknown_payout_keeps_the_last_ask(self):
+        # With no known result the settlement time pays nothing: the asks go
+        # on, and past the samples the last usable ask stands
+        q = self._quotes(market=dict(self._MARKET, result=""))
+        assert q.day_values(date(2026, 1, 21), date(2026, 1, 21), "yes", 0.37).tolist() == [0.45]
+        assert q.day_values(date(2026, 6, 1), date(2026, 6, 1), "yes", 0.37).tolist() == [0.45]
+        assert q.at_checkpoint(date(2026, 3, 2), "no", 0.37) == 0.56
+
+    def test_two_builds_are_equal_and_a_copy_is_itself(self):
+        a, b = self._quotes(), self._quotes()
+        assert a is not b and a == b and hash(a) == hash(b)
+        # Equal quotes share one fingerprint (what the dashboard keys on)
+        assert a.fingerprint == b.fingerprint
+        assert copy.copy(a) is a and copy.deepcopy(a) is a
+        with pytest.raises(ValueError):
+            a.yes_days[0] = 0.9
+        # NaN samples compare equal to NaN
+        dead = [_candle(_at(date(2026, 1, 5), 9), "x", "x")]
+        assert self._quotes(candles=dead) == self._quotes(candles=dead)
+        other = self._candles()
+        other[-1] = _candle(other[-1]["ts"], 0.46, 0.56)
+        assert self._quotes(candles=other) != a
+        assert self._quotes(candles=other).fingerprint != a.fingerprint
+        # -0.0 and 0.0, and two NaNs, are one value to both
+        zero = backtester.LegQuotes("Z", date(2026, 1, 5), [0.0, np.nan], [np.nan, 0.5],
+                                    date(2026, 1, 5), [], [], 0.0, 1.0)
+        signed = backtester.LegQuotes("Z", date(2026, 1, 5), [-0.0, float("nan")],
+                                      [float("nan"), 0.5], date(2026, 1, 5), [], [], -0.0, 1.0)
+        assert zero == signed and zero.fingerprint == signed.fingerprint
+        # A trade holding it keeps the same object through astuple
+        trade = backtester.BacktestTrade(
+            "time_series", "Q", "R", "", "", "Other", date(2026, 1, 5), date(2026, 1, 21),
+            0.3, 0.6, 0.7, 0.4, 10, 7.0, 0.3, "yes", "yes", 10.0, 2.7, 0.3, 0.6, 0.1, 2.7,
+            0.0, 16, 10_000.0, marks=(a, b))
+        assert astuple(trade)[-1][0] is a
+
+    def test_no_candle_is_kept(self):
+        class _Candle(dict):
+            pass
+
+        candles = {t: [_Candle(c) for c in self._candles()] for t in ("OA", "OB")}
+        refs = [weakref.ref(c) for series in candles.values() for c in series]
+        rec = _quoted([TestSizesOnPortfolioValue._opener()], candles)[0]
+        del candles
+        gc.collect()
+        assert all(r() is None for r in refs)
+        assert rec["leg_quotes"]["OA"].at_checkpoint(date(2026, 1, 12), "yes", 0.5) == 0.40
+
+    def test_a_day_off_the_weekly_grid_raises(self):
+        q = self._quotes()
+        for day in (date(2026, 1, 13), date(2025, 12, 29)):
+            with pytest.raises(ValueError, match="not an entry checkpoint"):
+                q.at_checkpoint(day, "yes", 0.5)
+        with pytest.raises(ValueError, match="side"):
+            q.at_checkpoint(date(2026, 1, 12), "maybe", 0.5)
+
+    def test_the_writer_quotes_only_records_whose_markets_have_candles(self):
+        quoted_a, quoted_b = TestSizesOnPortfolioValue._opener(), TestSizesOnPortfolioValue._opener()
+        bare = TestSizesOnPortfolioValue._follower(_LADDER_M2)
+        candles = {"OA": self._candles(), "OB": self._candles()}
+        _quoted([quoted_a, bare, quoted_b, quoted_a], candles)
+        assert set(quoted_a["leg_quotes"]) == {"OA", "OB"}
+        assert "leg_quotes" not in bare
+        # On the record, never on its entry dict (the Monday's keys)
+        assert "leg_quotes" not in quoted_a["entry"]
+        # One LegQuotes per ticker, shared by every record in one call
+        assert quoted_a["leg_quotes"]["OA"] is quoted_b["leg_quotes"]["OA"]
+
+    def test_legs_on_old_quotes_are_counted_at_debug(self, caplog):
+        # OA's last candle is ten days before it pays out; OB's is recent
+        stale = {"OA": [_candle(_at(date(2026, 1, 4), 9), 0.20, 0.80)],
+                 "OB": [_candle(_at(date(2026, 1, 14), 9), 0.60, 0.40)]}
+        with caplog.at_level(logging.DEBUG):
+            _quoted([TestSizesOnPortfolioValue._opener()], stale)
+        assert [r.getMessage() for r in caplog.records if "old on some day" in r.getMessage()
+                ] == ["Legs valued on a quote more than 7 days old on some day before they "
+                      "pay out: 1"]
+        assert all(r.levelno == logging.DEBUG for r in caplog.records
+                   if "old on some day" in r.getMessage())
+
+
+class TestSizesAtMarket:
+    """Pass 2 sizes each Monday on the cash plus every open trade AT MARKET
+    (_open_value): each leg at the latest usable ask of the side it holds on
+    a candle at or before the checkpoint, its payout once its market has paid
+    out, its entry price before it has had a usable ask. TestSizesOnPortfolioValue's
+    opener (YES on OA at 0.20, NO on OB at 0.40, paying out 01-15) and
+    follower are given candles here; on Saturday 01-10 OB's NO ask falls to
+    0.30, so on Monday 2 the opener is worth n x 0.50, not its cost n x 0.60.
+    The follower is sized on that value, as live compute_trade sizes on the
+    same value and cash."""
+
+    _START = date(2026, 1, 1)
+    _BALANCE = 10_000.0
+
+    def _candles(self, *, ob=((date(2026, 1, 10), 15, 0.70, 0.30),
+                              (date(2026, 1, 13), 15, 0.45, 0.55)), oa=()):
+        return {
+            "OA": [_candle(_at(_LADDER_M1, 9), 0.20, 0.80)]
+                  + [_candle(_at(d, h), y, n) for d, h, y, n in oa],
+            "OB": [_candle(_at(_LADDER_M1, 9), 0.60, 0.40)]
+                  + [_candle(_at(d, h), y, n) for d, h, y, n in ob],
+            "FA": [_candle(_at(_LADDER_M2, 9), 0.20, 0.80)],
+            "FB": [_candle(_at(_LADDER_M2, 9), 0.60, 0.40)],
+        }
+
+    def _sim(self, records, *, k=0.75):
+        return backtester._simulate_at_discount(records, self._START, self._BALANCE, k=k,
+                                                 size_cap=1.0, end_date=date(2026, 4, 1))
+
+    def _records(self, opener=None, candles=None):
+        records = [opener or TestSizesOnPortfolioValue._opener(),
+                   TestSizesOnPortfolioValue._follower(_LADDER_M2)]
+        return _quoted(records, self._candles() if candles is None else candles)
+
+    def test_a_moved_ask_sizes_the_next_trade_on_the_new_value(self):
+        records = self._records()
+        point = self._sim(records)
+        assert _traded(point) == [("OA", _LADDER_M1), ("FA", _LADDER_M2)]
+        opener, follower = point.trades
+        assert opener.marks is not None and follower.marks is not None
+        cash = self._BALANCE - (opener.total_cost + opener.fees)
+        value = cash + opener.n * (0.20 + 0.30)
+        assert backtester._open_value(opener, _LADDER_M2) == pytest.approx(opener.n * 0.50)
+        assert follower.balance_at_entry == pytest.approx(value, abs=1e-9)
+        # ... below the value at cost, which the same records without quotes
+        # size on
+        assert value < cash + opener.total_cost
+        at_cost = self._sim(_unquoted(records))
+        assert at_cost.trades[1].balance_at_entry == pytest.approx(cash + opener.total_cost)
+        assert at_cost.trades[1].n > follower.n
+        # ... and the count live compute_trade sizes on that value and cash
+        assert follower.n == TestSizesOnPortfolioValue._live_n(value, cash, 0.75)
+
+    def test_nothing_moved_since_the_last_close_means_the_curve_s_value(self):
+        # Nothing trades between the 01-11 close and Monday 2's checkpoint, so
+        # the value the follower is sized on is the curve's row for 01-11
+        point = self._sim(self._records())
+        follower = point.trades[1]
+        curve = point.equity_df.set_index("date")["portfolio_value"]
+        assert follower.balance_at_entry == pytest.approx(
+            float(curve[date(2026, 1, 11)]), abs=1e-9)
+
+    def test_a_leg_paid_out_mid_trade_counts_at_its_payout(self):
+        # OA settles NO on 01-08: from then the YES leg is worth 0, while OB
+        # (paying out 01-15) is still worth its NO ask
+        opener = _ladder_record(_ladder_market("OA", "EVO-1", "2026-01-08"),
+                                _ladder_market("OB", "EVO-2", "2026-01-15"), "o",
+                                [_LADDER_M1])
+        point = self._sim(self._records(opener=opener))
+        first, follower = point.trades
+        assert first.exit_date == date(2026, 1, 15)
+        assert backtester._open_value(first, _LADDER_M2) == pytest.approx(first.n * 0.30)
+        cash = self._BALANCE - (first.total_cost + first.fees)
+        assert follower.balance_at_entry == pytest.approx(cash + first.n * 0.30, abs=1e-9)
+        assert follower.n == TestSizesOnPortfolioValue._live_n(
+            cash + first.n * 0.30, cash, 0.75)
+
+    def test_a_dead_quote_keeps_the_last_usable_ask(self):
+        # OB's only candle after Monday 1 has no usable ask (a YES ask of 0
+        # and a NO ask of 1.00): the NO leg keeps its last usable NO ask, the
+        # Monday-1 candle's 0.40, which is its entry price, so the trade
+        # counts at its cost
+        candles = self._candles(ob=((date(2026, 1, 10), 15, 0.0, 1.00),))
+        point = self._sim(self._records(candles=candles))
+        opener, follower = point.trades
+        assert backtester._open_value(opener, _LADDER_M2) == opener.total_cost
+        cash = self._BALANCE - (opener.total_cost + opener.fees)
+        assert follower.balance_at_entry == pytest.approx(cash + opener.total_cost, abs=1e-9)
+
+    def test_a_dead_quote_after_a_move_keeps_the_moved_ask(self):
+        # OB's NO ask moves to 0.35 on Friday 01-09; on Saturday its candle
+        # has no usable ask. On Monday 2 the NO leg is worth 0.35, its last
+        # usable ask, not its 0.40 entry price
+        candles = self._candles(ob=((date(2026, 1, 9), 15, 0.65, 0.35),
+                                    (date(2026, 1, 10), 15, 0.0, 1.00)))
+        point = self._sim(self._records(candles=candles))
+        opener, follower = point.trades
+        assert backtester._open_value(opener, _LADDER_M2) == pytest.approx(
+            opener.n * (0.20 + 0.35))
+        cash = self._BALANCE - (opener.total_cost + opener.fees)
+        value = cash + opener.n * (0.20 + 0.35)
+        assert follower.balance_at_entry == pytest.approx(value, abs=1e-9)
+        assert follower.n == TestSizesOnPortfolioValue._live_n(value, cash, 0.75)
+
+    def test_an_emptied_yes_book_keeps_the_last_yes_ask(self):
+        # OA's YES ask rises to 0.97 on Friday 01-09; from Saturday no one
+        # offers YES (an ask of 1.00) until the pair pays out on 01-15. The
+        # YES leg keeps 0.97 on every day-end row and at Monday 2's
+        # checkpoint: the curve never falls back to the 0.20 entry price
+        candles = self._candles(ob=(), oa=((date(2026, 1, 9), 15, 0.97, 0.04),
+                                           (date(2026, 1, 10), 15, 1.00, 0.02)))
+        point = self._sim(self._records(candles=candles)[:1])
+        (t,) = point.trades
+        assert backtester._open_value(t, _LADDER_M2) == pytest.approx(t.n * (0.97 + 0.40))
+        curve = point.equity_df.set_index("date")["portfolio_value"]
+        cash = self._BALANCE - t.total_cost - t.fees
+        day = date(2026, 1, 9)
+        while day < date(2026, 1, 15):
+            assert curve[day] == pytest.approx(cash + t.n * (0.97 + 0.40), abs=1e-6), day
+            day += timedelta(days=1)
+        assert curve[date(2026, 1, 15)] == pytest.approx(self._BALANCE + t.profit, abs=1e-9)
+
+    def test_a_no_ask_at_the_clamp_is_not_a_price(self):
+        # OB's YES-bid book empties on Friday 01-09: the candle stores its NO
+        # ask as 0.99 (the clamp), beside a YES ask of 0.55. That 0.99 is not
+        # a price: the NO leg keeps 0.40, so Monday 2 sizes on the value at
+        # cost rather than on a NO leg near $1
+        candles = self._candles(ob=((date(2026, 1, 9), 15, 0.55, 0.99),
+                                    (date(2026, 1, 13), 15, 0.58, 0.43)))
+        point = self._sim(self._records(candles=candles))
+        opener, follower = point.trades
+        assert backtester._open_value(opener, _LADDER_M2) == opener.total_cost
+        cash = self._BALANCE - (opener.total_cost + opener.fees)
+        assert follower.balance_at_entry == pytest.approx(cash + opener.total_cost, abs=1e-9)
+
+    def test_a_trade_paying_out_on_the_monday_counts_once(self):
+        # The opener pays out on Monday 2 itself (12:00 UTC, before the
+        # checkpoint): its receipt is cash there, and it is no longer an open
+        # trade, so it is never counted twice
+        opener = _ladder_record(_ladder_market("OA", "EVO-1", "2026-01-12"),
+                                _ladder_market("OB", "EVO-2", "2026-01-12"), "o",
+                                [_LADDER_M1])
+        point = self._sim(self._records(opener=opener))
+        first, follower = point.trades
+        assert follower.balance_at_entry == pytest.approx(self._BALANCE + first.profit,
+                                                          abs=1e-9)
+
+    def test_the_curve_carries_the_trade_at_its_day_end_value(self):
+        point = self._sim(self._records()[:1])
+        (t,) = point.trades
+        curve = point.equity_df.set_index("date")["portfolio_value"]
+        n, fees, start = t.n, t.fees, self._BALANCE
+        # DR-03's leading row, and the days before the entry
+        assert curve[date(2025, 12, 31)] == start and curve[date(2026, 1, 4)] == start
+        expected = {
+            date(2026, 1, 5): start - fees,                       # at 0.20 + 0.40, its cost
+            date(2026, 1, 9): start - fees,
+            date(2026, 1, 10): start - fees - n * 0.10,           # NO ask 0.30 from 15:00
+            date(2026, 1, 12): start - fees - n * 0.10,
+            date(2026, 1, 13): start - fees + n * 0.15,           # NO ask 0.55 from 15:00
+            date(2026, 1, 14): start - fees + n * 0.15,
+            date(2026, 1, 15): start + t.profit,                  # paid out
+        }
+        for day, value in expected.items():
+            assert curve[day] == pytest.approx(value, abs=1e-6), day
+        # The endpoint is the start plus the trade's profit, as at cost
+        assert curve.iloc[-1] == pytest.approx(start + t.profit, abs=1e-9)
+        # The value steps sum to the profit; the carry steps to zero
+        assert sum(a for _d, a in backtester._value_steps(t)) == pytest.approx(t.profit)
+        assert sum(a for _d, a in backtester._carry_steps(t)) == pytest.approx(0.0, abs=1e-9)
+
+    def test_a_dip_while_held_is_a_drawdown(self):
+        point = self._sim(self._records()[:1])
+        (t,) = point.trades
+        curve = point.equity_df["portfolio_value"]
+        drawdown = float((curve / curve.cummax() - 1.0).min())
+        # The low is 01-10's mark, n x 0.10 below the start less the fees
+        assert drawdown == pytest.approx(-(t.fees + t.n * 0.10) / self._BALANCE, abs=1e-9)
+        # At cost the only dip is the fees
+        at_cost = self._sim(_unquoted(self._records()[:1])).equity_df
+        low = float((at_cost["portfolio_value"] / at_cost["portfolio_value"].cummax() - 1).min())
+        assert low == pytest.approx(-t.fees / self._BALANCE, abs=1e-9)
+
+    def test_the_value_steps_are_the_curve_s_moves(self):
+        # Two quoted trades: the curve's daily changes are the sum of their
+        # value steps on each day
+        point = self._sim(self._records())
+        steps = defaultdict(float)
+        for t in point.trades:
+            for day, amount in backtester._value_steps(t):
+                steps[day] += amount
+        curve = point.equity_df.set_index("date")["portfolio_value"]
+        for day, change in curve.diff().iloc[1:].items():
+            assert change == pytest.approx(steps.get(day, 0.0), abs=1e-6), day
+
+
+class TestSameTitleFlipAtMarket:
+    """A same-title pair whose pricier side flips between Mondays enters on
+    the Monday its gate passes, A = Y there; its marks follow that Monday's
+    legs (Pass 1b matches the quotes by ticker): NO on Y and YES on X."""
+
+    def test_the_marks_follow_the_traded_legs(self):
+        rec, _x, _y = _flipping_same_title_record()
+        candles = {"X": [_candle(_MONDAY_TS, 0.53, 0.47), _candle(_MONDAY2_TS, 0.40, 0.60),
+                         _candle(_at(date(2026, 1, 14), 9), 0.50, 0.50)],
+                   "Y": [_candle(_MONDAY_TS, 0.47, 0.53), _candle(_MONDAY2_TS, 0.70, 0.30),
+                         _candle(_at(date(2026, 1, 14), 9), 0.75, 0.25)]}
+        _quoted([rec], candles)
+        point = backtester._simulate_at_discount([rec], date(2026, 1, 1), 10_000.0, k=0.75,
+                                                 size_cap=1.0, end_date=date(2026, 3, 1))
+        (t,) = point.trades
+        assert (t.ticker_a, t.ticker_b, t.entry_date) == ("Y", "X", _LADDER_M2)
+        assert (t.marks[0].ticker, t.marks[1].ticker) == ("Y", "X")
+        # Monday 3: NO on Y at 0.25 and YES on X at 0.50
+        assert backtester._open_value(t, _LADDER_M3) == pytest.approx(t.n * 0.75)
+
+
+class TestAddOnStakeAtMarket:
+    """An add-on's held stake is its pair's open trades at market plus the
+    fees paid for them: what each paid, moved by what its contracts gained or
+    lost since. A pair whose value rose past its Kelly share is skipped where
+    at cost it would add; one whose value fell gets a larger add-on. Monday 1
+    quotes pA 0.20 / pB 0.45 / nB 0.55; Monday 2 pA 0.20 / pB 0.47 / nB 0.53
+    (a little wider, so at cost the pair adds a little)."""
+
+    _ROWS = [(_LADDER_M1, 0.20, 0.45, 0.55), (_LADDER_M2, 0.20, 0.47, 0.53)]
+
+    def _pair(self, pa_m2=None):
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-03-20"),
+                           _ladder_market("PB", "EVB-1", "2026-03-20"), "q", self._ROWS)
+        if pa_m2 is not None:
+            _quoted([p], {
+                "PA": [_candle(_at(_LADDER_M1, 9), 0.20, 0.80),
+                       _candle(_at(_LADDER_M2, 9), pa_m2, round(1.0 - pa_m2, 2))],
+                "PB": [_candle(_at(_LADDER_M1, 9), 0.45, 0.55),
+                       _candle(_at(_LADDER_M2, 9), 0.47, 0.53)]})
+        return p
+
+    @staticmethod
+    def _sim(p):
+        return backtester._simulate_at_discount([p], date(2026, 1, 1), 10_000.0, k=0.85,
+                                                 add_to_held=True, end_date=date(2026, 4, 1))
+
+    def test_a_pair_whose_value_rose_past_its_share_is_skipped(self, caplog):
+        at_cost = self._sim(self._pair())
+        assert [t.add_on for t in at_cost.trades] == [False, True]
+        with caplog.at_level(logging.INFO):
+            at_market = self._sim(self._pair(pa_m2=0.40))
+        (first,) = at_market.trades
+        assert any(r.getMessage().startswith(_ADD_ON_CAP_LINE) for r in caplog.records)
+        # The stake at market: what it paid moved by its change in value
+        value = first.n * (0.40 + 0.53)
+        stake = (first.total_cost + first.fees) + (value - first.total_cost)
+        cash = 10_000.0 - (first.total_cost + first.fees)
+        f2 = _uncapped_kelly({"pair_type": "time_series", "entry": self._pair()["entry"]["later"][0]},
+                             0.85)
+        assert held_pair_fraction(f2, stake, cash + value) <= 0
+        assert held_pair_fraction(f2, first.total_cost + first.fees,
+                                  cash + first.total_cost) > 0
+
+    def test_a_pair_whose_value_fell_adds_more(self):
+        at_cost = self._sim(self._pair())
+        fell = self._sim(self._pair(pa_m2=0.10))
+        assert [t.add_on for t in fell.trades] == [False, True]
+        first, add = fell.trades
+        assert add.n > at_cost.trades[1].n
+        value = first.n * (0.10 + 0.53)
+        cash = 10_000.0 - (first.total_cost + first.fees)
+        stake = (first.total_cost + first.fees) + (value - first.total_cost)
+        f2 = _uncapped_kelly({"pair_type": "time_series", "entry": self._pair()["entry"]["later"][0]},
+                             0.85)
+        assert add.balance_at_entry == pytest.approx(cash + value, abs=1e-9)
+        assert add.kelly_fraction == pytest.approx(held_pair_fraction(f2, stake, cash + value),
+                                                   abs=1e-12)
+
+
+_MOVING_EXTRA = {
+    "EA": [(date(2026, 1, 9), 15, 0.45, 0.55), (date(2026, 1, 22), 4, 0.38, 0.62)],
+    "EB": [(date(2026, 1, 10), 15, 0.75, 0.25), (date(2026, 1, 27), 3, 0.70, 0.30)],
+    "RUNG-EARLY": [(date(2026, 1, 16), 6, 0.25, 0.75)],
+    "RUNG-LATE": [(date(2026, 1, 14), 6, 0.66, 0.34), (date(2026, 2, 4), 6, 0.52, 0.48)],
+    "SA": [(date(2026, 1, 7), 6, 0.30, 0.70)],
+    "SB": [(date(2026, 1, 8), 6, 0.66, 0.34), (date(2026, 1, 20), 6, "x", 0.40)],
+}
+
+
+class _MovingGolden(TestPrepareEntriesGolden):
+    """The golden fixture with extra candles that move each traded leg's price
+    after entry (a dead quote among them)."""
+
+    _CANDLES = {t: sorted(list(series) + [_candle(_at(d, h), y, n)
+                                          for d, h, y, n in _MOVING_EXTRA.get(t, [])],
+                          key=lambda c: c["ts"])
+                for t, series in TestPrepareEntriesGolden._CANDLES.items()}
+
+
+@pytest.fixture(scope="class")
+def market_sweep_run():
+    """The moving-price golden fixture through run_backtest_sweep with every
+    family (band sweep, tier floors off, size caps, add to held pairs) on a
+    narrowed grid: band (0, 1) x k (0.5, 0.75)."""
+    toggles = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
+        apply_pre_toggle_defaults(toggles)
+        golden = _MovingGolden()
+        golden._patch(mp)
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=golden._START, initial_balance=10_000.0,
+                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                                 tier_off_sweep=True, add_on_sweep=True)
+        mp.undo()
+        yield SimpleNamespace(res=res, start=golden._START)
+    finally:
+        mp.undo()
+        toggles.undo()
+
+
+@pytest.mark.usefixtures("market_sweep_run")
+class TestMarketCapSweepParity:
+    """With prices that move after entry, every cap of every lazy family
+    (size cap, tier floors off, add to held pairs) still equals a fresh
+    simulation of the same quoted entries — the quotes depend on no cap, k,
+    band, tier setting or population — and the halves and the
+    excluding-top-event check equal fresh re-simulations too. Not vacuous:
+    the same entries without quotes size or mark differently."""
+
+    def _fresh_parity(self, point, subset, start, k, band, pop, cap, *, end_date,
+                      tier_floors=True, add_to_held=False, split_date=None, checks=False):
+        fresh = backtester._simulate_at_discount(
+            subset, start, 10_000.0, k=k, spread_band=band, population=pop, size_cap=cap,
+            quiet=True, end_date=end_date, tier_floors=tier_floors, add_to_held=add_to_held)
+        assert [astuple(t) for t in point.trades] == [astuple(t) for t in fresh.trades], \
+            (band, k, pop, cap)
+        pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df, check_exact=True)
+        assert point.peak_kelly_fraction == fresh.peak_kelly_fraction
+        if checks and pop in ("all", "time_series"):
+            assert point.halves == backtester._half_split(
+                _dr75_halves(subset, split_date), start, 10_000.0, k, band, population=pop,
+                tier_floors=tier_floors, size_cap=cap, quiet=True, end_date=end_date)
+            assert point.ex_top_event == backtester._ex_top_event(
+                fresh, subset, start, 10_000.0, band, population=pop,
+                tier_floors=tier_floors, quiet=True, end_date=end_date)
+        return fresh
+
+    def test_every_cap_of_every_family_equals_a_fresh_simulation(self, market_sweep_run):
+        res, start = market_sweep_run.res, market_sweep_run.start
+        checked = 0
+        for cs, tier_floors in ((res.cap_sweep, True), (res.tier_off_cap_sweep, False)):
+            for band in cs.bands:
+                subsets = _cap_sweep_subsets(cs.entries_by_band[band])
+                assert all("leg_quotes" in r for r in cs.entries_by_band[band])
+                for k in cs.ks:
+                    for cap, pops in cs.cell(band, k).items():
+                        for pop, point in pops.items():
+                            end = backtester._curve_end_date(cs.eager[(band, k, pop)])
+                            self._fresh_parity(point, subsets[pop], start, k, band, pop, cap,
+                                               end_date=end, tier_floors=tier_floors,
+                                               split_date=res.split_date, checks=True)
+                            checked += 1
+        for cs, tier_floors in ((res.add_on_cap_sweep, True),
+                                (res.add_on_tier_off_cap_sweep, False)):
+            for band in cs.bands:
+                entries = cs.entries_by_band[band]
+                for k in cs.ks:
+                    for cap, pops in cs.cell(band, k).items():
+                        point = pops["all"]
+                        self._fresh_parity(point, entries, start, k, band, "all", cap,
+                                           end_date=cs.end_dates[(band, k, "all")],
+                                           tier_floors=tier_floors, add_to_held=True)
+                        checked += 1
+        assert checked > 300
+
+    def test_market_values_move_the_run(self, market_sweep_run):
+        res = market_sweep_run.res
+        cs = res.cap_sweep
+        band, k = (0.0, 1.0), 0.75
+        entries = cs.entries_by_band[band]
+        quoted = backtester._simulate_at_discount(entries, market_sweep_run.start, 10_000.0,
+                                                  k=k, end_date=date(2026, 9, 30))
+        at_cost = backtester._simulate_at_discount(_unquoted(entries), market_sweep_run.start,
+                                                   10_000.0, k=k, end_date=date(2026, 9, 30))
+        # Some open trade is valued off its cost at some checkpoint
+        moved = [(t, d) for t in quoted.trades for d in (_LADDER_M2, _LADDER_M3, date(2026, 1, 26))
+                 if t.entry_date < d < t.exit_date
+                 and backtester._open_value(t, d) != t.total_cost]
+        assert moved
+        # ... and the curve differs, while its end is the same sum of profits
+        assert not quoted.equity_df["portfolio_value"].equals(at_cost.equity_df["portfolio_value"])
+        assert quoted.equity_df["portfolio_value"].iloc[-1] == pytest.approx(
+            10_000.0 + sum(t.profit for t in quoted.trades), abs=1e-6)
+
+
+class TestUnquotedExactness:
+    """A trade with no quotes is valued exactly as before trades were valued
+    at market: _open_value is its total_cost, its steps are the two at-cost
+    steps, and a run of records stripped of their quotes equals the run whose
+    writer did nothing — compared with == and check_exact, never approx."""
+
+    def test_the_steps_and_the_value_of_an_unquoted_trade(self):
+        point = TestSizesOnPortfolioValue()._sim(
+            [TestSizesOnPortfolioValue._opener(), TestSizesOnPortfolioValue._follower(_LADDER_M2)],
+            k=0.75)
+        for t in point.trades:
+            assert t.marks is None
+            assert backtester._open_value(t, _LADDER_M2) == t.total_cost
+            assert backtester._open_value_path(t) is None
+            assert backtester._carry_steps(t) == ((t.entry_date, t.total_cost),
+                                                  (t.exit_date, -t.total_cost))
+            assert backtester._value_steps(t) == ((t.entry_date, -t.fees),
+                                                  (t.exit_date, t.actual_payoff - t.total_cost))
+        opener, follower = point.trades
+        # The value an open unquoted trade adds is its cost, to the bit: the
+        # cash Pass 2 holds (contracts plus each leg's fee, in the fee loop's
+        # order, spent) plus the opener's total_cost
+        fee_a, fee_b = fee_leg_exact(opener.n, 0.20), fee_leg_exact(opener.n, 0.40)
+        cash = 10_000.0 - (opener.total_cost + fee_a + fee_b)
+        assert follower.balance_at_entry == cash + opener.total_cost
+
+    def test_a_flat_quoted_trade_has_the_at_cost_steps(self):
+        # Quotes that never leave the entry prices give exactly the at-cost steps
+        rec = _quoted([TestSizesOnPortfolioValue._opener()],
+                      {"OA": [_candle(_at(_LADDER_M1, 9), 0.20, 0.80)],
+                       "OB": [_candle(_at(_LADDER_M1, 9), 0.60, 0.40)]})
+        point = TestSizesOnPortfolioValue()._sim(rec, k=0.75)
+        (t,) = point.trades
+        assert t.marks is not None
+        assert backtester._carry_steps(t) == ((t.entry_date, t.total_cost),
+                                              (t.exit_date, -t.total_cost))
+        assert backtester._value_steps(t) == ((t.entry_date, -t.fees),
+                                              (t.exit_date, t.actual_payoff - t.total_cost))
+        bare = TestSizesOnPortfolioValue()._sim(_unquoted(rec), k=0.75)
+        pd.testing.assert_frame_equal(point.equity_df, bare.equity_df, check_exact=True)
+
+    def test_records_without_quotes_run_as_a_writer_that_did_nothing(self, monkeypatch):
+        golden = TestPrepareEntriesGolden()
+        with monkeypatch.context() as mp:
+            golden._patch(mp)
+            entries, _ = backtester._prepare_entries(MagicMock(), MagicMock(), golden._START,
+                                                     True, None, same_event_ladders=True)
+            mp.setattr(backtester, "_attach_leg_quotes", lambda *a, **k: None)
+            plain, _ = backtester._prepare_entries(MagicMock(), MagicMock(), golden._START,
+                                                   True, None, same_event_ladders=True)
+        assert all("leg_quotes" in r for r in entries)
+        assert not any("leg_quotes" in r for r in plain)
+        for k in (0.5, 0.75):
+            a = backtester._simulate_at_discount(_unquoted(entries), golden._START, 10_000.0,
+                                                 k=k, end_date=date(2026, 9, 30))
+            b = backtester._simulate_at_discount(plain, golden._START, 10_000.0, k=k,
+                                                 end_date=date(2026, 9, 30))
+            assert [astuple(t) for t in a.trades] == [astuple(t) for t in b.trades]
+            pd.testing.assert_frame_equal(a.equity_df, b.equity_df, check_exact=True)

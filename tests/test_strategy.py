@@ -6,6 +6,7 @@ YES on market_b (pB). Every fixture therefore carries a REAL float nB — a
 MagicMock auto-attribute would TypeError inside compute_trade's arithmetic.
 """
 import ast
+import dataclasses
 import inspect
 import json
 import logging
@@ -28,10 +29,12 @@ from kalshi_betting.config import (
 )
 from kalshi_betting.scanner import (
     CandidatePair,
+    HeldPair,
     PriceRange,
     enrich_with_orderbook_prices,
     leg_prices,
     leg_sides,
+    pair_held,
     prefix_fill_prices,
 )
 from kalshi_betting.strategy import TradeSpec, _kelly_p, compute_trade, select_portfolio
@@ -547,6 +550,288 @@ class TestComputeTradeSettings:
             assert sized > 0, k
 
 
+def _held_pair(value: float, count: float = 30.0, fees: float = 0.90) -> HeldPair:
+    """A held pair the account holds on A1 (YES) / B1 (NO), worth `value` at
+    today's prices, whose two markets paid `fees` in fees: its stake is
+    value + fees. It cost $18.90, fees included."""
+    return HeldPair(sides=(("A1", "yes"), ("B1", "no")), count=count,
+                    cost_dollars=18.9, value_dollars=value, fees_dollars=fees)
+
+
+class TestComputeTradeAddsToHeldPair:
+    """An add-on to a held pair (CandidatePair.held) is sized on its whole
+    position: the held pair's stake (its worth at today's prices plus the
+    fees paid for it) plus the new trade stays within min(f*, cap) of the
+    portfolio value, and the new trade alone within what a new pair would
+    get, never more than the cash. Both sizing paths, the bookless one and
+    the book search, read it through config.held_pair_fraction."""
+
+    # k 0.75, a 10% cap: the time-series fixture's f* (about 0.16) is capped
+    _SETTINGS = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
+                             interval_discount=0.75, size_cap=0.10)
+    # A $211 portfolio value, $150 of it cash
+    _VALUE_CENTS = 21_100
+    _CASH_CENTS = 15_000
+
+    def _bookless(self, held):
+        """The flow-through time-series fixture, bookless, adding to `held`."""
+        pair = make_pair(pA=_TS_PA, pB=_TS_PB, nA=_TS_NA, nB=_TS_NB, pair_type="time_series")
+        pair.held = held
+        return pair
+
+    @staticmethod
+    def _booked(held, qty: float = 100):
+        """The same pair with one level of book, adding to `held`."""
+        pair = make_booked_pair([(_TS_PA, _TS_NB, qty)], pair_type="time_series", pB=_TS_PB)
+        return dataclasses.replace(pair, held=held)
+
+    def _size(self, pair, cash_cents=_CASH_CENTS):
+        """compute_trade on the class's portfolio value and settings."""
+        return compute_trade(pair, self._VALUE_CENTS, settings=self._SETTINGS,
+                             cash_cents=cash_cents)
+
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_the_whole_position_stays_within_its_kelly_share(self, path):
+        # Worth $8 plus $0.90 of fees paid: a stake of $8.90
+        held = _held_pair(value=8.0)
+        assert held.stake_dollars == 8.0 + 0.90 == 8.9
+        build = self._bookless if path == "bookless" else self._booked
+        spec = self._size(build(held))
+        plain = self._size(build(None))
+        assert spec is not None and plain is not None
+        fraction = config.held_pair_fraction(0.10, 8.9, 211.0)
+        assert spec.kelly_fraction == fraction == 0.10 - 8.9 / 211.0
+        # Old and new together, fees included, within 10% of the portfolio value ...
+        assert held.stake_dollars + spec.total_cost_with_fees <= 0.10 * 211.0 + 1e-9
+        # ... the new stake within the add-on's budget, what the share is
+        # missing ($12.20), with no tolerance ...
+        assert spec.total_cost_with_fees <= config.kelly_budget(211.0, fraction, 150.0)
+        assert config.kelly_budget(211.0, fraction, 150.0) == pytest.approx(12.20, abs=1e-12)
+        # ... and never more than a new pair would get of the same value and cash
+        assert spec.total_cost_with_fees <= config.kelly_budget(211.0, 0.10, 150.0)
+        # 16 pairs ($11.71) where the same pair without the held stake buys 28 ($20.50)
+        assert (spec.x, plain.x) == (16, 28)
+        assert spec.total_cost_with_fees == pytest.approx(11.71)
+        # The held pair reaches the spec the trader and the reports read
+        assert pair_held(spec.pair) is held
+
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_the_fees_paid_shrink_the_add_on(self, path):
+        # The same $8 worth with its fees left out would be sized as a stake
+        # of $8 and buy 17 pairs ($12.44): each dollar of fees paid is a
+        # dollar less for the add-on
+        build = self._bookless if path == "bookless" else self._booked
+        with_fees = self._size(build(_held_pair(value=8.0)))
+        fee_free = self._size(build(_held_pair(value=8.0, fees=0.0)))
+        assert (with_fees.x, fee_free.x) == (16, 17)
+        assert fee_free.total_cost_with_fees == pytest.approx(12.44)
+        assert fee_free.kelly_fraction == 0.10 - 8.0 / 211.0 > with_fees.kelly_fraction
+
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_the_cash_binds_an_add_on_as_it_binds_a_new_pair(self, path):
+        # $10 of cash is less than the $12.20 the add-on may take: the cash
+        # sets the budget, for the add-on and a new pair alike
+        build = self._bookless if path == "bookless" else self._booked
+        spec = self._size(build(_held_pair(value=8.0)), cash_cents=1_000)
+        plain = self._size(build(None), cash_cents=1_000)
+        assert spec is not None and plain is not None
+        assert spec.x == plain.x == 13
+        assert spec.total_cost_with_fees == plain.total_cost_with_fees <= 10.0
+        # Only the share Kelly reports differs
+        assert spec.kelly_fraction == config.held_pair_fraction(0.10, 8.9, 211.0)
+        assert plain.kelly_fraction == 0.10
+
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_a_pair_holding_little_sizes_as_a_new_pair(self, path):
+        # $1 of worth and $0.90 of fees held against a $10,000 portfolio with
+        # no cap: what the share is missing is far more than the $150 of cash,
+        # so the cash sets both sizes
+        settings = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
+                                interval_discount=0.75, size_cap=1.0)
+        build = self._bookless if path == "bookless" else self._booked
+        held = _held_pair(value=1.0)
+        assert held.stake_dollars == pytest.approx(1.90)
+        spec = compute_trade(build(held), 1_000_000, settings=settings, cash_cents=15_000)
+        plain = compute_trade(build(None), 1_000_000, settings=settings, cash_cents=15_000)
+        assert spec is not None and plain is not None
+        assert (spec.x, spec.total_cost_with_fees) == (plain.x, plain.total_cost_with_fees)
+        assert spec.total_cost_with_fees <= 150.0
+        # The share it reports is the new pair's less what the pair stakes
+        assert spec.kelly_fraction == config.held_pair_fraction(
+            plain.kelly_fraction, held.stake_dollars, 10_000.0) == (
+            plain.kelly_fraction - held.stake_dollars / 10_000.0)
+
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_a_pair_at_its_kelly_share_adds_nothing_and_says_so_once(self, path, caplog):
+        # Worth $30 at today's prices, plus $0.90 of fees, against 10% of a
+        # $211 portfolio: nothing is missing
+        held = _held_pair(value=30.0)
+        pair = self._bookless(held) if path == "bookless" else self._booked(held, qty=1000)
+        with caplog.at_level(logging.INFO):
+            assert self._size(pair) is None
+        lines = [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith("Not adding to held pair")]
+        # One line, however many sizes the book search tried
+        assert lines == [
+            f"Not adding to held pair '{pair.canonical_title}': it already holds its "
+            "Kelly share (30 contracts each, worth $30.00 at today's prices, fees paid "
+            "$0.90, portfolio value $211.00)"]
+
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_a_pair_that_bought_its_share_adds_nothing_at_unchanged_prices(
+            self, path, caplog):
+        # Last run: $205.00, all cash, bought a new pair's whole 10% share, 28
+        # pairs for $20.50 ($19.60 of contracts and $0.90 of fees). This run,
+        # at unchanged prices: the pair is worth $19.60, the fees are spent,
+        # so the portfolio value is $204.10 ($184.50 of cash). Its stake,
+        # $20.50 with the fees, is more than 10% of $204.10 ($20.41)
+        build = self._bookless if path == "bookless" else (
+            lambda held: self._booked(held, qty=1000))
+        first = compute_trade(build(None), 20_500, settings=self._SETTINGS, cash_cents=20_500)
+        assert (first.x, first.total_cost_with_fees) == (28, pytest.approx(20.50))
+        # The two markets' fees as the positions listing reports them
+        fees = fee_leg_exact(28, _TS_PA) + fee_leg_exact(28, _TS_NB)
+        assert fees == pytest.approx(0.90)
+        assert fees == pytest.approx(first.total_cost_with_fees - first.total_cost)
+        held = HeldPair(sides=(("A1", "yes"), ("B1", "no")), count=28.0,
+                        cost_dollars=20.50, value_dollars=28 * _TS_PA + 28 * _TS_NB,
+                        fees_dollars=fees)
+        assert held.value_dollars == pytest.approx(19.60)
+        pair = build(held)
+        with caplog.at_level(logging.INFO):
+            assert compute_trade(pair, 20_410, settings=self._SETTINGS,
+                                 cash_cents=18_450) is None
+        assert [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("Not adding to held pair")] == [
+            f"Not adding to held pair '{pair.canonical_title}': it already holds its "
+            "Kelly share (28 contracts each, worth $19.60 at today's prices, fees paid "
+            "$0.90, portfolio value $204.10)"]
+        # Non-vacuous: with the fees left out of the stake ($19.60 against
+        # $20.41) the same pair would buy one more contract pair, $0.74 with
+        # its own fees
+        fee_free = compute_trade(build(dataclasses.replace(held, fees_dollars=0.0)), 20_410,
+                                 settings=self._SETTINGS, cash_cents=18_450)
+        assert (fee_free.x, fee_free.total_cost_with_fees) == (1, pytest.approx(0.74))
+
+    def test_at_unchanged_prices_no_new_pair_is_topped_up_next_run(self):
+        # Across 777 portfolio values from $50 to about $2,000, all cash: a
+        # new pair sized one run, then its add-on the next run at unchanged
+        # prices, the portfolio value being the cash left plus the pair at its
+        # worth. With the fees in the stake the add-on never buys anything;
+        # with them left out it would buy a contract or so on most of these
+        # values, every run
+        def real_bookless(held):
+            """The fixture's prices on real markets with no book, adding to
+            `held` (a mock market would log a tick warning on every call)."""
+            pair = make_booked_pair([(_TS_PA, _TS_NB, 1)], pair_type="time_series",
+                                    pB=_TS_PB)
+            return dataclasses.replace(pair, depth_levels=(), max_contracts=0, held=held)
+
+        tried = fee_free_adds = 0
+        for start in range(5_000, 200_001, 251):
+            first = compute_trade(real_bookless(None), start, settings=self._SETTINGS,
+                                  cash_cents=start)
+            n = first.x
+            held = HeldPair(sides=(("A1", "yes"), ("B1", "no")), count=float(n),
+                            cost_dollars=first.total_cost_with_fees,
+                            value_dollars=n * _TS_PA + n * _TS_NB,
+                            fees_dollars=fee_leg_exact(n, _TS_PA) + fee_leg_exact(n, _TS_NB))
+            cash = round(start - first.total_cost_with_fees * 100)
+            value = round(cash + held.value_dollars * 100)
+            add = compute_trade(real_bookless(held), value, settings=self._SETTINGS,
+                                cash_cents=cash)
+            assert add is None, (start, n, add.x)
+            fee_free = compute_trade(real_bookless(dataclasses.replace(held, fees_dollars=0.0)),
+                                     value, settings=self._SETTINGS, cash_cents=cash)
+            tried += 1
+            fee_free_adds += fee_free is not None
+        assert tried == 777
+        assert fee_free_adds > tried // 2
+
+    @pytest.mark.parametrize("case", ["untradeable", "unreachable-book"])
+    def test_any_other_refusal_says_no_size_fits(self, case, caplog):
+        # The held pair stakes $1.90 (worth $1, $0.90 of fees) of a 10% share
+        # of $10,000, so Kelly would add; what refuses it is something else,
+        # and the line must not blame Kelly
+        held = _held_pair(value=1.0)
+        if case == "untradeable":
+            pair = dataclasses.replace(self._booked(held), tradeable=False)
+        else:
+            # No fill-or-kill order can buy one contract pair from half a contract
+            pair = dataclasses.replace(
+                make_booked_pair([(_TS_PA, _TS_NB, 0.5)], pair_type="time_series",
+                                 pB=_TS_PB, max_contracts=1), held=held)
+        with caplog.at_level(logging.INFO):
+            assert compute_trade(pair, 1_000_000, settings=self._SETTINGS) is None
+        lines = [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith("Not adding to held pair")]
+        assert lines == [f"Not adding to held pair '{pair.canonical_title}': "
+                         "no size fits this run"]
+
+    @pytest.mark.parametrize("path", ["bookless", "booked"])
+    def test_no_cash_is_no_size_not_a_kelly_share(self, path, caplog):
+        # With no cash the add-on's share ($12.20 of the value) is still
+        # missing, but nothing can pay for it: the line says no size fits,
+        # never that the pair holds its share
+        build = self._bookless if path == "bookless" else self._booked
+        pair = build(_held_pair(value=8.0))
+        with caplog.at_level(logging.INFO):
+            assert self._size(pair, cash_cents=0) is None
+        assert [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("Not adding to held pair")] == [
+            f"Not adding to held pair '{pair.canonical_title}': no size fits this run"]
+        # Non-vacuous: with cash the same pair adds to the held one
+        assert self._size(pair) is not None
+
+    def test_a_held_pair_worth_more_adds_less(self):
+        # The same held pair (it cost $18.90, $0.90 of it fees), valued at
+        # today's prices: worth $4 it has lost value, worth $12 it has
+        # gained. The add-on buys what the $21.10 share is missing of the
+        # stake (worth plus fees), so it shrinks as the pair's worth grows,
+        # and is never more than a new pair (28 pairs) nor more than the cash
+        sizes = {}
+        for worth in (4.0, 8.0, 12.0):
+            held = _held_pair(value=worth)
+            spec = self._size(self._bookless(held))
+            fraction = config.held_pair_fraction(0.10, worth + 0.90, 211.0)
+            assert spec.kelly_fraction == fraction
+            assert spec.total_cost_with_fees <= config.kelly_budget(211.0, fraction, 150.0)
+            assert held.stake_dollars + spec.total_cost_with_fees <= 0.10 * 211.0 + 1e-9
+            sizes[worth] = spec.x
+        plain = self._size(self._bookless(None))
+        assert sizes == {4.0: 22, 8.0: 16, 12.0: 11}
+        assert plain.x == 28 and plain.total_cost_with_fees <= 150.0
+
+    def test_an_ordinary_pair_it_refuses_logs_nothing_new(self, caplog):
+        with caplog.at_level(logging.INFO):
+            assert self._size(make_pair(tradeable=False)) is None
+        assert "Not adding to held pair" not in caplog.text
+
+    def test_the_trade_line_names_the_held_count(self, caplog):
+        with caplog.at_level(logging.INFO):
+            self._size(self._bookless(_held_pair(value=8.0)))
+            [added] = [r.getMessage() for r in caplog.records
+                       if r.getMessage().startswith("Trade computed")]
+            caplog.clear()
+            self._size(self._bookless(None))
+            [plain] = [r.getMessage() for r in caplog.records
+                       if r.getMessage().startswith("Trade computed")]
+        assert added.endswith(" | adds to 30 held")
+        # An ordinary line ends where it always did
+        assert plain.endswith("%") and "adds to" not in plain
+
+    def test_a_mock_pairs_truthy_held_attribute_is_not_an_add_on(self, caplog):
+        mock_pair = make_pair(pA=_TS_PA, pB=_TS_PB, nA=_TS_NA, nB=_TS_NB,
+                              pair_type="time_series")
+        # MagicMock answers pair.held with a truthy auto-attribute
+        assert mock_pair.held
+        with caplog.at_level(logging.INFO):
+            spec = self._size(mock_pair)
+        plain = self._size(self._bookless(None))
+        assert spec is not None and spec.x == plain.x
+        assert "adds to" not in caplog.text
+
+
 def _bookless_pair(nA: float = 0.30, pB: float = 0.30) -> CandidatePair:
     """A real same-title CandidatePair with no book, on plain markets."""
     now = datetime.now(UTC)
@@ -702,6 +987,67 @@ def _keyword_values(module, func_name: str, callee: str, keyword: str, *,
     raise AssertionError(f"{module.__name__}.{func_name} not found")
 
 
+def _add_on_unblocking_problems(source: str) -> list[str]:
+    """
+    Check how main._run_prod decides which held markets the finders may see.
+
+    A held market is kept out of both finders only by blocked_tickers (the
+    same-title finder has no ladder refusal of its own), so the markets the
+    run lets back in must be exactly those of the add_on_pairs it hands the
+    finders, as that dict stands after its last change (the drop of pairs
+    already at their size cap). A set built from held_pairs' own result, or
+    before the drop, lets a full pair's markets back in with nothing to
+    protect them: an ordinary pair could then buy more of a held market.
+
+    Args:
+        source (str): Source text holding a def _run_prod (main.py's own, or
+            a changed copy).
+
+    Returns:
+        list[str]: One short sentence per rule the function breaks; empty
+            when it keeps them all.
+    """
+    tree = ast.parse(source)
+    [func] = [n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_run_prod"]
+    assigned: dict[str, list[tuple[int, ast.AST]]] = {}
+    for node in ast.walk(func):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    assigned.setdefault(target.id, []).append((node.lineno, node.value))
+    problems = []
+    tickers = assigned.get("add_on_tickers", [])
+    if len(tickers) != 1:
+        return ["add_on_tickers is not assigned exactly once"]
+    [(tickers_line, tickers_value)] = tickers
+    # The names the value reads, bar the ones its own comprehension binds
+    bound = {n.id for n in ast.walk(tickers_value)
+             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    read = {n.id for n in ast.walk(tickers_value)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)} - bound
+    if read != {"add_on_pairs"}:
+        problems.append(f"add_on_tickers is built from {sorted(read)}, not add_on_pairs")
+    if any(line > tickers_line for line, _ in assigned.get("add_on_pairs", [])):
+        problems.append("add_on_pairs changes after add_on_tickers is built")
+    blocked = assigned.get("blocked_tickers", [])
+    if [ast.unparse(value) for _, value in blocked] != ["held_tickers - add_on_tickers"]:
+        problems.append("blocked_tickers is not held_tickers - add_on_tickers")
+    # Both finders take the blocked set as their held-markets argument, and
+    # the market list they read is filtered by it
+    for finder in ("find_time_series_pairs", "find_same_title_pairs"):
+        calls = [n for n in ast.walk(func) if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", getattr(n.func, "attr", None)) == finder]
+        if not calls or any(len(c.args) < 2 or not isinstance(c.args[1], ast.Name)
+                            or c.args[1].id != "blocked_tickers" for c in calls):
+            problems.append(f"{finder} is not handed blocked_tickers")
+    if not any("blocked_tickers" in ast.unparse(value)
+               for _, value in assigned.get("markets", [])):
+        problems.append("the market list is not filtered by blocked_tickers")
+    return problems
+
+
 def _call_nodes(module, func_name: str, callee: str) -> list:
     """
     Every call to `callee` inside a function, as AST nodes.
@@ -721,6 +1067,286 @@ def _call_nodes(module, func_name: str, callee: str) -> list:
                     and (sub.func.id if isinstance(sub.func, ast.Name)
                          else getattr(sub.func, "attr", None)) == callee]
     raise AssertionError(f"{module.__name__}.{func_name} not found")
+
+
+def _def_named(source: str, name: str) -> ast.FunctionDef:
+    """
+    The one def called `name` in a source text.
+
+    Args:
+        source (str): A module's source, or a changed copy of it.
+        name (str): The function's name.
+
+    Returns:
+        ast.FunctionDef: Its node; fails the test unless there is exactly one.
+    """
+    defs = [n for n in ast.walk(ast.parse(source))
+            if isinstance(n, ast.FunctionDef) and n.name == name]
+    assert len(defs) == 1, f"{name}: {len(defs)} definitions"
+    return defs[0]
+
+
+def _calls_to(func: ast.AST, callee: str) -> list:
+    """
+    Every call to `callee` (a bare name or an attribute) inside func, in source order.
+
+    Args:
+        func (ast.AST): A function's node.
+        callee (str): The called name.
+
+    Returns:
+        list[ast.Call]: The calls, by line then column.
+    """
+    calls = [n for n in ast.walk(func) if isinstance(n, ast.Call)
+             and (n.func.id if isinstance(n.func, ast.Name)
+                  else getattr(n.func, "attr", None)) == callee]
+    return sorted(calls, key=lambda c: (c.lineno, c.col_offset))
+
+
+def _bound_from(func: ast.AST, call: ast.Call) -> list[str]:
+    """
+    The names an assignment inside func binds directly from this call.
+
+    Args:
+        func (ast.AST): A function's node.
+        call (ast.Call): One call inside it.
+
+    Returns:
+        list[str]: The assigned names (empty when the call's result is not assigned as is).
+    """
+    return [t.id for n in ast.walk(func) if isinstance(n, ast.Assign) and n.value is call
+            for t in n.targets if isinstance(t, ast.Name)]
+
+
+def _add_on_sizing_problems(source: str) -> list[str]:
+    """
+    Check how strategy._evaluate_size sizes an add-on to a held pair.
+
+    The capped Kelly fraction becomes held_pair_fraction's, fed the held
+    pair's stake (HeldPair.stake_dollars: its worth at today's prices plus the
+    fees paid for it; never its cost, never the worth alone) and the
+    portfolio value (never the cash), and only then does the budget read it:
+    kelly_budget and max_affordable_pairs both take that fraction, so an
+    add-on spends at most what the whole position is missing and at most the
+    cash. An add-on step after the budget, or fed the wrong base, sizes a
+    real add-on wrongly.
+
+    Args:
+        source (str): Source text holding def _evaluate_size (strategy.py's own,
+            or a changed copy).
+
+    Returns:
+        list[str]: One short sentence per rule it breaks; empty when it keeps them all.
+    """
+    func = _def_named(source, "_evaluate_size")
+    fractions = _calls_to(func, "held_pair_fraction")
+    if len(fractions) != 1:
+        return [f"held_pair_fraction is called {len(fractions)} times, not once"]
+    [share] = fractions
+    problems = []
+    if share.keywords or [ast.unparse(a) for a in share.args] != [
+            "kelly_fraction_capped", "held.stake_dollars", "portfolio_value_cents / 100.0"]:
+        problems.append(f"held_pair_fraction is called as {ast.unparse(share)}")
+    if _bound_from(func, share) != ["kelly_fraction_capped"]:
+        problems.append("held_pair_fraction's result is not the capped fraction")
+    for callee, index in (("kelly_budget", 1), ("max_affordable_pairs", 2)):
+        calls = _calls_to(func, callee)
+        if len(calls) != 1:
+            problems.append(f"{callee} is called {len(calls)} times, not once")
+            continue
+        [call] = calls
+        if len(call.args) <= index or ast.unparse(call.args[index]) != "kelly_fraction_capped":
+            problems.append(f"{callee} does not read the capped fraction")
+        if call.lineno <= share.lineno:
+            problems.append(f"{callee} comes before held_pair_fraction")
+    return problems
+
+
+def _refusal_line_problems(source: str) -> list[str]:
+    """
+    Check that compute_trade names every refusal of an add-on, once.
+
+    Every `return None` in compute_trade must come right after a
+    _log_no_add_on call in the same block, and there must be as many such
+    calls as returns, so an add-on refused on any path says why in exactly
+    one line. The calls that ask _holds_kelly_share hand it the cash
+    compute_trade got.
+
+    Args:
+        source (str): Source text holding def compute_trade (strategy.py's own,
+            or a changed copy).
+
+    Returns:
+        list[str]: One short sentence per rule it breaks; empty when it keeps them all.
+    """
+    func = _def_named(source, "compute_trade")
+    problems = []
+    returns = 0
+    for node in ast.walk(func):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(node, field, None)
+            if not isinstance(block, list):
+                continue
+            for i, stmt in enumerate(block):
+                if not (isinstance(stmt, ast.Return) and (
+                        stmt.value is None or (isinstance(stmt.value, ast.Constant)
+                                               and stmt.value.value is None))):
+                    continue
+                returns += 1
+                before = block[i - 1] if i else None
+                if not (isinstance(before, ast.Expr) and isinstance(before.value, ast.Call)
+                        and getattr(before.value.func, "id", None) == "_log_no_add_on"):
+                    problems.append(f"the return of None at line {stmt.lineno} logs no refusal")
+    lines = len(_calls_to(func, "_log_no_add_on"))
+    if returns == 0 or returns != lines:
+        problems.append(f"{returns} returns of None but {lines} refusal lines")
+    for call in _calls_to(func, "_holds_kelly_share"):
+        if [ast.unparse(k.value) for k in call.keywords if k.arg == "cash_cents"] != [
+                "cash_cents"]:
+            problems.append("_holds_kelly_share is not handed the cash")
+    return problems
+
+
+def _live_held_pair_problems(source: str) -> list[str]:
+    """
+    Check how main._run_prod finds, values and checks the held pairs it may add to.
+
+    The run finds them once, as held_pairs(held_positions, held_labels,
+    markets_by_ticker), with markets_by_ticker built from the whole market
+    list before held markets are dropped from it, so every held market's ask
+    is there. The at-cap drop reads each pair's stake (its worth at today's
+    prices plus the fees paid for it) against the portfolio value, through
+    the one add-on rule, as the sizer does. Kalshi's value of the open
+    positions is checked once (_checked_positions_value), after the
+    positions are read and before any held pair is found.
+
+    Args:
+        source (str): Source text holding def _run_prod (main.py's own, or a
+            changed copy).
+
+    Returns:
+        list[str]: One short sentence per rule it breaks; empty when it keeps them all.
+    """
+    func = _def_named(source, "_run_prod")
+    problems = []
+    found = _calls_to(func, "held_pairs")
+    if len(found) != 1:
+        return [f"held_pairs is called {len(found)} times, not once"]
+    [pairs] = found
+    if pairs.keywords or [ast.unparse(a) for a in pairs.args] != [
+            "held_positions", "held_labels", "markets_by_ticker"]:
+        problems.append(f"held_pairs is called as {ast.unparse(pairs)}")
+    if _bound_from(func, pairs) != ["add_on_pairs"]:
+        problems.append("held_pairs' result is not add_on_pairs")
+    maps = [n for n in ast.walk(func) if isinstance(n, ast.Assign) and any(
+        isinstance(t, ast.Name) and t.id == "markets_by_ticker" for t in n.targets)]
+    drops = [n.lineno for n in ast.walk(func) if isinstance(n, ast.Assign)
+             and any(isinstance(t, ast.Name) and t.id == "markets" for t in n.targets)
+             and "blocked_tickers" in ast.unparse(n.value)]
+    if len(maps) != 1 or ast.unparse(maps[0].value) != "{m.ticker: m for m in markets}":
+        problems.append("markets_by_ticker is not built once from the market list")
+    elif maps[0].lineno > pairs.lineno or (drops and maps[0].lineno > min(drops)):
+        problems.append("markets_by_ticker is built after held markets are dropped "
+                        "or after held_pairs")
+    shares = _calls_to(func, "held_pair_fraction")
+    at_cap = [n for n in ast.walk(func) if isinstance(n, ast.Compare) and n.left in shares
+              and [type(op) for op in n.ops] == [ast.LtE]
+              and [ast.unparse(c) for c in n.comparators] == ["0"]]
+    if len(shares) != 1 or len(at_cap) != 1 or [ast.unparse(a) for a in shares[0].args] != [
+            "settings.size_cap", "pair.stake_dollars", "portfolio_value_cents / 100"]:
+        problems.append("the at-cap drop is not held_pair_fraction(settings.size_cap, "
+                        "pair.stake_dollars, portfolio_value_cents / 100) <= 0")
+    checks = _calls_to(func, "_checked_positions_value")
+    reads = _calls_to(func, "get_held_positions")
+    if len(checks) != 1 or len(reads) != 1:
+        problems.append("the positions value is not checked exactly once after one "
+                        "positions read")
+    elif not reads[0].lineno < checks[0].lineno < pairs.lineno:
+        problems.append("the positions value is not checked between the positions read "
+                        "and held_pairs")
+    return problems
+
+
+def _backtest_add_on_problems(source: str) -> list[str]:
+    """
+    Check how backtester._simulate_at_discount values open trades and sizes an add-on.
+
+    Each Monday's portfolio value is the cash plus every open trade through
+    _open_value, the one valuation (at market; at cost for a trade with no
+    quotes). Each candidate starts from its capped Kelly fraction; an
+    add-on's becomes held_pair_fraction(fraction, stake, checkpoint_value),
+    the open pair's stake against that value, and then the one budget of the
+    walk, kelly_budget(checkpoint_value, fraction, cash), reads it. The trade
+    records that fraction. The stake counts the fees, as the live stake
+    (HeldPair.stake_dollars) does: the pair's record keeps each trade with
+    what it paid (its contracts plus fees, `invested`), and the stake adds,
+    for each, what it paid moved by what its contracts gained or lost since
+    (_open_value less their cost).
+
+    Args:
+        source (str): Source text holding def _simulate_at_discount
+            (backtester.py's own, or a changed copy).
+
+    Returns:
+        list[str]: One short sentence per rule it breaks; empty when it keeps them all.
+    """
+    func = _def_named(source, "_simulate_at_discount")
+    problems = []
+    shares = _calls_to(func, "held_pair_fraction")
+    budgets = _calls_to(func, "kelly_budget")
+    if len(shares) != 1 or len(budgets) != 1:
+        return [f"held_pair_fraction is called {len(shares)} times and kelly_budget "
+                f"{len(budgets)} times, not once each"]
+    [share], [budget] = shares, budgets
+    if share.keywords or [ast.unparse(a) for a in share.args] != [
+            "fraction", "stake", "checkpoint_value"]:
+        problems.append(f"held_pair_fraction is called as {ast.unparse(share)}")
+    if _bound_from(func, share) != ["fraction"]:
+        problems.append("held_pair_fraction's result is not the fraction")
+    if budget.keywords or [ast.unparse(a) for a in budget.args] != [
+            "checkpoint_value", "fraction", "cash"]:
+        problems.append(f"the budget is {ast.unparse(budget)}")
+    if budget.lineno <= share.lineno:
+        problems.append("the budget comes before held_pair_fraction")
+    starts = sorted(n.lineno for n in ast.walk(func) if isinstance(n, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "fraction" for t in n.targets)
+                    and ast.unparse(n.value) == "c['kelly_f_capped']")
+    if not starts or starts[0] >= share.lineno:
+        problems.append("the fraction does not start as the candidate's capped fraction")
+    trades = _calls_to(func, "BacktestTrade")
+    if not trades or any([ast.unparse(k.value) for k in t.keywords
+                          if k.arg == "kelly_fraction"] != ["fraction"] for t in trades):
+        problems.append("the trade does not record the fraction it was sized at")
+    # The portfolio value is the cash plus every open trade through _open_value
+    value_sum = ast.unparse(ast.parse("cash + sum(_open_value(t, d) for t in open_trades)",
+                                      mode="eval").body)
+    values = [ast.unparse(n.value) for n in ast.walk(func) if isinstance(n, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id == "checkpoint_value" for t in n.targets)
+              and not (isinstance(n.value, ast.Name) and n.value.id == "cash")]
+    if values != [value_sum]:
+        problems.append(f"the portfolio value is {values}, not the cash plus every open "
+                        "trade through _open_value")
+    # The stake: what each held trade paid, moved by its change in value
+    moved = ast.unparse(ast.parse(
+        "paid + (_open_value(held_trade, d) - held_trade.total_cost)", mode="eval").body)
+    stakes = [n for n in ast.walk(func) if isinstance(n, ast.AugAssign)
+              and ast.unparse(n.target) == "stake"]
+    loops = [n for n in ast.walk(func) if isinstance(n, ast.For)
+             and ast.unparse(n.target) in ("held_trade, paid", "(held_trade, paid)")
+             and ast.unparse(n.iter) == "held['trades']"]
+    if (len(stakes) != 1 or not isinstance(stakes[0].op, ast.Add)
+            or ast.unparse(stakes[0].value) != moved
+            or not any(stakes[0] in ast.walk(loop) for loop in loops)):
+        problems.append("the stake is not what each held trade paid moved by its change "
+                        "in value (_open_value less its cost)")
+    # The pair's record keeps each trade with what it paid, contracts plus fees
+    grows = [n for n in ast.walk(func) if isinstance(n, ast.Call)
+             and ast.unparse(n.func) == "held['trades'].append"]
+    if not grows or any([ast.unparse(a) for a in n.args] != ["(trade, invested)"]
+                        for n in grows):
+        problems.append("the open pair's record does not keep each trade with what it "
+                        "invested (contracts plus fees)")
+    return problems
 
 
 def _key_homes(tree: ast.AST, key: str) -> list[tuple[str | None, int]]:
@@ -1458,6 +2084,7 @@ class TestTimeSeriesKellyParity:
             "SAME_TITLE_SIZE_CAP",
             "TRADE_CATEGORIES",
             "TRADE_TAGS",
+            "ADD_TO_HELD_PAIRS",
         } | self._SAVED_FILE_INTERNALS
         resolver = "live_settings"
         # (module, exempted name) -> references found, so no exemption outlives its use
@@ -2018,6 +2645,22 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(config, "max_kelly_fraction", "pair_size_cap")
         assert _function_calls(backtester, "_simulate_at_discount", "pair_size_cap")
 
+    def test_ast_add_ons_size_through_held_pair_fraction(self):
+        # config.held_pair_fraction is the ONE definition of an add-on's size,
+        # read by the sizer where every other gate is, for the pair
+        # scanner.pair_held names (by type, never truthiness)
+        assert _function_calls(strategy, "_evaluate_size", "held_pair_fraction")
+        assert _function_calls(strategy, "_evaluate_size", "pair_held")
+        # ... and the backtest sizes its add-ons through the same definition
+        assert _function_calls(backtester, "_simulate_at_discount", "held_pair_fraction")
+        # The portfolio step tells an add-on by the same reader, and only one
+        # whose held pair is the spec's own markets and sides ...
+        assert _function_calls(strategy, "select_portfolio", "pair_held")
+        assert _function_calls(strategy, "select_portfolio", "matches")
+        # ... and both finders check an add-on's sides through HeldPair.matches
+        assert _function_calls(scanner, "find_time_series_pairs", "matches")
+        assert _function_calls(scanner, "find_same_title_pairs", "matches")
+
     def test_ast_every_sizer_budgets_through_kelly_budget(self):
         # config.kelly_budget is the ONE rule for what a trade may spend (a
         # share of the portfolio value, never more than the cash), and
@@ -2028,7 +2671,8 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(config, "max_affordable_pairs", "kelly_budget")
         assert _function_calls(scanner, "enrich_with_orderbook_prices", "kelly_budget")
         # The backtest budgets the same way: each Monday's portfolio value
-        # (cash plus open trades at cost), never more than the running cash
+        # (cash plus open trades at market, backtester._open_value), never
+        # more than the running cash
         assert _function_calls(backtester, "_simulate_at_discount", "kelly_budget")
         [budget_call] = [
             sub for node in ast.walk(ast.parse(inspect.getsource(backtester)))
@@ -2100,6 +2744,239 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(main, "_run_prod", "_bankroll_cents")
         assert not _function_calls(main, "_run_prod", "verify_auth")
 
+    def test_ast_add_ons_size_on_the_portfolio_value_before_the_budget(self):
+        # The sizer turns the capped fraction into held_pair_fraction's (the
+        # held pair's stake, its worth at today's prices plus the fees paid
+        # for it, against the portfolio value) BEFORE the budget reads it,
+        # and names every refusal once
+        assert _add_on_sizing_problems(inspect.getsource(strategy)) == []
+        assert _refusal_line_problems(inspect.getsource(strategy)) == []
+        # The refusal check prices through the same sizer, with the same cash
+        [value] = _keyword_values(strategy, "_holds_kelly_share", "_evaluate_size",
+                                  "cash_cents")
+        assert isinstance(value, ast.Name) and value.id == "cash_cents"
+        [refusal] = _keyword_values(strategy, "_holds_kelly_share", "_evaluate_size",
+                                    "refusal_out")
+        assert isinstance(refusal, ast.Name) and refusal.id == "refusal"
+
+    def test_ast_the_add_on_checks_catch_their_mutants(self):
+        # The two checks above, run on changed copies of strategy.py: each
+        # change sizes or reports an add-on wrongly and must be caught
+        source = inspect.getsource(strategy)
+        share = ("kelly_fraction_capped = held_pair_fraction(\n"
+                 "            kelly_fraction_capped, held.stake_dollars, "
+                 "portfolio_value_cents / 100.0)")
+        assert source.count(share) == 1
+        budget = ("budget_dollars = kelly_budget(portfolio_value_cents / 100.0, "
+                  "kelly_fraction_capped, cash)")
+        assert source.count(budget) == 1
+        refusal = ("    if min_payoff <= 0:\n"
+                   "        _log_no_add_on(pair, holds_kelly_share=False,\n"
+                   "                       portfolio_value_cents=portfolio_value_cents)\n")
+        assert source.count(refusal) == 1
+        cash = "settings, cash_cents=cash_cents),"
+        assert source.count(cash) == 2
+        sizing = {
+            "fed the cash": source.replace(share, share.replace(
+                "portfolio_value_cents / 100.0", "cash_cents / 100.0")),
+            "fed the cost": source.replace(share, share.replace(
+                "held.stake_dollars", "held.cost_dollars")),
+            "fed the worth without the fees": source.replace(share, share.replace(
+                "held.stake_dollars", "held.value_dollars")),
+            "result unused": source.replace(share, share.replace(
+                "kelly_fraction_capped = held_pair_fraction", "share = held_pair_fraction")),
+            "budget on the uncapped f": source.replace(budget, budget.replace(
+                "kelly_fraction_capped, cash", "kelly_fraction, cash")),
+        }
+        for name, mutant in sizing.items():
+            assert mutant != source, name
+            assert _add_on_sizing_problems(mutant), name
+        refusals = {
+            "a silent refusal": source.replace(refusal, "    if min_payoff <= 0:\n"),
+            "the cash not handed on": source.replace(cash, "settings),", 1),
+        }
+        for name, mutant in refusals.items():
+            assert mutant != source, name
+            assert _refusal_line_problems(mutant), name
+
+    def test_ast_the_live_run_values_held_pairs_at_market(self):
+        # main._run_prod: held_pairs gets the whole market map, the at-cap
+        # drop reads the pair's stake (worth plus fees paid) against the
+        # portfolio value, and the positions value is checked once before
+        # any held pair is found
+        assert _live_held_pair_problems(inspect.getsource(main)) == []
+
+    def test_ast_the_live_run_check_catches_its_mutants(self):
+        # The check above, run on a small copy of _run_prod's add-on steps and
+        # on changed copies of it (main.py itself is read by the pin above)
+        shape = (
+            "def _run_prod(client, settings):\n"
+            "    account = read_account_balance(client)\n"
+            "    cash_cents = sum(account.shard_cash_cents.values())\n"
+            "    portfolio_value_cents = _bankroll_cents(cash_cents, "
+            "account.positions_value_cents)\n"
+            "    held_listing = {}\n"
+            "    held_positions = get_held_positions(client, complete_out=held_listing)\n"
+            "    checked = _checked_positions_value(held_positions, held_listing)\n"
+            "    held_tickers = set(held_positions)\n"
+            "    held_labels = {}\n"
+            "    markets = fetch_open_events_with_markets(client)\n"
+            "    held_ladders = resolve_held_ladders(client, markets, held_tickers, "
+            "labels_out=held_labels)\n"
+            "    markets_by_ticker = {m.ticker: m for m in markets}\n"
+            "    add_on_pairs = held_pairs(held_positions, held_labels, markets_by_ticker)\n"
+            "    full = {key for key, pair in add_on_pairs.items()\n"
+            "            if held_pair_fraction(settings.size_cap, pair.stake_dollars,\n"
+            "                                  portfolio_value_cents / 100) <= 0}\n"
+            "    add_on_tickers = {ticker for key in add_on_pairs for ticker in key}\n"
+            "    blocked_tickers = held_tickers - add_on_tickers\n"
+            "    markets = [m for m in markets if m.ticker not in blocked_tickers]\n")
+        assert _live_held_pair_problems(shape) == []
+        build_map = "    markets_by_ticker = {m.ticker: m for m in markets}\n"
+        drop = "    markets = [m for m in markets if m.ticker not in blocked_tickers]\n"
+        check = "    checked = _checked_positions_value(held_positions, held_listing)\n"
+        mutants = {
+            "held_pairs handed the cash": shape.replace(
+                "held_labels, markets_by_ticker)", "held_labels, cash_cents)"),
+            "the map built after the drop": shape.replace(build_map, "").replace(
+                drop, drop + build_map),
+            "the map built from the held markets": shape.replace(
+                "for m in markets}", "for m in held_positions}"),
+            "the at-cap drop on the cost": shape.replace(
+                "pair.stake_dollars", "pair.cost_dollars"),
+            "the at-cap drop without the fees": shape.replace(
+                "pair.stake_dollars", "pair.value_dollars"),
+            "the at-cap drop on the cash": shape.replace(
+                "portfolio_value_cents / 100) <= 0", "cash_cents / 100) <= 0"),
+            "no positions check": shape.replace(check, ""),
+            "the check before the read": shape.replace(check, "").replace(
+                "    held_listing = {}\n", "    held_listing = {}\n" + check),
+        }
+        for name, mutant in mutants.items():
+            assert mutant != shape, name
+            assert _live_held_pair_problems(mutant), name
+
+    def test_ast_open_trades_are_valued_through_one_definition(self):
+        # The backtest values an open trade at market from the quotes the one
+        # writer, _attach_leg_quotes, puts on each entry record under
+        # "leg_quotes", which Pass 1b alone reads (into BacktestTrade.marks):
+        # the key is spelled only in those two functions, anywhere in the
+        # package. Both callers that release candles call the writer first.
+        import importlib
+        import pkgutil
+
+        import kalshi_betting
+
+        names = sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__))
+        modules = [kalshi_betting] + [importlib.import_module(f"kalshi_betting.{n}")
+                                      for n in names]
+        homes = {(module.__name__, owner)
+                 for module in modules
+                 for owner, _line in _key_homes(ast.parse(inspect.getsource(module)),
+                                                "leg_quotes")}
+        writer = ("kalshi_betting.backtester", "_attach_leg_quotes")
+        reader = ("kalshi_betting.backtester", "_simulate_at_discount")
+        assert homes == {writer, reader}
+        assert _function_calls(backtester, "_prepare_entries", "_attach_leg_quotes")
+        assert _function_calls(backtester, "_sweep_from_candidates", "_attach_leg_quotes")
+        # One quote read at a checkpoint (_leg_mark, for _open_value and
+        # _open_leg_stake) and one day-end path (_open_value_path): a quote is
+        # read only there. The equity curve,
+        # the dashboard's per-type lines and its risk-free hurdle reach the
+        # path through _carry_steps / _value_steps.
+        tree = ast.parse(inspect.getsource(backtester))
+        readers: dict[str, set] = {"at_checkpoint": set(), "day_values": set()}
+        for func in ast.walk(tree):
+            if isinstance(func, ast.FunctionDef):
+                for sub in ast.walk(func):
+                    if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                            and sub.func.attr in readers):
+                        readers[sub.func.attr].add(func.name)
+        assert readers == {"at_checkpoint": {"_leg_mark"},
+                           "day_values": {"_open_value_path"}}
+        # Both checkpoint valuations read a leg's quote through _leg_mark: a
+        # whole trade (_open_value) and one lone leg (_open_leg_stake)
+        assert _function_calls(backtester, "_open_value", "_leg_mark")
+        assert _function_calls(backtester, "_open_leg_stake", "_leg_mark")
+        assert _function_calls(backtester, "_carry_steps", "_open_value_path")
+        assert _function_calls(backtester, "_value_steps", "_open_value_path")
+        assert _function_calls(backtester, "_build_equity_curve", "_carry_steps")
+        assert _function_calls(dashboard, "_return_by_trade_type", "_value_steps")
+        assert _function_calls(dashboard, "_carried_on_days", "_carry_steps")
+        assert _function_calls(dashboard, "_rf_hurdle", "_carried_on_days")
+        # Pass 2 values open trades only through _open_value: the portfolio
+        # value and the held stake (pinned in detail by
+        # _backtest_add_on_problems)
+        assert _function_calls(backtester, "_simulate_at_discount", "_open_value")
+
+    def test_ast_the_backtest_sizes_add_ons_on_the_checkpoint_value(self):
+        # backtester._simulate_at_discount: each Monday's portfolio value is
+        # the cash plus every open trade through _open_value (at market); an
+        # add-on's fraction is held_pair_fraction(fraction, stake,
+        # checkpoint_value), read by the walk's one kelly_budget(
+        # checkpoint_value, fraction, cash), and the stake is what each held
+        # trade paid, fees included, moved by its change in value, as the
+        # live stake counts its worth today plus its fees
+        assert _backtest_add_on_problems(inspect.getsource(backtester)) == []
+
+    def test_ast_the_backtest_check_catches_its_mutants(self):
+        # The check above, run on a small copy of the valuation and add-on
+        # sizing in _simulate_at_discount and on changed copies of it
+        shape = (
+            "def _simulate_at_discount(candidates, cash, open_pairs, open_trades):\n"
+            "    for c in candidates:\n"
+            "        d = c['entry_date']\n"
+            "        checkpoint_value = cash\n"
+            "        checkpoint_value = cash + sum(_open_value(t, d) for t in open_trades)\n"
+            "        held = open_pairs.get(c['key'])\n"
+            "        fraction = c['kelly_f_capped']\n"
+            "        if held is not None:\n"
+            "            stake = 0.0\n"
+            "            for held_trade, paid in held['trades']:\n"
+            "                stake += paid + (_open_value(held_trade, d) - held_trade.total_cost)\n"
+            "            fraction = held_pair_fraction(fraction, stake, checkpoint_value)\n"
+            "            if fraction <= 0:\n"
+            "                continue\n"
+            "        budget = kelly_budget(checkpoint_value, fraction, cash)\n"
+            "        total_cost = budget * 0.9\n"
+            "        invested = total_cost + fee_a + fee_b\n"
+            "        trade = BacktestTrade(n=int(budget), kelly_fraction=fraction)\n"
+            "        held = open_pairs.setdefault(c['key'], {'trades': []})\n"
+            "        held['trades'].append((trade, invested))\n")
+        assert _backtest_add_on_problems(shape) == []
+        share_line = ("            fraction = held_pair_fraction(fraction, stake, "
+                      "checkpoint_value)\n")
+        budget_line = "        budget = kelly_budget(checkpoint_value, fraction, cash)\n"
+        stake_line = ("                stake += paid + (_open_value(held_trade, d) - "
+                      "held_trade.total_cost)\n")
+        record_line = "        held['trades'].append((trade, invested))\n"
+        mutants = {
+            "on the cash": shape.replace("stake, checkpoint_value)", "stake, cash)"),
+            "the stake at cost": shape.replace(stake_line, "                stake += paid\n"),
+            "the stake set, not added to": shape.replace(
+                stake_line, stake_line.replace("+=", "=")),
+            "the stake without the fees": shape.replace(
+                record_line, record_line.replace("invested", "total_cost")),
+            "the record never grows": shape.replace(record_line, ""),
+            "the value at cost": shape.replace(
+                "sum(_open_value(t, d) for t in open_trades)",
+                "sum(t.total_cost for t in open_trades)"),
+            "result unused": shape.replace(share_line, share_line.replace(
+                "fraction = held_pair_fraction", "share = held_pair_fraction")),
+            "budget before the share": shape.replace(budget_line, "").replace(
+                "        held = open_pairs.get", budget_line + "        held = open_pairs.get"),
+            "budget on the uncapped fraction": shape.replace(
+                "kelly_budget(checkpoint_value, fraction, cash)",
+                "kelly_budget(checkpoint_value, c['kelly_f_capped'], cash)"),
+            "no start from the capped fraction": shape.replace(
+                "fraction = c['kelly_f_capped']", "fraction = c['kelly_f']"),
+            "the trade records another fraction": shape.replace(
+                "kelly_fraction=fraction", "kelly_fraction=c['kelly_f_capped']"),
+        }
+        for name, mutant in mutants.items():
+            assert mutant != shape, name
+            assert _backtest_add_on_problems(mutant), name
+
     def test_ast_the_live_run_refuses_pairs_on_held_ladders(self):
         # The production run finds the ladders it holds and hands them to both
         # the finder and the portfolio step. A dropped keyword would silently
@@ -2113,12 +2990,61 @@ class TestTimeSeriesKellyParity:
         [portfolio_value] = _keyword_values(main, "_run_prod", "select_portfolio",
                                             "held_ladders")
         assert ast.unparse(portfolio_value) in {"held_ladders", "held_ladders or frozenset()"}
+        # The run reads its positions with their sides and costs, finds the
+        # exact held pairs it may add to through the one definition, and hands
+        # them to BOTH finders under their own name: a dropped or renamed
+        # keyword would silently add to nothing, since both default to none
+        assert _function_calls(main, "_run_prod", "get_held_positions")
+        assert _function_calls(main, "_run_prod", "held_pairs")
+        assert not _function_calls(main, "_run_prod", "get_held_tickers")
+        for finder in ("find_time_series_pairs", "find_same_title_pairs"):
+            [value] = _keyword_values(main, "_run_prod", finder, "add_on_pairs")
+            assert isinstance(value, ast.Name) and value.id == "add_on_pairs", finder
+            # ... and each finder reads the pairs it is handed
+            tree = ast.parse(inspect.getsource(getattr(scanner, finder)))
+            assert any(isinstance(n, ast.Name) and n.id == "add_on_pairs"
+                       and isinstance(n.ctx, ast.Load) for n in ast.walk(tree)), finder
         # Both rules read the ladder labels through the one definition
         assert _function_calls(scanner, "find_time_series_pairs", "ladder_keys")
         assert _function_calls(strategy, "select_portfolio", "pair_ladder_keys")
         assert _function_calls(scanner, "pair_ladder_keys", "market_ladder_keys")
         assert _function_calls(scanner, "market_ladder_keys", "ladder_keys")
         assert _function_calls(scanner, "market_ladder_keys", "time_series_group_key")
+
+    def test_ast_the_run_lets_back_in_only_the_pairs_it_hands_the_finders(self):
+        # main._run_prod lets back into the market list exactly the markets of
+        # the add_on_pairs it hands both finders, after the at-cap drop, and
+        # blocks every other held market from both finders
+        source = inspect.getsource(main)
+        assert _add_on_unblocking_problems(source) == []
+        # The check itself: each of these changed copies of _run_prod is caught
+        real = "add_on_tickers    = {ticker for key in add_on_pairs for ticker in key}"
+        assert source.count(real) == 1
+        found = "add_on_pairs = held_pairs(held_positions, held_labels, markets_by_ticker)"
+        assert source.count(found) == 1
+        mutants = {
+            # Built from held_pairs' result, before the at-cap drop
+            "from held_pairs": source.replace(
+                found,
+                "add_on_pairs = found = held_pairs(held_positions, held_labels, "
+                "markets_by_ticker)").replace(
+                real, "add_on_tickers    = {ticker for key in found for ticker in key}"),
+            # The drop moved after the markets are let back in
+            "drop after": source.replace(
+                real, real + "\n    add_on_pairs = {key: pair for key, pair in "
+                "add_on_pairs.items() if key}"),
+            # Every held market let back in
+            "all held": source.replace(
+                "blocked_tickers   = held_tickers - add_on_tickers",
+                "blocked_tickers   = held_tickers - held_tickers"),
+            # One finder handed the full held set instead of the blocked one
+            "finder held set": source.replace(
+                "find_same_title_pairs(markets, blocked_tickers,",
+                "find_same_title_pairs(markets, held_tickers,"),
+        }
+        for name, mutant in mutants.items():
+            assert mutant != source, name
+            assert _add_on_unblocking_problems(mutant), name
 
     def test_ast_the_backtest_reads_ladders_through_the_one_definition(self):
         # The backtest's one-open-trade-per-ladder rule labels each market
@@ -2559,6 +3485,149 @@ class TestSelectPortfolioLadders:
                  _ladder_spec(_OTHER_A, _OTHER_B, ratio=0.05)]
         assert select_portfolio(specs, 100_000) == select_portfolio(
             specs, 100_000, held_ladders=frozenset())
+
+
+def _add_on_spec(market_a, market_b, *, ratio: float = 0.10) -> TradeSpec:
+    """A time-series spec that adds to the pair the account holds on these markets."""
+    spec = _ladder_spec(market_a, market_b, ratio=ratio)
+    spec.pair.held = HeldPair(sides=tuple(sorted(((market_a.ticker, "yes"),
+                                                  (market_b.ticker, "no")))),
+                              count=30.0, cost_dollars=18.9, value_dollars=18.0,
+                              fees_dollars=0.9)
+    return spec
+
+
+class TestSelectPortfolioAddOns:
+    """An add-on to a held pair is exempt from the held ladders (they are its
+    own: scanner.held_pairs adds only to a pair no other held market shares a
+    ladder with) but not from the picks of this run. Every ordinary
+    time-series spec on a held ladder is still refused."""
+
+    _LADDER_LINE = ("Time-series trades skipped because the account already holds, or "
+                    "this run already picked, a trade on the same ladder: ")
+
+    def test_an_add_on_on_its_own_held_ladder_is_taken(self, caplog):
+        add_on = _add_on_spec(_R1, _R3)
+        held = scanner.pair_ladder_keys(add_on.pair)
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([add_on], 100_000, held_ladders=held) == [add_on]
+        assert "on the same ladder" not in caplog.text
+
+    def test_a_same_title_pick_earlier_in_the_run_blocks_an_add_on(self, caplog):
+        st = _ladder_spec(_R2, _R4, pair_type="same_title", ratio=0.20)
+        add_on = _add_on_spec(_R1, _R3, ratio=0.10)
+        held = scanner.pair_ladder_keys(add_on.pair)
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([add_on, st], 100_000, held_ladders=held) == [st]
+        assert self._LADDER_LINE + "1" in caplog.text
+
+    def test_an_ordinary_spec_on_a_held_ladder_is_still_refused(self, caplog):
+        add_on = _add_on_spec(_R1, _R3, ratio=0.10)
+        ordinary = _ladder_spec(_R2, _R4, ratio=0.20)
+        held = scanner.pair_ladder_keys(add_on.pair)
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([ordinary, add_on], 100_000,
+                                    held_ladders=held) == [add_on]
+        assert self._LADDER_LINE + "1" in caplog.text
+
+    def test_a_held_pair_naming_other_markets_is_no_exemption(self, caplog):
+        # A spec on the held Starship ladder carrying a HeldPair of two other
+        # markets is not an add-on to it, so the held ladders still refuse it
+        spec = _ladder_spec(_R1, _R3, ratio=0.10)
+        spec.pair.held = HeldPair(sides=(("ZZ-1", "yes"), ("ZZ-2", "no")), count=1.0,
+                                  cost_dollars=1.0, value_dollars=0.9, fees_dollars=0.1)
+        held = scanner.pair_ladder_keys(spec.pair)
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([spec], 100_000, held_ladders=held) == []
+        assert self._LADDER_LINE + "1" in caplog.text
+
+    def test_a_held_pair_bought_the_other_way_round_is_no_exemption(self):
+        # The spec's own two markets, but held NO on market A and YES on B:
+        # buying it would close the held pair, not add to it
+        spec = _ladder_spec(_R1, _R3, ratio=0.10)
+        spec.pair.held = HeldPair(sides=((_R1.ticker, "no"), (_R3.ticker, "yes")),
+                                  count=30.0, cost_dollars=18.9, value_dollars=18.0,
+                                  fees_dollars=0.9)
+        held = scanner.pair_ladder_keys(spec.pair)
+        assert select_portfolio([spec], 100_000, held_ladders=held) == []
+
+    @staticmethod
+    def _lone_spec(new_market, held_market, *, ratio: float = 0.10) -> TradeSpec:
+        """A time-series spec adding to a lone held NO leg on held_market (its partner paid out)."""
+        spec = _ladder_spec(new_market, held_market, ratio=ratio)
+        spec.pair.held = HeldPair(sides=((held_market.ticker, "no"),), count=30.0,
+                                  cost_dollars=12.5, value_dollars=13.5, fees_dollars=0.5,
+                                  labels=scanner.market_ladder_keys(held_market))
+        return spec
+
+    def test_an_add_on_to_a_lone_leg_is_taken_beside_its_own_held_ladders(self, caplog):
+        # NO is held on the last rung only; a new rung on the same ladder adds to it
+        spec = self._lone_spec(_R2, _R4)
+        held = scanner.market_ladder_keys(_R4)
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([spec], 100_000, held_ladders=held) == [spec]
+        assert "on the same ladder" not in caplog.text
+
+    def test_a_lone_legs_new_market_on_another_held_ladder_is_refused(self, caplog):
+        # Another held market sits on the new rung's ladder, beyond the leg's own
+        other = _ladder_market("OTHER-1", "KXOTHER-1", "Will it rain by March 5, 2026?")
+        new = _ladder_market("STAR-NEW", "KXOTHER-1", _STAR % "March 12, 2026")
+        spec = self._lone_spec(new, _R4)
+        held = scanner.market_ladder_keys(_R4) | scanner.market_ladder_keys(other)
+        assert scanner.market_ladder_keys(new) & scanner.market_ladder_keys(other)
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([spec], 100_000, held_ladders=held) == []
+        assert self._LADDER_LINE + "1" in caplog.text
+        # CONTROL: with only the leg's own ladders held, it is taken
+        assert select_portfolio([spec], 100_000,
+                                held_ladders=scanner.market_ladder_keys(_R4)) == [spec]
+
+    def test_an_add_on_picked_first_claims_its_ladder(self):
+        # Two add-ons on one ladder: held_pairs never builds this, but the
+        # second must still wait behind the first's pick
+        first = _add_on_spec(_R1, _R3, ratio=0.20)
+        second = _add_on_spec(_R2, _R4, ratio=0.10)
+        held = scanner.pair_ladder_keys(first.pair) | scanner.pair_ladder_keys(second.pair)
+        assert select_portfolio([second, first], 100_000, held_ladders=held) == [first]
+
+    def test_a_shrunk_add_on_keeps_its_held_pair_and_passes_the_send_check(self, caplog):
+        # An add-on too big for the cash left is shrunk like any spec and is
+        # still an add-on: it keeps its held pair (the trader's check before
+        # the NO leg reads it), its own held ladders never block it, and it
+        # claims its tickers and ladders like any pick
+        held = HeldPair(sides=(("A1", "yes"), ("B1", "no")), count=30.0,
+                        cost_dollars=18.9, value_dollars=18.0, fees_dollars=0.9)
+        spec = _held_spec(dataclasses.replace(make_booked_pair(_HOLE_LADDER), held=held), 700)
+        # A second add-on, ranked below it, whose later market asks the same
+        # question ("B"): only the shrunk add-on's pick can stop it, and it
+        # needs just a cent
+        rival = _ladder_spec(_ladder_market("L-1", "KXL-1", "Will it hail by March 1, 2026?"),
+                             _ladder_market("L-2", "KXL-2", "B"), ratio=0.05, cost=0.01)
+        rival.pair.held = HeldPair(sides=(("L-1", "yes"), ("L-2", "no")), count=5.0,
+                                   cost_dollars=3.0, value_dollars=2.9, fees_dollars=0.1)
+        ladders = scanner.pair_ladder_keys(spec.pair)
+        assert scanner.pair_ladder_keys(rival.pair) & ladders
+        held_ladders = ladders | scanner.pair_ladder_keys(rival.pair)
+        with caplog.at_level(logging.INFO):
+            got = select_portfolio([rival, spec], 11_421, held_ladders=held_ladders)
+        # 11,420 cents buys the add-on 128 pairs, as it does any spec on this book
+        [shrunk] = got
+        assert shrunk.x == 128 and shrunk.cash_need_cents == 11_420
+        assert pair_held(shrunk.pair) is held
+        assert shrunk.kelly_fraction == spec.kelly_fraction
+        assert "Shrunk 'booked pair' from 700 to 128 contract pairs" in caplog.text
+        # The shrunk add-on claimed its ladder, so the second add-on waits behind it
+        assert self._LADDER_LINE + "1" in caplog.text
+        # Non-vacuous: alone, with the cent that was left, the second add-on is taken
+        assert select_portfolio([rival], 1, held_ladders=held_ladders) == [rival]
+        # The trader's check before the NO leg passes on the held pair's own
+        # positions (-30 NO on B1, +30 YES on A1), and each leg buys the 128
+        no_leg, yes_leg = trader._ordered_legs(shrunk)
+        assert (no_leg.market.ticker, yes_leg.market.ticker) == ("B1", "A1")
+        assert no_leg.count == yes_leg.count == 128
+        assert trader._add_on_mismatch(shrunk, no_leg, yes_leg, -30.0, 30.0) is None
+        # ... and refuses it once a position has moved
+        assert trader._add_on_mismatch(shrunk, no_leg, yes_leg, -20.0, 30.0) is not None
 
 
 def _held_spec(pair, x: int, *, ratio: float = 0.10, k: float | None = 0.40) -> TradeSpec:

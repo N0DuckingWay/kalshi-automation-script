@@ -8,10 +8,11 @@ Purpose:
     arguments (--start-date, --balance, --no-cache, --max-horizon-days,
     --interval-discount, --no-sweep, --same-event-ladders /
     --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
-    --no-cap-sweep), configures logging to kalshi_backtest.log, constructs the necessary API
-    clients, delegates the full backtest simulation to
-    backtester.run_backtest_sweep(), and then calls
-    dashboard.generate_dashboard() to produce the interactive HTML report.
+    --no-cap-sweep, --no-add-on-sweep), configures logging to
+    kalshi_backtest.log, constructs the necessary API clients, delegates the
+    full backtest simulation to backtester.run_backtest_sweep(), and then
+    calls dashboard.generate_dashboard() to produce the interactive HTML
+    report.
     Prints a summary of key metrics (trade count, win rate, total return) to
     the log on completion, closed on every run by what settled-market corpus
     the run read (its assembly time, whether it was cached, and the archive
@@ -129,6 +130,14 @@ Notes:
     and k sweeps it is backtest-only: live sizing reads
     its caps from its run's config.LiveSettings, built from the saved live
     defaults.
+
+    The "Add to held pairs" family is ON by default too (add_on_sweep=True):
+    the result carries two more lazy CapSweeps (BacktestSweep.add_on_cap_sweep,
+    and add_on_tier_off_cap_sweep over the tier-floors-off runs) whose every
+    simulation adds to pairs it still holds, for the "all" population only.
+    Like the cap sweeps they simulate nothing during the run — every figure and
+    point the run returns is unchanged — and each cell is simulated only when
+    the dashboard is built, so --no-add-on-sweep makes that step faster.
 
     The pre-fetch echo's "live rule=" clause names the saved live defaults'
     time-series rule and, when one is set, their category/tag filter (never
@@ -262,10 +271,11 @@ def main() -> None:
     Parses command-line arguments (--start-date, --balance, --no-cache,
     --max-horizon-days, --interval-discount, --no-sweep,
     --same-event-ladders / --no-same-event-ladders, --spread-min,
-    --spread-max, --no-band-sweep, --no-cap-sweep), configures logging, constructs
-    historical and live Kalshi API clients, runs the full backtest
-    simulation via run_backtest_sweep(), and generates an interactive HTML
-    dashboard via generate_dashboard(). Logs a summary table of key metrics to
+    --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep),
+    configures logging, constructs historical and live Kalshi API clients,
+    runs the full backtest simulation via run_backtest_sweep(), and generates
+    an interactive HTML dashboard via generate_dashboard(). Logs a summary
+    table of key metrics to
     kalshi_backtest.log on completion (this module installs only a
     RotatingFileHandler, no console handler, so nothing reaches stdout).
 
@@ -282,7 +292,9 @@ def main() -> None:
     and the lazily simulated size caps (result.cap_sweep, and the
     tier-floors-off family's at every cap, result.tier_off_cap_sweep) only
     by the dashboard, which reads every cell as the page is built (its filter
-    bar, Interval Discount section and scenario explorer).
+    bar, Interval Discount section and scenario explorer); the lazily
+    simulated add-on sweeps (result.add_on_cap_sweep, and
+    result.add_on_tier_off_cap_sweep) are read the same way.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -368,6 +380,14 @@ def main() -> None:
              "faster page. Backtest only — live sizing reads its caps from "
              "the saved live defaults, or main.py's own --size-cap / "
              "--same-title-size-cap for one live run",
+    )
+    parser.add_argument(
+        "--no-add-on-sweep", action="store_true",
+        help="Skip the dashboard's Add to held pairs choice: its simulations run "
+             "only while the dashboard is built, so skipping them makes that step "
+             "faster and leaves the choice disabled. Backtest only — live runs add "
+             "to held pairs when the saved live defaults say so, or main.py's own "
+             "--add-to-held-pairs / --no-add-to-held-pairs for one live run",
     )
     args = parser.parse_args()
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
@@ -478,6 +498,9 @@ def main() -> None:
     # opt-out saves nothing in the run itself — only the time and size of
     # whatever report reads the cells, and the entries kept alive for it
     cap_sweep = not args.no_cap_sweep
+    # ON by default, like the cap sweep, and for the same reason: nothing is
+    # simulated during the run, so the opt-out saves only the dashboard step
+    add_on_sweep = not args.no_add_on_sweep
     # The saved live defaults' rule and filter, for the echo only: a read of its
     # own, separate from run_backtest_sweep's (which logs the INFO or WARNING).
     # Fails soft, unlike the checks above (one echo clause must not abort a run)
@@ -496,10 +519,12 @@ def main() -> None:
 
     logging.info(
         "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f | ladders=%s "
-        "| spread band=%g-%g | band sweep=%s | cap sweep=%s | live rule=%s",
+        "| spread band=%g-%g | band sweep=%s | cap sweep=%s | add-on sweep=%s "
+        "| live rule=%s",
         start_date, args.balance, "on" if use_cache else "off", effective_k,
         ladders_echo, echo_floor, echo_ceiling,
-        "on" if band_sweep else "off", "on" if cap_sweep else "off", live_rule_echo,
+        "on" if band_sweep else "off", "on" if cap_sweep else "off",
+        "on" if add_on_sweep else "off", live_rule_echo,
     )
     # Warn on a ceiling that empties a tier. config.time_series_spread_band's
     # docstring asks a caller taking an operator-typed ceiling to warn when it
@@ -568,7 +593,10 @@ def main() -> None:
         # tier-bound bands simulated again with the tiers off (needs the grid)
         tier_off_sweep=band_sweep,
         cap_sweep=cap_sweep,
-    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, and the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep
+        # The dashboard's "Add to held pairs: on" views, simulated lazily when
+        # the page is built (no simulation during the run)
+        add_on_sweep=add_on_sweep,
+    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy add-on sweeps (add_on_cap_sweep, and add_on_tier_off_cap_sweep with the band sweep) unless --no-add-on-sweep
     # Everything below reports the PRIMARY point, so the summary block and the
     # dashboard's other six sections read exactly as they did before the sweep
     # existed. The remaining k points are read by the filter bar's k select
@@ -582,7 +610,8 @@ def main() -> None:
     # tier-floors-off family, result.tier_off_cap_sweep, simulated only when
     # a cell is read) only by the dashboard, whose one grid walk reads
     # every cell as the page is built (filter bar, Interval Discount section
-    # and scenario explorer).
+    # and scenario explorer). The add-on sweeps (result.add_on_cap_sweep and
+    # result.add_on_tier_off_cap_sweep) are lazy the same way.
     trades, equity_df = result.primary.trades, result.primary.equity_df
 
     if not trades:
@@ -617,8 +646,9 @@ def main() -> None:
     # the k-hat breakdown, both Tier floors views (the bar's and the
     # explorer's, from its tier-floors-off family), the lazy size-cap sweeps
     # (cap_sweep and tier_off_cap_sweep, None under --no-cap-sweep — every
-    # cell of them is simulated here, in the page's one grid walk) and the
-    # header's run-settings line;
+    # cell of them is simulated here, in the page's one grid walk), the lazy
+    # add-on sweeps (add_on_cap_sweep and add_on_tier_off_cap_sweep, None
+    # under --no-add-on-sweep) and the header's run-settings line;
     # interval_discount is the resolved k these trades were sized at, which
     # the Risk section's Kelly scatter must price on
     #

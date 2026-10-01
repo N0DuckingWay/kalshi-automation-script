@@ -19,6 +19,13 @@ Purpose:
     reads the portfolio value. Dev mode holds nothing, so its virtual
     --sandbox-balance counts as both.
 
+    Kalshi's value of the open positions counts only when the contracts held
+    can back it: a contract pays at most $1 if it wins
+    (config.CONTRACT_PAYOUT_DOLLARS), so a larger value, or one the positions
+    listing cannot be checked against, is refused with a WARNING and the run
+    sizes on the cash alone (_checked_positions_value). A value of 0 is always
+    kept: it adds nothing.
+
     main() exits 2 before logging starts if config.ORDER_API_VERSION is not
     "v2". A production run that sends orders takes the machine-wide live-run
     lock (run_lock) before it builds a client and holds it until main() ends,
@@ -38,6 +45,15 @@ Purpose:
     no toggle flags. Between finding pairs and pricing them, _dedup_pairs and
     _filter_by_category trim the list.
 
+    A production run keeps every market the account holds out of new trades,
+    except, when the run's add_to_held_pairs setting is on, the markets it
+    may add to (scanner.held_pairs): the two markets of an exact held pair,
+    which each finder lets through only as that same pair, and a lone held
+    leg whose partner has paid out, which each finder lets through only
+    beside a market the account does not hold (add_on_pairs). It adds to
+    none when Kalshi's value of the open positions was not read or was
+    refused, since an add-on is sized on the portfolio value.
+
 Dependencies:
     Imports auth.py (the client, and the one balance read, which also checks
     the credentials), config.py (constants, exit codes, the order-path check
@@ -48,6 +64,16 @@ Dependencies:
     strategy.py (sizing and choosing trades), trader.py (sending orders) and
     run_lock.py (the one-real-money-run-at-a-time lock). Run as
     `python3 -m kalshi_betting.main`.
+
+    To add to held pairs it also reads scanner.get_held_positions,
+    resolve_held_ladders and held_pairs (the positions, their ladders and the
+    exact held pairs and lone held legs a run may add to), scanner.pair_held (which names the
+    held pair a trade adds to in the pairs table, the portfolio lines and the
+    rescue dump), config.held_pair_fraction (the one definition of an
+    add-on's size, which leaves out a held pair with no room left),
+    config.count_text (which writes a held count exactly) and
+    config.CONTRACT_PAYOUT_DOLLARS (what one contract pays at most, the
+    bound of the positions-value check).
 
 Notes:
     Label rule for everything this module logs: "A"/"B" always mean
@@ -89,6 +115,7 @@ from . import run_lock
 from ._http import api_error_summary
 from .auth import build_client, read_account_balance
 from .config import (
+    CONTRACT_PAYOUT_DOLLARS,
     EXIT_NO_TRADEABLE_SHARDS,
     EXIT_OK,
     EXIT_RUN_IN_PROGRESS,
@@ -104,9 +131,11 @@ from .config import (
     LiveDefaultsError,
     LiveDefaultsMissing,
     LiveSettings,
+    count_text,
     describe_live_settings,
     describe_time_series_rule,
     describe_trade_filter,
+    held_pair_fraction,
     live_defaults,
     live_rule_warnings,
     live_settings,
@@ -131,9 +160,11 @@ from .scanner import (
     filter_markets_within_horizon,
     find_same_title_pairs,
     find_time_series_pairs,
-    get_held_tickers,
+    get_held_positions,
+    held_pairs,
     inactive_shard_indexes,
     leg_sides,
+    pair_held,
     resolve_held_ladders,
 )
 from .strategy import compute_trade, select_portfolio
@@ -195,6 +226,59 @@ def _bankroll_cents(cash_cents: int, positions_value_cents: int | None) -> int:
         )
         return cash_cents
     return cash_cents + positions_value_cents
+
+
+def _checked_positions_value(cash_cents: int, positions_value_cents: int | None,
+                             held_positions: dict, listing_complete: bool) -> int | None:
+    """
+    Return Kalshi's value of the open positions if the contracts held can back it.
+
+    A contract pays at most config.CONTRACT_PAYOUT_DOLLARS ($1) if it wins, so
+    the open positions can be worth at most that much per contract held. The
+    value is kept when it is no more than that, counted over a positions
+    listing read to its end whose every count can be read. A value of 0 adds
+    nothing to the portfolio value and is always kept. An unread value (None)
+    is returned as it is, with no word here: _bankroll_cents has already
+    counted it as $0 and said so. Any other value is refused: one WARNING
+    names it, the contracts held and the reason, and the run sizes on the
+    cash alone. The check keeps a value in the wrong unit, or otherwise too
+    large, from making every trade too big.
+
+    Args:
+        cash_cents (int): The cash on every shard together, in cents, named in the WARNING.
+        positions_value_cents (int | None): Kalshi's value of the open
+            positions, in cents; None when the balance reply had none.
+        held_positions (dict): scanner.get_held_positions' result, ticker -> HeldPosition.
+        listing_complete (bool): Whether that listing was read to its end.
+
+    Returns:
+        int | None: positions_value_cents when it may count in the portfolio
+            value; None when it was not read, or is refused.
+    """
+    if positions_value_cents is None or positions_value_cents == 0:
+        # Not read, or nothing to count: nothing to check
+        return positions_value_cents
+    counts = [position.count for position in held_positions.values()]
+    if not listing_complete:
+        reason = ("the list of the account's positions was cut short, so not every "
+                  "contract held is known")
+    elif None in counts:
+        reason = (f"the contract count of {sum(c is None for c in counts)} held "
+                  f"market(s) could not be read")
+    else:
+        contracts = sum(abs(count) for count in counts)
+        # Rounded to a millionth of a cent, so float noise in the sum of the
+        # counts never refuses a value that is exactly at the bound
+        if positions_value_cents <= round(contracts * CONTRACT_PAYOUT_DOLLARS * 100, 6):
+            return positions_value_cents
+        reason = (f"that is more than the {count_text(contracts)} contract(s) held can "
+                  f"be worth at ${CONTRACT_PAYOUT_DOLLARS:.2f} each")
+    logging.warning(
+        "Kalshi's value of the open positions ($%.2f) is not used: %s — sizing on "
+        "cash alone ($%.2f) this run, as if no position were held",
+        positions_value_cents / 100, reason, cash_cents / 100,
+    )
+    return None
 
 
 def _display_specs(trade_specs: dict, portfolio: list) -> dict:
@@ -264,7 +348,10 @@ def _print_portfolio(portfolio: list, label: str) -> None:
     log an identical line (DR-17). "profit if won" is
     spec.min_payoff: the guaranteed floor for a same-title pair, and the
     profit in either winning settlement of a time-series pair (event by A, or
-    never by B) — the in-between settlement loses the whole stake.
+    never by B) — the in-between settlement loses the whole stake. A trade
+    that adds to a pair the account already holds (scanner.pair_held) ends
+    " — adds to N held", N being the contracts held on each market; every
+    other line is unchanged.
 
     Args:
         portfolio (list): List of TradeSpec objects representing the trades
@@ -279,9 +366,11 @@ def _print_portfolio(portfolio: list, label: str) -> None:
     for spec in portfolio:
         # Which side each market's leg buys — the only source of truth for sides
         side_a, side_b = leg_sides(spec.pair.pair_type)
+        # Cross-module: the held pair this trade adds to, read by type
+        held = pair_held(spec.pair)
         logging.info(
             "  [%s] %s (%s / %s) — %d× %s(A) + %d× %s(B) — "
-            "cost $%.2f incl. fees, profit if won $%.2f (%.1f%% return)",
+            "cost $%.2f incl. fees, profit if won $%.2f (%.1f%% return)%s",
             spec.pair.pair_type,
             spec.pair.canonical_title[:55],
             # DR-17: the tickers identify the trade when the title cannot —
@@ -292,6 +381,7 @@ def _print_portfolio(portfolio: list, label: str) -> None:
             spec.x, side_a.upper(), spec.y, side_b.upper(),
             spec.total_cost_with_fees, spec.min_payoff,
             spec.profit_ratio * 100,
+            f" — adds to {count_text(held.count)} held" if held is not None else "",
         )
 
 
@@ -491,7 +581,9 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
     Each row shows the two markets, each leg's outcome label and exchange
     shard, the deadlines, the prices, whether the pair is tradeable, and for a
     selected pair the contract counts, profit if won, monthly return and
-    Kelly fraction (the share of the portfolio value Kelly calls for).
+    Kelly fraction (the share of the portfolio value Kelly calls for). The
+    counts of a trade that adds to a pair the account already holds are
+    followed by "(adds to N held)", N being the contracts held on each market.
 
     Args:
         candidate_pairs (list): Every CandidatePair the scanner returned.
@@ -512,6 +604,10 @@ def print_pairs_table(candidate_pairs: list, display_specs: dict) -> None:
             # Sides rendered next to each count, in market order (A then B)
             side_a, side_b = leg_sides(pair.pair_type)
             trade_str   = f"{spec.x}× {side_a.upper()}(A) + {spec.y}× {side_b.upper()}(B)"
+            # Cross-module: a trade adding to a held pair says how much is held
+            held = pair_held(spec.pair)
+            if held is not None:
+                trade_str += f" (adds to {count_text(held.count)} held)"
             profit_str  = f"${spec.min_payoff:.2f}"
             monthly_str = f"{spec.monthly_profit_ratio:.2%}/mo"
             kelly_str   = f"{spec.kelly_fraction:.1%} (p={spec.kelly_p:.2f})"
@@ -690,6 +786,7 @@ _LIVE_FLAGS = (
     ("interval_discount", "--interval-discount"),
     ("size_cap", "--size-cap"),
     ("same_title_size_cap", "--same-title-size-cap"),
+    ("add_to_held_pairs", "--add-to-held-pairs/--no-add-to-held-pairs"),
     ("category", "--category"),
     ("any_category", "--any-category"),
     ("tag", "--tag"),
@@ -753,6 +850,8 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["size_cap"] = args.size_cap / 100
     if getattr(args, "same_title_size_cap", None) is not None:
         overrides["same_title_size_cap"] = args.same_title_size_cap / 100
+    if getattr(args, "add_to_held_pairs", None) is not None:
+        overrides["add_to_held_pairs"] = args.add_to_held_pairs
     # --category / --tag (repeatable) set the filter; --any-category / --any-tag
     # clear the saved one (argparse keeps each pair mutually exclusive)
     if getattr(args, "category", None) is not None:
@@ -973,6 +1072,21 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     at several deadlines) the account holds, and none at all if a held market
     cannot be identified.
 
+    Kalshi's value of the open positions counts only if the contracts held
+    can back it (_checked_positions_value, once the positions are read); a
+    refused value leaves the cash alone as the portfolio value, and the
+    minimum-balance check is applied to it again.
+
+    With settings.add_to_held_pairs on, it may add to an exact held pair
+    (scanner.held_pairs: the same two markets, the same side on each) or to a
+    lone held leg whose partner has paid out (a new pair buying that market
+    on its held side, beside a market not held), sized
+    on the whole position (config.held_pair_fraction); only when the
+    positions listing was read to its end, every held market was identified
+    and Kalshi's value of the open positions was read and kept, and never to
+    a pair whose stake (its worth at today's prices plus the fees paid for
+    it) already fills its per-trade cap of the portfolio value.
+
     Args:
         client: KalshiClient for production, from auth.build_client("prod").
         args: Parsed arguments (dry_run, max_horizon_days).
@@ -981,7 +1095,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         report (RunReport | None): Keyword-only. The --result-file summary to fill in.
 
     Returns:
-        int: EXIT_SKIPPED_LOW_BALANCE if the portfolio value is below
+        int: EXIT_SKIPPED_LOW_BALANCE if the portfolio value (the cash alone
+            when Kalshi's value of the open positions is refused) is below
             MIN_BALANCE_CENTS; EXIT_NO_TRADEABLE_SHARDS if nothing could be
             scanned; EXIT_TRADES_NEED_ATTENTION if a trade needs a person to
             check it; otherwise EXIT_TIME_SERIES_SKIPPED if a held market
@@ -1025,6 +1140,31 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.warning("%s", message)
         report.message = message
         return EXIT_SKIPPED_LOW_BALANCE
+
+    # Current open positions, each with its side and cost. A held market is
+    # never traded again, except an exact held pair or a lone held leg (its
+    # partner paid out) this run's settings add to; held_listing["complete"]
+    # says whether the listing was read to its end
+    held_listing: dict = {}
+    held_positions    = get_held_positions(client, complete_out=held_listing)
+    held_tickers      = set(held_positions)
+    # Kalshi's value of the open positions counts only if the contracts held
+    # can back it; None when it was not read, or is refused (with a WARNING)
+    checked_value_cents = _checked_positions_value(
+        cash_cents, positions_value_cents, held_positions,
+        held_listing.get("complete") is True,
+    )
+    if positions_value_cents is not None and checked_value_cents is None:
+        # Refused: size on the cash alone, and apply the minimum to it again
+        portfolio_value_cents = cash_cents
+        report.portfolio_value_before = cash_cents / 100
+        if portfolio_value_cents < MIN_BALANCE_CENTS:
+            message = (f"Portfolio value ${portfolio_value_cents / 100:.2f} (cash "
+                       f"${cash_cents / 100:.2f}) is below minimum "
+                       f"${MIN_BALANCE_CENTS / 100:.2f} — skipping run.")
+            logging.warning("%s", message)
+            report.message = message
+            return EXIT_SKIPPED_LOW_BALANCE
     if cash_cents < MIN_BALANCE_CENTS:
         # Low cash alone does not stop the run; no trade spends more than the cash left
         logging.warning(
@@ -1032,9 +1172,6 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             "the run goes on, and no trade spends more than the cash left",
             cash_cents / 100, MIN_BALANCE_CENTS / 100,
         )
-
-    # Get current open positions so we don't re-enter markets we already hold
-    held_tickers      = get_held_tickers(client)
 
     # Read the exchange's per-shard status breakdown so ingest can drop shards
     # that aren't trading. Returns None on the pre-sharding shape, which
@@ -1073,25 +1210,81 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         return EXIT_NO_TRADEABLE_SHARDS
 
     # Our positions' ladders, read before held markets are dropped; None
-    # means one could not be identified, so no time-series trade this run
-    held_ladders      = resolve_held_ladders(client, markets, held_tickers)
+    # means one could not be identified, so no time-series trade this run.
+    # Each identified market's own labels land in held_labels, for held_pairs
+    held_labels: dict = {}
+    held_ladders      = resolve_held_ladders(client, markets, held_tickers,
+                                             labels_out=held_labels)
+    # Every market by ticker, before held ones are dropped: held_pairs reads
+    # each held market's ask from it, to value a held pair at today's prices
+    markets_by_ticker = {m.ticker: m for m in markets}
     # The exit code of every clean return below
     clean_exit        = EXIT_OK if held_ladders is not None else EXIT_TIME_SERIES_SKIPPED
-    markets           = [m for m in markets if m.ticker not in held_tickers]
+    # What this run may add to (exact held pairs, and lone legs whose partner
+    # has paid out): only with the setting on, and only when every held
+    # market was listed and identified, since an unknown one could share a
+    # pair's ladder, and being alone on its ladder is what makes adding safe; and only when Kalshi's value of the open
+    # positions was read and kept, since an add-on is sized on the portfolio
+    # value, which would otherwise leave out what the account holds
+    add_on_pairs: dict = {}
+    if settings.add_to_held_pairs:
+        if held_ladders is None or held_listing.get("complete") is not True:
+            logging.warning("Not adding to held pairs this run: %s",
+                            "a market the account holds could not be looked up"
+                            if held_ladders is None
+                            else "the list of the account's positions was cut short, "
+                                 "so a held market may be missing from it")
+        elif held_positions and checked_value_cents is None:
+            logging.warning("Not adding to held pairs this run: %s",
+                            "Kalshi's value of the open positions could not be read, "
+                            "so the portfolio value counts only the cash"
+                            if positions_value_cents is None
+                            else "Kalshi's value of the open positions was refused, "
+                                 "so the portfolio value counts only the cash")
+        else:
+            # Cross-module: the one definition of what a run may add to (an
+            # exact held pair, both markets alone on one ladder, one YES and
+            # one NO of equal size; or a lone leg alone on its ladder, its
+            # partner paid out), valued at today's prices from this run's
+            # market list
+            add_on_pairs = held_pairs(held_positions, held_labels, markets_by_ticker)
+            # A pair whose stake (its worth at today's prices plus the fees
+            # paid for it) already fills its per-trade cap of the portfolio
+            # value can add nothing whatever Kelly says: it would only take
+            # its group's one slot and size to nothing, so its markets stay
+            # blocked like any other held market's
+            full = {key for key, pair in add_on_pairs.items()
+                    if held_pair_fraction(settings.size_cap, pair.stake_dollars,
+                                          portfolio_value_cents / 100) <= 0}
+            if full:
+                logging.info("Held pairs already at their size cap, not added to this "
+                             "run: %d", len(full))
+                add_on_pairs = {key: pair for key, pair in add_on_pairs.items()
+                                if key not in full}
+    # The markets of those pairs and lone legs stay in (a pair's market pairs
+    # only with its own partner, a lone leg only with a market not held);
+    # every other held market is dropped
+    add_on_tickers    = {ticker for key in add_on_pairs for ticker in key}
+    blocked_tickers   = held_tickers - add_on_tickers
+    markets           = [m for m in markets if m.ticker not in blocked_tickers]
 
     # Optional opt-in cap so both bet types only see markets closing within
     # the requested window — a no-op (returns markets unchanged) when unset
     markets           = filter_markets_within_horizon(markets, args.max_horizon_days)
 
     # Run both pair detection paths: time-series (the run's entry rule, and no
-    # pair on a ladder we hold) and same-title
+    # pair on a ladder we hold but one adding to an exact held pair or a lone
+    # held leg) and same-title (a held pair's markets pair only with each
+    # other, a lone leg only with a market not held)
     if held_ladders is None:
         time_series_pairs = []
     else:
         time_series_pairs = find_time_series_pairs(
-            client, held_tickers, markets, settings=settings, held_ladders=held_ladders,
+            client, blocked_tickers, markets, settings=settings, held_ladders=held_ladders,
+            add_on_pairs=add_on_pairs,
         )
-    same_title_pairs  = find_same_title_pairs(markets, held_tickers)
+    same_title_pairs  = find_same_title_pairs(markets, blocked_tickers,
+                                              add_on_pairs=add_on_pairs)
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
     # Category/tag filter, before enrichment so a dropped pair costs no book request
@@ -1197,17 +1390,21 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     except Exception as exc:
         logging.critical("Failed to write trade log: %s — rescue dump follows", exc)
         for r in results:
+            # Cross-module: an add-on's counts sit on top of what the pair
+            # already held, so its line names that held count too
+            held = pair_held(r.spec.pair)
             # Both counts are printed: x is market A's leg and y is market B's,
             # and for a time-series pair the NO leg (the one that gets unwound)
             # is market B's, so y is the count a human must reconcile first.
             logging.critical(
-                "  RESCUE | %s | %s | A=%s B=%s | x=%d y=%d cost=$%.2f incl. fees | %s",
+                "  RESCUE | %s | %s | A=%s B=%s | x=%d y=%d%s cost=$%.2f incl. fees | %s",
                 r.status,
                 r.spec.pair.canonical_title,
                 r.spec.pair.market_a.ticker,
                 r.spec.pair.market_b.ticker,
                 r.spec.x,
                 r.spec.y,
+                f" (adds to {count_text(held.count)} held)" if held is not None else "",
                 r.spec.total_cost_with_fees,
                 r.error or "",
             )
@@ -1293,7 +1490,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # values — no choices, range check or literal here
     live = parser.add_argument_group(
         "live trading toggles",
-        "Override one live default for THIS run only, in either mode. The live defaults "
+        "Override one live default for THIS run only, in either mode "
+        "(adding to held pairs: production runs only). The live defaults "
         "are the ones saved through python3 -m kalshi_betting.defaults_server "
         "(live_defaults.json); a run refuses to start without them. The weekly scheduler "
         "passes none of these flags, so a scheduled run trades exactly the saved defaults.",
@@ -1329,6 +1527,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--same-title-size-cap", type=int, default=None, metavar="PCT",
         help=f"Extra per-trade cap on same-title pairs, in whole percent, in {cap_step}%% "
              "steps; 100 = no extra cap beyond --size-cap "
+             "(default: the saved live defaults)",
+    )
+    live.add_argument(
+        "--add-to-held-pairs", action=argparse.BooleanOptionalAction, default=None,
+        help="Let this run add to a pair the account already holds (exactly the same "
+             "two markets, the same side on each), sizing the old and new contracts "
+             "together as a share of the portfolio value (the old ones at today's "
+             "prices plus the fees paid for them). --no-add-to-held-pairs never "
+             "trades a held market. Production runs only: a dev run holds nothing "
              "(default: the saved live defaults)",
     )
     # Filed as the backtest dashboard files a trade (_filter_by_category)
