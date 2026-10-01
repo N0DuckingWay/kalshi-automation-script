@@ -3772,6 +3772,36 @@ class TestAddOnIsSentOnlyOntoItsPair:
         # The NO leg's place, held for the YES leg
         assert pacer.acquire_with_hold.call_count == 1
 
+    @pytest.mark.parametrize("sides, before, reason", [
+        # NO held on TICK-B alone (its partner paid out); TICK-A is new and
+        # must still hold nothing
+        ((("TICK-B", "no"),), (-30.0, 5.0),
+         "TICK-A now holds 5 YES contracts; it was not held"),
+        ((("TICK-B", "no"),), (-20.0, 0.0),
+         "TICK-B now holds 20 NO contracts; the held pair had 30 NO contracts"),
+        ((("TICK-B", "no"),), (-30.0, None), "the position on TICK-A could not be read"),
+        # YES held on TICK-B: this pair would buy NO there
+        ((("TICK-B", "yes"),), (30.0, 0.0), "the account does not hold NO on TICK-B"),
+        # Held on a market this pair does not buy at all
+        ((("TICK-C", "no"),), (0.0, 0.0), "the pair does not buy the held market TICK-C"),
+    ], ids=["new-market-not-flat", "held-changed", "new-market-unread", "other-side",
+            "other-market"])
+    def test_a_lone_leg_add_on_is_refused_unless_it_still_matches(self, sides, before, reason):
+        spec = make_add_on_spec(sides=sides)
+        no_leg, yes_leg = _ordered_legs(spec)
+        assert trader._add_on_mismatch(spec, no_leg, yes_leg, *before) == reason
+
+    def test_a_lone_leg_add_on_that_still_matches_is_sent(self, post, pacer):
+        # NO held on TICK-B alone, TICK-A flat: sent like any pair
+        spec = make_add_on_spec(sides=(("TICK-B", "no"),))
+        no_leg, yes_leg = _ordered_legs(spec)
+        assert trader._add_on_mismatch(spec, no_leg, yes_leg, -30.0, 0.0) is None
+        post.side_effect = [v2_resp(10, 10), v2_resp(10, 10)]
+        client = MagicMock(get_positions_without_preload_content=positions_seq(
+            ("TICK-B", -30), None))
+        assert _execute_one(client, spec).status == "executed"
+        assert [c.kwargs["body"]["ticker"] for c in post.call_args_list] == ["TICK-B", "TICK-A"]
+
     def test_an_ordinary_pair_is_never_refused(self):
         # Not an add-on: whatever the positions read, the check has nothing
         # to say

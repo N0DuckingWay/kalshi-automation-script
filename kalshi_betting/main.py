@@ -46,9 +46,11 @@ Purpose:
     _filter_by_category trim the list.
 
     A production run keeps every market the account holds out of new trades,
-    except, when the run's add_to_held_pairs setting is on, the two markets
-    of an exact held pair it may add to (scanner.held_pairs), which each
-    finder lets through only as that same pair (add_on_pairs). It adds to
+    except, when the run's add_to_held_pairs setting is on, the markets it
+    may add to (scanner.held_pairs): the two markets of an exact held pair,
+    which each finder lets through only as that same pair, and a lone held
+    leg whose partner has paid out, which each finder lets through only
+    beside a market the account does not hold (add_on_pairs). It adds to
     none when Kalshi's value of the open positions was not read or was
     refused, since an add-on is sized on the portfolio value.
 
@@ -65,7 +67,7 @@ Dependencies:
 
     To add to held pairs it also reads scanner.get_held_positions,
     resolve_held_ladders and held_pairs (the positions, their ladders and the
-    exact held pairs a run may add to), scanner.pair_held (which names the
+    exact held pairs and lone held legs a run may add to), scanner.pair_held (which names the
     held pair a trade adds to in the pairs table, the portfolio lines and the
     rescue dump), config.held_pair_fraction (the one definition of an
     add-on's size, which leaves out a held pair with no room left),
@@ -1215,10 +1217,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     markets_by_ticker = {m.ticker: m for m in markets}
     # The exit code of every clean return below
     clean_exit        = EXIT_OK if held_ladders is not None else EXIT_TIME_SERIES_SKIPPED
-    # The exact held pairs this run may add to: only with the setting on, and
-    # only when every held market was listed and identified, since an unknown
-    # one could share a pair's ladder, and being alone on its ladder is what
-    # makes adding to a pair safe; and only when Kalshi's value of the open
+    # What this run may add to (exact held pairs, and lone legs whose partner
+    # has paid out): only with the setting on, and only when every held
+    # market was listed and identified, since an unknown one could share a
+    # pair's ladder, and being alone on its ladder is what makes adding safe; and only when Kalshi's value of the open
     # positions was read and kept, since an add-on is sized on the portfolio
     # value, which would otherwise leave out what the account holds
     add_on_pairs: dict = {}
@@ -1237,9 +1239,11 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
                             else "Kalshi's value of the open positions was refused, "
                                  "so the portfolio value counts only the cash")
         else:
-            # Cross-module: the one definition of an exact held pair (both
-            # markets alone on one ladder, one YES and one NO of equal size),
-            # each valued at today's prices from this run's market list
+            # Cross-module: the one definition of what a run may add to (an
+            # exact held pair, both markets alone on one ladder, one YES and
+            # one NO of equal size; or a lone leg alone on its ladder, its
+            # partner paid out), valued at today's prices from this run's
+            # market list
             add_on_pairs = held_pairs(held_positions, held_labels, markets_by_ticker)
             # A pair whose stake (its worth at today's prices plus the fees
             # paid for it) already fills its per-trade cap of the portfolio
@@ -1254,8 +1258,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
                              "run: %d", len(full))
                 add_on_pairs = {key: pair for key, pair in add_on_pairs.items()
                                 if key not in full}
-    # The markets of those pairs stay in (each pairs only with its own
-    # partner); every other held market is dropped
+    # The markets of those pairs and lone legs stay in (a pair's market pairs
+    # only with its own partner, a lone leg only with a market not held);
+    # every other held market is dropped
     add_on_tickers    = {ticker for key in add_on_pairs for ticker in key}
     blocked_tickers   = held_tickers - add_on_tickers
     markets           = [m for m in markets if m.ticker not in blocked_tickers]

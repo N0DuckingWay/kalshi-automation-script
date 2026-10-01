@@ -48,13 +48,14 @@ Dependencies:
     pair_gap_days() is the single reader of that gap for everything
     downstream of pair formation. resolve_held_ladders() finds the ladders
     of the markets the account holds, and find_time_series_pairs refuses any
-    candidate with a market on one of them, except an exact held pair it is
-    told to add to. get_held_positions() reads each held market's side and
-    cost (get_held_tickers() is its tickers), and held_pairs() finds the
-    exact held pairs a run may add to (HeldPosition, HeldPair, pair_held):
-    main._run_prod passes them as each finder's keyword-only add_on_pairs
-    when the run's add_to_held_pairs setting is on, which lets such a pair
-    through, and only with the side already held on each market.
+    candidate with a market on one of them, except one that adds to what it
+    is told to add to. get_held_positions() reads each held market's side and
+    cost (get_held_tickers() is its tickers), and held_pairs() finds what a
+    run may add to (HeldPosition, HeldPair, pair_held): exact held pairs, and
+    lone legs whose partner has paid out. main._run_prod passes them as each
+    finder's keyword-only add_on_pairs when the run's add_to_held_pairs
+    setting is on, which lets such a pair through, and only with the side
+    already held on each held market.
     historical.py imports event_series too, so the backtest's event-title
     lookup budget tells a combo ticker from any other exactly as the
     one-series rule does (DR-51).
@@ -760,37 +761,62 @@ class HeldPosition:
 @dataclass(frozen=True)
 class HeldPair:
     """
-    Two held markets that form one exact pair, which a run may add to.
+    A held position a run may add to: an exact pair, or one leg whose partner has paid out.
 
-    Built only by held_pairs: exactly two held markets on one ladder (no other
-    held market shares a ladder label with either, and every held market's
-    ladder is known), one held YES and one held NO, of equal size, both costs
-    readable. A candidate adds to it only when it names the same two tickers
-    with the same side on each (matches). Its stake (stake_dollars, the
-    worth plus the fees) is what sizing and the at-cap check subtract.
+    Built only by held_pairs, from held markets alone on their ladder (no
+    other held market shares a ladder label with them, and every held
+    market's ladder is known), with readable costs. Two shapes:
+
+    - An exact pair: two held markets, one held YES and one held NO, of equal
+      size. A candidate adds to it only when it names the same two tickers
+      with the same side on each (matches).
+    - A lone leg: one held market whose partner is gone from the positions
+      listing (it paid out). A candidate adds to it when it buys the side
+      held on that market and pairs it with a market the account does not
+      hold (matches); the finders also check that the new market sits on no
+      other held ladder.
+
+    Its stake (stake_dollars, the worth plus the fees) is what sizing and the
+    at-cap check subtract.
 
     Attributes:
-        sides (tuple[tuple[str, str], tuple[str, str]]): (ticker, "yes" | "no")
-            per market, sorted by ticker.
+        sides (tuple[tuple[str, str], ...]): (ticker, "yes" | "no") per held
+            market, sorted by ticker: two for an exact pair, one for a lone
+            leg.
         count (float): Contracts held on each market.
-        cost_dollars (float): Both markets' exposure plus fees paid: what the
-            account paid for the pair, named in the logs.
-        value_dollars (float): The pair's worth at today's prices, fees left
-            out: each market's contracts times the ask of the side held there
-            (its exposure when the market has no usable ask this run). Named
-            in the logs.
-        fees_dollars (float): Both markets' fees paid (HeldPosition.fees_dollars).
+        cost_dollars (float): The held markets' exposure plus fees paid: what
+            the account paid for them, named in the logs.
+        value_dollars (float): The held markets' worth at today's prices, fees
+            left out: each market's contracts times the ask of the side held
+            there (its exposure when the market has no usable ask this run).
+            For a lone leg, that one market's worth alone.
+        fees_dollars (float): The held markets' fees paid
+            (HeldPosition.fees_dollars).
+        labels (frozenset): The held markets' ladder labels (scanner.ladder_keys),
+            read for a lone leg: a new market it pairs with may sit on these
+            held ladders and no other. Empty when not given.
     """
-    sides: tuple[tuple[str, str], tuple[str, str]]
+    sides: tuple[tuple[str, str], ...]
     count: float
     cost_dollars: float
     value_dollars: float
     fees_dollars: float
+    labels: frozenset = frozenset()
+
+    @property
+    def lone(self) -> bool:
+        """
+        Say whether this is a lone leg (one held market whose partner has paid out).
+
+        Returns:
+            bool: True for one held market, False for an exact pair.
+        """
+        return len(self.sides) == 1
 
     @property
     def stake_dollars(self) -> float:
         """
-        Return what the pair already stakes: its worth at today's prices plus the fees paid.
+        Return what the held markets already stake: their worth at today's prices plus the fees paid.
 
         What sizing and the at-cap check subtract from the pair's Kelly share
         (config.held_pair_fraction): an add-on tops the pair up to that share
@@ -805,7 +831,7 @@ class HeldPair:
 
     def matches(self, market_a: Any, market_b: Any, pair_type: str) -> bool:
         """
-        Say whether a candidate buys exactly what this pair holds.
+        Say whether a candidate buys what is held, each held market on its held side.
 
         Args:
             market_a (Any): The candidate's market A, once its legs are ordered.
@@ -813,8 +839,10 @@ class HeldPair:
             pair_type (str): Its type; leg_sides says which side each leg buys.
 
         Returns:
-            bool: True when the two tickers are this pair's and each leg buys
-                the side held on it.
+            bool: For an exact pair, True when the two tickers are this
+                pair's and each leg buys the side held on it. For a lone leg,
+                True when one of the two tickers is the held market and its
+                leg buys the side held there (the other market is new).
         """
         side_a, side_b = leg_sides(pair_type)
         ticker_a = getattr(market_a, "ticker", None)
@@ -822,7 +850,12 @@ class HeldPair:
         # One ticker named twice is not two markets
         if ticker_a == ticker_b:
             return False
-        return dict(self.sides) == {ticker_a: side_a, ticker_b: side_b}
+        bought = {ticker_a: side_a, ticker_b: side_b}
+        if self.lone:
+            # The held market, bought on the side held there
+            ticker, side = self.sides[0]
+            return bought.get(ticker) == side
+        return dict(self.sides) == bought
 
 
 def pair_held(pair: Any) -> "HeldPair | None":
@@ -841,6 +874,45 @@ def pair_held(pair: Any) -> "HeldPair | None":
     """
     held = getattr(pair, "held", None)
     return held if isinstance(held, HeldPair) else None
+
+
+def _add_on_for(add_on_pairs: dict, add_on_tickers: set, ticker_a: Any,
+                ticker_b: Any) -> HeldPair | None:
+    """
+    Return what a candidate on two tickers would add to, or None.
+
+    An exact held pair is found by its two tickers. A lone leg (one held
+    market whose partner has paid out) is found by its one ticker, and only
+    when the candidate's other market is not held itself: a candidate
+    touching two held markets that are not one exact pair adds to nothing.
+    The finders still check the sides (HeldPair.matches) and, for a lone
+    leg, the new market's ladders.
+
+    Args:
+        add_on_pairs (dict): held_pairs' result, frozenset of held tickers ->
+            HeldPair.
+        add_on_tickers (set): Every ticker in add_on_pairs' keys.
+        ticker_a (Any): The candidate's first ticker.
+        ticker_b (Any): Its second ticker.
+
+    Returns:
+        HeldPair | None: The exact pair or lone leg the candidate would add
+            to, or None.
+    """
+    exact = add_on_pairs.get(frozenset((ticker_a, ticker_b)))
+    # A lone leg's key holds one ticker, so one ticker named twice could find one
+    if exact is not None and not exact.lone:
+        return exact
+    found = [(ticker, add_on_pairs.get(frozenset((ticker,)))) for ticker in (ticker_a, ticker_b)]
+    found = [(ticker, held) for ticker, held in found if held is not None]
+    # Exactly one held market, and the other market new to the account
+    if len(found) != 1:
+        return None
+    ticker, held = found[0]
+    other = ticker_b if ticker == ticker_a else ticker_a
+    if other in add_on_tickers:
+        return None
+    return held
 
 
 @dataclass
@@ -935,9 +1007,9 @@ class CandidatePair:
             lets strategy.compute_trade price the exact n it sizes
             (scanner.prefix_fill_prices) instead of reusing one scalar average
             computed over depth the trade could never reach.
-        held (HeldPair | None): The held pair this candidate adds to, set by
-            the finders only for an exact held pair in their add_on_pairs;
-            None for every other pair. Read it through pair_held(), by type.
+        held (HeldPair | None): The held pair (or lone held leg) this
+            candidate adds to, set by the finders only for one in their
+            add_on_pairs; None for every other pair. Read it through pair_held(), by type.
             Enrichment and compute_trade copy it through dc_replace, so it
             reaches spec.pair.
     """
@@ -958,9 +1030,9 @@ class CandidatePair:
     # and chose the tier; None = tier this pair on close_time. Read via
     # pair_gap_days(), never by truthiness (a 0-day stated gap is falsy).
     stated_gap_days: int | None = None
-    # The held pair this candidate adds to (set by the finders only for an
-    # exact held pair in their add_on_pairs); None for every other pair. Read
-    # via pair_held(), by type.
+    # The held pair or lone held leg this candidate adds to (set by the
+    # finders only for one in their add_on_pairs); None for every other pair.
+    # Read via pair_held(), by type.
     held: HeldPair | None = None
 
 
@@ -2954,26 +3026,35 @@ def _held_leg_worth(position: HeldPosition, side: str, market: Any) -> float:
 
 def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict) -> dict:
     """
-    Find the held pairs a run may add to: two held markets forming one exact, isolated pair.
+    Find what a run may add to: exact held pairs, and lone legs whose partner has paid out.
 
     Held markets are joined when they share a ladder label (resolve_held_ladders'
-    labels: a shared event or question, see ladder_keys). A group of exactly
-    two whose counts have opposite signs and equal size, and whose exposure
-    and fees can both be read, is a HeldPair. Every other shape is never added
-    to and stays blocked as any held market is: one leg alone (the other paid
-    out or was closed), three or more held markets on one ladder, unequal
-    counts (after a partial unwind), one side held twice, an unreadable count
-    or cost, or an exposure below the finest price times the count. Each
-    pair is valued at today's prices (_held_leg_worth): each market's
-    contracts at the ask of the side held there, or at their exposure when
-    the market has no usable ask this run. Its stake, what sizing
-    subtracts, is that worth plus both markets' fees paid
-    (HeldPair.stake_dollars).
+    labels: a shared event or question, see ladder_keys). Two shapes are
+    returned as a HeldPair:
+
+    - A group of exactly two whose counts have opposite signs and equal size
+      is an exact pair.
+    - A group of one is a lone leg: a held market alone on its ladder, most
+      often the later leg of a pair whose earlier leg has paid out (and so
+      left the positions listing). A run may pair it with a market the
+      account does not hold, buying the side held on it.
+
+    Both need the exposure and fees of every held market in them to be
+    readable, and an exposure of at least the finest price times the count.
+    Every other shape is never added to and stays blocked as any held market
+    is: three or more held markets on one ladder, unequal counts (after a
+    partial unwind), one side held twice, an unreadable count or cost. Each
+    is valued at today's prices (_held_leg_worth): each market's contracts at
+    the ask of the side held there, or at their exposure when the market has
+    no usable ask this run. Its stake, what sizing subtracts, is that worth
+    plus the fees paid on its held markets (HeldPair.stake_dollars); a lone
+    leg's stake is that one market's alone, since its partner's payout is
+    already cash.
 
     The ladder of every held market must be known. When any held market is
-    missing from labels_by_ticker, or has no labels, no pair is returned: a
-    market whose ladder is unknown could sit on a pair's ladder, and adding
-    to that pair would stack a trade beside it (fails closed).
+    missing from labels_by_ticker, or has no labels, nothing is returned: a
+    market whose ladder is unknown could sit on the same ladder, and adding
+    there would stack a trade beside it (fails closed).
 
     Args:
         positions (dict): get_held_positions' result, ticker -> HeldPosition.
@@ -2984,9 +3065,9 @@ def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict)
             each held market's ask.
 
     Returns:
-        dict: frozenset({ticker_a, ticker_b}) -> HeldPair, empty when no held
-            market is part of an exact pair or a held market's ladder is
-            unknown.
+        dict: frozenset of the held tickers (two for an exact pair, one for a
+            lone leg) -> HeldPair; empty when nothing qualifies or a held
+            market's ladder is unknown.
     """
     # A held market with no known ladder could share one with a pair, so no
     # pair can be shown to be alone on its ladder
@@ -3008,59 +3089,84 @@ def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict)
         Returns:
             str: The ticker that stands for its whole group.
         """
+        # Walk up to the group's representative, halving the path as it goes
         while parent[ticker] != ticker:
             parent[ticker] = parent[parent[ticker]]
             ticker = parent[ticker]
         return ticker
 
+    # The first held market seen with each label
     first_with: dict = {}
     for ticker in sorted(positions, key=str):
         for label in labels_by_ticker[ticker]:
             if label in first_with:
+                # A label seen before: join this market's group to that market's
                 parent[root(ticker)] = root(first_with[label])
             else:
                 first_with[label] = ticker
+    # The held markets of each group, in ticker order
     groups: dict = defaultdict(list)
     for ticker in sorted(positions, key=str):
         groups[root(ticker)].append(ticker)
 
     pairs: dict = {}
     for members in groups.values():
-        if len(members) != 2:
+        # Two markets can be an exact pair, one a lone leg; more is never added to
+        if len(members) not in (1, 2):
             continue
-        a, b = positions[members[0]], positions[members[1]]
-        costs = (a.exposure_dollars, a.fees_dollars, b.exposure_dollars, b.fees_dollars)
-        if (a.count is None or b.count is None or a.count * b.count >= 0
-                # Equal size exactly: 29.99 against 30 is a partial unwind
-                or abs(a.count) != abs(b.count) or None in costs
-                # A held contract costs at least the finest tradeable price, so
-                # a smaller exposure cannot be a real cost to size an add-on on
-                # (an exposure of "0.00" would let the pair add its whole share
-                # again)
-                or a.exposure_dollars < MIN_ACTIVE_PRICE_DOLLARS * abs(a.count)
-                or b.exposure_dollars < MIN_ACTIVE_PRICE_DOLLARS * abs(b.count)):
+        held = [positions[ticker] for ticker in members]
+        # Each held market's exposure and fees, which must all be readable
+        costs = tuple(cost for position in held
+                      for cost in (position.exposure_dollars, position.fees_dollars))
+        # An unreadable count, or an unreadable cost
+        if any(position.count is None for position in held) or None in costs:
             continue
-        side_a = "yes" if a.count > 0 else "no"
-        side_b = "yes" if b.count > 0 else "no"
+        # A held contract costs at least the finest tradeable price, so a
+        # smaller exposure cannot be a real cost to size an add-on on (an
+        # exposure of "0.00" would let it add its whole share again)
+        if any(position.exposure_dollars < MIN_ACTIVE_PRICE_DOLLARS * abs(position.count)
+               for position in held):
+            continue
+        if len(held) == 2:
+            a, b = held
+            # One YES and one NO, of exactly equal size: 29.99 against 30 is
+            # a partial unwind
+            if a.count * b.count >= 0 or abs(a.count) != abs(b.count):
+                continue
+        # The side held on each market: a positive count is YES, a negative NO
+        sides = tuple((position.ticker, "yes" if position.count > 0 else "no")
+                      for position in held)
         # Each market at today's price of the side held there
-        value = (_held_leg_worth(a, side_a, markets_by_ticker.get(a.ticker))
-                 + _held_leg_worth(b, side_b, markets_by_ticker.get(b.ticker)))
-        # Both fees are readable here (checked above), whatever the asks
+        value = sum(_held_leg_worth(position, side, markets_by_ticker.get(position.ticker))
+                    for position, (_ticker, side) in zip(held, sides, strict=True))
+        # Every fee is readable here (checked above), whatever the asks
         # read, so the stake always counts them
-        pairs[frozenset((a.ticker, b.ticker))] = HeldPair(
-            sides=((a.ticker, side_a), (b.ticker, side_b)),
-            count=abs(a.count), cost_dollars=sum(costs), value_dollars=value,
-            fees_dollars=a.fees_dollars + b.fees_dollars)
+        pairs[frozenset(members)] = HeldPair(
+            sides=sides, count=abs(held[0].count), cost_dollars=sum(costs),
+            value_dollars=value,
+            fees_dollars=sum(position.fees_dollars for position in held),
+            labels=frozenset().union(*(labels_by_ticker[ticker] for ticker in members)))
 
-    # Each pair, then the count, zero included
+    # Each pair or lone leg, then the counts, zero included
     for key in sorted(pairs, key=sorted):
         pair = pairs[key]
-        logging.info("Held pair to add to: %s, %g contracts each, cost $%.2f (fees $%.2f), "
-                     "worth $%.2f at today's prices",
-                     " / ".join(f"{side.upper()} {ticker}" for ticker, side in pair.sides),
-                     pair.count, pair.cost_dollars, pair.fees_dollars, pair.value_dollars)
+        held_text = " / ".join(f"{side.upper()} {ticker}" for ticker, side in pair.sides)
+        if pair.lone:
+            logging.info("Held market to add to (its partner has paid out): %s, %g contracts, "
+                         "cost $%.2f (fees $%.2f), worth $%.2f at today's prices",
+                         held_text, pair.count, pair.cost_dollars, pair.fees_dollars,
+                         pair.value_dollars)
+        else:
+            logging.info("Held pair to add to: %s, %g contracts each, cost $%.2f (fees $%.2f), "
+                         "worth $%.2f at today's prices",
+                         held_text, pair.count, pair.cost_dollars, pair.fees_dollars,
+                         pair.value_dollars)
+    lone = sum(1 for pair in pairs.values() if pair.lone)
     logging.info("Held pairs to add to: %d (other held markets, never added to: %d)",
-                 len(pairs), len(positions) - 2 * len(pairs))
+                 len(pairs) - lone,
+                 len(positions) - sum(len(pair.sides) for pair in pairs.values()))
+    if lone:
+        logging.info("Held markets to add to whose partner has paid out: %d", lone)
     return pairs
 
 
@@ -3742,7 +3848,10 @@ def find_time_series_pairs(
       0. Neither market is on a ladder we already hold (held_ladders; see
          ladder_keys), nor is a market of a held pair in add_on_pairs —
          unless the candidate is exactly that held pair, the same two
-         tickers, buying the side already held on each market
+         tickers, buying the side already held on each market, or adds to a
+         lone held leg in add_on_pairs (its partner paid out): the held
+         market bought on its held side, beside a market the account does
+         not hold that sits on no held ladder but the leg's own
          (HeldPair.matches, checked last, once a ladder's legs are ordered).
          Checked first, so a refused group can still offer its next best
          pair.
@@ -3837,9 +3946,8 @@ def find_time_series_pairs(
     Args:
         client (Any): Authenticated KalshiClient, used only when markets is None.
         held_tickers (set | None): Tickers to exclude: the held positions,
-            less the two markets of each held pair in add_on_pairs (which
-            must stay in for that pair to form). None or empty means exclude
-            nothing.
+            less the markets in add_on_pairs (which must stay in for a pair
+            to add to them). None or empty means exclude nothing.
         markets (list | None): Pre-fetched ApiMarket list to scan. When None,
             fetches all open markets via fetch_open_events_with_markets(client).
         inactive_shards (set | None): exchange_index values the exchange
@@ -3853,11 +3961,12 @@ def find_time_series_pairs(
             direct calls only: a live run hands the run's settings).
         held_ladders (frozenset): Keyword-only. Ladder labels of the markets we
             hold, from resolve_held_ladders (item 0). Empty refuses nothing.
-        add_on_pairs (dict | None): Keyword-only. The exact held pairs this run
-            may add to, from held_pairs: {frozenset of two tickers: HeldPair}.
-            The matching candidate passes item 0 and carries the HeldPair on
-            CandidatePair.held; any other candidate touching one of their
-            markets is refused at item 0. None or empty adds to nothing.
+        add_on_pairs (dict | None): Keyword-only. What this run may add to,
+            from held_pairs: {frozenset of the held tickers: HeldPair}, two
+            for an exact pair, one for a lone leg. A matching candidate
+            passes item 0 and carries the HeldPair on CandidatePair.held; any
+            other candidate touching one of their markets is refused at item
+            0. None or empty adds to nothing.
 
     Returns:
         list: CandidatePair objects, one per normalized title+outcome group
@@ -3875,9 +3984,10 @@ def find_time_series_pairs(
     """
     # Resolved once, so every candidate below is judged under one rule
     settings = live_settings() if settings is None else settings
-    # The exact held pairs the run may add to: {frozenset of two tickers: HeldPair}
+    # What the run may add to: {frozenset of the held tickers: HeldPair}
     add_on_pairs = add_on_pairs or {}
-    # Their markets, each of which may pair only with its own partner
+    # Their markets: one of an exact pair pairs only with its own partner, a
+    # lone leg only with a market the account does not hold
     add_on_tickers = {ticker for key in add_on_pairs for ticker in key}
     # Always logged: the admission rule depends on the run's settings (DR-66)
     logging.info("Time-series entry rule: %s",
@@ -4041,8 +4151,8 @@ def find_time_series_pairs(
             if held_ladders else set()
         )
         if add_on_tickers:
-            # A market of a held pair the run may add to is held, so it is on
-            # a held ladder too, and pairs only with its own partner
+            # A market the run may add to is held, so it is on a held ladder
+            # too, and pairs only as an add-on to what is held
             on_held_ladder |= {m.ticker for m in members_sorted
                                if m.ticker in add_on_tickers}
 
@@ -4059,12 +4169,19 @@ def find_time_series_pairs(
                 # means "this pair is tiered on close_time" (pair_gap_days).
                 stated_gap = None
 
-                # Before the group contest, so the next best pair can win. An
-                # exact held pair the run may add to passes here; its sides are
-                # checked once its legs are ordered, below. No lookup when
-                # there is no held pair to add to
-                add_on = (add_on_pairs.get(frozenset((mA.ticker, mB.ticker)))
+                # Before the group contest, so the next best pair can win. A
+                # candidate adding to an exact held pair or a lone held leg
+                # passes here; its sides are checked once its legs are
+                # ordered, below. No lookup when there is nothing to add to
+                add_on = (_add_on_for(add_on_pairs, add_on_tickers, mA.ticker, mB.ticker)
                           if add_on_pairs else None)
+                if add_on is not None and add_on.lone:
+                    # A lone leg pairs with a new market, which may sit on the
+                    # leg's own held ladders but on no other held ladder
+                    new_market = mB if mA.ticker == add_on.sides[0][0] else mA
+                    if (ladder_keys(new_market.event_ticker, norm_title)
+                            & (held_ladders - add_on.labels)):
+                        add_on = None
                 if add_on is None and (mA.ticker in on_held_ladder
                                        or mB.ticker in on_held_ladder):
                     held_ladder_skips += 1
@@ -4611,24 +4728,26 @@ def find_same_title_pairs(
     a group's best candidate PROMOTES its runner-up.
 
     A market of an exact held pair in add_on_pairs pairs only with its own
-    partner: every other candidate touching it is refused first, before every
-    other check and before the group contest, so the group's next best pair
-    can still win. The held pair itself is judged by every rule above, and is
-    refused too when its prices have crossed so that it would buy the other
-    way round from what is held (HeldPair.matches); a kept one carries the
-    HeldPair on CandidatePair.held.
+    partner, and a lone held leg in add_on_pairs (its partner paid out) only
+    with a market the account does not hold: every other candidate touching
+    one is refused first, before every other check and before the group
+    contest, so the group's next best pair can still win. A pair that adds
+    to either is judged by every rule above, and is refused too when its
+    prices have crossed so that it would buy a held market on the other side
+    from what is held (HeldPair.matches); a kept one carries the HeldPair on
+    CandidatePair.held.
 
     Args:
         markets (list): ApiMarket objects to scan (already fetched by the
             caller — unlike find_time_series_pairs, this function never
             fetches).
         held_tickers (set | None): Tickers to exclude: the held positions,
-            less the two markets of each held pair in add_on_pairs (which
-            must stay in for that pair to form). None or empty means exclude
+            less the markets in add_on_pairs (which must stay in for a pair
+            to add to them). None or empty means exclude nothing.
+        add_on_pairs (dict | None): Keyword-only. What this run may add to,
+            from held_pairs: {frozenset of the held tickers: HeldPair}, two
+            for an exact pair, one for a lone leg. None or empty adds to
             nothing.
-        add_on_pairs (dict | None): Keyword-only. The exact held pairs this run
-            may add to, from held_pairs: {frozenset of two tickers: HeldPair}.
-            None or empty adds to nothing.
 
     Returns:
         list: CandidatePair objects, one per (event_title, title, subtitle)
@@ -4701,7 +4820,8 @@ def find_same_title_pairs(
                 # to add to
                 add_on = None
                 if add_on_pairs:
-                    add_on = add_on_pairs.get(frozenset((m_outer.ticker, m_inner.ticker)))
+                    add_on = _add_on_for(add_on_pairs, add_on_tickers,
+                                         m_outer.ticker, m_inner.ticker)
                     if add_on is None and (m_outer.ticker in add_on_tickers
                                            or m_inner.ticker in add_on_tickers):
                         held_skips += 1

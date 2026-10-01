@@ -2896,7 +2896,9 @@ def held_pair_fraction(fraction: float, held_stake: float, portfolio_value: floa
     Return the fraction of the portfolio value an add-on to a held pair may take.
 
     An add-on buys more of a pair the account already holds: the same two
-    markets, the same side on each (scanner.HeldPair). Kelly sizes the whole
+    markets, the same side on each (scanner.HeldPair), or a new pair beside a
+    lone held leg whose partner has paid out, buying that market on its held
+    side (the lone leg is then "the pair" below). Kelly sizes the whole
     position: the pair should hold `fraction` of the portfolio value in all,
     where `fraction` is what a new pair would get (min(Kelly f*, the pair's
     cap)). The add-on buys what is missing, and never more than a new pair
@@ -2918,8 +2920,9 @@ def held_pair_fraction(fraction: float, held_stake: float, portfolio_value: floa
             stake: min(f*, pair_size_cap(...)), in (0, 1].
         held_stake (float): What the held pair already stakes, in dollars: its
             worth plus the fees paid for it (live: HeldPair.stake_dollars, the
-            worth at today's prices plus both markets' fees; the backtest: the
-            pair's open contracts at their cost plus their fees).
+            worth at today's prices plus its held markets' fees, one market's
+            for a lone leg; the backtest: the pair's open trades, or the lone
+            leg alone, at market plus their fees).
         portfolio_value (float): The value the run sizes on, in dollars: cash
             plus open positions.
 

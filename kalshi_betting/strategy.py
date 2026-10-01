@@ -875,14 +875,15 @@ def select_portfolio(specs: list, cash_cents: int, *,
     rules; change both together.
 
     Markets the account holds are kept out upstream (main._run_prod),
-    except the two markets of a held pair the run adds to. Such an add-on
-    (its pair.held, read through scanner.pair_held, names the spec's own two
-    tickers and the side bought on each: HeldPair.matches) is blocked only by
-    the ladders of specs picked earlier in this run: the held ladders it
-    meets are its own, since scanner.held_pairs lets a run add only to a pair
-    no other held market shares a ladder with. A shrunk add-on is still an
-    add-on: it keeps its held pair and claims its tickers and ladders like
-    any pick.
+    except the markets the run adds to: the two of a held pair, or one lone
+    held leg whose partner has paid out. Such an add-on (its pair.held, read
+    through scanner.pair_held, is held on the spec's own markets with the
+    side bought on each: HeldPair.matches) is blocked only by the ladders of
+    specs picked earlier in this run: the held ladders it meets are its own,
+    since scanner.held_pairs lets a run add only to markets no other held
+    market shares a ladder with. A lone leg's new market is also blocked by
+    any other held ladder it meets. A shrunk add-on is still an add-on: it
+    keeps its held pair and claims its tickers and ladders like any pick.
 
     Args:
         specs (list): TradeSpecs from compute_trade.
@@ -919,12 +920,16 @@ def select_portfolio(specs: list, cash_cents: int, *,
             continue
         keys = pair_ladder_keys(spec.pair)
         # At most one open time-series trade per ladder; an add-on meets only
-        # this run's earlier picks, and only when the held pair it carries is
-        # the spec's own two markets, each bought on its held side
+        # this run's earlier picks, and only when what it carries is held on
+        # the spec's own markets, each bought on its held side
         held = pair_held(spec.pair)
         is_add_on = held is not None and held.matches(
             spec.pair.market_a, spec.pair.market_b, spec.pair.pair_type)
         blocking = picked_ladders if is_add_on else used_ladders
+        if is_add_on and held.lone:
+            # A lone held leg's new market may meet the leg's own held ladders
+            # and no other held one
+            blocking = picked_ladders | (set(held_ladders) - held.labels)
         if spec.pair.pair_type == "time_series" and keys & blocking:
             ladder_skips += 1
             continue

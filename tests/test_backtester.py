@@ -10043,8 +10043,9 @@ class TestAddToHeldPairs:
         assert self._lines(caplog, "Time-series pairs skipped on a Monday") == []
 
     def test_an_add_on_needs_both_markets_unpaid(self):
-        # PA pays out on 01-10, before Monday 2; PB stays open. Live, a held
-        # pair with one leg paid out is no pair, so nothing is added
+        # PA pays out on 01-10, before Monday 2; PB stays open. The same pair
+        # cannot be bought again once PA has paid out (a new pair may still
+        # add to PB alone: TestAddToALoneLeg)
         p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-01-10"),
                            _ladder_market("PB", "EVB-1", "2026-03-20"), "q",
                            [(_LADDER_M1, *self._NARROW), (_LADDER_M2, *self._WIDE)])
@@ -10150,6 +10151,81 @@ class TestAddToHeldPairs:
                                    "floors off, all, adding to held pairs:")
         prefixes = _completion_prefixes(lines)
         assert len(prefixes) == len(set(prefixes)) == 5
+
+
+@pytest.mark.usefixtures("pre_toggle_defaults")
+class TestAddToALoneLeg:
+    """With add_to_held, once an open trade's other market has paid out its
+    remaining leg is a lone leg, as live's scanner.held_pairs finds it: a new
+    pair buying the side held on that market, beside a market no open trade
+    holds, may add to it, sized by config.held_pair_fraction with that leg
+    alone as the stake (its value plus its fee). Another open trade on a
+    ladder of either market refuses it, and so does buying the held market
+    on its other side. Figures are at pre_toggle_defaults."""
+
+    _START = TestAddToHeldPairs._START
+    _sim = TestAddToHeldPairs._sim
+    _lines = staticmethod(TestAddToHeldPairs._lines)
+    _NARROW, _WIDE = TestAddToHeldPairs._NARROW, TestAddToHeldPairs._WIDE
+
+    @staticmethod
+    def _held_and_new(*, new_event="EVQ-1"):
+        """P (YES PA / NO PB) on Monday 1, PA paying out on 01-10; Q (YES QA / NO PB) on Monday 2."""
+        pb = _ladder_market("PB", "EVB-1", "2026-03-20")
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-01-10"), pb, "q",
+                           [(_LADDER_M1, *TestAddToALoneLeg._NARROW)])
+        q = _ladder_record(_ladder_market("QA", new_event, "2026-03-20"), pb, "q",
+                           [(_LADDER_M2, *TestAddToALoneLeg._WIDE)])
+        return p, q
+
+    def test_a_new_pair_adds_to_the_leg_left_open(self, caplog):
+        p, q = self._held_and_new()
+        # CONTROL: without adding, PB is still held, so Q never trades
+        assert _traded(self._sim([p, q], k=0.85)) == [("PA", _LADDER_M1)]
+        with caplog.at_level(logging.INFO):
+            on = self._sim([p, q], k=0.85, add_to_held=True)
+        assert _traded(on) == [("PA", _LADDER_M1), ("QA", _LADDER_M2)]
+        first, add = on.trades
+        assert (first.add_on, add.add_on) == (False, True)
+        # The stake is PB's leg alone: its contracts at the NO price paid
+        # (the record carries no quotes) plus the fee paid on that leg
+        stake = first.n * first.entry_nB + fee_leg_exact(first.n, first.entry_nB)
+        f_q = _uncapped_kelly({"pair_type": "time_series", "entry": q["entry"]}, 0.85)
+        assert add.kelly_fraction == pytest.approx(
+            held_pair_fraction(f_q, stake, add.balance_at_entry), abs=1e-12)
+        # Less than the whole first trade's stake, which still counts PA
+        assert stake < first.total_cost + first.fees
+        assert self._lines(caplog, _ADD_ON_LINE) == [
+            _ADD_ON_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
+
+    def test_the_leg_is_not_lone_while_its_partner_is_open(self):
+        # PA pays out with PB: on Monday 2 the pair is still whole, so Q,
+        # which shares PB, is refused
+        pb = _ladder_market("PB", "EVB-1", "2026-03-20")
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-03-20"), pb, "q",
+                           [(_LADDER_M1, *self._NARROW)])
+        q = _ladder_record(_ladder_market("QA", "EVQ-1", "2026-03-20"), pb, "q",
+                           [(_LADDER_M2, *self._WIDE)])
+        assert _traded(self._sim([p, q], k=0.85, add_to_held=True)) == [("PA", _LADDER_M1)]
+
+    def test_buying_the_held_market_on_its_other_side_is_refused(self):
+        # R buys YES on PB, which the open trade holds NO on
+        p, _q = self._held_and_new()
+        r = _ladder_record(p["entry"]["mB"], _ladder_market("RB", "EVR-1", "2026-03-25"), "q",
+                           [(_LADDER_M2, *self._WIDE)])
+        assert _traded(self._sim([p, r], k=0.85, add_to_held=True)) == [("PA", _LADDER_M1)]
+
+    def test_another_open_trade_on_the_new_markets_ladder_refuses_it(self, caplog):
+        # S, open since Monday 1, holds QA's event: adding there would stack beside S
+        p, q = self._held_and_new(new_event="EVS-1")
+        s = _ladder_record(_ladder_market("SA", "EVS-1", "2026-03-20"),
+                           _ladder_market("SB", "EVT-1", "2026-03-20"), "s",
+                           [(_LADDER_M1, *self._NARROW)])
+        with caplog.at_level(logging.INFO):
+            on = self._sim([p, s, q], k=0.85, add_to_held=True)
+        assert sorted(_traded(on)) == [("PA", _LADDER_M1), ("SA", _LADDER_M1)]
+        assert self._lines(caplog, _ADD_ON_LADDER_LINE) == [
+            _ADD_ON_LADDER_LINE + "k=0.850, band 0-1, all, adding to held pairs): 1"]
 
 
 @pytest.mark.usefixtures("pre_toggle_defaults")

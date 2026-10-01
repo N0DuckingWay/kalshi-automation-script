@@ -2879,8 +2879,9 @@ class TestTimeSeriesKellyParity:
         assert homes == {writer, reader}
         assert _function_calls(backtester, "_prepare_entries", "_attach_leg_quotes")
         assert _function_calls(backtester, "_sweep_from_candidates", "_attach_leg_quotes")
-        # One valuation at a checkpoint (_open_value) and one day-end path
-        # (_open_value_path): a quote is read only there. The equity curve,
+        # One quote read at a checkpoint (_leg_mark, for _open_value and
+        # _open_leg_stake) and one day-end path (_open_value_path): a quote is
+        # read only there. The equity curve,
         # the dashboard's per-type lines and its risk-free hurdle reach the
         # path through _carry_steps / _value_steps.
         tree = ast.parse(inspect.getsource(backtester))
@@ -2891,8 +2892,12 @@ class TestTimeSeriesKellyParity:
                     if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
                             and sub.func.attr in readers):
                         readers[sub.func.attr].add(func.name)
-        assert readers == {"at_checkpoint": {"_open_value"},
+        assert readers == {"at_checkpoint": {"_leg_mark"},
                            "day_values": {"_open_value_path"}}
+        # Both checkpoint valuations read a leg's quote through _leg_mark: a
+        # whole trade (_open_value) and one lone leg (_open_leg_stake)
+        assert _function_calls(backtester, "_open_value", "_leg_mark")
+        assert _function_calls(backtester, "_open_leg_stake", "_leg_mark")
         assert _function_calls(backtester, "_carry_steps", "_open_value_path")
         assert _function_calls(backtester, "_value_steps", "_open_value_path")
         assert _function_calls(backtester, "_build_equity_curve", "_carry_steps")
@@ -3545,6 +3550,37 @@ class TestSelectPortfolioAddOns:
                                   fees_dollars=0.9)
         held = scanner.pair_ladder_keys(spec.pair)
         assert select_portfolio([spec], 100_000, held_ladders=held) == []
+
+    @staticmethod
+    def _lone_spec(new_market, held_market, *, ratio: float = 0.10) -> TradeSpec:
+        """A time-series spec adding to a lone held NO leg on held_market (its partner paid out)."""
+        spec = _ladder_spec(new_market, held_market, ratio=ratio)
+        spec.pair.held = HeldPair(sides=((held_market.ticker, "no"),), count=30.0,
+                                  cost_dollars=12.5, value_dollars=13.5, fees_dollars=0.5,
+                                  labels=scanner.market_ladder_keys(held_market))
+        return spec
+
+    def test_an_add_on_to_a_lone_leg_is_taken_beside_its_own_held_ladders(self, caplog):
+        # NO is held on the last rung only; a new rung on the same ladder adds to it
+        spec = self._lone_spec(_R2, _R4)
+        held = scanner.market_ladder_keys(_R4)
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([spec], 100_000, held_ladders=held) == [spec]
+        assert "on the same ladder" not in caplog.text
+
+    def test_a_lone_legs_new_market_on_another_held_ladder_is_refused(self, caplog):
+        # Another held market sits on the new rung's ladder, beyond the leg's own
+        other = _ladder_market("OTHER-1", "KXOTHER-1", "Will it rain by March 5, 2026?")
+        new = _ladder_market("STAR-NEW", "KXOTHER-1", _STAR % "March 12, 2026")
+        spec = self._lone_spec(new, _R4)
+        held = scanner.market_ladder_keys(_R4) | scanner.market_ladder_keys(other)
+        assert scanner.market_ladder_keys(new) & scanner.market_ladder_keys(other)
+        with caplog.at_level(logging.INFO):
+            assert select_portfolio([spec], 100_000, held_ladders=held) == []
+        assert self._LADDER_LINE + "1" in caplog.text
+        # CONTROL: with only the leg's own ladders held, it is taken
+        assert select_portfolio([spec], 100_000,
+                                held_ladders=scanner.market_ladder_keys(_R4)) == [spec]
 
     def test_an_add_on_picked_first_claims_its_ladder(self):
         # Two add-ons on one ladder: held_pairs never builds this, but the

@@ -3770,7 +3770,8 @@ class TestRunProdAddsToHeldPairsLive:
 
     @staticmethod
     def _run(monkeypatch, caplog, *, add_on: bool, held, killed=frozenset(),
-             mapping_confirmed: bool = True, same_title: bool = True):
+             mapping_confirmed: bool = True, same_title: bool = True,
+             lone_no: str | None = None):
         """
         Run one live production run against a stand-in exchange that keeps a ledger.
 
@@ -3795,6 +3796,9 @@ class TestRunProdAddsToHeldPairsLive:
                 NO fill is checked).
             same_title (bool): Keyword-only. False leaves out the run's one
                 same-title pair, so the ladder pair is the only one sent.
+            lone_no (str | None): Keyword-only. With held None, a ticker held
+                NO alone (30 contracts; its partner has paid out), valued by
+                the balance reply at $18.00.
 
         Returns:
             tuple[int, list, list, dict]: The exit code, the run's results,
@@ -3813,6 +3817,10 @@ class TestRunProdAddsToHeldPairsLive:
                 {"ticker": no_ticker, "position_fp": "-30.00",
                  "market_exposure_dollars": "18.00", "fees_paid_dollars": "0.50"},
             )
+        elif lone_no is not None:
+            positions[lone_no] = Decimal(-30)
+            held_rows = ({"ticker": lone_no, "position_fp": "-30.00",
+                          "market_exposure_dollars": "18.00", "fees_paid_dollars": "0.50"},)
         sent: list = []
 
         def orders(verb, url, headers=None, body=None):
@@ -3835,7 +3843,8 @@ class TestRunProdAddsToHeldPairsLive:
         client = _live_shape_client(
             monkeypatch,
             balance_payload={**_LIVE_BALANCE_PAYLOAD,
-                             "portfolio_value": 2_400 if held is not None else 0},
+                             "portfolio_value": (2_400 if held is not None
+                                                 else 1_800 if lone_no is not None else 0)},
             include_held_position=False, extra_events=_LADDER_EVENTS,
             held_rows=held_rows, order_side_effect=orders,
             position_lookup_responses={t: reader(t) for t in positions})
@@ -3873,6 +3882,31 @@ class TestRunProdAddsToHeldPairsLive:
         """(ticker, side, reduce_only) of every order sent on the ladder, in order."""
         return [(b["ticker"], b["side"], b["reduce_only"]) for b in sent
                 if b["ticker"] in _LADDER_TICKERS]
+
+    def test_a_lone_leg_adds_only_beside_its_held_side(self, monkeypatch, caplog):
+        """
+        NO is held on Dec 20 alone (the Dec 13 YES it was bought with has
+        paid out). Adding on, the run trades YES on Dec 13 beside NO on Dec
+        20, for the new contracts only; Dec 20 / Dec 27 would buy YES on Dec
+        20 and Dec 13 / Dec 27 holds neither, so neither is sent. Adding off,
+        no ladder order is sent.
+        """
+        l13, l20, _l27 = _LADDER_TICKERS
+        _code, results, sent, positions = self._run(
+            monkeypatch, caplog, add_on=True, held=None, lone_no=l20, same_title=False)
+        assert self._ladder_orders(sent) == [(l20, "ask", False), (l13, "bid", False)]
+        [result] = self._ladder(results)
+        assert result.status == "executed"
+        held = result.spec.pair.held
+        assert held is not None and held.lone and held.sides == ((l20, "no"),)
+        # The new contracts only: Dec 20 holds its 30 plus them, Dec 13 only them
+        assert positions[l20] == -30 - result.spec.x
+        assert positions[l13] == result.spec.x
+        assert "Held markets to add to whose partner has paid out: 1" in caplog.text
+        # Adding off: Dec 20 stays blocked and nothing is sent on the ladder
+        _code, results, sent, _positions = self._run(
+            monkeypatch, caplog, add_on=False, held=None, lone_no=l20, same_title=False)
+        assert self._ladder_orders(sent) == []
 
     def test_on_trades_only_yes_13_and_no_20(self, monkeypatch, caplog):
         """

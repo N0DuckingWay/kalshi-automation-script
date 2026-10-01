@@ -2534,11 +2534,13 @@ def _add_on_mismatch(spec: TradeSpec, no_leg: _Leg, yes_leg: _Leg,
     """
     Say why an add-on must not be sent, or None when it may (or adds to nothing).
 
-    An add-on is a pair that adds to a pair the account already holds
-    (scanner.pair_held). It may buy only NO on the ticker the account holds
-    NO on and YES on the ticker it holds YES on, and only while each market
-    still holds exactly the held pair's count (-count on the NO market,
-    +count on the YES market), read just before the NO leg is sent. A
+    An add-on is a pair that adds to what the account already holds
+    (scanner.pair_held): an exact held pair, or a lone held leg whose partner
+    has paid out. On each held market it may buy only the side held there
+    (NO on the ticker held NO, YES on the ticker held YES), and only while
+    that market still holds exactly the held count (-count on a NO market,
+    +count on a YES market), read just before the NO leg is sent. Beside a
+    lone leg, the other market is new and must still hold nothing. A
     position that could not be read, or that did not read as a finite number
     (the positions listing sent something like "nan"), counts as changed. An
     ordinary pair (pair_held is None) is never refused here.
@@ -2564,16 +2566,29 @@ def _add_on_mismatch(spec: TradeSpec, no_leg: _Leg, yes_leg: _Leg,
         return None
     held_sides = dict(held.sides)
     for leg in (no_leg, yes_leg):
+        # Beside a lone leg, one market is new and holds no side
+        if held.lone and leg.market.ticker not in held_sides:
+            continue
         if held_sides.get(leg.market.ticker) != leg.side:
             return f"the account does not hold {leg.side.upper()} on {leg.market.ticker}"
-    # What each market must still hold: NO contracts read negative. A reading
-    # that is not a finite number compares unequal to nothing, so it is
-    # refused here as unread rather than let through by the test below
-    for leg, before, expected in ((no_leg, before_no, -held.count),
-                                  (yes_leg, before_yes, held.count)):
+    # A lone leg's own market must be one of the two bought
+    if not held_sides.keys() & {no_leg.market.ticker, yes_leg.market.ticker}:
+        return f"the pair does not buy the held market {held.sides[0][0]}"
+    # What each market must still hold: NO contracts read negative, and a new
+    # market beside a lone leg nothing. A reading that is not a finite number
+    # compares unequal to nothing, so it is refused here as unread rather
+    # than let through by the test below
+    for leg, before in ((no_leg, before_no), (yes_leg, before_yes)):
+        if leg.market.ticker in held_sides:
+            expected = -held.count if leg.side == "no" else held.count
+        else:
+            expected = 0.0
         if before is None or not math.isfinite(before):
             return f"the position on {leg.market.ticker} could not be read"
         if abs(before - expected) >= _DELTA_EPS:
+            if leg.market.ticker not in held_sides:
+                return (f"{leg.market.ticker} now holds {_held_words(before)};"
+                        " it was not held")
             return (f"{leg.market.ticker} now holds {_held_words(before)};"
                     f" the held pair had {_held_words(expected)}")
     return None
@@ -2601,10 +2616,11 @@ def _execute_one(client: Any, spec: TradeSpec) -> TradeResult:
     is single-shot (_position_count_once); the YES leg's is retried like the
     read beside it, since a failed re-read would leave the NO leg unhedged.
 
-    A pair that adds to a held pair (scanner.pair_held) is checked after
-    those two reads and before anything is sent (_add_on_mismatch): unless
-    each leg buys the side held on its market and both positions still read
-    the held count, nothing is sent and the pair is "failed", "not sent:
+    A pair that adds to a held pair or a lone held leg (scanner.pair_held) is
+    checked after those two reads and before anything is sent
+    (_add_on_mismatch): unless each held market is bought on its held side
+    and still reads the held count (and a new market beside a lone leg reads
+    nothing), nothing is sent and the pair is "failed", "not sent:
     this does not match the held pair it adds to (...)". An ordinary pair is
     never refused there.
 

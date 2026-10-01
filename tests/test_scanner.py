@@ -5702,6 +5702,122 @@ class TestFinderAddsToHeldPairs:
         assert pair_held(pair) is not None
 
 
+def _lone(ticker: str, side: str, labels: frozenset, count: float = 30.0) -> HeldPair:
+    """A lone held leg (its partner paid out) the run may add to."""
+    return HeldPair(sides=((ticker, side),), count=count, cost_dollars=12.5,
+                    value_dollars=13.5, fees_dollars=0.5, labels=labels)
+
+
+class TestFinderAddsToALoneLeg:
+    """find_time_series_pairs lets a new pair add to a lone held leg (its
+    partner paid out): the held market bought on its held side, beside a
+    market the account does not hold that sits on no held ladder but the
+    leg's own. Every other candidate on the leg's ladder is still refused."""
+
+    _scan = staticmethod(TestFinderAddsToHeldPairs._scan)
+
+    @staticmethod
+    def _rungs(monkeypatch, *, mid_event="KXSTARSHIP-14"):
+        """Three rungs of one question; the account holds a lone leg on the last."""
+        monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", True)
+        early = _ladder_rung("RUNG-A", "by March 1, 2026", yes_ask=0.20, no_ask=0.80,
+                             close=datetime(2026, 3, 1, tzinfo=UTC))
+        mid = _ladder_rung("RUNG-B", "by March 10, 2026", event=mid_event,
+                           yes_ask=0.40, no_ask=0.60, close=datetime(2026, 3, 10, tzinfo=UTC))
+        late = _ladder_rung("RUNG-C", "by March 20, 2026", yes_ask=0.60, no_ask=0.40,
+                            close=datetime(2026, 3, 20, tzinfo=UTC))
+        _assert_one_ladder_group(early, late)
+        # One question, though the middle rung may be listed under another event
+        assert time_series_group_key(pair_key(mid), mid.subtitle) == \
+            time_series_group_key(pair_key(late), late.subtitle)
+        return early, mid, late
+
+    @staticmethod
+    def _lone_late(late, side="no"):
+        """The held ladders and the lone leg on the last rung."""
+        labels = market_ladder_keys(late)
+        return labels, {frozenset({late.ticker}): _lone(late.ticker, side, labels)}
+
+    def test_a_new_rung_adds_to_the_lone_leg(self, monkeypatch, caplog):
+        # The first rung's partner paid out; the run pairs the middle rung,
+        # not held, with the held NO on the last
+        _early, mid, late = self._rungs(monkeypatch)
+        held, add_ons = self._lone_late(late)
+        with caplog.at_level(logging.INFO):
+            [pair] = self._scan([mid, late], held_ladders=held, add_on_pairs=add_ons)
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("RUNG-B", "RUNG-C")
+        assert pair.held is add_ons[frozenset({"RUNG-C"})]
+        assert _ADD_ON_LINE + "1" in caplog.text
+
+    def test_two_unheld_rungs_still_never_pair_on_the_held_ladder(self, monkeypatch, caplog):
+        # Both other rungs may pair with the lone leg; the pair of the two
+        # unheld rungs is refused, and the widest add-on wins the group
+        early, mid, late = self._rungs(monkeypatch)
+        held, add_ons = self._lone_late(late)
+        with caplog.at_level(logging.INFO):
+            [pair] = self._scan([early, mid, late], held_ladders=held, add_on_pairs=add_ons)
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("RUNG-A", "RUNG-C")
+        assert pair_held(pair) is not None
+        assert _HELD_LINE + "1" in caplog.text
+
+    def test_a_lone_leg_held_on_the_other_side_is_refused(self, monkeypatch, caplog):
+        # YES held on the last rung: every candidate would buy NO there
+        early, mid, late = self._rungs(monkeypatch)
+        held, add_ons = self._lone_late(late, side="yes")
+        with caplog.at_level(logging.INFO):
+            assert self._scan([early, mid, late], held_ladders=held,
+                              add_on_pairs=add_ons) == []
+        assert _SIDE_LINE + "2" in caplog.text
+        assert _HELD_LINE + "1" in caplog.text
+
+    def test_a_new_market_on_another_held_ladder_is_refused(self, monkeypatch, caplog):
+        # The middle rung is listed under another event, which another held
+        # market sits on: adding there would stack a trade beside that one
+        _early, mid, late = self._rungs(monkeypatch, mid_event="KXOTHER-14")
+        held, add_ons = self._lone_late(late)
+        other_held = held | {("event", "KXOTHER-14")}
+        assert ("event", "KXOTHER-14") in market_ladder_keys(mid)
+        with caplog.at_level(logging.INFO):
+            assert self._scan([mid, late], held_ladders=other_held, add_on_pairs=add_ons) == []
+        assert _HELD_LINE + "1" in caplog.text
+        # CONTROL: with only the lone leg's own ladders held, the pair forms
+        [pair] = self._scan([mid, late], held_ladders=held, add_on_pairs=add_ons)
+        assert pair_held(pair) is not None
+
+
+class TestAddOnFor:
+    """_add_on_for finds what a candidate adds to: an exact pair by its two
+    tickers, a lone leg by its one, never a candidate touching two held
+    markets that are not one exact pair."""
+
+    _PAIR = HeldPair(sides=(("P-A", "yes"), ("P-B", "no")), count=5.0, cost_dollars=3.0,
+                     value_dollars=3.0, fees_dollars=0.1)
+    _LONE = _lone("L-1", "no", frozenset({("event", "L")}))
+    _ADD_ONS = {frozenset({"P-A", "P-B"}): _PAIR, frozenset({"L-1"}): _LONE,
+                frozenset({"M-1"}): _lone("M-1", "yes", frozenset({("event", "M")}))}
+    _TICKERS = {"P-A", "P-B", "L-1", "M-1"}
+
+    def _find(self, a, b):
+        return scanner._add_on_for(self._ADD_ONS, self._TICKERS, a, b)
+
+    def test_an_exact_pair_by_its_two_tickers(self):
+        assert self._find("P-B", "P-A") is self._PAIR
+
+    def test_a_lone_leg_beside_a_new_market(self):
+        assert self._find("NEW-1", "L-1") is self._LONE
+        assert self._find("L-1", "NEW-1") is self._LONE
+
+    @pytest.mark.parametrize("a, b", [
+        ("L-1", "M-1"),     # two lone legs
+        ("L-1", "P-A"),     # a lone leg and a pair's market
+        ("P-A", "NEW-1"),   # a pair's market beside a new one
+        ("L-1", "L-1"),     # one ticker named twice
+        ("NEW-1", "NEW-2"),
+    ])
+    def test_anything_else_adds_to_nothing(self, a, b):
+        assert self._find(a, b) is None
+
+
 _ST_HELD_LINE = ("Same-title candidates refused because they pair a held pair's market "
                  "with another market: ")
 _ST_SIDE_LINE = ("Same-title candidates refused for buying a held pair's sides the wrong "
@@ -5764,6 +5880,25 @@ class TestSameTitleAddsToHeldPairs:
         with caplog.at_level(logging.INFO):
             [pair] = find_same_title_pairs(markets, add_on_pairs=self._ADD_ONS)
         assert (pair.market_a.ticker, pair.market_b.ticker) == ("Z-1", "W-1")
+        assert _ST_SIDE_LINE + "1" in caplog.text
+
+    def test_a_lone_leg_pairs_with_a_market_not_held(self):
+        # X paid out; YES is still held on Y, which pairs with Z (NO on the
+        # pricier Z, YES on Y)
+        lone = {frozenset({"Y-1"}): _lone("Y-1", "yes", frozenset(), count=10.0)}
+        _x, y = self._held_pair()
+        z, _w = self._other_pair(0.60, 0.45)
+        [pair] = find_same_title_pairs([y, z], add_on_pairs=lone)
+        assert (pair.market_a.ticker, pair.market_b.ticker) == ("Z-1", "Y-1")
+        assert pair.held is lone[frozenset({"Y-1"})]
+
+    def test_a_lone_leg_bought_on_the_other_side_is_refused(self, caplog):
+        # Y is the pricier market now, so the pair would buy NO on Y
+        lone = {frozenset({"Y-1"}): _lone("Y-1", "yes", frozenset(), count=10.0)}
+        _x, y = self._held_pair(y_yes=0.60)
+        z, _w = self._other_pair(0.40, 0.45)
+        with caplog.at_level(logging.INFO):
+            assert find_same_title_pairs([y, z], add_on_pairs=lone) == []
         assert _ST_SIDE_LINE + "1" in caplog.text
 
     def test_an_empty_add_on_set_changes_nothing(self, caplog):
@@ -7294,9 +7429,29 @@ class TestHeldPairs:
                      mid.ticker: _held(mid.ticker, 5.0, 2.0, 0.1)}
         assert held_pairs(positions, labels, {**self._rung_markets(), **self._listed(mid)}) == {}
 
-    def test_one_leg_alone_is_never_added_to(self):
-        positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 6.0, 0.4)}
-        assert held_pairs(positions, self._ladder(), self._rung_markets()) == {}
+    def test_a_lone_leg_whose_partner_paid_out_is_added_to(self):
+        # The early rung paid out and left the positions listing; the late
+        # rung, alone on its ladder, may be added to, staked at its own worth
+        # at today's NO ask plus its own fee (its partner's payout is cash)
+        positions = {_RUNG_LATE: _held(_RUNG_LATE, -30.0, 12.0, 0.5)}
+        [(key, leg)] = held_pairs(positions, self._ladder(), self._rung_markets()).items()
+        assert key == frozenset({_RUNG_LATE})
+        assert leg.lone and leg.sides == ((_RUNG_LATE, "no"),)
+        assert leg.count == 30.0
+        assert leg.cost_dollars == pytest.approx(12.5)
+        assert leg.value_dollars == 30.0 * 0.45
+        assert leg.fees_dollars == 0.5
+        assert leg.stake_dollars == 30.0 * 0.45 + 0.5
+        assert leg.labels == self._ladder()[_RUNG_LATE]
+
+    @pytest.mark.parametrize("position", [
+        _held(_RUNG_LATE, None, 12.0, 0.5),       # unreadable count
+        _held(_RUNG_LATE, -30.0, None, 0.5),      # unreadable exposure
+        _held(_RUNG_LATE, -30.0, 12.0, None),     # unreadable fees
+        _held(_RUNG_LATE, -30.0, 0.0, 0.5),       # an exposure no contract could cost
+    ], ids=["count", "exposure", "fees", "zero-exposure"])
+    def test_a_lone_leg_with_an_unreadable_figure_is_never_added_to(self, position):
+        assert held_pairs({_RUNG_LATE: position}, self._ladder(), self._rung_markets()) == {}
 
     def test_a_market_without_labels_joins_nothing(self):
         positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 6.0, 0.4),
@@ -7338,10 +7493,16 @@ class TestHeldPairs:
                      "KXSNOW-1": _held("KXSNOW-1", None, None, None)}
         labels = {**self._ladder(), "KXRAIN-1": frozenset({("event", "KXRAIN")}),
                   "KXSNOW-1": frozenset({("event", "KXSNOW")})}
-        [pair] = held_pairs(positions, labels, self._rung_markets()).values()
+        found = held_pairs(positions, labels, self._rung_markets())
+        pair = found[frozenset({_RUNG_EARLY, _RUNG_LATE})]
         assert pair.value_dollars == 22.5
         assert pair.fees_dollars == 0.4 + 0.5
         assert pair.stake_dollars == 22.5 + (0.4 + 0.5)
+        # KXRAIN-1, alone on its ladder, is a lone leg of its own, valued
+        # apart (at its exposure: this run does not list it); the unreadable
+        # KXSNOW-1 is never added to
+        assert found[frozenset({"KXRAIN-1"})].stake_dollars == 5.0 + 0.2
+        assert set(found) == {frozenset({_RUNG_EARLY, _RUNG_LATE}), frozenset({"KXRAIN-1"})}
 
     @pytest.mark.parametrize("raw", [
         None, "", "abc", "0", "0.00", "1", "1.00", "1.5", "-0.20", "nan", "inf", True,
@@ -7401,17 +7562,22 @@ class TestHeldPairs:
     def test_the_run_says_what_it_may_add_to(self, caplog):
         positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 6.0, 0.4),
                      _RUNG_LATE: _held(_RUNG_LATE, -30.0, 12.0, 0.5),
-                     "KXRAIN-1": _held("KXRAIN-1", 7.0, 5.0, 0.2)}
-        labels = {**self._ladder(), "KXRAIN-1": frozenset({("event", "KXRAIN")})}
+                     "KXRAIN-1": _held("KXRAIN-1", 7.0, 5.0, 0.2),
+                     "KXSNOW-1": _held("KXSNOW-1", None, None, None)}
+        labels = {**self._ladder(), "KXRAIN-1": frozenset({("event", "KXRAIN")}),
+                  "KXSNOW-1": frozenset({("event", "KXSNOW")})}
         with caplog.at_level(logging.INFO):
             held_pairs(positions, labels, self._rung_markets())
-        # Exactly these lines: the pair with its cost (and the fees in it)
-        # and its worth today, then the count, and no sizing figure of
-        # held_pairs' own
+        # Exactly these lines: the lone leg and the pair, each with its cost
+        # (and the fees in it) and its worth today, then the counts, and no
+        # sizing figure of held_pairs' own
         assert [r.getMessage() for r in caplog.records] == [
+            "Held market to add to (its partner has paid out): YES KXRAIN-1, 7 contracts, "
+            "cost $5.20 (fees $0.20), worth $5.00 at today's prices",
             f"Held pair to add to: YES {_RUNG_EARLY} / NO {_RUNG_LATE}, 30 contracts each, "
             "cost $18.90 (fees $0.90), worth $22.50 at today's prices",
-            "Held pairs to add to: 1 (other held markets, never added to: 1)"]
+            "Held pairs to add to: 1 (other held markets, never added to: 1)",
+            "Held markets to add to whose partner has paid out: 1"]
 
     def test_the_count_line_is_logged_with_no_pair_too(self, caplog):
         with caplog.at_level(logging.INFO):
@@ -7452,6 +7618,17 @@ class TestHeldPairMatches:
 
     def test_a_mock_market_does_not_match(self):
         assert not self._PAIR.matches(MagicMock(), MagicMock(), "time_series")
+
+    def test_a_lone_leg_matches_its_held_side_beside_any_other_market(self):
+        lone = _lone("KX-C", "no", frozenset())
+        assert lone.lone and not self._PAIR.lone
+        # Time-series: NO is bought on market B, same-title on market A
+        assert lone.matches(_named("KX-NEW"), _named("KX-C"), "time_series")
+        assert lone.matches(_named("KX-C"), _named("KX-NEW"), "same_title")
+        # The held market bought on its other side, or not bought at all
+        assert not lone.matches(_named("KX-C"), _named("KX-NEW"), "time_series")
+        assert not lone.matches(_named("KX-A"), _named("KX-B"), "time_series")
+        assert not lone.matches(_named("KX-C"), _named("KX-C"), "time_series")
 
 
 class TestPairHeld:

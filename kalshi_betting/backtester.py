@@ -2433,14 +2433,66 @@ def _open_value(trade: BacktestTrade, day: date) -> float:
     """
     if trade.marks is None:
         return trade.total_cost
-    quotes_a, quotes_b = trade.marks
-    # Which side each leg holds (scanner.leg_sides, the one definition) and
+    return trade.n * (_leg_mark(trade, 0, day) + _leg_mark(trade, 1, day))
+
+
+def _leg_mark(trade: BacktestTrade, index: int, day: date) -> float:
+    """
+    What one contract of one leg of an open trade is worth at the checkpoint on `day`.
+
+    The one reader of a leg's checkpoint quote (LegQuotes.at_checkpoint),
+    shared by _open_value (both legs) and _open_leg_stake (one leg): the
+    latest usable ask of the side the leg holds, its payout once its market
+    has paid out, or its entry price before that side has had a usable ask,
+    or when the trade has no quotes at all.
+
+    Args:
+        trade (BacktestTrade): An open trade.
+        index (int): 0 for its market A leg, 1 for its market B leg.
+        day (date): A checkpoint date on the legs' weekly grid.
+
+    Returns:
+        float: The leg's value per contract, in dollars.
+
+    Raises:
+        ValueError: From LegQuotes.at_checkpoint, for a day off the legs'
+            checkpoint grid.
+    """
+    # Which side the leg holds (scanner.leg_sides, the one definition) and
     # what it cost, for a leg that has had no usable ask yet
-    side_a, side_b = leg_sides(trade.pair_type)
-    price_a, price_b = _leg_prices_for(trade.pair_type, trade.entry_pA, trade.entry_nA,
-                                       trade.entry_pB, trade.entry_nB)
-    return trade.n * (quotes_a.at_checkpoint(day, side_a, price_a)
-                      + quotes_b.at_checkpoint(day, side_b, price_b))
+    side = leg_sides(trade.pair_type)[index]
+    price = _leg_prices_for(trade.pair_type, trade.entry_pA, trade.entry_nA,
+                            trade.entry_pB, trade.entry_nB)[index]
+    if trade.marks is None:
+        return price
+    return trade.marks[index].at_checkpoint(day, side, price)
+
+
+def _open_leg_stake(trade: BacktestTrade, ticker: str, day: date) -> float:
+    """
+    What one leg of an open trade stakes at the checkpoint on `day`: its value at market plus its fee.
+
+    Read for a lone leg: once an open trade's other market has paid out, only
+    this leg is still held, as live's scanner.held_pairs counts a lone held
+    leg at its own worth plus its own fees (the other leg's payout is already
+    cash). The leg counts at the latest usable ask of the side it holds
+    (LegQuotes.at_checkpoint), or at its entry price when the trade has no
+    quotes, plus the exact fee paid on it (config.fee_leg_exact, the fee the
+    trade was charged for that leg).
+
+    Args:
+        trade (BacktestTrade): An open trade with a leg on `ticker`.
+        ticker (str): The leg's market.
+        day (date): A checkpoint date on the leg's weekly grid.
+
+    Returns:
+        float: The leg's stake in dollars.
+    """
+    index = 0 if trade.ticker_a == ticker else 1
+    # What the leg cost per contract, for the exact fee it was charged
+    price = _leg_prices_for(trade.pair_type, trade.entry_pA, trade.entry_nA,
+                            trade.entry_pB, trade.entry_nB)[index]
+    return trade.n * _leg_mark(trade, index, day) + fee_leg_exact(trade.n, price)
 
 
 # ─── Eligibility prefilter ─────────────────────────────────────────────────────
@@ -6582,6 +6634,44 @@ def _prepare_entries(
     return raw_entries, candidates.label_coverage
 
 
+def _lone_leg_records(open_legs: dict, active_tickers: set, market_a: dict,
+                      market_b: dict, day: date, pair_type: str) -> list[dict] | None:
+    """
+    Return the open leg records a new pair would add to as a lone leg, or None.
+
+    The backtest's twin of live's lone held leg (scanner.held_pairs): exactly
+    one of the pair's two markets is held, every open trade holding it has
+    had its other market pay out by `day`, and each holds the side this pair
+    buys there. The other market must be held by no open trade. Anything
+    else is no lone leg (None), and the pair is refused as before.
+
+    Args:
+        open_legs (dict): ticker -> open leg records (see _simulate_at_discount).
+        active_tickers (set): Tickers held by an open trade.
+        market_a (dict): The pair's market A.
+        market_b (dict): Its market B.
+        day (date): The checkpoint date.
+        pair_type (str): The pair's type; scanner.leg_sides says which side
+            each leg buys.
+
+    Returns:
+        list[dict] | None: The held market's open leg records, or None.
+    """
+    tickers = (market_a["ticker"], market_b["ticker"])
+    held = [index for index, ticker in enumerate(tickers) if ticker in active_tickers]
+    # Exactly one held market, which only open legs hold
+    if len(held) != 1 or tickers[held[0]] not in open_legs:
+        return None
+    index = held[0]
+    legs = open_legs[tickers[index]]
+    side = leg_sides(pair_type)[index]
+    # Every trade on it has had its other market pay out, and holds the side bought here
+    if all(leg["partner_paid_out"] <= day < leg["paid_out"] and leg["side"] == side
+           for leg in legs):
+        return legs
+    return None
+
+
 def _simulate_at_discount(
     raw_entries: list[dict],
     start_date: date,
@@ -6637,7 +6727,13 @@ def _simulate_at_discount(
     grows; a pair whose value has risen gets a smaller add-on, one whose
     value has fallen a larger one. Like every trade it spends at most the cash left, so it never
     stakes more than a new pair would. A pair that already holds that share
-    (a full-size pair) is skipped. A same-title pair then also keeps its
+    (a full-size pair) is skipped. Once an open trade's other market has paid
+    out, its remaining leg is a lone leg (live, scanner.held_pairs finds it
+    alone on its ladder): a new pair that buys the side held on that market,
+    beside a market no open trade holds, may add to it
+    (_lone_leg_records), refused when another open trade holds a ladder
+    label of either market, and sized by the same rule with that leg alone
+    as the stake (_open_leg_stake: its value at market plus its fee). A same-title pair then also keeps its
     later passing Mondays that have the first one's legs the same way round
     (its pricier side is decided again every Monday, and the other way round
     is the opposite trade); those can only add to its open trade, and only
@@ -7003,7 +7099,8 @@ def _simulate_at_discount(
     # that pair pays out) and at most one time-series pair is open per ladder
     # (freed the day each market pays out). Nothing is sold before it pays
     # out. With add_to_held, a pair still held may trade again as a new trade
-    # of its own (see the docstring).
+    # of its own, and a new pair may add to a held leg whose partner has paid
+    # out (see the docstring).
     trades: list[BacktestTrade] = []
     active_tickers: set[str] = set()
     cash = initial_balance
@@ -7027,6 +7124,10 @@ def _simulate_at_discount(
     # (its contracts plus fees), the day it pays out, and how many ladder
     # holds its own trades have taken
     open_pairs: dict[int, dict] = {}
+    # ...and each open leg by its market: the trade, the side it holds, its
+    # ladder labels, the day its market pays out and the day its partner's
+    # does — what a later add-on to a lone leg (its partner paid out) reads
+    open_legs: dict[str, list[dict]] = {}
     add_ons = add_on_cap_skips = add_on_ladder_skips = 0
 
     for c in candidates:
@@ -7065,6 +7166,14 @@ def _simulate_at_discount(
             # the same schedule as their cash
             for pid in [pid for pid, rec in open_pairs.items() if rec["until"] <= d]:
                 del open_pairs[pid]
+            # ...and every leg whose own market has paid out
+            for ticker in [t for t, legs in open_legs.items()
+                           if any(leg["paid_out"] <= d for leg in legs)]:
+                legs = [leg for leg in open_legs[ticker] if leg["paid_out"] > d]
+                if legs:
+                    open_legs[ticker] = legs
+                else:
+                    del open_legs[ticker]
 
         if d != checkpoint_date:
             # New checkpoint: value the portfolio as cash plus every open trade
@@ -7074,6 +7183,10 @@ def _simulate_at_discount(
             checkpoint_value = cash + sum(_open_value(t, d) for t in open_trades)
 
         held = None
+        # Set instead of held for an add-on to a lone leg: that leg's open records
+        lone_legs = None
+        mA, mB = c["mA"], c["mB"]
+        ladders_a, ladders_b = c["ladder_keys_a"], c["ladder_keys_b"]
         if c["pair_id"] in traded_pairs:
             # Traded before: only an add-on to its still-open trade may follow,
             # and only while neither of its markets has paid out (live finds a
@@ -7084,17 +7197,31 @@ def _simulate_at_discount(
         elif c["add_on_only"]:
             # A same-title pair's later Monday with nothing to add to
             continue
+        elif add_to_held and c["settled_date_a"] > d and c["settled_date_b"] > d:
+            # A new pair on one held market whose partner has paid out may add
+            # to that lone leg (live, scanner.held_pairs finds it alone)
+            lone_legs = _lone_leg_records(open_legs, active_tickers, mA, mB, d,
+                                          c["pair_type"])
 
-        mA, mB = c["mA"], c["mB"]
         # Skip if either ticker is still committed to a trade that hasn't
         # settled; an add-on's own trade holds its tickers, and the conflict
         # filter kept every other trade off them while it is open
-        if held is None and (mA["ticker"] in active_tickers
-                             or mB["ticker"] in active_tickers):
+        if held is None and lone_legs is None and (mA["ticker"] in active_tickers
+                                                   or mB["ticker"] in active_tickers):
             continue
 
-        ladders_a, ladders_b = c["ladder_keys_a"], c["ladder_keys_b"]
-        if held is not None:
+        if lone_legs is not None:
+            # The lone leg's own trades still hold its ladder labels (their
+            # other legs' labels were freed when those paid out); any more
+            # holds on a label of either market belong to another open trade,
+            # which refuses it, as live adds only beside no other held ladder
+            own = Counter(key for leg in lone_legs for key in leg["ladders"])
+            if not (ladders_a & ladders_b) or any(
+                    open_ladders.get(key, 0) > own[key]
+                    for key in (*ladders_a, *ladders_b)):
+                add_on_ladder_skips += 1
+                continue
+        elif held is not None:
             # An add-on holds only its own ladders: its two markets must share
             # one (live, scanner.held_pairs joins held markets by a shared
             # label, so a pair sharing none is never added to there), and any
@@ -7121,14 +7248,22 @@ def _simulate_at_discount(
         price_a, price_b = c["price_a"], c["price_b"]
 
         fraction = c["kelly_f_capped"]
-        if held is not None:
-            # The pair's stake: what each of its open trades paid (contracts
-            # plus fees), moved by what its contracts have gained or lost
-            # since (_open_value less their cost, zero for a trade with no
-            # quotes) — their value at market plus the fees paid for them
-            stake = 0.0
-            for held_trade, paid in held["trades"]:
-                stake += paid + (_open_value(held_trade, d) - held_trade.total_cost)
+        if held is not None or lone_legs is not None:
+            if lone_legs is not None:
+                # A lone leg's stake: that one leg, at market plus its fee, in
+                # each of its open trades (_open_leg_stake); its partner's
+                # payout is already cash
+                stake = sum(_open_leg_stake(leg["trade"], leg["ticker"], d)
+                            for leg in lone_legs)
+            else:
+                # The pair's stake: what each of its open trades paid
+                # (contracts plus fees), moved by what its contracts have
+                # gained or lost since (_open_value less their cost, zero for
+                # a trade with no quotes) — their value at market plus the
+                # fees paid for them
+                stake = 0.0
+                for held_trade, paid in held["trades"]:
+                    stake += paid + (_open_value(held_trade, d) - held_trade.total_cost)
             # Kelly sizes the whole position: buy what the pair is missing of
             # its Kelly share of the portfolio value (config.held_pair_fraction,
             # the live sizer's own rule); the budget below also keeps it within
@@ -7229,7 +7364,7 @@ def _simulate_at_discount(
             close_date_b=c["close_date_b"],
             settled_date_a=c["settled_date_a"],
             settled_date_b=c["settled_date_b"],
-            add_on=held is not None,
+            add_on=held is not None or lone_legs is not None,
             marks=c["marks"],
         )
         trades.append(trade)
@@ -7248,15 +7383,25 @@ def _simulate_at_discount(
         active_until.append((c["exit_date"], mB["ticker"]))
 
         if add_to_held:
+            if trade.add_on:
+                add_ons += 1
             # Add this trade, with what it paid (its contracts plus fees), and
-            # its ladder holds to its pair's record
+            # its ladder holds to its pair's record (a new record for a new
+            # pair, an add-on to a lone leg included)
             if held is None:
                 held = open_pairs[c["pair_id"]] = {"trades": [], "until": c["exit_date"],
                                                    "ladders": Counter()}
             held["trades"].append((trade, invested))
             held["ladders"].update((*ladders_a, *ladders_b))
-            if c["pair_id"] in traded_pairs:
-                add_ons += 1
+            # ...and each leg to its market's record, for a later add-on once
+            # the other leg has paid out
+            side_a, side_b = leg_sides(c["pair_type"])
+            for market, side, keys, paid_out, partner in (
+                    (mA, side_a, ladders_a, c["settled_date_a"], c["settled_date_b"]),
+                    (mB, side_b, ladders_b, c["settled_date_b"], c["settled_date_a"])):
+                open_legs.setdefault(market["ticker"], []).append(
+                    {"trade": trade, "ticker": market["ticker"], "side": side,
+                     "ladders": keys, "paid_out": paid_out, "partner_paid_out": partner})
 
         # Each market holds its ladders until it pays out
         traded_pairs.add(c["pair_id"])
