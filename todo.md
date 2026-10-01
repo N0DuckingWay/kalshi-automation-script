@@ -140,7 +140,8 @@ data or the operator's machine · **[decision]** needs an operator call before a
 - [ ] **Unbounded cursor loops in the settled-market fetch.** `_fetch_archive_day`
   (`historical.py:2567-2610`), `_fetch_live_window` (3172-3211) and `_fetch_live_sequential`
   (3271-3302) have no seen-cursor guard and no page cap (unlike scanner's TS-05 loops); a cycling
-  cursor on an in-window page loops forever.
+  cursor on an in-window page loops forever. Since 2026-10-01 `_fetch_archive_day` runs once per
+  created-day from `ARCHIVE_FIRST_CREATED_DATE` (~1,900 days) rather than from `--start-date`.
 - [ ] **`/series` cache write collision** between a concurrent live run and backtest can leave an
   unreadable file (tmp name derives from the destination; `historical.py:398-409, 678-687`). Same
   for `treasury_bill_rates.json`. Use a unique tmp name.
@@ -310,8 +311,10 @@ Kept here so they aren't mistaken for forgotten work. Source: code comments and 
   before fallback on a black-holed host.
 - Prefilter relies on observed (not contracted) candle-timing behaviour (`backtester.py:1975-2008`).
 - Empty-candle-cache future-mtime asymmetry vs DR-13 (`historical.py:4249-4256`).
-- Archive tail capped by pages/records; sequential fallbacks unbounded in memory; identity check is
-  a hash (`historical.py:2644-2752, 2775-2787, 4526-4549`).
+- The sequential archive fallback still stops after `ARCHIVE_MAX_BARREN_PAGES` empty pages (it can
+  miss long-lived markets; the sharded path reads every created-day instead); sequential fallbacks
+  unbounded in memory; identity check is a hash (`historical.py` `_fetch_archive_sequential`,
+  `_assembled_records`).
 - `_ex_top_event` / `CapSweep.entry_events` deliberately wider than the trades; `max_trades_simulated`
   counts eager points only; `CapSweep` has no memo; O(B²) ladder sub-pass has only a per-bucket canary.
 - Dashboard: best/worst-5 tables overlap below 11 trades (WONTFIX 2026-09-13); benchmark can carry

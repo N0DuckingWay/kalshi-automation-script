@@ -1346,33 +1346,33 @@ line, whose prefilter re-check then reports the zero it finds as expected
 rather than as "skipping 0". What still
 grows with the run is much smaller, because it holds strings rather than whole
 records: the set of market tickers each of those two walks keeps to drop
-duplicates, and the event tickers and titles being resolved. Three record lists
-also remain: the archive tail (capped by `ARCHIVE_TAIL_MAX_RECORDS`), a
-sequential fallback's whole result if the sharded fetch ever falls back to one,
-and a legacy `settled_markets_*.json` cache, which is read whole when it is
-served. An interrupted fetch resumes at day granularity, and `--no-cache`
+duplicates, and the event tickers and titles being resolved. Two record lists
+also remain: a sequential fallback's whole result if the sharded fetch ever
+falls back to one, and a legacy `settled_markets_*.json` cache, which is read
+whole when it is served. An interrupted fetch resumes at day granularity, and `--no-cache`
 reuses the day slices (they cannot go stale — see CLAUDE.md), so a refresh only
 fetches the current day plus any days not yet on disk. If a day slice disappears or is damaged while it is being streamed, the
 run stops with an error naming the day rather than continuing with a short
 corpus; re-running refetches that day.
 
-**One-time cache rebuild (BS-02).** Assembled `settled_markets_*.json` files
-written before the archive stop rule was fixed can be missing *long-lived*
-markets — ones created before `--start-date` that settled inside the window.
-The archive is ordered by creation time, and the old walk stopped too early to
-reach them. Run the backtest once with `--no-cache` to rebuild those assembled
-files (the rebuild is written in the streamed `.jsonl.gz` format and, once it
-is written, deletes the old `.json` of the same name, just as a rebuild used to
-overwrite it); the per-day slice files under
-`archive_days/` and `live_days/` are unaffected and are reused, so the rebuild
-re-pays only the tail walk. That tail
-is *not* free: it is never slice-cached, so it is a sequential, one-page-at-a-
-time walk down created-time history that is re-paid on **every** run, rebuild or
-not. It stops after `ARCHIVE_MAX_BARREN_PAGES` (50) consecutive pages with no
-in-window settlement, and — because a single long-dated settler resets that
-counter — is hard-capped at `ARCHIVE_TAIL_MAX_PAGES` (10,000) pages total, which
-logs a WARNING when hit (markets created deeper than that may be missed; raise
-the constant if a run needs them).
+**Long-lived markets: every created-day is read.** Some markets are created
+long before `--start-date` and settle inside the window ("Will GTA 6 be released
+by Dec 31, 2025?", created 2023-11). The archive is ordered by creation time and
+cannot be filtered by time, so the fetch reads one archive day slice per
+created-day from `ARCHIVE_FIRST_CREATED_DATE` (2021-06-01, a month before the
+archive's first market) up to the cutoff, and keeps the markets that settled in
+the window. The days before a 2025-10-01 start are small — about 3,000 pages,
+58 MB of slices, fetched in under 3 minutes on 2026-10-01 — and are reused
+from disk like every archive slice until the cutoff moves. Each run also asks the archive once
+whether it holds a market created before that first day, and logs a WARNING if
+it does. A one-page-at-a-time walk below `--start-date` did this before
+2026-10-01; it stopped after 50 pages in a row with nothing in the window and
+missed long-dated markets, so assembled `settled_markets_*` caches built before
+then can lack them: run the backtest once with `--no-cache` to rebuild them (the
+rebuild is written in the streamed `.jsonl.gz` format and, once it is written,
+deletes the old `.json` of the same name). The sequential fallback, used only
+when cursor synthesis fails, still stops after `ARCHIVE_MAX_BARREN_PAGES` (50)
+empty pages.
 
 **Prefilter tag bump (P5): delete the old assembled caches by hand.** P5's
 eligibility prefilter dropped a market that opened at or after
