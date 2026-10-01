@@ -122,8 +122,11 @@ Notes:
     Pass 2 walks the candidates in date order, best expected return first
     within a date, with a running cash balance. Each trade bets a share of
     that Monday's opening portfolio value (the cash after that day's pay-outs
-    plus every open trade at cost) but never spends more than the cash left
-    (config.kelly_budget, as live sizing does). A candidate the cash cannot
+    plus every open trade at market: each leg at the latest usable ask of the
+    side it holds, at its payout once paid out; a trade with no quotes at its
+    cost) but
+    never spends more than the cash left (config.kelly_budget, as live sizing
+    does). A candidate the cash cannot
     fully buy is shrunk to fit, and skipped if not one contract pair fits or
     a win no longer pays after fees. A market is in the open trades of at
     most one pair at a time (freed when that pair pays out; an add-on to a
@@ -132,7 +135,20 @@ Notes:
     deadlines; a market's ladders are freed on the day it pays out). Each
     pair opens at most once; a time-series pair that cannot be taken one
     Monday is tried again on its next passing Monday. The live run values
-    open positions at Kalshi's price rather than at cost.
+    open positions at Kalshi's own price, the backtest at the held side's
+    latest usable ask on its candles (_open_value); the two can differ either
+    way.
+
+    The prices that value an open trade come from the candles the backtest
+    already fetched: _attach_leg_quotes (the one writer) samples each traded
+    market into a LegQuotes on the entry records before the candles are
+    released, Pass 1b (the one reader) hands them to each trade as
+    BacktestTrade.marks, Pass 2 values open trades at each checkpoint through
+    _open_value, and the equity curve values them at each day's end through
+    _open_value_path (read by _carry_steps and _value_steps, which the
+    dashboard reads too). A record without quotes (every hand-built one)
+    values its trades at cost: each is carried at what it cost from its
+    entry day to its pay-out day.
 
     A simulation run with add_to_held (off unless a caller asks) may also add
     to a pair it still holds, as the live sizer does for a held pair: on a
@@ -140,8 +156,8 @@ Notes:
     trades again as a new trade of its own, sized through
     config.held_pair_fraction (the live sizer's rule: Kelly sizes the whole
     position as a share of the portfolio value, counting the pair's open
-    trades at their contract cost plus the fees paid for them, and an add-on
-    never stakes more than a new pair would). It is refused while any other
+    trades at market plus the fees paid for them, and an add-on never stakes
+    more than a new pair would). It is refused while any other
     open trade shares one of its ladders, as live adds only to a held pair no
     other held market shares a ladder with.
 
@@ -286,6 +302,7 @@ Notes:
     grouping on a cache without subtitles, can also produce it.
 """
 import functools
+import hashlib
 import logging
 import numbers
 import resource
@@ -381,6 +398,22 @@ _DAY_SECONDS = 86_400
 # (ScheduledRun.date_problems): ten years, since a market's close_time, and so
 # the checkpoints the prefilter compares it with, can lie years ahead.
 _SCHEDULE_CHECK_DAYS_AHEAD = 3_653
+
+# The top of the range historical.fetch_candlesticks clamps a candle's NO ask
+# into: it stores the NO ask as 1 - the YES bid, held within [0.01, 0.99], so a
+# YES-bid book with no bids reads as a NO ask of 0.99, exactly like a real
+# one-cent bid. A NO ask at this value is therefore no usable quote
+# (_usable_ask): the NO leg keeps its last usable NO ask instead.
+_CANDLE_NO_ASK_CEILING = 0.99
+
+# How old, in days, the candle behind a leg's day-end value may be before
+# _attach_leg_quotes counts the leg on its DEBUG line of legs valued on old
+# quotes. Reporting only: no quote is ever refused for its age.
+_STALE_QUOTE_DAYS = 7
+
+# date.toordinal() of 1970-01-01, so a UTC midnight's Unix time is
+# (ordinal - _EPOCH_ORDINAL) * _DAY_SECONDS.
+_EPOCH_ORDINAL = date(1970, 1, 1).toordinal()
 
 # Deadline-gap bands the interval-discount calibration report groups its
 # candidates into, as inclusive (lo, hi) day counts; the row label is derived
@@ -613,6 +646,270 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
 
 # ─── Data structures ──────────────────────────────────────────────────────────
 
+def _carried_forward(values: Any) -> np.ndarray:
+    """
+    A float array with every NaN after a number replaced by the last number before it.
+
+    NaNs before the first number stay NaN. LegQuotes stores its samples this
+    way, so a leg with no usable quote on some day counts at its last usable
+    one.
+
+    Args:
+        values: A sequence of floats (NaN for no usable ask).
+
+    Returns:
+        np.ndarray: A new float array of the same length.
+    """
+    array = np.array(values, dtype=float)
+    if array.size:
+        known = ~np.isnan(array)
+        # The index of the last number at or before each position
+        last = np.maximum.accumulate(np.where(known, np.arange(array.size), 0))
+        array = np.where(np.logical_or.accumulate(known), array[last], np.nan)
+    return array
+
+
+class LegQuotes:
+    """
+    One market's prices over the days a backtest trade in it can be open.
+
+    The backtest values an open trade at market: each leg at the ask of the
+    side it holds (a YES leg at the YES ask, a NO leg at the NO ask), the
+    price live pays to add to a held pair. This object holds those asks for
+    one market, sampled at two kinds of moment, both from the candles the
+    backtest already fetched (_leg_quotes builds it; no candle list is kept):
+      * DAY-END samples, one per UTC day from first_day on: each side's
+        latest usable ask on a candle ending at or before the next UTC
+        midnight. The equity curve reads them (backtester._open_value_path).
+      * CHECKPOINT samples, one per entry checkpoint (the live run's weekly
+        moment, _checkpoint_datetime) from first_checkpoint on: each side's
+        latest usable ask on a candle ending at or before that moment. Pass 2
+        sizes on them (backtester._open_value).
+    A usable ask is a number strictly between 0 and 1 (a NO ask also below
+    _CANDLE_NO_ASK_CEILING, which may be an empty book; _usable_ask). So a
+    side keeps its last usable ask through an empty book (a YES ask of 1.00),
+    an unreadable candle, or the time between its last candle and its payout.
+    A sample at or after the market's settlement_ts is its payout, when the
+    result is known: 1.0 on the side that won and 0.0 on the other. A sample
+    before the side's first usable ask is NaN, and a lookup returns the leg's
+    entry price in its place. A day or checkpoint past the end of the arrays
+    (they end on the settlement date) reads the payout, or the last day-end
+    sample when the payout is unknown. There is no age limit: a leg that
+    stops trading keeps its last usable ask until it pays out.
+
+    A plain class with __slots__ rather than a dataclass, so
+    dataclasses.astuple does not walk into it, and copying returns the
+    object itself: every trade of one run that holds a market shares one
+    LegQuotes. Two built from the same candles compare equal (ticker, grid
+    starts, arrays with NaN equal, payouts), so two runs' trades still
+    compare equal through astuple, and they share one `fingerprint`, which
+    the dashboard reads to tell two trade lists apart by their prices
+    (dashboard._list_key). The arrays are read-only.
+
+    Attributes:
+        ticker (str): The market's ticker.
+        first_day (date): The first day with a day-end sample.
+        yes_days (np.ndarray): Day-end YES asks, one per day from first_day.
+        no_days (np.ndarray): Day-end NO asks, the same days.
+        first_checkpoint (date): The first entry checkpoint date on or after
+            first_day; every later one is a whole number of weeks after it.
+        yes_checkpoints (np.ndarray): YES asks at each checkpoint.
+        no_checkpoints (np.ndarray): NO asks at each checkpoint.
+        paid_yes (float): What a YES contract pays: 1.0 or 0.0, NaN when the
+            result or the settlement time is unknown.
+        paid_no (float): What a NO contract pays (1 - paid_yes, NaN alike).
+        fingerprint (str): A hex digest of everything above; two LegQuotes
+            that compare equal share it.
+    """
+
+    __slots__ = ("ticker", "first_day", "yes_days", "no_days", "first_checkpoint",
+                 "yes_checkpoints", "no_checkpoints", "paid_yes", "paid_no", "fingerprint")
+
+    def __init__(self, ticker: str, first_day: date, yes_days: np.ndarray, no_days: np.ndarray,
+                 first_checkpoint: date, yes_checkpoints: np.ndarray,
+                 no_checkpoints: np.ndarray, paid_yes: float, paid_no: float) -> None:
+        """
+        Store one market's samples, made read-only, and their fingerprint.
+
+        Each array is carried forward first: a NaN after a usable sample takes
+        that sample's value, so a side reads NaN only before its first usable
+        ask, whoever built the arrays (_leg_quotes already builds them so).
+
+        Args:
+            ticker (str): The market's ticker.
+            first_day (date): The day of yes_days[0] and no_days[0].
+            yes_days (np.ndarray): Day-end YES asks (NaN: no usable ask).
+            no_days (np.ndarray): Day-end NO asks, the same days.
+            first_checkpoint (date): The date of yes_checkpoints[0].
+            yes_checkpoints (np.ndarray): YES asks at weekly checkpoints.
+            no_checkpoints (np.ndarray): NO asks at the same checkpoints.
+            paid_yes (float): A YES contract's payout, NaN when unknown.
+            paid_no (float): A NO contract's payout, NaN when unknown.
+        """
+        self.ticker = ticker
+        self.first_day = first_day
+        self.first_checkpoint = first_checkpoint
+        # Adding 0.0 turns -0.0 into 0.0, so equal payouts give one fingerprint
+        self.paid_yes = float(paid_yes) + 0.0
+        self.paid_no = float(paid_no) + 0.0
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(repr((ticker, first_day.isoformat(), first_checkpoint.isoformat(),
+                            self.paid_yes, self.paid_no)).encode("utf-8"))
+        for name, values in (("yes_days", yes_days), ("no_days", no_days),
+                             ("yes_checkpoints", yes_checkpoints),
+                             ("no_checkpoints", no_checkpoints)):
+            array = _carried_forward(values)
+            array.setflags(write=False)
+            setattr(self, name, array)
+            # One spelling of NaN and of zero, so arrays that compare equal
+            # (NaN equal to NaN) hash alike; the length keeps two arrays apart
+            canonical = np.where(np.isnan(array), np.nan, array + 0.0)
+            digest.update(len(array).to_bytes(8, "little"))
+            digest.update(canonical.tobytes())
+        self.fingerprint = digest.hexdigest()
+
+    def __copy__(self) -> "LegQuotes":
+        """Return this object: it is read-only, and trades share one per market."""
+        return self
+
+    def __deepcopy__(self, memo: dict) -> "LegQuotes":
+        """
+        Return this object (dataclasses.astuple deep-copies every field).
+
+        Args:
+            memo (dict): copy.deepcopy's memo, unused.
+
+        Returns:
+            LegQuotes: self.
+        """
+        return self
+
+    def __eq__(self, other: object) -> bool:
+        """
+        Compare two markets' samples by value, NaN equal to NaN.
+
+        Args:
+            other (object): Anything.
+
+        Returns:
+            bool: True when every attribute matches; NotImplemented for a
+                non-LegQuotes.
+        """
+        if not isinstance(other, LegQuotes):
+            return NotImplemented
+
+        def same(a: float, b: float) -> bool:
+            """Whether two payouts are equal, NaN counting as equal to NaN."""
+            return a == b or (a != a and b != b)
+
+        return (self.ticker == other.ticker and self.first_day == other.first_day
+                and self.first_checkpoint == other.first_checkpoint
+                and same(self.paid_yes, other.paid_yes) and same(self.paid_no, other.paid_no)
+                and all(np.array_equal(getattr(self, name), getattr(other, name), equal_nan=True)
+                        for name in ("yes_days", "no_days", "yes_checkpoints",
+                                     "no_checkpoints")))
+
+    def __hash__(self) -> int:
+        """Hash on the ticker and first day, which equal objects share."""
+        return hash((self.ticker, self.first_day))
+
+    def __repr__(self) -> str:
+        """Name the market and its first day, not the arrays."""
+        return f"LegQuotes({self.ticker!r}, from {self.first_day.isoformat()})"
+
+    def _side(self, side: str) -> tuple[np.ndarray, np.ndarray, float]:
+        """
+        Pick one side's day-end samples, checkpoint samples and final value.
+
+        The final value is what a lookup past the end of the arrays reads:
+        the side's payout, or, when the payout is unknown, its last day-end
+        sample (the last usable ask it had; NaN when it never had one).
+
+        Args:
+            side (str): "yes" or "no" (scanner.leg_sides).
+
+        Returns:
+            tuple: (day-end samples, checkpoint samples, final value).
+
+        Raises:
+            ValueError: For any other side.
+        """
+        if side == "yes":
+            days, checkpoints, paid = self.yes_days, self.yes_checkpoints, self.paid_yes
+        elif side == "no":
+            days, checkpoints, paid = self.no_days, self.no_checkpoints, self.paid_no
+        else:
+            raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+        if paid != paid and len(days):
+            # An unknown payout: past the samples the last usable ask stands
+            paid = float(days[-1])
+        return days, checkpoints, paid
+
+    def at_checkpoint(self, day: date, side: str, entry_price: float) -> float:
+        """
+        One contract's value at the entry checkpoint on `day`.
+
+        Args:
+            day (date): A checkpoint date on this market's weekly grid.
+            side (str): The side the leg holds, "yes" or "no".
+            entry_price (float): The leg's entry price, returned when the side
+                has had no usable ask yet.
+
+        Returns:
+            float: The side's latest usable ask at the checkpoint, the payout
+                once the market has paid out, or entry_price.
+
+        Raises:
+            ValueError: For a day before first_checkpoint or not a whole
+                number of weeks after it — a schedule other than the one the
+                samples were taken on — or for an unknown side.
+        """
+        _days, checkpoints, final = self._side(side)
+        offset = (day - self.first_checkpoint).days
+        if offset < 0 or offset % 7:
+            raise ValueError(
+                f"{day} is not an entry checkpoint of {self.ticker}'s quotes "
+                f"(weekly from {self.first_checkpoint})")
+        index = offset // 7
+        value = checkpoints[index] if index < len(checkpoints) else final
+        # NaN (no usable ask yet, and no payout) values the leg at entry
+        return entry_price if value != value else float(value)
+
+    def day_values(self, first: date, last: date, side: str, entry_price: float) -> np.ndarray:
+        """
+        One contract's value at the end of each day from `first` to `last`.
+
+        Args:
+            first (date): The first day (inclusive).
+            last (date): The last day (inclusive); before `first` gives [].
+            side (str): The side the leg holds, "yes" or "no".
+            entry_price (float): The leg's entry price, used for a day before
+                the side's first usable ask (before first_day too).
+
+        Returns:
+            np.ndarray: One float per day: that side's latest usable ask at the
+                day's end, the payout once the market has paid out, or
+                entry_price.
+
+        Raises:
+            ValueError: For an unknown side.
+        """
+        days, _checkpoints, final = self._side(side)
+        count = (last - first).days + 1
+        if count <= 0:
+            return np.empty(0)
+        start = (first - self.first_day).days
+        # Past the end of the samples: the payout (or the last usable ask)
+        out = np.full(count, final)
+        lo, hi = max(start, 0), min(start + count, len(days))
+        if hi > lo:
+            out[lo - start:hi - start] = days[lo:hi]
+        if start < 0:
+            # Before the first sample there is no quote
+            out[:min(-start, count)] = np.nan
+        return np.where(np.isnan(out), entry_price, out)
+
+
 @dataclass
 class BacktestTrade:
     """
@@ -690,10 +987,14 @@ class BacktestTrade:
             negative only in the loss cell. time_series: zero in both win cells
             and negative in the loss cell — there is no positive-slippage cell.
         holding_days (int): Calendar days between entry_date and exit_date. Always >= 1.
-        balance_at_entry (float): Portfolio value in dollars (cash plus open
-            trades at cost) at the start of the entry Monday, after that day's
-            pay-outs and before its trades. The Kelly share is taken of it; the
-            trade can cost less when the cash left was smaller.
+        balance_at_entry (float): Portfolio value in dollars at the entry
+            checkpoint, after that day's pay-outs and before its trades: the
+            cash plus every open trade at market (_open_value: each leg at the
+            ask of the side it holds, at its payout once paid out; a trade
+            with no quotes at its cost). The Kelly share is taken of it; the
+            trade can cost less when the cash left was smaller. It is taken at
+            the checkpoint, so it equals no day-end row of the equity curve
+            exactly.
         deadline_gap_days (int | None): Calendar days between the two legs'
             deadlines — their close_times for a cross-event pair, their two
             STATED deadlines for a same-event ladder (DR-73), which is also
@@ -737,6 +1038,13 @@ class BacktestTrade:
             count, cost, fees and payout; the earlier trade is never changed.
             Reporting only. False by default, so every other construction
             still builds.
+        marks (tuple[LegQuotes, LegQuotes] | None): Market A's and market B's
+            prices over time (LegQuotes), which value the open trade at
+            market: Pass 2 at each checkpoint (_open_value) and the equity
+            curve at each day's end (_open_value_path). None (the default, and
+            every hand-built trade) values it at its cost. Left out of
+            equality and repr, so two trades compare on what was traded;
+            references only, shared by every trade in the same markets.
     """
     pair_type: str       # "time_series" | "same_title"
     ticker_a: str
@@ -765,7 +1073,7 @@ class BacktestTrade:
     expected_payoff: float  # n * (1 - price_a - price_b) minus fees — same_title floor / time_series win-cell profit
     slippage: float         # profit - expected_payoff
     holding_days: int
-    balance_at_entry: float  # portfolio value on the entry Monday (cash + open trades at cost)
+    balance_at_entry: float  # portfolio value at the entry checkpoint (cash + open trades at market)
     # Calendar days between the two legs' deadlines — their close_times for a
     # cross-event pair, their two STATED deadlines for a same-event ladder
     # (DR-73) — carried out of _find_entry rather than recomputed, so it is
@@ -798,6 +1106,10 @@ class BacktestTrade:
     # Whether this trade added to a pair the simulation still held (only with
     # _simulate_at_discount(add_to_held=True)); reporting only
     add_on: bool = False
+    # Each leg's prices over time, for valuing the open trade at market; None
+    # values it at cost. Not compared or printed: it is how the trade is
+    # valued while open, not what was traded
+    marks: tuple[LegQuotes, LegQuotes] | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -888,9 +1200,10 @@ class SweepPoint:
         equity_df (pd.DataFrame): Daily equity curve with columns
             [date, portfolio_value, daily_return], opening one row before the
             run's start_date at the initial balance and flat at it when trades
-            is empty. portfolio_value is cash plus open positions carried at
-            cost, so it moves only on realized costs and P&L, never on
-            deployment (see _build_equity_curve).
+            is empty. portfolio_value is cash plus open positions at market
+            (at cost for a trade with no quotes), so deploying capital never
+            moves it: it moves on fees, on open trades' changes in value and
+            on pay-outs (see _build_equity_curve).
         spread_band (tuple[float, float] | None): The RESOLVED time-series
             spread band (floor, ceiling) this point's entries were detected
             under — the same tuple that was handed to _entries_for_band, so a
@@ -1380,7 +1693,11 @@ class CapSweep:
     the eager points it references are the ones BacktestSweep already
     holds. Each entry also carries one small dict per later qualifying
     Monday; those point at the pair's own two market dicts, so they add no
-    market dicts.
+    market dicts. Each record's "leg_quotes" (the prices that value its
+    trades at market) holds one LegQuotes per market, shared by every record
+    and band: about 18 bytes per market per day of its life in the window
+    (two asks a day, and two a week at the checkpoints), and no candle list. The quotes depend on no cap, k, band, tier setting
+    or population, so the reuse rule below stays exact.
 
     One Tier floors setting per CapSweep (tier_floors). The tier-on one
     (BacktestSweep.cap_sweep, tier_floors True) holds the tier-on
@@ -2087,6 +2404,43 @@ def _leg_prices_for(
     if pair_type == "time_series":
         return pA, nB
     return nA, pB
+
+
+def _open_value(trade: BacktestTrade, day: date) -> float:
+    """
+    What an open trade is worth at the entry checkpoint on `day`: the one valuation Pass 2 sizes on.
+
+    Each leg counts at the latest usable ask of the side it holds at that
+    checkpoint (a YES leg at the YES ask, a NO leg at the NO ask), at its
+    payout (1 or 0 per contract) once its market has paid out, and at its
+    entry price before that side has had any usable ask
+    (LegQuotes.at_checkpoint). A trade with no quotes
+    (trade.marks is None, every hand-built trade) is worth exactly its
+    total_cost, the value the portfolio carried before trades were valued at
+    market. Fees are never part of the value: they are spent.
+
+    Args:
+        trade (BacktestTrade): An open trade (it entered on or before `day`
+            and pays out after it).
+        day (date): A checkpoint date on the trade's legs' weekly grid.
+
+    Returns:
+        float: The trade's value in dollars.
+
+    Raises:
+        ValueError: From LegQuotes.at_checkpoint, for a day off the legs'
+            checkpoint grid (the quotes were taken on another schedule).
+    """
+    if trade.marks is None:
+        return trade.total_cost
+    quotes_a, quotes_b = trade.marks
+    # Which side each leg holds (scanner.leg_sides, the one definition) and
+    # what it cost, for a leg that has had no usable ask yet
+    side_a, side_b = leg_sides(trade.pair_type)
+    price_a, price_b = _leg_prices_for(trade.pair_type, trade.entry_pA, trade.entry_nA,
+                                       trade.entry_pB, trade.entry_nB)
+    return trade.n * (quotes_a.at_checkpoint(day, side_a, price_a)
+                      + quotes_b.at_checkpoint(day, side_b, price_b))
 
 
 # ─── Eligibility prefilter ─────────────────────────────────────────────────────
@@ -3607,7 +3961,7 @@ def _candles_at_or_before(candles: list[dict], timestamps: list[int]) -> list[di
     For each of several moments, find a market's latest candle at or before it.
 
     A faster way to do what _candle_at_or_before does, for many moments at
-    once; _find_entry is its only caller. _find_entry checks a pair at the
+    once; _find_entry and _leg_quotes call it. _find_entry checks a pair at the
     entry checkpoint of every Monday of the pair's window and records each
     Monday on which the pair passes its entry checks. To check a Monday it
     needs each market's prices as of that checkpoint: the market's latest
@@ -3651,6 +4005,197 @@ def _candles_at_or_before(candles: list[dict], timestamps: list[int]) -> list[di
         found.append(candles[i - 1] if i else None)
         previous = ts
     return found
+
+
+def _usable_ask(raw: Any, side: str) -> float:
+    """
+    Read one candle close as an ask that can value a leg, or NaN.
+
+    An ask is usable when it reads as a number strictly between 0 and 1 —
+    the rule live applies to a held pair's ask (scanner._held_leg_worth) —
+    so a sub-cent ask on a fine grid counts, while a YES ask of 1.00 (no one
+    offering YES) does not. A NO ask must also be below
+    _CANDLE_NO_ASK_CEILING: the candle stores the NO ask as 1 - the YES bid,
+    clamped to 0.99 at most, so 0.99 is also what a YES-bid book with no bids
+    reads as. Each bound is held PRICE_EPSILON inside, so float noise on a
+    price sitting on a bound reads as that bound.
+
+    Args:
+        raw: A candle's "yes_ask_close" or "no_ask_close" (normally a float).
+        side (str): "yes" for a YES ask, "no" for a NO ask.
+
+    Returns:
+        float: The ask when usable; NaN otherwise, which _leg_quotes skips,
+            so the side keeps its last usable ask.
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float("nan")
+    top = 1.0 if side == "yes" else _CANDLE_NO_ASK_CEILING
+    # A NaN fails both comparisons, so it stays unusable too
+    return value if PRICE_EPSILON < value < top - PRICE_EPSILON else float("nan")
+
+
+def _leg_quotes(market: dict, candles: list[dict], start_date: date) -> tuple[LegQuotes | None, int]:
+    """
+    Sample one market's candles into the prices that value an open leg in it (a LegQuotes).
+
+    Day-end samples run from first_day — the later of start_date and the day
+    the first candle can be read at a day's end — through the market's
+    settlement date (or its last candle's date when it has no readable
+    settlement time), each side's latest usable ask (_usable_ask) on a candle
+    ending at or before the next UTC midnight. Checkpoint samples run over
+    the same days, one at each entry checkpoint (_monday_timestamps), each
+    side's latest usable ask on a candle ending at or before it. Both use
+    _candles_at_or_before, the one candle lookup _find_entry uses, over the
+    candles whose ask on that side is usable — so a side keeps its last
+    usable ask through an empty book or an unreadable candle, and a side
+    with no usable ask yet is NaN. A sample at or after the settlement time
+    is the market's payout when the result is known (from its "result":
+    "yes" pays YES, "no" pays NO); with an unknown result the asks go on.
+
+    Args:
+        market (dict): The market's cached record ("ticker", "settlement_ts", "result").
+        candles (list[dict]): Its hourly candles ("ts", "yes_ask_close",
+            "no_ask_close"), in time order.
+        start_date (date): The backtest's first trading date.
+
+    Returns:
+        tuple[LegQuotes | None, int]: The market's quotes, None when it has no
+            candle; and how many day-end samples before its payout were read
+            from a candle more than _STALE_QUOTE_DAYS days old (reporting only).
+    """
+    if not candles:
+        return None, 0
+    ticker = market.get("ticker") or ""
+    settled = _parse_iso_datetime(market.get("settlement_ts"))
+    settle_ts = None
+    if settled is not None:
+        # Kalshi's times end in "Z"; a naive one (a hand-edited cache) is read
+        # as UTC, and one outside the representable range as unknown
+        if settled.tzinfo is None:
+            settled = settled.replace(tzinfo=UTC)
+        try:
+            settle_ts = settled.timestamp()
+            settled = settled.astimezone(UTC)
+        except (OverflowError, ValueError, OSError):
+            settled, settle_ts = None, None
+    result = market.get("result")
+    paid_yes = (1.0 if result == "yes" else 0.0 if result == "no" else float("nan"))
+    if settle_ts is None:
+        # No payout without a known settlement time
+        paid_yes = float("nan")
+    paid_no = 1.0 - paid_yes
+    # From this moment every sample is the payout; None when the payout is unknown
+    pays_from = settle_ts if paid_yes == paid_yes else None
+    first_ts = min(c["ts"] for c in candles)
+    last_ts = max(c["ts"] for c in candles)
+    # The first day whose end (the next UTC midnight) a candle has ended by
+    first_day = max(start_date, datetime.fromtimestamp(first_ts - 1, UTC).date())
+    last_day = (settled.date() if settled is not None
+                else datetime.fromtimestamp(last_ts, UTC).date())
+    last_day = max(first_day, last_day)
+    # Day ends as Unix times: the UTC midnight after each day
+    day_ends = [(first_day.toordinal() + 1 + i - _EPOCH_ORDINAL) * _DAY_SECONDS
+                for i in range((last_day - first_day).days + 1)]
+    # The entry checkpoints over the same days, and the first one's date
+    first_checkpoint = first_day
+    while first_checkpoint.weekday() != SCHEDULED_RUN.weekday:
+        first_checkpoint += timedelta(days=1)
+    checkpoints = _monday_timestamps(first_day, last_day)
+    stale_limit = _STALE_QUOTE_DAYS * _DAY_SECONDS
+    # Each side's candles with a usable ask, in the candles' own order, as
+    # small {"ts", "ask"} dicts, so a lookup lands on the latest usable ask
+    usable: dict[str, list[dict]] = {}
+    for side, key in (("yes", "yes_ask_close"), ("no", "no_ask_close")):
+        usable[side] = [{"ts": c["ts"], "ask": ask} for c in candles
+                        if (ask := _usable_ask(c.get(key), side)) == ask]
+
+    def sample(moments: list[int], count_stale: bool) -> tuple[list[float], list[float], int]:
+        """
+        Read each side's latest usable ask at each moment (the payout from settlement on).
+
+        Args:
+            moments (list[int]): Unix times, in time order.
+            count_stale (bool): Whether to count samples read from an old candle.
+
+        Returns:
+            tuple: (YES asks, NO asks, how many samples came from a candle
+                more than _STALE_QUOTE_DAYS days before their moment, on
+                either side).
+        """
+        # The one candle lookup _find_entry reads prices through
+        found_yes = _candles_at_or_before(usable["yes"], moments)
+        found_no = _candles_at_or_before(usable["no"], moments)
+        yes_out: list[float] = []
+        no_out: list[float] = []
+        stale = 0
+        for moment, yes_candle, no_candle in zip(moments, found_yes, found_no, strict=True):
+            if pays_from is not None and pays_from <= moment:
+                yes_out.append(paid_yes)
+                no_out.append(paid_no)
+                continue
+            yes_out.append(float("nan") if yes_candle is None else yes_candle["ask"])
+            no_out.append(float("nan") if no_candle is None else no_candle["ask"])
+            if count_stale and any(c is not None and moment - c["ts"] > stale_limit
+                                   for c in (yes_candle, no_candle)):
+                stale += 1
+        return yes_out, no_out, stale
+
+    yes_days, no_days, stale_days = sample(day_ends, True)
+    yes_checkpoints, no_checkpoints, _ = sample(checkpoints, False)
+    quotes = LegQuotes(ticker, first_day, yes_days, no_days, first_checkpoint,
+                       yes_checkpoints, no_checkpoints, paid_yes, paid_no)
+    return quotes, stale_days
+
+
+def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
+                       start_date: date) -> None:
+    """
+    Give each entry record the prices that value its trades at market: the one writer of "leg_quotes".
+
+    For each record whose two markets both have candles it sets
+    rec["leg_quotes"] = {ticker_a: LegQuotes, ticker_b: LegQuotes} on the
+    record itself (never on its entry dict, whose keys are the Monday's).
+    One LegQuotes is built per ticker per call and shared by every record,
+    band and tier setting that holds the market, and no candle list is kept
+    alive by it. A record whose markets lack candles (every hand-built
+    record) is left without the key, so its trades are valued at cost.
+    _simulate_at_discount's Pass 1b is the key's one reader. Called by
+    _prepare_entries after its entry pass and by _sweep_from_candidates just
+    before it releases the candles.
+
+    Args:
+        records (Iterable[dict]): Entry records (_entries_for_band output); a
+            record may appear more than once.
+        candles_by_ticker (dict): Ticker -> hourly candles, from _fetch_candles_parallel.
+        start_date (date): The backtest's first trading date.
+    """
+    by_ticker: dict[str, LegQuotes | None] = {}
+    by_pair: dict[tuple[str, str], dict] = {}
+    stale_legs = 0
+    for rec in records:
+        entry = rec["entry"]
+        tickers = (entry["mA"]["ticker"], entry["mB"]["ticker"])
+        pair = by_pair.get(tickers)
+        if pair is None:
+            for m in (entry["mA"], entry["mB"]):
+                ticker = m["ticker"]
+                if ticker not in by_ticker:
+                    quotes, stale_days = _leg_quotes(m, candles_by_ticker.get(ticker) or [],
+                                                     start_date)
+                    by_ticker[ticker] = quotes
+                    stale_legs += 1 if stale_days else 0
+            if by_ticker[tickers[0]] is None or by_ticker[tickers[1]] is None:
+                continue
+            pair = by_pair[tickers] = {tickers[0]: by_ticker[tickers[0]],
+                                       tickers[1]: by_ticker[tickers[1]]}
+        rec["leg_quotes"] = pair
+    if stale_legs:
+        # Reporting only: no quote is refused for its age
+        logging.debug("Legs valued on a quote more than %d days old on some day before they "
+                      "pay out: %d", _STALE_QUOTE_DAYS, stale_legs)
 
 
 def _find_entry(
@@ -6028,6 +6573,9 @@ def _prepare_entries(
     # config.BACKTEST_DEFAULT_SPREAD_BAND, i.e. no band), with the tier floors
     # on, it is the tier rule alone.
     raw_entries = _entries_for_band(candidates, spread_band=None)
+    # The prices that value each entry's trades at market while open, taken
+    # from the candles before they are released with this function's locals
+    _attach_leg_quotes(raw_entries, candidates.candles_by_ticker, candidates.start_date)
 
     logging.info("Prepared %d candidate entries for sizing", len(raw_entries))
     _log_qualifying_mondays(raw_entries, None)
@@ -6056,8 +6604,9 @@ def _simulate_at_discount(
     Scores each entry's Mondays with the Kelly rule (the formula that sets how
     much to bet), drops pairs with no usable pay-out, then walks the Mondays
     in date order. Each trade bets a share of that Monday's opening portfolio
-    value (cash plus open trades at cost) but never spends more than the cash
-    left; a trade the cash cannot fully buy is shrunk to fit. A time-series
+    value (cash plus open trades at market, _open_value) but never spends
+    more than the cash left; a trade the cash cannot fully buy is shrunk to
+    fit. A time-series
     pair that cannot be taken is tried again on its next passing Monday; a
     same-title pair is not, and only the best one per title group is kept. At
     most one time-series pair is open per ladder (one question at several
@@ -6082,10 +6631,11 @@ def _simulate_at_discount(
     config.held_pair_fraction — the live sizer's own rule: Kelly sizes the
     whole position, so the add-on stakes what the pair is missing of
     min(pair cap, f*) of the portfolio value, the pair's open trades counted
-    at their contract cost plus the fees paid for them. The portfolio value
+    at market (_open_value) plus the fees paid for them. The portfolio value
     leaves those fees out, since they are spent, so a pair that took its
     full share adds nothing at unchanged quotes unless the portfolio value
-    grows. Like every trade it spends at most the cash left, so it never
+    grows; a pair whose value has risen gets a smaller add-on, one whose
+    value has fallen a larger one. Like every trade it spends at most the cash left, so it never
     stakes more than a new pair would. A pair that already holds that share
     (a full-size pair) is skipped. A same-title pair then also keeps its
     later passing Mondays that have the first one's legs the same way round
@@ -6303,6 +6853,11 @@ def _simulate_at_discount(
                     same_title_ladders[id(m)] = _ladder_keys_dict(m)
             ladders_a, ladders_b = same_title_ladders[id(mA)], same_title_ladders[id(mB)]
 
+        # Each leg's prices over time (the one reader of what _attach_leg_quotes
+        # wrote), in this pair's A/B order; None values its trades at cost
+        quotes = rec.get("leg_quotes")
+        marks = None if quotes is None else (quotes[mA["ticker"]], quotes[mB["ticker"]])
+
         # One candidate per passing Monday, priced and ranked on that Monday
         for index, (monday, kelly_f, price_a, price_b, profit_ratio_entry) in enumerate(passing):
             entry_date = monday["entry_date"]
@@ -6346,6 +6901,8 @@ def _simulate_at_discount(
                 # pairs, knows which open trade a later Monday adds to)
                 "pair_id": pair_id,
                 "ladder_keys_a": ladders_a, "ladder_keys_b": ladders_b,
+                # How Pass 2 and the equity curve value the trade while open
+                "marks": marks,
             })
 
     if premise_violations:
@@ -6432,15 +6989,15 @@ def _simulate_at_discount(
     # Walk the candidates in date order with a running cash balance. Each date
     # is one checkpoint (the Monday-morning moment trades are entered, like one
     # live run). A candidate's budget is a share of the checkpoint's opening
-    # portfolio value (cash after that day's pay-outs plus open trades at
-    # cost), never more than the cash left (config.kelly_budget, as live). A
-    # candidate the cash cannot fully buy is shrunk to fit, and skipped if not
-    # one contract pair fits or a win no longer pays after fees.
+    # portfolio value (cash after that day's pay-outs plus every open trade at
+    # market, _open_value), never more than the cash left (config.kelly_budget,
+    # as live). A candidate the cash cannot fully buy is shrunk to fit, and
+    # skipped if not one contract pair fits or a win no longer pays after fees.
     #
-    # Unlike a live run, open trades (an add-on's held pair included) count at
-    # cost rather than at Kalshi's price, no extra cash is held back for the
-    # orders' worst-case prices, and a shrunk trade is not re-checked for a
-    # positive expected value.
+    # Unlike a live run, an open trade is valued at the ask of the side each
+    # leg holds (live reads Kalshi's own value of the positions), no extra
+    # cash is held back for the orders' worst-case prices, and a shrunk trade
+    # is not re-checked for a positive expected value.
     #
     # As live, a market is in the open trades of at most one pair (freed when
     # that pair pays out) and at most one time-series pair is open per ladder
@@ -6454,8 +7011,8 @@ def _simulate_at_discount(
     checkpoint_date: date | None = None
     checkpoint_value = cash
     pending_exits: list[tuple[date, float]] = []  # (exit_date, settlement receipt)
-    # (exit_date, cost) of each open trade, counted in the portfolio value until it pays out
-    open_costs: list[tuple[date, float]] = []
+    # Every open trade, counted in the portfolio value (at market) until it pays out
+    open_trades: list[BacktestTrade] = []
     # (exit_date, ticker) for every leg of a still-open trade — the release
     # ledger for active_tickers, kept alongside pending_exits so cash and
     # ticker availability are always freed on exactly the same day.
@@ -6466,9 +7023,9 @@ def _simulate_at_discount(
     ladders_until: list[tuple[date, frozenset]] = []
     ladder_refusals = 0
     # Adding to held pairs (filled only when add_to_held, so the off path
-    # records nothing new): each open pair's stake so far (what its trades
-    # cost: their contracts plus the fees paid for them), the day it pays
-    # out, and how many ladder holds its own trades have taken
+    # records nothing new): each open pair's trades with what each one paid
+    # (its contracts plus fees), the day it pays out, and how many ladder
+    # holds its own trades have taken
     open_pairs: dict[int, dict] = {}
     add_ons = add_on_cap_skips = add_on_ladder_skips = 0
 
@@ -6477,8 +7034,8 @@ def _simulate_at_discount(
         # Release settlement receipts from trades that exited on or before this entry
         cash += sum(amt for ed, amt in pending_exits if ed <= d)
         pending_exits = [(ed, amt) for ed, amt in pending_exits if ed > d]
-        # ...and stop counting their cost in the portfolio value
-        open_costs = [(ed, cost) for ed, cost in open_costs if ed > d]
+        # ...and stop counting them in the portfolio value
+        open_trades = [t for t in open_trades if t.exit_date > d]
         # Release the tickers of those same settled trades — the position is
         # closed, so (as live) the ticker is no longer blocked. Set difference
         # is safe because the conflict filter below guarantees a ticker is in
@@ -6510,9 +7067,11 @@ def _simulate_at_discount(
                 del open_pairs[pid]
 
         if d != checkpoint_date:
-            # New checkpoint: value the portfolio as cash plus open trades at cost
+            # New checkpoint: value the portfolio as cash plus every open trade
+            # at market (_open_value, the one valuation; a trade with no
+            # quotes counts at its cost)
             checkpoint_date = d
-            checkpoint_value = cash + sum(cost for _ed, cost in open_costs)
+            checkpoint_value = cash + sum(_open_value(t, d) for t in open_trades)
 
         held = None
         if c["pair_id"] in traded_pairs:
@@ -6563,13 +7122,18 @@ def _simulate_at_discount(
 
         fraction = c["kelly_f_capped"]
         if held is not None:
+            # The pair's stake: what each of its open trades paid (contracts
+            # plus fees), moved by what its contracts have gained or lost
+            # since (_open_value less their cost, zero for a trade with no
+            # quotes) — their value at market plus the fees paid for them
+            stake = 0.0
+            for held_trade, paid in held["trades"]:
+                stake += paid + (_open_value(held_trade, d) - held_trade.total_cost)
             # Kelly sizes the whole position: buy what the pair is missing of
-            # its Kelly share of the portfolio value, its open trades counted
-            # at contract cost plus the fees paid for them
-            # (config.held_pair_fraction, the live sizer's own rule); the
-            # budget below also keeps it within the cash, so it never stakes
-            # more than a new pair would
-            fraction = held_pair_fraction(fraction, held["cost"], checkpoint_value)
+            # its Kelly share of the portfolio value (config.held_pair_fraction,
+            # the live sizer's own rule); the budget below also keeps it within
+            # the cash, so it never stakes more than a new pair would
+            fraction = held_pair_fraction(fraction, stake, checkpoint_value)
             if fraction <= 0:
                 add_on_cap_skips += 1
                 continue
@@ -6626,7 +7190,7 @@ def _simulate_at_discount(
         event_a = mA.get("event_ticker") or ""
         is_ladder = _is_ladder_pair(c["pair_type"], mA, mB)
 
-        trades.append(BacktestTrade(
+        trade = BacktestTrade(
             pair_type=c["pair_type"],
             ticker_a=mA["ticker"],
             ticker_b=mB["ticker"],
@@ -6666,13 +7230,15 @@ def _simulate_at_discount(
             settled_date_a=c["settled_date_a"],
             settled_date_b=c["settled_date_b"],
             add_on=held is not None,
-        ))
+            marks=c["marks"],
+        )
+        trades.append(trade)
 
         # Cash out the door: contracts plus fees; the receipt comes back at exit
         cash -= invested
         pending_exits.append((c["exit_date"], receipt))
-        # Counted in the portfolio value at cost until it pays out
-        open_costs.append((c["exit_date"], total_cost))
+        # Counted in the portfolio value (at market) until it pays out
+        open_trades.append(trade)
 
         # Mark both tickers as active so no OVERLAPPING pair is added later;
         # the release ledger frees them again on this trade's exit date.
@@ -6682,12 +7248,12 @@ def _simulate_at_discount(
         active_until.append((c["exit_date"], mB["ticker"]))
 
         if add_to_held:
-            # Add what this trade cost (its contracts plus the fees paid for
-            # them) and its ladder holds to its pair's record
+            # Add this trade, with what it paid (its contracts plus fees), and
+            # its ladder holds to its pair's record
             if held is None:
-                held = open_pairs[c["pair_id"]] = {"cost": 0.0, "until": c["exit_date"],
+                held = open_pairs[c["pair_id"]] = {"trades": [], "until": c["exit_date"],
                                                    "ladders": Counter()}
-            held["cost"] += invested
+            held["trades"].append((trade, invested))
             held["ladders"].update((*ladders_a, *ladders_b))
             if c["pair_id"] in traded_pairs:
                 add_ons += 1
@@ -7133,7 +7699,7 @@ def run_backtest(
          main._dedup_pairs rule).                                  [simulate]
       7. Walk the entries in date order with a running cash balance: each
          trade bets a share of that Monday's portfolio value (cash plus open
-         trades at cost) but spends at most the cash left, shrinking to fit;
+         trades at market) but spends at most the cash left, shrinking to fit;
          at most one open time-series trade per ladder; each pair trades at
          most once (only the add-on family of run_backtest_sweep,
          _simulate_at_discount(add_to_held=True), adds to a pair it still
@@ -7160,8 +7726,8 @@ def run_backtest(
             [date, portfolio_value, daily_return], one row per day from
             start_date - 1 day (the untouched initial balance) through today,
             flat at initial_balance if trades is empty. portfolio_value is cash
-            plus open positions carried at cost, so deploying capital does not
-            move it (see _build_equity_curve).
+            plus open positions at market (see _build_equity_curve), so
+            deploying capital moves it only by the fees.
 
     Raises:
         ValueError: Before any fetch, from _prepare_candidates(), when
@@ -7952,15 +8518,24 @@ def _sweep_from_candidates(
                          "(%d time-series, %d same-title)", len(tier_off_entries[band]),
                          len(ts_entries), len(st_entries))
             _log_qualifying_mondays(tier_off_entries[band], band, tier_floors=False)
+    # The prices that value every entry's trades at market while open (every
+    # band's records, tier floors on and off; the same-title records sit in
+    # each band's list), taken from the candles before they are released.
+    # Each market's LegQuotes is shared by every record that holds it.
+    _attach_leg_quotes(
+        [rec for entries in (*entries_by_band.values(), *tier_off_entries.values())
+         for rec in entries],
+        candidates.candles_by_ticker, candidates.start_date)
     # Nothing below reads a candle or the pair list. Releasing both here keeps
-    # the peak at a single-band run's entry-pass peak and, like the old
-    # single-band path (whose pair list died with _prepare_entries' locals),
+    # the peak at a single-band run's entry-pass peak and, like the
+    # single-band path (whose pair list dies with _prepare_entries' locals),
     # holds no pair tuple through the simulations: the entry dicts carry the
-    # market records they need (mA/mB) and never a candle. Only the scalar
-    # fields — label_coverage, start_date, same_event_ladders,
-    # corpus_provenance — are read after this point. The pre-passes' rescan
-    # lists are lists of pair tuples too, so they go with them (their entries
-    # already live on in entries_by_band and tier_off_entries).
+    # market records they need (mA/mB) and never a candle, and the records'
+    # quotes keep only small sampled arrays. Only the scalar fields —
+    # label_coverage, start_date, same_event_ladders, corpus_provenance — are
+    # read after this point. The pre-passes' rescan lists are lists of pair
+    # tuples too, so they go with them (their entries already live on in
+    # entries_by_band and tier_off_entries).
     del candidates.candles_by_ticker, candidates.all_pairs
     del rescan, no_band_entries, off_rescan, off_no_band_entries
 
@@ -8613,6 +9188,112 @@ def run_backtest_sweep(
 
 # ─── Equity curve construction ────────────────────────────────────────────────
 
+def _open_value_path(trade: BacktestTrade) -> np.ndarray | None:
+    """
+    What an open trade is worth at the end of each day it is held: the one day-end path.
+
+    One value per UTC day from the entry day to the day before its pay-out
+    day, each n x (the day-end value of each leg): the latest usable ask of
+    the side it holds at that day's end, its payout once its market has paid
+    out, or its entry price before that side has had any usable ask
+    (LegQuotes.day_values). _carry_steps and
+    _value_steps are built from it, so the equity curve, the dashboard's
+    per-type lines and its risk-free hurdle all read the same path.
+
+    Args:
+        trade (BacktestTrade): A completed trade.
+
+    Returns:
+        np.ndarray | None: One float per held day; None for a trade with no
+            quotes (valued at cost) or one that pays out on its entry day.
+    """
+    if trade.marks is None:
+        return None
+    held_days = (trade.exit_date - trade.entry_date).days
+    if held_days <= 0:
+        return None
+    quotes_a, quotes_b = trade.marks
+    # Which side each leg holds (scanner.leg_sides) and what it cost
+    side_a, side_b = leg_sides(trade.pair_type)
+    price_a, price_b = _leg_prices_for(trade.pair_type, trade.entry_pA, trade.entry_nA,
+                                       trade.entry_pB, trade.entry_nB)
+    last = trade.exit_date - timedelta(days=1)
+    return trade.n * (quotes_a.day_values(trade.entry_date, last, side_a, price_a)
+                      + quotes_b.day_values(trade.entry_date, last, side_b, price_b))
+
+
+def _path_steps(trade: BacktestTrade, values: list[float], first: float,
+                last: float) -> tuple[tuple[date, float], ...]:
+    """
+    Turn a day-end path into dated steps: `first` on entry, each day's change, `last` on exit.
+
+    A day whose value did not change adds no step.
+
+    Args:
+        trade (BacktestTrade): The trade the path belongs to.
+        values (list[float]): Its day-end values (_open_value_path), entry day first.
+        first (float): The step on the entry day.
+        last (float): The step on the exit day.
+
+    Returns:
+        tuple[tuple[date, float], ...]: (day, amount) pairs in date order.
+    """
+    steps = [(trade.entry_date, first)]
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+        if change:
+            steps.append((trade.entry_date + timedelta(days=i), change))
+    steps.append((trade.exit_date, last))
+    return tuple(steps)
+
+
+def _carry_steps(trade: BacktestTrade) -> tuple[tuple[date, float], ...]:
+    """
+    What the portfolio carries in an open trade, as dated steps: its position on the curve.
+
+    The steps add up, day by day, to the trade's day-end value while it is
+    open (_open_value_path) and to zero from its pay-out day on. With no
+    quotes they are exactly ((entry_date, total_cost), (exit_date,
+    -total_cost)): the trade carried at its cost.
+
+    Args:
+        trade (BacktestTrade): A completed trade.
+
+    Returns:
+        tuple[tuple[date, float], ...]: (day, amount) pairs in date order.
+    """
+    path = _open_value_path(trade)
+    if path is None:
+        return ((trade.entry_date, trade.total_cost), (trade.exit_date, -trade.total_cost))
+    values = path.tolist()
+    return _path_steps(trade, values, values[0], -values[-1])
+
+
+def _value_steps(trade: BacktestTrade) -> tuple[tuple[date, float], ...]:
+    """
+    What an open trade adds to the portfolio value each day, as dated steps.
+
+    Cash falls by total_cost + fees on the entry day while the position
+    enters at its day-end value; each later day adds the change in that
+    value; the pay-out day adds the receipt less the last value. The steps
+    sum to the trade's profit. With no quotes they are exactly ((entry_date,
+    -fees), (exit_date, actual_payoff - total_cost)).
+
+    Args:
+        trade (BacktestTrade): A completed trade.
+
+    Returns:
+        tuple[tuple[date, float], ...]: (day, amount) pairs in date order.
+    """
+    path = _open_value_path(trade)
+    if path is None:
+        return ((trade.entry_date, -trade.fees),
+                (trade.exit_date, trade.actual_payoff - trade.total_cost))
+    values = path.tolist()
+    return _path_steps(trade, values, (values[0] - trade.total_cost) - trade.fees,
+                       trade.actual_payoff - values[-1])
+
+
 def _build_equity_curve(
     trades: list[BacktestTrade],
     start_date: date,
@@ -8624,10 +9305,16 @@ def _build_equity_curve(
     Construct a daily equity curve DataFrame from the list of backtest trades.
 
     "portfolio_value" is a PORTFOLIO VALUE, not a cash balance: it is cash plus
-    the carrying value of every position still open on that date, where an open
-    position is carried at its COST BASIS (total_cost) for its whole holding
-    period. So committing capital does not move the curve, and the only two
-    moves a trade can make are real economic ones:
+    the value of every position still open at that day's end. An open trade
+    is valued AT MARKET: each leg at the latest usable ask of the side it
+    holds at the end of the day (on a candle ending at or before the next UTC
+    midnight; LegQuotes), at its payout once its market has paid out, and at
+    its entry price before that side has had any usable ask — the same
+    valuation Pass 2 sizes on, read at the
+    day's end rather than at the checkpoint (_open_value_path, through
+    _carry_steps). A trade with no quotes (trade.marks is None, every
+    hand-built trade) is carried at its COST, which leaves it exactly two
+    moves:
       * entry_date: -fees. Cash falls by total_cost + fees while the contracts
         bought with it enter the portfolio at total_cost, so the net step is the
         taker fee alone. Fees are deliberately NOT capitalised into the carrying
@@ -8638,47 +9325,26 @@ def _build_equity_curve(
         cost and the gross settlement receipt credited, so the step is exactly
         the realized P&L before fees. Summed over both dates a trade moves the
         curve by actual_payoff - total_cost - fees, i.e. its own `profit`.
+    A quoted trade moves the curve on every day its value changes as well,
+    but its steps still sum to its own profit, so the curve's endpoints — the
+    start plus every trade's profit — do not depend on the marks.
 
-    Carrying at cost rather than marking to market daily is a deliberate choice
-    (DR-61), and NOT because the prices are missing. A true daily mark-to-market
-    off each leg's candles would need a per-day quote for every open position on
-    every calendar day of the window, and those quotes are already fetched:
-    _fetch_candles_parallel requests each leg's WHOLE hourly series (from the
-    later of start_date midnight UTC and the market's own open, through one day
-    past its close — everything a position in it could need a quote for) and
-    disk-caches it per ticker. What is missing is PLUMBING plus a policy — _find_entry returns
-    entry-checkpoint prices only, so candles_by_ticker lives on the _Candidates
-    object only until the last entry pass (it dies with _prepare_entries on
-    run_backtest's path, and _sweep_from_candidates deletes it before its first
-    simulation), and mark-to-market means threading a per-day series
-    through raw_entries and _simulate_at_discount into this function and
-    deciding what to carry on a day a leg has no candle at all. Cost-basis carry
-    is the minimal change that makes the derived metrics mean what their labels
-    say; do not price the rejected alternative as a new multi-hour fetch. The
-    cost of the choice is that an unrealized swing inside the holding period is
-    invisible, so drawdown here is REALIZED drawdown and is a lower bound on the
-    intraperiod one.
+    The value at market is the ask, which overstates what a leg would sell
+    for by the spread; a leg that stops trading keeps its last quote (there
+    is no age limit) until it pays out, so it shows a flat line and then a
+    jump. Swings inside a day are not seen.
 
     This matters because the curve is the sole input to every risk figure on the
     dashboard: the "Max Drawdown" KPI, the "Drawdown (%)" chart, _sharpe and
     _sortino (which read the derived "daily_return" column), the per-k sweep
     table's drawdown and Sharpe columns, and the benchmark row that sits in the
-    same column as ^GSPC's genuine mark-to-market drawdown. While the curve was
-    cash-only an open position was carried at ZERO, so every one of those read
-    capital DEPLOYMENT as loss: a real 2026-05-01 run with three trades, all
-    three profitable and a +4.8% return, reported a max drawdown of -60.0%, and
-    a k=0.40 point reported -100.0% (total ruin) against a final balance of
-    $4,655.87. Do not reintroduce cash-only accounting here.
+    same column as ^GSPC's own daily drawdown. Carrying an open position at
+    zero (a cash-only curve) would read every trade's deployment as a loss.
 
     The curve opens one day before start_date at the untouched initial balance,
     so a trade entering on start_date itself shows its day-0 cost as a real
-    pct_change and a real decline from the cummax peak. Without that leading row
-    the day-0 step was invisible to both (DR-03), and the per-k sweep table's
-    iloc[0] base was the post-outflow balance while the performance card's base
-    was initial_balance — one run reported two ways on one page. That guarantee
-    is independent of what the day-0 step contains: under DR-61 it is the fees
-    rather than the whole stake, and it is still the leading row that keeps the
-    cummax peak at initial_balance instead of at the already-charged value.
+    pct_change and a real decline from the cummax peak, and the performance
+    card and the per-k sweep table both divide by that same untouched opening.
 
     Args:
         trades (list[BacktestTrade]): Completed backtest trades with entry_date,
@@ -8701,8 +9367,8 @@ def _build_equity_curve(
             when start_date is itself after that day, exactly those two rows —
             with columns:
             - "date" (date): Calendar date.
-            - "portfolio_value" (float): Cash plus open positions at cost, in
-              dollars (see above).
+            - "portfolio_value" (float): Cash plus open positions at market
+              (at cost for a trade with no quotes), in dollars (see above).
             - "daily_return" (float): Fractional daily return (pct_change of portfolio_value).
             Never zero rows: a column-less DataFrame would violate this contract
             and crash the "daily_return" assignment below, as well as every
@@ -8732,23 +9398,23 @@ def _build_equity_curve(
     ]
 
     # Two accumulators, because a portfolio is cash PLUS whatever is still
-    # open. Tracking cash alone carried every open position at zero, which made
-    # the curve dive on entry and recover at settlement whether the trade won
-    # or lost — deployment reported as drawdown (DR-61, see the docstring).
+    # open. Tracking cash alone would carry every open position at zero,
+    # which makes the curve dive on entry and recover at settlement whether
+    # the trade won or lost — deployment reported as drawdown.
     cash_changes: dict[date, float] = defaultdict(float)
     position_changes: dict[date, float] = defaultdict(float)
     for t in trades:
         # Cash leaves the portfolio on entry day (contract cost + taker fees)
+        # and the gross receipt comes back on the pay-out day
         cash_changes[t.entry_date] -= t.total_cost + t.fees
-        # ...but the contracts it bought are an ASSET held until settlement, so
-        # they re-enter the portfolio at cost and only the fees are a realized
-        # day-one charge. Fees are deliberately not capitalised: they are gone
-        # the moment the order fills and nothing can be sold on for them.
-        position_changes[t.entry_date] += t.total_cost
-        # At settlement the position is written off at cost and the gross
-        # receipt credited, so the step is exactly the realized pre-fee P&L.
-        cash_changes[t.exit_date]      += t.actual_payoff
-        position_changes[t.exit_date]  -= t.total_cost
+        cash_changes[t.exit_date]  += t.actual_payoff
+        # ...while the contracts it bought are an ASSET held until then: they
+        # enter the portfolio at their day-end value, move with it each day
+        # and leave it on the pay-out day (at cost, entry and exit only, for
+        # a trade with no quotes). Fees are never part of that value: they
+        # are gone the moment the order fills.
+        for when, amount in _carry_steps(t):
+            position_changes[when] += amount
 
     rows = []
     cash = initial_balance

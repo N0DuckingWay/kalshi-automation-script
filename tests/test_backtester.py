@@ -1,5 +1,6 @@
 """Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
 import ast
+import copy
 import gc
 import inspect
 import logging
@@ -7733,8 +7734,16 @@ class TestPrepareEntriesGolden:
         monday_keys = {"entry_date", "pA", "pB", "nA", "nB", "mA", "mB", "gap_days"}
         rows = []
         for rec in entries:
-            # The record and entry shapes are part of the contract too.
-            assert set(rec) == {"pair_type", "canon", "group_key", "entry"}
+            # The record and entry shapes are part of the contract too. A
+            # record may also carry the prices that value its trades at market
+            # ("leg_quotes", written by _attach_leg_quotes), keyed by exactly
+            # the pair's two tickers
+            assert set(rec) - {"leg_quotes"} == {"pair_type", "canon", "group_key", "entry"}
+            if "leg_quotes" in rec:
+                assert set(rec["leg_quotes"]) == {rec["entry"]["mA"]["ticker"],
+                                                  rec["entry"]["mB"]["ticker"]}
+                assert all(isinstance(q, backtester.LegQuotes)
+                           for q in rec["leg_quotes"].values())
             e = rec["entry"]
             assert set(e) == monday_keys | {"later"}
             # Every later qualifying Monday carries every key but "later"
@@ -7760,6 +7769,9 @@ class TestPrepareEntriesGolden:
         # passed through untouched, never arithmetic.
         assert self._rows(entries) == self._GOLDEN[ladders]
         assert coverage.total == self._GOLDEN_CENSUS_TOTAL
+        # Every record _prepare_entries returns carries its markets' quotes
+        # (every ticker here has candles), so its trades are valued at market
+        assert all("leg_quotes" in rec for rec in entries)
 
     @pytest.mark.parametrize("ladders", [True, False])
     def test_the_two_halves_compose_to_the_capture(self, monkeypatch, ladders):
@@ -9509,11 +9521,13 @@ class TestOpenLadderExposure:
 class TestSizesOnPortfolioValue:
     """Pass 2 sizes each Monday's candidates on that Monday's opening
     portfolio value — the cash after the day's pay-outs plus every open trade
-    at its cost, the valuation the equity curve uses — and never spends more
-    than the cash left (config.kelly_budget), as a live run sizes on its cash
-    plus Kalshi's value of its open positions. Every simulation is handed k
-    and a size cap of 1.0, and only time-series pairs trade, so no figure
-    here depends on a toggle.
+    at its value, the valuation the equity curve uses (these hand-built
+    records carry no quotes, so at its cost; TestSizesAtMarket has the
+    quoted case) — and never spends more than the cash left
+    (config.kelly_budget), as a live run sizes on its cash plus Kalshi's
+    value of its open positions. Every simulation is handed k and a size cap
+    of 1.0, and only time-series pairs trade, so no figure here depends on a
+    toggle.
 
     The opener trades on Monday 1 and pays out on 01-15: it is open on
     Monday 2 (01-12) and paid out by Monday 3 (01-19); one test has it pay
@@ -9834,9 +9848,10 @@ class TestAddToHeldPairs:
         """The portfolio value an add-on is sized on (its balance_at_entry)
         is the equity curve's portfolio value at the close before its Monday,
         read off the curve rather than rebuilt from the trades' fields. Pass 2
-        and the curve each carry open trades at cost, fees excluded; this pins
-        the two to one figure, so a change to one that the other does not
-        follow fails here. The stake beside it counts the fees."""
+        and the curve value open trades the same way, fees excluded (this
+        hand-built record has no quotes, so both at cost); this pins the two
+        to one figure, so a change to one that the other does not follow
+        fails here. The stake beside it counts the fees."""
         p = self._widening_pair()
         f2 = _uncapped_kelly({"pair_type": "time_series", "entry": p["entry"]["later"][0]}, 0.85)
         on = self._sim([p], k=0.85, add_to_held=True)
@@ -16068,3 +16083,707 @@ class TestCapSweepTierSetting:
         assert [kw for _pop, kw in seen] == [
             {"size_cap": cap, "quiet": True, "tier_floors": False}
             for cap in (0.1, backtester.BUDGET_FRACTION, 1.0)]
+
+
+# ─── Open trades valued at market: the sizing base and the equity curve ──────
+
+def _at(day: date, hour: int) -> int:
+    """Unix time of `hour`:00 UTC on `day`: a candle's end."""
+    return int(datetime(day.year, day.month, day.day, hour, tzinfo=UTC).timestamp())
+
+
+def _quoted(records: list[dict], candles: dict, start: date = date(2026, 1, 1)) -> list[dict]:
+    """The records, each given its markets' quotes by the one writer."""
+    backtester._attach_leg_quotes(records, candles, start)
+    return records
+
+
+def _unquoted(records: list[dict]) -> list[dict]:
+    """The same records without their quotes, so every trade is valued at cost."""
+    return [{key: value for key, value in rec.items() if key != "leg_quotes"}
+            for rec in records]
+
+
+class TestLegQuotes:
+    """LegQuotes holds one market's asks at each UTC day's end and at each
+    entry checkpoint: each side's latest usable ask (strictly between 0 and 1,
+    a NO ask also below the 0.99 the candle clamps an empty YES-bid book to),
+    read from its candles by _candles_at_or_before (the lookup _find_entry
+    uses), its payout from its settlement time on, and NaN before a side's
+    first usable ask, which a lookup returns as the leg's entry price. These
+    are the prices every open trade is valued at, so each rule here moves
+    sizing and the equity curve."""
+
+    _START = date(2026, 1, 1)
+    _MARKET = {"ticker": "Q", "settlement_ts": "2026-01-21T12:00:00Z", "result": "yes"}
+
+    @staticmethod
+    def _candles() -> list[dict]:
+        # One candle ends exactly at a UTC midnight (01-08 00:00) and one
+        # exactly at the 01-12 entry checkpoint
+        checkpoint = int(backtester._checkpoint_datetime(date(2026, 1, 12)).timestamp())
+        return [_candle(_at(date(2026, 1, 5), 9), 0.30, 0.70),
+                _candle(_at(date(2026, 1, 8), 0), 0.35, 0.66),
+                _candle(checkpoint, 0.40, 0.61),
+                _candle(_at(date(2026, 1, 14), 23), 0.45, 0.56)]
+
+    def _quotes(self, market=None, candles=None):
+        quotes, _stale = backtester._leg_quotes(market or self._MARKET,
+                                                self._candles() if candles is None else candles,
+                                                self._START)
+        return quotes
+
+    def test_samples_equal_a_brute_force_lookup(self):
+        candles = self._candles()
+        q = self._quotes(candles=candles)
+        settle = datetime(2026, 1, 21, 12, tzinfo=UTC).timestamp()
+        assert q.first_day == date(2026, 1, 5) and q.first_checkpoint == date(2026, 1, 5)
+        day = q.first_day
+        while day <= date(2026, 1, 28):
+            end = _at(day + timedelta(days=1), 0)
+            sample = (q.day_values(day, day, "yes", -1.0).tolist(),
+                      q.day_values(day, day, "no", -1.0).tolist())
+            if end >= settle:
+                assert sample == ([1.0], [0.0]), day
+            else:
+                c = backtester._candle_at_or_before(candles, end)
+                assert sample == ([c["yes_ask_close"]], [c["no_ask_close"]]), day
+            day += timedelta(days=1)
+        for monday in (date(2026, 1, 5), date(2026, 1, 12), date(2026, 1, 19),
+                       date(2026, 1, 26)):
+            moment = int(backtester._checkpoint_datetime(monday).timestamp())
+            got = (q.at_checkpoint(monday, "yes", -1.0), q.at_checkpoint(monday, "no", -1.0))
+            if moment >= settle:
+                assert got == (1.0, 0.0), monday
+            else:
+                c = backtester._candle_at_or_before(candles, moment)
+                assert got == (c["yes_ask_close"], c["no_ask_close"]), monday
+        # The candle ending AT the checkpoint counts there, and the one ending
+        # at midnight counts at the end of the day before
+        assert q.at_checkpoint(date(2026, 1, 12), "yes", -1.0) == 0.40
+        assert q.day_values(date(2026, 1, 7), date(2026, 1, 7), "yes", -1.0).tolist() == [0.35]
+        # A range of days is the same samples in order
+        assert q.day_values(date(2026, 1, 6), date(2026, 1, 9), "no", -1.0).tolist() == [
+            0.70, 0.66, 0.66, 0.66]
+
+    @pytest.mark.parametrize("yes, no, no_value", [
+        (1.00, 0.00, 0.33), (0.00, 1.00, 0.33), ("x", None, 0.33), (float("nan"), 0.50, 0.50),
+        (1.00, 0.99, 0.33)])
+    def test_a_side_with_no_usable_ask_yet_reads_the_entry_price(self, yes, no, no_value):
+        # One candle whose YES ask is no price (an empty book's 1.00, 0, an
+        # unreadable value): the YES side has had no usable ask, so it reads
+        # the entry price; a NO ask at the 0.99 clamp is no price either
+        q = self._quotes(candles=[_candle(_at(date(2026, 1, 5), 9), yes, no)])
+        assert q.at_checkpoint(date(2026, 1, 12), "yes", 0.31) == 0.31
+        assert q.day_values(date(2026, 1, 6), date(2026, 1, 6), "yes", 0.31).tolist() == [0.31]
+        assert q.at_checkpoint(date(2026, 1, 12), "no", 0.33) == no_value
+
+    def test_a_side_keeps_its_last_usable_ask(self):
+        # 01-09: a real quote. 01-10: the YES ask book empties (1.00) while
+        # the NO ask reads 0.02. 01-11: an unreadable YES ask and a NO ask at
+        # the 0.99 clamp. Each side keeps its last usable ask through both,
+        # at each day's end and at the 01-12 checkpoint, until the payout
+        candles = [_candle(_at(date(2026, 1, 5), 9), 0.20, 0.80),
+                   _candle(_at(date(2026, 1, 9), 15), 0.97, 0.04),
+                   _candle(_at(date(2026, 1, 10), 15), 1.00, 0.02),
+                   _candle(_at(date(2026, 1, 11), 15), "x", 0.99)]
+        q = self._quotes(candles=candles)
+        first, last = date(2026, 1, 9), date(2026, 1, 20)
+        assert q.day_values(first, last, "yes", -1.0).tolist() == [0.97] * 12
+        assert q.day_values(first, last, "no", -1.0).tolist() == [0.04] + [0.02] * 11
+        assert q.at_checkpoint(date(2026, 1, 12), "yes", -1.0) == 0.97
+        assert q.at_checkpoint(date(2026, 1, 12), "no", -1.0) == 0.02
+        # The payout from settlement on (01-21 12:00, result yes)
+        assert q.day_values(date(2026, 1, 21), date(2026, 1, 21), "yes", -1.0).tolist() == [1.0]
+
+    def test_a_gap_in_hand_built_samples_keeps_the_last_ask(self):
+        # LegQuotes carries its own samples forward, so a NaN after a usable
+        # ask reads that ask; a NaN before any usable ask reads the entry price
+        q = backtester.LegQuotes("Q", date(2026, 1, 5), [np.nan, 0.30, np.nan, 0.35, np.nan],
+                                 [0.70, np.nan, np.nan, 0.65, np.nan], date(2026, 1, 5),
+                                 [np.nan, 0.31], [0.69, np.nan], float("nan"), float("nan"))
+        days = (date(2026, 1, 5), date(2026, 1, 9))
+        assert q.day_values(*days, "yes", 0.2).tolist() == [0.2, 0.30, 0.30, 0.35, 0.35]
+        assert q.day_values(*days, "no", 0.8).tolist() == [0.70, 0.70, 0.70, 0.65, 0.65]
+        assert q.at_checkpoint(date(2026, 1, 5), "yes", 0.2) == 0.2
+        assert q.at_checkpoint(date(2026, 1, 12), "no", 0.8) == 0.69
+        # An unknown payout: past the samples the last day-end ask stands
+        assert q.day_values(date(2026, 1, 20), date(2026, 1, 20), "yes", 0.2).tolist() == [0.35]
+        assert q.at_checkpoint(date(2026, 1, 26), "no", 0.8) == 0.65
+        assert np.isnan(q.yes_days[0]) and not np.isnan(q.yes_days[2])
+
+    def test_a_sub_cent_ask_is_a_price(self):
+        # A YES ask under a cent on a fine grid is a real price (a losing YES
+        # leg), not "no quote": it reads as itself
+        q = self._quotes(candles=[_candle(_at(date(2026, 1, 5), 9), 0.20, 0.80),
+                                  _candle(_at(date(2026, 1, 8), 9), 0.008, 0.99)])
+        assert q.day_values(date(2026, 1, 8), date(2026, 1, 8), "yes", 0.20).tolist() == [0.008]
+        assert q.at_checkpoint(date(2026, 1, 12), "yes", 0.20) == 0.008
+        # ... while its NO ask, at the 0.99 clamp, keeps the last usable one
+        assert q.at_checkpoint(date(2026, 1, 12), "no", 0.80) == 0.80
+
+    @pytest.mark.parametrize("raw, side, usable", [
+        (0.5, "yes", True), (0.0001, "yes", True), (0.9999, "yes", True), ("0.42", "yes", True),
+        (1.0, "yes", False), (0.0, "yes", False), (-0.1, "yes", False), (1.5, "yes", False),
+        (float("nan"), "yes", False), ("x", "yes", False), (None, "yes", False),
+        (0.98, "no", True), (0.01, "no", True), (0.99, "no", False),
+        (0.99 - 1e-9, "no", False), (1.0, "no", False), (0.0, "no", False)])
+    def test_which_asks_are_usable(self, raw, side, usable):
+        value = backtester._usable_ask(raw, side)
+        assert (value == value) is usable
+        if usable:
+            assert value == float(raw)
+
+    def test_before_the_first_candle_reads_the_entry_price(self):
+        q = self._quotes(candles=[_candle(_at(date(2026, 1, 13), 9), 0.40, 0.61)])
+        assert q.first_day == date(2026, 1, 13)
+        assert q.day_values(date(2026, 1, 11), date(2026, 1, 13), "yes", 0.2).tolist() == [
+            0.2, 0.2, 0.40]
+
+    @pytest.mark.parametrize("result, yes, no", [("yes", 1.0, 0.0), ("no", 0.0, 1.0)])
+    def test_the_payout_from_settlement_on(self, result, yes, no):
+        q = self._quotes(market=dict(self._MARKET, result=result))
+        for day in (date(2026, 1, 21), date(2026, 6, 1)):
+            assert q.day_values(day, day, "yes", 0.5).tolist() == [yes]
+            assert q.day_values(day, day, "no", 0.5).tolist() == [no]
+        assert q.at_checkpoint(date(2026, 3, 2), "yes", 0.5) == yes
+        assert q.at_checkpoint(date(2026, 3, 2), "no", 0.5) == no
+        # The day before it reads the last candle
+        assert q.day_values(date(2026, 1, 20), date(2026, 1, 20), "yes", 0.5).tolist() == [0.45]
+
+    def test_an_unknown_payout_keeps_the_last_ask(self):
+        # With no known result the settlement time pays nothing: the asks go
+        # on, and past the samples the last usable ask stands
+        q = self._quotes(market=dict(self._MARKET, result=""))
+        assert q.day_values(date(2026, 1, 21), date(2026, 1, 21), "yes", 0.37).tolist() == [0.45]
+        assert q.day_values(date(2026, 6, 1), date(2026, 6, 1), "yes", 0.37).tolist() == [0.45]
+        assert q.at_checkpoint(date(2026, 3, 2), "no", 0.37) == 0.56
+
+    def test_two_builds_are_equal_and_a_copy_is_itself(self):
+        a, b = self._quotes(), self._quotes()
+        assert a is not b and a == b and hash(a) == hash(b)
+        # Equal quotes share one fingerprint (what the dashboard keys on)
+        assert a.fingerprint == b.fingerprint
+        assert copy.copy(a) is a and copy.deepcopy(a) is a
+        with pytest.raises(ValueError):
+            a.yes_days[0] = 0.9
+        # NaN samples compare equal to NaN
+        dead = [_candle(_at(date(2026, 1, 5), 9), "x", "x")]
+        assert self._quotes(candles=dead) == self._quotes(candles=dead)
+        other = self._candles()
+        other[-1] = _candle(other[-1]["ts"], 0.46, 0.56)
+        assert self._quotes(candles=other) != a
+        assert self._quotes(candles=other).fingerprint != a.fingerprint
+        # -0.0 and 0.0, and two NaNs, are one value to both
+        zero = backtester.LegQuotes("Z", date(2026, 1, 5), [0.0, np.nan], [np.nan, 0.5],
+                                    date(2026, 1, 5), [], [], 0.0, 1.0)
+        signed = backtester.LegQuotes("Z", date(2026, 1, 5), [-0.0, float("nan")],
+                                      [float("nan"), 0.5], date(2026, 1, 5), [], [], -0.0, 1.0)
+        assert zero == signed and zero.fingerprint == signed.fingerprint
+        # A trade holding it keeps the same object through astuple
+        trade = backtester.BacktestTrade(
+            "time_series", "Q", "R", "", "", "Other", date(2026, 1, 5), date(2026, 1, 21),
+            0.3, 0.6, 0.7, 0.4, 10, 7.0, 0.3, "yes", "yes", 10.0, 2.7, 0.3, 0.6, 0.1, 2.7,
+            0.0, 16, 10_000.0, marks=(a, b))
+        assert astuple(trade)[-1][0] is a
+
+    def test_no_candle_is_kept(self):
+        class _Candle(dict):
+            pass
+
+        candles = {t: [_Candle(c) for c in self._candles()] for t in ("OA", "OB")}
+        refs = [weakref.ref(c) for series in candles.values() for c in series]
+        rec = _quoted([TestSizesOnPortfolioValue._opener()], candles)[0]
+        del candles
+        gc.collect()
+        assert all(r() is None for r in refs)
+        assert rec["leg_quotes"]["OA"].at_checkpoint(date(2026, 1, 12), "yes", 0.5) == 0.40
+
+    def test_a_day_off_the_weekly_grid_raises(self):
+        q = self._quotes()
+        for day in (date(2026, 1, 13), date(2025, 12, 29)):
+            with pytest.raises(ValueError, match="not an entry checkpoint"):
+                q.at_checkpoint(day, "yes", 0.5)
+        with pytest.raises(ValueError, match="side"):
+            q.at_checkpoint(date(2026, 1, 12), "maybe", 0.5)
+
+    def test_the_writer_quotes_only_records_whose_markets_have_candles(self):
+        quoted_a, quoted_b = TestSizesOnPortfolioValue._opener(), TestSizesOnPortfolioValue._opener()
+        bare = TestSizesOnPortfolioValue._follower(_LADDER_M2)
+        candles = {"OA": self._candles(), "OB": self._candles()}
+        _quoted([quoted_a, bare, quoted_b, quoted_a], candles)
+        assert set(quoted_a["leg_quotes"]) == {"OA", "OB"}
+        assert "leg_quotes" not in bare
+        # On the record, never on its entry dict (the Monday's keys)
+        assert "leg_quotes" not in quoted_a["entry"]
+        # One LegQuotes per ticker, shared by every record in one call
+        assert quoted_a["leg_quotes"]["OA"] is quoted_b["leg_quotes"]["OA"]
+
+    def test_legs_on_old_quotes_are_counted_at_debug(self, caplog):
+        # OA's last candle is ten days before it pays out; OB's is recent
+        stale = {"OA": [_candle(_at(date(2026, 1, 4), 9), 0.20, 0.80)],
+                 "OB": [_candle(_at(date(2026, 1, 14), 9), 0.60, 0.40)]}
+        with caplog.at_level(logging.DEBUG):
+            _quoted([TestSizesOnPortfolioValue._opener()], stale)
+        assert [r.getMessage() for r in caplog.records if "old on some day" in r.getMessage()
+                ] == ["Legs valued on a quote more than 7 days old on some day before they "
+                      "pay out: 1"]
+        assert all(r.levelno == logging.DEBUG for r in caplog.records
+                   if "old on some day" in r.getMessage())
+
+
+class TestSizesAtMarket:
+    """Pass 2 sizes each Monday on the cash plus every open trade AT MARKET
+    (_open_value): each leg at the latest usable ask of the side it holds on
+    a candle at or before the checkpoint, its payout once its market has paid
+    out, its entry price before it has had a usable ask. TestSizesOnPortfolioValue's
+    opener (YES on OA at 0.20, NO on OB at 0.40, paying out 01-15) and
+    follower are given candles here; on Saturday 01-10 OB's NO ask falls to
+    0.30, so on Monday 2 the opener is worth n x 0.50, not its cost n x 0.60.
+    The follower is sized on that value, as live compute_trade sizes on the
+    same value and cash."""
+
+    _START = date(2026, 1, 1)
+    _BALANCE = 10_000.0
+
+    def _candles(self, *, ob=((date(2026, 1, 10), 15, 0.70, 0.30),
+                              (date(2026, 1, 13), 15, 0.45, 0.55)), oa=()):
+        return {
+            "OA": [_candle(_at(_LADDER_M1, 9), 0.20, 0.80)]
+                  + [_candle(_at(d, h), y, n) for d, h, y, n in oa],
+            "OB": [_candle(_at(_LADDER_M1, 9), 0.60, 0.40)]
+                  + [_candle(_at(d, h), y, n) for d, h, y, n in ob],
+            "FA": [_candle(_at(_LADDER_M2, 9), 0.20, 0.80)],
+            "FB": [_candle(_at(_LADDER_M2, 9), 0.60, 0.40)],
+        }
+
+    def _sim(self, records, *, k=0.75):
+        return backtester._simulate_at_discount(records, self._START, self._BALANCE, k=k,
+                                                 size_cap=1.0, end_date=date(2026, 4, 1))
+
+    def _records(self, opener=None, candles=None):
+        records = [opener or TestSizesOnPortfolioValue._opener(),
+                   TestSizesOnPortfolioValue._follower(_LADDER_M2)]
+        return _quoted(records, self._candles() if candles is None else candles)
+
+    def test_a_moved_ask_sizes_the_next_trade_on_the_new_value(self):
+        records = self._records()
+        point = self._sim(records)
+        assert _traded(point) == [("OA", _LADDER_M1), ("FA", _LADDER_M2)]
+        opener, follower = point.trades
+        assert opener.marks is not None and follower.marks is not None
+        cash = self._BALANCE - (opener.total_cost + opener.fees)
+        value = cash + opener.n * (0.20 + 0.30)
+        assert backtester._open_value(opener, _LADDER_M2) == pytest.approx(opener.n * 0.50)
+        assert follower.balance_at_entry == pytest.approx(value, abs=1e-9)
+        # ... below the value at cost, which the same records without quotes
+        # size on
+        assert value < cash + opener.total_cost
+        at_cost = self._sim(_unquoted(records))
+        assert at_cost.trades[1].balance_at_entry == pytest.approx(cash + opener.total_cost)
+        assert at_cost.trades[1].n > follower.n
+        # ... and the count live compute_trade sizes on that value and cash
+        assert follower.n == TestSizesOnPortfolioValue._live_n(value, cash, 0.75)
+
+    def test_nothing_moved_since_the_last_close_means_the_curve_s_value(self):
+        # Nothing trades between the 01-11 close and Monday 2's checkpoint, so
+        # the value the follower is sized on is the curve's row for 01-11
+        point = self._sim(self._records())
+        follower = point.trades[1]
+        curve = point.equity_df.set_index("date")["portfolio_value"]
+        assert follower.balance_at_entry == pytest.approx(
+            float(curve[date(2026, 1, 11)]), abs=1e-9)
+
+    def test_a_leg_paid_out_mid_trade_counts_at_its_payout(self):
+        # OA settles NO on 01-08: from then the YES leg is worth 0, while OB
+        # (paying out 01-15) is still worth its NO ask
+        opener = _ladder_record(_ladder_market("OA", "EVO-1", "2026-01-08"),
+                                _ladder_market("OB", "EVO-2", "2026-01-15"), "o",
+                                [_LADDER_M1])
+        point = self._sim(self._records(opener=opener))
+        first, follower = point.trades
+        assert first.exit_date == date(2026, 1, 15)
+        assert backtester._open_value(first, _LADDER_M2) == pytest.approx(first.n * 0.30)
+        cash = self._BALANCE - (first.total_cost + first.fees)
+        assert follower.balance_at_entry == pytest.approx(cash + first.n * 0.30, abs=1e-9)
+        assert follower.n == TestSizesOnPortfolioValue._live_n(
+            cash + first.n * 0.30, cash, 0.75)
+
+    def test_a_dead_quote_keeps_the_last_usable_ask(self):
+        # OB's only candle after Monday 1 has no usable ask (a YES ask of 0
+        # and a NO ask of 1.00): the NO leg keeps its last usable NO ask, the
+        # Monday-1 candle's 0.40, which is its entry price, so the trade
+        # counts at its cost
+        candles = self._candles(ob=((date(2026, 1, 10), 15, 0.0, 1.00),))
+        point = self._sim(self._records(candles=candles))
+        opener, follower = point.trades
+        assert backtester._open_value(opener, _LADDER_M2) == opener.total_cost
+        cash = self._BALANCE - (opener.total_cost + opener.fees)
+        assert follower.balance_at_entry == pytest.approx(cash + opener.total_cost, abs=1e-9)
+
+    def test_a_dead_quote_after_a_move_keeps_the_moved_ask(self):
+        # OB's NO ask moves to 0.35 on Friday 01-09; on Saturday its candle
+        # has no usable ask. On Monday 2 the NO leg is worth 0.35, its last
+        # usable ask, not its 0.40 entry price
+        candles = self._candles(ob=((date(2026, 1, 9), 15, 0.65, 0.35),
+                                    (date(2026, 1, 10), 15, 0.0, 1.00)))
+        point = self._sim(self._records(candles=candles))
+        opener, follower = point.trades
+        assert backtester._open_value(opener, _LADDER_M2) == pytest.approx(
+            opener.n * (0.20 + 0.35))
+        cash = self._BALANCE - (opener.total_cost + opener.fees)
+        value = cash + opener.n * (0.20 + 0.35)
+        assert follower.balance_at_entry == pytest.approx(value, abs=1e-9)
+        assert follower.n == TestSizesOnPortfolioValue._live_n(value, cash, 0.75)
+
+    def test_an_emptied_yes_book_keeps_the_last_yes_ask(self):
+        # OA's YES ask rises to 0.97 on Friday 01-09; from Saturday no one
+        # offers YES (an ask of 1.00) until the pair pays out on 01-15. The
+        # YES leg keeps 0.97 on every day-end row and at Monday 2's
+        # checkpoint: the curve never falls back to the 0.20 entry price
+        candles = self._candles(ob=(), oa=((date(2026, 1, 9), 15, 0.97, 0.04),
+                                           (date(2026, 1, 10), 15, 1.00, 0.02)))
+        point = self._sim(self._records(candles=candles)[:1])
+        (t,) = point.trades
+        assert backtester._open_value(t, _LADDER_M2) == pytest.approx(t.n * (0.97 + 0.40))
+        curve = point.equity_df.set_index("date")["portfolio_value"]
+        cash = self._BALANCE - t.total_cost - t.fees
+        day = date(2026, 1, 9)
+        while day < date(2026, 1, 15):
+            assert curve[day] == pytest.approx(cash + t.n * (0.97 + 0.40), abs=1e-6), day
+            day += timedelta(days=1)
+        assert curve[date(2026, 1, 15)] == pytest.approx(self._BALANCE + t.profit, abs=1e-9)
+
+    def test_a_no_ask_at_the_clamp_is_not_a_price(self):
+        # OB's YES-bid book empties on Friday 01-09: the candle stores its NO
+        # ask as 0.99 (the clamp), beside a YES ask of 0.55. That 0.99 is not
+        # a price: the NO leg keeps 0.40, so Monday 2 sizes on the value at
+        # cost rather than on a NO leg near $1
+        candles = self._candles(ob=((date(2026, 1, 9), 15, 0.55, 0.99),
+                                    (date(2026, 1, 13), 15, 0.58, 0.43)))
+        point = self._sim(self._records(candles=candles))
+        opener, follower = point.trades
+        assert backtester._open_value(opener, _LADDER_M2) == opener.total_cost
+        cash = self._BALANCE - (opener.total_cost + opener.fees)
+        assert follower.balance_at_entry == pytest.approx(cash + opener.total_cost, abs=1e-9)
+
+    def test_a_trade_paying_out_on_the_monday_counts_once(self):
+        # The opener pays out on Monday 2 itself (12:00 UTC, before the
+        # checkpoint): its receipt is cash there, and it is no longer an open
+        # trade, so it is never counted twice
+        opener = _ladder_record(_ladder_market("OA", "EVO-1", "2026-01-12"),
+                                _ladder_market("OB", "EVO-2", "2026-01-12"), "o",
+                                [_LADDER_M1])
+        point = self._sim(self._records(opener=opener))
+        first, follower = point.trades
+        assert follower.balance_at_entry == pytest.approx(self._BALANCE + first.profit,
+                                                          abs=1e-9)
+
+    def test_the_curve_carries_the_trade_at_its_day_end_value(self):
+        point = self._sim(self._records()[:1])
+        (t,) = point.trades
+        curve = point.equity_df.set_index("date")["portfolio_value"]
+        n, fees, start = t.n, t.fees, self._BALANCE
+        # DR-03's leading row, and the days before the entry
+        assert curve[date(2025, 12, 31)] == start and curve[date(2026, 1, 4)] == start
+        expected = {
+            date(2026, 1, 5): start - fees,                       # at 0.20 + 0.40, its cost
+            date(2026, 1, 9): start - fees,
+            date(2026, 1, 10): start - fees - n * 0.10,           # NO ask 0.30 from 15:00
+            date(2026, 1, 12): start - fees - n * 0.10,
+            date(2026, 1, 13): start - fees + n * 0.15,           # NO ask 0.55 from 15:00
+            date(2026, 1, 14): start - fees + n * 0.15,
+            date(2026, 1, 15): start + t.profit,                  # paid out
+        }
+        for day, value in expected.items():
+            assert curve[day] == pytest.approx(value, abs=1e-6), day
+        # The endpoint is the start plus the trade's profit, as at cost
+        assert curve.iloc[-1] == pytest.approx(start + t.profit, abs=1e-9)
+        # The value steps sum to the profit; the carry steps to zero
+        assert sum(a for _d, a in backtester._value_steps(t)) == pytest.approx(t.profit)
+        assert sum(a for _d, a in backtester._carry_steps(t)) == pytest.approx(0.0, abs=1e-9)
+
+    def test_a_dip_while_held_is_a_drawdown(self):
+        point = self._sim(self._records()[:1])
+        (t,) = point.trades
+        curve = point.equity_df["portfolio_value"]
+        drawdown = float((curve / curve.cummax() - 1.0).min())
+        # The low is 01-10's mark, n x 0.10 below the start less the fees
+        assert drawdown == pytest.approx(-(t.fees + t.n * 0.10) / self._BALANCE, abs=1e-9)
+        # At cost the only dip is the fees
+        at_cost = self._sim(_unquoted(self._records()[:1])).equity_df
+        low = float((at_cost["portfolio_value"] / at_cost["portfolio_value"].cummax() - 1).min())
+        assert low == pytest.approx(-t.fees / self._BALANCE, abs=1e-9)
+
+    def test_the_value_steps_are_the_curve_s_moves(self):
+        # Two quoted trades: the curve's daily changes are the sum of their
+        # value steps on each day
+        point = self._sim(self._records())
+        steps = defaultdict(float)
+        for t in point.trades:
+            for day, amount in backtester._value_steps(t):
+                steps[day] += amount
+        curve = point.equity_df.set_index("date")["portfolio_value"]
+        for day, change in curve.diff().iloc[1:].items():
+            assert change == pytest.approx(steps.get(day, 0.0), abs=1e-6), day
+
+
+class TestSameTitleFlipAtMarket:
+    """A same-title pair whose pricier side flips between Mondays enters on
+    the Monday its gate passes, A = Y there; its marks follow that Monday's
+    legs (Pass 1b matches the quotes by ticker): NO on Y and YES on X."""
+
+    def test_the_marks_follow_the_traded_legs(self):
+        rec, _x, _y = _flipping_same_title_record()
+        candles = {"X": [_candle(_MONDAY_TS, 0.53, 0.47), _candle(_MONDAY2_TS, 0.40, 0.60),
+                         _candle(_at(date(2026, 1, 14), 9), 0.50, 0.50)],
+                   "Y": [_candle(_MONDAY_TS, 0.47, 0.53), _candle(_MONDAY2_TS, 0.70, 0.30),
+                         _candle(_at(date(2026, 1, 14), 9), 0.75, 0.25)]}
+        _quoted([rec], candles)
+        point = backtester._simulate_at_discount([rec], date(2026, 1, 1), 10_000.0, k=0.75,
+                                                 size_cap=1.0, end_date=date(2026, 3, 1))
+        (t,) = point.trades
+        assert (t.ticker_a, t.ticker_b, t.entry_date) == ("Y", "X", _LADDER_M2)
+        assert (t.marks[0].ticker, t.marks[1].ticker) == ("Y", "X")
+        # Monday 3: NO on Y at 0.25 and YES on X at 0.50
+        assert backtester._open_value(t, _LADDER_M3) == pytest.approx(t.n * 0.75)
+
+
+class TestAddOnStakeAtMarket:
+    """An add-on's held stake is its pair's open trades at market plus the
+    fees paid for them: what each paid, moved by what its contracts gained or
+    lost since. A pair whose value rose past its Kelly share is skipped where
+    at cost it would add; one whose value fell gets a larger add-on. Monday 1
+    quotes pA 0.20 / pB 0.45 / nB 0.55; Monday 2 pA 0.20 / pB 0.47 / nB 0.53
+    (a little wider, so at cost the pair adds a little)."""
+
+    _ROWS = [(_LADDER_M1, 0.20, 0.45, 0.55), (_LADDER_M2, 0.20, 0.47, 0.53)]
+
+    def _pair(self, pa_m2=None):
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-03-20"),
+                           _ladder_market("PB", "EVB-1", "2026-03-20"), "q", self._ROWS)
+        if pa_m2 is not None:
+            _quoted([p], {
+                "PA": [_candle(_at(_LADDER_M1, 9), 0.20, 0.80),
+                       _candle(_at(_LADDER_M2, 9), pa_m2, round(1.0 - pa_m2, 2))],
+                "PB": [_candle(_at(_LADDER_M1, 9), 0.45, 0.55),
+                       _candle(_at(_LADDER_M2, 9), 0.47, 0.53)]})
+        return p
+
+    @staticmethod
+    def _sim(p):
+        return backtester._simulate_at_discount([p], date(2026, 1, 1), 10_000.0, k=0.85,
+                                                 add_to_held=True, end_date=date(2026, 4, 1))
+
+    def test_a_pair_whose_value_rose_past_its_share_is_skipped(self, caplog):
+        at_cost = self._sim(self._pair())
+        assert [t.add_on for t in at_cost.trades] == [False, True]
+        with caplog.at_level(logging.INFO):
+            at_market = self._sim(self._pair(pa_m2=0.40))
+        (first,) = at_market.trades
+        assert any(r.getMessage().startswith(_ADD_ON_CAP_LINE) for r in caplog.records)
+        # The stake at market: what it paid moved by its change in value
+        value = first.n * (0.40 + 0.53)
+        stake = (first.total_cost + first.fees) + (value - first.total_cost)
+        cash = 10_000.0 - (first.total_cost + first.fees)
+        f2 = _uncapped_kelly({"pair_type": "time_series", "entry": self._pair()["entry"]["later"][0]},
+                             0.85)
+        assert held_pair_fraction(f2, stake, cash + value) <= 0
+        assert held_pair_fraction(f2, first.total_cost + first.fees,
+                                  cash + first.total_cost) > 0
+
+    def test_a_pair_whose_value_fell_adds_more(self):
+        at_cost = self._sim(self._pair())
+        fell = self._sim(self._pair(pa_m2=0.10))
+        assert [t.add_on for t in fell.trades] == [False, True]
+        first, add = fell.trades
+        assert add.n > at_cost.trades[1].n
+        value = first.n * (0.10 + 0.53)
+        cash = 10_000.0 - (first.total_cost + first.fees)
+        stake = (first.total_cost + first.fees) + (value - first.total_cost)
+        f2 = _uncapped_kelly({"pair_type": "time_series", "entry": self._pair()["entry"]["later"][0]},
+                             0.85)
+        assert add.balance_at_entry == pytest.approx(cash + value, abs=1e-9)
+        assert add.kelly_fraction == pytest.approx(held_pair_fraction(f2, stake, cash + value),
+                                                   abs=1e-12)
+
+
+_MOVING_EXTRA = {
+    "EA": [(date(2026, 1, 9), 15, 0.45, 0.55), (date(2026, 1, 22), 4, 0.38, 0.62)],
+    "EB": [(date(2026, 1, 10), 15, 0.75, 0.25), (date(2026, 1, 27), 3, 0.70, 0.30)],
+    "RUNG-EARLY": [(date(2026, 1, 16), 6, 0.25, 0.75)],
+    "RUNG-LATE": [(date(2026, 1, 14), 6, 0.66, 0.34), (date(2026, 2, 4), 6, 0.52, 0.48)],
+    "SA": [(date(2026, 1, 7), 6, 0.30, 0.70)],
+    "SB": [(date(2026, 1, 8), 6, 0.66, 0.34), (date(2026, 1, 20), 6, "x", 0.40)],
+}
+
+
+class _MovingGolden(TestPrepareEntriesGolden):
+    """The golden fixture with extra candles that move each traded leg's price
+    after entry (a dead quote among them)."""
+
+    _CANDLES = {t: sorted(list(series) + [_candle(_at(d, h), y, n)
+                                          for d, h, y, n in _MOVING_EXTRA.get(t, [])],
+                          key=lambda c: c["ts"])
+                for t, series in TestPrepareEntriesGolden._CANDLES.items()}
+
+
+@pytest.fixture(scope="class")
+def market_sweep_run():
+    """The moving-price golden fixture through run_backtest_sweep with every
+    family (band sweep, tier floors off, size caps, add to held pairs) on a
+    narrowed grid: band (0, 1) x k (0.5, 0.75)."""
+    toggles = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
+        apply_pre_toggle_defaults(toggles)
+        golden = _MovingGolden()
+        golden._patch(mp)
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=golden._START, initial_balance=10_000.0,
+                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                                 tier_off_sweep=True, add_on_sweep=True)
+        mp.undo()
+        yield SimpleNamespace(res=res, start=golden._START)
+    finally:
+        mp.undo()
+        toggles.undo()
+
+
+@pytest.mark.usefixtures("market_sweep_run")
+class TestMarketCapSweepParity:
+    """With prices that move after entry, every cap of every lazy family
+    (size cap, tier floors off, add to held pairs) still equals a fresh
+    simulation of the same quoted entries — the quotes depend on no cap, k,
+    band, tier setting or population — and the halves and the
+    excluding-top-event check equal fresh re-simulations too. Not vacuous:
+    the same entries without quotes size or mark differently."""
+
+    def _fresh_parity(self, point, subset, start, k, band, pop, cap, *, end_date,
+                      tier_floors=True, add_to_held=False, split_date=None, checks=False):
+        fresh = backtester._simulate_at_discount(
+            subset, start, 10_000.0, k=k, spread_band=band, population=pop, size_cap=cap,
+            quiet=True, end_date=end_date, tier_floors=tier_floors, add_to_held=add_to_held)
+        assert [astuple(t) for t in point.trades] == [astuple(t) for t in fresh.trades], \
+            (band, k, pop, cap)
+        pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df, check_exact=True)
+        assert point.peak_kelly_fraction == fresh.peak_kelly_fraction
+        if checks and pop in ("all", "time_series"):
+            assert point.halves == backtester._half_split(
+                _dr75_halves(subset, split_date), start, 10_000.0, k, band, population=pop,
+                tier_floors=tier_floors, size_cap=cap, quiet=True, end_date=end_date)
+            assert point.ex_top_event == backtester._ex_top_event(
+                fresh, subset, start, 10_000.0, band, population=pop,
+                tier_floors=tier_floors, quiet=True, end_date=end_date)
+        return fresh
+
+    def test_every_cap_of_every_family_equals_a_fresh_simulation(self, market_sweep_run):
+        res, start = market_sweep_run.res, market_sweep_run.start
+        checked = 0
+        for cs, tier_floors in ((res.cap_sweep, True), (res.tier_off_cap_sweep, False)):
+            for band in cs.bands:
+                subsets = _cap_sweep_subsets(cs.entries_by_band[band])
+                assert all("leg_quotes" in r for r in cs.entries_by_band[band])
+                for k in cs.ks:
+                    for cap, pops in cs.cell(band, k).items():
+                        for pop, point in pops.items():
+                            end = backtester._curve_end_date(cs.eager[(band, k, pop)])
+                            self._fresh_parity(point, subsets[pop], start, k, band, pop, cap,
+                                               end_date=end, tier_floors=tier_floors,
+                                               split_date=res.split_date, checks=True)
+                            checked += 1
+        for cs, tier_floors in ((res.add_on_cap_sweep, True),
+                                (res.add_on_tier_off_cap_sweep, False)):
+            for band in cs.bands:
+                entries = cs.entries_by_band[band]
+                for k in cs.ks:
+                    for cap, pops in cs.cell(band, k).items():
+                        point = pops["all"]
+                        self._fresh_parity(point, entries, start, k, band, "all", cap,
+                                           end_date=cs.end_dates[(band, k, "all")],
+                                           tier_floors=tier_floors, add_to_held=True)
+                        checked += 1
+        assert checked > 300
+
+    def test_market_values_move_the_run(self, market_sweep_run):
+        res = market_sweep_run.res
+        cs = res.cap_sweep
+        band, k = (0.0, 1.0), 0.75
+        entries = cs.entries_by_band[band]
+        quoted = backtester._simulate_at_discount(entries, market_sweep_run.start, 10_000.0,
+                                                  k=k, end_date=date(2026, 9, 30))
+        at_cost = backtester._simulate_at_discount(_unquoted(entries), market_sweep_run.start,
+                                                   10_000.0, k=k, end_date=date(2026, 9, 30))
+        # Some open trade is valued off its cost at some checkpoint
+        moved = [(t, d) for t in quoted.trades for d in (_LADDER_M2, _LADDER_M3, date(2026, 1, 26))
+                 if t.entry_date < d < t.exit_date
+                 and backtester._open_value(t, d) != t.total_cost]
+        assert moved
+        # ... and the curve differs, while its end is the same sum of profits
+        assert not quoted.equity_df["portfolio_value"].equals(at_cost.equity_df["portfolio_value"])
+        assert quoted.equity_df["portfolio_value"].iloc[-1] == pytest.approx(
+            10_000.0 + sum(t.profit for t in quoted.trades), abs=1e-6)
+
+
+class TestUnquotedExactness:
+    """A trade with no quotes is valued exactly as before trades were valued
+    at market: _open_value is its total_cost, its steps are the two at-cost
+    steps, and a run of records stripped of their quotes equals the run whose
+    writer did nothing — compared with == and check_exact, never approx."""
+
+    def test_the_steps_and_the_value_of_an_unquoted_trade(self):
+        point = TestSizesOnPortfolioValue()._sim(
+            [TestSizesOnPortfolioValue._opener(), TestSizesOnPortfolioValue._follower(_LADDER_M2)],
+            k=0.75)
+        for t in point.trades:
+            assert t.marks is None
+            assert backtester._open_value(t, _LADDER_M2) == t.total_cost
+            assert backtester._open_value_path(t) is None
+            assert backtester._carry_steps(t) == ((t.entry_date, t.total_cost),
+                                                  (t.exit_date, -t.total_cost))
+            assert backtester._value_steps(t) == ((t.entry_date, -t.fees),
+                                                  (t.exit_date, t.actual_payoff - t.total_cost))
+        opener, follower = point.trades
+        # The value an open unquoted trade adds is its cost, to the bit: the
+        # cash Pass 2 holds (contracts plus each leg's fee, in the fee loop's
+        # order, spent) plus the opener's total_cost
+        fee_a, fee_b = fee_leg_exact(opener.n, 0.20), fee_leg_exact(opener.n, 0.40)
+        cash = 10_000.0 - (opener.total_cost + fee_a + fee_b)
+        assert follower.balance_at_entry == cash + opener.total_cost
+
+    def test_a_flat_quoted_trade_has_the_at_cost_steps(self):
+        # Quotes that never leave the entry prices give exactly the at-cost steps
+        rec = _quoted([TestSizesOnPortfolioValue._opener()],
+                      {"OA": [_candle(_at(_LADDER_M1, 9), 0.20, 0.80)],
+                       "OB": [_candle(_at(_LADDER_M1, 9), 0.60, 0.40)]})
+        point = TestSizesOnPortfolioValue()._sim(rec, k=0.75)
+        (t,) = point.trades
+        assert t.marks is not None
+        assert backtester._carry_steps(t) == ((t.entry_date, t.total_cost),
+                                              (t.exit_date, -t.total_cost))
+        assert backtester._value_steps(t) == ((t.entry_date, -t.fees),
+                                              (t.exit_date, t.actual_payoff - t.total_cost))
+        bare = TestSizesOnPortfolioValue()._sim(_unquoted(rec), k=0.75)
+        pd.testing.assert_frame_equal(point.equity_df, bare.equity_df, check_exact=True)
+
+    def test_records_without_quotes_run_as_a_writer_that_did_nothing(self, monkeypatch):
+        golden = TestPrepareEntriesGolden()
+        with monkeypatch.context() as mp:
+            golden._patch(mp)
+            entries, _ = backtester._prepare_entries(MagicMock(), MagicMock(), golden._START,
+                                                     True, None, same_event_ladders=True)
+            mp.setattr(backtester, "_attach_leg_quotes", lambda *a, **k: None)
+            plain, _ = backtester._prepare_entries(MagicMock(), MagicMock(), golden._START,
+                                                   True, None, same_event_ladders=True)
+        assert all("leg_quotes" in r for r in entries)
+        assert not any("leg_quotes" in r for r in plain)
+        for k in (0.5, 0.75):
+            a = backtester._simulate_at_discount(_unquoted(entries), golden._START, 10_000.0,
+                                                 k=k, end_date=date(2026, 9, 30))
+            b = backtester._simulate_at_discount(plain, golden._START, 10_000.0, k=k,
+                                                 end_date=date(2026, 9, 30))
+            assert [astuple(t) for t in a.trades] == [astuple(t) for t in b.trades]
+            pd.testing.assert_frame_equal(a.equity_df, b.equity_df, check_exact=True)

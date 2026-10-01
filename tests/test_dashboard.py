@@ -28,6 +28,7 @@ import ast
 import base64
 import dataclasses
 import gzip
+import hashlib
 import html
 import inspect
 import json
@@ -46,7 +47,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from kalshi_betting import backtester, config, dashboard, defaults_server, historical
+from kalshi_betting import backtester, config, dashboard, defaults_server, historical, scanner
 from kalshi_betting.backtester import (
     BacktestSweep,
     BacktestTrade,
@@ -76,6 +77,7 @@ from kalshi_betting.treasury import (
     SOURCE_CACHE,
     SOURCE_UNAVAILABLE,
     RiskFreeRates,
+    day_numbers,
 )
 
 # test_backtester as a module, never its classes: a Test* class imported
@@ -10313,8 +10315,52 @@ class TestExplorerFullGrid:
     """
 
     BUDGET = 8_000_000
+    # The quoted variant: every (band, k) cell's curve its own, from trades
+    # whose quotes move on most days they are held (a run valued at market),
+    # each about 270 rows, plotted daily. Measured 2026-09-30 (same
+    # environment): the explorer's 21 blocks total 7,608,372 bytes (the
+    # largest cap block 380,276), against 249,188 at cost, in an
+    # 11,729,311-byte page (468 filter chunks, one per cell). Curves stay
+    # daily by choice, so each budget is its measurement + 20%, with no ceiling.
+    EXPLORER_BYTES_MEASURED_QUOTED = 7_608_372
+    BUDGET_QUOTED = int(EXPLORER_BYTES_MEASURED_QUOTED * 1.2)
+    PAGE_BYTES_MEASURED_QUOTED = 11_729_311
+    PAGE_BUDGET_QUOTED = int(PAGE_BYTES_MEASURED_QUOTED * 1.2)
 
     def test_the_explorer_blocks_of_a_full_grid_stay_under_8_mb(self, monkeypatch, tmp_path):
+        explorer, chunks, _page = self._explorer_blocks(monkeypatch, tmp_path, quoted=False)
+        assert chunks == 52
+        size = sum(len(body) for _, body in explorer)
+        assert size <= self.BUDGET, f"the explorer's blocks were {size} bytes"
+
+    def test_a_quoted_full_grid_s_explorer_blocks_stay_under_budget(self, monkeypatch,
+                                                                     tmp_path):
+        explorer, chunks, page = self._explorer_blocks(monkeypatch, tmp_path, quoted=True)
+        # Each (band, k) cell's list has quotes of its own, so its curve is
+        # its own: the filter ships one chunk per cell (13 ks x 36 bands),
+        # never one curve for another
+        assert chunks == 468
+        size = sum(len(body) for _, body in explorer)
+        assert size <= self.BUDGET_QUOTED, f"the explorer's blocks were {size} bytes"
+        assert page <= self.PAGE_BUDGET_QUOTED, f"the page was {page} bytes"
+
+    def _explorer_blocks(self, monkeypatch, tmp_path, *, quoted: bool) -> tuple[list, int, int]:
+        """
+        Build the full-grid page; return its explorer blocks, filter chunk count and size.
+
+        With `quoted`, every (band, k) cell trades its list with quotes of its
+        own (_random_marks), so each cell's curve is distinct and changes on
+        most days a trade is open — the explorer's worst case — and the
+        filter ships a chunk per cell. The page then files its trades by
+        ticker prefix (no series listing), one category and tag, which the
+        explorer never reads, so the filter's 468 lists build in seconds
+        rather than as 13 views each.
+
+        Returns:
+            tuple[list, int, int]: [(block id, base64 body)] of the explorer's
+                blocks in page order, the number of filter chunks, and the
+                page's size in bytes.
+        """
         import random
         rng = random.Random(3)
         series = [f"KXS{i:02d}" for i in range(8)]
@@ -10339,11 +10385,22 @@ class TestExplorerFullGrid:
             trades = sorted((trade(100 * j + i) for i in range(40)), key=lambda t: t.entry_date)
             lists.append((trades, backtester._build_equity_curve(trades, start, 10_000.0),
                            HalfSplit(rng.gauss(0, 0.05), rng.gauss(0, 0.05), 20, 20)))
+        mark_rng = random.Random(11)
+        quoted_cells = {}
+        if quoted:
+            # One list per (band, k) cell at every cap, its quotes its own
+            for bi in range(len(bands)):
+                for ki in range(len(ks)):
+                    base_trades, _, halves = lists[(bi + ki) % 4]
+                    marked = [_random_marks(t, mark_rng) for t in base_trades]
+                    quoted_cells[(bi, ki)] = (
+                        marked, backtester._build_equity_curve(marked, start, 10_000.0), halves)
         points = {}
         for bi, band in enumerate(bands):
             for ki, k in enumerate(ks):
                 for ci, cap in enumerate(caps):
-                    trades, curve, halves = lists[(bi + ki + ci) % 4]
+                    trades, curve, halves = (quoted_cells[(bi, ki)] if quoted
+                                             else lists[(bi + ki + ci) % 4])
                     point = SweepPoint(k=k, trades=trades, equity_df=curve, spread_band=band,
                                        size_cap=cap, halves=halves)
                     points[(band, k, cap)] = {
@@ -10365,14 +10422,13 @@ class TestExplorerFullGrid:
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        page = dashboard.generate_dashboard(
+        out = dashboard.generate_dashboard(
             primary.trades, primary.equity_df, start, 10_000.0, sweep=sweep,
-            interval_discount=0.75, series_categories=categories).read_text(encoding="utf-8")
-        assert len(TestFilterPage._chunks(page)) == 52
+            interval_discount=0.75, series_categories=None if quoted else categories)
+        page = out.read_text(encoding="utf-8")
         explorer = [(i, body) for i, body in _PACKED.findall(page) if i.startswith("scn-")]
         assert [i for i, _ in explorer] == ["scn-data"] + [f"scn-cap-{ci}" for ci in range(20)]
-        size = sum(len(body) for _, body in explorer)
-        assert size <= self.BUDGET, f"the explorer's blocks were {size} bytes"
+        return explorer, len(TestFilterPage._chunks(page)), out.stat().st_size
 
 
 class TestFilterPageSize:
@@ -10427,17 +10483,33 @@ class TestFilterPageSize:
     BUDGET_ADD_ON = int(PAGE_BYTES_MEASURED_ADD_ON * 1.2)
     PAGE_BYTES_MEASURED_ADD_ON_FAMILY = 1_784_261
     BUDGET_ADD_ON_FAMILY = int(PAGE_BYTES_MEASURED_ADD_ON_FAMILY * 1.2)
+    # Every trade with quotes that move on most days it is held (a run valued
+    # at market), the trade lists unchanged: each curve then changes on most
+    # days a trade is open, where at cost it changed only on entry and pay-out
+    # days. Measured 2026-09-30 (plotly 6.9.0, pandas 3.0.3, numpy 2.4.6):
+    # 1,397,952 bytes (823,634 at cost the same day, +70%), and with the
+    # tier-floors-off family 1,969,146 (1,105,564 at cost, +78%). Curves stay
+    # daily by choice, so each budget is its measurement + 20%, with no ceiling.
+    PAGE_BYTES_MEASURED_QUOTED = 1_397_952
+    BUDGET_QUOTED = int(PAGE_BYTES_MEASURED_QUOTED * 1.2)
+    PAGE_BYTES_MEASURED_QUOTED_FAMILY = 1_969_146
+    BUDGET_QUOTED_FAMILY = int(PAGE_BYTES_MEASURED_QUOTED_FAMILY * 1.2)
 
     @pytest.mark.parametrize(
-        "family, add_on", [(False, False), (True, False), (False, True), (True, True)],
-        ids=["tier-on-only", "tier-off-family", "add-on", "add-on-and-tier-off-family"])
+        "family, add_on, quoted",
+        [(False, False, False), (True, False, False), (False, True, False),
+         (True, True, False), (False, False, True), (True, False, True)],
+        ids=["tier-on-only", "tier-off-family", "add-on", "add-on-and-tier-off-family",
+             "quoted", "quoted-and-tier-off-family"])
     def test_distinct_band_lists_stay_under_budget(self, monkeypatch, tmp_path, family,
-                                                   add_on):
+                                                   add_on, quoted):
         import random
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
         rng = random.Random(3)
+        # The quotes' own draws, so the trade lists are the unquoted variant's
+        mark_rng = random.Random(11)
         # 4 categories x 2 tags: 13 views per list, 468 (702 with the family) in all
         series = [f"KXS{i:02d}" for i in range(8)]
         categories = {s: (f"Cat{i % 4}", (f"Tag{i}",)) for i, s in enumerate(series)}
@@ -10455,6 +10527,8 @@ class TestFilterPageSize:
         def point(first: int, band, **stamp) -> SweepPoint:
             # Stamped with the run's own cap, as production stamps it
             trades = sorted((trade(first + i) for i in range(40)), key=lambda t: t.entry_date)
+            if quoted:
+                trades = [_random_marks(t, mark_rng) for t in trades]
             return SweepPoint(k=0.75, trades=trades, spread_band=band, size_cap=0.2,
                               equity_df=backtester._build_equity_curve(trades, start, 10_000.0),
                               **stamp)
@@ -10534,7 +10608,9 @@ class TestFilterPageSize:
             assert (data["grid_add_off"] is not None) is family
         else:
             assert data["grid_add"] is None and data["grid_add_off"] is None
-        if add_on:
+        if quoted:
+            budget = self.BUDGET_QUOTED_FAMILY if family else self.BUDGET_QUOTED
+        elif add_on:
             budget = self.BUDGET_ADD_ON_FAMILY if family else self.BUDGET_ADD_ON
         else:
             budget = self.BUDGET_FAMILY if family else self.BUDGET
@@ -11779,3 +11855,313 @@ class TestRiskFreeIsThreaded:
         assert sorted(bad) == ["_sharpe in c (line 7)", "_sharpe in f (line 14)",
                                "_sharpe in g (line 16)", "_sharpe in g (line 16)",
                                "_sortino in e (line 10)"]
+
+
+# ─── Open trades valued at market (BacktestTrade.marks) ──────────────────────
+
+def _marked(trade: BacktestTrade, held_a: list[float], held_b: list[float]) -> BacktestTrade:
+    """
+    `trade` with quotes (BacktestTrade.marks), built straight from day-end asks.
+
+    held_a[i] and held_b[i] are the asks of the side each leg holds
+    (scanner.leg_sides) at the end of day entry_date + i; a NaN is no usable
+    quote, so that leg counts at its last usable ask that day (LegQuotes
+    carries it forward), or at its entry price before it has had one. Past
+    the last value a leg is worth its payout, read from the trade's own
+    outcomes. The side a leg does not hold has no samples (the curve never
+    reads it).
+    """
+    side_a, side_b = scanner.leg_sides(trade.pair_type)
+
+    def quotes(ticker: str, side: str, outcome: str,
+               held: list[float]) -> backtester.LegQuotes:
+        """One market's LegQuotes holding `held` on `side`."""
+        values = np.array(held, dtype=float)
+        unused = np.full(len(values), np.nan)
+        yes, no = (values, unused) if side == "yes" else (unused, values)
+        paid_yes = 1.0 if outcome == "yes" else 0.0
+        return backtester.LegQuotes(ticker, trade.entry_date, yes, no, trade.entry_date,
+                                    np.empty(0), np.empty(0), paid_yes, 1.0 - paid_yes)
+
+    return dataclasses.replace(trade, marks=(
+        quotes(trade.ticker_a, side_a, trade.outcome_a, held_a),
+        quotes(trade.ticker_b, side_b, trade.outcome_b, held_b)))
+
+
+def _random_marks(trade: BacktestTrade, rng) -> BacktestTrade:
+    """
+    `trade` with quotes that move on most days it is held: each leg's
+    held-side ask a random walk from its entry price on the cent grid, kept
+    inside [0.01, 0.99] — the shape a run valued at market gives its curves.
+    """
+    held = (trade.exit_date - trade.entry_date).days
+    prices = backtester._leg_prices_for(trade.pair_type, trade.entry_pA, trade.entry_nA,
+                                        trade.entry_pB, trade.entry_nB)
+
+    def walk(price: float) -> list[float]:
+        """One leg's day-end asks, a cent-grid random walk from `price`."""
+        out = []
+        for _ in range(held):
+            out.append(round(price, 2))
+            price = min(0.99, max(0.01, price + rng.gauss(0.0, 0.02)))
+        return out
+
+    return _marked(trade, walk(prices[0]), walk(prices[1]))
+
+
+class TestOpenTradesAtMarket:
+    """
+    A backtest trade with quotes (BacktestTrade.marks) is valued at market
+    while it is open. The dashboard reads that value through the
+    backtester's one day-end path — _value_steps for the per-type return
+    lines, _carry_steps (through _carried_on_days) for what the risk-free
+    hurdle charges — so every line, card and hurdle describes the curve
+    _build_equity_curve draws. A trade without quotes is booked exactly as
+    before, at cost.
+    """
+
+    _START = date(2026, 1, 5)
+    _END = date(2026, 1, 15)
+
+    @classmethod
+    def _trades(cls) -> list[BacktestTrade]:
+        """
+        Four trades: a time-series ladder whose earlier leg dips while it is
+        held, a cross-event pair that falls before it loses, a same-title pair
+        with a day of no usable quote (it keeps the day before's ask), and a
+        cross-event pair with no quotes (carried at cost).
+        """
+        base = make_trade()
+        ladder = _marked(
+            _typed_trade("time_series", True, date(2026, 1, 6), date(2026, 1, 10), base.profit),
+            [0.30, 0.10, 0.25, 0.55], [0.40, 0.40, 0.45, 0.40])
+        cross = _marked(
+            dataclasses.replace(
+                _typed_trade("time_series", False, date(2026, 1, 7), date(2026, 1, 9),
+                             -(base.total_cost + base.fees)),
+                ticker_a="CROSS-A", ticker_b="CROSS-B", outcome_a="no", outcome_b="yes"),
+            [0.30, 0.15], [0.40, 0.20])
+        # A same-title pair priced consistently: NO on A at 0.45, YES on B at 0.40
+        n = base.n
+        fees = fee_leg_exact(n, 0.45) + fee_leg_exact(n, 0.40)
+        same_title = _marked(
+            dataclasses.replace(
+                _typed_trade("same_title", False, date(2026, 1, 6), date(2026, 1, 11), 0.0),
+                ticker_a="ST-A", ticker_b="ST-B", entry_nA=0.45, entry_pB=0.40,
+                total_cost=n * 0.85, fees=fees, outcome_a="no", outcome_b="no",
+                actual_payoff=float(n), profit=n - n * 0.85 - fees),
+            [0.45, 0.50, 0.60, 0.40, 0.48], [0.40, 0.42, float("nan"), 0.30, 0.35])
+        plain = dataclasses.replace(
+            _typed_trade("time_series", False, date(2026, 1, 8), date(2026, 1, 12), 2.0),
+            ticker_a="PLAIN-A", ticker_b="PLAIN-B")
+        return [ladder, cross, same_title, plain]
+
+    @staticmethod
+    def _cash(trades: list[BacktestTrade], day: date, initial: float) -> float:
+        """The cash at a day's close, by hand: the start, less each entered
+        trade's cost and fees, plus each paid-out trade's receipt."""
+        return (initial - sum(t.total_cost + t.fees for t in trades if t.entry_date <= day)
+                + sum(t.actual_payoff for t in trades if t.exit_date <= day))
+
+    @staticmethod
+    def _held_value(trade: BacktestTrade, day: date) -> float:
+        """
+        What an open trade holds at a day's close, by hand from its quotes: n x
+        each leg's held-side ask that day (its entry price where the stored
+        ask is NaN, i.e. before the leg's first usable ask; its payout past
+        its last quote); its cost when it has no quotes.
+        """
+        if trade.marks is None:
+            return trade.total_cost
+        i = (day - trade.entry_date).days
+        prices = backtester._leg_prices_for(trade.pair_type, trade.entry_pA, trade.entry_nA,
+                                            trade.entry_pB, trade.entry_nB)
+        total = 0.0
+        for quotes, side, price in zip(trade.marks, scanner.leg_sides(trade.pair_type),
+                                       prices, strict=True):
+            samples = quotes.yes_days if side == "yes" else quotes.no_days
+            paid = quotes.paid_yes if side == "yes" else quotes.paid_no
+            value = float(samples[i]) if i < len(samples) else paid
+            total += price if math.isnan(value) else value
+        return trade.n * total
+
+    def _curve(self, trades: list[BacktestTrade]) -> pd.DataFrame:
+        """The trades' equity curve on $1,000, from the real builder."""
+        return backtester._build_equity_curve(trades, self._START, 1000.0, end_date=self._END)
+
+    def test_an_unquoted_trade_is_booked_exactly_at_cost_on_400_random_fixtures(self):
+        # TestCapitalDeployedParity's random fixtures: with no quotes the steps
+        # are the two at-cost steps, and what the curve carries is the cost
+        # without fees, bit for bit
+        rng = np.random.default_rng(20260927)
+        d0 = TestCapitalDeployedParity._D
+        for _ in range(400):
+            rows = int(rng.integers(0, 40))
+            eq = TestCapitalDeployedParity._curve(rows, stamped=bool(rng.integers(0, 2)))
+            trades = []
+            for _ in range(int(rng.integers(0, 10))):
+                entry = d0 + timedelta(days=int(rng.integers(-8, rows + 8)))
+                exit_ = entry + timedelta(days=int(rng.integers(0, 15)))
+                cost = float(rng.choice([rng.random() * 800, 3.5, 0.1, 1e-9]))
+                trades.append(_held(entry, exit_, cost, float(rng.random() * 5)))
+            days = day_numbers(eq["date"])
+            assert _float_bits(dashboard._carried_on_days(trades, days)) == _float_bits(
+                dashboard._deployed_on_days(trades, days, include_fees=False))
+            for t in trades:
+                assert backtester._value_steps(t) == (
+                    (t.entry_date, -t.fees), (t.exit_date, t.actual_payoff - t.total_cost))
+                assert backtester._carry_steps(t) == (
+                    (t.entry_date, t.total_cost), (t.exit_date, -t.total_cost))
+
+    @pytest.mark.parametrize("name", [
+        "no trade", "one trade", "same-day entry and exit", "overlapping",
+        "entry before the axis", "exit after the axis", "entirely off the axis",
+        "a Timestamp date column", "a tz-aware Timestamp column", "an empty curve",
+        "float noise", "a NaN cost", "a -0.0 cost", "a None entry or exit"])
+    def test_unquoted_carried_value_is_the_cost_without_fees(self, name):
+        trades, eq = TestCapitalDeployedParity._fixtures()[name]
+        days = day_numbers(eq["date"])
+        assert _float_bits(dashboard._carried_on_days(trades, days)) == _float_bits(
+            dashboard._deployed_on_days(trades, days, include_fees=False))
+
+    def test_a_list_s_key_tells_apart_lists_whose_quotes_differ(self):
+        # Two lists equal but for their quotes draw different curves, so they
+        # never share a chunk; equal quotes built twice (the same prices) do
+        trades = [make_trade(), _held(date(2026, 1, 6), date(2026, 1, 9), 2.0, 0.1)]
+        marked = [_marked(trades[0], [0.2] * 7, [0.5] * 7), trades[1]]
+        again = [_marked(trades[0], [0.2] * 7, [0.5] * 7), trades[1]]
+        moved = [_marked(trades[0], [0.2] * 6 + [0.3], [0.5] * 7), trades[1]]
+        assert marked[0].marks[0] is not again[0].marks[0]
+        assert dashboard._list_key(0.75, marked) == dashboard._list_key(0.75, again)
+        assert dashboard._list_key(0.75, marked) != dashboard._list_key(0.75, moved)
+        assert dashboard._list_key(0.75, marked) != dashboard._list_key(0.75, trades)
+        assert dashboard._list_key(0.75, marked) != dashboard._list_key(0.5, marked)
+        # A list with no quotes keys on its compared fields alone, so its
+        # chunks are shared exactly as they were before trades had quotes
+        rows = [tuple(getattr(t, name) for name in dashboard._TRADE_FIELDS) for t in trades]
+        assert dashboard._list_key(0.75, trades) == hashlib.sha256(
+            repr((0.75, rows)).encode("utf-8")).hexdigest()
+        # marks is the one BacktestTrade field not compared, and so not in
+        # _TRADE_FIELDS: the key reads it through the quotes' fingerprints
+        uncompared = [f.name for f in dataclasses.fields(BacktestTrade) if not f.compare]
+        assert uncompared == ["marks"]
+        assert dashboard._TRADE_FIELDS == tuple(
+            f.name for f in dataclasses.fields(BacktestTrade) if f.name != "marks")
+
+    def test_the_curve_and_its_type_lines_value_open_trades_at_market(self):
+        trades = self._trades()
+        ladder, cross, same_title, plain = trades
+        curve = self._curve(trades)
+        days = list(curve["date"])
+        want = [self._cash(trades, d, 1000.0)
+                + sum(self._held_value(t, d) for t in trades if t.entry_date <= d < t.exit_date)
+                for d in days]
+        assert list(curve["portfolio_value"]) == pytest.approx(want, abs=1e-9)
+        # The leading row is the untouched start (DR-03), the last the start
+        # plus every trade's profit, as at cost
+        assert curve["portfolio_value"].iloc[0] == 1000.0
+        assert curve["portfolio_value"].iloc[-1] == pytest.approx(
+            1000.0 + sum(t.profit for t in trades), abs=1e-9)
+        at_cost = self._curve([dataclasses.replace(t, marks=None) for t in trades])
+        assert at_cost["portfolio_value"].iloc[-1] == pytest.approx(
+            curve["portfolio_value"].iloc[-1], abs=1e-9)
+        # The same-title pair's YES leg has no usable ask on 01-08: it keeps
+        # 01-07's 0.42 (its last usable ask), not its 0.40 entry price
+        assert self._held_value(same_title, date(2026, 1, 8)) == pytest.approx(
+            same_title.n * (0.60 + 0.42))
+        row = days.index(date(2026, 1, 7))
+        assert curve["portfolio_value"].iloc[row] != pytest.approx(
+            at_cost["portfolio_value"].iloc[row], abs=1e-6)
+
+        lines = dashboard._return_by_trade_type(trades, curve, 1000.0)
+        assert [label for label, _, _ in lines] == [
+            "Same-title", "Time-series: ladder", "Time-series: cross-event"]
+        total = (curve["portfolio_value"] / 1000.0 - 1.0) * 100
+        summed = [sum(values) for values in zip(*(s for _, _, s in lines), strict=True)]
+        assert summed == pytest.approx(list(total), abs=1e-9)
+        by_label = {label: s for label, _, s in lines}
+        # Each type ends at its own profit
+        assert by_label["Time-series: ladder"][-1] == pytest.approx(ladder.profit / 10)
+        assert by_label["Time-series: cross-event"][-1] == pytest.approx(
+            (cross.profit + plain.profit) / 10)
+        assert by_label["Same-title"][-1] == pytest.approx(same_title.profit / 10)
+        # The ladder's line moves on a day it is held: its fees on entry, then
+        # its earlier leg's fall from 0.30 to 0.10 on 01-07
+        assert by_label["Time-series: ladder"][row] == pytest.approx(
+            (-ladder.fees + 5 * (0.10 + 0.40) - 5 * (0.30 + 0.40)) / 10)
+
+    def test_the_category_and_tag_slices_sum_to_the_whole(self):
+        trades = [dataclasses.replace(t, event_ticker=event) for t, event in zip(
+            self._trades(), ["KXAAA-1", "KXBBB-2", "KXAAA-3", "KXBBB-4"], strict=True)]
+        curve = self._curve(trades)
+        categories = {"KXAAA": ("CatA", ("TagA",)), "KXBBB": ("CatB", ("TagB",))}
+        axis = pd.DatetimeIndex(pd.to_datetime(list(curve["date"])))
+        payload = dashboard._list_payload(
+            trades, curve, axis, self._START, 1000.0, categories, 0.75,
+            {"CatA": 0, "CatB": 1}, {("CatA", "TagA"): 0, ("CatB", "TagB"): 1},
+            dashboard._StringTable(), heads=dashboard._StringTable())
+        views, n = payload["views"], len(axis)
+        whole = _expand(views["all"]["total"], n)
+        for keys in (("c0", "c1"), ("s0", "s1")):
+            parts = [_expand(views[key]["total"], n) for key in keys]
+            # Each total is rounded to 4 decimals of a percent
+            assert [a + b for a, b in zip(*parts, strict=True)] == pytest.approx(whole, abs=2e-4)
+        # Exactly, on the curves the views are drawn from (each slice's own)
+        slices = [[t for t in trades if t.event_ticker.startswith(prefix)]
+                  for prefix in ("KXAAA", "KXBBB")]
+        pnl = [self._curve(s)["portfolio_value"] - 1000.0 for s in slices]
+        assert list(pnl[0] + pnl[1]) == pytest.approx(
+            list(curve["portfolio_value"] - 1000.0), abs=1e-9)
+
+    def test_a_dip_while_a_trade_is_held_shows_in_max_drawdown(self):
+        # TestDeploymentIsNotRenderedAsDrawdown's two winners on $10, the first
+        # one's earlier leg falling from 0.30 to 0.10 on its second day and
+        # back: $1.00 of value lost on 01-06 on top of the $0.34 of fees
+        fixture = TestDeploymentIsNotRenderedAsDrawdown()
+        first, second = fixture._trades()
+        held = (first.exit_date - first.entry_date).days
+        first = _marked(first, [0.30, 0.10] + [0.30] * (held - 2), [0.40] * held)
+        trades = [first, second]
+        curve = backtester._build_equity_curve(trades, fixture._START, fixture._INITIAL)
+        out = dashboard._section_performance(curve, trades, fixture._START, fixture._INITIAL)
+        assert "-13.4% (2026-01-06)" in out
+        assert "-3.4% (2026-01-05)" not in out
+        # The endpoint is the at-cost run's
+        assert "+26.6%" in out
+        point = SweepPoint(k=config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, trades=trades,
+                           equity_df=curve)
+        row = _section_interval_discount(
+            BacktestSweep(primary=point, points=[point], calibration=None))
+        assert "-13.4%" in row and "+26.6%" in row
+
+    def test_what_the_curve_carries_is_its_value_less_its_cash(self):
+        trades = self._trades()
+        curve = self._curve(trades)
+        days = day_numbers(curve["date"])
+        carried = dashboard._carried_on_days(trades, days)
+        cash = [self._cash(trades, d, 1000.0) for d in curve["date"]]
+        assert list(carried) == pytest.approx(
+            list(curve["portfolio_value"].to_numpy() - np.array(cash)), abs=1e-9)
+        # Not the cost: the ladder's dip and the cross-event pair's fall are in it
+        at_cost = dashboard._deployed_on_days(trades, days, include_fees=False)
+        assert not np.allclose(carried, at_cost)
+
+    def test_a_fully_deployed_curve_at_market_is_charged_at_most_the_whole_yield(self):
+        # One quoted trade spends every dollar, so each close holds no cash and
+        # the value is the trade's value at market: the share in open trades is
+        # exactly 1 while it is held, whether its value rose or fell
+        trade = _marked(dataclasses.replace(make_trade(), entry_date=date(2026, 1, 7),
+                                            exit_date=date(2026, 1, 10)),
+                        [0.30, 0.50, 0.10], [0.40, 0.40, 0.40])
+        eq = backtester._build_equity_curve([trade], self._START, trade.total_cost + trade.fees,
+                                            end_date=date(2026, 1, 14))
+        # One auction at an exact binary fraction, so hurdle / yield is the share exactly
+        rates = RiskFreeRates(((date(2026, 1, 1), 0.5),), SOURCE_API, None)
+        share = dashboard._rf_hurdle(rates, eq, [trade]) / 0.5
+        dates, values = list(eq["date"]), list(eq["portfolio_value"])
+        held = [i for i, d in enumerate(dates) if trade.entry_date <= d < trade.exit_date]
+        assert [values[i] for i in held] == pytest.approx([3.5, 4.5, 2.5])
+        assert [share[i + 1] for i in held] == [1.0, 1.0, 1.0]
+        assert share.max() <= 1.0
+        # Charging the cost instead would read 3.5 / 2.5 of the yield after the fall
+        assert trade.total_cost / values[held[-1]] > 1.0

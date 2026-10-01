@@ -1269,15 +1269,19 @@ def _live_held_pair_problems(source: str) -> list[str]:
 
 def _backtest_add_on_problems(source: str) -> list[str]:
     """
-    Check how backtester._simulate_at_discount sizes an add-on to an open pair.
+    Check how backtester._simulate_at_discount values open trades and sizes an add-on.
 
-    Each candidate starts from its capped Kelly fraction; an add-on's becomes
-    held_pair_fraction(fraction, held["cost"], checkpoint_value), the open
-    pair's stake against the checkpoint's portfolio value, and then the one
-    budget of the walk, kelly_budget(checkpoint_value, fraction, cash), reads
-    it. The trade records that fraction. The stake counts the fees, as the
-    live stake (HeldPair.stake_dollars) does: every trade on the pair adds
-    what it invested, its contracts plus their fees, to held["cost"].
+    Each Monday's portfolio value is the cash plus every open trade through
+    _open_value, the one valuation (at market; at cost for a trade with no
+    quotes). Each candidate starts from its capped Kelly fraction; an
+    add-on's becomes held_pair_fraction(fraction, stake, checkpoint_value),
+    the open pair's stake against that value, and then the one budget of the
+    walk, kelly_budget(checkpoint_value, fraction, cash), reads it. The trade
+    records that fraction. The stake counts the fees, as the live stake
+    (HeldPair.stake_dollars) does: the pair's record keeps each trade with
+    what it paid (its contracts plus fees, `invested`), and the stake adds,
+    for each, what it paid moved by what its contracts gained or lost since
+    (_open_value less their cost).
 
     Args:
         source (str): Source text holding def _simulate_at_discount
@@ -1295,7 +1299,7 @@ def _backtest_add_on_problems(source: str) -> list[str]:
                 f"{len(budgets)} times, not once each"]
     [share], [budget] = shares, budgets
     if share.keywords or [ast.unparse(a) for a in share.args] != [
-            "fraction", "held['cost']", "checkpoint_value"]:
+            "fraction", "stake", "checkpoint_value"]:
         problems.append(f"held_pair_fraction is called as {ast.unparse(share)}")
     if _bound_from(func, share) != ["fraction"]:
         problems.append("held_pair_fraction's result is not the fraction")
@@ -1313,13 +1317,35 @@ def _backtest_add_on_problems(source: str) -> list[str]:
     if not trades or any([ast.unparse(k.value) for k in t.keywords
                           if k.arg == "kelly_fraction"] != ["fraction"] for t in trades):
         problems.append("the trade does not record the fraction it was sized at")
-    # held["cost"] grows only by `invested`, contracts plus fees
+    # The portfolio value is the cash plus every open trade through _open_value
+    value_sum = ast.unparse(ast.parse("cash + sum(_open_value(t, d) for t in open_trades)",
+                                      mode="eval").body)
+    values = [ast.unparse(n.value) for n in ast.walk(func) if isinstance(n, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id == "checkpoint_value" for t in n.targets)
+              and not (isinstance(n.value, ast.Name) and n.value.id == "cash")]
+    if values != [value_sum]:
+        problems.append(f"the portfolio value is {values}, not the cash plus every open "
+                        "trade through _open_value")
+    # The stake: what each held trade paid, moved by its change in value
+    moved = ast.unparse(ast.parse(
+        "paid + (_open_value(held_trade, d) - held_trade.total_cost)", mode="eval").body)
     stakes = [n for n in ast.walk(func) if isinstance(n, ast.AugAssign)
-              and ast.unparse(n.target) == "held['cost']"]
-    if not stakes or any(not isinstance(n.op, ast.Add) or ast.unparse(n.value) != "invested"
-                         for n in stakes):
-        problems.append("the open pair's stake does not grow by what each trade invested "
-                        "(contracts plus fees)")
+              and ast.unparse(n.target) == "stake"]
+    loops = [n for n in ast.walk(func) if isinstance(n, ast.For)
+             and ast.unparse(n.target) in ("held_trade, paid", "(held_trade, paid)")
+             and ast.unparse(n.iter) == "held['trades']"]
+    if (len(stakes) != 1 or not isinstance(stakes[0].op, ast.Add)
+            or ast.unparse(stakes[0].value) != moved
+            or not any(stakes[0] in ast.walk(loop) for loop in loops)):
+        problems.append("the stake is not what each held trade paid moved by its change "
+                        "in value (_open_value less its cost)")
+    # The pair's record keeps each trade with what it paid, contracts plus fees
+    grows = [n for n in ast.walk(func) if isinstance(n, ast.Call)
+             and ast.unparse(n.func) == "held['trades'].append"]
+    if not grows or any([ast.unparse(a) for a in n.args] != ["(trade, invested)"]
+                        for n in grows):
+        problems.append("the open pair's record does not keep each trade with what it "
+                        "invested (contracts plus fees)")
     return problems
 
 
@@ -2645,7 +2671,8 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(config, "max_affordable_pairs", "kelly_budget")
         assert _function_calls(scanner, "enrich_with_orderbook_prices", "kelly_budget")
         # The backtest budgets the same way: each Monday's portfolio value
-        # (cash plus open trades at cost), never more than the running cash
+        # (cash plus open trades at market, backtester._open_value), never
+        # more than the running cash
         assert _function_calls(backtester, "_simulate_at_discount", "kelly_budget")
         [budget_call] = [
             sub for node in ast.walk(ast.parse(inspect.getsource(backtester)))
@@ -2829,52 +2856,110 @@ class TestTimeSeriesKellyParity:
             assert mutant != shape, name
             assert _live_held_pair_problems(mutant), name
 
+    def test_ast_open_trades_are_valued_through_one_definition(self):
+        # The backtest values an open trade at market from the quotes the one
+        # writer, _attach_leg_quotes, puts on each entry record under
+        # "leg_quotes", which Pass 1b alone reads (into BacktestTrade.marks):
+        # the key is spelled only in those two functions, anywhere in the
+        # package. Both callers that release candles call the writer first.
+        import importlib
+        import pkgutil
+
+        import kalshi_betting
+
+        names = sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__))
+        modules = [kalshi_betting] + [importlib.import_module(f"kalshi_betting.{n}")
+                                      for n in names]
+        homes = {(module.__name__, owner)
+                 for module in modules
+                 for owner, _line in _key_homes(ast.parse(inspect.getsource(module)),
+                                                "leg_quotes")}
+        writer = ("kalshi_betting.backtester", "_attach_leg_quotes")
+        reader = ("kalshi_betting.backtester", "_simulate_at_discount")
+        assert homes == {writer, reader}
+        assert _function_calls(backtester, "_prepare_entries", "_attach_leg_quotes")
+        assert _function_calls(backtester, "_sweep_from_candidates", "_attach_leg_quotes")
+        # One valuation at a checkpoint (_open_value) and one day-end path
+        # (_open_value_path): a quote is read only there. The equity curve,
+        # the dashboard's per-type lines and its risk-free hurdle reach the
+        # path through _carry_steps / _value_steps.
+        tree = ast.parse(inspect.getsource(backtester))
+        readers: dict[str, set] = {"at_checkpoint": set(), "day_values": set()}
+        for func in ast.walk(tree):
+            if isinstance(func, ast.FunctionDef):
+                for sub in ast.walk(func):
+                    if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                            and sub.func.attr in readers):
+                        readers[sub.func.attr].add(func.name)
+        assert readers == {"at_checkpoint": {"_open_value"},
+                           "day_values": {"_open_value_path"}}
+        assert _function_calls(backtester, "_carry_steps", "_open_value_path")
+        assert _function_calls(backtester, "_value_steps", "_open_value_path")
+        assert _function_calls(backtester, "_build_equity_curve", "_carry_steps")
+        assert _function_calls(dashboard, "_return_by_trade_type", "_value_steps")
+        assert _function_calls(dashboard, "_carried_on_days", "_carry_steps")
+        assert _function_calls(dashboard, "_rf_hurdle", "_carried_on_days")
+        # Pass 2 values open trades only through _open_value: the portfolio
+        # value and the held stake (pinned in detail by
+        # _backtest_add_on_problems)
+        assert _function_calls(backtester, "_simulate_at_discount", "_open_value")
+
     def test_ast_the_backtest_sizes_add_ons_on_the_checkpoint_value(self):
-        # backtester._simulate_at_discount: an add-on's fraction is
-        # held_pair_fraction(fraction, held["cost"], checkpoint_value), read by
-        # the walk's one kelly_budget(checkpoint_value, fraction, cash), and
-        # held["cost"] grows by what each trade invested, fees included, as
-        # the live stake counts them
+        # backtester._simulate_at_discount: each Monday's portfolio value is
+        # the cash plus every open trade through _open_value (at market); an
+        # add-on's fraction is held_pair_fraction(fraction, stake,
+        # checkpoint_value), read by the walk's one kelly_budget(
+        # checkpoint_value, fraction, cash), and the stake is what each held
+        # trade paid, fees included, moved by its change in value, as the
+        # live stake counts its worth today plus its fees
         assert _backtest_add_on_problems(inspect.getsource(backtester)) == []
 
     def test_ast_the_backtest_check_catches_its_mutants(self):
-        # The check above, run on a small copy of the add-on sizing in
-        # _simulate_at_discount and on changed copies of it
+        # The check above, run on a small copy of the valuation and add-on
+        # sizing in _simulate_at_discount and on changed copies of it
         shape = (
-            "def _simulate_at_discount(candidates, cash, open_pairs, open_costs):\n"
+            "def _simulate_at_discount(candidates, cash, open_pairs, open_trades):\n"
             "    for c in candidates:\n"
-            "        checkpoint_value = cash + sum(cost for _ed, cost in open_costs)\n"
+            "        d = c['entry_date']\n"
+            "        checkpoint_value = cash\n"
+            "        checkpoint_value = cash + sum(_open_value(t, d) for t in open_trades)\n"
             "        held = open_pairs.get(c['key'])\n"
             "        fraction = c['kelly_f_capped']\n"
             "        if held is not None:\n"
-            "            fraction = held_pair_fraction(fraction, held['cost'], "
-            "checkpoint_value)\n"
+            "            stake = 0.0\n"
+            "            for held_trade, paid in held['trades']:\n"
+            "                stake += paid + (_open_value(held_trade, d) - held_trade.total_cost)\n"
+            "            fraction = held_pair_fraction(fraction, stake, checkpoint_value)\n"
             "            if fraction <= 0:\n"
             "                continue\n"
             "        budget = kelly_budget(checkpoint_value, fraction, cash)\n"
             "        total_cost = budget * 0.9\n"
             "        invested = total_cost + fee_a + fee_b\n"
-            "        trades.append(BacktestTrade(n=int(budget), kelly_fraction=fraction))\n"
-            "        held = open_pairs.setdefault(c['key'], {'cost': 0.0})\n"
-            "        held['cost'] += invested\n")
+            "        trade = BacktestTrade(n=int(budget), kelly_fraction=fraction)\n"
+            "        held = open_pairs.setdefault(c['key'], {'trades': []})\n"
+            "        held['trades'].append((trade, invested))\n")
         assert _backtest_add_on_problems(shape) == []
-        share_line = ("            fraction = held_pair_fraction(fraction, held['cost'], "
+        share_line = ("            fraction = held_pair_fraction(fraction, stake, "
                       "checkpoint_value)\n")
         budget_line = "        budget = kelly_budget(checkpoint_value, fraction, cash)\n"
-        stake_line = "        held['cost'] += invested\n"
+        stake_line = ("                stake += paid + (_open_value(held_trade, d) - "
+                      "held_trade.total_cost)\n")
+        record_line = "        held['trades'].append((trade, invested))\n"
         mutants = {
-            "on the cash": shape.replace("held['cost'], checkpoint_value)",
-                                         "held['cost'], cash)"),
-            "another key for the stake": shape.replace("held['cost']", "held['spent']"),
-            "the stake without the fees": shape.replace(
-                stake_line, stake_line.replace("invested", "total_cost")),
+            "on the cash": shape.replace("stake, checkpoint_value)", "stake, cash)"),
+            "the stake at cost": shape.replace(stake_line, "                stake += paid\n"),
             "the stake set, not added to": shape.replace(
                 stake_line, stake_line.replace("+=", "=")),
-            "the stake never grows": shape.replace(stake_line, ""),
+            "the stake without the fees": shape.replace(
+                record_line, record_line.replace("invested", "total_cost")),
+            "the record never grows": shape.replace(record_line, ""),
+            "the value at cost": shape.replace(
+                "sum(_open_value(t, d) for t in open_trades)",
+                "sum(t.total_cost for t in open_trades)"),
             "result unused": shape.replace(share_line, share_line.replace(
                 "fraction = held_pair_fraction", "share = held_pair_fraction")),
             "budget before the share": shape.replace(budget_line, "").replace(
-                "        held = open_pairs", budget_line + "        held = open_pairs"),
+                "        held = open_pairs.get", budget_line + "        held = open_pairs.get"),
             "budget on the uncapped fraction": shape.replace(
                 "kelly_budget(checkpoint_value, fraction, cash)",
                 "kelly_budget(checkpoint_value, c['kelly_f_capped'], cash)"),

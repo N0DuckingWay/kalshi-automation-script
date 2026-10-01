@@ -103,7 +103,11 @@ Dependencies:
     scenario-explorer labels can collide — _build_equity_curve() (the one
     definition of an equity curve, which the page-wide filter runs over a
     category's or tag's trades alone for that slice's attributed curve),
-    _leg_prices_for(), max_trades_simulated() (the one test of a carried
+    _value_steps() and _carry_steps() (a trade's day-by-day moves and what
+    the curve carries in it while open, both built from the backtester's one
+    day-end path, so the per-type return lines and the risk-free hurdle read
+    the curve's own valuation), _leg_prices_for(), max_trades_simulated()
+    (the one test of a carried
     post-cutoff verdict against the run's own trades, shared with
     backtest.py's closing line), _cap_percent() (the injective size-cap
     formatter the completion lines use, so no two Size cap options can read
@@ -215,9 +219,10 @@ Notes:
     SLICE of that run, whose figures drawn from an equity curve (return,
     drawdown, Sharpe, Sortino, the median monthly return, the benchmark's
     strategy row) come from the attributed curve — the starting balance
-    plus the slice's P&L as the run booked it (backtester._build_equity_curve
-    over the slice) — i.e. its contribution, not a standalone simulation, and
-    the bar's summary line says so. The header's trade count follows the
+    plus the slice's P&L as the run booked it, its open trades valued as the
+    run's curve values them (backtester._build_equity_curve over the slice)
+    — i.e. its contribution, not a standalone simulation, and the bar's
+    summary line says so. The header's trade count follows the
     selection too. A tag is Kalshi's FIRST tag of the series (_series_labels),
     so every breakdown partitions. Its k and size cap also move the
     interval-discount section (at the primary spread band, always with the
@@ -416,6 +421,7 @@ from .backtester import (
     _build_equity_curve,
     _calibration_bucket,
     _cap_percent,
+    _carry_steps,
     _exact_label,
     _leg_prices_for,
     _live_add_on_note,
@@ -424,6 +430,7 @@ from .backtester import (
     _live_rule_view,
     _live_sizing_note,
     _tier_floors_bind,
+    _value_steps,
     max_trades_simulated,
 )
 from .config import (
@@ -534,15 +541,17 @@ def _deployed_on_days(trades: list[BacktestTrade], days: np.ndarray, *,
     """
     The capital tied up in open trades on each row, for rows given as day numbers.
 
-    The one definition of capital in open trades: with fees for the Risk
-    section's chart (_capital_deployed), which shows everything a trade
-    cost; without them for the risk-free hurdle (_rf_hurdle). The hurdle
-    asks what the money sitting in open trades could have earned in T-bills
-    instead. A fee is not sitting anywhere: it left the account on the entry
-    day and is already a loss in the curve, and the portfolio value (the
-    hurdle's denominator) no longer holds it. Charging the yield on it too
-    would count it twice, and could push the charged share above 100% of
-    the account. A row counts every trade with entry <= its date < exit.
+    The one definition of capital in open trades AT COST: with fees for the
+    Risk section's chart (_capital_deployed), which shows everything a trade
+    cost; without them for the risk-free hurdle, through _carried_on_days,
+    which reads it for every trade with no quotes (and for the whole list
+    when nothing is quoted). The hurdle asks what the money sitting in open
+    trades could have earned in T-bills instead. A fee is not sitting
+    anywhere: it left the account on the entry day and is already a loss in
+    the curve, and the portfolio value (the hurdle's denominator) no longer
+    holds it. Charging the yield on it too would count it twice, and could
+    push the charged share above 100% of the account. A row counts every
+    trade with entry <= its date < exit.
     Dates are matched EXACTLY against the rows' days: an entry or exit on no
     row never adds or subtracts, and a non-date matches no row (_trade_day).
     Each row is floored at 0 but the running sum is not, so a trade entered
@@ -563,7 +572,8 @@ def _deployed_on_days(trades: list[BacktestTrade], days: np.ndarray, *,
             curve's "date" column), positional.
         include_fees (bool): Keyword-only and required, so each caller says
             which: True for the chart's fee-inclusive stake (TS-12), False
-            for the cost basis alone.
+            for the cost alone (what the curve carries in a trade with no
+            quotes, _carried_on_days).
 
     Returns:
         np.ndarray: One float per row.
@@ -573,11 +583,46 @@ def _deployed_on_days(trades: list[BacktestTrade], days: np.ndarray, *,
     count = len(trades)
     entries = np.fromiter((_trade_day(t.entry_date) for t in trades), np.int64, count)
     exits = np.fromiter((_trade_day(t.exit_date) for t in trades), np.int64, count)
-    # The chart's fee-inclusive stake (TS-12), or the hurdle's cost basis alone
+    # The chart's fee-inclusive stake (TS-12), or the cost alone (the hurdle's,
+    # for a trade with no quotes)
     costs = (np.fromiter((t.total_cost + t.fees for t in trades), float, count)
              if include_fees else np.fromiter((t.total_cost for t in trades), float, count))
     running = np.cumsum(_sum_on_days(entries, costs, days) - _sum_on_days(exits, costs, days))
     return np.where(running > 0.0, running, 0.0)
+
+
+def _carried_on_days(trades: list[BacktestTrade], days: np.ndarray) -> np.ndarray:
+    """
+    What the equity curve carries in open trades on each row, for rows given as day numbers.
+
+    The value the portfolio holds in its open positions at each day's end,
+    as backtester._build_equity_curve books it: a trade with quotes at its
+    value at market (backtester._carry_steps, built from the backtester's
+    one day-end path), a trade without at its cost WITHOUT fees
+    (_deployed_on_days). When no trade is quoted it is exactly
+    _deployed_on_days(trades, days, include_fees=False), bit for bit. Each
+    part is summed day by day in trade order, run as a sequential cumsum and
+    floored at 0, as _deployed_on_days is; a step dated on no row adds
+    nothing.
+
+    Args:
+        trades (list[BacktestTrade]): Completed trades; may be empty.
+        days (np.ndarray): The rows' day numbers (treasury.day_numbers of the
+            curve's "date" column), positional.
+
+    Returns:
+        np.ndarray: One float per row.
+    """
+    if not any(t.marks is not None for t in trades):
+        return _deployed_on_days(trades, days, include_fees=False)
+    plain = [t for t in trades if t.marks is None]
+    # Each quoted trade's carried value as dated steps (backtester's one path)
+    steps = [step for t in trades if t.marks is not None for step in _carry_steps(t)]
+    keys = np.fromiter((_trade_day(when) for when, _ in steps), np.int64, len(steps))
+    values = np.fromiter((amount for _, amount in steps), float, len(steps))
+    running = np.cumsum(_sum_on_days(keys, values, days))
+    return (_deployed_on_days(plain, days, include_fees=False)
+            + np.where(running > 0.0, running, 0.0))
 
 
 def _rf_hurdle(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame,
@@ -588,14 +633,17 @@ def _rf_hurdle(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame,
     Idle cash is taken to earn the bill's yield (the backtester books it at
     0%), so only the capital in open trades is charged: row t's hurdle is
     annual_t x open[t-1] / portfolio_value[t-1] (0 on row 0), annual_t being
-    the yield in force on row t's date and open the cost of every trade with
-    entry <= date < exit WITHOUT fees: fees were paid out on the entry day
-    and are already a loss in the curve, so they hold no money that could
-    have earned the yield (see _deployed_on_days). A trade is thus charged for exactly
-    exit - entry days (a same-day trade nothing), and the share is at most 1
-    wherever cash >= 0, i.e. on every simulated curve; a category or tag
-    slice whose cash goes negative is charged above 1, as borrowing. A row
-    whose previous value is not positive is charged nothing.
+    the yield in force on row t's date and open what the curve carries in
+    every trade with entry <= date < exit (_carried_on_days: its value at
+    market for a trade with quotes, its cost WITHOUT fees for one without).
+    Fees were paid out on the entry day and are already a loss in the curve,
+    so they hold no money that could have earned the yield. The portfolio
+    value is the cash plus that same carried value, so a trade is charged
+    for exactly exit - entry days (a same-day trade nothing), and the share
+    is at most 1 wherever cash >= 0, i.e. on every simulated curve; a
+    category or tag slice whose cash goes negative is charged above 1, as
+    borrowing. A row whose previous value is not positive is charged
+    nothing.
 
     The result is POSITIONAL (element i belongs to row i): _sharpe/_sortino
     subtract it by position, since a date-indexed Series would align on the
@@ -628,12 +676,13 @@ def _rf_hurdle(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame,
         return np.zeros(len(equity_df))
     # Converted once, for both lookups
     days = day_numbers(equity_df["date"])
-    # The cost basis the portfolio value carries: without fees, already spent
-    open_cost = _deployed_on_days(trades, days, include_fees=False)
+    # What the portfolio value carries in open trades: at market, or at cost
+    # without fees for a trade with no quotes (fees are already spent)
+    open_value = _carried_on_days(trades, days)
     value = equity_df["portfolio_value"].to_numpy(dtype=float)
     share = np.zeros(len(days))
     # The share in open trades at the previous close; 0 where it is not positive
-    np.divide(open_cost[:-1], value[:-1], out=share[1:], where=value[:-1] > 0.0)
+    np.divide(open_value[:-1], value[:-1], out=share[1:], where=value[:-1] > 0.0)
     # The latest auction on or before each day; zeros when unavailable
     return risk_free.annual_on_days(days) * share
 
@@ -836,13 +885,15 @@ def _return_by_trade_type(
     """
     Attribute the equity curve's cumulative return to each trade type.
 
-    Books every trade exactly as backtester._build_equity_curve does — minus
-    its fees on the entry date, plus (actual_payoff - total_cost) on the exit
-    date — so each type's line is that type's share of the curve and the lines
-    sum to the total return on every date (up to float noise). A step dated
-    outside the curve's own dates is booked on the first curve date on or
-    after it, or dropped if there is none, the same days the curve itself
-    would have seen it.
+    Books every trade exactly as backtester._build_equity_curve does, through
+    backtester._value_steps — for a trade with no quotes, minus its fees on
+    the entry date and plus (actual_payoff - total_cost) on the exit date;
+    for a quoted one, also each day's change in its value at market — so
+    each type's line is that type's share of the curve and the lines sum to
+    the total return on every date (up to float noise). A step dated outside
+    the curve's own dates is booked on the first curve date on or after it,
+    or dropped if there is none, the same days the curve itself would have
+    seen it.
 
     Args:
         trades (list[BacktestTrade]): The run's completed trades.
@@ -859,12 +910,18 @@ def _return_by_trade_type(
         return []
     dates = pd.to_datetime(equity_df["date"]).to_numpy()
     steps: dict[str, np.ndarray] = {}
+    # Each step date's row, looked up once per date
+    rows_by_date: dict = {}
     for t in trades:
         label = _trade_type_label(t)
         row = steps.setdefault(label, np.zeros(len(dates)))
-        for when, amount in ((t.entry_date, -t.fees),
-                             (t.exit_date, t.actual_payoff - t.total_cost)):
-            i = int(np.searchsorted(dates, np.datetime64(pd.Timestamp(when)), side="left"))
+        # What the trade adds to the portfolio value each day (backtester's
+        # one definition, the curve's own booking)
+        for when, amount in _value_steps(t):
+            i = rows_by_date.get(when)
+            if i is None:
+                i = rows_by_date[when] = int(np.searchsorted(
+                    dates, np.datetime64(pd.Timestamp(when)), side="left"))
             if i < len(dates):
                 row[i] += amount
     return [
@@ -5288,9 +5345,10 @@ def _kelly_points(trades: list[BacktestTrade],
 
     Returns:
         tuple[list[float], list[float]]: (uncapped Kelly fraction, fraction of
-            the entry-date balance actually committed — fee-inclusive cost over
-            BacktestTrade.balance_at_entry, 0.0 when that balance is not
-            positive), each in trade order.
+            the base the trade was sized on actually committed — fee-inclusive
+            cost over BacktestTrade.balance_at_entry, the portfolio value at
+            the entry checkpoint with open trades at market, 0.0 when that
+            value is not positive), each in trade order.
     """
     # Pass all four entry quotes — _kelly_fraction picks the leg prices per pair
     # type — plus the run's interval discount, so an --interval-discount run
@@ -5299,9 +5357,9 @@ def _kelly_points(trades: list[BacktestTrade],
         _kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB, t.entry_nB, t.pair_type, k=k)
         for t in trades
     ]
-    # The actual fraction uses the simulated balance at each trade's entry (the
-    # base its Kelly budget was computed from) — dividing by the initial
-    # balance would distort as equity drifts.
+    # The actual fraction uses the portfolio value at each trade's entry
+    # checkpoint (the base its Kelly budget was computed from) — dividing by
+    # the initial balance would distort as equity drifts.
     actual_fracs = [
         (t.total_cost + t.fees) / t.balance_at_entry if t.balance_at_entry > 0 else 0.0
         for t in trades
@@ -5328,8 +5386,9 @@ def _capital_deployed(trades: list[BacktestTrade], equity_df: pd.DataFrame) -> l
     Compute the capital tied up in open trades on each row of the equity curve.
 
     _deployed_on_days with fees, as a list, for the Risk section's chart and
-    every filter view's redraw of it; the risk-free hurdle reads the same
-    definition without fees.
+    every filter view's redraw of it: what each open trade cost, fees
+    included, even where the equity curve values it at market. The risk-free
+    hurdle reads what the curve carries instead (_carried_on_days).
 
     Args:
         trades (list[BacktestTrade]): Completed trades; may be empty.
@@ -5647,7 +5706,7 @@ _ADD_ON_SELECT_TITLE = (
     "off: a pair is bought once and not again while it is held. on: a pair still held "
     "can be bought again on a later Monday (the same two markets, the same side on "
     "each), sized so old and new together, with the fees paid, stay within the size "
-    "cap's share of the portfolio value (cash plus open trades at cost). Live trading follows "
+    "cap's share of the portfolio value (cash plus open trades at market). Live trading follows "
     "the saved live defaults, not this choice. The Scenario Explorer and Interval "
     "Discount sections always show it off. In the Risk section's Kelly chart an added "
     "trade plots only what it added, so it sits below the 1:1 line.")
@@ -5991,9 +6050,11 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
         "live_adds_to_held_pairs": getattr(sweep, "live_add_to_held_pairs", None) is True,
     }
 
-# Every field of a BacktestTrade, in declaration order: _list_key's identity
-# of a trade list is these values, trade by trade.
-_TRADE_FIELDS = tuple(f.name for f in dataclasses.fields(BacktestTrade))
+# Every compared field of a BacktestTrade, in declaration order: _list_key's
+# identity of a trade list is these values, trade by trade, plus the
+# fingerprints of the trade's marks (the prices that value an open trade at
+# market), the one field left out here because it is not compared.
+_TRADE_FIELDS = tuple(f.name for f in dataclasses.fields(BacktestTrade) if f.compare)
 
 # The walk logs its progress about this many times over a size-cap sweep's
 # grid, whose cells are simulated as they are read.
@@ -6827,10 +6888,13 @@ def _list_key(k: float | None, trades: list[BacktestTrade]) -> str:
 
     Two scenarios that traded equal lists show the same views — except the
     Kelly scatter, whose x values are priced at the scenario's k — so the
-    key holds k beside every field of every trade (_TRADE_FIELDS, the
-    dataclasses.astuple values of a flat BacktestTrade, read without its
-    deep copy). A SHA-256 of their repr: repr is exact for every field type a
-    trade carries (str, int, float, bool, date, None).
+    key holds k beside every compared field of every trade (_TRADE_FIELDS,
+    read without a deep copy) and, for a trade valued at market, its two
+    markets' quote fingerprints (backtester.LegQuotes.fingerprint), since
+    two lists equal but for their quotes draw different curves. A SHA-256 of
+    their repr: repr is exact for every field type those fields carry (str,
+    int, float, bool, date, None). A trade with no quotes (marks None) adds
+    nothing, so a list with no quotes keys on its compared fields alone.
 
     Args:
         k (float | None): The k the list's Kelly scatter is priced at.
@@ -6839,7 +6903,9 @@ def _list_key(k: float | None, trades: list[BacktestTrade]) -> str:
     Returns:
         str: A hex digest; equal lists at an equal k share it.
     """
-    rows = [tuple(getattr(t, name) for name in _TRADE_FIELDS) for t in trades]
+    rows = [tuple(getattr(t, name) for name in _TRADE_FIELDS)
+            + (() if t.marks is None else (tuple(q.fingerprint for q in t.marks),))
+            for t in trades]
     identity = repr((None if k is None else float(k), rows))
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
@@ -8706,10 +8772,11 @@ def _sparse_on_axis(dates, values, axis: pd.DatetimeIndex, ndigits: int) -> list
     """
     Place a series on the page's date axis, by date, keeping only its change points.
 
-    Every curve on the page is flat between trade dates, so shipping one point
-    per change instead of one per day is what keeps a view per band x
-    category x tag affordable; the filter script expands it back
-    (expand(): each value holds until the next change point). A date the
+    A curve changes only on the days its trades enter, pay out or (for a
+    trade valued at market) change in value, so shipping one point per
+    change instead of one per day keeps a view per band x category x tag
+    affordable; the filter script expands it back (expand(): each value
+    holds until the next change point). A date the
     series does not have, or a non-finite value, is None — a gap in the line.
 
     Args:
