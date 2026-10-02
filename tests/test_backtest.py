@@ -1004,6 +1004,20 @@ class TestCorpusProvenanceLine:
                 f"assembly of 2026-09-20 08:15 UTC) ({source}); archive cutoff at "
                 "assembly: 2026-07-25") in caplog.text
 
+    def test_a_cache_that_could_not_be_brought_up_to_date_says_so(
+            self, cli, monkeypatch, caplog):
+        # An earlier day's cache served as it was after its extension failed:
+        # never called today's
+        cli["result"].corpus_provenance = dataclasses.replace(self.PROV, stale=True)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert ("Settled-market corpus: assembled 2026-09-24 12:37 UTC, holding no "
+                "market settled after that (served as an earlier day's cache: it could "
+                "not be brought up to date this run (see the WARNING above); --no-cache "
+                "re-assembles it in full); archive cutoff at assembly: 2026-07-25"
+                ) in caplog.text
+        assert "assembled earlier today" not in caplog.text
+
     def test_a_freshly_assembled_corpus_says_so(self, cli, monkeypatch, caplog):
         cli["result"].corpus_provenance = dataclasses.replace(
             self.PROV, from_cache=False, archive_cutoff=None)

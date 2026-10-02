@@ -5710,6 +5710,8 @@ class TestCacheExtension:
                 _NoNetwork(), _NoNetwork(), start_date=self.START, use_cache=True)
         assert list(hit) == extended
         assert hit.provenance.from_cache is True
+        # Today's own cache, not an earlier day's served after a failure
+        assert hit.provenance.stale is False
         assert hit.provenance.full_assembly_at == self.T1
         assert ("by extending a full assembly of 2026-06-11 12:00 UTC, earlier today "
                 "(UTC), so it is served as it is") in caplog.text
@@ -5869,6 +5871,10 @@ class TestCacheExtension:
             got = self._fetch(calls, use_cache=True)
         assert list(got) == records
         assert calls["live"].calls == 0 and calls["titles"] == []
+        # Served as an earlier day's cache, and marked so: the reports must not
+        # call it today's (it holds nothing settled after its assembly)
+        assert got.provenance.from_cache is True and got.provenance.stale is True
+        assert got.provenance.assembled_at == self.T1
         warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
         assert len(warned) == 1
         assert warned[0].startswith("Could not read the archive cutoff to extend "
@@ -5898,6 +5904,7 @@ class TestCacheExtension:
         with caplog.at_level(logging.INFO):
             got = self._fetch(calls, use_cache=True)
         assert list(got) == records
+        assert got.provenance.from_cache is True and got.provenance.stale is True
         assert first.path.read_bytes() == before      # nothing was published
         assert not list((tmp_path / "cache").glob("*.tmp"))
         assert any(r.levelname == "WARNING" and r.getMessage().startswith(

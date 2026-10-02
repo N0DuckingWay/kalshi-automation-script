@@ -4482,8 +4482,10 @@ def _corpus_provenance_html(sweep: BacktestSweep | None) -> str:
     up to date — a cache from an earlier UTC day is extended through today —
     so a cached corpus is at most a few hours old, and this line says which
     it was: assembled by this run, extended through today by this run (with
-    the full assembly it was extended from), or served from a cache an
-    earlier run assembled the same UTC day.
+    the full assembly it was extended from), served from a cache an earlier
+    run assembled the same UTC day, or served as an earlier day's cache that
+    could not be brought up to date (CorpusProvenance.stale: the cutoff read
+    or the extension failed, and the log's WARNING says why).
 
     Always renders a line, healthy or not — absence must never be the only
     signal (DR-66). The archive cutoff at assembly is information only: a
@@ -4516,7 +4518,10 @@ def _corpus_provenance_html(sweep: BacktestSweep | None) -> str:
     if prov.full_assembly_at is not None:
         assembled += (f" (extended day by day since a full assembly of "
                       f"{prov.full_assembly_at:%Y-%m-%d %H:%M} UTC)")
-    if prov.from_cache:
+    if prov.stale:
+        source = ("served as an earlier day's cache: it could not be brought up to "
+                  "date this run (see the log); --no-cache re-assembles it in full")
+    elif prov.from_cache:
         source = ("served from an earlier run's cache, assembled earlier today; "
                   "--no-cache re-assembles it in full")
     elif prov.full_assembly_at is not None:

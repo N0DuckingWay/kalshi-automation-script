@@ -204,7 +204,10 @@ def _log_corpus_provenance(sweep: BacktestSweep) -> None:
     through today, so a cached corpus is at most a few hours old (assembled
     earlier the same UTC day) — and this line says which it was (DR-13).
     Logged on every run, "not recorded" included — absence must never be the
-    only signal (DR-66). The archive cutoff is information only: a market
+    only signal (DR-66). A cache from an earlier day that could not be
+    brought up to date (CorpusProvenance.stale: the cutoff read or the
+    extension failed, each with its WARNING) is named as that, never as
+    today's. The archive cutoff is information only: a market
     settled after it is priced from Kalshi's live candlestick endpoint.
 
     Args:
@@ -227,7 +230,11 @@ def _log_corpus_provenance(sweep: BacktestSweep) -> None:
     if provenance.full_assembly_at is not None:
         assembled += (f" (extended day by day since a full assembly of "
                       f"{provenance.full_assembly_at:%Y-%m-%d %H:%M} UTC)")
-    if provenance.from_cache:
+    if provenance.stale:
+        source = ("served as an earlier day's cache: it could not be brought up to "
+                  "date this run (see the WARNING above); --no-cache re-assembles it "
+                  "in full")
+    elif provenance.from_cache:
         source = ("served from an earlier run's cache, assembled earlier today; "
                   "--no-cache re-assembles it in full")
     elif provenance.full_assembly_at is not None:

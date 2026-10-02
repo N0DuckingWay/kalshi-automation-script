@@ -2696,6 +2696,16 @@ class TestCorpusProvenanceHeader:
         assert ("served from an earlier run&#x27;s cache, assembled earlier today; "
                 "--no-cache re-assembles it in full") in line
 
+    def test_a_cache_that_could_not_be_brought_up_to_date_says_so(
+            self, monkeypatch, tmp_path):
+        # An earlier day's cache served as it was after its extension failed
+        line = self._corpus_line(self._page(monkeypatch, tmp_path,
+                                            self._prov(from_cache=True, stale=True)))
+        assert ("(served as an earlier day&#x27;s cache: it could not be brought up "
+                "to date this run (see the log); --no-cache re-assembles it in full)"
+                ) in line
+        assert "earlier today" not in line
+
     @pytest.mark.parametrize("from_cache, source", [
         (False, "extended through today by this run"),
         (True, "served from an earlier run&#x27;s cache, assembled earlier today"),

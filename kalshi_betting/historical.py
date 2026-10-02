@@ -4016,8 +4016,9 @@ class CorpusProvenance:
 
     Attributes:
         from_cache (bool): True when the corpus was served, as it was, from
-            an assembled cache an earlier run wrote today (UTC); False when
-            this call assembled it or extended it.
+            an assembled cache an earlier run wrote — today (UTC), or, with
+            stale set, an earlier day; False when this call assembled it or
+            extended it.
         assembled_at (datetime | None): When the corpus was assembled or last
             extended (UTC, tz-aware). It holds no market that settled after
             this moment; the live fetch that fed it ran in the minutes before
@@ -4047,12 +4048,19 @@ class CorpusProvenance:
             (_extend_assembled_cache) — the moment its archive part was read;
             None for a corpus assembled in full at assembled_at (never
             extended), or a block whose value is unreadable. Defaulted.
+        stale (bool): True when the corpus is a cache from an earlier UTC day
+            served as it was, because bringing it up to date failed (the
+            archive cutoff could not be read, or the extension raised — each
+            with its WARNING). The reports must not call such a corpus
+            today's: it holds nothing settled after assembled_at. Set only by
+            _up_to_date_corpus; False (the default) everywhere else.
     """
     from_cache: bool
     assembled_at: datetime | None
     archive_cutoff: datetime | None
     assembly_counts: AssemblyCounts | None = None
     full_assembly_at: datetime | None = None
+    stale: bool = False
 
 
 def _window_start_ts(start_date: date) -> int:
@@ -4518,6 +4526,21 @@ class SettledCorpus:
             provenance = dc_replace(provenance, assembly_counts=None)
         return cls(path, expect_meta, count, provenance=provenance, meta=meta)
 
+    def with_provenance(self, provenance: CorpusProvenance | None) -> "SettledCorpus":
+        """
+        The same corpus over the same file, saying something else about what it covers.
+
+        Args:
+            provenance (CorpusProvenance | None): The provenance to carry
+                instead of this corpus's own.
+
+        Returns:
+            SettledCorpus: A new corpus with this one's file, identity block,
+                count and meta block, and that provenance.
+        """
+        return SettledCorpus(self._path, self._expect_meta, self._count,
+                             provenance=provenance, meta=self._meta)
+
     @property
     def path(self) -> Path:
         """
@@ -4857,6 +4880,23 @@ def _extend_assembled_cache(
         _close_records(live_records)
 
 
+def _served_stale(corpus: SettledCorpus) -> SettledCorpus:
+    """
+    The corpus, marked as an earlier day's cache served as it was because bringing it up to date failed.
+
+    Args:
+        corpus (SettledCorpus): The validated cache, from an earlier UTC day.
+
+    Returns:
+        SettledCorpus: The same file, its provenance's stale flag set (a
+            corpus without a provenance is returned as it is).
+    """
+    provenance = corpus.provenance
+    if provenance is None:
+        return corpus
+    return corpus.with_provenance(dc_replace(provenance, stale=True))
+
+
 def _up_to_date_corpus(
     corpus: SettledCorpus,
     hist_client: Any,
@@ -4885,7 +4925,9 @@ def _up_to_date_corpus(
         time: None, and the caller re-assembles in full — each with an INFO
         line giving the reason;
       * the cutoff read, or the extension itself, fails: a WARNING naming the
-        failure, and the cache is served as it was ("stale").
+        failure, and the cache is served as it was ("stale"), its provenance
+        marked stale so the closing log line and the dashboard header do not
+        call it today's (_served_stale).
     A cache written before live_frontier_ts existed counts as today's when it
     was assembled today, and otherwise is extended from the day BEFORE the
     one it was assembled on: an assembly that ran across a UTC midnight
@@ -4949,7 +4991,7 @@ def _up_to_date_corpus(
             "Could not read the archive cutoff to extend assembled cache %s (%s): "
             "serving it as assembled at %s — it holds no market settled after that",
             name, _exception_summary(exc), f"{assembled:%Y-%m-%d %H:%M UTC}")
-        return corpus, "stale"
+        return _served_stale(corpus), "stale"
     frontier_day = datetime.fromtimestamp(frontier, tz=UTC).date()
     if cutoff_ts < old_cutoff:
         logging.info(
@@ -4977,7 +5019,7 @@ def _up_to_date_corpus(
             "%s — it holds no market settled after that",
             name, _exception_summary(exc), f"{assembled:%Y-%m-%d %H:%M UTC}",
             exc_info=True)
-        return corpus, "stale"
+        return _served_stale(corpus), "stale"
     return extended, "extended"
 
 
