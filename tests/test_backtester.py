@@ -5,6 +5,7 @@ import gc
 import inspect
 import logging
 import math
+import pickle
 import random
 import re
 import statistics
@@ -17596,6 +17597,110 @@ class TestSellSweep:
                                  start_date=date(2026, 1, 1), sell_sweep=True,
                                  band_sweep=True, cap_sweep=True)
         assert res.sell_sweep is None
+
+    def test_sold_cells_simulates_only_the_levels_that_can_sell(self, sell_run, monkeypatch):
+        sell, start = sell_run.on.sell_sweep, sell_run.start
+        real = backtester._simulate_at_discount
+        calls: list = []
+
+        def spy(raw_entries, start_date, initial_balance, **kw):
+            calls.append((kw.get("sell_at"), kw.get("size_cap")))
+            return real(raw_entries, start_date, initial_balance, **kw)
+
+        caps = (0.05, 0.3, 1.0)
+        shown = skipped = 0
+        for tier_floors, bands, entries_by_band, end_dates in self._settings(sell):
+            for band in bands:
+                entries = entries_by_band[band]
+                for k in sell.ks:
+                    for add_to_held in (False, True):
+                        options = {"k": k, "spread_band": band, "quiet": True,
+                                   "end_date": end_dates[(band, k, "all")],
+                                   "tier_floors": tier_floors, "add_to_held": add_to_held}
+                        tops = {cap: backtester._highest_sale_level(
+                            real(entries, start, 10_000.0, size_cap=cap, **options),
+                            sell.levels) for cap in caps}
+                        calls.clear()
+                        monkeypatch.setattr(backtester, "_simulate_at_discount", spy)
+                        cells = list(sell.sold_cells(band, k, tier_floors=tier_floors,
+                                                     add_to_held=add_to_held, caps=caps))
+                        monkeypatch.undo()
+                        # Every level, ascending, every cap asked for
+                        assert [level for level, _ in cells] == list(sell.levels)
+                        # The no-selling run, then only (level, cap) at or below
+                        # that cap's highest sale level
+                        assert any(level is None for level, _cap in calls)
+                        assert all(level is None or level <= tops[cap]
+                                   for level, cap in calls)
+                        for level, by_cap in cells:
+                            assert tuple(by_cap) == caps
+                            for cap, point in by_cap.items():
+                                fresh = real(entries, start, 10_000.0, size_cap=cap,
+                                             sell_at=level, **options)
+                                if point is None:
+                                    # Above the cap's highest sale level: the
+                                    # no-selling run, so never simulated
+                                    assert tops[cap] is None or level > tops[cap]
+                                    assert not any(t.sold for t in fresh.trades)
+                                    skipped += 1
+                                    continue
+                                assert level <= tops[cap]
+                                assert (point.sell_at, point.size_cap) == (level, cap)
+                                assert ([astuple(t) for t in point.trades]
+                                        == [astuple(t) for t in fresh.trades])
+                                pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df,
+                                                              check_exact=True)
+                                assert any(t.sold for t in point.trades)
+                                shown += 1
+        assert shown > 0 and skipped > 0
+
+    def test_a_band_s_copy_sells_as_the_family_does_after_pickling(self, sell_run):
+        sell = sell_run.on.sell_sweep
+        for tier_floors, bands, entries_by_band, end_dates in self._settings(sell):
+            band = bands[0]
+            narrow = sell.for_band(band, tier_floors=tier_floors)
+            held = narrow.entries_by_band if tier_floors else narrow.off_entries_by_band
+            assert held == {band: entries_by_band[band]}
+            assert held[band] is entries_by_band[band]
+            days = narrow.end_dates if tier_floors else narrow.off_end_dates
+            assert days == {key: day for key, day in end_dates.items() if key[0] == band}
+            # A worker process receives it pickled
+            narrow = pickle.loads(pickle.dumps(narrow))
+            for k in sell.ks:
+                ours = list(narrow.sold_cells(band, k, tier_floors=tier_floors,
+                                              add_to_held=True, caps=(0.2, 1.0)))
+                theirs = list(sell.sold_cells(band, k, tier_floors=tier_floors,
+                                              add_to_held=True, caps=(0.2, 1.0)))
+                for (level_a, a), (level_b, b) in zip(ours, theirs, strict=True):
+                    assert level_a == level_b
+                    for cap in (0.2, 1.0):
+                        assert (a[cap] is None) == (b[cap] is None)
+                        if a[cap] is not None:
+                            assert ([astuple(t) for t in a[cap].trades]
+                                    == [astuple(t) for t in b[cap].trades])
+
+    def test_entry_events_cover_both_settings_and_every_sold_trade(self, sell_run):
+        sell = sell_run.on.sell_sweep
+        events = sell.entry_events()
+        assert events == (backtester._entry_events(sell.entries_by_band)
+                          | backtester._entry_events(sell.off_entries_by_band))
+        assert sell_run.on.cap_sweep.entry_events() <= events
+        for tier_floors, bands, _entries, _days in self._settings(sell):
+            for band in bands:
+                for level in sell.levels:
+                    cell = sell.cell(level, band, sell.ks[0], tier_floors=tier_floors,
+                                     add_to_held=True)
+                    for pops in cell.values():
+                        assert {(t.event_ticker, t.category)
+                                for t in pops["all"].trades} <= events
+
+    def test_a_cap_it_does_not_hold_is_refused(self, sell_run):
+        sell = sell_run.on.sell_sweep
+        with pytest.raises(ValueError, match="not all among"):
+            sell.sweep(0.5, caps=(0.33,))
+        # A subset of its caps is a sweep over that subset, ascending
+        assert sell.sweep(0.5, caps=(1.0, 0.2)).caps == (0.2, 1.0)
+        assert sell.sweep(None).sell_at is None
 
 
 class TestCapSweepSells:

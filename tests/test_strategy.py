@@ -1919,10 +1919,20 @@ class TestTimeSeriesKellyParity:
         # leave nothing to check), and so do the one reader and the truncator
         assert writer in found and reader in found and truncator in found
         # ... the count line, the Kelly gate, the excluding-top-event check and
-        # the cap sweep's event census read the Mondays through that reader ...
+        # the sweeps' event census read the Mondays through that reader ...
         for function in ("_log_qualifying_mondays", "_simulate_at_discount",
-                         "_ex_top_event", "entry_events"):
+                         "_ex_top_event", "_entry_events"):
             assert _function_calls(backtester, function, "_entry_mondays"), function
+        # ... the census being _entry_events, which every sweep's
+        # entry_events (the size-cap family's and the sell family's) calls
+        census_readers = [
+            node for node in ast.walk(ast.parse(inspect.getsource(backtester)))
+            if isinstance(node, ast.FunctionDef) and node.name == "entry_events"]
+        assert len(census_readers) == 2
+        for node in census_readers:
+            assert any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                       and sub.func.id == "_entry_events"
+                       for sub in ast.walk(node)), node.lineno
         # ... and the two first-Monday readers never call it
         assert not _function_calls(backtester, "_interval_calibration", "_entry_mondays")
         assert not _function_calls(backtester, "_split_date", "_entry_mondays")

@@ -619,6 +619,23 @@ DEFAULTS_SERVER_CONFIRM_ARM_MS = 1000
 # PROJECT_ROOT; defaults_server opens it when it starts.
 DASHBOARD_FILENAME = "backtest_dashboard.html"
 
+# The folder beside the dashboard file that holds the data its Sell select
+# loads: one sub-folder per build (<this folder>/<build id>/chunk-<id>.js),
+# far too many blocks to put in the page itself, so the page loads each one
+# through a <script src> element when a reader chooses it. Named as a
+# browser's "Save page as" names a page's folder; the page shows no sell level
+# without it, so the two are kept, copied and moved together. Each build
+# deletes the folders of earlier builds when it replaces the page.
+DASHBOARD_FILES_DIRNAME = "backtest_dashboard_files"
+
+# A build folder under DASHBOARD_FILES_DIRNAME still marked as being written
+# (its ".writing" file) is left alone while the mark is younger than this many
+# seconds — another backtest may be building its page at the same time — and
+# deleted by the next build once it is older: that build crashed or was
+# killed. Two days, far longer than a build is expected to take (an
+# estimate: the 365-day page's Sell select at under an hour).
+DASHBOARD_BUILD_STALE_SECONDS = 2 * 86_400
+
 # How much of the dashboard file, from its start, defaults_server reads to tell
 # whether the page has the filter bar's Save and Trade buttons (it looks for
 # the Trade link's id). The bar sits in the page's opening part, before every

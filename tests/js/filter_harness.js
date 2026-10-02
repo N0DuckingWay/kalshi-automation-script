@@ -30,6 +30,17 @@
 // ["reject", id] step, as a slow DecompressionStream's would, so every order
 // in which choices and arriving chunks can interleave can be driven on
 // purpose. Every other block inflates at once.
+//
+// Sidecar files (__SIDECARS): a <script> element the page appends to
+// document.head loads the file its src names — a chunk the Sell select reads
+// from beside the page — as a browser would: asynchronously, the file's one
+// call to window.__dashChunk running with document.currentScript set to that
+// element (handing over the chunk, already inflated, which the script's
+// inflateText — replaced by __inflateText below — passes through), then the
+// element's onload. A src not in __SIDECARS fires onerror instead; one in
+// __SIDECAR_EMPTY runs without handing anything over (onload alone); one in
+// __SIDECAR_DEFERRED waits for a ["resolve_file", src] or ["reject_file", src]
+// step. Every src loaded is recorded, in order (a snapshot's "files").
 
 var __emit = (typeof print === 'function') ? print : function(s) { console.log(s); };
 var __elements = {};
@@ -49,6 +60,14 @@ var __PENDING = {};
 var __inflated = [];
 // Every window.open call since the last snapshot, in order
 var __opened = [];
+// The sidecar files the page may load (src -> chunk), the ones that hand
+// nothing over, the ones whose load waits for a step, the loads waiting, by
+// src, and every src loaded, in order
+var __SIDECARS = {};
+var __SIDECAR_EMPTY = {};
+var __SIDECAR_DEFERRED = {};
+var __FILE_PENDING = {};
+var __files = [];
 
 function __escape(text) {
   return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -77,6 +96,9 @@ function __element(id, tag) {
     (el._listeners[type] = el._listeners[type] || []).push(fn);
   };
   el.appendChild = function(child) { el.children.push(child); return child; };
+  el._attrs = {};
+  el.setAttribute = function(name, value) { el._attrs[name] = String(value); };
+  el.getAttribute = function(name) { return name in el._attrs ? el._attrs[name] : null; };
   return el;
 }
 
@@ -121,7 +143,52 @@ function __select(id, spec) {
   return el;
 }
 
+// A sidecar file loading: its call to window.__dashChunk runs (unless it
+// hands nothing over), with document.currentScript set to the element, then
+// the element's onload — or, for a file that cannot be loaded, its onerror
+function __runFile(el, fails) {
+  var src = el.src;
+  if (fails || !(src in __SIDECARS)) {
+    if (el.onerror) { el.onerror(new Error('cannot load ' + src)); }
+    return;
+  }
+  if (!__SIDECAR_EMPTY[src]) {
+    document.currentScript = el;
+    try {
+      window.__dashChunk(el, JSON.parse(JSON.stringify(__SIDECARS[src])));
+    } finally {
+      document.currentScript = null;
+    }
+  }
+  if (el.onload) { el.onload(); }
+}
+
+// document.head: a <script> appended to it loads its src, a tick later (or
+// at its ["resolve_file"] / ["reject_file"] step, when deferred)
+var __HEAD = {children: []};
+__HEAD.appendChild = function(el) {
+  el.parentNode = __HEAD;
+  __HEAD.children.push(el);
+  if (el.tagName === 'script') {
+    __files.push(el.src);
+    if (__SIDECAR_DEFERRED[el.src]) {
+      (__FILE_PENDING[el.src] = __FILE_PENDING[el.src] || []).push(el);
+    } else {
+      Promise.resolve().then(function() { __runFile(el, false); });
+    }
+  }
+  return el;
+};
+__HEAD.removeChild = function(el) {
+  var at = __HEAD.children.indexOf(el);
+  if (at >= 0) { __HEAD.children.splice(at, 1); }
+  el.parentNode = null;
+  return el;
+};
+
 var document = {
+  head: __HEAD,
+  currentScript: null,
   getElementById: function(id) {
     if (!__elements[id]) {
       if (__STRICT && !__IDS[id]) { return null; }
@@ -239,6 +306,12 @@ function __inflate(el) {
   return Promise.resolve(JSON.parse(JSON.stringify(__BLOCKS[el.id])));
 }
 
+// The filter script's inflateText(text): a sidecar file's chunk, which the
+// file handed over already inflated (a fresh copy, as a real inflate parses one)
+function __inflateText(text) {
+  return Promise.resolve(JSON.parse(JSON.stringify(text)));
+}
+
 // The page as Python rendered it: its selects, its buttons, the charts the
 // scripts drive, the text of any element a test sets (page.texts) and, in
 // strict mode (page.strict), which ids it holds at all
@@ -272,10 +345,11 @@ function __setup(page) {
 // as it stands now, since a later step can still change it
 function __snapshot() {
   var snap = {reacts: __reacts, updates: __updates, inflated: __inflated.slice(),
-              opened: __opened,
+              opened: __opened, files: __files.slice(),
               text: {}, html: {}, display: {}, heights: {}, ownHeights: {},
               colors: {}, selects: {}, buttons: {}, rows: {}, weights: {},
-              layouts: {}, pending: Object.keys(__PENDING)};
+              layouts: {}, pending: Object.keys(__PENDING),
+              pendingFiles: Object.keys(__FILE_PENDING)};
   __reacts = [];
   __updates = [];
   __opened = [];
@@ -352,6 +426,8 @@ function __spin(ticks, next) {
 // id] / ["reject", id] (a deferred block's waiting inflates finish, or fail as
 // a damaged block's would — after a settle, so every load already started has
 // reached its inflate, and followed by one; nothing waiting is an error),
+// ["resolve_file", src] / ["reject_file", src] (a deferred sidecar file's
+// waiting loads finish, or fail to load, the same way),
 // ["call", name, args] (a page script's window function, called as another
 // script would — the filter's window.dashScenarioSelect call, with any
 // labels), ["click", id] (a reader clicking that element: its click
@@ -372,6 +448,16 @@ function __step(steps, i) {
         if (s[0] === 'resolve') { w.resolve(JSON.parse(JSON.stringify(__BLOCKS[s[1]]))); }
         else { w.reject(new Error('damaged block ' + s[1])); }
       });
+      __spin(200, function() { __step(steps, i + 1); });
+    });
+    return;
+  }
+  if (s[0] === 'resolve_file' || s[0] === 'reject_file') {
+    __spin(200, function() {
+      var loading = __FILE_PENDING[s[1]] || [];
+      if (!loading.length) { throw new Error('no load of ' + s[1] + ' is waiting'); }
+      delete __FILE_PENDING[s[1]];
+      loading.forEach(function(el) { __runFile(el, s[0] === 'reject_file'); });
       __spin(200, function() { __step(steps, i + 1); });
     });
     return;

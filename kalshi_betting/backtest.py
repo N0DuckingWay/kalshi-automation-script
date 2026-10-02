@@ -8,11 +8,14 @@ Purpose:
     arguments (--start-date, --balance, --no-cache, --max-horizon-days,
     --interval-discount, --no-sweep, --same-event-ladders /
     --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
-    --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep), configures logging to
-    kalshi_backtest.log, constructs the necessary API clients, delegates the
-    full backtest simulation to backtester.run_backtest_sweep(), and then
-    calls dashboard.generate_dashboard() to produce the interactive HTML
-    report.
+    --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers),
+    configures logging to kalshi_backtest.log, constructs the necessary API
+    clients, delegates the full backtest simulation to
+    backtester.run_backtest_sweep(), and then calls
+    dashboard.generate_dashboard() to produce the interactive HTML report and,
+    when the sell family is on, the sidecar chunk files its Sell select loads
+    (a folder beside the page, config.DASHBOARD_FILES_DIRNAME, which must be
+    kept with it).
     Prints a summary of key metrics (trade count, win rate, total return) to
     the log on completion, closed on every run by what settled-market corpus
     the run read (its assembly time, whether it was cached, and the archive
@@ -26,7 +29,8 @@ Dependencies:
     (the T-bill yields the page's Sharpe and Sortino subtract) from
     treasury.py.
     Imports from config.py:
-    PROJECT_ROOT,
+    PROJECT_ROOT, DASHBOARD_SELL_MAX_WORKERS (the --sell-workers default's
+    bound),
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS
     (the pre-fetch echo and the flag's help text), the deadline-gap tier constants
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS,
@@ -44,6 +48,12 @@ Notes:
     Historical data only exists on the production Kalshi API, so both API clients
     always use prod credentials regardless of what mode the live bot was run in.
     The backtest reads market data but never submits any orders.
+
+    --sell-workers N sets how many worker processes the dashboard simulates
+    its Sell select in (default: one less than the CPU count, at most
+    config.DASHBOARD_SELL_MAX_WORKERS; 1 runs it in the main process). The
+    workers are spawned, so they re-import this module: main() must only ever
+    run under the `if __name__ == "__main__"` guard at the bottom of the file.
 
     --interval-discount overrides the time-series interval discount k for this
     run ONLY: no live module imports this one (main.py's --interval-discount is
@@ -157,10 +167,12 @@ Notes:
 import argparse
 import logging
 import logging.handlers
+import os
 from datetime import UTC, date, datetime
 
 from .backtester import BacktestSweep, run_backtest_sweep
 from .config import (
+    DASHBOARD_SELL_MAX_WORKERS,
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
@@ -364,9 +376,19 @@ def main() -> None:
              "much faster and leaves the select disabled. Backtest only — live "
              "trading never sells a position",
     )
+    parser.add_argument(
+        "--sell-workers", type=int, default=None, metavar="N",
+        help="Worker processes the dashboard simulates its Sell select in "
+             "(default: one less than this machine's CPU count, at most "
+             f"{DASHBOARD_SELL_MAX_WORKERS} — config.DASHBOARD_SELL_MAX_WORKERS); "
+             "1 runs them in the main process. Each worker holds one spread band's "
+             "entries, so memory grows with the count",
+    )
     args = parser.parse_args()
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
         parser.error("--max-horizon-days must be a positive integer")
+    if args.sell_workers is not None and args.sell_workers < 1:
+        parser.error("--sell-workers must be a positive integer")
     if args.interval_discount is not None and not (0.0 <= args.interval_discount <= 1.0):
         parser.error("--interval-discount must be between 0 and 1")
     if args.spread_min is not None and not (0.0 <= args.spread_min <= 1.0):
@@ -478,6 +500,10 @@ def main() -> None:
     add_on_sweep = not args.no_add_on_sweep
     # ON by default too, and lazy the same way: the dashboard simulates it
     sell_sweep = not args.no_sell_sweep
+    # The dashboard simulates the Sell select in worker processes: one less
+    # than the CPUs (the main process waits on them), within the config bound
+    sell_workers = (args.sell_workers if args.sell_workers is not None
+                    else max(1, min((os.cpu_count() or 1) - 1, DASHBOARD_SELL_MAX_WORKERS)))
     # The saved live defaults' rule and filter, for the echo only: a read of its
     # own, separate from run_backtest_sweep's (which logs the INFO or WARNING).
     # Fails soft, unlike the checks above (one echo clause must not abort a run)
@@ -501,7 +527,9 @@ def main() -> None:
         start_date, args.balance, "on" if use_cache else "off", effective_k,
         ladders_echo, echo_floor, echo_ceiling,
         "on" if band_sweep else "off", "on" if cap_sweep else "off",
-        "on" if add_on_sweep else "off", "on" if sell_sweep else "off", live_rule_echo,
+        "on" if add_on_sweep else "off",
+        f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
+        if sell_sweep else "off", live_rule_echo,
     )
     # Warn on a ceiling that empties a tier. config.time_series_spread_band's
     # docstring asks a caller taking an operator-typed ceiling to warn when it
@@ -638,7 +666,8 @@ def main() -> None:
     risk_free = load_risk_free_rates()
     generate_dashboard(trades, equity_df, start_date, args.balance,
                        sweep=result, interval_discount=result.primary.k,
-                       series_categories=series_categories, risk_free=risk_free)
+                       series_categories=series_categories, risk_free=risk_free,
+                       sell_workers=sell_workers)
     logging.info("Open the HTML file in a browser to view the interactive charts.")
     # How a scenario on the page becomes the live defaults, or is traded: the
     # page cannot write files or start runs, so its buttons open the defaults

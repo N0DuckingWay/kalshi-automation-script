@@ -520,12 +520,13 @@ class TestAddOnSweepArgument:
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         # The band and cap sweeps' substrings other tests read stay a prefix
-        assert ("| band sweep=on | cap sweep=on | add-on sweep=on | sell sweep=on "
-                "| live rule=") in caplog.text
+        assert "| band sweep=on | cap sweep=on | add-on sweep=on | sell sweep=on (" \
+            in caplog.text
         caplog.clear()
         with caplog.at_level(logging.INFO):
-            _run(monkeypatch, "--no-add-on-sweep", "--no-cap-sweep")
-        assert "| cap sweep=off | add-on sweep=off | sell sweep=on | live rule=" in caplog.text
+            _run(monkeypatch, "--no-add-on-sweep", "--no-cap-sweep", "--sell-workers", "1")
+        assert ("| cap sweep=off | add-on sweep=off | sell sweep=on (1 worker process) "
+                "| live rule=") in caplog.text
 
 
 class TestSellSweepArgument:
@@ -544,6 +545,35 @@ class TestSellSweepArgument:
         assert (kwargs["sell_sweep"], kwargs["add_on_sweep"], kwargs["band_sweep"],
                 kwargs["cap_sweep"]) == (False, True, True, True)
         assert "| add-on sweep=on | sell sweep=off | live rule=" in caplog.text
+
+
+class TestSellWorkersArgument:
+    """--sell-workers: how many worker processes the dashboard simulates its
+    Sell select in — by default one less than the CPU count, within
+    config.DASHBOARD_SELL_MAX_WORKERS, and at least 1 — handed to
+    generate_dashboard and named in the echo."""
+
+    @pytest.mark.parametrize(("cpus", "expected"), [
+        (1, 1), (2, 1), (4, 3), (64, config.DASHBOARD_SELL_MAX_WORKERS), (None, 1)])
+    def test_the_default_leaves_one_cpu_and_stays_in_the_bound(self, cli, monkeypatch,
+                                                                 cpus, expected):
+        monkeypatch.setattr(backtest.os, "cpu_count", lambda: cpus)
+        _run(monkeypatch)
+        assert cli["dashboard"][1]["sell_workers"] == expected
+
+    def test_a_count_is_handed_through_and_echoed(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--sell-workers", "3")
+        assert cli["dashboard"][1]["sell_workers"] == 3
+        assert "| sell sweep=on (3 worker processes) | live rule=" in caplog.text
+
+    @pytest.mark.parametrize("value", ["0", "-2"])
+    def test_a_count_below_one_is_refused(self, cli, monkeypatch, capsys, value):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--sell-workers", value)
+        assert exc.value.code == 2
+        assert "--sell-workers must be a positive integer" in capsys.readouterr().err
+        assert "sweep_kwargs" not in cli
 
 
 class TestLiveRuleEcho:

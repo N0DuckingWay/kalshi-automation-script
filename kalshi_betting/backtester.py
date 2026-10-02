@@ -315,7 +315,7 @@ import statistics
 import sys
 from array import array
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -2212,13 +2212,33 @@ class CapSweep:
             set[tuple[str, str]]: (event ticker, category) pairs; the ticker
                 is "" for an entry that carries none.
         """
-        return {(monday["mA"].get("event_ticker") or "",
-                 # infer_category maps the event-ticker prefix to the fallback
-                 # label BacktestTrade.category carries (e.g. "Crypto")
-                 infer_category(monday["mA"].get("event_ticker", "")))
-                for entries in self.entries_by_band.values() for rec in entries
-                # Every Monday a cell could enter the pair on
-                for monday in _entry_mondays(rec["entry"])}
+        return _entry_events(self.entries_by_band)
+
+
+def _entry_events(entries_by_band: dict) -> set[tuple[str, str]]:
+    """
+    Every (event ticker, fallback category) a simulation of some entries could file a trade under.
+
+    Market A's event ticker on every qualifying Monday of every entry, and
+    infer_category of it — what _simulate_at_discount fills
+    BacktestTrade.event_ticker and .category with — so a report can list
+    every category and tag before a cell is simulated (CapSweep.entry_events,
+    SellSweep.entry_events).
+
+    Args:
+        entries_by_band (dict): Band -> that band's entry records.
+
+    Returns:
+        set[tuple[str, str]]: (event ticker, category) pairs; the ticker is ""
+            for an entry that carries none.
+    """
+    return {(monday["mA"].get("event_ticker") or "",
+             # infer_category maps the event-ticker prefix to the fallback
+             # label BacktestTrade.category carries (e.g. "Crypto")
+             infer_category(monday["mA"].get("event_ticker", "")))
+            for entries in entries_by_band.values() for rec in entries
+            # Every Monday a cell could enter the pair on
+            for monday in _entry_mondays(rec["entry"])}
 
 
 @dataclass(frozen=True)
@@ -2275,33 +2295,41 @@ class SellSweep:
     end_dates: dict = field(repr=False)
     off_end_dates: dict = field(repr=False)
 
-    def sweep(self, level: float, *, tier_floors: bool = True,
-              add_to_held: bool = False) -> CapSweep:
+    def sweep(self, level: float | None, *, tier_floors: bool = True,
+              add_to_held: bool = False, caps: Iterable[float] | None = None) -> CapSweep:
         """
         The lazy size-cap sweep that sells at `level` under one Tier floors and add-on setting.
 
         Args:
-            level (float): One of self.levels.
+            level (float | None): One of self.levels, or None for the same
+                sweep never selling (the run each level is measured against).
             tier_floors (bool): Keyword-only. False for the tier-floors-off
                 family's binding bands.
             add_to_held (bool): Keyword-only. Whether every simulation may
                 also add to a pair it still holds.
+            caps (Iterable[float] | None): Keyword-only. The caps to simulate,
+                each one of self.caps; None (default) means every one. A cap
+                left out is not simulated, and caps at or above a point's peak
+                still share one simulation among those kept.
 
         Returns:
             CapSweep: Over the tier-on or tier-off entries, the "all"
                 population only, selling at `level`.
 
         Raises:
-            ValueError: For a level not in self.levels, or tier floors off
-                on a run without the tier-floors-off family.
+            ValueError: For a level not in self.levels, a cap not in self.caps,
+                or tier floors off on a run without the tier-floors-off family.
         """
-        if level not in self.levels:
+        if level is not None and level not in self.levels:
             raise ValueError(f"sell level {level!r} is not one of {self.levels}")
         if not tier_floors and not self.off_bands:
             raise ValueError("this run has no tier-floors-off family to sell in")
+        chosen = self.caps if caps is None else tuple(sorted(set(caps)))
+        if any(cap not in self.caps for cap in chosen):
+            raise ValueError(f"size caps {chosen!r} are not all among {self.caps}")
         bands = self.bands if tier_floors else self.off_bands
         return CapSweep(
-            caps=self.caps, primary_cap=self.primary_cap, bands=tuple(bands), ks=self.ks,
+            caps=chosen, primary_cap=self.primary_cap, bands=tuple(bands), ks=self.ks,
             primary_k=self.primary_k, start_date=self.start_date,
             initial_balance=self.initial_balance, split_date=None, checks=False,
             entries_by_band=self.entries_by_band if tier_floors else self.off_entries_by_band,
@@ -2330,6 +2358,108 @@ class SellSweep:
             KeyError: For a band the setting does not hold.
         """
         return self.sweep(level, tier_floors=tier_floors, add_to_held=add_to_held).cell(band, k)
+
+    def entry_events(self) -> set[tuple[str, str]]:
+        """
+        Every (event ticker, fallback category) a sell run's trades could carry.
+
+        Over both Tier floors settings' entries, every qualifying Monday of
+        each (_entry_events): selling frees cash, so a sell run can trade a
+        pair no other scenario traded, and a report must list its category and
+        tag before any cell is simulated.
+
+        Returns:
+            set[tuple[str, str]]: (event ticker, category) pairs.
+        """
+        return _entry_events(self.entries_by_band) | _entry_events(self.off_entries_by_band)
+
+    def for_band(self, band: tuple[float, float], *, tier_floors: bool = True) -> "SellSweep":
+        """
+        This family narrowed to one band of one Tier floors setting.
+
+        A dashboard worker process receives one band's family, never every
+        band's entries: the copy holds that band's entries and end days alone
+        (the same objects, before pickling), and every other field unchanged.
+
+        Args:
+            band (tuple[float, float]): One of self.bands (tier floors on) or
+                self.off_bands (off).
+            tier_floors (bool): Keyword-only. Which setting's entries to keep.
+
+        Returns:
+            SellSweep: A copy whose only band, of that setting, is `band`.
+
+        Raises:
+            KeyError: For a band the setting does not hold.
+        """
+        days = self.end_dates if tier_floors else self.off_end_dates
+        kept = {key: day for key, day in days.items() if key[0] == band}
+        if tier_floors:
+            return replace(self, bands=(band,), off_bands=(),
+                           entries_by_band={band: self.entries_by_band[band]},
+                           off_entries_by_band={}, end_dates=kept, off_end_dates={})
+        return replace(self, bands=(), off_bands=(band,), entries_by_band={},
+                       off_entries_by_band={band: self.off_entries_by_band[band]},
+                       end_dates={}, off_end_dates=kept)
+
+    def sold_cells(self, band: tuple[float, float], k: float, *, tier_floors: bool = True,
+                   add_to_held: bool = False, caps: Iterable[float] | None = None,
+                   stats: dict | None = None,
+                   ) -> Iterator[tuple[float, dict[float, SweepPoint | None]]]:
+        """
+        Every sell level of one (band, k) cell, simulating only the levels that can sell.
+
+        First the cell is simulated without selling, at every cap asked for;
+        _highest_sale_level reads each cap's run and gives the highest level at
+        which one of its positions would have sold. A level above that is the
+        no-selling run itself (see _highest_sale_level), so it is not
+        simulated: its cap reads None. Every other (level, cap) is simulated,
+        level by level, the caps at or above a point's peak sharing one run
+        (CapSweep). Yielded one level at a time, so only one level's points
+        are alive at once.
+
+        Args:
+            band (tuple[float, float]): One of the setting's bands.
+            k (float): One of self.ks.
+            tier_floors (bool): Keyword-only. The Tier floors setting.
+            add_to_held (bool): Keyword-only. The Add to held pairs setting.
+            caps (Iterable[float] | None): Keyword-only. The caps to cover,
+                each one of self.caps; None (default) means every one.
+            stats (dict | None): Keyword-only. When given, its "simulated" and
+                "reused" counts are raised by the cap points this call
+                simulated and shared (CapSweep's counters), the no-selling
+                runs included, for a report's log line.
+
+        Yields:
+            tuple[float, dict[float, SweepPoint | None]]: (level, cap -> the
+                "all" point selling at that level, or None where it equals the
+                no-selling run), for every level of self.levels, ascending.
+
+        Raises:
+            ValueError: As sweep(); and from CapSweep, for a cell with no end day.
+            KeyError: For a band the setting does not hold.
+        """
+        chosen = self.caps if caps is None else tuple(sorted(set(caps)))
+
+        def read(level: float | None, wanted) -> dict:
+            """One sweep's cell at `level` over the caps wanted, counted into stats."""
+            swept = self.sweep(level, tier_floors=tier_floors, add_to_held=add_to_held,
+                               caps=wanted)
+            cell = swept.cell(band, k)
+            if stats is not None:
+                stats["simulated"] = stats.get("simulated", 0) + swept.simulated
+                stats["reused"] = stats.get("reused", 0) + swept.reused
+            return cell
+
+        base = read(None, chosen)
+        # The highest level each cap's no-selling run would have sold at
+        tops = {cap: _highest_sale_level(pops["all"], self.levels)
+                for cap, pops in base.items()}
+        del base
+        for level in self.levels:
+            needed = [cap for cap in chosen if tops[cap] is not None and level <= tops[cap]]
+            sold = read(level, needed) if needed else {}
+            yield level, {cap: sold[cap]["all"] if cap in sold else None for cap in chosen}
 
 
 @dataclass
@@ -9826,7 +9956,7 @@ def _sweep_from_candidates(
         same_event_ladders=ladders,
         split_date=split_date,
         # One fact about the one corpus, like label_coverage: the header's
-        # corpus line and post-cutoff banner read it (DR-13, M2)
+        # corpus line and the run's closing line read it (DR-13)
         corpus_provenance=candidates.corpus_provenance,
         config_same_event_ladders=config_ladders,
         tier_off_scenarios=tier_off_scenarios,

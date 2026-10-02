@@ -31,13 +31,15 @@ Purpose:
     is written to PROJECT_ROOT and can be opened directly in any browser.
 
     A sticky filter bar at the top of the page — Spread band, Tier floors, k,
-    Size cap, Add to held pairs, Category, Tag — re-scopes every
+    Size cap, Add to held pairs, Sell, Category, Tag — re-scopes every
     trade-derived section (performance, decomposition, calibration,
     diagnostics, risk, the benchmark's strategy row) to the run at another
     spread band, with the deadline-gap tier floors on (the run as simulated)
     or off (the band sweep's tier-floors-off run of that band), interval
     discount k and per-trade size cap, with or without adding to pairs the
-    run still holds, and/or one Kalshi category or category · tag of it,
+    run still holds, holding every position to its pay-out or selling it at
+    a share of its potential profit, and/or one Kalshi category or
+    category · tag of it,
     and moves the k-hat breakdown and the performance section's k-hat cards
     to the same band, tier setting and selection (the breakdown's reference
     line to the same k), the interval-discount section to the same k and
@@ -66,6 +68,38 @@ Purpose:
     section never follow it (their visitors have no `add` method). A page
     whose sweep has no such family, or whose family does not fit the grid,
     keeps the select disabled with a short note.
+
+    The bar's Sell choice is "no selling" (the page as rendered) or one of the
+    sell family's levels (backtester.SellSweep; config.TAKE_PROFIT_LEVELS,
+    every 5% from 5% to 100%): the same scenario re-simulated so each
+    position — a pair and everything added to it — is sold whole at the
+    first weekly checkpoint where its realized profit (what selling it at the
+    bids would return, after the sale's fees, less what it cost) reaches that
+    share of its potential profit (backtester._simulate_at_discount's
+    sell_at). It covers every scenario the bar shows: every band, Tier floors
+    choice, k, size cap and Add to held pairs choice. The run simulates none
+    of it, and neither does the page's walk: after the walk,
+    _build_sell_grid simulates every level of every cell the page shows, in
+    worker processes (one task per spread band and Tier floors setting, at
+    most generate_dashboard's sell_workers, spawned), skipping every level
+    above the highest at which some position of the cell's run without
+    selling would have sold — each such level IS that run, and shows the
+    page's own chunk — and writes each new trade list as a sidecar chunk
+    file in this
+    build's folder beside the page (config.DASHBOARD_FILES_DIRNAME/<build
+    id>/chunk-<id>.js: one call to window.__dashChunk with the packed
+    block), which the script loads through a <script src> element when a
+    reader chooses that level (a page opened from disk may load a script
+    beside it, where fetch() is refused). The page and its folder are kept,
+    copied and moved together; each build deletes the folders of earlier
+    builds once it has replaced the page (_publish_page, under a lock, and
+    never a folder another build is still writing). The choice changes the
+    trade sections and the header's trade count; the k-hat figures do not
+    depend on it, and the Scenario Explorer and the Interval Discount
+    section never follow it. Save as live defaults… stays disabled while a
+    level is chosen, since live trading never sells. A page whose sweep has
+    no Sell family, or whose family does not fit the grid or cannot be
+    built, keeps the select disabled with a short note.
 
     The filter bar also carries a "Save as live defaults…" button. It opens
     the defaults server's confirmation page (kalshi_betting.defaults_server,
@@ -120,10 +154,15 @@ Dependencies:
     _LIVE_RULE_NONE (the live-rule line's pieces, shared with the run's log
     line, which names the saved live defaults) — and reads
     BacktestSweep.cap_sweep, tier_off_cap_sweep, add_on_cap_sweep and
-    add_on_tier_off_cap_sweep (each a backtester.CapSweep) by their
-    attributes — and
+    add_on_tier_off_cap_sweep (each a backtester.CapSweep) and sell_sweep (a
+    backtester.SellSweep) by their attributes; imports backtester itself to
+    read, and in a worker process install, its SAME_TITLE_SIZE_CAP and
+    SCHEDULED_RUN (_run_sell_task) — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
-    page's file name, which defaults_server also opens), DEFAULTS_SERVER_HOST
+    page's file name, which defaults_server also opens), DASHBOARD_FILES_DIRNAME
+    and DASHBOARD_BUILD_STALE_SECONDS (the sidecar folder beside it, and when
+    a build folder still marked as being written is abandoned),
+    CONTRACT_PAYOUT_DOLLARS (named in the Sell select's title), DEFAULTS_SERVER_HOST
     and DEFAULTS_SERVER_PORT (the address the filter bar's save button and
     trade link open), LIVE_DEFAULTS_SOURCE_PATTERN (the note shapes that server
     accepts, which the button's note is checked against),
@@ -261,7 +300,9 @@ Notes:
     (_GridSource.add_cell and add_off_cell, handed to the visitors that
     define an `add` method: the chunk visitor) — by
     visitors that keep only what they
-    build: the chunk
+    build (the Sell select's cells are not walked: _build_sell_grid simulates
+    them afterwards, in worker processes, over the grid the walk walked):
+    the chunk
     visitor packs one chunk per distinct (k, trade list), sharing it between
     the scenarios that traded equal lists at one k (every cap at or above a
     cell's peak Kelly fraction does), the
@@ -290,20 +331,24 @@ Notes:
     walked again from the family's eager points at the run's own cap, one
     WARNING, the header saying so, the tier-on cap axis kept); an Add to
     held pairs cell that cannot be simulated costs only that choice (one
-    WARNING, the select shut with a note, every other chunk kept); a chunk that
+    WARNING, the select shut with a note, every other chunk kept), and so
+    does a Sell band whose simulations fail (one WARNING naming the band,
+    its cells shown as never simulated) or a Sell build that cannot run at
+    all (one WARNING, the select shut); a chunk that
     cannot be built,
     or a base block that cannot be, costs the bar, never the page: the page
     is written without it, with a notice in its place and a WARNING in the
     log. The page as rendered IS the primary scenario's unfiltered view with
-    the tier floors on and adding to held pairs off: the
+    the tier floors on, adding to held pairs off and no selling: the
     script inflates the base block and the primary scenario's chunk as the
     page loads, sets the bar back to that view (a browser can restore a stale
     choice on reload) and keeps its selects disabled until both are ready,
     and redraws only when a <select> changes — each chart from its layout as
     Python drew it, so a zoom never carries over into another selection. A
-    scenario's chunk is inflated when it is first chosen, and the last ones
-    used are kept; a choice made while a chunk is still loading supersedes
-    it.
+    scenario's chunk is inflated when it is first chosen — read from the
+    page, or, for a sidecar chunk (an id at or past the base block's
+    inline_chunks), loaded from its file — and the last ones used are kept;
+    a choice made while a chunk is still loading supersedes it.
 
     The k-hat breakdown (_section_khat) is the one chart that follows the
     filter bar without describing trades. It regroups each band's carried
@@ -378,17 +423,24 @@ Notes:
     own labelled KPI row.
 """
 import base64
+import contextlib
 import dataclasses
+import fcntl
 import gzip
 import hashlib
 import html
 import json
 import logging
 import math
+import multiprocessing
 import os
 import re
+import secrets
+import shutil
+import time
 from collections import defaultdict
 from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -399,6 +451,7 @@ import plotly.graph_objects as go
 import yfinance as yf
 from plotly.subplots import make_subplots
 
+from . import backtester as _backtester
 from .backtester import (
     _LIVE_RULE_LABEL,
     _LIVE_RULE_NONE,
@@ -428,7 +481,10 @@ from .backtester import (
 from .config import (
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     CALENDAR_DAYS_PER_YEAR,
+    CONTRACT_PAYOUT_DOLLARS,
+    DASHBOARD_BUILD_STALE_SECONDS,
     DASHBOARD_FILENAME,
+    DASHBOARD_FILES_DIRNAME,
     DEFAULTS_SERVER_HOST,
     DEFAULTS_SERVER_PORT,
     FLAT_RETURN_TOLERANCE,
@@ -5091,7 +5147,9 @@ def _trade_row_head(t: BacktestTrade, color: str) -> str:
 
     Everything from the <tr> through the outcome cell: the entry date, the
     pair type, the prices paid, each leg's side, market and close date, and
-    how each leg settled. None of it depends on how many contracts were
+    how each leg settled — for a trade sold before it paid out (a Sell
+    level), each leg's sale day and price, or its payout when its market paid
+    out before the sale, beside how it settled. None of it depends on how many contracts were
     bought, so every size-cap scenario that traded this pair on this entry
     date shows the same head — which is why the filter payload stores heads
     once, in a table shared by every chunk (_ChunkVisitor).
@@ -5119,11 +5177,26 @@ def _trade_row_head(t: BacktestTrade, color: str) -> str:
         f"(closes {_fmt_day(closes)}) at ${price:.2f}"
         for side, price, title, sub, ticker, closes, _, _ in legs
     )
-    outcome = "<br>".join(
-        f"{name}: settled <b>{str(result).upper()}</b> on {_fmt_day(settled)} "
-        f"({'won' if result == side else 'lost'})"
-        for name, (side, _, _, _, _, _, result, settled) in zip(("A", "B"), legs, strict=True)
-    )
+    if t.sold:
+        # A trade sold before it paid out: each leg's sale, or its payout when
+        # its market paid out before the sale, beside how its market settled
+        sales = (t.sale_price_a, t.sale_price_b)
+        outcome = "<br>".join(
+            (f"{name}: sold on {_fmt_day(t.exit_date)} at ${sale:.2f} "
+             f"(settled <b>{str(result).upper()}</b> on {_fmt_day(settled)})"
+             if sale is not None else
+             f"{name}: settled <b>{str(result).upper()}</b> on {_fmt_day(settled)} "
+             f"({'won' if result == side else 'lost'}) before the sale")
+            for name, sale, (side, _, _, _, _, _, result, settled)
+            in zip(("A", "B"), sales, legs, strict=True)
+        )
+    else:
+        outcome = "<br>".join(
+            f"{name}: settled <b>{str(result).upper()}</b> on {_fmt_day(settled)} "
+            f"({'won' if result == side else 'lost'})"
+            for name, (side, _, _, _, _, _, result, settled) in zip(("A", "B"), legs,
+                                                                     strict=True)
+        )
     cell = _TRADE_CELL
     return (f"<tr style='background:{color}'>"
             f"{cell}{t.entry_date}</td>"
@@ -5660,6 +5733,44 @@ _ADD_ON_NOTES = {
 _ADD_ON_SAVE_NOTE = ("The live defaults add to held pairs; saving with Add to held pairs "
                      "off here turns that off.")
 
+# The filter bar's "Sell" choice: the runs as simulated ("no selling"), or the
+# same scenario with each position sold whole once it has realized a share of
+# its potential profit (BacktestSweep.sell_sweep; _sell_option names each
+# level). Short menu words; the select's title carries the rule.
+_SELL_OPTION_NONE = "no selling"
+_SELL_SELECT_TITLE = (
+    "no selling: every position is held until its markets pay out. A level: at each weekly "
+    "checkpoint (the live run's time), a position (a pair and everything added to it) is "
+    "sold whole once its realized profit (what selling it at the bids would return, after "
+    "the sale's fees, less what it cost) reaches that share of its potential profit (its "
+    f"contract pairs at ${CONTRACT_PAYOUT_DOLLARS:.2f} each, less what it cost). A position "
+    "sold at a checkpoint is not bought again or added to there. Live trading never sells, "
+    "so Save as live defaults… is off while a level is chosen; the Scenario Explorer and "
+    "Interval Discount sections always show no selling.")
+# Added to the summary line while a sell level is chosen
+_SELL_SUMMARY_NOTE = (" A sale ends its trade on the sale day: its profit is what the sale "
+                      "returned, after the sale's fees, less what it cost, and its slippage "
+                      "is how far that falls short of its profit had it won. Live trading "
+                      "never sells, so Save as live defaults… is off.")
+# Closes the summary line's reach sentence on a page that has the Sell view;
+# the second is for a page with no Scenario Explorer grid
+_SELL_REACH = ("Sell changes the trade sections only; the k̂ figures do not depend on it, "
+               "and the Scenario Explorer and Interval Discount sections always show no "
+               "selling.")
+_SELL_REACH_NO_EXPLORER = ("Sell changes the trade sections only; the k̂ figures do not "
+                           "depend on it, and the Interval Discount section always shows no "
+                           "selling.")
+# Beside the select when the page keeps it shut, by the payload's "sell_state"
+_SELL_NOTES = {
+    "not simulated": "(not simulated in this backtest)",
+    "unavailable": "(not available on this page; see the log)",
+}
+# Why a sidecar chunk could not be loaded ({file}: the address its <script>
+# element asked for), the {reason} of the summary line's "unavailable" template
+_SIDECAR_MISSING = ("its file {file} could not be loaded; keep the folder "
+                    f"{DASHBOARD_FILES_DIRNAME} beside the page")
+_SIDECAR_EMPTY = "its file {file} held no data"
+
 # What the filter bar reaches beyond the seven sections it re-scopes whole,
 # said once, for the bar's summary line and its tests: the interval-discount
 # section follows its k and size cap alone, always at the primary spread band
@@ -5790,7 +5901,11 @@ def _bar_reach(kd_follows: bool, explorer_follows: bool, *, explorer_caps: bool 
 # {scenario} the one the sections still show. "add_on" closes a scenario's
 # phrase when the Add to held pairs choice is on, and a scenario with it on
 # is always its own simulation, so its whole-run view closes on "other_run"
-# at the primary band, k and size cap.
+# at the primary band, k and size cap; so is one at a sell level, whose
+# phrase the base block's sell_levels carry, and "sell_note" is added to the
+# line while a level is chosen. "sidecar_missing" and "sidecar_empty" are a
+# sidecar chunk file's {reason} in "unavailable": it could not be loaded, or
+# it ran without handing anything over ({file}: the address asked for).
 _SUMMARY_TEMPLATES = {
     "scenario": "{where}, {k}, {cap}",
     "all": "Showing every trade of the run at {scenario}: {count}.",
@@ -5799,6 +5914,9 @@ _SUMMARY_TEMPLATES = {
     "other_run": " This is its own simulation, not a slice of the primary run.",
     "add_on": _ADD_ON_PHRASE,
     "add_on_note": _ADD_ON_SUMMARY_NOTE,
+    "sell_note": _SELL_SUMMARY_NOTE,
+    "sidecar_missing": _SIDECAR_MISSING,
+    "sidecar_empty": _SIDECAR_EMPTY,
     "missing": "Showing nothing: {scenario} was not simulated by this run.",
     "loading": "Loading {scenario}…",
     "unavailable": ("The filter could not load the data for {failed} ({reason}); "
@@ -6096,6 +6214,10 @@ class _GridSource:
         add_cap_sweep, add_off_cap_sweep: The CapSweeps behind add_cell and
             add_off_cell — read only for their simulated / reused counters in
             the walk's log; None without them.
+        sell: The backtester.SellSweep the page's Sell select is built from
+            after the walk (_build_sell_grid), when its bands, ks and caps fit
+            this grid (_with_sell); None without it. Its cells are never walked
+            here: they are simulated in worker processes, level by level.
     """
     bands: tuple
     ks: tuple
@@ -6118,6 +6240,7 @@ class _GridSource:
     add_off_cell: Callable[[tuple[float, float] | None, float | None], dict] | None = None
     add_cap_sweep: object | None = None
     add_off_cap_sweep: object | None = None
+    sell: object | None = None
 
 
 def _primary_calibration(sweep: BacktestSweep | None) -> IntervalCalibration | None:
@@ -6444,6 +6567,56 @@ def _with_add_on(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSo
         source.off_fallback(), **fields))
 
 
+def _with_sell(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSource":
+    """
+    Attach a sweep's Sell family to a grid, when it fits.
+
+    The family (BacktestSweep.sell_sweep) is simulated after the walk, in
+    worker processes (_build_sell_grid), never by the walk itself, and only at
+    the cells the walked grid shows. It fits a grid on the very same bands and
+    ks whose caps are among its own — the size-cap grid, or the eager grid at
+    the run's own cap, so the Sell select survives the walk's cap-axis
+    fallback. Every event a sell run could trade under joins the grid's
+    events, so the bar lists its category and tag before anything is
+    simulated (a sale frees cash, and the cash can buy a pair no other
+    scenario traded). The grid's off_fallback is re-wrapped to keep it, as
+    _with_add_on keeps its family.
+
+    Args:
+        source (_GridSource): The grid, every other family already attached.
+        sweep (BacktestSweep | None): The run's sweep, or None.
+
+    Returns:
+        _GridSource: The source itself when there is no family, no band or no
+            fit (with one WARNING when a family existed); else a copy carrying
+            sell and the family's events.
+    """
+    sell = getattr(sweep, "sell_sweep", None) if sweep is not None else None
+    if sell is None or source.bands == (None,):
+        return source
+    try:
+        usable = (tuple(sell.bands) == tuple(source.bands) and tuple(sell.ks) == tuple(source.ks)
+                  and set(source.caps) <= set(sell.caps))
+        # Every entry's event, both Tier floors settings (SellSweep.entry_events)
+        events = source.events | frozenset(sell.entry_events()) if usable else None
+    except Exception:
+        logging.warning("The selling simulations could not be read; the filter bar's Sell "
+                        "select stays disabled", exc_info=True)
+        return source
+    if not usable:
+        logging.warning("The selling simulations do not match the page's grid (its bands, ks "
+                        "or caps); the filter bar's Sell select stays disabled")
+        return source
+    fields = {"sell": sell, "events": events}
+    attached = dataclasses.replace(source, **fields)
+    if source.off_fallback is None:
+        return attached
+    # The walk swaps in off_fallback() when a tier-floors-off cell fails: it
+    # keeps the family, so the Sell select is still built on that grid
+    return dataclasses.replace(attached, off_fallback=lambda: dataclasses.replace(
+        source.off_fallback(), **fields))
+
+
 def _trade_events(points) -> frozenset:
     """
     The (event ticker, fallback category) of every trade some points hold.
@@ -6611,7 +6784,9 @@ def _grid_source(
     size-cap sweep (when the run has one) was usable, and only if the family's
     bands, ks and caps are the grid's: a grid that set the size-cap sweep aside,
     and the walk's cap-axis fallback, never have that view, and each logs a
-    WARNING saying so (_warn_add_on_lost_with_the_cap_sweep).
+    WARNING saying so (_warn_add_on_lost_with_the_cap_sweep). Every banded
+    shape, the walk's fallbacks included, carries the Sell family (_with_sell)
+    when its bands and ks are the grid's and its caps include the grid's.
 
     The k axis is the sweep's own: its primary entry is sweep.primary.k,
     never k_used, which names the one k only without a sweep. An
@@ -6649,7 +6824,7 @@ def _grid_source(
             if primary.spread_band in bands and primary.k in ks and capped.primary_cap in caps:
                 # The tier-floors-off family rides along (_with_tier_off), and
                 # so does the Add to held pairs family (_with_add_on)
-                return _with_add_on(_with_tier_off(_GridSource(
+                return _with_sell(_with_add_on(_with_tier_off(_GridSource(
                     bands=bands, ks=ks, caps=caps,
                     primary=(bands.index(primary.spread_band), ks.index(primary.k),
                              caps.index(capped.primary_cap)),
@@ -6662,7 +6837,7 @@ def _grid_source(
                     events=frozenset(capped.entry_events()),
                     checks=bool(capped.checks), cap_sweep=capped,
                     fallback=lambda: _grid_source(sweep, trades, equity_df, k_used,
-                                                  use_cap_sweep=False)), sweep), sweep)
+                                                  use_cap_sweep=False)), sweep), sweep), sweep)
         except Exception:
             # The cap axis alone is lost, as when a cell cannot be simulated
             # in the walk: the eager points still give the bar every band and k
@@ -6670,19 +6845,20 @@ def _grid_source(
                             "the run's own cap only", exc_info=True)
             if getattr(sweep, "add_on_cap_sweep", None) is not None:
                 _warn_add_on_lost_with_the_cap_sweep()
-            return _with_tier_off(_eager_source(sweep), sweep)
+            return _with_sell(_with_tier_off(_eager_source(sweep), sweep), sweep)
         logging.warning(
             "The size-cap sweep does not hold this run's primary scenario (band %s, "
             "k %s, cap %s); the dashboard offers the run's own cap only",
             primary.spread_band, primary.k, capped.primary_cap)
         if getattr(sweep, "add_on_cap_sweep", None) is not None:
             _warn_add_on_lost_with_the_cap_sweep()
-        return _with_tier_off(_eager_source(sweep), sweep)
+        return _with_sell(_with_tier_off(_eager_source(sweep), sweep), sweep)
     source = _with_tier_off(_eager_source(sweep), sweep)
     # The walk's cap-axis fallback (use_cap_sweep False) never carries the
     # Add to held pairs view: the family's caps are the size-cap grid's, and
-    # the walk logs both the lost cap axis and the lost view
-    return _with_add_on(source, sweep) if use_cap_sweep else source
+    # the walk logs both the lost cap axis and the lost view. The Sell family
+    # fits the eager grid's one cap, so every shape keeps it
+    return _with_sell(_with_add_on(source, sweep) if use_cap_sweep else source, sweep)
 
 
 def _filter_labels(
@@ -8455,6 +8631,683 @@ def _build_filter_grid(
     return walked, chunks, kd
 
 
+# ─── The Sell select: every sell level of every scenario ──────────────────────
+#
+# The bar's Sell choice is "no selling" (the scenario as walked) or one of the
+# sell family's levels (backtester.SellSweep): sell a whole position once it
+# has realized that share of its potential profit. It covers every scenario
+# the bar shows. Its cells are simulated after the walk, in worker processes
+# (_build_sell_grid: one task per spread band and Tier floors setting), and
+# each new trade list is written as a sidecar chunk file beside the page,
+# which the page's script loads through a <script src> element when a reader
+# chooses it — far too many to put in the page itself.
+
+# The Sell select's value for "no selling" (every other option's value is the
+# level's index in the base block's sell_levels)
+_SELL_NONE = "none"
+
+# The file a build folder holds while its build is still being written
+# (DASHBOARD_BUILD_STALE_SECONDS), and the lock every build takes to replace
+# the page and delete the folders of earlier builds
+_BUILD_WRITING = ".writing"
+_BUILD_LOCK = ".lock"
+
+
+@dataclass(frozen=True)
+class _SellTask:
+    """
+    One worker's share of the Sell select: every sell level of one spread band's cells under one Tier floors setting.
+
+    Picklable as a whole, since it is handed to a worker process: the family is
+    narrowed to the one band (backtester.SellSweep.for_band), so a worker
+    receives that band's entries alone.
+
+    Attributes:
+        index (int): The task's place in the build; results are put back in
+            this order, which numbers the sidecar chunks the same way however
+            the workers finish.
+        band_index (int): The band's index on the page's grid.
+        tier_floors (bool): The band's runs as simulated (True) or with the
+            deadline-gap tier floors off (False, a band they bind at).
+        family: The backtester.SellSweep narrowed to this band.
+        cells (frozenset): (adds to held pairs, k index, cap index) of every
+            cell to cover: the cells at this band that the page shows
+            (its non-null chunk ids).
+        ks (tuple): The page's k axis.
+        caps (tuple): The page's size-cap axis.
+        axis (pd.DatetimeIndex): The page's date axis.
+        start_date (date): The backtest's start date.
+        initial_balance (float): Starting balance in dollars.
+        series_categories (dict | None): The series-category map.
+        cat_index (dict): Category -> its index among the bar's categories.
+        sub_index (dict): (category, tag) -> its index among the bar's tags.
+        risk_free (RiskFreeRates | None): The rates every view subtracts.
+        inline_keys (frozenset): The list keys (_list_key) of the chunks in
+            the page itself: a list with one of them is never written again.
+        out_dir (Path): The build's sidecar folder.
+        same_title_size_cap (float): backtester.SAME_TITLE_SIZE_CAP as the
+            parent reads it.
+        scheduled_run: backtester.SCHEDULED_RUN as the parent reads it.
+        install (bool): Whether the task runs in a worker process of its own,
+            which then installs those two bindings first (a spawned process
+            imports backtester afresh, from config). False in the parent.
+    """
+    index: int
+    band_index: int
+    tier_floors: bool
+    family: object
+    cells: frozenset
+    ks: tuple
+    caps: tuple
+    axis: pd.DatetimeIndex
+    start_date: date
+    initial_balance: float
+    series_categories: dict | None
+    cat_index: dict
+    sub_index: dict
+    risk_free: RiskFreeRates | None
+    inline_keys: frozenset
+    out_dir: Path
+    same_title_size_cap: float
+    scheduled_run: object
+    install: bool = False
+
+
+@dataclass(frozen=True)
+class _SellResult:
+    """
+    What one task produced.
+
+    Attributes:
+        index (int): Its task's index.
+        cells (dict): (level index, adds to held pairs, k index, cap index) ->
+            the cell's list key (_list_key), or None where the level is above
+            every sale of that cell's run (it is then the run without selling:
+            the page's own chunk).
+        written (tuple[str, ...]): The keys this task wrote a chunk file for,
+            in the order written.
+        simulated (int): Cap points the task simulated (CapSweep's counter).
+        reused (int): Cap points it shared rather than simulated.
+    """
+    index: int
+    cells: dict
+    written: tuple
+    simulated: int
+    reused: int
+
+
+@dataclass(frozen=True)
+class _SellGrid:
+    """
+    The Sell select's data for the page's base block.
+
+    Attributes:
+        grid (list | None): [level][Tier floors: 0 on, 1 off][Add to held
+            pairs: 0 off, 1 on] -> [band][k][cap] chunk ids (None for a cell
+            not covered: never simulated, or its task failed), or None for a
+            view the page does not have; None as a whole when the page shows
+            no Sell view.
+        levels (list[dict]): Per level, {"label": the option's text, "phrase":
+            what a scenario's summary phrase gains, "value": the level}.
+        sidecars (int): The sidecar chunk files written.
+    """
+    grid: list | None
+    levels: list
+    sidecars: int
+
+
+def _sell_option(level: float) -> str:
+    """
+    Name a sell level as the filter bar's Sell select does.
+
+    Args:
+        level (float): A share of potential profit, in (0, 1].
+
+    Returns:
+        str: e.g. "sell at 25% of potential profit" (backtester._cap_percent:
+            exact, so two levels never read alike).
+    """
+    return f"sell at {_cap_percent(level)}% of potential profit"
+
+
+def _sell_phrase(level: float) -> str:
+    """
+    What a scenario's summary phrase gains at a sell level.
+
+    Args:
+        level (float): A share of potential profit, in (0, 1].
+
+    Returns:
+        str: e.g. ", selling each position at 25% of its potential profit".
+    """
+    return f", selling each position at {_cap_percent(level)}% of its potential profit"
+
+
+def _sell_chunk_text(packed: str) -> str:
+    """
+    The text of one sidecar chunk file: a call that hands its packed block to the page's script.
+
+    The page loads the file through a <script src> element, which a page
+    opened from disk may load where fetch() may not; the element that loaded
+    it is document.currentScript, which tells the page which chunk arrived.
+
+    Args:
+        packed (str): The block, gzip-compressed and base64-encoded (_pack_text):
+            its alphabet holds no quote or backslash, so it needs no escaping.
+
+    Returns:
+        str: One line of JavaScript.
+    """
+    return f'window.__dashChunk(document.currentScript,"{packed}");\n'
+
+
+def _sell_key_file(out_dir: Path, key: str) -> Path:
+    """
+    The file a worker writes a new trade list's chunk to, before the parent numbers it.
+
+    Args:
+        out_dir (Path): The build's sidecar folder.
+        key (str): The list's key (_list_key).
+
+    Returns:
+        Path: <out_dir>/<key>.js.
+    """
+    return out_dir / f"{key}.js"
+
+
+def _sell_chunk_file(out_dir: Path, chunk_id: int) -> Path:
+    """
+    The file a numbered sidecar chunk is loaded from (the page's script builds the same name).
+
+    Args:
+        out_dir (Path): The build's sidecar folder.
+        chunk_id (int): The chunk's id.
+
+    Returns:
+        Path: <out_dir>/chunk-<id>.js.
+    """
+    return out_dir / f"chunk-{chunk_id}.js"
+
+
+def _write_sell_chunk(task: _SellTask, key: str, k: float, point: SweepPoint) -> None:
+    """
+    Write one sell run's trade list as a sidecar chunk file, atomically.
+
+    The chunk holds what an inline chunk holds — the list's per-trade arrays
+    and every category / category · tag view of it (_list_payload) and its
+    strings — plus its own trade-row heads (a worker cannot add to the
+    page's shared table): {"list", "strings", "heads"}. Written to a
+    temporary name and renamed, so a file at the key's name is always whole;
+    two workers that write one key write the same bytes.
+
+    Args:
+        task (_SellTask): The task (the page's axis, labels and rates, and the
+            folder).
+        key (str): The list's key.
+        k (float): The cell's k, which the list's Kelly scatter is priced at.
+        point (SweepPoint): The sell run, its curve cut to the page's axis.
+    """
+    strings, heads = _StringTable(), _StringTable()
+    lst = _list_payload(point.trades, point.equity_df, task.axis, task.start_date,
+                        task.initial_balance, task.series_categories, k, task.cat_index,
+                        task.sub_index, strings, heads=heads, risk_free=task.risk_free)
+    text = _sell_chunk_text(_pack_text(_strict_json(
+        {"list": lst, "strings": strings.items, "heads": heads.items})))
+    path = _sell_key_file(task.out_dir, key)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _run_sell_task(task: _SellTask) -> _SellResult:
+    """
+    Simulate every sell level of one task's cells and write each new trade list's chunk.
+
+    For each k and each Add to held pairs setting with a cell to cover, the
+    narrowed family's sold_cells simulates the cell without selling, then
+    only the (level, cap) at which some position would have sold — every
+    higher level IS the run without selling, so the page shows its own chunk
+    there (None). Each sell run's curve is cut to the page's axis
+    (_cut_to_axis) and keyed (_list_key, once per trade list); a key that is
+    neither in the page nor already written by this task is written
+    (_write_sell_chunk). Only one level's points are alive at a time.
+
+    Runs in a worker process (task.install True: the parent's
+    SAME_TITLE_SIZE_CAP and SCHEDULED_RUN are installed first) or in the
+    parent itself.
+
+    Args:
+        task (_SellTask): The task.
+
+    Returns:
+        _SellResult: Every cell's key (or None), the keys written, and the
+            simulation counts.
+
+    Raises:
+        Exception: Whatever a simulation or a write raised; the parent logs it
+            and leaves the task's cells uncovered.
+    """
+    if task.install:
+        # A spawned process imported backtester afresh: size and checkpoint
+        # as the parent does
+        _backtester.SAME_TITLE_SIZE_CAP = task.same_title_size_cap
+        _backtester.SCHEDULED_RUN = task.scheduled_run
+    family = task.family
+    band = family.bands[0] if task.tier_floors else family.off_bands[0]
+    axis_end = task.axis[-1] if len(task.axis) else None
+    stats = {"simulated": 0, "reused": 0}
+    cells: dict = {}
+    written: list[str] = []
+    done: set[str] = set()
+    for ki, k in enumerate(task.ks):
+        for add in (False, True):
+            wanted = [ci for ci in range(len(task.caps)) if (add, ki, ci) in task.cells]
+            if not wanted:
+                continue
+            # backtester.SellSweep.sold_cells: the levels that can sell, simulated
+            levels = family.sold_cells(band, k, tier_floors=task.tier_floors, add_to_held=add,
+                                       caps=[task.caps[ci] for ci in wanted], stats=stats)
+            for li, (_level, by_cap) in enumerate(levels):
+                cut = _cut_to_axis({cap: {_ALL_VIEW: point} for cap, point in by_cap.items()
+                                    if point is not None}, axis_end)
+                # One key per trade list: caps at or above a peak share one
+                keys: dict[int, str] = {}
+                for ci in wanted:
+                    pops = cut.get(task.caps[ci])
+                    if pops is None:
+                        cells[(li, add, ki, ci)] = None
+                        continue
+                    point = pops[_ALL_VIEW]
+                    key = keys.get(id(point.trades))
+                    if key is None:
+                        key = keys[id(point.trades)] = _list_key(k, point.trades)
+                    if key not in task.inline_keys and key not in done:
+                        _write_sell_chunk(task, key, k, point)
+                        done.add(key)
+                        written.append(key)
+                    cells[(li, add, ki, ci)] = key
+                del cut, keys
+    return _SellResult(task.index, cells, tuple(written), stats["simulated"], stats["reused"])
+
+
+def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: date,
+                initial_balance: float,
+                series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
+                risk_free: RiskFreeRates | None, folder: Path) -> list[_SellTask]:
+    """
+    Split the Sell select's work into one task per spread band and Tier floors setting.
+
+    A band's tier-on task covers its cells the page shows with the tier floors
+    on — adding to held pairs off (the base grid) and, with the Add to held
+    pairs view, on. A band the tiers bind at gets a tier-off task too, over its
+    own tier-floors-off cells (its run with them off, and adding on in the
+    tier-off add-on grid when the page has one). A band the tiers never bind
+    at has no tier-off task: its off view is its tier-on run, so the sell
+    grid aliases those rows as the page's base grid does. A band the family
+    holds no tier-off entries for is left out with one WARNING (never in
+    production, where the family's bands are the binding bands).
+
+    Args:
+        walked (_GridSource): The grid the walk walked; its sell is not None.
+        chunker (_ChunkVisitor): The chunk visitor that walked it.
+        start_date (date): The backtest's start date.
+        initial_balance (float): Starting balance in dollars.
+        series_categories (dict | None): The series-category map.
+        risk_free (RiskFreeRates | None): The rates every view subtracts.
+        folder (Path): The build's sidecar folder.
+
+    Returns:
+        list[_SellTask]: The tasks, tier-on bands first, in band order.
+    """
+    sell = walked.sell
+    add_grid = chunker.add_grid() if walked.add_cell is not None else None
+    off_view = walked.tier_binds is not None and chunker.off_grid() is not None
+    common = {"ks": tuple(walked.ks), "caps": tuple(walked.caps), "axis": chunker.axis,
+              "start_date": start_date, "initial_balance": initial_balance,
+              "series_categories": series_categories, "cat_index": dict(chunker.cat_index),
+              "sub_index": dict(chunker.sub_index), "risk_free": risk_free,
+              "inline_keys": frozenset(chunker.seen), "out_dir": folder,
+              # The two bindings a spawned worker installs (_run_sell_task)
+              "same_title_size_cap": _backtester.SAME_TITLE_SIZE_CAP,
+              "scheduled_run": _backtester.SCHEDULED_RUN}
+    tasks: list[_SellTask] = []
+
+    def add(bi: int, band, tier_floors: bool, rows: dict) -> None:
+        """
+        Queue one band's task, when it has a cell to cover.
+
+        Args:
+            bi (int): The band's index.
+            band: The band.
+            tier_floors (bool): The Tier floors setting.
+            rows (dict): Adds to held pairs (bool) -> that grid's [k][cap]
+                rows at this band, or None without that view.
+        """
+        cells = frozenset((adds, ki, ci) for adds, band_rows in rows.items()
+                          if band_rows is not None
+                          for ki, row in enumerate(band_rows)
+                          for ci, cid in enumerate(row) if cid is not None)
+        if cells:
+            tasks.append(_SellTask(
+                index=len(tasks), band_index=bi, tier_floors=tier_floors,
+                # One band's entries alone go to the worker
+                family=sell.for_band(band, tier_floors=tier_floors), cells=cells, **common))
+
+    for bi, band in enumerate(walked.bands):
+        add(bi, band, True, {False: chunker.grid[bi],
+                             True: add_grid[bi] if add_grid is not None else None})
+    if off_view:
+        own_add_off = chunker.grid_add_off if add_grid is not None else None
+        for bi, band in enumerate(walked.bands):
+            if not walked.tier_binds[bi]:
+                continue
+            if band not in sell.off_bands:
+                logging.warning("The selling simulations hold no tier-floors-off run at band "
+                                "%s; with the tier floors off, selling is not shown there",
+                                _band_label(band))
+                continue
+            add(bi, band, False, {False: chunker.grid_off[bi],
+                                  True: own_add_off[bi] if own_add_off is not None else None})
+    return tasks
+
+
+def _run_sell_tasks(tasks: list[_SellTask], workers: int) -> dict[int, _SellResult]:
+    """
+    Run the Sell select's tasks — in the parent, or across worker processes — never raising.
+
+    With one worker (or one task) every task runs here, in order. Otherwise a
+    pool of spawned processes runs them (spawn, not fork: safe on macOS, and
+    a fresh import in each worker, which installs the parent's
+    SAME_TITLE_SIZE_CAP and SCHEDULED_RUN). A task that raises costs its own
+    cells only: one WARNING naming its band (the first with its traceback),
+    and the rest go on; a pool that cannot run at all fails every task the
+    same way.
+
+    Args:
+        tasks (list[_SellTask]): The tasks.
+        workers (int): The most worker processes to use; 1 runs in-process.
+
+    Returns:
+        dict[int, _SellResult]: Task index -> its result, for the tasks that
+            finished.
+    """
+    results: dict[int, _SellResult] = {}
+    failures = 0
+    started = time.monotonic()
+
+    def finished(task: _SellTask, result: _SellResult | None, error: BaseException | None,
+                 done: int) -> None:
+        """
+        Record one task's outcome and log the build's progress.
+
+        Args:
+            task (_SellTask): The task.
+            result (_SellResult | None): Its result, or None when it failed.
+            error (BaseException | None): What it raised, or None.
+            done (int): How many tasks have finished so far.
+        """
+        nonlocal failures
+        band = task.family.bands[0] if task.tier_floors else task.family.off_bands[0]
+        where = (f"spread band {_band_label(band)}"
+                 + ("" if task.tier_floors else " with the tier floors off"))
+        if error is not None:
+            failures += 1
+            logging.warning("The Sell select's simulations at %s failed; selling is not shown "
+                            "there", where, exc_info=error if failures == 1 else None)
+        else:
+            results[task.index] = result
+        logging.info("Dashboard: Sell select: %d/%d bands done (%s) in %.0f s",
+                     done, len(tasks), where, time.monotonic() - started)
+
+    if workers <= 1 or len(tasks) <= 1:
+        for done, task in enumerate(tasks, 1):
+            try:
+                result, error = _run_sell_task(task), None
+            except Exception as exc:
+                result, error = None, exc
+            finished(task, result, error, done)
+        return results
+    try:
+        pool = ProcessPoolExecutor(max_workers=min(workers, len(tasks)),
+                                   mp_context=multiprocessing.get_context("spawn"))
+    except Exception as exc:
+        for done, task in enumerate(tasks, 1):
+            finished(task, None, exc, done)
+        return results
+    with pool:
+        futures = {pool.submit(_run_sell_task, dataclasses.replace(task, install=True)): task
+                   for task in tasks}
+        for done, future in enumerate(as_completed(futures), 1):
+            task = futures[future]
+            try:
+                result, error = future.result(), None
+            except Exception as exc:
+                result, error = None, exc
+            finished(task, result, error, done)
+    return results
+
+
+def _build_sell_grid(
+    walked: _GridSource,
+    chunker: "_ChunkVisitor",
+    *,
+    start_date: date,
+    initial_balance: float,
+    series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
+    risk_free: RiskFreeRates | None,
+    folder: Path,
+    workers: int = 1,
+) -> _SellGrid:
+    """
+    Build the Sell select: every sell level of every cell the page shows.
+
+    Runs after the walk, over its grid (walked.sell is the family): the tasks
+    (_sell_tasks) run in-process or in worker processes (_run_sell_tasks),
+    each writing its new trade lists as files named by their keys in
+    `folder`. Their results are then put back in task order, and each key
+    gets an id: an inline chunk's own id when the page already holds the list,
+    else the next sidecar id after the page's chunks — the file renamed to
+    chunk-<id>.js — so the numbering does not depend on which worker finished
+    first. A cell above every sale of its run takes the page's own chunk id
+    for that scenario. With the tier floors off, a band they never bind at
+    takes its tier-on rows, as the page's base grid does. Files a failed task
+    left behind are deleted.
+
+    Args:
+        walked (_GridSource): The grid the walk walked.
+        chunker (_ChunkVisitor): The chunk visitor that walked it (not failed).
+        start_date (date): The backtest's start date.
+        initial_balance (float): Starting balance in dollars.
+        series_categories (dict | None): The series-category map.
+        risk_free (RiskFreeRates | None): The rates every view subtracts.
+        folder (Path): The build's sidecar folder (it exists).
+        workers (int): Keyword-only. The most worker processes; 1 (default)
+            runs every task in-process.
+
+    Returns:
+        _SellGrid: The grid (None when no task finished), the levels and the
+            number of sidecar files written.
+    """
+    sell = walked.sell
+    started = time.monotonic()
+    tasks = _sell_tasks(walked, chunker, start_date=start_date,
+                        initial_balance=initial_balance, series_categories=series_categories,
+                        risk_free=risk_free, folder=folder)
+    logging.info("Dashboard: simulating the Sell select: %d sell levels at %d band(s) x Tier "
+                 "floors setting(s), in %d worker process(es)", len(sell.levels), len(tasks),
+                 1 if workers <= 1 or len(tasks) <= 1 else min(workers, len(tasks)))
+    results = _run_sell_tasks(tasks, workers)
+    # Every new list numbered in task order, after the page's own chunks
+    ids = dict(chunker.seen)
+    first_sidecar = next_id = len(chunker.chunks)
+    for index in sorted(results):
+        for key in results[index].written:
+            if key not in ids:
+                os.replace(_sell_key_file(folder, key), _sell_chunk_file(folder, next_id))
+                ids[key] = next_id
+                next_id += 1
+    # A failed task's files, and any write it left half-done
+    for leftover in folder.iterdir():
+        if leftover.is_file() and not leftover.name.startswith(("chunk-", ".writing")):
+            leftover.unlink(missing_ok=True)
+    levels = [{"label": _sell_option(level), "phrase": _sell_phrase(level), "value": level}
+              for level in sell.levels]
+    if not results:
+        return _SellGrid(grid=None, levels=levels, sidecars=0)
+    add_grid = chunker.add_grid() if walked.add_cell is not None else None
+    off_grid = chunker.off_grid() if walked.tier_binds is not None else None
+    bases = {(0, 0): chunker.grid, (0, 1): add_grid, (1, 0): off_grid,
+             (1, 1): chunker.add_off_grid() if (off_grid is not None and add_grid is not None)
+             else None}
+    shape = (len(walked.bands), len(walked.ks), len(walked.caps))
+
+    def blank() -> list:
+        """An empty [band][k][cap] grid."""
+        return [[[None] * shape[2] for _ in range(shape[1])] for _ in range(shape[0])]
+
+    grid = [[[blank() if bases[(t, a)] is not None else None for a in (0, 1)] for t in (0, 1)]
+            for _ in sell.levels]
+    for task in tasks:
+        result = results.get(task.index)
+        if result is None:
+            continue
+        t = 0 if task.tier_floors else 1
+        for (li, adds, ki, ci), key in result.cells.items():
+            a = 1 if adds else 0
+            if grid[li][t][a] is None:
+                continue
+            # Above every sale: the run without selling, the page's own chunk
+            grid[li][t][a][task.band_index][ki][ci] = (bases[(t, a)][task.band_index][ki][ci]
+                                                       if key is None else ids[key])
+    if off_grid is not None:
+        # With the tier floors off, a band they never bind at shows its run
+        # with them on — selling included, as the base grid has it
+        for level_grid in grid:
+            for a in (0, 1):
+                if level_grid[1][a] is None or level_grid[0][a] is None:
+                    continue
+                for bi, binds in enumerate(walked.tier_binds):
+                    if not binds:
+                        level_grid[1][a][bi] = [list(row) for row in level_grid[0][a][bi]]
+    sizes = sum(_sell_chunk_file(folder, i).stat().st_size
+                for i in range(first_sidecar, next_id))
+    logging.info("Dashboard: Sell select built in %.0f s: %d cap points simulated, %d shared, "
+                 "%d chunk file(s) (%.1f MB) in %s", time.monotonic() - started,
+                 sum(r.simulated for r in results.values()),
+                 sum(r.reused for r in results.values()), next_id - first_sidecar,
+                 sizes / 1e6, folder)
+    return _SellGrid(grid=grid, levels=levels, sidecars=next_id - first_sidecar)
+
+
+@contextlib.contextmanager
+def _builds_lock(root: Path):
+    """
+    Hold the lock every dashboard build takes on its sidecar folders.
+
+    An flock on <root>/.lock: a build makes its folder, and replaces the page
+    and deletes the folders of earlier builds, only while holding it, so a
+    build never deletes the folder another build has just made, nor the one
+    a page another build has just written reads.
+
+    Args:
+        root (Path): The folder of every build's sidecar folder
+            (DASHBOARD_FILES_DIRNAME beside the page); it exists.
+
+    Yields:
+        None: While the lock is held.
+    """
+    with (root / _BUILD_LOCK).open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _new_build_folder(page: Path) -> Path:
+    """
+    Make this build's sidecar folder, marked as still being written.
+
+    Named by the UTC time, the process and a random suffix, so two builds
+    never share one, under DASHBOARD_FILES_DIRNAME beside the page; made, and
+    marked (_BUILD_WRITING), under the builds' lock, so a build cleaning up
+    never meets it unmarked.
+
+    Args:
+        page (Path): The dashboard file the build will write.
+
+    Returns:
+        Path: The new, empty (but for its mark) folder.
+    """
+    root = page.parent / DASHBOARD_FILES_DIRNAME
+    root.mkdir(parents=True, exist_ok=True)
+    name = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{os.getpid()}-{secrets.token_hex(4)}"
+    with _builds_lock(root):
+        folder = root / name
+        folder.mkdir()
+        (folder / _BUILD_WRITING).write_text("", encoding="utf-8")
+    return folder
+
+
+def _remove_old_builds(root: Path, keep: str | None) -> None:
+    """
+    Delete every build folder but this build's and those still being written.
+
+    Called under the builds' lock, right after the page is replaced: a folder
+    no page reads any more is deleted, unless its mark (_BUILD_WRITING) is
+    younger than DASHBOARD_BUILD_STALE_SECONDS — another backtest building
+    its page now. A failure to delete one is a WARNING; the next build tries
+    again.
+
+    Args:
+        root (Path): The folder of every build's sidecar folder.
+        keep (str | None): This build's folder name, or None when it wrote
+            none.
+    """
+    now = time.time()
+    for child in root.iterdir():
+        if not child.is_dir() or child.name == keep:
+            continue
+        try:
+            age = now - (child / _BUILD_WRITING).stat().st_mtime
+        except FileNotFoundError:
+            age = None
+        if age is not None and age < DASHBOARD_BUILD_STALE_SECONDS:
+            continue
+        try:
+            shutil.rmtree(child)
+        except OSError:
+            logging.warning("Could not delete an earlier dashboard build's folder %s; the next "
+                            "build tries again", child, exc_info=True)
+
+
+def _publish_page(tmp_path: Path, out_path: Path, folder: Path | None) -> None:
+    """
+    Replace the dashboard with a written page, then delete the folders it no longer reads.
+
+    With no build folder anywhere, the page is simply renamed over the old
+    one (atomic on one filesystem). Otherwise, under the builds' lock: the
+    rename, the deletion of every earlier build's folder (_remove_old_builds),
+    and this build's mark removed — in that order, so whichever page is in
+    place always has its folder.
+
+    Args:
+        tmp_path (Path): The complete page, beside out_path.
+        out_path (Path): The dashboard file.
+        folder (Path | None): This build's sidecar folder, or None when it
+            wrote none.
+    """
+    root = out_path.parent / DASHBOARD_FILES_DIRNAME
+    if not root.is_dir():
+        os.replace(tmp_path, out_path)
+        return
+    with _builds_lock(root):
+        os.replace(tmp_path, out_path)
+        _remove_old_builds(root, None if folder is None else folder.name)
+        if folder is not None:
+            (folder / _BUILD_WRITING).unlink(missing_ok=True)
+
+
 def _new_explorer_visitor(source: _GridSource, sweep: BacktestSweep, *,
                           risk_free: RiskFreeRates | None = None) -> _ExplorerVisitor | None:
     """
@@ -8850,6 +9703,9 @@ def _filter_payload(
     explorer_tiers: bool = True,
     save: dict | None = None,
     add_on_state: str = "not simulated",
+    sell: _SellGrid | None = None,
+    sell_state: str = "not simulated",
+    sidecar_dir: str | None = None,
 ) -> dict:
     """
     Build the base data block the page's filter bar and script read on load.
@@ -8913,6 +9769,16 @@ def _filter_payload(
             "(not available on this page; see the log)"). Ignored when the
             page has the view, whose state is then "shown". "not simulated"
             (default).
+        sell (_SellGrid | None): Keyword-only. The Sell select's data
+            (_build_sell_grid); None (default), or one with no grid, ships no
+            Sell view.
+        sell_state (str): Keyword-only. Why the page has no Sell view when it
+            has none, worded as add_on_state is ("not simulated" or
+            "unavailable"); ignored when it has one. "not simulated" (default).
+        sidecar_dir (str | None): Keyword-only. The build's sidecar folder,
+            relative to the page ("backtest_dashboard_files/<build id>"), which
+            the script loads every chunk at or past "inline_chunks" from; None
+            (default) for a page with no sidecar chunk.
 
     Returns:
         dict: "dates" (the shared axis, ISO dates), "bands" ([{label,
@@ -8946,7 +9812,14 @@ def _filter_payload(
             (null, or the same with the tier floors off, present only with
             both the add-on and the tier-floors-off views,
             chunks.add_off_grid()) and "add_state" ("shown" when the page has
-            the add-on view, else add_on_state).
+            the add-on view, else add_on_state), and the Sell view's:
+            "grid_sell" (null, or [level][Tier floors 0 on / 1 off][Add to
+            held pairs 0 off / 1 on] -> [band][k][cap] chunk id or null, each
+            view the page lacks null — _SellGrid.grid), "sell_levels" ([{label,
+            phrase, value}] per level, [] without the view), "sell_state"
+            ("shown", else sell_state), "inline_chunks" (how many chunks the
+            page holds itself: every id from there on is a sidecar file) and
+            "sidecar_dir" (above).
     """
     axis = chunks.axis
     pb, pk, pc = source.primary
@@ -8963,6 +9836,7 @@ def _filter_payload(
     # source the walk stripped of it (an add-on cell failed) has none
     grid_add = chunks.add_grid() if source.add_cell is not None else None
     add_view = grid_add is not None
+    sell_view = sell is not None and sell.grid is not None
     return {
         "dates": [d.date().isoformat() for d in axis],
         "bands": [{"label": _band_option(band),
@@ -8999,7 +9873,9 @@ def _filter_payload(
                                                 explorer_caps=explorer_caps,
                                                 explorer_tiers=explorer_tiers)
                  + ("" if not add_view else
-                    " " + (_ADD_ON_REACH if explorer else _ADD_ON_REACH_NO_EXPLORER))},
+                    " " + (_ADD_ON_REACH if explorer else _ADD_ON_REACH_NO_EXPLORER))
+                 + ("" if not sell_view else
+                    " " + (_SELL_REACH if explorer else _SELL_REACH_NO_EXPLORER))},
         "styles": {"types": {label: {"color": color, "width": _TYPE_LINE_WIDTH,
                                      "dash": _TYPE_LINE_DASH}
                              for label, color in _TRADE_TYPE_LINES},
@@ -9042,6 +9918,14 @@ def _filter_payload(
         "grid_add": grid_add,
         "grid_add_off": chunks.add_off_grid() if (add_view and off_view) else None,
         "add_state": "shown" if add_view else add_on_state,
+        # The Sell view: every level's grids (null without the view), the
+        # levels' names, and why a page has none
+        "grid_sell": sell.grid if sell_view else None,
+        "sell_levels": sell.levels if sell_view else [],
+        "sell_state": "shown" if sell_view else sell_state,
+        # Every chunk id from here on is a sidecar file in sidecar_dir
+        "inline_chunks": len(chunks.chunks),
+        "sidecar_dir": sidecar_dir,
     }
 
 
@@ -9172,10 +10056,10 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
 
 def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     """
-    Render the sticky filter bar: seven <select>s, the save button and a summary line.
+    Render the sticky filter bar: eight <select>s, the save button and a summary line.
 
-    Spread band, Tier floors, k, Size cap and Add to held pairs choose the
-    scenario — each option one of the grid's axes, the run's own marked
+    Spread band, Tier floors, k, Size cap, Add to held pairs and Sell choose
+    the scenario — each option one of the grid's axes, the run's own marked
     " (primary)" (a band's option text is the payload's "option", which the
     script swaps for its tier-off one when the Tier floors choice changes) —
     and Category and Tag a slice of it. The Tier floors select offers each
@@ -9188,6 +10072,11 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     size cap)"), its title carrying the detail (_ADD_ON_SELECT_TITLE); a
     payload with no add-on view ("grid_add" null) puts a grey note beside it
     by its "add_state" (_ADD_ON_NOTES), and the script never enables it.
+    The Sell select offers "no selling" (selected) and every sell level the
+    payload names (sell_levels), its title carrying the rule
+    (_SELL_SELECT_TITLE); a payload with no Sell view ("grid_sell" null)
+    puts a grey note beside it by its "sell_state" (_SELL_NOTES), and the
+    script never enables it.
     Category and tag options carry the primary scenario's trade
     counts; the script rewrites them whenever the scenario changes. Tag
     options list every "Category · Tag" while the category is "All";
@@ -9270,6 +10159,19 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                 f"{html.escape(_ADD_ON_NOTES.get(add_state, _ADD_ON_NOTES['not simulated']))}"
                 "</span>")
     add_title = html.escape(_ADD_ON_SELECT_TITLE)
+    # The Sell choice: no selling (the page as rendered) or a level, each
+    # option's value its index in the payload's sell_levels; a page with no
+    # Sell view says why beside the select it keeps shut
+    sell_opts = (f'<option value="{_SELL_NONE}" selected>{html.escape(_SELL_OPTION_NONE)}'
+                 '</option>' + "".join(
+                     f'<option value="{i}">{html.escape(level["label"])}</option>'
+                     for i, level in enumerate(payload.get("sell_levels") or [])))
+    sell_state = payload.get("sell_state", "not simulated")
+    sell_note = ("" if sell_state == "shown" else
+                 '&nbsp;<span id="flt-sell-note" style="color:#9E9E9E; font-size:13px;">'
+                 f"{html.escape(_SELL_NOTES.get(sell_state, _SELL_NOTES['not simulated']))}"
+                 "</span>")
+    sell_title = html.escape(_SELL_SELECT_TITLE)
     # The save button's hover text: a page filed by ticker prefix says why a
     # category or tag cannot be saved from it
     save_filed = (payload.get("save") or {}).get("filed_by_listing", False)
@@ -9307,6 +10209,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         f'{options(payload["caps"], pc)}</select></label>&nbsp;&nbsp;'
         f'<label>Add to held pairs: <select id="flt-add" disabled autocomplete="off" '
         f'title="{add_title}">{add_opts}</select></label>{add_note}&nbsp;&nbsp;'
+        f'<label>Sell: <select id="flt-sell" disabled autocomplete="off" '
+        f'title="{sell_title}">{sell_opts}</select></label>{sell_note}&nbsp;&nbsp;'
         f'<label>Category: <select id="flt-cat" disabled autocomplete="off">'
         f'{cat_opts}</select></label>&nbsp;&nbsp;'
         f'<label>Tag: <select id="flt-tag" disabled autocomplete="off">'
@@ -9431,9 +10335,24 @@ def _packed_text_script(element_id: str, raw: str) -> str:
         str: The <script type="text/plain" data-encoding="gzip+base64"> element,
             gzip's mtime pinned to 0 so the same text always packs alike.
     """
-    packed = base64.b64encode(gzip.compress(raw.encode("utf-8"), mtime=0)).decode("ascii")
     return (f'<script type="text/plain" id="{element_id}" data-encoding="gzip+base64">'
-            f"{packed}</script>")
+            f"{_pack_text(raw)}</script>")
+
+
+def _pack_text(raw: str) -> str:
+    """
+    Compress a JSON text as every packed block holds it: gzip, then base64.
+
+    gzip's mtime is pinned to 0, so the same text always packs to the same
+    bytes — a sidecar chunk written by two worker processes is one file.
+
+    Args:
+        raw (str): Strict JSON text (_strict_json's).
+
+    Returns:
+        str: The base64 text (its alphabet holds no "<", quote or backslash).
+    """
+    return base64.b64encode(gzip.compress(raw.encode("utf-8"), mtime=0)).decode("ascii")
 
 
 # The page-wide filter's script. A raw string, so every backslash in it (a JS
@@ -9464,6 +10383,19 @@ def _packed_text_script(element_id: str, raw: str) -> str:
 # and neither the k-hat figures, the interval-discount section nor the
 # scenario explorer follow it (renderKhat, renderKhatCards and renderKd read
 # no part of it, and window.dashScenarioSelect still gets four arguments).
+# The Sell select, appended after it (SHOWN[7]), picks between the grids as
+# they stand and one grid per sell level (D.grid_sell[level][tier][add]); it
+# is enabled only when the base block carries them, its level's phrase and
+# the summary line's note are Python's (D.sell_levels, D.text.sell_note), it
+# keeps the save button disabled (live trading never sells), and, like Add
+# to held pairs, it reaches neither the k-hat figures, the interval-discount
+# section nor the scenario explorer. A chunk at or past D.inline_chunks is a
+# sidecar file in D.sidecar_dir, loaded through a <script src> element whose
+# one call to window.__dashChunk hands over its packed text (sidecarText),
+# inflated by the same code as a block in the page (inflateText); a file
+# that cannot be loaded, or hands nothing over, is named in Python's words
+# (D.text.sidecar_missing, sidecar_empty), and the selects go back to what
+# is still shown.
 # The script also rewrites the performance section's two k-hat cards
 # (renderKhatCards, from the k-hat breakdown's group for the selection) and the
 # interval-discount section at the bar's k and size cap (renderKd, from
@@ -9499,14 +10431,18 @@ _FILTER_JS = r"""
   // "Add to held pairs": the runs as simulated (off), or with a held pair
   // added to (on, D.grid_add)
   var addSel = document.getElementById('flt-add');
-  if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !addSel || !catSel || !tagSel) {
+  // "Sell": the runs as simulated (none), or each position sold whole at a
+  // sell level (D.grid_sell, a grid per level)
+  var sellSel = document.getElementById('flt-sell');
+  if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !addSel || !sellSel || !catSel
+      || !tagSel) {
     return;
   }
   // The bar's save button: a button, not a select, so never in SELECTS
   // (whose reset reads .options); optional, since a page without it has
   // nothing to save from
   var saveBtn = document.getElementById('flt-save');
-  var SELECTS = [bandSel, tierSel, kSel, capSel, addSel, catSel, tagSel];
+  var SELECTS = [bandSel, tierSel, kSel, capSel, addSel, sellSel, catSel, tagSel];
   // The k-hat chart's own "Group by" select follows the bar's rules
   var khatGroup = document.getElementById('khat-group');
   if (khatGroup) { SELECTS.push(khatGroup); }
@@ -9516,8 +10452,9 @@ _FILTER_JS = r"""
   // first. SEQ numbers the choices, so a chunk arriving after a later choice
   // is never drawn over it. SHOWN: what is on screen — the [band, k, cap]
   // indexes, the category and tag selects' values, the Tier floors choice
-  // ("on" / "off") and the Add to held pairs choice ("off" / "on"), each
-  // appended after the others so the other indexes keep their meaning.
+  // ("on" / "off"), the Add to held pairs choice ("off" / "on") and the Sell
+  // choice ("none", or a level's index), each appended after the others so
+  // the other indexes keep their meaning.
   var D = null, N = 0, C = null, CHUNKS = {}, KEPT = [], SEQ = 0, SHOWN = null;
   var KEEP = 16;                     // drawn chunks kept besides the primary
 
@@ -9549,17 +10486,26 @@ _FILTER_JS = r"""
   // The Add to held pairs choice reads "on" only on a page whose base block
   // carries its grid (the select stays disabled on any other)
   function addOn(a) { return !!(D.grid_add && a === 'on'); }
-  // The grid of chunk ids for a Tier floors choice t and an Add to held pairs
-  // choice a: null when the page holds none (an add-on view with the tier
-  // floors off, on a page with no tier-off add-on runs)
-  function gridAt(t, a) {
+  // The Sell choice s as a level's index into D.sell_levels and D.grid_sell,
+  // or null for none (and on a page without the Sell view, whose select
+  // stays disabled)
+  function sellAt(s) {
+    return (D.grid_sell && s !== 'none' && s !== undefined) ? parseInt(s, 10) : null;
+  }
+  // The grid of chunk ids for a Tier floors choice t, an Add to held pairs
+  // choice a and a Sell choice s: null when the page holds none (an add-on
+  // view with the tiers off, on a page with no tier-off add-on runs)
+  function gridAt(t, a, s) {
+    var level = sellAt(s);
+    if (level !== null) { return D.grid_sell[level][offAt(t) ? 1 : 0][addOn(a) ? 1 : 0]; }
     if (addOn(a)) { return offAt(t) ? D.grid_add_off : D.grid_add; }
     return offAt(t) ? D.grid_off : D.grid;
   }
   // null for a scenario the run never simulated (a whole grid missing included)
-  function chunkAt(b, k, c, t, a) { var g = gridAt(t, a); return g ? g[b][k][c] : null; }
+  function chunkAt(b, k, c, t, a, s) { var g = gridAt(t, a, s); return g ? g[b][k][c] : null; }
   function cellChunk() {
-    return chunkAt(bandIndex(), kIndex(), capIndex(), tierSel.value, addSel.value);
+    return chunkAt(bandIndex(), kIndex(), capIndex(), tierSel.value, addSel.value,
+                   sellSel.value);
   }
   // The page as rendered: the primary scenario with the tier floors on and
   // adding to held pairs off
@@ -9568,7 +10514,8 @@ _FILTER_JS = r"""
   // confirmation-page address, or null when it cannot become live settings:
   // nothing drawn yet, no save target on the page (D.save), a scenario the
   // run never simulated (an Add to held pairs choice the page holds no grid
-  // for included), a band the run did not record, a k or size cap the
+  // for included), a scenario that sells (live trading never sells), a band
+  // the run did not record, a k or size cap the
   // run did not record or that is not above zero, or a category or tag on a
   // page that does not file trades by Kalshi's series listing. A tag always goes with its category
   // (the tag select sets the category too). The server refuses, with its
@@ -9576,7 +10523,11 @@ _FILTER_JS = r"""
   // by String(), whose shortest form reads back as the same number.
   function saveHref() {
     if (!D || !D.save || !SHOWN || C === null) { return null; }
-    if (chunkAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6]) === null) { return null; }
+    // Live trading never sells a position: no live setting can carry a level
+    if (sellAt(SHOWN[7]) !== null) { return null; }
+    if (chunkAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7]) === null) {
+      return null;
+    }
     var band = D.bands[SHOWN[0]].value, k = D.ks[SHOWN[1]].value, cap = D.caps[SHOWN[2]].value;
     if (!band || !(k > 0) || !(cap > 0)) { return null; }
     var sliced = SHOWN[3] !== '' || SHOWN[4] !== '';
@@ -9612,9 +10563,10 @@ _FILTER_JS = r"""
   }
   // The run's own scenario: its cell, with the tiers on — or off at a band
   // the tiers do not reach (D.tier_binds false), whose off view IS that run —
-  // and adding to held pairs off (a run that adds is never the run as rendered)
+  // adding to held pairs off and no sell level (a run that adds, or sells,
+  // is never the run as rendered)
   function isPrimary() {
-    return isPrimaryCell() && !addOn(addSel.value)
+    return isPrimaryCell() && !addOn(addSel.value) && sellAt(sellSel.value) === null
       && (!tiersOff() || !D.tier_binds[bandIndex()]);
   }
   function list() { return C ? C.list : null; }
@@ -9645,12 +10597,16 @@ _FILTER_JS = r"""
   // A scenario in the summary's words: Python's _scenario_phrase, its band
   // named as the Tier floors choice t reads it (_band_where, _tier_off_where),
   // closed by Python's add-on phrase when the Add to held pairs choice a is on
-  function scenarioAt(b, k, c, t, a) {
+  // and by the sell level's phrase when the Sell choice s names one
+  function scenarioAt(b, k, c, t, a, s) {
+    var level = sellAt(s);
     return fill(D.text.scenario, {where: bandsAt(t)[b].where, k: D.ks[k].text,
-                                  cap: D.caps[c].text}) + (addOn(a) ? D.text.add_on : '');
+                                  cap: D.caps[c].text}) + (addOn(a) ? D.text.add_on : '')
+      + (level !== null ? D.sell_levels[level].phrase : '');
   }
   function scenario() {
-    return scenarioAt(bandIndex(), kIndex(), capIndex(), tierSel.value, addSel.value);
+    return scenarioAt(bandIndex(), kIndex(), capIndex(), tierSel.value, addSel.value,
+                      sellSel.value);
   }
   // The summary line: the templates _filter_summary_text fills for the view
   // Python rendered, filled here for every other one
@@ -9667,9 +10623,11 @@ _FILTER_JS = r"""
       text = fill(T.slice, {scenario: scenario(), selection: selectionName(key),
                             n: v.n, band_count: trades(count('all'))});
     }
-    // While adding is on, Python's note on what an added purchase counts as
-    setText('flt-summary', text + (addOn(addSel.value) && cellChunk() !== null
-                                    ? T.add_on_note : '') + T.unfiltered);
+    // While adding is on, Python's note on what an added purchase counts as,
+    // and while a sell level is chosen its note on what a sale is
+    var shown = cellChunk() !== null;
+    setText('flt-summary', text + (addOn(addSel.value) && shown ? T.add_on_note : '')
+            + (sellAt(sellSel.value) !== null && shown ? T.sell_note : '') + T.unfiltered);
   }
 
   // Trace i of a figure Python drew, with new data: its styling (colours,
@@ -9738,9 +10696,11 @@ _FILTER_JS = r"""
     if (body) { body.style.display = has ? '' : 'none'; }
   }
   // Trade rows: each [head, tail] pair is _trade_row's HTML, both halves
-  // escaped by Python (the heads shared by every chunk, the tails its own)
+  // escaped by Python (the heads shared by every chunk in the page, or a
+  // sidecar chunk's own; the tails its own)
   function rows(pairs) {
-    return pairs.map(function(p) { return D.rows[p[0]] + C.strings[p[1]]; }).join('');
+    var heads = C.heads || D.rows;
+    return pairs.map(function(p) { return heads[p[0]] + C.strings[p[1]]; }).join('');
   }
 
   function renderPerformance(v) {
@@ -10035,14 +10995,50 @@ _FILTER_JS = r"""
     }
   }
 
-  // A block is gzip-compressed JSON in base64 (_packed_json_script),
-  // inflated by the browser's own DecompressionStream.
-  function inflate(el) {
-    var bin = atob(el.textContent.trim());
+  // A block is gzip-compressed JSON in base64 (_pack_text), inflated by the
+  // browser's own DecompressionStream: a block in the page (inflate), or the
+  // text a sidecar file handed over (inflateText).
+  function inflateText(text) {
+    var bin = atob(text.trim());
     var bytes = new Uint8Array(bin.length);
     for (var i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }
     var stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-    return new Response(stream).text().then(function(text) { return JSON.parse(text); });
+    return new Response(stream).text().then(function(raw) { return JSON.parse(raw); });
+  }
+  function inflate(el) {
+    return inflateText(el.textContent);
+  }
+  // A sidecar chunk (an id at or past D.inline_chunks, the Sell select's) is
+  // a file of its own in D.sidecar_dir, holding one call to
+  // window.__dashChunk with its packed text: loaded through a <script src>
+  // element, which a page opened from disk may load where fetch() may not.
+  // The element that ran the call names the chunk; WAITING holds each load
+  // in flight by id, and a file that fails to load, or runs without handing
+  // anything over, rejects it in Python's words (D.text).
+  var WAITING = {};
+  window.__dashChunk = function(el, text) {
+    var key = el ? el.getAttribute('data-chunk') : null;
+    var waiting = key !== null ? WAITING[key] : null;
+    if (waiting) { delete WAITING[key]; waiting.resolve(text); }
+  };
+  function sidecarText(id) {
+    return new Promise(function(resolve, reject) {
+      var key = String(id), src = D.sidecar_dir + '/chunk-' + key + '.js';
+      var el = document.createElement('script');
+      WAITING[key] = {resolve: resolve, reject: reject};
+      function settle(template) {
+        if (el.parentNode) { el.parentNode.removeChild(el); }
+        if (WAITING[key]) {
+          delete WAITING[key];
+          reject(new Error(fill(template, {file: src})));
+        }
+      }
+      el.setAttribute('data-chunk', key);
+      el.onload = function() { settle(D.text.sidecar_empty); };
+      el.onerror = function() { settle(D.text.sidecar_missing); };
+      el.src = src;
+      document.head.appendChild(el);
+    });
   }
   // A DRAWN chunk becomes the most recently used; beyond KEEP of them the
   // least recently drawn is dropped (the primary's is never counted or
@@ -10066,7 +11062,9 @@ _FILTER_JS = r"""
     if (!entry) {
       entry = CHUNKS[id] = {data: null};
       entry.promise = Promise.resolve().then(function() {
-        return inflate(byId('dash-chunk-' + id));
+        // In the page itself, or a sidecar file beside it
+        return id < D.inline_chunks ? inflate(byId('dash-chunk-' + id))
+                                    : sidecarText(id).then(inflateText);
       }).then(function(data) {
         if (id === primaryChunk() || id === cellChunk()) { entry.data = data; }
         else { delete CHUNKS[id]; }
@@ -10080,7 +11078,7 @@ _FILTER_JS = r"""
   function draw() {
     refreshOptions();
     SHOWN = [bandIndex(), kIndex(), capIndex(), catSel.value, tagSel.value, tierSel.value,
-             addSel.value];
+             addSel.value, sellSel.value];
     render();
     refreshSave();
   }
@@ -10108,12 +11106,13 @@ _FILTER_JS = r"""
       // category and tag too, since one chosen while the chunk was loading
       // was never drawn either — the tag list rebuilt for the category shown
       // — and the line says which scenario could not be loaded; the Tier
-      // floors and Add to held pairs choices go back too, with the band
+      // floors, Add to held pairs and Sell choices go back too, with the band
       // options named for the first
       var tried = scenario();
       bandSel.value = String(SHOWN[0]);
       tierSel.value = SHOWN[5];
       addSel.value = SHOWN[6];
+      sellSel.value = SHOWN[7];
       relabelBands();
       kSel.value = String(SHOWN[1]);
       capSel.value = String(SHOWN[2]);
@@ -10122,7 +11121,8 @@ _FILTER_JS = r"""
       tagSel.value = SHOWN[4];
       setText('flt-summary', fill(D.text.unavailable, {
         failed: tried, reason: String(err),
-        scenario: scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6])}));
+        scenario: scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6],
+                             SHOWN[7])}));
       // The scenario still shown can be saved again
       refreshSave();
     });
@@ -10135,7 +11135,7 @@ _FILTER_JS = r"""
     SELECTS.forEach(function(s) { s.disabled = true; });
     if (saveBtn) { saveBtn.disabled = true; }
     if (D) {
-      var p = D.primary, here = scenarioAt(p[0], p[1], p[2], 'on', 'off');
+      var p = D.primary, here = scenarioAt(p[0], p[1], p[2], 'on', 'off', 'none');
       setText('flt-summary', fill(D.text.unavailable,
                                   {failed: here, reason: reason, scenario: here}));
       return;
@@ -10145,8 +11145,8 @@ _FILTER_JS = r"""
   }
   // A browser can restore a <select>'s last choice on a reload, or on going
   // back; the page as rendered is the primary scenario's unfiltered view with
-  // the tier floors on and adding to held pairs off, so the bar is set back
-  // to it. Python renders the selects disabled: they are enabled once the
+  // the tier floors on, adding to held pairs off and no sell level, so the
+  // bar is set back to it. Python renders the selects disabled: they are enabled once the
   // base block and the primary scenario's chunk are inflated, so no choice
   // can be made (or lost) before it can be drawn — and a category or tag
   // change never meets an unloaded chunk.
@@ -10170,11 +11170,13 @@ _FILTER_JS = r"""
   }).then(function(chunk) {
     if (SEQ === 0) {
       C = chunk;
-      SHOWN = D.primary.concat([catSel.value, tagSel.value, tierSel.value, addSel.value]);
+      SHOWN = D.primary.concat([catSel.value, tagSel.value, tierSel.value, addSel.value,
+                                sellSel.value]);
     }
-    // A run with no tier-off (or add-on) view keeps that select disabled
+    // A run with no tier-off (or add-on, or Sell) view keeps that select disabled
     SELECTS.forEach(function(s) {
-      s.disabled = (s === tierSel && !D.grid_off) || (s === addSel && !D.grid_add);
+      s.disabled = (s === tierSel && !D.grid_off) || (s === addSel && !D.grid_add)
+        || (s === sellSel && !D.grid_sell);
     });
     refreshSave();
   }, function(err) { unavailable(String(err)); });
@@ -10194,6 +11196,11 @@ _FILTER_JS = r"""
   addSel.addEventListener('change', function() {
     // Nothing to switch to without the add-on view (the select stays shut)
     if (!D || !D.grid_add) { return; }
+    choose();
+  });
+  sellSel.addEventListener('change', function() {
+    // Nothing to switch to without the Sell view (the select stays shut)
+    if (!D || !D.grid_sell) { return; }
     choose();
   });
   catSel.addEventListener('change', function() {
@@ -10245,6 +11252,7 @@ def generate_dashboard(
     interval_discount: float | None = None,
     series_categories: dict[str, tuple[str, tuple[str, ...]]] | None = None,
     risk_free: RiskFreeRates | None = None,
+    sell_workers: int = 1,
 ) -> Path:
     """
     Assemble all nine dashboard sections into a single self-contained HTML file.
@@ -10276,7 +11284,13 @@ def generate_dashboard(
     carried a size-cap sweep (_EXPLORER_OWN_CAP_HTML), and the bar's summary
     sentence when the bar offers more caps (_bar_reach) — and a notice in
     the section's place only if even that fails — the page is
-    always written). If the filter's data
+    always written). When the sweep carries the Sell family and the walked
+    grid fits it (_GridSource.sell), the Sell select is built after the walk
+    (_build_sell_grid: every sell level of every cell the bar shows, in up to
+    sell_workers spawned worker processes, each new trade list written as a
+    sidecar chunk file in a new build folder beside the page,
+    DASHBOARD_FILES_DIRNAME / <build id> in the page's folder); a failure costs the
+    Sell select alone, and a folder no chunk was written to is deleted. If the filter's data
     cannot be built, the page is written without the bar and its script,
     with a notice in the bar's place (and in the k-hat breakdown's, which
     reads the same base block, and in the interval-discount section, which
@@ -10292,7 +11306,11 @@ def generate_dashboard(
     renamed over it (os.replace, atomic on one filesystem), so a browser or a
     second reader never sees a half-written page and a failed write leaves
     the previous dashboard intact. Two runs finishing together each write a
-    complete page and the later rename wins.
+    complete page and the later rename wins. The rename and the deletion of
+    every earlier build's sidecar folder happen together under a lock
+    (_publish_page), so the page in place always has its folder, and a build
+    still writing its own is never touched; a page that fails to be written
+    deletes its own new folder and leaves the previous page and folder.
 
     The two sweep-related parameters are keyword-only with defaults, so a
     four-argument positional call works. Omit both and
@@ -10372,6 +11390,10 @@ def generate_dashboard(
             — a strategy curve on its open capital (_rf_hurdle), the S&P 500
             row in full — and the header names (_risk_free_html). None
             (default) subtracts 0% and the header says none was supplied.
+        sell_workers (int): The most worker processes the Sell select's
+            simulations run in (_build_sell_grid), when the sweep carries the
+            Sell family (BacktestSweep.sell_sweep); 1 (default) runs them in
+            this process.
 
     Returns:
         Path: Absolute path to the HTML file written,
@@ -10469,6 +11491,10 @@ def generate_dashboard(
     explores = sweep is not None and bool(sweep.scenarios)
     explorer_data: _ExplorerData | None = None
     explorer_failed = explorer_rebuilt = False
+    # The Sell select's data, built after the walk in its own folder of
+    # sidecar chunks beside the page (None: no Sell view, and no folder)
+    sell_grid: _SellGrid | None = None
+    build_folder: Path | None = None
     try:
         source = _grid_source(sweep, trades, equity_df, k_used)
         explorer_visitor = (_new_explorer_visitor(source, sweep, risk_free=risk_free)
@@ -10502,6 +11528,23 @@ def generate_dashboard(
             # bar's — an explorer rebuilt from the eager points has the run's
             # own cap alone, while the bar may offer every cap
             explorer_grid = explorer_data is not None and explorer_data.checks
+            if source.sell is not None:
+                # Every sell level of every scenario the bar shows, in worker
+                # processes; a failure costs the Sell select alone
+                try:
+                    build_folder = _new_build_folder(out_path)
+                    sell_grid = _build_sell_grid(
+                        source, chunker, start_date=start_date,
+                        initial_balance=initial_balance, series_categories=series_categories,
+                        risk_free=risk_free, folder=build_folder, workers=sell_workers)
+                except Exception:
+                    logging.warning("The Sell select could not be built; it stays disabled",
+                                    exc_info=True)
+                    sell_grid = None
+                if build_folder is not None and (sell_grid is None or not sell_grid.sidecars):
+                    # Nothing for the page to load from it
+                    shutil.rmtree(build_folder, ignore_errors=True)
+                    build_folder = None
             filter_data = _filter_payload(
                 source, chunker, start_date, initial_balance, series_categories, kd=kd,
                 tainted=tainted, explorer=explorer_grid,
@@ -10521,7 +11564,14 @@ def generate_dashboard(
                 # none has nothing to show
                 add_on_state=("unavailable"
                               if getattr(sweep, "add_on_cap_sweep", None) is not None
-                              else "not simulated"))
+                              else "not simulated"),
+                # The same for the Sell select, whose chunks past the page's
+                # own are files in this build's folder beside the page
+                sell=sell_grid,
+                sell_state=("unavailable" if getattr(sweep, "sell_sweep", None) is not None
+                            else "not simulated"),
+                sidecar_dir=(None if build_folder is None
+                             else f"{DASHBOARD_FILES_DIRNAME}/{build_folder.name}"))
             filter_bar = _filter_bar_html(filter_data, chunker.primary_views or {})
             base_block = _packed_json_script("dash-data", filter_data)
             chunks = chunker.chunks
@@ -10533,6 +11583,10 @@ def generate_dashboard(
     if filter_bar is None:
         # The notice in the bar's place, and the trade link, which needs no bar
         filter_data, chunks = None, []
+        if build_folder is not None:
+            # No script will load the Sell select's files
+            shutil.rmtree(build_folder, ignore_errors=True)
+            build_folder = None
         filter_bar = _FILTER_UNAVAILABLE_HTML + "\n" + _trade_paragraph_html()
         # Without the bar the section cannot follow it, whatever was built
         kd, kd_failed = None, False
@@ -10645,6 +11699,7 @@ def generate_dashboard(
     # Every chunk precedes the base block, and both precede the script that
     # reads them. newline="" writes every "\n" as-is on any platform.
     tmp_path = out_path.with_name(f".{out_path.name}.{os.getpid()}.tmp")
+    published = False
     try:
         with tmp_path.open("w", encoding="utf-8", newline="") as page:
             page.write(head)
@@ -10658,8 +11713,13 @@ def generate_dashboard(
                 page.write(base_block)
                 page.write(_FILTER_JS)
             page.write("\n</body>\n</html>")
-        os.replace(tmp_path, out_path)
+        # The page replaced, then the folders no page reads any more deleted
+        _publish_page(tmp_path, out_path, build_folder)
+        published = True
     finally:
         tmp_path.unlink(missing_ok=True)
+        if not published and build_folder is not None:
+            # The previous page stays, and reads its own folder
+            shutil.rmtree(build_folder, ignore_errors=True)
     logging.info("Dashboard written: %s", out_path)
     return out_path
