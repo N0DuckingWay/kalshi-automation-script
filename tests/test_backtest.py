@@ -904,9 +904,10 @@ class TestSummaryBlock:
 class TestCorpusProvenanceLine:
     """DR-13 (P2): the run's report closes, on every run, with what
     settled-market corpus it read — the Period line runs to today, the corpus
-    only to its assembly. The archive cutoff is information only: a window
-    starting after it is priced from the live candlestick endpoint, so the
-    old "structurally 0-trade" WARNING is gone."""
+    only to its assembly, which every run brings up to date (a cache from an
+    earlier UTC day is extended). The archive cutoff is information only: a
+    window starting after it is priced from the live candlestick endpoint, so
+    the old "structurally 0-trade" WARNING is gone."""
 
     PROV = CorpusProvenance(
         from_cache=True, assembled_at=datetime(2026, 9, 24, 12, 37, 49, tzinfo=UTC),
@@ -919,9 +920,9 @@ class TestCorpusProvenanceLine:
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         assert ("Settled-market corpus: assembled 2026-09-24 12:37 UTC, holding no "
-                "market settled after that (served from an earlier run's cache; "
-                "--no-cache extends it); archive cutoff at assembly: 2026-07-25"
-                ) in caplog.text
+                "market settled after that (served from an earlier run's cache, "
+                "assembled earlier today; --no-cache re-assembles it in full); "
+                "archive cutoff at assembly: 2026-07-25") in caplog.text
         assert "structural" not in caplog.text
 
     def test_a_window_after_the_cutoff_draws_no_warning(self, cli, monkeypatch, caplog):
@@ -936,21 +937,30 @@ class TestCorpusProvenanceLine:
                     and "archive cutoff" in r.getMessage()]
         assert "structural" not in caplog.text and "verdict" not in caplog.text
 
-    def test_a_legacy_cache_names_its_file_time(self, cli, monkeypatch, caplog):
-        # P2 review (C1/ADV-1): a legacy .json hit carries its file time here
-        # too, named as such, and claims no cutoff.
-        cli["result"].corpus_provenance = CorpusProvenance(
-            from_cache=True, assembled_at=datetime(2026, 8, 3, 19, 5, tzinfo=UTC),
-            archive_cutoff=None, legacy=True)
+    @pytest.mark.parametrize("from_cache, source", [
+        (False, "extended through today by this run"),
+        (True, "served from an earlier run's cache, assembled earlier today; "
+               "--no-cache re-assembles it in full"),
+    ])
+    def test_an_extended_corpus_names_its_full_assembly(
+            self, cli, monkeypatch, caplog, from_cache, source):
+        cli["result"].corpus_provenance = dataclasses.replace(
+            self.PROV, from_cache=from_cache,
+            full_assembly_at=datetime(2026, 9, 20, 8, 15, tzinfo=UTC))
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
-        assert ("Settled-market corpus: last written 2026-08-03 19:05 UTC (a legacy "
-                "cache's file time), holding no market settled after that (served "
-                "from an earlier run's cache; --no-cache extends it); archive cutoff "
-                "at assembly: not recorded (the legacy format records none)"
-                ) in caplog.text
-        assert not [r for r in caplog.records if r.levelname == "WARNING"
-                    and "archive cutoff" in r.getMessage()]
+        assert ("Settled-market corpus: assembled 2026-09-24 12:37 UTC, holding no "
+                "market settled after that (extended day by day since a full "
+                f"assembly of 2026-09-20 08:15 UTC) ({source}); archive cutoff at "
+                "assembly: 2026-07-25") in caplog.text
+
+    def test_a_freshly_assembled_corpus_says_so(self, cli, monkeypatch, caplog):
+        cli["result"].corpus_provenance = dataclasses.replace(
+            self.PROV, from_cache=False, archive_cutoff=None)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert ("holding no market settled after that (assembled by this run); "
+                "archive cutoff at assembly: not recorded") in caplog.text
 
     def test_no_provenance_says_not_recorded(self, cli, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):

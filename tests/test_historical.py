@@ -3,7 +3,6 @@ import copy
 import gzip
 import json
 import logging
-import os
 import threading
 import weakref
 import zlib
@@ -700,11 +699,12 @@ class TestFetchAllSettledMarkets:
     def test_corrupt_assembled_cache_falls_through_to_refetch(self, tmp_path, monkeypatch,
                                                               caplog):
         # BS-08: a truncated assembled cache (the multi-hour fetch's final
-        # write, historically interrupted by OOM kills) must read back as a
-        # miss and refetch, not raise before a single request is issued. This
-        # one is a LEGACY (pre-SS-1) single-document cache, which is still
-        # read through _load_json_cache; the streamed format's own corruption
-        # tests are in TestStreamedAssembledCache.
+        # write, historically interrupted by OOM kills) must never raise
+        # before a single request is issued. This one is a LEGACY (pre-SS-1)
+        # single-document cache, which is no longer read at all — it records
+        # nothing an extension could start from — so the window is simply
+        # re-assembled; the streamed format's own corruption tests are in
+        # TestStreamedAssembledCache.
         from datetime import date
 
         cache_dir = tmp_path / "cache"
@@ -737,13 +737,16 @@ class TestFetchAllSettledMarkets:
             "cursor": None,
         }))
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.INFO):
             out = historical.fetch_all_settled_markets(
                 MagicMock(), live, start_date=date(2026, 2, 1), use_cache=True,
             )
 
         assert {m["ticker"] for m in out} == {"RECENT"}
-        assert any("Corrupt JSON cache" in r.getMessage() for r in caplog.records)
+        assert ("Legacy assembled cache settled_markets_2026-02-01_nomve.json cannot "
+                "be brought up to date") in caplog.text
+        # Never even parsed, so its damage is not reported
+        assert "Corrupt JSON cache" not in caplog.text
         # A well-formed cache is written for the next run — in the streamed
         # format (SS-1), which the next run prefers — and the damaged legacy
         # file is gone, as the old code's rebuild overwrote it: nothing writes
@@ -5135,23 +5138,28 @@ class TestStreamedAssembledCache:
         assert historical.SettledCorpus.open_validated(
             path, historical._assembled_cache_meta(self.START, None)) is not None
 
-    def test_a_legacy_json_cache_is_still_served_whole_as_a_list(
+    def test_a_legacy_json_cache_is_rebuilt_and_retired(
             self, tmp_path, monkeypatch, caplog):
+        # A legacy .json records neither its archive cutoff nor its frontier
+        # day, so it cannot be brought up to date: it is not even read, the
+        # window is re-assembled in full, and the committed rebuild deletes it.
         archive_markets, live_markets = TestShardedFetch()._fixture_markets()
         archive = _FakeArchive(archive_markets)
         _install_sharded_fakes(monkeypatch, tmp_path, archive, TestShardedFetch.CUTOFF)
-        legacy = [{"ticker": "OLD1", "event_title": "x"}, {"ticker": "OLD2"}]
         (tmp_path / "cache").mkdir(parents=True)
-        (tmp_path / "cache" / "settled_markets_2026-06-05.json").write_text(json.dumps(legacy))
+        legacy_path = tmp_path / "cache" / "settled_markets_2026-06-05.json"
+        legacy_path.write_text(json.dumps([{"ticker": "OLD1"}, {"ticker": "OLD2"}]))
         with caplog.at_level(logging.INFO):
             out, live = self._again(live_markets)
-        # Served whole, as a list: since P2 a LegacySettledCorpus, the list
-        # subclass that only adds the file time as provenance (DR-13).
-        assert isinstance(out, list) and type(out) is historical.LegacySettledCorpus
-        assert not isinstance(out, historical.SettledCorpus) and out == legacy
-        assert archive.calls == 0 and live.calls == 0
-        assert "Loaded 2 settled markets from cache" in caplog.text
-        assert not list((tmp_path / "cache").glob("*.jsonl.gz"))  # a hit writes nothing
+        assert isinstance(out, historical.SettledCorpus)
+        assert "OLD1" not in {m["ticker"] for m in out}
+        assert archive.calls > 0 and live.calls > 0
+        assert ("Legacy assembled cache settled_markets_2026-06-05.json cannot be "
+                "brought up to date") in caplog.text
+        assert "Loaded" not in caplog.text
+        assert not legacy_path.exists()
+        assert ("Removed the superseded legacy settled-market cache "
+                "settled_markets_2026-06-05.json") in caplog.text
 
     def test_the_streamed_cache_wins_over_a_legacy_one_and_a_rebuild_retires_it(
             self, tmp_path, monkeypatch, caplog):
@@ -5314,16 +5322,42 @@ def _forbid_network(monkeypatch):
     monkeypatch.setattr(historical, "_load_or_build_event_titles", titles)
 
 
+def _freeze_clock(monkeypatch, when):
+    """Put the whole settled-market fetch on `when`: historical._utc_now is the
+    one clock it reads (the same-day test, the live phase's frontier and every
+    meta stamp). Returns a mutable holder, so a test can move the clock on."""
+    clock = {"now": when}
+    monkeypatch.setattr(historical, "_utc_now", lambda: clock["now"])
+    return clock
+
+
+class _TimedLive(_FakeLive):
+    """A live endpoint that serves only what has settled by the frozen clock —
+    the real endpoint cannot list a market before it settles, which is what
+    leaves an assembly's frontier day partial."""
+
+    def __init__(self, markets, clock, **kw):
+        super().__init__(markets, **kw)
+        self._all = list(self.markets)
+        self._clock = clock
+
+    def get_markets_without_preload_content(self, **kw):
+        now = self._clock["now"].timestamp()
+        self.markets = [m for m in self._all
+                        if historical._iso_epoch(m["settlement_ts"]) <= now]
+        return super().get_markets_without_preload_content(**kw)
+
+
 class TestCorpusProvenance:
     """DR-13 and M3 of the 2026-09-24 7-day-run review. A cache hit used to
     log one "Loaded N" line and return: nothing said the corpus stops at its
-    assembly while the window runs to today, and an EMPTY cache was a
-    permanent hit. Now the archive cutoff is stamped into the streamed cache
-    (informational, never part of its identity), every hit announces what it
-    covers with ZERO network calls, and an empty cache is served only while
-    younger than EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS. The post-cutoff
-    "structurally 0-trade" WARNING is gone: a post-cutoff market is priced
-    from the live candlestick endpoint."""
+    assembly while the window runs to today. Now the archive cutoff and the
+    frontier day are stamped into the streamed cache (informational, never
+    part of its identity), and a hit on a cache assembled TODAY (UTC)
+    announces what it covers with ZERO network calls; one from an earlier
+    day is extended (TestCacheExtension). The post-cutoff "structurally
+    0-trade" WARNING is gone: a post-cutoff market is priced from the live
+    candlestick endpoint."""
 
     PRE = date(2026, 6, 5)     # before TestShardedFetch.CUTOFF (2026-06-10)
     POST = date(2026, 6, 10)   # exactly on it: at-or-after is post-cutoff
@@ -5357,6 +5391,8 @@ class TestCorpusProvenance:
         meta = self._meta_of(out.path)
         assert meta["archive_cutoff_ts"] == int(self.CUTOFF_DT.timestamp())
         assert before <= datetime.fromisoformat(meta["assembled_at"]) <= after
+        # The partial day the live phase captured: today's UTC midnight
+        assert meta["live_frontier_ts"] == _day_lo(before.date().isoformat())
         prov = out.provenance
         # M9: the assembly's counts ride along too — with no prefilter nothing
         # is rejected, and the counts keep exactly the corpus's records
@@ -5376,9 +5412,12 @@ class TestCorpusProvenance:
         records = list(out)
         meta = {**historical._assembled_cache_meta(self.PRE, None),
                 "assembled_at": "2026-06-20T08:00:00+00:00",
-                "archive_cutoff_ts": int(datetime(2026, 5, 1, tzinfo=UTC).timestamp())}
+                "archive_cutoff_ts": int(datetime(2026, 5, 1, tzinfo=UTC).timestamp()),
+                "live_frontier_ts": _day_lo("2026-06-20")}
         _write_jsonl(out.path, meta, records)
         _forbid_network(monkeypatch)
+        # Later the same UTC day: served as it is
+        _freeze_clock(monkeypatch, datetime(2026, 6, 20, 22, tzinfo=UTC))
         hit = self._hit(self.PRE)
         assert list(hit) == records
         assert hit.provenance.archive_cutoff == datetime(2026, 5, 1, tzinfo=UTC)
@@ -5409,18 +5448,12 @@ class TestCorpusProvenance:
                 f"({counts.duplicates} duplicate or blank tickers)") in text
         assert (f"Assembled cache {out.path.name} was assembled at "
                 f"{fresh.assembled_at:%Y-%m-%d %H:%M UTC}") in text
-        assert "holds no market settled after that moment" in text
-        assert "the window nominally runs to today" in text
+        assert ("earlier today (UTC), so it is served as it is and holds no market "
+                "settled after that moment") in text
         assert "archive cutoff at assembly: 2026-06-10" in text
-        assert "Pass --no-cache to extend it" in text
-        # The remedy is priced honestly (P2 review): a re-assembly that reuses
-        # only still-valid day slices, plus a candlestick and title refetch —
-        # never "mainly the current day".
-        assert "re-assembles the whole corpus" in text
-        assert "archive day slice goes stale whenever the archive cutoff advances" in text
-        assert "re-fetches every pair's candlesticks and re-resolves event titles" in text
-        assert "close to a full fetch" in text
-        assert "mainly the current day" not in text
+        # What brings it up to date: the next UTC day's first run, or now
+        assert "The first run on a later UTC day extends it through that day" in text
+        assert "--no-cache re-assembles it in full now" in text
         # A hit warns about nothing.
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
@@ -5445,102 +5478,49 @@ class TestCorpusProvenance:
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
         assert "structurally" not in caplog.text
 
-    def test_a_cache_written_before_the_stamp_is_served_and_says_so(
+    def test_a_cache_written_before_the_stamps_is_served_the_day_it_was_assembled(
             self, tmp_path, monkeypatch, caplog):
-        # The real 2026-09-17 cache on disk carries assembled_at but no
-        # archive_cutoff_ts: it must still hit, and say the cutoff is unknown.
+        # A streamed cache written before archive_cutoff_ts and
+        # live_frontier_ts existed carries assembled_at alone: the day it was
+        # assembled it is served as it is, and says the cutoff is unknown.
         out, _, _ = self._fetch(tmp_path, monkeypatch, self.POST)
         records = list(out)
         _write_jsonl(out.path, {**historical._assembled_cache_meta(self.POST, None),
                                 "assembled_at": "2026-06-11T09:30:00+00:00"}, records)
         _forbid_network(monkeypatch)
-        caplog.clear()  # the fresh fetch above logged the miss path's WARNING
+        _freeze_clock(monkeypatch, datetime(2026, 6, 11, 23, 59, tzinfo=UTC))
+        caplog.clear()
         with caplog.at_level(logging.INFO):
             hit = self._hit(self.POST)
         assert list(hit) == records
         assert hit.provenance == historical.CorpusProvenance(
             from_cache=True, assembled_at=datetime(2026, 6, 11, 9, 30, tzinfo=UTC),
             archive_cutoff=None)
-        assert "the archive cutoff was not recorded when it was assembled" in caplog.text
+        assert "the archive cutoff was not recorded" in caplog.text
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
-    def test_a_legacy_hit_names_its_file_time_and_carries_it_as_provenance(
+    def test_a_cache_without_a_cutoff_is_rebuilt_on_a_later_day(
             self, tmp_path, monkeypatch, caplog):
-        # Seven of the eight assembled caches on disk on 2026-09-24 were
-        # legacy files: their file time must reach the page, not only the log
-        # (P2 review, DR-66) — so the list comes back as a LegacySettledCorpus.
-        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
-        (tmp_path / "cache").mkdir(parents=True)
-        legacy = tmp_path / "cache" / "settled_markets_2026-06-10.json"
-        legacy.write_text(json.dumps([{"ticker": "OLD1"}]))
-        written = datetime(2026, 6, 12, 7, 45, tzinfo=UTC)
-        os.utime(legacy, (written.timestamp(), written.timestamp()))
-        _forbid_network(monkeypatch)
-        with caplog.at_level(logging.INFO):
-            out = self._hit(self.POST)
-        assert type(out) is historical.LegacySettledCorpus
-        assert out == [{"ticker": "OLD1"}] and len(out) == 1
-        assert out.provenance == historical.CorpusProvenance(
-            from_cache=True, assembled_at=written, archive_cutoff=None, legacy=True)
-        assert ("Legacy assembled cache settled_markets_2026-06-10.json was last "
-                "written at 2026-06-12 07:45 UTC") in caplog.text
-        assert "its file time" in caplog.text
-        assert "the legacy format records no archive cutoff" in caplog.text
-        assert "(and rebuild it in the streamed format)" in caplog.text
-        # A legacy hit warns about nothing either.
-        assert not [r for r in caplog.records if r.levelname == "WARNING"]
-
-    def test_a_legacy_file_that_is_not_a_list_is_returned_as_before(
-            self, tmp_path, monkeypatch):
-        # Only a list is wrapped: whatever else a damaged legacy file holds is
-        # handed back exactly as before P2, untouched.
-        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
-        (tmp_path / "cache").mkdir(parents=True)
-        (tmp_path / "cache" / "settled_markets_2026-06-10.json").write_text(
-            json.dumps({"ticker": "NOT-A-LIST"}))
-        _forbid_network(monkeypatch)
-        out = self._hit(self.POST)
-        assert type(out) is dict and out == {"ticker": "NOT-A-LIST"}
-
-    # ── an EMPTY assembled cache (DR-13's empty-cache rule) ───────────────
-
-    @pytest.mark.parametrize("age_s, served", [
-        (60, True),
-        (historical.EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS - 60, True),
-        (historical.EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS + 60, False),
-        (30 * 86_400, False),
-        (None, False),          # no readable assembly time: fail toward a miss
-        (-3_600, False),        # a future stamp is not "young" either
-    ])
-    def test_an_empty_streamed_cache_is_served_only_while_young(
-            self, tmp_path, monkeypatch, caplog, age_s, served):
+        # ...and on any later day it cannot be extended (nothing says where its
+        # archive part ends), so the window is re-assembled in full.
         out, archive, live_markets = self._fetch(tmp_path, monkeypatch, self.PRE)
         fresh = list(out)
-        meta = historical._assembled_cache_meta(self.PRE, None)
-        if age_s is not None:
-            meta["assembled_at"] = (datetime.now(UTC) - timedelta(seconds=age_s)).isoformat()
-        _write_jsonl(out.path, meta, [])
+        _write_jsonl(out.path, {**historical._assembled_cache_meta(self.PRE, None),
+                                "assembled_at": "2026-06-11T09:30:00+00:00"}, fresh[:1])
         archive.calls = 0
-        live = _FakeLive(live_markets)
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.INFO):
             again = historical.fetch_all_settled_markets(
-                MagicMock(), live, start_date=self.PRE, use_cache=True)
-        if served:
-            assert len(again) == 0 and list(again) == []
-            assert archive.calls == 0 and live.calls == 0
-            assert "is EMPTY" in caplog.text and "serving it" in caplog.text
-        else:
-            assert archive.calls > 0  # re-assembled from the API + day slices
-            assert list(again) == fresh
-            assert "is EMPTY and was assembled" in caplog.text
-            assert "treating it as a miss and re-assembling" in caplog.text
+                MagicMock(), _FakeLive(live_markets), start_date=self.PRE, use_cache=True)
+        assert archive.calls > 0 and list(again) == fresh
+        assert ("records no archive cutoff, so it cannot be brought up to date — "
+                "re-assembling the window in full") in caplog.text
 
-    def test_an_empty_stale_streamed_cache_rebuilds_and_never_falls_through_to_legacy(
+    def test_an_empty_cache_without_a_cutoff_rebuilds_and_never_falls_through_to_legacy(
             self, tmp_path, monkeypatch, caplog):
-        # P2 review (R4): the stale-empty branch is a miss that REBUILDS, like
-        # an invalid streamed cache — a legacy file of the same stem beside it
-        # is an older assembly and must not be served, and the rebuild's
-        # commit retires it.
+        # An EMPTY cache used to be served at any age (DR-13); an earlier day's
+        # is now extended or rebuilt like any other. This one records no cutoff,
+        # so it is rebuilt — and a legacy file of the same stem beside it is an
+        # older assembly: never served, and retired by the rebuild's commit.
         out, archive, live_markets = self._fetch(tmp_path, monkeypatch, self.PRE)
         fresh = list(out)
         meta = {**historical._assembled_cache_meta(self.PRE, None),
@@ -5557,38 +5537,8 @@ class TestCorpusProvenance:
         assert archive.calls > 0 and list(again) == fresh
         assert "LEG" not in {m["ticker"] for m in again}
         assert not legacy.exists()
-        assert "treating it as a miss and re-assembling" in caplog.text
+        assert "records no archive cutoff" in caplog.text
         assert "Removed the superseded legacy settled-market cache" in caplog.text
-
-    @pytest.mark.parametrize("age_s, served", [(3_600, True), (24 * 86_400, False)])
-    def test_an_empty_legacy_cache_is_served_only_while_young(
-            self, tmp_path, monkeypatch, caplog, age_s, served):
-        # The 2-byte "[]" settled_markets_2026-08-29_*.json on disk was last
-        # written 2026-09-01 00:16 UTC (its file time) and was still a hit on
-        # 2026-09-24, some 23 days later.
-        archive_markets, live_markets = TestShardedFetch()._fixture_markets()
-        archive = _FakeArchive(archive_markets)
-        _install_sharded_fakes(monkeypatch, tmp_path, archive, TestShardedFetch.CUTOFF)
-        (tmp_path / "cache").mkdir(parents=True)
-        legacy = tmp_path / "cache" / "settled_markets_2026-06-05.json"
-        legacy.write_text("[]")
-        stamp = datetime.now(UTC).timestamp() - age_s
-        os.utime(legacy, (stamp, stamp))
-        with caplog.at_level(logging.INFO):
-            out = historical.fetch_all_settled_markets(
-                MagicMock(), _FakeLive(live_markets), start_date=self.PRE,
-                use_cache=True)
-        if served:
-            assert type(out) is historical.LegacySettledCorpus and out == []
-            assert out.provenance.legacy is True and out.provenance.from_cache is True
-            assert archive.calls == 0
-            assert legacy.exists()
-        else:
-            assert archive.calls > 0
-            assert isinstance(out, historical.SettledCorpus) and len(out) > 0
-            # The rebuild supersedes the empty legacy file like any other.
-            assert not legacy.exists()
-            assert "Removed the superseded legacy settled-market cache" in caplog.text
 
     # ── the derivation itself ─────────────────────────────────────────────
 
@@ -5622,6 +5572,337 @@ class TestCorpusProvenance:
     ])
     def test_the_assembly_stamp_is_read_as_a_utc_instant(self, raw, expected):
         assert historical._parse_assembled_at(raw) == expected
+
+
+class TestCacheExtension:
+    """Every backtest runs through the most recent available day. An assembled
+    cache from an earlier UTC day used to be served unchanged at any age, so a
+    run on a later day silently stopped at the cache's day; it is now EXTENDED
+    (_extend_assembled_cache): one /historical/cutoff read, then the live
+    endpoint's settled days from the cache's frontier day onward are spliced
+    in after its archive part and before its older live days. With the cutoff
+    unchanged the result equals a fresh assembly record for record; a cutoff
+    that moved past the frontier day, a cache that records no cutoff, or a
+    legacy cache is re-assembled in full; and a failure while extending is a
+    WARNING and the cache is served as it was."""
+
+    START = date(2026, 6, 5)
+    CUTOFF = "2026-06-10T00:00:00Z"
+    T1 = datetime(2026, 6, 11, 12, tzinfo=UTC)   # the first assembly: 06-11 is partial
+    T2 = datetime(2026, 6, 13, 10, tzinfo=UTC)   # two days later
+    COMBO = "KXMVECROSSCATEGORY-S1"
+
+    @classmethod
+    def _markets(cls):
+        archive, live = TestShardedFetch()._fixture_markets()
+        live = live + [
+            # A combo settled on 06-10, before the first assembly
+            _mk_raw_market("CMB", "2026-06-10T07:00:00Z", "2026-06-10T08:00:00Z",
+                           event_ticker=cls.COMBO),
+            # Settled on 06-11 AFTER the first assembly (its partial frontier day)
+            _mk_raw_market("L4", "2026-06-11T10:00:00Z", "2026-06-11T15:00:00Z"),
+            # Whole days after it, and the second run's own partial day
+            _mk_raw_market("L5", "2026-06-12T01:00:00Z", "2026-06-12T05:00:00Z"),
+            _mk_raw_market("L6", "2026-06-13T01:00:00Z", "2026-06-13T03:00:00Z"),
+            # Not settled yet at T2
+            _mk_raw_market("L7", "2026-06-13T04:00:00Z", "2026-06-13T20:00:00Z"),
+        ]
+        return archive, live
+
+    def _install(self, monkeypatch, tmp_path, *, cache="cache", blank=(),
+                 cutoff=None):
+        """Fakes behind the fetch: the archive, a movable cutoff (cutoff["iso"],
+        None to make the read fail), titles for every requested event except
+        those in `blank`, and a clock frozen at T1. Returns the call record."""
+        archive_markets, live_markets = self._markets()
+        archive = _FakeArchive(archive_markets)
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / cache)
+        cutoff = cutoff if cutoff is not None else {"iso": self.CUTOFF}
+        calls = {"cutoff": 0, "titles": [], "archive": archive, "cutoff_iso": cutoff}
+
+        def fake_signed_get(client, path, **params):
+            if path.endswith("/historical/cutoff"):
+                calls["cutoff"] += 1
+                if cutoff["iso"] is None:
+                    raise RuntimeError("cutoff read failed")
+                return _raw_resp({"market_settled_ts": cutoff["iso"]})
+            assert path.endswith("/historical/markets")
+            return _raw_resp(archive.page(**params))
+
+        def fake_titles(live_client, tickers, use_cache=True):
+            calls["titles"].append(set(tickers))
+            return {t: ("" if t in blank else f"Title {t}") for t in tickers}
+
+        monkeypatch.setattr(historical, "_signed_raw_get", fake_signed_get)
+        monkeypatch.setattr(historical, "_load_or_build_event_titles", fake_titles)
+        calls["clock"] = _freeze_clock(monkeypatch, self.T1)
+        calls["live"] = _TimedLive(live_markets, calls["clock"])
+        return calls
+
+    def _fetch(self, calls, *, use_cache, **kw):
+        return historical.fetch_all_settled_markets(
+            MagicMock(), calls["live"], start_date=self.START, use_cache=use_cache, **kw)
+
+    def _fresh_at(self, monkeypatch, tmp_path, when, **kw):
+        """A fresh, full assembly at `when` in a cache directory of its own."""
+        calls = self._install(monkeypatch, tmp_path, cache="fresh")
+        calls["clock"]["now"] = when
+        return list(self._fetch(calls, use_cache=False, **kw))
+
+    @staticmethod
+    def _meta_of(path):
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            return json.loads(fh.readline())["meta"]
+
+    # ── the extension equals a fresh assembly ─────────────────────────────
+
+    def test_a_next_day_hit_extends_the_cache_to_equal_a_fresh_assembly(
+            self, tmp_path, monkeypatch, caplog):
+        calls = self._install(monkeypatch, tmp_path)
+        first = self._fetch(calls, use_cache=False)
+        first_records = list(first)
+        tickers = {m["ticker"] for m in first_records}
+        # The first assembly's partial day: L3 settled before T1, L4 after
+        assert "L3" in tickers and "L4" not in tickers and "L5" not in tickers
+        assert self._meta_of(first.path)["live_frontier_ts"] == _day_lo("2026-06-11")
+
+        calls["clock"]["now"] = self.T2
+        calls["archive"].calls = 0
+        with caplog.at_level(logging.INFO):
+            extended = self._fetch(calls, use_cache=True)
+        got = list(extended)
+        # The archive is never re-read: one cutoff read and the live days
+        assert calls["archive"].calls == 0 and calls["cutoff"] == 2
+        fresh = self._fresh_at(monkeypatch, tmp_path, self.T2)
+        assert got == fresh, "the extension must equal a fresh assembly, in order"
+        assert {"L4", "L5", "L6"} <= {m["ticker"] for m in got}
+        assert "L7" not in {m["ticker"] for m in got}
+        # What the extended cache says about itself
+        meta = self._meta_of(extended.path)
+        assert meta["live_frontier_ts"] == _day_lo("2026-06-13")
+        assert datetime.fromisoformat(meta["full_assembly_at"]) == self.T1
+        assert "assembly_counts" not in meta
+        assert extended.provenance == historical.CorpusProvenance(
+            from_cache=False, assembled_at=self.T2,
+            archive_cutoff=datetime(2026, 6, 10, tzinfo=UTC), full_assembly_at=self.T1)
+        text = caplog.text
+        assert "Extending assembled cache settled_markets_2026-06-05.jsonl.gz" in text
+        # Kept everything but the partial day's one record (L3), added L3-L6
+        assert (f"kept {len(first_records) - 1} of its {len(first_records)} settled "
+                f"markets (dropped 1 settled on or after 2026-06-11") in text
+        assert "added 4 settled markets of" in text
+        assert "Extended assembled cache settled_markets_2026-06-05.jsonl.gz" in text
+        assert "Loaded" not in text
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    def test_later_the_same_day_it_is_served_with_zero_network_calls(
+            self, tmp_path, monkeypatch, caplog):
+        calls = self._install(monkeypatch, tmp_path)
+        self._fetch(calls, use_cache=False)
+        calls["clock"]["now"] = self.T2
+        extended = list(self._fetch(calls, use_cache=True))
+        # Five hours on, the same UTC day: no read of any kind
+        calls["clock"]["now"] = self.T2 + timedelta(hours=5)
+        _forbid_network(monkeypatch)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            hit = historical.fetch_all_settled_markets(
+                _NoNetwork(), _NoNetwork(), start_date=self.START, use_cache=True)
+        assert list(hit) == extended
+        assert hit.provenance.from_cache is True
+        assert hit.provenance.full_assembly_at == self.T1
+        assert ("by extending a full assembly of 2026-06-11 12:00 UTC, earlier today "
+                "(UTC), so it is served as it is") in caplog.text
+
+    def test_a_second_extension_keeps_the_full_assembly_time(
+            self, tmp_path, monkeypatch):
+        calls = self._install(monkeypatch, tmp_path)
+        self._fetch(calls, use_cache=False)
+        calls["clock"]["now"] = self.T2
+        self._fetch(calls, use_cache=True)
+        calls["clock"]["now"] = datetime(2026, 6, 14, 9, tzinfo=UTC)
+        again = self._fetch(calls, use_cache=True)
+        assert again.provenance.full_assembly_at == self.T1
+        assert again.provenance.assembled_at == datetime(2026, 6, 14, 9, tzinfo=UTC)
+        assert "L7" in {m["ticker"] for m in again}
+        assert list(again) == self._fresh_at(
+            monkeypatch, tmp_path, datetime(2026, 6, 14, 9, tzinfo=UTC))
+
+    def test_with_a_prefilter_it_still_equals_a_fresh_assembly(
+            self, tmp_path, monkeypatch, caplog):
+        def pred(m):
+            return m["ticker"] != "L5"
+
+        kw = {"prefilter": pred, "prefilter_tag": "t"}
+        calls = self._install(monkeypatch, tmp_path)
+        self._fetch(calls, use_cache=False, **kw)
+        calls["clock"]["now"] = self.T2
+        with caplog.at_level(logging.INFO):
+            extended = list(self._fetch(calls, use_cache=True, **kw))
+        assert extended == self._fresh_at(monkeypatch, tmp_path, self.T2, **kw)
+        assert "L5" not in {m["ticker"] for m in extended}
+        assert "added 3 eligible markets of" in caplog.text
+        assert "1 rejected by the prefilter t" in caplog.text
+
+    def test_a_cache_without_a_frontier_stamp_is_extended_from_the_day_before(
+            self, tmp_path, monkeypatch):
+        # A cache written before live_frontier_ts existed: its assembly could
+        # have run across a UTC midnight, so it is extended from the day
+        # BEFORE the one it was assembled on (a stored slice costs a read).
+        calls = self._install(monkeypatch, tmp_path)
+        first = self._fetch(calls, use_cache=False)
+        records = list(first)
+        meta = self._meta_of(first.path)
+        del meta["live_frontier_ts"]
+        _write_jsonl(first.path, meta, records)
+        seen = []
+        real_phase = historical._fetch_live_phase
+
+        def spy(client, lo, now_ts, keep=None, **k):
+            seen.append(lo)
+            return real_phase(client, lo, now_ts, keep, **k)
+
+        monkeypatch.setattr(historical, "_fetch_live_phase", spy)
+        calls["clock"]["now"] = self.T2
+        got = list(self._fetch(calls, use_cache=True))
+        assert seen == [_day_lo("2026-06-10")]
+        monkeypatch.setattr(historical, "_fetch_live_phase", real_phase)
+        assert got == self._fresh_at(monkeypatch, tmp_path, self.T2)
+
+    def test_an_empty_cache_is_extended_like_any_other(self, tmp_path, monkeypatch, caplog):
+        # An EMPTY cache used to be served at any age (DR-13); an earlier
+        # day's is extended now. It said nothing settled in its window before
+        # its frontier day, so only what settled since is added.
+        calls = self._install(monkeypatch, tmp_path)
+        first = self._fetch(calls, use_cache=False)
+        meta = self._meta_of(first.path)
+        del meta["assembly_counts"]          # they described the full corpus
+        _write_jsonl(first.path, meta, [])
+        calls["clock"]["now"] = self.T2
+        with caplog.at_level(logging.INFO):
+            got = self._fetch(calls, use_cache=True)
+        assert {m["ticker"] for m in got} == {"L3", "L4", "L5", "L6"}
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    # ── titles ────────────────────────────────────────────────────────────
+
+    def test_titles_are_resolved_for_new_records_and_old_blank_non_combos(
+            self, tmp_path, monkeypatch):
+        # The first assembly could not title EV-L2 or the combo; the
+        # extension asks again for EV-L2 (a non-combo's title shapes the
+        # pairs) but not for the combo, and keeps every title it already had.
+        calls = self._install(monkeypatch, tmp_path, blank={"EV-L2", self.COMBO})
+        self._fetch(calls, use_cache=False)
+        monkeypatch.setattr(historical, "_load_or_build_event_titles",
+                            lambda live_client, tickers, use_cache=True:
+                            (calls["titles"].append(set(tickers))
+                             or {t: f"Title {t}" for t in tickers}))
+        calls["titles"].clear()
+        calls["clock"]["now"] = self.T2
+        got = {m["ticker"]: m for m in self._fetch(calls, use_cache=True)}
+        (asked,) = calls["titles"]
+        assert asked == {"EV-L2", "EV-L3", "EV-L4", "EV-L5", "EV-L6"}
+        assert got["L2"]["event_title"] == "Title EV-L2"
+        assert got["CMB"]["event_title"] == ""
+        assert got["L1"]["event_title"] == "Title EV-L1"
+
+    # ── the archive cutoff decides whether it can be extended ─────────────
+
+    def test_a_cutoff_that_moved_but_not_past_the_frontier_day_still_extends(
+            self, tmp_path, monkeypatch, caplog):
+        calls = self._install(monkeypatch, tmp_path)
+        first = list(self._fetch(calls, use_cache=False))
+        calls["cutoff_iso"]["iso"] = "2026-06-11T00:00:00Z"
+        calls["clock"]["now"] = self.T2
+        calls["archive"].calls = 0
+        with caplog.at_level(logging.INFO):
+            got = self._fetch(calls, use_cache=True)
+        assert calls["archive"].calls == 0
+        # The same markets: what migrated into the archive is kept from the
+        # old live part
+        unchanged = {m["ticker"] for m in first} | {"L4", "L5", "L6"}
+        assert {m["ticker"] for m in got} == unchanged
+        assert got.provenance.archive_cutoff == datetime(2026, 6, 11, tzinfo=UTC)
+        assert "archive cutoff then 2026-06-10, now 2026-06-11" in caplog.text
+
+    @pytest.mark.parametrize("cutoff_iso, reason", [
+        ("2026-06-12T00:00:00Z", "has moved past 2026-06-11, the day assembled cache"),
+        ("2026-06-09T00:00:00Z", "is earlier than the one assembled cache"),
+    ])
+    def test_a_cutoff_it_cannot_extend_under_rebuilds(
+            self, tmp_path, monkeypatch, caplog, cutoff_iso, reason):
+        calls = self._install(monkeypatch, tmp_path)
+        self._fetch(calls, use_cache=False)
+        calls["cutoff_iso"]["iso"] = cutoff_iso
+        calls["clock"]["now"] = self.T2
+        calls["archive"].calls = 0
+        with caplog.at_level(logging.INFO):
+            got = self._fetch(calls, use_cache=True)
+        assert calls["archive"].calls > 0           # re-assembled in full
+        assert reason in caplog.text and "re-assembling the window in full" in caplog.text
+        assert got.provenance.full_assembly_at is None
+        assert got.provenance.archive_cutoff == datetime.fromisoformat(cutoff_iso)
+
+    def test_a_frontier_day_after_today_rebuilds(self, tmp_path, monkeypatch, caplog):
+        calls = self._install(monkeypatch, tmp_path)
+        first = self._fetch(calls, use_cache=False)
+        meta = {**self._meta_of(first.path), "live_frontier_ts": _day_lo("2026-06-20")}
+        _write_jsonl(first.path, meta, list(first))
+        calls["archive"].calls = 0
+        with caplog.at_level(logging.INFO):
+            self._fetch(calls, use_cache=True)
+        assert calls["archive"].calls > 0
+        assert "says its frontier day is after today" in caplog.text
+
+    # ── failures serve the cache as it was ────────────────────────────────
+
+    def test_a_failed_cutoff_read_serves_the_cache_as_assembled(
+            self, tmp_path, monkeypatch, caplog):
+        calls = self._install(monkeypatch, tmp_path)
+        first = self._fetch(calls, use_cache=False)
+        records = list(first)
+        calls["cutoff_iso"]["iso"] = None
+        calls["clock"]["now"] = self.T2
+        calls["live"].calls = 0
+        calls["titles"].clear()
+        with caplog.at_level(logging.INFO):
+            got = self._fetch(calls, use_cache=True)
+        assert list(got) == records
+        assert calls["live"].calls == 0 and calls["titles"] == []
+        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warned) == 1
+        assert warned[0].startswith("Could not read the archive cutoff to extend "
+                                    "assembled cache settled_markets_2026-06-05.jsonl.gz")
+        assert "serving it as assembled at 2026-06-11 12:00 UTC" in warned[0]
+        assert f"Loaded {len(records)} settled markets from cache" in caplog.text
+
+    @pytest.mark.parametrize("failure", ["live", "walks_disagree"])
+    def test_a_failed_extension_serves_the_cache_as_it_was(
+            self, tmp_path, monkeypatch, caplog, failure):
+        calls = self._install(monkeypatch, tmp_path)
+        first = self._fetch(calls, use_cache=False)
+        records = list(first)
+        before = first.path.read_bytes()
+        if failure == "live":
+            def boom(*_a, **_k):
+                raise RuntimeError("live endpoint down")
+            monkeypatch.setattr(historical, "_fetch_live_phase", boom)
+        else:
+            def titles(live_client, tickers, use_cache=True):
+                # Between the two walks a day slice vanishes, so the second
+                # walk cannot reproduce the first
+                historical._day_store_path("live_days", _day_lo("2026-06-12")).unlink()
+                return {}
+            monkeypatch.setattr(historical, "_load_or_build_event_titles", titles)
+        calls["clock"]["now"] = self.T2
+        with caplog.at_level(logging.INFO):
+            got = self._fetch(calls, use_cache=True)
+        assert list(got) == records
+        assert first.path.read_bytes() == before      # nothing was published
+        assert not list((tmp_path / "cache").glob("*.tmp"))
+        assert any(r.levelname == "WARNING" and r.getMessage().startswith(
+            "Could not extend assembled cache settled_markets_2026-06-05.jsonl.gz")
+            for r in caplog.records)
 
 
 class TestAssemblyCounts:
@@ -5742,16 +6023,24 @@ class TestAssemblyCounts:
             f"ignoring those counts"]
         assert "records no count of the records it rejected" in caplog.text
 
-    def test_a_legacy_hit_under_a_prefilter_says_it_records_no_counts(
+    def test_a_hit_on_a_cache_without_counts_says_it_records_none(
             self, tmp_path, monkeypatch, caplog):
+        # A streamed cache written before the counts existed (or an extended
+        # one, which drops them) records none; a same-day hit says so rather
+        # than let the silence read as "nothing was rejected".
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
-        (tmp_path / "cache").mkdir(parents=True)
-        (tmp_path / "cache" / f"settled_markets_{self.START}_t.json").write_text(
-            json.dumps([{"ticker": "OLD1"}]))
+        now = datetime(2026, 6, 20, 12, tzinfo=UTC)
+        _freeze_clock(monkeypatch, now)
+        meta = {**historical._assembled_cache_meta(self.START, "t"),
+                "assembled_at": now.isoformat(),
+                "archive_cutoff_ts": _day_lo("2026-06-10"),
+                "live_frontier_ts": _day_lo("2026-06-20")}
+        _write_jsonl(tmp_path / "cache" / f"settled_markets_{self.START}_t.jsonl.gz",
+                     meta, [{"ticker": "OLD1", "settlement_ts": "2026-06-06T00:00:00Z"}])
         _forbid_network(monkeypatch)
         with caplog.at_level(logging.INFO):
             out = self._hit()
-        assert out == [{"ticker": "OLD1"}]
+        assert [m["ticker"] for m in out] == ["OLD1"]
         assert out.provenance.assembly_counts is None
         assert ("Loaded 1 eligible markets from cache — the prefilter t ran "
                 "during its assembly, but this cache records no count of the "

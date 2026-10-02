@@ -70,8 +70,8 @@ Dependencies:
     SHORT_DEADLINE_GAP_DAYS, TIME_SERIES_INTERVAL_PROB_DISCOUNT and
     TIME_SERIES_SAME_EVENT_LADDERS from config.py; fetch_all_settled_markets(),
     fetch_candlesticks(), and infer_category() from historical.py, plus its
-    SettledCorpus and LegacySettledCorpus (read by TYPE, to take the
-    corpus's provenance) and CorpusProvenance (carried out on
+    SettledCorpus (read by TYPE, to take the corpus's provenance) and
+    CorpusProvenance (carried out on
     BacktestSweep.corpus_provenance and re-exported to dashboard.py, which
     imports only from here). Also
     depends on pandas (external) for the equity-curve DataFrame and numpy
@@ -269,10 +269,9 @@ Notes:
     historical.fetch_all_settled_markets returns — a disk-backed
     historical.SettledCorpus that streams the assembled
     settled_markets_*.jsonl.gz cache afresh on each walk, so the eligible set
-    is never resident as a whole; only a hit on a LEGACY
-    settled_markets_*.json cache hands over one list (read whole), resident
-    through both walks until _prepare_candidates releases it. The corpus
-    must re-iterate identically, and a second walk that
+    is never resident as a whole (a legacy settled_markets_*.json cache, the
+    one format that was handed over as a list, is no longer served). The
+    corpus must re-iterate identically, and a second walk that
     disagrees with the first on anything the subset was chosen from (the
     eligible count, or an eligible record's ticker or grouping fields) raises
     rather than misaligning the subset — as does a SettledCorpus walk that
@@ -361,7 +360,6 @@ from .config import (
 )
 from .historical import (
     CorpusProvenance,
-    LegacySettledCorpus,
     SettledCorpus,
     fetch_all_settled_markets,
     fetch_candlesticks,
@@ -1567,13 +1565,11 @@ class _Candidates:
             entry pass hands _find_entry (see above for when None resolves
             the same way in both).
         corpus_provenance (CorpusProvenance | None): What the fetched corpus
-            says about itself — when it was assembled, whether it was served
-            from an earlier run's cache, and the archive cutoff as of that
-            assembly — taken off the corpus BY TYPE (a
-            historical.SettledCorpus, or the historical.LegacySettledCorpus
-            list a legacy settled_markets_*.json hit returns, whose
-            provenance carries its file time and no cutoff) before it is
-            released. None when the corpus was a plain list (a test stub).
+            says about itself — when it was assembled or last extended,
+            whether it was served from an earlier run's cache, and the
+            archive cutoff as of that assembly — taken off the corpus BY TYPE
+            (a historical.SettledCorpus) before it is released. None when the
+            corpus was a plain list (a test stub).
             Carried to BacktestSweep.corpus_provenance for the dashboard
             header.
     """
@@ -2100,16 +2096,16 @@ class BacktestSweep:
             of history. None when the band sweep is off or the window was
             infeasible.
         corpus_provenance (CorpusProvenance | None): What this run's
-            settled-market corpus covers: when it was assembled — it holds
-            nothing settled after that, while the window nominally runs to
-            today — whether it came
-            from an earlier run's cache, and the archive cutoff AS OF that
-            assembly (information only). It hangs off the
+            settled-market corpus covers: when it was assembled or last
+            extended — it holds nothing settled after that, while the window
+            nominally runs to today — whether it came from an earlier run's
+            cache (assembled earlier the same UTC day), when it was last
+            assembled in full if it was extended since, and the archive
+            cutoff AS OF that assembly (information only). It hangs off the
             sweep for the reason label_coverage does: one fact about one
             corpus, valid at every point. The dashboard renders it under the
             Period line whether healthy or not (absence must never be
-            the only signal); a legacy settled_markets_*.json hit carries its
-            file time (legacy=True) and no cutoff.
+            the only signal).
             None when not recorded: the feasibility short-circuit (no fetch),
             a test that stubs the fetch with a plain list, or a hand-built
             sweep. DEFAULTED, like
@@ -5585,10 +5581,13 @@ def _log_corpus_prefilter(total: int, eligible: int,
     else:
         logging.info(
             "Markets to analyze: " + size + " — the eligibility prefilter (%s) "
-            "ran during assembly, but this %s records no count of the records "
-            "it rejected",
+            "ran during assembly, but this cache records no count of the "
+            "records it rejected%s",
             *size_args, tag,
-            "legacy cache" if provenance.legacy else "cache",
+            # An extended cache drops its counts; its extension logged its own
+            "" if provenance.full_assembly_at is None
+            else " (it was extended since its full assembly; the extension's own "
+                 "counts are on the line logged when it ran)",
         )
     if rejected_here == 0:
         logging.info(
@@ -5748,15 +5747,12 @@ def _prepare_candidates(
     # released, for the dashboard header (DR-13).
     # Read by TYPE, never by attribute probing: a plain list (a test stub) has
     # no provenance, and a MagicMock would answer any attribute with nonsense.
-    # A legacy-cache hit is a LegacySettledCorpus, whose provenance carries
-    # its file time.
     corpus_provenance = (
-        markets.provenance
-        if isinstance(markets, (SettledCorpus, LegacySettledCorpus)) else None
+        markets.provenance if isinstance(markets, SettledCorpus) else None
     )
     # Pass 1 of the two walks the docstring describes; the corpus may be any
-    # re-iterable of market dicts (a LEGACY .json cache hit is one list,
-    # resident until the `del markets` below). The prefilter is re-applied
+    # re-iterable of market dicts (a test stub's list is resident until the
+    # `del markets` below). The prefilter is re-applied
     # although the fetch already applied it: it is idempotent, costs no extra
     # walk, and keeps the guarantee beside the O(n^2) pairing that needs it.
     census = _OutcomeLabelTally()
@@ -5779,7 +5775,7 @@ def _prepare_candidates(
     )
     # Nothing below reads the corpus or the first pass's index: `groupable`
     # holds every record grouping needs, and the census has its counts. For a
-    # corpus held as a list (a legacy .json cache hit, or a test stub) this is
+    # corpus held as a list (a test stub) this is
     # what lets every eligible record that shares no key be collected BEFORE
     # the group maps are built, rather than after pair extraction; for a
     # streamed SettledCorpus it only drops a small handle.
@@ -5801,16 +5797,9 @@ def _prepare_candidates(
     # GROUPABLE count, not the eligible one, because the subset is what stays
     # resident from here on: the corpus was released just above.
     #
-    # Known residual, recorded rather than implied away: when the corpus is a
-    # list — only on a hit on a LEGACY settled_markets_*.json cache since
-    # SS-1's Commit C; a fetched or streamed-cache corpus is never resident —
-    # every eligible record WAS resident up to that release, and the peak RSS
-    # line above includes all of them, yet this warning does not count them.
-    # So such a run whose eligible count is far above the threshold but whose
-    # groupable count is not (the 7-day window above: 7,260,952 eligible,
-    # 184,255 groupable) gets no warning for the list that set its peak; its
-    # eligible count is still on the "Markets to analyze" and "Groupable
-    # subset" lines, and the cost on the RSS line. It deliberately carries only THIS
+    # A fetched corpus is never resident (a legacy settled_markets_*.json
+    # cache, the one format handed over as a list, is no longer served), so
+    # the groupable count is what this warning has to cover. It deliberately carries only THIS
     # run's numbers; the historical measurements live in config.py beside
     # BACKTEST_RECORD_BYTES_ESTIMATE, where a reader is prompted to keep them
     # current, rather than in a string emitted on every run (TS-07). Advisory

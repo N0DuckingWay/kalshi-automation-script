@@ -350,10 +350,10 @@ Notes:
     its off view), so no cell ships twice.
 
     Directly under the Period line the header says what settled-market corpus
-    the run read (BacktestSweep.corpus_provenance): when it was assembled (a
-    legacy settled_markets_*.json's file time, named as such) — the Period
-    runs to today, the corpus only to that moment — whether it was served
-    from an earlier run's cache, and the archive cutoff as of that assembly
+    the run read (BacktestSweep.corpus_provenance): when it was assembled or
+    extended — the Period runs to today, the corpus only to that moment —
+    whether it was served from an earlier run's cache, and the archive
+    cutoff as of that assembly
     (information only: a market settled after the cutoff is priced from
     Kalshi's live candlestick endpoint). It renders on every run, "not
     recorded" included, never as a silence.
@@ -4421,18 +4421,19 @@ def _corpus_provenance_html(sweep: BacktestSweep | None) -> str:
     Render the page-header line saying what settled-market corpus the run read.
 
     DR-13 and M3 of the 2026-09-24 review. The Period line above it prints
-    start_date → today because the equity curve runs to today, but the corpus
-    holds no market settled after its assembly — and a cached re-run serves a
-    corpus assembled by an earlier run, so the two can be days apart.
+    start_date → today because the equity curve runs to today, and the corpus
+    holds no market settled after its assembly. Every run brings its corpus
+    up to date — a cache from an earlier UTC day is extended through today —
+    so a cached corpus is at most a few hours old, and this line says which
+    it was: assembled by this run, extended through today by this run (with
+    the full assembly it was extended from), or served from a cache an
+    earlier run assembled the same UTC day.
 
     Always renders a line, healthy or not — absence must never be the only
-    signal (DR-66): the assembly time (a legacy settled_markets_*.json's
-    file time, named as such), whether it came from an earlier run's cache
-    (and that --no-cache extends it), and the archive cutoff at assembly.
-    The cutoff is information only: a market settled after it is priced from
-    Kalshi's live candlestick endpoint, so a window starting after the cutoff
-    is no longer bound to zero trades, and the red "structurally 0-trade"
-    banner this page used to carry is gone.
+    signal (DR-66). The archive cutoff at assembly is information only: a
+    market settled after it is priced from Kalshi's live candlestick
+    endpoint, so the red "structurally 0-trade" banner this page used to
+    carry is gone.
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
@@ -4453,26 +4454,21 @@ def _corpus_provenance_html(sweep: BacktestSweep | None) -> str:
         )
     if prov.assembled_at is None:
         assembled = "assembly time not recorded"
-    elif prov.legacy:
-        assembled = (f"last written {prov.assembled_at:%Y-%m-%d %H:%M} UTC (the "
-                     "file time of a legacy settled_markets_*.json, which records "
-                     "no assembly stamp) — it holds no market settled after that")
     else:
         assembled = (f"assembled {prov.assembled_at:%Y-%m-%d %H:%M} UTC — it holds "
                      "no market settled after that")
-    if not prov.from_cache:
+    if prov.full_assembly_at is not None:
+        assembled += (f" (extended day by day since a full assembly of "
+                      f"{prov.full_assembly_at:%Y-%m-%d %H:%M} UTC)")
+    if prov.from_cache:
+        source = ("served from an earlier run's cache, assembled earlier today; "
+                  "--no-cache re-assembles it in full")
+    elif prov.full_assembly_at is not None:
+        source = "extended through today by this run"
+    else:
         source = "assembled by this run"
-    elif prov.legacy:
-        source = ("served from an earlier run's cache; --no-cache extends it and "
-                  "rebuilds it in the streamed format")
-    else:
-        source = "served from an earlier run's cache; --no-cache extends it"
-    if prov.archive_cutoff is not None:
-        cutoff = f"archive cutoff at assembly: {prov.archive_cutoff:%Y-%m-%d}"
-    elif prov.legacy:
-        cutoff = "archive cutoff at assembly: not recorded (the legacy format records none)"
-    else:
-        cutoff = "archive cutoff at assembly: not recorded"
+    cutoff = ("archive cutoff at assembly: not recorded" if prov.archive_cutoff is None
+              else f"archive cutoff at assembly: {prov.archive_cutoff:%Y-%m-%d}")
     return (f"{grey}Settled-market corpus: {html.escape(assembled)} "
             f"({html.escape(source)}) | {html.escape(cutoff)}</p>")
 

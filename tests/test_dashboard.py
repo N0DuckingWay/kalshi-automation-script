@@ -2688,9 +2688,24 @@ class TestCorpusProvenanceHeader:
                 < page.index("Primary spread band:") < page.index("Portfolio Performance"))
 
     def test_a_cached_run_names_its_cache_and_the_remedy(self, monkeypatch, tmp_path):
+        # A cache is served as it is only on the UTC day it was assembled;
+        # an earlier day's is extended before it is served
         line = self._corpus_line(self._page(monkeypatch, tmp_path,
                                             self._prov(from_cache=True)))
-        assert "served from an earlier run&#x27;s cache; --no-cache extends it" in line
+        assert ("served from an earlier run&#x27;s cache, assembled earlier today; "
+                "--no-cache re-assembles it in full") in line
+
+    @pytest.mark.parametrize("from_cache, source", [
+        (False, "extended through today by this run"),
+        (True, "served from an earlier run&#x27;s cache, assembled earlier today"),
+    ])
+    def test_an_extended_corpus_names_its_full_assembly(
+            self, monkeypatch, tmp_path, from_cache, source):
+        line = self._corpus_line(self._page(monkeypatch, tmp_path, self._prov(
+            from_cache=from_cache, full_assembly_at=datetime(2026, 9, 20, 8, 15, tzinfo=UTC))))
+        assert ("assembled 2026-09-24 12:37 UTC — it holds no market settled after "
+                "that (extended day by day since a full assembly of 2026-09-20 "
+                f"08:15 UTC) ({source}") in line
 
     @pytest.mark.parametrize("from_cache", [False, True])
     def test_a_post_cutoff_window_gets_no_banner(self, monkeypatch, tmp_path, from_cache):
@@ -2706,19 +2721,6 @@ class TestCorpusProvenanceHeader:
                      "verdict is stale", "structural"):
             assert gone not in page
 
-    def test_a_legacy_cache_shows_its_file_time(self, monkeypatch, tmp_path):
-        # P2 review (C1/ADV-1): a legacy settled_markets_*.json hit carries its
-        # file time to the page, named as such, and claims no cutoff.
-        line = self._corpus_line(self._page(monkeypatch, tmp_path, self._prov(
-            from_cache=True, archive_cutoff=None, legacy=True)))
-        assert ("last written 2026-09-24 12:37 UTC (the file time of a legacy "
-                "settled_markets_*.json, which records no assembly stamp) — it "
-                "holds no market settled after that") in line
-        assert ("served from an earlier run&#x27;s cache; --no-cache extends it "
-                "and rebuilds it in the streamed format") in line
-        assert ("archive cutoff at assembly: not recorded (the legacy format "
-                "records none)") in line
-
     def test_an_unrecorded_cutoff_says_so(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path, self._prov(
             from_cache=True, archive_cutoff=None))
@@ -2732,7 +2734,7 @@ class TestCorpusProvenanceHeader:
     @pytest.mark.parametrize("sweep", [True, False])
     def test_no_provenance_reads_not_recorded(self, monkeypatch, tmp_path, sweep):
         # An infeasible window, a stubbed corpus, or no sweep at all: said,
-        # never silently absent (a legacy .json hit now carries its file time).
+        # never silently absent.
         page = self._page(monkeypatch, tmp_path, None, sweep=sweep)
         assert ("Settled-market corpus: assembly time and archive cutoff not "
                 "recorded for this run (no sweep was passed to the report") in page

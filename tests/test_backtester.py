@@ -4810,13 +4810,16 @@ class TestCandleEndpointRouting:
         assert backtester._settled_after(settled, self.CUTOFF) is expected
         assert backtester._settled_after(settled, None) is False
 
-    def test_prepare_candidates_routes_by_the_corpus_cutoff(self, monkeypatch):
+    def test_prepare_candidates_routes_by_the_corpus_cutoff(self, monkeypatch, tmp_path):
         # The cutoff the corpus was assembled under reaches the candle fetch
         prov = historical.CorpusProvenance(
             from_cache=True, assembled_at=datetime(2026, 9, 28, tzinfo=UTC),
             archive_cutoff=datetime(2026, 7, 29, tzinfo=UTC))
-        markets = historical.LegacySettledCorpus(
-            TestPrepareEntriesMemoryInstrumentation._markets(), prov)
+        on_disk = TestPrepareCandidatesOverASettledCorpus._corpus(
+            tmp_path, TestPrepareEntriesMemoryInstrumentation._markets())
+        markets = historical.SettledCorpus(
+            on_disk.path, historical._assembled_cache_meta(_SS1_START, "t"),
+            len(on_disk), provenance=prov)
         monkeypatch.setattr(backtester, "fetch_all_settled_markets",
                             lambda *a, **k: markets)
         seen = {}
@@ -11202,10 +11205,9 @@ class TestPrepareCandidatesOverASettledCorpus:
         self, tmp_path, monkeypatch,
     ):
         # Taken off the corpus BY TYPE before it is released: a SettledCorpus
-        # hands over its provenance, and so does the LegacySettledCorpus list
-        # a legacy-cache hit returns (its file time, no cutoff); a plain list
-        # (a test stub) has none; and a MagicMock — which would answer
-        # .provenance with a truthy auto-attribute — is not mistaken for one.
+        # hands over its provenance; a plain list (a test stub) has none; and
+        # a MagicMock — which would answer .provenance with a truthy
+        # auto-attribute — is not mistaken for one.
         template = _ss1_corpus(0)
         corpus = self._corpus(tmp_path, template)
         prov = historical.CorpusProvenance(
@@ -11217,18 +11219,6 @@ class TestPrepareCandidatesOverASettledCorpus:
         assert TestGroupableSubset._prepare().corpus_provenance is prov
         TestGroupableSubset._patch(monkeypatch, template)
         assert TestGroupableSubset._prepare().corpus_provenance is None
-        legacy_prov = historical.CorpusProvenance(
-            from_cache=True, assembled_at=datetime(2026, 8, 3, 19, 5, tzinfo=UTC),
-            archive_cutoff=None, legacy=True)
-        legacy = historical.LegacySettledCorpus(template, legacy_prov)
-        TestGroupableSubset._patch(monkeypatch, legacy)
-        prepared = TestGroupableSubset._prepare()
-        assert prepared.corpus_provenance is legacy_prov
-        # ...and the legacy list prepares exactly what the plain list does.
-        TestGroupableSubset._patch(monkeypatch, template)
-        plain = TestGroupableSubset._prepare()
-        assert prepared.all_pairs == plain.all_pairs
-        assert prepared.label_coverage == plain.label_coverage
         stub = MagicMock()
         stub.__iter__.return_value = iter([])
         stub.provenance = prov
@@ -11306,16 +11296,23 @@ class TestPrefilterLinesSayItRanDuringAssembly:
         assert "(3 more were duplicate or blank tickers; counted at this cache's " \
             "assembly)" in caplog.text
 
-    @pytest.mark.parametrize("legacy, noun", [(False, "cache"), (True, "legacy cache")])
-    def test_a_corpus_without_counts_says_it_records_none(self, caplog, legacy, noun):
+    @pytest.mark.parametrize("full_assembly_at, note", [
+        (None, ""),
+        # An extended cache drops its counts; its extension logged its own
+        (datetime(2026, 9, 20, tzinfo=UTC),
+         " (it was extended since its full assembly; the extension's own counts "
+         "are on the line logged when it ran)"),
+    ])
+    def test_a_corpus_without_counts_says_it_records_none(
+            self, caplog, full_assembly_at, note):
         with caplog.at_level(logging.INFO):
             backtester._log_corpus_prefilter(
-                7, 7, self._prov(from_cache=True, legacy=legacy,
-                                 archive_cutoff=None))
+                7, 7, self._prov(from_cache=True, archive_cutoff=None,
+                                 full_assembly_at=full_assembly_at))
         assert self._lines(caplog)[0] == (
             "INFO", f"Markets to analyze: 7 eligible — the eligibility prefilter "
-                    f"({self.TAG}) ran during assembly, but this {noun} records no "
-                    f"count of the records it rejected")
+                    f"({self.TAG}) ran during assembly, but this cache records no "
+                    f"count of the records it rejected{note}")
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
     @pytest.mark.parametrize("counts", [None, COUNTS])
@@ -11381,15 +11378,16 @@ class TestPrefilterLinesSayItRanDuringAssembly:
         assert first < group
 
     def test_prepare_candidates_warns_on_a_fetched_corpus_it_can_still_filter(
-        self, monkeypatch, caplog,
+        self, monkeypatch, caplog, tmp_path,
     ):
         # A corpus claiming to come from the fetch that still holds records
         # the predicate rejects: the stale-tag case. Dropped AND warned about.
         template = _ss1_corpus(0)
-        legacy = historical.LegacySettledCorpus(
-            template, self._prov(from_cache=True, legacy=True,
-                                 archive_cutoff=None))
-        TestGroupableSubset._patch(monkeypatch, legacy)
+        on_disk = TestPrepareCandidatesOverASettledCorpus._corpus(tmp_path, template)
+        fetched = historical.SettledCorpus(
+            on_disk.path, historical._assembled_cache_meta(_SS1_START, "t"),
+            len(on_disk), provenance=self._prov(from_cache=True, archive_cutoff=None))
+        TestGroupableSubset._patch(monkeypatch, fetched)
         with caplog.at_level(logging.INFO):
             prepared = TestGroupableSubset._prepare()
         rejected = len(template) - len(TestGroupableSubset._eligible(template))
@@ -11402,7 +11400,7 @@ class TestPrefilterLinesSayItRanDuringAssembly:
         assert (f"Markets to analyze: {len(template)} assembled as eligible, "
                 f"{len(template) - rejected} still eligible after the re-check "
                 f"below — the eligibility prefilter ({self.TAG}) ran during "
-                f"assembly, but this legacy cache records no count") in caplog.text
+                f"assembly, but this cache records no count") in caplog.text
         # ...and the dropped records are dropped exactly as before.
         TestGroupableSubset._patch(monkeypatch, template)
         assert prepared.all_pairs == TestGroupableSubset._prepare().all_pairs

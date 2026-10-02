@@ -179,19 +179,19 @@ def _log_corpus_provenance(sweep: BacktestSweep) -> None:
     """
     Close the run's report with what settled-market corpus it read.
 
-    The "Period:" line prints start_date → today (the simulated window), but
-    the corpus holds no market settled after its assembly, and a cached re-run
-    reads a corpus an earlier run assembled (DR-13). Logged on every run, "not
-    recorded" included — absence must never be the only signal (DR-66). The
-    archive cutoff is information only: a market settled after it is priced
-    from Kalshi's live candlestick endpoint, so a window starting after it is
-    no longer bound to zero trades.
+    The "Period:" line prints start_date → today (the simulated window), and
+    the corpus holds no market settled after its assembly. Every run brings
+    its corpus up to date — a cache from an earlier UTC day is extended
+    through today, so a cached corpus is at most a few hours old (assembled
+    earlier the same UTC day) — and this line says which it was (DR-13).
+    Logged on every run, "not recorded" included — absence must never be the
+    only signal (DR-66). The archive cutoff is information only: a market
+    settled after it is priced from Kalshi's live candlestick endpoint.
 
     Args:
         sweep (BacktestSweep): The run's result. Its corpus_provenance is None
             when not recorded (no corpus was fetched, or it did not come from
-            an assembled cache); a legacy settled_markets_*.json hit carries
-            its file time (legacy=True) and no cutoff.
+            an assembled cache).
     """
     provenance = sweep.corpus_provenance
     if provenance is None:
@@ -202,25 +202,24 @@ def _log_corpus_provenance(sweep: BacktestSweep) -> None:
         return
     if provenance.assembled_at is None:
         assembled = "assembly time not recorded"
-    elif provenance.legacy:
-        assembled = (f"last written {provenance.assembled_at:%Y-%m-%d %H:%M} UTC "
-                     "(a legacy cache's file time), holding no market settled "
-                     "after that")
     else:
         assembled = (f"assembled {provenance.assembled_at:%Y-%m-%d %H:%M} UTC, "
                      "holding no market settled after that")
-    if provenance.archive_cutoff is not None:
-        cutoff = f"{provenance.archive_cutoff:%Y-%m-%d}"
-    elif provenance.legacy:
-        cutoff = "not recorded (the legacy format records none)"
+    if provenance.full_assembly_at is not None:
+        assembled += (f" (extended day by day since a full assembly of "
+                      f"{provenance.full_assembly_at:%Y-%m-%d %H:%M} UTC)")
+    if provenance.from_cache:
+        source = ("served from an earlier run's cache, assembled earlier today; "
+                  "--no-cache re-assembles it in full")
+    elif provenance.full_assembly_at is not None:
+        source = "extended through today by this run"
     else:
-        cutoff = "not recorded"
+        source = "assembled by this run"
+    cutoff = ("not recorded" if provenance.archive_cutoff is None
+              else f"{provenance.archive_cutoff:%Y-%m-%d}")
     logging.info(
         "Settled-market corpus: %s (%s); archive cutoff at assembly: %s",
-        assembled,
-        "served from an earlier run's cache; --no-cache extends it"
-        if provenance.from_cache else "assembled by this run",
-        cutoff,
+        assembled, source, cutoff,
     )
 
 
