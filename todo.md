@@ -79,6 +79,12 @@ data or the operator's machine · **[decision]** needs an operator call before a
   months. Unverified: that `/series/{series}/markets/{ticker}/candlesticks` serves a settled
   market's whole history, and that its per-request cap is the archive's 5,000 candles (assumed;
   `historical.fetch_candlesticks`).
+- [ ] **What the candle endpoints answer for a market they do not hold.** The routing
+  (`backtester._fetch_candles_parallel` → `historical.fetch_candlesticks`) is result-neutral only if
+  each endpoint answers 404 for such a market: a 404 asks the other endpoint, while an empty 200 is
+  cached as no candles (for a day) and any other error is final. It matters only when the archive
+  cutoff moved after the corpus was last assembled or extended (a market routed to the wrong
+  endpoint first). Check one archived and one live market against both endpoints.
 - [ ] **Cache extension.** Two backtests of one window on consecutive UTC days: the second logs
   `Extending assembled cache …` and its corpus runs through today. Record how long an extension
   takes (estimated at an hour or two of paging per newly completed day).
