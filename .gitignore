@@ -28,6 +28,9 @@ scheduler_state.json.tmp
 backtest_cache/
 dashboard.html
 backtest_dashboard*.html
+# The dashboard's sidecar data (config.DASHBOARD_FILES_DIRNAME): the chunks its
+# Sell select loads, one folder per build, kept beside the page
+/backtest_dashboard_files/
 
 # Saved live trading defaults (operator state, written by
 # config.save_live_defaults when defaults_server's confirmation page is

@@ -452,6 +452,17 @@ TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.80
 INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
                            0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00)
 
+# The sell levels the backtest dashboard's Sell select offers, beside "no
+# selling": sell a whole position once its realized profit (what selling it at
+# the bids would return, after the sale's fees, less what it cost) reaches this
+# share of its potential profit (its contract pairs at CONTRACT_PAYOUT_DOLLARS
+# less what it cost). Every 5% from 5% to 100%. BACKTEST-ONLY: live trading
+# never sells a position (no live module reads this). Read by
+# backtester.run_backtest_sweep(sell_sweep=True), whose lazy SellSweep
+# simulates each level when the dashboard reads it.
+TAKE_PROFIT_LEVELS = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
+                      0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00)
+
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
 # Eight live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
@@ -607,6 +618,23 @@ DEFAULTS_SERVER_CONFIRM_ARM_MS = 1000
 # The one dashboard file every backtest run writes (and overwrites) in
 # PROJECT_ROOT; defaults_server opens it when it starts.
 DASHBOARD_FILENAME = "backtest_dashboard.html"
+
+# The folder beside the dashboard file that holds the data its Sell select
+# loads: one sub-folder per build (<this folder>/<build id>/chunk-<id>.js),
+# far too many blocks to put in the page itself, so the page loads each one
+# through a <script src> element when a reader chooses it. Named as a
+# browser's "Save page as" names a page's folder; the page shows no sell level
+# without it, so the two are kept, copied and moved together. Each build
+# deletes the folders of earlier builds when it replaces the page.
+DASHBOARD_FILES_DIRNAME = "backtest_dashboard_files"
+
+# A build folder under DASHBOARD_FILES_DIRNAME still marked as being written
+# (its ".writing" file) is left alone while the mark is younger than this many
+# seconds — another backtest may be building its page at the same time — and
+# deleted by the next build once it is older: that build crashed or was
+# killed. Two days, far longer than a build is expected to take (an
+# estimate: the 365-day page's Sell select at under an hour).
+DASHBOARD_BUILD_STALE_SECONDS = 2 * 86_400
 
 # How much of the dashboard file, from its start, defaults_server reads to tell
 # whether the page has the filter bar's Save and Trade buttons (it looks for
@@ -1370,6 +1398,15 @@ SETTLED_FETCH_CHUNK_RECORDS = 50_000
 # (0.15s) between its pages.
 CANDLESTICK_FETCH_MAX_WORKERS = 8
 
+# The most worker PROCESSES the backtest dashboard uses to simulate its Sell
+# select's levels (dashboard._build_sell_grid), and the default of
+# backtest.py's --sell-workers, which caps it at one less than the machine's
+# CPU count. Processes, not threads: the work is pure-Python simulation, which
+# threads would run one at a time. Each worker holds one spread band's entries
+# and its own share of the page's simulations, so memory grows with the count;
+# 1 runs everything in the main process (what the tests use).
+DASHBOARD_SELL_MAX_WORKERS = 8
+
 # GROUPABLE-market count above which backtester._prepare_candidates (the first
 # half of _prepare_entries) warns the operator about the RAM the
 # grouping/pairing step holds, and the per-record estimate the warning
@@ -1606,40 +1643,13 @@ ORDER_WRITE_BURST = 8
 # PREFILTER (a per-market test that drops settled markets no simulated trade
 # could use). The backtest's market list is cached on disk under this name
 # plus SCHEDULED_RUN.cache_slug() (backtester._prefilter_cache_tag), in the
-# file name (settled_markets_<start_date>_<tag>[_nomve].jsonl.gz, or .json
-# when legacy) and meta block, so a list filtered one way is never served to
-# another. MUST get a new version name whenever _can_ever_enter's logic or
+# file name (settled_markets_<start_date>_<tag>[_nomve].jsonl.gz) and meta
+# block, so a list filtered one way is never served to another. MUST get a
+# new version name whenever _can_ever_enter's logic or
 # CANDLESTICK_PERIOD_INTERVAL_MINUTES changes, or a stale cache is served
 # (_prepare_candidates' re-check WARNs on a stricter prefilter, but a looser
 # one goes unnoticed). Past versions: CLAUDE.md's prefilter gotcha.
 SETTLED_PREFILTER_CACHE_TAG = "checkpoint-v3"
-
-# How young an EMPTY assembled settled-market cache must be to still be served
-# (DR-13, P2 of the 2026-09-24 review). An empty corpus is not a result: it
-# records only that nothing qualified when it was assembled (or that a run was
-# cut short), and a cache hit makes zero network calls, so an empty cache used
-# to be a PERMANENT hit — the 2-byte "[]" settled_markets_2026-08-29_*.json on
-# disk, last written 2026-09-01 00:16 UTC (its file time), was still being
-# served on 2026-09-24. Under this age (measured from the assembly time the
-# streamed cache's meta records, or a legacy .json's file time) an empty cache
-# is served with a WARNING; at or over it, when its assembly time cannot be
-# read, or when that time is in the future, it is a miss and the corpus is
-# re-assembled. So a legitimately empty window re-checks at most once per this
-# interval — and each re-check is an ordinary miss: a full re-assembly of the
-# window from the day-slice stores (fetching any day not stored or no longer
-# valid, and always the current day), not a top-up, so for a long window it is
-# a full-volume run (the 2026-08-29 file's rebuild covers 26 days; the fresh
-# 7-day 2026-09-17 run of 2026-09-24 assembled 7,274,215 records, took 2,382 s
-# and peaked at 2,916,679,680 bytes max RSS). A NON-empty cache is never expired
-# by age — it is announced (its assembly time and what --no-cache costs to
-# extend it) and served; that is the operator decision "announce, don't
-# enforce". One day, in seconds; the same value as, but deliberately not the
-# same constant as, historical's private _DAY_SECONDS (a day-slice geometry
-# fact) and backtester's private _DAY_SECONDS (a calendar step), and as
-# historical's private _EMPTY_CANDLE_TTL_SECONDS — the older, separate staleness
-# rule for an EMPTY candlestick cache file, which (unlike this one) serves a
-# future-dated file; that rule predates this one and is left as it is.
-EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS = 86_400
 
 # How long historical.load_series_categories reuses its cached copy of Kalshi's
 # /series listing (every series' official category and tags — 14,391 series in

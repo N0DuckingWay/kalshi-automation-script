@@ -74,11 +74,26 @@ data or the operator's machine · **[decision]** needs an operator call before a
   `portfolio_value` been checked against `main._checked_positions_value`'s $1-a-contract bound, or
   compared with the held pairs' worth at the asks (Kalshi's own valuation; the two need not agree).
 
+- [ ] **Live candlestick endpoint for settled markets.** A backtest starting two weeks ago should
+  now find trades: the `returned no candles` count falls and trades appear in the window's last two
+  months. Unverified: that `/series/{series}/markets/{ticker}/candlesticks` serves a settled
+  market's whole history, and that its per-request cap is the archive's 5,000 candles (assumed;
+  `historical.fetch_candlesticks`).
+- [ ] **What the candle endpoints answer for a market they do not hold.** The routing
+  (`backtester._fetch_candles_parallel` → `historical.fetch_candlesticks`) is result-neutral only if
+  each endpoint answers 404 for such a market: a 404 asks the other endpoint, while an empty 200 is
+  cached as no candles (for a day) and any other error is final. It matters only when the archive
+  cutoff moved after the corpus was last assembled or extended (a market routed to the wrong
+  endpoint first). Check one archived and one live market against both endpoints.
+- [ ] **Cache extension.** Two backtests of one window on consecutive UTC days: the second logs
+  `Extending assembled cache …` and its corpus runs through today. Record how long an extension
+  takes (estimated at an hour or two of paging per newly completed day).
+- [ ] **Sell family build cost.** The 365-day build's `Dashboard: Sell select built in N s` line and
+  the size of `backtest_dashboard_files/`, against the estimates (30–60 minutes more with 8 workers;
+  1–5 GB of files), and the peak memory with `--sell-workers 8`.
+
 ## 3. Pending operator decisions  [decision]
 
-- [ ] **DR-50: short-circuit post-cutoff backtest windows** (structurally 0-trade). Today only a
-  WARNING (`historical.py:4104-4125, 5122-5134`). Must go on the cache-miss path after the cutoff
-  read, never on a hit.
 - [ ] **DR-75 follow-up: make the same-title group contest causal.** `best_by_group` still picks the
   largest `entry_monthly_ratio` across different Mondays — look-ahead (`backtester.py:6141-6157`) —
   and the ratio's horizon uses the *realized* close (`backtester.py:6064-6069`). Options: earliest
@@ -88,6 +103,14 @@ data or the operator's machine · **[decision]** needs an operator call before a
 - [ ] **Same-title close-gate bound: 1 h vs 15 min.** 15 min gives the same result on the 365-day
   corpus with ~1 h more margin (CLAUDE.md DR-74 table; `config.py:219`).
 - [ ] **Widen market-eligibility bounds (0.01/0.99)?** Deliberately held (`scanner.py:458-464`).
+- [ ] **Skip MVE combo markets in the backtest fetch?** They form no pairs (measured on the
+  2026-09-08/09 day slices; DR-54/55 refuse combo-vs-combo same-title pairs) but dominate every
+  settled-market fetch and every daily cache extension (an hour or two of paging per full day,
+  an estimate). A fetch-side filter would change the cache identity (a new tag), so it is a
+  decision, not a fix.
+- [ ] **Live selling.** The backtest dashboard can sell a position at a share of its potential
+  profit; live trading never sells, and building that would be a separate change (order path,
+  sizing, a live setting, the defaults server's pages).
 - [ ] **Same-title stacking across weeks** is out of scope of DR-76: its held-ladder rule refuses
   time-series pairs only (in `find_time_series_pairs` and `select_portfolio`), so a later run can
   trade another same-title pair of a question it already holds one on; and with `add_to_held_pairs` on it may also add to the
@@ -107,7 +130,14 @@ data or the operator's machine · **[decision]** needs an operator call before a
   closed on both (`backtester.py:3826-3834, 3852-3945`; `scanner.py:5111-5115`). Will move every
   result when fixed.
 - [ ] **Same-title pairs Pass 2 can't fund are never retried** (time-series are, since DR-76)
-  (`backtester.py:5800-5804, 6253-6308`).
+  (`backtester.py:5800-5804, 6253-6308`). For the same reason a same-title pair sold at a sell
+  level is never bought again.
+- [ ] **Selling early residuals** (`backtester._simulate_at_discount(sell_at=)`): a sale fills at the
+  candle's bid in any size (no depth, as for entries); a position with add-ons pays the sale's fee
+  per trade per leg (up to 1¢ per extra trade per market more than one combined order); the corpus
+  holds settled markets only, so the window's last weeks hold only pairs that have paid out, and a
+  pair sold before its markets settled is missing until they settle (needs open markets in the
+  corpus).
 - [ ] **Cross-event time-series pairs ordered on realized close**, live on scheduled close
   (`backtester.py:3725-3731, 3765-3795`). Needs a scheduled-close field (refetch) or span-date
   parsing, as ladders already have.
@@ -145,9 +175,6 @@ data or the operator's machine · **[decision]** needs an operator call before a
 - [ ] **`/series` cache write collision** between a concurrent live run and backtest can leave an
   unreadable file (tmp name derives from the destination; `historical.py:398-409, 678-687`). Same
   for `treasury_bill_rates.json`. Use a unique tmp name.
-- [ ] **Legacy `settled_markets_*.json` hits still load whole into memory** (`historical.py:5086-5110`)
-  and the RAM warning doesn't count that list (`backtester.py:5054-5076`). Simplest fix: delete the
-  legacy files (see §11).
 - [ ] **Pruning cached market dicts to the keys the backtester reads** — specified, unlanded, gated
   on profiling (peak RSS ≤ 3 GB, identical `Potential pairs` counts).
 - [ ] **Candle cache dict with `open_ts` but no `close_ts`** raises `KeyError` out of the worker
@@ -310,13 +337,14 @@ Kept here so they aren't mistaken for forgotten work. Source: code comments and 
 - Scheduler: a fault at 09:00 costs the Monday slot (DR-59); Treasury download can take ~4 min
   before fallback on a black-holed host.
 - Prefilter relies on observed (not contracted) candle-timing behaviour (`backtester.py:1975-2008`).
-- Empty-candle-cache future-mtime asymmetry vs DR-13 (`historical.py:4249-4256`).
+- Empty-candle-cache files are honoured by modification time, a future-dated one included
+  (`historical.fetch_candlesticks`).
 - The sequential archive fallback still stops after `ARCHIVE_MAX_BARREN_PAGES` empty pages (it can
   miss long-lived markets; the sharded path reads every created-day instead); sequential fallbacks
   unbounded in memory; identity check is a hash (`historical.py` `_fetch_archive_sequential`,
   `_assembled_records`).
-- `_ex_top_event` / `CapSweep.entry_events` deliberately wider than the trades; `max_trades_simulated`
-  counts eager points only; `CapSweep` has no memo; O(B²) ladder sub-pass has only a per-bucket canary.
+- `_ex_top_event` / `CapSweep.entry_events` / `SellSweep.entry_events` deliberately wider than the
+  trades; `CapSweep` has no memo; O(B²) ladder sub-pass has only a per-bucket canary.
 - Dashboard: best/worst-5 tables overlap below 11 trades (WONTFIX 2026-09-13); benchmark can carry
   one extra bar; `_deployed_on_days` pre-curve entry (unreachable).
 - `scheduler.py` "arbitrage" wording left deliberately.
@@ -329,4 +357,7 @@ accumulator, BS-12/28/29 orderbook/cursor guards, BS-13 scanner progress logs, B
 BS-18 trade-log locking, BS-19 dev key lookup, BS-20 HTML escaping, BS-21 worker-count comments,
 BS-22/23/27 historical, BS-24 ticker release, BS-25 log rotation, BS-26 duplicate log lines, BS-30
 empty drawdown; plus orphaned pre-cutoff `live_days/` pruning, CLAUDE.md test list, and README/CLAUDE
-CLI flag coverage.
+CLI flag coverage. Since then (2026-10, branch `claude/backtesting-position-auto-sell-hsj4d4`):
+DR-50 is moot (a post-cutoff window's markets are priced from the live candlestick endpoint, and the
+"structurally 0-trade" verdict is gone), and a legacy `settled_markets_*.json` is no longer loaded
+whole — it is re-assembled in full in the streamed format and retired.

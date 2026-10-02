@@ -34,6 +34,7 @@ import inspect
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -2630,16 +2631,15 @@ class TestEntryCheckpointHeader:
 
 
 class TestCorpusProvenanceHeader:
-    """DR-13 / M2 (P2): directly under the Period line the header says what
+    """DR-13 (P2): directly under the Period line the header says what
     settled-market corpus the run read — its assembly time (the Period runs to
     today, the corpus only to that moment), whether it came from an earlier
     run's cache, and the archive cutoff as of assembly — on EVERY run, healthy
-    or not (DR-66). A window at or after that cutoff gets a red banner that
-    states a bound (no trade could be entered whatever pairs formed), never a
-    cause — unless some simulated point traded, which proves the verdict stale
-    and gets an amber stale-verdict line instead. A legacy .json hit shows its
-    file time. Rendered through generate_dashboard(), because a unit test that
-    does not prove the string reaches the page is the gap DR-66b was about."""
+    or not (DR-66). The cutoff is information only: a post-cutoff market is
+    priced from the live candlestick endpoint, so the red "structurally
+    0-trade" banner is gone. A legacy .json hit shows its file time. Rendered
+    through generate_dashboard(), because a unit test that does not prove the
+    string reaches the page is the gap DR-66b was about."""
 
     ASSEMBLED = datetime(2026, 9, 24, 12, 37, 49, tzinfo=UTC)
     CUTOFF = datetime(2026, 7, 25, tzinfo=UTC)
@@ -2667,7 +2667,7 @@ class TestCorpusProvenanceHeader:
 
     def _prov(self, **overrides):
         fields = {"from_cache": False, "assembled_at": self.ASSEMBLED,
-                  "archive_cutoff": self.CUTOFF, "post_cutoff": False}
+                  "archive_cutoff": self.CUTOFF}
         fields.update(overrides)
         return CorpusProvenance(**fields)
 
@@ -2689,67 +2689,53 @@ class TestCorpusProvenanceHeader:
                 < page.index("Primary spread band:") < page.index("Portfolio Performance"))
 
     def test_a_cached_run_names_its_cache_and_the_remedy(self, monkeypatch, tmp_path):
+        # A cache is served as it is only on the UTC day it was assembled;
+        # an earlier day's is extended before it is served
         line = self._corpus_line(self._page(monkeypatch, tmp_path,
                                             self._prov(from_cache=True)))
-        assert "served from an earlier run&#x27;s cache; --no-cache extends it" in line
+        assert ("served from an earlier run&#x27;s cache, assembled earlier today; "
+                "--no-cache re-assembles it in full") in line
 
-    @pytest.mark.parametrize("from_cache", [False, True])
-    def test_a_post_cutoff_window_gets_the_banner(self, monkeypatch, tmp_path, from_cache):
-        page = self._page(monkeypatch, tmp_path,
-                          self._prov(post_cutoff=True, from_cache=from_cache))
-        assert ("This window starts at or after the archive cutoff (2026-07-25, as "
-                "of the corpus's assembly).") in page
-        assert "no trade could be entered in this window whatever pairs formed" in page
-        assert "says nothing about the strategy" in page
-        # Only a cached verdict can have gone stale — only it says so.
-        assert ("a cached run does not re-read it; --no-cache re-checks" in page) \
-            is from_cache
-        assert page.index("Settled-market corpus:") < page.index(
-            "This window starts at or after") < page.index("Portfolio Performance")
-        assert "that verdict is stale" not in page
+    def test_a_cache_that_could_not_be_brought_up_to_date_says_so(
+            self, monkeypatch, tmp_path):
+        # An earlier day's cache served as it was after its extension failed
+        line = self._corpus_line(self._page(monkeypatch, tmp_path,
+                                            self._prov(from_cache=True, stale=True)))
+        assert ("(served as an earlier day&#x27;s cache: it could not be brought up "
+                "to date this run (see the log); --no-cache re-assembles it in full)"
+                ) in line
+        assert "earlier today" not in line
 
-    @pytest.mark.parametrize("from_cache", [False, True])
-    @pytest.mark.parametrize("n_trades, other_point_trades", [(2, 0), (0, 3)])
-    def test_a_post_cutoff_verdict_contradicted_by_trades_is_reported_as_stale(
-            self, monkeypatch, tmp_path, from_cache, n_trades, other_point_trades):
-        # P2 review (R3/C3/ADV-3): a stamped verdict goes stale once the cutoff
-        # moves past start_date, and the run can then trade — a red "no trade
-        # could be entered" beside "Trades found: N" would be false on its
-        # face. A trade at ANY simulated point (the primary, or another k the
-        # filter bar's k select shows) turns it into a stale-verdict line instead.
-        page = self._page(monkeypatch, tmp_path,
-                          self._prov(post_cutoff=True, from_cache=from_cache),
-                          n_trades=n_trades, other_point_trades=other_point_trades)
-        assert f'Trades found: <span id="hdr-trades">{n_trades}</span>' in page
-        assert "This window starts at or after" not in page
-        assert "no trade could be entered in this window" not in page
-        recorded = ("at this corpus&#x27;s assembly" if from_cache else "by this run")
-        assert f"The archive cutoff recorded {recorded} (2026-07-25)" in page
-        assert (f"this run entered trades (up to {max(n_trades, other_point_trades)} "
-                "in one simulated scenario), so that verdict is stale") in page
-        assert "--no-cache re-reads the cutoff and re-stamps the cache." in page
-        assert page.index("Settled-market corpus:") < page.index(
-            "The archive cutoff recorded") < page.index("Portfolio Performance")
-
-    def test_a_legacy_cache_shows_its_file_time(self, monkeypatch, tmp_path):
-        # P2 review (C1/ADV-1): a legacy settled_markets_*.json hit carries its
-        # file time to the page, named as such, and claims no cutoff.
+    @pytest.mark.parametrize("from_cache, source", [
+        (False, "extended through today by this run"),
+        (True, "served from an earlier run&#x27;s cache, assembled earlier today"),
+    ])
+    def test_an_extended_corpus_names_its_full_assembly(
+            self, monkeypatch, tmp_path, from_cache, source):
         line = self._corpus_line(self._page(monkeypatch, tmp_path, self._prov(
-            from_cache=True, archive_cutoff=None, post_cutoff=None, legacy=True)))
-        assert ("last written 2026-09-24 12:37 UTC (the file time of a legacy "
-                "settled_markets_*.json, which records no assembly stamp) — it "
-                "holds no market settled after that") in line
-        assert ("served from an earlier run&#x27;s cache; --no-cache extends it "
-                "and rebuilds it in the streamed format") in line
-        assert ("archive cutoff at assembly: not recorded (the legacy format "
-                "records none; --no-cache re-checks it)") in line
+            from_cache=from_cache, full_assembly_at=datetime(2026, 9, 20, 8, 15, tzinfo=UTC))))
+        assert ("assembled 2026-09-24 12:37 UTC — it holds no market settled after "
+                "that (extended day by day since a full assembly of 2026-09-20 "
+                f"08:15 UTC) ({source}") in line
 
-    def test_an_unrecorded_cutoff_says_so_and_claims_no_verdict(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("from_cache", [False, True])
+    def test_a_post_cutoff_window_gets_no_banner(self, monkeypatch, tmp_path, from_cache):
+        # A cutoff after the window's start date used to draw a red
+        # "no trade could be entered" banner (or an amber stale-verdict line).
+        # Post-cutoff markets are priced from the live candlestick endpoint
+        # now, so the cutoff is reported and nothing more.
         page = self._page(monkeypatch, tmp_path, self._prov(
-            from_cache=True, archive_cutoff=None, post_cutoff=None))
-        assert ("archive cutoff at assembly: not recorded (--no-cache re-checks it)"
-                in self._corpus_line(page))
-        assert "This window starts at or after" not in page
+            archive_cutoff=datetime(2030, 1, 1, tzinfo=UTC), from_cache=from_cache),
+            n_trades=2)
+        assert "archive cutoff at assembly: 2030-01-01" in self._corpus_line(page)
+        for gone in ("This window starts at or after", "no trade could be entered",
+                     "verdict is stale", "structural"):
+            assert gone not in page
+
+    def test_an_unrecorded_cutoff_says_so(self, monkeypatch, tmp_path):
+        page = self._page(monkeypatch, tmp_path, self._prov(
+            from_cache=True, archive_cutoff=None))
+        assert self._corpus_line(page).endswith("archive cutoff at assembly: not recorded")
 
     def test_an_unrecorded_assembly_time_says_so(self, monkeypatch, tmp_path):
         line = self._corpus_line(self._page(monkeypatch, tmp_path,
@@ -2759,11 +2745,10 @@ class TestCorpusProvenanceHeader:
     @pytest.mark.parametrize("sweep", [True, False])
     def test_no_provenance_reads_not_recorded(self, monkeypatch, tmp_path, sweep):
         # An infeasible window, a stubbed corpus, or no sweep at all: said,
-        # never silently absent (a legacy .json hit now carries its file time).
+        # never silently absent.
         page = self._page(monkeypatch, tmp_path, None, sweep=sweep)
         assert ("Settled-market corpus: assembly time and archive cutoff not "
                 "recorded for this run (no sweep was passed to the report") in page
-        assert "This window starts at or after" not in page
 
 
 class TestFigHtmlDivId:
@@ -3747,7 +3732,7 @@ def _flt_walk(source, trades, curve, k_used=0.75, series=_FLT_SERIES, pooled_k=N
     block, {chunk id: chunk}). The base block carries the interval-discount
     section's data from the same walk ("kd") when the grid records a band,
     as the page's does."""
-    walked, chunker, _, kd = dashboard._build_filter_grid(
+    walked, chunker, kd = dashboard._build_filter_grid(
         source, trades, curve, k_used, _FLT_START, 1000.0, series, pooled_k=pooled_k)
     base = dashboard._filter_payload(
         walked, chunker, _FLT_START, 1000.0, series,
@@ -4858,13 +4843,16 @@ class TestFilterSummary:
         js = dashboard._FILTER_JS
         for template in ("T.all", "T.slice", "T.unfiltered", "T.missing", "T.other_scenario",
                          "T.other_run", "D.text.scenario", "D.text.loading",
-                         "D.text.unavailable", "D.text.khat_sized_at"):
+                         "D.text.unavailable", "D.text.khat_sized_at", "T.sell_note",
+                         "D.text.sidecar_missing", "D.text.sidecar_empty",
+                         "D.sell_levels[level].phrase"):
             assert template in js
-        # Nor the tier-floors-off views' words: Python's scenario, note and
-        # k-hat title templates carry every one of them
+        # Nor the tier-floors-off views' words, nor the Sell select's: Python's
+        # scenario, note, sell-level and k-hat title templates carry every one
         for phrase in ("Showing", "contribution", "Not filtered", "its own simulation",
                        "Loading", "not simulated", "cap per trade", "sized at",
-                       "never bind", "floor alone", "tier floors off"):
+                       "never bind", "floor alone", "tier floors off", "selling",
+                       "potential profit", "held no data", "sold on", "keep the folder"):
             assert phrase not in js, phrase
 
 
@@ -4921,12 +4909,40 @@ def _script_body() -> str:
     """dashboard._FILTER_JS without its <script> tags, its inflate(el) handing
     back the already-inflated block of that element (the harness's
     __inflate, over every packed block of the page; the blocks' encoding is
-    pinned by TestFilterPage's strict decodes)."""
+    pinned by TestFilterPage's strict decodes) and its inflateText(text)
+    handing back the chunk a sidecar file passed over, already inflated (the
+    harness's __inflateText; the files' encoding is pinned by
+    _sidecar_files' strict decodes)."""
     body = dashboard._FILTER_JS.strip()
     body = body[len("<script>"):-len("</script>")]
-    start = body.index("  function inflate(el) {")
-    end = body.index("\n  }\n", start) + len("\n  }\n")
-    return body[:start] + "  function inflate(el) { return __inflate(el); }\n" + body[end:]
+    for opening, stand_in in (
+            ("  function inflate(el) {", "  function inflate(el) { return __inflate(el); }\n"),
+            ("  function inflateText(text) {",
+             "  function inflateText(text) { return __inflateText(text); }\n")):
+        start = body.index(opening)
+        end = body.index("\n  }\n", start) + len("\n  }\n")
+        body = body[:start] + stand_in + body[end:]
+    return body
+
+
+# One sidecar chunk file's text: the call that hands its packed block over
+_SIDECAR_CALL = re.compile(r'window\.__dashChunk\(document\.currentScript,"([A-Za-z0-9+/=]*)"\);\n')
+
+
+def _sidecar_files(page: str, root: Path) -> dict[str, dict]:
+    """Every sidecar chunk file of a page — in the folder its base block names
+    (sidecar_dir), under `root` (the folder the page was written to) — decoded
+    strictly, by the src the page's script asks for."""
+    data = _packed_blocks(page).get("dash-data") or {}
+    folder = data.get("sidecar_dir")
+    if not folder:
+        return {}
+    out = {}
+    for path in sorted((root / folder).glob("chunk-*.js")):
+        match = _SIDECAR_CALL.fullmatch(path.read_text(encoding="utf-8"))
+        assert match, path
+        out[f"{folder}/{path.name}"] = _decode_block(match.group(1))
+    return out
 
 
 def _explorer_body() -> str:
@@ -4944,7 +4960,9 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
                 no_decompression: bool = False, *, strict: bool = False,
                 damaged: tuple = (), keep: int | None = None,
                 deferred: tuple = (), explorer: bool = False,
-                strict_ids: bool = False, setup_js: str = "") -> dict:
+                strict_ids: bool = False, setup_js: str = "",
+                files_root: Path | None = None, files_missing: tuple = (),
+                files_empty: tuple = (), files_deferred: tuple = ()) -> dict:
     """
     Run the page's scripts — the filter script, and with explorer=True the
     scenario explorer's before it — over a rendered page under
@@ -4990,6 +5008,19 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
         setup_js (str): Keyword-only. JavaScript run after the page is set up
             and before the scripts — to take something off the page Python
             drew.
+        files_root (Path | None): Keyword-only. The folder the page was
+            written to: its sidecar chunk files (the Sell select's, in the
+            folder the base block names) are handed to the harness, which
+            loads one when the script appends its <script src> element
+            (["resolve_file", src] / ["reject_file", src] for a deferred one;
+            each snapshot's "files" lists every src loaded). None (default)
+            hands none over, so every sidecar load fails as a missing file's.
+        files_missing (tuple): Keyword-only. Srcs to leave out, as files that
+            cannot be loaded.
+        files_empty (tuple): Keyword-only. Srcs that run without handing
+            anything over.
+        files_deferred (tuple): Keyword-only. Srcs whose load waits for a
+            ["resolve_file", src] or ["reject_file", src] step.
 
     Returns:
         dict: The snapshots the steps took, by name.
@@ -5005,10 +5036,16 @@ def _run_script(tmp_path: Path, page: str, steps: list, pre: tuple = (),
         body = body.replace("var KEEP = 16;", f"var KEEP = {int(keep)};")
     with_explorer = explorer and "function unpack(el)" in page
     has_filter = 'id="dash-data"' in page
+    sidecars = {} if files_root is None else _sidecar_files(page, files_root)
+    for src in files_missing:
+        sidecars.pop(src, None)
     program = "\n".join([
         _JS_HARNESS.read_text(encoding="utf-8"),
         f"var __PAGE = {json.dumps(elements)};",
         f"__BLOCKS = {json.dumps(_packed_blocks(page))};",
+        f"__SIDECARS = {json.dumps(sidecars)};",
+        *(f"__SIDECAR_EMPTY[{json.dumps(src)}] = true;" for src in files_empty),
+        *(f"__SIDECAR_DEFERRED[{json.dumps(src)}] = true;" for src in files_deferred),
         *(f"__DAMAGED[{json.dumps(i)}] = true;" for i in damaged),
         *(f"__DEFERRED[{json.dumps(i)}] = true;" for i in deferred),
         "__setup(__PAGE);",
@@ -5817,34 +5854,6 @@ class TestFilterKAndCap:
         assert [b["label"] for b in data["bands"]] == ["not recorded"]
         assert _KC_UNUSED_CLAUSE in page
         assert sweep.cap_sweep.reads == []
-
-    def test_every_cap_point_counts_toward_the_stale_cutoff_verdict(self, monkeypatch, tmp_path):
-        # A window stamped at or after the cutoff: no EAGER point traded, but
-        # the no-cap scenario — which only the walk simulates — did. That
-        # disproves "no trade could be entered", so the header says the
-        # verdict is stale, counting the cap point's trades
-        empty = SweepPoint(k=0.75, trades=[], spread_band=_KC_B0, size_cap=0.2,
-                           equity_df=backtester._build_equity_curve([], _FLT_START, 1000.0))
-        traded = _kc_trades(5)
-        points = {(_KC_B0, 0.75, 0.05): dataclasses.replace(empty, size_cap=0.05),
-                  (_KC_B0, 0.75, 0.2): empty,
-                  (_KC_B0, 0.75, 1.0): SweepPoint(
-                      k=0.75, trades=traded, spread_band=_KC_B0, size_cap=1.0,
-                      equity_df=backtester._build_equity_curve(traded, _FLT_START, 1000.0))}
-        prov = CorpusProvenance(from_cache=True, assembled_at=datetime(2026, 9, 24, tzinfo=UTC),
-                                archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC),
-                                post_cutoff=True)
-        sweep = BacktestSweep(primary=empty, points=[empty], calibration=None,
-                              label_coverage=_scn_coverage(), corpus_provenance=prov,
-                              cap_sweep=_FakeCapSweep(points, bands=(_KC_B0,), ks=(0.75,)))
-        assert backtester.max_trades_simulated(sweep) == 0
-        page = _kc_page(monkeypatch, tmp_path, sweep)
-        assert ("this run entered trades (up to 3 in one simulated scenario), so that "
-                "verdict is stale") in page
-        assert "no trade could be entered in this window" not in page
-        # Without the cap sweep the eager points alone decide: the red banner
-        page = _kc_page(monkeypatch, tmp_path, dataclasses.replace(sweep, cap_sweep=None))
-        assert "no trade could be entered in this window whatever pairs formed" in page
 
     def test_a_curve_built_after_midnight_is_cut_to_the_page_s_last_date(self, monkeypatch):
         # A cell simulated after UTC midnight ends its curve a day past the
@@ -8039,7 +8048,7 @@ class _ExplorerCapSweep(_FakeCapSweep):
                 for p in pops.values() for t in p.trades}
 
 
-def _ex_sweep(*, raise_on=None, st_trades=None, cell_trades=None) -> BacktestSweep:
+def _ex_sweep(*, raise_on=None) -> BacktestSweep:
     """
     A band sweep with a size-cap sweep over 2 bands x 2 ks x 3 caps (5%, 20%
     — the run's own — and no cap), primary (0-1, k 0.75, 20%).
@@ -8050,8 +8059,7 @@ def _ex_sweep(*, raise_on=None, st_trades=None, cell_trades=None) -> BacktestSwe
     on the trades alone would be the 20% row. Band 0.3-0.6 traded nothing at
     k 0.60 (a flat curve: Sharpe 0.0, which the heatmap must not show) and
     the same winning list at every cap at k 0.75. Same-title: one trade at
-    5%, two at 20% and no cap. `st_trades` / `cell_trades` replace the
-    same-title lists / every cell's list (the stale-cutoff test's fixture).
+    5%, two at 20% and no cap.
     """
     def resized(t, n):
         return _kc_resized(t, n)
@@ -8074,8 +8082,6 @@ def _ex_sweep(*, raise_on=None, st_trades=None, cell_trades=None) -> BacktestSwe
         return curves[id(trades)]
 
     def pops(band, k, cap, trades, eq=None, ladder=False):
-        if cell_trades is not None:
-            trades = cell_trades
         point = SweepPoint(k=k, trades=trades, equity_df=curve(trades) if eq is None else eq,
                            spread_band=band, size_cap=cap, halves=halves.get(id(trades)),
                            ex_top_event=("KXNHLHART-27", 0.01) if trades else None)
@@ -8094,8 +8100,7 @@ def _ex_sweep(*, raise_on=None, st_trades=None, cell_trades=None) -> BacktestSwe
                                         eq=rich if k == 0.75 else None)
         for cap in _EX_CAPS:
             points[(_KC_B1, k, cap)] = pops(_KC_B1, k, cap, empty if k == 0.6 else other)
-    st_lists = st_trades or {0.05: [_flt_trades()[0]], 0.2: _flt_trades()[:2],
-                             1.0: _flt_trades()[:2]}
+    st_lists = {0.05: [_flt_trades()[0]], 0.2: _flt_trades()[:2], 1.0: _flt_trades()[:2]}
     st = {cap: SweepPoint(k=0.75, trades=listed, equity_df=curve(listed),
                           population="same_title", size_cap=cap)
           for cap, listed in st_lists.items()}
@@ -8372,21 +8377,6 @@ class TestExplorerCapAndMetrics:
             assert piece in page
         assert html.escape(dashboard._BAR_REACH_NO_EXPLORER) in page
 
-    def test_a_same_title_cap_point_counts_toward_the_stale_cutoff_verdict(
-            self, monkeypatch, tmp_path):
-        # No cell traded and the run's own same-title point did not either;
-        # only the no-cap same-title point did — which the explorer shows
-        prov = CorpusProvenance(from_cache=True, assembled_at=datetime(2026, 9, 24, tzinfo=UTC),
-                                archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC),
-                                post_cutoff=True)
-        sweep = dataclasses.replace(
-            _ex_sweep(cell_trades=[], st_trades={0.05: [], 0.2: [], 1.0: _flt_trades()[:2]}),
-            corpus_provenance=prov)
-        assert backtester.max_trades_simulated(sweep) == 0
-        page = _kc_page(monkeypatch, tmp_path, sweep)
-        assert ("this run entered trades (up to 2 in one simulated scenario), so that "
-                "verdict is stale") in page
-
     def test_a_same_title_simulation_failure_costs_only_the_same_title_rows(
             self, monkeypatch, tmp_path, caplog):
         # The size-cap sweep's same-title population cannot be simulated,
@@ -8452,7 +8442,7 @@ class TestExplorerCapAndMetrics:
                               label_coverage=_scn_coverage(),
                               scenarios=list(cells[0.75][0.2].values()))
         explorer = dashboard._ExplorerVisitor(source, sweep)
-        _, chunker, _, _ = dashboard._build_filter_grid(
+        _, chunker, _ = dashboard._build_filter_grid(
             source, trades, page_curve, 0.75, _FLT_START, 1000.0, _FLT_SERIES,
             explorer=explorer)
         row = _unpack(explorer.payload().blocks[0])["cells"][0][0][0]     # the late "all"
@@ -9236,29 +9226,10 @@ class TestTierOffAtEveryCap:
         assert all(len(row) == 1 and row[0] is not None for row in data["grid_off"][0])
         assert _KC_UNUSED_CLAUSE in page and _OFF_UNUSED_CLAUSE not in page
 
-    def test_max_trades_counts_the_off_points_at_every_cap(self):
-        sweep = _kc_sweep_tiers_capped()
-        big = [_kc_resized(_ftrade(f"KXBIG-{i}", "time_series", date(2026, 1, 13),
-                                   date(2026, 1, 16), 1.0), 1) for i in range(9)]
-        curve = backtester._build_equity_curve(big, _FLT_START, 1000.0)
-        off = sweep.tier_off_cap_sweep
-        off.points[(_KC_B0, 0.6, 1.0)] = SweepPoint(
-            k=0.6, trades=big, equity_df=curve, spread_band=_KC_B0, size_cap=1.0,
-            tier_floors=False)
-        assert backtester.max_trades_simulated(sweep) < 9
-        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
-                                        0.75)
-        _, _, counter, _ = dashboard._build_filter_grid(
-            source, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START, 1000.0,
-            _FLT_SERIES)
-        assert counter.most == 9 and not counter.failed
-
-    def test_a_count_the_off_fallback_drops_is_not_kept(self):
-        # The first off cell (k 0.6) holds 9 trades at no cap and is counted;
-        # the second raises. The walk then re-reads the off view from the
-        # family's eager points, which the page shows instead, so the 9 —
-        # a scenario the page no longer shows — is dropped with the rest of
-        # the off view (_MaxTrades.reset_off)
+    def test_an_off_fallback_keeps_the_tier_on_cap_axis(self):
+        # The first off cell (k 0.6) holds 9 trades at no cap; the second
+        # raises. The walk then re-reads the off view from the family's eager
+        # points, which the page shows instead, and keeps the tier-on caps
         sweep = _kc_sweep_tiers_capped(raise_on=(_KC_B0, 0.75))
         big = [_kc_resized(_ftrade(f"KXBIG-{i}", "time_series", date(2026, 1, 13),
                                    date(2026, 1, 16), 1.0), 1) for i in range(9)]
@@ -9267,14 +9238,10 @@ class TestTierOffAtEveryCap:
             spread_band=_KC_B0, size_cap=1.0, tier_floors=False)
         source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
                                         0.75)
-        walked, _, counter, _ = dashboard._build_filter_grid(
+        walked, _, _ = dashboard._build_filter_grid(
             source, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START, 1000.0,
             _FLT_SERIES)
         assert walked.off_cap_sweep is None and walked.cap_sweep is source.cap_sweep
-        most_eager = max(len(p.trades) for p in [*sweep.scenarios, *sweep.tier_off_scenarios])
-        assert counter.most == max(most_eager, max(
-            len(p.trades) for (_b, _k, _c), p in sweep.cap_sweep.points.items()))
-        assert counter.most < 9
 
     def test_the_labels_include_every_tier_off_cap_event(self):
         series = {**_FLT_SERIES, "KXSNOW": ("Climate", ("Snow",))}
@@ -9395,7 +9362,7 @@ def _ao_payload(sweep: BacktestSweep, state: str = "not simulated") -> tuple:
     builds them for a sweep, with the add-on state the page would pass."""
     trades, curve = sweep.primary.trades, sweep.primary.equity_df
     source = dashboard._grid_source(sweep, trades, curve, 0.75)
-    walked, chunker, _, kd = dashboard._build_filter_grid(
+    walked, chunker, kd = dashboard._build_filter_grid(
         source, trades, curve, 0.75, _FLT_START, 1000.0, _FLT_SERIES_TIERS)
     base = dashboard._filter_payload(walked, chunker, _FLT_START, 1000.0, _FLT_SERIES_TIERS,
                                      kd=kd.payload(), add_on_state=state)
@@ -9713,70 +9680,18 @@ class TestAddOnView:
         stripped = dataclasses.replace(source, add_cell=None, add_off_cell=None,
                                        add_cap_sweep=None, add_off_cap_sweep=None)
         with caplog.at_level(logging.WARNING):
-            _, chunker, counter, _ = dashboard._build_filter_grid(
+            _, chunker, _ = dashboard._build_filter_grid(
                 stripped, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START,
                 1000.0, _FLT_SERIES_TIERS)
         assert sweep.add_on_cap_sweep.reads == []
-        # No add-on phase ran: nothing was warned, packed or counted for it
+        # No add-on phase ran: nothing was warned or packed for it
         assert not [r for r in caplog.records if "Add to held" in r.getMessage()]
-        assert chunker.grid_add is None and counter._pre_add is None
-
-    # ─── The stale-cutoff verdict ─────────────────────────────────────────────
-
-    def test_the_busiest_scenario_counts_the_add_on_ones(self):
-        for sweep, most in ((_kc_sweep(), 3), (_kc_sweep_add_on(), 4)):
-            source = dashboard._grid_source(sweep, sweep.primary.trades,
-                                            sweep.primary.equity_df, 0.75)
-            _, _, counter, _ = dashboard._build_filter_grid(
-                source, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START,
-                1000.0, _FLT_SERIES_TIERS)
-            assert (counter.most, counter.failed) == (most, False)
-
-    def test_a_failed_add_on_cell_takes_its_count_back(self):
-        sweep = _kc_sweep_add_on(raise_on=(_KC_B1, 0.75))
-        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
-                                        0.75)
-        _, _, counter, _ = dashboard._build_filter_grid(
-            source, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START, 1000.0,
-            _FLT_SERIES_TIERS)
-        # The cells read before the raise held four trades; the page shows none
-        assert (counter.most, counter.failed) == (3, False)
-        assert counter._pre_add is None
-
-    def test_a_trade_only_an_add_on_scenario_made_makes_the_verdict_stale(
-            self, monkeypatch, tmp_path):
-        # A window stamped at or after the cutoff: no scenario of the run as
-        # simulated traded, but the add-on view's did — which disproves "no
-        # trade could be entered", so the header says that verdict is stale
-        empty = SweepPoint(k=0.75, trades=[], spread_band=_KC_B0, size_cap=0.2,
-                           equity_df=backtester._build_equity_curve([], _FLT_START, 1000.0))
-        traded = _kc_trades(5)
-        family = {(_KC_B0, 0.75, 0.2): SweepPoint(
-            k=0.75, trades=traded, spread_band=_KC_B0, size_cap=0.2, add_to_held=True,
-            equity_df=backtester._build_equity_curve(traded, _FLT_START, 1000.0))}
-        prov = CorpusProvenance(from_cache=True, assembled_at=datetime(2026, 9, 24, tzinfo=UTC),
-                                archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC),
-                                post_cutoff=True)
-        sweep = BacktestSweep(
-            primary=empty, points=[empty], calibration=None, label_coverage=_scn_coverage(),
-            corpus_provenance=prov,
-            cap_sweep=_FakeCapSweep({(_KC_B0, 0.75, 0.2): empty}, bands=(_KC_B0,), ks=(0.75,),
-                                    caps=(0.2,)),
-            add_on_cap_sweep=_FakeCapSweep(family, bands=(_KC_B0,), ks=(0.75,), caps=(0.2,)))
-        assert backtester.max_trades_simulated(sweep) == 0
-        page = _ao_page(monkeypatch, tmp_path, sweep)
-        assert ("this run entered trades (up to 3 in one simulated scenario), so that "
-                "verdict is stale") in page
-        assert "no trade could be entered in this window" not in page
-        # Without the family the eager points alone decide: the red banner
-        page = _ao_page(monkeypatch, tmp_path,
-                        dataclasses.replace(sweep, add_on_cap_sweep=None))
-        assert "no trade could be entered in this window whatever pairs formed" in page
+        assert chunker.grid_add is None
 
     # ─── What it never reaches ────────────────────────────────────────────────
 
     def test_only_the_bar_s_visitors_take_the_add_on_cells(self):
-        assert hasattr(dashboard._ChunkVisitor, "add") and hasattr(dashboard._MaxTrades, "add")
+        assert hasattr(dashboard._ChunkVisitor, "add")
         assert not hasattr(dashboard._ExplorerVisitor, "add")
         assert not hasattr(dashboard._KdVisitor, "add")
 
@@ -10296,6 +10211,676 @@ class TestAddOnEndToEnd:
         # Not vacuous: adding made trades of its own, and the run as simulated differs
         assert added > 0
         assert data["grid_add"] != data["grid"]
+
+
+# ─── Sell: every sell level of every scenario (sidecar chunks) ───────────────
+
+_SELL_UNREAD = ("The selling simulations could not be read; the filter bar's Sell select "
+                "stays disabled")
+_SELL_MISMATCH = "The selling simulations do not match the page's grid"
+
+
+def _sold(t: BacktestTrade, *, a: float | None = 0.81, b: float | None = 0.12,
+          day: date | None = None) -> BacktestTrade:
+    """t sold before it paid out: on `day` (the day before its exit, by
+    default), market A's leg at `a` and B's at `b` (None: that leg's market
+    paid out before the sale)."""
+    return dataclasses.replace(t, sold=True, sale_price_a=a, sale_price_b=b, sale_fees=0.02,
+                               exit_date=day or t.exit_date - timedelta(days=1))
+
+
+class _FakeSellSweep:
+    """
+    A backtester.SellSweep stand-in carrying what the dashboard reads of one:
+    levels, bands, off_bands, ks, caps, entry_events(), for_band() and
+    sold_cells().
+
+    `sold` maps (level, band, k, tier_floors, add_to_held, cap) to the point a
+    sell run at that level shows; a key it lacks is a level above every sale
+    of that cell (sold_cells yields None there: the run without selling).
+    `raise_on` makes the cells of one (band, tier_floors) raise when read, as a
+    failed simulation would; `reads` records every (band, k, tier_floors,
+    add_to_held, caps) read, shared by every narrowed copy.
+    """
+
+    def __init__(self, sold: dict, *, levels=(0.25, 0.5), bands=(_KC_B0, _KC_B1),
+                 ks=(0.6, 0.75), caps=(0.05, 0.2, 1.0), off_bands=(), raise_on=None,
+                 reads=None, events_raise=False):
+        self.sold, self.levels, self.bands, self.ks, self.caps = sold, levels, bands, ks, caps
+        self.off_bands, self.raise_on, self.events_raise = off_bands, raise_on, events_raise
+        self.reads = [] if reads is None else reads
+
+    def entry_events(self):
+        if self.events_raise:
+            raise RuntimeError("the entries could not be read")
+        return {(t.event_ticker, t.category) for p in self.sold.values() for t in p.trades}
+
+    def for_band(self, band, *, tier_floors=True):
+        return _FakeSellSweep(self.sold, levels=self.levels,
+                              bands=(band,) if tier_floors else (), ks=self.ks, caps=self.caps,
+                              off_bands=() if tier_floors else (band,),
+                              raise_on=self.raise_on, reads=self.reads)
+
+    def sold_cells(self, band, k, *, tier_floors=True, add_to_held=False, caps=None,
+                   stats=None):
+        caps = tuple(self.caps if caps is None else caps)
+        self.reads.append((band, k, tier_floors, add_to_held, caps))
+        if (band, tier_floors) == self.raise_on:
+            raise RuntimeError("the sell simulation failed")
+        if stats is not None:
+            stats["simulated"] = stats.get("simulated", 0) + 1
+        for level in self.levels:
+            yield level, {cap: self.sold.get((level, band, k, tier_floors, add_to_held, cap))
+                          for cap in caps}
+
+
+def _sl_point(band, k, cap, trades, *, tier_floors=True, add_to_held=False,
+              sell_at=0.25) -> SweepPoint:
+    """A sell run's "all" point over `trades`."""
+    return SweepPoint(k=k, trades=trades,
+                      equity_df=backtester._build_equity_curve(trades, _FLT_START, 1000.0),
+                      spread_band=band, size_cap=cap, tier_floors=tier_floors,
+                      add_to_held=add_to_held, sell_at=sell_at)
+
+
+def _kc_sweep_sell(base: BacktestSweep | None = None, *, raise_on=None,
+                   events_raise=False, event: str | None = None) -> BacktestSweep:
+    """
+    A size-cap sweep (_kc_sweep() unless `base`) plus a Sell family at two
+    levels, 25% and 50%.
+
+    At 25%: (_KC_B0, k 0.60) sells at the 20% and no-cap caps (one list, as
+    caps above a peak share one), its 5% cap is above every sale (the run
+    without selling); (_KC_B0, 0.75) sells at every cap — 5% its own list, 20%
+    and no cap one shared list; (_KC_B1, 0.75) sells at every cap, one list
+    (with `event`, filed under that event: a series no other scenario
+    trades). At 50%: only (_KC_B0, 0.75) at 20% and no cap sells, later and
+    lower. With an Add to held pairs family on `base`, (_KC_B0, 0.75)'s add-on
+    cells sell at 25% too; with a tier-floors-off family, the binding band
+    (_KC_B0)'s run with the tiers off sells at 25% at the run's own cap.
+    """
+    sweep = base or _kc_sweep()
+    points = {key: (p["all"] if isinstance(p, dict) else p)
+              for key, p in sweep.cap_sweep.points.items()}
+    full = points[(_KC_B0, 0.75, 0.2)].trades
+    small = points[(_KC_B0, 0.75, 0.05)].trades
+    other = points[(_KC_B1, 0.75, 0.2)].trades
+    at_060 = [_sold(points[(_KC_B0, 0.6, 0.2)].trades[0]),
+              *points[(_KC_B0, 0.6, 0.2)].trades[1:]]
+    sold_small = [_sold(small[0]), *small[1:]]
+    sold_full = [_sold(full[0]), *full[1:]]
+    late = [_sold(full[0], a=0.9, b=None), _sold(full[1], a=0.7, b=0.2), *full[2:]]
+    sold_other = [_sold(other[0])] if event is None else [
+        dataclasses.replace(_sold(other[0]), event_ticker=event, ticker_a=f"{event}-A"),
+        *other[1:]]
+    sold = {}
+    for cap in (0.2, 1.0):
+        sold[(0.25, _KC_B0, 0.6, True, False, cap)] = _sl_point(_KC_B0, 0.6, cap, at_060)
+        sold[(0.25, _KC_B0, 0.75, True, False, cap)] = _sl_point(_KC_B0, 0.75, cap, sold_full)
+        sold[(0.5, _KC_B0, 0.75, True, False, cap)] = _sl_point(_KC_B0, 0.75, cap, late,
+                                                                sell_at=0.5)
+    sold[(0.25, _KC_B0, 0.75, True, False, 0.05)] = _sl_point(_KC_B0, 0.75, 0.05, sold_small)
+    for cap in (0.05, 0.2, 1.0):
+        sold[(0.25, _KC_B1, 0.75, True, False, cap)] = _sl_point(_KC_B1, 0.75, cap, sold_other)
+    if sweep.add_on_cap_sweep is not None:
+        added = sweep.add_on_cap_sweep.points[(_KC_B0, 0.75, 0.2)].trades
+        sold_added = [_sold(added[0]), *added[1:]]
+        for cap in (0.05, 0.2, 1.0):
+            sold[(0.25, _KC_B0, 0.75, True, True, cap)] = _sl_point(
+                _KC_B0, 0.75, cap, sold_added, add_to_held=True)
+    off_bands = ()
+    if sweep.tier_off_scenarios:
+        off_bands = (_KC_B0,)
+        off = sweep.tier_off_scenarios[0].trades
+        sold[(0.25, _KC_B0, 0.75, False, False, 0.2)] = _sl_point(
+            _KC_B0, 0.75, 0.2, [_sold(off[0]), *off[1:]], tier_floors=False)
+    family = _FakeSellSweep(sold, off_bands=off_bands, raise_on=raise_on,
+                            events_raise=events_raise)
+    return dataclasses.replace(sweep, sell_sweep=family)
+
+
+def _sl_page(monkeypatch, tmp_path, sweep, series=_FLT_SERIES_TIERS) -> str:
+    """A whole page of a sweep, written to tmp_path with its sidecar folder."""
+    return TestFilterPage()._page(monkeypatch, tmp_path, sweep, series)
+
+
+def _sl_build(sweep: BacktestSweep, folder: Path, *, workers: int = 1) -> tuple:
+    """(the grid walked, the chunk visitor, the Sell grid) as generate_dashboard
+    builds them for a sweep, the sidecar files written to `folder`."""
+    trades, curve = sweep.primary.trades, sweep.primary.equity_df
+    source = dashboard._grid_source(sweep, trades, curve, 0.75)
+    walked, chunker, _kd = dashboard._build_filter_grid(
+        source, trades, curve, 0.75, _FLT_START, 1000.0, _FLT_SERIES_TIERS)
+    folder.mkdir(parents=True, exist_ok=True)
+    grid = dashboard._build_sell_grid(walked, chunker, start_date=_FLT_START,
+                                      initial_balance=1000.0,
+                                      series_categories=_FLT_SERIES_TIERS, risk_free=None,
+                                      folder=folder, workers=workers)
+    return walked, chunker, grid
+
+
+def _sl_file(folder: Path, chunk_id: int) -> dict:
+    """One sidecar chunk file, decoded strictly."""
+    text = (folder / f"chunk-{chunk_id}.js").read_text(encoding="utf-8")
+    return _decode_block(_SIDECAR_CALL.fullmatch(text).group(1))
+
+
+# The _kc grid's Sell view at each level (tier floors on, adding off): the
+# page's own chunks (_KC_GRID: 0-4) where a level is above every sale, new
+# sidecar chunks (5 on) where it sells, numbered in task order — band 0.0-1
+# first, its k 0.60 then 0.75, each level in turn, caps ascending
+_SL_GRIDS = [[[[3, 5, 5], [6, 7, 7]], [[None, None, None], [9, 9, 9]]],
+             [[[3, 2, 2], [1, 8, 8]], [[None, None, None], [4, 4, 4]]]]
+
+
+class TestSellGrid:
+    """The bar's Sell view built after the walk: every sell level of every
+    cell the page shows, a level above every sale its scenario's own chunk, a
+    new trade list a sidecar file numbered after the page's own chunks, and a
+    failure costing its band's cells alone."""
+
+    def test_the_family_joins_a_grid_it_fits(self):
+        sweep = _kc_sweep_sell(event="KXRAIN-9")
+        source = dashboard._grid_source(sweep, sweep.primary.trades,
+                                        sweep.primary.equity_df, 0.75)
+        assert source.sell is sweep.sell_sweep
+        # Every event a sell run trades under is listed before anything is simulated
+        assert ("KXRAIN-9", "Other") in source.events
+        # The cap-axis fallback keeps it: its one cap is among the family's
+        assert source.fallback().sell is sweep.sell_sweep
+
+    def test_a_family_that_does_not_fit_or_cannot_be_read_is_set_aside(self, caplog):
+        sweep = _kc_sweep_sell()
+        trades, curve = sweep.primary.trades, sweep.primary.equity_df
+        other = dataclasses.replace(sweep, sell_sweep=_FakeSellSweep({}, ks=(0.75,)))
+        with caplog.at_level(logging.WARNING):
+            assert dashboard._grid_source(other, trades, curve, 0.75).sell is None
+        assert any(_SELL_MISMATCH in r.getMessage() for r in caplog.records)
+        caplog.clear()
+        unread = dataclasses.replace(sweep, sell_sweep=_FakeSellSweep({}, events_raise=True))
+        with caplog.at_level(logging.WARNING):
+            assert dashboard._grid_source(unread, trades, curve, 0.75).sell is None
+        assert any(_SELL_UNREAD in r.getMessage() for r in caplog.records)
+
+    def test_every_level_maps_each_cell_to_its_chunk(self, tmp_path):
+        walked, chunker, grid = _sl_build(_kc_sweep_sell(), tmp_path / "f")
+        assert chunker.grid == _KC_GRID and len(chunker.chunks) == 5
+        assert [level[0][0] for level in grid.grid] == _SL_GRIDS
+        # Without the tier-floors-off or the add-on view, those grids are null
+        assert all(level[0][1] is None and level[1] == [None, None] for level in grid.grid)
+        assert grid.sidecars == 5
+        assert sorted(p.name for p in (tmp_path / "f").iterdir()) == [
+            f"chunk-{i}.js" for i in range(5, 10)]
+        assert [(e["label"], e["phrase"], e["value"]) for e in grid.levels] == [
+            ("sell at 25% of potential profit",
+             ", selling each position at 25% of its potential profit", 0.25),
+            ("sell at 50% of potential profit",
+             ", selling each position at 50% of its potential profit", 0.5)]
+        # Each band's cells were read once per k it shows, adding off, every cap
+        # at once; band 0.3-0.6 shows no cell at k 0.60, so it was not read there
+        assert walked.sell.reads == [(_KC_B0, 0.6, True, False, (0.05, 0.2, 1.0)),
+                                     (_KC_B0, 0.75, True, False, (0.05, 0.2, 1.0)),
+                                     (_KC_B1, 0.75, True, False, (0.05, 0.2, 1.0))]
+
+    def test_a_sidecar_chunk_is_the_list_s_own_payload(self, tmp_path):
+        sweep = _kc_sweep_sell()
+        walked, chunker, _grid = _sl_build(sweep, tmp_path / "f")
+        point = sweep.sell_sweep.sold[(0.25, _KC_B0, 0.75, True, False, 0.2)]
+        strings, heads = dashboard._StringTable(), dashboard._StringTable()
+        expected = dashboard._list_payload(
+            point.trades, point.equity_df, chunker.axis, _FLT_START, 1000.0,
+            _FLT_SERIES_TIERS, 0.75, chunker.cat_index, chunker.sub_index, strings,
+            heads=heads)
+        chunk = _sl_file(tmp_path / "f", 7)
+        assert chunk == json.loads(dashboard._strict_json(
+            {"list": expected, "strings": strings.items, "heads": heads.items}))
+        # Its rows' heads are its own, and name the sale
+        assert any("sold on" in head for head in chunk["heads"])
+
+    def test_the_add_on_and_tier_off_views_are_covered(self, tmp_path):
+        sweep = _kc_sweep_sell(_kc_sweep_add_on(_kc_sweep_tiers()))
+        walked, chunker, grid = _sl_build(sweep, tmp_path / "f")
+        off, add, add_off = chunker.off_grid(), chunker.add_grid(), chunker.add_off_grid()
+        assert None not in (off, add, add_off)
+        level = grid.grid[0]
+        # Adding on: the add-on cells that sell are new chunks; the rest are the
+        # add-on view's own chunks
+        assert level[0][1][0][1] != add[0][1] and level[0][1][0][1][0] not in _ao_ids(add)
+        assert level[0][1][0][0] == add[0][0]
+        # Tier floors off: the binding band's own cell that sells is new, its
+        # other cells (the family is at the run's own cap) stay the off view's;
+        # the band the tiers never bind at shows its tier-on Sell rows
+        assert level[1][0][0][1][1] not in _ao_ids(off)
+        assert level[1][0][0][1][0] == off[0][1][0] and level[1][0][0][0] == off[0][0]
+        assert level[1][0][1] == level[0][0][1]
+        assert level[1][1][1] == level[0][1][1]
+        # With both, the binding band's tier-off add-on cells never sell here:
+        # each is the base grid's own chunk
+        assert level[1][1][0] == add_off[0]
+        assert (_KC_B0, 0.75, False, False, (0.05, 0.2, 1.0)) not in walked.sell.reads
+        assert (_KC_B0, 0.75, False, False, (0.2,)) in walked.sell.reads
+
+    def test_a_failed_band_costs_its_own_cells(self, tmp_path, caplog):
+        sweep = _kc_sweep_sell(raise_on=(_KC_B1, True))
+        with caplog.at_level(logging.WARNING):
+            _walked, _chunker, grid = _sl_build(sweep, tmp_path / "f")
+        warnings_ = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings_ == ["The Sell select's simulations at spread band 0.3-0.6 failed; "
+                             "selling is not shown there"]
+        assert [level[0][0][0] for level in grid.grid] == [g[0] for g in _SL_GRIDS]
+        assert all(level[0][0][1] == [[None] * 3, [None] * 3] for level in grid.grid)
+        assert grid.sidecars == 4
+
+    def test_no_sale_anywhere_writes_no_file(self, tmp_path):
+        sweep = dataclasses.replace(_kc_sweep(), sell_sweep=_FakeSellSweep({}))
+        _walked, chunker, grid = _sl_build(sweep, tmp_path / "f")
+        # Every level is above every sale: every cell is the page's own chunk
+        assert all(level[0][0] == chunker.grid for level in grid.grid)
+        assert grid.sidecars == 0 and list((tmp_path / "f").iterdir()) == []
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_worker_processes_build_what_the_parent_builds(self, monkeypatch, tmp_path):
+        run = TestSellEndToEnd._run(monkeypatch)
+        pages = {}
+        for workers in (1, 2):
+            root = tmp_path / f"w{workers}"
+            root.mkdir()
+            monkeypatch.setattr(dashboard, "PROJECT_ROOT", root)
+            monkeypatch.setattr(dashboard.yf, "download",
+                                lambda *a, **k: (_ for _ in ()).throw(RuntimeError("off")))
+            page = dashboard.generate_dashboard(
+                run.primary.trades, run.primary.equity_df, TestSellEndToEnd._START, 10_000.0,
+                sweep=run, sell_workers=workers).read_text(encoding="utf-8")
+            pages[workers] = (TestFilterPage._data(page), TestFilterPage._chunks(page),
+                              _sidecar_files(page, root))
+        (d1, c1, f1), (d2, c2, f2) = pages[1], pages[2]
+        assert d1["grid_sell"] == d2["grid_sell"] and d1["inline_chunks"] == d2["inline_chunks"]
+        assert c1 == c2
+        # The same files under the same names, whichever worker wrote each
+        names = {src.rsplit("/", 1)[1]: chunk for src, chunk in f1.items()}
+        assert names == {src.rsplit("/", 1)[1]: chunk for src, chunk in f2.items()}
+        assert len(names) > 0
+
+
+def _sl_flat_base(data: dict, t: int, a: int) -> list:
+    """Every chunk id the base view of a Tier floors and Add to held pairs
+    choice names, flattened."""
+    grid = {(0, 0): data["grid"], (1, 0): data["grid_off"], (0, 1): data["grid_add"],
+            (1, 1): data["grid_add_off"]}[(t, a)]
+    return [c for band in grid for row in band for c in row]
+
+
+class TestSellPage:
+    """The Sell select on a whole page: rendered shut, with its levels and, on a
+    page without the view, the note saying why; the base block's view; and
+    the page's own header and chunks unchanged."""
+
+    def test_the_select_lists_no_selling_then_every_level(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        select = re.search(r'<select id="flt-sell"([^>]*)>(.*?)</select>', page)
+        assert " disabled" in select.group(1)
+        assert html.unescape(re.search(r'title="([^"]*)"', select.group(1)).group(1)) == \
+            dashboard._SELL_SELECT_TITLE
+        assert re.findall(r'<option value="([^"]*)"( selected)?>(.*?)</option>',
+                          select.group(2)) == [
+            ("none", " selected", "no selling"), ("0", "", "sell at 25% of potential profit"),
+            ("1", "", "sell at 50% of potential profit")]
+        assert 'id="flt-sell-note"' not in page
+        data = TestFilterPage._data(page)
+        assert data["sell_state"] == "shown" and len(data["grid_sell"]) == 2
+        assert data["inline_chunks"] == 5
+        assert data["sidecar_dir"].startswith(f"{config.DASHBOARD_FILES_DIRNAME}/")
+        assert sorted(_sidecar_files(page, tmp_path)) == [
+            f"{data['sidecar_dir']}/chunk-{i}.js" for i in range(5, 10)]
+        # The summary's closing sentence says what the choice reaches
+        assert data["text"]["unfiltered"].endswith(" " + dashboard._SELL_REACH_NO_EXPLORER)
+
+    def test_a_page_without_the_view_says_why(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep())
+        assert re.search(r'<span id="flt-sell-note"[^>]*>([^<]*)</span>', page).group(1) == \
+            "(not simulated in this backtest)"
+        data = TestFilterPage._data(page)
+        assert (data["grid_sell"], data["sell_levels"], data["sell_state"],
+                data["sidecar_dir"]) == (None, [], "not simulated", None)
+        assert dashboard._SELL_REACH_NO_EXPLORER not in data["text"]["unfiltered"]
+        assert not (tmp_path / config.DASHBOARD_FILES_DIRNAME).exists()
+        unfit = dataclasses.replace(_kc_sweep(), sell_sweep=_FakeSellSweep({}, ks=(0.75,)))
+        page = _sl_page(monkeypatch, tmp_path, unfit)
+        assert re.search(r'<span id="flt-sell-note"[^>]*>([^<]*)</span>', page).group(1) == \
+            "(not available on this page; see the log)"
+
+    def test_the_page_s_own_data_is_unchanged_by_the_view(self, monkeypatch, tmp_path):
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        with_view = TestFilterPage._chunks(_sl_page(monkeypatch, tmp_path / "a",
+                                                    _kc_sweep_sell()))
+        without = TestFilterPage._chunks(_sl_page(monkeypatch, tmp_path / "b", _kc_sweep()))
+        assert with_view == without
+
+
+class TestSidecarFolders:
+    """Each build's sidecar folder: made beside the page, published with it,
+    and every earlier build's deleted — never one another build is still
+    writing, and never the folder of the page in place."""
+
+    @staticmethod
+    def _folders(root: Path) -> list[str]:
+        files = root / config.DASHBOARD_FILES_DIRNAME
+        return sorted(p.name for p in files.iterdir() if p.is_dir()) if files.exists() else []
+
+    def test_a_build_replaces_the_last_build_s_folder(self, monkeypatch, tmp_path):
+        first = TestFilterPage._data(_sl_page(monkeypatch, tmp_path, _kc_sweep_sell()))
+        second = TestFilterPage._data(_sl_page(monkeypatch, tmp_path, _kc_sweep_sell()))
+        assert first["sidecar_dir"] != second["sidecar_dir"]
+        assert self._folders(tmp_path) == [second["sidecar_dir"].split("/")[1]]
+        # Published: no longer marked as being written
+        assert not (tmp_path / second["sidecar_dir"] / ".writing").exists()
+
+    def test_a_build_still_being_written_is_kept_and_a_stale_one_deleted(
+            self, monkeypatch, tmp_path):
+        files = tmp_path / config.DASHBOARD_FILES_DIRNAME
+        (files / "other-build").mkdir(parents=True)
+        (files / "other-build" / ".writing").write_text("", encoding="utf-8")
+        (files / "crashed").mkdir()
+        (files / "crashed" / ".writing").write_text("", encoding="utf-8")
+        old = (datetime.now(UTC) - timedelta(seconds=config.DASHBOARD_BUILD_STALE_SECONDS + 60))
+        os.utime(files / "crashed" / ".writing", (old.timestamp(), old.timestamp()))
+        (files / "finished").mkdir()
+        data = TestFilterPage._data(_sl_page(monkeypatch, tmp_path, _kc_sweep_sell()))
+        assert self._folders(tmp_path) == sorted(["other-build",
+                                                  data["sidecar_dir"].split("/")[1]])
+
+    def test_a_page_without_the_view_deletes_the_folders_no_page_reads(
+            self, monkeypatch, tmp_path):
+        _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        assert len(self._folders(tmp_path)) == 1
+        _sl_page(monkeypatch, tmp_path, _kc_sweep())
+        assert self._folders(tmp_path) == []
+
+    def test_a_failed_page_keeps_the_last_page_and_its_folder(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        kept = self._folders(tmp_path)
+
+        def fail(*_a, **_k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(dashboard, "_publish_page", fail)
+        with pytest.raises(OSError, match="disk full"):
+            _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        assert (tmp_path / config.DASHBOARD_FILENAME).read_text(encoding="utf-8") == page
+        assert self._folders(tmp_path) == kept
+
+    def test_a_cleanup_failure_after_the_rename_keeps_the_new_page_s_folder(
+            self, monkeypatch, tmp_path, caplog):
+        # Another build's folder whose mark cannot be read (made by another
+        # user, say): the page is already in place when the cleanup meets it,
+        # so the cleanup must neither raise nor cost the new page its folder
+        files = tmp_path / config.DASHBOARD_FILES_DIRNAME
+        (files / "foreign").mkdir(parents=True)
+        (files / "foreign" / ".writing").write_text("", encoding="utf-8")
+        real_stat = Path.stat
+
+        def stat(self, *args, **kwargs):
+            if self.name == ".writing" and self.parent.name == "foreign":
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+        with caplog.at_level(logging.WARNING):
+            data = TestFilterPage._data(_sl_page(monkeypatch, tmp_path, _kc_sweep_sell()))
+        assert (tmp_path / data["sidecar_dir"]).is_dir()
+        assert list((tmp_path / data["sidecar_dir"]).glob("chunk-*.js"))
+        # Its mark unread, the other build's folder is kept
+        assert self._folders(tmp_path) == sorted(["foreign", data["sidecar_dir"].split("/")[1]])
+        assert any("Could not check or delete an earlier dashboard build" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_a_lock_that_cannot_be_taken_still_publishes_the_page(
+            self, monkeypatch, tmp_path, caplog):
+        # A run without the Sell family on a filesystem whose locks fail,
+        # after an earlier build left its folder: the page is still replaced,
+        # as it always was before these folders existed, and nothing is deleted
+        _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        kept = self._folders(tmp_path)
+        assert kept
+
+        def boom(*_args, **_kwargs):
+            raise OSError(37, "No locks available")
+
+        monkeypatch.setattr(dashboard.fcntl, "flock", boom)
+        (tmp_path / config.DASHBOARD_FILENAME).write_text("old page", encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            page = _sl_page(monkeypatch, tmp_path, _kc_sweep())
+        assert page != "old page" and "flt-bar" in page
+        assert self._folders(tmp_path) == kept
+        assert any("Could not take the dashboard builds' lock" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_a_failed_sell_build_leaves_no_folder(self, monkeypatch, tmp_path, caplog):
+        def fail(*_a, **_k):
+            raise RuntimeError("the pool could not start")
+
+        monkeypatch.setattr(dashboard, "_run_sell_tasks", fail)
+        with caplog.at_level(logging.WARNING):
+            page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        assert any("The Sell select could not be built" in r.getMessage()
+                   for r in caplog.records)
+        assert TestFilterPage._data(page)["sell_state"] == "unavailable"
+        assert self._folders(tmp_path) == []
+
+
+class TestSoldTradeRow:
+    """A trade sold before it paid out: its row names each leg's sale (or the
+    payout of a leg whose market paid out first) beside how it settled; every
+    other row is unchanged."""
+
+    def test_a_sold_trade_names_its_sales(self):
+        t = _flt_trades()[2]
+        sold = _sold(t, a=0.81, b=None)
+        head = dashboard._trade_row_head(sold, "#fff")
+        assert (f"A: sold on {dashboard._fmt_day(sold.exit_date)} at $0.81 (settled "
+                f"<b>{sold.outcome_a.upper()}</b> on {dashboard._fmt_day(sold.settled_date_a)})"
+                in head)
+        assert (f"B: settled <b>{sold.outcome_b.upper()}</b> on "
+                f"{dashboard._fmt_day(sold.settled_date_b)}") in head
+        assert "before the sale" in head
+        # Not sold: the row is the one it always was
+        assert "sold on" not in dashboard._trade_row_head(t, "#fff")
+        assert dashboard._trade_row_head(dataclasses.replace(sold, sold=False), "#fff") == \
+            dashboard._trade_row_head(dataclasses.replace(t, exit_date=sold.exit_date,
+                                                          sale_price_a=0.81), "#fff")
+
+
+class TestSellScript:
+    """The bar's Sell select under the page script (run outside a browser):
+    enabled only with the view and set back to no selling on load; a level
+    loads its sidecar file (or the page's own chunk, where the level is above
+    every sale), words the scenario with Python's phrase and note, shows the
+    chunk's own row heads and keeps Save disabled; a file that cannot be
+    loaded, or hands nothing over, puts the choice back in Python's words.
+    The harness's "wait" does not wait on flt-sell (a page without the view
+    keeps it shut), so setup_js adds it. Skipped without a JavaScript
+    runtime."""
+
+    WAIT = "__BAR.push('flt-sell');"
+
+    @classmethod
+    def _run(cls, tmp_path, page, steps, **kwargs) -> dict:
+        """_run_script over a page and its sidecar files, waiting on the Sell select."""
+        return _run_script(tmp_path, page, steps, setup_js=cls.WAIT + kwargs.pop("js", ""),
+                           files_root=tmp_path, **kwargs)
+
+    def test_the_select_is_enabled_only_with_the_view(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        snaps = self._run(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
+                          strict=True, pre=(("flt-sell", "1"),))
+        assert snaps["loaded"]["selects"]["flt-sell"]["disabled"] is True
+        ready = snaps["ready"]["selects"]["flt-sell"]
+        # A browser's restored choice is set back to the page as rendered
+        assert ready["disabled"] is False and ready["value"] == "none"
+        assert snaps["ready"]["files"] == []
+        bare = _sl_page(monkeypatch, tmp_path, _kc_sweep())
+        snap = _run_script(tmp_path, bare, [
+            ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
+            ["snap", "s"]], strict=True, files_root=tmp_path)["s"]
+        assert snap["selects"]["flt-sell"]["disabled"] is True
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0"] and snap["files"] == []
+
+    def test_a_level_loads_its_file_and_words_the_scenario(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        data = TestFilterPage._data(page)
+        files = _sidecar_files(page, tmp_path)
+        cid = data["grid_sell"][0][0][0][0][1][1]
+        assert cid == 7
+        src = f"{data['sidecar_dir']}/chunk-{cid}.js"
+        scenario = _phrase(data, 0, 1, 1) + data["sell_levels"][0]["phrase"]
+        steps = [["wait"], ["click", "flt-save"], ["snap", "before"],
+                 ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["snap", "loading"],
+                 ["settle"], ["snap", "sold"], ["click", "flt-save"], ["snap", "clicked"],
+                 ["set", "flt-sell", "none"], ["fire", "flt-sell"], ["settle"],
+                 ["snap", "none"]]
+        js = ("var __probe = document.getElementById('probe');"
+              "window.dashScenarioSelect = function() {"
+              " __probe.textContent = JSON.stringify(Array.prototype.slice.call(arguments)); };")
+        snaps = self._run(tmp_path, page, steps, js=js)
+        assert snaps["loading"]["text"]["flt-summary"] == data["text"]["loading"].format(
+            scenario=scenario)
+        snap = snaps["sold"]
+        assert snap["files"] == [src] and snap["inflated"] == ["dash-data", "dash-chunk-0"]
+        assert {r["id"] for r in snap["reacts"]} == _charts_redrawn()
+        view = files[src]["list"]["views"]["all"]
+        text = dashboard._filter_summary_text(data["text"], scenario, False, None, view["n"],
+                                              view["n"], note="other_run")
+        note = dashboard._SELL_SUMMARY_NOTE
+        assert snap["text"]["flt-summary"] == text.replace(
+            data["text"]["unfiltered"], note + data["text"]["unfiltered"])
+        # The trade tables join the chunk's own heads with its tails
+        best = files[src]
+        assert snap["html"]["diag-best"] == "".join(
+            best["heads"][h] + best["strings"][t] for h, t in view["best"])
+        assert "sold on" in snap["html"]["diag-best"]
+        # Live trading never sells: nothing to save while a level is shown
+        assert snap["buttons"]["flt-save"] is True and snaps["clicked"]["opened"] == []
+        # The explorer is told the scenario with four labels, never the level
+        assert len(json.loads(snap["text"]["probe"])) == 4
+        # Back to no selling: the page's own chunk, nothing loaded again, Save on
+        none = snaps["none"]
+        assert none["files"] == [src] and none["buttons"]["flt-save"] is False
+        assert dashboard._SELL_SUMMARY_NOTE not in none["text"]["flt-summary"]
+
+    def test_a_level_above_every_sale_shows_the_page_s_own_chunk(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        data = TestFilterPage._data(page)
+        # k 0.60 at the 5% cap: no sale at 25%, so the run without selling (chunk 3)
+        assert data["grid_sell"][0][0][0][0][0][0] == data["grid"][0][0][0] == 3
+        steps = [["wait"], ["set", "flt-k", "0"], ["set", "flt-cap", "0"],
+                 ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"], ["snap", "s"]]
+        snap = self._run(tmp_path, page, steps, strict=True)["s"]
+        assert snap["files"] == []
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-chunk-3"]
+        assert data["sell_levels"][0]["phrase"] in snap["text"]["flt-summary"]
+
+    def test_a_file_that_cannot_be_loaded_puts_the_choice_back(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        data = TestFilterPage._data(page)
+        src = f"{data['sidecar_dir']}/chunk-7.js"
+        steps = [["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
+                 ["snap", "s"]]
+        failed = _phrase(data, 0, 1, 1) + data["sell_levels"][0]["phrase"]
+        for kwargs, template in (({"files_missing": (src,)}, "sidecar_missing"),
+                                 ({"files_empty": (src,)}, "sidecar_empty")):
+            snap = self._run(tmp_path, page, steps, strict=True, **kwargs)["s"]
+            reason = "Error: " + data["text"][template].format(file=src)
+            assert snap["text"]["flt-summary"] == data["text"]["unavailable"].format(
+                failed=failed, reason=reason, scenario=_phrase(data, 0, 1, 1))
+            assert snap["selects"]["flt-sell"]["value"] == "none"
+            assert snap["files"] == [src]
+            assert snap["buttons"]["flt-save"] is False
+
+    def test_a_later_choice_supersedes_a_file_still_loading(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        data = TestFilterPage._data(page)
+        src = f"{data['sidecar_dir']}/chunk-7.js"
+        steps = [["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
+                 ["snap", "loading"], ["set", "flt-sell", "1"], ["fire", "flt-sell"],
+                 ["settle"], ["resolve_file", src], ["snap", "s"]]
+        snaps = self._run(tmp_path, page, steps, strict=True, files_deferred=(src,))
+        assert snaps["loading"]["pendingFiles"] == [src]
+        snap = snaps["s"]
+        # The later level (50%) is what is drawn
+        later = f"{data['sidecar_dir']}/chunk-8.js"
+        assert snap["files"] == [src, later]
+        assert data["sell_levels"][1]["phrase"] in snap["text"]["flt-summary"]
+        assert snap["selects"]["flt-sell"]["value"] == "1"
+
+
+class TestSellEndToEnd:
+    """A real run_backtest_sweep with the Sell family, over the backtester's
+    selling golden fixture narrowed to one band and one k, rendered through
+    generate_dashboard: every level's chunk at every cap is what a fresh
+    simulation selling at that level produces — a sidecar file where it
+    sells, the page's own chunk where it does not."""
+
+    _START = _tb.TestPrepareEntriesGolden._START
+
+    @staticmethod
+    def _run(monkeypatch) -> BacktestSweep:
+        """The selling golden fixture through run_backtest_sweep with every family on."""
+        golden = _tb._SellingGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_LEVELS", (0.05, 0.25, 0.5, 1.0))
+        return backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), golden._START, 10_000.0, same_event_ladders=True,
+            interval_discount=0.5, band_sweep=True, tier_off_sweep=True, cap_sweep=True,
+            add_on_sweep=True, sell_sweep=True)
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_every_level_pages_its_own_simulation(self, monkeypatch, tmp_path):
+        run = self._run(monkeypatch)
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        page = dashboard.generate_dashboard(
+            run.primary.trades, run.primary.equity_df, self._START, 10_000.0,
+            sweep=run).read_text(encoding="utf-8")
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        files = {int(src.rsplit("-", 1)[1][:-3]): chunk
+                 for src, chunk in _sidecar_files(page, tmp_path).items()}
+        sell, band = run.sell_sweep, (0.0, 1.0)
+        end = run.primary.equity_df["date"].iloc[-1]
+        sold = shared = 0
+        for tier_floors in (True, False):
+            entries = (sell.entries_by_band if tier_floors else sell.off_entries_by_band)[band]
+            t = 0 if tier_floors else 1
+            for add_to_held in (False, True):
+                a = 1 if add_to_held else 0
+                for li, level in enumerate(sell.levels):
+                    for ci, cap in enumerate(sell.caps):
+                        cid = data["grid_sell"][li][t][a][0][0][ci]
+                        assert cid is not None
+                        fresh = backtester._simulate_at_discount(
+                            entries, self._START, 10_000.0, k=0.5, spread_band=band,
+                            size_cap=cap, quiet=True, end_date=end, tier_floors=tier_floors,
+                            add_to_held=add_to_held, sell_at=level)
+                        chunk = files[cid] if cid >= data["inline_chunks"] else chunks[cid]
+                        view = chunk["list"]["views"]["all"]
+                        kpis = dashboard._performance_kpis(fresh.equity_df, fresh.trades,
+                                                           10_000.0)
+                        assert view["kpi"] == {key: value for key, _, value, _ in kpis}, (
+                            tier_floors, add_to_held, level, cap)
+                        assert view["n"] == len(fresh.trades)
+                        if any(tr.sold for tr in fresh.trades):
+                            assert cid >= data["inline_chunks"]
+                            sold += 1
+                        else:
+                            # Above every sale: the scenario's own chunk
+                            assert cid == _sl_flat_base(data, t, a)[ci]
+                            shared += 1
+        # Not vacuous either way
+        assert sold > 0 and shared > 0
 
 
 class TestExplorerFullGrid:

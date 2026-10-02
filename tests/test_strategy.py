@@ -1919,10 +1919,20 @@ class TestTimeSeriesKellyParity:
         # leave nothing to check), and so do the one reader and the truncator
         assert writer in found and reader in found and truncator in found
         # ... the count line, the Kelly gate, the excluding-top-event check and
-        # the cap sweep's event census read the Mondays through that reader ...
+        # the sweeps' event census read the Mondays through that reader ...
         for function in ("_log_qualifying_mondays", "_simulate_at_discount",
-                         "_ex_top_event", "entry_events"):
+                         "_ex_top_event", "_entry_events"):
             assert _function_calls(backtester, function, "_entry_mondays"), function
+        # ... the census being _entry_events, which every sweep's
+        # entry_events (the size-cap family's and the sell family's) calls
+        census_readers = [
+            node for node in ast.walk(ast.parse(inspect.getsource(backtester)))
+            if isinstance(node, ast.FunctionDef) and node.name == "entry_events"]
+        assert len(census_readers) == 2
+        for node in census_readers:
+            assert any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                       and sub.func.id == "_entry_events"
+                       for sub in ast.walk(node)), node.lineno
         # ... and the two first-Monday readers never call it
         assert not _function_calls(backtester, "_interval_calibration", "_entry_mondays")
         assert not _function_calls(backtester, "_split_date", "_entry_mondays")
@@ -2908,6 +2918,28 @@ class TestTimeSeriesKellyParity:
         # value and the held stake (pinned in detail by
         # _backtest_add_on_problems)
         assert _function_calls(backtester, "_simulate_at_discount", "_open_value")
+        # Selling early: a leg's bid and paid-out marker are read in one
+        # place, _trade_sale_value, which a sale reaches only through
+        # _position_sale_value — and the walk's sales and the shortcut that
+        # replays them (_highest_sale_level) both decide through _sells_at,
+        # so the shortcut tests exactly the rule the walk applies
+        sale_readers: dict[str, set] = {"bid_at_checkpoint": set(), "paid_at_checkpoint": set()}
+        for func in ast.walk(tree):
+            if isinstance(func, ast.FunctionDef):
+                for sub in ast.walk(func):
+                    if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                            and sub.func.attr in sale_readers):
+                        sale_readers[sub.func.attr].add(func.name)
+        assert sale_readers == {"bid_at_checkpoint": {"_trade_sale_value"},
+                                "paid_at_checkpoint": {"_trade_sale_value"}}
+        assert _function_calls(backtester, "_position_sale_value", "_trade_sale_value")
+        for func in ("_simulate_at_discount", "_position_sells", "_highest_sale_level"):
+            assert _function_calls(backtester, func, "_sells_at"), func
+        for func in ("_simulate_at_discount", "_position_sells", "_highest_sale_level"):
+            assert _function_calls(backtester, func, "_position_sale_value"), func
+        assert _function_calls(backtester, "_simulate_at_discount", "_position_sells")
+        for func in ("_simulate_at_discount", "_highest_sale_level"):
+            assert _function_calls(backtester, func, "_positions"), func
 
     def test_ast_the_backtest_sizes_add_ons_on_the_checkpoint_value(self):
         # backtester._simulate_at_discount: each Monday's portfolio value is

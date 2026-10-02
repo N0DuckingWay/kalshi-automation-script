@@ -8,28 +8,29 @@ Purpose:
     arguments (--start-date, --balance, --no-cache, --max-horizon-days,
     --interval-discount, --no-sweep, --same-event-ladders /
     --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
-    --no-cap-sweep, --no-add-on-sweep), configures logging to
-    kalshi_backtest.log, constructs the necessary API clients, delegates the
-    full backtest simulation to backtester.run_backtest_sweep(), and then
-    calls dashboard.generate_dashboard() to produce the interactive HTML
-    report.
+    --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers),
+    configures logging to kalshi_backtest.log, constructs the necessary API
+    clients, delegates the full backtest simulation to
+    backtester.run_backtest_sweep(), and then calls
+    dashboard.generate_dashboard() to produce the interactive HTML report and,
+    when the sell family is on, the sidecar chunk files its Sell select loads
+    (a folder beside the page, config.DASHBOARD_FILES_DIRNAME, which must be
+    kept with it).
     Prints a summary of key metrics (trade count, win rate, total return) to
     the log on completion, closed on every run by what settled-market corpus
     the run read (its assembly time, whether it was cached, and the archive
-    cutoff as of assembly — a WARNING when the window starts at or after it).
+    cutoff as of assembly, as information).
 
 Dependencies:
-    Imports run_backtest_sweep, BacktestSweep and max_trades_simulated (the
-    closing corpus line tests a stamped post-cutoff verdict against the run's
-    own trades with it — over the eager points; the dashboard header adds the
-    size-cap points its filter walk simulates) from backtester.py,
+    Imports run_backtest_sweep and BacktestSweep from backtester.py,
     generate_dashboard from dashboard.py, build_historical_client /
     build_prod_live_client / load_series_categories (the dashboard's
     returns-by-category labels) from historical.py, and load_risk_free_rates
     (the T-bill yields the page's Sharpe and Sortino subtract) from
     treasury.py.
     Imports from config.py:
-    PROJECT_ROOT,
+    PROJECT_ROOT, DASHBOARD_SELL_MAX_WORKERS (the --sell-workers default's
+    bound),
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS
     (the pre-fetch echo and the flag's help text), the deadline-gap tier constants
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS,
@@ -47,6 +48,12 @@ Notes:
     Historical data only exists on the production Kalshi API, so both API clients
     always use prod credentials regardless of what mode the live bot was run in.
     The backtest reads market data but never submits any orders.
+
+    --sell-workers N sets how many worker processes the dashboard simulates
+    its Sell select in (default: one less than the CPU count, at most
+    config.DASHBOARD_SELL_MAX_WORKERS; 1 runs it in the main process). The
+    workers are spawned, so they re-import this module: main() must only ever
+    run under the `if __name__ == "__main__"` guard at the bottom of the file.
 
     --interval-discount overrides the time-series interval discount k for this
     run ONLY: no live module imports this one (main.py's --interval-discount is
@@ -139,6 +146,13 @@ Notes:
     point the run returns is unchanged — and each cell is simulated only when
     the dashboard is built, so --no-add-on-sweep makes that step faster.
 
+    The "Sell" family is ON by default too (sell_sweep=True): the result
+    carries a lazy SellSweep (BacktestSweep.sell_sweep) that simulates, when
+    the dashboard is built, every scenario selling a position early at each
+    level of config.TAKE_PROFIT_LEVELS. It simulates nothing during the run;
+    --no-sell-sweep skips it, leaving the dashboard's Sell select disabled.
+    Live trading never sells.
+
     The pre-fetch echo's "live rule=" clause names the saved live defaults'
     time-series rule and, when one is set, their category/tag filter (never
     main.py's per-run overrides), from a read of its own, failing soft;
@@ -153,10 +167,12 @@ Notes:
 import argparse
 import logging
 import logging.handlers
+import os
 from datetime import UTC, date, datetime
 
-from .backtester import BacktestSweep, max_trades_simulated, run_backtest_sweep
+from .backtester import BacktestSweep, run_backtest_sweep
 from .config import (
+    DASHBOARD_SELL_MAX_WORKERS,
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
@@ -182,31 +198,22 @@ def _log_corpus_provenance(sweep: BacktestSweep) -> None:
     """
     Close the run's report with what settled-market corpus it read.
 
-    The "Period:" line prints start_date → today (the simulated window), but
-    the corpus holds no market settled after its assembly, and a cached re-run
-    reads a corpus an earlier run assembled (DR-13). A window at or after the
-    archive cutoff can enter no trade at all (M2): historical.py logs that as
-    a WARNING at fetch time (and, "as of assembly", on a cache hit), which on
-    a long run sits far above the result it explains, so it is repeated here,
-    beside it. Logged on every run, "not recorded" included — absence must
-    never be the only signal (DR-66). Worded as a bound, not a cause: such a
-    window may also have formed no pairs at all. And a stamped verdict can go
-    stale once the cutoff moves past start_date, so it is read beside
-    backtester.max_trades_simulated: if any simulated point traded, the
-    verdict is reported as stale instead of repeated. That counts the EAGER
-    points only; the dashboard header, built after this line, tests the
-    larger of it and the size-cap points its filter walk simulates, so the
-    two agree unless only a size-cap scenario traded — then the page calls
-    the verdict stale while this line still repeats it.
-
-    Takes the sweep WHOLE, like dashboard._section_interval_discount, so the
-    provenance and the trade counts it is judged against cannot drift apart.
+    The "Period:" line prints start_date → today (the simulated window), and
+    the corpus holds no market settled after its assembly. Every run brings
+    its corpus up to date — a cache from an earlier UTC day is extended
+    through today, so a cached corpus is at most a few hours old (assembled
+    earlier the same UTC day) — and this line says which it was (DR-13).
+    Logged on every run, "not recorded" included — absence must never be the
+    only signal (DR-66). A cache from an earlier day that could not be
+    brought up to date (CorpusProvenance.stale: the cutoff read or the
+    extension failed, each with its WARNING) is named as that, never as
+    today's. The archive cutoff is information only: a market
+    settled after it is priced from Kalshi's live candlestick endpoint.
 
     Args:
         sweep (BacktestSweep): The run's result. Its corpus_provenance is None
             when not recorded (no corpus was fetched, or it did not come from
-            an assembled cache); a legacy settled_markets_*.json hit carries
-            its file time (legacy=True) and no cutoff.
+            an assembled cache).
     """
     provenance = sweep.corpus_provenance
     if provenance is None:
@@ -217,50 +224,28 @@ def _log_corpus_provenance(sweep: BacktestSweep) -> None:
         return
     if provenance.assembled_at is None:
         assembled = "assembly time not recorded"
-    elif provenance.legacy:
-        assembled = (f"last written {provenance.assembled_at:%Y-%m-%d %H:%M} UTC "
-                     "(a legacy cache's file time), holding no market settled "
-                     "after that")
     else:
         assembled = (f"assembled {provenance.assembled_at:%Y-%m-%d %H:%M} UTC, "
                      "holding no market settled after that")
-    if provenance.archive_cutoff is not None:
-        cutoff = f"{provenance.archive_cutoff:%Y-%m-%d}"
-    elif provenance.legacy:
-        cutoff = "not recorded (the legacy format records none)"
+    if provenance.full_assembly_at is not None:
+        assembled += (f" (extended day by day since a full assembly of "
+                      f"{provenance.full_assembly_at:%Y-%m-%d %H:%M} UTC)")
+    if provenance.stale:
+        source = ("served as an earlier day's cache: it could not be brought up to "
+                  "date this run (see the WARNING above); --no-cache re-assembles it "
+                  "in full")
+    elif provenance.from_cache:
+        source = ("served from an earlier run's cache, assembled earlier today; "
+                  "--no-cache re-assembles it in full")
+    elif provenance.full_assembly_at is not None:
+        source = "extended through today by this run"
     else:
-        cutoff = "not recorded"
+        source = "assembled by this run"
+    cutoff = ("not recorded" if provenance.archive_cutoff is None
+              else f"{provenance.archive_cutoff:%Y-%m-%d}")
     logging.info(
         "Settled-market corpus: %s (%s); archive cutoff at assembly: %s",
-        assembled,
-        "served from an earlier run's cache; --no-cache extends it"
-        if provenance.from_cache else "assembled by this run",
-        cutoff,
-    )
-    if not provenance.post_cutoff:
-        return
-    # A trade at any simulated point disproves "no trade could be entered".
-    # The eager points only: the dashboard header also counts the size-cap
-    # points its walk simulates, so the two agree unless only one of those traded
-    traded = max_trades_simulated(sweep)
-    if traded:
-        logging.warning(
-            "The archive cutoff recorded %s is at or after this window's start "
-            "date, which would mean no trade could be entered — but this run "
-            "entered trades (up to %d in one simulated scenario), so that "
-            "verdict is stale: the cutoff has since moved past the start date. "
-            "--no-cache re-reads the cutoff and re-stamps the cache.",
-            "at this corpus's assembly" if provenance.from_cache else "by this run",
-            traded,
-        )
-        return
-    logging.warning(
-        "This window starts at or after the archive cutoff as of its "
-        "corpus's assembly — post-cutoff markets have no historical "
-        "candlesticks, so no trade could be entered whatever pairs formed; "
-        "a zero-trade result here is structural, not a strategy result%s",
-        " (a cached run does not re-read the cutoff; --no-cache re-checks it)"
-        if provenance.from_cache else "",
+        assembled, source, cutoff,
     )
 
 
@@ -271,8 +256,9 @@ def main() -> None:
     Parses command-line arguments (--start-date, --balance, --no-cache,
     --max-horizon-days, --interval-discount, --no-sweep,
     --same-event-ladders / --no-same-event-ladders, --spread-min,
-    --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep),
-    configures logging, constructs historical and live Kalshi API clients,
+    --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep,
+    --no-sell-sweep), configures logging, constructs historical and live
+    Kalshi API clients,
     runs the full backtest simulation via run_backtest_sweep(), and generates
     an interactive HTML dashboard via generate_dashboard(). Logs a summary
     table of key metrics to
@@ -285,8 +271,7 @@ def main() -> None:
     the plain run_backtest() path's did. The other swept discounts and bands
     exist for the dashboard (its page-wide filter bar, whose k select the
     Interval Discount section follows, its scenario explorer and k-hat
-    breakdown), the calibration report and max_trades_simulated's
-    post-cutoff check; the tier-floors-off family is read by that check and
+    breakdown) and the calibration report; the tier-floors-off family is read
     by the dashboard's filter bar, k-hat breakdown and scenario explorer
     (their Tier floors choice), carried to generate_dashboard on the sweep;
     and the lazily simulated size caps (result.cap_sweep, and the
@@ -294,7 +279,8 @@ def main() -> None:
     by the dashboard, which reads every cell as the page is built (its filter
     bar, Interval Discount section and scenario explorer); the lazily
     simulated add-on sweeps (result.add_on_cap_sweep, and
-    result.add_on_tier_off_cap_sweep) are read the same way.
+    result.add_on_tier_off_cap_sweep) and sell family (result.sell_sweep) are
+    read the same way.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -389,9 +375,27 @@ def main() -> None:
              "to held pairs when the saved live defaults say so, or main.py's own "
              "--add-to-held-pairs / --no-add-to-held-pairs for one live run",
     )
+    parser.add_argument(
+        "--no-sell-sweep", action="store_true",
+        help="Skip the dashboard's Sell select (sell a whole position once it has "
+             "made a chosen share of the profit it could make): its simulations run "
+             "only while the dashboard is built, so skipping them makes that step "
+             "much faster and leaves the select disabled. Backtest only — live "
+             "trading never sells a position",
+    )
+    parser.add_argument(
+        "--sell-workers", type=int, default=None, metavar="N",
+        help="Worker processes the dashboard simulates its Sell select in "
+             "(default: one less than this machine's CPU count, at most "
+             f"{DASHBOARD_SELL_MAX_WORKERS} — config.DASHBOARD_SELL_MAX_WORKERS); "
+             "1 runs them in the main process. Each worker holds one spread band's "
+             "entries, so memory grows with the count",
+    )
     args = parser.parse_args()
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
         parser.error("--max-horizon-days must be a positive integer")
+    if args.sell_workers is not None and args.sell_workers < 1:
+        parser.error("--sell-workers must be a positive integer")
     if args.interval_discount is not None and not (0.0 <= args.interval_discount <= 1.0):
         parser.error("--interval-discount must be between 0 and 1")
     if args.spread_min is not None and not (0.0 <= args.spread_min <= 1.0):
@@ -501,6 +505,12 @@ def main() -> None:
     # ON by default, like the cap sweep, and for the same reason: nothing is
     # simulated during the run, so the opt-out saves only the dashboard step
     add_on_sweep = not args.no_add_on_sweep
+    # ON by default too, and lazy the same way: the dashboard simulates it
+    sell_sweep = not args.no_sell_sweep
+    # The dashboard simulates the Sell select in worker processes: one less
+    # than the CPUs (the main process waits on them), within the config bound
+    sell_workers = (args.sell_workers if args.sell_workers is not None
+                    else max(1, min((os.cpu_count() or 1) - 1, DASHBOARD_SELL_MAX_WORKERS)))
     # The saved live defaults' rule and filter, for the echo only: a read of its
     # own, separate from run_backtest_sweep's (which logs the INFO or WARNING).
     # Fails soft, unlike the checks above (one echo clause must not abort a run)
@@ -520,11 +530,13 @@ def main() -> None:
     logging.info(
         "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f | ladders=%s "
         "| spread band=%g-%g | band sweep=%s | cap sweep=%s | add-on sweep=%s "
-        "| live rule=%s",
+        "| sell sweep=%s | live rule=%s",
         start_date, args.balance, "on" if use_cache else "off", effective_k,
         ladders_echo, echo_floor, echo_ceiling,
         "on" if band_sweep else "off", "on" if cap_sweep else "off",
-        "on" if add_on_sweep else "off", live_rule_echo,
+        "on" if add_on_sweep else "off",
+        f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
+        if sell_sweep else "off", live_rule_echo,
     )
     # Warn on a ceiling that empties a tier. config.time_series_spread_band's
     # docstring asks a caller taking an operator-typed ceiling to warn when it
@@ -596,6 +608,8 @@ def main() -> None:
         # The dashboard's "Add to held pairs: on" views, simulated lazily when
         # the page is built (no simulation during the run)
         add_on_sweep=add_on_sweep,
+        # The dashboard's Sell select, lazy the same way
+        sell_sweep=sell_sweep,
     )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy add-on sweeps (add_on_cap_sweep, and add_on_tier_off_cap_sweep with the band sweep) unless --no-add-on-sweep
     # Everything below reports the PRIMARY point, so the summary block and the
     # dashboard's other six sections read exactly as they did before the sweep
@@ -603,10 +617,8 @@ def main() -> None:
     # (which the Interval Discount section follows), the band-sweep payload by
     # the dashboard's scenario explorer, filter bar and k-hat breakdown, the
     # tier-floors-off family by that filter bar, k-hat breakdown and scenario
-    # explorer too (their Tier floors choice), every kept point — the
-    # tier-floors-off family's included — by max_trades_simulated's
-    # post-cutoff check (_log_corpus_provenance below, and the dashboard's
-    # header), and the lazy size-cap sweeps (result.cap_sweep and, over the
+    # explorer too (their Tier floors choice), and the lazy size-cap sweeps
+    # (result.cap_sweep and, over the
     # tier-floors-off family, result.tier_off_cap_sweep, simulated only when
     # a cell is read) only by the dashboard, whose one grid walk reads
     # every cell as the page is built (filter bar, Interval Discount section
@@ -633,9 +645,8 @@ def main() -> None:
         logging.info("  Final balance: $%s", f"{final_value:,.2f}")
 
     # After either branch: the window (the Period line, when printed) runs to
-    # today but the corpus only to its assembly, and a post-cutoff window's
-    # zero is structural — say so beside the result rather than only at the
-    # top of a long log (DR-13, M2)
+    # today but the corpus only to its assembly — say so beside the result
+    # rather than only at the top of a long log (DR-13)
     _log_corpus_provenance(result)
 
     # generate_dashboard() already logs "Dashboard written: %s" itself (BS-26) —
@@ -662,7 +673,8 @@ def main() -> None:
     risk_free = load_risk_free_rates()
     generate_dashboard(trades, equity_df, start_date, args.balance,
                        sweep=result, interval_discount=result.primary.k,
-                       series_categories=series_categories, risk_free=risk_free)
+                       series_categories=series_categories, risk_free=risk_free,
+                       sell_workers=sell_workers)
     logging.info("Open the HTML file in a browser to view the interactive charts.")
     # How a scenario on the page becomes the live defaults, or is traded: the
     # page cannot write files or start runs, so its buttons open the defaults

@@ -22,8 +22,7 @@ Dependencies:
     PROJECT_ROOT plus a dozen-plus tuning constants
     (MARKET_PAGE_SIZE, MVE_TITLE_LOOKUP_MAX_PAGES, SETTLED_FETCH_MAX_WORKERS,
     SETTLED_FETCH_CHUNK_RECORDS, ARCHIVE_MAX_BARREN_PAGES,
-    ARCHIVE_FIRST_CREATED_DATE, EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS,
-    EVENT_TITLE_FALLBACK_MAX_LOOKUPS, EVENT_TITLE_FALLBACK_MAX_WORKERS,
+    ARCHIVE_FIRST_CREATED_DATE, EVENT_TITLE_FALLBACK_MAX_LOOKUPS, EVENT_TITLE_FALLBACK_MAX_WORKERS,
     EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS,
     EVENT_TITLE_LISTING_MAX_BARREN_PAGES, MVE_SERIES_FAMILY_PREFIX,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
@@ -36,10 +35,9 @@ Dependencies:
     load_series_categories() is called by backtest.py and main.py,
     series_labels() by dashboard.py and main.py.
     Also exports SettledCorpus — the
-    disk-backed, re-iterable corpus fetch_all_settled_markets returns — and
-    LegacySettledCorpus, the list a legacy settled_markets_*.json hit
-    returns; each carries a CorpusProvenance (when, and under which archive
-    cutoff, the corpus was assembled, and — as AssemblyCounts — how many
+    disk-backed, re-iterable corpus fetch_all_settled_markets returns — which
+    carries a CorpusProvenance (when, and under which archive cutoff, the
+    corpus was assembled or last extended, and — as AssemblyCounts — how many
     records settled in its window and how many of them the prefilter
     rejected; backtester.py carries it to the dashboard header and reports
     the counts on its own prefilter line); and SettledCorpusError, which
@@ -102,26 +100,35 @@ Notes:
     walks them twice through one generator that reproduces the old merge
     exactly (_assembled_records), and the second walk streams straight into
     the assembled cache settled_markets_*.jsonl.gz, which is returned as a
-    SettledCorpus that streams the file again on every walk. Legacy
-    settled_markets_*.json caches are still served, whole, as lists (a
-    LegacySettledCorpus, which only adds the provenance) — only
-    while no streamed cache of the same identity exists, and the first
-    rebuild of that identity deletes them (_retire_legacy_cache). A file
-    that cannot be read once a walk is under way raises SettledCorpusError —
-    never a sequential-walk fallback, never a short corpus.
+    SettledCorpus that streams the file again on every walk. A legacy
+    settled_markets_*.json cache is no longer served: it records neither
+    when its live part ends nor its archive cutoff, so it cannot be brought
+    up to date, and the request is re-assembled in full (whose commit deletes
+    it, _retire_legacy_cache). A file that cannot be read once a walk is
+    under way raises SettledCorpusError — never a sequential-walk fallback,
+    never a short corpus.
 
-    A cache hit is announced, not silent (DR-13): it logs when the corpus was
-    assembled (the streamed cache's meta stamp, a legacy file's mtime), that
-    it holds nothing settled after that while the window nominally runs to
-    today, and what --no-cache costs to extend it (a re-assembly that reuses
-    only still-valid day slices, plus a candlestick and event-title refetch).
-    The archive cutoff is stamped into the streamed cache at assembly
-    (informational, never part of the identity check), so a hit repeats the
-    post-cutoff "structurally 0-trade" WARNING "as of assembly" with no
-    network call (M2); a legacy cache, or a streamed one written before that
-    stamp, records no cutoff and says so instead. An EMPTY assembled cache
-    is served only while younger than EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS;
-    older, it is a miss.
+    Every backtest runs through the most recent available day. An assembled
+    cache records when it was assembled, the archive cutoff it was assembled
+    under and the first second of its partial "frontier" day (meta
+    assembled_at, archive_cutoff_ts, live_frontier_ts; informational, never
+    part of the identity check). A cache whose frontier day is today (UTC)
+    is served as it is, with zero network calls, and announced (DR-13). One
+    from an earlier day is EXTENDED (_extend_assembled_cache): one
+    /historical/cutoff read, then the live endpoint's settled days from its
+    frontier day onward (day slices on disk are reused) are spliced in after
+    its archive part and before its older live days, in the order a fresh
+    assembly would produce, and its partial frontier day is replaced by the
+    complete one. A cutoff that moved past the cache's frontier day (its
+    newest markets have migrated into the archive), or a cache that records
+    no cutoff or assembly time, is re-assembled in full instead (one that
+    records no frontier day is extended from the earlier of the day before
+    its assembly and the day its newest live record settled on); a failure
+    while extending is a WARNING and the cache is served as it was, marked
+    stale. A window that
+    starts after the cutoff is no longer special: its markets are priced
+    from Kalshi's live candlestick endpoint (fetch_candlesticks' 404
+    fallback), so the old "structurally 0-trade" WARNING is gone.
 
     JSON parsing dominates the fetch's CPU time at current Kalshi volumes, so
     orjson is used when installed (optional `perf` extra) and the stdlib json
@@ -154,7 +161,6 @@ from .config import (
     ARCHIVE_MAX_BARREN_PAGES,
     CANDLESTICK_MAX_CANDLES_PER_REQUEST,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
-    EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
     EVENT_TITLE_FALLBACK_MAX_WORKERS,
     EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS,
@@ -464,9 +470,10 @@ def _exception_summary(exc: BaseException, limit: int = 120) -> str:
     The SDK's ApiException.__str__ emits the status, the reason, the ENTIRE
     HTTP header dict and the body across five lines (~900 bytes), and its own
     first line is only "(404)" — the reason lives on line two. Logged once per
-    failed candlestick fetch on a post-cutoff window (where every ticker 404s
-    by design, and those failures are deliberately never cached so they are
-    re-paid every run), that alone rotated the run's own diagnostics out of
+    failed candlestick fetch on a post-cutoff window (where every ticker
+    404'd on the historical endpoint before fetch_candlesticks learned to ask
+    the live one, and those failures are deliberately never cached so they
+    are re-paid every run), that alone rotated the run's own diagnostics out of
     kalshi_backtest.log: 99.5% of the file was this one warning and ~419 MB of
     older history was evicted (TS-02).
 
@@ -1391,6 +1398,45 @@ class _ShardedFetchUnsupported(Exception):
 
 # One archive/live day slice, in seconds. Slices are UTC calendar days.
 _DAY_SECONDS = 86_400
+
+
+def _utc_now() -> datetime:
+    """
+    The current instant, in UTC — the one clock the settled-market fetch reads.
+
+    fetch_all_settled_markets reads it to decide whether an assembled cache is
+    today's, to stamp when a corpus was assembled and which day its live
+    frontier was, and to bound the live phase; a test patches this one name to
+    put the whole fetch on any day it likes.
+
+    Returns:
+        datetime: datetime.now(UTC).
+    """
+    return datetime.now(UTC)
+
+
+def _frontier_day_start(live_min_ts: int, now_ts: int) -> int:
+    """
+    The first second of the live phase's frontier day: the UTC day still being written.
+
+    The live phase splits [live_min_ts, now) into whole UTC settled-days,
+    which it persists, and an open-ended frontier window from the start of
+    the current UTC day (never earlier than the day live_min_ts falls in),
+    which it fetches every run and never persists. Every market settled
+    before this second is therefore in a complete day slice or the archive;
+    an assembled cache records it (meta "live_frontier_ts") so a later run
+    knows from which day to extend it.
+
+    Args:
+        live_min_ts (int): The live phase's lower bound, epoch seconds.
+        now_ts (int): The current epoch second.
+
+    Returns:
+        int: Epoch seconds of the frontier day's UTC midnight.
+    """
+    first_lo = live_min_ts - (live_min_ts % _DAY_SECONDS)
+    today_lo = now_ts - (now_ts % _DAY_SECONDS)
+    return max(today_lo, first_lo)
 
 # The /historical/markets archive rejects limit > 1000 and ignores every
 # server-side time-filter param (min/max_settled_ts and friends — all
@@ -3601,8 +3647,7 @@ def _fetch_live_phase(
             full disk), like a day slice that cannot be written.
     """
     first_lo = live_min_ts - (live_min_ts % _DAY_SECONDS)
-    today_lo = now_ts - (now_ts % _DAY_SECONDS)
-    frontier_lo = max(today_lo, first_lo)
+    frontier_lo = _frontier_day_start(live_min_ts, now_ts)
     past_day_los = list(range(first_lo, frontier_lo, _DAY_SECONDS))
 
     expect_meta = {
@@ -3956,73 +4001,69 @@ class CorpusProvenance:
     """
     What a settled-market corpus covers: when it was assembled, and under which archive cutoff.
 
-    DR-13 and M2/M3 of the 2026-09-24 7-day-run review. A cache hit makes zero
+    DR-13 and M3 of the 2026-09-24 7-day-run review. A cache hit makes zero
     network calls, so before this a hit was served with one "Loaded N" line:
     nothing said that the corpus stops at the moment it was assembled while
-    the window nominally runs to today, and the post-cutoff "structurally
-    0-trade" WARNING — logged only after the /historical/cutoff read, which a
-    hit never reaches — vanished from every cached re-run. This carries both
-    facts out: fetch_all_settled_markets builds it from the assembled cache's
-    meta block (_corpus_provenance) — the block it just wrote on a fresh
-    assembly, the block its validating walk read on a hit — and hangs it on
-    the SettledCorpus it returns; backtester._prepare_candidates carries it to
+    the window nominally runs to today. This carries that out, with the
+    archive cutoff the corpus was assembled under (reported as information;
+    it decides nothing about which markets can trade, since a market settled
+    after the cutoff is priced from the live candlestick endpoint) and, for a
+    cache an earlier run brought up to date, when it was last assembled in
+    full. fetch_all_settled_markets builds it from the assembled cache's meta
+    block (_corpus_provenance) — the block it just wrote on a fresh assembly
+    or an extension, the block its validating walk read on a same-day hit —
+    and hangs it on the SettledCorpus it returns;
+    backtester._prepare_candidates carries it to
     BacktestSweep.corpus_provenance, and the dashboard renders it under the
-    Period line. A LEGACY settled_markets_*.json hit carries one too, on the
-    LegacySettledCorpus list it returns (legacy=True): its only assembly stamp
-    is the file's mtime, and the legacy format never recorded a cutoff, so
-    archive_cutoff and post_cutoff are None there. Seven of the eight
-    assembled caches on disk on 2026-09-24 were legacy files — including the
-    three pre-cutoff ones whose numbers staleness can actually move — so
-    leaving them out would have kept the page silent exactly where it matters.
+    Period line.
 
     Attributes:
-        from_cache (bool): True when the corpus was served from an assembled
-            cache an earlier run wrote; False when this call assembled it.
-        assembled_at (datetime | None): When the corpus was assembled (UTC,
-            tz-aware) — for a legacy cache, when its file was last written. It
-            holds no market that settled after this moment; the live fetch
-            that fed it ran in the minutes before (the 2026-09-17 cache's first
-            record, from the newest-settled-first frontier, settled at
-            12:18:38Z against an assembled_at of 12:37:49Z), so its newest
-            settlement sits at or somewhat before it. None when the meta block
-            carries no readable timestamp, or a legacy file's mtime cannot be
-            read.
+        from_cache (bool): True when the corpus was served, as it was, from
+            an assembled cache an earlier run wrote — today (UTC), or, with
+            stale set, an earlier day; False when this call assembled it or
+            extended it.
+        assembled_at (datetime | None): When the corpus was assembled or last
+            extended (UTC, tz-aware). It holds no market that settled after
+            this moment; the live fetch that fed it ran in the minutes before
+            (the 2026-09-17 cache's first record, from the
+            newest-settled-first frontier, settled at 12:18:38Z against an
+            assembled_at of 12:37:49Z), so its newest settlement sits at or
+            somewhat before it. None when the meta block carries no readable
+            timestamp.
         archive_cutoff (datetime | None): The archive cutoff (the
             /historical/cutoff endpoint's market_settled_ts) observed when the
-            corpus was assembled (UTC, tz-aware). None when it was not
-            recorded — every legacy cache, and every streamed cache written
-            before P2, lacks it.
-        post_cutoff (bool | None): The structurally-0-trade verdict AS OF
-            ASSEMBLY — start_date's UTC midnight at or after archive_cutoff
-            (_starts_at_or_after_cutoff, the same test the miss path's WARNING
-            applies), so every market the window can touch settled after the
-            cutoff and has no historical candlesticks. None exactly when
-            archive_cutoff is None. A True verdict can go stale: the cutoff has
-            only ever been seen to advance (2026-06-04 as read on 2026-08-03,
-            2026-07-25 on 2026-09-24), so it may since have passed start_date,
-            and a hit does not re-read it — which is why both renderers read a
-            True verdict beside the run's own trades
-            (backtester.max_trades_simulated): any simulated trade proves it
-            stale. A False verdict cannot go stale that way.
-        legacy (bool): True when the corpus is a legacy settled_markets_*.json
-            (assembled_at is then its file time, and nothing recorded a
-            cutoff); False for the streamed .jsonl.gz. Defaulted, so every
-            construction that predates it still builds a streamed provenance.
+            corpus was assembled or last extended (UTC, tz-aware). None when
+            it was not recorded — every streamed cache written before P2 lacks
+            it.
         assembly_counts (AssemblyCounts | None): How many records settled in
             the window and what became of the ones not kept — above all, how
-            many the prefilter rejected (M9). Recorded as of assembly, like
-            assembled_at. None for every legacy cache and every streamed one
-            written before these counts existed (including the 2026-09-17
-            cache on disk), for a block whose value is unreadable, and for a
-            hit whose counts disagree with the records its validating walk
-            counted (SettledCorpus.open_validated). Defaulted, like legacy.
+            many the prefilter rejected (M9). Recorded at a FULL assembly only:
+            an extension drops the old cache's partial frontier day, whose
+            counts cannot be separated from the rest, so an extended cache
+            records none (its own counts are logged instead). None too for
+            every streamed cache written before these counts existed
+            (including the 2026-09-17 cache on disk), for a block whose value
+            is unreadable, and for a hit whose counts disagree with the
+            records its validating walk counted
+            (SettledCorpus.open_validated). Defaulted.
+        full_assembly_at (datetime | None): When the corpus was last assembled
+            IN FULL, for a cache later runs extended day by day
+            (_extend_assembled_cache) — the moment its archive part was read;
+            None for a corpus assembled in full at assembled_at (never
+            extended), or a block whose value is unreadable. Defaulted.
+        stale (bool): True when the corpus is a cache from an earlier UTC day
+            served as it was, because bringing it up to date failed (the
+            archive cutoff could not be read, or the extension raised — each
+            with its WARNING). The reports must not call such a corpus
+            today's: it holds nothing settled after assembled_at. Set only by
+            _up_to_date_corpus; False (the default) everywhere else.
     """
     from_cache: bool
     assembled_at: datetime | None
     archive_cutoff: datetime | None
-    post_cutoff: bool | None
-    legacy: bool = False
     assembly_counts: AssemblyCounts | None = None
+    full_assembly_at: datetime | None = None
+    stale: bool = False
 
 
 def _window_start_ts(start_date: date) -> int:
@@ -4039,30 +4080,6 @@ def _window_start_ts(start_date: date) -> int:
                         tzinfo=UTC).timestamp())
 
 
-def _starts_at_or_after_cutoff(start_ts: int, cutoff_ts: int) -> bool:
-    """
-    The post-cutoff verdict: does the window open at or after the archive cutoff?
-
-    The ONE definition of it, shared by the fetch's WARNING and by the
-    provenance a corpus carries (_corpus_provenance), so the log line and the
-    dashboard banner can never fire on different conditions. True means every
-    market the window can touch settled after the cutoff — live-era markets,
-    which 404 on /historical/markets/{ticker}/candlesticks (CLAUDE.md's
-    "Backtest windows must start BEFORE the archive cutoff" gotcha) — so
-    _find_entry can never price either leg and no trade can be entered,
-    whatever pairs form. DR-50's planned short-circuit would branch on this
-    same test.
-
-    Args:
-        start_ts (int): The window's opening epoch second (_window_start_ts).
-        cutoff_ts (int): The archive cutoff, epoch seconds.
-
-    Returns:
-        bool: True when start_ts >= cutoff_ts.
-    """
-    return start_ts >= cutoff_ts
-
-
 def _parse_assembled_at(raw: Any) -> datetime | None:
     """
     Read an assembled cache's assembled_at meta value as a UTC instant.
@@ -4074,8 +4091,8 @@ def _parse_assembled_at(raw: Any) -> datetime | None:
 
     Returns:
         datetime | None: The instant, tz-aware in UTC (a naive string is read
-            as UTC, the writer's own zone), or None when the value is absent or
-            not an ISO-8601 timestamp.
+            as UTC, the writer's own zone), or None when the value is absent,
+            not an ISO-8601 timestamp, or has no UTC instant a datetime holds.
     """
     if not isinstance(raw, str):
         return None
@@ -4085,7 +4102,54 @@ def _parse_assembled_at(raw: Any) -> datetime | None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+    try:
+        return parsed.astimezone(UTC)
+    except OverflowError:
+        # A stamp with no UTC instant inside datetime's range (a year-1 time
+        # east of UTC, say): only a hand-edited block holds one
+        return None
+
+
+def _parse_archive_cutoff(raw: Any) -> datetime | None:
+    """
+    Read an assembled cache's archive_cutoff_ts meta value as a UTC instant.
+
+    Args:
+        raw (Any): The meta block's "archive_cutoff_ts" value — an int epoch
+            second as the writer records it, or anything else a damaged or
+            hand-edited block might hold.
+
+    Returns:
+        datetime | None: The cutoff, tz-aware in UTC, or None when the value
+            is absent, not an int (read by TYPE: a bool is an int subclass and
+            must not pass for an epoch), or outside the range a datetime holds.
+    """
+    epoch = _meta_epoch(raw)
+    return None if epoch is None else datetime.fromtimestamp(epoch, tz=UTC)
+
+
+def _meta_epoch(raw: Any) -> int | None:
+    """
+    Read an epoch-second meta value (archive_cutoff_ts, live_frontier_ts), range-checked.
+
+    Args:
+        raw (Any): The meta block's value — an int epoch second as the writer
+            records it, or anything else a damaged or hand-edited block
+            might hold.
+
+    Returns:
+        int | None: The value, or None when it is absent, not an int (read by
+            TYPE: a bool is an int subclass and must not pass for an epoch),
+            or outside the range a datetime holds — so nothing that decides
+            on it, or prints it, can raise.
+    """
+    if not isinstance(raw, int) or isinstance(raw, bool):
+        return None
+    try:
+        datetime.fromtimestamp(raw, tz=UTC)
+    except (OverflowError, ValueError, OSError):
+        return None
+    return raw
 
 
 def _corpus_provenance(meta: dict, *, from_cache: bool) -> CorpusProvenance:
@@ -4094,9 +4158,7 @@ def _corpus_provenance(meta: dict, *, from_cache: bool) -> CorpusProvenance:
 
     A pure function of the block, so a fresh assembly (the block just written)
     and a later hit (the block its validating walk read back) describe one
-    corpus identically. The verdict reads start_date from the block itself —
-    an identity key, already checked against the request — and only when the
-    block records an archive cutoff.
+    corpus identically.
 
     Args:
         meta (dict): The assembled cache's whole meta block.
@@ -4108,41 +4170,14 @@ def _corpus_provenance(meta: dict, *, from_cache: bool) -> CorpusProvenance:
             (see CorpusProvenance); nothing here raises on a bad block.
     """
     assembled_at = _parse_assembled_at(meta.get("assembled_at"))
-    raw_cutoff = meta.get("archive_cutoff_ts")
-    archive_cutoff: datetime | None = None
-    post_cutoff: bool | None = None
-    # By TYPE, like every other fail-safe read here: bool is an int subclass
-    # and must not pass for an epoch.
-    if isinstance(raw_cutoff, int) and not isinstance(raw_cutoff, bool):
-        try:
-            start = date.fromisoformat(meta.get("start_date"))
-            archive_cutoff = datetime.fromtimestamp(raw_cutoff, tz=UTC)
-        except (TypeError, ValueError, OverflowError, OSError):
-            start = archive_cutoff = None
-        if archive_cutoff is not None:
-            post_cutoff = _starts_at_or_after_cutoff(_window_start_ts(start), raw_cutoff)
     return CorpusProvenance(
         from_cache=from_cache, assembled_at=assembled_at,
-        archive_cutoff=archive_cutoff, post_cutoff=post_cutoff,
+        archive_cutoff=_parse_archive_cutoff(meta.get("archive_cutoff_ts")),
+        # Present only on a cache an extension wrote (informational too)
+        full_assembly_at=_parse_assembled_at(meta.get("full_assembly_at")),
         # Informational like the two keys above: by TYPE, None when absent
         assembly_counts=_parse_assembly_counts(meta.get("assembly_counts")),
     )
-
-
-def _file_time(path: Path) -> datetime | None:
-    """
-    A file's last-modified time, as a UTC instant — a legacy cache's only assembly stamp.
-
-    Args:
-        path (Path): The file.
-
-    Returns:
-        datetime | None: Its mtime in UTC, or None when it cannot be read.
-    """
-    try:
-        return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
-    except (OSError, OverflowError, ValueError):
-        return None
 
 
 def _describe_age(assembled_at: datetime, now: datetime) -> str:
@@ -4162,112 +4197,6 @@ def _describe_age(assembled_at: datetime, now: datetime) -> str:
         return "in the future by this host's clock"
     hours = seconds / 3600
     return f"{hours:.1f} h ago" if hours < 48 else f"{hours / 24:.1f} days ago"
-
-
-def _serve_assembled_cache(path: Path, count: int, assembled_at: datetime | None,
-                           now: datetime) -> bool:
-    """
-    Decide whether a valid assembled cache is served: always when non-empty, and only while young when empty.
-
-    DR-13. A non-empty cache is always served — it is a snapshot the operator
-    extends with --no-cache, announced rather than expired ("announce, don't
-    enforce"). An EMPTY one records only that nothing qualified when it was
-    assembled (or that a run was cut short), and since a hit makes no network
-    call it used to be a permanent hit: the 2-byte "[]"
-    settled_markets_2026-08-29_*.json, last written 2026-09-01 00:16 UTC (its
-    file time), was still served on 2026-09-24. It is now served only while
-    younger than EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS (with a WARNING);
-    older, or with an unreadable assembly time, it is a miss and is
-    re-assembled — so a legitimately empty window re-checks at most once per
-    that interval. The re-check is an ordinary miss, i.e. a full re-assembly
-    of the window from the day-slice stores (fetching whatever day is not
-    stored or no longer valid), not a top-up: for a long window that is a
-    full-volume run.
-
-    An assembly time in the FUTURE also counts as a miss. It can only come
-    from clock skew or a hand edit, and serving it would keep an empty cache
-    "young" for as long as the skew lasts, while failing toward a miss costs
-    one re-assembly. That is deliberately the opposite of the older
-    empty-CANDLE-cache rule in fetch_candlesticks (_EMPTY_CANDLE_TTL_SECONDS,
-    the same 86,400 but a separate private constant), which serves a
-    future-dated empty candle file; that rule predates this one and is left
-    as it is.
-
-    Args:
-        path (Path): The cache file, named in the log line.
-        count (int): How many records it holds.
-        assembled_at (datetime | None): When it was assembled (the streamed
-            cache's meta stamp, or a legacy file's mtime); None if unknown.
-        now (datetime): The current instant (tz-aware).
-
-    Returns:
-        bool: True to serve the cache, False to treat it as a miss.
-    """
-    if count:
-        return True
-    if assembled_at is not None:
-        age = (now - assembled_at).total_seconds()
-        if 0 <= age < EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS:
-            logging.warning(
-                "Assembled cache %s is EMPTY (assembled %s, %s): serving it, "
-                "since it is younger than %d s — an empty window is re-checked "
-                "at most that often; pass --no-cache to re-check it now",
-                path.name, assembled_at.strftime("%Y-%m-%d %H:%M UTC"),
-                _describe_age(assembled_at, now), EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS,
-            )
-            return True
-    logging.warning(
-        "Assembled cache %s is EMPTY and was assembled %s — treating it as a "
-        "miss and re-assembling (DR-13): an empty corpus records only that "
-        "nothing qualified when it was built, and serving it again would hide "
-        "every market settled since",
-        path.name,
-        "at an unknown time" if assembled_at is None else
-        f"{_describe_age(assembled_at, now)} ({assembled_at:%Y-%m-%d %H:%M UTC})",
-    )
-    return False
-
-
-def _warn_post_cutoff(start_date: date, archive_cutoff: datetime, *,
-                      as_of_assembly: datetime | None = None,
-                      from_cache: bool = False) -> None:
-    """
-    Log the structurally-0-trade WARNING, on a fresh fetch or (as of assembly) on a cache hit.
-
-    Warn only — never abort (DR-50's short-circuit is an open operator
-    decision): the fetch can still be useful, e.g. to warm the cache, and a
-    false positive must not block a legitimate run. On a HIT the verdict is
-    the one stamped at assembly (CorpusProvenance.post_cutoff), because a hit
-    makes no network call — so it is worded "as of" that assembly and names
-    --no-cache as the way to re-check it against the current cutoff. Both
-    wordings keep "is at or after the archive cutoff" and "structurally
-    0-trade", which is what an operator greps for.
-
-    Args:
-        start_date (date): The window's first day.
-        archive_cutoff (datetime): The cutoff the verdict was taken against.
-        as_of_assembly (datetime | None): On a hit, when the cached corpus was
-            assembled (None if unrecorded); ignored on a fresh fetch.
-        from_cache (bool): True on a cache hit, False on a fresh fetch.
-    """
-    if not from_cache:
-        logging.warning(
-            "start_date (%s) is at or after the archive cutoff (%s) — "
-            "post-cutoff markets 404 on the historical candlesticks endpoint, "
-            "so this window is structurally 0-trade",
-            start_date, archive_cutoff.date(),
-        )
-        return
-    logging.warning(
-        "start_date (%s) is at or after the archive cutoff (%s) as of this "
-        "cached corpus's assembly (%s) — post-cutoff markets 404 on the "
-        "historical candlesticks endpoint, so this window is structurally "
-        "0-trade unless the cutoff has since moved past start_date; a cache "
-        "hit does not re-read the cutoff, so pass --no-cache to re-check it",
-        start_date, archive_cutoff.date(),
-        "time not recorded" if as_of_assembly is None
-        else f"{as_of_assembly:%Y-%m-%d %H:%M UTC}",
-    )
 
 
 def _log_cache_load(count: int, counts: AssemblyCounts | None, start_date: date,
@@ -4314,69 +4243,42 @@ def _log_cache_load(count: int, counts: AssemblyCounts | None, start_date: date,
         logging.info("Loaded %d %s from cache", count, noun)
 
 
-def _announce_cache_hit(path: Path, start_date: date, provenance: CorpusProvenance,
-                        now: datetime) -> None:
+def _announce_cache_hit(path: Path, provenance: CorpusProvenance, now: datetime) -> None:
     """
-    Say what a served assembled cache covers, how to extend it, and (as of assembly) whether the window is post-cutoff.
+    Say what a served assembled cache covers: one assembled earlier today (UTC), served as it is.
 
     DR-13 / M3: a hit used to log only "Loaded N settled markets from cache",
     so a repeat run silently replayed a corpus truncated at its assembly
-    moment while every Period line said the window ran to today. INFO, not
-    WARNING — it fires on every healthy cached run; the staleness it names is
-    announced, not enforced. M2: the post-cutoff WARNING is re-emitted here
-    from the stamped verdict, since a hit never reaches the cutoff read.
-
-    The remedy it names is priced honestly: --no-cache RE-ASSEMBLES the
-    corpus (reusing a stored day slice only while it is still valid — a live
-    day slice once its day has fully elapsed, an archive day slice only while
-    the archive cutoff is the one it was fetched under, so every archive slice
-    goes stale when the cutoff advances), and it also re-fetches every pair
-    ticker's candlesticks and re-resolves event titles. For a window reaching
-    back before the cutoff that is close to a full fetch (on 2026-09-24 none
-    of the 63 archive slices on disk for 2026-05-01..07-02 carried the current
-    cutoff), so the line must not promise a cheap top-up.
+    moment while every Period line said the window ran to today. Since a
+    cache from an earlier UTC day is now brought up to date before it is
+    served (_extend_assembled_cache), a hit — served with zero network calls
+    — is a cache written earlier TODAY: it misses only what settled since,
+    and the next UTC day's first run extends it. INFO, not WARNING — it fires
+    on every healthy cached run. The archive cutoff at assembly is reported
+    as information only.
 
     Args:
         path (Path): The cache file served.
-        start_date (date): The window's first day.
-        provenance (CorpusProvenance): What the cache says about itself (for a
-            legacy .json, legacy=True and only its file time).
+        provenance (CorpusProvenance): What the cache says about itself.
         now (datetime): The current instant (tz-aware).
     """
-    legacy = provenance.legacy
     if provenance.assembled_at is None:
-        when = "records no assembly time, so how much of the window it covers is unknown"
+        when = "records no assembly time"
     else:
-        when = (
-            f"{'was last written' if legacy else 'was assembled'} at "
-            f"{provenance.assembled_at:%Y-%m-%d %H:%M UTC} "
-            f"({_describe_age(provenance.assembled_at, now)}"
-            f"{'; its file time' if legacy else ''}) and holds no market settled "
-            "after that moment"
-        )
-    if legacy:
-        cutoff = ("the legacy format records no archive cutoff, so the "
-                  "post-cutoff check cannot be repeated without a fetch")
-    elif provenance.archive_cutoff is None:
-        cutoff = ("the archive cutoff was not recorded when it was assembled, "
-                  "so the post-cutoff check cannot be repeated without a fetch")
-    else:
-        cutoff = f"archive cutoff at assembly: {provenance.archive_cutoff.date()}"
+        when = (f"was assembled at {provenance.assembled_at:%Y-%m-%d %H:%M UTC} "
+                f"({_describe_age(provenance.assembled_at, now)})")
+    if provenance.full_assembly_at is not None:
+        when += (f" by extending a full assembly of "
+                 f"{provenance.full_assembly_at:%Y-%m-%d %H:%M UTC}")
+    cutoff = ("the archive cutoff was not recorded" if provenance.archive_cutoff is None
+              else f"archive cutoff at assembly: {provenance.archive_cutoff.date()}")
     logging.info(
-        "%s %s %s, while the window nominally runs to today (%s UTC); %s. "
-        "Pass --no-cache to extend it%s: that re-assembles the whole corpus, "
-        "reusing a stored day slice only while it is still valid (an archive "
-        "day slice goes stale whenever the archive cutoff advances), and "
-        "re-fetches every pair's candlesticks and re-resolves event titles — "
-        "for a window reaching back before the archive cutoff that can cost "
-        "close to a full fetch",
-        "Legacy assembled cache" if legacy else "Assembled cache", path.name, when,
-        now.date(), cutoff,
-        " (and rebuild it in the streamed format)" if legacy else "",
+        "Assembled cache %s %s, earlier today (UTC), so it is served as it is "
+        "and holds no market settled after that moment; %s. The first run on "
+        "a later UTC day extends it through that day, and --no-cache "
+        "re-assembles it in full now",
+        path.name, when, cutoff,
     )
-    if provenance.post_cutoff and provenance.archive_cutoff is not None:
-        _warn_post_cutoff(start_date, provenance.archive_cutoff,
-                          as_of_assembly=provenance.assembled_at, from_cache=True)
 
 
 def _assembled_records(
@@ -4495,6 +4397,7 @@ def _count_assembled(
     event_tickers: set[str],
     identity: int,
     tally: _AssemblyTally | None = None,
+    title_wanted: Callable[[dict], bool] | None = None,
 ) -> tuple[int, int]:
     """
     The assembly's first walk over some sources: count, collect event tickers, fold identity.
@@ -4524,6 +4427,11 @@ def _count_assembled(
         tally (_AssemblyTally | None): The endpoint's counts, extended in
             place with every in-window record of these sources (see
             _assembled_records). None counts nothing.
+        title_wanted (Callable[[dict], bool] | None): Which yielded records'
+            event tickers to collect. None (the default) collects every
+            truthy one, as a full assembly does; an extension passes
+            _needs_title for its old records, so only the titles still
+            missing there are looked up again.
 
     Returns:
         tuple[int, int]: (records yielded by these sources, updated identity).
@@ -4533,7 +4441,7 @@ def _count_assembled(
         count += 1
         identity = _assembly_identity(identity, m)
         event_ticker = m.get("event_ticker")
-        if event_ticker:
+        if event_ticker and (title_wanted is None or title_wanted(m)):
             event_tickers.add(event_ticker)
     return count, identity
 
@@ -4542,8 +4450,7 @@ class SettledCorpus:
     """
     The settled-market corpus as a disk-backed, re-iterable sequence of market dicts.
 
-    What fetch_all_settled_markets returns (except on a LEGACY cache hit, which
-    is still a list): a view of the assembled cache file
+    What fetch_all_settled_markets returns: a view of the assembled cache file
     settled_markets_<start_date>[_<tag>][_nomve].jsonl.gz. Every `for m in
     corpus` re-opens the file and yields its records one at a time, as fresh
     dicts, in the assembled order, so the corpus is never held in memory — the
@@ -4558,14 +4465,16 @@ class SettledCorpus:
     ends on a different count, raises SettledCorpusError rather than returning
     a short or different corpus. A walk abandoned early is not checked.
 
-    provenance says what the corpus covers — when it was assembled, the
-    archive cutoff it was assembled under and the post-cutoff verdict as of
-    then (CorpusProvenance) — read from the same meta block the identity
-    check reads, so it describes exactly the file the walks stream.
+    provenance says what the corpus covers — when it was assembled and the
+    archive cutoff it was assembled under (CorpusProvenance) — read from the
+    same meta block the identity check reads, so it describes exactly the
+    file the walks stream; meta is that whole block, which an extension
+    reads its starting points from (_extend_assembled_cache).
     """
 
     def __init__(self, path: Path, expect_meta: dict, count: int,
-                 provenance: CorpusProvenance | None = None):
+                 provenance: CorpusProvenance | None = None,
+                 meta: dict | None = None):
         """
         Args:
             path (Path): The assembled cache file (jsonl-v1 framing).
@@ -4579,11 +4488,16 @@ class SettledCorpus:
                 assembled. Both production constructions (a fresh assembly and
                 open_validated) pass it; None (the default) is a hand-built
                 corpus, which a report then shows as "not recorded".
+            meta (dict | None): The file's whole meta block — the identity
+                keys plus the informational ones (assembled_at,
+                archive_cutoff_ts, live_frontier_ts, ...). None (the default)
+                reads as an empty block.
         """
         self._path = path
         self._expect_meta = dict(expect_meta)
         self._count = count
         self._provenance = provenance
+        self._meta = dict(meta or {})
 
     @classmethod
     def open_validated(cls, path: Path, expect_meta: dict) -> "SettledCorpus | None":
@@ -4606,8 +4520,8 @@ class SettledCorpus:
                 not keep exactly the records the walk counted), or
                 None when the file is absent (silently) or unreadable,
                 truncated, damaged or written for a different request (with a
-                WARNING naming the reason). Whether a valid EMPTY corpus is
-                then served is the caller's decision (_serve_assembled_cache).
+                WARNING naming the reason). Whether it is then served as it is,
+                extended, or rebuilt is the caller's decision.
         """
         if not path.exists():
             return None
@@ -4638,7 +4552,22 @@ class SettledCorpus:
                 path.name, counts.kept, count,
             )
             provenance = dc_replace(provenance, assembly_counts=None)
-        return cls(path, expect_meta, count, provenance=provenance)
+        return cls(path, expect_meta, count, provenance=provenance, meta=meta)
+
+    def with_provenance(self, provenance: CorpusProvenance | None) -> "SettledCorpus":
+        """
+        The same corpus over the same file, saying something else about what it covers.
+
+        Args:
+            provenance (CorpusProvenance | None): The provenance to carry
+                instead of this corpus's own.
+
+        Returns:
+            SettledCorpus: A new corpus with this one's file, identity block,
+                count and meta block, and that provenance.
+        """
+        return SettledCorpus(self._path, self._expect_meta, self._count,
+                             provenance=provenance, meta=self._meta)
 
     @property
     def path(self) -> Path:
@@ -4657,6 +4586,15 @@ class SettledCorpus:
                 run's cache; None only on a hand-built corpus.
         """
         return self._provenance
+
+    @property
+    def meta(self) -> dict:
+        """
+        Returns:
+            dict: A copy of the file's whole meta block, as validated or
+                written ({} on a hand-built corpus).
+        """
+        return dict(self._meta)
 
     def __len__(self) -> int:
         """
@@ -4705,44 +4643,475 @@ class SettledCorpus:
         return f"SettledCorpus({str(self._path)!r}, {self._count} records)"
 
 
-class LegacySettledCorpus(list):
+def _needs_title(m: dict) -> bool:
     """
-    A legacy settled_markets_*.json hit: the whole list, exactly as before, plus its provenance.
+    Whether an already-assembled record's event title should be looked up again.
 
-    Before SS-1 every assembled cache was one JSON document, loaded whole as a
-    list, and such files still load that way (seven of the eight assembled
-    caches on disk on 2026-09-24 were legacy files, 315 MB to 3.27 GB). A
-    plain list can carry no attribute, so without this a legacy hit reached
-    the dashboard header as "not recorded" even though the fetch had just
-    logged the file's time — the page stayed silent for exactly the
-    pre-cutoff caches whose numbers staleness can move (DR-13, DR-66). This
-    subclass changes nothing a consumer can see — it IS the list (equality,
-    len(), iteration, isinstance(..., list)) — and adds only .provenance,
-    which backtester._prepare_candidates reads BY TYPE. Building it copies
-    the list's pointer array once (8 bytes per record: 18,759,168 bytes for
-    a 2,344,886-record list, measured with sys.getsizeof), never a record.
+    An extension resolves titles for its new records, and for an old record
+    only when its event title is still blank and its event is not a combo:
+    a combo's title has no measured effect on which pairs form, and there are
+    millions of them, while a non-combo's matters (TS-11) and there are few.
+
+    Args:
+        m (dict): A record read back from an assembled cache.
+
+    Returns:
+        bool: True when it has an event ticker, a blank event_title, and the
+            event is not an MVE combo (_is_combo_event).
+    """
+    event_ticker = m.get("event_ticker")
+    return (bool(event_ticker) and not m.get("event_title")
+            and not _is_combo_event(event_ticker))
+
+
+class _CorpusSplit:
+    """
+    One walk of an assembled cache, cut where its archive part ends.
+
+    A full assembly writes its archive records first (every one settled
+    before the archive cutoff it was assembled under), then its live records
+    (the partial frontier day, then whole days, newest first). An extension
+    must splice the new live records in between — after the archive part,
+    before the old live days — to keep a fresh assembly's order, so each
+    walk reads the old file ONCE through a shared iterator: head() yields the
+    archive part and stops at the first record settled at or after the
+    cutoff, holding it; tail() yields that record and everything after it.
+    head() must be exhausted before tail() starts, which _assembled_records
+    guarantees by walking its sources in turn.
     """
 
-    def __init__(self, records: list[dict], provenance: CorpusProvenance):
+    def __init__(self, records: Iterable[dict], cutoff_ts: int):
         """
         Args:
-            records (list[dict]): The legacy cache's records, as
-                _load_json_cache returned them.
-            provenance (CorpusProvenance): legacy=True, from_cache=True, the
-                file's mtime as assembled_at, and no cutoff or verdict (the
-                legacy format recorded none).
+            records (Iterable[dict]): The old cache's records, in file order
+                (one walk of its SettledCorpus).
+            cutoff_ts (int): The archive cutoff the old cache was assembled
+                under, epoch seconds.
         """
-        super().__init__(records)
-        self._provenance = provenance
+        self._it = iter(records)
+        self._cutoff = cutoff_ts
+        self._held: dict | None = None
 
-    @property
-    def provenance(self) -> CorpusProvenance:
+    def head(self) -> Iterator[dict]:
         """
-        Returns:
-            CorpusProvenance: When the legacy file was last written (its file
-                time) and that no cutoff was recorded.
+        Yield the archive part: records up to the first one settled at or after the cutoff.
+
+        Yields:
+            dict: The old cache's leading records settled before the cutoff.
         """
-        return self._provenance
+        for m in self._it:
+            settle = _iso_epoch(m.get("settlement_ts"))
+            if settle is None or settle >= self._cutoff:
+                self._held = m
+                return
+            yield m
+
+    def tail(self) -> Iterator[dict]:
+        """
+        Yield the rest of the walk: the record head() stopped at, then every later one.
+
+        Yields:
+            dict: The old cache's remaining records, in file order.
+        """
+        if self._held is not None:
+            held, self._held = self._held, None
+            yield held
+        yield from self._it
+
+
+def _extend_assembled_cache(
+    corpus: SettledCorpus,
+    live_client,
+    start_date: date,
+    prefilter: Callable[[dict], bool] | None,
+    prefilter_tag: str | None,
+    cache_meta: dict,
+    cutoffs: tuple[int, int],
+    extend_from_ts: int,
+) -> SettledCorpus:
+    """
+    Bring an assembled cache from an earlier UTC day up to now, in a fresh assembly's order.
+
+    A full assembly holds no market settled after it was assembled, and a
+    hit used to serve it unchanged at any age, so a backtest run on a later
+    day silently stopped at the cache's day. This extends it instead: the
+    live endpoint's settled days from `extend_from_ts` (the old cache's
+    frontier day — the partial day it captured) through today are fetched
+    (_fetch_live_phase; day slices on disk are reused, and only the missing
+    days and today's frontier hit the API), and the corpus is re-assembled
+    from three sources, walked twice like a fresh assembly (count and
+    collect titles, then patch and write, with the same identity check):
+      1. the old cache's archive part (its records settled before the cutoff
+         it was assembled under — the leading records of the file);
+      2. the new live records;
+      3. the old cache's later records settled before `extend_from_ts` (its
+         older live days), and any settled exactly at it; its records from
+         the frontier day onward are dropped, since the complete day in (2)
+         replaces them (one settled at the very midnight is kept because an
+         endpoint that reads min_settled_ts as exclusive leaves it out of
+         (2); when (2) does hold it, (2)'s copy wins the dedup).
+    Each walk reads the old file once (_CorpusSplit). With the archive cutoff
+    unchanged that is exactly a fresh assembly's record order; with a cutoff
+    that moved forward (but not past `extend_from_ts`, which the caller
+    checks) the same markets, the ones that migrated into the archive taken
+    from the old live part. Titles are resolved for the new records, and for
+    old records whose title is still blank (non-combo only, _needs_title);
+    every other old record keeps the title it was assembled with.
+
+    The extended cache replaces the old one atomically (_DayStreamWriter: the
+    old file is read while the new one is written beside it, and the rename
+    happens only after the second walk reproduced the first). Its meta block
+    records the new assembly time, cutoff and frontier day, and when the
+    corpus was last assembled in full ("full_assembly_at"); it records no
+    assembly_counts — the dropped frontier day's counts cannot be separated
+    from the rest — and the extension's own counts are logged instead.
+
+    Args:
+        corpus (SettledCorpus): The validated old cache. Its file is
+            replaced, so the object must not be walked after this returns.
+        live_client: KalshiClient from build_prod_live_client().
+        start_date (date): The window's first day (the cache's own).
+        prefilter (Callable[[dict], bool] | None): The predicate the cache
+            was assembled under (part of its identity); applied to the new
+            records and, idempotently, to the old ones.
+        prefilter_tag (str | None): Its tag, for the log lines.
+        cache_meta (dict): The cache's identity block (_assembled_cache_meta).
+        cutoffs (tuple[int, int]): (the cutoff the old cache was assembled
+            under, the current one), epoch seconds; the current one must lie
+            between the old one and extend_from_ts (the caller checks).
+        extend_from_ts (int): The UTC midnight from which every settled day
+            is fetched again — the old cache's frontier day.
+
+    Returns:
+        SettledCorpus: The extended corpus over the rewritten cache file,
+            from_cache False, its provenance read from the block just written.
+
+    Raises:
+        SettledCorpusError: If the old file or a day slice cannot be read
+            during a walk, or the second walk does not reproduce the first;
+            nothing is published.
+        OSError: If the frontier spool or the new cache cannot be written.
+        Exception: Whatever the live fetch raises once its retries are spent.
+            The caller turns every exception into a WARNING and serves the
+            old cache as it was.
+    """
+    old_meta = corpus.meta
+    old_cutoff_ts, cutoff_ts = cutoffs
+    start_ts = _window_start_ts(start_date)
+    # Every market settled from here on comes from the new live fetch; the old
+    # cache supplies only what settled before it
+    ext_lo = max(extend_from_ts, start_ts)
+    old_assembled = _parse_assembled_at(old_meta.get("assembled_at"))
+    full_assembly = (_parse_assembled_at(old_meta.get("full_assembly_at"))
+                     or old_assembled)
+    logging.info(
+        "Extending assembled cache %s (assembled %s%s; archive cutoff then %s, "
+        "now %s) through today: every market settled from %s onward is fetched "
+        "again from the live endpoint, reusing the day slices on disk",
+        corpus.path.name,
+        "at an unknown time" if old_assembled is None
+        else f"{old_assembled:%Y-%m-%d %H:%M UTC}",
+        "" if full_assembly is None or full_assembly == old_assembled
+        else f", from a full assembly of {full_assembly:%Y-%m-%d %H:%M UTC}",
+        datetime.fromtimestamp(old_cutoff_ts, tz=UTC).date(),
+        datetime.fromtimestamp(cutoff_ts, tz=UTC).date(),
+        datetime.fromtimestamp(ext_lo, tz=UTC).date(),
+    )
+    # Live-day slices wholly before the current cutoff are dead disk now
+    _prune_stale_live_days(cutoff_ts)
+    # The old records kept are those settled before the frontier midnight —
+    # and AT it: the new fetch asks from that second, and an endpoint that
+    # reads min_settled_ts as exclusive would leave a record settled exactly
+    # then out of it. A copy the new fetch does hold comes first and wins the
+    # dedup, so this never duplicates one
+    tail_ceiling = ext_lo + 1
+    now_ts = int(_utc_now().timestamp())
+    new_tally = _AssemblyTally()
+    # Persisted settled days plus today's frontier, as a fresh assembly fetches them
+    live_records = _fetch_live_phase(live_client, ext_lo, now_ts, prefilter,
+                                     tally=new_tally)
+    try:
+        # Walk A: count each part, collect the titles to resolve, fold identity
+        split_a = _CorpusSplit(corpus, old_cutoff_ts)
+        seen_a: set = set()
+        event_tickers: set[str] = set()
+        head_count, identity_a = _count_assembled(
+            ((split_a.head(), None),), start_ts, prefilter, seen_a, event_tickers, 0,
+            title_wanted=_needs_title)
+        new_count, identity_a = _count_assembled(
+            ((live_records, None),), start_ts, prefilter, seen_a, event_tickers,
+            identity_a, tally=new_tally)
+        tail_count, identity_a = _count_assembled(
+            ((split_a.tail(), tail_ceiling),), start_ts, prefilter, seen_a, event_tickers,
+            identity_a, title_wanted=_needs_title)
+        del seen_a, split_a
+        new_counts = new_tally.counts()
+        kept_old = head_count + tail_count
+        logging.info(
+            "Extension of %s: kept %d of its %d %s (dropped %d settled on or "
+            "after %s, the partial day it was assembled on, which the complete "
+            "day replaces), added %d %s of %d records settled from then on (%s)",
+            corpus.path.name, kept_old, len(corpus), _kept_noun(prefilter_tag),
+            len(corpus) - kept_old, datetime.fromtimestamp(ext_lo, tz=UTC).date(),
+            new_count, _kept_noun(prefilter_tag), new_counts.settled,
+            _describe_counts(new_counts, prefilter_tag),
+        )
+        # The new records' titles, and the old records' still-blank non-combo ones
+        logging.info("Resolving event titles for %d unique event_tickers", len(event_tickers))
+        titles = _load_or_build_event_titles(live_client, event_tickers, use_cache=True)
+        del event_tickers
+
+        expected = kept_old + new_count
+        new_meta = {
+            **cache_meta,
+            "assembled_at": _utc_now().isoformat(),
+            "archive_cutoff_ts": cutoff_ts,
+            "live_frontier_ts": _frontier_day_start(ext_lo, now_ts),
+        }
+        if full_assembly is not None:
+            new_meta["full_assembly_at"] = full_assembly.isoformat()
+        written = 0
+        identity_b = 0
+        # Walk B: the same three parts, a FRESH seen set, written as they come
+        with _DayStreamWriter(corpus.path, new_meta) as writer:
+            split_b = _CorpusSplit(corpus, old_cutoff_ts)
+            seen_b: set = set()
+            parts = (((split_b.head(), None), False), ((live_records, None), True),
+                     ((split_b.tail(), tail_ceiling), False))
+            for source, new in parts:
+                for m in _assembled_records((source,), start_ts, prefilter, seen_b):
+                    event_ticker = m.get("event_ticker") or ""
+                    if new:
+                        # As a full assembly patches every record, when titles resolved at all
+                        if titles:
+                            m["event_title"] = titles.get(event_ticker, "")
+                    elif not m.get("event_title") and titles.get(event_ticker):
+                        # An old record whose title was missing and is known now
+                        m["event_title"] = titles[event_ticker]
+                    identity_b = _assembly_identity(identity_b, m)
+                    writer.write_record(m)
+                    written += 1
+            if written != expected or identity_b != identity_a:
+                raise SettledCorpusError(
+                    f"The extension of {corpus.path.name} did not reproduce "
+                    f"itself: the first walk yielded {expected} markets and the "
+                    f"second {written}"
+                    + ("" if written != expected else " with a different order or "
+                       "different tickers/event_tickers")
+                    + ". A file changed between the two walks (another run may "
+                      "be writing backtest_cache/ concurrently). Nothing was "
+                      "written."
+                )
+            writer.commit()
+        logging.info(
+            "Extended assembled cache %s: %d %s, holding every market settled "
+            "before %s",
+            corpus.path.name, written, _kept_noun(prefilter_tag), new_meta["assembled_at"],
+        )
+        return SettledCorpus(
+            corpus.path, cache_meta, written,
+            provenance=_corpus_provenance(new_meta, from_cache=False), meta=new_meta,
+        )
+    finally:
+        # Release the live phase's frontier spool, as a full assembly does
+        _close_records(live_records)
+
+
+def _served_stale(corpus: SettledCorpus) -> SettledCorpus:
+    """
+    The corpus, marked as an earlier day's cache served as it was because bringing it up to date failed.
+
+    Args:
+        corpus (SettledCorpus): The validated cache, from an earlier UTC day.
+
+    Returns:
+        SettledCorpus: The same file, its provenance's stale flag set (a
+            corpus without a provenance is returned as it is).
+    """
+    provenance = corpus.provenance
+    if provenance is None:
+        return corpus
+    return corpus.with_provenance(dc_replace(provenance, stale=True))
+
+
+def _first_live_settle(corpus: SettledCorpus, cutoff_ts: int) -> int | None:
+    """
+    When the newest record of an assembled cache's live part settled: the first record at or after its cutoff.
+
+    A full assembly writes its archive records first (each settled before the
+    cutoff it read), then its live records, its frontier window first (that
+    day's records, as the endpoint serves them), then whole days newest
+    first; so the first record settled at or after the cutoff belongs to
+    the frontier day — or, when that window held nothing, to an earlier day,
+    which only makes an extension read one more stored day. Walks the
+    archive part once and stops there.
+
+    Args:
+        corpus (SettledCorpus): The validated cache.
+        cutoff_ts (int): The archive cutoff it was assembled under.
+
+    Returns:
+        int | None: That record's settlement, epoch seconds (whole); None
+            when no record settled at or after the cutoff.
+    """
+    walk = iter(corpus)
+    try:
+        for m in walk:
+            settle = _iso_epoch(m.get("settlement_ts"))
+            if settle is not None and settle >= cutoff_ts:
+                return int(settle)
+        return None
+    finally:
+        # An abandoned walk: close its file now, not when it is collected
+        close = getattr(walk, "close", None)
+        if close is not None:
+            close()
+
+
+def _up_to_date_corpus(
+    corpus: SettledCorpus,
+    hist_client: Any,
+    live_client,
+    start_date: date,
+    prefilter: Callable[[dict], bool] | None,
+    prefilter_tag: str | None,
+    cache_meta: dict,
+    now: datetime,
+) -> tuple[SettledCorpus, str] | None:
+    """
+    Decide what to do with a valid assembled cache: serve it, extend it, or rebuild.
+
+    The one place the "always through the most recent available day" rule is
+    decided for a cached corpus:
+      * its frontier day (meta live_frontier_ts — the partial day it was
+        assembled on) is today (UTC): served as it is, with zero network
+        calls ("today");
+      * an earlier day: one /historical/cutoff read; when the cutoff is the
+        one it was assembled under, or has moved forward but not past its
+        frontier day, it is extended through today (_extend_assembled_cache,
+        "extended");
+      * the cutoff has moved past its frontier day (markets it would need
+        have migrated into the archive, which the live endpoint no longer
+        serves), moved backward, or the cache records no cutoff or assembly
+        time: None, and the caller re-assembles in full — each with an INFO
+        line giving the reason;
+      * the cutoff read, or the extension itself, fails: a WARNING naming the
+        failure, and the cache is served as it was ("stale"), its provenance
+        marked stale so the closing log line and the dashboard header do not
+        call it today's (_served_stale).
+    A cache written before live_frontier_ts existed counts as today's when it
+    was assembled today, and otherwise is extended from the day BEFORE the
+    one it was assembled on, or from the day its newest live record settled
+    on when that is earlier (_first_live_settle, one walk of its archive
+    part): an assembly that ran across one or more UTC midnights captured
+    its frontier day only partly, and a day slice already on disk costs a
+    read, not a fetch. A meta value no datetime can hold reads as
+    unrecorded (_meta_epoch), so a damaged block costs a re-assembly, never
+    an exception.
+
+    Args:
+        corpus (SettledCorpus): The validated cache.
+        hist_client (Any): Client for the signed /historical/cutoff read.
+        live_client: KalshiClient from build_prod_live_client().
+        start_date (date): The window's first day.
+        prefilter (Callable[[dict], bool] | None): The cache's predicate.
+        prefilter_tag (str | None): Its tag.
+        cache_meta (dict): The cache's identity block.
+        now (datetime): The current instant (tz-aware, _utc_now()).
+
+    Returns:
+        tuple[SettledCorpus, str] | None: The corpus to serve and how it was
+            obtained ("today", "extended" or "stale"), or None to rebuild.
+    """
+    meta = corpus.meta
+    provenance = corpus.provenance
+    name = corpus.path.name
+    now_ts = int(now.timestamp())
+    today_lo = now_ts - (now_ts % _DAY_SECONDS)
+    assembled = provenance.assembled_at if provenance is not None else None
+    if assembled is None:
+        logging.info("Assembled cache %s records no assembly time, so it cannot be "
+                     "brought up to date — re-assembling the window in full", name)
+        return None
+    # Range-checked: a value no datetime can hold reads as unrecorded, so a
+    # damaged meta block costs a re-assembly, never an exception
+    frontier = _meta_epoch(meta.get("live_frontier_ts"))
+    assembled_lo: int | None = None
+    if frontier is not None:
+        if frontier == today_lo:
+            return corpus, "today"
+        if frontier > today_lo:
+            logging.info("Assembled cache %s says its frontier day is after today "
+                         "by this host's clock — re-assembling the window in full", name)
+            return None
+    else:
+        assembled_ts = int(assembled.timestamp())
+        assembled_lo = assembled_ts - (assembled_ts % _DAY_SECONDS)
+        if assembled_lo == today_lo:
+            return corpus, "today"
+        if assembled_lo > today_lo:
+            logging.info("Assembled cache %s says it was assembled after today by "
+                         "this host's clock — re-assembling the window in full", name)
+            return None
+    old_cutoff = _meta_epoch(meta.get("archive_cutoff_ts"))
+    if old_cutoff is None:
+        logging.info("Assembled cache %s records no archive cutoff, so it cannot be "
+                     "brought up to date — re-assembling the window in full", name)
+        return None
+    if frontier is None:
+        # No frontier recorded (a cache written before the stamp existed):
+        # extend from the day before it was assembled, or from the day its
+        # newest live record settled on if that is earlier — an assembly can
+        # run across more than one UTC midnight between its live fetch and
+        # its stamp, and extending from too late a day would drop the rest
+        # of its frontier day for good
+        frontier = assembled_lo - _DAY_SECONDS
+        newest = _first_live_settle(corpus, old_cutoff)
+        if newest is not None:
+            frontier = min(frontier, newest - newest % _DAY_SECONDS)
+        if _meta_epoch(frontier) is None:
+            logging.info("Assembled cache %s records no frontier day, and none can be "
+                         "worked out from it — re-assembling the window in full", name)
+            return None
+    try:
+        # The one network read a decision needs
+        raw = _historical_get(hist_client, f"{_API_PREFIX}/historical/cutoff")
+        cutoff_ts = int(datetime.fromisoformat(raw["market_settled_ts"]).timestamp())
+    except Exception as exc:
+        logging.warning(
+            "Could not read the archive cutoff to extend assembled cache %s (%s): "
+            "serving it as assembled at %s — it holds no market settled after that",
+            name, _exception_summary(exc), f"{assembled:%Y-%m-%d %H:%M UTC}")
+        return _served_stale(corpus), "stale"
+    frontier_day = datetime.fromtimestamp(frontier, tz=UTC).date()
+    if cutoff_ts < old_cutoff:
+        logging.info(
+            "The archive cutoff (%s) is earlier than the one assembled cache %s was "
+            "assembled under (%s) — re-assembling the window in full",
+            datetime.fromtimestamp(cutoff_ts, tz=UTC).date(), name,
+            datetime.fromtimestamp(old_cutoff, tz=UTC).date())
+        return None
+    if cutoff_ts > frontier:
+        logging.info(
+            "The archive cutoff (%s) has moved past %s, the day assembled cache %s "
+            "was last extended from: markets settled since then have migrated into "
+            "the archive, which only a full assembly reads — re-assembling the "
+            "window in full",
+            datetime.fromtimestamp(cutoff_ts, tz=UTC).date(), frontier_day, name)
+        return None
+    try:
+        # Splice in every market settled from its frontier day onward
+        extended = _extend_assembled_cache(
+            corpus, live_client, start_date, prefilter, prefilter_tag, cache_meta,
+            (old_cutoff, cutoff_ts), frontier)
+    except Exception as exc:
+        logging.warning(
+            "Could not extend assembled cache %s (%s): serving it as assembled at "
+            "%s — it holds no market settled after that",
+            name, _exception_summary(exc), f"{assembled:%Y-%m-%d %H:%M UTC}",
+            exc_info=True)
+        return _served_stale(corpus), "stale"
+    return extended, "extended"
 
 
 def _retire_legacy_cache(legacy_path: Path, superseded_by: Path) -> None:
@@ -4794,7 +5163,7 @@ def fetch_all_settled_markets(
     use_cache: bool = True,
     prefilter: Callable[[dict], bool] | None = None,
     prefilter_tag: str | None = None,
-) -> SettledCorpus | list[dict]:
+) -> SettledCorpus:
     """
     Fetch all settled Kalshi markets from start_date onward, as a re-iterable corpus of dicts.
 
@@ -4868,54 +5237,51 @@ def fetch_all_settled_markets(
     built with MVE included, so the default (True) filename is unchanged and
     no existing cache is orphaned. On use_cache=True, when the .jsonl.gz file
     exists it is validated by one full streaming walk (all or nothing: any
-    decode error, truncation or meta mismatch is a WARNING and a miss) and
-    served as a SettledCorpus — and a miss there REBUILDS: it never falls
-    through to a legacy file, which the streamed cache's own commit
-    superseded. Only when no .jsonl.gz exists at all is a LEGACY
+    decode error, truncation or meta mismatch is a WARNING and a miss), and
+    then brought up to date (_up_to_date_corpus): served as it is, with ZERO
+    network calls, when it was assembled today (UTC); extended through today
+    when it is from an earlier day (_extend_assembled_cache: one
+    /historical/cutoff read and the live endpoint's settled days from its
+    frontier day onward); re-assembled in full when it cannot be extended
+    (the cutoff moved past its frontier day, or it records no cutoff or
+    assembly time); and served as it was, with a WARNING, when the extension
+    fails. A miss REBUILDS: it never falls through to a legacy file, which
+    the streamed cache's own commit superseded. A LEGACY
     settled_markets_<...>.json cache of the same identity (the single JSON
-    document every run before SS-1 wrote, some of them GB-scale) still loaded
-    exactly as before, whole, as a list; failing that, the corpus is fetched.
-    New runs never write the legacy format. Pass use_cache=False (--no-cache)
-    to rebuild — thanks to the day stores that now only costs the frontier
-    day plus any newly-appeared days. A fresh result is always written
-    regardless of use_cache, so a --no-cache run refreshes what the next
-    default run will load; and once it is committed, a legacy file of the
-    same identity is deleted (_retire_legacy_cache, with an INFO line), just
-    as the old code's rebuild overwrote it — otherwise that older assembly
-    would be served again whenever the .jsonl.gz went missing.
+    document every run before SS-1 wrote) is no longer served at all — it
+    records nothing an extension could start from — so its window is
+    re-assembled in full, and once that is committed the legacy file is
+    deleted (_retire_legacy_cache, with an INFO line). New runs never write
+    the legacy format. Pass use_cache=False (--no-cache) to re-assemble in
+    full; thanks to the day stores that costs the frontier day plus any
+    archive or live day not stored or no longer valid. A fresh result is
+    always written regardless of use_cache.
 
-    A hit is ANNOUNCED, never silent, and still makes ZERO network calls
-    (DR-13 and M2/M3 of the 2026-09-24 review). The streamed cache's meta
-    block records, besides its identity, three informational keys the
-    identity check never compares: assembled_at (the corpus holds no market
-    settled after it), since P2 archive_cutoff_ts (the cutoff it was
-    assembled under), and since M9 assembly_counts (how many records settled
-    in the window and how many of them the prefilter rejected). A hit's
-    count line names its records "eligible markets" when a prefilter ran and
-    quotes those counts as of assembly (_log_cache_load). A hit also logs
-    the assembly time and its age, that the window
-    nominally runs to today, the cutoff at assembly, and what --no-cache
-    costs to extend the corpus (_announce_cache_hit); a legacy .json hit logs
-    its file time instead, says it records no cutoff, and is returned as a
-    LegacySettledCorpus carrying that file time. When the stamped cutoff
-    puts start_date at or after it, the structurally-0-trade WARNING the miss
-    path logs after its cutoff read is repeated, worded "as of this cached
-    corpus's assembly", since the cutoff may have advanced since and a hit
-    does not re-read it. A non-empty cache is never expired by age
-    ("announce, don't enforce"); an EMPTY one — streamed or legacy — is
-    served only while younger than EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS, and
-    is otherwise (or with an unreadable assembly time) a miss that rebuilds
-    (_serve_assembled_cache).
+    Every corpus is announced, never silent (DR-13 and M3 of the 2026-09-24
+    review). The streamed cache's meta block records, besides its identity,
+    informational keys the identity check never compares: assembled_at (the
+    corpus holds no market settled after it), archive_cutoff_ts (the cutoff
+    it was assembled under), live_frontier_ts (the first second of its
+    partial frontier day, from which a later day's run extends it),
+    assembly_counts on a full assembly (how many records settled in the
+    window and how many of them the prefilter rejected, M9) and
+    full_assembly_at on an extended one (when it was last assembled in
+    full). A served cache's count line names its records "eligible markets"
+    when a prefilter ran and quotes those counts as of assembly
+    (_log_cache_load), and a same-day hit also logs its assembly time and
+    the cutoff at assembly (_announce_cache_hit). An extension logs what it
+    kept, dropped and added.
 
     Args:
         hist_client (Any): Authenticated KalshiClient from build_historical_client().
         live_client: KalshiClient from build_prod_live_client() for recent settlements.
         start_date (date): Earliest settlement date to include. Markets that settled
             before this date are skipped even if the API returns them.
-        use_cache (bool): If True (default), load the assembled per-start_date
-            cache if available and skip fetching entirely. If False, always
-            re-assemble from the API + day stores. Either way the result is
-            saved to disk.
+        use_cache (bool): If True (default), use the assembled per-start_date
+            cache when there is one: served as it is when assembled today,
+            otherwise extended through today (or re-assembled in full when
+            it cannot be). If False, always re-assemble from the API + day
+            stores. Either way the result is saved to disk.
         prefilter (Callable[[dict], bool] | None): Optional per-record
             predicate; records failing it are dropped during assembly and
             never reach the returned corpus or the assembled cache. Intended for
@@ -4944,11 +5310,9 @@ def fetch_all_settled_markets(
             read or no longer holds len() records.
 
     Returns:
-        SettledCorpus | list[dict]: A re-iterable corpus of market dicts that
-            supports len() — a SettledCorpus streaming the assembled
-            .jsonl.gz cache (fresh dicts on every walk) after a fetch or a
-            new-format cache hit, or a LegacySettledCorpus (a list) when a
-            LEGACY .json cache is served. Either way each record has the keys: ticker,
+        SettledCorpus: A re-iterable corpus of market dicts that supports
+            len(), streaming the assembled .jsonl.gz cache (fresh dicts on
+            every walk). Each record has the keys: ticker,
             event_ticker, event_title, title, subtitle, result ("yes" |
             "no"), yes_ask_dollars, no_ask_dollars, yes_bid_dollars,
             open_time, close_time (ISO str), settlement_ts (ISO str), status,
@@ -4958,9 +5322,9 @@ def fetch_all_settled_markets(
             now falls back to yes_sub_title; price_level_structure/
             price_ranges are unread groundwork that older cache records lack
             entirely). Consumers must only iterate it (as many times as they
-            like) and take its len(); nothing indexes it. Both kinds also
-            carry .provenance (CorpusProvenance: from_cache, assembled_at,
-            archive_cutoff, post_cutoff, legacy, assembly_counts), which the
+            like) and take its len(); nothing indexes it. It also carries
+            .provenance (CorpusProvenance: from_cache, assembled_at,
+            archive_cutoff, assembly_counts, full_assembly_at), which the
             backtester carries to the dashboard header and quotes on its
             prefilter line.
     """
@@ -4996,60 +5360,44 @@ def fetch_all_settled_markets(
     legacy_cache_path = CACHE_DIR / f"{stem}.json"
     cache_meta = _assembled_cache_meta(start_date, prefilter_tag)
     if use_cache:
-        # Every hit below is announced (DR-13) — what the corpus covers and how
-        # to extend it — and makes ZERO network calls: the post-cutoff verdict
-        # a hit reports is the one stamped at assembly, never a fresh read of
-        # /historical/cutoff (pinned by TestCorpusProvenance).
-        now = datetime.now(UTC)
+        # Every backtest runs through the most recent available day: a cache
+        # assembled today (UTC) is served with ZERO network calls; one from an
+        # earlier day is extended through today, or re-assembled in full when
+        # it cannot be (pinned by TestCorpusProvenance and TestCacheExtension).
+        now = _utc_now()
         if cache_path.exists():
-            # Preferred: the streamed cache, validated by one full walk and
-            # then served as a disk-backed corpus, so a hit never materializes
-            # it. The same walk reads the meta block its provenance comes from.
+            # The streamed cache, validated by one full walk; the same walk
+            # reads the meta block its provenance and frontier day come from.
             corpus = SettledCorpus.open_validated(cache_path, cache_meta)
-            if corpus is not None and _serve_assembled_cache(
-                    cache_path, len(corpus), corpus.provenance.assembled_at, now):
-                # What the corpus is, and what its prefilter rejected as of
-                # assembly (M9) — the counts come from its own meta block
-                _log_cache_load(len(corpus), corpus.provenance.assembly_counts,
-                                start_date, prefilter_tag)
-                # Coverage line, and the post-cutoff WARNING as of assembly
-                _announce_cache_hit(cache_path, start_date, corpus.provenance, now)
-                return corpus
-            # Present but invalid (its WARNING is already logged), or valid but
-            # EMPTY and stale (likewise): a miss that REBUILDS, never a
-            # fall-through to a legacy file. A streamed cache of this identity
-            # was committed at some point, so any legacy file beside it is an
-            # OLDER assembly that commit superseded — serving it would quietly
-            # swap the corpus the operator last rebuilt for the one that
-            # rebuild replaced.
-        else:
-            # Otherwise a legacy cache, exactly as before SS-1: read whole, as
-            # a list (the backtester only iterates it). Existing GB-scale
-            # caches must keep loading; nothing writes this format any more,
-            # and the first rebuild of the same identity retires it (below).
-            # Its file time is its only assembly stamp and it records no
-            # cutoff; the list is handed back as a LegacySettledCorpus so that
-            # file time reaches the dashboard header too, not only this log.
-            cached = _load_json_cache(legacy_cache_path)
-            if cached is not None:
-                written_at = _file_time(legacy_cache_path)
-                if _serve_assembled_cache(legacy_cache_path, len(cached), written_at, now):
-                    # A legacy file records no assembly counts (M9)
-                    _log_cache_load(len(cached), None, start_date, prefilter_tag)
-                    provenance = CorpusProvenance(
-                        from_cache=True, assembled_at=written_at,
-                        archive_cutoff=None, post_cutoff=None, legacy=True,
-                    )
-                    # Coverage line (file time, no cutoff to repeat a verdict from)
-                    _announce_cache_hit(legacy_cache_path, start_date, provenance, now)
-                    # Only a list is wrapped: anything else a damaged file holds
-                    # is returned exactly as before this change.
-                    if isinstance(cached, list):
-                        return LegacySettledCorpus(cached, provenance)
-                    return cached
-                # An EMPTY legacy cache past the age limit (the 2-byte "[]"
-                # 2026-08-29 file): rebuilt below, and the rebuild's commit
-                # retires it like any superseded legacy file.
+            if corpus is not None:
+                # Serve it, extend it, or rebuild (None)
+                decided = _up_to_date_corpus(corpus, hist_client, live_client, start_date,
+                                             prefilter, prefilter_tag, cache_meta, now)
+                if decided is not None:
+                    served, how = decided
+                    if how != "extended":
+                        # What the corpus is, and what its prefilter rejected
+                        # as of assembly (M9) — from its own meta block
+                        _log_cache_load(len(served), served.provenance.assembly_counts,
+                                        start_date, prefilter_tag)
+                    if how == "today":
+                        # Coverage line: assembly time, cutoff at assembly
+                        _announce_cache_hit(cache_path, served.provenance, now)
+                    return served
+            # Invalid (its WARNING is already logged) or not to be extended
+            # (its INFO line says why): a miss that REBUILDS, never a
+            # fall-through to a legacy file, which a streamed cache of this
+            # identity superseded when it was committed.
+        elif legacy_cache_path.exists():
+            # A legacy settled_markets_*.json records neither its archive
+            # cutoff nor where its live part ends, so it cannot be brought up
+            # to date: re-assembled in full below (it is not even read), and
+            # the rebuild's commit deletes it (_retire_legacy_cache).
+            logging.info(
+                "Legacy assembled cache %s cannot be brought up to date (it records "
+                "no archive cutoff and no frontier day) — re-assembling the window "
+                "in full in the streamed format, which then replaces it",
+                legacy_cache_path.name)
 
     # Convert start_date to a unix timestamp for filtering individual market records
     start_ts = _window_start_ts(start_date)
@@ -5058,19 +5406,11 @@ def fetch_all_settled_markets(
     cutoff    = _historical_get(hist_client, f"{_API_PREFIX}/historical/cutoff")
     cutoff_ts = int(datetime.fromisoformat(cutoff["market_settled_ts"]).timestamp())
 
-    # A start_date at/after the archive cutoff means every market this window
-    # could ever touch is post-cutoff — i.e. live-era. Live-era markets 404 on
-    # /historical/markets/{ticker}/candlesticks (see the CLAUDE.md "Backtest
-    # windows must start BEFORE the archive cutoff" gotcha), so _find_entry()
-    # can never get candles for either leg and the run is structurally 0-trade
-    # no matter how many markets this fetch returns. Warn only — never abort,
-    # since the fetch can still be useful (e.g. for cache warming) and a false
-    # positive here must not block a legitimate run (DR-50's short-circuit is
-    # an open operator decision). The cutoff is also stamped into the
-    # assembled cache below, so a later HIT can repeat this verdict "as of
-    # assembly" without a network call (M2).
-    if _starts_at_or_after_cutoff(start_ts, cutoff_ts):
-        _warn_post_cutoff(start_date, datetime.fromtimestamp(cutoff_ts, tz=UTC))
+    # A window may start at or after the cutoff: its markets settled after
+    # it, and the backtester prices them from Kalshi's live candlestick
+    # endpoint (fetch_candlesticks' 404 fallback), so nothing here is
+    # structurally 0-trade any more. The cutoff is stamped into the assembled
+    # cache below, as information a later hit reports.
 
     # Build the historical-endpoint base kwargs; gate the MVE filter on the config flag.
     # When INCLUDE_MVE_MARKETS is True, omitting mve_filter lets MVE markets through;
@@ -5140,7 +5480,8 @@ def fetch_all_settled_markets(
     # Windowed parallel fetch with settled-day disk reuse; sequential on
     # fallback. Past days come back unfiltered; the frontier (and a fallback)
     # apply the prefilter as pages arrive and report what they dropped.
-    live_records = _fetch_live_phase(live_client, live_min_ts, int(time.time()),
+    now_ts = int(_utc_now().timestamp())
+    live_records = _fetch_live_phase(live_client, live_min_ts, now_ts,
                                      prefilter, tally=live_tally)
     try:
         live_sources = ((live_records, None),)
@@ -5194,15 +5535,17 @@ def fetch_all_settled_markets(
         expected = archive_count + live_count
         written = 0
         identity_b = 0
-        # The identity block plus two INFORMATIONAL keys a later hit reads
-        # back (CorpusProvenance) and the identity check never compares: when
-        # the corpus was assembled (it holds nothing settled after that), and
-        # the archive cutoff it was assembled under (so a hit can repeat the
-        # post-cutoff verdict "as of assembly" with no network call — M2).
+        # The identity block plus INFORMATIONAL keys a later run reads back
+        # (CorpusProvenance, _up_to_date_corpus) and the identity check never
+        # compares: when the corpus was assembled (it holds nothing settled
+        # after that), the archive cutoff it was assembled under, and the
+        # first second of its partial frontier day, from which a later day's
+        # run extends it.
         assembled_meta = {
             **cache_meta,
-            "assembled_at": datetime.now(UTC).isoformat(),
+            "assembled_at": _utc_now().isoformat(),
             "archive_cutoff_ts": cutoff_ts,
+            "live_frontier_ts": _frontier_day_start(live_min_ts, now_ts),
             # Informational too (M9): how many records settled in the window
             # and what the prefilter and the dedup removed, as of assembly
             "assembly_counts": {
@@ -5383,6 +5726,115 @@ def _merge_candle_pages(candles: list[dict]) -> list[dict]:
     return merged
 
 
+def _candle_endpoints(ticker: str, series: str | None,
+                      live_first: bool) -> list[tuple[str, str]]:
+    """
+    The candlestick endpoints to ask for one market, in the order to ask them.
+
+    Kalshi serves a market's candles from one of two places. A market that
+    settled before the archive cutoff is in the archive, at
+    /historical/markets/{ticker}/candlesticks; a market that settled after it
+    (the last couple of months) is still on the live API, at
+    /series/{series_ticker}/markets/{ticker}/candlesticks, and the archive
+    path answers 404 for it. The live path needs the market's series, so
+    without one only the archive is asked.
+
+    Args:
+        ticker (str): The market's ticker.
+        series (str | None): Its series ticker (historical.series_ticker of its
+            event ticker), or None/"" when unknown.
+        live_first (bool): Whether to ask the live endpoint first (the market
+            settled at or after the archive cutoff).
+
+    Returns:
+        list[tuple[str, str]]: (name, path) pairs, "historical" and/or "live",
+            first to ask first.
+    """
+    archive = ("historical", f"{_API_PREFIX}/historical/markets/{ticker}/candlesticks")
+    if not isinstance(series, str) or not series:
+        return [archive]
+    live = ("live", f"{_API_PREFIX}/series/{series}/markets/{ticker}/candlesticks")
+    return [live, archive] if live_first else [archive, live]
+
+
+def _fetch_candle_pages(client: Any, path: str, windows: list[tuple[int, int]],
+                        rate_limit_sleep: float, progress: dict) -> tuple[list[dict], int, int]:
+    """
+    Fetch every request of one window from one candlestick endpoint and parse it.
+
+    Each request is the same retried read-only GET (_historical_get); the
+    candles of a paged window are put in timestamp order with the overlaps'
+    repeats dropped (_merge_candle_pages). Any failed request raises, so the
+    window is all-or-nothing.
+
+    Args:
+        client (Any): Authenticated KalshiClient.
+        path (str): The endpoint path (_candle_endpoints).
+        windows (list[tuple[int, int]]): The window's requests (_candle_request_windows).
+        rate_limit_sleep (float): Seconds to sleep after each request.
+        progress (dict): Its "request" key is set to the 1-based number of the
+            request in flight, for the caller's failure line.
+
+    Returns:
+        tuple[list[dict], int, int]: The parsed candles ("ts", "yes_ask_close",
+            "no_ask_close"), how many raw candles came back and how many of
+            them could not be parsed.
+
+    Raises:
+        Exception: Whatever a request raises (an ApiException carries .status).
+    """
+    candles: list[dict] = []
+    raw_count = 0
+    dropped = 0
+    progress["request"] = 0
+    for request_open, request_close in windows:
+        progress["request"] += 1
+        # Raw signed GET — the pinned SDK has no historical_api module and
+        # its candlestick models predate the current wire format anyway.
+        # Read-only, so _historical_get's api_call_with_retry backoff
+        # applies per request.
+        data = _historical_get(
+            client, path,
+            start_ts=request_open,
+            end_ts=request_close,
+            period_interval=CANDLESTICK_PERIOD_INTERVAL_MINUTES,
+        )
+        raw_candlesticks = data.get("candlesticks") or []
+        raw_count += len(raw_candlesticks)
+        for c in raw_candlesticks:
+            try:
+                ya = c.get("yes_ask") or {}
+                yb = c.get("yes_bid") or {}
+                # Dollar-string extraction with explicit presence checks —
+                # see _candle_close for why truthiness fallthrough is wrong
+                yes_ask = _candle_close(ya)
+                yes_bid = _candle_close(yb)
+                if yes_ask is None or yes_bid is None:
+                    # Counts as a DROP, not a silent skip: _candle_close
+                    # signals an unparseable/absent close by returning None
+                    # rather than raising, so without this the candle would
+                    # bypass the counter below and a thinned series would be
+                    # cached with no visible signal at all (BS-23).
+                    dropped += 1
+                    continue
+                # NO ask ≈ 1 - YES bid (binary market complement); clamp to avoid 0 or 1
+                no_ask = 1.0 - yes_bid
+                candles.append({
+                    "ts": c["end_period_ts"],
+                    "yes_ask_close": yes_ask,
+                    "no_ask_close": max(0.01, min(0.99, no_ask)),
+                })
+            except (ValueError, TypeError, AttributeError, KeyError):
+                dropped += 1
+        # Rate limit: sleep briefly after each call to avoid 429 responses
+        time.sleep(rate_limit_sleep)
+    if len(windows) > 1:
+        # Paged: put the requests' candles in timestamp order and drop the
+        # repeats the one-period overlaps return twice.
+        candles = _merge_candle_pages(candles)
+    return candles, raw_count, dropped
+
+
 def fetch_candlesticks(
     hist_client: Any,
     ticker: str,
@@ -5390,6 +5842,9 @@ def fetch_candlesticks(
     close_ts: int,
     use_cache: bool = True,
     rate_limit_sleep: float = 0.15,
+    *,
+    series: str | None = None,
+    live_first: bool = False,
 ) -> list[dict]:
     """
     Fetch OHLC candlesticks for one market over its active lifetime.
@@ -5402,6 +5857,18 @@ def fetch_candlesticks(
     because most Kalshi markets are single-game/few-hour windows that don't
     cross a UTC midnight boundary — daily candles return zero bars for them
     (see config.py CANDLESTICK_PERIOD_INTERVAL_MINUTES for the full explanation).
+
+    Two endpoints serve candles (_candle_endpoints): the archive
+    (/historical/markets/{ticker}/candlesticks) for a market that settled
+    before Kalshi's archive cutoff, and the live API
+    (/series/{series}/markets/{ticker}/candlesticks) for one that settled
+    after it, which the archive answers with 404. Given the market's series,
+    the endpoint live_first names is asked first and a 404 from it asks the
+    other for the whole window, so a market the cutoff has moved past since
+    it was routed is still found. Any other failure, or a 404 from both, is
+    final. Without a series only the archive is asked, as before. The live
+    endpoint's per-request cap is assumed to be the archive's
+    (CANDLESTICK_MAX_CANDLES_PER_REQUEST); it has not been measured.
 
     The endpoint serves at most CANDLESTICK_MAX_CANDLES_PER_REQUEST candles
     per request and refuses a longer one with HTTP 400, which used to reach
@@ -5445,6 +5912,12 @@ def fetch_candlesticks(
         rate_limit_sleep (float): Seconds to sleep after each API call (each
             request of a paged window included) to stay within the Kalshi rate
             limit. Defaults to 0.15 seconds.
+        series (str | None): Keyword-only. The market's series ticker
+            (series_ticker of its event ticker); with one, the live endpoint is
+            asked too. None (default) asks the archive only.
+        live_first (bool): Keyword-only. Ask the live endpoint before the
+            archive — the market settled at or after the archive cutoff. Read
+            only with a series. False (default).
 
     Returns:
         list[dict]: List of candlestick dicts with keys:
@@ -5485,61 +5958,31 @@ def fetch_candlesticks(
     # One request unless the window is longer than the endpoint serves in one
     # (CANDLESTICK_MAX_CANDLES_PER_REQUEST), in which case it is paged.
     windows = _candle_request_windows(open_ts, close_ts)
-    # 1-based number of the request in flight, read only by the failure line
-    # below; reset to 0 once every request has returned, so a failure after
-    # that (the cache write) is not blamed on the last request.
-    request_no = 0
+    # The archive, the live API, or both, in the order to ask them
+    endpoints = _candle_endpoints(ticker, series, live_first)
+    # "request": the 1-based number of the request in flight, read only by the
+    # failure line below; reset to 0 once every request has returned, so a
+    # failure after that (the cache write) is not blamed on the last request.
+    progress = {"request": 0}
+    # The endpoints asked so far, named in the failure line when there were two
+    tried: list[str] = []
     try:
-        candles = []
-        raw_count = 0
-        dropped = 0
-        for request_open, request_close in windows:
-            request_no += 1
-            # Raw signed GET — the pinned SDK has no historical_api module and
-            # its candlestick models predate the current wire format anyway.
-            # Read-only, so _historical_get's api_call_with_retry backoff
-            # applies per request.
-            data = _historical_get(
-                hist_client,
-                f"{_API_PREFIX}/historical/markets/{ticker}/candlesticks",
-                start_ts=request_open,
-                end_ts=request_close,
-                period_interval=CANDLESTICK_PERIOD_INTERVAL_MINUTES,
-            )
-            raw_candlesticks = data.get("candlesticks") or []
-            raw_count += len(raw_candlesticks)
-            for c in raw_candlesticks:
-                try:
-                    ya = c.get("yes_ask") or {}
-                    yb = c.get("yes_bid") or {}
-                    # Dollar-string extraction with explicit presence checks —
-                    # see _candle_close for why truthiness fallthrough is wrong
-                    yes_ask = _candle_close(ya)
-                    yes_bid = _candle_close(yb)
-                    if yes_ask is None or yes_bid is None:
-                        # Counts as a DROP, not a silent skip: _candle_close
-                        # signals an unparseable/absent close by returning None
-                        # rather than raising, so without this the candle would
-                        # bypass the counter below and a thinned series would be
-                        # cached with no visible signal at all (BS-23).
-                        dropped += 1
-                        continue
-                    # NO ask ≈ 1 - YES bid (binary market complement); clamp to avoid 0 or 1
-                    no_ask  = 1.0 - yes_bid
-                    candles.append({
-                        "ts": c["end_period_ts"],
-                        "yes_ask_close": yes_ask,
-                        "no_ask_close": max(0.01, min(0.99, no_ask)),
-                    })
-                except (ValueError, TypeError, AttributeError, KeyError):
-                    dropped += 1
-            # Rate limit: sleep briefly after each call to avoid 429 responses
-            time.sleep(rate_limit_sleep)
-        request_no = 0
-        if len(windows) > 1:
-            # Paged: put the requests' candles in timestamp order and drop the
-            # repeats the one-period overlaps return twice.
-            candles = _merge_candle_pages(candles)
+        for attempt, (name, path) in enumerate(endpoints):
+            tried.append(name)
+            try:
+                candles, raw_count, dropped = _fetch_candle_pages(
+                    hist_client, path, windows, rate_limit_sleep, progress)
+                break
+            except Exception as e:
+                # A 404 means this endpoint does not hold the market (the
+                # archive cutoff sits on the other side of its settlement);
+                # the other endpoint may. Anything else, or a 404 from the
+                # last endpoint, is final.
+                if getattr(e, "status", None) != 404 or attempt + 1 == len(endpoints):
+                    raise
+                # The failed request took no sleep of its own
+                time.sleep(rate_limit_sleep)
+        progress["request"] = 0
         if dropped:
             # The drop happens before the cache write, so a thinned series is
             # otherwise cached as if it were complete with no visible signal.
@@ -5551,7 +5994,8 @@ def fetch_candlesticks(
         # unconditionally — use_cache only controls whether reads may come
         # from disk, mirroring fetch_all_settled_markets — otherwise a
         # --no-cache run would never actually refresh the file the next
-        # default run loads.
+        # default run loads. Which endpoint served the candles is not
+        # recorded: the candles are the same market's either way.
         _save_json_cache(cache_path, {
             "open_ts": open_ts, "close_ts": close_ts,
             "period_interval": CANDLESTICK_PERIOD_INTERVAL_MINUTES,
@@ -5559,17 +6003,19 @@ def fetch_candlesticks(
         })
         return candles
     except Exception as e:
-        # ONE line, no header dump (TS-02): post-cutoff tickers 404 by design
-        # and are deliberately never cached, so this warning is re-paid on
-        # every run for every such ticker. The per-run count is summarized
-        # once by backtester._fetch_candles_parallel, which sees every ticker.
-        # A paged window names the request that failed; a single-request one
-        # keeps the exact line it always logged.
-        where = (f" (request {request_no} of {len(windows)})"
-                 if len(windows) > 1 and request_no else "")
+        # ONE line, no header dump (TS-02): a ticker neither endpoint serves
+        # is deliberately never cached, so this warning is re-paid on every
+        # run for every such ticker. The per-run count is summarized once by
+        # backtester._fetch_candles_parallel, which sees every ticker. A
+        # paged window names the request that failed, and a fetch that asked
+        # both endpoints says so; a single-request, archive-only fetch keeps
+        # the exact line it always logged.
+        where = (f" (request {progress['request']} of {len(windows)})"
+                 if len(windows) > 1 and progress["request"] else "")
+        via = f" ({' then '.join(tried)} endpoint)" if tried != ["historical"] else ""
         logging.warning(
-            "Candlestick fetch failed for %s: HTTP %s %s%s",
-            ticker, getattr(e, "status", "?"), _exception_summary(e), where,
+            "Candlestick fetch failed for %s: HTTP %s %s%s%s",
+            ticker, getattr(e, "status", "?"), _exception_summary(e), where, via,
         )
         time.sleep(rate_limit_sleep)
         # Deliberately DO NOT cache — a poisoned empty file would silence this

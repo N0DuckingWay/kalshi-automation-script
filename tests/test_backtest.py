@@ -24,7 +24,8 @@ the setting.
 
 And --no-add-on-sweep: the dashboard's Add to held pairs family is on by
 default (add_on_sweep=True), the flag threads add_on_sweep=False, and the echo
-line names the setting right after the cap sweep's.
+line names the setting right after the cap sweep's. --no-sell-sweep does the
+same for the Sell family (sell_sweep), named right after the add-on sweep.
 
 And the echo's "live rule=" clause: the saved live defaults' rule (with their
 origin), "none saved" with no file, "not recorded" with a refused one — a read
@@ -519,11 +520,60 @@ class TestAddOnSweepArgument:
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         # The band and cap sweeps' substrings other tests read stay a prefix
-        assert "| band sweep=on | cap sweep=on | add-on sweep=on | live rule=" in caplog.text
+        assert "| band sweep=on | cap sweep=on | add-on sweep=on | sell sweep=on (" \
+            in caplog.text
         caplog.clear()
         with caplog.at_level(logging.INFO):
-            _run(monkeypatch, "--no-add-on-sweep", "--no-cap-sweep")
-        assert "| cap sweep=off | add-on sweep=off | live rule=" in caplog.text
+            _run(monkeypatch, "--no-add-on-sweep", "--no-cap-sweep", "--sell-workers", "1")
+        assert ("| cap sweep=off | add-on sweep=off | sell sweep=on (1 worker process) "
+                "| live rule=") in caplog.text
+
+
+class TestSellSweepArgument:
+    """--no-sell-sweep: the dashboard's Sell family is ON by default, like the
+    add-on family, and the flag threads sell_sweep=False into
+    run_backtest_sweep; the echo names the setting after the add-on sweep's."""
+
+    def test_sell_sweep_is_on_by_default(self, cli, monkeypatch):
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["sell_sweep"] is True
+
+    def test_no_sell_sweep_turns_only_it_off(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--no-sell-sweep")
+        kwargs = cli["sweep_kwargs"]
+        assert (kwargs["sell_sweep"], kwargs["add_on_sweep"], kwargs["band_sweep"],
+                kwargs["cap_sweep"]) == (False, True, True, True)
+        assert "| add-on sweep=on | sell sweep=off | live rule=" in caplog.text
+
+
+class TestSellWorkersArgument:
+    """--sell-workers: how many worker processes the dashboard simulates its
+    Sell select in — by default one less than the CPU count, within
+    config.DASHBOARD_SELL_MAX_WORKERS, and at least 1 — handed to
+    generate_dashboard and named in the echo."""
+
+    @pytest.mark.parametrize(("cpus", "expected"), [
+        (1, 1), (2, 1), (4, 3), (64, config.DASHBOARD_SELL_MAX_WORKERS), (None, 1)])
+    def test_the_default_leaves_one_cpu_and_stays_in_the_bound(self, cli, monkeypatch,
+                                                                 cpus, expected):
+        monkeypatch.setattr(backtest.os, "cpu_count", lambda: cpus)
+        _run(monkeypatch)
+        assert cli["dashboard"][1]["sell_workers"] == expected
+
+    def test_a_count_is_handed_through_and_echoed(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--sell-workers", "3")
+        assert cli["dashboard"][1]["sell_workers"] == 3
+        assert "| sell sweep=on (3 worker processes) | live rule=" in caplog.text
+
+    @pytest.mark.parametrize("value", ["0", "-2"])
+    def test_a_count_below_one_is_refused(self, cli, monkeypatch, capsys, value):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--sell-workers", value)
+        assert exc.value.code == 2
+        assert "--sell-workers must be a positive integer" in capsys.readouterr().err
+        assert "sweep_kwargs" not in cli
 
 
 class TestLiveRuleEcho:
@@ -902,15 +952,16 @@ class TestSummaryBlock:
 
 
 class TestCorpusProvenanceLine:
-    """DR-13 / M2 (P2): the run's report closes, on every run, with what
+    """DR-13 (P2): the run's report closes, on every run, with what
     settled-market corpus it read — the Period line runs to today, the corpus
-    only to its assembly — and a post-cutoff window's zero is called
-    structural beside the result, not only at the top of a long log, unless
-    the run's own trades prove that stamped verdict stale."""
+    only to its assembly, which every run brings up to date (a cache from an
+    earlier UTC day is extended). The archive cutoff is information only: a
+    window starting after it is priced from the live candlestick endpoint, so
+    the old "structurally 0-trade" WARNING is gone."""
 
     PROV = CorpusProvenance(
         from_cache=True, assembled_at=datetime(2026, 9, 24, 12, 37, 49, tzinfo=UTC),
-        archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC), post_cutoff=False)
+        archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC))
 
     @pytest.mark.parametrize("n_trades", [0, 2])
     def test_the_corpus_line_closes_every_run(self, cli, monkeypatch, caplog, n_trades):
@@ -919,55 +970,61 @@ class TestCorpusProvenanceLine:
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         assert ("Settled-market corpus: assembled 2026-09-24 12:37 UTC, holding no "
-                "market settled after that (served from an earlier run's cache; "
-                "--no-cache extends it); archive cutoff at assembly: 2026-07-25"
-                ) in caplog.text
+                "market settled after that (served from an earlier run's cache, "
+                "assembled earlier today; --no-cache re-assembles it in full); "
+                "archive cutoff at assembly: 2026-07-25") in caplog.text
         assert "structural" not in caplog.text
 
-    def test_a_post_cutoff_window_is_called_structural(self, cli, monkeypatch, caplog):
-        cli["result"].corpus_provenance = dataclasses.replace(self.PROV, post_cutoff=True)
+    def test_a_window_after_the_cutoff_draws_no_warning(self, cli, monkeypatch, caplog):
+        # The run's start date (the CLI default here) is irrelevant now: a
+        # cutoff after it, or before it, is reported and judged on nothing.
+        cli["result"].corpus_provenance = dataclasses.replace(
+            self.PROV, archive_cutoff=datetime(2030, 1, 1, tzinfo=UTC))
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
-        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-        assert any("starts at or after the archive cutoff as of its corpus's assembly"
-                   in m and "no trade could be entered whatever pairs formed" in m
-                   and "--no-cache re-checks it" in m for m in warned)
-        assert not any("that verdict is stale" in m for m in warned)
-
-    def test_a_post_cutoff_verdict_contradicted_by_trades_is_reported_as_stale(
-            self, cli, monkeypatch, caplog):
-        # P2 review (R3/C3/ADV-3): after a trade summary, "no trade could be
-        # entered" would be false on its face. The same helper the dashboard
-        # header reads (backtester.max_trades_simulated) turns it into a
-        # stale-verdict WARNING, so the page and the log agree.
-        cli["result"] = _sweep(n_trades=2)
-        cli["result"].corpus_provenance = dataclasses.replace(self.PROV, post_cutoff=True)
-        with caplog.at_level(logging.INFO):
-            _run(monkeypatch)
-        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-        assert not any("no trade could be entered whatever pairs formed" in m
-                       for m in warned)
-        assert any("The archive cutoff recorded at this corpus's assembly is at or "
-                   "after this window's start date" in m
-                   and "entered trades (up to 2 in one simulated scenario), so that "
-                   "verdict is stale" in m and "--no-cache re-reads the cutoff" in m
-                   for m in warned)
-
-    def test_a_legacy_cache_names_its_file_time(self, cli, monkeypatch, caplog):
-        # P2 review (C1/ADV-1): a legacy .json hit carries its file time here
-        # too, named as such, and claims no cutoff.
-        cli["result"].corpus_provenance = CorpusProvenance(
-            from_cache=True, assembled_at=datetime(2026, 8, 3, 19, 5, tzinfo=UTC),
-            archive_cutoff=None, post_cutoff=None, legacy=True)
-        with caplog.at_level(logging.INFO):
-            _run(monkeypatch)
-        assert ("Settled-market corpus: last written 2026-08-03 19:05 UTC (a legacy "
-                "cache's file time), holding no market settled after that (served "
-                "from an earlier run's cache; --no-cache extends it); archive cutoff "
-                "at assembly: not recorded (the legacy format records none)"
-                ) in caplog.text
+        assert "archive cutoff at assembly: 2030-01-01" in caplog.text
         assert not [r for r in caplog.records if r.levelname == "WARNING"
                     and "archive cutoff" in r.getMessage()]
+        assert "structural" not in caplog.text and "verdict" not in caplog.text
+
+    @pytest.mark.parametrize("from_cache, source", [
+        (False, "extended through today by this run"),
+        (True, "served from an earlier run's cache, assembled earlier today; "
+               "--no-cache re-assembles it in full"),
+    ])
+    def test_an_extended_corpus_names_its_full_assembly(
+            self, cli, monkeypatch, caplog, from_cache, source):
+        cli["result"].corpus_provenance = dataclasses.replace(
+            self.PROV, from_cache=from_cache,
+            full_assembly_at=datetime(2026, 9, 20, 8, 15, tzinfo=UTC))
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert ("Settled-market corpus: assembled 2026-09-24 12:37 UTC, holding no "
+                "market settled after that (extended day by day since a full "
+                f"assembly of 2026-09-20 08:15 UTC) ({source}); archive cutoff at "
+                "assembly: 2026-07-25") in caplog.text
+
+    def test_a_cache_that_could_not_be_brought_up_to_date_says_so(
+            self, cli, monkeypatch, caplog):
+        # An earlier day's cache served as it was after its extension failed:
+        # never called today's
+        cli["result"].corpus_provenance = dataclasses.replace(self.PROV, stale=True)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert ("Settled-market corpus: assembled 2026-09-24 12:37 UTC, holding no "
+                "market settled after that (served as an earlier day's cache: it could "
+                "not be brought up to date this run (see the WARNING above); --no-cache "
+                "re-assembles it in full); archive cutoff at assembly: 2026-07-25"
+                ) in caplog.text
+        assert "assembled earlier today" not in caplog.text
+
+    def test_a_freshly_assembled_corpus_says_so(self, cli, monkeypatch, caplog):
+        cli["result"].corpus_provenance = dataclasses.replace(
+            self.PROV, from_cache=False, archive_cutoff=None)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert ("holding no market settled after that (assembled by this run); "
+                "archive cutoff at assembly: not recorded") in caplog.text
 
     def test_no_provenance_says_not_recorded(self, cli, monkeypatch, caplog):
         with caplog.at_level(logging.INFO):
