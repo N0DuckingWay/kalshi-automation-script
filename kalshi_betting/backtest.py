@@ -8,7 +8,7 @@ Purpose:
     arguments (--start-date, --balance, --no-cache, --max-horizon-days,
     --interval-discount, --no-sweep, --same-event-ladders /
     --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
-    --no-cap-sweep, --no-add-on-sweep), configures logging to
+    --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep), configures logging to
     kalshi_backtest.log, constructs the necessary API clients, delegates the
     full backtest simulation to backtester.run_backtest_sweep(), and then
     calls dashboard.generate_dashboard() to produce the interactive HTML
@@ -136,6 +136,13 @@ Notes:
     point the run returns is unchanged — and each cell is simulated only when
     the dashboard is built, so --no-add-on-sweep makes that step faster.
 
+    The "Sell" family is ON by default too (sell_sweep=True): the result
+    carries a lazy SellSweep (BacktestSweep.sell_sweep) that simulates, when
+    the dashboard is built, every scenario selling a position early at each
+    level of config.TAKE_PROFIT_LEVELS. It simulates nothing during the run;
+    --no-sell-sweep skips it, leaving the dashboard's Sell select disabled.
+    Live trading never sells.
+
     The pre-fetch echo's "live rule=" clause names the saved live defaults'
     time-series rule and, when one is set, their category/tag filter (never
     main.py's per-run overrides), from a read of its own, failing soft;
@@ -230,8 +237,9 @@ def main() -> None:
     Parses command-line arguments (--start-date, --balance, --no-cache,
     --max-horizon-days, --interval-discount, --no-sweep,
     --same-event-ladders / --no-same-event-ladders, --spread-min,
-    --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep),
-    configures logging, constructs historical and live Kalshi API clients,
+    --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep,
+    --no-sell-sweep), configures logging, constructs historical and live
+    Kalshi API clients,
     runs the full backtest simulation via run_backtest_sweep(), and generates
     an interactive HTML dashboard via generate_dashboard(). Logs a summary
     table of key metrics to
@@ -252,7 +260,8 @@ def main() -> None:
     by the dashboard, which reads every cell as the page is built (its filter
     bar, Interval Discount section and scenario explorer); the lazily
     simulated add-on sweeps (result.add_on_cap_sweep, and
-    result.add_on_tier_off_cap_sweep) are read the same way.
+    result.add_on_tier_off_cap_sweep) and sell family (result.sell_sweep) are
+    read the same way.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -346,6 +355,14 @@ def main() -> None:
              "faster and leaves the choice disabled. Backtest only — live runs add "
              "to held pairs when the saved live defaults say so, or main.py's own "
              "--add-to-held-pairs / --no-add-to-held-pairs for one live run",
+    )
+    parser.add_argument(
+        "--no-sell-sweep", action="store_true",
+        help="Skip the dashboard's Sell select (sell a whole position once it has "
+             "made a chosen share of the profit it could make): its simulations run "
+             "only while the dashboard is built, so skipping them makes that step "
+             "much faster and leaves the select disabled. Backtest only — live "
+             "trading never sells a position",
     )
     args = parser.parse_args()
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
@@ -459,6 +476,8 @@ def main() -> None:
     # ON by default, like the cap sweep, and for the same reason: nothing is
     # simulated during the run, so the opt-out saves only the dashboard step
     add_on_sweep = not args.no_add_on_sweep
+    # ON by default too, and lazy the same way: the dashboard simulates it
+    sell_sweep = not args.no_sell_sweep
     # The saved live defaults' rule and filter, for the echo only: a read of its
     # own, separate from run_backtest_sweep's (which logs the INFO or WARNING).
     # Fails soft, unlike the checks above (one echo clause must not abort a run)
@@ -478,11 +497,11 @@ def main() -> None:
     logging.info(
         "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f | ladders=%s "
         "| spread band=%g-%g | band sweep=%s | cap sweep=%s | add-on sweep=%s "
-        "| live rule=%s",
+        "| sell sweep=%s | live rule=%s",
         start_date, args.balance, "on" if use_cache else "off", effective_k,
         ladders_echo, echo_floor, echo_ceiling,
         "on" if band_sweep else "off", "on" if cap_sweep else "off",
-        "on" if add_on_sweep else "off", live_rule_echo,
+        "on" if add_on_sweep else "off", "on" if sell_sweep else "off", live_rule_echo,
     )
     # Warn on a ceiling that empties a tier. config.time_series_spread_band's
     # docstring asks a caller taking an operator-typed ceiling to warn when it
@@ -554,6 +573,8 @@ def main() -> None:
         # The dashboard's "Add to held pairs: on" views, simulated lazily when
         # the page is built (no simulation during the run)
         add_on_sweep=add_on_sweep,
+        # The dashboard's Sell select, lazy the same way
+        sell_sweep=sell_sweep,
     )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy add-on sweeps (add_on_cap_sweep, and add_on_tier_off_cap_sweep with the band sweep) unless --no-add-on-sweep
     # Everything below reports the PRIMARY point, so the summary block and the
     # dashboard's other six sections read exactly as they did before the sweep

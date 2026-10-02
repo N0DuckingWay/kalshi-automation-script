@@ -2908,6 +2908,28 @@ class TestTimeSeriesKellyParity:
         # value and the held stake (pinned in detail by
         # _backtest_add_on_problems)
         assert _function_calls(backtester, "_simulate_at_discount", "_open_value")
+        # Selling early: a leg's bid and paid-out marker are read in one
+        # place, _trade_sale_value, which a sale reaches only through
+        # _position_sale_value — and the walk's sales and the shortcut that
+        # replays them (_highest_sale_level) both decide through _sells_at,
+        # so the shortcut tests exactly the rule the walk applies
+        sale_readers: dict[str, set] = {"bid_at_checkpoint": set(), "paid_at_checkpoint": set()}
+        for func in ast.walk(tree):
+            if isinstance(func, ast.FunctionDef):
+                for sub in ast.walk(func):
+                    if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                            and sub.func.attr in sale_readers):
+                        sale_readers[sub.func.attr].add(func.name)
+        assert sale_readers == {"bid_at_checkpoint": {"_trade_sale_value"},
+                                "paid_at_checkpoint": {"_trade_sale_value"}}
+        assert _function_calls(backtester, "_position_sale_value", "_trade_sale_value")
+        for func in ("_simulate_at_discount", "_position_sells", "_highest_sale_level"):
+            assert _function_calls(backtester, func, "_sells_at"), func
+        for func in ("_simulate_at_discount", "_position_sells", "_highest_sale_level"):
+            assert _function_calls(backtester, func, "_position_sale_value"), func
+        assert _function_calls(backtester, "_simulate_at_discount", "_position_sells")
+        for func in ("_simulate_at_discount", "_highest_sale_level"):
+            assert _function_calls(backtester, func, "_positions"), func
 
     def test_ast_the_backtest_sizes_add_ons_on_the_checkpoint_value(self):
         # backtester._simulate_at_discount: each Monday's portfolio value is

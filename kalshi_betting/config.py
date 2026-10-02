@@ -452,6 +452,17 @@ TIME_SERIES_INTERVAL_PROB_DISCOUNT = 0.80
 INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
                            0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00)
 
+# The sell levels the backtest dashboard's Sell select offers, beside "no
+# selling": sell a whole position once its realized profit (what selling it at
+# the bids would return, after the sale's fees, less what it cost) reaches this
+# share of its potential profit (its contract pairs at CONTRACT_PAYOUT_DOLLARS
+# less what it cost). Every 5% from 5% to 100%. BACKTEST-ONLY: live trading
+# never sells a position (no live module reads this). Read by
+# backtester.run_backtest_sweep(sell_sweep=True), whose lazy SellSweep
+# simulates each level when the dashboard reads it.
+TAKE_PROFIT_LEVELS = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
+                      0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00)
+
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
 # Eight live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
@@ -1369,6 +1380,15 @@ SETTLED_FETCH_CHUNK_RECORDS = 50_000
 # workers. Each worker keeps fetch_candlesticks' own rate_limit_sleep default
 # (0.15s) between its pages.
 CANDLESTICK_FETCH_MAX_WORKERS = 8
+
+# The most worker PROCESSES the backtest dashboard uses to simulate its Sell
+# select's levels (dashboard._build_sell_grid), and the default of
+# backtest.py's --sell-workers, which caps it at one less than the machine's
+# CPU count. Processes, not threads: the work is pure-Python simulation, which
+# threads would run one at a time. Each worker holds one spread band's entries
+# and its own share of the page's simulations, so memory grows with the count;
+# 1 runs everything in the main process (what the tests use).
+DASHBOARD_SELL_MAX_WORKERS = 8
 
 # GROUPABLE-market count above which backtester._prepare_candidates (the first
 # half of _prepare_entries) warns the operator about the RAM the

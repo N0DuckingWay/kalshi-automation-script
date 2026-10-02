@@ -24,7 +24,8 @@ the setting.
 
 And --no-add-on-sweep: the dashboard's Add to held pairs family is on by
 default (add_on_sweep=True), the flag threads add_on_sweep=False, and the echo
-line names the setting right after the cap sweep's.
+line names the setting right after the cap sweep's. --no-sell-sweep does the
+same for the Sell family (sell_sweep), named right after the add-on sweep.
 
 And the echo's "live rule=" clause: the saved live defaults' rule (with their
 origin), "none saved" with no file, "not recorded" with a refused one — a read
@@ -519,11 +520,30 @@ class TestAddOnSweepArgument:
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         # The band and cap sweeps' substrings other tests read stay a prefix
-        assert "| band sweep=on | cap sweep=on | add-on sweep=on | live rule=" in caplog.text
+        assert ("| band sweep=on | cap sweep=on | add-on sweep=on | sell sweep=on "
+                "| live rule=") in caplog.text
         caplog.clear()
         with caplog.at_level(logging.INFO):
             _run(monkeypatch, "--no-add-on-sweep", "--no-cap-sweep")
-        assert "| cap sweep=off | add-on sweep=off | live rule=" in caplog.text
+        assert "| cap sweep=off | add-on sweep=off | sell sweep=on | live rule=" in caplog.text
+
+
+class TestSellSweepArgument:
+    """--no-sell-sweep: the dashboard's Sell family is ON by default, like the
+    add-on family, and the flag threads sell_sweep=False into
+    run_backtest_sweep; the echo names the setting after the add-on sweep's."""
+
+    def test_sell_sweep_is_on_by_default(self, cli, monkeypatch):
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["sell_sweep"] is True
+
+    def test_no_sell_sweep_turns_only_it_off(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--no-sell-sweep")
+        kwargs = cli["sweep_kwargs"]
+        assert (kwargs["sell_sweep"], kwargs["add_on_sweep"], kwargs["band_sweep"],
+                kwargs["cap_sweep"]) == (False, True, True, True)
+        assert "| add-on sweep=on | sell sweep=off | live rule=" in caplog.text
 
 
 class TestLiveRuleEcho:
