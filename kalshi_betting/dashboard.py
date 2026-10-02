@@ -9226,7 +9226,10 @@ def _builds_lock(root: Path):
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            # Closing the file releases the lock anyway, so an unlock that
+            # fails must not turn a finished step into a failed one
+            with contextlib.suppress(OSError):
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _new_build_folder(page: Path) -> Path:
@@ -9261,8 +9264,9 @@ def _remove_old_builds(root: Path, keep: str | None) -> None:
     Called under the builds' lock, right after the page is replaced: a folder
     no page reads any more is deleted, unless its mark (_BUILD_WRITING) is
     younger than DASHBOARD_BUILD_STALE_SECONDS — another backtest building
-    its page now. A failure to delete one is a WARNING; the next build tries
-    again.
+    its page now. Never raises: it runs after the new page is in place, so a
+    folder it cannot list, read or delete is a WARNING (the next build tries
+    again), and one whose mark it cannot read is kept.
 
     Args:
         root (Path): The folder of every build's sidecar folder.
@@ -9270,20 +9274,27 @@ def _remove_old_builds(root: Path, keep: str | None) -> None:
             none.
     """
     now = time.time()
-    for child in root.iterdir():
-        if not child.is_dir() or child.name == keep:
-            continue
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        logging.warning("Could not list the dashboard's build folders in %s; the next "
+                        "build tries again", root, exc_info=True)
+        return
+    for child in children:
         try:
-            age = now - (child / _BUILD_WRITING).stat().st_mtime
-        except FileNotFoundError:
-            age = None
-        if age is not None and age < DASHBOARD_BUILD_STALE_SECONDS:
-            continue
-        try:
+            if not child.is_dir() or child.name == keep:
+                continue
+            try:
+                age = now - (child / _BUILD_WRITING).stat().st_mtime
+            except FileNotFoundError:
+                age = None
+            if age is not None and age < DASHBOARD_BUILD_STALE_SECONDS:
+                continue
             shutil.rmtree(child)
         except OSError:
-            logging.warning("Could not delete an earlier dashboard build's folder %s; the next "
-                            "build tries again", child, exc_info=True)
+            logging.warning("Could not check or delete an earlier dashboard build's folder "
+                            "%s; it is kept, and the next build tries again", child,
+                            exc_info=True)
 
 
 def _publish_page(tmp_path: Path, out_path: Path, folder: Path | None) -> None:
@@ -9294,23 +9305,67 @@ def _publish_page(tmp_path: Path, out_path: Path, folder: Path | None) -> None:
     one (atomic on one filesystem). Otherwise, under the builds' lock: the
     rename, the deletion of every earlier build's folder (_remove_old_builds),
     and this build's mark removed — in that order, so whichever page is in
-    place always has its folder.
+    place always has its folder. The rename is the publication: nothing after
+    it raises, so the caller never takes the page in place for an unpublished
+    one (and deletes the folder it reads). A lock that cannot be taken still
+    publishes the page — a page was always published before these folders
+    existed — but deletes no folder, with a WARNING.
 
     Args:
         tmp_path (Path): The complete page, beside out_path.
         out_path (Path): The dashboard file.
         folder (Path | None): This build's sidecar folder, or None when it
             wrote none.
+
+    Raises:
+        OSError: Only from the rename itself, when the page could not be
+            replaced (the previous page is then still in place).
     """
     root = out_path.parent / DASHBOARD_FILES_DIRNAME
     if not root.is_dir():
         os.replace(tmp_path, out_path)
         return
-    with _builds_lock(root):
+    try:
+        lock = _builds_lock(root)
+        lock.__enter__()
+    except OSError:
+        logging.warning("Could not take the dashboard builds' lock in %s; the page is "
+                        "replaced, but no earlier build's folder is deleted this time",
+                        root, exc_info=True)
         os.replace(tmp_path, out_path)
+        _unmark_build(folder)
+        return
+    try:
+        os.replace(tmp_path, out_path)
+        # Published: nothing below raises
         _remove_old_builds(root, None if folder is None else folder.name)
-        if folder is not None:
-            (folder / _BUILD_WRITING).unlink(missing_ok=True)
+        _unmark_build(folder)
+    finally:
+        # Releasing the lock (closing its file) comes after the page is in
+        # place, so an error there must not read as a failed publication
+        with contextlib.suppress(OSError):
+            lock.__exit__(None, None, None)
+
+
+def _unmark_build(folder: Path | None) -> None:
+    """
+    Remove a published build's mark (_BUILD_WRITING), never raising.
+
+    A mark left behind only makes another build keep the folder until the
+    mark is DASHBOARD_BUILD_STALE_SECONDS old, then treat it as abandoned —
+    by then a newer page has replaced this one.
+
+    Args:
+        folder (Path | None): This build's sidecar folder, or None when it
+            wrote none.
+    """
+    if folder is None:
+        return
+    try:
+        (folder / _BUILD_WRITING).unlink(missing_ok=True)
+    except OSError:
+        logging.warning("Could not unmark the dashboard build folder %s", folder,
+                        exc_info=True)
 
 
 def _new_explorer_visitor(source: _GridSource, sweep: BacktestSweep, *,

@@ -121,8 +121,11 @@ Notes:
     assembly would produce, and its partial frontier day is replaced by the
     complete one. A cutoff that moved past the cache's frontier day (its
     newest markets have migrated into the archive), or a cache that records
-    no cutoff or frontier, is re-assembled in full instead; a failure while
-    extending is a WARNING and the cache is served as it was. A window that
+    no cutoff or assembly time, is re-assembled in full instead (one that
+    records no frontier day is extended from the earlier of the day before
+    its assembly and the day its newest live record settled on); a failure
+    while extending is a WARNING and the cache is served as it was, marked
+    stale. A window that
     starts after the cutoff is no longer special: its markets are priced
     from Kalshi's live candlestick endpoint (fetch_candlesticks' 404
     fallback), so the old "structurally 0-trade" WARNING is gone.
@@ -4088,8 +4091,8 @@ def _parse_assembled_at(raw: Any) -> datetime | None:
 
     Returns:
         datetime | None: The instant, tz-aware in UTC (a naive string is read
-            as UTC, the writer's own zone), or None when the value is absent or
-            not an ISO-8601 timestamp.
+            as UTC, the writer's own zone), or None when the value is absent,
+            not an ISO-8601 timestamp, or has no UTC instant a datetime holds.
     """
     if not isinstance(raw, str):
         return None
@@ -4099,7 +4102,12 @@ def _parse_assembled_at(raw: Any) -> datetime | None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+    try:
+        return parsed.astimezone(UTC)
+    except OverflowError:
+        # A stamp with no UTC instant inside datetime's range (a year-1 time
+        # east of UTC, say): only a hand-edited block holds one
+        return None
 
 
 def _parse_archive_cutoff(raw: Any) -> datetime | None:
@@ -4116,12 +4124,32 @@ def _parse_archive_cutoff(raw: Any) -> datetime | None:
             is absent, not an int (read by TYPE: a bool is an int subclass and
             must not pass for an epoch), or outside the range a datetime holds.
     """
+    epoch = _meta_epoch(raw)
+    return None if epoch is None else datetime.fromtimestamp(epoch, tz=UTC)
+
+
+def _meta_epoch(raw: Any) -> int | None:
+    """
+    Read an epoch-second meta value (archive_cutoff_ts, live_frontier_ts), range-checked.
+
+    Args:
+        raw (Any): The meta block's value — an int epoch second as the writer
+            records it, or anything else a damaged or hand-edited block
+            might hold.
+
+    Returns:
+        int | None: The value, or None when it is absent, not an int (read by
+            TYPE: a bool is an int subclass and must not pass for an epoch),
+            or outside the range a datetime holds — so nothing that decides
+            on it, or prints it, can raise.
+    """
     if not isinstance(raw, int) or isinstance(raw, bool):
         return None
     try:
-        return datetime.fromtimestamp(raw, tz=UTC)
+        datetime.fromtimestamp(raw, tz=UTC)
     except (OverflowError, ValueError, OSError):
         return None
+    return raw
 
 
 def _corpus_provenance(meta: dict, *, from_cache: bool) -> CorpusProvenance:
@@ -4717,8 +4745,11 @@ def _extend_assembled_cache(
          it was assembled under — the leading records of the file);
       2. the new live records;
       3. the old cache's later records settled before `extend_from_ts` (its
-         older live days); its records from the frontier day onward are
-         dropped, since the complete day in (2) replaces them.
+         older live days), and any settled exactly at it; its records from
+         the frontier day onward are dropped, since the complete day in (2)
+         replaces them (one settled at the very midnight is kept because an
+         endpoint that reads min_settled_ts as exclusive leaves it out of
+         (2); when (2) does hold it, (2)'s copy wins the dedup).
     Each walk reads the old file once (_CorpusSplit). With the archive cutoff
     unchanged that is exactly a fresh assembly's record order; with a cutoff
     that moved forward (but not past `extend_from_ts`, which the caller
@@ -4788,6 +4819,12 @@ def _extend_assembled_cache(
     )
     # Live-day slices wholly before the current cutoff are dead disk now
     _prune_stale_live_days(cutoff_ts)
+    # The old records kept are those settled before the frontier midnight —
+    # and AT it: the new fetch asks from that second, and an endpoint that
+    # reads min_settled_ts as exclusive would leave a record settled exactly
+    # then out of it. A copy the new fetch does hold comes first and wins the
+    # dedup, so this never duplicates one
+    tail_ceiling = ext_lo + 1
     now_ts = int(_utc_now().timestamp())
     new_tally = _AssemblyTally()
     # Persisted settled days plus today's frontier, as a fresh assembly fetches them
@@ -4805,7 +4842,7 @@ def _extend_assembled_cache(
             ((live_records, None),), start_ts, prefilter, seen_a, event_tickers,
             identity_a, tally=new_tally)
         tail_count, identity_a = _count_assembled(
-            ((split_a.tail(), ext_lo),), start_ts, prefilter, seen_a, event_tickers,
+            ((split_a.tail(), tail_ceiling),), start_ts, prefilter, seen_a, event_tickers,
             identity_a, title_wanted=_needs_title)
         del seen_a, split_a
         new_counts = new_tally.counts()
@@ -4840,7 +4877,7 @@ def _extend_assembled_cache(
             split_b = _CorpusSplit(corpus, old_cutoff_ts)
             seen_b: set = set()
             parts = (((split_b.head(), None), False), ((live_records, None), True),
-                     ((split_b.tail(), ext_lo), False))
+                     ((split_b.tail(), tail_ceiling), False))
             for source, new in parts:
                 for m in _assembled_records((source,), start_ts, prefilter, seen_b):
                     event_ticker = m.get("event_ticker") or ""
@@ -4897,6 +4934,40 @@ def _served_stale(corpus: SettledCorpus) -> SettledCorpus:
     return corpus.with_provenance(dc_replace(provenance, stale=True))
 
 
+def _first_live_settle(corpus: SettledCorpus, cutoff_ts: int) -> int | None:
+    """
+    When the newest record of an assembled cache's live part settled: the first record at or after its cutoff.
+
+    A full assembly writes its archive records first (each settled before the
+    cutoff it read), then its live records, its frontier window first (that
+    day's records, as the endpoint serves them), then whole days newest
+    first; so the first record settled at or after the cutoff belongs to
+    the frontier day — or, when that window held nothing, to an earlier day,
+    which only makes an extension read one more stored day. Walks the
+    archive part once and stops there.
+
+    Args:
+        corpus (SettledCorpus): The validated cache.
+        cutoff_ts (int): The archive cutoff it was assembled under.
+
+    Returns:
+        int | None: That record's settlement, epoch seconds (whole); None
+            when no record settled at or after the cutoff.
+    """
+    walk = iter(corpus)
+    try:
+        for m in walk:
+            settle = _iso_epoch(m.get("settlement_ts"))
+            if settle is not None and settle >= cutoff_ts:
+                return int(settle)
+        return None
+    finally:
+        # An abandoned walk: close its file now, not when it is collected
+        close = getattr(walk, "close", None)
+        if close is not None:
+            close()
+
+
 def _up_to_date_corpus(
     corpus: SettledCorpus,
     hist_client: Any,
@@ -4930,9 +5001,13 @@ def _up_to_date_corpus(
         call it today's (_served_stale).
     A cache written before live_frontier_ts existed counts as today's when it
     was assembled today, and otherwise is extended from the day BEFORE the
-    one it was assembled on: an assembly that ran across a UTC midnight
-    captured that earlier day only partly, and a day slice already on disk
-    costs a read, not a fetch.
+    one it was assembled on, or from the day its newest live record settled
+    on when that is earlier (_first_live_settle, one walk of its archive
+    part): an assembly that ran across one or more UTC midnights captured
+    its frontier day only partly, and a day slice already on disk costs a
+    read, not a fetch. A meta value no datetime can hold reads as
+    unrecorded (_meta_epoch), so a damaged block costs a re-assembly, never
+    an exception.
 
     Args:
         corpus (SettledCorpus): The validated cache.
@@ -4958,8 +5033,11 @@ def _up_to_date_corpus(
         logging.info("Assembled cache %s records no assembly time, so it cannot be "
                      "brought up to date — re-assembling the window in full", name)
         return None
-    frontier = meta.get("live_frontier_ts")
-    if isinstance(frontier, int) and not isinstance(frontier, bool):
+    # Range-checked: a value no datetime can hold reads as unrecorded, so a
+    # damaged meta block costs a re-assembly, never an exception
+    frontier = _meta_epoch(meta.get("live_frontier_ts"))
+    assembled_lo: int | None = None
+    if frontier is not None:
         if frontier == today_lo:
             return corpus, "today"
         if frontier > today_lo:
@@ -4975,13 +5053,26 @@ def _up_to_date_corpus(
             logging.info("Assembled cache %s says it was assembled after today by "
                          "this host's clock — re-assembling the window in full", name)
             return None
-        # No frontier recorded: extend from the day before it was assembled
-        frontier = assembled_lo - _DAY_SECONDS
-    old_cutoff = meta.get("archive_cutoff_ts")
-    if not isinstance(old_cutoff, int) or isinstance(old_cutoff, bool):
+    old_cutoff = _meta_epoch(meta.get("archive_cutoff_ts"))
+    if old_cutoff is None:
         logging.info("Assembled cache %s records no archive cutoff, so it cannot be "
                      "brought up to date — re-assembling the window in full", name)
         return None
+    if frontier is None:
+        # No frontier recorded (a cache written before the stamp existed):
+        # extend from the day before it was assembled, or from the day its
+        # newest live record settled on if that is earlier — an assembly can
+        # run across more than one UTC midnight between its live fetch and
+        # its stamp, and extending from too late a day would drop the rest
+        # of its frontier day for good
+        frontier = assembled_lo - _DAY_SECONDS
+        newest = _first_live_settle(corpus, old_cutoff)
+        if newest is not None:
+            frontier = min(frontier, newest - newest % _DAY_SECONDS)
+        if _meta_epoch(frontier) is None:
+            logging.info("Assembled cache %s records no frontier day, and none can be "
+                         "worked out from it — re-assembling the window in full", name)
+            return None
     try:
         # The one network read a decision needs
         raw = _historical_get(hist_client, f"{_API_PREFIX}/historical/cutoff")

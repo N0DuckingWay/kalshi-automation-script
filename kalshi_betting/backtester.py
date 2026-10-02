@@ -3172,10 +3172,13 @@ def _highest_sale_level(point: "SweepPoint", levels: Iterable[float]) -> float |
     each as a sale would (_position_sale_value). _sells_at holds at every
     level below one at which it holds, so the levels at which some position
     sells are exactly those up to the one returned. A run selling at any
-    HIGHER level never sells: it walks as the no-selling run until its first
-    sale, and there is none, so it is the no-selling run (only its sell_at
-    stamp differs). The sell family and the dashboard simulate only the
-    levels up to it.
+    HIGHER level OF `levels` never sells: it walks as the no-selling run until
+    its first sale, and there is none, so it is the no-selling run (only its
+    sell_at stamp differs). The guarantee covers the levels given, not every
+    higher share: a share between the returned level and the next one given
+    can still sell, if a position's ratio of realized to potential profit
+    reached it. The sell family and the dashboard simulate only the levels up
+    to it, out of the very levels they pass here.
 
     Args:
         point (SweepPoint): A simulation that never sold (sell_at None).

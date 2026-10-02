@@ -10610,6 +10610,52 @@ class TestSidecarFolders:
         assert (tmp_path / config.DASHBOARD_FILENAME).read_text(encoding="utf-8") == page
         assert self._folders(tmp_path) == kept
 
+    def test_a_cleanup_failure_after_the_rename_keeps_the_new_page_s_folder(
+            self, monkeypatch, tmp_path, caplog):
+        # Another build's folder whose mark cannot be read (made by another
+        # user, say): the page is already in place when the cleanup meets it,
+        # so the cleanup must neither raise nor cost the new page its folder
+        files = tmp_path / config.DASHBOARD_FILES_DIRNAME
+        (files / "foreign").mkdir(parents=True)
+        (files / "foreign" / ".writing").write_text("", encoding="utf-8")
+        real_stat = Path.stat
+
+        def stat(self, *args, **kwargs):
+            if self.name == ".writing" and self.parent.name == "foreign":
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+        with caplog.at_level(logging.WARNING):
+            data = TestFilterPage._data(_sl_page(monkeypatch, tmp_path, _kc_sweep_sell()))
+        assert (tmp_path / data["sidecar_dir"]).is_dir()
+        assert list((tmp_path / data["sidecar_dir"]).glob("chunk-*.js"))
+        # Its mark unread, the other build's folder is kept
+        assert self._folders(tmp_path) == sorted(["foreign", data["sidecar_dir"].split("/")[1]])
+        assert any("Could not check or delete an earlier dashboard build" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_a_lock_that_cannot_be_taken_still_publishes_the_page(
+            self, monkeypatch, tmp_path, caplog):
+        # A run without the Sell family on a filesystem whose locks fail,
+        # after an earlier build left its folder: the page is still replaced,
+        # as it always was before these folders existed, and nothing is deleted
+        _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        kept = self._folders(tmp_path)
+        assert kept
+
+        def boom(*_args, **_kwargs):
+            raise OSError(37, "No locks available")
+
+        monkeypatch.setattr(dashboard.fcntl, "flock", boom)
+        (tmp_path / config.DASHBOARD_FILENAME).write_text("old page", encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            page = _sl_page(monkeypatch, tmp_path, _kc_sweep())
+        assert page != "old page" and "flt-bar" in page
+        assert self._folders(tmp_path) == kept
+        assert any("Could not take the dashboard builds' lock" in r.getMessage()
+                   for r in caplog.records)
+
     def test_a_failed_sell_build_leaves_no_folder(self, monkeypatch, tmp_path, caplog):
         def fail(*_a, **_k):
             raise RuntimeError("the pool could not start")

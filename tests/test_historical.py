@@ -5771,6 +5771,95 @@ class TestCacheExtension:
         monkeypatch.setattr(historical, "_fetch_live_phase", real_phase)
         assert got == self._fresh_at(monkeypatch, tmp_path, self.T2)
 
+    def test_a_stamp_less_cache_whose_assembly_took_two_days_loses_nothing(
+            self, tmp_path, monkeypatch):
+        # Its live fetch ran on 06-11 (a partial day), but it was stamped two
+        # UTC midnights later. Extending from the day before the stamp (06-12)
+        # would drop the rest of 06-11 for good — L4, settled 06-11 15:00 —
+        # so it is extended from the day its newest live record settled on.
+        calls = self._install(monkeypatch, tmp_path)
+        first = self._fetch(calls, use_cache=False)
+        records = list(first)
+        assert "L4" not in {m["ticker"] for m in records}
+        meta = self._meta_of(first.path)
+        del meta["live_frontier_ts"]
+        meta["assembled_at"] = datetime(2026, 6, 13, 1, tzinfo=UTC).isoformat()
+        _write_jsonl(first.path, meta, records)
+        seen = []
+        real_phase = historical._fetch_live_phase
+
+        def spy(client, lo, now_ts, keep=None, **k):
+            seen.append(lo)
+            return real_phase(client, lo, now_ts, keep, **k)
+
+        monkeypatch.setattr(historical, "_fetch_live_phase", spy)
+        when = datetime(2026, 6, 14, 9, tzinfo=UTC)
+        calls["clock"]["now"] = when
+        got = list(self._fetch(calls, use_cache=True))
+        assert seen and seen[0] <= _day_lo("2026-06-11")
+        assert "L4" in {m["ticker"] for m in got}
+        monkeypatch.setattr(historical, "_fetch_live_phase", real_phase)
+        assert got == self._fresh_at(monkeypatch, tmp_path, when)
+
+    def test_a_record_settled_at_the_frontier_midnight_survives_an_exclusive_min(
+            self, tmp_path, monkeypatch):
+        # Under an endpoint that reads min_settled_ts as exclusive (and
+        # max_settled_ts as inclusive), a record settled exactly at 06-11
+        # 00:00 reaches a fresh assembly only through the 06-10 day slice. The
+        # extension from 06-11 asks from that very second, so the old cache's
+        # copy must be kept.
+        mid = _mk_raw_market("MID", "2026-06-10T20:00:00Z", "2026-06-11T00:00:00Z")
+
+        class _ExclusiveMin(_TimedLive):
+            def get_markets_without_preload_content(self, min_settled_ts=None, **kw):
+                now = self._clock["now"].timestamp()
+                self.markets = [m for m in self._all
+                                if historical._iso_epoch(m["settlement_ts"]) <= now
+                                and (min_settled_ts is None or
+                                     historical._iso_epoch(m["settlement_ts"]) > min_settled_ts)]
+                return _FakeLive.get_markets_without_preload_content(
+                    self, min_settled_ts=min_settled_ts, **kw)
+
+        def install(cache):
+            calls = self._install(monkeypatch, tmp_path, cache=cache)
+            _archive, live = self._markets()
+            calls["live"] = _ExclusiveMin(live + [mid], calls["clock"])
+            return calls
+
+        calls = install("cache")
+        assert "MID" in {m["ticker"] for m in self._fetch(calls, use_cache=False)}
+        calls["clock"]["now"] = self.T2
+        got = list(self._fetch(calls, use_cache=True))
+        assert "MID" in {m["ticker"] for m in got}
+        fresh = install("fresh")
+        fresh["clock"]["now"] = self.T2
+        assert got == list(self._fetch(fresh, use_cache=False))
+
+    @pytest.mark.parametrize("key, value, extends", [
+        ("live_frontier_ts", -10**12, True),     # read as unrecorded: the day-before rule
+        ("archive_cutoff_ts", 10**15, False),    # read as unrecorded: re-assembled in full
+    ])
+    def test_a_meta_value_no_datetime_holds_never_raises(
+            self, tmp_path, monkeypatch, caplog, key, value, extends):
+        calls = self._install(monkeypatch, tmp_path)
+        first = self._fetch(calls, use_cache=False)
+        records = list(first)
+        meta = self._meta_of(first.path)
+        meta[key] = value
+        _write_jsonl(first.path, meta, records)
+        calls["clock"]["now"] = self.T2
+        with caplog.at_level(logging.INFO):
+            got = list(self._fetch(calls, use_cache=True))
+        assert got == self._fresh_at(monkeypatch, tmp_path, self.T2)
+        assert ("Extended assembled cache" in caplog.text) is extends
+        assert ("records no archive cutoff" in caplog.text) is (not extends)
+
+    def test_an_assembly_stamp_with_no_utc_instant_reads_as_unrecorded(self):
+        assert historical._parse_assembled_at("0001-01-01T00:30:00+01:00") is None
+        assert historical._meta_epoch(True) is None
+        assert historical._meta_epoch(10**15) is None
+        assert historical._meta_epoch(1_781_000_000) == 1_781_000_000
+
     def test_an_empty_cache_is_extended_like_any_other(self, tmp_path, monkeypatch, caplog):
         # An EMPTY cache used to be served at any age (DR-13); an earlier
         # day's is extended now. It said nothing settled in its window before
