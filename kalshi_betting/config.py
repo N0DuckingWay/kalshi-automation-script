@@ -1318,8 +1318,7 @@ POSITION_PAGE_SIZE = 500
 # does; the guard now remembers every cursor it has used, and this cap bounds
 # the walk regardless (TS-05). At MARKET_PAGE_SIZE (200) this is 1,000,000
 # markets; a 2026-09 prod ingest is ~135k markets (~700 pages). Same
-# bound-the-work-then-say-so idiom as ARCHIVE_TAIL_MAX_PAGES and
-# EVENT_TITLE_FALLBACK_MAX_LOOKUPS.
+# bound-the-work-then-say-so idiom as EVENT_TITLE_FALLBACK_MAX_LOOKUPS.
 SCANNER_MAX_PAGES  = 5000
 
 # Cap on the number of multivariate-events pages the backtester's event-title
@@ -1393,10 +1392,9 @@ CANDLESTICK_FETCH_MAX_WORKERS = 8
 # Known residual, narrowed by SS-1's Commit C: fetch_all_settled_markets now
 # returns a historical.SettledCorpus that streams the assembled
 # settled_markets_*.jsonl.gz cache on every walk, so a fetched or
-# streamed-cache corpus is never resident (during its assembly only the
-# archive tail, capped by ARCHIVE_TAIL_MAX_RECORDS, and a sequential
-# fallback's result are lists; day slices and the live frontier stream off
-# disk, the frontier through an anonymous spool file). Only a hit on a LEGACY
+# streamed-cache corpus is never resident (during its assembly only a
+# sequential fallback's result is a list; day slices and the live frontier
+# stream off disk, the frontier through an anonymous spool file). Only a hit on a LEGACY
 # settled_markets_*.json cache still hands over ONE list — read whole, and
 # since the prefilter was applied during its assembly it IS the eligible set —
 # resident, and counted by the "Peak RSS before grouping" line, until
@@ -1744,9 +1742,9 @@ EVENT_TITLE_LISTING_MAX_BARREN_PAGES = 50
 # resumes automatically if the API starts sending nested markets again.
 MVE_MAX_EMPTY_PAGES = 25
 
-# Stop an archive walk (historical._fetch_archive_tail and
-# _fetch_archive_sequential) after this many CONSECUTIVE pages containing zero
-# settlements inside the backtest window.
+# Stop the sequential archive walk (historical._fetch_archive_sequential, the
+# fallback used only when cursor synthesis fails) after this many CONSECUTIVE
+# pages containing zero settlements inside the backtest window.
 #
 # /historical/markets is ordered by created_time DESC, ticker DESC — NOT by
 # settlement time — so no EXACT stop rule exists: a market created arbitrarily
@@ -1759,39 +1757,31 @@ MVE_MAX_EMPTY_PAGES = 25
 # instead — the same idiom as EVENT_TITLE_LISTING_MAX_BARREN_PAGES and
 # MVE_MAX_EMPTY_PAGES. At the archive's 1000-record page cap, 50 consecutive
 # barren pages is ~50k records of created-time depth searched past the last
-# page that produced anything.
+# page that produced anything. It is still not complete: on 2026-10-01 the same
+# rule, applied below a 2025-10-01 start, stopped at page 2,813 and missed 60
+# in-window markets created in 2023-2024, beyond two stretches of 56 and 59
+# empty pages. The sharded path does not use it; it reads every created-day
+# from ARCHIVE_FIRST_CREATED_DATE instead (below).
 ARCHIVE_MAX_BARREN_PAGES = 50
 
-# Absolute ceiling on how many pages the archive TAIL walk (the sequential
-# downward walk below created_time == start_date, historical._fetch_archive_tail)
-# may request — roughly 2M records of created-time depth below start_date at the
-# archive's 1000-record page cap. ARCHIVE_MAX_BARREN_PAGES above is the PRIMARY
-# stop rule; this is the backstop, because that rule only bounds depth PAST the
-# last productive page: a single long-dated in-window settlement resets the
-# barren counter, so without a ceiling the tail can crawl most of created-time
-# history one serial request at a time, uncached, on every run. When the cap is
-# hit, a WARNING names how many pages were walked and that very-long-lived
-# pre-start markets beyond it may be missed — the same bounded-scan idiom as
-# EVENT_TITLE_FALLBACK_MAX_LOOKUPS (bound the work, then say loudly what the
-# bound cost).
-ARCHIVE_TAIL_MAX_PAGES = 2000
-
-# Hard ceiling on RECORDS the archive tail accumulates in memory, independent of
-# the page cap above. The tail and the two sequential fallbacks are the fetch
-# walks with no chunked `emit` sink (the day workers stream into slice files;
-# the live frontier streams through a prefilter-applying sink into an
-# anonymous temporary spool file, historical._FrontierSpool), and
-# the tail is the one of them that applies no prefilter either, so its whole
-# unfiltered result is resident at once. ARCHIVE_TAIL_MAX_PAGES alone bounds
-# that at 2000 x 1000 x ~BACKTEST_RECORD_BYTES_ESTIMATE, i.e. roughly 5 GB,
-# which is the same OOM shape the sharded fetch was rewritten to avoid
-# (BS-15). The two caps COMPOSE: whichever binds first stops the walk, so the
-# real bound is min(pages x 1000, this) records. 500k at ~2.7 KB each is about
-# 1.3 GB — large enough that no realistic window reaches it, small enough that
-# a pathological one cannot take the host down. Hitting it logs a WARNING
-# naming the count, the same bound-the-work-then-say-so idiom as the page cap
-# and EVENT_TITLE_FALLBACK_MAX_LOOKUPS (TS-15).
-ARCHIVE_TAIL_MAX_RECORDS = 500_000
+# The first UTC created-day the archive phase reads. The archive cannot be asked
+# for "created before the window, settled inside it" (/historical/markets
+# filters only by tickers, event, series and combos — no time filter), so the
+# only complete way to find a long-lived market created before --start-date is
+# to read every created-day before it: historical._fetch_archive_phase fetches
+# one cached slice per created-day from the earlier of this date and
+# start_date up to the archive cutoff, and the assembly keeps the records that
+# settled inside the window. The archive's oldest market was created
+# 2021-06-30T13:46:45Z (read 2026-10-01); this sits a month below it, and the
+# phase checks it on every sharded run with one request, logging a WARNING if
+# the archive ever serves a market created earlier. Cost, measured 2026-10-01
+# for a 2025-10-01 start: the 1,583 days before the window are 3,001 pages
+# (2.97M markets, about 58 MB of slices); the parallel day workers fetched
+# those 1,583 slices in 2 min 53 s on 2026-10-01, and they are reused from
+# disk until the archive cutoff moves — the same rule as every archive slice. The walk this replaced read the same
+# depth one page at a time in about 11 minutes and stopped early (see
+# ARCHIVE_MAX_BARREN_PAGES above).
+ARCHIVE_FIRST_CREATED_DATE = date(2021, 6, 1)
 
 # Emit a progress log line every this many pages in scanner.py's three
 # pagination loops (fetch_open_events_with_markets's standard-events and MVE

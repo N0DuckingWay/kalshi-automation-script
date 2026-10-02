@@ -146,6 +146,17 @@ def _unpaced_title_lookups(monkeypatch):
     monkeypatch.setattr(historical, "EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS", 0)
 
 
+@pytest.fixture(autouse=True)
+def _archive_first_day_near_the_fixtures(monkeypatch):
+    """Start the archive day slices on 2026-06-01, just below every fake
+    archive record in this module (the oldest is created 2026-06-02), instead
+    of config's 2021-06-01: otherwise every sharded fetch here would ask the
+    fake archive for ~1,800 empty days. A window that starts earlier still
+    starts its slices at its own start, as in production; a test of the first
+    day itself sets its own."""
+    monkeypatch.setattr(historical, "ARCHIVE_FIRST_CREATED_DATE", date(2026, 6, 1))
+
+
 class TestEventTitlesCache:
     def test_resolves_from_bulk_events_endpoint(self, isolated_cache, monkeypatch):
         # Single page with both tickers, no MVE, no fallback needed
@@ -1092,16 +1103,16 @@ class TestShardedFetch:
         # Archive spread over several created-days with edge cases:
         # multiple pages per day, a created_time tie, a non-binary result, a
         # record with no settlement_ts, a long-lived market created BEFORE
-        # start_date settling inside the window (tail territory), and
-        # fast-settled pre-start markets.
+        # start_date settling inside the window (read from its created-day's
+        # slice, below start_date), and fast-settled pre-start markets.
         #
         # BS-02 arrangement (load-bearing): the five PRE* records sit between
         # start_date and LONGLIVED in created order so that — at page_size 3,
-        # in BOTH the tail walk and the top-down sequential walk — LONGLIVED
-        # lands on the page immediately AFTER a page whose records all settled
-        # before the window. The old "stop when page[0] settled pre-window"
-        # rule therefore provably drops LONGLIVED on both paths; the
-        # barren-page rule finds it. Changing the count or the created_time
+        # in the top-down sequential walk — LONGLIVED lands on the page
+        # immediately AFTER a page whose records all settled before the
+        # window. The old "stop when page[0] settled pre-window" rule
+        # therefore provably drops LONGLIVED there; the barren-page rule
+        # finds it. Changing the count or the created_time
         # ordering of the PRE* records breaks that alignment.
         archive = [
             # day 2026-06-09 (top day, 4 records → 2 pages at page_size 3)
@@ -1125,8 +1136,9 @@ class TestShardedFetch:
             _mk_raw_market("PRE3", "2026-06-04T23:40:00Z", "2026-06-04T23:45:00Z"),
             _mk_raw_market("PRE4", "2026-06-04T23:35:00Z", "2026-06-04T23:40:00Z"),
             _mk_raw_market("PRE5", "2026-06-04T23:30:00Z", "2026-06-04T23:35:00Z"),
-            # tail: created before start_date but settled inside the window —
-            # reachable only by paging PAST the all-pre-window page above
+            # created before start_date but settled inside the window — the
+            # sequential walk reaches it only by paging PAST the
+            # all-pre-window page above
             _mk_raw_market("LONGLIVED", "2026-06-04T23:00:00Z", "2026-06-06T10:00:00Z"),
             # more pre-start fast markets below it
             _mk_raw_market("OLD1", "2026-06-04T20:00:00Z", "2026-06-04T21:00:00Z"),
@@ -1162,7 +1174,7 @@ class TestShardedFetch:
             self._ts(self.START + "T00:00:00+00:00"), self._ts(self.CUTOFF),
         )
         assert {m["ticker"] for m in out} == expected
-        # BS-02: the long-lived tail settler must be in the RESULT, not merely
+        # BS-02: the long-lived settler must be in the RESULT, not merely
         # in the oracle's set — it sits behind an all-pre-window page that the
         # old early-stop rule never paged past.
         assert "LONGLIVED" in {m["ticker"] for m in out}
@@ -1173,123 +1185,137 @@ class TestShardedFetch:
         assert a1["open_time"] == "2026-06-09T20:00:00.500000Z"
         assert a1["yes_ask_dollars"] == "0.40"
 
-    def test_tail_keeps_longlived_settlement_past_barren_page(self, tmp_path,
-                                                              monkeypatch):
+    def test_a_long_lived_market_created_before_start_is_found(self, tmp_path,
+                                                                monkeypatch):
         # BS-02, headline regression. The archive is ordered by created_time,
         # so page[0] is only the newest-CREATED record — its settlement time
         # says nothing about the rest of the page, let alone deeper pages. The
-        # old rule stopped both walks at the first page whose page[0] settled
+        # old rule stopped the walk at the first page whose page[0] settled
         # pre-window, which (most markets being short-lived) fires almost
         # immediately and silently drops long-lived in-window settlers.
-        # LONGLIVED is positioned one page BEHIND such a page in both walks.
         archive_markets, live_markets = self._fixture_markets()
 
-        # Sharded path — the tail walk below created_time == start_date.
+        # Sharded path — LONGLIVED is read from its created-day's slice
+        # (2026-06-04, below start_date); no walk below start_date stops early.
         out = self._run(monkeypatch, tmp_path / "sharded",
                         _FakeArchive(archive_markets), _FakeLive(live_markets))
         assert "LONGLIVED" in {m["ticker"] for m in out}
 
-        # Sequential fallback — same rule, same fixture, top-down walk.
-        # Opaque cursors defeat cursor synthesis, forcing the fallback.
+        # Sequential fallback — LONGLIVED sits one page BEHIND a page whose
+        # records all settled before the window; the barren-page rule pages
+        # past it. Opaque cursors defeat cursor synthesis, forcing the fallback.
         out_seq = self._run(monkeypatch, tmp_path / "sequential",
                             _FakeArchive(archive_markets, opaque_cursors=True),
                             _FakeLive(live_markets))
         assert "LONGLIVED" in {m["ticker"] for m in out_seq}
 
-    def test_tail_progress_logs_under_its_own_label(self, tmp_path, monkeypatch,
-                                                    caplog):
-        # CLAUDE.md: progress labels are load-bearing for diagnosis. The tail is
-        # a SERIAL walk, but it used to share the day-slice pool's progress
-        # object, so its pages logged as "[sharded]" — a stalled tail was
-        # indistinguishable in the log from a stalled (parallel) slice pool.
-        captured = {}
-        real_tail = historical._fetch_archive_tail
+    def _deep_long_lived_markets(self):
+        """An in-window market created far below start_date, behind three full
+        pages (at page_size 3) of markets that settled before the window."""
+        pre = [_mk_raw_market(f"PRE{i}", f"2026-06-04T{22 - i:02d}:00:00Z",
+                              f"2026-06-04T{22 - i:02d}:30:00Z") for i in range(9)]
+        deep = _mk_raw_market("DEEPLONG", "2026-06-02T08:00:00Z", "2026-06-07T00:00:00Z")
+        near = _mk_raw_market("NEAR", "2026-06-06T08:00:00Z", "2026-06-06T09:00:00Z")
+        return [near] + pre + [deep]
 
-        def spy(hist_client, start_ts, cutoff_ts, hist_kwargs, progress):
-            captured["progress"] = progress
-            return real_tail(hist_client, start_ts, cutoff_ts, hist_kwargs, progress)
+    def test_a_market_behind_a_run_of_empty_pages_is_found(self, tmp_path, monkeypatch):
+        # 2026-10-01: a walk below start_date that stopped after 50 pages in a
+        # row with nothing in the window missed 60 in-window markets created
+        # in 2023-2024. The sharded path reads every created-day from the
+        # archive's first instead, so no run of empty pages can hide one.
+        monkeypatch.setattr(historical, "ARCHIVE_MAX_BARREN_PAGES", 2)
+        markets = self._deep_long_lived_markets()
 
-        monkeypatch.setattr(historical, "_fetch_archive_tail", spy)
+        out = self._run(monkeypatch, tmp_path / "sharded", _FakeArchive(markets),
+                        _FakeLive([]))
+        assert {m["ticker"] for m in out} == {"NEAR", "DEEPLONG"}
+
+        # GUARD: the fixture really does hide DEEPLONG from a walk that stops
+        # after two empty pages — the sequential fallback, which keeps that
+        # rule, misses it.
+        out_seq = self._run(monkeypatch, tmp_path / "sequential",
+                            _FakeArchive(markets, opaque_cursors=True), _FakeLive([]))
+        assert {m["ticker"] for m in out_seq} == {"NEAR"}
+
+    def test_the_day_slices_start_at_the_archive_first_day(self, tmp_path, monkeypatch,
+                                                           caplog):
         archive_markets, live_markets = self._fixture_markets()
-        self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
-                  _FakeLive(live_markets))
-
-        progress = captured["progress"]
-        # The tail really did page through this progress object...
-        assert progress.pages > 0
-        # ...and it is not the day-slice pool's counter (a shared object would
-        # already be carrying the slice pages).
         with caplog.at_level(logging.INFO):
-            # _FetchProgress only logs every 100 pages, so drive it to the next
-            # boundary and read the label off the line it emits.
-            for _ in range(100 - progress.pages % 100):
-                progress.tick(0)
-        lines = [r.getMessage() for r in caplog.records if "pages scanned" in r.getMessage()]
-        assert lines
-        assert all("Historical archive [tail]" in ln for ln in lines)
-        assert not any("[sharded]" in ln for ln in lines)
+            self._run(monkeypatch, tmp_path / "first", _FakeArchive(archive_markets),
+                      _FakeLive(live_markets))
+        assert ("Archive day slices (created-days 2026-06-01 to 2026-06-09): "
+                "0 reused from disk, 9 to fetch") in caplog.text
+        assert historical._day_store_path("archive_days", _day_lo("2026-06-01")).exists()
 
-    def test_tail_stops_at_the_absolute_page_cap(self, monkeypatch, caplog):
-        # The barren rule only bounds depth PAST the last productive page: every
-        # page here holds an in-window settlement, so the counter never rises
-        # and only ARCHIVE_TAIL_MAX_PAGES ends this serial, uncached walk.
-        monkeypatch.setattr(historical, "ARCHIVE_TAIL_MAX_PAGES", 3)
-        pages = [
-            # Created before start_date, settling inside the window → every page
-            # is "productive", so the barren counter stays at 0 throughout.
-            [_mk_raw_market(f"LL{i}", f"2026-06-04T2{i}:00:00Z",
-                            "2026-06-06T10:00:00Z")]
-            for i in range(3)
-        ] + [
-            # Beyond the cap: must never be requested (_PagedArchive asserts).
-            [_mk_raw_market("DEEP", "2026-06-01T00:00:00Z", "2026-06-07T00:00:00Z")],
-        ]
-        with caplog.at_level(logging.WARNING):
-            kept, calls = self._walk_paged(
-                monkeypatch, historical._fetch_archive_tail, pages,
-            )
-        assert kept == {"LL0", "LL1", "LL2"}
-        assert calls == 3
-        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-        assert any("ARCHIVE_TAIL_MAX_PAGES" in w for w in warnings)
+        # A first day after start_date: the slices start at start_date itself.
+        caplog.clear()
+        monkeypatch.setattr(historical, "ARCHIVE_FIRST_CREATED_DATE", date(2026, 6, 7))
+        with caplog.at_level(logging.INFO):
+            self._run(monkeypatch, tmp_path / "later", _FakeArchive(archive_markets),
+                      _FakeLive(live_markets))
+        assert ("Archive day slices (created-days 2026-06-05 to 2026-06-09): "
+                "0 reused from disk, 5 to fetch") in caplog.text
 
-    def test_tail_stops_at_the_absolute_record_cap(self, monkeypatch, caplog):
-        # TS-15. The tail is the one fetch path with no chunked emit sink, so
-        # its whole result is resident at once; the page cap alone allows
-        # ~2M records (~5 GB). The record cap composes with it — whichever
-        # binds first stops the walk — and here the page cap is left high so
-        # only the record cap can fire.
-        monkeypatch.setattr(historical, "ARCHIVE_TAIL_MAX_PAGES", 100)
-        monkeypatch.setattr(historical, "ARCHIVE_TAIL_MAX_RECORDS", 2)
-        pages = [
-            [_mk_raw_market(f"LL{i}", f"2026-06-04T2{i}:00:00Z",
-                            "2026-06-06T10:00:00Z")]
-            for i in range(3)
-        ] + [
-            # Beyond the cap: must never be requested (_PagedArchive asserts).
-            [_mk_raw_market("DEEP", "2026-06-01T00:00:00Z", "2026-06-07T00:00:00Z")],
-        ]
+    def test_a_market_created_before_the_first_day_is_reported(self, tmp_path,
+                                                               monkeypatch, caplog):
+        archive_markets, live_markets = self._fixture_markets()
+        older = _mk_raw_market("ANCIENT", "2026-05-20T08:00:00Z", "2026-06-07T00:00:00Z")
         with caplog.at_level(logging.WARNING):
-            kept, calls = self._walk_paged(
-                monkeypatch, historical._fetch_archive_tail, pages,
-            )
-        assert kept == {"LL0", "LL1"}
-        assert calls == 2
-        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-        assert any("ARCHIVE_TAIL_MAX_RECORDS" in w for w in warnings)
-        # GUARD: the page cap must not be what stopped this walk.
-        assert not any("ARCHIVE_TAIL_MAX_PAGES" in w for w in warnings)
+            out = self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets + [older]),
+                            _FakeLive(live_markets))
+        warnings = [r.getMessage() for r in caplog.records
+                    if r.levelname == "WARNING" and "Archive first day" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "created before 2026-06-01" in warnings[0]
+        assert "ANCIENT" in warnings[0]
+        assert "ARCHIVE_FIRST_CREATED_DATE" in warnings[0]
+        # Below the first day it is not read, and the WARNING says so.
+        assert "ANCIENT" not in {m["ticker"] for m in out}
 
-    def test_record_cap_does_not_fire_on_an_ordinary_walk(self, monkeypatch, caplog):
-        # GUARD: the cap is a backstop, silent on any realistic window.
-        monkeypatch.setattr(historical, "ARCHIVE_MAX_BARREN_PAGES", 1)
-        pages = [
-            [_mk_raw_market("LL0", "2026-06-04T20:00:00Z", "2026-06-06T10:00:00Z")],
-            [_mk_raw_market("PB1", "2026-06-04T19:00:00Z", "2026-06-04T19:30:00Z")],
-        ]
+    def test_a_malformed_first_day_page_is_a_warning_not_a_crash(self, monkeypatch,
+                                                                 caplog):
+        monkeypatch.setattr(historical, "_historical_get",
+                            lambda *a, **k: {"markets": ["not an object", None]})
         with caplog.at_level(logging.WARNING):
-            self._walk_paged(monkeypatch, historical._fetch_archive_tail, pages)
-        assert "ARCHIVE_TAIL_MAX_RECORDS" not in caplog.text
+            historical._check_archive_floor(MagicMock(), _day_lo("2026-06-01"),
+                                            {"limit": 1000})
+        assert "Archive first day" not in caplog.text
+        monkeypatch.setattr(historical, "_historical_get",
+                            lambda *a, **k: ["not", "an", "object"])
+        with caplog.at_level(logging.WARNING):
+            historical._check_archive_floor(MagicMock(), _day_lo("2026-06-01"),
+                                            {"limit": 1000})
+        assert "Archive first day: could not check" in caplog.text
+
+    def test_the_first_day_check_is_silent_when_nothing_is_older(self, tmp_path,
+                                                                 monkeypatch, caplog):
+        archive_markets, live_markets = self._fixture_markets()
+        with caplog.at_level(logging.WARNING):
+            self._run(monkeypatch, tmp_path, _FakeArchive(archive_markets),
+                      _FakeLive(live_markets))
+        assert "Archive first day" not in caplog.text
+
+    def test_a_failed_first_day_check_warns_and_the_fetch_goes_on(self, tmp_path,
+                                                                  monkeypatch, caplog):
+        archive_markets, live_markets = self._fixture_markets()
+        archive = _FakeArchive(archive_markets)
+        real_page = archive.page
+        # Only the first-day check asks for a page at the first day's midnight
+        # (the 2026-06-01 slice itself starts its walk at 2026-06-02).
+        first_day = historical._encode_archive_cursor(
+            _day_lo("2026-06-01"), 0, historical._CURSOR_TICKER_SENTINEL)
+
+        def page(**params):
+            if params.get("cursor") == first_day:
+                raise RuntimeError("simulated failure")
+            return real_page(**params)
+
+        archive.page = page
+        with caplog.at_level(logging.WARNING):
+            out = self._run(monkeypatch, tmp_path, archive, _FakeLive(live_markets))
+        assert ("Archive first day: could not check for markets created before "
+                "2026-06-01 (simulated failure)") in caplog.text
+        assert "LONGLIVED" in {m["ticker"] for m in out}
 
     def _walk_paged(self, monkeypatch, walk, pages):
         """Run one archive walk against hand-built pages; return (kept, calls)."""
@@ -1300,22 +1326,15 @@ class TestShardedFetch:
         )
         start_ts = self._ts(self.START + "T00:00:00+00:00")
         cutoff_ts = self._ts(self.CUTOFF)
-        if walk is historical._fetch_archive_tail:
-            kept = walk(MagicMock(), start_ts, cutoff_ts, {"limit": 1000},
-                        historical._FetchProgress("test tail"))
-        else:
-            kept = walk(MagicMock(), start_ts, cutoff_ts, {"limit": 1000})
+        kept = walk(MagicMock(), start_ts, cutoff_ts, {"limit": 1000})
         return {m["ticker"] for m in kept}, paged.calls
 
-    @pytest.mark.parametrize("walk", [
-        historical._fetch_archive_tail,
-        historical._fetch_archive_sequential,
-    ])
-    def test_archive_walk_stops_after_max_barren_pages(self, monkeypatch, walk):
-        # No exact stop rule exists on a created-ordered walk, so the walks are
-        # bounded by productivity instead: ARCHIVE_MAX_BARREN_PAGES consecutive
-        # pages with zero in-window settlements ends the walk. Deeper pages
-        # must never be requested (_PagedArchive asserts if they are).
+    def test_archive_walk_stops_after_max_barren_pages(self, monkeypatch):
+        # No exact stop rule exists on a created-ordered walk, so the
+        # sequential fallback is bounded by productivity instead:
+        # ARCHIVE_MAX_BARREN_PAGES consecutive pages with zero in-window
+        # settlements ends the walk. Deeper pages must never be requested
+        # (_PagedArchive asserts if they are).
         monkeypatch.setattr(historical, "ARCHIVE_MAX_BARREN_PAGES", 3)
         pages = [
             # Productive page: resets/holds the counter at 0.
@@ -1327,25 +1346,22 @@ class TestShardedFetch:
             # Beyond the cap: an in-window settler the walk must NOT reach.
             [_mk_raw_market("DEEP", "2026-06-01T00:00:00Z", "2026-06-07T00:00:00Z")],
         ]
-        kept, calls = self._walk_paged(monkeypatch, walk, pages)
+        kept, calls = self._walk_paged(monkeypatch, historical._fetch_archive_sequential,
+                                       pages)
         assert kept == {"NEAR"}
         assert calls == 4  # the fourth barren-capped page is the last fetched
 
-    @pytest.mark.parametrize("walk", [
-        historical._fetch_archive_tail,
-        historical._fetch_archive_sequential,
-    ])
-    def test_barren_counter_is_consecutive_and_result_agnostic(self, monkeypatch, walk):
+    def test_barren_counter_is_consecutive_and_result_agnostic(self, monkeypatch):
         # Two things at once: the counter RESETS on a productive page (so the
         # bound is consecutive, not cumulative), and productivity is judged on
         # ANY in-window settlement — the reset page here holds only a VOIDED
-        # market, which neither walk keeps. Pages full of voided (or, in the
-        # tail, day-sliced) records must not spuriously trip the counter.
+        # market, which the walk does not keep. Pages full of voided records
+        # must not spuriously trip the counter.
         monkeypatch.setattr(historical, "ARCHIVE_MAX_BARREN_PAGES", 2)
         pages = [
             [_mk_raw_market("NEAR", "2026-06-04T23:00:00Z", "2026-06-06T00:00:00Z")],
             [_mk_raw_market("PB1", "2026-06-04T22:00:00Z", "2026-06-04T22:30:00Z")],
-            # Kept by neither walk, but proof the walk is still in productive
+            # Not kept, but proof the walk is still in productive
             # created-time territory → counter back to 0.
             [_mk_raw_market("VOIDED", "2026-06-04T21:00:00Z", "2026-06-06T05:00:00Z",
                             result="void")],
@@ -1354,7 +1370,8 @@ class TestShardedFetch:
             # Never reached: the cap is hit on the page above.
             [_mk_raw_market("DEEP", "2026-06-01T00:00:00Z", "2026-06-07T00:00:00Z")],
         ]
-        kept, calls = self._walk_paged(monkeypatch, walk, pages)
+        kept, calls = self._walk_paged(monkeypatch, historical._fetch_archive_sequential,
+                                       pages)
         assert kept == {"NEAR"}
         assert calls == 5
 
@@ -1369,7 +1386,7 @@ class TestShardedFetch:
         out2 = self._run(monkeypatch, tmp_path, archive, live)
         assert {m["ticker"] for m in out2} == {m["ticker"] for m in out1}
         # Run 2 skips every stored day slice: archive pays only the synthesis
-        # probe + the tail walk; live pays only the frontier window.
+        # probe + the first-day check; live pays only the frontier window.
         assert archive.calls < cold_archive_calls
         assert live.calls < cold_live_calls
         assert (tmp_path / "cache" / "archive_days").exists()
@@ -1504,8 +1521,9 @@ class TestShardedFetch:
         archive_markets, live_markets = self._fixture_markets()
 
         def pred(m):
-            # Discriminating on purpose: keeps a mix of archive-day, tail, and
-            # live records so every code path is exercised, not just one.
+            # Discriminating on purpose: keeps a mix of archive-day (window
+            # and pre-start) and live records so every code path is
+            # exercised, not just one.
             return not m["ticker"].endswith("1")
 
         _install_sharded_fakes(monkeypatch, tmp_path / "full",
@@ -1855,9 +1873,6 @@ class TestProgressLabels:
         source = inspect.getsource(historical)
         assert 'Historical archive [sharded]' in source
         assert 'Historical archive [sequential]' in source
-        # The tail is a third distinct phase, serial and uncached — its pages
-        # must not be attributed to the parallel day-slice pool.
-        assert 'Historical archive [tail]' in source
         assert 'Live settled sweep [windowed]' in source
         assert 'Live settled sweep [sequential]' in source
         # No un-suffixed variant left behind.
@@ -2695,9 +2710,8 @@ class TestSequentialFallbacksApplyKeep:
                 MagicMock(), self._ts(self.START), self._ts(self.CUTOFF),
                 {"limit": 1000}, keep)
 
-        unfiltered, tail_none = run(None)
-        filtered, tail_keep = run(self._keep)
-        assert tail_none == tail_keep == []
+        unfiltered = run(None)
+        filtered = run(self._keep)
         assert filtered == [m for m in unfiltered if self._keep(m)]
         assert 0 < len(filtered) < len(unfiltered)
 
@@ -3451,8 +3465,9 @@ class TestArchivePhaseSkippedWhenProvablyEmpty:
     """
     TS-25: the archive holds only markets that settled BEFORE the cutoff, so a
     window starting at or after it cannot contain a single archive record. The
-    phase still ran the cursor-synthesis probe and the tail walk to prove that,
-    costing ~18 seconds and ~50,000 parsed records on every post-cutoff run.
+    phase still ran the cursor-synthesis probe and a walk below start_date to
+    prove that, costing ~18 seconds and ~50,000 parsed records on every
+    post-cutoff run.
     """
 
     @staticmethod
@@ -3469,11 +3484,10 @@ class TestArchivePhaseSkippedWhenProvablyEmpty:
         monkeypatch.setattr(historical, "_signed_raw_get", _boom)
         cutoff = self._ts("2026-06-04T00:00:00Z")
         with caplog.at_level(logging.INFO):
-            slices, tail = historical._fetch_archive_phase(
+            slices = historical._fetch_archive_phase(
                 MagicMock(), cutoff, cutoff, {"limit": 1000},
             )
         assert slices == []
-        assert tail == []
         assert "Historical archive phase skipped" in caplog.text
 
     def test_no_request_is_made_when_the_window_starts_after_the_cutoff(
@@ -3484,13 +3498,13 @@ class TestArchivePhaseSkippedWhenProvablyEmpty:
 
         monkeypatch.setattr(historical, "_signed_raw_get", _boom)
         with caplog.at_level(logging.INFO):
-            slices, tail = historical._fetch_archive_phase(
+            slices = historical._fetch_archive_phase(
                 MagicMock(),
                 self._ts("2026-07-01T00:00:00Z"),
                 self._ts("2026-06-04T00:00:00Z"),
                 {"limit": 1000},
             )
-        assert (slices, tail) == ([], [])
+        assert slices == []
         assert "Historical archive phase skipped" in caplog.text
 
     def test_a_pre_cutoff_window_still_runs_the_phase(self, monkeypatch, caplog):
@@ -4019,9 +4033,7 @@ def _track_disk_records(monkeypatch):
 
     Only records READ FROM DISK are tracked (day slices, the live frontier's
     spool and the assembled cache, plus the meta line of whichever slice or
-    cache file is open). The archive tail is a list built by _market_to_dict,
-    the one documented in-memory residual of these fixtures, so it is
-    deliberately not counted.
+    cache file is open).
     """
     refs: list = []
     real = historical._slice_loads
@@ -4363,11 +4375,10 @@ class TestPhasesReturnLazyViews:
         _install_sharded_fakes(monkeypatch, tmp_path, _FakeArchive(archive_markets),
                                TestShardedFetch.CUTOFF)
         reads = _completed_reads(monkeypatch)
-        day, tail = historical._fetch_archive_phase(
+        day = historical._fetch_archive_phase(
             MagicMock(), _day_lo("2026-06-05"),
             TestShardedFetch._ts(TestShardedFetch.CUTOFF), {"limit": 1000}, None)
         assert isinstance(day, historical._DaySliceStream)
-        assert isinstance(tail, list)
         # Cold run: the prescan found nothing and nothing was read back.
         assert reads == []
         records = list(day)
@@ -4662,7 +4673,8 @@ class TestStreamedAssemblyParity:
         newer_day = [
             r("A1", "2026-06-09T10:00:00Z", "EV-A"),
             r("DUP", "2026-06-09T09:00:00Z", "EV-D", tag="archive-newer"),
-            # Rejected by the prefilter: with it, the TAIL's SHADOW must win
+            # Rejected by the prefilter: with it, the pre-start day's SHADOW
+            # must win
             # (prefilter before dedup); without it, this one wins.
             r("SHADOW", "2026-06-09T08:00:00Z", "EV-S", keep=False, tag="rejected"),
             r("PRE", "2026-06-04T23:59:59Z", "EV-P"),       # settled before the window
@@ -4677,14 +4689,17 @@ class TestStreamedAssemblyParity:
             r("B1", "2026-06-08T08:00:00Z", "EV-B", event_title="stale"),
             r("B2", "2026-06-05T00:00:00Z", "EV-B"),         # exactly at start: kept
         ]
-        tail = [
-            r("SHADOW", "2026-06-06T10:00:00Z", "EV-S", tag="tail"),
-            r("DUP", "2026-06-07T10:00:00Z", "EV-D", tag="tail"),
+        # A created-day before start_date: its markets that settle inside
+        # the window are read from its slice, after the window's own days.
+        pre_start_day = [
+            r("SHADOW", "2026-06-06T10:00:00Z", "EV-S", tag="pre-start"),
+            r("DUP", "2026-06-07T10:00:00Z", "EV-D", tag="pre-start"),
             r("T1", "2026-06-06T10:00:00Z", "EV-T"),
-            # The tail is never keep-filtered by its phase, so this rejected
+            # Day slices are never keep-filtered by the phase, so this rejected
             # copy reaches the merge on EVERY source shape: with the prefilter
             # the LIVE copy must win (prefilter before dedup), without it this.
-            r("TWIN", "2026-06-07T09:00:00Z", "EV-W", keep=False, tag="tail-rejected"),
+            r("TWIN", "2026-06-07T09:00:00Z", "EV-W", keep=False,
+              tag="pre-start-rejected"),
         ]
         frontier = [
             r("F1", "2026-09-24T01:00:00Z", "EV-F"),
@@ -4700,17 +4715,18 @@ class TestStreamedAssemblyParity:
             r("REJ", "2026-06-10T08:00:00Z", "EV-R", keep=False),
             r("TWIN", "2026-06-10T07:00:00Z", "EV-W", tag="live"),
         ]
-        return newer_day, older_day, tail, frontier, live_newer, live_older
+        return newer_day, older_day, pre_start_day, frontier, live_newer, live_older
 
     @staticmethod
     def _keep(m):
         return m.get("keep", True)
 
     def _run(self, tmp_path, monkeypatch, caplog, *, mode, prefilter, titles_for):
-        newer_day, older_day, tail, frontier, live_newer, live_older = self._sources()
+        (newer_day, older_day, pre_start_day, frontier, live_newer,
+         live_older) = self._sources()
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
         if mode == "lists":
-            day_src = newer_day + older_day
+            day_src = newer_day + older_day + pre_start_day
             live_src = frontier + live_newer + live_older
         else:
             # The real lazy views over real files, as the phases build them.
@@ -4719,10 +4735,12 @@ class TestStreamedAssemblyParity:
             meta_l = {"kind": "live_settled_day", "include_mve": True, "complete": True}
             # Live days must lie after the cutoff, or the real
             # _prune_stale_live_days (which the assembly runs) deletes them.
-            archive_los = (_day_lo("2026-06-09"), _day_lo("2026-06-08"))
+            archive_los = (_day_lo("2026-06-09"), _day_lo("2026-06-08"),
+                           _day_lo("2026-06-04"))
             live_los = (_day_lo("2026-06-11"), _day_lo("2026-06-10"))
             for store, meta, los, days in (
-                    ("archive_days", meta_a, archive_los, (newer_day, older_day)),
+                    ("archive_days", meta_a, archive_los,
+                     (newer_day, older_day, pre_start_day)),
                     ("live_days", meta_l, live_los, (live_newer, live_older))):
                 for lo, recs in zip(los, days, strict=True):
                     _write_jsonl(historical._day_store_path(store, lo), meta, recs)
@@ -4737,8 +4755,7 @@ class TestStreamedAssemblyParity:
             live_src = historical._RecordChain(
                 [m for m in frontier if prefilter is None or prefilter(m)],
                 historical._assemble_day_slices("live_days", sorted(live_los), meta_l))
-        monkeypatch.setattr(historical, "_fetch_archive_phase",
-                            lambda *a, **k: (day_src, tail))
+        monkeypatch.setattr(historical, "_fetch_archive_phase", lambda *a, **k: day_src)
         monkeypatch.setattr(historical, "_fetch_live_phase", lambda *a, **k: live_src)
         monkeypatch.setattr(historical, "_historical_get",
                             lambda *a, **k: {"market_settled_ts": self.CUTOFF})
@@ -4767,11 +4784,13 @@ class TestStreamedAssemblyParity:
         out, asked = self._run(tmp_path, monkeypatch, caplog, mode=mode,
                                prefilter=prefilter, titles_for=titles_for)
 
-        newer_day, older_day, tail, frontier, live_newer, live_older = self._sources()
+        (newer_day, older_day, pre_start_day, frontier, live_newer,
+         live_older) = self._sources()
         start_ts = _day_lo("2026-06-05")
         cutoff_ts = TestShardedFetch._ts(self.CUTOFF)
+        archive = newer_day + older_day + pre_start_day
         expected, archive_count, live_count, unique = _old_assembly(
-            newer_day + older_day, tail, frontier + live_newer + live_older,
+            archive, [], frontier + live_newer + live_older,
             start_ts, cutoff_ts, prefilter, titles_for)
 
         assert isinstance(out, historical.SettledCorpus)
@@ -4782,7 +4801,7 @@ class TestStreamedAssemblyParity:
         # M9: every count line reports the settled records beside the kept
         # ones, split into what the prefilter and the dedup removed.
         archive_counts, live_counts = _old_assembly_counts(
-            [[(newer_day + older_day, cutoff_ts), (tail, cutoff_ts)],
+            [[(archive, cutoff_ts)],
              [(frontier + live_newer + live_older, None)]], start_ts, prefilter)
         total = historical._total_counts(archive_counts, live_counts)
         # Not vacuous: the fixture's numbers, worked by hand. The settled
@@ -4827,8 +4846,9 @@ class TestStreamedAssemblyParity:
         assert by_ticker["DUP"]["tag"] == "archive-newer"
         assert by_ticker["ATCUT"]["tag"] == "live"
         assert by_ticker["A1"].get("tag") is None
-        assert by_ticker["SHADOW"]["tag"] == ("tail" if use_prefilter else "rejected")
-        assert by_ticker["TWIN"]["tag"] == ("live" if use_prefilter else "tail-rejected")
+        assert by_ticker["SHADOW"]["tag"] == ("pre-start" if use_prefilter else "rejected")
+        assert by_ticker["TWIN"]["tag"] == ("live" if use_prefilter
+                                              else "pre-start-rejected")
         assert "L1" in by_ticker and by_ticker["L1"].get("tag") is None
         assert not {"PRE", "NOSETTLE", "", None} & set(by_ticker)
         assert ("REJ" in by_ticker) is (not use_prefilter)
@@ -4875,9 +4895,8 @@ class TestStreamedAssemblyParity:
         out = historical.fetch_all_settled_markets(
             MagicMock(), _FakeLive(live_markets, ignore_max=ignore_max),
             start_date=self.START, use_cache=False, prefilter=pred, prefilter_tag="t")
-        day, tail = captured["archive"]
         expected, _, _, _ = _old_assembly(
-            day, tail, captured["live"], _day_lo("2026-06-05"),
+            captured["archive"], [], captured["live"], _day_lo("2026-06-05"),
             TestShardedFetch._ts(TestShardedFetch.CUTOFF), pred, _mapped_titles)
         assert list(out) == expected
         assert {"A1", "LONGLIVED", "L1", "L3"} <= {m["ticker"] for m in expected}
@@ -4897,7 +4916,7 @@ class TestStreamedAssemblyParity:
         else:  # same tickers, same order; one record's event_ticker changed
             second = [first[0], r("L2", "2026-06-11T09:00:00Z", "EV-OTHER"), first[2]]
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
-        monkeypatch.setattr(historical, "_fetch_archive_phase", lambda *a, **k: ([], []))
+        monkeypatch.setattr(historical, "_fetch_archive_phase", lambda *a, **k: [])
         source = _DriftingRecords(first, second)
         monkeypatch.setattr(historical, "_fetch_live_phase", lambda *a, **k: source)
         monkeypatch.setattr(historical, "_historical_get",

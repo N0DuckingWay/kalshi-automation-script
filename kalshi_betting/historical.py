@@ -21,8 +21,8 @@ Dependencies:
     can never disagree with the one-series rule about what a combo is); and
     PROJECT_ROOT plus a dozen-plus tuning constants
     (MARKET_PAGE_SIZE, MVE_TITLE_LOOKUP_MAX_PAGES, SETTLED_FETCH_MAX_WORKERS,
-    SETTLED_FETCH_CHUNK_RECORDS, ARCHIVE_MAX_BARREN_PAGES, ARCHIVE_TAIL_MAX_PAGES,
-    ARCHIVE_TAIL_MAX_RECORDS, EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS,
+    SETTLED_FETCH_CHUNK_RECORDS, ARCHIVE_MAX_BARREN_PAGES,
+    ARCHIVE_FIRST_CREATED_DATE, EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS, EVENT_TITLE_FALLBACK_MAX_WORKERS,
     EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS,
     EVENT_TITLE_LISTING_MAX_BARREN_PAGES, MVE_SERIES_FAMILY_PREFIX,
@@ -89,8 +89,7 @@ Notes:
     neither the partial day nor its prefilter-passing subset — which on the
     day after a Monday can be most of the day — is ever resident. The two
     sequential fallbacks apply the same prefilter per record but still hold
-    their whole filtered result; the archive tail is the one walk that
-    applies no prefilter (its record cap bounds it instead). Those three
+    their whole filtered result. Those three
     fetch-time filters are the only places the prefilter runs before the
     assembly: the day slices are handed back UNFILTERED (M9 of the 2026-09-24
     review), so the assembly's first walk sees every one of their records and
@@ -151,9 +150,8 @@ from urllib.parse import urlencode, urlparse
 from ._http import api_call_with_retry, fetch_json_page
 from .auth import build_client
 from .config import (
+    ARCHIVE_FIRST_CREATED_DATE,
     ARCHIVE_MAX_BARREN_PAGES,
-    ARCHIVE_TAIL_MAX_PAGES,
-    ARCHIVE_TAIL_MAX_RECORDS,
     CANDLESTICK_MAX_CANDLES_PER_REQUEST,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS,
@@ -2450,8 +2448,9 @@ def _assemble_day_slices(
     """
     Return a phase's day-slice records as a lazy stream off disk (never a list).
 
-    Slices are read back rather than held in RAM because a full-history fetch
-    spans ~900 days at up to ~200k records each — retaining every slice (and
+    Slices are read back rather than held in RAM because the archive phase
+    alone spans ~1,900 created-days (every day since the archive's first) at
+    up to ~475k records each — retaining every slice (and
     then flattening it into a second list) was measured at 2.7 GB RSS only 17%
     of the way through a run, and grew superlinearly as GC pressure mounted.
     Since SS-1 even the read-back is not collected: a 7-day window's past days
@@ -2615,142 +2614,69 @@ def _fetch_archive_day(
     return total
 
 
-def _fetch_archive_tail(
-    hist_client: Any,
-    start_ts: int,
-    cutoff_ts: int,
-    hist_kwargs: dict,
-    progress: _FetchProgress,
-) -> list[dict]:
+def _archive_first_ts() -> int:
     """
-    Continue the archive walk below created_time == start_ts.
+    Epoch seconds of ARCHIVE_FIRST_CREATED_DATE's UTC midnight.
 
-    The archive is ordered by created_time, not settlement time, so markets
-    CREATED before start_date can still SETTLE inside the backtest window
-    (long-lived markets). The per-day slices cover everything created on or
-    after start_date; this tail is what collects those older-created records,
-    paging downward from created_time == start_ts.
+    The archive phase reads one slice per created-day from this day (or from
+    the window's start, when that is earlier) to the cutoff. The constant is
+    read when called, so a test can move the first day by patching
+    historical.ARCHIVE_FIRST_CREATED_DATE.
 
-    Stop rule: no EXACT one exists on a created-ordered walk, because a market
-    created arbitrarily early can still settle in-window. The walk therefore
-    stops after ARCHIVE_MAX_BARREN_PAGES CONSECUTIVE pages that contain no
-    in-window settlement at all (or when the archive runs out of pages). It
-    deliberately does NOT stop at the first page whose newest-created record
-    settled pre-window: that record's settlement says nothing about the rest
-    of the page or about deeper pages, and since most markets are short-lived
-    such a page shows up almost immediately — the old rule killed the tail
-    after one or two pages and silently dropped long-lived in-window settlers.
+    Returns:
+        int: UTC midnight of the archive's first created-day, epoch seconds.
+    """
+    first = ARCHIVE_FIRST_CREATED_DATE
+    return int(datetime(first.year, first.month, first.day, tzinfo=UTC).timestamp())
 
-    That barren rule only bounds depth PAST the last productive page, though: a
-    single long-dated in-window settlement resets the counter, so the walk is
-    additionally capped at ARCHIVE_TAIL_MAX_PAGES total pages. This tail is
-    serial (one 1000-record request at a time) and is never persisted as a day
-    slice, so it is re-paid on every run — an unbounded version can crawl most
-    of created-time history. Hitting the cap logs a WARNING and truncates.
+
+def _check_archive_floor(hist_client: Any, first_ts: int, hist_kwargs: dict) -> None:
+    """
+    Warn when the archive holds a market created before the first day read.
+
+    The archive phase reads every created-day from first_ts up, so a market
+    created earlier is never read, even if it settles inside the window.
+    ARCHIVE_FIRST_CREATED_DATE sits below the oldest market Kalshi's archive
+    served when it was set; this one request, with a cursor at first_ts,
+    asks whether that still holds: its page starts with the newest market
+    created before first_ts, if there is one.
+
+    It never stops the run: a market found below first_ts, or a request that
+    fails, is one WARNING, and the fetch goes on with what it read.
 
     Args:
         hist_client (Any): Authenticated KalshiClient.
-        start_ts (int): Backtest window start, epoch seconds (UTC midnight).
-        cutoff_ts (int): Archive/live boundary from /historical/cutoff.
-        hist_kwargs (dict): Base query params (limit, optional mve_filter).
-        progress (_FetchProgress): Page counter for log output. The caller
-            passes a progress object labeled for the TAIL specifically — these
-            pages are not day-slice pages, and CLAUDE.md's progress-label rule
-            means a shared "[sharded]" label would make a stalled tail
-            indistinguishable in the log from a stalled day-slice pool.
-
-    Returns:
-        list[dict]: Compact market dicts created before start_ts that settled
-            within [start_ts, cutoff_ts).
-
-    Raises:
-        _ShardedFetchUnsupported: If the synthesized start cursor lands above
-            start_ts (server ignored it).
+        first_ts (int): The first created-day the phase reads, UTC midnight.
+        hist_kwargs (dict): Base query params (limit, optional mve_filter), as
+            every archive page is asked for; the page below the first day is
+            empty while the constant holds, so the limit costs nothing.
     """
-    cursor = _encode_archive_cursor(start_ts, 0, _CURSOR_TICKER_SENTINEL)
-    kept: list[dict] = []
-    first_page = True
-    barren = 0
-    pages = 0
-    while True:
-        data = _historical_get(hist_client, f"{_API_PREFIX}/historical/markets",
-                               cursor=cursor, **hist_kwargs)
-        pages += 1
-        page = data.get("markets") or []
-        if first_page and page:
-            newest = _iso_epoch(page[0].get("created_time"))
-            if newest is None or newest > start_ts + 1.0:
-                raise _ShardedFetchUnsupported(
-                    "synthesized tail cursor landed above start_ts"
-                )
-        first_page = False
-        kept_before = len(kept)
-        for m in page:
-            settle = _iso_epoch(m.get("settlement_ts"))
-            if settle is None or m.get("result") not in ("yes", "no"):
-                continue
-            if not start_ts <= settle < cutoff_ts:
-                continue
-            created = _iso_epoch(m.get("created_time"))
-            # Records created exactly at start_ts belong to the bottom day
-            # slice; skipping them here avoids double-collection (the final
-            # ticker dedup would drop them anyway).
-            if created is not None and created >= start_ts:
-                continue
-            kept.append(_market_to_dict(m))
-        progress.tick(len(kept) - kept_before)
-        next_cursor = data.get("cursor")
-        if not next_cursor or not page:
-            return kept
-        # Productivity bail-out (see the stop-rule note in the docstring).
-        # Judged on ANY in-window settlement on the page, deliberately
-        # independent of the result/created_time keep filters above: a page
-        # made entirely of voided markets, or of records skipped because they
-        # belong to a day slice, still proves the walk is in productive
-        # created-time territory and must not trip the counter.
-        page_in_window = any(
-            s is not None and start_ts <= s < cutoff_ts
-            for s in (_iso_epoch(m.get("settlement_ts")) for m in page)
+    first_day = datetime.fromtimestamp(first_ts, tz=UTC).date().isoformat()
+    try:
+        data = _historical_get(
+            hist_client, f"{_API_PREFIX}/historical/markets",
+            cursor=_encode_archive_cursor(first_ts, 0, _CURSOR_TICKER_SENTINEL),
+            **hist_kwargs,
         )
-        barren = 0 if page_in_window else barren + 1
-        if barren >= ARCHIVE_MAX_BARREN_PAGES:
-            logging.info(
-                "Historical archive tail: %d consecutive pages with no in-window "
-                "settlements (ARCHIVE_MAX_BARREN_PAGES) — stopping pagination",
-                barren,
-            )
-            return kept
-        # Absolute depth backstop: the barren rule above only bounds depth past
-        # the last PRODUCTIVE page, so one long-dated in-window settlement
-        # resets it and the serial, uncached tail keeps crawling.
-        if pages >= ARCHIVE_TAIL_MAX_PAGES:
-            logging.warning(
-                "Historical archive tail: reached the %d-page cap "
-                "(ARCHIVE_TAIL_MAX_PAGES) after walking %d pages below "
-                "created_time == start_date — stopping. Very long-lived markets "
-                "created deeper than this that settle inside the window may be "
-                "missed; raise ARCHIVE_TAIL_MAX_PAGES if a run needs them.",
-                ARCHIVE_TAIL_MAX_PAGES, pages,
-            )
-            return kept
-        # Residency backstop, composing with the page cap above: whichever
-        # binds first stops the walk. Like the two sequential fallbacks, this
-        # walk has no chunked emit sink, so its whole result stays resident;
-        # unlike them it is not `keep`-filtered, so this cap counts every
-        # in-window record. The page cap alone allows ~2M records (roughly
-        # 5 GB), the same OOM shape the sharded fetch exists to avoid (TS-15).
-        if len(kept) >= ARCHIVE_TAIL_MAX_RECORDS:
-            logging.warning(
-                "Historical archive tail: reached the %d-record cap "
-                "(ARCHIVE_TAIL_MAX_RECORDS) after walking %d pages below "
-                "created_time == start_date — stopping to bound memory. "
-                "Long-lived pre-start markets beyond this point that settle "
-                "inside the window may be missed; raise the cap if a run needs "
-                "them.",
-                ARCHIVE_TAIL_MAX_RECORDS, pages,
-            )
-            return kept
-        cursor = next_cursor
+        older = [m for m in data.get("markets") or []
+                 if isinstance(m, dict)
+                 and (created := _iso_epoch(m.get("created_time"))) is not None
+                 and created < first_ts]
+    except Exception as exc:
+        logging.warning(
+            "Archive first day: could not check for markets created before %s "
+            "(%s) — any such market is not read", first_day, _exception_summary(exc),
+        )
+        return
+    if older:
+        logging.warning(
+            "Archive first day: the archive holds markets created before %s "
+            "(the newest of them, %s, was created %s), and the archive day "
+            "slices start at %s, so those markets are never read, even if they "
+            "settle inside the window — set config.ARCHIVE_FIRST_CREATED_DATE "
+            "earlier", first_day, older[0].get("ticker"),
+            older[0].get("created_time"), first_day,
+        )
 
 
 def _fetch_archive_sequential(
@@ -2775,8 +2701,11 @@ def _fetch_archive_sequential(
     Completeness is bounded, not exact. The archive is ordered by created_time,
     so a market created arbitrarily early can settle in-window and no page
     proves that deeper pages hold nothing. The walk therefore stops after
-    ARCHIVE_MAX_BARREN_PAGES consecutive pages with no in-window settlement —
-    the same rule as _fetch_archive_tail, and for the same reason.
+    ARCHIVE_MAX_BARREN_PAGES consecutive pages with no in-window settlement.
+    That stop can miss a long-lived market created far below a stretch of
+    such pages (the sharded path reads every created-day instead, and is
+    complete); walking the whole archive one page at a time would take
+    hours, and this walk runs only when cursor synthesis fails.
 
     Residency: this walk has no chunked emit sink, so its whole result is held
     in memory. `keep` is applied per record as each page arrives, so a record
@@ -2931,22 +2860,30 @@ def _fetch_archive_phase(
     keep: Callable[[dict], bool] | None = None,
     *,
     tally: "_AssemblyTally | None" = None,
-) -> tuple[Iterable[dict], list[dict]]:
+) -> Iterable[dict]:
     """
-    Fetch the archive's contribution: created-day slices plus the below-start tail.
+    Fetch the archive's contribution: one slice per created-day, from the first.
 
     Sharded path (preferred): verify cursor synthesis, then fetch one slice
-    per UTC created-day in [start_ts, cutoff_ts) — reusing any slice already
-    on disk from a previous run — with SETTLED_FETCH_MAX_WORKERS parallel
-    workers, then walk the tail below start_ts. Each worker persists its own
-    slice as soon as the day completes, so an interrupted fetch resumes at day
-    granularity instead of restarting the multi-hour walk.
+    per UTC created-day from the earlier of ARCHIVE_FIRST_CREATED_DATE and
+    start_ts up to cutoff_ts — reusing any slice already on disk from a
+    previous run — with SETTLED_FETCH_MAX_WORKERS parallel workers. The days
+    before start_ts are what find the long-lived markets: a market created
+    in 2023 that settles inside the window sits in its 2023 slice, and the
+    caller's assembly keeps it because its settlement is in the window. The
+    archive cannot be asked for "created before start_ts and settled after
+    it" (it has no time filter), so reading every earlier created-day is the
+    only complete way; a walk that stopped after a run of pages with nothing
+    in the window missed 60 such markets on 2026-10-01. Each worker persists
+    its own slice as soon as the day completes, so an interrupted fetch
+    resumes at day granularity instead of restarting the multi-hour walk.
 
     Slice records are never accumulated in memory: a worker streams its records
     into its slice file in chunks and returns only a count, and the day-slice
     records are handed back as a lazy _DaySliceStream from
-    _assemble_day_slices (see there for why — a ~900-day window otherwise runs
-    to tens of GB, and a single 2026-08 day is itself millions of records).
+    _assemble_day_slices (see there for why — the ~1,900 days back to the
+    first one otherwise run to tens of GB, and a single 2026-08 day is itself
+    millions of records).
     Nothing is read back here; the caller's assembly walks the stream. A slice
     that cannot be read during that walk raises SettledCorpusError from the
     walk itself — it no longer reaches the sequential fallback below, which
@@ -2975,32 +2912,29 @@ def _fetch_archive_phase(
             filtering it at read-back saved no memory and hid its rejections
             from the assembly's count; the caller's assembly applies the same
             predicate to every record and counts. Slice FILES stay
-            unfiltered either way. The tail walk does not apply it either
-            (its ARCHIVE_TAIL_MAX_RECORDS cap counts unfiltered records).
+            unfiltered either way.
         tally (_AssemblyTally | None): Handed to the sequential fallback,
             which adds the in-window records `keep` dropped (the only records
             of this phase the assembly never sees). The sharded path adds
             nothing: everything it returns reaches the assembly unfiltered.
 
     Returns:
-        tuple[Iterable[dict], list[dict]]: (day-slice records newest-day
-            first, tail records). On the sharded path the first element is a
-            _DaySliceStream — re-iterable, read lazily off disk on every walk,
-            never a list, and not `keep`-filtered; the tail is a list (its
-            record cap bounds it). Day-slice records are NOT yet
+        Iterable[dict]: The archive's records, newest created-day first. On
+            the sharded path, a _DaySliceStream — re-iterable, read lazily off
+            disk on every walk, never a list, not `keep`-filtered and NOT yet
             settlement-filtered (the caller applies the [start_ts, cutoff_ts)
-            window); tail records already are. On the sequential fallback,
-            everything is returned settlement-filtered (and `keep`-filtered)
-            in the first element, a list, and the second is empty; when the
-            window starts at or after the cutoff, both are empty lists.
+            window, which is what drops the earlier days' records that settled
+            before the window). On the sequential fallback, a list already
+            settlement-filtered and `keep`-filtered; when the window starts at
+            or after the cutoff, an empty list.
     """
     if start_ts >= cutoff_ts:
         # The archive holds only markets that settled BEFORE the cutoff, so a
         # window starting at or after it cannot contain a single archive
         # record — there is nothing here to fetch, whatever the walk would do.
-        # Without this the phase still ran the cursor-synthesis probe and the
-        # tail walk to prove that, costing ~18 seconds and ~50,000 parsed
-        # records on every post-cutoff run (TS-25). Logged rather than silent
+        # Without this the phase still ran the cursor-synthesis probe and a
+        # walk below start_ts to prove that, costing ~18 seconds and ~50,000
+        # parsed records on every post-cutoff run (TS-25). Logged rather than silent
         # so the absence of the usual archive progress lines is explained
         # rather than read as a phase that failed; note that this also skips
         # the synthesis probe, so a run with no archive contribution no longer
@@ -3011,7 +2945,7 @@ def _fetch_archive_phase(
             datetime.fromtimestamp(start_ts, tz=UTC).isoformat(timespec="seconds"),
             datetime.fromtimestamp(cutoff_ts, tz=UTC).isoformat(timespec="seconds"),
         )
-        return [], []
+        return []
 
     try:
         # The probe issues a real request, so it can fail for reasons that have
@@ -3030,9 +2964,14 @@ def _fetch_archive_phase(
         if not synthesis_ok:
             raise _ShardedFetchUnsupported("archive cursor re-encoding mismatch")
 
-        # One slice per UTC day of created_time. All archive records satisfy
+        # One slice per UTC day of created_time, from the archive's first day
+        # (or start_ts, if a window starts earlier still) to the cutoff. The
+        # days before start_ts hold the markets created before the window that
+        # settle inside it; the assembly drops the rest of their records,
+        # which settled before the window. All archive records satisfy
         # created < settle < cutoff, so days at/above the cutoff can't exist.
-        day_los = list(range(start_ts, cutoff_ts, _DAY_SECONDS))
+        first_ts = min(_archive_first_ts(), start_ts)
+        day_los = list(range(first_ts, cutoff_ts, _DAY_SECONDS))
         expect_meta = {
             "kind": "archive_created_day",
             "cutoff_ts": cutoff_ts,
@@ -3055,8 +2994,13 @@ def _fetch_archive_phase(
             else:
                 to_fetch.append(lo)
         reused = len(on_disk)
-        logging.info("Archive day slices: %d reused from disk, %d to fetch",
-                     reused, len(to_fetch))
+        logging.info(
+            "Archive day slices (created-days %s to %s): %d reused from disk, "
+            "%d to fetch",
+            datetime.fromtimestamp(day_los[0], tz=UTC).date().isoformat(),
+            datetime.fromtimestamp(day_los[-1], tz=UTC).date().isoformat(),
+            reused, len(to_fetch),
+        )
 
         progress = _FetchProgress("Historical archive [sharded]")
         if to_fetch:
@@ -3087,20 +3031,14 @@ def _fetch_archive_phase(
                     pool.shutdown(wait=False, cancel_futures=True)
                     raise
 
-        # Long-lived markets created before start_date but settling inside the
-        # window — same records the sequential walk picked up past start_ts.
-        # Its own progress object, labeled "[tail]": these pages are a serial
-        # walk, not day-slice pages, and sharing the "[sharded]" counter made a
-        # slow tail read in the log as a slow (parallel) slice pool — exactly
-        # the label ambiguity CLAUDE.md calls load-bearing for diagnosis.
-        tail_progress = _FetchProgress("Historical archive [tail]")
-        tail = _fetch_archive_tail(hist_client, start_ts, cutoff_ts, hist_kwargs,
-                                   tail_progress)
+        # The first day is a fixed date, so say so loudly if Kalshi ever
+        # serves a market created before it: such a market is never read.
+        _check_archive_floor(hist_client, first_ts, hist_kwargs)
 
         # A lazy stream, not a list: nothing is read here, and every later
         # walk re-reads the slices one record at a time (SS-1). Unfiltered
         # (M9): the assembly applies `keep` itself and counts what it rejects.
-        return _assemble_day_slices("archive_days", on_disk, expect_meta), tail
+        return _assemble_day_slices("archive_days", on_disk, expect_meta)
     except _ShardedFetchUnsupported as exc:
         logging.warning(
             "Archive fetch: sharded path unavailable (%s) — falling back to the "
@@ -3111,7 +3049,7 @@ def _fetch_archive_phase(
         # the walk still holds its whole keep-passing result, and adds what it
         # dropped to the tally, since the assembly never sees those records.
         return _fetch_archive_sequential(hist_client, start_ts, cutoff_ts,
-                                         hist_kwargs, keep, tally=tally), []
+                                         hist_kwargs, keep, tally=tally)
 
 
 # ─── Live (post-cutoff) fetching ──────────────────────────────────────────────
@@ -3849,7 +3787,7 @@ class AssemblyCounts:
     too; CorpusProvenance carries it to the backtester, whose prefilter line
     says the filter ran during assembly and quotes it.
 
-    RECORDS, not markets. The day slices, the tail and the live windows
+    RECORDS, not markets. The day slices and the live windows
     deliberately overlap at their boundaries, so one market can arrive twice.
     Among records the prefilter passes, a repeat is caught by the ticker
     dedup and counted in `duplicates`; a repeat the prefilter rejects is
@@ -3892,9 +3830,9 @@ class _AssemblyTally:
     frontier's sink and the two sequential fallbacks, which must drop
     rejected records before they are held — add the records they dropped
     (note_rejected), since the assembly never sees those. Every other record
-    reaches the assembly's first walk — the day slices and the tail
-    unfiltered (the day-slice streams are no longer filtered at read-back,
-    and the tail never was), the fetch-time filters' survivors after their
+    reaches the assembly's first walk — the day slices unfiltered (the
+    day-slice streams are no longer filtered at read-back), the fetch-time
+    filters' survivors after their
     filter — and that walk, _count_assembled, counts it there
     (_assembled_records' `tally`). The second walk passes none, so nothing
     is counted twice.
@@ -4459,7 +4397,7 @@ def _assembled_records(
     `seen` — the ticker is then added. The old code kept the same records in
     a ticker-keyed dict, whose insertion order is this yield order.
 
-    Adjacent day slices, the tail walk, and live windows deliberately overlap
+    Adjacent day slices and live windows deliberately overlap
     at their boundaries so no record can fall in a gap; the dedup collapses
     those overlaps without changing the set (tickers are unique per market).
     Only tickers are held — never a record — so a walk costs one set of
@@ -4472,7 +4410,7 @@ def _assembled_records(
         start_ts (int): Inclusive settlement floor, epoch seconds.
         prefilter (Callable[[dict], bool] | None): The caller's predicate.
             Applied here, before the dedup, as the single point where it is
-            GUARANTEED for every source. The day slices and the tail reach it
+            GUARANTEED for every source. The day slices reach it
             unfiltered; the live frontier and both sequential fallbacks were
             already filtered where they were fetched, because their records
             would otherwise be held — re-checking those is idempotent. And
@@ -4863,9 +4801,10 @@ def fetch_all_settled_markets(
     Uses two complementary API endpoints to get full coverage:
     - /historical/markets — settled markets archived before the API cutoff
       timestamp. Fetched as parallel per-created-day slices via synthesized
-      pagination cursors (see _fetch_archive_phase), plus a tail walk below
-      start_date for long-lived markets; falls back to the original
-      sequential walk if the cursor format ever drifts.
+      pagination cursors (see _fetch_archive_phase), every created-day from
+      the archive's first (ARCHIVE_FIRST_CREATED_DATE) so that long-lived
+      markets created before start_date are read too; falls back to the
+      original sequential walk if the cursor format ever drifts.
     - /markets?status=settled — markets that settled after the API cutoff.
       Fetched as parallel per-settled-day windows bounded server-side by
       min/max_settled_ts (see _fetch_live_phase), starting at
@@ -4889,11 +4828,11 @@ def fetch_all_settled_markets(
     record, then a list copy, then one whole-list json.dumps — could never
     finish. The phases now return lazy views (day slices are re-read off disk
     per walk, and so is the live frontier, spooled to an anonymous temporary
-    file by _FrontierSpool and released when assembly ends; only the tail and
-    a sequential fallback's result are lists), and one generator,
+    file by _FrontierSpool and released when assembly ends; only a
+    sequential fallback's result is a list), and one generator,
     _assembled_records, reproduces the old
     `_merge` exactly: sources in the old order (archive day slices
-    newest-first, then the tail, both bounded above by cutoff_ts; then live:
+    newest-first, bounded above by cutoff_ts; then live:
     frontier, then live day slices newest-first, unbounded above),
     settlement >= start_ts, the prefilter, and first-wins ticker dedup. It is
     walked TWICE. Walk A counts the records the "Historical endpoint" and
@@ -5154,16 +5093,17 @@ def fetch_all_settled_markets(
     # Sharded parallel fetch with day-level disk reuse; sequential on fallback.
     # Its day slices come back unfiltered; only a sequential fallback applies
     # the prefilter itself, and it reports what it dropped into archive_tally.
-    day_records, tail_records = _fetch_archive_phase(
+    day_records = _fetch_archive_phase(
         hist_client, start_ts, cutoff_ts, hist_kwargs, prefilter, tally=archive_tally,
     )
 
     # Assembly: settlement-window filter, prefilter and first-wins ticker
     # dedup, streamed (_assembled_records) rather than collected into a dict
     # of every selected record (SS-1). The sources, their order and their
-    # ceilings are exactly the old _merge calls': archive day slices then the
-    # tail, both below cutoff_ts; then live, unbounded above.
-    archive_sources = ((day_records, cutoff_ts), (tail_records, cutoff_ts))
+    # ceilings are the old _merge calls': the archive day slices (every
+    # created-day from the archive's first, newest first), below cutoff_ts;
+    # then live, unbounded above.
+    archive_sources = ((day_records, cutoff_ts),)
 
     # Walk A, archive half: count what the old `len(selected)` reported and
     # collect the event_tickers titles are resolved for, and count every
