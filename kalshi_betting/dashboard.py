@@ -4448,6 +4448,36 @@ def _risk_free_html(risk_free: RiskFreeRates | None, equity_df: pd.DataFrame) ->
         quote=False) + "</p>")
 
 
+def _starting_balance_text(initial_balance: float, source: str | None) -> str:
+    """
+    Render the header's starting balance, with where it came from when that is known.
+
+    The starting balance is the amount the simulation starts with; the
+    page's total return and cumulative-return charts are measured from it.
+    backtest.py passes one of three sources: the Kalshi account's value when
+    the run started ("the account's value at <time> UTC: cash $X + open
+    positions $Y"), its cash alone when Kalshi's positions value could not be
+    read ("the account's cash at <time> UTC; its open positions' value could
+    not be read"), or "set by --balance". Anything but a non-empty str (a
+    test, or another script calling generate_dashboard) shows the amount
+    alone.
+
+    Args:
+        initial_balance (float): The starting balance in dollars.
+        source (str | None): Where the amount came from, or None.
+
+    Returns:
+        str: The text with &, < and > escaped for the page, such as
+            "$211.42 (the account's value at 2026-10-02 21:30 UTC: cash
+            $116.15 + open positions $95.27)", or "$10,000.00" with no source.
+    """
+    text = f"${initial_balance:,.2f}"
+    if isinstance(source, str) and source:
+        text += f" ({source})"
+    # Page text, not an attribute value: quotes need no escaping
+    return html.escape(text, quote=False)
+
+
 def _entry_checkpoint_html(sweep: BacktestSweep | None) -> str:
     """
     Render the page-header line naming the weekly moment at which the run opened its trades.
@@ -11313,6 +11343,7 @@ def generate_dashboard(
     series_categories: dict[str, tuple[str, tuple[str, ...]]] | None = None,
     risk_free: RiskFreeRates | None = None,
     sell_workers: int = 1,
+    balance_source: str | None = None,
 ) -> Path:
     """
     Assemble all nine dashboard sections into a single self-contained HTML file.
@@ -11454,6 +11485,12 @@ def generate_dashboard(
             simulations run in (_build_sell_grid), when the sweep carries the
             Sell family (BacktestSweep.sell_sweep); 1 (default) runs them in
             this process.
+        balance_source (str | None): Where initial_balance came from, printed
+            beside it in the header (_starting_balance_text): backtest.py
+            passes the account's value when the run started, with its cash and
+            open positions; its cash alone when Kalshi's positions value could
+            not be read; or "set by --balance". None (default) shows the
+            amount alone.
 
     Returns:
         Path: Absolute path to the HTML file written,
@@ -11741,7 +11778,7 @@ def generate_dashboard(
 <h1>Kalshi Arbitrage Backtest</h1>
 <p style="color:#616161; font-size:14px;">
   Period: {start_date} → {today} &nbsp;|&nbsp;
-  Starting balance: ${initial_balance:,.2f} &nbsp;|&nbsp;
+  Starting balance: {_starting_balance_text(initial_balance, balance_source)} &nbsp;|&nbsp;
   Trades found: <span id="hdr-trades">{len(trades)}</span>
 </p>
 {corpus_note}

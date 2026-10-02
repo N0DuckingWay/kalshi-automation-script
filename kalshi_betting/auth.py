@@ -18,8 +18,9 @@ Dependencies:
     Imports file paths, site addresses and DEFAULT_EXCHANGE_INDEX from config.py,
     and api_call_with_retry and fetch_json_page from _http.py.
     Used by main.py (build_client, read_account_balance), historical.py
-    (build_client), trader.py (read_shard_balances) and the human-run
-    verification tool (build_client, verify_auth).
+    (build_client), trader.py (read_shard_balances), backtest.py
+    (read_account_balance: a backtest's starting balance when --balance is
+    not given) and the human-run verification tool (build_client, verify_auth).
 
 Notes:
     - Set the key ID and private key as attributes on the SDK's Configuration,

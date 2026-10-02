@@ -34,9 +34,19 @@ run's last line, after the one pointing at the dashboard: how the filter bar's
 scenario becomes the live defaults (the defaults server, then the page's save
 button).
 
-Fully offline: run_backtest_sweep, generate_dashboard, both client builders
-and load_risk_free_rates are monkeypatched, so no network call, no credential
-read and no real backtest happen. PROJECT_ROOT is redirected at tmp_path and
+And the starting balance: with no --balance the run starts from the account's
+value (its cash on every shard plus Kalshi's value of its open positions, or
+the cash alone with a WARNING when that value is unreadable), read once through
+the production live client before the fetch; --balance skips the read; a
+balance that is not a positive number is refused before logging is
+configured; a read that fails, or comes to nothing, stops the run before the
+fetch; and a balance below config.MIN_BALANCE_CENTS draws a WARNING. The
+amount reaches the sweep, the log, the summary block and the dashboard, and
+where it came from reaches the log and the dashboard.
+
+Fully offline: run_backtest_sweep, generate_dashboard, both client builders,
+read_account_balance and load_risk_free_rates are monkeypatched, so no network
+call, no credential read and no real backtest happen. PROJECT_ROOT is redirected at tmp_path and
 logging.basicConfig is stubbed, so the run's RotatingFileHandler can neither
 write into the repo root nor leak a handler onto the root logger for the rest
 of the session.
@@ -50,8 +60,10 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
+from kalshi_python_sync.exceptions import ApiException
 
 from kalshi_betting import backtest, config
+from kalshi_betting.auth import AccountBalance
 from kalshi_betting.backtester import BacktestSweep, CorpusProvenance, SweepPoint
 from kalshi_betting.config import (
     MAX_DEADLINE_GAP_DAYS,
@@ -100,7 +112,10 @@ def cli(monkeypatch, tmp_path):
     Returns a dict that fills in with "sweep_kwargs" (run_backtest_sweep's
     keyword arguments) and "dashboard" ((args, kwargs)) as main() proceeds, plus
     "result" — the BacktestSweep the stub returned, so a test can assert
-    identity rather than equality.
+    identity rather than equality. "account" is what the account read returns
+    (an AccountBalance, or an exception to raise), "balance_reads" the client
+    each read was handed, and "live_client" the one production live client
+    main() builds.
     """
     calls: dict = {"result": _sweep()}
 
@@ -124,7 +139,21 @@ def cli(monkeypatch, tmp_path):
     monkeypatch.setattr(backtest, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(backtest.logging, "basicConfig", _no_basic_config)
     monkeypatch.setattr(backtest, "build_historical_client", lambda: MagicMock())
-    monkeypatch.setattr(backtest, "build_prod_live_client", lambda: MagicMock())
+    calls["live_client"] = MagicMock()
+    monkeypatch.setattr(backtest, "build_prod_live_client", lambda: calls["live_client"])
+    # The account read a run given no --balance makes, never a real one: $116.15
+    # of cash and $95.27 of open positions, so such a run starts from $211.42.
+    # Every client it is handed is recorded
+    calls["account"] = AccountBalance({0: 11_615, 1: 0}, 9_527)
+    calls["balance_reads"] = []
+
+    def _fake_balance_read(client):
+        calls["balance_reads"].append(client)
+        if isinstance(calls["account"], Exception):
+            raise calls["account"]
+        return calls["account"]
+
+    monkeypatch.setattr(backtest, "read_account_balance", _fake_balance_read)
     monkeypatch.setattr(backtest, "run_backtest_sweep", _fake_sweep)
     monkeypatch.setattr(backtest, "generate_dashboard", _fake_dashboard)
     # Never read the real backtest_cache or the network for series categories
@@ -882,11 +911,12 @@ class TestDashboardHandoff:
         _run(monkeypatch, "--interval-discount", "0.62")
         args, kwargs = cli["dashboard"]
         result = cli["result"]
-        # The four positional arguments are unchanged from before the sweep
+        # The four positional arguments are unchanged from before the sweep;
+        # the starting balance is the account's value (see TestStartingBalance)
         assert args[0] is result.primary.trades
         assert args[1] is result.primary.equity_df
         assert args[2] == date.fromisoformat("2024-01-01")
-        assert args[3] == pytest.approx(10_000.0)
+        assert args[3] == pytest.approx(211.42)
         # ...and the sweep travels whole rather than unpacked
         assert kwargs["sweep"] is result
         # The k the plotted trades were SIZED at — read back off the point, not
@@ -926,7 +956,8 @@ class TestSummaryBlock:
     def test_summary_reports_the_primary_point(self, cli, monkeypatch, caplog):
         cli["result"] = _sweep(n_trades=2)
         with caplog.at_level(logging.INFO):
-            _run(monkeypatch)
+            # The curve opens at $10,000, so the return is measured against that
+            _run(monkeypatch, "--balance", "10000")
         text = caplog.text
         assert "Backtest Summary" in text
         assert "Total trades:  2" in text
@@ -949,6 +980,184 @@ class TestSummaryBlock:
         with caplog.at_level(logging.INFO):
             _run(monkeypatch)
         assert f"k={config.TIME_SERIES_INTERVAL_PROB_DISCOUNT:.3f}" in caplog.text
+
+
+class _FrozenNow(datetime):
+    """A datetime whose now() is 2026-10-02 21:30:05 UTC, so a read time is fixed."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return datetime(2026, 10, 2, 21, 30, 5, tzinfo=UTC)
+
+
+class TestStartingBalance:
+    """With no --balance the run starts from what the Kalshi account is worth
+    now — its cash on every shard plus Kalshi's value of its open positions,
+    the figure a live run sizes its trades on — read once, through the
+    production client, before the fetch; --balance gives an amount and skips
+    the read. The amount reaches the sweep, the log, the summary block and the
+    dashboard, and where it came from reaches the log and the dashboard. A
+    balance that cannot be read, or a read that comes to nothing, stops the
+    run: an amount nobody chose would size every simulated trade for some
+    other account."""
+
+    SOURCE = ("the account's value at 2026-10-02 21:30 UTC: cash $116.15 + open "
+              "positions $95.27")
+
+    @pytest.fixture(autouse=True)
+    def _frozen_now(self, monkeypatch):
+        monkeypatch.setattr(backtest, "datetime", _FrozenNow)
+
+    def test_by_default_the_run_starts_from_the_account_value(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        # One read, through the production client the fetch uses
+        assert cli["balance_reads"] == [cli["live_client"]]
+        assert cli["sweep_kwargs"]["live_client"] is cli["live_client"]
+        # The cash on every shard plus the open positions: $116.15 + $95.27
+        assert cli["sweep_kwargs"]["initial_balance"] == pytest.approx(211.42)
+        args, kwargs = cli["dashboard"]
+        assert args[3] == pytest.approx(211.42)
+        assert kwargs["balance_source"] == self.SOURCE
+        # The log names the amount and its source, then the config echo carries it
+        messages = [r.getMessage() for r in caplog.records]
+        at = messages.index(f"Starting balance: $211.42 ({self.SOURCE})")
+        assert messages[at + 1].startswith(
+            "Backtest config: start=2024-01-01 | balance=$211.42 | ")
+
+    def test_cash_on_every_shard_counts(self, cli, monkeypatch):
+        cli["account"] = AccountBalance({0: 10_000, 1: 5_050, 2: 1}, 0)
+        _run(monkeypatch)
+        assert cli["sweep_kwargs"]["initial_balance"] == pytest.approx(150.51)
+        assert cli["dashboard"][1]["balance_source"] == (
+            "the account's value at 2026-10-02 21:30 UTC: cash $150.51 + open "
+            "positions $0.00")
+
+    def test_with_no_readable_positions_value_it_starts_from_the_cash(
+            self, cli, monkeypatch, caplog):
+        # As a live run does: the cash alone, and a WARNING saying so
+        cli["account"] = AccountBalance({0: 11_615}, None)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert cli["sweep_kwargs"]["initial_balance"] == pytest.approx(116.15)
+        source = ("the account's cash at 2026-10-02 21:30 UTC; its open positions' "
+                  "value could not be read")
+        assert cli["dashboard"][1]["balance_source"] == source
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert ("Kalshi's balance reply carried no readable portfolio_value — the "
+                "backtest starts from the account's cash alone ($116.15), as if no "
+                "position were held") in warnings
+        assert f"Starting balance: $116.15 ({source})" in caplog.text
+
+    def test_the_balance_flag_skips_the_read(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--balance", "500")
+        assert cli["balance_reads"] == []
+        assert cli["sweep_kwargs"]["initial_balance"] == pytest.approx(500.0)
+        args, kwargs = cli["dashboard"]
+        assert args[3] == pytest.approx(500.0)
+        assert kwargs["balance_source"] == "set by --balance"
+        assert "Starting balance: $500.00 (set by --balance)" in caplog.text
+        assert "| balance=$500.00 |" in caplog.text
+
+    def test_the_summary_is_measured_against_the_account_value(
+            self, cli, monkeypatch, caplog):
+        # A $5,000 account whose primary point ends at $10,691.38
+        cli["account"] = AccountBalance({0: 400_000}, 100_000)
+        cli["result"] = _sweep(n_trades=2)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert "Total return:  +113.8%" in caplog.text
+        assert "Final balance: $10,691.38" in caplog.text
+
+    @pytest.mark.parametrize("error, reason", [
+        (RuntimeError("connection refused"), "RuntimeError: connection refused"),
+        (ApiException(status=401, reason="Unauthorized",
+                      body='{"error": {"code": "authentication_error", '
+                           '"message": "invalid signature"}}'),
+         "HTTP 401 Unauthorized — authentication_error: invalid signature"),
+        (ValueError("Unparseable balance payload: keys=[]"),
+         "ValueError: Unparseable balance payload: keys=[]"),
+    ])
+    def test_a_failed_read_stops_the_run_before_the_fetch(
+            self, cli, monkeypatch, caplog, error, reason):
+        cli["account"] = error
+        with caplog.at_level(logging.INFO), pytest.raises(SystemExit) as stopped:
+            _run(monkeypatch)
+        message = (f"could not read the account balance ({reason}); pass --balance "
+                   "DOLLARS to choose a starting balance")
+        # A SystemExit carrying text prints it to stderr and exits 1
+        assert stopped.value.code == f"backtest: {message}"
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert errors == [f"Backtest not run: {message}"]
+        # Nothing was fetched, simulated or written
+        assert "sweep_kwargs" not in cli and "dashboard" not in cli
+        assert "Backtest config:" not in caplog.text
+
+    def test_an_account_worth_nothing_stops_the_run(self, cli, monkeypatch, caplog):
+        cli["account"] = AccountBalance({0: 0, 1: 0}, 0)
+        with caplog.at_level(logging.INFO), pytest.raises(SystemExit) as stopped:
+            _run(monkeypatch)
+        assert stopped.value.code == (
+            "backtest: the account is worth $0.00, so there is nothing to start "
+            "from; pass --balance DOLLARS to choose a starting balance")
+        assert "sweep_kwargs" not in cli and "dashboard" not in cli
+
+    def test_no_cash_beside_an_unreadable_positions_value_stops_the_run(
+            self, cli, monkeypatch, caplog):
+        # The account may hold positions of unknown worth, so it is never
+        # called "worth $0", and the run never says it starts from the cash
+        cli["account"] = AccountBalance({0: 0, 1: 0}, None)
+        with caplog.at_level(logging.INFO), pytest.raises(SystemExit) as stopped:
+            _run(monkeypatch)
+        assert stopped.value.code == (
+            "backtest: the account's cash is $0.00 and its open positions' value "
+            "could not be read, so there is nothing to start from; pass --balance "
+            "DOLLARS to choose a starting balance")
+        assert "worth $0.00" not in caplog.text
+        assert "starts from the account's cash alone" not in caplog.text
+        assert "sweep_kwargs" not in cli and "dashboard" not in cli
+
+    @pytest.mark.parametrize("argv, account, amount", [
+        ((), AccountBalance({0: 900}, 300), "12.00"),
+        (("--balance", "20"), None, "20.00"),
+    ])
+    def test_a_balance_below_the_live_minimum_draws_a_warning(
+            self, cli, monkeypatch, caplog, argv, account, amount):
+        # A live run does not trade below config.MIN_BALANCE_CENTS; the
+        # backtest still runs, and says so
+        if account is not None:
+            cli["account"] = account
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, *argv)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert (f"Starting balance ${amount} is below the "
+                f"${config.MIN_BALANCE_CENTS / 100:,.2f} minimum "
+                "(config.MIN_BALANCE_CENTS) below which a live run does not trade; "
+                "the backtest trades from it anyway") in warnings
+        assert "sweep_kwargs" in cli
+
+    def test_a_balance_at_or_above_the_live_minimum_draws_no_warning(
+            self, cli, monkeypatch, caplog):
+        cli["account"] = AccountBalance({0: config.MIN_BALANCE_CENTS}, 0)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert "minimum (config.MIN_BALANCE_CENTS)" not in caplog.text
+
+    @pytest.mark.parametrize("dollars", [0.0, -1.0, float("nan"), float("inf")])
+    def test_a_starting_balance_is_always_a_finite_amount_above_zero(self, dollars):
+        with pytest.raises(ValueError, match="a starting balance must be a finite amount"):
+            backtest.StartingBalance(dollars, "set by --balance")
+
+    @pytest.mark.parametrize("value", ["0", "-5", "nan", "inf", "-inf"])
+    def test_a_balance_that_is_not_a_positive_amount_is_refused(
+            self, cli, monkeypatch, capsys, value):
+        with pytest.raises(SystemExit) as stopped:
+            _run(monkeypatch, f"--balance={value}")
+        assert stopped.value.code == 2
+        assert "--balance must be a positive number of dollars" in capsys.readouterr().err
+        assert cli["balance_reads"] == []
+        assert "sweep_kwargs" not in cli
 
 
 class TestCorpusProvenanceLine:
@@ -1090,6 +1299,12 @@ class TestRejectedArgumentLeavesNoLogFile:
     def test_floor_not_less_than_ceiling_writes_no_log_file(self, tmp_path, monkeypatch):
         self._run(["backtest", "--spread-min", "0.6", "--spread-max", "0.3"],
                    tmp_path, monkeypatch)
+        assert not (tmp_path / "kalshi_backtest.log").exists()
+
+    @pytest.mark.parametrize("value", ["0", "-1", "nan"])
+    def test_a_balance_that_is_not_a_positive_amount_writes_no_log_file(
+            self, tmp_path, monkeypatch, value):
+        self._run(["backtest", f"--balance={value}"], tmp_path, monkeypatch)
         assert not (tmp_path / "kalshi_backtest.log").exists()
 
     def test_one_sided_floor_at_the_default_ceiling_writes_no_log_file(
