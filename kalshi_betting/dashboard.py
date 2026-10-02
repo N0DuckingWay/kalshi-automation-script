@@ -106,10 +106,7 @@ Dependencies:
     _value_steps() and _carry_steps() (a trade's day-by-day moves and what
     the curve carries in it while open, both built from the backtester's one
     day-end path, so the per-type return lines and the risk-free hurdle read
-    the curve's own valuation), _leg_prices_for(), max_trades_simulated()
-    (the one test of a carried
-    post-cutoff verdict against the run's own trades, shared with
-    backtest.py's closing line), _cap_percent() (the injective size-cap
+    the curve's own valuation), _leg_prices_for(), _cap_percent() (the injective size-cap
     formatter the completion lines use, so no two Size cap options can read
     alike), _band_label() (the bare "floor-ceiling" a tier-floors-off run is
     labelled with, since its floor alone gated it) and _tier_floors_bind()
@@ -262,13 +259,12 @@ Notes:
     `off` method; a band the tiers never bind at reuses its tier-on chunks,
     so nothing is simulated twice), then the Add to held pairs cells
     (_GridSource.add_cell and add_off_cell, handed to the visitors that
-    define an `add` method: the chunk visitor and the trade counter) — by
+    define an `add` method: the chunk visitor) — by
     visitors that keep only what they
     build: the chunk
     visitor packs one chunk per distinct (k, trade list), sharing it between
     the scenarios that traded equal lists at one k (every cap at or above a
-    cell's peak Kelly fraction does), a counter records the busiest
-    scenario for the header's stale-cutoff test (_MaxTrades), and the
+    cell's peak Kelly fraction does), the
     interval-discount visitor keeps the primary band's per-k table rows and
     equity curves at every k and cap (_KdVisitor — a visitor that fails
     costs only that section's k and cap selection, with a notice in the
@@ -357,13 +353,10 @@ Notes:
     the run read (BacktestSweep.corpus_provenance): when it was assembled (a
     legacy settled_markets_*.json's file time, named as such) — the Period
     runs to today, the corpus only to that moment — whether it was served
-    from an earlier run's cache, and the archive cutoff as of that assembly,
-    with a red banner when the window starts at or after it and so could
-    never enter a trade — or, when some simulated point DID
-    trade (backtester.max_trades_simulated's eager points, or a size-cap
-    scenario the filter's walk simulated), an amber line saying that
-    verdict is stale instead. It renders on every run, "not recorded"
-    included, never as a silence.
+    from an earlier run's cache, and the archive cutoff as of that assembly
+    (information only: a market settled after the cutoff is priced from
+    Kalshi's live candlestick endpoint). It renders on every run, "not
+    recorded" included, never as a silence.
 
     The page header also names the run's primary spread band, its same-event
     ladder setting and its per-trade size cap (and whether the
@@ -431,7 +424,6 @@ from .backtester import (
     _live_sizing_note,
     _tier_floors_bind,
     _value_steps,
-    max_trades_simulated,
 )
 from .config import (
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
@@ -4424,61 +4416,31 @@ def _entry_checkpoint_html(sweep: BacktestSweep | None) -> str:
     return f'<p style="color:#616161; font-size:14px;">Entry checkpoint: {text}</p>'
 
 
-def _corpus_provenance_html(sweep: BacktestSweep | None, *,
-                            traded: int | None = None) -> str:
+def _corpus_provenance_html(sweep: BacktestSweep | None) -> str:
     """
-    Render the page-header lines saying what settled-market corpus the run read.
+    Render the page-header line saying what settled-market corpus the run read.
 
-    DR-13 and M2/M3 of the 2026-09-24 review. The Period line above it prints
+    DR-13 and M3 of the 2026-09-24 review. The Period line above it prints
     start_date → today because the equity curve runs to today, but the corpus
     holds no market settled after its assembly — and a cached re-run serves a
-    corpus assembled by an earlier run, so the two can be days apart. And a
-    window starting at or after the archive cutoff cannot enter any trade
-    (post-cutoff markets have no historical candlesticks), which used to
-    reach only the log, and only on a cache miss: a cached re-run, and the
-    HTML on every run, showed a flat 0.0% result with no caveat.
+    corpus assembled by an earlier run, so the two can be days apart.
 
     Always renders a line, healthy or not — absence must never be the only
     signal (DR-66): the assembly time (a legacy settled_markets_*.json's
     file time, named as such), whether it came from an earlier run's cache
     (and that --no-cache extends it), and the archive cutoff at assembly.
-    When the carried verdict says the window starts at or after that cutoff,
-    a second line follows, in one of two forms decided by the most trades
-    any simulated scenario made — backtester.max_trades_simulated over the
-    eager points (the one count the log's closing WARNING reads too), or
-    `traded` when the caller adds the size-cap points the page shows, so
-    the two agree unless only a size-cap scenario traded (see below):
-      * no simulated point traded: a red banner stating a BOUND, not a cause
-        — no trade could be entered whatever pairs formed; such a run may
-        also have formed no pairs at all (the 2026-09-17 window formed 0).
-      * some simulated point traded: the verdict is proven stale (the cutoff
-        has since moved past the start date, or the run could not have
-        traded), so the page says THAT instead of a red "no trade could be
-        entered" beside "Trades found: N".
-    The verdict is the one historical._corpus_provenance CARRIED, never
-    re-derived here.
-
-    The page can also show size-cap scenarios the eager sweep never
-    simulated (BacktestSweep.cap_sweep, read by the filter bar's walk), and
-    a larger cap can turn an n < 1 skip into a trade, so generate_dashboard
-    passes `traded` — the larger of max_trades_simulated and the busiest cap
-    point the walk simulated (_MaxTrades). The log's closing line reads the
-    eager points only (backtest._log_corpus_provenance, which runs before the
-    dashboard is built), so on a run where ONLY a non-default cap traded the
-    page calls the verdict stale where the log still repeats it: the page
-    has the evidence and the log does not.
+    The cutoff is information only: a market settled after it is priced from
+    Kalshi's live candlestick endpoint, so a window starting after the cutoff
+    is no longer bound to zero trades, and the red "structurally 0-trade"
+    banner this page used to carry is gone.
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
-        traded (int | None): Keyword-only. The most trades any scenario the
-            page shows made; None (default) reads
-            backtester.max_trades_simulated(sweep), the eager points only.
 
     Returns:
-        str: One grey <p> line, plus a red or amber <p> when the carried
-            post-cutoff verdict is True. "not recorded" when there is no
-            sweep or it carries no provenance (the window's fetch was
-            skipped, a stubbed corpus, a hand-built sweep).
+        str: One grey <p> line. "not recorded" when there is no sweep or it
+            carries no provenance (the window's fetch was skipped, a stubbed
+            corpus, a hand-built sweep).
     """
     prov: CorpusProvenance | None = None if sweep is None else sweep.corpus_provenance
     grey = '<p style="color:#616161; font-size:14px;">'
@@ -4508,46 +4470,11 @@ def _corpus_provenance_html(sweep: BacktestSweep | None, *,
     if prov.archive_cutoff is not None:
         cutoff = f"archive cutoff at assembly: {prov.archive_cutoff:%Y-%m-%d}"
     elif prov.legacy:
-        cutoff = ("archive cutoff at assembly: not recorded (the legacy format "
-                  "records none; --no-cache re-checks it)")
+        cutoff = "archive cutoff at assembly: not recorded (the legacy format records none)"
     else:
-        cutoff = "archive cutoff at assembly: not recorded (--no-cache re-checks it)"
-    line = (f"{grey}Settled-market corpus: {html.escape(assembled)} "
+        cutoff = "archive cutoff at assembly: not recorded"
+    return (f"{grey}Settled-market corpus: {html.escape(assembled)} "
             f"({html.escape(source)}) | {html.escape(cutoff)}</p>")
-    if not prov.post_cutoff:
-        return line
-    cutoff_day = (f"{prov.archive_cutoff:%Y-%m-%d}" if prov.archive_cutoff is not None
-                  else "not recorded")
-    # A trade at any simulated point disproves "no trade could be entered":
-    # the one test the log's closing WARNING applies too (over the eager
-    # points; the caller adds the cap points the page's walk simulated)
-    if traded is None:
-        traded = max_trades_simulated(sweep)
-    if traded:
-        recorded = "at this corpus's assembly" if prov.from_cache else "by this run"
-        notice = (
-            f"The archive cutoff recorded {recorded} ({cutoff_day}) is at or "
-            "after this window's start date, which would mean no trade could be "
-            f"entered — but this run entered trades (up to {traded} in one "
-            "simulated scenario), so that verdict is stale: the cutoff has since "
-            "moved past the start date. --no-cache re-reads the cutoff and "
-            "re-stamps the cache."
-        )
-        return line + (
-            '<p style="color:#E65100; font-size:14px; font-weight:700;">'
-            f"{html.escape(notice)}</p>"
-        )
-    stale = (" If the cutoff has since moved past the start date this may no "
-             "longer hold — a cached run does not re-read it; --no-cache "
-             "re-checks." if prov.from_cache else "")
-    return line + (
-        '<p style="color:#B71C1C; font-size:14px; font-weight:700;">'
-        f"This window starts at or after the archive cutoff ({cutoff_day}, as "
-        "of the corpus's assembly). Post-cutoff markets have no historical "
-        "candlesticks, so no trade could be entered in this window whatever "
-        "pairs formed: a zero-trade result on this page is structural and "
-        f"says nothing about the strategy.{html.escape(stale)}</p>"
-    )
 
 
 # The scenario explorer's tier-floors-off banner opens on this HTML, so none
@@ -6972,11 +6899,9 @@ def _same_title_points(source: _GridSource) -> dict:
     rows at the other caps only — ONE WARNING (with the traceback) — and the
     run's own same-title point at the run's own cap stands in, read from the
     eager grid (source.fallback, whose same_title is a lookup), so the
-    scenario explorer still shows it and the header's stale-cutoff count
-    still sees it (backtester.max_trades_simulated counts it too). The cells
+    scenario explorer still shows it. The cells
     already walked, and the filter bar's cap axis, are untouched: unlike a
-    cell, this population feeds only the explorer's same-title row and that
-    count.
+    cell, this population feeds only the explorer's same-title row.
 
     Args:
         source (_GridSource): The grid being walked.
@@ -7304,147 +7229,6 @@ def _walk_grid(source: _GridSource, visitors: list,
     if error is not None:
         raise error
     return walked
-
-
-class _MaxTrades:
-    """
-    The largest trade count of any scenario the page shows.
-
-    The header's stale-cutoff verdict (_corpus_provenance_html) is disproved
-    by ANY simulated trade, and a size-cap sweep simulates scenarios
-    backtester.max_trades_simulated never sees (it reads the eager points):
-    a larger cap can turn an n < 1 skip into a trade. That includes the
-    same-title population at every cap, which the scenario explorer shows
-    and the walk therefore reads (same_title) — or, when that population
-    could not be simulated (_same_title_points), the run's own point alone,
-    which is all the page then shows of it: the count covers what the page
-    shows, so it is not marked failed for that. The tier-floors-off cells the
-    walk hands to `off` are counted too, at every cap the page shows them
-    (the tier-floors-off size-cap sweep's points included): the page shows
-    them, and backtester.max_trades_simulated counts the family's eager
-    points as well. What `off` counted is kept apart from the tier-on count,
-    so the walk can drop it (reset_off) when it re-reads the off cells from
-    the family's eager points after an off cell failed. The Add to held pairs
-    scenarios the walk hands to `add` are counted the same way, since the page
-    shows them and a larger position can turn an n < 1 skip into a trade;
-    what `add` counted is dropped again (reset_add) should an add-on cell
-    fail, because the page then shows none of them.
-
-    Attributes:
-        most (int): The largest len(trades) over every point visited.
-        failed (bool): Whether counting raised (most is then not used).
-    """
-
-    def __init__(self) -> None:
-        """Start at zero."""
-        self.reset(None)
-
-    def reset(self, source: _GridSource | None) -> None:
-        """
-        Start again for another grid (the walk's fallback).
-
-        Args:
-            source (_GridSource | None): The grid about to be walked (unused).
-        """
-        self.most = 0
-        self.failed = False
-        # The tier-on count alone (tier-on cells and the same-title
-        # population): what reset_off returns to
-        self._on_most = 0
-        self._on_failed = False
-        # (most, failed) as they stood before the first add-on cell was
-        # counted: what reset_add returns to
-        self._pre_add: tuple[int, bool] | None = None
-
-    def reset_off(self, source: _GridSource) -> None:
-        """
-        Drop what the tier-floors-off cells counted (the walk re-reads them).
-
-        Args:
-            source (_GridSource): The grid whose off cells are walked next
-                (unused).
-        """
-        self.most, self.failed = self._on_most, self._on_failed
-
-    def _count(self, pops, *, on: bool) -> None:
-        """
-        Fold some points' trade counts into the running maximum.
-
-        Args:
-            pops: SweepPoints.
-            on (bool): Keyword-only. Whether they are tier-on points (or the
-                same-title population), which reset_off keeps.
-        """
-        try:
-            for point in pops:
-                self.most = max(self.most, len(point.trades))
-                if on:
-                    self._on_most = max(self._on_most, len(point.trades))
-        except Exception:
-            logging.warning("Could not count a dashboard scenario's trades", exc_info=True)
-            self.failed = True
-            if on:
-                self._on_failed = True
-
-    def __call__(self, bi: int, ki: int, ci: int, pops: dict) -> None:
-        """
-        Count one scenario's points.
-
-        Args:
-            bi (int): Band index.
-            ki (int): k index.
-            ci (int): Cap index.
-            pops (dict): Population -> SweepPoint.
-        """
-        self._count(pops.values(), on=True)
-
-    def off(self, bi: int, ki: int, ci: int, pops: dict) -> None:
-        """
-        Count one tier-floors-off scenario's points, as a tier-on one's.
-
-        Args:
-            bi (int): Band index (a band the tiers bind at).
-            ki (int): k index.
-            ci (int): Cap index.
-            pops (dict): Population -> SweepPoint.
-        """
-        self._count(pops.values(), on=False)
-
-    def add(self, bi: int, ki: int, ci: int, pops: dict, *, off: bool = False) -> None:
-        """
-        Count one Add to held pairs scenario's points.
-
-        Args:
-            bi (int): Band index.
-            ki (int): k index.
-            ci (int): Cap index.
-            pops (dict): Population -> SweepPoint.
-            off (bool): Keyword-only. Whether the cell is a tier-floors-off
-                one (counted alike). False (default).
-        """
-        if self._pre_add is None:
-            self._pre_add = (self.most, self.failed)
-        self._count(pops.values(), on=False)
-
-    def reset_add(self, source: _GridSource) -> None:
-        """
-        Drop what the Add to held pairs cells counted (the page shows none of them).
-
-        Args:
-            source (_GridSource): The grid walked from here on (unused).
-        """
-        if self._pre_add is not None:
-            self.most, self.failed = self._pre_add
-        self._pre_add = None
-
-    def same_title(self, by_cap: dict) -> None:
-        """
-        Count the same-title population's points, one per size cap.
-
-        Args:
-            by_cap (dict): Cap -> the same-title SweepPoint at that cap.
-        """
-        self._count(by_cap.values(), on=True)
 
 
 class _KdVisitor:
@@ -8636,7 +8420,7 @@ def _build_filter_grid(
     pooled_k: float | None = None,
     explorer: _ExplorerVisitor | None = None,
     risk_free: RiskFreeRates | None = None,
-) -> tuple[_GridSource, _ChunkVisitor, _MaxTrades, _KdVisitor]:
+) -> tuple[_GridSource, _ChunkVisitor, _KdVisitor]:
     """
     Walk the page's grid once with the page's visitors.
 
@@ -8661,19 +8445,18 @@ def _build_filter_grid(
             nothing.
 
     Returns:
-        tuple[_GridSource, _ChunkVisitor, _MaxTrades, _KdVisitor]: The grid
-            actually walked (the source, or its eager fallback) and the three
+        tuple[_GridSource, _ChunkVisitor, _KdVisitor]: The grid
+            actually walked (the source, or its eager fallback) and the two
             filter visitors — one walk, so a size-cap sweep's cells are
-            simulated once for all of them and for the explorer's.
+            simulated once for both of them and for the explorer's.
     """
     chunks = _ChunkVisitor(source, trades, equity_df, k_used, start_date, initial_balance,
                            series_categories, risk_free=risk_free)
-    most = _MaxTrades()
     kd = _KdVisitor(source, chunks.axis, pooled_k, risk_free=risk_free)
     axis_end = chunks.axis[-1] if len(chunks.axis) else None
-    visitors = [chunks, most, kd] + ([] if explorer is None else [explorer])
+    visitors = [chunks, kd] + ([] if explorer is None else [explorer])
     walked = _walk_grid(source, visitors, axis_end)
-    return walked, chunks, most, kd
+    return walked, chunks, kd
 
 
 def _new_explorer_visitor(source: _GridSource, sweep: BacktestSweep, *,
@@ -10484,8 +10267,7 @@ def generate_dashboard(
     written (_build_filter_grid), because the header needs its result: a
     size-cap sweep's cells are simulated during that walk (the
     tier-floors-off size-cap sweep's and the Add to held pairs family's too),
-    the busiest of them feeds the
-    header's stale-cutoff test (_MaxTrades), a size-cap sweep the walk could
+    a size-cap sweep the walk could
     not use is named on the run-settings line (_run_settings_html's
     cap_sweep_unused, and tier_off_cap_sweep_unused for the tier-floors-off
     one alone), _live_rule_html names the bar's own options, the interval-discount
@@ -10570,11 +10352,8 @@ def generate_dashboard(
             on every run (_corpus_provenance_html): when the corpus was
             assembled — the Period runs to today, the corpus only to that
             moment — whether it came from an earlier run's cache, and the
-            archive cutoff at assembly, with a red banner when the window
-            starts at or after it, or an amber stale-verdict line
-            when a simulated point — an eager one or a size-cap cell the
-            filter's walk simulated — traded anyway. "not recorded" when the
-            sweep carries none or there is no sweep.
+            archive cutoff at assembly (information only). "not recorded"
+            when the sweep carries none or there is no sweep.
         interval_discount (float | None): The interval discount `trades` were
             SIZED at, threaded into the Risk section's Kelly scatter and the
             filter's views of it. Separate from `sweep` because that scatter
@@ -10678,7 +10457,6 @@ def generate_dashboard(
     # renders from its own arguments.
     filter_data = filter_bar = base_block = None
     chunks: list = []
-    most_traded = 0
     walked: _GridSource | None = None
     # The interval-discount section's data at every k and cap the bar offers,
     # from the same walk (None: the section renders statically), and whether
@@ -10699,7 +10477,7 @@ def generate_dashboard(
         source = _grid_source(sweep, trades, equity_df, k_used)
         explorer_visitor = (_new_explorer_visitor(source, sweep, risk_free=risk_free)
                             if explores else None)
-        source, chunker, counter, kd_visitor = _build_filter_grid(
+        source, chunker, kd_visitor = _build_filter_grid(
             source, trades, equity_df, k_used, start_date, initial_balance, series_categories,
             pooled_k=_pooled_k(sweep), explorer=explorer_visitor, risk_free=risk_free)
         walked = source
@@ -10709,8 +10487,6 @@ def generate_dashboard(
                 # Its visitor failed (and said so): the sweep's own points
                 explorer_data, explorer_failed = _explorer_fallback(sweep, risk_free=risk_free)
                 explorer_rebuilt = not explorer_failed
-        if not counter.failed:
-            most_traded = counter.most
         # A chunk that failed to build has already said so and dropped them all
         if not chunker.failed:
             pb, pk, pc = source.primary
@@ -10793,16 +10569,9 @@ def generate_dashboard(
     live_rule = _live_rule_html(sweep, bar=filter_data)
 
     # Directly under the Period line, which it qualifies: the corpus holds
-    # nothing settled after its assembly even though the period runs to today,
-    # and a window at or after the archive cutoff could never enter a trade
-    # (unless a simulated point traded, which proves that verdict stale — an
-    # eager point, per backtester.max_trades_simulated, or a size-cap cell the
-    # walk above simulated). Rendered on every run, healthy or not (DR-13,
-    # M2; DR-66's rule).
-    traded = (None if sweep is None
-              # The eager points' busiest (the log's closing line reads the same)
-              else max(most_traded, max_trades_simulated(sweep)))
-    corpus_note = _corpus_provenance_html(sweep, traded=traded)
+    # nothing settled after its assembly even though the period runs to today.
+    # Rendered on every run, healthy or not (DR-13; DR-66's rule).
+    corpus_note = _corpus_provenance_html(sweep)
     # The rate every ratio below subtracts, or its absence (DR-66)
     rf_note = _risk_free_html(risk_free, equity_df)
 

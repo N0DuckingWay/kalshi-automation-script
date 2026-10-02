@@ -16,13 +16,10 @@ Purpose:
     Prints a summary of key metrics (trade count, win rate, total return) to
     the log on completion, closed on every run by what settled-market corpus
     the run read (its assembly time, whether it was cached, and the archive
-    cutoff as of assembly — a WARNING when the window starts at or after it).
+    cutoff as of assembly, as information).
 
 Dependencies:
-    Imports run_backtest_sweep, BacktestSweep and max_trades_simulated (the
-    closing corpus line tests a stamped post-cutoff verdict against the run's
-    own trades with it — over the eager points; the dashboard header adds the
-    size-cap points its filter walk simulates) from backtester.py,
+    Imports run_backtest_sweep and BacktestSweep from backtester.py,
     generate_dashboard from dashboard.py, build_historical_client /
     build_prod_live_client / load_series_categories (the dashboard's
     returns-by-category labels) from historical.py, and load_risk_free_rates
@@ -155,7 +152,7 @@ import logging
 import logging.handlers
 from datetime import UTC, date, datetime
 
-from .backtester import BacktestSweep, max_trades_simulated, run_backtest_sweep
+from .backtester import BacktestSweep, run_backtest_sweep
 from .config import (
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
@@ -184,23 +181,11 @@ def _log_corpus_provenance(sweep: BacktestSweep) -> None:
 
     The "Period:" line prints start_date → today (the simulated window), but
     the corpus holds no market settled after its assembly, and a cached re-run
-    reads a corpus an earlier run assembled (DR-13). A window at or after the
-    archive cutoff can enter no trade at all (M2): historical.py logs that as
-    a WARNING at fetch time (and, "as of assembly", on a cache hit), which on
-    a long run sits far above the result it explains, so it is repeated here,
-    beside it. Logged on every run, "not recorded" included — absence must
-    never be the only signal (DR-66). Worded as a bound, not a cause: such a
-    window may also have formed no pairs at all. And a stamped verdict can go
-    stale once the cutoff moves past start_date, so it is read beside
-    backtester.max_trades_simulated: if any simulated point traded, the
-    verdict is reported as stale instead of repeated. That counts the EAGER
-    points only; the dashboard header, built after this line, tests the
-    larger of it and the size-cap points its filter walk simulates, so the
-    two agree unless only a size-cap scenario traded — then the page calls
-    the verdict stale while this line still repeats it.
-
-    Takes the sweep WHOLE, like dashboard._section_interval_discount, so the
-    provenance and the trade counts it is judged against cannot drift apart.
+    reads a corpus an earlier run assembled (DR-13). Logged on every run, "not
+    recorded" included — absence must never be the only signal (DR-66). The
+    archive cutoff is information only: a market settled after it is priced
+    from Kalshi's live candlestick endpoint, so a window starting after it is
+    no longer bound to zero trades.
 
     Args:
         sweep (BacktestSweep): The run's result. Its corpus_provenance is None
@@ -237,31 +222,6 @@ def _log_corpus_provenance(sweep: BacktestSweep) -> None:
         if provenance.from_cache else "assembled by this run",
         cutoff,
     )
-    if not provenance.post_cutoff:
-        return
-    # A trade at any simulated point disproves "no trade could be entered".
-    # The eager points only: the dashboard header also counts the size-cap
-    # points its walk simulates, so the two agree unless only one of those traded
-    traded = max_trades_simulated(sweep)
-    if traded:
-        logging.warning(
-            "The archive cutoff recorded %s is at or after this window's start "
-            "date, which would mean no trade could be entered — but this run "
-            "entered trades (up to %d in one simulated scenario), so that "
-            "verdict is stale: the cutoff has since moved past the start date. "
-            "--no-cache re-reads the cutoff and re-stamps the cache.",
-            "at this corpus's assembly" if provenance.from_cache else "by this run",
-            traded,
-        )
-        return
-    logging.warning(
-        "This window starts at or after the archive cutoff as of its "
-        "corpus's assembly — post-cutoff markets have no historical "
-        "candlesticks, so no trade could be entered whatever pairs formed; "
-        "a zero-trade result here is structural, not a strategy result%s",
-        " (a cached run does not re-read the cutoff; --no-cache re-checks it)"
-        if provenance.from_cache else "",
-    )
 
 
 def main() -> None:
@@ -285,8 +245,7 @@ def main() -> None:
     the plain run_backtest() path's did. The other swept discounts and bands
     exist for the dashboard (its page-wide filter bar, whose k select the
     Interval Discount section follows, its scenario explorer and k-hat
-    breakdown), the calibration report and max_trades_simulated's
-    post-cutoff check; the tier-floors-off family is read by that check and
+    breakdown) and the calibration report; the tier-floors-off family is read
     by the dashboard's filter bar, k-hat breakdown and scenario explorer
     (their Tier floors choice), carried to generate_dashboard on the sweep;
     and the lazily simulated size caps (result.cap_sweep, and the
@@ -603,10 +562,8 @@ def main() -> None:
     # (which the Interval Discount section follows), the band-sweep payload by
     # the dashboard's scenario explorer, filter bar and k-hat breakdown, the
     # tier-floors-off family by that filter bar, k-hat breakdown and scenario
-    # explorer too (their Tier floors choice), every kept point — the
-    # tier-floors-off family's included — by max_trades_simulated's
-    # post-cutoff check (_log_corpus_provenance below, and the dashboard's
-    # header), and the lazy size-cap sweeps (result.cap_sweep and, over the
+    # explorer too (their Tier floors choice), and the lazy size-cap sweeps
+    # (result.cap_sweep and, over the
     # tier-floors-off family, result.tier_off_cap_sweep, simulated only when
     # a cell is read) only by the dashboard, whose one grid walk reads
     # every cell as the page is built (filter bar, Interval Discount section
@@ -633,9 +590,8 @@ def main() -> None:
         logging.info("  Final balance: $%s", f"{final_value:,.2f}")
 
     # After either branch: the window (the Period line, when printed) runs to
-    # today but the corpus only to its assembly, and a post-cutoff window's
-    # zero is structural — say so beside the result rather than only at the
-    # top of a long log (DR-13, M2)
+    # today but the corpus only to its assembly — say so beside the result
+    # rather than only at the top of a long log (DR-13)
     _log_corpus_provenance(result)
 
     # generate_dashboard() already logs "Dashboard written: %s" itself (BS-26) —

@@ -860,13 +860,12 @@ class TestFetchAllSettledMarkets:
                        in live.get_markets_without_preload_content.call_args_list]
         assert min(seen_min_ts) == expected_min_ts
 
-    def test_start_date_at_or_after_cutoff_warns(self, tmp_path, monkeypatch, caplog):
-        # BS-11: a start_date at/after the archive cutoff means every market
-        # in the window is live-era, and live-era markets 404 on the historical
-        # candlesticks endpoint (see the CLAUDE.md "Backtest windows must
-        # start BEFORE the archive cutoff" gotcha) — so the window is
-        # structurally 0-trade no matter what this fetch returns. This is a
-        # WARN, not an abort: the fetch must still run to completion.
+    def test_start_date_at_or_after_cutoff_does_not_warn(self, tmp_path, monkeypatch, caplog):
+        # BS-11 used to WARN that such a window was structurally 0-trade:
+        # live-era markets 404 on the historical candlesticks endpoint. They
+        # are priced from the live endpoint now (fetch_candlesticks' 404
+        # fallback), so the window is an ordinary one: no WARNING, and the
+        # fetch runs to completion.
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
 
         def fake_signed_get(client, path, **params):
@@ -886,15 +885,15 @@ class TestFetchAllSettledMarkets:
                 MagicMock(), live, start_date=date(2026, 7, 6), use_cache=False,
             )
 
-        # Warn, never abort — the fetch still completes and returns normally.
+        # The fetch completes and returns normally, and says nothing about it.
         assert list(out) == []
         assert len(out) == 0
-        assert any("archive cutoff" in r.getMessage() for r in caplog.records
-                   if r.levelname == "WARNING")
+        assert not any("archive cutoff" in r.getMessage() for r in caplog.records
+                       if r.levelname == "WARNING")
 
     def test_start_date_before_cutoff_does_not_warn(self, tmp_path, monkeypatch, caplog):
         # The common case (default start_date 2024-01-01, cutoff far later)
-        # must not trip the new warning.
+        # draws no warning either.
         monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
 
         def fake_signed_get(client, path, **params):
@@ -3237,6 +3236,137 @@ class _CandleEndpoint:
         ]})
 
 
+class _TwoCandleEndpoints:
+    """Fake archive and live candlestick endpoints, told apart by path.
+
+    `holds` names the endpoints that hold the market ("historical", "live");
+    the others answer 404, as the archive does for a market settled after the
+    archive cutoff. Each call is recorded as (endpoint name, start_ts, end_ts).
+    """
+
+    def __init__(self, first_ts, last_ts, holds, *, fail_status=404):
+        self.archive = _CandleEndpoint(first_ts, last_ts)
+        self.holds = set(holds)
+        self.fail_status = fail_status
+        self.calls: list[tuple[str, int, int]] = []
+
+    def __call__(self, client, path, **params):
+        if path.startswith(f"{historical._API_PREFIX}/historical/markets/"):
+            name = "historical"
+        elif path.startswith(f"{historical._API_PREFIX}/series/"):
+            name = "live"
+            # The live path names the series before the ticker
+            assert path.split("/")[-4] == "KXSERIES", path
+        else:
+            raise AssertionError(f"unexpected path {path}")
+        assert path.endswith("/markets/T1/candlesticks"), path
+        self.calls.append((name, params["start_ts"], params["end_ts"]))
+        if name not in self.holds:
+            raise _FakeApiException(self.fail_status, "Not Found"
+                                    if self.fail_status == 404 else "Bad Request")
+        return self.archive(client, path, **params)
+
+
+class TestFetchCandlesticksEndpoints:
+    """A market that settled after Kalshi's archive cutoff has its candles on
+    the live API (/series/{series}/markets/{ticker}/candlesticks), not in the
+    archive, which answers 404 for it. fetch_candlesticks asks the endpoint
+    live_first names first and the other one on a 404."""
+
+    OPEN = 1_700_000_000 - 1_700_000_000 % _HOUR
+    CLOSE = OPEN + 10 * _HOUR
+
+    def _fetch(self, monkeypatch, tmp_path, endpoints, **kw):
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        monkeypatch.setattr(historical, "_signed_raw_get", endpoints)
+        return historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=kw.pop("open_ts", self.OPEN),
+            close_ts=kw.pop("close_ts", self.CLOSE), use_cache=False,
+            rate_limit_sleep=0.0, **kw)
+
+    def test_without_a_series_only_the_archive_is_asked(self, monkeypatch, tmp_path):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds={"live"})
+        out = self._fetch(monkeypatch, tmp_path, endpoints, live_first=True)
+        assert out == []
+        assert [name for name, *_ in endpoints.calls] == ["historical"]
+
+    def test_live_first_asks_the_live_endpoint_and_stops_there(self, monkeypatch, tmp_path):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds={"live"})
+        out = self._fetch(monkeypatch, tmp_path, endpoints, series="KXSERIES",
+                          live_first=True)
+        assert [name for name, *_ in endpoints.calls] == ["live"]
+        assert [c["ts"] for c in out] == endpoints.archive.served(self.OPEN, self.CLOSE)
+        # Cached like any other fetch: the next run reads it with no request
+        cached = json.loads((tmp_path / "candles" / "T1.json").read_text())
+        assert cached["candles"] == out
+
+    def test_a_404_from_the_archive_asks_the_live_endpoint(self, monkeypatch, tmp_path):
+        # Routed to the archive (the cutoff had not passed it when read), but
+        # the archive does not hold it: the live endpoint does
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds={"live"})
+        out = self._fetch(monkeypatch, tmp_path, endpoints, series="KXSERIES",
+                          live_first=False)
+        assert [name for name, *_ in endpoints.calls] == ["historical", "live"]
+        assert len(out) == len(endpoints.archive.served(self.OPEN, self.CLOSE))
+
+    def test_a_404_from_the_live_endpoint_asks_the_archive(self, monkeypatch, tmp_path):
+        # The cutoff moved past the market since it was routed: it is archived
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds={"historical"})
+        out = self._fetch(monkeypatch, tmp_path, endpoints, series="KXSERIES",
+                          live_first=True)
+        assert [name for name, *_ in endpoints.calls] == ["live", "historical"]
+        assert len(out) == len(endpoints.archive.served(self.OPEN, self.CLOSE))
+
+    def test_a_404_from_both_is_one_line_naming_both_and_nothing_is_cached(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds=set())
+        with caplog.at_level(logging.WARNING):
+            out = self._fetch(monkeypatch, tmp_path, endpoints, series="KXSERIES",
+                              live_first=True)
+        assert out == []
+        msgs = [r.getMessage() for r in caplog.records
+                if "Candlestick fetch failed" in r.getMessage()]
+        assert msgs == ["Candlestick fetch failed for T1: HTTP 404 Not Found "
+                        "(live then historical endpoint)"]
+        assert not (tmp_path / "candles" / "T1.json").exists()
+
+    def test_any_other_failure_is_final_without_asking_the_other_endpoint(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds=set(),
+                                        fail_status=400)
+        with caplog.at_level(logging.WARNING):
+            out = self._fetch(monkeypatch, tmp_path, endpoints, series="KXSERIES",
+                              live_first=True)
+        assert out == []
+        assert [name for name, *_ in endpoints.calls] == ["live"]
+        assert any("HTTP 400 Bad Request (live endpoint)" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_a_long_window_is_paged_on_the_live_endpoint_too(self, monkeypatch, tmp_path):
+        close = self.OPEN + 400 * 86_400
+        endpoints = _TwoCandleEndpoints(self.OPEN, close, holds={"live"})
+        out = self._fetch(monkeypatch, tmp_path, endpoints, series="KXSERIES",
+                          live_first=True, close_ts=close)
+        assert [name for name, *_ in endpoints.calls] == ["live", "live"]
+        assert [c["ts"] for c in out] == endpoints.archive.served(self.OPEN, close)
+
+    def test_a_404_on_a_later_page_retries_the_whole_window_on_the_other_endpoint(
+        self, monkeypatch, tmp_path,
+    ):
+        # All-or-nothing per endpoint: the pages the first endpoint did serve
+        # are discarded, never stitched to the other endpoint's
+        close = self.OPEN + 400 * 86_400
+        endpoints = _TwoCandleEndpoints(self.OPEN, close, holds={"historical", "live"})
+        endpoints.archive.fail_on_call = {2: 1}  # the archive's second page 404s once
+        out = self._fetch(monkeypatch, tmp_path, endpoints, series="KXSERIES",
+                          live_first=False, close_ts=close)
+        assert [name for name, *_ in endpoints.calls] == [
+            "historical", "historical", "live", "live"]
+        assert [c["ts"] for c in out] == endpoints.archive.served(self.OPEN, close)
+
+
 class TestCandleRequestWindows:
     """historical._candle_request_windows: one request unless the window is
     longer than the endpoint serves, then overlapping requests within the cap."""
@@ -5185,16 +5315,15 @@ def _forbid_network(monkeypatch):
 
 
 class TestCorpusProvenance:
-    """DR-13 and M2/M3 of the 2026-09-24 7-day-run review. A cache hit used to
+    """DR-13 and M3 of the 2026-09-24 7-day-run review. A cache hit used to
     log one "Loaded N" line and return: nothing said the corpus stops at its
-    assembly while the window runs to today, the post-cutoff "structurally
-    0-trade" WARNING — logged only after the cutoff read, which a hit never
-    reaches — vanished from every cached re-run, and an EMPTY cache was a
+    assembly while the window runs to today, and an EMPTY cache was a
     permanent hit. Now the archive cutoff is stamped into the streamed cache
     (informational, never part of its identity), every hit announces what it
-    covers and repeats the verdict "as of assembly" with ZERO network calls,
-    and an empty cache is served only while younger than
-    EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS."""
+    covers with ZERO network calls, and an empty cache is served only while
+    younger than EMPTY_ASSEMBLED_CACHE_MAX_AGE_SECONDS. The post-cutoff
+    "structurally 0-trade" WARNING is gone: a post-cutoff market is priced
+    from the live candlestick endpoint."""
 
     PRE = date(2026, 6, 5)     # before TestShardedFetch.CUTOFF (2026-06-10)
     POST = date(2026, 6, 10)   # exactly on it: at-or-after is post-cutoff
@@ -5238,7 +5367,7 @@ class TestCorpusProvenance:
             "settled": counts.settled, "rejected": 0, "duplicates": counts.duplicates}
         assert prov == historical.CorpusProvenance(
             from_cache=False, assembled_at=datetime.fromisoformat(meta["assembled_at"]),
-            archive_cutoff=self.CUTOFF_DT, post_cutoff=False, assembly_counts=counts)
+            archive_cutoff=self.CUTOFF_DT, assembly_counts=counts)
 
     def test_the_stamp_is_informational_not_identity(self, tmp_path, monkeypatch):
         # A file whose informational keys differ from anything this run would
@@ -5269,7 +5398,7 @@ class TestCorpusProvenance:
         # The same meta block, read back: identical facts, flagged as cached.
         assert hit.provenance == historical.CorpusProvenance(
             from_cache=True, assembled_at=fresh.assembled_at,
-            archive_cutoff=fresh.archive_cutoff, post_cutoff=False,
+            archive_cutoff=fresh.archive_cutoff,
             assembly_counts=fresh.assembly_counts)
         text = caplog.text
         assert f"Loaded {len(out)} settled markets from cache" in text
@@ -5292,39 +5421,34 @@ class TestCorpusProvenance:
         assert "re-fetches every pair's candlesticks and re-resolves event titles" in text
         assert "close to a full fetch" in text
         assert "mainly the current day" not in text
-        # A pre-cutoff window's hit repeats no post-cutoff WARNING.
+        # A hit warns about nothing.
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
-    def test_a_post_cutoff_hit_repeats_the_warning_as_of_assembly_with_zero_network_calls(
+    def test_a_post_cutoff_window_draws_no_warning_fresh_or_cached(
             self, tmp_path, monkeypatch, caplog):
+        # A window starting on the cutoff used to draw a "structurally
+        # 0-trade" WARNING on a miss and again, as of assembly, on a hit. Its
+        # markets are priced from the live candlestick endpoint now, so
+        # neither path warns; the cutoff is still reported as information.
         with caplog.at_level(logging.WARNING):
             out, _, _ = self._fetch(tmp_path, monkeypatch, self.POST)
-        # The miss path's WARNING is unchanged, word for word.
-        miss = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"
-                and "archive cutoff" in r.getMessage()]
-        assert miss == ["start_date (2026-06-10) is at or after the archive cutoff "
-                        "(2026-06-10) — post-cutoff markets 404 on the historical "
-                        "candlesticks endpoint, so this window is structurally 0-trade"]
-        assert out.provenance.post_cutoff is True
+        assert not [r for r in caplog.records if r.levelname == "WARNING"
+                    and "archive cutoff" in r.getMessage()]
+        assert out.provenance.archive_cutoff == self.CUTOFF_DT
 
         caplog.clear()
         _forbid_network(monkeypatch)
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.INFO):
             hit = self._hit(self.POST)
-        assert hit.provenance.post_cutoff is True and hit.provenance.from_cache is True
-        warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warned) == 1
-        assert "start_date (2026-06-10) is at or after the archive cutoff (2026-06-10)" \
-            in warned[0]
-        assert "as of this cached corpus's assembly" in warned[0]
-        assert "structurally 0-trade unless the cutoff has since moved" in warned[0]
-        assert "pass --no-cache to re-check it" in warned[0]
+        assert hit.provenance.from_cache is True
+        assert "archive cutoff at assembly: 2026-06-10" in caplog.text
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+        assert "structurally" not in caplog.text
 
     def test_a_cache_written_before_the_stamp_is_served_and_says_so(
             self, tmp_path, monkeypatch, caplog):
         # The real 2026-09-17 cache on disk carries assembled_at but no
-        # archive_cutoff_ts: it must still hit, with an unknown verdict — and
-        # no post-cutoff WARNING can be claimed without a network read.
+        # archive_cutoff_ts: it must still hit, and say the cutoff is unknown.
         out, _, _ = self._fetch(tmp_path, monkeypatch, self.POST)
         records = list(out)
         _write_jsonl(out.path, {**historical._assembled_cache_meta(self.POST, None),
@@ -5336,7 +5460,7 @@ class TestCorpusProvenance:
         assert list(hit) == records
         assert hit.provenance == historical.CorpusProvenance(
             from_cache=True, assembled_at=datetime(2026, 6, 11, 9, 30, tzinfo=UTC),
-            archive_cutoff=None, post_cutoff=None)
+            archive_cutoff=None)
         assert "the archive cutoff was not recorded when it was assembled" in caplog.text
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
@@ -5357,14 +5481,13 @@ class TestCorpusProvenance:
         assert type(out) is historical.LegacySettledCorpus
         assert out == [{"ticker": "OLD1"}] and len(out) == 1
         assert out.provenance == historical.CorpusProvenance(
-            from_cache=True, assembled_at=written, archive_cutoff=None,
-            post_cutoff=None, legacy=True)
+            from_cache=True, assembled_at=written, archive_cutoff=None, legacy=True)
         assert ("Legacy assembled cache settled_markets_2026-06-10.json was last "
                 "written at 2026-06-12 07:45 UTC") in caplog.text
         assert "its file time" in caplog.text
         assert "the legacy format records no archive cutoff" in caplog.text
         assert "(and rebuild it in the streamed format)" in caplog.text
-        # No cutoff was recorded, so no verdict is claimed on a legacy hit.
+        # A legacy hit warns about nothing either.
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
     def test_a_legacy_file_that_is_not_a_list_is_returned_as_before(
@@ -5471,19 +5594,22 @@ class TestCorpusProvenance:
 
     @pytest.mark.parametrize("meta, expected", [
         ({"start_date": "2026-06-10", "archive_cutoff_ts": 1_781_049_600},
-         (datetime(2026, 6, 10, tzinfo=UTC), True)),          # start == cutoff
-        ({"start_date": "2026-06-09", "archive_cutoff_ts": 1_781_049_600},
-         (datetime(2026, 6, 10, tzinfo=UTC), False)),         # a day before
+         datetime(2026, 6, 10, tzinfo=UTC)),
         ({"start_date": "2026-06-10", "archive_cutoff_ts": 1_781_049_601},
-         (datetime(2026, 6, 10, 0, 0, 1, tzinfo=UTC), False)),  # a second later
-        ({"start_date": "2026-06-10", "archive_cutoff_ts": True}, (None, None)),
-        ({"start_date": "2026-06-10", "archive_cutoff_ts": "1781049600"}, (None, None)),
-        ({"start_date": "2026-06-10"}, (None, None)),
-        ({"start_date": "garbage", "archive_cutoff_ts": 1_781_049_600}, (None, None)),
+         datetime(2026, 6, 10, 0, 0, 1, tzinfo=UTC)),
+        # Read by TYPE: a bool is an int subclass and is no epoch
+        ({"start_date": "2026-06-10", "archive_cutoff_ts": True}, None),
+        ({"start_date": "2026-06-10", "archive_cutoff_ts": "1781049600"}, None),
+        ({"start_date": "2026-06-10"}, None),
+        # Outside the range a datetime holds: unreadable, never an exception
+        ({"start_date": "2026-06-10", "archive_cutoff_ts": 10**20}, None),
+        # The start date no longer matters to the cutoff it reports
+        ({"start_date": "garbage", "archive_cutoff_ts": 1_781_049_600},
+         datetime(2026, 6, 10, tzinfo=UTC)),
     ])
-    def test_the_verdict_derivation(self, meta, expected):
+    def test_the_cutoff_derivation(self, meta, expected):
         prov = historical._corpus_provenance(meta, from_cache=True)
-        assert (prov.archive_cutoff, prov.post_cutoff) == expected
+        assert prov.archive_cutoff == expected
 
     @pytest.mark.parametrize("raw, expected", [
         ("2026-09-24T12:37:49.789667+00:00",

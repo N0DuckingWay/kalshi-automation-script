@@ -73,9 +73,7 @@ Dependencies:
     SettledCorpus and LegacySettledCorpus (read by TYPE, to take the
     corpus's provenance) and CorpusProvenance (carried out on
     BacktestSweep.corpus_provenance and re-exported to dashboard.py, which
-    imports only from here). Exports max_trades_simulated(), read by
-    dashboard.py and backtest.py to test a carried post-cutoff verdict
-    against the run's own trades. Also
+    imports only from here). Also
     depends on pandas (external) for the equity-curve DataFrame and numpy
     (external, a declared dependency pandas already pulls in) for counting
     the grouping-key hashes behind the groupable subset. Does NOT
@@ -368,6 +366,7 @@ from .historical import (
     fetch_all_settled_markets,
     fetch_candlesticks,
     infer_category,
+    series_ticker,
 )
 from .scanner import (
     DEADLINE_CUMULATIVE,
@@ -1569,8 +1568,8 @@ class _Candidates:
             the same way in both).
         corpus_provenance (CorpusProvenance | None): What the fetched corpus
             says about itself — when it was assembled, whether it was served
-            from an earlier run's cache, and the archive cutoff / post-cutoff
-            verdict as of that assembly — taken off the corpus BY TYPE (a
+            from an earlier run's cache, and the archive cutoff as of that
+            assembly — taken off the corpus BY TYPE (a
             historical.SettledCorpus, or the historical.LegacySettledCorpus
             list a legacy settled_markets_*.json hit returns, whose
             provenance carries its file time and no cutoff) before it is
@@ -2104,15 +2103,13 @@ class BacktestSweep:
             settled-market corpus covers: when it was assembled — it holds
             nothing settled after that, while the window nominally runs to
             today — whether it came
-            from an earlier run's cache, and the archive cutoff and
-            structurally-0-trade verdict AS OF that assembly. It hangs off the
+            from an earlier run's cache, and the archive cutoff AS OF that
+            assembly (information only). It hangs off the
             sweep for the reason label_coverage does: one fact about one
             corpus, valid at every point. The dashboard renders it under the
             Period line whether healthy or not (absence must never be
             the only signal); a legacy settled_markets_*.json hit carries its
-            file time (legacy=True) and no cutoff. A True verdict can go stale
-            after assembly, so both renderers read it beside
-            max_trades_simulated(sweep): any simulated trade proves it stale.
+            file time (legacy=True) and no cutoff.
             None when not recorded: the feasibility short-circuit (no fetch),
             a test that stubs the fetch with a plain list, or a hand-built
             sweep. DEFAULTED, like
@@ -2246,57 +2243,6 @@ class BacktestSweep:
     add_on_tier_off_cap_sweep: CapSweep | None = None
     # The saved live defaults' add_to_held_pairs, recorded with the other live_* fields
     live_add_to_held_pairs: bool | None = None
-
-
-def max_trades_simulated(sweep: BacktestSweep) -> int:
-    """
-    The trade count of the busiest point a sweep simulated — the evidence a stamped post-cutoff verdict is stale.
-
-    CorpusProvenance.post_cutoff is a verdict AS OF ASSEMBLY: a cached corpus
-    stamped when start_date sat at or after the archive cutoff keeps saying so
-    after the cutoff has moved past start_date, and a hit never re-reads it.
-    Once it has moved, the corpus's markets are archived, their candlesticks
-    exist (404s are never cached), and the run can trade — while the header
-    banner and the closing WARNING said "no trade could be entered". A trade
-    at ANY simulated point disproves that sentence, so this is the one
-    definition both renderers (dashboard._corpus_provenance_html and
-    backtest._log_corpus_provenance) test a True verdict against. It counts
-    every EAGER point the run keeps — the primary, each swept k, each
-    band-sweep scenario, each tier-off scenario
-    (BacktestSweep.tier_off_scenarios) and the same-title point, every one
-    simulated at the run's own size cap; the split-half and ex-top
-    re-simulations are not kept as points (only their figures are) and are
-    not counted. Every point it counts can reach the same page: the tier-on
-    ones through the filter bar's k select and the scenario explorer, the
-    tier-off ones through the Tier floors choice's off view in the filter bar
-    and the scenario explorer — and a trade at a tier-off point proves just
-    as well that the window's markets had candlesticks, i.e. that the window
-    could trade. Zero proves nothing either way: an entry that Kelly then
-    rejected at every k also shows the window could trade.
-
-    A size-cap sweep (sweep.cap_sweep, and sweep.tier_off_cap_sweep over the
-    tier-floors-off family) simulates its other caps only when a reader asks
-    for a cell, never here, and a larger cap can turn an n < 1
-    skip into a trade. The dashboard adds the trade counts of the cap points
-    it simulates (dashboard._corpus_provenance_html's traded argument), while
-    the log's closing line, written before the dashboard is built, sees the
-    eager points alone — so on a run where ONLY a non-default cap traded, the
-    page calls the verdict stale while the log still repeats it. Every eager
-    point, tier-on and tier-off, agrees between the two.
-
-    Args:
-        sweep (BacktestSweep): The run's sweep.
-
-    Returns:
-        int: The largest len(trades) over sweep.primary, sweep.points,
-            sweep.scenarios, sweep.tier_off_scenarios and
-            sweep.same_title_point (when present); 0 when none of them
-            traded.
-    """
-    points = [sweep.primary, *sweep.points, *sweep.scenarios, *sweep.tier_off_scenarios]
-    if sweep.same_title_point is not None:
-        points.append(sweep.same_title_point)
-    return max(len(point.trades) for point in points)
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -4831,11 +4777,37 @@ def _candle_window_open(market: dict, window_open_ts: int, close_ts: int) -> int
     return max(window_open_ts, market_open_ts)
 
 
+def _settled_after(settled: datetime | None, cutoff_ts: int | None) -> bool:
+    """
+    Whether a market settled at or after Kalshi's archive cutoff (its candles are on the live API).
+
+    Args:
+        settled (datetime | None): The market's settlement time; a naive one
+            is read as UTC.
+        cutoff_ts (int | None): The archive cutoff, Unix seconds; None when
+            not known.
+
+    Returns:
+        bool: True only when both are known and the settlement is at or after
+            the cutoff.
+    """
+    if settled is None or cutoff_ts is None:
+        return False
+    if settled.tzinfo is None:
+        settled = settled.replace(tzinfo=UTC)
+    try:
+        return settled.timestamp() >= cutoff_ts
+    except (OverflowError, ValueError, OSError):
+        return False
+
+
 def _fetch_candles_parallel(
     hist_client: Any,
     needed_tickers: dict[str, dict],
     start_date: date,
     use_cache: bool,
+    *,
+    cutoff_ts: int | None = None,
 ) -> dict[str, list[dict]]:
     """
     Fetch the hourly candlestick series for every needed ticker, in parallel.
@@ -4873,6 +4845,16 @@ def _fetch_candles_parallel(
     and reported in ONE summary WARNING (silent at zero) — the per-run signal
     that replaces reading hundreds of individual 404 lines (TS-02).
 
+    Each ticker is handed its series (historical.series_ticker of its event
+    ticker — the literal prefix, never scanner.event_series, which collapses
+    the KXMVE* family), so fetch_candlesticks can ask Kalshi's live
+    candlestick endpoint for a market the archive does not hold yet: one that
+    settled at or after the archive cutoff, which is asked there first
+    (live_first). The routing only saves requests — a 404 from the endpoint
+    asked first asks the other one — so a cutoff that moved since cutoff_ts
+    was read changes no result. A market with no event ticker is asked of the
+    archive only, with exactly the call this function always made.
+
     Args:
         hist_client (Any): Historical KalshiClient, shared across worker
             threads (the same pattern historical.py's fetch pools use).
@@ -4883,6 +4865,10 @@ def _fetch_candles_parallel(
             own open — _candle_window_open).
         use_cache (bool): Passed through to fetch_candlesticks — whether the
             per-ticker disk cache may be reused.
+        cutoff_ts (int | None): Keyword-only. Kalshi's archive cutoff (Unix
+            seconds): a market that settled at or after it is asked of the
+            live endpoint first. None (default, and any corpus with no
+            recorded cutoff) asks the archive first.
 
     Returns:
         dict[str, list[dict]]: Ticker -> candle list (keys: ts, yes_ask_close,
@@ -4902,7 +4888,7 @@ def _fetch_candles_parallel(
 
     # Split the work first: no-close_time markets resolve without any HTTP, so
     # they never occupy a worker slot.
-    work: list[tuple[str, int, int]] = []
+    work: list[tuple[str, int, int, dict]] = []
     for ticker, m in needed_tickers.items():
         close_time = m.get("close_time")
         if not close_time:
@@ -4926,7 +4912,16 @@ def _fetch_candles_parallel(
         # Open at the market's own open when it opened after the window began:
         # it has no candles before then, so asking for them only costs requests.
         open_ts = _candle_window_open(m, window_open_ts, close_ts)
-        work.append((ticker, open_ts, close_ts))
+        # Which endpoint to ask first: the live API for a market settled at or
+        # after the archive cutoff (the archive answers 404 for it). Passed
+        # only with a series, so a market with no event ticker gets exactly
+        # the archive-only call it always got.
+        series = series_ticker(m.get("event_ticker") or "")
+        endpoint: dict = {}
+        if series:
+            settled = _parse_iso_datetime(m.get("settlement_ts"))
+            endpoint = {"series": series, "live_first": _settled_after(settled, cutoff_ts)}
+        work.append((ticker, open_ts, close_ts, endpoint))
 
     if work:
         with ThreadPoolExecutor(max_workers=CANDLESTICK_FETCH_MAX_WORKERS) as pool:
@@ -4934,8 +4929,8 @@ def _fetch_candles_parallel(
             # no_ask_close (float) — cached per ticker, so a second run is much faster
             futures = {
                 pool.submit(fetch_candlesticks, hist_client, ticker,
-                            open_ts, close_ts, use_cache): ticker
-                for ticker, open_ts, close_ts in work
+                            open_ts, close_ts, use_cache, **endpoint): ticker
+                for ticker, open_ts, close_ts, endpoint in work
             }
             done = 0
             try:
@@ -4957,9 +4952,9 @@ def _fetch_candles_parallel(
                 pool.shutdown(wait=False, cancel_futures=True)
                 raise
 
-    # Summarize the misses ONCE. On a post-cutoff window every ticker 404s
-    # (documented, and deliberately never cached), so the count is the useful
-    # signal — not one warning per ticker (TS-02). Counted off the RESULT dict
+    # Summarize the misses ONCE: the count is the useful signal, not one
+    # warning per ticker (TS-02). A ticker neither endpoint serves is never
+    # cached, so it is asked again on every run. Counted off the RESULT dict
     # rather than off caught exceptions, because fetch_candlesticks already
     # fail-softs a failure to [] internally; deliberately outside the `if work`
     # block so the tickers resolved to [] above for a missing or unparseable
@@ -4968,7 +4963,8 @@ def _fetch_candles_parallel(
     if empty:
         logging.warning(
             "Candlestick fetch: %d of %d tickers returned no candles "
-            "(post-cutoff tickers 404 by design and are never cached)",
+            "(neither Kalshi's archive nor its live candlestick endpoint served them; "
+            "never cached, so asked again next run)",
             empty, len(candles_by_ticker),
         )
 
@@ -5748,8 +5744,8 @@ def _prepare_candidates(
         prefilter_tag=_prefilter_cache_tag(),
     )
     # What the corpus says about itself — assembly time, cache or fresh, and
-    # the archive cutoff / post-cutoff verdict as of assembly — taken now,
-    # before `markets` is released, for the dashboard header (DR-13, M2).
+    # the archive cutoff as of assembly — taken now, before `markets` is
+    # released, for the dashboard header (DR-13).
     # Read by TYPE, never by attribute probing: a plain list (a test stub) has
     # no provenance, and a MagicMock would answer any attribute with nonsense.
     # A legacy-cache hit is a LegacySettledCorpus, whose provenance carries
@@ -5907,8 +5903,13 @@ def _prepare_candidates(
     # across tickers — one independent read-only GET each, cached per ticker so
     # a second run is much faster. Sequentially this loop dominated the whole
     # backtest (~4.3 tickers/sec live-measured).
+    # The archive cutoff the corpus was assembled (or extended) under routes
+    # each ticker to the endpoint that holds its candles; None (a corpus with
+    # no recorded cutoff) asks the archive first and the live API on a 404
+    cutoff = None if corpus_provenance is None else corpus_provenance.archive_cutoff
     candles_by_ticker = _fetch_candles_parallel(
-        hist_client, needed_tickers, start_date, use_cache
+        hist_client, needed_tickers, start_date, use_cache,
+        cutoff_ts=None if cutoff is None else int(cutoff.timestamp()),
     )
 
     logging.info("Candlestick fetch complete.")
@@ -8410,7 +8411,7 @@ def _sweep_from_candidates(
     each eager "all" point is simulated (the tier-on loop's and the tier-off
     loop's, in separate maps). They simulate nothing here either: the run's
     simulations, log lines and every figure are those of a run without the
-    flag, and max_trades_simulated does not count their cells. They keep
+    flag. They keep
     entries_by_band and tier_off_entries alive for the reader, as the size-cap
     sweeps do.
 

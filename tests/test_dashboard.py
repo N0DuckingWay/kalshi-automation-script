@@ -2630,16 +2630,15 @@ class TestEntryCheckpointHeader:
 
 
 class TestCorpusProvenanceHeader:
-    """DR-13 / M2 (P2): directly under the Period line the header says what
+    """DR-13 (P2): directly under the Period line the header says what
     settled-market corpus the run read — its assembly time (the Period runs to
     today, the corpus only to that moment), whether it came from an earlier
     run's cache, and the archive cutoff as of assembly — on EVERY run, healthy
-    or not (DR-66). A window at or after that cutoff gets a red banner that
-    states a bound (no trade could be entered whatever pairs formed), never a
-    cause — unless some simulated point traded, which proves the verdict stale
-    and gets an amber stale-verdict line instead. A legacy .json hit shows its
-    file time. Rendered through generate_dashboard(), because a unit test that
-    does not prove the string reaches the page is the gap DR-66b was about."""
+    or not (DR-66). The cutoff is information only: a post-cutoff market is
+    priced from the live candlestick endpoint, so the red "structurally
+    0-trade" banner is gone. A legacy .json hit shows its file time. Rendered
+    through generate_dashboard(), because a unit test that does not prove the
+    string reaches the page is the gap DR-66b was about."""
 
     ASSEMBLED = datetime(2026, 9, 24, 12, 37, 49, tzinfo=UTC)
     CUTOFF = datetime(2026, 7, 25, tzinfo=UTC)
@@ -2667,7 +2666,7 @@ class TestCorpusProvenanceHeader:
 
     def _prov(self, **overrides):
         fields = {"from_cache": False, "assembled_at": self.ASSEMBLED,
-                  "archive_cutoff": self.CUTOFF, "post_cutoff": False}
+                  "archive_cutoff": self.CUTOFF}
         fields.update(overrides)
         return CorpusProvenance(**fields)
 
@@ -2694,62 +2693,36 @@ class TestCorpusProvenanceHeader:
         assert "served from an earlier run&#x27;s cache; --no-cache extends it" in line
 
     @pytest.mark.parametrize("from_cache", [False, True])
-    def test_a_post_cutoff_window_gets_the_banner(self, monkeypatch, tmp_path, from_cache):
-        page = self._page(monkeypatch, tmp_path,
-                          self._prov(post_cutoff=True, from_cache=from_cache))
-        assert ("This window starts at or after the archive cutoff (2026-07-25, as "
-                "of the corpus's assembly).") in page
-        assert "no trade could be entered in this window whatever pairs formed" in page
-        assert "says nothing about the strategy" in page
-        # Only a cached verdict can have gone stale — only it says so.
-        assert ("a cached run does not re-read it; --no-cache re-checks" in page) \
-            is from_cache
-        assert page.index("Settled-market corpus:") < page.index(
-            "This window starts at or after") < page.index("Portfolio Performance")
-        assert "that verdict is stale" not in page
-
-    @pytest.mark.parametrize("from_cache", [False, True])
-    @pytest.mark.parametrize("n_trades, other_point_trades", [(2, 0), (0, 3)])
-    def test_a_post_cutoff_verdict_contradicted_by_trades_is_reported_as_stale(
-            self, monkeypatch, tmp_path, from_cache, n_trades, other_point_trades):
-        # P2 review (R3/C3/ADV-3): a stamped verdict goes stale once the cutoff
-        # moves past start_date, and the run can then trade — a red "no trade
-        # could be entered" beside "Trades found: N" would be false on its
-        # face. A trade at ANY simulated point (the primary, or another k the
-        # filter bar's k select shows) turns it into a stale-verdict line instead.
-        page = self._page(monkeypatch, tmp_path,
-                          self._prov(post_cutoff=True, from_cache=from_cache),
-                          n_trades=n_trades, other_point_trades=other_point_trades)
-        assert f'Trades found: <span id="hdr-trades">{n_trades}</span>' in page
-        assert "This window starts at or after" not in page
-        assert "no trade could be entered in this window" not in page
-        recorded = ("at this corpus&#x27;s assembly" if from_cache else "by this run")
-        assert f"The archive cutoff recorded {recorded} (2026-07-25)" in page
-        assert (f"this run entered trades (up to {max(n_trades, other_point_trades)} "
-                "in one simulated scenario), so that verdict is stale") in page
-        assert "--no-cache re-reads the cutoff and re-stamps the cache." in page
-        assert page.index("Settled-market corpus:") < page.index(
-            "The archive cutoff recorded") < page.index("Portfolio Performance")
+    def test_a_post_cutoff_window_gets_no_banner(self, monkeypatch, tmp_path, from_cache):
+        # A cutoff after the window's start date used to draw a red
+        # "no trade could be entered" banner (or an amber stale-verdict line).
+        # Post-cutoff markets are priced from the live candlestick endpoint
+        # now, so the cutoff is reported and nothing more.
+        page = self._page(monkeypatch, tmp_path, self._prov(
+            archive_cutoff=datetime(2030, 1, 1, tzinfo=UTC), from_cache=from_cache),
+            n_trades=2)
+        assert "archive cutoff at assembly: 2030-01-01" in self._corpus_line(page)
+        for gone in ("This window starts at or after", "no trade could be entered",
+                     "verdict is stale", "structural"):
+            assert gone not in page
 
     def test_a_legacy_cache_shows_its_file_time(self, monkeypatch, tmp_path):
         # P2 review (C1/ADV-1): a legacy settled_markets_*.json hit carries its
         # file time to the page, named as such, and claims no cutoff.
         line = self._corpus_line(self._page(monkeypatch, tmp_path, self._prov(
-            from_cache=True, archive_cutoff=None, post_cutoff=None, legacy=True)))
+            from_cache=True, archive_cutoff=None, legacy=True)))
         assert ("last written 2026-09-24 12:37 UTC (the file time of a legacy "
                 "settled_markets_*.json, which records no assembly stamp) — it "
                 "holds no market settled after that") in line
         assert ("served from an earlier run&#x27;s cache; --no-cache extends it "
                 "and rebuilds it in the streamed format") in line
         assert ("archive cutoff at assembly: not recorded (the legacy format "
-                "records none; --no-cache re-checks it)") in line
+                "records none)") in line
 
-    def test_an_unrecorded_cutoff_says_so_and_claims_no_verdict(self, monkeypatch, tmp_path):
+    def test_an_unrecorded_cutoff_says_so(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path, self._prov(
-            from_cache=True, archive_cutoff=None, post_cutoff=None))
-        assert ("archive cutoff at assembly: not recorded (--no-cache re-checks it)"
-                in self._corpus_line(page))
-        assert "This window starts at or after" not in page
+            from_cache=True, archive_cutoff=None))
+        assert self._corpus_line(page).endswith("archive cutoff at assembly: not recorded")
 
     def test_an_unrecorded_assembly_time_says_so(self, monkeypatch, tmp_path):
         line = self._corpus_line(self._page(monkeypatch, tmp_path,
@@ -2763,7 +2736,6 @@ class TestCorpusProvenanceHeader:
         page = self._page(monkeypatch, tmp_path, None, sweep=sweep)
         assert ("Settled-market corpus: assembly time and archive cutoff not "
                 "recorded for this run (no sweep was passed to the report") in page
-        assert "This window starts at or after" not in page
 
 
 class TestFigHtmlDivId:
@@ -3747,7 +3719,7 @@ def _flt_walk(source, trades, curve, k_used=0.75, series=_FLT_SERIES, pooled_k=N
     block, {chunk id: chunk}). The base block carries the interval-discount
     section's data from the same walk ("kd") when the grid records a band,
     as the page's does."""
-    walked, chunker, _, kd = dashboard._build_filter_grid(
+    walked, chunker, kd = dashboard._build_filter_grid(
         source, trades, curve, k_used, _FLT_START, 1000.0, series, pooled_k=pooled_k)
     base = dashboard._filter_payload(
         walked, chunker, _FLT_START, 1000.0, series,
@@ -5817,34 +5789,6 @@ class TestFilterKAndCap:
         assert [b["label"] for b in data["bands"]] == ["not recorded"]
         assert _KC_UNUSED_CLAUSE in page
         assert sweep.cap_sweep.reads == []
-
-    def test_every_cap_point_counts_toward_the_stale_cutoff_verdict(self, monkeypatch, tmp_path):
-        # A window stamped at or after the cutoff: no EAGER point traded, but
-        # the no-cap scenario — which only the walk simulates — did. That
-        # disproves "no trade could be entered", so the header says the
-        # verdict is stale, counting the cap point's trades
-        empty = SweepPoint(k=0.75, trades=[], spread_band=_KC_B0, size_cap=0.2,
-                           equity_df=backtester._build_equity_curve([], _FLT_START, 1000.0))
-        traded = _kc_trades(5)
-        points = {(_KC_B0, 0.75, 0.05): dataclasses.replace(empty, size_cap=0.05),
-                  (_KC_B0, 0.75, 0.2): empty,
-                  (_KC_B0, 0.75, 1.0): SweepPoint(
-                      k=0.75, trades=traded, spread_band=_KC_B0, size_cap=1.0,
-                      equity_df=backtester._build_equity_curve(traded, _FLT_START, 1000.0))}
-        prov = CorpusProvenance(from_cache=True, assembled_at=datetime(2026, 9, 24, tzinfo=UTC),
-                                archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC),
-                                post_cutoff=True)
-        sweep = BacktestSweep(primary=empty, points=[empty], calibration=None,
-                              label_coverage=_scn_coverage(), corpus_provenance=prov,
-                              cap_sweep=_FakeCapSweep(points, bands=(_KC_B0,), ks=(0.75,)))
-        assert backtester.max_trades_simulated(sweep) == 0
-        page = _kc_page(monkeypatch, tmp_path, sweep)
-        assert ("this run entered trades (up to 3 in one simulated scenario), so that "
-                "verdict is stale") in page
-        assert "no trade could be entered in this window" not in page
-        # Without the cap sweep the eager points alone decide: the red banner
-        page = _kc_page(monkeypatch, tmp_path, dataclasses.replace(sweep, cap_sweep=None))
-        assert "no trade could be entered in this window whatever pairs formed" in page
 
     def test_a_curve_built_after_midnight_is_cut_to_the_page_s_last_date(self, monkeypatch):
         # A cell simulated after UTC midnight ends its curve a day past the
@@ -8039,7 +7983,7 @@ class _ExplorerCapSweep(_FakeCapSweep):
                 for p in pops.values() for t in p.trades}
 
 
-def _ex_sweep(*, raise_on=None, st_trades=None, cell_trades=None) -> BacktestSweep:
+def _ex_sweep(*, raise_on=None) -> BacktestSweep:
     """
     A band sweep with a size-cap sweep over 2 bands x 2 ks x 3 caps (5%, 20%
     — the run's own — and no cap), primary (0-1, k 0.75, 20%).
@@ -8050,8 +7994,7 @@ def _ex_sweep(*, raise_on=None, st_trades=None, cell_trades=None) -> BacktestSwe
     on the trades alone would be the 20% row. Band 0.3-0.6 traded nothing at
     k 0.60 (a flat curve: Sharpe 0.0, which the heatmap must not show) and
     the same winning list at every cap at k 0.75. Same-title: one trade at
-    5%, two at 20% and no cap. `st_trades` / `cell_trades` replace the
-    same-title lists / every cell's list (the stale-cutoff test's fixture).
+    5%, two at 20% and no cap.
     """
     def resized(t, n):
         return _kc_resized(t, n)
@@ -8074,8 +8017,6 @@ def _ex_sweep(*, raise_on=None, st_trades=None, cell_trades=None) -> BacktestSwe
         return curves[id(trades)]
 
     def pops(band, k, cap, trades, eq=None, ladder=False):
-        if cell_trades is not None:
-            trades = cell_trades
         point = SweepPoint(k=k, trades=trades, equity_df=curve(trades) if eq is None else eq,
                            spread_band=band, size_cap=cap, halves=halves.get(id(trades)),
                            ex_top_event=("KXNHLHART-27", 0.01) if trades else None)
@@ -8094,8 +8035,7 @@ def _ex_sweep(*, raise_on=None, st_trades=None, cell_trades=None) -> BacktestSwe
                                         eq=rich if k == 0.75 else None)
         for cap in _EX_CAPS:
             points[(_KC_B1, k, cap)] = pops(_KC_B1, k, cap, empty if k == 0.6 else other)
-    st_lists = st_trades or {0.05: [_flt_trades()[0]], 0.2: _flt_trades()[:2],
-                             1.0: _flt_trades()[:2]}
+    st_lists = {0.05: [_flt_trades()[0]], 0.2: _flt_trades()[:2], 1.0: _flt_trades()[:2]}
     st = {cap: SweepPoint(k=0.75, trades=listed, equity_df=curve(listed),
                           population="same_title", size_cap=cap)
           for cap, listed in st_lists.items()}
@@ -8372,21 +8312,6 @@ class TestExplorerCapAndMetrics:
             assert piece in page
         assert html.escape(dashboard._BAR_REACH_NO_EXPLORER) in page
 
-    def test_a_same_title_cap_point_counts_toward_the_stale_cutoff_verdict(
-            self, monkeypatch, tmp_path):
-        # No cell traded and the run's own same-title point did not either;
-        # only the no-cap same-title point did — which the explorer shows
-        prov = CorpusProvenance(from_cache=True, assembled_at=datetime(2026, 9, 24, tzinfo=UTC),
-                                archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC),
-                                post_cutoff=True)
-        sweep = dataclasses.replace(
-            _ex_sweep(cell_trades=[], st_trades={0.05: [], 0.2: [], 1.0: _flt_trades()[:2]}),
-            corpus_provenance=prov)
-        assert backtester.max_trades_simulated(sweep) == 0
-        page = _kc_page(monkeypatch, tmp_path, sweep)
-        assert ("this run entered trades (up to 2 in one simulated scenario), so that "
-                "verdict is stale") in page
-
     def test_a_same_title_simulation_failure_costs_only_the_same_title_rows(
             self, monkeypatch, tmp_path, caplog):
         # The size-cap sweep's same-title population cannot be simulated,
@@ -8452,7 +8377,7 @@ class TestExplorerCapAndMetrics:
                               label_coverage=_scn_coverage(),
                               scenarios=list(cells[0.75][0.2].values()))
         explorer = dashboard._ExplorerVisitor(source, sweep)
-        _, chunker, _, _ = dashboard._build_filter_grid(
+        _, chunker, _ = dashboard._build_filter_grid(
             source, trades, page_curve, 0.75, _FLT_START, 1000.0, _FLT_SERIES,
             explorer=explorer)
         row = _unpack(explorer.payload().blocks[0])["cells"][0][0][0]     # the late "all"
@@ -9236,29 +9161,10 @@ class TestTierOffAtEveryCap:
         assert all(len(row) == 1 and row[0] is not None for row in data["grid_off"][0])
         assert _KC_UNUSED_CLAUSE in page and _OFF_UNUSED_CLAUSE not in page
 
-    def test_max_trades_counts_the_off_points_at_every_cap(self):
-        sweep = _kc_sweep_tiers_capped()
-        big = [_kc_resized(_ftrade(f"KXBIG-{i}", "time_series", date(2026, 1, 13),
-                                   date(2026, 1, 16), 1.0), 1) for i in range(9)]
-        curve = backtester._build_equity_curve(big, _FLT_START, 1000.0)
-        off = sweep.tier_off_cap_sweep
-        off.points[(_KC_B0, 0.6, 1.0)] = SweepPoint(
-            k=0.6, trades=big, equity_df=curve, spread_band=_KC_B0, size_cap=1.0,
-            tier_floors=False)
-        assert backtester.max_trades_simulated(sweep) < 9
-        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
-                                        0.75)
-        _, _, counter, _ = dashboard._build_filter_grid(
-            source, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START, 1000.0,
-            _FLT_SERIES)
-        assert counter.most == 9 and not counter.failed
-
-    def test_a_count_the_off_fallback_drops_is_not_kept(self):
-        # The first off cell (k 0.6) holds 9 trades at no cap and is counted;
-        # the second raises. The walk then re-reads the off view from the
-        # family's eager points, which the page shows instead, so the 9 —
-        # a scenario the page no longer shows — is dropped with the rest of
-        # the off view (_MaxTrades.reset_off)
+    def test_an_off_fallback_keeps_the_tier_on_cap_axis(self):
+        # The first off cell (k 0.6) holds 9 trades at no cap; the second
+        # raises. The walk then re-reads the off view from the family's eager
+        # points, which the page shows instead, and keeps the tier-on caps
         sweep = _kc_sweep_tiers_capped(raise_on=(_KC_B0, 0.75))
         big = [_kc_resized(_ftrade(f"KXBIG-{i}", "time_series", date(2026, 1, 13),
                                    date(2026, 1, 16), 1.0), 1) for i in range(9)]
@@ -9267,14 +9173,10 @@ class TestTierOffAtEveryCap:
             spread_band=_KC_B0, size_cap=1.0, tier_floors=False)
         source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
                                         0.75)
-        walked, _, counter, _ = dashboard._build_filter_grid(
+        walked, _, _ = dashboard._build_filter_grid(
             source, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START, 1000.0,
             _FLT_SERIES)
         assert walked.off_cap_sweep is None and walked.cap_sweep is source.cap_sweep
-        most_eager = max(len(p.trades) for p in [*sweep.scenarios, *sweep.tier_off_scenarios])
-        assert counter.most == max(most_eager, max(
-            len(p.trades) for (_b, _k, _c), p in sweep.cap_sweep.points.items()))
-        assert counter.most < 9
 
     def test_the_labels_include_every_tier_off_cap_event(self):
         series = {**_FLT_SERIES, "KXSNOW": ("Climate", ("Snow",))}
@@ -9395,7 +9297,7 @@ def _ao_payload(sweep: BacktestSweep, state: str = "not simulated") -> tuple:
     builds them for a sweep, with the add-on state the page would pass."""
     trades, curve = sweep.primary.trades, sweep.primary.equity_df
     source = dashboard._grid_source(sweep, trades, curve, 0.75)
-    walked, chunker, _, kd = dashboard._build_filter_grid(
+    walked, chunker, kd = dashboard._build_filter_grid(
         source, trades, curve, 0.75, _FLT_START, 1000.0, _FLT_SERIES_TIERS)
     base = dashboard._filter_payload(walked, chunker, _FLT_START, 1000.0, _FLT_SERIES_TIERS,
                                      kd=kd.payload(), add_on_state=state)
@@ -9713,70 +9615,18 @@ class TestAddOnView:
         stripped = dataclasses.replace(source, add_cell=None, add_off_cell=None,
                                        add_cap_sweep=None, add_off_cap_sweep=None)
         with caplog.at_level(logging.WARNING):
-            _, chunker, counter, _ = dashboard._build_filter_grid(
+            _, chunker, _ = dashboard._build_filter_grid(
                 stripped, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START,
                 1000.0, _FLT_SERIES_TIERS)
         assert sweep.add_on_cap_sweep.reads == []
-        # No add-on phase ran: nothing was warned, packed or counted for it
+        # No add-on phase ran: nothing was warned or packed for it
         assert not [r for r in caplog.records if "Add to held" in r.getMessage()]
-        assert chunker.grid_add is None and counter._pre_add is None
-
-    # ─── The stale-cutoff verdict ─────────────────────────────────────────────
-
-    def test_the_busiest_scenario_counts_the_add_on_ones(self):
-        for sweep, most in ((_kc_sweep(), 3), (_kc_sweep_add_on(), 4)):
-            source = dashboard._grid_source(sweep, sweep.primary.trades,
-                                            sweep.primary.equity_df, 0.75)
-            _, _, counter, _ = dashboard._build_filter_grid(
-                source, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START,
-                1000.0, _FLT_SERIES_TIERS)
-            assert (counter.most, counter.failed) == (most, False)
-
-    def test_a_failed_add_on_cell_takes_its_count_back(self):
-        sweep = _kc_sweep_add_on(raise_on=(_KC_B1, 0.75))
-        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
-                                        0.75)
-        _, _, counter, _ = dashboard._build_filter_grid(
-            source, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START, 1000.0,
-            _FLT_SERIES_TIERS)
-        # The cells read before the raise held four trades; the page shows none
-        assert (counter.most, counter.failed) == (3, False)
-        assert counter._pre_add is None
-
-    def test_a_trade_only_an_add_on_scenario_made_makes_the_verdict_stale(
-            self, monkeypatch, tmp_path):
-        # A window stamped at or after the cutoff: no scenario of the run as
-        # simulated traded, but the add-on view's did — which disproves "no
-        # trade could be entered", so the header says that verdict is stale
-        empty = SweepPoint(k=0.75, trades=[], spread_band=_KC_B0, size_cap=0.2,
-                           equity_df=backtester._build_equity_curve([], _FLT_START, 1000.0))
-        traded = _kc_trades(5)
-        family = {(_KC_B0, 0.75, 0.2): SweepPoint(
-            k=0.75, trades=traded, spread_band=_KC_B0, size_cap=0.2, add_to_held=True,
-            equity_df=backtester._build_equity_curve(traded, _FLT_START, 1000.0))}
-        prov = CorpusProvenance(from_cache=True, assembled_at=datetime(2026, 9, 24, tzinfo=UTC),
-                                archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC),
-                                post_cutoff=True)
-        sweep = BacktestSweep(
-            primary=empty, points=[empty], calibration=None, label_coverage=_scn_coverage(),
-            corpus_provenance=prov,
-            cap_sweep=_FakeCapSweep({(_KC_B0, 0.75, 0.2): empty}, bands=(_KC_B0,), ks=(0.75,),
-                                    caps=(0.2,)),
-            add_on_cap_sweep=_FakeCapSweep(family, bands=(_KC_B0,), ks=(0.75,), caps=(0.2,)))
-        assert backtester.max_trades_simulated(sweep) == 0
-        page = _ao_page(monkeypatch, tmp_path, sweep)
-        assert ("this run entered trades (up to 3 in one simulated scenario), so that "
-                "verdict is stale") in page
-        assert "no trade could be entered in this window" not in page
-        # Without the family the eager points alone decide: the red banner
-        page = _ao_page(monkeypatch, tmp_path,
-                        dataclasses.replace(sweep, add_on_cap_sweep=None))
-        assert "no trade could be entered in this window whatever pairs formed" in page
+        assert chunker.grid_add is None
 
     # ─── What it never reaches ────────────────────────────────────────────────
 
     def test_only_the_bar_s_visitors_take_the_add_on_cells(self):
-        assert hasattr(dashboard._ChunkVisitor, "add") and hasattr(dashboard._MaxTrades, "add")
+        assert hasattr(dashboard._ChunkVisitor, "add")
         assert not hasattr(dashboard._ExplorerVisitor, "add")
         assert not hasattr(dashboard._KdVisitor, "add")
 

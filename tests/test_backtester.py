@@ -4735,6 +4735,102 @@ class TestFetchCandlesParallel:
                          start_date=date(2026, 1, 1), initial_balance=1000.0)
 
 
+class TestCandleEndpointRouting:
+    """_fetch_candles_parallel hands fetch_candlesticks each market's series
+    and asks Kalshi's live candlestick endpoint first for a market that
+    settled at or after the archive cutoff, whose candles the archive does not
+    hold yet. A market with no event ticker gets exactly the archive-only call
+    it always got."""
+
+    CUTOFF = int(datetime(2026, 7, 29, tzinfo=UTC).timestamp())
+
+    @staticmethod
+    def _calls(monkeypatch, needed, **kw):
+        seen = {}
+
+        def _record(_c, ticker, open_ts, close_ts, use_cache, **endpoint):
+            seen[ticker] = endpoint
+            return []
+
+        monkeypatch.setattr(backtester, "fetch_candlesticks", _record)
+        _fetch_candles_parallel(MagicMock(), needed, date(2026, 1, 1), True, **kw)
+        return seen
+
+    def test_each_market_is_routed_by_its_settlement_and_series(self, monkeypatch):
+        needed = {
+            "LIVE": {"ticker": "LIVE", "event_ticker": "KXRAIN-26AUG10",
+                     "close_time": "2026-08-10T00:00:00Z",
+                     "settlement_ts": "2026-08-10T02:00:00Z"},
+            "OLD": {"ticker": "OLD", "event_ticker": "KXSNOW-26JUN01",
+                    "close_time": "2026-06-01T00:00:00Z",
+                    "settlement_ts": "2026-06-01T02:00:00Z"},
+            "EDGE": {"ticker": "EDGE", "event_ticker": "KXHAIL",
+                     "close_time": "2026-07-29T00:00:00Z",
+                     "settlement_ts": "2026-07-29T00:00:00Z"},
+            "BARE": {"ticker": "BARE", "close_time": "2026-08-10T00:00:00Z",
+                     "settlement_ts": "2026-08-10T02:00:00Z"},
+            "UNSETTLED": {"ticker": "UNSETTLED", "event_ticker": "KXWIND-26AUG10",
+                          "close_time": "2026-08-10T00:00:00Z"},
+        }
+        seen = self._calls(monkeypatch, needed, cutoff_ts=self.CUTOFF)
+        assert seen == {
+            "LIVE": {"series": "KXRAIN", "live_first": True},
+            "OLD": {"series": "KXSNOW", "live_first": False},
+            # At the cutoff exactly: settled at or after it, so live first
+            "EDGE": {"series": "KXHAIL", "live_first": True},
+            # No event ticker: no series, the archive-only call as before
+            "BARE": {},
+            "UNSETTLED": {"series": "KXWIND", "live_first": False},
+        }
+
+    def test_no_cutoff_asks_the_archive_first(self, monkeypatch):
+        needed = {"LIVE": {"ticker": "LIVE", "event_ticker": "KXRAIN-26AUG10",
+                           "close_time": "2026-08-10T00:00:00Z",
+                           "settlement_ts": "2026-08-10T02:00:00Z"}}
+        assert self._calls(monkeypatch, needed) == {
+            "LIVE": {"series": "KXRAIN", "live_first": False}}
+
+    def test_a_combo_market_is_asked_under_its_literal_series(self, monkeypatch):
+        # historical.series_ticker, never scanner.event_series, which collapses
+        # every KXMVE* series onto "KXMVE" for the one-series pairing rule
+        needed = {"C": {"ticker": "C", "event_ticker": "KXMVECROSSCATEGORY-SHARD1-S6",
+                        "close_time": "2026-08-10T00:00:00Z",
+                        "settlement_ts": "2026-08-10T02:00:00Z"}}
+        seen = self._calls(monkeypatch, needed, cutoff_ts=self.CUTOFF)
+        assert seen["C"]["series"] == "KXMVECROSSCATEGORY"
+
+    @pytest.mark.parametrize("settled, expected", [
+        (None, False),
+        (datetime(2026, 7, 28, 23, 59, 59, tzinfo=UTC), False),
+        (datetime(2026, 7, 29, tzinfo=UTC), True),
+        # A naive time (only a hand-edited cache) is read as UTC
+        (datetime(2026, 7, 29, 0, 0, 1), True),
+    ])
+    def test_settled_after(self, settled, expected):
+        assert backtester._settled_after(settled, self.CUTOFF) is expected
+        assert backtester._settled_after(settled, None) is False
+
+    def test_prepare_candidates_routes_by_the_corpus_cutoff(self, monkeypatch):
+        # The cutoff the corpus was assembled under reaches the candle fetch
+        prov = historical.CorpusProvenance(
+            from_cache=True, assembled_at=datetime(2026, 9, 28, tzinfo=UTC),
+            archive_cutoff=datetime(2026, 7, 29, tzinfo=UTC))
+        markets = historical.LegacySettledCorpus(
+            TestPrepareEntriesMemoryInstrumentation._markets(), prov)
+        monkeypatch.setattr(backtester, "fetch_all_settled_markets",
+                            lambda *a, **k: markets)
+        seen = {}
+
+        def _spy(hist_client, needed, start_date, use_cache, **kw):
+            seen.update(kw)
+            return {t: [] for t in needed}
+
+        monkeypatch.setattr(backtester, "_fetch_candles_parallel", _spy)
+        backtester._prepare_candidates(MagicMock(), MagicMock(), date(2026, 1, 1),
+                                       True, None)
+        assert seen == {"cutoff_ts": self.CUTOFF}
+
+
 class TestLogRss:
     """_log_rss: one INFO line, same meaning on macOS and Linux (TS-07)."""
 
@@ -5369,16 +5465,16 @@ class TestOutcomeLabelCoverageIsCarried:
 
 
 class TestCorpusProvenanceIsCarried:
-    """DR-13 / M2 (P2): what the fetched corpus says about itself — when it was
+    """DR-13 (P2): what the fetched corpus says about itself — when it was
     assembled, whether it came from an earlier run's cache, and the archive
-    cutoff and post-cutoff verdict as of that assembly — rides from the
+    cutoff as of that assembly — rides from the
     SettledCorpus through _Candidates onto BacktestSweep.corpus_provenance,
     exactly the way label_coverage travels, so the dashboard header can render
     it. None whenever it was never recorded."""
 
     PROV = historical.CorpusProvenance(
         from_cache=True, assembled_at=datetime(2026, 9, 24, 12, 37, tzinfo=UTC),
-        archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC), post_cutoff=True)
+        archive_cutoff=datetime(2026, 7, 25, tzinfo=UTC))
 
     def test_the_sweep_carries_the_provenance(self, monkeypatch):
         monkeypatch.setattr(backtester, "_prepare_candidates",
@@ -5399,34 +5495,6 @@ class TestCorpusProvenanceIsCarried:
         result = backtester.run_backtest_sweep(
             MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False)
         assert result.corpus_provenance is None
-
-    @staticmethod
-    def _point(n_trades, k=0.75):
-        return backtester.SweepPoint(k=k, trades=[object()] * n_trades,
-                                     equity_df=pd.DataFrame())
-
-    @pytest.mark.parametrize("where, expected", [
-        ("none", 0), ("primary", 3), ("points", 5), ("scenarios", 7),
-        ("same_title_point", 2), ("tier_off_scenarios", 9),
-    ])
-    def test_max_trades_simulated_reads_every_point_the_page_can_show(
-            self, where, expected):
-        # The one test both renderers apply to a carried post-cutoff verdict:
-        # a trade at ANY simulated point proves it stale, since the filter
-        # bar's k select and the scenario explorer put every point on the
-        # same page — a tier-floors-off scenario included.
-        primary = self._point(3 if where == "primary" else 0)
-        off_point = self._point(9 if where == "tier_off_scenarios" else 0, k=0.9)
-        off_point.tier_floors = False
-        sweep = backtester.BacktestSweep(
-            primary=primary,
-            points=[primary, self._point(5 if where == "points" else 0, k=0.5)],
-            calibration=None,
-            scenarios=[self._point(7 if where == "scenarios" else 0, k=0.9)],
-            same_title_point=(self._point(2) if where == "same_title_point"
-                              else None),
-            tier_off_scenarios=[off_point])
-        assert backtester.max_trades_simulated(sweep) == expected
 
     def test_existing_constructions_default_to_none(self):
         # Defaulted, like label_coverage: a hand-built sweep or candidates
@@ -11142,7 +11210,7 @@ class TestPrepareCandidatesOverASettledCorpus:
         corpus = self._corpus(tmp_path, template)
         prov = historical.CorpusProvenance(
             from_cache=True, assembled_at=datetime(2026, 1, 5, 9, tzinfo=UTC),
-            archive_cutoff=datetime(2025, 12, 1, tzinfo=UTC), post_cutoff=True)
+            archive_cutoff=datetime(2025, 12, 1, tzinfo=UTC))
         with_prov = historical.SettledCorpus(corpus.path, historical._assembled_cache_meta(
             _SS1_START, "t"), len(corpus), provenance=prov)
         TestGroupableSubset._patch(monkeypatch, with_prov)
@@ -11151,7 +11219,7 @@ class TestPrepareCandidatesOverASettledCorpus:
         assert TestGroupableSubset._prepare().corpus_provenance is None
         legacy_prov = historical.CorpusProvenance(
             from_cache=True, assembled_at=datetime(2026, 8, 3, 19, 5, tzinfo=UTC),
-            archive_cutoff=None, post_cutoff=None, legacy=True)
+            archive_cutoff=None, legacy=True)
         legacy = historical.LegacySettledCorpus(template, legacy_prov)
         TestGroupableSubset._patch(monkeypatch, legacy)
         prepared = TestGroupableSubset._prepare()
@@ -11210,7 +11278,7 @@ class TestPrefilterLinesSayItRanDuringAssembly:
     @staticmethod
     def _prov(**fields):
         base = {"from_cache": False, "assembled_at": datetime(2026, 9, 24, 12, 37, tzinfo=UTC),
-                "archive_cutoff": datetime(2026, 7, 25, tzinfo=UTC), "post_cutoff": True}
+                "archive_cutoff": datetime(2026, 7, 25, tzinfo=UTC)}
         base.update(fields)
         return historical.CorpusProvenance(**base)
 
@@ -11243,7 +11311,7 @@ class TestPrefilterLinesSayItRanDuringAssembly:
         with caplog.at_level(logging.INFO):
             backtester._log_corpus_prefilter(
                 7, 7, self._prov(from_cache=True, legacy=legacy,
-                                 archive_cutoff=None, post_cutoff=None))
+                                 archive_cutoff=None))
         assert self._lines(caplog)[0] == (
             "INFO", f"Markets to analyze: 7 eligible — the eligibility prefilter "
                     f"({self.TAG}) ran during assembly, but this {noun} records no "
@@ -11320,7 +11388,7 @@ class TestPrefilterLinesSayItRanDuringAssembly:
         template = _ss1_corpus(0)
         legacy = historical.LegacySettledCorpus(
             template, self._prov(from_cache=True, legacy=True,
-                                 archive_cutoff=None, post_cutoff=None))
+                                 archive_cutoff=None))
         TestGroupableSubset._patch(monkeypatch, legacy)
         with caplog.at_level(logging.INFO):
             prepared = TestGroupableSubset._prepare()
@@ -12255,7 +12323,7 @@ class TestBandSweepEdges:
         assert res.tier_off_calibrations_by_band == {}
         assert res.scenarios == [] and res.calibrations_by_band == {}
         assert res.primary.tier_floors is True
-        assert backtester.max_trades_simulated(res) == 0
+        assert all(not p.trades for p in res.points)
 
     def test_a_single_band_run_keeps_its_calibration_keyed_by_band(self, monkeypatch):
         res = self._run(monkeypatch, sweep=False)
@@ -14298,8 +14366,6 @@ class TestAddOnSweep:
                 assert (a.k, a.spread_band, a.population) == (b.k, b.spread_band, b.population)
                 assert self._trades(a) == self._trades(b)
                 assert a.add_to_held is False
-        # The trade count the stale-verdict check reads counts eager points only
-        assert backtester.max_trades_simulated(on) == backtester.max_trades_simulated(off)
         # Nothing was simulated by building the two sweeps
         assert add_on_run.built == (0, 0)
 
