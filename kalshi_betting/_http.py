@@ -15,7 +15,8 @@ Purpose:
     error details Kalshi sends back, and api_error_summary() turns a failed
     request into one short line of text for trader.py and scanner.py to log.
     main.py records one the same way: the exception that stopped a production
-    run started with --result-file, in that run's result.
+    run started with --result-file, in that run's result. backtest.py stops
+    with one when the account balance it starts from cannot be read.
 
 Dependencies:
     No project imports — this module is a leaf so auth.py, scanner.py,

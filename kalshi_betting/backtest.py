@@ -10,8 +10,9 @@ Purpose:
     --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
     --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers),
     configures logging to kalshi_backtest.log, constructs the necessary API
-    clients, delegates the full backtest simulation to
-    backtester.run_backtest_sweep(), and then calls
+    clients, works out the starting balance (--balance, or else what the Kalshi
+    account is worth when the run starts), delegates the full backtest
+    simulation to backtester.run_backtest_sweep(), and then calls
     dashboard.generate_dashboard() to produce the interactive HTML report and,
     when the sell family is on, the sidecar chunk files its Sell select loads
     (a folder beside the page, config.DASHBOARD_FILES_DIRNAME, which must be
@@ -25,12 +26,15 @@ Dependencies:
     Imports run_backtest_sweep and BacktestSweep from backtester.py,
     generate_dashboard from dashboard.py, build_historical_client /
     build_prod_live_client / load_series_categories (the dashboard's
-    returns-by-category labels) from historical.py, and load_risk_free_rates
+    returns-by-category labels) from historical.py, load_risk_free_rates
     (the T-bill yields the page's Sharpe and Sortino subtract) from
-    treasury.py.
+    treasury.py, read_account_balance (the account's cash and open positions,
+    the starting balance when --balance is not given) from auth.py, and
+    api_error_summary (the one-line reason a failed balance read is reported
+    with) from _http.py.
     Imports from config.py:
     PROJECT_ROOT, DASHBOARD_SELL_MAX_WORKERS (the --sell-workers default's
-    bound),
+    bound), MIN_BALANCE_CENTS (the low starting-balance WARNING),
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS
     (the pre-fetch echo and the flag's help text), the deadline-gap tier constants
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS,
@@ -47,7 +51,26 @@ Dependencies:
 Notes:
     Historical data only exists on the production Kalshi API, so both API clients
     always use prod credentials regardless of what mode the live bot was run in.
-    The backtest reads market data but never submits any orders.
+    The backtest reads market data and, unless --balance is given, the
+    account balance, but never submits any orders.
+
+    The starting balance is the amount the simulation starts with, all of it
+    cash: its trade sizes follow from it, and the dashboard's total return and
+    cumulative-return charts are measured from it. --balance DOLLARS sets it.
+    Without the flag the run reads, once and before the fetch, what the
+    production account is worth now: the cash on every shard plus what Kalshi
+    says the open positions are worth — the portfolio value a live run sizes
+    its trades on — so the backtest's trades are sized for the account as it
+    stands. When Kalshi's reply has no readable positions value the cash
+    alone is used, with a WARNING. A balance that cannot be read, or a read
+    that comes to nothing, stops the run before anything is fetched (exit 1,
+    the reason on stderr and in the log), since a starting balance nobody
+    chose would size every simulated trade for some other account; --balance
+    then runs without the read. A starting balance below
+    config.MIN_BALANCE_CENTS, the value below which a live run does not
+    trade, draws a WARNING, since the backtest trades from it anyway. The
+    log's "Starting balance" line and the dashboard's header say where the
+    amount came from.
 
     --sell-workers N sets how many worker processes the dashboard simulates
     its Sell select in (default: one less than the CPU count, at most
@@ -167,13 +190,18 @@ Notes:
 import argparse
 import logging
 import logging.handlers
+import math
 import os
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
+from ._http import api_error_summary
+from .auth import read_account_balance
 from .backtester import BacktestSweep, run_backtest_sweep
 from .config import (
     DASHBOARD_SELL_MAX_WORKERS,
     MAX_DEADLINE_GAP_DAYS,
+    MIN_BALANCE_CENTS,
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
     PRICE_EPSILON,
@@ -192,6 +220,114 @@ from .config import (
 from .dashboard import generate_dashboard
 from .historical import build_historical_client, build_prod_live_client, load_series_categories
 from .treasury import load_risk_free_rates
+
+
+@dataclass(frozen=True)
+class StartingBalance:
+    """
+    The amount a backtest starts with, and where that amount came from.
+
+    main() works it out before the fetch: from --balance when the flag is
+    given, otherwise from the Kalshi account (_account_starting_balance). The
+    simulation starts with the amount, all of it cash, so its trade sizes
+    follow from it, and the dashboard's total return and cumulative-return
+    charts are measured from it. The source is printed beside it in the log
+    and in the dashboard's header.
+
+    Attributes:
+        dollars (float): The starting balance in dollars; a finite amount above 0.
+        source (str): A short note saying where the amount came from.
+
+    Raises:
+        ValueError: If dollars is not a finite amount above 0.
+    """
+    dollars: float
+    source: str
+
+    def __post_init__(self) -> None:
+        # A run cannot start from nothing, and its returns are measured from this amount
+        if not (math.isfinite(self.dollars) and self.dollars > 0):
+            raise ValueError(
+                f"a starting balance must be a finite amount above 0, not {self.dollars!r}")
+
+
+class StartingBalanceError(Exception):
+    """
+    The account gave no amount a backtest can start from; the message says why.
+
+    Raised by _account_starting_balance. main() turns it into a stop before
+    the fetch (exit 1), adding that --balance chooses an amount instead.
+    """
+
+
+def _account_starting_balance(client) -> StartingBalance:
+    """
+    Read what the Kalshi account is worth now, the starting balance of a run given no --balance.
+
+    The amount is the account's portfolio value: the cash on every shard plus
+    what Kalshi says the open positions are worth. That is the figure a live
+    run sizes its trades on, so the backtest's trades are sized for the
+    account as it stands. When Kalshi's reply has no readable positions value,
+    the cash alone is used and a WARNING says so, as a live run does. The live
+    run's check of that value against the contracts held is not made here:
+    the backtest risks no money, and the source note names the cash and the
+    positions value apart, so a wrong part can be seen.
+
+    Makes one read-only GET of the account balance, retried on temporary
+    errors (auth.read_account_balance, which also logs its "Auth OK" line).
+
+    Args:
+        client: A production KalshiClient, as historical.build_prod_live_client() makes.
+
+    Returns:
+        StartingBalance: The account's value in dollars, and a note naming
+            when it was read and what it is made of: "the account's value at
+            <time> UTC: cash $X + open positions $Y", or, when the positions
+            value could not be read, "the account's cash at <time> UTC; its
+            open positions' value could not be read".
+
+    Raises:
+        StartingBalanceError: If the balance cannot be read (an error status
+            such as 401 for bad credentials, a reply with no readable cash,
+            or a network failure that outlasts the retries), or what was read
+            comes to nothing: an account worth $0, or no cash beside a
+            positions value that could not be read.
+    """
+    try:
+        # One retried read: the cash on each shard and Kalshi's value of the open positions
+        account = read_account_balance(client)
+    except Exception as e:
+        # The failure in one line (the HTTP status and Kalshi's error code, or
+        # the error's type and first line), never the SDK's multi-line text
+        raise StartingBalanceError(
+            f"could not read the account balance ({api_error_summary(e)})") from e
+    cash_cents = sum(account.shard_cash_cents.values())
+    positions_cents = account.positions_value_cents
+    read_at = f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC"
+    if positions_cents is None:
+        if cash_cents <= 0:
+            # Positions of unknown worth may be held, so never say "worth $0"
+            raise StartingBalanceError(
+                f"the account's cash is ${cash_cents / 100:,.2f} and its open positions' "
+                "value could not be read, so there is nothing to start from")
+        logging.warning(
+            "Kalshi's balance reply carried no readable portfolio_value — the backtest "
+            "starts from the account's cash alone ($%s), as if no position were held",
+            f"{cash_cents / 100:,.2f}",
+        )
+        return StartingBalance(
+            cash_cents / 100,
+            f"the account's cash at {read_at}; its open positions' value could not be read",
+        )
+    if cash_cents + positions_cents <= 0:
+        raise StartingBalanceError(
+            f"the account is worth ${(cash_cents + positions_cents) / 100:,.2f}, so there "
+            "is nothing to start from")
+    return StartingBalance(
+        (cash_cents + positions_cents) / 100,
+        f"the account's value at {read_at}: cash ${cash_cents / 100:,.2f} + open "
+        f"positions ${positions_cents / 100:,.2f}",
+    )
 
 
 def _log_corpus_provenance(sweep: BacktestSweep) -> None:
@@ -258,8 +394,10 @@ def main() -> None:
     --same-event-ladders / --no-same-event-ladders, --spread-min,
     --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep,
     --no-sell-sweep), configures logging, constructs historical and live
-    Kalshi API clients,
-    runs the full backtest simulation via run_backtest_sweep(), and generates
+    Kalshi API clients, works out the starting balance (--balance, or else the
+    account's value now, read through _account_starting_balance; a read that
+    fails, or comes to nothing, stops the run with exit 1 before the
+    fetch), runs the full backtest simulation via run_backtest_sweep(), and generates
     an interactive HTML dashboard via generate_dashboard(). Logs a summary
     table of key metrics to
     kalshi_backtest.log on completion (this module installs only a
@@ -292,9 +430,13 @@ def main() -> None:
         "--start-date", default="2024-01-01", metavar="YYYY-MM-DD",
         help="Earliest settlement date to include (default: 2024-01-01)",
     )
+    # None means "read the account": its value is only known once a client exists
     parser.add_argument(
-        "--balance", type=float, default=10_000.0, metavar="DOLLARS",
-        help="Simulated starting balance in dollars (default: 10000)",
+        "--balance", type=float, default=None, metavar="DOLLARS",
+        help="Simulated starting balance in dollars (default: what the Kalshi "
+             "account is worth when the run starts — its cash plus Kalshi's value "
+             "of its open positions, read from the production account; the run "
+             "stops if that cannot be read or comes to nothing)",
     )
     parser.add_argument(
         "--no-cache", action="store_true",
@@ -392,6 +534,10 @@ def main() -> None:
              "entries, so memory grows with the count",
     )
     args = parser.parse_args()
+    # Every return is measured against the starting balance, so it must be a
+    # real amount above 0 (float() also reads "nan" and "inf")
+    if args.balance is not None and not (math.isfinite(args.balance) and args.balance > 0):
+        parser.error("--balance must be a positive number of dollars")
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
         parser.error("--max-horizon-days must be a positive integer")
     if args.sell_workers is not None and args.sell_workers < 1:
@@ -527,11 +673,39 @@ def main() -> None:
     except LiveDefaultsError as e:
         live_rule_echo = f"not recorded — the saved live defaults are refused ({e})"
 
+    # Always uses prod API — historical data only exists there.
+    hist_client = build_historical_client()  # authenticated prod KalshiClient for /historical raw GETs
+    live_client = build_prod_live_client()  # returns KalshiClient pointed at prod for recently-settled market fetching
+
+    # The starting balance, before the fetch so the echo below can name it:
+    # --balance when given, otherwise what the account is worth now
+    if args.balance is not None:
+        start = StartingBalance(args.balance, "set by --balance")
+    else:
+        try:
+            # One read-only GET of the production account's balance
+            start = _account_starting_balance(live_client)
+        except StartingBalanceError as e:
+            # Stop rather than guess an amount: the run's trade sizes and
+            # returns follow from it. The log has no console handler, so the
+            # reason is printed to stderr too (SystemExit with a message, exit 1)
+            message = f"{e}; pass --balance DOLLARS to choose a starting balance"
+            logging.error("Backtest not run: %s", message)
+            raise SystemExit(f"backtest: {message}") from None
+    logging.info("Starting balance: $%s (%s)", f"{start.dollars:,.2f}", start.source)
+    if start.dollars < MIN_BALANCE_CENTS / 100:
+        # A live run does not trade below this value; the backtest has no such stop
+        logging.warning(
+            "Starting balance $%s is below the $%s minimum (config.MIN_BALANCE_CENTS) "
+            "below which a live run does not trade; the backtest trades from it anyway",
+            f"{start.dollars:,.2f}", f"{MIN_BALANCE_CENTS / 100:,.2f}",
+        )
+
     logging.info(
         "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f | ladders=%s "
         "| spread band=%g-%g | band sweep=%s | cap sweep=%s | add-on sweep=%s "
         "| sell sweep=%s | live rule=%s",
-        start_date, args.balance, "on" if use_cache else "off", effective_k,
+        start_date, start.dollars, "on" if use_cache else "off", effective_k,
         ladders_echo, echo_floor, echo_ceiling,
         "on" if band_sweep else "off", "on" if cap_sweep else "off",
         "on" if add_on_sweep else "off",
@@ -585,15 +759,11 @@ def main() -> None:
             " (the band sweep's grid bands are unaffected)" if band_sweep else "",
         )
 
-    # Always uses prod API — historical data only exists there.
-    hist_client = build_historical_client()  # authenticated prod KalshiClient for /historical raw GETs
-    live_client = build_prod_live_client()  # returns KalshiClient pointed at prod for recently-settled market fetching
-
     result = run_backtest_sweep(
         hist_client=hist_client,
         live_client=live_client,
         start_date=start_date,
-        initial_balance=args.balance,
+        initial_balance=start.dollars,
         use_cache=use_cache,
         max_horizon_days=args.max_horizon_days,
         interval_discount=args.interval_discount,
@@ -630,7 +800,7 @@ def main() -> None:
         logging.info("No backtest trades found. Dashboard will show empty charts.")
     else:
         final_value  = float(equity_df["portfolio_value"].iloc[-1])
-        total_return = (final_value - args.balance) / args.balance
+        total_return = (final_value - start.dollars) / start.dollars
         n_win        = sum(1 for t in trades if t.profit > 0)
         logging.info("Backtest Summary")
         # UTC, matching the window the backtester actually simulates
@@ -671,10 +841,11 @@ def main() -> None:
     # raises (falls back to the saved copy, then "unavailable"), but an
     # unresponsive single-address host can cost about 4 minutes first
     risk_free = load_risk_free_rates()
-    generate_dashboard(trades, equity_df, start_date, args.balance,
+    # balance_source: the header says where the starting balance came from
+    generate_dashboard(trades, equity_df, start_date, start.dollars,
                        sweep=result, interval_discount=result.primary.k,
                        series_categories=series_categories, risk_free=risk_free,
-                       sell_workers=sell_workers)
+                       sell_workers=sell_workers, balance_source=start.source)
     logging.info("Open the HTML file in a browser to view the interactive charts.")
     # How a scenario on the page becomes the live defaults, or is traded: the
     # page cannot write files or start runs, so its buttons open the defaults

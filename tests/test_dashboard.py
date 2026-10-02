@@ -2630,6 +2630,36 @@ class TestEntryCheckpointHeader:
                 "scheduler's run time</p>") in page
 
 
+class TestStartingBalanceHeader:
+    """The Period line's starting balance says where the amount came from when
+    backtest.py names it — the account's value when the run started, or
+    --balance — and is the amount alone on a call that names nothing."""
+
+    _SOURCE = ("the account's value at 2026-10-02 21:30 UTC: cash $116.15 + open "
+               "positions $95.27")
+
+    def test_the_source_is_printed_beside_the_amount(self, monkeypatch, tmp_path):
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path, balance_source=self._SOURCE)
+        assert ("Starting balance: $1,000.00 (the account's value at 2026-10-02 "
+                "21:30 UTC: cash $116.15 + open positions $95.27) &nbsp;|&nbsp;") in page
+        # On the Period line, above every section
+        assert (page.index("Period:") < page.index("Starting balance:")
+                < page.index("Trades found:") < page.index("Portfolio Performance"))
+
+    def test_no_source_shows_the_amount_alone(self, monkeypatch, tmp_path):
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path)
+        assert "Starting balance: $1,000.00 &nbsp;|&nbsp;" in page
+
+    @pytest.mark.parametrize("source", [None, "", MagicMock(), 7])
+    def test_anything_but_a_note_shows_the_amount_alone(self, source):
+        assert dashboard._starting_balance_text(211.42, source) == "$211.42"
+
+    def test_the_note_is_escaped(self):
+        # &, < and > are escaped; an apostrophe, harmless in page text, is kept
+        assert (dashboard._starting_balance_text(10_000.0, "set by <--balance> & 'x'")
+                == "$10,000.00 (set by &lt;--balance&gt; &amp; 'x')")
+
+
 class TestCorpusProvenanceHeader:
     """DR-13 (P2): directly under the Period line the header says what
     settled-market corpus the run read — its assembly time (the Period runs to

@@ -272,7 +272,6 @@ time-series partner today (per CLAUDE.md's measurements). Confirmed by probe on 
   tests use; `[tool.mypy]` configured but mypy isn't installed or run; no `[build-system]` table.
 - [ ] `scheduler.py:173-192` suggests a crontab line writing to `/tmp/kalshi_arb.log` (outside
   `PROJECT_ROOT`) and bypassing the daemon's timeout/catch-up/retry.
-- [ ] `backtest.py --balance` is not validated (0 or negative accepted; `backtest.py:286-289`).
 - [ ] `display_title` renders the name twice when the title ends with the subtitle
   (`scanner.py:2226-2232`; cosmetic).
 
@@ -360,4 +359,7 @@ empty drawdown; plus orphaned pre-cutoff `live_days/` pruning, CLAUDE.md test li
 CLI flag coverage. Since then (2026-10, branch `claude/backtesting-position-auto-sell-hsj4d4`):
 DR-50 is moot (a post-cutoff window's markets are priced from the live candlestick endpoint, and the
 "structurally 0-trade" verdict is gone), and a legacy `settled_markets_*.json` is no longer loaded
-whole — it is re-assembled in full in the streamed format and retired.
+whole — it is re-assembled in full in the streamed format and retired. Since then (branch
+`feat/backtest-account-balance`): `backtest.py --balance` is validated (a positive, finite
+number of dollars, else exit 2 before logging is configured), and without it a backtest starts
+from the account's current value instead of $10,000.
