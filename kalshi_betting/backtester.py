@@ -39,8 +39,7 @@ Dependencies:
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap — whose
     spread_min and tier_floors keywords apply this module's bands and
-    tier-floors-off family — and time_series_profit_prob), kelly_budget
-    (the most one trade may spend, the same rule live sizing uses), the
+    tier-floors-off family — and time_series_profit_prob), the
     spread-band helpers
     time_series_spread_band and time_series_spread_too_wide (which
     _find_entry applies to time-series candidates; the first also validates
@@ -51,7 +50,8 @@ Dependencies:
     plus BUDGET_FRACTION and SAME_TITLE_SIZE_CAP (bound by value),
     pair_size_cap (one definition, shared with live sizing),
     held_pair_fraction (the one definition of an add-on's size, shared with
-    live sizing), LiveSettings,
+    live sizing), LiveSettings (one per simulation, handed to the live
+    sizer), _step_cap (the size-cap grid LiveSettings accepts),
     live_defaults with its LiveDefaultsError / LiveDefaultsMissing refusals,
     describe_time_series_rule, _names_text, _exact_number and _cap_text (the
     reporting-only "Live time-series rule" line, which names the saved live
@@ -76,17 +76,20 @@ Dependencies:
     imports only from here). Also
     depends on pandas (external) for the equity-curve DataFrame and numpy
     (external, a declared dependency pandas already pulls in) for counting
-    the grouping-key hashes behind the groupable subset. Does NOT
-    import strategy.py — Kelly sizing and portfolio selection are
-    re-implemented inline against the same config.py constants, so a change
-    to either sizing formula must be made in both places to keep live/backtest
-    parity. Exports BacktestTrade, HalfSplit, SweepPoint,
+    the grouping-key hashes behind the groupable subset. Sizes every trade
+    with the live bot's own code: scanner._enrich_pair walks a synthetic
+    order book (depth_model.book, from the DepthModel the caller hands in)
+    and strategy.compute_trade picks the count, through scanner's
+    CandidatePair, HeldPair, _market_from_dict and leg_prices. The Kelly
+    gate in Pass 1 still copies the formula, at the top of the book.
+    Exports BacktestTrade, HalfSplit, SweepPoint,
     CalibrationObservation, IntervalCalibrationBucket, IntervalCalibration,
     OutcomeLabelCoverage, CapSweep, SIZE_CAP_SWEEP and BacktestSweep
     (BacktestTrade, BacktestSweep,
     IntervalCalibration, OutcomeLabelCoverage and SweepPoint are consumed by
     dashboard.py, which also imports the private helpers _exact_label,
-    _leg_prices_for, _build_equity_curve — the one definition of an equity
+    _paid_prices (what a trade paid, which its trade rows and Kelly
+    scatter read), _build_equity_curve — the one definition of an equity
     curve, which its page-wide filter runs over a category's or tag's trades
     for that slice's curve — _calibration_bucket, _band_label (the bare
     "floor-ceiling" its filter bar and scenario explorer name a band's
@@ -118,15 +121,18 @@ Notes:
     tickers were found as a same-title pair, as the live run does.
 
     Pass 2 walks the candidates in date order, best expected return first
-    within a date, with a running cash balance. Each trade bets a share of
-    that Monday's opening portfolio value (the cash after that day's pay-outs
-    plus every open trade at market: each leg at the latest usable ask of the
-    side it holds, at its payout once paid out; a trade with no quotes at its
-    cost) but
-    never spends more than the cash left (config.kelly_budget, as live sizing
-    does). A candidate the cash cannot
-    fully buy is shrunk to fit, and skipped if not one contract pair fits or
-    a win no longer pays after fees. A market is in the open trades of at
+    within a date, with a running cash balance. Each trade is sized by the
+    live sizer, strategy.compute_trade, on that Monday's opening portfolio
+    value (the cash after that day's pay-outs plus every open trade at
+    market: each leg at the latest usable ask of the side it holds, at its
+    payout once paid out; a trade with no quotes at its cost) and the cash
+    left, so it bets a share of the value but never spends more than the
+    cash. With a depth model it first walks a synthetic order book
+    (scanner._enrich_pair), as a live run walks the real one, so a larger
+    trade pays a worse average price; without one, or with no volume data
+    for a leg that Monday, it fills at the candle prices (the top of the
+    book). A candidate is skipped if not one contract pair fits or a win no
+    longer pays after fees. A market is in the open trades of at
     most one pair at a time (freed when that pair pays out; an add-on to a
     held pair is another trade of that pair, with the same pay-out day), and
     at most one time-series pair is open per ladder (one question at several
@@ -217,7 +223,8 @@ Notes:
 
     With cap_sweep, run_backtest_sweep also returns a CapSweep over every other
     cap of SIZE_CAP_SWEEP (defined here, not in config.py), seeded from the
-    eager points (caps at or above a point's peak share one simulation) and
+    eager points (caps at or above a point's peak share one simulation; with
+    a walked book, at or above its cap_free_from too) and
     simulated lazily, one (band, k) cell at a time. With tier_off_sweep too, a SECOND CapSweep
     (BacktestSweep.tier_off_cap_sweep, tier_floors False) does the same over
     the tier-floors-off family's binding bands, seeded from that family's own
@@ -309,6 +316,7 @@ Notes:
 import functools
 import hashlib
 import logging
+import math
 import numbers
 import resource
 import statistics
@@ -356,18 +364,21 @@ from .config import (
     _cap_text,
     _exact_number,
     _names_text,
+    _step_cap,
     describe_time_series_rule,
     fee_leg_exact,
     fee_per_pair_approx,
     held_pair_fraction,
-    kelly_budget,
     live_defaults,
+    max_kelly_fraction,
     min_price_diff_for_gap,
     pair_size_cap,
     time_series_profit_prob,
     time_series_spread_band,
     time_series_spread_too_wide,
 )
+from .depth_model import DepthModel, bid_ladder, can_start_at, volume_24h
+from .depth_model import book as _synthetic_book
 from .historical import (
     CorpusProvenance,
     SettledCorpus,
@@ -380,10 +391,17 @@ from .scanner import (
     DEADLINE_CUMULATIVE,
     DEADLINE_SNAPSHOT,
     DEADLINE_UNKNOWN,
+    ENRICH_UNAFFORDABLE,
+    ENRICH_UNPROFITABLE,
     REFUSED_NO_STATED_DEADLINE,
     REFUSED_SAME_DEADLINE,
     REFUSED_SNAPSHOT,
     SAME_DAY,
+    CandidatePair,
+    HeldPair,
+    _cash_binds,
+    _enrich_pair,
+    _market_from_dict,
     close_gap_bound_text,
     closes_apart,
     cumulative_deadline_pair,
@@ -391,11 +409,13 @@ from .scanner import (
     deadline_profile,
     event_series,
     ladder_keys,
+    leg_prices,
     leg_sides,
     same_event_ladder,
     stated_deadline,
     time_series_group_key,
 )
+from .strategy import TradeSpec, compute_trade
 
 # Seconds in one UTC day. Same value as historical._DAY_SECONDS, kept local
 # rather than importing a private name.
@@ -505,18 +525,23 @@ def _resolve_size_cap(size_cap: float | None) -> float:
     Return the checked per-trade size cap one simulation sizes under.
 
     None reads this module's BUDGET_FRACTION when called, not when defined,
-    so a test that patches backtester.BUDGET_FRACTION takes effect.
+    so a test that patches backtester.BUDGET_FRACTION takes effect. The cap
+    must sit on config.SIZE_CAP_STEP's grid, as LiveSettings requires: each
+    simulation hands it to the live sizer.
 
     Args:
         size_cap (float | None): The cap, a share in (0, 1]; None for BUDGET_FRACTION.
 
     Returns:
-        float: The resolved cap, as a builtin float.
+        float: The resolved cap, as a builtin float on the grid.
 
     Raises:
-        ValueError: If the resolved cap is a bool, not a numbers.Real, NaN or outside (0, 1].
+        ValueError: If the resolved cap is a bool, not a numbers.Real, NaN, outside
+            (0, 1], or off the grid.
     """
-    return _validated_cap(BUDGET_FRACTION if size_cap is None else size_cap, "size_cap")
+    cap = _validated_cap(BUDGET_FRACTION if size_cap is None else size_cap, "size_cap")
+    # config's own grid rule, which names the value it refuses
+    return _step_cap(cap, "size_cap")
 
 
 def _resolve_same_title_size_cap() -> float:
@@ -526,15 +551,17 @@ def _resolve_same_title_size_cap() -> float:
     Reads this module's by-value SAME_TITLE_SIZE_CAP at CALL time (patch
     backtester's). Checked because a bad value would not fail otherwise:
     pair_size_cap's min() reads NaN as no cap and 0 or below as no same-title
-    trade.
+    trade. It must sit on config.SIZE_CAP_STEP's grid too, as LiveSettings
+    requires.
 
     Returns:
-        float: SAME_TITLE_SIZE_CAP, as a builtin float in (0, 1].
+        float: SAME_TITLE_SIZE_CAP, as a builtin float in (0, 1] on the grid.
 
     Raises:
-        ValueError: As _validated_cap, for a bad SAME_TITLE_SIZE_CAP.
+        ValueError: As _validated_cap, or for a cap off the grid.
     """
-    return _validated_cap(SAME_TITLE_SIZE_CAP, "SAME_TITLE_SIZE_CAP")
+    cap = _validated_cap(SAME_TITLE_SIZE_CAP, "SAME_TITLE_SIZE_CAP")
+    return _step_cap(cap, "SAME_TITLE_SIZE_CAP")
 
 
 def _cap_percent(cap: float) -> str:
@@ -697,8 +724,8 @@ class LegQuotes:
         (_leg_mark).
     Each sample is the latest usable ask (_usable_ask) at or before that
     moment, kept with no age limit; from settlement on it is the payout (1.0
-    or 0.0), and before the first usable ask it is NaN, read as the leg's
-    entry price. Past the arrays' end it reads the payout (or the last
+    or 0.0), and before the first usable ask it is NaN, read as the price
+    the leg paid. Past the arrays' end it reads the payout (or the last
     day-end sample when the payout is unknown).
 
     For selling a position early (_simulate_at_discount's sell_at), it also
@@ -709,6 +736,12 @@ class LegQuotes:
     candle ended at most one candle period before it and the opposite ask is
     usable. Unlike the asks, bids are NOT carried forward: an old or missing
     quote means no bid (NaN), and a leg with no bid cannot be sold.
+
+    For trading through a modeled order book it also holds the market's
+    24-hour traded volume at every checkpoint and the depth model (one
+    object shared by every market), from which book_at builds that
+    checkpoint's synthetic book for a buy, and sale_ladder the bids a sale
+    walks there.
 
     A plain __slots__ class, not a dataclass, so astuple does not walk into
     it and a copy is the object itself. Two built from the same candles
@@ -732,6 +765,10 @@ class LegQuotes:
         no_bid_checkpoints (np.ndarray): NO bids at each checkpoint, alike.
         paid_checkpoints (np.ndarray): Whether the market had paid out (a
             known payout, at or before the checkpoint) at each checkpoint.
+        volume_checkpoints (np.ndarray): Contracts traded in the 24 hours up
+            to each checkpoint (depth_model.volume_24h; NaN: no volume data).
+        depth (DepthModel | None): The depth model the synthetic books come
+            from; None means every trade fills at the top of the book.
         fingerprint (str): A hex digest of everything above; two LegQuotes
             that compare equal share it.
     """
@@ -739,14 +776,16 @@ class LegQuotes:
     __slots__ = ("ticker", "first_day", "yes_days", "no_days", "first_checkpoint",
                  "yes_checkpoints", "no_checkpoints", "paid_yes", "paid_no",
                  "yes_bid_checkpoints", "no_bid_checkpoints", "paid_checkpoints",
-                 "fingerprint")
+                 "volume_checkpoints", "depth", "fingerprint")
 
     def __init__(self, ticker: str, first_day: date, yes_days: np.ndarray, no_days: np.ndarray,
                  first_checkpoint: date, yes_checkpoints: np.ndarray,
                  no_checkpoints: np.ndarray, paid_yes: float, paid_no: float,
                  yes_bid_checkpoints: np.ndarray | None = None,
                  no_bid_checkpoints: np.ndarray | None = None,
-                 paid_checkpoints: np.ndarray | None = None) -> None:
+                 paid_checkpoints: np.ndarray | None = None,
+                 volume_checkpoints: np.ndarray | None = None,
+                 depth: DepthModel | None = None) -> None:
         """
         Store one market's samples, made read-only, and their fingerprint.
 
@@ -772,6 +811,9 @@ class LegQuotes:
             no_bid_checkpoints (np.ndarray | None): NO bids, alike.
             paid_checkpoints (np.ndarray | None): Whether the market had paid
                 out by each checkpoint. None reads as never.
+            volume_checkpoints (np.ndarray | None): 24-hour volume at each
+                checkpoint (NaN: none). None reads as no volume data.
+            depth (DepthModel | None): The depth model; None for none.
         """
         self.ticker = ticker
         self.first_day = first_day
@@ -811,6 +853,17 @@ class LegQuotes:
         self.paid_checkpoints = paid
         digest.update(len(paid).to_bytes(8, "little"))
         digest.update(paid.tobytes())
+        # The volume, as given; missing reads as no volume data
+        volume = (np.full(count, np.nan) if volume_checkpoints is None
+                  else np.array(volume_checkpoints, dtype=float))
+        volume.setflags(write=False)
+        self.volume_checkpoints = volume
+        canonical = np.where(np.isnan(volume), np.nan, volume + 0.0)
+        digest.update(len(volume).to_bytes(8, "little"))
+        digest.update(canonical.tobytes())
+        # The model's digest names its table, so equal models fingerprint alike
+        self.depth = depth
+        digest.update((depth.digest if depth is not None else "none").encode("utf-8"))
         self.fingerprint = digest.hexdigest()
 
     def __reduce__(self) -> tuple:
@@ -818,8 +871,9 @@ class LegQuotes:
         Rebuild from the samples when pickled (a dashboard worker process receives it so).
 
         Re-running __init__ gives the same read-only arrays and fingerprint:
-        carrying the asks forward again changes nothing, and the bids are
-        stored as given.
+        carrying the asks forward again changes nothing, and the bids and
+        volume are stored as given. The depth model travels with it, so a
+        worker sizes through the same books.
 
         Returns:
             tuple: (LegQuotes, its constructor arguments).
@@ -827,7 +881,8 @@ class LegQuotes:
         return (LegQuotes, (self.ticker, self.first_day, self.yes_days, self.no_days,
                             self.first_checkpoint, self.yes_checkpoints, self.no_checkpoints,
                             self.paid_yes, self.paid_no, self.yes_bid_checkpoints,
-                            self.no_bid_checkpoints, self.paid_checkpoints))
+                            self.no_bid_checkpoints, self.paid_checkpoints,
+                            self.volume_checkpoints, self.depth))
 
     def __copy__(self) -> "LegQuotes":
         """Return this object: it is read-only, and trades share one per market."""
@@ -863,14 +918,19 @@ class LegQuotes:
             """Whether two payouts are equal, NaN counting as equal to NaN."""
             return a == b or (a != a and b != b)
 
+        def model(quotes: "LegQuotes") -> str | None:
+            """The depth model's digest, or None for no model."""
+            return None if quotes.depth is None else quotes.depth.digest
+
         return (self.ticker == other.ticker and self.first_day == other.first_day
                 and self.first_checkpoint == other.first_checkpoint
                 and same(self.paid_yes, other.paid_yes) and same(self.paid_no, other.paid_no)
                 and all(np.array_equal(getattr(self, name), getattr(other, name), equal_nan=True)
                         for name in ("yes_days", "no_days", "yes_checkpoints",
                                      "no_checkpoints", "yes_bid_checkpoints",
-                                     "no_bid_checkpoints"))
-                and np.array_equal(self.paid_checkpoints, other.paid_checkpoints))
+                                     "no_bid_checkpoints", "volume_checkpoints"))
+                and np.array_equal(self.paid_checkpoints, other.paid_checkpoints)
+                and model(self) == model(other))
 
     def __hash__(self) -> int:
         """Hash on the ticker and first day, which equal objects share."""
@@ -915,8 +975,8 @@ class LegQuotes:
         Args:
             day (date): A checkpoint date on this market's weekly grid.
             side (str): The side the leg holds, "yes" or "no".
-            entry_price (float): The leg's entry price, returned when the side
-                has had no usable ask yet.
+            entry_price (float): The price the leg paid, returned when the
+                side has had no usable ask yet.
 
         Returns:
             float: The side's latest usable ask at the checkpoint, the payout
@@ -1005,6 +1065,86 @@ class LegQuotes:
         index = self._checkpoint_index(day)
         return float(bids[index]) if index < len(bids) else float("nan")
 
+    def _volume_at(self, day: date) -> float | None:
+        """
+        The 24-hour volume behind the checkpoint on `day`, when a book can be built there.
+
+        Args:
+            day (date): A checkpoint date.
+
+        Returns:
+            float | None: The volume; None when there is no depth model, the
+                day is not one of this market's checkpoints, or the volume is
+                unknown there.
+        """
+        if self.depth is None:
+            return None
+        offset = (day - self.first_checkpoint).days
+        if offset < 0 or offset % 7 or offset // 7 >= len(self.volume_checkpoints):
+            return None
+        volume = float(self.volume_checkpoints[offset // 7])
+        return None if volume != volume else volume
+
+    def has_book_at(self, day: date) -> bool:
+        """
+        Whether book_at can build this market's book at the checkpoint on `day`.
+
+        Args:
+            day (date): A checkpoint date.
+
+        Returns:
+            bool: True when there is a depth model and a volume there.
+        """
+        return self._volume_at(day) is not None
+
+    def book_at(self, day: date, yes_ask: float, yes_bid: float) -> dict | None:
+        """
+        This market's synthetic order book at the checkpoint on `day`, anchored at these prices.
+
+        Built by depth_model.book from the depth model and the market's 24-hour
+        volume there, in scanner._fetch_orderbook's shape, so the live
+        enrichment can walk it.
+
+        Args:
+            day (date): A checkpoint date.
+            yes_ask (float): The market's YES ask then, where the NO bids start.
+            yes_bid (float): Its YES bid then (1 - its NO ask), where the YES bids start.
+
+        Returns:
+            dict | None: {"yes": YES bids, "no": NO bids}; None when there is no
+                model, the day is not one of its checkpoints, or the volume is
+                unknown there.
+        """
+        volume = self._volume_at(day)
+        if volume is None:
+            return None
+        return _synthetic_book(self.depth, yes_ask, yes_bid, volume)
+
+    def sale_ladder(self, day: date, best_bid: float) -> list[list[float]] | None:
+        """
+        The bids a sale into this market would walk at the checkpoint on `day`.
+
+        Built by depth_model.bid_ladder from the depth model and the market's
+        24-hour volume there, starting at best_bid: the fresh bid of the side
+        sold, which the caller reads.
+
+        Args:
+            day (date): A checkpoint date.
+            best_bid (float): The side's fresh bid there.
+
+        Returns:
+            list[list[float]] | None: [[price, contracts], ...], best first;
+                empty when the model puts no contracts near that bid. None
+                when the model cannot say: no model, no volume data there,
+                or a bid the model has no ladders for (below 1c or above
+                99c, depth_model.can_start_at). The sale then takes that one
+                bid, in any size.
+        """
+        volume = self._volume_at(day)
+        if volume is None or not can_start_at(best_bid):
+            return None
+        return bid_ladder(self.depth, best_bid, volume)
+
     def day_values(self, first: date, last: date, side: str, entry_price: float) -> np.ndarray:
         """
         One contract's value at the end of each day from `first` to `last`.
@@ -1013,7 +1153,7 @@ class LegQuotes:
             first (date): The first day (inclusive).
             last (date): The last day (inclusive); before `first` gives [].
             side (str): The side the leg holds, "yes" or "no".
-            entry_price (float): The leg's entry price, used for a day before
+            entry_price (float): The price the leg paid, used for a day before
                 the side's first usable ask (before first_day too).
 
         Returns:
@@ -1066,24 +1206,27 @@ class BacktestTrade:
             prices (entry_pA..entry_nB), the tickers and event_ticker all
             come from that Monday.
         exit_date (date): The date the later-settling market resolved; marks when cash returned.
-        entry_pA (float): YES ask price of market A at entry. Range: [0.01, 0.99].
-            The traded price of the market-A leg for time_series; for same_title
-            it is the quote that made A the pricier side (reporting only).
+        entry_pA (float): YES ask price of market A at entry (the candle
+            quote, the top of the book). Range: [0.01, 0.99]. The quote of the
+            market-A leg for time_series; for same_title it is the quote that
+            made A the pricier side (reporting only).
         entry_pB (float): YES ask price of market B at entry. Range: [0.01, 0.99].
-            The traded price of the market-B leg for same_title; for time_series
-            it feeds the profit model together with entry_pA but is not traded.
+            The quote of the market-B leg for same_title; for time_series it
+            feeds the profit model together with entry_pA but is not traded.
         entry_nA (float): NO ask price of market A at entry (≈ 1 − yes_bid_A).
-            Range: [0.01, 0.99]. The traded price of the market-A leg for
+            Range: [0.01, 0.99]. The quote of the market-A leg for
             same_title; reporting only for time_series.
         entry_nB (float): NO ask price of market B at entry (≈ 1 − yes_bid_B).
-            Range: [0.01, 0.99]. The traded price of the market-B leg for
+            Range: [0.01, 0.99]. The quote of the market-B leg for
             time_series; reporting only for same_title.
         n (int): Number of contracts bought on each leg (x = y = n). Always >= 1.
             Both legs are always the same size.
-        total_cost (float): Dollar cost of the contracts: n * (price_a + price_b),
-            where the leg prices are (entry_nA, entry_pB) for same_title and
-            (entry_pA, entry_nB) for time_series. Excludes taker fees (see fees).
-        fees (float): Exact ceiling-rounded taker fee for both legs, charged at entry.
+        total_cost (float): Dollar cost of the contracts: n times the two
+            prices paid (_paid_prices: fill_price_a and fill_price_b, or the
+            leg quotes for a trade built without them). Excludes taker fees
+            (see fees).
+        fees (float): Exact ceiling-rounded taker fee for both legs at the
+            prices paid, charged at entry.
         outcome_a (str): Settlement result of market A — "yes" or "no".
         outcome_b (str): Settlement result of market B — "yes" or "no".
         actual_payoff (float): Gross dollar value received at settlement: $1 per
@@ -1107,7 +1250,7 @@ class BacktestTrade:
             config.BUDGET_FRACTION unless a size-cap sweep (CapSweep)
             simulated another.
         expected_payoff (float): NET profit in a win scenario after exact fees:
-            n * (1 − price_a − price_b) − fees on the leg prices above. For
+            n * (1 − price_a − price_b) − fees on the prices paid. For
             same_title this is the guaranteed floor (every co-resolution
             outcome pays at least n); for time_series it is the profit realized
             in either win cell, while the in-between cell loses total_cost +
@@ -1171,14 +1314,15 @@ class BacktestTrade:
         sold (bool): True when the trade's position was sold before it paid
             out (only a simulation run with sell_at sells): exit_date is then
             the sale day, actual_payoff what the sale returned after its fees
-            (each leg at the bid of the side it holds less config.fee_leg_exact
-            on the sale, a leg whose market had already paid out at its
-            payout), and profit, profit_ratio, monthly_profit_ratio,
-            holding_days and slippage are the sale's. outcome_a/_b and
-            settled_date_a/_b keep how the markets really settled. False by
-            default.
-        sale_price_a (float | None): The bid market A's leg sold at; None when
-            the trade was not sold, or market A had paid out by the sale.
+            (each leg at its sale price less config.fee_leg_exact on the sale,
+            a leg whose market had already paid out at its payout), and
+            profit, profit_ratio, monthly_profit_ratio, holding_days and
+            slippage are the sale's. outcome_a/_b and settled_date_a/_b keep
+            how the markets really settled. False by default.
+        sale_price_a (float | None): The price market A's leg sold at: the
+            average down the modeled bid ladder, or the bid itself with no
+            ladder (_position_sale_value). None when the trade was not sold,
+            or market A had paid out by the sale.
         sale_price_b (float | None): The same for market B's leg.
         sale_fees (float): The taker fees the sale paid, both legs; 0.0 when
             the trade was not sold. Already deducted from actual_payoff.
@@ -1189,6 +1333,15 @@ class BacktestTrade:
             every hand-built trade) values it at its cost. Left out of
             equality and repr, so two trades compare on what was traded;
             references only, shared by every trade in the same markets.
+        fill_price_a (float | None): The average price paid per contract on
+            market A's leg: the candle quote at the top of the book, or the
+            average over the synthetic book's levels the trade walked. None on
+            a trade built without it, which reads its leg quote instead
+            (_paid_prices).
+        fill_price_b (float | None): The same for market B's leg.
+        book_walked (bool): True when the trade was sized by walking a
+            synthetic order book; False when it filled at the top of the book
+            (no depth model, or no volume data that Monday).
     """
     pair_type: str       # "time_series" | "same_title"
     ticker_a: str
@@ -1198,10 +1351,10 @@ class BacktestTrade:
     category: str
     entry_date: date
     exit_date: date      # date the last-settling market resolved
-    entry_pA: float      # YES ask of A at entry — the market-A leg price for time_series
-    entry_pB: float      # YES ask of B at entry — the market-B leg price for same_title
-    entry_nA: float      # NO ask of A at entry (≈ 1 - yes_bid_A) — the market-A leg price for same_title
-    entry_nB: float      # NO ask of B at entry (≈ 1 - yes_bid_B) — the market-B leg price for time_series
+    entry_pA: float      # YES ask of A at entry — the market-A leg quote for time_series
+    entry_pB: float      # YES ask of B at entry — the market-B leg quote for same_title
+    entry_nA: float      # NO ask of A at entry (≈ 1 - yes_bid_A) — the market-A leg quote for same_title
+    entry_nB: float      # NO ask of B at entry (≈ 1 - yes_bid_B) — the market-B leg quote for time_series
     n: int               # contracts bought on each leg (x = y = n)
     total_cost: float
     fees: float          # exact both-leg taker fees, charged at entry
@@ -1251,7 +1404,7 @@ class BacktestTrade:
     # _simulate_at_discount(add_to_held=True)); reporting only
     add_on: bool = False
     # Whether its position was sold early (only with _simulate_at_discount's
-    # sell_at), at what bid each leg sold (None: not sold, or that market had
+    # sell_at), at what price each leg sold (None: not sold, or that market had
     # already paid out) and the fees the sale paid; defaulted so every other
     # construction still builds
     sold: bool = False
@@ -1262,6 +1415,11 @@ class BacktestTrade:
     # values it at cost. Not compared or printed: it is how the trade is
     # valued while open, not what was traded
     marks: tuple[LegQuotes, LegQuotes] | None = field(default=None, compare=False, repr=False)
+    # The average price paid per contract on each leg (None: read the leg
+    # quotes, _paid_prices), and whether a synthetic book was walked
+    fill_price_a: float | None = None
+    fill_price_b: float | None = None
+    book_walked: bool = False
 
 
 @dataclass(frozen=True)
@@ -1406,10 +1564,11 @@ class SweepPoint:
             and with add_to_held also its later passing Mondays that keep the
             first one's legs the same way round); 0.0 when none passed, None
             only on a hand-built point. It does not depend on the cap, and
-            every cap at or above it sizes the point the same way — an
-            add-on's size included, since the cap reaches it only through
-            min(pair cap, f*) — so CapSweep reuses one simulation for all of
-            them.
+            with no walked book every cap at or above it sizes the point the
+            same way — an add-on's size included, since the cap reaches it
+            only through min(pair cap, f*) — so CapSweep reuses one
+            simulation for all of them (with a walked book, from
+            cap_free_from).
         add_to_held (bool): True when the simulation could add to a pair it
             still held (_simulate_at_discount(add_to_held=True)). Not only a
             label: _ex_top_event re-simulates the point at this setting, so its
@@ -1422,6 +1581,14 @@ class SweepPoint:
             _ex_top_event re-simulate the point at this setting. Appended with
             a default of None, so every existing construction still builds as
             a point that never sells.
+        cap_free_from (float | None): The size cap at and above which no
+            trade of this simulation depends on the cap: the larger of
+            peak_kelly_fraction and, for each pair type with a candidate that
+            could walk a synthetic book, the cap above which the live search
+            range stops moving (round(1 - k, 12) for time-series,
+            min(same-title cap, SAME_TITLE_CO_RESOLVE_PROB) for same-title).
+            CapSweep shares one simulation only at caps at or above it. None
+            on a hand-built point, which shares from peak_kelly_fraction.
     """
     k: float
     trades: list[BacktestTrade]
@@ -1435,6 +1602,7 @@ class SweepPoint:
     peak_kelly_fraction: float | None = None
     add_to_held: bool = False
     sell_at: float | None = None
+    cap_free_from: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1788,6 +1956,25 @@ def _curve_end_date(point: SweepPoint | None) -> date | None:
     return last if isinstance(last, date) else None
 
 
+def _sharing_floor(point: SweepPoint | None) -> float | None:
+    """
+    The size cap at and above which a point's simulation is the same at every cap.
+
+    Args:
+        point (SweepPoint | None): A simulated point, or None.
+
+    Returns:
+        float | None: The larger of its peak_kelly_fraction and its
+            cap_free_from (the peak alone when cap_free_from is None, as on a
+            hand-built point); None when there is no point or no peak.
+    """
+    if point is None or point.peak_kelly_fraction is None:
+        return None
+    if point.cap_free_from is None:
+        return point.peak_kelly_fraction
+    return max(point.peak_kelly_fraction, point.cap_free_from)
+
+
 @dataclass
 class CapSweep:
     """
@@ -1804,10 +1991,12 @@ class CapSweep:
     to summarise each cell and drop it; nothing here is memoised, so asking
     for a cell twice simulates it twice.
 
-    Seeded from the eager point. A point's peak_kelly_fraction does not depend
-    on the cap, and every cap at or above it sizes the point's entries
-    identically — provided SAME_TITLE_SIZE_CAP, read at call time, is not
-    rebound between the eager point and the cell. So:
+    Seeded from the eager point. A point's peak_kelly_fraction (its "peak"
+    below; with a walked book, the larger cap_free_from — _sharing_floor
+    reads whichever applies) does not depend on the cap, and every cap at or
+    above it sizes the point's entries identically — provided
+    SAME_TITLE_SIZE_CAP, read at call time, is not rebound between the eager
+    point and the cell. So:
       * the primary cap always returns the eager object ITSELF;
       * when the primary cap is itself at or above the eager point's peak,
         every other cap at or above that peak returns a
@@ -1821,8 +2010,11 @@ class CapSweep:
     Sharing is exact. The peak covers every Monday a pair may be traded on,
     so at any cap at or above it no size depends on the cap, and the whole
     walk — cash, open markets, ladders, the Monday each pair trades on — is
-    the same. The halves and the excluding-top-event run use subsets of the
-    point's candidates, whose peaks are no higher.
+    the same. A simulation that walks synthetic books shares only from its
+    cap_free_from (_sharing_floor), since there the cap also bounds how deep
+    the live enrichment averages a book. The halves and the
+    excluding-top-event run use subsets of the point's candidates, whose
+    floors are no higher.
     A simulated cap runs quiet — its completion line and its
     premise-violation WARNING go to DEBUG, since the primary-cap run already
     reported the same count and ~10 repeats per cell would flood the log
@@ -2040,8 +2232,9 @@ class CapSweep:
 
         The eager branch comes FIRST, so the primary cap always returns the
         eager object itself; then the eager seed (only when the primary cap
-        is at or above the eager point's peak — see the class docstring);
-        then a point this call simulated at a cap at or above its own peak;
+        is at or above the cap the eager point shares from, _sharing_floor —
+        see the class docstring); then a point this call simulated at a cap
+        at or above the cap it shares from;
         else a quiet simulation, pinned to the eager point's end date (with
         no eager point, to end_dates' day for this cell) and run at this
         sweep's Tier floors, add-on and sell settings (tier_floors,
@@ -2073,9 +2266,9 @@ class CapSweep:
         """
         out: dict[float, SweepPoint] = {}
         # The eager point is the one the backtest simulated during the run, at
-        # its own cap; its peak does not depend on the cap, so it is this
-        # subset's peak too
-        seed = eager_point.peak_kelly_fraction if eager_point is not None else None
+        # its own cap; the cap it shares from does not depend on the cap, so
+        # it is this subset's too
+        seed = _sharing_floor(eager_point)
         # Every simulated cap ends its curve where the eager point's ended, not
         # on whatever day (UTC) this cell happens to be read; a cell with no
         # eager point takes its day from end_dates
@@ -2131,11 +2324,12 @@ class CapSweep:
                         point, subset, self.start_date, self.initial_balance, band,
                         population=population, tier_floors=self.tier_floors, quiet=True,
                         end_date=end_date)
-                # The first simulated point whose cap reaches its own peak
-                # sizes as every larger cap (never set while the eager point
-                # seeds, whose peak every simulated cap here sits below)
-                if (reuse is None and point.peak_kelly_fraction is not None
-                        and cap >= point.peak_kelly_fraction):
+                # The first simulated point whose cap reaches the cap it
+                # shares from sizes as every larger cap (never set while the
+                # eager point seeds, whose floor every simulated cap here
+                # sits below)
+                floor = _sharing_floor(point)
+                if reuse is None and floor is not None and cap >= floor:
                     reuse = point
             out[cap] = point
         return out
@@ -2654,6 +2848,10 @@ class BacktestSweep:
             sell level of every scenario, simulated when the dashboard reads
             it. None unless run_backtest_sweep(sell_sweep=True) ran on a
             feasible window.
+        depth_model (DepthModel | None): The depth model every trade's
+            synthetic order book came from (which snapshots, how many
+            ladders, when they were taken), for the page's header; None when
+            the run had none, so every trade filled at the top of the book.
     """
     primary: SweepPoint
     points: list[SweepPoint]
@@ -2692,6 +2890,8 @@ class BacktestSweep:
     live_add_to_held_pairs: bool | None = None
     # The dashboard's "Sell" family, lazy (None unless run_backtest_sweep(sell_sweep=True))
     sell_sweep: SellSweep | None = None
+    # The depth model the trades' synthetic books came from (None: top of the book)
+    depth_model: DepthModel | None = None
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -2767,8 +2967,9 @@ def _leg_prices_for(
     market's quotes as loose floats rather than a CandidatePair: (nA, pB) for a
     same-title pair (NO on market A, YES on market B) and (pA, nB) for a
     time-series pair (YES on the earlier market A, NO on the later market B).
-    Every price the backtester sizes, fees or pays out on comes through here,
-    so the leg mapping is written exactly once.
+    These are the top-of-the-book prices: _find_entry and Pass 1's Kelly gate
+    read them, and a trade built without fill prices paid them
+    (_paid_prices).
 
     Args:
         pair_type (str): "time_series" or "same_title" — anything but the exact
@@ -2780,12 +2981,32 @@ def _leg_prices_for(
         nB (float): NO ask of market B, dollars in [0.01, 0.99].
 
     Returns:
-        tuple[float, float]: (price_a, price_b) — the cost of the side bought on
-            market A and on market B respectively.
+        tuple[float, float]: (price_a, price_b) — the quote of the side bought
+            on market A and on market B respectively.
     """
     if pair_type == "time_series":
         return pA, nB
     return nA, pB
+
+
+def _paid_prices(trade: BacktestTrade) -> tuple[float, float]:
+    """
+    The average price a trade paid per contract on each leg.
+
+    The one reader of what a trade paid: its fill prices, or, for a trade
+    built without them, its two leg quotes (_leg_prices_for), which is what
+    a top-of-the-book fill pays.
+
+    Args:
+        trade (BacktestTrade): A trade.
+
+    Returns:
+        tuple[float, float]: (market A's leg, market B's leg), in dollars.
+    """
+    if trade.fill_price_a is not None and trade.fill_price_b is not None:
+        return trade.fill_price_a, trade.fill_price_b
+    return _leg_prices_for(trade.pair_type, trade.entry_pA, trade.entry_nA,
+                           trade.entry_pB, trade.entry_nB)
 
 
 def _open_value(trade: BacktestTrade, day: date) -> float:
@@ -2794,8 +3015,8 @@ def _open_value(trade: BacktestTrade, day: date) -> float:
 
     Each leg counts at the latest usable ask of the side it holds at that
     checkpoint (a YES leg at the YES ask, a NO leg at the NO ask), at its
-    payout (1 or 0 per contract) once its market has paid out, and at its
-    entry price before that side has had any usable ask
+    payout (1 or 0 per contract) once its market has paid out, and at the
+    price it paid (_paid_prices) before that side has had any usable ask
     (LegQuotes.at_checkpoint). A trade with no quotes
     (trade.marks is None, every hand-built trade) is worth exactly its
     total_cost, the value the portfolio carried before trades were valued at
@@ -2825,8 +3046,8 @@ def _leg_mark(trade: BacktestTrade, index: int, day: date) -> float:
     The one reader of a leg's checkpoint quote (LegQuotes.at_checkpoint),
     shared by _open_value (both legs) and _open_leg_stake (one leg): the
     latest usable ask of the side the leg holds, its payout once its market
-    has paid out, or its entry price before that side has had a usable ask,
-    or when the trade has no quotes at all.
+    has paid out, or the price it paid (_paid_prices) before that side has
+    had a usable ask, or when the trade has no quotes at all.
 
     Args:
         trade (BacktestTrade): An open trade.
@@ -2841,10 +3062,9 @@ def _leg_mark(trade: BacktestTrade, index: int, day: date) -> float:
             checkpoint grid.
     """
     # Which side the leg holds (scanner.leg_sides, the one definition) and
-    # what it cost, for a leg that has had no usable ask yet
+    # what it paid, for a leg that has had no usable ask yet
     side = leg_sides(trade.pair_type)[index]
-    price = _leg_prices_for(trade.pair_type, trade.entry_pA, trade.entry_nA,
-                            trade.entry_pB, trade.entry_nB)[index]
+    price = _paid_prices(trade)[index]
     if trade.marks is None:
         return price
     return trade.marks[index].at_checkpoint(day, side, price)
@@ -2858,9 +3078,9 @@ def _open_leg_stake(trade: BacktestTrade, ticker: str, day: date) -> float:
     this leg is still held, as live's scanner.held_pairs counts a lone held
     leg at its own worth plus its own fees (the other leg's payout is already
     cash). The leg counts at the latest usable ask of the side it holds
-    (LegQuotes.at_checkpoint), or at its entry price when the trade has no
-    quotes, plus the exact fee paid on it (config.fee_leg_exact, the fee the
-    trade was charged for that leg).
+    (LegQuotes.at_checkpoint), or at the price it paid when the trade has no
+    quotes, plus the exact fee paid on it (config.fee_leg_exact at the price
+    paid, the fee the trade was charged for that leg).
 
     Args:
         trade (BacktestTrade): An open trade with a leg on `ticker`.
@@ -2871,9 +3091,8 @@ def _open_leg_stake(trade: BacktestTrade, ticker: str, day: date) -> float:
         float: The leg's stake in dollars.
     """
     index = 0 if trade.ticker_a == ticker else 1
-    # What the leg cost per contract, for the exact fee it was charged
-    price = _leg_prices_for(trade.pair_type, trade.entry_pA, trade.entry_nA,
-                            trade.entry_pB, trade.entry_nB)[index]
+    # What the leg paid per contract, for the exact fee it was charged
+    price = _paid_prices(trade)[index]
     return trade.n * _leg_mark(trade, index, day) + fee_leg_exact(trade.n, price)
 
 
@@ -2912,50 +3131,33 @@ def _sale_label(sell_at: float) -> str:
     return f"selling at {_cap_percent(sell_at)}% of potential profit"
 
 
-def _trade_sale_value(trade: BacktestTrade, day: date) -> tuple | None:
+def _ladder_average(ladder: list[list[float]], contracts: float) -> float | None:
     """
-    What selling one open trade at the checkpoint on `day` would return, after the sale's fees.
-
-    A leg whose market had paid out by the checkpoint
-    (LegQuotes.paid_at_checkpoint) counts at its payout, with no sale and no
-    fee. Every other leg sells its n contracts at the bid of the side it
-    holds (LegQuotes.bid_at_checkpoint), less the taker fee on that sale
-    (config.fee_leg_exact).
+    The average price of selling `contracts` down a bid ladder, best bid first.
 
     Args:
-        trade (BacktestTrade): An open trade.
-        day (date): A checkpoint date on its legs' weekly grid.
+        ladder (list[list[float]]): [[price, contracts], ...], best first.
+        contracts (float): How many contracts to sell; above 0.
 
     Returns:
-        tuple | None: (value, fees, (market A's sale price, market B's)), a
-            price None for a leg that paid out; None when the trade has no
-            quotes or a leg still to pay out has no bid, so it cannot be sold.
-
-    Raises:
-        ValueError: From LegQuotes, for a day off the legs' checkpoint grid.
+        float | None: Their average price (exactly the best bid when that
+            level holds them all); None when the ladder holds fewer contracts
+            than that.
     """
-    if trade.marks is None:
+    left = contracts
+    proceeds = 0.0
+    used = 0
+    for price, size in ladder:
+        take = min(size, left)
+        proceeds += take * price
+        left -= take
+        used += 1
+        if left <= 0:
+            break
+    # Ladder sizes carry six decimals, so anything finer is float noise
+    if round(left, 6) > 0:
         return None
-    value = 0.0
-    fees = 0.0
-    prices: list[float | None] = []
-    # Which side each leg holds (scanner.leg_sides, the one definition)
-    for quotes, side in zip(trade.marks, leg_sides(trade.pair_type), strict=True):
-        if quotes.paid_at_checkpoint(day):
-            # Paid out: worth its payout, with nothing to sell
-            value += trade.n * (quotes.paid_yes if side == "yes" else quotes.paid_no)
-            prices.append(None)
-            continue
-        bid = quotes.bid_at_checkpoint(day, side)
-        if bid != bid:
-            # No fresh bid (NaN): this leg cannot be sold now
-            return None
-        # config.fee_leg_exact: the taker fee on selling n contracts at the bid
-        fee = fee_leg_exact(trade.n, bid)
-        value += trade.n * bid - fee
-        fees += fee
-        prices.append(bid)
-    return value, fees, (prices[0], prices[1])
+    return ladder[0][0] if used == 1 else proceeds / contracts
 
 
 def _positions(open_trades: list[BacktestTrade]) -> list[list[BacktestTrade]]:
@@ -3003,27 +3205,86 @@ def _position_sale_value(position: list[BacktestTrade], day: date) -> tuple | No
     """
     What selling a whole position at the checkpoint on `day` would return, and what it cost and could pay.
 
-    The one valuation a sale decides on (and _highest_sale_level replays):
-    the value is each trade's _trade_sale_value summed in the position's
-    order, the cost each trade's contracts plus entry fees, and the potential
-    total return each trade's contract pairs times CONTRACT_PAYOUT_DOLLARS —
-    what one leg pays in a win.
+    The one valuation a sale decides on (and _highest_sale_level replays).
+    The position's contracts are totalled per market (by ticker and side
+    held: an add-on to a lone leg can hold one market as A in one trade and
+    as B in another), and each market gets one sale price:
+      * a market that had paid out by the checkpoint
+        (LegQuotes.paid_at_checkpoint) counts at its payout, with no sale and
+        no fee;
+      * otherwise the sale starts at the fresh bid of the side held
+        (LegQuotes.bid_at_checkpoint). With a modeled bid ladder there
+        (LegQuotes.sale_ladder) the price is the average over the position's
+        contracts walked down it, and a ladder holding fewer contracts than
+        the position means it cannot be sold now; with none (no model, no
+        volume data, or a bid the model has no ladders for), the price is
+        the bid itself, in any size.
+    Each trade's leg returns its contracts at that price, less the taker fee
+    on selling them (config.fee_leg_exact). The cost is each trade's
+    contracts plus entry fees, and the potential total return each trade's
+    contract pairs times CONTRACT_PAYOUT_DOLLARS — what one leg pays in a win.
 
     Args:
         position (list[BacktestTrade]): One position's open trades (_positions).
         day (date): A checkpoint date on the legs' weekly grid.
 
     Returns:
-        tuple | None: (each trade's _trade_sale_value, in order; the sale
-            value; the total cost; the potential total return); None when any
-            of its trades cannot be sold now.
+        tuple | None: (each trade's sale as (value, fees, (market A's sale
+            price, market B's)), in order — a price None for a leg that paid
+            out; the sale value; the total cost; the potential total return).
+            None when a trade has no quotes, or a market still to pay out has
+            no fresh bid or too few contracts on its ladder.
+
+    Raises:
+        ValueError: From LegQuotes, for a day off the legs' checkpoint grid.
     """
+    # Every leg: its market and side, with the trade's quotes for that market
+    legs = []
+    for trade in position:
+        if trade.marks is None:
+            return None
+        # Which side each leg holds (scanner.leg_sides, the one definition)
+        legs.append(list(zip((trade.ticker_a, trade.ticker_b), trade.marks,
+                             leg_sides(trade.pair_type), strict=True)))
+    # The contracts held on each market, and its quotes
+    held: dict[tuple[str, str], list] = {}
+    for trade, trade_legs in zip(position, legs, strict=True):
+        for ticker, quotes, side in trade_legs:
+            held.setdefault((ticker, side), [quotes, 0])[1] += trade.n
+    # One sale price per market; None when it has paid out
+    prices: dict[tuple[str, str], float | None] = {}
+    for (ticker, side), (quotes, contracts) in held.items():
+        if quotes.paid_at_checkpoint(day):
+            prices[(ticker, side)] = None
+            continue
+        bid = quotes.bid_at_checkpoint(day, side)
+        if bid != bid:
+            # No fresh bid (NaN): this market cannot be sold now
+            return None
+        ladder = quotes.sale_ladder(day, bid)
+        price = bid if ladder is None else _ladder_average(ladder, contracts)
+        if price is None:
+            # The modeled bids hold fewer contracts than the position
+            return None
+        prices[(ticker, side)] = price
     per_trade = []
     value = cost = potential = 0.0
-    for trade in position:
-        sale = _trade_sale_value(trade, day)
-        if sale is None:
-            return None
+    for trade, trade_legs in zip(position, legs, strict=True):
+        trade_value = fees = 0.0
+        sale_prices: list[float | None] = []
+        for ticker, quotes, side in trade_legs:
+            price = prices[(ticker, side)]
+            if price is None:
+                # Paid out: worth its payout, with nothing to sell
+                trade_value += trade.n * (quotes.paid_yes if side == "yes" else quotes.paid_no)
+                sale_prices.append(None)
+                continue
+            # config.fee_leg_exact: the taker fee on selling n contracts at the price
+            fee = fee_leg_exact(trade.n, price)
+            trade_value += trade.n * price - fee
+            fees += fee
+            sale_prices.append(price)
+        sale = (trade_value, fees, (sale_prices[0], sale_prices[1]))
         per_trade.append(sale)
         value += sale[0]
         cost += trade.total_cost + trade.fees
@@ -3089,7 +3350,7 @@ def _sold_copy(trade: BacktestTrade, day: date, sale: tuple) -> BacktestTrade:
     Args:
         trade (BacktestTrade): The open trade sold.
         day (date): The sale's checkpoint date.
-        sale (tuple): Its _trade_sale_value.
+        sale (tuple): Its sale, as _position_sale_value gives each trade's.
 
     Returns:
         BacktestTrade: A copy marked sold.
@@ -4825,7 +5086,8 @@ def _usable_ask(raw: Any, side: str) -> float:
     return value if PRICE_EPSILON < value < top - PRICE_EPSILON else float("nan")
 
 
-def _leg_quotes(market: dict, candles: list[dict], start_date: date) -> tuple[LegQuotes | None, int]:
+def _leg_quotes(market: dict, candles: list[dict], start_date: date,
+                depth_model: DepthModel | None = None) -> tuple[LegQuotes | None, int]:
     """
     Sample one market's candles into the prices that value an open leg in it (a LegQuotes).
 
@@ -4850,11 +5112,17 @@ def _leg_quotes(market: dict, candles: list[dict], start_date: date) -> tuple[Le
     it (NaN otherwise, and never carried forward), and whether the market
     had paid out by then (its exact settlement time, with a known payout).
 
+    And at each checkpoint, what a synthetic order book reads: the contracts
+    traded in the 24 hours up to it (depth_model.volume_24h, the snapshot's
+    own definition; NaN when unknown), beside the depth model itself.
+
     Args:
         market (dict): The market's cached record ("ticker", "settlement_ts", "result").
         candles (list[dict]): Its hourly candles ("ts", "yes_ask_close",
-            "no_ask_close"), in time order.
+            "no_ask_close", "volume"), in time order.
         start_date (date): The backtest's first trading date.
+        depth_model (DepthModel | None): The depth model the quotes carry;
+            None means no synthetic book.
 
     Returns:
         tuple[LegQuotes | None, int]: The market's quotes, None when it has no
@@ -4962,14 +5230,19 @@ def _leg_quotes(market: dict, candles: list[dict], start_date: date) -> tuple[Le
         # never reaches a price; a NaN ask leaves a NaN bid
         yes_bids.append(round(1.0 - no_ask, 6))
         no_bids.append(round(1.0 - yes_ask, 6))
+    # The 24-hour volume at each checkpoint, read the way a depth snapshot
+    # reads it (depth_model.volume_24h needs the candles in time order)
+    ordered = sorted(candles, key=lambda c: c["ts"])
+    volumes = [float("nan") if (v := volume_24h(ordered, moment)) is None else v
+               for moment in checkpoints]
     quotes = LegQuotes(ticker, first_day, yes_days, no_days, first_checkpoint,
                        yes_checkpoints, no_checkpoints, paid_yes, paid_no,
-                       yes_bids, no_bids, paid)
+                       yes_bids, no_bids, paid, volumes, depth_model)
     return quotes, stale_days
 
 
 def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
-                       start_date: date) -> None:
+                       start_date: date, depth_model: DepthModel | None = None) -> None:
     """
     Give each entry record the prices that value its trades at market: the one writer of "leg_quotes".
 
@@ -4979,7 +5252,9 @@ def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
     One LegQuotes is built per ticker per call and shared by every record,
     band and tier setting that holds the market, and no candle list is kept
     alive by it. A record whose markets lack candles (every hand-built
-    record) is left without the key, so its trades are valued at cost.
+    record) is left without the key, so its trades are valued at cost and
+    filled at the top of the book. The quotes also carry the depth model,
+    from which Pass 2 builds each trade's synthetic book.
     _simulate_at_discount's Pass 1b is the key's one reader. Called by
     _prepare_entries after its entry pass and by _sweep_from_candidates just
     before it releases the candles.
@@ -4989,6 +5264,8 @@ def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
             record may appear more than once.
         candles_by_ticker (dict): Ticker -> hourly candles, from _fetch_candles_parallel.
         start_date (date): The backtest's first trading date.
+        depth_model (DepthModel | None): The depth model; None means every
+            trade fills at the top of the book.
     """
     by_ticker: dict[str, LegQuotes | None] = {}
     by_pair: dict[tuple[str, str], dict] = {}
@@ -5002,7 +5279,7 @@ def _attach_leg_quotes(records: Iterable[dict], candles_by_ticker: dict,
                 ticker = m["ticker"]
                 if ticker not in by_ticker:
                     quotes, stale_days = _leg_quotes(m, candles_by_ticker.get(ticker) or [],
-                                                     start_date)
+                                                     start_date, depth_model)
                     by_ticker[ticker] = quotes
                     stale_legs += 1 if stale_days else 0
             if by_ticker[tickers[0]] is None or by_ticker[tickers[1]] is None:
@@ -5090,8 +5367,8 @@ def _find_entry(
         price-only); the legs are NO on market A (nA) and YES on market B (pB),
         and the entry requires pA − pB >= SAME_TITLE_MIN_PRICE_DIFF with the
         ceiling and fee check on (nA, pB).
-    In both cases the traded pair of prices comes from _leg_prices_for, and
-    both of them must be live [0.01, 0.99] quotes.
+    In both cases the two legs' top-of-the-book quotes come from
+    _leg_prices_for, and both of them must be live [0.01, 0.99] quotes.
 
     The BACKTEST-only spread band (spread_band, resolved through
     config.time_series_spread_band) narrows the time-series rule and nothing
@@ -5176,7 +5453,7 @@ def _find_entry(
             "gap_days" (int | None) for the first qualifying Monday, and
             "later" (tuple[dict, ...]). pA, pB, nA and nB are all four
             quotes of the canonicalized A and B (YES ask and NO ask of each),
-            of which _leg_prices_for picks the two that were actually traded.
+            of which _leg_prices_for picks the two legs' quotes.
             "gap_days" is the loop-invariant deadline gap the price tier and
             the MAX_DEADLINE_GAP_DAYS cutoff were applied on, carried out for
             reporting so a report cannot bucket a pair under a gap it was not
@@ -5451,8 +5728,8 @@ def _find_entry(
         if pair_type == "time_series" and time_series_spread_too_wide(gap, spread_max=band_hi):
             continue
 
-        # The two prices actually paid — (nA, pB) for same_title, (pA, nB) for
-        # time_series — via the module's single leg mapping
+        # The two legs' top-of-the-book quotes — (nA, pB) for same_title,
+        # (pA, nB) for time_series — via the module's single leg mapping
         price_a, price_b = _leg_prices_for(pair_type, pA, nA, pB, nB)
 
         # Both traded leg prices must be live (0.01–0.99) quotes — mirrors the
@@ -5705,7 +5982,7 @@ def _fetch_candles_parallel(
 
     Returns:
         dict[str, list[dict]]: Ticker -> candle list (keys: ts, yes_ask_close,
-        no_ask_close). Every key of needed_tickers is present; the value is an
+        no_ask_close, volume). Every key of needed_tickers is present; the value is an
         empty list for markets with no usable (missing or unparseable) close_time.
 
     Raises:
@@ -5759,7 +6036,8 @@ def _fetch_candles_parallel(
     if work:
         with ThreadPoolExecutor(max_workers=CANDLESTICK_FETCH_MAX_WORKERS) as pool:
             # Returns list[dict] with keys: ts (unix int), yes_ask_close (float),
-            # no_ask_close (float) — cached per ticker, so a second run is much faster
+            # no_ask_close (float), volume (float or None) — cached per ticker,
+            # so a second run is much faster
             futures = {
                 pool.submit(fetch_candlesticks, hist_client, ticker,
                             open_ts, close_ts, use_cache, **endpoint): ticker
@@ -5799,6 +6077,16 @@ def _fetch_candles_parallel(
             "(neither Kalshi's archive nor its live candlestick endpoint served them; "
             "never cached, so asked again next run)",
             empty, len(candles_by_ticker),
+        )
+    # Tickers whose every candle lacks a traded-volume count: one line, so a
+    # renamed API field shows up instead of passing as quiet markets.
+    with_candles = [series for series in candles_by_ticker.values() if series]
+    no_volume = sum(1 for series in with_candles
+                    if all(c.get("volume") is None for c in series))
+    if no_volume:
+        logging.info(
+            "Candlestick fetch: %d of %d tickers' candles carry no traded volume",
+            no_volume, len(with_candles),
         )
 
     return candles_by_ticker
@@ -7355,6 +7643,8 @@ def _prepare_entries(
     use_cache: bool,
     max_horizon_days: int | None,
     same_event_ladders: bool | None = None,
+    *,
+    depth_model: DepthModel | None = None,
 ) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
     """
     Run the half of the backtest that does not depend on the interval discount.
@@ -7388,6 +7678,9 @@ def _prepare_entries(
             _find_entry() call of the entry pass — load-bearing: the two must
             agree, or a pair this function proposes is replayed under the
             other rule's ordering.
+        depth_model (DepthModel | None): Keyword-only. The depth model the
+            entries' quotes carry, so their trades walk synthetic books; None
+            (default) fills every trade at the top of the book.
 
     Returns:
         tuple[list[dict] | None, OutcomeLabelCoverage | None]: The prepared
@@ -7441,12 +7734,200 @@ def _prepare_entries(
     # on, it is the tier rule alone.
     raw_entries = _entries_for_band(candidates, spread_band=None)
     # The prices that value each entry's trades at market while open, taken
-    # from the candles before they are released with this function's locals
-    _attach_leg_quotes(raw_entries, candidates.candles_by_ticker, candidates.start_date)
+    # from the candles before they are released with this function's locals,
+    # with the depth model their synthetic books are built from
+    _attach_leg_quotes(raw_entries, candidates.candles_by_ticker, candidates.start_date,
+                       depth_model)
 
     logging.info("Prepared %d candidate entries for sizing", len(raw_entries))
     _log_qualifying_mondays(raw_entries, None)
     return raw_entries, candidates.label_coverage
+
+
+# Why _size_trade refused a candidate whose walked book left no size worth buying
+_NO_SIZE_FITS = "no size fits"
+# Why _size_trade skipped a walked candidate the cash left cannot buy one
+# contract pair of (the book did not cause it, so it is counted apart)
+_NO_CASH = "no cash for one contract pair"
+
+
+def _cents(dollars: float) -> int:
+    """
+    Dollars as whole cents, rounded down, as the live sizer takes them.
+
+    Rounded to 6 decimals first (config.leg_cash_cents' idiom), so float
+    noise such as 0.29 * 100 = 28.999999999999996 never costs a cent; a real
+    fraction of a cent is dropped. The same rounding reads an amount a hair
+    under a whole cent (0.09999999999999998) as that cent.
+
+    Args:
+        dollars (float): An amount in dollars, at least 0 up to float noise
+            (a hair below 0 reads as 0).
+
+    Returns:
+        int: Whole cents.
+    """
+    return math.floor(round(dollars * 100, 6))
+
+
+def _debug_log(level: int, msg: str, *args: Any) -> None:
+    """
+    Log one of the live enrichment's lines at DEBUG, whatever its own level.
+
+    The backtest walks many books, so scanner._enrich_pair's lines are kept
+    out of the INFO log; level is the line's own level, unused.
+
+    Args:
+        level (int): The level the live run logs the line at.
+        msg (str): The message format.
+        *args (Any): Its arguments.
+    """
+    logging.debug(msg, *args)
+
+
+def _candidate_pair(c: dict, held: HeldPair | None, markets: dict) -> CandidatePair:
+    """
+    The live sizer's CandidatePair for one Pass 2 candidate, at that Monday's quotes.
+
+    Each market is built from its cached record by the live parser
+    (scanner._market_from_dict), once per record per simulation (`markets`),
+    so the live code reads each market's own close time and price grid. A
+    time-series pair carries the deadline gap _find_entry tiered it on as its
+    stated gap (scanner.pair_gap_days reads it), so the walk applies the same
+    tier.
+
+    Args:
+        c (dict): A Pass 2 candidate.
+        held (HeldPair | None): What an add-on adds to; None for a new pair.
+        markets (dict): id(market record) -> ApiMarket, the simulation's memo.
+
+    Returns:
+        CandidatePair: Tradeable, priced at the quotes, not yet walked.
+    """
+    built = []
+    for m in (c["mA"], c["mB"]):
+        market = markets.get(id(m))
+        if market is None:
+            market = markets[id(m)] = _market_from_dict(m, m.get("event_title") or "")
+        built.append(market)
+    gap = c["gap_days"]
+    stated = (gap if c["pair_type"] == "time_series" and type(gap) is int else None)
+    return CandidatePair(
+        market_a=built[0], market_b=built[1], pA=c["pA"], pB=c["pB"], nA=c["nA"],
+        nB=c["nB"], tradeable=True, canonical_title=str(c["canon"]),
+        pair_type=c["pair_type"], stated_gap_days=stated, held=held)
+
+
+def _books_for(c: dict, d: date) -> tuple[dict, dict] | None:
+    """
+    Both markets' synthetic books at the candidate's checkpoint, anchored at its quotes.
+
+    Market A's book starts at its YES ask pA and YES bid 1 - nA, market B's at
+    pB and 1 - nB, so the top of each book is the candle's own prices.
+
+    Args:
+        c (dict): A Pass 2 candidate.
+        d (date): Its checkpoint date.
+
+    Returns:
+        tuple[dict, dict] | None: (market A's book, market B's), or None when
+            either cannot be built (no quotes, no depth model, or no volume
+            data that Monday).
+    """
+    marks = c["marks"]
+    if marks is None:
+        return None
+    book_a = marks[0].book_at(d, c["pA"], 1.0 - c["nA"])
+    book_b = marks[1].book_at(d, c["pB"], 1.0 - c["nB"])
+    if book_a is None or book_b is None:
+        return None
+    return book_a, book_b
+
+
+def _size_trade(c: dict, d: date, checkpoint_value: float, cash: float,
+                settings: LiveSettings, held: HeldPair | None,
+                markets: dict) -> tuple[TradeSpec | None, str | None]:
+    """
+    Size one Pass 2 candidate as the live bot would.
+
+    With a synthetic book for both markets (_books_for), the live enrichment
+    (scanner._enrich_pair) prices the pair off it; then the live sizer
+    (strategy.compute_trade) picks the count, on the portfolio value and the
+    cash in whole cents, so a trade bets its Kelly share of the value but
+    never spends more than the cash. With no book it sizes at the candle
+    prices, the top of the book.
+
+    Args:
+        c (dict): A Pass 2 candidate.
+        d (date): Its checkpoint date.
+        checkpoint_value (float): The portfolio value at the checkpoint, in dollars.
+        cash (float): The cash left, in dollars.
+        settings (LiveSettings): The simulation's settings.
+        held (HeldPair | None): What an add-on adds to; None for a new pair.
+        markets (dict): The simulation's market memo (_candidate_pair).
+
+    Returns:
+        tuple[TradeSpec | None, str | None]: (the spec, None); (None, why)
+            when a walked book refused it (an ENRICH_* or SPREAD_* code, or
+            "no size fits"), or _NO_CASH when the cash left, not the book,
+            cannot buy one contract pair; (None, None) when the top of the
+            book had no size worth buying.
+    """
+    pair = _candidate_pair(c, held, markets)
+    value_cents, cash_cents = _cents(checkpoint_value), _cents(cash)
+    books = _books_for(c, d)
+    if books is not None:
+        # The live enrichment's own step, its lines at DEBUG
+        pair, refusal = _enrich_pair(pair, *books, value_cents, settings=settings,
+                                     cash_cents=cash_cents, log=_debug_log)
+        if not pair.tradeable:
+            # The cash left, not the book, cannot buy one contract pair (the
+            # test behind enrichment's "cash binds" note): counted apart from
+            # the book's refusals
+            if refusal == ENRICH_UNAFFORDABLE and _cash_binds(
+                    value_cents, max_kelly_fraction(pair.pair_type, settings), cash_cents):
+                return None, _NO_CASH
+            return None, refusal or ENRICH_UNPROFITABLE
+    # The live sizer, quiet: its "Trade computed" lines at DEBUG
+    spec = compute_trade(pair, value_cents, settings=settings, cash_cents=cash_cents, quiet=True)
+    if spec is None:
+        return None, (_NO_SIZE_FITS if books is not None else None)
+    return spec, None
+
+
+def _held_pair(c: dict, stake: float, trades: list[BacktestTrade],
+               lone_ticker: str | None) -> HeldPair:
+    """
+    What an add-on adds to, as the live sizer reads it.
+
+    compute_trade reads only its stake (stake_dollars), here the backtest's
+    own: the held pair's open trades at market plus the fees paid for them,
+    or a lone leg's alone.
+
+    Args:
+        c (dict): The add-on's candidate.
+        stake (float): The held stake, in dollars.
+        trades (list[BacktestTrade]): The held trades.
+        lone_ticker (str | None): The held market of a lone leg; None for an exact pair.
+
+    Returns:
+        HeldPair: Its sides (one for a lone leg), contracts held, what they
+            cost with their fees, and the stake.
+    """
+    sides = dict(zip((c["mA"]["ticker"], c["mB"]["ticker"]), leg_sides(c["pair_type"]),
+                     strict=True))
+    if lone_ticker is None:
+        held = sorted(sides.items())
+        cost = sum(t.total_cost + t.fees for t in trades)
+    else:
+        held = [(lone_ticker, sides[lone_ticker])]
+        # The held leg's own contracts and fee, in each trade
+        cost = 0.0
+        for t in trades:
+            price = _paid_prices(t)[0 if t.ticker_a == lone_ticker else 1]
+            cost += t.n * price + fee_leg_exact(t.n, price)
+    return HeldPair(sides=tuple(held), count=float(sum(t.n for t in trades)),
+                    cost_dollars=cost, value_dollars=stake, fees_dollars=0.0)
 
 
 def _lone_leg_records(open_legs: dict, active_tickers: set, market_a: dict,
@@ -7508,21 +7989,30 @@ def _simulate_at_discount(
     believes), and build the equity curve.
 
     Scores each entry's Mondays with the Kelly rule (the formula that sets how
-    much to bet), drops pairs with no usable pay-out, then walks the Mondays
-    in date order. Each trade bets a share of that Monday's opening portfolio
-    value (cash plus open trades at market, _open_value) but never spends
-    more than the cash left; a trade the cash cannot fully buy is shrunk to
-    fit. A time-series
+    much to bet) at the top of the book, drops pairs with no usable pay-out,
+    then walks the Mondays in date order. Each trade is sized by the live
+    code (_size_trade): with a depth model and volume data that Monday, the
+    live enrichment walks a synthetic order book and the live sizer
+    (strategy.compute_trade) picks the count; otherwise the sizer fills at
+    the candle prices. Either way a trade bets a share of that Monday's
+    opening portfolio value (cash plus open trades at market, _open_value)
+    but never spends more than the cash left, so a trade the cash cannot
+    fully buy is shrunk to fit. One config.LiveSettings per simulation, built
+    from the arguments, carries k, the caps, the band and the tier setting
+    to the live code. A time-series
     pair that cannot be taken is tried again on its next passing Monday; a
     same-title pair is not, and only the best one per title group is kept. At
     most one time-series pair is open per ladder (one question at several
     deadlines). The Kelly check runs before the pay-out checks, so keep that
     order: the count of impossible pay-outs covers only pairs that passed it.
 
-    spread_band, population and tier_floors only label the log lines and the
-    returned point. size_cap changes trade sizes, and so which trades find cash,
-    but never which Mondays pass the Kelly check or peak_kelly_fraction
-    (CapSweep relies on this).
+    spread_band and tier_floors must be the ones the entries were found
+    under: a walked book applies the live spread rule with them. population
+    only labels the log lines and the returned point. size_cap changes trade
+    sizes, and so which trades find cash, but never which Mondays pass the
+    Kelly check or peak_kelly_fraction (CapSweep relies on this); with a
+    walked book it also bounds the live search, which cap_free_from accounts
+    for.
 
     add_to_held lets the walk add to what it still holds, as live does, each
     add-on a new trade (BacktestTrade.add_on):
@@ -7538,9 +8028,10 @@ def _simulate_at_discount(
     held (open trades at market plus their fees; a lone leg alone,
     _open_leg_stake), so it never stakes more than a new pair would, and is
     skipped when that is already a full share. The cap reaches it only
-    through min(pair cap, f*), so peak_kelly_fraction still marks the cap
-    above which the walk is the same. Off by default: no add-on state is
-    kept and no add-on line is logged.
+    through min(pair cap, f*) (and, with a walked book, the live search's
+    bound), so cap_free_from still marks the cap above which the walk is
+    the same. Off by default: no add-on state is kept and no add-on line is
+    logged.
 
     sell_at sells a whole position before it pays out (None, the default,
     never sells, and the walk is then unchanged):
@@ -7551,13 +8042,15 @@ def _simulate_at_discount(
         that day's pay-outs and before its valuation, a position sells when
         its realized profit reaches sell_at of its potential profit
         (_sells_at). Realized profit is what selling returns
-        (_position_sale_value: each leg at the bid of the side it holds,
-        less the taker fee on the sale; a leg whose market has paid out, at
-        its payout) less its cost (contracts plus entry fees); potential
-        profit is its contract pairs at CONTRACT_PAYOUT_DOLLARS less that
-        cost;
-      * a position with no quotes, or with a leg still to pay out and no
-        fresh bid, is not sold at that checkpoint;
+        (_position_sale_value: each market's contracts sold down its modeled
+        bid ladder from the fresh bid of the side held, or at that bid with
+        no ladder, less the taker fee on the sale; a leg whose market has
+        paid out, at its payout) less its cost (contracts plus entry fees);
+        potential profit is its contract pairs at CONTRACT_PAYOUT_DOLLARS
+        less that cost;
+      * a position with no quotes, or with a market still to pay out and no
+        fresh bid or too few contracts on its ladder, is not sold at that
+        checkpoint;
       * each of its trades exits at the sale (_sold_copy), its markets and
         ladders are freed, and its pair may be bought again at a later
         checkpoint, never at the sale's (nor may a pair touching its markets
@@ -7565,19 +8058,20 @@ def _simulate_at_discount(
     A checkpoint with no candidate changes nothing unless a position sells
     there, so at a level no position reaches the walk is exactly the one
     that never sells (_highest_sale_level). The cap still reaches the walk
-    only through min(pair cap, f*), so CapSweep's reuse above
-    peak_kelly_fraction holds with selling on. With add_to_held as well, a
+    only through the sizes, so CapSweep's reuse above cap_free_from holds
+    with selling on. With add_to_held as well, a
     position not sold may still be added to; one sold at a checkpoint is not.
 
     Args:
         raw_entries (list[dict]): Prepared entries, one record per pair.
         start_date (date): First trading date of the window.
         initial_balance (float): Starting cash in dollars.
-        k (float | None): The interval discount, in [0, 1]; None means config.py's.
-        spread_band (tuple[float, float] | None): The band the entries were found under; a label.
+        k (float | None): The interval discount, in (0, 1]; None means config.py's.
+        spread_band (tuple[float, float] | None): The band the entries were found under.
         population (str): Which entries these are (e.g. "all", "time_series"); a label.
-        tier_floors (bool): Keyword-only. Whether the tier floors were applied; a label.
-        size_cap (float | None): Keyword-only. Per-trade cap in (0, 1]; None for BUDGET_FRACTION.
+        tier_floors (bool): Keyword-only. Whether the entries were found with the tier floors.
+        size_cap (float | None): Keyword-only. Per-trade cap in (0, 1] on the 5% grid;
+            None for BUDGET_FRACTION.
         quiet (bool): Keyword-only. True logs this run's lines at DEBUG.
         end_date (date | None): Keyword-only. Last day of the equity curve; None for today (UTC).
         add_to_held (bool): Keyword-only. Whether a pair still held may trade again (see
@@ -7589,20 +8083,22 @@ def _simulate_at_discount(
     Returns:
         SweepPoint: The trades and daily equity curve, stamped with the resolved
             k and size cap, the band, population, tier setting, the largest
-            Kelly fraction seen, whether it could add to held pairs and the
-            level it sold at.
+            Kelly fraction seen, whether it could add to held pairs, the
+            level it sold at and the cap it is the same at and above
+            (cap_free_from).
 
     Raises:
-        ValueError: For an unknown population, a bad spread band, a bad size cap
-            or a bad sell_at.
+        ValueError: For an unknown population, a bad spread band, a bad size
+            cap, a bad sell_at, or a k outside (0, 1].
         TypeError: For a spread band that is not a pair of numbers.
     """
     if population not in _SIMULATION_LABELS:
         raise ValueError(
             f"population must be one of {_SIMULATION_LABELS}, got {population!r}"
         )
-    # The band this run is LABELLED with. config.time_series_spread_band owns
-    # the default and the validation; resolving here (once, before the loop)
+    # The band the entries were found under; it goes into the live spread
+    # rule (the settings below). config.time_series_spread_band owns the
+    # default and the validation; resolving here (once, before the loop)
     # also means a bad band fails before any work rather than after it.
     band_lo, band_hi = time_series_spread_band(spread_band)
     # The discount actually in force, recorded on the result so no caller has
@@ -7615,6 +8111,13 @@ def _simulate_at_discount(
     st_cap = _resolve_same_title_size_cap()
     # The share of potential profit that sells a position (None: never sell)
     sell_level = _resolve_sell_at(sell_at)
+    # The live code's settings for this simulation: its k and caps, and the
+    # band and tier setting the entries were found under (validated here,
+    # before any entry is scored)
+    settings = LiveSettings(
+        tier_floors=tier_floors is not False, spread_band=(band_lo, band_hi),
+        interval_discount=effective_k, size_cap=cap, same_title_size_cap=st_cap,
+        categories=None, tags=None, add_to_held_pairs=bool(add_to_held))
 
     # ── Pass 1b: score the prepared entries and keep the tradeable ones ──
     candidates = []
@@ -7631,6 +8134,9 @@ def _simulate_at_discount(
     # SweepPoint.peak_kelly_fraction: the largest uncapped fraction over
     # every Monday a pair may be traded on
     peak_kelly = 0.0
+    # The pair types with a candidate whose Monday can walk a synthetic book,
+    # read off the candidates (never the trades the cap lets a walk reach)
+    walk_types: set[str] = set()
     # Same-title markets' ladder labels, worked out once per market
     same_title_ladders: dict[int, frozenset] = {}
 
@@ -7655,8 +8161,9 @@ def _simulate_at_discount(
             pA, pB, nA, nB = monday["pA"], monday["pB"], monday["nA"], monday["nB"]
             entry_date = monday["entry_date"]
 
-            # The two prices actually paid — (nA, pB) for same_title, (pA, nB) for
-            # time_series — the backtester's mirror of scanner.leg_prices
+            # The two legs' top-of-the-book quotes — (nA, pB) for same_title,
+            # (pA, nB) for time_series — the backtester's mirror of
+            # scanner.leg_prices; Pass 2 finds the prices actually paid
             price_a, price_b = _leg_prices_for(pair_type, pA, nA, pB, nB)
 
             # ── Kelly fraction (sizing happens in Pass 2 against the checkpoint) ──
@@ -7694,7 +8201,7 @@ def _simulate_at_discount(
             # value once the fee is counted on the losing side too (DR-62)
             kelly_f = (p - q / kelly_b_entry) if kelly_b_entry > 0 else -1.0
             if kelly_f > 0:
-                passing.append((monday, kelly_f, price_a, price_b, profit_ratio_entry))
+                passing.append((monday, kelly_f, profit_ratio_entry))
                 if pair_type != "time_series" and not add_to_held:
                     # A same-title pair is tried on its first passing Monday only
                     break
@@ -7712,7 +8219,7 @@ def _simulate_at_discount(
                                       if (row[0]["mA"]["ticker"], row[0]["mB"]["ticker"]) == legs]
         # Any passing Monday may be the one traded (or, for a same-title pair
         # adding to held pairs, added on)
-        peak_kelly = max(peak_kelly, *(kelly_f for _m, kelly_f, *_prices in passing))
+        peak_kelly = max(peak_kelly, *(kelly_f for _m, kelly_f, _ratio in passing))
         # config.pair_size_cap: the one definition live sizing caps through
         size_cap_for_pair = pair_size_cap(pair_type, cap, st_cap)
 
@@ -7787,7 +8294,7 @@ def _simulate_at_discount(
         marks = None if quotes is None else (quotes[mA["ticker"]], quotes[mB["ticker"]])
 
         # One candidate per passing Monday, priced and ranked on that Monday
-        for index, (monday, kelly_f, price_a, price_b, profit_ratio_entry) in enumerate(passing):
+        for index, (monday, kelly_f, profit_ratio_entry) in enumerate(passing):
             entry_date = monday["entry_date"]
             holding_days = max(1, (exit_date - entry_date).days)
 
@@ -7798,6 +8305,12 @@ def _simulate_at_discount(
             expected_days = max(1, (max(close_a_d, close_b_d) - entry_date).days)
             entry_monthly_ratio = profit_ratio_entry * 30.0 / expected_days
 
+            # Whether this Monday can walk a synthetic book (both markets
+            # have one there): decides cap_free_from below
+            if (marks is not None and marks[0].has_book_at(entry_date)
+                    and marks[1].has_book_at(entry_date)):
+                walk_types.add(pair_type)
+
             candidates.append({
                 "pair_type": pair_type,
                 "canon": canon,
@@ -7805,8 +8318,6 @@ def _simulate_at_discount(
                 "mA": mA, "mB": mB,
                 "pA": monday["pA"], "pB": monday["pB"],
                 "nA": monday["nA"], "nB": monday["nB"],
-                # Leg prices Pass 2 sizes, fees and pays out on
-                "price_a": price_a, "price_b": price_b,
                 "entry_date": entry_date,
                 "exit_date": exit_date,
                 "outcome_a": outcome_a,
@@ -7849,8 +8360,8 @@ def _simulate_at_discount(
         # DR-72 widens the named CAUSES beyond the single "mixed snapshot
         # family" guess this line used to make — see the cause list below,
         # and CLAUDE.md's strategy-change gotcha for what each one means.
-        # A tier-floors-off simulation (a label, like the band — its entries
-        # were detected with the deadline-gap tiers not applied) appends
+        # A tier-floors-off simulation (its entries were found with the
+        # deadline-gap tiers not applied) appends
         # " [tier floors off]", so a count from that backtest-only family is
         # never read as one from the run's tier-on scenarios; the tier-on
         # text is unchanged.
@@ -7873,6 +8384,14 @@ def _simulate_at_discount(
             premise_violations,
             " [tier floors off]" if tier_floors is False else "",
         )
+
+    # The cap at and above which no trade here depends on the cap. A walked
+    # book is also averaged only as deep as config.max_kelly_fraction allows,
+    # which stops moving once the cap reaches the pair type's own ceiling
+    # (its value with no per-trade cap)
+    uncapped = replace(settings, size_cap=1.0)
+    cap_free_from = max([peak_kelly, *(max_kelly_fraction(pair_type, uncapped)
+                                       for pair_type in sorted(walk_types))])
 
     # Keep only the best same-title candidate per title group, as the live
     # finders keep one pair per group; this ranks by expected monthly return
@@ -7916,11 +8435,12 @@ def _simulate_at_discount(
     # ── Pass 2: chronological cash-constrained greedy selection ───────────────
     # Walk the candidates in date order with a running cash balance. Each date
     # is one checkpoint (the Monday-morning moment trades are entered, like one
-    # live run). A candidate's budget is a share of the checkpoint's opening
-    # portfolio value (cash after that day's pay-outs plus every open trade at
-    # market, _open_value), never more than the cash left (config.kelly_budget,
-    # as live). A candidate the cash cannot fully buy is shrunk to fit, and
-    # skipped if not one contract pair fits or a win no longer pays after fees.
+    # live run). Each candidate is sized by the live code (_size_trade): a
+    # share of the checkpoint's opening portfolio value (cash after that day's
+    # pay-outs plus every open trade at market, _open_value), never more than
+    # the cash left, walking a synthetic book when one can be built. A
+    # candidate the cash cannot fully buy is shrunk to fit, and skipped if
+    # not one contract pair fits or a win no longer pays after fees.
     #
     # Unlike a live run, an open trade is valued at the ask of the side each
     # leg holds (live reads Kalshi's own value of the positions), no extra
@@ -7972,6 +8492,13 @@ def _simulate_at_discount(
     sold_here: set[str] = set()
     sold_pairs: set[int] = set()
     positions_sold = bought_again = 0
+    # The live code's market objects, built once per record (_candidate_pair),
+    # trades filled at the top of the book, walked books' refusals by reason,
+    # and walked candidates the cash left could not buy one contract pair of
+    markets: dict[int, Any] = {}
+    top_of_book = 0
+    walk_refusals: Counter = Counter()
+    cash_skips = 0
 
     def release(d: date) -> None:
         """
@@ -8175,11 +8702,9 @@ def _simulate_at_discount(
             ladder_refusals += 1
             continue
 
-        # The traded leg prices (see _leg_prices_for) — every dollar figure
-        # below is computed on these, never on the reporting-only quotes
-        price_a, price_b = c["price_a"], c["price_b"]
-
         fraction = c["kelly_f_capped"]
+        # What an add-on adds to, as the live sizer reads it (None: a new pair)
+        held_pair = None
         if held is not None or lone_legs is not None:
             if lone_legs is not None:
                 # A lone leg's stake: that one leg, at market plus its fee, in
@@ -8198,44 +8723,46 @@ def _simulate_at_discount(
                     stake += paid + (_open_value(held_trade, d) - held_trade.total_cost)
             # Kelly sizes the whole position: buy what the pair is missing of
             # its Kelly share of the portfolio value (config.held_pair_fraction,
-            # the live sizer's own rule); the budget below also keeps it within
-            # the cash, so it never stakes more than a new pair would
+            # the live sizer's own rule). Checked here, at the top of the book,
+            # so a pair already at its share is counted on its own line
             fraction = held_pair_fraction(fraction, stake, checkpoint_value)
             if fraction <= 0:
                 add_on_cap_skips += 1
                 continue
+            held_pair = (_held_pair(c, stake, [t for t, _paid in held["trades"]], None)
+                         if lone_legs is None else
+                         _held_pair(c, stake, [leg["trade"] for leg in lone_legs],
+                                    lone_legs[0]["ticker"]))
 
-        # Budget: a share of the portfolio value, never more than the cash left (as live)
-        budget = kelly_budget(checkpoint_value, fraction, cash)
-        n = int(budget / (price_a + price_b))
-        if n < 1:
-            # The budget can't buy one contract pair — skipped live too
+        # Sized by the live code: a share of the portfolio value, never more
+        # than the cash left, over a walked synthetic book when there is one
+        spec, refusal = _size_trade(c, d, checkpoint_value, cash, settings, held_pair, markets)
+        if spec is None:
+            if refusal == _NO_CASH:
+                cash_skips += 1
+            elif refusal is not None:
+                walk_refusals[refusal] += 1
             continue
-
-        # Lower n until contracts plus exact fees fit the budget, as live compute_trade
-        # does; this is also what shrinks a trade to the cash left
-        fee_a, fee_b = fee_leg_exact(n, price_a), fee_leg_exact(n, price_b)
-        while n > 0 and n * (price_a + price_b) + fee_a + fee_b > budget:
-            n -= 1
-            fee_a, fee_b = fee_leg_exact(n, price_a), fee_leg_exact(n, price_b)
-        if n < 1:
-            # Fees ate the whole budget — no contract count fits
-            continue
-
-        total_cost = n * (price_a + price_b)
+        n = spec.x
+        # The average price each leg pays, the fees there and the cash spent
+        # (the spec's own figures); every dollar figure below reads these
+        fill_a, fill_b = leg_prices(spec.pair)
+        walked = len(spec.pair.depth_levels) > 0
+        fee_a, fee_b = fee_leg_exact(n, fill_a), fee_leg_exact(n, fill_b)
+        total_cost = spec.total_cost
         # Exact ceiling-rounded taker fees for both legs, charged at entry
         fees = fee_a + fee_b
-        # Cash spent, summed in the fee loop's order so it equals what fitted the budget
-        invested = total_cost + fee_a + fee_b
+        invested = spec.total_cost_with_fees
         # Win-scenario NET profit after exact fees (same_title: the floor every
         # co-resolution outcome clears; time_series: the profit of either win
-        # cell) — reject if the ceiling rounding ate the margin (mirrors live
-        # compute_trade's min_payoff gate)
-        expected_payoff = n * (1.0 - price_a - price_b) - fees
+        # cell); the sizer already refused a trade whose fees ate it
+        expected_payoff = n * (1.0 - fill_a - fill_b) - fees
         if expected_payoff <= 0:
             continue
-        # Safety check only: a trade that fits the budget always fits the cash
-        if invested > cash:
+        # Safety check only: the sizer never spends more than the cash it was
+        # handed, in whole cents (a float cash a hair below a cent reads as
+        # that cent, as live's cash does)
+        if invested > _cents(cash) / 100.0:
             continue
 
         # Realized P&L from the settlement outcomes — n per leg whose market
@@ -8280,9 +8807,9 @@ def _simulate_at_discount(
             profit=profit,
             profit_ratio=profit_ratio,
             monthly_profit_ratio=monthly_profit_ratio,
-            # The capped Kelly fraction; on an add-on, the share of the
-            # portfolio value held_pair_fraction allowed
-            kelly_fraction=fraction,
+            # The capped Kelly fraction the sizer sized at; on an add-on, the
+            # share of the portfolio value held_pair_fraction allowed
+            kelly_fraction=spec.kelly_fraction,
             expected_payoff=expected_payoff,
             slippage=slippage,
             holding_days=c["holding_days"],
@@ -8298,8 +8825,13 @@ def _simulate_at_discount(
             settled_date_b=c["settled_date_b"],
             add_on=held is not None or lone_legs is not None,
             marks=c["marks"],
+            fill_price_a=fill_a,
+            fill_price_b=fill_b,
+            book_walked=walked,
         )
         trades.append(trade)
+        if not walked:
+            top_of_book += 1
 
         # Cash out the door: contracts plus fees; the receipt comes back at exit
         cash -= invested
@@ -8425,6 +8957,27 @@ def _simulate_at_discount(
             "Pairs bought again after a sale (%s): %d",
             run_label, bought_again,
         )
+    # How trades were sized: at the top of the book (no depth model, or no
+    # volume data for a leg that Monday), walked books' refusals by reason,
+    # and walked candidates skipped for want of cash (each silent at zero)
+    if top_of_book:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Trades sized at the top of the book (no depth data) (%s): %d",
+            run_label, top_of_book,
+        )
+    for reason in sorted(walk_refusals):
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Trades refused when their book was walked (%s) (%s): %d",
+            reason, run_label, walk_refusals[reason],
+        )
+    if cash_skips:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Trades skipped with no cash left for one contract pair (%s): %d",
+            run_label, cash_skips,
+        )
     logging.log(
         logging.DEBUG if quiet else logging.INFO,
         "Backtest complete at %s: %d trades, %d profitable",
@@ -8442,10 +8995,11 @@ def _simulate_at_discount(
         # stamp the same scenario; None stays None ("given no band").
         spread_band=None if spread_band is None else (band_lo, band_hi),
         population=population,
-        # A label, like the band: only an explicit False marks a tier-off point
+        # Only an explicit False marks a tier-off point
         tier_floors=tier_floors is not False,
         size_cap=cap, peak_kelly_fraction=peak_kelly,
         add_to_held=bool(add_to_held), sell_at=sell_level,
+        cap_free_from=cap_free_from,
     )
 
 
@@ -9028,16 +9582,16 @@ def _half_split(
         initial_balance (float): The balance EACH half starts from, in dollars
             — the halves are two independent runs, never one run's two parts.
         k (float): The scenario's resolved interval discount.
-        band (tuple[float, float]): The scenario's resolved band (a label for
-            the completion lines; the entries already reflect it).
+        band (tuple[float, float]): The scenario's resolved band, the one its
+            entries were found under; it goes into the live spread rule.
         population (str): The checked population the halves belong to —
             "all" (default) or "time_series" — which names the two runs
             "<population>/H1" and "<population>/H2" on their completion lines,
             so the two populations' split-half runs never share a prefix.
-        tier_floors (bool): Keyword-only. The scenario's tier-floor setting
-            (a label, like band — the entries already reflect it), handed to
-            both halves' simulations so a tier-off scenario's halves are
-            named as tier-off runs.
+        tier_floors (bool): Keyword-only. The scenario's tier-floor setting,
+            the one its entries were found under, handed to both halves'
+            simulations (it goes into the live spread rule, and names a
+            tier-off scenario's halves as tier-off runs).
         size_cap (float | None): Keyword-only. The scenario's per-trade size
             cap; None (default) or BUDGET_FRACTION for the run's own.
         quiet (bool): Keyword-only. Log both halves' completion lines (and
@@ -9106,9 +9660,11 @@ def _ex_top_event(
         entries (list[dict]): The entries that point was simulated from.
         start_date (date): The backtest's start date.
         initial_balance (float): The balance the re-run starts from.
-        band (tuple[float, float]): The scenario's band (a label).
+        band (tuple[float, float]): The scenario's band, the one its entries
+            were found under.
         population (str): The point's population, used to name the re-run's log line.
-        tier_floors (bool): Keyword-only. The point's tier-floor setting (a label).
+        tier_floors (bool): Keyword-only. The point's tier-floor setting, the
+            one its entries were found under.
         quiet (bool): Keyword-only. Log the re-run's lines at DEBUG.
         end_date (date | None): Keyword-only. Last day of the re-run's equity curve; None for today.
 
@@ -9249,10 +9805,10 @@ def _band_sweep_cell(
         initial_balance (float): The balance every simulation here starts
             from, in dollars.
         point_k (float): The cell's resolved interval discount.
-        band (tuple[float, float]): The cell's resolved band (a label; the
-            entries already reflect it).
-        tier_floors (bool): Keyword-only. The cell's tier-floor setting (a
-            label; the entries already reflect it), handed to every
+        band (tuple[float, float]): The cell's resolved band, the one its
+            entries were found under; it goes into the live spread rule.
+        tier_floors (bool): Keyword-only. The cell's tier-floor setting, the
+            one its entries were found under, handed to every
             simulation here through _sim_options — so only an explicit False
             is ever forwarded. The tier-on sweep never passes it.
 
@@ -9301,6 +9857,7 @@ def _sweep_from_candidates(
     add_on_sweep: bool = False,
     sell_sweep: bool = False,
     live: LiveSettings | None | object = _LIVE_NOT_READ,
+    depth_model: DepthModel | None = None,
 ) -> BacktestSweep:
     """
     Run every entry pass and every simulation of one backtest over one fetch.
@@ -9427,7 +9984,7 @@ def _sweep_from_candidates(
             Phase 1, so one _Candidates feeds one sweep.
         initial_balance (float): Simulated starting cash balance in dollars;
             every scenario, half and re-simulation starts from it.
-        interval_discount (float | None): The primary k, in [0, 1]. None means
+        interval_discount (float | None): The primary k, in (0, 1]. None means
             no override, which config.time_series_profit_prob resolves to
             TIME_SERIES_INTERVAL_PROB_DISCOUNT.
         sweep (bool): When True, every band is simulated at every k of
@@ -9470,6 +10027,9 @@ def _sweep_from_candidates(
         live (LiveSettings | None): Keyword-only. run_backtest_sweep's read of
             the saved live defaults (None: none saved, or the file refused);
             left out, read here.
+        depth_model (DepthModel | None): Keyword-only. The depth model every
+            entry's quotes carry, so every simulation's trades walk synthetic
+            books; None (default) fills every trade at the top of the book.
 
     Returns:
         BacktestSweep: primary, points (the primary band's k sweep),
@@ -9481,7 +10041,8 @@ def _sweep_from_candidates(
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
             cap_sweep, tier_off_cap_sweep, add_on_cap_sweep,
             add_on_tier_off_cap_sweep, same_title_size_cap, the nine live_*
-            fields, entry_checkpoint and sell_sweep — see BacktestSweep.
+            fields, entry_checkpoint, sell_sweep and depth_model — see
+            BacktestSweep.
 
     Raises:
         ValueError: If tier_off_sweep is set without band_sweep (the tier-off
@@ -9638,12 +10199,13 @@ def _sweep_from_candidates(
             _log_qualifying_mondays(tier_off_entries[band], band, tier_floors=False)
     # The prices that value every entry's trades at market while open (every
     # band's records, tier floors on and off; the same-title records sit in
-    # each band's list), taken from the candles before they are released.
-    # Each market's LegQuotes is shared by every record that holds it.
+    # each band's list), taken from the candles before they are released,
+    # with the depth model their synthetic books are built from. Each
+    # market's LegQuotes is shared by every record that holds it.
     _attach_leg_quotes(
         [rec for entries in (*entries_by_band.values(), *tier_off_entries.values())
          for rec in entries],
-        candidates.candles_by_ticker, candidates.start_date)
+        candidates.candles_by_ticker, candidates.start_date, depth_model)
     # Nothing below reads a candle or the pair list. Releasing both here keeps
     # the peak at a single-band run's entry-pass peak and, like the
     # single-band path (whose pair list dies with _prepare_entries' locals),
@@ -9975,6 +10537,8 @@ def _sweep_from_candidates(
         # For the dashboard header: the schedule every entry pass scanned at
         entry_checkpoint=SCHEDULED_RUN.label(),
         sell_sweep=sold,
+        # Where every trade's synthetic book came from, for the page's header
+        depth_model=depth_model,
     )
 
 
@@ -9994,6 +10558,8 @@ def run_backtest_sweep(
     cap_sweep: bool = False,
     add_on_sweep: bool = False,
     sell_sweep: bool = False,
+    *,
+    depth_model: DepthModel | None = None,
 ) -> BacktestSweep:
     """
     Replay both pair strategies at one interval discount, or at a grid of them —
@@ -10082,7 +10648,7 @@ def run_backtest_sweep(
             straight through to _prepare_candidates(), which carries it to
             every entry pass. None applies no cap.
         interval_discount (float | None): Interval discount for the primary
-            point, in [0, 1]. None (default) means "no override", which
+            point, in (0, 1]. None (default) means "no override", which
             resolves to config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (config.py's
             k, not necessarily the saved live defaults' k live sizing reads).
         sweep (bool): When True (default), also simulate every discount in
@@ -10151,6 +10717,11 @@ def run_backtest_sweep(
             The flag adds no simulation to the run itself. False (default)
             returns None, as does the infeasible window. Backtest-only: live
             trading never sells.
+        depth_model (DepthModel | None): Keyword-only. The depth model every
+            trade's synthetic order book is built from
+            (depth_model.load_depth_model()); None (default) fills every trade
+            at the top of the book. Recorded on BacktestSweep.depth_model and
+            named on one log line.
 
     Returns:
         BacktestSweep: primary (the effective-discount, primary-band result),
@@ -10166,13 +10737,14 @@ def run_backtest_sweep(
             tier_off_sweep, the lazy cap_sweep and tier_off_cap_sweep, the
             lazy add-on family (add_on_cap_sweep and
             add_on_tier_off_cap_sweep), same_title_size_cap, the live_*
-            fields, entry_checkpoint and the lazy sell_sweep — see
-            BacktestSweep.
+            fields, entry_checkpoint, the lazy sell_sweep and depth_model —
+            see BacktestSweep.
 
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
-            without band_sweep, if this module's SAME_TITLE_SIZE_CAP is not a
-            number in (0, 1], or if spread_band is not a valid band; and,
+            without band_sweep, if interval_discount is not a number in
+            (0, 1], if this module's SAME_TITLE_SIZE_CAP is not on the 5%
+            grid in (0, 1], or if spread_band is not a valid band; and,
             before any fetch, from _prepare_candidates() when SCHEDULED_RUN
             cannot place the entry checkpoints (a configuration error).
         TypeError: From config.time_series_spread_band, before any fetch, if
@@ -10212,6 +10784,13 @@ def run_backtest_sweep(
                          "re-runs the band sweep's binding bands")
     # The same for the extra same-title cap: refused here, not after the fetch
     same_title_cap = _resolve_same_title_size_cap()
+    # And for k: every simulation hands it to the live sizer, whose
+    # LiveSettings takes only a k in (0, 1]
+    if interval_discount is not None and (
+            isinstance(interval_discount, bool)
+            or not isinstance(interval_discount, numbers.Real)
+            or not 0.0 < interval_discount <= 1.0):
+        raise ValueError(f"interval_discount (k) must be in (0, 1], got {interval_discount!r}")
 
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
@@ -10292,6 +10871,14 @@ def run_backtest_sweep(
         "on — the dashboard's Sell select is simulated when the dashboard is built"
         if sell_sweep else "off — the dashboard's Sell select stays disabled",
     )
+    # And the depth model this run builds every trade's synthetic book from
+    # (load_depth_model's own line says it was loaded)
+    if depth_model is None:
+        logging.info("Depth model: none — every trade fills at the top of the book")
+    else:
+        logging.info("Depth model: %d snapshot(s), %d ladders, taken %s to %s",
+                     depth_model.snapshots, depth_model.ladders,
+                     depth_model.first_taken or "unknown", depth_model.last_taken or "unknown")
     # The saved live defaults (never main.py's per-run overrides), read ONCE
     # before the fetch, so a refused file warns at the top of the run
     live = _live_settings_for_report()
@@ -10328,6 +10915,7 @@ def run_backtest_sweep(
                                same_title_size_cap=same_title_cap,
                                # For the dashboard header (config.ScheduledRun.label)
                                entry_checkpoint=SCHEDULED_RUN.label(),
+                               depth_model=depth_model,
                                **_live_rule_fields(live))
     else:
         # Every entry pass and simulation. It deletes the candles and pair list
@@ -10338,6 +10926,7 @@ def run_backtest_sweep(
             spread_band=primary_band, band_sweep=band_sweep,
             tier_off_sweep=tier_off_sweep, cap_sweep=cap_sweep,
             add_on_sweep=add_on_sweep, sell_sweep=sell_sweep, live=live,
+            depth_model=depth_model,
         )
     # On every path, "none recorded" included, so the report never omits it
     logging.info("%s", _live_rule_line(result))
@@ -10353,8 +10942,8 @@ def _open_value_path(trade: BacktestTrade) -> np.ndarray | None:
     One value per UTC day from the entry day to the day before its pay-out
     day, each n x (the day-end value of each leg): the latest usable ask of
     the side it holds at that day's end, its payout once its market has paid
-    out, or its entry price before that side has had any usable ask
-    (LegQuotes.day_values). _carry_steps and
+    out, or the price it paid (_paid_prices) before that side has had any
+    usable ask (LegQuotes.day_values). _carry_steps and
     _value_steps are built from it, so the equity curve, the dashboard's
     per-type lines and its risk-free hurdle all read the same path.
 
@@ -10371,10 +10960,9 @@ def _open_value_path(trade: BacktestTrade) -> np.ndarray | None:
     if held_days <= 0:
         return None
     quotes_a, quotes_b = trade.marks
-    # Which side each leg holds (scanner.leg_sides) and what it cost
+    # Which side each leg holds (scanner.leg_sides) and what it paid
     side_a, side_b = leg_sides(trade.pair_type)
-    price_a, price_b = _leg_prices_for(trade.pair_type, trade.entry_pA, trade.entry_nA,
-                                       trade.entry_pB, trade.entry_nB)
+    price_a, price_b = _paid_prices(trade)
     last = trade.exit_date - timedelta(days=1)
     return trade.n * (quotes_a.day_values(trade.entry_date, last, side_a, price_a)
                       + quotes_b.day_values(trade.entry_date, last, side_b, price_b))
@@ -10467,7 +11055,7 @@ def _build_equity_curve(
     is valued AT MARKET: each leg at the latest usable ask of the side it
     holds at the end of the day (on a candle ending at or before the next UTC
     midnight; LegQuotes), at its payout once its market has paid out, and at
-    its entry price before that side has had any usable ask — the same
+    the price it paid before that side has had any usable ask — the same
     valuation Pass 2 sizes on, read at the
     day's end rather than at the checkpoint (_open_value_path, through
     _carry_steps). A trade with no quotes (trade.marks is None, every

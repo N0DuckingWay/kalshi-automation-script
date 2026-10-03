@@ -140,6 +140,7 @@ import base64
 import gzip
 import json
 import logging
+import math
 import tempfile
 import threading
 import time
@@ -159,6 +160,7 @@ from .auth import build_client
 from .config import (
     ARCHIVE_FIRST_CREATED_DATE,
     ARCHIVE_MAX_BARREN_PAGES,
+    CANDLESTICK_CACHE_FIELDS_VERSION,
     CANDLESTICK_MAX_CANDLES_PER_REQUEST,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
@@ -5644,6 +5646,39 @@ def _candle_close(side: dict) -> float | None:
     return None
 
 
+def _candle_count(candle: dict) -> float | None:
+    """
+    Read the contracts traded in one candle's hour.
+
+    Takes the fixed-point "volume_fp" when the candle has it, else "volume"
+    (a number or a numeric string). A value that is present but unreadable is
+    not replaced by the other key.
+
+    Args:
+        candle (dict): One raw candle from the API.
+
+    Returns:
+        float | None: A finite count of zero or more. None when the candle has
+            neither key, or the value is not a readable non-negative number.
+            Never raises.
+    """
+    if not isinstance(candle, dict):
+        return None
+    for key in ("volume_fp", "volume"):
+        raw = candle.get(key)
+        if raw is None or raw == "":
+            continue
+        if isinstance(raw, bool):
+            return None
+        try:
+            count = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        # "+ 0.0" turns a negative zero ("-0") into a plain 0.0
+        return count + 0.0 if math.isfinite(count) and count >= 0 else None
+    return None
+
+
 def _candle_request_windows(open_ts: int, close_ts: int) -> list[tuple[int, int]]:
     """
     Split one candlestick window into requests the endpoint will serve.
@@ -5777,8 +5812,8 @@ def _fetch_candle_pages(client: Any, path: str, windows: list[tuple[int, int]],
 
     Returns:
         tuple[list[dict], int, int]: The parsed candles ("ts", "yes_ask_close",
-            "no_ask_close"), how many raw candles came back and how many of
-            them could not be parsed.
+            "no_ask_close", "volume"), how many raw candles came back and how
+            many of them could not be parsed.
 
     Raises:
         Exception: Whatever a request raises (an ApiException carries .status).
@@ -5823,6 +5858,8 @@ def _fetch_candle_pages(client: Any, path: str, windows: list[tuple[int, int]],
                     "ts": c["end_period_ts"],
                     "yes_ask_close": yes_ask,
                     "no_ask_close": max(0.01, min(0.99, no_ask)),
+                    # Contracts traded in this hour; None when not readable
+                    "volume": _candle_count(c),
                 })
             except (ValueError, TypeError, AttributeError, KeyError):
                 dropped += 1
@@ -5886,16 +5923,19 @@ def fetch_candlesticks(
     later run.
 
     Results are cached per ticker in backtest_cache/candlesticks/<ticker>.json,
-    tagged with the [open_ts, close_ts] window and period_interval that were
-    actually fetched — the whole window as one entry, however many requests it
-    took. A cache hit requires the cached window to COVER the
+    tagged with the [open_ts, close_ts] window, the period_interval and the
+    fields version (CANDLESTICK_CACHE_FIELDS_VERSION) that were actually
+    fetched — the whole window as one entry, however many requests it took. A
+    cache hit requires the cached window to COVER the
     requested window AND the cached period_interval to match the current
     CANDLESTICK_PERIOD_INTERVAL_MINUTES — open_ts varies between backtest runs
     with different --start-date values, so a cache built for a later start_date
     must not be reused for an earlier one (it would be silently missing the
     earlier candles), and a cache built under a different granularity (e.g. an
     older daily-interval cache) must not be silently reused as if it were
-    hourly. Only successful fetches are cached; a fetch failure returns []
+    hourly. It also requires the cached fields version to match the current
+    one, so a file written before a candle field was added is fetched again.
+    Only successful fetches are cached; a fetch failure returns []
     WITHOUT persisting it, so the ticker is retried on the next run (a cached
     empty file would otherwise silence it forever). Pre-existing empty cache
     files are honored only while younger than _EMPTY_CANDLE_TTL_SECONDS.
@@ -5924,8 +5964,11 @@ def fetch_candlesticks(
             - "ts" (int): Unix timestamp of the candle's end period.
             - "yes_ask_close" (float): YES ask price at close. Range: [0.01, 0.99].
             - "no_ask_close" (float): Approximated NO ask price at close (1 − yes_bid_close).
-              Clamped to [0.01, 0.99]. Returns an empty list on API failure,
-              including a failure of any one request of a paged window.
+              Clamped to [0.01, 0.99].
+            - "volume" (float | None): Contracts traded in the candle's hour;
+              None when the API gave no readable count.
+            Returns an empty list on API failure, including a failure of any
+            one request of a paged window.
     """
     _CANDLES_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = _CANDLES_DIR / f"{ticker}.json"
@@ -5935,13 +5978,14 @@ def fetch_candlesticks(
         # through to a refetch instead of raising out of the worker thread.
         cached = _load_json_cache(cache_path)
         # Legacy cache files are a bare list with no window metadata (or predate
-        # the period_interval tag) — we can't confirm what range/granularity
-        # they cover, so fall through and refetch. The refetch below re-saves
-        # in the current tagged format, migrating it.
+        # the period_interval or fields tag) — we can't confirm what
+        # range/granularity/fields they cover, so fall through and refetch. The
+        # refetch below re-saves in the current tagged format, migrating it.
         if isinstance(cached, dict) and cached.get("open_ts", None) is not None:
             covers_window = (
                 cached["open_ts"] <= open_ts and cached["close_ts"] >= close_ts
                 and cached.get("period_interval") == CANDLESTICK_PERIOD_INTERVAL_MINUTES
+                and cached.get("fields") == CANDLESTICK_CACHE_FIELDS_VERSION
             )
             candles = cached.get("candles", [])
             if covers_window:
@@ -5988,17 +6032,19 @@ def fetch_candlesticks(
             # otherwise cached as if it were complete with no visible signal.
             logging.warning("%s: dropped %d/%d malformed candles",
                             ticker, dropped, raw_count)
-        # Only successful fetches are cached (tagged with the window and
-        # granularity just fetched); failures fall through the except branch
-        # and return [] without persisting so the next run retries. Saved
-        # unconditionally — use_cache only controls whether reads may come
-        # from disk, mirroring fetch_all_settled_markets — otherwise a
+        # Only successful fetches are cached (tagged with the window,
+        # granularity and fields version just fetched); failures fall
+        # through the except branch and return [] without persisting so the
+        # next run retries.
+        # Saved unconditionally — use_cache only controls whether reads may
+        # come from disk, mirroring fetch_all_settled_markets — otherwise a
         # --no-cache run would never actually refresh the file the next
         # default run loads. Which endpoint served the candles is not
         # recorded: the candles are the same market's either way.
         _save_json_cache(cache_path, {
             "open_ts": open_ts, "close_ts": close_ts,
             "period_interval": CANDLESTICK_PERIOD_INTERVAL_MINUTES,
+            "fields": CANDLESTICK_CACHE_FIELDS_VERSION,
             "candles": candles,
         })
         return candles
