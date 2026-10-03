@@ -316,7 +316,13 @@ class TestBidLadder:
 
     @pytest.mark.parametrize("best", [0.0, 0.009, 0.991, 1.0, -0.5, float("nan"), None, "x"])
     def test_empty_when_the_best_bid_is_outside_the_range(self, best):
+        assert not depth_model.can_start_at(best)
         assert depth_model.bid_ladder(_model(self.ROW), best, 5) == []
+
+    @pytest.mark.parametrize("best", [0.01, 0.0100004, 0.5, 1 - 0.8, 0.99, 0.9900004])
+    def test_can_start_at_every_bid_it_builds_a_ladder_at(self, best):
+        assert depth_model.can_start_at(best)
+        assert depth_model.bid_ladder(_model(self.ROW), best, 5)
 
     def test_empty_without_a_volume(self):
         assert depth_model.bid_ladder(_model(self.ROW), 0.5, None) == []

@@ -5155,10 +5155,10 @@ def _trade_row(t: BacktestTrade, color: str) -> str:
     from scanner.leg_sides and the prices from backtester._leg_prices_for, the
     same single sources the simulation priced and paid out with.
 
-    The row is its two halves joined, _trade_row_head (everything that does
-    not depend on the trade's size) and _trade_row_tail (the size cells), so
-    the page-wide filter can ship each head once for every size-cap scenario
-    that trades it and still show exactly this row.
+    The row is its two halves joined, _trade_row_head (everything but the
+    size cells) and _trade_row_tail (the size cells), so the page-wide filter
+    can ship each distinct head once, for every scenario that shows it, and
+    still show exactly this row.
 
     Args:
         t (BacktestTrade): Trade to display.
@@ -5178,16 +5178,18 @@ _TRADE_CELL = "<td style='padding:4px 8px;vertical-align:top;'>"
 
 def _trade_row_head(t: BacktestTrade, color: str) -> str:
     """
-    Render the size-independent half of a best/worst-trade row.
+    Render the first half of a best/worst-trade row: everything but the size cells.
 
     Everything from the <tr> through the outcome cell: the entry date, the
     pair type, the prices paid, each leg's side, market and close date, and
     how each leg settled — for a trade sold before it paid out (a Sell
     level), each leg's sale day and price, or its payout when its market paid
-    out before the sale, beside how it settled. None of it depends on how many contracts were
-    bought, so every size-cap scenario that traded this pair on this entry
-    date shows the same head — which is why the filter payload stores heads
-    once, in a table shared by every chunk (_ChunkVisitor).
+    out before the sale, beside how it settled. It holds no contract count,
+    cost or profit, so size-cap scenarios that traded this pair on this entry
+    date usually show the same head; a sale price walked down a modeled bid
+    ladder is an average over the position's size, so a sold trade's head can
+    differ between them. The filter payload stores each distinct head once,
+    in a table shared by every chunk (_ChunkVisitor).
 
     Args:
         t (BacktestTrade): Trade to display.
@@ -8231,9 +8233,9 @@ class _ChunkVisitor:
     fraction trades the same list. The primary scenario's chunk is built from
     the page's own trades and curve, first, so it is chunk 0 and its views
     are exactly what the sections render. Trade-table rows are split
-    (_trade_row_head / _trade_row_tail): the heads, which do not depend on a
-    trade's size, go in one table shared by every chunk (heads, shipped in the
-    base block), the tails in the chunk's own strings.
+    (_trade_row_head / _trade_row_tail): the heads, which hold no contract
+    count, go in one table shared by every chunk (heads, shipped in the base
+    block, each distinct head once), the tails in the chunk's own strings.
 
     A tier-floors-off cell the walk hands to `off` is packed the same way
     (never substituting the page's own trades: it is its own run) and filed
@@ -9715,9 +9717,8 @@ def _list_payload(
         strings (_StringTable): Where this list's HTML fragments are stored
             (its chunk's own table): category tables and trade-row tails.
         heads (_StringTable): Keyword-only. The table of trade-row heads
-            (_trade_row_head) shared by every chunk of the page: a head does
-            not depend on the trade's size, so every size-cap scenario that
-            trades one pair shares it.
+            (_trade_row_head) shared by every chunk of the page, each distinct
+            head once: size-cap scenarios that show a trade alike share it.
         risk_free (RiskFreeRates | None): Keyword-only. The rates every
             view's Sharpe and Sortino subtract (_view_payload). None (default)
             subtracts nothing.

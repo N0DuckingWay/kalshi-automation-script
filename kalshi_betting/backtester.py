@@ -376,7 +376,7 @@ from .config import (
     time_series_spread_band,
     time_series_spread_too_wide,
 )
-from .depth_model import DepthModel, volume_24h
+from .depth_model import DepthModel, bid_ladder, can_start_at, volume_24h
 from .depth_model import book as _synthetic_book
 from .historical import (
     CorpusProvenance,
@@ -734,10 +734,11 @@ class LegQuotes:
     usable. Unlike the asks, bids are NOT carried forward: an old or missing
     quote means no bid (NaN), and a leg with no bid cannot be sold.
 
-    For buying through a modeled order book it also holds the market's
+    For trading through a modeled order book it also holds the market's
     24-hour traded volume at every checkpoint and the depth model (one
     object shared by every market), from which book_at builds that
-    checkpoint's synthetic book.
+    checkpoint's synthetic book for a buy, and sale_ladder the bids a sale
+    walks there.
 
     A plain __slots__ class, not a dataclass, so astuple does not walk into
     it and a copy is the object itself. Two built from the same candles
@@ -1116,6 +1117,31 @@ class LegQuotes:
             return None
         return _synthetic_book(self.depth, yes_ask, yes_bid, volume)
 
+    def sale_ladder(self, day: date, best_bid: float) -> list[list[float]] | None:
+        """
+        The bids a sale into this market would walk at the checkpoint on `day`.
+
+        Built by depth_model.bid_ladder from the depth model and the market's
+        24-hour volume there, starting at best_bid: the fresh bid of the side
+        sold, which the caller reads.
+
+        Args:
+            day (date): A checkpoint date.
+            best_bid (float): The side's fresh bid there.
+
+        Returns:
+            list[list[float]] | None: [[price, contracts], ...], best first;
+                empty when the model puts no contracts near that bid. None
+                when the model cannot say: no model, no volume data there,
+                or a bid the model has no ladders for (below 1c or above
+                99c, depth_model.can_start_at). The sale then takes that one
+                bid, in any size.
+        """
+        volume = self._volume_at(day)
+        if volume is None or not can_start_at(best_bid):
+            return None
+        return bid_ladder(self.depth, best_bid, volume)
+
     def day_values(self, first: date, last: date, side: str, entry_price: float) -> np.ndarray:
         """
         One contract's value at the end of each day from `first` to `last`.
@@ -1285,14 +1311,15 @@ class BacktestTrade:
         sold (bool): True when the trade's position was sold before it paid
             out (only a simulation run with sell_at sells): exit_date is then
             the sale day, actual_payoff what the sale returned after its fees
-            (each leg at the bid of the side it holds less config.fee_leg_exact
-            on the sale, a leg whose market had already paid out at its
-            payout), and profit, profit_ratio, monthly_profit_ratio,
-            holding_days and slippage are the sale's. outcome_a/_b and
-            settled_date_a/_b keep how the markets really settled. False by
-            default.
-        sale_price_a (float | None): The bid market A's leg sold at; None when
-            the trade was not sold, or market A had paid out by the sale.
+            (each leg at its sale price less config.fee_leg_exact on the sale,
+            a leg whose market had already paid out at its payout), and
+            profit, profit_ratio, monthly_profit_ratio, holding_days and
+            slippage are the sale's. outcome_a/_b and settled_date_a/_b keep
+            how the markets really settled. False by default.
+        sale_price_a (float | None): The price market A's leg sold at: the
+            average down the modeled bid ladder, or the bid itself with no
+            ladder (_position_sale_value). None when the trade was not sold,
+            or market A had paid out by the sale.
         sale_price_b (float | None): The same for market B's leg.
         sale_fees (float): The taker fees the sale paid, both legs; 0.0 when
             the trade was not sold. Already deducted from actual_payoff.
@@ -1374,7 +1401,7 @@ class BacktestTrade:
     # _simulate_at_discount(add_to_held=True)); reporting only
     add_on: bool = False
     # Whether its position was sold early (only with _simulate_at_discount's
-    # sell_at), at what bid each leg sold (None: not sold, or that market had
+    # sell_at), at what price each leg sold (None: not sold, or that market had
     # already paid out) and the fees the sale paid; defaulted so every other
     # construction still builds
     sold: bool = False
@@ -3101,50 +3128,33 @@ def _sale_label(sell_at: float) -> str:
     return f"selling at {_cap_percent(sell_at)}% of potential profit"
 
 
-def _trade_sale_value(trade: BacktestTrade, day: date) -> tuple | None:
+def _ladder_average(ladder: list[list[float]], contracts: float) -> float | None:
     """
-    What selling one open trade at the checkpoint on `day` would return, after the sale's fees.
-
-    A leg whose market had paid out by the checkpoint
-    (LegQuotes.paid_at_checkpoint) counts at its payout, with no sale and no
-    fee. Every other leg sells its n contracts at the bid of the side it
-    holds (LegQuotes.bid_at_checkpoint), less the taker fee on that sale
-    (config.fee_leg_exact).
+    The average price of selling `contracts` down a bid ladder, best bid first.
 
     Args:
-        trade (BacktestTrade): An open trade.
-        day (date): A checkpoint date on its legs' weekly grid.
+        ladder (list[list[float]]): [[price, contracts], ...], best first.
+        contracts (float): How many contracts to sell; above 0.
 
     Returns:
-        tuple | None: (value, fees, (market A's sale price, market B's)), a
-            price None for a leg that paid out; None when the trade has no
-            quotes or a leg still to pay out has no bid, so it cannot be sold.
-
-    Raises:
-        ValueError: From LegQuotes, for a day off the legs' checkpoint grid.
+        float | None: Their average price (exactly the best bid when that
+            level holds them all); None when the ladder holds fewer contracts
+            than that.
     """
-    if trade.marks is None:
+    left = contracts
+    proceeds = 0.0
+    used = 0
+    for price, size in ladder:
+        take = min(size, left)
+        proceeds += take * price
+        left -= take
+        used += 1
+        if left <= 0:
+            break
+    # Ladder sizes carry six decimals, so anything finer is float noise
+    if round(left, 6) > 0:
         return None
-    value = 0.0
-    fees = 0.0
-    prices: list[float | None] = []
-    # Which side each leg holds (scanner.leg_sides, the one definition)
-    for quotes, side in zip(trade.marks, leg_sides(trade.pair_type), strict=True):
-        if quotes.paid_at_checkpoint(day):
-            # Paid out: worth its payout, with nothing to sell
-            value += trade.n * (quotes.paid_yes if side == "yes" else quotes.paid_no)
-            prices.append(None)
-            continue
-        bid = quotes.bid_at_checkpoint(day, side)
-        if bid != bid:
-            # No fresh bid (NaN): this leg cannot be sold now
-            return None
-        # config.fee_leg_exact: the taker fee on selling n contracts at the bid
-        fee = fee_leg_exact(trade.n, bid)
-        value += trade.n * bid - fee
-        fees += fee
-        prices.append(bid)
-    return value, fees, (prices[0], prices[1])
+    return ladder[0][0] if used == 1 else proceeds / contracts
 
 
 def _positions(open_trades: list[BacktestTrade]) -> list[list[BacktestTrade]]:
@@ -3192,27 +3202,86 @@ def _position_sale_value(position: list[BacktestTrade], day: date) -> tuple | No
     """
     What selling a whole position at the checkpoint on `day` would return, and what it cost and could pay.
 
-    The one valuation a sale decides on (and _highest_sale_level replays):
-    the value is each trade's _trade_sale_value summed in the position's
-    order, the cost each trade's contracts plus entry fees, and the potential
-    total return each trade's contract pairs times CONTRACT_PAYOUT_DOLLARS —
-    what one leg pays in a win.
+    The one valuation a sale decides on (and _highest_sale_level replays).
+    The position's contracts are totalled per market (by ticker and side
+    held: an add-on to a lone leg can hold one market as A in one trade and
+    as B in another), and each market gets one sale price:
+      * a market that had paid out by the checkpoint
+        (LegQuotes.paid_at_checkpoint) counts at its payout, with no sale and
+        no fee;
+      * otherwise the sale starts at the fresh bid of the side held
+        (LegQuotes.bid_at_checkpoint). With a modeled bid ladder there
+        (LegQuotes.sale_ladder) the price is the average over the position's
+        contracts walked down it, and a ladder holding fewer contracts than
+        the position means it cannot be sold now; with none (no model, no
+        volume data, or a bid the model has no ladders for), the price is
+        the bid itself, in any size.
+    Each trade's leg returns its contracts at that price, less the taker fee
+    on selling them (config.fee_leg_exact). The cost is each trade's
+    contracts plus entry fees, and the potential total return each trade's
+    contract pairs times CONTRACT_PAYOUT_DOLLARS — what one leg pays in a win.
 
     Args:
         position (list[BacktestTrade]): One position's open trades (_positions).
         day (date): A checkpoint date on the legs' weekly grid.
 
     Returns:
-        tuple | None: (each trade's _trade_sale_value, in order; the sale
-            value; the total cost; the potential total return); None when any
-            of its trades cannot be sold now.
+        tuple | None: (each trade's sale as (value, fees, (market A's sale
+            price, market B's)), in order — a price None for a leg that paid
+            out; the sale value; the total cost; the potential total return).
+            None when a trade has no quotes, or a market still to pay out has
+            no fresh bid or too few contracts on its ladder.
+
+    Raises:
+        ValueError: From LegQuotes, for a day off the legs' checkpoint grid.
     """
+    # Every leg: its market and side, with the trade's quotes for that market
+    legs = []
+    for trade in position:
+        if trade.marks is None:
+            return None
+        # Which side each leg holds (scanner.leg_sides, the one definition)
+        legs.append(list(zip((trade.ticker_a, trade.ticker_b), trade.marks,
+                             leg_sides(trade.pair_type), strict=True)))
+    # The contracts held on each market, and its quotes
+    held: dict[tuple[str, str], list] = {}
+    for trade, trade_legs in zip(position, legs, strict=True):
+        for ticker, quotes, side in trade_legs:
+            held.setdefault((ticker, side), [quotes, 0])[1] += trade.n
+    # One sale price per market; None when it has paid out
+    prices: dict[tuple[str, str], float | None] = {}
+    for (ticker, side), (quotes, contracts) in held.items():
+        if quotes.paid_at_checkpoint(day):
+            prices[(ticker, side)] = None
+            continue
+        bid = quotes.bid_at_checkpoint(day, side)
+        if bid != bid:
+            # No fresh bid (NaN): this market cannot be sold now
+            return None
+        ladder = quotes.sale_ladder(day, bid)
+        price = bid if ladder is None else _ladder_average(ladder, contracts)
+        if price is None:
+            # The modeled bids hold fewer contracts than the position
+            return None
+        prices[(ticker, side)] = price
     per_trade = []
     value = cost = potential = 0.0
-    for trade in position:
-        sale = _trade_sale_value(trade, day)
-        if sale is None:
-            return None
+    for trade, trade_legs in zip(position, legs, strict=True):
+        trade_value = fees = 0.0
+        sale_prices: list[float | None] = []
+        for ticker, quotes, side in trade_legs:
+            price = prices[(ticker, side)]
+            if price is None:
+                # Paid out: worth its payout, with nothing to sell
+                trade_value += trade.n * (quotes.paid_yes if side == "yes" else quotes.paid_no)
+                sale_prices.append(None)
+                continue
+            # config.fee_leg_exact: the taker fee on selling n contracts at the price
+            fee = fee_leg_exact(trade.n, price)
+            trade_value += trade.n * price - fee
+            fees += fee
+            sale_prices.append(price)
+        sale = (trade_value, fees, (sale_prices[0], sale_prices[1]))
         per_trade.append(sale)
         value += sale[0]
         cost += trade.total_cost + trade.fees
@@ -3278,7 +3347,7 @@ def _sold_copy(trade: BacktestTrade, day: date, sale: tuple) -> BacktestTrade:
     Args:
         trade (BacktestTrade): The open trade sold.
         day (date): The sale's checkpoint date.
-        sale (tuple): Its _trade_sale_value.
+        sale (tuple): Its sale, as _position_sale_value gives each trade's.
 
     Returns:
         BacktestTrade: A copy marked sold.
@@ -7959,13 +8028,15 @@ def _simulate_at_discount(
         that day's pay-outs and before its valuation, a position sells when
         its realized profit reaches sell_at of its potential profit
         (_sells_at). Realized profit is what selling returns
-        (_position_sale_value: each leg at the bid of the side it holds,
-        less the taker fee on the sale; a leg whose market has paid out, at
-        its payout) less its cost (contracts plus entry fees); potential
-        profit is its contract pairs at CONTRACT_PAYOUT_DOLLARS less that
-        cost;
-      * a position with no quotes, or with a leg still to pay out and no
-        fresh bid, is not sold at that checkpoint;
+        (_position_sale_value: each market's contracts sold down its modeled
+        bid ladder from the fresh bid of the side held, or at that bid with
+        no ladder, less the taker fee on the sale; a leg whose market has
+        paid out, at its payout) less its cost (contracts plus entry fees);
+        potential profit is its contract pairs at CONTRACT_PAYOUT_DOLLARS
+        less that cost;
+      * a position with no quotes, or with a market still to pay out and no
+        fresh bid or too few contracts on its ladder, is not sold at that
+        checkpoint;
       * each of its trades exits at the sale (_sold_copy), its markets and
         ladders are freed, and its pair may be bought again at a later
         checkpoint, never at the sale's (nor may a pair touching its markets

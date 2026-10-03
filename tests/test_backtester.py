@@ -17008,8 +17008,9 @@ def _ck(day: date) -> int:
 
 
 def _sale_value(n: int, *legs) -> float:
-    """What a sale of n contract pairs returns, leg by leg as _trade_sale_value
-    adds it: a bid less the fee on selling n at it, or a payout (no fee)."""
+    """What a sale of n contract pairs returns, leg by leg as
+    _position_sale_value adds it (at the bid, with no ladder): a bid less the
+    fee on selling n at it, or a payout (no fee)."""
     value = 0.0
     for kind, price in legs:
         value += n * price if kind == "paid" else n * price - fee_leg_exact(n, price)
@@ -17383,25 +17384,36 @@ class TestHighestSaleLevel:
     never sold. A level above the one it returns never sells, so its run IS
     the no-selling run (only its sell_at stamp differs); at the level it
     returns and every one below, the run sells at least one position. Pinned
-    for every 5% level on both selling fixtures."""
+    for every 5% level on both selling fixtures, each also with a depth model,
+    so that buys and sales walk modeled books."""
 
     _LEVELS = tuple(round(0.05 * i, 2) for i in range(1, 21))
 
+    @pytest.mark.parametrize("walked", [False, True])
     @pytest.mark.parametrize("fixture", ["plain", "add_on"])
-    def test_levels_above_it_are_the_no_selling_run(self, fixture):
+    def test_levels_above_it_are_the_no_selling_run(self, fixture, walked):
+        model = _walk_model() if walked else None
         if fixture == "plain":
             suite = TestSellAtShareOfPotentialProfit()
-            records = _quoted([suite._record((_LADDER_M1, _LADDER_M2, _LADDER_M3))],
-                              suite._candles())
-
-            def sim(level):
-                return suite._sim(records, level)
+            candles = suite._candles()
+            records = [suite._record((_LADDER_M1, _LADDER_M2, _LADDER_M3))]
         else:
             suite = TestSellingWithAddOns()
-            records = suite._records(TestSellingWithAddOns._MONDAYS + (_LADDER_M3,))
+            candles = suite._candles()
+            records = [TestSellAtShareOfPotentialProfit._record(
+                TestSellingWithAddOns._MONDAYS + (_LADDER_M3,))]
+        if walked:
+            candles = _with_volume(candles)
+        backtester._attach_leg_quotes(records, candles, date(2026, 1, 1), model)
 
-            def sim(level):
-                return suite._sim(records, level)
+        def sim(level):
+            return suite._sim(records, level)
+        if walked:
+            # Not vacuous: the buys walk a book, and a sale walks the bids
+            assert all(t.book_walked for t in sim(None).trades)
+            assert any(t.sold and t.sale_price_a is not None
+                       and t.sale_price_a < t.marks[0].bid_at_checkpoint(t.exit_date, "yes")
+                       for level in self._LEVELS for t in sim(level).trades)
         base = sim(None)
         top = backtester._highest_sale_level(base, self._LEVELS)
         assert top is not None and top < 1.0
@@ -18195,9 +18207,10 @@ class TestWalkedCapSweepParity:
                             pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df,
                                                           check_exact=True)
                             sales += sum(t.sold for t in point.trades)
-        # Not vacuous: at 5% and 50% some walked position sells (no position
-        # reaches 100% of its potential before it pays out here)
-        assert sales > 0 or level == 1.0
+        # Not vacuous: at 5% some walked position sells. At higher levels a
+        # position here is often larger than its modeled bid ladder holds, so
+        # it is not sold, and none reaches 100% of its potential before it pays out
+        assert sales > 0 or level != 0.05
 
     def test_the_walk_is_not_vacuous(self, walk_sweep_run):
         res = walk_sweep_run.res
@@ -18484,3 +18497,331 @@ class TestDepthModelIsRecorded:
         monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", 0.37)
         with pytest.raises(ValueError, match="SAME_TITLE_SIZE_CAP must be a multiple of 5%.*0.37"):
             backtester._resolve_same_title_size_cap()
+
+
+# ─── Selling down a modeled bid ladder ───────────────────────────────────────
+
+def _ladder_model(levels) -> depth_model.DepthModel:
+    """A depth model whose every bid ladder holds `levels`: (distance below
+    the best bid, contracts), each distance one of DEPTH_MODEL_DISTANCES."""
+    ladder = [[round(0.50 - distance, 2), contracts] for distance, contracts in levels]
+    model = depth_model.fit([{"ticker": "L", "taken_at": "2026-09-28T16:00:00Z",
+                              "volume_24h": 400.0, "yes": ladder, "no": ladder}])
+    assert model is not None
+    return model
+
+
+def _walk_average(bid: float, n: int, levels) -> float:
+    """The test's own walk: n contracts sold down `levels` from `bid`."""
+    left, proceeds = n, 0.0
+    for distance, contracts in levels:
+        take = min(contracts, left)
+        proceeds += take * round(bid - distance, 4)
+        left -= take
+    assert left == 0
+    return proceeds / n
+
+
+def _sale_quotes(ticker: str, yes_bid: float, no_bid: float, model,
+                 volume: float | None = 400.0, paid: bool = False) -> backtester.LegQuotes:
+    """One market's hand-built quotes with a single checkpoint, Monday 2, at
+    these bids; NO pays out when it has paid out."""
+    day = _LADDER_M2
+    return backtester.LegQuotes(ticker, day, [0.5], [0.5], day, [0.5], [0.5], 0.0, 1.0,
+                                [yes_bid], [no_bid], [paid],
+                                None if volume is None else [volume], model)
+
+
+def _held_trade(n: int, a: backtester.LegQuotes, b: backtester.LegQuotes,
+                pair_type: str = "time_series") -> backtester.BacktestTrade:
+    """An open trade of n contract pairs on quotes a (market A) and b (market B)."""
+    trade = TestEquityCurveOpensAtTheInitialBalance()._trade(n, 0.30, 0.40, "no", float(n))
+    return dc_replace(trade, pair_type=pair_type, ticker_a=a.ticker, ticker_b=b.ticker,
+                      marks=(a, b))
+
+
+class TestPositionSaleValueWalksTheLadder:
+    """_position_sale_value totals a position's contracts per market and side
+    held, and sells each market down its modeled bid ladder from the fresh
+    bid (LegQuotes.sale_ladder): the sale price is the average over those
+    contracts, each trade's leg returns its contracts at it less the fee on
+    selling them, and a ladder holding fewer contracts than the position
+    means it is not sold. With no model, no volume data there, or a bid the
+    model has no ladders for (below 1c or above 99c), it sells at the bid in
+    any size."""
+
+    _LEVELS = ((0.0, 100.0), (0.01, 200.0), (0.02, 1000.0))
+
+    def _pair(self, model, n: int):
+        # Time-series: YES on QA (bid 0.40), NO on QB (bid 0.55)
+        a = _sale_quotes("QA", 0.40, 0.58, model)
+        b = _sale_quotes("QB", 0.44, 0.55, model)
+        return _held_trade(n, a, b)
+
+    def test_a_walked_sale_takes_the_average_down_the_ladder(self):
+        trade = self._pair(_ladder_model(self._LEVELS), 250)
+        per_trade, value, cost, potential = backtester._position_sale_value(
+            [trade], _LADDER_M2)
+        ((sale_value, fees, (price_a, price_b)),) = per_trade
+        # 100 at the bid, 150 one cent down
+        assert price_a == pytest.approx((100 * 0.40 + 150 * 0.39) / 250, abs=1e-12)
+        assert price_b == pytest.approx((100 * 0.55 + 150 * 0.54) / 250, abs=1e-12)
+        assert price_a == pytest.approx(_walk_average(0.40, 250, self._LEVELS), abs=1e-12)
+        assert fees == fee_leg_exact(250, price_a) + fee_leg_exact(250, price_b)
+        assert sale_value == _sale_value(250, ("bid", price_a), ("bid", price_b))
+        assert value == sale_value
+        assert (cost, potential) == (trade.total_cost + trade.fees, 250.0)
+
+    def test_a_position_larger_than_the_ladder_is_not_sold(self):
+        model = _ladder_model(self._LEVELS)
+        # The ladder holds 1,300 contracts: all of them sell, one more does not
+        numbers = backtester._position_sale_value([self._pair(model, 1300)], _LADDER_M2)
+        ((_value, _fees, (price_a, _price_b)),) = numbers[0]
+        assert price_a == pytest.approx(_walk_average(0.40, 1300, self._LEVELS), abs=1e-12)
+        assert backtester._position_sale_value([self._pair(model, 1301)], _LADDER_M2) is None
+        # A model that puts no contracts near the bid sells nothing
+        zeros = tuple(0.0 for _ in model.overall)
+        empty = depth_model.DepthModel(cells={}, volume_rows={}, overall=zeros, snapshots=1,
+                                       ladders=1, first_taken="", last_taken="", digest="zero")
+        assert _sale_quotes("QA", 0.40, 0.58, empty).sale_ladder(_LADDER_M2, 0.40) == []
+        assert backtester._position_sale_value([self._pair(empty, 1)], _LADDER_M2) is None
+
+    def test_a_bid_the_model_has_no_ladders_for_sells_at_the_bid(self):
+        # Below 1c or above 99c the model cannot say, so a NO leg there (its
+        # YES ask above 99c or under 1c) sells at the bid in any size, exactly
+        # as with no model
+        model = _ladder_model(self._LEVELS)
+        a = _sale_quotes("QA", 0.40, 0.58, None)
+        for no_bid in (0.0001, 0.005, 0.9901, 0.995, 0.9999):
+            walked = _sale_quotes("QB", 0.40, no_bid, model)
+            assert walked.sale_ladder(_LADDER_M2, no_bid) is None
+            trade = _held_trade(1_000_000, a, walked)
+            bare = dc_replace(trade, marks=(a, _sale_quotes("QB", 0.40, no_bid, None)))
+            numbers = backtester._position_sale_value([trade], _LADDER_M2)
+            assert numbers == backtester._position_sale_value([bare], _LADDER_M2)
+            ((sale_value, _fees, prices),) = numbers[0]
+            assert prices == (0.40, no_bid)
+            assert sale_value == _sale_value(1_000_000, ("bid", 0.40), ("bid", no_bid))
+        # From 1c to 99c the model starts a ladder, so the size matters again
+        for bid in (0.01, 0.99):
+            assert _sale_quotes("QB", 0.40, bid, model).sale_ladder(_LADDER_M2, bid)
+        top = _held_trade(1301, a, _sale_quotes("QB", 0.40, 0.99, model))
+        assert backtester._position_sale_value([top], _LADDER_M2) is None
+
+    def test_no_model_or_no_volume_sells_at_the_bid_in_any_size(self):
+        model = _ladder_model(self._LEVELS)
+        for a, b in ((_sale_quotes("QA", 0.40, 0.58, None), _sale_quotes("QB", 0.44, 0.55, None)),
+                     (_sale_quotes("QA", 0.40, 0.58, model, volume=None),
+                      _sale_quotes("QB", 0.44, 0.55, model, volume=None))):
+            assert a.sale_ladder(_LADDER_M2, 0.40) is None
+            trade = _held_trade(1_000_000, a, b)
+            ((sale_value, fees, prices),) = backtester._position_sale_value(
+                [trade], _LADDER_M2)[0]
+            assert prices == (0.40, 0.55)
+            assert sale_value == _sale_value(1_000_000, ("bid", 0.40), ("bid", 0.55))
+        # With both, the ladder is the model's, from the bid it is handed
+        quotes = _sale_quotes("QA", 0.40, 0.58, model)
+        assert quotes.sale_ladder(_LADDER_M2, 0.40) == depth_model.bid_ladder(model, 0.40, 400.0)
+        assert quotes.sale_ladder(_LADDER_M2, 0.40) == [[0.40, 100.0], [0.39, 200.0],
+                                                        [0.38, 1000.0]]
+        # Not a checkpoint of these quotes: no ladder
+        assert quotes.sale_ladder(_LADDER_M3, 0.40) is None
+
+    def test_a_lone_leg_add_on_totals_by_ticker(self):
+        # X is held NO as market B of a time-series trade and as market A of a
+        # same-title one (an add-on to the lone leg): 160 NO contracts on X
+        # walk one ladder, though each trade's 80 fit its best level
+        levels = ((0.0, 100.0), (0.01, 1000.0))
+        model = _ladder_model(levels)
+        x = _sale_quotes("X", 0.38, 0.60, model)
+        first = _held_trade(80, _sale_quotes("Y", 0.40, 0.58, model), x)
+        add = _held_trade(80, x, _sale_quotes("W", 0.45, 0.53, model), "same_title")
+        on_x = _walk_average(0.60, 160, levels)
+        assert on_x < 0.60
+        (sale_1, sale_2), *_ = backtester._position_sale_value([first, add], _LADDER_M2)
+        assert sale_1[2] == (0.40, on_x) and sale_2[2] == (on_x, 0.45)
+        # Alone, each trade's X sells at the best bid
+        assert backtester._position_sale_value([first], _LADDER_M2)[0][0][2] == (0.40, 0.60)
+        assert backtester._position_sale_value([add], _LADDER_M2)[0][0][2] == (0.60, 0.45)
+        # Together past the ladder's 1,100 contracts: not sold, though each fits alone
+        big = dc_replace(add, n=1050)
+        assert backtester._position_sale_value([big], _LADDER_M2) is not None
+        assert backtester._position_sale_value([first, big], _LADDER_M2) is None
+
+    def test_a_paid_out_market_counts_at_its_payout(self):
+        # QB has paid out NO: worth $1 a contract, with no ladder to walk
+        thin = _ladder_model(((0.0, 1.0),))
+        a = _sale_quotes("QA", 0.40, 0.58, None)
+        b = _sale_quotes("QB", 0.44, 0.55, thin, paid=True)
+        ((sale_value, fees, prices),) = backtester._position_sale_value(
+            [_held_trade(50, a, b)], _LADDER_M2)[0]
+        assert prices == (0.40, None)
+        assert fees == fee_leg_exact(50, 0.40)
+        assert sale_value == _sale_value(50, ("bid", 0.40), ("paid", 1.0))
+
+    def test_pickled_quotes_sell_the_same(self):
+        model = _ladder_model(self._LEVELS)
+        trade = self._pair(model, 250)
+        a, b = (pickle.loads(pickle.dumps(q)) for q in trade.marks)
+        assert a.depth is not None and a.depth.digest == model.digest
+        assert a.sale_ladder(_LADDER_M2, 0.40) == trade.marks[0].sale_ladder(_LADDER_M2, 0.40)
+        again = dc_replace(trade, marks=(a, b))
+        assert (backtester._position_sale_value([again], _LADDER_M2)
+                == backtester._position_sale_value([trade], _LADDER_M2))
+
+
+def _with_volume(candles: dict, after: int | None = None, volume: float = 400.0) -> dict:
+    """The candles, each ending after `after` (every one with None) carrying
+    an hour's volume, so the depth model has a ladder at that checkpoint."""
+    return {t: [dict(c, volume=volume) if after is None or c["ts"] > after else dict(c)
+                for c in series]
+            for t, series in candles.items()}
+
+
+class TestWalkedSales:
+    """Through _simulate_at_discount on TestSellAtShareOfPotentialProfit's
+    pair (bought on Monday 1, where its candles carry no volume, so at the
+    top of the book as with no model): with a depth model the sale walks each
+    market's modeled bids, and a ladder too thin for the position keeps it
+    unsold."""
+
+    _SUITE = TestSellAtShareOfPotentialProfit()
+    _LEVELS = tuple(round(0.05 * i, 2) for i in range(1, 21))
+
+    def _records(self, model):
+        candles = _with_volume(self._SUITE._candles(), after=_ck(_LADDER_M1))
+        recs = [self._SUITE._record()]
+        backtester._attach_leg_quotes(recs, candles, date(2026, 1, 1), model)
+        return recs
+
+    @staticmethod
+    def _plain(point) -> list:
+        """The trades as tuples without their quotes, which carry the model."""
+        return [astuple(dc_replace(t, marks=None)) for t in point.trades]
+
+    def _n(self) -> int:
+        (held,) = self._SUITE._sim(self._records(None)).trades
+        return held.n
+
+    def test_a_ladder_too_thin_for_the_position_never_sells(self):
+        n = self._n()
+        records = self._records(_ladder_model(((0.0, float(n // 4)),)))
+        base = self._SUITE._sim(records)
+        (held,) = base.trades
+        assert held.n == n and not held.book_walked
+        for level in self._LEVELS:
+            point = self._SUITE._sim(records, level)
+            assert [astuple(t) for t in point.trades] == [astuple(t) for t in base.trades]
+            pd.testing.assert_frame_equal(point.equity_df, base.equity_df, check_exact=True)
+        assert backtester._highest_sale_level(base, self._LEVELS) is None
+        # With no model the same position sells at 25% on Monday 2
+        assert self._SUITE._sim(self._records(None), 0.25).trades[0].sold
+
+    def test_a_deep_best_bid_sells_as_with_no_model(self):
+        deep = self._records(_ladder_model(((0.0, float(10 * self._n())),)))
+        bare = self._records(None)
+        for level in (None, 0.05, 0.25, 0.5, 0.7, 1.0):
+            walked, plain = self._SUITE._sim(deep, level), self._SUITE._sim(bare, level)
+            assert self._plain(walked) == self._plain(plain)
+            pd.testing.assert_frame_equal(walked.equity_df, plain.equity_df, check_exact=True)
+
+    def test_a_walked_sale_is_at_the_average_down_the_ladder(self):
+        n = self._n()
+        levels = ((0.0, float(n // 3)), (0.01, float(n // 3)), (0.02, float(10 * n)))
+        (sold,) = self._SUITE._sim(self._records(_ladder_model(levels)), 0.05).trades
+        assert sold.sold and sold.exit_date == _LADDER_M2 and sold.n == n
+        bid_a, bid_b = TestSellAtShareOfPotentialProfit._BIDS[_LADDER_M2]
+        assert sold.sale_price_a == pytest.approx(_walk_average(bid_a, n, levels), abs=1e-12)
+        assert sold.sale_price_b == pytest.approx(_walk_average(bid_b, n, levels), abs=1e-12)
+        assert sold.sale_price_a < bid_a and sold.sale_price_b < bid_b
+        assert sold.sale_fees == (fee_leg_exact(n, sold.sale_price_a)
+                                  + fee_leg_exact(n, sold.sale_price_b))
+        assert sold.actual_payoff == _sale_value(n, ("bid", sold.sale_price_a),
+                                                 ("bid", sold.sale_price_b))
+        assert sold.profit == sold.actual_payoff - sold.total_cost - sold.fees
+
+
+class _WalkedSellingGolden(_SellingGolden):
+    """The selling golden fixture whose candles carry each hour's volume, so
+    buys and sales walk the depth model's books."""
+
+    _CANDLES = _with_volume(_SellingGolden._CANDLES)
+
+
+@pytest.fixture(scope="class")
+def walked_sell_run():
+    """The walked selling golden fixture through run_backtest_sweep with a
+    depth model and every family on sell_run's narrowed grid: band (0, 1) x
+    k (0.5, 0.75), four sell levels."""
+    toggles = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
+        apply_pre_toggle_defaults(toggles)
+        golden = _WalkedSellingGolden()
+        golden._patch(mp)
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        mp.setattr(backtester, "TAKE_PROFIT_LEVELS", (1.0, 0.05, 0.25, 0.5))
+        mp.setattr(backtester, "datetime", type(
+            "Clock", (TestCapSweepEndDate._Clock,),
+            {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC)}))
+        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=golden._START, initial_balance=10_000.0,
+                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                                 tier_off_sweep=True, add_on_sweep=True, sell_sweep=True,
+                                 depth_model=_walk_model())
+        mp.undo()
+        yield SimpleNamespace(on=res, start=golden._START)
+    finally:
+        mp.undo()
+        toggles.undo()
+
+
+@pytest.mark.usefixtures("walked_sell_run")
+class TestWalkedSellSweep:
+    """TestSellSweep's parity checks on the walked selling golden fixture,
+    with buys and sales walking modeled books: every level and cap of the
+    Sell family equals a fresh simulation, every level above a run's highest
+    sale level is that run without selling, sold_cells simulates only the
+    levels that can sell, and a band's pickled copy sells as the family does."""
+
+    @pytest.fixture
+    def sell_run(self, walked_sell_run):
+        """The walked run, under the name TestSellSweep's checks read."""
+        return walked_sell_run
+
+    _settings = TestSellSweep.__dict__["_settings"]
+    test_every_level_and_cap_equals_a_fresh_simulation = (
+        TestSellSweep.test_every_level_and_cap_equals_a_fresh_simulation)
+    test_levels_above_the_highest_sale_level_are_the_no_selling_run = (
+        TestSellSweep.test_levels_above_the_highest_sale_level_are_the_no_selling_run)
+    test_sold_cells_simulates_only_the_levels_that_can_sell = (
+        TestSellSweep.test_sold_cells_simulates_only_the_levels_that_can_sell)
+    test_a_band_s_copy_sells_as_the_family_does_after_pickling = (
+        TestSellSweep.test_a_band_s_copy_sells_as_the_family_does_after_pickling)
+
+    def test_sales_walk_the_bids(self, walked_sell_run):
+        sell = walked_sell_run.on.sell_sweep
+        walked = sold = 0
+        for level in sell.levels:
+            for k in sell.ks:
+                for add in (False, True):
+                    cell = sell.cell(level, sell.bands[0], k, add_to_held=add)
+                    for pops in cell.values():
+                        for t in pops["all"].trades:
+                            assert t.book_walked
+                            if not t.sold:
+                                continue
+                            sold += 1
+                            sides = scanner.leg_sides(t.pair_type)
+                            for quotes, side, price in zip(t.marks, sides,
+                                                           (t.sale_price_a, t.sale_price_b),
+                                                           strict=True):
+                                if price is None:
+                                    continue
+                                bid = quotes.bid_at_checkpoint(t.exit_date, side)
+                                assert price <= bid
+                                walked += price < bid
+        # Positions sell, and their sales walk past the best bid
+        assert sold > 0 and walked > 0

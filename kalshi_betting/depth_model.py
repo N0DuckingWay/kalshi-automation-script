@@ -290,6 +290,20 @@ def _row(model: DepthModel, volume: float, best_bid: float) -> tuple[float, ...]
     return model.overall if row is None else row
 
 
+def can_start_at(best_bid: float) -> bool:
+    """
+    Whether bid_ladder can start a ladder at this best bid.
+
+    Args:
+        best_bid (float): A side's best bid, in dollars.
+
+    Returns:
+        bool: True for a number from 0.01 to 0.99 (rounded to 4 decimals).
+    """
+    start = _rounded(best_bid)
+    return start is not None and _LOWEST_BID <= start <= _HIGHEST_BID
+
+
 def bid_ladder(model: DepthModel, best_bid: float, volume: float) -> list[list[float]]:
     """
     Synthetic bid levels for one side of a book, best first.
@@ -305,13 +319,13 @@ def bid_ladder(model: DepthModel, best_bid: float, volume: float) -> list[list[f
 
     Returns:
         list[list[float]]: [[price, contracts], ...]. Empty when best_bid is
-            outside [0.01, 0.99] or the volume is unknown.
+            one the table cannot start at (can_start_at) or the volume is
+            unknown.
     """
-    start = _rounded(best_bid)
     volume = _finite(volume)
-    if (model is None or volume is None or start is None
-            or not _LOWEST_BID <= start <= _HIGHEST_BID):
+    if model is None or volume is None or not can_start_at(best_bid):
         return []
+    start = _rounded(best_bid)
     levels = []
     before = 0.0
     row = _row(model, volume, start)

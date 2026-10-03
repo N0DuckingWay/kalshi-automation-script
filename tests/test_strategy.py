@@ -3178,21 +3178,31 @@ class TestTimeSeriesKellyParity:
         # value and the held stake (pinned in detail by
         # _backtest_add_on_problems)
         assert _function_calls(backtester, "_simulate_at_discount", "_open_value")
-        # Selling early: a leg's bid and paid-out marker are read in one
-        # place, _trade_sale_value, which a sale reaches only through
-        # _position_sale_value — and the walk's sales and the shortcut that
-        # replays them (_highest_sale_level) both decide through _sells_at,
-        # so the shortcut tests exactly the rule the walk applies
-        sale_readers: dict[str, set] = {"bid_at_checkpoint": set(), "paid_at_checkpoint": set()}
+        # Selling early: a market's bid, paid-out marker and modeled bid
+        # ladder are read in one place, _position_sale_value, which walks the
+        # ladder through _ladder_average; the ladder is built only by
+        # LegQuotes.sale_ladder, from the bid it is handed — and the walk's
+        # sales and the shortcut that replays them (_highest_sale_level) both
+        # decide through _sells_at, so the shortcut tests exactly the rule
+        # the walk applies
+        sale_readers: dict[str, set] = {"bid_at_checkpoint": set(), "paid_at_checkpoint": set(),
+                                        "sale_ladder": set()}
         for func in ast.walk(tree):
             if isinstance(func, ast.FunctionDef):
                 for sub in ast.walk(func):
                     if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
                             and sub.func.attr in sale_readers):
                         sale_readers[sub.func.attr].add(func.name)
-        assert sale_readers == {"bid_at_checkpoint": {"_trade_sale_value"},
-                                "paid_at_checkpoint": {"_trade_sale_value"}}
-        assert _function_calls(backtester, "_position_sale_value", "_trade_sale_value")
+        assert sale_readers == {"bid_at_checkpoint": {"_position_sale_value"},
+                                "paid_at_checkpoint": {"_position_sale_value"},
+                                "sale_ladder": {"_position_sale_value"}}
+        assert _function_calls(backtester, "_position_sale_value", "_ladder_average")
+        ladder_builders = {func.name for func in ast.walk(tree)
+                           if isinstance(func, ast.FunctionDef)
+                           and any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                                   and sub.func.id == "bid_ladder" for sub in ast.walk(func))}
+        assert ladder_builders == {"sale_ladder"}
+        assert not hasattr(backtester, "_trade_sale_value")
         for func in ("_simulate_at_discount", "_position_sells", "_highest_sale_level"):
             assert _function_calls(backtester, func, "_sells_at"), func
         for func in ("_simulate_at_discount", "_position_sells", "_highest_sale_level"):

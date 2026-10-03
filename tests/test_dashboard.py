@@ -11051,8 +11051,8 @@ class TestFilterPageSize:
     case for the filter, which ships a chunk per distinct scenario list and a
     view per list x category x tag — stays well inside the page budget the
     scenario explorer set (5 MB), because every block is gzip-packed
-    (_packed_json_script) and every trade row's size-independent head is
-    shipped once (the base block's shared table). Each band also carries a
+    (_packed_json_script) and every distinct trade-row head is shipped once
+    (the base block's shared table). Each band also carries a
     300-entry k-hat population, which the k-hat breakdown ships per band x
     category x tag. Measured 810,784 bytes on this fixture (2026-09-26,
     plotly 6.9.0 / pandas 3.0.3 / numpy 2.4.6), against 744,946 for the same
