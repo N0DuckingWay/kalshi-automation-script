@@ -1,8 +1,8 @@
 """Tests for backtest.py — the backtester's CLI argument surface.
 
 Covers the two interval-discount flags added with the calibration sweep:
-argparse accepts a valid --interval-discount, main() rejects an out-of-range
-one through parser.error(), and both --interval-discount and --no-sweep are
+argparse accepts a valid --interval-discount, main() rejects one at or below
+0 or above 1 through parser.error(), and both --interval-discount and --no-sweep are
 threaded into backtester.run_backtest_sweep() (the same threading-assertion
 idiom test_backtester.py uses for --max-horizon-days).
 
@@ -188,17 +188,18 @@ class TestIntervalDiscountArgument:
         _run(monkeypatch, "--interval-discount", "0.62")
         assert cli["sweep_kwargs"]["interval_discount"] == pytest.approx(0.62)
 
-    @pytest.mark.parametrize("value", ["0.0", "1.0", "0.5"])
+    @pytest.mark.parametrize("value", ["0.01", "1.0", "0.5"])
     def test_boundary_values_are_accepted(self, cli, monkeypatch, value):
         _run(monkeypatch, "--interval-discount", value)
         assert cli["sweep_kwargs"]["interval_discount"] == pytest.approx(float(value))
 
-    @pytest.mark.parametrize("value", ["1.5", "-0.1", "42"])
+    # 0 included: the backtest sizes through the live sizer, which takes a k above 0
+    @pytest.mark.parametrize("value", ["1.5", "-0.1", "42", "0", "0.0", "nan"])
     def test_out_of_range_value_errors(self, cli, monkeypatch, capsys, value):
         with pytest.raises(SystemExit) as exc:
             _run(monkeypatch, "--interval-discount", value)
         assert exc.value.code == 2
-        assert "--interval-discount must be between 0 and 1" in capsys.readouterr().err
+        assert "--interval-discount must be above 0 and at most 1" in capsys.readouterr().err
         # parser.error() aborts before any client is built or any run starts
         assert "sweep_kwargs" not in cli
 

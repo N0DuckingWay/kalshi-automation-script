@@ -450,7 +450,7 @@ def main() -> None:
     parser.add_argument(
         "--interval-discount", type=float, default=None, metavar="K",
         help="Override the time-series interval discount k for this backtest "
-             "(0-1; default: config.TIME_SERIES_INTERVAL_PROB_DISCOUNT). Affects "
+             "(above 0, at most 1; default: config.TIME_SERIES_INTERVAL_PROB_DISCOUNT). Affects "
              "this backtest only — the live sizer reads the saved live defaults' k "
              "unless main.py's own --interval-discount overrides it for one live run.",
     )
@@ -542,8 +542,10 @@ def main() -> None:
         parser.error("--max-horizon-days must be a positive integer")
     if args.sell_workers is not None and args.sell_workers < 1:
         parser.error("--sell-workers must be a positive integer")
-    if args.interval_discount is not None and not (0.0 <= args.interval_discount <= 1.0):
-        parser.error("--interval-discount must be between 0 and 1")
+    # Above 0, as the live sizer the backtest sizes through requires (k = 0
+    # would price every time-series pair as riskless)
+    if args.interval_discount is not None and not (0.0 < args.interval_discount <= 1.0):
+        parser.error("--interval-discount must be above 0 and at most 1")
     if args.spread_min is not None and not (0.0 <= args.spread_min <= 1.0):
         parser.error("--spread-min must be between 0 and 1")
     if args.spread_max is not None and not (0.0 <= args.spread_max <= 1.0):
