@@ -18,6 +18,11 @@ so these tests stay fully offline. Both sites are Kalshi-controlled
 interval-discount section is tested the same way: _section_interval_discount()
 is driven from a hand-built BacktestSweep, never through generate_dashboard().
 
+The header's Fills line (TestFillsHeader) says how many of the primary scenario's
+trades walked a modeled order book, and the trade rows and Kelly scatter read what
+each trade paid (TestFillsOnRowsAndScatter) while the entry-price buckets and the
+spread calibration stay on the entry quotes.
+
 The scenario explorer (PB5) is pinned by VALUE on a non-square band x k grid
 whose primary sits off index 0 on both axes, and the seven sections that
 predate it are pinned against digests captured on main by
@@ -73,6 +78,7 @@ from kalshi_betting.dashboard import (
     _section_risk,
     _section_scenario_explorer,
 )
+from kalshi_betting.depth_model import DepthModel
 from kalshi_betting.treasury import (
     SOURCE_API,
     SOURCE_CACHE,
@@ -2589,6 +2595,7 @@ class TestEntryCheckpointHeader:
             r"\(size-cap sweep [^<]*\)</p>\n"
             r"<p [^>]*>Live rule: none recorded[^\n]*</p>\n"
             rf'<p style="color:#616161; font-size:14px;">{re.escape(self._RECORDED)}\n'
+            r"<p [^>]*>Fills: [^\n]*</p>\n"
             r"<p [^>]*>Risk-free rate[^\n]*</p>\n"
             r"<p [^>]*>Outcome-label coverage for this run is below the floor",
             page)
@@ -2628,6 +2635,108 @@ class TestEntryCheckpointHeader:
         page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
         assert (f"Entry checkpoint: {backtester.SCHEDULED_RUN.label()} — the live "
                 "scheduler's run time</p>") in page
+
+
+class TestFillsHeader:
+    """The header's Fills line says how many of the primary scenario's trades
+    walked a modeled order book and how many filled at the top of the book,
+    which snapshots the depth came from, or, with no depth model, that every
+    trade filled at the top of the book."""
+
+    _NO_MODEL = ("Fills: no usable depth snapshot — every trade fills at the top of the "
+                 "book, in any size (see the log; run python3 -m kalshi_betting.depth_model "
+                 "snapshot)</p>")
+
+    @staticmethod
+    def _model(snapshots: int = 3, first: str = "2026-10-02T21:30:00Z",
+               last: str = "2026-10-09T21:30:00Z") -> DepthModel:
+        return DepthModel(cells={}, volume_rows={}, overall=(0.0,) * 7, snapshots=snapshots,
+                          ladders=90, first_taken=first, last_taken=last, digest="test")
+
+    @staticmethod
+    def _sweep(walked: int, top: int, model: DepthModel | None) -> BacktestSweep:
+        trades = ([dataclasses.replace(make_trade(), book_walked=True,
+                                       fill_price_a=0.31, fill_price_b=0.41)] * walked
+                  + [make_trade()] * top)
+        pt = _scn_point((0.3, 0.6), 0.75, trades=trades)
+        return BacktestSweep(primary=pt, points=[pt], calibration=None, depth_model=model)
+
+    def test_a_walked_run_counts_walked_and_top_of_book_trades(self):
+        line = dashboard._fills_html(self._sweep(5, 2, self._model()))
+        assert line == (
+            '<p style="color:#616161; font-size:14px;">Fills: 5 of 7 trades walked a '
+            "modeled order book (3 snapshots, taken 2026-10-02 to 2026-10-09); 2 at the "
+            "top of the book (no depth data)</p>")
+
+    def test_one_snapshot_on_one_day_reads_in_the_singular(self):
+        line = dashboard._fills_html(self._sweep(
+            1, 0, self._model(1, "2026-10-02T21:30:00Z", "2026-10-02T22:30:00Z")))
+        assert ("Fills: 1 of 1 trades walked a modeled order book "
+                "(1 snapshot, taken 2026-10-02); 0 at the top of the book") in line
+
+    @pytest.mark.parametrize("first, last", [("", ""), ("unknown", "2026-10-09T21:30:00Z"),
+                                             (None, None), ("2026-13-45", "2026-10-09")])
+    def test_a_stamp_that_is_not_a_date_leaves_the_dates_out(self, first, last):
+        line = dashboard._fills_html(self._sweep(2, 0, self._model(2, first, last)))
+        assert "(2 snapshots); 0 at the top of the book" in line
+        assert "taken" not in line
+
+    def test_no_model_is_a_red_line_naming_the_command(self):
+        line = dashboard._fills_html(self._sweep(0, 4, None))
+        assert line.endswith(self._NO_MODEL)
+        assert "color:#B71C1C" in line and "font-weight:700" in line
+        assert "walked a modeled" not in line
+
+    def test_no_sweep_says_not_recorded(self):
+        assert dashboard._fills_html(None) == (
+            '<p style="color:#616161; font-size:14px;">Fills: not recorded</p>')
+
+    def test_a_run_with_no_trades_counts_zero_of_zero(self):
+        line = dashboard._fills_html(self._sweep(0, 0, self._model()))
+        assert "Fills: 0 of 0 trades walked a modeled order book" in line
+
+    def test_the_count_reads_the_primary_points_trades_only(self):
+        # Another point's trades (a swept k, a band's scenario) are not counted
+        sweep = self._sweep(1, 1, self._model())
+        other = _scn_point((0.3, 0.6), 0.5, trades=[make_trade()] * 9)
+        sweep = dataclasses.replace(sweep, points=[sweep.primary, other], scenarios=[other])
+        assert "Fills: 1 of 2 trades" in dashboard._fills_html(sweep)
+
+    def test_the_page_places_it_under_the_entry_checkpoint(self, monkeypatch, tmp_path):
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path,
+                                           sweep=self._sweep(1, 1, self._model()))
+        assert "Fills: 1 of 2 trades walked a modeled order book" in page
+        assert page.count("Fills: ") == 1
+        assert (page.index("Period:") < page.index("Primary spread band:")
+                < page.index("Entry checkpoint:") < page.index("Fills: ")
+                < page.index("Portfolio Performance"))
+
+    def test_a_page_without_a_depth_model_carries_the_red_line(self, monkeypatch, tmp_path):
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path,
+                                           sweep=self._sweep(0, 1, None))
+        assert self._NO_MODEL in page
+
+    def test_a_page_without_a_sweep_says_not_recorded(self, monkeypatch, tmp_path):
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path)
+        assert "Fills: not recorded</p>" in page
+
+    def test_the_model_a_run_records_reaches_the_page(self, monkeypatch, tmp_path):
+        # The model run_backtest_sweep is handed is the one the header names
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        sweep = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0, sweep=False,
+            depth_model=self._model(2, "2026-10-02T21:30:00Z", "2026-10-02T21:30:00Z"))
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
+        assert ("Fills: 0 of 0 trades walked a modeled order book "
+                "(2 snapshots, taken 2026-10-02); 0 at the top of the book") in page
+
+    def test_a_run_without_a_model_reaches_the_page_as_the_red_line(self, monkeypatch,
+                                                                    tmp_path):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        sweep = backtester.run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1),
+                                              1000.0, sweep=False)
+        page = TestRunSettingsHeader._page(monkeypatch, tmp_path, sweep=sweep)
+        assert self._NO_MODEL in page
 
 
 class TestStartingBalanceHeader:
@@ -3160,6 +3269,119 @@ class TestBestWorstTradeRows:
         assert "(closes date unknown)" in cells[4]
         assert "on date unknown" in cells[5]
         assert " — " not in cells[4]
+
+
+class TestFillsOnRowsAndScatter:
+    """What a trade paid (backtester._paid_prices) is what the best/worst rows
+    show and what the Kelly scatter prices at; the entry-price buckets and the
+    spread calibration stay on the entry quotes; a trade built without fills
+    reads its quotes, as before."""
+
+    # The make_trade quotes: pA 0.30, nA 0.70, pB 0.60, nB 0.40
+    @staticmethod
+    def _with_fills(a: float, b: float, **overrides) -> BacktestTrade:
+        return dataclasses.replace(make_trade(), fill_price_a=a, fill_price_b=b,
+                                   book_walked=True, **overrides)
+
+    def test_a_time_series_row_shows_the_fills_not_the_quotes(self):
+        row = TestBestWorstTradeRows._row(
+            pair_type="time_series", fill_price_a=0.33, fill_price_b=0.43,
+            outcome_a="no", outcome_b="no", book_walked=True)
+        cells = TestBestWorstTradeRows._cells(row)
+        assert cells[2:4] == ["$0.33", "$0.43"]          # YES on A, NO on B
+        assert "(closes Jan 13, 2026) at $0.33" in cells[4]
+        assert "(closes Jan 14, 2026) at $0.43" in cells[4]
+        assert "$0.30" not in row and "$0.40" not in row
+
+    def test_a_same_title_row_shows_the_fills_not_the_quotes(self):
+        row = TestBestWorstTradeRows._row(
+            pair_type="same_title", entry_nA=0.32, entry_pB=0.35,
+            fill_price_a=0.34, fill_price_b=0.37, outcome_a="yes", outcome_b="no",
+            book_walked=True)
+        cells = TestBestWorstTradeRows._cells(row)
+        assert cells[2:4] == ["$0.37", "$0.34"]          # YES on B, NO on A
+        assert "at $0.34" in cells[4] and "at $0.37" in cells[4]
+        assert "$0.32" not in row and "$0.35" not in row
+
+    def test_a_trade_with_no_fills_still_shows_its_quotes(self):
+        cells = TestBestWorstTradeRows._cells(dashboard._trade_row(make_trade(), "#FFF"))
+        assert cells[2:4] == ["$0.30", "$0.40"]
+
+    def test_a_head_changes_with_the_fills_and_not_with_the_size(self):
+        walked = self._with_fills(0.33, 0.43)
+        assert (dashboard._trade_row_head(walked, "#FFF")
+                != dashboard._trade_row_head(make_trade(), "#FFF"))
+        resized = dataclasses.replace(walked, n=9, total_cost=3.0, fees=0.2)
+        assert (dashboard._trade_row_head(resized, "#FFF")
+                == dashboard._trade_row_head(walked, "#FFF"))
+
+    def test_quotes_at_fills_swap_in_only_the_legs_bought(self):
+        ts = self._with_fills(0.33, 0.43)
+        # (YES fill on A, A's NO quote, B's YES quote stays the reference, NO fill on B)
+        assert dashboard._quotes_at_fills(ts) == (0.33, 0.70, 0.60, 0.43)
+        st = dataclasses.replace(ts, pair_type="same_title")
+        # (A's YES quote, NO fill on A, YES fill on B, B's NO quote)
+        assert dashboard._quotes_at_fills(st) == (0.30, 0.33, 0.43, 0.40)
+        assert dashboard._quotes_at_fills(make_trade()) == (0.30, 0.70, 0.60, 0.40)
+
+    def test_the_scatter_prices_a_time_series_trade_at_its_fills(self):
+        k = 0.75
+        x, _ = dashboard._kelly_points([self._with_fills(0.33, 0.43)], k)
+        # Hand-worked: the YES fill and the NO fill are the leg prices, and the
+        # later market's YES quote (0.60) is the model's reference ask
+        p = 1.0 - k * (0.60 - 0.33)
+        fee = fee_per_pair_approx(0.33, 0.43)
+        b = (1.0 - 0.33 - 0.43 - fee) / (0.33 + 0.43 + fee)
+        assert x == [pytest.approx(p - (1.0 - p) / b)]
+        assert x[0] != pytest.approx(dashboard._kelly_points([make_trade()], k)[0][0])
+
+    def test_the_scatter_prices_a_same_title_trade_at_its_fills(self):
+        t = dataclasses.replace(self._with_fills(0.62, 0.30), pair_type="same_title",
+                                entry_nA=0.60, entry_pB=0.28)
+        x, _ = dashboard._kelly_points([t], 0.75)
+        p = SAME_TITLE_CO_RESOLVE_PROB
+        fee = fee_per_pair_approx(0.62, 0.30)
+        b = (1.0 - 0.62 - 0.30 - fee) / (0.62 + 0.30 + fee)
+        assert x == [pytest.approx(max(0.0, p - (1.0 - p) / b))]
+
+    @pytest.mark.parametrize("pair_type", ["time_series", "same_title"])
+    def test_a_trade_with_no_fills_plots_its_quotes_exactly(self, pair_type):
+        t = dataclasses.replace(make_trade(), pair_type=pair_type)
+        x, _ = dashboard._kelly_points([t], 0.75)
+        assert x == [_kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB, t.entry_nB,
+                                     pair_type, k=0.75)]
+
+    def test_a_walked_trade_at_the_quotes_plots_the_same_point(self):
+        # Fills equal to the top-of-book quotes change nothing
+        x_walked, _ = dashboard._kelly_points([self._with_fills(0.30, 0.40)], 0.75)
+        x_quotes, _ = dashboard._kelly_points([make_trade()], 0.75)
+        assert x_walked == x_quotes
+
+    def test_the_risk_section_scatter_reads_the_fills(self):
+        t = self._with_fills(0.33, 0.43)
+        curve = backtester._build_equity_curve([t], date(2026, 1, 5), 1000.0)
+        data, _ = _nth_figure(dashboard._section_risk([t], curve, 1000.0, k=0.75), 0)
+        assert data[0]["x"] == pytest.approx(dashboard._kelly_points([t], 0.75)[0])
+
+    def test_the_entry_price_buckets_and_spread_stay_on_the_quotes(self):
+        t = self._with_fills(0.33, 0.43, outcome_a="no", outcome_b="yes")
+        frame = dashboard._decomposition_frame([t], None)
+        assert list(frame["entry_pA"]) == [0.30]
+        # pB − pA from the two YES-ask quotes, and the in-between cell as the outcome
+        assert dashboard._spread_observations([t]) == [(pytest.approx(0.30), 1)]
+
+    def test_chunk_keys_separate_trade_lists_that_differ_only_in_fills(self):
+        base = make_trade()
+        a = [dataclasses.replace(base, fill_price_a=0.31, fill_price_b=0.41)]
+        b = [dataclasses.replace(base, fill_price_a=0.32, fill_price_b=0.41)]
+        c = [dataclasses.replace(base, fill_price_a=0.31, fill_price_b=0.41, book_walked=True)]
+        keys = {dashboard._list_key(0.75, lst) for lst in (a, b, c, [base])}
+        assert len(keys) == 4
+        # Equal lists still share one key
+        twin = [dataclasses.replace(base, fill_price_a=0.31, fill_price_b=0.41)]
+        assert dashboard._list_key(0.75, twin) == dashboard._list_key(0.75, a)
+        # The three new fields are among the compared ones the key reads
+        assert {"fill_price_a", "fill_price_b", "book_walked"} <= set(dashboard._TRADE_FIELDS)
 
 
 class TestReturnsByCategory:

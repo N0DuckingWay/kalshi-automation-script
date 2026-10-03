@@ -140,7 +140,8 @@ Dependencies:
     _value_steps() and _carry_steps() (a trade's day-by-day moves and what
     the curve carries in it while open, both built from the backtester's one
     day-end path, so the per-type return lines and the risk-free hurdle read
-    the curve's own valuation), _leg_prices_for(), _cap_percent() (the injective size-cap
+    the curve's own valuation), _paid_prices() (what each leg of a trade paid, which
+    the trade rows and the Kelly scatter read), _cap_percent() (the injective size-cap
     formatter the completion lines use, so no two Size cap options can read
     alike), _band_label() (the bare "floor-ceiling" a tier-floors-off run is
     labelled with, since its floor alone gated it) and _tier_floors_bind()
@@ -305,7 +306,7 @@ Notes:
     the chunk
     visitor packs one chunk per distinct (k, trade list), sharing it between
     the scenarios that traded equal lists at one k (every cap at or above a
-    cell's peak Kelly fraction does), the
+    cell's sharing floor, backtester._sharing_floor, does), the
     interval-discount visitor keeps the primary band's per-k table rows and
     equity curves at every k and cap (_KdVisitor — a visitor that fails
     costs only that section's k and cap selection, with a notice in the
@@ -414,7 +415,12 @@ Notes:
     (BacktestSweep.config_same_event_ladders), naming a departure from this
     checkout's config rather than rendering a bare on/off. The line under it
     names the entry checkpoint (BacktestSweep.entry_checkpoint), the live
-    scheduler's weekly run time at which every simulated trade was opened.
+    scheduler's weekly run time at which every simulated trade was opened. The
+    fills line after it says how many of the primary scenario's trades walked
+    a modeled order book and how many filled at the top of the book, and, with
+    no depth model, that every trade did (_fills_html). Trade rows and the
+    Kelly scatter read what each trade paid (backtester._paid_prices); the
+    entry-price buckets and the spread calibration stay on the entry quotes.
 
     The scenario explorer's heatmap, fragility banner and equity curve read
     the "time_series" population — every time-series entry simulated alone,
@@ -469,12 +475,12 @@ from .backtester import (
     _cap_percent,
     _carry_steps,
     _exact_label,
-    _leg_prices_for,
     _live_add_on_note,
     _live_filter_text,
     _live_rule_ladder_note,
     _live_rule_view,
     _live_sizing_note,
+    _paid_prices,
     _tier_floors_bind,
     _value_steps,
 )
@@ -1016,7 +1022,8 @@ def _spread_observations(trades: list[BacktestTrade]) -> list[tuple[float, int]]
     """
     The time-series spread calibration's observations, one per time-series trade.
 
-    The prediction is the entry spread pB − pA: the market-implied probability
+    The prediction is the entry spread pB − pA, from the two YES-ask quotes at
+    entry (not the prices paid): the market-implied probability
     that the event first happens between the two deadlines. The outcome is 1
     when the pair settled A = NO, B = YES (the in-between cell, where both legs
     lose) and 0 otherwise. Same-title trades are left out — their price gap is
@@ -1615,10 +1622,10 @@ def _decomposition_aggregates(df: pd.DataFrame) -> dict:
     """
     Sum the decomposition frame's P&L four ways, for the section's bar charts.
 
-    Entry price buckets read entry_pA, which is market A's YES ask at entry for
-    both pair types, but its meaning differs: for a time_series row it is the
-    price actually PAID for the YES leg on the earlier contract, while for a
-    same_title row it is the pricier side's quote (the NO leg costs nA).
+    Entry price buckets read entry_pA, market A's YES ask at entry, for both
+    pair types. It is a quote, not what the trade paid: the leg a trade buys
+    on market A (the YES leg of a time_series trade, the NO leg of a
+    same_title one) paid its own fill price.
 
     Args:
         df (pd.DataFrame): _decomposition_frame's output. Not modified.
@@ -4502,6 +4509,71 @@ def _entry_checkpoint_html(sweep: BacktestSweep | None) -> str:
     return f'<p style="color:#616161; font-size:14px;">Entry checkpoint: {text}</p>'
 
 
+def _snapshot_day(stamp: object) -> str | None:
+    """
+    The calendar day of a depth snapshot's ISO UTC time.
+
+    Args:
+        stamp (object): A snapshot time such as "2026-10-02T21:30:00Z".
+
+    Returns:
+        str | None: "2026-10-02", or None when stamp is not a string that
+            starts with a real date.
+    """
+    if not isinstance(stamp, str):
+        return None
+    try:
+        return date.fromisoformat(stamp[:10]).isoformat()
+    except ValueError:
+        return None
+
+
+def _fills_html(sweep: BacktestSweep | None) -> str:
+    """
+    Render the page-header line saying how the run's trades filled.
+
+    Reads the run's primary scenario: how many of its trades walked a modeled
+    order book (BacktestTrade.book_walked) and how many filled at the top of
+    the book for want of depth data, beside the snapshots the book's depth
+    came from (BacktestSweep.depth_model). A run with no depth model gets a
+    red line, since every trade then filled at the top of the book, in any
+    size. The count follows the primary scenario only: the filter bar's
+    other scenarios fill their own trades.
+
+    Args:
+        sweep (BacktestSweep | None): The run's sweep payload, or None.
+
+    Returns:
+        str: One <p> line. "Fills: not recorded" with no sweep; a red
+            "Fills: no usable depth snapshot ..." line with no depth model;
+            otherwise a grey "Fills: N of T trades walked a modeled order
+            book (S snapshots, taken <first> to <last>); K at the top of the
+            book (no depth data)" line.
+    """
+    grey = '<p style="color:#616161; font-size:14px;">'
+    if sweep is None:
+        return f"{grey}Fills: not recorded</p>"
+    model = sweep.depth_model
+    if model is None:
+        return ('<p style="color:#B71C1C; font-size:14px; font-weight:700;">'
+                "Fills: no usable depth snapshot — every trade fills at the top of the "
+                "book, in any size (see the log; run python3 -m kalshi_betting.depth_model "
+                "snapshot)</p>")
+    trades = sweep.primary.trades
+    walked = sum(1 for t in trades if t.book_walked)
+    first, last = _snapshot_day(model.first_taken), _snapshot_day(model.last_taken)
+    if first is None or last is None:
+        taken = ""
+    elif first == last:
+        taken = f", taken {first}"
+    else:
+        taken = f", taken {first} to {last}"
+    snapshots = f"{model.snapshots} snapshot{'' if model.snapshots == 1 else 's'}{taken}"
+    return (f"{grey}Fills: {walked} of {len(trades)} trades walked a modeled order book "
+            f"({snapshots}); {len(trades) - walked} at the top of the book "
+            "(no depth data)</p>")
+
+
 def _corpus_provenance_html(sweep: BacktestSweep | None) -> str:
     """
     Render the page-header line saying what settled-market corpus the run read.
@@ -5152,13 +5224,13 @@ def _trade_row(t: BacktestTrade, color: str) -> str:
     market, the date that market closed for trading and the price paid per
     contract — and, separately, the side the market settled on and when, marked
     won or lost for the side this trade held. Which side each leg bought comes
-    from scanner.leg_sides and the prices from backtester._leg_prices_for, the
-    same single sources the simulation priced and paid out with.
+    from scanner.leg_sides and the prices from backtester._paid_prices (the
+    average each leg paid, over the book the trade walked), the same single
+    sources the simulation priced and paid out with.
 
-    The row is its two halves joined, _trade_row_head (everything but the
+    The row is its two halves joined, _trade_row_head (everything up to the
     size cells) and _trade_row_tail (the size cells), so the page-wide filter
-    can ship each distinct head once, for every scenario that shows it, and
-    still show exactly this row.
+    can ship each distinct head once and still show exactly this row.
 
     Args:
         t (BacktestTrade): Trade to display.
@@ -5178,18 +5250,18 @@ _TRADE_CELL = "<td style='padding:4px 8px;vertical-align:top;'>"
 
 def _trade_row_head(t: BacktestTrade, color: str) -> str:
     """
-    Render the first half of a best/worst-trade row: everything but the size cells.
+    Render the first half of a best/worst-trade row, up to the size cells.
 
     Everything from the <tr> through the outcome cell: the entry date, the
     pair type, the prices paid, each leg's side, market and close date, and
     how each leg settled — for a trade sold before it paid out (a Sell
     level), each leg's sale day and price, or its payout when its market paid
-    out before the sale, beside how it settled. It holds no contract count,
-    cost or profit, so size-cap scenarios that traded this pair on this entry
-    date usually show the same head; a sale price walked down a modeled bid
-    ladder is an average over the position's size, so a sold trade's head can
-    differ between them. The filter payload stores each distinct head once,
-    in a table shared by every chunk (_ChunkVisitor).
+    out before the sale, beside how it settled. The prices are what the trade
+    paid per contract (backtester._paid_prices) and, for a sold trade, the
+    average it sold at, so a trade that walked a book can show a different
+    head at a different size; the filter payload stores each distinct head
+    once, in a table shared by every chunk (_ChunkVisitor), so scenarios
+    whose heads read alike share it.
 
     Args:
         t (BacktestTrade): Trade to display.
@@ -5200,8 +5272,7 @@ def _trade_row_head(t: BacktestTrade, color: str) -> str:
             Kalshi-controlled string escaped; _trade_row_tail closes it.
     """
     side_a, side_b = leg_sides(t.pair_type)
-    price_a, price_b = _leg_prices_for(t.pair_type, t.entry_pA, t.entry_nA,
-                                       t.entry_pB, t.entry_nB)
+    price_a, price_b = _paid_prices(t)
     paid = {side_a: price_a, side_b: price_b}
     legs = (
         (side_a, price_a, t.title_a, t.subtitle_a, t.ticker_a, t.close_date_a,
@@ -5366,6 +5437,30 @@ def _section_diagnostics(trades: list[BacktestTrade]) -> str:
 
 # ─── Section 7: Risk Metrics ──────────────────────────────────────────────────
 
+def _quotes_at_fills(t: BacktestTrade) -> tuple[float, float, float, float]:
+    """
+    A trade's four quotes, with the two legs it bought replaced by what it paid.
+
+    What the live sizer prices a trade at: the leg prices are the average the
+    trade paid (backtester._paid_prices), while the other market's YES ask
+    stays the quote, since the time-series probability model reads it as the
+    reference. For a time_series trade that is (YES fill on A, A's NO quote,
+    B's YES quote, NO fill on B); for a same_title trade (A's YES quote, NO
+    fill on A, YES fill on B, B's NO quote). A trade built without fills pays
+    its quotes, so this returns them unchanged.
+
+    Args:
+        t (BacktestTrade): A trade.
+
+    Returns:
+        tuple[float, float, float, float]: (pA, nA, pB, nB) for _kelly_fraction.
+    """
+    paid_a, paid_b = _paid_prices(t)
+    if t.pair_type == "time_series":
+        return paid_a, t.entry_nA, t.entry_pB, paid_b
+    return t.entry_pA, paid_a, paid_b, t.entry_nB
+
+
 def _kelly_points(trades: list[BacktestTrade],
                   k: float | None) -> tuple[list[float], list[float]]:
     """
@@ -5377,17 +5472,19 @@ def _kelly_points(trades: list[BacktestTrade],
             handed to _kelly_fraction (None resolves to the config constant).
 
     Returns:
-        tuple[list[float], list[float]]: (uncapped Kelly fraction, fraction of
+        tuple[list[float], list[float]]: (uncapped Kelly fraction at the
+            prices the trade paid, fraction of
             the base the trade was sized on actually committed — fee-inclusive
             cost over BacktestTrade.balance_at_entry, the portfolio value at
             the entry checkpoint with open trades at market, 0.0 when that
             value is not positive), each in trade order.
     """
-    # Pass all four entry quotes — _kelly_fraction picks the leg prices per pair
-    # type — plus the run's interval discount, so an --interval-discount run
-    # plots the Kelly its trades were actually sized at rather than the config one
+    # The four quotes with the legs at the prices paid (_quotes_at_fills) —
+    # _kelly_fraction picks the leg prices per pair type — plus the run's
+    # interval discount, so an --interval-discount run plots the Kelly its
+    # trades were actually sized at rather than the config one
     kelly_fracs = [
-        _kelly_fraction(t.entry_pA, t.entry_nA, t.entry_pB, t.entry_nB, t.pair_type, k=k)
+        _kelly_fraction(*_quotes_at_fills(t), t.pair_type, k=k)
         for t in trades
     ]
     # The actual fraction uses the portfolio value at each trade's entry
@@ -7645,7 +7742,8 @@ class _ExplorerVisitor:
     (_explorer_curve), as compact strict JSON text — the only per-scenario
     thing it keeps across cells, besides the headline population's seven
     numbers the heatmap's cap-dependent matrices are made of. Within a cell,
-    the points of the caps at or above its peak Kelly fraction share their
+    the points of the caps at or above its sharing floor
+    (backtester._sharing_floor) share their
     trades, curve, split halves and top-event check (backtester.CapSweep),
     so each row is computed once per distinct (trades, curve, halves, top
     event, population) — keyed by the objects' identities, which the cell
@@ -7808,7 +7906,7 @@ class _ExplorerVisitor:
         # Every input of the row: the trades and the curve (_point_kpis), the
         # halves and the top-event check (_robustness_extras) and the
         # population (which extras and whether a curve). Copies sharing all
-        # four objects — the caps at or above a cell's peak — share the row
+        # four objects — the caps at or above a cell's sharing floor — share the row
         key = (id(point.trades), id(point.equity_df), id(point.halves), point.ex_top_event,
                population)
         hit = self._cache.get(key)
@@ -7897,7 +7995,7 @@ class _ExplorerVisitor:
                         # Python draws the primary scenario's curve itself
                         self.primary_curve = _curve_on_axis(point.equity_df, self.axis)
             # Caps whose rows are the same texts (every cap at or above the
-            # cell's peak) share one joined text: what is kept across cells
+            # cell's sharing floor) share one joined text: what is kept across cells
             joined = tuple(id(part) for part in parts)
             if joined not in self._joined:
                 self._joined[joined] = "[" + ",".join(parts) + "]"
@@ -8229,13 +8327,13 @@ class _ChunkVisitor:
     tag view of it (_list_payload), packed on its own
     (<script id="dash-chunk-N">), so the page's script inflates one only when
     a reader chooses it. Scenarios whose trade lists are equal at an equal k
-    share one chunk (_list_key) — every cap at or above a cell's peak Kelly
-    fraction trades the same list. The primary scenario's chunk is built from
+    share one chunk (_list_key) — every cap at or above a cell's sharing
+    floor (backtester._sharing_floor) trades the same list. The primary scenario's chunk is built from
     the page's own trades and curve, first, so it is chunk 0 and its views
     are exactly what the sections render. Trade-table rows are split
-    (_trade_row_head / _trade_row_tail): the heads, which hold no contract
-    count, go in one table shared by every chunk (heads, shipped in the base
-    block, each distinct head once), the tails in the chunk's own strings.
+    (_trade_row_head / _trade_row_tail): the heads go in one table shared by
+    every chunk (heads, shipped in the base block), where equal heads are
+    stored once, the tails in the chunk's own strings.
 
     A tier-floors-off cell the walk hands to `off` is packed the same way
     (never substituting the page's own trades: it is its own run) and filed
@@ -8349,7 +8447,7 @@ class _ChunkVisitor:
         self.primary_views: dict | None = None
         self.failed = False
         # (phase, band, k) of the cell whose list keys are memoised: a cell's
-        # caps at or above its peak share one trade list, so its key is
+        # caps at or above its sharing floor share one trade list, so its key is
         # computed once. The phase ("on", "off", "add" or "add_off") is part
         # of it: another phase's lists are new objects, whose ids may reuse
         # those of the cell walked last
@@ -8947,7 +9045,7 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
             for li, (_level, by_cap) in enumerate(levels):
                 cut = _cut_to_axis({cap: {_ALL_VIEW: point} for cap, point in by_cap.items()
                                     if point is not None}, axis_end)
-                # One key per trade list: caps at or above a peak share one
+                # One key per trade list: caps at or above a sharing floor share one
                 keys: dict[int, str] = {}
                 for ci in wanted:
                     pops = cut.get(task.caps[ci])
@@ -9718,7 +9816,8 @@ def _list_payload(
             (its chunk's own table): category tables and trade-row tails.
         heads (_StringTable): Keyword-only. The table of trade-row heads
             (_trade_row_head) shared by every chunk of the page, each distinct
-            head once: size-cap scenarios that show a trade alike share it.
+            head stored once: scenarios that trade one pair at prices that
+            read alike share its head.
         risk_free (RiskFreeRates | None): Keyword-only. The rates every
             view's Sharpe and Sortino subtract (_view_payload). None (default)
             subtracts nothing.
@@ -11408,8 +11507,8 @@ def generate_dashboard(
     four-argument positional call works. Omit both and
     the interval-discount and scenario-explorer sections each show the same
     kind of short placeholder every other builder emits for empty input, and
-    the header's run-settings and entry-checkpoint lines read "not recorded"
-    — with no coverage line and no strike-blind notice, since that path has
+    the header's run-settings, entry-checkpoint and fills lines read "not
+    recorded" — with no coverage line and no strike-blind notice, since that path has
     no census to report.
 
     Args:
@@ -11440,8 +11539,10 @@ def generate_dashboard(
             population scenarios and the run's outcome-label census, and
             splitting it would create copies that could disagree. It also
             feeds the header's run-settings line (_run_settings_html), the
-            live-rule line under it (_live_rule_html) and the entry-checkpoint
-            line (_entry_checkpoint_html). None
+            live-rule line under it (_live_rule_html), the entry-checkpoint
+            line (_entry_checkpoint_html) and the fills line (_fills_html:
+            how many of its primary trades walked a modeled order book, from
+            which depth snapshots). None
             (default) renders both sections' placeholders and the k-hat
             breakdown's "not recorded" notice — and therefore no coverage line
             either, which is honest: that path shows no k̂ card
@@ -11725,6 +11826,8 @@ def generate_dashboard(
 
     # The weekly moment every entry was priced at, under the run-settings line
     entry_checkpoint = _entry_checkpoint_html(sweep)
+    # How the trades filled: over a modeled order book, or at the top of the book
+    fills_note = _fills_html(sweep)
 
     # Each section is built as it is written, so only one is alive at a time
     sections = (
@@ -11786,6 +11889,7 @@ def generate_dashboard(
 {run_settings}
 {live_rule}
 {entry_checkpoint}
+{fills_note}
 {rf_note}
 {header_note}
 {filter_bar}

@@ -88,7 +88,8 @@ Dependencies:
     (BacktestTrade, BacktestSweep,
     IntervalCalibration, OutcomeLabelCoverage and SweepPoint are consumed by
     dashboard.py, which also imports the private helpers _exact_label,
-    _leg_prices_for, _build_equity_curve — the one definition of an equity
+    _paid_prices (what a trade paid, which its trade rows and Kelly
+    scatter read), _build_equity_curve — the one definition of an equity
     curve, which its page-wide filter runs over a category's or tag's trades
     for that slice's curve — _calibration_bucket, _band_label (the bare
     "floor-ceiling" its filter bar and scenario explorer name a band's
@@ -7751,7 +7752,8 @@ def _cents(dollars: float) -> int:
 
     Rounded to 6 decimals first (config.leg_cash_cents' idiom), so float
     noise such as 0.29 * 100 = 28.999999999999996 never costs a cent; a real
-    fraction of a cent is dropped.
+    fraction of a cent is dropped. The same rounding reads an amount a hair
+    under a whole cent (0.09999999999999998) as that cent.
 
     Args:
         dollars (float): An amount in dollars, at least 0 up to float noise
