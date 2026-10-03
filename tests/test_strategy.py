@@ -832,6 +832,112 @@ class TestComputeTradeAddsToHeldPair:
         assert "adds to" not in caplog.text
 
 
+class TestComputeTradeQuiet:
+    """compute_trade(quiet=True) logs its "Trade computed" and add-on lines at
+    DEBUG instead of INFO, and changes nothing else: the same spec, the same
+    text, and the non-convergence WARNING still a WARNING."""
+
+    _SETTINGS = TestComputeTradeAddsToHeldPair._SETTINGS
+
+    @staticmethod
+    def _records(caplog):
+        """(level, message) of every record caplog took."""
+        return [(r.levelno, r.getMessage()) for r in caplog.records]
+
+    def _run(self, caplog, pair, quiet, cash_cents=TestComputeTradeAddsToHeldPair._CASH_CENTS):
+        """compute_trade at the add-on class's value and settings, with its records."""
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            spec = compute_trade(pair, TestComputeTradeAddsToHeldPair._VALUE_CENTS,
+                                 settings=self._SETTINGS, cash_cents=cash_cents, quiet=quiet)
+        return spec, self._records(caplog)
+
+    @pytest.mark.parametrize("held", [None, _held_pair(value=8.0)], ids=["new", "add-on"])
+    def test_the_trade_line_moves_to_debug(self, caplog, held):
+        pair = dataclasses.replace(
+            make_booked_pair([(_TS_PA, _TS_NB, 100)], pair_type="time_series", pB=_TS_PB),
+            held=held)
+        loud, loud_records = self._run(caplog, pair, quiet=False)
+        quiet, quiet_records = self._run(caplog, pair, quiet=True)
+        assert loud == quiet and loud is not None
+        [loud_line] = [r for r in loud_records if r[1].startswith("Trade computed")]
+        [quiet_line] = [r for r in quiet_records if r[1].startswith("Trade computed")]
+        assert loud_line[0] == logging.INFO and quiet_line[0] == logging.DEBUG
+        assert loud_line[1] == quiet_line[1]
+        # Nothing else moves level
+        assert [r for r in loud_records if r != loud_line] == [
+            r for r in quiet_records if r != quiet_line]
+
+    @pytest.mark.parametrize(("value", "cash_cents"), [(30.0, 15_000), (8.0, 0)],
+                             ids=["kelly-share", "no-size"])
+    def test_the_add_on_line_moves_to_debug(self, caplog, value, cash_cents):
+        # Worth $30 holds its share; worth $8 with no cash fits no size
+        pair = dataclasses.replace(
+            make_booked_pair([(_TS_PA, _TS_NB, 1000)], pair_type="time_series", pB=_TS_PB),
+            held=_held_pair(value=value))
+        loud_spec, loud = self._run(caplog, pair, quiet=False, cash_cents=cash_cents)
+        quiet_spec, quiet = self._run(caplog, pair, quiet=True, cash_cents=cash_cents)
+        assert loud_spec is None and quiet_spec is None
+        [loud_line] = [r for r in loud if r[1].startswith("Not adding to held pair")]
+        assert loud_line[0] == logging.INFO
+        assert quiet == [(logging.DEBUG, m) if (lvl, m) == loud_line else (lvl, m)
+                         for lvl, m in loud]
+
+    def test_the_non_convergence_warning_stays_a_warning(self, caplog, monkeypatch):
+        # One bisection pass cannot close a 100-contract search
+        monkeypatch.setattr(strategy, "SIZE_SOLVE_MAX_ITERATIONS", 1)
+        pair = make_booked_pair([(_TS_PA, _TS_NB, 100)], pair_type="time_series", pB=_TS_PB)
+        _spec, records = self._run(caplog, pair, quiet=True)
+        [line] = [r for r in records if "did not converge" in r[1]]
+        assert line[0] == logging.WARNING
+        assert not [r for r in records if r[0] == logging.INFO]
+
+    def test_quiet_is_off_by_default(self):
+        default = inspect.signature(compute_trade).parameters["quiet"]
+        assert default.kind is inspect.Parameter.KEYWORD_ONLY and default.default is False
+
+    def test_a_pair_that_is_not_tradeable_logs_its_add_on_line_at_debug(self, caplog):
+        # The first refusal compute_trade can make, before any sizing
+        pair = dataclasses.replace(
+            make_booked_pair([(_TS_PA, _TS_NB, 100)], pair_type="time_series", pB=_TS_PB),
+            held=_held_pair(value=8.0), tradeable=False)
+        spec, loud = self._run(caplog, pair, quiet=False)
+        assert spec is None
+        assert loud == [(logging.INFO, "Not adding to held pair 'booked pair': no size fits "
+                                       "this run")]
+        _spec, quiet = self._run(caplog, pair, quiet=True)
+        assert quiet == [(logging.DEBUG, loud[0][1])]
+
+    def test_ast_every_quiet_line_reads_the_quiet_level(self):
+        # Every refusal line and the Trade computed line are logged at `info`,
+        # which quiet sets to DEBUG
+        assert _quiet_level_problems(inspect.getsource(strategy)) == []
+
+    def test_ast_the_quiet_check_catches_its_mutants(self):
+        source = inspect.getsource(strategy)
+        not_tradeable = ("    if not pair.tradeable:\n"
+                         "        _log_no_add_on(pair, holds_kelly_share=False,\n"
+                         "                       portfolio_value_cents=portfolio_value_cents, "
+                         "level=info)\n")
+        assert source.count(not_tradeable) == 1
+        trade_line = "    logging.log(\n        info,\n        \"Trade computed:"
+        assert source.count(trade_line) == 1
+        info = "info = logging.DEBUG if quiet else logging.INFO"
+        assert source.count(info) == 1
+        mutants = {
+            "a refusal line at INFO": source.replace(
+                not_tradeable, not_tradeable.replace(", level=info", "")),
+            "the trade line at INFO": source.replace(
+                trade_line, "    logging.info(\n        \"Trade computed:"),
+            "the trade line at a fixed level": source.replace(
+                trade_line, trade_line.replace("info,", "logging.INFO,")),
+            "quiet ignored": source.replace(info, "info = logging.INFO"),
+        }
+        for name, mutant in mutants.items():
+            assert mutant != source, name
+            assert _quiet_level_problems(mutant), name
+
+
 def _bookless_pair(nA: float = 0.30, pB: float = 0.30) -> CandidatePair:
     """A real same-title CandidatePair with no book, on plain markets."""
     now = datetime.now(UTC)
@@ -1204,6 +1310,46 @@ def _refusal_line_problems(source: str) -> list[str]:
         if [ast.unparse(k.value) for k in call.keywords if k.arg == "cash_cents"] != [
                 "cash_cents"]:
             problems.append("_holds_kelly_share is not handed the cash")
+    return problems
+
+
+def _quiet_level_problems(source: str) -> list[str]:
+    """
+    Check that compute_trade's quiet setting reaches every line it covers.
+
+    compute_trade sets `info` once, to DEBUG when quiet and INFO otherwise;
+    every refusal line (_log_no_add_on) and the "Trade computed" line must be
+    logged at that level, so a quiet caller gets no INFO line from any path.
+
+    Args:
+        source (str): Source text holding def compute_trade (strategy.py's own,
+            or a changed copy).
+
+    Returns:
+        list[str]: One short sentence per rule it breaks; empty when it keeps them all.
+    """
+    func = _def_named(source, "compute_trade")
+    problems = []
+    infos = [n.value for n in ast.walk(func) if isinstance(n, ast.Assign)
+             and any(isinstance(t, ast.Name) and t.id == "info" for t in n.targets)]
+    if [ast.unparse(v) for v in infos] != ["logging.DEBUG if quiet else logging.INFO"]:
+        problems.append("info is not set once from quiet")
+    refusals = _calls_to(func, "_log_no_add_on")
+    if not refusals:
+        problems.append("compute_trade has no refusal line")
+    for call in refusals:
+        if [ast.unparse(k.value) for k in call.keywords if k.arg == "level"] != ["info"]:
+            problems.append(f"the refusal line at line {call.lineno} is not logged at info")
+    for call in [n for n in ast.walk(func) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)
+                 and isinstance(n.func.value, ast.Name) and n.func.value.id == "logging"]:
+        if call.func.attr == "log":
+            if not call.args or ast.unparse(call.args[0]) != "info":
+                problems.append(f"the line at line {call.lineno} is not logged at info")
+        elif call.func.attr in ("info", "debug"):
+            problems.append(f"logging.{call.func.attr} at line {call.lineno} ignores quiet")
+    if not _calls_to(func, "log"):
+        problems.append("compute_trade logs no Trade computed line")
     return problems
 
 
@@ -1804,13 +1950,34 @@ class TestTimeSeriesKellyParity:
         # share a close_time — from the 30% tier to the 15% one.
         assert _function_calls(scanner, "_pair_max_sum", "pair_gap_days")
         assert not _function_calls(scanner, "_pair_max_sum", "deadline_gap_days")
-        assert _function_calls(scanner, "enrich_with_orderbook_prices", "pair_gap_days")
-        assert not _function_calls(
-            scanner, "enrich_with_orderbook_prices", "deadline_gap_days")
+        assert _function_calls(scanner, "_enrich_pair", "pair_gap_days")
+        assert not _function_calls(scanner, "_enrich_pair", "deadline_gap_days")
         # validate_pair_price's ceiling test too: a wider close_time gap could raise
         # the floor, and its BELOW_FLOOR answer would let an over-ceiling spread pass
         assert _function_calls(scanner, "validate_pair_price", "pair_gap_days")
         assert not _function_calls(scanner, "validate_pair_price", "deadline_gap_days")
+
+    def test_ast_enrichment_prices_each_pair_through_enrich_pair(self):
+        # The live wrapper fetches the books and hands each pair to
+        # _enrich_pair, the one step that prices a pair off its books, so the
+        # wrapper prices nothing itself
+        assert _function_calls(scanner, "enrich_with_orderbook_prices", "_enrich_pair")
+        for helper in ("_leg_ask_levels", "_pair_orderbooks", "prefix_fill_prices",
+                       "_reference_yes_ask", "_pair_max_sum", "_levels_with_edge_after_fee",
+                       "max_affordable_pairs", "time_series_spread_refusal"):
+            assert _function_calls(scanner, "_enrich_pair", helper), helper
+            assert not _function_calls(scanner, "enrich_with_orderbook_prices", helper), helper
+        # ... handing it the run's settings and cash by their bare names
+        for keyword, name in (("settings", "settings"), ("cash_cents", "cash_cents")):
+            [value] = _keyword_values(scanner, "enrich_with_orderbook_prices", "_enrich_pair",
+                                      keyword)
+            assert isinstance(value, ast.Name) and value.id == name, keyword
+        # _enrich_pair requires settings, keyword-only, so it never reads config's
+        [node] = [n for n in ast.walk(ast.parse(inspect.getsource(scanner)))
+                  if isinstance(n, ast.FunctionDef) and n.name == "_enrich_pair"]
+        kwonly = [a.arg for a in node.args.kwonlyargs]
+        assert "settings" in kwonly
+        assert node.args.kw_defaults[kwonly.index("settings")] is None
 
     def test_ast_the_series_prefix_has_one_definition(self):
         # The backtester must not re-split the event ticker itself: the mirror
@@ -2159,7 +2326,7 @@ class TestTimeSeriesKellyParity:
                         f"{mod}.{node.name} gives settings a default; only a whitelisted "
                         "entry point may, and it must resolve it")
         # Non-vacuous: the helpers and entry points this rule exists for
-        assert {"find_time_series_pairs", "enrich_with_orderbook_prices",
+        assert {"find_time_series_pairs", "enrich_with_orderbook_prices", "_enrich_pair",
                 "validate_pair_price", "pre_execution_check", "_pair_max_sum",
                 "live_time_series_floor", "time_series_spread_refusal",
                 "max_kelly_fraction", "_run_dev", "_run_prod", "compute_trade",
@@ -2561,9 +2728,8 @@ class TestTimeSeriesKellyParity:
         # Every live site of the spread rule (and enrichment's bound) goes through
         # its one definition
         assert _function_calls(scanner, "find_time_series_pairs", "time_series_spread_refusal")
-        assert _function_calls(scanner, "enrich_with_orderbook_prices",
-                               "time_series_spread_refusal")
-        assert _function_calls(scanner, "enrich_with_orderbook_prices", "max_kelly_fraction")
+        assert _function_calls(scanner, "_enrich_pair", "time_series_spread_refusal")
+        assert _function_calls(scanner, "_enrich_pair", "max_kelly_fraction")
         assert _function_calls(scanner, "validate_pair_price", "time_series_spread_refusal")
         assert _function_calls(scanner, "_pair_max_sum", "live_time_series_floor")
         # ... which reaches the floor through the helper _find_entry uses
@@ -2679,7 +2845,7 @@ class TestTimeSeriesKellyParity:
         # portfolio walk and the shard funder cannot disagree
         assert _function_calls(strategy, "_evaluate_size", "kelly_budget")
         assert _function_calls(config, "max_affordable_pairs", "kelly_budget")
-        assert _function_calls(scanner, "enrich_with_orderbook_prices", "kelly_budget")
+        assert _function_calls(scanner, "_enrich_pair", "kelly_budget")
         # The backtest budgets the same way: each Monday's portfolio value
         # (cash plus open trades at market, backtester._open_value), never
         # more than the running cash
@@ -2696,7 +2862,7 @@ class TestTimeSeriesKellyParity:
         assert isinstance(cash_arg, ast.Name) and cash_arg.id == "cash"
         # The sizer and enrichment hand the cash on to the one count helper
         for module, func in ((strategy, "_evaluate_size"),
-                             (scanner, "enrich_with_orderbook_prices")):
+                             (scanner, "_enrich_pair")):
             [value] = _keyword_values(module, func, "max_affordable_pairs", "cash_cents")
             assert isinstance(value, ast.Name) and value.id == "cash_cents", func
         # The sizer passes the cash to every size it evaluates
@@ -2782,7 +2948,8 @@ class TestTimeSeriesKellyParity:
         assert source.count(budget) == 1
         refusal = ("    if min_payoff <= 0:\n"
                    "        _log_no_add_on(pair, holds_kelly_share=False,\n"
-                   "                       portfolio_value_cents=portfolio_value_cents)\n")
+                   "                       portfolio_value_cents=portfolio_value_cents, "
+                   "level=info)\n")
         assert source.count(refusal) == 1
         cash = "settings, cash_cents=cash_cents),"
         assert source.count(cash) == 2

@@ -432,16 +432,17 @@ def _holds_kelly_share(
 
 
 def _log_no_add_on(pair: CandidatePair, holds_kelly_share: bool, *,
-                   portfolio_value_cents: int) -> None:
+                   portfolio_value_cents: int, level: int = logging.INFO) -> None:
     """
     Log why compute_trade adds nothing to a held pair; an ordinary pair logs nothing.
 
     An add-on to a held pair (scanner.pair_held) that sizes to nothing gets
-    one INFO line, so a run that found a held pair and added nothing says
-    why. compute_trade calls this once, at the return that refuses the pair;
-    the sizes its search tries on the way are never logged. The Kelly-share
-    line names the two parts of the pair's stake, its worth at today's
-    prices and the fees paid for it, beside the portfolio value.
+    one line (INFO unless the caller passes level), so a run that found a
+    held pair and added nothing says why. compute_trade calls this once, at
+    the return that refuses the pair; the sizes its search tries on the way
+    are never logged. The Kelly-share line names the two parts of the pair's
+    stake, its worth at today's prices and the fees paid for it, beside the
+    portfolio value.
 
     Args:
         pair (CandidatePair): The pair compute_trade was asked to size.
@@ -451,12 +452,14 @@ def _log_no_add_on(pair: CandidatePair, holds_kelly_share: bool, *,
             profit after exact fees, no cash) is "no size fits this run".
         portfolio_value_cents (int): Keyword-only. The value compute_trade sized on, in
             cents; the Kelly-share line names it.
+        level (int): Keyword-only. The line's log level; INFO by default.
     """
     held = pair_held(pair)
     if held is None:
         return
     if holds_kelly_share:
-        logging.info(
+        logging.log(
+            level,
             "Not adding to held pair '%s': it already holds its Kelly share "
             "(%g contracts each, worth $%.2f at today's prices, fees paid $%.2f, "
             "portfolio value $%.2f)",
@@ -464,8 +467,8 @@ def _log_no_add_on(pair: CandidatePair, holds_kelly_share: bool, *,
             portfolio_value_cents / 100,
         )
     else:
-        logging.info("Not adding to held pair '%s': no size fits this run",
-                     pair.canonical_title)
+        logging.log(level, "Not adding to held pair '%s': no size fits this run",
+                    pair.canonical_title)
 
 
 def _order_cash_cents(pair: CandidatePair, n: int, price_a: float, price_b: float) -> int:
@@ -529,7 +532,7 @@ def _priced_pair(pair: CandidatePair, n: int, price_a: float, price_b: float) ->
 
 def compute_trade(
     pair: CandidatePair, portfolio_value_cents: int, *, settings: LiveSettings | None = None,
-    cash_cents: int | None = None,
+    cash_cents: int | None = None, quiet: bool = False,
 ) -> TradeSpec | None:
     """
     Size a candidate pair into a TradeSpec, or return None if it is not worth trading.
@@ -547,13 +550,15 @@ def compute_trade(
     config.held_pair_fraction's, what the held pair's stake (its worth at
     today's prices plus the fees paid for it) is missing of that share of the
     portfolio value, never more than a new pair would get. When compute_trade
-    returns None for an add-on it logs one INFO line saying why.
+    returns None for an add-on it logs one INFO line saying why (DEBUG when quiet).
 
     Args:
         pair (CandidatePair): Must be tradeable; max_contracts 0 means no depth limit.
         portfolio_value_cents (int): Cash plus open positions' value, in cents (the cash alone if nothing is held).
         settings (LiveSettings | None): Keyword-only. The run's settings; None reads config.py's (tests only).
         cash_cents (int | None): Keyword-only. The cash on hand in cents; None means it is all cash.
+        quiet (bool): Keyword-only. True logs the "Trade computed" and add-on lines at
+            DEBUG instead of INFO (the backtest sizes many trades); warnings are unchanged.
 
     Returns:
         TradeSpec | None: The sized trade, or None if the pair is not tradeable, no size is worth
@@ -565,9 +570,11 @@ def compute_trade(
     """
     # Resolved once, so every size this call evaluates reads one k and cap
     settings = live_settings() if settings is None else settings
+    # The level of this call's INFO lines
+    info = logging.DEBUG if quiet else logging.INFO
     if not pair.tradeable:
         _log_no_add_on(pair, holds_kelly_share=False,
-                       portfolio_value_cents=portfolio_value_cents)
+                       portfolio_value_cents=portfolio_value_cents, level=info)
         return None
 
     # Book levels from enrichment; () means size on the scalar leg prices
@@ -580,7 +587,7 @@ def compute_trade(
             # For an add-on, say whether its Kelly share or something else refused it
             _log_no_add_on(pair, _holds_kelly_share(pair, levels, portfolio_value_cents,
                                                     settings, cash_cents=cash_cents),
-                           portfolio_value_cents=portfolio_value_cents)
+                           portfolio_value_cents=portfolio_value_cents, level=info)
             return None
         # The size whose OWN fill price justifies it, and that price
         n = sized.n
@@ -591,7 +598,7 @@ def compute_trade(
             # For an add-on, say whether its Kelly share or something else refused it
             _log_no_add_on(pair, _holds_kelly_share(pair, levels, portfolio_value_cents,
                                                     settings, cash_cents=cash_cents),
-                           portfolio_value_cents=portfolio_value_cents)
+                           portfolio_value_cents=portfolio_value_cents, level=info)
             return None
         # No book (e.g. the bare pair the backtester's Kelly-parity test builds):
         # the single-shot sizing, which must stay unchanged
@@ -616,7 +623,7 @@ def compute_trade(
         if n < 1:
             # Fees ate the entire Kelly budget — no contract count fits
             _log_no_add_on(pair, holds_kelly_share=False,
-                           portfolio_value_cents=portfolio_value_cents)
+                           portfolio_value_cents=portfolio_value_cents, level=info)
             return None
         if not levels or n == priced_n:
             # The cost at the prices n is actually filled at fits the budget
@@ -651,7 +658,7 @@ def compute_trade(
         if n < 1:
             # Nothing the cap can reach
             _log_no_add_on(pair, holds_kelly_share=False,
-                           portfolio_value_cents=portfolio_value_cents)
+                           portfolio_value_cents=portfolio_value_cents, level=info)
             return None
         # A cheaper leg can cost a cent more in exact fee (p(1 - p) grows
         # toward 0.5), so the re-priced cost can overrun the budget again:
@@ -662,7 +669,7 @@ def compute_trade(
     min_payoff = n * (1.0 - price_a - price_b) - fee_a - fee_b
     if min_payoff <= 0:
         _log_no_add_on(pair, holds_kelly_share=False,
-                       portfolio_value_cents=portfolio_value_cents)
+                       portfolio_value_cents=portfolio_value_cents, level=info)
         return None
 
     total_cost = n * (price_a + price_b)
@@ -692,7 +699,8 @@ def compute_trade(
     # The held pair this trade adds to, if any; the _priced_pair copy below
     # keeps it, so it reaches spec.pair
     held = pair_held(pair)
-    logging.info(
+    logging.log(
+        info,
         "Trade computed: %s [%s] | %s(A)@%.2f + %s(B)@%.2f | p=%.2f kelly=%.1f%% n=%d "
         "cost=$%.2f profit_ratio=%.2f%% monthly=%.2f%%%s",
         pair.canonical_title,
