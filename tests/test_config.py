@@ -1339,6 +1339,21 @@ class TestContractPayout:
         assert type(config.CONTRACT_PAYOUT_DOLLARS) is float
 
 
+class TestTakeProfitHoldDays:
+    """TAKE_PROFIT_HOLD_DAYS: how many days in a row the backtest's sell rule
+    needs a position at its level before selling it (backtest-only).
+
+    Shipped at 3: the checkpoint and the two days before it. It must be a
+    whole number from 1 to 7 (backtester._resolve_hold_days refuses anything
+    else), so every daily check falls within the week since the previous
+    checkpoint.
+    """
+
+    def test_three_days_ship(self):
+        assert config.TAKE_PROFIT_HOLD_DAYS == 3
+        assert type(config.TAKE_PROFIT_HOLD_DAYS) is int
+
+
 class TestDescribeTimeSeriesRule:
     """describe_time_series_rule says "no spread band" for (0, 1) alone and
     names any band with a floor or a ceiling of its own."""

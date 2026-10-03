@@ -520,7 +520,8 @@ def main() -> None:
     parser.add_argument(
         "--no-sell-sweep", action="store_true",
         help="Skip the dashboard's Sell select (sell a whole position once it has "
-             "made a chosen share of the profit it could make): its simulations run "
+             "held a chosen share of the profit it could make for "
+             "config.TAKE_PROFIT_HOLD_DAYS days in a row): its simulations run "
              "only while the dashboard is built, so skipping them makes that step "
              "much faster and leaves the select disabled. Backtest only — live "
              "trading never sells a position",
