@@ -1841,6 +1841,37 @@ CANDLESTICK_MAX_CANDLES_PER_REQUEST = 5000
 # older version is fetched again (version 2 adds the hour's traded volume).
 CANDLESTICK_CACHE_FIELDS_VERSION = 2
 
+# The backtest's depth model (depth_model.py): a table of how many contracts
+# typically rest near the best bid of a live Kalshi book, fitted to saved
+# snapshots, from which the backtest builds a synthetic book at each checkpoint.
+# Backtest only; no live-trading module reads any of it.
+#
+# How far below the best bid the table is read, in dollars. Each entry is the
+# contracts resting at or within that distance of the best bid.
+DEPTH_MODEL_DISTANCES = (0.0, 0.01, 0.02, 0.03, 0.05, 0.10, 0.20)
+# Edges of the 24-hour volume buckets, in contracts traded:
+# 0 | 1-99 | 100-999 | 1,000-9,999 | 10,000+.
+DEPTH_MODEL_VOLUME_EDGES = (1, 100, 1_000, 10_000)
+# Edges of the best-bid price bands, in dollars:
+# under 5c | 5-20c | 20-50c | 50-80c | 80-95c | 95c and over.
+DEPTH_MODEL_PRICE_EDGES = (0.05, 0.20, 0.50, 0.80, 0.95)
+# Which quantile of the saved ladders each table cell reports (0.5 = the median).
+DEPTH_MODEL_QUANTILE = 0.5
+# A cell fitted to fewer ladders than this reads its volume row instead, and a
+# volume row fitted to fewer reads the table over all ladders.
+DEPTH_MODEL_MIN_LADDERS = 20
+# How many open markets one snapshot samples.
+DEPTH_SNAPSHOT_MARKETS = 2_000
+# Folder under the backtest cache that holds the saved snapshots.
+DEPTH_SNAPSHOTS_DIRNAME = "depth_snapshots"
+# The trailing window, in seconds, whose traded contracts make a market's
+# volume feature.
+DEPTH_VOLUME_WINDOW_SECONDS = 86_400
+# Threads a snapshot uses to read books and candles.
+DEPTH_SNAPSHOT_MAX_WORKERS = 4
+# A snapshot logs its progress after every this many markets.
+DEPTH_SNAPSHOT_PROGRESS_EVERY = 250
+
 
 def min_price_diff_for_gap(gap_days: int, spread_min: float | None = None, *,
                            tier_floors: bool = True) -> float:
