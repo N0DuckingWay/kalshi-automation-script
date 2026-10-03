@@ -1837,6 +1837,10 @@ CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
 # series and could never enter a backtest trade.
 CANDLESTICK_MAX_CANDLES_PER_REQUEST = 5000
 
+# Version of the fields a cached candle carries. A cache written under an
+# older version is fetched again (version 2 adds the hour's traded volume).
+CANDLESTICK_CACHE_FIELDS_VERSION = 2
+
 
 def min_price_diff_for_gap(gap_days: int, spread_min: float | None = None, *,
                            tier_floors: bool = True) -> float:

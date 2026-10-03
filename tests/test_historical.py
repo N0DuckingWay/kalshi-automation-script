@@ -2910,12 +2910,13 @@ class TestJsonCacheDurability:
 
 
 def _patch_candle_fetch(monkeypatch, ts, yes_ask="0.55", yes_bid="0.53",
-                        legacy_format=False) -> MagicMock:
+                        legacy_format=False, volume=None) -> MagicMock:
     """Patch _signed_raw_get to serve one raw candlestick page.
 
     legacy_format=True emits the pre-drift shape (close_dollars string beside
     an integer-cent close); the default emits the current shape (the dollar
-    string IS close). Both must parse to dollars.
+    string IS close). Both must parse to dollars. `volume`, when given, is the
+    candle's raw "volume_fp" value.
     """
     if legacy_format:
         ya = {"close": 55, "close_dollars": yes_ask}
@@ -2923,7 +2924,10 @@ def _patch_candle_fetch(monkeypatch, ts, yes_ask="0.55", yes_bid="0.53",
     else:
         ya = {"close": yes_ask}
         yb = {"close": yes_bid}
-    payload = {"candlesticks": [{"end_period_ts": ts, "yes_ask": ya, "yes_bid": yb}]}
+    candle = {"end_period_ts": ts, "yes_ask": ya, "yes_bid": yb}
+    if volume is not None:
+        candle["volume_fp"] = volume
+    payload = {"candlesticks": [candle]}
     mock = MagicMock(return_value=_raw_resp(payload))
     monkeypatch.setattr(historical, "_signed_raw_get", mock)
     return mock
@@ -2966,6 +2970,50 @@ class TestCandleClose:
         assert [c["ts"] for c in out] == [2]
 
 
+class TestCandleCount:
+    def test_reads_the_fixed_point_string(self):
+        assert historical._candle_count({"volume_fp": "12.00"}) == 12.0
+
+    def test_reads_a_plain_volume_number_or_string(self):
+        assert historical._candle_count({"volume": 7}) == 7.0
+        assert historical._candle_count({"volume": "7.50"}) == 7.5
+
+    def test_the_fixed_point_key_wins_over_the_plain_one(self):
+        assert historical._candle_count({"volume_fp": "3.00", "volume": 99}) == 3.0
+
+    def test_zero_is_a_count(self):
+        assert historical._candle_count({"volume_fp": "0.00"}) == 0.0
+        assert historical._candle_count({"volume": 0}) == 0.0
+
+    def test_a_negative_zero_is_a_plain_zero(self):
+        for raw in ("-0", "-0.00", -0.0):
+            count = historical._candle_count({"volume_fp": raw})
+            assert count == 0.0, raw
+            # A negative zero would be cached as the text -0.0
+            assert json.dumps(count) == "0.0", raw
+
+    def test_neither_key_is_none(self):
+        assert historical._candle_count({}) is None
+        assert historical._candle_count({"volume_fp": None, "volume": None}) is None
+        assert historical._candle_count({"volume_fp": ""}) is None
+
+    def test_an_unreadable_value_is_none(self):
+        for raw in ("n/a", [1], {"a": 1}, True, object()):
+            assert historical._candle_count({"volume_fp": raw}) is None, raw
+            assert historical._candle_count({"volume": raw}) is None, raw
+
+    def test_an_unreadable_fixed_point_value_is_not_replaced_by_the_plain_one(self):
+        assert historical._candle_count({"volume_fp": "n/a", "volume": 5}) is None
+
+    def test_a_negative_or_non_finite_value_is_none(self):
+        for raw in ("-1.00", -3, "nan", "inf", float("inf"), float("nan"), "1e999", 10**400):
+            assert historical._candle_count({"volume_fp": raw}) is None, raw
+
+    def test_a_candle_that_is_not_a_dict_is_none(self):
+        for bad in (None, 5, "x", [1]):
+            assert historical._candle_count(bad) is None
+
+
 class TestFetchCandlesticks:
     def test_parses_current_dollar_string_close(self, tmp_path, monkeypatch):
         # Current wire format: yes_ask.close is the fixed-point DOLLAR string
@@ -2978,7 +3026,49 @@ class TestFetchCandlesticks:
             "ts": 1_700_000_000,
             "yes_ask_close": pytest.approx(0.55),
             "no_ask_close": pytest.approx(0.47),  # 1 - yes_bid 0.53
+            "volume": None,                        # this payload carries no volume
         }]
+
+    def test_each_candle_keeps_its_hours_volume(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        _patch_candle_fetch(monkeypatch, 1_700_000_000, volume="12.00")
+        out = historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False, rate_limit_sleep=0.0,
+        )
+        assert out[0]["volume"] == 12.0
+        # The price keys are the ones they always were
+        assert out[0]["ts"] == 1_700_000_000
+        assert out[0]["yes_ask_close"] == pytest.approx(0.55)
+        assert out[0]["no_ask_close"] == pytest.approx(0.47)
+
+    def test_volume_is_read_from_the_plain_key_and_from_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        payload = {"candlesticks": [
+            {"end_period_ts": 1, "yes_ask": {"close": "0.55"}, "yes_bid": {"close": "0.53"},
+             "volume": 4},
+            {"end_period_ts": 2, "yes_ask": {"close": "0.55"}, "yes_bid": {"close": "0.53"}},
+            {"end_period_ts": 3, "yes_ask": {"close": "0.55"}, "yes_bid": {"close": "0.53"},
+             "volume_fp": "-2.00"},
+            {"end_period_ts": 4, "yes_ask": {"close": "0.55"}, "yes_bid": {"close": "0.53"},
+             "volume_fp": "junk"},
+        ]}
+        monkeypatch.setattr(historical, "_signed_raw_get",
+                            MagicMock(return_value=_raw_resp(payload)))
+        out = historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=0, close_ts=5, use_cache=False, rate_limit_sleep=0.0,
+        )
+        assert [c["volume"] for c in out] == [4.0, None, None, None]
+
+    def test_a_bad_volume_does_not_drop_the_candle(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        _patch_candle_fetch(monkeypatch, 1_700_000_000, volume="junk")
+        with caplog.at_level(logging.WARNING):
+            out = historical.fetch_candlesticks(
+                MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False,
+                rate_limit_sleep=0.0,
+            )
+        assert len(out) == 1
+        assert not any("dropped" in r.getMessage() for r in caplog.records)
 
     def test_requests_hourly_period_interval(self, tmp_path, monkeypatch):
         # Regression: daily granularity (period_interval=1440) only emits a
@@ -3098,6 +3188,73 @@ class TestFetchCandlesticks:
         )
         assert fetch.call_count == 1
         assert out[0]["ts"] == 1_700_000_000
+
+    def test_cache_without_the_fields_tag_is_refetched_and_retagged(
+        self, tmp_path, monkeypatch,
+    ):
+        # A file written before candles carried volume covers the window and
+        # the period but has no "fields" tag, so it is fetched again once and
+        # the rewritten file carries the tag and the volume.
+        candles_dir = tmp_path / "candles"
+        monkeypatch.setattr(historical, "_CANDLES_DIR", candles_dir)
+        candles_dir.mkdir(parents=True)
+        (candles_dir / "T1.json").write_text(json.dumps({
+            "open_ts": 0, "close_ts": 1000, "period_interval": 60,
+            "candles": [{"ts": 500, "yes_ask_close": 0.5, "no_ask_close": 0.5}],
+        }))
+        fetch = _patch_candle_fetch(monkeypatch, 1_700_000_000, volume="9.00")
+        out = historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=100, close_ts=200, rate_limit_sleep=0.0,
+        )
+        assert fetch.call_count == 1
+        assert out[0]["ts"] == 1_700_000_000
+        assert out[0]["volume"] == 9.0
+        saved = json.loads((candles_dir / "T1.json").read_text())
+        assert saved["fields"] == historical.CANDLESTICK_CACHE_FIELDS_VERSION
+        assert saved["candles"][0]["volume"] == 9.0
+
+    def test_cache_under_an_older_fields_version_is_refetched(self, tmp_path, monkeypatch):
+        candles_dir = tmp_path / "candles"
+        monkeypatch.setattr(historical, "_CANDLES_DIR", candles_dir)
+        candles_dir.mkdir(parents=True)
+        (candles_dir / "T1.json").write_text(json.dumps({
+            "open_ts": 0, "close_ts": 1000, "period_interval": 60,
+            "fields": historical.CANDLESTICK_CACHE_FIELDS_VERSION - 1,
+            "candles": [{"ts": 500, "yes_ask_close": 0.5, "no_ask_close": 0.5}],
+        }))
+        fetch = _patch_candle_fetch(monkeypatch, 1_700_000_000)
+        historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=100, close_ts=200, rate_limit_sleep=0.0,
+        )
+        assert fetch.call_count == 1
+
+    def test_a_tagged_cache_is_reused_with_no_request(self, tmp_path, monkeypatch):
+        candles_dir = tmp_path / "candles"
+        monkeypatch.setattr(historical, "_CANDLES_DIR", candles_dir)
+        candles_dir.mkdir(parents=True)
+        cached = [{"ts": 500, "yes_ask_close": 0.5, "no_ask_close": 0.5, "volume": 3.0}]
+        (candles_dir / "T1.json").write_text(json.dumps({
+            "open_ts": 0, "close_ts": 1000, "period_interval": 60,
+            "fields": historical.CANDLESTICK_CACHE_FIELDS_VERSION,
+            "candles": cached,
+        }))
+        fetch = _patch_candle_fetch(monkeypatch, 1_700_000_000)
+        out = historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=100, close_ts=200, rate_limit_sleep=0.0,
+        )
+        assert fetch.call_count == 0
+        assert out == cached
+
+    def test_a_fetch_writes_the_fields_tag(self, tmp_path, monkeypatch):
+        candles_dir = tmp_path / "candles"
+        monkeypatch.setattr(historical, "_CANDLES_DIR", candles_dir)
+        _patch_candle_fetch(monkeypatch, 1_700_000_000)
+        historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=100, close_ts=200, use_cache=False,
+            rate_limit_sleep=0.0,
+        )
+        saved = json.loads((candles_dir / "T1.json").read_text())
+        assert saved["fields"] == historical.CANDLESTICK_CACHE_FIELDS_VERSION == 2
 
     def test_legacy_bare_list_cache_is_migrated(self, tmp_path, monkeypatch):
         # Cache files written before the windowed-cache fix are a bare list

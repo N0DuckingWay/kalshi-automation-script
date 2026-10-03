@@ -5705,7 +5705,7 @@ def _fetch_candles_parallel(
 
     Returns:
         dict[str, list[dict]]: Ticker -> candle list (keys: ts, yes_ask_close,
-        no_ask_close). Every key of needed_tickers is present; the value is an
+        no_ask_close, volume). Every key of needed_tickers is present; the value is an
         empty list for markets with no usable (missing or unparseable) close_time.
 
     Raises:
@@ -5759,7 +5759,8 @@ def _fetch_candles_parallel(
     if work:
         with ThreadPoolExecutor(max_workers=CANDLESTICK_FETCH_MAX_WORKERS) as pool:
             # Returns list[dict] with keys: ts (unix int), yes_ask_close (float),
-            # no_ask_close (float) — cached per ticker, so a second run is much faster
+            # no_ask_close (float), volume (float or None) — cached per ticker,
+            # so a second run is much faster
             futures = {
                 pool.submit(fetch_candlesticks, hist_client, ticker,
                             open_ts, close_ts, use_cache, **endpoint): ticker
@@ -5799,6 +5800,16 @@ def _fetch_candles_parallel(
             "(neither Kalshi's archive nor its live candlestick endpoint served them; "
             "never cached, so asked again next run)",
             empty, len(candles_by_ticker),
+        )
+    # Tickers whose every candle lacks a traded-volume count: one line, so a
+    # renamed API field shows up instead of passing as quiet markets.
+    with_candles = [series for series in candles_by_ticker.values() if series]
+    no_volume = sum(1 for series in with_candles
+                    if all(c.get("volume") is None for c in series))
+    if no_volume:
+        logging.info(
+            "Candlestick fetch: %d of %d tickers' candles carry no traded volume",
+            no_volume, len(with_candles),
         )
 
     return candles_by_ticker

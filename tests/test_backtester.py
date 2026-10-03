@@ -4712,6 +4712,51 @@ class TestFetchCandlesParallel:
         assert len(msgs) == 1
         assert "1 of 2 tickers returned no candles" in msgs[0]
 
+    @staticmethod
+    def _volume_summaries(caplog):
+        return [r.getMessage() for r in caplog.records
+                if "carry no traded volume" in r.getMessage()]
+
+    def test_tickers_whose_candles_all_lack_volume_are_counted_once(
+        self, monkeypatch, caplog,
+    ):
+        # A renamed API field leaves every candle without a count; the one
+        # INFO line makes that visible. A ticker with any volume is not counted,
+        # and one with no candles at all is on the "no candles" line instead.
+        needed = self._needed(4)
+
+        def fake(_c, ticker, *_a, **_k):
+            if ticker == "T00":
+                return [{**_candle(_MONDAY_TS, 0.70, 0.32), "volume": 5.0}]
+            if ticker == "T01":
+                return [{**_candle(_MONDAY_TS, 0.70, 0.32), "volume": None},
+                        {**_candle(_MONDAY_TS + 3600, 0.70, 0.32), "volume": 1.0}]
+            if ticker == "T02":
+                return [_candle(_MONDAY_TS, 0.70, 0.32)]   # no "volume" key at all
+            return []
+
+        monkeypatch.setattr(backtester, "fetch_candlesticks", fake)
+        with caplog.at_level("INFO"):
+            _fetch_candles_parallel(MagicMock(), needed, date(2026, 1, 1), False)
+
+        msgs = self._volume_summaries(caplog)
+        assert len(msgs) == 1
+        assert "1 of 3 tickers' candles carry no traded volume" in msgs[0]
+
+    def test_volume_line_is_silent_when_every_ticker_has_volume(self, monkeypatch, caplog):
+        monkeypatch.setattr(
+            backtester, "fetch_candlesticks",
+            lambda *_a, **_k: [{**_candle(_MONDAY_TS, 0.70, 0.32), "volume": 0.0}])
+        with caplog.at_level("INFO"):
+            _fetch_candles_parallel(MagicMock(), self._needed(3), date(2026, 1, 1), False)
+        assert self._volume_summaries(caplog) == []
+
+    def test_volume_line_is_silent_when_no_ticker_has_candles(self, monkeypatch, caplog):
+        monkeypatch.setattr(backtester, "fetch_candlesticks", lambda *_a, **_k: [])
+        with caplog.at_level("INFO"):
+            _fetch_candles_parallel(MagicMock(), self._needed(3), date(2026, 1, 1), False)
+        assert self._volume_summaries(caplog) == []
+
     def test_run_backtest_surfaces_worker_exception(self, monkeypatch):
         # Same guarantee end-to-end: the three existing run_backtest fixtures
         # rely on an unknown ticker raising KeyError out of the whole run as a
