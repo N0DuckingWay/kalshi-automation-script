@@ -391,6 +391,7 @@ from .scanner import (
     DEADLINE_CUMULATIVE,
     DEADLINE_SNAPSHOT,
     DEADLINE_UNKNOWN,
+    ENRICH_UNAFFORDABLE,
     ENRICH_UNPROFITABLE,
     REFUSED_NO_STATED_DEADLINE,
     REFUSED_SAME_DEADLINE,
@@ -398,6 +399,7 @@ from .scanner import (
     SAME_DAY,
     CandidatePair,
     HeldPair,
+    _cash_binds,
     _enrich_pair,
     _market_from_dict,
     close_gap_bound_text,
@@ -7744,6 +7746,9 @@ def _prepare_entries(
 
 # Why _size_trade refused a candidate whose walked book left no size worth buying
 _NO_SIZE_FITS = "no size fits"
+# Why _size_trade skipped a walked candidate the cash left cannot buy one
+# contract pair of (the book did not cause it, so it is counted apart)
+_NO_CASH = "no cash for one contract pair"
 
 
 def _cents(dollars: float) -> int:
@@ -7864,8 +7869,9 @@ def _size_trade(c: dict, d: date, checkpoint_value: float, cash: float,
     Returns:
         tuple[TradeSpec | None, str | None]: (the spec, None); (None, why)
             when a walked book refused it (an ENRICH_* or SPREAD_* code, or
-            "no size fits"); (None, None) when the top of the book had no
-            size worth buying.
+            "no size fits"), or _NO_CASH when the cash left, not the book,
+            cannot buy one contract pair; (None, None) when the top of the
+            book had no size worth buying.
     """
     pair = _candidate_pair(c, held, markets)
     value_cents, cash_cents = _cents(checkpoint_value), _cents(cash)
@@ -7875,6 +7881,12 @@ def _size_trade(c: dict, d: date, checkpoint_value: float, cash: float,
         pair, refusal = _enrich_pair(pair, *books, value_cents, settings=settings,
                                      cash_cents=cash_cents, log=_debug_log)
         if not pair.tradeable:
+            # The cash left, not the book, cannot buy one contract pair (the
+            # test behind enrichment's "cash binds" note): counted apart from
+            # the book's refusals
+            if refusal == ENRICH_UNAFFORDABLE and _cash_binds(
+                    value_cents, max_kelly_fraction(pair.pair_type, settings), cash_cents):
+                return None, _NO_CASH
             return None, refusal or ENRICH_UNPROFITABLE
     # The live sizer, quiet: its "Trade computed" lines at DEBUG
     spec = compute_trade(pair, value_cents, settings=settings, cash_cents=cash_cents, quiet=True)
@@ -8481,10 +8493,12 @@ def _simulate_at_discount(
     sold_pairs: set[int] = set()
     positions_sold = bought_again = 0
     # The live code's market objects, built once per record (_candidate_pair),
-    # trades filled at the top of the book, and walked books' refusals by reason
+    # trades filled at the top of the book, walked books' refusals by reason,
+    # and walked candidates the cash left could not buy one contract pair of
     markets: dict[int, Any] = {}
     top_of_book = 0
     walk_refusals: Counter = Counter()
+    cash_skips = 0
 
     def release(d: date) -> None:
         """
@@ -8724,7 +8738,9 @@ def _simulate_at_discount(
         # than the cash left, over a walked synthetic book when there is one
         spec, refusal = _size_trade(c, d, checkpoint_value, cash, settings, held_pair, markets)
         if spec is None:
-            if refusal is not None:
+            if refusal == _NO_CASH:
+                cash_skips += 1
+            elif refusal is not None:
                 walk_refusals[refusal] += 1
             continue
         n = spec.x
@@ -8942,8 +8958,8 @@ def _simulate_at_discount(
             run_label, bought_again,
         )
     # How trades were sized: at the top of the book (no depth model, or no
-    # volume data for a leg that Monday), and walked books' refusals by
-    # reason (each silent at zero)
+    # volume data for a leg that Monday), walked books' refusals by reason,
+    # and walked candidates skipped for want of cash (each silent at zero)
     if top_of_book:
         logging.log(
             logging.DEBUG if quiet else logging.INFO,
@@ -8955,6 +8971,12 @@ def _simulate_at_discount(
             logging.DEBUG if quiet else logging.INFO,
             "Trades refused when their book was walked (%s) (%s): %d",
             reason, run_label, walk_refusals[reason],
+        )
+    if cash_skips:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Trades skipped with no cash left for one contract pair (%s): %d",
+            run_label, cash_skips,
         )
     logging.log(
         logging.DEBUG if quiet else logging.INFO,
@@ -10849,7 +10871,8 @@ def run_backtest_sweep(
         "on — the dashboard's Sell select is simulated when the dashboard is built"
         if sell_sweep else "off — the dashboard's Sell select stays disabled",
     )
-    # And the depth model every trade's synthetic book is built from
+    # And the depth model this run builds every trade's synthetic book from
+    # (load_depth_model's own line says it was loaded)
     if depth_model is None:
         logging.info("Depth model: none — every trade fills at the top of the book")
     else:

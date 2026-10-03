@@ -16871,10 +16871,12 @@ class TestMarketCapSweepParity:
     the same entries without quotes size or mark differently."""
 
     def _fresh_parity(self, point, subset, start, k, band, pop, cap, *, end_date,
-                      tier_floors=True, add_to_held=False, split_date=None, checks=False):
+                      tier_floors=True, add_to_held=False, split_date=None, checks=False,
+                      sell_at=None):
         fresh = backtester._simulate_at_discount(
             subset, start, 10_000.0, k=k, spread_band=band, population=pop, size_cap=cap,
-            quiet=True, end_date=end_date, tier_floors=tier_floors, add_to_held=add_to_held)
+            quiet=True, end_date=end_date, tier_floors=tier_floors, add_to_held=add_to_held,
+            sell_at=sell_at)
         assert [astuple(t) for t in point.trades] == [astuple(t) for t in fresh.trades], \
             (band, k, pop, cap)
         pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df, check_exact=True)
@@ -16882,7 +16884,8 @@ class TestMarketCapSweepParity:
         if checks and pop in ("all", "time_series"):
             assert point.halves == backtester._half_split(
                 _dr75_halves(subset, split_date), start, 10_000.0, k, band, population=pop,
-                tier_floors=tier_floors, size_cap=cap, quiet=True, end_date=end_date)
+                tier_floors=tier_floors, size_cap=cap, quiet=True, end_date=end_date,
+                add_to_held=add_to_held, sell_at=sell_at)
             assert point.ex_top_event == backtester._ex_top_event(
                 fresh, subset, start, 10_000.0, band, population=pop,
                 tier_floors=tier_floors, quiet=True, end_date=end_date)
@@ -18034,6 +18037,52 @@ class TestWalkedTradeParity:
         (top,) = self._sim(_walked([top_rec], candles, None)).trades
         assert not top.book_walked
 
+    def test_a_walked_trade_the_cash_left_cannot_buy_is_counted_apart(self, caplog):
+        # On $2.80, a same-title pair on Monday 1 spends all but $0.59. On
+        # Monday 2 the largest Kelly share a time-series pair may take (25% of
+        # about $2.69) is more than that, and $0.59 cannot buy one contract
+        # pair at its best prices (0.20 + 0.40). The cash, not the book, stops it
+        def records(model):
+            same = _ladder_same_title(_ladder_market("SA", "EVA-1", "2026-03-20"),
+                                      _ladder_market("SB", "EVB-1", "2026-03-20"), [_LADDER_M1])
+            ts = _ladder_record(_ladder_market("OA", "EVO-1", "2026-03-20"),
+                                _ladder_market("OB", "EVO-2", "2026-03-20"), "o",
+                                [(_LADDER_M2, 0.20, 0.60, 0.40)])
+            candles = {"SA": [_vol_candle(_LADDER_M1, 0.70, 0.30),
+                              _vol_candle(_LADDER_M2, 0.70, 0.30)],
+                       "SB": [_vol_candle(_LADDER_M1, 0.40, 0.60),
+                              _vol_candle(_LADDER_M2, 0.40, 0.60)],
+                       "OA": [_vol_candle(_LADDER_M2, 0.20, 0.80)],
+                       "OB": [_vol_candle(_LADDER_M2, 0.60, 0.40)]}
+            return _walked([same, ts], candles, model)
+
+        def run(model, **kw):
+            return backtester._simulate_at_discount(records(model), self._START, 2.80, k=0.75,
+                                                     size_cap=1.0, end_date=self._END, **kw)
+
+        line = ("Trades skipped with no cash left for one contract pair "
+                "(k=0.750, band 0-1, all, no cap): 1")
+        with caplog.at_level(logging.DEBUG):
+            point = run(_walk_model())
+        assert [(t.ticker_a, t.entry_date) for t in point.trades] == [("SA", _LADDER_M1)]
+        assert line in caplog.messages
+        # Counted by the test behind the live enrichment's own note
+        assert any(m.startswith("No affordable contract pairs for")
+                   and "the $0.59 of cash binds" in m for m in caplog.messages)
+        assert not [m for m in caplog.messages if m.startswith("Trades refused when")]
+        # At the top of the book the same pair is skipped too, and neither line is logged
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            top = run(None)
+        assert [(t.ticker_a, t.entry_date) for t in top.trades] == [("SA", _LADDER_M1)]
+        assert not [m for m in caplog.messages if m.startswith(("Trades skipped with no cash",
+                                                                "Trades refused when"))]
+        # A quiet run logs the count at DEBUG
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            run(_walk_model(), quiet=True)
+        assert [r.levelno for r in caplog.records if r.getMessage() == line] == [logging.DEBUG]
+
     def test_the_top_of_book_count_and_no_volume(self, caplog):
         # No volume in a market's candles means no book for it: the trade
         # fills at the top of the book and is counted as such
@@ -18272,11 +18321,18 @@ class TestCapFreeFrom:
 class TestCapSweepSharesFromCapFreeFrom:
     """With a walked book the cap sets how deep the live sizer searches, so a
     cap above a point's peak can still buy a different trade: CapSweep shares
-    one simulation only from cap_free_from. One walked time-series pair, its
-    eager point at a 20% cap, every cap against a fresh simulation."""
+    one simulation only from cap_free_from. Every cap against a fresh
+    simulation, in every kind of CapSweep: the size-cap family, tier floors
+    off, adding to held pairs, selling, and with the split-half and
+    excluding-top-event checks."""
 
     _BAND = (0.0, 1.0)
     _START, _END = date(2026, 1, 1), date(2026, 4, 1)
+    # What each kind of CapSweep sets ("checks" sets checks=True instead)
+    _FAMILIES = {"tier floors off": {"tier_floors": False},
+                 "adding to held pairs": {"add_to_held": True},
+                 "selling": {"sell_at": 0.5},
+                 "checks": {}}
 
     def _fresh(self, entries, k, cap):
         return backtester._simulate_at_discount(entries, self._START, 10_000.0, k=k,
@@ -18314,6 +18370,102 @@ class TestCapSweepSharesFromCapFreeFrom:
         # a different trade from no cap at all
         assert any(sizes[cap] != sizes[1.0] for cap in backtester.SIZE_CAP_SWEEP
                    if eager.peak_kelly_fraction <= cap < eager.cap_free_from)
+
+    @staticmethod
+    def _two_pairs(quotes, later_pA: float) -> list[dict]:
+        """Two walked time-series pairs. OA/OB enters on Monday 1 and is
+        quoted again on Monday 2 with YES on A cheaper, so the held pair can
+        add to itself; QA/QB enters on Monday 2. Fresh checkpoint candles on
+        Mondays 3 and 4, where each B market's YES falls to 0.10, give the
+        positions bids to sell at."""
+        pA, pB, nB = quotes
+        first = _ladder_record(_ladder_market("OA", "EVOA-1", "2026-03-20"),
+                               _ladder_market("OB", "EVOB-1", "2026-03-20"), "o",
+                               [(_LADDER_M1, pA, pB, nB), (_LADDER_M2, later_pA, pB, nB)])
+        second = _ladder_record(_ladder_market("QA", "EVQA-1", "2026-03-20"),
+                                _ladder_market("QB", "EVQB-1", "2026-03-20"), "q",
+                                [(_LADDER_M2, pA, pB, nB)])
+        candles = {"OA": [_vol_candle(_LADDER_M1, pA, round(1.0 - pA, 4)),
+                          _vol_candle(_LADDER_M2, later_pA, round(1.0 - later_pA, 4))],
+                   "OB": [_vol_candle(_LADDER_M1, pB, nB), _vol_candle(_LADDER_M2, pB, nB)],
+                   "QA": [_vol_candle(_LADDER_M2, pA, round(1.0 - pA, 4))],
+                   "QB": [_vol_candle(_LADDER_M2, pB, nB)]}
+        for day in (_LADDER_M3, _M4):
+            for a, b, yes_a in (("OA", "OB", later_pA), ("QA", "QB", pA)):
+                candles[a].append(dict(_candle(_ck(day), yes_a, round(1.0 - yes_a, 4)),
+                                       volume=400.0))
+                candles[b].append(dict(_candle(_ck(day), 0.10, 0.90), volume=400.0))
+        return _walked([first, second], candles, _walk_model())
+
+    @pytest.mark.parametrize("quotes, k, later_pA", [
+        # Peak below the 20% eager cap, cap_free_from above it
+        ((0.05, 0.68, 0.35), 0.75, 0.02),
+        # Peak above 20%, cap_free_from above the peak
+        ((0.20, 0.75, 0.40), 0.5, 0.10),
+    ])
+    @pytest.mark.parametrize("family", list(_FAMILIES))
+    def test_every_kind_of_sweep_shares_only_from_cap_free_from(self, family, quotes, k,
+                                                               later_pA):
+        entries = self._two_pairs(quotes, later_pA)
+        options = self._FAMILIES[family]
+        checks = family == "checks"
+        # With the checks, Monday 2 splits the two pairs into two halves
+        split = _LADDER_M2 if checks else None
+        subsets = _cap_sweep_subsets(entries)
+        pops = [pop for pop in subsets if subsets[pop]] if checks else ["all"]
+        eager, end_dates = {}, {}
+        if "add_to_held" in options or "sell_at" in options:
+            # These sweeps take no eager points: every cap is simulated, and
+            # each cell ends on its end_dates day
+            end_dates = {(self._BAND, k, pop): self._END for pop in pops}
+        else:
+            # The others start from eager points at a 20% cap, built as the
+            # run builds them
+            for pop in pops:
+                point = backtester._simulate_at_discount(
+                    subsets[pop], self._START, 10_000.0, k=k, spread_band=self._BAND,
+                    population=pop, size_cap=0.2, quiet=True, end_date=self._END, **options)
+                if checks and pop in ("all", "time_series"):
+                    point.halves = backtester._half_split(
+                        backtester._split_halves(subsets[pop], split), self._START, 10_000.0,
+                        k, self._BAND, population=pop, size_cap=0.2, quiet=True,
+                        end_date=self._END)
+                    point.ex_top_event = backtester._ex_top_event(
+                        point, subsets[pop], self._START, 10_000.0, self._BAND,
+                        population=pop, quiet=True, end_date=self._END)
+                eager[(self._BAND, k, pop)] = point
+        cs = backtester.CapSweep(caps=backtester.SIZE_CAP_SWEEP, primary_cap=0.2,
+                                 bands=(self._BAND,), ks=(k,), primary_k=k,
+                                 start_date=self._START, initial_balance=10_000.0,
+                                 split_date=split, checks=checks,
+                                 entries_by_band={self._BAND: entries}, st_entries=[],
+                                 eager=eager, end_dates=end_dates, **options)
+        cell = cs.cell(self._BAND, k)
+        assert tuple(cell) == backtester.SIZE_CAP_SWEEP
+        parity = TestMarketCapSweepParity()
+        fresh = {}
+        for cap, points in cell.items():
+            assert sorted(points) == sorted(pops), cap
+            for pop, point in points.items():
+                fresh[cap, pop] = parity._fresh_parity(
+                    point, subsets[pop], self._START, k, self._BAND, pop, cap,
+                    end_date=self._END, split_date=split, checks=checks, **options)
+        # Not vacuous: a cap at or above the peak but below cap_free_from buys
+        # something different from no cap at all
+        top = fresh[1.0, "all"]
+        window = [cap for cap in backtester.SIZE_CAP_SWEEP
+                  if top.peak_kelly_fraction <= cap < top.cap_free_from]
+
+        def bought(point):
+            return [(t.ticker_a, t.n) for t in point.trades]
+
+        assert any(bought(fresh[cap, "all"]) != bought(top) for cap in window)
+        if checks:
+            assert any(cell[cap]["all"].halves != cell[1.0]["all"].halves for cap in window)
+        if "add_to_held" in options:
+            assert any(t.add_on for t in top.trades)
+        if "sell_at" in options:
+            assert any(t.sold for t in top.trades)
 
 
 @pytest.mark.usefixtures("pre_toggle_defaults")

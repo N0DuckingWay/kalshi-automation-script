@@ -2940,7 +2940,11 @@ class TestTimeSeriesKellyParity:
         # portfolio walk and the shard funder cannot disagree
         assert _function_calls(strategy, "_evaluate_size", "kelly_budget")
         assert _function_calls(config, "max_affordable_pairs", "kelly_budget")
-        assert _function_calls(scanner, "_enrich_pair", "kelly_budget")
+        # Enrichment's "cash binds" test, which the backtest also counts its
+        # cash-bound skips by
+        assert _function_calls(scanner, "_enrich_pair", "_cash_binds")
+        assert _function_calls(scanner, "_cash_binds", "kelly_budget")
+        assert _function_calls(backtester, "_size_trade", "_cash_binds")
         # The backtest budgets through the live sizer itself: each Monday's
         # portfolio value (cash plus open trades at market,
         # backtester._open_value) and the running cash, in whole cents, go to

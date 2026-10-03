@@ -5532,6 +5532,27 @@ def _levels_with_edge_after_fee(qualifying: list) -> list:
     ))
 
 
+def _cash_binds(portfolio_value_cents: int, bound: float, cash_cents: int | None) -> bool:
+    """
+    Whether the cash on hand, not the Kelly share of the portfolio value, limits a budget.
+
+    _enrich_pair reads it to say "the $C of cash binds" when it drops a pair
+    it cannot afford, and backtester._size_trade reads it to count those
+    drops on their own line.
+
+    Args:
+        portfolio_value_cents (int): Cash plus open positions' value, in cents.
+        bound (float): The largest Kelly share the sizer can return for the
+            pair (config.max_kelly_fraction).
+        cash_cents (int | None): The cash on hand in cents; None means it is all cash.
+
+    Returns:
+        bool: True when that share of the portfolio value is more than the cash.
+    """
+    return (cash_cents is not None
+            and kelly_budget(portfolio_value_cents / 100.0, bound) > cash_cents / 100.0)
+
+
 # Why _enrich_pair refused a pair. A refused time-series spread is named by
 # config's SPREAD_* code instead. UNAFFORDABLE: the budget cannot buy one
 # contract pair; THIN_BOOK: it can, but the book holds under one contract at
@@ -5649,9 +5670,7 @@ def _enrich_pair(
                 "time-series Kelly cannot be positive)"
             )
         # If the cash, not the portfolio share, limited the budget, say so
-        if (affordable < 1 and cash_cents is not None
-                and kelly_budget(portfolio_value_cents / 100.0, bound)
-                > cash_cents / 100.0):
+        if affordable < 1 and _cash_binds(portfolio_value_cents, bound, cash_cents):
             why += f"; the ${cash_cents / 100:.2f} of cash binds"
         log(logging.INFO,
             "No affordable contract pairs for '%s' — %.2f contract(s) rest at "

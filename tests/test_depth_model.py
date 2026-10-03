@@ -546,7 +546,7 @@ class TestLoadDepthModel:
             "2026-10-01T16:00:00Z", "2026-10-02T16:00:00Z")
         assert _warnings(caplog) == []
         info = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
-        assert info == ["Depth model: 2 snapshot(s), 6 ladders, taken "
+        assert info == ["Depth model loaded from saved snapshots: 2 snapshot(s), 6 ladders, taken "
                         "2026-10-01T16:00:00Z to 2026-10-02T16:00:00Z"]
 
     def test_a_temp_file_left_by_an_interrupted_write_is_ignored(self, snapshots):
@@ -775,7 +775,8 @@ class TestSnapshot:
         # The yes ladders (best 0.38) and no ladders (best 0.60) of the 100-999 bucket
         row = next(line for line in text if line.startswith("100-999"))
         assert row.split()[1:] == ["0", "0", "6", "6", "0", "0"]
-        assert any(line.startswith("Depth model: 1 snapshot(s), 12 ladders") for line in text)
+        assert any(line.startswith("Depth model loaded from saved snapshots: 1 snapshot(s), "
+                                   "12 ladders") for line in text)
 
     def test_candles_without_volume_leave_the_model_empty_and_say_so(self, snapshots,
                                                                      monkeypatch, caplog):

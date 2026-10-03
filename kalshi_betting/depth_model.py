@@ -456,8 +456,9 @@ def _log_cell_counts(found: _Ladders) -> None:
 
 
 def _log_model(model: DepthModel) -> None:
-    """Log which snapshots a model was fitted to."""
-    logging.info("Depth model: %d snapshot(s), %d ladders, taken %s to %s",
+    """Log which saved snapshots a model was fitted to."""
+    logging.info("Depth model loaded from saved snapshots: %d snapshot(s), %d ladders, "
+                 "taken %s to %s",
                  model.snapshots, model.ladders, model.first_taken, model.last_taken)
 
 
