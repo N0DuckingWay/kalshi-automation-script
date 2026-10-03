@@ -74,10 +74,12 @@ Purpose:
     every 5% from 5% to 100%): the same scenario re-simulated so each
     position — a pair and everything added to it — is sold whole at the
     first weekly checkpoint where its realized profit (what selling it at the
-    bids would return, after the sale's fees, less what it cost) reaches that
-    share of its potential profit (backtester._simulate_at_discount's
-    sell_at). It covers every scenario the bar shows: every band, Tier floors
-    choice, k, size cap and Add to held pairs choice. The run simulates none
+    bids would return, after the sale's fees, less what it cost) has stayed at
+    or above that share of its potential profit for
+    config.TAKE_PROFIT_HOLD_DAYS days in a row, checked once a day
+    (backtester._simulate_at_discount's sell_at). It covers every scenario
+    the bar shows: every band, Tier floors choice, k, size cap and Add to
+    held pairs choice. The run simulates none
     of it, and neither does the page's walk: after the walk,
     _build_sell_grid simulates every level of every cell the page shows, in
     worker processes (one task per spread band and Tier floors setting, at
@@ -156,8 +158,9 @@ Dependencies:
     BacktestSweep.cap_sweep, tier_off_cap_sweep, add_on_cap_sweep and
     add_on_tier_off_cap_sweep (each a backtester.CapSweep) and sell_sweep (a
     backtester.SellSweep) by their attributes; imports backtester itself to
-    read, and in a worker process install, its SAME_TITLE_SIZE_CAP and
-    SCHEDULED_RUN (_run_sell_task) — and
+    read, and in a worker process install, its SAME_TITLE_SIZE_CAP,
+    SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS (_run_sell_task; the last also
+    names the Sell select's rule, _sell_select_title) — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
     page's file name, which defaults_server also opens), DASHBOARD_FILES_DIRNAME
     and DASHBOARD_BUILD_STALE_SECONDS (the sidecar folder beside it, and when
@@ -5769,19 +5772,44 @@ _ADD_ON_SAVE_NOTE = ("The live defaults add to held pairs; saving with Add to he
                      "off here turns that off.")
 
 # The filter bar's "Sell" choice: the runs as simulated ("no selling"), or the
-# same scenario with each position sold whole once it has realized a share of
-# its potential profit (BacktestSweep.sell_sweep; _sell_option names each
-# level). Short menu words; the select's title carries the rule.
+# same scenario with each position sold whole once it has held a share of its
+# potential profit for TAKE_PROFIT_HOLD_DAYS days in a row
+# (BacktestSweep.sell_sweep; _sell_option names each level). Short menu words;
+# the select's title carries the rule (_sell_select_title).
 _SELL_OPTION_NONE = "no selling"
-_SELL_SELECT_TITLE = (
-    "no selling: every position is held until its markets pay out. A level: at each weekly "
-    "checkpoint (the live run's time), a position (a pair and everything added to it) is "
-    "sold whole once its realized profit (what selling it at the bids would return, after "
-    "the sale's fees, less what it cost) reaches that share of its potential profit (its "
-    f"contract pairs at ${CONTRACT_PAYOUT_DOLLARS:.2f} each, less what it cost). A position "
-    "sold at a checkpoint is not bought again or added to there. Live trading never sells, "
-    "so Save as live defaults… is off while a level is chosen; the Scenario Explorer and "
-    "Interval Discount sections always show no selling.")
+
+
+def _sell_select_title(hold_days: int) -> str:
+    """
+    The Sell select's hover text: the rule a sell level sells a position by.
+
+    Args:
+        hold_days (int): How many days in a row a position must stay at a
+            level before it is sold (backtester.TAKE_PROFIT_HOLD_DAYS, as the
+            page's sell runs read it).
+
+    Returns:
+        str: The rule in plain words; with more than one day, how the days
+            are checked.
+    """
+    if hold_days == 1:
+        rule = ("reaches that share of its potential profit (its contract pairs at "
+                f"${CONTRACT_PAYOUT_DOLLARS:.2f} each, less what it cost).")
+    else:
+        rule = ("has stayed at or above that share of its potential profit (its contract "
+                f"pairs at ${CONTRACT_PAYOUT_DOLLARS:.2f} each, less what it cost) for "
+                f"{hold_days} days in a row: it is checked once a day, 24 hours apart, the "
+                "last check at the checkpoint, and each earlier check reads the last quote "
+                "of the 24 hours before it.")
+    return ("no selling: every position is held until its markets pay out. A level: at each "
+            "weekly checkpoint (the live run's time), a position (a pair and everything "
+            "added to it) is sold whole once its realized profit (what selling it at the "
+            f"bids would return, after the sale's fees, less what it cost) {rule} A position "
+            "sold at a checkpoint is not bought again or added to there. Live trading never "
+            "sells, so Save as live defaults… is off while a level is chosen; the Scenario "
+            "Explorer and Interval Discount sections always show no selling.")
+
+
 # Added to the summary line while a sell level is chosen
 _SELL_SUMMARY_NOTE = (" A sale ends its trade on the sale day: its profit is what the sale "
                       "returned, after the sale's fees, less what it cost, and its slippage "
@@ -8670,7 +8698,8 @@ def _build_filter_grid(
 #
 # The bar's Sell choice is "no selling" (the scenario as walked) or one of the
 # sell family's levels (backtester.SellSweep): sell a whole position once it
-# has realized that share of its potential profit. It covers every scenario
+# has held that share of its potential profit for TAKE_PROFIT_HOLD_DAYS days in
+# a row. It covers every scenario
 # the bar shows. Its cells are simulated after the walk, in worker processes
 # (_build_sell_grid: one task per spread band and Tier floors setting), and
 # each new trade list is written as a sidecar chunk file beside the page,
@@ -8723,8 +8752,11 @@ class _SellTask:
         same_title_size_cap (float): backtester.SAME_TITLE_SIZE_CAP as the
             parent reads it.
         scheduled_run: backtester.SCHEDULED_RUN as the parent reads it.
+        hold_days (int): backtester.TAKE_PROFIT_HOLD_DAYS as the parent reads
+            it: how many days in a row a position must stay at a level
+            before it is sold.
         install (bool): Whether the task runs in a worker process of its own,
-            which then installs those two bindings first (a spawned process
+            which then installs those three bindings first (a spawned process
             imports backtester afresh, from config). False in the parent.
     """
     index: int
@@ -8745,6 +8777,7 @@ class _SellTask:
     out_dir: Path
     same_title_size_cap: float
     scheduled_run: object
+    hold_days: int
     install: bool = False
 
 
@@ -8908,8 +8941,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     (_write_sell_chunk). Only one level's points are alive at a time.
 
     Runs in a worker process (task.install True: the parent's
-    SAME_TITLE_SIZE_CAP and SCHEDULED_RUN are installed first) or in the
-    parent itself.
+    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS are
+    installed first) or in the parent itself.
 
     Args:
         task (_SellTask): The task.
@@ -8923,10 +8956,11 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
             and leaves the task's cells uncovered.
     """
     if task.install:
-        # A spawned process imported backtester afresh: size and checkpoint
-        # as the parent does
+        # A spawned process imported backtester afresh: size, checkpoint and
+        # sell as the parent does
         _backtester.SAME_TITLE_SIZE_CAP = task.same_title_size_cap
         _backtester.SCHEDULED_RUN = task.scheduled_run
+        _backtester.TAKE_PROFIT_HOLD_DAYS = task.hold_days
     family = task.family
     band = family.bands[0] if task.tier_floors else family.off_bands[0]
     axis_end = task.axis[-1] if len(task.axis) else None
@@ -9002,9 +9036,10 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
               "series_categories": series_categories, "cat_index": dict(chunker.cat_index),
               "sub_index": dict(chunker.sub_index), "risk_free": risk_free,
               "inline_keys": frozenset(chunker.seen), "out_dir": folder,
-              # The two bindings a spawned worker installs (_run_sell_task)
+              # The three bindings a spawned worker installs (_run_sell_task)
               "same_title_size_cap": _backtester.SAME_TITLE_SIZE_CAP,
-              "scheduled_run": _backtester.SCHEDULED_RUN}
+              "scheduled_run": _backtester.SCHEDULED_RUN,
+              "hold_days": _backtester.TAKE_PROFIT_HOLD_DAYS}
     tasks: list[_SellTask] = []
 
     def add(bi: int, band, tier_floors: bool, rows: dict) -> None:
@@ -9053,10 +9088,10 @@ def _run_sell_tasks(tasks: list[_SellTask], workers: int) -> dict[int, _SellResu
     With one worker (or one task) every task runs here, in order. Otherwise a
     pool of spawned processes runs them (spawn, not fork: safe on macOS, and
     a fresh import in each worker, which installs the parent's
-    SAME_TITLE_SIZE_CAP and SCHEDULED_RUN). A task that raises costs its own
-    cells only: one WARNING naming its band (the first with its traceback),
-    and the rest go on; a pool that cannot run at all fails every task the
-    same way.
+    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS). A task
+    that raises costs its own cells only: one WARNING naming its band (the
+    first with its traceback), and the rest go on; a pool that cannot run at
+    all fails every task the same way.
 
     Args:
         tasks (list[_SellTask]): The tasks.
@@ -10164,7 +10199,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     by its "add_state" (_ADD_ON_NOTES), and the script never enables it.
     The Sell select offers "no selling" (selected) and every sell level the
     payload names (sell_levels), its title carrying the rule
-    (_SELL_SELECT_TITLE); a payload with no Sell view ("grid_sell" null)
+    (_sell_select_title, at backtester.TAKE_PROFIT_HOLD_DAYS as the page's
+    sell runs read it); a payload with no Sell view ("grid_sell" null)
     puts a grey note beside it by its "sell_state" (_SELL_NOTES), and the
     script never enables it.
     Category and tag options carry the primary scenario's trade
@@ -10261,7 +10297,9 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                  '&nbsp;<span id="flt-sell-note" style="color:#9E9E9E; font-size:13px;">'
                  f"{html.escape(_SELL_NOTES.get(sell_state, _SELL_NOTES['not simulated']))}"
                  "</span>")
-    sell_title = html.escape(_SELL_SELECT_TITLE)
+    # The rule names how many days in a row a position must hold its level,
+    # read as the page's sell runs read it (_SellTask installs it in workers)
+    sell_title = html.escape(_sell_select_title(_backtester.TAKE_PROFIT_HOLD_DAYS))
     # The save button's hover text: a page filed by ticker prefix says why a
     # category or tag cannot be saved from it
     save_filed = (payload.get("save") or {}).get("filed_by_listing", False)

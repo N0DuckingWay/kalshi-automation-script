@@ -2920,23 +2920,35 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(backtester, "_simulate_at_discount", "_open_value")
         # Selling early: a leg's bid and paid-out marker are read in one
         # place, _trade_sale_value, which a sale reaches only through
-        # _position_sale_value — and the walk's sales and the shortcut that
-        # replays them (_highest_sale_level) both decide through _sells_at,
-        # so the shortcut tests exactly the rule the walk applies
-        sale_readers: dict[str, set] = {"bid_at_checkpoint": set(), "paid_at_checkpoint": set()}
+        # _position_sale_value. Every check the sell rule reads — the
+        # checkpoint and the daily checks before it (TAKE_PROFIT_HOLD_DAYS) —
+        # comes from _hold_readings, the one caller of _position_sale_value,
+        # and the walk's sales, its quick test at a checkpoint with no
+        # candidate (_position_sells) and the shortcut that replays them
+        # (_highest_sale_level) all decide through _reached_every_day, which
+        # tests every check with _sells_at: the shortcut tests exactly the
+        # rule the walk applies. This checks which function calls which; the
+        # behaviour tests (TestSaleNeedsDaysInARow) pin how many days a site
+        # checks
+        sale_readers: dict[str, set] = {"bid_at_checkpoint": set(), "paid_at_checkpoint": set(),
+                                        "_position_sale_value": set(), "_sells_at": set()}
         for func in ast.walk(tree):
             if isinstance(func, ast.FunctionDef):
                 for sub in ast.walk(func):
-                    if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
-                            and sub.func.attr in sale_readers):
-                        sale_readers[sub.func.attr].add(func.name)
+                    if not isinstance(sub, ast.Call):
+                        continue
+                    fn = sub.func
+                    name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+                    if name in sale_readers:
+                        sale_readers[name].add(func.name)
         assert sale_readers == {"bid_at_checkpoint": {"_trade_sale_value"},
-                                "paid_at_checkpoint": {"_trade_sale_value"}}
+                                "paid_at_checkpoint": {"_trade_sale_value"},
+                                "_position_sale_value": {"_hold_readings"},
+                                "_sells_at": {"_hold_readings", "_reached_every_day"}}
         assert _function_calls(backtester, "_position_sale_value", "_trade_sale_value")
         for func in ("_simulate_at_discount", "_position_sells", "_highest_sale_level"):
-            assert _function_calls(backtester, func, "_sells_at"), func
-        for func in ("_simulate_at_discount", "_position_sells", "_highest_sale_level"):
-            assert _function_calls(backtester, func, "_position_sale_value"), func
+            assert _function_calls(backtester, func, "_hold_readings"), func
+            assert _function_calls(backtester, func, "_reached_every_day"), func
         assert _function_calls(backtester, "_simulate_at_discount", "_position_sells")
         for func in ("_simulate_at_discount", "_highest_sale_level"):
             assert _function_calls(backtester, func, "_positions"), func

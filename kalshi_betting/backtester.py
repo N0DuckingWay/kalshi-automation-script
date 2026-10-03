@@ -239,11 +239,13 @@ Notes:
 
     With sell_sweep, it also returns the dashboard's "Sell" family
     (BacktestSweep.sell_sweep, a SellSweep): every level of
-    config.TAKE_PROFIT_LEVELS — sell a whole position once it has realized
-    that share of its potential profit (_simulate_at_discount's sell_at) —
-    over every scenario the filter bar shows, tier floors on and off, adding
-    to held pairs or not. Like the add-on family it simulates nothing during
-    the run; each cell is simulated when the dashboard reads it.
+    config.TAKE_PROFIT_LEVELS — sell a whole position once its realized
+    profit has stayed at or above that share of its potential profit for
+    config.TAKE_PROFIT_HOLD_DAYS days in a row (_simulate_at_discount's
+    sell_at) — over every scenario the filter bar shows, tier floors on and
+    off, adding to held pairs or not. Like the add-on family it simulates
+    nothing during the run; each cell is simulated when the dashboard reads
+    it.
 
     An ENTRY CHECKPOINT is a moment at which the backtest may open a
     simulated trade: the live bot's weekly run time (config.SCHEDULED_RUN,
@@ -315,7 +317,7 @@ import statistics
 import sys
 from array import array
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -346,6 +348,7 @@ from .config import (
     SHORT_DEADLINE_GAP_DAYS,
     SPREAD_BAND_SWEEP_CEILINGS,
     SPREAD_BAND_SWEEP_FLOORS,
+    TAKE_PROFIT_HOLD_DAYS,
     TAKE_PROFIT_LEVELS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     TIME_SERIES_SAME_EVENT_LADDERS,
@@ -417,6 +420,13 @@ _CANDLE_NO_ASK_CEILING = 0.99
 # _attach_leg_quotes counts the leg on its DEBUG line of legs valued on old
 # quotes. Reporting only: no quote is ever refused for its age.
 _STALE_QUOTE_DAYS = 7
+
+# The most days the sell rule may span (TAKE_PROFIT_HOLD_DAYS): one week. A
+# sale at an entry checkpoint then looks back at most six days, all after the
+# previous checkpoint, so every trade the position holds at the sale was
+# already held at each daily check (trades are bought only at checkpoints);
+# the rule values those trades at every check.
+_HOLD_DAYS_MAX = 7
 
 # date.toordinal() of 1970-01-01, so a UTC midnight's Unix time is
 # (ordinal - _EPOCH_ORDINAL) * _DAY_SECONDS.
@@ -710,6 +720,15 @@ class LegQuotes:
     usable. Unlike the asks, bids are NOT carried forward: an old or missing
     quote means no bid (NaN), and a leg with no bid cannot be sold.
 
+    The sell rule also checks a position on the days before a sale
+    (TAKE_PROFIT_HOLD_DAYS), so it holds, for every day from first_day, each
+    side's bid at that day's check and whether the market had paid out by
+    then. A day's check is at the moment of the next checkpoint (on or after
+    that day) less whole days — 24 hours apart, the check on a checkpoint's
+    date being the checkpoint itself — and reads the latest candle that ended
+    in the 24 hours before it, that day's last quote. These bids are not
+    carried forward either.
+
     A plain __slots__ class, not a dataclass, so astuple does not walk into
     it and a copy is the object itself. Two built from the same candles
     compare equal and share a `fingerprint` (read by dashboard._list_key).
@@ -732,6 +751,12 @@ class LegQuotes:
         no_bid_checkpoints (np.ndarray): NO bids at each checkpoint, alike.
         paid_checkpoints (np.ndarray): Whether the market had paid out (a
             known payout, at or before the checkpoint) at each checkpoint.
+        yes_bid_daily (np.ndarray): YES bids at each day's check, one per day
+            from first_day (NaN: no quote in the 24 hours before it); never
+            carried forward.
+        no_bid_daily (np.ndarray): NO bids at each day's check, alike.
+        paid_daily (np.ndarray): Whether the market had paid out by each
+            day's check.
         fingerprint (str): A hex digest of everything above; two LegQuotes
             that compare equal share it.
     """
@@ -739,22 +764,25 @@ class LegQuotes:
     __slots__ = ("ticker", "first_day", "yes_days", "no_days", "first_checkpoint",
                  "yes_checkpoints", "no_checkpoints", "paid_yes", "paid_no",
                  "yes_bid_checkpoints", "no_bid_checkpoints", "paid_checkpoints",
-                 "fingerprint")
+                 "yes_bid_daily", "no_bid_daily", "paid_daily", "fingerprint")
 
     def __init__(self, ticker: str, first_day: date, yes_days: np.ndarray, no_days: np.ndarray,
                  first_checkpoint: date, yes_checkpoints: np.ndarray,
                  no_checkpoints: np.ndarray, paid_yes: float, paid_no: float,
                  yes_bid_checkpoints: np.ndarray | None = None,
                  no_bid_checkpoints: np.ndarray | None = None,
-                 paid_checkpoints: np.ndarray | None = None) -> None:
+                 paid_checkpoints: np.ndarray | None = None,
+                 yes_bid_daily: np.ndarray | None = None,
+                 no_bid_daily: np.ndarray | None = None,
+                 paid_daily: np.ndarray | None = None) -> None:
         """
         Store one market's samples, made read-only, and their fingerprint.
 
         Each ask array is carried forward first: a NaN after a usable sample
         takes that sample's value, so a side reads NaN only before its first
         usable ask, whoever built the arrays (_leg_quotes already builds them
-        so). The bid arrays are stored as given — a bid is never carried
-        forward.
+        so). The bid arrays, checkpoint and daily, are stored as given — a bid
+        is never carried forward.
 
         Args:
             ticker (str): The market's ticker.
@@ -772,6 +800,12 @@ class LegQuotes:
             no_bid_checkpoints (np.ndarray | None): NO bids, alike.
             paid_checkpoints (np.ndarray | None): Whether the market had paid
                 out by each checkpoint. None reads as never.
+            yes_bid_daily (np.ndarray | None): YES bids at each day's check,
+                one per day from first_day (NaN: none). None (a hand-built
+                quote) reads as no bid on any day.
+            no_bid_daily (np.ndarray | None): NO bids at each day's check, alike.
+            paid_daily (np.ndarray | None): Whether the market had paid out by
+                each day's check. None reads as never.
         """
         self.ticker = ticker
         self.first_day = first_day
@@ -811,6 +845,24 @@ class LegQuotes:
         self.paid_checkpoints = paid
         digest.update(len(paid).to_bytes(8, "little"))
         digest.update(paid.tobytes())
+        # The daily bids and paid-out markers, one per day from first_day,
+        # alike; missing ones read as no bid and never paid
+        days = len(self.yes_days)
+        for name, values in (("yes_bid_daily", yes_bid_daily),
+                             ("no_bid_daily", no_bid_daily)):
+            array = (np.full(days, np.nan) if values is None
+                     else np.array(values, dtype=float))
+            array.setflags(write=False)
+            setattr(self, name, array)
+            canonical = np.where(np.isnan(array), np.nan, array + 0.0)
+            digest.update(len(array).to_bytes(8, "little"))
+            digest.update(canonical.tobytes())
+        paid = (np.zeros(days, dtype=bool) if paid_daily is None
+                else np.array(paid_daily, dtype=bool))
+        paid.setflags(write=False)
+        self.paid_daily = paid
+        digest.update(len(paid).to_bytes(8, "little"))
+        digest.update(paid.tobytes())
         self.fingerprint = digest.hexdigest()
 
     def __reduce__(self) -> tuple:
@@ -827,7 +879,8 @@ class LegQuotes:
         return (LegQuotes, (self.ticker, self.first_day, self.yes_days, self.no_days,
                             self.first_checkpoint, self.yes_checkpoints, self.no_checkpoints,
                             self.paid_yes, self.paid_no, self.yes_bid_checkpoints,
-                            self.no_bid_checkpoints, self.paid_checkpoints))
+                            self.no_bid_checkpoints, self.paid_checkpoints,
+                            self.yes_bid_daily, self.no_bid_daily, self.paid_daily))
 
     def __copy__(self) -> "LegQuotes":
         """Return this object: it is read-only, and trades share one per market."""
@@ -869,8 +922,10 @@ class LegQuotes:
                 and all(np.array_equal(getattr(self, name), getattr(other, name), equal_nan=True)
                         for name in ("yes_days", "no_days", "yes_checkpoints",
                                      "no_checkpoints", "yes_bid_checkpoints",
-                                     "no_bid_checkpoints"))
-                and np.array_equal(self.paid_checkpoints, other.paid_checkpoints))
+                                     "no_bid_checkpoints", "yes_bid_daily",
+                                     "no_bid_daily"))
+                and np.array_equal(self.paid_checkpoints, other.paid_checkpoints)
+                and np.array_equal(self.paid_daily, other.paid_daily))
 
     def __hash__(self) -> int:
         """Hash on the ticker and first day, which equal objects share."""
@@ -959,51 +1014,110 @@ class LegQuotes:
                 f"(weekly from {self.first_checkpoint})")
         return offset // 7
 
-    def paid_at_checkpoint(self, day: date) -> bool:
+    @staticmethod
+    def _days_back(days_back: Any) -> int:
         """
-        Whether the market had paid out, with a known payout, by the checkpoint on `day`.
+        Check how many days before a checkpoint a lookup asks about.
+
+        Args:
+            days_back (Any): 0 for the checkpoint itself, or 1 to
+                _HOLD_DAYS_MAX - 1 for a daily check before it.
+
+        Returns:
+            int: days_back, as a builtin int.
+
+        Raises:
+            ValueError: For a bool, a number that is not whole, or one
+                outside 0 to _HOLD_DAYS_MAX - 1.
+        """
+        if (isinstance(days_back, (bool, np.bool_)) or not isinstance(days_back, numbers.Integral)
+                or not 0 <= days_back < _HOLD_DAYS_MAX):
+            raise ValueError(f"days_back must be a whole number from 0 to "
+                             f"{_HOLD_DAYS_MAX - 1}, got {days_back!r}")
+        return int(days_back)
+
+    def _day_index(self, day: date, back: int) -> int:
+        """
+        The index, in the daily bid arrays, of the check `back` days before the checkpoint on `day`.
 
         Args:
             day (date): A checkpoint date on this market's weekly grid.
+            back (int): A checked number of days back (_days_back), 1 or more.
 
         Returns:
-            bool: The checkpoint's marker; past the arrays' end (after the
-                market's settlement date), True exactly when the payout is
-                known.
+            int: Days from first_day to that check (negative before
+                first_day; may be past the arrays' end).
 
         Raises:
             ValueError: For a day off the weekly checkpoint grid.
         """
-        index = self._checkpoint_index(day)
-        if index < len(self.paid_checkpoints):
-            return bool(self.paid_checkpoints[index])
+        self._checkpoint_index(day)
+        return (day - self.first_day).days - back
+
+    def paid_at_checkpoint(self, day: date, days_back: int = 0) -> bool:
+        """
+        Whether the market had paid out, with a known payout, by the checkpoint on `day` (or a check before it).
+
+        Args:
+            day (date): A checkpoint date on this market's weekly grid.
+            days_back (int): 0 (the default) for the checkpoint itself; 1 to
+                _HOLD_DAYS_MAX - 1 for the daily check that many days before
+                it.
+
+        Returns:
+            bool: The marker; past the arrays' end (after the market's
+                settlement date), True exactly when the payout is known; for
+                a check before first_day, False.
+
+        Raises:
+            ValueError: For a day off the weekly checkpoint grid, or a bad
+                days_back.
+        """
+        back = self._days_back(days_back)
+        if back:
+            index, paid = self._day_index(day, back), self.paid_daily
+        else:
+            index, paid = self._checkpoint_index(day), self.paid_checkpoints
+        if index < 0:
+            return False
+        if index < len(paid):
+            return bool(paid[index])
         return self.paid_yes == self.paid_yes
 
-    def bid_at_checkpoint(self, day: date, side: str) -> float:
+    def bid_at_checkpoint(self, day: date, side: str, days_back: int = 0) -> float:
         """
-        What selling one contract of `side` would fetch at the checkpoint on `day`.
+        What selling one contract of `side` would fetch at the checkpoint on `day` (or a check before it).
 
         Args:
             day (date): A checkpoint date on this market's weekly grid.
             side (str): The side held, "yes" or "no".
+            days_back (int): 0 (the default) for the checkpoint itself; 1 to
+                _HOLD_DAYS_MAX - 1 for the daily check that many days before
+                it.
 
         Returns:
-            float: The side's fresh bid at the checkpoint; NaN when there is
-                none (no candle within one candle period of it, an unusable
-                opposite ask, or past the arrays' end).
+            float: At the checkpoint, the side's fresh bid (from a candle
+                within one candle period of it); at an earlier check, the bid
+                from the last quote in the 24 hours before that check. NaN
+                when there is none (no such candle, an unusable opposite ask,
+                before first_day, or past the arrays' end).
 
         Raises:
-            ValueError: For a day off the weekly checkpoint grid, or an
-                unknown side.
+            ValueError: For a day off the weekly checkpoint grid, an unknown
+                side or a bad days_back.
         """
         if side == "yes":
-            bids = self.yes_bid_checkpoints
+            bids, daily = self.yes_bid_checkpoints, self.yes_bid_daily
         elif side == "no":
-            bids = self.no_bid_checkpoints
+            bids, daily = self.no_bid_checkpoints, self.no_bid_daily
         else:
             raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
-        index = self._checkpoint_index(day)
-        return float(bids[index]) if index < len(bids) else float("nan")
+        back = self._days_back(days_back)
+        if back:
+            index, bids = self._day_index(day, back), daily
+        else:
+            index = self._checkpoint_index(day)
+        return float(bids[index]) if 0 <= index < len(bids) else float("nan")
 
     def day_values(self, first: date, last: date, side: str, entry_price: float) -> np.ndarray:
         """
@@ -1852,9 +1966,10 @@ class CapSweep:
     Monday; those point at the pair's own two market dicts, so they add no
     market dicts. Each record's "leg_quotes" (the prices that value its
     trades at market) holds one LegQuotes per market, shared by every record
-    and band: about 18 bytes per market per day of its life in the window
-    (two asks a day, and two a week at the checkpoints), and no candle list. The quotes depend on no cap, k, band, tier setting
-    or population, so the reuse rule below stays exact.
+    and band: about 38 bytes per market per day of its life in the window
+    (two asks, two bids and a paid-out marker a day, and the same at each
+    checkpoint), and no candle list. The quotes depend on no cap, k, band,
+    tier setting or population, so the reuse rule below stays exact.
 
     One Tier floors setting per CapSweep (tier_floors). The tier-on one
     (BacktestSweep.cap_sweep, tier_floors True) holds the tier-on
@@ -2248,7 +2363,8 @@ class SellSweep:
 
     The backtest dashboard's Sell select offers "no selling" (the scenario as
     simulated) and each of `levels` (config.TAKE_PROFIT_LEVELS): sell a whole
-    position once it has realized that share of its potential profit
+    position once its realized profit has stayed at or above that share of
+    its potential profit for config.TAKE_PROFIT_HOLD_DAYS days in a row
     (_simulate_at_discount's sell_at). It covers every scenario the filter bar
     shows — every band, Tier floors setting, k, size cap and Add to held
     pairs setting. Nothing is simulated while the backtest runs: sweep()
@@ -2898,6 +3014,46 @@ def _resolve_sell_at(sell_at: float | None) -> float | None:
     return _validated_cap(sell_at, "sell_at")
 
 
+def _resolve_hold_days() -> int:
+    """
+    Check how many days in a row a position must stay at its sell level before it is sold.
+
+    Reads this module's TAKE_PROFIT_HOLD_DAYS when called (patch
+    backtester's, never config's). Read wherever the sell rule is applied
+    (_simulate_at_discount with sell_at, _highest_sale_level) and by
+    run_backtest_sweep before its fetch when the sell family is on.
+
+    Returns:
+        int: A whole number from 1 to _HOLD_DAYS_MAX.
+
+    Raises:
+        ValueError: For a bool, a number that is not whole, or one outside 1
+            to _HOLD_DAYS_MAX.
+    """
+    days = TAKE_PROFIT_HOLD_DAYS
+    if (isinstance(days, (bool, np.bool_)) or not isinstance(days, numbers.Integral)
+            or not 1 <= days <= _HOLD_DAYS_MAX):
+        raise ValueError(f"TAKE_PROFIT_HOLD_DAYS must be a whole number from 1 to "
+                         f"{_HOLD_DAYS_MAX}, got {days!r}")
+    return int(days)
+
+
+def _hold_days_text(hold_days: int) -> str:
+    """
+    Say, for a log line or the dashboard, when a position is sold at a level.
+
+    Args:
+        hold_days (int): A resolved day count (_resolve_hold_days).
+
+    Returns:
+        str: "once it reaches a level at a checkpoint" for 1; otherwise
+            e.g. "once it has stayed at or above a level for 3 days in a row".
+    """
+    if hold_days == 1:
+        return "once it reaches a level at a checkpoint"
+    return f"once it has stayed at or above a level for {hold_days} days in a row"
+
+
 def _sale_label(sell_at: float) -> str:
     """
     Name a sell level for a completion line or a log summary.
@@ -2912,7 +3068,7 @@ def _sale_label(sell_at: float) -> str:
     return f"selling at {_cap_percent(sell_at)}% of potential profit"
 
 
-def _trade_sale_value(trade: BacktestTrade, day: date) -> tuple | None:
+def _trade_sale_value(trade: BacktestTrade, day: date, days_back: int = 0) -> tuple | None:
     """
     What selling one open trade at the checkpoint on `day` would return, after the sale's fees.
 
@@ -2920,16 +3076,22 @@ def _trade_sale_value(trade: BacktestTrade, day: date) -> tuple | None:
     (LegQuotes.paid_at_checkpoint) counts at its payout, with no sale and no
     fee. Every other leg sells its n contracts at the bid of the side it
     holds (LegQuotes.bid_at_checkpoint), less the taker fee on that sale
-    (config.fee_leg_exact).
+    (config.fee_leg_exact). With days_back, the same value at the sell
+    rule's daily check that many days before the checkpoint
+    (TAKE_PROFIT_HOLD_DAYS): what a sale then would have returned.
 
     Args:
         trade (BacktestTrade): An open trade.
         day (date): A checkpoint date on its legs' weekly grid.
+        days_back (int): 0 (the default) for the checkpoint; 1 to
+            _HOLD_DAYS_MAX - 1 for a daily check before it.
 
     Returns:
         tuple | None: (value, fees, (market A's sale price, market B's)), a
             price None for a leg that paid out; None when the trade has no
-            quotes or a leg still to pay out has no bid, so it cannot be sold.
+            quotes or a leg still to pay out has no bid at this check (at the
+            checkpoint, no fresh bid; at an earlier check, no quote in the 24
+            hours before it), so it cannot be valued there.
 
     Raises:
         ValueError: From LegQuotes, for a day off the legs' checkpoint grid.
@@ -2941,14 +3103,14 @@ def _trade_sale_value(trade: BacktestTrade, day: date) -> tuple | None:
     prices: list[float | None] = []
     # Which side each leg holds (scanner.leg_sides, the one definition)
     for quotes, side in zip(trade.marks, leg_sides(trade.pair_type), strict=True):
-        if quotes.paid_at_checkpoint(day):
+        if quotes.paid_at_checkpoint(day, days_back):
             # Paid out: worth its payout, with nothing to sell
             value += trade.n * (quotes.paid_yes if side == "yes" else quotes.paid_no)
             prices.append(None)
             continue
-        bid = quotes.bid_at_checkpoint(day, side)
+        bid = quotes.bid_at_checkpoint(day, side, days_back)
         if bid != bid:
-            # No fresh bid (NaN): this leg cannot be sold now
+            # No bid at this check (NaN): this leg cannot be valued here
             return None
         # config.fee_leg_exact: the taker fee on selling n contracts at the bid
         fee = fee_leg_exact(trade.n, bid)
@@ -2999,7 +3161,8 @@ def _positions(open_trades: list[BacktestTrade]) -> list[list[BacktestTrade]]:
     return list(groups.values())
 
 
-def _position_sale_value(position: list[BacktestTrade], day: date) -> tuple | None:
+def _position_sale_value(position: list[BacktestTrade], day: date,
+                         days_back: int = 0) -> tuple | None:
     """
     What selling a whole position at the checkpoint on `day` would return, and what it cost and could pay.
 
@@ -3007,21 +3170,25 @@ def _position_sale_value(position: list[BacktestTrade], day: date) -> tuple | No
     the value is each trade's _trade_sale_value summed in the position's
     order, the cost each trade's contracts plus entry fees, and the potential
     total return each trade's contract pairs times CONTRACT_PAYOUT_DOLLARS —
-    what one leg pays in a win.
+    what one leg pays in a win. With days_back, the value is the one at the
+    sell rule's daily check that many days before the checkpoint
+    (_hold_readings reads it so).
 
     Args:
         position (list[BacktestTrade]): One position's open trades (_positions).
         day (date): A checkpoint date on the legs' weekly grid.
+        days_back (int): 0 (the default) for the checkpoint; 1 to
+            _HOLD_DAYS_MAX - 1 for a daily check before it.
 
     Returns:
         tuple | None: (each trade's _trade_sale_value, in order; the sale
             value; the total cost; the potential total return); None when any
-            of its trades cannot be sold now.
+            of its trades cannot be valued at this check (_trade_sale_value).
     """
     per_trade = []
     value = cost = potential = 0.0
     for trade in position:
-        sale = _trade_sale_value(trade, day)
+        sale = _trade_sale_value(trade, day, days_back)
         if sale is None:
             return None
         per_trade.append(sale)
@@ -3041,7 +3208,8 @@ def _sells_at(sell_at: float, realized: float, potential: float) -> bool:
     potential (less PRICE_EPSILON of float noise). For a fixed position the
     test holds at every level below one at which it holds, since a float
     product with a positive number never falls as the other factor rises;
-    _highest_sale_level relies on that.
+    _highest_sale_level relies on that. The sell rule applies it at every
+    daily check (_reached_every_day).
 
     Args:
         sell_at (float): The share, in (0, 1].
@@ -3054,7 +3222,75 @@ def _sells_at(sell_at: float, realized: float, potential: float) -> bool:
     return potential > 0 and realized >= sell_at * potential - PRICE_EPSILON
 
 
-def _position_sells(sell_at: float, position: list[BacktestTrade], day: date) -> bool:
+def _hold_readings(position: list[BacktestTrade], day: date, hold_days: int, *,
+                   level: float | None = None) -> tuple | None:
+    """
+    A position's sale at the checkpoint on `day`, and its profit at each daily check the sell rule reads.
+
+    The sell rule (TAKE_PROFIT_HOLD_DAYS) sells a position at a checkpoint
+    only when it has reached its level there and at the daily check on each
+    of the hold_days - 1 days before it — so it has stayed at the level for
+    hold_days days in a row, checked once a day, 24 hours apart. Each check
+    is valued as a sale then would be (_position_sale_value: at the
+    checkpoint the fresh bids, at an earlier check the last quote of the 24
+    hours before it). The walk's sales (_simulate_at_discount), its quick
+    test at a checkpoint where nothing is bought (_position_sells) and the
+    shortcut that replays the walk (_highest_sale_level) all read the checks
+    here and decide through _reached_every_day, so they apply one rule.
+
+    Args:
+        position (list[BacktestTrade]): One position's open trades (_positions).
+        day (date): A checkpoint date on the legs' weekly grid.
+        hold_days (int): How many checks, the checkpoint's included (_resolve_hold_days).
+        level (float | None): Keyword-only. When given, stop at the first
+            check below this share of potential profit and return None: the
+            walk asks about its one level, so a check after a failing one is
+            never read. _highest_sale_level asks about every level and
+            passes none.
+
+    Returns:
+        tuple | None: (the checkpoint's _position_sale_value, [(realized
+            profit, potential profit) at each check, the checkpoint's
+            first]); None when the position cannot be valued at some check
+            (a trade with no quotes, or a leg still to pay out with no bid
+            there) or, with level, a check falls below it.
+    """
+    sale = _position_sale_value(position, day)
+    profits = []
+    for back in range(hold_days):
+        # The checkpoint first, then each day before it
+        valued = sale if back == 0 else _position_sale_value(position, day, back)
+        if valued is None:
+            return None
+        _per_trade, value, cost, potential = valued
+        profits.append((value - cost, potential - cost))
+        if level is not None and not _sells_at(level, value - cost, potential - cost):
+            # Below the one level asked about: no later check is read
+            return None
+    return sale, profits
+
+
+def _reached_every_day(sell_at: float, profits: list[tuple[float, float]]) -> bool:
+    """
+    Whether a position reached sell_at of its potential profit at every daily check.
+
+    _sells_at at each check of _hold_readings. Like _sells_at it holds at
+    every level below one at which it holds (it holds at each check), which
+    _highest_sale_level relies on.
+
+    Args:
+        sell_at (float): The share, in (0, 1].
+        profits (list[tuple[float, float]]): (realized profit, potential
+            profit) at each check (_hold_readings).
+
+    Returns:
+        bool: True when every check reaches it.
+    """
+    return all(_sells_at(sell_at, realized, potential) for realized, potential in profits)
+
+
+def _position_sells(sell_at: float, position: list[BacktestTrade], day: date,
+                    hold_days: int) -> bool:
     """
     Whether a position would be sold at the checkpoint on `day`.
 
@@ -3062,16 +3298,16 @@ def _position_sells(sell_at: float, position: list[BacktestTrade], day: date) ->
         sell_at (float): The share of potential profit that sells it.
         position (list[BacktestTrade]): One position's open trades.
         day (date): A checkpoint date on its legs' weekly grid.
+        hold_days (int): How many days in a row it must stay at that share
+            (_resolve_hold_days).
 
     Returns:
-        bool: False when it cannot be sold now (_position_sale_value is
-            None); otherwise _sells_at on its realized and potential profit.
+        bool: False when it cannot be valued at some check
+            (_hold_readings is None); otherwise whether it reached sell_at
+            at every check (_reached_every_day).
     """
-    numbers = _position_sale_value(position, day)
-    if numbers is None:
-        return False
-    _per_trade, value, cost, potential = numbers
-    return _sells_at(sell_at, value - cost, potential - cost)
+    readings = _hold_readings(position, day, hold_days, level=sell_at)
+    return readings is not None and _reached_every_day(sell_at, readings[1])
 
 
 def _sold_copy(trade: BacktestTrade, day: date, sale: tuple) -> BacktestTrade:
@@ -3168,17 +3404,18 @@ def _highest_sale_level(point: "SweepPoint", levels: Iterable[float]) -> float |
     Replays the sell test on a no-selling run's trades: at every checkpoint
     from the first entry to the last pay-out (_sale_checkpoints) it groups
     the trades open there — entered before it and paying out after it, the
-    trades a selling walk would hold — into positions (_positions) and values
-    each as a sale would (_position_sale_value). _sells_at holds at every
-    level below one at which it holds, so the levels at which some position
-    sells are exactly those up to the one returned. A run selling at any
-    HIGHER level OF `levels` never sells: it walks as the no-selling run until
-    its first sale, and there is none, so it is the no-selling run (only its
-    sell_at stamp differs). The guarantee covers the levels given, not every
-    higher share: a share between the returned level and the next one given
-    can still sell, if a position's ratio of realized to potential profit
-    reached it. The sell family and the dashboard simulate only the levels up
-    to it, out of the very levels they pass here.
+    trades a selling walk would hold — into positions (_positions) and reads
+    each at the checkpoint and at the daily checks before it, as a sale
+    would (_hold_readings, TAKE_PROFIT_HOLD_DAYS). _reached_every_day holds
+    at every level below one at which it holds, so the levels at which some
+    position sells are exactly those up to the one returned. A run selling
+    at any HIGHER level OF `levels` never sells: it walks as the no-selling
+    run until its first sale, and there is none, so it is the no-selling run
+    (only its sell_at stamp differs). The guarantee covers the levels given,
+    not every higher share: a share between the returned level and the next
+    one given can still sell, if a position's ratio of realized to potential
+    profit reached it at every check. The sell family and the dashboard
+    simulate only the levels up to it, out of the very levels they pass here.
 
     Args:
         point (SweepPoint): A simulation that never sold (sell_at None).
@@ -3190,11 +3427,12 @@ def _highest_sale_level(point: "SweepPoint", levels: Iterable[float]) -> float |
 
     Raises:
         ValueError: For a point that sold, whose trades are not a
-            no-selling run's.
+            no-selling run's, or a bad TAKE_PROFIT_HOLD_DAYS.
     """
     if point.sell_at is not None:
         raise ValueError("_highest_sale_level reads a run that never sold, "
                          f"not one selling at {point.sell_at!r}")
+    hold_days = _resolve_hold_days()
     descending = sorted(levels, reverse=True)
     if not point.trades or not descending:
         return None
@@ -3215,14 +3453,14 @@ def _highest_sale_level(point: "SweepPoint", levels: Iterable[float]) -> float |
         # In the order the trades were made, as the walk holds them
         open_trades = [point.trades[i] for i in sorted(open_ids)]
         for position in _positions(open_trades):
-            numbers = _position_sale_value(position, day)
-            if numbers is None:
+            # Every check, read once: each level is tested against all of them
+            readings = _hold_readings(position, day, hold_days)
+            if readings is None:
                 continue
-            _per_trade, value, cost, potential = numbers
             for level in descending:
                 if best is not None and level <= best:
                     break
-                if _sells_at(level, value - cost, potential - cost):
+                if _reached_every_day(level, readings[1]):
                     best = level
                     break
             if best == descending[0]:
@@ -4849,6 +5087,11 @@ def _leg_quotes(market: dict, candles: list[dict], start_date: date) -> tuple[Le
     the checkpoint, when that candle ended at most one candle period before
     it (NaN otherwise, and never carried forward), and whether the market
     had paid out by then (its exact settlement time, with a known payout).
+    It records the same once a day over the day-end samples' days, for the
+    days the sell rule checks before a sale (TAKE_PROFIT_HOLD_DAYS): each
+    day's check is at the moment of the next checkpoint on or after it, less
+    whole days, and reads the latest candle that ended in the 24 hours
+    before it.
 
     Args:
         market (dict): The market's cached record ("ticker", "settlement_ts", "result").
@@ -4938,33 +5181,68 @@ def _leg_quotes(market: dict, candles: list[dict], start_date: date) -> tuple[Le
                 stale += 1
         return yes_out, no_out, stale
 
+    def bids(moments: list[int], recent: Callable[[int], bool]
+             ) -> tuple[list[float], list[float], list[bool]]:
+        """
+        What a sale would fetch at each moment, and whether the market had paid out by then.
+
+        A side's bid is 1 - the other side's usable ask on the latest candle
+        at or before the moment, read only when that candle is recent
+        enough (`recent` of its age in seconds) and never carried forward.
+
+        Args:
+            moments (list[int]): Unix times, in time order.
+            recent (Callable[[int], bool]): Whether a candle that ended that
+                many seconds before a moment may be read there.
+
+        Returns:
+            tuple: (YES bids, NO bids, paid-out markers), one per moment;
+                NaN where there is no bid.
+        """
+        yes_out: list[float] = []
+        no_out: list[float] = []
+        paid_out: list[bool] = []
+        for moment, candle in zip(moments, _candles_at_or_before(candles, moments),
+                                  strict=True):
+            # Paid out by then: its exact settlement time, with a known payout
+            is_paid = pays_from is not None and pays_from <= moment
+            paid_out.append(is_paid)
+            if is_paid or candle is None or not recent(moment - candle["ts"]):
+                yes_out.append(float("nan"))
+                no_out.append(float("nan"))
+                continue
+            no_ask = _usable_ask(candle.get("no_ask_close"), "no")
+            yes_ask = _usable_ask(candle.get("yes_ask_close"), "yes")
+            # Rounded to 6 decimals so float noise (1 - 0.43 = 0.5700000000000001)
+            # never reaches a price; a NaN ask leaves a NaN bid
+            yes_out.append(round(1.0 - no_ask, 6))
+            no_out.append(round(1.0 - yes_ask, 6))
+        return yes_out, no_out, paid_out
+
     yes_days, no_days, stale_days = sample(day_ends, True)
     yes_checkpoints, no_checkpoints, _ = sample(checkpoints, False)
-    # What a sale would fetch at each checkpoint: a side's bid is 1 - the
-    # other side's ask, read off the latest candle only when it ended at most
-    # one candle period before the checkpoint, never carried forward; and
-    # whether the market had paid out by then (its exact settlement time)
+    # What a sale would fetch at each checkpoint: a bid from a candle that
+    # ended at most one candle period before it
     period = CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60
-    yes_bids: list[float] = []
-    no_bids: list[float] = []
-    paid: list[bool] = []
-    for moment, candle in zip(checkpoints, _candles_at_or_before(candles, checkpoints),
-                              strict=True):
-        is_paid = pays_from is not None and pays_from <= moment
-        paid.append(is_paid)
-        if is_paid or candle is None or moment - candle["ts"] > period:
-            yes_bids.append(float("nan"))
-            no_bids.append(float("nan"))
-            continue
-        no_ask = _usable_ask(candle.get("no_ask_close"), "no")
-        yes_ask = _usable_ask(candle.get("yes_ask_close"), "yes")
-        # Rounded to 6 decimals so float noise (1 - 0.43 = 0.5700000000000001)
-        # never reaches a price; a NaN ask leaves a NaN bid
-        yes_bids.append(round(1.0 - no_ask, 6))
-        no_bids.append(round(1.0 - yes_ask, 6))
+    yes_bids, no_bids, paid = bids(checkpoints, lambda age: age <= period)
+    # ... and at one check a day, over the day-end samples' days, for the
+    # days the sell rule reads before a sale: each at the moment of the next
+    # checkpoint on or after that day, less whole days (so 24 hours apart,
+    # a checkpoint's own date at the checkpoint), reading that day's last
+    # quote — a candle that ended in the 24 hours before the check
+    run_moments: dict[date, int] = {}
+    day_checks: list[int] = []
+    for offset in range((last_day - first_day).days + 1):
+        day = first_day + timedelta(days=offset)
+        ahead = (SCHEDULED_RUN.weekday - day.weekday()) % 7
+        run_day = day + timedelta(days=ahead)
+        if run_day not in run_moments:
+            run_moments[run_day] = int(_checkpoint_datetime(run_day).timestamp())
+        day_checks.append(run_moments[run_day] - ahead * _DAY_SECONDS)
+    yes_daily, no_daily, paid_daily = bids(day_checks, lambda age: age < _DAY_SECONDS)
     quotes = LegQuotes(ticker, first_day, yes_days, no_days, first_checkpoint,
                        yes_checkpoints, no_checkpoints, paid_yes, paid_no,
-                       yes_bids, no_bids, paid)
+                       yes_bids, no_bids, paid, yes_daily, no_daily, paid_daily)
     return quotes, stale_days
 
 
@@ -7549,15 +7827,18 @@ def _simulate_at_discount(
       * at every entry checkpoint from the first candidate's to the last
         pay-out — including those with no candidate (_sale_stream) — after
         that day's pay-outs and before its valuation, a position sells when
-        its realized profit reaches sell_at of its potential profit
-        (_sells_at). Realized profit is what selling returns
-        (_position_sale_value: each leg at the bid of the side it holds,
-        less the taker fee on the sale; a leg whose market has paid out, at
-        its payout) less its cost (contracts plus entry fees); potential
-        profit is its contract pairs at CONTRACT_PAYOUT_DOLLARS less that
-        cost;
+        its realized profit has stayed at or above sell_at of its potential
+        profit for TAKE_PROFIT_HOLD_DAYS days in a row: at the checkpoint and
+        at a daily check on each day before it, 24 hours apart
+        (_hold_readings, _reached_every_day). Realized profit is what
+        selling returns (_position_sale_value: each leg at the bid of the
+        side it holds, less the taker fee on the sale; a leg whose market has
+        paid out, at its payout) less its cost (contracts plus entry fees);
+        potential profit is its contract pairs at CONTRACT_PAYOUT_DOLLARS
+        less that cost;
       * a position with no quotes, or with a leg still to pay out and no
-        fresh bid, is not sold at that checkpoint;
+        fresh bid at the checkpoint (or no quote in the 24 hours before an
+        earlier check), is not sold at that checkpoint;
       * each of its trades exits at the sale (_sold_copy), its markets and
         ladders are freed, and its pair may be bought again at a later
         checkpoint, never at the sale's (nor may a pair touching its markets
@@ -7593,8 +7874,8 @@ def _simulate_at_discount(
             level it sold at.
 
     Raises:
-        ValueError: For an unknown population, a bad spread band, a bad size cap
-            or a bad sell_at.
+        ValueError: For an unknown population, a bad spread band, a bad size cap,
+            a bad sell_at, or, with sell_at, a bad TAKE_PROFIT_HOLD_DAYS.
         TypeError: For a spread band that is not a pair of numbers.
     """
     if population not in _SIMULATION_LABELS:
@@ -7613,8 +7894,11 @@ def _simulate_at_discount(
     cap = _resolve_size_cap(size_cap)
     # ... and the extra same-title cap, held to the same rule
     st_cap = _resolve_same_title_size_cap()
-    # The share of potential profit that sells a position (None: never sell)
+    # The share of potential profit that sells a position (None: never sell),
+    # and how many days in a row a position must stay at it (read only when
+    # selling, so a run that never sells never reads it)
     sell_level = _resolve_sell_at(sell_at)
+    hold_days = None if sell_level is None else _resolve_hold_days()
 
     # ── Pass 1b: score the prepared entries and keep the tradeable ones ──
     candidates = []
@@ -8027,7 +8311,7 @@ def _simulate_at_discount(
 
     def sell(d: date) -> None:
         """
-        Sell, whole, every open position that has realized sell_at of its potential profit.
+        Sell, whole, every open position that has stayed at sell_at of its potential profit for hold_days days.
 
         Each sold trade's proceeds come in now, its record is replaced by its
         sold copy (_sold_copy), its pay-out, markets and ladder labels are
@@ -8042,12 +8326,11 @@ def _simulate_at_discount(
         sold_here.clear()
         sold_ids: set[int] = set()
         for position in _positions(open_trades):
-            numbers = _position_sale_value(position, d)
-            if numbers is None:
+            # The checkpoint and the daily checks before it (_hold_readings)
+            readings = _hold_readings(position, d, hold_days, level=sell_level)
+            if readings is None or not _reached_every_day(sell_level, readings[1]):
                 continue
-            per_trade, value, cost, potential = numbers
-            if not _sells_at(sell_level, value - cost, potential - cost):
-                continue
+            per_trade = readings[0][0]
             positions_sold += 1
             for trade, sale in zip(position, per_trade, strict=True):
                 # The sale's proceeds, trade by trade
@@ -8100,7 +8383,7 @@ def _simulate_at_discount(
             # changes here unless a position sells, so a run that never sells
             # makes exactly the moves of one that cannot (_highest_sale_level)
             open_now = [t for t in open_trades if t.exit_date > d]
-            if not any(_position_sells(sell_level, position, d)
+            if not any(_position_sells(sell_level, position, d, hold_days)
                        for position in _positions(open_now)):
                 continue
             release(d)
@@ -10172,7 +10455,9 @@ def run_backtest_sweep(
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
             without band_sweep, if this module's SAME_TITLE_SIZE_CAP is not a
-            number in (0, 1], or if spread_band is not a valid band; and,
+            number in (0, 1], if sell_sweep is set and this module's
+            TAKE_PROFIT_HOLD_DAYS is not a whole number from 1 to
+            _HOLD_DAYS_MAX, or if spread_band is not a valid band; and,
             before any fetch, from _prepare_candidates() when SCHEDULED_RUN
             cannot place the entry checkpoints (a configuration error).
         TypeError: From config.time_series_spread_band, before any fetch, if
@@ -10212,6 +10497,9 @@ def run_backtest_sweep(
                          "re-runs the band sweep's binding bands")
     # The same for the extra same-title cap: refused here, not after the fetch
     same_title_cap = _resolve_same_title_size_cap()
+    # ... and, when the sell family rides the result, for the sell rule's day
+    # count, which the dashboard otherwise reads only after the run
+    hold_days = _resolve_hold_days() if sell_sweep else None
 
     logging.info("Starting backtest from %s with $%.2f", start_date, initial_balance)
 
@@ -10286,10 +10574,12 @@ def run_backtest_sweep(
         "dashboard is built" if add_on_sweep else
         "off — the dashboard's Add to held pairs select stays disabled",
     )
-    # And for the sell family, the same way
+    # And for the sell family, the same way, with when a position is sold
     logging.info(
         "Selling early (backtest): %s",
-        "on — the dashboard's Sell select is simulated when the dashboard is built"
+        f"on — a position is sold {_hold_days_text(hold_days)} "
+        "(config.TAKE_PROFIT_HOLD_DAYS); the dashboard's Sell select is simulated "
+        "when the dashboard is built"
         if sell_sweep else "off — the dashboard's Sell select stays disabled",
     )
     # The saved live defaults (never main.py's per-run overrides), read ONCE
