@@ -845,8 +845,15 @@ class LegQuotes:
         self.paid_checkpoints = paid
         digest.update(len(paid).to_bytes(8, "little"))
         digest.update(paid.tobytes())
-        # The daily bids and paid-out markers, one per day from first_day,
-        # alike; missing ones read as no bid and never paid
+        # The sell rule's daily checks (TAKE_PROFIT_HOLD_DAYS): one per day
+        # from first_day, each side's bid at that day's check and whether the
+        # market had paid out by then. The old checkpoint arrays above only
+        # cover Mondays; a sale needs a price for each of the days before
+        # its Monday too (a leg already paid out counts at its payout). A
+        # hand-built quote has none: no bid, never paid. Like every array
+        # here they go into the fingerprint, so two quotes that differ in any
+        # stored number never share one (dashboard._list_key shares a page
+        # chunk between trade lists whose quotes' fingerprints match)
         days = len(self.yes_days)
         for name, values in (("yes_bid_daily", yes_bid_daily),
                              ("no_bid_daily", no_bid_daily)):
@@ -3257,9 +3264,11 @@ def _hold_readings(position: list[BacktestTrade], day: date, hold_days: int, *,
     """
     sale = _position_sale_value(position, day)
     profits = []
-    for back in range(hold_days):
-        # The checkpoint first, then each day before it
-        valued = sale if back == 0 else _position_sale_value(position, day, back)
+    for days_back in range(hold_days):
+        # days_back 0 is the checkpoint itself — the day of the sale, valued
+        # just above as `sale` (it is also the sale's proceeds), so it is
+        # reused rather than valued twice; 1, 2, ... are the days before it
+        valued = sale if days_back == 0 else _position_sale_value(position, day, days_back)
         if valued is None:
             return None
         _per_trade, value, cost, potential = valued
@@ -3307,6 +3316,11 @@ def _position_sells(sell_at: float, position: list[BacktestTrade], day: date,
             at every check (_reached_every_day).
     """
     readings = _hold_readings(position, day, hold_days, level=sell_at)
+    # Sold only when every check has a price (readings is not None) and each
+    # reaches sell_at. With level=sell_at, _hold_readings already stops at
+    # the first check below it, so the second test repeats the first; it is
+    # kept so this, the walk's sales and _highest_sale_level all decide
+    # through the one function
     return readings is not None and _reached_every_day(sell_at, readings[1])
 
 
@@ -5189,6 +5203,11 @@ def _leg_quotes(market: dict, candles: list[dict], start_date: date) -> tuple[Le
         A side's bid is 1 - the other side's usable ask on the latest candle
         at or before the moment, read only when that candle is recent
         enough (`recent` of its age in seconds) and never carried forward.
+        Used twice below, with one bid rule for both: at the weekly
+        checkpoints, where a sale happens (a candle at most one candle
+        period old), and at each day's check of the sell rule's days before
+        a sale (TAKE_PROFIT_HOLD_DAYS: that day's last quote, a candle from
+        the 24 hours before it). Only the `recent` test differs.
 
         Args:
             moments (list[int]): Unix times, in time order.
