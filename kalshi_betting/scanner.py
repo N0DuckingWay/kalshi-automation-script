@@ -138,7 +138,7 @@ import math
 import re
 import unicodedata
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from datetime import UTC, date, datetime, timedelta
@@ -459,8 +459,8 @@ _ANY_SNAPSHOT = re.compile(
 #
 # NOTE ON THE NAME: "snapshot" here means a MARKET SHAPE ("what is X on <date>"),
 # which is the sense CLAUDE.md, README.md and backtester.py's premise-violation
-# WARNING all use. It is unrelated to enrich_with_orderbook_prices' "mixed
-# snapshot" comment, which is about a stale vs. fresh PRICE quote.
+# WARNING all use. It is unrelated to _enrich_pair's "one snapshot" comment,
+# which is about a stale vs. fresh PRICE quote.
 DEADLINE_CUMULATIVE = "cumulative"
 DEADLINE_SNAPSHOT = "snapshot"
 DEADLINE_UNKNOWN = "unknown"
@@ -4398,7 +4398,7 @@ def find_time_series_pairs(
                 # changes which NON-tradeable row represents such a group.
                 #
                 # The epsilon runs the OPPOSITE way from the qualifying-level
-                # filters in enrich_with_orderbook_prices/validate_pair_price,
+                # filters in _enrich_pair/validate_pair_price,
                 # which ADD it to a keep bound so a level exactly on the bound
                 # is not dropped for float noise. This is the REJECT side: the
                 # skip condition is strictly pA + nB < 1, so a sum that is
@@ -5532,6 +5532,270 @@ def _levels_with_edge_after_fee(qualifying: list) -> list:
     ))
 
 
+def _cash_binds(portfolio_value_cents: int, bound: float, cash_cents: int | None) -> bool:
+    """
+    Whether the cash on hand, not the Kelly share of the portfolio value, limits a budget.
+
+    _enrich_pair reads it to say "the $C of cash binds" when it drops a pair
+    it cannot afford, and backtester._size_trade reads it to count those
+    drops on their own line.
+
+    Args:
+        portfolio_value_cents (int): Cash plus open positions' value, in cents.
+        bound (float): The largest Kelly share the sizer can return for the
+            pair (config.max_kelly_fraction).
+        cash_cents (int | None): The cash on hand in cents; None means it is all cash.
+
+    Returns:
+        bool: True when that share of the portfolio value is more than the cash.
+    """
+    return (cash_cents is not None
+            and kelly_budget(portfolio_value_cents / 100.0, bound) > cash_cents / 100.0)
+
+
+# Why _enrich_pair refused a pair. A refused time-series spread is named by
+# config's SPREAD_* code instead. UNAFFORDABLE: the budget cannot buy one
+# contract pair; THIN_BOOK: it can, but the book holds under one contract at
+# the gap.
+ENRICH_NO_EDGE_AFTER_FEE = "no edge after fee"
+ENRICH_NO_QUALIFYING = "no qualifying levels"
+ENRICH_UNAFFORDABLE = "unaffordable"
+ENRICH_THIN_BOOK = "book too thin"
+ENRICH_NO_REFERENCE = "no reference ask"
+ENRICH_CROSSED = "crossed book"
+ENRICH_UNPROFITABLE = "unprofitable"
+
+
+def _enrich_pair(
+    pair: CandidatePair, ob_a: dict, ob_b: dict, portfolio_value_cents: int, *,
+    settings: LiveSettings, cash_cents: int | None, log: Callable[..., Any] = logging.log,
+) -> tuple[CandidatePair, str | None]:
+    """
+    Price one pair off its two order books, as live enrichment does.
+
+    Matches the two legs' asks level by level, keeps the levels under the
+    pair's price-sum ceiling that still have an edge after the fee, and prices
+    each leg at its average fill over the most contracts the largest Kelly
+    share could buy (never more than the cash). A time-series pair also needs
+    a YES ask on the later book that is not below its own YES bid, and a
+    spread the run's spread rule accepts. It needs no client:
+    enrich_with_orderbook_prices fetches the books and calls it once per pair.
+
+    Args:
+        pair (CandidatePair): A tradeable pair.
+        ob_a (dict): market_a's book, {"yes": YES bids, "no": NO bids}, in dollars.
+        ob_b (dict): market_b's book, the same shape.
+        portfolio_value_cents (int): Cash plus open positions' value, in cents.
+        settings (LiveSettings): Keyword-only. The run's settings.
+        cash_cents (int | None): Keyword-only. The cash on hand in cents; None means it is all cash.
+        log (Callable): Keyword-only. Takes each of this function's own lines as
+            log(level, msg, *args); logging.log by default. The book reader's
+            WARNING about unusable bid levels (_bids_to_ask_levels) still goes
+            to the logging module.
+
+    Returns:
+        tuple[CandidatePair, str | None]: The re-priced pair, and why it was
+            refused (an ENRICH_* code, or config's SPREAD_* code for a refused
+            spread; the first check that failed). None when it is tradeable.
+    """
+    # Derive the ask levels each leg would consume — each buy fills against
+    # the OPPOSITE-side bids of ITS OWN market, and which market carries the
+    # NO leg depends on the pair type (see _leg_ask_levels)
+    no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
+
+    # Merge-pair the NO and YES depth levels into (yes_price, no_price, qty) tuples
+    paired     = _pair_orderbooks(no_levels, yes_levels)
+
+    # Keep only contract pairs where the combined fill price leaves the required
+    # gap: same_title requires >= SAME_TITLE_MIN_PRICE_DIFF; time_series requires
+    # the run's entry floor — see _pair_max_sum for the exact ceilings.
+    max_sum    = _pair_max_sum(pair, settings)
+    qualifying = [
+        (yp, np_, qty)
+        for yp, np_, qty in paired
+        if yp + np_ <= max_sum + PRICE_EPSILON
+    ]
+
+    # Keep the prefix that still has an edge after the fee, as validate_pair_price does
+    before = len(qualifying)
+    qualifying = _levels_with_edge_after_fee(qualifying)
+    if before and not qualifying:
+        log(logging.INFO,
+            "No contract pair for '%s' keeps an edge after the fee — skipping",
+            pair.canonical_title)
+        return dc_replace(pair, tradeable=False), ENRICH_NO_EDGE_AFTER_FEE
+
+    if not qualifying:
+        # No depth available at the required gap — mark untradeable to skip execution
+        log(logging.INFO,
+            "No qualifying contract pairs for '%s' after price gap filter — skipping",
+            pair.canonical_title)
+        return dc_replace(pair, tradeable=False), ENRICH_NO_QUALIFYING
+
+    # Orient the levels into MARKET order — (market_a's leg price,
+    # market_b's leg price, qty) — so everything downstream reads them the
+    # way leg_prices reads the pair's scalars. leg_sides is the only source
+    # of truth for which market buys which side.
+    side_a, _side_b = leg_sides(pair.pair_type)
+    a_is_no = side_a == "no"
+    depth_levels = tuple(
+        (np_, yp, q) if a_is_no else (yp, np_, q) for yp, np_, q in qualifying
+    )
+
+    total_qty = sum(qty for _, _, qty in qualifying)
+    # Average only over the most contracts the largest possible Kelly share
+    # could buy at the book's best price (never more than the cash), not the
+    # whole book. For time-series pairs this limit holds only because of the
+    # checks below.
+    best_a, best_b, _ = depth_levels[0]
+    bound = max_kelly_fraction(pair.pair_type, settings)
+    affordable = max_affordable_pairs(portfolio_value_cents, best_a + best_b, bound,
+                                      cash_cents=cash_cents)
+    cap = min(int(total_qty), affordable)
+    fills = prefix_fill_prices(depth_levels, cap)
+
+    if fills is None:
+        # cap < 1: the budget cannot afford one contract pair, or the book
+        # holds under one contract of qualifying depth. Drop the pair rather
+        # than write max_contracts=0, which compute_trade reads as UNCAPPED
+        # — the sub-one-contract hole that overloaded sentinel used to have.
+        # Both figures are named because they are different faults with
+        # different fixes (add funds vs. the book is too thin), and the
+        # binding one is whichever is smaller. A bound of 0 gets its own wording: only
+        # a time-series 1 - k rounding to 0 (k = 1) makes one (no cap can be 0).
+        why = ""
+        if bound == 0 and pair.pair_type == "time_series":
+            why = (
+                f"; the per-trade bound is 0 (k = {settings.interval_discount:.2f}: "
+                "time-series Kelly cannot be positive)"
+            )
+        # If the cash, not the portfolio share, limited the budget, say so
+        if affordable < 1 and _cash_binds(portfolio_value_cents, bound, cash_cents):
+            why += f"; the ${cash_cents / 100:.2f} of cash binds"
+        log(logging.INFO,
+            "No affordable contract pairs for '%s' — %.2f contract(s) rest at "
+            "the gap and the budget affords %d%s; skipping",
+            pair.canonical_title, total_qty, affordable, why)
+        return dc_replace(pair, tradeable=False), (
+            ENRICH_UNAFFORDABLE if affordable < 1 else ENRICH_THIN_BOOK)
+
+    # Back to SIDE order ("the YES leg"/"the NO leg") for the code below
+    avg_yes, avg_no = (fills[1], fills[0]) if a_is_no else (fills[0], fills[1])
+
+    # The REFERENCE quote — the non-leg market's YES ask — refreshed from the
+    # book already in hand. Left at its scan-time value it would be compared
+    # against a fresh avg_yes by strategy._kelly_p, whose subtraction runs
+    # through config.time_series_profit_prob's max(0, pB - pA) clamp: a stale
+    # pB at or below the fresh pA clamps to zero, returning p = 1.0, so the
+    # pair models as RISKLESS and Kelly sizes it at the per-trade cap.
+    ref_yes = _reference_yes_ask(pair, ob_a, ob_b)
+
+    # Why the pair is refused, the first check that fails (None: tradeable)
+    refused = None
+    # Time-series only: same_title's model is the fixed co-resolution prior,
+    # so its pA is not a model input and there is no clamp to protect
+    is_time_series = leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES
+    direction_ok = True
+    if is_time_series:
+        # pair_gap_days: a same-event ladder is tiered on its STATED gap (DR-73)
+        gap = pair_gap_days(pair)
+        if ref_yes is None:
+            # Nothing prices the in-between mass now: fail CLOSED. A stale pB below the
+            # book's YES bid would let Kelly exceed 1 - k, which a cap above 1 - k (the
+            # 100% default) does not stop. backtester._find_entry does not mirror this
+            # (CLAUDE.md: "Known residual of the live spread rule").
+            direction_ok = False
+            refused = ENRICH_NO_REFERENCE
+            log(logging.WARNING,
+                "Pair '%s' dropped: the later contract has no YES ask on its book "
+                "(no resting NO bids), so nothing prices its in-between mass now",
+                pair.canonical_title)
+        elif ref_yes + no_levels[0][0] < 1.0 - PRICE_EPSILON:
+            # no_levels[0][0] is the later market's best NO ask, 1 - its best YES bid; a
+            # YES ask below that bid is a crossed book, the one state where Kelly can
+            # exceed 1 - k.
+            direction_ok = False
+            refused = ENRICH_CROSSED
+            log(logging.WARNING,
+                "Pair '%s' dropped: the later contract's YES ask %.4f sits below "
+                "its own YES bid %.4f — a crossed book",
+                pair.canonical_title, ref_yes, 1.0 - no_levels[0][0])
+        else:
+            # Positivity and the floor are tested on the spread the sizer
+            # prices (the prefix average), the ceiling on the TOP of the
+            # book. Past the guards above, the price-sum ceiling implies the
+            # floor to within 2 * PRICE_EPSILON and the edge cut leaves a
+            # spread above the fee, so only the ceiling is live here; the
+            # other two stay as defence (TS-34).
+            basis = f"fresh reference ask {ref_yes:.4f}"
+            refusal = time_series_spread_refusal(ref_yes - avg_yes, gap, settings)
+            if refusal is None:
+                refusal = time_series_spread_refusal(
+                    ref_yes - qualifying[0][0], gap, settings)
+            direction_ok = refusal is None
+            refused = refusal
+            if refusal == SPREAD_NOT_POSITIVE:
+                log(logging.WARNING,
+                    "Pair '%s' dropped: the later contract no longer prices above "
+                    "the YES leg fill %.4f — %s", pair.canonical_title, avg_yes, basis)
+            elif refusal == SPREAD_BELOW_FLOOR:
+                log(logging.WARNING,
+                    "Pair '%s' dropped: pB - pA %.4f at the YES leg fill is under the "
+                    "%.2f entry floor — %s", pair.canonical_title, ref_yes - avg_yes,
+                    live_time_series_floor(gap, settings), basis)
+            elif refusal == SPREAD_ABOVE_CEILING:
+                log(logging.WARNING,
+                    "Pair '%s' dropped: pB - pA %.4f at the top of the book exceeds "
+                    "the spread band's %g ceiling — %s", pair.canonical_title,
+                    ref_yes - qualifying[0][0], settings.spread_band[1], basis)
+
+    # Re-validate tradeability at the depth-weighted prices (the pair may still be
+    # unprofitable if all qualifying contracts are at the edge of the gap threshold).
+    profitable = (1.0 - avg_no - avg_yes) > fee_per_pair_approx(avg_no, avg_yes)
+
+    if not profitable:
+        # Kept as its own arm so this line only ever reports the profitability
+        # verdict — a direction drop has already logged its own WARNING above
+        log(logging.INFO,
+            "Pair '%s' unprofitable after depth adjustment: avg_no=%.3f avg_yes=%.3f",
+            pair.canonical_title, avg_no, avg_yes)
+        if refused is None:
+            refused = ENRICH_UNPROFITABLE
+
+    new_tradeable = profitable and direction_ok
+
+    # Replace the LEG prices and contract count with depth-accurate values,
+    # writing back to whichever fields are the leg prices for this pair type
+    # (nA/pB for same_title, pA/nB for time_series — the fields
+    # leg_prices() reads); strategy.py sizes the final Kelly trade on them
+    if leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES:
+        leg_updates = {"pA": avg_yes, "nB": avg_no}
+        # pB is the model's reference quote, not a leg price — refreshed so
+        # strategy._kelly_p's pB - pA subtraction has both operands from one
+        # snapshot. Left alone when None, which has dropped the pair above.
+        if ref_yes is not None:
+            leg_updates["pB"] = ref_yes
+    else:
+        leg_updates = {"nA": avg_no, "pB": avg_yes}
+        # Mirror: pA is same_title's reference quote. Nothing sizes on it
+        # (_kelly_p uses the fixed co-resolution prior here) and it is NOT
+        # guarded above, but it is the operand of the reported pA - pB
+        # "Price Diff", which otherwise subtracts a scan-time quote from a
+        # depth-weighted fill and can print a negative gap for a pair that
+        # passed the finder's directional filter. Refreshed for coherence.
+        if ref_yes is not None:
+            leg_updates["pA"] = ref_yes
+    return dc_replace(
+        pair,
+        tradeable=new_tradeable,
+        # How many contracts the prices just written are valid for — the
+        # bound compute_trade's own depth clamp then honours
+        max_contracts=cap,
+        depth_levels=depth_levels,
+        **leg_updates,
+    ), refused
+
+
 def enrich_with_orderbook_prices(
     client: Any, pairs: list, portfolio_value_cents: int, *,
     settings: LiveSettings | None = None, cash_cents: int | None = None,
@@ -5539,9 +5803,10 @@ def enrich_with_orderbook_prices(
     """
     Check each pair against its live order books and price it at what the account could really pay.
 
-    For each tradeable pair, fetches both order books, matches the two legs'
-    asks level by level, keeps the levels whose combined price leaves the
-    required gap, and stops at the first level with no edge left after the fee.
+    For each tradeable pair, fetches both order books and prices the pair with
+    _enrich_pair, which matches the two legs' asks level by level, keeps the
+    levels whose combined price leaves the required gap, and stops at the
+    first level with no edge left after the fee.
     The leg prices become the average fill price over the contracts this trade
     could afford: at most what the largest possible Kelly share of the
     portfolio value buys at the book's best price, and never more than the
@@ -5598,202 +5863,10 @@ def enrich_with_orderbook_prices(
             enriched.append(dc_replace(pair, tradeable=False))
             continue
 
-        # Derive the ask levels each leg would consume — each buy fills against
-        # the OPPOSITE-side bids of ITS OWN market, and which market carries the
-        # NO leg depends on the pair type (see _leg_ask_levels)
-        no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
-
-        # Merge-pair the NO and YES depth levels into (yes_price, no_price, qty) tuples
-        paired     = _pair_orderbooks(no_levels, yes_levels)
-
-        # Keep only contract pairs where the combined fill price leaves the required
-        # gap: same_title requires >= SAME_TITLE_MIN_PRICE_DIFF; time_series requires
-        # the run's entry floor — see _pair_max_sum for the exact ceilings.
-        max_sum    = _pair_max_sum(pair, settings)
-        qualifying = [
-            (yp, np_, qty)
-            for yp, np_, qty in paired
-            if yp + np_ <= max_sum + PRICE_EPSILON
-        ]
-
-        # Keep the prefix that still has an edge after the fee, as validate_pair_price does
-        before = len(qualifying)
-        qualifying = _levels_with_edge_after_fee(qualifying)
-        if before and not qualifying:
-            logging.info(
-                "No contract pair for '%s' keeps an edge after the fee — skipping",
-                pair.canonical_title)
-            enriched.append(dc_replace(pair, tradeable=False))
-            continue
-
-        if not qualifying:
-            # No depth available at the required gap — mark untradeable to skip execution
-            logging.info(
-                "No qualifying contract pairs for '%s' after price gap filter — skipping",
-                pair.canonical_title,
-            )
-            enriched.append(dc_replace(pair, tradeable=False))
-            continue
-
-        # Orient the levels into MARKET order — (market_a's leg price,
-        # market_b's leg price, qty) — so everything downstream reads them the
-        # way leg_prices reads the pair's scalars. leg_sides is the only source
-        # of truth for which market buys which side.
-        side_a, _side_b = leg_sides(pair.pair_type)
-        a_is_no = side_a == "no"
-        depth_levels = tuple(
-            (np_, yp, q) if a_is_no else (yp, np_, q) for yp, np_, q in qualifying
-        )
-
-        total_qty = sum(qty for _, _, qty in qualifying)
-        # Average only over the most contracts the largest possible Kelly share
-        # could buy at the book's best price (never more than the cash), not the
-        # whole book. For time-series pairs this limit holds only because of the
-        # checks below.
-        best_a, best_b, _ = depth_levels[0]
-        bound = max_kelly_fraction(pair.pair_type, settings)
-        affordable = max_affordable_pairs(portfolio_value_cents, best_a + best_b, bound,
-                                          cash_cents=cash_cents)
-        cap = min(int(total_qty), affordable)
-        fills = prefix_fill_prices(depth_levels, cap)
-
-        if fills is None:
-            # cap < 1: the budget cannot afford one contract pair, or the book
-            # holds under one contract of qualifying depth. Drop the pair rather
-            # than write max_contracts=0, which compute_trade reads as UNCAPPED
-            # — the sub-one-contract hole that overloaded sentinel used to have.
-            # Both figures are named because they are different faults with
-            # different fixes (add funds vs. the book is too thin), and the
-            # binding one is whichever is smaller. A bound of 0 gets its own wording: only
-            # a time-series 1 - k rounding to 0 (k = 1) makes one (no cap can be 0).
-            why = ""
-            if bound == 0 and pair.pair_type == "time_series":
-                why = (
-                    f"; the per-trade bound is 0 (k = {settings.interval_discount:.2f}: "
-                    "time-series Kelly cannot be positive)"
-                )
-            # If the cash, not the portfolio share, limited the budget, say so
-            if (affordable < 1 and cash_cents is not None
-                    and kelly_budget(portfolio_value_cents / 100.0, bound)
-                    > cash_cents / 100.0):
-                why += f"; the ${cash_cents / 100:.2f} of cash binds"
-            logging.info(
-                "No affordable contract pairs for '%s' — %.2f contract(s) rest at "
-                "the gap and the budget affords %d%s; skipping",
-                pair.canonical_title, total_qty, affordable, why,
-            )
-            enriched.append(dc_replace(pair, tradeable=False))
-            continue
-
-        # Back to SIDE order ("the YES leg"/"the NO leg") for the code below
-        avg_yes, avg_no = (fills[1], fills[0]) if a_is_no else (fills[0], fills[1])
-
-        # The REFERENCE quote — the non-leg market's YES ask — refreshed from the
-        # book already in hand. Left at its scan-time value it would be compared
-        # against a fresh avg_yes by strategy._kelly_p, whose subtraction runs
-        # through config.time_series_profit_prob's max(0, pB - pA) clamp: a stale
-        # pB at or below the fresh pA clamps to zero, returning p = 1.0, so the
-        # pair models as RISKLESS and Kelly sizes it at the per-trade cap.
-        ref_yes = _reference_yes_ask(pair, ob_a, ob_b)
-
-        # Time-series only: same_title's model is the fixed co-resolution prior,
-        # so its pA is not a model input and there is no clamp to protect
-        is_time_series = leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES
-        direction_ok = True
-        if is_time_series:
-            # pair_gap_days: a same-event ladder is tiered on its STATED gap (DR-73)
-            gap = pair_gap_days(pair)
-            if ref_yes is None:
-                # Nothing prices the in-between mass now: fail CLOSED. A stale pB below the
-                # book's YES bid would let Kelly exceed 1 - k, which a cap above 1 - k (the
-                # 100% default) does not stop. backtester._find_entry does not mirror this
-                # (CLAUDE.md: "Known residual of the live spread rule").
-                direction_ok = False
-                logging.warning(
-                    "Pair '%s' dropped: the later contract has no YES ask on its book "
-                    "(no resting NO bids), so nothing prices its in-between mass now",
-                    pair.canonical_title)
-            elif ref_yes + no_levels[0][0] < 1.0 - PRICE_EPSILON:
-                # no_levels[0][0] is the later market's best NO ask, 1 - its best YES bid; a
-                # YES ask below that bid is a crossed book, the one state where Kelly can
-                # exceed 1 - k.
-                direction_ok = False
-                logging.warning(
-                    "Pair '%s' dropped: the later contract's YES ask %.4f sits below "
-                    "its own YES bid %.4f — a crossed book",
-                    pair.canonical_title, ref_yes, 1.0 - no_levels[0][0])
-            else:
-                # Positivity and the floor are tested on the spread the sizer
-                # prices (the prefix average), the ceiling on the TOP of the
-                # book. Past the guards above, the price-sum ceiling implies the
-                # floor to within 2 * PRICE_EPSILON and the edge cut leaves a
-                # spread above the fee, so only the ceiling is live here; the
-                # other two stay as defence (TS-34).
-                basis = f"fresh reference ask {ref_yes:.4f}"
-                refusal = time_series_spread_refusal(ref_yes - avg_yes, gap, settings)
-                if refusal is None:
-                    refusal = time_series_spread_refusal(
-                        ref_yes - qualifying[0][0], gap, settings)
-                direction_ok = refusal is None
-                if refusal == SPREAD_NOT_POSITIVE:
-                    logging.warning(
-                        "Pair '%s' dropped: the later contract no longer prices above "
-                        "the YES leg fill %.4f — %s", pair.canonical_title, avg_yes, basis)
-                elif refusal == SPREAD_BELOW_FLOOR:
-                    logging.warning(
-                        "Pair '%s' dropped: pB - pA %.4f at the YES leg fill is under the "
-                        "%.2f entry floor — %s", pair.canonical_title, ref_yes - avg_yes,
-                        live_time_series_floor(gap, settings), basis)
-                elif refusal == SPREAD_ABOVE_CEILING:
-                    logging.warning(
-                        "Pair '%s' dropped: pB - pA %.4f at the top of the book exceeds "
-                        "the spread band's %g ceiling — %s", pair.canonical_title,
-                        ref_yes - qualifying[0][0], settings.spread_band[1], basis)
-
-        # Re-validate tradeability at the depth-weighted prices (the pair may still be
-        # unprofitable if all qualifying contracts are at the edge of the gap threshold).
-        profitable = (1.0 - avg_no - avg_yes) > fee_per_pair_approx(avg_no, avg_yes)
-
-        if not profitable:
-            # Kept as its own arm so this line only ever reports the profitability
-            # verdict — a direction drop has already logged its own WARNING above
-            logging.info(
-                "Pair '%s' unprofitable after depth adjustment: avg_no=%.3f avg_yes=%.3f",
-                pair.canonical_title, avg_no, avg_yes,
-            )
-
-        new_tradeable = profitable and direction_ok
-
-        # Replace the LEG prices and contract count with depth-accurate values,
-        # writing back to whichever fields are the leg prices for this pair type
-        # (nA/pB for same_title, pA/nB for time_series — the fields
-        # leg_prices() reads); strategy.py sizes the final Kelly trade on them
-        if leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES:
-            leg_updates = {"pA": avg_yes, "nB": avg_no}
-            # pB is the model's reference quote, not a leg price — refreshed so
-            # strategy._kelly_p's pB - pA subtraction has both operands from one
-            # snapshot. Left alone when None, which has dropped the pair above.
-            if ref_yes is not None:
-                leg_updates["pB"] = ref_yes
-        else:
-            leg_updates = {"nA": avg_no, "pB": avg_yes}
-            # Mirror: pA is same_title's reference quote. Nothing sizes on it
-            # (_kelly_p uses the fixed co-resolution prior here) and it is NOT
-            # guarded above, but it is the operand of the reported pA - pB
-            # "Price Diff", which otherwise subtracts a scan-time quote from a
-            # depth-weighted fill and can print a negative gap for a pair that
-            # passed the finder's directional filter. Refreshed for coherence.
-            if ref_yes is not None:
-                leg_updates["pA"] = ref_yes
-        enriched.append(dc_replace(
-            pair,
-            tradeable=new_tradeable,
-            # How many contracts the prices just written are valid for — the
-            # bound compute_trade's own depth clamp then honours
-            max_contracts=cap,
-            depth_levels=depth_levels,
-            **leg_updates,
-        ))
+        # Price the pair off its two books, a step that needs no client
+        priced, _refusal = _enrich_pair(pair, ob_a, ob_b, portfolio_value_cents,
+                                        settings=settings, cash_cents=cash_cents)
+        enriched.append(priced)
 
     tradeable_after = sum(1 for p in enriched if p.tradeable)
     logging.info(

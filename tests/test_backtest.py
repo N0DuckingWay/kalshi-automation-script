@@ -1,8 +1,8 @@
 """Tests for backtest.py — the backtester's CLI argument surface.
 
 Covers the two interval-discount flags added with the calibration sweep:
-argparse accepts a valid --interval-discount, main() rejects an out-of-range
-one through parser.error(), and both --interval-discount and --no-sweep are
+argparse accepts a valid --interval-discount, main() rejects one at or below
+0 or above 1 through parser.error(), and both --interval-discount and --no-sweep are
 threaded into backtester.run_backtest_sweep() (the same threading-assertion
 idiom test_backtester.py uses for --max-horizon-days).
 
@@ -34,6 +34,11 @@ run's last line, after the one pointing at the dashboard: how the filter bar's
 scenario becomes the live defaults (the defaults server, then the page's save
 button).
 
+And the depth model: main() fits it (depth_model.load_depth_model) before the
+fetch, hands it to run_backtest_sweep, and the config echo's last clause says
+whether trades fill over a walked book (with its snapshot and ladder counts) or
+at the top of the book.
+
 And the starting balance: with no --balance the run starts from the account's
 value (its cash on every shard plus Kalshi's value of its open positions, or
 the cash alone with a WARNING when that value is unreadable), read once through
@@ -45,7 +50,7 @@ amount reaches the sweep, the log, the summary block and the dashboard, and
 where it came from reaches the log and the dashboard.
 
 Fully offline: run_backtest_sweep, generate_dashboard, both client builders,
-read_account_balance and load_risk_free_rates are monkeypatched, so no network
+read_account_balance, load_risk_free_rates and load_depth_model are monkeypatched, so no network
 call, no credential read and no real backtest happen. PROJECT_ROOT is redirected at tmp_path and
 logging.basicConfig is stubbed, so the run's RotatingFileHandler can neither
 write into the repo root nor leak a handler onto the root logger for the rest
@@ -74,6 +79,7 @@ from kalshi_betting.config import (
     min_price_diff_for_gap,
     time_series_spread_too_wide,
 )
+from kalshi_betting.depth_model import DepthModel
 from kalshi_betting.treasury import SOURCE_API, RiskFreeRates
 
 from .conftest import save_config_live_defaults
@@ -121,6 +127,7 @@ def cli(monkeypatch, tmp_path):
 
     def _fake_sweep(**kwargs):
         calls["sweep_kwargs"] = kwargs
+        calls["order"].append("run_backtest_sweep")
         return calls["result"]
 
     def _fake_dashboard(*args, **kwargs):
@@ -165,6 +172,17 @@ def cli(monkeypatch, tmp_path):
         ((date(2026, 1, 5), 0.04),), SOURCE_API, datetime(2026, 9, 27, tzinfo=UTC),
     )
     monkeypatch.setattr(backtest, "load_risk_free_rates", lambda: calls["risk_free"])
+    # Never read the real saved order-book snapshots: None (no model) unless a
+    # test sets calls["depth_model"]. Each call is recorded, in order, in
+    # calls["order"] with the sweep's, so a test can say what came first
+    calls["depth_model"] = None
+    calls["order"] = []
+
+    def _fake_load_depth_model():
+        calls["order"].append("load_depth_model")
+        return calls["depth_model"]
+
+    monkeypatch.setattr(backtest, "load_depth_model", _fake_load_depth_model)
     return calls
 
 
@@ -188,17 +206,18 @@ class TestIntervalDiscountArgument:
         _run(monkeypatch, "--interval-discount", "0.62")
         assert cli["sweep_kwargs"]["interval_discount"] == pytest.approx(0.62)
 
-    @pytest.mark.parametrize("value", ["0.0", "1.0", "0.5"])
+    @pytest.mark.parametrize("value", ["0.01", "1.0", "0.5"])
     def test_boundary_values_are_accepted(self, cli, monkeypatch, value):
         _run(monkeypatch, "--interval-discount", value)
         assert cli["sweep_kwargs"]["interval_discount"] == pytest.approx(float(value))
 
-    @pytest.mark.parametrize("value", ["1.5", "-0.1", "42"])
+    # 0 included: the backtest sizes through the live sizer, which takes a k above 0
+    @pytest.mark.parametrize("value", ["1.5", "-0.1", "42", "0", "0.0", "nan"])
     def test_out_of_range_value_errors(self, cli, monkeypatch, capsys, value):
         with pytest.raises(SystemExit) as exc:
             _run(monkeypatch, "--interval-discount", value)
         assert exc.value.code == 2
-        assert "--interval-discount must be between 0 and 1" in capsys.readouterr().err
+        assert "--interval-discount must be above 0 and at most 1" in capsys.readouterr().err
         # parser.error() aborts before any client is built or any run starts
         assert "sweep_kwargs" not in cli
 
@@ -603,6 +622,79 @@ class TestSellWorkersArgument:
         assert exc.value.code == 2
         assert "--sell-workers must be a positive integer" in capsys.readouterr().err
         assert "sweep_kwargs" not in cli
+
+
+def _depth_model(snapshots: int = 3, ladders: int = 4_120) -> DepthModel:
+    """A fitted-looking DepthModel; main() reads only its snapshot and ladder counts."""
+    return DepthModel(cells={}, volume_rows={}, overall=(0.0,) * 7, snapshots=snapshots,
+                      ladders=ladders, first_taken="2026-10-02T21:30:00Z",
+                      last_taken="2026-10-09T21:30:00Z", digest="test")
+
+
+class TestDepthModel:
+    """main() fits the depth model before the fetch, hands it to the sweep, and
+    the config echo says how trades will fill."""
+
+    def test_the_model_reaches_the_sweep(self, cli, monkeypatch):
+        cli["depth_model"] = _depth_model()
+        _run(monkeypatch)
+        # The very object load_depth_model returned, not a copy or a rebuild
+        assert cli["sweep_kwargs"]["depth_model"] is cli["depth_model"]
+
+    def test_with_no_model_the_sweep_gets_none(self, cli, monkeypatch):
+        _run(monkeypatch)
+        assert "depth_model" in cli["sweep_kwargs"]
+        assert cli["sweep_kwargs"]["depth_model"] is None
+
+    def test_it_is_loaded_before_the_fetch(self, cli, monkeypatch):
+        _run(monkeypatch)
+        assert cli["order"] == ["load_depth_model", "run_backtest_sweep"]
+
+    def test_the_echo_names_a_walked_book(self, cli, monkeypatch, caplog):
+        cli["depth_model"] = _depth_model(snapshots=3, ladders=4_120)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert "fills=walked book (3 snapshots, 4120 ladders)" in caplog.text
+
+    def test_the_echo_counts_one_snapshot_in_the_singular(self, cli, monkeypatch, caplog):
+        cli["depth_model"] = _depth_model(snapshots=1, ladders=1)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert "fills=walked book (1 snapshot, 1 ladder)" in caplog.text
+
+    def test_the_echo_names_the_top_of_the_book_with_no_model(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert "fills=top of book (no usable depth snapshot)" in caplog.text
+
+    def test_the_clause_closes_the_echo_and_leaves_the_rest_alone(self, cli, monkeypatch,
+                                                                    caplog):
+        cli["depth_model"] = _depth_model()
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        [echo] = [r.getMessage() for r in caplog.records
+                  if r.getMessage().startswith("Backtest config:")]
+        # After the live rule, so every clause other tests read keeps its place
+        assert echo.index("| live rule=") < echo.index("| fills=")
+        assert echo.endswith("| fills=walked book (3 snapshots, 4120 ladders)")
+        k = backtest.TIME_SERIES_INTERVAL_PROB_DISCOUNT
+        assert "| sell sweep=on (" in echo and f"k={k:.3f}" in echo
+
+    def test_the_echo_comes_before_the_fetch(self, cli, monkeypatch, caplog):
+        # The line is logged before run_backtest_sweep is called, so an operator
+        # can stop a run that would fill at the top of the book
+        seen = {}
+        original = cli["result"]
+
+        def _sweep_after_echo(**kwargs):
+            seen["echoed"] = any(r.getMessage().startswith("Backtest config:")
+                                 for r in caplog.records)
+            return original
+
+        monkeypatch.setattr(backtest, "run_backtest_sweep", _sweep_after_echo)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert seen == {"echoed": True}
 
 
 class TestLiveRuleEcho:

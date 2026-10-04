@@ -11,7 +11,9 @@ Purpose:
     --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers),
     configures logging to kalshi_backtest.log, constructs the necessary API
     clients, works out the starting balance (--balance, or else what the Kalshi
-    account is worth when the run starts), delegates the full backtest
+    account is worth when the run starts), fits the depth model from the saved
+    order-book snapshots (depth_model.load_depth_model) so each trade is sized
+    over a modeled book, delegates the full backtest
     simulation to backtester.run_backtest_sweep(), and then calls
     dashboard.generate_dashboard() to produce the interactive HTML report and,
     when the sell family is on, the sidecar chunk files its Sell select loads
@@ -28,7 +30,9 @@ Dependencies:
     build_prod_live_client / load_series_categories (the dashboard's
     returns-by-category labels) from historical.py, load_risk_free_rates
     (the T-bill yields the page's Sharpe and Sortino subtract) from
-    treasury.py, read_account_balance (the account's cash and open positions,
+    treasury.py, load_depth_model (the table every trade's modeled order book
+    is built from; the backtest's fills line names it) from depth_model.py,
+    read_account_balance (the account's cash and open positions,
     the starting balance when --balance is not given) from auth.py, and
     api_error_summary (the one-line reason a failed balance read is reported
     with) from _http.py.
@@ -77,6 +81,13 @@ Notes:
     config.DASHBOARD_SELL_MAX_WORKERS; 1 runs it in the main process). The
     workers are spawned, so they re-import this module: main() must only ever
     run under the `if __name__ == "__main__"` guard at the bottom of the file.
+
+    The depth model is fitted before the fetch from the order-book snapshots
+    saved by `python3 -m kalshi_betting.depth_model snapshot`, and handed to
+    run_backtest_sweep, which sizes each trade over a modeled book built from
+    it. With no usable snapshot every trade fills at the top of the book, in
+    any size. The config echo's fills= clause says which, and the log names
+    the reason.
 
     --interval-discount overrides the time-series interval discount k for this
     run ONLY: no live module imports this one (main.py's --interval-discount is
@@ -218,6 +229,7 @@ from .config import (
     time_series_spread_too_wide,
 )
 from .dashboard import generate_dashboard
+from .depth_model import DepthModel, load_depth_model
 from .historical import build_historical_client, build_prod_live_client, load_series_categories
 from .treasury import load_risk_free_rates
 
@@ -328,6 +340,26 @@ def _account_starting_balance(client) -> StartingBalance:
         f"the account's value at {read_at}: cash ${cash_cents / 100:,.2f} + open "
         f"positions ${positions_cents / 100:,.2f}",
     )
+
+
+def _fills_echo(depth_model: DepthModel | None) -> str:
+    """
+    Say how the run's trades will fill, for the pre-fetch config line.
+
+    Args:
+        depth_model (DepthModel | None): The depth table load_depth_model
+            fitted, or None when there is none.
+
+    Returns:
+        str: "walked book (S snapshots, L ladders)" with a model, otherwise
+            "top of book (no usable depth snapshot)". The log line from
+            load_depth_model says why there is none.
+    """
+    if depth_model is None:
+        return "top of book (no usable depth snapshot)"
+    snapshots, ladders = depth_model.snapshots, depth_model.ladders
+    return (f"walked book ({snapshots} snapshot{'' if snapshots == 1 else 's'}, "
+            f"{ladders} ladder{'' if ladders == 1 else 's'})")
 
 
 def _log_corpus_provenance(sweep: BacktestSweep) -> None:
@@ -450,7 +482,7 @@ def main() -> None:
     parser.add_argument(
         "--interval-discount", type=float, default=None, metavar="K",
         help="Override the time-series interval discount k for this backtest "
-             "(0-1; default: config.TIME_SERIES_INTERVAL_PROB_DISCOUNT). Affects "
+             "(above 0, at most 1; default: config.TIME_SERIES_INTERVAL_PROB_DISCOUNT). Affects "
              "this backtest only — the live sizer reads the saved live defaults' k "
              "unless main.py's own --interval-discount overrides it for one live run.",
     )
@@ -543,8 +575,10 @@ def main() -> None:
         parser.error("--max-horizon-days must be a positive integer")
     if args.sell_workers is not None and args.sell_workers < 1:
         parser.error("--sell-workers must be a positive integer")
-    if args.interval_discount is not None and not (0.0 <= args.interval_discount <= 1.0):
-        parser.error("--interval-discount must be between 0 and 1")
+    # Above 0, as the live sizer the backtest sizes through requires (k = 0
+    # would price every time-series pair as riskless)
+    if args.interval_discount is not None and not (0.0 < args.interval_discount <= 1.0):
+        parser.error("--interval-discount must be above 0 and at most 1")
     if args.spread_min is not None and not (0.0 <= args.spread_min <= 1.0):
         parser.error("--spread-min must be between 0 and 1")
     if args.spread_max is not None and not (0.0 <= args.spread_max <= 1.0):
@@ -702,16 +736,21 @@ def main() -> None:
             f"{start.dollars:,.2f}", f"{MIN_BALANCE_CENTS / 100:,.2f}",
         )
 
+    # Fit the depth table from the saved order-book snapshots before the fetch,
+    # so the echo below can say how trades will fill; never raises (with no
+    # usable snapshot it returns None and logs why)
+    depth_model = load_depth_model()
+
     logging.info(
         "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f | ladders=%s "
         "| spread band=%g-%g | band sweep=%s | cap sweep=%s | add-on sweep=%s "
-        "| sell sweep=%s | live rule=%s",
+        "| sell sweep=%s | live rule=%s | fills=%s",
         start_date, start.dollars, "on" if use_cache else "off", effective_k,
         ladders_echo, echo_floor, echo_ceiling,
         "on" if band_sweep else "off", "on" if cap_sweep else "off",
         "on" if add_on_sweep else "off",
         f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
-        if sell_sweep else "off", live_rule_echo,
+        if sell_sweep else "off", live_rule_echo, _fills_echo(depth_model),
     )
     # Warn on a ceiling that empties a tier. config.time_series_spread_band's
     # docstring asks a caller taking an operator-typed ceiling to warn when it
@@ -781,6 +820,8 @@ def main() -> None:
         add_on_sweep=add_on_sweep,
         # The dashboard's Sell select, lazy the same way
         sell_sweep=sell_sweep,
+        # Every trade's order book is built from this table (None: top of book)
+        depth_model=depth_model,
     )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy add-on sweeps (add_on_cap_sweep, and add_on_tier_off_cap_sweep with the band sweep) unless --no-add-on-sweep
     # Everything below reports the PRIMARY point, so the summary block and the
     # dashboard's other six sections read exactly as they did before the sweep

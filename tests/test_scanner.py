@@ -3,9 +3,12 @@ import dataclasses
 import json
 import logging
 import re
+import sys
+from dataclasses import replace as dc_replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,8 +20,20 @@ from kalshi_betting.config import (
     DEFAULT_EXCHANGE_INDEX,
     INCLUDE_MVE_MARKETS,
     MAX_DEADLINE_GAP_DAYS,
+    PRICE_EPSILON,
     SAME_TITLE_LEG_SIDES,
+    SPREAD_ABOVE_CEILING,
+    SPREAD_BELOW_FLOOR,
+    SPREAD_NOT_POSITIVE,
     TIME_SERIES_LEG_SIDES,
+    LiveSettings,
+    fee_per_pair_approx,
+    kelly_budget,
+    live_settings,
+    live_time_series_floor,
+    max_affordable_pairs,
+    max_kelly_fraction,
+    time_series_spread_refusal,
 )
 from kalshi_betting.scanner import (
     CandidatePair,
@@ -29,8 +44,12 @@ from kalshi_betting.scanner import (
     _fetch_orderbook,
     _filter_active_markets,
     _leg_ask_levels,
+    _levels_with_edge_after_fee,
     _market_from_dict,
+    _pair_max_sum,
+    _pair_orderbooks,
     _parse_price_ranges,
+    _reference_yes_ask,
     _shard_index,
     check_shard_coverage,
     deadline_gap_days,
@@ -49,6 +68,7 @@ from kalshi_betting.scanner import (
     leg_sides,
     market_ladder_keys,
     normalize_title,
+    pair_gap_days,
     pair_held,
     pair_key,
     pair_ladder_keys,
@@ -5258,6 +5278,590 @@ class TestEnrichmentSpreadRule:
             _ts_orderbook_client(pA_fill=0.30, nB_fill=0.50, pB_ref=0.62), pairs,
             _AMPLE_BALANCE_CENTS)
         assert calls == [1]
+
+
+# enrich_with_orderbook_prices as it was before its per-pair loop moved into
+# scanner._enrich_pair, kept word for word (only renamed) as the oracle the
+# split must match: the same pairs, the same log lines, the same fetches.
+def _old_enrich_with_orderbook_prices(
+    client: Any, pairs: list, portfolio_value_cents: int, *,
+    settings: LiveSettings | None = None, cash_cents: int | None = None,
+) -> list:
+    """
+    Check each pair against its live order books and price it at what the account could really pay.
+
+    For each tradeable pair, fetches both order books, matches the two legs'
+    asks level by level, keeps the levels whose combined price leaves the
+    required gap, and stops at the first level with no edge left after the fee.
+    The leg prices become the average fill price over the contracts this trade
+    could afford: at most what the largest possible Kelly share of the
+    portfolio value buys at the book's best price, and never more than the
+    cash. The kept levels are stored on the pair (depth_levels) so
+    compute_trade can price any count, and max_contracts is the number of
+    contracts the prices are for. A time-series pair also fails when the later
+    market shows no YES ask, its YES ask sits below its own YES bid, or the
+    spread rule refuses it. A pair that fails a check is marked tradeable=False.
+
+    Args:
+        client (Any): Kalshi client used to fetch order books (each fetched once per call).
+        pairs (list): CandidatePairs; one already marked tradeable=False is passed through unchanged.
+        portfolio_value_cents (int): Cash plus open positions' value, in cents; required, as it limits how much of the book is averaged.
+        settings (LiveSettings | None): Keyword-only. The run's settings; None reads config.py's (tests only).
+        cash_cents (int | None): Keyword-only. The cash on hand in cents; None means it is all cash. Hand compute_trade the same value.
+
+    Returns:
+        list: One CandidatePair per input, in order, with prices, tradeable, max_contracts and depth_levels set from the books.
+    """
+    # Resolved once, so every pair below is judged under one rule
+    settings = live_settings() if settings is None else settings
+
+    # Cache order books by ticker to avoid fetching the same book twice
+    # when the same market appears in multiple pairs
+    ob_cache: dict[str, dict | None] = {}
+
+    def get_ob(ticker: str) -> dict | None:
+        if ticker not in ob_cache:
+            # Fetch the order book from the Kalshi API and cache the result
+            ob_cache[ticker] = _fetch_orderbook(client, ticker)
+        return ob_cache[ticker]
+
+    enriched = []
+    for pair in pairs:
+        # Non-tradeable pairs (failed best-ask check) are passed through unchanged —
+        # they still appear in the dev simulation Excel sheet for transparency
+        if not pair.tradeable:
+            enriched.append(pair)
+            continue
+
+        ob_a = get_ob(pair.market_a.ticker)
+        ob_b = get_ob(pair.market_b.ticker)
+
+        if ob_a is None or ob_b is None:
+            # If either order book is unavailable we cannot validate depth, so
+            # mark the pair non-tradeable. Passing best-ask prices through with
+            # tradeable=True would let strategy.compute_trade size against unbounded
+            # depth (max_contracts=0 is treated as "no cap" downstream) — the
+            # opposite of what pre_execution_check is meant to catch.
+            logging.warning(
+                "Orderbook unavailable for '%s' — marking non-tradeable",
+                pair.canonical_title,
+            )
+            enriched.append(dc_replace(pair, tradeable=False))
+            continue
+
+        # Derive the ask levels each leg would consume — each buy fills against
+        # the OPPOSITE-side bids of ITS OWN market, and which market carries the
+        # NO leg depends on the pair type (see _leg_ask_levels)
+        no_levels, yes_levels = _leg_ask_levels(pair, ob_a, ob_b)
+
+        # Merge-pair the NO and YES depth levels into (yes_price, no_price, qty) tuples
+        paired     = _pair_orderbooks(no_levels, yes_levels)
+
+        # Keep only contract pairs where the combined fill price leaves the required
+        # gap: same_title requires >= SAME_TITLE_MIN_PRICE_DIFF; time_series requires
+        # the run's entry floor — see _pair_max_sum for the exact ceilings.
+        max_sum    = _pair_max_sum(pair, settings)
+        qualifying = [
+            (yp, np_, qty)
+            for yp, np_, qty in paired
+            if yp + np_ <= max_sum + PRICE_EPSILON
+        ]
+
+        # Keep the prefix that still has an edge after the fee, as validate_pair_price does
+        before = len(qualifying)
+        qualifying = _levels_with_edge_after_fee(qualifying)
+        if before and not qualifying:
+            logging.info(
+                "No contract pair for '%s' keeps an edge after the fee — skipping",
+                pair.canonical_title)
+            enriched.append(dc_replace(pair, tradeable=False))
+            continue
+
+        if not qualifying:
+            # No depth available at the required gap — mark untradeable to skip execution
+            logging.info(
+                "No qualifying contract pairs for '%s' after price gap filter — skipping",
+                pair.canonical_title,
+            )
+            enriched.append(dc_replace(pair, tradeable=False))
+            continue
+
+        # Orient the levels into MARKET order — (market_a's leg price,
+        # market_b's leg price, qty) — so everything downstream reads them the
+        # way leg_prices reads the pair's scalars. leg_sides is the only source
+        # of truth for which market buys which side.
+        side_a, _side_b = leg_sides(pair.pair_type)
+        a_is_no = side_a == "no"
+        depth_levels = tuple(
+            (np_, yp, q) if a_is_no else (yp, np_, q) for yp, np_, q in qualifying
+        )
+
+        total_qty = sum(qty for _, _, qty in qualifying)
+        # Average only over the most contracts the largest possible Kelly share
+        # could buy at the book's best price (never more than the cash), not the
+        # whole book. For time-series pairs this limit holds only because of the
+        # checks below.
+        best_a, best_b, _ = depth_levels[0]
+        bound = max_kelly_fraction(pair.pair_type, settings)
+        affordable = max_affordable_pairs(portfolio_value_cents, best_a + best_b, bound,
+                                          cash_cents=cash_cents)
+        cap = min(int(total_qty), affordable)
+        fills = prefix_fill_prices(depth_levels, cap)
+
+        if fills is None:
+            # cap < 1: the budget cannot afford one contract pair, or the book
+            # holds under one contract of qualifying depth. Drop the pair rather
+            # than write max_contracts=0, which compute_trade reads as UNCAPPED
+            # — the sub-one-contract hole that overloaded sentinel used to have.
+            # Both figures are named because they are different faults with
+            # different fixes (add funds vs. the book is too thin), and the
+            # binding one is whichever is smaller. A bound of 0 gets its own wording: only
+            # a time-series 1 - k rounding to 0 (k = 1) makes one (no cap can be 0).
+            why = ""
+            if bound == 0 and pair.pair_type == "time_series":
+                why = (
+                    f"; the per-trade bound is 0 (k = {settings.interval_discount:.2f}: "
+                    "time-series Kelly cannot be positive)"
+                )
+            # If the cash, not the portfolio share, limited the budget, say so
+            if (affordable < 1 and cash_cents is not None
+                    and kelly_budget(portfolio_value_cents / 100.0, bound)
+                    > cash_cents / 100.0):
+                why += f"; the ${cash_cents / 100:.2f} of cash binds"
+            logging.info(
+                "No affordable contract pairs for '%s' — %.2f contract(s) rest at "
+                "the gap and the budget affords %d%s; skipping",
+                pair.canonical_title, total_qty, affordable, why,
+            )
+            enriched.append(dc_replace(pair, tradeable=False))
+            continue
+
+        # Back to SIDE order ("the YES leg"/"the NO leg") for the code below
+        avg_yes, avg_no = (fills[1], fills[0]) if a_is_no else (fills[0], fills[1])
+
+        # The REFERENCE quote — the non-leg market's YES ask — refreshed from the
+        # book already in hand. Left at its scan-time value it would be compared
+        # against a fresh avg_yes by strategy._kelly_p, whose subtraction runs
+        # through config.time_series_profit_prob's max(0, pB - pA) clamp: a stale
+        # pB at or below the fresh pA clamps to zero, returning p = 1.0, so the
+        # pair models as RISKLESS and Kelly sizes it at the per-trade cap.
+        ref_yes = _reference_yes_ask(pair, ob_a, ob_b)
+
+        # Time-series only: same_title's model is the fixed co-resolution prior,
+        # so its pA is not a model input and there is no clamp to protect
+        is_time_series = leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES
+        direction_ok = True
+        if is_time_series:
+            # pair_gap_days: a same-event ladder is tiered on its STATED gap (DR-73)
+            gap = pair_gap_days(pair)
+            if ref_yes is None:
+                # Nothing prices the in-between mass now: fail CLOSED. A stale pB below the
+                # book's YES bid would let Kelly exceed 1 - k, which a cap above 1 - k (the
+                # 100% default) does not stop. backtester._find_entry does not mirror this
+                # (CLAUDE.md: "Known residual of the live spread rule").
+                direction_ok = False
+                logging.warning(
+                    "Pair '%s' dropped: the later contract has no YES ask on its book "
+                    "(no resting NO bids), so nothing prices its in-between mass now",
+                    pair.canonical_title)
+            elif ref_yes + no_levels[0][0] < 1.0 - PRICE_EPSILON:
+                # no_levels[0][0] is the later market's best NO ask, 1 - its best YES bid; a
+                # YES ask below that bid is a crossed book, the one state where Kelly can
+                # exceed 1 - k.
+                direction_ok = False
+                logging.warning(
+                    "Pair '%s' dropped: the later contract's YES ask %.4f sits below "
+                    "its own YES bid %.4f — a crossed book",
+                    pair.canonical_title, ref_yes, 1.0 - no_levels[0][0])
+            else:
+                # Positivity and the floor are tested on the spread the sizer
+                # prices (the prefix average), the ceiling on the TOP of the
+                # book. Past the guards above, the price-sum ceiling implies the
+                # floor to within 2 * PRICE_EPSILON and the edge cut leaves a
+                # spread above the fee, so only the ceiling is live here; the
+                # other two stay as defence (TS-34).
+                basis = f"fresh reference ask {ref_yes:.4f}"
+                refusal = time_series_spread_refusal(ref_yes - avg_yes, gap, settings)
+                if refusal is None:
+                    refusal = time_series_spread_refusal(
+                        ref_yes - qualifying[0][0], gap, settings)
+                direction_ok = refusal is None
+                if refusal == SPREAD_NOT_POSITIVE:
+                    logging.warning(
+                        "Pair '%s' dropped: the later contract no longer prices above "
+                        "the YES leg fill %.4f — %s", pair.canonical_title, avg_yes, basis)
+                elif refusal == SPREAD_BELOW_FLOOR:
+                    logging.warning(
+                        "Pair '%s' dropped: pB - pA %.4f at the YES leg fill is under the "
+                        "%.2f entry floor — %s", pair.canonical_title, ref_yes - avg_yes,
+                        live_time_series_floor(gap, settings), basis)
+                elif refusal == SPREAD_ABOVE_CEILING:
+                    logging.warning(
+                        "Pair '%s' dropped: pB - pA %.4f at the top of the book exceeds "
+                        "the spread band's %g ceiling — %s", pair.canonical_title,
+                        ref_yes - qualifying[0][0], settings.spread_band[1], basis)
+
+        # Re-validate tradeability at the depth-weighted prices (the pair may still be
+        # unprofitable if all qualifying contracts are at the edge of the gap threshold).
+        profitable = (1.0 - avg_no - avg_yes) > fee_per_pair_approx(avg_no, avg_yes)
+
+        if not profitable:
+            # Kept as its own arm so this line only ever reports the profitability
+            # verdict — a direction drop has already logged its own WARNING above
+            logging.info(
+                "Pair '%s' unprofitable after depth adjustment: avg_no=%.3f avg_yes=%.3f",
+                pair.canonical_title, avg_no, avg_yes,
+            )
+
+        new_tradeable = profitable and direction_ok
+
+        # Replace the LEG prices and contract count with depth-accurate values,
+        # writing back to whichever fields are the leg prices for this pair type
+        # (nA/pB for same_title, pA/nB for time_series — the fields
+        # leg_prices() reads); strategy.py sizes the final Kelly trade on them
+        if leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES:
+            leg_updates = {"pA": avg_yes, "nB": avg_no}
+            # pB is the model's reference quote, not a leg price — refreshed so
+            # strategy._kelly_p's pB - pA subtraction has both operands from one
+            # snapshot. Left alone when None, which has dropped the pair above.
+            if ref_yes is not None:
+                leg_updates["pB"] = ref_yes
+        else:
+            leg_updates = {"nA": avg_no, "pB": avg_yes}
+            # Mirror: pA is same_title's reference quote. Nothing sizes on it
+            # (_kelly_p uses the fixed co-resolution prior here) and it is NOT
+            # guarded above, but it is the operand of the reported pA - pB
+            # "Price Diff", which otherwise subtracts a scan-time quote from a
+            # depth-weighted fill and can print a negative gap for a pair that
+            # passed the finder's directional filter. Refreshed for coherence.
+            if ref_yes is not None:
+                leg_updates["pA"] = ref_yes
+        enriched.append(dc_replace(
+            pair,
+            tradeable=new_tradeable,
+            # How many contracts the prices just written are valid for — the
+            # bound compute_trade's own depth clamp then honours
+            max_contracts=cap,
+            depth_levels=depth_levels,
+            **leg_updates,
+        ))
+
+    tradeable_after = sum(1 for p in enriched if p.tradeable)
+    logging.info(
+        "Orderbook depth check: %d/%d pairs remain tradeable after price gap filter",
+        tradeable_after,
+        sum(1 for p in pairs if p.tradeable),
+    )
+    return enriched
+
+
+def _books_client(books: dict):
+    """
+    Mock KalshiClient serving orderbook_fp books by ticker.
+
+    Args:
+        books (dict): ticker -> {"yes_dollars": [...], "no_dollars": [...]}.
+            A ticker not in it answers with no orderbook key, so the fetch
+            logs a WARNING and returns None (a missing book).
+
+    Returns:
+        MagicMock: The client; its get_market_orderbook_without_preload_content
+            mock records each fetch.
+    """
+    def fake_orderbook(ticker):
+        payload = {"orderbook_fp": books[ticker]} if ticker in books else {"unknown": {}}
+        return SimpleNamespace(status=200, data=json.dumps(payload).encode("utf-8"))
+
+    client = MagicMock()
+    client.get_market_orderbook_without_preload_content = MagicMock(side_effect=fake_orderbook)
+    return client
+
+
+def _bids(*levels: tuple) -> list:
+    """Bid levels [[price, qty], ...] as dollar strings, from (price, qty) pairs."""
+    return [[str(round(price, 4)), str(qty)] for price, qty in levels]
+
+
+def _ts_books(levels, *, pB_ref=None, late="LATE", ref_qty=1000) -> dict:
+    """
+    Time-series books on EARLY and `late`: YES on EARLY at each pA, NO on `late` at each nB.
+
+    Args:
+        levels (list): (pA, nB, qty) fills; EARLY's NO bids and the later
+            market's YES bids are their complements.
+        pB_ref (float | None): The later market's YES ask (a NO bid at
+            1 - pB_ref); None leaves its NO side empty.
+        late (str): The later market's ticker.
+        ref_qty (float): Contracts resting at the reference ask.
+
+    Returns:
+        dict: ticker -> orderbook_fp side dict.
+    """
+    return {
+        "EARLY": {"yes_dollars": [], "no_dollars": _bids(*((1 - a, q) for a, _, q in levels))},
+        late: {"yes_dollars": _bids(*((1 - b, q) for _, b, q in levels)),
+               "no_dollars": [] if pB_ref is None else _bids((1 - pB_ref, ref_qty))},
+    }
+
+
+def _st_books(nA, pB, *, qty=100, pA_ref=None) -> dict:
+    """Same-title books: NO on A1 at nA, YES on B1 at pB; A1's YES ask is pA_ref."""
+    return {
+        "A1": {"yes_dollars": _bids((1 - nA, qty)),
+               "no_dollars": [] if pA_ref is None else _bids((1 - pA_ref, qty))},
+        "B1": {"yes_dollars": [], "no_dollars": _bids((1 - pB, qty))},
+    }
+
+
+def _asymmetric_fee(price_a, price_b):
+    """A fake fee: none when the first price is the lower, $1 otherwise.
+
+    The edge cut asks it (YES price, NO price) and the profitability check
+    (NO price, YES price), so a pair whose YES leg is the cheaper one keeps
+    its levels and then fails profitability, a path no real fee reaches.
+    """
+    return 0.0 if price_a <= price_b else 1.0
+
+
+def _ts_ladder():
+    """A ladder closing at one instant whose STATED gap is 19 days (the 0.70 ceiling)."""
+    return dataclasses.replace(_ts_candidate(gap_days=0, pA=0.30, pB=0.60, nB=0.45),
+                               stated_gap_days=19)
+
+
+def _late2(pair):
+    """The same time-series pair with its later market renamed LATE2."""
+    return dataclasses.replace(
+        pair, market_b=SimpleNamespace(**{**vars(pair.market_b), "ticker": "LATE2"}))
+
+
+# One case: id -> (pairs, books, portfolio value in cents, settings, cash in
+# cents, {scanner name: stand-in}, the refusal _enrich_pair names for a
+# single tradeable pair, or None)
+def _enrichment_cases() -> dict:
+    ts = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
+    st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
+    tiers_off = _live(tier_floors=False)
+    k_one = _live(interval_discount=1.0, size_cap=1.0)
+    big = _AMPLE_BALANCE_CENTS
+    fee = {"fee_per_pair_approx": _asymmetric_fee}
+
+    def spread(code):
+        return {"time_series_spread_refusal": lambda spread, gap, settings: code}
+
+    return {
+        "ts-tradeable": ([ts], _ts_books([(0.30, 0.50, 100)], pB_ref=0.65),
+                         big, _live(), None, {}, None),
+        "ts-no-edge-after-fee": (
+            [_ts_candidate(gap_days=10, pA=0.53, pB=0.56, nB=0.45)],
+            _ts_books([(0.53, 0.45, 100)], pB_ref=0.56), big, tiers_off, None, {},
+            scanner.ENRICH_NO_EDGE_AFTER_FEE),
+        "ts-ladder-no-qualifying": (
+            [_ts_ladder()], _ts_books([(0.30, 0.45, 100)], pB_ref=0.60), big, _live(),
+            None, {}, scanner.ENRICH_NO_QUALIFYING),
+        "ts-empty-book": (
+            [ts], {"EARLY": {"yes_dollars": [], "no_dollars": []},
+                   "LATE": {"yes_dollars": _bids((0.50, 100)), "no_dollars": []}},
+            big, _live(), None, {}, scanner.ENRICH_NO_QUALIFYING),
+        "ts-k-of-one": ([ts], _ts_books([(0.30, 0.50, 100)], pB_ref=0.62), big, k_one,
+                        None, {}, scanner.ENRICH_UNAFFORDABLE),
+        "ts-cash-binds": ([ts], _ts_books([(0.30, 0.50, 100)], pB_ref=0.62), 1_000_000,
+                          _live(), 10, {}, scanner.ENRICH_UNAFFORDABLE),
+        "ts-small-budget": ([ts], _ts_books([(0.30, 0.50, 100)], pB_ref=0.62), 50,
+                            _live(), None, {}, scanner.ENRICH_UNAFFORDABLE),
+        "ts-under-one-contract": ([ts], _ts_books([(0.30, 0.50, 0.5)], pB_ref=0.62), big,
+                                  _live(), None, {}, scanner.ENRICH_THIN_BOOK),
+        # Thin and no cash: the budget is named first
+        "ts-thin-and-no-cash": ([ts], _ts_books([(0.30, 0.50, 0.5)], pB_ref=0.62), big,
+                                _live(), 0, {}, scanner.ENRICH_UNAFFORDABLE),
+        "ts-no-reference": ([ts], _ts_books([(0.30, 0.50, 100)]), big, _live(), None, {},
+                            scanner.ENRICH_NO_REFERENCE),
+        "ts-crossed": ([_ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)],
+                       _ts_books([(0.30, 0.40, 100)], pB_ref=0.55), big, _live(), None, {},
+                       scanner.ENRICH_CROSSED),
+        "ts-above-ceiling": (
+            [_ts_candidate(gap_days=10, pA=0.20, pB=0.72, nB=0.28)],
+            _ts_books([(0.20, 0.28, 10), (0.30, 0.28, 90)], pB_ref=0.72), big,
+            _TIERS_OFF_HALF, None, {}, config.SPREAD_ABOVE_CEILING),
+        "ts-not-positive": ([ts], _ts_books([(0.30, 0.50, 100)], pB_ref=0.65), big, _live(),
+                            None, spread(config.SPREAD_NOT_POSITIVE),
+                            config.SPREAD_NOT_POSITIVE),
+        "ts-below-floor": ([ts], _ts_books([(0.30, 0.50, 100)], pB_ref=0.65), big, _live(),
+                           None, spread(config.SPREAD_BELOW_FLOOR), config.SPREAD_BELOW_FLOOR),
+        "ts-unprofitable": ([ts], _ts_books([(0.30, 0.50, 100)], pB_ref=0.65), big, _live(),
+                            None, fee, scanner.ENRICH_UNPROFITABLE),
+        # Both checks fail: the first one names the refusal, and both lines are logged
+        "ts-crossed-and-unprofitable": (
+            [_ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.40)],
+            _ts_books([(0.30, 0.40, 100)], pB_ref=0.55), big, _live(), None, fee,
+            scanner.ENRICH_CROSSED),
+        "ts-cut-at-the-fee": (
+            [_ts_candidate(gap_days=10, pA=0.30, pB=0.56, nB=0.45)],
+            {"EARLY": {"yes_dollars": [], "no_dollars": _bids((0.70, 100), (0.47, 2000))},
+             "LATE": {"yes_dollars": _bids((0.55, 2100)), "no_dollars": _bids((0.44, 1000))}},
+            1_000_000, tiers_off, None, {}, None),
+        "st-tradeable": ([st], _st_books(0.44, 0.31, pA_ref=0.60), big, _live(), None, {},
+                         None),
+        "st-no-reference-kept": ([st], _st_books(0.44, 0.31), big, _live(), None, {}, None),
+        "st-no-qualifying": ([_st_candidate(pA=0.60, pB=0.40, nA=0.60)],
+                             _st_books(0.60, 0.40, pA_ref=0.60), big, _live(), None, {},
+                             scanner.ENRICH_NO_QUALIFYING),
+        "st-no-cash": ([st], _st_books(0.44, 0.31, pA_ref=0.60), big, _live(), 0, {},
+                       scanner.ENRICH_UNAFFORDABLE),
+        "st-unprofitable": ([st], _st_books(0.44, 0.31, pA_ref=0.60), big, _live(), None,
+                            fee, scanner.ENRICH_UNPROFITABLE),
+        # EARLY's book serves both time-series pairs, fetched once
+        "shared-book": (
+            [ts, _late2(ts), st],
+            {**_ts_books([(0.30, 0.50, 100)], pB_ref=0.65),
+             **_ts_books([(0.30, 0.50, 100)], pB_ref=0.85, late="LATE2"),
+             **_st_books(0.44, 0.31, pA_ref=0.60)},
+            big, _TIERS_OFF_HALF, None, {}, None),
+        # LATE2 has no book; the pair before it is passed through untouched
+        "missing-book": (
+            [dataclasses.replace(st, tradeable=False), _late2(ts), ts],
+            _ts_books([(0.30, 0.50, 100)], pB_ref=0.65), big, _live(), None, {}, None),
+    }
+
+
+_ENRICHMENT_CASES = _enrichment_cases()
+
+
+class TestEnrichPairMatchesTheOldLoop:
+    """scanner._enrich_pair is enrich_with_orderbook_prices' old per-pair loop,
+    moved: the live function returns the same pairs, logs the same lines at the
+    same levels and fetches each book once, on every refusal path; and
+    _enrich_pair names each refusal and sends its own lines to `log`."""
+
+    @staticmethod
+    def _patch(monkeypatch, stand_ins: dict) -> None:
+        """Replace names in scanner and in this module, where the oracle reads them."""
+        module = sys.modules[__name__]
+        for name, value in stand_ins.items():
+            monkeypatch.setattr(scanner, name, value)
+            monkeypatch.setattr(module, name, value)
+
+    @staticmethod
+    def _run(caplog, enrich, case):
+        """Run one enrichment function on a fresh client; (pairs, records, fetches)."""
+        pairs, books, value, settings, cash, _stand_ins, _code = case
+        client = _books_client(books)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            out = enrich(client, pairs, value, settings=settings, cash_cents=cash)
+        records = [(r.levelno, r.getMessage()) for r in caplog.records]
+        fetches = [c.kwargs["ticker"] for c in
+                   client.get_market_orderbook_without_preload_content.call_args_list]
+        return out, records, fetches
+
+    @pytest.mark.parametrize("name", sorted(_ENRICHMENT_CASES))
+    def test_the_live_function_matches_the_old_one(self, caplog, monkeypatch, name):
+        case = _ENRICHMENT_CASES[name]
+        self._patch(monkeypatch, case[5])
+        old, old_records, old_fetches = self._run(caplog, _old_enrich_with_orderbook_prices,
+                                                  case)
+        new, new_records, new_fetches = self._run(caplog, enrich_with_orderbook_prices, case)
+        assert len(new) == len(old) == len(case[0])
+        for before, after, given in zip(old, new, case[0], strict=True):
+            for f in dataclasses.fields(CandidatePair):
+                a, b = getattr(before, f.name), getattr(after, f.name)
+                assert type(a) is type(b) and a == b, (name, f.name, a, b)
+            # A pair passed through is the same object in both
+            assert (before is given) == (after is given)
+        assert new_records == old_records
+        assert new_fetches == old_fetches
+        # Each book is fetched once
+        assert len(new_fetches) == len(set(new_fetches))
+
+    @pytest.mark.parametrize("name", sorted(n for n, c in _ENRICHMENT_CASES.items()
+                                            if len(c[0]) == 1))
+    def test_enrich_pair_names_the_refusal_and_logs_only_to_log(self, caplog, monkeypatch,
+                                                                name):
+        case = _ENRICHMENT_CASES[name]
+        pairs, books, value, settings, cash, stand_ins, code = case
+        self._patch(monkeypatch, stand_ins)
+        [pair] = pairs
+        [expected], old_records, _fetches = self._run(
+            caplog, _old_enrich_with_orderbook_prices, case)
+        client = _books_client(books)
+        ob_a = _fetch_orderbook(client, pair.market_a.ticker)
+        ob_b = _fetch_orderbook(client, pair.market_b.ticker)
+        lines = []
+
+        def log(level, msg, *args):
+            lines.append((level, msg % args))
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            priced, refusal = scanner._enrich_pair(pair, ob_a, ob_b, value, settings=settings,
+                                                   cash_cents=cash, log=log)
+        # These books have no unusable level, so nothing reaches the logging
+        # module when log is given
+        assert caplog.records == []
+        assert priced == expected
+        assert refusal == code
+        assert (refusal is None) == priced.tradeable
+        # log got every line the old loop logged for this pair, in order: all
+        # but the closing summary
+        assert lines == old_records[:-1]
+        assert old_records[-1][1].startswith("Orderbook depth check:")
+
+    def test_every_refusal_code_is_reached(self):
+        codes = {c[6] for c in _ENRICHMENT_CASES.values() if len(c[0]) == 1}
+        assert codes == {
+            None, scanner.ENRICH_NO_EDGE_AFTER_FEE, scanner.ENRICH_NO_QUALIFYING,
+            scanner.ENRICH_UNAFFORDABLE, scanner.ENRICH_THIN_BOOK, scanner.ENRICH_NO_REFERENCE,
+            scanner.ENRICH_CROSSED, scanner.ENRICH_UNPROFITABLE, config.SPREAD_NOT_POSITIVE,
+            config.SPREAD_BELOW_FLOOR, config.SPREAD_ABOVE_CEILING}
+        # Each code is its own short string
+        enrich_codes = [scanner.ENRICH_NO_EDGE_AFTER_FEE, scanner.ENRICH_NO_QUALIFYING,
+                        scanner.ENRICH_UNAFFORDABLE, scanner.ENRICH_THIN_BOOK,
+                        scanner.ENRICH_NO_REFERENCE, scanner.ENRICH_CROSSED,
+                        scanner.ENRICH_UNPROFITABLE]
+        spread_codes = [config.SPREAD_NOT_POSITIVE, config.SPREAD_BELOW_FLOOR,
+                        config.SPREAD_ABOVE_CEILING]
+        assert len(set(enrich_codes + spread_codes)) == 10
+
+    def test_an_unusable_book_level_is_still_logged_by_the_book_reader(self, caplog):
+        # log gets _enrich_pair's own lines; the book reader's WARNING about a
+        # level it drops (here a NO bid of zero contracts) goes to logging
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
+        books = _ts_books([(0.30, 0.50, 100)])
+        books["EARLY"]["no_dollars"].append(["0.6000", "0"])
+        client = _books_client(books)
+        ob_a = _fetch_orderbook(client, "EARLY")
+        ob_b = _fetch_orderbook(client, "LATE")
+        lines = []
+
+        def log(level, msg, *args):
+            lines.append((level, msg % args))
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            _priced, refusal = scanner._enrich_pair(
+                pair, ob_a, ob_b, _AMPLE_BALANCE_CENTS, settings=_live(), cash_cents=None,
+                log=log)
+        assert refusal == scanner.ENRICH_NO_REFERENCE
+        [record] = caplog.records
+        assert record.levelno == logging.WARNING
+        assert record.getMessage().startswith("Orderbook for EARLY: dropped 1 of 2 bid levels")
+        [(level, line)] = lines
+        assert level == logging.WARNING
+        assert "the later contract has no YES ask on its book" in line
+
+    def test_enrich_pair_logs_through_logging_by_default(self, caplog):
+        # With no log handed in, the lines go to the logging module, as live
+        pair = _ts_candidate(gap_days=10, pA=0.30, pB=0.60, nB=0.50)
+        client = _books_client(_ts_books([(0.30, 0.50, 100)]))
+        ob_a = _fetch_orderbook(client, "EARLY")
+        ob_b = _fetch_orderbook(client, "LATE")
+        with caplog.at_level(logging.INFO):
+            _priced, refusal = scanner._enrich_pair(
+                pair, ob_a, ob_b, _AMPLE_BALANCE_CENTS, settings=_live(), cash_cents=None)
+        assert refusal == scanner.ENRICH_NO_REFERENCE
+        [record] = caplog.records
+        assert record.levelno == logging.WARNING
+        assert "the later contract has no YES ask on its book" in record.getMessage()
 
 
 class TestValidatePairPriceSpreadRule:

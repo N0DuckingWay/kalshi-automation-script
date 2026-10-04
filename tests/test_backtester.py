@@ -2,6 +2,7 @@
 import ast
 import copy
 import gc
+import hashlib
 import inspect
 import logging
 import math
@@ -14,7 +15,7 @@ import time
 import weakref
 from array import array
 from collections import defaultdict
-from dataclasses import astuple
+from dataclasses import astuple, fields
 from dataclasses import replace as dc_replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -31,7 +32,7 @@ import pytest
 # /historical route through its own _signed_raw_get, since the pinned SDK has
 # no historical_api module at all), so backtester.py is always importable
 # and its pure-logic functions are unit-testable offline.
-from kalshi_betting import backtester, historical, scanner
+from kalshi_betting import backtester, depth_model, historical, scanner
 from kalshi_betting.backtester import (
     _can_ever_enter,
     _extract_pairs,
@@ -58,6 +59,7 @@ from kalshi_betting.config import (
     SCHEDULED_RUN,
     SPREAD_BAND_SWEEP_CEILINGS,
     SPREAD_BAND_SWEEP_FLOORS,
+    LiveSettings,
     ScheduledRun,
     fee_leg_exact,
     fee_per_pair_approx,
@@ -4711,6 +4713,51 @@ class TestFetchCandlesParallel:
         msgs = self._empty_summaries(caplog)
         assert len(msgs) == 1
         assert "1 of 2 tickers returned no candles" in msgs[0]
+
+    @staticmethod
+    def _volume_summaries(caplog):
+        return [r.getMessage() for r in caplog.records
+                if "carry no traded volume" in r.getMessage()]
+
+    def test_tickers_whose_candles_all_lack_volume_are_counted_once(
+        self, monkeypatch, caplog,
+    ):
+        # A renamed API field leaves every candle without a count; the one
+        # INFO line makes that visible. A ticker with any volume is not counted,
+        # and one with no candles at all is on the "no candles" line instead.
+        needed = self._needed(4)
+
+        def fake(_c, ticker, *_a, **_k):
+            if ticker == "T00":
+                return [{**_candle(_MONDAY_TS, 0.70, 0.32), "volume": 5.0}]
+            if ticker == "T01":
+                return [{**_candle(_MONDAY_TS, 0.70, 0.32), "volume": None},
+                        {**_candle(_MONDAY_TS + 3600, 0.70, 0.32), "volume": 1.0}]
+            if ticker == "T02":
+                return [_candle(_MONDAY_TS, 0.70, 0.32)]   # no "volume" key at all
+            return []
+
+        monkeypatch.setattr(backtester, "fetch_candlesticks", fake)
+        with caplog.at_level("INFO"):
+            _fetch_candles_parallel(MagicMock(), needed, date(2026, 1, 1), False)
+
+        msgs = self._volume_summaries(caplog)
+        assert len(msgs) == 1
+        assert "1 of 3 tickers' candles carry no traded volume" in msgs[0]
+
+    def test_volume_line_is_silent_when_every_ticker_has_volume(self, monkeypatch, caplog):
+        monkeypatch.setattr(
+            backtester, "fetch_candlesticks",
+            lambda *_a, **_k: [{**_candle(_MONDAY_TS, 0.70, 0.32), "volume": 0.0}])
+        with caplog.at_level("INFO"):
+            _fetch_candles_parallel(MagicMock(), self._needed(3), date(2026, 1, 1), False)
+        assert self._volume_summaries(caplog) == []
+
+    def test_volume_line_is_silent_when_no_ticker_has_candles(self, monkeypatch, caplog):
+        monkeypatch.setattr(backtester, "fetch_candlesticks", lambda *_a, **_k: [])
+        with caplog.at_level("INFO"):
+            _fetch_candles_parallel(MagicMock(), self._needed(3), date(2026, 1, 1), False)
+        assert self._volume_summaries(caplog) == []
 
     def test_run_backtest_surfaces_worker_exception(self, monkeypatch):
         # Same guarantee end-to-end: the three existing run_backtest fixtures
@@ -13309,18 +13356,37 @@ class TestSizeCap:
     ):
         entries = self._entries(monkeypatch)
         with caplog.at_level(logging.INFO):
-            for cap in (None, 0.35, 1.0, 0.19999999999999998, 0.05):
+            for cap in (None, 0.35, 1.0, 0.15, 0.05):
                 self._sim(entries, size_cap=cap)
         lines = _completion_lines(caplog)
         assert lines[1] == ("Backtest complete at k=0.750, band 0-1, all, cap 35%: "
                             "1 trades, 1 profitable")
         assert lines[2] == ("Backtest complete at k=0.750, band 0-1, all, no cap: "
                             "1 trades, 1 profitable")
-        # A cap that merely ROUNDS to the default still gets its own prefix
-        assert lines[3].startswith(
-            "Backtest complete at k=0.750, band 0-1, all, cap 19.999999999999998%:")
+        assert lines[3].startswith("Backtest complete at k=0.750, band 0-1, all, cap 15%:")
         prefixes = _completion_prefixes(lines)
         assert len(prefixes) == len(set(prefixes)) == 5
+
+    def test_a_cap_within_float_noise_of_the_grid_is_the_grid_cap(self, monkeypatch, caplog):
+        # The live sizer's LiveSettings puts a cap onto the 5% grid, so a cap
+        # that differs from a grid cap only by float noise IS that cap: it
+        # sizes, stamps and names itself as the grid cap
+        entries = self._entries(monkeypatch)
+        assert backtester._resolve_size_cap(0.19999999999999998) == 0.2
+        with caplog.at_level(logging.INFO):
+            noisy = self._sim(entries, size_cap=0.19999999999999998)
+            grid = self._sim(entries, size_cap=0.2)
+        assert noisy.size_cap == grid.size_cap == 0.2
+        assert [astuple(t) for t in noisy.trades] == [astuple(t) for t in grid.trades]
+        assert len(set(_completion_prefixes(_completion_lines(caplog)))) == 1
+
+    @pytest.mark.parametrize("cap", [0.37, 0.123, 0.051, 0.9999])
+    def test_a_cap_off_the_grid_is_refused_naming_it(self, monkeypatch, cap):
+        # Every simulation hands its cap to the live sizer, whose LiveSettings
+        # takes only caps on the 5% grid
+        entries = self._entries(monkeypatch)
+        with pytest.raises(ValueError, match=rf"size_cap must be a multiple of 5%.*{cap}"):
+            self._sim(entries, size_cap=cap)
 
     def test_a_tier_off_run_at_another_cap_names_both_in_order(self, monkeypatch, caplog):
         # The merged format: the tier suffix follows the BAND, the cap suffix
@@ -16426,7 +16492,8 @@ class TestLegQuotes:
             "time_series", "Q", "R", "", "", "Other", date(2026, 1, 5), date(2026, 1, 21),
             0.3, 0.6, 0.7, 0.4, 10, 7.0, 0.3, "yes", "yes", 10.0, 2.7, 0.3, 0.6, 0.1, 2.7,
             0.0, 16, 10_000.0, marks=(a, b))
-        assert astuple(trade)[-1][0] is a
+        marks = [f.name for f in fields(trade)].index("marks")
+        assert astuple(trade)[marks][0] is a
 
     def test_no_candle_is_kept(self):
         class _Candle(dict):
@@ -16804,10 +16871,12 @@ class TestMarketCapSweepParity:
     the same entries without quotes size or mark differently."""
 
     def _fresh_parity(self, point, subset, start, k, band, pop, cap, *, end_date,
-                      tier_floors=True, add_to_held=False, split_date=None, checks=False):
+                      tier_floors=True, add_to_held=False, split_date=None, checks=False,
+                      sell_at=None):
         fresh = backtester._simulate_at_discount(
             subset, start, 10_000.0, k=k, spread_band=band, population=pop, size_cap=cap,
-            quiet=True, end_date=end_date, tier_floors=tier_floors, add_to_held=add_to_held)
+            quiet=True, end_date=end_date, tier_floors=tier_floors, add_to_held=add_to_held,
+            sell_at=sell_at)
         assert [astuple(t) for t in point.trades] == [astuple(t) for t in fresh.trades], \
             (band, k, pop, cap)
         pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df, check_exact=True)
@@ -16815,7 +16884,8 @@ class TestMarketCapSweepParity:
         if checks and pop in ("all", "time_series"):
             assert point.halves == backtester._half_split(
                 _dr75_halves(subset, split_date), start, 10_000.0, k, band, population=pop,
-                tier_floors=tier_floors, size_cap=cap, quiet=True, end_date=end_date)
+                tier_floors=tier_floors, size_cap=cap, quiet=True, end_date=end_date,
+                add_to_held=add_to_held, sell_at=sell_at)
             assert point.ex_top_event == backtester._ex_top_event(
                 fresh, subset, start, 10_000.0, band, population=pop,
                 tier_floors=tier_floors, quiet=True, end_date=end_date)
@@ -16950,8 +17020,9 @@ def _held(day: date, yes_ask: float, no_ask: float) -> list[dict]:
 
 
 def _sale_value(n: int, *legs) -> float:
-    """What a sale of n contract pairs returns, leg by leg as _trade_sale_value
-    adds it: a bid less the fee on selling n at it, or a payout (no fee)."""
+    """What a sale of n contract pairs returns, leg by leg as
+    _position_sale_value adds it (at the bid, with no ladder): a bid less the
+    fee on selling n at it, or a payout (no fee)."""
     value = 0.0
     for kind, price in legs:
         value += n * price if kind == "paid" else n * price - fee_leg_exact(n, price)
@@ -17600,35 +17671,51 @@ class TestHighestSaleLevel:
     the no-selling run (only its sell_at stamp differs); at the level it
     returns and every one below, the run sells at least one position. Pinned
     for every 5% level on both selling fixtures, and on one whose checkpoint
-    is higher than the days before it, so the lowest check decides."""
+    is higher than the days before it, so the lowest check decides; each also
+    with a depth model, so that buys and sales walk modeled books."""
 
     _LEVELS = tuple(round(0.05 * i, 2) for i in range(1, 21))
 
     @staticmethod
-    def _spiky() -> list[dict]:
-        """TestSaleNeedsDaysInARow's pair with Monday 2's checkpoint at the
-        50% bids and the days before it at the 25% ones; nothing after."""
+    def _spiky_candles() -> dict:
+        """TestSaleNeedsDaysInARow's pair's candles with Monday 2's checkpoint
+        at the 50% bids and the days before it at the 25% ones; nothing after."""
         days = TestSaleNeedsDaysInARow()
         day, up = days._DAY, days._UP
+        return days._candles({2 * day: up, day: up, 0: days._HIGH}, monday3=False)
+
+    @classmethod
+    def _spiky(cls) -> list[dict]:
+        """The pair on _spiky_candles, with its quotes."""
         suite = TestSellAtShareOfPotentialProfit()
         return _quoted([suite._record((_LADDER_M1, _LADDER_M2, _LADDER_M3))],
-                       days._candles({2 * day: up, day: up, 0: days._HIGH}, monday3=False))
+                       cls._spiky_candles())
 
+    @pytest.mark.parametrize("walked", [False, True])
     @pytest.mark.parametrize("fixture", ["plain", "add_on", "spiky"])
-    def test_levels_above_it_are_the_no_selling_run(self, fixture):
+    def test_levels_above_it_are_the_no_selling_run(self, fixture, walked):
+        model = _walk_model() if walked else None
         if fixture in ("plain", "spiky"):
             suite = TestSellAtShareOfPotentialProfit()
-            records = (_quoted([suite._record((_LADDER_M1, _LADDER_M2, _LADDER_M3))],
-                               suite._candles()) if fixture == "plain" else self._spiky())
-
-            def sim(level):
-                return suite._sim(records, level)
+            candles = suite._candles() if fixture == "plain" else self._spiky_candles()
+            records = [suite._record((_LADDER_M1, _LADDER_M2, _LADDER_M3))]
         else:
             suite = TestSellingWithAddOns()
-            records = suite._records(TestSellingWithAddOns._MONDAYS + (_LADDER_M3,))
+            candles = suite._candles()
+            records = [TestSellAtShareOfPotentialProfit._record(
+                TestSellingWithAddOns._MONDAYS + (_LADDER_M3,))]
+        if walked:
+            candles = _with_volume(candles)
+        backtester._attach_leg_quotes(records, candles, date(2026, 1, 1), model)
 
-            def sim(level):
-                return suite._sim(records, level)
+        def sim(level):
+            return suite._sim(records, level)
+        if walked:
+            # Not vacuous: the buys walk a book, and a sale walks the bids
+            assert all(t.book_walked for t in sim(None).trades)
+            assert any(t.sold and t.sale_price_a is not None
+                       and t.sale_price_a < t.marks[0].bid_at_checkpoint(t.exit_date, "yes")
+                       for level in self._LEVELS for t in sim(level).trades), fixture
         base = sim(None)
         top = backtester._highest_sale_level(base, self._LEVELS)
         assert top is not None and top < 1.0
@@ -18068,3 +18155,1241 @@ class TestCapSweepSells:
         cs.cell(self._BAND, 0.75)
         assert seen and all(level == 0.25 for _pop, level in seen)
         assert {pop for pop, _level in seen} == {"all", "all/H1", "all/H2", "all/ex-top"}
+
+
+# ─── Walking a synthetic order book with the live sizer ──────────────────────
+
+def _walk_model() -> depth_model.DepthModel:
+    """A depth model fitted to made-up books: a thin best level and deeper ones
+    below it, so a trade of a few hundred contract pairs walks several levels
+    and a size cap binds well inside the book."""
+    records = []
+    for i in range(40):
+        best = round(0.10 + 0.02 * i, 2)
+        ladder = [[best, 60.0], [round(best - 0.01, 2), 300.0], [round(best - 0.02, 2), 700.0],
+                  [round(best - 0.05, 2), 2_500.0], [round(best - 0.10, 2), 8_000.0]]
+        ladder = [level for level in ladder if level[0] > 0]
+        records.append({"ticker": f"D{i}", "taken_at": "2026-09-28T16:00:00Z",
+                        "volume_24h": 400.0, "yes": ladder, "no": ladder})
+    model = depth_model.fit(records)
+    assert model is not None
+    return model
+
+
+def _vol_candle(day: date, yes_ask: float, no_ask: float, volume: float = 400.0) -> dict:
+    """A 09:00 UTC candle on `day`, before that Monday's checkpoint, with its hour's volume."""
+    return dict(_candle(_at(day, 9), yes_ask, no_ask), volume=volume)
+
+
+def _walked(records: list[dict], candles: dict, model, start: date = date(2026, 1, 1)):
+    """The records, each given its markets' quotes and the depth model by the one writer."""
+    backtester._attach_leg_quotes(records, candles, start, model)
+    return records
+
+
+def _live_walk(rec: dict, monday: date, candles: dict, model, settings: LiveSettings,
+               value: float, cash: float, held: HeldPair | None = None):
+    """What the live code makes of one record's Monday: the two synthetic books
+    built straight from depth_model.book at that Monday's quotes and 24-hour
+    volume, priced by scanner._enrich_pair and sized by compute_trade on the
+    value and cash in whole cents (rounded to 6 decimals, then down)."""
+    entry = next(m for m in backtester._entry_mondays(rec["entry"])
+                 if m["entry_date"] == monday)
+    moment = int(backtester._checkpoint_datetime(monday).timestamp())
+    books = []
+    for market, yes_ask, no_ask in ((entry["mA"], entry["pA"], entry["nA"]),
+                                    (entry["mB"], entry["pB"], entry["nB"])):
+        volume = depth_model.volume_24h(candles[market["ticker"]], moment)
+        books.append(depth_model.book(model, yes_ask, 1.0 - no_ask, volume))
+    pair = CandidatePair(
+        market_a=scanner._market_from_dict(entry["mA"], ""),
+        market_b=scanner._market_from_dict(entry["mB"], ""),
+        pA=entry["pA"], pB=entry["pB"], nA=entry["nA"], nB=entry["nB"], tradeable=True,
+        canonical_title=str(rec["canon"]), pair_type=rec["pair_type"],
+        stated_gap_days=entry["gap_days"] if rec["pair_type"] == "time_series" else None,
+        held=held)
+    value_cents = math.floor(round(value * 100, 6))
+    cash_cents = math.floor(round(cash * 100, 6))
+    priced, refusal = scanner._enrich_pair(pair, *books, value_cents, settings=settings,
+                                           cash_cents=cash_cents)
+    assert refusal is None and priced.tradeable
+    spec = compute_trade(priced, value_cents, settings=settings, cash_cents=cash_cents)
+    assert spec is not None
+    return spec
+
+
+def _assert_trade_is_spec(trade: backtester.BacktestTrade, spec) -> None:
+    """A walked backtest trade bought what the live spec says: count, fills, cost, fees."""
+    assert trade.book_walked and spec.pair.depth_levels
+    assert trade.n == spec.x
+    assert (trade.fill_price_a, trade.fill_price_b) == scanner.leg_prices(spec.pair)
+    assert trade.total_cost == spec.total_cost
+    fee_a = fee_leg_exact(spec.x, trade.fill_price_a)
+    fee_b = fee_leg_exact(spec.x, trade.fill_price_b)
+    assert trade.fees == fee_a + fee_b
+    assert spec.total_cost_with_fees == spec.total_cost + fee_a + fee_b
+    assert trade.kelly_fraction == spec.kelly_fraction
+    assert trade.expected_payoff == pytest.approx(spec.min_payoff, abs=1e-9)
+
+
+@pytest.mark.usefixtures("pre_toggle_defaults")
+class TestWalkedTradeParity:
+    """With a depth model, Pass 2 sizes each trade with the live code over a
+    synthetic book: a walked backtest trade is exactly what scanner._enrich_pair
+    and strategy.compute_trade make of the same books, portfolio value and
+    cash, for a time-series pair, a same-title pair and an add-on. Figures at
+    pre_toggle_defaults (k 0.75, a 20% cap, no extra same-title cap)."""
+
+    _START = date(2026, 1, 1)
+    _BALANCE = 10_000.0
+    _END = date(2026, 4, 1)
+
+    @staticmethod
+    def _settings(k: float = 0.75, cap: float = 0.2, add: bool = False) -> LiveSettings:
+        return LiveSettings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=k,
+                            size_cap=cap, same_title_size_cap=backtester.SAME_TITLE_SIZE_CAP,
+                            add_to_held_pairs=add)
+
+    @staticmethod
+    def _ts(quotes=(0.20, 0.60, 0.40)) -> tuple[dict, dict]:
+        pA, pB, nB = quotes
+        rec = _ladder_record(_ladder_market("OA", "EVO-1", "2026-03-20"),
+                             _ladder_market("OB", "EVO-2", "2026-03-20"), "o",
+                             [(_LADDER_M1, pA, pB, nB)])
+        candles = {"OA": [_vol_candle(_LADDER_M1, pA, round(1.0 - pA, 4))],
+                   "OB": [_vol_candle(_LADDER_M1, pB, nB)]}
+        return rec, candles
+
+    def _sim(self, records, **kw):
+        kw.setdefault("k", 0.75)
+        return backtester._simulate_at_discount(records, self._START, self._BALANCE,
+                                                 end_date=self._END, **kw)
+
+    def test_a_time_series_trade_is_the_live_spec(self, caplog):
+        model = _walk_model()
+        rec, candles = self._ts()
+        with caplog.at_level(logging.DEBUG):
+            point = self._sim(_walked([rec], candles, model))
+        (trade,) = point.trades
+        spec = _live_walk(rec, _LADDER_M1, candles, model, self._settings(),
+                          self._BALANCE, self._BALANCE)
+        _assert_trade_is_spec(trade, spec)
+        # A trade this size walks past the best level, so it pays more than
+        # the candle's prices on both legs
+        assert trade.fill_price_a > trade.entry_pA and trade.fill_price_b > trade.entry_nB
+        # The walk is quiet: no WARNING, and the sizer's lines at DEBUG
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not [r for r in caplog.records if r.levelno >= logging.INFO
+                    and r.getMessage().startswith("Trade computed")]
+        # The same Monday at the top of the book (no depth model) fills at the
+        # candle prices, a larger trade for the same budget
+        top_rec, _ = self._ts()
+        (top,) = self._sim(_walked([top_rec], candles, None)).trades
+        assert not top.book_walked
+        assert (top.fill_price_a, top.fill_price_b) == (top.entry_pA, top.entry_nB)
+        assert top.n > trade.n
+
+    def test_a_same_title_trade_is_the_live_spec(self, caplog):
+        model = _walk_model()
+        rec = _ladder_same_title(_ladder_market("SA", "EVA-1", "2026-03-20"),
+                                 _ladder_market("SB", "EVB-1", "2026-03-20"), [_LADDER_M1])
+        candles = {"SA": [_vol_candle(_LADDER_M1, 0.70, 0.30)],
+                   "SB": [_vol_candle(_LADDER_M1, 0.40, 0.60)]}
+        with caplog.at_level(logging.DEBUG):
+            point = self._sim(_walked([rec], candles, model))
+        (trade,) = point.trades
+        spec = _live_walk(rec, _LADDER_M1, candles, model, self._settings(),
+                          self._BALANCE, self._BALANCE)
+        _assert_trade_is_spec(trade, spec)
+        # NO on A at 0.30 and YES on B at 0.40 at the top; a 20% share walks past both
+        assert trade.fill_price_a > 0.30 and trade.fill_price_b > 0.40
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_an_add_on_is_the_live_spec_on_its_stake(self, caplog):
+        # At k 0.40 and no cap the first trade walks deep into Monday 1's book;
+        # on Monday 2 YES on A is far cheaper, so the pair is short of its
+        # Kelly share and adds to itself
+        model = _walk_model()
+        rec = _ladder_record(_ladder_market("PA", "EVP-1", "2026-03-20"),
+                             _ladder_market("PB", "EVP-2", "2026-03-20"), "q",
+                             [_LADDER_M1, (_LADDER_M2, 0.10, 0.60, 0.40)])
+        candles = {"PA": [_vol_candle(_LADDER_M1, 0.20, 0.80),
+                          _vol_candle(_LADDER_M2, 0.10, 0.90)],
+                   "PB": [_vol_candle(_LADDER_M1, 0.60, 0.40),
+                          _vol_candle(_LADDER_M2, 0.60, 0.40)]}
+        with caplog.at_level(logging.DEBUG):
+            point = self._sim(_walked([rec], candles, model), k=0.40, size_cap=1.0,
+                              add_to_held=True)
+        first, add = point.trades
+        assert not first.add_on and add.add_on and add.entry_date == _LADDER_M2
+        # The pair's stake on Monday 2: what the first trade paid (contracts
+        # plus fees), moved by its change in value since
+        paid = (first.total_cost + fee_leg_exact(first.n, first.fill_price_a)
+                + fee_leg_exact(first.n, first.fill_price_b))
+        worth = backtester._open_value(first, _LADDER_M2)
+        stake = paid + (worth - first.total_cost)
+        cash = self._BALANCE - paid
+        assert add.balance_at_entry == pytest.approx(cash + worth, abs=1e-9)
+        held = HeldPair(sides=(("PA", "yes"), ("PB", "no")), count=float(first.n),
+                        cost_dollars=paid, value_dollars=stake, fees_dollars=0.0)
+        spec = _live_walk(rec, _LADDER_M2, candles, model,
+                          self._settings(k=0.40, cap=1.0, add=True),
+                          add.balance_at_entry, cash, held=held)
+        _assert_trade_is_spec(add, spec)
+        assert pair_held(spec.pair) == held
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_a_candle_crossed_time_series_monday_is_refused_when_walked(self, caplog):
+        # Market B's YES ask 0.55 sits below its own YES bid 0.60 (1 - its NO
+        # ask 0.40): the live enrichment's crossed-book guard refuses it
+        model = _walk_model()
+        rec, candles = self._ts(quotes=(0.20, 0.55, 0.40))
+        with caplog.at_level(logging.INFO):
+            point = self._sim(_walked([rec], candles, model))
+        assert point.trades == []
+        assert ("Trades refused when their book was walked (crossed book) "
+                "(k=0.750, band 0-1, all): 1") in caplog.messages
+        # At the top of the book it passes the Kelly gate and trades
+        top_rec, _ = self._ts(quotes=(0.20, 0.55, 0.40))
+        (top,) = self._sim(_walked([top_rec], candles, None)).trades
+        assert not top.book_walked
+
+    def test_a_walked_trade_the_cash_left_cannot_buy_is_counted_apart(self, caplog):
+        # On $2.80, a same-title pair on Monday 1 spends all but $0.59. On
+        # Monday 2 the largest Kelly share a time-series pair may take (25% of
+        # about $2.69) is more than that, and $0.59 cannot buy one contract
+        # pair at its best prices (0.20 + 0.40). The cash, not the book, stops it
+        def records(model):
+            same = _ladder_same_title(_ladder_market("SA", "EVA-1", "2026-03-20"),
+                                      _ladder_market("SB", "EVB-1", "2026-03-20"), [_LADDER_M1])
+            ts = _ladder_record(_ladder_market("OA", "EVO-1", "2026-03-20"),
+                                _ladder_market("OB", "EVO-2", "2026-03-20"), "o",
+                                [(_LADDER_M2, 0.20, 0.60, 0.40)])
+            candles = {"SA": [_vol_candle(_LADDER_M1, 0.70, 0.30),
+                              _vol_candle(_LADDER_M2, 0.70, 0.30)],
+                       "SB": [_vol_candle(_LADDER_M1, 0.40, 0.60),
+                              _vol_candle(_LADDER_M2, 0.40, 0.60)],
+                       "OA": [_vol_candle(_LADDER_M2, 0.20, 0.80)],
+                       "OB": [_vol_candle(_LADDER_M2, 0.60, 0.40)]}
+            return _walked([same, ts], candles, model)
+
+        def run(model, **kw):
+            return backtester._simulate_at_discount(records(model), self._START, 2.80, k=0.75,
+                                                     size_cap=1.0, end_date=self._END, **kw)
+
+        line = ("Trades skipped with no cash left for one contract pair "
+                "(k=0.750, band 0-1, all, no cap): 1")
+        with caplog.at_level(logging.DEBUG):
+            point = run(_walk_model())
+        assert [(t.ticker_a, t.entry_date) for t in point.trades] == [("SA", _LADDER_M1)]
+        assert line in caplog.messages
+        # Counted by the test behind the live enrichment's own note
+        assert any(m.startswith("No affordable contract pairs for")
+                   and "the $0.59 of cash binds" in m for m in caplog.messages)
+        assert not [m for m in caplog.messages if m.startswith("Trades refused when")]
+        # At the top of the book the same pair is skipped too, and neither line is logged
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            top = run(None)
+        assert [(t.ticker_a, t.entry_date) for t in top.trades] == [("SA", _LADDER_M1)]
+        assert not [m for m in caplog.messages if m.startswith(("Trades skipped with no cash",
+                                                                "Trades refused when"))]
+        # A quiet run logs the count at DEBUG
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            run(_walk_model(), quiet=True)
+        assert [r.levelno for r in caplog.records if r.getMessage() == line] == [logging.DEBUG]
+
+    def test_the_top_of_book_count_and_no_volume(self, caplog):
+        # No volume in a market's candles means no book for it: the trade
+        # fills at the top of the book and is counted as such
+        model = _walk_model()
+        rec, candles = self._ts()
+        candles = {t: [{k: v for k, v in c.items() if k != "volume"} for c in series]
+                   for t, series in candles.items()}
+        with caplog.at_level(logging.INFO):
+            point = self._sim(_walked([rec], candles, model))
+        (trade,) = point.trades
+        assert not trade.book_walked
+        assert ("Trades sized at the top of the book (no depth data) "
+                "(k=0.750, band 0-1, all): 1") in caplog.messages
+        assert not [m for m in caplog.messages if m.startswith("Trades refused when")]
+
+
+class TestLegQuotesCarryTheBook:
+    """LegQuotes keep each checkpoint's 24-hour volume and the depth model,
+    build the synthetic book there (book_at), and keep both through a pickle
+    round trip, as a dashboard worker process receives them."""
+
+    @staticmethod
+    def _quotes(model, volume: bool = True):
+        rec, candles = TestWalkedTradeParity._ts()
+        if not volume:
+            candles = {t: [{k: v for k, v in c.items() if k != "volume"} for c in series]
+                       for t, series in candles.items()}
+        _walked([rec], candles, model)
+        return rec["leg_quotes"]["OB"], candles
+
+    def test_the_volume_is_the_snapshot_s_own_definition(self):
+        quotes, candles = self._quotes(_walk_model())
+        moments = backtester._monday_timestamps(quotes.first_checkpoint, date(2026, 3, 20))
+        expected = [np.nan if v is None else v
+                    for v in (depth_model.volume_24h(candles["OB"], m) for m in moments)]
+        np.testing.assert_array_equal(quotes.volume_checkpoints, expected)
+        assert quotes.volume_checkpoints[0] == 400.0
+        # The week after the candle has earlier candles but none in its 24 hours
+        assert quotes.volume_checkpoints[1] == 0.0
+
+    def test_book_at_builds_the_model_s_book_at_the_quotes(self):
+        model = _walk_model()
+        quotes, _ = self._quotes(model)
+        book = quotes.book_at(_LADDER_M1, 0.60, 0.60)
+        assert book == depth_model.book(model, 0.60, 0.60, 400.0)
+        # The cheapest YES ask the NO bids give is the YES ask itself
+        assert scanner._bids_to_ask_levels(book["no"])[0][0] == pytest.approx(0.60, abs=1e-9)
+        assert quotes.has_book_at(_LADDER_M1)
+        # No book off the checkpoint grid, before it, or past the samples
+        for day in (_LADDER_M1 + timedelta(days=1), date(2025, 12, 29), date(2030, 1, 7)):
+            assert quotes.book_at(day, 0.60, 0.60) is None and not quotes.has_book_at(day)
+
+    def test_no_model_or_no_volume_means_no_book(self):
+        bare, _ = self._quotes(None)
+        assert bare.book_at(_LADDER_M1, 0.60, 0.60) is None
+        assert not bare.has_book_at(_LADDER_M1)
+        quiet, _ = self._quotes(_walk_model(), volume=False)
+        assert np.isnan(quiet.volume_checkpoints[0])
+        assert quiet.book_at(_LADDER_M1, 0.60, 0.60) is None
+
+    def test_a_pickle_round_trip_keeps_the_volume_and_the_model(self):
+        model = _walk_model()
+        quotes, _ = self._quotes(model)
+        again = pickle.loads(pickle.dumps(quotes))
+        assert again == quotes and again.fingerprint == quotes.fingerprint
+        assert again.depth is not None and again.depth.digest == model.digest
+        np.testing.assert_array_equal(again.volume_checkpoints, quotes.volume_checkpoints)
+        assert again.book_at(_LADDER_M1, 0.60, 0.60) == quotes.book_at(_LADDER_M1, 0.60, 0.60)
+        # Without the model, the checkpoint volume or the daily volume it is
+        # a different LegQuotes (the last three arguments are those, in that
+        # order: volume_checkpoints, volume_daily, depth)
+        cls, args = quotes.__reduce__()
+        assert cls(*args[:-1], None) != quotes
+        assert cls(*args[:-1], None).fingerprint != quotes.fingerprint
+        no_volume = cls(*args[:-3], None, args[-2], model)
+        assert no_volume != quotes and no_volume.fingerprint != quotes.fingerprint
+        no_daily = cls(*args[:-3], args[-3], None, model)
+        assert no_daily != quotes and no_daily.fingerprint != quotes.fingerprint
+
+    @staticmethod
+    def _daily_quotes(model):
+        """OB's quotes with two more candles before Monday 2: one an hour
+        before the check two days back (50 contracts traded) and one an hour
+        before the check a day back (5)."""
+        rec, candles = TestWalkedTradeParity._ts()
+        candles["OB"] += [dict(_candle(_ck(_LADDER_M2) - back * 86_400 - 3600, 0.60, 0.40),
+                               volume=volume) for back, volume in ((2, 50.0), (1, 5.0))]
+        _walked([rec], candles, model)
+        return rec["leg_quotes"]["OB"], candles
+
+    def test_the_daily_volume_is_the_snapshot_s_own_definition_at_each_check(self):
+        quotes, candles = self._daily_quotes(_walk_model())
+        # Each day's check: the next checkpoint on or after it, less whole days
+        checks = []
+        for i in range(len(quotes.volume_daily)):
+            day = quotes.first_day + timedelta(days=i)
+            ahead = (backtester.SCHEDULED_RUN.weekday - day.weekday()) % 7
+            checks.append(_ck(day + timedelta(days=ahead)) - ahead * 86_400)
+        expected = [np.nan if v is None else v
+                    for v in (depth_model.volume_24h(candles["OB"], m) for m in checks)]
+        np.testing.assert_array_equal(quotes.volume_daily, expected)
+        index = (_LADDER_M2 - quotes.first_day).days
+        assert list(quotes.volume_daily[index - 2:index + 1]) == [50.0, 5.0, 0.0]
+        # On a checkpoint's own date the check is the checkpoint
+        week = (_LADDER_M2 - quotes.first_checkpoint).days // 7
+        assert quotes.volume_daily[index] == quotes.volume_checkpoints[week]
+        # The daily volume goes into the comparison and the fingerprint
+        cls, args = quotes.__reduce__()
+        changed = list(args)
+        changed[-2] = np.where(np.arange(len(args[-2])) == index - 1, 6.0, args[-2])
+        other = cls(*changed)
+        assert other != quotes and other.fingerprint != quotes.fingerprint
+
+    def test_a_pickle_round_trip_keeps_the_daily_volume(self):
+        model = _walk_model()
+        quotes, _ = self._daily_quotes(model)
+        again = pickle.loads(pickle.dumps(quotes))
+        assert again == quotes and again.fingerprint == quotes.fingerprint
+        np.testing.assert_array_equal(again.volume_daily, quotes.volume_daily)
+        assert not np.isnan(again.volume_daily).all()
+        # And it walks the same ladder at the daily checks
+        for back in (1, 2):
+            assert again.sale_ladder(_LADDER_M2, 0.60, back) == quotes.sale_ladder(
+                _LADDER_M2, 0.60, back)
+
+
+class _WalkedGolden(_MovingGolden):
+    """The moving-price golden fixture with fresh candles at the checkpoints
+    after entry (_SELL_EXTRA, so some positions sell), held over the sell
+    rule's daily checks before each, every candle carrying its hour's
+    volume."""
+
+    _CANDLES = {t: sorted([dict(c, volume=400.0) for c in series]
+                          + [dict(c, volume=400.0)
+                             for d, y, n in _SELL_EXTRA.get(t, []) for c in _held(d, y, n)],
+                          key=lambda c: c["ts"])
+                for t, series in _MovingGolden._CANDLES.items()}
+
+
+@pytest.fixture(scope="class")
+def walk_sweep_run():
+    """The walked golden fixture through run_backtest_sweep with a depth model
+    and every family (band sweep, tier floors off, size caps, add to held
+    pairs, selling) on a narrowed grid: bands (0, 0.5) and (0, 1) x k (0.5,
+    0.75)."""
+    toggles = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
+        apply_pre_toggle_defaults(toggles)
+        golden = _WalkedGolden()
+        golden._patch(mp)
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=golden._START, initial_balance=10_000.0,
+                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                                 tier_off_sweep=True, add_on_sweep=True, sell_sweep=True,
+                                 depth_model=_walk_model())
+        mp.undo()
+        yield SimpleNamespace(res=res, start=golden._START)
+    finally:
+        mp.undo()
+        toggles.undo()
+
+
+@pytest.mark.usefixtures("walk_sweep_run")
+class TestWalkedCapSweepParity:
+    """With walked books every cap of every lazy family (size cap, tier floors
+    off, add to held pairs, selling) still equals a fresh simulation of the
+    same entries: a walked simulation shares only from its cap_free_from, the
+    cap above which the live search's bound stops moving."""
+
+    def test_every_cap_of_every_family_equals_a_fresh_simulation(self, walk_sweep_run):
+        res, start = walk_sweep_run.res, walk_sweep_run.start
+        parity = TestMarketCapSweepParity()
+        checked = 0
+        for cs, tier_floors in ((res.cap_sweep, True), (res.tier_off_cap_sweep, False)):
+            for band in cs.bands:
+                subsets = _cap_sweep_subsets(cs.entries_by_band[band])
+                for k in cs.ks:
+                    for cap, pops in cs.cell(band, k).items():
+                        for pop, point in pops.items():
+                            end = backtester._curve_end_date(cs.eager[(band, k, pop)])
+                            parity._fresh_parity(point, subsets[pop], start, k, band, pop, cap,
+                                                 end_date=end, tier_floors=tier_floors,
+                                                 split_date=res.split_date, checks=True)
+                            checked += 1
+        for cs, tier_floors in ((res.add_on_cap_sweep, True),
+                                (res.add_on_tier_off_cap_sweep, False)):
+            for band in cs.bands:
+                for k in cs.ks:
+                    for cap, pops in cs.cell(band, k).items():
+                        parity._fresh_parity(pops["all"], cs.entries_by_band[band], start, k,
+                                             band, "all", cap,
+                                             end_date=cs.end_dates[(band, k, "all")],
+                                             tier_floors=tier_floors, add_to_held=True)
+                        checked += 1
+        assert checked > 300
+
+    @pytest.mark.parametrize("level", [0.05, 0.5, 1.0])
+    def test_every_sell_cell_equals_a_fresh_simulation(self, walk_sweep_run, level):
+        res, start = walk_sweep_run.res, walk_sweep_run.start
+        sold = res.sell_sweep
+        sales = 0
+        for tier_floors, bands, entries_by_band, end_dates in (
+                (True, sold.bands, sold.entries_by_band, sold.end_dates),
+                (False, sold.off_bands, sold.off_entries_by_band, sold.off_end_dates)):
+            for band in bands:
+                for k in sold.ks:
+                    for add in (False, True):
+                        cell = sold.cell(level, band, k, tier_floors=tier_floors,
+                                         add_to_held=add)
+                        for cap, pops in cell.items():
+                            fresh = backtester._simulate_at_discount(
+                                entries_by_band[band], start, 10_000.0, k=k, spread_band=band,
+                                size_cap=cap, quiet=True, end_date=end_dates[(band, k, "all")],
+                                tier_floors=tier_floors, add_to_held=add, sell_at=level)
+                            point = pops["all"]
+                            assert [astuple(t) for t in point.trades] == [
+                                astuple(t) for t in fresh.trades], (band, k, cap, add)
+                            pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df,
+                                                          check_exact=True)
+                            sales += sum(t.sold for t in point.trades)
+        # Not vacuous: at 5% some walked position sells. At higher levels a
+        # position here is often larger than its modeled bid ladder holds, so
+        # it is not sold, and none reaches 100% of its potential before it pays out
+        assert sales > 0 or level != 0.05
+
+    def test_the_walk_is_not_vacuous(self, walk_sweep_run):
+        res = walk_sweep_run.res
+        assert res.depth_model is not None
+        trades = [t for p in res.scenarios for t in p.trades]
+        assert trades and all(t.book_walked for t in trades)
+        assert any(scanner.leg_prices(SimpleNamespace(
+            pair_type=t.pair_type, pA=t.entry_pA, pB=t.entry_pB, nA=t.entry_nA,
+            nB=t.entry_nB)) != (t.fill_price_a, t.fill_price_b) for t in trades)
+        # Some eager point shares only from a cap above its peak: the walk
+        # bounds the live search below that cap
+        assert any(p.cap_free_from > p.peak_kelly_fraction for p in res.scenarios)
+        for p in res.scenarios:
+            assert backtester._sharing_floor(p) == max(p.peak_kelly_fraction, p.cap_free_from)
+
+
+class TestCapFreeFrom:
+    """SweepPoint.cap_free_from is the cap at and above which no trade of the
+    simulation depends on the cap: the peak with no walked book, and with one,
+    at least the live search's own ceiling for each pair type that can walk
+    (config.max_kelly_fraction with no per-trade cap), decided from the
+    candidates. CapSweep shares from it (_sharing_floor)."""
+
+    _START = date(2026, 1, 1)
+
+    def _sim(self, records, **kw):
+        return backtester._simulate_at_discount(records, self._START, 10_000.0,
+                                                 end_date=date(2026, 4, 1), **kw)
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_it_is_the_peak_without_a_book_and_the_ceiling_with_one(self):
+        rec, candles = TestWalkedTradeParity._ts()
+        top = self._sim(_walked([rec], candles, None), k=0.75)
+        assert top.cap_free_from == top.peak_kelly_fraction
+        rec, candles = TestWalkedTradeParity._ts()
+        walked = self._sim(_walked([rec], candles, _walk_model()), k=0.75)
+        # round(1 - 0.75, 12): the time-series ceiling on f*
+        assert walked.cap_free_from == max(walked.peak_kelly_fraction, 0.25)
+        same = _ladder_same_title(_ladder_market("SA", "EVA-1", "2026-03-20"),
+                                  _ladder_market("SB", "EVB-1", "2026-03-20"), [_LADDER_M1])
+        st_candles = {"SA": [_vol_candle(_LADDER_M1, 0.70, 0.30)],
+                      "SB": [_vol_candle(_LADDER_M1, 0.40, 0.60)]}
+        point = self._sim(_walked([same], st_candles, _walk_model()), k=0.75)
+        # min(same-title cap 1.0, the 0.95 co-resolution prior)
+        assert point.cap_free_from == max(point.peak_kelly_fraction, SAME_TITLE_CO_RESOLVE_PROB)
+
+    def test_the_sharing_floor_reads_both(self):
+        def point(peak, free):
+            return backtester.SweepPoint(k=0.75, trades=[], equity_df=pd.DataFrame(),
+                                         peak_kelly_fraction=peak, cap_free_from=free)
+        assert backtester._sharing_floor(None) is None
+        assert backtester._sharing_floor(point(None, 0.3)) is None
+        assert backtester._sharing_floor(point(0.2, None)) == 0.2
+        assert backtester._sharing_floor(point(0.2, 0.25)) == 0.25
+        assert backtester._sharing_floor(point(0.4, 0.25)) == 0.4
+
+
+@pytest.mark.usefixtures("pre_toggle_defaults")
+class TestCapSweepSharesFromCapFreeFrom:
+    """With a walked book the cap sets how deep the live sizer searches, so a
+    cap above a point's peak can still buy a different trade: CapSweep shares
+    one simulation only from cap_free_from. Every cap against a fresh
+    simulation, in every kind of CapSweep: the size-cap family, tier floors
+    off, adding to held pairs, selling, and with the split-half and
+    excluding-top-event checks."""
+
+    _BAND = (0.0, 1.0)
+    _START, _END = date(2026, 1, 1), date(2026, 4, 1)
+    # What each kind of CapSweep sets ("checks" sets checks=True instead)
+    _FAMILIES = {"tier floors off": {"tier_floors": False},
+                 "adding to held pairs": {"add_to_held": True},
+                 "selling": {"sell_at": 0.5},
+                 "checks": {}}
+
+    def _fresh(self, entries, k, cap):
+        return backtester._simulate_at_discount(entries, self._START, 10_000.0, k=k,
+                                                 spread_band=self._BAND, size_cap=cap,
+                                                 end_date=self._END)
+
+    @pytest.mark.parametrize("quotes, k", [
+        # Peak below the 20% eager cap, cap_free_from above it: the eager
+        # point must not stand in for the caps between them
+        ((0.05, 0.68, 0.35), 0.75),
+        # Peak above 20%: the first simulated cap at or above the peak must
+        # not stand in for the caps below cap_free_from
+        ((0.20, 0.75, 0.40), 0.5),
+    ])
+    def test_every_cap_equals_a_fresh_simulation(self, quotes, k):
+        rec, candles = TestWalkedTradeParity._ts(quotes=quotes)
+        entries = _walked([rec], candles, _walk_model())
+        eager = self._fresh(entries, k, 0.2)
+        assert eager.peak_kelly_fraction < eager.cap_free_from
+        cs = backtester.CapSweep(caps=backtester.SIZE_CAP_SWEEP, primary_cap=0.2,
+                                 bands=(self._BAND,), ks=(k,), primary_k=k,
+                                 start_date=self._START, initial_balance=10_000.0,
+                                 split_date=None, checks=False,
+                                 entries_by_band={self._BAND: entries}, st_entries=[],
+                                 eager={(self._BAND, k, "all"): eager})
+        cell = cs.cell(self._BAND, k)
+        assert tuple(cell) == backtester.SIZE_CAP_SWEEP
+        sizes = {}
+        for cap, pops in cell.items():
+            fresh = self._fresh(entries, k, cap)
+            assert [astuple(t) for t in pops["all"].trades] == [
+                astuple(t) for t in fresh.trades], cap
+            sizes[cap] = [t.n for t in fresh.trades]
+        # Not vacuous: a cap at or above the peak but below cap_free_from buys
+        # a different trade from no cap at all
+        assert any(sizes[cap] != sizes[1.0] for cap in backtester.SIZE_CAP_SWEEP
+                   if eager.peak_kelly_fraction <= cap < eager.cap_free_from)
+
+    @staticmethod
+    def _two_pairs(quotes, later_pA: float) -> list[dict]:
+        """Two walked time-series pairs. OA/OB enters on Monday 1 and is
+        quoted again on Monday 2 with YES on A cheaper, so the held pair can
+        add to itself; QA/QB enters on Monday 2. Fresh checkpoint candles on
+        Mondays 3 and 4, held over the sell rule's daily checks before each,
+        where each B market's YES falls to 0.10, give the positions bids to
+        sell at."""
+        pA, pB, nB = quotes
+        first = _ladder_record(_ladder_market("OA", "EVOA-1", "2026-03-20"),
+                               _ladder_market("OB", "EVOB-1", "2026-03-20"), "o",
+                               [(_LADDER_M1, pA, pB, nB), (_LADDER_M2, later_pA, pB, nB)])
+        second = _ladder_record(_ladder_market("QA", "EVQA-1", "2026-03-20"),
+                                _ladder_market("QB", "EVQB-1", "2026-03-20"), "q",
+                                [(_LADDER_M2, pA, pB, nB)])
+        candles = {"OA": [_vol_candle(_LADDER_M1, pA, round(1.0 - pA, 4)),
+                          _vol_candle(_LADDER_M2, later_pA, round(1.0 - later_pA, 4))],
+                   "OB": [_vol_candle(_LADDER_M1, pB, nB), _vol_candle(_LADDER_M2, pB, nB)],
+                   "QA": [_vol_candle(_LADDER_M2, pA, round(1.0 - pA, 4))],
+                   "QB": [_vol_candle(_LADDER_M2, pB, nB)]}
+        for day in (_LADDER_M3, _M4):
+            for a, b, yes_a in (("OA", "OB", later_pA), ("QA", "QB", pA)):
+                candles[a].extend(dict(c, volume=400.0)
+                                  for c in _held(day, yes_a, round(1.0 - yes_a, 4)))
+                candles[b].extend(dict(c, volume=400.0) for c in _held(day, 0.10, 0.90))
+        return _walked([first, second], candles, _walk_model())
+
+    @pytest.mark.parametrize("quotes, k, later_pA", [
+        # Peak below the 20% eager cap, cap_free_from above it
+        ((0.05, 0.68, 0.35), 0.75, 0.02),
+        # Peak above 20%, cap_free_from above the peak
+        ((0.20, 0.75, 0.40), 0.5, 0.10),
+    ])
+    @pytest.mark.parametrize("family", list(_FAMILIES))
+    def test_every_kind_of_sweep_shares_only_from_cap_free_from(self, family, quotes, k,
+                                                               later_pA):
+        entries = self._two_pairs(quotes, later_pA)
+        options = self._FAMILIES[family]
+        checks = family == "checks"
+        # With the checks, Monday 2 splits the two pairs into two halves
+        split = _LADDER_M2 if checks else None
+        subsets = _cap_sweep_subsets(entries)
+        pops = [pop for pop in subsets if subsets[pop]] if checks else ["all"]
+        eager, end_dates = {}, {}
+        if "add_to_held" in options or "sell_at" in options:
+            # These sweeps take no eager points: every cap is simulated, and
+            # each cell ends on its end_dates day
+            end_dates = {(self._BAND, k, pop): self._END for pop in pops}
+        else:
+            # The others start from eager points at a 20% cap, built as the
+            # run builds them
+            for pop in pops:
+                point = backtester._simulate_at_discount(
+                    subsets[pop], self._START, 10_000.0, k=k, spread_band=self._BAND,
+                    population=pop, size_cap=0.2, quiet=True, end_date=self._END, **options)
+                if checks and pop in ("all", "time_series"):
+                    point.halves = backtester._half_split(
+                        backtester._split_halves(subsets[pop], split), self._START, 10_000.0,
+                        k, self._BAND, population=pop, size_cap=0.2, quiet=True,
+                        end_date=self._END)
+                    point.ex_top_event = backtester._ex_top_event(
+                        point, subsets[pop], self._START, 10_000.0, self._BAND,
+                        population=pop, quiet=True, end_date=self._END)
+                eager[(self._BAND, k, pop)] = point
+        cs = backtester.CapSweep(caps=backtester.SIZE_CAP_SWEEP, primary_cap=0.2,
+                                 bands=(self._BAND,), ks=(k,), primary_k=k,
+                                 start_date=self._START, initial_balance=10_000.0,
+                                 split_date=split, checks=checks,
+                                 entries_by_band={self._BAND: entries}, st_entries=[],
+                                 eager=eager, end_dates=end_dates, **options)
+        cell = cs.cell(self._BAND, k)
+        assert tuple(cell) == backtester.SIZE_CAP_SWEEP
+        parity = TestMarketCapSweepParity()
+        fresh = {}
+        for cap, points in cell.items():
+            assert sorted(points) == sorted(pops), cap
+            for pop, point in points.items():
+                fresh[cap, pop] = parity._fresh_parity(
+                    point, subsets[pop], self._START, k, self._BAND, pop, cap,
+                    end_date=self._END, split_date=split, checks=checks, **options)
+        # Not vacuous: a cap at or above the peak but below cap_free_from buys
+        # something different from no cap at all
+        top = fresh[1.0, "all"]
+        window = [cap for cap in backtester.SIZE_CAP_SWEEP
+                  if top.peak_kelly_fraction <= cap < top.cap_free_from]
+
+        def bought(point):
+            return [(t.ticker_a, t.n) for t in point.trades]
+
+        assert any(bought(fresh[cap, "all"]) != bought(top) for cap in window)
+        if checks:
+            assert any(cell[cap]["all"].halves != cell[1.0]["all"].halves for cap in window)
+        if "add_to_held" in options:
+            assert any(t.add_on for t in top.trades)
+        if "sell_at" in options:
+            assert any(t.sold for t in top.trades)
+
+
+@pytest.mark.usefixtures("pre_toggle_defaults")
+class TestCashIsReadInWholeCents:
+    """A trade is sized on the cash left in whole cents, as live's cash is, so
+    a float cash a hair below a cent buys what that cent buys and is never
+    refused for float noise. Two same-title pairs on one Monday, no depth
+    model, no cap: the first leaves the cash just under $186.57."""
+
+    @staticmethod
+    def _record(a: str, b: str, pA: float, pB: float) -> dict:
+        row = {"entry_date": _LADDER_M1, "pA": pA, "pB": pB, "nA": round(1.0 - pA, 4),
+               "nB": round(1.0 - pB, 4), "gap_days": None,
+               "mA": _ladder_market(a, f"EV{a}-1", "2026-03-20", result="yes"),
+               "mB": _ladder_market(b, f"EV{b}-1", "2026-03-20", result="yes")}
+        return {"pair_type": "same_title", "canon": a, "group_key": ("EV", a, a),
+                "entry": {**row, "later": ()}}
+
+    def test_the_cash_left_to_the_cent_is_spent(self):
+        records = [self._record("SA", "SB", 0.70, 0.40), self._record("SC", "SD", 0.69, 0.39)]
+        point = backtester._simulate_at_discount(records, date(2026, 1, 1), 1_000.01, k=0.75,
+                                                 size_cap=1.0, end_date=date(2026, 4, 1))
+        first, second = point.trades
+        # The cash left, as the walk spends it (the spec's cost with fees)
+        cash = 1_000.01 - (first.total_cost + fee_leg_exact(first.n, first.fill_price_a)
+                           + fee_leg_exact(first.n, first.fill_price_b))
+        assert cash < 186.57 and backtester._cents(cash) == 18_657
+        # The second trade is what the live sizer buys with $186.57: every cent
+        assert (second.ticker_a, second.n) == ("SC", 255)
+        assert second.total_cost + second.fees == pytest.approx(186.57, abs=1e-9)
+
+
+class TestBandReachesEveryResimulation:
+    """A walked book applies the live spread rule, so every simulation must be
+    handed the band and tier setting its entries were found under: the eager
+    band sweep, its populations and checks, and every lazy family's cells."""
+
+    def test_every_simulation_gets_its_entries_band_and_tier(self, monkeypatch):
+        from kalshi_betting import config
+
+        apply_pre_toggle_defaults(monkeypatch)
+        golden = _WalkedGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.25))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        real_entries = backtester._entries_for_band
+        real_simulate = backtester._simulate_at_discount
+
+        def tagging(candidates, spread_band=None, *, tier_floors=True, **kw):
+            out = real_entries(candidates, spread_band, tier_floors=tier_floors, **kw)
+            for rec in out:
+                if rec["pair_type"] == "time_series":
+                    rec["_found_under"] = (config.time_series_spread_band(spread_band),
+                                           tier_floors)
+            return out
+
+        calls = []
+
+        def spy(raw_entries, start_date, initial_balance, k=None, spread_band=None,
+                population="all", **kw):
+            calls.append((config.time_series_spread_band(spread_band),
+                          kw.get("tier_floors", True), population,
+                          [rec for rec in raw_entries if rec["pair_type"] == "time_series"]))
+            return real_simulate(raw_entries, start_date, initial_balance, k=k,
+                                 spread_band=spread_band, population=population, **kw)
+
+        monkeypatch.setattr(backtester, "_entries_for_band", tagging)
+        monkeypatch.setattr(backtester, "_simulate_at_discount", spy)
+        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=golden._START, initial_balance=10_000.0,
+                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                                 tier_off_sweep=True, add_on_sweep=True, sell_sweep=True,
+                                 depth_model=_walk_model())
+        eager = len(calls)
+        for cs in (res.cap_sweep, res.tier_off_cap_sweep, res.add_on_cap_sweep,
+                   res.add_on_tier_off_cap_sweep):
+            for band in cs.bands:
+                cs.cell(band, cs.ks[0])
+        for tier_floors, bands in ((True, res.sell_sweep.bands), (False, res.sell_sweep.off_bands)):
+            for band in bands:
+                res.sell_sweep.cell(0.5, band, res.sell_sweep.ks[0], tier_floors=tier_floors)
+        assert eager > 50 and len(calls) > eager + 50
+        assert {tier for _band, tier, _pop, _recs in calls} == {True, False}
+        checked = 0
+        for band, tier, population, records in calls:
+            for rec in records:
+                assert rec["_found_under"] == (band, tier), (band, tier, population)
+                checked += 1
+        assert checked > 500
+
+
+@pytest.mark.usefixtures("golden_band_sweep")
+class TestNoDepthModelChangesNothing:
+    """With no depth model every trade fills at the top of the book. On the
+    golden band sweep this is exactly the run from before trades walked a
+    book: its eager points (stamps, trades and curves up to a fixed day) hash
+    to the value captured from the code before the walk."""
+
+    # Captured by running the same _sweep_digest over run_backtest_sweep's
+    # golden band sweep on the commit before the walk
+    _DIGEST = "521e65a1a28e369cdc246995718855a92e69d13f81e70ce7c7b1ed1e5b5b946e"
+
+    @staticmethod
+    def _sweep_digest(result) -> str:
+        h = hashlib.sha256()
+        points = list(result.scenarios)
+        if result.same_title_point is not None:
+            points.append(result.same_title_point)
+        for p in points:
+            h.update(repr((p.population, p.spread_band, round(p.k, 9), p.tier_floors,
+                           p.size_cap, round(p.peak_kelly_fraction, 9))).encode())
+            for t in p.trades:
+                h.update(repr((t.pair_type, t.ticker_a, t.ticker_b, t.entry_date.isoformat(),
+                               t.exit_date.isoformat(), t.n, round(t.total_cost, 6),
+                               round(t.fees, 6), round(t.profit, 6), round(t.kelly_fraction, 9),
+                               round(t.balance_at_entry, 6))).encode())
+            for day, value in zip(p.equity_df["date"], p.equity_df["portfolio_value"],
+                                  strict=True):
+                day = day.date() if isinstance(day, datetime) else day
+                if day <= date(2026, 6, 30):
+                    h.update(repr((day.isoformat(), round(float(value), 6))).encode())
+            if p.halves is not None:
+                h.update(repr((round(p.halves.h1_return, 9), round(p.halves.h2_return, 9),
+                               p.halves.h1_trades, p.halves.h2_trades)).encode())
+            if p.ex_top_event is not None:
+                h.update(repr((p.ex_top_event[0], round(p.ex_top_event[1], 9))).encode())
+        return h.hexdigest()
+
+    def test_the_golden_band_sweep_is_the_one_before_the_walk(self, golden_band_sweep):
+        res = golden_band_sweep.result
+        assert res.depth_model is None
+        assert self._sweep_digest(res) == self._DIGEST
+        trades = [t for p in res.scenarios for t in p.trades]
+        assert trades and not any(t.book_walked for t in trades)
+        assert all((t.fill_price_a, t.fill_price_b) == backtester._leg_prices_for(
+            t.pair_type, t.entry_pA, t.entry_nA, t.entry_pB, t.entry_nB) for t in trades)
+
+
+class TestDepthModelIsRecorded:
+    """run_backtest_sweep names its depth model on one line and records it on
+    BacktestSweep.depth_model, on the infeasible branch too, and refuses a k
+    the live sizer cannot take before fetching anything."""
+
+    @pytest.mark.parametrize("with_model", [False, True])
+    def test_both_branches_record_and_name_it(self, monkeypatch, caplog, with_model):
+        model = _walk_model() if with_model else None
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        with caplog.at_level(logging.INFO):
+            res = run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                                     depth_model=model)
+        assert res.depth_model is model
+        line = [m for m in caplog.messages if m.startswith("Depth model:")]
+        assert line == ([f"Depth model: {model.snapshots} snapshot(s), {model.ladders} ladders, "
+                         f"taken {model.first_taken} to {model.last_taken}"] if with_model
+                        else ["Depth model: none — every trade fills at the top of the book"])
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_a_feasible_run_records_it(self, monkeypatch):
+        golden = _WalkedGolden()
+        golden._patch(monkeypatch)
+        model = _walk_model()
+        res = run_backtest_sweep(MagicMock(), MagicMock(), golden._START, 10_000.0,
+                                 sweep=False, depth_model=model)
+        assert res.depth_model is model
+        assert res.primary.trades and all(t.book_walked for t in res.primary.trades)
+
+    @pytest.mark.parametrize("k", [0.0, -0.1, 1.5, float("nan"), True])
+    def test_a_k_the_live_sizer_refuses_is_refused_before_the_fetch(self, monkeypatch, k):
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **kw: pytest.fail("fetched"))
+        with pytest.raises(ValueError, match=r"interval_discount \(k\) must be in \(0, 1\]"):
+            run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                               interval_discount=k)
+
+    def test_a_simulation_refuses_k_zero(self):
+        with pytest.raises(ValueError, match="interval_discount"):
+            backtester._simulate_at_discount([], date(2026, 1, 1), 1000.0, k=0.0)
+
+    def test_an_off_grid_same_title_cap_is_refused_naming_it(self, monkeypatch):
+        monkeypatch.setattr(backtester, "SAME_TITLE_SIZE_CAP", 0.37)
+        with pytest.raises(ValueError, match="SAME_TITLE_SIZE_CAP must be a multiple of 5%.*0.37"):
+            backtester._resolve_same_title_size_cap()
+
+
+# ─── Selling down a modeled bid ladder ───────────────────────────────────────
+
+def _ladder_model(levels) -> depth_model.DepthModel:
+    """A depth model whose every bid ladder holds `levels`: (distance below
+    the best bid, contracts), each distance one of DEPTH_MODEL_DISTANCES."""
+    ladder = [[round(0.50 - distance, 2), contracts] for distance, contracts in levels]
+    model = depth_model.fit([{"ticker": "L", "taken_at": "2026-09-28T16:00:00Z",
+                              "volume_24h": 400.0, "yes": ladder, "no": ladder}])
+    assert model is not None
+    return model
+
+
+def _walk_average(bid: float, n: int, levels) -> float:
+    """The test's own walk: n contracts sold down `levels` from `bid`."""
+    left, proceeds = n, 0.0
+    for distance, contracts in levels:
+        take = min(contracts, left)
+        proceeds += take * round(bid - distance, 4)
+        left -= take
+    assert left == 0
+    return proceeds / n
+
+
+def _sale_quotes(ticker: str, yes_bid: float, no_bid: float, model,
+                 volume: float | None = 400.0, paid: bool = False) -> backtester.LegQuotes:
+    """One market's hand-built quotes with a single checkpoint, Monday 2, at
+    these bids; NO pays out when it has paid out."""
+    day = _LADDER_M2
+    return backtester.LegQuotes(ticker, day, [0.5], [0.5], day, [0.5], [0.5], 0.0, 1.0,
+                                [yes_bid], [no_bid], [paid],
+                                volume_checkpoints=None if volume is None else [volume],
+                                depth=model)
+
+
+def _held_trade(n: int, a: backtester.LegQuotes, b: backtester.LegQuotes,
+                pair_type: str = "time_series") -> backtester.BacktestTrade:
+    """An open trade of n contract pairs on quotes a (market A) and b (market B)."""
+    trade = TestEquityCurveOpensAtTheInitialBalance()._trade(n, 0.30, 0.40, "no", float(n))
+    return dc_replace(trade, pair_type=pair_type, ticker_a=a.ticker, ticker_b=b.ticker,
+                      marks=(a, b))
+
+
+class TestPositionSaleValueWalksTheLadder:
+    """_position_sale_value totals a position's contracts per market and side
+    held, and sells each market down its modeled bid ladder from the fresh
+    bid (LegQuotes.sale_ladder): the sale price is the average over those
+    contracts, each trade's leg returns its contracts at it less the fee on
+    selling them, and a ladder holding fewer contracts than the position
+    means it is not sold. With no model, no volume data there, or a bid the
+    model has no ladders for (below 1c or above 99c), it sells at the bid in
+    any size."""
+
+    _LEVELS = ((0.0, 100.0), (0.01, 200.0), (0.02, 1000.0))
+
+    def _pair(self, model, n: int):
+        # Time-series: YES on QA (bid 0.40), NO on QB (bid 0.55)
+        a = _sale_quotes("QA", 0.40, 0.58, model)
+        b = _sale_quotes("QB", 0.44, 0.55, model)
+        return _held_trade(n, a, b)
+
+    def test_a_walked_sale_takes_the_average_down_the_ladder(self):
+        trade = self._pair(_ladder_model(self._LEVELS), 250)
+        per_trade, value, cost, potential = backtester._position_sale_value(
+            [trade], _LADDER_M2)
+        ((sale_value, fees, (price_a, price_b)),) = per_trade
+        # 100 at the bid, 150 one cent down
+        assert price_a == pytest.approx((100 * 0.40 + 150 * 0.39) / 250, abs=1e-12)
+        assert price_b == pytest.approx((100 * 0.55 + 150 * 0.54) / 250, abs=1e-12)
+        assert price_a == pytest.approx(_walk_average(0.40, 250, self._LEVELS), abs=1e-12)
+        assert fees == fee_leg_exact(250, price_a) + fee_leg_exact(250, price_b)
+        assert sale_value == _sale_value(250, ("bid", price_a), ("bid", price_b))
+        assert value == sale_value
+        assert (cost, potential) == (trade.total_cost + trade.fees, 250.0)
+
+    def test_a_position_larger_than_the_ladder_is_not_sold(self):
+        model = _ladder_model(self._LEVELS)
+        # The ladder holds 1,300 contracts: all of them sell, one more does not
+        numbers = backtester._position_sale_value([self._pair(model, 1300)], _LADDER_M2)
+        ((_value, _fees, (price_a, _price_b)),) = numbers[0]
+        assert price_a == pytest.approx(_walk_average(0.40, 1300, self._LEVELS), abs=1e-12)
+        assert backtester._position_sale_value([self._pair(model, 1301)], _LADDER_M2) is None
+        # A model that puts no contracts near the bid sells nothing
+        zeros = tuple(0.0 for _ in model.overall)
+        empty = depth_model.DepthModel(cells={}, volume_rows={}, overall=zeros, snapshots=1,
+                                       ladders=1, first_taken="", last_taken="", digest="zero")
+        assert _sale_quotes("QA", 0.40, 0.58, empty).sale_ladder(_LADDER_M2, 0.40) == []
+        assert backtester._position_sale_value([self._pair(empty, 1)], _LADDER_M2) is None
+
+    def test_a_bid_the_model_has_no_ladders_for_sells_at_the_bid(self):
+        # Below 1c or above 99c the model cannot say, so a NO leg there (its
+        # YES ask above 99c or under 1c) sells at the bid in any size, exactly
+        # as with no model
+        model = _ladder_model(self._LEVELS)
+        a = _sale_quotes("QA", 0.40, 0.58, None)
+        for no_bid in (0.0001, 0.005, 0.9901, 0.995, 0.9999):
+            walked = _sale_quotes("QB", 0.40, no_bid, model)
+            assert walked.sale_ladder(_LADDER_M2, no_bid) is None
+            trade = _held_trade(1_000_000, a, walked)
+            bare = dc_replace(trade, marks=(a, _sale_quotes("QB", 0.40, no_bid, None)))
+            numbers = backtester._position_sale_value([trade], _LADDER_M2)
+            assert numbers == backtester._position_sale_value([bare], _LADDER_M2)
+            ((sale_value, _fees, prices),) = numbers[0]
+            assert prices == (0.40, no_bid)
+            assert sale_value == _sale_value(1_000_000, ("bid", 0.40), ("bid", no_bid))
+        # From 1c to 99c the model starts a ladder, so the size matters again
+        for bid in (0.01, 0.99):
+            assert _sale_quotes("QB", 0.40, bid, model).sale_ladder(_LADDER_M2, bid)
+        top = _held_trade(1301, a, _sale_quotes("QB", 0.40, 0.99, model))
+        assert backtester._position_sale_value([top], _LADDER_M2) is None
+
+    def test_no_model_or_no_volume_sells_at_the_bid_in_any_size(self):
+        model = _ladder_model(self._LEVELS)
+        for a, b in ((_sale_quotes("QA", 0.40, 0.58, None), _sale_quotes("QB", 0.44, 0.55, None)),
+                     (_sale_quotes("QA", 0.40, 0.58, model, volume=None),
+                      _sale_quotes("QB", 0.44, 0.55, model, volume=None))):
+            assert a.sale_ladder(_LADDER_M2, 0.40) is None
+            trade = _held_trade(1_000_000, a, b)
+            ((sale_value, fees, prices),) = backtester._position_sale_value(
+                [trade], _LADDER_M2)[0]
+            assert prices == (0.40, 0.55)
+            assert sale_value == _sale_value(1_000_000, ("bid", 0.40), ("bid", 0.55))
+        # With both, the ladder is the model's, from the bid it is handed
+        quotes = _sale_quotes("QA", 0.40, 0.58, model)
+        assert quotes.sale_ladder(_LADDER_M2, 0.40) == depth_model.bid_ladder(model, 0.40, 400.0)
+        assert quotes.sale_ladder(_LADDER_M2, 0.40) == [[0.40, 100.0], [0.39, 200.0],
+                                                        [0.38, 1000.0]]
+        # Not a checkpoint of these quotes: no ladder
+        assert quotes.sale_ladder(_LADDER_M3, 0.40) is None
+
+    def test_a_lone_leg_add_on_totals_by_ticker(self):
+        # X is held NO as market B of a time-series trade and as market A of a
+        # same-title one (an add-on to the lone leg): 160 NO contracts on X
+        # walk one ladder, though each trade's 80 fit its best level
+        levels = ((0.0, 100.0), (0.01, 1000.0))
+        model = _ladder_model(levels)
+        x = _sale_quotes("X", 0.38, 0.60, model)
+        first = _held_trade(80, _sale_quotes("Y", 0.40, 0.58, model), x)
+        add = _held_trade(80, x, _sale_quotes("W", 0.45, 0.53, model), "same_title")
+        on_x = _walk_average(0.60, 160, levels)
+        assert on_x < 0.60
+        (sale_1, sale_2), *_ = backtester._position_sale_value([first, add], _LADDER_M2)
+        assert sale_1[2] == (0.40, on_x) and sale_2[2] == (on_x, 0.45)
+        # Alone, each trade's X sells at the best bid
+        assert backtester._position_sale_value([first], _LADDER_M2)[0][0][2] == (0.40, 0.60)
+        assert backtester._position_sale_value([add], _LADDER_M2)[0][0][2] == (0.60, 0.45)
+        # Together past the ladder's 1,100 contracts: not sold, though each fits alone
+        big = dc_replace(add, n=1050)
+        assert backtester._position_sale_value([big], _LADDER_M2) is not None
+        assert backtester._position_sale_value([first, big], _LADDER_M2) is None
+
+    def test_a_paid_out_market_counts_at_its_payout(self):
+        # QB has paid out NO: worth $1 a contract, with no ladder to walk
+        thin = _ladder_model(((0.0, 1.0),))
+        a = _sale_quotes("QA", 0.40, 0.58, None)
+        b = _sale_quotes("QB", 0.44, 0.55, thin, paid=True)
+        ((sale_value, fees, prices),) = backtester._position_sale_value(
+            [_held_trade(50, a, b)], _LADDER_M2)[0]
+        assert prices == (0.40, None)
+        assert fees == fee_leg_exact(50, 0.40)
+        assert sale_value == _sale_value(50, ("bid", 0.40), ("paid", 1.0))
+
+    def test_pickled_quotes_sell_the_same(self):
+        model = _ladder_model(self._LEVELS)
+        trade = self._pair(model, 250)
+        a, b = (pickle.loads(pickle.dumps(q)) for q in trade.marks)
+        assert a.depth is not None and a.depth.digest == model.digest
+        assert a.sale_ladder(_LADDER_M2, 0.40) == trade.marks[0].sale_ladder(_LADDER_M2, 0.40)
+        again = dc_replace(trade, marks=(a, b))
+        assert (backtester._position_sale_value([again], _LADDER_M2)
+                == backtester._position_sale_value([trade], _LADDER_M2))
+
+
+def _with_volume(candles: dict, after: int | None = None, volume: float = 400.0) -> dict:
+    """The candles, each ending after `after` (every one with None) carrying
+    an hour's volume, so the depth model has a ladder at that checkpoint."""
+    return {t: [dict(c, volume=volume) if after is None or c["ts"] > after else dict(c)
+                for c in series]
+            for t, series in candles.items()}
+
+
+class TestWalkedSales:
+    """Through _simulate_at_discount on TestSellAtShareOfPotentialProfit's
+    pair (bought on Monday 1, where its candles carry no volume, so at the
+    top of the book as with no model): with a depth model the sale walks each
+    market's modeled bids, and a ladder too thin for the position keeps it
+    unsold."""
+
+    _SUITE = TestSellAtShareOfPotentialProfit()
+    _LEVELS = tuple(round(0.05 * i, 2) for i in range(1, 21))
+
+    def _records(self, model):
+        candles = _with_volume(self._SUITE._candles(), after=_ck(_LADDER_M1))
+        recs = [self._SUITE._record()]
+        backtester._attach_leg_quotes(recs, candles, date(2026, 1, 1), model)
+        return recs
+
+    @staticmethod
+    def _plain(point) -> list:
+        """The trades as tuples without their quotes, which carry the model."""
+        return [astuple(dc_replace(t, marks=None)) for t in point.trades]
+
+    def _n(self) -> int:
+        (held,) = self._SUITE._sim(self._records(None)).trades
+        return held.n
+
+    def test_a_ladder_too_thin_for_the_position_never_sells(self):
+        n = self._n()
+        records = self._records(_ladder_model(((0.0, float(n // 4)),)))
+        base = self._SUITE._sim(records)
+        (held,) = base.trades
+        assert held.n == n and not held.book_walked
+        for level in self._LEVELS:
+            point = self._SUITE._sim(records, level)
+            assert [astuple(t) for t in point.trades] == [astuple(t) for t in base.trades]
+            pd.testing.assert_frame_equal(point.equity_df, base.equity_df, check_exact=True)
+        assert backtester._highest_sale_level(base, self._LEVELS) is None
+        # With no model the same position sells at 25% on Monday 2
+        assert self._SUITE._sim(self._records(None), 0.25).trades[0].sold
+
+    def test_a_deep_best_bid_sells_as_with_no_model(self):
+        deep = self._records(_ladder_model(((0.0, float(10 * self._n())),)))
+        bare = self._records(None)
+        for level in (None, 0.05, 0.25, 0.5, 0.7, 1.0):
+            walked, plain = self._SUITE._sim(deep, level), self._SUITE._sim(bare, level)
+            assert self._plain(walked) == self._plain(plain)
+            pd.testing.assert_frame_equal(walked.equity_df, plain.equity_df, check_exact=True)
+
+    def test_a_walked_sale_is_at_the_average_down_the_ladder(self):
+        n = self._n()
+        levels = ((0.0, float(n // 3)), (0.01, float(n // 3)), (0.02, float(10 * n)))
+        (sold,) = self._SUITE._sim(self._records(_ladder_model(levels)), 0.05).trades
+        assert sold.sold and sold.exit_date == _LADDER_M2 and sold.n == n
+        bid_a, bid_b = TestSellAtShareOfPotentialProfit._BIDS[_LADDER_M2]
+        assert sold.sale_price_a == pytest.approx(_walk_average(bid_a, n, levels), abs=1e-12)
+        assert sold.sale_price_b == pytest.approx(_walk_average(bid_b, n, levels), abs=1e-12)
+        assert sold.sale_price_a < bid_a and sold.sale_price_b < bid_b
+        assert sold.sale_fees == (fee_leg_exact(n, sold.sale_price_a)
+                                  + fee_leg_exact(n, sold.sale_price_b))
+        assert sold.actual_payoff == _sale_value(n, ("bid", sold.sale_price_a),
+                                                 ("bid", sold.sale_price_b))
+        assert sold.profit == sold.actual_payoff - sold.total_cost - sold.fees
+
+    def test_an_earlier_check_walks_that_day_s_ladder(self):
+        # A model whose ladders are deep on a busy day (400 contracts traded
+        # in the 24 hours) and thin on a quiet one (5). Each daily check
+        # before a sale walks the ladder built from its own day's volume, so
+        # a quiet day before Monday 2 holds the sale back
+        n = self._n()
+        width = len(depth_model.config.DEPTH_MODEL_DISTANCES)
+        busy, quiet = (float(10 * n),) * width, (float(n // 4),) * width
+        model = depth_model.DepthModel(
+            cells={}, volume_rows={depth_model._volume_bucket(5.0): quiet,
+                                   depth_model._volume_bucket(400.0): busy},
+            overall=busy, snapshots=1, ladders=1, first_taken="", last_taken="",
+            digest="busy-quiet")
+        day_back = _ck(_LADDER_M2) - 86_400
+
+        def records(quiet_day: bool, walked: bool = True) -> list[dict]:
+            """The pair's record; with quiet_day, SA's candle at the check a
+            day before Monday 2 trades 5 contracts instead of 400."""
+            candles = _with_volume(self._SUITE._candles(), after=_ck(_LADDER_M1))
+            if quiet_day:
+                candles["SA"] = [dict(c, volume=5.0) if c["ts"] == day_back else c
+                                 for c in candles["SA"]]
+            recs = [self._SUITE._record()]
+            backtester._attach_leg_quotes(recs, candles, date(2026, 1, 1),
+                                          model if walked else None)
+            return recs
+
+        # Every check busy: sold on Monday 2, at the best bids
+        (sold,) = self._SUITE._sim(records(False), 0.25).trades
+        assert sold.sold and sold.exit_date == _LADDER_M2 and sold.n == n
+        assert (sold.sale_price_a, sold.sale_price_b) == (
+            TestSellAtShareOfPotentialProfit._BIDS[_LADDER_M2])
+        # SA quiet the day before: that check's ladder holds n // 4 contracts,
+        # too few for the position, so the sale waits for Monday 3
+        quiet_records = records(True)
+        sa = quiet_records[0]["leg_quotes"]["SA"]
+        bid = sa.bid_at_checkpoint(_LADDER_M2, "yes", 1)
+        assert sa.sale_ladder(_LADDER_M2, bid, 1) == [[bid, float(n // 4)]]
+        assert sa.sale_ladder(_LADDER_M2, bid, 1) == depth_model.bid_ladder(model, bid, 5.0)
+        assert sa.sale_ladder(_LADDER_M2, bid, 0) == depth_model.bid_ladder(model, bid, 400.0)
+        (held,) = self._SUITE._sim(quiet_records, 0.25).trades
+        assert held.sold and held.exit_date == _LADDER_M3
+        # With no model the quiet day changes nothing: sold on Monday 2
+        (plain,) = self._SUITE._sim(records(True, walked=False), 0.25).trades
+        assert plain.sold and plain.exit_date == _LADDER_M2
+
+
+class _WalkedSellingGolden(_SellingGolden):
+    """The selling golden fixture whose candles carry each hour's volume, so
+    buys and sales walk the depth model's books."""
+
+    _CANDLES = _with_volume(_SellingGolden._CANDLES)
+
+
+@pytest.fixture(scope="class")
+def walked_sell_run():
+    """The walked selling golden fixture through run_backtest_sweep with a
+    depth model and every family on sell_run's narrowed grid: band (0, 1) x
+    k (0.5, 0.75), four sell levels."""
+    toggles = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
+        apply_pre_toggle_defaults(toggles)
+        golden = _WalkedSellingGolden()
+        golden._patch(mp)
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        mp.setattr(backtester, "TAKE_PROFIT_LEVELS", (1.0, 0.05, 0.25, 0.5))
+        mp.setattr(backtester, "datetime", type(
+            "Clock", (TestCapSweepEndDate._Clock,),
+            {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC)}))
+        res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                 start_date=golden._START, initial_balance=10_000.0,
+                                 same_event_ladders=True, band_sweep=True, cap_sweep=True,
+                                 tier_off_sweep=True, add_on_sweep=True, sell_sweep=True,
+                                 depth_model=_walk_model())
+        mp.undo()
+        yield SimpleNamespace(on=res, start=golden._START)
+    finally:
+        mp.undo()
+        toggles.undo()
+
+
+@pytest.mark.usefixtures("walked_sell_run")
+class TestWalkedSellSweep:
+    """TestSellSweep's parity checks on the walked selling golden fixture,
+    with buys and sales walking modeled books: every level and cap of the
+    Sell family equals a fresh simulation, every level above a run's highest
+    sale level is that run without selling, sold_cells simulates only the
+    levels that can sell, and a band's pickled copy sells as the family does."""
+
+    @pytest.fixture
+    def sell_run(self, walked_sell_run):
+        """The walked run, under the name TestSellSweep's checks read."""
+        return walked_sell_run
+
+    _settings = TestSellSweep.__dict__["_settings"]
+    test_every_level_and_cap_equals_a_fresh_simulation = (
+        TestSellSweep.test_every_level_and_cap_equals_a_fresh_simulation)
+    test_levels_above_the_highest_sale_level_are_the_no_selling_run = (
+        TestSellSweep.test_levels_above_the_highest_sale_level_are_the_no_selling_run)
+    test_sold_cells_simulates_only_the_levels_that_can_sell = (
+        TestSellSweep.test_sold_cells_simulates_only_the_levels_that_can_sell)
+    test_a_band_s_copy_sells_as_the_family_does_after_pickling = (
+        TestSellSweep.test_a_band_s_copy_sells_as_the_family_does_after_pickling)
+
+    def test_sales_walk_the_bids(self, walked_sell_run):
+        sell = walked_sell_run.on.sell_sweep
+        walked = sold = 0
+        for level in sell.levels:
+            for k in sell.ks:
+                for add in (False, True):
+                    cell = sell.cell(level, sell.bands[0], k, add_to_held=add)
+                    for pops in cell.values():
+                        for t in pops["all"].trades:
+                            assert t.book_walked
+                            if not t.sold:
+                                continue
+                            sold += 1
+                            sides = scanner.leg_sides(t.pair_type)
+                            for quotes, side, price in zip(t.marks, sides,
+                                                           (t.sale_price_a, t.sale_price_b),
+                                                           strict=True):
+                                if price is None:
+                                    continue
+                                bid = quotes.bid_at_checkpoint(t.exit_date, side)
+                                assert price <= bid
+                                walked += price < bid
+        # Positions sell, and their sales walk past the best bid
+        assert sold > 0 and walked > 0
