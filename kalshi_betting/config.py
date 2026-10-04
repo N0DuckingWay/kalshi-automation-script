@@ -454,14 +454,26 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 
 # The sell levels the backtest dashboard's Sell select offers, beside "no
 # selling": sell a whole position once its realized profit (what selling it at
-# the bids would return, after the sale's fees, less what it cost) reaches this
-# share of its potential profit (its contract pairs at CONTRACT_PAYOUT_DOLLARS
-# less what it cost). Every 5% from 5% to 100%. BACKTEST-ONLY: live trading
+# the bids would return, after the sale's fees, less what it cost) has stayed at
+# or above this share of its potential profit (its contract pairs at
+# CONTRACT_PAYOUT_DOLLARS less what it cost) for TAKE_PROFIT_HOLD_DAYS days in a
+# row. Every 5% from 5% to 100%. BACKTEST-ONLY: live trading
 # never sells a position (no live module reads this). Read by
 # backtester.run_backtest_sweep(sell_sweep=True), whose lazy SellSweep
 # simulates each level when the dashboard reads it.
 TAKE_PROFIT_LEVELS = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
                       0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00)
+
+# How many days in a row a position must stay at or above its sell level
+# (TAKE_PROFIT_LEVELS) before the backtest sells it, so a price that jumps for
+# a moment does not trigger a sale. The position is checked once a day, the
+# checks 24 hours apart and the last one at the weekly checkpoint where the
+# sale happens: that check reads the bids there, and each earlier day's check
+# reads the last quote of the 24 hours before it. 1 sells on the checkpoint's
+# bids alone. A whole number from 1 to 7, so every check falls within the
+# week since the previous checkpoint. BACKTEST-ONLY, like TAKE_PROFIT_LEVELS:
+# read by backtester's sell rule (_simulate_at_discount's sell_at).
+TAKE_PROFIT_HOLD_DAYS = 3
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #

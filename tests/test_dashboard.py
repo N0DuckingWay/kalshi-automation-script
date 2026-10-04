@@ -10508,6 +10508,24 @@ class TestSellGrid:
         assert all(level[0][0] == chunker.grid for level in grid.grid)
         assert grid.sidecars == 0 and list((tmp_path / "f").iterdir()) == []
 
+    def test_a_worker_sells_by_the_parent_s_day_count(self, monkeypatch, tmp_path):
+        # Each task carries the parent's TAKE_PROFIT_HOLD_DAYS beside its
+        # same-title cap and schedule; a worker process, which imports
+        # backtester afresh, installs all three before it simulates
+        for name in ("SAME_TITLE_SIZE_CAP", "SCHEDULED_RUN"):
+            monkeypatch.setattr(backtester, name, getattr(backtester, name))
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_HOLD_DAYS", 2)
+        walked, chunker, _grid = _sl_build(_kc_sweep_sell(), tmp_path / "f")
+        tasks = dashboard._sell_tasks(walked, chunker, start_date=_FLT_START,
+                                      initial_balance=1000.0,
+                                      series_categories=_FLT_SERIES_TIERS, risk_free=None,
+                                      folder=tmp_path / "g")
+        assert tasks and all(task.hold_days == 2 for task in tasks)
+        # Run in this process as a worker would (nothing to cover, so no simulation)
+        dashboard._run_sell_task(dataclasses.replace(tasks[0], cells=frozenset(),
+                                                     install=True, hold_days=5))
+        assert backtester.TAKE_PROFIT_HOLD_DAYS == 5
+
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_worker_processes_build_what_the_parent_builds(self, monkeypatch, tmp_path):
         run = TestSellEndToEnd._run(monkeypatch)
@@ -10545,12 +10563,29 @@ class TestSellPage:
     page without the view, the note saying why; the base block's view; and
     the page's own header and chunks unchanged."""
 
+    def test_the_title_says_how_many_days_a_level_must_hold(self, monkeypatch, tmp_path):
+        # One day is the checkpoint alone; more names the count and how the
+        # days are checked
+        one, three = dashboard._sell_select_title(1), dashboard._sell_select_title(3)
+        assert ("reaches that share of its potential profit (its contract pairs at $1.00 "
+                "each, less what it cost). A position sold at a checkpoint") in one
+        assert "days in a row" not in one
+        assert ("has stayed at or above that share of its potential profit (its contract "
+                "pairs at $1.00 each, less what it cost) for 3 days in a row: it is checked "
+                "once a day, 24 hours apart, the last check at the checkpoint") in three
+        # The page names the count its sell runs read
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_HOLD_DAYS", 2)
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        select = re.search(r'<select id="flt-sell"([^>]*)>', page)
+        assert html.unescape(re.search(r'title="([^"]*)"', select.group(1)).group(1)) == \
+            dashboard._sell_select_title(2)
+
     def test_the_select_lists_no_selling_then_every_level(self, monkeypatch, tmp_path):
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
         select = re.search(r'<select id="flt-sell"([^>]*)>(.*?)</select>', page)
         assert " disabled" in select.group(1)
         assert html.unescape(re.search(r'title="([^"]*)"', select.group(1)).group(1)) == \
-            dashboard._SELL_SELECT_TITLE
+            dashboard._sell_select_title(backtester.TAKE_PROFIT_HOLD_DAYS)
         assert re.findall(r'<option value="([^"]*)"( selected)?>(.*?)</option>',
                           select.group(2)) == [
             ("none", " selected", "no selling"), ("0", "", "sell at 25% of potential profit"),
