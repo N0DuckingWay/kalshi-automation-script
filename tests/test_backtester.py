@@ -17010,6 +17010,15 @@ def _ck(day: date) -> int:
     return int(backtester._checkpoint_datetime(day).timestamp())
 
 
+def _held(day: date, yes_ask: float, no_ask: float) -> list[dict]:
+    """Candles at these prices at the entry checkpoint on `day` and at each of
+    the sell rule's daily checks before it (backtester.TAKE_PROFIT_HOLD_DAYS
+    as read when called, 24 hours apart), oldest first: the prices hold for
+    every day a sale there checks."""
+    return [_candle(_ck(day) - back * 86_400, yes_ask, no_ask)
+            for back in range(backtester.TAKE_PROFIT_HOLD_DAYS - 1, -1, -1)]
+
+
 def _sale_value(n: int, *legs) -> float:
     """What a sale of n contract pairs returns, leg by leg as
     _position_sale_value adds it (at the bid, with no ladder): a bid less the
@@ -17115,21 +17124,133 @@ class TestLegQuotesBids:
         assert np.array_equal(stale.yes_checkpoints, q.yes_checkpoints)
         assert stale != q and stale.fingerprint != q.fingerprint
 
+    def test_one_bid_a_day_reads_the_last_quote_of_the_24_hours_before_its_check(self):
+        # The sell rule's daily checks before Monday 2's checkpoint run 24
+        # hours apart. Each reads the latest candle that ended in the 24
+        # hours before it: 23 hours old is read, exactly 24 hours old is the
+        # check before's, and nothing older is carried forward
+        m2, day = _ck(_LADDER_M2), 86_400
+        q = self._quotes([_candle(_ck(_LADDER_M1), 0.30, 0.72),
+                          _candle(m2 - 4 * day, 0.35, 0.66),
+                          _candle(m2 - 2 * day, 0.45, 0.57),
+                          _candle(m2 - day - 23 * 3600, 0.40, 0.62),
+                          _candle(m2, 0.43, 0.57)])
+        expected = {0: (0.43, 0.57), 1: (0.38, 0.6), 2: (0.43, 0.55), 3: None,
+                    4: (0.34, 0.65), 5: None, 6: None}
+        for back, bids in expected.items():
+            got = (q.bid_at_checkpoint(_LADDER_M2, "yes", back),
+                   q.bid_at_checkpoint(_LADDER_M2, "no", back))
+            if bids is None:
+                assert all(math.isnan(b) for b in got), back
+            else:
+                assert got == bids, back
+            assert not q.paid_at_checkpoint(_LADDER_M2, back)
+        # 0 is the checkpoint's own (fresh) bid, the default
+        assert q.bid_at_checkpoint(_LADDER_M2, "yes", 0) == q.bid_at_checkpoint(_LADDER_M2, "yes")
+
+    def test_the_checks_are_24_hours_apart_across_a_clock_change(self):
+        # Monday 2026-03-09's checkpoint is 16:00 UTC (09:00 PDT); its check
+        # two days back is 16:00 UTC on 03-07 (08:00 PST), not 09:00 there. A
+        # candle at 16:30 UTC that Saturday is after that check, so the
+        # check a day back reads it
+        monday = date(2026, 3, 9)
+        market = {"ticker": "Q", "settlement_ts": "2026-03-20T12:00:00Z", "result": "no"}
+        quotes, _stale = backtester._leg_quotes(
+            market, [_candle(_ck(date(2026, 3, 2)), 0.30, 0.72),
+                     _candle(_ck(monday) - 2 * 86_400 + 1800, 0.45, 0.57),
+                     _candle(_ck(monday), 0.43, 0.57)], date(2026, 3, 1))
+        assert _ck(monday) % 86_400 == 16 * 3600
+        assert math.isnan(quotes.bid_at_checkpoint(monday, "yes", 2))
+        assert quotes.bid_at_checkpoint(monday, "yes", 1) == 0.43
+
+    def test_a_daily_check_knows_when_the_market_paid_out(self):
+        # Paid out on Saturday 01-10 at 20:00 UTC: after Monday 2's check two
+        # days back (17:00 UTC that day), before the one a day back
+        candles = [_candle(_ck(_LADDER_M1), 0.40, 0.61),
+                   _candle(_ck(_LADDER_M2) - 2 * 86_400, 0.95, 0.06)]
+        q = self._quotes(candles, settle="2026-01-10T20:00:00Z")
+        assert not q.paid_at_checkpoint(_LADDER_M2, 2)
+        assert q.bid_at_checkpoint(_LADDER_M2, "yes", 2) == 0.94
+        assert q.paid_at_checkpoint(_LADDER_M2, 1) and q.paid_at_checkpoint(_LADDER_M2)
+        assert math.isnan(q.bid_at_checkpoint(_LADDER_M2, "yes", 1))
+        # A check before the market's first day has no bid and no payout
+        late = self._quotes([_candle(_ck(_LADDER_M2) - 2 * 86_400, 0.40, 0.61)])
+        assert late.first_day == date(2026, 1, 10)
+        assert math.isnan(late.bid_at_checkpoint(_LADDER_M2, "yes", 3))
+        assert not late.paid_at_checkpoint(_LADDER_M2, 3)
+
+    def test_a_check_after_a_payout_that_same_day_reads_paid(self):
+        # Paid out on Saturday 01-10 at 12:00 UTC, before that day's check
+        # (17:00 UTC), the last day the daily arrays hold: read paid there,
+        # from the arrays themselves, with no bid
+        q = self._quotes([_candle(_ck(_LADDER_M1), 0.40, 0.61),
+                          _candle(_ck(_LADDER_M2) - 2 * 86_400 - 3600, 0.95, 0.06)],
+                         settle="2026-01-10T12:00:00Z")
+        assert len(q.paid_daily) == (date(2026, 1, 10) - q.first_day).days + 1
+        assert q.paid_daily[-1] and q.paid_at_checkpoint(_LADDER_M2, 2)
+        assert math.isnan(q.bid_at_checkpoint(_LADDER_M2, "yes", 2))
+        assert not q.paid_at_checkpoint(_LADDER_M2, 3)
+
+    def test_the_daily_checks_count_from_a_first_day_between_checkpoints(self):
+        # The first candle is on Thursday 01-01, so the market's first day is
+        # not its first checkpoint (Monday 01-05): Monday 2's check three days
+        # back is Friday 01-09, whose candle it reads
+        q = self._quotes([_candle(_ck(_LADDER_M1) - 4 * 86_400, 0.30, 0.72),
+                          _candle(_ck(_LADDER_M2) - 3 * 86_400, 0.45, 0.57),
+                          _candle(_ck(_LADDER_M2), 0.43, 0.57)])
+        assert q.first_day == date(2026, 1, 1) and q.first_checkpoint == _LADDER_M1
+        assert q.bid_at_checkpoint(_LADDER_M2, "yes", 3) == 0.43
+        assert math.isnan(q.bid_at_checkpoint(_LADDER_M2, "yes", 2))
+
+    @pytest.mark.parametrize("bad", [7, -1, True, False, 1.5, "1"])
+    def test_a_check_more_than_six_days_back_or_not_whole_is_refused(self, bad):
+        q = self._quotes([_candle(_ck(_LADDER_M1), 0.40, 0.61)])
+        with pytest.raises(ValueError, match="days_back"):
+            q.bid_at_checkpoint(_LADDER_M2, "yes", bad)
+        with pytest.raises(ValueError, match="days_back"):
+            q.paid_at_checkpoint(_LADDER_M2, bad)
+        # A numpy whole number is a whole number
+        assert math.isnan(q.bid_at_checkpoint(_LADDER_M2, "yes", np.int64(2)))
+
+    def test_daily_bids_are_in_the_fingerprint_and_survive_pickling(self):
+        import pickle
+
+        def built(bid):
+            return backtester.LegQuotes(
+                "Z", date(2026, 1, 5), [0.3] * 8, [0.7] * 8, date(2026, 1, 5), [0.3, 0.3],
+                [0.7, 0.7], 1.0, 0.0, [0.28, 0.29], [0.69, 0.68], [False, False],
+                [0.28, 0.29, bid, 0.31, 0.3, 0.3, 0.3, 0.29], [0.7] * 8, [False] * 8)
+
+        q = built(0.30)
+        assert q.bid_at_checkpoint(date(2026, 1, 12), "yes", 5) == 0.30
+        copy_ = pickle.loads(pickle.dumps(q))
+        assert copy_ == q and copy_.fingerprint == q.fingerprint
+        assert np.array_equal(copy_.yes_bid_daily, q.yes_bid_daily)
+        other = built(0.31)
+        assert other != q and other.fingerprint != q.fingerprint
+        # A hand-built quote without them has no daily bid and never pays out
+        bare = backtester.LegQuotes("Z", date(2026, 1, 5), [0.3] * 8, [0.7] * 8,
+                                    date(2026, 1, 5), [0.3, 0.3], [0.7, 0.7], 1.0, 0.0)
+        assert math.isnan(bare.bid_at_checkpoint(date(2026, 1, 12), "yes", 1))
+        assert not bare.paid_at_checkpoint(date(2026, 1, 12), 1)
+
 
 class TestSellAtShareOfPotentialProfit:
     """With sell_at, the cash walk sells a whole position once its realized
     profit (what selling returns — each leg at the bid of the side it holds,
     less the fee on the sale; a paid-out leg at its payout — less the cost of
     its contracts and entry fees) reaches sell_at of its potential profit
-    (its contract pairs at $1 less that cost). It checks at every entry
-    checkpoint from the first candidate to the last pay-out, after the day's
-    pay-outs and before its valuation and trades. Every simulation is handed
-    k 0.75 and no cap.
+    (its contract pairs at $1 less that cost) at an entry checkpoint and at
+    the daily checks before it (TAKE_PROFIT_HOLD_DAYS; TestSaleNeedsDaysInARow
+    pins that part). It checks at every entry checkpoint from the first
+    candidate to the last pay-out, after the day's pay-outs and before its
+    valuation and trades. Every simulation is handed k 0.75 and no cap.
 
     The fixture: YES on SA at 0.20 and NO on SB at 0.40, bought on Monday 1
     (2026-01-05); SA pays out 02-10 and SB 03-20, both "no" (a win). Fresh
-    candles at Mondays 2-4 give the bids: Monday 2 YES 0.28 / NO 0.55,
-    Monday 3 0.29 / 0.62, Monday 4 0.23 / 0.50; none after."""
+    candles at Mondays 2-4, repeated at each daily check before them
+    (_held), give the bids: Monday 2 YES 0.28 / NO 0.55, Monday 3 0.29 /
+    0.62, Monday 4 0.23 / 0.50; none after."""
 
     _START = date(2026, 1, 1)
     _BALANCE = 10_000.0
@@ -17141,8 +17262,8 @@ class TestSellAtShareOfPotentialProfit:
                b: [_candle(_ck(_LADDER_M1), 0.60, 0.42)]}
         for day, (yes_bid, no_bid) in cls._BIDS.items():
             # SA's YES bid is 1 - its NO ask; SB's NO bid is 1 - its YES ask
-            out[a].append(_candle(_ck(day), round(yes_bid + 0.02, 2), round(1 - yes_bid, 2)))
-            out[b].append(_candle(_ck(day), round(1 - no_bid, 2), round(no_bid + 0.02, 2)))
+            out[a].extend(_held(day, round(yes_bid + 0.02, 2), round(1 - yes_bid, 2)))
+            out[b].extend(_held(day, round(1 - no_bid, 2), round(no_bid + 0.02, 2)))
         return out
 
     @staticmethod
@@ -17202,15 +17323,16 @@ class TestSellAtShareOfPotentialProfit:
         pd.testing.assert_frame_equal(high.equity_df, base.equity_df, check_exact=True)
 
     def test_a_leg_without_a_fresh_bid_is_not_sold(self):
-        candles = self._candles()
-        # SB's Monday 2 candle ends a period and a second before the checkpoint
-        candles["SB"][1] = dict(candles["SB"][1], ts=_ck(_LADDER_M2) - 3601)
-        (sold,) = self._sim(_quoted([self._record()], candles), 0.25).trades
-        assert sold.exit_date == _LADDER_M3 and sold.sale_price_b == 0.62
-        # A period exactly is fresh: sold on Monday 2
-        candles["SB"][1] = dict(candles["SB"][1], ts=_ck(_LADDER_M2) - 3600)
-        (sold,) = self._sim(_quoted([self._record()], candles), 0.25).trades
-        assert sold.exit_date == _LADDER_M2
+        for age, sold_on in ((3601, _LADDER_M3), (3600, _LADDER_M2)):
+            candles = self._candles()
+            # SB's Monday 2 checkpoint candle ends `age` seconds before the
+            # checkpoint: a period and a second is stale, a period exactly fresh
+            at = next(i for i, c in enumerate(candles["SB"]) if c["ts"] == _ck(_LADDER_M2))
+            candles["SB"][at] = dict(candles["SB"][at], ts=_ck(_LADDER_M2) - age)
+            (sold,) = self._sim(_quoted([self._record()], candles), 0.25).trades
+            assert sold.exit_date == sold_on
+            if sold_on == _LADDER_M3:
+                assert sold.sale_price_b == 0.62
 
     def test_a_trade_with_no_quotes_is_never_sold(self):
         records = [self._record()]
@@ -17229,7 +17351,7 @@ class TestSellAtShareOfPotentialProfit:
                           _candle(_ck(_LADDER_M2), 0.97, 0.04)],
                    "SB": [_candle(_ck(_LADDER_M1), 0.60, 0.42),
                           _candle(_ck(_LADDER_M2), 0.98, 0.03),
-                          _candle(_ck(_LADDER_M3), 0.97, 0.04)]}
+                          *_held(_LADDER_M3, 0.97, 0.04)]}
         records = _quoted([self._record(a=a, b=b)], candles)
         (held,) = self._sim(records).trades
         assert held.actual_payoff == held.n  # SA's YES pays; SB's NO does not
@@ -17306,18 +17428,19 @@ class TestSellingWithAddOns:
     at 0.20/0.40; on Monday 2 its prices fall (bids YES 0.13 / NO 0.34) while
     the record quotes a wider spread (0.15/0.65/0.35), so the held pair is
     short of its Kelly share and is added to; on Monday 3 the bids are YES
-    0.29 / NO 0.62 again."""
+    0.29 / NO 0.62 again. Each Monday's prices hold over the daily checks
+    before it (_held)."""
 
     _START = date(2026, 1, 1)
 
     @staticmethod
     def _candles() -> dict:
         return {"SA": [_candle(_ck(_LADDER_M1), 0.20, 0.82),
-                       _candle(_ck(_LADDER_M2), 0.15, 0.87),
-                       _candle(_ck(_LADDER_M3), 0.31, 0.71)],
+                       *_held(_LADDER_M2, 0.15, 0.87),
+                       *_held(_LADDER_M3, 0.31, 0.71)],
                 "SB": [_candle(_ck(_LADDER_M1), 0.60, 0.42),
-                       _candle(_ck(_LADDER_M2), 0.66, 0.35),
-                       _candle(_ck(_LADDER_M3), 0.38, 0.64)]}
+                       *_held(_LADDER_M2, 0.66, 0.35),
+                       *_held(_LADDER_M3, 0.38, 0.64)]}
 
     def _records(self, mondays) -> list[dict]:
         return _quoted([TestSellAtShareOfPotentialProfit._record(mondays)], self._candles())
@@ -17360,6 +17483,166 @@ class TestSellingWithAddOns:
         assert all(not t.sold for t in self._sim(records).trades)
 
 
+class TestSaleNeedsDaysInARow:
+    """A position is sold at a checkpoint only when it has reached its level
+    there and at the daily check on each of the TAKE_PROFIT_HOLD_DAYS - 1
+    days before it: checks 24 hours apart, each earlier one reading the last
+    quote of the 24 hours before it. A level reached at the checkpoint
+    alone, a day below it or a day with no quote waits for a later
+    checkpoint, so a price that jumps for a moment is not sold on; one day
+    is the checkpoint alone.
+
+    The fixture: TestSellAtShareOfPotentialProfit's pair. Monday 2's bids
+    (YES 0.28 / NO 0.55) reach 25% of the potential profit; Monday 3's (0.29
+    / 0.62), held over every check before it, reach 50%; a "low" day's
+    (0.20 / 0.42) reach neither."""
+
+    _UP, _LOW, _HIGH = (0.28, 0.55), (0.20, 0.42), (0.29, 0.62)
+    _DAY = 86_400
+
+    @staticmethod
+    def _prices(yes_bid: float, no_bid: float) -> tuple:
+        """(SA's candle prices, SB's) whose bids are these: SA's YES bid is 1
+        - its NO ask, SB's NO bid 1 - its YES ask."""
+        return ((round(yes_bid + 0.02, 2), round(1 - yes_bid, 2)),
+                (round(1 - no_bid, 2), round(no_bid + 0.02, 2)))
+
+    def _candles(self, monday2: dict, monday3: bool = True) -> dict:
+        """SA's and SB's candles: Monday 1's entry quotes, a candle at each of
+        `monday2`'s seconds before Monday 2's checkpoint at its bids, and
+        (with monday3) Monday 3's bids held over its checks."""
+        out = {"SA": [_candle(_ck(_LADDER_M1), 0.20, 0.82)],
+               "SB": [_candle(_ck(_LADDER_M1), 0.60, 0.42)]}
+        for before in sorted(monday2, reverse=True):
+            sa, sb = self._prices(*monday2[before])
+            out["SA"].append(_candle(_ck(_LADDER_M2) - before, *sa))
+            out["SB"].append(_candle(_ck(_LADDER_M2) - before, *sb))
+        if monday3:
+            sa, sb = self._prices(*self._HIGH)
+            out["SA"].extend(_held(_LADDER_M3, *sa))
+            out["SB"].extend(_held(_LADDER_M3, *sb))
+        return out
+
+    @staticmethod
+    def _sold_on(candles: dict, level: float = 0.25) -> date | None:
+        """The day the pair is sold at `level`, or None when it is held."""
+        suite = TestSellAtShareOfPotentialProfit()
+        (trade,) = suite._sim(_quoted([suite._record()], candles), level).trades
+        return trade.exit_date if trade.sold else None
+
+    def test_the_level_must_hold_at_every_check(self):
+        day, up, low = self._DAY, self._UP, self._LOW
+        # Every check of Monday 2 reaches 25%: sold there
+        assert self._sold_on(self._candles({2 * day: up, day: up, 0: up})) == _LADDER_M2
+        # The checkpoint alone, or with only the day before: it waits for Monday 3
+        assert self._sold_on(self._candles({0: up})) == _LADDER_M3
+        assert self._sold_on(self._candles({day: up, 0: up})) == _LADDER_M3
+        # A day below the level between two above it
+        assert self._sold_on(self._candles({2 * day: up, day: low, 0: up})) == _LADDER_M3
+        # And at a level Monday 3 does not hold either, never
+        assert self._sold_on(self._candles({0: up}), 0.70) is None
+
+    def test_an_earlier_check_reads_the_last_quote_of_the_24_hours_before_it(self):
+        day, up = self._DAY, self._UP
+        # The check two days back reads a quote from 23 hours before it...
+        assert self._sold_on(self._candles({2 * day + 23 * 3600: up, day: up, 0: up})) \
+            == _LADDER_M2
+        # ... but not one exactly 24 hours before it: that is the check before's
+        assert self._sold_on(self._candles({3 * day: up, day: up, 0: up})) == _LADDER_M3
+        # The last quote of the day counts, not an earlier one that day
+        assert self._sold_on(self._candles({2 * day + 3 * 3600: up, 2 * day: self._LOW,
+                                            day: up, 0: up})) == _LADDER_M3
+
+    def test_fewer_days_check_fewer_days(self, monkeypatch):
+        day, up, low = self._DAY, self._UP, self._LOW
+        candles = {2 * day: low, day: up, 0: up}
+        assert self._sold_on(self._candles(candles)) == _LADDER_M3
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_HOLD_DAYS", 2)
+        assert self._sold_on(self._candles(candles)) == _LADDER_M2
+        # One day is the checkpoint alone
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_HOLD_DAYS", 1)
+        assert self._sold_on(self._candles({0: up})) == _LADDER_M2
+        # Seven reads the six days before: one low six days back holds it
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_HOLD_DAYS", 7)
+        held = {back * day: up for back in range(7)}
+        assert self._sold_on(self._candles(held)) == _LADDER_M2
+        assert self._sold_on(self._candles({**held, 6 * day: low})) == _LADDER_M3
+
+    def test_a_leg_paid_out_between_checks_counts_at_its_payout_from_then(self):
+        # SA's event happens: SA pays YES on Saturday 01-17 at 20:00 UTC,
+        # between Monday 3's check two days back (17:00 UTC that day) and the
+        # one a day back; SB (YES too) pays 03-20, its NO bidding 0.03
+        a = dict(_ladder_market("SA", "EVS-1", "2026-01-17", result="yes"),
+                 settlement_ts="2026-01-17T20:00:00+00:00")
+        b = _ladder_market("SB", "EVS-2", "2026-03-20", result="yes")
+        suite = TestSellAtShareOfPotentialProfit()
+        candles = {"SA": [_candle(_ck(_LADDER_M1), 0.20, 0.82)],
+                   "SB": [_candle(_ck(_LADDER_M1), 0.60, 0.42), *_held(_LADDER_M3, 0.97, 0.04)]}
+        # No SA quote before it paid out: the check two days back cannot be
+        # valued, so it is not sold on Monday 3 (nor later: no fresh bids)
+        (held,) = suite._sim(_quoted([suite._record(a=a, b=b)], candles), 1.0).trades
+        assert not held.sold
+        # SA's YES bidding 0.98 an hour before that check: sold on Monday 3,
+        # the later checks and the sale counting SA at its payout
+        candles["SA"].append(_candle(_ck(_LADDER_M3) - 2 * self._DAY - 3600, 0.99, 0.02))
+        (sold,) = suite._sim(_quoted([suite._record(a=a, b=b)], candles), 1.0).trades
+        assert sold.sold and sold.exit_date == _LADDER_M3
+        assert (sold.sale_price_a, sold.sale_price_b) == (None, 0.03)
+        assert sold.actual_payoff == _sale_value(sold.n, ("paid", 1.0), ("bid", 0.03))
+        # Paid out at 12:00 UTC that Saturday, before its check: every check
+        # counts SA at its payout, so no SA quote is needed
+        early = _ladder_market("SA", "EVS-1", "2026-01-17", result="yes")
+        assert early["settlement_ts"] == "2026-01-17T12:00:00+00:00"
+        candles["SA"].pop()
+        (sold,) = suite._sim(_quoted([suite._record(a=early, b=b)], candles), 1.0).trades
+        assert sold.sold and sold.exit_date == _LADDER_M3
+
+    def test_with_add_ons_the_whole_position_is_checked(self):
+        # TestSellingWithAddOns' position (a pair and the add-on bought on
+        # Monday 2): its trades together must hold the level at every check
+        suite = TestSellingWithAddOns()
+        records = suite._records(TestSellingWithAddOns._MONDAYS)
+        assert all(t.sold and t.exit_date == _LADDER_M3
+                   for t in suite._sim(records, 0.25).trades)
+        # The day before Monday 3 low on both markets (its check's last
+        # quote at Monday 1's prices): held to its pay-out
+        candles = suite._candles()
+        for ticker, (y, n) in (("SA", (0.20, 0.82)), ("SB", (0.60, 0.42))):
+            at = next(i for i, c in enumerate(candles[ticker])
+                      if c["ts"] == _ck(_LADDER_M3) - self._DAY)
+            candles[ticker][at] = _candle(candles[ticker][at]["ts"], y, n)
+        records = _quoted([TestSellAtShareOfPotentialProfit._record(
+            TestSellingWithAddOns._MONDAYS)], candles)
+        assert not any(t.sold for t in suite._sim(records, 0.25).trades)
+
+    @pytest.mark.parametrize("bad", [0, 8, 2.5, True, "3", None])
+    def test_a_bad_day_count_is_refused_before_any_work(self, monkeypatch, bad):
+        suite = TestSellAtShareOfPotentialProfit()
+        records = _quoted([suite._record()], suite._candles())
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_HOLD_DAYS", bad)
+        with pytest.raises(ValueError, match="TAKE_PROFIT_HOLD_DAYS"):
+            suite._sim(records, 0.25)
+        # A run that never sells never reads it; the shortcut does
+        base = suite._sim(records)
+        with pytest.raises(ValueError, match="TAKE_PROFIT_HOLD_DAYS"):
+            backtester._highest_sale_level(base, (0.25,))
+        # run_backtest_sweep refuses it before anything is fetched, and only
+        # with the sell family on
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: pytest.fail("fetched"))
+        with pytest.raises(ValueError, match="TAKE_PROFIT_HOLD_DAYS"):
+            run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                               start_date=date(2026, 1, 1), sell_sweep=True)
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        assert run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                  start_date=date(2026, 1, 1)).sell_sweep is None
+
+    def test_the_rule_is_named_in_words(self):
+        assert backtester._hold_days_text(1) == "once it reaches a level at a checkpoint"
+        assert backtester._hold_days_text(3) == (
+            "once it has stayed at or above a level for 3 days in a row")
+
+
 class TestPositions:
     """_positions groups open trades into positions: trades joined, directly
     or through other trades, by a shared market, in the order of their first
@@ -17387,18 +17670,34 @@ class TestHighestSaleLevel:
     never sold. A level above the one it returns never sells, so its run IS
     the no-selling run (only its sell_at stamp differs); at the level it
     returns and every one below, the run sells at least one position. Pinned
-    for every 5% level on both selling fixtures, each also with a depth model,
-    so that buys and sales walk modeled books."""
+    for every 5% level on both selling fixtures, and on one whose checkpoint
+    is higher than the days before it, so the lowest check decides; each also
+    with a depth model, so that buys and sales walk modeled books."""
 
     _LEVELS = tuple(round(0.05 * i, 2) for i in range(1, 21))
 
+    @staticmethod
+    def _spiky_candles() -> dict:
+        """TestSaleNeedsDaysInARow's pair's candles with Monday 2's checkpoint
+        at the 50% bids and the days before it at the 25% ones; nothing after."""
+        days = TestSaleNeedsDaysInARow()
+        day, up = days._DAY, days._UP
+        return days._candles({2 * day: up, day: up, 0: days._HIGH}, monday3=False)
+
+    @classmethod
+    def _spiky(cls) -> list[dict]:
+        """The pair on _spiky_candles, with its quotes."""
+        suite = TestSellAtShareOfPotentialProfit()
+        return _quoted([suite._record((_LADDER_M1, _LADDER_M2, _LADDER_M3))],
+                       cls._spiky_candles())
+
     @pytest.mark.parametrize("walked", [False, True])
-    @pytest.mark.parametrize("fixture", ["plain", "add_on"])
+    @pytest.mark.parametrize("fixture", ["plain", "add_on", "spiky"])
     def test_levels_above_it_are_the_no_selling_run(self, fixture, walked):
         model = _walk_model() if walked else None
-        if fixture == "plain":
+        if fixture in ("plain", "spiky"):
             suite = TestSellAtShareOfPotentialProfit()
-            candles = suite._candles()
+            candles = suite._candles() if fixture == "plain" else self._spiky_candles()
             records = [suite._record((_LADDER_M1, _LADDER_M2, _LADDER_M3))]
         else:
             suite = TestSellingWithAddOns()
@@ -17416,7 +17715,7 @@ class TestHighestSaleLevel:
             assert all(t.book_walked for t in sim(None).trades)
             assert any(t.sold and t.sale_price_a is not None
                        and t.sale_price_a < t.marks[0].bid_at_checkpoint(t.exit_date, "yes")
-                       for level in self._LEVELS for t in sim(level).trades)
+                       for level in self._LEVELS for t in sim(level).trades), fixture
         base = sim(None)
         top = backtester._highest_sale_level(base, self._LEVELS)
         assert top is not None and top < 1.0
@@ -17428,6 +17727,21 @@ class TestHighestSaleLevel:
                                               check_exact=True)
             else:
                 assert any(t.sold for t in point.trades), level
+
+    def test_the_lowest_check_decides(self, monkeypatch):
+        suite = TestSellAtShareOfPotentialProfit()
+        base = suite._sim(self._spiky())
+        top = backtester._highest_sale_level(base, self._LEVELS)
+        # On the checkpoint alone the higher bids decide
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_HOLD_DAYS", 1)
+        alone = backtester._highest_sale_level(base, self._LEVELS)
+        assert top is not None and alone is not None and top < alone
+        (held,) = base.trades
+        bids = {"up": TestSaleNeedsDaysInARow._UP, "high": TestSaleNeedsDaysInARow._HIGH}
+        ratios = {name: _ratio(held, _sale_value(held.n, ("bid", y), ("bid", n)))
+                  for name, (y, n) in bids.items()}
+        assert top <= ratios["up"] < top + 0.05
+        assert alone <= ratios["high"] < alone + 0.05
 
     def test_it_reads_only_a_run_that_never_sold(self):
         suite = TestSellAtShareOfPotentialProfit()
@@ -17457,7 +17771,8 @@ class TestSaleStream:
         assert list(backtester._sale_stream([])) == []
 
 
-# Fresh candles at the checkpoints after entry, so the sell rule has bids to read
+# Fresh candles at the checkpoints after entry, held over the daily checks
+# before each (_held), so the sell rule has bids to read
 _SELL_EXTRA = {
     "EA": [(_LADDER_M2, 0.40, 0.62), (_LADDER_M3, 0.47, 0.55), (_M4, 0.42, 0.60)],
     "EB": [(_LADDER_M2, 0.58, 0.44), (_LADDER_M3, 0.55, 0.47), (_M4, 0.57, 0.45)],
@@ -17470,10 +17785,11 @@ _SELL_EXTRA = {
 
 class _SellingGolden(TestPrepareEntriesGolden):
     """The golden fixture with fresh candles at the entry checkpoints after
-    entry, so positions have bids and some sell."""
+    entry, held over the sell rule's daily checks before each, so positions
+    have bids and some sell."""
 
-    _CANDLES = {t: sorted(list(series) + [_candle(_ck(d), y, n)
-                                          for d, y, n in _SELL_EXTRA.get(t, [])],
+    _CANDLES = {t: sorted(list(series) + [c for d, y, n in _SELL_EXTRA.get(t, [])
+                                          for c in _held(d, y, n)],
                           key=lambda c: c["ts"])
                 for t, series in TestPrepareEntriesGolden._CANDLES.items()}
 
@@ -17574,8 +17890,9 @@ class TestSellSweep:
     def test_the_run_logs_a_setting_line_and_a_summary_line(self, sell_run):
         selling = [m for m in sell_run.msgs_on if m.startswith(self._SELLING)]
         assert selling == [
-            "Selling early (backtest): on — the dashboard's Sell select is simulated when "
-            "the dashboard is built",
+            "Selling early (backtest): on — a position is sold once it has stayed at or "
+            "above a level for 3 days in a row (config.TAKE_PROFIT_HOLD_DAYS); the "
+            "dashboard's Sell select is simulated when the dashboard is built",
             "Selling early: 4 level(s) x 20 size cap(s) x 1 band(s) (1 with the tier floors "
             "off) x 2 k, adding to held pairs or not, each simulated when the dashboard "
             "reads it"]
@@ -18151,22 +18468,73 @@ class TestLegQuotesCarryTheBook:
         assert again.depth is not None and again.depth.digest == model.digest
         np.testing.assert_array_equal(again.volume_checkpoints, quotes.volume_checkpoints)
         assert again.book_at(_LADDER_M1, 0.60, 0.60) == quotes.book_at(_LADDER_M1, 0.60, 0.60)
-        # Without the model or the volume it is a different LegQuotes
+        # Without the model, the checkpoint volume or the daily volume it is
+        # a different LegQuotes (the last three arguments are those, in that
+        # order: volume_checkpoints, volume_daily, depth)
         cls, args = quotes.__reduce__()
         assert cls(*args[:-1], None) != quotes
         assert cls(*args[:-1], None).fingerprint != quotes.fingerprint
-        no_volume = cls(*args[:-2], None, model)
+        no_volume = cls(*args[:-3], None, args[-2], model)
         assert no_volume != quotes and no_volume.fingerprint != quotes.fingerprint
+        no_daily = cls(*args[:-3], args[-3], None, model)
+        assert no_daily != quotes and no_daily.fingerprint != quotes.fingerprint
+
+    @staticmethod
+    def _daily_quotes(model):
+        """OB's quotes with two more candles before Monday 2: one an hour
+        before the check two days back (50 contracts traded) and one an hour
+        before the check a day back (5)."""
+        rec, candles = TestWalkedTradeParity._ts()
+        candles["OB"] += [dict(_candle(_ck(_LADDER_M2) - back * 86_400 - 3600, 0.60, 0.40),
+                               volume=volume) for back, volume in ((2, 50.0), (1, 5.0))]
+        _walked([rec], candles, model)
+        return rec["leg_quotes"]["OB"], candles
+
+    def test_the_daily_volume_is_the_snapshot_s_own_definition_at_each_check(self):
+        quotes, candles = self._daily_quotes(_walk_model())
+        # Each day's check: the next checkpoint on or after it, less whole days
+        checks = []
+        for i in range(len(quotes.volume_daily)):
+            day = quotes.first_day + timedelta(days=i)
+            ahead = (backtester.SCHEDULED_RUN.weekday - day.weekday()) % 7
+            checks.append(_ck(day + timedelta(days=ahead)) - ahead * 86_400)
+        expected = [np.nan if v is None else v
+                    for v in (depth_model.volume_24h(candles["OB"], m) for m in checks)]
+        np.testing.assert_array_equal(quotes.volume_daily, expected)
+        index = (_LADDER_M2 - quotes.first_day).days
+        assert list(quotes.volume_daily[index - 2:index + 1]) == [50.0, 5.0, 0.0]
+        # On a checkpoint's own date the check is the checkpoint
+        week = (_LADDER_M2 - quotes.first_checkpoint).days // 7
+        assert quotes.volume_daily[index] == quotes.volume_checkpoints[week]
+        # The daily volume goes into the comparison and the fingerprint
+        cls, args = quotes.__reduce__()
+        changed = list(args)
+        changed[-2] = np.where(np.arange(len(args[-2])) == index - 1, 6.0, args[-2])
+        other = cls(*changed)
+        assert other != quotes and other.fingerprint != quotes.fingerprint
+
+    def test_a_pickle_round_trip_keeps_the_daily_volume(self):
+        model = _walk_model()
+        quotes, _ = self._daily_quotes(model)
+        again = pickle.loads(pickle.dumps(quotes))
+        assert again == quotes and again.fingerprint == quotes.fingerprint
+        np.testing.assert_array_equal(again.volume_daily, quotes.volume_daily)
+        assert not np.isnan(again.volume_daily).all()
+        # And it walks the same ladder at the daily checks
+        for back in (1, 2):
+            assert again.sale_ladder(_LADDER_M2, 0.60, back) == quotes.sale_ladder(
+                _LADDER_M2, 0.60, back)
 
 
 class _WalkedGolden(_MovingGolden):
     """The moving-price golden fixture with fresh candles at the checkpoints
-    after entry (_SELL_EXTRA, so some positions sell), every candle carrying
-    its hour's volume."""
+    after entry (_SELL_EXTRA, so some positions sell), held over the sell
+    rule's daily checks before each, every candle carrying its hour's
+    volume."""
 
     _CANDLES = {t: sorted([dict(c, volume=400.0) for c in series]
-                          + [dict(_candle(_ck(d), y, n), volume=400.0)
-                             for d, y, n in _SELL_EXTRA.get(t, [])],
+                          + [dict(c, volume=400.0)
+                             for d, y, n in _SELL_EXTRA.get(t, []) for c in _held(d, y, n)],
                           key=lambda c: c["ts"])
                 for t, series in _MovingGolden._CANDLES.items()}
 
@@ -18376,8 +18744,9 @@ class TestCapSweepSharesFromCapFreeFrom:
         """Two walked time-series pairs. OA/OB enters on Monday 1 and is
         quoted again on Monday 2 with YES on A cheaper, so the held pair can
         add to itself; QA/QB enters on Monday 2. Fresh checkpoint candles on
-        Mondays 3 and 4, where each B market's YES falls to 0.10, give the
-        positions bids to sell at."""
+        Mondays 3 and 4, held over the sell rule's daily checks before each,
+        where each B market's YES falls to 0.10, give the positions bids to
+        sell at."""
         pA, pB, nB = quotes
         first = _ladder_record(_ladder_market("OA", "EVOA-1", "2026-03-20"),
                                _ladder_market("OB", "EVOB-1", "2026-03-20"), "o",
@@ -18392,9 +18761,9 @@ class TestCapSweepSharesFromCapFreeFrom:
                    "QB": [_vol_candle(_LADDER_M2, pB, nB)]}
         for day in (_LADDER_M3, _M4):
             for a, b, yes_a in (("OA", "OB", later_pA), ("QA", "QB", pA)):
-                candles[a].append(dict(_candle(_ck(day), yes_a, round(1.0 - yes_a, 4)),
-                                       volume=400.0))
-                candles[b].append(dict(_candle(_ck(day), 0.10, 0.90), volume=400.0))
+                candles[a].extend(dict(c, volume=400.0)
+                                  for c in _held(day, yes_a, round(1.0 - yes_a, 4)))
+                candles[b].extend(dict(c, volume=400.0) for c in _held(day, 0.10, 0.90))
         return _walked([first, second], candles, _walk_model())
 
     @pytest.mark.parametrize("quotes, k, later_pA", [
@@ -18681,7 +19050,8 @@ def _sale_quotes(ticker: str, yes_bid: float, no_bid: float, model,
     day = _LADDER_M2
     return backtester.LegQuotes(ticker, day, [0.5], [0.5], day, [0.5], [0.5], 0.0, 1.0,
                                 [yes_bid], [no_bid], [paid],
-                                None if volume is None else [volume], model)
+                                volume_checkpoints=None if volume is None else [volume],
+                                depth=model)
 
 
 def _held_trade(n: int, a: backtester.LegQuotes, b: backtester.LegQuotes,
@@ -18891,6 +19261,52 @@ class TestWalkedSales:
         assert sold.actual_payoff == _sale_value(n, ("bid", sold.sale_price_a),
                                                  ("bid", sold.sale_price_b))
         assert sold.profit == sold.actual_payoff - sold.total_cost - sold.fees
+
+    def test_an_earlier_check_walks_that_day_s_ladder(self):
+        # A model whose ladders are deep on a busy day (400 contracts traded
+        # in the 24 hours) and thin on a quiet one (5). Each daily check
+        # before a sale walks the ladder built from its own day's volume, so
+        # a quiet day before Monday 2 holds the sale back
+        n = self._n()
+        width = len(depth_model.config.DEPTH_MODEL_DISTANCES)
+        busy, quiet = (float(10 * n),) * width, (float(n // 4),) * width
+        model = depth_model.DepthModel(
+            cells={}, volume_rows={depth_model._volume_bucket(5.0): quiet,
+                                   depth_model._volume_bucket(400.0): busy},
+            overall=busy, snapshots=1, ladders=1, first_taken="", last_taken="",
+            digest="busy-quiet")
+        day_back = _ck(_LADDER_M2) - 86_400
+
+        def records(quiet_day: bool, walked: bool = True) -> list[dict]:
+            """The pair's record; with quiet_day, SA's candle at the check a
+            day before Monday 2 trades 5 contracts instead of 400."""
+            candles = _with_volume(self._SUITE._candles(), after=_ck(_LADDER_M1))
+            if quiet_day:
+                candles["SA"] = [dict(c, volume=5.0) if c["ts"] == day_back else c
+                                 for c in candles["SA"]]
+            recs = [self._SUITE._record()]
+            backtester._attach_leg_quotes(recs, candles, date(2026, 1, 1),
+                                          model if walked else None)
+            return recs
+
+        # Every check busy: sold on Monday 2, at the best bids
+        (sold,) = self._SUITE._sim(records(False), 0.25).trades
+        assert sold.sold and sold.exit_date == _LADDER_M2 and sold.n == n
+        assert (sold.sale_price_a, sold.sale_price_b) == (
+            TestSellAtShareOfPotentialProfit._BIDS[_LADDER_M2])
+        # SA quiet the day before: that check's ladder holds n // 4 contracts,
+        # too few for the position, so the sale waits for Monday 3
+        quiet_records = records(True)
+        sa = quiet_records[0]["leg_quotes"]["SA"]
+        bid = sa.bid_at_checkpoint(_LADDER_M2, "yes", 1)
+        assert sa.sale_ladder(_LADDER_M2, bid, 1) == [[bid, float(n // 4)]]
+        assert sa.sale_ladder(_LADDER_M2, bid, 1) == depth_model.bid_ladder(model, bid, 5.0)
+        assert sa.sale_ladder(_LADDER_M2, bid, 0) == depth_model.bid_ladder(model, bid, 400.0)
+        (held,) = self._SUITE._sim(quiet_records, 0.25).trades
+        assert held.sold and held.exit_date == _LADDER_M3
+        # With no model the quiet day changes nothing: sold on Monday 2
+        (plain,) = self._SUITE._sim(records(True, walked=False), 0.25).trades
+        assert plain.sold and plain.exit_date == _LADDER_M2
 
 
 class _WalkedSellingGolden(_SellingGolden):
