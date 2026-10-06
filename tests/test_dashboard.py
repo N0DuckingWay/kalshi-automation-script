@@ -44,6 +44,7 @@ import re
 import shutil
 import subprocess
 import warnings
+from array import array
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -5097,14 +5098,16 @@ class TestFilterSummary:
                          "T.other_run", "D.text.scenario", "D.text.loading",
                          "D.text.unavailable", "D.text.khat_sized_at", "T.sell_note",
                          "D.text.sidecar_missing", "D.text.sidecar_empty",
-                         "D.sell_levels[level].phrase"):
+                         "D.sell_levels[level].phrase", "D.sell_days[parseInt(d, 10)].phrase"):
             assert template in js
-        # Nor the tier-floors-off views' words, nor the Sell select's: Python's
-        # scenario, note, sell-level and k-hat title templates carry every one
+        # Nor the tier-floors-off views' words, nor the Sell and Min. days
+        # selects': Python's scenario, note, sell-level, minimum-days and k-hat
+        # title templates carry every one
         for phrase in ("Showing", "contribution", "Not filtered", "its own simulation",
                        "Loading", "not simulated", "cap per trade", "sized at",
                        "never bind", "floor alone", "tier floors off", "selling",
-                       "potential profit", "held no data", "sold on", "keep the folder"):
+                       "potential profit", "held no data", "sold on", "keep the folder",
+                       "last market closes", "at least"):
             assert phrase not in js, phrase
 
 
@@ -10484,46 +10487,87 @@ def _sold(t: BacktestTrade, *, a: float | None = 0.81, b: float | None = 0.12,
 class _FakeSellSweep:
     """
     A backtester.SellSweep stand-in carrying what the dashboard reads of one:
-    levels, bands, off_bands, ks, caps, entry_events(), for_band() and
-    sold_cells().
+    levels, min_days, bands, off_bands, ks, caps, entry_events(), for_band()
+    and sold_grid().
 
-    `sold` maps (level, band, k, tier_floors, add_to_held, cap) to the point a
-    sell run at that level shows; a key it lacks is a level above every sale
-    of that cell (sold_cells yields None there: the run without selling).
-    `raise_on` makes the cells of one (band, tier_floors) raise when read, as a
-    failed simulation would; `reads` records every (band, k, tier_floors,
-    add_to_held, caps) read, shared by every narrowed copy.
+    sold_grid yields every (level, minimum of days), levels then each level's
+    minimums ascending, and per cap one of what the real one yields, by these
+    rules in order (rest = (band, k, tier_floors, add_to_held, cap)):
+      * `same[(level, days, *rest)]`: that SameSale, as configured (it must
+        name a cell yielded earlier as a point);
+      * None (the run without selling) when `sold` lacks (level, *rest), or
+        when days is above `reach[(level, *rest)]`;
+      * `later[(level, days, *rest)]`: a point of its own (another run);
+      * a SameSale naming the cell the last non-None cell of this level and
+        cap was (a point names itself, a SameSale its target);
+      * else `sold[(level, *rest)]`, the point at this level's first minimum.
+    `raise_on` makes the cells of one (band, tier_floors) raise once the
+    first (level, minimum) has been yielded, as a simulation failing part of
+    the way through would; `reads` records every (band, k, tier_floors,
+    add_to_held, caps) read, shared by every narrowed copy. The stats it is
+    handed count one simulation per read and every SameSale and None cell.
     """
 
-    def __init__(self, sold: dict, *, levels=(0.25, 0.5), bands=(_KC_B0, _KC_B1),
+    def __init__(self, sold: dict, *, levels=(0.25, 0.5), min_days=None, bands=(_KC_B0, _KC_B1),
                  ks=(0.6, 0.75), caps=(0.05, 0.2, 1.0), off_bands=(), raise_on=None,
-                 reads=None, events_raise=False):
-        self.sold, self.levels, self.bands, self.ks, self.caps = sold, levels, bands, ks, caps
+                 reads=None, events_raise=False, later=None, same=None, reach=None):
+        # config's options (the page's) unless a test names its own
+        self.min_days = tuple(config.TAKE_PROFIT_MIN_DAYS) if min_days is None else min_days
+        self.sold, self.levels = sold, levels
+        self.bands, self.ks, self.caps = bands, ks, caps
         self.off_bands, self.raise_on, self.events_raise = off_bands, raise_on, events_raise
+        self.later, self.same, self.reach = later or {}, same or {}, reach or {}
         self.reads = [] if reads is None else reads
 
     def entry_events(self):
         if self.events_raise:
             raise RuntimeError("the entries could not be read")
-        return {(t.event_ticker, t.category) for p in self.sold.values() for t in p.trades}
+        return {(t.event_ticker, t.category)
+                for p in (*self.sold.values(), *self.later.values()) for t in p.trades}
 
     def for_band(self, band, *, tier_floors=True):
-        return _FakeSellSweep(self.sold, levels=self.levels,
+        return _FakeSellSweep(self.sold, levels=self.levels, min_days=self.min_days,
                               bands=(band,) if tier_floors else (), ks=self.ks, caps=self.caps,
                               off_bands=() if tier_floors else (band,),
-                              raise_on=self.raise_on, reads=self.reads)
+                              raise_on=self.raise_on, reads=self.reads, later=self.later,
+                              same=self.same, reach=self.reach)
 
-    def sold_cells(self, band, k, *, tier_floors=True, add_to_held=False, caps=None,
-                   stats=None):
+    def _cell(self, level, days, rest, last):
+        """One (level, minimum, cap) by the rules above; `last` is the call's
+        (level, cap) -> the (level, minimum) its last non-None cell named."""
+        cap = rest[-1]
+        if (level, days, *rest) in self.same:
+            target = self.same[(level, days, *rest)]
+            last[(level, cap)] = (target.level, target.min_days)
+            return target
+        if (level, *rest) not in self.sold or days > self.reach.get((level, *rest), days):
+            return None
+        if (level, days, *rest) in self.later:
+            last[(level, cap)] = (level, days)
+            return self.later[(level, days, *rest)]
+        if (level, cap) in last:
+            return backtester.SameSale(*last[(level, cap)])
+        last[(level, cap)] = (level, days)
+        return self.sold[(level, *rest)]
+
+    def sold_grid(self, band, k, *, tier_floors=True, add_to_held=False, caps=None,
+                  stats=None):
         caps = tuple(self.caps if caps is None else caps)
         self.reads.append((band, k, tier_floors, add_to_held, caps))
-        if (band, tier_floors) == self.raise_on:
-            raise RuntimeError("the sell simulation failed")
         if stats is not None:
-            stats["simulated"] = stats.get("simulated", 0) + 1
+            stats["simulated"] += 1
+        last: dict = {}
         for level in self.levels:
-            yield level, {cap: self.sold.get((level, band, k, tier_floors, add_to_held, cap))
-                          for cap in caps}
+            for days in self.min_days:
+                out = {cap: self._cell(level, days, (band, k, tier_floors, add_to_held, cap),
+                                       last) for cap in caps}
+                if stats is not None:
+                    stats["same"] += sum(isinstance(c, backtester.SameSale)
+                                         for c in out.values())
+                    stats["pruned"] += sum(c is None for c in out.values())
+                yield level, days, out
+                if (band, tier_floors) == self.raise_on:
+                    raise RuntimeError("the sell simulation failed")
 
 
 def _sl_point(band, k, cap, trades, *, tier_floors=True, add_to_held=False,
@@ -10539,17 +10583,21 @@ def _kc_sweep_sell(base: BacktestSweep | None = None, *, raise_on=None,
                    events_raise=False, event: str | None = None) -> BacktestSweep:
     """
     A size-cap sweep (_kc_sweep() unless `base`) plus a Sell family at two
-    levels, 25% and 50%.
+    levels, 25% and 50%, and config's minimum-days options (1 to 7, 14, 21).
 
     At 25%: (_KC_B0, k 0.60) sells at the 20% and no-cap caps (one list, as
     caps above a peak share one), its 5% cap is above every sale (the run
-    without selling); (_KC_B0, 0.75) sells at every cap — 5% its own list, 20%
-    and no cap one shared list; (_KC_B1, 0.75) sells at every cap, one list
-    (with `event`, filed under that event: a series no other scenario
-    trades). At 50%: only (_KC_B0, 0.75) at 20% and no cap sells, later and
-    lower. With an Add to held pairs family on `base`, (_KC_B0, 0.75)'s add-on
-    cells sell at 25% too; with a tier-floors-off family, the binding band
-    (_KC_B0)'s run with the tiers off sells at 25% at the run's own cap.
+    without selling); (_KC_B0, 0.75) sells at every cap — 5% its own list
+    with 1 day to spare at most (so from 2 days on it is the run without
+    selling), 20% and no cap one shared list; (_KC_B1, 0.75) sells at every
+    cap, one list (with `event`, filed under that event: a series no other
+    scenario trades), and from 3 days on another list (a run of its own). At
+    50%: only (_KC_B0, 0.75) at 20% sells, later and lower; at no cap it is
+    exactly the 25% run (SameSale). Every other (level, minimum) of a cell
+    that sells is its first minimum's run (SameSale). With an Add to held
+    pairs family on `base`, (_KC_B0, 0.75)'s add-on cells sell at 25% too;
+    with a tier-floors-off family, the binding band (_KC_B0)'s run with the
+    tiers off sells at 25% at the run's own cap.
     """
     sweep = base or _kc_sweep()
     points = {key: (p["all"] if isinstance(p, dict) else p)
@@ -10586,8 +10634,13 @@ def _kc_sweep_sell(base: BacktestSweep | None = None, *, raise_on=None,
         off = sweep.tier_off_scenarios[0].trades
         sold[(0.25, _KC_B0, 0.75, False, False, 0.2)] = _sl_point(
             _KC_B0, 0.75, 0.2, [_sold(off[0]), *off[1:]], tier_floors=False)
+    other_later = [_sold(other[0], a=0.85)]
+    later = {(0.25, 3, _KC_B1, 0.75, True, False, cap): _sl_point(_KC_B1, 0.75, cap, other_later)
+             for cap in (0.05, 0.2, 1.0)}
+    same = {(0.5, 1, _KC_B0, 0.75, True, False, 1.0): backtester.SameSale(0.25, 1)}
+    reach = {(0.25, _KC_B0, 0.75, True, False, 0.05): 1}
     family = _FakeSellSweep(sold, off_bands=off_bands, raise_on=raise_on,
-                            events_raise=events_raise)
+                            events_raise=events_raise, later=later, same=same, reach=reach)
     return dataclasses.replace(sweep, sell_sweep=family)
 
 
@@ -10617,19 +10670,87 @@ def _sl_file(folder: Path, chunk_id: int) -> dict:
     return _decode_block(_SIDECAR_CALL.fullmatch(text).group(1))
 
 
-# The _kc grid's Sell view at each level (tier floors on, adding off): the
-# page's own chunks (_KC_GRID: 0-4) where a level is above every sale, new
-# sidecar chunks (5 on) where it sells, numbered in task order — band 0.0-1
-# first, its k 0.60 then 0.75, each level in turn, caps ascending
-_SL_GRIDS = [[[[3, 5, 5], [6, 7, 7]], [[None, None, None], [9, 9, 9]]],
-             [[[3, 2, 2], [1, 8, 8]], [[None, None, None], [4, 4, 4]]]]
+def _sl_blocks(blocks) -> list:
+    """The Sell blocks of a _SellGrid (or of a page's text), decoded strictly, by number."""
+    decoded = _packed_blocks(blocks if isinstance(blocks, str) else "".join(blocks))
+    found = sorted(int(name[len("dash-sell-"):]) for name in decoded
+                   if name.startswith("dash-sell-"))
+    assert found == list(range(len(found)))
+    return [decoded[f"dash-sell-{i}"] for i in found]
+
+
+def _sl_view(index, blocks: list, bases: dict, li: int, di: int, n_days: int) -> list:
+    """
+    The chunk ids one (level index li, minimum-days index di) shows, resolved
+    as the page's script resolves them (chunkAt): [Tier floors 0 on / 1 off]
+    [Add to held pairs 0 off / 1 on] -> [band][k][cap], None for a view the
+    page lacks (`bases`: (t, a) -> its base grid, or None). A cell is None
+    where its band has no block, the block has no such view or row, or the
+    row is not covered; -1 is the scenario's own chunk, the base grid's id.
+    """
+    out = [[None, None], [None, None]]
+    for t in (0, 1):
+        for a in (0, 1):
+            base = bases[(t, a)]
+            if base is None:
+                continue
+            view = []
+            for bi, band_rows in enumerate(base):
+                bid = index[t][bi] if index is not None else None
+                rows = blocks[bid][a] if bid is not None else None
+                view.append([[None if rows is None or rows[ki][ci] is None
+                              else (cid if (v := rows[ki][ci][li * n_days + di]) == -1 else v)
+                              for ci, cid in enumerate(row)]
+                             for ki, row in enumerate(band_rows)])
+            out[t][a] = view
+    return out
+
+
+def _sl_grid_view(chunker, grid, li: int, di: int) -> list:
+    """_sl_view over a _SellGrid built for a chunk visitor's grid."""
+    add = chunker.add_grid()
+    off = chunker.off_grid()
+    bases = {(0, 0): chunker.grid, (0, 1): add, (1, 0): off,
+             (1, 1): chunker.add_off_grid() if off is not None and add is not None else None}
+    return _sl_view(grid.index, _sl_blocks(grid.blocks), bases, li, di, len(grid.days))
+
+
+def _sl_page_view(page: str, li: int, di: int) -> list:
+    """_sl_view over a whole page: its base block's grids and its Sell blocks."""
+    data = TestFilterPage._data(page)
+    bases = {(0, 0): data["grid"], (0, 1): data["grid_add"], (1, 0): data["grid_off"],
+             (1, 1): data["grid_add_off"]}
+    return _sl_view(data["sell_blocks"], _sl_blocks(page), bases, li, di,
+                    len(data["sell_days"]))
+
+
+# The _kc grid's Sell view (tier floors on, adding off) by (level index,
+# minimum of days): the page's own chunks (_KC_GRID: 0-4) where a setting
+# sells nothing, new sidecar chunks (5 on) where it sells, numbered in task
+# order — band 0.0-1 first, its k 0.60 then 0.75, each level and minimum in
+# turn, caps ascending. From 3 days on every minimum reads as 3 does.
+_SL_VIEWS = {
+    (0, 1): [[[3, 5, 5], [6, 7, 7]], [[None, None, None], [9, 9, 9]]],
+    (0, 2): [[[3, 5, 5], [1, 7, 7]], [[None, None, None], [9, 9, 9]]],
+    (0, 3): [[[3, 5, 5], [1, 7, 7]], [[None, None, None], [10, 10, 10]]],
+    (1, 1): [[[3, 2, 2], [1, 8, 7]], [[None, None, None], [4, 4, 4]]],
+    (1, 2): [[[3, 2, 2], [1, 8, 7]], [[None, None, None], [4, 4, 4]]],
+    (1, 3): [[[3, 2, 2], [1, 8, 7]], [[None, None, None], [4, 4, 4]]],
+}
+
+
+def _sl_expected(li: int, days: int) -> list:
+    """_SL_VIEWS at any minimum of days (every one past 3 reads as 3)."""
+    return _SL_VIEWS[(li, min(days, 3))]
 
 
 class TestSellGrid:
-    """The bar's Sell view built after the walk: every sell level of every
-    cell the page shows, a level above every sale its scenario's own chunk, a
-    new trade list a sidecar file numbered after the page's own chunks, and a
-    failure costing its band's cells alone."""
+    """The bar's Sell view built after the walk: every (sell level, minimum of
+    days) of every cell the page shows, a setting that sells nothing its
+    scenario's own chunk (-1), one that repeats an earlier run that run's
+    chunk, a new trade list a sidecar file numbered after the page's own
+    chunks; one packed block per finished task, named by the base block's
+    index; and a failure costing its band's cells alone."""
 
     def test_the_family_joins_a_grid_it_fits(self):
         sweep = _kc_sweep_sell(event="KXRAIN-9")
@@ -10654,25 +10775,74 @@ class TestSellGrid:
             assert dashboard._grid_source(unread, trades, curve, 0.75).sell is None
         assert any(_SELL_UNREAD in r.getMessage() for r in caplog.records)
 
-    def test_every_level_maps_each_cell_to_its_chunk(self, tmp_path):
-        walked, chunker, grid = _sl_build(_kc_sweep_sell(), tmp_path / "f")
+    def test_every_setting_maps_each_cell_to_its_chunk(self, tmp_path, caplog):
+        with caplog.at_level(logging.INFO):
+            walked, chunker, grid = _sl_build(_kc_sweep_sell(), tmp_path / "f")
+        days = tuple(config.TAKE_PROFIT_MIN_DAYS)
         assert chunker.grid == _KC_GRID and len(chunker.chunks) == 5
-        assert [level[0][0] for level in grid.grid] == _SL_GRIDS
-        # Without the tier-floors-off or the add-on view, those grids are null
-        assert all(level[0][1] is None and level[1] == [None, None] for level in grid.grid)
-        assert grid.sidecars == 5
-        assert sorted(p.name for p in (tmp_path / "f").iterdir()) == [
-            f"chunk-{i}.js" for i in range(5, 10)]
+        # One block per band, each band's tier-on block named; no tier-off view
+        assert grid.index == [[0, 1], [None, None]] and len(grid.blocks) == 2
+        for li in range(2):
+            for di, n in enumerate(days):
+                view = _sl_grid_view(chunker, grid, li, di)
+                assert view[0][0] == _sl_expected(li, n), (li, n)
+                # Without the tier-floors-off or the add-on view, those are null
+                assert view[0][1] is None and view[1] == [None, None]
+        assert grid.sidecars == 6
+        assert sorted(p.name for p in (tmp_path / "f").iterdir()) == sorted(
+            f"chunk-{i}.js" for i in range(5, 11))
         assert [(e["label"], e["phrase"], e["value"]) for e in grid.levels] == [
             ("sell at 25% of potential profit",
              ", selling each position at 25% of its potential profit", 0.25),
             ("sell at 50% of potential profit",
              ", selling each position at 50% of its potential profit", 0.5)]
+        assert [(e["label"], e["phrase"], e["value"]) for e in grid.days] == [
+            (f"{n} day" if n == 1 else f"{n} days",
+             f" and at least {n} day{'' if n == 1 else 's'} before its last market closes", n)
+            for n in days]
         # Each band's cells were read once per k it shows, adding off, every cap
         # at once; band 0.3-0.6 shows no cell at k 0.60, so it was not read there
         assert walked.sell.reads == [(_KC_B0, 0.6, True, False, (0.05, 0.2, 1.0)),
                                      (_KC_B0, 0.75, True, False, (0.05, 0.2, 1.0)),
                                      (_KC_B1, 0.75, True, False, (0.05, 0.2, 1.0))]
+        # The build's closing line counts the cells that repeat a run, and
+        # those that sell nothing, as sold_grid reported them
+        built = [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith("Dashboard: Sell select built")]
+        assert len(built) == 1
+        assert len(days) == 9
+        # Repeating: k 0.60's two selling caps at 25% past 1 day (2 x 8); k
+        # 0.75's 20% at 25% and 50% (8 + 8), no cap at 25% (8) and at 50% (9:
+        # its first minimum repeats the 25% run); band 0.3-0.6 at 25%, every
+        # cap at every minimum but 1 and 3 days (3 x 7) — 70
+        # Without a sale: k 0.60's 5% at 25% and every cap at 50% (9 + 27);
+        # k 0.75's 5% at 25% past 1 day (8) and at 50% (9); band 0.3-0.6 at
+        # 50% (27) — 80
+        assert "70 cells repeating an earlier run, 80 cells without a sale" in built[0], \
+            built[0]
+
+    def test_every_covered_row_is_full_and_names_a_chunk_or_minus_one(self, tmp_path):
+        _walked, chunker, grid = _sl_build(_kc_sweep_sell(), tmp_path / "f")
+        width = len(grid.levels) * len(grid.days)
+        ids = set(range(len(chunker.chunks) + grid.sidecars)) | {-1}
+        for block in _sl_blocks(grid.blocks):
+            assert block[1] is None
+            for row in block[0]:
+                for cell in row:
+                    # A row is None (not covered) or holds every setting
+                    assert cell is None or (len(cell) == width and set(cell) <= ids)
+        # Band 0.3-0.6 shows no cell at k 0.60: those rows are not covered
+        assert _sl_blocks(grid.blocks)[1][0][0] == [None, None, None]
+
+    def test_a_repeated_run_takes_the_id_of_the_cell_it_names(self, tmp_path):
+        _walked, chunker, grid = _sl_build(_kc_sweep_sell(), tmp_path / "f")
+        days = tuple(config.TAKE_PROFIT_MIN_DAYS)
+        (b0, _b1) = _sl_blocks(grid.blocks)
+        cell = b0[0][1][2]                     # band 0.0-1, k 0.75, no cap
+        # 50% at 1 day repeats the 25% run at 1 day (an earlier level)
+        assert cell[len(days)] == cell[0] == 7
+        # A setting that sells nothing is -1, not the own chunk's id
+        assert b0[0][1][0][1] == -1 and b0[0][0][0] == [-1] * (2 * len(days))
 
     def test_a_sidecar_chunk_is_the_list_s_own_payload(self, tmp_path):
         sweep = _kc_sweep_sell()
@@ -10694,41 +10864,97 @@ class TestSellGrid:
         walked, chunker, grid = _sl_build(sweep, tmp_path / "f")
         off, add, add_off = chunker.off_grid(), chunker.add_grid(), chunker.add_off_grid()
         assert None not in (off, add, add_off)
-        level = grid.grid[0]
+        # Tasks: band 0.0-1 and 0.3-0.6 with the tiers on, then 0.0-1 (the one
+        # the tiers bind at) off; 0.3-0.6 off reads its tier-on block
+        assert grid.index == [[0, 1], [2, 1]]
+        view = _sl_grid_view(chunker, grid, 0, 0)
         # Adding on: the add-on cells that sell are new chunks; the rest are the
         # add-on view's own chunks
-        assert level[0][1][0][1] != add[0][1] and level[0][1][0][1][0] not in _ao_ids(add)
-        assert level[0][1][0][0] == add[0][0]
+        assert view[0][1][0][1] != add[0][1] and view[0][1][0][1][0] not in _ao_ids(add)
+        assert view[0][1][0][0] == add[0][0]
         # Tier floors off: the binding band's own cell that sells is new, its
         # other cells (the family is at the run's own cap) stay the off view's;
         # the band the tiers never bind at shows its tier-on Sell rows
-        assert level[1][0][0][1][1] not in _ao_ids(off)
-        assert level[1][0][0][1][0] == off[0][1][0] and level[1][0][0][0] == off[0][0]
-        assert level[1][0][1] == level[0][0][1]
-        assert level[1][1][1] == level[0][1][1]
+        assert view[1][0][0][1][1] not in _ao_ids(off)
+        assert view[1][0][0][1][0] == off[0][1][0] and view[1][0][0][0] == off[0][0]
+        assert view[1][0][1] == view[0][0][1]
+        assert view[1][1][1] == view[0][1][1]
         # With both, the binding band's tier-off add-on cells never sell here:
         # each is the base grid's own chunk
-        assert level[1][1][0] == add_off[0]
+        assert view[1][1][0] == add_off[0]
         assert (_KC_B0, 0.75, False, False, (0.05, 0.2, 1.0)) not in walked.sell.reads
         assert (_KC_B0, 0.75, False, False, (0.2,)) in walked.sell.reads
 
     def test_a_failed_band_costs_its_own_cells(self, tmp_path, caplog):
+        # Band 0.3-0.6's cells raise once its first setting has been read and
+        # its list written: that file is deleted, and its band has no block
         sweep = _kc_sweep_sell(raise_on=(_KC_B1, True))
         with caplog.at_level(logging.WARNING):
-            _walked, _chunker, grid = _sl_build(sweep, tmp_path / "f")
+            _walked, chunker, grid = _sl_build(sweep, tmp_path / "f")
         warnings_ = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert warnings_ == ["The Sell select's simulations at spread band 0.3-0.6 failed; "
                              "selling is not shown there"]
-        assert [level[0][0][0] for level in grid.grid] == [g[0] for g in _SL_GRIDS]
-        assert all(level[0][0][1] == [[None] * 3, [None] * 3] for level in grid.grid)
+        assert grid.index == [[0, None], [None, None]] and len(grid.blocks) == 1
+        for li in range(2):
+            for di, n in enumerate(config.TAKE_PROFIT_MIN_DAYS):
+                view = _sl_grid_view(chunker, grid, li, di)[0][0]
+                assert view[0] == _sl_expected(li, n)[0]
+                assert view[1] == [[None] * 3, [None] * 3]
         assert grid.sidecars == 4
+        assert sorted(p.name for p in (tmp_path / "f").iterdir()) == [
+            f"chunk-{i}.js" for i in range(5, 9)]
 
     def test_no_sale_anywhere_writes_no_file(self, tmp_path):
         sweep = dataclasses.replace(_kc_sweep(), sell_sweep=_FakeSellSweep({}))
         _walked, chunker, grid = _sl_build(sweep, tmp_path / "f")
-        # Every level is above every sale: every cell is the page's own chunk
-        assert all(level[0][0] == chunker.grid for level in grid.grid)
+        # Every setting sells nothing: every cell is the page's own chunk
+        assert grid.index == [[0, 1], [None, None]]
+        assert all(set(c) == {-1} for b in _sl_blocks(grid.blocks) for row in b[0] for c in row
+                   if c is not None)
+        assert _sl_grid_view(chunker, grid, 1, 4)[0][0] == chunker.grid
         assert grid.sidecars == 0 and list((tmp_path / "f").iterdir()) == []
+
+    def test_the_base_block_carries_the_index_and_no_grid_of_ids(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        data = TestFilterPage._data(page)
+        assert "grid_sell" not in data
+        assert data["sell_blocks"] == [[0, 1], [None, None]]
+        assert [d["value"] for d in data["sell_days"]] == list(config.TAKE_PROFIT_MIN_DAYS)
+        # The page's resolution of every setting is the grid's
+        for li in range(2):
+            for di, n in enumerate(config.TAKE_PROFIT_MIN_DAYS):
+                assert _sl_page_view(page, li, di)[0][0] == _sl_expected(li, n)
+        # The blocks sit after the page's own chunks and before the base block
+        assert (page.index('id="dash-chunk-4"') < page.index('id="dash-sell-0"')
+                < page.index('id="dash-sell-1"') < page.index('id="dash-data"'))
+
+    def test_a_task_returns_one_compact_row_per_cell(self, tmp_path):
+        # A task's result holds, per covered cell, one array of small numbers
+        # (a place in its key list, or -1 for the run without selling), not
+        # one entry per setting: the parent keeps every result until the
+        # last task ends
+        walked, chunker, _grid = _sl_build(_kc_sweep_sell(), tmp_path / "f")
+        folder = tmp_path / "g"
+        folder.mkdir()
+        tasks = dashboard._sell_tasks(walked, chunker, start_date=_FLT_START,
+                                      initial_balance=1000.0,
+                                      series_categories=_FLT_SERIES_TIERS, risk_free=None,
+                                      folder=folder)
+        width = len(walked.sell.levels) * len(walked.sell.min_days)
+        assert tasks
+        for task in tasks:
+            result = dashboard._run_sell_task(task)
+            assert set(result.rows) == set(task.cells)
+            assert len(set(result.keys)) == len(result.keys)
+            for row in result.rows.values():
+                assert isinstance(row, array) and row.typecode == "i" and len(row) == width
+                assert all(-1 <= place < len(result.keys) for place in row)
+            # Every key is named by a row, and is the page's own or one the
+            # task wrote
+            assert {result.keys[place] for row in result.rows.values()
+                    for place in row if place >= 0} == set(result.keys)
+            assert set(result.written) <= set(result.keys) <= (
+                set(chunker.seen) | set(result.written))
 
     def test_a_worker_sells_by_the_parent_s_day_count(self, monkeypatch, tmp_path):
         # Each task carries the parent's TAKE_PROFIT_HOLD_DAYS beside its
@@ -10762,10 +10988,12 @@ class TestSellGrid:
                 run.primary.trades, run.primary.equity_df, TestSellEndToEnd._START, 10_000.0,
                 sweep=run, sell_workers=workers).read_text(encoding="utf-8")
             pages[workers] = (TestFilterPage._data(page), TestFilterPage._chunks(page),
-                              _sidecar_files(page, root))
-        (d1, c1, f1), (d2, c2, f2) = pages[1], pages[2]
-        assert d1["grid_sell"] == d2["grid_sell"] and d1["inline_chunks"] == d2["inline_chunks"]
+                              _sidecar_files(page, root), _sl_blocks(page))
+        (d1, c1, f1, _b1), (d2, c2, f2, _b2) = pages[1], pages[2]
+        assert d1["sell_blocks"] == d2["sell_blocks"] and d1["sell_blocks"] is not None
+        assert d1["inline_chunks"] == d2["inline_chunks"]
         assert c1 == c2
+        assert pages[1][3] == pages[2][3] and len(pages[1][3]) > 0
         # The same files under the same names, whichever worker wrote each
         names = {src.rsplit("/", 1)[1]: chunk for src, chunk in f1.items()}
         assert names == {src.rsplit("/", 1)[1]: chunk for src, chunk in f2.items()}
@@ -10790,7 +11018,9 @@ class TestSellPage:
         # days are checked
         one, three = dashboard._sell_select_title(1), dashboard._sell_select_title(3)
         assert ("reaches that share of its potential profit (its contract pairs at $1.00 "
-                "each, less what it cost). A position sold at a checkpoint") in one
+                "each, less what it cost). It is sold only while at least the days the "
+                "Min. days to maturity select names remain before its last market stops "
+                "trading. A position sold at a checkpoint") in one
         assert "days in a row" not in one
         assert ("has stayed at or above that share of its potential profit (its contract "
                 "pairs at $1.00 each, less what it cost) for 3 days in a row: it is checked "
@@ -10814,21 +11044,52 @@ class TestSellPage:
             ("1", "", "sell at 50% of potential profit")]
         assert 'id="flt-sell-note"' not in page
         data = TestFilterPage._data(page)
-        assert data["sell_state"] == "shown" and len(data["grid_sell"]) == 2
+        assert data["sell_state"] == "shown" and data["sell_blocks"] == [[0, 1], [None, None]]
         assert data["inline_chunks"] == 5
         assert data["sidecar_dir"].startswith(f"{config.DASHBOARD_FILES_DIRNAME}/")
-        assert sorted(_sidecar_files(page, tmp_path)) == [
-            f"{data['sidecar_dir']}/chunk-{i}.js" for i in range(5, 10)]
+        assert sorted(_sidecar_files(page, tmp_path)) == sorted(
+            f"{data['sidecar_dir']}/chunk-{i}.js" for i in range(5, 11))
+        # Each Sell block decodes strictly: [adding][k][cap] -> one id per setting
+        blocks = _sl_blocks(page)
+        assert len(blocks) == 2 and all(block[1] is None for block in blocks)
         # The summary's closing sentence says what the choice reaches
         assert data["text"]["unfiltered"].endswith(" " + dashboard._SELL_REACH_NO_EXPLORER)
+
+    def test_the_days_select_follows_sell_with_every_option_and_its_rule(self, monkeypatch,
+                                                                          tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        # Right after the Sell select, and before Category
+        ids = re.findall(r'<select id="(flt-[a-z]+)"', page)
+        assert ids[ids.index("flt-sell") + 1:ids.index("flt-sell") + 3] == ["flt-days",
+                                                                            "flt-cat"]
+        assert '<label>Min. days to maturity: <select id="flt-days"' in page
+        select = re.search(r'<select id="flt-days"([^>]*)>(.*?)</select>', page)
+        assert " disabled" in select.group(1) and 'autocomplete="off"' in select.group(1)
+        assert html.unescape(re.search(r'title="([^"]*)"', select.group(1)).group(1)) == \
+            dashboard._SELL_DAYS_TITLE
+        days = tuple(config.TAKE_PROFIT_MIN_DAYS)
+        assert len(days) == 9
+        assert re.findall(r'<option value="([^"]*)"( selected)?>(.*?)</option>',
+                          select.group(2)) == [
+            (str(i), " selected" if i == 0 else "", f"{n} day" if n == 1 else f"{n} days")
+            for i, n in enumerate(days)]
+        data = TestFilterPage._data(page)
+        assert [d["label"] for d in data["sell_days"]] == [
+            dashboard._sell_days_option(n) for n in days]
+        assert data["sell_days"][2]["phrase"] == \
+            " and at least 3 days before its last market closes"
 
     def test_a_page_without_the_view_says_why(self, monkeypatch, tmp_path):
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep())
         assert re.search(r'<span id="flt-sell-note"[^>]*>([^<]*)</span>', page).group(1) == \
             "(not simulated in this backtest)"
         data = TestFilterPage._data(page)
-        assert (data["grid_sell"], data["sell_levels"], data["sell_state"],
-                data["sidecar_dir"]) == (None, [], "not simulated", None)
+        assert (data["sell_blocks"], data["sell_levels"], data["sell_days"], data["sell_state"],
+                data["sidecar_dir"]) == (None, [], [], "not simulated", None)
+        assert _sl_blocks(page) == []
+        # The Min. days select is there, shut and empty
+        days = re.search(r'<select id="flt-days"([^>]*)>(.*?)</select>', page)
+        assert " disabled" in days.group(1) and days.group(2) == ""
         assert dashboard._SELL_REACH_NO_EXPLORER not in data["text"]["unfiltered"]
         assert not (tmp_path / config.DASHBOARD_FILES_DIRNAME).exists()
         unfit = dataclasses.replace(_kc_sweep(), sell_sweep=_FakeSellSweep({}, ks=(0.75,)))
@@ -10979,15 +11240,17 @@ class TestSoldTradeRow:
 
 
 class TestSellScript:
-    """The bar's Sell select under the page script (run outside a browser):
-    enabled only with the view and set back to no selling on load; a level
-    loads its sidecar file (or the page's own chunk, where the level is above
-    every sale), words the scenario with Python's phrase and note, shows the
-    chunk's own row heads and keeps Save disabled; a file that cannot be
-    loaded, or hands nothing over, puts the choice back in Python's words.
-    The harness's "wait" does not wait on flt-sell (a page without the view
-    keeps it shut), so setup_js adds it. Skipped without a JavaScript
-    runtime."""
+    """The bar's Sell and Min. days to maturity selects under the page script
+    (run outside a browser): Sell enabled only with the view and set back to
+    no selling on load; Min. days shut under no selling and open once a level
+    is chosen; a level first inflates its band's Sell block, then loads its
+    sidecar file (or the page's own chunk, where the setting sells nothing),
+    words the scenario with Python's level and days phrases and note, shows
+    the chunk's own row heads and keeps Save disabled; a block that cannot be
+    inflated, or a file that cannot be loaded or hands nothing over, puts
+    both choices back in Python's words. The harness's "wait" does not wait
+    on flt-sell (a page without the view keeps it shut), so setup_js adds it.
+    Skipped without a JavaScript runtime."""
 
     WAIT = "__BAR.push('flt-sell');"
 
@@ -10997,30 +11260,59 @@ class TestSellScript:
         return _run_script(tmp_path, page, steps, setup_js=cls.WAIT + kwargs.pop("js", ""),
                            files_root=tmp_path, **kwargs)
 
+    @staticmethod
+    def _scenario(data: dict, bi: int, ki: int, ci: int, li: int, di: int) -> str:
+        """A selling scenario in the summary's words, as the script builds it."""
+        return (_phrase(data, bi, ki, ci) + data["sell_levels"][li]["phrase"]
+                + data["sell_days"][di]["phrase"])
+
+    @staticmethod
+    def _di(days: int) -> str:
+        """The Min. days select's value for a number of days."""
+        return str(tuple(config.TAKE_PROFIT_MIN_DAYS).index(days))
+
     def test_the_select_is_enabled_only_with_the_view(self, monkeypatch, tmp_path):
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
         snaps = self._run(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
-                          strict=True, pre=(("flt-sell", "1"),))
+                          strict=True, pre=(("flt-sell", "1"), ("flt-days", "3")))
         assert snaps["loaded"]["selects"]["flt-sell"]["disabled"] is True
-        ready = snaps["ready"]["selects"]["flt-sell"]
-        # A browser's restored choice is set back to the page as rendered
-        assert ready["disabled"] is False and ready["value"] == "none"
+        assert snaps["loaded"]["selects"]["flt-days"]["disabled"] is True
+        ready = snaps["ready"]["selects"]
+        # A browser's restored choice is set back to the page as rendered,
+        # and Min. days stays shut under no selling
+        assert ready["flt-sell"]["disabled"] is False and ready["flt-sell"]["value"] == "none"
+        assert ready["flt-days"]["disabled"] is True and ready["flt-days"]["value"] == "0"
         assert snaps["ready"]["files"] == []
+        assert snaps["ready"]["inflated"] == ["dash-data", "dash-chunk-0"]
         bare = _sl_page(monkeypatch, tmp_path, _kc_sweep())
         snap = _run_script(tmp_path, bare, [
             ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
             ["snap", "s"]], strict=True, files_root=tmp_path)["s"]
         assert snap["selects"]["flt-sell"]["disabled"] is True
+        assert snap["selects"]["flt-days"]["disabled"] is True
         assert snap["inflated"] == ["dash-data", "dash-chunk-0"] and snap["files"] == []
 
-    def test_a_level_loads_its_file_and_words_the_scenario(self, monkeypatch, tmp_path):
+    def test_min_days_opens_with_a_level_and_shuts_without_one(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        steps = [["wait"], ["set", "flt-days", self._di(3)], ["fire", "flt-days"], ["settle"],
+                 ["snap", "ignored"], ["set", "flt-days", "0"],
+                 ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"], ["snap", "sold"],
+                 ["set", "flt-sell", "none"], ["fire", "flt-sell"], ["settle"],
+                 ["snap", "none"]]
+        snaps = self._run(tmp_path, page, steps, strict=True)
+        # Under no selling a days change draws nothing and loads nothing
+        assert snaps["ignored"]["reacts"] == [] and snaps["ignored"]["files"] == []
+        assert snaps["sold"]["selects"]["flt-days"]["disabled"] is False
+        assert snaps["none"]["selects"]["flt-days"]["disabled"] is True
+
+    def test_a_level_inflates_its_band_s_block_then_loads_its_file(self, monkeypatch, tmp_path):
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
         data = TestFilterPage._data(page)
         files = _sidecar_files(page, tmp_path)
-        cid = data["grid_sell"][0][0][0][0][1][1]
+        cid = _sl_page_view(page, 0, 0)[0][0][0][1][1]
         assert cid == 7
         src = f"{data['sidecar_dir']}/chunk-{cid}.js"
-        scenario = _phrase(data, 0, 1, 1) + data["sell_levels"][0]["phrase"]
+        scenario = self._scenario(data, 0, 1, 1, 0, 0)
         steps = [["wait"], ["click", "flt-save"], ["snap", "before"],
                  ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["snap", "loading"],
                  ["settle"], ["snap", "sold"], ["click", "flt-save"], ["snap", "clicked"],
@@ -11033,7 +11325,9 @@ class TestSellScript:
         assert snaps["loading"]["text"]["flt-summary"] == data["text"]["loading"].format(
             scenario=scenario)
         snap = snaps["sold"]
-        assert snap["files"] == [src] and snap["inflated"] == ["dash-data", "dash-chunk-0"]
+        # The band's block first, then the file it names
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-sell-0"]
+        assert snap["files"] == [src]
         assert {r["id"] for r in snap["reacts"]} == _charts_redrawn()
         view = files[src]["list"]["views"]["all"]
         text = dashboard._filter_summary_text(data["text"], scenario, False, None, view["n"],
@@ -11041,6 +11335,9 @@ class TestSellScript:
         note = dashboard._SELL_SUMMARY_NOTE
         assert snap["text"]["flt-summary"] == text.replace(
             data["text"]["unfiltered"], note + data["text"]["unfiltered"])
+        # The summary names the minimum of days after the level
+        assert (data["sell_levels"][0]["phrase"] + " and at least 1 day before its last "
+                "market closes") in snap["text"]["flt-summary"]
         # The trade tables join the chunk's own heads with its tails
         best = files[src]
         assert snap["html"]["diag-best"] == "".join(
@@ -11053,27 +11350,83 @@ class TestSellScript:
         # Back to no selling: the page's own chunk, nothing loaded again, Save on
         none = snaps["none"]
         assert none["files"] == [src] and none["buttons"]["flt-save"] is False
+        assert none["inflated"] == ["dash-data", "dash-chunk-0", "dash-sell-0"]
         assert dashboard._SELL_SUMMARY_NOTE not in none["text"]["flt-summary"]
 
-    def test_a_level_above_every_sale_shows_the_page_s_own_chunk(self, monkeypatch, tmp_path):
+    def test_changing_the_days_loads_another_chunk(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        data = TestFilterPage._data(page)
+        folder = data["sidecar_dir"]
+        # Band 0.3-0.6, k 0.75, 20%, selling at 25%: 1 and 2 days read chunk
+        # 9, 3 days and more chunk 10
+        assert [_sl_page_view(page, 0, int(self._di(n)))[0][0][1][1][1] for n in (1, 2, 3, 21)] \
+            == [9, 9, 10, 10]
+        steps = [["wait"], ["set", "flt-band", "1"], ["set", "flt-sell", "0"],
+                 ["fire", "flt-sell"], ["settle"], ["snap", "one"],
+                 ["set", "flt-days", self._di(3)], ["fire", "flt-days"], ["settle"],
+                 ["snap", "three"], ["set", "flt-days", self._di(2)], ["fire", "flt-days"],
+                 ["settle"], ["snap", "two"]]
+        snaps = self._run(tmp_path, page, steps, strict=True)
+        assert snaps["one"]["files"] == [f"{folder}/chunk-9.js"]
+        three = snaps["three"]
+        assert three["files"] == [f"{folder}/chunk-9.js", f"{folder}/chunk-10.js"]
+        assert three["inflated"] == ["dash-data", "dash-chunk-0", "dash-sell-1"]
+        assert self._scenario(data, 1, 1, 1, 0, 2) in three["text"]["flt-summary"]
+        assert three["selects"]["flt-days"]["value"] == self._di(3)
+        # Back to 2 days: chunk 9 again, kept, nothing loaded
+        assert snaps["two"]["files"] == three["files"]
+        assert self._scenario(data, 1, 1, 1, 0, 1) in snaps["two"]["text"]["flt-summary"]
+
+    def test_a_setting_that_sells_nothing_shows_the_page_s_own_chunk(self, monkeypatch,
+                                                                     tmp_path):
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
         data = TestFilterPage._data(page)
         # k 0.60 at the 5% cap: no sale at 25%, so the run without selling (chunk 3)
-        assert data["grid_sell"][0][0][0][0][0][0] == data["grid"][0][0][0] == 3
+        assert _sl_blocks(page)[0][0][0][0][0] == -1
+        assert _sl_page_view(page, 0, 0)[0][0][0][0][0] == data["grid"][0][0][0] == 3
         steps = [["wait"], ["set", "flt-k", "0"], ["set", "flt-cap", "0"],
                  ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"], ["snap", "s"]]
         snap = self._run(tmp_path, page, steps, strict=True)["s"]
         assert snap["files"] == []
-        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-chunk-3"]
-        assert data["sell_levels"][0]["phrase"] in snap["text"]["flt-summary"]
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-sell-0", "dash-chunk-3"]
+        assert self._scenario(data, 0, 0, 0, 0, 0) in snap["text"]["flt-summary"]
+        # At k 0.75 and 5%, 25% sells at 1 day and nothing from 2 days: the
+        # page's own chunk 1, which the script inflates from the page
+        steps = [["wait"], ["set", "flt-cap", "0"], ["set", "flt-sell", "0"],
+                 ["fire", "flt-sell"], ["settle"], ["set", "flt-days", self._di(2)],
+                 ["fire", "flt-days"], ["settle"], ["snap", "s"]]
+        snap = self._run(tmp_path, page, steps, strict=True)["s"]
+        assert snap["files"] == [f"{data['sidecar_dir']}/chunk-6.js"]
+        assert snap["inflated"][-1] == "dash-chunk-1"
 
-    def test_a_file_that_cannot_be_loaded_puts_the_choice_back(self, monkeypatch, tmp_path):
+    def test_a_block_that_cannot_be_inflated_puts_both_choices_back(self, monkeypatch,
+                                                                    tmp_path):
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
         data = TestFilterPage._data(page)
-        src = f"{data['sidecar_dir']}/chunk-7.js"
+        steps = [["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
+                 ["snap", "s"], ["repair", "dash-sell-0"], ["set", "flt-sell", "0"],
+                 ["fire", "flt-sell"], ["settle"], ["snap", "retried"]]
+        snaps = self._run(tmp_path, page, steps, strict=True, damaged=("dash-sell-0",))
+        snap = snaps["s"]
+        assert snap["text"]["flt-summary"] == data["text"]["unavailable"].format(
+            failed=self._scenario(data, 0, 1, 1, 0, 0),
+            reason="Error: damaged block dash-sell-0", scenario=_phrase(data, 0, 1, 1))
+        assert snap["selects"]["flt-sell"]["value"] == "none"
+        assert snap["selects"]["flt-days"]["value"] == "0"
+        assert snap["selects"]["flt-days"]["disabled"] is True
+        assert snap["files"] == [] and snap["buttons"]["flt-save"] is False
+        # A failed block is not kept: the next choice inflates it again
+        assert snaps["retried"]["inflated"].count("dash-sell-0") == 2
+        assert snaps["retried"]["files"] == [f"{data['sidecar_dir']}/chunk-7.js"]
+
+    def test_a_file_that_cannot_be_loaded_puts_both_choices_back(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        data = TestFilterPage._data(page)
+        folder = data["sidecar_dir"]
+        src = f"{folder}/chunk-7.js"
         steps = [["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
                  ["snap", "s"]]
-        failed = _phrase(data, 0, 1, 1) + data["sell_levels"][0]["phrase"]
+        failed = self._scenario(data, 0, 1, 1, 0, 0)
         for kwargs, template in (({"files_missing": (src,)}, "sidecar_missing"),
                                  ({"files_empty": (src,)}, "sidecar_empty")):
             snap = self._run(tmp_path, page, steps, strict=True, **kwargs)["s"]
@@ -11081,8 +11434,22 @@ class TestSellScript:
             assert snap["text"]["flt-summary"] == data["text"]["unavailable"].format(
                 failed=failed, reason=reason, scenario=_phrase(data, 0, 1, 1))
             assert snap["selects"]["flt-sell"]["value"] == "none"
+            assert snap["selects"]["flt-days"]["disabled"] is True
             assert snap["files"] == [src]
             assert snap["buttons"]["flt-save"] is False
+        # A days change whose file is missing puts the days back too, the level kept
+        later = f"{folder}/chunk-10.js"
+        steps = [["wait"], ["set", "flt-band", "1"], ["set", "flt-sell", "0"],
+                 ["fire", "flt-sell"], ["settle"], ["set", "flt-days", self._di(3)],
+                 ["fire", "flt-days"], ["settle"], ["snap", "s"]]
+        snap = self._run(tmp_path, page, steps, strict=True, files_missing=(later,))["s"]
+        assert snap["selects"]["flt-sell"]["value"] == "0"
+        assert snap["selects"]["flt-days"]["value"] == "0"
+        assert snap["selects"]["flt-days"]["disabled"] is False
+        assert snap["text"]["flt-summary"] == data["text"]["unavailable"].format(
+            failed=self._scenario(data, 1, 1, 1, 0, 2),
+            reason="Error: " + data["text"]["sidecar_missing"].format(file=later),
+            scenario=self._scenario(data, 1, 1, 1, 0, 0))
 
     def test_a_later_choice_supersedes_a_file_still_loading(self, monkeypatch, tmp_path):
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
@@ -11100,18 +11467,86 @@ class TestSellScript:
         assert data["sell_levels"][1]["phrase"] in snap["text"]["flt-summary"]
         assert snap["selects"]["flt-sell"]["value"] == "1"
 
+    def test_a_later_choice_supersedes_a_block_still_inflating(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        data = TestFilterPage._data(page)
+        folder = data["sidecar_dir"]
+        # A level at band 0.0-1, whose block waits; then band 0.3-0.6, whose
+        # block inflates at once: that is drawn, and the first block, once it
+        # arrives, draws nothing over it (and is kept)
+        steps = [["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
+                 ["snap", "waiting"], ["set", "flt-band", "1"], ["fire", "flt-band"],
+                 ["settle"], ["snap", "other"], ["resolve", "dash-sell-0"], ["snap", "s"]]
+        snaps = self._run(tmp_path, page, steps, strict=True, deferred=("dash-sell-0",))
+        assert snaps["waiting"]["pending"] == ["dash-sell-0"]
+        assert snaps["waiting"]["files"] == [] and snaps["waiting"]["reacts"] == []
+        other = snaps["other"]
+        assert other["files"] == [f"{folder}/chunk-9.js"]
+        assert self._scenario(data, 1, 1, 1, 0, 0) in other["text"]["flt-summary"]
+        snap = snaps["s"]
+        assert snap["reacts"] == [] and snap["files"] == other["files"]
+        assert snap["text"]["flt-summary"] == other["text"]["flt-summary"]
+        assert snap["selects"]["flt-band"]["value"] == "1"
+
+    def test_tiers_off_at_a_band_they_never_bind_reads_the_tier_on_block(self, monkeypatch,
+                                                                         tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_tiers()))
+        data = TestFilterPage._data(page)
+        folder = data["sidecar_dir"]
+        # Blocks: band 0.0-1 and 0.3-0.6 with the tiers on, then 0.0-1 off;
+        # 0.3-0.6 off names its tier-on block
+        assert data["sell_blocks"] == [[0, 1], [2, 1]]
+        steps = [["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
+                 ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"],
+                 ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"], ["snap", "s"],
+                 ["set", "flt-sell", "1"], ["fire", "flt-sell"], ["settle"], ["snap", "50"],
+                 ["set", "flt-sell", "0"], ["set", "flt-band", "0"], ["fire", "flt-band"],
+                 ["settle"], ["snap", "binding"]]
+        snaps = self._run(tmp_path, page, steps, strict=True)
+        snap = snaps["s"]
+        assert "dash-sell-1" in snap["inflated"] and "dash-sell-2" not in snap["inflated"]
+        # The tier-on run's sidecar at 25%
+        cid = _sl_page_view(page, 0, 0)[1][0][1][1][1]
+        assert cid == _sl_page_view(page, 0, 0)[0][0][1][1][1] >= data["inline_chunks"]
+        assert snap["files"] == [f"{folder}/chunk-{cid}.js"]
+        # At 50% it sells nothing: the tier-off view's own chunk — its tier-on
+        # run's, drawn just before and kept, so nothing is loaded
+        own = data["grid_off"][1][1][1]
+        assert own == data["grid"][1][1][1] == 4
+        fifty = snaps["50"]
+        assert fifty["inflated"] == snap["inflated"] and fifty["files"] == snap["files"]
+        view = TestFilterPage._chunks(page)[own]["list"]["views"]["all"]
+        scenario = (_phrase_off(data, 1, 1, 1) + data["sell_levels"][1]["phrase"]
+                    + data["sell_days"][0]["phrase"])
+        text = dashboard._filter_summary_text(data["text"], scenario, False, None, view["n"],
+                                              view["n"])
+        assert fifty["text"]["flt-summary"] == text.replace(
+            data["text"]["unfiltered"], dashboard._SELL_SUMMARY_NOTE + data["text"]["unfiltered"])
+        # Band 0.0-1, where the tiers bind, reads its own tier-off block and
+        # the sidecar of its run with the tiers off
+        binding = snaps["binding"]
+        assert binding["inflated"][-1] == "dash-sell-2"
+        off_cid = _sl_page_view(page, 0, 0)[1][0][0][1][1]
+        assert off_cid != _sl_page_view(page, 0, 0)[0][0][0][1][1]
+        assert binding["files"][-1] == f"{folder}/chunk-{off_cid}.js"
+
 
 class TestSellEndToEnd:
     """A real run_backtest_sweep with the Sell family, over the backtester's
-    selling golden fixture narrowed to one band and one k, rendered through
-    generate_dashboard: every level's chunk at every cap is what a fresh
-    simulation selling at that level produces — a sidecar file where it
-    sells, the page's own chunk where it does not."""
+    selling golden fixture narrowed to one band and one k, four sell levels
+    and three minimum-days options, rendered through generate_dashboard:
+    every (level, minimum, cap) chunk is what a fresh simulation selling at
+    that level with that minimum produces — a sidecar file where it sells,
+    the page's own chunk where it does not. The fixture's sales come 13, 20,
+    26, 33, 53 and 60 days before maturity, so 1, 14 and 30 days give cells
+    that are simulated, cells that repeat an earlier run and cells that sell
+    nothing; the build's closing line says so."""
 
     _START = _tb.TestPrepareEntriesGolden._START
+    _DAYS = (1, 14, 30)
 
-    @staticmethod
-    def _run(monkeypatch) -> BacktestSweep:
+    @classmethod
+    def _run(cls, monkeypatch) -> BacktestSweep:
         """The selling golden fixture through run_backtest_sweep with every family on."""
         golden = _tb._SellingGolden()
         golden._patch(monkeypatch)
@@ -11119,24 +11554,28 @@ class TestSellEndToEnd:
         monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
         monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
         monkeypatch.setattr(backtester, "TAKE_PROFIT_LEVELS", (0.05, 0.25, 0.5, 1.0))
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_MIN_DAYS", cls._DAYS)
         return backtester.run_backtest_sweep(
             MagicMock(), MagicMock(), golden._START, 10_000.0, same_event_ladders=True,
             interval_discount=0.5, band_sweep=True, tier_off_sweep=True, cap_sweep=True,
             add_on_sweep=True, sell_sweep=True)
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
-    def test_every_level_pages_its_own_simulation(self, monkeypatch, tmp_path):
+    def test_every_setting_pages_its_own_simulation(self, monkeypatch, tmp_path, caplog):
         run = self._run(monkeypatch)
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        page = dashboard.generate_dashboard(
-            run.primary.trades, run.primary.equity_df, self._START, 10_000.0,
-            sweep=run).read_text(encoding="utf-8")
+        with caplog.at_level(logging.INFO):
+            page = dashboard.generate_dashboard(
+                run.primary.trades, run.primary.equity_df, self._START, 10_000.0,
+                sweep=run).read_text(encoding="utf-8")
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         files = {int(src.rsplit("-", 1)[1][:-3]): chunk
                  for src, chunk in _sidecar_files(page, tmp_path).items()}
         sell, band = run.sell_sweep, (0.0, 1.0)
+        assert sell.min_days == self._DAYS
+        assert [d["value"] for d in data["sell_days"]] == list(self._DAYS)
         end = run.primary.equity_df["date"].iloc[-1]
         sold = shared = 0
         for tier_floors in (True, False):
@@ -11145,29 +11584,39 @@ class TestSellEndToEnd:
             for add_to_held in (False, True):
                 a = 1 if add_to_held else 0
                 for li, level in enumerate(sell.levels):
-                    for ci, cap in enumerate(sell.caps):
-                        cid = data["grid_sell"][li][t][a][0][0][ci]
-                        assert cid is not None
-                        fresh = backtester._simulate_at_discount(
-                            entries, self._START, 10_000.0, k=0.5, spread_band=band,
-                            size_cap=cap, quiet=True, end_date=end, tier_floors=tier_floors,
-                            add_to_held=add_to_held, sell_at=level)
-                        chunk = files[cid] if cid >= data["inline_chunks"] else chunks[cid]
-                        view = chunk["list"]["views"]["all"]
-                        kpis = dashboard._performance_kpis(fresh.equity_df, fresh.trades,
-                                                           10_000.0)
-                        assert view["kpi"] == {key: value for key, _, value, _ in kpis}, (
-                            tier_floors, add_to_held, level, cap)
-                        assert view["n"] == len(fresh.trades)
-                        if any(tr.sold for tr in fresh.trades):
-                            assert cid >= data["inline_chunks"]
-                            sold += 1
-                        else:
-                            # Above every sale: the scenario's own chunk
-                            assert cid == _sl_flat_base(data, t, a)[ci]
-                            shared += 1
-        # Not vacuous either way
+                    for di, min_days in enumerate(sell.min_days):
+                        view_ids = _sl_page_view(page, li, di)[t][a][0][0]
+                        for ci, cap in enumerate(sell.caps):
+                            cid = view_ids[ci]
+                            assert cid is not None
+                            fresh = backtester._simulate_at_discount(
+                                entries, self._START, 10_000.0, k=0.5, spread_band=band,
+                                size_cap=cap, quiet=True, end_date=end,
+                                tier_floors=tier_floors, add_to_held=add_to_held,
+                                sell_at=level, sell_min_days=min_days)
+                            chunk = files[cid] if cid >= data["inline_chunks"] else chunks[cid]
+                            view = chunk["list"]["views"]["all"]
+                            kpis = dashboard._performance_kpis(fresh.equity_df, fresh.trades,
+                                                               10_000.0)
+                            assert view["kpi"] == {key: value for key, _, value, _ in kpis}, (
+                                tier_floors, add_to_held, level, min_days, cap)
+                            assert view["n"] == len(fresh.trades)
+                            if any(tr.sold for tr in fresh.trades):
+                                assert cid >= data["inline_chunks"]
+                                sold += 1
+                            else:
+                                # Sells nothing: the scenario's own chunk
+                                assert cid == _sl_flat_base(data, t, a)[ci]
+                                shared += 1
+        # Not vacuous either way, and every kind of cell occurred: simulated,
+        # repeating an earlier run, and selling nothing
         assert sold > 0 and shared > 0
+        built = [r.getMessage() for r in caplog.records
+                 if r.getMessage().startswith("Dashboard: Sell select built")]
+        assert len(built) == 1
+        counts = re.search(r"(\d+) cap points simulated, \d+ shared across caps, (\d+) cells "
+                           r"repeating an earlier run, (\d+) cells without a sale", built[0])
+        assert counts and all(int(n) > 0 for n in counts.groups()), built[0]
 
 
 class TestExplorerFullGrid:

@@ -457,12 +457,26 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 # the bids would return, after the sale's fees, less what it cost) has stayed at
 # or above this share of its potential profit (its contract pairs at
 # CONTRACT_PAYOUT_DOLLARS less what it cost) for TAKE_PROFIT_HOLD_DAYS days in a
-# row. Every 5% from 5% to 100%. BACKTEST-ONLY: live trading
-# never sells a position (no live module reads this). Read by
-# backtester.run_backtest_sweep(sell_sweep=True), whose lazy SellSweep
-# simulates each level when the dashboard reads it.
-TAKE_PROFIT_LEVELS = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
-                      0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00)
+# row. Every 1% from 80% to 100%, 21 levels, each the float nearest its percent
+# over 100 (so 81% is exactly the float 0.81). BACKTEST-ONLY: live trading
+# never sells a position (no live module reads this). Distinct shares in
+# (0, 1]. Read by backtester.run_backtest_sweep(sell_sweep=True), which checks
+# them before its fetch, and whose lazy SellSweep simulates each level when the
+# dashboard reads it.
+TAKE_PROFIT_LEVELS = tuple(percent / 100 for percent in range(80, 101))
+
+# The minimum-days options the backtest dashboard offers beside each sell level:
+# a position that has reached its level (TAKE_PROFIT_LEVELS) is sold only if at
+# least this many days remain before it matures, and is otherwise held until it
+# pays out. A position matures on the date its last market stops trading (the
+# latest close date among its markets); the days are UTC calendar days from the
+# checkpoint's date to that date, so 1 holds back only a position whose last
+# market closes on or before the checkpoint's own date, and 21 sells only one
+# with three weeks or more to go. Whole numbers of at least 1, none repeated.
+# BACKTEST-ONLY, like TAKE_PROFIT_LEVELS: read by
+# backtester.run_backtest_sweep(sell_sweep=True), which checks them before its
+# fetch, and by the SellSweep it returns (_simulate_at_discount's sell_min_days).
+TAKE_PROFIT_MIN_DAYS = (1, 2, 3, 4, 5, 6, 7, 14, 21)
 
 # How many days in a row a position must stay at or above its sell level
 # (TAKE_PROFIT_LEVELS) before the backtest sells it, so a price that jumps for

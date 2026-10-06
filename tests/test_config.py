@@ -1354,6 +1354,30 @@ class TestTakeProfitHoldDays:
         assert type(config.TAKE_PROFIT_HOLD_DAYS) is int
 
 
+class TestTakeProfitLevelsAndMinDays:
+    """TAKE_PROFIT_LEVELS and TAKE_PROFIT_MIN_DAYS: the backtest dashboard's
+    sell levels and its minimum-days options (backtest-only).
+
+    The levels are every 1% from 80% to 100%, each the float nearest its
+    percent over 100, so a level prints as its percent (0.81 reads "81") and
+    equals the literal a test or a reader would write. The day options are
+    1 to 7, 14 and 21, ascending whole numbers, none repeated, which
+    backtester.run_backtest_sweep checks before its fetch.
+    """
+
+    def test_twenty_one_levels_from_80_to_100_percent_ship(self):
+        assert len(config.TAKE_PROFIT_LEVELS) == 21
+        assert config.TAKE_PROFIT_LEVELS[0] == 0.80 and config.TAKE_PROFIT_LEVELS[-1] == 1.0
+        assert config.TAKE_PROFIT_LEVELS == tuple(sorted(set(config.TAKE_PROFIT_LEVELS)))
+        for percent, level in zip(range(80, 101), config.TAKE_PROFIT_LEVELS, strict=True):
+            assert level == float(f"0.{percent}" if percent < 100 else "1.0")
+            assert type(level) is float
+
+    def test_nine_day_options_ship(self):
+        assert config.TAKE_PROFIT_MIN_DAYS == (1, 2, 3, 4, 5, 6, 7, 14, 21)
+        assert all(type(days) is int for days in config.TAKE_PROFIT_MIN_DAYS)
+
+
 class TestDescribeTimeSeriesRule:
     """describe_time_series_rule says "no spread band" for (0, 1) alone and
     names any band with a floor or a ceiling of its own."""

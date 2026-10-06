@@ -183,9 +183,11 @@ Notes:
     The "Sell" family is ON by default too (sell_sweep=True): the result
     carries a lazy SellSweep (BacktestSweep.sell_sweep) that simulates, when
     the dashboard is built, every scenario selling a position early at each
-    level of config.TAKE_PROFIT_LEVELS. It simulates nothing during the run;
-    --no-sell-sweep skips it, leaving the dashboard's Sell select disabled.
-    Live trading never sells.
+    level of config.TAKE_PROFIT_LEVELS with each minimum of days before
+    maturity of config.TAKE_PROFIT_MIN_DAYS (the dashboard's Sell and Min.
+    days to maturity selects). It simulates nothing during the run;
+    --no-sell-sweep skips it, leaving both selects disabled. Live trading
+    never sells.
 
     The pre-fetch echo's "live rule=" clause names the saved live defaults'
     time-series rule and, when one is set, their category/tag filter (never
@@ -551,12 +553,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--no-sell-sweep", action="store_true",
-        help="Skip the dashboard's Sell select (sell a whole position once it has "
-             "held a chosen share of the profit it could make for "
-             "config.TAKE_PROFIT_HOLD_DAYS days in a row): its simulations run "
-             "only while the dashboard is built, so skipping them makes that step "
-             "much faster and leaves the select disabled. Backtest only — live "
-             "trading never sells a position",
+        help="Skip the dashboard's Sell and Min. days to maturity selects (sell a "
+             "whole position once it has held a chosen share of the profit it could "
+             "make for config.TAKE_PROFIT_HOLD_DAYS days in a row, while at least a "
+             "chosen number of days remain before its last market stops trading): "
+             "their simulations run only while the dashboard is built, so skipping "
+             "them makes that step much faster and leaves both selects disabled. "
+             "Backtest only — live trading never sells a position",
     )
     parser.add_argument(
         "--sell-workers", type=int, default=None, metavar="N",

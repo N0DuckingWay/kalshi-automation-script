@@ -14,7 +14,7 @@ import textwrap
 import time
 import weakref
 from array import array
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import astuple, fields
 from dataclasses import replace as dc_replace
 from datetime import UTC, date, datetime, timedelta, timezone
@@ -17445,10 +17445,10 @@ class TestSellingWithAddOns:
     def _records(self, mondays) -> list[dict]:
         return _quoted([TestSellAtShareOfPotentialProfit._record(mondays)], self._candles())
 
-    def _sim(self, records, sell_at=None):
+    def _sim(self, records, sell_at=None, **kw):
         return backtester._simulate_at_discount(
             records, self._START, 10_000.0, k=0.75, size_cap=1.0,
-            end_date=date(2026, 4, 1), add_to_held=True, sell_at=sell_at)
+            end_date=date(2026, 4, 1), add_to_held=True, sell_at=sell_at, **kw)
 
     _MONDAYS = (_LADDER_M1, (_LADDER_M2, 0.15, 0.65, 0.35))
 
@@ -17625,7 +17625,7 @@ class TestSaleNeedsDaysInARow:
         # A run that never sells never reads it; the shortcut does
         base = suite._sim(records)
         with pytest.raises(ValueError, match="TAKE_PROFIT_HOLD_DAYS"):
-            backtester._highest_sale_level(base, (0.25,))
+            backtester._sale_reach(base, (0.25,))
         # run_backtest_sweep refuses it before anything is fetched, and only
         # with the sell family on
         monkeypatch.setattr(backtester, "_prepare_candidates",
@@ -17641,6 +17641,409 @@ class TestSaleNeedsDaysInARow:
         assert backtester._hold_days_text(1) == "once it reaches a level at a checkpoint"
         assert backtester._hold_days_text(3) == (
             "once it has stayed at or above a level for 3 days in a row")
+
+
+class TestSellMinDays:
+    """_simulate_at_discount(sell_min_days=N) sells a position at its level
+    only while at least N days remain before it matures: the date its last
+    market stops trading — the latest close date among its trades' markets
+    — counted in calendar days from the checkpoint's date (_days_left).
+    Nearer than that the position is not even valued, and it is held until
+    it pays out. None, the default, sets no minimum.
+
+    The fixture: TestSellAtShareOfPotentialProfit's pair (YES on SA, NO on
+    SB, bought on Monday 1 at k 0.75 and no cap), whose Monday 2 bids reach
+    25% of its potential profit, with its markets' close dates set per test
+    (each market pays out on its close date, as _ladder_market builds it)."""
+
+    _START = TestSellAtShareOfPotentialProfit._START
+    _BALANCE = TestSellAtShareOfPotentialProfit._BALANCE
+    _sim = TestSellAtShareOfPotentialProfit._sim
+
+    @staticmethod
+    def _records(close_a: str, close_b: str, extra=()) -> list[dict]:
+        """The pair with SA closing on close_a and SB on close_b, with its
+        quotes, followed by `extra` records (no candles, so no quotes)."""
+        suite = TestSellAtShareOfPotentialProfit
+        rec = suite._record(a=_ladder_market("SA", "EVS-1", close_a),
+                            b=_ladder_market("SB", "EVS-2", close_b))
+        return _quoted([rec, *extra], suite._candles())
+
+    @staticmethod
+    def _other() -> dict:
+        """O: another pair, unquoted, a candidate on Monday 2 only."""
+        return _ladder_record(_ladder_market("OA", "EVO-1", "2026-03-20"),
+                              _ladder_market("OB", "EVO-2", "2026-03-20"), "o", [_LADDER_M2])
+
+    @pytest.mark.parametrize("with_candidate", [False, True])
+    def test_a_position_too_near_maturity_is_held_to_pay_out(self, with_candidate):
+        # SB, the later market, closes on 01-15: three days after Monday 2
+        # (01-12), where the pair reaches 25%. Without a candidate on Monday 2
+        # the walk decides there with its quick test (_position_sells); with
+        # O as a candidate, in its sale step before the candidates. Both
+        # apply the days rule
+        extra = [self._other()] if with_candidate else []
+        records = self._records("2026-01-14", "2026-01-15", extra)
+        base = self._sim(records)
+        assert not any(t.sold for t in base.trades)
+        assert _traded(base) == [("SA", _LADDER_M1)] + (
+            [("OA", _LADDER_M2)] if with_candidate else [])
+        for min_days in (None, 1, 2, 3):
+            point = self._sim(records, 0.25, sell_min_days=min_days)
+            sold = point.trades[0]
+            assert sold.ticker_a == "SA" and sold.sold and sold.exit_date == _LADDER_M2
+            assert [check.days_left for check in point.sales] == [3]
+            assert point.sell_min_days == min_days
+        # Four days required: held to pay out, exactly the run that never sells
+        held = self._sim(records, 0.25, sell_min_days=4)
+        assert held.sales == () and held.sell_min_days == 4
+        assert [astuple(t) for t in held.trades] == [astuple(t) for t in base.trades]
+        pd.testing.assert_frame_equal(held.equity_df, base.equity_df, check_exact=True)
+
+    @pytest.mark.parametrize("close_a, close_b", [("2026-01-14", "2026-01-22"),
+                                                  ("2026-01-22", "2026-01-14")])
+    def test_the_market_that_closes_last_sets_maturity(self, close_a, close_b):
+        # One market closes 2 days after Monday 2, the other 10: the position
+        # matures with the later one, whichever leg it is
+        records = self._records(close_a, close_b)
+        base = self._sim(records)
+        for min_days in (3, 10):
+            point = self._sim(records, 0.25, sell_min_days=min_days)
+            (sold,) = point.trades
+            # A rule reading the earlier close (2 days) would hold it at 3
+            assert sold.sold and sold.exit_date == _LADDER_M2
+            assert [check.days_left for check in point.sales] == [10]
+        held = self._sim(records, 0.25, sell_min_days=11)
+        assert not held.trades[0].sold
+        assert [astuple(t) for t in held.trades] == [astuple(t) for t in base.trades]
+
+    def test_one_day_differs_from_no_minimum_only_when_the_last_market_closes_that_day(self):
+        # Both markets close at 20:00 UTC on Monday 2 itself, after its
+        # checkpoint (17:00 UTC), and pay out the next day: 0 days left, so
+        # no minimum sells there and a 1-day minimum holds the position
+        suite = TestSellAtShareOfPotentialProfit
+
+        def closing(ticker, event, close):
+            return dict(_ladder_market(ticker, event, "2026-01-14"),
+                        close_time=f"{close}T20:00:00+00:00")
+
+        def records(close_b):
+            rec = suite._record(a=closing("SA", "EVS-1", "2026-01-12"),
+                                b=closing("SB", "EVS-2", close_b))
+            return _quoted([rec], suite._candles())
+
+        same_day = records("2026-01-12")
+        assert self._sim(same_day, 0.25).sales[0].days_left == 0
+        assert self._sim(same_day, 0.25).trades[0].exit_date == _LADDER_M2
+        held = self._sim(same_day, 0.25, sell_min_days=1)
+        assert [astuple(t) for t in held.trades] == [
+            astuple(t) for t in self._sim(same_day).trades]
+        # SB closing the next day: 1 day left, and a 1-day minimum sells as no minimum does
+        next_day = records("2026-01-13")
+        assert [astuple(t) for t in self._sim(next_day, 0.25, sell_min_days=1).trades] == [
+            astuple(t) for t in self._sim(next_day, 0.25).trades]
+        assert self._sim(next_day, 0.25, sell_min_days=1).trades[0].sold
+
+    def test_a_lone_leg_add_on_matures_with_its_latest_market(self):
+        # A pair X/Y and a lone-leg add-on Z/Y bought once X paid out:
+        # _positions joins them through Y into the one position a sale sells
+        # whole, which matures when Z, its last market, closes
+        trade = TestSweepHelpers._trade("E", 1.0)
+        pair = dc_replace(trade, ticker_a="X", ticker_b="Y",
+                          close_date_a=date(2026, 1, 14), close_date_b=date(2026, 1, 20))
+        add_on = dc_replace(trade, ticker_a="Z", ticker_b="Y", add_on=True,
+                            close_date_a=date(2026, 2, 2), close_date_b=date(2026, 1, 20))
+        (position,) = backtester._positions([pair, add_on])
+        assert backtester._days_left(position, _LADDER_M2) == 21
+        assert backtester._far_enough(position, _LADDER_M2, 21)
+        assert not backtester._far_enough(position, _LADDER_M2, 22)
+        # The pair alone would mature with Y, 8 days after Monday 2
+        assert backtester._days_left([pair], _LADDER_M2) == 8
+        assert not backtester._far_enough([pair], _LADDER_M2, 9)
+
+    def test_a_position_without_a_close_date_is_never_sold_under_a_minimum(self):
+        # The fixture's own close dates: SB closes on 03-20, 67 days after
+        # Monday 2. The quick test applies the days rule before the checks
+        records = self._records("2026-02-10", "2026-03-20")
+        (trade,) = self._sim(records).trades
+        hold = backtester._resolve_hold_days()
+        assert backtester._days_left([trade], _LADDER_M2) == 67
+        assert backtester._position_sells(0.25, [trade], _LADDER_M2, hold)
+        assert backtester._position_sells(0.25, [trade], _LADDER_M2, hold, 67)
+        assert not backtester._position_sells(0.25, [trade], _LADDER_M2, hold, 68)
+        # Without a close date its days left are unknown: it sells with no
+        # minimum, never with one
+        bare = dc_replace(trade, close_date_b=None)
+        assert backtester._days_left([bare], _LADDER_M2) is None
+        assert backtester._position_sells(0.25, [bare], _LADDER_M2, hold)
+        assert not backtester._position_sells(0.25, [bare], _LADDER_M2, hold, 1)
+        assert backtester._far_enough([bare], _LADDER_M2, None)
+        assert not backtester._far_enough([bare], _LADDER_M2, 1)
+
+    @pytest.mark.parametrize("bad", [0, -1, True, np.bool_(True), 1.5, 3.0, "3"])
+    def test_a_bad_minimum_is_refused_before_any_entry_is_scored(self, bad):
+        # [{}] raises KeyError the moment Pass 1b scores it (checked below),
+        # so a ValueError here was raised before any entry was scored
+        with pytest.raises(ValueError, match="sell_min_days must be a whole number"):
+            self._sim([{}], 0.25, sell_min_days=bad)
+
+    def test_a_minimum_needs_a_sell_level_and_numpy_whole_numbers_are_whole(self):
+        with pytest.raises(ValueError, match="sell_min_days needs sell_at"):
+            self._sim([{}], None, sell_min_days=3)
+        with pytest.raises(KeyError):
+            self._sim([{}], 0.25, sell_min_days=3)
+        point = self._sim(self._records("2026-02-10", "2026-03-20"), 0.25,
+                          sell_min_days=np.int64(3))
+        assert point.sell_min_days == 3 and type(point.sell_min_days) is int
+        assert point.trades[0].sold
+
+    def test_the_completion_line_names_the_minimum(self, caplog):
+        records = self._records("2026-02-10", "2026-03-20")
+        with caplog.at_level(logging.INFO):
+            for min_days in (3, 1, None):
+                self._sim(records, 0.25, sell_min_days=min_days)
+        label = "k=0.750, band 0-1, all, selling at 25% of potential profit"
+        assert _completion_lines(caplog) == [
+            f"Backtest complete at {label}, at least 3 days before maturity: "
+            "1 trades, 1 profitable",
+            f"Backtest complete at {label}, at least 1 day before maturity: "
+            "1 trades, 1 profitable",
+            f"Backtest complete at {label}: 1 trades, 1 profitable"]
+        lines = [r.getMessage() for r in caplog.records]
+        assert (f"Positions sold before they paid out ({label}, at least 3 days before "
+                "maturity): 1") in lines
+        assert backtester._sale_label(0.25) == "selling at 25% of potential profit"
+
+    def test_sales_record_one_check_per_position_sold(self):
+        suite = TestSellAtShareOfPotentialProfit()
+        records = _quoted([suite._record()], suite._candles())
+        base = suite._sim(records)
+        assert base.sales is None and base.sell_min_days is None
+        # A level no position reaches: a selling run that sold nothing
+        assert suite._sim(records, 0.70).sales == ()
+        point = suite._sim(records, 0.25)
+        (check,) = point.sales
+        (held,) = base.trades
+        # 67 days from Monday 2 (01-12) to SB's close on 03-20
+        assert check.days_left == 67
+        # The profits the sale read at its checkpoint and each day before it
+        readings = backtester._hold_readings([held], _LADDER_M2,
+                                             backtester._resolve_hold_days())
+        assert check.profits == tuple(readings[1])
+        assert len(check.profits) == backtester.TAKE_PROFIT_HOLD_DAYS
+        cost = held.total_cost + held.fees
+        for _realized, potential in check.profits:
+            assert potential == pytest.approx(held.n - cost, abs=1e-9)
+        assert backtester._reached_every_day(0.25, list(check.profits))
+        assert not backtester._reached_every_day(0.50, list(check.profits))
+        # A position of two trades — a pair and its add-on, sold together on
+        # Monday 3 — is one check, 60 days before SB closes
+        adds = TestSellingWithAddOns()
+        together = adds._sim(adds._records(TestSellingWithAddOns._MONDAYS), 0.25)
+        assert len(together.trades) == 2 and all(t.sold for t in together.trades)
+        assert [check.days_left for check in together.sales] == [60]
+        # How the trades came about: neither compared nor printed
+        sales = next(f for f in fields(backtester.SweepPoint) if f.name == "sales")
+        assert sales.compare is False and sales.repr is False
+
+
+class TestSalesComeBeforePurchases:
+    """At an entry checkpoint the walk pays out the day's settlements, then
+    sells, then values the portfolio, then takes the day's candidates — new
+    pairs and add-ons alike. So a sale's proceeds fund that checkpoint's
+    trades, every trade there is sized on the portfolio value after the
+    sales, and a sold pair is neither bought nor added to there. Each case is
+    built so that buying before selling would give another result, and is
+    checked with no minimum of days before maturity and with one that does
+    not hold the sale back: the days rule sits inside the sale step, so it
+    cannot move the order.
+
+    The fixture, at k 0.05 and no cap, so that Kelly bets nearly everything:
+    P (TestSellAtShareOfPotentialProfit's pair, quoted: YES on SA, NO on SB)
+    takes about 94.6% of the $10,000 on Monday 1 and reaches 25% of its
+    potential profit on Monday 2, 67 days before SB closes. R (RA/RB, no
+    quotes, so valued at cost and never sold) ranks below P on Monday 1 and
+    takes the cash P leaves, leaving less than one contract pair of Q (QA/QB,
+    no quotes; $0.96 a contract pair with fees). Every trade is checked
+    against the live sizer on the same portfolio value and cash."""
+
+    _START = date(2026, 1, 1)
+    _BALANCE = 10_000.0
+    _K = 0.05
+    _Q_QUOTES = (0.30, 0.40, 0.62)    # pA, pB, nB: Q buys YES at 0.30 and NO at 0.62
+
+    def _sim(self, records, sell_at=None, **kw):
+        return backtester._simulate_at_discount(
+            records, self._START, self._BALANCE, k=self._K, size_cap=1.0,
+            end_date=date(2026, 4, 1), sell_at=sell_at, **kw)
+
+    @staticmethod
+    def _filler(mondays=(_LADDER_M1,)) -> dict:
+        """R, quoted the same on each of `mondays`."""
+        return _ladder_record(_ladder_market("RA", "EVR-1", "2026-03-20"),
+                              _ladder_market("RB", "EVR-2", "2026-03-20"), "r",
+                              [(monday, 0.30, 0.60, 0.45) for monday in mondays])
+
+    @classmethod
+    def _new_pair(cls, monday: date) -> dict:
+        """Q, a candidate on `monday` only."""
+        return _ladder_record(_ladder_market("QA", "EVQ-1", "2026-03-20"),
+                              _ladder_market("QB", "EVQ-2", "2026-03-20"), "q",
+                              [(monday, *cls._Q_QUOTES)])
+
+    @staticmethod
+    def _records(*extra, p_mondays=(_LADDER_M1,)) -> list[dict]:
+        """P (with its quotes), then `extra` (none have candles, so no quotes)."""
+        suite = TestSellAtShareOfPotentialProfit
+        return _quoted([suite._record(p_mondays), *extra], suite._candles())
+
+    @classmethod
+    def _live(cls, rec: dict, monday: date, value: float, cash: float, *,
+              held: HeldPair | None = None, add_to_held: bool = False):
+        """The spec live compute_trade sizes for `rec`'s quotes on `monday`, on
+        a portfolio value and a cash in dollars, taken in whole cents as the
+        backtest hands them over (backtester._cents), with the simulation's
+        settings; None when it sizes nothing."""
+        entry = next(m for m in backtester._entry_mondays(rec["entry"])
+                     if m["entry_date"] == monday)
+        pair = CandidatePair(
+            market_a=scanner._market_from_dict(entry["mA"], ""),
+            market_b=scanner._market_from_dict(entry["mB"], ""),
+            pA=entry["pA"], pB=entry["pB"], nA=entry["nA"], nB=entry["nB"], tradeable=True,
+            canonical_title=str(rec["canon"]), pair_type="time_series",
+            stated_gap_days=entry["gap_days"], held=held)
+        settings = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
+                                interval_discount=cls._K, size_cap=1.0,
+                                same_title_size_cap=backtester.SAME_TITLE_SIZE_CAP,
+                                add_to_held_pairs=add_to_held)
+        return compute_trade(pair, backtester._cents(value), settings=settings,
+                             cash_cents=backtester._cents(cash))
+
+    def _unsold(self, records, **kw):
+        """The run that never sells: P and R bought on Monday 1, and the cash
+        they leave."""
+        held = self._sim(records, **kw)
+        p, r = held.trades[:2]
+        assert (p.ticker_a, r.ticker_a) == ("SA", "RA")
+        cash = self._BALANCE - (p.total_cost + p.fees) - (r.total_cost + r.fees)
+        # Less than one contract pair of Q
+        assert 0 <= cash < _pair_cost(1, self._Q_QUOTES[0], self._Q_QUOTES[2])
+        return held, p, r, cash
+
+    @pytest.mark.parametrize("min_days", [None, 3])
+    def test_a_sale_funds_a_new_pair_at_its_own_checkpoint(self, min_days):
+        q = self._new_pair(_LADDER_M2)
+        records = self._records(self._filler(), q)
+        held, p, r, cash_before = self._unsold(records)
+        # CONTROL: without selling, Q is not bought on Monday 2 ...
+        assert _traded(held) == [("SA", _LADDER_M1), ("RA", _LADDER_M1)]
+        # ... nor would the live sizer buy it on Monday 2's value before the
+        # sale (P at market): a walk that bought before it sold buys nothing
+        value_before = cash_before + backtester._open_value(p, _LADDER_M2) + r.total_cost
+        assert self._live(q, _LADDER_M2, value_before, cash_before) is None
+
+        point = self._sim(records, 0.25, sell_min_days=min_days)
+        assert _traded(point) == [("SA", _LADDER_M1), ("RA", _LADDER_M1), ("QA", _LADDER_M2)]
+        p_sold, r_kept, q_trade = point.trades
+        assert p_sold.sold and p_sold.exit_date == _LADDER_M2
+        assert astuple(r_kept) == astuple(r)
+        assert [check.days_left for check in point.sales] == [67]
+        # Q is sized on Monday 2's value after the sale: the cash with the
+        # sale's proceeds, plus R at cost — below the value before it (the
+        # sale is at the bids, less its fees; P was valued at the asks)
+        cash_after = cash_before + p_sold.actual_payoff
+        assert q_trade.balance_at_entry == pytest.approx(cash_after + r.total_cost, abs=1e-6)
+        assert q_trade.balance_at_entry < value_before
+        spec = self._live(q, _LADDER_M2, q_trade.balance_at_entry, cash_after)
+        assert spec is not None and spec.x == q_trade.n > 0
+        assert spec.total_cost_with_fees == pytest.approx(q_trade.total_cost + q_trade.fees,
+                                                          abs=1e-9)
+
+    @pytest.mark.parametrize("min_days", [None, 3])
+    def test_a_sale_funds_an_add_on_at_its_own_checkpoint(self, min_days):
+        # R passes Monday 2 too: with add_to_held, an add-on to R there
+        r_rec = self._filler((_LADDER_M1, _LADDER_M2))
+        records = self._records(r_rec)
+        held, p, r, cash_before = self._unsold(records, add_to_held=True)
+        # R is unquoted: its stake is what it paid, contracts plus fees
+        stake = r.total_cost + r.fees
+        r_held = HeldPair(sides=(("RA", "yes"), ("RB", "no")), count=float(r.n),
+                          cost_dollars=stake, value_dollars=r.total_cost, fees_dollars=r.fees)
+        # CONTROL: without selling, R is not added to on Monday 2 (the cash
+        # left cannot buy a contract pair), nor would the live sizer add to it
+        # on Monday 2's value before the sale
+        assert [(t.ticker_a, t.add_on) for t in held.trades] == [("SA", False), ("RA", False)]
+        value_before = cash_before + backtester._open_value(p, _LADDER_M2) + r.total_cost
+        assert self._live(r_rec, _LADDER_M2, value_before, cash_before, held=r_held,
+                          add_to_held=True) is None
+
+        point = self._sim(records, 0.25, add_to_held=True, sell_min_days=min_days)
+        assert [(t.ticker_a, t.entry_date, t.add_on, t.sold) for t in point.trades] == [
+            ("SA", _LADDER_M1, False, True), ("RA", _LADDER_M1, False, False),
+            ("RA", _LADDER_M2, True, False)]
+        p_sold, _r, add = point.trades
+        cash_after = cash_before + p_sold.actual_payoff
+        assert add.balance_at_entry == pytest.approx(cash_after + r.total_cost, abs=1e-6)
+        # held_pair_fraction saw R's stake against the value after the sale
+        f2 = _uncapped_kelly({"pair_type": "time_series", "entry": r_rec["entry"]["later"][0]},
+                             self._K)
+        assert add.kelly_fraction == pytest.approx(
+            held_pair_fraction(f2, stake, add.balance_at_entry), abs=1e-12)
+        spec = self._live(r_rec, _LADDER_M2, add.balance_at_entry, cash_after, held=r_held,
+                          add_to_held=True)
+        assert spec is not None and spec.x == add.n > 0
+
+    @pytest.mark.parametrize("add_to_held", [False, True])
+    @pytest.mark.parametrize("min_days", [None, 3])
+    def test_the_sold_pair_is_not_bought_or_added_to_at_its_own_checkpoint(
+            self, min_days, add_to_held):
+        # P also passes Monday 2, at quotes whose Kelly fraction is nearly 1,
+        # and Monday 3 at its first quotes
+        records = self._records(p_mondays=(_LADDER_M1, (_LADDER_M2, 0.20, 0.21, 0.40),
+                                           _LADDER_M3))
+        unsold = self._sim(records, add_to_held=add_to_held)
+        if add_to_held:
+            # CONTROL: unsold, P is short of its Kelly share on Monday 2 and
+            # is added to there, so a walk that bought before it sold would
+            # add to the position it then sells
+            assert [(t.entry_date, t.add_on) for t in unsold.trades] == [
+                (_LADDER_M1, False), (_LADDER_M2, True)]
+        else:
+            assert _traded(unsold) == [("SA", _LADDER_M1)]
+        point = self._sim(records, 0.25, add_to_held=add_to_held, sell_min_days=min_days)
+        # Sold on Monday 2 and neither bought nor added to there (its markets
+        # are freed by the sale); bought again on Monday 3
+        assert [(t.entry_date, t.add_on, t.sold, t.exit_date) for t in point.trades] == [
+            (_LADDER_M1, False, True, _LADDER_M2), (_LADDER_M3, False, False, date(2026, 3, 20))]
+
+    @pytest.mark.parametrize("min_days", [None, 3])
+    def test_a_sale_where_nothing_is_bought_funds_the_next_checkpoint(self, min_days):
+        # Q is a candidate on Monday 3 only; Monday 2 has no candidate
+        q = self._new_pair(_LADDER_M3)
+        records = self._records(self._filler(), q)
+        held, _p, r, cash_before = self._unsold(records)
+        # CONTROL: without selling, Q is not bought on Monday 3 either
+        assert _traded(held) == [("SA", _LADDER_M1), ("RA", _LADDER_M1)]
+        point = self._sim(records, 0.25, sell_min_days=min_days)
+        assert _traded(point) == [("SA", _LADDER_M1), ("RA", _LADDER_M1), ("QA", _LADDER_M3)]
+        p_sold, _r, q_trade = point.trades
+        assert p_sold.sold and p_sold.exit_date == _LADDER_M2
+        cash_after = cash_before + p_sold.actual_payoff
+        assert q_trade.balance_at_entry == pytest.approx(cash_after + r.total_cost, abs=1e-6)
+        spec = self._live(q, _LADDER_M3, q_trade.balance_at_entry, cash_after)
+        assert spec is not None and spec.x == q_trade.n > 0
+
+    def test_a_sale_the_days_rule_holds_back_frees_no_cash(self):
+        # P has 67 days left on Monday 2: a minimum of 68 holds its sale back,
+        # so there is no cash for Q, exactly as in the run that never sells
+        records = self._records(self._filler(), self._new_pair(_LADDER_M2))
+        base = self._sim(records)
+        point = self._sim(records, 0.25, sell_min_days=68)
+        assert point.sales == ()
+        assert [astuple(t) for t in point.trades] == [astuple(t) for t in base.trades]
+        pd.testing.assert_frame_equal(point.equity_df, base.equity_df, check_exact=True)
+        assert [check.days_left for check in self._sim(records, 0.25, sell_min_days=67).sales] \
+            == [67]
 
 
 class TestPositions:
@@ -17665,16 +18068,21 @@ class TestPositions:
         assert backtester._positions([]) == []
 
 
-class TestHighestSaleLevel:
-    """_highest_sale_level(point, levels) replays the sell test on a run that
-    never sold. A level above the one it returns never sells, so its run IS
-    the no-selling run (only its sell_at stamp differs); at the level it
-    returns and every one below, the run sells at least one position. Pinned
-    for every 5% level on both selling fixtures, and on one whose checkpoint
-    is higher than the days before it, so the lowest check decides; each also
-    with a depth model, so that buys and sales walk modeled books."""
+class TestSaleReach:
+    """_sale_reach(point, levels) replays the sell test on a run that never
+    sold, and gives for each level the most days before maturity at which
+    some position would have sold there. That is what lets SellSweep.sold_grid
+    skip a (level, minimum) without simulating it: a run selling at level L
+    with a minimum of N days sells at least once for every N up to reach[L],
+    and is exactly the no-selling run for every N above it (and at every N
+    when L is not a key, so a level out of reach is the no-selling run).
+    Pinned by brute force on three selling fixtures (a plain pair, one with
+    add-ons, and one whose checkpoint is higher than the days before it, so
+    the lowest check decides), with and without a depth model (buys and sales
+    then walk modeled books): for each level, N is raised from 1 until a run
+    makes no sale."""
 
-    _LEVELS = tuple(round(0.05 * i, 2) for i in range(1, 21))
+    _LEVELS = (0.05, 0.15, 0.25, 0.35, 0.5, 0.7, 1.0)
 
     @staticmethod
     def _spiky_candles() -> dict:
@@ -17691,13 +18099,13 @@ class TestHighestSaleLevel:
         return _quoted([suite._record((_LADDER_M1, _LADDER_M2, _LADDER_M3))],
                        cls._spiky_candles())
 
-    @pytest.mark.parametrize("walked", [False, True])
-    @pytest.mark.parametrize("fixture", ["plain", "add_on", "spiky"])
-    def test_levels_above_it_are_the_no_selling_run(self, fixture, walked):
+    @classmethod
+    def _fixture(cls, name: str, walked: bool):
+        """(suite, records) for the fixture `name`, with its quotes."""
         model = _walk_model() if walked else None
-        if fixture in ("plain", "spiky"):
+        if name in ("plain", "spiky"):
             suite = TestSellAtShareOfPotentialProfit()
-            candles = suite._candles() if fixture == "plain" else self._spiky_candles()
+            candles = suite._candles() if name == "plain" else cls._spiky_candles()
             records = [suite._record((_LADDER_M1, _LADDER_M2, _LADDER_M3))]
         else:
             suite = TestSellingWithAddOns()
@@ -17707,35 +18115,55 @@ class TestHighestSaleLevel:
         if walked:
             candles = _with_volume(candles)
         backtester._attach_leg_quotes(records, candles, date(2026, 1, 1), model)
+        return suite, records
 
-        def sim(level):
-            return suite._sim(records, level)
+    @pytest.mark.parametrize("walked", [False, True])
+    @pytest.mark.parametrize("fixture", ["plain", "add_on", "spiky"])
+    def test_each_level_s_reach_is_the_most_days_at_which_a_run_still_sells(
+            self, fixture, walked):
+        suite, records = self._fixture(fixture, walked)
+        base = suite._sim(records, None)
+        reach = backtester._sale_reach(base, self._LEVELS)
+        # Not vacuous: some levels sell, with days to spare, and some do not
+        assert reach and all(days > 0 for days in reach.values())
+        assert set(reach) < set(self._LEVELS)
+        walked_sales = 0
+        for level in self._LEVELS:
+            min_days = 1
+            while True:
+                point = suite._sim(records, level, sell_min_days=min_days)
+                if not point.sales:
+                    break
+                assert any(t.sold for t in point.trades)
+                walked_sales += sum(
+                    t.sold and t.sale_price_a is not None
+                    and t.sale_price_a < t.marks[0].bid_at_checkpoint(t.exit_date, "yes")
+                    for t in point.trades)
+                min_days += 1
+            # The first minimum with no sale is one past the reach
+            assert min_days - 1 == reach.get(level, 0), (fixture, level)
+            # ... and that run is the no-selling run itself
+            assert [astuple(t) for t in point.trades] == [astuple(t) for t in base.trades]
+            pd.testing.assert_frame_equal(point.equity_df, base.equity_df, check_exact=True)
+        # Reaching a level means reaching every lower one: a prefix
+        reached = [level for level in self._LEVELS if level in reach]
+        assert reached == list(self._LEVELS[:len(reached)])
         if walked:
             # Not vacuous: the buys walk a book, and a sale walks the bids
-            assert all(t.book_walked for t in sim(None).trades)
-            assert any(t.sold and t.sale_price_a is not None
-                       and t.sale_price_a < t.marks[0].bid_at_checkpoint(t.exit_date, "yes")
-                       for level in self._LEVELS for t in sim(level).trades), fixture
-        base = sim(None)
-        top = backtester._highest_sale_level(base, self._LEVELS)
-        assert top is not None and top < 1.0
-        for level in self._LEVELS:
-            point = sim(level)
-            if level > top:
-                assert [astuple(t) for t in point.trades] == [astuple(t) for t in base.trades]
-                pd.testing.assert_frame_equal(point.equity_df, base.equity_df,
-                                              check_exact=True)
-            else:
-                assert any(t.sold for t in point.trades), level
+            assert all(t.book_walked for t in base.trades)
+            assert walked_sales > 0, fixture
 
     def test_the_lowest_check_decides(self, monkeypatch):
+        # Every 5%, so the highest level reached sits within 5% of the ratio
+        # that decides it
+        levels = tuple(round(0.05 * i, 2) for i in range(1, 21))
         suite = TestSellAtShareOfPotentialProfit()
         base = suite._sim(self._spiky())
-        top = backtester._highest_sale_level(base, self._LEVELS)
+        top = max(backtester._sale_reach(base, levels))
         # On the checkpoint alone the higher bids decide
         monkeypatch.setattr(backtester, "TAKE_PROFIT_HOLD_DAYS", 1)
-        alone = backtester._highest_sale_level(base, self._LEVELS)
-        assert top is not None and alone is not None and top < alone
+        alone = max(backtester._sale_reach(base, levels))
+        assert top < alone
         (held,) = base.trades
         bids = {"up": TestSaleNeedsDaysInARow._UP, "high": TestSaleNeedsDaysInARow._HIGH}
         ratios = {name: _ratio(held, _sale_value(held.n, ("bid", y), ("bid", n)))
@@ -17743,16 +18171,57 @@ class TestHighestSaleLevel:
         assert top <= ratios["up"] < top + 0.05
         assert alone <= ratios["high"] < alone + 0.05
 
-    def test_it_reads_only_a_run_that_never_sold(self):
+    def test_it_reads_only_a_run_that_never_sold(self, monkeypatch):
         suite = TestSellAtShareOfPotentialProfit()
         records = _quoted([suite._record()], suite._candles())
         with pytest.raises(ValueError, match="never sold"):
-            backtester._highest_sale_level(suite._sim(records, 0.25), self._LEVELS)
-        empty = suite._sim([], None)
-        assert backtester._highest_sale_level(empty, self._LEVELS) is None
+            backtester._sale_reach(suite._sim(records, 0.25), self._LEVELS)
+        assert backtester._sale_reach(suite._sim([], None), self._LEVELS) == {}
+        base = suite._sim(records)
+        assert backtester._sale_reach(base, ()) == {}
         # A run whose trades have no quotes never sells at any level
-        assert backtester._highest_sale_level(suite._sim([suite._record()]),
-                                              self._LEVELS) is None
+        assert backtester._sale_reach(suite._sim([suite._record()]), self._LEVELS) == {}
+        # A trade with no close date is never sold under a minimum, so it
+        # reaches no level, where the same trade with one does
+        (trade,) = base.trades
+        bare = dc_replace(base, trades=[dc_replace(trade, close_date_b=None)])
+        assert backtester._sale_reach(bare, self._LEVELS) == {}
+        assert backtester._sale_reach(base, self._LEVELS)
+        # It reads the sell rule's day count when called
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_HOLD_DAYS", 0)
+        with pytest.raises(ValueError, match="TAKE_PROFIT_HOLD_DAYS"):
+            backtester._sale_reach(base, self._LEVELS)
+
+
+class TestSaleCover:
+    """_sale_cover(sales, levels) reduces a selling run's sales to the fewest
+    days any of them had left and the index of the highest level every one
+    reached at every check — the two bounds within which SellSweep.sold_grid
+    treats a stricter (level, minimum) as the same run."""
+
+    _LEVELS = (0.05, 0.25, 0.5, 1.0)
+
+    @staticmethod
+    def _sale(days_left, *ratios):
+        """A sale whose checks realized these shares of a $100 potential profit."""
+        return backtester.SaleCheck(days_left, tuple((100.0 * r, 100.0) for r in ratios))
+
+    def test_the_fewest_days_and_the_highest_level_all_sales_reach(self):
+        sales = (self._sale(20, 0.6, 0.55, 0.9), self._sale(33, 0.3, 0.8, 0.5))
+        # Every check of both reaches 25%; the second's first check misses 50%
+        assert backtester._sale_cover(sales, self._LEVELS) == (20, 1)
+        assert backtester._sale_cover(sales[:1], self._LEVELS) == (20, 2)
+        assert backtester._sale_cover((self._sale(5, 1.0, 1.0),), self._LEVELS) == (5, 3)
+        # A level checks every check: one low check is enough to miss it
+        assert backtester._sale_cover((self._sale(7, 0.9, 0.01),), self._LEVELS) == (7, -1)
+
+    def test_an_unknown_days_left_covers_no_minimum(self):
+        sales = (self._sale(None, 0.6), self._sale(12, 0.6))
+        assert backtester._sale_cover(sales, self._LEVELS) == (-1, 2)
+
+    def test_a_run_with_no_sale_is_refused(self):
+        with pytest.raises(ValueError, match="sold at least once"):
+            backtester._sale_cover((), self._LEVELS)
 
 
 class TestSaleStream:
@@ -17797,9 +18266,18 @@ class _SellingGolden(TestPrepareEntriesGolden):
 @pytest.fixture(scope="class")
 def sell_run():
     """The selling golden fixture through run_backtest_sweep with every family
-    on a narrowed grid — band (0, 1) x k (0.5, 0.75), four sell levels —
-    beside the same run with the sell family off. Every simulation DURING the
-    runs goes through a spy; the spy is undone before any cell is read."""
+    on a narrowed grid — band (0, 1) x k (0.5, 0.75), four sell levels, four
+    minimum-days options — beside the same run with the sell family off.
+    Every simulation DURING the runs goes through a spy; the spy is undone
+    before any cell is read.
+
+    The fixture's sales come 13, 20, 26, 33, 53 or 60 days before their
+    positions mature, and its no-selling runs reach the 25% level at most
+    26, 53 or 60 days out, depending on the setting and the cap: the day
+    options 1, 14, 21 and 30
+    give sold_grid all three kinds of cell (a run it simulates, a run it
+    already simulated, and the no-selling run because the minimum is past
+    the reach), and a 21-day run that differs from the 1-day one."""
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     try:
@@ -17810,6 +18288,7 @@ def sell_run():
         mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
         mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
         mp.setattr(backtester, "TAKE_PROFIT_LEVELS", (1.0, 0.05, 0.25, 0.5))
+        mp.setattr(backtester, "TAKE_PROFIT_MIN_DAYS", (21, 1, 30, 14))
         mp.setattr(backtester, "datetime", type(
             "Clock", (TestCapSweepEndDate._Clock,),
             {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC)}))
@@ -17858,10 +18337,14 @@ def sell_run():
 @pytest.mark.usefixtures("sell_run")
 class TestSellSweep:
     """run_backtest_sweep(sell_sweep=True): the dashboard's "Sell" family, a
-    lazy SellSweep over every sell level, tier floors on and off, adding to
-    held pairs or not, the "all" population only. The run simulates nothing
-    extra; every cell is simulated when read, and every cap of it equals a
-    fresh simulation selling at that level."""
+    lazy SellSweep over every sell level and every minimum of days before
+    maturity, tier floors on and off, adding to held pairs or not, the "all"
+    population only. The run simulates nothing extra; every cell is
+    simulated when read, and every cap of it equals a fresh simulation
+    selling at that level. sold_grid reads a cell at every level and minimum
+    while simulating only the runs that differ, and every cell it yields —
+    a point, a SameSale naming an earlier point, or None for the no-selling
+    run — equals a fresh simulation at that setting."""
 
     _SELLING = "Selling early"
 
@@ -17893,9 +18376,9 @@ class TestSellSweep:
             "Selling early (backtest): on — a position is sold once it has stayed at or "
             "above a level for 3 days in a row (config.TAKE_PROFIT_HOLD_DAYS); the "
             "dashboard's Sell select is simulated when the dashboard is built",
-            "Selling early: 4 level(s) x 20 size cap(s) x 1 band(s) (1 with the tier floors "
-            "off) x 2 k, adding to held pairs or not, each simulated when the dashboard "
-            "reads it"]
+            "Selling early: 4 level(s) x 4 minimum-days option(s) x 20 size cap(s) x 1 "
+            "band(s) (1 with the tier floors off) x 2 k, adding to held pairs or not, each "
+            "simulated when the dashboard reads it"]
         others = [m for m in sell_run.msgs_on
                   if not m.startswith((self._SELLING, "Peak RSS"))]
         assert others == [m for m in sell_run.msgs_off
@@ -17907,6 +18390,9 @@ class TestSellSweep:
         on = sell_run.on
         sell = on.sell_sweep
         assert sell.levels == (0.05, 0.25, 0.5, 1.0)
+        # The patched options, ascending
+        assert sell.min_days == (1, 14, 21, 30)
+        assert sell_run.no_cap.sell_sweep.min_days == (1, 14, 21, 30)
         assert sell.caps == on.add_on_cap_sweep.caps and len(sell.caps) == 20
         assert sell.bands == on.add_on_cap_sweep.bands
         assert sell.off_bands == on.add_on_tier_off_cap_sweep.bands
@@ -17954,34 +18440,6 @@ class TestSellSweep:
         # Not vacuous: positions sell
         assert sold > 0
 
-    def test_levels_above_the_highest_sale_level_are_the_no_selling_run(self, sell_run):
-        sell, start = sell_run.on.sell_sweep, sell_run.start
-        compared = 0
-        for tier_floors, bands, entries_by_band, end_dates in self._settings(sell):
-            for band in bands:
-                for k in sell.ks:
-                    for add_to_held in (False, True):
-                        for cap in (0.1, 0.5, 1.0):
-                            options = {"k": k, "spread_band": band, "size_cap": cap,
-                                       "quiet": True, "end_date": end_dates[(band, k, "all")],
-                                       "tier_floors": tier_floors, "add_to_held": add_to_held}
-                            base = backtester._simulate_at_discount(
-                                entries_by_band[band], start, 10_000.0, **options)
-                            top = backtester._highest_sale_level(base, sell.levels)
-                            for level in sell.levels:
-                                point = backtester._simulate_at_discount(
-                                    entries_by_band[band], start, 10_000.0, sell_at=level,
-                                    **options)
-                                if top is None or level > top:
-                                    assert ([astuple(t) for t in point.trades]
-                                            == [astuple(t) for t in base.trades])
-                                    pd.testing.assert_frame_equal(
-                                        point.equity_df, base.equity_df, check_exact=True)
-                                    compared += 1
-                                else:
-                                    assert any(t.sold for t in point.trades)
-        assert compared > 0
-
     def test_a_level_or_setting_it_does_not_hold_is_refused(self, sell_run):
         sell = sell_run.on.sell_sweep
         with pytest.raises(ValueError, match="not one of"):
@@ -17997,67 +18455,221 @@ class TestSellSweep:
                                  band_sweep=True, cap_sweep=True)
         assert res.sell_sweep is None
 
-    def test_sold_cells_simulates_only_the_levels_that_can_sell(self, sell_run, monkeypatch):
-        sell, start = sell_run.on.sell_sweep, sell_run.start
-        real = backtester._simulate_at_discount
-        calls: list = []
+    @staticmethod
+    def _same_run(point, other) -> None:
+        """Assert two simulations are one run: trades, curve and peak alike."""
+        assert [astuple(t) for t in point.trades] == [astuple(t) for t in other.trades]
+        pd.testing.assert_frame_equal(point.equity_df, other.equity_df, check_exact=True)
+        assert point.peak_kelly_fraction == other.peak_kelly_fraction
 
-        def spy(raw_entries, start_date, initial_balance, **kw):
-            calls.append((kw.get("sell_at"), kw.get("size_cap")))
-            return real(raw_entries, start_date, initial_balance, **kw)
-
-        caps = (0.05, 0.3, 1.0)
-        shown = skipped = 0
+    def _grid_parity(self, sell_run, *, only=None, caps=None, sell=None) -> Counter:
+        """Read every (level, minimum, cap) of sold_grid and check each cell
+        against a fresh simulation at that level, minimum and cap: a point is
+        that simulation; a SameSale names an EARLIER cell of the same cap that
+        was yielded as a point, and the fresh run equals that point; None is
+        the no-selling run, and the fresh run there makes no sale. `only`
+        keeps the (tier_floors, k, add_to_held) settings it names (None:
+        every one), `caps` is handed to sold_grid, and `sell` replaces the
+        run's SellSweep (None: the run's own). Returns how many cells of
+        each kind were read."""
+        sell = sell_run.on.sell_sweep if sell is None else sell
+        start = sell_run.start
+        kinds: Counter = Counter()
         for tier_floors, bands, entries_by_band, end_dates in self._settings(sell):
             for band in bands:
                 entries = entries_by_band[band]
                 for k in sell.ks:
                     for add_to_held in (False, True):
+                        if only is not None and (tier_floors, k, add_to_held) not in only:
+                            continue
                         options = {"k": k, "spread_band": band, "quiet": True,
                                    "end_date": end_dates[(band, k, "all")],
                                    "tier_floors": tier_floors, "add_to_held": add_to_held}
-                        tops = {cap: backtester._highest_sale_level(
-                            real(entries, start, 10_000.0, size_cap=cap, **options),
-                            sell.levels) for cap in caps}
-                        calls.clear()
-                        monkeypatch.setattr(backtester, "_simulate_at_discount", spy)
-                        cells = list(sell.sold_cells(band, k, tier_floors=tier_floors,
-                                                     add_to_held=add_to_held, caps=caps))
-                        monkeypatch.undo()
-                        # Every level, ascending, every cap asked for
-                        assert [level for level, _ in cells] == list(sell.levels)
-                        # The no-selling run, then only (level, cap) at or below
-                        # that cap's highest sale level
-                        assert any(level is None for level, _cap in calls)
-                        assert all(level is None or level <= tops[cap]
-                                   for level, cap in calls)
-                        for level, by_cap in cells:
-                            assert tuple(by_cap) == caps
-                            for cap, point in by_cap.items():
-                                fresh = real(entries, start, 10_000.0, size_cap=cap,
-                                             sell_at=level, **options)
-                                if point is None:
-                                    # Above the cap's highest sale level: the
-                                    # no-selling run, so never simulated
-                                    assert tops[cap] is None or level > tops[cap]
-                                    assert not any(t.sold for t in fresh.trades)
-                                    skipped += 1
-                                    continue
-                                assert level <= tops[cap]
-                                assert (point.sell_at, point.size_cap) == (level, cap)
-                                assert ([astuple(t) for t in point.trades]
-                                        == [astuple(t) for t in fresh.trades])
-                                pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df,
-                                                              check_exact=True)
-                                assert any(t.sold for t in point.trades)
-                                shown += 1
-        assert shown > 0 and skipped > 0
+                        chosen = sell.caps if caps is None else tuple(caps)
+                        bases = {cap: backtester._simulate_at_discount(
+                            entries, start, 10_000.0, size_cap=cap, **options)
+                            for cap in chosen}
+                        reach = {cap: backtester._sale_reach(bases[cap], sell.levels)
+                                 for cap in chosen}
+                        points: dict = {}
+                        trades: dict = {}
+                        order = []
+                        for level, min_days, by_cap in sell.sold_grid(
+                                band, k, tier_floors=tier_floors, add_to_held=add_to_held,
+                                caps=caps):
+                            order.append((level, min_days))
+                            assert tuple(by_cap) == chosen
+                            for cap, cell in by_cap.items():
+                                fresh = backtester._simulate_at_discount(
+                                    entries, start, 10_000.0, size_cap=cap, sell_at=level,
+                                    sell_min_days=min_days, **options)
+                                if cell is None:
+                                    assert fresh.sales == ()
+                                    self._same_run(fresh, bases[cap])
+                                    top = reach[cap].get(level)
+                                    kinds["pruned, level" if top is None
+                                          else "pruned, days"] += 1
+                                elif isinstance(cell, backtester.SameSale):
+                                    # An earlier cell of this cap, simulated
+                                    named = points[(cell.level, cell.min_days, cap)]
+                                    assert (cell.level, cell.min_days) != (level, min_days)
+                                    self._same_run(fresh, named)
+                                    assert fresh.sales == named.sales
+                                    kinds["same"] += 1
+                                else:
+                                    assert (cell.sell_at, cell.sell_min_days, cell.size_cap,
+                                            cell.add_to_held, cell.tier_floors) == (
+                                        level, min_days, cap, add_to_held, tier_floors)
+                                    self._same_run(fresh, cell)
+                                    assert cell.sales and cell.sales == fresh.sales
+                                    points[(level, min_days, cap)] = cell
+                                    kinds["point"] += 1
+                                trades[(level, min_days, cap)] = [astuple(t)
+                                                                  for t in fresh.trades]
+                                if (isinstance(cell, backtester.SweepPoint) and min_days > 1
+                                        and trades[(level, min_days, cap)]
+                                        != trades[(level, sell.min_days[0], cap)]):
+                                    kinds["point differing from the fewest days"] += 1
+                        # Every level, ascending, and each level's minimums, ascending
+                        assert order == [(level, min_days) for level in sell.levels
+                                         for min_days in sell.min_days]
+        return kinds
 
-    def test_a_band_s_copy_sells_as_the_family_does_after_pickling(self, sell_run):
+    def test_every_cell_of_the_sold_grid_equals_a_fresh_simulation(self, sell_run):
         sell = sell_run.on.sell_sweep
+        kinds = self._grid_parity(sell_run)
+        cells = 2 * 2 * 2 * len(sell.levels) * len(sell.min_days) * len(sell.caps)
+        assert sum(kinds[kind] for kind in ("point", "same", "pruned, level",
+                                            "pruned, days")) == cells
+        # Not vacuous: every kind of cell occurs — a run reused through a
+        # SameSale, the no-selling run because the minimum is past the reach
+        # (not only because the level is never reached), and a run with a
+        # minimum above one day that sells differently from the one-day run
+        assert sell.min_days[0] == 1
+        for kind in ("point", "same", "pruned, level", "pruned, days",
+                     "point differing from the fewest days"):
+            assert kinds[kind] > 0, (kind, kinds)
+
+    @pytest.mark.parametrize("mutant", ["days", "level"])
+    def test_the_parity_check_catches_a_cover_without_either_bound(self, sell_run,
+                                                                   monkeypatch, mutant):
+        # A cover that drops its days bound (as if every sale had all the
+        # time in the world) or its level bound (as if every sale reached
+        # every level) makes sold_grid name runs that are not the same run;
+        # the parity check above must fail on it
+        real = backtester._sale_cover
+
+        def wrong(sales, levels):
+            fewest, top = real(sales, levels)
+            return (10 ** 9, top) if mutant == "days" else (fewest, len(levels) - 1)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(backtester, "_sale_cover", wrong)
+            with pytest.raises(AssertionError):
+                self._grid_parity(sell_run, only={(True, 0.75, False)}, caps=(0.5, 1.0))
+        # The same narrow check passes with the real cover
+        kinds = self._grid_parity(sell_run, only={(True, 0.75, False)}, caps=(0.5, 1.0))
+        assert kinds["same"] > 0
+
+    # Every minimum of days from 1 to one past the fixture's farthest reach
+    # (60 days): the four options above never sit on a cover's or a reach's
+    # boundary (sales 13, 20, 26, 33, 53 and 60 days out; reaches 26, 53 and
+    # 60), and every whole number does
+    _WIDE_DAYS = tuple(range(1, 62))
+
+    def _wide_parity(self, sell_run) -> Counter:
+        """_grid_parity over every setting at caps 50% and no cap, with every
+        minimum of _WIDE_DAYS in place of the run's four options."""
+        wide = dc_replace(sell_run.on.sell_sweep, min_days=self._WIDE_DAYS)
+        return self._grid_parity(sell_run, caps=(0.5, 1.0), sell=wide)
+
+    def test_every_minimum_on_every_boundary_equals_a_fresh_simulation(self, sell_run):
+        kinds = self._wide_parity(sell_run)
+        # Not vacuous: runs simulated, runs repeated, and the run without
+        # selling both where the level is never reached and where the minimum
+        # is past the reach
+        for kind in ("point", "same", "pruned, level", "pruned, days"):
+            assert kinds[kind] > 0, (kind, kinds)
+
+    # Two ways sold_grid could leave the boundaries the narrow check above
+    # cannot see: a cover with no lower days bound (a run from an earlier
+    # level with a larger minimum taken as this cell's run), and a reach
+    # whose own number of days is pruned as though no position sold there
+    _SOLD_GRID_MUTANTS = {
+        "no lower days bound": ("if d0 <= min_days <= fewest and li <= top_index",
+                                "if min_days <= fewest and li <= top_index"),
+        "the reach itself pruned": ("if top is None or min_days > top:",
+                                    "if top is None or min_days >= top:"),
+    }
+
+    @pytest.mark.parametrize("mutant", sorted(_SOLD_GRID_MUTANTS))
+    def test_the_wide_check_catches_a_sold_grid_off_its_boundaries(self, sell_run,
+                                                                    monkeypatch, mutant):
+        # sold_grid's own source with one comparison changed, compiled in
+        # backtester's namespace: the wide parity check above must fail on it
+        old, new = self._SOLD_GRID_MUTANTS[mutant]
+        source = textwrap.dedent(inspect.getsource(backtester.SellSweep.sold_grid))
+        assert source.count(old) == 1
+        namespace = dict(vars(backtester))
+        exec(compile(source.replace(old, new), "<sold_grid mutant>", "exec"), namespace)
+        with monkeypatch.context() as mp:
+            mp.setattr(backtester.SellSweep, "sold_grid", namespace["sold_grid"])
+            with pytest.raises(AssertionError):
+                self._wide_parity(sell_run)
+
+    def test_only_the_cells_yielded_as_points_are_simulated(self, sell_run, monkeypatch):
+        sell = sell_run.on.sell_sweep
+        real = backtester._simulate_at_discount
+        calls: list = []
+
+        def spy(raw_entries, start_date, initial_balance, **kw):
+            calls.append((kw.get("sell_at"), kw.get("sell_min_days"), kw.get("size_cap")))
+            return real(raw_entries, start_date, initial_balance, **kw)
+
+        caps = (0.05, 0.3, 1.0)
+        for tier_floors, bands, _entries, _days in self._settings(sell):
+            for band in bands:
+                for k in sell.ks:
+                    for add_to_held in (False, True):
+                        calls.clear()
+                        stats: dict = {}
+                        with monkeypatch.context() as mp:
+                            mp.setattr(backtester, "_simulate_at_discount", spy)
+                            grid = list(sell.sold_grid(band, k, tier_floors=tier_floors,
+                                                       add_to_held=add_to_held, caps=caps,
+                                                       stats=stats))
+                        points = {(level, min_days, cap)
+                                  for level, min_days, by_cap in grid
+                                  for cap, cell in by_cap.items()
+                                  if isinstance(cell, backtester.SweepPoint)}
+                        same = sum(isinstance(cell, backtester.SameSale)
+                                   for _l, _d, by_cap in grid for cell in by_cap.values())
+                        pruned = sum(cell is None
+                                     for _l, _d, by_cap in grid for cell in by_cap.values())
+                        # The no-selling run, then only cells yielded as points
+                        assert any(level is None for level, _days, _cap in calls)
+                        assert all(min_days is None for level, min_days, _cap in calls
+                                   if level is None)
+                        selling = [call for call in calls if call[0] is not None]
+                        assert set(selling) <= points
+                        # Caps at or above a peak share one simulation, so a
+                        # point's (level, minimum) was simulated at some cap
+                        assert {(level, min_days) for level, min_days, _cap in points} \
+                            == {(level, min_days) for level, min_days, _cap in selling}
+                        # The counts a report logs
+                        assert stats["simulated"] == len(calls)
+                        assert stats["simulated"] + stats["reused"] == len(caps) + len(points)
+                        assert (stats["same"], stats["pruned"]) == (same, pruned)
+                        assert len(points) + same + pruned == (
+                            len(sell.levels) * len(sell.min_days) * len(caps))
+
+    def test_a_band_s_copy_reads_the_same_grid_after_pickling(self, sell_run):
+        sell = sell_run.on.sell_sweep
+        caps = (0.2, 1.0)
         for tier_floors, bands, entries_by_band, end_dates in self._settings(sell):
             band = bands[0]
             narrow = sell.for_band(band, tier_floors=tier_floors)
+            # The copy holds that band's entries and end days alone, the same objects
             held = narrow.entries_by_band if tier_floors else narrow.off_entries_by_band
             assert held == {band: entries_by_band[band]}
             assert held[band] is entries_by_band[band]
@@ -18065,18 +18677,88 @@ class TestSellSweep:
             assert days == {key: day for key, day in end_dates.items() if key[0] == band}
             # A worker process receives it pickled
             narrow = pickle.loads(pickle.dumps(narrow))
+            assert (narrow.levels, narrow.min_days) == (sell.levels, sell.min_days)
             for k in sell.ks:
-                ours = list(narrow.sold_cells(band, k, tier_floors=tier_floors,
-                                              add_to_held=True, caps=(0.2, 1.0)))
-                theirs = list(sell.sold_cells(band, k, tier_floors=tier_floors,
-                                              add_to_held=True, caps=(0.2, 1.0)))
-                for (level_a, a), (level_b, b) in zip(ours, theirs, strict=True):
-                    assert level_a == level_b
-                    for cap in (0.2, 1.0):
-                        assert (a[cap] is None) == (b[cap] is None)
-                        if a[cap] is not None:
+                ours = list(narrow.sold_grid(band, k, tier_floors=tier_floors,
+                                             add_to_held=True, caps=caps))
+                theirs = list(sell.sold_grid(band, k, tier_floors=tier_floors,
+                                             add_to_held=True, caps=caps))
+                assert [(level, days) for level, days, _ in ours] == [
+                    (level, days) for level, days, _ in theirs]
+                for (_l, _d, a), (_l2, _d2, b) in zip(ours, theirs, strict=True):
+                    for cap in caps:
+                        if isinstance(a[cap], backtester.SweepPoint):
+                            assert isinstance(b[cap], backtester.SweepPoint)
                             assert ([astuple(t) for t in a[cap].trades]
                                     == [astuple(t) for t in b[cap].trades])
+                        else:
+                            assert a[cap] == b[cap]
+
+    def test_a_minimum_it_does_not_offer_is_refused(self, sell_run):
+        sell = sell_run.on.sell_sweep
+        band, k = sell.bands[0], sell.ks[0]
+        for bad in (3, True, 0):
+            with pytest.raises(ValueError, match="minimum days .* is not one of"):
+                sell.sweep(0.5, min_days=bad)
+        with pytest.raises(ValueError, match="not one of"):
+            sell.cell(0.5, band, k, min_days=2)
+        with pytest.raises(ValueError, match="needs a sell level"):
+            sell.sweep(None, min_days=1)
+        swept = sell.sweep(0.5, min_days=14)
+        assert (swept.sell_at, swept.sell_min_days) == (0.5, 14)
+        assert sell.sweep(0.5).sell_min_days is None
+        point = sell.cell(0.25, band, k, min_days=21)[1.0]["all"]
+        assert (point.sell_at, point.sell_min_days) == (0.25, 21)
+
+    @pytest.mark.parametrize("bad", [(0,), (True,), (), (2, 2), (1, 2.5), ("3",), 3, None])
+    def test_bad_minimum_days_options_are_refused_before_any_fetch(self, monkeypatch, caplog,
+                                                                     bad):
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_MIN_DAYS", bad)
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: pytest.fail("fetched"))
+        with caplog.at_level(logging.INFO), pytest.raises(ValueError,
+                                                          match="TAKE_PROFIT_MIN_DAYS"):
+            run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                               start_date=date(2026, 1, 1), sell_sweep=True)
+        # Refused before the run's first line
+        assert not caplog.records
+        # Only the sell family reads them
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        assert run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                  start_date=date(2026, 1, 1)).sell_sweep is None
+
+    @pytest.mark.parametrize("bad", [(0.0,), (True,), (), (0.5, 0.5), (0.5, np.float64(0.5)),
+                                     (1.5,), (float("nan"),), ("0.9",), (Decimal("0.9"),),
+                                     0.9, None])
+    def test_bad_sell_levels_are_refused_before_any_fetch(self, monkeypatch, caplog, bad):
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_LEVELS", bad)
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: pytest.fail("fetched"))
+        with caplog.at_level(logging.INFO), pytest.raises(ValueError,
+                                                          match="TAKE_PROFIT_LEVELS"):
+            run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                               start_date=date(2026, 1, 1), sell_sweep=True)
+        # Refused before the run's first line
+        assert not caplog.records
+        # Only the sell family reads them
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        assert run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                  start_date=date(2026, 1, 1)).sell_sweep is None
+
+    def test_the_levels_are_checked_and_sorted(self, monkeypatch):
+        with monkeypatch.context() as mp:
+            mp.setattr(backtester, "TAKE_PROFIT_LEVELS", (np.float64(0.9), 0.85, 1))
+            levels = backtester._resolve_sell_levels()
+        assert levels == (0.85, 0.9, 1.0) and all(type(level) is float for level in levels)
+        assert backtester._resolve_sell_levels() == tuple(
+            percent / 100 for percent in range(80, 101))
+
+    def test_the_options_are_checked_and_sorted(self, monkeypatch):
+        with monkeypatch.context() as mp:
+            mp.setattr(backtester, "TAKE_PROFIT_MIN_DAYS", (np.int64(7), 2, 21))
+            options = backtester._resolve_min_days_options()
+        assert options == (2, 7, 21) and all(type(days) is int for days in options)
+        assert backtester._resolve_min_days_options() == (1, 2, 3, 4, 5, 6, 7, 14, 21)
 
     def test_entry_events_cover_both_settings_and_every_sold_trade(self, sell_run):
         sell = sell_run.on.sell_sweep
@@ -18105,7 +18787,9 @@ class TestSellSweep:
 class TestCapSweepSells:
     """A CapSweep with sell_at sells at that level in every simulation and
     check it runs, takes no eager point (none sells) and needs an end day for
-    every cell; _sim_options forwards sell_at only when it is set."""
+    every cell; with sell_min_days it also holds back, in every simulation
+    and check, a sale that comes fewer than that many days before maturity.
+    _sim_options forwards sell_at and sell_min_days only when set."""
 
     _BAND = (0.0, 1.0)
 
@@ -18114,6 +18798,20 @@ class TestCapSweepSells:
         assert backtester._sim_options(None, False, sell_at=0.25) == {"sell_at": 0.25}
         assert backtester._sim_options(None, True, add_to_held=True, sell_at=1.0) == {
             "quiet": True, "add_to_held": True, "sell_at": 1.0}
+
+    def test_sim_options_forwards_sell_min_days_only_when_set(self):
+        # Every call without a minimum carries no extra keyword, so a
+        # fixed-signature stand-in for _simulate_at_discount never meets it
+        day = date(2026, 9, 26)
+        assert backtester._sim_options(None, False, sell_min_days=None) == {}
+        assert backtester._sim_options(None, False, sell_at=0.25, sell_min_days=None) == {
+            "sell_at": 0.25}
+        assert backtester._sim_options(None, False, sell_at=0.25, sell_min_days=3) == {
+            "sell_at": 0.25, "sell_min_days": 3}
+        assert backtester._sim_options(0.35, True, end_date=day, tier_floors=False,
+                                       add_to_held=True, sell_at=1.0, sell_min_days=1) == {
+            "size_cap": 0.35, "quiet": True, "end_date": day, "tier_floors": False,
+            "add_to_held": True, "sell_at": 1.0, "sell_min_days": 1}
 
     def _sweep(self, **kw):
         defaults = {"caps": (0.5, 1.0), "primary_cap": 0.5, "bands": (self._BAND,),
@@ -18134,27 +18832,94 @@ class TestCapSweepSells:
         with pytest.raises(ValueError, match="sells early but end_dates has no day"):
             cs.cell(self._BAND, 0.75)
 
-    def test_every_run_and_check_sells(self, monkeypatch):
+    def test_a_minimum_needs_a_sell_level_and_a_whole_number(self):
+        # Checked as the simulation checks it, when the sweep is built
+        with pytest.raises(ValueError, match="sell_min_days needs sell_at"):
+            self._sweep(sell_min_days=3)
+        for bad in (0, -2, True, 2.5, "3"):
+            with pytest.raises(ValueError, match="sell_min_days must be a whole number"):
+                self._sweep(sell_at=0.25, sell_min_days=bad)
+        assert self._sweep(sell_at=0.25, sell_min_days=np.int64(3)).sell_min_days == 3
+        assert self._sweep(sell_at=0.25).sell_min_days is None
+
+    @pytest.mark.parametrize("min_days", [None, 3])
+    def test_every_run_and_check_sells(self, monkeypatch, min_days):
         seen = []
 
         def fake_simulate(raw_entries, start_date, initial_balance, k=None,
                           spread_band=None, population="all", **kw):
-            seen.append((population, kw.get("sell_at")))
+            seen.append((population, kw.get("sell_at"), kw))
             return backtester.SweepPoint(
                 k=k, trades=[TestSweepHelpers._trade("E1", 5.0)],
                 equity_df=pd.DataFrame({"portfolio_value": [100.0]}),
                 spread_band=spread_band, population=population, size_cap=kw.get("size_cap"),
-                peak_kelly_fraction=0.9, sell_at=kw.get("sell_at"))
+                peak_kelly_fraction=0.9, sell_at=kw.get("sell_at"),
+                sell_min_days=kw.get("sell_min_days"))
 
         monkeypatch.setattr(backtester, "_simulate_at_discount", fake_simulate)
         entries = [{"pair_type": "same_title", "entry": {
             "mA": {"event_ticker": "E1"}, "mB": {"event_ticker": "E2"},
             "entry_date": date(2026, 1, 5)}}]
-        cs = self._sweep(sell_at=0.25, checks=True, entries_by_band={self._BAND: entries},
+        cs = self._sweep(sell_at=0.25, sell_min_days=min_days, checks=True,
+                         entries_by_band={self._BAND: entries},
                          end_dates={(self._BAND, 0.75, "all"): date(2026, 3, 1)})
         cs.cell(self._BAND, 0.75)
-        assert seen and all(level == 0.25 for _pop, level in seen)
-        assert {pop for pop, _level in seen} == {"all", "all/H1", "all/H2", "all/ex-top"}
+        assert seen and all(level == 0.25 for _pop, level, _kw in seen)
+        assert {pop for pop, _level, _kw in seen} == {"all", "all/H1", "all/H2", "all/ex-top"}
+        # The minimum reaches every run and check (the excluding-top-event
+        # run reads it off the point), and is not forwarded when unset
+        if min_days is None:
+            assert not any("sell_min_days" in kw for _pop, _level, kw in seen)
+        else:
+            assert all(kw.get("sell_min_days") == min_days for _pop, _level, kw in seen)
+
+    def test_every_cap_with_a_minimum_equals_a_fresh_simulation(self, sell_run):
+        # The selling golden fixture, both Tier floors settings, both k,
+        # adding to held pairs or not: every cap of a CapSweep with a minimum
+        # of days before maturity equals a fresh simulation at that cap,
+        # level and minimum. At 50% (with a 3-day minimum) every sale comes
+        # 53 days before maturity, so none is held back; at 25% some come 13
+        # days before, which a 21-day minimum holds back
+        sell, start = sell_run.on.sell_sweep, sell_run.start
+        settings = ((True, sell.bands, sell.entries_by_band, sell.end_dates),
+                    (False, sell.off_bands, sell.off_entries_by_band, sell.off_end_dates))
+        checked = sold = held_back = 0
+        for level, min_days in ((0.5, 3), (0.25, 21)):
+            for tier_floors, bands, entries_by_band, end_dates in settings:
+                for band in bands:
+                    for k in sell.ks:
+                        for add_to_held in (False, True):
+                            plain = sell.sweep(level, tier_floors=tier_floors,
+                                               add_to_held=add_to_held)
+                            sweep = dc_replace(plain, sell_min_days=min_days)
+                            without = plain.cell(band, k)
+                            for cap, by_pop in sweep.cell(band, k).items():
+                                point = by_pop["all"]
+                                assert (point.sell_at, point.sell_min_days, point.size_cap) \
+                                    == (level, min_days, cap)
+                                fresh = backtester._simulate_at_discount(
+                                    entries_by_band[band], start, 10_000.0, k=k,
+                                    spread_band=band, size_cap=cap, quiet=True,
+                                    end_date=end_dates[(band, k, "all")],
+                                    tier_floors=tier_floors, add_to_held=add_to_held,
+                                    sell_at=level, sell_min_days=min_days)
+                                assert ([astuple(t) for t in point.trades]
+                                        == [astuple(t) for t in fresh.trades])
+                                pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df,
+                                                              check_exact=True)
+                                assert point.peak_kelly_fraction == fresh.peak_kelly_fraction
+                                assert point.sales == fresh.sales
+                                assert all(check.days_left >= min_days
+                                           for check in point.sales)
+                                checked += 1
+                                sold += len(point.sales)
+                                if ([astuple(t) for t in point.trades]
+                                        != [astuple(t) for t in without[cap]["all"].trades]):
+                                    held_back += 1
+                                    assert (level, min_days) == (0.25, 21)
+        assert checked == 2 * 2 * len(sell.ks) * 2 * len(sell.caps)
+        # Not vacuous: positions sell, and the 21-day minimum holds some back
+        assert sold > 0 and held_back > 0
 
 
 # ─── Walking a synthetic order book with the live sizer ──────────────────────
@@ -18544,7 +19309,8 @@ def walk_sweep_run():
     """The walked golden fixture through run_backtest_sweep with a depth model
     and every family (band sweep, tier floors off, size caps, add to held
     pairs, selling) on a narrowed grid: bands (0, 0.5) and (0, 1) x k (0.5,
-    0.75)."""
+    0.75), and the sell levels 5%, 50% and 100%, which span what this
+    fixture's walked positions reach."""
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     try:
@@ -18554,6 +19320,7 @@ def walk_sweep_run():
         mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
         mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
         mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        mp.setattr(backtester, "TAKE_PROFIT_LEVELS", (0.05, 0.5, 1.0))
         res = run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
                                  start_date=golden._START, initial_balance=10_000.0,
                                  same_event_ladders=True, band_sweep=True, cap_sweep=True,
@@ -18881,6 +19648,8 @@ class TestBandReachesEveryResimulation:
         monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.25))
         monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
         monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        # The sell levels walk_sweep_run uses, so the 50% cells read below exist
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_LEVELS", (0.05, 0.5, 1.0))
         real_entries = backtester._entries_for_band
         real_simulate = backtester._simulate_at_discount
 
@@ -19235,7 +20004,7 @@ class TestWalkedSales:
             point = self._SUITE._sim(records, level)
             assert [astuple(t) for t in point.trades] == [astuple(t) for t in base.trades]
             pd.testing.assert_frame_equal(point.equity_df, base.equity_df, check_exact=True)
-        assert backtester._highest_sale_level(base, self._LEVELS) is None
+        assert backtester._sale_reach(base, self._LEVELS) == {}
         # With no model the same position sells at 25% on Monday 2
         assert self._SUITE._sim(self._records(None), 0.25).trades[0].sold
 
@@ -19320,7 +20089,7 @@ class _WalkedSellingGolden(_SellingGolden):
 def walked_sell_run():
     """The walked selling golden fixture through run_backtest_sweep with a
     depth model and every family on sell_run's narrowed grid: band (0, 1) x
-    k (0.5, 0.75), four sell levels."""
+    k (0.5, 0.75), four sell levels and four minimum-days options."""
     toggles = pytest.MonkeyPatch()
     mp = pytest.MonkeyPatch()
     try:
@@ -19331,6 +20100,7 @@ def walked_sell_run():
         mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
         mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
         mp.setattr(backtester, "TAKE_PROFIT_LEVELS", (1.0, 0.05, 0.25, 0.5))
+        mp.setattr(backtester, "TAKE_PROFIT_MIN_DAYS", (21, 1, 30, 14))
         mp.setattr(backtester, "datetime", type(
             "Clock", (TestCapSweepEndDate._Clock,),
             {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC)}))
@@ -19350,9 +20120,11 @@ def walked_sell_run():
 class TestWalkedSellSweep:
     """TestSellSweep's parity checks on the walked selling golden fixture,
     with buys and sales walking modeled books: every level and cap of the
-    Sell family equals a fresh simulation, every level above a run's highest
-    sale level is that run without selling, sold_cells simulates only the
-    levels that can sell, and a band's pickled copy sells as the family does."""
+    Sell family equals a fresh simulation; every (level, minimum of days)
+    sold_grid yields at three caps — a point, a SameSale or the run without
+    selling — equals a fresh simulation at that setting; sold_grid simulates
+    only the cells it yields as points; and a band's pickled copy reads the
+    same grid as the family."""
 
     @pytest.fixture
     def sell_run(self, walked_sell_run):
@@ -19360,14 +20132,21 @@ class TestWalkedSellSweep:
         return walked_sell_run
 
     _settings = TestSellSweep.__dict__["_settings"]
+    _same_run = TestSellSweep.__dict__["_same_run"]
+    _grid_parity = TestSellSweep._grid_parity
     test_every_level_and_cap_equals_a_fresh_simulation = (
         TestSellSweep.test_every_level_and_cap_equals_a_fresh_simulation)
-    test_levels_above_the_highest_sale_level_are_the_no_selling_run = (
-        TestSellSweep.test_levels_above_the_highest_sale_level_are_the_no_selling_run)
-    test_sold_cells_simulates_only_the_levels_that_can_sell = (
-        TestSellSweep.test_sold_cells_simulates_only_the_levels_that_can_sell)
-    test_a_band_s_copy_sells_as_the_family_does_after_pickling = (
-        TestSellSweep.test_a_band_s_copy_sells_as_the_family_does_after_pickling)
+    test_only_the_cells_yielded_as_points_are_simulated = (
+        TestSellSweep.test_only_the_cells_yielded_as_points_are_simulated)
+    test_a_band_s_copy_reads_the_same_grid_after_pickling = (
+        TestSellSweep.test_a_band_s_copy_reads_the_same_grid_after_pickling)
+
+    def test_every_cell_of_the_sold_grid_at_three_caps_equals_a_fresh_simulation(self,
+                                                                                 sell_run):
+        kinds = self._grid_parity(sell_run, caps=(0.05, 0.3, 1.0))
+        # Not vacuous: runs are simulated, and some settings sell nothing
+        assert kinds["point"] > 0
+        assert kinds["pruned, level"] + kinds["pruned, days"] > 0
 
     def test_sales_walk_the_bids(self, walked_sell_run):
         sell = walked_sell_run.on.sell_sweep
