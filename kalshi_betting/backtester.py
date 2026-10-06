@@ -2771,7 +2771,7 @@ class SellSweep:
             min_days (int | None): Keyword-only. One of self.min_days: sell
                 only while at least that many days remain before the
                 position's last market stops trading. None (default) sets no
-                minimum, the rule sold_cells reads.
+                minimum.
             tier_floors (bool): Keyword-only. False for the tier-floors-off
                 family's binding bands.
             add_to_held (bool): Keyword-only. Whether every simulation may
@@ -2882,68 +2882,6 @@ class SellSweep:
         return replace(self, bands=(), off_bands=(band,), entries_by_band={},
                        off_entries_by_band={band: self.off_entries_by_band[band]},
                        end_dates={}, off_end_dates=kept)
-
-    def sold_cells(self, band: tuple[float, float], k: float, *, tier_floors: bool = True,
-                   add_to_held: bool = False, caps: Iterable[float] | None = None,
-                   stats: dict | None = None,
-                   ) -> Iterator[tuple[float, dict[float, SweepPoint | None]]]:
-        """
-        Every sell level of one (band, k) cell, with no minimum of days, simulating only the levels that can sell.
-
-        sold_grid reads the same cell at every level and every minimum of
-        days; this reads the levels alone, with no minimum.
-
-        First the cell is simulated without selling, at every cap asked for;
-        _highest_sale_level reads each cap's run and gives the highest level at
-        which one of its positions would have sold. A level above that is the
-        no-selling run itself (see _highest_sale_level), so it is not
-        simulated: its cap reads None. Every other (level, cap) is simulated,
-        level by level, the caps at or above a point's peak sharing one run
-        (CapSweep). Yielded one level at a time, so only one level's points
-        are alive at once.
-
-        Args:
-            band (tuple[float, float]): One of the setting's bands.
-            k (float): One of self.ks.
-            tier_floors (bool): Keyword-only. The Tier floors setting.
-            add_to_held (bool): Keyword-only. The Add to held pairs setting.
-            caps (Iterable[float] | None): Keyword-only. The caps to cover,
-                each one of self.caps; None (default) means every one.
-            stats (dict | None): Keyword-only. When given, its "simulated" and
-                "reused" counts are raised by the cap points this call
-                simulated and shared (CapSweep's counters), the no-selling
-                runs included, for a report's log line.
-
-        Yields:
-            tuple[float, dict[float, SweepPoint | None]]: (level, cap -> the
-                "all" point selling at that level, or None where it equals the
-                no-selling run), for every level of self.levels, ascending.
-
-        Raises:
-            ValueError: As sweep(); and from CapSweep, for a cell with no end day.
-            KeyError: For a band the setting does not hold.
-        """
-        chosen = self.caps if caps is None else tuple(sorted(set(caps)))
-
-        def read(level: float | None, wanted) -> dict:
-            """One sweep's cell at `level` over the caps wanted, counted into stats."""
-            swept = self.sweep(level, tier_floors=tier_floors, add_to_held=add_to_held,
-                               caps=wanted)
-            cell = swept.cell(band, k)
-            if stats is not None:
-                stats["simulated"] = stats.get("simulated", 0) + swept.simulated
-                stats["reused"] = stats.get("reused", 0) + swept.reused
-            return cell
-
-        base = read(None, chosen)
-        # The highest level each cap's no-selling run would have sold at
-        tops = {cap: _highest_sale_level(pops["all"], self.levels)
-                for cap, pops in base.items()}
-        del base
-        for level in self.levels:
-            needed = [cap for cap in chosen if tops[cap] is not None and level <= tops[cap]]
-            sold = read(level, needed) if needed else {}
-            yield level, {cap: sold[cap]["all"] if cap in sold else None for cap in chosen}
 
     def sold_grid(self, band: tuple[float, float], k: float, *, tier_floors: bool = True,
                   add_to_held: bool = False, caps: Iterable[float] | None = None,
@@ -3534,7 +3472,7 @@ def _resolve_hold_days() -> int:
 
     Reads this module's TAKE_PROFIT_HOLD_DAYS when called (patch
     backtester's, never config's). Read wherever the sell rule is applied
-    (_simulate_at_discount with sell_at, _highest_sale_level) and by
+    (_simulate_at_discount with sell_at, _sale_reach) and by
     run_backtest_sweep before its fetch when the sell family is on.
 
     Returns:
@@ -3804,7 +3742,7 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
     """
     What selling a whole position at the checkpoint on `day` would return, and what it cost and could pay.
 
-    The one valuation a sale decides on (and _highest_sale_level replays).
+    The one valuation a sale decides on (and _sale_reach replays).
     The position's contracts are totalled per market (by ticker and side
     held: an add-on to a lone leg can hold one market as A in one trade and
     as B in another), and each market gets one sale price:
@@ -3909,7 +3847,7 @@ def _sells_at(sell_at: float, realized: float, potential: float) -> bool:
     potential (less PRICE_EPSILON of float noise). For a fixed position the
     test holds at every level below one at which it holds, since a float
     product with a positive number never falls as the other factor rises;
-    _highest_sale_level relies on that. The sell rule applies it at every
+    _sale_reach relies on that. The sell rule applies it at every
     daily check (_reached_every_day).
 
     Args:
@@ -3938,7 +3876,7 @@ def _hold_readings(position: list[BacktestTrade], day: date, hold_days: int, *,
     bid ladder, built from that check's 24-hour volume). The walk's sales
     (_simulate_at_discount), its quick test at a checkpoint where nothing is
     bought (_position_sells) and the shortcut that replays the walk
-    (_highest_sale_level) all read the checks here and decide through
+    (_sale_reach) all read the checks here and decide through
     _reached_every_day, so they apply one rule.
 
     Args:
@@ -3948,7 +3886,7 @@ def _hold_readings(position: list[BacktestTrade], day: date, hold_days: int, *,
         level (float | None): Keyword-only. When given, stop at the first
             check below this share of potential profit and return None: the
             walk asks about its one level, so a check after a failing one is
-            never read. _highest_sale_level asks about every level and
+            never read. _sale_reach asks about every level and
             passes none.
 
     Returns:
@@ -3982,7 +3920,7 @@ def _reached_every_day(sell_at: float, profits: list[tuple[float, float]]) -> bo
 
     _sells_at at each check of _hold_readings. Like _sells_at it holds at
     every level below one at which it holds (it holds at each check), which
-    _highest_sale_level relies on.
+    _sale_reach relies on.
 
     Args:
         sell_at (float): The share, in (0, 1].
@@ -4026,7 +3964,7 @@ def _position_sells(sell_at: float, position: list[BacktestTrade], day: date,
     # Sold only when every check has a price (readings is not None) and each
     # reaches sell_at. With level=sell_at, _hold_readings already stops at
     # the first check below it, so the second test repeats the first; it is
-    # kept so this, the walk's sales and _highest_sale_level all decide
+    # kept so this, the walk's sales and _sale_reach all decide
     # through the one function
     return readings is not None and _reached_every_day(sell_at, readings[1])
 
@@ -4118,91 +4056,21 @@ def _sale_stream(candidates: list[dict]):
         yield day, None
 
 
-def _highest_sale_level(point: "SweepPoint", levels: Iterable[float]) -> float | None:
-    """
-    The highest of `levels` at which some position of a run that never sold would have been sold.
-
-    Replays the sell test on a no-selling run's trades: at every checkpoint
-    from the first entry to the last pay-out (_sale_checkpoints) it groups
-    the trades open there — entered before it and paying out after it, the
-    trades a selling walk would hold — into positions (_positions) and reads
-    each at the checkpoint and at the daily checks before it, as a sale
-    would (_hold_readings, TAKE_PROFIT_HOLD_DAYS). _reached_every_day holds
-    at every level below one at which it holds, so the levels at which some
-    position sells are exactly those up to the one returned. A run selling
-    at any HIGHER level OF `levels` never sells: it walks as the no-selling
-    run until its first sale, and there is none, so it is the no-selling run
-    (only its sell_at stamp differs). The guarantee covers the levels given,
-    not every higher share: a share between the returned level and the next
-    one given can still sell, if a position's ratio of realized to potential
-    profit reached it at every check. The sell family and the dashboard
-    simulate only the levels up to it, out of the very levels they pass here.
-
-    Args:
-        point (SweepPoint): A simulation that never sold (sell_at None).
-        levels (Iterable[float]): The shares to test, each in (0, 1].
-
-    Returns:
-        float | None: The highest level at which a position sells; None
-            when none sells at any of them (or there is no trade).
-
-    Raises:
-        ValueError: For a point that sold, whose trades are not a
-            no-selling run's, or a bad TAKE_PROFIT_HOLD_DAYS.
-    """
-    if point.sell_at is not None:
-        raise ValueError("_highest_sale_level reads a run that never sold, "
-                         f"not one selling at {point.sell_at!r}")
-    hold_days = _resolve_hold_days()
-    descending = sorted(levels, reverse=True)
-    if not point.trades or not descending:
-        return None
-    by_entry = sorted(range(len(point.trades)), key=lambda i: point.trades[i].entry_date)
-    first = point.trades[by_entry[0]].entry_date
-    last = max(t.exit_date for t in point.trades)
-    best: float | None = None
-    added = 0
-    open_ids: list[int] = []
-    for day in _sale_checkpoints(first + timedelta(days=1), last - timedelta(days=1)):
-        # Open here: entered before this checkpoint, paying out after it
-        while added < len(by_entry) and point.trades[by_entry[added]].entry_date < day:
-            open_ids.append(by_entry[added])
-            added += 1
-        open_ids = [i for i in open_ids if point.trades[i].exit_date > day]
-        if not open_ids:
-            continue
-        # In the order the trades were made, as the walk holds them
-        open_trades = [point.trades[i] for i in sorted(open_ids)]
-        for position in _positions(open_trades):
-            # Every check, read once: each level is tested against all of them
-            readings = _hold_readings(position, day, hold_days)
-            if readings is None:
-                continue
-            for level in descending:
-                if best is not None and level <= best:
-                    break
-                if _reached_every_day(level, readings[1]):
-                    best = level
-                    break
-            if best == descending[0]:
-                # Every level sells somewhere: nothing higher to find
-                return best
-    return best
-
-
 def _sale_reach(point: "SweepPoint", levels: Iterable[float]) -> dict[float, int]:
     """
     For each level, the most days before maturity at which some position of a no-selling run would sell there.
 
-    The replay _highest_sale_level makes: at every checkpoint from the first
-    entry to the last pay-out it groups the trades open there into positions
-    (_positions) and reads each at the checkpoint and the daily checks
-    before it (_hold_readings). For each position it also reads its days
-    left before maturity (_days_left; a position with an unknown one is
-    skipped, since a minimum never sells it) and records them against every
-    level _reached_every_day holds at — a prefix of the ascending levels,
-    since reaching a share means reaching every lower one. The value kept
-    per level is the largest such count.
+    It replays the sell test on a run that never sold: at every checkpoint
+    from the first entry to the last pay-out (_sale_checkpoints) it groups
+    the trades open there — entered before it and paying out after it, the
+    trades a selling walk would hold — into positions (_positions) and
+    reads each at the checkpoint and the daily checks before it, as a sale
+    would (_hold_readings, TAKE_PROFIT_HOLD_DAYS). For each position it
+    also reads its days left before maturity (_days_left; a position with
+    an unknown one is skipped, since a minimum never sells it) and records
+    them against every level _reached_every_day holds at — a prefix of the
+    ascending levels, since reaching a share means reaching every lower
+    one. The value kept per level is the largest such count.
 
     What it guarantees, for SellSweep.sold_grid: a run selling at level L
     with a minimum of N days is the no-selling run itself whenever L is not a
@@ -8948,7 +8816,7 @@ def _simulate_at_discount(
     trade there is sized on the portfolio value after the sales.
     A checkpoint with no candidate changes nothing unless a position sells
     there, so at a level no position reaches the walk is exactly the one
-    that never sells (_highest_sale_level). The cap still reaches the walk
+    that never sells (_sale_reach). The cap still reaches the walk
     only through the sizes, so CapSweep's reuse above cap_free_from holds
     with selling on. With add_to_held as well, a
     position not sold may still be added to; one sold at a checkpoint is not.
@@ -9538,7 +9406,7 @@ def _simulate_at_discount(
         if c is None:
             # A checkpoint with no candidate, visited only to sell. Nothing
             # changes here unless a position sells, so a run that never sells
-            # makes exactly the moves of one that cannot (_highest_sale_level)
+            # makes exactly the moves of one that cannot (_sale_reach)
             open_now = [t for t in open_trades if t.exit_date > d]
             if not any(_position_sells(sell_level, position, d, hold_days, min_days)
                        for position in _positions(open_now)):
