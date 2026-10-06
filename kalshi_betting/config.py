@@ -459,9 +459,10 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 # CONTRACT_PAYOUT_DOLLARS less what it cost) for TAKE_PROFIT_HOLD_DAYS days in a
 # row. Every 1% from 80% to 100%, 21 levels, each the float nearest its percent
 # over 100 (so 81% is exactly the float 0.81). BACKTEST-ONLY: live trading
-# never sells a position (no live module reads this). Read by
-# backtester.run_backtest_sweep(sell_sweep=True), whose lazy SellSweep
-# simulates each level when the dashboard reads it.
+# never sells a position (no live module reads this). Distinct shares in
+# (0, 1]. Read by backtester.run_backtest_sweep(sell_sweep=True), which checks
+# them before its fetch, and whose lazy SellSweep simulates each level when the
+# dashboard reads it.
 TAKE_PROFIT_LEVELS = tuple(percent / 100 for percent in range(80, 101))
 
 # The minimum-days options the backtest dashboard offers beside each sell level:

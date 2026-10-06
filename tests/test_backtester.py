@@ -18462,16 +18462,18 @@ class TestSellSweep:
         pd.testing.assert_frame_equal(point.equity_df, other.equity_df, check_exact=True)
         assert point.peak_kelly_fraction == other.peak_kelly_fraction
 
-    def _grid_parity(self, sell_run, *, only=None, caps=None) -> Counter:
+    def _grid_parity(self, sell_run, *, only=None, caps=None, sell=None) -> Counter:
         """Read every (level, minimum, cap) of sold_grid and check each cell
         against a fresh simulation at that level, minimum and cap: a point is
         that simulation; a SameSale names an EARLIER cell of the same cap that
         was yielded as a point, and the fresh run equals that point; None is
         the no-selling run, and the fresh run there makes no sale. `only`
         keeps the (tier_floors, k, add_to_held) settings it names (None:
-        every one), `caps` is handed to sold_grid. Returns how many cells of
+        every one), `caps` is handed to sold_grid, and `sell` replaces the
+        run's SellSweep (None: the run's own). Returns how many cells of
         each kind were read."""
-        sell, start = sell_run.on.sell_sweep, sell_run.start
+        sell = sell_run.on.sell_sweep if sell is None else sell
+        start = sell_run.start
         kinds: Counter = Counter()
         for tier_floors, bands, entries_by_band, end_dates in self._settings(sell):
             for band in bands:
@@ -18568,6 +18570,52 @@ class TestSellSweep:
         # The same narrow check passes with the real cover
         kinds = self._grid_parity(sell_run, only={(True, 0.75, False)}, caps=(0.5, 1.0))
         assert kinds["same"] > 0
+
+    # Every minimum of days from 1 to one past the fixture's farthest reach
+    # (60 days): the four options above never sit on a cover's or a reach's
+    # boundary (sales 13, 20, 26, 33, 53 and 60 days out; reaches 26, 53 and
+    # 60), and every whole number does
+    _WIDE_DAYS = tuple(range(1, 62))
+
+    def _wide_parity(self, sell_run) -> Counter:
+        """_grid_parity over every setting at caps 50% and no cap, with every
+        minimum of _WIDE_DAYS in place of the run's four options."""
+        wide = dc_replace(sell_run.on.sell_sweep, min_days=self._WIDE_DAYS)
+        return self._grid_parity(sell_run, caps=(0.5, 1.0), sell=wide)
+
+    def test_every_minimum_on_every_boundary_equals_a_fresh_simulation(self, sell_run):
+        kinds = self._wide_parity(sell_run)
+        # Not vacuous: runs simulated, runs repeated, and the run without
+        # selling both where the level is never reached and where the minimum
+        # is past the reach
+        for kind in ("point", "same", "pruned, level", "pruned, days"):
+            assert kinds[kind] > 0, (kind, kinds)
+
+    # Two ways sold_grid could leave the boundaries the narrow check above
+    # cannot see: a cover with no lower days bound (a run from an earlier
+    # level with a larger minimum taken as this cell's run), and a reach
+    # whose own number of days is pruned as though no position sold there
+    _SOLD_GRID_MUTANTS = {
+        "no lower days bound": ("if d0 <= min_days <= fewest and li <= top_index",
+                                "if min_days <= fewest and li <= top_index"),
+        "the reach itself pruned": ("if top is None or min_days > top:",
+                                    "if top is None or min_days >= top:"),
+    }
+
+    @pytest.mark.parametrize("mutant", sorted(_SOLD_GRID_MUTANTS))
+    def test_the_wide_check_catches_a_sold_grid_off_its_boundaries(self, sell_run,
+                                                                    monkeypatch, mutant):
+        # sold_grid's own source with one comparison changed, compiled in
+        # backtester's namespace: the wide parity check above must fail on it
+        old, new = self._SOLD_GRID_MUTANTS[mutant]
+        source = textwrap.dedent(inspect.getsource(backtester.SellSweep.sold_grid))
+        assert source.count(old) == 1
+        namespace = dict(vars(backtester))
+        exec(compile(source.replace(old, new), "<sold_grid mutant>", "exec"), namespace)
+        with monkeypatch.context() as mp:
+            mp.setattr(backtester.SellSweep, "sold_grid", namespace["sold_grid"])
+            with pytest.raises(AssertionError):
+                self._wide_parity(sell_run)
 
     def test_only_the_cells_yielded_as_points_are_simulated(self, sell_run, monkeypatch):
         sell = sell_run.on.sell_sweep
@@ -18678,6 +18726,32 @@ class TestSellSweep:
         monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
         assert run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
                                   start_date=date(2026, 1, 1)).sell_sweep is None
+
+    @pytest.mark.parametrize("bad", [(0.0,), (True,), (), (0.5, 0.5), (0.5, np.float64(0.5)),
+                                     (1.5,), (float("nan"),), ("0.9",), (Decimal("0.9"),),
+                                     0.9, None])
+    def test_bad_sell_levels_are_refused_before_any_fetch(self, monkeypatch, caplog, bad):
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_LEVELS", bad)
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: pytest.fail("fetched"))
+        with caplog.at_level(logging.INFO), pytest.raises(ValueError,
+                                                          match="TAKE_PROFIT_LEVELS"):
+            run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                               start_date=date(2026, 1, 1), sell_sweep=True)
+        # Refused before the run's first line
+        assert not caplog.records
+        # Only the sell family reads them
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        assert run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                  start_date=date(2026, 1, 1)).sell_sweep is None
+
+    def test_the_levels_are_checked_and_sorted(self, monkeypatch):
+        with monkeypatch.context() as mp:
+            mp.setattr(backtester, "TAKE_PROFIT_LEVELS", (np.float64(0.9), 0.85, 1))
+            levels = backtester._resolve_sell_levels()
+        assert levels == (0.85, 0.9, 1.0) and all(type(level) is float for level in levels)
+        assert backtester._resolve_sell_levels() == tuple(
+            percent / 100 for percent in range(80, 101))
 
     def test_the_options_are_checked_and_sorted(self, monkeypatch):
         with monkeypatch.context() as mp:

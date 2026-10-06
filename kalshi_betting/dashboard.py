@@ -100,15 +100,16 @@ Purpose:
     page opened from disk may load a script beside it, where fetch() is
     refused). Which chunk each setting shows is not in the base block: each
     task's ids are one packed block of the page ("dash-sell-<i>"), which the
-    script inflates only when a level is first chosen at that band, and the
-    base block names which block holds which band (sell_blocks). The page
+    script inflates only when a level is first chosen at that band and Tier
+    floors setting, and the base block names which block holds which band
+    under each setting (sell_blocks). The page
     and its folder are kept, copied and moved together; each build deletes
     the folders of earlier builds once it has replaced the page
     (_publish_page, under a lock, and never a folder another build is still
-    writing). The choice changes the
+    writing). The two choices change the
     trade sections and the header's trade count; the k-hat figures do not
-    depend on it, and the Scenario Explorer and the Interval Discount
-    section never follow it. Save as live defaults… stays disabled while a
+    depend on them, and the Scenario Explorer and the Interval Discount
+    section never follow them. Save as live defaults… stays disabled while a
     level is chosen, since live trading never sells. A page whose sweep has
     no Sell family, or whose family does not fit the grid or cannot be
     built, keeps the select disabled with a short note.
@@ -457,6 +458,7 @@ import re
 import secrets
 import shutil
 import time
+from array import array
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -5939,14 +5941,15 @@ _SELL_SUMMARY_NOTE = (" A sale ends its trade on the sale day: its profit is wha
                       "returned, after the sale's fees, less what it cost, and its slippage "
                       "is how far that falls short of its profit had it won. Live trading "
                       "never sells, so Save as live defaults… is off.")
-# Closes the summary line's reach sentence on a page that has the Sell view;
-# the second is for a page with no Scenario Explorer grid
-_SELL_REACH = ("Sell changes the trade sections only; the k̂ figures do not depend on it, "
-               "and the Scenario Explorer and Interval Discount sections always show no "
-               "selling.")
-_SELL_REACH_NO_EXPLORER = ("Sell changes the trade sections only; the k̂ figures do not "
-                           "depend on it, and the Interval Discount section always shows no "
-                           "selling.")
+# Closes the summary line's reach sentence on a page that has the Sell view
+# (the Sell and Min. days to maturity selects reach the same sections); the
+# second is for a page with no Scenario Explorer grid
+_SELL_REACH = ("Sell and Min. days to maturity change the trade sections only; the k̂ "
+               "figures do not depend on them, and the Scenario Explorer and Interval "
+               "Discount sections always show no selling.")
+_SELL_REACH_NO_EXPLORER = ("Sell and Min. days to maturity change the trade sections only; "
+                           "the k̂ figures do not depend on them, and the Interval Discount "
+                           "section always shows no selling.")
 # Beside the select when the page keeps it shut, by the payload's "sell_state"
 _SELL_NOTES = {
     "not simulated": "(not simulated in this backtest)",
@@ -8912,16 +8915,25 @@ class _SellTask:
 @dataclass(frozen=True)
 class _SellResult:
     """
-    What one task produced.
+    What one task produced, compactly: one row of small numbers per cell, and the list keys they name.
+
+    The parent holds every task's result until the last task finishes, so a
+    cell's settings are stored as one array of C ints (array("i")) rather
+    than one dict entry per (level, minimum of days, cell).
 
     Attributes:
         index (int): Its task's index.
-        cells (dict): (level index, minimum-days index, adds to held pairs,
-            k index, cap index) -> the cell's list key (_list_key), or None
-            where that sell setting sells nothing (no position of the cell's
-            run without selling reaches the level with that many days left,
-            backtester._sale_reach): it is then the run without selling, the
-            page's own chunk.
+        keys (tuple[str, ...]): Every distinct list key (_list_key) the
+            task's rows name, in the order the task first met each: the keys
+            of the page's own chunks and of the files this task wrote.
+        rows (dict): (adds to held pairs, k index, cap index) of every cell
+            the task covered -> an array("i") with one entry per (level,
+            minimum of days), level by level and each level's minimums in
+            order (the order of the Sell blocks' rows): the index in keys of
+            that sell run's list key, or -1 where that setting sells nothing
+            (no position of the cell's run without selling reaches the level
+            with that many days left, backtester._sale_reach), so it is the
+            run without selling, the page's own chunk.
         written (tuple[str, ...]): The keys this task wrote a chunk file for,
             in the order written.
         simulated (int): Cap points the task simulated (CapSweep's counter).
@@ -8932,7 +8944,8 @@ class _SellResult:
         pruned (int): Cells that are the run without selling.
     """
     index: int
-    cells: dict
+    keys: tuple
+    rows: dict
     written: tuple
     simulated: int
     reused: int
@@ -9124,10 +9137,12 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     shows its own chunk there. Each point's curve is cut to the page's axis
     (_cut_to_axis) and keyed (_list_key, once per trade list read at one
     (level, minimum)); a key that is neither in the page nor already written
-    by this task is written (_write_sell_chunk). A SameSale takes the key of
-    the cell it names (seen), so it needs no simulation and no file. Only one
-    (level, minimum)'s points are alive at a time: each yield's are dropped
-    before the next is read.
+    by this task is written (_write_sell_chunk). Each cell's answers go into
+    its row (_SellResult.rows) as the key's place in the task's key list, or
+    -1 for the run without selling; a SameSale copies the entry its earlier
+    setting left in the same row, so it needs no simulation and no file.
+    Only one (level, minimum)'s points are alive at a time: each yield's are
+    dropped before the next is read.
 
     Runs in a worker process (task.install True: the parent's
     SAME_TITLE_SIZE_CAP, SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS are
@@ -9137,8 +9152,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
         task (_SellTask): The task.
 
     Returns:
-        _SellResult: Every cell's key (or None), the keys written, and the
-            simulation counts.
+        _SellResult: Every covered cell's row and the keys the rows name, the
+            keys written, and the simulation counts.
 
     Raises:
         Exception: Whatever a simulation or a write raised; the parent logs it
@@ -9155,8 +9170,13 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     axis_end = task.axis[-1] if len(task.axis) else None
     level_index = {level: li for li, level in enumerate(family.levels)}
     days_index = {days: di for di, days in enumerate(family.min_days)}
+    n_days = len(family.min_days)
+    width = len(family.levels) * n_days
     stats = {"simulated": 0, "reused": 0, "same": 0, "pruned": 0}
-    cells: dict = {}
+    # Every distinct key the rows name, and each one's place in that list
+    keys: list[str] = []
+    key_place: dict[str, int] = {}
+    rows: dict[tuple[bool, int, int], array] = {}
     written: list[str] = []
     done: set[str] = set()
     for ki, k in enumerate(task.ks):
@@ -9164,42 +9184,46 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
             wanted = [ci for ci in range(len(task.caps)) if (add, ki, ci) in task.cells]
             if not wanted:
                 continue
-            # (level index, days index, cap index) -> the key of every cell
-            # read for this k and setting, which a later SameSale names
-            seen: dict[tuple[int, int, int], str | None] = {}
+            # One row per cell, every setting filled in as sold_grid yields it
+            cell_rows = {ci: array("i", [-1]) * width for ci in wanted}
             # backtester.SellSweep.sold_grid: only the runs that differ, simulated
             grid = family.sold_grid(band, k, tier_floors=task.tier_floors, add_to_held=add,
                                     caps=[task.caps[ci] for ci in wanted], stats=stats)
             for level, min_days, by_cap in grid:
-                li, di = level_index[level], days_index[min_days]
+                place = level_index[level] * n_days + days_index[min_days]
                 cut = _cut_to_axis({cap: {_ALL_VIEW: cell} for cap, cell in by_cap.items()
                                     if cell is not None and not isinstance(cell, SameSale)},
                                    axis_end)
                 # One key per trade list: caps at or above a sharing floor share one
-                keys: dict[int, str] = {}
+                listed: dict[int, str] = {}
                 for ci in wanted:
                     cell = by_cap[task.caps[ci]]
                     if cell is None:
                         # Sells nothing: the run without selling
-                        key = None
-                    elif isinstance(cell, SameSale):
+                        continue
+                    if isinstance(cell, SameSale):
                         # Exactly the run read at that earlier setting, same cap
-                        key = seen[(level_index[cell.level], days_index[cell.min_days], ci)]
-                    else:
-                        point = cut[task.caps[ci]][_ALL_VIEW]
-                        key = keys.get(id(point.trades))
-                        if key is None:
-                            key = keys[id(point.trades)] = _list_key(k, point.trades)
-                        if key not in task.inline_keys and key not in done:
-                            _write_sell_chunk(task, key, k, point)
-                            done.add(key)
-                            written.append(key)
-                    seen[(li, di, ci)] = key
-                    cells[(li, di, add, ki, ci)] = key
+                        cell_rows[ci][place] = cell_rows[ci][
+                            level_index[cell.level] * n_days + days_index[cell.min_days]]
+                        continue
+                    point = cut[task.caps[ci]][_ALL_VIEW]
+                    key = listed.get(id(point.trades))
+                    if key is None:
+                        key = listed[id(point.trades)] = _list_key(k, point.trades)
+                    if key not in task.inline_keys and key not in done:
+                        _write_sell_chunk(task, key, k, point)
+                        done.add(key)
+                        written.append(key)
+                    if key not in key_place:
+                        key_place[key] = len(keys)
+                        keys.append(key)
+                    cell_rows[ci][place] = key_place[key]
                 # Nothing of this yield is kept while the next is simulated
-                by_cap = cut = keys = cell = point = None
-    return _SellResult(task.index, cells, tuple(written), stats["simulated"], stats["reused"],
-                       stats["same"], stats["pruned"])
+                by_cap = cut = listed = cell = point = None
+            for ci, row in cell_rows.items():
+                rows[(add, ki, ci)] = row
+    return _SellResult(task.index, tuple(keys), rows, tuple(written), stats["simulated"],
+                       stats["reused"], stats["same"], stats["pruned"])
 
 
 def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: date,
@@ -9382,9 +9406,10 @@ def _build_sell_grid(
     else the next sidecar id after the page's chunks — the file renamed to
     chunk-<id>.js — so the numbering does not depend on which worker finished
     first. Each finished task becomes one packed block (see _SellGrid): every
-    covered cell's row holds one id per (level, minimum of days), -1 where
-    that setting sells nothing (the page's own chunk for the scenario), so a
-    row is full wherever a cell is covered. With the tier floors off, a band
+    covered cell's row (_SellResult.rows, places in the task's key list)
+    becomes one chunk id per (level, minimum of days), -1 where that setting
+    sells nothing (the page's own chunk for the scenario), so a row is full
+    wherever a cell is covered. With the tier floors off, a band
     they never bind at names its tier-on block in the index, as the page's
     base grid shows its tier-on run there. Files a failed task left behind
     are deleted, and its band's index entry stays None.
@@ -9440,7 +9465,6 @@ def _build_sell_grid(
     bases = {(0, 0): chunker.grid, (0, 1): add_grid, (1, 0): off_grid,
              (1, 1): chunker.add_off_grid() if (off_grid is not None and add_grid is not None)
              else None}
-    width = len(sell.levels) * len(sell.min_days)
     index: list = [[None] * len(walked.bands), [None] * len(walked.bands)]
     blocks: list[str] = []
     for task in tasks:
@@ -9450,13 +9474,14 @@ def _build_sell_grid(
         t = 0 if task.tier_floors else 1
         data = [None if bases[(t, a)] is None
                 else [[None] * len(walked.caps) for _ in walked.ks] for a in (0, 1)]
-        for (li, di, adds, ki, ci), key in result.cells.items():
+        # Each key the task's rows name, as a chunk id
+        chunk_ids = [ids[key] for key in result.keys]
+        for (adds, ki, ci), row in result.rows.items():
             rows = data[1 if adds else 0]
             if rows is None:
                 continue
-            cell = rows[ki][ci] = rows[ki][ci] or [None] * width
             # -1: sells nothing, so the scenario's own chunk
-            cell[li * len(sell.min_days) + di] = -1 if key is None else ids[key]
+            rows[ki][ci] = [-1 if place < 0 else chunk_ids[place] for place in row]
         index[t][task.band_index] = len(blocks)
         blocks.append(_packed_json_script(f"dash-sell-{len(blocks)}", data))
     if off_grid is not None:
@@ -10825,9 +10850,9 @@ _FILTER_JS = r"""
   // choice ("none", or a level's index) and the Min. days to maturity choice
   // (an index into D.sell_days), each appended after the others so the other
   // indexes keep their meaning. SELL: every Sell block ("dash-sell-<i>")
-  // inflated or inflating, by i — each band's chunk ids at every sell level
-  // and minimum of days, inflated the first time a level is chosen at that
-  // band and then kept.
+  // inflated or inflating, by i — one band's chunk ids under one Tier floors
+  // setting at every sell level and minimum of days, inflated the first time
+  // a level is chosen there and then kept.
   var D = null, N = 0, C = null, CHUNKS = {}, KEPT = [], SEQ = 0, SHOWN = null;
   var SELL = {};
   var KEEP = 16;                     // drawn chunks kept besides the primary
@@ -11748,8 +11773,8 @@ def generate_dashboard(
     the bar shows, in up to sell_workers spawned worker processes, each new
     trade list written as a sidecar chunk file in a new build folder beside
     the page, DASHBOARD_FILES_DIRNAME / <build id> in the page's folder, and
-    each band's chunk ids as a packed block written after the page's own
-    chunks); a failure costs the Sell select alone, and a folder no chunk
+    each band's chunk ids under each Tier floors setting as a packed block
+    written after the page's own chunks); a failure costs the Sell select alone, and a folder no chunk
     was written to is deleted. If the filter's data
     cannot be built, the page is written without the bar and its script,
     with a notice in the bar's place (and in the k-hat breakdown's, which

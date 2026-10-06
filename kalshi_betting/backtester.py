@@ -2725,7 +2725,8 @@ class SellSweep:
     BacktestSweep's size-cap and add-on families already hold.
 
     Attributes:
-        levels (tuple[float, ...]): The sell levels, ascending, each in (0, 1].
+        levels (tuple[float, ...]): The sell levels, ascending, distinct,
+            each in (0, 1] (_resolve_sell_levels).
         min_days (tuple[int, ...]): The minimum-days options, ascending,
             each a whole number of at least 1 (_resolve_min_days_options).
         caps (tuple[float, ...]): The size caps of every scenario (the
@@ -2892,8 +2893,9 @@ class SellSweep:
         Every (sell level, minimum of days) of one (band, k) cell, simulating only the runs that differ.
 
         First the cell is simulated without selling, at every cap asked for,
-        and _sale_reach reads each cap's run: for each level, the most days
-        before maturity at which one of its positions would have sold there.
+        and _sale_reach reads each distinct run once (caps that share one run
+        share its reading): for each level, the most days before maturity at
+        which one of its positions would have sold there.
         Then the levels are read in ascending order, and each level's
         minimums in ascending order, and every (level, minimum, cap) is one
         of three things:
@@ -2905,8 +2907,8 @@ class SellSweep:
             this level is at or above level0 and at or below the highest
             level all of that run's sales reached, and this minimum is at or
             above min_days0 and at or below the fewest days any of its sales
-            had left (_sale_cover). Both bounds are needed: a run from an
-            earlier level can have a larger minimum than this one;
+            had left (_sale_cover). Both days bounds are needed: a run from
+            an earlier level can have a larger minimum than this one;
           * a point — simulated, the caps at or above a point's peak sharing
             one run (CapSweep). Every such run sells at least once, since
             its minimum is within the cap's reach (_sale_reach); a run that
@@ -2960,9 +2962,18 @@ class SellSweep:
             return cell
 
         base = read(None, None, chosen)
-        # For each cap, the most days left at which each level sells somewhere
-        reach = {cap: _sale_reach(pops["all"], self.levels) for cap, pops in base.items()}
-        del base
+        # For each cap, the most days left at which each level sells
+        # somewhere. Caps at or above a run's sharing floor hold copies of one
+        # run, with the same trades list, and _sale_reach's answer depends on
+        # the trades alone, so each distinct run is replayed once
+        replayed: dict[int, dict[float, int]] = {}
+        reach: dict[float, dict[float, int]] = {}
+        for cap, pops in base.items():
+            point = pops["all"]
+            if id(point.trades) not in replayed:
+                replayed[id(point.trades)] = _sale_reach(point, self.levels)
+            reach[cap] = replayed[id(point.trades)]
+        del base, replayed
         # Per cap, every run simulated so far: (level index, minimum, its _sale_cover)
         runs: dict[float, list[tuple[int, int, tuple[int, int]]]] = {cap: [] for cap in chosen}
 
@@ -3194,9 +3205,10 @@ class BacktestSweep:
             America/Los_Angeles"), for the dashboard header. None = not
             recorded (a hand-built sweep).
         sell_sweep (SellSweep | None): The dashboard's "Sell" family: every
-            sell level of every scenario, simulated when the dashboard reads
-            it. None unless run_backtest_sweep(sell_sweep=True) ran on a
-            feasible window.
+            sell level (config.TAKE_PROFIT_LEVELS), each with every minimum of
+            days before maturity (config.TAKE_PROFIT_MIN_DAYS), of every
+            scenario, simulated when the dashboard reads it. None unless
+            run_backtest_sweep(sell_sweep=True) ran on a feasible window.
         depth_model (DepthModel | None): The depth model every trade's
             synthetic order book came from (which snapshots, how many
             ladders, when they were taken), for the page's header; None when
@@ -3464,6 +3476,41 @@ def _resolve_sell_at(sell_at: float | None) -> float | None:
     if sell_at is None:
         return None
     return _validated_cap(sell_at, "sell_at")
+
+
+def _resolve_sell_levels() -> tuple[float, ...]:
+    """
+    Check the sell levels the Sell family offers, and return them in ascending order.
+
+    Reads this module's TAKE_PROFIT_LEVELS when called (patch backtester's,
+    never config's). run_backtest_sweep calls it before its fetch when the
+    sell family is on, so a bad level is refused in milliseconds rather than
+    after the fetch, and _sweep_from_candidates calls it again to build the
+    SellSweep's levels. Each level is checked as one simulation's sell level
+    is (_resolve_sell_at's rule, _validated_cap). A level named twice is
+    refused: the dashboard's Sell build finds each level's place among the
+    options by its value, so a repeated level would leave one of its two
+    places unfilled.
+
+    Returns:
+        tuple[float, ...]: The levels, ascending, as builtin floats.
+
+    Raises:
+        ValueError: If TAKE_PROFIT_LEVELS is not a collection, is empty, holds
+            a value that is not a real number in (0, 1] (a bool or NaN
+            included), or names one level twice.
+    """
+    try:
+        levels = tuple(TAKE_PROFIT_LEVELS)
+    except TypeError:
+        raise ValueError("TAKE_PROFIT_LEVELS must be a tuple of shares in (0, 1], got "
+                         f"{TAKE_PROFIT_LEVELS!r}") from None
+    if not levels:
+        raise ValueError("TAKE_PROFIT_LEVELS must name at least one sell level")
+    checked = [_validated_cap(level, "each of TAKE_PROFIT_LEVELS") for level in levels]
+    if len(set(checked)) != len(checked):
+        raise ValueError(f"TAKE_PROFIT_LEVELS names a level twice: {levels!r}")
+    return tuple(sorted(checked))
 
 
 def _resolve_hold_days() -> int:
@@ -11294,7 +11341,7 @@ def _sweep_from_candidates(
         # nothing simulated here
         sell_caps = caps if cap_sweep else (primary.size_cap,)
         sold = SellSweep(
-            levels=tuple(sorted(TAKE_PROFIT_LEVELS)), min_days=_resolve_min_days_options(),
+            levels=_resolve_sell_levels(), min_days=_resolve_min_days_options(),
             caps=sell_caps, primary_cap=primary.size_cap, bands=tuple(bands),
             off_bands=tuple(tier_off_bands), ks=tuple(grid), primary_k=effective_k,
             start_date=start_date, initial_balance=initial_balance,
@@ -11542,8 +11589,10 @@ def run_backtest_sweep(
             (0, 1], if this module's SAME_TITLE_SIZE_CAP is not on the 5%
             grid in (0, 1], if sell_sweep is set and this module's
             TAKE_PROFIT_HOLD_DAYS is not a whole number from 1 to
-            _HOLD_DAYS_MAX or its TAKE_PROFIT_MIN_DAYS is not a non-empty
-            collection of distinct whole numbers of at least 1, or if
+            _HOLD_DAYS_MAX, its TAKE_PROFIT_LEVELS is not a non-empty
+            collection of distinct real numbers in (0, 1] or its
+            TAKE_PROFIT_MIN_DAYS is not a non-empty collection of distinct
+            whole numbers of at least 1, or if
             spread_band is not a valid band; and,
             before any fetch, from _prepare_candidates() when SCHEDULED_RUN
             cannot place the entry checkpoints (a configuration error).
@@ -11585,10 +11634,11 @@ def run_backtest_sweep(
     # The same for the extra same-title cap: refused here, not after the fetch
     same_title_cap = _resolve_same_title_size_cap()
     # ... and, when the sell family rides the result, for the sell rule's day
-    # count and the minimum-days options, which the dashboard otherwise reads
-    # only after the run
+    # count, the sell levels and the minimum-days options, which the
+    # dashboard otherwise reads only after the run
     hold_days = _resolve_hold_days() if sell_sweep else None
     if sell_sweep:
+        _resolve_sell_levels()
         _resolve_min_days_options()
     # And for k: every simulation hands it to the live sizer, whose
     # LiveSettings takes only a k in (0, 1]

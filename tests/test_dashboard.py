@@ -44,6 +44,7 @@ import re
 import shutil
 import subprocess
 import warnings
+from array import array
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -10926,6 +10927,34 @@ class TestSellGrid:
         # The blocks sit after the page's own chunks and before the base block
         assert (page.index('id="dash-chunk-4"') < page.index('id="dash-sell-0"')
                 < page.index('id="dash-sell-1"') < page.index('id="dash-data"'))
+
+    def test_a_task_returns_one_compact_row_per_cell(self, tmp_path):
+        # A task's result holds, per covered cell, one array of small numbers
+        # (a place in its key list, or -1 for the run without selling), not
+        # one entry per setting: the parent keeps every result until the
+        # last task ends
+        walked, chunker, _grid = _sl_build(_kc_sweep_sell(), tmp_path / "f")
+        folder = tmp_path / "g"
+        folder.mkdir()
+        tasks = dashboard._sell_tasks(walked, chunker, start_date=_FLT_START,
+                                      initial_balance=1000.0,
+                                      series_categories=_FLT_SERIES_TIERS, risk_free=None,
+                                      folder=folder)
+        width = len(walked.sell.levels) * len(walked.sell.min_days)
+        assert tasks
+        for task in tasks:
+            result = dashboard._run_sell_task(task)
+            assert set(result.rows) == set(task.cells)
+            assert len(set(result.keys)) == len(result.keys)
+            for row in result.rows.values():
+                assert isinstance(row, array) and row.typecode == "i" and len(row) == width
+                assert all(-1 <= place < len(result.keys) for place in row)
+            # Every key is named by a row, and is the page's own or one the
+            # task wrote
+            assert {result.keys[place] for row in result.rows.values()
+                    for place in row if place >= 0} == set(result.keys)
+            assert set(result.written) <= set(result.keys) <= (
+                set(chunker.seen) | set(result.written))
 
     def test_a_worker_sells_by_the_parent_s_day_count(self, monkeypatch, tmp_path):
         # Each task carries the parent's TAKE_PROFIT_HOLD_DAYS beside its
