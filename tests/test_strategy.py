@@ -3225,6 +3225,12 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(backtester, "_simulate_at_discount", "_position_sells")
         for func in ("_simulate_at_discount", "_highest_sale_level"):
             assert _function_calls(backtester, func, "_positions"), func
+        # The days rule (sell_min_days): the walk's sales and its quick test
+        # at a checkpoint with no candidate both ask _far_enough, the one
+        # test, which reads a position's days to maturity from _days_left
+        for func in ("_simulate_at_discount", "_position_sells"):
+            assert _function_calls(backtester, func, "_far_enough"), func
+        assert _function_calls(backtester, "_far_enough", "_days_left")
 
     def test_ast_the_price_paid_and_the_book_each_have_one_reader(self):
         # What a backtest trade paid (fill_price_a/_b) is read only through

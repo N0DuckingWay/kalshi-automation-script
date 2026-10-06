@@ -1422,6 +1422,32 @@ a later checkpoint, so a price that jumps for a moment does not trigger a sale.
 with the Sell select on, a backtest refuses any other value before it fetches
 any market data.
 
+**A minimum of days before maturity.** The backtester can also hold back a
+sale that comes too close to the end: `_simulate_at_discount(sell_at=…,
+sell_min_days=N)` sells a position that has reached its level only while at
+least N days remain before it **matures** — the day its last market stops
+trading, i.e. the latest close date among its markets, counted in calendar
+days from the checkpoint's date (the close dates are UTC on every Kalshi
+timestamp, and the checkpoint's date is its UTC date). Nearer than that, the
+position is not sold; since its days left only shrink, it is then held until
+it pays out (unless, with Add to held pairs, an add-on brings in a market
+that closes later). N is a whole number of at least 1 and needs a sell level;
+without it (the default) there is no minimum. A minimum of 1 day is almost
+the same as none: the two differ only when the position's last market closes
+on the checkpoint's own UTC date or earlier. Every selling run records, for
+each position it sells, the days it had left and its profit at each check
+(`SweepPoint.sales`). The dashboard's Sell select does not offer a minimum.
+One look-ahead to know about: the backtest's close date is the date a
+settled market actually closed, so for an event decided early the backtest
+sees maturity coming sooner than a live trader, reading the scheduled close,
+would have.
+
+**Sales come before purchases.** At each checkpoint the backtest first pays
+out what settled, then makes its sales, then values the portfolio, and only
+then buys — new pairs and add-ons to held pairs alike. So a sale's money is
+there for that checkpoint's purchases, and every purchase there is sized on
+the portfolio value after the sales.
+
 A leg with no fresh bid at a checkpoint, or whose ladder at any of the checks
 holds fewer contracts than the position, cannot be sold there, so its position
 is held until the next one. A sold trade ends on the sale day at the sale's

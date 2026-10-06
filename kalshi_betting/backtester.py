@@ -82,7 +82,7 @@ Dependencies:
     and strategy.compute_trade picks the count, through scanner's
     CandidatePair, HeldPair, _market_from_dict and leg_prices. The Kelly
     gate in Pass 1 still copies the formula, at the top of the book.
-    Exports BacktestTrade, HalfSplit, SweepPoint,
+    Exports BacktestTrade, HalfSplit, SaleCheck, SweepPoint,
     CalibrationObservation, IntervalCalibrationBucket, IntervalCalibration,
     OutcomeLabelCoverage, CapSweep, SIZE_CAP_SWEEP and BacktestSweep
     (BacktestTrade, BacktestSweep,
@@ -252,7 +252,10 @@ Notes:
     sell_at) — over every scenario the filter bar shows, tier floors on and
     off, adding to held pairs or not. Like the add-on family it simulates
     nothing during the run; each cell is simulated when the dashboard reads
-    it.
+    it. _simulate_at_discount (and CapSweep) can also hold back a sale when
+    fewer than sell_min_days days remain before the position's last market
+    stops trading; every selling run records each sale it makes as a
+    SaleCheck on SweepPoint.sales.
 
     An ENTRY CHECKPOINT is a moment at which the backtest may open a
     simulated trade: the live bot's weekly run time (config.SCHEDULED_RUN,
@@ -619,7 +622,8 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
                  end_date: date | None = None,
                  tier_floors: bool = True,
                  add_to_held: bool = False,
-                 sell_at: float | None = None) -> dict:
+                 sell_at: float | None = None,
+                 sell_min_days: int | None = None) -> dict:
     """
     Build the keyword arguments a sweep helper forwards to _simulate_at_discount.
 
@@ -652,8 +656,9 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
     tier-on CapSweep calls the simulator with exactly the keywords it always
     did (size_cap, quiet, and end_date when pinned), and a tier-off one adds
     tier_floors=False. add_to_held is forwarded only when it is exactly True
-    (a CapSweep that adds to held pairs), and sell_at only when it is set (a
-    CapSweep that sells early), so every other call is unchanged.
+    (a CapSweep that adds to held pairs), and sell_at and sell_min_days each
+    only when it is set (a CapSweep that sells early, with or without a
+    minimum of days before maturity), so every other call is unchanged.
 
     Args:
         size_cap (float | None): The cap the caller simulates under; None or
@@ -674,11 +679,16 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
             at which the simulation sells a position early (see
             _simulate_at_discount); forwarded only when it is not None.
             Default None, not forwarded.
+        sell_min_days (int | None): Keyword-only. The fewest days a position
+            must have left before its last market stops trading for the
+            simulation to sell it (see _simulate_at_discount); forwarded only
+            when it is not None. Default None, not forwarded.
 
     Returns:
         dict: {} on a default call; otherwise "size_cap", "quiet",
             "end_date", "tier_floors" (always False when present),
-            "add_to_held" (always True when present) and/or "sell_at".
+            "add_to_held" (always True when present), "sell_at" and/or
+            "sell_min_days".
     """
     out: dict = {}
     if size_cap is not None and size_cap != BUDGET_FRACTION:
@@ -694,6 +704,8 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
         out["add_to_held"] = True
     if sell_at is not None:
         out["sell_at"] = sell_at
+    if sell_min_days is not None:
+        out["sell_min_days"] = sell_min_days
     return out
 
 # ─── Data structures ──────────────────────────────────────────────────────────
@@ -1458,8 +1470,10 @@ class BacktestTrade:
         close_date_b (date | None): The date market B closed for trading.
         settled_date_a (date | None): The date market A settled.
         settled_date_b (date | None): The date market B settled. All six are
-            reporting only, read by the dashboard's best/worst trade tables;
-            None/"" on a trade constructed without them.
+            read by the dashboard's best/worst trade tables, and the two
+            close dates also by the sell rule's minimum of days before
+            maturity (_days_left: a position matures when its last market
+            closes); None/"" on a trade constructed without them.
         add_on (bool): True when this trade added to a pair the simulation
             still held — the same two markets, bought the same way round, while
             an earlier trade of the pair was open (only a simulation run with
@@ -1639,6 +1653,34 @@ class HalfSplit:
     h2_entries: int | None = None
 
 
+@dataclass(frozen=True)
+class SaleCheck:
+    """
+    One position a selling simulation sold: how many days it had left, and its profit at each check.
+
+    _simulate_at_discount records one for every position it sells, in the
+    order it sells them, on SweepPoint.sales. Together they say, without
+    simulating again, whether a stricter sell setting would have made every
+    one of the same sales: a higher share of potential profit (every check's
+    profits must still reach it, as _reached_every_day reads them) or more
+    days required before maturity (days_left must still be at least that
+    many, as _far_enough reads it).
+
+    Declared before SweepPoint for the same reason as HalfSplit: SweepPoint
+    annotates a field with this class.
+
+    Attributes:
+        days_left (int | None): Calendar days from the sale's checkpoint date
+            to the latest close date among the position's markets
+            (_days_left); None when one of its trades has no close date.
+        profits (tuple[tuple[float, float], ...]): (realized profit,
+            potential profit), in dollars, at each daily check the sale
+            read, the checkpoint's own first (_hold_readings).
+    """
+    days_left: int | None
+    profits: tuple[tuple[float, float], ...]
+
+
 @dataclass
 class SweepPoint:
     """
@@ -1745,6 +1787,20 @@ class SweepPoint:
             min(same-title cap, SAME_TITLE_CO_RESOLVE_PROB) for same-title).
             CapSweep shares one simulation only at caps at or above it. None
             on a hand-built point, which shares from peak_kelly_fraction.
+        sell_min_days (int | None): The fewest days a position had to have
+            left before its last market stopped trading for the simulation
+            to sell it (_simulate_at_discount's sell_min_days), or None when
+            there was no such minimum. Like sell_at, _half_split and
+            _ex_top_event re-simulate the point at this setting. Defaulted,
+            so every existing construction still builds as a point with no
+            minimum.
+        sales (tuple[SaleCheck, ...] | None): One SaleCheck per position the
+            simulation sold, in the order it sold them: () when it could sell
+            and sold nothing, None when it never sells (sell_at None) or the
+            point was built by hand. A copy CapSweep shares at another cap
+            keeps it, since its walk, and so its sales, are the same. Not in
+            repr and not compared: it describes how the trades came about,
+            which the trades themselves already record.
     """
     k: float
     trades: list[BacktestTrade]
@@ -1759,6 +1815,8 @@ class SweepPoint:
     add_to_held: bool = False
     sell_at: float | None = None
     cap_free_from: float | None = None
+    sell_min_days: int | None = None
+    sales: tuple[SaleCheck, ...] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -2243,7 +2301,12 @@ class CapSweep:
     exactly as an add-to-held sweep does. Sharing stays exact: selling
     changes neither which Mondays a pair may trade on nor its Kelly fraction
     (peak_kelly_fraction is the no-selling run's), and at caps at or above
-    the peak every size, and so every position and sale, is the same.
+    the peak every size, and so every position and sale, is the same. A
+    selling sweep may also hold back every sale that comes fewer than
+    sell_min_days days before the position's last market stops trading
+    (_simulate_at_discount's sell_min_days), in every simulation and check
+    it runs; the days rule reads only the positions' close dates and the
+    checkpoint date, which no cap moves, so sharing stays exact with it too.
 
     Retention of the tier-off one, declared the same way: it keeps the
     family's entries_by_band — one entry dict per binding band per tier-off
@@ -2313,6 +2376,11 @@ class CapSweep:
             simulation it runs, and its checks, sells a position early
             (_simulate_at_discount's sell_at). Forwarded only when set.
             Default None (never sells).
+        sell_min_days (int | None): The fewest days a position must have
+            left before its last market stops trading for every simulation
+            it runs, and its checks, to sell it (_simulate_at_discount's
+            sell_min_days). Needs sell_at. Forwarded only when set. Default
+            None (no minimum).
         end_dates (dict): (band, k, population) -> the day that population's
             curves end on, for a cell with no eager point (the eager map is
             empty for a sweep whose setting no eager run shares: one that
@@ -2351,10 +2419,12 @@ class CapSweep:
     reused: int = 0
     # The share of potential profit that sells a position early (None: never)
     sell_at: float | None = None
+    # The fewest days before maturity a sale needs (None: no minimum)
+    sell_min_days: int | None = None
 
     def __post_init__(self) -> None:
         """
-        Refuse an add-to-held or selling sweep that was handed eager points, or a bad sell level.
+        Refuse an add-to-held or selling sweep that was handed eager points, or a bad sell setting.
 
         Every eager point was simulated without adding to held pairs and
         without selling, and _by_cap returns the eager point itself at the
@@ -2364,12 +2434,15 @@ class CapSweep:
 
         Raises:
             ValueError: If add_to_held or sell_at is set and eager is not
-                empty or same_title_eager is not None, or if sell_at is not
-                a share in (0, 1].
+                empty or same_title_eager is not None, if sell_at is not a
+                share in (0, 1], or if sell_min_days is set without sell_at
+                or is not a whole number of at least 1.
         """
         if self.sell_at is not None:
             # Checked as the simulation checks it, before any cell is read
             _resolve_sell_at(self.sell_at)
+        # The days rule, checked the same way (it needs a sell level)
+        _resolve_sell_min_days(self.sell_min_days, self.sell_at)
         if ((self.add_to_held or self.sell_at is not None)
                 and (self.eager or self.same_title_eager is not None)):
             raise ValueError(
@@ -2396,9 +2469,9 @@ class CapSweep:
         else a quiet simulation, pinned to the eager point's end date (with
         no eager point, to end_dates' day for this cell) and run at this
         sweep's Tier floors, add-on and sell settings (tier_floors,
-        add_to_held, sell_at), with the split-half and top-event checks — at
-        those settings too — when the band sweep ran and the population
-        carries them.
+        add_to_held, sell_at, sell_min_days), with the split-half and
+        top-event checks — at those settings too — when the band sweep ran
+        and the population carries them.
 
         Args:
             subset (list[dict]): The population's entries.
@@ -2469,7 +2542,8 @@ class CapSweep:
                     **_sim_options(None, True, end_date=end_date,
                                    tier_floors=self.tier_floors,
                                    add_to_held=self.add_to_held,
-                                   sell_at=self.sell_at))
+                                   sell_at=self.sell_at,
+                                   sell_min_days=self.sell_min_days))
                 self.simulated += 1
                 if self.checks and population in _CHECKED_POPULATIONS:
                     point.halves = _half_split(
@@ -2477,7 +2551,7 @@ class CapSweep:
                         self.initial_balance, k, band, population=population,
                         tier_floors=self.tier_floors, size_cap=cap, quiet=True,
                         end_date=end_date, add_to_held=self.add_to_held,
-                        sell_at=self.sell_at)
+                        sell_at=self.sell_at, sell_min_days=self.sell_min_days)
                     point.ex_top_event = _ex_top_event(
                         point, subset, self.start_date, self.initial_balance, band,
                         population=population, tier_floors=self.tier_floors, quiet=True,
@@ -3300,6 +3374,95 @@ def _resolve_hold_days() -> int:
     return int(days)
 
 
+def _resolve_sell_min_days(min_days: int | None, sell_at: float | None) -> int | None:
+    """
+    Check the fewest days before maturity at which a simulation may sell a position.
+
+    The days rule (_simulate_at_discount's sell_min_days, CapSweep's): a
+    position that has reached its sell level is sold only if at least this
+    many days remain before its last market stops trading (_far_enough);
+    nearer than that it is held until it pays out. It means nothing without
+    a sell level, so it is refused without one.
+
+    Args:
+        min_days (int | None): A whole number of at least 1 (numpy whole
+            numbers too, never a bool), or None for no minimum.
+        sell_at (float | None): The simulation's resolved sell level, or None
+            when it never sells.
+
+    Returns:
+        int | None: The minimum as a builtin int, or None.
+
+    Raises:
+        ValueError: If min_days is set while sell_at is None, or is a bool,
+            not a whole number, or below 1.
+    """
+    if min_days is None:
+        return None
+    if sell_at is None:
+        raise ValueError("sell_min_days needs sell_at: a run that never sells "
+                         "has no sale to hold back")
+    if (isinstance(min_days, (bool, np.bool_)) or not isinstance(min_days, numbers.Integral)
+            or min_days < 1):
+        raise ValueError(f"sell_min_days must be a whole number of at least 1, "
+                         f"got {min_days!r}")
+    return int(min_days)
+
+
+def _days_left(position: list[BacktestTrade], day: date) -> int | None:
+    """
+    Days from `day` to the date the position's last market stops trading: its days to maturity.
+
+    A position matures when the last of its markets closes, so this is the
+    latest close date among its trades' markets (BacktestTrade.close_date_a
+    and close_date_b, the dates the markets' close_time names — UTC on every
+    Kalshi timestamp) less the checkpoint's date, in whole calendar days. It
+    is 0 when the last market closes on the checkpoint's own date, and
+    negative when it closed before it (a market that has stopped trading
+    but not yet paid out). The days rule (_far_enough) reads it, and every
+    sale records it (SaleCheck.days_left).
+
+    Args:
+        position (list[BacktestTrade]): One position's open trades (_positions).
+        day (date): The checkpoint date.
+
+    Returns:
+        int | None: The days left; None when any trade lacks a close date
+            (only a hand-built trade can: _simulate_at_discount gives every
+            trade both).
+    """
+    closes = [d for t in position for d in (t.close_date_a, t.close_date_b)]
+    if any(d is None for d in closes):
+        return None
+    return (max(closes) - day).days
+
+
+def _far_enough(position: list[BacktestTrade], day: date, min_days: int | None) -> bool:
+    """
+    Whether the days rule lets a position be sold at the checkpoint on `day`.
+
+    With no minimum, always. With one, only when the position has at least
+    that many days left before its last market stops trading (_days_left);
+    a position whose days left are unknown is never sold under a minimum.
+    The walk's sales (_simulate_at_discount) and its quick test at a
+    checkpoint with no candidate (_position_sells) both ask here before they
+    value the position, so they apply one rule.
+
+    Args:
+        position (list[BacktestTrade]): One position's open trades.
+        day (date): The checkpoint date.
+        min_days (int | None): The resolved minimum (_resolve_sell_min_days),
+            or None for none.
+
+    Returns:
+        bool: True when the position may be sold there.
+    """
+    if min_days is None:
+        return True
+    left = _days_left(position, day)
+    return left is not None and left >= min_days
+
+
 def _hold_days_text(hold_days: int) -> str:
     """
     Say, for a log line or the dashboard, when a position is sold at a level.
@@ -3316,18 +3479,23 @@ def _hold_days_text(hold_days: int) -> str:
     return f"once it has stayed at or above a level for {hold_days} days in a row"
 
 
-def _sale_label(sell_at: float) -> str:
+def _sale_label(sell_at: float, min_days: int | None = None) -> str:
     """
-    Name a sell level for a completion line or a log summary.
+    Name a sell level, and any minimum of days before maturity, for a completion line or a log summary.
 
     Args:
         sell_at (float): A resolved share in (0, 1].
+        min_days (int | None): The resolved minimum of days before maturity
+            (_resolve_sell_min_days), or None for none.
 
     Returns:
         str: "selling at <percent>% of potential profit", the percent through
-            _cap_percent, which never prints two levels alike.
+            _cap_percent, which never prints two levels alike; with a
+            minimum, followed by ", at least <N> day(s) before maturity".
     """
-    return f"selling at {_cap_percent(sell_at)}% of potential profit"
+    days = ("" if min_days is None
+            else f", at least {min_days} day{'' if min_days == 1 else 's'} before maturity")
+    return f"selling at {_cap_percent(sell_at)}% of potential profit{days}"
 
 
 def _ladder_average(ladder: list[list[float]], contracts: float) -> float | None:
@@ -3597,9 +3765,13 @@ def _reached_every_day(sell_at: float, profits: list[tuple[float, float]]) -> bo
 
 
 def _position_sells(sell_at: float, position: list[BacktestTrade], day: date,
-                    hold_days: int) -> bool:
+                    hold_days: int, min_days: int | None = None) -> bool:
     """
     Whether a position would be sold at the checkpoint on `day`.
+
+    The walk's quick test at a checkpoint with no candidate
+    (_simulate_at_discount): it applies the walk's own rule, the days rule
+    first (_far_enough), then the checks.
 
     Args:
         sell_at (float): The share of potential profit that sells it.
@@ -3607,12 +3779,18 @@ def _position_sells(sell_at: float, position: list[BacktestTrade], day: date,
         day (date): A checkpoint date on its legs' weekly grid.
         hold_days (int): How many days in a row it must stay at that share
             (_resolve_hold_days).
+        min_days (int | None): The fewest days it must have left before its
+            last market stops trading (_resolve_sell_min_days); None (default)
+            for no minimum.
 
     Returns:
-        bool: False when it cannot be valued at some check
-            (_hold_readings is None); otherwise whether it reached sell_at
-            at every check (_reached_every_day).
+        bool: False when it is too near maturity (_far_enough) or cannot be
+            valued at some check (_hold_readings is None); otherwise whether
+            it reached sell_at at every check (_reached_every_day).
     """
+    if not _far_enough(position, day, min_days):
+        # Too near maturity: held to pay out, never valued
+        return False
     readings = _hold_readings(position, day, hold_days, level=sell_at)
     # Sold only when every check has a price (readings is not None) and each
     # reaches sell_at. With level=sell_at, _hold_readings already stops at
@@ -8324,6 +8502,7 @@ def _simulate_at_discount(
     end_date: date | None = None,
     add_to_held: bool = False,
     sell_at: float | None = None,
+    sell_min_days: int | None = None,
 ) -> SweepPoint:
     """
     Choose, size and settle trades from prepared entries at one interval
@@ -8399,13 +8578,28 @@ def _simulate_at_discount(
       * each of its trades exits at the sale (_sold_copy), its markets and
         ladders are freed, and its pair may be bought again at a later
         checkpoint, never at the sale's (nor may a pair touching its markets
-        be bought there).
+        be bought there);
+      * sell_min_days (None, the default, sets no minimum) holds back the
+        sale of a position with fewer than that many days left before it
+        matures — the date its last market stops trading, the latest close
+        date among its trades' markets, counted in calendar days from the
+        checkpoint's date (_days_left). Such a position is not even valued
+        there (_far_enough is asked first). Its days left only shrink at
+        later checkpoints, so it is held until it pays out — unless, with
+        add_to_held, an add-on brings in a market that closes later.
+    Sales come before every purchase at a checkpoint: the walk pays out the
+    day's settlements (release), then sells (sell), then values the
+    portfolio, then takes the day's candidates, new pairs and add-ons alike.
+    So a sale's proceeds are cash for that checkpoint's trades, and every
+    trade there is sized on the portfolio value after the sales.
     A checkpoint with no candidate changes nothing unless a position sells
     there, so at a level no position reaches the walk is exactly the one
     that never sells (_highest_sale_level). The cap still reaches the walk
     only through the sizes, so CapSweep's reuse above cap_free_from holds
     with selling on. With add_to_held as well, a
     position not sold may still be added to; one sold at a checkpoint is not.
+    Every position sold is recorded as a SaleCheck on the returned point's
+    sales.
 
     Args:
         raw_entries (list[dict]): Prepared entries, one record per pair.
@@ -8424,18 +8618,24 @@ def _simulate_at_discount(
         sell_at (float | None): Keyword-only. The share of potential profit, in (0, 1],
             at which a position is sold (see above); None never sells. Set, it ends the
             completion line's label with ", selling at <percent>% of potential profit".
+        sell_min_days (int | None): Keyword-only. The fewest days a position must have
+            left before its last market stops trading to be sold (see above): a whole
+            number of at least 1, set only with sell_at; None sets no minimum. Set, it
+            adds ", at least <N> day(s) before maturity" to the label.
 
     Returns:
         SweepPoint: The trades and daily equity curve, stamped with the resolved
             k and size cap, the band, population, tier setting, the largest
             Kelly fraction seen, whether it could add to held pairs, the
-            level it sold at and the cap it is the same at and above
-            (cap_free_from).
+            level it sold at and its minimum of days, the cap it is the same
+            at and above (cap_free_from), and, when it could sell, a
+            SaleCheck per position sold (sales).
 
     Raises:
         ValueError: For an unknown population, a bad spread band, a bad size
-            cap, a bad sell_at, a k outside (0, 1], or, with sell_at, a bad
-            TAKE_PROFIT_HOLD_DAYS.
+            cap, a bad sell_at, a sell_min_days without sell_at or not a
+            whole number of at least 1, a k outside (0, 1], or, with
+            sell_at, a bad TAKE_PROFIT_HOLD_DAYS.
         TypeError: For a spread band that is not a pair of numbers.
     """
     if population not in _SIMULATION_LABELS:
@@ -8460,6 +8660,8 @@ def _simulate_at_discount(
     # selling, so a run that never sells never reads it)
     sell_level = _resolve_sell_at(sell_at)
     hold_days = None if sell_level is None else _resolve_hold_days()
+    # ...and the fewest days before maturity a sale needs (None: no minimum)
+    min_days = _resolve_sell_min_days(sell_min_days, sell_level)
     # The live code's settings for this simulation: its k and caps, and the
     # band and tier setting the entries were found under (validated here,
     # before any entry is scored)
@@ -8841,6 +9043,8 @@ def _simulate_at_discount(
     sold_here: set[str] = set()
     sold_pairs: set[int] = set()
     positions_sold = bought_again = 0
+    # One SaleCheck per position sold, in the order sold (SweepPoint.sales)
+    sale_checks: list[SaleCheck] = []
     # The live code's market objects, built once per record (_candidate_pair),
     # trades filled at the top of the book, walked books' refusals by reason,
     # and walked candidates the cash left could not buy one contract pair of
@@ -8905,10 +9109,12 @@ def _simulate_at_discount(
         """
         Sell, whole, every open position that has stayed at sell_at of its potential profit for hold_days days.
 
-        Each sold trade's proceeds come in now, its record is replaced by its
-        sold copy (_sold_copy), its pay-out, markets and ladder labels are
-        freed, and its pair may be bought again at a later checkpoint (never
-        at this one: its markets go into sold_here).
+        A position with fewer than min_days days left before it matures is
+        skipped before it is valued (_far_enough). Each sold trade's proceeds
+        come in now, its record is replaced by its sold copy (_sold_copy),
+        its pay-out, markets and ladder labels are freed, and its pair may be
+        bought again at a later checkpoint (never at this one: its markets go
+        into sold_here). Each position sold adds a SaleCheck to sale_checks.
 
         Args:
             d (date): The checkpoint date, after its pay-outs.
@@ -8918,12 +9124,17 @@ def _simulate_at_discount(
         sold_here.clear()
         sold_ids: set[int] = set()
         for position in _positions(open_trades):
+            if not _far_enough(position, d, min_days):
+                # Too near maturity: held to pay out, never valued
+                continue
             # The checkpoint and the daily checks before it (_hold_readings)
             readings = _hold_readings(position, d, hold_days, level=sell_level)
             if readings is None or not _reached_every_day(sell_level, readings[1]):
                 continue
             per_trade = readings[0][0]
             positions_sold += 1
+            # What the sale had: its days left and its profit at every check
+            sale_checks.append(SaleCheck(_days_left(position, d), tuple(readings[1])))
             for trade, sale in zip(position, per_trade, strict=True):
                 # The sale's proceeds, trade by trade
                 cash += sale[0]
@@ -8975,7 +9186,7 @@ def _simulate_at_discount(
             # changes here unless a position sells, so a run that never sells
             # makes exactly the moves of one that cannot (_highest_sale_level)
             open_now = [t for t in open_trades if t.exit_date > d]
-            if not any(_position_sells(sell_level, position, d, hold_days)
+            if not any(_position_sells(sell_level, position, d, hold_days, min_days)
                        for position in _positions(open_now)):
                 continue
             release(d)
@@ -8986,6 +9197,8 @@ def _simulate_at_discount(
         if d != checkpoint_date:
             if sell_level is not None:
                 # Sales come after the day's pay-outs and before its valuation
+                # and every candidate (new pairs and add-ons alike), so a
+                # sale's cash funds this checkpoint's trades
                 sell(d)
             # New checkpoint: value the portfolio as cash plus every open trade
             # at market (_open_value, the one valuation; a trade with no
@@ -9260,7 +9473,7 @@ def _simulate_at_discount(
         population,
         "" if cap == BUDGET_FRACTION else f", {_cap_label(cap)}",
         ", adding to held pairs" if add_to_held else "",
-        "" if sell_level is None else f", {_sale_label(sell_level)}",
+        "" if sell_level is None else f", {_sale_label(sell_level, min_days)}",
     )
     # Once per pair per Monday a busy ladder held it back (silent at zero)
     if ladder_refusals:
@@ -9347,7 +9560,9 @@ def _simulate_at_discount(
         tier_floors=tier_floors is not False,
         size_cap=cap, peak_kelly_fraction=peak_kelly,
         add_to_held=bool(add_to_held), sell_at=sell_level,
-        cap_free_from=cap_free_from,
+        cap_free_from=cap_free_from, sell_min_days=min_days,
+        # Recorded only by a run that could sell
+        sales=None if sell_level is None else tuple(sale_checks),
     )
 
 
@@ -9912,12 +10127,14 @@ def _half_split(
     end_date: date | None = None,
     add_to_held: bool = False,
     sell_at: float | None = None,
+    sell_min_days: int | None = None,
 ) -> HalfSplit:
     """
     Simulate each half of one scenario's entries alone and keep three numbers each.
 
     Both halves are simulated at the scenario's own size cap, tier-floor
-    setting, add-on setting and sell level, forwarded through _sim_options — which
+    setting, add-on setting, sell level and minimum of days before maturity,
+    forwarded through _sim_options — which
     forwards NOTHING on a default call, so the eager tier-on band sweep calls
     _simulate_at_discount with exactly the keywords it always did.
 
@@ -9953,6 +10170,9 @@ def _half_split(
         sell_at (float | None): Keyword-only. The share of potential profit
             at which both halves sell a position, as the scenario did;
             forwarded only when set. Default None.
+        sell_min_days (int | None): Keyword-only. The fewest days before
+            maturity at which both halves sell a position, as the scenario
+            did; forwarded only when set. Default None.
 
     Returns:
         HalfSplit: Each half's total return, trade count and entry count. The
@@ -9963,7 +10183,8 @@ def _half_split(
     # Only the options that differ from the defaults, so a default call is
     # byte-for-byte the call it always was
     options = _sim_options(size_cap, quiet, end_date=end_date, tier_floors=tier_floors,
-                           add_to_held=add_to_held, sell_at=sell_at)
+                           add_to_held=add_to_held, sell_at=sell_at,
+                           sell_min_days=sell_min_days)
     h1 = _simulate_at_discount(first, start_date, initial_balance, k=k,
                                spread_band=band, population=f"{population}/H1", **options)
     h2 = _simulate_at_discount(second, start_date, initial_balance, k=k,
@@ -10001,7 +10222,8 @@ def _ex_top_event(
     subtracting that event's profit, because the other trades would have been
     sized differently without it. The re-run also adds to held pairs exactly
     when the point did (point.add_to_held), and sells early at the point's
-    level (point.sell_at).
+    level and minimum of days before maturity (point.sell_at,
+    point.sell_min_days).
 
     Args:
         point (SweepPoint): The scenario's "all" or "time_series" point.
@@ -10039,7 +10261,8 @@ def _ex_top_event(
                                                    end_date=end_date,
                                                    tier_floors=tier_floors,
                                                    add_to_held=point.add_to_held,
-                                                   sell_at=point.sell_at))
+                                                   sell_at=point.sell_at,
+                                                   sell_min_days=point.sell_min_days))
     return top, _total_return(without, initial_balance)
 
 
