@@ -249,13 +249,17 @@ Notes:
     config.TAKE_PROFIT_LEVELS — sell a whole position once its realized
     profit has stayed at or above that share of its potential profit for
     config.TAKE_PROFIT_HOLD_DAYS days in a row (_simulate_at_discount's
-    sell_at) — over every scenario the filter bar shows, tier floors on and
-    off, adding to held pairs or not. Like the add-on family it simulates
-    nothing during the run; each cell is simulated when the dashboard reads
-    it. _simulate_at_discount (and CapSweep) can also hold back a sale when
-    fewer than sell_min_days days remain before the position's last market
-    stops trading; every selling run records each sale it makes as a
-    SaleCheck on SweepPoint.sales.
+    sell_at) — each with every minimum of config.TAKE_PROFIT_MIN_DAYS — sell
+    only while at least that many days remain before the position's last
+    market stops trading (sell_min_days) — over every scenario the filter bar
+    shows, tier floors on and off, adding to held pairs or not. Like the
+    add-on family it simulates nothing during the run; each cell is simulated
+    when the dashboard reads it. Every selling run records each sale it makes
+    as a SaleCheck on SweepPoint.sales, which is how SellSweep.sold_grid
+    simulates only the (level, minimum) settings that differ: one no position
+    of the no-selling run would sell at is that run (_sale_reach), and one at
+    least as strict as a run it already simulated, when every sale of that run
+    also meets it, is that run (_sale_cover, yielded as a SameSale).
 
     An ENTRY CHECKPOINT is a moment at which the backtest may open a
     simulated trade: the live bot's weekly run time (config.SCHEDULED_RUN,
@@ -361,6 +365,7 @@ from .config import (
     SPREAD_BAND_SWEEP_FLOORS,
     TAKE_PROFIT_HOLD_DAYS,
     TAKE_PROFIT_LEVELS,
+    TAKE_PROFIT_MIN_DAYS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     TIME_SERIES_SAME_EVENT_LADDERS,
     LiveDefaultsError,
@@ -2668,30 +2673,61 @@ def _entry_events(entries_by_band: dict) -> set[tuple[str, str]]:
 
 
 @dataclass(frozen=True)
+class SameSale:
+    """
+    A sell cell that is exactly a run SellSweep.sold_grid already yielded, at the same size cap.
+
+    sold_grid yields one of these, instead of a point, for a (level, minimum
+    days, cap) that walks exactly as an earlier (level, min_days) of the
+    same cell and cap that it simulated and yielded as a point (_sale_cover
+    says why the two are one run). A reader reuses whatever it made of that
+    earlier point; nothing is simulated or kept for this one.
+
+    Attributes:
+        level (float): The sell level of the earlier, simulated cell.
+        min_days (int): Its minimum of days before maturity.
+    """
+    level: float
+    min_days: int
+
+
+@dataclass(frozen=True)
 class SellSweep:
     """
-    The dashboard's "Sell" family: every sell level of every scenario, simulated on demand.
+    The dashboard's "Sell" family: every sell level and minimum of days of every scenario, simulated on demand.
 
     The backtest dashboard's Sell select offers "no selling" (the scenario as
     simulated) and each of `levels` (config.TAKE_PROFIT_LEVELS): sell a whole
     position once its realized profit has stayed at or above that share of
     its potential profit for config.TAKE_PROFIT_HOLD_DAYS days in a row
-    (_simulate_at_discount's sell_at). It covers every scenario the filter bar
-    shows — every band, Tier floors setting, k, size cap and Add to held
-    pairs setting. Nothing is simulated while the backtest runs: sweep()
-    builds, for one level, Tier floors setting and add-on setting, a CapSweep
-    over the same entries the size-cap and add-on families hold, and cell()
-    reads one (band, k) cell of it, every cap, the "all" population only
-    (what the filter bar shows). Like the add-on family it has no eager point
-    to start from, so each cell's curves end on the day its eager twin's did
-    (end_dates / off_end_dates), and each cap is simulated until one reaches
-    the peak Kelly fraction, which every larger cap shares.
+    (_simulate_at_discount's sell_at) — and, for each of `min_days`
+    (config.TAKE_PROFIT_MIN_DAYS), only while at least that many days remain
+    before the position's last market stops trading (sell_min_days). It
+    covers every scenario the filter bar shows — every band, Tier floors
+    setting, k, size cap and Add to held pairs setting. Nothing is simulated
+    while the backtest runs: sweep() builds, for one level, minimum,
+    Tier floors setting and add-on setting, a CapSweep over the same entries
+    the size-cap and add-on families hold, and cell() reads one (band, k)
+    cell of it, every cap, the "all" population only (what the filter bar
+    shows). Like the add-on family it has no eager point to start from, so
+    each cell's curves end on the day its eager twin's did (end_dates /
+    off_end_dates), and each cap is simulated until one reaches the peak
+    Kelly fraction, which every larger cap shares.
+
+    sold_grid() reads one (band, k) cell at every level and minimum while
+    simulating as few of them as it can, and exactly: a (level, minimum) no
+    position can sell at is the no-selling run (_sale_reach), and one at
+    least as strict as a run it already simulated, when every sale of that
+    run also meets it, is that run (_sale_cover). Every other one is
+    simulated.
 
     Retention: none of its own. Its entry maps are the very objects
     BacktestSweep's size-cap and add-on families already hold.
 
     Attributes:
         levels (tuple[float, ...]): The sell levels, ascending, each in (0, 1].
+        min_days (tuple[int, ...]): The minimum-days options, ascending,
+            each a whole number of at least 1 (_resolve_min_days_options).
         caps (tuple[float, ...]): The size caps of every scenario (the
             size-cap sweep's, or the run's own alone).
         primary_cap (float): The run's own cap.
@@ -2709,6 +2745,7 @@ class SellSweep:
         off_end_dates (dict): The same for the tier-off family. Not in repr.
     """
     levels: tuple[float, ...]
+    min_days: tuple[int, ...]
     caps: tuple[float, ...]
     primary_cap: float
     bands: tuple
@@ -2722,14 +2759,19 @@ class SellSweep:
     end_dates: dict = field(repr=False)
     off_end_dates: dict = field(repr=False)
 
-    def sweep(self, level: float | None, *, tier_floors: bool = True,
-              add_to_held: bool = False, caps: Iterable[float] | None = None) -> CapSweep:
+    def sweep(self, level: float | None, *, min_days: int | None = None,
+              tier_floors: bool = True, add_to_held: bool = False,
+              caps: Iterable[float] | None = None) -> CapSweep:
         """
-        The lazy size-cap sweep that sells at `level` under one Tier floors and add-on setting.
+        The lazy size-cap sweep that sells at `level` under one minimum of days, Tier floors and add-on setting.
 
         Args:
             level (float | None): One of self.levels, or None for the same
                 sweep never selling (the run each level is measured against).
+            min_days (int | None): Keyword-only. One of self.min_days: sell
+                only while at least that many days remain before the
+                position's last market stops trading. None (default) sets no
+                minimum, the rule sold_cells reads.
             tier_floors (bool): Keyword-only. False for the tier-floors-off
                 family's binding bands.
             add_to_held (bool): Keyword-only. Whether every simulation may
@@ -2741,14 +2783,23 @@ class SellSweep:
 
         Returns:
             CapSweep: Over the tier-on or tier-off entries, the "all"
-                population only, selling at `level`.
+                population only, selling at `level` with that minimum.
 
         Raises:
-            ValueError: For a level not in self.levels, a cap not in self.caps,
-                or tier floors off on a run without the tier-floors-off family.
+            ValueError: For a level not in self.levels, a minimum not in
+                self.min_days or one given without a level, a cap not in
+                self.caps, or tier floors off on a run without the
+                tier-floors-off family.
         """
         if level is not None and level not in self.levels:
             raise ValueError(f"sell level {level!r} is not one of {self.levels}")
+        if min_days is not None:
+            if level is None:
+                raise ValueError("a minimum of days before maturity needs a sell level: "
+                                 "a sweep that never sells has no sale to hold back")
+            if (isinstance(min_days, (bool, np.bool_))
+                    or min_days not in self.min_days):
+                raise ValueError(f"minimum days {min_days!r} is not one of {self.min_days}")
         if not tier_floors and not self.off_bands:
             raise ValueError("this run has no tier-floors-off family to sell in")
         chosen = self.caps if caps is None else tuple(sorted(set(caps)))
@@ -2762,18 +2813,20 @@ class SellSweep:
             entries_by_band=self.entries_by_band if tier_floors else self.off_entries_by_band,
             st_entries=[], eager={}, tier_floors=tier_floors, add_to_held=add_to_held,
             end_dates=self.end_dates if tier_floors else self.off_end_dates,
-            sell_at=level)
+            sell_at=level, sell_min_days=min_days)
 
     def cell(self, level: float, band: tuple[float, float], k: float, *,
-             tier_floors: bool = True,
+             min_days: int | None = None, tier_floors: bool = True,
              add_to_held: bool = False) -> dict[float, dict[str, SweepPoint]]:
         """
-        One (band, k) cell, every size cap, selling at `level`.
+        One (band, k) cell, every size cap, selling at `level` with an optional minimum of days.
 
         Args:
             level (float): One of self.levels.
             band (tuple[float, float]): One of the setting's bands.
             k (float): One of self.ks.
+            min_days (int | None): Keyword-only. One of self.min_days, or None
+                (default) for no minimum.
             tier_floors (bool): Keyword-only. The Tier floors setting.
             add_to_held (bool): Keyword-only. The Add to held pairs setting.
 
@@ -2784,7 +2837,8 @@ class SellSweep:
             ValueError: As sweep(); and from CapSweep, for a cell with no end day.
             KeyError: For a band the setting does not hold.
         """
-        return self.sweep(level, tier_floors=tier_floors, add_to_held=add_to_held).cell(band, k)
+        return self.sweep(level, min_days=min_days, tier_floors=tier_floors,
+                          add_to_held=add_to_held).cell(band, k)
 
     def entry_events(self) -> set[tuple[str, str]]:
         """
@@ -2834,7 +2888,10 @@ class SellSweep:
                    stats: dict | None = None,
                    ) -> Iterator[tuple[float, dict[float, SweepPoint | None]]]:
         """
-        Every sell level of one (band, k) cell, simulating only the levels that can sell.
+        Every sell level of one (band, k) cell, with no minimum of days, simulating only the levels that can sell.
+
+        sold_grid reads the same cell at every level and every minimum of
+        days; this reads the levels alone, with no minimum.
 
         First the cell is simulated without selling, at every cap asked for;
         _highest_sale_level reads each cap's run and gives the highest level at
@@ -2887,6 +2944,127 @@ class SellSweep:
             needed = [cap for cap in chosen if tops[cap] is not None and level <= tops[cap]]
             sold = read(level, needed) if needed else {}
             yield level, {cap: sold[cap]["all"] if cap in sold else None for cap in chosen}
+
+    def sold_grid(self, band: tuple[float, float], k: float, *, tier_floors: bool = True,
+                  add_to_held: bool = False, caps: Iterable[float] | None = None,
+                  stats: dict | None = None,
+                  ) -> Iterator[tuple[float, int,
+                                      dict[float, SweepPoint | SameSale | None]]]:
+        """
+        Every (sell level, minimum of days) of one (band, k) cell, simulating only the runs that differ.
+
+        First the cell is simulated without selling, at every cap asked for,
+        and _sale_reach reads each cap's run: for each level, the most days
+        before maturity at which one of its positions would have sold there.
+        Then the levels are read in ascending order, and each level's
+        minimums in ascending order, and every (level, minimum, cap) is one
+        of three things:
+          * None — the no-selling run itself: the level is not in the cap's
+            reach, or the minimum is above it, so the run never sells
+            (_sale_reach), and nothing is simulated;
+          * SameSale(level0, min_days0) — exactly the run already yielded as
+            a point at that earlier (level0, min_days0) and the same cap:
+            this level is at or above level0 and at or below the highest
+            level all of that run's sales reached, and this minimum is at or
+            above min_days0 and at or below the fewest days any of its sales
+            had left (_sale_cover). Both bounds are needed: a run from an
+            earlier level can have a larger minimum than this one;
+          * a point — simulated, the caps at or above a point's peak sharing
+            one run (CapSweep). Every such run sells at least once, since
+            its minimum is within the cap's reach (_sale_reach); a run that
+            did not would mean the replay and the walk disagree, and raises.
+        Only one (level, minimum)'s points are alive at a time: between
+        yields the generator keeps, per simulated run, its level, minimum
+        and _sale_cover — never a point.
+
+        Args:
+            band (tuple[float, float]): One of the setting's bands.
+            k (float): One of self.ks.
+            tier_floors (bool): Keyword-only. The Tier floors setting.
+            add_to_held (bool): Keyword-only. The Add to held pairs setting.
+            caps (Iterable[float] | None): Keyword-only. The caps to cover,
+                each one of self.caps; None (default) means every one.
+            stats (dict | None): Keyword-only. When given, its "simulated"
+                and "reused" counts are raised by the cap points this call
+                simulated and shared (CapSweep's counters, the no-selling
+                runs included), its "same" count by the cells yielded as
+                SameSale and its "pruned" count by those yielded as None, for
+                a report's log line.
+
+        Yields:
+            tuple[float, int, dict[float, SweepPoint | SameSale | None]]:
+                (level, minimum, cap -> the "all" point selling at that level
+                with that minimum, a SameSale naming the earlier point it
+                equals, or None where it equals the no-selling run), for
+                every level of self.levels and every minimum of
+                self.min_days, levels ascending and each level's minimums
+                ascending.
+
+        Raises:
+            ValueError: As sweep(); and from CapSweep, for a cell with no end day.
+            KeyError: For a band the setting does not hold.
+            RuntimeError: When a run simulated because the no-selling run
+                showed a position that would sell there made no sale.
+        """
+        chosen = self.caps if caps is None else tuple(sorted(set(caps)))
+        if stats is not None:
+            for key in ("simulated", "reused", "same", "pruned"):
+                stats.setdefault(key, 0)
+
+        def read(level: float | None, min_days: int | None, wanted) -> dict:
+            """One sweep's cell at (level, min_days) over the caps wanted, counted into stats."""
+            swept = self.sweep(level, min_days=min_days, tier_floors=tier_floors,
+                               add_to_held=add_to_held, caps=wanted)
+            cell = swept.cell(band, k)
+            if stats is not None:
+                stats["simulated"] += swept.simulated
+                stats["reused"] += swept.reused
+            return cell
+
+        base = read(None, None, chosen)
+        # For each cap, the most days left at which each level sells somewhere
+        reach = {cap: _sale_reach(pops["all"], self.levels) for cap, pops in base.items()}
+        del base
+        # Per cap, every run simulated so far: (level index, minimum, its _sale_cover)
+        runs: dict[float, list[tuple[int, int, tuple[int, int]]]] = {cap: [] for cap in chosen}
+
+        def cells_at(li: int, level: float, min_days: int) -> dict:
+            """Every cap of one (level, minimum): None, a SameSale or a simulated point."""
+            out: dict[float, SweepPoint | SameSale | None] = {}
+            needed = []
+            for cap in chosen:
+                top = reach[cap].get(level)
+                if top is None or min_days > top:
+                    # No position of the no-selling run sells here
+                    out[cap] = None
+                    continue
+                # An earlier run of this cap that makes exactly these sales;
+                # every earlier run's level index is at or below li
+                out[cap] = next((SameSale(self.levels[i0], d0)
+                                 for i0, d0, (fewest, top_index) in runs[cap]
+                                 if d0 <= min_days <= fewest and li <= top_index), None)
+                if out[cap] is None:
+                    needed.append(cap)
+            if needed:
+                sold = read(level, min_days, needed)
+                for cap in needed:
+                    point = sold[cap]["all"]
+                    if not point.sales:
+                        raise RuntimeError(
+                            f"the run selling at {level!r} with at least {min_days} day(s) "
+                            f"before maturity at cap {cap!r} made no sale, though the "
+                            "no-selling run has a position that would sell there")
+                    runs[cap].append((li, min_days, _sale_cover(point.sales, self.levels)))
+                    out[cap] = point
+            if stats is not None:
+                stats["same"] += sum(isinstance(v, SameSale) for v in out.values())
+                stats["pruned"] += sum(v is None for v in out.values())
+            return {cap: out[cap] for cap in chosen}
+
+        for li, level in enumerate(self.levels):
+            for min_days in self.min_days:
+                # Built inside the call, so between yields this frame holds no point
+                yield level, min_days, cells_at(li, level, min_days)
 
 
 @dataclass
@@ -3402,11 +3580,64 @@ def _resolve_sell_min_days(min_days: int | None, sell_at: float | None) -> int |
     if sell_at is None:
         raise ValueError("sell_min_days needs sell_at: a run that never sells "
                          "has no sale to hold back")
-    if (isinstance(min_days, (bool, np.bool_)) or not isinstance(min_days, numbers.Integral)
-            or min_days < 1):
-        raise ValueError(f"sell_min_days must be a whole number of at least 1, "
-                         f"got {min_days!r}")
-    return int(min_days)
+    return _whole_days(min_days, "sell_min_days")
+
+
+def _whole_days(days: Any, name: str) -> int:
+    """
+    Check one minimum of days before maturity: a whole number of at least 1.
+
+    The one test of a days value, shared by _resolve_sell_min_days (one
+    simulation's minimum) and _resolve_min_days_options (the Sell family's
+    options), so the two can never accept different values.
+
+    Args:
+        days (Any): The value to check. A numpy whole number is accepted; a
+            bool never is.
+        name (str): What the value is, for the error message.
+
+    Returns:
+        int: The value as a builtin int.
+
+    Raises:
+        ValueError: If days is a bool, not a whole number, or below 1.
+    """
+    if (isinstance(days, (bool, np.bool_)) or not isinstance(days, numbers.Integral)
+            or days < 1):
+        raise ValueError(f"{name} must be a whole number of at least 1, got {days!r}")
+    return int(days)
+
+
+def _resolve_min_days_options() -> tuple[int, ...]:
+    """
+    Check the minimum-days options the Sell family offers, and return them in ascending order.
+
+    Reads this module's TAKE_PROFIT_MIN_DAYS when called (patch
+    backtester's, never config's). run_backtest_sweep calls it before its
+    fetch when the sell family is on, so a bad option is refused in
+    milliseconds rather than after the fetch, and _sweep_from_candidates
+    calls it again to build the SellSweep's min_days. Each option is checked
+    as one simulation's minimum is (_whole_days).
+
+    Returns:
+        tuple[int, ...]: The options, ascending, as builtin ints.
+
+    Raises:
+        ValueError: If TAKE_PROFIT_MIN_DAYS is not a collection, is empty,
+            holds a value that is not a whole number of at least 1 (a bool
+            included), or names one value twice.
+    """
+    try:
+        options = tuple(TAKE_PROFIT_MIN_DAYS)
+    except TypeError:
+        raise ValueError("TAKE_PROFIT_MIN_DAYS must be a tuple of whole numbers of at "
+                         f"least 1, got {TAKE_PROFIT_MIN_DAYS!r}") from None
+    if not options:
+        raise ValueError("TAKE_PROFIT_MIN_DAYS must name at least one minimum of days")
+    checked = [_whole_days(days, "each of TAKE_PROFIT_MIN_DAYS") for days in options]
+    if len(set(checked)) != len(checked):
+        raise ValueError(f"TAKE_PROFIT_MIN_DAYS names a value twice: {options!r}")
+    return tuple(sorted(checked))
 
 
 def _days_left(position: list[BacktestTrade], day: date) -> int | None:
@@ -3957,6 +4188,129 @@ def _highest_sale_level(point: "SweepPoint", levels: Iterable[float]) -> float |
                 # Every level sells somewhere: nothing higher to find
                 return best
     return best
+
+
+def _sale_reach(point: "SweepPoint", levels: Iterable[float]) -> dict[float, int]:
+    """
+    For each level, the most days before maturity at which some position of a no-selling run would sell there.
+
+    The replay _highest_sale_level makes: at every checkpoint from the first
+    entry to the last pay-out it groups the trades open there into positions
+    (_positions) and reads each at the checkpoint and the daily checks
+    before it (_hold_readings). For each position it also reads its days
+    left before maturity (_days_left; a position with an unknown one is
+    skipped, since a minimum never sells it) and records them against every
+    level _reached_every_day holds at — a prefix of the ascending levels,
+    since reaching a share means reaching every lower one. The value kept
+    per level is the largest such count.
+
+    What it guarantees, for SellSweep.sold_grid: a run selling at level L
+    with a minimum of N days is the no-selling run itself whenever L is not a
+    key, or N is more than the value at L. A selling run walks exactly as
+    the no-selling run does until its first sale, and that first sale would
+    have to be one of the (checkpoint, position) pairs replayed here that
+    reaches L at every check with at least N days left — there is none.
+    (The converse holds too: with N at or below the value the run sells at
+    least once. Had it sold nothing before the (checkpoint, position) that
+    set the value, it would reach that pair just as the no-selling run did,
+    and sell it there.)
+
+    Args:
+        point (SweepPoint): A simulation that never sold (sell_at None).
+        levels (Iterable[float]): The shares to test, each in (0, 1].
+
+    Returns:
+        dict[float, int]: level -> the most days left of a position that
+            reaches it; a level no such position reaches is not a key. Empty
+            when there is no trade.
+
+    Raises:
+        ValueError: For a point that sold, or a bad TAKE_PROFIT_HOLD_DAYS.
+    """
+    if point.sell_at is not None:
+        raise ValueError("_sale_reach reads a run that never sold, "
+                         f"not one selling at {point.sell_at!r}")
+    hold_days = _resolve_hold_days()
+    ascending = sorted(levels)
+    reach: dict[float, int] = {}
+    if not point.trades or not ascending:
+        return reach
+    by_entry = sorted(range(len(point.trades)), key=lambda i: point.trades[i].entry_date)
+    first = point.trades[by_entry[0]].entry_date
+    last = max(t.exit_date for t in point.trades)
+    added = 0
+    open_ids: list[int] = []
+    for day in _sale_checkpoints(first + timedelta(days=1), last - timedelta(days=1)):
+        # Open here: entered before this checkpoint, paying out after it
+        while added < len(by_entry) and point.trades[by_entry[added]].entry_date < day:
+            open_ids.append(by_entry[added])
+            added += 1
+        open_ids = [i for i in open_ids if point.trades[i].exit_date > day]
+        if not open_ids:
+            continue
+        # In the order the trades were made, as the walk holds them
+        open_trades = [point.trades[i] for i in sorted(open_ids)]
+        for position in _positions(open_trades):
+            left = _days_left(position, day)
+            if left is None:
+                # Never sold under a minimum (_far_enough)
+                continue
+            readings = _hold_readings(position, day, hold_days)
+            if readings is None:
+                continue
+            for level in ascending:
+                if not _reached_every_day(level, readings[1]):
+                    # Nor any higher level
+                    break
+                reach[level] = max(reach.get(level, left), left)
+    return reach
+
+
+def _sale_cover(sales: tuple[SaleCheck, ...], levels: tuple[float, ...]) -> tuple[int, int]:
+    """
+    How far a selling run's own sales say it reaches: the fewest days left among them, and the highest level all reached.
+
+    SellSweep.sold_grid reads it to tell, without simulating, which stricter
+    sell settings walk exactly as a run it simulated. A run selling at level
+    levels[i0] with a minimum of N0 days is the same run as one at
+    levels[i], with a minimum of N days, whenever i0 <= i <= the index
+    returned and N0 <= N <= the days returned. Two facts make it so. The
+    stricter setting sells nothing the simulated run did not: a position
+    that reaches levels[i] at every check reaches levels[i0] too, and one
+    with at least N days left has at least N0. And the bounds say every sale
+    the simulated run made also reaches levels[i] at every check with at
+    least N days left, so the stricter setting makes each of those sales
+    too. Walking side by side from the same start, the two runs therefore
+    decide alike at every checkpoint and position, and stay one walk. This
+    needs nothing about how a position's days left change over time (an
+    add-on to a lone leg can join a market that closes later).
+
+    Args:
+        sales (tuple[SaleCheck, ...]): Every sale of one selling run
+            (SweepPoint.sales), at least one.
+        levels (tuple[float, ...]): The sell levels, ascending.
+
+    Returns:
+        tuple[int, int]: (the fewest days_left among the sales, -1 when one
+            is unknown; the index in levels of the highest level every
+            sale's profits reach at every check (_reached_every_day), -1
+            when not even the lowest is).
+
+    Raises:
+        ValueError: For a run that made no sale: it says nothing about any
+            other setting (sold_grid never simulates one).
+    """
+    if not sales:
+        raise ValueError("_sale_cover reads a run that sold at least once")
+    days = [sale.days_left for sale in sales]
+    fewest = -1 if any(d is None for d in days) else min(days)
+    top = -1
+    for i, level in enumerate(levels):
+        if not all(_reached_every_day(level, list(sale.profits)) for sale in sales):
+            # Nor any higher level
+            break
+        top = i
+    return fewest, top
 
 
 # ─── Eligibility prefilter ─────────────────────────────────────────────────────
@@ -11067,21 +11421,22 @@ def _sweep_from_candidates(
 
     sold = None
     if sell_sweep:
-        # Every sell level over the same grid as the add-on family, tier floors
-        # on and off, adding to held pairs or not; nothing simulated here
+        # Every sell level and minimum of days over the same grid as the
+        # add-on family, tier floors on and off, adding to held pairs or not;
+        # nothing simulated here
         sell_caps = caps if cap_sweep else (primary.size_cap,)
         sold = SellSweep(
-            levels=tuple(sorted(TAKE_PROFIT_LEVELS)), caps=sell_caps,
-            primary_cap=primary.size_cap, bands=tuple(bands),
+            levels=tuple(sorted(TAKE_PROFIT_LEVELS)), min_days=_resolve_min_days_options(),
+            caps=sell_caps, primary_cap=primary.size_cap, bands=tuple(bands),
             off_bands=tuple(tier_off_bands), ks=tuple(grid), primary_k=effective_k,
             start_date=start_date, initial_balance=initial_balance,
             entries_by_band=entries_by_band, off_entries_by_band=tier_off_entries,
             end_dates=add_on_end_dates, off_end_dates=add_on_off_end_dates)
-        logging.info("Selling early: %d level(s) x %d size cap(s) x %d band(s) (%d with the "
-                     "tier floors off) x %d k, adding to held pairs or not, each simulated "
-                     "when the dashboard reads it",
-                     len(sold.levels), len(sell_caps), len(bands), len(tier_off_bands),
-                     len(grid))
+        logging.info("Selling early: %d level(s) x %d minimum-days option(s) x %d size cap(s) "
+                     "x %d band(s) (%d with the tier floors off) x %d k, adding to held "
+                     "pairs or not, each simulated when the dashboard reads it",
+                     len(sold.levels), len(sold.min_days), len(sell_caps), len(bands),
+                     len(tier_off_bands), len(grid))
 
     return BacktestSweep(
         primary=primary, points=points, calibration=calibration,
@@ -11204,8 +11559,9 @@ def run_backtest_sweep(
     _sweep_from_candidates, one summary line per sweep.
 
     With sell_sweep, the result also carries the dashboard's "Sell" family
-    (BacktestSweep.sell_sweep): every level of config.TAKE_PROFIT_LEVELS over
-    the same grid, tier floors on and off, adding to held pairs or not,
+    (BacktestSweep.sell_sweep): every level of config.TAKE_PROFIT_LEVELS, each
+    with every minimum of days before maturity of config.TAKE_PROFIT_MIN_DAYS,
+    over the same grid, tier floors on and off, adding to held pairs or not,
     simulated only when the dashboard reads it. The run logs one setting line
     for it and, from _sweep_from_candidates, one summary line.
 
@@ -11284,8 +11640,9 @@ def run_backtest_sweep(
             None, as does the infeasible window. Backtest-only: live sizing
             never reads either.
         sell_sweep (bool): When True, also return BacktestSweep.sell_sweep —
-            a lazy SellSweep over every level of config.TAKE_PROFIT_LEVELS.
-            The flag adds no simulation to the run itself. False (default)
+            a lazy SellSweep over every level of config.TAKE_PROFIT_LEVELS and
+            every minimum of days of config.TAKE_PROFIT_MIN_DAYS. The flag
+            adds no simulation to the run itself. False (default)
             returns None, as does the infeasible window. Backtest-only: live
             trading never sells.
         depth_model (DepthModel | None): Keyword-only. The depth model every
@@ -11317,7 +11674,9 @@ def run_backtest_sweep(
             (0, 1], if this module's SAME_TITLE_SIZE_CAP is not on the 5%
             grid in (0, 1], if sell_sweep is set and this module's
             TAKE_PROFIT_HOLD_DAYS is not a whole number from 1 to
-            _HOLD_DAYS_MAX, or if spread_band is not a valid band; and,
+            _HOLD_DAYS_MAX or its TAKE_PROFIT_MIN_DAYS is not a non-empty
+            collection of distinct whole numbers of at least 1, or if
+            spread_band is not a valid band; and,
             before any fetch, from _prepare_candidates() when SCHEDULED_RUN
             cannot place the entry checkpoints (a configuration error).
         TypeError: From config.time_series_spread_band, before any fetch, if
@@ -11358,8 +11717,11 @@ def run_backtest_sweep(
     # The same for the extra same-title cap: refused here, not after the fetch
     same_title_cap = _resolve_same_title_size_cap()
     # ... and, when the sell family rides the result, for the sell rule's day
-    # count, which the dashboard otherwise reads only after the run
+    # count and the minimum-days options, which the dashboard otherwise reads
+    # only after the run
     hold_days = _resolve_hold_days() if sell_sweep else None
+    if sell_sweep:
+        _resolve_min_days_options()
     # And for k: every simulation hands it to the live sizer, whose
     # LiveSettings takes only a k in (0, 1]
     if interval_discount is not None and (

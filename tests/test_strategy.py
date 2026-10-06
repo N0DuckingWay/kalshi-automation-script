@@ -3189,10 +3189,11 @@ class TestTimeSeriesKellyParity:
         # sell rule reads — the checkpoint and the daily checks before it
         # (TAKE_PROFIT_HOLD_DAYS) — comes from _hold_readings, the one caller
         # of _position_sale_value, and the walk's sales, its quick test at a
-        # checkpoint with no candidate (_position_sells) and the shortcut
-        # that replays them (_highest_sale_level) all decide through
+        # checkpoint with no candidate (_position_sells), the shortcuts that
+        # replay them (_highest_sale_level, _sale_reach) and the reading of a
+        # run's own sales (_sale_cover) all decide through
         # _reached_every_day, which tests every check with _sells_at: the
-        # shortcut tests exactly the rule the walk applies. This checks which
+        # shortcuts test exactly the rule the walk applies. This checks which
         # function calls which; the behaviour tests (TestSaleNeedsDaysInARow)
         # pin how many days a site checks
         sale_readers: dict[str, set] = {"bid_at_checkpoint": set(), "paid_at_checkpoint": set(),
@@ -3219,18 +3220,23 @@ class TestTimeSeriesKellyParity:
                                    and sub.func.id == "bid_ladder" for sub in ast.walk(func))}
         assert ladder_builders == {"sale_ladder"}
         assert not hasattr(backtester, "_trade_sale_value")
-        for func in ("_simulate_at_discount", "_position_sells", "_highest_sale_level"):
+        for func in ("_simulate_at_discount", "_position_sells", "_highest_sale_level",
+                     "_sale_reach"):
             assert _function_calls(backtester, func, "_hold_readings"), func
             assert _function_calls(backtester, func, "_reached_every_day"), func
+        assert _function_calls(backtester, "_sale_cover", "_reached_every_day")
         assert _function_calls(backtester, "_simulate_at_discount", "_position_sells")
-        for func in ("_simulate_at_discount", "_highest_sale_level"):
+        for func in ("_simulate_at_discount", "_highest_sale_level", "_sale_reach"):
             assert _function_calls(backtester, func, "_positions"), func
         # The days rule (sell_min_days): the walk's sales and its quick test
         # at a checkpoint with no candidate both ask _far_enough, the one
-        # test, which reads a position's days to maturity from _days_left
+        # test, which reads a position's days to maturity from _days_left;
+        # the replay that says how many days each level reaches reads them
+        # there too
         for func in ("_simulate_at_discount", "_position_sells"):
             assert _function_calls(backtester, func, "_far_enough"), func
-        assert _function_calls(backtester, "_far_enough", "_days_left")
+        for func in ("_far_enough", "_sale_reach"):
+            assert _function_calls(backtester, func, "_days_left"), func
 
     def test_ast_the_price_paid_and_the_book_each_have_one_reader(self):
         # What a backtest trade paid (fill_price_a/_b) is read only through
