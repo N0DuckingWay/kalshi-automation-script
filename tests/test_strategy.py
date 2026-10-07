@@ -2244,18 +2244,24 @@ class TestTimeSeriesKellyParity:
     def test_ast_the_forecast_reads_the_midpoint_spread(self):
         # DR-78: every forecast reads the mid spread. The live sizer reads the
         # one enrichment wrote on the pair (scanner.pair_mid_spread); enrichment,
-        # the backtest's candidates and Kelly gate, and the dashboard's scatter
-        # work it out with config.time_series_mid_spread, the one definition
+        # the backtest's candidates and Kelly gate, the k-hat calibration, and
+        # the dashboard's scatter and spread calibration work it out with
+        # config.time_series_mid_spread, the one definition
         assert _function_calls(strategy, "_kelly_p_at", "pair_mid_spread")
         assert _function_calls(strategy, "compute_trade", "pair_mid_spread")
         for module, func in ((scanner, "_enrich_pair"), (backtester, "_candidate_pair"),
                              (backtester, "_simulate_at_discount"),
+                             (backtester, "_interval_calibration"),
                              (dashboard, "_kelly_fraction"), (dashboard, "_entry_mid_spread")):
             assert _function_calls(module, func, "time_series_mid_spread"), (module, func)
         # The scatter forecasts at the entry quotes' mid spread, never at the fills
         [spread] = _keyword_values(dashboard, "_kelly_points", "_kelly_fraction", "spread")
         assert isinstance(spread, ast.Call) and getattr(spread.func, "id", None) == \
             "_entry_mid_spread"
+        # k-hat and the spread calibration measure against the same mid spread
+        # the forecast reads: k-hat at each pair's first qualifying Monday's
+        # quotes, the spread calibration at each trade's entry quotes
+        assert _function_calls(dashboard, "_spread_observations", "_entry_mid_spread")
         # Every call of the model, anywhere in the package, takes as its spread a
         # bare name its own function binds from the mid spread: never a
         # subtraction of two prices, never a price
@@ -2308,6 +2314,8 @@ class TestTimeSeriesKellyParity:
                                            "no_levels[0][0]"]],
             ("backtester", "_candidate_pair"): [["c['pA']", "c['nA']", "c['pB']", "c['nB']"]],
             ("backtester", "_simulate_at_discount"): [["pA", "nA", "pB", "nB"]],
+            ("backtester", "_interval_calibration"): [["entry['pA']", "entry['nA']",
+                                                        "entry['pB']", "entry['nB']"]],
             ("dashboard", "_kelly_fraction"): [["pA", "nA", "pB", "nB"]],
             ("dashboard", "_entry_mid_spread"): [["t.entry_pA", "t.entry_nA", "t.entry_pB",
                                                   "t.entry_nB"]],

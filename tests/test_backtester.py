@@ -6819,6 +6819,20 @@ class TestRunBacktestTimeSeriesFlow:
         assert calib.pooled.realised_rate == pytest.approx(1.0)
         assert calib.pooled.mean_implied == pytest.approx(self._PB - self._PA)
 
+    def test_calibration_reads_the_entry_mid_spread(self, monkeypatch):
+        # DR-78, through the real entry pass: a later book 0.05 wide (EB YES
+        # 0.60, NO 0.45) puts the mid spread at 0.275 where the YES-ask gap is
+        # 0.30, and k-hat is measured against the former
+        raw = self._prepared(monkeypatch, "no", "yes", eb_no=0.45)
+        (rec,) = raw
+        assert (rec["entry"]["pB"] - rec["entry"]["pA"]) == pytest.approx(0.30)
+        calib = _interval_calibration(raw)
+        assert calib.pooled.n == 1
+        assert calib.pooled.mean_implied == time_series_mid_spread(
+            self._PA, self._NA, self._PB, 0.45)
+        assert calib.pooled.mean_implied == pytest.approx(0.275)
+        assert calib.pooled.empirical_k == pytest.approx(1.0 / 0.275)
+
     def test_calibration_buckets_the_fixture_under_its_own_tier(self, monkeypatch):
         # 13-day gap => the 8-15d band, at the short tier _find_entry filtered
         # it under. The gap rides out of _find_entry, so the report can never
@@ -6941,11 +6955,13 @@ class TestRunBacktestSameDateLegOrder:
 
 
 def _cal_entry(gap_days, pA, pB, result_a, result_b, pair_type="time_series",
-               event_ticker=None):
+               event_ticker=None, *, nA=None, nB=None):
     """Build one _prepare_entries record shaped as _interval_calibration reads it.
 
     event_ticker, when given, is market A's event ticker; by default mA carries
-    no event_ticker key at all, the shape every older fixture here uses."""
+    no event_ticker key at all, the shape every older fixture here uses. nA and
+    nB are the NO asks; by default each is 1 minus its YES ask (a book with no
+    width), so the mid spread the calibration reads is the YES-ask gap."""
     mA = {"ticker": "A", "result": result_a}
     if event_ticker is not None:
         mA["event_ticker"] = event_ticker
@@ -6955,7 +6971,9 @@ def _cal_entry(gap_days, pA, pB, result_a, result_b, pair_type="time_series",
         "group_key": "group",
         "entry": {
             "entry_date": date(2026, 1, 5),
-            "pA": pA, "pB": pB, "nA": 1.0 - pA, "nB": 1.0 - pB,
+            "pA": pA, "pB": pB,
+            "nA": 1.0 - pA if nA is None else nA,
+            "nB": 1.0 - pB if nB is None else nB,
             "mA": mA,
             "mB": {"ticker": "B", "result": result_b},
             "gap_days": gap_days,
@@ -7063,13 +7081,108 @@ class TestIntervalCalibration:
 
     def test_non_positive_implied_mass_yields_no_ratio(self):
         # Undefined, not zero: reporting 0.0 would read as "the market
-        # overstated everything" rather than "not measurable". Unreachable
-        # from a real entry (the tier requires pB - pA >= 0.15), but reporting
-        # code must not divide by zero.
+        # overstated everything" rather than "not measurable". A zero YES-ask
+        # gap never enters, but an entry whose earlier quote is crossed can
+        # have a mid spread at or below zero
+        # (test_a_crossed_earlier_quote_can_put_the_mid_spread_below_zero),
+        # and reporting code must not divide by zero either way.
         calib = _interval_calibration([_cal_entry(3, 0.50, 0.50, "no", "no")])
         assert calib.pooled.n == 1
         assert calib.pooled.mean_implied == pytest.approx(0.0)
         assert calib.pooled.empirical_k is None
+
+    def test_a_crossed_earlier_quote_can_put_the_mid_spread_below_zero(self):
+        # The one way an entry's mid spread can be zero or negative. On any
+        # entry, _find_entry's fee check keeps the later book's width (its YES
+        # ask plus its NO ask, minus 1) under the YES-ask gap, so with the
+        # earlier quote not crossed the mid spread is above half that gap.
+        # Here the earlier quote is crossed by 0.30 (YES ask 0.30, YES bid
+        # 0.60) and the later book has no width: _find_entry records the 0.05
+        # YES-ask gap at a floor of 0 (tier floors off), and it reads -0.10 at
+        # the midpoints. The observation keeps its sign, and a bucket whose
+        # mean mid spread is not above zero reports no k-hat rather than a
+        # negative one
+        mA = {"ticker": "EARLY", "event_ticker": "E1", "result": "no",
+              "close_time": "2026-02-01T00:00:00+00:00"}
+        mB = {"ticker": "LATE", "event_ticker": "E2", "result": "yes",
+              "close_time": "2026-02-14T00:00:00+00:00"}
+
+        def entry(nA, pB, nB):
+            """_find_entry over one Monday: A YES 0.30 / NO nA, B YES pB / NO nB."""
+            return _find_entry([_candle(_MONDAY_TS, 0.30, nA)],
+                               [_candle(_MONDAY_TS, pB, nB)],
+                               mA, mB, "time_series", date(2026, 1, 1),
+                               tier_floors=False)
+
+        crossed = entry(0.40, 0.35, 0.65)
+        assert crossed is not None
+        calib = _interval_calibration([{"pair_type": "time_series", "canon": "c",
+                                        "group_key": "g", "entry": crossed}])
+        (obs,) = calib.observations
+        assert obs.implied == time_series_mid_spread(0.30, 0.40, 0.35, 0.65)
+        assert obs.implied == pytest.approx(-0.10)
+        assert calib.pooled.mean_implied == pytest.approx(-0.10)
+        assert calib.pooled.empirical_k is None
+        assert [b.empirical_k for b in calib.buckets] == [None]
+        # A wide later book beside an uncrossed earlier one cannot do it: B
+        # 0.40/0.90 (0.30 wide) puts the two legs at $1.20, more than a win
+        # pays, so it is never an entry
+        assert entry(0.70, 0.40, 0.90) is None
+
+    def test_a_crossed_first_monday_is_measured_at_its_mid_spread(self, caplog):
+        # The population is every entry, never what the Kelly gate passes, so
+        # a first Monday crossed on either market (a YES ask below its own YES
+        # bid), which the gate skips, still counts, at its mid spread. GA
+        # crossed (YES ask 0.30, YES bid 0.40) beside GB 0.60/0.40 reads 0.25;
+        # GB crossed (YES ask 0.55, YES bid 0.60) beside GA 0.30/0.70 reads
+        # 0.275
+        gate = TestKellyGateReadsTheMidSpread
+        crossed = [gate._record((_LADDER_M1, 0.30, 0.60, 0.60, 0.40)),
+                   gate._record((_LADDER_M1, 0.30, 0.70, 0.55, 0.40))]
+        for rec in crossed:
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                point = backtester._simulate_at_discount(
+                    [rec], date(2026, 1, 1), 10_000.0, k=0.75, end_date=date(2026, 4, 1))
+            # The gate skipped it, and counted it, as crossed
+            assert point.trades == []
+            assert gate._LINE + "1" in [r.getMessage() for r in caplog.records]
+        calib = _interval_calibration(crossed)
+        assert [o.implied for o in calib.observations] == [
+            time_series_mid_spread(0.30, 0.60, 0.60, 0.40),
+            time_series_mid_spread(0.30, 0.70, 0.55, 0.40)]
+        assert [o.implied for o in calib.observations] == pytest.approx([0.25, 0.275])
+        assert calib.pooled.n == 2
+        assert calib.pooled.mean_implied == pytest.approx(0.2625)
+
+    def test_implied_is_the_mid_spread_not_the_ask_gap(self):
+        # DR-78: k-hat measures against the quantity the forecast's k
+        # multiplies. Two pairs whose later book is 0.10 wide and earlier book
+        # has none: A 0.30/0.70 with B 0.60/0.50 reads 0.25 at the midpoints
+        # against a 0.30 YES-ask gap, and A 0.10/0.90 with B 0.50/0.60 reads
+        # 0.35 against 0.40. One settled in between, so k-hat is 0.5 / 0.30,
+        # where the YES-ask gap would give 0.5 / 0.35
+        calib = _interval_calibration([
+            _cal_entry(3, 0.30, 0.60, "no", "yes", nA=0.70, nB=0.50),
+            _cal_entry(5, 0.10, 0.50, "no", "no", nA=0.90, nB=0.60),
+        ])
+        assert [o.implied for o in calib.observations] == [
+            time_series_mid_spread(0.30, 0.70, 0.60, 0.50),
+            time_series_mid_spread(0.10, 0.90, 0.50, 0.60)]
+        assert [o.implied for o in calib.observations] == pytest.approx([0.25, 0.35])
+        pooled = calib.pooled
+        assert (pooled.n, pooled.realised_rate) == (2, pytest.approx(0.5))
+        assert pooled.mean_implied == pytest.approx(0.30)
+        assert pooled.empirical_k == pytest.approx(0.5 / 0.30)
+        assert pooled.empirical_k != pytest.approx(0.5 / 0.35)
+        # The gap band's row (both pairs sit in 0-7d) reads the same mid spreads
+        assert [(b.label, b.mean_implied) for b in calib.buckets] == [
+            ("0-7d", pytest.approx(0.30))]
+        # An earlier book with width moves it the other way: A 0.30/0.80
+        # (0.10 wide) with B 0.60/0.40 reads 0.35 against a 0.30 ask gap
+        (wide_a,) = _interval_calibration([
+            _cal_entry(3, 0.30, 0.60, "no", "yes", nA=0.80, nB=0.40)]).observations
+        assert wide_a.implied == pytest.approx(0.35)
 
     def test_gap_days_none_still_counts_in_pooled(self):
         # Defensive: a time-series entry always carries a gap, but if one ever
@@ -7230,6 +7343,10 @@ class TestLogIntervalCalibration:
         msgs = self._messages(caplog)
 
         assert msgs[0].startswith("Interval-discount calibration")
+        # The header names the basis: the market-implied gap at the midpoints
+        # (the mid spread, DR-78)
+        assert msgs[0] == ("Interval-discount calibration (k_hat = realised in-between "
+                           "rate / market-implied gap at the midpoints)")
         assert "k_hat" in msgs[1] and "realised" in msgs[1] and "implied" in msgs[1]
         # One row per band, then the pooled row
         assert msgs[2].split() == ["0-7d", "0.15", "4", "0.2500", "0.5000", "0.500"]

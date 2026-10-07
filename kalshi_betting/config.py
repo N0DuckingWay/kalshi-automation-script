@@ -325,7 +325,9 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #   intervening-rung staleness guard is the natural answer and is deliberately
 #   not built here.
 #
-#   The gate it shipped behind, and its result. DR-73 left the switch off
+#   The gate it shipped behind, and its result. (Every k-hat in this paragraph
+#   and the next was measured against the YES-ask gap pB - pA, not the mid
+#   spread the calibration divides by, DR-78.) DR-73 left the switch off
 #   until k-hat was calibrated where the capital goes — the widest
 #   (pB - pA > 0.60) band, not pooled, since p and b depend on the spread
 #   rather than the gap in days (the earlier 1.114 was measured on snapshot
@@ -439,7 +441,9 @@ TIME_SERIES_SAME_EVENT_LADDERS = True
 # that backtest run only; live runs price at the saved live defaults' k, which
 # main.py --interval-discount K overrides for one run) and
 # read the dashboard's "Interval Discount (k) Calibration" section, or the
-# calibration block in kalshi_backtest.log — see CLAUDE.md, "Interval-discount
+# calibration block in kalshi_backtest.log, whose empirical k-hat is the
+# realised in-between rate divided by the mean mid spread, a fraction of the
+# same quantity this constant multiplies — see CLAUDE.md, "Interval-discount
 # calibration (2026-09 follow-up)" for the full mechanism.
 #
 # k also bounds every live time-series stake below 1 - k on the books
@@ -2095,10 +2099,14 @@ def time_series_mid_spread(yes_ask_a: float, no_ask_a: float,
     backtest's candidates carry it from that Monday's candle quotes
     (backtester._candidate_pair), and the backtest's Kelly gate
     (backtester._simulate_at_discount) works it out from the same four
-    quotes. The dashboard's Kelly scatter works it out from each trade's
-    entry quotes (dashboard._entry_mid_spread), and dashboard._kelly_fraction
-    from its own four quotes when it is handed none. The entry rules (the
-    spread rule, the band, the floors) read the YES-ask gap instead.
+    quotes. The backtest's empirical k-hat (backtester._interval_calibration)
+    divides the realised in-between rate by it, read at each pair's first
+    qualifying Monday's quotes, so k-hat and the forecast's k are fractions
+    of one quantity. The dashboard's Kelly scatter and spread calibration
+    work it out from each trade's entry quotes (dashboard._entry_mid_spread),
+    and dashboard._kelly_fraction from its own four quotes when it is handed
+    none. The entry rules (the spread rule, the band, the floors) read the
+    YES-ask gap instead.
 
     Args:
         yes_ask_a (float): The earlier market's (market A's) best YES ask, in
