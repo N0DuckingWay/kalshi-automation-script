@@ -366,6 +366,31 @@ class TestSectionIntervalDiscount:
         assert "Excluded 3 premise violation(s)" in out
         assert "never writes config.py" in out
 
+    def test_a_caption_says_the_implied_gap_is_the_mid_spread(self):
+        # DR-78: k-hat divides by the mean mid spread. The table keeps its
+        # "Mean implied gap" header, and one grey line right under the table
+        # says what that gap is, in plain words
+        points = _sweep_points([0.75])
+        sweep = BacktestSweep(primary=points[0], points=points,
+                              calibration=_calibration())
+        out = _section_interval_discount(sweep)
+        caption = ("<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
+                   "k&#770; = realised in-between rate ÷ mean implied gap, where a "
+                   "pair's implied gap is its mid spread (B's midpoint minus A's).</p>")
+        assert out.count(caption) == 1
+        header = '<th style="padding:8px 16px;">Mean implied gap</th>'
+        assert out.count(header) == 1
+        # Straight after the calibration table, before the premise-violation
+        # note and the "Recommendation only" line
+        table_end = out.index("</table>", out.index(header))
+        assert out.index(caption) == table_end + len("</table>")
+        assert out.index(caption) < out.index("Excluded 3 premise violation(s)")
+        assert out.index(caption) < out.index("Recommendation only")
+        assert "pB − pA" not in out
+        # No calibration, no table, so no caption
+        bare = BacktestSweep(primary=points[0], points=points, calibration=None)
+        assert "mean implied gap, where" not in _section_interval_discount(bare)
+
     def test_sweep_table_reports_per_k_metrics(self):
         points = _sweep_points([0.60, 0.75])
         sweep = BacktestSweep(primary=points[1], points=points, calibration=None)

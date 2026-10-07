@@ -2126,6 +2126,14 @@ _KD_TEXT = {
                "(the log names the error): it shows the run's own k and size cap."),
 }
 
+# The grey caption under the interval-discount section's calibration table:
+# what its "Mean implied gap" column holds — the mid spread, the quantity the
+# forecast's k multiplies, so the table's k-hat compares with k directly
+_KD_GAP_CAPTION = (
+    "<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
+    "k&#770; = realised in-between rate ÷ mean implied gap, where a pair's implied "
+    "gap is its mid spread (B's midpoint minus A's).</p>")
+
 # What live trading reads for k and for the tier floors, as the page's captions
 # name it: the saved live defaults, which a main.py flag overrides for one run
 _LIVE_K_READ = ("the saved live defaults' k (main.py --interval-discount overrides it for "
@@ -2518,7 +2526,8 @@ def _section_interval_discount(
       2. The calibration table — one row per deadline-gap bucket plus the
          pooled row, showing n, the realised in-between rate, the mean
          market-implied gap at the midpoints (the mean mid spread), and that
-         bucket's k-hat.
+         bucket's k-hat — with a grey caption under it saying k-hat is the
+         realised in-between rate divided by that mean (_KD_GAP_CAPTION).
       3. ONE equity curve (div id "kd-equity"), at the k and size cap shown,
          followed by a table of each k's trade count, total return, final
          balance, max drawdown and Sharpe at that size cap (tbody "kd-rows",
@@ -2666,6 +2675,8 @@ def _section_interval_discount(
   <th style="padding:8px 16px;">k&#770;</th>
 </tr>
 """ + "".join(_crow(b) for b in [*cal.buckets, cal.pooled]) + "</table>"
+        # Under the table: what the "Mean implied gap" column is
+        cal_table += _KD_GAP_CAPTION
 
         if cal.excluded_premise_violations:
             # Summary-line idiom, silent at zero — mirrors _log_interval_calibration.

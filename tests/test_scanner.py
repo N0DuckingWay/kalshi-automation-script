@@ -6045,8 +6045,9 @@ class TestPairMidSpread:
 class TestEnrichmentWritesTheMidSpread:
     """Enrichment writes a time-series pair's mid spread from the tops of the
     two books it fetched (config.time_series_mid_spread): the earlier
-    market's YES ask and NO ask (its YES-bid side, the one side nothing else
-    reads) and the later market's. It reads the tops, never the averaged
+    market's YES ask and NO ask (its YES-bid side, one of the two sides
+    neither leg buys from, which the earlier-book crossed check reads too)
+    and the later market's. It reads the tops, never the averaged
     fills nor the pair's own scan-time quotes; a missing YES bid counts as a
     bid of 0; a same-title pair, and a pair refused before it is priced or
     with no later YES ask, carry none. Nothing else about the pair changes."""

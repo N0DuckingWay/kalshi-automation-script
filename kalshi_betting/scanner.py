@@ -973,11 +973,19 @@ class CandidatePair:
             on market B costs). Range: [0, 1]. A leg price for same_title; for
             time_series it is not a leg price: the spread rule tests it
             against pA (in the finder, and again on the fresh book in
-            enrichment), and the forecast reads mid_spread rather than it.
+            enrichment), and the forecast reads mid_spread rather than it,
+            though mid_spread reads the same quote at half weight (it is one
+            of the two quotes the later market's midpoint averages), a quote
+            neither leg buys from.
         nA (float): NO ask price of market A in dollars (what a NO contract on
             market A costs). Range: [0, 1]. A leg price for same_title; reporting-only for
             time_series (still read so the prod log's "nA (NO ask)" column
-            stays meaningful).
+            stays meaningful). On the live path a time_series pair's nA stays
+            the finder's scan-time quote: enrichment refreshes pB but not nA,
+            so that column is not the earlier market's NO ask the forecast
+            read off its book. Of a run's outputs, only the "Trade computed"
+            log line prints the mid spread the forecast read. A backtest
+            candidate's nA is that Monday's quote, the one its forecast reads.
         tradeable (bool): True when the two LEG prices sum to less than
             1 - fee_per_pair_approx(leg prices) — i.e. a win scenario pays more
             than the pair costs — and, for time_series, pB > pA. Neither pair
@@ -5643,11 +5651,15 @@ def _enrich_pair(
     accepts. Once a time-series pair is priced and the later book has a YES
     ask, it also records the mid spread at the tops of both books
     (CandidatePair.mid_spread, config.time_series_mid_spread), the input the
-    sizer's forecast reads, whether or not a check then refuses the pair;
-    that reads the earlier market's YES bids, the one side of the two books
-    the legs do not consume, which the earlier-book crossed check reads too.
-    It needs no client: enrich_with_orderbook_prices fetches the books and
-    calls it once per pair.
+    sizer's forecast reads, whether or not a check then refuses the pair.
+    The mid spread reads the best level of all four sides of the two books (a
+    side is one market's YES bids or its NO bids), each at half weight and at
+    whatever quantity rests there: the two the legs buy from, and the two
+    neither leg buys from — the earlier market's YES bids, which the
+    earlier-book crossed check reads too, and the later market's NO bids,
+    whose complement is the reference YES ask. validate_pair_price never
+    re-checks the mid spread before the orders go out. It needs no client:
+    enrich_with_orderbook_prices fetches the books and calls it once per pair.
 
     Args:
         pair (CandidatePair): A tradeable pair.
@@ -5767,9 +5779,10 @@ def _enrich_pair(
         # pair_gap_days: a same-event ladder is tiered on its STATED gap (DR-73)
         gap = pair_gap_days(pair)
         # The earlier market's best NO ask (1 - its best YES bid), from the
-        # YES-bid side of its book, which the legs do not consume: read for
-        # its midpoint and the crossed-book check below. 1.0 (a bid of 0) when
-        # it has none, which can only lower its midpoint
+        # YES-bid side of its book: one of the two sides neither leg buys
+        # from (the other, the later market's NO bids, gives ref_yes above).
+        # Read for its midpoint and the crossed-book check below. 1.0 (a bid
+        # of 0) when it has none, which can only lower its midpoint
         a_no_asks = _bids_to_ask_levels(ob_a["yes"], _pair_ticker(pair, "market_a"))
         no_ask_a = a_no_asks[0][0] if a_no_asks else 1.0
         # The earlier market's best YES ask: the top of the YES leg's levels
