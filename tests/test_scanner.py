@@ -33,6 +33,7 @@ from kalshi_betting.config import (
     live_time_series_floor,
     max_affordable_pairs,
     max_kelly_fraction,
+    time_series_mid_spread,
     time_series_spread_refusal,
 )
 from kalshi_betting.scanner import (
@@ -48,6 +49,7 @@ from kalshi_betting.scanner import (
     _market_from_dict,
     _pair_max_sum,
     _pair_orderbooks,
+    _pair_ticker,
     _parse_price_ranges,
     _reference_yes_ask,
     _shard_index,
@@ -72,6 +74,7 @@ from kalshi_betting.scanner import (
     pair_held,
     pair_key,
     pair_ladder_keys,
+    pair_mid_spread,
     prefix_fill_prices,
     resolve_held_ladders,
     tick_size_for_price,
@@ -5281,8 +5284,11 @@ class TestEnrichmentSpreadRule:
 
 
 # enrich_with_orderbook_prices as it was before its per-pair loop moved into
-# scanner._enrich_pair, kept word for word (only renamed) as the oracle the
-# split must match: the same pairs, the same log lines, the same fetches.
+# scanner._enrich_pair, kept as the oracle the split must match: the same
+# pairs, the same log lines, the same fetches. It is that code word for word
+# (only renamed), but for the mid spread's lines, which are the live code's:
+# the earlier market's best NO ask and YES ask read in the time-series block,
+# and mid_spread written beside the refreshed pB.
 def _old_enrich_with_orderbook_prices(
     client: Any, pairs: list, portfolio_value_cents: int, *,
     settings: LiveSettings | None = None, cash_cents: int | None = None,
@@ -5454,6 +5460,11 @@ def _old_enrich_with_orderbook_prices(
         if is_time_series:
             # pair_gap_days: a same-event ladder is tiered on its STATED gap (DR-73)
             gap = pair_gap_days(pair)
+            # The earlier market's best NO ask (1 - its best YES bid), 1.0 with
+            # no YES bid, and its best YES ask: the mid spread's A side
+            a_no_asks = _bids_to_ask_levels(ob_a["yes"], _pair_ticker(pair, "market_a"))
+            no_ask_a = a_no_asks[0][0] if a_no_asks else 1.0
+            yes_ask_a = yes_levels[0][0]
             if ref_yes is None:
                 # Nothing prices the in-between mass now: fail CLOSED. A stale pB below the
                 # book's YES bid would let Kelly exceed 1 - k, which a cap above 1 - k (the
@@ -5526,6 +5537,9 @@ def _old_enrich_with_orderbook_prices(
             # snapshot. Left alone when None, which has dropped the pair above.
             if ref_yes is not None:
                 leg_updates["pB"] = ref_yes
+                # The mid spread at the tops of both books
+                leg_updates["mid_spread"] = time_series_mid_spread(
+                    yes_ask_a, no_ask_a, ref_yes, no_levels[0][0])
         else:
             leg_updates = {"nA": avg_no, "pB": avg_yes}
             # Mirror: pA is same_title's reference quote. Nothing sizes on it
@@ -5613,6 +5627,29 @@ def _st_books(nA, pB, *, qty=100, pA_ref=None) -> dict:
     }
 
 
+def _mid_books(*, a_yes_bids=((0.27, 100),), a_no_bids=((0.70, 100),),
+               b_yes_bids=((0.52, 100),), b_no_bids=((0.36, 100),)) -> dict:
+    """
+    Two-sided time-series books on EARLY and LATE, each side's bids as (price, qty).
+
+    EARLY's NO bids become the YES leg's asks and its YES bids its NO asks;
+    LATE's YES bids become the NO leg's asks and its NO bids its YES ask (the
+    reference). The defaults: EARLY YES ask 0.30, NO ask 0.73 (YES bid 0.27,
+    midpoint 0.285); LATE YES ask 0.64, NO ask 0.48 (YES bid 0.52, midpoint
+    0.58). The mid spread is 0.295 against an ask gap of 0.34.
+
+    Returns:
+        dict: ticker -> orderbook_fp side dict, for _books_client.
+    """
+    return {"EARLY": {"yes_dollars": _bids(*a_yes_bids), "no_dollars": _bids(*a_no_bids)},
+            "LATE": {"yes_dollars": _bids(*b_yes_bids), "no_dollars": _bids(*b_no_bids)}}
+
+
+# The default _mid_books tops, each ask computed as the book reader computes
+# it (1 - the bid), so the expected mid spread is the code's to the last bit
+_MID_TOPS = (1.0 - 0.70, 1.0 - 0.27, 1.0 - 0.36, 1.0 - 0.52)
+
+
 def _asymmetric_fee(price_a, price_b):
     """A fake fee: none when the first price is the lower, $1 otherwise.
 
@@ -5652,6 +5689,11 @@ def _enrichment_cases() -> dict:
     return {
         "ts-tradeable": ([ts], _ts_books([(0.30, 0.50, 100)], pB_ref=0.65),
                          big, _live(), None, {}, None),
+        # EARLY has YES bids too, so the mid spread reads both of its sides;
+        # every scan-time quote of the candidate differs from its book's top,
+        # so a mid spread read off the candidate would not match the oracle's
+        "ts-two-sided-books": ([_ts_candidate(gap_days=10, pA=0.28, pB=0.66, nB=0.46)],
+                               _mid_books(), big, _live(), None, {}, None),
         "ts-no-edge-after-fee": (
             [_ts_candidate(gap_days=10, pA=0.53, pB=0.56, nB=0.45)],
             _ts_books([(0.53, 0.45, 100)], pB_ref=0.56), big, tiers_off, None, {},
@@ -5862,6 +5904,157 @@ class TestEnrichPairMatchesTheOldLoop:
         [record] = caplog.records
         assert record.levelno == logging.WARNING
         assert "the later contract has no YES ask on its book" in record.getMessage()
+
+
+class TestPairMidSpread:
+    """pair_mid_spread reads CandidatePair.mid_spread by type: only a finite
+    int or float above PRICE_EPSILON counts, and anything else reads as None
+    (no mid spread to use)."""
+
+    def test_a_real_spread_is_returned_as_a_float(self):
+        assert pair_mid_spread(SimpleNamespace(mid_spread=0.31)) == 0.31
+        one = pair_mid_spread(SimpleNamespace(mid_spread=1))
+        assert one == 1.0 and type(one) is float
+        # Just above the tolerance counts
+        assert pair_mid_spread(SimpleNamespace(mid_spread=2 * PRICE_EPSILON)) == 2 * PRICE_EPSILON
+
+    @pytest.mark.parametrize("value", [
+        None, True, False, "0.31", Decimal("0.31"), MagicMock(),
+        float("nan"), float("inf"), float("-inf"),
+        0.0, PRICE_EPSILON, -0.05,
+    ], ids=["none", "true", "false", "str", "decimal", "mock", "nan", "inf", "-inf",
+            "zero", "epsilon", "negative"])
+    def test_anything_else_reads_as_none(self, value):
+        assert pair_mid_spread(SimpleNamespace(mid_spread=value)) is None
+
+    def test_a_pair_never_priced_off_its_books_has_none(self):
+        # The field's default, what the finders leave; an object without the
+        # field; and a MagicMock pair, whose truthy auto-attribute is no number
+        mA, mB = _ts_pair_markets(gap_days=10, pA=0.30, pB=0.60)
+        [found] = find_time_series_pairs(MagicMock(), held_tickers=set(), markets=[mA, mB],
+                                         settings=_live())
+        assert found.mid_spread is None and pair_mid_spread(found) is None
+        assert pair_mid_spread(SimpleNamespace()) is None
+        assert pair_mid_spread(MagicMock()) is None
+
+
+class TestEnrichmentWritesTheMidSpread:
+    """Enrichment writes a time-series pair's mid spread from the tops of the
+    two books it fetched (config.time_series_mid_spread): the earlier
+    market's YES ask and NO ask (its YES-bid side, the one side nothing else
+    reads) and the later market's. It reads the tops, never the averaged
+    fills nor the pair's own scan-time quotes; a missing YES bid counts as a
+    bid of 0; a same-title pair, and a pair refused before it is priced or
+    with no later YES ask, carry none. Nothing else about the pair changes."""
+
+    @staticmethod
+    def _pair():
+        return _ts_candidate(gap_days=10, pA=0.30, pB=0.64, nB=0.48)
+
+    def test_the_pair_s_own_quotes_are_not_read(self):
+        # Every scan-time quote of this candidate (YES asks 0.28 and 0.66, NO
+        # asks 0.72 and 0.46) differs from its book's top (0.30 and 0.64,
+        # 0.73 and 0.48): the mid spread comes from the books alone
+        stale = _ts_candidate(gap_days=10, pA=0.28, pB=0.66, nB=0.46)
+        assert (stale.pA, stale.nA, stale.pB, stale.nB) == (0.28, 0.72, 0.66, 0.46)
+        [enriched] = enrich_with_orderbook_prices(_books_client(_mid_books()), [stale],
+                                                  _AMPLE_BALANCE_CENTS, settings=_live())
+        assert enriched.tradeable is True
+        assert enriched.mid_spread == time_series_mid_spread(*_MID_TOPS)
+        assert enriched.mid_spread == pytest.approx(0.295, abs=1e-9)
+
+    def test_the_mid_spread_comes_from_the_tops_of_both_books(self):
+        client = _books_client(_mid_books())
+        [enriched] = enrich_with_orderbook_prices(client, [self._pair()], _AMPLE_BALANCE_CENTS,
+                                                  settings=_live())
+        assert enriched.tradeable is True
+        assert enriched.mid_spread == time_series_mid_spread(*_MID_TOPS)
+        # mid B 0.58 - mid A 0.285, not the ask gap 0.64 - 0.30
+        assert enriched.mid_spread == pytest.approx(0.295)
+        assert enriched.mid_spread == pytest.approx((0.64 + 0.52) / 2 - (0.30 + 0.27) / 2)
+        assert enriched.pB - enriched.pA == pytest.approx(0.34)
+        assert pair_mid_spread(enriched) == enriched.mid_spread
+        # Read off the two books already fetched: no extra request
+        assert client.get_market_orderbook_without_preload_content.call_count == 2
+
+    def test_no_yes_bid_on_the_earlier_book_counts_as_a_bid_of_zero(self):
+        # EARLY has no YES bids: its NO ask reads 1.0 and its midpoint is its
+        # YES ask / 2 = 0.15, so the spread is 0.58 - 0.15
+        client = _books_client(_mid_books(a_yes_bids=()))
+        [enriched] = enrich_with_orderbook_prices(client, [self._pair()], _AMPLE_BALANCE_CENTS,
+                                                  settings=_live())
+        assert enriched.tradeable is True
+        assert enriched.mid_spread == time_series_mid_spread(_MID_TOPS[0], 1.0, *_MID_TOPS[2:])
+        assert enriched.mid_spread == pytest.approx(0.43)
+
+    def test_deep_books_are_read_at_their_tops(self):
+        # Three YES-leg levels and two NO-leg levels, all qualifying, and an
+        # ample budget: the leg prices average down the book, the mid spread
+        # still reads each side's best level. EARLY's YES bids arrive out of
+        # order; its best is 0.27
+        books = _mid_books(a_yes_bids=((0.25, 50), (0.27, 20), (0.20, 30)),
+                           a_no_bids=((0.70, 10), (0.68, 40), (0.66, 50)),
+                           b_yes_bids=((0.52, 10), (0.50, 90)),
+                           b_no_bids=((0.36, 5), (0.34, 100)))
+        [enriched] = enrich_with_orderbook_prices(_books_client(books), [self._pair()],
+                                                  _AMPLE_BALANCE_CENTS, settings=_live())
+        assert enriched.tradeable is True
+        # (10 x 0.30 + 40 x 0.32 + 50 x 0.34) / 100 and (10 x 0.48 + 90 x 0.50) / 100
+        assert enriched.pA == pytest.approx(0.328)
+        assert enriched.nB == pytest.approx(0.498)
+        assert enriched.mid_spread == time_series_mid_spread(*_MID_TOPS)
+
+    def test_a_same_title_pair_carries_none(self):
+        st = _st_candidate(pA=0.60, pB=0.31, nA=0.44)
+        [enriched] = enrich_with_orderbook_prices(
+            _books_client(_st_books(0.44, 0.31, pA_ref=0.60)), [st], _AMPLE_BALANCE_CENTS,
+            settings=_live())
+        assert enriched.tradeable is True
+        assert enriched.mid_spread is None
+
+    @pytest.mark.parametrize("books, cash, code", [
+        # 0.45 + 0.48 sits over the 0.85 price-sum ceiling: nothing qualifies
+        (_mid_books(a_no_bids=((0.55, 100),)), None, scanner.ENRICH_NO_QUALIFYING),
+        # No cash: not one contract pair is affordable
+        (_mid_books(), 0, scanner.ENRICH_UNAFFORDABLE),
+        # No YES ask on the later book: nothing to read its midpoint from
+        (_mid_books(b_no_bids=()), None, scanner.ENRICH_NO_REFERENCE),
+    ], ids=["no-qualifying", "unaffordable", "no-later-yes-ask"])
+    def test_a_refused_pair_with_nothing_to_read_carries_none(self, books, cash, code):
+        client = _books_client(books)
+        ob_a, ob_b = _fetch_orderbook(client, "EARLY"), _fetch_orderbook(client, "LATE")
+        priced, refusal = scanner._enrich_pair(self._pair(), ob_a, ob_b, _AMPLE_BALANCE_CENTS,
+                                               settings=_live(), cash_cents=cash)
+        assert refusal == code
+        assert priced.tradeable is False
+        assert priced.mid_spread is None
+
+    def test_the_earlier_yes_bids_change_nothing_but_the_mid_spread(self, caplog):
+        # The same pair on the same books with and without EARLY's YES bids:
+        # every other field, and every log line, is the same
+        runs = []
+        for a_yes_bids in (((0.27, 100),), ()):
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG):
+                [enriched] = enrich_with_orderbook_prices(
+                    _books_client(_mid_books(a_yes_bids=a_yes_bids)), [self._pair()],
+                    _AMPLE_BALANCE_CENTS, settings=_live())
+            runs.append((enriched, [(r.levelno, r.getMessage()) for r in caplog.records]))
+        (with_bids, lines), (without, lines_without) = runs
+        assert with_bids.mid_spread != without.mid_spread
+        assert dc_replace(with_bids, mid_spread=None) == dc_replace(without, mid_spread=None)
+        assert lines == lines_without
+
+    def test_an_unusable_yes_bid_on_the_earlier_book_is_named_by_the_book_reader(self, caplog):
+        # A YES bid of zero contracts on EARLY is dropped with the book
+        # reader's one summary WARNING; the mid spread reads the level left
+        books = _mid_books(a_yes_bids=((0.27, 100), (0.40, 0)))
+        with caplog.at_level(logging.INFO):
+            [enriched] = enrich_with_orderbook_prices(_books_client(books), [self._pair()],
+                                                      _AMPLE_BALANCE_CENTS, settings=_live())
+        assert enriched.mid_spread == time_series_mid_spread(*_MID_TOPS)
+        [warning] = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning.getMessage().startswith("Orderbook for EARLY: dropped 1 of 2 bid levels")
 
 
 class TestValidatePairPriceSpreadRule:

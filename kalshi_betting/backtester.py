@@ -39,7 +39,9 @@ Dependencies:
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap — whose
     spread_min and tier_floors keywords apply this module's bands and
-    tier-floors-off family — and time_series_profit_prob), the
+    tier-floors-off family — time_series_profit_prob, and
+    time_series_mid_spread, the mid spread _candidate_pair gives each
+    time-series candidate at its Monday's quotes), the
     spread-band helpers
     time_series_spread_band and time_series_spread_too_wide (which
     _find_entry applies to time-series candidates; the first also validates
@@ -384,6 +386,7 @@ from .config import (
     max_kelly_fraction,
     min_price_diff_for_gap,
     pair_size_cap,
+    time_series_mid_spread,
     time_series_profit_prob,
     time_series_spread_band,
     time_series_spread_too_wide,
@@ -8583,7 +8586,15 @@ def _candidate_pair(c: dict, held: HeldPair | None, markets: dict) -> CandidateP
     so the live code reads each market's own close time and price grid. A
     time-series pair carries the deadline gap _find_entry tiered it on as its
     stated gap (scanner.pair_gap_days reads it), so the walk applies the same
-    tier.
+    tier, and its mid spread at that Monday's four quotes
+    (config.time_series_mid_spread), never at the market records' own
+    quotes, which are their last ones, from when they closed. The live
+    enrichment writes the mid spread again from a walked book, whose top is
+    those quotes. The candle fetch clamps every NO ask into 0.01-0.99, so a
+    YES bid never reads below 0.01 here. Live enrichment reads an earlier
+    market's YES bid as it is, a missing one as 0, so where that bid is under
+    a cent or missing, the mid spread here can sit up to 0.005 below what
+    live enrichment would read off the same book.
 
     Args:
         c (dict): A Pass 2 candidate.
@@ -8601,10 +8612,14 @@ def _candidate_pair(c: dict, held: HeldPair | None, markets: dict) -> CandidateP
         built.append(market)
     gap = c["gap_days"]
     stated = (gap if c["pair_type"] == "time_series" and type(gap) is int else None)
+    # The mid spread at that Monday's quotes, the one definition live
+    # enrichment also writes it with; None for a same-title pair
+    mid = (time_series_mid_spread(c["pA"], c["nA"], c["pB"], c["nB"])
+           if c["pair_type"] == "time_series" else None)
     return CandidatePair(
         market_a=built[0], market_b=built[1], pA=c["pA"], pB=c["pB"], nA=c["nA"],
         nB=c["nB"], tradeable=True, canonical_title=str(c["canon"]),
-        pair_type=c["pair_type"], stated_gap_days=stated, held=held)
+        pair_type=c["pair_type"], stated_gap_days=stated, held=held, mid_spread=mid)
 
 
 def _books_for(c: dict, d: date) -> tuple[dict, dict] | None:

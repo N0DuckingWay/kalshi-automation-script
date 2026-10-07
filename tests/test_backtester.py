@@ -66,6 +66,7 @@ from kalshi_betting.config import (
     held_pair_fraction,
     kelly_budget,
     min_price_diff_for_gap,
+    time_series_mid_spread,
     time_series_profit_prob,
 )
 from kalshi_betting.scanner import CandidatePair, HeldPair, pair_held
@@ -19179,6 +19180,85 @@ class TestWalkedTradeParity:
         assert ("Trades sized at the top of the book (no depth data) "
                 "(k=0.750, band 0-1, all): 1") in caplog.messages
         assert not [m for m in caplog.messages if m.startswith("Trades refused when")]
+
+
+def _pass2_candidate(rec: dict, marks=None) -> dict:
+    """The Pass 2 candidate _candidate_pair and _size_trade read for a
+    record's first Monday: its two market records, that Monday's quotes and
+    gap, and each market's quotes over time (None: no book to walk)."""
+    entry = rec["entry"]
+    return {"pair_type": rec["pair_type"], "canon": rec["canon"],
+            "mA": entry["mA"], "mB": entry["mB"],
+            "pA": entry["pA"], "pB": entry["pB"], "nA": entry["nA"], "nB": entry["nB"],
+            "gap_days": entry["gap_days"], "marks": marks}
+
+
+class TestCandidatePairCarriesTheMidSpread:
+    """_candidate_pair gives a time-series candidate its mid spread at that
+    Monday's quotes (config.time_series_mid_spread), never at the market
+    records' own quotes, and a same-title candidate none. A candle NO ask
+    the fetch clamped to 0.99 is read as it comes, a YES bid of 0.01. On a
+    walked book the live enrichment writes it again from the book's top,
+    which is those quotes, so it comes out the same."""
+
+    @staticmethod
+    def _record_quotes(market: dict, yes_ask: str, no_ask: str) -> dict:
+        """A market record carrying its own last quotes, unlike any Monday's."""
+        return {**market, "yes_ask_dollars": yes_ask, "no_ask_dollars": no_ask,
+                "yes_bid_dollars": str(round(1.0 - float(no_ask), 4))}
+
+    def test_a_time_series_candidate_reads_its_monday_s_quotes(self):
+        mA = self._record_quotes(_ladder_market("MA", "EVM-1", "2026-03-20"), "0.9900", "0.0200")
+        mB = self._record_quotes(_ladder_market("MB", "EVM-2", "2026-03-20"), "0.9800", "0.0300")
+        # A wider later book: YES ask 0.62 and NO ask 0.42, against 0.30 and 0.72
+        rec = _ladder_record(mA, mB, "m", [(_LADDER_M1, 0.30, 0.62, 0.42)])
+        rec["entry"]["nA"] = 0.72
+        c = _pass2_candidate(rec)
+        pair = backtester._candidate_pair(c, None, {})
+        assert pair.mid_spread == time_series_mid_spread(0.30, 0.72, 0.62, 0.42)
+        assert pair.mid_spread == pytest.approx(0.31)
+        # The records' own quotes reach the parsed markets, and give another number
+        assert pair.market_a.yes_ask_dollars == "0.9900"
+        assert pair.market_b.no_ask_dollars == "0.0300"
+        assert pair.mid_spread != pytest.approx(
+            time_series_mid_spread(0.99, 0.02, 0.98, 0.03), abs=1e-6)
+
+    def test_a_clamped_candle_no_ask_reads_a_bid_of_one_cent(self):
+        # The candle fetch clamps every NO ask into 0.01-0.99, so an earlier
+        # market whose YES bid closed at 0 arrives with a NO ask of 0.99, a
+        # bid of 0.01. The candidate reads it as it comes: its mid spread sits
+        # 0.005 below the one live enrichment reads, a missing bid being 0
+        # there (a NO ask of 1.0)
+        mA = _ladder_market("MA", "EVM-1", "2026-03-20")
+        mB = _ladder_market("MB", "EVM-2", "2026-03-20")
+        rec = _ladder_record(mA, mB, "m", [(_LADDER_M1, 0.30, 0.62, 0.42)])
+        rec["entry"]["nA"] = 0.99
+        pair = backtester._candidate_pair(_pass2_candidate(rec), None, {})
+        assert pair.mid_spread == time_series_mid_spread(0.30, 0.99, 0.62, 0.42)
+        assert pair.mid_spread == pytest.approx(
+            time_series_mid_spread(0.30, 1.0, 0.62, 0.42) - 0.005, abs=1e-12)
+
+    def test_a_same_title_candidate_carries_none(self):
+        rec = _ladder_same_title(_ladder_market("SA", "EVA-1", "2026-03-20"),
+                                 _ladder_market("SB", "EVB-1", "2026-03-20"), [_LADDER_M1])
+        assert backtester._candidate_pair(_pass2_candidate(rec), None, {}).mid_spread is None
+
+    def test_the_sized_pair_carries_it_at_the_top_of_the_book_and_on_a_walked_book(self):
+        settings = TestWalkedTradeParity._settings()
+        rec, candles = TestWalkedTradeParity._ts()
+        expected = time_series_mid_spread(0.20, 0.80, 0.60, 0.40)
+        # No book: the sizer sizes the candidate's own pair
+        top, why = backtester._size_trade(_pass2_candidate(rec), _LADDER_M1, 10_000.0,
+                                          10_000.0, settings, None, {})
+        assert why is None and top.pair.mid_spread == expected
+        # A walked book: enrichment writes it from the book's top, the same quotes
+        _walked([rec], candles, _walk_model())
+        quotes = rec["leg_quotes"]
+        walked, why = backtester._size_trade(
+            _pass2_candidate(rec, (quotes["OA"], quotes["OB"])), _LADDER_M1, 10_000.0,
+            10_000.0, settings, None, {})
+        assert why is None and walked.pair.depth_levels
+        assert walked.pair.mid_spread == pytest.approx(expected, abs=1e-12)
 
 
 class TestLegQuotesCarryTheBook:

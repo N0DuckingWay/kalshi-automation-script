@@ -53,6 +53,7 @@ from kalshi_betting.config import (
     max_kelly_fraction,
     min_price_diff_for_gap,
     pair_size_cap,
+    time_series_mid_spread,
     time_series_profit_prob,
     time_series_spread_refusal,
 )
@@ -168,6 +169,88 @@ class TestFeePairApprox:
         assert fee_per_pair_approx(price_a=0.30, price_b=0.40) == pytest.approx(
             fee_per_pair_approx(0.30, 0.40)
         )
+
+
+def _two_midpoints(yes_ask_a, no_ask_a, yes_ask_b, no_ask_b):
+    """mid B - mid A, each midpoint taken the plain way: (YES ask + YES bid) / 2,
+    the YES bid being 1 - the NO ask."""
+    mid_a = (yes_ask_a + (1.0 - no_ask_a)) / 2.0
+    mid_b = (yes_ask_b + (1.0 - no_ask_b)) / 2.0
+    return mid_b - mid_a
+
+
+class TestTimeSeriesMidSpread:
+    """time_series_mid_spread is the later market's midpoint minus the earlier
+    one's, a midpoint being halfway between a market's YES ask and its YES
+    bid (1 - its NO ask). It is computed as the ask gap less half the
+    difference in the two books' widths (a width being YES ask + NO ask - 1),
+    so on books with no width it is the ask gap to the last bit whenever the
+    two YES ask + NO ask sums are the same float, and within float noise of
+    it otherwise. A missing YES bid (a NO ask of 1.0) puts that market's
+    midpoint at half its YES ask."""
+
+    def test_equals_the_ask_gap_on_every_complementary_cent_book(self):
+        # Every pair of whole-cent YES asks pA < pB, each market's NO ask its
+        # complement: each book's YES ask + NO ask is exactly 1.0 in floating
+        # point, so the mid spread is the ask gap to the last bit (the plain
+        # two-midpoint form is not, on some)
+        checked = plain = 0
+        for i in range(1, 100):
+            for j in range(i + 1, 100):
+                pA, pB = i / 100, j / 100
+                nA, nB = (100 - i) / 100, (100 - j) / 100
+                assert pA + nA == 1.0 and pB + nB == 1.0, (pA, pB)
+                assert time_series_mid_spread(pA, nA, pB, nB) == pB - pA, (pA, pB)
+                plain += _two_midpoints(pA, nA, pB, nB) == pB - pA
+                checked += 1
+        assert checked == 4851
+        assert plain < checked
+
+    def test_books_with_no_width_built_as_the_book_reader_builds_them(self):
+        # Each ask taken as the book reader takes it, 1 - the other side's
+        # bid: a YES bid at i cents and a NO bid at 100 - i cents give a book
+        # with no width, but its YES ask + NO ask need not come to exactly
+        # 1.0. Where the two books' sums are the same float the mid spread is
+        # the ask gap to the last bit; where they are not, it is within about
+        # 1e-16 of it
+        def quotes(i):
+            return 1.0 - float(f"{(100 - i) / 100:.4f}"), 1.0 - float(f"{i / 100:.4f}")
+
+        same_sum = other_sum = 0
+        for i in range(1, 100):
+            for j in range(i + 1, 100):
+                (pA, nA), (pB, nB) = quotes(i), quotes(j)
+                spread = time_series_mid_spread(pA, nA, pB, nB)
+                if pA + nA == pB + nB:
+                    assert spread == pB - pA, (i, j)
+                    same_sum += 1
+                else:
+                    assert abs(spread - (pB - pA)) <= 1.2e-16, (i, j)
+                    other_sum += 1
+        # Both kinds occur, so both branches above are exercised
+        assert same_sum + other_sum == 4851
+        assert same_sum and other_sum
+
+    def test_matches_the_two_midpoints_on_random_quotes(self):
+        # Any four 4-decimal quotes, crossed books included: the same number
+        # as mid B - mid A, to float noise
+        rng = random.Random(20261006)
+        for _ in range(20_000):
+            quotes = [round(rng.uniform(0.0001, 0.9999), 4) for _ in range(4)]
+            assert abs(time_series_mid_spread(*quotes) - _two_midpoints(*quotes)) <= 1e-15, quotes
+
+    def test_a_wider_later_book_makes_the_ask_gap_overstate_it(self):
+        # A: YES ask 0.30, NO ask 0.72 (YES bid 0.28, midpoint 0.29, width 0.02).
+        # B: YES ask 0.62, NO ask 0.42 (YES bid 0.58, midpoint 0.60, width 0.04).
+        # The ask gap is 0.32; half the extra 0.02 of B's width comes off it
+        assert time_series_mid_spread(0.30, 0.72, 0.62, 0.42) == pytest.approx(0.31)
+
+    def test_no_yes_bid_puts_the_earlier_midpoint_at_half_its_yes_ask(self):
+        # A NO ask of 1.0 stands for no YES bid (a bid of 0): mid A = its YES ask / 2
+        for pA, pB, nB in ((0.30, 0.60, 0.42), (0.21, 0.55, 0.47), (0.05, 0.31, 0.70)):
+            mid_b = (pB + (1.0 - nB)) / 2.0
+            assert time_series_mid_spread(pA, 1.0, pB, nB) == pytest.approx(
+                mid_b - pA / 2.0, abs=1e-15)
 
 
 class TestTimeSeriesProfitProb:

@@ -2049,6 +2049,60 @@ def time_series_spread_too_wide(spread: float, spread_max: float | None) -> bool
     return spread > spread_max + PRICE_EPSILON
 
 
+def time_series_mid_spread(yes_ask_a: float, no_ask_a: float,
+                           yes_ask_b: float, no_ask_b: float) -> float:
+    """
+    Return a time-series pair's mid spread: the later market's midpoint minus the earlier one's.
+
+    A market's midpoint is halfway between its best YES ask and its best YES
+    bid, and its YES bid is 1 minus its best NO ask. The mid spread is the
+    market-implied chance, read at the midpoints, that the event first
+    happens between the two deadlines. A book's width is its YES ask plus its
+    NO ask, minus 1: what buying and selling straight back would cost, a cost
+    of trading rather than a view of the odds. The YES-ask gap
+    (yes_ask_b - yes_ask_a) is the mid spread plus half the later book's
+    width minus half the earlier book's.
+
+    So it is computed as the ask gap minus half the difference in the two
+    widths. That is the same number as mid B - mid A, and the ask gap itself,
+    to the last bit, whenever the two books' YES ask plus NO ask come to the
+    same float, as whole-cent pairs such as 0.30 and 0.70 (which add to
+    exactly 1.0) do. On any other book with no width it is within about
+    1e-16 of the ask gap.
+
+    A market with no YES bid has no bid to average with: live enrichment
+    passes a NO ask of 1.0 for it (a bid of 0), which can only lower its
+    midpoint. The backtest's candle quotes never hold a NO ask above 0.99,
+    because the candle fetch (historical.fetch_candlesticks) clamps every NO
+    ask into 0.01-0.99, so a YES bid there never reads below 0.01. Where live
+    enrichment would read the earlier market's bid as 0, or as under a cent,
+    the backtest reads that market's midpoint up to 0.005 higher and the mid
+    spread up to 0.005 lower.
+
+    The one definition: live enrichment (scanner._enrich_pair) writes it on
+    each time-series pair it prices at its fills whose later book has a YES
+    ask (CandidatePair.mid_spread), and the backtest's candidates carry it
+    from that Monday's candle quotes (backtester._candidate_pair). Nothing
+    sizes on it: the Kelly model reads the YES-ask gap
+    (time_series_profit_prob).
+
+    Args:
+        yes_ask_a (float): The earlier market's (market A's) best YES ask, in
+            dollars. Earlier and later as the pair orders its legs: by
+            close_time, or by stated deadline for a same-event ladder (DR-73).
+        no_ask_a (float): The earlier market's best NO ask, in dollars: 1.0
+            when it has no YES bid (live enrichment); never above 0.99 on
+            backtest candle quotes.
+        yes_ask_b (float): The later market's (market B's) best YES ask, in dollars.
+        no_ask_b (float): The later market's best NO ask, in dollars.
+
+    Returns:
+        float: mid B - mid A, in dollars.
+    """
+    return ((yes_ask_b - yes_ask_a)
+            - ((yes_ask_b + no_ask_b) - (yes_ask_a + no_ask_a)) / 2.0)
+
+
 def time_series_profit_prob(pA: float, pB: float, k: float | None = None) -> float:
     """
     Return the modelled probability that a time-series pair trade is profitable.

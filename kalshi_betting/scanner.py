@@ -46,7 +46,11 @@ Dependencies:
     close_gap_bound_text, the bound its refusal line prints (DR-74), and
     ladder_keys, which ladders a market is on).
     pair_gap_days() is the single reader of that gap for everything
-    downstream of pair formation. resolve_held_ladders() finds the ladders
+    downstream of pair formation, and pair_mid_spread() the single reader of
+    the mid spread on a time-series pair (the later market's midpoint minus
+    the earlier one's, config.time_series_mid_spread), which enrichment writes
+    from the two books and the backtest's _candidate_pair from candle quotes.
+    resolve_held_ladders() finds the ladders
     of the markets the account holds, and find_time_series_pairs refuses any
     candidate with a market on one of them, except one that adds to what it
     is told to add to. get_held_positions() reads each held market's side and
@@ -181,6 +185,7 @@ from .config import (
     live_time_series_floor,
     max_affordable_pairs,
     max_kelly_fraction,
+    time_series_mid_spread,
     time_series_spread_refusal,
 )
 
@@ -1012,6 +1017,15 @@ class CandidatePair:
             add_on_pairs; None for every other pair. Read it through pair_held(), by type.
             Enrichment and compute_trade copy it through dc_replace, so it
             reaches spec.pair.
+        mid_spread (float | None): For a time-series pair, the later
+            market's midpoint minus the earlier one's
+            (config.time_series_mid_spread; a midpoint is halfway between a
+            market's YES ask and its YES bid). Enrichment writes it from the
+            tops of the two order books it fetched, once it has priced the
+            pair at its fills and found a YES ask on the later book; the
+            backtest writes it from that Monday's candle quotes. None before
+            that, and always None for same_title. The finders never set it.
+            Read it through pair_mid_spread(), by type.
     """
     market_a: Any           # same_title: pricier side by YES ask | time_series: EARLIER contract (close_time, or STATED deadline for a DR-73 ladder)
     market_b: Any           # same_title: cheaper side by YES ask  | time_series: the later one, by the same ordering
@@ -1034,6 +1048,12 @@ class CandidatePair:
     # finders only for one in their add_on_pairs); None for every other pair.
     # Read via pair_held(), by type.
     held: HeldPair | None = None
+    # A time-series pair's later market's YES midpoint minus the earlier
+    # one's (config.time_series_mid_spread): written by enrichment from the
+    # tops of both books, and by the backtest from that Monday's candle
+    # quotes; None until then and for same_title. Read via pair_mid_spread(),
+    # by type.
+    mid_spread: float | None = None
 
 
 def leg_sides(pair_type: str) -> tuple[str, str]:
@@ -1138,6 +1158,36 @@ def pair_gap_days(pair: Any) -> int:
     if type(stated) is int:
         return stated
     return deadline_gap_days(pair.market_a, pair.market_b)
+
+
+def pair_mid_spread(pair: Any) -> float | None:
+    """
+    Return the mid spread a time-series pair carries, or None if it has none to use.
+
+    The mid spread is the later market's midpoint minus the earlier one's
+    (config.time_series_mid_spread), which enrichment (from the two books)
+    and the backtest's _candidate_pair (from candle quotes) write on
+    CandidatePair.mid_spread. It is read by type, like pair_gap_days: only a
+    real int or float (never a bool, which is an int subclass, nor a
+    MagicMock's auto-attribute) that is finite and above PRICE_EPSILON
+    counts. Anything else reads as None: the pair was never priced off its
+    order books or candle quotes, or its midpoints are not in order (the
+    later market's at or below the earlier's), so it states no chance of the
+    event landing between the deadlines (config.time_series_profit_prob's
+    zero clamp would read such a gap as riskless).
+
+    Args:
+        pair (Any): A CandidatePair, or anything standing in for one.
+
+    Returns:
+        float | None: The mid spread in dollars, above PRICE_EPSILON; None
+            when there is none to use.
+    """
+    spread = getattr(pair, "mid_spread", None)
+    if isinstance(spread, bool) or not isinstance(spread, (int, float)):
+        return None
+    spread = float(spread)
+    return spread if math.isfinite(spread) and spread > PRICE_EPSILON else None
 
 
 def normalize_title(title: str) -> str:
@@ -5578,7 +5628,12 @@ def _enrich_pair(
     each leg at its average fill over the most contracts the largest Kelly
     share could buy (never more than the cash). A time-series pair also needs
     a YES ask on the later book that is not below its own YES bid, and a
-    spread the run's spread rule accepts. It needs no client:
+    spread the run's spread rule accepts. Once a time-series pair is priced
+    and the later book has a YES ask, it also records the mid spread at the
+    tops of both books (CandidatePair.mid_spread,
+    config.time_series_mid_spread), whether or not a check then refuses the
+    pair; that reads the earlier market's YES bids, the one side of the two
+    books nothing else here reads. It needs no client:
     enrich_with_orderbook_prices fetches the books and calls it once per pair.
 
     Args:
@@ -5699,6 +5754,13 @@ def _enrich_pair(
     if is_time_series:
         # pair_gap_days: a same-event ladder is tiered on its STATED gap (DR-73)
         gap = pair_gap_days(pair)
+        # The earlier market's best NO ask (1 - its best YES bid), from the
+        # YES-bid side of its book: fetched with the rest, read only here. 1.0
+        # (a bid of 0) when it has none, which can only lower its midpoint
+        a_no_asks = _bids_to_ask_levels(ob_a["yes"], _pair_ticker(pair, "market_a"))
+        no_ask_a = a_no_asks[0][0] if a_no_asks else 1.0
+        # The earlier market's best YES ask: the top of the YES leg's levels
+        yes_ask_a = yes_levels[0][0]
         if ref_yes is None:
             # Nothing prices the in-between mass now: fail CLOSED. A stale pB below the
             # book's YES bid would let Kelly exceed 1 - k, which a cap above 1 - k (the
@@ -5775,6 +5837,11 @@ def _enrich_pair(
         # snapshot. Left alone when None, which has dropped the pair above.
         if ref_yes is not None:
             leg_updates["pB"] = ref_yes
+            # The mid spread at the tops of both books: the later market's
+            # YES ask and NO ask, and the earlier one's, read above
+            # (config.time_series_mid_spread, the one definition)
+            leg_updates["mid_spread"] = time_series_mid_spread(
+                yes_ask_a, no_ask_a, ref_yes, no_levels[0][0])
     else:
         leg_updates = {"nA": avg_no, "pB": avg_yes}
         # Mirror: pA is same_title's reference quote. Nothing sizes on it
@@ -5814,7 +5881,9 @@ def enrich_with_orderbook_prices(
     compute_trade can price any count, and max_contracts is the number of
     contracts the prices are for. A time-series pair also fails when the later
     market shows no YES ask, its YES ask sits below its own YES bid, or the
-    spread rule refuses it. A pair that fails a check is marked tradeable=False.
+    spread rule refuses it. A time-series pair priced at its fills with a YES
+    ask on the later book also carries its mid spread (mid_spread). A pair
+    that fails a check is marked tradeable=False.
 
     Args:
         client (Any): Kalshi client used to fetch order books (each fetched once per call).
@@ -5824,7 +5893,7 @@ def enrich_with_orderbook_prices(
         cash_cents (int | None): Keyword-only. The cash on hand in cents; None means it is all cash. Hand compute_trade the same value.
 
     Returns:
-        list: One CandidatePair per input, in order, with prices, tradeable, max_contracts and depth_levels set from the books.
+        list: One CandidatePair per input, in order, with prices, tradeable, max_contracts and depth_levels set from the books (and mid_spread, for a time-series pair priced at its fills with a later YES ask).
     """
     # Resolved once, so every pair below is judged under one rule
     settings = live_settings() if settings is None else settings
