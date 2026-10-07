@@ -110,9 +110,11 @@ SIZE_SOLVE_MAX_ITERATIONS     = 64
 # Tiered minimum YES ask price difference for time-series pairs, keyed by the
 # deadline gap between the two legs. The LATER contract's YES ask must
 # exceed the earlier's by at least the tier — later/earlier by close_time,
-# or by STATED deadline for a same-event ladder (DR-73): that gap is the market-implied
-# probability that the event first happens BETWEEN the two deadlines, which is
-# the trade's single loss scenario. A wider deadline gap leaves more time for
+# or by STATED deadline for a same-event ladder (DR-73). That YES-ask gap is
+# the entry rule's measure of the market-implied probability that the event
+# first happens BETWEEN the two deadlines, the trade's single loss scenario
+# (the forecast reads that probability at the midpoints instead,
+# time_series_mid_spread). A wider deadline gap leaves more time for
 # exactly that, so more of the market's in-between mass is genuine and a
 # bigger price gap is demanded before the strategy disputes it:
 #   gap <= SHORT_DEADLINE_GAP_DAYS (15 days)  -> MIN_PRICE_DIFF_SHORT_GAP (15%)
@@ -233,8 +235,8 @@ SAME_TITLE_MAX_CLOSE_GAP_SECONDS = 60 * 60
 
 # Maximum number of calendar days allowed between the deadlines of the two legs
 # in a time-series pair. The wider the gap, the more of the market-implied
-# in-between probability (the later YES ask minus the earlier) is genuine
-# rather than mispricing; past 30 days there is too much room for the event to
+# in-between probability (the later market's price minus the earlier one's) is
+# genuine rather than mispricing; past 30 days there is too much room for the event to
 # land between the deadlines for the trade to dispute the market's number.
 MAX_DEADLINE_GAP_DAYS         = 30
 
@@ -278,7 +280,8 @@ MAX_DEADLINE_GAP_DAYS         = 30
 #   past the pA + nB < $1 guard -> 24 pairs emitted, in 24 events and 23
 #   series, all tradeable.
 #
-#   Exposure, at k 0.75 and a 20% cap for every pair (tier floors on, no band):
+#   Exposure, at k 0.75 and a 20% cap for every pair (tier floors on, no band;
+#   measured with the forecast on the YES-ask gap pB - pA, not the mid spread):
 #   strategy.compute_trade + select_portfolio over those 24 pairs at a $10,000
 #   balance size 17 trades and SELECT 6, deploying $9,803.66 — 98%
 #   of the balance — with an aggregate market-implied EV of -$3,039.94, i.e.
@@ -419,14 +422,19 @@ TIME_SERIES_SAME_EVENT_LADDERS = True
 # band's ceiling (the live toggles below), and when BOTH legs are worded as
 # cumulative "by <date>" deadlines (scanner.deadline_phrasing) — only then does
 # the earlier deadline's event nest inside the later one's, which is what makes
-# the model below meaningful at all. The market-implied probability
-# that the event first happens BETWEEN the two deadlines is (pB - pA); that is
-# the trade's single loss scenario (earlier NO, later YES). This constant is the
-# fraction of that market-implied in-between mass we believe — 0.80 means "the
-# market overstates it by a fifth; prices will converge by 20%". It is an
-# operator-tunable ESTIMATE, not a measured quantity: at 1.0 (take the market at
-# face value) the Kelly fraction is <= 0 for every candidate and the strategy
-# never fires; smaller values size more aggressively. Measure it against
+# the model below meaningful at all. That entry rule screens the YES-ask gap
+# (pB - pA). The forecast reads the midpoints instead (DR-78): a market's
+# midpoint is halfway between its YES ask and its YES bid, and the
+# market-implied probability that the event first happens BETWEEN the two
+# deadlines is the mid spread, the later market's midpoint minus the earlier
+# one's (time_series_mid_spread), which leaves out the cost of crossing each
+# book; that is the trade's single loss scenario (earlier NO, later YES). This
+# constant is the fraction of that market-implied in-between mass we believe —
+# 0.80 means "the market overstates it by a fifth; prices will converge by
+# 20%". It is an operator-tunable ESTIMATE, not a measured quantity: at 1.0
+# (take the market at face value) the Kelly fraction is <= 0 for every
+# candidate and the strategy never fires; smaller values size more
+# aggressively. Measure it against
 # settled history with `backtest.py --interval-discount K` (overrides k for
 # that backtest run only; live runs price at the saved live defaults' k, which
 # main.py --interval-discount K overrides for one run) and
@@ -2022,8 +2030,9 @@ def time_series_spread_too_wide(spread: float, spread_max: float | None) -> bool
     """
     Return True when a time-series YES-ask spread exceeds the band's ceiling.
 
-    spread is pB - pA, the market-implied in-between mass the strategy
-    disputes. PRICE_EPSILON is absorbed on the KEEP side (TS-09): a spread is
+    spread is pB - pA, the YES-ask gap the entry rule screens (the forecast
+    reads the mid spread instead, time_series_mid_spread). PRICE_EPSILON is
+    absorbed on the KEEP side (TS-09): a spread is
     refused only when it exceeds spread_max by MORE than the tolerance, so
     0.90 - 0.30 == 0.6000000000000001 is kept at a 0.60 ceiling — a pair
     sitting exactly on the documented bound is never dropped for float noise.
@@ -2079,12 +2088,17 @@ def time_series_mid_spread(yes_ask_a: float, no_ask_a: float,
     the backtest reads that market's midpoint up to 0.005 higher and the mid
     spread up to 0.005 lower.
 
-    The one definition: live enrichment (scanner._enrich_pair) writes it on
-    each time-series pair it prices at its fills whose later book has a YES
-    ask (CandidatePair.mid_spread), and the backtest's candidates carry it
-    from that Monday's candle quotes (backtester._candidate_pair). Nothing
-    sizes on it: the Kelly model reads the YES-ask gap
-    (time_series_profit_prob).
+    It is the time-series forecast's input (time_series_profit_prob), and
+    this is its one definition: live enrichment (scanner._enrich_pair) writes
+    it on each time-series pair it prices at its fills whose later book has a
+    YES ask (CandidatePair.mid_spread), which the live sizer reads; the
+    backtest's candidates carry it from that Monday's candle quotes
+    (backtester._candidate_pair), and the backtest's Kelly gate
+    (backtester._simulate_at_discount) works it out from the same four
+    quotes. The dashboard's Kelly scatter works it out from each trade's
+    entry quotes (dashboard._entry_mid_spread), and dashboard._kelly_fraction
+    from its own four quotes when it is handed none. The entry rules (the
+    spread rule, the band, the floors) read the YES-ask gap instead.
 
     Args:
         yes_ask_a (float): The earlier market's (market A's) best YES ask, in
@@ -2103,23 +2117,28 @@ def time_series_mid_spread(yes_ask_a: float, no_ask_a: float,
             - ((yes_ask_b + no_ask_b) - (yes_ask_a + no_ask_a)) / 2.0)
 
 
-def time_series_profit_prob(pA: float, pB: float, k: float | None = None) -> float:
+def time_series_profit_prob(spread: float, k: float | None = None) -> float:
     """
-    Return the modelled probability that a time-series pair trade is profitable.
+    Return the modelled chance that a time-series pair trade pays.
 
-    The trade (YES on the earlier contract at pA, NO on the later at ~1 - pB)
-    loses only when the event first happens BETWEEN the two deadlines — earlier
-    NO, later YES. The market-implied probability of that in-between scenario
-    is the YES-ask gap (pB - pA); the strategy disputes it, believing only
-    TIME_SERIES_INTERVAL_PROB_DISCOUNT of that mass. So:
+    The trade (YES on the earlier contract, NO on the later one) loses only
+    when the event first happens BETWEEN the two deadlines: earlier NO, later
+    YES. The market's chance of that is the mid spread (time_series_mid_spread,
+    the later market's midpoint minus the earlier one's); the strategy
+    believes only the fraction k of it (TIME_SERIES_INTERVAL_PROB_DISCOUNT by
+    default). So:
 
-        p = 1 - TIME_SERIES_INTERVAL_PROB_DISCOUNT * max(0, pB - pA)
+        p = 1 - k * max(0, spread)
 
-    The gap is clamped at zero so a pair whose earlier contract is pricier
-    (never a candidate, but reachable from reporting code) models as riskless
-    rather than as a negative loss probability. This is the single definition
-    of the model — strategy._kelly_p, backtester.run_backtest and
-    dashboard._kelly_fraction all call it, so the three can never drift.
+    The clamp keeps a spread at or below zero from reading as a negative
+    chance of loss, but it would read such a pair as riskless, so no pair is
+    sized on one: the live sizer refuses a pair without a mid spread above
+    PRICE_EPSILON (scanner.pair_mid_spread), and the backtest's Kelly gate
+    passes a Monday only on quotes that put the spread above zero. The prices
+    an order pays never enter p; they set the cost, the fees and Kelly's b.
+    This is the single definition of the model: strategy._kelly_p_at,
+    backtester._simulate_at_discount and dashboard._kelly_fraction all call
+    it, so the three can never drift.
 
     The optional k overrides that constant for one call; every live call
     passes the run's LiveSettings.interval_discount (strategy._kelly_p_at), or
@@ -2127,18 +2146,16 @@ def time_series_profit_prob(pA: float, pB: float, k: float | None = None) -> flo
     time, so a test that monkeypatches the constant takes effect.
 
     Args:
-        pA (float): YES ask of the earlier contract, dollars in [0, 1].
-        pB (float): YES ask of the later contract, dollars in [0, 1]. Earlier
-            and later by close_time, or by STATED deadline for a same-event
-            ladder (DR-73).
+        spread (float): The pair's mid spread, in dollars
+            (time_series_mid_spread).
         k (float | None): Interval-discount override in [0, 1]. None (default)
             reads TIME_SERIES_INTERVAL_PROB_DISCOUNT.
 
     Returns:
-        float: Probability of profit in (0, 1] for a discount in [0, 1].
+        float: The chance of profit, in [0, 1] for a discount and a spread in [0, 1].
     """
     discount = TIME_SERIES_INTERVAL_PROB_DISCOUNT if k is None else k
-    return 1.0 - discount * max(0.0, pB - pA)
+    return 1.0 - discount * max(0.0, spread)
 
 
 def fee_per_pair_approx(price_a: float, price_b: float) -> float:
@@ -3067,11 +3084,19 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
     bounded by the pair type's ceiling on f* (anything but "time_series" is
     same-title):
 
-    time_series: f* = 1 - k*(pB - pA)/(1 - c), c = pA + nB + fee, is below
-        1 - k whenever pB is at or above 1 - nB (that market's YES bid) to
-        within PRICE_EPSILON, since the fee exceeds PRICE_EPSILON — which is
-        why enrichment drops a pair whose later book is crossed by more than
-        that, or has no current ask. The bound is 1 - k rounded to 12
+    time_series: f* = 1 - k*s/(1 - c), where s is the mid spread
+        (time_series_mid_spread) and c = pA + nB + fee at the fills. A
+        crossed book is one whose YES ask sits below its own YES bid. On books
+        neither of which is crossed by more than PRICE_EPSILON, the later
+        market's midpoint is at least its YES bid (1 - its best NO ask, at
+        least 1 - nB) and the earlier market's midpoint at most its YES ask
+        (at most pA), each to within PRICE_EPSILON / 2. So
+        s >= (1 - nB) - pA - PRICE_EPSILON = 1 - c + fee - PRICE_EPSILON,
+        which is above 1 - c since the fee exceeds PRICE_EPSILON, and
+        f* < 1 - k. That is why enrichment drops a pair whose later book has
+        no current YES ask or is crossed, or whose earlier book is crossed,
+        and why the backtest's Kelly gate skips a Monday whose quotes are
+        crossed on either market. The bound is 1 - k rounded to 12
         places: 1.0 - 0.8 is 0.19999999999999996, which would shift
         max_contracts down by one on round-number books. At k = 1 it is 0,
         and no time-series trade can size.

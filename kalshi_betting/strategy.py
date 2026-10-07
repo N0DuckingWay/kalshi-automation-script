@@ -11,14 +11,18 @@ Purpose:
     what the open positions are worth, but only cash buys contracts, so no
     trade's budget is more than the cash on hand. select_portfolio then picks
     trades best-first and shrinks any trade that no longer fits the cash left.
+    A time-series trade's chance of paying is forecast from the market's odds
+    at the midpoints (a midpoint is halfway between a market's YES ask and
+    its YES bid): the mid spread enrichment writes on the pair (DR-78), never
+    the prices an order pays, which set the cost, the fees and Kelly's b.
 
 Dependencies:
     Imports config (fees, budget and size-cap rules, the chance-of-profit
     model, LiveSettings, held_pair_fraction, which sizes a trade that adds to
     a pair the account holds, and count_text for the "adds to N held"
-    marker) and scanner (CandidatePair, pair_held and order-book pricing
-    helpers). main calls compute_trade and select_portfolio; trader and
-    reporter read TradeSpec.
+    marker) and scanner (CandidatePair, pair_held, pair_mid_spread, the
+    forecast's input, and order-book pricing helpers). main calls
+    compute_trade and select_portfolio; trader and reporter read TradeSpec.
 
 Notes:
     Prices here are leg prices (scanner.leg_prices): (nA, pB) same-title, (pA, nB) time-series.
@@ -63,6 +67,7 @@ from .scanner import (
     leg_sides,
     pair_held,
     pair_ladder_keys,
+    pair_mid_spread,
     prefix_fill_prices,
     v2_effective_cap,
 )
@@ -124,58 +129,62 @@ def _depth_levels(pair: CandidatePair) -> tuple:
     return tuple(levels) if isinstance(levels, (tuple, list)) else ()
 
 
-def _kelly_p(pair: CandidatePair, settings: LiveSettings) -> float:
+def _kelly_p(pair: CandidatePair, settings: LiveSettings) -> float | None:
     """
-    Probability of profit for the pair, at its stored YES-leg price.
+    The pair's chance of profit under the run's k; None when a time-series pair has no mid spread.
+
+    _kelly_p_at with the run's k (settings.interval_discount); see it for both
+    models.
+
+    Args:
+        pair (CandidatePair): Supplies pair_type and, for time_series, mid_spread.
+        settings (LiveSettings): The run's toggles; reads interval_discount (k).
+
+    Returns:
+        float | None: p, the "p" in compute_trade's Kelly formula; None for a
+            time-series pair without a usable mid spread.
+    """
+    return _kelly_p_at(pair, settings.interval_discount)
+
+
+def _kelly_p_at(pair: CandidatePair, k: float | None) -> float | None:
+    """
+    The pair's chance of profit: the forecast the Kelly formula sizes on.
+
+    It reads the market's odds, not what an order pays, so it is the same at
+    every order size. The prices paid set the cost, the fees and Kelly's b.
+
+    time_series: 1 - k * the mid spread (config.time_series_profit_prob). The
+    mid spread is the later market's midpoint minus the earlier one's, a
+    midpoint being halfway between a market's YES ask and its YES bid; it is
+    the market's chance that the event lands between the two deadlines, the
+    trade's one losing outcome given the cumulative-deadline premise (screened
+    by wording, DR-67), and the model believes the fraction k of it (at k = 1
+    nothing trades on uncrossed books). Enrichment writes it from the tops of
+    both books (scanner.pair_mid_spread reads it). A pair without one, or
+    with one at or below PRICE_EPSILON, has no forecast: None, and the
+    caller must not size the pair, since the model's zero clamp would read it
+    as riskless.
 
     same_title: the fixed SAME_TITLE_CO_RESOLVE_PROB prior. It is only valid
     for pairs the scanner confirmed ask one question — same wording, different
     series, closing within SAME_TITLE_MAX_CLOSE_GAP_SECONDS (DR-02, DR-74).
 
-    time_series: config.time_series_profit_prob(pA, pB, k) = 1 - k*(pB - pA).
-    Given the cumulative-deadline premise (screened by wording, DR-67), the
-    trade loses only if the event lands between the two deadlines; pB - pA is
-    the market's price for that, and the model believes the fraction k of it
-    (at k = 1 nothing trades on a consistent book). The YES-ask gap is used
-    rather than the executable spread because it is the smaller, more
-    conservative estimate of that mass.
-
-    The helper clamps pB - pA at zero, which would model a pair as riskless.
-    Enrichment marks non-tradeable, and compute_trade skips, every time-series
-    pair whose fresh pB is missing or not above every YES fill the sizer can
-    reach, so the clamp cannot fire on an enriched pair.
-
     Args:
-        pair (CandidatePair): Supplies pair_type, pA and pB.
-        settings (LiveSettings): The run's toggles; reads interval_discount (k).
+        pair (CandidatePair): Supplies pair_type and, for time_series, mid_spread.
+        k (float | None): The run's time-series discount; None reads config's
+            value, so only same-title may pass None.
 
     Returns:
-        float: p in (0, 1], the "p" in compute_trade's Kelly formula.
-    """
-    # The pair's own stored YES-leg quote. compute_trade calls _kelly_p_at
-    # directly instead, with the price of the quantity it is actually sizing.
-    return _kelly_p_at(pair, pair.pA, settings.interval_discount)
-
-
-def _kelly_p_at(pair: CandidatePair, yes_leg_price: float, k: float | None) -> float:
-    """
-    The pair's chance of profit, priced at a given YES-leg price.
-
-    Used when sizing a given count, since the YES leg's price changes with the
-    count. A same-title pair ignores the price and k and gets the fixed prior.
-
-    Args:
-        pair (CandidatePair): Supplies pair_type and pB.
-        yes_leg_price (float): pA at the size being tested, in (0, 1).
-        k (float | None): The run's time-series discount; None reads config's value, so only same-title may pass None.
-
-    Returns:
-        float: The chance of profit, in (0, 1].
+        float | None: The chance of profit, in (0, 1]; None for a time-series
+            pair without a usable mid spread.
     """
     if pair.pair_type == "time_series":
+        # Read by type: None means nothing to forecast on
+        spread = pair_mid_spread(pair)
         # Single shared definition of the time-series model — backtester and
         # dashboard call the same helper so the three sizers cannot drift
-        return time_series_profit_prob(yes_leg_price, pair.pB, k=k)
+        return None if spread is None else time_series_profit_prob(spread, k=k)
     return SAME_TITLE_CO_RESOLVE_PROB
 
 
@@ -188,7 +197,7 @@ class _Sizing(NamedTuple):
         target (int): How many the budget buys at that price, capped at the book's depth.
         price_a (float): market_a's leg price at n, in dollars.
         price_b (float): market_b's leg price at n, in dollars.
-        p (float): The chance of profit at that price.
+        p (float): The chance of profit (_kelly_p_at), the same at every n.
         profit_ratio (float): Win profit over contract cost; for ranking, not sizing.
         kelly_fraction (float): Kelly fraction after the size cap; for an add-on, after
             config.held_pair_fraction too.
@@ -244,8 +253,9 @@ def _evaluate_size(
     """
     Price n contract pairs off the book and return how many the budget then buys.
 
-    Every sizing check runs here, at n's own price. With no book, the pair's
-    stored leg prices are used and n is ignored. For an add-on
+    Every sizing check runs here, at n's own price; the chance of profit p
+    (_kelly_p_at) is the same at every n. With no book, the pair's stored
+    leg prices are used and n is ignored. For an add-on
     (scanner.pair_held), Kelly sizes the whole position: the capped fraction
     becomes config.held_pair_fraction's, what the held pair's stake (its
     worth at today's prices plus the fees paid for it, HeldPair.stake_dollars)
@@ -264,8 +274,8 @@ def _evaluate_size(
 
     Returns:
         _Sizing | None: The result, or None if any check fails (such as no edge after fees,
-            too little budget or depth, or an add-on whose held pair already holds its
-            Kelly share).
+            too little budget or depth, a time-series pair with no mid spread, or an add-on
+            whose held pair already holds its Kelly share).
     """
     if levels:
         fills = prefix_fill_prices(levels, n)
@@ -297,8 +307,12 @@ def _evaluate_size(
     # Reported return on contract cost (ranking + prod log) — not Kelly's b
     profit_ratio = net_spread / (price_a + price_b)
 
-    # p at THIS size's price, not the pair's stored pA, and at the run's k
-    p = _kelly_p_at(pair, price_a, settings.interval_discount)
+    # The forecast at the run's k: the same at every size, since it reads the
+    # market's odds (the mid spread), not the prices this size pays
+    p = _kelly_p_at(pair, settings.interval_discount)
+    if p is None:
+        # A time-series pair with no mid spread has nothing to forecast on
+        return None
     q = 1.0 - p
     # Kelly's b is the payoff per dollar AT RISK, and a losing pair loses its
     # fees too, so the fee is in the denominator (DR-62). Deliberately a
@@ -432,7 +446,8 @@ def _holds_kelly_share(
 
 
 def _log_no_add_on(pair: CandidatePair, holds_kelly_share: bool, *,
-                   portfolio_value_cents: int, level: int = logging.INFO) -> None:
+                   portfolio_value_cents: int, level: int = logging.INFO,
+                   no_forecast: bool = False) -> None:
     """
     Log why compute_trade adds nothing to a held pair; an ordinary pair logs nothing.
 
@@ -453,6 +468,9 @@ def _log_no_add_on(pair: CandidatePair, holds_kelly_share: bool, *,
         portfolio_value_cents (int): Keyword-only. The value compute_trade sized on, in
             cents; the Kelly-share line names it.
         level (int): Keyword-only. The line's log level; INFO by default.
+        no_forecast (bool): Keyword-only. True when a time-series add-on has
+            no usable mid spread, so there is no chance of profit to size it
+            on; its line says so instead of "no size fits this run".
     """
     held = pair_held(pair)
     if held is None:
@@ -466,6 +484,9 @@ def _log_no_add_on(pair: CandidatePair, holds_kelly_share: bool, *,
             pair.canonical_title, held.count, held.value_dollars, held.fees_dollars,
             portfolio_value_cents / 100,
         )
+    elif no_forecast:
+        logging.log(level, "Not adding to held pair '%s': no forecast (no usable "
+                    "mid spread)", pair.canonical_title)
     else:
         logging.log(level, "Not adding to held pair '%s': no size fits this run",
                     pair.canonical_title)
@@ -545,6 +566,13 @@ def compute_trade(
     those prices. Fees count as money at risk when sizing. Pass the same value, cash and settings enrichment got, or
     enrichment's depth limit no longer bounds the size.
 
+    A time-series pair's chance of profit is read from its mid spread
+    (_kelly_p_at), the same at every size. A time-series pair without a
+    usable mid spread (scanner.pair_mid_spread: missing, not a finite number,
+    or not above PRICE_EPSILON; on the live path, a pair never priced off its
+    order books) is refused with one INFO line (DEBUG when quiet); for an
+    add-on that line is its add-on line, naming the missing forecast.
+
     An add-on to a held pair (pair.held, read through scanner.pair_held) is
     sized on its whole position: the capped Kelly fraction becomes
     config.held_pair_fraction's, what the held pair's stake (its worth at
@@ -561,8 +589,9 @@ def compute_trade(
             DEBUG instead of INFO (the backtest sizes many trades); warnings are unchanged.
 
     Returns:
-        TradeSpec | None: The sized trade, or None if the pair is not tradeable, no size is worth
-            buying, or it is an add-on whose held pair already holds its Kelly share.
+        TradeSpec | None: The sized trade, or None if the pair is not tradeable, a time-series
+            pair has no mid spread to forecast on, no size is worth buying, or it is an
+            add-on whose held pair already holds its Kelly share.
 
     Raises:
         AttributeError/TypeError: If a market's close_time is None (only a hand-built pair can have one).
@@ -575,6 +604,19 @@ def compute_trade(
     if not pair.tradeable:
         _log_no_add_on(pair, holds_kelly_share=False,
                        portfolio_value_cents=portfolio_value_cents, level=info)
+        return None
+    # scanner.pair_mid_spread reads the forecast's input by type: None when
+    # the pair carries no usable one (missing, not a finite number, or not
+    # above PRICE_EPSILON)
+    if pair.pair_type == "time_series" and pair_mid_spread(pair) is None:
+        # Nothing to forecast on. An add-on says so on its add-on line
+        # instead, so every refused pair gets one line
+        if pair_held(pair) is None:
+            logging.log(info, "No forecast for '%s': no usable mid spread — skipping",
+                        pair.canonical_title)
+        _log_no_add_on(pair, holds_kelly_share=False,
+                       portfolio_value_cents=portfolio_value_cents, level=info,
+                       no_forecast=True)
         return None
 
     # Book levels from enrichment; () means size on the scalar leg prices
@@ -630,8 +672,9 @@ def compute_trade(
             break
 
         # n moved: re-price at the count actually submitted (trader reads this
-        # price for the FoK limit and rollback floor). p, profit_ratio and the
-        # Kelly fraction stay at pre-shrink values — reporting/ranking only.
+        # price for the FoK limit and rollback floor). profit_ratio and the
+        # Kelly fraction stay at pre-shrink values — reporting/ranking only;
+        # p is the same at every size.
         fills = prefix_fill_prices(levels, n)
         if fills is not None:
             price_a, price_b = fills
@@ -699,9 +742,13 @@ def compute_trade(
     # The held pair this trade adds to, if any; the _priced_pair copy below
     # keeps it, so it reaches spec.pair
     held = pair_held(pair)
+    # A time-series line names the mid spread its p was read from
+    # (scanner.pair_mid_spread; never None here, the check above refused that)
+    mid_text = (f" (mid spread {pair_mid_spread(pair):.3f})"
+                if pair.pair_type == "time_series" else "")
     logging.log(
         info,
-        "Trade computed: %s [%s] | %s(A)@%.2f + %s(B)@%.2f | p=%.2f kelly=%.1f%% n=%d "
+        "Trade computed: %s [%s] | %s(A)@%.2f + %s(B)@%.2f | p=%.2f%s kelly=%.1f%% n=%d "
         "cost=$%.2f profit_ratio=%.2f%% monthly=%.2f%%%s",
         pair.canonical_title,
         pair.pair_type,
@@ -710,6 +757,7 @@ def compute_trade(
         side_b.upper(),
         price_b,
         p,
+        mid_text,
         kelly_fraction_capped * 100,
         n,
         total_cost,
@@ -774,17 +822,20 @@ def _spec_at_count(spec: TradeSpec, n: int) -> TradeSpec | None:
     Costs, fees and the win payoff are worked out again for n; the ranking
     figures (kelly_p, kelly_fraction, the profit ratios, days_to_close) keep
     the spec's values. The Kelly, spread and edge checks are not repeated,
-    since buying fewer contracts never raises the price per contract. What can
-    fail at a smaller n is checked: the book must hold n, each order must reach
-    n at its own limit price, a win must still pay after fees, and the expected
-    profit must stay positive with the real, rounded-up fees.
+    since buying fewer contracts never raises the price per contract and the
+    chance of profit (_kelly_p_at, read from the mid spread) is the same at
+    every size. What can fail at a smaller n is checked: the book must hold n,
+    each order must reach n at its own limit price, a win must still pay after
+    fees, and the expected profit must stay positive with the real, rounded-up
+    fees.
 
     Args:
         spec (TradeSpec): A spec from compute_trade.
         n (int): The contract pairs wanted. At least 1.
 
     Returns:
-        TradeSpec | None: A new spec at n, or None if a check fails or a time-series spec has no interval_discount.
+        TradeSpec | None: A new spec at n, or None if a check fails or a time-series spec has
+            no interval_discount or no mid spread.
     """
     pair = spec.pair
     k = spec.interval_discount
@@ -816,10 +867,11 @@ def _spec_at_count(spec: TradeSpec, n: int) -> TradeSpec | None:
         return None
     total_cost = n * (price_a + price_b)
     total_cost_with_fees = total_cost + fee_a + fee_b
-    # The chance of profit at n's own YES price
-    p = _kelly_p_at(pair, price_a, k)
-    if p * min_payoff <= (1.0 - p) * total_cost_with_fees:
-        # Expected profit is not positive with the real, rounded-up fees
+    # The chance of profit, the same at every size; None: no mid spread
+    p = _kelly_p_at(pair, k)
+    if p is None or p * min_payoff <= (1.0 - p) * total_cost_with_fees:
+        # Nothing to forecast on, or the expected profit is not positive
+        # with the real, rounded-up fees
         return None
     return dc_replace(
         spec,

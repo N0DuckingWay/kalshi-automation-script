@@ -1524,14 +1524,17 @@ def _raw_events_page(events: list, cursor: str | None = None) -> SimpleNamespace
 # complement to a YES ask of 0.20 (matching pB above) — see
 # scanner._bids_to_ask_levels. Buying side S on a market consumes that
 # market's OPPOSITE-side bids, so the opt-in time-series pair is the mirror
-# image: TS-EARLY (a YES buy) serves NO bids at 0.70 => YES asks 0.30 with an
-# empty yes side; TS-LATE (a NO buy) serves YES bids at 0.60 => NO asks 0.40,
-# and a NO bid at 0.40 => the reference YES ask of 0.60 enrichment needs (at its
-# own YES bid: uncrossed). 100 contracts each — the depth cap the replay pins.
+# image: TS-EARLY (a YES buy) serves NO bids at 0.70 => YES asks 0.30, and a
+# YES bid at 0.30 => a NO ask of 0.70 (a book with no width, whose midpoint
+# the mid spread reads); TS-LATE (a NO buy) serves YES bids at 0.60 => NO
+# asks 0.40, and a NO bid at 0.40 => the reference YES ask of 0.60 enrichment
+# needs (at its own YES bid: uncrossed). The mid spread is the YES-ask gap,
+# 0.30. 100 contracts each — the depth cap the replay pins.
 _ORDERBOOK_PAYLOADS = {
     _TICKER_SAME_EXP: {"orderbook_fp": {"yes_dollars": [["0.55", "100"]], "no_dollars": []}},
     _TICKER_SAME_CHEAP: {"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.80", "100"]]}},
-    _TICKER_TS_EARLY: {"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.70", "100"]]}},
+    _TICKER_TS_EARLY: {"orderbook_fp": {"yes_dollars": [["0.30", "100"]],
+                                        "no_dollars": [["0.70", "100"]]}},
     _TICKER_TS_LATE: {"orderbook_fp": {"yes_dollars": [["0.60", "100"]],
                                        "no_dollars": [["0.40", "100"]]}},
 }
@@ -1930,7 +1933,7 @@ class TestRunDevLiveShapeReplay:
         # earlier one is the anomaly; the bot buys YES on the earlier (A) at
         # pA and NO on the later (B) at nB. This replay drives the inverted
         # finder, the mirrored orderbook enrichment (a YES buy consumes NO
-        # bids, a NO buy consumes YES bids), the discounted-gap Kelly model
+        # bids, a NO buy consumes YES bids), the discounted mid-spread Kelly model
         # and the NO-first dry-run order log end-to-end on the flow-through
         # fixture: pA 0.30, pB 0.60, nB 0.40, 10-day gap.
         client = _live_shape_client(
@@ -2758,7 +2761,7 @@ class TestLiveSettingsReachEverySite:
             for call in calls[key]:
                 assert arg(call, index, "settings") is settings, key
         for call in calls[("strategy", "time_series_profit_prob")]:
-            assert arg(call, 2, "k") == settings.interval_discount
+            assert arg(call, 1, "k") == settings.interval_discount
         for key in (("strategy", "pair_size_cap"), ("config", "pair_size_cap")):
             for call in calls[key]:
                 assert arg(call, 1, "size_cap") == settings.size_cap, key
@@ -3745,9 +3748,11 @@ _LADDER_EVENTS = (
     ]},
 )
 # Each rung's book, 100 contracts a level: its NO bids give the YES asks
-# above, and its YES bids the NO asks
+# above, and its YES bids the NO asks (each book with no width, so a pair's
+# mid spread is its YES-ask gap)
 _LADDER_BOOKS = {
-    _TICKER_LAD_13: {"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.80", "100"]]}},
+    _TICKER_LAD_13: {"orderbook_fp": {"yes_dollars": [["0.20", "100"]],
+                                      "no_dollars": [["0.80", "100"]]}},
     _TICKER_LAD_20: {"orderbook_fp": {"yes_dollars": [["0.40", "100"]],
                                       "no_dollars": [["0.60", "100"]]}},
     _TICKER_LAD_27: {"orderbook_fp": {"yes_dollars": [["0.70", "100"]],

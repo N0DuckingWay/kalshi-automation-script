@@ -69,6 +69,7 @@ from kalshi_betting.config import (
     SAME_TITLE_CO_RESOLVE_PROB,
     fee_leg_exact,
     fee_per_pair_approx,
+    time_series_mid_spread,
     time_series_profit_prob,
 )
 from kalshi_betting.dashboard import (
@@ -103,9 +104,10 @@ def make_trade(title_a: str = "Will BTC exceed $80k?", profit: float | None = No
     dashboard section builders under test read.
 
     YES on the earlier contract at 0.30 and NO on the later at 0.40 (later YES
-    ask 0.60, earlier NO ask 0.70 — reporting only), n=5, settled in the
-    "event by A" win cell (A=YES, hence B=YES). _section_risk calls the
-    six-argument _kelly_fraction on these entry prices live, threading the run's
+    ask 0.60, earlier NO ask 0.70: both books with no width, so the mid spread
+    the forecast reads is 0.30), n=5, settled in the "event by A" win cell
+    (A=YES, hence B=YES). _section_risk calls _kelly_fraction on these entry
+    prices live, threading the run's
     interval discount. deadline_gap_days is reporting-only on BacktestTrade and
     defaults to None (the same-title / no-gap-recorded shape).
     """
@@ -167,18 +169,20 @@ def make_equity(values: list[float], start: date = date(2026, 1, 5)) -> pd.DataF
 
 class TestKellyFraction:
     """dashboard._kelly_fraction maps the legs like scanner.leg_prices and
-    prices time-series pairs through config.time_series_profit_prob."""
+    prices time-series pairs through config.time_series_profit_prob of the
+    mid spread."""
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_time_series_flow_through_fixture(self):
-        # YES 0.30 + NO 0.40, later YES ask 0.60: p = 0.775, f* ≈ 0.1620 at k 0.75.
-        # b's denominator carries the fee — the dollars at risk include it,
-        # because a losing pair loses cost + fees (DR-62).
+        # YES 0.30 + NO 0.40, later YES ask 0.60, both books with no width: a
+        # mid spread of 0.30, p = 0.775, f* ≈ 0.1620 at k 0.75. b's denominator
+        # carries the fee — the dollars at risk include it, because a losing
+        # pair loses cost + fees (DR-62).
         pA, nA, pB, nB = 0.30, 0.70, 0.60, 0.40
         fee = fee_per_pair_approx(pA, nB)
         net_spread = (1.0 - pA - nB) - fee
         b = net_spread / (pA + nB + fee)
-        p = time_series_profit_prob(pA, pB)
+        p = time_series_profit_prob(time_series_mid_spread(pA, nA, pB, nB))
         assert _kelly_fraction(pA, nA, pB, nB, "time_series") == pytest.approx(p - (1 - p) / b)
         assert _kelly_fraction(pA, nA, pB, nB, "time_series") == pytest.approx(0.1620, abs=1e-4)
 
@@ -3327,14 +3331,45 @@ class TestFillsOnRowsAndScatter:
 
     def test_the_scatter_prices_a_time_series_trade_at_its_fills(self):
         k = 0.75
-        x, _ = dashboard._kelly_points([self._with_fills(0.33, 0.43)], k)
+        x, _ = dashboard._kelly_points([self._with_fills(0.31, 0.41)], k)
         # Hand-worked: the YES fill and the NO fill are the leg prices, and the
-        # later market's YES quote (0.60) is the model's reference ask
-        p = 1.0 - k * (0.60 - 0.33)
-        fee = fee_per_pair_approx(0.33, 0.43)
-        b = (1.0 - 0.33 - 0.43 - fee) / (0.33 + 0.43 + fee)
+        # forecast reads the entry quotes' mid spread, 0.60 - 0.30 on books
+        # with no width (never the fills), as the live sizer prices its legs
+        # at the fills and its forecast at the book's tops
+        p = 1.0 - k * 0.30
+        fee = fee_per_pair_approx(0.31, 0.41)
+        b = (1.0 - 0.31 - 0.41 - fee) / (0.31 + 0.41 + fee)
+        assert p - (1.0 - p) / b > 0
         assert x == [pytest.approx(p - (1.0 - p) / b)]
         assert x[0] != pytest.approx(dashboard._kelly_points([make_trade()], k)[0][0])
+
+    def test_the_scatter_forecasts_at_the_entry_mid_spread_not_the_fills(self):
+        # Market A's entry book is 0.05 wide (YES ask 0.30, NO ask 0.75), so
+        # the entry mid spread is 0.325: the forecast reads that, while the
+        # four quotes with the fills swapped in would read 0.315
+        k = 0.75
+        t = self._with_fills(0.31, 0.41, entry_nA=0.75)
+        assert dashboard._entry_mid_spread(t) == pytest.approx(0.325)
+        assert dashboard._entry_mid_spread(t) == time_series_mid_spread(0.30, 0.75, 0.60, 0.40)
+        x, _ = dashboard._kelly_points([t], k)
+        assert x == [_kelly_fraction(0.31, 0.75, 0.60, 0.41, "time_series", k=k,
+                                     spread=dashboard._entry_mid_spread(t))]
+        p = 1.0 - k * 0.325
+        fee = fee_per_pair_approx(0.31, 0.41)
+        b = (1.0 - 0.31 - 0.41 - fee) / (0.31 + 0.41 + fee)
+        assert p - (1.0 - p) / b > 0
+        assert x == [pytest.approx(p - (1.0 - p) / b)]
+        # Not the mid spread of the four with the fills swapped in
+        assert time_series_mid_spread(*dashboard._quotes_at_fills(t)) == pytest.approx(0.315)
+        assert x[0] != pytest.approx(
+            _kelly_fraction(*dashboard._quotes_at_fills(t), "time_series", k=k))
+
+    def test_a_same_title_trade_has_no_entry_mid_spread(self):
+        st = dataclasses.replace(make_trade(), pair_type="same_title")
+        assert dashboard._entry_mid_spread(st) is None
+        # ... and the spread keyword never reaches the same-title prior
+        assert (_kelly_fraction(0.70, 0.20, 0.30, 0.65, "same_title", spread=0.99)
+                == _kelly_fraction(0.70, 0.20, 0.30, 0.65, "same_title"))
 
     def test_the_scatter_prices_a_same_title_trade_at_its_fills(self):
         t = dataclasses.replace(self._with_fills(0.62, 0.30), pair_type="same_title",
@@ -7835,7 +7870,7 @@ class TestKhatCards:
     itself, rewritten by the script from the k-hat breakdown's own groups."""
 
     def test_the_delta_is_red_when_khat_is_above_k(self):
-        # p = 1 − k·(pB − pA): a k-hat above k means the sizer sized too big
+        # p = 1 − k·(the mid spread): a k-hat above k means the sizer sized too big
         assert dashboard._khat_delta(0.9, 0.75) == ("+0.150", "#F44336")
         assert dashboard._khat_delta(0.6, 0.75) == ("-0.150", "#4CAF50")
         assert dashboard._khat_delta(0.75, 0.75) == ("+0.000", "#4CAF50")

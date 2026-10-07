@@ -254,35 +254,46 @@ class TestTimeSeriesMidSpread:
 
 
 class TestTimeSeriesProfitProb:
-    """p = 1 - k * max(0, pB - pA): one minus the believed fraction k of the
+    """p = 1 - k * max(0, spread): one minus the believed fraction k of the
     market-implied probability that the event first happens between the two
-    deadlines (the single loss cell of a YES-on-earlier / NO-on-later pair)."""
+    deadlines (the single loss cell of a YES-on-earlier / NO-on-later pair),
+    read at the midpoints (the mid spread, time_series_mid_spread; DR-78)."""
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_flow_through_fixture(self):
-        # pA 0.30, pB 0.60 → p = 1 - 0.75 * 0.30 = 0.775 (k 0.75, pre-toggle)
-        assert time_series_profit_prob(0.30, 0.60) == pytest.approx(0.775)
+        # A mid spread of 0.30 → p = 1 - 0.75 * 0.30 = 0.775 (k 0.75, pre-toggle)
+        assert time_series_profit_prob(0.30) == pytest.approx(0.775)
 
     def test_matches_definition_from_constant(self):
-        for pA, pB in [(0.10, 0.25), (0.30, 0.60), (0.40, 0.55), (0.30, 0.70)]:
-            expected = 1.0 - config.TIME_SERIES_INTERVAL_PROB_DISCOUNT * (pB - pA)
-            assert time_series_profit_prob(pA, pB) == pytest.approx(expected)
+        for spread in (0.15, 0.30, 0.15, 0.40):
+            expected = 1.0 - config.TIME_SERIES_INTERVAL_PROB_DISCOUNT * spread
+            assert time_series_profit_prob(spread) == pytest.approx(expected)
+
+    def test_it_reads_the_mid_spread_not_the_ask_gap(self):
+        # The model takes the spread it is handed: a later book 0.10 wide puts
+        # the mid spread 0.05 under the YES-ask gap, and p reads the former
+        spread = time_series_mid_spread(0.30, 0.70, 0.60, 0.50)
+        assert spread == pytest.approx(0.25)
+        assert time_series_profit_prob(spread, k=0.80) == pytest.approx(0.80)
+        assert time_series_profit_prob(spread, k=0.80) != pytest.approx(
+            1.0 - 0.80 * (0.60 - 0.30))
 
     def test_clamps_to_one_when_earlier_is_pricier(self):
-        # A pricier earlier contract is never a candidate; reachable only from
-        # reporting code, where it must model as riskless, not as p > 1
-        assert time_series_profit_prob(0.60, 0.30) == 1.0
-        assert time_series_profit_prob(0.50, 0.50) == 1.0
+        # A spread at or below zero (the later midpoint not above the earlier)
+        # would model as riskless, never as p > 1: which is why the sizer never
+        # asks with one (scanner.pair_mid_spread refuses it)
+        assert time_series_profit_prob(-0.30) == 1.0
+        assert time_series_profit_prob(0.0) == 1.0
 
     def test_discount_of_one_is_market_implied(self, monkeypatch):
-        # k = 1 takes the market at face value: p = 1 - (pB - pA). Under this
+        # k = 1 takes the market at face value: p = 1 - spread. Under this
         # model Kelly is <= 0 for every pair (see test_strategy's parity class).
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 1.0)
-        assert time_series_profit_prob(0.30, 0.60) == pytest.approx(0.70)
+        assert time_series_profit_prob(0.30) == pytest.approx(0.70)
 
     def test_discount_of_zero_ignores_the_gap(self, monkeypatch):
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.0)
-        assert time_series_profit_prob(0.30, 0.60) == 1.0
+        assert time_series_profit_prob(0.30) == 1.0
 
     def test_discount_constant_value_and_range(self):
         # Pinned so a retune is visible in review; within (0, 1], the range
@@ -295,24 +306,24 @@ class TestTimeSeriesProfitProb:
         # The backtester's calibration sweep passes one k per simulation; the
         # override must win over the config constant — 1 - 0.50 * 0.30 = 0.85 —
         # without mutating it, since the live sizer keeps reading it.
-        assert time_series_profit_prob(0.30, 0.60, k=0.50) == pytest.approx(0.85)
-        assert time_series_profit_prob(0.30, 0.60, k=1.0) == pytest.approx(0.70)
+        assert time_series_profit_prob(0.30, k=0.50) == pytest.approx(0.85)
+        assert time_series_profit_prob(0.30, k=1.0) == pytest.approx(0.70)
         assert config.TIME_SERIES_INTERVAL_PROB_DISCOUNT == 0.75
 
     def test_k_none_is_identical_to_omitting_it(self):
         # k=None reads the config constant, so the backtest's default point
         # prices exactly as live sizing does at config.py's k
-        for pA, pB in [(0.10, 0.25), (0.30, 0.60), (0.40, 0.55), (0.60, 0.30)]:
-            assert time_series_profit_prob(pA, pB, k=None) == time_series_profit_prob(pA, pB)
+        for spread in (0.15, 0.30, 0.15, -0.30):
+            assert time_series_profit_prob(spread, k=None) == time_series_profit_prob(spread)
 
     def test_constant_read_at_call_time_and_only_when_k_is_omitted(self, monkeypatch):
         # The None sentinel must resolve inside the body rather than binding at
         # def time: a monkeypatched constant still governs an override-free
         # call (1 - 0.50 * 0.30 = 0.85)...
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.50)
-        assert time_series_profit_prob(0.30, 0.60) == pytest.approx(0.85)
+        assert time_series_profit_prob(0.30) == pytest.approx(0.85)
         # ...and is ignored entirely once k is supplied (1 - 0.75 * 0.30)
-        assert time_series_profit_prob(0.30, 0.60, k=0.75) == pytest.approx(0.775)
+        assert time_series_profit_prob(0.30, k=0.75) == pytest.approx(0.775)
 
 
 class TestLegSideTuples:
@@ -841,6 +852,9 @@ class TestMaxAffordablePairs:
             p = MagicMock()
             p.pA, p.pB, p.nA, p.nB = pA, pB, nA, nB
             p.pair_type, p.tradeable, p.max_contracts = pair_type, True, 0
+            # The forecast's input, as enrichment writes it from the books' tops
+            p.mid_spread = (time_series_mid_spread(pA, nA, pB, nB)
+                            if pair_type == "time_series" else None)
             p.canonical_title = f"{pair_type} {pA}/{pB}"
             p.market_a.close_time = now + timedelta(days=15)
             p.market_b.close_time = now + timedelta(days=30)
@@ -1830,6 +1844,8 @@ class TestShippedLiveToggles:
                         continue
                     pair = MagicMock()
                     pair.pA, pair.pB, pair.nA, pair.nB = pA, pB, 1 - pA, nB
+                    # The forecast's input, as enrichment writes it from the books' tops
+                    pair.mid_spread = time_series_mid_spread(pA, 1 - pA, pB, nB)
                     pair.pair_type, pair.tradeable, pair.max_contracts = "time_series", True, 0
                     pair.canonical_title = f"ts {pA}/{pB}/{nB}"
                     pair.market_a.close_time = now + timedelta(days=5)

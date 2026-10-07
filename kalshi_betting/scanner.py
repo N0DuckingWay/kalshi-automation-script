@@ -49,7 +49,8 @@ Dependencies:
     downstream of pair formation, and pair_mid_spread() the single reader of
     the mid spread on a time-series pair (the later market's midpoint minus
     the earlier one's, config.time_series_mid_spread), which enrichment writes
-    from the two books and the backtest's _candidate_pair from candle quotes.
+    from the two books and the backtest's _candidate_pair from candle quotes,
+    and which strategy's time-series forecast reads (DR-78).
     resolve_held_ladders() finds the ladders
     of the markets the account holds, and find_time_series_pairs refuses any
     candidate with a market on one of them, except one that adds to what it
@@ -970,8 +971,9 @@ class CandidatePair:
             same_title.
         pB (float): YES ask price of market B in dollars (what a YES contract
             on market B costs). Range: [0, 1]. A leg price for same_title; for
-            time_series it feeds the price-gap filter and the Kelly model but
-            is not a leg price.
+            time_series it is not a leg price: the spread rule tests it
+            against pA (in the finder, and again on the fresh book in
+            enrichment), and the forecast reads mid_spread rather than it.
         nA (float): NO ask price of market A in dollars (what a NO contract on
             market A costs). Range: [0, 1]. A leg price for same_title; reporting-only for
             time_series (still read so the prod log's "nA (NO ask)" column
@@ -1020,12 +1022,15 @@ class CandidatePair:
         mid_spread (float | None): For a time-series pair, the later
             market's midpoint minus the earlier one's
             (config.time_series_mid_spread; a midpoint is halfway between a
-            market's YES ask and its YES bid). Enrichment writes it from the
-            tops of the two order books it fetched, once it has priced the
-            pair at its fills and found a YES ask on the later book; the
-            backtest writes it from that Monday's candle quotes. None before
-            that, and always None for same_title. The finders never set it.
-            Read it through pair_mid_spread(), by type.
+            market's YES ask and its YES bid): the market's chance that the
+            event lands between the two deadlines, and the time-series
+            forecast's one input (strategy._kelly_p_at, DR-78). Enrichment
+            writes it from the tops of the two order books it fetched, once it
+            has priced the pair at its fills and found a YES ask on the later
+            book; the backtest writes it from that Monday's candle quotes.
+            None before that, and always None for same_title. The finders
+            never set it. Read it through pair_mid_spread(), by type: the
+            sizer refuses a time-series pair without a usable one.
     """
     market_a: Any           # same_title: pricier side by YES ask | time_series: EARLIER contract (close_time, or STATED deadline for a DR-73 ladder)
     market_b: Any           # same_title: cheaper side by YES ask  | time_series: the later one, by the same ordering
@@ -1049,10 +1054,10 @@ class CandidatePair:
     # Read via pair_held(), by type.
     held: HeldPair | None = None
     # A time-series pair's later market's YES midpoint minus the earlier
-    # one's (config.time_series_mid_spread): written by enrichment from the
-    # tops of both books, and by the backtest from that Monday's candle
-    # quotes; None until then and for same_title. Read via pair_mid_spread(),
-    # by type.
+    # one's (config.time_series_mid_spread), the forecast's input: written by
+    # enrichment from the tops of both books, and by the backtest from that
+    # Monday's candle quotes; None until then and for same_title. Read via
+    # pair_mid_spread(), by type.
     mid_spread: float | None = None
 
 
@@ -1162,7 +1167,7 @@ def pair_gap_days(pair: Any) -> int:
 
 def pair_mid_spread(pair: Any) -> float | None:
     """
-    Return the mid spread a time-series pair carries, or None if it has none to use.
+    Return the mid spread a time-series pair's forecast reads, or None if it has none to use.
 
     The mid spread is the later market's midpoint minus the earlier one's
     (config.time_series_mid_spread), which enrichment (from the two books)
@@ -1173,8 +1178,10 @@ def pair_mid_spread(pair: Any) -> float | None:
     counts. Anything else reads as None: the pair was never priced off its
     order books or candle quotes, or its midpoints are not in order (the
     later market's at or below the earlier's), so it states no chance of the
-    event landing between the deadlines (config.time_series_profit_prob's
-    zero clamp would read such a gap as riskless).
+    event landing between the deadlines. A time-series pair with None must
+    not be sized: config.time_series_profit_prob's zero clamp would read it
+    as riskless, so strategy._kelly_p_at returns no forecast for it and
+    compute_trade refuses it.
 
     Args:
         pair (Any): A CandidatePair, or anything standing in for one.
@@ -3953,8 +3960,10 @@ def find_time_series_pairs(
          order-independently by deadline_gap_days() for a cross-event pair and
          by the two STATED deadlines for a same-event ladder — one number
          either way afterwards, through pair_gap_days()
-      6. pB - pA strictly positive (B is the LATER contract; the gap is the
-         in-between mass the strategy disputes) and at or above the run's entry
+      6. pB - pA strictly positive (B is the LATER contract; this YES-ask gap
+         is the entry rule's measure of the in-between mass the strategy
+         disputes, while the forecast reads that mass at the midpoints,
+         config.time_series_mid_spread) and at or above the run's entry
          floor (config.time_series_spread_refusal). A non-positive spread is
          skipped uncounted; one under the floor is counted.
       7. Skips candidates whose leg ASK prices already sum to $1 or more. A
@@ -4520,9 +4529,10 @@ def find_time_series_pairs(
 
         # Keep only the single best pair per normalized title+outcome group to avoid flooding
         # the portfolio with many near-identical positions. Tradeable pairs rank above
-        # non-tradeable ones; within each tier, the largest pB - pA (the disputed
-        # in-between probability) wins. pB > pA holds for every entry in group_pairs
-        # (see the directional filter above), so no abs() is needed.
+        # non-tradeable ones; within each tier, the largest pB - pA (the YES-ask gap the
+        # entry rule screens; the forecast reads the mid spread) wins. pB > pA holds for
+        # every entry in group_pairs (see the directional filter above), so no abs() is
+        # needed.
         group_pairs.sort(key=lambda p: (p.tradeable, p.pB - p.pA), reverse=True)
         candidate_pairs.append(group_pairs[0])
 
@@ -5245,8 +5255,9 @@ def _reference_yes_ask(pair: Any, ob_a: dict, ob_b: dict) -> float | None:
     Best YES ask on the market that does NOT carry the pair's YES leg.
 
     Each pair type buys YES on one market and NO on the other, so exactly one
-    market's YES ask is a LEG price; the OTHER market's YES ask is the model's
-    reference quote (pB for time_series, pA for same_title). _leg_ask_levels
+    market's YES ask is a LEG price; the OTHER market's YES ask is the pair's
+    reference quote: pB for time_series, which the spread rule tests and the
+    mid spread reads, and pA for same_title, which is only reported. _leg_ask_levels
     reads only one side of each book, which leaves the side that yields this
     quote fetched but unused — so deriving it here costs no extra request.
 
@@ -5627,14 +5638,16 @@ def _enrich_pair(
     pair's price-sum ceiling that still have an edge after the fee, and prices
     each leg at its average fill over the most contracts the largest Kelly
     share could buy (never more than the cash). A time-series pair also needs
-    a YES ask on the later book that is not below its own YES bid, and a
-    spread the run's spread rule accepts. Once a time-series pair is priced
-    and the later book has a YES ask, it also records the mid spread at the
-    tops of both books (CandidatePair.mid_spread,
-    config.time_series_mid_spread), whether or not a check then refuses the
-    pair; that reads the earlier market's YES bids, the one side of the two
-    books nothing else here reads. It needs no client:
-    enrich_with_orderbook_prices fetches the books and calls it once per pair.
+    a YES ask on the later book, neither book crossed (a crossed book's YES
+    ask sits below its own YES bid), and a spread the run's spread rule
+    accepts. Once a time-series pair is priced and the later book has a YES
+    ask, it also records the mid spread at the tops of both books
+    (CandidatePair.mid_spread, config.time_series_mid_spread), the input the
+    sizer's forecast reads, whether or not a check then refuses the pair;
+    that reads the earlier market's YES bids, the one side of the two books
+    the legs do not consume, which the earlier-book crossed check reads too.
+    It needs no client: enrich_with_orderbook_prices fetches the books and
+    calls it once per pair.
 
     Args:
         pair (CandidatePair): A tradeable pair.
@@ -5737,12 +5750,11 @@ def _enrich_pair(
     # Back to SIDE order ("the YES leg"/"the NO leg") for the code below
     avg_yes, avg_no = (fills[1], fills[0]) if a_is_no else (fills[0], fills[1])
 
-    # The REFERENCE quote — the non-leg market's YES ask — refreshed from the
-    # book already in hand. Left at its scan-time value it would be compared
-    # against a fresh avg_yes by strategy._kelly_p, whose subtraction runs
-    # through config.time_series_profit_prob's max(0, pB - pA) clamp: a stale
-    # pB at or below the fresh pA clamps to zero, returning p = 1.0, so the
-    # pair models as RISKLESS and Kelly sizes it at the per-trade cap.
+    # The REFERENCE quote — the non-leg market's YES ask — read fresh from the
+    # book already in hand. For a time-series pair it is the later market's
+    # YES ask: the spread rule below tests it against the fills, and it is
+    # half of that market's midpoint in the mid spread the sizer's forecast
+    # reads, so a scan-time value would test and price a quote that has moved.
     ref_yes = _reference_yes_ask(pair, ob_a, ob_b)
 
     # Why the pair is refused, the first check that fails (None: tradeable)
@@ -5755,17 +5767,19 @@ def _enrich_pair(
         # pair_gap_days: a same-event ladder is tiered on its STATED gap (DR-73)
         gap = pair_gap_days(pair)
         # The earlier market's best NO ask (1 - its best YES bid), from the
-        # YES-bid side of its book: fetched with the rest, read only here. 1.0
-        # (a bid of 0) when it has none, which can only lower its midpoint
+        # YES-bid side of its book, which the legs do not consume: read for
+        # its midpoint and the crossed-book check below. 1.0 (a bid of 0) when
+        # it has none, which can only lower its midpoint
         a_no_asks = _bids_to_ask_levels(ob_a["yes"], _pair_ticker(pair, "market_a"))
         no_ask_a = a_no_asks[0][0] if a_no_asks else 1.0
         # The earlier market's best YES ask: the top of the YES leg's levels
         yes_ask_a = yes_levels[0][0]
         if ref_yes is None:
-            # Nothing prices the in-between mass now: fail CLOSED. A stale pB below the
-            # book's YES bid would let Kelly exceed 1 - k, which a cap above 1 - k (the
-            # 100% default) does not stop. backtester._find_entry does not mirror this
-            # (CLAUDE.md: "Known residual of the live spread rule").
+            # Nothing prices the in-between mass now: with no YES ask on the
+            # later book there is no midpoint for it, so no mid spread for the
+            # forecast and no fresh quote for the spread rule. Fail CLOSED.
+            # backtester._find_entry does not mirror this (CLAUDE.md: "Known
+            # residual of the live spread rule").
             direction_ok = False
             refused = ENRICH_NO_REFERENCE
             log(logging.WARNING,
@@ -5773,22 +5787,33 @@ def _enrich_pair(
                 "(no resting NO bids), so nothing prices its in-between mass now",
                 pair.canonical_title)
         elif ref_yes + no_levels[0][0] < 1.0 - PRICE_EPSILON:
-            # no_levels[0][0] is the later market's best NO ask, 1 - its best YES bid; a
-            # YES ask below that bid is a crossed book, the one state where Kelly can
-            # exceed 1 - k.
+            # no_levels[0][0] is the later market's best NO ask, 1 - its best
+            # YES bid; a YES ask below that bid is a crossed book. Its midpoint
+            # then sits below its YES bid, and Kelly could exceed 1 - k
+            # (config.max_kelly_fraction relies on this check)
             direction_ok = False
             refused = ENRICH_CROSSED
             log(logging.WARNING,
                 "Pair '%s' dropped: the later contract's YES ask %.4f sits below "
                 "its own YES bid %.4f — a crossed book",
                 pair.canonical_title, ref_yes, 1.0 - no_levels[0][0])
+        elif yes_ask_a + no_ask_a < 1.0 - PRICE_EPSILON:
+            # The earlier market's YES ask below its own YES bid (1 - no_ask_a):
+            # a crossed book, whose midpoint sits above its YES ask, and Kelly
+            # could exceed 1 - k (config.max_kelly_fraction relies on this check)
+            direction_ok = False
+            refused = ENRICH_CROSSED
+            log(logging.WARNING,
+                "Pair '%s' dropped: the earlier contract's YES ask %.4f sits below "
+                "its own YES bid %.4f — a crossed book",
+                pair.canonical_title, yes_ask_a, 1.0 - no_ask_a)
         else:
-            # Positivity and the floor are tested on the spread the sizer
-            # prices (the prefix average), the ceiling on the TOP of the
-            # book. Past the guards above, the price-sum ceiling implies the
-            # floor to within 2 * PRICE_EPSILON and the edge cut leaves a
-            # spread above the fee, so only the ceiling is live here; the
-            # other two stay as defence (TS-34).
+            # Positivity and the floor are tested on the YES-ask gap at the
+            # YES leg's fill (the prefix average the order pays), the ceiling
+            # on the TOP of the book. Past the guards above, the price-sum
+            # ceiling implies the floor to within 2 * PRICE_EPSILON and the
+            # edge cut leaves a spread above the fee, so only the ceiling is
+            # live here; the other two stay as defence (TS-34).
             basis = f"fresh reference ask {ref_yes:.4f}"
             refusal = time_series_spread_refusal(ref_yes - avg_yes, gap, settings)
             if refusal is None:
@@ -5832,14 +5857,15 @@ def _enrich_pair(
     # leg_prices() reads); strategy.py sizes the final Kelly trade on them
     if leg_sides(pair.pair_type) == TIME_SERIES_LEG_SIDES:
         leg_updates = {"pA": avg_yes, "nB": avg_no}
-        # pB is the model's reference quote, not a leg price — refreshed so
-        # strategy._kelly_p's pB - pA subtraction has both operands from one
-        # snapshot. Left alone when None, which has dropped the pair above.
+        # pB is the later market's YES ask, not a leg price: written fresh
+        # from the book, the quote the spread rule above tested. Left alone
+        # when None, which has dropped the pair above.
         if ref_yes is not None:
             leg_updates["pB"] = ref_yes
-            # The mid spread at the tops of both books: the later market's
-            # YES ask and NO ask, and the earlier one's, read above
-            # (config.time_series_mid_spread, the one definition)
+            # The mid spread at the tops of both books, the input the sizer's
+            # forecast reads (DR-78): the later market's YES ask and NO ask,
+            # and the earlier one's, read above (config.time_series_mid_spread,
+            # the one definition)
             leg_updates["mid_spread"] = time_series_mid_spread(
                 yes_ask_a, no_ask_a, ref_yes, no_levels[0][0])
     else:
@@ -5880,10 +5906,11 @@ def enrich_with_orderbook_prices(
     cash. The kept levels are stored on the pair (depth_levels) so
     compute_trade can price any count, and max_contracts is the number of
     contracts the prices are for. A time-series pair also fails when the later
-    market shows no YES ask, its YES ask sits below its own YES bid, or the
-    spread rule refuses it. A time-series pair priced at its fills with a YES
-    ask on the later book also carries its mid spread (mid_spread). A pair
-    that fails a check is marked tradeable=False.
+    market shows no YES ask, either market's YES ask sits below its own YES
+    bid (a crossed book), or the spread rule refuses it. A time-series pair
+    priced at its fills with a YES ask on the later book also carries its mid
+    spread (mid_spread), which the sizer's forecast reads. A pair that fails
+    a check is marked tradeable=False.
 
     Args:
         client (Any): Kalshi client used to fetch order books (each fetched once per call).

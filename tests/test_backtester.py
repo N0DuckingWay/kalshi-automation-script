@@ -55,6 +55,7 @@ from kalshi_betting.config import (
     INTERVAL_DISCOUNT_SWEEP,
     MAX_DEADLINE_GAP_DAYS,
     MVE_SERIES_FAMILY_PREFIX,
+    PRICE_EPSILON,
     SAME_TITLE_CO_RESOLVE_PROB,
     SCHEDULED_RUN,
     SPREAD_BAND_SWEEP_CEILINGS,
@@ -6567,15 +6568,17 @@ class TestRunBacktestTimeSeriesFlow:
         assert _group_by_exact_title(markets) == {}
 
     @staticmethod
-    def _expected_kelly(pA, nB, pB):
+    def _expected_kelly(pA, nB, pB, nA=None):
         # p - (1 - p)/b computed from the config helpers, so this pins the
         # model THROUGH run_backtest rather than a hardcoded number. b's
         # denominator carries the fee: the losing cell loses cost + fees, so
-        # that is the capital actually at risk (DR-62).
+        # that is the capital actually at risk (DR-62). p reads the four
+        # quotes' mid spread (DR-78), EA's NO ask defaulting to 1 - pA
+        nA = 1.0 - pA if nA is None else nA
         fee = fee_per_pair_approx(pA, nB)
         net = (1.0 - pA - nB) - fee
         b = net / (pA + nB + fee)
-        p = time_series_profit_prob(pA, pB)
+        p = time_series_profit_prob(time_series_mid_spread(pA, nA, pB, nB))
         return p - (1.0 - p) / b
 
     def _assert_entry_and_sizing(self, t):
@@ -8655,13 +8658,15 @@ class TestKellyPicksTheEarliestPassingMonday:
         # One ladder (both ask question "g") at k = 0.95. R_FAIL ranks higher
         # but fails the gate on both Mondays; R_PASS passes. R_FAIL never
         # becomes a candidate, so it never holds the ladder, and R_PASS trades.
+        # R_FAIL's later book is 0.05 wide (mid spread 0.575); R_PASS's books
+        # have no width (mid spread 0.53)
         r_fail = self._record((self._M1, 0.90, 0.15), (self._M2, 0.90, 0.15), pA=0.30,
                               legs=self._legs("no", "no", tag="-F"), group_key="g")
-        r_pass = self._record((self._M1, 0.45, 0.52), pA=0.10,
+        r_pass = self._record((self._M1, 0.55, 0.45), pA=0.02,
                               legs=self._legs("no", "no", tag="-P"), group_key="g")
-        assert self._kelly(r_fail, 0.95) == pytest.approx([-0.083, -0.083], abs=1e-3)
+        assert self._kelly(r_fail, 0.95) == pytest.approx([-0.038, -0.038], abs=1e-3)
         (f_pass,) = self._kelly(r_pass, 0.95)
-        assert f_pass == pytest.approx(0.067, abs=1e-3)
+        assert f_pass == pytest.approx(0.015, abs=1e-3)
 
         def profit_ratio(rec):
             e = rec["entry"]
@@ -8669,7 +8674,7 @@ class TestKellyPicksTheEarliestPassingMonday:
             return net / (e["pA"] + e["nB"])
 
         assert profit_ratio(r_fail) == pytest.approx(1.17, abs=0.01)
-        assert profit_ratio(r_pass) == pytest.approx(0.57, abs=0.01)
+        assert profit_ratio(r_pass) == pytest.approx(1.09, abs=0.01)
         point = self._sim([r_fail, r_pass], k=0.95)
         (t,) = point.trades
         assert (t.ticker_a, t.entry_date) == ("EARLY-P", self._M1)
@@ -9693,6 +9698,8 @@ class TestSizesOnPortfolioValue:
             market_a=_market("FA"), market_b=_market("FB"),
             pA=0.20, pB=0.60, nA=0.80, nB=0.40, tradeable=True,
             canonical_title="f", pair_type="time_series", max_contracts=0,
+            # The forecast's input, as backtester._candidate_pair gives it
+            mid_spread=time_series_mid_spread(0.20, 0.80, 0.60, 0.40),
         )
         settings = dc_replace(config.live_settings(), interval_discount=k, size_cap=1.0)
         spec = compute_trade(pair, round(value * 100), settings=settings,
@@ -9837,6 +9844,8 @@ def _live_add_on(first, value: float, cash: float, *, k: float, size_cap: float,
         market_a=_market("PA"), market_b=_market("PB"), pA=pA, pB=pB,
         nA=round(1.0 - pA, 4), nB=nB, tradeable=True, canonical_title="q",
         pair_type="time_series", max_contracts=0, held=held,
+        # The forecast's input, as backtester._candidate_pair gives it
+        mid_spread=time_series_mid_spread(pA, round(1.0 - pA, 4), pB, nB),
     )
     settings = dc_replace(config.live_settings(), interval_discount=k, size_cap=size_cap)
     spec = compute_trade(pair, round(value * 100), settings=settings,
@@ -13119,8 +13128,10 @@ def _uncapped_kelly(rec: dict, k: float) -> float | None:
     qualifying Monday (or, handed {"pair_type": ..., "entry": monday}, at
     that Monday), rebuilt from the config helpers — the oracle for
     peak_kelly_fraction wherever a pair's later Mondays repeat its first
-    Monday's quotes, as TestPrepareEntriesGolden's tier-on entries do. None
-    when the net spread leaves nothing to size."""
+    Monday's quotes, as TestPrepareEntriesGolden's tier-on entries do. A
+    time-series forecast reads that Monday's mid spread (DR-78). None when
+    the net spread leaves nothing to size, or a time-series Monday's quote is
+    crossed on either market (the gate skips it)."""
     e = rec["entry"]
     price_a, price_b = backtester._leg_prices_for(rec["pair_type"], e["pA"], e["nA"],
                                                   e["pB"], e["nB"])
@@ -13129,8 +13140,14 @@ def _uncapped_kelly(rec: dict, k: float) -> float | None:
     if net <= 0:
         return None
     b = net / (price_a + price_b + fee)
-    p = (time_series_profit_prob(e["pA"], e["pB"], k=k)
-         if rec["pair_type"] == "time_series" else SAME_TITLE_CO_RESOLVE_PROB)
+    if rec["pair_type"] == "time_series":
+        if (e["pA"] + e["nA"] < 1.0 - PRICE_EPSILON
+                or e["pB"] + e["nB"] < 1.0 - PRICE_EPSILON):
+            return None
+        p = time_series_profit_prob(
+            time_series_mid_spread(e["pA"], e["nA"], e["pB"], e["nB"]), k=k)
+    else:
+        p = SAME_TITLE_CO_RESOLVE_PROB
     return p - (1.0 - p) / b
 
 
@@ -13260,16 +13277,22 @@ class TestSizeCap:
         assert _uncapped_kelly(st, 0.75) == pytest.approx(0.77, abs=0.01)
 
     def test_a_candidate_dropped_after_the_kelly_gate_still_counts(self, monkeypatch):
-        # At k = 1.0 the golden time-series peak is TA/TB (~0.106) — voided,
-        # so it never trades — and nothing else passes the Kelly gate.
+        # The golden fixture's two voided pairs never trade. At k = 0.75 WA/WB
+        # (a 0.98 spread on books with no width) passes the Kelly gate, so it
+        # sets the peak though it is dropped after the gate; TA/TB's later
+        # quote is crossed (YES ask 0.45 under its 0.50 YES bid), so the gate
+        # skips it and it counts toward nothing.
         golden = TestPrepareEntriesGolden()
         entries, _ = golden._prepare(monkeypatch, True)
-        ts = [r for r in entries if r["pair_type"] == "time_series"]
-        point = self._sim(ts, k=1.0)
+        voided = [r for r in entries if r["entry"]["mA"]["ticker"] in ("TA", "WA")]
+        assert len(voided) == 2
+        point = self._sim(voided, k=0.75)
         assert point.trades == []
-        ta = next(r for r in ts if r["entry"]["mA"]["ticker"] == "TA")
-        assert point.peak_kelly_fraction == pytest.approx(_uncapped_kelly(ta, 1.0), abs=1e-12)
-        assert point.peak_kelly_fraction == pytest.approx(0.106, abs=1e-3)
+        ta, wa = (next(r for r in voided if r["entry"]["mA"]["ticker"] == t)
+                  for t in ("TA", "WA"))
+        assert _uncapped_kelly(ta, 0.75) is None
+        assert point.peak_kelly_fraction == pytest.approx(_uncapped_kelly(wa, 0.75), abs=1e-12)
+        assert point.peak_kelly_fraction == pytest.approx(0.249, abs=1e-3)
 
     def test_the_same_title_cap_binds_same_title_only(self, monkeypatch):
         # SAME_TITLE_SIZE_CAP (backtester's binding, read at call time, applied
@@ -13758,10 +13781,12 @@ class TestCapSweep:
                 assert point is eager[(band, k, pop)]
                 low_peaks += point.peak_kelly_fraction < self._PRIMARY_CAP
         # Not vacuous: the identity holds where the eager point's peak sits
-        # BELOW the primary cap too (at k = 1.0 the time-series peak is TA/TB's
-        # ~0.106 and the ladder's 0.0), the case the seed branch would copy
+        # BELOW the primary cap too (at k = 1.0 no time-series Monday passes
+        # the Kelly gate: on uncrossed quotes f* < 1 - k = 0, and TA/TB's
+        # crossed later quote is skipped, so the time-series and ladder peaks
+        # are 0.0), the case the seed branch would copy
         ts = eager[((0.0, 1.0), 1.0, "time_series")]
-        assert ts.peak_kelly_fraction == pytest.approx(0.106, abs=1e-3)
+        assert ts.peak_kelly_fraction == 0.0
         assert eager[((0.0, 1.0), 1.0, "ladder")].peak_kelly_fraction == 0.0
         assert low_peaks > 0
         st = on.cap_sweep.same_title()
@@ -15454,8 +15479,8 @@ class TestTierFloorsOff:
     def test_a_zero_spread_is_refused_with_the_tiers_off(self):
         # At a floor of 0 with the tiers off the threshold is 0.0, so the gap
         # test alone would admit pB == pA: a pair with no in-between mass,
-        # which time_series_profit_prob models as riskless (p = 1, Kelly at
-        # the cap). The later leg's candle is CROSSED (pB + nB = 0.80 < 1), so
+        # which has nothing to dispute, as config.time_series_spread_refusal
+        # says. The later leg's candle is CROSSED (pB + nB = 0.80 < 1), so
         # the pair clears every other price test — the live quotes, the sum
         # ceiling of 1 and the fee check — and only the refusal of a spread
         # that is not strictly positive stands between it and an entry.
@@ -17912,7 +17937,10 @@ class TestSalesComeBeforePurchases:
             market_b=scanner._market_from_dict(entry["mB"], ""),
             pA=entry["pA"], pB=entry["pB"], nA=entry["nA"], nB=entry["nB"], tradeable=True,
             canonical_title=str(rec["canon"]), pair_type="time_series",
-            stated_gap_days=entry["gap_days"], held=held)
+            stated_gap_days=entry["gap_days"], held=held,
+            # The forecast's input, as backtester._candidate_pair gives it
+            mid_spread=time_series_mid_spread(entry["pA"], entry["nA"], entry["pB"],
+                                              entry["nB"]))
         settings = LiveSettings(tier_floors=True, spread_band=(0.0, 1.0),
                                 interval_discount=cls._K, size_cap=1.0,
                                 same_title_size_cap=backtester.SAME_TITLE_SIZE_CAP,
@@ -17998,24 +18026,32 @@ class TestSalesComeBeforePurchases:
     @pytest.mark.parametrize("min_days", [None, 3])
     def test_the_sold_pair_is_not_bought_or_added_to_at_its_own_checkpoint(
             self, min_days, add_to_held):
-        # P also passes Monday 2, at quotes whose Kelly fraction is nearly 1,
-        # and Monday 3 at its first quotes
-        records = self._records(p_mondays=(_LADDER_M1, (_LADDER_M2, 0.20, 0.21, 0.40),
-                                           _LADDER_M3))
+        # P passes Mondays 1-3 at its first quotes. X (XA/XB, no quotes) ranks
+        # above it on Monday 1 (it pays out sooner), takes most of the cash and
+        # pays out before Monday 2, so P is bought small on Monday 1 and is
+        # short of its Kelly share on Monday 2
+        x = _ladder_record(_ladder_market("XA", "EVX-1", "2026-01-08"),
+                           _ladder_market("XB", "EVX-2", "2026-01-08"), "x", [_LADDER_M1])
+        records = self._records(x, p_mondays=(_LADDER_M1, _LADDER_M2, _LADDER_M3))
+
+        def p_trades(point):
+            return [(t.entry_date, t.add_on, t.sold, t.exit_date)
+                    for t in point.trades if t.ticker_a == "SA"]
+
         unsold = self._sim(records, add_to_held=add_to_held)
+        assert _traded(unsold)[:2] == [("XA", _LADDER_M1), ("SA", _LADDER_M1)]
         if add_to_held:
-            # CONTROL: unsold, P is short of its Kelly share on Monday 2 and
-            # is added to there, so a walk that bought before it sold would
-            # add to the position it then sells
-            assert [(t.entry_date, t.add_on) for t in unsold.trades] == [
-                (_LADDER_M1, False), (_LADDER_M2, True)]
+            # CONTROL: unsold, P is added to on Monday 2, so a walk that bought
+            # before it sold would add to the position it then sells
+            assert p_trades(unsold)[:2] == [(_LADDER_M1, False, False, date(2026, 3, 20)),
+                                             (_LADDER_M2, True, False, date(2026, 3, 20))]
         else:
-            assert _traded(unsold) == [("SA", _LADDER_M1)]
+            assert p_trades(unsold) == [(_LADDER_M1, False, False, date(2026, 3, 20))]
         point = self._sim(records, 0.25, add_to_held=add_to_held, sell_min_days=min_days)
         # Sold on Monday 2 and neither bought nor added to there (its markets
         # are freed by the sale); bought again on Monday 3
-        assert [(t.entry_date, t.add_on, t.sold, t.exit_date) for t in point.trades] == [
-            (_LADDER_M1, False, True, _LADDER_M2), (_LADDER_M3, False, False, date(2026, 3, 20))]
+        assert p_trades(point) == [(_LADDER_M1, False, True, _LADDER_M2),
+                                   (_LADDER_M3, False, False, date(2026, 3, 20))]
 
     @pytest.mark.parametrize("min_days", [None, 3])
     def test_a_sale_where_nothing_is_bought_funds_the_next_checkpoint(self, min_days):
@@ -19105,20 +19141,20 @@ class TestWalkedTradeParity:
         assert pair_held(spec.pair) == held
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
-    def test_a_candle_crossed_time_series_monday_is_refused_when_walked(self, caplog):
+    def test_a_candle_crossed_time_series_monday_is_skipped_at_the_kelly_gate(self, caplog):
         # Market B's YES ask 0.55 sits below its own YES bid 0.60 (1 - its NO
-        # ask 0.40): the live enrichment's crossed-book guard refuses it
-        model = _walk_model()
-        rec, candles = self._ts(quotes=(0.20, 0.55, 0.40))
-        with caplog.at_level(logging.INFO):
-            point = self._sim(_walked([rec], candles, model))
-        assert point.trades == []
-        assert ("Trades refused when their book was walked (crossed book) "
-                "(k=0.750, band 0-1, all): 1") in caplog.messages
-        # At the top of the book it passes the Kelly gate and trades
-        top_rec, _ = self._ts(quotes=(0.20, 0.55, 0.40))
-        (top,) = self._sim(_walked([top_rec], candles, None)).trades
-        assert not top.book_walked
+        # ask 0.40): the Kelly gate skips the Monday before any book is
+        # walked, as the live enrichment's crossed-book guard would refuse it
+        line = ("Time-series Mondays skipped because a market's YES ask sat below its "
+                "own YES bid (a crossed book) (k=0.750, band 0-1, all): 1")
+        for model in (_walk_model(), None):
+            rec, candles = self._ts(quotes=(0.20, 0.55, 0.40))
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                point = self._sim(_walked([rec], candles, model))
+            assert point.trades == []
+            assert line in caplog.messages
+            assert not [m for m in caplog.messages if m.startswith("Trades refused when")]
 
     def test_a_walked_trade_the_cash_left_cannot_buy_is_counted_apart(self, caplog):
         # On $2.80, a same-title pair on Monday 1 spends all but $0.59. On
@@ -19259,6 +19295,117 @@ class TestCandidatePairCarriesTheMidSpread:
             10_000.0, settings, None, {})
         assert why is None and walked.pair.depth_levels
         assert walked.pair.mid_spread == pytest.approx(expected, abs=1e-12)
+
+
+class TestKellyGateReadsTheMidSpread:
+    """_simulate_at_discount's Kelly gate forecasts a time-series Monday at
+    its mid spread (config.time_series_mid_spread over that Monday's four
+    quotes), as live sizing does (DR-78), and skips a Monday whose quote is
+    crossed on either market (a YES ask below its own YES bid), counting it
+    on its own line. Figures at k 0.75 and config.py's per-trade cap; every
+    pair but the one-float-step case buys YES on GA at 0.30 and NO on GB at
+    0.40."""
+
+    _START = date(2026, 1, 1)
+    _BALANCE = 10_000.0
+    _LINE = ("Time-series Mondays skipped because a market's YES ask sat below its "
+             "own YES bid (a crossed book) (k=0.750, band 0-1, all): ")
+
+    def _sim(self, records, **kw):
+        """One simulation of `records` at k 0.75 from $10,000."""
+        return backtester._simulate_at_discount(records, self._START, self._BALANCE, k=0.75,
+                                                 end_date=date(2026, 4, 1), **kw)
+
+    @staticmethod
+    def _record(*mondays) -> dict:
+        """A time-series pair quoted on each Monday as (date, pA, nA, pB, nB)."""
+        mA = _ladder_market("GA", "EVG-1", "2026-03-20")
+        mB = _ladder_market("GB", "EVG-2", "2026-03-20")
+        rows = [{"entry_date": day, "pA": pA, "nA": nA, "pB": pB, "nB": nB,
+                 "mA": mA, "mB": mB, "gap_days": 10} for day, pA, nA, pB, nB in mondays]
+        first, *rest = rows
+        return {"pair_type": "time_series", "canon": "g", "group_key": "g",
+                "entry": {**first, "later": tuple(rest)}}
+
+    def _lines(self, caplog) -> list[tuple[int, str]]:
+        """(level, message) of every captured crossed-Monday line."""
+        return [(r.levelno, r.getMessage()) for r in caplog.records
+                if r.getMessage().startswith(self._LINE)]
+
+    def test_a_monday_the_ask_gap_passes_and_the_mid_spread_fails(self):
+        # GA's book is 0.20 wide (YES ask 0.30, YES bid 0.10) and GB's has no
+        # width: the YES-ask gap 0.30 would pass (Kelly about +0.16), the mid
+        # spread 0.40 does not (about -0.12)
+        rec = self._record((_LADDER_M1, 0.30, 0.90, 0.60, 0.40))
+        assert time_series_mid_spread(0.30, 0.90, 0.60, 0.40) == pytest.approx(0.40)
+        assert _uncapped_kelly(rec, 0.75) == pytest.approx(-0.1173, abs=1e-4)
+        point = self._sim([rec])
+        assert point.trades == [] and point.peak_kelly_fraction == 0.0
+        # Control: GA's YES bid at its ask, so the mid spread is the ask gap
+        control = self._record((_LADDER_M1, 0.30, 0.70, 0.60, 0.40))
+        point = self._sim([control])
+        assert _traded(point) == [("GA", _LADDER_M1)]
+        assert point.peak_kelly_fraction == pytest.approx(_uncapped_kelly(control, 0.75))
+        assert point.peak_kelly_fraction == pytest.approx(0.1620, abs=1e-4)
+
+    def test_a_monday_the_ask_gap_fails_and_the_mid_spread_passes(self):
+        # The reverse: GB's book is 0.10 wide (YES ask 0.70, YES bid 0.60) and
+        # GA's has none: the YES-ask gap 0.40 would fail, the mid spread 0.35
+        # passes
+        rec = self._record((_LADDER_M1, 0.30, 0.70, 0.70, 0.40))
+        f = _uncapped_kelly(rec, 0.75)
+        assert f == pytest.approx(0.0224, abs=1e-4)
+        point = self._sim([rec])
+        assert _traded(point) == [("GA", _LADDER_M1)]
+        assert point.peak_kelly_fraction == pytest.approx(f)
+        # Control: GA 0.10 wide too (YES bid 0.20), so the mid spread is the ask gap
+        control = self._record((_LADDER_M1, 0.30, 0.80, 0.70, 0.40))
+        point = self._sim([control])
+        assert point.trades == [] and point.peak_kelly_fraction == 0.0
+
+    def test_a_crossed_monday_is_skipped_and_counted(self, caplog):
+        # Monday 1: GA crossed (YES ask 0.30 under its 0.40 YES bid), where its
+        # midpoint sits above its ask; Monday 2: GB crossed (YES ask 0.55
+        # under its 0.60 YES bid); Monday 3 uncrossed, with no width
+        rec = self._record((_LADDER_M1, 0.30, 0.60, 0.60, 0.40),
+                           (_LADDER_M2, 0.30, 0.70, 0.55, 0.40),
+                           (_LADDER_M3, 0.30, 0.70, 0.60, 0.40))
+        # Monday 1's quote would have taken Kelly past the 1 - k bound
+        p = time_series_profit_prob(time_series_mid_spread(0.30, 0.60, 0.60, 0.40), k=0.75)
+        fee = fee_per_pair_approx(0.30, 0.40)
+        assert p - (1.0 - p) * (0.70 + fee) / (0.30 - fee) > 1.0 - 0.75
+        with caplog.at_level(logging.DEBUG):
+            point = self._sim([rec])
+        assert _traded(point) == [("GA", _LADDER_M3)]
+        monday3 = {"pair_type": "time_series", "entry": rec["entry"]["later"][1]}
+        assert point.peak_kelly_fraction == pytest.approx(_uncapped_kelly(monday3, 0.75))
+        assert point.peak_kelly_fraction < 1.0 - 0.75
+        assert self._lines(caplog) == [(logging.INFO, self._LINE + "2")]
+        # A quiet run logs it at DEBUG
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            self._sim([rec], quiet=True)
+        assert self._lines(caplog) == [(logging.DEBUG, self._LINE + "2")]
+        # Silent at zero
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            self._sim([self._record((_LADDER_M3, 0.30, 0.70, 0.60, 0.40))])
+        assert self._lines(caplog) == []
+
+    def test_a_quote_one_float_step_short_of_one_is_not_crossed(self, caplog):
+        # Both books have no width (GA at 0.32, GB at 0.67), each ask built as
+        # 1 - the other side's bid, so on both markets the YES ask and NO ask
+        # come to one float step under 1.0. The gate tolerates PRICE_EPSILON,
+        # so the Monday is not skipped and the pair trades
+        pA, nA = 1.0 - 0.68, 1.0 - 0.32
+        pB, nB = 1.0 - 0.33, 1.0 - 0.67
+        assert pA + nA < 1.0 and pB + nB < 1.0
+        rec = self._record((_LADDER_M1, pA, nA, pB, nB))
+        with caplog.at_level(logging.DEBUG):
+            point = self._sim([rec])
+        assert _traded(point) == [("GA", _LADDER_M1)]
+        assert point.peak_kelly_fraction == pytest.approx(_uncapped_kelly(rec, 0.75))
+        assert self._lines(caplog) == []
 
 
 class TestLegQuotesCarryTheBook:
@@ -19556,8 +19703,10 @@ class TestCapSweepSharesFromCapFreeFrom:
 
     @pytest.mark.parametrize("quotes, k", [
         # Peak below the 20% eager cap, cap_free_from above it: the eager
-        # point must not stand in for the caps between them
-        ((0.05, 0.68, 0.35), 0.75),
+        # point must not stand in for the caps between them. Market B's book is
+        # 0.07 wide, so the mid spread is 0.695 (the YES-ask gap 0.73 less half
+        # the width) and the peak 0.189
+        ((0.04, 0.77, 0.30), 0.75),
         # Peak above 20%: the first simulated cap at or above the peak must
         # not stand in for the caps below cap_free_from
         ((0.20, 0.75, 0.40), 0.5),
@@ -19614,8 +19763,9 @@ class TestCapSweepSharesFromCapFreeFrom:
         return _walked([first, second], candles, _walk_model())
 
     @pytest.mark.parametrize("quotes, k, later_pA", [
-        # Peak below the 20% eager cap, cap_free_from above it
-        ((0.05, 0.68, 0.35), 0.75, 0.02),
+        # Peak below the 20% eager cap, cap_free_from above it (the mid
+        # spread 0.695 on Monday 1, 0.715 on Monday 2)
+        ((0.04, 0.77, 0.30), 0.75, 0.02),
         # Peak above 20%, cap_free_from above the peak
         ((0.20, 0.75, 0.40), 0.5, 0.10),
     ])
@@ -19779,13 +19929,16 @@ class TestBandReachesEveryResimulation:
 @pytest.mark.usefixtures("golden_band_sweep")
 class TestNoDepthModelChangesNothing:
     """With no depth model every trade fills at the top of the book. On the
-    golden band sweep this is exactly the run from before trades walked a
-    book: its eager points (stamps, trades and curves up to a fixed day) hash
-    to the value captured from the code before the walk."""
+    golden band sweep the eager points (stamps, trades and curves up to a
+    fixed day) hash to the value below, and every trade and curve is the run
+    from before trades walked a book; only the peak Kelly fraction of the
+    points whose peak was TA/TB's differs, since TA/TB's later quote is
+    crossed and the Kelly gate skips it."""
 
     # Captured by running the same _sweep_digest over run_backtest_sweep's
-    # golden band sweep on the commit before the walk
-    _DIGEST = "521e65a1a28e369cdc246995718855a92e69d13f81e70ce7c7b1ed1e5b5b946e"
+    # golden band sweep; with every point's peak Kelly fraction left out, it
+    # equals the same digest of the code before the walk
+    _DIGEST = "0ac44e6d6ef30481217001dcbaee2988749375d6fcbf3681419a8a4a132c7e91"
 
     @staticmethod
     def _sweep_digest(result) -> str:
