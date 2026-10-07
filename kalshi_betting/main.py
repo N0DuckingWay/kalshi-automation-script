@@ -459,7 +459,7 @@ def _dedup_pairs(primary: list, secondary: list) -> list:
     as before: were a collision to occur, the same-title pair would be kept
     because it is the near-arbitrage — identical questions must co-resolve, so
     its payoff is a floor — whereas the time-series pair is a directional bet
-    whose sizing rests on the discounted-gap estimate of the in-between
+    whose sizing rests on the discounted mid-spread estimate of the in-between
     probability (config.time_series_profit_prob). This matches the
     same_title > time_series tie-break already used by strategy.select_portfolio().
 

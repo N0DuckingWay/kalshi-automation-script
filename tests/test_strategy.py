@@ -46,25 +46,44 @@ from kalshi_betting.strategy import TradeSpec, _kelly_p, compute_trade, select_p
 _AMPLE_BALANCE_CENTS = 100_000_000
 
 
+# make_pair / make_booked_pair's default: read a time-series pair's mid spread
+# off its four quotes, as enrichment writes it from the tops of its books
+_FROM_QUOTES = object()
+
+
 def make_pair(
     pA: float = 0.70,
     pB: float = 0.30,
-    nA: float = 0.20,
+    nA: float | None = None,
     nB: float = 0.65,
     tradeable: bool = True,
     pair_type: str = "same_title",
     max_contracts: int = 0,
+    mid_spread: object = _FROM_QUOTES,
 ) -> MagicMock:
     """Factory for CandidatePair-like mocks; avoids importing the real dataclass.
 
     nB is set as a real float (never left to MagicMock auto-vivification):
     scanner.leg_prices reads it directly for time-series pairs.
+
+    nA defaults to 0.20 for same_title (its NO leg) and to 1 - pA for
+    time_series, so market A's quotes are a book with no width. A time-series
+    pair's mid_spread, the input its forecast reads, defaults to
+    config.time_series_mid_spread over the four quotes, as enrichment writes it
+    from the tops of the books; pass a value (None included) to set it
+    instead. A same-title pair's is None.
     """
+    if nA is None:
+        nA = 1.0 - pA if pair_type == "time_series" else 0.20
+    if mid_spread is _FROM_QUOTES:
+        mid_spread = (config.time_series_mid_spread(pA, nA, pB, nB)
+                      if pair_type == "time_series" else None)
     pair = MagicMock()
     pair.pA = pA
     pair.pB = pB
     pair.nA = nA
     pair.nB = nB
+    pair.mid_spread = mid_spread
     pair.tradeable = tradeable
     pair.pair_type = pair_type
     pair.max_contracts = max_contracts
@@ -82,8 +101,9 @@ def make_booked_pair(
     pB: float = 0.62,
     pA: float | None = None,
     nB: float | None = None,
-    nA: float = 0.70,
+    nA: float | None = None,
     max_contracts: int | None = None,
+    mid_spread: object = _FROM_QUOTES,
 ) -> CandidatePair:
     """Build a REAL CandidatePair carrying order-book depth.
 
@@ -95,7 +115,10 @@ def make_booked_pair(
     levels are (price_a, price_b, qty) in MARKET order, ascending by combined
     price — the shape enrichment writes. The scalar leg prices default to the
     BEST level, and max_contracts to the full depth, which is what enrichment
-    would have written for a balance large enough not to bind.
+    would have written for a balance large enough not to bind. For a
+    time-series pair nA defaults to 1 - pA (market A's book with no width) and
+    mid_spread to config.time_series_mid_spread over the four scalar quotes,
+    the tops of the books, as enrichment writes it; pass either to set it.
     """
     depth = tuple(levels)
     best_a, best_b, _ = depth[0]
@@ -107,10 +130,14 @@ def make_booked_pair(
                          exchange_index=0)
     if pair_type == "time_series":
         pA_v, nB_v = (best_a if pA is None else pA), (best_b if nB is None else nB)
-        nA_v, pB_v = nA, pB
+        nA_v, pB_v = (1.0 - pA_v if nA is None else nA), pB
+        if mid_spread is _FROM_QUOTES:
+            mid_spread = config.time_series_mid_spread(pA_v, nA_v, pB_v, nB_v)
     else:
         nA_v, pB_v = best_a, best_b
         pA_v, nB_v = (0.70 if pA is None else pA), (0.70 if nB is None else nB)
+        if mid_spread is _FROM_QUOTES:
+            mid_spread = None
     return CandidatePair(
         market_a=mA, market_b=mB,
         pA=pA_v, pB=pB_v, nA=nA_v,
@@ -120,6 +147,7 @@ def make_booked_pair(
         nB=nB_v,
         max_contracts=total if max_contracts is None else max_contracts,
         depth_levels=depth,
+        mid_spread=mid_spread,
     )
 
 
@@ -155,34 +183,39 @@ def make_spec(
 _TS_PA, _TS_PB, _TS_NA, _TS_NB = 0.30, 0.60, 0.70, 0.40
 
 
-def _ts_kelly_fraction(pA: float, pB: float, nB: float) -> float:
+def _ts_kelly_fraction(pA: float, pB: float, nB: float, nA: float | None = None) -> float:
     """Uncapped Kelly f* = p - (1-p)/b for a time-series pair, from the config
     helpers alone — the oracle every sizer (strategy, dashboard, backtester)
     must agree with.
 
     b divides by the dollars AT RISK, which include the fee: a losing pair loses
     total_cost_with_fees, not just the contracts' cost (DR-62). This is NOT the
-    reported TradeSpec.profit_ratio, whose denominator is fee-less.
+    reported TradeSpec.profit_ratio, whose denominator is fee-less. p reads the
+    mid spread of the four quotes (DR-78), nA defaulting to 1 - pA as
+    make_pair's does.
     """
+    nA = 1.0 - pA if nA is None else nA
     fee = fee_per_pair_approx(pA, nB)
     net_spread = (1.0 - pA - nB) - fee
     b = net_spread / (pA + nB + fee)
-    p = time_series_profit_prob(pA, pB)
+    p = time_series_profit_prob(config.time_series_mid_spread(pA, nA, pB, nB))
     return p - (1.0 - p) / b
 
 
 @pytest.mark.usefixtures("pre_toggle_defaults")
 class TestKellyP:
-    """Probability-of-profit models: the discounted market gap for time-series
+    """Probability-of-profit models: the discounted mid spread for time-series
     (config.time_series_profit_prob) and the fixed co-resolution prior for
     same-title, at k 0.75 (pre_toggle_defaults)."""
 
     def test_time_series_discounted_gap_model(self):
+        # Both books have no width (nA defaults to 1 - pA), so the mid spread
+        # is the YES-ask gap 0.30
         pair = make_pair(pA=0.30, pB=0.60, nB=0.40, pair_type="time_series")
-        # p = 1 - k * (pB - pA) = 1 - 0.75 * 0.30 = 0.775
+        # p = 1 - k * spread = 1 - 0.75 * 0.30 = 0.775
         assert _kelly_p(pair, live_settings()) == pytest.approx(0.775)
         assert _kelly_p(pair, live_settings()) == pytest.approx(
-            time_series_profit_prob(0.30, 0.60))
+            time_series_profit_prob(config.time_series_mid_spread(0.30, 0.70, 0.60, 0.40)))
 
     def test_time_series_model_is_not_the_old_expression(self):
         # The pre-2026-09 formula 1 - pA*(1-pB) modelled the impossible
@@ -226,11 +259,18 @@ class TestComputeTrade:
 
     def test_time_series_boundary_checks_use_leg_prices(self):
         # For time_series the leg prices are pA/nB — a boundary nA or pB (not
-        # leg prices) must NOT reject, while a boundary pA or nB must
-        ok = make_pair(pA=0.30, pB=0.60, nA=0.0, nB=0.40, pair_type="time_series")
+        # leg prices) must NOT reject, while a boundary pA or nB must. nA and
+        # pB reach the sizer only through the mid spread enrichment writes
+        # from the books' tops, held here at the 0.30 of a book with no width,
+        # so every case reaches the leg-price checks rather than stopping for
+        # want of a forecast
+        ok = make_pair(pA=0.30, pB=0.60, nA=0.0, nB=0.40, pair_type="time_series",
+                       mid_spread=0.30)
         assert compute_trade(ok, 1_000_000) is not None
-        assert compute_trade(make_pair(pA=0.0, pB=0.60, nB=0.40, pair_type="time_series"), 1_000_000) is None
-        assert compute_trade(make_pair(pA=0.30, pB=0.60, nB=1.0, pair_type="time_series"), 1_000_000) is None
+        assert compute_trade(make_pair(pA=0.0, pB=0.60, nB=0.40, pair_type="time_series",
+                                       mid_spread=0.30), 1_000_000) is None
+        assert compute_trade(make_pair(pA=0.30, pB=0.60, nB=1.0, pair_type="time_series",
+                                       mid_spread=0.30), 1_000_000) is None
 
     def test_returns_trade_spec_for_valid_same_title_pair(self):
         # same_title pair: p=0.95 fixed prior; nA=0.20+pB=0.30=0.50 < 1, wide spread gives positive Kelly
@@ -351,7 +391,8 @@ class TestComputeTradeTimeSeries:
     def test_kelly_p_and_fraction_from_config_helpers(self):
         result = compute_trade(self._pair(), 1_000_000)
         assert result is not None
-        assert result.kelly_p == pytest.approx(time_series_profit_prob(_TS_PA, _TS_PB))
+        assert result.kelly_p == pytest.approx(time_series_profit_prob(
+            config.time_series_mid_spread(_TS_PA, _TS_NA, _TS_PB, _TS_NB)))
         assert result.kelly_p == pytest.approx(0.775)
         expected_f = _ts_kelly_fraction(_TS_PA, _TS_PB, _TS_NB)
         # ~0.1620 — below the 20% cap, so Kelly (not the cap) sizes this pair.
@@ -407,14 +448,23 @@ class TestComputeTradeTimeSeries:
         assert result.total_cost == pytest.approx(70.0)
 
     def test_nA_and_pB_are_not_priced(self):
-        # Changing the reporting-only nA leaves every dollar figure untouched;
-        # pB only moves the probability (and hence the fraction / n)
+        # The sizer reads the pair's mid spread (enrichment writes it from the
+        # tops of the books), never its nA or pB: with the mid spread held,
+        # other nA and pB quotes leave every figure untouched...
         base = compute_trade(self._pair(), 1_000_000)
-        other_nA = compute_trade(self._pair(nA=0.99), 1_000_000)
-        assert base is not None and other_nA is not None
-        assert (base.x, base.total_cost, base.min_payoff) == (
-            other_nA.x, other_nA.total_cost, other_nA.min_payoff
-        )
+        other = compute_trade(
+            self._pair(nA=0.99, pB=0.85, mid_spread=_TS_PB - _TS_PA), 1_000_000)
+        assert base is not None and other is not None
+        assert (base.x, base.kelly_p, base.kelly_fraction, base.total_cost,
+                base.min_payoff) == (other.x, other.kelly_p, other.kelly_fraction,
+                                     other.total_cost, other.min_payoff)
+        # ...while the mid spread alone moves p, and with it the fraction and n
+        narrower = compute_trade(self._pair(mid_spread=0.20), 1_000_000)
+        assert narrower is not None
+        assert narrower.kelly_p == pytest.approx(time_series_profit_prob(0.20))
+        assert narrower.kelly_fraction > base.kelly_fraction
+        assert narrower.x > base.x
+        assert narrower.total_cost / narrower.x == pytest.approx(_TS_PA + _TS_NB)
 
 
 def _live(k: float = 0.75, cap: float = 0.20, st_cap: float = 1.0) -> LiveSettings:
@@ -467,7 +517,8 @@ class TestComputeTradeSettings:
         at_06 = compute_trade(pair, 1_000_000, settings=_live(k=0.6))
         assert base.kelly_p == pytest.approx(0.775)
         assert at_06.kelly_p == pytest.approx(1.0 - 0.6 * (_TS_PB - _TS_PA))
-        assert at_06.kelly_p == pytest.approx(time_series_profit_prob(_TS_PA, _TS_PB, k=0.6))
+        assert at_06.kelly_p == pytest.approx(time_series_profit_prob(
+            config.time_series_mid_spread(_TS_PA, _TS_NA, _TS_PB, _TS_NB), k=0.6))
         assert at_06.kelly_fraction > base.kelly_fraction
         # The booked path prices at the run's k too (one flat level: one price at every n)
         booked = make_booked_pair([(_TS_PA, _TS_NB, 1_000_000.0)], pB=_TS_PB)
@@ -515,9 +566,11 @@ class TestComputeTradeSettings:
         assert compute_trade(make_pair(**self._TS), 1_000_000).kelly_p == pytest.approx(0.82)
 
     def test_time_series_fraction_stays_under_one_minus_k(self):
-        # With no per-trade cap, 1 - k bounds a time-series f* whenever the
-        # reference YES ask is at or above the later book's YES bid (see
-        # config.max_kelly_fraction, which relies on it)
+        # With no per-trade cap, 1 - k bounds a time-series f* whenever
+        # neither book is crossed: the reference YES ask at or above the
+        # later book's YES bid, and the earlier book's YES ask at or above
+        # its own YES bid (here nA is 1 - its YES ask). See
+        # config.max_kelly_fraction, which relies on it
         rng = random.Random(20260927)
         balance = 1_000_000
         for k in (0.4, 0.6, 0.75, 0.8, 0.9):
@@ -548,6 +601,277 @@ class TestComputeTradeSettings:
                     assert spec.kelly_fraction <= bound, (k, levels, pB)
             # Non-vacuous at every k, the 0.9 extreme included
             assert sized > 0, k
+
+
+def _silent(*_args, **_kwargs) -> None:
+    """
+    A log callable for scanner._enrich_pair that drops its lines.
+
+    Args:
+        *_args: The level, message and its arguments, ignored.
+        **_kwargs: Ignored.
+    """
+
+
+def _random_ts_case(rng: random.Random, *, crossed: str | None = None) -> tuple:
+    """
+    One random time-series pair, its two books, and a run's settings.
+
+    The books are two-sided, as scanner._enrich_pair reads them: EARLY's NO
+    bids are the YES leg's asks and its YES bids its NO asks; LATE's YES bids
+    are the NO leg's asks and its NO bids its YES ask (the reference). Each
+    side has one to four levels on a cent grid (a tenth of a cent now and
+    then). Each book's top is uncrossed (its YES ask at or above its own YES
+    bid), with no width a third of the time; crossed names the one book
+    ("EARLY" or "LATE") whose YES ask is put below its own YES bid instead,
+    by at least a tick.
+
+    Args:
+        rng (random.Random): The draws' source.
+        crossed (str | None): Keyword-only. "EARLY", "LATE" or None.
+
+    Returns:
+        tuple: (pair, ob_a, ob_b, settings, portfolio value in cents, cash in
+            cents or None).
+    """
+    tick = 0.01 if rng.random() < 0.85 else 0.001
+
+    def draw(lo: float, hi: float) -> float:
+        # A multiple of the tick in [lo, hi]
+        return round(rng.randint(round(lo / tick), max(round(lo / tick), round(hi / tick)))
+                     * tick, 4)
+
+    yes_ask_a = draw(0.01, 0.80)
+    no_ask_b = draw(0.01, max(0.01, 0.97 - yes_ask_a))
+    yes_bid_b = round(1.0 - no_ask_b, 4)
+    if crossed == "LATE":
+        ref = draw(max(0.01, yes_bid_b - 0.15), yes_bid_b - tick)
+    else:
+        ref = yes_bid_b if rng.random() < 1 / 3 else draw(yes_bid_b, min(0.99, yes_bid_b + 0.15))
+    if crossed == "EARLY":
+        yes_bid_a = draw(yes_ask_a + tick, min(0.99, yes_ask_a + 0.15))
+    else:
+        yes_bid_a = yes_ask_a if rng.random() < 1 / 3 else draw(0.01, yes_ask_a)
+
+    def ladder(top: float, step_sign: int) -> list:
+        # Bids from `top` away from it, one to four levels, each with its own size
+        bids, price = [], top
+        for _ in range(rng.randint(1, 4)):
+            if not 0.0001 <= price <= 0.9999:
+                break
+            bids.append([str(round(price, 4)), str(rng.randint(1, 5000))])
+            price = round(price + step_sign * tick * rng.randint(1, 3), 4)
+        return bids
+
+    # Lower bids are worse: a YES ask from a NO bid rises as the bid falls
+    ob_a = {"no": ladder(round(1.0 - yes_ask_a, 4), -1), "yes": ladder(yes_bid_a, -1)}
+    ob_b = {"yes": ladder(yes_bid_b, -1), "no": ladder(round(1.0 - ref, 4), -1)}
+    early = datetime(2026, 3, 1, tzinfo=UTC)
+    pair = CandidatePair(
+        market_a=SimpleNamespace(ticker="EARLY", close_time=early),
+        market_b=SimpleNamespace(ticker="LATE", close_time=early + timedelta(days=10)),
+        pA=yes_ask_a, pB=ref, nA=round(1.0 - yes_bid_a, 4), nB=no_ask_b, tradeable=True,
+        canonical_title="random pair", pair_type="time_series")
+    settings = LiveSettings(
+        tier_floors=rng.random() < 0.3, spread_band=rng.choice(((0.0, 1.0), (0.0, 0.5))),
+        interval_discount=rng.choice((0.3, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 0.95)),
+        size_cap=rng.choice((0.05, 0.1, 0.2, 0.5, 1.0)), same_title_size_cap=1.0)
+    value = rng.choice((20_000, 1_000_000, 100_000_000))
+    cash = rng.choice((None, value, value // 3, 500))
+    return pair, ob_a, ob_b, settings, value, cash
+
+
+def _top_kelly_fraction(pair: CandidatePair, k: float) -> float:
+    """
+    The uncapped Kelly fraction at the top of a priced pair's books.
+
+    Its legs cost least there, so no size reaches a larger one: the chance
+    of profit is the same at every size (strategy._kelly_p_at), and Kelly's
+    b only falls as the fills rise.
+
+    Args:
+        pair (CandidatePair): A time-series pair enrichment priced, with a
+            usable mid spread.
+        k (float): The time-series discount.
+
+    Returns:
+        float: p - (1 - p) / b at the best level's two prices.
+    """
+    top_a, top_b, _qty = pair.depth_levels[0]
+    fee = fee_per_pair_approx(top_a, top_b)
+    b = (1.0 - top_a - top_b - fee) / (top_a + top_b + fee)
+    p = strategy._kelly_p_at(pair, k)
+    return p - (1.0 - p) / b
+
+
+class TestForecastReadsTheMidSpread:
+    """The time-series forecast reads the mid spread (DR-78): the later
+    market's midpoint minus the earlier one's, a midpoint being halfway
+    between a market's YES ask and its YES bid. It is the same at every
+    order size, the sizer refuses a pair without one, and with neither book
+    crossed no Kelly share reaches 1 - k. Figures at k 0.75 (_live)."""
+
+    def test_p_is_the_same_at_every_size_on_a_multi_level_book(self):
+        # Three levels a leg, so the fills (and the YES-ask gap at the YES
+        # fill) move with the size; the forecast does not
+        levels = [(0.30, 0.40, 100.0), (0.32, 0.41, 100.0), (0.35, 0.42, 100.0)]
+        pair = make_booked_pair(levels, pB=0.62)
+        assert pair.mid_spread == pytest.approx(0.31)
+        expected = time_series_profit_prob(pair.mid_spread, k=0.75)
+        fills, ps = set(), set()
+        for n in range(1, 301):
+            sized = strategy._evaluate_size(pair, pair.depth_levels, n,
+                                            _AMPLE_BALANCE_CENTS, _live())
+            if sized is not None:
+                fills.add(round(sized.price_a, 9))
+                ps.add(sized.p)
+        # Non-vacuous: sizes on two levels were priced, at many fills
+        assert len(fills) > 50
+        assert ps == {expected}
+        spec = compute_trade(pair, _AMPLE_BALANCE_CENTS, settings=_live())
+        assert spec is not None and spec.kelly_p == expected
+
+    def test_the_ask_gap_says_buy_and_the_mid_spread_says_no(self):
+        # EARLY's book is 0.20 wide (YES ask 0.30, YES bid 0.10) and LATE's
+        # has no width (YES ask 0.60, NO ask 0.40): the YES-ask gap 0.30
+        # would buy, the mid spread 0.40 does not
+        pair = make_pair(pA=0.30, nA=0.90, pB=0.60, nB=0.40, pair_type="time_series")
+        assert pair.mid_spread == pytest.approx(0.40)
+        assert compute_trade(pair, 1_000_000, settings=_live()) is None
+        # Control: the same pair forecast at the ask gap buys
+        at_gap = make_pair(pA=0.30, nA=0.90, pB=0.60, nB=0.40, pair_type="time_series",
+                           mid_spread=0.30)
+        spec = compute_trade(at_gap, 1_000_000, settings=_live())
+        assert spec is not None and spec.kelly_p == pytest.approx(0.775)
+
+    def test_the_ask_gap_says_no_and_the_mid_spread_says_buy(self):
+        # The reverse: LATE's book is 0.10 wide (YES ask 0.70, YES bid 0.60)
+        # and EARLY's has none: the YES-ask gap 0.40 would not buy, the mid
+        # spread 0.35 does
+        pair = make_pair(pA=0.30, nA=0.70, pB=0.70, nB=0.40, pair_type="time_series")
+        assert pair.mid_spread == pytest.approx(0.35)
+        spec = compute_trade(pair, 1_000_000, settings=_live())
+        assert spec is not None
+        p = time_series_profit_prob(0.35, k=0.75)
+        fee = fee_per_pair_approx(0.30, 0.40)
+        assert spec.kelly_p == pytest.approx(p)
+        assert spec.kelly_fraction == pytest.approx(p - (1.0 - p) * (0.70 + fee) / (0.30 - fee))
+        assert 0.0 < spec.kelly_fraction < 0.05
+        # Control: the same pair forecast at the ask gap does not buy
+        at_gap = make_pair(pA=0.30, nA=0.70, pB=0.70, nB=0.40, pair_type="time_series",
+                           mid_spread=0.40)
+        assert compute_trade(at_gap, 1_000_000, settings=_live()) is None
+
+    @pytest.mark.parametrize("mid", [None, 0.0, config.PRICE_EPSILON, -0.05, float("nan")])
+    def test_no_usable_mid_spread_is_refused_and_said(self, caplog, mid):
+        line = "No forecast for 'test pair': no usable mid spread — skipping"
+        pair = make_pair(pA=_TS_PA, pB=_TS_PB, nA=_TS_NA, nB=_TS_NB, pair_type="time_series",
+                         mid_spread=mid)
+        assert strategy._kelly_p_at(pair, 0.75) is None
+        for quiet, level in ((False, logging.INFO), (True, logging.DEBUG)):
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG):
+                assert compute_trade(pair, 1_000_000, settings=_live(), quiet=quiet) is None
+            assert [(r.levelno, r.getMessage()) for r in caplog.records] == [(level, line)]
+        # The booked path refuses it too
+        booked = make_booked_pair([(_TS_PA, _TS_NB, 1000.0)], pB=_TS_PB, mid_spread=mid)
+        assert compute_trade(booked, 1_000_000, settings=_live()) is None
+
+    @pytest.mark.parametrize("quiet", [False, True])
+    def test_an_add_on_without_one_says_so_on_its_add_on_line_alone(self, caplog, quiet):
+        # One line per refused pair: an add-on names the missing forecast on
+        # its add-on line, and logs no second line
+        pair = dataclasses.replace(
+            make_booked_pair([(_TS_PA, _TS_NB, 100.0)], pB=_TS_PB, mid_spread=None),
+            held=_held_pair(value=8.0))
+        with caplog.at_level(logging.DEBUG):
+            assert compute_trade(pair, 1_000_000, settings=_live(), quiet=quiet) is None
+        assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+            (logging.DEBUG if quiet else logging.INFO,
+             "Not adding to held pair 'booked pair': no forecast (no usable mid spread)")]
+
+    def test_a_spec_without_a_mid_spread_is_never_shrunk(self):
+        # _spec_at_count re-checks the expected profit at the forecast, which
+        # a pair without a mid spread does not have
+        booked = make_booked_pair([(_TS_PA, _TS_NB, 1000.0)], pB=_TS_PB)
+        spec = compute_trade(booked, 1_000_000, settings=_live())
+        assert spec is not None and spec.x > 10
+        assert strategy._spec_at_count(spec, 10) is not None
+        bare = dataclasses.replace(spec, pair=dataclasses.replace(spec.pair, mid_spread=None))
+        assert strategy._spec_at_count(bare, 10) is None
+
+    def test_the_trade_line_names_the_mid_spread(self, caplog):
+        with caplog.at_level(logging.INFO):
+            spec = compute_trade(
+                make_pair(pA=0.30, nA=0.70, pB=0.70, nB=0.40, pair_type="time_series"),
+                1_000_000, settings=_live())
+        assert spec is not None
+        [line] = [r.getMessage() for r in caplog.records
+                  if r.getMessage().startswith("Trade computed")]
+        assert f"| p={spec.kelly_p:.2f} (mid spread 0.350) kelly=" in line
+        # A same-title line has none
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert compute_trade(make_pair(nA=0.20, pB=0.30, pair_type="same_title"),
+                                 1_000_000, settings=_live()) is not None
+        [line] = [r.getMessage() for r in caplog.records
+                  if r.getMessage().startswith("Trade computed")]
+        assert "| p=0.95 kelly=" in line and "mid spread" not in line
+
+    def test_no_kelly_share_reaches_one_minus_k_on_uncrossed_books(self):
+        # 10,000 random two-sided books, neither crossed, through enrichment
+        # and the sizer. The bound (config.max_kelly_fraction) holds because
+        # the later midpoint is at or above its YES bid, which is at least
+        # 1 - the NO fill, and the earlier one at or below its YES ask, which
+        # is at most the YES fill, so the mid spread exceeds what a winning
+        # pair nets after fees (1 - pA - nB - fee at the fills)
+        rng = random.Random(20261006)
+        tradeable = sized = only_the_bound = near = 0
+        for _ in range(10_000):
+            pair, ob_a, ob_b, s, value, cash = _random_ts_case(rng)
+            priced, refused = scanner._enrich_pair(pair, ob_a, ob_b, value, settings=s,
+                                                   cash_cents=cash, log=_silent)
+            if refused is not None:
+                continue
+            tradeable += 1
+            k = s.interval_discount
+            # Every pair enrichment keeps has a forecast below 1
+            assert scanner.pair_mid_spread(priced) is not None
+            f_top = _top_kelly_fraction(priced, k)
+            assert f_top < 1.0 - k, (k, ob_a, ob_b, f_top)
+            near += f_top > 0.97 * (1.0 - k)
+            spec = compute_trade(priced, value, settings=s, cash_cents=cash, quiet=True)
+            if spec is None:
+                continue
+            sized += 1
+            only_the_bound += s.size_cap > 1.0 - k
+            assert spec.kelly_fraction < 1.0 - k, (k, ob_a, ob_b, spec.kelly_fraction)
+            assert spec.kelly_fraction <= s.size_cap + 1e-12
+            assert spec.kelly_fraction <= config.max_kelly_fraction("time_series", s) + 1e-12
+        # Non-vacuous: thousands priced and sized, many where only 1 - k
+        # bounds the share, and some within 3% of it
+        assert tradeable > 3000 and sized > 2000 and only_the_bound > 500 and near > 50, (
+            tradeable, sized, only_the_bound, near)
+
+    @pytest.mark.parametrize("crossed", ["EARLY", "LATE"])
+    def test_a_crossed_book_is_never_tradeable(self, crossed):
+        # Either book crossed by a tick or more: enrichment refuses the pair.
+        # Many of those it refuses as crossed would otherwise reach 1 - k
+        rng = random.Random(20261007)
+        as_crossed = would_breach = 0
+        for _ in range(2_000):
+            pair, ob_a, ob_b, s, value, cash = _random_ts_case(rng, crossed=crossed)
+            priced, refused = scanner._enrich_pair(pair, ob_a, ob_b, value, settings=s,
+                                                   cash_cents=cash, log=_silent)
+            assert refused is not None and priced.tradeable is False, (ob_a, ob_b)
+            if refused != scanner.ENRICH_CROSSED:
+                continue
+            as_crossed += 1
+            if (scanner.pair_mid_spread(priced) is not None
+                    and _top_kelly_fraction(priced, s.interval_discount)
+                    >= 1.0 - s.interval_discount):
+                would_breach += 1
+        assert as_crossed > 1000 and would_breach > 300, (as_crossed, would_breach)
 
 
 def _held_pair(value: float, count: float = 30.0, fees: float = 0.90) -> HeldPair:
@@ -1209,6 +1533,25 @@ def _calls_to(func: ast.AST, callee: str) -> list:
     return sorted(calls, key=lambda c: (c.lineno, c.col_offset))
 
 
+def _own_nodes(func: ast.AST):
+    """
+    Every node of a function's own body, not those of a def, class or lambda inside it.
+
+    Args:
+        func (ast.AST): A function's node.
+
+    Yields:
+        ast.AST: Each node the function itself runs, in no set order.
+    """
+    stack = list(ast.iter_child_nodes(func))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        yield node
+        stack.extend(ast.iter_child_nodes(node))
+
+
 def _bound_from(func: ast.AST, call: ast.Call) -> list[str]:
     """
     The names an assignment inside func binds directly from this call.
@@ -1615,7 +1958,8 @@ def _kelly_fraction_at(pair, price_a: float, price_b: float) -> float:
 
     Mirrors compute_trade's formula so a test can state, in its own terms, what
     the old whole-book average would have concluded about a book. b carries the
-    fee in its denominator, as compute_trade's kelly_b does (DR-62).
+    fee in its denominator, as compute_trade's kelly_b does (DR-62); p is the
+    pair's forecast, read from its mid spread and the same at every price.
     """
     fee = fee_per_pair_approx(price_a, price_b)
     net_spread = (1.0 - price_a - price_b) - fee
@@ -1623,7 +1967,7 @@ def _kelly_fraction_at(pair, price_a: float, price_b: float) -> float:
         return -1.0
     b = net_spread / (price_a + price_b + fee)
     # config.py's k, as compute_trade(settings=None) resolves it
-    p = strategy._kelly_p_at(pair, price_a, k=config.TIME_SERIES_INTERVAL_PROB_DISCOUNT)
+    p = strategy._kelly_p_at(pair, k=config.TIME_SERIES_INTERVAL_PROB_DISCOUNT)
     return p - (1.0 - p) / b
 
 
@@ -1851,7 +2195,8 @@ class TestTimeSeriesKellyParity:
 
     def test_kelly_p_equals_config_helper(self):
         pair = make_pair(pA=_TS_PA, pB=_TS_PB, nB=_TS_NB, pair_type="time_series")
-        assert _kelly_p(pair, live_settings()) == time_series_profit_prob(_TS_PA, _TS_PB)
+        assert _kelly_p(pair, live_settings()) == time_series_profit_prob(
+            config.time_series_mid_spread(_TS_PA, 1.0 - _TS_PA, _TS_PB, _TS_NB))
 
     def test_dashboard_fraction_equals_compute_trade_fraction(self):
         dash = dashboard._kelly_fraction(_TS_PA, _TS_NA, _TS_PB, _TS_NB, "time_series")
@@ -1878,8 +2223,9 @@ class TestTimeSeriesKellyParity:
         assert dashboard._kelly_fraction(0.70, 0.20, 0.30, 0.99, "same_title") == pytest.approx(expected)
 
     def test_discount_of_one_never_trades(self, monkeypatch):
-        # k = 1 (market-implied): p = 1 - (pB - pA) → f* < 0 for every pair;
-        # compute_trade returns None and the dashboard clamps to 0.0
+        # k = 1 (market-implied): p = 1 - the mid spread → f* < 0 for every
+        # pair whose books are not crossed; compute_trade returns None and the
+        # dashboard clamps to 0.0
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 1.0)
         assert _ts_kelly_fraction(_TS_PA, _TS_PB, _TS_NB) < 0
         pair = make_pair(pA=_TS_PA, pB=_TS_PB, nA=_TS_NA, nB=_TS_NB, pair_type="time_series")
@@ -1890,17 +2236,96 @@ class TestTimeSeriesKellyParity:
 
     def test_ast_strategy_kelly_p_calls_helper(self):
         # A two-link chain, same shape (and same intent) as the backtester pin
-        # below: the priced call moved into _kelly_p_at when compute_trade
-        # started re-deriving p at each candidate size, since pA is a LEG price
-        # and therefore moves with the quantity being bought.
+        # below: _kelly_p prices through _kelly_p_at, which every sizing step
+        # calls with the run's k.
         assert _function_calls(strategy, "_kelly_p_at", "time_series_profit_prob")
         assert _function_calls(strategy, "_kelly_p", "_kelly_p_at")
 
+    def test_ast_the_forecast_reads_the_midpoint_spread(self):
+        # DR-78: every forecast reads the mid spread. The live sizer reads the
+        # one enrichment wrote on the pair (scanner.pair_mid_spread); enrichment,
+        # the backtest's candidates and Kelly gate, the k-hat calibration, and
+        # the dashboard's scatter and spread calibration work it out with
+        # config.time_series_mid_spread, the one definition
+        assert _function_calls(strategy, "_kelly_p_at", "pair_mid_spread")
+        assert _function_calls(strategy, "compute_trade", "pair_mid_spread")
+        for module, func in ((scanner, "_enrich_pair"), (backtester, "_candidate_pair"),
+                             (backtester, "_simulate_at_discount"),
+                             (backtester, "_interval_calibration"),
+                             (dashboard, "_kelly_fraction"), (dashboard, "_entry_mid_spread")):
+            assert _function_calls(module, func, "time_series_mid_spread"), (module, func)
+        # The scatter forecasts at the entry quotes' mid spread, never at the fills
+        [spread] = _keyword_values(dashboard, "_kelly_points", "_kelly_fraction", "spread")
+        assert isinstance(spread, ast.Call) and getattr(spread.func, "id", None) == \
+            "_entry_mid_spread"
+        # k-hat and the spread calibration measure against the same mid spread
+        # the forecast reads: k-hat at each pair's first qualifying Monday's
+        # quotes, the spread calibration at each trade's entry quotes
+        assert _function_calls(dashboard, "_spread_observations", "_entry_mid_spread")
+        # Every call of the model, anywhere in the package, takes as its spread a
+        # bare name its own function binds from the mid spread: never a
+        # subtraction of two prices, never a price
+        import importlib
+        import pkgutil
+
+        import kalshi_betting
+
+        found = []
+        # The quotes each mid spread is worked out from, as written, per function
+        quotes = {}
+        for name in sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__)):
+            tree = ast.parse(inspect.getsource(importlib.import_module(f"kalshi_betting.{name}")))
+            every_call = _calls_to(tree, "time_series_profit_prob")
+            every_mid = _calls_to(tree, "time_series_mid_spread")
+            mids_in_defs = 0
+            for func in ast.walk(tree):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                own = list(_own_nodes(func))
+                for call in [n for n in own if any(n is c for c in every_call)]:
+                    found.append((name, func.name))
+                    assert call.args and isinstance(call.args[0], ast.Name), (
+                        name, func.name, ast.unparse(call))
+                    spread_name = call.args[0].id
+                    bound_from = [n.value for n in own if isinstance(n, ast.Assign)
+                                  and any(isinstance(t, ast.Name) and t.id == spread_name
+                                          for t in n.targets)]
+                    assert bound_from and all(
+                        _calls_to(value, "pair_mid_spread")
+                        or _calls_to(value, "time_series_mid_spread")
+                        for value in bound_from), (name, func.name, spread_name)
+                for call in [n for n in own if any(n is c for c in every_mid)]:
+                    mids_in_defs += 1
+                    quotes.setdefault((name, func.name), []).append(
+                        [ast.unparse(a) for a in call.args]
+                        + [f"{kw.arg}={ast.unparse(kw.value)}" for kw in call.keywords])
+            # None sits outside a def (at module level, or in a lambda)
+            assert len([f for f in found if f[0] == name]) == len(every_call), name
+            assert mids_in_defs == len(every_mid), name
+        assert sorted(found) == [("backtester", "_simulate_at_discount"),
+                                 ("dashboard", "_kelly_fraction"),
+                                 ("strategy", "_kelly_p_at")]
+        # Every mid spread is worked out from the earlier market's YES ask and
+        # NO ask, then the later market's, in the helper's order. The spread
+        # is (pB + nA - pA - nB) / 2, so swapping pB with nA (or pA with nB)
+        # keeps its value and no value test can see it; this pins the order
+        assert quotes == {
+            ("scanner", "_enrich_pair"): [["yes_ask_a", "no_ask_a", "ref_yes",
+                                           "no_levels[0][0]"]],
+            ("backtester", "_candidate_pair"): [["c['pA']", "c['nA']", "c['pB']", "c['nB']"]],
+            ("backtester", "_simulate_at_discount"): [["pA", "nA", "pB", "nB"]],
+            ("backtester", "_interval_calibration"): [["entry['pA']", "entry['nA']",
+                                                        "entry['pB']", "entry['nB']"]],
+            ("dashboard", "_kelly_fraction"): [["pA", "nA", "pB", "nB"]],
+            ("dashboard", "_entry_mid_spread"): [["t.entry_pA", "t.entry_nA", "t.entry_pB",
+                                                  "t.entry_nB"]],
+        }
+
     def test_ast_compute_trade_prices_through_kelly_helper(self):
         # compute_trade must reach the model through the same helper, never
-        # reimplement 1 - k * (pB - pA) against its own per-size prices. The
-        # chain runs through _evaluate_size, which is where every gate now
-        # lives, and _solve_marginal_size, which searches over it.
+        # reimplement 1 - k * the mid spread on its own. The chain runs
+        # through _evaluate_size, which is where every gate lives, and
+        # _solve_marginal_size, which searches over it.
         assert _function_calls(strategy, "_evaluate_size", "_kelly_p_at")
         assert _function_calls(strategy, "_solve_marginal_size", "_evaluate_size")
         assert _function_calls(strategy, "compute_trade", "_evaluate_size")
@@ -2362,8 +2787,8 @@ class TestTimeSeriesKellyParity:
         # Helpers that read config.py's k / fraction when handed None (or, where
         # it is defaulted, nothing): name -> (positional index, keyword name)
         explicit_args = {
-            "time_series_profit_prob": (2, "k"),
-            "_kelly_p_at": (2, "k"),
+            "time_series_profit_prob": (1, "k"),
+            "_kelly_p_at": (1, "k"),
             "max_affordable_pairs": (2, "fraction"),
         }
 
@@ -3544,20 +3969,23 @@ class TestTimeSeriesKellyParity:
 
 # ── DR-62: Kelly's denominator is the dollars AT RISK, fee included ───────────
 
-# The reproduction fixture: a time-series pair every scanner gate admits —
-# pB - pA = 0.82 clears even the 30% long-gap tier and the leg sum 0.37 is far
-# under the 0.85 price ceiling — whose TRUE expected value is negative once the
-# losing cell's fee is counted. Under the pre-DR-62 fee-less Kelly denominator
-# f* = +0.0113 and this pair was sized and submitted with real money.
-_DR62_PA, _DR62_PB, _DR62_NB = 0.16, 0.98, 0.21
+# The headline fixture: a time-series pair whose two books have no width, so
+# its mid spread (the forecast's input) is its YES-ask gap pB - pA = 0.10, a
+# spread the shipped live rule admits (tier floors off, band ceiling 0.5), and
+# whose leg sum 0.90 leaves a 10-cent edge. Its TRUE expected value is
+# negative once the losing cell's fee is counted, while the fee-less Kelly
+# denominator calls it positive (f* -0.0121 against +0.0141 at k 0.75).
+_DR62_PA, _DR62_PB, _DR62_NA, _DR62_NB = 0.20, 0.30, 0.80, 0.70
 
 
-def _fee_less_kelly_fraction(pA: float, pB: float, nB: float) -> float:
+def _fee_less_kelly_fraction(pA: float, pB: float, nB: float, nA: float | None = None) -> float:
     """The PRE-DR-62 time-series Kelly fraction: net_spread over the fee-LESS
     cost (price_a + price_b). Kept only so the tests below can state, in their
-    own terms, what the old gate concluded — never what the code now does."""
+    own terms, what the old gate concluded — never what the code now does.
+    p reads the four quotes' mid spread, nA defaulting to 1 - pA."""
+    nA = 1.0 - pA if nA is None else nA
     net_spread = (1.0 - pA - nB) - fee_per_pair_approx(pA, nB)
-    p = time_series_profit_prob(pA, pB)
+    p = time_series_profit_prob(config.time_series_mid_spread(pA, nA, pB, nB))
     return p - (1.0 - p) / (net_spread / (pA + nB))
 
 
@@ -3623,10 +4051,10 @@ class TestKellyRiskIncludesFees:
     rather than papered over. Worked under pre_toggle_defaults (k 0.75, a 20% cap)."""
 
     def test_the_headline_fixture_is_rejected(self):
-        # THE pin. Accepted before DR-62, rejected now.
-        assert _fee_less_kelly_fraction(_DR62_PA, _DR62_PB, _DR62_NB) > 0
-        assert _ts_kelly_fraction(_DR62_PA, _DR62_PB, _DR62_NB) < 0
-        pair = make_pair(pA=_DR62_PA, pB=_DR62_PB, nA=0.85, nB=_DR62_NB,
+        # THE pin. Accepted by a fee-less denominator, rejected now.
+        assert _fee_less_kelly_fraction(_DR62_PA, _DR62_PB, _DR62_NB, _DR62_NA) > 0
+        assert _ts_kelly_fraction(_DR62_PA, _DR62_PB, _DR62_NB, _DR62_NA) < 0
+        pair = make_pair(pA=_DR62_PA, pB=_DR62_PB, nA=_DR62_NA, nB=_DR62_NB,
                          pair_type="time_series")
         assert compute_trade(pair, 1_000_000) is None
 
@@ -3636,7 +4064,8 @@ class TestKellyRiskIncludesFees:
         # and what the module's own settlement model says.
         fee = fee_per_pair_approx(_DR62_PA, _DR62_NB)
         net_spread = (1.0 - _DR62_PA - _DR62_NB) - fee
-        p = time_series_profit_prob(_DR62_PA, _DR62_PB)
+        p = time_series_profit_prob(
+            config.time_series_mid_spread(_DR62_PA, _DR62_NA, _DR62_PB, _DR62_NB))
         q = 1.0 - p
         ev_fee_less = p * net_spread - q * (_DR62_PA + _DR62_NB)
         ev_true = p * net_spread - q * (_DR62_PA + _DR62_NB + fee)
@@ -3648,7 +4077,7 @@ class TestKellyRiskIncludesFees:
     def test_the_overstatement_is_q_times_the_fee_for_any_pair(self):
         # Not a property of the fixture: the two EV expressions differ by q*fee
         # for every price pair, which is why same-title (q = 0.05) is immune
-        # and the time-series bet (q = k*(pB - pA)) is not.
+        # and the time-series bet (q = k * its mid spread) is not.
         for price_a, price_b, p in ((0.30, 0.40, 0.775), (0.20, 0.30, 0.95),
                                     (0.16, 0.21, 0.385)):
             fee = fee_per_pair_approx(price_a, price_b)
@@ -3733,19 +4162,20 @@ class TestKellyRiskIncludesFees:
     def test_small_n_can_still_be_ev_negative_on_exact_fees(self):
         # The residual the gate does NOT close, pinned so nobody restates the
         # guarantee as "positive EV on the spec's own fields". Accepted at
-        # n = 30, yet p*min_payoff - q*total_cost_with_fees is a half-cent
+        # n = 31, yet p*min_payoff - q*total_cost_with_fees is a quarter-cent
         # NEGATIVE, entirely because the exact per-leg fee is ceiling-rounded
         # above fee_per_pair_approx. compute_trade's min_payoff > 0 check bounds
-        # this regime; it does not eliminate it.
-        pair = make_pair(pA=0.12, pB=0.33, nA=0.88, nB=0.70,
+        # this regime; it does not eliminate it. Both books have no width, so
+        # the mid spread is the YES-ask gap 0.13.
+        pair = make_pair(pA=0.31, pB=0.44, nA=0.69, nB=0.56,
                          pair_type="time_series")
         spec = compute_trade(pair, 1_000_000)
         assert spec is not None
-        assert spec.x == 30
+        assert spec.x == 31
         assert spec.min_payoff > 0  # the backstop that bounds the shortfall
         q = 1.0 - spec.kelly_p
         ev = spec.kelly_p * spec.min_payoff - q * spec.total_cost_with_fees
-        assert ev == pytest.approx(-0.005, abs=1e-3)
+        assert ev == pytest.approx(-0.0025, abs=1e-3)
         # ...and the approximation the gate priced with says the opposite
         price_a, price_b = leg_prices(spec.pair)
         approx_fee = fee_per_pair_approx(price_a, price_b) * spec.x
@@ -3774,7 +4204,7 @@ class TestKellyRiskIncludesFees:
         # The backtest replays the live admission rule, which is why no
         # backtest could ever have surfaced this — so the mirror is pinned on
         # the rejection too, not only on the value.
-        assert _backtester_trades(_DR62_PA, _DR62_PB, 0.85, _DR62_NB) == []
+        assert _backtester_trades(_DR62_PA, _DR62_PB, _DR62_NA, _DR62_NB) == []
         # Sanity: the same harness DOES enter the profitable fixture, so the
         # emptiness above is the Kelly gate and not a broken fixture.
         assert len(_backtester_trades(_TS_PA, _TS_PB, _TS_NA, _TS_NB)) == 1
@@ -4112,7 +4542,9 @@ def _held_spec(pair, x: int, *, ratio: float = 0.10, k: float | None = 0.40) -> 
     arbitrary but distinct, so a test can check they are kept. k is the
     interval discount a shrink prices a time-series pair's p at: 0.40 keeps
     every count these tests expect positive in expected value at the exact
-    fees (on _HOLE_LADDER at pB 0.62, p = 1 - 0.40 x 0.33 = 0.868)."""
+    fees (on _HOLE_LADDER at pB 0.62 the mid spread is 0.265, the YES-ask gap
+    0.33 less half the later book's 0.13 width, so p = 1 - 0.40 x 0.265 =
+    0.894)."""
     return TradeSpec(pair=pair, x=x, y=x, total_cost=10_000.0, total_cost_with_fees=10_000.0,
                      min_payoff=1.0, profit_ratio=0.07, days_to_close=12,
                      monthly_profit_ratio=ratio, kelly_p=0.83, kelly_fraction=0.11,
@@ -4328,12 +4760,15 @@ class TestSelectPortfolioShrinksToCash:
         assert p * got.min_payoff > (1 - p) * got.total_cost_with_fees
 
     def test_a_shrink_to_one_pair_that_loses_in_expectation_is_skipped(self):
-        # pA 0.21 / nB 0.45 / pB 0.59 at k 0.80: p = 0.696. One pair pays
-        # $0.30 and risks $0.70 (0.696 x 0.30 - 0.304 x 0.70 = -$0.004) and
-        # needs 72 cents; two pairs pay $0.61 and risk $1.39 (+$0.002) and
-        # need 143
-        pair = make_booked_pair([(0.21, 0.45, 5_000)], pB=0.59)
+        # pA 0.21 / nB 0.45 / pB 0.63 at k 0.80: the mid spread is 0.38 (the
+        # YES-ask gap 0.42 less half the later book's 0.08 width), p = 0.696.
+        # One pair pays $0.30 and risks $0.70 (0.696 x 0.30 - 0.304 x 0.70 =
+        # -$0.004) and needs 72 cents; two pairs pay $0.61 and risk $1.39
+        # (+$0.002) and need 143
+        pair = make_booked_pair([(0.21, 0.45, 5_000)], pB=0.63)
+        assert pair.mid_spread == pytest.approx(0.38)
         spec = compute_trade(pair, 1_000_000, settings=_live(k=0.80, cap=0.10))
+        assert spec.kelly_p == pytest.approx(0.696)
         assert select_portfolio([spec], 72) == []
         assert select_portfolio([spec], 142) == []
         assert select_portfolio([spec], 143)[0].x == 2
@@ -4357,7 +4792,7 @@ class TestSelectPortfolioShrinksToCash:
         now = datetime.now(UTC)
         grids = {"cent": ("", None, 0.01),
                  "deci": ("deci_cent", [PriceRange(0.0, 1.0, 0.001)], 0.001)}
-        shrunk = checked = 0
+        shrunk = checked = ts_checked = 0
         for trial in range(150):
             specs = []
             for i in range(rng.randrange(1, 7)):
@@ -4382,6 +4817,10 @@ class TestSelectPortfolioShrinksToCash:
                 if pair_type == "time_series":
                     prices = {"pA": best_a, "nB": best_b, "nA": round(1 - best_a, 4),
                               "pB": round(min(0.99, 1 - best_b + rng.randrange(0, 20) * tick), 4)}
+                    # The forecast's input, at the tops of the books, as
+                    # enrichment writes it: without it the sizer refuses the pair
+                    prices["mid_spread"] = config.time_series_mid_spread(
+                        prices["pA"], prices["nA"], prices["pB"], prices["nB"])
                 else:
                     prices = {"nA": best_a, "pB": best_b, "pA": 0.70, "nB": 0.70}
                 pair = CandidatePair(
@@ -4397,40 +4836,44 @@ class TestSelectPortfolioShrinksToCash:
             selected = select_portfolio(specs, cash)
             shrunk += sum(s not in specs for s in selected)
             checked += len(selected)
+            ts_checked += sum(s.pair.pair_type == "time_series" for s in selected)
             assert sum(s.cash_need_cents for s in selected) <= cash
             assert sum(trader._required_cents_by_shard(selected).values()) <= cash
             for s in selected:
                 # Per spec too, whichever shards its legs sit on
                 assert s.cash_need_cents >= sum(trader._required_cents_by_shard([s]).values())
-        # Non-vacuous: portfolios were selected, and some specs were shrunk
-        assert checked > 50 and shrunk > 5, (checked, shrunk)
+        # Non-vacuous: portfolios of both pair types were selected (a
+        # time-series pair's NO leg sits on market B, a same-title pair's on
+        # market A), and some specs were shrunk
+        assert (checked > 50 and shrunk > 5 and ts_checked > 50
+                and checked - ts_checked > 50), (checked, shrunk, ts_checked)
 
 
 class TestKellyOperandsShareOneSnapshot:
-    """_kelly_p's two time-series operands (pair.pA and pair.pB) must both come
-    from the enrichment snapshot.
+    """_kelly_p's time-series input (pair.mid_spread) must come from the
+    enrichment snapshot: the tops of both books enrichment just fetched.
 
-    config.time_series_profit_prob clamps the gap at zero, so a pB left at its
-    scan-time value while pA is refreshed to a depth-weighted fill can return
-    p = 1.0 — a riskless model on what is a directional bet, which Kelly then
-    sizes at the BUDGET_FRACTION cap. scanner.enrich_with_orderbook_prices
-    refreshes pB from the same books and drops any pair whose reference is not
-    above the YES fill, so no pair it marks tradeable can reach the clamp
-    (TS-34)."""
+    config.time_series_profit_prob clamps the spread at zero, so a spread that
+    is not above zero would return p = 1.0 — a riskless model on what is a
+    directional bet, which Kelly then sizes at the cap. Enrichment writes the
+    mid spread from the same books it prices the legs on, and drops any pair
+    whose later book has no YES ask or either book is crossed, so no pair it
+    marks tradeable can reach the clamp (TS-34, DR-78)."""
 
     @staticmethod
     def _books(*, pA_fill: float, nB_fill: float, pB_ref: float, qty: int = 100):
         """Mock KalshiClient serving EARLY/LATE time-series books, one level each.
 
         EARLY rests a NO bid of (1 - pA_fill) so its YES ask — the YES leg's
-        fill — is pA_fill. LATE rests a YES bid of (1 - nB_fill) so its NO ask
-        — the NO leg's fill — is nB_fill, and a NO bid of (1 - pB_ref) so its
-        YES ask (the reference quote) is pB_ref. Books arrive in the raw
-        orderbook_fp wire format, which is what _fetch_orderbook parses.
+        fill — is pA_fill, and a YES bid at pA_fill, so its book has no width.
+        LATE rests a YES bid of (1 - nB_fill) so its NO ask — the NO leg's
+        fill — is nB_fill, and a NO bid of (1 - pB_ref) so its YES ask (the
+        reference quote) is pB_ref. Books arrive in the raw orderbook_fp wire
+        format, which is what _fetch_orderbook parses.
         """
         def fake_orderbook(ticker):
             if ticker == "EARLY":
-                ob = {"yes_dollars": [],
+                ob = {"yes_dollars": [[str(round(pA_fill, 4)), str(qty)]],
                       "no_dollars": [[str(round(1.0 - pA_fill, 4)), str(qty)]]}
             else:
                 ob = {"yes_dollars": [[str(round(1.0 - nB_fill, 4)), str(qty)]],
@@ -4473,10 +4916,12 @@ class TestKellyOperandsShareOneSnapshot:
         [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
 
         # The invariant: a tradeable time-series pair still runs in the
-        # direction it qualified in, so the max(0, pB - pA) clamp is
-        # unreachable; an inverted one is dropped before compute_trade sizes it
+        # direction it qualified in, with a mid spread above zero, so the
+        # max(0, spread) clamp is unreachable; an inverted one is dropped
+        # before compute_trade sizes it
         if enriched.tradeable:
             assert enriched.pB > enriched.pA
+            assert enriched.mid_spread > 0
             assert _kelly_p(enriched, live_settings()) < 1.0
         else:
             assert compute_trade(enriched, 100_000) is None
@@ -4487,14 +4932,18 @@ class TestKellyOperandsShareOneSnapshot:
     def test_uninverted_pair_keeps_a_real_loss_probability(self):
         # The control: an UNCROSSED LATE book (YES bid 0.50, NO bid 0.35)
         # leaves the refreshed reference 0.65 above the 0.30 fill, so the pair
-        # survives and is priced on a genuine, non-clamped gap
+        # survives and is priced on a genuine, non-clamped mid spread: the
+        # midpoints 0.575 and 0.30, read off this one snapshot
         pair = self._pair(pA=0.30, pB=0.60, nB=0.50)
         client = self._books(pA_fill=0.30, nB_fill=0.50, pB_ref=0.65)
         [enriched] = enrich_with_orderbook_prices(client, [pair], _AMPLE_BALANCE_CENTS)
         assert enriched.tradeable is True
         assert enriched.pB > enriched.pA
+        assert enriched.mid_spread == pytest.approx(0.275)
+        assert enriched.mid_spread == config.time_series_mid_spread(
+            1.0 - 0.70, 1.0 - 0.30, 1.0 - 0.35, 1.0 - 0.50)
         assert _kelly_p(enriched, live_settings()) == pytest.approx(
-            time_series_profit_prob(enriched.pA, enriched.pB)
+            time_series_profit_prob(enriched.mid_spread)
         )
         assert _kelly_p(enriched, live_settings()) < 1.0
 

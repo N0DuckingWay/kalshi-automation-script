@@ -69,6 +69,7 @@ from kalshi_betting.config import (
     SAME_TITLE_CO_RESOLVE_PROB,
     fee_leg_exact,
     fee_per_pair_approx,
+    time_series_mid_spread,
     time_series_profit_prob,
 )
 from kalshi_betting.dashboard import (
@@ -103,9 +104,10 @@ def make_trade(title_a: str = "Will BTC exceed $80k?", profit: float | None = No
     dashboard section builders under test read.
 
     YES on the earlier contract at 0.30 and NO on the later at 0.40 (later YES
-    ask 0.60, earlier NO ask 0.70 — reporting only), n=5, settled in the
-    "event by A" win cell (A=YES, hence B=YES). _section_risk calls the
-    six-argument _kelly_fraction on these entry prices live, threading the run's
+    ask 0.60, earlier NO ask 0.70: both books with no width, so the mid spread
+    the forecast reads is 0.30), n=5, settled in the "event by A" win cell
+    (A=YES, hence B=YES). _section_risk calls _kelly_fraction on these entry
+    prices live, threading the run's
     interval discount. deadline_gap_days is reporting-only on BacktestTrade and
     defaults to None (the same-title / no-gap-recorded shape).
     """
@@ -167,18 +169,20 @@ def make_equity(values: list[float], start: date = date(2026, 1, 5)) -> pd.DataF
 
 class TestKellyFraction:
     """dashboard._kelly_fraction maps the legs like scanner.leg_prices and
-    prices time-series pairs through config.time_series_profit_prob."""
+    prices time-series pairs through config.time_series_profit_prob of the
+    mid spread."""
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_time_series_flow_through_fixture(self):
-        # YES 0.30 + NO 0.40, later YES ask 0.60: p = 0.775, f* ≈ 0.1620 at k 0.75.
-        # b's denominator carries the fee — the dollars at risk include it,
-        # because a losing pair loses cost + fees (DR-62).
+        # YES 0.30 + NO 0.40, later YES ask 0.60, both books with no width: a
+        # mid spread of 0.30, p = 0.775, f* ≈ 0.1620 at k 0.75. b's denominator
+        # carries the fee — the dollars at risk include it, because a losing
+        # pair loses cost + fees (DR-62).
         pA, nA, pB, nB = 0.30, 0.70, 0.60, 0.40
         fee = fee_per_pair_approx(pA, nB)
         net_spread = (1.0 - pA - nB) - fee
         b = net_spread / (pA + nB + fee)
-        p = time_series_profit_prob(pA, pB)
+        p = time_series_profit_prob(time_series_mid_spread(pA, nA, pB, nB))
         assert _kelly_fraction(pA, nA, pB, nB, "time_series") == pytest.approx(p - (1 - p) / b)
         assert _kelly_fraction(pA, nA, pB, nB, "time_series") == pytest.approx(0.1620, abs=1e-4)
 
@@ -361,6 +365,31 @@ class TestSectionIntervalDiscount:
         assert "POOLED" in out
         assert "Excluded 3 premise violation(s)" in out
         assert "never writes config.py" in out
+
+    def test_a_caption_says_the_implied_gap_is_the_mid_spread(self):
+        # DR-78: k-hat divides by the mean mid spread. The table keeps its
+        # "Mean implied gap" header, and one grey line right under the table
+        # says what that gap is, in plain words
+        points = _sweep_points([0.75])
+        sweep = BacktestSweep(primary=points[0], points=points,
+                              calibration=_calibration())
+        out = _section_interval_discount(sweep)
+        caption = ("<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
+                   "k&#770; = realised in-between rate ÷ mean implied gap, where a "
+                   "pair's implied gap is its mid spread (B's midpoint minus A's).</p>")
+        assert out.count(caption) == 1
+        header = '<th style="padding:8px 16px;">Mean implied gap</th>'
+        assert out.count(header) == 1
+        # Straight after the calibration table, before the premise-violation
+        # note and the "Recommendation only" line
+        table_end = out.index("</table>", out.index(header))
+        assert out.index(caption) == table_end + len("</table>")
+        assert out.index(caption) < out.index("Excluded 3 premise violation(s)")
+        assert out.index(caption) < out.index("Recommendation only")
+        assert "pB − pA" not in out
+        # No calibration, no table, so no caption
+        bare = BacktestSweep(primary=points[0], points=points, calibration=None)
+        assert "mean implied gap, where" not in _section_interval_discount(bare)
 
     def test_sweep_table_reports_per_k_metrics(self):
         points = _sweep_points([0.60, 0.75])
@@ -3327,14 +3356,45 @@ class TestFillsOnRowsAndScatter:
 
     def test_the_scatter_prices_a_time_series_trade_at_its_fills(self):
         k = 0.75
-        x, _ = dashboard._kelly_points([self._with_fills(0.33, 0.43)], k)
+        x, _ = dashboard._kelly_points([self._with_fills(0.31, 0.41)], k)
         # Hand-worked: the YES fill and the NO fill are the leg prices, and the
-        # later market's YES quote (0.60) is the model's reference ask
-        p = 1.0 - k * (0.60 - 0.33)
-        fee = fee_per_pair_approx(0.33, 0.43)
-        b = (1.0 - 0.33 - 0.43 - fee) / (0.33 + 0.43 + fee)
+        # forecast reads the entry quotes' mid spread, 0.60 - 0.30 on books
+        # with no width (never the fills), as the live sizer prices its legs
+        # at the fills and its forecast at the book's tops
+        p = 1.0 - k * 0.30
+        fee = fee_per_pair_approx(0.31, 0.41)
+        b = (1.0 - 0.31 - 0.41 - fee) / (0.31 + 0.41 + fee)
+        assert p - (1.0 - p) / b > 0
         assert x == [pytest.approx(p - (1.0 - p) / b)]
         assert x[0] != pytest.approx(dashboard._kelly_points([make_trade()], k)[0][0])
+
+    def test_the_scatter_forecasts_at_the_entry_mid_spread_not_the_fills(self):
+        # Market A's entry book is 0.05 wide (YES ask 0.30, NO ask 0.75), so
+        # the entry mid spread is 0.325: the forecast reads that, while the
+        # four quotes with the fills swapped in would read 0.315
+        k = 0.75
+        t = self._with_fills(0.31, 0.41, entry_nA=0.75)
+        assert dashboard._entry_mid_spread(t) == pytest.approx(0.325)
+        assert dashboard._entry_mid_spread(t) == time_series_mid_spread(0.30, 0.75, 0.60, 0.40)
+        x, _ = dashboard._kelly_points([t], k)
+        assert x == [_kelly_fraction(0.31, 0.75, 0.60, 0.41, "time_series", k=k,
+                                     spread=dashboard._entry_mid_spread(t))]
+        p = 1.0 - k * 0.325
+        fee = fee_per_pair_approx(0.31, 0.41)
+        b = (1.0 - 0.31 - 0.41 - fee) / (0.31 + 0.41 + fee)
+        assert p - (1.0 - p) / b > 0
+        assert x == [pytest.approx(p - (1.0 - p) / b)]
+        # Not the mid spread of the four with the fills swapped in
+        assert time_series_mid_spread(*dashboard._quotes_at_fills(t)) == pytest.approx(0.315)
+        assert x[0] != pytest.approx(
+            _kelly_fraction(*dashboard._quotes_at_fills(t), "time_series", k=k))
+
+    def test_a_same_title_trade_has_no_entry_mid_spread(self):
+        st = dataclasses.replace(make_trade(), pair_type="same_title")
+        assert dashboard._entry_mid_spread(st) is None
+        # ... and the spread keyword never reaches the same-title prior
+        assert (_kelly_fraction(0.70, 0.20, 0.30, 0.65, "same_title", spread=0.99)
+                == _kelly_fraction(0.70, 0.20, 0.30, 0.65, "same_title"))
 
     def test_the_scatter_prices_a_same_title_trade_at_its_fills(self):
         t = dataclasses.replace(self._with_fills(0.62, 0.30), pair_type="same_title",
@@ -3368,7 +3428,8 @@ class TestFillsOnRowsAndScatter:
         t = self._with_fills(0.33, 0.43, outcome_a="no", outcome_b="yes")
         frame = dashboard._decomposition_frame([t], None)
         assert list(frame["entry_pA"]) == [0.30]
-        # pB − pA from the two YES-ask quotes, and the in-between cell as the outcome
+        # The entry quotes' mid spread (0.30 on these books with no width),
+        # never the fills', and the in-between cell as the outcome
         assert dashboard._spread_observations([t]) == [(pytest.approx(0.30), 1)]
 
     def test_chunk_keys_separate_trade_lists_that_differ_only_in_fills(self):
@@ -7782,6 +7843,14 @@ class TestKhatBreakdown:
         section = dashboard._section_khat(None, 0.75)
         assert "could not be built" in section and "khat-group" not in section
 
+    def test_the_intro_names_the_midpoint_basis(self):
+        # DR-78: the intro states k-hat's basis, the mean mid spread, in the
+        # same words as the Portfolio Performance cards' caption
+        section = dashboard._section_khat(None, 0.75)
+        assert ("k&#770; = realised in-between rate ÷ mean market-implied gap at the "
+                "midpoints, over every time-series candidate entry at the band") in section
+        assert "pB − pA" not in section
+
     def test_group_names_are_escaped_in_the_table(self):
         stat = dashboard._khat_finish({"n": 2, "events": 1, "rate": 0.5, "implied": 0.4,
                                        "k": 1.25})
@@ -7835,7 +7904,7 @@ class TestKhatCards:
     itself, rewritten by the script from the k-hat breakdown's own groups."""
 
     def test_the_delta_is_red_when_khat_is_above_k(self):
-        # p = 1 − k·(pB − pA): a k-hat above k means the sizer sized too big
+        # p = 1 − k·(the mid spread): a k-hat above k means the sizer sized too big
         assert dashboard._khat_delta(0.9, 0.75) == ("+0.150", "#F44336")
         assert dashboard._khat_delta(0.6, 0.75) == ("-0.150", "#4CAF50")
         assert dashboard._khat_delta(0.75, 0.75) == ("+0.000", "#4CAF50")
@@ -7867,6 +7936,15 @@ class TestKhatCards:
             buckets=[], excluded_premise_violations=0)
         assert dashboard._khat_band(pooled, None, {}, {}, ks=(0.75,))["groups"]["all"][
             "delta"] == [["-0.250", "#4CAF50"]]
+
+    def test_the_caption_names_the_midpoint_basis(self):
+        # DR-78: k-hat divides by the mean mid spread, the quantity the
+        # forecast's k multiplies, and the caption says so in plain words
+        caption = dashboard._KHAT_CARDS_CAPTION
+        assert ("Empirical k&#770; = realised in-between rate ÷ mean market-implied gap "
+                "at the midpoints (a market's midpoint is halfway between its YES ask and "
+                "its YES bid), over every time-series candidate entry") in caption
+        assert "pB − pA" not in caption
 
     def test_the_section_gains_the_cards_only_when_given(self):
         trades, curve = _flt_trades(), _flt_sweep().primary.equity_df
@@ -11939,19 +12017,26 @@ class TestFilterPageSize:
 
 
 def _cal_trade(pA: float, pB: float, outcome_a: str, outcome_b: str,
-               pair_type: str = "time_series") -> BacktestTrade:
-    """make_trade with the entry YES asks, settlement sides and pair type the
-    calibration section reads."""
+               pair_type: str = "time_series", *, nA: float | None = None,
+               nB: float | None = None) -> BacktestTrade:
+    """make_trade with the entry quotes, settlement sides and pair type the
+    calibration section reads. The NO asks default to 1 minus their YES asks
+    (books with no width), so the mid spread the section scores is the
+    YES-ask gap the trade is written with."""
     return dataclasses.replace(make_trade(), entry_pA=pA, entry_pB=pB,
+                               entry_nA=1.0 - pA if nA is None else nA,
+                               entry_nB=1.0 - pB if nB is None else nB,
                                outcome_a=outcome_a, outcome_b=outcome_b,
                                pair_type=pair_type)
 
 
 class TestSpreadCalibration:
     """The Calibration Analysis section scores each time-series trade's entry
-    spread pB − pA against whether it settled A = NO, B = YES."""
+    mid spread (the later market's midpoint minus the earlier one's) against
+    whether it settled A = NO, B = YES."""
 
-    # Spreads chosen off the 0.1-wide bin edges, which float noise can straddle
+    # Spreads chosen off the 0.1-wide bin edges, which float noise can
+    # straddle; books with no width, so each mid spread is the YES-ask gap
     TRADES = [
         _cal_trade(0.30, 0.65, "yes", "yes"),               # 0.35, event by A
         _cal_trade(0.20, 0.65, "no", "yes"),                # 0.45, in between
@@ -11963,6 +12048,25 @@ class TestSpreadCalibration:
         obs = dashboard._spread_observations(self.TRADES)
         assert [p for p, _ in obs] == pytest.approx([0.35, 0.45, 0.25])
         assert [a for _, a in obs] == [0, 1, 0]
+
+    def test_the_prediction_is_the_entry_mid_spread_not_the_ask_gap(self):
+        # DR-78: B's entry book is 0.20 wide (YES ask 0.65, NO ask 0.55) and
+        # A's has none, so a 0.35 YES-ask gap reads 0.25 at the midpoints —
+        # the quantity the forecast multiplies by k. It lands in the 0.2–0.3
+        # bin, where the YES-ask gap would land in 0.3–0.4
+        t = _cal_trade(0.30, 0.65, "no", "yes", nA=0.70, nB=0.55)
+        assert dashboard._spread_observations([t]) == [
+            (time_series_mid_spread(0.30, 0.70, 0.65, 0.55), 1)]
+        assert dashboard._spread_observations([t]) == [(dashboard._entry_mid_spread(t), 1)]
+        assert dashboard._spread_observations([t])[0][0] == pytest.approx(0.25)
+        rel = dashboard._reliability([t])
+        assert rel["labels"] == ["0.2–0.3"]
+        assert rel["mean_pred"] == pytest.approx([0.25])
+        assert rel["brier"] == pytest.approx((0.25 - 1) ** 2)
+        # An earlier book with width moves it the other way: A 0.30/0.80
+        # (0.10 wide) with B 0.65/0.35 reads 0.40 against a 0.35 ask gap
+        wide_a = _cal_trade(0.30, 0.65, "no", "no", nA=0.80, nB=0.35)
+        assert dashboard._spread_observations([wide_a])[0][0] == pytest.approx(0.40)
 
     def test_same_title_trades_contribute_nothing(self):
         assert dashboard._spread_observations(self.TRADES[3:]) == []
@@ -11991,9 +12095,19 @@ class TestSpreadCalibration:
 
     def test_the_section_names_its_axes(self):
         section = dashboard._section_calibration(self.TRADES)
-        assert "Predicted probability: spread pB − pA" in section \
-            or "Predicted probability: spread pB \\u2212 pA" in section
+        assert "Predicted probability: mid spread" in section
+        assert "pB − pA" not in section and "pB \\u2212 pA" not in section
         assert "Time-series trades only" in section
+
+    def test_the_caption_names_the_mid_spread(self):
+        section = dashboard._section_calibration(self.TRADES)
+        assert dashboard._CALIBRATION_CAPTION in section
+        assert dashboard._CALIBRATION_CAPTION == (
+            '<p style="color:#666;font-size:13px">Time-series trades only: the entry mid '
+            "spread (B's midpoint minus A's; a midpoint is halfway between a market's YES "
+            "ask and its YES bid) — the market-implied probability that the event lands "
+            "between the two deadlines — against how often the pair settled A = NO, "
+            "B = YES.</p>")
 
 
 class TestFilterableSections:

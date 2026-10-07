@@ -39,7 +39,11 @@ Dependencies:
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap — whose
     spread_min and tier_floors keywords apply this module's bands and
-    tier-floors-off family — and time_series_profit_prob), the
+    tier-floors-off family — time_series_profit_prob, and
+    time_series_mid_spread, the mid spread the Kelly gate prices each
+    time-series Monday at, _candidate_pair gives each time-series
+    candidate at its Monday's quotes and _interval_calibration measures
+    k-hat against at each pair's first qualifying Monday), the
     spread-band helpers
     time_series_spread_band and time_series_spread_too_wide (which
     _find_entry applies to time-series candidates; the first also validates
@@ -81,7 +85,8 @@ Dependencies:
     order book (depth_model.book, from the DepthModel the caller hands in)
     and strategy.compute_trade picks the count, through scanner's
     CandidatePair, HeldPair, _market_from_dict and leg_prices. The Kelly
-    gate in Pass 1 still copies the formula, at the top of the book.
+    gate in Pass 1 still copies the formula, at the top of the book, with
+    the forecast read from that Monday's mid spread as live sizing reads it.
     Exports BacktestTrade, HalfSplit, SaleCheck, SweepPoint,
     CalibrationObservation, IntervalCalibrationBucket, IntervalCalibration,
     OutcomeLabelCoverage, CapSweep, SIZE_CAP_SWEEP and BacktestSweep
@@ -183,7 +188,8 @@ Notes:
 
     _interval_calibration() measures the EMPIRICAL discount from one band's
     k-independent entries — the realised in-between rate divided by the mean
-    market-implied gap, pooled and per deadline-gap band — and
+    market-implied gap at the midpoints (the mid spread, which the forecast's
+    k multiplies too), pooled and per deadline-gap band — and
     _log_interval_calibration() reports it. Because it reads the prepared
     entries rather than _simulate_at_discount(), it is never filtered by the
     Kelly gate, which is what stops the estimate confirming whatever k
@@ -384,6 +390,7 @@ from .config import (
     max_kelly_fraction,
     min_price_diff_for_gap,
     pair_size_cap,
+    time_series_mid_spread,
     time_series_profit_prob,
     time_series_spread_band,
     time_series_spread_too_wide,
@@ -497,7 +504,7 @@ _SIMULATION_LABELS = _SCENARIO_POPULATIONS + tuple(
 
 # The per-trade size caps a size-cap sweep offers the dashboard: 5% steps to
 # 95%, then 1.0 — NO cap. Kelly's f* = p - q/b <= p <= 1 (time_series_profit_prob
-# is 1 - k*max(0, pB-pA) with k in [0, 1]; same-title prices at the fixed
+# is 1 - k*max(0, mid spread) with k in [0, 1]; same-title prices at the fixed
 # SAME_TITLE_CO_RESOLVE_PROB), so min(1.0, f*) is f* itself and "100%" and
 # "off" are one run. A same-title candidate also stays under
 # SAME_TITLE_SIZE_CAP at every cap (config.pair_size_cap). BACKTEST-ONLY:
@@ -1385,10 +1392,12 @@ class BacktestTrade:
             made A the pricier side (reporting only).
         entry_pB (float): YES ask price of market B at entry. Range: [0.01, 0.99].
             The quote of the market-B leg for same_title; for time_series it
-            feeds the profit model together with entry_pA but is not traded.
+            is not traded, and with the other three entry quotes it gives the
+            mid spread the profit model reads (config.time_series_mid_spread).
         entry_nA (float): NO ask price of market A at entry (≈ 1 − yes_bid_A).
             Range: [0.01, 0.99]. The quote of the market-A leg for
-            same_title; reporting only for time_series.
+            same_title; for time_series it is not traded, and gives market
+            A's YES bid in the mid spread.
         entry_nB (float): NO ask price of market B at entry (≈ 1 − yes_bid_B).
             Range: [0.01, 0.99]. The quote of the market-B leg for
             time_series; reporting only for same_title.
@@ -1847,7 +1856,16 @@ class CalibrationObservation:
             from, carried out of _find_entry. None only if a time-series entry
             somehow reached here without one, in which case the observation
             still counts in the pooled row but lands in no gap band.
-        implied (float): Market-implied in-between mass at entry, pB - pA.
+        implied (float): The market-implied chance, at entry, that the event
+            first happens between the two deadlines: the pair's mid spread
+            at its first qualifying Monday's four quotes
+            (config.time_series_mid_spread — the later market's midpoint
+            minus the earlier one's), the quantity the forecast's k
+            multiplies. Zero or negative only when the earlier market's
+            quote is crossed (its YES ask below its own YES bid): on any
+            other entry, _find_entry's fee check keeps the later book's
+            width (its YES ask plus its NO ask, minus 1) under the YES-ask
+            gap, which keeps the mid spread above half that gap.
         in_between (bool): Whether the pair actually settled in-between
             (earlier NO, later YES) — the time-series bet's only loss cell.
         event_ticker (str): Market A's event ticker as the entry carries it
@@ -1903,14 +1921,15 @@ class IntervalCalibrationBucket:
         realised_rate (float): Fraction of the bucket that actually settled
             in-between (earlier NO, later YES) — the event the time-series bet
             loses on. 0.0 when n is 0.
-        mean_implied (float): Mean market-implied in-between mass (pB - pA) at
-            entry across the bucket. 0.0 when n is 0.
+        mean_implied (float): Mean market-implied in-between mass at entry
+            across the bucket: the mean of its observations' mid spreads
+            (CalibrationObservation.implied). 0.0 when n is 0.
         empirical_k (float | None): realised_rate / mean_implied — the
             fraction of the market-implied in-between mass that actually
             materialized, i.e. the empirical counterpart of
-            config.TIME_SERIES_INTERVAL_PROB_DISCOUNT. None when mean_implied
-            is not positive (including the n == 0 case), since the ratio is
-            undefined rather than zero.
+            config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, a fraction of the same
+            mid spread. None when mean_implied is not positive (including the
+            n == 0 case), since the ratio is undefined rather than zero.
     """
     label: str
     tier: float
@@ -6142,7 +6161,9 @@ def _find_entry(
         contract is never a candidate. The legs are YES on A at pA and NO on B
         at nB, so the price-sum ceiling (pA + nB <= 1 − threshold) and the fee
         check are applied to those two leg prices — never to (nA, pB), which
-        are reporting-only quotes for this pair type. The deadline gap driving
+        are not traded for this pair type (the Kelly gate in
+        _simulate_at_discount reads all four quotes for the mid spread its
+        forecast prices at). The deadline gap driving
         the tier (and the 30-day cutoff) is the ABSOLUTE timedelta.days on the
         two close_time datetimes, exactly as scanner.deadline_gap_days computes
         it (order-independent) — not calendar-date subtraction, which counts a
@@ -6186,10 +6207,11 @@ def _find_entry(
     what is left of the gap test is that pB must EXCEED pA: a time-series
     Monday whose spread is not strictly positive (pB − pA <= PRICE_EPSILON)
     is refused whatever the tiers, because a pair with no in-between mass
-    has nothing to dispute and time_series_profit_prob would model it as
-    riskless (p = 1). That refusal is inert with the tiers on, where every
-    tier already demands more; at a floor of 0 with them off it is the one
-    gap condition left, beside a sum ceiling of 1 the fee check implies.
+    has nothing to dispute, as the live spread rule refuses it
+    (config.time_series_spread_refusal). That refusal is inert with the
+    tiers on, where every tier already demands more; at a floor of 0 with
+    them off it is the one gap condition left, beside a sum ceiling of 1 the
+    fee check implies.
 
     Scanning stops at the earlier close date (not the later one) because after
     the first market closes, the pair is no longer open for entry.
@@ -6463,7 +6485,8 @@ def _find_entry(
         # Skip settled or illiquid candles (prices at the extreme ends of the
         # range). Both YES asks are checked regardless of pair type: for
         # time_series pB is not a leg price, but it still drives the gap and
-        # the profit model, so a dead quote there is just as disqualifying.
+        # the profit model's mid spread, so a dead quote there is just as
+        # disqualifying.
         if not (0.01 <= p_a_raw <= 0.99 and 0.01 <= p_b_raw <= 0.99):
             continue
 
@@ -6474,8 +6497,8 @@ def _find_entry(
             pA, pB, nA, nB = p_a_raw, p_b_raw, n_a_raw, n_b_raw
             gap = pB - pA
             # A Monday with no in-between mass (pB - pA not strictly positive)
-            # has nothing to dispute, and time_series_profit_prob would model
-            # it as riskless (p = 1, Kelly at the cap). Inert with the tiers
+            # has nothing to dispute, as the live spread rule says
+            # (config.time_series_spread_refusal). Inert with the tiers
             # on, since every tier > 0 already demands more; it keeps the
             # tier-floors-off family, whose floor-0 threshold is 0.0, from
             # entering such a pair. PRICE_EPSILON sits on the REJECT side here
@@ -8583,7 +8606,17 @@ def _candidate_pair(c: dict, held: HeldPair | None, markets: dict) -> CandidateP
     so the live code reads each market's own close time and price grid. A
     time-series pair carries the deadline gap _find_entry tiered it on as its
     stated gap (scanner.pair_gap_days reads it), so the walk applies the same
-    tier.
+    tier, and its mid spread at that Monday's four quotes
+    (config.time_series_mid_spread), the input the live sizer's forecast
+    reads, as the Kelly gate does, never at the market records' own quotes,
+    which are their last ones, from when they closed. The live enrichment
+    writes the mid spread again from a walked book, whose top is those
+    quotes. The candle fetch clamps every NO ask into 0.01-0.99, so a YES bid
+    never reads below 0.01 here. Live enrichment reads an earlier market's
+    YES bid as it is, a missing one as 0, so where that bid is under a cent
+    or missing, the mid spread here can sit up to 0.005 below what live
+    enrichment would read off the same book, and the chance of profit up to
+    k x 0.005 above it.
 
     Args:
         c (dict): A Pass 2 candidate.
@@ -8601,10 +8634,15 @@ def _candidate_pair(c: dict, held: HeldPair | None, markets: dict) -> CandidateP
         built.append(market)
     gap = c["gap_days"]
     stated = (gap if c["pair_type"] == "time_series" and type(gap) is int else None)
+    # The mid spread at that Monday's quotes, which the sizer's forecast
+    # reads: the one definition live enrichment also writes it with; None for
+    # a same-title pair
+    mid = (time_series_mid_spread(c["pA"], c["nA"], c["pB"], c["nB"])
+           if c["pair_type"] == "time_series" else None)
     return CandidatePair(
         market_a=built[0], market_b=built[1], pA=c["pA"], pB=c["pB"], nA=c["nA"],
         nB=c["nB"], tradeable=True, canonical_title=str(c["canon"]),
-        pair_type=c["pair_type"], stated_gap_days=stated, held=held)
+        pair_type=c["pair_type"], stated_gap_days=stated, held=held, mid_spread=mid)
 
 
 def _books_for(c: dict, d: date) -> tuple[dict, dict] | None:
@@ -8779,8 +8817,12 @@ def _simulate_at_discount(
     believes), and build the equity curve.
 
     Scores each entry's Mondays with the Kelly rule (the formula that sets how
-    much to bet) at the top of the book, drops pairs with no usable pay-out,
-    then walks the Mondays in date order. Each trade is sized by the live
+    much to bet) at the top of the book, a time-series pair's chance of paying
+    read from that Monday's mid spread (config.time_series_mid_spread), as
+    live sizing reads it, and a Monday whose quotes are crossed on either
+    market (a YES ask below its own YES bid) skipped and counted. It drops
+    pairs with no usable pay-out, then walks the Mondays in date order. Each
+    trade is sized by the live
     code (_size_trade): with a depth model and volume data that Monday, the
     live enrichment walks a synthetic order book and the live sizer
     (strategy.compute_trade) picks the count; otherwise the sizer fills at
@@ -8951,6 +8993,10 @@ def _simulate_at_discount(
     # this function was extracted (a test pins the resulting count in the
     # WARNING) — do not reorder the two. Counted once per pair.
     premise_violations = 0
+    # Time-series Mondays the Kelly gate skipped because a market's quote was
+    # crossed (its YES ask below its own YES bid), once per pair per Monday;
+    # reported once after the walk
+    crossed_mondays = 0
     # SweepPoint.peak_kelly_fraction: the largest uncapped fraction over
     # every Monday a pair may be traded on
     peak_kelly = 0.0
@@ -9004,17 +9050,33 @@ def _simulate_at_discount(
                              if net_spread > 0 else 0.0)
 
             # Probability model. time_series: the discounted market-implied
-            # in-between mass, 1 - k * (pB - pA), from config.time_series_profit_prob
-            # — the single definition strategy._kelly_p and dashboard._kelly_fraction
-            # also call, so the three can never drift (called directly by name here;
-            # a test pins the two-link chain run_backtest -> _simulate_at_discount
-            # -> the helper). k is this function's override, and None — what
+            # in-between mass at the midpoints, 1 - k * the mid spread, from
+            # config.time_series_profit_prob — the single definition
+            # strategy._kelly_p_at and dashboard._kelly_fraction also call, so
+            # the three can never drift (called directly by name here; a test
+            # pins the two-link chain run_backtest -> _simulate_at_discount ->
+            # the helper). k is this function's override, and None — what
             # run_backtest passes — is the sentinel the helper resolves to
-            # config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.py's k (live sizing
-            # prices through the same helper at the saved live defaults' k).
-            # same_title: the fixed co-resolution prior.
-            p = (time_series_profit_prob(pA, pB, k=k)
-                 if pair_type == "time_series" else SAME_TITLE_CO_RESOLVE_PROB)
+            # config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.py's k (live
+            # sizing prices through the same helper at the saved live
+            # defaults' k). same_title: the fixed co-resolution prior.
+            if pair_type == "time_series":
+                # A quote whose YES ask sits below its own YES bid is a crossed
+                # book: live enrichment drops it, and its midpoint could let
+                # Kelly pass 1 - k (config.max_kelly_fraction relies on this)
+                if pA + nA < 1.0 - PRICE_EPSILON or pB + nB < 1.0 - PRICE_EPSILON:
+                    crossed_mondays += 1
+                    continue
+                # The market's in-between chance at the midpoints, the input
+                # live sizing reads (config.time_series_mid_spread, DR-78). On
+                # these uncrossed quotes a Monday that passes the fee check
+                # has a mid spread above its fee less PRICE_EPSILON, so above
+                # zero: the model's zero clamp, which would read a spread at
+                # or below zero as riskless, never decides a Monday here
+                spread = time_series_mid_spread(pA, nA, pB, nB)
+                p = time_series_profit_prob(spread, k=k)
+            else:
+                p = SAME_TITLE_CO_RESOLVE_PROB
             q = 1.0 - p
 
             # Kelly formula: f* = p - q/b; non-positive means no positive expected
@@ -9744,6 +9806,15 @@ def _simulate_at_discount(
         ", adding to held pairs" if add_to_held else "",
         "" if sell_level is None else f", {_sale_label(sell_level, min_days)}",
     )
+    # Once per pair per Monday the Kelly gate skipped for a crossed quote
+    # (silent at zero)
+    if crossed_mondays:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Time-series Mondays skipped because a market's YES ask sat below its "
+            "own YES bid (a crossed book) (%s): %d",
+            run_label, crossed_mondays,
+        )
     # Once per pair per Monday a busy ladder held it back (silent at zero)
     if ladder_refusals:
         logging.log(
@@ -9846,8 +9917,9 @@ def _calibration_bucket(
     Reduce a set of time-series observations to one calibration report row.
 
     Computes the realised in-between rate, the mean market-implied in-between
-    mass, and their ratio — the empirical interval discount k_hat, i.e. how
-    much of the mass the market priced actually materialized. The one
+    mass (the mean mid spread, CalibrationObservation.implied), and their
+    ratio — the empirical interval discount k_hat, i.e. how much of the mass
+    the market priced actually materialized. The one
     definition of that arithmetic: _interval_calibration builds every row of
     its report here, and dashboard._khat_band, which regroups
     IntervalCalibration.observations by category, tag and spread band,
@@ -9867,8 +9939,9 @@ def _calibration_bucket(
 
     Returns:
         IntervalCalibrationBucket: The row. empirical_k is None whenever
-            mean_implied is not strictly positive — with a zero (or, from
-            reporting-only clamping, negative) implied mass the ratio is
+            mean_implied is not strictly positive — with a zero or negative
+            mean mid spread (only entries whose earlier quote is crossed can
+            pull it there; see CalibrationObservation.implied) the ratio is
             undefined, and reporting it as 0.0 would read as "the market
             overstated everything" rather than "not measurable".
     """
@@ -9902,15 +9975,19 @@ def _interval_calibration(
     Measure the empirical interval discount k over the prepared entries.
 
     The time-series bet loses exactly one settlement cell: the event first
-    happens BETWEEN the two deadlines (earlier NO, later YES). The market
-    prices that cell at pB - pA; config.time_series_profit_prob believes only
-    TIME_SERIES_INTERVAL_PROB_DISCOUNT of it. This function measures the
-    fraction that actually materialized:
+    happens BETWEEN the two deadlines (earlier NO, later YES). The market's
+    price of that cell is the mid spread: the later market's midpoint minus
+    the earlier one's, a market's midpoint being halfway between its YES ask
+    and its YES bid (config.time_series_mid_spread, DR-78). The forecast
+    (config.time_series_profit_prob) believes only
+    TIME_SERIES_INTERVAL_PROB_DISCOUNT of that price; this function measures
+    the fraction that actually materialized:
 
-        k_hat = P(earlier NO, later YES) / mean(pB - pA)
+        k_hat = P(earlier NO, later YES) / mean(mid spread)
 
     pooled and per deadline-gap band, so an operator can compare the hand-set
-    constant against what the history did.
+    constant against what the history did. k_hat and the forecast's k are
+    fractions of the same quantity, so they compare directly.
 
     The population is deliberately k-INDEPENDENT: it reads the prepared
     entries directly (_prepare_entries()' output, or one spread band's
@@ -9921,10 +9998,13 @@ def _interval_calibration(
     would confirm itself. Being k-independent also means one computation is
     valid for every k at one band, which is why BacktestSweep holds one of
     these per band rather than each SweepPoint holding its own. It is not
-    band-independent: a band decides which pairs enter at all. It prices each
-    pair at its first qualifying Monday, never at the Monday a simulation
-    trades it on: that Monday depends on k, so using it would bring back the
-    circularity described above.
+    band-independent: a band decides which pairs enter at all. It reads each
+    pair's mid spread at its first qualifying Monday's quotes (the entry's own
+    pA, nA, pB and nB), never at the Monday a simulation trades it on: that
+    Monday depends on k, so using it would bring back the circularity
+    described above. A first Monday whose quote is crossed (a market's YES
+    ask below its own YES bid) is measured like any other, at its mid
+    spread, though the Kelly gate never trades a crossed Monday.
 
     Two properties of the population to keep in mind when reading the number:
 
@@ -9944,10 +10024,15 @@ def _interval_calibration(
         SMALLER than this one. Two different populations, two different names,
         neither a bug in the other.
       - It is conditional on the strategy's own entry filters — only pairs
-        whose gap already cleared its tier ever produced an entry. That is a
-        feature, not a sampling flaw: it is exactly the conditional
+        whose YES-ask gap already cleared its tier ever produced an entry.
+        That is a feature, not a sampling flaw: it is exactly the conditional
         distribution the live sizer faces under the same entry rule, so k_hat
-        is the right number to compare TIME_SERIES_INTERVAL_PROB_DISCOUNT against.
+        is measured on the population TIME_SERIES_INTERVAL_PROB_DISCOUNT is
+        applied to, and against the quantity it multiplies. One pair's mid
+        spread can still be zero or negative, but only when its earlier
+        market's quote is crossed (see CalibrationObservation.implied), so a
+        bucket's mean can be too, and then it reports no k_hat
+        (_calibration_bucket).
 
     Args:
         raw_entries (list[dict]): Prepared entries (_prepare_entries() output,
@@ -10028,7 +10113,12 @@ def _interval_calibration(
             # candidate is always bucketed under the very gap its price tier
             # and the MAX_DEADLINE_GAP_DAYS cutoff were applied on.
             gap_days=entry["gap_days"],
-            implied=entry["pB"] - entry["pA"],
+            # The market's in-between chance at the midpoints, from the first
+            # qualifying Monday's four quotes: the input the forecast's k
+            # multiplies (config.time_series_mid_spread, DR-78), so k-hat and
+            # k are fractions of one quantity
+            implied=time_series_mid_spread(entry["pA"], entry["nA"],
+                                           entry["pB"], entry["nB"]),
             in_between=(outcome_a == "no" and outcome_b == "yes"),
             event_ticker=event_ticker,
             # The ticker-prefix label BacktestTrade.category carries, which a
@@ -10116,7 +10206,7 @@ def _log_interval_calibration(calibration: IntervalCalibration | None) -> None:
 
     logging.info(
         "Interval-discount calibration (k_hat = realised in-between rate / "
-        "market-implied gap)"
+        "market-implied gap at the midpoints)"
     )
     logging.info("  %-14s%4s%9s%12s%11s%10s",
                  "bucket", "tier", "n", "realised", "implied", "k_hat")

@@ -53,6 +53,7 @@ from kalshi_betting.config import (
     max_kelly_fraction,
     min_price_diff_for_gap,
     pair_size_cap,
+    time_series_mid_spread,
     time_series_profit_prob,
     time_series_spread_refusal,
 )
@@ -170,36 +171,129 @@ class TestFeePairApprox:
         )
 
 
+def _two_midpoints(yes_ask_a, no_ask_a, yes_ask_b, no_ask_b):
+    """mid B - mid A, each midpoint taken the plain way: (YES ask + YES bid) / 2,
+    the YES bid being 1 - the NO ask."""
+    mid_a = (yes_ask_a + (1.0 - no_ask_a)) / 2.0
+    mid_b = (yes_ask_b + (1.0 - no_ask_b)) / 2.0
+    return mid_b - mid_a
+
+
+class TestTimeSeriesMidSpread:
+    """time_series_mid_spread is the later market's midpoint minus the earlier
+    one's, a midpoint being halfway between a market's YES ask and its YES
+    bid (1 - its NO ask). It is computed as the ask gap less half the
+    difference in the two books' widths (a width being YES ask + NO ask - 1),
+    so on books with no width it is the ask gap to the last bit whenever the
+    two YES ask + NO ask sums are the same float, and within float noise of
+    it otherwise. A missing YES bid (a NO ask of 1.0) puts that market's
+    midpoint at half its YES ask."""
+
+    def test_equals_the_ask_gap_on_every_complementary_cent_book(self):
+        # Every pair of whole-cent YES asks pA < pB, each market's NO ask its
+        # complement: each book's YES ask + NO ask is exactly 1.0 in floating
+        # point, so the mid spread is the ask gap to the last bit (the plain
+        # two-midpoint form is not, on some)
+        checked = plain = 0
+        for i in range(1, 100):
+            for j in range(i + 1, 100):
+                pA, pB = i / 100, j / 100
+                nA, nB = (100 - i) / 100, (100 - j) / 100
+                assert pA + nA == 1.0 and pB + nB == 1.0, (pA, pB)
+                assert time_series_mid_spread(pA, nA, pB, nB) == pB - pA, (pA, pB)
+                plain += _two_midpoints(pA, nA, pB, nB) == pB - pA
+                checked += 1
+        assert checked == 4851
+        assert plain < checked
+
+    def test_books_with_no_width_built_as_the_book_reader_builds_them(self):
+        # Each ask taken as the book reader takes it, 1 - the other side's
+        # bid: a YES bid at i cents and a NO bid at 100 - i cents give a book
+        # with no width, but its YES ask + NO ask need not come to exactly
+        # 1.0. Where the two books' sums are the same float the mid spread is
+        # the ask gap to the last bit; where they are not, it is within about
+        # 1e-16 of it
+        def quotes(i):
+            return 1.0 - float(f"{(100 - i) / 100:.4f}"), 1.0 - float(f"{i / 100:.4f}")
+
+        same_sum = other_sum = 0
+        for i in range(1, 100):
+            for j in range(i + 1, 100):
+                (pA, nA), (pB, nB) = quotes(i), quotes(j)
+                spread = time_series_mid_spread(pA, nA, pB, nB)
+                if pA + nA == pB + nB:
+                    assert spread == pB - pA, (i, j)
+                    same_sum += 1
+                else:
+                    assert abs(spread - (pB - pA)) <= 1.2e-16, (i, j)
+                    other_sum += 1
+        # Both kinds occur, so both branches above are exercised
+        assert same_sum + other_sum == 4851
+        assert same_sum and other_sum
+
+    def test_matches_the_two_midpoints_on_random_quotes(self):
+        # Any four 4-decimal quotes, crossed books included: the same number
+        # as mid B - mid A, to float noise
+        rng = random.Random(20261006)
+        for _ in range(20_000):
+            quotes = [round(rng.uniform(0.0001, 0.9999), 4) for _ in range(4)]
+            assert abs(time_series_mid_spread(*quotes) - _two_midpoints(*quotes)) <= 1e-15, quotes
+
+    def test_a_wider_later_book_makes_the_ask_gap_overstate_it(self):
+        # A: YES ask 0.30, NO ask 0.72 (YES bid 0.28, midpoint 0.29, width 0.02).
+        # B: YES ask 0.62, NO ask 0.42 (YES bid 0.58, midpoint 0.60, width 0.04).
+        # The ask gap is 0.32; half the extra 0.02 of B's width comes off it
+        assert time_series_mid_spread(0.30, 0.72, 0.62, 0.42) == pytest.approx(0.31)
+
+    def test_no_yes_bid_puts_the_earlier_midpoint_at_half_its_yes_ask(self):
+        # A NO ask of 1.0 stands for no YES bid (a bid of 0): mid A = its YES ask / 2
+        for pA, pB, nB in ((0.30, 0.60, 0.42), (0.21, 0.55, 0.47), (0.05, 0.31, 0.70)):
+            mid_b = (pB + (1.0 - nB)) / 2.0
+            assert time_series_mid_spread(pA, 1.0, pB, nB) == pytest.approx(
+                mid_b - pA / 2.0, abs=1e-15)
+
+
 class TestTimeSeriesProfitProb:
-    """p = 1 - k * max(0, pB - pA): one minus the believed fraction k of the
+    """p = 1 - k * max(0, spread): one minus the believed fraction k of the
     market-implied probability that the event first happens between the two
-    deadlines (the single loss cell of a YES-on-earlier / NO-on-later pair)."""
+    deadlines (the single loss cell of a YES-on-earlier / NO-on-later pair),
+    read at the midpoints (the mid spread, time_series_mid_spread; DR-78)."""
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_flow_through_fixture(self):
-        # pA 0.30, pB 0.60 → p = 1 - 0.75 * 0.30 = 0.775 (k 0.75, pre-toggle)
-        assert time_series_profit_prob(0.30, 0.60) == pytest.approx(0.775)
+        # A mid spread of 0.30 → p = 1 - 0.75 * 0.30 = 0.775 (k 0.75, pre-toggle)
+        assert time_series_profit_prob(0.30) == pytest.approx(0.775)
 
     def test_matches_definition_from_constant(self):
-        for pA, pB in [(0.10, 0.25), (0.30, 0.60), (0.40, 0.55), (0.30, 0.70)]:
-            expected = 1.0 - config.TIME_SERIES_INTERVAL_PROB_DISCOUNT * (pB - pA)
-            assert time_series_profit_prob(pA, pB) == pytest.approx(expected)
+        for spread in (0.15, 0.30, 0.15, 0.40):
+            expected = 1.0 - config.TIME_SERIES_INTERVAL_PROB_DISCOUNT * spread
+            assert time_series_profit_prob(spread) == pytest.approx(expected)
+
+    def test_it_reads_the_mid_spread_not_the_ask_gap(self):
+        # The model takes the spread it is handed: a later book 0.10 wide puts
+        # the mid spread 0.05 under the YES-ask gap, and p reads the former
+        spread = time_series_mid_spread(0.30, 0.70, 0.60, 0.50)
+        assert spread == pytest.approx(0.25)
+        assert time_series_profit_prob(spread, k=0.80) == pytest.approx(0.80)
+        assert time_series_profit_prob(spread, k=0.80) != pytest.approx(
+            1.0 - 0.80 * (0.60 - 0.30))
 
     def test_clamps_to_one_when_earlier_is_pricier(self):
-        # A pricier earlier contract is never a candidate; reachable only from
-        # reporting code, where it must model as riskless, not as p > 1
-        assert time_series_profit_prob(0.60, 0.30) == 1.0
-        assert time_series_profit_prob(0.50, 0.50) == 1.0
+        # A spread at or below zero (the later midpoint not above the earlier)
+        # would model as riskless, never as p > 1: which is why the sizer never
+        # asks with one (scanner.pair_mid_spread refuses it)
+        assert time_series_profit_prob(-0.30) == 1.0
+        assert time_series_profit_prob(0.0) == 1.0
 
     def test_discount_of_one_is_market_implied(self, monkeypatch):
-        # k = 1 takes the market at face value: p = 1 - (pB - pA). Under this
+        # k = 1 takes the market at face value: p = 1 - spread. Under this
         # model Kelly is <= 0 for every pair (see test_strategy's parity class).
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 1.0)
-        assert time_series_profit_prob(0.30, 0.60) == pytest.approx(0.70)
+        assert time_series_profit_prob(0.30) == pytest.approx(0.70)
 
     def test_discount_of_zero_ignores_the_gap(self, monkeypatch):
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.0)
-        assert time_series_profit_prob(0.30, 0.60) == 1.0
+        assert time_series_profit_prob(0.30) == 1.0
 
     def test_discount_constant_value_and_range(self):
         # Pinned so a retune is visible in review; within (0, 1], the range
@@ -212,24 +306,24 @@ class TestTimeSeriesProfitProb:
         # The backtester's calibration sweep passes one k per simulation; the
         # override must win over the config constant — 1 - 0.50 * 0.30 = 0.85 —
         # without mutating it, since the live sizer keeps reading it.
-        assert time_series_profit_prob(0.30, 0.60, k=0.50) == pytest.approx(0.85)
-        assert time_series_profit_prob(0.30, 0.60, k=1.0) == pytest.approx(0.70)
+        assert time_series_profit_prob(0.30, k=0.50) == pytest.approx(0.85)
+        assert time_series_profit_prob(0.30, k=1.0) == pytest.approx(0.70)
         assert config.TIME_SERIES_INTERVAL_PROB_DISCOUNT == 0.75
 
     def test_k_none_is_identical_to_omitting_it(self):
         # k=None reads the config constant, so the backtest's default point
         # prices exactly as live sizing does at config.py's k
-        for pA, pB in [(0.10, 0.25), (0.30, 0.60), (0.40, 0.55), (0.60, 0.30)]:
-            assert time_series_profit_prob(pA, pB, k=None) == time_series_profit_prob(pA, pB)
+        for spread in (0.15, 0.30, 0.15, -0.30):
+            assert time_series_profit_prob(spread, k=None) == time_series_profit_prob(spread)
 
     def test_constant_read_at_call_time_and_only_when_k_is_omitted(self, monkeypatch):
         # The None sentinel must resolve inside the body rather than binding at
         # def time: a monkeypatched constant still governs an override-free
         # call (1 - 0.50 * 0.30 = 0.85)...
         monkeypatch.setattr(config, "TIME_SERIES_INTERVAL_PROB_DISCOUNT", 0.50)
-        assert time_series_profit_prob(0.30, 0.60) == pytest.approx(0.85)
+        assert time_series_profit_prob(0.30) == pytest.approx(0.85)
         # ...and is ignored entirely once k is supplied (1 - 0.75 * 0.30)
-        assert time_series_profit_prob(0.30, 0.60, k=0.75) == pytest.approx(0.775)
+        assert time_series_profit_prob(0.30, k=0.75) == pytest.approx(0.775)
 
 
 class TestLegSideTuples:
@@ -758,6 +852,9 @@ class TestMaxAffordablePairs:
             p = MagicMock()
             p.pA, p.pB, p.nA, p.nB = pA, pB, nA, nB
             p.pair_type, p.tradeable, p.max_contracts = pair_type, True, 0
+            # The forecast's input, as enrichment writes it from the books' tops
+            p.mid_spread = (time_series_mid_spread(pA, nA, pB, nB)
+                            if pair_type == "time_series" else None)
             p.canonical_title = f"{pair_type} {pA}/{pB}"
             p.market_a.close_time = now + timedelta(days=15)
             p.market_b.close_time = now + timedelta(days=30)
@@ -1747,6 +1844,8 @@ class TestShippedLiveToggles:
                         continue
                     pair = MagicMock()
                     pair.pA, pair.pB, pair.nA, pair.nB = pA, pB, 1 - pA, nB
+                    # The forecast's input, as enrichment writes it from the books' tops
+                    pair.mid_spread = time_series_mid_spread(pA, 1 - pA, pB, nB)
                     pair.pair_type, pair.tradeable, pair.max_contracts = "time_series", True, 0
                     pair.canonical_title = f"ts {pA}/{pB}/{nB}"
                     pair.market_a.close_time = now + timedelta(days=5)

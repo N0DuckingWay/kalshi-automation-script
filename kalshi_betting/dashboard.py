@@ -8,9 +8,10 @@ Purpose:
     results of a backtest run. Assembles nine sections — portfolio performance
     (equity curve, Sharpe, drawdown, and the selection's empirical k-hat and
     k-hat − k), returns decomposition (by month, category,
-    entry price), calibration analysis (the time-series entry spread
-    pB − pA against the rate settled A = NO, B = YES: Brier score,
-    reliability diagram),
+    entry price), calibration analysis (the time-series entry mid spread —
+    the later market's midpoint minus the earlier one's, a midpoint being
+    halfway between a market's YES ask and its YES bid — against the rate
+    settled A = NO, B = YES: Brier score, reliability diagram),
     interval-discount (k) calibration (the pooled empirical k-hat, and the
     equity curve and per-k table at the filter bar's k and size cap, at the
     primary spread band),
@@ -186,11 +187,14 @@ Dependencies:
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS
     and MAX_DEADLINE_GAP_DAYS (so the filter bar and the scenario explorer's
     tier-off banner name the tier floors and their deadline-gap bounds from
-    config, never as literals), describe_time_series_rule(), fee_per_pair_approx() and
-    time_series_profit_prob() from config.py — the latter is the single
-    definition of the time-series Kelly probability shared with strategy.py
-    and backtester.py, so the Kelly scatter here shows the same fraction the
-    live sizer computes. Imports historical.series_labels (as _series_labels),
+    config, never as literals), describe_time_series_rule(), fee_per_pair_approx(),
+    time_series_mid_spread() and time_series_profit_prob() from config.py —
+    the last two are the single definitions of the time-series forecast's
+    input (the mid spread, which scanner.py and backtester.py work out too
+    and strategy.py reads off the pair through scanner.pair_mid_spread) and
+    of its Kelly probability (which strategy.py and backtester.py call too),
+    so the Kelly scatter here shows the same fraction the live sizer
+    computes. Imports historical.series_labels (as _series_labels),
     the one category/tag filing rule, shared with main.py's live filter,
     scanner.leg_sides, and RiskFreeRates, SOURCE_CACHE and day_numbers from
     treasury.py. Uses plotly, numpy, pandas, and yfinance (all external).
@@ -432,9 +436,12 @@ Notes:
     scheduler's weekly run time at which every simulated trade was opened. The
     fills line after it says how many of the primary scenario's trades walked
     a modeled order book and how many filled at the top of the book, and, with
-    no depth model, that every trade did (_fills_html). Trade rows and the
-    Kelly scatter read what each trade paid (backtester._paid_prices); the
-    entry-price buckets and the spread calibration stay on the entry quotes.
+    no depth model, that every trade did (_fills_html). Trade rows read what
+    each trade paid (backtester._paid_prices); the Kelly scatter prices each
+    trade's legs at what it paid and its forecast at its entry quotes' mid
+    spread (_entry_mid_spread); the entry-price buckets stay on the entry
+    quotes, and the spread calibration scores their mid spread
+    (_entry_mid_spread again), never the prices paid.
 
     The scenario explorer's heatmap, fragility banner and equity curve read
     the "time_series" population — every time-series entry simulated alone,
@@ -522,6 +529,7 @@ from .config import (
     TRADING_DAYS_PER_YEAR,
     describe_time_series_rule,
     fee_per_pair_approx,
+    time_series_mid_spread,
     time_series_profit_prob,
 )
 from .historical import series_labels as _series_labels
@@ -1038,21 +1046,24 @@ def _spread_observations(trades: list[BacktestTrade]) -> list[tuple[float, int]]
     """
     The time-series spread calibration's observations, one per time-series trade.
 
-    The prediction is the entry spread pB − pA, from the two YES-ask quotes at
-    entry (not the prices paid): the market-implied probability
-    that the event first happens between the two deadlines. The outcome is 1
-    when the pair settled A = NO, B = YES (the in-between cell, where both legs
-    lose) and 0 otherwise. Same-title trades are left out — their price gap is
-    not the probability of anything.
+    The prediction is the entry mid spread: the later market's midpoint minus
+    the earlier one's at the four entry quotes (_entry_mid_spread; a market's
+    midpoint is halfway between its YES ask and its YES bid), never the prices
+    paid — the market-implied probability that the event first happens
+    between the two deadlines, and the input the forecast reads. The outcome
+    is 1 when the pair settled A = NO, B = YES (the in-between cell, where
+    both legs lose) and 0 otherwise. Same-title trades are left out — their
+    price gap is not the probability of anything.
 
     Args:
         trades (list[BacktestTrade]): Completed trades of either pair type.
 
     Returns:
-        list[tuple[float, int]]: (spread, in_between) per time-series trade, in
-            list order; empty when there is none.
+        list[tuple[float, int]]: (mid spread, in_between) per time-series
+            trade, in list order; empty when there is none.
     """
-    return [(t.entry_pB - t.entry_pA,
+    # The same mid spread the backtest's Kelly gate forecast the trade at
+    return [(_entry_mid_spread(t),
              1 if (t.outcome_a, t.outcome_b) == ("no", "yes") else 0)
             for t in trades if t.pair_type == "time_series"]
 
@@ -1114,25 +1125,27 @@ def _score_text(value: float | None) -> str:
 
 
 def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
-                    k: float | None = None) -> float:
+                    k: float | None = None, *, spread: float | None = None) -> float:
     """
     Uncapped Kelly fraction f* = p - (1-p)/b for one pair trade.
 
-    Mirrors strategy._kelly_p and strategy.compute_trade so the dashboard scatter
-    shows the same theoretical Kelly the live sizer would compute (before the
-    per-pair cap, config.pair_size_cap) — including the fee-inclusive Kelly denominator
-    b = net_spread / (price_a + price_b + fee), since the losing cell loses the
-    fee too (DR-62). The legs are mapped exactly like scanner.leg_prices:
-    a same_title pair costs nA + pB (NO on A, YES on B) and is priced on the
-    SAME_TITLE_CO_RESOLVE_PROB prior; a time_series pair costs pA + nB (YES on
-    the earlier contract A, NO on the later contract B) and is priced on
-    config.time_series_profit_prob(pA, pB) — one minus the discounted
-    market-implied probability of the single loss cell (A=NO, B=YES; the event
-    first happens between the deadlines). The two win cells are event by A
-    (A=YES, hence B=YES) and never by B (A=NO, B=NO); A=YES/B=NO is impossible
-    for a cumulative-deadline pair, a premise both pair-finders now screen for
-    in the legs' wording (scanner.deadline_phrasing). Returns 0.0 when there is
-    no edge.
+    Mirrors strategy._kelly_p_at and strategy.compute_trade so the dashboard
+    scatter shows the same theoretical Kelly the live sizer would compute
+    (before the per-pair cap, config.pair_size_cap) — including the
+    fee-inclusive Kelly denominator b = net_spread / (price_a + price_b + fee),
+    since the losing cell loses the fee too (DR-62). The legs are mapped
+    exactly like scanner.leg_prices: a same_title pair costs nA + pB (NO on A,
+    YES on B) and is priced on the SAME_TITLE_CO_RESOLVE_PROB prior; a
+    time_series pair costs pA + nB (YES on the earlier contract A, NO on the
+    later contract B) and is priced on config.time_series_profit_prob of its
+    mid spread (config.time_series_mid_spread: the later market's midpoint
+    minus the earlier one's, a midpoint being halfway between a market's YES
+    ask and its YES bid) — one minus the discounted market-implied probability
+    of the single loss cell (A=NO, B=YES; the event first happens between the
+    deadlines). The two win cells are event by A (A=YES, hence B=YES) and never
+    by B (A=NO, B=NO); A=YES/B=NO is impossible for a cumulative-deadline pair,
+    a premise both pair-finders now screen for in the legs' wording
+    (scanner.deadline_phrasing). Returns 0.0 when there is no edge.
 
     The optional k must be whatever interval discount the plotted trades were
     actually SIZED at (backtester.SweepPoint.k). Leaving it None on a run that
@@ -1141,9 +1154,10 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
 
     Args:
         pA (float): YES ask price of market A at entry (a leg price for time_series).
-        nA (float): NO ask price of market A at entry (a leg price for same_title).
+        nA (float): NO ask price of market A at entry (a leg price for same_title;
+            gives market A's YES bid in the time_series mid spread).
         pB (float): YES ask price of market B at entry (a leg price for same_title;
-            feeds the probability model for time_series).
+            feeds the time_series mid spread).
         nB (float): NO ask price of market B at entry (a leg price for time_series).
         pair_type (str): "time_series" or "same_title" — selects the leg prices
             and the probability model; anything else is treated as same_title,
@@ -1154,15 +1168,24 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
             config.TIME_SERIES_INTERVAL_PROB_DISCOUNT (config.py's k, which
             the backtest defaults to; live sizing reads the saved live
             defaults' k). Ignored for same_title, which prices on a fixed prior.
+        spread (float | None): Keyword-only. The time_series mid spread to
+            forecast at; None (default) reads it from the four quotes given.
+            A caller whose four hold fills in place of quotes hands in the
+            entry quotes' own (_entry_mid_spread), as the live sizer prices
+            its legs at the fills and its forecast at the book's tops.
+            Ignored for same_title.
 
     Returns:
         float: Uncapped Kelly fraction, clamped to be >= 0.
     """
     if pair_type == "time_series":
         price_a, price_b = pA, nB
-        # Shared definition with strategy._kelly_p / backtester._simulate_at_discount
+        # The forecast's input (DR-78): these four quotes' mid spread, unless
+        # the caller hands in the entry quotes' own (its four may hold fills)
+        spread = time_series_mid_spread(pA, nA, pB, nB) if spread is None else spread
+        # Shared definition with strategy._kelly_p_at / backtester._simulate_at_discount
         # so the dashboard can never show a Kelly the live sizer would not compute
-        p = time_series_profit_prob(pA, pB, k=k)
+        p = time_series_profit_prob(spread, k=k)
     else:
         price_a, price_b = nA, pB
         p = SAME_TITLE_CO_RESOLVE_PROB
@@ -1179,6 +1202,29 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
     b = net_spread / (cost + fee_approx)
     q = 1.0 - p
     return max(0.0, p - q / b)
+
+
+def _entry_mid_spread(t: BacktestTrade) -> float | None:
+    """
+    A time-series trade's mid spread at its entry quotes; None for same-title.
+
+    The forecast's input on the Monday the trade was entered: the later
+    market's midpoint minus the earlier one's over entry_pA, entry_nA,
+    entry_pB and entry_nB (config.time_series_mid_spread), the quotes the
+    backtest's Kelly gate priced it at, whatever the trade then paid. The
+    Kelly scatter (_kelly_points) forecasts each trade at it, and the spread
+    calibration (_spread_observations) scores it.
+
+    Args:
+        t (BacktestTrade): A trade.
+
+    Returns:
+        float | None: The mid spread in dollars; None for a same_title trade.
+    """
+    if t.pair_type != "time_series":
+        return None
+    # The one definition the live sizer's forecast and the Kelly gate read
+    return time_series_mid_spread(t.entry_pA, t.entry_nA, t.entry_pB, t.entry_nB)
 
 
 # ─── Section builders ─────────────────────────────────────────────────────────
@@ -1750,9 +1796,9 @@ def _reliability(trades: list[BacktestTrade]) -> dict:
     Compute the spread-calibration figures: Brier score, log loss and the
     reliability diagram's points.
 
-    Each time-series trade contributes one prediction — its entry spread
-    pB − pA, the market-implied probability that the event lands between the
-    two deadlines — against whether the pair settled A = NO, B = YES
+    Each time-series trade contributes one prediction — its entry mid spread,
+    the market-implied probability that the event lands between the two
+    deadlines — against whether the pair settled A = NO, B = YES
     (_spread_observations). Same-title trades contribute nothing. The diagram
     bins the predictions into 10 equal-width probability bins and keeps the
     non-empty ones.
@@ -1763,7 +1809,7 @@ def _reliability(trades: list[BacktestTrade]) -> dict:
     Returns:
         dict: "brier" and "log_loss" (_brier_score / _log_loss, None with no
             time-series trade), and per non-empty bin, in ascending order:
-            "mean_pred" (mean spread), "mean_act" (share that settled in
+            "mean_pred" (mean mid spread), "mean_act" (share that settled in
             between), "counts" (trades in the bin), "labels" ("0.3–0.4"), and
             how the diagram draws each bin: "sizes" (marker px) and "texts"
             (hover).
@@ -1816,9 +1862,10 @@ def _calibration_title(brier: float | None, log_loss: float | None) -> str:
 
 
 _CALIBRATION_CAPTION = (
-    '<p style="color:#666;font-size:13px">Time-series trades only: the entry spread '
-    "pB − pA — the market-implied probability that the event lands between the two "
-    "deadlines — against how often the pair settled A = NO, B = YES.</p>"
+    '<p style="color:#666;font-size:13px">Time-series trades only: the entry mid '
+    "spread (B's midpoint minus A's; a midpoint is halfway between a market's YES ask "
+    "and its YES bid) — the market-implied probability that the event lands between the "
+    "two deadlines — against how often the pair settled A = NO, B = YES.</p>"
 )
 
 
@@ -1827,8 +1874,9 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
     Build the "Calibration Analysis" HTML section.
 
     Computes Brier score and log loss KPIs and renders a reliability diagram
-    of the time-series entry spread pB − pA against the rate the pairs settled
-    A = NO, B = YES, per bin (_reliability). Same-title trades are not shown;
+    of the time-series entry mid spread (_entry_mid_spread) against the rate
+    the pairs settled A = NO, B = YES, per bin (_reliability). Same-title
+    trades are not shown;
     a selection without a time-series trade shows "—" cards and an empty
     diagram.
 
@@ -1856,7 +1904,7 @@ def _section_calibration(trades: list[BacktestTrade]) -> str:
     ))
     fig_cal.update_layout(
         title=_calibration_title(brier, ll),
-        xaxis_title="Predicted probability: spread pB − pA",
+        xaxis_title="Predicted probability: mid spread",
         yaxis_title="Actual rate settled A = NO, B = YES",
         xaxis={"range": [0, 1]}, yaxis={"range": [0, 1]},
     )
@@ -2078,6 +2126,14 @@ _KD_TEXT = {
                "(the log names the error): it shows the run's own k and size cap."),
 }
 
+# The grey caption under the interval-discount section's calibration table:
+# what its "Mean implied gap" column holds — the mid spread, the quantity the
+# forecast's k multiplies, so the table's k-hat compares with k directly
+_KD_GAP_CAPTION = (
+    "<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
+    "k&#770; = realised in-between rate ÷ mean implied gap, where a pair's implied "
+    "gap is its mid spread (B's midpoint minus A's).</p>")
+
 # What live trading reads for k and for the tier floors, as the page's captions
 # name it: the saved live defaults, which a main.py flag overrides for one run
 _LIVE_K_READ = ("the saved live defaults' k (main.py --interval-discount overrides it for "
@@ -2090,7 +2146,8 @@ _LIVE_TIER_FLOORS_READ = ("the saved live defaults' tier floors (main.py --tier-
 # they follow the filter bar.
 _KHAT_CARDS_CAPTION = (
     "<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
-    "Empirical k&#770; = realised in-between rate ÷ mean market-implied gap (pB − pA), "
+    "Empirical k&#770; = realised in-between rate ÷ mean market-implied gap at the midpoints "
+    "(a market's midpoint is halfway between its YES ask and its YES bid), "
     "over every time-series candidate entry at the spread band shown, in the category or "
     "tag selected — measured before the Kelly gate, so it depends on neither k nor the "
     "size cap. k&#770; − k is that figure minus the k shown: positive means the in-between "
@@ -2137,9 +2194,12 @@ def _khat_delta(khat: float | None, k: float | None) -> tuple[str, str]:
     and its number is _khat_delta_value's — the scenario explorer's k-hat − k
     heatmap cells' too — so no two can round or colour it differently.
 
-    p = 1 − k·(pB − pA), so a LARGER k is the more conservative belief: a
+    p = 1 − k·(the mid spread), so a LARGER k is the more conservative belief: a
     k-hat above k means the in-between cell landed more often than the sizer
-    assumed — it sized too big — which is red; zero or below is green.
+    assumed — it sized too big — which is red; zero or below is green. Both
+    are fractions of the mid spread: k-hat is the realised in-between rate
+    divided by it (backtester._interval_calibration) and the sizer's k
+    multiplies it, so the two compare directly.
 
     The difference is rounded to the three decimals shown BEFORE its sign
     and colour are read, so the text and the colour always describe the same
@@ -2465,7 +2525,9 @@ def _section_interval_discount(
          kpi-kd_delta, _khat_delta).
       2. The calibration table — one row per deadline-gap bucket plus the
          pooled row, showing n, the realised in-between rate, the mean
-         market-implied gap, and that bucket's k-hat.
+         market-implied gap at the midpoints (the mean mid spread), and that
+         bucket's k-hat — with a grey caption under it saying k-hat is the
+         realised in-between rate divided by that mean (_KD_GAP_CAPTION).
       3. ONE equity curve (div id "kd-equity"), at the k and size cap shown,
          followed by a table of each k's trade count, total return, final
          balance, max drawdown and Sharpe at that size cap (tbody "kd-rows",
@@ -2613,6 +2675,8 @@ def _section_interval_discount(
   <th style="padding:8px 16px;">k&#770;</th>
 </tr>
 """ + "".join(_crow(b) for b in [*cal.buckets, cal.pooled]) + "</table>"
+        # Under the table: what the "Mean implied gap" column is
+        cal_table += _KD_GAP_CAPTION
 
         if cal.excluded_premise_violations:
             # Summary-line idiom, silent at zero — mirrors _log_interval_calibration.
@@ -2805,8 +2869,9 @@ def _khat_stat(observations) -> dict:
     Returns:
         dict: "n" (entries), "events" (distinct market-A event tickers; a
             missing ticker counts as one "" event), "rate" (realised
-            in-between rate), "implied" (mean market-implied gap), "k"
-            (k-hat, None when the implied gap is not positive), plus "text"
+            in-between rate), "implied" (mean market-implied gap at the
+            midpoints, the mean mid spread), "k" (k-hat, None when the
+            implied gap is not positive), plus "text"
             and "cells" (_khat_finish). The event count is a better guide
             to how much evidence a bar holds than the entry count — the
             rungs of one ladder share one event and settle together — but it
@@ -3013,7 +3078,8 @@ def _section_khat(payload: dict | None, k_used: float | None) -> str:
     Build the "Empirical k̂ by Category, Tag and Spread Band" section.
 
     k-hat is the realised in-between rate divided by the mean market-implied
-    gap (pB − pA), over every time-series candidate ENTRY at a band — the
+    gap at the midpoints (the mid spread, which the forecast's k multiplies
+    too), over every time-series candidate ENTRY at a band — the
     population backtester._interval_calibration pools (k-independent, before
     the Kelly gate, premise violations excluded), regrouped here. One chart
     and one table, driven by the page-wide filter bar — its band, its Tier
@@ -3055,7 +3121,7 @@ def _section_khat(payload: dict | None, k_used: float | None) -> str:
     title = _SECTION_STYLE.format(title="Empirical k̂ by Category, Tag and Spread Band")
     intro = (
         "<p style='font-family:sans-serif;font-size:13px;color:#616161;'>"
-        "k&#770; = realised in-between rate ÷ mean market-implied gap (pB − pA), over "
+        "k&#770; = realised in-between rate ÷ mean market-implied gap at the midpoints, over "
         "every time-series candidate entry at the band — measured before the Kelly gate, "
         "so it covers entries the run never traded, and independent of k; premise "
         "violations (earlier YES, later NO) are excluded. Follows the filter bar above, "
@@ -5457,13 +5523,14 @@ def _quotes_at_fills(t: BacktestTrade) -> tuple[float, float, float, float]:
     """
     A trade's four quotes, with the two legs it bought replaced by what it paid.
 
-    What the live sizer prices a trade at: the leg prices are the average the
-    trade paid (backtester._paid_prices), while the other market's YES ask
-    stays the quote, since the time-series probability model reads it as the
-    reference. For a time_series trade that is (YES fill on A, A's NO quote,
-    B's YES quote, NO fill on B); for a same_title trade (A's YES quote, NO
-    fill on A, YES fill on B, B's NO quote). A trade built without fills pays
-    its quotes, so this returns them unchanged.
+    What the live sizer prices a trade's legs at: the leg prices are the
+    average the trade paid (backtester._paid_prices), while the other two
+    quotes stay as they were at entry. For a time_series trade that is (YES
+    fill on A, A's NO quote, B's YES quote, NO fill on B); for a same_title
+    trade (A's YES quote, NO fill on A, YES fill on B, B's NO quote). A trade
+    built without fills pays its quotes, so this returns them unchanged. The
+    time-series forecast reads the entry quotes' own mid spread
+    (_entry_mid_spread), never these mixed four.
 
     Args:
         t (BacktestTrade): A trade.
@@ -5482,6 +5549,11 @@ def _kelly_points(trades: list[BacktestTrade],
     """
     Compute the Kelly-vs-actual scatter's two coordinates, one pair per trade.
 
+    The Kelly fraction prices a trade's legs at what it paid and a
+    time-series trade's forecast at its entry quotes' mid spread, as the
+    live sizer prices the legs at the fills and the forecast at the book's
+    tops.
+
     Args:
         trades (list[BacktestTrade]): Completed trades; may be empty.
         k (float | None): The interval discount the trades were SIZED at,
@@ -5496,11 +5568,13 @@ def _kelly_points(trades: list[BacktestTrade],
             value is not positive), each in trade order.
     """
     # The four quotes with the legs at the prices paid (_quotes_at_fills) —
-    # _kelly_fraction picks the leg prices per pair type — plus the run's
+    # _kelly_fraction picks the leg prices per pair type — the forecast at
+    # the entry quotes' mid spread (_entry_mid_spread), and the run's
     # interval discount, so an --interval-discount run plots the Kelly its
     # trades were actually sized at rather than the config one
     kelly_fracs = [
-        _kelly_fraction(*_quotes_at_fills(t), t.pair_type, k=k)
+        _kelly_fraction(*_quotes_at_fills(t), t.pair_type, k=k,
+                        spread=_entry_mid_spread(t))
         for t in trades
     ]
     # The actual fraction uses the portfolio value at each trade's entry
