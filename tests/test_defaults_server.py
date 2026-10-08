@@ -67,6 +67,7 @@ import os
 import pkgutil
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -756,6 +757,17 @@ class TestCheckout:
         assert headers["X-Frame-Options"] == "DENY"
 
 
+class TestPortsApart:
+    """The live dashboard's two ports are other web origins than this server's."""
+
+    def test_the_live_dashboard_s_tab_page_has_a_port_of_its_own(self):
+        assert config.LIVE_DASHBOARD_PORT != config.DEFAULTS_SERVER_PORT
+
+    def test_the_live_dashboard_s_backtest_page_has_a_port_of_its_own(self):
+        assert config.LIVE_BACKTEST_PORT != config.DEFAULTS_SERVER_PORT
+        assert config.LIVE_BACKTEST_PORT != config.LIVE_DASHBOARD_PORT
+
+
 class TestCodeFingerprint:
     """_code_fingerprint (a SHA-256 over the package's .py files) and _LOADED_CODE."""
 
@@ -1359,6 +1371,24 @@ class TestSave:
     def test_the_origin_must_be_this_server(self, origin):
         app = _app()
         form = _page_form(app, _query())
+        assert _post(app, form, origin=origin).status == 403
+        assert config.read_saved_live_defaults() is None
+
+    def test_the_live_dashboard_s_tab_page_cannot_save(self):
+        # The live dashboard's tab page (its own port, so its own web origin)
+        # is refused as any other page is
+        app = _app()
+        form = _page_form(app, _query())
+        origin = f"http://{config.LIVE_DASHBOARD_HOST}:{config.LIVE_DASHBOARD_PORT}"
+        assert _post(app, form, origin=origin).status == 403
+        assert config.read_saved_live_defaults() is None
+
+    def test_the_backtest_page_in_the_live_dashboard_cannot_save(self):
+        # The backtest page the live dashboard serves on its second port is
+        # another origin too, so a script on it cannot press Confirm and save
+        app = _app()
+        form = _page_form(app, _query())
+        origin = f"http://{config.LIVE_DASHBOARD_HOST}:{config.LIVE_BACKTEST_PORT}"
         assert _post(app, form, origin=origin).status == 403
         assert config.read_saved_live_defaults() is None
 
@@ -3548,6 +3578,15 @@ class TestMain:
         assert server.closed
         assert "Defaults server stopped" in log
 
+    def test_it_turns_ctrl_c_back_on(self, run_main, monkeypatch):
+        # start_dashboard.sh starts it in the background, where a job begins
+        # with Ctrl-C ignored: main makes Ctrl-C stop it again, first of all
+        calls = []
+        monkeypatch.setattr(defaults_server.signal, "signal",
+                            lambda signum, handler: calls.append((signum, handler)))
+        run_main["run"](["--no-browser"])
+        assert calls == [(signal.SIGINT, signal.default_int_handler)]
+
 
 @pytest.fixture
 def busy_port(tmp_path, monkeypatch):
@@ -3902,7 +3941,7 @@ class TestIsolation:
     _STDLIB_ALLOWED = frozenset({
         "argparse", "base64", "collections", "dataclasses", "datetime", "errno", "fcntl",
         "hashlib", "hmac", "html", "http", "json", "logging", "math", "os", "pathlib", "re",
-        "secrets", "subprocess", "sys", "urllib", "webbrowser"})
+        "secrets", "signal", "subprocess", "sys", "urllib", "webbrowser"})
 
     @classmethod
     def _import_problems(cls, tree) -> list[str]:

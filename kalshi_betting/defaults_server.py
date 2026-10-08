@@ -151,6 +151,7 @@ import math
 import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import urllib.request
@@ -3361,8 +3362,10 @@ def main(argv: list[str] | None = None) -> None:
     """
     Run the defaults server until Ctrl-C, or reopen this checkout's server's page.
 
-    It binds DEFAULTS_SERVER_HOST:DEFAULTS_SERVER_PORT first. When the port
-    is taken it binds nothing and starts nothing: if the listener is this
+    It turns Ctrl-C back on first (start_dashboard.sh starts it in the
+    background, where a job begins with Ctrl-C ignored), then binds
+    DEFAULTS_SERVER_HOST:DEFAULTS_SERVER_PORT. When the port is taken it
+    binds nothing and starts nothing: if the listener is this
     checkout's own defaults server running this checkout's current code (its
     GET /checkout names this resolved PROJECT_ROOT and this code's
     fingerprint), it opens the page asked for and returns; if it is that
@@ -3407,6 +3410,10 @@ def main(argv: list[str] | None = None) -> None:
         help="Open nothing; only log the address to open",
     )
     args = parser.parse_args(argv)
+    # start_dashboard.sh starts it in the background, where a job begins with
+    # Ctrl-C ignored; Ctrl-C must stop it through the KeyboardInterrupt below,
+    # so the runs still going are named
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     base = f"http://{DEFAULTS_SERVER_HOST}:{DEFAULTS_SERVER_PORT}"
     try:
         # One request at a time, so two saves or two starts can never interleave

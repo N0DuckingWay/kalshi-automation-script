@@ -175,7 +175,8 @@ Dependencies:
     SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS (_run_sell_task; the last also
     names the Sell select's rule, _sell_select_title) — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
-    page's file name, which defaults_server also opens), DASHBOARD_FILES_DIRNAME
+    page's file name, which defaults_server opens when run on its own and
+    live_dashboard serves as its Backtest tab), DASHBOARD_FILES_DIRNAME
     and DASHBOARD_BUILD_STALE_SECONDS (the sidecar folder beside it, and when
     a build folder still marked as being written is abandoned),
     CONTRACT_PAYOUT_DOLLARS (named in the Sell select's title), DEFAULTS_SERVER_HOST
@@ -198,7 +199,9 @@ Dependencies:
     the one category/tag filing rule, shared with main.py's live filter,
     scanner.leg_sides, and RiskFreeRates, SOURCE_CACHE and day_numbers from
     treasury.py. Uses plotly, numpy, pandas, and yfinance (all external).
-    Called by backtest.py after run_backtest_sweep() completes.
+    Called by backtest.py after run_backtest_sweep() completes;
+    live_portfolio.py imports its _sharpe and _sortino, so the Live trading
+    tab's ratios are this page's own.
 
 Notes:
     The HTML file loads Plotly.js from the CDN (cdn.plot.ly), so an internet
@@ -811,6 +814,9 @@ def _sharpe(daily_returns: pd.Series, rf: float | np.ndarray = 0.0, *,
     TRADING_DAYS_PER_YEAR explicitly. The parameter is keyword-only so it can
     never be passed positionally into `rf`'s slot. Every call on the page
     passes `rf` (_rf_hurdle, or _rf_hurdle_invested on the ^GSPC row).
+    live_portfolio.period_stats (the live dashboard's Live trading tab) calls
+    it too, over whole days, passing CALENDAR_DAYS_PER_YEAR explicitly and,
+    as `rf`, the yield on the share of the account held in positions.
 
     Args:
         daily_returns (pd.Series): Series of per-period fractional returns
@@ -821,9 +827,10 @@ def _sharpe(daily_returns: pd.Series, rf: float | np.ndarray = 0.0, *,
         periods_per_year (int): Periods per year in `daily_returns`. Must be
             positive; not validated, since every value that reaches it is a
             config constant — every in-module call site but one takes the
-            CALENDAR_DAYS_PER_YEAR default and the other (_section_benchmark's
-            ^GSPC row) passes TRADING_DAYS_PER_YEAR explicitly. Defaults to
-            CALENDAR_DAYS_PER_YEAR (365).
+            CALENDAR_DAYS_PER_YEAR default, the other (_section_benchmark's
+            ^GSPC row) passes TRADING_DAYS_PER_YEAR explicitly, and
+            live_portfolio.period_stats passes CALENDAR_DAYS_PER_YEAR.
+            Defaults to CALENDAR_DAYS_PER_YEAR (365).
 
     Returns:
         float: Annualized Sharpe ratio; 0.0 when daily_returns never varies
@@ -858,7 +865,8 @@ def _sortino(daily_returns: pd.Series, rf: float | np.ndarray = 0.0, *,
     trading-day series such as the ^GSPC benchmark. It defaults to the calendar
     base for the same reason _sharpe does — every in-module caller of this
     helper consumes the calendar-day equity curve — and is keyword-only so it
-    can never land in `rf`'s positional slot.
+    can never land in `rf`'s positional slot. live_portfolio.period_stats (the
+    Live trading tab) calls it too, over whole days, as it calls _sharpe.
 
     Args:
         daily_returns (pd.Series): Series of per-period fractional returns.
@@ -866,8 +874,9 @@ def _sortino(daily_returns: pd.Series, rf: float | np.ndarray = 0.0, *,
             or one per period, POSITIONALLY aligned with daily_returns.
             Defaults to 0.0.
         periods_per_year (int): Periods per year in `daily_returns`. Must be
-            positive; not validated, since both of its call sites take the
-            default. Defaults to CALENDAR_DAYS_PER_YEAR (365).
+            positive; not validated, since both of its in-module call sites
+            take the default and live_portfolio.period_stats passes
+            CALENDAR_DAYS_PER_YEAR. Defaults to CALENDAR_DAYS_PER_YEAR (365).
 
     Returns:
         float: Annualized Sortino ratio; 0.0 when daily_returns never varies
