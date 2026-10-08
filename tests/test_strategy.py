@@ -2773,6 +2773,8 @@ class TestTimeSeriesKellyParity:
             "TRADE_CATEGORIES",
             "TRADE_TAGS",
             "ADD_TO_HELD_PAIRS",
+            "SELL_AT",
+            "SELL_MIN_DAYS",
         } | self._SAVED_FILE_INTERNALS
         resolver = "live_settings"
         # (module, exempted name) -> references found, so no exemption outlives its use

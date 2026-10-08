@@ -509,16 +509,17 @@ TAKE_PROFIT_HOLD_DAYS = 3
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
-# Eight live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
-# TRADE_CATEGORIES, TRADE_TAGS and ADD_TO_HELD_PAIRS below; k, BUDGET_FRACTION
-# and SAME_TITLE_SIZE_CAP above). They are NOT the live defaults: a live run starts
-# only from the saved ones (LIVE_DEFAULTS_FILE, below) and never falls back to
-# these. They are the backtest's k and caps (backtester and backtest bind them
-# by value), and what live_settings() returns: the settings a live entry point
-# falls back to when a caller hands it none, which only tests and direct
-# library calls do. No live module reads them but through LiveSettings (see
-# there). tests/test_config.py::TestShippedLiveToggles pins the values; see
-# CLAUDE.md: "The live defaults of 2026-09-27 — decision record".
+# Ten live toggles (TIME_SERIES_TIER_FLOORS, TIME_SERIES_SPREAD_BAND,
+# TRADE_CATEGORIES, TRADE_TAGS, ADD_TO_HELD_PAIRS, SELL_AT and SELL_MIN_DAYS
+# below; k, BUDGET_FRACTION and SAME_TITLE_SIZE_CAP above). They are NOT the
+# live defaults: a live run starts only from the saved ones (LIVE_DEFAULTS_FILE,
+# below) and never falls back to these. They are the backtest's k and caps
+# (backtester and backtest bind them by value), and what live_settings()
+# returns: the settings a live entry point falls back to when a caller hands it
+# none, which only tests and direct library calls do. No live module reads them
+# but through LiveSettings (see there). tests/test_config.py::TestShippedLiveToggles
+# pins the values; see CLAUDE.md: "The live defaults of 2026-09-27 — decision
+# record".
 
 # Whether the time-series entry rule applies the deadline-gap tier floors
 # (MIN_PRICE_DIFF_SHORT_GAP / MIN_PRICE_DIFF_LONG_GAP): True -> pB - pA must
@@ -571,6 +572,26 @@ TRADE_TAGS: tuple[str, ...] | None = None
 # constant.
 ADD_TO_HELD_PAIRS = True
 
+# The share of its potential profit at which a held position is to be sold,
+# on a 1% grid in (0, 1] (like TAKE_PROFIT_LEVELS, the backtest's sell
+# levels), or None to never sell. None here is config.py's value (the
+# no-settings fallback), never a live run's defaults: a live run reads the
+# saved live defaults' sell_at instead (a saved file that leaves the key out
+# reads it as None), which main.py --sell-at / --no-sell overrides for one run.
+SELL_AT: float | None = None
+
+# The fewest whole days a position must have left before its last market
+# stops trading to be sold, or None for no minimum. It only means something
+# with a sell level (SELL_AT): LiveSettings refuses a minimum without one. A
+# live run reads the saved live defaults' sell_min_days instead, which
+# main.py --sell-min-days / --no-sell-min-days overrides for one run.
+SELL_MIN_DAYS: int | None = None
+
+# The sell level's grid: SELL_AT, the saved live defaults' sell_at and main.py's
+# --sell-at (in whole percent) must each be a multiple of it from 1% to 100%,
+# as TAKE_PROFIT_LEVELS are.
+SELL_AT_STEP = 0.01
+
 # The size caps' grid: BUDGET_FRACTION, SAME_TITLE_SIZE_CAP, the saved live
 # defaults' two caps and main.py's --size-cap / --same-title-size-cap (in
 # percent) must each be a multiple of it
@@ -586,8 +607,9 @@ LIVE_EXPOSURE_WARN_FRACTION = 0.20
 
 # ── Saved live defaults ───────────────────────────────────────────────────────
 
-# The live defaults every live run starts from: one JSON record of the eight
-# live toggles (add_to_held_pairs may be left out, and then reads as off),
+# The live defaults every live run starts from: one JSON record of the ten
+# live toggles (add_to_held_pairs, sell_at and sell_min_days may be left out,
+# and then each reads as off),
 # saved through defaults_server's confirmation page
 # (python3 -m kalshi_betting.defaults_server; its --seed proposes
 # LIVE_DEFAULTS_SEED for a first save). save_live_defaults writes it, on that
@@ -2346,6 +2368,37 @@ def _step_cap(value, name: str) -> float:
     return round(SIZE_CAP_STEP * steps, 2)
 
 
+def _step_share(value, name: str) -> float:
+    """
+    Validate a sell level and normalise it onto the SELL_AT_STEP grid.
+
+    Normalised with round(SELL_AT_STEP * steps, 2), so a level from any source
+    is float-equal to the same percent over 100 (0.85 for 85%), which is also
+    how config.TAKE_PROFIT_LEVELS spells its levels.
+
+    Args:
+        value: The level, a real number in (0, 1].
+        name (str): The field's name, for the error message.
+
+    Returns:
+        float: The level on the grid.
+
+    Raises:
+        ValueError: If the value is not a real number (a bool and NaN are not),
+            is outside (0, 1], or is not a whole number (one or more) of
+            SELL_AT_STEPs.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real) or not 0.0 < value <= 1.0:
+        raise ValueError(f"{name} must be in (0, 1], got {value!r}")
+    steps = round(value / SELL_AT_STEP)
+    # steps < 1: a positive level within PRICE_EPSILON of 0 would otherwise
+    # pass the multiple test as zero steps and return 0.0, below the grid
+    if steps < 1 or abs(value - steps * SELL_AT_STEP) > PRICE_EPSILON:
+        raise ValueError(f"{name} must be a multiple of {SELL_AT_STEP:.0%} "
+                         f"from {SELL_AT_STEP:.0%} to 100%, got {value!r}")
+    return round(SELL_AT_STEP * steps, 2)
+
+
 def _names(value, name: str) -> tuple[str, ...] | None:
     """
     Validate a category or tag filter and normalise it to a tuple of names.
@@ -2421,6 +2474,15 @@ class LiveSettings:
             side on each), with Kelly sizing the whole position; a real bool.
             Default False, which is also what a saved file that leaves it out
             reads as.
+        sell_at (float | None): The share of its potential profit at which a
+            held position is sold, on the SELL_AT_STEP (1%) grid in (0, 1];
+            None (default) never sells, which is also what a saved file that
+            leaves it out reads as.
+        sell_min_days (int | None): The fewest whole days (1 or more, a real
+            int) a position must have left before its last market stops
+            trading to be sold; None (default) sets no minimum, which is also
+            what a saved file that leaves it out reads as. Needs sell_at: a
+            minimum with no sell level is refused.
         origin (str): Where these toggles' defaults were read: the saved defaults
             file with when (and from what) it was saved, or LIVE_DEFAULTS_FROM_CONFIG
             for toggles built from this module's constants (the default).
@@ -2438,6 +2500,8 @@ class LiveSettings:
     categories: tuple[str, ...] | None = None
     tags: tuple[str, ...] | None = None
     add_to_held_pairs: bool = False
+    sell_at: float | None = None
+    sell_min_days: int | None = None
     origin: str = field(default=LIVE_DEFAULTS_FROM_CONFIG, compare=False)
 
     def __post_init__(self) -> None:
@@ -2475,6 +2539,19 @@ class LiveSettings:
         if type(self.add_to_held_pairs) is not bool:
             raise ValueError(
                 f"add_to_held_pairs must be True or False, got {self.add_to_held_pairs!r}")
+        # None means never sell; a level is a real number on the 1% grid (a
+        # bool, which Python counts as an int, is refused by _step_share)
+        if self.sell_at is not None:
+            object.__setattr__(self, "sell_at", _step_share(self.sell_at, "sell_at"))
+        if self.sell_min_days is not None:
+            # type() is int: a bool, a float such as 1.0 and a numpy integer
+            # are all refused
+            if type(self.sell_min_days) is not int or self.sell_min_days < 1:
+                raise ValueError("sell_min_days must be a whole number of days, 1 or more, "
+                                 f"got {self.sell_min_days!r}")
+            if self.sell_at is None:
+                raise ValueError("sell_min_days needs a sell level (sell_at), got "
+                                 f"sell_min_days {self.sell_min_days!r} with sell_at None")
         # One printable line: no newline, control, zero-width or text-direction
         # character, so it prints on one log line and cannot pass for other
         # text. Printable is not HTML-safe: a web page must still escape it
@@ -2483,15 +2560,15 @@ class LiveSettings:
             raise ValueError(f"origin must be a printable description, got {self.origin!r}")
 
 
-# The eight toggles by field name: every LiveSettings field except origin
+# The ten toggles by field name: every LiveSettings field except origin
 LIVE_TOGGLE_FIELDS = tuple(f.name for f in fields(LiveSettings) if f.compare)
 
 # Toggles a saved file may leave out. A missing one reads as its LiveSettings
-# default (add_to_held_pairs: off, whatever config.py ships), because nobody
-# confirmed a value for it in that file. save_live_defaults leaves one out
-# while it is at its default, so such a file can still be read by code that
-# does not know the toggle.
-_OPTIONAL_TOGGLES = ("add_to_held_pairs",)
+# default (add_to_held_pairs: off, sell_at: never sell, sell_min_days: no
+# minimum, whatever config.py ships), because nobody confirmed a value for it
+# in that file. save_live_defaults leaves one out while it is at its default,
+# so such a file can still be read by code that does not know the toggle.
+_OPTIONAL_TOGGLES = ("add_to_held_pairs", "sell_at", "sell_min_days")
 # Each of those toggles' LiveSettings default
 _TOGGLE_DEFAULTS = {f.name: f.default for f in fields(LiveSettings)
                     if f.name in _OPTIONAL_TOGGLES}
@@ -2499,7 +2576,8 @@ _TOGGLE_DEFAULTS = {f.name: f.default for f in fields(LiveSettings)
 # The values `python3 -m kalshi_betting.defaults_server --seed` offers for a
 # first save of the live defaults: tier floors off, spread band 0-0.5, k 0.80,
 # a 10% per-trade cap, a 20% same-title cap, any category or tag, and adding
-# to held pairs on. One pair stakes at most 10% of the portfolio value; an
+# to held pairs on; it never sells (sell_at and sell_min_days stay at their
+# defaults). One pair stakes at most 10% of the portfolio value; an
 # add-on to a held pair stakes no more than a new pair would, and keeps the
 # held pair (at today's prices, plus the fees paid for it) and the add-on
 # together within 10% of the portfolio value. Nothing trades on them until
@@ -2530,7 +2608,7 @@ class LiveDefaultsMissing(LiveDefaultsError):
 
 def live_settings() -> LiveSettings:
     """
-    Return config.py's own eight toggle constants as LiveSettings, validated.
+    Return config.py's own ten toggle constants as LiveSettings, validated.
 
     Read at call time, so a test that monkeypatches a constant here takes
     effect. It is NOT the live defaults: a live run starts only from the saved
@@ -2555,6 +2633,8 @@ def live_settings() -> LiveSettings:
         categories=TRADE_CATEGORIES,
         tags=TRADE_TAGS,
         add_to_held_pairs=ADD_TO_HELD_PAIRS,
+        sell_at=SELL_AT,
+        sell_min_days=SELL_MIN_DAYS,
     )
 
 
@@ -2658,11 +2738,13 @@ def _saved_settings(record) -> LiveSettings:
     Turn a parsed saved-defaults record into LiveSettings, or refuse it.
 
     Checks what LiveSettings cannot see in JSON: the file's keys and format, the
-    save time, the source note, exactly the eight toggle names (a toggle in
+    save time, the source note, exactly the ten toggle names (a toggle in
     _OPTIONAL_TOGGLES may be left out, and then takes its LiveSettings
-    default, off), a spread band of two real numbers (LiveSettings would read
-    a JSON true as 1) and printable filter names. LiveSettings then validates
-    every value.
+    default: off, never sell, no minimum), a spread band of two real numbers
+    (LiveSettings would read a JSON true as 1), a sell level and a minimum of
+    days that are not JSON booleans (LiveSettings refuses a bool too; this
+    names the file's field in the message) and printable filter names. LiveSettings
+    then validates every value.
 
     Args:
         record: What json.loads returned for the file.
@@ -2696,11 +2778,16 @@ def _saved_settings(record) -> LiveSettings:
     if not isinstance(raw, dict) or not required <= set(raw) <= set(LIVE_TOGGLE_FIELDS):
         raise ValueError(f'"settings" must hold exactly {", ".join(LIVE_TOGGLE_FIELDS)} '
                          f'({", ".join(_OPTIONAL_TOGGLES)} may be left out, and then '
-                         "reads as off)")
+                         "each reads as off)")
     band = raw["spread_band"]
     if not (isinstance(band, list) and len(band) == 2 and all(
             isinstance(x, (int, float)) and not isinstance(x, bool) for x in band)):
         raise ValueError(f'"spread_band" must be [floor, ceiling], got {band!r}')
+    # A JSON true or false is refused here so the message names the file's
+    # field (LiveSettings would refuse it too)
+    for name in ("sell_at", "sell_min_days"):
+        if isinstance(raw.get(name), bool):
+            raise ValueError(f'"{name}" must be a number or null, got {raw[name]!r}')
     for name in ("categories", "tags"):
         _filter_names(raw[name], name)
     origin = f"{LIVE_DEFAULTS_FILE.name}, saved {saved_at}" + (f" from {source}" if source else "")
@@ -2750,11 +2837,14 @@ def read_saved_live_defaults() -> LiveSettings | None:
     - "format": LIVE_DEFAULTS_FORMAT;
     - "saved_at": UTC, e.g. 2026-09-27T21:05:13Z;
     - "source": a note (live_defaults_source's rules);
-    - "settings": the eight toggles by LiveSettings field name. tier_floors is
+    - "settings": the ten toggles by LiveSettings field name. tier_floors is
       true/false, spread_band is [floor, ceiling], interval_discount, size_cap
       and same_title_size_cap are numbers (the caps as fractions),
-      categories and tags are null (any) or a list of names, and
-      add_to_held_pairs is true/false or left out, which reads as off.
+      categories and tags are null (any) or a list of names,
+      add_to_held_pairs is true/false or left out, which reads as off,
+      sell_at is a share of potential profit on the 1% grid (e.g. 0.85) and
+      sell_min_days a whole number of days, each left out (or null) to read as
+      off, and sell_min_days only with sell_at.
 
     Refused on top of that: a repeated key, NaN or Infinity, a file over
     LIVE_DEFAULTS_MAX_BYTES, any value LiveSettings rejects, and anything at
@@ -2900,11 +2990,11 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
     this process id, flushed, and renamed over the file, so a reader at the
     same moment sees the old file or the new one, never part of one. The
     directory is flushed too, so the rename survives a power cut. The file is
-    then read back from disk and must equal settings (the eight toggles;
+    then read back from disk and must equal settings (the ten toggles;
     origin is not compared). A toggle in _OPTIONAL_TOGGLES is written only
-    when it is not at its default, so a file with add_to_held_pairs off holds
-    only the seven other toggles, and code that does not know
-    add_to_held_pairs can still read it.
+    when it is not at its default, so a file with add_to_held_pairs off and
+    selling off holds only the seven other toggles, and code that does not
+    know the optional ones can still read it.
 
     Args:
         settings (LiveSettings): The new defaults.
@@ -3392,6 +3482,23 @@ def _names_text(names: tuple[str, ...] | None) -> str:
     return ", ".join(names)
 
 
+def _sell_at_text(level: float | None) -> str:
+    """
+    Name a validated sell level on the "Live settings:" line.
+
+    Args:
+        level (float | None): LiveSettings.sell_at: a level on the SELL_AT_STEP
+            grid in (0, 1], or None for never selling.
+
+    Returns:
+        str: "off" for None, else the whole percent, e.g. "85% of potential
+            profit" (the 1% grid makes the rounding exact).
+    """
+    if level is None:
+        return "off"
+    return f"{round(level * 100)}% of potential profit"
+
+
 # Every live toggle as the "Live settings:" line (describe_live_settings) and
 # the comparison of two sets of defaults (live_settings_changes) name it:
 # (label, field, renderer), each exact where a short form would print two
@@ -3405,6 +3512,8 @@ _LIVE_SETTING_FIELDS = (
     ("categories", "categories", _names_text),
     ("tags", "tags", _names_text),
     ("add to held pairs", "add_to_held_pairs", lambda v: "on" if v else "off"),
+    ("sell at", "sell_at", _sell_at_text),
+    ("min days to maturity", "sell_min_days", lambda v: "any" if v is None else str(v)),
 )
 
 
@@ -3442,7 +3551,7 @@ def describe_live_settings(settings: LiveSettings, reference: LiveSettings | Non
     Returns:
         str: e.g. "tier floors off | spread band 0-0.5 | k 0.8 | per-trade cap
             100% (no cap) | same-title cap 20% | categories any | tags any |
-            add to held pairs on",
+            add to held pairs on | sell at off | min days to maturity any",
             with " (default: X)" after each field that differs from reference's
             when reference is the saved live defaults (its origin is anything
             but LIVE_DEFAULTS_FROM_CONFIG), " (config: X)" when it was built
@@ -3492,7 +3601,7 @@ def live_settings_changes(current: LiveSettings | None,
 
 def live_settings_argv(settings: LiveSettings) -> list[str]:
     """
-    Spell a run's settings as main.py's toggle flags, all eight of them.
+    Spell a run's settings as main.py's toggle flags, all ten of them.
 
     A program that starts main.py with these flags gets a run that trades
     exactly these settings, whatever the saved live defaults say:
@@ -3504,7 +3613,9 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
     --tag=NAME, so a name that begins with "-" still reads as a name; no
     filter is written as --any-category or --any-tag. Adding to held pairs is
     written either way (--add-to-held-pairs / --no-add-to-held-pairs), so a
-    saved value never decides it.
+    saved value never decides it. The sell level is written as a whole percent
+    (--sell-at=85) or --no-sell, and the minimum of days as --sell-min-days=N
+    or --no-sell-min-days, for the same reason.
 
     Args:
         settings (LiveSettings): The settings to spell.
@@ -3513,7 +3624,8 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
         list[str]: The flags, in the order main.py lists them: the tier-floor
             switch, --spread-min, --spread-max, --interval-discount,
             --size-cap, --same-title-size-cap, the add-to-held-pairs switch,
-            then the category flags and the tag flags.
+            the sell-level flag, the sell-minimum flag, then the category
+            flags and the tag flags.
     """
     argv = ["--tier-floors" if settings.tier_floors else "--no-tier-floors",
             f"--spread-min={settings.spread_band[0]!r}",
@@ -3523,6 +3635,11 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
             f"--same-title-size-cap={round(settings.same_title_size_cap * 100)}",
             "--add-to-held-pairs" if settings.add_to_held_pairs
             else "--no-add-to-held-pairs"]
+    # The sell level is a multiple of 1%, so its whole percent is exact
+    argv += ([f"--sell-at={round(settings.sell_at * 100)}"] if settings.sell_at is not None
+             else ["--no-sell"])
+    argv += ([f"--sell-min-days={settings.sell_min_days}"]
+             if settings.sell_min_days is not None else ["--no-sell-min-days"])
     argv += ([f"--category={name}" for name in settings.categories]
              if settings.categories is not None else ["--any-category"])
     argv += ([f"--tag={name}" for name in settings.tags]

@@ -7139,7 +7139,7 @@ class TestSaveLiveDefaultsButton:
             settings, source = defaults_server._proposal(defaults_server._params(query),
                                                          current)
             assert settings == expected, name
-            # Every field, one by one (equality skips none of the eight)
+            # Every field, one by one (equality skips none of the toggles)
             for field in config.LIVE_TOGGLE_FIELDS:
                 assert getattr(settings, field) == getattr(expected, field), (name, field)
             assert source == data["save"]["source"]

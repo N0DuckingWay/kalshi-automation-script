@@ -46,7 +46,7 @@ Purpose:
         port).
 
     Each run is its own `python -m kalshi_betting.main --mode prod` process,
-    started with all eight toggles as explicit flags (config.live_settings_argv)
+    started with all ten toggles as explicit flags (config.live_settings_argv)
     so it trades exactly what its page showed, in a new session (so Ctrl-C on
     this server, or closing its terminal, never reaches it), from
     config.PROJECT_ROOT, writing everything it prints to its own folder under
@@ -54,7 +54,7 @@ Purpose:
 
 Dependencies:
     Imports config and run_lock only (besides the standard library). From
-    config: LiveSettings, LIVE_TOGGLE_FIELDS (the eight toggle names the
+    config: LiveSettings, LIVE_TOGGLE_FIELDS (the ten toggle names the
     fingerprint reads), LiveDefaultsError (a refused saved file) and the
     saved-defaults helpers (read_saved_live_defaults, save_live_defaults,
     live_settings_changes, describe_live_settings, live_rule_warnings,
@@ -207,16 +207,20 @@ from .config import (
 # The fields a confirmation request carries, in the GET query and repeated in
 # the POST body; the signed text is built from exactly these, as raw strings
 _FIELDS = ("tier_floors", "spread_min", "spread_max", "k", "size_cap",
-           "same_title_size_cap", "add_to_held_pairs", "category", "tag", "source")
+           "same_title_size_cap", "add_to_held_pairs", "sell_at", "sell_min_days",
+           "category", "tag", "source")
 # The fields a proposal must carry; every other one may be left out
 _REQUIRED = ("tier_floors", "spread_min", "spread_max", "k", "size_cap")
-# The largest number of fields a query or form may hold (its ten fields plus
+# The largest number of fields a query or form may hold (its twelve fields plus
 # the fingerprint, nonce, token, action and acknowledgement, with room to
 # spare); more is refused unread
 _MAX_FIELDS = 20
 # A plain decimal number in ASCII digits: no underscores, spaces, digits of
 # other scripts, "nan" or "inf"
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", re.ASCII)
+# A whole number of days in ASCII digits: no sign, spaces or digits of other
+# scripts, and at most six of them (no real minimum of days is longer)
+_WHOLE_NUMBER = re.compile(r"\d{1,6}", re.ASCII)
 # A token or fingerprint: 64 lower-case hex digits (a SHA-256 hex digest)
 _HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 # A page's one-time nonce: 32 lower-case hex digits
@@ -744,27 +748,72 @@ def _name(text: str, name: str) -> str:
     return text
 
 
+def _whole_number(text: str, name: str) -> int:
+    """
+    Read a field as a plain whole number.
+
+    Args:
+        text (str): The field's value.
+        name (str): The field's name, for the message.
+
+    Returns:
+        int: The number.
+
+    Raises:
+        ValueError: If the value is not one to six ASCII digits (no sign, no
+            spaces, no digits of other scripts).
+    """
+    if not _WHOLE_NUMBER.fullmatch(text):
+        raise ValueError(f"{name} must be a whole number of at most six digits, got {text!r}")
+    return int(text)
+
+
+def _kept(name: str, current: LiveSettings | None, source: str) -> object:
+    """
+    Return the value of a setting a request left out.
+
+    The saved value when defaults are saved and the request is not the seed's
+    own link; otherwise the seed's, so a seed link that leaves the setting out
+    still proposes exactly the seed.
+
+    Args:
+        name (str): The LiveSettings field's name.
+        current (LiveSettings | None): The live defaults in force, or None
+            when none are saved.
+        source (str): The request's source note ("" when it has none).
+
+    Returns:
+        object: The saved value of the field, or LIVE_DEFAULTS_SEED's.
+    """
+    if current is not None and source != LIVE_DEFAULTS_SEED_SOURCE:
+        return getattr(current, name)
+    return getattr(LIVE_DEFAULTS_SEED, name)
+
+
 def _proposal(params: dict[str, list[str]],
               current: LiveSettings | None) -> tuple[LiveSettings, str]:
     """
     Turn a confirmation request's fields into the proposed live defaults.
 
     tier_floors ("on" / "off"), spread_min, spread_max, k and size_cap (a
-    fraction, e.g. 0.2) are required. same_title_size_cap and
-    add_to_held_pairs ("on" / "off") may be left out, and each then keeps the
-    saved value (or the seed's when none is saved); they are the only two
-    fields that fall back to what is saved, so a link that leaves one out
-    keeps it as it is (the dashboard's save button leaves the same-title cap
-    out when its run recorded none, and the add-to-held choice out on a page
-    that does not show it). One exception: a link carrying the seed's note
-    that leaves add_to_held_pairs out takes the seed's value, so it still
-    proposes exactly the seed, and the page shows the change against what is
-    saved. A missing category or tag means any, whatever is saved; a tag needs
-    its category. source is the note the saved file will keep: left out, it
-    is empty; given, it must be one of the two shapes
-    config.LIVE_DEFAULTS_SOURCE_PATTERN allows, with ASCII digits only, and
-    the seed's note (LIVE_DEFAULTS_SEED_SOURCE) may label only the seed
-    values themselves.
+    fraction, e.g. 0.2) are required. same_title_size_cap,
+    add_to_held_pairs ("on" / "off"), sell_at ("off" or a share in (0, 1],
+    e.g. 0.85) and sell_min_days ("off" or a whole number of days) may be left
+    out, and each then keeps the saved value (or the seed's when none is
+    saved); they are the only fields that fall back to what is saved, so a
+    link that leaves one out keeps it as it is (the dashboard's save button
+    leaves the same-title cap out when its run recorded none, and the
+    add-to-held choice out on a page that does not show it). One exception: a
+    link carrying the seed's note that leaves add_to_held_pairs, sell_at or
+    sell_min_days out takes the seed's value, so it still proposes exactly the
+    seed, and the page shows the change against what is saved. A minimum of
+    days left over with no sell level (sell_at off, given or kept) is refused
+    by LiveSettings, and the page shows why. A missing category or tag means
+    any, whatever is saved; a tag needs its category. source is the note the
+    saved file will keep: left out, it is empty; given, it must be one of the
+    two shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, with ASCII digits
+    only, and the seed's note (LIVE_DEFAULTS_SEED_SOURCE) may label only the
+    seed values themselves.
 
     Args:
         params (dict[str, list[str]]): The request's fields (_params).
@@ -778,7 +827,8 @@ def _proposal(params: dict[str, list[str]],
         ValueError: Naming the first rule the request breaks: an unknown,
             repeated, blank or missing field, a value that is not a plain
             number or a printable name, a tier_floors or add_to_held_pairs
-            other than on or off, a tag without a category, a source
+            other than on or off, a sell_at or sell_min_days other than
+            off or a plain number, a tag without a category, a source
             of another shape, any value LiveSettings refuses, or the seed's
             note on other values.
     """
@@ -802,22 +852,32 @@ def _proposal(params: dict[str, list[str]],
         same_title = current.same_title_size_cap
     else:
         same_title = LIVE_DEFAULTS_SEED.same_title_size_cap
+    source = value.get("source", "")
     if "add_to_held_pairs" in value:
         if value["add_to_held_pairs"] not in ("on", "off"):
             raise ValueError("add_to_held_pairs must be on or off, got "
                              f"{value['add_to_held_pairs']!r}")
         add_on = value["add_to_held_pairs"] == "on"
-    elif current is not None and value.get("source") != LIVE_DEFAULTS_SEED_SOURCE:
-        add_on = current.add_to_held_pairs
     else:
-        # No defaults saved, or a seed link: the seed's value, so a seed link
-        # that leaves the field out still proposes exactly the seed
-        add_on = LIVE_DEFAULTS_SEED.add_to_held_pairs
+        # The saved value; with no defaults saved, or on a seed link, the
+        # seed's, so a seed link that leaves the field out still proposes
+        # exactly the seed
+        add_on = _kept("add_to_held_pairs", current, source)
+    # "off" is never selling, or no minimum of days; a field left out falls
+    # back the same way
+    if "sell_at" in value:
+        sell_at = None if value["sell_at"] == "off" else _number(value["sell_at"], "sell_at")
+    else:
+        sell_at = _kept("sell_at", current, source)
+    if "sell_min_days" in value:
+        sell_min_days = (None if value["sell_min_days"] == "off"
+                         else _whole_number(value["sell_min_days"], "sell_min_days"))
+    else:
+        sell_min_days = _kept("sell_min_days", current, source)
     if "tag" in value and "category" not in value:
         raise ValueError("a tag needs its category")
     categories = (_name(value["category"], "category"),) if "category" in value else None
     tags = (_name(value["tag"], "tag"),) if "tag" in value else None
-    source = value.get("source", "")
     # re.ASCII: the pattern's digits are 0-9 only, never a digit of another
     # script (which could show a date out of order on the page)
     if source and not re.fullmatch(LIVE_DEFAULTS_SOURCE_PATTERN, source, re.ASCII):
@@ -839,6 +899,8 @@ def _proposal(params: dict[str, list[str]],
         categories=categories,
         tags=tags,
         add_to_held_pairs=add_on,
+        sell_at=sell_at,
+        sell_min_days=sell_min_days,
     )
     # The seed's note names the seed values, so it may label nothing else
     if source == LIVE_DEFAULTS_SEED_SOURCE and settings != LIVE_DEFAULTS_SEED:
@@ -852,8 +914,10 @@ def _seed_query() -> str:
     Build the confirmation page's query that proposes LIVE_DEFAULTS_SEED.
 
     Each number is written as its repr (the exact float), adding to held
-    pairs as on or off, the source note is LIVE_DEFAULTS_SEED_SOURCE, and a
-    category or tag is added only when the seed sets one (it sets none: any).
+    pairs as on or off, the sell level and the minimum of days as off or their
+    value (the seed sells nothing, so both are off), the source note is
+    LIVE_DEFAULTS_SEED_SOURCE, and a category or tag is added only when the
+    seed sets one (it sets none: any).
 
     Returns:
         str: The query string, without the "?".
@@ -867,6 +931,8 @@ def _seed_query() -> str:
         ("size_cap", repr(seed.size_cap)),
         ("same_title_size_cap", repr(seed.same_title_size_cap)),
         ("add_to_held_pairs", "on" if seed.add_to_held_pairs else "off"),
+        ("sell_at", "off" if seed.sell_at is None else repr(seed.sell_at)),
+        ("sell_min_days", "off" if seed.sell_min_days is None else str(seed.sell_min_days)),
     ]
     pairs += [("category", name) for name in seed.categories or ()]
     pairs += [("tag", name) for name in seed.tags or ()]
@@ -902,7 +968,7 @@ def _fingerprint(current: LiveSettings | None) -> str:
         current (LiveSettings | None): The saved defaults, or None when none are saved.
 
     Returns:
-        str: The SHA-256 hex digest of "none", or of the origin and the eight
+        str: The SHA-256 hex digest of "none", or of the origin and the ten
             toggles as JSON.
     """
     if current is None:
@@ -2828,7 +2894,7 @@ class _App:
         The one place the server starts a process. It makes the run's folder
         under config.LIVE_RUNS_DIR, writes run.json (what the run is) before
         anything starts, locks output.log and starts
-        `python -m kalshi_betting.main --mode prod` with all eight toggles as
+        `python -m kalshi_betting.main --mode prod` with all ten toggles as
         flags (config.live_settings_argv), --result-file in the folder and,
         for a dry run, --dry-run, from config.PROJECT_ROOT, its output going
         to output.log. The process inherits the lock through its output, so
@@ -2857,7 +2923,7 @@ class _App:
         started = datetime.now(UTC)
         folder = config.LIVE_RUNS_DIR / f"{started.strftime(_FOLDER_TIME)}-{run_id}"
         folder.mkdir(parents=True)
-        # All eight toggles as flags, so the run trades exactly these settings
+        # All ten toggles as flags, so the run trades exactly these settings
         argv = [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
                 *live_settings_argv(settings), "--result-file", str(folder / _RESULT_NAME)]
         if dry_run:

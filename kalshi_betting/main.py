@@ -127,6 +127,7 @@ from .config import (
     PROJECT_ROOT,
     SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
     SAME_TITLE_MIN_PRICE_DIFF,
+    SELL_AT_STEP,
     SIZE_CAP_STEP,
     LiveDefaultsError,
     LiveDefaultsMissing,
@@ -787,6 +788,10 @@ _LIVE_FLAGS = (
     ("size_cap", "--size-cap"),
     ("same_title_size_cap", "--same-title-size-cap"),
     ("add_to_held_pairs", "--add-to-held-pairs/--no-add-to-held-pairs"),
+    ("sell_at", "--sell-at"),
+    ("no_sell", "--no-sell"),
+    ("sell_min_days", "--sell-min-days"),
+    ("no_sell_min_days", "--no-sell-min-days"),
     ("category", "--category"),
     ("any_category", "--any-category"),
     ("tag", "--tag"),
@@ -852,6 +857,20 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["same_title_size_cap"] = args.same_title_size_cap / 100
     if getattr(args, "add_to_held_pairs", None) is not None:
         overrides["add_to_held_pairs"] = args.add_to_held_pairs
+    # --no-sell clears both sell settings (a minimum of days means nothing
+    # without a level); --sell-at and --sell-min-days then set one each, and
+    # LiveSettings refuses a minimum left with no level. argparse keeps
+    # --sell-at and --no-sell mutually exclusive, as it does the two
+    # minimum-of-days flags
+    if getattr(args, "no_sell", None):
+        overrides["sell_at"] = None
+        overrides["sell_min_days"] = None
+    if getattr(args, "sell_at", None) is not None:
+        overrides["sell_at"] = args.sell_at / 100
+    if getattr(args, "no_sell_min_days", None):
+        overrides["sell_min_days"] = None
+    if getattr(args, "sell_min_days", None) is not None:
+        overrides["sell_min_days"] = args.sell_min_days
     # --category / --tag (repeatable) set the filter; --any-category / --any-tag
     # clear the saved one (argparse keeps each pair mutually exclusive)
     if getattr(args, "category", None) is not None:
@@ -879,6 +898,11 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
             message += (f" ({' and '.join(percent)} take{'s' if len(percent) == 1 else ''} "
                         f"a whole percent, a multiple of {step} from {step} to 100, read "
                         "as that percent / 100)")
+        if any(dest == "sell_at" for dest, _ in given):
+            # --sell-at's unit, from its grid definition (SELL_AT_STEP)
+            sell_step = f"{SELL_AT_STEP * 100:g}"
+            message += (f" (--sell-at takes a whole percent, a multiple of {sell_step} "
+                        f"from {sell_step} to 100, read as that percent / 100)")
         parser.error(message)
 
 
@@ -1491,8 +1515,8 @@ def _build_parser() -> argparse.ArgumentParser:
     live = parser.add_argument_group(
         "live trading toggles",
         "Override one live default for THIS run only, in either mode "
-        "(adding to held pairs: production runs only). The live defaults "
-        "are the ones saved through python3 -m kalshi_betting.defaults_server "
+        "(adding to held pairs and selling: production runs only). The live "
+        "defaults are the ones saved through python3 -m kalshi_betting.defaults_server "
         "(live_defaults.json); a run refuses to start without them. The weekly scheduler "
         "passes none of these flags, so a scheduled run trades exactly the saved defaults.",
     )
@@ -1537,6 +1561,30 @@ def _build_parser() -> argparse.ArgumentParser:
              "prices plus the fees paid for them). --no-add-to-held-pairs never "
              "trades a held market. Production runs only: a dev run holds nothing "
              "(default: the saved live defaults)",
+    )
+    sell_level = live.add_mutually_exclusive_group()
+    sell_level.add_argument(
+        "--sell-at", type=int, default=None, metavar="PCT",
+        help="Sell a held position once it has stayed at or above PCT%% of its potential profit "
+             "for config.TAKE_PROFIT_HOLD_DAYS days in a row; a whole percent from 1 to "
+             "100. Production runs only (default: the saved live defaults)",
+    )
+    sell_level.add_argument(
+        "--no-sell", action="store_true", default=None,
+        help="Sell nothing this run, whatever the saved live defaults say (also clears "
+             "the saved minimum of days; cannot be combined with --sell-min-days)",
+    )
+    sell_days = live.add_mutually_exclusive_group()
+    sell_days.add_argument(
+        "--sell-min-days", type=int, default=None, metavar="N",
+        help="Sell a position only while at least N days (1 or more) remain before "
+             "its last market stops trading; needs a sell level, saved or given with "
+             "--sell-at (default: the saved live defaults)",
+    )
+    sell_days.add_argument(
+        "--no-sell-min-days", action="store_true", default=None,
+        help="Set no minimum of days to maturity this run, whatever the saved live "
+             "defaults say",
     )
     # Filed as the backtest dashboard files a trade (_filter_by_category)
     categories = live.add_mutually_exclusive_group()

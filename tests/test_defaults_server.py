@@ -97,14 +97,14 @@ KEY = b"k" * 32
 _REAL_POPEN = subprocess.Popen
 # A source note of the dashboard's shape
 DASHBOARD_NOTE = "backtest dashboard for 2025-09-24 to 2026-09-27"
-# The eight rows of a comparison, in their order on the page
+# The ten rows of a comparison, in their order on the page
 LABELS = ["tier floors", "spread band", "k", "per-trade cap", "same-title cap",
-          "categories", "tags", "add to held pairs"]
+          "categories", "tags", "add to held pairs", "sell at", "min days to maturity"]
 # A proposal's fields: the seed's values, spelled as the dashboard spells them
 _BASE = {"tier_floors": "off", "spread_min": "0", "spread_max": "0.5", "k": "0.8",
          "size_cap": "0.1"}
 # The settings _BASE proposes when nothing is saved: the seed's (its same-title
-# cap, and adding to held pairs on, the two fields a proposal may leave out)
+# cap, adding to held pairs on and no selling, the fields a proposal may leave out)
 _BASE_SETTINGS = LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, add_to_held_pairs=True)
 # The ASCII digits as Arabic-Indic and as full-width digits (str.translate tables)
 _ARABIC_INDIC = str.maketrans("0123456789", "".join(chr(0x0660 + i) for i in range(10)))
@@ -822,7 +822,7 @@ class TestConfirmPage:
         assert changed == {"tier floors", "spread band"}
         assert all(css == "same" for label, css in page.rows.items() if label not in changed)
         assert response.body.count('<span class="tag">changed</span>') == 2
-        assert "2 of 8 settings change." in response.body
+        assert "2 of 10 settings change." in response.body
         assert "Overwrite the live trading defaults?" in response.body
         assert f"This writes <code>{config.LIVE_DEFAULTS_FILE.absolute()}</code>" \
             in response.body
@@ -848,10 +848,13 @@ class TestConfirmPage:
         assert "none saved — live runs refuse to start until defaults are saved" in response.body
         assert set(page.rows.values()) == {"changed"}
         assert all(cells[1] == "—" for cells in page.cells.values())
-        assert "8 of 8 settings change." in response.body
-        # The same-title cap and adding to held pairs fall back to the seed's
+        assert "10 of 10 settings change." in response.body
+        # The same-title cap, adding to held pairs and the two sell settings
+        # fall back to the seed's
         assert page.cells["same-title cap"][2] == "20%"
         assert page.cells["add to held pairs"][2] == "on"
+        assert page.cells["sell at"][2] == "off"
+        assert page.cells["min days to maturity"][2] == "any"
 
     def test_the_exposure_warning_shows(self):
         response = _get(_app(), "/confirm?" + _query(k="0.4", size_cap="1"))
@@ -894,6 +897,70 @@ class TestConfirmPage:
         settings, _ = defaults_server._proposal(defaults_server._params(_query()), None)
         assert settings.add_to_held_pairs is config.LIVE_DEFAULTS_SEED.add_to_held_pairs
 
+    @pytest.mark.parametrize("saved", [
+        {}, {"sell_at": 0.85}, {"sell_at": 0.85, "sell_min_days": 3}])
+    def test_missing_sell_settings_keep_the_saved_values(self, saved):
+        # A link that names neither (an older dashboard page, a hand-made link)
+        # leaves selling exactly as saved, shown as no change
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, **saved))
+        page = _parse(_get(_app(), "/confirm?" + _query()).body)
+        assert page.rows["sell at"] == page.rows["min days to maturity"] == "same"
+        assert page.cells["sell at"][1] == page.cells["sell at"][2]
+        assert page.cells["min days to maturity"][1] == page.cells["min days to maturity"][2]
+        proposed, _ = defaults_server._proposal(defaults_server._params(_query()),
+                                                config.read_saved_live_defaults())
+        assert (proposed.sell_at, proposed.sell_min_days) == (
+            saved.get("sell_at"), saved.get("sell_min_days"))
+
+    def test_missing_sell_settings_with_none_saved_are_the_seed_s(self):
+        settings, _ = defaults_server._proposal(defaults_server._params(_query()), None)
+        assert settings.sell_at is config.LIVE_DEFAULTS_SEED.sell_at is None
+        assert settings.sell_min_days is config.LIVE_DEFAULTS_SEED.sell_min_days is None
+
+    @pytest.mark.parametrize("given, expected", [
+        ({"sell_at": "0.85"}, (0.85, None)),
+        ({"sell_at": "0.85", "sell_min_days": "3"}, (0.85, 3)),
+        ({"sell_at": "1", "sell_min_days": "1"}, (1.0, 1)),
+        ({"sell_at": "0.01", "sell_min_days": "21"}, (0.01, 21)),
+        ({"sell_at": "0.29"}, (0.29, None)),
+        ({"sell_at": "1e-2"}, (0.01, None)),
+        ({"sell_at": "0.85", "sell_min_days": "off"}, (0.85, None)),
+        ({"sell_at": "off"}, (None, None)),
+        ({"sell_at": "off", "sell_min_days": "off"}, (None, None)),
+        ({"sell_at": "0.85", "sell_min_days": "007"}, (0.85, 7)),
+    ])
+    def test_named_sell_settings_are_proposed(self, given, expected):
+        # With nothing saved, so a field a link leaves out is the seed's (off)
+        settings, _ = defaults_server._proposal(defaults_server._params(_query(**given)), None)
+        assert (settings.sell_at, settings.sell_min_days) == expected
+        page = _parse(_get(_app(), "/confirm?" + _query(**given)).body)
+        level = "off" if expected[0] is None else f"{round(expected[0] * 100)}% of potential profit"
+        days = "any" if expected[1] is None else str(expected[1])
+        assert page.cells["sell at"][1:3] == ["—", level]
+        assert page.cells["min days to maturity"][1:3] == ["—", days]
+
+    def test_a_named_sell_level_over_a_saved_one_is_a_change(self):
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, sell_at=0.85, sell_min_days=3))
+        page = _parse(_get(_app(), "/confirm?" + _query(sell_at="0.9")).body)
+        assert page.rows["sell at"] == "changed"
+        assert page.cells["sell at"][1:3] == ["85% of potential profit", "90% of potential profit"]
+        # The minimum was left out, so it stays as saved
+        assert page.rows["min days to maturity"] == "same"
+        page = _parse(_get(_app(), "/confirm?" + _query(
+            sell_at="off", sell_min_days="off")).body)
+        assert [label for label, css in page.rows.items() if css == "changed"] == [
+            "sell at", "min days to maturity"]
+        assert page.cells["sell at"][1:3] == ["85% of potential profit", "off"]
+        assert page.cells["min days to maturity"][1:3] == ["3", "any"]
+
+    def test_turning_the_level_off_but_keeping_a_saved_minimum_is_refused_with_the_reason(self):
+        # The minimum was left out, so it stays at the saved 3 with no level
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, sell_at=0.85, sell_min_days=3))
+        response = _get(_app(), "/confirm?" + _query(sell_at="off"))
+        assert response.status == 400
+        assert "sell_min_days needs a sell level" in html.unescape(response.body)
+        assert "<form" not in response.body
+
     def test_a_missing_category_or_tag_proposes_any(self):
         _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, ("Sports",), ("Basketball",)))
         page = _parse(_get(_app(), "/confirm?" + _query(same_title_size_cap="0.2")).body)
@@ -933,7 +1000,7 @@ class TestConfirmPage:
         assert page.buttons[1] == {"type": "button", "disabled": None}
         assert html.escape(defaults_server._NOTHING_TO_SAVE) in response.body
         assert "These are already the live defaults — nothing to save." in response.body
-        assert "0 of 8 settings change." in response.body
+        assert "0 of 10 settings change." in response.body
         # With nothing to save, the page does not say it writes
         assert "This writes" not in response.body
         assert str(config.LIVE_DEFAULTS_FILE.absolute()) in response.body
@@ -1244,6 +1311,23 @@ class TestConfirmRefusals:
         _query(tier_floors="maybe"),
         _query(add_to_held_pairs="maybe"), _query(add_to_held_pairs="true"),
         _query(add_to_held_pairs="1"), _query(add_to_held_pairs="On"),
+        # A sell level: a plain decimal share on the 1% grid in (0, 1], or off
+        _query(sell_at="maybe"), _query(sell_at="Off"), _query(sell_at="on"),
+        _query(sell_at="0"), _query(sell_at="-0.5"), _query(sell_at="1.01"),
+        _query(sell_at="85"), _query(sell_at="0.855"), _query(sell_at="0.001"),
+        _query(sell_at="nan"), _query(sell_at="inf"), _query(sell_at="0_85"),
+        _query(sell_at="０.85"), _query(sell_at="٠.85"), _query(sell_at=" 0.85"),
+        _query(sell_at="0x1"), _query(sell_at="1e-400"),
+        # A minimum of days: plain ASCII digits (at most six) with a level, or off
+        _query(sell_at="0.85", sell_min_days="0"), _query(sell_at="0.85", sell_min_days="-1"),
+        _query(sell_at="0.85", sell_min_days="1.5"), _query(sell_at="0.85", sell_min_days="1e1"),
+        _query(sell_at="0.85", sell_min_days="+3"), _query(sell_at="0.85", sell_min_days=" 3"),
+        _query(sell_at="0.85", sell_min_days="３"), _query(sell_at="0.85", sell_min_days="٣"),
+        _query(sell_at="0.85", sell_min_days="1" * 7), _query(sell_at="0.85", sell_min_days="soon"),
+        _query(sell_at="0.85", sell_min_days="Off"),
+        # A minimum with no level: none given and none saved (the seed's is off),
+        # or the level named off
+        _query(sell_min_days="3"), _query(sell_at="off", sell_min_days="3"),
         _query(k="nan"), _query(k="inf"), _query(k="0_8"), _query(k="1e-400"),
         _query(k="1e400"), _query(k="０.8"), _query(k=" 0.8"), _query(k="0"),
         _query(k="1.5"), _query(k="0x1"),
@@ -1292,6 +1376,18 @@ class TestConfirmRefusals:
         response = _get(_app(), "/confirm?" + _query(source=config.LIVE_DEFAULTS_SEED_SOURCE))
         assert response.status == 400
         assert "may label only the seed values" in response.body
+
+    def test_the_seed_note_labels_no_selling_settings(self):
+        # The seed sells nothing: its note on a link that sells is refused
+        for given in ({"sell_at": "0.85"}, {"sell_at": "0.85", "sell_min_days": "3"}):
+            response = _get(_app(), "/confirm?" + _query(
+                source=config.LIVE_DEFAULTS_SEED_SOURCE, **given))
+            assert response.status == 400, given
+            assert "may label only the seed values" in response.body
+        # ... and a seed link that names selling off is the seed
+        assert _get(_app(), "/confirm?" + _query(
+            source=config.LIVE_DEFAULTS_SEED_SOURCE, sell_at="off",
+            sell_min_days="off")).status == 200
 
     def test_an_invalid_proposal_is_refused_on_the_post_too(self):
         # A form carrying a proposal no page would render, signed as a page would sign it
@@ -1587,6 +1683,48 @@ class TestSeed:
         saved = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
         assert defaults_server._proposal(params, saved)[0] == config.LIVE_DEFAULTS_SEED
 
+    def test_the_seed_query_spells_selling_off(self):
+        pairs = dict(defaults_server._params(defaults_server._seed_query()))
+        assert pairs["sell_at"] == ["off"] and pairs["sell_min_days"] == ["off"]
+        assert config.LIVE_DEFAULTS_SEED.sell_at is None
+        assert config.LIVE_DEFAULTS_SEED.sell_min_days is None
+
+    def test_the_seed_page_turns_off_selling_that_is_saved(self):
+        # The seed link names selling off, so it proposes exactly the seed over
+        # defaults that sell: both rows change
+        _save(replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3))
+        response = _get(_app(), "/confirm?" + defaults_server._seed_query())
+        page = _parse(response.body)
+        assert [label for label, css in page.rows.items() if css == "changed"] == [
+            "sell at", "min days to maturity"]
+        assert "2 of 10 settings change." in response.body
+
+    def test_a_seed_link_that_leaves_selling_out_still_proposes_the_seed(self):
+        # A seed link from before selling existed (no sell fields), opened over
+        # defaults that sell: the seed's off, shown as changes, never refused
+        # for putting the seed's note on other values
+        _save(replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3))
+        stale = "&".join(part for part in defaults_server._seed_query().split("&")
+                         if not part.startswith(("sell_at=", "sell_min_days=")))
+        assert "sell_at" not in stale and "source=" in stale
+        params = defaults_server._params(stale)
+        assert defaults_server._proposal(params, config.read_saved_live_defaults()) == (
+            config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED_SOURCE)
+        app = _app()
+        response = _get(app, "/confirm?" + stale)
+        assert response.status == 200
+        page = _parse(response.body)
+        assert [label for label, css in page.rows.items() if css == "changed"] == [
+            "sell at", "min days to maturity"]
+        assert _post(app, _click(response.body, "confirm")).status == 303
+        assert config.live_defaults() == config.LIVE_DEFAULTS_SEED
+        # Control: the same link without the seed's note keeps what is saved
+        plain = "&".join(part for part in stale.split("&") if not part.startswith("source="))
+        kept, _ = defaults_server._proposal(
+            defaults_server._params(plain),
+            replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3))
+        assert (kept.sell_at, kept.sell_min_days) == (0.85, 3)
+
     def test_a_seven_toggle_file_is_proposed_the_seed_with_adding_on(self):
         # A saved file that leaves the toggle out reads it as off; the seed
         # page proposes it on, a change shown in its row
@@ -1597,7 +1735,7 @@ class TestSeed:
         assert [label for label, css in page.rows.items() if css == "changed"] == [
             "add to held pairs"]
         assert page.cells["add to held pairs"][1:3] == ["off", "on"]
-        assert "1 of 8 settings change." in response.body
+        assert "1 of 10 settings change." in response.body
 
     def test_a_seed_link_that_leaves_out_adding_to_held_pairs_still_proposes_the_seed(self):
         # A seed link without the add_to_held_pairs field, opened while a file
@@ -2016,6 +2154,32 @@ class TestTokenAndNonce:
 
 class TestActions:
     """What each action does, and what it never does."""
+
+    def test_confirming_selling_saves_it_and_a_run_is_started_with_its_flags(self):
+        starter = _Starter()
+        app = _app(start_process=starter)
+        form = _page_form(app, _query(sell_at="0.85", sell_min_days="3"), "confirm-trade")
+        # The page carried both fields, as the link named them
+        assert ("sell_at", "0.85") in form and ("sell_min_days", "3") in form
+        run_id = _run_id(_post(app, form))
+        saved = config.read_saved_live_defaults()
+        assert (saved.sell_at, saved.sell_min_days) == (0.85, 3)
+        text = config.LIVE_DEFAULTS_FILE.read_text()
+        assert '"sell_at": 0.85,' in text and text.rstrip().endswith('"sell_min_days": 3\n  }\n}')
+        [(argv, _)] = starter.calls
+        assert argv[5:-2] == config.live_settings_argv(saved)
+        assert "--sell-at=85" in argv and "--sell-min-days=3" in argv
+        assert "--no-sell" not in argv and "--no-sell-min-days" not in argv
+        record = json.loads((_run_folder(run_id) / "run.json").read_text())
+        assert "sell at 85% of potential profit | min days to maturity 3" in record["settings"]
+
+    def test_a_run_from_defaults_that_do_not_sell_says_so_in_its_flags(self):
+        starter = _Starter()
+        app = _app(start_process=starter)
+        _post(app, _page_form(app, _query(), "confirm-trade"))
+        [(argv, _)] = starter.calls
+        assert "--no-sell" in argv and "--no-sell-min-days" in argv
+        assert not any(arg.startswith(("--sell-at", "--sell-min-days")) for arg in argv)
 
     def test_trade_saves_then_starts_exactly_the_page_s_settings(self):
         starter = _Starter()

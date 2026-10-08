@@ -335,7 +335,7 @@ class TestNoPairsMsg:
 @pytest.fixture
 def pinned_config_toggles(monkeypatch, _isolate_live_defaults):
     """
-    Pin the eight live toggles and save them as this test's live defaults.
+    Pin the ten live toggles and save them as this test's live defaults.
 
     Through conftest's apply_pre_toggle_defaults, the one definition of their
     values, then save_config_live_defaults into the test's own path (requested
@@ -483,6 +483,9 @@ class TestLiveSettingsFlags:
          ("Economics", "Sports")),
         (["--tag", "Oil & Gas"], "tags", ("Oil & Gas",)),
         (["--add-to-held-pairs"], "add_to_held_pairs", True),
+        (["--sell-at", "85"], "sell_at", 0.85),
+        (["--sell-at", "1"], "sell_at", 0.01),
+        (["--sell-at", "100"], "sell_at", 1.0),
     ])
     def test_each_flag_overrides_only_its_own_field(self, monkeypatch, mode, argv, field, value):
         seen = _main_with(monkeypatch, ["--mode", mode, *argv])
@@ -507,6 +510,127 @@ class TestLiveSettingsFlags:
         assert "add to held pairs off (default: on)" in line and line.count("(default:") == 1
         # No flag keeps the saved value
         assert _main_with(monkeypatch, ["--mode", "prod"])["settings"].add_to_held_pairs is True
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("argv, saved, expected", [
+        # A level alone, over a saved level and over none
+        (["--sell-at", "90"], {"sell_at": 0.85}, {"sell_at": 0.9}),
+        (["--sell-at", "90"], {}, {"sell_at": 0.9}),
+        # A level keeps the saved minimum; a minimum keeps the saved level
+        (["--sell-at", "90"], {"sell_at": 0.85, "sell_min_days": 3},
+         {"sell_at": 0.9, "sell_min_days": 3}),
+        (["--sell-min-days", "7"], {"sell_at": 0.85, "sell_min_days": 3},
+         {"sell_at": 0.85, "sell_min_days": 7}),
+        (["--sell-min-days", "7"], {"sell_at": 0.85}, {"sell_at": 0.85, "sell_min_days": 7}),
+        # Both given, over nothing saved
+        (["--sell-at", "90", "--sell-min-days", "7"], {},
+         {"sell_at": 0.9, "sell_min_days": 7}),
+        # --no-sell-min-days keeps the level; --no-sell clears both
+        (["--no-sell-min-days"], {"sell_at": 0.85, "sell_min_days": 3}, {"sell_at": 0.85}),
+        (["--no-sell"], {"sell_at": 0.85, "sell_min_days": 3}, {}),
+        (["--no-sell"], {"sell_at": 0.85}, {}),
+        (["--no-sell", "--no-sell-min-days"], {"sell_at": 0.85, "sell_min_days": 3}, {}),
+        # ... and with nothing saved they change nothing
+        (["--no-sell"], {}, {}),
+        (["--no-sell-min-days"], {}, {}),
+    ])
+    def test_the_sell_flags_lay_over_the_saved_level_and_minimum(
+        self, monkeypatch, mode, argv, saved, expected,
+    ):
+        _save_live_defaults(**saved)
+        seen = _main_with(monkeypatch, ["--mode", mode, *argv])
+        assert seen["code"] == EXIT_OK and seen["mode"] == mode
+        settings, reference = seen["settings"], seen["reference"]
+        assert (reference.sell_at, reference.sell_min_days) == (
+            saved.get("sell_at"), saved.get("sell_min_days"))
+        assert (settings.sell_at, settings.sell_min_days) == (
+            expected.get("sell_at"), expected.get("sell_min_days"))
+        # Nothing but the two sell settings moved
+        for other in config.LIVE_TOGGLE_FIELDS:
+            if other not in ("sell_at", "sell_min_days"):
+                assert getattr(settings, other) == getattr(reference, other), other
+
+    def test_no_sell_turns_a_saved_level_off_for_one_run_and_marks_it(self, monkeypatch):
+        _save_live_defaults(sell_at=0.85, sell_min_days=3)
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-sell"])
+        line = describe_live_settings(seen["settings"], seen["reference"])
+        assert "sell at off (default: 85% of potential profit)" in line
+        assert "min days to maturity any (default: 3)" in line
+        assert line.count("(default:") == 2
+        # No flag keeps the saved level and minimum
+        kept = _main_with(monkeypatch, ["--mode", "prod"])["settings"]
+        assert (kept.sell_at, kept.sell_min_days) == (0.85, 3)
+
+    @pytest.mark.parametrize("argv, saved, words", [
+        # A minimum needs a level: none saved, none given, or --no-sell clearing it
+        (["--sell-min-days", "3"], {}, ["--sell-min-days", "sell_min_days needs a sell level"]),
+        (["--no-sell", "--sell-min-days", "3"], {"sell_at": 0.85},
+         ["--no-sell", "--sell-min-days", "sell_min_days needs a sell level"]),
+        # A level off the whole-percent range or grid
+        (["--sell-at", "0"], {}, ["--sell-at", "sell_at", "(0, 1]"]),
+        (["--sell-at", "101"], {}, ["--sell-at", "sell_at", "(0, 1]"]),
+        (["--sell-at", "-5"], {}, ["--sell-at", "sell_at", "(0, 1]"]),
+        # A minimum under one day
+        (["--sell-at", "85", "--sell-min-days", "0"], {},
+         ["--sell-at", "--sell-min-days", "sell_min_days must be a whole number of days"]),
+        (["--sell-min-days", "-2"], {"sell_at": 0.85},
+         ["--sell-min-days", "sell_min_days must be a whole number of days"]),
+    ])
+    def test_a_sell_flag_the_settings_refuse_is_a_usage_error(
+        self, monkeypatch, capsys, argv, saved, words,
+    ):
+        _save_live_defaults(**saved)
+        seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
+        assert seen["code"] == 2
+        # Refused before logging, the client and either run mode
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = capsys.readouterr().err
+        for word in words:
+            assert word in err, (word, err)
+
+    def test_a_sell_level_flag_names_its_own_unit(self, monkeypatch, capsys):
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--sell-at", "0"])
+        assert seen["code"] == 2
+        err = capsys.readouterr().err
+        assert "--sell-at takes a whole percent, a multiple of 1 from 1 to 100, read as " \
+            "that percent / 100" in err, err
+        # The cap flags' note (a multiple of 5) is not borrowed for it
+        assert f"a multiple of {self._STEP}" not in err, err
+        # ... and the minimum of days, which is no percent, says nothing about one
+        _save_live_defaults(sell_at=0.85)
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--sell-min-days", "0"])
+        assert seen["code"] == 2
+        assert "whole percent" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize("argv", [
+        ["--sell-at", "12.5"], ["--sell-at", "half"], ["--sell-at", "0.85"],
+        ["--sell-min-days", "1.5"], ["--sell-min-days", "soon"],
+    ])
+    def test_a_fractional_or_non_numeric_sell_value_is_a_usage_error(
+        self, monkeypatch, capsys, argv,
+    ):
+        # argparse's own int check: a whole percent and a whole number of days only
+        seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "invalid int value" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("argv, words", [
+        (["--sell-at", "85", "--no-sell"], ["--no-sell", "--sell-at"]),
+        (["--sell-min-days", "3", "--no-sell-min-days"],
+         ["--no-sell-min-days", "--sell-min-days"]),
+    ])
+    def test_a_sell_setting_and_its_off_twin_are_mutually_exclusive(
+        self, monkeypatch, capsys, argv, words,
+    ):
+        seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        err = capsys.readouterr().err
+        assert "not allowed with argument" in err, err
+        for word in words:
+            assert word in err, (word, err)
 
     def test_no_flag_hands_the_run_the_saved_defaults_themselves(self, monkeypatch):
         # The scheduler's exact argv (tests/test_scheduler.py pins it)
@@ -635,15 +759,16 @@ class TestLiveSettingsFlags:
         for flag in ("--tier-floors", "--no-tier-floors", "--spread-min", "--spread-max",
                      "--interval-discount", "--size-cap", "--same-title-size-cap",
                      "--add-to-held-pairs", "--no-add-to-held-pairs",
+                     "--sell-at", "--no-sell", "--sell-min-days", "--no-sell-min-days",
                      "--category", "--any-category", "--tag", "--any-tag"):
             assert flag in out, flag
         # Every value flag defaults to the saved live defaults, never a config.py constant
-        assert out.count("default: the saved live defaults") == 9
-        assert out.count("whatever the saved live defaults say") == 2
+        assert out.count("default: the saved live defaults") == 11
+        assert out.count("whatever the saved live defaults say") == 4
         assert "config.TIME_SERIES" not in out and "config.TRADE" not in out
         assert "config.BUDGET_FRACTION" not in out and "config.SAME_TITLE" not in out
         assert ("Override one live default for THIS run only, in either mode "
-                "(adding to held pairs: production runs only). The live "
+                "(adding to held pairs and selling: production runs only). The live "
                 "defaults are the ones saved through python3 -m "
                 "kalshi_betting.defaults_server (live_defaults.json); a run refuses to "
                 "start without them. The weekly scheduler passes none of these flags, so "
@@ -653,6 +778,14 @@ class TestLiveSettingsFlags:
         assert "100 = no extra cap beyond --size-cap" in out
         assert "Production runs only: a dev run holds nothing" in out
         assert "config.ADD_TO_HELD_PAIRS" not in out
+        # The sell flags: a whole percent from 1 to 100 (argparse %-formats help,
+        # so the "%%" is pinned too), and their off twins
+        assert ("Sell a held position once it has stayed at or above PCT% of its potential profit "
+                "for config.TAKE_PROFIT_HOLD_DAYS days in a row; a whole percent from 1 to "
+                "100.") in out
+        assert "Sell nothing this run, whatever the saved live defaults say" in out
+        assert "Sell a position only while at least N days (1 or more) remain" in out
+        assert "config.SELL_AT" not in out and "config.SELL_MIN_DAYS" not in out
         assert "live trading toggles" in out
 
     def test_the_echo_marks_exactly_the_departing_fields(self, monkeypatch):
@@ -723,7 +856,12 @@ class TestLogLiveSettings:
         "categories": (["--category", "Economics"], "categories Economics (default: any)"),
         "tags": (["--tag", "Oil & Gas"], "tags Oil & Gas (default: any)"),
         "add_to_held_pairs": (["--add-to-held-pairs"], "add to held pairs on (default: off)"),
+        "sell_at": (["--sell-at", "85"], "sell at 85% of potential profit (default: off)"),
+        "sell_min_days": (["--sell-min-days", "3"], "min days to maturity 3 (default: any)"),
     }
+    # What the saved defaults hold under a field's flag when the flag needs more
+    # than the pinned constants: a minimum of days needs a saved sell level
+    _SAVED_FOR_FIELD = {"sell_min_days": {"sell_at": 0.85}}
 
     def test_every_field_has_a_departing_flag(self):
         # A new toggle needs a row, so its departure WARNING is tested
@@ -732,6 +870,8 @@ class TestLogLiveSettings:
     @pytest.mark.parametrize("field", sorted(_ONE_FLAG_PER_FIELD))
     def test_a_departing_production_run_warns(self, monkeypatch, caplog, field):
         argv, mark = self._ONE_FLAG_PER_FIELD[field]
+        if field in self._SAVED_FOR_FIELD:
+            _save_live_defaults(**self._SAVED_FOR_FIELD[field])
         code = _prod_until_the_balance_gate(monkeypatch, argv, caplog)
         assert code == EXIT_SKIPPED_LOW_BALANCE
         (line,) = [r.getMessage() for r in caplog.records
@@ -2592,7 +2732,8 @@ class TestLiveSettingsReachEverySite:
     _SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.05, 0.9),
                              interval_discount=0.6, size_cap=0.35, same_title_size_cap=0.25,
                              categories=("economics", "POLITICS"),
-                             tags=("Inflation", "elections"), add_to_held_pairs=True)
+                             tags=("Inflation", "elections"), add_to_held_pairs=True,
+                             sell_at=0.85, sell_min_days=3)
 
     # The cached /series listing (SHARDAEVT and HELDAEVT unlisted: filed as Other)
     _LISTING = {
@@ -2800,13 +2941,13 @@ class TestLiveSettingsReachEverySite:
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 8
+        assert echo in caplog.text and echo.count("(config:") == 10
         assert "This PRODUCTION run overrides" not in caplog.text
         assert "one time-series pair may stake up to 35%" in caplog.text
         assert "one same-title pair may stake up to 25%" in caplog.text
         # The workbook's separator row carries the same marked line
         assert captured["run_note"] == f"settings: {describe_live_settings(settings, reference)}"
-        assert captured["run_note"].count("(config:") == 8
+        assert captured["run_note"].count("(config:") == 10
 
     def test_a_dev_run_handed_its_settings_reads_them_at_every_site(self, monkeypatch, caplog):
         settings, reference, calls, captured = self._run_under_the_tripwire(
@@ -2826,7 +2967,7 @@ class TestLiveSettingsReachEverySite:
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 8
+        assert echo in caplog.text and echo.count("(config:") == 10
         # Dev never submits an order, so never the production WARNING
         assert "This PRODUCTION run overrides" not in caplog.text
 
@@ -6163,7 +6304,7 @@ class TestResultFile:
 
 def _other_toggles(target: LiveSettings) -> LiveSettings:
     """
-    Build live defaults that differ from target in every one of the eight toggles.
+    Build live defaults that differ from target in every one of the ten toggles.
 
     Args:
         target (LiveSettings): The settings a run should trade.
@@ -6182,6 +6323,10 @@ def _other_toggles(target: LiveSettings) -> LiveSettings:
         categories=None if target.categories is not None else ("Saved",),
         tags=None if target.tags is not None else ("Saved",),
         add_to_held_pairs=not target.add_to_held_pairs,
+        # Always selling, so a target that sells nothing needs --no-sell and
+        # --no-sell-min-days to win over them
+        sell_at=0.5 if target.sell_at != 0.5 else 0.6,
+        sell_min_days=2 if target.sell_min_days != 2 else 3,
     )
     for name in config.LIVE_TOGGLE_FIELDS:
         assert getattr(other, name) != getattr(target, name), name
@@ -6209,6 +6354,18 @@ _ARGV_TARGETS = {
         tier_floors=False, spread_band=(0.05, 0.5), interval_discount=0.8,
         size_cap=0.2, same_title_size_cap=0.2, categories=None,
         tags=("Soccer", "Basketball", "--double dash")),
+    # Selling on: a level and a minimum, the smallest and the largest level, and
+    # a level alone (so --no-sell-min-days has to clear a saved minimum)
+    "selling-at-85-with-a-minimum": LiveSettings(
+        tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+        size_cap=0.1, same_title_size_cap=0.2, sell_at=0.85, sell_min_days=7),
+    "selling-at-1-percent-of-profit": LiveSettings(
+        tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+        size_cap=0.2, same_title_size_cap=1.0, sell_at=0.01),
+    "selling-at-100-with-a-day": LiveSettings(
+        tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+        size_cap=1.0, same_title_size_cap=0.2, add_to_held_pairs=True,
+        sell_at=1.0, sell_min_days=1),
 }
 
 
@@ -6239,12 +6396,39 @@ class TestLiveSettingsArgv:
         assert (args.category is not None) or args.any_category
         assert (args.tag is not None) or args.any_tag
         assert args.add_to_held_pairs is target.add_to_held_pairs
+        # The sell settings are given either way: a percent or --no-sell, a
+        # number of days or --no-sell-min-days
+        if target.sell_at is None:
+            assert args.sell_at is None and args.no_sell is True
+        else:
+            assert args.sell_at == round(target.sell_at * 100) and args.no_sell is None
+        if target.sell_min_days is None:
+            assert args.sell_min_days is None and args.no_sell_min_days is True
+        else:
+            assert args.sell_min_days == target.sell_min_days
+            assert args.no_sell_min_days is None
 
     def test_the_seed_is_spelled_flag_by_flag(self):
         assert config.live_settings_argv(config.LIVE_DEFAULTS_SEED) == [
             "--no-tier-floors", "--spread-min=0.0", "--spread-max=0.5",
             "--interval-discount=0.8", "--size-cap=10", "--same-title-size-cap=20",
-            "--add-to-held-pairs", "--any-category", "--any-tag"]
+            "--add-to-held-pairs", "--no-sell", "--no-sell-min-days",
+            "--any-category", "--any-tag"]
+
+    def test_selling_is_spelled_as_whole_percents_and_days(self):
+        argv = config.live_settings_argv(_ARGV_TARGETS["selling-at-85-with-a-minimum"])
+        assert argv[argv.index("--no-add-to-held-pairs"):][:3] == [
+            "--no-add-to-held-pairs", "--sell-at=85", "--sell-min-days=7"]
+        # Every level of the grid is spelled as its exact whole percent (0.29 * 100
+        # is 28.999999999999996) and reads back as the same level
+        parser = main._build_parser()
+        for percent in range(1, 101):
+            target = dataclasses.replace(_ARGV_TARGETS["seed"], sell_at=percent / 100)
+            argv = config.live_settings_argv(target)
+            assert f"--sell-at={percent}" in argv and "--no-sell" not in argv
+            assert "--no-sell-min-days" in argv
+            args = parser.parse_args(["--mode", "prod", *argv])
+            assert args.sell_at / 100 == target.sell_at
 
     def test_a_name_that_begins_with_a_dash_is_read_as_a_name(self):
         target = _ARGV_TARGETS["names-starting-with-a-dash"]
