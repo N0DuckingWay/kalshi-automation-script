@@ -2741,8 +2741,11 @@ class TestTimeSeriesKellyParity:
 
         # live_portfolio is reporting only (the live dashboard's Live trading
         # tab): it imports dashboard for the backtest page's own Sharpe and
-        # Sortino, and nothing on the live trading path imports it
-        band_readers = {"config", "backtester", "backtest", "dashboard", "live_portfolio"}
+        # Sortino, and nothing on the live trading path imports it; nor does
+        # anything import live_dashboard, which serves that tab and imports
+        # live_portfolio
+        band_readers = {"config", "backtester", "backtest", "dashboard", "live_portfolio",
+                        "live_dashboard"}
         names = {m.name for m in pkgutil.iter_modules(kalshi_betting.__path__)}
         # A rename must fail here, not silently shrink the allowlist
         assert band_readers <= names, band_readers - names
@@ -3301,10 +3304,11 @@ class TestTimeSeriesKellyParity:
         # The backtest, its CLI and the dashboard read the saved live defaults for
         # their reports only: none of them names the writer, the file's path, the
         # seed or config's private parse, so none can change what live runs trade.
-        # live_portfolio (the Live trading tab) is left out of the live-path walk,
-        # since it reads the backtest page's ratios, so it is checked here: it has
-        # no use for the live defaults, so it names none of their readers either
-        from kalshi_betting import backtest, live_portfolio
+        # live_portfolio (the Live trading tab) and live_dashboard (which serves
+        # it) are left out of the live-path walk, since live_portfolio reads the
+        # backtest page's ratios, so they are checked here: neither has any use
+        # for the live defaults, so neither names their readers either
+        from kalshi_betting import backtest, live_dashboard, live_portfolio
 
         writes = {"save_live_defaults", "_saved_text", "_sync_directory"}
         names = writes | self._SAVED_FILE_INTERNALS
@@ -3313,7 +3317,7 @@ class TestTimeSeriesKellyParity:
         for name in names | readers:
             assert hasattr(config, name), name
         forbidden_in = {backtester: names, backtest: names, dashboard: names,
-                        live_portfolio: names | readers}
+                        live_portfolio: names | readers, live_dashboard: names | readers}
         for module, forbidden in forbidden_in.items():
             mod = module.__name__.rsplit(".", 1)[-1]
             for node in ast.walk(ast.parse(inspect.getsource(module))):

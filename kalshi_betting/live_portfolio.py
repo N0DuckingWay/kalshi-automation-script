@@ -39,7 +39,8 @@ Dependencies:
     (PROD_LOG_PATH, where the trade log lives, also looked up when it is
     called); dashboard (_sharpe and _sortino, the backtest page's own ratios,
     looked up when called); treasury (RiskFreeRates, the 8-week T-bill
-    yields); _http (api_error_summary, one line per failed request). Nothing
+    yields); _http (api_error_summary, one line per failed request).
+    Imported by live_dashboard (the Live trading tab's server) only; nothing
     in the trading pipeline imports this module: it only reads.
 
 Notes:
@@ -232,6 +233,9 @@ class Market:
         last_price (Decimal | None): The YES price of the last trade.
         archived (bool): True for a market found only in Kalshi's archive
             (/historical/markets), whose daily prices only the archive serves.
+        subtitle (str): Its outcome label ("" when Kalshi gave none): what
+            tells two markets of one question apart, such as the deadline of
+            one rung of a ladder. Kalshi's subtitle, else its yes_sub_title.
     """
     ticker: str
     event_ticker: str
@@ -244,6 +248,7 @@ class Market:
     yes_ask: Decimal | None
     last_price: Decimal | None
     archived: bool = False
+    subtitle: str = ""
 
 
 @dataclass(frozen=True)
@@ -653,12 +658,16 @@ def _market(row: dict, *, archived: bool) -> Market:
         KeyError: If it has no ticker.
     """
     settled = row.get("settlement_ts")
+    # The outcome label: Kalshi's subtitle, else its yes_sub_title (the field
+    # the scanner reads the same label from); anything but text reads as none
+    label = row.get("subtitle") or row.get("yes_sub_title") or ""
     return Market(str(row["ticker"]), str(row.get("event_ticker") or ""),
                   str(row.get("title") or row["ticker"]), str(row.get("status") or ""),
                   str(row.get("result") or ""), _when(settled) if settled else None,
                   _opt_dec(row.get("settlement_value_dollars")),
                   _opt_dec(row.get("yes_bid_dollars")), _opt_dec(row.get("yes_ask_dollars")),
-                  _opt_dec(row.get("last_price_dollars")), archived)
+                  _opt_dec(row.get("last_price_dollars")), archived,
+                  label if isinstance(label, str) else "")
 
 
 def read_markets(client: Any, tickers: Iterable[str]) -> dict[str, Market]:
@@ -2283,7 +2292,7 @@ class PeriodStats:
             chained); None for a period with no time in it.
         pnl (float): The value's change, less deposits plus withdrawals.
         sharpe (float | None): dashboard._sharpe over its whole days' returns;
-            None with fewer than 2 whole days.
+            None with fewer than config.LIVE_RATIO_MIN_WHOLE_DAYS whole days.
         sortino (float | None): dashboard._sortino, likewise.
         whole_days (int): How many whole days (one daily close to the next)
             the two ratios used.
@@ -2378,7 +2387,8 @@ def period_stats(history: History, returns: list[TradeReturn],
     _sortino, at config.CALENDAR_DAYS_PER_YEAR periods a year), over whole
     days only: a day runs from one daily close to the next, its return
     chained over the moments inside it, and the part-days before the
-    period's first close and after its last are left out. They subtract the
+    period's first close and after its last are left out; with fewer than
+    config.LIVE_RATIO_MIN_WHOLE_DAYS whole days there are none. They subtract the
     8-week T-bill yield on the share of the value held in positions at the
     start of each day (the backtest page's rule); with no yields, 0%. The
     trade figures cover the bot purchases first filled in the period.
@@ -2421,7 +2431,7 @@ def period_stats(history: History, returns: list[TradeReturn],
             deployed.append(1 - history.cash[opened] / history.total(opened))
             day = None
     sharpe = sortino = None
-    if len(daily) >= 2:
+    if len(daily) >= config.LIVE_RATIO_MIN_WHOLE_DAYS:
         rf: float | np.ndarray = (0.0 if risk_free is None
                                   else risk_free.annual_on(day_starts) * np.array(deployed))
         series = pd.Series(daily)
@@ -2542,6 +2552,10 @@ class Holding:
         value (Decimal): What they are worth now (at what they cost when
             never priced).
         cost (Decimal): What they cost, fees included.
+        subtitle (str): The market's outcome label (Market.subtitle; "" when
+            it has none or was not found).
+        event_ticker (str): The market's event (_event_of), so the markets
+            of one question can be listed together.
     """
     ticker: str
     title: str
@@ -2551,6 +2565,8 @@ class Holding:
     price: Decimal | None
     value: Decimal
     cost: Decimal
+    subtitle: str = ""
+    event_ticker: str = ""
 
 
 @dataclass(frozen=True)
@@ -2564,7 +2580,8 @@ class LiveView:
         kalshi_positions_value (Decimal | None): What Kalshi says the
             positions are worth; None when its reply had no usable value.
         holdings (tuple[Holding, ...]): What is held now, in group_order,
-            then most valuable first.
+            then by event and market, so the markets of one question (the
+            rungs of a ladder, both legs of a pair on one event) sit together.
         group_order (tuple[str, ...]): The groups, most money put in first,
             with OTHER_BETS last.
         history (History | None): The account over time; None before the
@@ -2627,7 +2644,8 @@ def _holdings(ledger: Ledger, marks: Marks, markets: dict[str, Market],
         out.append(Holding(ticker, market.title if market else ticker, group, side, count,
                            None if mark is None else (mark if side == "yes" else _ONE - mark),
                            _value(side, count, basis[(ticker, group, side)], mark),
-                           basis[(ticker, group, side)]))
+                           basis[(ticker, group, side)], market.subtitle if market else "",
+                           _event_of(ticker, markets)))
     return out
 
 
@@ -2651,6 +2669,25 @@ def _group_order(history: History | None, holdings: list[Holding]) -> tuple[str,
     groups = set(put_in) | set(worth)
     return tuple(sorted(groups, key=lambda g: (g == OTHER_BETS, -put_in.get(g, 0.0),
                                                -worth.get(g, _ZERO), g)))
+
+
+def _sorted_holdings(holdings: list[Holding], group_order: tuple[str, ...]) -> list[Holding]:
+    """
+    Order the holdings for the page: by group, in group_order, then by event and market.
+
+    Within a group the markets of one question (the rungs of a ladder, both
+    legs of a pair on one event) sit together, whatever each is worth.
+
+    Args:
+        holdings (list[Holding]): The holdings, from _holdings.
+        group_order (tuple[str, ...]): The groups' order, from _group_order
+            (it lists every holding's group).
+
+    Returns:
+        list[Holding]: The holdings in that order.
+    """
+    place = {group: i for i, group in enumerate(group_order)}
+    return sorted(holdings, key=lambda h: (place[h.group], h.event_ticker, h.ticker, h.side))
 
 
 def _held_words(count: Decimal) -> str:
@@ -2791,8 +2828,7 @@ def build_live_view(client: Any, *, risk_free: treasury.RiskFreeRates | None,
         for label, months in config.LIVE_DASHBOARD_PERIODS)
     holdings = _holdings(ledger, marks, markets, group_of)
     group_order = _group_order(history, holdings)
-    place = {group: i for i, group in enumerate(group_order)}
-    holdings.sort(key=lambda h: (place[h.group], -h.value, h.ticker, h.side))
+    holdings = _sorted_holdings(holdings, group_order)
 
     run_of = {trade.trade_id: trade.logged_at for trade in trades}
     first_bot_fill: dict[datetime, datetime] = {}

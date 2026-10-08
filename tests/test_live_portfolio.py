@@ -445,6 +445,17 @@ class TestReadsAgainWhenTheAccountChanges:
 
 
 class TestReadMarkets:
+    def test_the_outcome_label_is_the_subtitle_else_yes_sub_title(self, kalshi):
+        kalshi.rows["/markets"] = [
+            {"ticker": "R1", "title": "When?", "yes_sub_title": "Before Dec 1, 2026"},
+            {"ticker": "R2", "title": "When?", "subtitle": "Before Nov 1, 2026",
+             "yes_sub_title": "ignored"},
+            {"ticker": "R3", "title": "When?", "yes_sub_title": 7},
+            {"ticker": "R4", "title": "When?"}]
+        found = live_portfolio.read_markets(object(), ["R1", "R2", "R3", "R4"])
+        assert {t: m.subtitle for t, m in found.items()} == {
+            "R1": "Before Dec 1, 2026", "R2": "Before Nov 1, 2026", "R3": "", "R4": ""}
+
     def test_live_first_then_the_archive(self, kalshi, monkeypatch):
         monkeypatch.setattr(config, "LIVE_MARKET_TICKERS_PER_REQUEST", 2)
         kalshi.rows["/markets"] = [
@@ -2179,7 +2190,7 @@ class TestSnapshot:
             "kalshi_positions_value": "7.85", "holdings_value": "4.50", "changing": False,
             "holdings": [{"ticker": "A", "title": "Will A?", "group": "Crypto", "side": "yes",
                           "contracts": "10", "price": "0.45", "value": "4.50",
-                          "cost": "3.0700"}]}
+                          "cost": "3.0700", "subtitle": "", "event_ticker": ""}]}
         never_priced = dataclasses.replace(_view().holdings[0], price=None)
         record = live_portfolio.snapshot_record(
             _view(holdings=(never_priced,), kalshi_positions_value=None))
@@ -2247,7 +2258,8 @@ class TestBuildLiveView:
         kalshi.balance = {"balance_breakdown": [{"exchange_index": 0,
                                                  "balance_dollars": "90.9050"}],
                           "portfolio_value": 1225}
-        kalshi.rows["/markets"] = [_market_row("A1", "KXCRYPTO-26DEC", "0.40", "0.50"),
+        kalshi.rows["/markets"] = [{**_market_row("A1", "KXCRYPTO-26DEC", "0.40", "0.50"),
+                                    "yes_sub_title": "Above $100k"},
                                    _market_row("B1", "KXCRYPTO-26DEC31", "0.55", "0.65"),
                                    _market_row("X", "KXWEATHER-26OCT", "0.20", "0.30")]
         closes = live_portfolio.day_ends(T0 - timedelta(days=3), datetime.now(UTC))
@@ -2271,6 +2283,8 @@ class TestBuildLiveView:
             ("B1", "Crypto", "no", D(13), D("0.40"), D("5.20"), D("5.2000")),
             ("X", OTHER_BETS, "yes", D(5), D("0.25"), D("1.25"), D("1.0000"))]
         assert view.holdings[0].title == "Will A1?"
+        assert [(h.subtitle, h.event_ticker) for h in view.holdings] == [
+            ("Above $100k", "KXCRYPTO-26DEC"), ("", "KXCRYPTO-26DEC31"), ("", "KXWEATHER-26OCT")]
         assert view.holdings_value == D("12.30")
         # The banner's $100.00 against $100.0050 rebuilt just before the pair
         assert (view.cash_check.matched, view.cash_check.checked) == (1, 1)
@@ -2332,11 +2346,12 @@ class TestBuildLiveView:
             series_categories={**self.CATEGORIES, "KXWEATHER": ("Climate", ("Rain",))},
             trade_logs=live_portfolio.trade_log_paths())
         assert view.warnings == ()
-        # Crypto put in $9.10 and Climate $4.00, though Climate is worth more now
+        # Crypto put in $9.10 and Climate $4.00, though Climate is worth more now;
+        # within a group, by event (D1's KXCRYPTO-26NOV before C1's KXWEATHER-26OCT)
         assert view.group_order == ("Crypto", "Climate", OTHER_BETS)
         assert [(h.ticker, h.group, h.value) for h in view.holdings] == [
             ("A1", "Crypto", D("5.85")), ("B1", "Crypto", D("5.20")),
-            ("C1", "Climate", D("9.00")), ("D1", "Climate", D("9.00"))]
+            ("D1", "Climate", D("9.00")), ("C1", "Climate", D("9.00"))]
         # X was looked up once the ledger showed it held at the start, so it
         # has its daily price there (0.25), not what it cost (0.20)
         asked = [params["tickers"] for path, params in kalshi.calls if path == "/markets"]
@@ -2399,6 +2414,20 @@ class TestBuildLiveView:
             ("A1", D("5.85")), ("B1", D("5.20")), ("X", D("1.25"))]
         assert fake.calls == []                          # no daily prices to read
         assert view.cash_check.checked == 0
+
+    def test_the_rungs_of_one_question_sit_together(self):
+        def held(ticker, event, group, value, side="yes"):
+            return Holding(ticker, f"Will {ticker}?", group, side, D(1), D("0.5"), D(value),
+                           D(1), "", event)
+
+        rung_dec = held("Q-26DEC01", "Q", "Tech", "1", "no")
+        rung_nov = held("Q-26NOV01", "Q", "Tech", "9")
+        other = held("P-1", "P", "Tech", "5")
+        mine = held("Z", "Z", OTHER_BETS, "50")
+        ordered = live_portfolio._sorted_holdings([mine, rung_nov, other, rung_dec],
+                                                  ("Tech", OTHER_BETS))
+        # By value the two rungs would sit apart, with P-1 ($5) between them
+        assert [h.ticker for h in ordered] == ["P-1", "Q-26DEC01", "Q-26NOV01", "Z"]
 
     def test_a_purchase_whose_market_was_not_found_is_filed_by_its_ticker(self):
         markets = {"A": _market("A", event="KXFED-26DEC")}

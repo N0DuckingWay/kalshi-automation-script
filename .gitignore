@@ -51,6 +51,12 @@ run_result.json
 # of git
 /live_runs/
 
+# The live dashboard's record of each read of the account
+# (config.LIVE_PORTFOLIO_LOG_FILE): the cash and every holding, one JSON line
+# per page load. Operator state; its server log, kalshi_live_dashboard.log,
+# is covered by *.log above
+live_portfolio_log.jsonl
+
 # Python
 __pycache__/
 *.py[cod]

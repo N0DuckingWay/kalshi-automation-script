@@ -776,6 +776,10 @@ LIVE_MARKS_CACHE_DIR = PROJECT_ROOT / "backtest_cache" / "live_marks"
 # back from now; 0 means since the bot's first live trade).
 LIVE_DASHBOARD_PERIODS = (("All", 0), ("1Y", 12), ("6M", 6), ("3M", 3), ("1M", 1))
 
+# The Live trading tab's Sharpe and Sortino need at least this many whole days
+# (one daily close to the next) in a period; with fewer they show "—".
+LIVE_RATIO_MIN_WHOLE_DAYS = 2
+
 # One JSON line per read of the account: when it was read, the cash, Kalshi's
 # own value of the positions, and every holding with its value. Read when
 # used, so tests point it elsewhere.
@@ -797,6 +801,68 @@ LIVE_CASH_CHECK_ABOVE_PER_SHARD_DOLLARS = "0.01"
 # The rebuilt cash a mismatched run's warning shows is rounded to this: the
 # hundredth of a cent the account keeps its cash to. Text, for decimal.Decimal.
 LIVE_CASH_SHOWN_STEP_DOLLARS = "0.0001"
+
+# Where live_dashboard.py listens: the tab page and its account data on one
+# port, the backtest page on another. Two ports are two web origins, so
+# nothing on the backtest page (or the chart library it loads from the web)
+# can read the account, and nothing on either can press the defaults
+# server's buttons (DEFAULTS_SERVER_PORT). Loopback only.
+LIVE_DASHBOARD_HOST = "127.0.0.1"
+LIVE_DASHBOARD_PORT = 8766
+LIVE_BACKTEST_PORT = 8767
+
+# Seconds the live dashboard waits on a silent connection before dropping it.
+# A file being sent (the backtest page can be hundreds of MB) is sent with no
+# limit, so a slow reader is never cut off part way.
+LIVE_DASHBOARD_SOCKET_TIMEOUT_SECONDS = 30
+
+# The header the Live tab's own script adds when it asks for the account
+# (GET /api/live, value "1"). A request without it is refused, so another web
+# page cannot make this server read the account.
+LIVE_DASHBOARD_REQUEST_HEADER = "X-Live-Dashboard"
+
+# Every Kalshi request the live dashboard's own client sends: (connect, read)
+# timeouts in seconds, so one stalled request cannot hold a page load forever.
+LIVE_KALSHI_TIMEOUT_SECONDS = (10, 60)
+
+# One read of the account at a time: a request that arrives while a read is
+# going waits at most this many seconds for that read's result (503 after).
+LIVE_DASHBOARD_BUILD_WAIT_SECONDS = 300
+
+# How often, in seconds, the live dashboard downloads the 8-week T-bill
+# yields again (new auctions are weekly).
+LIVE_RISK_FREE_REFRESH_SECONDS = 24 * 60 * 60
+
+# A read of the account that starts before the first T-bill download has
+# finished waits at most this many seconds for it (then its ratios subtract
+# 0%, and the page says so). The download can take minutes when the
+# Treasury's server does not answer, so the wait is short.
+LIVE_RISK_FREE_FIRST_WAIT_SECONDS = 10
+
+# How many connections each of the live dashboard's two servers lets wait to
+# be accepted: a page load and the backtest page's chunk files can arrive
+# together, and macOS refuses a connection past the queue outright.
+LIVE_DASHBOARD_LISTEN_BACKLOG = 64
+
+# When the live dashboard finds its port taken (a program already answers a
+# connection to it, or the port cannot be bound), it asks the server there
+# what it is (GET /health): the wait in seconds for the connection and the
+# answer, and the most it reads.
+LIVE_DASHBOARD_HEALTH_TIMEOUT_SECONDS = 5
+LIVE_DASHBOARD_HEALTH_MAX_BYTES = 65_536
+
+# A file the live dashboard sends is copied in blocks of this many bytes.
+LIVE_DASHBOARD_FILE_BLOCK_BYTES = 1_048_576
+
+# The chart library the Live tab loads: the same Plotly build the backtest
+# page loads, and its integrity hash (the sha384 of that file, so the browser
+# runs it only when it is exactly that file).
+LIVE_DASHBOARD_PLOTLY_URL = "https://cdn.plot.ly/plotly-2.30.0.min.js"
+LIVE_DASHBOARD_PLOTLY_SRI = "sha384-H7GB7Kme/VbPI/0S4LNq7OixFNVRgRGE8kyqTntBuiXle1KBm8KWLQh/Ah6bXCYW"
+
+# The Live tab draws at most this many categories by name, each in a color of
+# its own; the rest are drawn together as "More categories".
+LIVE_DASHBOARD_MAX_CATEGORY_BANDS = 6
 
 # Which side each leg of a pair buys, as (side bought on market_a, side bought
 # on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
