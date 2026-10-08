@@ -11696,8 +11696,9 @@ def run_backtest_sweep(
             a lazy SellSweep over every level of config.TAKE_PROFIT_LEVELS and
             every minimum of days of config.TAKE_PROFIT_MIN_DAYS. The flag
             adds no simulation to the run itself. False (default)
-            returns None, as does the infeasible window. Backtest-only: live
-            trading never sells.
+            returns None, as does the infeasible window. Backtest-only: a live
+            run sells only at its saved sell_at level (seller.plan_sales),
+            which the dashboard's "Save as live defaults…" can set.
         depth_model (DepthModel | None): Keyword-only. The depth model every
             trade's synthetic order book is built from
             (depth_model.load_depth_model()); None (default) fills every trade

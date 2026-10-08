@@ -419,10 +419,12 @@ def _with_simulated_proceeds(sales: list, cash_cents: int,
 def _record_sales(sales: list, cash_before_cents: int, cash_after_cents: int,
                   run_note: str) -> None:
     """
-    Add this run's sales to the trade log at once, or dump them to the log if that fails.
+    Add this run's sales to the trade log, or dump them to the log if that fails.
 
-    Called as soon as the sales are done and before anything is bought, so a
-    sale order that filled is on record however the run ends. If the write
+    Called before anything is bought, so a sale order that filled is on
+    record however the rest of the run ends. A dry run calls it right after
+    the sales are sent; a live run that sold calls it once it has read its
+    positions and cash back (or at once if that read raises). If the write
     fails (the file is open elsewhere, say), every sale is dumped as a
     CRITICAL RESCUE line and the error is raised again, which stops the run
     before it buys anything.

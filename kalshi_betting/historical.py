@@ -6141,8 +6141,8 @@ def recent_candles(client: Any, ticker: str, event_ticker: str, start_ts: int,
     long for one request paged (_candle_request_windows), each request a
     retried read-only GET, and each candle parsed by _fetch_candle_pages.
     Unlike fetch_candlesticks it never reads or writes the candle cache: a
-    live run touches nothing under backtest_cache/, and its candles must be
-    the latest the exchange has.
+    live sale's candle reads touch nothing under backtest_cache/, and its
+    candles must be the latest the exchange has.
 
     Hourly candles are sparse: many hours of a quiet market have no candle
     at all, so a gap is normal. A candle that cannot be parsed is left out,
