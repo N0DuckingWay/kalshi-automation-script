@@ -113,8 +113,8 @@ Dependencies:
     contract count exactly in an alert or a marker); scanner.py (each leg's
     side and price, pair_held, which says which held pair, if any, a pair
     adds to, the price-grid math — ceil_to_tick, floor_to_tick,
-    tick_size_for_price, and _V2_MIN_PRICE, the lowest valid limit price —
-    walk_bids for a sale's prices, and
+    tick_size_for_price, and v2_bottom_of_grid_price, the lowest level of a
+    market's grid — walk_bids for a sale's prices, and
     validate_pair_price); _http.py (signed requests, retried position reads
     and readers for error replies); auth.py (read_shard_balances);
     reporter.py (TradeResult, SaleResult); strategy.py (TradeSpec); and
@@ -236,13 +236,13 @@ from .config import (
 from .reporter import SaleResult, TradeResult
 from .scanner import (
     _SCANNED_PRICE_QUANTUM,
-    _V2_MIN_PRICE,
     ceil_to_tick,
     floor_to_tick,
     leg_prices,
     leg_sides,
     pair_held,
     tick_size_for_price,
+    v2_bottom_of_grid_price,
     v2_limit_price,
     validate_pair_price,
     walk_bids,
@@ -3325,9 +3325,9 @@ def _sale_limit(market: Any, side: str, lowest_bid: float, slippage_ticks: int) 
         )
         # Rounded DOWN onto the grid of the band the bid lies in
         price = floor_to_tick(cap, tick_size_for_price(market, float(cap)))
-    # Cross-module: the lowest tradeable level is one tick of the grid above 0,
-    # as v2_limit_price clamps a buy leg's price
-    bottom = tick_size_for_price(market, float(_V2_MIN_PRICE))
+    # Cross-module: the lowest tradeable level of the market's grid, the one
+    # v2_limit_price clamps a buy leg's price to as well
+    bottom = v2_bottom_of_grid_price(market)
     return min(max(price, bottom), _v2_top_of_grid_price(market))
 
 

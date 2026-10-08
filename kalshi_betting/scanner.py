@@ -69,7 +69,9 @@ Dependencies:
     through walk_bids (backtester._ladder_average), live selling
     (seller.plan_sales) walks a held market's real bids (bid_ladder) the same
     way, and trader.sell_positions prices its sale orders from those walks,
-    rounding a NO sale's YES bid down with floor_to_tick. get_settlements()
+    rounding a NO sale's YES bid down with floor_to_tick and keeping every
+    sale's price at or above v2_bottom_of_grid_price, the lowest level of a
+    market's grid. get_settlements()
     reads the markets the account held when they paid
     out (Settlement: counts, cost, fees and payout), and market_for_labels()
     finds a market by ticker in the run's list, or else from the exchange as
@@ -691,6 +693,28 @@ def floor_to_tick(price: Decimal, tick: Decimal) -> Decimal:
     return (price / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
 
 
+def v2_bottom_of_grid_price(market: Any) -> Decimal:
+    """
+    The lowest tradeable level of one market's own tick grid, in dollars.
+
+    Prices live strictly between 0 and 1, so the lowest level is one tick
+    above 0 on the grid of the band that holds the smallest price: 0.01 on a
+    linear-cent grid, 0.001 on deci-cent, 0.0001 on a centi-cent edge band.
+    It is the one definition of that level: v2_limit_price keeps a buy leg's
+    price at or above it, trader._sale_limit keeps a sale's price at or above
+    it, and the human-run V2 probe sells a held YES at exactly this level.
+
+    Args:
+        market (Any): The market whose grid to use. Any object exposing
+            price_level_structure / price_ranges.
+
+    Returns:
+        Decimal: The lowest valid price level on this market's grid.
+    """
+    # The market's own tick at the finest possible price
+    return tick_size_for_price(market, float(_V2_MIN_PRICE))
+
+
 def v2_limit_price(leg_kind: str, scanned_price_dollars: float, market: Any) -> Decimal:
     """
     Compute the limit price for one V2 buy leg, in dollars.
@@ -744,7 +768,7 @@ def v2_limit_price(leg_kind: str, scanned_price_dollars: float, market: Any) -> 
     price = ceil_to_tick(price, final_tick)
     # Grid-aware clamp: the extreme valid levels are one tick inside 0 and 1
     # on this market's own grid at each end of the book
-    bottom_tick = tick_size_for_price(market, float(_V2_MIN_PRICE))
+    bottom_tick = v2_bottom_of_grid_price(market)
     top_tick = tick_size_for_price(market, float(Decimal("1") - _V2_MIN_PRICE))
     return min(max(price, bottom_tick), Decimal("1") - top_tick)
 

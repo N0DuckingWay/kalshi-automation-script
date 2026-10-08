@@ -22,6 +22,12 @@ Purpose:
     line says to stop trading after a FAIL but never to flatten, and asks for
     nothing after a NEUTRAL.
 
+    --step yes-close (TestYesCloseBodies, TestYesCloseStep,
+    TestYesCloseDispatch) buys 0.01 YES and sells it with the reduce-only ask
+    live selling sends: its bodies must come from trader._build_yes_order_v2
+    and trader._build_sale_order_v2, and it PASSes only when the account reads
+    exactly flat after the sale.
+
 Dependencies:
     Imports v2_probe, trader and config (the fee model); patches at each
     function's definition site.
@@ -40,6 +46,7 @@ Notes:
 """
 import inspect
 import json
+import sys
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -47,7 +54,7 @@ from unittest.mock import MagicMock
 import pytest
 from kalshi_python_sync.exceptions import ApiException
 
-from kalshi_betting import config, trader, v2_probe
+from kalshi_betting import config, scanner, trader, v2_probe
 from kalshi_betting.scanner import PriceRange
 
 TICKER = "PROBE-TICKER"
@@ -179,7 +186,8 @@ class FakeExchange:
     a canned kill, which cannot show whether a price would actually have
     crossed. This models the single fact DR-04 turns on: an ASK (sell YES)
     fills only at or BELOW the resting YES bid, a BID (buy YES) fills only at
-    or ABOVE the resting YES ask. An order that does not cross is answered as
+    or ABOVE the resting YES ask. A reduce-only order closes no more than the
+    position it reduces. An order that does not cross is answered as
     the exchange answers it: a fill_or_kill order with the HTTP 409 kill
     response (fok_kill_error), an immediate_or_cancel order with a 2xx that
     has nothing filled and the full count remaining. A body the endpoint
@@ -212,13 +220,17 @@ class FakeExchange:
             # The exchange rejects a fill-or-kill that cannot fill before it
             # matches: an error response, and the position does not move.
             raise fok_kill_error()
-        if body["reduce_only"]:
+        if body["reduce_only"] and body["side"] == "bid":
             # reduce_only can only close existing exposure: a YES bid buys
             # back no more than the NO position actually held, and cannot
             # touch an account that is flat or already long (a bare
             # min(signed, -position) would turn the bid into a SALE out of a
             # long holding and report it as a fill).
             signed = min(signed, max(-self.position, Decimal("0")))
+        elif body["reduce_only"]:
+            # The mirror for an ask: it sells no more than the YES actually
+            # held, and cannot touch an account that is flat or already short.
+            signed = max(signed, -max(self.position, Decimal("0")))
         self.position += signed
         return v2_resp(str(abs(signed)), str(count - abs(signed)))
 
@@ -1714,6 +1726,630 @@ class TestMainDispatch:
         )
         assert v2_probe._ORDER_FAIL_CLOSING.startswith(v2_probe._STOP_TRADING)
         assert v2_probe._TRANSFER_FAIL_CLOSING.startswith(v2_probe._STOP_TRADING)
+
+
+def two_sided_book_resp(yes_bid: str = "0.59", no_bid: str = "0.40",
+                        qty: str = "500") -> SimpleNamespace:
+    """Raw orderbook response with a resting bid on each side.
+
+    A NO bid at 0.40 is a YES ask at 0.60, which the yes-close step's bid buys
+    from; the YES bid at 0.59 is what its sale sells into.
+    """
+    payload = {
+        "orderbook_fp": {"yes_dollars": [[yes_bid, qty]], "no_dollars": [[no_bid, qty]]},
+    }
+    return SimpleNamespace(status=200, data=json.dumps(payload).encode("utf-8"))
+
+
+def yes_close_client(positions: list | None = None, exchange_index: int = 0) -> MagicMock:
+    """probe_client with a two-sided book, which the yes-close step needs.
+
+    `positions` defaults to an empty list, for tests that answer position
+    reads through a patched trader._position_count instead.
+    """
+    client = probe_client(positions or [], exchange_index=exchange_index)
+    client.get_market_orderbook_without_preload_content = MagicMock(
+        return_value=two_sided_book_resp()
+    )
+    return client
+
+
+def answer_in_turn(monkeypatch, responses: list) -> list:
+    """Answer each probe submission with the next of `responses`.
+
+    An exception in the list is raised instead of returned. A body the
+    endpoint itself would refuse gets its HTTP 400 first
+    (reject_like_the_endpoint). Returns the list of bodies sent, in order.
+    """
+    submitted: list = []
+    queue = iter(responses)
+
+    def post(client, method, path, *, query=None, body=None):
+        assert method == "POST"
+        submitted.append(body)
+        reject_like_the_endpoint(body)
+        item = next(queue)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    monkeypatch.setattr(v2_probe, "signed_request_json", post)
+    return submitted
+
+
+def script_reads(monkeypatch, reads: list) -> tuple:
+    """Answer trader._position_count from `reads` and record each pause.
+
+    Returns (observed reads, sleep durations, handling), where `handling`
+    holds, for each read, the type of the exception being handled when the
+    read was made — None when it was made outside every except clause.
+    """
+    seq = iter(reads)
+    observed: list = []
+    handling: list = []
+
+    def scripted(client, ticker):
+        value = next(seq)
+        observed.append(value)
+        handling.append(sys.exc_info()[0])
+        return value
+
+    slept: list = []
+    monkeypatch.setattr(trader, "_position_count", scripted)
+    monkeypatch.setattr(v2_probe.time, "sleep", lambda s: slept.append(s))
+    return observed, slept, handling
+
+
+def _flat_market(structure: str = "", ranges: list | None = None) -> SimpleNamespace:
+    """A stand-in market carrying only what the order builders read."""
+    return SimpleNamespace(
+        ticker=TICKER, price_level_structure=structure, price_ranges=ranges, exchange_index=0,
+    )
+
+
+class TestYesCloseBodies:
+    """The yes-close step's two bodies come from the real trader builders: the
+    YES-leg builder for the buy (count and price overridden) and the live sale
+    builder for the reduce-only ask (count overridden, limit at the bottom of
+    the grid)."""
+
+    @pytest.mark.parametrize(
+        "structure, ranges, expected_price", TestBodyConstruction._TOP_OF_GRID_BY_REGIME,
+    )
+    def test_buy_body_is_the_yes_builders_with_count_and_price_overridden(
+        self, structure, ranges, expected_price,
+    ):
+        market = _flat_market(structure, ranges)
+        body = v2_probe._yes_buy_body(market, 0.60)
+        reference = trader._build_yes_order_v2(trader._Leg(
+            market=market, side="yes", price_dollars=0.60, count=1, label="YES on v2-probe",
+        ))
+        for key in ("ticker", "side", "time_in_force", "self_trade_prevention_type",
+                    "exchange_index", "reduce_only", "post_only"):
+            assert body[key] == reference[key]
+        assert body["side"] == "bid"
+        assert body["time_in_force"] == "fill_or_kill"
+        assert body["reduce_only"] is False
+        assert body["count"] == v2_probe.PROBE_COUNT_STR
+        # The bid sits at the top of the grid, so it crosses any resting ask
+        assert body["price"] == expected_price
+        reject_like_the_endpoint(body)
+
+    # (price_level_structure, price_ranges, the lowest level of that grid):
+    # the same fixtures as the top-of-grid list above.
+    _GRID_BOTTOM_BY_REGIME = [
+        ("", None, "0.0100"),
+        ("linear_cent", [PriceRange(start=0.0, end=1.0, step=0.01)], "0.0100"),
+        ("deci_cent", [PriceRange(start=0.0, end=1.0, step=0.001)], "0.0010"),
+        ("tapered_deci_cent", [
+            PriceRange(start=0.0, end=0.05, step=0.001),
+            PriceRange(start=0.05, end=0.95, step=0.01),
+            PriceRange(start=0.95, end=1.0, step=0.001),
+        ], "0.0010"),
+        ("center_deci_edge_centi_cent", [
+            PriceRange(start=0.0, end=0.01, step=0.0001),
+            PriceRange(start=0.01, end=0.99, step=0.001),
+            PriceRange(start=0.99, end=1.0, step=0.0001),
+        ], "0.0001"),
+    ]
+
+    @pytest.mark.parametrize("structure, ranges, expected_price", _GRID_BOTTOM_BY_REGIME)
+    def test_sale_body_is_the_live_sale_builders_with_the_probe_count(
+        self, structure, ranges, expected_price,
+    ):
+        market = _flat_market(structure, ranges)
+        body = v2_probe._yes_close_body(market)
+        reference = trader._build_sale_order_v2(market, "yes", 1, Decimal(expected_price))
+        # Every key but the count (and the random client_order_id) is what
+        # the live sale builder sends for that limit
+        for key in ("ticker", "side", "price", "time_in_force",
+                    "self_trade_prevention_type", "exchange_index",
+                    "reduce_only", "post_only"):
+            assert body[key] == reference[key]
+        assert body["side"] == "ask"
+        assert body["reduce_only"] is True
+        assert body["time_in_force"] == "immediate_or_cancel"
+        assert body["self_trade_prevention_type"] == config.V2_SELF_TRADE_PREVENTION_TYPE
+        assert body["self_trade_prevention_type"] in _V2_SELF_TRADE_PREVENTION
+        assert body["post_only"] is False
+        assert body["count"] == v2_probe.PROBE_COUNT_STR
+        assert body["price"] == expected_price
+        # The price is the grid's lowest level as scanner defines it, the same
+        # level a live sale's price is clamped to when its walked bid is lower
+        bottom = scanner.v2_bottom_of_grid_price(market)
+        assert body["price"] == trader._format_price(bottom)
+        assert trader._sale_limit(market, "yes", 0.0001, 1) == bottom
+        # The endpoint accepts this body
+        reject_like_the_endpoint(body)
+
+
+class TestYesCloseStep:
+    """--step yes-close: buy 0.01 YES, sell it with the reduce-only ask live
+    selling sends, and PASS only when the account reads exactly flat."""
+
+    def test_buy_and_sale_against_a_book_that_honours_prices_passes(self, monkeypatch):
+        exchange = FakeExchange(yes_bid="0.59", yes_ask="0.60")
+        monkeypatch.setattr(v2_probe, "signed_request_json", exchange.submit)
+        monkeypatch.setattr(trader, "_position_count", exchange.position_count)
+        out = v2_probe._step_yes_close(yes_close_client(exchange_index=2), TICKER, True, 1)
+        assert out == v2_probe._PASS
+        assert exchange.position == 0
+        buy, sale = exchange.submitted
+        assert (buy["side"], buy["price"], buy["time_in_force"], buy["reduce_only"]) == (
+            "bid", "0.9900", "fill_or_kill", False,
+        )
+        assert (sale["side"], sale["price"], sale["time_in_force"], sale["reduce_only"]) == (
+            "ask", "0.0100", "immediate_or_cancel", True,
+        )
+        assert buy["count"] == sale["count"] == v2_probe.PROBE_COUNT_STR
+        # Both orders route to the market's own shard
+        assert buy["exchange_index"] == sale["exchange_index"] == 2
+
+    def test_orders_post_to_the_v2_order_path(self, submits, monkeypatch):
+        script_reads(monkeypatch, [0, 0.01, 0])
+        out = v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1)
+        assert out == v2_probe._PASS
+        assert [b["path"] for b in submits] == [config.V2_ORDER_PATH] * 2
+        assert [b["body"]["side"] for b in submits] == ["bid", "ask"]
+
+    def test_a_killed_buy_is_neutral_and_sends_no_sale(self, monkeypatch, capsys):
+        # No YES ask at or under the top of the grid: the exchange answers the
+        # fill-or-kill bid with its HTTP 409 kill and nothing is bought.
+        exchange = FakeExchange(yes_bid="0.59", yes_ask="1.00")
+        monkeypatch.setattr(v2_probe, "signed_request_json", exchange.submit)
+        monkeypatch.setattr(trader, "_position_count", exchange.position_count)
+        out = v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1)
+        assert out == v2_probe._NEUTRAL
+        assert exchange.position == 0
+        assert len(exchange.submitted) == 1
+        printed = capsys.readouterr().out
+        assert "HTTP 409" in printed
+        assert "nothing to sell" in printed
+
+    def test_a_2xx_kill_is_neutral_and_is_not_re_read(self, monkeypatch, capsys):
+        submitted = answer_in_turn(monkeypatch, [KILLED])
+        observed, slept, _ = script_reads(monkeypatch, [0, 0])
+        out = v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1)
+        assert out == v2_probe._NEUTRAL
+        assert len(submitted) == 1
+        assert observed == [0, 0]
+        assert slept == []
+        assert "killed unfilled and the account is still flat" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("reads", [[0, 0.01, 0.01], [0, None, None]],
+                             ids=["position-stays-open", "lookup-keeps-failing"])
+    def test_a_kill_with_an_account_that_is_not_flat_fails(self, monkeypatch, capsys, reads):
+        submitted = answer_in_turn(monkeypatch, [fok_kill_error()])
+        observed, slept, _ = script_reads(monkeypatch, reads)
+        out = v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        assert len(submitted) == 1
+        assert observed == reads
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert "FLATTEN ANY POSITION YOU FIND" in capsys.readouterr().out
+
+    def test_a_sale_that_sells_nothing_fails_naming_the_position(self, monkeypatch, capsys):
+        # The book the probe read showed a YES bid, but by the time the sale
+        # arrives there is none at or above the bottom of the grid: the
+        # immediate-or-cancel ask fills nothing and the 0.01 YES stays open.
+        exchange = FakeExchange(yes_bid="0.00", yes_ask="0.60")
+        monkeypatch.setattr(v2_probe, "signed_request_json", exchange.submit)
+        monkeypatch.setattr(trader, "_position_count", exchange.position_count)
+        slept: list = []
+        monkeypatch.setattr(v2_probe.time, "sleep", lambda s: slept.append(s))
+        out = v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        assert exchange.position == Decimal("0.01")
+        assert len(exchange.submitted) == 2
+        # The open position is read once more before the verdict
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "did NOT return the position to flat" in printed
+        assert "the position is still 0.01: the ask sold nothing" in printed
+        assert_names_the_remedy(printed)
+
+    @pytest.mark.parametrize("final, words", [
+        (0.02, "the position grew from 0.01 to 0.02: the ask added YES"),
+        (-0.01, "the position is -0.01, a NO position: the ask sold past zero"),
+        (0.005, "the position is 0.005: the ask sold only part of the 0.01 held"),
+        (None, "the position lookup failed"),
+    ], ids=["more-yes", "into-no", "part-sold", "lookup-fails"])
+    def test_a_sale_that_does_not_end_flat_fails_naming_it(
+        self, submits, monkeypatch, capsys, final, words,
+    ):
+        observed, slept, _ = script_reads(monkeypatch, [0, 0.01, final, final])
+        out = v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        assert observed == [0, 0.01, final, final]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert len(submits) == 2
+        printed = capsys.readouterr().out
+        assert words in printed
+        assert f"Position after re-read: {final}" in printed
+        assert_names_the_remedy(printed)
+
+    def test_a_lagging_ledger_after_the_sale_passes(self, submits, monkeypatch, capsys):
+        observed, slept, _ = script_reads(monkeypatch, [0, 0.01, 0.01, 0])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._PASS
+        assert observed == [0, 0.01, 0.01, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "Position after the sale: 0.01" in printed
+        assert "Position after re-read: 0" in printed
+
+    def test_a_flat_read_after_the_sale_is_not_re_read(self, submits, monkeypatch):
+        observed, slept, _ = script_reads(monkeypatch, [0, 0.01, 0])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._PASS
+        assert observed == [0, 0.01, 0]
+        assert slept == []
+
+    def test_a_lagging_ledger_after_the_buy_is_re_read_before_the_sale(
+        self, submits, monkeypatch,
+    ):
+        observed, slept, _ = script_reads(monkeypatch, [0, 0, 0.01, 0])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._PASS
+        assert observed == [0, 0, 0.01, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert len(submits) == 2
+
+    def test_a_buy_that_opens_no_fails_and_sends_no_sale(self, submits, monkeypatch, capsys):
+        script_reads(monkeypatch, [0, -0.01])
+        out = v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        assert len(submits) == 1
+        printed = capsys.readouterr().out
+        assert "NEGATIVE (NO) position of -0.01" in printed
+        assert f"A POSITION IS OPEN ON {TICKER}" in printed
+        assert_names_the_remedy(printed)
+
+    def test_a_filled_buy_that_stays_flat_fails(self, submits, monkeypatch, capsys):
+        observed, slept, _ = script_reads(monkeypatch, [0, 0, 0])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, 0, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert len(submits) == 1
+        assert "still 0 after a re-read" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("body", TestNonObjectOrderBody._NON_OBJECT_BODIES)
+    def test_a_non_object_buy_body_fails_and_checks_the_account(
+        self, body, monkeypatch, capsys,
+    ):
+        submitted = answer_in_turn(monkeypatch, [body])
+        observed, slept, _ = script_reads(monkeypatch, [0, 0.01])
+        out = v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        # The position was looked up, and the sale was never sent
+        assert observed == [0, 0.01]
+        assert slept == []
+        assert len(submitted) == 1
+        printed = capsys.readouterr().out
+        assert type(body).__name__ in printed
+        assert "FLATTEN IT MANUALLY" in printed
+
+    def test_a_non_object_buy_body_with_a_flat_first_read_is_re_read(
+        self, monkeypatch, capsys,
+    ):
+        submitted = answer_in_turn(monkeypatch, ["accepted"])
+        observed, slept, _ = script_reads(monkeypatch, [0, 0, 0.01])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, 0, 0.01]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert len(submitted) == 1
+        assert "FLATTEN IT MANUALLY" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("body", TestUnreadableFillCountsChecksTheAccount._UNREADABLE_BODIES)
+    def test_unreadable_fill_counts_fail_and_check_the_account(
+        self, body, monkeypatch, capsys,
+    ):
+        submitted = answer_in_turn(monkeypatch, [body])
+        observed, slept, _ = script_reads(monkeypatch, [0, 0, 0.01])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, 0, 0.01]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert len(submitted) == 1
+        assert "FLATTEN IT MANUALLY" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("fill, remaining", TestNonConformingFillOrKill._NON_CONFORMING)
+    def test_a_fill_or_kill_reply_that_cannot_happen_fails(
+        self, fill, remaining, monkeypatch, capsys,
+    ):
+        submitted = answer_in_turn(monkeypatch, [v2_resp(fill, remaining)])
+        script_reads(monkeypatch, [0, 0.01])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._FAIL
+        assert len(submitted) == 1
+        printed = capsys.readouterr().out
+        assert f"fill_count={fill}" in printed
+        assert f"remaining_count={remaining}" in printed
+        assert "CONFIRMED" not in printed
+        assert_names_the_remedy(printed)
+
+    def test_a_buy_error_fails_and_reads_the_account_after_the_except(
+        self, monkeypatch, capsys,
+    ):
+        submitted = answer_in_turn(
+            monkeypatch, [ApiException(status=400, reason="Bad Request")],
+        )
+        observed, slept, handling = script_reads(monkeypatch, [0, 0, 0.01])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._FAIL
+        assert len(submitted) == 1
+        # Flat first read after the error: read once more, which finds the YES
+        assert observed == [0, 0, 0.01]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        # No read is made while the submission's error is being handled
+        assert handling == [None, None, None]
+        printed = capsys.readouterr().out
+        assert "YES-buy submission raised" in printed
+        assert "FLATTEN IT MANUALLY" in printed
+
+    def test_a_sale_error_fails_and_reads_the_account_after_the_except(
+        self, monkeypatch, capsys,
+    ):
+        submitted = answer_in_turn(
+            monkeypatch, [FILLED, ApiException(status=400, reason="Bad Request")],
+        )
+        observed, slept, handling = script_reads(monkeypatch, [0, 0.01, 0.01])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._FAIL
+        assert len(submitted) == 2
+        # The open YES is evidence, so it is not re-read
+        assert observed == [0, 0.01, 0.01]
+        assert slept == []
+        assert handling == [None, None, None]
+        printed = capsys.readouterr().out
+        assert "the reduce-only ask raised" in printed
+        assert f"A 0.01 position is OPEN on {TICKER}" in printed
+        assert "the position is still 0.01: the ask sold nothing" in printed
+        assert_names_the_remedy(printed)
+
+    def test_a_sale_error_that_leaves_a_no_position_names_it(self, monkeypatch, capsys):
+        # reduce_only should stop the ask at zero; a NO position after an error
+        # is named, with the remedy, as it is when the sale returns no error
+        answer_in_turn(monkeypatch, [FILLED, ApiException(status=500, reason="Server Error")])
+        observed, slept, handling = script_reads(monkeypatch, [0, 0.01, -0.01])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, 0.01, -0.01]
+        assert slept == []
+        assert handling == [None, None, None]
+        printed = capsys.readouterr().out
+        assert "a NO position: the ask sold past zero" in printed
+        assert_names_the_remedy(printed)
+
+    def test_a_sale_error_with_a_flat_account_names_no_remedy(self, monkeypatch, capsys):
+        # The sale went through despite the error: still a FAIL, but there is
+        # nothing to flatten, so the step's own lines do not say to
+        answer_in_turn(monkeypatch, [FILLED, ApiException(status=500, reason="Server Error")])
+        observed, slept, _ = script_reads(monkeypatch, [0, 0.01, 0, 0])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._FAIL
+        assert observed == [0, 0.01, 0, 0]
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        printed = capsys.readouterr().out
+        assert "nothing to flatten" in printed
+        assert "did NOT return the position to flat" not in printed
+        assert v2_probe._FLATTEN not in printed
+
+    @pytest.mark.parametrize("body", TestNonObjectOrderBody._NON_OBJECT_BODIES)
+    def test_a_non_object_sale_reply_fails_without_raising(self, body, monkeypatch, capsys):
+        # The account reads flat, but the reply does not say how many sold:
+        # live selling reads the reply first, so the step cannot pass on it
+        submitted = answer_in_turn(monkeypatch, [FILLED, body])
+        script_reads(monkeypatch, [0, 0.01, 0])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._FAIL
+        assert len(submitted) == 2
+        printed = capsys.readouterr().out
+        assert f"the sale's reply was {type(body).__name__}, not a JSON object" in printed
+        assert "nothing to flatten" in printed
+        assert v2_probe._FLATTEN not in printed
+
+    @pytest.mark.parametrize("reply, words", [
+        (v2_resp("0.00", "0.01"), "fill_count=0.00 remaining_count=0.01"),
+        (v2_resp("0.02", "0.00"), "fill_count=0.02 remaining_count=0.00"),
+        (v2_resp("0.01", "0.01"), "fill_count=0.01 remaining_count=0.01"),
+        ({"order_id": "ord_probe"}, "carried no readable fill_count/remaining_count"),
+        (v2_resp("sNaN", "0.00"), "carried no readable fill_count/remaining_count"),
+    ], ids=["says-nothing-sold", "over-fill", "stale-remainder", "no-counts", "not-a-number"])
+    def test_a_sale_reply_that_disagrees_with_the_account_fails(
+        self, monkeypatch, capsys, reply, words,
+    ):
+        # The account shows the 0.01 sold, but the reply says otherwise (or
+        # nothing): live selling would take the reply's count, without
+        # reading the account
+        submitted = answer_in_turn(monkeypatch, [FILLED, reply])
+        observed, slept, _ = script_reads(monkeypatch, [0, 0.01, 0])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._FAIL
+        assert len(submitted) == 2
+        assert observed == [0, 0.01, 0]
+        assert slept == []
+        printed = capsys.readouterr().out
+        assert words in printed
+        assert "trader._sale_fill_count" in printed
+        assert "nothing to flatten" in printed
+        assert v2_probe._FLATTEN not in printed
+        assert f"{v2_probe._PASS}:" not in printed
+
+    def test_a_sale_reply_under_an_order_key_passes(self, monkeypatch, capsys):
+        answer_in_turn(monkeypatch, [FILLED, {"order": v2_resp("0.01", "0.00")}])
+        script_reads(monkeypatch, [0, 0.01, 0])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._PASS
+        assert "the sale's reply reported the 0.01 sold" in capsys.readouterr().out
+
+    def test_a_buy_read_that_is_not_a_number_sends_no_sale(self, submits, monkeypatch, capsys):
+        # A NaN reading passes no sign test, so it must not be taken for a YES
+        observed, _, _ = script_reads(monkeypatch, [0, float("nan")])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._FAIL
+        assert len(observed) == 2
+        assert len(submits) == 1
+        printed = capsys.readouterr().out
+        assert "did not read as a number (nan)" in printed
+        assert "CONFIRMED" not in printed
+
+    def test_a_sale_read_that_is_not_a_number_is_unknown(self, submits, monkeypatch, capsys):
+        nan = float("nan")
+        script_reads(monkeypatch, [0, 0.01, nan, nan])
+        assert v2_probe._step_yes_close(yes_close_client(), TICKER, True, 1) == v2_probe._FAIL
+        assert len(submits) == 2
+        printed = capsys.readouterr().out
+        assert "the position did not read as a number (nan)" in printed
+        assert "sold only part" not in printed
+        assert_names_the_remedy(printed)
+
+    def test_a_ticker_that_is_not_flat_submits_nothing(self, submits, monkeypatch, capsys):
+        out = v2_probe._step_yes_close(yes_close_client([0.01]), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        assert submits == []
+        printed = capsys.readouterr().out
+        assert "probe must start FLAT" in printed
+        assert "FLATTEN" not in printed
+
+    @pytest.mark.parametrize("book, words", [
+        ({"yes_dollars": [["0.59", "500"]], "no_dollars": []}, "no YES ask"),
+        ({"yes_dollars": [], "no_dollars": [["0.40", "500"]]}, "no resting YES bids"),
+    ], ids=["no-yes-ask", "no-yes-bid"])
+    def test_a_one_sided_book_is_neutral_and_submits_nothing(
+        self, submits, monkeypatch, capsys, book, words,
+    ):
+        client = yes_close_client([0])
+        client.get_market_orderbook_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(
+                status=200, data=json.dumps({"orderbook_fp": book}).encode("utf-8"),
+            )
+        )
+        assert v2_probe._step_yes_close(client, TICKER, True, 1) == v2_probe._NEUTRAL
+        assert submits == []
+        assert words in capsys.readouterr().out
+
+    def test_an_unreadable_book_is_neutral(self, submits, monkeypatch):
+        client = yes_close_client([0])
+        client.get_market_orderbook_without_preload_content = MagicMock(
+            return_value=SimpleNamespace(status=200, data=b"{}")
+        )
+        assert v2_probe._step_yes_close(client, TICKER, True, 1) == v2_probe._NEUTRAL
+        assert submits == []
+
+    def test_declining_the_buy_is_neutral_and_submits_nothing(self, submits, monkeypatch):
+        answer(monkeypatch, "no")
+        assert v2_probe._step_yes_close(
+            yes_close_client([0]), TICKER, False, 1,
+        ) == v2_probe._NEUTRAL
+        assert submits == []
+
+    def test_declining_the_sale_is_a_failure(self, submits, monkeypatch, capsys):
+        answers = iter(["yes", "no"])
+        monkeypatch.setattr("builtins.input", lambda *_a, **_k: next(answers))
+        script_reads(monkeypatch, [0, 0.01])
+        out = v2_probe._step_yes_close(yes_close_client(), TICKER, False, 1)
+        assert out == v2_probe._FAIL
+        assert len(submits) == 1  # only the buy went out
+        assert "FLATTEN IT MANUALLY" in capsys.readouterr().out
+
+
+class TestUnknownPositionReadings:
+    """A position reading that is not a finite number (a listing that sends
+    "NaN") tells nothing about the account, like a failed lookup."""
+
+    def test_no_mapping_never_confirms_a_reading_that_is_not_a_number(
+        self, submits, monkeypatch, capsys,
+    ):
+        observed, _, _ = script_reads(monkeypatch, [0, float("nan")])
+        out = v2_probe._step_no_mapping(probe_client([]), TICKER, True, 1)
+        assert out == v2_probe._FAIL
+        assert len(observed) == 2
+        # The close is not sent
+        assert len(submits) == 1
+        printed = capsys.readouterr().out
+        assert "did not read as a number (nan)" in printed
+        assert "Half one CONFIRMED" not in printed
+
+    def test_the_shared_tail_re_reads_and_reports_it_as_unreadable(self, monkeypatch, capsys):
+        nan = float("nan")
+        observed, slept, _ = script_reads(monkeypatch, [nan])
+        judged = v2_probe._recheck_and_report_position(MagicMock(), TICKER, nan)
+        assert len(observed) == 1
+        assert slept == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        # The re-read is what it judged: NaN, the one value unequal to itself
+        assert judged != judged
+        printed = capsys.readouterr().out
+        assert "Could not read the position" in printed
+        assert "position is OPEN" not in printed
+
+    @pytest.mark.parametrize("first, reads, judged", [
+        (0.01, [], 0.01),
+        (0, [0.01], 0.01),
+        (None, [0], 0),
+    ], ids=["open-not-re-read", "flat-then-open", "unknown-then-flat"])
+    def test_the_shared_tail_returns_the_reading_it_judged(
+        self, monkeypatch, capsys, first, reads, judged,
+    ):
+        script_reads(monkeypatch, reads)
+        assert v2_probe._recheck_and_report_position(MagicMock(), TICKER, first) == judged
+
+
+class TestYesCloseDispatch:
+    """main() runs --step yes-close as an order step."""
+
+    def test_yes_close_is_an_order_step_that_needs_a_ticker(self, monkeypatch):
+        assert v2_probe._STEPS["yes-close"] is v2_probe._step_yes_close
+        assert "yes-close" in v2_probe._TICKER_STEPS
+        monkeypatch.setattr(
+            v2_probe.auth, "build_client",
+            lambda mode: pytest.fail("must refuse before building a client"),
+        )
+        assert v2_probe.main(["--step", "yes-close"]) == 2
+
+    def test_main_runs_the_step_end_to_end_and_names_selling(self, monkeypatch, capsys):
+        exchange = FakeExchange(yes_bid="0.59", yes_ask="0.60")
+        monkeypatch.setattr(v2_probe, "signed_request_json", exchange.submit)
+        monkeypatch.setattr(trader, "_position_count", exchange.position_count)
+        client = yes_close_client()
+        monkeypatch.setattr(v2_probe.auth, "build_client", lambda mode: client)
+        monkeypatch.setattr(v2_probe.auth, "verify_auth", lambda c: {0: 100})
+        assert v2_probe.main(["--ticker", TICKER, "--step", "yes-close", "--yes"]) == 0
+        assert exchange.position == 0
+        closing = capsys.readouterr().out.split("RESULT: yes-close -> PASS", 1)[1]
+        assert "--step yes-close has to PASS before live selling is turned on" in closing
+
+    @pytest.mark.parametrize("outcome", [v2_probe._FAIL, v2_probe._NEUTRAL])
+    def test_every_other_closing_line_names_the_selling_step(
+        self, monkeypatch, capsys, outcome,
+    ):
+        closing = TestMainDispatch._closing(
+            monkeypatch, capsys, "yes-close", outcome,
+            ["--ticker", TICKER, "--step", "yes-close"],
+        )
+        assert "--step yes-close has to PASS before live selling is turned on" in closing
+        if outcome == v2_probe._FAIL:
+            # The same closing line as the other order steps
+            assert v2_probe._ORDER_FAIL_CLOSING in closing
+
+    def test_a_non_v2_order_path_refuses_the_step(self, monkeypatch, capsys):
+        monkeypatch.setattr(config, "ORDER_API_VERSION", "legacy")
+        monkeypatch.setattr(
+            v2_probe.auth, "build_client",
+            lambda mode: pytest.fail("must refuse before building a client"),
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            v2_probe.main(["--ticker", TICKER, "--step", "yes-close", "--yes"])
+        assert exc_info.value.code == 2
+        assert "KALSHI V2 ORDER-PATH LIVE PROBE" not in capsys.readouterr().out
+
 
 _PIPELINE_MODULES = [
     "main", "trader", "scanner", "auth", "strategy", "reporter", "scheduler",
