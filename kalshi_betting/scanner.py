@@ -64,6 +64,10 @@ Dependencies:
     historical.py imports event_series too, so the backtest's event-title
     lookup budget tells a combo ticker from any other exactly as the
     one-series rule does (DR-51).
+    walk_bids, bid_ladder and floor_to_tick are the sell rule's book
+    arithmetic: the backtest sells a position down its modeled bid ladder
+    through walk_bids (backtester._ladder_average), and live selling will
+    walk a held market's real bids (bid_ladder) the same way.
     Depends on the KalshiClient produced by auth.py.
 
 Notes:
@@ -147,7 +151,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from datetime import UTC, date, datetime, timedelta
-from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any
 
 from ._http import api_call_with_retry, api_error_summary, fetch_json_page
@@ -645,6 +649,36 @@ def ceil_to_tick(price: Decimal, tick: Decimal) -> Decimal:
             it already sits exactly on the grid.
     """
     return (price / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+
+
+def floor_to_tick(price: Decimal, tick: Decimal) -> Decimal:
+    """
+    Round a price DOWN to the nearest point of a tick grid at or below it.
+
+    ceil_to_tick's mirror. A bid is the most an order pays per contract, so
+    rounding a bid down onto the grid keeps it at or below the price it was
+    computed from: the order never pays more than that price. Live selling
+    will use it for the YES bid that buys back a held NO (which is how a NO
+    is sold), so the NO never fetches less than the price it was computed
+    from.
+
+    Hand it a price with its float noise already removed. A price that
+    started as a float goes through
+    Decimal(str(x)).quantize(_SCANNED_PRICE_QUANTUM) first, as v2_limit_price
+    does before ceil_to_tick: Decimal(0.57) is a hair below 0.57 and would
+    floor a whole tick lower, to 0.56.
+
+    Args:
+        price (Decimal): Price in dollars to round, at most six decimals
+            (see above). Range: [0, 1].
+        tick (Decimal): Tick size in dollars for the grid to land on. Must be
+            > 0 (tick_size_for_price guarantees this).
+
+    Returns:
+        Decimal: The largest grid point <= price. Returns price unchanged
+            when it already sits exactly on the grid.
+    """
+    return (price / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
 
 
 def v2_limit_price(leg_kind: str, scanned_price_dollars: float, market: Any) -> Decimal:
@@ -5163,7 +5197,9 @@ def _bids_to_ask_levels(bids_raw: list, ticker: str = "<unknown>") -> list[tuple
 
     Applies to both sides: YES bid at P → NO ask at (1−P);
                            NO bid at P → YES ask at (1−P).
-    Descending bids naturally yield ascending asks after the complement.
+    The wire lists bids in ascending price order, so their complements come
+    out descending; the asks are sorted cheapest first before they are
+    returned, so the order the bids arrive in does not matter.
 
     Bounded by config.MIN/MAX_ACTIVE_PRICE_DOLLARS (0.0001/0.9999), the extreme
     tradeable levels on Kalshi's FINEST grid — NOT by the 0.01/0.99
@@ -5173,8 +5209,8 @@ def _bids_to_ask_levels(bids_raw: list, ticker: str = "<unknown>") -> list[tuple
     priced under a cent, or over 99c, vanished before pairing (TS-14).
 
     Args:
-        bids_raw (list): [[price_str, qty_str], ...] sorted descending by
-            price, as parsed from the orderbook payload.
+        bids_raw (list): [[price_str, qty_str], ...] as parsed from the
+            orderbook payload (ascending by price on the wire).
         ticker (str): The market the book came from, named in the drop
             WARNING only. Defaults to a placeholder for hand-built input.
 
@@ -5211,6 +5247,126 @@ def _bids_to_ask_levels(bids_raw: list, ticker: str = "<unknown>") -> list[tuple
         )
     levels.sort(key=lambda x: x[0])
     return levels
+
+
+def bid_ladder(book: dict | None, side: str, *, ticker: str = "<unknown>") -> list[list[float]]:
+    """
+    One side's resting bids from an order book, best (highest) first: what selling that side would walk.
+
+    Selling contracts of a side means taking that side's resting bids, the
+    highest first. _fetch_orderbook returns {"yes": [...], "no": [...]},
+    where "yes" holds the YES bids and "no" the NO bids, each level a
+    [price, quantity] pair (dollar strings on the wire, in ascending price
+    order; floats when converted from a cents book). This reads one side as
+    floats and puts the best bid first, the order walk_bids reads. Live
+    selling will read a held market's bids with it before walking them.
+
+    A level is kept only when its price is a tradeable level on Kalshi's
+    finest grid (MIN_ACTIVE_PRICE_DOLLARS to MAX_ACTIVE_PRICE_DOLLARS, the
+    bounds _bids_to_ask_levels keeps too) and its quantity is a positive
+    finite number. Every other level is left out and counted, and one
+    WARNING names the count (silent at zero): a book thinned by a payload
+    that changed shape must not read as a genuinely thin book.
+
+    Args:
+        book (dict | None): An order book as _fetch_orderbook returns it;
+            None (the book could not be read) reads as no bids.
+        side (str): "yes" for the YES bids (what selling YES fetches), "no"
+            for the NO bids.
+        ticker (str): Keyword-only. The market the book came from, named in
+            the WARNING only. Defaults to a placeholder for hand-built input.
+
+    Returns:
+        list[list[float]]: [[price, quantity], ...] from the highest price
+            down; levels of one price keep their order in the book. Empty
+            when the book or the side holds no usable level.
+
+    Raises:
+        ValueError: For a side other than "yes" or "no".
+    """
+    if side not in ("yes", "no"):
+        raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+    if not isinstance(book, dict):
+        return []
+    raw = book.get(side)
+    if not isinstance(raw, (list, tuple)):
+        return []
+    levels: list[list[float]] = []
+    dropped = 0
+    for entry in raw:
+        try:
+            price = float(entry[0])
+            size = float(entry[1])
+        except (TypeError, ValueError, IndexError, KeyError, OverflowError):
+            # OverflowError: an integer too large for a float
+            dropped += 1
+            continue
+        # A NaN price or quantity fails these comparisons, so it is left out too
+        if (MIN_ACTIVE_PRICE_DOLLARS <= price <= MAX_ACTIVE_PRICE_DOLLARS
+                and 0.0 < size < math.inf):
+            levels.append([price, size])
+        else:
+            dropped += 1
+    if dropped:
+        logging.warning(
+            "Orderbook for %s: left out %d of %d %s bid levels as unusable "
+            "(price outside [%s, %s], quantity not a positive finite number, "
+            "or unreadable)",
+            ticker, dropped, len(raw), side.upper(),
+            MIN_ACTIVE_PRICE_DOLLARS, MAX_ACTIVE_PRICE_DOLLARS,
+        )
+    # sorted() keeps equal prices in their book order
+    return sorted(levels, key=lambda level: -level[0])
+
+
+def walk_bids(ladder: Sequence, contracts: float) -> tuple[float, float] | None:
+    """
+    Sell `contracts` down a bid ladder, best bid first: their average price and the lowest price reached.
+
+    Each level sells as many contracts as it holds, or what is left to sell,
+    whichever is fewer, until all are sold. The backtest sells a position
+    down its modeled bid ladder with it (backtester._ladder_average reads the
+    average); live selling will walk a held market's real bids with it
+    (bid_ladder), and the lowest price reached bounds the sale order's price.
+
+    Args:
+        ladder (Sequence): [[price, quantity], ...], best (highest) price first.
+        contracts (float): How many contracts to sell; above 0.
+
+    Returns:
+        tuple[float, float] | None: (average price, lowest price reached).
+            The average is exactly the best bid when the first level holds
+            them all. The lowest price is that of the last level that sold
+            part of them; a leftover of float noise (under half a millionth
+            of a contract, which the shortfall test ignores too) taken from
+            a further level does not move it. None when the ladder holds
+            fewer contracts than `contracts`, when it is empty, or when
+            `contracts` is not above 0 (NaN included): a sale of no
+            contracts has no price.
+    """
+    # `not ... > 0` is also true for NaN
+    if len(ladder) == 0 or not contracts > 0:
+        return None
+    left = contracts
+    proceeds = 0.0
+    used = 0
+    lowest = None
+    for price, size in ladder:
+        take = min(size, left)
+        proceeds += take * price
+        left -= take
+        used += 1
+        # Ladder sizes carry six decimals, so a take that rounds to zero at
+        # six decimals is float noise left over from the levels above: the
+        # sale does not reach this level's price
+        if lowest is None or round(take, 6) > 0:
+            lowest = price
+        if left <= 0:
+            break
+    # The same six-decimal rule: anything finer left unsold is float noise
+    if round(left, 6) > 0:
+        return None
+    return (ladder[0][0] if used == 1 else proceeds / contracts), lowest
 
 
 def _leg_ask_levels(

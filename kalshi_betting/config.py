@@ -33,6 +33,12 @@ Notes:
     caps and the fallback live_settings() returns, never a live run's
     defaults. The runs defaults_server starts keep their files under
     LIVE_RUNS_DIR, which the server reads at call time, so tests redirect it.
+    The sell rule's tests live here, where live code may import them:
+    take_profit_reached (the test at one check) and days_to_maturity, which
+    the backtest decides its sales with (through backtester._sells_at and
+    _days_left), and reached_every_check (the test at every check), which
+    live selling will call; the backtest applies that same test at each check
+    through backtester._reached_every_day.
 """
 import fcntl
 import json
@@ -1879,6 +1885,14 @@ CANDLESTICK_MAX_CANDLES_PER_REQUEST = 5000
 # older version is fetched again (version 2 adds the hour's traded volume).
 CANDLESTICK_CACHE_FIELDS_VERSION = 2
 
+# The highest NO ask a candle can carry. historical.fetch_candlesticks stores a
+# candle's NO ask as 1 - its YES bid, held within [0.01, this], so a YES-bid
+# book with no bids reads as a NO ask of exactly this value, just like a real
+# one-cent YES bid. A NO ask at this value is therefore no usable quote
+# (historical.usable_candle_ask): the backtest's open-trade values and sale
+# bids, and live selling's earlier-day checks, never read a price from it.
+CANDLE_NO_ASK_CEILING = 0.99
+
 # The backtest's depth model (depth_model.py): a table of how many contracts
 # typically rest near the best bid of a live Kalshi book, fitted to saved
 # snapshots, from which the backtest builds a synthetic book at each checkpoint.
@@ -3127,6 +3141,117 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
     if pair_type == "time_series":
         return min(cap, round(1.0 - settings.interval_discount, 12))
     return min(cap, SAME_TITLE_CO_RESOLVE_PROB)
+
+
+# ── Selling a held position early ─────────────────────────────────────────────
+#
+# The sell rule: a position (a held pair, with everything added to it) is sold
+# once its realized profit has stayed at or above a set share of its potential
+# profit at every daily check. Realized profit is what selling it at the bids
+# would return, after the sale's fees, less what it cost; potential profit is
+# what it pays if it wins (its contract pairs at CONTRACT_PAYOUT_DOLLARS) less
+# what it cost. The backtest decides its sales with take_profit_reached and
+# days_to_maturity (through backtester._sells_at and _days_left), and live
+# selling will decide with them too, so the two can never apply different
+# arithmetic. reached_every_check is the test at every check that live selling
+# will call; the backtest applies the same test at each check through
+# backtester._reached_every_day, and a test pins the two equal.
+
+def take_profit_reached(sell_at: float, realized: float, potential: float) -> bool:
+    """
+    Whether a position has realized at least `sell_at` of its potential profit at one check.
+
+    The sell rule's one test. A position with no potential profit (it cost
+    as much as it can pay, or more) never sells. Otherwise it sells once
+    realized >= sell_at x potential, less PRICE_EPSILON so float noise on a
+    profit sitting exactly on the level still counts as reaching it. For a
+    fixed position the test holds at every level below one at which it holds,
+    since a float product with a positive number never falls as the other
+    factor rises; the backtest's shortcut over many levels relies on that.
+    Called by backtester._sells_at at every daily check; live selling will
+    call it at every check through reached_every_check.
+
+    Args:
+        sell_at (float): The share of potential profit to sell at, in (0, 1].
+        realized (float): What selling the position would return, after the
+            sale's fees, less its total cost, in dollars.
+        potential (float): What the position pays if it wins less its total
+            cost, in dollars.
+
+    Returns:
+        bool: True when the position has reached `sell_at` at this check.
+    """
+    return potential > 0 and realized >= sell_at * potential - PRICE_EPSILON
+
+
+def reached_every_check(sell_at: float, profits) -> bool:
+    """
+    Whether a position reached `sell_at` of its potential profit at every daily check.
+
+    take_profit_reached at each check. A position is sold only when it has
+    stayed at its level on every one of the TAKE_PROFIT_HOLD_DAYS checks, so
+    a price that jumps for a moment does not trigger a sale. Like
+    take_profit_reached, it holds at every level below one at which it holds.
+    With no checks at all it is False: a position that was never valued has
+    shown nothing, so it is not sold. Live selling will decide each sale with
+    it. The backtest applies the same test at each check through
+    backtester._reached_every_day (which calls take_profit_reached through
+    backtester._sells_at and is never handed an empty list).
+
+    Args:
+        sell_at (float): The share of potential profit to sell at, in (0, 1].
+        profits: (realized profit, potential profit) at each check, in
+            dollars, in any iterable.
+
+    Returns:
+        bool: True when there is at least one check and every check reaches
+            `sell_at`.
+    """
+    checks = list(profits)
+    return bool(checks) and all(take_profit_reached(sell_at, realized, potential)
+                                for realized, potential in checks)
+
+
+def days_to_maturity(close_dates, day: date) -> int | None:
+    """
+    Days from `day` to the date a position's last market stops trading: its days to maturity.
+
+    A position matures when the last of its markets closes, so this is the
+    latest of its markets' close dates less `day`, in whole calendar days. It
+    is 0 when the last market closes on `day` itself, and negative when it
+    closed before (a market that has stopped trading but not yet paid out).
+    The sell rule's optional minimum of days reads it: a position nearer to
+    maturity than the minimum is not sold. The backtest reads it through
+    backtester._days_left (close dates from its trades); live selling will
+    read it with each held market's scheduled close date. Every argument is
+    a calendar date: a datetime (a close_time, say) is refused, because the
+    difference of two datetimes counts whole 24-hour spans, which can be a
+    day short of the calendar days between their dates. Turn a Kalshi
+    timestamp into its UTC date first.
+
+    Args:
+        close_dates: The close date (a datetime.date) of every market in the
+            position, in any iterable; a market whose close date is unknown
+            appears as None.
+        day (date): The date the position is checked on.
+
+    Returns:
+        int | None: The days left; None when there are no close dates or any
+            of them is unknown, since a position whose maturity cannot be
+            read is never sold under a minimum.
+
+    Raises:
+        TypeError: When `day` or a close date is a datetime rather than a
+            date.
+    """
+    dates = list(close_dates)
+    # datetime is a subclass of date, so it must be refused by name
+    if isinstance(day, datetime) or any(isinstance(d, datetime) for d in dates):
+        raise TypeError("days_to_maturity reads calendar dates, not datetimes: "
+                        "pass each timestamp's UTC date")
+    if not dates or any(d is None for d in dates):
+        return None
+    return (max(dates) - day).days
 
 
 def _exact_number(value: float) -> str:

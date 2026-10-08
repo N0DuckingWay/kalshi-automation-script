@@ -1475,6 +1475,138 @@ class TestTakeProfitLevelsAndMinDays:
         assert all(type(days) is int for days in config.TAKE_PROFIT_MIN_DAYS)
 
 
+class TestCandleNoAskCeiling:
+    """CANDLE_NO_ASK_CEILING: the highest NO ask a candle can carry, which is
+    no quote. historical clamps to it and refuses it; the backtester's alias
+    is the same object."""
+
+    def test_one_value_everywhere(self):
+        from kalshi_betting import historical
+
+        assert config.CANDLE_NO_ASK_CEILING == 0.99
+        assert historical.CANDLE_NO_ASK_CEILING is config.CANDLE_NO_ASK_CEILING
+        assert backtester._CANDLE_NO_ASK_CEILING is config.CANDLE_NO_ASK_CEILING
+
+
+class TestTakeProfitReached:
+    """take_profit_reached: the sell rule's one test at a check — a position
+    with a potential profit sells once its realized profit reaches sell_at of
+    it, less PRICE_EPSILON of float noise. backtester._sells_at decides with
+    it, so it is the backtest's rule exactly."""
+
+    def test_at_and_around_the_level(self):
+        # 80% of a $10 potential profit is $8
+        assert config.take_profit_reached(0.8, 8.0, 10.0) is True
+        assert config.take_profit_reached(0.8, 9.5, 10.0) is True
+        # Float noise below the level still reaches it ...
+        assert config.take_profit_reached(0.8, 8.0 - PRICE_EPSILON, 10.0) is True
+        assert config.take_profit_reached(0.8, 8.0 - PRICE_EPSILON / 2, 10.0) is True
+        # ... a real shortfall does not
+        assert config.take_profit_reached(0.8, 8.0 - 2 * PRICE_EPSILON, 10.0) is False
+        assert config.take_profit_reached(0.8, 7.99, 10.0) is False
+        # 0.1 + 0.2 is 0.30000000000000004 and 0.3 is a hair below it: both reach 0.3
+        assert config.take_profit_reached(0.3, 0.1 + 0.2, 1.0) is True
+        assert config.take_profit_reached(1.0, 0.3, 0.1 + 0.2) is True
+
+    @pytest.mark.parametrize("potential", [0.0, -0.0, -0.01, -5.0])
+    def test_no_potential_profit_never_sells(self, potential):
+        assert config.take_profit_reached(0.8, 100.0, potential) is False
+        assert config.take_profit_reached(0.01, 0.0, potential) is False
+
+    def test_it_is_the_backtests_test(self):
+        rng = random.Random(1207)
+        for _ in range(2000):
+            level = rng.choice(config.TAKE_PROFIT_LEVELS)
+            potential = rng.uniform(-1.0, 20.0)
+            realized = level * potential + rng.choice([-1, 1]) * rng.choice(
+                [0.0, PRICE_EPSILON / 2, PRICE_EPSILON, 2 * PRICE_EPSILON, rng.uniform(0, 1)])
+            assert (config.take_profit_reached(level, realized, potential)
+                    is backtester._sells_at(level, realized, potential))
+            assert config.take_profit_reached(level, realized, potential) is (
+                potential > 0 and realized >= level * potential - PRICE_EPSILON)
+
+    def test_a_level_reached_is_reached_at_every_lower_level(self):
+        rng = random.Random(1208)
+        levels = config.TAKE_PROFIT_LEVELS
+        for _ in range(500):
+            potential = rng.uniform(0.01, 20.0)
+            realized = rng.uniform(0.7, 1.05) * potential
+            reached = [config.take_profit_reached(level, realized, potential) for level in levels]
+            # True for a prefix of the ascending levels, then False
+            assert reached == sorted(reached, reverse=True)
+
+
+class TestReachedEveryCheck:
+    """reached_every_check: take_profit_reached at every daily check."""
+
+    def test_every_check_must_reach_the_level(self):
+        assert config.reached_every_check(0.8, [(8.0, 10.0), (9.0, 10.0), (8.5, 10.0)]) is True
+        assert config.reached_every_check(0.8, [(8.0, 10.0), (7.0, 10.0), (8.5, 10.0)]) is False
+        # One check with no potential profit holds the sale back
+        assert config.reached_every_check(0.8, [(8.0, 10.0), (1.0, 0.0)]) is False
+
+    @pytest.mark.parametrize("checks", [[], (), iter([])])
+    def test_no_checks_never_sells(self, checks):
+        # A position that was never valued has shown nothing: fail closed,
+        # where all() of nothing would read as a sale
+        assert config.reached_every_check(0.8, checks) is False
+        assert config.reached_every_check(0.01, checks) is False
+
+    def test_any_iterable_of_checks(self):
+        checks = [(8.0, 10.0), (9.0, 10.0)]
+        assert config.reached_every_check(0.8, iter(checks)) is True
+        assert config.reached_every_check(0.8, tuple(checks)) is True
+
+    def test_it_is_the_backtests_rule(self):
+        rng = random.Random(1209)
+        for _ in range(500):
+            level = rng.choice(config.TAKE_PROFIT_LEVELS)
+            checks = [(rng.uniform(-2.0, 10.0), rng.uniform(-1.0, 10.0))
+                      for _ in range(rng.randint(1, 4))]
+            assert (config.reached_every_check(level, checks)
+                    is backtester._reached_every_day(level, checks))
+
+
+class TestDaysToMaturity:
+    """days_to_maturity: whole days from a date to a position's last close
+    date — what the sell rule's minimum of days reads. Unknown when any close
+    date is (a position whose maturity cannot be read is never sold under a
+    minimum)."""
+
+    def test_the_latest_close_date_decides(self):
+        day = date(2026, 1, 12)
+        assert config.days_to_maturity([date(2026, 1, 20), date(2026, 2, 2)], day) == 21
+        assert config.days_to_maturity([date(2026, 2, 2), date(2026, 1, 20)], day) == 21
+        assert config.days_to_maturity([date(2026, 1, 13)], day) == 1
+
+    def test_zero_on_the_closing_date_and_negative_after_it(self):
+        day = date(2026, 1, 12)
+        assert config.days_to_maturity([date(2026, 1, 12), date(2026, 1, 5)], day) == 0
+        assert config.days_to_maturity([date(2026, 1, 10), date(2026, 1, 5)], day) == -2
+
+    @pytest.mark.parametrize("closes", [[], [None], [date(2026, 2, 2), None],
+                                        [None, date(2026, 2, 2)]])
+    def test_unknown_when_any_date_is_or_there_are_none(self, closes):
+        assert config.days_to_maturity(closes, date(2026, 1, 12)) is None
+
+    def test_any_iterable_of_dates(self):
+        closes = (d for d in [date(2026, 1, 20), date(2026, 2, 2)])
+        assert config.days_to_maturity(closes, date(2026, 1, 12)) == 21
+
+    def test_a_datetime_is_refused(self):
+        # Two datetimes differ by whole 24-hour spans: a close at 08:00 three
+        # calendar days after a 16:00 check would read 2 days, not 3. A
+        # datetime is a date by subclass, so it is refused by name
+        close = datetime(2026, 1, 15, 8, 0, tzinfo=UTC)
+        now = datetime(2026, 1, 12, 16, 0, tzinfo=UTC)
+        assert config.days_to_maturity([close.date()], now.date()) == 3
+        for closes, day in (([close], now), ([close], now.date()),
+                            ([close.date()], now), ([date(2026, 2, 2), close], now.date()),
+                            ([None, close], now.date())):
+            with pytest.raises(TypeError, match="calendar dates"):
+                config.days_to_maturity(closes, day)
+
+
 class TestDescribeTimeSeriesRule:
     """describe_time_series_rule says "no spread band" for (0, 1) alone and
     names any band with a floor or a ceiling of its own."""

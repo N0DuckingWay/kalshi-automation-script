@@ -17378,6 +17378,96 @@ class TestLegQuotesBids:
         assert not bare.paid_at_checkpoint(date(2026, 1, 12), 1)
 
 
+class TestTheSellRuleIsShared:
+    """The sell rule's pieces live where live code may import them, and the
+    backtest reads them there: its daily-check bids are exactly
+    historical.bid_before's (one day's window), its candle bids
+    historical.candle_sale_bids', its ladder walk scanner.walk_bids', its
+    test config.take_profit_reached and its days to maturity
+    config.days_to_maturity. So a live sale can apply the backtest's rule
+    with no arithmetic of its own."""
+
+    # Paid out long after every check below, so no check reads a payout
+    _MARKET = {"ticker": "Q", "settlement_ts": "2026-07-01T00:00:00Z", "result": "yes"}
+    _START = date(2025, 12, 1)
+    _ASKS = (0.30, 0.43, 0.57, 0.72, 0.99, 1.00, 0.0001, 0.9999, 0.98, 0.01, "x", None,
+             float("nan"))
+
+    @staticmethod
+    def _same(got: float, want: float) -> bool:
+        """Equal floats, NaN equal to NaN."""
+        return (math.isnan(got) and math.isnan(want)) or got == want
+
+    def _series(self, rng: random.Random) -> list[dict]:
+        """Hourly candles with random gaps over six weeks (one series in two
+        spans a clock change), with candles placed on the daily checks'
+        boundaries — a day old, a second younger, at the check itself — and
+        now and then a repeated hour or two neighbours out of order."""
+        first = rng.choice([date(2026, 1, 1), date(2026, 2, 23)])
+        t0 = int(datetime(first.year, first.month, first.day, tzinfo=UTC).timestamp())
+        stamps = {t0 + hour * 3600 for hour in range(6 * 7 * 24)
+                  if rng.random() < 0.3}
+        mondays = [first + timedelta(days=(7 - first.weekday()) % 7 + 7 * w) for w in range(6)]
+        for day in rng.sample(mondays, 3):
+            for back in range(0, backtester._HOLD_DAYS_MAX):
+                moment = _ck(day) - back * 86_400
+                stamps.add(moment - rng.choice([86_400, 86_399, 3_601, 3_600, 1, 0]))
+        candles = [_candle(ts, rng.choice(self._ASKS), rng.choice(self._ASKS))
+                   for ts in sorted(stamps)]
+        for _ in range(rng.randint(0, 3)):
+            i = rng.randrange(len(candles))
+            if rng.random() < 0.5:
+                # Two candles for one hour: the later one in the list is read
+                candles.insert(i + 1, _candle(candles[i]["ts"], rng.choice(self._ASKS),
+                                              rng.choice(self._ASKS)))
+            elif i + 1 < len(candles):
+                candles[i], candles[i + 1] = candles[i + 1], candles[i]
+        return candles
+
+    def test_bid_before_is_the_backtests_daily_check_bid(self):
+        rng = random.Random(9001)
+        period = backtester.CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60
+        compared = bids = 0
+        for _ in range(40):
+            candles = self._series(rng)
+            quotes, _stale = backtester._leg_quotes(self._MARKET, candles, self._START)
+            last = datetime.fromtimestamp(max(c["ts"] for c in candles), UTC).date()
+            day = quotes.first_checkpoint
+            while day <= last + timedelta(days=8):
+                for side in ("yes", "no"):
+                    # Each daily check before the checkpoint: a day's window
+                    for back in range(1, backtester._HOLD_DAYS_MAX):
+                        want = quotes.bid_at_checkpoint(day, side, back)
+                        got = historical.bid_before(candles, _ck(day) - back * 86_400, side,
+                                                    window=86_400)
+                        assert self._same(got, want), (day, side, back, got, want)
+                        compared += 1
+                        bids += want == want
+                    # The checkpoint itself: a candle at most one period old
+                    want = quotes.bid_at_checkpoint(day, side)
+                    got = historical.bid_before(candles, _ck(day), side, window=period + 1)
+                    assert self._same(got, want), (day, side, 0, got, want)
+                day += timedelta(days=7)
+        # Bids and no-bids both occur, so the comparison is not vacuous
+        assert compared > 2000 and 500 < bids < compared
+
+    def test_the_wrappers_read_the_shared_definitions(self):
+        rng = random.Random(9002)
+        for _ in range(300):
+            ladder = [[price, round(rng.uniform(0.01, 50.0), rng.choice([0, 2, 6]))]
+                      for price in sorted({rng.randint(1, 9999) / 10_000 for _ in range(4)},
+                                          reverse=True)]
+            contracts = rng.uniform(0.5, 120.0)
+            walked = scanner.walk_bids(ladder, contracts)
+            assert backtester._ladder_average(ladder, contracts) == (
+                None if walked is None else walked[0])
+        for raw in self._ASKS:
+            for side in ("yes", "no"):
+                assert self._same(backtester._usable_ask(raw, side),
+                                  historical.usable_candle_ask(raw, side))
+        assert backtester._CANDLE_NO_ASK_CEILING == historical.CANDLE_NO_ASK_CEILING
+
+
 class TestSellAtShareOfPotentialProfit:
     """With sell_at, the cash walk sells a whole position once its realized
     profit (what selling returns — each leg at the bid of the side it holds,

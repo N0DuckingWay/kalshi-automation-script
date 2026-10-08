@@ -265,7 +265,14 @@ Notes:
     simulates only the (level, minimum) settings that differ: one no position
     of the no-selling run would sell at is that run (_sale_reach), and one at
     least as strict as a run it already simulated, when every sale of that run
-    also meets it, is that run (_sale_cover, yielded as a SameSale).
+    also meets it, is that run (_sale_cover, yielded as a SameSale). The
+    sell rule's arithmetic lives where live code may import it, and the
+    backtest reads it there through its own one-line wrappers: the test at
+    each check (config.take_profit_reached, through _sells_at), the days to
+    maturity (config.days_to_maturity, through _days_left), the walk down a
+    bid ladder (scanner.walk_bids, through _ladder_average) and the candle
+    bid rule (historical.usable_candle_ask and candle_sale_bids, through
+    _usable_ask and _leg_quotes).
 
     An ENTRY CHECKPOINT is a moment at which the backtest may open a
     simulated trade: the live bot's weekly run time (config.SCHEDULED_RUN,
@@ -354,6 +361,7 @@ from .config import (
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     BACKTEST_RECORD_BYTES_ESTIMATE,
     BUDGET_FRACTION,
+    CANDLE_NO_ASK_CEILING,
     CANDLESTICK_FETCH_MAX_WORKERS,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     CONTRACT_PAYOUT_DOLLARS,
@@ -382,6 +390,7 @@ from .config import (
     _exact_number,
     _names_text,
     _step_cap,
+    days_to_maturity,
     describe_time_series_rule,
     fee_leg_exact,
     fee_per_pair_approx,
@@ -390,6 +399,7 @@ from .config import (
     max_kelly_fraction,
     min_price_diff_for_gap,
     pair_size_cap,
+    take_profit_reached,
     time_series_mid_spread,
     time_series_profit_prob,
     time_series_spread_band,
@@ -400,10 +410,12 @@ from .depth_model import book as _synthetic_book
 from .historical import (
     CorpusProvenance,
     SettledCorpus,
+    candle_sale_bids,
     fetch_all_settled_markets,
     fetch_candlesticks,
     infer_category,
     series_ticker,
+    usable_candle_ask,
 )
 from .scanner import (
     DEADLINE_CUMULATIVE,
@@ -432,6 +444,7 @@ from .scanner import (
     same_event_ladder,
     stated_deadline,
     time_series_group_key,
+    walk_bids,
 )
 from .strategy import TradeSpec, compute_trade
 
@@ -445,11 +458,10 @@ _DAY_SECONDS = 86_400
 _SCHEDULE_CHECK_DAYS_AHEAD = 3_653
 
 # The top of the range historical.fetch_candlesticks clamps a candle's NO ask
-# into: it stores the NO ask as 1 - the YES bid, held within [0.01, 0.99], so a
-# YES-bid book with no bids reads as a NO ask of 0.99, exactly like a real
-# one-cent bid. A NO ask at this value is therefore no usable quote
-# (_usable_ask): the NO leg keeps its last usable NO ask instead.
-_CANDLE_NO_ASK_CEILING = 0.99
+# into (config.CANDLE_NO_ASK_CEILING, the one definition): a NO ask at this
+# value is no usable quote (_usable_ask), so the NO leg keeps its last usable
+# NO ask instead.
+_CANDLE_NO_ASK_CEILING = CANDLE_NO_ASK_CEILING
 
 # How old, in days, the candle behind a leg's day-end value may be before
 # _attach_leg_quotes counts the leg on its DEBUG line of legs valued on old
@@ -3664,12 +3676,13 @@ def _days_left(position: list[BacktestTrade], day: date) -> int | None:
     Returns:
         int | None: The days left; None when any trade lacks a close date
             (only a hand-built trade can: _simulate_at_discount gives every
-            trade both).
+            trade both) or the position is empty (never in the walk, whose
+            positions each hold at least one trade).
     """
-    closes = [d for t in position for d in (t.close_date_a, t.close_date_b)]
-    if any(d is None for d in closes):
-        return None
-    return (max(closes) - day).days
+    # config.days_to_maturity: the one definition of days to maturity, kept
+    # in config so live code can read it too
+    return days_to_maturity([d for t in position for d in (t.close_date_a, t.close_date_b)],
+                            day)
 
 
 def _far_enough(position: list[BacktestTrade], day: date, min_days: int | None) -> bool:
@@ -3746,20 +3759,10 @@ def _ladder_average(ladder: list[list[float]], contracts: float) -> float | None
             level holds them all); None when the ladder holds fewer contracts
             than that.
     """
-    left = contracts
-    proceeds = 0.0
-    used = 0
-    for price, size in ladder:
-        take = min(size, left)
-        proceeds += take * price
-        left -= take
-        used += 1
-        if left <= 0:
-            break
-    # Ladder sizes carry six decimals, so anything finer is float noise
-    if round(left, 6) > 0:
-        return None
-    return ladder[0][0] if used == 1 else proceeds / contracts
+    # scanner.walk_bids: the one walk down a bid ladder, kept in scanner so
+    # live code can walk a real book with it too
+    walked = walk_bids(ladder, contracts)
+    return None if walked is None else walked[0]
 
 
 def _positions(open_trades: list[BacktestTrade]) -> list[list[BacktestTrade]]:
@@ -3924,7 +3927,9 @@ def _sells_at(sell_at: float, realized: float, potential: float) -> bool:
     Returns:
         bool: True when the position sells.
     """
-    return potential > 0 and realized >= sell_at * potential - PRICE_EPSILON
+    # config.take_profit_reached: the one test, kept in config so live code
+    # can decide a sale with it too
+    return take_profit_reached(sell_at, realized, potential)
 
 
 def _hold_readings(position: list[BacktestTrade], day: date, hold_days: int, *,
@@ -5832,13 +5837,9 @@ def _usable_ask(raw: Any, side: str) -> float:
         float: The ask when usable; NaN otherwise, which _leg_quotes skips,
             so the side keeps its last usable ask.
     """
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return float("nan")
-    top = 1.0 if side == "yes" else _CANDLE_NO_ASK_CEILING
-    # A NaN fails both comparisons, so it stays unusable too
-    return value if PRICE_EPSILON < value < top - PRICE_EPSILON else float("nan")
+    # historical.usable_candle_ask: the one definition, kept in historical
+    # so live code can read candles with it too
+    return usable_candle_ask(raw, side)
 
 
 def _leg_quotes(market: dict, candles: list[dict], start_date: date,
@@ -6002,12 +6003,12 @@ def _leg_quotes(market: dict, candles: list[dict], start_date: date,
                 yes_out.append(float("nan"))
                 no_out.append(float("nan"))
                 continue
-            no_ask = _usable_ask(candle.get("no_ask_close"), "no")
-            yes_ask = _usable_ask(candle.get("yes_ask_close"), "yes")
-            # Rounded to 6 decimals so float noise (1 - 0.43 = 0.5700000000000001)
-            # never reaches a price; a NaN ask leaves a NaN bid
-            yes_out.append(round(1.0 - no_ask, 6))
-            no_out.append(round(1.0 - yes_ask, 6))
+            # historical.candle_sale_bids: the one candle bid rule (1 - the
+            # other side's usable ask, to six decimals; NaN with no usable
+            # ask), kept in historical so live code can read candles with it
+            yes_bid, no_bid = candle_sale_bids(candle)
+            yes_out.append(yes_bid)
+            no_out.append(no_bid)
         return yes_out, no_out, paid_out
 
     yes_days, no_days, stale_days = sample(day_ends, True)

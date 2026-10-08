@@ -3,6 +3,8 @@ import copy
 import gzip
 import json
 import logging
+import math
+import random
 import threading
 import weakref
 import zlib
@@ -6526,3 +6528,167 @@ class TestLoadSeriesCategories:
         monkeypatch.setattr(historical, "_historical_get", fake_get)
         assert set(historical.load_series_categories(MagicMock())) == {"KXA", "KXB"}
         assert calls == [{}, {"cursor": "c1"}]
+
+
+# ─── What a sale would fetch, read from candles ───────────────────────────────
+
+def _bid_candle(ts: int, yes_ask, no_ask) -> dict:
+    """One candle as fetch_candlesticks returns it (no volume needed here)."""
+    return {"ts": ts, "yes_ask_close": yes_ask, "no_ask_close": no_ask}
+
+
+class TestUsableCandleAsk:
+    """usable_candle_ask: a candle close is an ask that can value or sell a
+    leg when it is strictly between 0 and 1 (a NO ask also below the 0.99 an
+    empty YES-bid book is clamped to), each bound held PRICE_EPSILON inside."""
+
+    @pytest.mark.parametrize("raw, side, usable", [
+        (0.5, "yes", True), (0.0001, "yes", True), (0.9999, "yes", True), ("0.42", "yes", True),
+        (1.0, "yes", False), (1.0 - 1e-9, "yes", False), (0.0, "yes", False),
+        (1e-9, "yes", False), (-0.1, "yes", False), (1.5, "yes", False),
+        (float("nan"), "yes", False), ("x", "yes", False), (None, "yes", False),
+        ([0.5], "yes", False),
+        (0.98, "no", True), (0.01, "no", True), (0.99, "no", False),
+        (0.99 - 1e-9, "no", False), (1.0, "no", False), (0.0, "no", False)])
+    def test_which_asks_are_usable(self, raw, side, usable):
+        value = historical.usable_candle_ask(raw, side)
+        assert (value == value) is usable
+        if usable:
+            assert value == float(raw)
+
+    def test_the_no_ask_ceiling(self):
+        from kalshi_betting import config
+
+        assert historical.CANDLE_NO_ASK_CEILING == 0.99
+        # One definition, config's
+        assert historical.CANDLE_NO_ASK_CEILING is config.CANDLE_NO_ASK_CEILING
+
+    def test_an_empty_yes_bid_book_is_no_quote(self, tmp_path, monkeypatch):
+        # fetch_candlesticks clamps a candle's NO ask (1 - its YES bid) to the
+        # ceiling, so a YES bid of 0 reads as exactly CANDLE_NO_ASK_CEILING —
+        # the value usable_candle_ask refuses — and a YES bid of a cent
+        # reads the same way
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        for yes_bid in ("0.00", "0.01"):
+            _patch_candle_fetch(monkeypatch, 1_700_000_000, yes_bid=yes_bid)
+            out = historical.fetch_candlesticks(
+                MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False,
+                rate_limit_sleep=0.0)
+            assert out[0]["no_ask_close"] == historical.CANDLE_NO_ASK_CEILING
+            assert math.isnan(historical.usable_candle_ask(out[0]["no_ask_close"], "no"))
+        # The clamp follows the ceiling: it reads the same binding
+        monkeypatch.setattr(historical, "CANDLE_NO_ASK_CEILING", 0.98)
+        _patch_candle_fetch(monkeypatch, 1_700_000_000, yes_bid="0.00")
+        out = historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False, rate_limit_sleep=0.0)
+        assert out[0]["no_ask_close"] == 0.98
+        assert math.isnan(historical.usable_candle_ask(out[0]["no_ask_close"], "no"))
+
+
+class TestCandleSaleBids:
+    """candle_sale_bids: a candle's YES bid is 1 - its usable NO ask and its
+    NO bid 1 - its usable YES ask, to six decimals; an unusable ask leaves no
+    bid (NaN) on the other side."""
+
+    def test_one_less_the_other_sides_ask_to_six_decimals(self):
+        # 1 - 0.57 is not 0.43 in floats, nor 1 - 0.43 0.57: rounding fixes both
+        assert 1.0 - 0.43 != 0.57
+        assert historical.candle_sale_bids(_bid_candle(1, 0.43, 0.57)) == (0.43, 0.57)
+        assert historical.candle_sale_bids(_bid_candle(1, 0.30, 0.72)) == (0.28, 0.70)
+        assert historical.candle_sale_bids(_bid_candle(1, "0.40", "0.61")) == (0.39, 0.6)
+
+    @pytest.mark.parametrize("yes_ask, no_ask, yes_bid, no_bid", [
+        (1.00, 0.40, 0.60, None),   # no one offers YES: no NO bid
+        (0.30, 0.99, None, 0.70),   # the NO ask at its clamp: no YES bid
+        ("x", None, None, None),
+        (float("nan"), float("nan"), None, None),
+        (0.0001, 0.98, 0.02, 0.9999),
+    ])
+    def test_an_unusable_ask_leaves_no_bid_on_the_other_side(self, yes_ask, no_ask,
+                                                              yes_bid, no_bid):
+        got = historical.candle_sale_bids(_bid_candle(1, yes_ask, no_ask))
+        for value, expected in zip(got, (yes_bid, no_bid), strict=True):
+            assert math.isnan(value) if expected is None else value == expected
+
+    def test_a_candle_missing_an_ask(self):
+        yes_bid, no_bid = historical.candle_sale_bids({"ts": 1, "yes_ask_close": 0.30})
+        assert math.isnan(yes_bid) and no_bid == 0.70
+
+
+class TestBidBefore:
+    """bid_before: one side's bid from the last candle that ended at or
+    before a moment, only when it ended less than `window` seconds before it
+    (a candle exactly that old is not read), never carried forward. The
+    candle is found as the backtest finds one: stepping through the candles
+    in their own order up to the first that ends after the moment."""
+
+    _DAY = 86_400
+    _T = 1_768_000_000
+
+    def test_the_latest_candle_at_or_before_the_moment(self):
+        t = self._T
+        candles = [_bid_candle(t - 7200, 0.30, 0.72), _bid_candle(t - 3600, 0.40, 0.61),
+                   _bid_candle(t + 1, 0.50, 0.51)]
+        assert historical.bid_before(candles, t, "yes", window=self._DAY) == 0.39
+        assert historical.bid_before(candles, t, "no", window=self._DAY) == 0.6
+        # A candle ending exactly at the moment is read
+        assert historical.bid_before(candles, t + 1, "yes", window=self._DAY) == 0.49
+
+    def test_the_window_boundary(self):
+        t, day = self._T, self._DAY
+        # Exactly a window old: not read (it belongs to the check before)
+        assert math.isnan(historical.bid_before([_bid_candle(t - day, 0.40, 0.61)], t, "yes",
+                                                window=day))
+        # One second younger: read
+        assert historical.bid_before([_bid_candle(t - day + 1, 0.40, 0.61)], t, "yes",
+                                     window=day) == 0.39
+        # A newer candle after the moment does not stand in for an old one
+        stale = [_bid_candle(t - day, 0.40, 0.61), _bid_candle(t + 60, 0.45, 0.56)]
+        assert math.isnan(historical.bid_before(stale, t, "no", window=day))
+
+    def test_no_candle_or_none_yet(self):
+        t = self._T
+        assert math.isnan(historical.bid_before([], t, "yes", window=self._DAY))
+        assert math.isnan(historical.bid_before([_bid_candle(t + 1, 0.4, 0.6)], t, "yes",
+                                                window=self._DAY))
+
+    def test_an_unusable_ask_gives_no_bid(self):
+        t = self._T
+        candles = [_bid_candle(t - 7200, 0.30, 0.72), _bid_candle(t - 60, 1.00, 0.99)]
+        # The latest candle has no usable ask on either side, and the older
+        # one is not carried forward
+        assert math.isnan(historical.bid_before(candles, t, "yes", window=self._DAY))
+        assert math.isnan(historical.bid_before(candles, t, "no", window=self._DAY))
+
+    def test_candles_out_of_order_are_read_in_their_own_order(self):
+        t = self._T
+        # The walk stops at the first candle that ends after the moment, so
+        # the out-of-order candle behind it is never reached
+        candles = [_bid_candle(t - 7200, 0.30, 0.72), _bid_candle(t + 3600, 0.50, 0.51),
+                   _bid_candle(t - 60, 0.40, 0.61)]
+        assert historical.bid_before(candles, t, "yes", window=self._DAY) == 0.28
+        # In time order, the same candles give the latest one
+        ordered = sorted(candles, key=lambda c: c["ts"])
+        assert historical.bid_before(ordered, t, "yes", window=self._DAY) == 0.39
+
+    def test_it_matches_a_brute_force_reading_of_sorted_candles(self):
+        rng = random.Random(5150)
+        asks = [0.30, 0.43, 0.57, 0.99, 1.00, 0.0001, "x", None, float("nan"), 0.72]
+        for _ in range(300):
+            stamps = sorted(rng.sample(range(self._T - 4 * self._DAY, self._T + self._DAY, 900),
+                                       rng.randint(0, 12)))
+            candles = [_bid_candle(ts, rng.choice(asks), rng.choice(asks)) for ts in stamps]
+            moment = rng.choice(stamps + [self._T]) - rng.choice([0, 1, 899, self._DAY])
+            for side, index in (("yes", 0), ("no", 1)):
+                got = historical.bid_before(candles, moment, side, window=self._DAY)
+                before = [c for c in candles if c["ts"] <= moment]
+                if not before or moment - before[-1]["ts"] >= self._DAY:
+                    assert math.isnan(got)
+                    continue
+                expected = historical.candle_sale_bids(before[-1])[index]
+                assert (math.isnan(got) and math.isnan(expected)) or got == expected
+
+    @pytest.mark.parametrize("side", ["YES", "", None, "both"])
+    def test_an_unknown_side_is_refused(self, side):
+        with pytest.raises(ValueError, match="side"):
+            historical.bid_before([], self._T, side, window=self._DAY)

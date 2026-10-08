@@ -3666,6 +3666,48 @@ class TestTimeSeriesKellyParity:
         for func in ("_far_enough", "_sale_reach"):
             assert _function_calls(backtester, func, "_days_left"), func
 
+    def test_ast_the_backtest_reads_the_sell_rule_where_live_code_can(self):
+        # The sell rule's arithmetic lives in config, scanner and historical,
+        # which a live module may import (none may import the backtester).
+        # The backtester's own names for it are thin wrappers that call the
+        # shared definitions, so a live sale and a backtest sale can never
+        # apply different arithmetic
+        from kalshi_betting import historical
+
+        wrappers = {"_sells_at": ("take_profit_reached", 1),
+                    "_ladder_average": ("walk_bids", 2),
+                    "_days_left": ("days_to_maturity", 1),
+                    "_usable_ask": ("usable_candle_ask", 1)}
+        source = inspect.getsource(backtester)
+        for name, (shared, statements) in wrappers.items():
+            assert _function_calls(backtester, name, shared), name
+            body = _def_named(source, name).body
+            # The docstring, then the call and nothing else
+            assert isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+            assert len(body) - 1 == statements, name
+        # The candle bid rule: _leg_quotes records each sale bid through
+        # candle_sale_bids, and the backtester works out no bid as
+        # round(1.0 - an ask, ...) of its own
+        assert _function_calls(backtester, "_leg_quotes", "candle_sale_bids")
+
+        def own_bids(module) -> list[str]:
+            """Every round(1 - x, ...) call in a module's source."""
+            return [ast.unparse(n) for n in ast.walk(ast.parse(inspect.getsource(module)))
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id == "round" and n.args
+                    and isinstance(n.args[0], ast.BinOp) and isinstance(n.args[0].op, ast.Sub)
+                    and isinstance(n.args[0].left, ast.Constant) and n.args[0].left.value == 1]
+
+        assert own_bids(backtester) == []
+        # Non-vacuous: the shared rule is found where it lives
+        assert len(own_bids(historical)) == 2
+        assert _function_calls(historical, "candle_sale_bids", "usable_candle_ask")
+        assert _function_calls(historical, "bid_before", "candle_sale_bids")
+        # The NO ask's ceiling has one value, config's, which historical and
+        # the backtester both import
+        assert backtester._CANDLE_NO_ASK_CEILING is config.CANDLE_NO_ASK_CEILING
+        assert historical.CANDLE_NO_ASK_CEILING is config.CANDLE_NO_ASK_CEILING
+
     def test_ast_the_price_paid_and_the_book_each_have_one_reader(self):
         # What a backtest trade paid (fill_price_a/_b) is read only through
         # _paid_prices, and every valuation that falls back on the price paid

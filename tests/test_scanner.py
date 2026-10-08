@@ -2,6 +2,7 @@
 import dataclasses
 import json
 import logging
+import random
 import re
 import sys
 from dataclasses import replace as dc_replace
@@ -10052,3 +10053,251 @@ class TestCentsBidsToDollarBids:
 
     def test_all_malformed_yields_empty_not_an_exception(self):
         assert scanner._cents_bids_to_dollar_bids("T", "true", [["x", 1], [0.5, 1]]) == []
+
+
+# ─── The sell rule's book arithmetic: walk_bids, bid_ladder, floor_to_tick ──
+
+def _old_ladder_average(ladder: list[list[float]], contracts: float) -> float | None:
+    """backtester._ladder_average's walk as it stood before it moved to
+    scanner.walk_bids, kept verbatim as the reference the shared walk must
+    match bit for bit."""
+    left = contracts
+    proceeds = 0.0
+    used = 0
+    for price, size in ladder:
+        take = min(size, left)
+        proceeds += take * price
+        left -= take
+        used += 1
+        if left <= 0:
+            break
+    # Ladder sizes carry six decimals, so anything finer is float noise
+    if round(left, 6) > 0:
+        return None
+    return ladder[0][0] if used == 1 else proceeds / contracts
+
+
+def _random_ladder(rng: random.Random) -> list[list[float]]:
+    """A bid ladder, best first: 1 to 6 levels on a cent, deci-cent or
+    centi-cent grid, sizes whole, two-decimal, or six-decimal with float
+    noise in them."""
+    count = rng.randint(1, 6)
+    grid = rng.choice([100, 1000, 10_000])
+    prices = sorted({rng.randint(1, grid - 1) / grid for _ in range(count)}, reverse=True)
+    ladder = []
+    for price in prices:
+        kind = rng.random()
+        if kind < 0.3:
+            size = float(rng.randint(1, 500))
+        elif kind < 0.6:
+            size = round(rng.uniform(0.01, 300.0), 2)
+        else:
+            size = round(rng.uniform(0.000001, 50.0), 6) + rng.choice([0.0, 1e-9, -1e-9])
+        ladder.append([price, size])
+    return ladder
+
+
+class TestWalkBids:
+    """walk_bids sells a count down a bid ladder, best bid first: the
+    backtest's sale walk (backtester._ladder_average reads its average,
+    which must be exactly the old walk's), plus the lowest price the walk
+    reached, which bounds a live sale order's price."""
+
+    def test_the_average_is_the_old_walks_bit_for_bit(self):
+        rng = random.Random(4242)
+        compared = refused = 0
+        for _ in range(600):
+            ladder = _random_ladder(rng)
+            total = sum(size for _price, size in ladder)
+            for contracts in (total, total + 1e-7, total + 1e-5, total - 1e-7,
+                              total * rng.uniform(0.05, 0.95), ladder[0][1],
+                              float(rng.randint(1, 50)), round(total * rng.random(), 6)):
+                if contracts <= 0:
+                    continue
+                old = _old_ladder_average(ladder, contracts)
+                walked = scanner.walk_bids(ladder, contracts)
+                if old is None:
+                    assert walked is None, (ladder, contracts)
+                    refused += 1
+                    continue
+                assert walked is not None, (ladder, contracts)
+                # repr tells every float apart, -0.0 from 0.0 included
+                assert repr(walked[0]) == repr(old), (ladder, contracts)
+                assert walked[1] in [price for price, _size in ladder]
+                compared += 1
+        # Both outcomes occur, so the comparison is not vacuous
+        assert compared > 1000 and refused > 300
+
+    def test_one_level_that_holds_them_all_is_the_best_bid(self):
+        assert scanner.walk_bids([[0.62, 100.0], [0.55, 50.0]], 40.0) == (0.62, 0.62)
+        assert scanner.walk_bids([[0.62, 100.0]], 100.0) == (0.62, 0.62)
+
+    def test_the_lowest_price_is_the_last_level_reached(self):
+        ladder = [[0.62, 10.0], [0.60, 10.0], [0.55, 10.0], [0.40, 10.0]]
+        average, lowest = scanner.walk_bids(ladder, 25.0)
+        assert lowest == 0.55
+        assert average == pytest.approx((10 * 0.62 + 10 * 0.60 + 5 * 0.55) / 25)
+        # Exactly the first two levels: the walk stops at the second
+        assert scanner.walk_bids(ladder, 20.0)[1] == 0.60
+
+    def test_a_noise_remainder_does_not_reach_a_lower_level(self):
+        # 0.1 + 0.2 is 0.30000000000000004, so about 5.6e-17 is left after
+        # the second level and taken from the third: the average is the old
+        # walk's, but the sale reaches no lower than the second level
+        ladder = [[0.70, 0.1], [0.65, 0.2], [0.10, 5.0]]
+        assert 0.1 + 0.2 - 0.1 - 0.2 > 0
+        average, lowest = scanner.walk_bids(ladder, 0.1 + 0.2)
+        assert average == _old_ladder_average(ladder, 0.1 + 0.2)
+        assert lowest == 0.65
+
+    def test_too_thin_a_ladder_is_refused(self):
+        assert scanner.walk_bids([[0.62, 10.0], [0.55, 5.0]], 15.01) is None
+        # Six-decimal noise beyond the ladder's depth is not a shortfall
+        assert scanner.walk_bids([[0.62, 10.0], [0.55, 5.0]], 15.0000004) == (
+            _old_ladder_average([[0.62, 10.0], [0.55, 5.0]], 15.0000004), 0.55)
+        assert scanner.walk_bids([], 1.0) is None
+
+    @pytest.mark.parametrize("contracts", [0, 0.0, -0.0, -1.0, 1e-7, float("nan")])
+    def test_a_count_that_is_not_above_zero_has_no_price(self, contracts):
+        # A sale of no contracts (or a count that cannot be read) is refused,
+        # on a full ladder and an empty one alike. A tiny positive count is a
+        # sale, priced at the best bid
+        ladder = [[0.62, 10.0], [0.55, 5.0]]
+        if contracts > 0:
+            assert scanner.walk_bids(ladder, contracts) == (0.62, 0.62)
+        else:
+            assert scanner.walk_bids(ladder, contracts) is None
+            assert scanner.walk_bids([], contracts) is None
+
+    def test_the_lowest_price_on_random_whole_ladders(self):
+        rng = random.Random(4243)
+        for _ in range(300):
+            ladder = [[price, float(rng.randint(1, 20))] for price in
+                      sorted({rng.randint(1, 99) / 100 for _ in range(5)}, reverse=True)]
+            contracts = float(rng.randint(1, 60))
+            walked = scanner.walk_bids(ladder, contracts)
+            depth = 0.0
+            for price, size in ladder:
+                depth += size
+                if depth >= contracts:
+                    assert walked is not None and walked[1] == price
+                    break
+            else:
+                assert walked is None
+
+
+class TestBidLadder:
+    """bid_ladder reads one side's resting bids from _fetch_orderbook's
+    result — dollar-string levels in ascending price order on the wire — as
+    floats, best first, the order walk_bids reads."""
+
+    _BOOK = {"yes": [["0.0100", "100.00"], ["0.0200", "257.00"]],
+             "no": [["0.4500", "10.00"], ["0.4700", "3.50"], ["0.9600", "1.00"]]}
+
+    def test_a_wire_book_reads_best_first(self):
+        assert scanner.bid_ladder(self._BOOK, "yes") == [[0.02, 257.0], [0.01, 100.0]]
+        assert scanner.bid_ladder(self._BOOK, "no") == [[0.96, 1.0], [0.47, 3.5], [0.45, 10.0]]
+        # Floats from a cents book read the same way
+        assert scanner.bid_ladder({"yes": [[0.45, 10], [0.5, 2]], "no": []}, "yes") == [
+            [0.5, 2.0], [0.45, 10.0]]
+
+    def test_a_walk_over_a_wire_book(self):
+        # Selling 5 NO contracts: 1 at 0.96 and 3.5 at 0.47, then 0.5 at 0.45
+        average, lowest = scanner.walk_bids(scanner.bid_ladder(self._BOOK, "no"), 5.0)
+        assert lowest == 0.45
+        assert average == pytest.approx((0.96 + 3.5 * 0.47 + 0.5 * 0.45) / 5)
+
+    def test_unusable_levels_are_left_out(self):
+        book = {"yes": [["x", "1"], ["0.5"], None, 7, ["0.0000", "5"], ["1.0000", "5"],
+                        ["0.5000", "0"], ["0.5000", "-1"], ["0.5000", "nan"],
+                        ["nan", "5"], ["0.5000", "inf"], ["-0.1", "5"], ["0.3000", "2.00"],
+                        {"price": "0.4"}, ["0.6000", "1.50", "extra"]],
+                "no": []}
+        assert scanner.bid_ladder(book, "yes") == [[0.6, 1.5], [0.3, 2.0]]
+
+    def test_prices_off_the_finest_grid_are_left_out(self):
+        # The tradeable levels on Kalshi's finest grid, 0.0001 to 0.9999, the
+        # bounds _bids_to_ask_levels keeps too; anything between them and 0
+        # or 1 is no tradeable level
+        book = {"yes": [["0.00005", "5"], ["0.0001", "1"], ["0.9999", "2"],
+                        ["0.99995", "5"]], "no": []}
+        assert scanner.bid_ladder(book, "yes") == [[0.9999, 2.0], [0.0001, 1.0]]
+        assert [config.MIN_ACTIVE_PRICE_DOLLARS, config.MAX_ACTIVE_PRICE_DOLLARS] == [
+            0.0001, 0.9999]
+
+    def test_a_number_too_large_for_a_float_is_left_out(self):
+        # float() of an integer past a float's range raises OverflowError
+        book = {"yes": [["0.5", 10 ** 400], [10 ** 400, "5"], ["0.40", "2"]], "no": []}
+        assert scanner.bid_ladder(book, "yes") == [[0.4, 2.0]]
+
+    def test_left_out_levels_are_counted_in_one_warning(self, caplog):
+        book = {"yes": [["0.4000", "10.00"], ["0.4500", "oops"], ["0.5000", "-3"],
+                        ["0.99995", "1"]], "no": [["0.30", "1"]]}
+        with caplog.at_level(logging.WARNING):
+            assert scanner.bid_ladder(book, "yes", ticker="KXT-1") == [[0.4, 10.0]]
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings == [
+            "Orderbook for KXT-1: left out 3 of 4 YES bid levels as unusable "
+            "(price outside [0.0001, 0.9999], quantity not a positive finite number, "
+            "or unreadable)"]
+
+    def test_a_clean_book_logs_nothing(self, caplog):
+        with caplog.at_level(logging.DEBUG):
+            scanner.bid_ladder(self._BOOK, "no", ticker="KXT-1")
+            scanner.bid_ladder(None, "no", ticker="KXT-1")
+            scanner.bid_ladder({"yes": [], "no": []}, "no", ticker="KXT-1")
+        assert caplog.records == []
+
+    @pytest.mark.parametrize("book", [None, {}, {"no": [["0.5", "1"]]}, {"yes": None},
+                                      {"yes": []}, {"yes": "0.5"}, {"yes": 3}, [["0.5", "1"]]])
+    def test_no_book_or_no_side_reads_as_no_bids(self, book):
+        assert scanner.bid_ladder(book, "yes") == []
+
+    def test_levels_of_one_price_keep_their_order(self):
+        book = {"yes": [["0.40", "1"], ["0.50", "2"], ["0.40", "3"], ["0.50", "4"]], "no": []}
+        assert scanner.bid_ladder(book, "yes") == [[0.5, 2.0], [0.5, 4.0], [0.4, 1.0],
+                                                   [0.4, 3.0]]
+
+    @pytest.mark.parametrize("side", ["YES", "", None, "both"])
+    def test_an_unknown_side_is_refused(self, side):
+        with pytest.raises(ValueError, match="side"):
+            scanner.bid_ladder(self._BOOK, side)
+
+
+class TestFloorToTick:
+    """floor_to_tick rounds a price down onto a tick grid: ceil_to_tick's
+    mirror, for the most a bid that buys back a held NO pays. A price that
+    started as a float is quantized to six decimals first."""
+
+    @pytest.mark.parametrize("price, tick, expected", [
+        ("0.567", "0.01", "0.56"), ("0.56", "0.01", "0.56"), ("0.5699999", "0.01", "0.56"),
+        ("0.5678", "0.001", "0.567"), ("0.567", "0.001", "0.567"),
+        ("0.00567", "0.0001", "0.0056"), ("0.99995", "0.0001", "0.9999"),
+        ("0.0099", "0.01", "0.00"), ("1", "0.01", "1.00"),
+    ])
+    def test_rounds_down_onto_the_grid(self, price, tick, expected):
+        assert scanner.floor_to_tick(Decimal(price), Decimal(tick)) == Decimal(expected)
+
+    def test_a_quantized_float_price_floors_onto_itself(self):
+        # Every grid price read from a float, and every complement 1 - p a NO
+        # sale's bid starts from, floors onto itself once its float noise is
+        # quantized away (Decimal(0.57) alone is a hair below 0.57)
+        assert Decimal(0.57) < Decimal("0.57")
+        for steps, tick in ((100, "0.01"), (1000, "0.001"), (10_000, "0.0001")):
+            tick = Decimal(tick)
+            for k in range(1, steps):
+                for value in (k / steps, 1.0 - (steps - k) / steps):
+                    price = Decimal(str(value)).quantize(scanner._SCANNED_PRICE_QUANTUM)
+                    assert scanner.floor_to_tick(price, tick) == Decimal(k) / steps, value
+
+    def test_it_mirrors_ceil_to_tick(self):
+        rng = random.Random(4244)
+        for _ in range(500):
+            tick = Decimal(rng.choice(["0.01", "0.001", "0.0001"]))
+            price = Decimal(rng.randint(0, 1_000_000)) / Decimal(1_000_000)
+            low = scanner.floor_to_tick(price, tick)
+            high = scanner.ceil_to_tick(price, tick)
+            assert low <= price <= high
+            assert high - low in (Decimal(0), tick)
+            assert low / tick == (low / tick).to_integral_value()
+            assert (low == price) is (high == price)

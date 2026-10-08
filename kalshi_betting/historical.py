@@ -26,8 +26,8 @@ Dependencies:
     EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS,
     EVENT_TITLE_LISTING_MAX_BARREN_PAGES, MVE_SERIES_FAMILY_PREFIX,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
-    CANDLESTICK_MAX_CANDLES_PER_REQUEST, INCLUDE_MVE_MARKETS, PROD_URL) from
-    config.py. Exports
+    CANDLESTICK_MAX_CANDLES_PER_REQUEST, CANDLE_NO_ASK_CEILING,
+    INCLUDE_MVE_MARKETS, PROD_URL, PRICE_EPSILON) from config.py. Exports
     build_historical_client() and build_prod_live_client(), both called by
     backtest.py (NOT backtester.py, which never builds its own clients); and
     fetch_all_settled_markets(), fetch_candlesticks(), and infer_category(),
@@ -42,6 +42,12 @@ Dependencies:
     rejected; backtester.py carries it to the dashboard header and reports
     the counts on its own prefilter line); and SettledCorpusError, which
     walking a SettledCorpus raises when its file cannot be read.
+    And the candle bid rule a sale reads: usable_candle_ask, which
+    backtester.py reads the asks that value an open leg through (its
+    _usable_ask, in _leg_quotes); candle_sale_bids, which backtester.py
+    records its sale bids with; and bid_before, which reads one side's bid at
+    one moment the same way, for live selling's checks on the days before a
+    sale.
 
 Notes:
     Historical market data only exists on the production API — the sandbox does
@@ -160,6 +166,7 @@ from .auth import build_client
 from .config import (
     ARCHIVE_FIRST_CREATED_DATE,
     ARCHIVE_MAX_BARREN_PAGES,
+    CANDLE_NO_ASK_CEILING,
     CANDLESTICK_CACHE_FIELDS_VERSION,
     CANDLESTICK_MAX_CANDLES_PER_REQUEST,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
@@ -171,6 +178,7 @@ from .config import (
     MARKET_PAGE_SIZE,
     MVE_SERIES_FAMILY_PREFIX,
     MVE_TITLE_LOOKUP_MAX_PAGES,
+    PRICE_EPSILON,
     PROD_URL,
     PROJECT_ROOT,
     SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS,
@@ -5852,12 +5860,14 @@ def _fetch_candle_pages(client: Any, path: str, windows: list[tuple[int, int]],
                     # cached with no visible signal at all (BS-23).
                     dropped += 1
                     continue
-                # NO ask ≈ 1 - YES bid (binary market complement); clamp to avoid 0 or 1
+                # NO ask ≈ 1 - YES bid (binary market complement); clamp to
+                # avoid 0 or 1. The top is CANDLE_NO_ASK_CEILING, the value
+                # usable_candle_ask refuses as no quote
                 no_ask = 1.0 - yes_bid
                 candles.append({
                     "ts": c["end_period_ts"],
                     "yes_ask_close": yes_ask,
-                    "no_ask_close": max(0.01, min(0.99, no_ask)),
+                    "no_ask_close": max(0.01, min(CANDLE_NO_ASK_CEILING, no_ask)),
                     # Contracts traded in this hour; None when not readable
                     "volume": _candle_count(c),
                 })
@@ -6069,3 +6079,122 @@ def fetch_candlesticks(
         # a paged window too: the requests that DID succeed are discarded
         # rather than cached as if they were the whole window.
         return []
+
+
+# ─── What a sale would fetch, read from candles ───────────────────────────────
+#
+# A candle carries each side's ASK at the end of its hour (fetch_candlesticks:
+# "yes_ask_close", and "no_ask_close", which is 1 - the YES bid). Selling a
+# side fetches that side's BID, and a YES bid is the price someone offers for
+# YES, which is 1 - the NO ask (and a NO bid 1 - the YES ask). The backtest
+# reads its bids this way (backtester._leg_quotes), and live selling will read
+# the days before a sale from recent candles with the same functions. The
+# highest NO ask a candle can carry, which is no quote, is
+# config.CANDLE_NO_ASK_CEILING, the value fetch_candlesticks clamps to.
+
+
+def usable_candle_ask(raw: Any, side: str) -> float:
+    """
+    Read one candle close as an ask that can value or sell a leg, or NaN.
+
+    An ask is usable when it reads as a number strictly between 0 and 1 —
+    the rule live applies to a held pair's ask (scanner._held_leg_worth) —
+    so a sub-cent ask on a fine grid counts, while a YES ask of 1.00 (no one
+    offering YES) does not. A NO ask must also be below
+    CANDLE_NO_ASK_CEILING: the candle stores the NO ask as 1 - the YES bid,
+    clamped to that ceiling at most, so the ceiling is also what a YES-bid
+    book with no bids reads as. Each bound is held PRICE_EPSILON inside, so
+    float noise on a price sitting on a bound reads as that bound. The
+    backtest reads the asks that value an open leg through it
+    (backtester._usable_ask, in _leg_quotes), and candle_sale_bids reads both
+    asks of a candle through it.
+
+    Args:
+        raw: A candle's "yes_ask_close" or "no_ask_close" (normally a float).
+        side (str): "yes" for a YES ask, "no" for a NO ask.
+
+    Returns:
+        float: The ask when usable; NaN otherwise.
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float("nan")
+    top = 1.0 if side == "yes" else CANDLE_NO_ASK_CEILING
+    # A NaN fails both comparisons, so it stays unusable too
+    return value if PRICE_EPSILON < value < top - PRICE_EPSILON else float("nan")
+
+
+def candle_sale_bids(candle: dict) -> tuple[float, float]:
+    """
+    What selling one contract of each side would fetch on one candle: (YES bid, NO bid).
+
+    The YES bid is 1 - the candle's usable NO ask and the NO bid is 1 - its
+    usable YES ask (usable_candle_ask), each rounded to six decimals so float
+    noise (1 - 0.43 is 0.5700000000000001) never reaches a price. An
+    unusable ask leaves NaN on the other side: that side has no bid there.
+    The backtest records its sale bids with it (backtester._leg_quotes), and
+    bid_before reads a recent candle with it.
+
+    Args:
+        candle (dict): One candle, as fetch_candlesticks returns it
+            ("yes_ask_close", "no_ask_close"; either may be missing).
+
+    Returns:
+        tuple[float, float]: (YES bid, NO bid); NaN for a side with no bid.
+    """
+    return (round(1.0 - usable_candle_ask(candle.get("no_ask_close"), "no"), 6),
+            round(1.0 - usable_candle_ask(candle.get("yes_ask_close"), "yes"), 6))
+
+
+def bid_before(candles: list[dict], moment: int, side: str, *, window: int) -> float:
+    """
+    One side's bid from the last candle that ended at or before `moment`, if it is recent enough.
+
+    The sell rule checks a position once a day before it sells, and an
+    earlier day's check reads that day's last quote: the latest candle that
+    ended at or before the check and less than `window` seconds before it
+    (the backtest's daily checks use one day, so a candle exactly 24 hours
+    old belongs to the check before). An older quote is never carried
+    forward. The candle is found the way the backtest finds one
+    (backtester._candles_at_or_before for one moment): stepping through the
+    candles in their own order and stopping at the first that ends after
+    `moment`, the answer being the one before it. So for candles in time
+    order it is the latest candle at or before `moment`. Whether the market
+    had paid out by then is not read here; the caller handles a payout.
+    Live selling will read the days before a sale from a market's recent
+    candles with it.
+
+    Args:
+        candles (list[dict]): One market's candles, each with "ts" (the end
+            of its hour, Unix seconds), normally in time order.
+        moment (int): The check, in Unix seconds.
+        side (str): The side to sell, "yes" or "no".
+        window (int): Keyword-only. How many seconds old the candle may be:
+            it must have ended less than this long before `moment`.
+
+    Returns:
+        float: The side's bid (candle_sale_bids); NaN when no candle ended
+            at or before `moment`, the latest one is `window` seconds old or
+            more, or the other side's ask on it is not usable.
+
+    Raises:
+        ValueError: For a side other than "yes" or "no".
+    """
+    if side == "yes":
+        index = 0
+    elif side == "no":
+        index = 1
+    else:
+        raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+    # Step forward to the first candle that ends after the moment; the one
+    # just before it is the latest at or before the moment
+    i = 0
+    while i < len(candles) and candles[i]["ts"] <= moment:
+        i += 1
+    if i == 0:
+        return float("nan")
+    candle = candles[i - 1]
+    if not moment - candle["ts"] < window:
+        return float("nan")
+    return candle_sale_bids(candle)[index]
