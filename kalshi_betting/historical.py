@@ -48,9 +48,9 @@ Dependencies:
     _usable_ask, in _leg_quotes); candle_sale_bids, which backtester.py
     records its sale bids with; and bid_before, which reads one side's bid at
     one moment the same way, for live selling's checks on the days before a
-    sale; and recent_candles, which fetches a held market's last few days of
-    candles for those checks, parsed as fetch_candlesticks parses them but
-    never read from or written to the candle cache.
+    sale (seller.plan_sales); and recent_candles, which fetches a market's
+    last few days of candles for those checks, parsed as fetch_candlesticks
+    parses them but never read from or written to the candle cache.
 
 Notes:
     Historical market data only exists on the production API — the sandbox does
@@ -6132,11 +6132,11 @@ def recent_candles(client: Any, ticker: str, event_ticker: str, start_ts: int,
     """
     Fetch one market's hourly candles over [start_ts, end_ts] for a live run, never cached.
 
-    Live selling checks a held position on the days before a sale from each
-    held market's recent candles (bid_before reads them). They are fetched
-    and parsed exactly as fetch_candlesticks fetches and parses them: the
-    live candlestick endpoint first (the market is still open, or settled
-    after the archive cutoff), then the archive on a 404
+    Live selling (seller.plan_sales) checks a held position on the days
+    before a sale from each of its markets' recent candles (bid_before reads
+    them). They are fetched and parsed exactly as fetch_candlesticks fetches
+    and parses them: the live candlestick endpoint first (the market is still
+    open, or settled after the archive cutoff), then the archive on a 404
     (_candle_endpoints, _fetch_candles_from_endpoints), with a window too
     long for one request paged (_candle_request_windows), each request a
     retried read-only GET, and each candle parsed by _fetch_candle_pages.
@@ -6207,9 +6207,9 @@ def recent_candles(client: Any, ticker: str, event_ticker: str, start_ts: int,
 # "yes_ask_close", and "no_ask_close", which is 1 - the YES bid). Selling a
 # side fetches that side's BID, and a YES bid is the price someone offers for
 # YES, which is 1 - the NO ask (and a NO bid 1 - the YES ask). The backtest
-# reads its bids this way (backtester._leg_quotes), and live selling will read
-# the days before a sale from recent candles with the same functions. The
-# highest NO ask a candle can carry, which is no quote, is
+# reads its bids this way (backtester._leg_quotes), and live selling
+# (seller.plan_sales) reads the days before a sale from recent candles with the
+# same functions. The highest NO ask a candle can carry, which is no quote, is
 # config.CANDLE_NO_ASK_CEILING, the value fetch_candlesticks clamps to.
 
 
@@ -6282,8 +6282,8 @@ def bid_before(candles: list[dict], moment: int, side: str, *, window: int) -> f
     `moment`, the answer being the one before it. So for candles in time
     order it is the latest candle at or before `moment`. Whether the market
     had paid out by then is not read here; the caller handles a payout.
-    Live selling will read the days before a sale from a market's recent
-    candles with it.
+    seller.plan_sales reads the days before a live sale from each market's
+    recent candles (recent_candles) with it.
 
     Args:
         candles (list[dict]): One market's candles, each with "ts" (the end

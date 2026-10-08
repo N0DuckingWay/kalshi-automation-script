@@ -66,13 +66,14 @@ Dependencies:
     one-series rule does (DR-51).
     walk_bids, bid_ladder and floor_to_tick are the sell rule's book
     arithmetic: the backtest sells a position down its modeled bid ladder
-    through walk_bids (backtester._ladder_average), and live selling will
-    walk a held market's real bids (bid_ladder) the same way.
-    get_settlements() reads the markets the account held when they paid out
-    (Settlement: counts, cost, fees and payout), and market_for_labels()
+    through walk_bids (backtester._ladder_average), and live selling
+    (seller.plan_sales) walks a held market's real bids (bid_ladder) the same
+    way. get_settlements() reads the markets the account held when they paid
+    out (Settlement: counts, cost, fees and payout), and market_for_labels()
     finds a market by ticker in the run's list, or else from the exchange as
-    resolve_held_ladders does: live selling reads both to value a held
-    market whose partner has paid out.
+    resolve_held_ladders does: seller.plan_sales reads both to value a held
+    market whose partner has paid out, and reads held_pairs() (with its
+    log=False) for the positions it may sell.
     Depends on the KalshiClient produced by auth.py.
 
 Notes:
@@ -3476,7 +3477,8 @@ def _held_leg_worth(position: HeldPosition, side: str, market: Any) -> float:
     return position.exposure_dollars
 
 
-def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict) -> dict:
+def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict, *,
+               log: bool = True) -> dict:
     """
     Find what a run may add to: exact held pairs, and lone legs whose partner has paid out.
 
@@ -3508,6 +3510,9 @@ def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict)
     market whose ladder is unknown could sit on the same ladder, and adding
     there would stack a trade beside it (fails closed).
 
+    Live selling (seller.plan_sales) reads the same shapes as the positions
+    it may sell, with log=False, since the lines here name what a run adds to.
+
     Args:
         positions (dict): get_held_positions' result, ticker -> HeldPosition.
         labels_by_ticker (dict): ticker -> ladder labels for every held market
@@ -3515,6 +3520,9 @@ def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict)
         markets_by_ticker (dict): ticker -> market for this run's whole market
             list, read before held markets are dropped from it; supplies
             each held market's ask.
+        log (bool): Keyword-only. Whether to log what was found, one INFO
+            line per pair or lone leg and the counts (default True); False
+            logs nothing.
 
     Returns:
         dict: frozenset of the held tickers (two for an exact pair, one for a
@@ -3524,7 +3532,8 @@ def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict)
     # A held market with no known ladder could share one with a pair, so no
     # pair can be shown to be alone on its ladder
     if any(not labels_by_ticker.get(ticker) for ticker in positions):
-        logging.info("Held pairs to add to: none (a held market's ladder is unknown)")
+        if log:
+            logging.info("Held pairs to add to: none (a held market's ladder is unknown)")
         return {}
 
     # Union-find over shared labels, in ticker order so the groups are the
@@ -3599,6 +3608,8 @@ def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict)
             fees_dollars=sum(position.fees_dollars for position in held),
             labels=frozenset().union(*(labels_by_ticker[ticker] for ticker in members)))
 
+    if not log:
+        return pairs
     # Each pair or lone leg, then the counts, zero included
     for key in sorted(pairs, key=sorted):
         pair = pairs[key]
@@ -5611,8 +5622,8 @@ def bid_ladder(book: dict | None, side: str, *, ticker: str = "<unknown>") -> li
     where "yes" holds the YES bids and "no" the NO bids, each level a
     [price, quantity] pair (dollar strings on the wire, in ascending price
     order; floats when converted from a cents book). This reads one side as
-    floats and puts the best bid first, the order walk_bids reads. Live
-    selling will read a held market's bids with it before walking them.
+    floats and puts the best bid first, the order walk_bids reads.
+    seller.plan_sales reads a held market's bids with it before walking them.
 
     A level is kept only when its price is a tradeable level on Kalshi's
     finest grid (MIN_ACTIVE_PRICE_DOLLARS to MAX_ACTIVE_PRICE_DOLLARS, the
@@ -5679,8 +5690,9 @@ def walk_bids(ladder: Sequence, contracts: float) -> tuple[float, float] | None:
     Each level sells as many contracts as it holds, or what is left to sell,
     whichever is fewer, until all are sold. The backtest sells a position
     down its modeled bid ladder with it (backtester._ladder_average reads the
-    average); live selling will walk a held market's real bids with it
-    (bid_ladder), and the lowest price reached bounds the sale order's price.
+    average); seller.plan_sales walks a held market's real bids with it
+    (bid_ladder) and keeps both figures in its plan (SalePlan.walked), the
+    lowest price reached for the sale order's price.
 
     Args:
         ladder (Sequence): [[price, quantity], ...], best (highest) price first.

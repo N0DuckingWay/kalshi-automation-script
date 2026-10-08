@@ -14,7 +14,8 @@ Purpose:
 Dependencies:
     No project imports. Imported by auth.py, scanner.py, strategy.py, trader.py,
     reporter.py, historical.py, backtester.py, dashboard.py, backtest.py,
-    scheduler.py, treasury.py, run_lock.py, and main.py — plus two standalone,
+    depth_model.py, scheduler.py, treasury.py, run_lock.py, seller.py and
+    main.py — plus two standalone,
     human-run tools kept deliberately outside the pipeline's import graph: the
     verification CLI (see CLAUDE.md's pipeline-isolation rule) and
     defaults_server.py, the local pages that save the live defaults and start
@@ -36,9 +37,10 @@ Notes:
     The sell rule's tests live here, where live code may import them:
     take_profit_reached (the test at one check) and days_to_maturity, which
     the backtest decides its sales with (through backtester._sells_at and
-    _days_left), and reached_every_check (the test at every check), which
-    live selling will call; the backtest applies that same test at each check
-    through backtester._reached_every_day.
+    _days_left) and seller.plan_sales decides live sales with, and
+    reached_every_check (the test at every check), which seller.plan_sales
+    calls; the backtest applies that same test at each check through
+    backtester._reached_every_day.
 """
 import fcntl
 import json
@@ -497,15 +499,24 @@ TAKE_PROFIT_LEVELS = tuple(percent / 100 for percent in range(80, 101))
 TAKE_PROFIT_MIN_DAYS = (1, 2, 3, 4, 5, 6, 7, 14, 21)
 
 # How many days in a row a position must stay at or above its sell level
-# (TAKE_PROFIT_LEVELS) before the backtest sells it, so a price that jumps for
-# a moment does not trigger a sale. The position is checked once a day, the
-# checks 24 hours apart and the last one at the weekly checkpoint where the
-# sale happens: that check reads the bids there, and each earlier day's check
-# reads the last quote of the 24 hours before it. 1 sells on the checkpoint's
-# bids alone. A whole number from 1 to 7, so every check falls within the
-# week since the previous checkpoint. BACKTEST-ONLY, like TAKE_PROFIT_LEVELS:
-# read by backtester's sell rule (_simulate_at_discount's sell_at).
+# before it is sold, so a price that jumps for a moment does not trigger a
+# sale. The position is checked once a day, the checks 24 hours apart and the
+# last one at the moment of the sale: that check reads the bids then, and each
+# earlier day's check reads the last quote of the 24 hours before it. 1 sells
+# on the sale moment's bids alone. A whole number from 1 to
+# TAKE_PROFIT_HOLD_DAYS_MAX. Read by the backtest's sell rule
+# (backtester._simulate_at_discount's sell_at, at its weekly checkpoints) and
+# by live selling (seller.plan_sales, at the run's own moment), each checking
+# it when called.
 TAKE_PROFIT_HOLD_DAYS = 3
+
+# The most checks TAKE_PROFIT_HOLD_DAYS may ask for: one week. In the backtest
+# a sale at an entry checkpoint then looks back at most six days, all after
+# the previous checkpoint, so every trade the position holds at the sale was
+# already held at each daily check (trades are bought only at checkpoints).
+# Live selling reads its earlier checks from each market's candles over that
+# span at most.
+TAKE_PROFIT_HOLD_DAYS_MAX = 7
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
@@ -591,6 +602,27 @@ SELL_MIN_DAYS: int | None = None
 # --sell-at (in whole percent) must each be a multiple of it from 1% to 100%,
 # as TAKE_PROFIT_LEVELS are.
 SELL_AT_STEP = 0.01
+
+# The most markets live selling (seller.plan_sales) looks up on the exchange in
+# one run to find a held market's paid-out partner. A held market whose partner
+# has paid out is judged with that partner, found among the account's
+# settlements: one held on the other side, with the same count, asking the same
+# question. A settled market is no longer in the run's list of open markets, so
+# its question is looked up, which costs one or two read-only requests. Past
+# this many lookups, the held markets still waiting for theirs are not sold
+# that run.
+SALE_PARTNER_MAX_LOOKUPS = 20
+
+# How many days ago, at most, a held market's partner may have paid out for
+# live selling (seller.plan_sales) to count it. The partner is the other market
+# of a pair bought together, and a pair's two markets stop trading at most
+# MAX_DEADLINE_GAP_DAYS apart (a same-title pair's within an hour of each
+# other), so while the held market still trades, its partner normally paid out
+# less than that long ago. This allows twice that. An older settlement is never
+# taken for a partner, so a market the account traded long ago can neither
+# stand in for one nor make the real one look ambiguous; a real partner older
+# than this is not found, and the held market is not sold.
+SALE_PARTNER_MAX_AGE_DAYS = 2 * MAX_DEADLINE_GAP_DAYS
 
 # The size caps' grid: BUDGET_FRACTION, SAME_TITLE_SIZE_CAP, the saved live
 # defaults' two caps and main.py's --size-cap / --same-title-size-cap (in
@@ -1921,10 +1953,11 @@ CANDLESTICK_CACHE_FIELDS_VERSION = 2
 CANDLE_NO_ASK_CEILING = 0.99
 
 # Seconds historical.recent_candles pauses after each candlestick request.
-# Live selling reads each held market's last few days of candles once per
-# run, one market at a time, so a short pause keeps those reads well inside
-# the account's read limit (the backtest's own fetch pauses 0.15 s, with
-# several workers at once).
+# Live selling (seller.plan_sales) reads the last few days of candles of each
+# market of a position it judges (a held market, or a partner that had not yet
+# paid out by a check) once per run, one market at a time, so a short pause
+# keeps those reads well inside the account's read limit (the backtest's own
+# fetch pauses 0.15 s, with several workers at once).
 RECENT_CANDLES_RATE_LIMIT_SLEEP_SECONDS = 0.05
 
 # The backtest's depth model (depth_model.py): a table of how many contracts
@@ -3254,10 +3287,10 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
 # what it pays if it wins (its contract pairs at CONTRACT_PAYOUT_DOLLARS) less
 # what it cost. The backtest decides its sales with take_profit_reached and
 # days_to_maturity (through backtester._sells_at and _days_left), and live
-# selling will decide with them too, so the two can never apply different
-# arithmetic. reached_every_check is the test at every check that live selling
-# will call; the backtest applies the same test at each check through
-# backtester._reached_every_day, and a test pins the two equal.
+# selling (seller.plan_sales) decides with them too, so the two can never apply
+# different arithmetic. reached_every_check is the test at every check that
+# seller.plan_sales calls; the backtest applies the same test at each check
+# through backtester._reached_every_day, and a test pins the two equal.
 
 def take_profit_reached(sell_at: float, realized: float, potential: float) -> bool:
     """
@@ -3270,8 +3303,9 @@ def take_profit_reached(sell_at: float, realized: float, potential: float) -> bo
     fixed position the test holds at every level below one at which it holds,
     since a float product with a positive number never falls as the other
     factor rises; the backtest's shortcut over many levels relies on that.
-    Called by backtester._sells_at at every daily check; live selling will
-    call it at every check through reached_every_check.
+    Called by backtester._sells_at at every daily check, and by
+    seller.plan_sales at each check (to stop at the first one below the
+    level) and through reached_every_check.
 
     Args:
         sell_at (float): The share of potential profit to sell at, in (0, 1].
@@ -3295,8 +3329,8 @@ def reached_every_check(sell_at: float, profits) -> bool:
     a price that jumps for a moment does not trigger a sale. Like
     take_profit_reached, it holds at every level below one at which it holds.
     With no checks at all it is False: a position that was never valued has
-    shown nothing, so it is not sold. Live selling will decide each sale with
-    it. The backtest applies the same test at each check through
+    shown nothing, so it is not sold. seller.plan_sales decides each live
+    sale with it. The backtest applies the same test at each check through
     backtester._reached_every_day (which calls take_profit_reached through
     backtester._sells_at and is never handed an empty list).
 
@@ -3324,8 +3358,8 @@ def days_to_maturity(close_dates, day: date) -> int | None:
     closed before (a market that has stopped trading but not yet paid out).
     The sell rule's optional minimum of days reads it: a position nearer to
     maturity than the minimum is not sold. The backtest reads it through
-    backtester._days_left (close dates from its trades); live selling will
-    read it with each held market's scheduled close date. Every argument is
+    backtester._days_left (close dates from its trades); seller.plan_sales
+    reads it with each held market's scheduled close date. Every argument is
     a calendar date: a datetime (a close_time, say) is refused, because the
     difference of two datetimes counts whole 24-hour spans, which can be a
     day short of the calendar days between their dates. Turn a Kalshi

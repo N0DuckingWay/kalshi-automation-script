@@ -378,6 +378,7 @@ from .config import (
     SPREAD_BAND_SWEEP_CEILINGS,
     SPREAD_BAND_SWEEP_FLOORS,
     TAKE_PROFIT_HOLD_DAYS,
+    TAKE_PROFIT_HOLD_DAYS_MAX,
     TAKE_PROFIT_LEVELS,
     TAKE_PROFIT_MIN_DAYS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
@@ -468,12 +469,13 @@ _CANDLE_NO_ASK_CEILING = CANDLE_NO_ASK_CEILING
 # quotes. Reporting only: no quote is ever refused for its age.
 _STALE_QUOTE_DAYS = 7
 
-# The most days the sell rule may span (TAKE_PROFIT_HOLD_DAYS): one week. A
-# sale at an entry checkpoint then looks back at most six days, all after the
+# The most days the sell rule may span (TAKE_PROFIT_HOLD_DAYS): one week
+# (config.TAKE_PROFIT_HOLD_DAYS_MAX, which live selling checks too). A sale at
+# an entry checkpoint then looks back at most six days, all after the
 # previous checkpoint, so every trade the position holds at the sale was
 # already held at each daily check (trades are bought only at checkpoints);
 # the rule values those trades at every check.
-_HOLD_DAYS_MAX = 7
+_HOLD_DAYS_MAX = TAKE_PROFIT_HOLD_DAYS_MAX
 
 # date.toordinal() of 1970-01-01, so a UTC midnight's Unix time is
 # (ordinal - _EPOCH_ORDINAL) * _DAY_SECONDS.
@@ -3551,7 +3553,9 @@ def _resolve_hold_days() -> int:
     Reads this module's TAKE_PROFIT_HOLD_DAYS when called (patch
     backtester's, never config's). Read wherever the sell rule is applied
     (_simulate_at_discount with sell_at, _sale_reach) and by
-    run_backtest_sweep before its fetch when the sell family is on.
+    run_backtest_sweep before its fetch when the sell family is on. Live
+    selling checks its own binding the same way (seller._hold_days), so a
+    change to what this accepts must be made there too.
 
     Returns:
         int: A whole number from 1 to _HOLD_DAYS_MAX.
