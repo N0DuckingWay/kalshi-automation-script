@@ -909,7 +909,9 @@ SALE_HEDGE_SLIPPAGE_TICKS     = 1
 # trail a fill by about a second. A run whose listing still does not show the
 # sales after this wait does not use Kalshi's value of the open positions,
 # since that value may still count what was sold, and sizes its buys on the
-# cash alone.
+# cash alone. When a sale's count was read from the account and came up
+# short, the listing is read on the longer pauses of
+# V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS instead.
 SALE_READ_BACK_RECHECK_SECONDS = 1.0
 
 # Fallback tick size, in dollars, for a market whose tick structure is unknown
@@ -1043,7 +1045,11 @@ V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
 # during the wait, so waiting longer on a zero risks no extra wrong-side
 # position then. The cost is that a filled NO leg checked while the mapping
 # is still unverified can wait up to 7 s unhedged — usually only the first of
-# a process, and only when the ledger lags.
+# a process, and only when the ledger lags. Live selling reads a lagging
+# ledger on the same pauses: a sale order whose reply did not say how many it
+# sold, while the account shows less than the whole order
+# (trader._sell_leg), and the positions listing after the sales, while such a
+# sale came up short (main._positions_after_sales).
 V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS = (1.0, 2.0, 4.0)
 
 # While the V2 NO-leg mapping is neither confirmed nor disproven in a process,

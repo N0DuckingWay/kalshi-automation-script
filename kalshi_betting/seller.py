@@ -64,7 +64,8 @@ Dependencies:
 Notes:
     Every request it makes is a read-only GET, each at most once per run:
     a held market's order book, a market's recent candles, the account's
-    settlements (only when a lone held market is judged), and a settled
+    settlements over the last config.SALE_PARTNER_MAX_AGE_DAYS (only when a
+    lone held market is judged), and a settled
     market's ladder labels (at most config.SALE_PARTNER_MAX_LOOKUPS lookups
     per run). It fails closed throughout: an unknown ladder, a missing book
     or candle, settlements that cannot all be read, or a partner that cannot
@@ -427,7 +428,9 @@ class _Reads:
         """
         The account's settlements, read once, when every record could be read.
 
-        A record left out because it could not be read may be the very
+        Only the markets that paid out in the last SALE_PARTNER_MAX_AGE_DAYS
+        are asked for (scanner.get_settlements' min_ts), the only ones a
+        partner can be. A record left out because it could not be read may be the very
         partner a lone held market needs, so then no settlement is used: no
         lone held market is sold this run (fails closed). One WARNING says
         so, once.
@@ -439,9 +442,14 @@ class _Reads:
         if not self._settlements_read:
             self._settlements_read = True
             unreadable: dict = {}
-            # Cross-module: every market the account held when it paid out,
-            # with the count of records that could not be read
-            found = get_settlements(self.client, unreadable_out=unreadable)
+            # Only the window a partner may come from is asked for, so an
+            # unreadable record older than that cannot stop a sale; a second
+            # earlier, so the exchange's window is never narrower than
+            # _find_partner's age check, which still applies
+            oldest = math.floor(self.now_ts - SALE_PARTNER_MAX_AGE_DAYS * _DAY_SECONDS) - 1
+            # Cross-module: every market the account held when it paid out in
+            # that window, with the count of records that could not be read
+            found = get_settlements(self.client, unreadable_out=unreadable, min_ts=oldest)
             if found is None:
                 self._settlements_problem = "the account's settlements could not be read"
             elif unreadable.get("unreadable", 0) > 0:

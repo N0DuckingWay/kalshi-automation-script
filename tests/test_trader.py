@@ -6496,25 +6496,30 @@ class _SaleExchange:
     request) or "error" (an HTTP 400; nothing fills). `outside` moves a
     ticker's position by that much right after its order, as a trade outside
     this run would. A ticker in `lag` reads its old position once after its
-    order, as a lagging ledger does; one in `unreadable` reads fine before its
-    order and fails after it; one in `down` never reads. Every read, pacer
-    place and POST is recorded in `events`, in order, and every body in
-    `bodies`.
+    order, as a lagging ledger does, and one in `lag_reads` for that many
+    reads; one in `unreadable` reads fine before its order and fails after
+    it; one in `down` never reads. Every read, pacer place and POST is
+    recorded in `events`, in order, and every body in `bodies`.
     """
 
     def __init__(self, positions, *, fills=None, reply=None, outside=None, lag=(),
-                 unreadable=(), down=(), part=None):
+                 unreadable=(), down=(), part=None, lag_reads=None, part_reads=None):
         self.positions = dict(positions)
         self.fills = dict(fills or {})
         self.reply = dict(reply or {})
         self.outside = dict(outside or {})
         self.lag = set(lag)
+        # Ticker -> how many reads after its order still show its old position
+        self.lag_reads = dict(lag_reads or {})
         # Ticker -> the position its first read after its order shows, as a
         # ledger that has recorded only part of the order's fills does
         self.part = dict(part or {})
+        # Ticker -> how many reads after its order show that part (default 1)
+        self.part_reads = dict(part_reads or {})
         self.unreadable = set(unreadable)
         self.down = set(down)
         self.posted: set = set()
+        # Ticker -> [the position its next reads show, how many reads left]
         self.stale: dict = {}
         self.events: list = []
         self.bodies: list = []
@@ -6536,9 +6541,11 @@ class _SaleExchange:
         room = held if body["side"] == "ask" else -held
         filled = max(0, min(asked, room, self.fills.get(ticker, asked)))
         if ticker in self.lag:
-            self.stale[ticker] = held
+            self.stale[ticker] = [held, 1]
+        if ticker in self.lag_reads:
+            self.stale[ticker] = [held, self.lag_reads[ticker]]
         if ticker in self.part:
-            self.stale[ticker] = self.part[ticker]
+            self.stale[ticker] = [self.part[ticker], self.part_reads.get(ticker, 1)]
         self.positions[ticker] = (held + (filled if body["side"] == "bid" else -filled)
                                   + self.outside.get(ticker, 0))
         if reply == "raise":
@@ -6556,7 +6563,12 @@ class _SaleExchange:
         if ticker in self.down or (ticker in self.unreadable and ticker in self.posted):
             raise RuntimeError("positions endpoint down")
         if ticker in self.stale:
-            return positions_resp(ticker, self.stale.pop(ticker))
+            shown, left = self.stale[ticker]
+            if left <= 1:
+                del self.stale[ticker]
+            else:
+                self.stale[ticker][1] = left - 1
+            return positions_resp(ticker, shown)
         return positions_resp(ticker, self.positions.get(ticker, 0))
 
 
@@ -6787,11 +6799,15 @@ class TestSellPositions:
         with caplog.at_level(logging.INFO):
             [result] = self._sell(monkeypatch, exchange, [plan])
         assert (result.status, result.sold) == ("partly_sold", {"KX-A": 4})
+        # The count came from the account, not the reply
+        assert result.decided_by_account is True
         # The account is read after the raise and, since it moved less than
-        # the whole order, read once more after the pause
+        # the whole order, read again after each pause of the schedule; the
+        # last reading decides
         assert exchange.events == [("read", "KX-A"), ("pace",), ("post", "KX-A"),
-                                   ("read", "KX-A"), ("read", "KX-A")]
-        assert sleeps == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+                                   ("read", "KX-A"), ("read", "KX-A"), ("read", "KX-A"),
+                                   ("read", "KX-A")]
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
         # The error is logged on one line
         assert any(r.getMessage() == (
             "Sale order on KX-A raised, so the account decides how many sold:"
@@ -6802,10 +6818,53 @@ class TestSellPositions:
                           partner=_paid_out("KX-P", "no"))
         exchange = _SaleExchange({"KX-A": 5}, reply={"KX-A": "raise"}, lag={"KX-A"})
         [result] = self._sell(monkeypatch, exchange, [plan])
-        # The first read after the order still shows 5; the re-read shows the sale
+        # The first read after the order still shows 5; the re-read shows the
+        # sale, and no further re-read is made
         assert (result.status, result.sold) == ("sold", {"KX-A": 5})
-        assert sleeps == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert result.decided_by_account is True
+        assert sleeps == [config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS[0]]
         assert exchange.events[-2:] == [("read", "KX-A"), ("read", "KX-A")]
+
+    def test_a_ledger_that_lags_past_the_first_re_read_is_read_again(self, monkeypatch,
+                                                                     sleeps):
+        # The pair's first order fills all 5 and its reply raises, and the
+        # ledger shows nothing sold for two reads after it: the third reading
+        # shows the sale, so the second order sells 5 too and the pair stays
+        # balanced (one re-read would have read 0 and sent nothing on KX-A,
+        # leaving KX-A's 5 YES held alone)
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-B": "raise"},
+                                 lag_reads={"KX-B": 2})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("sold", {"KX-B": 5, "KX-A": 5})
+        assert result.decided_by_account is True
+        # It stops at the reading that shows the whole count
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS[:2])
+        assert [(b["ticker"], b["count"]) for b in exchange.bodies] == [
+            ("KX-B", "5.00"), ("KX-A", "5.00")]
+        assert exchange.positions == {"KX-A": 0, "KX-B": 0}
+
+    def test_a_ledger_that_lags_through_every_re_read_decides_on_its_last_reading(
+        self, monkeypatch, sleeps,
+    ):
+        # Past the schedule the last reading decides: here it still shows
+        # nothing sold, so nothing is sent on KX-A. The sale is marked as
+        # decided by the account, which main._run_prod then checks against
+        # the positions listing
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-B": "raise"},
+                                 lag_reads={"KX-B": 4})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("not_sold", {"KX-B": 0, "KX-A": 0})
+        assert result.decided_by_account is True
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
+        assert [b["ticker"] for b in exchange.bodies] == ["KX-B"]
+
+    def test_a_reply_that_says_how_many_sold_is_not_decided_by_the_account(
+        self, monkeypatch, sleeps,
+    ):
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, fills={"KX-B": 3})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.decided_by_account) == ("partly_sold", False)
+        assert sleeps == []
 
     def test_an_error_reply_with_an_unmoved_position_sold_nothing(self, monkeypatch, sleeps):
         plan = _sale_plan((_held("KX-A", "yes"), [[0.45, 10]]),
@@ -6814,8 +6873,9 @@ class TestSellPositions:
         [result] = self._sell(monkeypatch, exchange, [plan])
         assert (result.status, result.sold, result.error) == (
             "not_sold", {"KX-A": 0}, "the sale order filled nothing")
-        # Read again once after the pause before it counts as nothing sold
-        assert sleeps == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert result.decided_by_account is True
+        # Read again after each pause before it counts as nothing sold
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
 
     @pytest.mark.parametrize("reply", ["over", "no-fill-count"])
     def test_a_reply_without_a_usable_count_reads_the_account(self, monkeypatch, sleeps,
@@ -6825,6 +6885,7 @@ class TestSellPositions:
         exchange = _SaleExchange({"KX-A": 5}, reply={"KX-A": reply})
         [result] = self._sell(monkeypatch, exchange, [plan])
         assert (result.status, result.sold) == ("sold", {"KX-A": 5})
+        assert result.decided_by_account is True
         assert exchange.events[-1] == ("read", "KX-A")
 
     def test_an_unreadable_position_is_manual_review_with_no_second_order(
@@ -6882,8 +6943,9 @@ class TestSellPositions:
         assert [(b["ticker"], b["count"]) for b in exchange.bodies] == [
             ("KX-B", "5.00"), ("KX-A", "3.00")]
         assert exchange.positions == {"KX-A": 2, "KX-B": -2}
-        # A move short of the whole order is read once more before it counts
-        assert sleeps == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        # A move short of the whole order is read again after each pause
+        # before it counts
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
 
     def test_a_partly_recorded_fill_is_read_again_before_the_second_order(
         self, monkeypatch, sleeps,
@@ -6897,8 +6959,49 @@ class TestSellPositions:
         assert (result.status, result.sold) == ("sold", {"KX-B": 5, "KX-A": 5})
         assert [(b["ticker"], b["count"]) for b in exchange.bodies] == [
             ("KX-B", "5.00"), ("KX-A", "5.00")]
-        assert sleeps == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert sleeps == [config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS[0]]
         assert exchange.positions == {"KX-A": 0, "KX-B": 0}
+
+    def test_a_fill_recorded_in_part_past_the_first_re_read_is_read_again(
+        self, monkeypatch, sleeps,
+    ):
+        # The first two readings after KX-B's order show only 2 of its 5
+        # fills: the third shows all 5, so the second order sells 5 (one
+        # re-read would have sold 2 on KX-A, leaving 3 YES on KX-A held alone
+        # while the run reported a balanced part-sale)
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-B": "raise"},
+                                 part={"KX-B": -3}, part_reads={"KX-B": 2})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("sold", {"KX-B": 5, "KX-A": 5})
+        assert [(b["ticker"], b["count"]) for b in exchange.bodies] == [
+            ("KX-B", "5.00"), ("KX-A", "5.00")]
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS[:2])
+        assert exchange.positions == {"KX-A": 0, "KX-B": 0}
+
+    def test_a_failed_read_after_short_readings_is_manual_review(self, monkeypatch, sleeps):
+        # Two readings show only 2 of KX-B's 5 sold, then the positions
+        # endpoint fails: no reading is safe to act on, so the count is
+        # unknown and nothing is sent on KX-A
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-B": "raise"},
+                                 part={"KX-B": -3}, part_reads={"KX-B": 2})
+        original = exchange.read
+        reads = {"KX-B": 0}
+
+        def read(**kwargs):
+            """Fail KX-B's fourth read: the before-read, two short reads, then down."""
+            if kwargs["ticker"] == "KX-B":
+                reads["KX-B"] += 1
+                if reads["KX-B"] == 4:
+                    exchange.events.append(("read", "KX-B"))
+                    raise RuntimeError("positions endpoint down")
+            return original(**kwargs)
+
+        exchange.read = read
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("manual_review", {"KX-A": 0})
+        assert result.decided_by_account is True
+        assert [b["ticker"] for b in exchange.bodies] == ["KX-B"]
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS[:2])
 
     def test_a_partial_move_then_a_failed_re_read_is_manual_review(
         self, monkeypatch, sleeps,
@@ -6932,7 +7035,7 @@ class TestSellPositions:
                                  lag={"KX-B"})
         [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
         assert (result.status, result.sold) == ("sold", {"KX-B": 5, "KX-A": 5})
-        assert sleeps == [trader._V2_MAPPING_RECHECK_DELAY_SECONDS]
+        assert sleeps == [config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS[0]]
         assert exchange.positions == {"KX-A": 0, "KX-B": 0}
 
     @pytest.mark.parametrize("outside", [

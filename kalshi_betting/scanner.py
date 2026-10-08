@@ -3084,8 +3084,8 @@ def _settlement_from_dict(record: Any) -> Settlement | None:
                       yes_cost, no_cost, fees, revenue, settled_at)
 
 
-def get_settlements(client: Any, *, unreadable_out: dict | None = None
-                    ) -> list[Settlement] | None:
+def get_settlements(client: Any, *, unreadable_out: dict | None = None,
+                    min_ts: int | None = None) -> list[Settlement] | None:
     """
     Fetch every market the account held when it paid out (GET /portfolio/settlements).
 
@@ -3118,6 +3118,11 @@ def get_settlements(client: Any, *, unreadable_out: dict | None = None
             "unreadable" key is set to 0 at the start and, when the call
             returns a list, to the number of records left out of it. A call
             that returns None leaves nothing to use.
+        min_ts (int | None): Keyword-only. When given, a Unix time sent as
+            every page's min_ts, so the exchange returns only the markets
+            that paid out after it: live selling asks for its partner window
+            alone, so an unreadable record older than that cannot stop a
+            sale. None asks for every settlement.
 
     Returns:
         list[Settlement] | None: Every readable settlement, in the reply's
@@ -3137,6 +3142,9 @@ def get_settlements(client: Any, *, unreadable_out: dict | None = None
     pages = 0
     while True:
         kwargs: dict = {"limit": SETTLEMENT_PAGE_SIZE}
+        # Every page asks for the same window, the first and the rest alike
+        if min_ts is not None:
+            kwargs["min_ts"] = min_ts
         # Pages after the first continue from the reply's cursor
         if cursor:
             kwargs["cursor"] = cursor

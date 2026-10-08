@@ -84,8 +84,12 @@ class _World:
         candles (dict): Ticker -> candles (absent: they cannot be read).
         settlements (list | None): The account's settlements; None: unreadable.
         unreadable (int): Settlement records left out as unreadable.
+        unreadable_old (int): Unreadable records that paid out before any
+            window the seller asks for: left out only when a call names no
+            min_ts.
         lookup (dict): Ticker -> market the exchange returns on a lookup.
-        calls (dict): Every stubbed read made, by kind.
+        calls (dict): Every stubbed read made, by kind ("min_ts": each
+            settlements call's window).
     """
 
     def __init__(self) -> None:
@@ -96,8 +100,10 @@ class _World:
         self.candles: dict = {}
         self.settlements: list | None = []
         self.unreadable = 0
+        self.unreadable_old = 0
         self.lookup: dict = {}
-        self.calls: dict = {"book": [], "candles": [], "settlements": 0, "lookup": []}
+        self.calls: dict = {"book": [], "candles": [], "settlements": 0, "lookup": [],
+                            "min_ts": []}
 
     def list(self, market: ApiMarket) -> None:
         """Put a market in this run's market list."""
@@ -127,10 +133,14 @@ class _World:
             self.calls["candles"].append((ticker, event_ticker, start, end))
             return self.candles.get(ticker)
 
-        def settlements(client, *, unreadable_out=None):
+        def settlements(client, *, unreadable_out=None, min_ts=None):
             self.calls["settlements"] += 1
+            self.calls["min_ts"].append(min_ts)
             if unreadable_out is not None:
-                unreadable_out["unreadable"] = self.unreadable
+                # An unreadable record older than the window asked for is not
+                # sent at all, as the exchange leaves it out
+                unreadable_out["unreadable"] = (
+                    self.unreadable + (self.unreadable_old if min_ts is None else 0))
             return self.settlements
 
         def lookup(client, ticker, markets_by_ticker, event_titles):
@@ -752,6 +762,32 @@ class TestPartners:
             assert world.plan(monkeypatch, 0.01) == []
         assert "1 of the account's settlements could not be read" in caplog.text
 
+    def test_only_the_partner_window_of_settlements_is_asked_for(self, monkeypatch):
+        # The read asks for the markets that paid out in the last
+        # SALE_PARTNER_MAX_AGE_DAYS (a second more, never less), so an
+        # unreadable record older than that is never sent and cannot stop
+        # the sale; one inside the window still does
+        world = _lone_world(_settled(_SAME_EVENT, _EV_B))
+        world.unreadable_old = 1
+        (plan,) = world.plan(monkeypatch, 0.01)
+        assert plan.legs[1].ticker == _SAME_EVENT
+        limit = seller.SALE_PARTNER_MAX_AGE_DAYS * _DAY
+        assert world.calls["min_ts"] == [_CK - limit - 1]
+        assert all(type(ts) is int for ts in world.calls["min_ts"])
+
+    def test_the_age_check_still_applies_to_what_the_window_returns(self, monkeypatch,
+                                                                     caplog):
+        # The exchange's window reaches a second past the age limit, so a
+        # settlement in that second is returned; the seller's own check
+        # still leaves it out
+        limit = seller.SALE_PARTNER_MAX_AGE_DAYS * _DAY
+        world = _lone_world(_settled(_SAME_EVENT, _EV_B,
+                                     at=datetime.fromtimestamp(_CK - limit - 1, UTC)))
+        with caplog.at_level(logging.INFO):
+            assert world.plan(monkeypatch, 0.01) == []
+        assert world.calls["min_ts"] == [_CK - limit - 1]
+        assert "no paid-out partner" in caplog.text
+
     def test_a_partner_recorded_as_settling_after_now_is_not_used(self, monkeypatch, caplog):
         world = _lone_world(_settled(_SAME_EVENT, _EV_B,
                                      at=datetime.fromtimestamp(_CK + 60, UTC)))
@@ -766,7 +802,8 @@ class TestPositionsAndReads:
     def test_no_sell_level_reads_nothing(self, monkeypatch):
         world = _exact_pair_world()
         assert world.plan(monkeypatch, None) == []
-        assert world.calls == {"book": [], "candles": [], "settlements": 0, "lookup": []}
+        assert world.calls == {"book": [], "candles": [], "settlements": 0, "lookup": [],
+                               "min_ts": []}
 
     def test_a_held_market_missing_from_the_market_list_is_not_sold(self, monkeypatch,
                                                                     caplog):

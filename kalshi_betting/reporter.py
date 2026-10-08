@@ -245,11 +245,19 @@ class SaleResult:
             market's full count.
         error (str | None): What went wrong or was left over; None for
             "sold" and "simulated".
+        decided_by_account (bool): True when the reply of at least one of
+            its orders did not say how many contracts it sold (the POST
+            raised, or the reply had no usable fill count), so the account's
+            position was read to find out (trader._sell_leg). A lagging
+            ledger can show fewer sold than really were, so main._run_prod
+            reads the positions back after such a sale and checks the count.
+            False for a dry run and when every reply said.
     """
     plan: Any
     status: str            # "sold" | "partly_sold" | "not_sold" | "unbalanced" | "manual_review" | "simulated"
     sold: dict[str, int]
     error: str | None = None
+    decided_by_account: bool = False
 
 
 # A sale's status in plain words, as the trade log's Status column shows it

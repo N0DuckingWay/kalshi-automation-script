@@ -3525,21 +3525,30 @@ def _holding_problem(leg: Any, before: float | None) -> str | None:
 
 
 def _sell_leg(client: Any, leg: Any, count: int, limit: Decimal,
-              before: float) -> int | None:
+              before: float) -> tuple[int | None, bool]:
     """
     Send one sale order for a held market and find out how many contracts it sold.
 
     The order takes one place on the write pacer and is sent once. A 2xx
     reply with a usable fill count is the answer. Otherwise (the POST raised,
     or the reply did not say) the account decides: the position is read
-    again and its move toward zero from `before` is the count sold. Any move
-    short of the whole count is read once more after
-    _V2_MAPPING_RECHECK_DELAY_SECONDS, because the positions ledger can lag a
-    fill by about a second, and part of an order's fills may be recorded
-    before the rest; the later reading is the answer, and when it cannot be
-    read the count is unknown. Those reads come after the except clause: a
-    read that failed inside it would carry the order's error as its cause
-    and could be retried as a passing network fault.
+    again and its move toward zero from `before` is the count sold.
+
+    The positions ledger can lag a fill, wholly or in part (some of an
+    order's fills recorded before the rest), so a move short of the whole
+    count is not taken at once: the position is read again after each pause
+    of config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS in turn (1, 2 and 4
+    seconds, the schedule the buy path's NO-leg check reads a lagging ledger
+    on), stopping at the first reading that shows the whole count. The last
+    reading decides. A reading that cannot be read, at any point, leaves the
+    count unknown: a lagging ledger could hide a fill, so no earlier reading
+    is safe to act on. Even the last reading can still trail the fills, so
+    the caller is told that the account decided, and main._run_prod checks
+    the positions listing again after the sales.
+
+    These reads come after the except clause: a read that failed inside it
+    would carry the order's error as its cause and could be retried as a
+    passing network fault.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -3550,10 +3559,11 @@ def _sell_leg(client: Any, leg: Any, count: int, limit: Decimal,
             of this position was sent and checked by _holding_problem.
 
     Returns:
-        int | None: Contracts sold, from 0 to `count`, or None when that
-            cannot be known (the reply said nothing usable and a position read
-            failed, or the position moved by an amount the order cannot
-            explain).
+        tuple[int | None, bool]: (contracts sold, from 0 to `count`, or None
+            when that cannot be known: the reply said nothing usable and a
+            position read failed, or the position moved by an amount the
+            order cannot explain; and whether the account's position, rather
+            than the order's reply, was read for that count).
     """
     ticker = leg.ticker
     body = _build_sale_order_v2(leg.market, leg.side, count, limit)
@@ -3569,7 +3579,7 @@ def _sell_leg(client: Any, leg: Any, count: int, limit: Decimal,
     else:
         sold = _sale_fill_count(reply, count)
         if sold is not None:
-            return sold
+            return sold, False
         logging.warning(
             "Sale order reply on %s did not say how many sold, so the account decides",
             ticker,
@@ -3577,12 +3587,12 @@ def _sell_leg(client: Any, leg: Any, count: int, limit: Decimal,
     # Outside the except clause (see the docstring); the account's change
     # across the order, never what it holds, is the evidence
     moved = _contracts_sold(before, _position_count(client, ticker), leg.side)
-    if moved is not None and moved < count - _DELTA_EPS:
-        # A position that moved less than the whole order right after a fill
-        # may be ledger lag, wholly or in part: the later reading decides, and
-        # one that cannot be read leaves the count unknown (a lagging ledger
-        # could hide a fill, so neither reading is safe to act on)
-        time.sleep(_V2_MAPPING_RECHECK_DELAY_SECONDS)
+    for pause in V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS:
+        if moved is None or moved >= count - _DELTA_EPS:
+            # Unreadable (the count stays unknown), or the whole count shows
+            break
+        # Short of the whole order: possibly ledger lag, so read it again
+        time.sleep(pause)
         moved = _contracts_sold(before, _position_count(client, ticker), leg.side)
     sold = _whole_count(moved, count)
     if sold is None:
@@ -3593,7 +3603,7 @@ def _sell_leg(client: Any, leg: Any, count: int, limit: Decimal,
     else:
         logging.info("The account shows the sale order on %s sold %d of %d",
                      ticker, sold, count)
-    return sold
+    return sold, True
 
 
 def _contracts_text(count: int, side: str) -> str:
@@ -3797,7 +3807,7 @@ def _hedge_lowest(plan: Any, leg: Any, count: int) -> float:
 
 
 def _sale_result(plan: Any, status: str, sold: dict, error: str | None,
-                 level: int, line: str) -> SaleResult:
+                 level: int, line: str, *, decided_by_account: bool = False) -> SaleResult:
     """
     Log one position's sale outcome on one line and return its record.
 
@@ -3808,12 +3818,15 @@ def _sale_result(plan: Any, status: str, sold: dict, error: str | None,
         error (str | None): The SaleResult error.
         level (int): The logging level of the line.
         line (str): The whole line.
+        decided_by_account (bool): Keyword-only. Whether an order's count was
+            read from the account rather than its reply (_sell_leg).
 
     Returns:
         SaleResult: The record for the run.
     """
     logging.log(level, "%s", line)
-    return SaleResult(plan=plan, status=status, sold=sold, error=error)
+    return SaleResult(plan=plan, status=status, sold=sold, error=error,
+                      decided_by_account=decided_by_account)
 
 
 def _sell_lone(client: Any, plan: Any, leg: Any, before: float) -> SaleResult:
@@ -3831,7 +3844,7 @@ def _sell_lone(client: Any, plan: Any, leg: Any, before: float) -> SaleResult:
         SaleResult: "sold", "partly_sold", "not_sold" or "manual_review".
     """
     limit = _sale_limit(leg.market, leg.side, _walked_lowest(plan, leg.ticker), 0)
-    sold = _sell_leg(client, leg, leg.count, limit, before)
+    sold, by_account = _sell_leg(client, leg, leg.count, limit, before)
     text = _order_text(leg, sold, leg.count, limit)
     if sold is None:
         return _sale_result(
@@ -3840,19 +3853,22 @@ def _sell_lone(client: Any, plan: Any, leg: Any, before: float) -> SaleResult:
             logging.CRITICAL,
             f"SALE OUTCOME UNKNOWN for '{plan.title}': {text} — check the position on"
             f" {leg.ticker} in the Kalshi UI. Manual review required.",
+            decided_by_account=by_account,
         )
     if sold == 0:
         return _sale_result(plan, "not_sold", {leg.ticker: 0}, "the sale order filled nothing",
-                            logging.WARNING, f"Not sold '{plan.title}': {text}")
+                            logging.WARNING, f"Not sold '{plan.title}': {text}",
+                            decided_by_account=by_account)
     if sold < leg.count:
         return _sale_result(
             plan, "partly_sold", {leg.ticker: sold}, f"sold {sold} of {leg.count}",
             logging.WARNING,
             f"Partly sold '{plan.title}': {text}; still held:"
             f" {_contracts_text(leg.count - sold, leg.side)} on {leg.ticker}",
+            decided_by_account=by_account,
         )
     return _sale_result(plan, "sold", {leg.ticker: sold}, None, logging.INFO,
-                        f"Sold '{plan.title}': {text}")
+                        f"Sold '{plan.title}': {text}", decided_by_account=by_account)
 
 
 def _sell_pair(client: Any, plan: Any, first: Any, other: Any,
@@ -3868,8 +3884,15 @@ def _sell_pair(client: Any, plan: Any, first: Any, other: Any,
     cannot be known, no second order is sent.
 
     Both markets' positions were read before the first order was sent, as a
-    buy pair's are, so no retried read stands between the first sale and the
-    second while the pair is unbalanced.
+    buy pair's are. When the first order's reply says how many it sold, the
+    second order follows at once. When it does not (the POST raised, or the
+    reply had no usable count), the account decides (_sell_leg): its
+    position is read with retries, and a reading short of the whole count is
+    read again after pauses of up to 7 seconds in all, so the pair stays
+    uneven while those reads and pauses run (longer when a read has to be
+    retried, each retried read waiting up to about a minute). The YES leg of
+    a buy pair makes the same trade-off: acting on a reading that may lag
+    could sell the wrong count, which is worse than waiting.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -3885,7 +3908,8 @@ def _sell_pair(client: Any, plan: Any, first: Any, other: Any,
     """
     count = first.count
     limit_first = _sale_limit(first.market, first.side, _walked_lowest(plan, first.ticker), 0)
-    first_sold = _sell_leg(client, first, count, limit_first, befores[first.ticker])
+    first_sold, first_by_account = _sell_leg(client, first, count, limit_first,
+                                             befores[first.ticker])
     first_text = _order_text(first, first_sold, count, limit_first)
     if first_sold is None:
         return _sale_result(
@@ -3897,17 +3921,22 @@ def _sell_pair(client: Any, plan: Any, first: Any, other: Any,
             f" {other.ticker}, which still holds {_contracts_text(other.count, other.side)}."
             " Check both positions in the Kalshi UI: the pair may no longer be balanced."
             " Manual review required.",
+            decided_by_account=first_by_account,
         )
     if first_sold == 0:
         return _sale_result(
             plan, "not_sold", {first.ticker: 0, other.ticker: 0},
             "the first sale order filled nothing", logging.WARNING,
             f"Not sold '{plan.title}': {first_text}; nothing sent on {other.ticker}",
+            decided_by_account=first_by_account,
         )
 
     limit_other = _sale_limit(other.market, other.side,
                               _hedge_lowest(plan, other, first_sold), SALE_HEDGE_SLIPPAGE_TICKS)
-    other_sold = _sell_leg(client, other, first_sold, limit_other, befores[other.ticker])
+    other_sold, other_by_account = _sell_leg(client, other, first_sold, limit_other,
+                                             befores[other.ticker])
+    # Whether an account reading decided either order's count
+    by_account = first_by_account or other_by_account
     text = f"{first_text}, then {_order_text(other, other_sold, first_sold, limit_other)}"
     if other_sold is None:
         return _sale_result(
@@ -3917,6 +3946,7 @@ def _sell_pair(client: Any, plan: Any, first: Any, other: Any,
             logging.CRITICAL,
             f"SALE OUTCOME UNKNOWN for '{plan.title}': {text}. Check both positions in the"
             " Kalshi UI: the pair may no longer be balanced. Manual review required.",
+            decided_by_account=by_account,
         )
     if other_sold < first_sold:
         left_first = _contracts_text(count - first_sold, first.side)
@@ -3932,6 +3962,7 @@ def _sell_pair(client: Any, plan: Any, first: Any, other: Any,
             f" holds {left_first} and {other.ticker} holds {left_other}, so the pair is no"
             f" longer balanced. Sell the extra {extra} on {other.ticker} by hand in the"
             " Kalshi UI, or leave them to pay out.",
+            decided_by_account=by_account,
         )
     sold = {first.ticker: first_sold, other.ticker: other_sold}
     if first_sold < count:
@@ -3940,8 +3971,10 @@ def _sell_pair(client: Any, plan: Any, first: Any, other: Any,
             logging.WARNING,
             f"Partly sold '{plan.title}': {text}; the other {count - first_sold} on each"
             " market are still held, as an exact pair",
+            decided_by_account=by_account,
         )
-    return _sale_result(plan, "sold", sold, None, logging.INFO, f"Sold '{plan.title}': {text}")
+    return _sale_result(plan, "sold", sold, None, logging.INFO, f"Sold '{plan.title}': {text}",
+                        decided_by_account=by_account)
 
 
 def _simulate_sale(plan: Any, legs: list) -> SaleResult:
@@ -4043,8 +4076,11 @@ def sell_positions(client: Any, plans: list, *, dry_run: bool) -> list[SaleResul
     since the plan was made, or cannot be read, means nothing is sent for
     that position ("not_sold"). How many an order sold is read from its
     reply; when the reply does not say (or the POST raised), from how the
-    account's position moved (_sell_leg). When even that cannot be known,
-    the position is "manual_review" and no further order is sent for it. Nothing is sent while the V2 NO-leg mapping
+    account's position moved, read again on a schedule of pauses while it
+    shows less than the whole count (_sell_leg), and the result is marked
+    SaleResult.decided_by_account. When even that cannot be known, the
+    position is "manual_review" and no further order is sent for it.
+    Nothing is sent while the V2 NO-leg mapping
     stands disproven in this process (_V2_NO_MAPPING_DISPROVEN). Every outcome
     logs one line naming the position, what was sold on each market and the
     limit sent; for "manual_review" and "unbalanced" that line is a CRITICAL

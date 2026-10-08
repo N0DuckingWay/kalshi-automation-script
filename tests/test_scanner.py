@@ -8434,6 +8434,17 @@ class TestGetSettlements:
         assert [c.kwargs for c in client.get_settlements_without_preload_content.call_args_list] == [
             {"limit": 200}, {"limit": 200, "cursor": "C1"}]
 
+    def test_min_ts_is_asked_for_on_every_page(self):
+        # A window is sent with the first page and with each page after it
+        client = _settlements_client(
+            _settlements_page(_LIVE_SETTLEMENTS[:2], cursor="C1"),
+            _settlements_page(_LIVE_SETTLEMENTS[2:], cursor=""))
+        got = scanner.get_settlements(client, min_ts=1_790_000_000)
+        assert [s.ticker for s in got] == [r["ticker"] for r in _LIVE_SETTLEMENTS]
+        assert [c.kwargs for c in client.get_settlements_without_preload_content.call_args_list] == [
+            {"limit": 200, "min_ts": 1_790_000_000},
+            {"limit": 200, "min_ts": 1_790_000_000, "cursor": "C1"}]
+
     @pytest.mark.parametrize("cursors", [["C1", "C1"], ["C1", "C2", "C1"]])
     def test_a_repeated_cursor_stops_and_gives_none(self, cursors, caplog):
         client = _settlements_client(*[_settlements_page(_LIVE_SETTLEMENTS[:1], cursor=c)

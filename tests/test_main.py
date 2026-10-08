@@ -4394,6 +4394,53 @@ class _SellExchange:
                 [b for b in bodies if not b["reduce_only"]])
 
 
+class _TrailingSellExchange(_SellExchange):
+    """
+    A _SellExchange whose position reads for one market trail its sale order.
+
+    For `lag_reads` reads of `ticker`'s own position after its first order,
+    the reads show only `shown_sold` of that order's contracts sold (0: the
+    position as it was before the order), as a positions ledger that has not
+    caught up with the fills shows it. Later reads, and the positions
+    listing, show the ledger as it is.
+    """
+
+    def __init__(self, monkeypatch, *, ticker: str, lag_reads: int, shown_sold: int = 0,
+                 **kwargs):
+        """
+        Build the exchange.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
+            ticker (str): The market whose reads trail.
+            lag_reads (int): How many reads after its first order trail.
+            shown_sold (int): How many of the order's contracts those reads show sold.
+            **kwargs: _SellExchange's own arguments.
+        """
+        super().__init__(monkeypatch, **kwargs)
+        self.trailing = ticker
+        self.lag_reads = lag_reads
+        self.shown_sold = Decimal(shown_sold)
+        self.shown: Decimal | None = None
+
+    def _request(self, verb, url, headers=None, body=None):
+        """Note what the trailing reads show, then serve the request."""
+        if verb == "POST" and body["ticker"] == self.trailing and self.shown is None:
+            held = self.ledger.get(self.trailing, Decimal(0))
+            # Toward zero by shown_sold: a YES falls, a NO rises
+            self.shown = held - self.shown_sold if held > 0 else held + self.shown_sold
+        return super()._request(verb, url, headers=headers, body=body)
+
+    def _positions(self, **kwargs):
+        """Serve a trailing read, or the ledger as it is."""
+        if (kwargs.get("ticker") == self.trailing and self.shown is not None
+                and self.lag_reads > 0):
+            self.lag_reads -= 1
+            return _raw_json_response({"market_positions": [
+                {"ticker": self.trailing, "position_fp": f"{self.shown:.2f}"}]})
+        return super()._positions(**kwargs)
+
+
 def _run_selling(exchange: _SellExchange, monkeypatch, caplog, *, dry_run: bool,
                  **changes) -> tuple[int, dict, reporter.RunReport]:
     """
@@ -4550,15 +4597,146 @@ class TestSaleHelpers:
         assert main._sold_tickers([_helper_sale("not_sold", {"SELL-A": 0, "SELL-B": 0})],
                                   dry_run=False) == set()
 
+    def test_every_held_market_of_a_picked_position_is_planned(self):
+        # Whatever the sale's outcome; a paid-out partner has no market
+        assert main._planned_tickers([_helper_sale("not_sold", {})]) == {"SELL-A", "SELL-B"}
+        assert main._planned_tickers(
+            [_helper_sale("not_sold", {"SELL-A": 0}, lone=True)]) == {"SELL-A"}
+        assert main._planned_tickers([]) == set()
+
+    def test_the_short_account_decided_sales(self):
+        def sale(status, sold, by_account=True):
+            return dataclasses.replace(_helper_sale(status, sold),
+                                       decided_by_account=by_account)
+
+        assert main._account_decided_short([
+            sale("not_sold", {"SELL-A": 0, "SELL-B": 0}),
+            sale("sold", {"SELL-C": 30}),
+            sale("partly_sold", {"SELL-D": 10}, by_account=False),
+        ]) == ["SELL-A", "SELL-B"]
+        for status in ("partly_sold", "unbalanced"):
+            assert main._account_decided_short([sale(status, {"SELL-A": 10})]) == ["SELL-A"]
+        # A sale left for a person already says so; one fully sold cannot be short
+        assert main._account_decided_short([sale("manual_review", {"SELL-A": 10})]) == []
+
+    @staticmethod
+    def _positions(**counts) -> dict:
+        """A positions listing: ticker -> HeldPosition with that signed count."""
+        return {ticker.replace("_", "-"): scanner_mod.HeldPosition(
+            ticker.replace("_", "-"), count, None, None) for ticker, count in counts.items()}
+
+    def test_the_listing_is_read_in_two_directions(self):
+        before = self._positions(SELL_A=30.0, SELL_B=-30.0)
+
+        def sale(sold, by_account):
+            return dataclasses.replace(_helper_sale("partly_sold", sold),
+                                       decided_by_account=by_account)
+
+        # As recorded: 10 sold on each market
+        recorded = [sale({"SELL-A": 10, "SELL-B": 10}, True)]
+        assert main._listing_misses_sales(
+            recorded, before, self._positions(SELL_A=20.0, SELL_B=-20.0)) == ([], [])
+        # Fewer shown than recorded: not shown yet, whoever decided the count
+        for by_account in (True, False):
+            assert main._listing_misses_sales(
+                [sale({"SELL-A": 10, "SELL-B": 10}, by_account)], before,
+                self._positions(SELL_A=30.0, SELL_B=-25.0)) == (["SELL-A", "SELL-B"], [])
+        # More shown than an account reading recorded: more sold; a market
+        # gone from the listing holds nothing
+        assert main._listing_misses_sales(
+            recorded, before, self._positions(SELL_B=-20.0)) == ([], ["SELL-A"])
+        # A count the reply gave is trusted: the other direction is read as not shown
+        assert main._listing_misses_sales(
+            [sale({"SELL-A": 10, "SELL-B": 10}, False)], before,
+            self._positions(SELL_B=-20.0)) == (["SELL-A"], [])
+
+    def test_an_account_decided_zero_is_checked_and_a_reply_zero_is_not(self):
+        before = self._positions(SELL_A=30.0, SELL_B=-30.0)
+        after = self._positions(SELL_B=-30.0)
+        by_account = dataclasses.replace(_helper_sale("not_sold", {"SELL-A": 0, "SELL-B": 0}),
+                                         decided_by_account=True)
+        assert main._listing_misses_sales([by_account], before, after) == ([], ["SELL-A"])
+        by_reply = _helper_sale("not_sold", {"SELL-A": 0, "SELL-B": 0})
+        assert main._listing_misses_sales([by_reply], before, after) == ([], [])
+
+    def test_a_market_missing_from_a_listing_cut_short_is_not_checked(self):
+        # The listing stopped early, so SELL-A missing from it may still be
+        # held: its count is unknown, so neither direction is claimed for it
+        # (read as sold out, an account-decided 0 would look like 30 sold).
+        # SELL-B, which the listing does name, is still checked
+        before = self._positions(SELL_A=30.0, SELL_B=-30.0)
+        cut_short = self._positions(SELL_B=-30.0)
+        by_account = dataclasses.replace(_helper_sale("not_sold", {"SELL-A": 0, "SELL-B": 0}),
+                                         decided_by_account=True)
+        assert main._listing_misses_sales([by_account], before, cut_short,
+                                          listing_complete=False) == ([], [])
+        assert main._listing_misses_sales([by_account], before, cut_short,
+                                          listing_complete=True) == ([], ["SELL-A"])
+        part = dataclasses.replace(_helper_sale("partly_sold", {"SELL-A": 10, "SELL-B": 10}),
+                                   decided_by_account=True)
+        assert main._listing_misses_sales([part], before, cut_short,
+                                          listing_complete=False) == (["SELL-B"], [])
+        assert main._listing_misses_sales(
+            [part], before, self._positions(SELL_B=-10.0),
+            listing_complete=False) == ([], ["SELL-B"])
+
+    def test_a_sale_the_listing_shows_more_sold_on_is_left_for_a_person(self, caplog):
+        before = self._positions(SELL_A=30.0, SELL_B=-30.0)
+        after = self._positions(SELL_B=-20.0)
+        short = dataclasses.replace(
+            _helper_sale("partly_sold", {"SELL-A": 10, "SELL-B": 10}),
+            error="sold 10 of 30 on each market", decided_by_account=True)
+        other = _helper_sale("sold", {"SELL-C": 30})
+        with caplog.at_level(logging.INFO):
+            flagged = main._flag_sales_sold_more([short, other], ["SELL-A"], before, after)
+        assert flagged[1] is other
+        assert flagged[0].status == "manual_review"
+        assert flagged[0].sold == {"SELL-A": 10, "SELL-B": 10}
+        assert flagged[0].error == (
+            "the account shows more sold than recorded: SELL-A held 30 YES: this run "
+            "recorded 10 sold, the account now shows 0 left (30 sold) (this replaces what "
+            "was recorded before the check: sold 10 of 30 on each market)")
+        [critical] = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert critical.startswith("SALE RECORDED SHORT for 'Q': SELL-A held 30 YES: this "
+                                   "run recorded 10 sold, the account now shows 0 left "
+                                   "(30 sold).")
+        assert "Kalshi UI" in critical
+        # Earlier lines about the sale were built on the short count
+        assert ("This replaces every earlier line about this sale, including any extra it "
+                "said to sell by hand") in critical
+        # Left for a person: its held markets stay out of every purchase
+        assert main._sold_tickers(flagged, dry_run=False) == {"SELL-A", "SELL-B", "SELL-C"}
+
+    def test_a_value_that_did_not_fall_after_a_sale_is_refused(self, caplog):
+        held = self._positions(SELL_B=-20.0)
+        with caplog.at_level(logging.INFO):
+            # Not below the $24.00 kept at the start: refused
+            assert main._checked_positions_value(
+                100_000, 2_400, held, True, value_before_sales=2_400) is None
+            # Below it: kept
+            assert main._checked_positions_value(
+                100_000, 800, held, True, value_before_sales=2_400) == 800
+            # A value of 0 adds nothing and is always kept
+            assert main._checked_positions_value(
+                100_000, 0, held, True, value_before_sales=0) == 0
+            # With nothing sold there is nothing to compare with
+            assert main._checked_positions_value(100_000, 2_000, held, True) == 2_000
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning == (
+            "Kalshi's value of the open positions ($24.00) is not used: this run's sales "
+            "sold, or may have sold, contracts, yet it is not below the $24.00 it was "
+            "before them, so it may still count what was sold — sizing on cash alone "
+            "($1000.00) this run, as if no position were held")
+
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestRunProdSellsInADryRun:
     """A production dry run with a sell level sells nothing but sizes its buys
     as if each would-be sale filled: the estimated proceeds (floored to the
-    cent) go on the cash and its shard, the portfolio value is left as read,
-    and the markets it would sell stay out of every purchase. A held pair
-    below its level is kept, and stays blocked like any held market. With
-    selling off, nothing about the run changes."""
+    cent) go on the cash and its shard, the portfolio value is never below
+    that cash, and the markets it would sell stay out of every purchase. A
+    held pair below its level is kept, and stays blocked like any held
+    market. With selling off, nothing about the run changes."""
 
     _BEFORE = {**_LIVE_BALANCE_PAYLOAD, "portfolio_value": 0}
 
@@ -4588,10 +4766,12 @@ class TestRunProdSellsInADryRun:
             _TICKER_SELL_EARLY, _TICKER_SELL_LATE]
         exchange.client.get_settlements_without_preload_content.assert_not_called()
         # The buys are sized on the cash plus exactly the floored proceeds,
-        # on the portfolio value as read, and shard 0 holds the proceeds
+        # and shard 0 holds the proceeds. The portfolio value read was the
+        # cash alone (Kalshi's value of the positions read $0), so it grows to
+        # that cash, as a live run's read back after the sale would
         cash = _CASH_CENTS + _SELL_PROCEEDS_CENTS
-        assert seen["enrich"] == [(_CASH_CENTS, cash)]
-        assert seen["specs"] == [(_CASH_CENTS, cash)]
+        assert seen["enrich"] == [(cash, cash)]
+        assert seen["specs"] == [(cash, cash)]
         assert seen["portfolio"] == [cash]
         assert seen["shards"] == [{0: 25_000 + _SELL_PROCEEDS_CENTS, 1: 999_900}]
         assert "Dry run: sizing as if the sales filled — cash $10277.06 (+$28.06)" in messages
@@ -4617,7 +4797,10 @@ class TestRunProdSellsInADryRun:
             (_TICKER_SELL_EARLY, 30, 0.55), (_TICKER_SELL_LATE, 30, 0.42)]
         (no_trades, before, after, [sale]), (trades, *_rest) = seen["log"]
         assert no_trades == [] and _rest[2] == []
-        assert (before, after) == (pytest.approx(10_249.0), pytest.approx(10_277.06))
+        # The sales' banner shows the cash as Kalshi holds it, before and
+        # after: a dry run's sales sent nothing (the estimate is the run
+        # result's cash_after_sales and the log line above)
+        assert (before, after) == (pytest.approx(10_249.0), pytest.approx(10_249.0))
         assert sale.status == "simulated"
         assert sale.sold == {_TICKER_SELL_EARLY: 30, _TICKER_SELL_LATE: 30}
         assert {r.spec.pair.market_a.ticker for r in trades} == {_TICKER_SAME_EXP}
@@ -4636,7 +4819,7 @@ class TestRunProdSellsInADryRun:
         code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
                                            sell_at=0.80, add_to_held_pairs=True)
         assert code == EXIT_OK
-        assert "Held pairs sold this run, not added to: 1" in _messages(caplog)
+        assert "Held pairs picked for sale this run, not added to: 1" in _messages(caplog)
         ts_key = frozenset((_TICKER_TS_EARLY, _TICKER_TS_LATE))
         for blocked, markets, add_on_pairs in seen["ts"] + seen["st"]:
             assert set(add_on_pairs) == {ts_key}
@@ -4667,7 +4850,8 @@ class TestRunProdSellsInADryRun:
 
         for name in ("plan_sales", "sell_positions", "report_sales", "_sold_tickers",
                      "_with_simulated_proceeds", "_record_sales", "_positions_after_sales",
-                     "_listing_misses_sales", "_value_after_sales"):
+                     "_listing_misses_sales", "_value_after_sales", "_planned_tickers",
+                     "_account_decided_short", "_flag_sales_sold_more"):
             monkeypatch.setattr(main, name, never)
         again = _SellExchange(monkeypatch, held_rows=_SELL_ROWS + _HELD_TS_PAIR,
                               before=self._BEFORE, include_time_series=True)
@@ -4967,6 +5151,375 @@ class TestRunProdSellsLive:
         assert ("event", "EVS-SELL-EARLY") in ladders
         for blocked, _markets, add_on_pairs in seen["ts"] + seen["st"]:
             assert _SELL_TICKERS <= blocked and not add_on_pairs
+
+    @staticmethod
+    def _pauses(monkeypatch) -> tuple[list, list]:
+        """
+        Take no pauses: record main's, and the sale re-reads' (one second or
+        more; the candle reads' short pauses go through the same time.sleep).
+        """
+        trader_sleeps: list = []
+        main_sleeps: list = []
+        monkeypatch.setattr(trader_mod.time, "sleep",
+                            lambda s: trader_sleeps.append(s) if s >= 1 else None)
+        monkeypatch.setattr(main, "time", SimpleNamespace(sleep=main_sleeps.append))
+        return trader_sleeps, main_sleeps
+
+    @pytest.mark.parametrize("shown_sold", [0, 10])
+    def test_a_ledger_that_trails_past_the_first_re_read_still_sells_the_pair(
+            self, monkeypatch, caplog, shown_sold):
+        # SELL-EARLY's order fills all 30 but its reply is an error, and the
+        # first two reads of its position after it show none, or only 10, of
+        # them sold: the third read shows all 30, so SELL-LATE's order sells
+        # 30 too and the pair is sold in full
+        trader_sleeps, _main_sleeps = self._pauses(monkeypatch)
+        exchange = _TrailingSellExchange(
+            monkeypatch, ticker=_TICKER_SELL_EARLY, lag_reads=2, shown_sold=shown_sold,
+            held_rows=_SELL_ROWS, before=self._BEFORE, after=_AFTER_SALE_BALANCE,
+            fills_then_raises={_TICKER_SELL_EARLY})
+        monkeypatch.setattr(main, "find_same_title_pairs",
+                            lambda markets, held, *, add_on_pairs=None: [])
+        code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
+                                           sell_at=0.80)
+        assert code == EXIT_OK, _messages(caplog)[-5:]
+        assert [r.status for r in report.sales] == ["sold"]
+        sales, _buys = exchange.orders()
+        assert [(b["ticker"], b["count"]) for b in sales] == [
+            (_TICKER_SELL_EARLY, "30.00"), (_TICKER_SELL_LATE, "30.00")]
+        assert exchange.ledger[_TICKER_SELL_EARLY] == 0 == exchange.ledger[_TICKER_SELL_LATE]
+        assert trader_sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS[:2])
+        assert not [r for r in caplog.records if r.levelno >= logging.CRITICAL]
+
+    @pytest.mark.parametrize("shown_sold, status, late_left, recorded", [
+        # Every read shows nothing sold: nothing is sent on SELL-LATE
+        (0, "not_sold", -30, "0"),
+        # Every read shows 10 of the 30 sold: SELL-LATE sells 10
+        (10, "partly_sold", -20, "10"),
+    ])
+    def test_a_sale_recorded_short_by_a_trailing_ledger_needs_a_person(
+            self, monkeypatch, caplog, shown_sold, status, late_left, recorded):
+        # The reads of SELL-EARLY's position trail its fill past every
+        # re-read, so the run records fewer sold than really were and
+        # SELL-LATE's order sells too few: the positions listing read back
+        # after the sales shows SELL-EARLY sold out, so the sale is left for a
+        # person (a CRITICAL, exit 20), and both its markets stay out of
+        # every purchase
+        trader_sleeps, main_sleeps = self._pauses(monkeypatch)
+        after = {**_AFTER_SALE_BALANCE, "portfolio_value": 800}
+        exchange = _TrailingSellExchange(
+            monkeypatch, ticker=_TICKER_SELL_EARLY, lag_reads=10, shown_sold=shown_sold,
+            held_rows=_SELL_ROWS, before=self._BEFORE, after=after,
+            fills_then_raises={_TICKER_SELL_EARLY})
+        code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
+                                          sell_at=0.80)
+        assert code == EXIT_TRADES_NEED_ATTENTION
+        assert exchange.ledger[_TICKER_SELL_EARLY] == 0
+        assert exchange.ledger[_TICKER_SELL_LATE] == late_left
+        assert trader_sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
+        # The listing is read back, and once more after the wait
+        assert [e[0] for e in exchange.events].count("listing") == 3
+        assert main_sleeps == [config.SALE_READ_BACK_RECHECK_SECONDS]
+        criticals = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+        [short] = [m for m in criticals if m.startswith("SALE RECORDED SHORT")]
+        assert (f"SELL-EARLY held 30 YES: this run recorded {recorded} sold, the account "
+                f"now shows 0 left (30 sold)") in short
+        # The run result and the trade log show it as a sale to check
+        [record] = report.sales
+        assert record.status == "manual_review"
+        assert record.error.startswith("the account shows more sold than recorded: "
+                                       "SELL-EARLY held 30 YES")
+        [(_no_trades, _before, _after, [logged])] = [w for w in seen["log"] if w[3]]
+        assert logged.status == "manual_review"
+        row = reporter._sale_to_row(logged, datetime.now(UTC))
+        assert row[16] == "check" and "the account shows more sold than recorded" in row[17]
+        # Its markets stay out of every purchase, and the closing line says so
+        for blocked, markets, _pairs in seen["ts"] + seen["st"]:
+            assert _SELL_TICKERS <= blocked and not markets & _SELL_TICKERS
+        _sales, buys = exchange.orders()
+        assert not [b for b in buys if b["ticker"] in _SELL_TICKERS]
+        assert report.message.endswith(
+            " Sales that need a person to check: 1 (see the CRITICAL lines above).")
+        # Before the check, the trader recorded what the account showed;
+        # the check replaces it, in the error and in the CRITICAL
+        assert "(this replaces what was recorded before the check: " in record.error
+        assert "This replaces every earlier line about this sale" in short
+        assert any(r.getMessage().startswith(
+            {"not_sold": "Not sold '", "partly_sold": "Partly sold '"}[status])
+            for r in caplog.records)
+
+    def test_the_defaults_server_shows_a_sale_recorded_short(self, monkeypatch, caplog,
+                                                             tmp_path):
+        from kalshi_betting import defaults_server
+        self._pauses(monkeypatch)
+        exchange = _TrailingSellExchange(
+            monkeypatch, ticker=_TICKER_SELL_EARLY, lag_reads=10, held_rows=_SELL_ROWS,
+            before=self._BEFORE, after=_AFTER_SALE_BALANCE,
+            fills_then_raises={_TICKER_SELL_EARLY})
+        code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
+                                           sell_at=0.80)
+        assert code == EXIT_TRADES_NEED_ATTENTION
+        reporter.write_run_report(tmp_path / defaults_server._RESULT_NAME, report, code)
+        result = defaults_server._read_result(tmp_path)
+        assert result.state == "ok"
+        page = defaults_server._sales_html(
+            result.record["sales"], result.record["cash_after_sales"], dry_run=False)
+        assert "<td>check</td>" in page
+        assert "the account shows more sold than recorded: SELL-EARLY held 30 YES" in page
+
+    def test_a_part_fill_counted_from_the_account_is_checked_and_stands(
+            self, monkeypatch, caplog):
+        # SELL-EARLY's order really fills 10 of 30 and its reply is an error:
+        # every read shows 10 sold, so SELL-LATE sells 10. The listing read
+        # back (again after pauses of 1, 2 and 4 s, since the count came
+        # from the account and was short) agrees, so the part-sale stands
+        trader_sleeps, main_sleeps = self._pauses(monkeypatch)
+        exchange = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=self._BEFORE,
+                                 after={**_AFTER_SALE_BALANCE, "portfolio_value": 1_600},
+                                 fills={_TICKER_SELL_EARLY: 10},
+                                 fills_then_raises={_TICKER_SELL_EARLY})
+        monkeypatch.setattr(main, "find_same_title_pairs",
+                            lambda markets, held, *, add_on_pairs=None: [])
+        code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
+                                           sell_at=0.80)
+        assert code == EXIT_OK
+        assert [r.status for r in report.sales] == ["partly_sold"]
+        assert exchange.ledger[_TICKER_SELL_EARLY] == 20
+        assert exchange.ledger[_TICKER_SELL_LATE] == -20
+        assert [e[0] for e in exchange.events].count("listing") == 5
+        assert main_sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
+        for pause in ("1", "2", "4"):
+            assert ("This run's sales on SELL-EARLY, SELL-LATE were counted from the "
+                    "account's positions, which can trail a fill; reading the positions "
+                    f"listing again in {pause} s to check them") in _messages(caplog)
+        assert not [r for r in caplog.records if r.levelno >= logging.CRITICAL]
+        # $16.00 is below the $24.00 kept at the start, so it is used
+        assert ("After the sales: portfolio value $10293.06 = cash $10277.06 + open "
+                "positions $16.00") in _messages(caplog)
+
+    def test_a_sale_that_read_nothing_sold_from_the_account_still_reads_the_listing(
+            self, monkeypatch, caplog):
+        # The order is refused with an error and fills nothing: the account
+        # reads nothing sold, and the run reads its positions back all the
+        # same (the reading might have trailed a fill), again after pauses
+        # of 1, 2 and 4 s; they show nothing sold, so nothing is flagged and
+        # nothing more is sent
+        _trader_sleeps, main_sleeps = self._pauses(monkeypatch)
+        exchange = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=self._BEFORE,
+                                 raises={_TICKER_SELL_EARLY})
+        monkeypatch.setattr(main, "find_same_title_pairs",
+                            lambda markets, held, *, add_on_pairs=None: [])
+        code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
+                                           sell_at=0.80)
+        assert code == EXIT_OK
+        assert [r.status for r in report.sales] == ["not_sold"]
+        assert [e[0] for e in exchange.events].count("listing") == 5
+        assert main_sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
+        assert [e[0] for e in exchange.events].count("balance") >= 2
+        sales, _buys = exchange.orders()
+        assert [b["ticker"] for b in sales] == [_TICKER_SELL_EARLY]
+        assert not [r for r in caplog.records if r.levelno >= logging.CRITICAL]
+
+    def _trailing_everywhere(self, monkeypatch, caplog, *, stale_reads: int):
+        """
+        Run a sale whose short count the account decided, with a listing that trails too.
+
+        SELL-EARLY's order fills all 30 but its reply is an error, and every
+        read of its own position trails the fill, so the run records nothing
+        sold and sends nothing on SELL-LATE: 30 NO are really held alone. The
+        positions listing trails as well, for `stale_reads` reads after the
+        sales (each still shows what was held at the start).
+
+        Returns:
+            tuple: (exit code, run result, the exchange, each listing read,
+                each of main's waits).
+        """
+        monkeypatch.setattr(trader_mod.time, "sleep", lambda s: None)
+        exchange = _TrailingSellExchange(
+            monkeypatch, ticker=_TICKER_SELL_EARLY, lag_reads=10, held_rows=_SELL_ROWS,
+            before=self._BEFORE, after=_AFTER_SALE_BALANCE,
+            fills_then_raises={_TICKER_SELL_EARLY})
+        reads, sleeps = self._lagging_listing(monkeypatch, stale_reads=stale_reads)
+        monkeypatch.setattr(main, "find_same_title_pairs",
+                            lambda markets, held, *, add_on_pairs=None: [])
+        code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
+                                           sell_at=0.80)
+        assert exchange.ledger[_TICKER_SELL_EARLY] == 0
+        assert exchange.ledger[_TICKER_SELL_LATE] == -30
+        return code, report, exchange, reads, sleeps
+
+    @pytest.mark.parametrize("stale_reads", [1, 2, 3])
+    def test_a_listing_that_trails_an_account_decided_sale_is_read_on_the_longer_waits(
+            self, monkeypatch, caplog, stale_reads):
+        # The short count came from the account, so the listing is read again
+        # after pauses of 1, 2 and 4 s; the first read after a pause that
+        # shows SELL-EARLY sold out leaves the sale for a person (a CRITICAL,
+        # exit 20), and the run reads no further
+        code, report, _exchange, reads, sleeps = self._trailing_everywhere(
+            monkeypatch, caplog, stale_reads=stale_reads)
+        assert code == EXIT_TRADES_NEED_ATTENTION
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)[:stale_reads]
+        assert len(reads) == 2 + stale_reads
+        assert [r.status for r in report.sales] == ["manual_review"]
+        criticals = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+        [short] = [m for m in criticals if m.startswith("SALE RECORDED SHORT")]
+        assert ("SELL-EARLY held 30 YES: this run recorded 0 sold, the account now shows 0 "
+                "left (30 sold)") in short
+
+    def test_a_listing_still_trailing_after_the_last_pause_leaves_the_count_standing(
+            self, monkeypatch, caplog):
+        # The recorded residual (CLAUDE.md's live-selling paragraph): when the
+        # listing still trails after the last pause, nothing the run can read
+        # contradicts the short count, so the sale stands as not sold and the
+        # run exits 0, although 30 NO are really held alone
+        code, report, _exchange, reads, sleeps = self._trailing_everywhere(
+            monkeypatch, caplog, stale_reads=4)
+        assert code == EXIT_OK
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
+        assert len(reads) == 5
+        assert [r.status for r in report.sales] == ["not_sold"]
+        assert not [r for r in caplog.records if r.levelno >= logging.CRITICAL]
+
+    def test_a_market_missing_from_a_listing_cut_short_is_not_read_as_sold(
+            self, monkeypatch, caplog):
+        # SELL-EARLY's order is refused (HTTP 500) and fills nothing, so the
+        # account decides: nothing sold. Every listing read after the sales
+        # stops early and leaves SELL-EARLY out, though all 30 are still held.
+        # A market missing from a listing cut short may still be held, so the
+        # run claims nothing about it: no CRITICAL, and the sale stands
+        _trader_sleeps, main_sleeps = self._pauses(monkeypatch)
+        exchange = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=self._BEFORE,
+                                 raises={_TICKER_SELL_EARLY})
+        real_positions = main.get_held_positions
+        reads: list = []
+
+        def cut_short(client, *, complete_out=None):
+            positions = real_positions(client, complete_out=complete_out)
+            reads.append(positions)
+            if len(reads) > 1:
+                complete_out["complete"] = False
+                positions = {t: p for t, p in positions.items() if t != _TICKER_SELL_EARLY}
+            return positions
+
+        monkeypatch.setattr(main, "get_held_positions", cut_short)
+        monkeypatch.setattr(main, "find_same_title_pairs",
+                            lambda markets, held, *, add_on_pairs=None: [])
+        code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
+                                           sell_at=0.80)
+        assert exchange.ledger[_TICKER_SELL_EARLY] == 30
+        assert code == EXIT_OK
+        assert [r.status for r in report.sales] == ["not_sold"]
+        assert not [r for r in caplog.records if r.levelno >= logging.CRITICAL]
+        assert main_sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
+        # The value read with a listing cut short is not used, as at the start
+        assert any(r.getMessage().startswith(
+            "Kalshi's value of the open positions ($24.00) is not used: the list of the "
+            "account's positions was cut short") for r in caplog.records)
+
+    def test_a_second_order_recorded_short_replaces_the_extra_to_sell_by_hand(
+            self, monkeypatch, caplog):
+        # SELL-EARLY's order sells all 30 and its reply says so. SELL-LATE's
+        # sells all 30 too, but its reply is an error and every read of its
+        # position trails the fill, so the trader records the pair as uneven
+        # and says to sell an extra 30 NO on SELL-LATE by hand. The listing
+        # read back shows SELL-LATE sold out: the run's CRITICAL replaces that
+        # instruction, since nothing extra is held
+        self._pauses(monkeypatch)
+        exchange = _TrailingSellExchange(
+            monkeypatch, ticker=_TICKER_SELL_LATE, lag_reads=10, held_rows=_SELL_ROWS,
+            before=self._BEFORE, after=_AFTER_SALE_BALANCE,
+            fills_then_raises={_TICKER_SELL_LATE})
+        code, _seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
+                                           sell_at=0.80)
+        assert code == EXIT_TRADES_NEED_ATTENTION
+        assert exchange.ledger[_TICKER_SELL_EARLY] == 0 == exchange.ledger[_TICKER_SELL_LATE]
+        criticals = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+        [uneven] = [m for m in criticals if m.startswith("SALE LEFT A PAIR UNBALANCED")]
+        assert "Sell the extra 30 NO contracts on SELL-LATE by hand" in uneven
+        [short] = [m for m in criticals if m.startswith("SALE RECORDED SHORT")]
+        assert ("SELL-LATE held 30 NO: this run recorded 0 sold, the account now shows 0 "
+                "left (30 sold)") in short
+        assert ("This replaces every earlier line about this sale, including any extra it "
+                "said to sell by hand") in short
+        [record] = report.sales
+        assert record.status == "manual_review"
+        assert ("(this replaces what was recorded before the check: sold 30 YES on "
+                "SELL-EARLY but only 0 NO on SELL-LATE") in record.error
+
+    def test_a_value_that_still_counts_a_sold_pair_is_not_used(self, monkeypatch, caplog):
+        # The listing shows the sale, but Kalshi's value of the open positions
+        # still reads $40.00, as it did before the sale (the 60 contracts
+        # still held could back up to $60): selling should have lowered it,
+        # so it may still count the sold pair, which the cash now holds as
+        # proceeds. The buys are sized on the cash alone
+        before = {**_LIVE_BALANCE_PAYLOAD, "portfolio_value": 4_000}
+        after = {**_AFTER_SALE_BALANCE, "portfolio_value": 4_000}
+        exchange = _SellExchange(monkeypatch, held_rows=_SELL_ROWS + _HELD_TS_PAIR,
+                                 before=before, after=after, include_time_series=True)
+        code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
+                                           sell_at=0.80)
+        assert code == EXIT_OK, _messages(caplog)[-5:]
+        cash = _CASH_CENTS + _SELL_PROCEEDS_CENTS
+        assert seen["enrich"] == [(cash, cash)]
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert ("Kalshi's value of the open positions ($40.00) is not used: this run's sales "
+                "sold, or may have sold, contracts, yet it is not below the $40.00 it was "
+                "before them, so it may still count what was sold — sizing on cash alone "
+                "($10277.06) this run, as if no position were held") in warnings
+        assert ("After the sales: portfolio value $10277.06 = cash $10277.06 + open "
+                "positions not used (counted as $0.00)") in _messages(caplog)
+
+
+@pytest.mark.usefixtures("pinned_config_toggles")
+class TestLiveAndDryRunsAgree:
+    """A dry run of an account sizes its buys and picks what it adds to as a
+    live run of that account does after the same sales."""
+
+    def test_a_pair_picked_for_sale_is_never_added_to(self, monkeypatch, caplog):
+        # Live, the take-profit rule picks the pair but its first order fills
+        # nothing (the book moved); a dry run simulates the sale. Neither
+        # offers the pair as one to add to
+        before = {**_LIVE_BALANCE_PAYLOAD, "portfolio_value": 2_400}
+        key = frozenset(_SELL_TICKERS)
+        live = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=before,
+                             fills={_TICKER_SELL_EARLY: 0})
+        code, seen, report = _run_selling(live, monkeypatch, caplog, dry_run=False,
+                                          sell_at=0.80, add_to_held_pairs=True)
+        assert code == EXIT_OK
+        assert [r.status for r in report.sales] == ["not_sold"]
+        assert "Held pairs picked for sale this run, not added to: 1" in _messages(caplog)
+        dry = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=before)
+        code2, seen2, report2 = _run_selling(dry, monkeypatch, caplog, dry_run=True,
+                                             sell_at=0.80, add_to_held_pairs=True)
+        assert code2 == EXIT_OK
+        assert [r.status for r in report2.sales] == ["simulated"]
+        assert "Held pairs picked for sale this run, not added to: 1" in _messages(caplog)
+        for run in (seen, seen2):
+            assert run["ts"] and run["st"]
+            for blocked, markets, add_on_pairs in run["ts"] + run["st"]:
+                assert key not in (add_on_pairs or {})
+                assert _SELL_TICKERS <= blocked and not markets & _SELL_TICKERS
+
+    def test_with_no_value_read_a_dry_run_sizes_as_the_live_run_does(self, monkeypatch,
+                                                                      caplog):
+        # No portfolio_value in the balance reply: the portfolio value is the
+        # cash alone. A dry run adds the sale's estimated proceeds to the
+        # cash, and the portfolio value grows with it (it is never below the
+        # cash), exactly as the live run's cash read back after the sale
+        no_value = {k: v for k, v in _LIVE_BALANCE_PAYLOAD.items() if k != "portfolio_value"}
+        dry = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=no_value)
+        _code, seen, _report = _run_selling(dry, monkeypatch, caplog, dry_run=True,
+                                            sell_at=0.80)
+        # Copied now: the second run's spies wrap the first run's, which
+        # would record the second run's calls here too
+        dry_sized = (list(seen["enrich"]), list(seen["specs"]))
+        live = _SellExchange(monkeypatch, held_rows=_SELL_ROWS, before=no_value,
+                             after={k: v for k, v in _AFTER_SALE_BALANCE.items()
+                                    if k != "portfolio_value"})
+        _code2, seen2, _report2 = _run_selling(live, monkeypatch, caplog, dry_run=False,
+                                               sell_at=0.80)
+        cash = _CASH_CENTS + _SELL_PROCEEDS_CENTS
+        assert dry_sized == (seen2["enrich"], seen2["specs"]) == ([(cash, cash)],
+                                                                  [(cash, cash)])
 
 
 def _args(dry_run: bool = False, max_horizon_days=None) -> SimpleNamespace:
