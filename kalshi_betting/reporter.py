@@ -24,8 +24,9 @@ Dependencies:
     Imports PROJECT_ROOT, create_new_output, count_text (writes the held
     count of an add-on exactly) and the run result's constants
     (LIVE_RUN_RESULT_FORMAT, RUN_REPORT_MAX_WARNINGS,
-    RUN_REPORT_LINE_MAX_CHARS) from config.py. Exports the TradeResult
-    dataclass (consumed by trader.py), the two public write functions, and
+    RUN_REPORT_LINE_MAX_CHARS) from config.py. Exports the TradeResult and
+    SaleResult dataclasses (built by trader.py: a pair's trade, and a held
+    position's sale), the two public write functions, and
     the run result's RunReport, TradeRecord, LegRecord, RunReportHandler,
     trade_record, report_trades and write_run_report (all consumed by
     main.py).
@@ -82,7 +83,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -189,6 +190,42 @@ class TradeResult:
     """
     spec: TradeSpec
     status: str            # "executed" | "failed" | "simulated" | "rolled_back" | "rollback_failed" | "manual_review"
+    error: str | None = None
+
+
+@dataclass
+class SaleResult:
+    """
+    Outcome record for one held position the take-profit rule sold, or tried to.
+
+    Built by trader.sell_positions, one per seller.SalePlan.
+
+    Attributes:
+        plan (Any): The seller.SalePlan that was sold or simulated.
+        status (str): What happened.
+            "sold": every contract held on each of its held markets sold.
+            "partly_sold": some sold; for a pair, the same count on each
+                market, so the rest is still an exact pair.
+            "not_sold": nothing sold, or nothing was sent (error says which);
+                in a dry run too, for a plan whose orders cannot be built.
+            "unbalanced": a pair's second order sold fewer contracts than its
+                first, so the two markets no longer hold the same count.
+            "manual_review": how many contracts an order sold could not be
+                known, so no further order was sent for the position.
+            "simulated": dry run; nothing was sent.
+        sold (dict[str, int]): Held ticker -> contracts known to be sold
+            there (0 for a market whose order filled nothing or was not
+            sent). A market whose sale could not be known is left out, and
+            the dict is empty when the plan could not be used as written (a
+            held market's count, side, walked bid or ladder unreadable) or an
+            unexpected error stopped its sale. A dry run lists every held
+            market's full count.
+        error (str | None): What went wrong or was left over; None for
+            "sold" and "simulated".
+    """
+    plan: Any
+    status: str            # "sold" | "partly_sold" | "not_sold" | "unbalanced" | "manual_review" | "simulated"
+    sold: dict[str, int]
     error: str | None = None
 
 

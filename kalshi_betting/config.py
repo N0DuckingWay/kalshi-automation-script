@@ -891,6 +891,17 @@ ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT = 12
 # tick since the pre-execution check still fill.
 BUY_SLIPPAGE_TICKS            = 1
 
+# How many ticks below its walked price the second order of a held pair's sale
+# may fill. trader.sell_positions sells a pair as two orders: first the market
+# with the thinner book, at no worse than the lowest bid its walk reached, then
+# exactly as many contracts of the other market as the first order sold, at no
+# worse than that market's lowest bid for that count less this many ticks of
+# its grid at that bid (trader._sale_limit). One tick lets a book that moved by
+# one tick still take the second order, so the pair stays balanced. The price
+# is rounded onto the grid toward the safe side, so where the grid is coarser
+# just past that bid (a band boundary) the order is priced at the bid itself.
+SALE_HEDGE_SLIPPAGE_TICKS     = 1
+
 # Fallback tick size, in dollars, for a market whose tick structure is unknown
 # or uniform-cent ("linear_cent", or no price_ranges bands at all). Kalshi's
 # tick grids are nested ($0.01 ⊂ $0.001 ⊂ $0.0001), so the coarsest grid is
@@ -970,7 +981,9 @@ V2_ORDER_PATH                 = "/trade-api/v2/portfolio/events/orders"
 # handles each shape through its existing paths. Nothing filled is an ordinary
 # non-fill. On a buy leg, part filled or an error response goes to the
 # position-delta check (a part fill the account shows ends as manual_review).
-# On the unwind, either one is rollback_failed.
+# On the unwind, either one is rollback_failed. On a sale of a held position
+# (trader.sell_positions), a part fill is an ordinary outcome and an error
+# response goes to the same position-delta check.
 V2_SELF_TRADE_PREVENTION_TYPE = "taker_at_cross"
 
 # What the V2 create-order endpoint sends when a fill_or_kill order cannot fill

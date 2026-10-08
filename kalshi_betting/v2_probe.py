@@ -1223,8 +1223,8 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
 
     print(
         f"{_PASS}: an ask opened a NO position (negative) and a reduce_only bid returned "
-        "the account to flat. BOTH halves of the trader._V2_LEG_SIDE mapping are "
-        "confirmed against the live API."
+        "the account to flat. The buy-NO ask and the NO-closing bid of "
+        "trader._V2_LEG_SIDE are confirmed against the live API."
     )
     return _PASS
 

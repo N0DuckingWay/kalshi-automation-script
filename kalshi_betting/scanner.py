@@ -66,9 +66,11 @@ Dependencies:
     one-series rule does (DR-51).
     walk_bids, bid_ladder and floor_to_tick are the sell rule's book
     arithmetic: the backtest sells a position down its modeled bid ladder
-    through walk_bids (backtester._ladder_average), and live selling
+    through walk_bids (backtester._ladder_average), live selling
     (seller.plan_sales) walks a held market's real bids (bid_ladder) the same
-    way. get_settlements() reads the markets the account held when they paid
+    way, and trader.sell_positions prices its sale orders from those walks,
+    rounding a NO sale's YES bid down with floor_to_tick. get_settlements()
+    reads the markets the account held when they paid
     out (Settlement: counts, cost, fees and payout), and market_for_labels()
     finds a market by ticker in the run's list, or else from the exchange as
     resolve_held_ladders does: seller.plan_sales reads both to value a held
@@ -664,10 +666,11 @@ def floor_to_tick(price: Decimal, tick: Decimal) -> Decimal:
 
     ceil_to_tick's mirror. A bid is the most an order pays per contract, so
     rounding a bid down onto the grid keeps it at or below the price it was
-    computed from: the order never pays more than that price. Live selling
-    will use it for the YES bid that buys back a held NO (which is how a NO
-    is sold), so the NO never fetches less than the price it was computed
-    from.
+    computed from: the order never pays more than that price.
+    trader.sell_positions rounds with it the YES bid that buys back a held NO
+    (which is how a NO is sold, trader._sale_limit), so the NO never fetches
+    less than the price it was computed from; trader._v2_top_of_grid_price
+    floors a market's highest tradeable level with it too.
 
     Hand it a price with its float noise already removed. A price that
     started as a float goes through
@@ -5691,8 +5694,10 @@ def walk_bids(ladder: Sequence, contracts: float) -> tuple[float, float] | None:
     whichever is fewer, until all are sold. The backtest sells a position
     down its modeled bid ladder with it (backtester._ladder_average reads the
     average); seller.plan_sales walks a held market's real bids with it
-    (bid_ladder) and keeps both figures in its plan (SalePlan.walked), the
-    lowest price reached for the sale order's price.
+    (bid_ladder) and keeps both figures in its plan (SalePlan.walked), and
+    trader.sell_positions prices each sale order from the lowest price
+    reached (trader._sale_limit), walking a pair's second market again for
+    the count its first order sold.
 
     Args:
         ladder (Sequence): [[price, quantity], ...], best (highest) price first.
