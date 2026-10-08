@@ -107,7 +107,7 @@ Dependencies:
     rule's report that dashboard._live_rule_html shares with this module's
     log line — _live_rule_view with its _LIVE_RULE_PRIMARY and
     _LIVE_RULE_NOT_SIMULATED verdicts, _live_rule_ladder_note,
-    _live_filter_text, _live_sizing_note, _live_add_on_note,
+    _live_filter_text, _live_sizing_note, _live_add_on_note, _live_sell_note,
     _LIVE_RULE_LABEL and _LIVE_RULE_NONE; an
     IntervalCalibration carries the CalibrationObservations its pooled row
     was reduced from, so a report can regroup that population through
@@ -3233,6 +3233,13 @@ class BacktestSweep:
         live_add_to_held_pairs (bool | None): Whether the saved live defaults
             add to held pairs, from the same read; reporting only (this run's
             own points never do).
+        live_sell_at (float | None): The share of potential profit at which
+            the saved live defaults sell a held position, from the same read;
+            None when they never sell (or nothing was recorded). Reporting
+            only: this run's own points never sell.
+        live_sell_min_days (int | None): The fewest days before maturity the
+            saved live defaults need to sell, from the same read; None for no
+            minimum (or nothing recorded).
         entry_checkpoint (str | None): SCHEDULED_RUN.label() of the schedule
             the entry checkpoints were placed by (e.g. "Monday 09:00
             America/Los_Angeles"), for the dashboard header. None = not
@@ -3280,8 +3287,11 @@ class BacktestSweep:
     # and the same over the tier-floors-off family's binding bands
     add_on_cap_sweep: CapSweep | None = None
     add_on_tier_off_cap_sweep: CapSweep | None = None
-    # The saved live defaults' add_to_held_pairs, recorded with the other live_* fields
+    # The saved live defaults' add_to_held_pairs, sell_at and sell_min_days,
+    # recorded with the other live_* fields
     live_add_to_held_pairs: bool | None = None
+    live_sell_at: float | None = None
+    live_sell_min_days: int | None = None
     # The dashboard's "Sell" family, lazy (None unless run_backtest_sweep(sell_sweep=True))
     sell_sweep: SellSweep | None = None
     # The depth model the trades' synthetic books came from (None: top of the book)
@@ -7962,14 +7972,14 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
     Name the BacktestSweep keywords that record the saved live defaults.
 
     Both production BacktestSweep constructions spread this (beside
-    same_title_size_cap), so the nine fields are recorded together from one
+    same_title_size_cap), so the eleven fields are recorded together from one
     read or not at all.
 
     Args:
         live (LiveSettings | None): _live_settings_for_report()'s result.
 
     Returns:
-        dict: The nine live_* keywords from live; {} when live is None.
+        dict: The eleven live_* keywords from live; {} when live is None.
     """
     if live is None:
         return {}
@@ -7978,7 +7988,8 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
             "live_origin": live.origin, "live_interval_discount": live.interval_discount,
             "live_size_cap": live.size_cap,
             "live_same_title_size_cap": live.same_title_size_cap,
-            "live_add_to_held_pairs": live.add_to_held_pairs}
+            "live_add_to_held_pairs": live.add_to_held_pairs,
+            "live_sell_at": live.sell_at, "live_sell_min_days": live.sell_min_days}
 
 
 # The label a recorded live rule is named with, in the log line and page header
@@ -8057,6 +8068,36 @@ def _live_add_on_note(sweep: BacktestSweep) -> str:
     if sweep.live_add_to_held_pairs is not True:
         return ""
     return "; the live defaults add to held pairs, which this run's primary does not"
+
+
+def _live_sell_note(sweep: BacktestSweep) -> str:
+    """
+    Say when the saved live defaults sell held positions and this run's headline figures do not.
+
+    The backtest's own simulations (its primary scenario and every scenario
+    it runs) never sell a position. Only the dashboard's Sell select does,
+    simulated when the page is built. So when the saved live defaults sell,
+    the live-rule log line ends with this clause, naming the level and any
+    minimum of days, and saying the primary differs from live there.
+
+    Args:
+        sweep (BacktestSweep): The run's sweep.
+
+    Returns:
+        str: "; the live defaults sell at 85% of potential profit (at least 3
+            days before maturity), which this run's primary does not" when
+            live_sell_at is recorded (the parenthesis only with a recorded
+            live_sell_min_days; the level in the exact percent the page's
+            Sell options use), else "" (never sells, or not recorded).
+    """
+    level = sweep.live_sell_at
+    if level is None:
+        return ""
+    days = sweep.live_sell_min_days
+    after = ("" if days is None else
+             f" (at least {days} day{'' if days == 1 else 's'} before maturity)")
+    return (f"; the live defaults sell at {_cap_percent(level)}% of potential profit{after}, "
+            "which this run's primary does not")
 
 
 def _live_filter_text(categories: tuple[str, ...] | None,
@@ -8180,7 +8221,8 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
     Always a line, so a report never silently omits the live rule: with none
     recorded it says so (_LIVE_RULE_NONE). A recorded rule's line ends with
     _live_sizing_note when the saved defaults size differently from this
-    run's primary, then _live_add_on_note when they add to held pairs.
+    run's primary, then _live_add_on_note when they add to held pairs, then
+    _live_sell_note when they sell.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
@@ -8199,7 +8241,7 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
         rule += f"; category/tag filter ({_live_filter_text(categories, tags)})"
     if view.where == _LIVE_RULE_NOT_SIMULATED:
         return (f"{prefix}{rule} — not simulated by this run{_live_sizing_note(sweep)}"
-                f"{_live_add_on_note(sweep)}")
+                f"{_live_add_on_note(sweep)}{_live_sell_note(sweep)}")
     # Tier floors off at a band no tier binds at: the tier-on cell holds it
     never_binds = ("" if sweep.live_tier_floors or not view.tier_floors else
                    " (no tier floor binds at this band, so off and on are one rule)")
@@ -8225,7 +8267,7 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
                  f"Category or Tag option of {subject} at a time (each offered where this "
                  "run filed a pair under it), never as their union")
     return (f"{prefix}{rule} — {tail}{_live_rule_ladder_note(sweep)}"
-            f"{_live_sizing_note(sweep)}{_live_add_on_note(sweep)}")
+            f"{_live_sizing_note(sweep)}{_live_add_on_note(sweep)}{_live_sell_note(sweep)}")
 
 
 def _tier_floors_bind(band: tuple[float, float]) -> bool:
@@ -10975,7 +11017,7 @@ def _sweep_from_candidates(
             configured switch, read beside same_event_ladders's
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
             cap_sweep, tier_off_cap_sweep, add_on_cap_sweep,
-            add_on_tier_off_cap_sweep, same_title_size_cap, the nine live_*
+            add_on_tier_off_cap_sweep, same_title_size_cap, the eleven live_*
             fields, entry_checkpoint, sell_sweep and depth_model — see
             BacktestSweep.
 
@@ -11555,8 +11597,9 @@ def run_backtest_sweep(
     here reaches live.
 
     It reports the saved live defaults' time-series rule, category/tag filter,
-    k and caps: one fail-soft read before the fetch, recorded on the nine
-    live_* fields and, worded by _live_rule_line, logged last ("none
+    k and caps, whether they add to held pairs and their sell level and
+    minimum of days: one fail-soft read before the fetch, recorded on the
+    eleven live_* fields and, worded by _live_rule_line, logged last ("none
     recorded" when no usable defaults are saved).
 
     With add_on_sweep, the result also carries the dashboard's "Add to held

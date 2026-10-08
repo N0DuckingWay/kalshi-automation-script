@@ -818,7 +818,8 @@ def _proposal(params: dict[str, list[str]],
     saved); they are the only fields that fall back to what is saved, so a
     link that leaves one out keeps it as it is (the dashboard's save button
     leaves the same-title cap out when its run recorded none, and the
-    add-to-held choice out on a page that does not show it). One exception: a
+    add-to-held choice, or the sell level and minimum of days, out on a page
+    that does not show it). One exception: a
     link carrying the seed's note that leaves add_to_held_pairs, sell_at or
     sell_min_days out takes the seed's value, so it still proposes exactly the
     seed, and the page shows the change against what is saved. A minimum of

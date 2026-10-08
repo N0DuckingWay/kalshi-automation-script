@@ -6651,9 +6651,10 @@ class TestSaveLiveDefaultsButton:
 
         Each number must read back as the base block's own value, and the
         query must carry the run's same-title cap, the source note and the
-        category and tag given, and no other field. add_to_held_pairs may be
-        present (a page with the Add to held pairs view sends it) and is not
-        checked here: its value is the caller's to check.
+        category and tag given, and no other field. add_to_held_pairs,
+        sell_at and sell_min_days may be present (a page with the Add to held
+        pairs or Sell view sends them) and are not checked here: their values
+        are the caller's to check.
 
         Args:
             data (dict): The page's base block.
@@ -6678,7 +6679,8 @@ class TestSaveLiveDefaultsButton:
         assert query["source"] == data["save"]["source"]
         assert query.get("category") == category and query.get("tag") == tag
         known = {"tier_floors", "spread_min", "spread_max", "k", "size_cap",
-                 "same_title_size_cap", "source", "category", "tag", "add_to_held_pairs"}
+                 "same_title_size_cap", "source", "category", "tag", "add_to_held_pairs",
+                 "sell_at", "sell_min_days"}
         assert set(query) <= known
 
     def test_the_button_is_rendered_disabled_with_its_words(self, monkeypatch, tmp_path):
@@ -6997,12 +6999,18 @@ class TestSaveLiveDefaultsButton:
         assert target == {"url": _SAVE_URL, "same_title_size_cap": None,
                           "filed_by_listing": True,
                           "source": "backtest dashboard for 2026-01-05 to 2026-09-28",
-                          "live_adds_to_held_pairs": False}
+                          "live_adds_to_held_pairs": False, "live_sells": False}
         # ... which is True only for a run that recorded saved defaults adding
         for saved, said in ((True, True), (False, False), (None, False)):
             swept = dataclasses.replace(sweep, live_add_to_held_pairs=saved)
             assert dashboard._save_target(swept, _FLT_START, today, _FLT_SERIES)[
                 "live_adds_to_held_pairs"] is said
+        # ... and "live_sells" only for a recorded sell level (a minimum alone is no sale)
+        for level, days, said in ((0.85, 3, True), (0.85, None, True), (None, None, False),
+                                  (None, 3, False)):
+            swept = dataclasses.replace(sweep, live_sell_at=level, live_sell_min_days=days)
+            assert dashboard._save_target(swept, _FLT_START, today, _FLT_SERIES)[
+                "live_sells"] is said
         # Only a recorded setting that differs from a recorded switch is named
         for ladders, configured in ((True, True), (False, None), (None, True)):
             swept = dataclasses.replace(sweep, same_event_ladders=ladders,
@@ -7140,6 +7148,92 @@ class TestSaveLiveDefaultsButton:
                                                          current)
             assert settings == expected, name
             # Every field, one by one (equality skips none of the toggles)
+            for field in config.LIVE_TOGGLE_FIELDS:
+                assert getattr(settings, field) == getattr(expected, field), (name, field)
+            assert source == data["save"]["source"]
+        # Nothing was written by showing the page
+        assert config.read_saved_live_defaults() == current
+
+    def test_a_page_without_the_sell_view_sends_neither_sell_field(self, monkeypatch, tmp_path):
+        # The server then keeps the saved sell level and minimum of days, as it
+        # keeps the saved add-to-held choice from a page without that view
+        config.save_live_defaults(
+            dataclasses.replace(config.live_settings(), sell_at=0.9, sell_min_days=5),
+            source="")
+        current = config.read_saved_live_defaults()
+        assert (current.sell_at, current.sell_min_days) == (0.9, 5)
+        page = self._kc(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        assert data["sell_blocks"] is None
+        snap = _run_script(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
+        [opened] = snap["opened"]
+        query = self._query(data, opened)
+        self._assert_sends(data, query, *data["primary"])
+        assert "sell_at" not in query and "sell_min_days" not in query
+        settings, _ = defaults_server._proposal(
+            defaults_server._params(opened["url"].partition("?")[2]), current)
+        assert (settings.sell_at, settings.sell_min_days) == (0.9, 5)
+
+    @pytest.mark.parametrize("saved", ["nothing", "not selling", "selling"])
+    def test_the_sell_scenario_on_screen_is_what_the_defaults_server_reads(
+            self, monkeypatch, tmp_path, saved):
+        # A page with the Sell view names its choice every time: "off" twice
+        # under no selling (so saved defaults that sell are turned off, and
+        # the seed is not leaned on), the level and the minimum of days when a
+        # level is shown. The clicked address goes to the server's own
+        # application and parser, whatever is saved.
+        page = self._kc(monkeypatch, tmp_path, _kc_sweep_sell())
+        data = TestFilterPage._data(page)
+        assert data["sell_blocks"] is not None
+        three = TestSellScript._di(3)
+        snaps = TestSellScript._run(tmp_path, page, [
+            ["wait"], ["click", "flt-save"], ["snap", "none"],
+            ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
+            ["click", "flt-save"], ["snap", "level"],
+            ["set", "flt-days", three], ["fire", "flt-days"], ["settle"],
+            ["click", "flt-save"], ["snap", "days"],
+            ["set", "flt-sell", "1"], ["fire", "flt-sell"], ["settle"],
+            ["click", "flt-save"], ["snap", "other"],
+            ["set", "flt-sell", "none"], ["fire", "flt-sell"], ["settle"],
+            ["click", "flt-save"], ["snap", "back"]], strict=True)
+        if saved != "nothing":
+            save_config_live_defaults()
+        if saved == "selling":
+            config.save_live_defaults(
+                dataclasses.replace(config.live_settings(), sell_at=0.9, sell_min_days=5),
+                source="")
+        current = config.read_saved_live_defaults()
+        assert (current is not None) is (saved != "nothing")
+        app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
+        pb, pk, pc = data["primary"]
+        # The page names no add-to-held-pairs choice, so the server keeps the
+        # saved one, or the seed's with none saved
+        add_on = (current.add_to_held_pairs if current is not None
+                  else config.LIVE_DEFAULTS_SEED.add_to_held_pairs)
+        levels, days = data["sell_levels"], data["sell_days"]
+        assert levels[0]["value"] == 0.25 and levels[1]["value"] == 0.5
+        assert [d["value"] for d in days][:3] == [1, 2, 3]
+        # Another level keeps the minimum of days chosen; no selling sends none
+        cases = (("none", None, None), ("level", 0.25, 1), ("days", 0.25, 3),
+                 ("other", 0.5, 3), ("back", None, None))
+        for name, level, minimum in cases:
+            [opened] = snaps[name]["opened"]
+            query = self._query(data, opened)
+            self._assert_sends(data, query, pb, pk, pc)
+            assert query["sell_at"] == ("off" if level is None else str(level)), name
+            assert query["sell_min_days"] == ("off" if minimum is None else str(minimum)), name
+            raw = opened["url"].partition("?")[2]
+            response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
+                                                           _SAVE_HOST))
+            assert response.status == 200, response.body
+            settings, source = defaults_server._proposal(defaults_server._params(raw), current)
+            expected = config.LiveSettings(
+                tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
+                interval_discount=data["ks"][pk]["value"],
+                size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
+                add_to_held_pairs=add_on, sell_at=level, sell_min_days=minimum)
+            assert settings == expected, name
             for field in config.LIVE_TOGGLE_FIELDS:
                 assert getattr(settings, field) == getattr(expected, field), (name, field)
             assert source == data["save"]["source"]
@@ -11103,6 +11197,27 @@ class TestSellPage:
         assert ("has stayed at or above that share of its potential profit (its contract "
                 "pairs at $1.00 each, less what it cost) for 3 days in a row: it is checked "
                 "once a day, 24 hours apart, the last check at the checkpoint") in three
+        # Saving a level makes live runs sell at it: the title says how, in the
+        # same days
+        assert one.endswith(
+            "Save as live defaults… saves the level and minimum shown: a live run then "
+            "sells at them, on real order books, once a position reaches its level. The "
+            "Scenario Explorer and Interval Discount sections always show no selling.")
+        assert three.endswith(
+            "Save as live defaults… saves the level and minimum shown: a live run then "
+            "sells at them, on real order books, once a position has held its level for 3 "
+            "days in a row (read on Kalshi's hourly candles for the days before the run). "
+            "The Scenario Explorer and Interval Discount sections always show no selling.")
+        # Nothing on the page still says live trading never sells
+        for words in (one, three, dashboard._SELL_SUMMARY_NOTE, dashboard._SELL_DAYS_TITLE,
+                      dashboard._SELL_REACH, dashboard._SAVE_TITLE, dashboard._FILTER_JS):
+            assert "never sells" not in words and "Live trading never" not in words
+        assert dashboard._SELL_SUMMARY_NOTE.endswith(
+            " Save as live defaults… saves this level and minimum, so a live run sells at "
+            "them.")
+        # A live run reads each market's scheduled close for the minimum of days
+        assert "a live run reads each market's scheduled close instead" in \
+            dashboard._SELL_DAYS_TITLE
         # The page names the count its sell runs read
         monkeypatch.setattr(backtester, "TAKE_PROFIT_HOLD_DAYS", 2)
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
@@ -11182,6 +11297,157 @@ class TestSellPage:
                                                     _kc_sweep_sell()))
         without = TestFilterPage._chunks(_sl_page(monkeypatch, tmp_path / "b", _kc_sweep()))
         assert with_view == without
+
+
+class TestLiveSellRule:
+    """The backtest report and the filter bar when the saved live defaults sell:
+    a grey note beside the save button warning that saving with no selling
+    turns live selling off (only on a page with the Sell view), and the
+    page-header line naming the Sell options that show the sale rule at the
+    live rule's band — or that the page cannot show it."""
+
+    _LEVEL = {"label": "sell at 85% of potential profit", "value": 0.85}
+    _DAYS = [{"label": "1 day", "value": 1}, {"label": "3 days", "value": 3}]
+    _NOTE = ("; the live defaults sell at 85% of potential profit (at least 3 days before "
+             "maturity), which this run's primary does not")
+
+    @classmethod
+    def _view(cls, blocks=((0,), (None,)), levels=None, days=None) -> dict:
+        """The Sell keys of a filter bar's base block: a Sell block per band
+        under each Tier floors setting (tiers on, then off), the levels
+        offered and the minimums of days offered."""
+        return {"sell_blocks": [list(row) for row in blocks],
+                "sell_levels": [cls._LEVEL] if levels is None else levels,
+                "sell_days": cls._DAYS if days is None else days}
+
+    # ─── The save button's note ───────────────────────────────────────────────
+
+    def test_the_save_button_warns_that_saving_with_no_selling_turns_selling_off(
+            self, monkeypatch, tmp_path):
+        note = ('The live defaults sell; saving with Sell set to "no selling" turns live '
+                "selling off.")
+        assert dashboard._SELL_SAVE_NOTE == note
+
+        def between(page):
+            bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
+            return bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
+
+        with_view = _kc_sweep_sell()
+        page = _sl_page(monkeypatch, tmp_path, dataclasses.replace(
+            with_view, live_sell_at=0.85, live_sell_min_days=3))
+        # Right after the button, before the trade link, in Python's words
+        assert re.search(r'</button>&nbsp;<span id="flt-sell-save-note"[^>]*>'
+                         + re.escape(html.escape(note)) + '</span>', between(page))
+        assert note not in dashboard._FILTER_JS
+        # A level with no minimum is selling too
+        page = _sl_page(monkeypatch, tmp_path, dataclasses.replace(
+            with_view, live_sell_at=0.85, live_sell_min_days=None))
+        assert 'id="flt-sell-save-note"' in page
+        # No note when the saved defaults do not sell (or the run recorded none) ...
+        page = _sl_page(monkeypatch, tmp_path, with_view)
+        assert 'id="flt-sell-save-note"' not in page
+        # ... nor on a page with no Sell view, whose Save sends no choice
+        page = _sl_page(monkeypatch, tmp_path, dataclasses.replace(
+            _kc_sweep(), live_sell_at=0.85, live_sell_min_days=3))
+        assert 'id="flt-sell-save-note"' not in page and 'id="flt-save"' in page
+
+    def test_both_notes_follow_the_button_when_both_apply(self, monkeypatch, tmp_path):
+        sweep = dataclasses.replace(_kc_sweep_sell(_kc_sweep_add_on()),
+                                    live_add_to_held_pairs=True, live_sell_at=0.85)
+        page = _sl_page(monkeypatch, tmp_path, sweep)
+        bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
+        between = bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
+        assert between.index('id="flt-add-save-note"') < between.index('id="flt-sell-save-note"')
+
+    # ─── The page-header line ─────────────────────────────────────────────────
+
+    def test_the_header_names_the_options_that_show_the_rule(self):
+        run = TestLiveRuleHeader
+        rule = config.describe_time_series_rule(True, (0.0, 1.0))
+        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
+        sweep = dataclasses.replace(run._sweep(), live_sell_at=0.85, live_sell_min_days=3)
+        shown = {**run._bar(), **self._view()}
+        # The rule is the page's primary and the bar has the view at that level
+        # and minimum: choose them
+        assert run()._text(sweep, shown) == (
+            head + self._NOTE + ' — choose Sell "sell at 85% of potential profit" and Min. '
+            'days to maturity "3 days" in the filter bar to see it')
+        # No saved minimum: the smallest option is the nearest the bar has
+        no_minimum = dataclasses.replace(sweep, live_sell_min_days=None)
+        assert run()._text(no_minimum, shown) == (
+            head + "; the live defaults sell at 85% of potential profit, which this run's "
+            'primary does not — choose Sell "sell at 85% of potential profit" and Min. days '
+            'to maturity "1 day" (the nearest to no minimum) in the filter bar to see it')
+        # A level written with float noise still finds its option
+        noisy = dataclasses.replace(sweep, live_sell_at=0.85 + 1e-12)
+        assert run()._text(noisy, shown).endswith("in the filter bar to see it")
+
+    def test_a_page_that_cannot_show_the_level_says_so(self):
+        run = TestLiveRuleHeader
+        rule = config.describe_time_series_rule(True, (0.0, 1.0))
+        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
+        cannot = " — this page cannot show that Sell level and minimum of days"
+        sweep = dataclasses.replace(run._sweep(), live_sell_at=0.85, live_sell_min_days=3)
+        other_level = [{"label": "sell at 90% of potential profit", "value": 0.9}]
+        other_days = [{"label": "1 day", "value": 1}, {"label": "5 days", "value": 5}]
+        for bar in (
+                None, run._bar(), {**run._bar(), **self._view(), "sell_blocks": None},
+                # no Sell block for the band under the tiers-on setting
+                {**run._bar(), **self._view(blocks=((None,), (4,)))},
+                {**run._bar(), **self._view(blocks=())},
+                # the level, or the saved minimum of days, is not offered
+                {**run._bar(), **self._view(levels=other_level)},
+                {**run._bar(), **self._view(levels=[])},
+                {**run._bar(), **self._view(days=other_days)},
+                {**run._bar(), **self._view(days=[])}):
+            assert run()._text(sweep, bar) == head + self._NOTE + cannot, bar
+        # A rule the page does not show: the note alone, no promise of a view
+        elsewhere = dataclasses.replace(sweep, live_spread_band=(0.3, 0.6),
+                                        calibrations_by_band={(0.0, 1.0): None})
+        assert run()._text(elsewhere, {**run._bar(), **self._view()}).endswith(
+            "— not simulated by this run" + self._NOTE)
+        # Not selling (or not recorded): no note at all
+        for level, days in ((None, None), (None, 3)):
+            plain = dataclasses.replace(sweep, live_sell_at=level, live_sell_min_days=days)
+            text = run()._text(plain, {**run._bar(), **self._view()})
+            assert "live defaults sell" not in text and "Sell" not in text
+
+    def test_tiers_off_at_a_binding_band_reads_the_tier_off_blocks(self):
+        run = TestLiveRuleHeader
+        band = (0.0, 0.5)
+        sweep = dataclasses.replace(
+            run._sweep(live_tier_floors=False, live_spread_band=band,
+                       calibrations_by_band={(0.0, 1.0): None, band: None},
+                       tier_off_calibrations_by_band={(0.0, 1.0): None, band: None},
+                       tier_off_scenarios=[object()]),
+            live_sell_at=0.85, live_sell_min_days=3)
+        for blocks, said in (
+                (((0, 1), (2, 3)), "in the filter bar to see it"),
+                # a block for the band under the tiers on, none under the tiers off
+                (((0, 1), (None, 3)), "this page cannot show that Sell level and minimum of days")):
+            bar = {**run._bar(bands=[band, (0.0, 1.0)]), **self._view(blocks=blocks)}
+            assert run()._text(sweep, bar).endswith(said), blocks
+
+    def test_the_header_of_a_whole_page_points_at_the_selects(self, monkeypatch, tmp_path):
+        sweep = dataclasses.replace(_kc_sweep_sell(), live_sell_at=0.25, live_sell_min_days=3,
+                                    live_tier_floors=True, live_spread_band=_KC_B0)
+        page = _sl_page(monkeypatch, tmp_path, sweep)
+        assert ("the live defaults sell at 25% of potential profit (at least 3 days before "
+                "maturity), which this run's primary does not — choose Sell \"sell at 25% of "
+                "potential profit\" and Min. days to maturity \"3 days\" in the filter bar "
+                "to see it</p>") in page
+        page = _sl_page(monkeypatch, tmp_path, dataclasses.replace(sweep, sell_sweep=None))
+        assert ("the live defaults sell at 25% of potential profit (at least 3 days before "
+                "maturity), which this run's primary does not — this page cannot show that Sell "
+                "level and minimum of days</p>") in page
+
+    def test_a_minimum_of_one_day_is_worded_in_the_singular(self):
+        run = TestLiveRuleHeader
+        sweep = dataclasses.replace(run._sweep(), live_sell_at=0.9, live_sell_min_days=1)
+        assert run()._text(sweep, None).endswith(
+            "; the live defaults sell at 90% of potential profit (at least 1 day before "
+            "maturity), which this run's primary does not — this page cannot show that Sell "
+            "level and minimum of days")
 
 
 class TestSidecarFolders:
@@ -11324,9 +11590,10 @@ class TestSellScript:
     is chosen; a level first inflates its band's Sell block, then loads its
     sidecar file (or the page's own chunk, where the setting sells nothing),
     words the scenario with Python's level and days phrases and note, shows
-    the chunk's own row heads and keeps Save disabled; a block that cannot be
-    inflated, or a file that cannot be loaded or hands nothing over, puts
-    both choices back in Python's words. The harness's "wait" does not wait
+    the chunk's own row heads and keeps Save disabled until the chunk is drawn,
+    after which its address carries the level and minimum shown; a block that
+    cannot be inflated, or a file that cannot be loaded or hands nothing over,
+    puts both choices back in Python's words. The harness's "wait" does not wait
     on flt-sell (a page without the view keeps it shut), so setup_js adds it.
     Skipped without a JavaScript runtime."""
 
@@ -11421,8 +11688,15 @@ class TestSellScript:
         assert snap["html"]["diag-best"] == "".join(
             best["heads"][h] + best["strings"][t] for h, t in view["best"])
         assert "sold on" in snap["html"]["diag-best"]
-        # Live trading never sells: nothing to save while a level is shown
-        assert snap["buttons"]["flt-save"] is True and snaps["clicked"]["opened"] == []
+        # While the band's block and the level's file load nothing can be saved;
+        # once the chunk is drawn the button is enabled, and its address
+        # carries the level and the minimum of days shown
+        assert snaps["loading"]["buttons"]["flt-save"] is True
+        assert snap["buttons"]["flt-save"] is False
+        [opened] = snaps["clicked"]["opened"]
+        query = TestSaveLiveDefaultsButton._query(data, opened)
+        assert float(query["sell_at"]) == data["sell_levels"][0]["value"]
+        assert query["sell_min_days"] == str(data["sell_days"][0]["value"])
         # The explorer is told the scenario with four labels, never the level
         assert len(json.loads(snap["text"]["probe"])) == 4
         # Back to no selling: the page's own chunk, nothing loaded again, Save on
@@ -11430,6 +11704,56 @@ class TestSellScript:
         assert none["files"] == [src] and none["buttons"]["flt-save"] is False
         assert none["inflated"] == ["dash-data", "dash-chunk-0", "dash-sell-0"]
         assert dashboard._SELL_SUMMARY_NOTE not in none["text"]["flt-summary"]
+
+    def test_the_save_button_follows_the_level_and_minimum_on_screen(self, monkeypatch,
+                                                                       tmp_path):
+        page = _sl_page(monkeypatch, tmp_path,
+                        dataclasses.replace(_kc_sweep_sell(), same_title_size_cap=0.5))
+        data = TestFilterPage._data(page)
+        src = f"{data['sidecar_dir']}/chunk-7.js"
+        save = TestSaveLiveDefaultsButton()
+        steps = [["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
+                 ["click", "flt-save"], ["snap", "loading"],
+                 ["resolve_file", src], ["snap", "drawn"],
+                 ["click", "flt-save"], ["snap", "clicked"]]
+        snaps = self._run(tmp_path, page, steps, strict=True, files_deferred=(src,))
+        loading = snaps["loading"]
+        assert loading["pendingFiles"] == [src]
+        assert loading["buttons"]["flt-save"] is True and loading["opened"] == []
+        assert snaps["drawn"]["buttons"]["flt-save"] is False
+        [opened] = snaps["clicked"]["opened"]
+        query = save._query(data, opened)
+        save._assert_sends(data, query, *data["primary"])
+        assert (query["sell_at"], query["sell_min_days"]) == ("0.25", "1")
+        # A file that cannot be loaded puts the choice back: the scenario still
+        # shown is the one saved, with no selling
+        failed = self._run(tmp_path, page, steps[:4] + [
+            ["reject_file", src], ["snap", "failed"], ["click", "flt-save"],
+            ["snap", "clicked"]], strict=True, files_deferred=(src,))
+        assert failed["failed"]["buttons"]["flt-save"] is False
+        [opened] = failed["clicked"]["opened"]
+        query = save._query(data, opened)
+        assert (query["sell_at"], query["sell_min_days"]) == ("off", "off")
+
+    def test_a_sell_scenario_the_run_never_simulated_cannot_be_saved(self, monkeypatch,
+                                                                       tmp_path):
+        # (0.3-0.6, k 0.60) was never simulated, so it holds no sale either; a
+        # simulated scenario at the same level can be saved again
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())
+        data = TestFilterPage._data(page)
+        assert _KC_GRID[1][0] == [None, None, None]
+        steps = [["wait"], ["set", "flt-k", "0"], ["set", "flt-band", "1"],
+                 ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
+                 ["click", "flt-save"], ["snap", "missing"],
+                 ["set", "flt-k", "1"], ["fire", "flt-k"], ["settle"],
+                 ["click", "flt-save"], ["snap", "back"]]
+        snaps = self._run(tmp_path, page, steps, strict=True)
+        assert snaps["missing"]["buttons"]["flt-save"] is True
+        assert snaps["missing"]["opened"] == []
+        assert snaps["back"]["buttons"]["flt-save"] is False
+        [opened] = snaps["back"]["opened"]
+        query = TestSaveLiveDefaultsButton._query(data, opened)
+        assert (query["sell_at"], query["sell_min_days"]) == ("0.25", "1")
 
     def test_changing_the_days_loads_another_chunk(self, monkeypatch, tmp_path):
         page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell())

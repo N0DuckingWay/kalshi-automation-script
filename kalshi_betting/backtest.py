@@ -186,9 +186,10 @@ Notes:
     level of config.TAKE_PROFIT_LEVELS with each minimum of days before
     maturity of config.TAKE_PROFIT_MIN_DAYS (the dashboard's Sell and Min.
     days to maturity selects). It simulates nothing during the run;
-    --no-sell-sweep skips it, leaving both selects disabled. None of this
-    reaches live trading, which sells at its own saved sell_at level
-    (seller.plan_sales).
+    --no-sell-sweep skips it, leaving both selects disabled. Nothing here
+    reaches live trading by itself: a live run sells only at its saved
+    sell_at level (seller.plan_sales), which the dashboard's Save as live
+    defaults… can set to a level shown there.
 
     The pre-fetch echo's "live rule=" clause names the saved live defaults'
     time-series rule and, when one is set, their category/tag filter (never
@@ -560,8 +561,9 @@ def main() -> None:
              "chosen number of days remain before its last market stops trading): "
              "their simulations run only while the dashboard is built, so skipping "
              "them makes that step much faster and leaves both selects disabled. "
-             "Backtest only — a live run sells at its own saved sell_at level, "
-             "never at these",
+             "Backtest only — a live run sells only at its saved sell_at level, "
+             "which the dashboard's Save as live defaults… can set to a level "
+             "shown here",
     )
     parser.add_argument(
         "--sell-workers", type=int, default=None, metavar="N",
