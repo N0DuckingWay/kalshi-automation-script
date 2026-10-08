@@ -29,11 +29,17 @@ Dependencies:
     CANDLESTICK_MAX_CANDLES_PER_REQUEST, INCLUDE_MVE_MARKETS, PROD_URL) from
     config.py. Exports
     build_historical_client() and build_prod_live_client(), both called by
-    backtest.py (NOT backtester.py, which never builds its own clients); and
+    backtest.py (NOT backtester.py, which never builds its own clients;
+    build_prod_live_client() also by depth_model.py and by live_dashboard.py,
+    whose Live trading tab reads the account with it); and
     fetch_all_settled_markets(), fetch_candlesticks(), and infer_category(),
-    all called by backtester.py (infer_category() by main.py too).
-    load_series_categories() is called by backtest.py and main.py,
-    series_labels() by dashboard.py and main.py.
+    all called by backtester.py (infer_category() by main.py and
+    live_portfolio.py too). load_series_categories() is called by
+    backtest.py, main.py and live_dashboard.py, series_labels() by
+    dashboard.py, main.py and live_portfolio.py. live_portfolio.py (the Live
+    trading tab, which only reads) also reads _historical_get with
+    _API_PREFIX, its only way to Kalshi, _candle_close, and _load_json_cache
+    and _save_json_cache for the finalized markets' daily prices it keeps.
     Also exports SettledCorpus — the
     disk-backed, re-iterable corpus fetch_all_settled_markets returns — which
     carries a CorpusProvenance (when, and under which archive cutoff, the
@@ -273,9 +279,11 @@ def series_labels(
     """
     Name the Kalshi category and FIRST tag an event's series is filed under.
 
-    The one filing rule behind the backtest dashboard's categories and tags and
-    main._filter_by_category's live filter (which states its own matching). First
-    tag only, so every breakdown partitions what it breaks down.
+    The one filing rule behind the backtest dashboard's categories and tags,
+    main._filter_by_category's live filter (which states its own matching) and
+    the Live trading tab's categories (live_portfolio.build_live_view, which
+    takes the category alone). First tag only, so every breakdown partitions
+    what it breaks down.
 
     Args:
         event_ticker (str): The event whose series (series_ticker) is looked up.
@@ -334,8 +342,9 @@ def load_series_categories(
     dashboard breaks returns down by them, because infer_category's ticker
     prefixes predate the "KX" prefix every current series carries and so file
     nearly every trade under "Other". Nothing is priced, sized or settled on
-    these labels; they file the dashboard's trades and decide which pairs a
-    live category/tag filter keeps.
+    these labels; they file the dashboard's trades, decide which pairs a
+    live category/tag filter keeps, and file the bot's purchases on the live
+    dashboard's Live trading tab.
 
     The listing is cached in backtest_cache/series_categories.json and reused
     while younger than max_age_seconds. It is one read-only GET (retried like
@@ -449,7 +458,8 @@ def _historical_get(client: Any, path: str, **params) -> dict:
 
     Composes _signed_raw_get with fetch_json_page (which raises ApiException
     on non-2xx so api_call_with_retry can back off on 429/5xx exactly like the
-    modeled SDK calls did).
+    modeled SDK calls did). live_portfolio sends every read of the Live
+    trading tab through this, looked up when it is called.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -529,7 +539,9 @@ def build_prod_live_client():
 
     Used alongside build_historical_client() to cover recently settled markets
     that are not yet in the historical archive (i.e. settled after the API cutoff
-    timestamp from the /historical/cutoff endpoint).
+    timestamp from the /historical/cutoff endpoint). depth_model's snapshots
+    read live books with it, and live_dashboard reads the account with it,
+    with its own timeouts and GET-only transport wrapped around it.
 
     Returns:
         KalshiClient: An authenticated client pointed at the production endpoint.
@@ -648,6 +660,8 @@ def _load_json_cache(path: Path):
     streamed instead (SettledCorpus). The event-title accumulator does not
     come through here: its reader, _read_title_file, must tell a file that
     could not be READ from one whose content is bad, which this one cannot.
+    treasury.py reads its saved yields with it, and live_portfolio.py the
+    finalized markets' daily prices it keeps.
 
     Args:
         path (Path): Filesystem path to the JSON cache file.
@@ -689,6 +703,8 @@ def _save_json_cache(path: Path, data) -> None:
     # fetch safe. Never introduce a fetch whose cache path is shared across
     # workers. (The assembled settled-market cache no longer comes through
     # here: since SS-1 it is streamed by _DayStreamWriter, same idiom.)
+    # live_portfolio keeps one file per finalized market under
+    # config.LIVE_MARKS_CACHE_DIR through this too; treasury its yields.
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, default=str))
     tmp.replace(path)
@@ -5616,6 +5632,9 @@ def fetch_all_settled_markets(
 def _candle_close(side: dict) -> float | None:
     """
     Extract the closing price in dollars from one candle side dict.
+
+    fetch_candlesticks reads each hourly candle's asks with it, and
+    live_portfolio each daily candle's bid, ask and last price.
 
     The API sends fixed-point DOLLAR strings (e.g. "0.5500"). Older payloads
     named the field close_dollars alongside an integer-cent close; the current

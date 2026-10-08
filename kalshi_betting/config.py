@@ -14,11 +14,12 @@ Purpose:
 Dependencies:
     No project imports. Imported by auth.py, scanner.py, strategy.py, trader.py,
     reporter.py, historical.py, backtester.py, dashboard.py, backtest.py,
-    scheduler.py, treasury.py, run_lock.py, and main.py — plus two standalone,
-    human-run tools kept deliberately outside the pipeline's import graph: the
-    verification CLI (see CLAUDE.md's pipeline-isolation rule) and
-    defaults_server.py, the local pages that save the live defaults and start
-    live trading runs with them.
+    scheduler.py, treasury.py, run_lock.py, depth_model.py, live_portfolio.py
+    and main.py — plus three standalone, human-run tools kept deliberately
+    outside the pipeline's import graph: the verification CLI (see
+    CLAUDE.md's pipeline-isolation rule), defaults_server.py, the local pages
+    that save the live defaults and start live trading runs with them, and
+    live_dashboard.py, the read-only local server of the dashboard's two tabs.
 
 Notes:
     PROJECT_ROOT is derived from __file__ so the package works correctly on any
@@ -654,7 +655,8 @@ DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS = 5
 DEFAULTS_SERVER_CONFIRM_ARM_MS = 1000
 
 # The one dashboard file every backtest run writes (and overwrites) in
-# PROJECT_ROOT; defaults_server opens it when it starts.
+# PROJECT_ROOT; defaults_server opens it when run on its own, and
+# live_dashboard serves it on LIVE_BACKTEST_PORT as the Backtest tab.
 DASHBOARD_FILENAME = "backtest_dashboard.html"
 
 # The folder beside the dashboard file that holds the data its Sell select
@@ -860,8 +862,9 @@ LIVE_DASHBOARD_FILE_BLOCK_BYTES = 1_048_576
 LIVE_DASHBOARD_PLOTLY_URL = "https://cdn.plot.ly/plotly-2.30.0.min.js"
 LIVE_DASHBOARD_PLOTLY_SRI = "sha384-H7GB7Kme/VbPI/0S4LNq7OixFNVRgRGE8kyqTntBuiXle1KBm8KWLQh/Ah6bXCYW"
 
-# The Live tab draws at most this many categories by name, each in a color of
-# its own; the rest are drawn together as "More categories".
+# The Live tab gives at most this many categories a color of their own; the
+# rest are drawn together in gray as "More categories" (or, when only one is
+# left past them, by its own name in that gray).
 LIVE_DASHBOARD_MAX_CATEGORY_BANDS = 6
 
 # Which side each leg of a pair buys, as (side bought on market_a, side bought

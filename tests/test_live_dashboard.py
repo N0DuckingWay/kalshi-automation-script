@@ -23,6 +23,7 @@ import os
 import pkgutil
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -84,6 +85,9 @@ def _history(groups: dict[str, float], cash: float = 100.0) -> History:
     """
     A history in which each group starts at its value and gains 1% a moment, and the cash stays put.
 
+    The groups first appear in the order given, a minute apart (one change
+    each, moving no cash), which is the order live_portfolio lists them in.
+
     Args:
         groups (dict[str, float]): Each group's value at the start.
         cash (float): The cash at every moment.
@@ -94,8 +98,9 @@ def _history(groups: dict[str, float], cash: float = 100.0) -> History:
     times = _times()
     value = {g: tuple(start * 1.01 ** i for i in range(len(times))) for g, start in groups.items()}
     zeros = tuple(0.0 for _ in times)
+    steps = {g: ((START + timedelta(minutes=i + 1), 0.0),) for i, g in enumerate(groups)}
     return History(times, tuple(cash for _ in times), value, dict.fromkeys(groups, zeros),
-                   dict.fromkeys(groups, zeros), dict.fromkeys(groups, ()), zeros)
+                   dict.fromkeys(groups, zeros), steps, zeros)
 
 
 def _holding(ticker, group, side="yes", contracts="10", price="0.45", cost="3.07",
@@ -384,6 +389,27 @@ class TestArea:
         assert all(area[name] == color for name, color in colors[0].items())
         swatches = {row["cells"][6]: row["swatch"][1] for row in out["holdings"]["rows"]}
         assert swatches == colors[0]
+
+    def test_a_later_bigger_category_does_not_take_an_earlier_ones_color(self):
+        # Crypto first, then Climate; then Politics arrives worth far more than
+        # both, and later still a seventh category, past the six slots: every
+        # earlier category keeps its color, and each new one takes the next
+        # slot, then the gray
+        def colors(groups):
+            out = payload(_view(groups))
+            return {t["name"]: t["fillcolor"] for t in out["area"]["data"] if "fillcolor" in t}
+
+        before = colors({"Crypto": 20.0, "Climate": 10.0, OTHER_BETS: 5.0})
+        after = colors({"Crypto": 20.0, "Climate": 10.0, "Politics": 900.0, OTHER_BETS: 5.0})
+        assert before == {CASH: live_dashboard._CASH_COLOR, "Crypto": live_dashboard._PALETTE[0],
+                          "Climate": live_dashboard._PALETTE[1],
+                          OTHER_BETS: live_dashboard._OTHER_BETS_COLOR}
+        assert after == {**before, "Politics": live_dashboard._PALETTE[2]}
+        six = {f"Cat{i}": 1.0 + i for i in range(6)}
+        full = colors({**six, "Huge": 1000.0})
+        assert {g: full[g] for g in six} == {f"Cat{i}": live_dashboard._PALETTE[i]
+                                             for i in range(6)}
+        assert full["Huge"] == live_dashboard._MORE_COLOR
 
     def test_a_group_held_but_not_in_the_history_still_has_a_color(self):
         view = _view(holdings=(_holding("T0", "Crypto"), _holding("N", "Newcomer")))
@@ -1311,6 +1337,15 @@ class TestMain:
     def test_no_browser(self, run_main):
         _run_main(["--no-browser"])
         assert run_main["opened"] == []
+
+    def test_it_turns_ctrl_c_back_on(self, run_main, monkeypatch):
+        # start_dashboard.sh starts it in the background, where a job begins
+        # with Ctrl-C ignored: main makes Ctrl-C stop it again
+        calls = []
+        monkeypatch.setattr(live_dashboard.signal, "signal",
+                            lambda signum, handler: calls.append((signum, handler)))
+        _run_main(["--no-browser"])
+        assert calls == [(signal.SIGINT, signal.default_int_handler)]
 
     def test_this_checkout_s_running_dashboard_has_its_page_opened(self, run_main, capsys):
         run_main["busy"].add(config.LIVE_DASHBOARD_PORT)

@@ -28,7 +28,13 @@ Dependencies:
     dataclass (consumed by trader.py), the two public write functions, and
     the run result's RunReport, TradeRecord, LegRecord, RunReportHandler,
     trade_record, report_trades and write_run_report (all consumed by
-    main.py).
+    main.py). The trade log it writes (PROD_LOG_PATH, and the fallback
+    copies _write_fallback_log puts beside it) is read back by
+    live_portfolio.py, the live dashboard's Live trading tab, which finds
+    the bot's purchases in it: it looks PROD_LOG_PATH up when it reads, and
+    matches the fallback copies' name pattern and the columns it reads, so
+    those change only together with live_portfolio's _FALLBACK_LOG and
+    _LOG_HEADERS.
 
 Notes:
     The TradeResult dataclass is defined here (not in trader.py) because reporter.py
@@ -99,6 +105,8 @@ from .config import (
 from .scanner import display_title, leg_prices, leg_sides, pair_held
 from .strategy import TradeSpec
 
+# The shared trade log; live_portfolio.trade_log_paths reads it (and the
+# fallback copies beside it) back for the Live trading tab
 PROD_LOG_PATH = PROJECT_ROOT / "trade_log.xlsx"
 
 # Sidecar lock file coordinating concurrent writers to PROD_LOG_PATH (e.g. the
@@ -515,7 +523,9 @@ def _write_fallback_log(results: list, balance_before: float, balance_after: flo
         run_note (str): Keyword-only note for the banner row, as in the shared log.
 
     Returns:
-        Path: The new file, trade_log_<date>_<time>.xlsx in the project folder.
+        Path: The new file, trade_log_<date>_<time>_<microseconds>.xlsx in the
+            project folder ("-N" added when that name is taken), the pattern
+            live_portfolio.trade_log_paths reads it back by.
     """
     run_ts = datetime.now(UTC).astimezone()
     # Microseconds keep two near-simultaneous fallbacks off the collision path at

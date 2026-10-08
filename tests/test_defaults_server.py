@@ -67,6 +67,7 @@ import os
 import pkgutil
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -3577,6 +3578,15 @@ class TestMain:
         assert server.closed
         assert "Defaults server stopped" in log
 
+    def test_it_turns_ctrl_c_back_on(self, run_main, monkeypatch):
+        # start_dashboard.sh starts it in the background, where a job begins
+        # with Ctrl-C ignored: main makes Ctrl-C stop it again, first of all
+        calls = []
+        monkeypatch.setattr(defaults_server.signal, "signal",
+                            lambda signum, handler: calls.append((signum, handler)))
+        run_main["run"](["--no-browser"])
+        assert calls == [(signal.SIGINT, signal.default_int_handler)]
+
 
 @pytest.fixture
 def busy_port(tmp_path, monkeypatch):
@@ -3931,7 +3941,7 @@ class TestIsolation:
     _STDLIB_ALLOWED = frozenset({
         "argparse", "base64", "collections", "dataclasses", "datetime", "errno", "fcntl",
         "hashlib", "hmac", "html", "http", "json", "logging", "math", "os", "pathlib", "re",
-        "secrets", "subprocess", "sys", "urllib", "webbrowser"})
+        "secrets", "signal", "subprocess", "sys", "urllib", "webbrowser"})
 
     @classmethod
     def _import_problems(cls, tree) -> list[str]:

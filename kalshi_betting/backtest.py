@@ -197,8 +197,8 @@ Notes:
     ./start_dashboard.sh --seed), confirmed through defaults_server, sets the
     live defaults; nothing else chosen here reaches live trading. The run's
     last line says how: run ./start_dashboard.sh (it starts the defaults
-    server and opens the page), then use the filter bar's Save as live
-    defaults… or Trade using defaults… button.
+    server and the live dashboard, whose Backtest tab is the page), then use
+    the filter bar's Save as live defaults… or Trade using defaults… button.
 """
 import argparse
 import logging
@@ -894,11 +894,12 @@ def main() -> None:
     logging.info("Open the HTML file in a browser to view the interactive charts.")
     # How a scenario on the page becomes the live defaults, or is traded: the
     # page cannot write files or start runs, so its buttons open the defaults
-    # server's pages (started by ./start_dashboard.sh)
+    # server's pages (started by ./start_dashboard.sh, beside the live
+    # dashboard, whose Backtest tab shows this page)
     logging.info("To save the filter bar's scenario as the live defaults, or to trade: run "
-                 "./start_dashboard.sh (it starts the defaults server and opens this page), "
-                 "then use the filter bar's Save as live defaults… or Trade using defaults… "
-                 "button.")
+                 "./start_dashboard.sh (it starts the defaults server and the live dashboard, "
+                 "whose Backtest tab is this page), then use the filter bar's Save as live "
+                 "defaults… or Trade using defaults… button.")
 
 
 if __name__ == "__main__":

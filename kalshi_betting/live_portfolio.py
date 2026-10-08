@@ -2582,8 +2582,12 @@ class LiveView:
         holdings (tuple[Holding, ...]): What is held now, in group_order,
             then by event and market, so the markets of one question (the
             rungs of a ladder, both legs of a pair on one event) sit together.
-        group_order (tuple[str, ...]): The groups, most money put in first,
-            with OTHER_BETS last.
+        group_order (tuple[str, ...]): The groups, each category in the order
+            it first appeared (its first bot purchase), ties by name, with
+            OTHER_BETS last. A new category always comes after the ones
+            before it, so each keeps its place (and its color on the page)
+            from one read to the next, while the matched purchases and
+            their categories stay the same (_group_order).
         history (History | None): The account over time; None before the
             bot's first live trade.
         periods (tuple[PeriodStats, ...] | None): One per
@@ -2651,9 +2655,23 @@ def _holdings(ledger: Ledger, marks: Marks, markets: dict[str, Market],
 
 def _group_order(history: History | None, holdings: list[Holding]) -> tuple[str, ...]:
     """
-    Order the groups: most money put in over the whole history first, OTHER_BETS last.
+    Order the groups: each category by when it first appeared, ties by name, OTHER_BETS last.
 
-    Without a history, by what each group holds now.
+    A category first appears at its earliest change after the history's
+    start, which is the first fill of its first bot purchase (the first of
+    history.steps). The history always starts just before the bot's first
+    fill, and a newer purchase only ever adds a later change, so a category
+    that appears later always comes after every category before it, however
+    much it puts in or is worth: a category keeps its place, and so its color
+    on the page, from one read to the next. That holds while the matched
+    purchases and their categories stay the same: Kalshi filing a series
+    under another category, a /series listing that cannot be read with no
+    copy cached (the categories then come from infer_category), or an older
+    trade log found later can rename or reorder them. A group with no change
+    in the history comes after those that have one, by name. OTHER_BETS can
+    have none (without a history every holding is OTHER_BETS; with one, a
+    position held since before the bot's first fill and untouched since),
+    and it comes last in any case.
 
     Args:
         history (History | None): The history, or None.
@@ -2662,13 +2680,12 @@ def _group_order(history: History | None, holdings: list[Holding]) -> tuple[str,
     Returns:
         tuple[str, ...]: Every group in the history or the holdings.
     """
-    put_in = {r.group: r.put_in for r in _group_returns(history, 0)} if history else {}
-    worth: dict[str, Decimal] = defaultdict(Decimal)
-    for holding in holdings:
-        worth[holding.group] += holding.value
-    groups = set(put_in) | set(worth)
-    return tuple(sorted(groups, key=lambda g: (g == OTHER_BETS, -put_in.get(g, 0.0),
-                                               -worth.get(g, _ZERO), g)))
+    first = ({group: steps[0][0] for group, steps in history.steps.items() if steps}
+             if history else {})
+    groups = {holding.group for holding in holdings} | (set(history.value) if history else set())
+    never = datetime.min.replace(tzinfo=UTC)     # only beside groups with no change at all
+    return tuple(sorted(groups, key=lambda g: (g == OTHER_BETS, g not in first,
+                                               first.get(g, never), g)))
 
 
 def _sorted_holdings(holdings: list[Holding], group_order: tuple[str, ...]) -> list[Holding]:

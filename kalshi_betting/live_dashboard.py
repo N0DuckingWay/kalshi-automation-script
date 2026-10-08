@@ -14,10 +14,13 @@ Purpose:
 
         python3 -m kalshi_betting.live_dashboard [--no-browser]
 
-    It opens the page in the browser unless told not to; Ctrl-C stops both
-    servers. When its port is already taken by this checkout's own live
-    dashboard, running this checkout's current code, it opens that page and
-    exits, starting nothing; otherwise a taken port is refused (exit 2).
+    or through ./start_dashboard.sh, which starts it in the background beside
+    the defaults server and lets it open the page (except with --seed). It
+    opens the page in the browser unless told not to, and Ctrl-C stops both
+    of its servers (8766 and 8767). When its port is already taken by this
+    checkout's own live dashboard, running this checkout's current code, it
+    opens that page and exits, starting nothing; otherwise a taken port is
+    refused (exit 2).
 
 Dependencies:
     config (the LIVE_DASHBOARD_* and LIVE_BACKTEST_PORT settings, the Plotly
@@ -30,7 +33,8 @@ Dependencies:
     are filed under); treasury (load_risk_free_rates, the T-bill yields the
     Sharpe and Sortino ratios subtract; RiskFreeRates and SOURCE_CACHE);
     _http (api_error_summary, the one-line description of a failed read).
-    Nothing imports this module: a person runs it.
+    Nothing imports this module: a person runs it, or start_dashboard.sh
+    starts it as a process of its own.
 
 Notes:
     Read-only: it sends Kalshi read-only requests only (through
@@ -53,13 +57,20 @@ Notes:
     time: a request that arrives during a read waits for that read's result
     (_SingleFlight).
 
-    Known limits, recorded rather than fixed: a read has no overall deadline
+    A category's color follows its place in live_portfolio's group order,
+    which puts each category where it first appeared (its first bot
+    purchase), so a category keeps its color from one read to the next: a
+    new category takes the next free slot, or the gray of the rest, and
+    never an older category's color. That holds while the matched purchases
+    and their categories stay the same; Kalshi filing a series under another
+    category, a /series listing that cannot be read with no copy cached, or
+    an older trade log found later can rename or reorder them. Within one
+    read every chart and table agrees.
+
+    Known limit, recorded rather than fixed: a read has no overall deadline
     (each request to Kalshi has its timeouts, but their retries can stretch
     one read past config.LIVE_DASHBOARD_BUILD_WAIT_SECONDS, and requests that
-    arrive meanwhile are answered 503 until it ends); and a category's color
-    follows its place in live_portfolio's group order (most money put in
-    first), so a purchase that changes that order can change the colors
-    between two reads, while within one read every chart and table agrees.
+    arrive meanwhile are answered 503 until it ends).
 """
 from __future__ import annotations
 
@@ -401,8 +412,9 @@ class _Bands:
     How the groups are drawn: which categories have a band of their own, and every group's color.
 
     Attributes:
-        named (tuple[str, ...]): Categories drawn by name, most money put in
-            first (a lone category past the palette's slots last, in gray).
+        named (tuple[str, ...]): Categories drawn by name, in the order each
+            first appeared (a lone category past the palette's slots last,
+            in gray).
         folded (tuple[str, ...]): Categories drawn together as MORE_CATEGORIES
             (two or more, or none).
         colors (dict[str, str]): Each group's color (a category past the
@@ -417,7 +429,8 @@ def _bands(view: live_portfolio.LiveView) -> _Bands:
     """
     Choose the named bands and every group's color, the same for every chart and period.
 
-    The categories in view.group_order (most money put in first) take the
+    The categories in view.group_order (in the order each first appeared,
+    so the same category takes the same slot on every read) take the
     palette's slots in order, at most config.LIVE_DASHBOARD_MAX_CATEGORY_BANDS
     of them; the rest are drawn together as MORE_CATEGORIES, in gray. When
     only one category is left past the slots, it is drawn by its own name in

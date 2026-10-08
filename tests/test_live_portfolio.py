@@ -2334,9 +2334,9 @@ class TestBuildLiveView:
         fake.batch["D1"] = [_candle(c, "0.05", "0.15") for c in closes]
         fake.batch["X"] = [_candle(c, "0.20", "0.30") for c in closes if c <= paid]
 
-    def test_categories_are_market_as_and_ordered_by_money_put_in(self, whole_account,
-                                                                   log_paths, pacific,
-                                                                   monkeypatch):
+    def test_categories_are_market_as_and_ordered_by_first_purchase(self, whole_account,
+                                                                     log_paths, pacific,
+                                                                     monkeypatch):
         kalshi, fake = whole_account
         self._two_categories(kalshi, fake)
         _write_run(monkeypatch, T0, [_trade_result("A1", "B1", "executed"),
@@ -2346,12 +2346,14 @@ class TestBuildLiveView:
             series_categories={**self.CATEGORIES, "KXWEATHER": ("Climate", ("Rain",))},
             trade_logs=live_portfolio.trade_log_paths())
         assert view.warnings == ()
-        # Crypto put in $9.10 and Climate $4.00, though Climate is worth more now;
-        # within a group, by event (D1's KXCRYPTO-26NOV before C1's KXWEATHER-26OCT)
-        assert view.group_order == ("Crypto", "Climate", OTHER_BETS)
+        # Climate's first fill (D1, 6 s before the run) came before Crypto's (B1,
+        # 3 s before), so Climate comes first though Crypto put in more ($9.10
+        # against $4.00); within a group, by event (D1's KXCRYPTO-26NOV before
+        # C1's KXWEATHER-26OCT)
+        assert view.group_order == ("Climate", "Crypto", OTHER_BETS)
         assert [(h.ticker, h.group, h.value) for h in view.holdings] == [
-            ("A1", "Crypto", D("5.85")), ("B1", "Crypto", D("5.20")),
-            ("D1", "Climate", D("9.00")), ("C1", "Climate", D("9.00"))]
+            ("D1", "Climate", D("9.00")), ("C1", "Climate", D("9.00")),
+            ("A1", "Crypto", D("5.85")), ("B1", "Crypto", D("5.20"))]
         # X was looked up once the ledger showed it held at the start, so it
         # has its daily price there (0.25), not what it cost (0.20)
         asked = [params["tickers"] for path, params in kalshi.calls if path == "/markets"]
@@ -2414,6 +2416,33 @@ class TestBuildLiveView:
             ("A1", D("5.85")), ("B1", D("5.20")), ("X", D("1.25"))]
         assert fake.calls == []                          # no daily prices to read
         assert view.cash_check.checked == 0
+
+    def test_a_later_bigger_category_does_not_take_an_earlier_ones_place(self):
+        # Each category's first change is its first purchase: Early before
+        # Middle before Late, though Late put in and is worth the most, and
+        # Other bets last, though your own bet changed before Middle and Late
+        times = _times(_utc(2026, 10, 1, 12))
+        first = {"Early": T0, "Middle": T0 + timedelta(hours=1),
+                 "Late": T0 + timedelta(days=2), OTHER_BETS: T0 + timedelta(minutes=1)}
+        spent = {"Early": 2.0, "Middle": 3.0, "Late": 500.0, OTHER_BETS: 1.0}
+        history = History(
+            times, (0.0,) * 5, {g: (0.0, 0.0, s, s, s) for g, s in spent.items()},
+            {g: (0.0, 0.0, -s, -s, -s) for g, s in spent.items()},
+            {g: (0.0, 0.0, s, s, s) for g, s in spent.items()},
+            {g: ((when, -spent[g]),) for g, when in first.items()}, (0.0,) * 5)
+        before = live_portfolio._group_order(dataclasses.replace(
+            history, **{name: {g: v for g, v in getattr(history, name).items() if g != "Late"}
+                        for name in ("value", "net_cash", "spent", "steps")}), [])
+        assert before == ("Early", "Middle", OTHER_BETS)
+        assert live_portfolio._group_order(history, []) == (
+            "Early", "Middle", "Late", OTHER_BETS)
+        # Two that first appeared at one moment go by name; a group held now
+        # with no change in the history comes after those that have one
+        tied = dataclasses.replace(history, steps={**history.steps,
+                                                   "Late": ((T0, -500.0),)})
+        newcomer = Holding("N", "Will N?", "Aardvark", "yes", D(1), D("0.5"), D("0.5"), D(1))
+        assert live_portfolio._group_order(tied, [newcomer]) == (
+            "Early", "Late", "Middle", "Aardvark", OTHER_BETS)
 
     def test_the_rungs_of_one_question_sit_together(self):
         def held(ticker, event, group, value, side="yes"):
