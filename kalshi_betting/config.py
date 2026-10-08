@@ -1406,6 +1406,11 @@ MARKET_PAGE_SIZE   = 200
 # Number of positions to request per page when paginating the /portfolio/positions endpoint.
 POSITION_PAGE_SIZE = 500
 
+# Number of settlements to request per page from /portfolio/settlements
+# (scanner.get_settlements, the list of markets the account held when they
+# paid out). The endpoint accepts at most 200.
+SETTLEMENT_PAGE_SIZE = 200
+
 # Hard ceiling on pages walked by scanner.py's cursor loops (open events, MVE
 # events, positions). The stuck-cursor guard catches a cursor that repeats
 # consecutively, but a keyset cycling with period > 1 (A, B, A, B, ...) never
@@ -1914,6 +1919,13 @@ CANDLESTICK_CACHE_FIELDS_VERSION = 2
 # (historical.usable_candle_ask): the backtest's open-trade values and sale
 # bids, and live selling's earlier-day checks, never read a price from it.
 CANDLE_NO_ASK_CEILING = 0.99
+
+# Seconds historical.recent_candles pauses after each candlestick request.
+# Live selling reads each held market's last few days of candles once per
+# run, one market at a time, so a short pause keeps those reads well inside
+# the account's read limit (the backtest's own fetch pauses 0.15 s, with
+# several workers at once).
+RECENT_CANDLES_RATE_LIMIT_SLEEP_SECONDS = 0.05
 
 # The backtest's depth model (depth_model.py): a table of how many contracts
 # typically rest near the best bid of a live Kalshi book, fitted to saved

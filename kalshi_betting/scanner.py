@@ -68,6 +68,11 @@ Dependencies:
     arithmetic: the backtest sells a position down its modeled bid ladder
     through walk_bids (backtester._ladder_average), and live selling will
     walk a held market's real bids (bid_ladder) the same way.
+    get_settlements() reads the markets the account held when they paid out
+    (Settlement: counts, cost, fees and payout), and market_for_labels()
+    finds a market by ticker in the run's list, or else from the exchange as
+    resolve_held_ladders does: live selling reads both to value a held
+    market whose partner has paid out.
     Depends on the KalshiClient produced by auth.py.
 
 Notes:
@@ -177,6 +182,7 @@ from .config import (
     SAME_TITLE_MIN_PRICE_DIFF,
     SCANNER_MAX_PAGES,
     SCANNER_PROGRESS_LOG_EVERY_PAGES,
+    SETTLEMENT_PAGE_SIZE,
     SPREAD_ABOVE_CEILING,
     SPREAD_BELOW_FLOOR,
     SPREAD_NOT_POSITIVE,
@@ -2657,20 +2663,21 @@ def filter_markets_within_horizon(markets: list, max_horizon_days: int | None) -
     return within_horizon
 
 
-def _held_dollars(raw: Any) -> float | None:
+def _nonnegative_decimal(raw: Any) -> Decimal | None:
     """
-    Read a dollar amount from the positions listing, or None when it cannot be used.
+    Read one number from a portfolio reply as an exact Decimal, or None when it cannot be used.
 
-    Parsed with Decimal, as every dollar string is (auth.py's rule), and
-    refused when absent, a JSON true/false, unreadable, not finite, negative,
-    or too large for a float (Decimal("1e400") is finite, float() of it is
-    not, and an infinite cost would make an add-on's size NaN).
+    Parsed with Decimal, as every dollar string is (auth.py's rule), from its
+    text, so a dollar string, an integer and a JSON number all read as the
+    decimal they spell, with no float rounding.
+    Refused when absent, a JSON true/false, unreadable (a list or object
+    included), not finite, or negative.
 
     Args:
-        raw (Any): The field's value as the listing sent it.
+        raw (Any): The field's value as the reply sent it.
 
     Returns:
-        float | None: The amount in dollars, or None.
+        Decimal | None: The value, or None.
     """
     if raw is None or isinstance(raw, bool):
         return None
@@ -2680,8 +2687,42 @@ def _held_dollars(raw: Any) -> float | None:
         return None
     if not value.is_finite() or value < 0:
         return None
+    return value
+
+
+def _finite_float(value: Decimal | None) -> float | None:
+    """
+    Turn a Decimal into a float, or None when there is none or it is too large for a float.
+
+    Decimal("1e400") is finite, float() of it is not, and an infinite cost
+    would make a size or a sale value NaN downstream.
+
+    Args:
+        value (Decimal | None): A value from _nonnegative_decimal.
+
+    Returns:
+        float | None: The value as a float, or None.
+    """
+    if value is None:
+        return None
     result = float(value)
     return result if math.isfinite(result) else None
+
+
+def _held_dollars(raw: Any) -> float | None:
+    """
+    Read a dollar amount from the positions listing, or None when it cannot be used.
+
+    Refused when absent, a JSON true/false, unreadable, not finite, negative
+    (_nonnegative_decimal), or too large for a float (_finite_float).
+
+    Args:
+        raw (Any): The field's value as the listing sent it.
+
+    Returns:
+        float | None: The amount in dollars, or None.
+    """
+    return _finite_float(_nonnegative_decimal(raw))
 
 
 def get_held_positions(client: Any, *, complete_out: dict | None = None) -> dict:
@@ -2857,6 +2898,277 @@ def get_held_tickers(client: Any) -> set:
     return set(get_held_positions(client))
 
 
+@dataclass(frozen=True)
+class Settlement:
+    """
+    One market the account held when it paid out, as GET /portfolio/settlements reports it.
+
+    Live selling reads these to value a held market whose partner has paid
+    out: the partner is gone from the positions listing, and its counts, cost
+    and payout are only here.
+
+    Attributes:
+        ticker (str): The market that paid out.
+        event_ticker (str): Its event.
+        result (str): How it settled (market_result): "yes", "no", "scalar"
+            or "void", as Kalshi sends it.
+        yes_count (float): YES contracts the account held when it paid out.
+        no_count (float): NO contracts the account held when it paid out.
+        yes_cost_dollars (float): What the account paid for those YES
+            contracts (their cost basis), fees not included.
+        no_cost_dollars (float): The same for the NO contracts.
+        fees_dollars (float): Fees the account paid on this market's trades
+            (fee_cost).
+        revenue_dollars (float): What the market paid the account when it
+            settled: $1 for each winning contract.
+        settled_at (datetime): When it paid out, in UTC.
+    """
+    ticker: str
+    event_ticker: str
+    result: str
+    yes_count: float
+    no_count: float
+    yes_cost_dollars: float
+    no_cost_dollars: float
+    fees_dollars: float
+    revenue_dollars: float
+    settled_at: datetime
+
+
+def _settlement_amount(record: dict, key: str, legacy_key: str | None, *,
+                       legacy_cents: bool) -> float | None:
+    """
+    Read one count or dollar amount of a settlement, preferring the newer field name.
+
+    The reply has carried two spellings of each field: newer fixed-point
+    strings (yes_count_fp, yes_total_cost_dollars) and the older integers
+    the pinned SDK documents (yes_count, and yes_total_cost in CENTS). The
+    newer field is used whenever it is present, even when its value cannot
+    be read (it never falls back to the older one then), and the older one
+    only when the newer is absent: presence decides, never truthiness, so a
+    real 0 is never passed over.
+
+    An older field in cents must be a JSON integer, as the SDK types it. A
+    string or a JSON number with a decimal point is refused rather than read
+    as cents: it may be a dollar amount sent under the old name, which read
+    as cents would come out 100 times too small (a cost too small would make
+    a position look more profitable than it is). Cents are turned into
+    dollars exactly, in Decimal.
+
+    Args:
+        record (dict): One settlement as the reply sent it.
+        key (str): The newer field name.
+        legacy_key (str | None): The older field name, or None when there is none.
+        legacy_cents (bool): Keyword-only. Whether the older field is in cents.
+
+    Returns:
+        float | None: The amount (contracts, or dollars), or None when
+            neither field is present or the one used is not a readable,
+            finite, non-negative number (for cents, a non-negative integer).
+    """
+    if key in record:
+        value = _nonnegative_decimal(record[key])
+    elif legacy_key is not None and legacy_key in record:
+        raw = record[legacy_key]
+        if legacy_cents and (not isinstance(raw, int) or isinstance(raw, bool)):
+            # Not the integer of cents the field holds
+            return None
+        value = _nonnegative_decimal(raw)
+        if value is not None and legacy_cents:
+            try:
+                value = value / 100
+            except ArithmeticError:
+                # A value beyond the decimal context's limits cannot be
+                # read; the record is then left out and counted, never raised
+                return None
+    else:
+        return None
+    return _finite_float(value)
+
+
+def _settled_at(raw: Any) -> datetime | None:
+    """
+    Read a settlement's settled_time as a UTC datetime, or None when it cannot be read.
+
+    Kalshi sends an ISO 8601 time ending in "Z". A time with no offset (its
+    instant is unknown), or one that cannot be placed in UTC, is refused.
+
+    Args:
+        raw (Any): The settled_time value as the reply sent it.
+
+    Returns:
+        datetime | None: The time in UTC, or None.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.utcoffset() is None:
+        return None
+    try:
+        return parsed.astimezone(UTC)
+    except (OverflowError, ValueError):
+        # A time near the ends of datetime's range that UTC cannot hold
+        return None
+
+
+def _settlement_from_dict(record: Any) -> Settlement | None:
+    """
+    Build one Settlement from a reply record, or None when it cannot be read in full.
+
+    Every field must read: a non-empty ticker and event ticker, a non-empty
+    result, both counts, both costs, the fees and the revenue as finite
+    non-negative numbers (_settlement_amount: the newer field name first,
+    the older one's cents turned into dollars), and a settled time with a
+    UTC offset.
+
+    Args:
+        record (Any): One entry of the reply's "settlements" list.
+
+    Returns:
+        Settlement | None: The settlement, or None.
+    """
+    if not isinstance(record, dict):
+        return None
+    ticker = record.get("ticker")
+    event_ticker = record.get("event_ticker")
+    result = record.get("market_result")
+    if not all(isinstance(v, str) and v for v in (ticker, event_ticker, result)):
+        return None
+    amounts = (
+        _settlement_amount(record, "yes_count_fp", "yes_count", legacy_cents=False),
+        _settlement_amount(record, "no_count_fp", "no_count", legacy_cents=False),
+        _settlement_amount(record, "yes_total_cost_dollars", "yes_total_cost",
+                           legacy_cents=True),
+        _settlement_amount(record, "no_total_cost_dollars", "no_total_cost",
+                           legacy_cents=True),
+        # fee_cost has only ever been a dollar string
+        _settlement_amount(record, "fee_cost", None, legacy_cents=False),
+        _settlement_amount(record, "revenue_dollars", "revenue", legacy_cents=True),
+    )
+    settled_at = _settled_at(record.get("settled_time"))
+    if any(a is None for a in amounts) or settled_at is None:
+        return None
+    yes_count, no_count, yes_cost, no_cost, fees, revenue = amounts
+    return Settlement(ticker, event_ticker, result, yes_count, no_count,
+                      yes_cost, no_cost, fees, revenue, settled_at)
+
+
+def get_settlements(client: Any, *, unreadable_out: dict | None = None
+                    ) -> list[Settlement] | None:
+    """
+    Fetch every market the account held when it paid out (GET /portfolio/settlements).
+
+    Live selling reads it to value a held market whose partner has paid out.
+    Every page is a read-only GET through api_call_with_retry, on the SDK's
+    raw-response variant (parsed here, like the positions listing, since the
+    pinned SDK's Settlement model requires integer fields the reply no
+    longer sends).
+
+    The cursor loop is bounded twice over, as get_held_positions' is: a
+    cursor already requested stops it, and so does SCANNER_MAX_PAGES. A list
+    stopped early may be missing a partner, so it is not used at all: the
+    call returns None, and so it does when a page cannot be read. The caller
+    must then treat every partner as unknown (fail closed).
+
+    A page with no "settlements" list at all is read as a page that cannot
+    be read (a renamed key would otherwise look like an account with no
+    settlements); an explicit null or empty list is a page with none.
+
+    A record that cannot be read in full (_settlement_from_dict) is left
+    out, and one WARNING names how many were (silent at zero). A left-out
+    record may be the very partner a caller is looking for, so a caller that
+    needs every partner (live selling needs exactly one per held market)
+    reads the count through unreadable_out and treats any left-out record
+    as a possible partner.
+
+    Args:
+        client (Any): An authenticated KalshiClient produced by auth.build_client().
+        unreadable_out (dict | None): Keyword-only. When given, its
+            "unreadable" key is set to 0 at the start and, when the call
+            returns a list, to the number of records left out of it. A call
+            that returns None leaves nothing to use.
+
+    Returns:
+        list[Settlement] | None: Every readable settlement, in the reply's
+            order; empty when the account has none. None, with a WARNING
+            saying why, when a page could not be read or the list was cut
+            short.
+    """
+    if unreadable_out is not None:
+        # Set before the walk, so the key is there however the call ends
+        unreadable_out["unreadable"] = 0
+    settlements: list[Settlement] = []
+    unreadable = 0
+    cursor: str | None = None
+    # Every cursor already requested, so a keyset that cycles (A, B, A, B, ...)
+    # is caught as well as one that repeats at once
+    seen_cursors: set[str] = set()
+    pages = 0
+    while True:
+        kwargs: dict = {"limit": SETTLEMENT_PAGE_SIZE}
+        # Pages after the first continue from the reply's cursor
+        if cursor:
+            kwargs["cursor"] = cursor
+        try:
+            # Raw, retried read-only GET; a non-2xx reply raises here
+            data = api_call_with_retry(
+                fetch_json_page, client.get_settlements_without_preload_content, **kwargs
+            )
+        except Exception as exc:
+            # One line, never the SDK's multi-line text with every header
+            logging.warning("Could not read the account's settlements (page %d): %s",
+                            pages + 1, api_error_summary(exc))
+            return None
+        pages += 1
+        rows = data.get("settlements") if isinstance(data, dict) else None
+        new_cursor = data.get("cursor") if isinstance(data, dict) else None
+        # An empty list may arrive as null; a reply that is not an object,
+        # has no "settlements" key, or holds anything else there cannot be read
+        if (not isinstance(data, dict) or "settlements" not in data
+                or not isinstance(rows, (list, type(None)))
+                or not isinstance(new_cursor, (str, type(None)))):
+            logging.warning("Could not read the account's settlements: page %d is not "
+                            "a list of settlements with a cursor", pages)
+            return None
+        for row in rows or []:
+            settlement = _settlement_from_dict(row)
+            if settlement is None:
+                unreadable += 1
+            else:
+                settlements.append(settlement)
+        if new_cursor and new_cursor in seen_cursors:
+            logging.warning(
+                "Settlements fetch: cursor did not advance (repeated) on page %d — "
+                "stopping; the list may be incomplete, so no settlement is used this run",
+                pages)
+            return None
+        # A list that ends on the last allowed page was not cut short
+        if new_cursor and pages >= SCANNER_MAX_PAGES:
+            logging.warning(
+                "Settlements fetch: reached SCANNER_MAX_PAGES (%d) — stopping; the list "
+                "may be incomplete, so no settlement is used this run", SCANNER_MAX_PAGES)
+            return None
+        if not new_cursor:
+            # A null or empty cursor marks the last page
+            break
+        seen_cursors.add(new_cursor)
+        cursor = new_cursor
+    if unreadable:
+        logging.warning(
+            "Settlements: left out %d record(s) that could not be read in full (a missing "
+            "ticker, event ticker or result, a count, cost, fee or revenue that is not a "
+            "readable non-negative number or, in an older cents field, not a whole number, "
+            "or a settled time with no UTC offset)",
+            unreadable)
+    logging.info("Settlements read: %d (%d unreadable)", len(settlements), unreadable)
+    if unreadable_out is not None:
+        unreadable_out["unreadable"] = unreadable
+    return settlements
+
+
 @dataclass
 class ApiMarket:
     """
@@ -2988,7 +3300,8 @@ def _error_text(exc: BaseException) -> str:
         return name
 
 
-def _fetch_held_market(client: Any, ticker: str, event_titles: dict) -> ApiMarket | None:
+def _fetch_held_market(client: Any, ticker: str, event_titles: dict, *,
+                       noun: str = "held market") -> ApiMarket | None:
     """
     Ask the exchange for one held market and its event's title.
 
@@ -3000,6 +3313,9 @@ def _fetch_held_market(client: Any, ticker: str, event_titles: dict) -> ApiMarke
         client (Any): An authenticated Kalshi client.
         ticker (str): The held market's ticker.
         event_titles (dict): Event titles already fetched, by event ticker.
+        noun (str): Keyword-only. What the failure lines call the market:
+            "held market" for resolve_held_ladders, plain "market" for
+            market_for_labels, which also looks up markets no longer held.
 
     Returns:
         ApiMarket | None: The market, or None if it or its event can't be read.
@@ -3011,11 +3327,11 @@ def _fetch_held_market(client: Any, ticker: str, event_titles: dict) -> ApiMarke
         )
         raw = data.get("market") if isinstance(data, dict) else None
         if not isinstance(raw, dict):
-            logging.warning("Could not look up held market %s: the reply had no market", ticker)
+            logging.warning("Could not look up %s %s: the reply had no market", noun, ticker)
             return None
         event_ticker = raw.get("event_ticker")
         if not isinstance(event_ticker, str) or not event_ticker:
-            logging.warning("Could not look up held market %s: it has no event ticker", ticker)
+            logging.warning("Could not look up %s %s: it has no event ticker", noun, ticker)
             return None
         if event_ticker not in event_titles:
             ev_data = api_call_with_retry(
@@ -3024,16 +3340,53 @@ def _fetch_held_market(client: Any, ticker: str, event_titles: dict) -> ApiMarke
             )
             event = ev_data.get("event") if isinstance(ev_data, dict) else None
             if not isinstance(event, dict):
-                logging.warning("Could not look up held market %s: the reply for its event "
-                                "%s had no event", ticker, event_ticker)
+                logging.warning("Could not look up %s %s: the reply for its event "
+                                "%s had no event", noun, ticker, event_ticker)
                 return None
             # A title-less event reads as "", as in the market list
             event_titles[event_ticker] = event.get("title") or ""
         # Parsed like the market list, so its labels match its ladder-mates'
         return _market_from_dict(raw, event_titles[event_ticker])
     except Exception as exc:
-        logging.warning("Could not look up held market %s: %s", ticker, _error_text(exc))
+        logging.warning("Could not look up %s %s: %s", noun, ticker, _error_text(exc))
         return None
+
+
+def market_for_labels(client: Any, ticker: Any, markets_by_ticker: dict,
+                      event_titles: dict) -> ApiMarket | None:
+    """
+    Find one market whose ladder labels are needed: in this run's market list, else from the exchange.
+
+    Live selling needs the ladder labels (market_ladder_keys) of a market
+    that has paid out, to tell whether it was the partner of a market still
+    held. Such a market is usually missing from the run's list of open
+    markets, so it is looked up exactly as resolve_held_ladders looks up a
+    held market the list lacks (_fetch_held_market: the market, then its
+    event's title, which the question label includes), and its labels then
+    match those of its ladder-mates in the list.
+
+    Args:
+        client (Any): An authenticated Kalshi client.
+        ticker (Any): The market's ticker; anything but a non-empty string
+            names no market.
+        markets_by_ticker (dict): This run's markets by ticker, before held
+            ones are removed.
+        event_titles (dict): Event titles already fetched, by event ticker;
+            a lookup adds to it, so one event is asked about once.
+
+    Returns:
+        ApiMarket | None: The market, or None when the ticker names none or
+            the lookup fails (one WARNING says why).
+    """
+    if not isinstance(ticker, str) or not ticker:
+        return None
+    market = markets_by_ticker.get(ticker)
+    if market is not None:
+        return market
+    # The held-market lookup, so a market found this way carries the same
+    # labels it would carry in the list; its failure lines say "market",
+    # since a paid-out partner is no longer held
+    return _fetch_held_market(client, ticker, event_titles, noun="market")
 
 
 def resolve_held_ladders(client: Any, markets: list, held_tickers: set, *,

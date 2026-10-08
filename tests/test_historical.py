@@ -3529,6 +3529,162 @@ class TestFetchCandlesticksEndpoints:
         assert [c["ts"] for c in out] == endpoints.archive.served(self.OPEN, close)
 
 
+class TestRecentCandles:
+    """recent_candles reads a held market's last few days of candles for live
+    selling: the live endpoint first and the archive on a 404, parsed exactly
+    as fetch_candlesticks parses them, and never read from or written to the
+    candle cache, so a live run touches nothing under backtest_cache/."""
+
+    OPEN = 1_700_000_000 - 1_700_000_000 % _HOUR
+    CLOSE = OPEN + 72 * _HOUR
+    EVENT = "KXSERIES-26OCT08"
+
+    @pytest.fixture(autouse=True)
+    def _no_cache(self, monkeypatch, tmp_path):
+        """Point every cache path at a fresh folder and make any cache access fail."""
+        # Kept so a test can compare with fetch_candlesticks, which caches
+        self.real_cache = (historical._load_json_cache, historical._save_json_cache)
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "cache" / "candlesticks")
+
+        def refuse(*_args, **_kwargs):
+            raise AssertionError("recent_candles touched the candle cache")
+
+        monkeypatch.setattr(historical, "_load_json_cache", refuse)
+        monkeypatch.setattr(historical, "_save_json_cache", refuse)
+        yield
+        # Nothing was written: not the candle folder, not the cache folder
+        assert not (tmp_path / "cache").exists()
+
+    def _recent(self, monkeypatch, endpoints, **kw):
+        monkeypatch.setattr(historical, "_signed_raw_get", endpoints)
+        return historical.recent_candles(
+            MagicMock(), "T1", kw.pop("event_ticker", self.EVENT),
+            kw.pop("start_ts", self.OPEN), kw.pop("end_ts", self.CLOSE))
+
+    def test_parses_like_fetch_candlesticks(self, monkeypatch, tmp_path, caplog):
+        payload = {"candlesticks": [
+            # The live reply's shape: dollar strings under close_dollars, volume_fp
+            {"end_period_ts": self.OPEN + _HOUR, "volume_fp": "0.00",
+             "yes_ask": {"close_dollars": "0.2000"}, "yes_bid": {"close_dollars": "0.1200"}},
+            {"end_period_ts": self.OPEN + 5 * _HOUR, "volume_fp": "3.00",
+             "yes_ask": {"close_dollars": "0.4500"}, "yes_bid": {"close_dollars": "0.0050"}},
+            # Unparseable: left out and counted, as fetch_candlesticks does
+            {"end_period_ts": self.OPEN + 6 * _HOUR,
+             "yes_ask": {"close": "x"}, "yes_bid": {"close": "0.10"}},
+        ]}
+        endpoint = MagicMock(return_value=_raw_resp(payload))
+        with caplog.at_level(logging.WARNING):
+            recent = self._recent(monkeypatch, endpoint)
+        assert recent == [
+            {"ts": self.OPEN + _HOUR, "yes_ask_close": 0.2, "no_ask_close": 0.88,
+             "volume": 0.0},
+            {"ts": self.OPEN + 5 * _HOUR, "yes_ask_close": 0.45,
+             "no_ask_close": historical.CANDLE_NO_ASK_CEILING, "volume": 3.0},
+        ]
+        assert "T1: dropped 1/3 malformed candles" in caplog.text
+        # Hourly, over the window asked for
+        _, params = endpoint.call_args
+        assert (params["start_ts"], params["end_ts"]) == (self.OPEN, self.CLOSE)
+        assert params["period_interval"] == historical.CANDLESTICK_PERIOD_INTERVAL_MINUTES
+        # fetch_candlesticks reads the same reply to the same candles
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(historical, "_load_json_cache", self.real_cache[0])
+            mp.setattr(historical, "_save_json_cache", self.real_cache[1])
+            mp.setattr(historical, "_CANDLES_DIR", tmp_path / "elsewhere")
+            mp.setattr(historical, "_signed_raw_get",
+                       MagicMock(return_value=_raw_resp(payload)))
+            cached = historical.fetch_candlesticks(
+                MagicMock(), "T1", self.OPEN, self.CLOSE, use_cache=False,
+                rate_limit_sleep=0.0, series="KXSERIES", live_first=True)
+        assert recent == cached
+
+    def test_asks_the_live_endpoint_first_and_stops_there(self, monkeypatch):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds={"live", "historical"})
+        out = self._recent(monkeypatch, endpoints)
+        assert [name for name, *_ in endpoints.calls] == ["live"]
+        assert [c["ts"] for c in out] == endpoints.archive.served(self.OPEN, self.CLOSE)
+
+    def test_a_404_from_the_live_endpoint_asks_the_archive(self, monkeypatch):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds={"historical"})
+        out = self._recent(monkeypatch, endpoints)
+        assert [name for name, *_ in endpoints.calls] == ["live", "historical"]
+        assert [c["ts"] for c in out] == endpoints.archive.served(self.OPEN, self.CLOSE)
+
+    def test_another_failure_gives_none_in_one_line_without_the_archive(
+        self, monkeypatch, caplog,
+    ):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds=set(), fail_status=400)
+        with caplog.at_level(logging.WARNING):
+            assert self._recent(monkeypatch, endpoints) is None
+        assert [name for name, *_ in endpoints.calls] == ["live"]
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert msgs == ["Recent candles could not be read for T1: HTTP 400 Bad Request "
+                        "(live endpoint)"]
+
+    def test_a_404_from_both_gives_none(self, monkeypatch, caplog):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds=set())
+        with caplog.at_level(logging.WARNING):
+            assert self._recent(monkeypatch, endpoints) is None
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert msgs == ["Recent candles could not be read for T1: HTTP 404 Not Found "
+                        "(live then historical endpoint)"]
+
+    def test_a_failure_on_a_later_page_names_the_request(self, monkeypatch, caplog):
+        close = self.OPEN + 400 * 86_400
+        endpoints = _TwoCandleEndpoints(self.OPEN, close, holds={"live"}, fail_status=400)
+        # The live endpoint holds the market, but its second page is refused
+        endpoints.archive.fail_on_call = {2: 1}
+        endpoints.archive.fail_status = 400
+        with caplog.at_level(logging.WARNING):
+            assert self._recent(monkeypatch, endpoints, end_ts=close) is None
+        assert ("Recent candles could not be read for T1: HTTP 400 Injected "
+                "(request 2 of 2) (live endpoint)") in caplog.text
+
+    def test_no_candles_in_the_window_is_an_empty_list(self, monkeypatch):
+        endpoint = MagicMock(return_value=_raw_resp({"candlesticks": []}))
+        assert self._recent(monkeypatch, endpoint) == []
+
+    @pytest.mark.parametrize("end", [None, "1700003600", True, 1_700_003_600.0, [1]])
+    def test_a_candle_with_no_integer_end_time_gives_none(self, monkeypatch, caplog, end):
+        # The shared parser copies the end time as sent, and bid_before would
+        # raise comparing a null with a moment; the reply is not used at all
+        payload = {"candlesticks": [
+            {"end_period_ts": self.OPEN + _HOUR, "volume_fp": "0.00",
+             "yes_ask": {"close_dollars": "0.2000"}, "yes_bid": {"close_dollars": "0.1200"}},
+            {"end_period_ts": end, "volume_fp": "0.00",
+             "yes_ask": {"close_dollars": "0.3000"}, "yes_bid": {"close_dollars": "0.2200"}},
+        ]}
+        endpoint = MagicMock(return_value=_raw_resp(payload))
+        with caplog.at_level(logging.WARNING):
+            assert self._recent(monkeypatch, endpoint) is None
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert msgs == ["Recent candles could not be read for T1: 1 of 2 candles have an "
+                        "end time that is not an integer number of seconds"]
+
+    def test_a_long_window_is_paged(self, monkeypatch):
+        close = self.OPEN + 400 * 86_400
+        endpoints = _TwoCandleEndpoints(self.OPEN, close, holds={"live"})
+        out = self._recent(monkeypatch, endpoints, end_ts=close)
+        assert [name for name, *_ in endpoints.calls] == ["live", "live"]
+        assert [c["ts"] for c in out] == endpoints.archive.served(self.OPEN, close)
+
+    def test_without_a_series_only_the_archive_is_asked(self, monkeypatch):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds={"historical"})
+        out = self._recent(monkeypatch, endpoints, event_ticker=None)
+        assert [name for name, *_ in endpoints.calls] == ["historical"]
+        assert len(out) == len(endpoints.archive.served(self.OPEN, self.CLOSE))
+
+    def test_each_request_pauses_for_the_configured_time(self, monkeypatch):
+        sleeps: list = []
+        monkeypatch.setattr(historical.time, "sleep", sleeps.append)
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds={"historical"})
+        self._recent(monkeypatch, endpoints)
+        # The failed live request, then the archive's one request
+        assert sleeps == [historical.RECENT_CANDLES_RATE_LIMIT_SLEEP_SECONDS] * 2
+        assert historical.RECENT_CANDLES_RATE_LIMIT_SLEEP_SECONDS == 0.05
+
+
 class TestCandleRequestWindows:
     """historical._candle_request_windows: one request unless the window is
     longer than the endpoint serves, then overlapping requests within the cap."""

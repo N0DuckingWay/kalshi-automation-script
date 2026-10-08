@@ -27,6 +27,7 @@ Dependencies:
     EVENT_TITLE_LISTING_MAX_BARREN_PAGES, MVE_SERIES_FAMILY_PREFIX,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     CANDLESTICK_MAX_CANDLES_PER_REQUEST, CANDLE_NO_ASK_CEILING,
+    RECENT_CANDLES_RATE_LIMIT_SLEEP_SECONDS,
     INCLUDE_MVE_MARKETS, PROD_URL, PRICE_EPSILON) from config.py. Exports
     build_historical_client() and build_prod_live_client(), both called by
     backtest.py (NOT backtester.py, which never builds its own clients); and
@@ -47,7 +48,9 @@ Dependencies:
     _usable_ask, in _leg_quotes); candle_sale_bids, which backtester.py
     records its sale bids with; and bid_before, which reads one side's bid at
     one moment the same way, for live selling's checks on the days before a
-    sale.
+    sale; and recent_candles, which fetches a held market's last few days of
+    candles for those checks, parsed as fetch_candlesticks parses them but
+    never read from or written to the candle cache.
 
 Notes:
     Historical market data only exists on the production API — the sandbox does
@@ -181,6 +184,7 @@ from .config import (
     PRICE_EPSILON,
     PROD_URL,
     PROJECT_ROOT,
+    RECENT_CANDLES_RATE_LIMIT_SLEEP_SECONDS,
     SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS,
     SETTLED_FETCH_CHUNK_RECORDS,
     SETTLED_FETCH_MAX_WORKERS,
@@ -5882,6 +5886,60 @@ def _fetch_candle_pages(client: Any, path: str, windows: list[tuple[int, int]],
     return candles, raw_count, dropped
 
 
+def _fetch_candles_from_endpoints(client: Any, endpoints: list[tuple[str, str]],
+                                  windows: list[tuple[int, int]], rate_limit_sleep: float,
+                                  progress: dict, tried: list[str]
+                                  ) -> tuple[list[dict], int, int]:
+    """
+    Fetch one market's candle window from the first endpoint that holds it.
+
+    The endpoints are asked in order (_candle_endpoints). A 404 means that
+    endpoint does not hold the market (the archive cutoff sits on the other
+    side of its settlement), so the next one is asked for the whole window;
+    any other failure, or a 404 from the last endpoint, is final. Each
+    endpoint's window is all-or-nothing (_fetch_candle_pages), so pages one
+    endpoint did serve are never joined to another's. fetch_candlesticks
+    (the backtest, cached) and recent_candles (live selling, never cached)
+    both fetch through it.
+
+    Args:
+        client (Any): Authenticated KalshiClient.
+        endpoints (list[tuple[str, str]]): (name, path) pairs to ask, first
+            to ask first (_candle_endpoints).
+        windows (list[tuple[int, int]]): The window's requests (_candle_request_windows).
+        rate_limit_sleep (float): Seconds to sleep after each request; a
+            failed request that moves on to the next endpoint sleeps once too.
+        progress (dict): Passed to _fetch_candle_pages, which keeps the
+            1-based number of the request in flight under "request".
+        tried (list[str]): Each endpoint's name is appended as it is asked,
+            for the caller's failure line.
+
+    Returns:
+        tuple[list[dict], int, int]: _fetch_candle_pages' result from the
+            endpoint that served the window.
+
+    Raises:
+        Exception: What the failed request raised: a failure other than a
+            404, or the last endpoint's 404 (an ApiException carries
+            .status).
+        ValueError: When there is no endpoint to ask.
+    """
+    for attempt, (name, path) in enumerate(endpoints):
+        tried.append(name)
+        try:
+            return _fetch_candle_pages(client, path, windows, rate_limit_sleep, progress)
+        except Exception as e:
+            # A 404 means this endpoint does not hold the market (the
+            # archive cutoff sits on the other side of its settlement);
+            # the other endpoint may. Anything else, or a 404 from the
+            # last endpoint, is final.
+            if getattr(e, "status", None) != 404 or attempt + 1 == len(endpoints):
+                raise
+            # The failed request took no sleep of its own
+            time.sleep(rate_limit_sleep)
+    raise ValueError("no candlestick endpoint to ask")
+
+
 def fetch_candlesticks(
     hist_client: Any,
     ticker: str,
@@ -6021,21 +6079,9 @@ def fetch_candlesticks(
     # The endpoints asked so far, named in the failure line when there were two
     tried: list[str] = []
     try:
-        for attempt, (name, path) in enumerate(endpoints):
-            tried.append(name)
-            try:
-                candles, raw_count, dropped = _fetch_candle_pages(
-                    hist_client, path, windows, rate_limit_sleep, progress)
-                break
-            except Exception as e:
-                # A 404 means this endpoint does not hold the market (the
-                # archive cutoff sits on the other side of its settlement);
-                # the other endpoint may. Anything else, or a 404 from the
-                # last endpoint, is final.
-                if getattr(e, "status", None) != 404 or attempt + 1 == len(endpoints):
-                    raise
-                # The failed request took no sleep of its own
-                time.sleep(rate_limit_sleep)
+        # The first endpoint that holds the market serves the whole window
+        candles, raw_count, dropped = _fetch_candles_from_endpoints(
+            hist_client, endpoints, windows, rate_limit_sleep, progress, tried)
         progress["request"] = 0
         if dropped:
             # The drop happens before the cache write, so a thinned series is
@@ -6079,6 +6125,80 @@ def fetch_candlesticks(
         # a paged window too: the requests that DID succeed are discarded
         # rather than cached as if they were the whole window.
         return []
+
+
+def recent_candles(client: Any, ticker: str, event_ticker: str, start_ts: int,
+                   end_ts: int) -> list[dict] | None:
+    """
+    Fetch one market's hourly candles over [start_ts, end_ts] for a live run, never cached.
+
+    Live selling checks a held position on the days before a sale from each
+    held market's recent candles (bid_before reads them). They are fetched
+    and parsed exactly as fetch_candlesticks fetches and parses them: the
+    live candlestick endpoint first (the market is still open, or settled
+    after the archive cutoff), then the archive on a 404
+    (_candle_endpoints, _fetch_candles_from_endpoints), with a window too
+    long for one request paged (_candle_request_windows), each request a
+    retried read-only GET, and each candle parsed by _fetch_candle_pages.
+    Unlike fetch_candlesticks it never reads or writes the candle cache: a
+    live run touches nothing under backtest_cache/, and its candles must be
+    the latest the exchange has.
+
+    Hourly candles are sparse: many hours of a quiet market have no candle
+    at all, so a gap is normal. A candle that cannot be parsed is left out,
+    with one WARNING naming the count, as fetch_candlesticks does.
+
+    Args:
+        client (Any): An authenticated KalshiClient for the production API.
+        ticker (str): The market's ticker.
+        event_ticker (str): Its event ticker; its series (series_ticker)
+            names the live endpoint's path.
+        start_ts (int): Unix seconds the window starts at.
+        end_ts (int): Unix seconds the window ends at.
+
+    Returns:
+        list[dict] | None: The candles ("ts", "yes_ask_close",
+            "no_ask_close", "volume"), as fetch_candlesticks returns them;
+            [] when the endpoint has none in the window. None, with one
+            WARNING line, when any request fails or a candle's end time is
+            not an integer number of seconds: the caller must then treat the
+            market's earlier days as unknown.
+    """
+    # The live endpoint's path names the market's series
+    series = series_ticker(event_ticker if isinstance(event_ticker, str) else "")
+    progress = {"request": 0}
+    tried: list[str] = []
+    windows: list[tuple[int, int]] = []
+    try:
+        # One request unless the window is longer than one request serves
+        windows = _candle_request_windows(start_ts, end_ts)
+        # Live first: a held market's candles are on the live endpoint
+        endpoints = _candle_endpoints(ticker, series, live_first=True)
+        candles, raw_count, dropped = _fetch_candles_from_endpoints(
+            client, endpoints, windows, RECENT_CANDLES_RATE_LIMIT_SLEEP_SECONDS,
+            progress, tried)
+    except Exception as e:
+        # One line, never the SDK's multi-line text with every header
+        where = (f" (request {progress['request']} of {len(windows)})"
+                 if len(windows) > 1 and progress["request"] else "")
+        via = f" ({' then '.join(tried)} endpoint)" if tried else ""
+        logging.warning("Recent candles could not be read for %s: HTTP %s %s%s%s",
+                        ticker, getattr(e, "status", "?"), _exception_summary(e), where, via)
+        return None
+    if dropped:
+        logging.warning("%s: dropped %d/%d malformed candles", ticker, dropped, raw_count)
+    # The shared parser copies each candle's end time as sent; bid_before
+    # compares it with a moment, so an end time that is not an integer
+    # number of seconds (null, a string) would raise there. Such a reply
+    # cannot place the market's earlier days, so it is not used at all.
+    unplaced = sum(1 for c in candles
+                   if not isinstance(c["ts"], int) or isinstance(c["ts"], bool))
+    if unplaced:
+        logging.warning("Recent candles could not be read for %s: %d of %d candles have "
+                        "an end time that is not an integer number of seconds",
+                        ticker, unplaced, len(candles))
+        return None
+    return candles
 
 
 # ─── What a sale would fetch, read from candles ───────────────────────────────

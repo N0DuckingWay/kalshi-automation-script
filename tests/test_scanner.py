@@ -7,7 +7,7 @@ import re
 import sys
 from dataclasses import replace as dc_replace
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -8212,6 +8212,388 @@ class TestResolveHeldLadders:
         assert resolve_held_ladders(client, [listed], {listed.ticker, "KXZZZ-1"},
                                     labels_out=labels) is None
         assert labels == {listed.ticker: market_ladder_keys(listed)}
+
+
+class TestMarketForLabels:
+    """market_for_labels finds a market whose ladder labels live selling
+    needs (a paid-out partner, say): from this run's list when it is there,
+    else through the one held-market lookup."""
+
+    def test_a_listed_market_needs_no_request(self):
+        listed = _star_rung(_RUNG_EARLY, "Mar 1, 2026")
+        client = MagicMock()
+        with patch.object(scanner, "_fetch_held_market") as lookup:
+            got = scanner.market_for_labels(client, listed.ticker, {listed.ticker: listed}, {})
+        assert got is listed
+        lookup.assert_not_called()
+        client.get_market_without_preload_content.assert_not_called()
+
+    def test_a_market_the_list_lacks_is_looked_up_once(self):
+        raw = _star_raw("KXSTAR-14-OCT16", "Oct 16, 2026")
+        client = _lookup_client({raw["ticker"]: raw})
+        titles: dict = {}
+        with patch.object(scanner, "_fetch_held_market",
+                          wraps=scanner._fetch_held_market) as lookup:
+            got = scanner.market_for_labels(client, raw["ticker"], {}, titles)
+        # Its failure lines would say "market": a paid-out partner is not held
+        lookup.assert_called_once_with(client, raw["ticker"], titles, noun="market")
+        assert got == _market_from_dict(raw, _STAR_TITLE)
+        # Its labels are its listed ladder-mate's: the same event and question
+        assert market_ladder_keys(got) == market_ladder_keys(
+            _star_rung(_RUNG_EARLY, "Mar 1, 2026"))
+        assert titles == {_STAR_EVENT: _STAR_TITLE}
+
+    def test_one_event_is_asked_about_once(self):
+        raws = {t: _star_raw(t, d) for t, d in
+                (("KXSTAR-14-OCT16", "Oct 16, 2026"), ("KXSTAR-14-NOV30", "Nov 30, 2026"))}
+        client = _lookup_client(raws)
+        titles: dict = {}
+        for ticker in raws:
+            assert scanner.market_for_labels(client, ticker, {}, titles) is not None
+        assert client.get_market_without_preload_content.call_count == 2
+        client.get_event_without_preload_content.assert_called_once()
+
+    def test_a_failed_lookup_gives_none(self, caplog):
+        client = MagicMock()
+        client.get_market_without_preload_content.return_value = _error_reply(404, "Not Found")
+        with caplog.at_level(logging.WARNING):
+            assert scanner.market_for_labels(client, "KXGONE-1", {}, {}) is None
+        assert "Could not look up market KXGONE-1: " in caplog.text
+        assert "HTTP 404 Not Found" in caplog.text
+        assert "HEADER-DUMP" not in caplog.text
+        # A market looked up for its labels is not called held
+        assert "held market" not in caplog.text
+
+    @pytest.mark.parametrize("reply", [{"no": "market"}, {"market": {"ticker": "KXGONE-1"}}])
+    def test_every_failure_line_calls_it_a_market(self, reply, caplog):
+        client = MagicMock()
+        client.get_market_without_preload_content.return_value = _json_reply(reply)
+        with caplog.at_level(logging.WARNING):
+            assert scanner.market_for_labels(client, "KXGONE-1", {}, {}) is None
+        assert "Could not look up market KXGONE-1: " in caplog.text
+        assert "held market" not in caplog.text
+
+    @pytest.mark.parametrize("ticker", ["", None, 5, ["KX-A"]])
+    def test_a_ticker_that_names_no_market_gives_none_without_a_request(self, ticker):
+        client = MagicMock()
+        assert scanner.market_for_labels(client, ticker, {}, {}) is None
+        client.get_market_without_preload_content.assert_not_called()
+
+
+# Five settlements as the live reply sent them (GET /portfolio/settlements, read
+# 2026-10-08): newer fixed-point spellings, with revenue still in cents
+_LIVE_SETTLEMENTS = [
+    {"event_ticker": "KXKENNEDYREOPEN-28", "exchange_index": 0, "fee_cost": "0.030500",
+     "market_result": "no", "no_count_fp": "0.00", "no_total_cost_dollars": "0.000000",
+     "revenue": 0, "settled_time": "2026-10-08T04:35:27.118276Z",
+     "ticker": "KXKENNEDYREOPEN-28-26OCT08", "value": 0, "yes_count_fp": "8.00",
+     "yes_total_cost_dollars": "0.460000"},
+    {"event_ticker": "KXTRUMPSAY-26OCT05", "exchange_index": 0, "fee_cost": "0.002800",
+     "market_result": "no", "no_count_fp": "0.00", "no_total_cost_dollars": "0.000000",
+     "revenue": 0, "settled_time": "2026-10-05T15:35:07.171663Z",
+     "ticker": "KXTRUMPSAY-26OCT05-AUTO", "value": 0, "yes_count_fp": "4.00",
+     "yes_total_cost_dollars": "0.040000"},
+    {"event_ticker": "KXTRUMPAICZARWHEN-26", "exchange_index": 0, "fee_cost": "0.293700",
+     "market_result": "yes", "no_count_fp": "23.00", "no_total_cost_dollars": "5.520000",
+     "revenue": 0, "settled_time": "2026-10-04T18:14:17.116567Z",
+     "ticker": "KXTRUMPAICZARWHEN-26-26OCT30", "value": 100, "yes_count_fp": "0.00",
+     "yes_total_cost_dollars": "0.000000"},
+    {"event_ticker": "KXNFLTOTAL-26OCT04INDWAS", "exchange_index": 0, "fee_cost": "0.000400",
+     "market_result": "no", "no_count_fp": "0.01", "no_total_cost_dollars": "0.004200",
+     "revenue": 0, "settled_time": "2026-10-04T16:45:27.12044Z",
+     "ticker": "KXNFLTOTAL-26OCT04INDWAS-45", "value": 0, "yes_count_fp": "0.01",
+     "yes_total_cost_dollars": "0.005900"},
+    {"event_ticker": "KXTRUMPAICZARWHEN-26", "exchange_index": 0, "fee_cost": "0.331500",
+     "market_result": "no", "no_count_fp": "0.00", "no_total_cost_dollars": "0.000000",
+     "revenue": 0, "settled_time": "2026-10-02T14:45:33.963447Z",
+     "ticker": "KXTRUMPAICZARWHEN-26-26OCT02", "value": 0, "yes_count_fp": "23.00",
+     "yes_total_cost_dollars": "6.670000"},
+]
+
+# One settlement in the older spellings the pinned SDK documents: integer
+# counts, costs and revenue in CENTS, fee_cost a dollar string
+_LEGACY_SETTLEMENT = {
+    "ticker": "KXOLD-26JAN-B1", "event_ticker": "KXOLD-26JAN", "market_result": "yes",
+    "yes_count": 10, "yes_total_cost": 460, "no_count": 0, "no_total_cost": 0,
+    "revenue": 1000, "fee_cost": "0.120000", "settled_time": "2026-01-02T03:04:05Z",
+    "value": 100,
+}
+
+
+def _settlements_page(rows, cursor=None) -> SimpleNamespace:
+    """Raw-response stand-in for one /portfolio/settlements page holding `rows`."""
+    return _json_reply({"settlements": rows, "cursor": cursor})
+
+
+def _settlements_client(*pages) -> MagicMock:
+    """A client whose settlements listing serves `pages` in order."""
+    client = MagicMock()
+    client.get_settlements_without_preload_content = MagicMock(side_effect=list(pages))
+    return client
+
+
+class TestGetSettlements:
+    """get_settlements reads every market the account held when it paid out.
+    Live selling values a held market's paid-out partner from it, so it reads
+    both spellings Kalshi has sent, turns cents into dollars exactly, and gives
+    None (never a partial list) when a page cannot be read or the list is cut
+    short."""
+
+    def test_the_live_shape_is_read(self, caplog):
+        client = _settlements_client(_settlements_page(_LIVE_SETTLEMENTS, cursor=""))
+        with caplog.at_level(logging.INFO):
+            got = scanner.get_settlements(client)
+        assert got[0] == scanner.Settlement(
+            "KXKENNEDYREOPEN-28-26OCT08", "KXKENNEDYREOPEN-28", "no", 8.0, 0.0, 0.46, 0.0,
+            0.0305, 0.0, datetime(2026, 10, 8, 4, 35, 27, 118276, tzinfo=UTC))
+        assert got[2] == scanner.Settlement(
+            "KXTRUMPAICZARWHEN-26-26OCT30", "KXTRUMPAICZARWHEN-26", "yes", 0.0, 23.0, 0.0,
+            5.52, 0.2937, 0.0, datetime(2026, 10, 4, 18, 14, 17, 116567, tzinfo=UTC))
+        # A five-digit fraction of a second reads too
+        assert got[3].settled_at == datetime(2026, 10, 4, 16, 45, 27, 120440, tzinfo=UTC)
+        assert (got[3].yes_count, got[3].yes_cost_dollars) == (0.01, 0.0059)
+        assert [s.ticker for s in got] == [r["ticker"] for r in _LIVE_SETTLEMENTS]
+        # One page of the endpoint's largest size
+        client.get_settlements_without_preload_content.assert_called_once_with(
+            limit=config.SETTLEMENT_PAGE_SIZE)
+        assert config.SETTLEMENT_PAGE_SIZE == 200
+        assert "Settlements read: 5 (0 unreadable)" in caplog.text
+        # Silent at zero
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_the_legacy_sdk_shape_is_read_in_dollars(self):
+        got = scanner.get_settlements(_settlements_client(_settlements_page([_LEGACY_SETTLEMENT])))
+        assert got == [scanner.Settlement(
+            "KXOLD-26JAN-B1", "KXOLD-26JAN", "yes", 10.0, 0.0, 4.6, 0.0, 0.12, 10.0,
+            datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC))]
+
+    @pytest.mark.parametrize("cents, dollars", [
+        (46, 0.46), (1, 0.01), (7, 0.07), (29, 0.29), (12345, 123.45), (0, 0.0),
+    ])
+    def test_cents_become_dollars_exactly(self, cents, dollars):
+        row = dict(_LEGACY_SETTLEMENT, yes_total_cost=cents, revenue=cents)
+        [got] = scanner.get_settlements(_settlements_client(_settlements_page([row])))
+        assert got.yes_cost_dollars == dollars
+        assert got.revenue_dollars == dollars
+
+    @pytest.mark.parametrize("field", ["yes_total_cost", "no_total_cost", "revenue"])
+    @pytest.mark.parametrize("value", ["46", 46.0, "23.000000", 0.46, "1e1000002",
+                                       "1e999999999999999999", -1])
+    def test_an_older_cents_field_must_be_a_whole_number(self, field, value, caplog):
+        # A string or a decimal-point number under an older cents name may be a
+        # dollar amount; read as cents it would be 100 times too small
+        row = dict(_LEGACY_SETTLEMENT, **{field: value})
+        client = _settlements_client(_settlements_page([_LEGACY_SETTLEMENT, row]))
+        with caplog.at_level(logging.INFO):
+            got = scanner.get_settlements(client)
+        assert [s.ticker for s in got] == ["KXOLD-26JAN-B1"]
+        assert "Settlements read: 1 (1 unreadable)" in caplog.text
+
+    def test_a_value_beyond_the_decimal_context_is_counted_not_raised(self, caplog):
+        # Turning cents into dollars is Decimal arithmetic; a value beyond the
+        # context's limits leaves the record out rather than ending the run
+        row = dict(_LEGACY_SETTLEMENT, ticker="KXBIG-1", revenue=10 ** 6)
+        client = _settlements_client(_settlements_page([_LIVE_SETTLEMENTS[0], row]))
+        with localcontext() as ctx, caplog.at_level(logging.INFO):
+            ctx.Emax = 3
+            got = scanner.get_settlements(client)
+        assert [s.ticker for s in got] == ["KXKENNEDYREOPEN-28-26OCT08"]
+        assert "Settlements read: 1 (1 unreadable)" in caplog.text
+
+    def test_a_mixed_page_reads_each_record_by_its_own_spelling(self):
+        both = dict(_LIVE_SETTLEMENTS[0], ticker="KXBOTH-1",
+                    # The newer field wins whenever it is present
+                    yes_count=3, yes_total_cost=999, revenue_dollars="1.00", revenue=0)
+        got = scanner.get_settlements(_settlements_client(
+            _settlements_page([_LIVE_SETTLEMENTS[0], _LEGACY_SETTLEMENT, both])))
+        assert [s.ticker for s in got] == ["KXKENNEDYREOPEN-28-26OCT08", "KXOLD-26JAN-B1",
+                                           "KXBOTH-1"]
+        assert got[1].yes_cost_dollars == 4.6
+        assert (got[2].yes_count, got[2].yes_cost_dollars, got[2].revenue_dollars) == (
+            8.0, 0.46, 1.0)
+
+    def test_presence_decides_never_truthiness(self):
+        # A newer field of zero is a real zero, not a reason to read the older one
+        row = dict(_LIVE_SETTLEMENTS[0], revenue_dollars="0", revenue=500,
+                   yes_count_fp="0", yes_count=9)
+        [got] = scanner.get_settlements(_settlements_client(_settlements_page([row])))
+        assert (got.revenue_dollars, got.yes_count) == (0.0, 0.0)
+
+    @pytest.mark.parametrize("field", ["yes_count_fp", "no_total_cost_dollars",
+                                       "revenue_dollars"])
+    def test_an_unreadable_newer_field_never_falls_back(self, field):
+        row = dict(_LEGACY_SETTLEMENT, **{field: None})
+        assert scanner.get_settlements(_settlements_client(_settlements_page([row]))) == []
+
+    def test_two_pages_follow_the_cursor(self):
+        client = _settlements_client(
+            _settlements_page(_LIVE_SETTLEMENTS[:2], cursor="C1"),
+            _settlements_page(_LIVE_SETTLEMENTS[2:], cursor=""))
+        got = scanner.get_settlements(client)
+        assert [s.ticker for s in got] == [r["ticker"] for r in _LIVE_SETTLEMENTS]
+        assert [c.kwargs for c in client.get_settlements_without_preload_content.call_args_list] == [
+            {"limit": 200}, {"limit": 200, "cursor": "C1"}]
+
+    @pytest.mark.parametrize("cursors", [["C1", "C1"], ["C1", "C2", "C1"]])
+    def test_a_repeated_cursor_stops_and_gives_none(self, cursors, caplog):
+        client = _settlements_client(*[_settlements_page(_LIVE_SETTLEMENTS[:1], cursor=c)
+                                       for c in cursors])
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_settlements(client) is None
+        assert client.get_settlements_without_preload_content.call_count == len(cursors)
+        assert "cursor did not advance" in caplog.text
+        assert "Settlements read" not in caplog.text
+
+    def test_the_page_cap_gives_none(self, monkeypatch, caplog):
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 2)
+        client = _settlements_client(_settlements_page(_LIVE_SETTLEMENTS[:1], cursor="C1"),
+                                     _settlements_page(_LIVE_SETTLEMENTS[1:2], cursor="C2"))
+        with caplog.at_level(logging.WARNING):
+            assert scanner.get_settlements(client) is None
+        assert "SCANNER_MAX_PAGES (2)" in caplog.text
+
+    def test_a_list_that_ends_on_the_last_allowed_page_is_complete(self, monkeypatch):
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 2)
+        client = _settlements_client(_settlements_page(_LIVE_SETTLEMENTS[:1], cursor="C1"),
+                                     _settlements_page(_LIVE_SETTLEMENTS[1:2], cursor=None))
+        assert len(scanner.get_settlements(client)) == 2
+
+    @pytest.mark.parametrize("change", [
+        {"ticker": None}, {"ticker": ""}, {"ticker": 5}, {"event_ticker": None},
+        {"market_result": None}, {"market_result": ""},
+        {"yes_count_fp": "abc"}, {"yes_count_fp": "-1"}, {"yes_count_fp": "nan"},
+        {"no_count_fp": "inf"}, {"yes_total_cost_dollars": "-0.01"},
+        {"no_total_cost_dollars": [1]}, {"fee_cost": None}, {"fee_cost": "x"},
+        {"revenue": "1e400"}, {"revenue": None}, {"revenue": "1e1000002"},
+        {"revenue": "23.000000"}, {"revenue": 0.5}, {"settled_time": None},
+        {"settled_time": "garbage"}, {"settled_time": "2026-10-08T04:35:27"},
+        {"settled_time": "2026-10-08"}, {"settled_time": 1791424800},
+        # A JSON true or false is never a number
+        {"yes_count_fp": True}, {"no_total_cost_dollars": False}, {"revenue": False},
+        {"fee_cost": True},
+    ])
+    def test_an_unreadable_record_is_left_out_and_counted(self, change, caplog):
+        bad = dict(_LIVE_SETTLEMENTS[1], **change)
+        client = _settlements_client(_settlements_page([_LIVE_SETTLEMENTS[0], bad]))
+        with caplog.at_level(logging.INFO):
+            got = scanner.get_settlements(client)
+        assert [s.ticker for s in got] == ["KXKENNEDYREOPEN-28-26OCT08"]
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and "left out 1 record(s)" in warnings[0]
+        assert "Settlements read: 1 (1 unreadable)" in caplog.text
+
+    @pytest.mark.parametrize("field", ["ticker", "yes_count_fp", "fee_cost", "revenue",
+                                       "settled_time", "market_result"])
+    def test_a_missing_field_is_unreadable(self, field):
+        row = {k: v for k, v in _LIVE_SETTLEMENTS[0].items() if k != field}
+        assert scanner.get_settlements(_settlements_client(_settlements_page([row]))) == []
+
+    @pytest.mark.parametrize("record", ["x", None, [], 5])
+    def test_a_record_that_is_not_an_object_is_counted(self, record, caplog):
+        client = _settlements_client(_settlements_page([record]))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_settlements(client) == []
+        assert "Settlements read: 0 (1 unreadable)" in caplog.text
+
+    def test_unreadable_out_counts_the_records_left_out(self, caplog):
+        # Two settlements that could each be the partner of one held market;
+        # the second has no UTC offset, so it is left out. The count tells a
+        # caller that needs exactly one partner that the list may hide one.
+        first = _LIVE_SETTLEMENTS[4]
+        second = dict(first, ticker="KXTRUMPAICZARWHEN-26-26OCT09",
+                      settled_time="2026-10-09T14:45:33")
+        out = {"unreadable": 7}
+        got = scanner.get_settlements(_settlements_client(_settlements_page([first, second])),
+                                      unreadable_out=out)
+        assert [s.ticker for s in got] == [first["ticker"]]
+        assert out == {"unreadable": 1}
+
+    def test_unreadable_out_is_zero_on_a_clean_read(self):
+        out: dict = {}
+        got = scanner.get_settlements(
+            _settlements_client(_settlements_page(_LIVE_SETTLEMENTS)), unreadable_out=out)
+        assert len(got) == 5 and out == {"unreadable": 0}
+
+    def test_unreadable_out_is_set_before_a_failed_call(self):
+        out = {"unreadable": 7}
+        client = _settlements_client(
+            _settlements_page([_LIVE_SETTLEMENTS[0], "x"], cursor="C1"),
+            _error_reply(400, "Bad Request"))
+        assert scanner.get_settlements(client, unreadable_out=out) is None
+        # The key is there, but a call that gives None leaves nothing to use
+        assert "unreadable" in out
+
+    def test_a_legacy_bool_is_refused(self):
+        row = dict(_LEGACY_SETTLEMENT, yes_count=True)
+        assert scanner.get_settlements(_settlements_client(_settlements_page([row]))) == []
+
+    def test_a_time_with_an_offset_is_read_in_utc(self):
+        row = dict(_LIVE_SETTLEMENTS[0], settled_time="2026-10-07T21:35:27-07:00")
+        [got] = scanner.get_settlements(_settlements_client(_settlements_page([row])))
+        assert got.settled_at == datetime(2026, 10, 8, 4, 35, 27, tzinfo=UTC)
+        assert got.settled_at.tzinfo is UTC
+
+    def test_a_failed_page_gives_none_in_one_line(self, caplog):
+        client = MagicMock()
+        client.get_settlements_without_preload_content.return_value = _error_reply(
+            404, "Not Found")
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_settlements(client) is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "Could not read the account's settlements (page 1): HTTP 404 Not Found" in (
+            warnings[0])
+        assert "\n" not in warnings[0] and "HEADER-DUMP" not in caplog.text
+        assert "Settlements read" not in caplog.text
+
+    def test_a_later_page_that_fails_gives_none_not_a_partial_list(self, caplog):
+        client = _settlements_client(_settlements_page(_LIVE_SETTLEMENTS[:2], cursor="C1"),
+                                     _error_reply(400, "Bad Request"))
+        with caplog.at_level(logging.WARNING):
+            assert scanner.get_settlements(client) is None
+        assert "(page 2): HTTP 400 Bad Request" in caplog.text
+
+    def test_a_connection_failure_is_retried_then_gives_none(self, caplog):
+        client = MagicMock()
+        client.get_settlements_without_preload_content.side_effect = ProtocolError(
+            "Connection broken: IncompleteRead(0 bytes read)")
+        with patch.object(_http.time, "sleep"), caplog.at_level(logging.WARNING):
+            assert scanner.get_settlements(client) is None
+        # Retried like every read-only GET
+        assert client.get_settlements_without_preload_content.call_count > 1
+        assert ("ProtocolError: Connection broken: IncompleteRead(0 bytes read)"
+                in caplog.text)
+
+    def test_a_rate_limited_page_is_retried(self):
+        client = _settlements_client(_error_reply(429, "Too Many Requests"),
+                                     _settlements_page(_LIVE_SETTLEMENTS[:1]))
+        with patch.object(_http.time, "sleep"):
+            got = scanner.get_settlements(client)
+        assert [s.ticker for s in got] == ["KXKENNEDYREOPEN-28-26OCT08"]
+
+    @pytest.mark.parametrize("body", [
+        [], "ok", None, {"settlements": {}}, {"settlements": "x"},
+        {"settlements": [], "cursor": 5}, {"settlements": [], "cursor": ["C1"]},
+        # No "settlements" key at all: a renamed key, not an account with none
+        {}, {"cursor": ""}, {"Settlements": [], "cursor": ""},
+    ])
+    def test_a_page_that_is_not_a_list_of_settlements_gives_none(self, body, caplog):
+        client = MagicMock()
+        client.get_settlements_without_preload_content.return_value = _json_reply(body)
+        with caplog.at_level(logging.WARNING):
+            assert scanner.get_settlements(client) is None
+        assert "Could not read the account's settlements" in caplog.text
+
+    @pytest.mark.parametrize("body", [
+        {"settlements": [], "cursor": ""}, {"settlements": None, "cursor": None},
+        {"settlements": []},
+    ])
+    def test_no_settlements_is_an_empty_list(self, body, caplog):
+        client = MagicMock()
+        client.get_settlements_without_preload_content.return_value = _json_reply(body)
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_settlements(client) == []
+        assert "Settlements read: 0 (0 unreadable)" in caplog.text
 
 
 _RUNG_EARLY = "KXSTAR-14-MAR01"
