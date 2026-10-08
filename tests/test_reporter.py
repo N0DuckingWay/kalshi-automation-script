@@ -26,7 +26,7 @@ from unittest.mock import MagicMock
 import openpyxl
 import pytest
 
-from kalshi_betting import config, reporter
+from kalshi_betting import config, reporter, seller
 from kalshi_betting.reporter import TradeResult
 from kalshi_betting.scanner import ApiMarket, CandidatePair, HeldPair, leg_prices, leg_sides
 from kalshi_betting.strategy import TradeSpec
@@ -680,6 +680,180 @@ class TestReportTrades:
         assert errors == ["Could not describe a pair for the run result: cannot read spec"]
 
 
+def _sale_market(ticker: str, day: int) -> ApiMarket:
+    """A held market of the sold position, closing on November `day`, 2026."""
+    return ApiMarket(ticker=ticker, event_ticker=f"EV-{ticker}",
+                     title=f"Will S happen by November {day}, 2026?", subtitle="",
+                     status="active", close_time=datetime(2026, 11, day, tzinfo=UTC))
+
+
+def make_sale(status: str = "sold", *, sold: dict | None = None, error: str | None = None,
+              lone: bool = False, days_left: int | None = 9) -> reporter.SaleResult:
+    """
+    Build a sale of a held position as trader.sell_positions returns it.
+
+    The position holds 30 YES on SELL-A (sold at an average bid of 0.55) and
+    30 NO on SELL-B (0.42), costing $18.80 in all. Selling both returns
+    16.50 - 0.52 + 12.60 - 0.52 = $28.06 after the fees, so it realizes
+    $9.26 of its $11.20 potential profit. With lone=True, SELL-B is a
+    paid-out partner instead (it paid $0), and only SELL-A is sold.
+
+    Args:
+        status (str): The sale's status.
+        sold (dict | None): Keyword-only. Contracts sold per held ticker;
+            None for 30 on each held market.
+        error (str | None): Keyword-only. The sale's error.
+        lone (bool): Keyword-only. True for a lone held market with a paid-out partner.
+        days_left (int | None): Keyword-only. Days left before its last market stops trading.
+
+    Returns:
+        reporter.SaleResult: The sale.
+    """
+    a = seller.SaleLeg("SELL-A", "EV-SELL-A", "yes", 30, 6.30, market=_sale_market("SELL-A", 1))
+    if lone:
+        b = seller.SaleLeg("SELL-B", "EV-SELL-B", "no", 30, 12.50, payout_dollars=0.0,
+                           paid_at=datetime(2026, 10, 1, tzinfo=UTC))
+        walked = {"SELL-A": (0.55, 0.55)}
+        proceeds, realized = 15.98, 15.98 - 18.80
+    else:
+        b = seller.SaleLeg("SELL-B", "EV-SELL-B", "no", 30, 12.50,
+                           market=_sale_market("SELL-B", 6))
+        walked = {"SELL-A": (0.55, 0.55), "SELL-B": (0.42, 0.42)}
+        proceeds, realized = 28.06, 28.06 - 18.80
+    plan = seller.SalePlan(
+        title="Will S happen by November 1, 2026?", legs=(a, b), count=30, cost_dollars=18.80,
+        ladders={t: [[w[0], 100.0]] for t, w in walked.items()}, walked=walked,
+        proceeds_dollars=proceeds, profits=((realized, 11.20),) * 3, days_left=days_left,
+        level=0.80)
+    held = [leg.ticker for leg in (a, b) if leg.market is not None]
+    return reporter.SaleResult(plan=plan, status=status,
+                               sold=dict.fromkeys(held, 30) if sold is None else sold,
+                               error=error)
+
+
+class TestSaleRows:
+    """A sale's row in the trade log, under the trade columns: the position's
+    markets, the bids it was priced at, the contracts sold, its cost and the
+    profit it realizes, a plain status word and a "[sale: ...]" Notes prefix."""
+
+    def test_a_sold_pair(self):
+        row = reporter._sale_to_row(make_sale(), datetime(2026, 10, 8, 16, 0, tzinfo=UTC))
+        assert row == [
+            "2026-10-08", "16:00:00",
+            "Will S happen by November 1, 2026?", "SELL-A",
+            "Will S happen by November 6, 2026?", "SELL-B",
+            "2026-11-01", "2026-11-06", 0.55, 0.42, "", 30, 30,
+            18.8, 9.26, round(9.26 / 18.80, 4), "sold",
+            "[sale: YES A / NO B, 83% of potential profit (level 80%), 9 days left, "
+            "fees=$1.04] ",
+        ]
+        assert len(row) == len(reporter._TRADE_COLUMNS)
+
+    def test_a_lone_market_names_its_paid_out_partner(self):
+        row = reporter._sale_to_row(make_sale(lone=True, days_left=1),
+                                    datetime(2026, 10, 8, 16, 0, tzinfo=UTC))
+        assert row[2:13] == ["Will S happen by November 1, 2026?", "SELL-A", "(paid out)",
+                             "SELL-B", "2026-11-01", "", 0.55, "", "", 30, ""]
+        assert row[17] == ("[sale: YES A / NO B, -25% of potential profit (level 80%), "
+                           "1 day left, fees=$0.52] ")
+
+    @pytest.mark.parametrize("status, word", [
+        ("sold", "sold"), ("partly_sold", "partly sold"), ("not_sold", "not sold"),
+        ("unbalanced", "unbalanced"), ("manual_review", "check"), ("simulated", "simulated")])
+    def test_each_status_has_a_plain_word(self, status, word):
+        row = reporter._sale_to_row(make_sale(status), datetime(2026, 10, 8, tzinfo=UTC))
+        assert row[_STATUS_COL_INDEX] == word
+
+    @pytest.mark.parametrize("status, shown", [
+        ("sold", True), ("simulated", True), ("partly_sold", False), ("not_sold", False),
+        ("unbalanced", False), ("manual_review", False)])
+    def test_the_profit_is_shown_only_when_the_whole_position_sold(self, status, shown):
+        # The profit and its ratio are the plan's figures: what selling all of
+        # it at those bids realizes, so a sale that sold less leaves them blank
+        row = reporter._sale_to_row(make_sale(status), datetime(2026, 10, 8, tzinfo=UTC))
+        assert row[13] == 18.8
+        assert row[14:16] == ([9.26, round(9.26 / 18.80, 4)] if shown else ["", ""])
+
+    def test_an_unknown_count_and_the_error_are_shown(self):
+        sale = make_sale("manual_review", sold={"SELL-B": 0}, days_left=None,
+                         error="could not tell how many sold")
+        row = reporter._sale_to_row(sale, datetime(2026, 10, 8, tzinfo=UTC))
+        assert row[11:13] == ["", 0]
+        assert row[17].endswith("days left unknown, fees=$1.04] could not tell how many sold")
+
+    def test_sales_go_in_the_log_under_their_own_banner(self, reporter_paths):
+        log_path, _ = reporter_paths
+        reporter.append_to_prod_log([], 100.0, 128.06, run_note="settings: x",
+                                    sales=[make_sale(), make_sale("unbalanced")])
+        reporter.append_to_prod_log([make_result("1")], 128.06, 120.0)
+        banners = _separator_rows(log_path)
+        assert banners[0].endswith("after: $128.06  |  0 trade(s), 2 sale(s)  |  settings: x")
+        assert banners[1].endswith("1 trade(s)")
+        ws = openpyxl.load_workbook(log_path).active
+        rows = [r for r in ws.iter_rows(min_row=2) if r[_STATUS_COL_INDEX].value]
+        assert [r[_STATUS_COL_INDEX].value for r in rows] == ["sold", "unbalanced", "executed"]
+        # Sold like executed, an uneven pair as strong as a failed rollback
+        colours = [r[0].fill.fgColor.rgb[-6:] for r in rows]
+        assert colours == ["E2EFDA", "F4B7B4", "E2EFDA"]
+        assert ws.max_column == len(reporter._TRADE_COLUMNS)
+
+    def test_the_fallback_file_carries_the_sales(self, reporter_paths):
+        path = reporter._write_fallback_log([], 100.0, 128.06,
+                                            sales=[make_sale("manual_review")])
+        (banner,) = _separator_rows(path)
+        assert banner.endswith("0 trade(s), 1 sale(s)")
+        assert _count_data_rows(path) == 1
+
+
+class TestReportSales:
+    """report_sales describes each sale for the run result and never raises."""
+
+    def test_a_sale_is_recorded_with_its_figures(self):
+        [record] = reporter.report_sales([make_sale(sold={"SELL-A": 30, "SELL-B": 10},
+                                                    status="unbalanced", error="uneven")])
+        # Only part of it sold, so the plan's profit is not what it realized
+        assert record == reporter.SaleRecord(
+            title="Will S happen by November 1, 2026?", status="unbalanced", level=0.8,
+            days_left=9, cost=18.8, proceeds=28.06, profit=None, realized_percent=82.68,
+            legs=(reporter.SaleLegRecord("SELL-A", "yes", 30, 30, 0.55),
+                  reporter.SaleLegRecord("SELL-B", "no", 30, 10, 0.42)),
+            error="uneven")
+
+    @pytest.mark.parametrize("status", ["sold", "simulated"])
+    def test_a_whole_sale_records_its_profit(self, status):
+        [record] = reporter.report_sales([make_sale(status)])
+        assert record.profit == 9.26
+
+    def test_a_paid_out_partner_is_not_a_leg(self):
+        [record] = reporter.report_sales([make_sale(lone=True)])
+        assert [leg.ticker for leg in record.legs] == ["SELL-A"]
+
+    def test_a_sale_that_cannot_be_described_keeps_its_place(self, caplog):
+        broken = reporter.SaleResult(plan=SimpleNamespace(title="Broken"), status="not_sold",
+                                     sold={}, error="not sent")
+        with caplog.at_level(logging.ERROR):
+            records = reporter.report_sales([broken, object(), make_sale()])
+        assert records[0] == reporter.SaleRecord(
+            title="Broken", status="not_sold", level=None, days_left=None, cost=None,
+            proceeds=None, profit=None, realized_percent=None, legs=(), error="not sent")
+        assert records[1].status == "unknown" and records[1].title is None
+        assert records[2] == reporter.sale_record(make_sale())
+        assert len([r for r in caplog.records if r.levelno == logging.ERROR]) == 2
+
+    def test_the_run_result_carries_the_sales(self, tmp_path):
+        path = tmp_path / "result.json"
+        report = _run_report(sales=reporter.report_sales([make_sale()]),
+                             cash_after_sales=128.06)
+        reporter.write_run_report(path, report, 0)
+        record = _strict_json(path)
+        assert record["cash_after_sales"] == 128.06
+        [sale] = record["sales"]
+        assert sale["status"] == "sold" and sale["profit"] == 9.26
+        assert sale["legs"] == [
+            {"ticker": "SELL-A", "side": "yes", "held": 30, "sold": 30, "price": 0.55},
+            {"ticker": "SELL-B", "side": "no", "held": 30, "sold": 30, "price": 0.42}]
+
+
 class TestWriteRunReport:
     """write_run_report writes the whole record as strict JSON, replacing the
     file at once, and never raises: a failure is an ERROR and leaves no
@@ -698,6 +872,7 @@ class TestWriteRunReport:
             "portfolio_value_before": 180.25, "submission_started": False,
             "trades": [dataclasses.asdict(t) for t in report.trades],
             "warnings": report.warnings, "warnings_dropped": 0, "error": None,
+            "sales": [], "cash_after_sales": None,
         }
         assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", record["finished_at"])
         assert record["trades"][0]["a"]["ticker"] == "TICK-A-R"

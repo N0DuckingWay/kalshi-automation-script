@@ -103,7 +103,8 @@ Purpose:
     left is still an exact pair. A partial fill is a normal outcome for these
     orders, so their replies are read by _sale_fill_count, never by
     _v2_fill_status; an unclear reply is judged, as a buy leg's is, by how
-    the account's position moved. Nothing calls it yet.
+    the account's position moved. main._run_prod calls it before it buys
+    anything.
 
 Dependencies:
     Imports from config.py (the order, transfer and write-pacing settings,
@@ -4047,7 +4048,8 @@ def sell_positions(client: Any, plans: list, *, dry_run: bool) -> list[SaleResul
     stands disproven in this process (_V2_NO_MAPPING_DISPROVEN). Every outcome
     logs one line naming the position, what was sold on each market and the
     limit sent; for "manual_review" and "unbalanced" that line is a CRITICAL
-    saying what to check or do by hand. Nothing calls it yet.
+    saying what to check or do by hand. main._run_prod calls it before it
+    buys anything.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().

@@ -950,12 +950,15 @@ class TestIsolation:
                     assert alias.name.split(".")[0] in sys.stdlib_module_names, alias.name
         assert project == {"config", "scanner", "historical"}
 
-    def test_no_pipeline_or_backtest_module_imports_it_yet(self):
+    def test_main_alone_imports_it(self):
+        # The live run (main._run_prod) is its one user; no other pipeline,
+        # backtest or report module imports it
         import importlib
         import pkgutil
 
         import kalshi_betting
 
+        importers = set()
         for info in pkgutil.iter_modules(kalshi_betting.__path__):
             if info.name == "seller":
                 continue
@@ -967,7 +970,9 @@ class TestIsolation:
                     names = {a.name.split(".")[-1] for a in node.names}
                 else:
                     continue
-                assert "seller" not in names, info.name
+                if "seller" in names:
+                    importers.add(info.name)
+        assert importers == {"main"}
 
     def test_it_decides_and_prices_through_the_shared_rule(self):
         # The decision: config's one test at each check and at every check

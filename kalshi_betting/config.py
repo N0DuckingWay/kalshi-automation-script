@@ -478,8 +478,9 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 # or above this share of its potential profit (its contract pairs at
 # CONTRACT_PAYOUT_DOLLARS less what it cost) for TAKE_PROFIT_HOLD_DAYS days in a
 # row. Every 1% from 80% to 100%, 21 levels, each the float nearest its percent
-# over 100 (so 81% is exactly the float 0.81). BACKTEST-ONLY: live trading
-# never sells a position (no live module reads this). Distinct shares in
+# over 100 (so 81% is exactly the float 0.81). BACKTEST-ONLY: no live module
+# reads this; a live run sells at its own saved sell_at level instead
+# (LiveSettings.sell_at, applied by seller.plan_sales). Distinct shares in
 # (0, 1]. Read by backtester.run_backtest_sweep(sell_sweep=True), which checks
 # them before its fetch, and whose lazy SellSweep simulates each level when the
 # dashboard reads it.
@@ -901,6 +902,15 @@ BUY_SLIPPAGE_TICKS            = 1
 # is rounded onto the grid toward the safe side, so where the grid is coarser
 # just past that bid (a band boundary) the order is priced at the bid itself.
 SALE_HEDGE_SLIPPAGE_TICKS     = 1
+
+# How long a live run waits, in seconds, before it reads its positions listing
+# a second time after its sales, when the first read does not yet show what
+# the sales sold (main._positions_after_sales). Kalshi's positions ledger can
+# trail a fill by about a second. A run whose listing still does not show the
+# sales after this wait does not use Kalshi's value of the open positions,
+# since that value may still count what was sold, and sizes its buys on the
+# cash alone.
+SALE_READ_BACK_RECHECK_SECONDS = 1.0
 
 # Fallback tick size, in dollars, for a market whose tick structure is unknown
 # or uniform-cent ("linear_cent", or no price_ranges bands at all). Kalshi's

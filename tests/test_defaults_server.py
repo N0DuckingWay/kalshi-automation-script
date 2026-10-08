@@ -2521,6 +2521,16 @@ class TestAttention:
             "names: close out a market the account did not hold before the run, and put "
             "one it did hold back to what it held.")
 
+    def test_a_sale_left_for_a_person_raises_the_banner(self):
+        # A real-money run whose sale left a pair uneven needs attention,
+        # whatever exit code its result records
+        _disk_run(result=_result(exit_code=0, sales=[
+            {"title": "Pair", "status": "unbalanced", "legs": [], "error": "uneven"}]))
+        notice = _app()._attention()
+        assert notice is not None
+        assert "ended needing manual attention (a sale was left for a person to check)" in (
+            notice.text)
+
     def test_a_newer_clean_run_clears_it(self):
         later = "2099-06-01T00:00:00"
         # A scheduled run that needed attention, then a newer clean server run
@@ -2865,7 +2875,7 @@ class TestRunPage:
     # Each rule of the table, on a run read from disk: (result, headline, text on the page)
     _RULES = [
         (_result(exit_code=20, trades=[_trade("executed"), _trade("manual_review")]),
-         "Trades need your attention", "Do not start another real-money run"),
+         "Trades or sales need your attention", "Do not start another real-money run"),
         (_result(exit_code=None, submission_started=True, error="KeyboardInterrupt: "),
          "The run stopped while sending orders", "Orders may have been placed"),
         (_result(exit_code=None, trades=[_trade("executed")],
@@ -2944,7 +2954,83 @@ class TestRunPage:
         app = _app()
         run_id = _memory_run(app, returncode=20, result=_result(exit_code=0))
         assert self._headline(_get(app, f"/runs/{run_id}").body) == \
-            "Trades need your attention"
+            "Trades or sales need your attention"
+
+    def test_a_runs_sales_are_shown_before_its_trades(self):
+        # The Sales table: each position, its status in plain words, what
+        # sold on each market and its profit (only for a position that sold
+        # in full); the cash the sales left under it
+        legs = [{"ticker": "SELL-A", "side": "yes", "held": 30, "sold": 30, "price": 0.55},
+                {"ticker": "SELL-B", "side": "no", "held": 30, "sold": 30, "price": 0.42}]
+        sale = {"title": "Will S happen by Nov 1, 2026?", "status": "sold", "level": 0.8,
+                "days_left": 9, "cost": 18.8, "proceeds": 28.06, "profit": 9.26,
+                "realized_percent": 82.68, "legs": legs, "error": None}
+        partly = dict(sale, title="Partly", status="partly_sold", error="sold 10 of 30",
+                      legs=[dict(legs[0], sold=10), dict(legs[1], sold=None)])
+        _disk_run(result=_result(exit_code=0, sales=[sale, partly], cash_after_sales=128.06,
+                                 trades=[_trade("executed")]))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert body.index("<h2>Sales</h2>") < body.index("<h2>Completed</h2>")
+        assert "<th>Position</th><th>Status</th><th>Sold</th><th>Profit</th>" in body
+        assert ("<td>sold</td><td>30 of 30 YES on SELL-A, 30 of 30 NO on SELL-B</td>"
+                "<td>$9.26</td>") in body
+        assert ("<td>partly sold</td><td>10 of 30 YES on SELL-A, ? of 30 NO on SELL-B "
+                "(sold 10 of 30)</td><td>—</td>") in body
+        assert "Cash after the sales $128.06" in body
+        assert self._headline(body) == "Trades completed"
+
+    @pytest.mark.parametrize("status, word", [("unbalanced", "unbalanced"),
+                                              ("manual_review", "check")])
+    def test_a_sale_left_for_a_person_needs_attention(self, status, word):
+        # Even when the recorded exit code says nothing of it
+        sale = {"title": "Pair", "status": status, "legs": [], "error": "see the log"}
+        _disk_run(result=_result(exit_code=0, sales=[sale]))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert self._headline(body) == "Trades or sales need your attention"
+        assert f"<td>Pair</td><td>{word}</td><td>— (see the log)</td><td>—</td>" in body
+
+    def test_badly_typed_sales_are_left_out_not_fatal(self):
+        _disk_run(result=_result(exit_code=0, sales=[
+            "junk", {"status": 5, "legs": ["junk", {"ticker": 7, "held": "30"}],
+                     "profit": float("nan")}]))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert "<td>unknown</td><td>? of ? ? on ?</td><td>—</td>" in body
+
+    # One position sold in full, as a run result records it
+    _SOLD = {"title": "Pair", "status": "sold", "level": 0.8, "days_left": 9, "cost": 18.8,
+             "proceeds": 28.06, "profit": 9.26, "realized_percent": 82.68, "error": None,
+             "legs": [{"ticker": "SELL-A", "side": "yes", "held": 30, "sold": 30,
+                       "price": 0.55}]}
+
+    def test_a_run_that_only_sold_says_so(self):
+        # A live run that sold and then bought nothing: the headline names
+        # the sale, and the portfolio value read at the start is not what
+        # its buys were sized on, so the line says it came before the sales
+        _disk_run(result=_result(exit_code=0, sales=[self._SOLD], cash_after_sales=128.06,
+                                 balance_before=100.0, portfolio_value_before=150.0))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert self._headline(body) == "Positions sold; no trades to complete"
+        assert "Portfolio value $150.00 (cash $100.00) — before the sales" in body
+        assert "what Kelly sizes on" not in body
+        assert "<p>Cash after the sales $128.06</p>" in body
+
+    def test_a_dry_run_that_would_only_have_sold_says_so(self):
+        # Its cash after the sales is an estimate: nothing was sent
+        sale = dict(self._SOLD, status="simulated")
+        _disk_run(dry_run=True, result=_result(dry_run=True, exit_code=0, sales=[sale],
+                                               cash_after_sales=128.06))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert self._headline(body) == "Dry run finished — no orders were sent"
+        assert "These positions would have been sold:" in body
+        assert "Cash after the sales $128.06 (estimated: nothing was sent)" in body
+
+    def test_a_sale_that_sold_nothing_is_no_trade_to_complete(self):
+        sale = dict(self._SOLD, status="not_sold", profit=None, error="filled nothing",
+                    legs=[dict(self._SOLD["legs"][0], sold=0)])
+        _disk_run(result=_result(exit_code=0, sales=[sale]))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert self._headline(body) == "No trades to complete"
+        assert "<td>not sold</td><td>0 of 30 YES on SELL-A (filled nothing)</td>" in body
 
     def test_every_exit_code_has_a_rule_of_its_own(self):
         codes = {name: getattr(config, name) for name in dir(config)
@@ -4042,6 +4128,15 @@ class TestIsolation:
                     continue
                 assert "defaults_server" not in imported, (
                     f"kalshi_betting/{name}.py imports defaults_server")
+
+    def test_its_copies_of_the_sale_tables_match_their_sources(self):
+        # It may not import reporter or main, so it keeps its own copies of
+        # the sale status words and of the sale statuses that need a person;
+        # they must say exactly what the originals say
+        reporter = importlib.import_module("kalshi_betting.reporter")
+        main = importlib.import_module("kalshi_betting.main")
+        assert defaults_server._SALE_STATUS_WORDS == reporter._SALE_STATUS_WORDS
+        assert defaults_server._SALE_ATTENTION_STATUSES == main._SALE_ATTENTION_STATUSES
 
     def test_it_imports_the_standard_library_config_and_run_lock_only(self):
         project, other = set(), set()

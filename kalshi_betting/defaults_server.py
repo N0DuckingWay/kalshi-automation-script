@@ -389,6 +389,20 @@ _ATTENTION_STATUSES = ("rollback_failed", "manual_review")
 _TRADE_GROUPS = (("Needs attention", _ATTENTION_STATUSES), ("Completed", ("executed",)),
                  ("Would have traded", ("simulated",)))
 
+# A sale (take-profit rule) that needs a person: a pair it left uneven, or one
+# whose outcome could not be known
+_SALE_ATTENTION_STATUSES = ("unbalanced", "manual_review")
+
+# A sale's status in plain words, as the trade log's Status column words it
+_SALE_STATUS_WORDS = {"sold": "sold", "partly_sold": "partly sold", "not_sold": "not sold",
+                      "unbalanced": "unbalanced", "manual_review": "check",
+                      "simulated": "simulated"}
+
+# What a run page says under its Sales table
+_SALE_PROFIT_NOTE = ("Profit is what selling the whole position realizes at the bids the "
+                     "sale was priced at, after fees; it is shown only for a position that "
+                     "sold in full (or, in a dry run, would have).")
+
 # The exit code argparse gives a command line it refuses: the run stopped
 # before it logged anything, so it sent nothing
 _USAGE_EXIT = 2
@@ -606,8 +620,9 @@ class _LastRun:
     Attributes:
         finished (datetime): When it ended, timezone-aware; the newest run decides.
         verdict (str): "clean" (it finished trading with nothing left to
-            check), "attention" (a pair needs a person) or "unclean" (it ended
-            without a clean result, so orders may have been placed).
+            check), "attention" (a pair or a sale needs a person) or
+            "unclean" (it ended without a clean result, so orders may have
+            been placed).
         why (str): How it ended, in words, e.g. "exit 20" or "it wrote no result".
         where (str): Which run, as plain text; a scheduled run, which has no
             page, also names the log its result is in.
@@ -1449,14 +1464,55 @@ def _leg(value) -> dict | None:
             "price": _finite(value.get("price"))}
 
 
+def _sale_leg(value) -> dict | None:
+    """
+    Read one held market of a sale in a run result, each field checked for its type.
+
+    Args:
+        value: The recorded market.
+
+    Returns:
+        dict | None: ticker, side (str | None), held and sold (int | None)
+            and price (float | None); None when the market is not an object.
+    """
+    if not isinstance(value, dict):
+        return None
+    return {"ticker": _text(value.get("ticker")), "side": _text(value.get("side")),
+            "held": _int(value.get("held")), "sold": _int(value.get("sold")),
+            "price": _finite(value.get("price"))}
+
+
+def _sale(value) -> dict | None:
+    """
+    Read one sale in a run result, each field checked for its type.
+
+    Args:
+        value: The recorded sale.
+
+    Returns:
+        dict | None: title, status (an unreadable one reads "unknown"),
+            error, profit and legs (each _sale_leg, the unreadable ones left
+            out); None when the sale is not an object.
+    """
+    if not isinstance(value, dict):
+        return None
+    legs = value.get("legs") if isinstance(value.get("legs"), list) else []
+    return {"title": _text(value.get("title")),
+            "status": _text(value.get("status")) or "unknown",
+            "error": _text(value.get("error")),
+            "profit": _finite(value.get("profit")),
+            "legs": [leg for leg in (_sale_leg(item) for item in legs) if leg is not None]}
+
+
 def _read_result(folder: Path) -> _Result:
     """
     Read a run's result file strictly: the record's type-checked fields, or why there are none.
 
     The file must be a JSON object in config.LIVE_RUN_RESULT_FORMAT, with a
     bool dry_run and an int or null exit_code; otherwise it is "unreadable".
-    Every other field is kept only when it has its type (a pair's fields
-    too), so a hand-edited or damaged file never breaks a page.
+    Every other field is kept only when it has its type (a pair's and a
+    sale's fields too), so a hand-edited or damaged file never breaks a page.
+    A result written before sales were recorded reads as one with no sales.
 
     Args:
         folder (Path): The run's folder.
@@ -1488,6 +1544,8 @@ def _read_result(folder: Path) -> _Result:
                        "cost_with_fees": _finite(trade.get("cost_with_fees")),
                        "profit_if_won": _finite(trade.get("profit_if_won")),
                        "adds_to_held": _finite(trade.get("adds_to_held"))})
+    listed = raw.get("sales") if isinstance(raw.get("sales"), list) else []
+    sales = [sale for sale in (_sale(item) for item in listed) if sale is not None]
     warnings = raw.get("warnings") if isinstance(raw.get("warnings"), list) else []
     dropped = _int(raw.get("warnings_dropped"))
     return _Result("ok", {
@@ -1501,6 +1559,8 @@ def _read_result(folder: Path) -> _Result:
         "balance_after": _finite(raw.get("balance_after")),
         "portfolio_value_before": _finite(raw.get("portfolio_value_before")),
         "trades": trades,
+        "sales": sales,
+        "cash_after_sales": _finite(raw.get("cash_after_sales")),
         "warnings": [line for line in warnings if isinstance(line, str)],
         "warnings_dropped": dropped if dropped is not None and dropped > 0 else 0,
     })
@@ -1705,7 +1765,8 @@ def _folder_last_run(folder: Path, process: subprocess.Popen | None) -> _LastRun
     run still going, one that could not be started, one its argument parser
     refused, and one that stopped before it could send an order
     (_NO_ORDER_EXITS, or an error before its first order). Of the rest, a pair
-    left for a person, or exit EXIT_TRADES_NEED_ATTENTION, is "attention"; a
+    or a sale left for a person, or exit EXIT_TRADES_NEED_ATTENTION, is
+    "attention"; a
     run with no readable result, stopped by a signal, stopped by an error
     while or after sending orders, or ended with any other code but a clean
     one, is "unclean"; a clean exit (_CLEAN_EXITS) is "clean".
@@ -1741,9 +1802,12 @@ def _folder_last_run(folder: Path, process: subprocess.Popen | None) -> _LastRun
                or (process is None and code is None and _refused_to_start(_log_tail(folder))))
     if result.state == "missing" and refused:
         return None  # its argument parser refused it before it logged anything
-    if (any(t["status"] in _ATTENTION_STATUSES for t in trades)
+    sale_attention = any(s["status"] in _SALE_ATTENTION_STATUSES
+                         for s in record.get("sales", []))
+    if (any(t["status"] in _ATTENTION_STATUSES for t in trades) or sale_attention
             or code == EXIT_TRADES_NEED_ATTENTION):
         verdict = ("attention", f"exit {code}" if code == EXIT_TRADES_NEED_ATTENTION
+                   else "a sale was left for a person to check" if sale_attention
                    else "a pair was left for a person to check")
     elif result.state != "ok":
         if code in _NO_ORDER_EXITS:
@@ -1929,6 +1993,56 @@ def _trades_html(trades: list[dict]) -> str:
     return "\n".join(parts)
 
 
+def _sold_text(leg: dict) -> str:
+    """
+    Say what one held market of a sale sold, as "30 of 30 YES on KX-A".
+
+    Args:
+        leg (dict): The market (_sale_leg).
+
+    Returns:
+        str: The contracts sold and held, the side and the ticker, "?" for any not recorded.
+    """
+    sold = "?" if leg["sold"] is None else str(leg["sold"])
+    held = "?" if leg["held"] is None else str(leg["held"])
+    side = "?" if leg["side"] is None else leg["side"].upper()
+    return f"{sold} of {held} {side} on {leg['ticker'] or '?'}"
+
+
+def _sales_html(sales: list[dict], cash_after: float | None, *, dry_run: bool) -> str:
+    """
+    Show a run's sales (the take-profit rule) as one short table, with the cash they left.
+
+    Args:
+        sales (list[dict]): The run result's sales (_sale).
+        cash_after (float | None): The cash after the sales, in dollars, or None.
+        dry_run (bool): Keyword-only. True for a dry run, whose cash after
+            the sales is an estimate (its sales were never sent).
+
+    Returns:
+        str: The table's HTML; "" when there are no sales.
+    """
+    if not sales:
+        return ""
+    head = "<tr><th>Position</th><th>Status</th><th>Sold</th><th>Profit</th></tr>"
+    body = []
+    for sale in sales:
+        status = _SALE_STATUS_WORDS.get(sale["status"], sale["status"])
+        sold = ", ".join(_sold_text(leg) for leg in sale["legs"]) or "—"
+        if sale["error"]:
+            sold += f" ({sale['error']})"
+        profit = (_money(sale["profit"]) if sale["status"] in ("sold", "simulated")
+                  else "—")
+        cells = (sale["title"] or "—", status, sold, profit)
+        body.append("<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in cells) + "</tr>")
+    parts = [f"<h2>Sales</h2>\n<table>{head}{''.join(body)}</table>",
+             f"<p class=\"note\">{html.escape(_SALE_PROFIT_NOTE)}</p>"]
+    if cash_after is not None:
+        parts.append(f"<p>Cash after the sales {_money(cash_after)}"
+                     + (" (estimated: nothing was sent)" if dry_run else "") + "</p>")
+    return "\n".join(parts)
+
+
 def _outcome(run: _Run, exit_code: int | None, result: _Result, lines: list[str]) -> _Outcome:
     """
     Sum up a run that has ended: the first rule of the run page's table that applies.
@@ -1960,10 +2074,11 @@ def _outcome(run: _Run, exit_code: int | None, result: _Result, lines: list[str]
         return _Outcome("The run refused to start", "warn",
                         f"<p>{html.escape(error_line or 'No reason was printed.')}</p>"
                         "<p>Nothing was sent.</p>")
-    # 1: a pair needs a person
+    # 1: a pair or a sale needs a person
     if (any(t["status"] in _ATTENTION_STATUSES for t in trades)
+            or any(s["status"] in _SALE_ATTENTION_STATUSES for s in record.get("sales", []))
             or exit_code == EXIT_TRADES_NEED_ATTENTION):
-        return _Outcome("Trades need your attention", "banner",
+        return _Outcome("Trades or sales need your attention", "banner",
                         "<p>Check these positions in the Kalshi UI. Do not start another "
                         "real-money run — from this page, the dashboard, a terminal or the "
                         "scheduler — until this is understood.</p>"
@@ -1996,8 +2111,16 @@ def _outcome(run: _Run, exit_code: int | None, result: _Result, lines: list[str]
     if exit_code in (EXIT_OK, EXIT_TIME_SERIES_SKIPPED):
         note = ("<p>No time-series pair was searched: a held market could not be "
                 "identified.</p>" if exit_code == EXIT_TIME_SERIES_SKIPPED else "")
-        # 7: nothing to trade
+        # 7: nothing to trade (a run that sold says so)
         if not trades:
+            sales = record.get("sales", [])
+            if any(s["status"] in ("sold", "partly_sold") for s in sales):
+                return _Outcome("Positions sold; no trades to complete", "ok",
+                                message + note)
+            if sales and all(s["status"] == "simulated" for s in sales):
+                return _Outcome("Dry run finished — no orders were sent", "",
+                                "<p>These positions would have been sold:</p>"
+                                + message + note)
             return _Outcome("No trades to complete", "", message + note)
         # 4, 5, 6 (and 8, the same with exit 40's note)
         if executed:
@@ -2092,9 +2215,18 @@ def _run_html(run: _Run) -> str:
                      f"{_money(record['balance_after'])}</p>")
     if record.get("portfolio_value_before") is not None:
         # Cash plus open positions, read before trading: what the run sizes on
-        # (worded so it also fits a run that stopped at the minimum)
+        # (worded so it also fits a run that stopped at the minimum). A run
+        # that sold sizes its buys on what the sales left, so for it this is
+        # only the value it started from
         parts.append(f"<p>Portfolio value {_money(record['portfolio_value_before'])} "
-                     f"(cash {_money(record.get('balance_before'))}) — what Kelly sizes on</p>")
+                     f"(cash {_money(record.get('balance_before'))}) — "
+                     + ("before the sales" if record.get("sales")
+                        else "what Kelly sizes on") + "</p>")
+    # The sales come first, as the run made them before it bought anything
+    sales = _sales_html(record.get("sales", []), record.get("cash_after_sales"),
+                        dry_run=run.dry_run)
+    if sales:
+        parts.append(sales)
     trades = _trades_html(record.get("trades", []))
     if trades:
         parts.append(trades)

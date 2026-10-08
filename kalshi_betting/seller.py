@@ -58,7 +58,8 @@ Dependencies:
     and its walk, settlements and partner lookups) and historical
     (bid_before, recent_candles) only. It never imports the backtester, the
     backtest, the dashboard, the depth model, trader, strategy or main
-    (pinned by tests/test_seller.py). No module imports it yet.
+    (pinned by tests/test_seller.py). main.py alone imports it: a
+    production run calls plan_sales before it buys anything.
 
 Notes:
     Every request it makes is a read-only GET, each at most once per run:
