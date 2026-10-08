@@ -2739,7 +2739,10 @@ class TestTimeSeriesKellyParity:
 
         import kalshi_betting
 
-        band_readers = {"config", "backtester", "backtest", "dashboard"}
+        # live_portfolio is reporting only (the live dashboard's Live trading
+        # tab): it imports dashboard for the backtest page's own Sharpe and
+        # Sortino, and nothing on the live trading path imports it
+        band_readers = {"config", "backtester", "backtest", "dashboard", "live_portfolio"}
         names = {m.name for m in pkgutil.iter_modules(kalshi_betting.__path__)}
         # A rename must fail here, not silently shrink the allowlist
         assert band_readers <= names, band_readers - names
@@ -3297,15 +3300,21 @@ class TestTimeSeriesKellyParity:
     def test_ast_the_reports_never_write_the_saved_live_defaults(self):
         # The backtest, its CLI and the dashboard read the saved live defaults for
         # their reports only: none of them names the writer, the file's path, the
-        # seed or config's private parse, so none can change what live runs trade
-        from kalshi_betting import backtest
+        # seed or config's private parse, so none can change what live runs trade.
+        # live_portfolio (the Live trading tab) is left out of the live-path walk,
+        # since it reads the backtest page's ratios, so it is checked here: it has
+        # no use for the live defaults, so it names none of their readers either
+        from kalshi_betting import backtest, live_portfolio
 
         writes = {"save_live_defaults", "_saved_text", "_sync_directory"}
         names = writes | self._SAVED_FILE_INTERNALS
+        readers = {"live_settings", *self._DEFAULTS_READERS}
         # A rename in config must fail here, not leave the check naming nothing
-        for name in names:
+        for name in names | readers:
             assert hasattr(config, name), name
-        for module in (backtester, backtest, dashboard):
+        forbidden_in = {backtester: names, backtest: names, dashboard: names,
+                        live_portfolio: names | readers}
+        for module, forbidden in forbidden_in.items():
             mod = module.__name__.rsplit(".", 1)[-1]
             for node in ast.walk(ast.parse(inspect.getsource(module))):
                 if isinstance(node, ast.Name):
@@ -3320,7 +3329,8 @@ class TestTimeSeriesKellyParity:
                     found = node.value
                 else:
                     continue
-                assert found not in names, f"{mod}:{getattr(node, 'lineno', '?')} names {found}"
+                assert found not in forbidden, (
+                    f"{mod}:{getattr(node, 'lineno', '?')} names {found}")
         # Non-vacuous: both report reads are there, through the one reader
         assert _function_calls(backtester, "_live_settings_for_report", "live_defaults")
         assert _function_calls(backtest, "main", "live_defaults")

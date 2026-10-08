@@ -757,6 +757,47 @@ LIVE_SHARE_STEP_DOLLARS = "0.000000000001"
 # decimal.Decimal.
 LIVE_PAYOUT_TOLERANCE_DOLLARS = "0.01"
 
+# The live dashboard values each day by Kalshi's daily candles, one per day,
+# each closing at midnight in this time zone.
+LIVE_CANDLE_DAY_ZONE = "America/New_York"
+LIVE_CANDLE_PERIOD_MINUTES = 1440
+
+# Kalshi's limits on one batch candlestick request (GET /markets/candlesticks):
+# at most this many markets, and at most this many candles in all.
+LIVE_CANDLE_TICKERS_PER_REQUEST = 100
+LIVE_CANDLE_MAX_PER_REQUEST = 10_000
+
+# The daily prices of finalized markets read from Kalshi's archive, one JSON
+# file per market. Such a market's prices can no longer change, so each is
+# read from Kalshi once. Read when used, so tests point it elsewhere.
+LIVE_MARKS_CACHE_DIR = PROJECT_ROOT / "backtest_cache" / "live_marks"
+
+# The periods the Live trading tab shows its statistics for: (label, months
+# back from now; 0 means since the bot's first live trade).
+LIVE_DASHBOARD_PERIODS = (("All", 0), ("1Y", 12), ("6M", 6), ("3M", 3), ("1M", 1))
+
+# One JSON line per read of the account: when it was read, the cash, Kalshi's
+# own value of the positions, and every holding with its value. Read when
+# used, so tests point it elsewhere.
+LIVE_PORTFOLIO_LOG_FILE = PROJECT_ROOT / "live_portfolio_log.jsonl"
+
+# The live dashboard server's own log. Read when used, so tests point it elsewhere.
+LIVE_DASHBOARD_LOG_FILE = PROJECT_ROOT / "kalshi_live_dashboard.log"
+
+# A run's "Balance before" in the trade log matches the cash rebuilt from
+# Kalshi's records when the rebuilt cash is at most this far below it ...
+LIVE_CASH_CHECK_BELOW_DOLLARS = "0.005"
+# ... and less than this much above it for each shard: the logged figure
+# rounds each shard's cash down to the cent. Every shard the balance reply
+# lists now counts, empty ones too (which shards held cash at a past run is
+# not known), so with four shards a gap just under 4 cents still matches; the
+# page shows the largest gap beside the count. Text, for decimal.Decimal.
+LIVE_CASH_CHECK_ABOVE_PER_SHARD_DOLLARS = "0.01"
+
+# The rebuilt cash a mismatched run's warning shows is rounded to this: the
+# hundredth of a cent the account keeps its cash to. Text, for decimal.Decimal.
+LIVE_CASH_SHOWN_STEP_DOLLARS = "0.0001"
+
 # Which side each leg of a pair buys, as (side bought on market_a, side bought
 # on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
 # elsewhere. Same-title: NO on the pricier contract (market_a), YES on the
@@ -1906,8 +1947,8 @@ CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
 # 2026-09-23 calibration corpus, the longest request with a cached series
 # spanned 4,993.97 hours, while all 115 requests spanning more than 5,000
 # hours (the shortest 5,005.33) came back with no candles and left no cache
-# file, which is what a failed request leaves. historical.fetch_candlesticks —
-# the only reader — therefore sends any window longer than (this - 1) candle
+# file, which is what a failed request leaves. historical.fetch_candlesticks
+# therefore sends any window longer than (this - 1) candle
 # periods as consecutive requests of at most (this - 1) periods each,
 # overlapping by one period, and merges them ascending by timestamp with the
 # overlap's repeats dropped (historical._candle_request_windows /
@@ -1919,7 +1960,9 @@ CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
 # every fetch error to [], never cached), so every market whose window — then
 # opened at the backtest's --start-date and run to a day past its close —
 # spanned more than about 208 days of hourly candles silently had no price
-# series and could never enter a backtest trade.
+# series and could never enter a backtest trade. live_portfolio.read_marks
+# reads this too, for the daily candles it asks the archive for one market at
+# a time.
 CANDLESTICK_MAX_CANDLES_PER_REQUEST = 5000
 
 # Version of the fields a cached candle carries. A cache written under an

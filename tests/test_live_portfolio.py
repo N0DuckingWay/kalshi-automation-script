@@ -1,34 +1,55 @@
 """Tests for live_portfolio.py: reading the account from Kalshi, reading the
-bot's trade log, matching the bot's purchases to Kalshi orders, and the ledger
-of every contract bought, sold and paid out.
+bot's trade log, matching the bot's purchases to Kalshi orders, the ledger of
+every contract bought, sold and paid out, and what is worked out from it: the
+daily prices, the account's value over time, each period's statistics, each
+purchase's return, the holdings now, the check of each run's logged cash, the
+whole view and its JSON log line.
 
 All offline. historical._historical_get is replaced by FakeKalshi, which
-serves each listing page by page by cursor, so no request ever leaves the
-machine. The trade logs are written by reporter.append_to_prod_log itself,
-with its paths pointed at tmp_path (as tests/test_reporter.py does) and its
-clock and the host's time zone pinned. The ledger's cash is checked against
-a separate running-position formula over 300 random fill sequences.
+serves each listing page by page by cursor, and by FakeCandles for the daily
+candles, so no request ever leaves the machine. The trade logs are written by
+reporter.append_to_prod_log itself, with its paths pointed at tmp_path (as
+tests/test_reporter.py does) and its clock and the host's time zone pinned.
+The ledger's cash is checked against a separate running-position formula over
+300 random fill sequences, and the pair-weighted median against numpy's
+median over 200 random sets of purchases.
 """
 import copy
+import dataclasses
+import json
+import logging
+import math
 import random
+import re
 import shutil
 from collections import defaultdict
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from itertools import pairwise
 from types import SimpleNamespace
 
+import numpy as np
 import openpyxl
+import pandas as pd
 import pytest
+from kalshi_python_sync.exceptions import ApiException
 
-from kalshi_betting import auth, config, historical, live_portfolio, reporter
+from kalshi_betting import auth, config, dashboard, historical, live_portfolio, reporter, treasury
 from kalshi_betting.live_portfolio import (
     OTHER_BETS,
     Account,
     BotLeg,
     BotTrade,
+    CashFlow,
     Fill,
+    History,
+    Holding,
+    LiveView,
     Market,
+    Marks,
     Payout,
+    RunStart,
+    TradeReturn,
 )
 from kalshi_betting.reporter import TradeResult
 from kalshi_betting.scanner import ApiMarket, CandidatePair
@@ -442,6 +463,8 @@ class TestReadMarkets:
         assert found["M1"] == Market("M1", "E1", "One?", "active", "", None, None,
                                      D("0.40"), D("0.45"), D("0.42"))
         assert found["M2"].settled_at == T0
+        # Only a market the live listing lacked is marked as the archive's
+        assert found["M2"].archived and not found["M1"].archived and not found["M3"].archived
         assert (found["M2"].result, found["M2"].yes_value) == ("scalar", D("0.3500"))
         assert found["M3"].title == "M3" and found["M3"].yes_bid is None
         asked = [(path, params["tickers"]) for path, params in kalshi.calls]
@@ -1217,3 +1240,1170 @@ class TestLedgerMatchesARunningPosition:
             if count == 0:
                 assert basis[key] == 0
         assert ledger.warnings == ()
+
+
+# ---- prices ----------------------------------------------------------------
+
+def _utc(*parts) -> datetime:
+    """A UTC moment from its parts (year, month, day, hour, ...)."""
+    return datetime(*parts, tzinfo=UTC)
+
+
+# Just before the bot's first fill (T0), and a read nine days later
+START = T0 - timedelta(microseconds=1)
+READ = _utc(2026, 10, 7, 12)
+# The daily candles' closes around them, and the first one read_marks asks for:
+# midnight New York time starting the day before START's day (Sep 27, 04:00 UTC)
+CLOSES = live_portfolio.day_ends(T0 - timedelta(days=3), READ)
+FROM_TS = int(_utc(2026, 9, 27, 4).timestamp())
+TO_TS = int(READ.timestamp())
+
+
+def _candle(end: datetime, bid=None, ask=None, last=None, *, key="close_dollars") -> dict:
+    """A daily candle as Kalshi sends it: each side's close as dollar text under `key`."""
+    def side(price):
+        return {key: None if price is None else f"{D(str(price)):.4f}"}
+    return {"end_period_ts": int(end.timestamp()), "yes_bid": side(bid), "yes_ask": side(ask),
+            "price": side(last)}
+
+
+def _market(ticker, *, status="active", result="", settled_at=None, yes_value=None,
+            bid=None, ask=None, last=None, event=None, archived=False) -> Market:
+    """A Market as read_markets builds one (archived: found only in Kalshi's archive)."""
+    def dec(value):
+        return None if value is None else D(str(value))
+    return Market(ticker, event or f"EV-{ticker}", f"Will {ticker}?", status, result, settled_at,
+                  yes_value, dec(bid), dec(ask), dec(last), archived)
+
+
+class FakeCandles:
+    """
+    Stands in for historical._historical_get on Kalshi's two candle listings.
+
+    batch maps a ticker to its candles on GET /markets/candlesticks; archive
+    maps a ticker to its candles on GET /historical/markets/{ticker}/candlesticks
+    (a ticker it lacks answers 404). fail maps a ticker to what its archive
+    request raises, and fail_batch, when set, is raised by every batch
+    request; batch_reply, when set, is what every batch request answers.
+    Each answer holds the candles that close inside the request's
+    [start_ts, end_ts]. Every call is recorded.
+    """
+
+    def __init__(self):
+        self.batch, self.archive, self.fail = {}, {}, {}
+        self.fail_batch = None
+        self.batch_reply = None
+        self.calls = []
+
+    def __call__(self, client, path, **params):
+        assert path.startswith(_API), path
+        short = path[len(_API):]
+        self.calls.append((short, dict(params)))
+        assert params["period_interval"] == config.LIVE_CANDLE_PERIOD_MINUTES
+        lo, hi = params["start_ts"], params["end_ts"]
+
+        def inside(rows):
+            return [copy.deepcopy(c) for c in rows if lo <= c["end_period_ts"] <= hi]
+
+        if short == "/markets/candlesticks":
+            if self.fail_batch is not None:
+                raise self.fail_batch
+            if self.batch_reply is not None:
+                return copy.deepcopy(self.batch_reply)
+            return {"markets": [{"market_ticker": t, "candlesticks": inside(self.batch[t])}
+                                for t in params["market_tickers"].split(",") if t in self.batch]}
+        ticker = re.fullmatch(r"/historical/markets/(.+)/candlesticks", short).group(1)
+        if ticker in self.fail:
+            raise self.fail[ticker]
+        if ticker not in self.archive:
+            raise ApiException(status=404, reason="Not Found")
+        return {"candlesticks": inside(self.archive[ticker])}
+
+    def batches(self) -> list[dict]:
+        """The parameters of each batch request."""
+        return [params for short, params in self.calls if short == "/markets/candlesticks"]
+
+    def archived(self) -> list[str]:
+        """The archive paths asked, in order."""
+        return [short for short, _ in self.calls if short.startswith("/historical/")]
+
+
+@pytest.fixture
+def candles(monkeypatch):
+    """A FakeCandles in place of historical._historical_get."""
+    fake = FakeCandles()
+    monkeypatch.setattr(historical, "_historical_get", fake)
+    return fake
+
+
+def _daily(mid, *, until=None):
+    """The daily points read_marks gives a market quoted at `mid` on every close it asks for."""
+    return tuple((c, D(mid)) for c in CLOSES
+                 if FROM_TS <= c.timestamp() <= TO_TS and (until is None or c <= until))
+
+
+class TestDayEnds:
+    def test_closes_across_both_clock_changes(self):
+        # New York leaves daylight time on 2026-11-01 and goes back to it on
+        # 2027-03-14: its midnight is 04:00 UTC in summer, 05:00 UTC in winter
+        assert live_portfolio.day_ends(_utc(2026, 10, 30, 12), _utc(2026, 11, 2, 12)) == [
+            _utc(2026, 10, 31, 4), _utc(2026, 11, 1, 4), _utc(2026, 11, 2, 5)]
+        assert live_portfolio.day_ends(_utc(2027, 3, 13, 12), _utc(2027, 3, 16, 12)) == [
+            _utc(2027, 3, 14, 5), _utc(2027, 3, 15, 4), _utc(2027, 3, 16, 4)]
+
+    def test_a_close_at_the_start_or_the_end_is_left_out(self):
+        close = _utc(2026, 9, 29, 4)
+        assert live_portfolio.day_ends(close, close + timedelta(days=2)) == [
+            close + timedelta(days=1)]
+        assert live_portfolio.day_ends(close, close) == []
+
+
+class TestPrices:
+    @pytest.mark.parametrize("bid, ask, last, mid", [
+        ("0.40", "0.50", "0.30", "0.45"),
+        ("0", "0.50", None, "0.25"),        # no bid at all: half the ask
+        ("0", "0.03", "0.50", "0.015"),     # ... before any last trade
+        ("0.40", "1", None, "0.70"),        # no ask at all: halfway from the bid to 1
+        ("0.97", "1", "0.50", "0.985"),     # ... before any last trade
+        ("0", "1", "0.30", "0.30"),         # both sides empty: the last trade
+        ("0", "0", "0.30", "0.30"),
+        ("0.40", "1.20", None, None),
+        ("0", "-0.10", None, None),
+        ("0.50", "0.50", None, None),       # a bid at the ask
+        ("0.60", "0.50", None, None),
+        ("-0.10", "0.50", None, None),
+        (None, "0.50", None, None),
+        ("0.40", None, None, None),
+        ("0", "1", "0", None),              # a last trade of 0 or 1 is no price
+        ("0", "1", "1", None),
+        (None, None, "0.62", "0.62"),
+    ])
+    def test_the_midpoint_refuses_kalshis_empty_sides(self, bid, ask, last, mid):
+        def dec(value):
+            return None if value is None else D(value)
+        assert live_portfolio._mid(dec(bid), dec(ask), dec(last)) == dec(mid)
+
+    def test_candles_in_both_shapes(self):
+        end = _utc(2026, 9, 29, 4)
+        new = _candle(end, "0.40", "0.50")
+        old = _candle(end, "0.40", "0.50", key="close")
+        assert live_portfolio._candle_mid(new) == (end, D("0.45"))
+        assert live_portfolio._candle_mid(old) == (end, D("0.45"))
+        # close_dollars is preferred when both are there
+        both = {**new, "yes_bid": {"close_dollars": "0.4000", "close": 40}}
+        assert live_portfolio._candle_mid(both) == (end, D("0.45"))
+
+    def test_a_candle_with_no_quote_takes_its_last_trade(self):
+        end = _utc(2026, 9, 29, 4)
+        assert live_portfolio._candle_mid(_candle(end, "0", "1", "0.33")) == (end, D("0.33"))
+        assert live_portfolio._candle_mid(_candle(end, "0", "1")) is None
+
+    def test_a_day_with_no_trades(self):
+        # Kalshi's candle for a day with no trades: the trades side carries only
+        # the last price before the day, which is still the last trade
+        end = _utc(2026, 9, 29, 4)
+        quiet = {**_candle(end, "0.97", "1"), "price": {"previous_dollars": "0.9800"}}
+        assert live_portfolio._candle_mid(quiet) == (end, D("0.985"))
+        mirror = {**_candle(end, "0", "0.03"), "price": {"previous_dollars": "0.0200"}}
+        assert live_portfolio._candle_mid(mirror) == (end, D("0.015"))
+        empty = {**_candle(end, "0", "1"), "price": {"previous_dollars": "0.9800"}}
+        assert live_portfolio._candle_mid(empty) == (end, D("0.98"))
+        older = {**_candle(end, "0", "1"), "price": {"previous": "0.4100"}}
+        assert live_portfolio._candle_mid(older) == (end, D("0.41"))
+        # The day's own last trade comes before the price before it
+        traded = {**_candle(end, "0", "1"), "price": {"close_dollars": "0.6000",
+                                                      "previous_dollars": "0.9800"}}
+        assert live_portfolio._candle_mid(traded) == (end, D("0.60"))
+        assert live_portfolio._candle_mid(
+            {**_candle(end, "0", "1"), "price": {"previous_dollars": "soon"}}) is None
+
+    @pytest.mark.parametrize("change", [
+        {"end_period_ts": None}, {"end_period_ts": "soon"}, {"end_period_ts": 10 ** 20},
+        {"yes_ask": "0.50"}, {"yes_ask": {"close_dollars": "nan"}}])
+    def test_an_unreadable_candle_gives_no_price(self, change):
+        candle = {**_candle(_utc(2026, 9, 29, 4), "0.40", "0.50"), **change}
+        assert live_portfolio._candle_mid(candle) is None
+
+    def test_a_decided_result_comes_before_the_quote(self):
+        quote = {"bid": "0.10", "ask": "0.20", "last": "0.15"}
+        assert live_portfolio.quote_mid(_market("M", result="yes", **quote)) == 1
+        assert live_portfolio.quote_mid(_market("M", result="no", **quote)) == 0
+        assert live_portfolio.quote_mid(
+            _market("M", result="scalar", yes_value=D("0.35"), **quote)) == D("0.35")
+        assert live_portfolio.quote_mid(_market("M", result="scalar", **quote)) == D("0.15")
+        assert live_portfolio.quote_mid(_market("M", **quote)) == D("0.15")
+        assert live_portfolio.quote_mid(_market("M", bid="0", ask="1", last="0.12")) == D("0.12")
+        assert live_portfolio.quote_mid(_market("M")) is None
+
+    def test_marks_carry_the_last_value_forward(self):
+        first, second = CLOSES[3], CLOSES[5]
+        marks = Marks({"M": ((first, D("0.4")), (second, D("0.5")))}, {"M": D("0.7")}, READ)
+        assert marks.at("M", first - timedelta(seconds=1)) is None
+        assert marks.at("M", first) == D("0.4")
+        assert marks.at("M", second - timedelta(seconds=1)) == D("0.4")
+        assert marks.at("M", second + timedelta(days=1)) == D("0.5")
+        assert marks.at("M", READ) == marks.at("M", READ + timedelta(days=1)) == D("0.7")
+        assert marks.at("X", READ) is None
+        # With no value now, the last daily price stands at the read too
+        assert Marks(marks.daily, {}, READ).at("M", READ) == D("0.5")
+
+
+class TestReadMarks:
+    def test_the_batch_asks_few_enough_markets_and_candles(self, candles, monkeypatch):
+        # The candle limit binds below the market limit here
+        monkeypatch.setattr(config, "LIVE_CANDLE_TICKERS_PER_REQUEST", 5)
+        monkeypatch.setattr(config, "LIVE_CANDLE_MAX_PER_REQUEST", 40)
+        tickers = [f"M{i}" for i in range(7)]
+        for ticker in tickers:
+            candles.batch[ticker] = [_candle(c, "0.40", "0.50") for c in CLOSES]
+        marks, warnings = live_portfolio.read_marks(
+            object(), set(tickers), START, {t: _market(t) for t in tickers}, READ)
+        assert warnings == []
+        asked = candles.batches()
+        # 12 candles a market fit 40 // 12 = 3 markets a request
+        assert [p["market_tickers"] for p in asked] == ["M0,M1,M2", "M3,M4,M5", "M6"]
+        assert {(p["start_ts"], p["end_ts"]) for p in asked} == {(FROM_TS, TO_TS)}
+        for params in asked:
+            assert (len(params["market_tickers"].split(","))
+                    * live_portfolio._candles_in(params["start_ts"], params["end_ts"])) <= 40
+        assert marks.daily == {t: _daily("0.45") for t in tickers}
+        assert candles.archived() == []
+
+    def test_a_long_span_is_read_in_windows(self, candles, monkeypatch):
+        monkeypatch.setattr(config, "LIVE_CANDLE_MAX_PER_REQUEST", 5)
+        candles.batch["M"] = [_candle(c, "0.40", "0.50") for c in CLOSES]
+        marks, warnings = live_portfolio.read_marks(object(), {"M"}, START, {"M": _market("M")},
+                                                    READ)
+        windows = [(p["start_ts"], p["end_ts"]) for p in candles.batches()]
+        assert len(windows) > 1 and warnings == []
+        assert windows[0][0] == FROM_TS and windows[-1][1] == TO_TS
+        assert all(later[0] == earlier[1] for earlier, later in pairwise(windows))
+        assert all(live_portfolio._candles_in(lo, hi) <= 5 for lo, hi in windows)
+        # A candle closing where two windows meet comes back twice and counts once
+        assert marks.daily == {"M": _daily("0.45")}
+
+    def test_a_long_span_of_many_markets_asks_few_enough_candles(self, candles, monkeypatch):
+        monkeypatch.setattr(config, "LIVE_CANDLE_MAX_PER_REQUEST", 12)
+        tickers = ["M0", "M1", "M2"]
+        for ticker in tickers:
+            candles.batch[ticker] = [_candle(c, "0.40", "0.50") for c in CLOSES]
+        marks, warnings = live_portfolio.read_marks(
+            object(), set(tickers), START, {t: _market(t) for t in tickers}, READ)
+        assert warnings == []
+        asked = [(p["market_tickers"], p["start_ts"], p["end_ts"]) for p in candles.batches()]
+        # Ten days hold 12 candles of one market: one market a request; the last
+        # eight hours hold 2, so all three fit in one request
+        split = FROM_TS + 10 * 86_400
+        assert asked == [("M0", FROM_TS, split), ("M1", FROM_TS, split), ("M2", FROM_TS, split),
+                         ("M0,M1,M2", split, TO_TS)]
+        for tickers_asked, lo, hi in asked:
+            assert len(tickers_asked.split(",")) * live_portfolio._candles_in(lo, hi) <= 12
+        assert marks.daily == {t: _daily("0.45") for t in tickers}
+
+    def test_settled_markets_the_batch_lacks_come_from_the_archive(self, candles, tmp_path):
+        settled = CLOSES[6] + timedelta(hours=3)
+        markets = {
+            "OPEN": _market("OPEN", bid="0.40", ask="0.50"),
+            "FINAL": _market("FINAL", status="finalized", result="yes", settled_at=settled,
+                             yes_value=D(1), archived=True),
+            "DECIDED": _market("DECIDED", status="determined", result="no", settled_at=settled),
+        }
+        candles.batch["OPEN"] = [_candle(c, "0.40", "0.50") for c in CLOSES]
+        for ticker in ("FINAL", "DECIDED"):
+            candles.archive[ticker] = [_candle(c, "0.20", "0.30") for c in CLOSES if c <= settled]
+        wanted = {"OPEN", "FINAL", "DECIDED", "GONE"}
+        marks, warnings = live_portfolio.read_marks(object(), wanted, START, markets, READ)
+        assert warnings == []
+        # FINAL is only in the archive, so it goes straight there; GONE was
+        # found nowhere, so it has no candles to ask for
+        assert [p["market_tickers"] for p in candles.batches()] == ["DECIDED,OPEN"]
+        assert candles.archived() == ["/historical/markets/DECIDED/candlesticks",
+                                      "/historical/markets/FINAL/candlesticks"]
+        assert marks.daily == {"OPEN": _daily("0.45"), "FINAL": _daily("0.25", until=settled),
+                               "DECIDED": _daily("0.25", until=settled)}
+        assert marks.now == {"OPEN": D("0.45"), "FINAL": D(1), "DECIDED": D(0)}
+        # Only the finalized market is kept: never an open or not yet final one
+        kept = config.LIVE_MARKS_CACHE_DIR
+        assert kept.parent == tmp_path
+        assert sorted(p.name for p in kept.iterdir()) == ["FINAL.json"]
+        # The next read takes FINAL from its file, with no request for it
+        candles.calls.clear()
+        again, warnings = live_portfolio.read_marks(object(), wanted, START, markets, READ)
+        assert again == marks and warnings == []
+        assert [p["market_tickers"] for p in candles.batches()] == ["DECIDED,OPEN"]
+        assert candles.archived() == ["/historical/markets/DECIDED/candlesticks"]
+
+    def test_a_kept_file_that_starts_too_late_is_read_again(self, candles):
+        settled = CLOSES[6] + timedelta(hours=3)
+        markets = {"FINAL": _market("FINAL", status="finalized", result="yes",
+                                    settled_at=settled, yes_value=D(1))}
+        candles.archive["FINAL"] = [_candle(c, "0.20", "0.30") for c in CLOSES if c <= settled]
+        live_portfolio.read_marks(object(), {"FINAL"}, START, markets, READ)
+        candles.calls.clear()
+        earlier = START - timedelta(days=2)
+        marks, _ = live_portfolio.read_marks(object(), {"FINAL"}, earlier, markets, READ)
+        assert candles.archived() == ["/historical/markets/FINAL/candlesticks"]
+        kept = json.loads((config.LIVE_MARKS_CACHE_DIR / "FINAL.json").read_text())
+        assert kept["start_ts"] == int(_utc(2026, 9, 25, 4).timestamp()) < FROM_TS
+        # The first candle there is, Sep 26's, is before the first one read before
+        assert marks.daily["FINAL"][0][0] == CLOSES[0] == _utc(2026, 9, 26, 4)
+
+    def test_a_failed_archive_read_is_a_warning(self, candles):
+        settled = CLOSES[6]
+        markets = {"FINAL": _market("FINAL", status="finalized", result="yes",
+                                    settled_at=settled, yes_value=D(1)),
+                   "OLD": _market("OLD", status="finalized", result="no", settled_at=settled),
+                   "OPEN": _market("OPEN")}
+        candles.fail["FINAL"] = ApiException(status=503, reason="Service Unavailable")
+        candles.archive["OLD"] = [_candle(c, "0.20", "0.30") for c in CLOSES if c <= settled]
+        candles.batch["OPEN"] = [_candle(c, "0.40", "0.50") for c in CLOSES]
+        marks, warnings = live_portfolio.read_marks(object(), set(markets), START, markets, READ)
+        assert warnings == ["Daily prices of FINAL could not be read (HTTP 503 Service "
+                            "Unavailable): it is valued at its last known price, or at what "
+                            "it cost"]
+        assert set(marks.daily) == {"OLD", "OPEN"}
+        # FINAL is valued at its result now, and at what it cost before
+        assert marks.at("FINAL", READ) == 1
+        assert marks.at("FINAL", CLOSES[5]) is None
+        assert not (config.LIVE_MARKS_CACHE_DIR / "FINAL.json").exists()
+
+    def test_an_archive_answer_without_candles_is_a_warning(self, monkeypatch):
+        settled = CLOSES[6]
+        markets = {"FINAL": _market("FINAL", status="finalized", result="yes",
+                                    settled_at=settled, yes_value=D(1))}
+        monkeypatch.setattr(historical, "_historical_get", lambda client, path, **p: (
+            {"markets": []} if path.endswith("/markets/candlesticks") else {"oops": 1}))
+        marks, warnings = live_portfolio.read_marks(object(), {"FINAL"}, START, markets, READ)
+        assert warnings == ["Daily prices of FINAL could not be read (ValueError: the archive's "
+                            "candles for FINAL came without a candle list): it is valued at its "
+                            "last known price, or at what it cost"]
+        assert marks.daily == {}
+
+    def test_a_failed_batch_request_is_a_warning(self, candles):
+        settled = CLOSES[6]
+        markets = {"FINAL": _market("FINAL", status="finalized", result="yes",
+                                    settled_at=settled, yes_value=D(1)),
+                   "OPEN": _market("OPEN", bid="0.40", ask="0.50")}
+        candles.fail_batch = ApiException(status=500, reason="Internal Server Error")
+        marks, warnings = live_portfolio.read_marks(object(), set(markets), START, markets, READ)
+        assert warnings == ["Daily prices of 2 market(s) could not be read (HTTP 500 Internal "
+                            "Server Error): they are valued at their last known price, or at "
+                            "what they cost"]
+        assert candles.archived() == []
+        assert marks.daily == {} and marks.now == {"FINAL": D(1), "OPEN": D("0.45")}
+
+    def test_a_failed_batch_request_never_costs_the_archives_markets(self, candles):
+        settled = CLOSES[6]
+        markets = {"OLD": _market("OLD", status="finalized", result="no", settled_at=settled,
+                                  archived=True),
+                   "OPEN": _market("OPEN", bid="0.40", ask="0.50")}
+        candles.archive["OLD"] = [_candle(c, "0.20", "0.30") for c in CLOSES if c <= settled]
+        candles.fail_batch = ApiException(status=400, reason="Bad Request")
+        marks, warnings = live_portfolio.read_marks(object(), {"OLD", "OPEN", "GONE"}, START,
+                                                    markets, READ)
+        # The batch asked only for OPEN, and its failure is OPEN's alone
+        assert [p["market_tickers"] for p in candles.batches()] == ["OPEN"]
+        assert warnings == ["Daily prices of 1 market(s) could not be read (HTTP 400 Bad "
+                            "Request): they are valued at their last known price, or at what "
+                            "they cost"]
+        assert candles.archived() == ["/historical/markets/OLD/candlesticks"]
+        assert marks.daily == {"OLD": _daily("0.25", until=settled)}
+
+    def test_an_open_market_the_batch_lacks_is_not_asked_of_the_archive(self, candles):
+        markets = {"OPEN": _market("OPEN", bid="0.40", ask="0.50"), "QUIET": _market("QUIET")}
+        candles.batch["OPEN"] = [_candle(c, "0.40", "0.50") for c in CLOSES]
+        marks, warnings = live_portfolio.read_marks(object(), set(markets), START, markets, READ)
+        assert warnings == [] and candles.archived() == []
+        assert marks.daily == {"OPEN": _daily("0.45")}
+
+    @pytest.mark.parametrize("reply, problem", [
+        ({"oops": []}, "ValueError: the batch candle reply came without a market list"),
+        ({"markets": 5}, "ValueError: the batch candle reply came without a market list"),
+        ({"markets": None}, "ValueError: the batch candle reply came without a market list"),
+    ])
+    def test_a_batch_reply_without_a_market_list_is_a_warning(self, candles, reply, problem):
+        markets = {"OPEN": _market("OPEN", bid="0.40", ask="0.50")}
+        candles.batch_reply = reply
+        marks, warnings = live_portfolio.read_marks(object(), {"OPEN"}, START, markets, READ)
+        assert warnings == [f"Daily prices of 1 market(s) could not be read ({problem}): they "
+                            f"are valued at their last known price, or at what they cost"]
+        assert marks.daily == {}
+
+    def test_entries_of_the_batch_reply_it_cannot_read_are_skipped(self, candles):
+        markets = {"OPEN": _market("OPEN", bid="0.40", ask="0.50")}
+        good = [_candle(c, "0.40", "0.50") for c in CLOSES if FROM_TS <= c.timestamp() <= TO_TS]
+        candles.batch_reply = {"markets": [
+            5, None, {"market_ticker": ["OPEN"], "candlesticks": good},
+            {"market_ticker": {"t": "OPEN"}, "candlesticks": good},
+            {"market_ticker": "OTHER", "candlesticks": good},
+            {"market_ticker": "OPEN", "candlesticks": "none"},
+            {"market_ticker": "OPEN", "candlesticks": [*good, 7]}]}
+        marks, warnings = live_portfolio.read_marks(object(), {"OPEN"}, START, markets, READ)
+        assert warnings == []
+        assert marks.daily == {"OPEN": _daily("0.45")}
+
+    def test_a_kept_file_for_another_market_is_not_used(self, candles):
+        settled = CLOSES[6]
+        markets = {"FINAL": _market("FINAL", status="finalized", result="yes",
+                                    settled_at=settled, yes_value=D(1), archived=True)}
+        candles.archive["FINAL"] = [_candle(c, "0.20", "0.30") for c in CLOSES if c <= settled]
+        folder = config.LIVE_MARKS_CACHE_DIR
+        folder.mkdir(parents=True)
+        (folder / "FINAL.json").write_text(json.dumps({
+            "ticker": "OTHER", "start_ts": FROM_TS, "end_ts": TO_TS,
+            "candles": [_candle(c, "0.80", "0.90") for c in CLOSES]}))
+        marks, warnings = live_portfolio.read_marks(object(), {"FINAL"}, START, markets, READ)
+        assert warnings == []
+        assert candles.archived() == ["/historical/markets/FINAL/candlesticks"]
+        assert marks.daily == {"FINAL": _daily("0.25", until=settled)}
+        # ... and the file is written again, for FINAL
+        assert json.loads((folder / "FINAL.json").read_text())["ticker"] == "FINAL"
+
+    def test_nothing_wanted_asks_nothing(self, candles):
+        assert live_portfolio.read_marks(object(), set(), START, {}, READ) == (
+            Marks({}, {}, READ), [])
+        assert candles.calls == []
+
+    def test_a_ticker_that_cannot_name_a_file_is_never_kept(self):
+        assert live_portfolio._marks_file("../evil") is None
+        assert live_portfolio._marks_file("a/b") is None
+        assert live_portfolio._marks_file("KXBTCD-26SEP1517-T80999.99") == (
+            config.LIVE_MARKS_CACHE_DIR / "KXBTCD-26SEP1517-T80999.99.json")
+
+
+# ---- the account over time -------------------------------------------------
+
+def _after(cash_at_start, ledger, *, flows=(), read_at=READ, shards=1) -> Account:
+    """The account whose cash before every ledger event and flow was `cash_at_start`."""
+    cash = (cash_at_start + sum((e.cash for e in ledger.events), D(0))
+            + sum((f.amount for f in flows), D(0)))
+    return Account(read_at, cash, shards, None, dict(ledger.held_now), (), (), tuple(flows), False)
+
+
+def _crypto(owner: str) -> str:
+    """Bot purchases T1, T2 ... are Crypto; everything else is Other bets."""
+    return "Crypto" if owner.startswith("T") else OTHER_BETS
+
+
+class TestHistory:
+    @pytest.mark.parametrize("seed", range(50))
+    def test_cash_rebuilt_backward_equals_cash_replayed_forward(self, seed):
+        fills, owner_by_fill, legs, payouts = _random_case(seed)
+        rng = random.Random(seed + 1000)
+        flows = sorted((CashFlow(T0 + timedelta(hours=rng.randint(0, 60)),
+                                 D(rng.randint(-5000, 5000)) / 100)
+                        for _ in range(rng.randint(0, 4))), key=lambda f: f.time)
+        ledger = live_portfolio.build_ledger(fills, payouts, owner_by_fill, legs)
+        read_at = T0 + timedelta(days=3)
+        start_cash = D("250.0000")
+        account = _after(start_cash, ledger, flows=flows, read_at=read_at)
+        changes = [(e.time, e.cash) for e in ledger.events] + [(f.time, f.amount) for f in flows]
+        moments = sorted({when for when, _ in changes} | {START, read_at})
+        for moment in moments:
+            forward = start_cash + sum((amount for when, amount in changes if when <= moment),
+                                       D(0))
+            assert live_portfolio.cash_at(account, ledger, moment) == forward
+        history = live_portfolio.build_history(account, ledger, Marks({}, {}, read_at), _crypto,
+                                               START)
+        assert history.cash == tuple(float(live_portfolio.cash_at(account, ledger, moment))
+                                     for moment in history.times)
+        assert sum(history.flows) == pytest.approx(float(sum((f.amount for f in flows), D(0))))
+
+    def _half_sold_pair(self, sale_price: str) -> History:
+        """A bot pair bought, then 5 of its 10 YES A sold by you the next day."""
+        fills = [_fill("bot-b", "B", T0, False, 10, "0.60"),                  # NO B at 0.40
+                 _fill("bot-a", "A", T0 + timedelta(seconds=1), True, 10, "0.30"),
+                 _fill("sale", "A", _utc(2026, 9, 29, 10), False, 5, sale_price)]
+        ledger = _ledger(fills, {"bot-b": "T1", "bot-a": "T1"},
+                         legs={"T1": frozenset({"A", "B"})})
+        read_at = _utc(2026, 10, 1, 12)
+        closes = live_portfolio.day_ends(START, read_at)
+        marks = Marks({"A": tuple((c, D("0.40")) for c in closes),
+                       "B": tuple((c, D("0.60")) for c in closes)},
+                      {"A": D("0.40"), "B": D("0.60")}, read_at)
+        account = _after(D(100), ledger, read_at=read_at)
+        return live_portfolio.build_history(account, ledger, marks, _crypto, START)
+
+    def test_a_pair_half_sold_at_the_midpoint_leaves_the_total_alone(self):
+        history = self._half_sold_pair("0.40")
+        # Start, Sep 29, Sep 30 and Oct 1 closes, the read; the sale is on Sep 29 at 10:00
+        assert len(history.times) == 5 and history.times[0] == START
+        assert [history.total(i) for i in range(5)] == [100.0, 101.0, 101.0, 101.0, 101.0]
+        value, net = history.value["Crypto"], history.net_cash["Crypto"]
+        assert value[1] - value[2] == net[2] - net[1] == 2.0
+        assert set(history.value) == {"Crypto"}
+
+    def test_a_sale_below_the_midpoint_costs_only_the_gap(self):
+        history = self._half_sold_pair("0.35")
+        # 5 contracts sold 0.05 below the midpoint they were valued at
+        assert history.total(2) - history.total(1) == pytest.approx(-0.25)
+        value, net = history.value["Crypto"], history.net_cash["Crypto"]
+        assert value[1] - value[2] == 2.0
+        assert net[2] - net[1] == pytest.approx(1.75)
+
+    def test_a_settlement_moves_value_into_cash(self):
+        ledger = _ledger([_fill("m", "M", T0, True, 10, "0.30")],
+                         payouts=[Payout("M", _utc(2026, 9, 29, 10), "yes", None, D(10))])
+        read_at = _utc(2026, 10, 1, 12)
+        closes = live_portfolio.day_ends(START, read_at)
+        marks = Marks({"M": ((closes[0], D("0.70")),)}, {}, read_at)
+        history = live_portfolio.build_history(_after(D(100), ledger, read_at=read_at), ledger,
+                                               marks, _crypto, START)
+        assert history.cash == (100.0, 97.0, 107.0, 107.0, 107.0)
+        assert history.value == {OTHER_BETS: (0.0, 7.0, 0.0, 0.0, 0.0)}
+        # Paid $10 for contracts valued at $7 the night before
+        assert history.total(2) - history.total(1) == pytest.approx(3.0)
+        assert history.net_cash[OTHER_BETS] == (0.0, -3.0, 7.0, 7.0, 7.0)
+        assert history.spent[OTHER_BETS] == (0.0, 3.0, 3.0, 3.0, 3.0)
+        assert history.steps[OTHER_BETS] == ((T0, -3.0), (_utc(2026, 9, 29, 10), 7.0))
+
+    def test_a_group_with_no_value_but_cash_that_moved_is_kept(self):
+        fills = [_fill("old-buy", "Z", T0 - timedelta(days=2), True, 1),
+                 _fill("old-sell", "Z", T0 - timedelta(days=1), False, 1),
+                 _fill("buy", "M", T0, True, 10, "0.30"),
+                 _fill("sell", "M", T0 + timedelta(hours=1), False, 10, "0.35")]
+        # T9's trade opened and closed before the start: nothing of it is shown
+        ledger = _ledger(fills, {"old-buy": "T9", "old-sell": "T9"})
+        read_at = _utc(2026, 10, 1, 12)
+        history = live_portfolio.build_history(
+            _after(D(100), ledger, read_at=read_at), ledger, Marks({}, {}, read_at),
+            lambda owner: "Old" if owner == "T9" else OTHER_BETS, START)
+        assert history.value == {OTHER_BETS: (0.0,) * 5}
+        assert history.net_cash[OTHER_BETS][-1] == pytest.approx(0.5)
+
+    def test_contracts_never_priced_are_valued_at_cost(self):
+        ledger = _ledger([_fill("m", "M", T0, True, 10, "0.30", "0.07")])
+        read_at = _utc(2026, 10, 1, 12)
+        history = live_portfolio.build_history(_after(D(100), ledger, read_at=read_at), ledger,
+                                               Marks({}, {}, read_at), _crypto, START)
+        assert history.value[OTHER_BETS] == (0.0, 3.07, 3.07, 3.07, 3.07)
+        assert [history.total(i) for i in range(5)] == pytest.approx([100.0] * 5)
+
+    def test_a_deposit_is_valued_at_the_moment_it_lands(self):
+        ledger = _ledger([_fill("m", "M", T0, True, 10, "0.30")])
+        read_at = _utc(2026, 10, 1, 12)
+        deposit = CashFlow(_utc(2026, 9, 29, 10), D("50"))
+        account = _after(D(100), ledger, flows=[deposit], read_at=read_at)
+        history = live_portfolio.build_history(account, ledger, Marks({}, {}, read_at), _crypto,
+                                               START)
+        assert history.times == (START, _utc(2026, 9, 29, 4), deposit.time,
+                                 _utc(2026, 9, 30, 4), _utc(2026, 10, 1, 4), read_at)
+        assert history.flows == (0.0, 0.0, 50.0, 0.0, 0.0, 0.0)
+        assert history.cash == (100.0, 97.0, 147.0, 147.0, 147.0, 147.0)
+
+
+# ---- statistics ------------------------------------------------------------
+
+def _times(read_at):
+    """The moments a history from START to `read_at` is valued at."""
+    return (START, *live_portfolio.day_ends(START, read_at), read_at)
+
+
+class TestPeriodStats:
+    READ = _utc(2026, 10, 1, 12)
+
+    def _deposit_history(self) -> History:
+        """+10%, +10% with a $50 deposit, -5%, +2%: the last two whole days in the middle."""
+        totals = (100.0, 110.0, 171.0, 162.45, 165.699)
+        return History(_times(self.READ), totals, {}, {}, {}, {}, (0.0, 0.0, 50.0, 0.0, 0.0))
+
+    def test_the_total_return_takes_a_deposit_out(self):
+        stats = live_portfolio.period_stats(self._deposit_history(), [], None, "All", 0)
+        assert stats.total_return == pytest.approx(1.1 * 1.1 * 0.95 * 1.02 - 1)
+        # Profit leaves the deposit out
+        assert stats.pnl == pytest.approx(165.699 - 100 - 50)
+        assert (stats.label, stats.first, stats.last) == ("All", START, self.READ)
+
+    def test_ratios_are_the_backtest_pages_over_whole_days_only(self):
+        stats = live_portfolio.period_stats(self._deposit_history(), [], None, "All", 0)
+        # The part-day before the first close and the one up to the read are left out
+        whole = pd.Series([121.0 / 110.0 - 1, 162.45 / 171.0 - 1])
+        assert stats.whole_days == 2
+        assert stats.sharpe == dashboard._sharpe(whole, 0.0,
+                                                 periods_per_year=config.CALENDAR_DAYS_PER_YEAR)
+        assert stats.sortino == dashboard._sortino(whole, 0.0,
+                                                   periods_per_year=config.CALENDAR_DAYS_PER_YEAR)
+        every = pd.Series([110.0 / 100.0 - 1, *whole, 165.699 / 162.45 - 1])
+        assert stats.sharpe != dashboard._sharpe(every, 0.0)
+
+    def test_the_ratios_are_looked_up_when_called(self, monkeypatch):
+        monkeypatch.setattr(dashboard, "_sharpe", lambda series, rf, *, periods_per_year: 7.0)
+        monkeypatch.setattr(dashboard, "_sortino", lambda series, rf, *, periods_per_year: 8.0)
+        stats = live_portfolio.period_stats(self._deposit_history(), [], None, "All", 0)
+        assert (stats.sharpe, stats.sortino) == (7.0, 8.0)
+
+    def test_the_hurdle_is_the_yield_on_the_share_in_positions(self):
+        cash = (100.0, 50.0, 60.0, 70.0, 70.0)
+        value = {"Crypto": (0.0, 60.0, 55.0, 40.0, 41.0)}            # totals 100 110 115 110 111
+        zeros = {"Crypto": (0.0,) * 5}
+        history = History(_times(self.READ), cash, value, zeros, zeros, {"Crypto": ()},
+                          (0.0,) * 5)
+        rates = treasury.RiskFreeRates(((date(2026, 9, 1), 0.04),), treasury.SOURCE_API, T0)
+        stats = live_portfolio.period_stats(history, [], rates, "All", 0)
+        whole = pd.Series([115.0 / 110.0 - 1, 110.0 / 115.0 - 1])
+        rf = np.array([0.04, 0.04]) * np.array([1 - 50.0 / 110.0, 1 - 60.0 / 115.0])
+        assert stats.sharpe == dashboard._sharpe(whole, rf, periods_per_year=365)
+        assert stats.sortino == dashboard._sortino(whole, rf, periods_per_year=365)
+        assert stats.sharpe != dashboard._sharpe(whole, 0.0, periods_per_year=365)
+
+    def test_under_two_whole_days_there_are_no_ratios(self):
+        read_at = _utc(2026, 9, 30, 12)                  # start, Sep 29, Sep 30, the read
+        history = History(_times(read_at), (100.0, 101.0, 99.0, 100.0), {}, {}, {}, {},
+                          (0.0,) * 4)
+        stats = live_portfolio.period_stats(history, [], None, "All", 0)
+        assert (stats.sharpe, stats.sortino, stats.whole_days) == (None, None, 1)
+        assert stats.total_return == pytest.approx(0.0)
+
+    def test_short_periods_on_a_short_history_are_all_of_it(self):
+        read_at = T0 + timedelta(days=10)
+        times = _times(read_at)
+        rng = random.Random(7)
+        cash = tuple(rng.uniform(40, 60) for _ in times)
+        value = {"Crypto": tuple(rng.uniform(40, 60) for _ in times),
+                 OTHER_BETS: tuple(rng.uniform(0, 5) for _ in times)}
+        net = {g: tuple(rng.uniform(-5, 5) for _ in times) for g in value}
+        steps = {g: tuple((t, rng.uniform(-9, 5)) for t in times[1:]) for g in value}
+        history = History(times, cash, value, net, net, steps, (0.0,) * len(times))
+        returns = [TradeReturn("T1", T0, D(4), 0.1, D(4), True),
+                   TradeReturn("T2", T0 + timedelta(days=3), D(2), -0.2, D(0), False)]
+        everything = live_portfolio.period_stats(history, returns, None, "All", 0)
+        assert everything.purchases == 2 and everything.pairs == 6 and everything.open_pairs == 4
+        for label, months in (("1M", 1), ("3M", 3), ("1Y", 12)):
+            assert live_portfolio.period_stats(history, returns, None, label, months) == (
+                dataclasses.replace(everything, label=label))
+
+    def test_money_put_to_work_the_day_it_lands_earns_only_from_then(self):
+        # $200: $100 in 200 YES A at 0.50. At 01:00 New York time on Sep 29,
+        # $1,000 lands and buys 2,000 YES B at 0.50. Both are at 0.52 at the
+        # next close: the day earned 3.67% on $1,200, not 22% on $200.
+        landed = _utc(2026, 9, 29, 5)
+        fills = [_fill("a", "A", T0, True, 200, "0.50"),
+                 _fill("b", "B", landed + timedelta(minutes=1), True, 2000, "0.50")]
+        ledger = _ledger(fills)
+        read_at = _utc(2026, 9, 30, 12)
+        closes = live_portfolio.day_ends(START, read_at)
+        marks = Marks({"A": ((closes[0], D("0.50")), (closes[1], D("0.52"))),
+                       "B": ((closes[1], D("0.52")),)}, {}, read_at)
+        account = _after(D(200), ledger, flows=[CashFlow(landed, D(1000))], read_at=read_at)
+        history = live_portfolio.build_history(account, ledger, marks, _crypto, START)
+        assert history.times == (START, closes[0], landed, closes[1], read_at)
+        assert [history.total(i) for i in range(5)] == pytest.approx(
+            [200.0, 200.0, 1200.0, 1244.0, 1244.0])
+        stats = live_portfolio.period_stats(history, [], None, "All", 0)
+        assert stats.total_return == pytest.approx(1244 / 1200 - 1)
+        assert stats.pnl == pytest.approx(44.0)
+        # The whole day from the Sep 29 close to the Sep 30 close, chained over
+        # the deposit, is the ratios' one day
+        assert stats.whole_days == 1
+
+    def test_a_whole_day_is_chained_over_the_moments_inside_it(self):
+        times = (START, _utc(2026, 9, 29, 4), _utc(2026, 9, 29, 10), _utc(2026, 9, 30, 4),
+                 _utc(2026, 9, 30, 15), _utc(2026, 10, 1, 4), _utc(2026, 10, 1, 12))
+        # Sep 29: +5% up to a $50 deposit, then +10%; Sep 30: -5%, then -2%
+        totals = (100.0, 110.0, 165.5, 182.05, 172.9475, 169.48855, 170.0)
+        flows = (0.0, 0.0, 50.0, 0.0, 0.0, 0.0, 0.0)
+        history = History(times, totals, {}, {}, {}, {}, flows)
+        stats = live_portfolio.period_stats(history, [], None, "All", 0)
+        steps = [110.0 / 100.0, 115.5 / 110.0, 182.05 / 165.5, 172.9475 / 182.05,
+                 169.48855 / 172.9475, 170.0 / 169.48855]
+        assert steps[1:5] == pytest.approx([1.05, 1.10, 0.95, 0.98])
+        whole = pd.Series([steps[1] * steps[2] - 1, steps[3] * steps[4] - 1])
+        assert stats.whole_days == 2
+        assert stats.sharpe == pytest.approx(dashboard._sharpe(
+            whole, 0.0, periods_per_year=config.CALENDAR_DAYS_PER_YEAR), rel=1e-12)
+        assert stats.sortino == pytest.approx(dashboard._sortino(
+            whole, 0.0, periods_per_year=config.CALENDAR_DAYS_PER_YEAR), rel=1e-12)
+        assert stats.total_return == pytest.approx(math.prod(steps) - 1, rel=1e-12)
+
+    def test_a_start_or_a_read_at_a_close_bounds_a_whole_day(self):
+        # Both ends are daily closes: every day between them is whole
+        start, read_at = _utc(2026, 9, 28, 4), _utc(2026, 10, 1, 4)
+        times = (start, *live_portfolio.day_ends(start, read_at), read_at)
+        history = History(times, (100.0, 101.0, 99.0, 102.0), {}, {}, {}, {}, (0.0,) * 4)
+        stats = live_portfolio.period_stats(history, [], None, "All", 0)
+        assert stats.whole_days == 3
+        assert stats.sharpe == dashboard._sharpe(
+            pd.Series([101.0 / 100.0 - 1, 99.0 / 101.0 - 1, 102.0 / 99.0 - 1]), 0.0,
+            periods_per_year=config.CALENDAR_DAYS_PER_YEAR)
+
+    def test_a_month_back_is_counted_on_new_york_s_calendar(self):
+        # 22:00 New York time on Mar 30 is already Mar 31 in UTC: a month back is
+        # Feb 28 at 22:00 New York time, so the period opens at the Mar 1 close
+        start = _utc(2027, 1, 10, 12)
+        read_at = _utc(2027, 3, 31, 2)
+        times = (start, *live_portfolio.day_ends(start, read_at), read_at)
+        history = History(times, (100.0,) * len(times), {}, {}, {}, {}, (0.0,) * len(times))
+        assert live_portfolio.period_stats(history, [], None, "1M", 1).first == (
+            _utc(2027, 3, 1, 5))
+        later = _utc(2027, 3, 31, 12)
+        times = (start, *live_portfolio.day_ends(start, later), later)
+        history = History(times, (100.0,) * len(times), {}, {}, {}, {}, (0.0,) * len(times))
+        assert live_portfolio.period_stats(history, [], None, "1M", 1).first == (
+            _utc(2027, 3, 1, 5))
+
+    def test_a_period_opens_at_a_close_not_at_a_deposit(self):
+        # A month before Dec 1 10:00 New York time is Nov 1 10:00 (15:00 UTC); a
+        # deposit landed after it, at 20:00 UTC, before the Nov 2 close
+        times = (START, _utc(2026, 9, 29, 4), _utc(2026, 11, 1, 4), _utc(2026, 11, 1, 20),
+                 _utc(2026, 11, 2, 5), _utc(2026, 12, 1, 15))
+        history = History(times, (100.0, 100.0, 100.0, 105.0, 105.0, 105.0), {}, {}, {}, {},
+                          (0.0, 0.0, 0.0, 5.0, 0.0, 0.0))
+        assert live_portfolio.period_stats(history, [], None, "1M", 1).first == (
+            _utc(2026, 11, 2, 5))
+        assert live_portfolio.period_stats(history, [], None, "3M", 3).first == START
+
+    def test_a_month_back_starts_at_the_first_close_after_it(self):
+        read_at = _utc(2026, 12, 15, 12)
+        times = _times(read_at)
+        history = History(times, tuple(100.0 + i for i in range(len(times))), {}, {}, {}, {},
+                          (0.0,) * len(times))
+        returns = [TradeReturn("T1", T0, D(4), 0.1, D(4), True),
+                   TradeReturn("T2", _utc(2026, 12, 1), D(2), -0.2, D(2), True)]
+        stats = live_portfolio.period_stats(history, returns, None, "1M", 1)
+        # A month before Dec 15 12:00 UTC is Nov 15 12:00; the next close is midnight
+        # New York time on Nov 16 (05:00 UTC)
+        assert stats.first == _utc(2026, 11, 16, 5)
+        assert (stats.purchases, stats.pairs, stats.mean_trade) == (1, 2, -0.2)
+
+
+class TestGroupReturns:
+    def test_reinvested_money_is_not_put_in_twice(self):
+        t = [T0 + timedelta(minutes=i) for i in range(4)]
+        fills = [_fill("b1", "M1", t[0], True, 100, "0.10"),     # spend $10
+                 _fill("s1", "M1", t[1], False, 100, "0.12"),    # get $12 back
+                 _fill("b2", "M2", t[2], True, 100, "0.12"),     # spend the $12
+                 _fill("s2", "M2", t[3], False, 100, "0.144")]   # get $14.40 back
+        ledger = _ledger(fills, {"b1": "T1", "b2": "T2"},
+                         legs={"T1": frozenset({"M1", "X1"}), "T2": frozenset({"M2", "X2"})})
+        read_at = _utc(2026, 10, 1, 12)
+        history = live_portfolio.build_history(_after(D(100), ledger, read_at=read_at), ledger,
+                                               Marks({}, {}, read_at), _crypto, START)
+        stats = live_portfolio.period_stats(history, [], None, "All", 0)
+        [crypto] = stats.groups
+        assert crypto.group == "Crypto"
+        assert crypto.put_in == pytest.approx(10.0)
+        assert crypto.pnl == pytest.approx(4.4)
+        assert crypto.ret == pytest.approx(0.44)
+
+    def test_value_held_at_the_period_start_is_put_in(self):
+        times = _times(_utc(2026, 10, 1, 12))
+        history = History(times, (0.0,) * 5, {"Crypto": (0.0, 20.0, 22.0, 25.0, 25.0)},
+                          {"Crypto": (0.0, -20.0, -20.0, -20.0, -20.0)},
+                          {"Crypto": (0.0, 20.0, 20.0, 20.0, 20.0)},
+                          {"Crypto": ((T0, -20.0),)}, (0.0,) * 5)
+        # From the first close on: $20 held then, nothing more put in, $5 gained
+        stats = live_portfolio.period_stats(history, [], None, "1M", 1)
+        [crypto] = live_portfolio._group_returns(history, 1)
+        assert (crypto.put_in, crypto.pnl, crypto.ret) == (20.0, 5.0, 0.25)
+        assert stats.groups[0].put_in == 20.0           # the whole history: $20 spent
+        assert stats.groups[0].pnl == 5.0
+
+    def test_nothing_put_in_has_no_return(self):
+        times = _times(_utc(2026, 10, 1, 12))
+        history = History(times, (0.0,) * 5, {OTHER_BETS: (0.0,) * 5},
+                          {OTHER_BETS: (0.0, 1.0, 1.0, 1.0, 1.0)}, {OTHER_BETS: (0.0,) * 5},
+                          {OTHER_BETS: ((T0, 1.0),)}, (0.0,) * 5)
+        [group] = live_portfolio._group_returns(history, 0)
+        assert (group.pnl, group.put_in, group.ret) == (1.0, 0.0, None)
+
+
+class TestTradeReturns:
+    TRADE = _bot("T1", [("A", "yes", 10), ("B", "no", 10)], T0 + timedelta(minutes=1))
+
+    def _pair_ledger(self, *sales):
+        """T1's pair (YES A at 0.30, NO B at 0.40), then your sales of YES A: (count, price)."""
+        fills = [_fill("b", "B", T0, False, 10, "0.60"),
+                 _fill("a", "A", T0 + timedelta(seconds=1), True, 10, "0.30")]
+        fills += [_fill(f"sale{i}", "A", T0 + timedelta(days=1 + i), False, count, price)
+                  for i, (count, price) in enumerate(sales)]
+        return _ledger(fills, {"a": "T1", "b": "T1"}, legs={"T1": frozenset({"A", "B"})})
+
+    def test_a_sale_counts_toward_its_own_trade(self):
+        marks = Marks({}, {"A": D("0.55"), "B": D("0.55")}, READ)
+        [ret] = live_portfolio.trade_returns([self.TRADE], self._pair_ledger((10, "0.50")),
+                                             marks)
+        # Spent $7; $5 back from the sale; 10 NO B worth $4.50 now
+        assert ret.ret == pytest.approx((-7 + 5 + 4.5) / 7)
+        assert (ret.trade_id, ret.opened, ret.pairs) == ("T1", T0, D(10))
+        assert (ret.open_pairs, ret.still_open) == (D(0), True)
+
+    def test_a_partly_sold_trade_counts_only_what_is_held(self):
+        marks = Marks({}, {"A": D("0.55"), "B": D("0.55")}, READ)
+        [ret] = live_portfolio.trade_returns([self.TRADE], self._pair_ledger((4, "0.50")),
+                                             marks)
+        assert ret.open_pairs == D(6) and ret.still_open
+        assert ret.ret == pytest.approx((-7 + 2 + 6 * 0.55 + 4.5) / 7)
+
+    def test_contracts_never_priced_count_at_cost(self):
+        [ret] = live_portfolio.trade_returns([self.TRADE], self._pair_ledger(),
+                                             Marks({}, {}, READ))
+        assert ret.ret == 0.0 and ret.open_pairs == D(10)
+
+    def test_a_fully_closed_trade_is_no_longer_open(self):
+        fills = [_fill("b", "B", T0, False, 10, "0.60"),
+                 _fill("a", "A", T0 + timedelta(seconds=1), True, 10, "0.30")]
+        payouts = [Payout("A", T0 + timedelta(days=2), "yes", None, D(10)),
+                   Payout("B", T0 + timedelta(days=2), "yes", None, D(0))]
+        ledger = _ledger(fills, {"a": "T1", "b": "T1"}, payouts,
+                         legs={"T1": frozenset({"A", "B"})})
+        [ret] = live_portfolio.trade_returns([self.TRADE], ledger, Marks({}, {}, READ))
+        assert ret.ret == pytest.approx(3 / 7)
+        assert (ret.open_pairs, ret.still_open) == (D(0), False)
+
+    def test_rolled_back_rows_and_one_leg_purchases_are_left_out(self):
+        logged = T0 + timedelta(minutes=1)
+        trades = [self.TRADE,
+                  _bot("T2", [("D", "yes", 5), ("C", "no", 5)], logged, status="rolled_back"),
+                  _bot("T3", [("E", "yes", 5), ("F", "no", 5)], logged)]
+        fills = [_fill("b", "B", T0, False, 10, "0.60"),
+                 _fill("a", "A", T0 + timedelta(seconds=1), True, 10, "0.30"),
+                 _fill("r-no", "C", T0, False, 5, "0.50"),
+                 _fill("r-back", "C", T0 + timedelta(seconds=2), True, 5, "0.55"),
+                 _fill("t3-a", "E", T0, True, 5, "0.40")]
+        owners = {"a": "T1", "b": "T1", "r-no": "T2", "r-back": "T2", "t3-a": "T3"}
+        legs = {t.trade_id: frozenset(leg.ticker for leg in t.legs) for t in trades}
+        returns = live_portfolio.trade_returns(trades, _ledger(fills, owners, legs=legs),
+                                               Marks({}, {}, READ))
+        assert [r.trade_id for r in returns] == ["T1"]
+
+    @pytest.mark.parametrize("status, counted", [
+        ("executed", True), ("manual_review", True),
+        ("rolled_back", False), ("rollback_failed", False)])
+    def test_only_a_row_that_can_hold_a_pair_counts_when_both_orders_are_found(self, status,
+                                                                                counted):
+        # Both orders of the row are its own in the ledger; a manual-review row
+        # whose two orders filled holds a pair, a rolled-back or failed-unwind
+        # row never does (its YES leg never filled), whatever the ledger says
+        trade = _bot("T1", [("A", "yes", 10), ("B", "no", 10)], T0 + timedelta(minutes=1),
+                     status=status)
+        ledger = self._pair_ledger()
+        returns = live_portfolio.trade_returns([trade], ledger, Marks({}, {}, READ))
+        assert [(r.trade_id, r.pairs, r.open_pairs) for r in returns] == (
+            [("T1", D(10), D(10))] if counted else [])
+
+
+class TestPairWeighted:
+    @pytest.mark.parametrize("seed", range(200))
+    def test_it_matches_numpy_on_the_list_with_each_pair_once(self, seed):
+        rng = random.Random(seed)
+        returns = [TradeReturn(f"T{i}", T0, D(rng.randint(1, 6)),
+                               rng.choice([rng.uniform(-1, 2), round(rng.uniform(-1, 1), 1)]),
+                               D(0), False)
+                   for i in range(rng.randint(1, 12))]
+        expanded = [r.ret for r in returns for _ in range(int(r.pairs))]
+        mean, median = live_portfolio.pair_weighted(returns)
+        assert median == np.median(expanded)
+        assert mean == pytest.approx(float(np.mean(expanded)), rel=1e-12)
+
+    def test_no_purchase_has_no_figure(self):
+        assert live_portfolio.pair_weighted([]) == (None, None)
+
+
+# ---- the cash each run logged ----------------------------------------------
+
+class TestCheckLoggedCash:
+    def _setup(self, shards=1):
+        """$3.00 of the bot's YES A bought at T0, leaving $20.2275 of cash now."""
+        fill = _fill("bot", "A", T0, True, 10, "0.30")
+        ledger = _ledger([fill], {"bot": "T1"})
+        account = Account(READ, D("20.2275"), shards, None, {"A": D(10)}, (fill,), (), (), False)
+        return account, ledger
+
+    def _check(self, banner, *, shards=1, first=T0, logged=T0 + timedelta(minutes=1)):
+        account, ledger = self._setup(shards)
+        run = RunStart(logged - timedelta(hours=6), logged, D(banner))
+        fills = {run.logged_at: first} if first else {}
+        return live_portfolio.check_logged_cash(account, ledger, [run], fills)
+
+    def test_a_banner_rounded_down_to_the_cent_matches(self):
+        # Rebuilt just before the run's first fill: $23.2275, logged as $23.22
+        check = self._check("23.22")
+        assert (check.matched, check.checked, check.worst, check.misses) == (1, 1, D("0.0075"), ())
+
+    @pytest.mark.parametrize("banner, shards, matches", [
+        ("23.2075", 1, False),     # $0.02 more rebuilt than logged
+        ("23.2475", 1, False),     # $0.02 less
+        ("23.2325", 1, True),      # half a cent less: still a match
+        ("23.2326", 1, False),
+        ("23.2175", 1, False),     # a whole cent more, on one shard
+        ("23.2175", 2, True),      # ... is within two shards' rounding
+        ("23.2075", 2, False),
+    ])
+    def test_the_bounds(self, banner, shards, matches):
+        check = self._check(banner, shards=shards)
+        assert check.matched == int(matches)
+        logged = T0 + timedelta(minutes=1)
+        assert check.misses == (() if matches else ((logged, D(banner), D("23.2275")),))
+
+    def test_a_run_with_no_fills_is_checked_at_its_log_time(self):
+        # After the fill: $20.2275 rebuilt at the log time
+        assert self._check("20.22", first=None).matched == 1
+        assert self._check("23.22", first=None).matched == 0
+
+    def test_a_run_before_the_bots_first_fill_is_checked_too(self):
+        # A real run whose orders never filled, logged an hour before the
+        # bot's first fill: its cash is rebuilt at its log time
+        before = T0 - timedelta(hours=1)
+        check = self._check("23.22", first=None, logged=before)
+        assert (check.checked, check.matched) == (1, 1)
+        miss = self._check("23.20", first=None, logged=before)
+        assert miss.misses == ((before, D("23.20"), D("23.2275")),)
+
+    def test_a_miss_is_one_sentence_with_the_rebuilt_cash_to_the_hundredth_of_a_cent(self):
+        logged = _utc(2026, 9, 28, 7, 11, 35)
+        check = live_portfolio.CashCheck(0, 2, D("1.004999999999"), (
+            (logged, D("101.00"), D("100.005000000000")),
+            (logged + timedelta(days=1), D("50.10"), D("49.123456789012"))))
+        assert live_portfolio._cash_miss_warnings(check) == [
+            "The run logged at 2026-09-28 07:11 UTC wrote $101.00 as its cash before trading; "
+            "Kalshi's records rebuild $100.0050 then",
+            "The run logged at 2026-09-29 07:11 UTC wrote $50.10 as its cash before trading; "
+            "Kalshi's records rebuild $49.1235 then"]
+
+
+# ---- the whole view, and its log line ----------------------------------------
+
+def _view(**changes) -> LiveView:
+    """A LiveView built from Decimal fixtures, as build_live_view returns one."""
+    holding = Holding("A", "Will A?", "Crypto", "yes", D("10"), D("0.45"), D("4.50"), D("3.0700"))
+    view = LiveView(READ, D("20.2275"), D("7.85"), (holding,), ("Crypto",), None, None, (),
+                    live_portfolio.CashCheck(1, 1, D("0.0075"), ()), None, False, ())
+    return dataclasses.replace(view, **changes)
+
+
+class TestSnapshot:
+    def test_the_record_is_plain_json(self):
+        record = live_portfolio.snapshot_record(_view())
+        assert json.loads(json.dumps(record)) == {
+            "read_at": "2026-10-07T12:00:00+00:00", "cash": "20.2275",
+            "kalshi_positions_value": "7.85", "holdings_value": "4.50", "changing": False,
+            "holdings": [{"ticker": "A", "title": "Will A?", "group": "Crypto", "side": "yes",
+                          "contracts": "10", "price": "0.45", "value": "4.50",
+                          "cost": "3.0700"}]}
+        never_priced = dataclasses.replace(_view().holdings[0], price=None)
+        record = live_portfolio.snapshot_record(
+            _view(holdings=(never_priced,), kalshi_positions_value=None))
+        assert json.loads(json.dumps(record))["holdings"][0]["price"] is None
+        assert record["kalshi_positions_value"] is None
+
+    def test_each_read_adds_one_line(self, tmp_path):
+        log = config.LIVE_PORTFOLIO_LOG_FILE
+        assert log.parent == tmp_path
+        live_portfolio.append_snapshot(_view())
+        live_portfolio.append_snapshot(_view(cash=D("1")))
+        lines = log.read_text(encoding="utf-8").splitlines()
+        assert [json.loads(line)["cash"] for line in lines] == ["20.2275", "1"]
+
+    def test_a_write_that_fails_is_a_warning(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(config, "LIVE_PORTFOLIO_LOG_FILE", tmp_path)   # a folder
+        with caplog.at_level(logging.WARNING):
+            live_portfolio.append_snapshot(_view())
+        assert [r.levelno for r in caplog.records] == [logging.WARNING]
+        assert "Could not add this read of the account to" in caplog.text
+
+    def test_a_record_json_cannot_hold_is_a_warning(self, caplog):
+        odd = dataclasses.replace(_view().holdings[0], group=object())
+        with caplog.at_level(logging.WARNING):
+            live_portfolio.append_snapshot(_view(holdings=(odd,)))
+        assert "TypeError" in caplog.text
+        assert not config.LIVE_PORTFOLIO_LOG_FILE.exists()
+
+
+def _market_row(ticker, event, bid, ask) -> dict:
+    """A market record as /markets sends it."""
+    return {"ticker": ticker, "event_ticker": event, "title": f"Will {ticker}?",
+            "status": "active", "result": "", "yes_bid_dollars": bid, "yes_ask_dollars": ask,
+            "last_price_dollars": bid}
+
+
+@pytest.fixture
+def whole_account(kalshi, monkeypatch):
+    """FakeKalshi for the account and its markets, FakeCandles for the daily candles."""
+    fake = FakeCandles()
+
+    def get(client, path, **params):
+        if path.endswith("candlesticks"):
+            return fake(client, path, **params)
+        return kalshi(client, path, **params)
+
+    monkeypatch.setattr(historical, "_historical_get", get)
+    return kalshi, fake
+
+
+class TestBuildLiveView:
+    CATEGORIES = {"KXCRYPTO": ("Crypto", ("BTC",))}
+
+    def _account(self, kalshi, fake, positions=None):
+        """One bot pair (13 YES A1 at 0.30, 13 NO B1 at 0.40) and 5 YES X of your own."""
+        kalshi.rows["/portfolio/fills"] = [
+            fill_row("bot-a", "A1", T0 - timedelta(seconds=2), "bid", 13, "0.30"),
+            fill_row("bot-b", "B1", T0 - timedelta(seconds=3), "ask", 13, "0.60"),
+            fill_row("mine", "X", T0 - timedelta(days=2), "bid", 5, "0.20"),
+        ]
+        held = positions or {"A1": "13.00", "B1": "-13.00", "X": "5.00"}
+        kalshi.rows["/portfolio/positions"] = [{"ticker": t, "position_fp": n}
+                                               for t, n in held.items()]
+        # $100.0050 before the bot's $9.10 pair
+        kalshi.balance = {"balance_breakdown": [{"exchange_index": 0,
+                                                 "balance_dollars": "90.9050"}],
+                          "portfolio_value": 1225}
+        kalshi.rows["/markets"] = [_market_row("A1", "KXCRYPTO-26DEC", "0.40", "0.50"),
+                                   _market_row("B1", "KXCRYPTO-26DEC31", "0.55", "0.65"),
+                                   _market_row("X", "KXWEATHER-26OCT", "0.20", "0.30")]
+        closes = live_portfolio.day_ends(T0 - timedelta(days=3), datetime.now(UTC))
+        for ticker, mid in (("A1", ("0.40", "0.50")), ("B1", ("0.55", "0.65")),
+                            ("X", ("0.20", "0.30"))):
+            fake.batch[ticker] = [_candle(c, *mid) for c in closes]
+
+    def test_a_bot_pair_and_your_own_bet(self, whole_account, log_paths, pacific, monkeypatch):
+        kalshi, fake = whole_account
+        self._account(kalshi, fake)
+        _write_run(monkeypatch, T0, [_trade_result("A1", "B1", "executed")], 100.00)
+        view = live_portfolio.build_live_view(
+            object(), risk_free=None, series_categories=self.CATEGORIES,
+            trade_logs=live_portfolio.trade_log_paths())
+        assert view.warnings == ()
+        assert (view.cash, view.kalshi_positions_value) == (D("90.9050"), D("12.25"))
+        assert view.group_order == ("Crypto", OTHER_BETS)
+        assert [(h.ticker, h.group, h.side, h.contracts, h.price, h.value, h.cost)
+                for h in view.holdings] == [
+            ("A1", "Crypto", "yes", D(13), D("0.45"), D("5.85"), D("3.9000")),
+            ("B1", "Crypto", "no", D(13), D("0.40"), D("5.20"), D("5.2000")),
+            ("X", OTHER_BETS, "yes", D(5), D("0.25"), D("1.25"), D("1.0000"))]
+        assert view.holdings[0].title == "Will A1?"
+        assert view.holdings_value == D("12.30")
+        # The banner's $100.00 against $100.0050 rebuilt just before the pair
+        assert (view.cash_check.matched, view.cash_check.checked) == (1, 1)
+        assert view.history.times[0] == T0 - timedelta(seconds=3, microseconds=1)
+        assert [p.label for p in view.periods] == [label for label, _ in
+                                                   config.LIVE_DASHBOARD_PERIODS]
+        [trade] = view.trades
+        assert trade.ret == pytest.approx((-9.10 + 5.85 + 5.20) / 9.10)
+        assert view.periods[0].purchases == 1
+        # The history's last moment is the read, valued as the holdings are
+        assert view.history.total(-1) == pytest.approx(90.905 + 12.30)
+        assert {t for p in fake.batches() for t in p["market_tickers"].split(",")} == {
+            "A1", "B1", "X"}
+        assert view.changing is False
+
+    def _two_categories(self, kalshi, fake):
+        """
+        Two bot pairs in one run, and a bet of your own held at the start.
+
+        Crypto: 13 YES A1 at 0.30 and 13 NO B1 at 0.40, $9.10. Climate: 10 YES
+        C1 at 0.20 (a weather market) and 10 NO D1 at 0.20 (a crypto market:
+        a purchase's category is its market A's), $4.00, but worth more than
+        Crypto now. Your 5 YES X, bought two days before the bot's first
+        fill, paid out a day after it; Kalshi lists that settlement and no
+        position, so only the ledger shows X held at the start.
+        """
+        self._account(kalshi, fake, positions={"A1": "13.00", "B1": "-13.00", "C1": "10.00",
+                                               "D1": "-10.00"})
+        kalshi.rows["/portfolio/fills"] += [
+            fill_row("bot-c", "C1", T0 - timedelta(seconds=5), "bid", 10, "0.20"),
+            fill_row("bot-d", "D1", T0 - timedelta(seconds=6), "ask", 10, "0.80")]
+        paid = T0 + timedelta(days=1)
+        kalshi.rows["/portfolio/settlements"] = [
+            {"ticker": "X", "settled_time": _iso(paid), "market_result": "yes", "revenue": 500}]
+        # $100.0050 before the bot's two pairs ($13.10), and X's $5 since
+        kalshi.balance = {"balance_breakdown": [{"exchange_index": 0,
+                                                 "balance_dollars": "91.9050"}],
+                          "portfolio_value": 2905}
+        kalshi.rows["/markets"] = [
+            *(row for row in kalshi.rows["/markets"] if row["ticker"] != "X"),
+            _market_row("C1", "KXWEATHER-26OCT", "0.85", "0.95"),
+            _market_row("D1", "KXCRYPTO-26NOV", "0.05", "0.15"),
+            {**_market_row("X", "KXWEATHER-26OCT", "0.98", "1.00"), "status": "finalized",
+             "result": "yes", "settlement_ts": _iso(paid)}]
+        closes = live_portfolio.day_ends(T0 - timedelta(days=3), datetime.now(UTC))
+        fake.batch["C1"] = [_candle(c, "0.85", "0.95") for c in closes]
+        fake.batch["D1"] = [_candle(c, "0.05", "0.15") for c in closes]
+        fake.batch["X"] = [_candle(c, "0.20", "0.30") for c in closes if c <= paid]
+
+    def test_categories_are_market_as_and_ordered_by_money_put_in(self, whole_account,
+                                                                   log_paths, pacific,
+                                                                   monkeypatch):
+        kalshi, fake = whole_account
+        self._two_categories(kalshi, fake)
+        _write_run(monkeypatch, T0, [_trade_result("A1", "B1", "executed"),
+                                     _trade_result("C1", "D1", "executed", count=10)], 100.00)
+        view = live_portfolio.build_live_view(
+            object(), risk_free=None,
+            series_categories={**self.CATEGORIES, "KXWEATHER": ("Climate", ("Rain",))},
+            trade_logs=live_portfolio.trade_log_paths())
+        assert view.warnings == ()
+        # Crypto put in $9.10 and Climate $4.00, though Climate is worth more now
+        assert view.group_order == ("Crypto", "Climate", OTHER_BETS)
+        assert [(h.ticker, h.group, h.value) for h in view.holdings] == [
+            ("A1", "Crypto", D("5.85")), ("B1", "Crypto", D("5.20")),
+            ("C1", "Climate", D("9.00")), ("D1", "Climate", D("9.00"))]
+        # X was looked up once the ledger showed it held at the start, so it
+        # has its daily price there (0.25), not what it cost (0.20)
+        asked = [params["tickers"] for path, params in kalshi.calls if path == "/markets"]
+        assert asked == ["A1,B1,C1,D1", "X"]
+        assert view.history.value[OTHER_BETS][0] == pytest.approx(1.25)
+        assert (view.cash_check.matched, view.cash_check.checked) == (1, 1)
+
+    def test_an_account_that_kept_changing_says_so(self, whole_account, log_paths, pacific,
+                                                    monkeypatch):
+        kalshi, fake = whole_account
+        self._account(kalshi, fake)
+        _write_run(monkeypatch, T0, [_trade_result("A1", "B1", "executed")], 100.00)
+        read = live_portfolio.read_account
+        monkeypatch.setattr(live_portfolio, "read_account",
+                            lambda client: dataclasses.replace(read(client), changing=True))
+        view = live_portfolio.build_live_view(
+            object(), risk_free=None, series_categories=self.CATEGORIES,
+            trade_logs=live_portfolio.trade_log_paths())
+        assert view.changing is True
+        assert view.warnings == ("The account kept changing while it was read: the figures "
+                                 "may not all be from one moment",)
+
+    def test_every_real_run_is_checked_and_a_miss_is_a_warning(self, whole_account, log_paths,
+                                                              pacific, monkeypatch):
+        kalshi, fake = whole_account
+        self._account(kalshi, fake)
+        # A run two hours before the bot's first fill, whose pair failed and sent
+        # nothing that filled, then the bot's real pair, logged with a wrong cash
+        _write_run(monkeypatch, T0 - timedelta(hours=2), [_trade_result("A1", "B1", "failed")],
+                   100.00)
+        _write_run(monkeypatch, T0, [_trade_result("A1", "B1", "executed")], 101.00)
+        view = live_portfolio.build_live_view(
+            object(), risk_free=None, series_categories=self.CATEGORIES,
+            trade_logs=live_portfolio.trade_log_paths())
+        assert (view.cash_check.matched, view.cash_check.checked) == (1, 2)
+        assert view.warnings == ("The run logged at 2026-09-28 09:00 UTC wrote $101.00 as its "
+                                 "cash before trading; Kalshi's records rebuild $100.0050 then",)
+
+    def test_kalshi_holding_something_else_is_a_warning(self, whole_account, log_paths, pacific,
+                                                         monkeypatch):
+        kalshi, fake = whole_account
+        self._account(kalshi, fake, positions={"A1": "12.00", "B1": "-13.00", "X": "5.00",
+                                               "Y": "-2.00"})
+        _write_run(monkeypatch, T0, [_trade_result("A1", "B1", "executed")], 100.00)
+        view = live_portfolio.build_live_view(
+            object(), risk_free=None, series_categories=self.CATEGORIES,
+            trade_logs=live_portfolio.trade_log_paths())
+        assert view.warnings == (
+            "A1: Kalshi holds 12 YES, but the fills and payouts add up to 13 YES",
+            "Y: Kalshi holds 2 NO, but the fills and payouts add up to none")
+
+    def test_before_the_bots_first_trade_there_is_no_history(self, whole_account, log_paths):
+        kalshi, fake = whole_account
+        self._account(kalshi, fake)
+        view = live_portfolio.build_live_view(object(), risk_free=None, series_categories=None,
+                                              trade_logs=live_portfolio.trade_log_paths())
+        assert (view.history, view.periods, view.trades) == (None, None, ())
+        assert view.group_order == (OTHER_BETS,)
+        assert [(h.ticker, h.value) for h in view.holdings] == [
+            ("A1", D("5.85")), ("B1", D("5.20")), ("X", D("1.25"))]
+        assert fake.calls == []                          # no daily prices to read
+        assert view.cash_check.checked == 0
+
+    def test_a_purchase_whose_market_was_not_found_is_filed_by_its_ticker(self):
+        markets = {"A": _market("A", event="KXFED-26DEC")}
+        assert live_portfolio._event_of("A", markets) == "KXFED-26DEC"
+        assert live_portfolio._event_of("KXBTC-26OCT-T50", {}) == "KXBTC-26OCT"
+        assert live_portfolio._event_of("PLAIN", {}) == "PLAIN"
+        unlisted = dataclasses.replace(_market("B-1"), event_ticker="")
+        assert live_portfolio._event_of("B-1", {"B-1": unlisted}) == "B"

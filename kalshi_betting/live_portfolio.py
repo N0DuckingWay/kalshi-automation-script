@@ -14,14 +14,33 @@ Purpose:
     into a ledger of the contracts each owner bought, sold and was paid for,
     with the cash each one moved.
 
+    From the ledger it values the account over time: the cash, and each
+    holding at its midpoint, just before the bot's first trade, at each of
+    Kalshi's daily closes (midnight New York time), at each deposit or
+    withdrawal, and now, by category
+    (a bot purchase's category is its market A's Kalshi category; everything
+    else is Other bets). From those values it works out each period's
+    statistics (total return, profit, Sharpe and Sortino, each category's
+    return), each bot purchase's return, the holdings now, and whether the
+    cash each run logged before it traded matches the cash rebuilt from
+    Kalshi's records. build_live_view puts it all together for the page, and
+    append_snapshot writes one JSON line per read.
+
 Dependencies:
-    config (the LIVE_* page sizes, matching windows and read retries,
-    SCANNER_MAX_PAGES, count_text); auth (_positions_value_cents, its reading
-    of what the balance reply says the positions are worth); historical
-    (_historical_get, the retried, signed, read-only GET, looked up when it is
-    called so tests can replace it); reporter (PROD_LOG_PATH, where the
-    trade log lives, also looked up when it is called). Nothing in the
-    trading pipeline imports this module: it only reads.
+    config (the LIVE_* page sizes, matching windows, read retries, candle
+    limits, periods and files, SCANNER_MAX_PAGES,
+    CANDLESTICK_MAX_CANDLES_PER_REQUEST, CALENDAR_DAYS_PER_YEAR, count_text);
+    auth (_positions_value_cents, its reading of what the balance reply says
+    the positions are worth); historical (_historical_get, the retried,
+    signed, read-only GET, looked up when it is called so tests can replace
+    it; _candle_close, a candle's closing price; _load_json_cache and
+    _save_json_cache for the finalized markets' daily prices; series_labels
+    and infer_category, the backtest page's filing rule); reporter
+    (PROD_LOG_PATH, where the trade log lives, also looked up when it is
+    called); dashboard (_sharpe and _sortino, the backtest page's own ratios,
+    looked up when called); treasury (RiskFreeRates, the 8-week T-bill
+    yields); _http (api_error_summary, one line per failed request). Nothing
+    in the trading pipeline imports this module: it only reads.
 
 Notes:
     A fill's direction comes from its book_side alone: "bid" buys YES (or
@@ -40,23 +59,40 @@ Notes:
 
     The trade log's dates and times are this computer's local time (reporter
     writes them that way), so they are read in the local time zone.
+
+    A holding is valued at, in order: its market's decided result; the
+    midpoint of its quote (Kalshi shows an empty side as 0 for the bid or 1
+    for the ask, and the midpoint counts it there, so a one-sided quote is
+    halfway from its real side to that edge; a quote with both sides empty
+    gives none); the last trade, when strictly between 0 and 1; the latest
+    earlier daily price; and, never priced at all, what it cost.
 """
 from __future__ import annotations
 
+import bisect
 import dataclasses
+import json
+import logging
+import math
 import re
 import time
 from collections import defaultdict
-from collections.abc import Iterable
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as dtime
 from decimal import Decimal, InvalidOperation
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
+import numpy as np
 import openpyxl
+import pandas as pd
 
-from . import auth, config, historical, reporter
+from . import auth, config, dashboard, historical, reporter, treasury
+from ._http import api_error_summary
 
 # The owner of every contract the bot's trade log does not account for
 OTHER_BETS = "Other bets"
@@ -73,6 +109,12 @@ _OTHER_STATUSES = frozenset({"failed", "simulated"})
 # Statuses whose rows sent an order to buy their NO leg back (an unwind; on
 # "rollback_failed" it bought back part of the leg, or none)
 _UNWOUND_STATUSES = frozenset({"rolled_back", "rollback_failed"})
+
+# Statuses whose rows may have bought both legs: a completed purchase, and
+# one left for manual review. Both their legs are looked for among the
+# orders, and such a row counts as a purchase in the trade figures when both
+# its orders were found.
+_PAIR_STATUSES = frozenset({"executed", "manual_review"})
 
 # The start of a trade-log row's Notes: "[time_series: YES A / NO B ..."
 _NOTE = re.compile(r"^\[(\w+): (YES|NO) A / (YES|NO) B")
@@ -98,6 +140,13 @@ _BANNER = re.compile(r"^── Run: .*?Balance before: \$(-?[\d,]+\.\d+)")
 # Finder's "trade_log copy.xlsx", never matches.
 _FALLBACK_LOG = re.compile(
     r"trade_log_\d{4}-\d{2}-\d{2}_\d{6}_\d{6}(-(\d+|[0-9a-f]{8}))?\.xlsx")
+
+# Kalshi's daily candles close at midnight in this time zone
+_KALSHI_DAY = ZoneInfo(config.LIVE_CANDLE_DAY_ZONE)
+
+# A ticker that can name its own file in config.LIVE_MARKS_CACHE_DIR: letters,
+# digits, ".", "_" and "-" only, never starting with "." (so never "..")
+_CACHE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 # ---- what Kalshi says ------------------------------------------------------
@@ -181,6 +230,8 @@ class Market:
         yes_bid (Decimal | None): The best YES bid now.
         yes_ask (Decimal | None): The best YES ask now.
         last_price (Decimal | None): The YES price of the last trade.
+        archived (bool): True for a market found only in Kalshi's archive
+            (/historical/markets), whose daily prices only the archive serves.
     """
     ticker: str
     event_ticker: str
@@ -192,6 +243,7 @@ class Market:
     yes_bid: Decimal | None
     yes_ask: Decimal | None
     last_price: Decimal | None
+    archived: bool = False
 
 
 @dataclass(frozen=True)
@@ -585,12 +637,13 @@ def read_account(client: Any) -> Account:
     return dataclasses.replace(account, changing=True)
 
 
-def _market(row: dict) -> Market:
+def _market(row: dict, *, archived: bool) -> Market:
     """
     Read one market record from /markets or /historical/markets.
 
     Args:
         row (dict): The market record.
+        archived (bool): Keyword-only: True when it came from /historical/markets.
 
     Returns:
         Market: The market; a price it cannot read is None.
@@ -605,7 +658,7 @@ def _market(row: dict) -> Market:
                   str(row.get("result") or ""), _when(settled) if settled else None,
                   _opt_dec(row.get("settlement_value_dollars")),
                   _opt_dec(row.get("yes_bid_dollars")), _opt_dec(row.get("yes_ask_dollars")),
-                  _opt_dec(row.get("last_price_dollars")))
+                  _opt_dec(row.get("last_price_dollars")), archived)
 
 
 def read_markets(client: Any, tickers: Iterable[str]) -> dict[str, Market]:
@@ -619,8 +672,9 @@ def read_markets(client: Any, tickers: Iterable[str]) -> dict[str, Market]:
         tickers (Iterable[str]): The markets wanted.
 
     Returns:
-        dict[str, Market]: Each market found, by ticker; a market neither
-            listing has is left out.
+        dict[str, Market]: Each market found, by ticker (Market.archived is
+            True for one only the archive has); a market neither listing has
+            is left out.
 
     Raises:
         ValueError: If a reply or a record cannot be read.
@@ -634,7 +688,7 @@ def read_markets(client: Any, tickers: Iterable[str]) -> dict[str, Market]:
         for i in range(0, len(missing), step):
             for row in _pages(client, path, "markets", tickers=",".join(missing[i:i + step]),
                               limit=config.LIVE_PAGE_SIZE):
-                market = _market(row)
+                market = _market(row, archived=path == "/historical/markets")
                 found[market.ticker] = market
     return found
 
@@ -971,7 +1025,7 @@ def match_bot_fills(trades: list[BotTrade], fills: Iterable[Fill]
             order.sort(key=lambda f: (f.time, f.fill_id))
     ordered = sorted(trades, key=lambda t: t.logged_at)
     wanted = [(t, leg) for t in ordered for leg in t.legs
-              if t.status in ("executed", "manual_review") or leg.side == "no"]
+              if t.status in _PAIR_STATUSES or leg.side == "no"]
     owner: dict[str, str] = {}
     no_opened: dict[str, datetime] = {}
     left: list[tuple[BotTrade, BotLeg]] = []
@@ -1365,3 +1419,1459 @@ def build_ledger(fills: Iterable[Fill], payouts: Iterable[Payout], owner_by_fill
         if net := sum((lot.count if lot.side == "yes" else -lot.count for lot in open_lots), _ZERO):
             held[ticker] = net
     return Ledger(tuple(events), held, tuple(warnings))
+
+
+# ---- prices ----------------------------------------------------------------
+
+def day_ends(start: datetime, end: datetime) -> list[datetime]:
+    """
+    List each daily close strictly between two moments.
+
+    Kalshi's daily candles close at midnight in config.LIVE_CANDLE_DAY_ZONE
+    (New York): 04:00 UTC in summer, 05:00 UTC in winter. These are the
+    moments, besides the start and now, the account is valued at.
+
+    Args:
+        start (datetime): An aware moment; a close exactly at it is left out.
+        end (datetime): An aware moment; a close exactly at it is left out.
+
+    Returns:
+        list[datetime]: The closes, in UTC, oldest first.
+    """
+    ends: list[datetime] = []
+    day = start.astimezone(_KALSHI_DAY).date()
+    while (moment := _day_close(day)) < end:
+        if moment > start:
+            ends.append(moment)
+        day += timedelta(days=1)
+    return ends
+
+
+def _day_close(day: date) -> datetime:
+    """
+    The moment one day begins on Kalshi's daily clock (midnight New York time).
+
+    Args:
+        day (date): The day.
+
+    Returns:
+        datetime: Midnight at the start of that day, in UTC.
+    """
+    return datetime.combine(day, dtime(0), _KALSHI_DAY).astimezone(UTC)
+
+
+def _is_close(moment: datetime) -> bool:
+    """
+    Whether a moment is one of Kalshi's daily closes (midnight New York time).
+
+    Args:
+        moment (datetime): An aware moment.
+
+    Returns:
+        bool: True when it is exactly midnight in config.LIVE_CANDLE_DAY_ZONE.
+    """
+    return moment == _day_close(moment.astimezone(_KALSHI_DAY).date())
+
+
+def _mid(bid: Decimal | None, ask: Decimal | None, last: Decimal | None) -> Decimal | None:
+    """
+    A YES price from a quote: its midpoint, else its last trade.
+
+    Kalshi shows a side with no orders as 0 (bid) or 1 (ask), the edge of
+    the price range, and the midpoint counts it there: a quote with no bid
+    is worth half its ask, and one with no ask is halfway from its bid to 1.
+    A quote with both sides empty (bid 0, ask 1), or whose bid is not below
+    its ask, or that lies outside 0 to 1, gives no midpoint; the last trade
+    is then used when it is strictly between 0 and 1.
+
+    Args:
+        bid (Decimal | None): The best YES bid.
+        ask (Decimal | None): The best YES ask.
+        last (Decimal | None): The YES price of the last trade.
+
+    Returns:
+        Decimal | None: The YES price, or None when the quote gives none.
+    """
+    if (bid is not None and ask is not None and _ZERO <= bid < ask <= _ONE
+            and (bid > _ZERO or ask < _ONE)):
+        return (bid + ask) / 2
+    if last is not None and _ZERO < last < _ONE:
+        return last
+    return None
+
+
+def _candle_side(candle: dict, key: str) -> Decimal | None:
+    """
+    One side of a candle at its close.
+
+    The closing price is read by historical._candle_close, the backtest's own
+    reading: close_dollars when present, else close (both dollars).
+
+    Args:
+        candle (dict): One candle as Kalshi sends it.
+        key (str): "yes_bid", "yes_ask" or "price" (the trades).
+
+    Returns:
+        Decimal | None: The closing price in dollars, or None when the candle
+            has none this can read.
+    """
+    side = candle.get(key)
+    if not isinstance(side, dict):
+        return None
+    return _opt_dec(historical._candle_close(side))
+
+
+def _candle_last(candle: dict) -> Decimal | None:
+    """
+    The last trade at a daily candle's close.
+
+    On a day with trades it is the trades' close (_candle_side). On a day
+    with none, Kalshi's candle carries only the last price before the day,
+    which is still the last trade at the close: previous_dollars, else
+    previous, read as historical._candle_close reads close_dollars, else close
+    (a present but unreadable previous_dollars gives None).
+
+    Args:
+        candle (dict): One candle as Kalshi sends it.
+
+    Returns:
+        Decimal | None: The last trade's YES price in dollars, or None when
+            the candle has none this can read.
+    """
+    close = _candle_side(candle, "price")
+    if close is not None:
+        return close
+    price = candle.get("price")
+    if not isinstance(price, dict):
+        return None
+    for key in ("previous_dollars", "previous"):
+        raw = price.get(key)
+        if raw is not None and raw != "":
+            return _opt_dec(raw)
+    return None
+
+
+def _candle_mid(candle: dict) -> tuple[datetime, Decimal] | None:
+    """
+    A daily candle's YES price at its close: the midpoint, else the last trade.
+
+    Args:
+        candle (dict): One candle as Kalshi sends it.
+
+    Returns:
+        tuple[datetime, Decimal] | None: When the candle closed (UTC) and the
+            YES price then; None when it has no readable close time or price.
+    """
+    try:
+        when = _when(candle["end_period_ts"])
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return None
+    mid = _mid(_candle_side(candle, "yes_bid"), _candle_side(candle, "yes_ask"),
+               _candle_last(candle))
+    return None if mid is None else (when, mid)
+
+
+def quote_mid(market: Market) -> Decimal | None:
+    """
+    A market's YES value now.
+
+    Its payout once decided (1 or 0, or a scalar's YES value); otherwise the
+    midpoint of its quote, else its last trade (_mid).
+
+    Args:
+        market (Market): The market, from read_markets.
+
+    Returns:
+        Decimal | None: What one YES contract is worth, or None when nothing
+            gives a price.
+    """
+    if market.result in ("yes", "no"):
+        return _ONE if market.result == "yes" else _ZERO
+    if market.result == "scalar" and market.yes_value is not None:
+        return market.yes_value
+    return _mid(market.yes_bid, market.yes_ask, market.last_price)
+
+
+@dataclass(frozen=True)
+class Marks:
+    """
+    The YES value of each market the account held, over time.
+
+    Attributes:
+        daily (dict[str, tuple[tuple[datetime, Decimal], ...]]): By ticker,
+            each daily close (UTC) with the YES price then, oldest first.
+        now (dict[str, Decimal]): By ticker, the YES value now (quote_mid),
+            for markets that have one.
+        read_at (datetime): When the account was read.
+    """
+    daily: dict[str, tuple[tuple[datetime, Decimal], ...]]
+    now: dict[str, Decimal]
+    read_at: datetime
+    _times: dict[str, list[datetime]] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Index each market's daily closes once, for at()'s lookups."""
+        object.__setattr__(self, "_times", {ticker: [when for when, _ in points]
+                                            for ticker, points in self.daily.items()})
+
+    def at(self, ticker: str, moment: datetime) -> Decimal | None:
+        """
+        A market's YES value at a moment.
+
+        From the moment the account was read on, the value now when there is
+        one; otherwise the latest daily price at or before the moment.
+
+        Args:
+            ticker (str): The market.
+            moment (datetime): An aware moment.
+
+        Returns:
+            Decimal | None: The YES value, or None when the market has none yet
+                (its contracts are then valued at what they cost).
+        """
+        if moment >= self.read_at and ticker in self.now:
+            return self.now[ticker]
+        i = bisect.bisect_right(self._times.get(ticker, []), moment)
+        return self.daily[ticker][i - 1][1] if i else None
+
+
+def _now_marks(tickers: Iterable[str], markets: dict[str, Market]) -> dict[str, Decimal]:
+    """
+    The YES value now of each market that has one.
+
+    Args:
+        tickers (Iterable[str]): The markets wanted.
+        markets (dict[str, Market]): Markets looked up, from read_markets.
+
+    Returns:
+        dict[str, Decimal]: By ticker, quote_mid of each market found that has a value.
+    """
+    now: dict[str, Decimal] = {}
+    for ticker in tickers:
+        market = markets.get(ticker)
+        mid = quote_mid(market) if market is not None else None
+        if mid is not None:
+            now[ticker] = mid
+    return now
+
+
+def _candle_windows(start_ts: int, end_ts: int, most: int) -> list[tuple[int, int]]:
+    """
+    Split a span of time into windows that each hold at most `most` daily candles per market.
+
+    A window from lo to hi holds at most _candles_in(lo, hi) candles of one
+    market. Neighbouring windows share their end second, so a candle ending
+    exactly there can come back twice; the caller keeps one.
+
+    Args:
+        start_ts (int): The span's start, in seconds since 1970.
+        end_ts (int): The span's end, in seconds since 1970.
+        most (int): The most candles of one market a window may hold.
+
+    Returns:
+        list[tuple[int, int]]: The windows (start, end), oldest first.
+    """
+    period = config.LIVE_CANDLE_PERIOD_MINUTES * 60
+    span = max(1, most - 2) * period
+    windows: list[tuple[int, int]] = []
+    lo = start_ts
+    while True:
+        hi = min(lo + span, end_ts)
+        windows.append((lo, max(lo, hi)))
+        if hi >= end_ts:
+            return windows
+        lo = hi
+
+
+def _candles_in(lo: int, hi: int) -> int:
+    """
+    The most daily candles of one market a request from lo to hi can return.
+
+    One per daily close inside the window, one for the day still open at its
+    end, and one more for a day a clock change shortened.
+
+    Args:
+        lo (int): The window's start, in seconds since 1970.
+        hi (int): The window's end, in seconds since 1970.
+
+    Returns:
+        int: The most candles.
+    """
+    return (hi - lo) // (config.LIVE_CANDLE_PERIOD_MINUTES * 60) + 2
+
+
+def _read_batch(client: Any, tickers: list[str], start_ts: int, end_ts: int,
+                warnings: list[str]) -> tuple[dict[str, list[dict]], set[str]]:
+    """
+    Read daily candles for many markets through Kalshi's batch candlestick listing.
+
+    GET /markets/candlesticks, with at most config.LIVE_CANDLE_TICKERS_PER_REQUEST
+    markets per request and never more than config.LIVE_CANDLE_MAX_PER_REQUEST
+    candles in one answer. A request that fails, or whose reply has no list
+    of markets, is one warning, and its markets are left without daily
+    prices; an entry of the list that is not an object naming one of the
+    markets asked for is skipped.
+
+    Args:
+        client (Any): A client from auth.build_client.
+        tickers (list[str]): The markets.
+        start_ts (int): The first moment wanted, in seconds since 1970.
+        end_ts (int): The last moment wanted, in seconds since 1970.
+        warnings (list[str]): Gets one line per request that failed.
+
+    Returns:
+        tuple: The raw candles of each market the answers listed, by ticker;
+            and the markets whose request failed.
+    """
+    served: dict[str, list[dict]] = defaultdict(list)
+    failed: set[str] = set()
+    most = config.LIVE_CANDLE_MAX_PER_REQUEST
+    for lo, hi in _candle_windows(start_ts, end_ts, most):
+        size = max(1, min(config.LIVE_CANDLE_TICKERS_PER_REQUEST, most // _candles_in(lo, hi)))
+        for i in range(0, len(tickers), size):
+            chunk = tickers[i:i + size]
+            try:
+                data = _get(client, "/markets/candlesticks", market_tickers=",".join(chunk),
+                            start_ts=lo, end_ts=hi,
+                            period_interval=config.LIVE_CANDLE_PERIOD_MINUTES)
+                entries = data.get("markets")
+                if not isinstance(entries, list):
+                    raise ValueError("the batch candle reply came without a market list")
+            except Exception as exc:  # one failed request costs its markets' daily prices only
+                failed.update(chunk)
+                warnings.append(f"Daily prices of {len(chunk)} market(s) could not be read "
+                                f"({api_error_summary(exc)}): they are valued at their last "
+                                f"known price, or at what they cost")
+                continue
+            wanted = set(chunk)
+            for entry in entries:
+                ticker = entry.get("market_ticker") if isinstance(entry, dict) else None
+                if not isinstance(ticker, str) or ticker not in wanted:
+                    continue
+                candles = entry.get("candlesticks")
+                if isinstance(candles, list):
+                    served[ticker].extend(candle for candle in candles if isinstance(candle, dict))
+    return dict(served), failed
+
+
+def _read_archive(client: Any, ticker: str, start_ts: int, end_ts: int) -> list[dict]:
+    """
+    Read one market's daily candles from Kalshi's archive.
+
+    GET /historical/markets/{ticker}/candlesticks, in requests of at most
+    config.CANDLESTICK_MAX_CANDLES_PER_REQUEST candles each.
+
+    Args:
+        client (Any): A client from auth.build_client.
+        ticker (str): The market.
+        start_ts (int): The first moment wanted, in seconds since 1970.
+        end_ts (int): The last moment wanted, in seconds since 1970.
+
+    Returns:
+        list[dict]: The raw candles.
+
+    Raises:
+        ValueError: If an answer has no candle list.
+        Exception: Whatever the request raises (an ApiException after the retries).
+    """
+    candles: list[dict] = []
+    for lo, hi in _candle_windows(start_ts, end_ts, config.CANDLESTICK_MAX_CANDLES_PER_REQUEST):
+        data = _get(client, f"/historical/markets/{ticker}/candlesticks", start_ts=lo, end_ts=hi,
+                    period_interval=config.LIVE_CANDLE_PERIOD_MINUTES)
+        rows = data.get("candlesticks")
+        if not isinstance(rows, list):
+            raise ValueError(f"the archive's candles for {ticker} came without a candle list")
+        candles.extend(row for row in rows if isinstance(row, dict))
+    return candles
+
+
+def _marks_file(ticker: str) -> Path | None:
+    """
+    The file a finalized market's daily candles are kept in.
+
+    config.LIVE_MARKS_CACHE_DIR is read when this is called, so tests can
+    point it elsewhere.
+
+    Args:
+        ticker (str): The market.
+
+    Returns:
+        Path | None: LIVE_MARKS_CACHE_DIR/<ticker>.json, or None for a ticker
+            that cannot safely name a file.
+    """
+    if not _CACHE_NAME.fullmatch(ticker):
+        return None
+    return Path(config.LIVE_MARKS_CACHE_DIR) / f"{ticker}.json"
+
+
+def _finalized(market: Market | None) -> bool:
+    """
+    Whether a market's prices can no longer change (Kalshi has finalized it).
+
+    Args:
+        market (Market | None): The market, or None when it was not found.
+
+    Returns:
+        bool: True for a finalized market.
+    """
+    return market is not None and market.status == "finalized"
+
+
+def _kept_candles(ticker: str, start_ts: int) -> list[dict] | None:
+    """
+    A finalized market's daily candles from its file, when they go back far enough.
+
+    Args:
+        ticker (str): The market.
+        start_ts (int): The first moment wanted, in seconds since 1970.
+
+    Returns:
+        list[dict] | None: The candles, or None when there is no usable file
+            or it starts later than `start_ts`.
+    """
+    path = _marks_file(ticker)
+    if path is None:
+        return None
+    # Cross-module: the backtest's own small-cache reader; a damaged file reads as no file
+    data = historical._load_json_cache(path)
+    if (not isinstance(data, dict) or data.get("ticker") != ticker
+            or type(data.get("start_ts")) is not int or data["start_ts"] > start_ts
+            or not isinstance(data.get("candles"), list)):
+        return None
+    return [candle for candle in data["candles"] if isinstance(candle, dict)]
+
+
+def _keep_candles(ticker: str, start_ts: int, end_ts: int, candles: list[dict]) -> None:
+    """
+    Write a finalized market's daily candles to its file, for later reads.
+
+    A file that cannot be written is logged and otherwise ignored: the
+    market is read from Kalshi again next time.
+
+    Args:
+        ticker (str): The market.
+        start_ts (int): The first moment the candles cover, in seconds since 1970.
+        end_ts (int): The last moment, in seconds since 1970.
+        candles (list[dict]): The raw candles.
+    """
+    path = _marks_file(ticker)
+    if path is None:
+        return
+    try:
+        # Cross-module: the backtest's own atomic writer (a temporary file, then a rename)
+        historical._save_json_cache(path, {"ticker": ticker, "start_ts": start_ts,
+                                           "end_ts": end_ts, "candles": candles})
+    except (OSError, TypeError, ValueError) as exc:
+        logging.warning("Could not keep the daily prices of %s in %s (%s)", ticker, path,
+                        api_error_summary(exc))
+
+
+def _daily_points(candles: Iterable[dict]) -> tuple[tuple[datetime, Decimal], ...]:
+    """
+    Turn raw daily candles into (close time, YES price) points.
+
+    Args:
+        candles (Iterable[dict]): Raw candles, in any order, possibly repeated.
+
+    Returns:
+        tuple: One point per close time (the last candle read wins), oldest
+            first; candles with no price are left out.
+    """
+    points: dict[datetime, Decimal] = {}
+    for candle in candles:
+        point = _candle_mid(candle)
+        if point is not None:
+            points[point[0]] = point[1]
+    return tuple(sorted(points.items()))
+
+
+def read_marks(client: Any, tickers: Iterable[str], start: datetime, markets: dict[str, Market],
+               read_at: datetime) -> tuple[Marks, list[str]]:
+    """
+    Read the daily prices, and the prices now, of the markets the account held.
+
+    The daily candles run from the day before `start` to the read. A
+    finalized market whose file in config.LIVE_MARKS_CACHE_DIR goes back far
+    enough is read from it, with no request. A market read_markets found only
+    in Kalshi's archive (Market.archived) is read from the archive's own
+    candle listing, one market at a time; the other markets read_markets
+    found are asked of Kalshi's batch listing (GET /markets/candlesticks),
+    and one that comes back with no candles there and has settled is then
+    read from the archive too. A market read from the archive is kept in its
+    file when it is finalized; a market that is still open is never kept.
+    A market read_markets did not find is never asked for: neither listing
+    has it, so it has no candles to read. A request that fails is a warning
+    (one line, through _http.api_error_summary), never an error: those
+    markets are valued at their last known price, or at what they cost. So
+    a failed batch request never costs the markets only the archive has.
+
+    Args:
+        client (Any): A client from auth.build_client.
+        tickers (Iterable[str]): The markets.
+        start (datetime): The first moment the account is valued at.
+        markets (dict[str, Market]): Markets looked up, from read_markets.
+        read_at (datetime): When the account was read.
+
+    Returns:
+        tuple: The Marks, and the warnings.
+    """
+    wanted = sorted(set(tickers))
+    now = _now_marks(wanted, markets)
+    if not wanted:
+        return Marks({}, now, read_at), []
+    day_before = start.astimezone(_KALSHI_DAY).date() - timedelta(days=1)
+    start_ts = int(_day_close(day_before).timestamp())
+    end_ts = max(start_ts, math.ceil(read_at.timestamp()))
+    warnings: list[str] = []
+    candles: dict[str, list[dict]] = {}
+    batch: list[str] = []
+    archive: list[str] = []
+    for ticker in wanted:
+        market = markets.get(ticker)
+        if market is None:
+            continue                     # found in neither listing: no candles to read
+        kept = _kept_candles(ticker, start_ts) if _finalized(market) else None
+        if kept is not None:
+            candles[ticker] = kept
+        elif market.archived:
+            archive.append(ticker)
+        else:
+            batch.append(ticker)
+    served, failed = _read_batch(client, batch, start_ts, end_ts, warnings)
+    candles.update(served)
+    # A settled market the batch gave no candles is looked for in the archive;
+    # one whose batch request failed, or that is still open, is not
+    archive += [ticker for ticker in batch if ticker not in failed and not served.get(ticker)
+                and markets[ticker].settled_at is not None]
+    for ticker in sorted(archive):
+        market = markets[ticker]
+        try:
+            archived = _read_archive(client, ticker, start_ts, end_ts)
+        except Exception as exc:  # one market's failure costs that market's daily prices only
+            warnings.append(f"Daily prices of {ticker} could not be read "
+                            f"({api_error_summary(exc)}): it is valued at its last known "
+                            f"price, or at what it cost")
+            continue
+        candles[ticker] = archived
+        if _finalized(market):
+            _keep_candles(ticker, start_ts, end_ts, archived)
+    daily = {ticker: points for ticker, rows in candles.items() if (points := _daily_points(rows))}
+    return Marks(daily, now, read_at), warnings
+
+
+def _value(side: str, count: Decimal, basis: Decimal, mark: Decimal | None) -> Decimal:
+    """
+    What some contracts are worth at a YES value.
+
+    Args:
+        side (str): "yes" or "no".
+        count (Decimal): Contracts held.
+        basis (Decimal): What they cost.
+        mark (Decimal | None): The YES value, or None when the market has never been priced.
+
+    Returns:
+        Decimal: count times the side's value (1 less the YES value for NO),
+            or what they cost when there is no YES value.
+    """
+    if mark is None:
+        return basis
+    return count * (mark if side == "yes" else _ONE - mark)
+
+
+# ---- the account over time -------------------------------------------------
+
+@dataclass(frozen=True)
+class History:
+    """
+    The account's value at each moment it is valued at, by group.
+
+    A group is a Kalshi category (for the bot's purchases) or OTHER_BETS.
+    Every series has one value per moment in `times`.
+
+    Attributes:
+        times (tuple[datetime, ...]): Just before the bot's first fill, each
+            daily close since, each deposit or withdrawal since (the moment it
+            landed, with it counted), and the read (UTC), oldest first.
+        cash (tuple[float, ...]): The cash.
+        value (dict[str, tuple[float, ...]]): Each group's holdings' value.
+        net_cash (dict[str, tuple[float, ...]]): Each group's cash in, less
+            cash out, since the start (fees included).
+        spent (dict[str, tuple[float, ...]]): Each group's dollars spent
+            opening contracts since the start (fees included).
+        steps (dict[str, tuple[tuple[datetime, float], ...]]): Each group's
+            net cash after each of its changes since the start.
+        flows (tuple[float, ...]): Deposits less withdrawals since the
+            previous moment (0 at the first). Each lands exactly at its own
+            moment, so none earns or loses anything before the next moment.
+    """
+    times: tuple[datetime, ...]
+    cash: tuple[float, ...]
+    value: dict[str, tuple[float, ...]]
+    net_cash: dict[str, tuple[float, ...]]
+    spent: dict[str, tuple[float, ...]]
+    steps: dict[str, tuple[tuple[datetime, float], ...]]
+    flows: tuple[float, ...]
+
+    def total(self, i: int) -> float:
+        """
+        The account's whole value at one moment: the cash and every holding.
+
+        Args:
+            i (int): The moment's place in `times`.
+
+        Returns:
+            float: The value in dollars.
+        """
+        return self.cash[i] + sum(series[i] for series in self.value.values())
+
+
+def _cash_reader(account: Account, ledger: Ledger) -> Callable[[datetime], Decimal]:
+    """
+    Build the reader of the cash at any moment: the cash now, less every change after it.
+
+    The changes are the ledger's cash (fills and payouts) and the deposits
+    and withdrawals.
+
+    Args:
+        account (Account): The account, from read_account.
+        ledger (Ledger): The ledger, from build_ledger.
+
+    Returns:
+        Callable[[datetime], Decimal]: The cash at a moment, in dollars.
+    """
+    changes = sorted([(e.time, e.cash) for e in ledger.events]
+                     + [(f.time, f.amount) for f in account.flows], key=lambda change: change[0])
+    times = [when for when, _ in changes]
+    after = [_ZERO] * (len(changes) + 1)          # after[i]: changes i, i+1, ... added up
+    for i in range(len(changes) - 1, -1, -1):
+        after[i] = after[i + 1] + changes[i][1]
+
+    def cash(moment: datetime) -> Decimal:
+        """The cash at `moment`: the cash now, less every change after it."""
+        return account.cash - after[bisect.bisect_right(times, moment)]
+
+    return cash
+
+
+def cash_at(account: Account, ledger: Ledger, moment: datetime) -> Decimal:
+    """
+    The cash at a moment: the cash now, less every cash change after it.
+
+    Args:
+        account (Account): The account, from read_account.
+        ledger (Ledger): The ledger, from build_ledger.
+        moment (datetime): An aware moment.
+
+    Returns:
+        Decimal: The cash then, in dollars.
+    """
+    return _cash_reader(account, ledger)(moment)
+
+
+def build_history(account: Account, ledger: Ledger, marks: Marks,
+                  group_of: Callable[[str], str], start: datetime) -> History:
+    """
+    Value the account at the start, at each daily close since and now, group by group.
+
+    It is also valued at the moment of each deposit or withdrawal since the
+    start (with it counted), so the money moved in or out is in the value
+    from that moment on and the time-weighted return never credits its gain
+    or loss to the money already there. Each holding is valued at its
+    market's YES value then (Marks.at), or at what it cost when its market
+    has never been priced. A group's net cash and spending count only what
+    happened after `start`.
+
+    Args:
+        account (Account): The account, from read_account.
+        ledger (Ledger): The ledger, from build_ledger.
+        marks (Marks): The markets' values over time, from read_marks.
+        group_of (Callable[[str], str]): A ledger owner's group.
+        start (datetime): Just before the bot's first fill.
+
+    Returns:
+        History: The values; a group whose value, net cash and spending are
+            0 at every moment is left out.
+    """
+    landed = {f.time for f in account.flows if start < f.time < account.read_at}
+    times = tuple(sorted({start, *day_ends(start, account.read_at), *landed, account.read_at}))
+    cash_then = _cash_reader(account, ledger)
+    held: dict[tuple[str, str, str], Decimal] = defaultdict(Decimal)
+    basis: dict[tuple[str, str, str], Decimal] = defaultdict(Decimal)
+    net: dict[str, Decimal] = defaultdict(Decimal)
+    spent: dict[str, Decimal] = defaultdict(Decimal)
+    columns: dict[str, dict[str, list[float]]] = {name: defaultdict(list)
+                                                  for name in ("value", "net", "spent")}
+    steps: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
+    groups = sorted({group_of(e.owner) for e in ledger.events})
+    events, i = ledger.events, 0
+    for moment in times:
+        while i < len(events) and events[i].time <= moment:
+            event = events[i]
+            group, key = group_of(event.owner), (event.ticker, event.owner, event.side)
+            held[key] += event.contracts
+            basis[key] += event.basis
+            if event.time > start:                   # only what happened since the start
+                net[group] += event.cash
+                spent[group] += event.spent
+                steps[group].append((event.time, float(net[group])))
+            i += 1
+        worth: dict[str, Decimal] = defaultdict(Decimal)
+        for (ticker, owner, side), count in held.items():
+            if count:
+                worth[group_of(owner)] += _value(side, count, basis[(ticker, owner, side)],
+                                                 marks.at(ticker, moment))
+        for group in groups:
+            columns["value"][group].append(float(worth[group]))
+            columns["net"][group].append(float(net[group]))
+            columns["spent"][group].append(float(spent[group]))
+    flows = [0.0] + [float(sum((f.amount for f in account.flows if lo < f.time <= hi), _ZERO))
+                     for lo, hi in pairwise(times)]
+    keep = [group for group in groups
+            if any(columns["value"][group]) or any(columns["net"][group])
+            or any(columns["spent"][group])]
+    return History(times, tuple(float(cash_then(moment)) for moment in times),
+                   {g: tuple(columns["value"][g]) for g in keep},
+                   {g: tuple(columns["net"][g]) for g in keep},
+                   {g: tuple(columns["spent"][g]) for g in keep},
+                   {g: tuple(steps[g]) for g in keep}, tuple(flows))
+
+
+# ---- statistics ------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TradeReturn:
+    """
+    How one bot purchase has done so far.
+
+    Attributes:
+        trade_id (str): The purchase (BotTrade.trade_id).
+        opened (datetime): Its first fill (UTC).
+        pairs (Decimal): Contract pairs it bought.
+        ret (float): Its return so far: cash back plus value now, less what it
+            spent, over what it spent (fees, sales and payouts included).
+        open_pairs (Decimal): Pairs still held: the fewer of its contracts
+            still held on its two markets.
+        still_open (bool): True while any of its contracts is still held.
+    """
+    trade_id: str
+    opened: datetime
+    pairs: Decimal
+    ret: float
+    open_pairs: Decimal
+    still_open: bool
+
+
+def trade_returns(trades: list[BotTrade], ledger: Ledger, marks: Marks) -> list[TradeReturn]:
+    """
+    The return so far of each bot purchase that bought a contract pair.
+
+    That is a row whose status is "executed" or "manual_review"
+    (_PAIR_STATUSES) and whose two orders were both found: a manual-review
+    row whose two orders filled holds a pair like any other. A purchase's
+    contracts still held are valued at their market's value now (Marks.at
+    at the read), or at what they cost when never priced. A sale of its
+    contracts, by the bot or by you, counts as cash it got back. Rolled-back
+    and failed-unwind rows are left out (their YES leg never filled, so they
+    hold no pair, though their category still counts them), and so is any
+    purchase only one of whose orders was found.
+
+    Args:
+        trades (list[BotTrade]): The bot's purchases, from read_trade_logs.
+        ledger (Ledger): The ledger, from build_ledger.
+        marks (Marks): The markets' values, from read_marks.
+
+    Returns:
+        list[TradeReturn]: One per such purchase, in the trade log's order.
+    """
+    cash: dict[str, Decimal] = defaultdict(Decimal)
+    spent: dict[str, Decimal] = defaultdict(Decimal)
+    opened: dict[str, datetime] = {}
+    markets: dict[str, set[str]] = defaultdict(set)
+    held: dict[tuple[str, str, str], Decimal] = defaultdict(Decimal)
+    basis: dict[tuple[str, str, str], Decimal] = defaultdict(Decimal)
+    for e in ledger.events:
+        cash[e.owner] += e.cash
+        spent[e.owner] += e.spent
+        if e.spent:
+            opened[e.owner] = min(opened.get(e.owner, e.time), e.time)
+            markets[e.owner].add(e.ticker)
+        held[(e.ticker, e.owner, e.side)] += e.contracts
+        basis[(e.ticker, e.owner, e.side)] += e.basis
+    value: dict[str, Decimal] = defaultdict(Decimal)
+    per_market: dict[tuple[str, str], Decimal] = defaultdict(Decimal)
+    for (ticker, owner, side), count in held.items():
+        if count:
+            value[owner] += _value(side, count, basis[(ticker, owner, side)],
+                                   marks.at(ticker, marks.read_at))
+            per_market[(owner, ticker)] += count
+    out: list[TradeReturn] = []
+    for trade in trades:
+        legs = {leg.ticker for leg in trade.legs}
+        if (trade.status not in _PAIR_STATUSES or markets[trade.trade_id] != legs
+                or not spent[trade.trade_id]):
+            continue
+        a, b = (per_market[(trade.trade_id, leg.ticker)] for leg in trade.legs)
+        out.append(TradeReturn(
+            trade.trade_id, opened[trade.trade_id], trade.legs[0].count,
+            float((cash[trade.trade_id] + value[trade.trade_id]) / spent[trade.trade_id]),
+            min(a, b), bool(a or b)))
+    return out
+
+
+def pair_weighted(returns: list[TradeReturn]) -> tuple[float | None, float | None]:
+    """
+    The mean and median return over contract pairs: a purchase of N pairs counts N times.
+
+    The median is the middle pair's return, or the average of the two middle
+    pairs' returns when the pairs are an even number (as numpy's median of
+    the list with each return repeated once per pair).
+
+    Args:
+        returns (list[TradeReturn]): The purchases.
+
+    Returns:
+        tuple[float | None, float | None]: The mean and the median; None and
+            None when there is no pair.
+    """
+    weights = [float(r.pairs) for r in returns]
+    total = sum(weights)
+    if not returns or total <= 0:
+        return None, None
+    mean = sum(w * r.ret for w, r in zip(weights, returns, strict=True)) / total
+    ordered = sorted(zip((r.ret for r in returns), weights, strict=True))
+    run = 0.0
+    for i, (ret, weight) in enumerate(ordered):
+        run += weight
+        if run > total / 2:
+            return mean, ret
+        if run == total / 2:
+            return mean, (ret + ordered[i + 1][0]) / 2
+    return mean, ordered[-1][0]
+
+
+@dataclass(frozen=True)
+class GroupReturn:
+    """
+    How one group (a category, or Other bets) did over a period.
+
+    Attributes:
+        group (str): The group.
+        pnl (float): Its profit: value plus net cash at the end, less the same
+            at the period's start.
+        put_in (float): Its value at the start, plus the most cash it had out
+            at any moment since, so money reinvested is not counted twice.
+        ret (float | None): pnl over put_in; None when nothing was put in.
+    """
+    group: str
+    pnl: float
+    put_in: float
+    ret: float | None
+
+
+@dataclass(frozen=True)
+class PeriodStats:
+    """
+    The Live trading tab's figures for one period.
+
+    Attributes:
+        label (str): The period, e.g. "All" or "1M".
+        first (datetime): Its first moment (UTC): the start, or the first
+            daily close in the period.
+        last (datetime): Its last moment: the read.
+        total_return (float | None): The return over the period with
+            deposits and withdrawals taken out (each moment-to-moment return
+            chained); None for a period with no time in it.
+        pnl (float): The value's change, less deposits plus withdrawals.
+        sharpe (float | None): dashboard._sharpe over its whole days' returns;
+            None with fewer than 2 whole days.
+        sortino (float | None): dashboard._sortino, likewise.
+        whole_days (int): How many whole days (one daily close to the next)
+            the two ratios used.
+        mean_trade (float | None): The pair-weighted mean return of the bot
+            purchases made in the period (pair_weighted).
+        median_trade (float | None): Their pair-weighted median return.
+        pairs (Decimal): Contract pairs those purchases bought.
+        purchases (int): How many purchases.
+        open_pairs (Decimal): Their pairs still held.
+        groups (tuple[GroupReturn, ...]): Each group's return over the period.
+    """
+    label: str
+    first: datetime
+    last: datetime
+    total_return: float | None
+    pnl: float
+    sharpe: float | None
+    sortino: float | None
+    whole_days: int
+    mean_trade: float | None
+    median_trade: float | None
+    pairs: Decimal
+    purchases: int
+    open_pairs: Decimal
+    groups: tuple[GroupReturn, ...]
+
+
+def _group_returns(history: History, a: int) -> tuple[GroupReturn, ...]:
+    """
+    Each group's return from moment `a` of the history to the read.
+
+    Profit is the group's value plus its net cash at the end, less the same
+    at moment `a`. What it put in is its value at `a` plus the most cash it
+    had out at any moment since (its net cash at `a` less its lowest net cash
+    after), so a payout put back to work is not counted twice: spending $10,
+    getting $12 back, spending the $12 and getting $14.40 back put in $10.
+
+    Args:
+        history (History): The history, from build_history.
+        a (int): The period's first moment's place in history.times.
+
+    Returns:
+        tuple[GroupReturn, ...]: One per group, in history.value's order.
+    """
+    times, end = history.times, len(history.times) - 1
+    out: list[GroupReturn] = []
+    for group in history.value:
+        start_net = history.net_cash[group][a]
+        gain = ((history.value[group][end] + history.net_cash[group][end])
+                - (history.value[group][a] + start_net))
+        out_most = max([0.0] + [start_net - n for when, n in history.steps[group]
+                                if times[a] < when <= times[end]])
+        put_in = history.value[group][a] + out_most
+        out.append(GroupReturn(group, gain, put_in, gain / put_in if put_in > 0 else None))
+    return tuple(out)
+
+
+def _months_before(moment: datetime, months: int) -> datetime:
+    """
+    The moment some months before another, on New York's calendar.
+
+    The daily closes are midnights in config.LIVE_CANDLE_DAY_ZONE, so a
+    month back is counted on that zone's wall clock (pandas' DateOffset, so
+    March 31 less one month is February 28 or 29): between 8 pm and midnight
+    New York time the UTC date is already the next day's. A wall time a
+    clock change skips is read as zoneinfo reads it.
+
+    Args:
+        moment (datetime): An aware moment.
+        months (int): How many months back.
+
+    Returns:
+        datetime: The moment that many months earlier, in UTC.
+    """
+    local = moment.astimezone(_KALSHI_DAY).replace(tzinfo=None)
+    earlier = (pd.Timestamp(local) - pd.DateOffset(months=months)).to_pydatetime()
+    return earlier.replace(tzinfo=_KALSHI_DAY).astimezone(UTC)
+
+
+def period_stats(history: History, returns: list[TradeReturn],
+                 risk_free: treasury.RiskFreeRates | None, label: str, months: int) -> PeriodStats:
+    """
+    Work out one period's figures.
+
+    The period runs from the first daily close at or after `months` months
+    before the read, counted on New York's calendar as the daily closes are
+    (the history's start for 0, or when the history is shorter), to the
+    read. The total return chains each moment-to-moment return, taking out
+    the deposits and withdrawals: each lands at a moment of its own
+    (build_history), so it is taken out at the end of the step it lands in.
+    Sharpe and Sortino are the backtest page's own (dashboard._sharpe and
+    _sortino, at config.CALENDAR_DAYS_PER_YEAR periods a year), over whole
+    days only: a day runs from one daily close to the next, its return
+    chained over the moments inside it, and the part-days before the
+    period's first close and after its last are left out. They subtract the
+    8-week T-bill yield on the share of the value held in positions at the
+    start of each day (the backtest page's rule); with no yields, 0%. The
+    trade figures cover the bot purchases first filled in the period.
+
+    Args:
+        history (History): The history, from build_history.
+        returns (list[TradeReturn]): Every purchase's return, from trade_returns.
+        risk_free (treasury.RiskFreeRates | None): The T-bill yields, or None.
+        label (str): The period's label.
+        months (int): How many months back the period reaches; 0 for all of it.
+
+    Returns:
+        PeriodStats: The figures.
+    """
+    times, now = history.times, history.times[-1]
+    closes = [_is_close(moment) for moment in times]
+    a, end = 0, len(times) - 1
+    if months and times[0] < (cut := _months_before(now, months)):
+        after_cut = [i for i, moment in enumerate(times) if moment >= cut]   # the read at least
+        a = next((i for i in after_cut if closes[i]), after_cut[0])
+    growth, pnl = 1.0, 0.0
+    daily: list[float] = []
+    day_starts: list[date] = []
+    deployed: list[float] = []
+    day: tuple[int, float] | None = None       # (the day's opening close, its growth so far)
+    for k in range(a + 1, len(times)):
+        before, after = history.total(k - 1), history.total(k) - history.flows[k]
+        pnl += after - before
+        step = after / before if before > 0 else None
+        if step is not None:
+            growth *= step
+        if closes[k - 1]:
+            day = (k - 1, 1.0)                  # a daily close opens a day
+        if day is not None:
+            day = None if step is None else (day[0], day[1] * step)
+        if closes[k] and day is not None:       # the next close ends it: a whole day
+            opened = day[0]
+            daily.append(day[1] - 1)
+            day_starts.append(times[opened].astimezone(_KALSHI_DAY).date())
+            deployed.append(1 - history.cash[opened] / history.total(opened))
+            day = None
+    sharpe = sortino = None
+    if len(daily) >= 2:
+        rf: float | np.ndarray = (0.0 if risk_free is None
+                                  else risk_free.annual_on(day_starts) * np.array(deployed))
+        series = pd.Series(daily)
+        # Cross-module: the backtest page's own ratios, looked up when called
+        sharpe = dashboard._sharpe(series, rf, periods_per_year=config.CALENDAR_DAYS_PER_YEAR)
+        sortino = dashboard._sortino(series, rf, periods_per_year=config.CALENDAR_DAYS_PER_YEAR)
+    inside = [r for r in returns if r.opened >= times[a]]
+    mean, median = pair_weighted(inside)
+    return PeriodStats(label, times[a], now, growth - 1 if a < end else None, pnl, sharpe,
+                       sortino, len(daily), mean, median, sum((r.pairs for r in inside), _ZERO),
+                       len(inside), sum((r.open_pairs for r in inside), _ZERO),
+                       _group_returns(history, a))
+
+
+# ---- the cash each run logged ----------------------------------------------
+
+@dataclass(frozen=True)
+class CashCheck:
+    """
+    Whether the cash each real run logged before trading matches Kalshi's records.
+
+    Attributes:
+        matched (int): Runs whose logged cash matches.
+        checked (int): Runs checked.
+        worst (Decimal): The largest difference found, in dollars (0 with none).
+        misses (tuple[tuple[datetime, Decimal, Decimal], ...]): Each run that
+            does not match: its log time (UTC), the cash it logged, and the
+            cash rebuilt then.
+    """
+    matched: int
+    checked: int
+    worst: Decimal
+    misses: tuple[tuple[datetime, Decimal, Decimal], ...]
+
+
+def check_logged_cash(account: Account, ledger: Ledger, runs: list[RunStart],
+                      first_bot_fill: dict[datetime, datetime]) -> CashCheck:
+    """
+    Check each real run's logged "Balance before" against the cash rebuilt from Kalshi's records.
+
+    Every real run is checked, those before the bot's first fill included:
+    the cash is rebuilt (cash_at, which holds at any moment) just before the
+    run's first bot fill, or at its log time when it had none. The logged
+    figure rounds each shard's cash down to the cent, so it matches when the
+    rebuilt cash is at most config.LIVE_CASH_CHECK_BELOW_DOLLARS below it and
+    less than config.LIVE_CASH_CHECK_ABOVE_PER_SHARD_DOLLARS per shard above
+    it. Which shards held cash at each run is not known, so every shard the
+    balance reply lists now is counted, empty ones included: with four
+    shards listed, a rebuilt cash just under 4 cents above the logged figure
+    is a match even when only one shard held cash then. The largest gap
+    found (worst) is reported beside the count, so such a gap still shows.
+
+    Args:
+        account (Account): The account, from read_account.
+        ledger (Ledger): The ledger, from build_ledger.
+        runs (list[RunStart]): The real runs, from read_trade_logs.
+        first_bot_fill (dict[datetime, datetime]): Each run's first bot fill,
+            by the run's log time.
+
+    Returns:
+        CashCheck: The result.
+    """
+    cash_then = _cash_reader(account, ledger)
+    low = -Decimal(config.LIVE_CASH_CHECK_BELOW_DOLLARS)
+    high = Decimal(config.LIVE_CASH_CHECK_ABOVE_PER_SHARD_DOLLARS) * max(1, account.shards)
+    matched = checked = 0
+    worst = _ZERO
+    misses: list[tuple[datetime, Decimal, Decimal]] = []
+    for run in runs:
+        first = first_bot_fill.get(run.logged_at)
+        rebuilt = cash_then(first - timedelta(microseconds=1) if first else run.logged_at)
+        gap = rebuilt - run.cash_before
+        checked += 1
+        worst = max(worst, abs(gap))
+        if low <= gap < high:
+            matched += 1
+        else:
+            misses.append((run.logged_at, run.cash_before, rebuilt))
+    return CashCheck(matched, checked, worst, tuple(misses))
+
+
+def _cash_miss_warnings(check: CashCheck) -> list[str]:
+    """
+    One sentence per run whose logged cash does not match, for the page to show as it is.
+
+    The logged cash is shown as the trade log wrote it; the rebuilt cash is
+    rounded to config.LIVE_CASH_SHOWN_STEP_DOLLARS (the hundredth of a cent
+    the account keeps its cash to), since it can carry the ledger's finer
+    shares of a fee or a cost.
+
+    Args:
+        check (CashCheck): The check, from check_logged_cash.
+
+    Returns:
+        list[str]: The sentences, in the order of the runs.
+    """
+    step = Decimal(config.LIVE_CASH_SHOWN_STEP_DOLLARS)
+    return [f"The run logged at {logged:%Y-%m-%d %H:%M} UTC wrote ${banner} as its cash before "
+            f"trading; Kalshi's records rebuild ${rebuilt.quantize(step)} then"
+            for logged, banner, rebuilt in check.misses]
+
+
+# ---- what the page shows ---------------------------------------------------
+
+@dataclass(frozen=True)
+class Holding:
+    """
+    Contracts of one side of one market held now, by one group.
+
+    Attributes:
+        ticker (str): The market.
+        title (str): Its title (the ticker when it was not found).
+        group (str): A Kalshi category, or OTHER_BETS.
+        side (str): "yes" or "no".
+        contracts (Decimal): Contracts held.
+        price (Decimal | None): What one contract of the side held is worth
+            now; None when its market has never been priced.
+        value (Decimal): What they are worth now (at what they cost when
+            never priced).
+        cost (Decimal): What they cost, fees included.
+    """
+    ticker: str
+    title: str
+    group: str
+    side: str
+    contracts: Decimal
+    price: Decimal | None
+    value: Decimal
+    cost: Decimal
+
+
+@dataclass(frozen=True)
+class LiveView:
+    """
+    Everything the Live trading tab shows, from one read of the account.
+
+    Attributes:
+        read_at (datetime): When the account was read (UTC).
+        cash (Decimal): The cash on every shard.
+        kalshi_positions_value (Decimal | None): What Kalshi says the
+            positions are worth; None when its reply had no usable value.
+        holdings (tuple[Holding, ...]): What is held now, in group_order,
+            then most valuable first.
+        group_order (tuple[str, ...]): The groups, most money put in first,
+            with OTHER_BETS last.
+        history (History | None): The account over time; None before the
+            bot's first live trade.
+        periods (tuple[PeriodStats, ...] | None): One per
+            config.LIVE_DASHBOARD_PERIODS; None before the first trade.
+        trades (tuple[TradeReturn, ...]): Each bot purchase's return (trade_returns).
+        cash_check (CashCheck): The runs' logged cash against Kalshi's records.
+        risk_free (treasury.RiskFreeRates | None): The T-bill yields the
+            ratios used, or None (0%).
+        changing (bool): True when the account kept changing while it was read.
+        warnings (tuple[str, ...]): Every warning of the read and of each step
+            after it, for the page to show.
+    """
+    read_at: datetime
+    cash: Decimal
+    kalshi_positions_value: Decimal | None
+    holdings: tuple[Holding, ...]
+    group_order: tuple[str, ...]
+    history: History | None
+    periods: tuple[PeriodStats, ...] | None
+    trades: tuple[TradeReturn, ...]
+    cash_check: CashCheck
+    risk_free: treasury.RiskFreeRates | None
+    changing: bool
+    warnings: tuple[str, ...]
+
+    @property
+    def holdings_value(self) -> Decimal:
+        """What every holding is worth now, added up."""
+        return sum((holding.value for holding in self.holdings), _ZERO)
+
+
+def _holdings(ledger: Ledger, marks: Marks, markets: dict[str, Market],
+              group_of: Callable[[str], str]) -> list[Holding]:
+    """
+    What is held now, one Holding per market, side and group.
+
+    Args:
+        ledger (Ledger): The ledger, from build_ledger.
+        marks (Marks): The markets' values, from read_marks.
+        markets (dict[str, Market]): Markets looked up, for their titles.
+        group_of (Callable[[str], str]): A ledger owner's group.
+
+    Returns:
+        list[Holding]: The holdings, in no particular order.
+    """
+    held: dict[tuple[str, str, str], Decimal] = defaultdict(Decimal)
+    basis: dict[tuple[str, str, str], Decimal] = defaultdict(Decimal)
+    for e in ledger.events:
+        key = (e.ticker, group_of(e.owner), e.side)
+        held[key] += e.contracts
+        basis[key] += e.basis
+    out: list[Holding] = []
+    for (ticker, group, side), count in held.items():
+        if not count:
+            continue
+        mark = marks.at(ticker, marks.read_at)
+        market = markets.get(ticker)
+        out.append(Holding(ticker, market.title if market else ticker, group, side, count,
+                           None if mark is None else (mark if side == "yes" else _ONE - mark),
+                           _value(side, count, basis[(ticker, group, side)], mark),
+                           basis[(ticker, group, side)]))
+    return out
+
+
+def _group_order(history: History | None, holdings: list[Holding]) -> tuple[str, ...]:
+    """
+    Order the groups: most money put in over the whole history first, OTHER_BETS last.
+
+    Without a history, by what each group holds now.
+
+    Args:
+        history (History | None): The history, or None.
+        holdings (list[Holding]): What is held now.
+
+    Returns:
+        tuple[str, ...]: Every group in the history or the holdings.
+    """
+    put_in = {r.group: r.put_in for r in _group_returns(history, 0)} if history else {}
+    worth: dict[str, Decimal] = defaultdict(Decimal)
+    for holding in holdings:
+        worth[holding.group] += holding.value
+    groups = set(put_in) | set(worth)
+    return tuple(sorted(groups, key=lambda g: (g == OTHER_BETS, -put_in.get(g, 0.0),
+                                               -worth.get(g, _ZERO), g)))
+
+
+def _held_words(count: Decimal) -> str:
+    """
+    A signed holding in words: "10 YES", "4 NO" or "none".
+
+    Args:
+        count (Decimal): Contracts held, YES positive and NO negative.
+
+    Returns:
+        str: The words.
+    """
+    if not count:
+        return "none"
+    return f"{config.count_text(float(abs(count)))} {'YES' if count > 0 else 'NO'}"
+
+
+def _event_of(ticker: str, markets: dict[str, Market]) -> str:
+    """
+    A market's event: as Kalshi lists it, else the ticker less its last "-" part.
+
+    Args:
+        ticker (str): The market.
+        markets (dict[str, Market]): Markets looked up.
+
+    Returns:
+        str: The event ticker.
+    """
+    market = markets.get(ticker)
+    if market is not None and market.event_ticker:
+        return market.event_ticker
+    return ticker.rsplit("-", 1)[0]
+
+
+def _held_since(ledger: Ledger, start: datetime | None) -> set[str]:
+    """
+    The markets held at some moment from `start` on.
+
+    Args:
+        ledger (Ledger): The ledger, from build_ledger.
+        start (datetime | None): The first moment; None for the markets held now.
+
+    Returns:
+        set[str]: Markets held at `start`, or with a change after it (all
+            those held now when `start` is None).
+    """
+    if start is None:
+        return set(ledger.held_now)
+    held: dict[tuple[str, str, str], Decimal] = defaultdict(Decimal)
+    later: set[str] = set()
+    for e in ledger.events:
+        if e.time > start:
+            later.add(e.ticker)
+        else:
+            held[(e.ticker, e.owner, e.side)] += e.contracts
+    return later | {ticker for (ticker, _, _), count in held.items() if count}
+
+
+def build_live_view(client: Any, *, risk_free: treasury.RiskFreeRates | None,
+                    series_categories: dict[str, tuple[str, tuple[str, ...]]] | None,
+                    trade_logs: Iterable[Path]) -> LiveView:
+    """
+    Read the account and work out everything the Live trading tab shows.
+
+    In order: read the account and the trade logs; match the bot's orders;
+    look up the markets (those held now, those traded since the bot's first
+    fill, those whose payout must be rebuilt, every bot leg, then any held
+    at the start that are still missing); rebuild the payouts and build the
+    ledger; compare what it holds with Kalshi's positions (a warning per
+    market that differs); read the daily prices; then the history, each
+    period of config.LIVE_DASHBOARD_PERIODS, the purchases' returns, the
+    holdings now and the cash check. A bot purchase's group is its market
+    A's Kalshi category (historical.series_labels, the backtest page's
+    filing rule, with historical.infer_category for a series Kalshi's
+    listing lacks); everything else is OTHER_BETS. Before the bot's first
+    fill there is no history and no period.
+
+    Args:
+        client (Any): A client from auth.build_client.
+        risk_free (treasury.RiskFreeRates | None): Keyword-only: the T-bill
+            yields for the ratios, or None (0%).
+        series_categories (dict | None): Keyword-only:
+            historical.load_series_categories' map, or None.
+        trade_logs (Iterable[Path]): Keyword-only: the trade logs
+            (trade_log_paths()).
+
+    Returns:
+        LiveView: The view.
+
+    Raises:
+        ValueError: If a reply or record from Kalshi cannot be read.
+        KeyError: If a record lacks a field this needs.
+        ApiException: If Kalshi answers with an error status after the retries.
+    """
+    account = read_account(client)
+    trades, runs, log_warnings = read_trade_logs(trade_logs)
+    owner_by_fill, match_warnings = match_bot_fills(trades, account.fills)
+    bot_fills = [f for f in account.fills if f.fill_id in owner_by_fill]
+    start = bot_fills[0].time - timedelta(microseconds=1) if bot_fills else None
+    wanted = (set(account.positions) | tickers_needing_payout(account)
+              | {leg.ticker for trade in trades for leg in trade.legs})
+    if start is not None:
+        wanted |= {f.ticker for f in account.fills if f.time > start}
+    markets = read_markets(client, wanted)
+    payouts, payout_warnings = all_payouts(account, markets)
+    owner_legs = {trade.trade_id: frozenset(leg.ticker for leg in trade.legs) for trade in trades}
+    ledger = build_ledger(account.fills, payouts, owner_by_fill, owner_legs)
+    priced = _held_since(ledger, start)
+    if missing := priced - wanted:
+        markets = {**markets, **read_markets(client, missing)}
+
+    position_warnings = [
+        f"{ticker}: Kalshi holds {_held_words(account.positions.get(ticker, _ZERO))}, but the "
+        f"fills and payouts add up to {_held_words(ledger.held_now.get(ticker, _ZERO))}"
+        for ticker in sorted(set(ledger.held_now) | set(account.positions))
+        if ledger.held_now.get(ticker, _ZERO) != account.positions.get(ticker, _ZERO)]
+
+    if start is None:
+        marks, mark_warnings = Marks({}, _now_marks(priced, markets), account.read_at), []
+    else:
+        marks, mark_warnings = read_marks(client, priced, start, markets, account.read_at)
+
+    category: dict[str, str] = {}
+    for trade in trades:
+        event = _event_of(trade.legs[0].ticker, markets)
+        # Cross-module: the backtest page's filing rule, so a category means the same on both tabs
+        category[trade.trade_id] = historical.series_labels(
+            event, historical.infer_category(event), series_categories)[0]
+
+    def group_of(owner: str) -> str:
+        """A ledger owner's group: its purchase's category, or OTHER_BETS."""
+        return category.get(owner, OTHER_BETS)
+
+    history = None if start is None else build_history(account, ledger, marks, group_of, start)
+    returns = trade_returns(trades, ledger, marks)
+    periods = None if history is None else tuple(
+        period_stats(history, returns, risk_free, label, months)
+        for label, months in config.LIVE_DASHBOARD_PERIODS)
+    holdings = _holdings(ledger, marks, markets, group_of)
+    group_order = _group_order(history, holdings)
+    place = {group: i for i, group in enumerate(group_order)}
+    holdings.sort(key=lambda h: (place[h.group], -h.value, h.ticker, h.side))
+
+    run_of = {trade.trade_id: trade.logged_at for trade in trades}
+    first_bot_fill: dict[datetime, datetime] = {}
+    for fill in bot_fills:
+        run = run_of[owner_by_fill[fill.fill_id]]
+        first_bot_fill.setdefault(run, fill.time)          # bot_fills are oldest first
+    cash_check = check_logged_cash(account, ledger, runs, first_bot_fill)
+    cash_warnings = _cash_miss_warnings(cash_check)
+
+    changing = (["The account kept changing while it was read: the figures may not all be "
+                 "from one moment"] if account.changing else [])
+    warnings = (*account.warnings, *changing, *log_warnings, *match_warnings, *payout_warnings,
+                *ledger.warnings, *position_warnings, *mark_warnings, *cash_warnings)
+    return LiveView(account.read_at, account.cash, account.kalshi_positions_value,
+                    tuple(holdings), group_order, history, periods, tuple(returns), cash_check,
+                    risk_free, account.changing, tuple(warnings))
+
+
+# ---- the log line ----------------------------------------------------------
+
+def _jsonable(value: Any) -> Any:
+    """
+    Turn a record into plain JSON values: a Decimal into its exact text, a datetime into ISO text.
+
+    Args:
+        value (Any): A Decimal, datetime, dict, list, tuple, or a plain JSON value.
+
+    Returns:
+        Any: The same record in JSON's own types.
+    """
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def snapshot_record(view: LiveView) -> dict:
+    """
+    One read of the account as a JSON-ready record: the holdings and cash at that moment.
+
+    Args:
+        view (LiveView): The view, from build_live_view.
+
+    Returns:
+        dict: "read_at", "cash", "kalshi_positions_value", "holdings_value",
+            "changing" and "holdings" (each holding's fields); every Decimal
+            as its exact text and every time as ISO text.
+    """
+    return _jsonable({
+        "read_at": view.read_at,
+        "cash": view.cash,
+        "kalshi_positions_value": view.kalshi_positions_value,
+        "holdings_value": view.holdings_value,
+        "changing": view.changing,
+        "holdings": [dataclasses.asdict(holding) for holding in view.holdings],
+    })
+
+
+def append_snapshot(view: LiveView) -> None:
+    """
+    Add one line, snapshot_record(view) as JSON, to config.LIVE_PORTFOLIO_LOG_FILE.
+
+    The path is read when this is called, so tests point it elsewhere. A line
+    that cannot be written is a WARNING in the log, never an error: the page
+    still shows the read.
+
+    Args:
+        view (LiveView): The view, from build_live_view.
+    """
+    path = Path(config.LIVE_PORTFOLIO_LOG_FILE)
+    try:
+        line = json.dumps(snapshot_record(view), allow_nan=False)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except (OSError, TypeError, ValueError) as exc:
+        logging.warning("Could not add this read of the account to %s (%s)", path,
+                        api_error_summary(exc))
