@@ -710,6 +710,53 @@ DEFAULTS_SERVER_RUN_LOG_TAIL_BYTES = 65_536
 # How many of the newest run folders the server's index page lists.
 DEFAULTS_SERVER_INDEX_RUNS = 10
 
+# ── Live trading dashboard (live_portfolio.py, live_dashboard.py) ─────────────
+
+# Kalshi's largest page for the fills, settlements, positions and markets
+# listings the live dashboard reads.
+LIVE_PAGE_SIZE = 1000
+
+# Kalshi's largest page for the deposits and withdrawals listings.
+LIVE_TRANSFERS_PAGE_SIZE = 500
+
+# How many markets one /markets or /historical/markets request looks up.
+LIVE_MARKET_TICKERS_PER_REQUEST = 100
+
+# A bot run's orders are looked for after the previous real run wrote the
+# trade log, and at most this long before this run wrote it: a run writes the
+# log as it ends, just after it sends its orders.
+LIVE_BOT_RUN_WINDOW_SECONDS = 6 * 60 * 60
+
+# How far past a run's log time its orders are still looked for, to allow for
+# this computer's clock running behind Kalshi's.
+LIVE_BOT_RUN_CLOCK_SLACK_SECONDS = 120
+
+# Your own sales of two markets this close together are read as one pair
+# sold by hand.
+LIVE_MANUAL_PAIR_SECONDS = 10 * 60
+
+# When the account changed while it was being read, it is read again: at most
+# this many reads in all; the age the newest fill must reach first (Kalshi's
+# balance takes about a second to include a fill); and the pause between reads.
+LIVE_READ_ATTEMPTS = 3
+LIVE_READ_SETTLE_SECONDS = 5
+LIVE_READ_RETRY_PAUSE_SECONDS = 2
+
+# The trade log's Time cell shows the whole second, rounded down, so a run
+# wrote its log up to this long after the time the cell shows. A run's last
+# orders can land inside that second, after the time shown.
+LIVE_TRADE_LOG_TIME_STEP_SECONDS = 1
+
+# A share of one fill's fee, or of the cost of the contracts one close takes,
+# is rounded to this many dollars; the last share takes what is left, so the
+# shares always add back to the whole exactly. Text, for decimal.Decimal.
+LIVE_SHARE_STEP_DOLLARS = "0.000000000001"
+
+# A settlement whose credited amount differs from what the contracts held add
+# up to by more than this many dollars is named on the page. Text, for
+# decimal.Decimal.
+LIVE_PAYOUT_TOLERANCE_DOLLARS = "0.01"
+
 # Which side each leg of a pair buys, as (side bought on market_a, side bought
 # on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
 # elsewhere. Same-title: NO on the pricier contract (market_a), YES on the
