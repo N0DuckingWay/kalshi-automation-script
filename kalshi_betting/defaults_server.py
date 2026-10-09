@@ -8,15 +8,18 @@ Purpose:
     (config.LIVE_DEFAULTS_FILE, live_defaults.json), which every live run
     starts from, and starts live trading runs with them. Run by a person,
     deliberately, from a terminal, through the launcher at the checkout's
-    root (./start_dashboard.sh [--seed], which first checks that its Python
-    can import the live bot) or directly:
+    root (./start_dashboard.sh [--seed] [--no-browser], which first checks
+    that its Python can import the live bot and the live dashboard, then
+    starts the live dashboard and this server in the background, passing
+    this server --no-browser when the live dashboard opens the page) or
+    directly:
 
         python3 -m kalshi_betting.defaults_server [--seed] [--no-browser]
 
-    On start it opens one page: with --seed the confirmation page proposing
-    the seed values; otherwise the backtest dashboard, or its own index when
-    there is no dashboard, the dashboard was built before its Save and Trade
-    buttons, or it cannot be read. When its port is already taken by this
+    On start it opens one page (none with --no-browser): with --seed the
+    confirmation page proposing the seed values; otherwise the backtest
+    dashboard, or its own index when there is no dashboard, the dashboard
+    was built before its Save and Trade buttons, or it cannot be read. When its port is already taken by this
     checkout's own server, running this checkout's current code, it opens
     that page from the running server and exits, starting nothing; when the
     port is held by that server running older code, by another checkout's
@@ -151,6 +154,7 @@ import math
 import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import urllib.request
@@ -3560,8 +3564,10 @@ def main(argv: list[str] | None = None) -> None:
     """
     Run the defaults server until Ctrl-C, or reopen this checkout's server's page.
 
-    It binds DEFAULTS_SERVER_HOST:DEFAULTS_SERVER_PORT first. When the port
-    is taken it binds nothing and starts nothing: if the listener is this
+    It turns Ctrl-C back on first (start_dashboard.sh starts it in the
+    background, where a job begins with Ctrl-C ignored), then binds
+    DEFAULTS_SERVER_HOST:DEFAULTS_SERVER_PORT. When the port is taken it
+    binds nothing and starts nothing: if the listener is this
     checkout's own defaults server running this checkout's current code (its
     GET /checkout names this resolved PROJECT_ROOT and this code's
     fingerprint), it opens the page asked for and returns; if it is that
@@ -3606,6 +3612,10 @@ def main(argv: list[str] | None = None) -> None:
         help="Open nothing; only log the address to open",
     )
     args = parser.parse_args(argv)
+    # start_dashboard.sh starts it in the background, where a job begins with
+    # Ctrl-C ignored; Ctrl-C must stop it through the KeyboardInterrupt below,
+    # so the runs still going are named
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     base = f"http://{DEFAULTS_SERVER_HOST}:{DEFAULTS_SERVER_PORT}"
     try:
         # One request at a time, so two saves or two starts can never interleave

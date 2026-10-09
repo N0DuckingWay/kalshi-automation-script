@@ -9,14 +9,17 @@ Purpose:
     Sortino subtract, on each day the yield of the latest auction on or
     before it. A download is saved under backtest_cache/; if it fails, the
     saved copy is used, and with none the rate is unavailable (the dashboard
-    subtracts 0% and says so). Reporting only: no live-trading module
-    imports this one.
+    subtracts 0% and says so). The live dashboard's Live trading tab
+    subtracts the same yields from its Sharpe and Sortino. Reporting only:
+    no order-path module imports this one.
 
 Dependencies:
     config (URL, bill term, rate field, TREASURY_API_* bounds), _http
     (api_call_with_retry) and historical (cache helpers). Imported by
-    backtest (load_risk_free_rates) and dashboard (RiskFreeRates,
-    SOURCE_CACHE, day_numbers).
+    backtest (load_risk_free_rates), dashboard (RiskFreeRates,
+    SOURCE_CACHE, day_numbers), live_portfolio (RiskFreeRates, for the Live
+    trading tab's ratios) and live_dashboard (load_risk_free_rates,
+    RiskFreeRates, SOURCE_CACHE), the last two only reading.
 
 Notes:
     Cash-management bills are filtered out. A date before the first auction

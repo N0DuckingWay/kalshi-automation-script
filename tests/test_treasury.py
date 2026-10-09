@@ -6,8 +6,9 @@ Last edited by: Zachary Hoffman
 Purpose:
     Tests for treasury.py: parsing the auction records, paging the download,
     load_risk_free_rates()'s never-raising cache fallback, the per-day lookup
-    (annual_on, annual_on_days, day_numbers), and that no live-trading module
-    imports this reporting-only module.
+    (annual_on, annual_on_days, day_numbers), and that no order-path module
+    imports this reporting-only module (the Live trading tab's
+    live_portfolio and live_dashboard, which only read, do).
 
 Dependencies:
     Imports kalshi_betting.treasury. Fully offline: tests/conftest.py's

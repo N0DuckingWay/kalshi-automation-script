@@ -14,12 +14,13 @@ Purpose:
 Dependencies:
     No project imports. Imported by auth.py, scanner.py, strategy.py, trader.py,
     reporter.py, historical.py, backtester.py, dashboard.py, backtest.py,
-    depth_model.py, scheduler.py, treasury.py, run_lock.py, seller.py and
-    main.py — plus two standalone,
-    human-run tools kept deliberately outside the pipeline's import graph: the
-    verification CLI (see CLAUDE.md's pipeline-isolation rule) and
-    defaults_server.py, the local pages that save the live defaults and start
-    live trading runs with them.
+    scheduler.py, treasury.py, run_lock.py, depth_model.py, live_portfolio.py,
+    seller.py and main.py — plus three standalone, human-run tools kept
+    deliberately outside the pipeline's import graph: the verification CLI
+    (see CLAUDE.md's pipeline-isolation rule), defaults_server.py, the local
+    pages that save the live defaults and start live trading runs with them,
+    and live_dashboard.py, the read-only local server of the dashboard's two
+    tabs.
 
 Notes:
     PROJECT_ROOT is derived from __file__ so the package works correctly on any
@@ -715,7 +716,8 @@ DEFAULTS_SERVER_SOCKET_TIMEOUT_SECONDS = 5
 DEFAULTS_SERVER_CONFIRM_ARM_MS = 1000
 
 # The one dashboard file every backtest run writes (and overwrites) in
-# PROJECT_ROOT; defaults_server opens it when it starts.
+# PROJECT_ROOT; defaults_server opens it when run on its own, and
+# live_dashboard serves it on LIVE_BACKTEST_PORT as the Backtest tab.
 DASHBOARD_FILENAME = "backtest_dashboard.html"
 
 # The folder beside the dashboard file that holds the data its Sell select
@@ -770,6 +772,165 @@ DEFAULTS_SERVER_RUN_LOG_TAIL_BYTES = 65_536
 
 # How many of the newest run folders the server's index page lists.
 DEFAULTS_SERVER_INDEX_RUNS = 10
+
+# ── Live trading dashboard (live_portfolio.py, live_dashboard.py) ─────────────
+
+# Kalshi's largest page for the fills, settlements, positions and markets
+# listings the live dashboard reads.
+LIVE_PAGE_SIZE = 1000
+
+# Kalshi's largest page for the deposits and withdrawals listings.
+LIVE_TRANSFERS_PAGE_SIZE = 500
+
+# How many markets one /markets or /historical/markets request looks up.
+LIVE_MARKET_TICKERS_PER_REQUEST = 100
+
+# A bot run's orders are looked for after the previous real run wrote the
+# trade log, and at most this long before this run wrote it: a run writes the
+# log just after it sends its orders (a run that sells writes it twice, once
+# after its sale orders and once after its purchases, and each is a log time
+# of its own).
+LIVE_BOT_RUN_WINDOW_SECONDS = 6 * 60 * 60
+
+# How far past a run's log time its orders are still looked for, to allow for
+# this computer's clock running behind Kalshi's.
+LIVE_BOT_RUN_CLOCK_SLACK_SECONDS = 120
+
+# Your own sales of two markets this close together are read as one pair
+# sold by hand. The bot's sale orders are read the same way (only its
+# purchases are matched to the bot), so a held pair's two sale orders this
+# close together close that pair's purchase.
+LIVE_MANUAL_PAIR_SECONDS = 10 * 60
+
+# When the account changed while it was being read, it is read again: at most
+# this many reads in all; the age the newest fill must reach first (Kalshi's
+# balance takes about a second to include a fill); and the pause between reads.
+LIVE_READ_ATTEMPTS = 3
+LIVE_READ_SETTLE_SECONDS = 5
+LIVE_READ_RETRY_PAUSE_SECONDS = 2
+
+# The trade log's Time cell shows the whole second, rounded down, so a run
+# wrote its log up to this long after the time the cell shows. A run's last
+# orders can land inside that second, after the time shown.
+LIVE_TRADE_LOG_TIME_STEP_SECONDS = 1
+
+# A share of one fill's fee, or of the cost of the contracts one close takes,
+# is rounded to this many dollars; the last share takes what is left, so the
+# shares always add back to the whole exactly. Text, for decimal.Decimal.
+LIVE_SHARE_STEP_DOLLARS = "0.000000000001"
+
+# A settlement whose credited amount differs from what the contracts held add
+# up to by more than this many dollars is named on the page. Text, for
+# decimal.Decimal.
+LIVE_PAYOUT_TOLERANCE_DOLLARS = "0.01"
+
+# The live dashboard values each day by Kalshi's daily candles, one per day,
+# each closing at midnight in this time zone.
+LIVE_CANDLE_DAY_ZONE = "America/New_York"
+LIVE_CANDLE_PERIOD_MINUTES = 1440
+
+# Kalshi's limits on one batch candlestick request (GET /markets/candlesticks):
+# at most this many markets, and at most this many candles in all.
+LIVE_CANDLE_TICKERS_PER_REQUEST = 100
+LIVE_CANDLE_MAX_PER_REQUEST = 10_000
+
+# The daily prices of finalized markets read from Kalshi's archive, one JSON
+# file per market. Such a market's prices can no longer change, so each is
+# read from Kalshi once. Read when used, so tests point it elsewhere.
+LIVE_MARKS_CACHE_DIR = PROJECT_ROOT / "backtest_cache" / "live_marks"
+
+# The periods the Live trading tab shows its statistics for: (label, months
+# back from now; 0 means since the bot's first live trade).
+LIVE_DASHBOARD_PERIODS = (("All", 0), ("1Y", 12), ("6M", 6), ("3M", 3), ("1M", 1))
+
+# The Live trading tab's Sharpe and Sortino need at least this many whole days
+# (one daily close to the next) in a period; with fewer they show "—".
+LIVE_RATIO_MIN_WHOLE_DAYS = 2
+
+# One JSON line per read of the account: when it was read, the cash, Kalshi's
+# own value of the positions, and every holding with its value. Read when
+# used, so tests point it elsewhere.
+LIVE_PORTFOLIO_LOG_FILE = PROJECT_ROOT / "live_portfolio_log.jsonl"
+
+# The live dashboard server's own log. Read when used, so tests point it elsewhere.
+LIVE_DASHBOARD_LOG_FILE = PROJECT_ROOT / "kalshi_live_dashboard.log"
+
+# A run's "Balance before" in the trade log matches the cash rebuilt from
+# Kalshi's records when the rebuilt cash is at most this far below it ...
+LIVE_CASH_CHECK_BELOW_DOLLARS = "0.005"
+# ... and less than this much above it for each shard: the logged figure
+# rounds each shard's cash down to the cent. Every shard the balance reply
+# lists now counts, empty ones too (which shards held cash at a past run is
+# not known), so with four shards a gap just under 4 cents still matches; the
+# page shows the largest gap beside the count. Text, for decimal.Decimal.
+LIVE_CASH_CHECK_ABOVE_PER_SHARD_DOLLARS = "0.01"
+
+# The rebuilt cash a mismatched run's warning shows is rounded to this: the
+# hundredth of a cent the account keeps its cash to. Text, for decimal.Decimal.
+LIVE_CASH_SHOWN_STEP_DOLLARS = "0.0001"
+
+# Where live_dashboard.py listens: the tab page and its account data on one
+# port, the backtest page on another. Two ports are two web origins, so
+# nothing on the backtest page (or the chart library it loads from the web)
+# can read the account, and nothing on either can press the defaults
+# server's buttons (DEFAULTS_SERVER_PORT). Loopback only.
+LIVE_DASHBOARD_HOST = "127.0.0.1"
+LIVE_DASHBOARD_PORT = 8766
+LIVE_BACKTEST_PORT = 8767
+
+# Seconds the live dashboard waits on a silent connection before dropping it.
+# A file being sent (the backtest page can be hundreds of MB) is sent with no
+# limit, so a slow reader is never cut off part way.
+LIVE_DASHBOARD_SOCKET_TIMEOUT_SECONDS = 30
+
+# The header the Live tab's own script adds when it asks for the account
+# (GET /api/live, value "1"). A request without it is refused, so another web
+# page cannot make this server read the account.
+LIVE_DASHBOARD_REQUEST_HEADER = "X-Live-Dashboard"
+
+# Every Kalshi request the live dashboard's own client sends: (connect, read)
+# timeouts in seconds, so one stalled request cannot hold a page load forever.
+LIVE_KALSHI_TIMEOUT_SECONDS = (10, 60)
+
+# One read of the account at a time: a request that arrives while a read is
+# going waits at most this many seconds for that read's result (503 after).
+LIVE_DASHBOARD_BUILD_WAIT_SECONDS = 300
+
+# How often, in seconds, the live dashboard downloads the 8-week T-bill
+# yields again (new auctions are weekly).
+LIVE_RISK_FREE_REFRESH_SECONDS = 24 * 60 * 60
+
+# A read of the account that starts before the first T-bill download has
+# finished waits at most this many seconds for it (then its ratios subtract
+# 0%, and the page says so). The download can take minutes when the
+# Treasury's server does not answer, so the wait is short.
+LIVE_RISK_FREE_FIRST_WAIT_SECONDS = 10
+
+# How many connections each of the live dashboard's two servers lets wait to
+# be accepted: a page load and the backtest page's chunk files can arrive
+# together, and macOS refuses a connection past the queue outright.
+LIVE_DASHBOARD_LISTEN_BACKLOG = 64
+
+# When the live dashboard finds its port taken (a program already answers a
+# connection to it, or the port cannot be bound), it asks the server there
+# what it is (GET /health): the wait in seconds for the connection and the
+# answer, and the most it reads.
+LIVE_DASHBOARD_HEALTH_TIMEOUT_SECONDS = 5
+LIVE_DASHBOARD_HEALTH_MAX_BYTES = 65_536
+
+# A file the live dashboard sends is copied in blocks of this many bytes.
+LIVE_DASHBOARD_FILE_BLOCK_BYTES = 1_048_576
+
+# The chart library the Live tab loads: the same Plotly build the backtest
+# page loads, and its integrity hash (the sha384 of that file, so the browser
+# runs it only when it is exactly that file).
+LIVE_DASHBOARD_PLOTLY_URL = "https://cdn.plot.ly/plotly-2.30.0.min.js"
+LIVE_DASHBOARD_PLOTLY_SRI = "sha384-H7GB7Kme/VbPI/0S4LNq7OixFNVRgRGE8kyqTntBuiXle1KBm8KWLQh/Ah6bXCYW"
+
+# The Live tab gives at most this many categories a color of their own; the
+# rest are drawn together in gray as "More categories" (or, when only one is
+# left past them, by its own name in that gray).
+LIVE_DASHBOARD_MAX_CATEGORY_BANDS = 6
 
 # Which side each leg of a pair buys, as (side bought on market_a, side bought
 # on market_b). scanner.leg_sides() is the ONLY reader — never hardcode a side
@@ -1953,8 +2114,8 @@ CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
 # 2026-09-23 calibration corpus, the longest request with a cached series
 # spanned 4,993.97 hours, while all 115 requests spanning more than 5,000
 # hours (the shortest 5,005.33) came back with no candles and left no cache
-# file, which is what a failed request leaves. historical.fetch_candlesticks —
-# the only reader — therefore sends any window longer than (this - 1) candle
+# file, which is what a failed request leaves. historical.fetch_candlesticks
+# therefore sends any window longer than (this - 1) candle
 # periods as consecutive requests of at most (this - 1) periods each,
 # overlapping by one period, and merges them ascending by timestamp with the
 # overlap's repeats dropped (historical._candle_request_windows /
@@ -1966,7 +2127,9 @@ CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
 # every fetch error to [], never cached), so every market whose window — then
 # opened at the backtest's --start-date and run to a day past its close —
 # spanned more than about 208 days of hourly candles silently had no price
-# series and could never enter a backtest trade.
+# series and could never enter a backtest trade. live_portfolio.read_marks
+# reads this too, for the daily candles it asks the archive for one market at
+# a time.
 CANDLESTICK_MAX_CANDLES_PER_REQUEST = 5000
 
 # Version of the fields a cached candle carries. A cache written under an

@@ -20,7 +20,9 @@ Dependencies:
     Used by main.py (build_client, read_account_balance), historical.py
     (build_client), trader.py (read_shard_balances), backtest.py
     (read_account_balance: a backtest's starting balance when --balance is
-    not given) and the human-run verification tool (build_client, verify_auth).
+    not given), live_portfolio.py (_positions_value_cents, the Live trading
+    tab's reading of Kalshi's positions value; read-only) and the human-run
+    verification tool (build_client, verify_auth).
 
 Notes:
     - Set the key ID and private key as attributes on the SDK's Configuration,

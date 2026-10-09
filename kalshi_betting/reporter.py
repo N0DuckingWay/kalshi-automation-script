@@ -37,7 +37,14 @@ Dependencies:
     SaleRecord, SaleLegRecord, RunReportHandler, trade_record, report_trades,
     sale_record, report_sales and write_run_report (all consumed by main.py).
     A sale's plan (seller.SalePlan) is read by its attributes only; seller.py
-    is never imported here.
+    is never imported here. The trade log it writes (PROD_LOG_PATH, and the
+    fallback copies _write_fallback_log puts beside it) is read back by
+    live_portfolio.py, the live dashboard's Live trading tab, which finds
+    the bot's purchases in it, and tells a sale row from a purchase by the
+    start of its Notes ("[sale: "): it looks PROD_LOG_PATH up when it reads,
+    and matches the fallback copies' name pattern, the columns it reads and
+    that Notes start, so those change only together with live_portfolio's
+    _FALLBACK_LOG, _LOG_HEADERS and _SALE_NOTE.
 
 Notes:
     The TradeResult dataclass is defined here (not in trader.py) because reporter.py
@@ -123,6 +130,8 @@ from .config import (
 from .scanner import display_title, leg_prices, leg_sides, pair_held
 from .strategy import TradeSpec
 
+# The shared trade log; live_portfolio.trade_log_paths reads it (and the
+# fallback copies beside it) back for the Live trading tab
 PROD_LOG_PATH = PROJECT_ROOT / "trade_log.xlsx"
 
 # Sidecar lock file coordinating concurrent writers to PROD_LOG_PATH (e.g. the
@@ -275,6 +284,10 @@ _SALE_STATUS_WORDS = {
 # would have), so the plan's profit is what the sale realized
 _SALE_WHOLE_STATUSES = ("sold", "simulated")
 
+# The Market cell of a sold position's paid-out partner. No sale order goes
+# to that market, and live_portfolio reads this cell to leave it out
+PAID_OUT_MARKET = "(paid out)"
+
 
 def _apply_header_row(ws, fill: PatternFill) -> None:
     """
@@ -402,10 +415,11 @@ def _sale_leg_cells(leg: Any, plan: Any, sold: dict) -> list:
     Returns:
         list: [market, ticker, deadline, average bid sold at, contracts sold]
             for a held market (the count blank when it is not known); for a
-            paid-out partner, "(paid out)" and its ticker, the rest blank.
+            paid-out partner, PAID_OUT_MARKET ("(paid out)") and its ticker,
+            the rest blank.
     """
     if leg.market is None:
-        return ["(paid out)", leg.ticker, "", "", ""]
+        return [PAID_OUT_MARKET, leg.ticker, "", "", ""]
     close = leg.market.close_time
     count = sold.get(leg.ticker)
     return [display_title(leg.market), leg.ticker,
@@ -740,7 +754,9 @@ def _write_fallback_log(results: list, balance_before: float, balance_after: flo
             written before the trades; empty adds nothing.
 
     Returns:
-        Path: The new file, trade_log_<date>_<time>.xlsx in the project folder.
+        Path: The new file, trade_log_<date>_<time>_<microseconds>.xlsx in the
+            project folder ("-N" added when that name is taken), the pattern
+            live_portfolio.trade_log_paths reads it back by.
     """
     run_ts = datetime.now(UTC).astimezone()
     # Microseconds keep two near-simultaneous fallbacks off the collision path at
