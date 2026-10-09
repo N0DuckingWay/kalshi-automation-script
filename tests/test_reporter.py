@@ -4,8 +4,9 @@ live toggles) it appends to the separator row on both paths, plus the row/Notes/
 sheet layout after the 2026-09 strategy change (side-neutral x/y headers, the
 "[<pair_type>: <SIDE_A> A / <SIDE_B> B[ nB=…]] " Notes prefix, and the "nB (NO
 ask)" candidates column), and the run result main.py --result-file writes
-(trade_record, report_trades, write_run_report and RunReportHandler). All
-tests run offline against tmp_path; no real Kalshi API interaction.
+(trade_record, report_trades — with the Kalshi category and tag it files each
+record under — write_run_report and RunReportHandler). All tests run offline
+against tmp_path; no real Kalshi API interaction.
 
 The lock-timeout test pre-acquires the sidecar lock file from a *separate*
 open() call in the test itself. This genuinely conflicts with reporter's own
@@ -678,6 +679,137 @@ class TestReportTrades:
             cost_with_fees=None, profit_if_won=None)
         errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
         assert errors == ["Could not describe a pair for the run result: cannot read spec"]
+
+    # The Kalshi category and first tag each pair's market A is filed under,
+    # as main._pair_labels would give them, by market A's ticker
+    _LABELS = {"TICK-A-1": ("Sports", "Basketball"), "TICK-A-2": ("Economics", "Fed"),
+               "TA": ("Politics", "Congress")}
+
+    def _labels_of(self, pair) -> tuple:
+        """
+        Stand in for main._pair_labels: file a pair by its market A's ticker.
+
+        Args:
+            pair: The pair report_trades hands over.
+
+        Returns:
+            tuple: (category, tag) from _LABELS.
+
+        Raises:
+            KeyError: For a ticker _LABELS does not name.
+        """
+        return self._LABELS[pair.market_a.ticker]
+
+    def test_each_record_names_the_category_and_tag_it_is_filed_under(self, tmp_path):
+        first, second = make_result("1"), make_result("2", status="failed")
+        handed = []
+
+        def labels_of(pair):
+            """
+            Record which pair was handed over, then file it.
+
+            Args:
+                pair: The pair report_trades hands over.
+
+            Returns:
+                tuple: (category, tag).
+            """
+            handed.append(pair)
+            return self._labels_of(pair)
+
+        records = reporter.report_trades([first, second], labels_of=labels_of)
+        # Each result's own pair, once, in order
+        assert [id(p) for p in handed] == [id(first.spec.pair), id(second.spec.pair)]
+        assert records == [
+            dataclasses.replace(reporter.trade_record(first), category="Sports",
+                                tag="Basketball"),
+            dataclasses.replace(reporter.trade_record(second), category="Economics",
+                                tag="Fed")]
+        # ... and the result file carries both
+        path = tmp_path / "result.json"
+        reporter.write_run_report(path, _run_report(trades=records), 0)
+        assert [(t["category"], t["tag"]) for t in _strict_json(path)["trades"]] == [
+            ("Sports", "Basketball"), ("Economics", "Fed")]
+
+    def test_without_a_way_to_file_them_no_record_names_a_category(self, tmp_path):
+        result = make_result("1")
+        record = reporter.trade_record(result)
+        assert record.category is None and record.tag is None
+        assert reporter.report_trades([result]) == [record]
+        path = tmp_path / "result.json"
+        reporter.write_run_report(path, _run_report(trades=[record]), 0)
+        trade = _strict_json(path)["trades"][0]
+        assert trade["category"] is None and trade["tag"] is None
+
+    def test_a_pair_that_cannot_be_filed_keeps_its_record_and_says_so(self, caplog):
+        def fail(pair):
+            """
+            Fail to file any pair.
+
+            Args:
+                pair: The pair report_trades hands over.
+
+            Raises:
+                KeyError: Always.
+            """
+            raise KeyError("no event ticker")
+
+        first = make_result("1")
+        # A result with no spec at all: reading its pair fails too
+        with caplog.at_level(logging.INFO):
+            records = reporter.report_trades([first, object()], labels_of=fail)
+        assert records[0] == reporter.trade_record(first)
+        assert records[1] == reporter.TradeRecord(
+            status="unknown", error=None, pair_type=None, title=None, a=None, b=None,
+            cost_with_fees=None, profit_if_won=None)
+        filed = [r for r in caplog.records if r.getMessage().startswith("Could not file pair")]
+        assert [(r.levelno, r.getMessage()) for r in filed] == [
+            (logging.INFO, "Could not file pair 'test pair' under a Kalshi category for "
+                           "the run result: 'no event ticker'"),
+            (logging.INFO, "Could not file pair None under a Kalshi category for the run "
+                           "result: 'object' object has no attribute 'spec'")]
+
+    @pytest.mark.parametrize("labels", [
+        ("Sports", None), (None, "Basketball"), (1, 2), ("Sports",),
+        ("Sports", "Basketball", "Extra"), None,
+    ], ids=["no-tag", "no-category", "numbers", "one-label", "three-labels", "none"])
+    def test_labels_that_are_not_two_strings_are_left_out(self, labels):
+        result = make_result("1")
+        records = reporter.report_trades([result], labels_of=lambda pair: labels)
+        assert records == [reporter.trade_record(result)]
+
+    def test_a_pair_it_could_not_describe_is_still_filed(self, caplog):
+        # The fallback record of a pair trade_record cannot read still gets its
+        # labels when its pair can be read, and one whose pair cannot keeps none
+        class Unreadable:
+            """A result whose every field raises when read."""
+
+            def __getattr__(self, name):
+                """
+                Fail on every field, the way a broken property would.
+
+                Args:
+                    name (str): The field read.
+
+                Raises:
+                    RuntimeError: Always.
+                """
+                raise RuntimeError(f"cannot read {name}")
+
+        broken_pair = SimpleNamespace(
+            pair_type="time_series", canonical_title="broken pair", pA=0.3,
+            market_a=SimpleNamespace(ticker="TA"), market_b=SimpleNamespace(ticker="TB"))
+        broken = TradeResult(spec=SimpleNamespace(pair=broken_pair, x=3, y=4),
+                             status="manual_review", error="position lookup failed")
+        with caplog.at_level(logging.INFO):
+            records = reporter.report_trades([broken, Unreadable()], labels_of=self._labels_of)
+        assert records[0] == reporter.TradeRecord(
+            status="manual_review", error="position lookup failed", pair_type="time_series",
+            title="broken pair", a=reporter.LegRecord("TA", None, None, 3, None),
+            b=reporter.LegRecord("TB", None, None, 4, None),
+            cost_with_fees=None, profit_if_won=None, category="Politics", tag="Congress")
+        assert records[1].status == "unknown"
+        assert records[1].category is None and records[1].tag is None
 
 
 class TestWriteRunReport:

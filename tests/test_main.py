@@ -28,7 +28,8 @@ Purpose:
     live-toggle AST pin) run under pinned_config_toggles, which pins config's
     toggles and saves them as the test's live defaults; every other test that
     runs main.main() saves config.py's toggles first (conftest's
-    saved_live_defaults). TestCategoryFilter covers main._filter_by_category.
+    saved_live_defaults). TestCategoryFilter covers main._filter_by_category
+    and main._pair_labels, the filing rule it shares with the run result.
 
     On the live-run lock: TestRunLock pins that a production run that sends
     orders holds run_lock's machine-wide lock from before it builds a client
@@ -1168,6 +1169,42 @@ class TestCategoryFilter:
     def test_dashboard_and_live_filter_share_one_filing_rule(self):
         assert dashboard._series_labels is historical.series_labels
         assert main.series_labels is historical.series_labels
+
+    def test_a_listing_handed_in_is_used_and_not_read_again(self, monkeypatch, caplog):
+        # _run_prod reads the listing once for its run result and hands it on
+        def no_read(*args, **kwargs):
+            raise AssertionError("the listing was read although one was handed in")
+
+        monkeypatch.setattr(main, "load_series_categories", no_read)
+        listing = {t: (c, tuple(tags)) for t, (c, tags) in self.LISTING.items()}
+        settings = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, categories=("sports",))
+        with caplog.at_level(logging.INFO):
+            out = main._filter_by_category(self._pairs(), settings, MagicMock(),
+                                           series_categories=listing)
+        assert self._tickers(out) == ["KXNCAAMBGAME-26JAN13WIUEIU", "KXUCLGAME-26APR14ATMBAR"]
+        assert "kept 2 of 10 candidate pairs" in caplog.text
+        # No filter set: the pairs come back untouched, whatever is handed in
+        pairs = self._pairs()
+        no_filter = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
+        assert main._filter_by_category(pairs, no_filter, MagicMock(),
+                                        series_categories=listing) is pairs
+        # An empty listing handed in is no listing: nothing is kept, and it says why
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert main._filter_by_category(self._pairs(), settings, MagicMock(),
+                                            series_categories={}) == []
+        assert "Kalshi's /series listing could not be read and no cached copy exists" in (
+            caplog.text)
+
+    def test_pair_labels_files_a_pair_by_its_market_a_series(self):
+        listing = {t: (c, tuple(tags)) for t, (c, tags) in self.LISTING.items()}
+        assert main._pair_labels(_filter_pair("KXNCAAMBGAME-26JAN13WIUEIU"), listing) == (
+            "Sports", "Basketball")
+        assert main._pair_labels(_filter_pair("KXSCOTUSLAST-26"), listing) == (
+            "Politics", "General")
+        # A series the listing lacks: its ticker-prefix label, and "General"
+        assert main._pair_labels(_filter_pair("KXBTCD-26SEP1517"), listing) == (
+            infer_category("KXBTCD-26SEP1517"), "General")
 
 
 class TestSetupLogging:
@@ -2648,8 +2685,8 @@ class TestLiveSettingsReachEverySite:
         _seed_series_listing(self._LISTING)
         real_filter = main._filter_by_category
 
-        def filter_spy(pairs, settings_, listing_client):
-            kept = real_filter(pairs, settings_, listing_client)
+        def filter_spy(pairs, settings_, listing_client, **kwargs):
+            kept = real_filter(pairs, settings_, listing_client, **kwargs)
             captured.setdefault("filter", []).append(
                 (list(pairs), settings_, listing_client, list(kept)))
             return kept
@@ -4057,16 +4094,17 @@ def make_spec() -> SimpleNamespace:
     # contract (B) is priced above the earlier (pA=0.30 -> pB=0.60); the legs
     # bought are YES on A at pA and NO on B at nB=0.40; nA=0.70 is A's
     # reporting-only NO ask. nB is a REAL float: print_pairs_table renders it
-    # and scanner.leg_prices reads it directly (no getattr default).
+    # and scanner.leg_prices reads it directly (no getattr default). Market A's
+    # event ticker is what main._pair_labels files the pair by (series KXRAIN).
     pair = SimpleNamespace(
         pair_type="time_series",
         market_a=SimpleNamespace(
-            ticker="TICK-A", title="Market A", subtitle="", close_time=None,
-            exchange_index=DEFAULT_EXCHANGE_INDEX,
+            ticker="TICK-A", event_ticker="KXRAIN-26OCT01", title="Market A", subtitle="",
+            close_time=None, exchange_index=DEFAULT_EXCHANGE_INDEX,
         ),
         market_b=SimpleNamespace(
-            ticker="TICK-B", title="Market B", subtitle="", close_time=None,
-            exchange_index=DEFAULT_EXCHANGE_INDEX,
+            ticker="TICK-B", event_ticker="KXRAIN-26OCT08", title="Market B", subtitle="",
+            close_time=None, exchange_index=DEFAULT_EXCHANGE_INDEX,
         ),
         pA=0.30,
         pB=0.60,
@@ -4614,6 +4652,9 @@ class TestSizesOnPortfolioValue:
             TradeResult(spec=s, status="simulated" if dry_run else "executed")
             for s in portfolio])
         monkeypatch.setattr(main, "append_to_prod_log", trade_log)
+        # Kalshi's /series listing, which a run handed a report reads to file
+        # its trades: none here, so no request reaches the fake client
+        monkeypatch.setattr(main, "load_series_categories", lambda client: {})
         with caplog.at_level(logging.INFO):
             code = main._run_prod(MagicMock(), _args(dry_run=dry_run), report=report)
         return code, seen
@@ -4779,6 +4820,9 @@ class TestSizesOnPortfolioValue:
 
         monkeypatch.setattr(main, "enrich_with_orderbook_prices", enrich)
         monkeypatch.setattr(main, "compute_trade", sized)
+        # A run handed a report reads Kalshi's /series listing: a fresh cached
+        # copy, so no request reaches the fake client
+        _seed_series_listing(TestLiveSettingsReachEverySite._LISTING)
         report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
         with caplog.at_level(logging.INFO):
             code = main._run_prod(client, SimpleNamespace(dry_run=True, max_horizon_days=None),
@@ -4806,6 +4850,9 @@ class TestSizesOnPortfolioValue:
         client = _live_shape_client(monkeypatch, balance_payload=payload)
         monkeypatch.setattr(main, "append_to_prod_log",
                             lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"))
+        # A run handed a report reads Kalshi's /series listing: a fresh cached
+        # copy, so no request reaches the fake client
+        _seed_series_listing(TestLiveSettingsReachEverySite._LISTING)
         report = main.RunReport(dry_run=True, started_at=datetime.now(UTC))
         with caplog.at_level(logging.INFO):
             code = main._run_prod(client, SimpleNamespace(dry_run=True, max_horizon_days=None),
@@ -5507,13 +5554,20 @@ def _no_report_handler() -> bool:
     return not any(isinstance(h, main.RunReportHandler) for h in logging.getLogger().handlers)
 
 
+# Kalshi's /series listing as load_series_categories returns it (series
+# ticker -> (category, tags)), filing make_spec()'s pair (series KXRAIN)
+_RESULT_FILE_LISTING = {"KXRAIN": ("Climate and Weather", ("Rain", "Weather")),
+                        "KXOTHER": ("Sports", ("Soccer",))}
+
 # The record make_spec()'s pair gives in a run result: a time-series pair
-# buying YES on A at pA and NO on B at nB, five contracts a side
+# buying YES on A at pA and NO on B at nB, five contracts a side, filed by
+# _RESULT_FILE_LISTING under its series' category and first tag
 _MAKE_SPEC_TRADE = {
     "pair_type": "time_series", "title": "Test pair",
     "a": {"ticker": "TICK-A", "market": "Market A", "side": "yes", "count": 5, "price": 0.3},
     "b": {"ticker": "TICK-B", "market": "Market B", "side": "no", "count": 5, "price": 0.4},
     "cost_with_fees": 2.3, "profit_if_won": 0.5, "adds_to_held": None,
+    "category": "Climate and Weather", "tag": "Rain",
 }
 
 
@@ -5524,7 +5578,9 @@ class TestResultFile:
     it ends once logging is set up: one test per way _run_prod ends, each
     checking the exit code, the message (the line the run logged, word for
     word), the trades and the balances; then an exception, a run stopped
-    while sending orders, an undescribable pair, a lock refusal, a usage
+    while sending orders, an undescribable pair, the Kalshi category and tag
+    each trade is filed under (Kalshi's /series listing read once, only by a
+    run with a result to fill and candidate pairs), a lock refusal, a usage
     error (exit 2, no file, an older one removed), the flag in dev, no flag,
     and the handler's removal.
     """
@@ -5534,13 +5590,14 @@ class TestResultFile:
     _AFTER = 99_000
 
     def _run(self, monkeypatch, tmp_path, caplog, *, dry_run=False, status="executed",
-             **stubs) -> tuple[dict, dict, list]:
+             argv=(), result_file=True, **stubs) -> tuple[dict, dict | None, list]:
         """
         Run main.main() in production with --result-file and every request stubbed.
 
         By default one same-title-found pair (make_spec's) is sized, passes
-        every check and ends with the given status. Each keyword in stubs
-        replaces one of main's names for this run.
+        every check and ends with the given status, and Kalshi's /series
+        listing is _RESULT_FILE_LISTING. Each keyword in stubs replaces one of
+        main's names for this run.
 
         Args:
             monkeypatch (pytest.MonkeyPatch): For the stubs.
@@ -5548,11 +5605,14 @@ class TestResultFile:
             caplog (pytest.LogCaptureFixture): Captures the run's log lines.
             dry_run (bool): Pass --dry-run.
             status (str): The status execute_trades gives each pair.
+            argv (tuple): More command-line flags, e.g. ("--category", "Sports").
+            result_file (bool): Pass --result-file; without it no file is read back.
             **stubs: main's names to replace, e.g. read_account_balance=...
 
         Returns:
-            tuple[dict, dict, list]: What _main_with saw, the parsed result
-                file, and the run's log records.
+            tuple[dict, dict | None, list]: What _main_with saw, the parsed
+                result file (None without --result-file), and the run's log
+                records.
         """
         spec = make_spec()
         path = tmp_path / "result.json"
@@ -5580,14 +5640,17 @@ class TestResultFile:
             "execute_trades": lambda client, portfolio, *, dry_run: [
                 TradeResult(spec=s, status=status) for s in portfolio],
             "append_to_prod_log": lambda *a, **k: logged.append(a) or pathlib.Path("/fake"),
+            # Kalshi's /series listing, which the run reads to file each trade
+            "load_series_categories": lambda client: _RESULT_FILE_LISTING,
         }
         patches.update(stubs)
-        argv = ["--mode", "prod", "--result-file", str(path)] + (["--dry-run"] if dry_run else [])
+        argv = (["--mode", "prod"] + (["--result-file", str(path)] if result_file else [])
+                + (["--dry-run"] if dry_run else []) + list(argv))
         with caplog.at_level(logging.INFO):
             seen = _main_with(monkeypatch, argv, **patches)
         assert _no_report_handler()
         seen["trade_log_calls"] = logged
-        return seen, _read_result(path), list(caplog.records)
+        return seen, _read_result(path) if result_file else None, list(caplog.records)
 
     @staticmethod
     def _logged_once(records, message: str, level: int) -> None:
@@ -6086,9 +6149,137 @@ class TestResultFile:
             ("executed", None, "TICK-C", "TICK-D", 5, 5)]
         assert all(t["cost_with_fees"] is None and t["a"]["price"] is None
                    for t in result["trades"])
+        # ... still filed under its category and tag, since its pair can be read
+        assert [(t["category"], t["tag"]) for t in result["trades"]] == [
+            ("Climate and Weather", "Rain")] * 2
         errors = [r for r in records if r.levelno == logging.ERROR
                   and r.getMessage().startswith("Could not describe a pair for the run result")]
         assert len(errors) == 2
+
+    @pytest.mark.parametrize("argv", [(), ("--category", "Climate and Weather")],
+                             ids=["no-filter", "category-filter"])
+    def test_the_listing_is_read_once_before_any_book(self, monkeypatch, tmp_path, caplog,
+                                                       argv):
+        # One read with the run's own client, right after the finders' pairs
+        # are merged and before enrichment reads a book, even when a category
+        # filter needs the listing too
+        client = MagicMock()
+        events = []
+
+        def listing(client_):
+            """
+            Record a read of Kalshi's /series listing, then return it.
+
+            Args:
+                client_: The client the run reads it with.
+
+            Returns:
+                dict: _RESULT_FILE_LISTING.
+            """
+            events.append(("listing", client_))
+            return _RESULT_FILE_LISTING
+
+        def enrich(client_, pairs, value, *, settings, cash_cents):
+            """
+            Record that the books are being read, and price nothing.
+
+            Args:
+                client_: The run's client.
+                pairs (list): The candidate pairs the filter kept.
+                value (int): The portfolio value, in cents.
+                settings (LiveSettings): Keyword-only. The run's settings.
+                cash_cents (int): Keyword-only. The cash, in cents.
+
+            Returns:
+                list: The pairs, unchanged.
+            """
+            events.append(("enrich", [p.market_a.ticker for p in pairs]))
+            return pairs
+
+        seen, result, records = self._run(
+            monkeypatch, tmp_path, caplog, dry_run=True, status="simulated", argv=argv,
+            build_client=lambda mode: client, load_series_categories=listing,
+            enrich_with_orderbook_prices=enrich)
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        # The filter kept the pair from the listing already read
+        assert events == [("listing", client), ("enrich", ["TICK-A"])]
+        assert result["trades"] == [self._trade("simulated")]
+        filtered = [r.getMessage() for r in records
+                    if r.getMessage().startswith("Category/tag filter (")]
+        assert filtered == ([] if not argv else [
+            "Category/tag filter (categories Climate and Weather; tags any): kept 1 of 1 "
+            "candidate pairs"])
+
+    def test_with_no_listing_a_trade_has_no_category(self, monkeypatch, tmp_path, caplog):
+        # The listing could not be read and no copy is cached: each trade's
+        # category and tag are null, not infer_category's "Other"
+        seen, result, _ = self._run(monkeypatch, tmp_path, caplog,
+                                    load_series_categories=lambda client: {})
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        assert result["trades"] == [{**self._trade("executed"), "category": None, "tag": None}]
+
+    def test_a_run_with_no_candidate_pairs_reads_no_listing(self, monkeypatch, tmp_path,
+                                                            caplog):
+        reads = []
+        seen, result, _ = self._run(
+            monkeypatch, tmp_path, caplog,
+            find_same_title_pairs=lambda markets, held, *, add_on_pairs=None: [],
+            load_series_categories=lambda client: reads.append(client) or {})
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        assert reads == [] and result["trades"] == []
+
+    def test_a_run_without_the_flag_reads_no_listing(self, monkeypatch, tmp_path, caplog):
+        # A scheduled run writes no result, so with no category/tag filter set
+        # it has nothing to read the listing for
+        reads = []
+        seen, result, _ = self._run(
+            monkeypatch, tmp_path, caplog, result_file=False,
+            load_series_categories=lambda client: reads.append(client) or {})
+        assert seen["code"] == EXIT_OK and result is None
+        assert reads == []
+        # ... though it traded and wrote its trade log as before
+        assert len(seen["trade_log_calls"]) == 1
+        assert not (tmp_path / "result.json").exists()
+
+    def test_a_live_shape_run_files_each_trade_from_the_cached_listing(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        # The real listing read, from a fresh cached copy (no request), and the
+        # real filing of each pair by its market A's series: EVT-TS-EARLY is
+        # series EVT, SAME-EXP's event EXPEVT-1 is series EXPEVT
+        client = _live_shape_client(
+            monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD, include_time_series=True)
+        _seed_series_listing(TestLiveSettingsReachEverySite._LISTING)
+        requests = []
+
+        def no_request(client_, path, **params):
+            """
+            Record a request for the listing; a fresh cached copy needs none.
+
+            Args:
+                client_: The client it would be signed with.
+                path (str): The API path.
+                **params: The query parameters.
+
+            Raises:
+                AssertionError: Always.
+            """
+            requests.append(path)
+            raise AssertionError("the fresh /series listing was requested")
+
+        monkeypatch.setattr(historical, "_historical_get", no_request)
+        path = tmp_path / "result.json"
+        with caplog.at_level(logging.INFO):
+            seen = _main_with(monkeypatch, ["--mode", "prod", "--dry-run", "--result-file",
+                                            str(path)],
+                              _run_prod=main._run_prod, build_client=lambda mode: client,
+                              append_to_prod_log=lambda *a, **k: pathlib.Path("/fake"))
+        result = _read_result(path)
+        assert seen["code"] == result["exit_code"] == EXIT_OK
+        assert requests == []
+        filed = {t["a"]["ticker"]: (t["category"], t["tag"]) for t in result["trades"]}
+        assert filed == {_TICKER_TS_EARLY: ("Economics", "Inflation"),
+                         _TICKER_SAME_EXP: ("Politics", "Elections")}
 
     def test_a_lock_refusal_writes_50_and_its_message(self, monkeypatch, tmp_path, caplog):
         path = tmp_path / "result.json"

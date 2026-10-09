@@ -280,10 +280,11 @@ def series_labels(
     Name the Kalshi category and FIRST tag an event's series is filed under.
 
     The one filing rule behind the backtest dashboard's categories and tags,
-    main._filter_by_category's live filter (which states its own matching) and
-    the Live trading tab's categories (live_portfolio.build_live_view, which
-    takes the category alone). First tag only, so every breakdown partitions
-    what it breaks down.
+    main._filter_by_category's live filter (which states its own matching),
+    each trade's category and tag in a production run's result (both through
+    main._pair_labels) and the Live trading tab's categories
+    (live_portfolio.build_live_view, which takes the category alone). First
+    tag only, so every breakdown partitions what it breaks down.
 
     Args:
         event_ticker (str): The event whose series (series_ticker) is looked up.
@@ -343,7 +344,8 @@ def load_series_categories(
     prefixes predate the "KX" prefix every current series carries and so file
     nearly every trade under "Other". Nothing is priced, sized or settled on
     these labels; they file the dashboard's trades, decide which pairs a
-    live category/tag filter keeps, and file the bot's purchases on the live
+    live category/tag filter keeps, file each trade of a production run's
+    result (main.py --result-file), and file the bot's purchases on the live
     dashboard's Live trading tab.
 
     The listing is cached in backtest_cache/series_categories.json and reused

@@ -14,6 +14,8 @@ Purpose:
     (its outcome, its cash before and after trading, the portfolio value it
     sized on, whether it began sending orders, one record per pair and its
     WARNING-or-worse log lines), saved as one JSON file when the run ends.
+    Each pair's record names the Kalshi category and first tag it is filed
+    under, when main.py hands report_trades a way to file it.
 
 Dependencies:
     Imports display_title, leg_sides (which side each leg buys, rendered
@@ -85,7 +87,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO
@@ -774,6 +776,11 @@ class TradeRecord:
             account already held (scanner.pair_held), the contracts it held
             on each market; None for any other trade. The defaults server's
             run page shows it as "(adds to N held)".
+        category (str | None): The Kalshi category market A's series is filed
+            under (e.g. "Sports"), by the rule the backtest dashboard and the
+            live category/tag filter use; None when not known.
+        tag (str | None): That series' first tag (e.g. "Basketball"); None
+            when not known. The run page shows the two as "Sports · Basketball".
     """
     status: str
     error: str | None
@@ -784,6 +791,8 @@ class TradeRecord:
     cost_with_fees: float | None
     profit_if_won: float | None
     adds_to_held: float | None = None
+    category: str | None = None
+    tag: str | None = None
 
 
 @dataclass
@@ -979,7 +988,7 @@ def _fallback_leg(market, count) -> LegRecord | None:
                      count if type(count) is int else None, None)
 
 
-def report_trades(results: list) -> list[TradeRecord]:
+def report_trades(results: list, *, labels_of=None) -> list[TradeRecord]:
     """
     Describe every pair's outcome for a RunReport; never raises.
 
@@ -987,10 +996,15 @@ def report_trades(results: list) -> list[TradeRecord]:
     holding what the trade log's rescue lines read of it (status, error, title
     and both tickers and counts, each only if it can be read), so the run goes
     on to write the trade log after it. If even that cannot be read, the
-    record says only that its status is "unknown".
+    record says only that its status is "unknown". Each record then gets the
+    Kalshi category and tag its pair is filed under, when labels_of can file it.
 
     Args:
         results (list[TradeResult]): The trader's results, in submission order.
+        labels_of (Callable | None): Keyword-only. Given a pair, returns the
+            (Kalshi category, first tag) it is filed under; main._run_prod
+            passes one built on Kalshi's /series listing. None leaves every
+            record's category and tag unknown.
 
     Returns:
         list[TradeRecord]: One record per result, in the same order.
@@ -1019,7 +1033,38 @@ def report_trades(results: list) -> list[TradeRecord]:
             records.append(TradeRecord(
                 status="unknown", error=None, pair_type=None, title=None, a=None, b=None,
                 cost_with_fees=None, profit_if_won=None))
-    return records
+    # Each pair's category and tag, added after the fact so that a pair which
+    # cannot be filed still keeps its record (the loop above made exactly one
+    # record per result, so the two lists are the same length)
+    return [_with_labels(record, result, labels_of)
+            for record, result in zip(records, results, strict=True)]
+
+
+def _with_labels(record: TradeRecord, result, labels_of) -> TradeRecord:
+    """
+    Add the Kalshi category and tag a pair is filed under to its record; never raises.
+
+    Args:
+        record (TradeRecord): The pair's record, from report_trades.
+        result: The trader's result it describes.
+        labels_of (Callable | None): Gives a pair's (category, tag); None adds nothing.
+
+    Returns:
+        TradeRecord: The record with both labels when labels_of gives two
+            strings for the pair, else the record unchanged.
+    """
+    if labels_of is None:
+        return record
+    try:
+        category, tag = labels_of(result.spec.pair)
+    except Exception as exc:
+        # The run page shows "—" for a pair with no category; nothing to act on
+        logging.info("Could not file pair %r under a Kalshi category for the run result: %s",
+                     record.title, exc)
+        return record
+    if not (isinstance(category, str) and isinstance(tag, str)):
+        return record
+    return replace(record, category=category, tag=tag)
 
 
 def write_run_report(path: Path, report: RunReport, exit_code: int | None) -> None:
