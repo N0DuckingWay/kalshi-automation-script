@@ -6449,7 +6449,25 @@ class TestLoadSeriesCategories:
         with caplog.at_level(logging.WARNING):
             assert historical.load_series_categories(MagicMock()) == {}
         assert "falls back to ticker-prefix categories" in caplog.text
+        assert "a run's result records no category" in caplog.text
         assert not cache.exists()
+
+    @pytest.mark.parametrize("error", [RecursionError("nested too deeply"),
+                                       PermissionError("folder cannot be searched")])
+    def test_a_cached_copy_that_cannot_be_read_is_treated_as_missing(
+            self, cache, monkeypatch, caplog, error):
+        # Every run the defaults server starts reads the listing, so a cache
+        # read that raises must never stop the run: no copy, then the fetch
+        def unreadable(path):
+            raise error
+
+        monkeypatch.setattr(historical, "_load_json_cache", unreadable)
+        calls = self._stub(monkeypatch, self.LISTING)
+        with caplog.at_level(logging.WARNING):
+            assert historical.load_series_categories(None) == {}
+            assert "KXNCAAMBGAME" in historical.load_series_categories(MagicMock())
+        assert len(calls) == 1
+        assert "could not read the cached /series listing" in caplog.text
 
     @pytest.mark.parametrize("fetched_at", [
         datetime(2020, 1, 1, tzinfo=UTC),               # stale

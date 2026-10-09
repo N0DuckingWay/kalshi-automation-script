@@ -352,8 +352,10 @@ def load_series_categories(
     while younger than max_age_seconds. It is one read-only GET (retried like
     every other historical read). It never raises: a failed fetch logs a WARNING
     and returns the cached copy however old, or {} — on which the dashboard files
-    by infer_category and a set live category/tag filter keeps nothing. A fetched
-    listing is returned even when writing its cache fails.
+    by infer_category, a run's result records no category and a set live
+    category/tag filter keeps nothing. A cached copy that cannot be read is
+    treated as missing, with a WARNING. A fetched listing is returned even when
+    writing its cache fails.
 
     Args:
         client (Any): A KalshiClient pointed at prod (build_prod_live_client() or
@@ -366,15 +368,21 @@ def load_series_categories(
         dict[str, tuple[str, tuple[str, ...]]]: series ticker -> (category,
             tags). A series with no category maps to ""; with no tags to ().
     """
-    cached = _load_json_cache(_SERIES_CATEGORIES_CACHE)
     cached_map: dict[str, tuple[str, tuple[str, ...]]] = {}
     fetched_at: datetime | None = None
-    if isinstance(cached, dict):
-        cached_map = _parse_series_categories(cached.get("series"))
-        try:
-            fetched_at = datetime.fromisoformat(cached.get("fetched_at"))
-        except (TypeError, ValueError):
-            fetched_at = None
+    try:
+        cached = _load_json_cache(_SERIES_CATEGORIES_CACHE)
+        if isinstance(cached, dict):
+            cached_map = _parse_series_categories(cached.get("series"))
+            try:
+                fetched_at = datetime.fromisoformat(cached.get("fetched_at"))
+            except (TypeError, ValueError):
+                fetched_at = None
+    except Exception as exc:  # a folder that cannot be searched, a file nested too deeply
+        logging.warning(
+            "Series categories: could not read the cached /series listing (%s) — "
+            "treating it as missing", _exception_summary(exc))
+        cached_map, fetched_at = {}, None
     if client is None:
         # Dev mode: the sandbox key must never sign a production request
         return cached_map
@@ -408,8 +416,9 @@ def load_series_categories(
             "Series category listing unavailable (%s) — %s",
             _exception_summary(exc),
             f"using the cached copy of {len(cached_map)} series" if cached_map
-            else "every series falls back to ticker-prefix categories (and a live "
-                 "category/tag filter, if set, trades nothing)",
+            else "every series falls back to ticker-prefix categories (a run's "
+                 "result records no category, and a live category/tag filter, if "
+                 "set, trades nothing)",
         )
         return cached_map
     try:

@@ -1833,8 +1833,8 @@ def _category_text(trade: dict) -> str:
 
     Returns:
         str: "Sports · Basketball"; the category alone when no tag is
-            recorded; "—" when the run recorded no category (a run from before
-            this column, or one that could not read Kalshi's /series listing).
+            recorded; "—" when the result records no category (the run had no
+            copy of Kalshi's /series listing, or could not file the pair).
     """
     if not trade["category"]:
         return "—"

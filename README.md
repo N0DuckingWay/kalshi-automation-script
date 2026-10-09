@@ -1020,7 +1020,7 @@ the status — then its cost with fees, profit if it wins, and `adds_to_held`:
 for a trade that adds to a pair the account already holds, the contracts held
 on each market, else `null`, and `category` and `tag`: the Kalshi category and
 first tag market A's series is filed under, the backtest dashboard's rule, or
-`null` when Kalshi's /series listing could not be read), and every
+`null` when the run had no copy of Kalshi's /series listing), and every
 WARNING-or-worse line it logged in `warnings`: every ERROR and CRITICAL line
 whole, and the first 50 WARNING lines, each cut at 500 characters (ending in
 "…"), with `warnings_dropped` counting the WARNING lines left out. The file is

@@ -1012,32 +1012,30 @@ def report_trades(results: list, *, labels_of=None) -> list[TradeRecord]:
     records = []
     for result in results:
         try:
-            records.append(trade_record(result))
-            continue
+            record = trade_record(result)
         except Exception as exc:
             logging.error("Could not describe a pair for the run result: %s", exc)
-        try:
-            spec = getattr(result, "spec", None)
-            pair = getattr(spec, "pair", None)
-            records.append(TradeRecord(
-                status=_text_or_none(getattr(result, "status", None)) or "unknown",
-                error=_text_or_none(getattr(result, "error", None)),
-                pair_type=_text_or_none(getattr(pair, "pair_type", None)),
-                title=_text_or_none(getattr(pair, "canonical_title", None)),
-                a=_fallback_leg(getattr(pair, "market_a", None), getattr(spec, "x", None)),
-                b=_fallback_leg(getattr(pair, "market_b", None), getattr(spec, "y", None)),
-                cost_with_fees=None, profit_if_won=None))
-        except Exception:
-            # A field that raises when read (not merely missing): keep the
-            # pair's place in the list with nothing but an unknown status
-            records.append(TradeRecord(
-                status="unknown", error=None, pair_type=None, title=None, a=None, b=None,
-                cost_with_fees=None, profit_if_won=None))
-    # Each pair's category and tag, added after the fact so that a pair which
-    # cannot be filed still keeps its record (the loop above made exactly one
-    # record per result, so the two lists are the same length)
-    return [_with_labels(record, result, labels_of)
-            for record, result in zip(records, results, strict=True)]
+            try:
+                spec = getattr(result, "spec", None)
+                pair = getattr(spec, "pair", None)
+                record = TradeRecord(
+                    status=_text_or_none(getattr(result, "status", None)) or "unknown",
+                    error=_text_or_none(getattr(result, "error", None)),
+                    pair_type=_text_or_none(getattr(pair, "pair_type", None)),
+                    title=_text_or_none(getattr(pair, "canonical_title", None)),
+                    a=_fallback_leg(getattr(pair, "market_a", None), getattr(spec, "x", None)),
+                    b=_fallback_leg(getattr(pair, "market_b", None), getattr(spec, "y", None)),
+                    cost_with_fees=None, profit_if_won=None)
+            except Exception:
+                # A field that raises when read (not merely missing): keep the
+                # pair's place in the list with nothing but an unknown status
+                record = TradeRecord(
+                    status="unknown", error=None, pair_type=None, title=None, a=None, b=None,
+                    cost_with_fees=None, profit_if_won=None)
+        # The pair's category and tag, added once its record is made, so a
+        # pair that cannot be filed still keeps its record
+        records.append(_with_labels(record, result, labels_of))
+    return records
 
 
 def _with_labels(record: TradeRecord, result, labels_of) -> TradeRecord:
