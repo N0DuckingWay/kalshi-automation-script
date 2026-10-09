@@ -2781,11 +2781,95 @@ class TestRunPage:
         order = [body.index(f"<h2>{label}</h2>")
                  for label in ("Needs attention", "Completed", "Not completed")]
         assert order == sorted(order)
-        assert "<th>Status</th><th>Type</th><th>Market A</th><th>Leg A</th><th>Market B</th>" \
-               "<th>Leg B</th><th>Cost incl. fees</th><th>Profit if won</th><th>Note</th>" in body
+        assert "<th>Status</th><th>Type</th><th>Category</th><th>Market A</th><th>Leg A</th>" \
+               "<th>Market B</th><th>Leg B</th><th>Cost incl. fees</th><th>Profit if won</th>" \
+               "<th>Note</th>" in body
         assert "<td>30 × YES @ 0.2100</td>" in body and "<td>30 × NO @ 0.5000</td>" in body
         assert "<td>Rain by Oct 1 (RAIN-A)</td>" in body
         assert "<td>$21.90</td>" in body and "<td>orphan</td>" in body
+
+    @staticmethod
+    def _category_cell(body: str, status: str) -> str:
+        """
+        Read the Category cell of a pair's row: the cell right after its Type cell.
+
+        Args:
+            body (str): The run page.
+            status (str): The pair's status, the first cell of its row.
+
+        Returns:
+            str: The cell's HTML text, as written on the page.
+        """
+        found = re.search(rf"<td>{status}</td><td>time_series</td><td>(.*?)</td>"
+                          r"<td>Rain by Oct 1 \(RAIN-A\)</td>", body)
+        assert found, "the row has no Category cell right after its Type cell"
+        return found.group(1)
+
+    def test_each_pair_shows_its_category_and_tag(self):
+        _disk_run(result=_result(exit_code=20, trades=[
+            _trade("executed", category="Sports", tag="Basketball"),
+            _trade("rollback_failed", error="orphan", category="Economics", tag="Fed"),
+            _trade("failed", error="killed", category="Politics", tag="Elections")]))
+        body = _get(_app(), "/runs/0123456789abcdef").body
+        for status, text in (("executed", "Sports · Basketball"),
+                             ("rollback_failed", "Economics · Fed"),
+                             ("failed", "Politics · Elections")):
+            assert self._category_cell(body, status) == html.escape(text)
+        # Each shows in the table of its own group
+        sections = {part.split("</h2>")[0]: part for part in body.split("<h2>")[1:]}
+        assert "<td>Sports · Basketball</td>" in sections["Completed"]
+        assert "<td>Economics · Fed</td>" in sections["Needs attention"]
+        assert "<td>Politics · Elections</td>" in sections["Not completed"]
+
+    def test_a_dry_runs_would_be_trades_show_their_category(self):
+        _disk_run(result=_result(exit_code=0, dry_run=True, trades=[
+            _trade("simulated", category="Sports", tag="Basketball")]))
+        body = _get(_app(), "/runs/0123456789abcdef").body
+        section = body.split("<h2>Would have traded</h2>")[1]
+        assert self._category_cell(section, "simulated") == "Sports · Basketball"
+
+    def test_a_category_with_no_tag_is_shown_alone(self):
+        _disk_run(result=_result(exit_code=0, trades=[_trade("executed", category="Sports")]))
+        body = _get(_app(), "/runs/0123456789abcdef").body
+        assert self._category_cell(body, "executed") == "Sports"
+        assert "Sports ·" not in body
+
+    @pytest.mark.parametrize("changes", [
+        {},  # a run from before the column: the keys are not in the result at all
+        {"category": None, "tag": None},  # the run could not read Kalshi's /series listing
+        {"category": "", "tag": "Basketball"},
+        {"category": None, "tag": "Basketball"},  # a tag means nothing without its category
+    ])
+    def test_a_pair_with_no_recorded_category_shows_a_dash(self, changes):
+        _disk_run(result=_result(exit_code=0, trades=[_trade("executed", **changes)]))
+        body = _get(_app(), "/runs/0123456789abcdef").body
+        # The dash is the Category cell: the Type cell before it says time_series
+        assert self._category_cell(body, "executed") == "—"
+        assert "Basketball" not in body
+
+    @pytest.mark.parametrize("value", [5, True, 1.5, ["Sports"], {"name": "Sports"}])
+    def test_a_badly_typed_category_shows_a_dash(self, value):
+        _disk_run(result=_result(exit_code=0, trades=[
+            _trade("executed", category=value, tag="Basketball")]))
+        body = _get(_app(), "/runs/0123456789abcdef").body
+        assert self._headline(body) == "Trades completed"
+        assert self._category_cell(body, "executed") == "—"
+
+    @pytest.mark.parametrize("value", [5, True, 1.5, ["Basketball"], {"name": "Basketball"}])
+    def test_a_badly_typed_tag_is_left_out(self, value):
+        _disk_run(result=_result(exit_code=0, trades=[
+            _trade("executed", category="Sports", tag=value)]))
+        body = _get(_app(), "/runs/0123456789abcdef").body
+        assert self._headline(body) == "Trades completed"
+        assert self._category_cell(body, "executed") == "Sports"
+
+    def test_html_in_a_category_or_tag_is_escaped(self):
+        _disk_run(result=_result(exit_code=0, trades=[
+            _trade("executed", category="<b>x</b>", tag="<i>y</i>")]))
+        body = _get(_app(), "/runs/0123456789abcdef").body
+        assert self._category_cell(body, "executed") == \
+            "&lt;b&gt;x&lt;/b&gt; · &lt;i&gt;y&lt;/i&gt;"
+        assert "<b>x</b>" not in body and "<i>y</i>" not in body
 
     def test_a_trade_that_added_to_a_held_pair_says_so_in_its_note(self):
         # The run result's adds_to_held shows in the Note cell, after any

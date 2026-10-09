@@ -280,10 +280,11 @@ def series_labels(
     Name the Kalshi category and FIRST tag an event's series is filed under.
 
     The one filing rule behind the backtest dashboard's categories and tags,
-    main._filter_by_category's live filter (which states its own matching) and
-    the Live trading tab's categories (live_portfolio.build_live_view, which
-    takes the category alone). First tag only, so every breakdown partitions
-    what it breaks down.
+    main._filter_by_category's live filter (which states its own matching),
+    each trade's category and tag in a production run's result (both through
+    main._pair_labels) and the Live trading tab's categories
+    (live_portfolio.build_live_view, which takes the category alone). First
+    tag only, so every breakdown partitions what it breaks down.
 
     Args:
         event_ticker (str): The event whose series (series_ticker) is looked up.
@@ -343,15 +344,18 @@ def load_series_categories(
     prefixes predate the "KX" prefix every current series carries and so file
     nearly every trade under "Other". Nothing is priced, sized or settled on
     these labels; they file the dashboard's trades, decide which pairs a
-    live category/tag filter keeps, and file the bot's purchases on the live
+    live category/tag filter keeps, file each trade of a production run's
+    result (main.py --result-file), and file the bot's purchases on the live
     dashboard's Live trading tab.
 
     The listing is cached in backtest_cache/series_categories.json and reused
     while younger than max_age_seconds. It is one read-only GET (retried like
     every other historical read). It never raises: a failed fetch logs a WARNING
     and returns the cached copy however old, or {} — on which the dashboard files
-    by infer_category and a set live category/tag filter keeps nothing. A fetched
-    listing is returned even when writing its cache fails.
+    by infer_category, a run's result records no category and a set live
+    category/tag filter keeps nothing. A cached copy that cannot be read is
+    treated as missing, with a WARNING. A fetched listing is returned even when
+    writing its cache fails.
 
     Args:
         client (Any): A KalshiClient pointed at prod (build_prod_live_client() or
@@ -364,15 +368,21 @@ def load_series_categories(
         dict[str, tuple[str, tuple[str, ...]]]: series ticker -> (category,
             tags). A series with no category maps to ""; with no tags to ().
     """
-    cached = _load_json_cache(_SERIES_CATEGORIES_CACHE)
     cached_map: dict[str, tuple[str, tuple[str, ...]]] = {}
     fetched_at: datetime | None = None
-    if isinstance(cached, dict):
-        cached_map = _parse_series_categories(cached.get("series"))
-        try:
-            fetched_at = datetime.fromisoformat(cached.get("fetched_at"))
-        except (TypeError, ValueError):
-            fetched_at = None
+    try:
+        cached = _load_json_cache(_SERIES_CATEGORIES_CACHE)
+        if isinstance(cached, dict):
+            cached_map = _parse_series_categories(cached.get("series"))
+            try:
+                fetched_at = datetime.fromisoformat(cached.get("fetched_at"))
+            except (TypeError, ValueError):
+                fetched_at = None
+    except Exception as exc:  # a folder that cannot be searched, a file nested too deeply
+        logging.warning(
+            "Series categories: could not read the cached /series listing (%s) — "
+            "treating it as missing", _exception_summary(exc))
+        cached_map, fetched_at = {}, None
     if client is None:
         # Dev mode: the sandbox key must never sign a production request
         return cached_map
@@ -406,8 +416,9 @@ def load_series_categories(
             "Series category listing unavailable (%s) — %s",
             _exception_summary(exc),
             f"using the cached copy of {len(cached_map)} series" if cached_map
-            else "every series falls back to ticker-prefix categories (and a live "
-                 "category/tag filter, if set, trades nothing)",
+            else "every series falls back to ticker-prefix categories (a run's "
+                 "result records no category, and a live category/tag filter, if "
+                 "set, trades nothing)",
         )
         return cached_map
     try:

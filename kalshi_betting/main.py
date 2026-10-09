@@ -34,9 +34,10 @@ Purpose:
 
     With --result-file PATH (prod only) the run deletes any file at PATH, then
     writes a JSON summary there when it ends: its exit code, closing line,
-    balances, whether it began sending orders, each pair's outcome, its
-    warnings and any error. A usage error before logging starts, or a kill
-    signal, leaves no file, so a caller reads the exit code first.
+    balances, whether it began sending orders, each pair's outcome with the
+    Kalshi category and tag it is filed under, its warnings and any error. A
+    usage error before logging starts, or a kill signal, leaves no file, so a
+    caller reads the exit code first.
 
     The live settings come from the saved live defaults (live_defaults.json);
     a toggle flag overrides one of them for this run only. With no saved
@@ -58,12 +59,12 @@ Dependencies:
     Imports auth.py (the client, and the one balance read, which also checks
     the credentials), config.py (constants, exit codes, the order-path check
     and the live-settings helpers), historical.py (Kalshi's series categories,
-    for the category/tag filter), reporter.py (Excel output and the run
-    summary), _http.py (a one-line description of an error), scanner.py
-    (finding markets and pairs, and pricing them from the order book),
-    strategy.py (sizing and choosing trades), trader.py (sending orders) and
-    run_lock.py (the one-real-money-run-at-a-time lock). Run as
-    `python3 -m kalshi_betting.main`.
+    for the category/tag filter and each trade's category in the run summary),
+    reporter.py (Excel output and the run summary), _http.py (a one-line
+    description of an error), scanner.py (finding markets and pairs, and
+    pricing them from the order book), strategy.py (sizing and choosing
+    trades), trader.py (sending orders) and run_lock.py (the
+    one-real-money-run-at-a-time lock). Run as `python3 -m kalshi_betting.main`.
 
     To add to held pairs it also reads scanner.get_held_positions,
     resolve_held_ladders and held_pairs (the positions, their ladders and the
@@ -489,7 +490,31 @@ def _dedup_pairs(primary: list, secondary: list) -> list:
     return result
 
 
-def _filter_by_category(pairs: list, settings: LiveSettings, listing_client) -> list:
+def _pair_labels(pair, series_categories: dict) -> tuple[str, str]:
+    """
+    Name the Kalshi category and first tag a pair is filed under.
+
+    A pair is filed by market A's series through historical.series_labels,
+    the rule the backtest dashboard files a trade by. The live category/tag
+    filter keeps a pair by these labels, and the run result records them for
+    the defaults server's run page.
+
+    Args:
+        pair: A CandidatePair; market_a.event_ticker is read.
+        series_categories (dict): Kalshi's /series listing
+            (load_series_categories). A series it lacks is filed under its
+            ticker-prefix label (infer_category) and "General".
+
+    Returns:
+        tuple[str, str]: (category, tag), e.g. ("Sports", "Basketball").
+    """
+    event = pair.market_a.event_ticker
+    # Cross-module: the one filing rule the dashboard and the live filter share
+    return series_labels(event, infer_category(event), series_categories)
+
+
+def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
+                        series_categories: dict | None = None) -> list:
     """
     Keep only the pairs filed under the run's categories and tags.
 
@@ -506,6 +531,8 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client) -> 
         settings (LiveSettings): The run's toggles.
         listing_client: A production KalshiClient, or None to read the cached
             /series listing only (dev: the sandbox key never signs a prod request).
+        series_categories (dict | None): Keyword-only. Kalshi's /series listing
+            when the caller has already read it; None reads it here.
 
     Returns:
         list: The kept pairs, in their original order — the input list itself,
@@ -513,8 +540,10 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client) -> 
     """
     if settings.categories is None and settings.tags is None:
         return pairs
-    # Kalshi's category and tags per series, the map the dashboard files by
-    series_categories = load_series_categories(listing_client)
+    # Kalshi's category and tags per series, the map the dashboard files by,
+    # unless the caller has read it already
+    if series_categories is None:
+        series_categories = load_series_categories(listing_client)
     # The filter in the "Live settings:" line's own words
     wanted = describe_trade_filter(settings)
     if not series_categories:
@@ -532,9 +561,8 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client) -> 
     filed_cats: set = set()
     filed_tags: set = set()
     for pair in pairs:
-        event = pair.market_a.event_ticker
         # Filed exactly as the dashboard files a trade of this event
-        category, tag = series_labels(event, infer_category(event), series_categories)
+        category, tag = _pair_labels(pair, series_categories)
         filed_cats.add(category.casefold())
         filed_tags.add(tag.casefold())
         if ((cats is None or category.casefold() in cats)
@@ -1087,6 +1115,12 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     a pair whose stake (its worth at today's prices plus the fees paid for
     it) already fills its per-trade cap of the portfolio value.
 
+    Handed a report (--result-file), a run that finds candidate pairs reads
+    Kalshi's /series listing once, right after it merges the two finders'
+    pairs, and records each trade's category and tag in the report; with no
+    listing a trade's category is left unknown. Without a report it reads the
+    listing only when a category/tag filter is set.
+
     Args:
         client: KalshiClient for production, from auth.build_client("prod").
         args: Parsed arguments (dry_run, max_horizon_days).
@@ -1105,6 +1139,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     Raises:
         ValueError: When settings is None and a config.py toggle is invalid.
     """
+    # A run started with --result-file (every run the defaults server starts)
+    # records its trades' categories; a scheduled run has no result to fill in
+    records_result = report is not None
     # What the run did, for main.py --result-file; without it nothing reads this one
     report = RunReport(dry_run=args.dry_run, started_at=datetime.now(UTC)) if report is None else report
     # Resolved ONCE, before any request, and handed to every site below that reads a toggle
@@ -1287,8 +1324,14 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
                                               add_on_pairs=add_on_pairs)
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
+    # Kalshi's /series listing, read once for a run that records its trades'
+    # categories, here before pricing so the read never delays an order or the
+    # trade log; None lets the filter read it itself when a filter is set
+    series_categories = (load_series_categories(client)
+                         if records_result and candidate_pairs else None)
     # Category/tag filter, before enrichment so a dropped pair costs no book request
-    candidate_pairs   = _filter_by_category(candidate_pairs, settings, client)
+    candidate_pairs   = _filter_by_category(candidate_pairs, settings, client,
+                                            series_categories=series_categories)
     # Price each pair from its order book, up to what one trade's budget could buy
     candidate_pairs   = enrich_with_orderbook_prices(
         client, candidate_pairs, portfolio_value_cents, settings=settings,
@@ -1356,9 +1399,14 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # mapping, for at most config.V2_MAPPING_CHECK_SERIAL_BUDGET_SECONDS; a
     # disproof stops every pair that starts after it)
     results = execute_trades(client, portfolio, dry_run=args.dry_run)
-    # Each pair's outcome for the run result, before the trade log is written;
+    # Each pair's outcome for the run result, filed under its Kalshi category
+    # and tag when the listing was read (with no listing a category is left
+    # unknown rather than filed as "Other"), before the trade log is written;
     # it never raises, so the trade log and its rescue dump are always reached
-    report.trades = report_trades(results)
+    report.trades = report_trades(
+        results,
+        labels_of=(lambda pair: _pair_labels(pair, series_categories))
+        if series_categories else None)
 
     # Read the cash after trading for the trade log; if that fails, use the cash before
     try:
