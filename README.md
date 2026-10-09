@@ -844,8 +844,8 @@ start the run = python -m kalshi_betting.main --mode prod <all eight toggle flag
                 (its own session, from this checkout; everything it prints → live_runs/<id>/output.log)
 /runs/<id>    = reloads every 2 s while it runs, then the outcome: trades completed, a dry
                 run's would-be trades, no trades to complete, not traded (and why), or an
-                error — with every pair, the warnings, the balances, the portfolio value
-                Kelly sizes on and the end of the log
+                error — with every pair and its Kalshi category, the warnings, the balances,
+                the portfolio value Kelly sizes on and the end of the log
 ```
 
 A button that does not apply is shown disabled, in its place, with the reason

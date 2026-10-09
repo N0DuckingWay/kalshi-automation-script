@@ -38,7 +38,8 @@ Purpose:
         trade with them.
       - /runs/<id> shows one run: while it runs, its progress and the end of
         its output; once it ends, its outcome, read from the result file the
-        run wrote (main.py --result-file) and the exit code.
+        run wrote (main.py --result-file) and the exit code, with each pair
+        and the Kalshi category and tag it is filed under.
       - / lists what the server is for and the newest runs; /saved shows the
         defaults just saved; /checkout answers which checkout this server
         serves and a fingerprint of the code it loaded, as JSON (a second
@@ -1422,7 +1423,9 @@ def _read_result(folder: Path) -> _Result:
                        "a": _leg(trade.get("a")), "b": _leg(trade.get("b")),
                        "cost_with_fees": _finite(trade.get("cost_with_fees")),
                        "profit_if_won": _finite(trade.get("profit_if_won")),
-                       "adds_to_held": _finite(trade.get("adds_to_held"))})
+                       "adds_to_held": _finite(trade.get("adds_to_held")),
+                       "category": _text(trade.get("category")),
+                       "tag": _text(trade.get("tag"))})
     warnings = raw.get("warnings") if isinstance(raw.get("warnings"), list) else []
     dropped = _int(raw.get("warnings_dropped"))
     return _Result("ok", {
@@ -1821,11 +1824,29 @@ def _market_text(leg: dict | None) -> str:
     return " ".join(names) or "—"
 
 
+def _category_text(trade: dict) -> str:
+    """
+    Name the Kalshi category a pair is filed under, as the backtest dashboard's Tag options do.
+
+    Args:
+        trade (dict): One pair of a run result (_read_result).
+
+    Returns:
+        str: "Sports · Basketball"; the category alone when no tag is
+            recorded; "—" when the run recorded no category (a run from before
+            this column, or one that could not read Kalshi's /series listing).
+    """
+    if not trade["category"]:
+        return "—"
+    return f"{trade['category']} · {trade['tag']}" if trade["tag"] else trade["category"]
+
+
 def _trades_html(trades: list[dict]) -> str:
     """
     Show a run's pairs as tables: needs attention, completed, would have traded, not completed.
 
-    A pair's Note is the trader's error, if any, followed by "(adds to N
+    Each pair shows the Kalshi category and tag its market A's series is filed
+    under. A pair's Note is the trader's error, if any, followed by "(adds to N
     held)" for a trade that added to a pair the account already held.
 
     Args:
@@ -1842,7 +1863,7 @@ def _trades_html(trades: list[dict]) -> str:
         grouped.append((label, rows))
     grouped.append(("Not completed", [t for t in trades if id(t) not in placed]))
     parts = []
-    head = ("<tr><th>Status</th><th>Type</th><th>Market A</th><th>Leg A</th>"
+    head = ("<tr><th>Status</th><th>Type</th><th>Category</th><th>Market A</th><th>Leg A</th>"
             "<th>Market B</th><th>Leg B</th><th>Cost incl. fees</th><th>Profit if won</th>"
             "<th>Note</th></tr>")
     for label, rows in grouped:
@@ -1856,9 +1877,10 @@ def _trades_html(trades: list[dict]) -> str:
                 f"(adds to {count_text(t['adds_to_held'])} held)"
                 if (t["adds_to_held"] or 0) > 0 else "",
             ) if part)
-            cells = (t["status"], t["pair_type"] or "—", _market_text(t["a"]),
-                     _leg_text(t["a"]), _market_text(t["b"]), _leg_text(t["b"]),
-                     _money(t["cost_with_fees"]), _money(t["profit_if_won"]), note)
+            cells = (t["status"], t["pair_type"] or "—", _category_text(t),
+                     _market_text(t["a"]), _leg_text(t["a"]), _market_text(t["b"]),
+                     _leg_text(t["b"]), _money(t["cost_with_fees"]),
+                     _money(t["profit_if_won"]), note)
             body.append("<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in cells) + "</tr>")
         parts.append(f"<h2>{html.escape(label)}</h2>\n<table>{head}{''.join(body)}</table>")
     return "\n".join(parts)
