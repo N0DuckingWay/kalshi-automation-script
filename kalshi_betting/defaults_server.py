@@ -9,21 +9,19 @@ Purpose:
     starts from, and starts live trading runs with them. Run by a person,
     deliberately, from a terminal, through the launcher at the checkout's
     root (./start_dashboard.sh [--seed] [--no-browser], which checks that its
-    Python can import the live bot and the live dashboard, then starts the
-    live dashboard and this server in the background, this one with
-    --no-browser when the live dashboard opens the page) or directly:
+    Python can import the live bot and starts the live dashboard too) or directly:
 
         python3 -m kalshi_betting.defaults_server [--seed] [--no-browser]
 
-    On start it opens one page (none with --no-browser): with --seed the
-    confirmation page proposing the seed values; otherwise the backtest
-    dashboard, or its own index when there is no dashboard, the dashboard
-    was built before its Save and Trade buttons, or it cannot be read. When
-    its port is already taken by this checkout's own server, running this
-    checkout's current code, it opens that page from the running server and
-    exits, starting nothing; when the port is held by that server running
-    older code, by another checkout's server, or by anything else, it
-    refuses (exit 2).
+    On start it opens one page: with --seed the confirmation page proposing
+    the seed values; otherwise the backtest dashboard, or its own index when
+    there is no dashboard, the dashboard was built before its Save and Trade
+    buttons, or it cannot be read. When its port is already taken by this
+    checkout's own server, running this checkout's current code, it opens
+    that page from the running server and exits, starting nothing; when the
+    port is held by that server running older code, by another checkout's
+    server, or by anything else, it refuses (exit 2). With --no-browser it
+    opens no page; the launcher passes it when the live dashboard opens one.
 
     Its pages:
       - /confirm, opened with the proposed settings in its address (by the
@@ -392,8 +390,7 @@ _ATTENTION_STATUSES = ("rollback_failed", "manual_review")
 _TRADE_GROUPS = (("Needs attention", _ATTENTION_STATUSES), ("Completed", ("executed",)),
                  ("Would have traded", ("simulated",)))
 
-# A sale (take-profit rule) that needs a person: a pair it left uneven, or one
-# whose outcome could not be known
+# Sale (take-profit) statuses that need a person: a pair left uneven, or an unknown outcome
 _SALE_ATTENTION_STATUSES = ("unbalanced", "manual_review")
 
 # A sale's status in plain words, as the trade log's Status column words it
@@ -623,9 +620,8 @@ class _LastRun:
     Attributes:
         finished (datetime): When it ended, timezone-aware; the newest run decides.
         verdict (str): "clean" (it finished trading with nothing left to
-            check), "attention" (a pair or a sale needs a person) or
-            "unclean" (it ended without a clean result, so orders may have
-            been placed).
+            check), "attention" (a pair or sale needs a person) or "unclean" (it ended
+            without a clean result, so orders may have been placed).
         why (str): How it ended, in words, e.g. "exit 20" or "it wrote no result".
         where (str): Which run, as plain text; a scheduled run, which has no
             page, also names the log its result is in.
@@ -789,18 +785,13 @@ def _kept(name: str, current: LiveSettings | None, source: str) -> object:
     """
     Return the value of a setting a request left out.
 
-    The saved value when defaults are saved and the request is not the seed's
-    own link; otherwise the seed's, so a seed link that leaves the setting out
-    still proposes exactly the seed.
-
     Args:
         name (str): The LiveSettings field's name.
-        current (LiveSettings | None): The live defaults in force, or None
-            when none are saved.
+        current (LiveSettings | None): The live defaults in force, or None if none are saved.
         source (str): The request's source note ("" when it has none).
 
     Returns:
-        object: The saved value of the field, or LIVE_DEFAULTS_SEED's.
+        object: The saved value, or the seed's when none is saved or source is the seed's note.
     """
     if current is not None and source != LIVE_DEFAULTS_SEED_SOURCE:
         return getattr(current, name)
@@ -814,19 +805,14 @@ def _proposal(params: dict[str, list[str]],
 
     tier_floors ("on" / "off"), spread_min, spread_max, k and size_cap (a
     fraction, e.g. 0.2) are required. same_title_size_cap,
-    add_to_held_pairs ("on" / "off"), sell_at ("off" or a share in (0, 1],
-    e.g. 0.85) and sell_min_days ("off" or a whole number of days) are the
-    only fields that fall back to what is saved: one left out keeps the
-    saved value, or the seed's when none is saved (the dashboard's save
-    button leaves out the add-to-held choice, or the sell level and minimum
-    of days, on a page without that view, and the same-title cap when its
-    run recorded none). A link carrying the seed's note that leaves out
-    add_to_held_pairs, sell_at or sell_min_days takes the seed's value, so
-    it still proposes exactly the seed. A minimum of days with no sell
-    level is refused by LiveSettings, and the page shows why. A missing
-    category or tag means any, whatever is saved; a tag needs its
-    category. source is the note the saved file will keep: left out, it is
-    empty; given, it must be one of the two shapes
+    add_to_held_pairs ("on" / "off"), sell_at ("off" or a share in (0, 1])
+    and sell_min_days ("off" or a whole number of days) may be left out:
+    each then keeps the saved value, or the seed's when none is saved or
+    (all but the same-title cap) on a link carrying the seed's note, so such a link still
+    proposes exactly the seed, and the page shows the change against what is
+    saved. A missing category or tag means any, whatever is saved; a tag needs
+    its category. source is the note the saved file will keep: left out, it
+    is empty; given, it must be one of the two shapes
     config.LIVE_DEFAULTS_SOURCE_PATTERN allows, with ASCII digits only, and
     the seed's note (LIVE_DEFAULTS_SEED_SOURCE) may label only the seed
     values themselves.
@@ -843,8 +829,8 @@ def _proposal(params: dict[str, list[str]],
         ValueError: Naming the first rule the request breaks: an unknown,
             repeated, blank or missing field, a value that is not a plain
             number or a printable name, a tier_floors or add_to_held_pairs
-            other than on or off, a sell_at or sell_min_days other than
-            off or a plain number, a tag without a category, a source
+            other than on or off, a sell_at neither off nor a number, a sell_min_days
+            neither off nor one to six digits, a tag without a category, a source
             of another shape, any value LiveSettings refuses, or the seed's
             note on other values.
     """
@@ -875,10 +861,8 @@ def _proposal(params: dict[str, list[str]],
                              f"{value['add_to_held_pairs']!r}")
         add_on = value["add_to_held_pairs"] == "on"
     else:
-        # Left out: the saved value, or the seed's (see _kept)
         add_on = _kept("add_to_held_pairs", current, source)
-    # "off" is never selling, or no minimum of days; a field left out falls
-    # back the same way
+    # "off" means never selling, or no minimum of days
     if "sell_at" in value:
         sell_at = None if value["sell_at"] == "off" else _number(value["sell_at"], "sell_at")
     else:
@@ -928,9 +912,9 @@ def _seed_query() -> str:
     Build the confirmation page's query that proposes LIVE_DEFAULTS_SEED.
 
     Each number is written as its repr (the exact float), adding to held
-    pairs as on or off, the sell level and the minimum of days as off or
-    their value, the source note is LIVE_DEFAULTS_SEED_SOURCE, and a
+    pairs as on or off, the source note is LIVE_DEFAULTS_SEED_SOURCE, and a
     category or tag is added only when the seed sets one (it sets none: any).
+    The sell level and the minimum of days are written as off when unset.
 
     Returns:
         str: The query string, without the "?".
@@ -1470,8 +1454,7 @@ def _sale_leg(value) -> dict | None:
         value: The recorded market.
 
     Returns:
-        dict | None: ticker, side (str | None), held and sold (int | None)
-            and price (float | None); None when the market is not an object.
+        dict | None: ticker, side, held, sold, price (None if unreadable); None if not an object.
     """
     if not isinstance(value, dict):
         return None
@@ -1488,9 +1471,8 @@ def _sale(value) -> dict | None:
         value: The recorded sale.
 
     Returns:
-        dict | None: title, status (an unreadable one reads "unknown"),
-            error, profit and legs (each _sale_leg, the unreadable ones left
-            out); None when the sale is not an object.
+        dict | None: title, status ("unknown" if unreadable), error, profit and
+            legs (the readable ones, each _sale_leg); None if not an object.
     """
     if not isinstance(value, dict):
         return None
@@ -1508,9 +1490,9 @@ def _read_result(folder: Path) -> _Result:
 
     The file must be a JSON object in config.LIVE_RUN_RESULT_FORMAT, with a
     bool dry_run and an int or null exit_code; otherwise it is "unreadable".
-    Every other field is kept only when it has its type (a pair's and a
-    sale's fields too), so a hand-edited or damaged file never breaks a page.
-    A result with no list of sales reads as one with no sales.
+    Every other field is kept only when it has its type (a pair's fields
+    too), so a hand-edited or damaged file never breaks a page.
+    A sale's fields are read the same way; a result with no list of sales has none.
 
     Args:
         folder (Path): The run's folder.
@@ -1763,10 +1745,10 @@ def _folder_last_run(folder: Path, process: subprocess.Popen | None) -> _LastRun
     run still going, one that could not be started, one its argument parser
     refused, and one that stopped before it could send an order
     (_NO_ORDER_EXITS, or an error before its first order). Of the rest, a pair
-    or a sale left for a person, or exit EXIT_TRADES_NEED_ATTENTION, is
-    "attention"; a run with no readable result, stopped by a signal, stopped
-    by an error while or after sending orders, or ended with any other code
-    but a clean one, is "unclean"; a clean exit (_CLEAN_EXITS) is "clean".
+    (or a sale) left for a person, or exit EXIT_TRADES_NEED_ATTENTION, is "attention"; a
+    run with no readable result, stopped by a signal, stopped by an error
+    while or after sending orders, or ended with any other code but a clean
+    one, is "unclean"; a clean exit (_CLEAN_EXITS) is "clean".
 
     Args:
         folder (Path): The run's folder (named like a run's).
@@ -1998,7 +1980,7 @@ def _sold_text(leg: dict) -> str:
         leg (dict): The market (_sale_leg).
 
     Returns:
-        str: The contracts sold and held, the side and the ticker, "?" for any not recorded.
+        str: That text, with "?" for anything not recorded.
     """
     sold = "?" if leg["sold"] is None else str(leg["sold"])
     held = "?" if leg["held"] is None else str(leg["held"])
@@ -2013,8 +1995,7 @@ def _sales_html(sales: list[dict], cash_after: float | None, *, dry_run: bool) -
     Args:
         sales (list[dict]): The run result's sales (_sale).
         cash_after (float | None): The cash after the sales, in dollars, or None.
-        dry_run (bool): Keyword-only. True for a dry run, whose cash after
-            the sales is an estimate (its sales were never sent).
+        dry_run (bool): Keyword-only. A dry run's cash after the sales is an estimate.
 
     Returns:
         str: The table's HTML; "" when there are no sales.
@@ -2108,7 +2089,7 @@ def _outcome(run: _Run, exit_code: int | None, result: _Result, lines: list[str]
     if exit_code in (EXIT_OK, EXIT_TIME_SERIES_SKIPPED):
         note = ("<p>No time-series pair was searched: a held market could not be "
                 "identified.</p>" if exit_code == EXIT_TIME_SERIES_SKIPPED else "")
-        # 7: nothing to trade (a run that sold says so)
+        # 7: nothing to trade
         if not trades:
             sales = record.get("sales", [])
             if any(s["status"] in ("sold", "partly_sold") for s in sales):
@@ -2212,9 +2193,8 @@ def _run_html(run: _Run) -> str:
                      f"{_money(record['balance_after'])}</p>")
     if record.get("portfolio_value_before") is not None:
         # Cash plus open positions, read before trading: what the run sizes on
-        # (worded so it also fits a run that stopped at the minimum); a run
-        # that sold sizes its buys on what the sales left, so for a run with
-        # sales this is the value before them
+        # (worded so it also fits a run that stopped at the minimum)
+        # A run that sold sizes on what its sales left, so this is the value before them
         parts.append(f"<p>Portfolio value {_money(record['portfolio_value_before'])} "
                      f"(cash {_money(record.get('balance_before'))}) — "
                      + ("before the sales" if record.get("sales")

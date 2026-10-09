@@ -64,15 +64,10 @@ Dependencies:
     historical.py imports event_series too, so the backtest's event-title
     lookup budget tells a combo ticker from any other exactly as the
     one-series rule does (DR-51).
-    The sell rule's book arithmetic lives here: bid_ladder reads one side's
-    bids from a book, and walk_bids sells a count down a bid ladder (the
-    backtest's modeled one and live selling's real one alike).
-    trader.sell_positions rounds a NO sale's YES bid down with floor_to_tick
-    and keeps every sale at or above v2_bottom_of_grid_price, a market's
-    lowest level. get_settlements() reads the markets the account held when
-    they paid out, and market_for_labels() finds a market by ticker:
-    seller.plan_sales reads both to value a held market whose partner has
-    paid out, and reads held_pairs(log=False) for the positions it may sell.
+    Live selling's helpers (see CLAUDE.md, live selling): bid_ladder (a held
+    market's real bids) and walk_bids (a sale's walk down them, shared with
+    the backtest), floor_to_tick and v2_bottom_of_grid_price (sale prices),
+    and get_settlements and market_for_labels (paid-out partners).
     Depends on the KalshiClient produced by auth.py.
 
 Notes:
@@ -659,26 +654,18 @@ def ceil_to_tick(price: Decimal, tick: Decimal) -> Decimal:
 
 def floor_to_tick(price: Decimal, tick: Decimal) -> Decimal:
     """
-    Round a price DOWN to the nearest point of a tick grid at or below it.
+    Round a price DOWN to the nearest point of a tick grid (ceil_to_tick's mirror).
 
-    ceil_to_tick's mirror: a bid rounded down never pays more than the price
-    it was computed from. trader._sale_limit sells a held NO with a YES bid
-    rounded down this way, so the NO never sells below its computed price;
-    trader._v2_top_of_grid_price floors a market's top level with it too.
-
-    Remove float noise first: pass a float price through
-    Decimal(str(x)).quantize(_SCANNED_PRICE_QUANTUM), as v2_limit_price does,
-    since Decimal(0.57) is a hair below 0.57 and would floor to 0.56.
+    trader._sale_limit rounds a held NO's YES bid down with it, so the NO never
+    sells below its computed price. Quantize a float price to six decimals
+    first: Decimal(0.57) is a hair below 0.57 and would floor to 0.56.
 
     Args:
-        price (Decimal): Price in dollars to round, at most six decimals
-            (see above). Range: [0, 1].
-        tick (Decimal): Tick size in dollars for the grid to land on. Must be
-            > 0 (tick_size_for_price guarantees this).
+        price (Decimal): Price in dollars, at most six decimals. Range: [0, 1].
+        tick (Decimal): Tick size in dollars. Must be > 0.
 
     Returns:
-        Decimal: The largest grid point <= price. Returns price unchanged
-            when it already sits exactly on the grid.
+        Decimal: The largest grid point <= price (price itself when on the grid).
     """
     return (price / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
 
@@ -687,19 +674,15 @@ def v2_bottom_of_grid_price(market: Any) -> Decimal:
     """
     The lowest tradeable level of one market's own tick grid, in dollars.
 
-    One tick above 0 on the grid of the band holding the smallest price: 0.01
-    on a linear-cent grid, 0.001 on deci-cent, 0.0001 on a centi-cent edge
-    band. v2_limit_price keeps a buy leg at or above it, trader._sale_limit
-    keeps a sale at or above it, and the V2 probe sells a held YES at it.
+    One tick above 0 (0.01 on a linear-cent grid, 0.0001 on a centi-cent edge
+    band). Buy legs and sales are kept at or above it; the V2 probe sells at it.
 
     Args:
-        market (Any): The market whose grid to use. Any object exposing
-            price_level_structure / price_ranges.
+        market (Any): Any object exposing price_level_structure / price_ranges.
 
     Returns:
         Decimal: The lowest valid price level on this market's grid.
     """
-    # The market's own tick at the finest possible price
     return tick_size_for_price(market, float(_V2_MIN_PRICE))
 
 
@@ -2683,10 +2666,8 @@ def _nonnegative_decimal(raw: Any) -> Decimal | None:
     """
     Read one number from a portfolio reply as an exact Decimal, or None when it cannot be used.
 
-    Parsed from its text with Decimal (auth.py's rule for dollar strings), so
-    a dollar string, an integer and a JSON number all read exactly. Refused
-    when absent, a JSON true/false, unreadable (a list or object included),
-    not finite, or negative.
+    Parsed from its text with Decimal, so every number reads exactly. Refused
+    when absent, a JSON true/false, unreadable, not finite, or negative.
 
     Args:
         raw (Any): The field's value as the reply sent it.
@@ -2709,14 +2690,12 @@ def _finite_float(value: Decimal | None) -> float | None:
     """
     Turn a Decimal into a float, or None when there is none or it is too large for a float.
 
-    Decimal("1e400") is finite, float() of it is not, and an infinite cost
-    would make a size or a sale value NaN downstream.
-
     Args:
         value (Decimal | None): A value from _nonnegative_decimal.
 
     Returns:
-        float | None: The value as a float, or None.
+        float | None: The float, or None (an infinite cost would make a size
+            or a sale value NaN downstream).
     """
     if value is None:
         return None
@@ -2727,9 +2706,6 @@ def _finite_float(value: Decimal | None) -> float | None:
 def _held_dollars(raw: Any) -> float | None:
     """
     Read a dollar amount from the positions listing, or None when it cannot be used.
-
-    Refused when absent, a JSON true/false, unreadable, not finite, negative
-    (_nonnegative_decimal), or too large for a float (_finite_float).
 
     Args:
         raw (Any): The field's value as the listing sent it.
@@ -2918,24 +2894,18 @@ class Settlement:
     """
     One market the account held when it paid out, as GET /portfolio/settlements reports it.
 
-    Live selling reads these to value a held market whose partner has paid
-    out: the partner is gone from the positions listing, and its counts, cost
-    and payout are only here.
+    Live selling values a held market's paid-out partner from it.
 
     Attributes:
         ticker (str): The market that paid out.
         event_ticker (str): Its event.
-        result (str): How it settled (market_result): "yes", "no", "scalar"
-            or "void", as Kalshi sends it.
-        yes_count (float): YES contracts the account held when it paid out.
-        no_count (float): NO contracts the account held when it paid out.
-        yes_cost_dollars (float): What the account paid for those YES
-            contracts (their cost basis), fees not included.
+        result (str): market_result as Kalshi sends it: "yes", "no", "scalar" or "void".
+        yes_count (float): YES contracts held when it paid out.
+        no_count (float): NO contracts held when it paid out.
+        yes_cost_dollars (float): The YES contracts' cost basis, fees not included.
         no_cost_dollars (float): The same for the NO contracts.
-        fees_dollars (float): Fees the account paid on this market's trades
-            (fee_cost).
-        revenue_dollars (float): What the market paid the account when it
-            settled: $1 for each winning contract.
+        fees_dollars (float): Fees paid on this market's trades (fee_cost).
+        revenue_dollars (float): What it paid out: $1 per winning contract.
         settled_at (datetime): When it paid out, in UTC.
     """
     ticker: str
@@ -2955,42 +2925,33 @@ def _settlement_amount(record: dict, key: str, legacy_key: str | None, *,
     """
     Read one count or dollar amount of a settlement, preferring the newer field name.
 
-    Most fields have a newer spelling, a fixed-point string (yes_count_fp,
-    yes_total_cost_dollars), and an older integer the pinned SDK documents
-    (yes_count, and yes_total_cost in CENTS). The newer field is used
-    whenever it is present, even if unreadable; the older one only when the
-    newer is absent. Presence decides, never truthiness, so a real 0 counts.
-
-    An older cents field must be a JSON integer. Anything else is refused: it
-    may be a dollar amount under the old name, which read as cents would make
-    a cost 100 times too small and a position look more profitable than it
-    is. Cents become dollars exactly, in Decimal.
+    The newer fixed-point field (yes_count_fp, yes_total_cost_dollars) is used
+    whenever present, even at 0 or unreadable; the older integer (yes_count,
+    or yes_total_cost in CENTS) only when the newer is absent. A cents field must be
+    a JSON integer: a dollar amount read as cents would be 100 times too small.
 
     Args:
         record (dict): One settlement as the reply sent it.
         key (str): The newer field name.
-        legacy_key (str | None): The older field name, or None when there is none.
+        legacy_key (str | None): The older field name, or None.
         legacy_cents (bool): Keyword-only. Whether the older field is in cents.
 
     Returns:
-        float | None: The amount (contracts, or dollars), or None when
-            neither field is present or the one used is not a readable,
-            finite, non-negative number (for cents, a non-negative integer).
+        float | None: Contracts or dollars; None when neither field is present
+            or the one used is not a finite, non-negative number.
     """
     if key in record:
         value = _nonnegative_decimal(record[key])
     elif legacy_key is not None and legacy_key in record:
         raw = record[legacy_key]
         if legacy_cents and (not isinstance(raw, int) or isinstance(raw, bool)):
-            # Not the integer of cents the field holds
             return None
         value = _nonnegative_decimal(raw)
         if value is not None and legacy_cents:
             try:
                 value = value / 100
             except ArithmeticError:
-                # Beyond the decimal context's limits: the record is left
-                # out and counted, never raised
+                # Beyond Decimal's limits: the record is refused, never raised
                 return None
     else:
         return None
@@ -3001,14 +2962,11 @@ def _settled_at(raw: Any) -> datetime | None:
     """
     Read a settlement's settled_time as a UTC datetime, or None when it cannot be read.
 
-    Kalshi sends an ISO 8601 time ending in "Z". A time with no offset (its
-    instant is unknown), or one that cannot be placed in UTC, is refused.
-
     Args:
         raw (Any): The settled_time value as the reply sent it.
 
     Returns:
-        datetime | None: The time in UTC, or None.
+        datetime | None: The time in UTC; None when it has no UTC offset or UTC cannot hold it.
     """
     if not isinstance(raw, str):
         return None
@@ -3021,17 +2979,12 @@ def _settled_at(raw: Any) -> datetime | None:
     try:
         return parsed.astimezone(UTC)
     except (OverflowError, ValueError):
-        # A time near the ends of datetime's range that UTC cannot hold
         return None
 
 
 def _settlement_from_dict(record: Any) -> Settlement | None:
     """
-    Build one Settlement from a reply record, or None when it cannot be read in full.
-
-    Every field must read: a non-empty ticker, event ticker and result, both
-    counts, both costs, the fees and the revenue as finite non-negative
-    numbers (_settlement_amount), and a settled time with a UTC offset.
+    Build one Settlement from a reply record, or None when any field cannot be read.
 
     Args:
         record (Any): One entry of the reply's "settlements" list.
@@ -3070,51 +3023,35 @@ def get_settlements(client: Any, *, unreadable_out: dict | None = None,
     """
     Fetch every market the account held when it paid out (GET /portfolio/settlements).
 
-    Live selling reads it to value a held market whose partner has paid out.
-    Each page is a read-only GET through api_call_with_retry on the SDK's
-    raw-response variant, parsed here (the pinned SDK's Settlement model
-    requires integer fields the reply no longer sends).
-
-    Fails closed: the call returns None when a page cannot be read (a page
-    with no "settlements" key included, since a renamed key would otherwise
-    read as no settlements), when a cursor repeats, or when SCANNER_MAX_PAGES
-    is reached with more to read. A list cut short may be missing a partner,
-    so the caller must then treat every partner as unknown. A null or empty
-    "settlements" list is a page with none.
-
-    A record that cannot be read in full is left out and counted in one
-    WARNING (silent at zero). It may be the very partner a caller wants, so
-    live selling reads the count through unreadable_out and treats any
-    left-out record as a possible partner.
+    Each page is a retried, read-only GET on the SDK's raw-response variant
+    (the pinned SDK's model no longer fits the reply). Fails closed: returns
+    None when a page cannot be read (no "settlements" key included), a cursor
+    repeats, or SCANNER_MAX_PAGES cuts the list short, since a short list may
+    be missing the paid-out partner live selling looks for. A record that
+    cannot be read in full is left out, counted in one WARNING and in
+    unreadable_out: it may be that partner.
 
     Args:
-        client (Any): An authenticated KalshiClient produced by auth.build_client().
-        unreadable_out (dict | None): Keyword-only. When given, its
-            "unreadable" key is set to 0 at the start and, when the call
-            returns a list, to the number of records left out of it.
-        min_ts (int | None): Keyword-only. A Unix time sent as every page's
-            min_ts, so only markets that paid out after it come back; live
-            selling asks for its partner window alone, so an unreadable
-            older record cannot stop a sale. None asks for every settlement.
+        client (Any): An authenticated KalshiClient from auth.build_client().
+        unreadable_out (dict | None): Keyword-only. When given, its "unreadable"
+            key gets the number of records left out (0 until a list is returned).
+        min_ts (int | None): Keyword-only. A Unix time sent on every page, so
+            only markets that paid out after it come back; None asks for all.
 
     Returns:
         list[Settlement] | None: Every readable settlement, in the reply's
-            order; empty when the account has none. None, with a WARNING,
-            when a page could not be read or the list was cut short.
+            order; None (with a WARNING) when the list could not be read whole.
     """
     if unreadable_out is not None:
-        # Set before the walk, so the key is there however the call ends
         unreadable_out["unreadable"] = 0
     settlements: list[Settlement] = []
     unreadable = 0
     cursor: str | None = None
-    # Every cursor already requested, so a keyset that cycles (A, B, A, B, ...)
-    # is caught as well as one that repeats at once
+    # Every cursor requested, so a cycle (A, B, A, B, ...) is caught too
     seen_cursors: set[str] = set()
     pages = 0
     while True:
         kwargs: dict = {"limit": SETTLEMENT_PAGE_SIZE}
-        # Every page asks for the same window
         if min_ts is not None:
             kwargs["min_ts"] = min_ts
         if cursor:
@@ -3132,8 +3069,7 @@ def get_settlements(client: Any, *, unreadable_out: dict | None = None,
         pages += 1
         rows = data.get("settlements") if isinstance(data, dict) else None
         new_cursor = data.get("cursor") if isinstance(data, dict) else None
-        # An empty list may arrive as null; a reply that is not an object,
-        # has no "settlements" key, or holds anything else there cannot be read
+        # A null list is a page with none; any other shape fails closed
         if (not isinstance(data, dict) or "settlements" not in data
                 or not isinstance(rows, (list, type(None)))
                 or not isinstance(new_cursor, (str, type(None)))):
@@ -3159,7 +3095,6 @@ def get_settlements(client: Any, *, unreadable_out: dict | None = None,
                 "may be incomplete, so no settlement is used this run", SCANNER_MAX_PAGES)
             return None
         if not new_cursor:
-            # A null or empty cursor marks the last page
             break
         seen_cursors.add(new_cursor)
         cursor = new_cursor
@@ -3321,8 +3256,7 @@ def _fetch_held_market(client: Any, ticker: str, event_titles: dict, *,
         ticker (str): The held market's ticker.
         event_titles (dict): Event titles already fetched, by event ticker.
         noun (str): Keyword-only. What the failure lines call the market:
-            "held market" for resolve_held_ladders, plain "market" for
-            market_for_labels, which also looks up markets no longer held.
+            "held market", or "market" for one that may no longer be held.
 
     Returns:
         ApiMarket | None: The market, or None if it or its event can't be read.
@@ -3362,23 +3296,18 @@ def _fetch_held_market(client: Any, ticker: str, event_titles: dict, *,
 def market_for_labels(client: Any, ticker: Any, markets_by_ticker: dict,
                       event_titles: dict) -> ApiMarket | None:
     """
-    Find one market whose ladder labels are needed: in this run's market list, else from the exchange.
+    Find a market by ticker: in this run's market list, else from the exchange.
 
-    Live selling needs the ladder labels (market_ladder_keys) of a paid-out
-    market to tell whether it was the partner of one still held. Such a
-    market is usually missing from the run's list of open markets, so it is
-    looked up as resolve_held_ladders looks up a held market
-    (_fetch_held_market, its event's title included), and its labels then
-    match its ladder-mates' in the list.
+    seller.plan_sales gets a paid-out market's ladder labels through it. A
+    market missing from the list is looked up as resolve_held_ladders looks up
+    a held market (event title included), so its labels match its ladder-mates'.
 
     Args:
         client (Any): An authenticated Kalshi client.
         ticker (Any): The market's ticker; anything but a non-empty string
             names no market.
-        markets_by_ticker (dict): This run's markets by ticker, before held
-            ones are removed.
-        event_titles (dict): Event titles already fetched, by event ticker;
-            a lookup adds to it, so one event is asked about once.
+        markets_by_ticker (dict): This run's markets by ticker, before held ones are removed.
+        event_titles (dict): Event titles by event ticker; a lookup adds to it.
 
     Returns:
         ApiMarket | None: The market, or None when the ticker names none or
@@ -3389,7 +3318,6 @@ def market_for_labels(client: Any, ticker: Any, markets_by_ticker: dict,
     market = markets_by_ticker.get(ticker)
     if market is not None:
         return market
-    # Its failure lines say "market": a paid-out partner is no longer held
     return _fetch_held_market(client, ticker, event_titles, noun="market")
 
 
@@ -3513,9 +3441,6 @@ def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict,
     market whose ladder is unknown could sit on the same ladder, and adding
     there would stack a trade beside it (fails closed).
 
-    Live selling (seller.plan_sales) reads the same shapes as the positions
-    it may sell, with log=False, since the lines here name what a run adds to.
-
     Args:
         positions (dict): get_held_positions' result, ticker -> HeldPosition.
         labels_by_ticker (dict): ticker -> ladder labels for every held market
@@ -3523,8 +3448,8 @@ def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict,
         markets_by_ticker (dict): ticker -> market for this run's whole market
             list, read before held markets are dropped from it; supplies
             each held market's ask.
-        log (bool): Keyword-only. Whether to log what was found: one INFO
-            line per pair or lone leg, and the counts (default True).
+        log (bool): Keyword-only. Whether to log what was found (default
+            True); seller.plan_sales, reading the positions it may sell, passes False.
 
     Returns:
         dict: frozenset of the held tickers (two for an exact pair, one for a
@@ -5563,8 +5488,7 @@ def _bids_to_ask_levels(bids_raw: list, ticker: str = "<unknown>") -> list[tuple
 
     Applies to both sides: YES bid at P → NO ask at (1−P);
                            NO bid at P → YES ask at (1−P).
-    The asks are sorted cheapest first, so the order the bids arrive in
-    (ascending on the wire) does not matter.
+    The asks are sorted cheapest first, whatever order the bids arrive in.
 
     Bounded by config.MIN/MAX_ACTIVE_PRICE_DOLLARS (0.0001/0.9999), the extreme
     tradeable levels on Kalshi's FINEST grid — NOT by the 0.01/0.99
@@ -5574,8 +5498,7 @@ def _bids_to_ask_levels(bids_raw: list, ticker: str = "<unknown>") -> list[tuple
     priced under a cent, or over 99c, vanished before pairing (TS-14).
 
     Args:
-        bids_raw (list): [[price_str, qty_str], ...] as parsed from the
-            orderbook payload (ascending by price on the wire).
+        bids_raw (list): [[price_str, qty_str], ...] from the orderbook payload.
         ticker (str): The market the book came from, named in the drop
             WARNING only. Defaults to a placeholder for hand-built input.
 
@@ -5616,31 +5539,22 @@ def _bids_to_ask_levels(bids_raw: list, ticker: str = "<unknown>") -> list[tuple
 
 def bid_ladder(book: dict | None, side: str, *, ticker: str = "<unknown>") -> list[list[float]]:
     """
-    One side's resting bids from an order book, best (highest) first: what selling that side would walk.
+    One side's usable resting bids from an order book, best (highest) first, for walk_bids.
 
-    _fetch_orderbook returns {"yes": [...], "no": [...]}: the YES and the NO
-    bids as [price in dollars, quantity] levels, in ascending price order.
-    This reads one side as floats, best bid first, the order walk_bids
-    reads; seller.plan_sales reads a held market's bids with it.
-
-    A level is kept only when its price is a tradeable level on Kalshi's
-    finest grid (MIN_ACTIVE_PRICE_DOLLARS to MAX_ACTIVE_PRICE_DOLLARS, as in
-    _bids_to_ask_levels) and its quantity is a positive finite number. The
-    rest are counted in one WARNING (silent at zero), so a book thinned by a
-    changed payload does not read as a genuinely thin book.
+    A level ([price in dollars, quantity]) is kept only when its price is within
+    MIN_ACTIVE_PRICE_DOLLARS to MAX_ACTIVE_PRICE_DOLLARS (the extreme levels of
+    Kalshi's finest grid) and its quantity is a positive finite number. The rest
+    are counted in one WARNING, so a book thinned by a changed payload does not
+    pass for a genuinely thin one.
 
     Args:
-        book (dict | None): An order book as _fetch_orderbook returns it;
-            None (the book could not be read) reads as no bids.
-        side (str): "yes" for the YES bids (what selling YES fetches), "no"
-            for the NO bids.
-        ticker (str): Keyword-only. The market the book came from, named in
-            the WARNING only. Defaults to a placeholder for hand-built input.
+        book (dict | None): A book from _fetch_orderbook; None reads as no bids.
+        side (str): "yes" or "no": the bids of the side being sold.
+        ticker (str): Keyword-only. The market, named in the WARNING only.
 
     Returns:
-        list[list[float]]: [[price, quantity], ...] from the highest price
-            down; levels of one price keep their order in the book. Empty
-            when the book or the side holds no usable level.
+        list[list[float]]: [[price, quantity], ...], highest price first
+            (equal prices keep their book order); empty when no level is usable.
 
     Raises:
         ValueError: For a side other than "yes" or "no".
@@ -5676,32 +5590,28 @@ def bid_ladder(book: dict | None, side: str, *, ticker: str = "<unknown>") -> li
             ticker, dropped, len(raw), side.upper(),
             MIN_ACTIVE_PRICE_DOLLARS, MAX_ACTIVE_PRICE_DOLLARS,
         )
-    # sorted() keeps equal prices in their book order
     return sorted(levels, key=lambda level: -level[0])
 
 
 def walk_bids(ladder: Sequence, contracts: float) -> tuple[float, float] | None:
     """
-    Sell `contracts` down a bid ladder, best bid first: their average price and the lowest price reached.
+    Sell `contracts` down a bid ladder, best first: their average price and lowest price reached.
 
     Each level sells what it holds or what is left, whichever is fewer. The
-    backtest walks its modeled ladder with it (backtester._ladder_average);
-    seller.plan_sales walks a held market's real bids (bid_ladder) and keeps
-    both figures (SalePlan.walked); trader._sale_limit prices each sale order
-    from the lowest price reached.
+    one walk for the backtest's modeled ladder (backtester._ladder_average)
+    and live selling's real bids (bid_ladder), whose lowest price reached
+    prices each sale order (trader._sale_limit).
 
     Args:
         ladder (Sequence): [[price, quantity], ...], best (highest) price first.
         contracts (float): How many contracts to sell; above 0.
 
     Returns:
-        tuple[float, float] | None: (average price, lowest price reached).
-            The average is exactly the best bid when the first level holds
-            them all. The lowest price is that of the last level that sold
-            part of them; a further level that takes only float noise (under
-            half a millionth of a contract) does not count. None when the
-            ladder is empty or short by more than that noise, or when
-            `contracts` is not above 0 (NaN included).
+        tuple[float, float] | None: (average price, lowest price reached); the
+            average is exactly the best bid when the first level holds them
+            all. A later level taking only float noise (under half a millionth
+            of a contract) is not reached. None when the ladder is empty or
+            short by more than that noise, or `contracts` is not above 0.
     """
     # `not ... > 0` is also true for NaN
     if len(ladder) == 0 or not contracts > 0:
@@ -5715,13 +5625,11 @@ def walk_bids(ladder: Sequence, contracts: float) -> tuple[float, float] | None:
         proceeds += take * price
         left -= take
         used += 1
-        # Ladder sizes carry six decimals, so a take that rounds to zero there
-        # is float noise from the levels above: the sale does not reach this price
+        # A take that rounds to 0 at six decimals is float noise: not a level reached
         if lowest is None or round(take, 6) > 0:
             lowest = price
         if left <= 0:
             break
-    # The same six-decimal rule: anything finer left unsold is float noise
     if round(left, 6) > 0:
         return None
     return (ladder[0][0] if used == 1 else proceeds / contracts), lowest

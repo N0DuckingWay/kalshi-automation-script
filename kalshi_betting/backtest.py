@@ -187,9 +187,9 @@ Notes:
     maturity of config.TAKE_PROFIT_MIN_DAYS (the dashboard's Sell and Min.
     days to maturity selects). It simulates nothing during the run;
     --no-sell-sweep skips it, leaving both selects disabled. Nothing here
-    reaches live trading by itself: a live run sells only at its saved
-    sell_at level (seller.plan_sales), which the dashboard's Save as live
-    defaults… can set to a level shown there.
+    reaches live trading by itself: a live run sells at its saved sell_at
+    level (main.py --sell-at overrides it for one run), which the dashboard's
+    Save as live defaults… can set.
 
     The pre-fetch echo's "live rule=" clause names the saved live defaults'
     time-series rule and, when one is set, their category/tag filter (never
