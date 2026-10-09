@@ -5,106 +5,48 @@ Last edited by: Zachary Hoffman
 
 Purpose:
     Decides which held positions the take-profit rule sells this run, and
-    plans each sale. It decides and plans only: it sends no order.
+    plans each sale. It sends no order: main.py hands the plans to
+    trader.sell_positions.
 
-    The rule is the backtest's (backtester's sell_at). A position is sold once
-    the profit selling it would realize has stayed at or above a set share of
-    its potential profit (LiveSettings.sell_at) at every one of
+    A position is either an exact held pair (scanner.held_pairs: two held
+    markets alone on one ladder, one YES and one NO, of equal count, with
+    readable costs) or a lone held market (alone on its ladder) with exactly
+    one paid-out partner: a settled market the account no longer holds, that
+    it held on the other side with the same count, asking the same question,
+    and that paid out (settled yes or no) at most
+    config.SALE_PARTNER_MAX_AGE_DAYS ago. Anything else is never sold, and a
+    log line says why. (A ladder is one question asked at several deadlines:
+    two markets are on one ladder when they share an event or ask the same
+    question, scanner.ladder_keys.)
+
+    The rule is the backtest's. Potential profit is what the position pays if
+    it wins (its contract pairs at CONTRACT_PAYOUT_DOLLARS) less what it cost;
+    realized profit is what selling its markets would return after the sale's
+    fees (a partner that has paid out counts at its payout), less that cost.
+    A position is sold when its realized profit reaches the share of its
+    potential profit set by LiveSettings.sell_at at every one of
     config.TAKE_PROFIT_HOLD_DAYS daily checks, 24 hours apart, the last one
-    now. Realized profit is what selling the held markets would return after
-    the sale's fees (plus what a paid-out partner returned), less what the
-    whole position cost; potential profit is what it pays if it wins (its
-    contract pairs at CONTRACT_PAYOUT_DOLLARS) less that cost. With
+    now. The check now walks each held market's real order book (sells the
+    count down its bids, best first); an earlier check reads each market's
+    last candle bid in the 24 hours before it, in any size. The tests are config.take_profit_reached and
+    config.reached_every_check, the ones the backtest decides with. With
     LiveSettings.sell_min_days, a position with fewer days left before its
-    last held market stops trading is not sold, and is not valued at all.
-
-    A position is one of two shapes. Anything else is never sold, and a log
-    line says why:
-      * an exact held pair (scanner.held_pairs): two held markets alone on
-        one ladder, one YES and one NO, of equal count, with readable costs;
-      * a lone held market (held_pairs' lone legs) with exactly one paid-out
-        partner among the account's settlements (scanner.get_settlements): a
-        settled market the account no longer holds, held on the other side,
-        with the same count, asking the same question, that paid out at most
-        config.SALE_PARTNER_MAX_AGE_DAYS ago and settled yes or no. The
-        partner counts at what it paid out once it had paid out by a check,
-        and its cost is its settlement cost basis on the side held plus its
-        fees.
-    Every held market of a position must be in this run's market list, since
-    the days rule reads its close time and the plan its title.
-
-    What each market is worth at each check, the way a backtest sale with no
-    depth model values it (backtester._position_sale_value):
-      * now: the market's real order book (scanner._fetch_orderbook), its
-        bids for the side held walked for the position's count
-        (scanner.bid_ladder, scanner.walk_bids); bids that hold fewer
-        contracts mean no sale;
-      * each earlier day: the bid on the market's last candle in the 24 hours
-        before that check (historical.bid_before on
-        historical.recent_candles), in any size; no such candle means no
-        sale;
-      * a market sold at a price is worth count x price less the taker fee on
-        that sale (config.fee_leg_exact); a paid-out partner is worth its
-        revenue, with no fee.
-    The decision is config.take_profit_reached at each check and
-    config.reached_every_check over all of them, the tests the backtest
-    decides with too. Checks are read newest first and the first one below
-    the level ends the position's turn, so earlier days' candles are read
-    only for positions still in line to sell.
+    last held market stops trading is neither valued nor sold.
 
 Dependencies:
-    Imports the standard library, config (LiveSettings, the sell rule's
-    tests, fee_leg_exact and constants), scanner (held_pairs, the order book
-    and its walk, settlements and partner lookups) and historical
-    (bid_before, recent_candles) only. It never imports the backtester, the
-    backtest, the dashboard, the depth model, trader, strategy or main
-    (pinned by tests/test_seller.py). main.py alone imports it: a
-    production run calls plan_sales before it buys anything.
+    Imports the standard library, config, scanner and historical only, never
+    the backtester, backtest, dashboard, depth model, trader, strategy or
+    main (pinned by tests/test_seller.py). main.py alone imports it, and
+    calls plan_sales before it buys anything.
 
 Notes:
-    Every request it makes is a read-only GET, each at most once per run:
-    a held market's order book, a market's recent candles, the account's
-    settlements over the last config.SALE_PARTNER_MAX_AGE_DAYS (only when a
-    lone held market is judged), and a settled
-    market's ladder labels (at most config.SALE_PARTNER_MAX_LOOKUPS lookups
-    per run). It fails closed throughout: an unknown ladder, a missing book
-    or candle, settlements that cannot all be read, or a partner that cannot
-    be shown to be the only one each mean no sale, with a log line.
-
-    A position refused before it is valued reads nothing more: one refused
-    by the days rule reads no book, and one whose book is too thin reads no
-    settlement or candle. A position below the level at the check now reads
-    no candle. For a lone held market the check now needs its partner's cost
-    and payout, so the settlements (and its candidates' questions) are read
-    before that check, even when the check then fails.
-
-    How a lone held market's partner is matched, and what that leaves open:
-    the settlements say nothing about which markets were bought together,
-    so the partner is the one settled market that fits (the other side, the
-    same count, the same question, paid out recently). A held market that
-    was never one market of a pair (one left open by an unwind that failed,
-    or one bought by hand) is judged with such a market as if it were its
-    partner, when one fits. When the account bought the same question at
-    the same count twice within SALE_PARTNER_MAX_AGE_DAYS, both settlements
-    fit and the held market is not sold.
-
-    Where it differs from the backtest:
-      * the earlier checks read one candle bid in any size (the backtest
-        walks a modeled ladder when it has depth data);
-      * the days rule reads each held market's scheduled close_time (the
-        backtest its realized close), and only the held markets' (the
-        backtest reads both markets of each trade, a paid-out one's too);
-      * the sale's fee is charged once per market (the backtest charges it
-        per trade);
-      * a paid-out partner counts at the revenue its settlement reports (the
-        backtest at $1 or $0 a contract by its result); one that settled
-        other than yes or no is never used, as the backtest never trades
-        such a pair;
-      * a partner whose settlement is recorded after this run's moment (the
-        exchange's clock ahead of this machine's) is not used, where the
-        backtest would value it at its bid then;
-      * a ladder with three or more held markets, or two of unequal count,
-        is never sold.
+    Every request is a read-only GET, each made at most once per run. A
+    position's steps run in order and stop at the first that fails, so a
+    refused position reads nothing past that point. It fails closed: an
+    unknown ladder, a missing book or candle, settlements that cannot all be
+    read, or a partner that cannot be shown to be the only one each mean no
+    sale, with a log line. Where live selling differs from the backtest is
+    recorded in CLAUDE.md (live selling).
 """
 import logging
 import math
@@ -144,14 +86,13 @@ from .scanner import (
     walk_bids,
 )
 
-# One day in seconds. The daily checks are this far apart, and each earlier
-# day's check reads a candle that ended less than this long before it, as the
-# backtest's daily checks do.
+# One day in seconds: the gap between daily checks, and how far back an
+# earlier check looks for a candle
 _DAY_SECONDS = 86_400
 
-# One candle period in seconds: the candles read for the earlier checks start
-# this much before the oldest check's 24 hours, so no candle a check could
-# read is left out at the window's edge.
+# One candle period in seconds: the candles fetched for the earlier checks
+# start this much before the oldest check's 24 hours, so none a check could
+# read is cut off
 _CANDLE_PERIOD_SECONDS = CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60
 
 # The side a lone held market's partner was held on: the other one
@@ -169,17 +110,14 @@ class SaleLeg:
         side (str): The side the account holds there (or held, for a paid-out
             partner), "yes" or "no".
         count (int): Contracts held on it: the position's contract pairs.
-        cost_dollars (float): What the account paid for them, fees included.
-            For a held market its listing exposure plus the fees paid
-            (HeldPosition.exposure_dollars + fees_dollars); for a paid-out
-            partner its settlement cost basis on the side held plus its fees
-            (Settlement.yes_cost_dollars or no_cost_dollars, + fees_dollars).
-        market (Any): The market from this run's market list while it is
-            held (an ApiMarket: the days rule reads its close time, and the
-            plan its title); None for a paid-out partner.
-        payout_dollars (float | None): What a paid-out partner paid the
-            account when it settled (Settlement.revenue_dollars); None while
-            held.
+        cost_dollars (float): What the account paid for them, fees included:
+            a held market's exposure plus fees paid (HeldPosition), a
+            paid-out partner's cost basis on the side held plus its fees
+            (Settlement).
+        market (Any): The ApiMarket from this run's market list while held;
+            None for a paid-out partner.
+        payout_dollars (float | None): What a paid-out partner paid when it
+            settled (Settlement.revenue_dollars); None while held.
         paid_at (datetime | None): When a paid-out partner settled, in UTC;
             None while held.
     """
@@ -206,13 +144,12 @@ class SalePlan:
         count (int): Its contract pairs: the contracts held on each market.
         cost_dollars (float): What the whole position cost, fees included
             (the sum of its legs' costs).
-        ladders (dict): Held ticker -> that market's bids for the side held
-            now, best first ([[price, quantity], ...], scanner.bid_ladder).
+        ladders (dict): Held ticker -> its bids for the side held now, best
+            first ([[price, quantity], ...], scanner.bid_ladder).
         walked (dict): Held ticker -> (average price, lowest price reached)
-            selling the position's count down those bids (scanner.walk_bids).
-        proceeds_dollars (float): What selling the held markets now returns,
-            after the sale's fees: each held market's count x its average
-            price, less config.fee_leg_exact on that sale.
+            selling the count down those bids (scanner.walk_bids).
+        proceeds_dollars (float): What selling the held markets now returns
+            after the sale's fees (config.fee_leg_exact).
         profits (tuple): (realized profit, potential profit) at each check,
             now first, then 1, 2, ... days before.
         days_left (int | None): Days from today (UTC) to the date its last
@@ -237,10 +174,9 @@ def _hold_days() -> int:
     """
     Check how many daily checks a position must pass before it is sold.
 
-    Reads this module's TAKE_PROFIT_HOLD_DAYS when called (a test patches
-    seller's binding), and checks it as the backtest checks its own
-    (backtester._resolve_hold_days), so a change to what one accepts must be
-    made in the other too.
+    Reads this module's TAKE_PROFIT_HOLD_DAYS when called, so a test patches
+    seller.TAKE_PROFIT_HOLD_DAYS, never config's. It checks the value as
+    backtester._resolve_hold_days does: change the two together.
 
     Returns:
         int: A whole number from 1 to TAKE_PROFIT_HOLD_DAYS_MAX.
@@ -326,9 +262,7 @@ def _shape_reason(position: HeldPosition) -> tuple[str, str]:
 
     held_pairs leaves a held market out when its count or cost cannot be
     read, its cost is below the finest price times its count, or other held
-    markets share its ladder but do not form one exact pair with it (three or
-    more on one ladder, unequal counts, one side twice, or a partner whose
-    count or cost cannot be read).
+    markets share its ladder without forming one exact pair with it.
 
     Args:
         position (HeldPosition): The held market's listing row.
@@ -364,10 +298,9 @@ class _Reads:
     """
     This run's reads for selling beyond the positions listing, each made at most once.
 
-    Candles are read per market when a check first needs them; the account's
-    settlements when a lone held market first needs its partner; and a
-    settled market's ladder labels when a partner candidate first needs them,
-    at most SALE_PARTNER_MAX_LOOKUPS from the exchange per run.
+    Each is made only when first needed: a market's candles, the account's
+    settlements, and a settled market's ladder labels (at most
+    SALE_PARTNER_MAX_LOOKUPS exchange lookups per run).
 
     Attributes:
         client (Any): The authenticated Kalshi client.
@@ -418,22 +351,19 @@ class _Reads:
         if ticker not in self._candles:
             end = math.floor(self.now_ts)
             start = end - self.hold_days * _DAY_SECONDS - _CANDLE_PERIOD_SECONDS
-            # Cross-module: the market's hourly candles, read fresh from the
-            # exchange and never from or into the backtest's candle cache
+            # Cross-module: hourly candles read fresh, never through the
+            # backtest's candle cache
             self._candles[ticker] = recent_candles(self.client, ticker, event_ticker,
                                                    start, end)
         return self._candles[ticker]
 
     def settlements(self) -> tuple[list | None, str]:
         """
-        The account's settlements, read once, when every record could be read.
+        The account's recent settlements, read once, when every record could be read.
 
-        Only the markets that paid out in the last SALE_PARTNER_MAX_AGE_DAYS
-        are asked for (scanner.get_settlements' min_ts), the only ones a
-        partner can be. A record left out because it could not be read may be the very
-        partner a lone held market needs, so then no settlement is used: no
-        lone held market is sold this run (fails closed). One WARNING says
-        so, once.
+        A record that could not be read may be the partner a lone held market
+        needs, so then none is used and no lone held market is sold this run
+        (fails closed); one WARNING says so.
 
         Returns:
             tuple[list | None, str]: (the settlements, "") or (None, why they
@@ -442,13 +372,12 @@ class _Reads:
         if not self._settlements_read:
             self._settlements_read = True
             unreadable: dict = {}
-            # Only the window a partner may come from is asked for, so an
-            # unreadable record older than that cannot stop a sale; a second
-            # earlier, so the exchange's window is never narrower than
-            # _find_partner's age check, which still applies
+            # Ask only for the window a partner may come from, so an older
+            # unreadable record cannot stop a sale; one second wider, so it is
+            # never narrower than _find_partner's own age check
             oldest = math.floor(self.now_ts - SALE_PARTNER_MAX_AGE_DAYS * _DAY_SECONDS) - 1
-            # Cross-module: every market the account held when it paid out in
-            # that window, with the count of records that could not be read
+            # Cross-module: the settlements in that window, counting the
+            # records that could not be read
             found = get_settlements(self.client, unreadable_out=unreadable, min_ts=oldest)
             if found is None:
                 self._settlements_problem = "the account's settlements could not be read"
@@ -485,9 +414,8 @@ class _Reads:
                 return None, (f"the limit of {SALE_PARTNER_MAX_LOOKUPS} partner lookups "
                               "this run was reached")
             self.lookups += 1
-        # Cross-module: the market from the run's list, else from the exchange
-        # exactly as a held market the list lacks is looked up, so its labels
-        # match its ladder-mates'
+        # Cross-module: from the run's list, else looked up the way a held
+        # market the list lacks is, so its labels match its ladder-mates'
         market = market_for_labels(self.client, ticker, self.markets_by_ticker,
                                    self._event_titles)
         if market is None:
@@ -505,30 +433,20 @@ def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
     """
     Find a lone held market's one paid-out partner among the account's settlements.
 
-    The partner is the other market of the pair the account bought with the
-    held market, and every pair the bot buys asks one question: the
-    time-series finder pairs one question at two deadlines, and the
-    same-title finder one question listed twice (both group on
-    scanner.time_series_group_key's question, which the question label is
-    read from). So a partner must carry the held market's question label. A
-    candidate is a settled market the account does not hold now, held on the
-    other side with the same count (and none on the held side), that paid
-    out at most SALE_PARTNER_MAX_AGE_DAYS before now (or is recorded as
-    paying out later, which _plan_one refuses). Each candidate's labels are
-    found in the run's market list or looked up (_Reads.labels), and it is
-    the partner when they include the held market's question.
+    The settlements do not say which markets were bought together, so the
+    partner is the one settled market that fits. Both markets of every pair
+    the bot buys ask one question (scanner.time_series_group_key), so the
+    partner must carry the held market's question label; another option of
+    the same multi-choice event does not. A candidate is a settled market the
+    account no longer holds, held on the other side with the same count (and
+    none on the held side), that paid out at most SALE_PARTNER_MAX_AGE_DAYS
+    ago (one recorded as paying out after now passes here; _plan_one
+    refuses it). As the held market is alone on its ladder, no other held
+    market can claim the same partner.
 
-    Exactly one partner is needed. None, two or more, a candidate whose
-    labels cannot be read, or a held market with no question label each mean
-    the held market is not sold; so does a partner that settled other than
-    yes or no, since the backtest never trades such a pair.
-
-    This is narrower than a ladder (scanner.ladder_keys, which a shared
-    event also joins). A settled market on the held market's event that asks
-    another question, such as another option of a multi-choice event, was
-    never its pair-mate, so it is no candidate. And as the held market is
-    alone on its ladder, no other held market asks its question, so a
-    partner found this way is no other held market's partner.
+    Fails closed: no partner, two or more, a candidate whose labels cannot be
+    read, a held market with no question label, or a partner that settled
+    other than yes or no each mean the held market is not sold.
 
     Args:
         reads (_Reads): This run's reads.
@@ -603,14 +521,13 @@ def _plan_one(pair: HeldPair, reads: _Reads, held_labels: dict, *, sell_at: floa
     """
     Judge one position by the take-profit rule, logging its verdict, and plan its sale.
 
-    In order, stopping at the first that fails (each failure is one "Not
-    selling" line, and a check below the level, or no potential profit, one
-    "-> keep" line): a whole count; every held market in the run's market
-    list; the days rule (no request); each held market's book now, walked
-    for the count; for a lone held market, its one paid-out partner (the
-    settlements are read here, once per run), which must not be recorded as
-    paying out after now; a potential profit above 0; the check now; then
-    each earlier day's check, reading candles only for the markets it needs.
+    Steps run in order and stop at the first that fails, logging one "Not
+    selling" line (or "-> keep" for no potential profit or a check below the
+    level): a whole count; every held market in the run's market list (for
+    its close time and title); the days rule; each held market's book now,
+    walked for the count; a lone held market's one paid-out partner, not
+    recorded as paying out after now; a potential profit above 0; the check
+    now; then each earlier check.
 
     Args:
         pair (HeldPair): An exact held pair or a lone held market (held_pairs).
@@ -688,7 +605,8 @@ def _plan_one(pair: HeldPair, reads: _Reads, held_labels: dict, *, sell_at: floa
             return None
         if partner.settled_at.timestamp() > reads.now_ts:
             # A payout recorded after now (the exchange's clock ahead of this
-            # machine's) has no book or candle rule to value it by
+            # machine's) has no book or candle rule to value it by (the
+            # backtest would value that leg at its bid then)
             not_selling(f"its partner {partner.ticker} is recorded as settling after now")
             return None
         other = _OTHER_SIDE[side]
@@ -711,9 +629,8 @@ def _plan_one(pair: HeldPair, reads: _Reads, held_labels: dict, *, sell_at: floa
         logging.info("%s -> keep (no potential profit)", head)
         return None
 
-    # Check now: what selling the held markets returns after the sale's fees,
-    # plus what a partner that has paid out by now returned. Cross-module:
-    # config.fee_leg_exact is the taker fee on selling `count` at a price
+    # The check now: each held market sold at its walk's average price, less
+    # the taker fee on that sale (config.fee_leg_exact)
     proceeds = sum(count * walked[leg.ticker][0] - fee_leg_exact(count, walked[leg.ticker][0])
                    for leg in legs if leg.market is not None)
     # A partner paid out by now (one recorded later was refused above)
@@ -772,14 +689,10 @@ def plan_sales(client: Any, held_positions: dict, held_labels: dict, markets_by_
     """
     Find the held positions the take-profit rule sells this run, and plan each sale.
 
-    Every held market is accounted for in the log: one line per position
-    (an exact held pair, or a lone held market with its paid-out partner)
-    giving its verdict, one line per held market in no such position saying
-    why it is never sold, and a summary line. When any held market's ladder
-    is unknown, no position is judged: one line names those markets, and
-    the summary counts them as "ladder unknown" and every other held market
-    as "not judged". Nothing is sent: the plans carry what the sale orders
-    need (the walked prices and the counts).
+    Logs a verdict line per position, a "Not selling" line per held market in
+    no position, and a summary. When any held market's ladder is unknown, no
+    position is judged (fails closed): one line names those markets, and the
+    summary counts the other held markets as "not judged".
 
     Args:
         client (Any): The authenticated Kalshi client (production): its

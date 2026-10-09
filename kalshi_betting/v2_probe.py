@@ -108,13 +108,11 @@ Notes:
     reads fill_count/remaining_count itself via trader._parse_fixed_point,
     keeping the same Decimal comparison and the same "unparseable means
     ambiguous, never a non-fill" semantics. No order step collapses a
-    non-conforming response into a clean kill, and all three apply the SAME
-    test for what a true kill is (nothing filled, the full count still
-    remaining): _step_no_mapping, and _step_yes_close for its YES buy,
-    classify the counts into THREE outcomes rather than two — a complete
-    fill, a true kill, and a fill-or-kill invariant violation (partial,
-    over-fill, stale remainder) — where _step_no_mapping used to call a
-    partial fill a kill and report the account as "still flat" (DR-20);
+    non-conforming response into a clean kill, and all three use the SAME
+    kill test (nothing filled, the full count still remaining).
+    _step_no_mapping, and _step_yes_close for its YES buy, sort the counts
+    into THREE outcomes: a complete fill, a true kill, and a fill-or-kill
+    invariant violation (partial, over-fill, stale remainder) (DR-20);
     _step_unfillable_ask tests for the same true kill and FAILs anything else,
     naming the counts, as it always has. Their REMEDIES still differ, and only
     the kill test is shared: that step's ask is meant to be unfillable, so it
@@ -139,13 +137,13 @@ Notes:
     every branch in this state: _step_unfillable_ask's own
     unreadable-fill-counts branch returns FAIL above its only post-submission
     position read, its `not killed` branch names the counts but reports the
-    account from one un-refreshed read and never says FLATTEN, and the two
-    mapping steps' submission-EXCEPTION handlers (no-mapping and
-    unfillable-ask) decide from one un-refreshed read too, for any error
-    other than the kill response below. Those four are recorded residuals —
-    see CLAUDE.md's DR-60 bullet — so nothing here should be read as a
-    module-wide guarantee. _step_yes_close's own exception handlers do re-read,
-    through _recheck_and_report_position, after the except clause has ended.
+    account from one un-refreshed read and never says FLATTEN, and the
+    submission-EXCEPTION handlers of no-mapping and unfillable-ask decide from
+    one un-refreshed read too, for any error other than the kill response
+    below. Those four are recorded residuals — see CLAUDE.md's DR-60 bullet —
+    so nothing here should be read as a module-wide guarantee.
+    _step_yes_close's handlers for those errors do re-read, through
+    _recheck_and_report_position.
 
     THE KILL RESPONSE. The exchange answers a fill-or-kill that cannot fill in
     full with an HTTP 409 error whose body carries the code
@@ -173,27 +171,12 @@ Notes:
     ledger can lag is not known, so one re-read can still FAIL a close that
     worked.
 
-    THE YES-CLOSE STEP. _step_yes_close buys 0.01 YES with a fill-or-kill
-    bid built by trader._build_yes_order_v2 (count and price overridden: the
-    bid is placed at the top of the market's grid, so it crosses whatever YES
-    ask is resting), and judges that buy the way _step_no_mapping judges its
-    NO buy: a complete fill, a true kill (NEUTRAL on a flat account), or
-    anything else (FAIL naming the counts); a 2xx body it cannot read is a
-    FAIL that checks the account. It then sells the YES back with the body
-    trader._build_sale_order_v2 builds for a live sale — a reduce-only,
-    immediate-or-cancel ask — with the count set to 0.01 and the limit set to
-    the lowest level of the market's grid, so the ask crosses whatever YES
-    bid is resting; reduce_only keeps it from selling more than the 0.01
-    held. The step PASSes only when the account reads exactly flat after the
-    sale, read once more after trader._V2_MAPPING_RECHECK_DELAY_SECONDS when
-    the first read is not 0, AND the sale's reply reports the 0.01 sold
-    (fill_count 0.01, remaining_count 0): live selling takes the number a
-    sale sold from that reply's fill_count when it can read one, without
-    reading the account (trader._sale_fill_count). A position reading that is
-    not a finite number counts as a failed lookup (_position_unknown). It
-    refuses to run (NEUTRAL) unless the book shows both a YES ask to buy from
-    and a YES bid to sell back into, and its submission errors are judged on
-    position reads made after the error has been handled.
+    THE YES-CLOSE STEP. _step_yes_close buys 0.01 YES, then sells it with the
+    reduce-only, immediate-or-cancel ask trader._build_sale_order_v2 builds
+    for a live sale. It PASSes only when the account then reads exactly flat
+    AND the sale's reply reports fill_count 0.01 and remaining_count 0, since
+    live selling takes a sale's count from that reply when it can read one
+    (trader._sale_fill_count). Its docstring gives the full sequence.
 
     CONFIRMATION. Nothing is submitted until the request body has been printed
     and the operator has typed "yes" — unless --yes was passed, which is for a
@@ -284,8 +267,8 @@ _FLATTEN = (
 # flat.
 _REMEDY = f"{_STOP_TRADING} {_FLATTEN}"
 
-# Sentences main() ends every closing line with: which steps have to PASS,
-# and for what.
+# Sentences that end main()'s closing lines (all but the transfer FAIL's):
+# which steps have to PASS, and for what.
 _BOTH_STEPS_MUST_PASS = (
     "Both --step no-mapping and --step unfillable-ask have to PASS before the V2 order "
     "path should be trusted to run unsupervised."
@@ -509,25 +492,21 @@ def _yes_buy_body(market: Any, yes_price: float) -> dict:
     Build the YES-buy request body for --step yes-close: the real YES-leg
     builder, with a 0.01 count, bidding the top of the market's grid.
 
-    Built through trader._build_yes_order_v2 on a real trader._Leg (side
-    "yes", count 1, `yes_price` as its scanned price), so the side ("bid"),
-    time_in_force ("fill_or_kill"), self_trade_prevention_type, ticker, shard,
-    reduce_only and post_only are what a live YES leg sends. Two fields are
-    then overridden: the count (the V2 minimum of 0.01 contracts, as in
-    _no_buy_body) and the price. The price is the highest level of the
-    market's grid (trader._v2_top_of_grid_price), so the bid crosses whatever
-    YES ask is resting: this step checks how a held YES is sold, not what
-    a YES costs, and 0.01 contracts at the top of the grid is still about one
-    cent.
+    Built through trader._build_yes_order_v2 on a real trader._Leg, so every
+    other field (side "bid", fill_or_kill, self_trade_prevention_type, ticker,
+    shard, reduce_only, post_only) is what a live YES leg sends. The price is
+    trader._v2_top_of_grid_price, so the bid crosses any resting YES ask: the
+    step tests how a held YES is sold, not what it costs, and 0.01 contracts
+    still risk only about one cent.
 
     Args:
         market (Any): The scanner.ApiMarket to trade.
-        yes_price (float): The best YES ask in dollars, from the order book;
-            the builder reads it, and its price is then overridden.
+        yes_price (float): The best YES ask in dollars; the builder reads it,
+            then the price is overridden.
 
     Returns:
-        dict: The request body — trader._build_yes_order_v2's output with the
-            count and the price overridden.
+        dict: trader._build_yes_order_v2's body with the count and the price
+            overridden.
     """
     # Cross-module: the same leg type the live path builds in _ordered_legs,
     # here for a YES leg
@@ -547,22 +526,18 @@ def _yes_close_body(market: Any) -> dict:
     Build the sale order that closes the probe's 0.01 YES: the body
     trader._build_sale_order_v2 builds for a live sale, with a 0.01 count.
 
-    Everything that makes it a sale comes from the builder — side "ask"
-    (trader._V2_LEG_SIDE's "close_yes"), reduce_only=True, time_in_force
-    "immediate_or_cancel", self_trade_prevention_type, the ticker and the
-    market's own shard. The limit handed to the builder is the lowest level of
-    the market's grid (scanner.v2_bottom_of_grid_price, the bottom a live
-    sale's price is kept at or above), so the ask crosses whatever YES bid is
-    resting; reduce_only keeps it from selling more than the account
-    holds. The builder takes a whole-contract count, so the body's count is
-    then set to the V2 minimum of 0.01 contracts, as in _no_buy_body.
+    The builder sets everything that makes it a sale (side "ask" from
+    trader._V2_LEG_SIDE's "close_yes", reduce_only=True, immediate_or_cancel,
+    self_trade_prevention_type, ticker, shard). Its limit is the lowest level
+    of the market's grid, so the ask crosses any resting YES bid; reduce_only
+    keeps it from selling more than the account holds. The builder takes whole
+    contracts, so the count is then set to 0.01.
 
     Args:
         market (Any): The scanner.ApiMarket whose YES position is being sold.
 
     Returns:
-        dict: The request body — trader._build_sale_order_v2's output with the
-            count overridden.
+        dict: trader._build_sale_order_v2's body with the count overridden.
     """
     # Cross-module: the lowest level of the market's grid, the one definition
     # trader._sale_limit clamps a live sale's price to
@@ -760,11 +735,10 @@ def _position_unknown(position: Any) -> bool:
     """
     Say whether a position reading tells nothing about the account.
 
-    trader._position_count returns None when the lookup failed, and a float
-    parsed from the positions listing otherwise; a listing that sends
-    something like "NaN" parses to a number that is not finite. Neither says
-    how many contracts are held, so both count as unknown, as the live sale
-    path counts them (trader._holding_problem, trader._contracts_sold).
+    trader._position_count returns None when the lookup failed, and otherwise
+    a float, which is not finite when the listing sends something like "NaN".
+    Both count as unknown, as in the live sale path
+    (trader._holding_problem, trader._contracts_sold).
 
     Args:
         position (Any): A reading from trader._position_count.
@@ -786,7 +760,7 @@ def _recheck_and_report_position(
     that do run it cannot drift apart. For the two mapping steps it has
     exactly THREE call sites:
     `_non_object_body_fail` (a 2xx body that is not a JSON object at all —
-    DR-58, itself reached from every submission-response reader),
+    DR-58, itself reached from the three readers it guards),
     `_step_no_mapping`'s unreadable-fill-counts branch (a genuine JSON object
     whose `fill_count`/`remaining_count` cannot be read — DR-60), and
     `_step_no_mapping`'s fill-or-kill invariant-violation branch (counts that
@@ -811,9 +785,8 @@ def _recheck_and_report_position(
     from a single un-refreshed read and never says FLATTEN; and the two
     mapping steps' post-submission EXCEPTION handlers, which likewise decide
     from a single un-refreshed read for any error other than the exchange's
-    kill response
-    (that one goes through _position_after_kill). Widening to them is a
-    separate change, and the word
+    kill response (that one goes through _position_after_kill). Widening to
+    them is a separate change, and the word
     "SINGLE DEFINITION" above is about this tail's ONE implementation, never a
     claim that every such branch runs it.
 
@@ -823,7 +796,9 @@ def _recheck_and_report_position(
     exactly-zero read because a non-zero one is already the evidence that step
     wants. Here neither `None` nor `0` is evidence of anything, and collapsing
     `None` into "flat" is precisely the silent branch this exists to prevent.
-    A first read that already moved is evidence and is NOT re-polled.
+    A first read that already moved is evidence and is NOT re-polled. A
+    reading that is not a finite number counts as None (_position_unknown):
+    it is re-read and reported as unreadable, never as an open position.
 
     The retried `trader._position_count` is used deliberately (never the
     single-shot `_position_count_once`): the probe is a human-supervised tool
@@ -839,10 +814,6 @@ def _recheck_and_report_position(
             `float` (possibly 0) or `None` when that lookup failed. The caller
             prints it because only the caller knows what to call the read;
             this function prints only the re-read and the verdict.
-
-    A reading that is not a finite number is unknown too (_position_unknown):
-    it is re-read like None and reported as unreadable, never as an open
-    position.
 
     Returns:
         float | None: The position it judged — the caller's reading, or the
@@ -878,16 +849,13 @@ def _non_object_body_fail(client: Any, ticker: str, data: Any, label: str) -> st
     Report a submitted order whose 2xx body is not a JSON object, and check the
     account.
 
-    This guards three of the probe's submission-response readers, which is
-    not the same as its five SUBMISSIONS: `_step_no_mapping`'s NO buy,
-    `_step_unfillable_ask`'s ask and `_step_yes_close`'s YES buy read fill
-    fields off the body before the account says what happened, and come here
-    when the body is not an object. Of the two reduce-only closes,
-    `_step_no_mapping`'s NO close only hands its body to `_emit` and takes its
-    verdict from `trader._position_count`, so nothing there can raise on a
-    non-object body; `_step_yes_close`'s YES sale reads its reply only after
-    the account reads flat, through `_sale_reply_problem`, which checks for a
-    non-object body itself and reports it rather than raising.
+    It guards the three submission-response readers that read fill fields off
+    the body: `_step_no_mapping`'s NO buy, `_step_unfillable_ask`'s ask and
+    `_step_yes_close`'s YES buy. The two reduce-only closes need no guard:
+    the NO close's body only goes to `_emit` (its verdict comes from
+    `trader._position_count`), and the YES sale's reply is read by
+    `_sale_reply_problem`, which reports a non-object body rather than
+    raising.
 
     `_http.signed_request_json` is annotated `-> Any` and does not narrow a 2xx
     body to a dict, so `"accepted"`, `[]`, `123`, `true` or a literal `null` all
@@ -895,12 +863,13 @@ def _non_object_body_fail(client: Any, ticker: str, data: Any, label: str) -> st
     the submission calls `data.get(...)` — `_fill_counts` at all three guarded
     readers, and `_report_fee` in `_step_no_mapping` and `_step_yes_close` —
     so such a body used to raise an uncaught `AttributeError` IMMEDIATELY
-    AFTER A REAL ORDER HAD BEEN SUBMITTED: the probe died on a traceback with no position read, no
-    flatten-it-manually warning (and, in `_step_no_mapping`, no reduce-only
-    close), and a real position was left open with nothing to tell the operator
-    it existed (DR-58). The close is NOT restored here — it rests on the very
-    mapping this unreadable body proves nothing about, so the position is left
-    for a human, as a disproven mapping already leaves it. A 2xx proves the
+    AFTER A REAL ORDER HAD BEEN SUBMITTED: the probe died on a traceback with
+    no position read, no flatten-it-manually warning (and, in
+    `_step_no_mapping`, no reduce-only close), and a real position was left
+    open with nothing to tell the operator it existed (DR-58). The close is
+    NOT restored here — it rests on the very mapping this unreadable body
+    proves nothing about, so the position is left for a human, as a disproven
+    mapping already leaves it. A 2xx proves the
     order reached the exchange, so it MAY have filled
     — the same reading `trader._execute_transfer` takes of a non-object 2xx
     transfer body (DR-05), and the opposite of the ORDER-submission readers in
@@ -1068,12 +1037,11 @@ def _step_no_mapping(client: Any, ticker: str, assume_yes: bool, dest_shard: int
          straight after the close is read once more after
          trader._V2_MAPPING_RECHECK_DELAY_SECONDS and the re-read is judged,
          because the ledger can lag a fill. This is the step's SECOND
-         submission, and it needs
-         no _non_object_body_fail guard: its 2xx body is only
-         handed to _emit (typed Any — it just pretty-prints), and the verdict
-         comes from trader._position_count, so there is no data.get(...) on
-         it to raise. Add the guard here if a future edit starts reading fill
-         fields off close_data (DR-58).
+         submission, and it needs no _non_object_body_fail guard: its 2xx
+         body is only handed to _emit (typed Any — it just pretty-prints),
+         and the verdict comes from trader._position_count, so there is no
+         data.get(...) on it to raise. Add the guard here if a future edit
+         starts reading fill fields off close_data (DR-58).
 
     Args:
         client (Any): Authenticated prod KalshiClient.
@@ -1583,20 +1551,16 @@ def _sale_reply_problem(data: Any) -> str | None:
     Say how the YES sale's reply fails to report the sale, once the account
     shows all 0.01 sold; None when it reports exactly that.
 
-    Live selling reads a sale's reply before the account (trader._sell_leg,
-    through trader._sale_fill_count): a usable fill_count there is taken as
-    the number sold, and the account is not read. So when the account reads
-    flat after the probe's sale, the reply must say fill_count 0.01. Its
-    remaining_count must be 0 too: live selling does not read that field, but
-    the probe checks both counts on every reply it reads, as it does for its
-    buys, since a surprise in either is a finding about the reply's shape.
-
-    Never raises: a reply that is not a JSON object, or whose counts cannot be
-    read, is described rather than read.
+    Live selling takes a sale's count from its reply's fill_count when it can
+    read one, without reading the account (trader._sell_leg, through
+    trader._sale_fill_count), so the reply must say fill_count 0.01. It must
+    also say remaining_count 0: live selling does not read that field, but the
+    probe checks both counts on every reply it reads, as it does for its
+    buys. Never raises: a reply it cannot read is described instead.
 
     Args:
-        data (Any): The parsed 2xx reply to the sale. Normally a dict, with
-            the order at the top level or under an "order" key.
+        data (Any): The parsed 2xx reply to the sale, normally a dict with the
+            order at the top level or under an "order" key.
 
     Returns:
         str | None: A phrase naming what the reply says, or None when it
@@ -1628,50 +1592,39 @@ def _step_yes_close(client: Any, ticker: str, assume_yes: bool, dest_shard: int)
     Verify the order live selling sends to sell a held YES: a reduce-only ask.
 
     Sequence, all of it against the live account:
-      1. Fetch the market and confirm the account is FLAT on its ticker, as
-         every order step does: the verdict is which way the position moved.
-      2. Read the order book. The step needs a YES ask to buy from (a resting
-         NO bid at P is a YES ask at 1 - P) and a YES bid to sell back into.
-         Without either it stops (NEUTRAL) before submitting anything, so it
-         never buys a YES it could not sell.
+      1. Fetch the market and confirm the account is FLAT on its ticker: the
+         verdict is which way the position moved.
+      2. Read the order book. Unless it shows both a YES ask to buy from (a
+         resting NO bid at P is a YES ask at 1 - P) and a YES bid to sell back
+         into, stop at NEUTRAL before submitting anything.
       3. Buy 0.01 YES with a fill-or-kill bid at the top of the grid
-         (_yes_buy_body), and judge the buy as _step_no_mapping judges its NO
-         buy. The exchange's kill response, or a 2xx with nothing filled and
-         the full count remaining, is a kill: NEUTRAL when the account reads
-         flat (_position_after_kill re-reads a first read that is not 0),
-         FAIL otherwise. A 2xx body that is not a JSON object
-         (_non_object_body_fail), a body whose fill counts cannot be read,
-         and readable counts that are neither a complete fill nor a true kill
-         (a fill-or-kill reply that cannot happen) are FAILs that report the
-         account through _recheck_and_report_position. Any other error is a
-         FAIL that reports the account the same way.
-      4. Read the position, once more after
-         trader._V2_MAPPING_RECHECK_DELAY_SECONDS when a complete fill reads
-         exactly 0. It must be POSITIVE (YES contracts). A NEGATIVE position
-         means the bid bought NO; the sale is then not sent, since a
-         reduce-only ask cannot close a NO position. A failed lookup, or a
-         reading that is not a finite number (_position_unknown), is a FAIL
-         that sends no sale either.
-      5. Sell the YES with _yes_close_body: trader._build_sale_order_v2's
-         reduce-only, immediate-or-cancel ask, for 0.01 contracts, at the
-         lowest level of the grid. The position must then read exactly 0,
-         read once more after the same pause when the first read is not 0.
-         Anything else (nothing sold, part sold, more YES, any NO, or a
-         reading that tells nothing) is a FAIL naming the position, with
-         _REMEDY; so is an error from the sale's POST when the account does
-         not then read flat.
-      6. With the account flat, read the sale's 2xx reply (_sale_reply_problem,
-         which never raises on a reply it cannot read). Live selling takes the
-         number a sale sold from that reply's fill_count when it can read one,
-         so PASS needs the reply to report the 0.01 sold (fill_count 0.01,
-         remaining_count 0). A reply that is not a JSON object, has no
-         readable counts, or reports anything else is a FAIL; the account is
-         flat by then, so there is nothing to flatten.
+         (_yes_buy_body) and judge it as _step_no_mapping judges its NO buy:
+         a kill (the exchange's kill response, or nothing filled and the full
+         count remaining) is NEUTRAL on a flat account and FAIL otherwise; an
+         unreadable body, unreadable counts, an impossible fill-or-kill reply
+         or any other error is a FAIL that reports the account through
+         _recheck_and_report_position.
+      4. Read the position (once more after
+         trader._V2_MAPPING_RECHECK_DELAY_SECONDS if a complete fill reads
+         0). It must be POSITIVE (YES contracts). Anything else — NO
+         contracts, 0, or a reading that tells nothing (_position_unknown) —
+         is a FAIL and no sale is sent (a reduce-only ask cannot close a NO
+         position).
+      5. Sell the YES with _yes_close_body (trader._build_sale_order_v2's
+         reduce-only, immediate-or-cancel ask, 0.01 contracts, at the lowest
+         level of the grid). The position must then read exactly 0 (re-read
+         once after the same pause if not). Anything else, or a POST error
+         after which the account does not read flat, is a FAIL naming the
+         position, with _REMEDY.
+      6. With the account flat, check the sale's reply (_sale_reply_problem):
+         PASS needs it to report fill_count 0.01 and remaining_count 0, since
+         live selling takes a sale's count from that reply when it can read
+         one. Anything else is a FAIL, with nothing to flatten.
 
     Every submission error is handled after its except clause has ended, so a
-    position read made while reporting it cannot pick the error up as its
-    cause (the retried read would then mistake a fatal lookup error for a
-    passing network fault and wait out its backoff).
+    position read made then cannot pick the error up as its cause (the
+    retried read would mistake a fatal lookup error for a network fault and
+    wait out its backoff).
 
     Args:
         client (Any): Authenticated prod KalshiClient.
@@ -1681,17 +1634,13 @@ def _step_yes_close(client: Any, ticker: str, assume_yes: bool, dest_shard: int)
         dest_shard (int): Unused — shared step signature.
 
     Returns:
-        str: _PASS only when the buy opened a YES position, the sale
-            returned the account to exactly flat and the sale's reply reported
-            the 0.01 sold; _FAIL on any contrary evidence, an error, an
-            unreadable or impossible reply to the buy, a sale reply that does
-            not report the sale the account shows,
-            a position left open — including declining the SECOND (sale)
-            confirmation, since a real position is open by then — or a market
-            that cannot be read or a ticker that is not flat to begin with;
+        str: _PASS only when the buy opened a YES position, the sale left the
+            account exactly flat and its reply reported the 0.01 sold.
             _NEUTRAL only when no position was ever at risk: no order book, no
-            YES ask or no YES bid on the book, a true kill of the buy against
-            a flat account, or declining the FIRST (buy) confirmation.
+            YES ask or no YES bid on the book, a true kill of the buy on a
+            flat account, or the FIRST (buy) confirmation declined. _FAIL
+            otherwise, including a declined SECOND (sale) confirmation, since
+            a position is open by then.
     """
     print("\n===== STEP: yes-close (the reduce-only ask that sells a held YES) =====")
 
@@ -1765,10 +1714,8 @@ def _step_yes_close(client: Any, ticker: str, assume_yes: bool, dest_shard: int)
     except Exception as exc:
         error = exc
     if error is not None and trader._is_fok_kill(error):
-        # The exchange's kill response (trader._is_fok_kill, the one
-        # definition the live path reads too): nothing bought, so there is
-        # nothing to sell — judged on the account after one re-read of a
-        # first read that is not flat.
+        # The exchange's kill response (trader._is_fok_kill, the live path's
+        # one definition): judged on the account, re-read once unless flat
         print(f"The exchange killed the fill-or-kill YES buy: {_kill_response_text(error)}")
         after = _position_after_kill(client, ticker, "YES buy")
         if after == 0:
@@ -1935,9 +1882,8 @@ def _step_yes_close(client: Any, ticker: str, assume_yes: bool, dest_shard: int)
         )
         return _FAIL
 
-    # The account is flat, so the sale sold the YES held. Live selling decides
-    # how many a sale sold from its reply when the reply says, without reading
-    # the account, so the reply has to report the same sale.
+    # Flat, so the YES was sold. Live selling takes a sale's count from its
+    # reply when it can, so the reply must report this sale too.
     reply_problem = _sale_reply_problem(close_data)
     if reply_problem is not None:
         print(

@@ -89,22 +89,15 @@ Purpose:
     fund are dropped. main._run_prod calls it right after pre_execution_check.
 
     sell_positions() sells the held positions the take-profit rule picked
-    (seller.plan_sales), one position at a time. Each held market is sold by
-    one reduce_only, immediate_or_cancel order for the contracts held there:
-    a held YES by an ask on the YES book ("close_yes"), a held NO by a YES
-    bid ("close_no"). Before any order of a position, each held market must
-    still hold the plan's count (_holding_problem). Its price is no worse
-    than the lowest bid the plan's walk reached (_sale_limit): the ask is
-    rounded UP onto the market's grid and the NO's YES bid DOWN, so neither
-    sells below that bid. An exact pair
-    is sold by two orders: the market with the thinner book first, then
-    exactly as many contracts of the other as the first sold, at most
-    config.SALE_HEDGE_SLIPPAGE_TICKS ticks below its walked bid, so what is
-    left is still an exact pair. A partial fill is a normal outcome for these
+    (seller.plan_sales), one position at a time; main._run_prod calls it
+    before it buys anything. Each held market is sold by one reduce_only,
+    immediate_or_cancel order, priced no worse than the lowest bid reached
+    selling its count down the market's bids (_sale_limit). An exact pair is
+    sold by two orders; the second, for exactly as many contracts as the
+    first sold, may go up to config.SALE_HEDGE_SLIPPAGE_TICKS ticks lower, so
+    what is left is still an exact pair. A partial fill is normal for these
     orders, so their replies are read by _sale_fill_count, never by
-    _v2_fill_status; an unclear reply is judged, as a buy leg's is, by how
-    the account's position moved. main._run_prod calls it before it buys
-    anything.
+    _v2_fill_status.
 
 Dependencies:
     Imports from config.py (the order, transfer and write-pacing settings,
@@ -112,9 +105,7 @@ Dependencies:
     which rounds a leg's cost up to the cent, and count_text, which writes a
     contract count exactly in an alert or a marker); scanner.py (each leg's
     side and price, pair_held, which says which held pair, if any, a pair
-    adds to, the price-grid math — ceil_to_tick, floor_to_tick,
-    tick_size_for_price, and v2_bottom_of_grid_price, the lowest level of a
-    market's grid — walk_bids for a sale's prices, and
+    adds to, the price-grid math, walk_bids for a sale's prices, and
     validate_pair_price); _http.py (signed requests, retried position reads
     and readers for error replies); auth.py (read_shard_balances);
     reporter.py (TradeResult, SaleResult); strategy.py (TradeSpec); and
@@ -129,10 +120,10 @@ Notes:
     twice or at a worse price, and a resent transfer moves the money twice.
     _submit_order_v2, _submit_sale_v2 and _execute_transfer call
     signed_request_json directly and must never be wrapped in
-    api_call_with_retry. Each POST first takes
-    one place on _ORDER_WRITE_PACER (a YES leg uses the place its NO leg held
-    for it); that only delays the request, which is still sent once. An HTTP
-    429 raises like any other error reply.
+    api_call_with_retry. Each POST first takes one place on
+    _ORDER_WRITE_PACER (a YES leg uses the place its NO leg held for it);
+    that only delays the request, which is still sent once. An HTTP 429
+    raises like any other error reply.
 
     Position reads (_position_count) ARE retried, since a read cannot trade;
     do not make reads and submissions alike in either direction. Two reads
@@ -177,10 +168,9 @@ Notes:
     Position reads use the SDK's raw-response method and parse the JSON
     themselves (_read_position), because the SDK's position model cannot read
     live replies. The SDK has no method for the V2 order route, so the
-    _build_*_order_v2 functions build the JSON body and send it through
-    _http.signed_request_json: a buy leg's or an unwind's body by
-    _submit_order_v2, a sale's body by _submit_sale_v2 (whose reply is read by
-    _sale_fill_count, since a part-filled sale is a normal outcome).
+    _build_*_order_v2 functions build the JSON body, and _submit_order_v2 (a
+    buy leg or an unwind) or _submit_sale_v2 (a sale) sends it through
+    _http.signed_request_json.
 
     All V2 price math is done in Decimal, never float: the endpoint takes
     dollar-string prices, and binary float noise would produce a string the
@@ -873,8 +863,7 @@ def _v2_top_of_grid_price(market: Any) -> Decimal:
     """
     # A dollar string, so the Decimal carries no float noise to floor away
     target = Decimal(V2_ROLLBACK_BID_PRICE_DOLLARS)
-    # Cross-module: the one rounding-down onto a market's grid (scanner's),
-    # the same one a NO sale's bid is rounded with
+    # Cross-module: scanner's rounding down onto a grid, which a NO sale's bid uses too
     return floor_to_tick(target, tick_size_for_price(market, float(target)))
 
 
@@ -3245,59 +3234,45 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
 # ─── Selling held positions ───────────────────────────────────────────────────
 #
 # sell_positions sells the positions the take-profit rule picked
-# (seller.plan_sales), one position at a time. Each held market of a position
-# is sold by one reduce-only, immediate-or-cancel order for the contracts the
-# account holds there: it fills what rests at or better than its limit price
-# and cancels the rest, and reduce_only keeps it from ever opening a position.
-# Each order is sent once, never retried, after one place on the write pacer.
+# (seller.plan_sales); the helpers below price, build, send and read its
+# sale orders.
 
 
 def _sale_limit(market: Any, side: str, lowest_bid: float, slippage_ticks: int) -> Decimal:
     """
     The limit price of an order that sells held contracts, on the market's own grid.
 
-    The order never gives the side held less than its floor: the lowest bid
-    the sale's walk reached (seller's SalePlan.walked, or scanner.walk_bids
-    for a smaller count), less `slippage_ticks` ticks of the grid at that
-    bid. The floor is rounded onto the grid once, toward the safe side:
+    The floor is the lowest bid reached when the sale's count is sold down
+    the market's bids, best first (the plan's "walk": SalePlan.walked, or
+    scanner.walk_bids for a smaller count), less `slippage_ticks` ticks of
+    the YES-book grid where that bid trades (at the bid for a YES, at 1
+    minus it for a NO). The order never sells the side held below the floor:
 
-      * A held YES is sold by an ask on the YES book at the floor, rounded UP
-        onto the grid. An ask fills only at its price or higher, so the YES
-        never sells below the floor.
-      * A held NO is sold by buying YES back: a bid on the YES book at 1
-        minus the floor, rounded DOWN onto the grid. A bid pays at most its
-        price, so the NO never fetches less than the floor.
+      * a held YES is sold by an ask at the floor, rounded UP onto the grid
+        (an ask fills only at its price or higher);
+      * a held NO is sold by a YES bid at 1 minus the floor, rounded DOWN
+        (a bid pays at most its price).
 
-    The tick is the grid's step where the side held is priced: on the YES
-    book at the walked bid for a YES, and at 1 minus the walked bid for a NO
-    (a NO price p trades at YES price 1 - p). A price on the boundary between
-    two price bands gets the finer band's step (tick_size_for_price), so when
-    the band just past that boundary is coarser, the rounding toward the safe
-    side can take the slippage back and price the order at the walked bid
-    itself.
-
-    The price is then kept within the market's tradeable levels: at least
-    the grid's lowest level (one tick above 0), at most _v2_top_of_grid_price.
-    A clamp can take the price past the floor only when the floor lies beyond
-    those levels, where no bid can rest on this grid.
-
-    The walked bid is a float, so it is first rounded to six decimals
-    (scanner._SCANNED_PRICE_QUANTUM) to drop float noise: no Kalshi price has
-    a seventh decimal, and 1 - 0.43 is 0.5700000000000001 as a float.
+    On a boundary between two price bands the tick is the finer band's
+    (tick_size_for_price), so where the next band is coarser the rounding
+    can take the slippage back and price the order at the walked bid. The
+    price is then kept between the grid's lowest level and
+    _v2_top_of_grid_price; that clamp can move the price past the floor only
+    when the floor lies beyond those levels, where no bid can rest. The
+    walked bid is first rounded to six decimals (scanner._SCANNED_PRICE_QUANTUM) to drop float
+    noise.
 
     Args:
-        market (Any): The held market (an ApiMarket): its grid
-            (price_level_structure / price_ranges).
+        market (Any): The held market (an ApiMarket), whose grid is used.
         side (str): The side held there, "yes" or "no".
-        lowest_bid (float): The lowest bid reached for the side held, in
-            dollars, as a price of that side (a NO bid for a held NO).
-            Range: (0, 1).
-        slippage_ticks (int): How many ticks of the grid below that bid the
-            order may fill; 0 or more.
+        lowest_bid (float): The lowest bid reached, in dollars, as a price of
+            the side held (a NO price for a held NO); in (0, 1).
+        slippage_ticks (int): Ticks below that bid the order may fill; 0 or
+            more.
 
     Returns:
-        Decimal: The price to send: an ask price for a held YES, a YES bid
-            price for a held NO, a valid level of the market's grid.
+        Decimal: The ask price for a held YES, or the YES bid price for a held
+            NO; a valid level of the market's grid.
 
     Raises:
         ValueError: For a side other than "yes" or "no".
@@ -3306,8 +3281,9 @@ def _sale_limit(market: Any, side: str, lowest_bid: float, slippage_ticks: int) 
         raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
     walked = Decimal(str(lowest_bid)).quantize(_SCANNED_PRICE_QUANTUM)
     if side == "yes":
-        # Cross-module: the floor, in ticks of the YES book at the walked bid;
-        # kept at 0 or more so the next grid lookup reads a price in [0, 1]
+        # Cross-module: the floor, slippage_ticks ticks (of the grid at the
+        # walked bid) below it; kept at 0 or more so the next tick lookup
+        # reads a price in [0, 1]
         floor_price = max(
             walked - slippage_ticks * tick_size_for_price(market, float(walked)),
             Decimal("0"),
@@ -3317,16 +3293,16 @@ def _sale_limit(market: Any, side: str, lowest_bid: float, slippage_ticks: int) 
     else:
         # The YES-book level a NO walked to `walked` trades at
         level = Decimal("1") - walked
-        # Cross-module: 1 minus the floor, in ticks of the YES book at that
-        # level; kept at 1 or less so the next grid lookup reads a price in [0, 1]
+        # Cross-module: 1 minus the floor, slippage_ticks ticks (of the grid at
+        # that level) above it; kept at 1 or less so the next tick lookup
+        # reads a price in [0, 1]
         cap = min(
             level + slippage_ticks * tick_size_for_price(market, float(level)),
             Decimal("1"),
         )
         # Rounded DOWN onto the grid of the band the bid lies in
         price = floor_to_tick(cap, tick_size_for_price(market, float(cap)))
-    # Cross-module: the lowest tradeable level of the market's grid, the one
-    # v2_limit_price clamps a buy leg's price to as well
+    # Cross-module: the grid's lowest tradeable level (a buy leg's lower clamp too)
     bottom = v2_bottom_of_grid_price(market)
     return min(max(price, bottom), _v2_top_of_grid_price(market))
 
@@ -3335,17 +3311,15 @@ def _build_sale_order_v2(market: Any, side: str, count: int, limit: Decimal) -> 
     """
     Build the V2 order body that sells `count` held contracts of one side.
 
-    A held YES is sold by an ask on the YES book ("close_yes" in
-    _V2_LEG_SIDE); a held NO by a YES bid ("close_no"), as the unwind of a NO
-    leg closes it. reduce_only means the order can only shrink the position,
-    never open one or turn it into the other side, and the endpoint accepts
-    reduce_only only with immediate_or_cancel: it fills what rests at or
-    better than the limit at once and cancels the rest, leaving nothing on
-    the book.
+    A held YES is sold by an ask on the YES book ("close_yes"), a held NO by
+    a YES bid ("close_no"), as an unwind closes a NO leg. The order is
+    reduce_only, so it can only shrink the position, and immediate_or_cancel:
+    it fills what rests at or better than the limit at once and cancels the
+    rest.
 
     Args:
-        market (Any): The held market (an ApiMarket): its ticker and the
-            exchange_index (shard) the order is sent to.
+        market (Any): The held market (an ApiMarket): its ticker and its
+            shard (exchange_index).
         side (str): The side held there, "yes" or "no".
         count (int): Whole contracts to sell; at least 1, never more than the
             account holds there.
@@ -3383,9 +3357,7 @@ def _submit_sale_v2(client: Any, body: dict) -> Any:
     Send one sale order and return the exchange's reply.
 
     Never retried: a resent sale could sell twice. It takes one place on the
-    write pacer right before the POST, then sends the body once through
-    _http.signed_request_json, which raises ApiException on any error reply
-    (an HTTP 429 included).
+    write pacer, then POSTs the body once through _http.signed_request_json.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -3395,14 +3367,14 @@ def _submit_sale_v2(client: Any, body: dict) -> Any:
         Any: The parsed reply body (normally a dict carrying the order).
 
     Raises:
-        Exception: Whatever the POST raises: ApiException on an error reply,
-            a transport error, or json.JSONDecodeError on a 2xx reply that is
-            not JSON.
+        Exception: Whatever the POST raises: ApiException on an error reply
+            (HTTP 429 included), a transport error, or json.JSONDecodeError on
+            a 2xx reply that is not JSON.
     """
     # One pacer place per POST, taken before logging so the log time is the send time
     _ORDER_WRITE_PACER.acquire()
-    # Log before submitting: the client_order_id is the handle a human has for
-    # finding this order in the account if its outcome turns out unclear
+    # Logged before the POST: the client_order_id lets a person find this
+    # order in the account if its outcome is unclear
     logging.info(
         "Submitting V2 sale order: ticker=%s side=%s price=%s count=%s client_order_id=%s",
         body["ticker"], body["side"], body["price"], body["count"], body["client_order_id"],
@@ -3461,8 +3433,7 @@ def _contracts_sold(before: float | None, after: float | None, side: str) -> flo
         float | None: The contracts the readings say were sold, or None when
             either reading is missing or the difference is not a finite number.
     """
-    # The signed change across the order (after - before), None when either
-    # reading is missing
+    # after - before; None when either reading is missing
     delta = _fill_delta(before, after)
     if delta is None:
         return None
@@ -3495,14 +3466,13 @@ def _holding_problem(leg: Any, before: float | None) -> str | None:
     """
     Say why a held market must not be sold now, or None when it may.
 
-    A sale plan was built from the positions listing read at the start of the
-    run. Before any order of a position is sent, each of its held markets is
-    read again, and it must still hold exactly the plan's count on the side
-    held: +count for a YES, -count for a NO (Kalshi signs NO contracts
-    negative). A market that changed since (a trade by hand, say) would make
-    a pair's second order unbalance it, or make the outcome lines name
-    contracts that are no longer there, so the position is not sold. A
-    reading that failed, or that is not a finite number, counts as changed.
+    A plan is built from the positions read at the start of the run. Just
+    before a position's first order, each held market must still hold the
+    plan's count on its side: +count for a YES, -count for a NO (Kalshi signs
+    NO contracts negative). A market that changed since (a trade by hand,
+    say) would make a pair's second order unbalance it, or the outcome lines
+    name contracts no longer there, so the position is not sold. A reading
+    that failed or is not a finite number counts as changed.
 
     Args:
         leg (Any): A held market's seller.SaleLeg (side and count checked by
@@ -3511,9 +3481,9 @@ def _holding_problem(leg: Any, before: float | None) -> str | None:
             when the read failed.
 
     Returns:
-        str | None: A short reason, such as "the position on KX-A could not be
-            read" or "KX-B now holds 3 NO contracts; the plan holds 5 NO
-            contracts"; None when it still holds the plan's count.
+        str | None: A short reason (e.g. "KX-B now holds 3 NO contracts; the
+            plan holds 5 NO contracts"), or None when it still holds the
+            plan's count.
     """
     expected = leg.count if leg.side == "yes" else -leg.count
     if before is None or not math.isfinite(before):
@@ -3529,24 +3499,21 @@ def _sell_leg(client: Any, leg: Any, count: int, limit: Decimal,
     """
     Send one sale order for a held market and find out how many contracts it sold.
 
-    The order takes one place on the write pacer and is sent once. A 2xx
-    reply with a usable fill count is the answer. Otherwise (the POST raised,
-    or the reply did not say) the account decides: the position is read
-    again and its move toward zero from `before` is the count sold.
+    The order is sent once (one pacer place, never retried). A 2xx reply
+    with a usable fill count is the answer. Otherwise (the POST raised, or
+    the reply did not say) the account decides: the count sold is how far
+    the position moved toward zero from `before`.
 
-    The positions ledger can lag a fill, wholly or in part (some of an
-    order's fills recorded before the rest), so a move short of the whole
-    count is not taken at once: the position is read again after each pause
-    of config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS in turn (1, 2 and 4
-    seconds, the schedule the buy path's NO-leg check reads a lagging ledger
-    on), stopping at the first reading that shows the whole count. The last
-    reading decides. A reading that cannot be read, at any point, leaves the
-    count unknown: a lagging ledger could hide a fill, so no earlier reading
-    is safe to act on. Even the last reading can still trail the fills, so
-    the caller is told that the account decided, and main._run_prod checks
+    The positions ledger can lag a fill, so while the move is short of the
+    whole count the position is read again after each pause of
+    config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS (1, 2 and 4 seconds),
+    stopping once it shows the whole count; the last reading decides. A
+    reading that fails at any point leaves the count unknown, since an
+    earlier reading may have lagged. Even the last reading can trail the
+    fills, so the result says the account decided, and main._run_prod checks
     the positions listing again after the sales.
 
-    These reads come after the except clause: a read that failed inside it
+    The reads come after the except clause: a read that failed inside it
     would carry the order's error as its cause and could be retried as a
     passing network fault.
 
@@ -3560,10 +3527,9 @@ def _sell_leg(client: Any, leg: Any, count: int, limit: Decimal,
 
     Returns:
         tuple[int | None, bool]: (contracts sold, from 0 to `count`, or None
-            when that cannot be known: the reply said nothing usable and a
-            position read failed, or the position moved by an amount the
-            order cannot explain; and whether the account's position, rather
-            than the order's reply, was read for that count).
+            when that cannot be known: a position read failed, or the
+            position moved by an amount the order cannot explain; and whether
+            that count came from the account rather than the reply).
     """
     ticker = leg.ticker
     body = _build_sale_order_v2(leg.market, leg.side, count, limit)
@@ -3735,9 +3701,7 @@ def _depth_left(plan: Any, leg: Any) -> float:
     How many contracts a held market's bids hold past what its sale walks.
 
     The contracts resting at or above the lowest bid the walk reached, less
-    the contracts held there: what would be left on those bids after the
-    sale. A pair sells its market with less left first, so the order more
-    likely to fall short goes first and the other is then sold to match it.
+    the contracts held there.
 
     Args:
         plan (Any): The seller.SalePlan.
@@ -3758,9 +3722,10 @@ def _sale_legs(plan: Any) -> tuple[list | None, str | None]:
     The held markets of a plan, in the order their sale orders are sent.
 
     A position has one held market (a lone market whose partner has paid
-    out) or two (an exact pair: one YES and one NO of equal count). A pair's
-    market with less depth left past its walked count goes first
-    (_depth_left; on a tie, the ticker first in order).
+    out) or two (an exact pair: one YES and one NO of equal count). A pair
+    sells first the market with less depth left past its walked count
+    (_depth_left; on a tie, the ticker first in order): its order is the more
+    likely to fall short, and the other is then sold to match it.
 
     Args:
         plan (Any): The seller.SalePlan.
@@ -3797,11 +3762,11 @@ def _hedge_lowest(plan: Any, leg: Any, count: int) -> float:
 
     Returns:
         float: The lowest bid scanner.walk_bids reaches for `count` on the
-            plan's ladder; the plan's own walked bid for the full count when
-            the ladder cannot fill `count` (which a count no larger than the
-            one the plan walked never meets).
+            plan's ladder, or the plan's own walked bid when the ladder
+            cannot fill `count` (which never happens for a count no larger
+            than the plan's).
     """
-    # Cross-module: the one walk of a bid ladder, the one the plan was priced with
+    # Cross-module: the same bid walk the plan was priced with
     walk = walk_bids(_ladder(plan, leg.ticker), count)
     return walk[1] if walk is not None else _walked_lowest(plan, leg.ticker)
 
@@ -3877,22 +3842,17 @@ def _sell_pair(client: Any, plan: Any, first: Any, other: Any,
     Sell an exact held pair with two orders, keeping it balanced.
 
     The first order sells all of `first`'s contracts at no worse than its
-    walked bid. The second then sells exactly as many of `other`'s contracts
-    as the first sold, at no worse than config.SALE_HEDGE_SLIPPAGE_TICKS
-    ticks below the bid its walk reaches for that count, so what is left is
-    still an exact pair. When the first sells nothing, or how many it sold
-    cannot be known, no second order is sent.
+    walked bid. The second sells exactly as many of `other`'s as the first
+    sold, at no worse than config.SALE_HEDGE_SLIPPAGE_TICKS ticks below the
+    bid its walk reaches for that count, so what is left is still an exact
+    pair. When the first sells nothing, or how many it sold cannot be known,
+    no second order is sent.
 
-    Both markets' positions were read before the first order was sent, as a
-    buy pair's are. When the first order's reply says how many it sold, the
-    second order follows at once. When it does not (the POST raised, or the
-    reply had no usable count), the account decides (_sell_leg): its
-    position is read with retries, and a reading short of the whole count is
-    read again after pauses of up to 7 seconds in all, so the pair stays
-    uneven while those reads and pauses run (longer when a read has to be
-    retried, each retried read waiting up to about a minute). The YES leg of
-    a buy pair makes the same trade-off: acting on a reading that may lag
-    could sell the wrong count, which is worse than waiting.
+    When the first order's reply does not say how many it sold (or its POST
+    raised), the account decides (_sell_leg), and the pair stays uneven while
+    its reads and pauses run (up to 7 seconds of pauses, longer when a read is retried). As with
+    a buy pair's YES leg, waiting is safer than acting on a reading that may
+    lag and selling the wrong count.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -4036,9 +3996,8 @@ def _sell_one(client: Any, plan: Any, *, dry_run: bool) -> SaleResult:
             f"Not sold '{plan.title}': the V2 NO-leg mapping was disproven earlier in this"
             " run; nothing sent",
         )
-    # Every held market is read before any order is sent: the baselines an
-    # unclear reply is judged against, and the check that each still holds the
-    # plan's count
+    # Every held market is read before any order: the baselines an unclear
+    # reply is judged against, and the check that it still holds the plan's count
     befores = {leg.ticker: _position_count(client, leg.ticker) for leg in legs}
     for leg in legs:
         changed = _holding_problem(leg, befores[leg.ticker])
@@ -4056,53 +4015,36 @@ def sell_positions(client: Any, plans: list, *, dry_run: bool) -> list[SaleResul
     """
     Sell the held positions the take-profit rule picked, one at a time, in order.
 
-    Each plan comes from seller.plan_sales. Only its held markets get orders
-    (a paid-out partner has nothing left to sell), each a reduce-only,
-    immediate-or-cancel order for the contracts held there (_sell_leg), sent
-    once, never retried, after one place on the write pacer. Its price is no
-    worse than the lowest bid the plan's walk reached (_sale_limit): a YES is
-    sold by an ask rounded up onto the grid, a NO by a YES bid rounded down.
+    Each plan comes from seller.plan_sales; main._run_prod calls this before
+    it buys anything. Only a plan's held markets get orders (a paid-out
+    partner has nothing left to sell): one order for a lone held market, two
+    for an exact pair (_sell_pair). Each is a reduce-only,
+    immediate-or-cancel order priced by _sale_limit and sent once, never
+    retried (_sell_leg).
 
-      * A lone held market is sold by one order.
-      * An exact pair is sold by two: first the market with less depth left
-        past its walked count, for all of its contracts; then exactly as many
-        of the other market's contracts as the first order sold, at no worse
-        than config.SALE_HEDGE_SLIPPAGE_TICKS ticks below the bid its walk
-        reaches for that count. What is left is still an exact pair unless
-        the second order sells fewer ("unbalanced").
-
-    Before any order of a position, each of its held markets is read and must
-    still hold the plan's count on the side held; a market that changed
-    since the plan was made, or cannot be read, means nothing is sent for
-    that position ("not_sold"). How many an order sold is read from its
-    reply; when the reply does not say (or the POST raised), from how the
-    account's position moved, read again on a schedule of pauses while it
-    shows less than the whole count (_sell_leg), and the result is marked
-    SaleResult.decided_by_account. When even that cannot be known, the
-    position is "manual_review" and no further order is sent for it.
-    Nothing is sent while the V2 NO-leg mapping
-    stands disproven in this process (_V2_NO_MAPPING_DISPROVEN). Every outcome
-    logs one line naming the position, what was sold on each market and the
-    limit sent; for "manual_review" and "unbalanced" that line is a CRITICAL
-    saying what to check or do by hand. main._run_prod calls it before it
-    buys anything.
+    Nothing is sent for a position when one of its held markets no longer
+    holds the plan's count or cannot be read, nor while the V2 NO-leg mapping
+    stands disproven in this process (_V2_NO_MAPPING_DISPROVEN). Each
+    outcome logs one line; for "manual_review" and "unbalanced" it is a
+    CRITICAL saying what to check or do by hand.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
         plans (list): seller.SalePlan objects, in the order to sell them.
-        dry_run (bool): Keyword-only. True sends no request at all: each
-            plan's orders are logged ("[DRY RUN] Would sell ...") and it is
-            reported "simulated", with every held market's count as sold. A
-            plan whose orders cannot be built is "not_sold" in a dry run too,
-            as it would be in a live run.
+        dry_run (bool): Keyword-only. True sends no request: each plan's
+            orders are logged ("[DRY RUN] Would sell ...") and it is reported
+            "simulated", with every held market's count as sold. A plan whose
+            orders cannot be built is "not_sold", as in a live run.
 
     Returns:
-        list[SaleResult]: One per plan, in order (empty for no plans). Status
-            "sold" (all of it sold), "partly_sold" (part sold; a pair's rest
-            is still an exact pair), "not_sold" (nothing sold, or nothing
-            sent), "unbalanced" (a pair's second order sold fewer than its
-            first), "manual_review" (how many an order sold cannot be known)
-            or "simulated" (dry run).
+        list[SaleResult]: One per plan, in order. Status "sold" (all of it),
+            "partly_sold" (part sold; a pair's rest is still an exact pair),
+            "not_sold" (nothing sold, or nothing sent), "unbalanced" (a pair's
+            second order sold fewer than its first), "manual_review" (how many
+            an order sold cannot be known; nothing more is sent for it) or
+            "simulated" (dry run). A sale whose count was read from the
+            account rather than the order's reply is marked
+            SaleResult.decided_by_account.
     """
     results = []
     for plan in plans:

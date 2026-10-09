@@ -35,13 +35,9 @@ Notes:
     caps and the fallback live_settings() returns, never a live run's
     defaults. The runs defaults_server starts keep their files under
     LIVE_RUNS_DIR, which the server reads at call time, so tests redirect it.
-    The sell rule's tests live here, where live code may import them:
-    take_profit_reached (the test at one check) and days_to_maturity, which
-    the backtest decides its sales with (through backtester._sells_at and
-    _days_left) and seller.plan_sales decides live sales with, and
-    reached_every_check (the test at every check), which seller.plan_sales
-    calls; the backtest applies that same test at each check through
-    backtester._reached_every_day.
+    The sell rule's tests (take_profit_reached, reached_every_check,
+    days_to_maturity) live here, where live code may import them, so the
+    backtest and live selling (seller.py) decide sales alike.
 """
 import fcntl
 import json
@@ -480,8 +476,7 @@ INTERVAL_DISCOUNT_SWEEP = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65,
 # CONTRACT_PAYOUT_DOLLARS less what it cost) for TAKE_PROFIT_HOLD_DAYS days in a
 # row. Every 1% from 80% to 100%, 21 levels, each the float nearest its percent
 # over 100 (so 81% is exactly the float 0.81). BACKTEST-ONLY: no live module
-# reads this; a live run sells at its own saved sell_at level instead
-# (LiveSettings.sell_at, applied by seller.plan_sales). Distinct shares in
+# reads this (a live run sells at its saved sell_at). Distinct shares in
 # (0, 1]. Read by backtester.run_backtest_sweep(sell_sweep=True), which checks
 # them before its fetch, and whose lazy SellSweep simulates each level when the
 # dashboard reads it.
@@ -502,22 +497,19 @@ TAKE_PROFIT_MIN_DAYS = (1, 2, 3, 4, 5, 6, 7, 14, 21)
 
 # How many days in a row a position must stay at or above its sell level
 # before it is sold, so a price that jumps for a moment does not trigger a
-# sale. The position is checked once a day, the checks 24 hours apart and the
-# last one at the moment of the sale: that check reads the bids then, and each
-# earlier day's check reads the last quote of the 24 hours before it. 1 sells
-# on the sale moment's bids alone. A whole number from 1 to
-# TAKE_PROFIT_HOLD_DAYS_MAX. Read by the backtest's sell rule
-# (backtester._simulate_at_discount's sell_at, at its weekly checkpoints) and
-# by live selling (seller.plan_sales, at the run's own moment), each checking
-# it when called.
+# sale. The checks are 24 hours apart, the last at the moment of the sale
+# (reading the bids then); each earlier check reads the last quote of the 24
+# hours before it. 1 sells on the sale moment's bids alone. A whole number from
+# 1 to TAKE_PROFIT_HOLD_DAYS_MAX; the backtest
+# (backtester._simulate_at_discount's sell_at) and live selling
+# (seller.plan_sales) each validate it when they read it.
 TAKE_PROFIT_HOLD_DAYS = 3
 
-# The most checks TAKE_PROFIT_HOLD_DAYS may ask for: one week. In the backtest
-# a sale at an entry checkpoint then looks back at most six days, all after
-# the previous checkpoint, so every trade the position holds at the sale was
-# already held at each daily check (trades are bought only at checkpoints).
-# Live selling reads its earlier checks from each market's candles over that
-# span at most.
+# The most checks TAKE_PROFIT_HOLD_DAYS may ask for: one week, so in the
+# backtest every check of a sale falls after the previous entry checkpoint and
+# every trade the position holds at the sale was already held at every check
+# (trades are bought only at checkpoints). Live selling reads at most about a
+# week of each market's candles.
 TAKE_PROFIT_HOLD_DAYS_MAX = 7
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
@@ -585,19 +577,17 @@ TRADE_TAGS: tuple[str, ...] | None = None
 # constant.
 ADD_TO_HELD_PAIRS = True
 
-# The share of its potential profit at which a held position is to be sold,
-# on a 1% grid in (0, 1] (like TAKE_PROFIT_LEVELS, the backtest's sell
-# levels), or None to never sell. None here is config.py's value (the
-# no-settings fallback), never a live run's defaults: a live run reads the
-# saved live defaults' sell_at instead (a saved file that leaves the key out
-# reads it as None), which main.py --sell-at / --no-sell overrides for one run.
+# The share of its potential profit at which a held position is sold, on the
+# 1% grid (SELL_AT_STEP) in (0, 1], or None to never sell. A live run reads the
+# saved live defaults' sell_at instead (a file without the key reads as None),
+# which main.py --sell-at / --no-sell overrides for one run.
 SELL_AT: float | None = None
 
 # The fewest whole days a position must have left before its last market
-# stops trading to be sold, or None for no minimum. It only means something
-# with a sell level (SELL_AT): LiveSettings refuses a minimum without one. A
-# live run reads the saved live defaults' sell_min_days instead, which
-# main.py --sell-min-days / --no-sell-min-days overrides for one run.
+# stops trading to be sold, or None for no minimum; LiveSettings refuses a
+# minimum without a sell level. A live run reads the saved live defaults'
+# sell_min_days instead, which main.py --sell-min-days / --no-sell-min-days
+# overrides for one run.
 SELL_MIN_DAYS: int | None = None
 
 # The sell level's grid: SELL_AT, the saved live defaults' sell_at and main.py's
@@ -605,25 +595,24 @@ SELL_MIN_DAYS: int | None = None
 # as TAKE_PROFIT_LEVELS are.
 SELL_AT_STEP = 0.01
 
-# The most markets live selling (seller.plan_sales) looks up on the exchange in
-# one run to find a held market's paid-out partner. A held market whose partner
-# has paid out is judged with that partner, found among the account's
-# settlements: one held on the other side, with the same count, asking the same
-# question. A settled market is no longer in the run's list of open markets, so
-# its question is looked up, which costs one or two read-only requests. Past
-# this many lookups, the held markets still waiting for theirs are not sold
-# that run.
+# How many settled markets, at most, live selling (seller.plan_sales) looks up
+# on the exchange in one run. A held market whose partner (the other market it
+# was bought with) has paid out is judged together with that partner, found
+# among the account's settlements as the one settled market held on the other
+# side, with the same count, asking the same question. A settled market is not
+# in the run's market list, so its question is looked up, at one or two
+# read-only requests each. Past this many, the held markets still waiting for a
+# partner are not sold that run.
 SALE_PARTNER_MAX_LOOKUPS = 20
 
 # How many days ago, at most, a held market's partner may have paid out for
-# live selling (seller.plan_sales) to count it. The partner is the other market
-# of a pair bought together, and a pair's two markets stop trading at most
-# MAX_DEADLINE_GAP_DAYS apart (a same-title pair's within an hour of each
-# other), so while the held market still trades, its partner normally paid out
-# less than that long ago. This allows twice that. An older settlement is never
-# taken for a partner, so a market the account traded long ago can neither
-# stand in for one nor make the real one look ambiguous; a real partner older
-# than this is not found, and the held market is not sold.
+# live selling (seller.plan_sales) to use it: twice MAX_DEADLINE_GAP_DAYS. A
+# pair's two markets stop trading at most that many days apart, so while the
+# held market still trades, its partner normally paid out less than that long
+# ago. An older settlement is
+# never taken for a partner, so a market traded long ago can neither stand in
+# for one nor make the real one look ambiguous; a real partner older than this
+# is not found, and the held market is not sold.
 SALE_PARTNER_MAX_AGE_DAYS = 2 * MAX_DEADLINE_GAP_DAYS
 
 # The size caps' grid: BUDGET_FRACTION, SAME_TITLE_SIZE_CAP, the saved live
@@ -787,9 +776,8 @@ LIVE_MARKET_TICKERS_PER_REQUEST = 100
 
 # A bot run's orders are looked for after the previous real run wrote the
 # trade log, and at most this long before this run wrote it: a run writes the
-# log just after it sends its orders (a run that sells writes it twice, once
-# after its sale orders and once after its purchases, and each is a log time
-# of its own).
+# log just after it sends its orders (a run that sells writes it twice, after
+# its sales and after its purchases, each a log time of its own).
 LIVE_BOT_RUN_WINDOW_SECONDS = 6 * 60 * 60
 
 # How far past a run's log time its orders are still looked for, to allow for
@@ -797,7 +785,7 @@ LIVE_BOT_RUN_WINDOW_SECONDS = 6 * 60 * 60
 LIVE_BOT_RUN_CLOCK_SLACK_SECONDS = 120
 
 # Your own sales of two markets this close together are read as one pair
-# sold by hand. The bot's sale orders are read the same way (only its
+# sold by hand. The bot's sale orders are read that way too (only its
 # purchases are matched to the bot), so a held pair's two sale orders this
 # close together close that pair's purchase.
 LIVE_MANUAL_PAIR_SECONDS = 10 * 60
@@ -1053,26 +1041,23 @@ ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT = 12
 # tick since the pre-execution check still fill.
 BUY_SLIPPAGE_TICKS            = 1
 
-# How many ticks below its walked price the second order of a held pair's sale
-# may fill. trader.sell_positions sells a pair as two orders: first the market
-# with the thinner book, at no worse than the lowest bid its walk reached, then
-# exactly as many contracts of the other market as the first order sold, at no
-# worse than that market's lowest bid for that count less this many ticks of
-# its grid at that bid (trader._sale_limit). One tick lets a book that moved by
-# one tick still take the second order, so the pair stays balanced. The price
-# is rounded onto the grid toward the safe side, so where the grid is coarser
-# just past that bid (a band boundary) the order is priced at the bid itself.
+# How many ticks of its grid below its walked bid (the lowest bid reached when
+# its count is sold down the bids, best first) the second order of a held
+# pair's sale may fill (trader._sale_limit). A pair sells as two orders: first
+# the market with less depth left past its count, at no slippage, then exactly
+# as many contracts of the other as the first sold. One tick lets the second
+# order still fill after a one-tick move, so the pair stays balanced. Where the
+# grid is coarser just past that bid (a band boundary), rounding toward the
+# safe side prices the order at the bid itself.
 SALE_HEDGE_SLIPPAGE_TICKS     = 1
 
-# How long a live run waits, in seconds, before it reads its positions listing
-# a second time after its sales, when the first read does not yet show what
-# the sales sold (main._positions_after_sales). Kalshi's positions ledger can
-# trail a fill by about a second. A run whose listing still does not show the
-# sales after this wait does not use Kalshi's value of the open positions,
-# since that value may still count what was sold, and sizes its buys on the
-# cash alone. When a sale's count was read from the account and came up
-# short, the listing is read on the longer pauses of
-# V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS instead.
+# Seconds a live run waits before reading its positions listing again when the
+# first read after its sales differs from what they recorded
+# (main._positions_after_sales); Kalshi's positions ledger can trail a fill by
+# about a second. A listing that still does not show the sales leaves Kalshi's
+# value of the open positions unused (it may still count what was sold). When
+# a sale whose count an account reading decided came up short, the listing is
+# read on V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS' longer pauses instead.
 SALE_READ_BACK_RECHECK_SECONDS = 1.0
 
 # Fallback tick size, in dollars, for a market whose tick structure is unknown
@@ -1154,9 +1139,9 @@ V2_ORDER_PATH                 = "/trade-api/v2/portfolio/events/orders"
 # handles each shape through its existing paths. Nothing filled is an ordinary
 # non-fill. On a buy leg, part filled or an error response goes to the
 # position-delta check (a part fill the account shows ends as manual_review).
-# On the unwind, either one is rollback_failed. On a sale of a held position
-# (trader.sell_positions), a part fill is an ordinary outcome and an error
-# response goes to the same position-delta check.
+# On the unwind, either one is rollback_failed. On a sale (trader.sell_positions)
+# a part fill is ordinary, and an error response goes to the position-delta
+# check.
 V2_SELF_TRADE_PREVENTION_TYPE = "taker_at_cross"
 
 # What the V2 create-order endpoint sends when a fill_or_kill order cannot fill
@@ -1206,11 +1191,10 @@ V2_ROLLBACK_BID_PRICE_DOLLARS = "0.9999"
 # during the wait, so waiting longer on a zero risks no extra wrong-side
 # position then. The cost is that a filled NO leg checked while the mapping
 # is still unverified can wait up to 7 s unhedged — usually only the first of
-# a process, and only when the ledger lags. Live selling reads a lagging
-# ledger on the same pauses: a sale order whose reply did not say how many it
-# sold, while the account shows less than the whole order
-# (trader._sell_leg), and the positions listing after the sales, while such a
-# sale came up short (main._positions_after_sales).
+# a process, and only when the ledger lags. Live selling re-reads on the same
+# pauses while a sale whose reply did not give its count shows less than its
+# whole order sold: the market's position (trader._sell_leg), then the
+# positions listing after the sales (main._positions_after_sales).
 V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS = (1.0, 2.0, 4.0)
 
 # While the V2 NO-leg mapping is neither confirmed nor disproven in a process,
@@ -1628,9 +1612,9 @@ MARKET_PAGE_SIZE   = 200
 # Number of positions to request per page when paginating the /portfolio/positions endpoint.
 POSITION_PAGE_SIZE = 500
 
-# Number of settlements to request per page from /portfolio/settlements
-# (scanner.get_settlements, the list of markets the account held when they
-# paid out). The endpoint accepts at most 200.
+# Settlements per page from /portfolio/settlements (scanner.get_settlements:
+# the markets the account held when they paid out); 200 is the endpoint's
+# maximum.
 SETTLEMENT_PAGE_SIZE = 200
 
 # Hard ceiling on pages walked by scanner.py's cursor loops (open events, MVE
@@ -2136,20 +2120,17 @@ CANDLESTICK_MAX_CANDLES_PER_REQUEST = 5000
 # older version is fetched again (version 2 adds the hour's traded volume).
 CANDLESTICK_CACHE_FIELDS_VERSION = 2
 
-# The highest NO ask a candle can carry. historical.fetch_candlesticks stores a
-# candle's NO ask as 1 - its YES bid, held within [0.01, this], so a YES-bid
-# book with no bids reads as a NO ask of exactly this value, just like a real
-# one-cent YES bid. A NO ask at this value is therefore no usable quote
-# (historical.usable_candle_ask): the backtest's open-trade values and sale
-# bids, and live selling's earlier-day checks, never read a price from it.
+# The highest NO ask a candle can carry: historical.fetch_candlesticks stores a
+# candle's NO ask as 1 - its YES bid, held within [0.01, this], so an empty
+# YES-bid book reads as this value, just like a real one-cent YES bid. A NO ask
+# at this value is therefore no usable quote (historical.usable_candle_ask),
+# for the backtest and for live selling alike.
 CANDLE_NO_ASK_CEILING = 0.99
 
 # Seconds historical.recent_candles pauses after each candlestick request.
-# Live selling (seller.plan_sales) reads the last few days of candles of each
-# market of a position it judges (a held market, or a partner that had not yet
-# paid out by a check) once per run, one market at a time, so a short pause
-# keeps those reads well inside the account's read limit (the backtest's own
-# fetch pauses 0.15 s, with several workers at once).
+# Live selling (seller.plan_sales) reads a few days of candles for each market
+# it judges, one market at a time, so a short pause keeps it well inside the
+# account's read limit.
 RECENT_CANDLES_RATE_LIMIT_SLEEP_SECONDS = 0.05
 
 # The backtest's depth model (depth_model.py): a table of how many contracts
@@ -2610,8 +2591,8 @@ def _step_share(value, name: str) -> float:
     Validate a sell level and normalise it onto the SELL_AT_STEP grid.
 
     Normalised with round(SELL_AT_STEP * steps, 2), so a level from any source
-    is float-equal to the same percent over 100 (0.85 for 85%), which is also
-    how config.TAKE_PROFIT_LEVELS spells its levels.
+    is float-equal to its percent over 100 (0.85 for 85%), as
+    TAKE_PROFIT_LEVELS spells its levels.
 
     Args:
         value: The level, a real number in (0, 1].
@@ -2713,13 +2694,11 @@ class LiveSettings:
             reads as.
         sell_at (float | None): The share of its potential profit at which a
             held position is sold, on the SELL_AT_STEP (1%) grid in (0, 1];
-            None (default) never sells, which is also what a saved file that
-            leaves it out reads as.
-        sell_min_days (int | None): The fewest whole days (1 or more, a real
-            int) a position must have left before its last market stops
-            trading to be sold; None (default) sets no minimum, which is also
-            what a saved file that leaves it out reads as. Needs sell_at: a
-            minimum with no sell level is refused.
+            None (default, and a saved file that leaves it out) never sells.
+        sell_min_days (int | None): The fewest whole days (a real int, 1 or
+            more) a position must have left before its last market stops
+            trading to be sold; None (default, and a saved file that leaves
+            it out) sets no minimum. Refused without sell_at.
         origin (str): Where these toggles' defaults were read: the saved defaults
             file with when (and from what) it was saved, or LIVE_DEFAULTS_FROM_CONFIG
             for toggles built from this module's constants (the default).
@@ -2776,8 +2755,8 @@ class LiveSettings:
         if type(self.add_to_held_pairs) is not bool:
             raise ValueError(
                 f"add_to_held_pairs must be True or False, got {self.add_to_held_pairs!r}")
-        # None means never sell; a level is a real number on the 1% grid (a
-        # bool, which Python counts as an int, is refused by _step_share)
+        # None means never sell; _step_share refuses a bool, which Python
+        # counts as an int
         if self.sell_at is not None:
             object.__setattr__(self, "sell_at", _step_share(self.sell_at, "sell_at"))
         if self.sell_min_days is not None:
@@ -2813,12 +2792,11 @@ _TOGGLE_DEFAULTS = {f.name: f.default for f in fields(LiveSettings)
 # The values `python3 -m kalshi_betting.defaults_server --seed` offers for a
 # first save of the live defaults: tier floors off, spread band 0-0.5, k 0.80,
 # a 10% per-trade cap, a 20% same-title cap, any category or tag, and adding
-# to held pairs on; it never sells (sell_at and sell_min_days stay at their
-# defaults). One pair stakes at most 10% of the portfolio value; an
-# add-on to a held pair stakes no more than a new pair would, and keeps the
-# held pair (at today's prices, plus the fees paid for it) and the add-on
-# together within 10% of the portfolio value. Nothing trades on them until
-# they are confirmed and saved to LIVE_DEFAULTS_FILE.
+# to held pairs on; it never sells. One pair stakes at most 10% of the
+# portfolio value; an add-on to a held pair stakes no more than a new pair
+# would, and keeps the held pair (at today's prices, plus the fees paid for
+# it) and the add-on together within 10% of the portfolio value. Nothing
+# trades on them until they are confirmed and saved to LIVE_DEFAULTS_FILE.
 LIVE_DEFAULTS_SEED = LiveSettings(
     tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.80,
     size_cap=0.10, same_title_size_cap=0.20, categories=None, tags=None,
@@ -2979,8 +2957,7 @@ def _saved_settings(record) -> LiveSettings:
     _OPTIONAL_TOGGLES may be left out, and then takes its LiveSettings
     default: off, never sell, no minimum), a spread band of two real numbers
     (LiveSettings would read a JSON true as 1), a sell level and a minimum of
-    days that are not JSON booleans (LiveSettings refuses a bool too; this
-    names the file's field in the message) and printable filter names. LiveSettings
+    days that are not JSON booleans, and printable filter names. LiveSettings
     then validates every value.
 
     Args:
@@ -3080,8 +3057,8 @@ def read_saved_live_defaults() -> LiveSettings | None:
       categories and tags are null (any) or a list of names,
       add_to_held_pairs is true/false or left out, which reads as off,
       sell_at is a share of potential profit on the 1% grid (e.g. 0.85) and
-      sell_min_days a whole number of days, each left out (or null) to read as
-      off, and sell_min_days only with sell_at.
+      sell_min_days a whole number of days (only with sell_at), each null or
+      left out for off.
 
     Refused on top of that: a repeated key, NaN or Infinity, a file over
     LIVE_DEFAULTS_MAX_BYTES, any value LiveSettings rejects, and anything at
@@ -3229,9 +3206,9 @@ def save_live_defaults(settings: LiveSettings, *, source: str) -> LiveSettings:
     directory is flushed too, so the rename survives a power cut. The file is
     then read back from disk and must equal settings (the ten toggles;
     origin is not compared). A toggle in _OPTIONAL_TOGGLES is written only
-    when it is not at its default, so a file with add_to_held_pairs off and
-    selling off holds only the seven other toggles, and code that does not
-    know the optional ones can still read it.
+    when it is not at its default, so a file with all three of them off holds
+    only the seven other toggles, and code that does not know them can still
+    read it.
 
     Args:
         settings (LiveSettings): The new defaults.
@@ -3477,27 +3454,23 @@ def max_kelly_fraction(pair_type: str, settings: LiveSettings) -> float:
 # profit at every daily check. Realized profit is what selling it at the bids
 # would return, after the sale's fees, less what it cost; potential profit is
 # what it pays if it wins (its contract pairs at CONTRACT_PAYOUT_DOLLARS) less
-# what it cost. The backtest decides its sales with take_profit_reached and
-# days_to_maturity (through backtester._sells_at and _days_left), and live
-# selling (seller.plan_sales) decides with them too, so the two can never apply
-# different arithmetic. reached_every_check is the test at every check that
-# seller.plan_sales calls; the backtest applies the same test at each check
-# through backtester._reached_every_day, and a test pins the two equal.
+# what it cost. Live selling (seller.plan_sales) decides with all three
+# functions below, and the backtest with take_profit_reached and
+# days_to_maturity (through backtester._sells_at and _days_left), so the two
+# never apply different arithmetic; a test pins backtester._reached_every_day
+# equal to reached_every_check.
 
 def take_profit_reached(sell_at: float, realized: float, potential: float) -> bool:
     """
     Whether a position has realized at least `sell_at` of its potential profit at one check.
 
-    The sell rule's one test. A position with no potential profit (it cost
-    as much as it can pay, or more) never sells. Otherwise it sells once
-    realized >= sell_at x potential, less PRICE_EPSILON so float noise on a
-    profit sitting exactly on the level still counts as reaching it. For a
-    fixed position the test holds at every level below one at which it holds,
-    since a float product with a positive number never falls as the other
-    factor rises; the backtest's shortcut over many levels relies on that.
-    Called by backtester._sells_at at every daily check, and by
-    seller.plan_sales at each check (to stop at the first one below the
-    level) and through reached_every_check.
+    A position with no potential profit (it cost as much as it can pay, or
+    more) never sells. Otherwise it sells once realized >= sell_at x
+    potential, less PRICE_EPSILON so a profit sitting exactly on the level
+    still counts despite float noise. For a fixed position it holds at every
+    level below one at which it holds (a float product with a positive number
+    never falls as the other factor rises); the backtest's shortcut over many
+    levels relies on that.
 
     Args:
         sell_at (float): The share of potential profit to sell at, in (0, 1].
@@ -3516,15 +3489,10 @@ def reached_every_check(sell_at: float, profits) -> bool:
     """
     Whether a position reached `sell_at` of its potential profit at every daily check.
 
-    take_profit_reached at each check. A position is sold only when it has
-    stayed at its level on every one of the TAKE_PROFIT_HOLD_DAYS checks, so
-    a price that jumps for a moment does not trigger a sale. Like
+    take_profit_reached at each check given (TAKE_PROFIT_HOLD_DAYS of them in
+    a sale), so a price that jumps for a moment does not trigger a sale. Like
     take_profit_reached, it holds at every level below one at which it holds.
-    With no checks at all it is False: a position that was never valued has
-    shown nothing, so it is not sold. seller.plan_sales decides each live
-    sale with it. The backtest applies the same test at each check through
-    backtester._reached_every_day (which calls take_profit_reached through
-    backtester._sells_at and is never handed an empty list).
+    With no checks it is False: a position never valued is not sold.
 
     Args:
         sell_at (float): The share of potential profit to sell at, in (0, 1].
@@ -3544,18 +3512,16 @@ def days_to_maturity(close_dates, day: date) -> int | None:
     """
     Days from `day` to the date a position's last market stops trading: its days to maturity.
 
-    A position matures when the last of its markets closes, so this is the
-    latest of its markets' close dates less `day`, in whole calendar days. It
-    is 0 when the last market closes on `day` itself, and negative when it
-    closed before (a market that has stopped trading but not yet paid out).
-    The sell rule's optional minimum of days reads it: a position nearer to
-    maturity than the minimum is not sold. The backtest reads it through
-    backtester._days_left (close dates from its trades); seller.plan_sales
-    reads it with each held market's scheduled close date. Every argument is
-    a calendar date: a datetime (a close_time, say) is refused, because the
-    difference of two datetimes counts whole 24-hour spans, which can be a
-    day short of the calendar days between their dates. Turn a Kalshi
-    timestamp into its UTC date first.
+    The latest of the markets' close dates less `day`, in whole calendar
+    days: 0 when the last market closes on `day`, negative when it closed
+    before (stopped trading but not yet paid out). The sell rule's optional
+    minimum of days reads it: a position nearer to maturity than the minimum
+    is not sold.
+
+    Every argument is a calendar date: a datetime (a close_time, say) is
+    refused, because the difference of two datetimes counts whole 24-hour
+    spans, which can be a day short of the calendar days between their dates.
+    Turn a Kalshi timestamp into its UTC date first.
 
     Args:
         close_dates: The close date (a datetime.date) of every market in the
@@ -3565,8 +3531,7 @@ def days_to_maturity(close_dates, day: date) -> int | None:
 
     Returns:
         int | None: The days left; None when there are no close dates or any
-            of them is unknown, since a position whose maturity cannot be
-            read is never sold under a minimum.
+            is unknown (such a position is never sold under a minimum).
 
     Raises:
         TypeError: When `day` or a close date is a datetime rather than a
@@ -3851,9 +3816,9 @@ def live_settings_argv(settings: LiveSettings) -> list[str]:
     --tag=NAME, so a name that begins with "-" still reads as a name; no
     filter is written as --any-category or --any-tag. Adding to held pairs is
     written either way (--add-to-held-pairs / --no-add-to-held-pairs), so a
-    saved value never decides it. The sell level is written as a whole percent
-    (--sell-at=85) or --no-sell, and the minimum of days as --sell-min-days=N
-    or --no-sell-min-days, for the same reason.
+    saved value never decides it. The sell level (--sell-at=85 / --no-sell)
+    and its minimum of days (--sell-min-days=N / --no-sell-min-days) are
+    written either way too.
 
     Args:
         settings (LiveSettings): The settings to spell.

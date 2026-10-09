@@ -49,14 +49,11 @@ Dependencies:
     rejected; backtester.py carries it to the dashboard header and reports
     the counts on its own prefilter line); and SettledCorpusError, which
     walking a SettledCorpus raises when its file cannot be read.
-    And the candle bid rule a sale reads: usable_candle_ask, which
-    backtester.py reads the asks that value an open leg through (its
-    _usable_ask, in _leg_quotes); candle_sale_bids, which backtester.py
-    records its sale bids with; and bid_before, which reads one side's bid at
-    one moment the same way, for live selling's checks on the days before a
-    sale (seller.plan_sales); and recent_candles, which fetches a market's
-    last few days of candles for those checks, parsed as fetch_candlesticks
-    parses them but never read from or written to the candle cache.
+    And the candle bid rule a sale reads: usable_candle_ask and
+    candle_sale_bids (read by backtester.py's _usable_ask and _leg_quotes);
+    bid_before, which seller.plan_sales reads an earlier day's bid with; and
+    recent_candles, which fetches a market's recent candles for it and never
+    reads or writes the candle cache.
 
 Notes:
     Historical market data only exists on the production API — the sandbox does
@@ -5884,8 +5881,7 @@ def _fetch_candle_pages(client: Any, path: str, windows: list[tuple[int, int]],
                     dropped += 1
                     continue
                 # NO ask ≈ 1 - YES bid (binary market complement); clamp to
-                # avoid 0 or 1. The top is CANDLE_NO_ASK_CEILING, the value
-                # usable_candle_ask refuses as no quote
+                # avoid 0 or 1 (usable_candle_ask reads the top as no quote)
                 no_ask = 1.0 - yes_bid
                 candles.append({
                     "ts": c["end_period_ts"],
@@ -5912,19 +5908,15 @@ def _fetch_candles_from_endpoints(client: Any, endpoints: list[tuple[str, str]],
     """
     Fetch one market's candle window from the first endpoint that holds it.
 
-    The endpoints are asked in order (_candle_endpoints). A 404 means that
-    endpoint does not hold the market (the archive cutoff sits on the other
-    side of its settlement), so the next one is asked for the whole window;
-    any other failure, or a 404 from the last endpoint, is final. Each
-    endpoint's window is all-or-nothing (_fetch_candle_pages), so pages one
-    endpoint did serve are never joined to another's. fetch_candlesticks
-    (the backtest, cached) and recent_candles (live selling, never cached)
-    both fetch through it.
+    On a 404 the next endpoint is asked for the whole window. An endpoint
+    serves the whole window or nothing (_fetch_candle_pages), so one
+    endpoint's pages are never joined to another's. fetch_candlesticks
+    (cached) and recent_candles (never cached) both fetch through it.
 
     Args:
         client (Any): Authenticated KalshiClient.
-        endpoints (list[tuple[str, str]]): (name, path) pairs to ask, first
-            to ask first (_candle_endpoints).
+        endpoints (list[tuple[str, str]]): (name, path) pairs, first to ask
+            first (_candle_endpoints).
         windows (list[tuple[int, int]]): The window's requests (_candle_request_windows).
         rate_limit_sleep (float): Seconds to sleep after each request; a
             failed request that moves on to the next endpoint sleeps once too.
@@ -5938,9 +5930,8 @@ def _fetch_candles_from_endpoints(client: Any, endpoints: list[tuple[str, str]],
             endpoint that served the window.
 
     Raises:
-        Exception: What the failed request raised: a failure other than a
-            404, or the last endpoint's 404 (an ApiException carries
-            .status).
+        Exception: What the failed request raised: any failure but a 404,
+            or the last endpoint's 404 (an ApiException carries .status).
         ValueError: When there is no endpoint to ask.
     """
     for attempt, (name, path) in enumerate(endpoints):
@@ -6151,21 +6142,14 @@ def recent_candles(client: Any, ticker: str, event_ticker: str, start_ts: int,
     """
     Fetch one market's hourly candles over [start_ts, end_ts] for a live run, never cached.
 
-    Live selling (seller.plan_sales) checks a held position on the days
-    before a sale from each of its markets' recent candles (bid_before reads
-    them). They are fetched and parsed exactly as fetch_candlesticks fetches
-    and parses them: the live candlestick endpoint first (the market is still
-    open, or settled after the archive cutoff), then the archive on a 404
-    (_candle_endpoints, _fetch_candles_from_endpoints), with a window too
-    long for one request paged (_candle_request_windows), each request a
-    retried read-only GET, and each candle parsed by _fetch_candle_pages.
-    Unlike fetch_candlesticks it never reads or writes the candle cache: a
-    live sale's candle reads touch nothing under backtest_cache/, and its
-    candles must be the latest the exchange has.
-
-    Hourly candles are sparse: many hours of a quiet market have no candle
-    at all, so a gap is normal. A candle that cannot be parsed is left out,
-    with one WARNING naming the count, as fetch_candlesticks does.
+    seller.plan_sales reads a held position's earlier days from these
+    candles (through bid_before). They are fetched and parsed by the
+    helpers fetch_candlesticks uses (here the live endpoint first, the archive
+    on a 404, a long window paged, each request a retried read-only GET),
+    but the candle cache is never read or written: a live sale gets the
+    exchange's latest candles and touches nothing under backtest_cache/. A
+    quiet market has hours with no candle, so gaps are normal; a candle that
+    cannot be parsed is left out, with one WARNING naming the count.
 
     Args:
         client (Any): An authenticated KalshiClient for the production API.
@@ -6206,10 +6190,9 @@ def recent_candles(client: Any, ticker: str, event_ticker: str, start_ts: int,
         return None
     if dropped:
         logging.warning("%s: dropped %d/%d malformed candles", ticker, dropped, raw_count)
-    # The shared parser copies each candle's end time as sent; bid_before
-    # compares it with a moment, so an end time that is not an integer
-    # number of seconds (null, a string) would raise there. Such a reply
-    # cannot place the market's earlier days, so it is not used at all.
+    # bid_before compares each end time (copied as sent) with a moment, so
+    # one that is not an integer (null, a string) would raise there; such a
+    # reply cannot place the earlier days, so none of it is used.
     unplaced = sum(1 for c in candles
                    if not isinstance(c["ts"], int) or isinstance(c["ts"], bool))
     if unplaced:
@@ -6222,31 +6205,25 @@ def recent_candles(client: Any, ticker: str, event_ticker: str, start_ts: int,
 
 # ─── What a sale would fetch, read from candles ───────────────────────────────
 #
-# A candle carries each side's ASK at the end of its hour (fetch_candlesticks:
-# "yes_ask_close", and "no_ask_close", which is 1 - the YES bid). Selling a
-# side fetches that side's BID, and a YES bid is the price someone offers for
-# YES, which is 1 - the NO ask (and a NO bid 1 - the YES ask). The backtest
-# reads its bids this way (backtester._leg_quotes), and live selling
-# (seller.plan_sales) reads the days before a sale from recent candles with the
-# same functions. The highest NO ask a candle can carry, which is no quote, is
-# config.CANDLE_NO_ASK_CEILING, the value fetch_candlesticks clamps to.
+# A candle carries each side's ASK at the end of its hour ("yes_ask_close",
+# and "no_ask_close", which is 1 - the YES bid). Selling a side fetches its
+# BID, the best price someone offers for it: the YES bid is 1 - the NO ask,
+# the NO bid 1 - the YES ask. The backtest (backtester._leg_quotes) and live
+# selling (seller.plan_sales) both read bids through the functions below.
 
 
 def usable_candle_ask(raw: Any, side: str) -> float:
     """
     Read one candle close as an ask that can value or sell a leg, or NaN.
 
-    An ask is usable when it reads as a number strictly between 0 and 1 —
-    the rule live applies to a held pair's ask (scanner._held_leg_worth) —
-    so a sub-cent ask on a fine grid counts, while a YES ask of 1.00 (no one
-    offering YES) does not. A NO ask must also be below
-    CANDLE_NO_ASK_CEILING: the candle stores the NO ask as 1 - the YES bid,
-    clamped to that ceiling at most, so the ceiling is also what a YES-bid
-    book with no bids reads as. Each bound is held PRICE_EPSILON inside, so
-    float noise on a price sitting on a bound reads as that bound. The
-    backtest reads the asks that value an open leg through it
-    (backtester._usable_ask, in _leg_quotes), and candle_sale_bids reads both
-    asks of a candle through it.
+    Usable means a number strictly between 0 and 1, as live reads a held
+    pair's ask (scanner._held_leg_worth): a sub-cent ask counts, a YES ask of
+    1.00 (no one offering YES) does not. A NO ask must also be below
+    CANDLE_NO_ASK_CEILING, the cap fetch_candlesticks puts on the stored NO
+    ask (1 - the YES bid), so the cap is also what an empty YES-bid book
+    reads as. Each bound is held PRICE_EPSILON inside, so float noise on a
+    bound reads as the bound. backtester._usable_ask and candle_sale_bids
+    read asks through it.
 
     Args:
         raw: A candle's "yes_ask_close" or "no_ask_close" (normally a float).
@@ -6268,12 +6245,11 @@ def candle_sale_bids(candle: dict) -> tuple[float, float]:
     """
     What selling one contract of each side would fetch on one candle: (YES bid, NO bid).
 
-    The YES bid is 1 - the candle's usable NO ask and the NO bid is 1 - its
+    The YES bid is 1 - the candle's usable NO ask and the NO bid 1 - its
     usable YES ask (usable_candle_ask), each rounded to six decimals so float
-    noise (1 - 0.43 is 0.5700000000000001) never reaches a price. An
-    unusable ask leaves NaN on the other side: that side has no bid there.
-    The backtest records its sale bids with it (backtester._leg_quotes), and
-    bid_before reads a recent candle with it.
+    noise (1 - 0.43 is 0.5700000000000001) never reaches a price; an unusable
+    ask leaves NaN (no bid) on the other side. backtester._leg_quotes and
+    bid_before read bids with it.
 
     Args:
         candle (dict): One candle, as fetch_candlesticks returns it
@@ -6290,19 +6266,15 @@ def bid_before(candles: list[dict], moment: int, side: str, *, window: int) -> f
     """
     One side's bid from the last candle that ended at or before `moment`, if it is recent enough.
 
-    The sell rule checks a position once a day before it sells, and an
-    earlier day's check reads that day's last quote: the latest candle that
-    ended at or before the check and less than `window` seconds before it
-    (the backtest's daily checks use one day, so a candle exactly 24 hours
-    old belongs to the check before). An older quote is never carried
-    forward. The candle is found the way the backtest finds one
-    (backtester._candles_at_or_before for one moment): stepping through the
-    candles in their own order and stopping at the first that ends after
-    `moment`, the answer being the one before it. So for candles in time
-    order it is the latest candle at or before `moment`. Whether the market
-    had paid out by then is not read here; the caller handles a payout.
-    seller.plan_sales reads the days before a live sale from each market's
-    recent candles (recent_candles) with it.
+    The sell rule checks a position once a day before it sells; an earlier
+    day's check reads that day's last quote: the latest candle that ended at
+    or before the check and less than `window` seconds before it (one day for
+    the daily checks, so a candle exactly 24 hours old belongs to the check
+    before). An older quote is never carried forward. Like
+    backtester._candles_at_or_before, it steps through the candles in their
+    own order and takes the one before the first that ends after `moment`.
+    A payout is not read here; the caller handles it. seller.plan_sales
+    reads a live sale's earlier days with it, from recent_candles.
 
     Args:
         candles (list[dict]): One market's candles, each with "ts" (the end
@@ -6326,8 +6298,7 @@ def bid_before(candles: list[dict], moment: int, side: str, *, window: int) -> f
         index = 1
     else:
         raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
-    # Step forward to the first candle that ends after the moment; the one
-    # just before it is the latest at or before the moment
+    # Step to the first candle that ends after the moment; use the one before it
     i = 0
     while i < len(candles) and candles[i]["ts"] <= moment:
         i += 1

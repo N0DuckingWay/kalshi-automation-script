@@ -8,22 +8,22 @@ Purpose:
     (config.LIVE_DEFAULTS_FILE, live_defaults.json), which every live run
     starts from, and starts live trading runs with them. Run by a person,
     deliberately, from a terminal, through the launcher at the checkout's
-    root (./start_dashboard.sh [--seed] [--no-browser], which first checks
-    that its Python can import the live bot and the live dashboard, then
-    starts the live dashboard and this server in the background, passing
-    this server --no-browser when the live dashboard opens the page) or
-    directly:
+    root (./start_dashboard.sh [--seed] [--no-browser], which checks that its
+    Python can import the live bot and the live dashboard, then starts the
+    live dashboard and this server in the background, this one with
+    --no-browser when the live dashboard opens the page) or directly:
 
         python3 -m kalshi_betting.defaults_server [--seed] [--no-browser]
 
     On start it opens one page (none with --no-browser): with --seed the
     confirmation page proposing the seed values; otherwise the backtest
     dashboard, or its own index when there is no dashboard, the dashboard
-    was built before its Save and Trade buttons, or it cannot be read. When its port is already taken by this
-    checkout's own server, running this checkout's current code, it opens
-    that page from the running server and exits, starting nothing; when the
-    port is held by that server running older code, by another checkout's
-    server, or by anything else, it refuses (exit 2).
+    was built before its Save and Trade buttons, or it cannot be read. When
+    its port is already taken by this checkout's own server, running this
+    checkout's current code, it opens that page from the running server and
+    exits, starting nothing; when the port is held by that server running
+    older code, by another checkout's server, or by anything else, it
+    refuses (exit 2).
 
     Its pages:
       - /confirm, opened with the proposed settings in its address (by the
@@ -222,8 +222,7 @@ _MAX_FIELDS = 20
 # A plain decimal number in ASCII digits: no underscores, spaces, digits of
 # other scripts, "nan" or "inf"
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", re.ASCII)
-# A whole number of days in ASCII digits: no sign, spaces or digits of other
-# scripts, and at most six of them (no real minimum of days is longer)
+# A whole number of days: one to six ASCII digits, with no sign or spaces
 _WHOLE_NUMBER = re.compile(r"\d{1,6}", re.ASCII)
 # A token or fingerprint: 64 lower-case hex digits (a SHA-256 hex digest)
 _HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
@@ -779,8 +778,7 @@ def _whole_number(text: str, name: str) -> int:
         int: The number.
 
     Raises:
-        ValueError: If the value is not one to six ASCII digits (no sign, no
-            spaces, no digits of other scripts).
+        ValueError: If the value is not one to six ASCII digits.
     """
     if not _WHOLE_NUMBER.fullmatch(text):
         raise ValueError(f"{name} must be a whole number of at most six digits, got {text!r}")
@@ -817,23 +815,21 @@ def _proposal(params: dict[str, list[str]],
     tier_floors ("on" / "off"), spread_min, spread_max, k and size_cap (a
     fraction, e.g. 0.2) are required. same_title_size_cap,
     add_to_held_pairs ("on" / "off"), sell_at ("off" or a share in (0, 1],
-    e.g. 0.85) and sell_min_days ("off" or a whole number of days) may be left
-    out, and each then keeps the saved value (or the seed's when none is
-    saved); they are the only fields that fall back to what is saved, so a
-    link that leaves one out keeps it as it is (the dashboard's save button
-    leaves the same-title cap out when its run recorded none, and the
-    add-to-held choice, or the sell level and minimum of days, out on a page
-    that does not show it). One exception: a
-    link carrying the seed's note that leaves add_to_held_pairs, sell_at or
-    sell_min_days out takes the seed's value, so it still proposes exactly the
-    seed, and the page shows the change against what is saved. A minimum of
-    days left over with no sell level (sell_at off, given or kept) is refused
-    by LiveSettings, and the page shows why. A missing category or tag means
-    any, whatever is saved; a tag needs its category. source is the note the
-    saved file will keep: left out, it is empty; given, it must be one of the
-    two shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, with ASCII digits
-    only, and the seed's note (LIVE_DEFAULTS_SEED_SOURCE) may label only the
-    seed values themselves.
+    e.g. 0.85) and sell_min_days ("off" or a whole number of days) are the
+    only fields that fall back to what is saved: one left out keeps the
+    saved value, or the seed's when none is saved (the dashboard's save
+    button leaves out the add-to-held choice, or the sell level and minimum
+    of days, on a page without that view, and the same-title cap when its
+    run recorded none). A link carrying the seed's note that leaves out
+    add_to_held_pairs, sell_at or sell_min_days takes the seed's value, so
+    it still proposes exactly the seed. A minimum of days with no sell
+    level is refused by LiveSettings, and the page shows why. A missing
+    category or tag means any, whatever is saved; a tag needs its
+    category. source is the note the saved file will keep: left out, it is
+    empty; given, it must be one of the two shapes
+    config.LIVE_DEFAULTS_SOURCE_PATTERN allows, with ASCII digits only, and
+    the seed's note (LIVE_DEFAULTS_SEED_SOURCE) may label only the seed
+    values themselves.
 
     Args:
         params (dict[str, list[str]]): The request's fields (_params).
@@ -879,9 +875,7 @@ def _proposal(params: dict[str, list[str]],
                              f"{value['add_to_held_pairs']!r}")
         add_on = value["add_to_held_pairs"] == "on"
     else:
-        # The saved value; with no defaults saved, or on a seed link, the
-        # seed's, so a seed link that leaves the field out still proposes
-        # exactly the seed
+        # Left out: the saved value, or the seed's (see _kept)
         add_on = _kept("add_to_held_pairs", current, source)
     # "off" is never selling, or no minimum of days; a field left out falls
     # back the same way
@@ -934,10 +928,9 @@ def _seed_query() -> str:
     Build the confirmation page's query that proposes LIVE_DEFAULTS_SEED.
 
     Each number is written as its repr (the exact float), adding to held
-    pairs as on or off, the sell level and the minimum of days as off or their
-    value (the seed sells nothing, so both are off), the source note is
-    LIVE_DEFAULTS_SEED_SOURCE, and a category or tag is added only when the
-    seed sets one (it sets none: any).
+    pairs as on or off, the sell level and the minimum of days as off or
+    their value, the source note is LIVE_DEFAULTS_SEED_SOURCE, and a
+    category or tag is added only when the seed sets one (it sets none: any).
 
     Returns:
         str: The query string, without the "?".
@@ -1517,7 +1510,7 @@ def _read_result(folder: Path) -> _Result:
     bool dry_run and an int or null exit_code; otherwise it is "unreadable".
     Every other field is kept only when it has its type (a pair's and a
     sale's fields too), so a hand-edited or damaged file never breaks a page.
-    A result written before sales were recorded reads as one with no sales.
+    A result with no list of sales reads as one with no sales.
 
     Args:
         folder (Path): The run's folder.
@@ -1771,10 +1764,9 @@ def _folder_last_run(folder: Path, process: subprocess.Popen | None) -> _LastRun
     refused, and one that stopped before it could send an order
     (_NO_ORDER_EXITS, or an error before its first order). Of the rest, a pair
     or a sale left for a person, or exit EXIT_TRADES_NEED_ATTENTION, is
-    "attention"; a
-    run with no readable result, stopped by a signal, stopped by an error
-    while or after sending orders, or ended with any other code but a clean
-    one, is "unclean"; a clean exit (_CLEAN_EXITS) is "clean".
+    "attention"; a run with no readable result, stopped by a signal, stopped
+    by an error while or after sending orders, or ended with any other code
+    but a clean one, is "unclean"; a clean exit (_CLEAN_EXITS) is "clean".
 
     Args:
         folder (Path): The run's folder (named like a run's).
@@ -2220,9 +2212,9 @@ def _run_html(run: _Run) -> str:
                      f"{_money(record['balance_after'])}</p>")
     if record.get("portfolio_value_before") is not None:
         # Cash plus open positions, read before trading: what the run sizes on
-        # (worded so it also fits a run that stopped at the minimum). A run
-        # that sold sizes its buys on what the sales left, so for it this is
-        # only the value it started from
+        # (worded so it also fits a run that stopped at the minimum); a run
+        # that sold sizes its buys on what the sales left, so for a run with
+        # sales this is the value before them
         parts.append(f"<p>Portfolio value {_money(record['portfolio_value_before'])} "
                      f"(cash {_money(record.get('balance_before'))}) — "
                      + ("before the sales" if record.get("sales")

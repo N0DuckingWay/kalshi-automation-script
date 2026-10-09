@@ -9,10 +9,9 @@ Purpose:
     A dev run writes a new timestamped file with two sheets: the simulated
     trades and every candidate pair found.
 
-    A production run that sells held positions (the take-profit rule,
-    seller.py and trader.sell_positions) adds its sales to the same log, with
-    a banner row of their own, before it buys anything: one row per position,
-    under the same columns as a trade.
+    A production run that sells held positions (seller.py,
+    trader.sell_positions) first writes its sales to the same log, under a
+    banner row of their own: one row per position, in the trade columns.
 
     It also writes the run result of a production run started with
     `main.py --result-file`: a RunReport that main.py fills in as the run goes
@@ -31,20 +30,20 @@ Dependencies:
     count of an add-on exactly), fee_leg_exact (the fee on a sale, for a sale
     row's Notes) and the run result's constants (LIVE_RUN_RESULT_FORMAT,
     RUN_REPORT_MAX_WARNINGS, RUN_REPORT_LINE_MAX_CHARS) from config.py.
-    Exports the TradeResult and SaleResult dataclasses (built by trader.py: a
-    pair's trade, and a held position's sale), the two public write
+    Exports the TradeResult and SaleResult dataclasses (built by trader.py
+    for a pair's trade and a held position's sale), the two public write
     functions, and the run result's RunReport, TradeRecord, LegRecord,
     SaleRecord, SaleLegRecord, RunReportHandler, trade_record, report_trades,
     sale_record, report_sales and write_run_report (all consumed by main.py).
-    A sale's plan (seller.SalePlan) is read by its attributes only; seller.py
-    is never imported here. The trade log it writes (PROD_LOG_PATH, and the
-    fallback copies _write_fallback_log puts beside it) is read back by
-    live_portfolio.py, the live dashboard's Live trading tab, which finds
-    the bot's purchases in it, and tells a sale row from a purchase by the
-    start of its Notes ("[sale: "): it looks PROD_LOG_PATH up when it reads,
-    and matches the fallback copies' name pattern, the columns it reads and
-    that Notes start, so those change only together with live_portfolio's
-    _FALLBACK_LOG, _LOG_HEADERS and _SALE_NOTE.
+    Reads a seller.SalePlan by its attributes only; never imports seller.py.
+    The trade log it writes (PROD_LOG_PATH, and the fallback copies
+    _write_fallback_log puts beside it) is read back by live_portfolio.py,
+    the live dashboard's Live trading tab, which finds the bot's purchases in
+    it and tells a sale row from a purchase by its Notes start ("[sale: ").
+    live_portfolio looks PROD_LOG_PATH up when it reads, and matches the
+    fallback copies' name pattern, the columns it reads and that Notes start,
+    so those change only together with its _FALLBACK_LOG, _LOG_HEADERS and
+    _SALE_NOTE.
 
 Notes:
     The TradeResult dataclass is defined here (not in trader.py) because reporter.py
@@ -80,24 +79,14 @@ Notes:
     flag moved away from the saved live defaults, ending " | defaults:
     <origin>" (which saved file, when and from what it was saved).
 
-    A sale row fills the trade columns this way: Market A/B and Ticker A/B are
-    the position's markets (a lone held market's paid-out partner is market B,
-    named "(paid out)"), the deadlines are the held markets' close times, pA
-    and pB are the average bids the sale was priced at (blank for a paid-out
-    partner), nA is blank, x and y are the contracts sold on each market,
-    the cost is what the whole position cost, "Profit if won" is the profit
-    selling it realizes at those bids (with a paid-out partner's payout) and
-    the ratio is that profit over the cost, both left blank unless the whole
-    position sold (or, in a dry run, would have). Its Status is a plain word
-    (_SALE_STATUS_WORDS) and its Notes start "[sale: YES A / NO B, 84% of
-    potential profit (level 80%), 9 days left, fees=$0.42] ".
+    A sale row fills the same 18 columns; _sale_to_row says how.
 
     Neither filling nor writing a run result may stop a run or change its exit
     code: report_trades and report_sales never raise (a pair or sale they
     cannot describe is logged and kept as a record of what could be read),
     and write_run_report catches every error, since main() calls it in a
-    finally. The result is replaced
-    whole (a staging file renamed over it), and is strict JSON.
+    finally. The result is replaced whole (a staging file renamed over it),
+    and is strict JSON.
     RunReportHandler keeps every ERROR and CRITICAL line whole, since those
     are the lines a person has to act on; only WARNING lines are cut and
     capped.
@@ -235,32 +224,28 @@ class SaleResult:
     Attributes:
         plan (Any): The seller.SalePlan that was sold or simulated.
         status (str): What happened.
-            "sold": every contract held on each of its held markets sold.
+            "sold": every contract of every held market sold.
             "partly_sold": some sold; for a pair, the same count on each
                 market, so the rest is still an exact pair.
-            "not_sold": nothing sold, or nothing was sent (error says which);
-                in a dry run too, for a plan whose orders cannot be built.
+            "not_sold": nothing sold or nothing was sent (error says which),
+                also in a dry run for a plan whose orders cannot be built.
             "unbalanced": a pair's second order sold fewer contracts than its
-                first, so the two markets no longer hold the same count.
+                first, so the two markets now hold different counts.
             "manual_review": how many contracts an order sold could not be
                 known, so no further order was sent for the position.
             "simulated": dry run; nothing was sent.
         sold (dict[str, int]): Held ticker -> contracts known to be sold
-            there (0 for a market whose order filled nothing or was not
-            sent). A market whose sale could not be known is left out, and
-            the dict is empty when the plan could not be used as written (a
-            held market's count, side, walked bid or ladder unreadable) or an
-            unexpected error stopped its sale. A dry run lists every held
-            market's full count.
+            there (0 when its order filled nothing or was not sent). A market
+            whose count is unknown is left out; the dict is empty when the
+            plan could not be used as written or an unexpected error stopped
+            the sale. A dry run lists every held market's full count.
         error (str | None): What went wrong or was left over; None for
             "sold" and "simulated".
-        decided_by_account (bool): True when the reply of at least one of
-            its orders did not say how many contracts it sold (the POST
-            raised, or the reply had no usable fill count), so the account's
-            position was read to find out (trader._sell_leg). A lagging
-            ledger can show fewer sold than really were, so main._run_prod
-            reads the positions back after such a sale and checks the count.
-            False for a dry run and when every reply said.
+        decided_by_account (bool): True when an order's POST raised or its
+            reply did not say how many contracts it sold, so the account's
+            position was read instead (trader._sell_leg). Such a reading can
+            lag and show fewer sold than really were, so main._run_prod reads
+            the positions back to check the count.
     """
     plan: Any
     status: str            # "sold" | "partly_sold" | "not_sold" | "unbalanced" | "manual_review" | "simulated"
@@ -407,16 +392,15 @@ def _sale_leg_cells(leg: Any, plan: Any, sold: dict) -> list:
     The five trade-log cells one market of a sold position fills.
 
     Args:
-        leg (Any): One of the plan's markets (a seller.SaleLeg): held now
-            (it has a market) or a paid-out partner (its market is None).
+        leg (Any): A seller.SaleLeg: a held market, or a paid-out partner
+            (its market is None).
         plan (Any): The seller.SalePlan.
-        sold (dict): SaleResult.sold: held ticker -> contracts known to be sold.
+        sold (dict): SaleResult.sold.
 
     Returns:
-        list: [market, ticker, deadline, average bid sold at, contracts sold]
-            for a held market (the count blank when it is not known); for a
-            paid-out partner, PAID_OUT_MARKET ("(paid out)") and its ticker,
-            the rest blank.
+        list: [market, ticker, deadline, average bid, contracts sold] for a
+            held market (the count blank when unknown); for a paid-out
+            partner, PAID_OUT_MARKET and its ticker, the rest blank.
     """
     if leg.market is None:
         return [PAID_OUT_MARKET, leg.ticker, "", "", ""]
@@ -432,20 +416,18 @@ def _sale_to_row(sale: SaleResult, run_ts: datetime) -> list:
     """
     Serialize one position's sale to a flat list matching the _TRADE_COLUMNS column order.
 
-    The position's markets fill the A and B columns in the plan's order (its
-    held markets in ticker order, then a lone held market's paid-out
-    partner). pA/pB hold the average bid each held market was priced to sell
-    at (SalePlan.walked), nA is blank, x/y hold the contracts sold on each
-    market (SaleResult.sold), the cost is what the whole position cost,
-    "Profit if won" is the profit selling it realizes at those bids (with a
-    paid-out partner's payout: SalePlan.profits at the check now) and the
-    ratio is that profit over the cost. Those are the plan's figures, so they
-    are filled in only when the whole position sold ("sold"), or would have
-    in a dry run ("simulated"), and left blank for any other status; the
-    Status says how much really sold. The Notes start "[sale: YES A / NO B,
-    84% of potential profit (level 80%), 9 days left, fees=$0.42] ", the fees
-    being the taker fee on each held market's sale at its average bid, and
-    end with the sale's error (if any).
+    Markets A and B are the plan's markets in its order (held markets by
+    ticker, then a lone held market's paid-out partner, shown as "(paid
+    out)"). pA/pB are the average bids each held market was priced to sell
+    at, nA is blank, x/y are the contracts sold, and the cost is what the
+    whole position cost. "Profit if won" is the profit selling it realizes
+    at those bids, a paid-out partner's payout included (SalePlan.profits[0],
+    the reading taken now), and the ratio is that profit over the cost. Both
+    are the plan's figures, so they are filled in only for "sold" and
+    "simulated"; the Status says how much really sold. Notes start "[sale:
+    YES A / NO B, 84% of potential profit (level 80%), 9 days left,
+    fees=$0.42] " (the planned taker fee on each held market's whole sale,
+    whatever really sold) and end with the sale's error, if any.
 
     Args:
         sale (SaleResult): The sale, from trader.sell_positions.
@@ -461,8 +443,8 @@ def _sale_to_row(sale: SaleResult, run_ts: datetime) -> list:
     cells_b = _sale_leg_cells(legs[1], plan, sold) if len(legs) > 1 else [""] * 5
     # The side held on each market: market A first, then market B
     sides = " / ".join(f"{leg.side.upper()} {'AB'[i]}" for i, leg in enumerate(legs[:2]))
-    # The sale's fees as planned. Cross-module: config.fee_leg_exact, the one
-    # fee rule, on each held market's sale at its average bid
+    # Cross-module: config.fee_leg_exact, the one fee rule, on each held
+    # market's sale at its average bid
     fees = sum(fee_leg_exact(plan.count, plan.walked[leg.ticker][0])
                for leg in legs if leg.market is not None)
     realized, potential = plan.profits[0]
@@ -795,11 +777,10 @@ def append_to_prod_log(results: list, balance_before: float, balance_after: floa
 
     Creates the file with a header row the first time. Each call adds a
     banner row, then one colour-coded row per sale (_sale_to_row) and per
-    trade. A production run that sells writes its sales in a call of their
-    own, as soon as they are done and before it buys anything, so a sale is on
-    record however the run ends. A lock stops two runs writing at once; if it
-    cannot be taken in time, the rows go to a separate timestamped file
-    instead, so they are never lost.
+    trade. A run that sells writes its sales in a call of their own, before
+    it buys anything, so they are on record however the run ends. A lock
+    stops two runs writing at once; if it cannot be taken in time, the rows
+    go to a separate timestamped file instead, so they are never lost.
 
     Args:
         results (list): TradeResult objects from trader.execute_trades(); may be empty.
@@ -1036,8 +1017,7 @@ class SaleLegRecord:
         side (str | None): "yes" or "no", the side held there.
         held (int | None): The contracts held there when the sale was planned.
         sold (int | None): The contracts known to be sold there; None when
-            that could not be known (SaleResult.sold leaves it out). A dry
-            run records the whole count, as if it sold.
+            unknown. A dry run records the whole count, as if it sold.
         price (float | None): The average bid the sale was priced at
             (SalePlan.walked), in dollars; None when not a finite number.
     """
@@ -1054,30 +1034,26 @@ class SaleRecord:
     One held position's sale as a run result records it.
 
     The money figures are the plan's, at the bids the sale was priced at;
-    status says how much really sold, and the profit is given only when all
-    of it did.
+    status says how much really sold.
 
     Attributes:
         title (str | None): The position's title (SalePlan.title).
-        status (str): The sale's status ("sold", "partly_sold", "not_sold",
-            "unbalanced", "manual_review" or "simulated"; see SaleResult),
-            or "unknown" when it could not be read.
+        status (str): The SaleResult status, or "unknown" when it could not
+            be read.
         level (float | None): The share of potential profit it was sold at
             (LiveSettings.sell_at, e.g. 0.8).
         days_left (int | None): Days before its last held market stops trading.
         cost (float | None): What the whole position cost, fees included, in dollars.
-        proceeds (float | None): What selling all of its held markets
-            returns at those bids, after the sale's fees, in dollars, as
-            planned (whatever really sold).
-        profit (float | None): The profit the sale realized: those
-            proceeds, plus a paid-out partner's payout, less the cost. None
-            unless the whole position sold ("sold"), or would have in a dry
-            run ("simulated").
+        proceeds (float | None): What selling every held market returns at
+            those bids after the sale's fees, in dollars, whatever really sold.
+        profit (float | None): Those proceeds plus a paid-out partner's
+            payout, less the cost, in dollars; None unless the status is
+            "sold" or "simulated".
         realized_percent (float | None): The profit selling all of it at
             those bids realizes, as a share of its potential profit, in
             percent (e.g. 84.0): what the take-profit rule checked.
-        legs (tuple[SaleLegRecord, ...]): Its held markets, in the plan's order
-            (a paid-out partner has nothing to sell and is left out).
+        legs (tuple[SaleLegRecord, ...]): Its held markets, in the plan's
+            order (a paid-out partner has nothing to sell and is left out).
         error (str | None): The trader's one-line error, if any.
     """
     title: str | None
@@ -1120,10 +1096,10 @@ class RunReport:
         sales (list[SaleRecord]): One per held position sold, tried or
             simulated, in order; filled in when the sales end, before any buying.
         cash_after_sales (float | None): Cash on all shards after the sales,
-            in dollars: in a live run, read back from Kalshi when anything
-            sold, else the cash read at the start of the run; in a dry run, an
-            estimate: that cash plus each sale's estimated proceeds. None when
-            no sale was tried, or the cash could not be read after the sales.
+            in dollars: in a live run, read back from Kalshi when the run
+            reads its account again, else the starting cash; in a dry run,
+            the starting cash plus each sale's estimated proceeds. None when
+            no sale was tried or the cash could not be read after them.
     """
     dry_run: bool
     started_at: datetime
@@ -1361,17 +1337,12 @@ def sale_record(sale: SaleResult) -> SaleRecord:
         sale (SaleResult): The trader's result for one position.
 
     Returns:
-        SaleRecord: Its title, status, level and days left, its cost, the
-            proceeds selling it returns at the bids it was priced at, the
-            profit that realizes (only when all of it sold) and its share of
-            the potential profit, and each held market's side, count held,
-            count sold and price.
+        SaleRecord: The sale's figures and each held market's record.
 
     Raises:
         Exception: Whatever reading the sale raises when its plan or figures
-            cannot be read (an AttributeError, TypeError, ValueError,
-            IndexError or KeyError in practice); report_sales catches it and
-            keeps a record of what could be read instead.
+            cannot be read; report_sales catches it and keeps a record of
+            what could be read instead.
     """
     plan = sale.plan
     sold = sale.sold if isinstance(sale.sold, dict) else {}
