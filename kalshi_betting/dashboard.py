@@ -71,9 +71,11 @@ Purpose:
     A chunk holds a view for the whole list, for each category and for each
     category · tag. The category · tag views partition the list's trades,
     and each also carries what several of them can be combined from: its
-    curve as running dollars per trade type ("m", shipped in place of "eq",
-    the same curve in cents — and only when it can be relied on, _mix_curve)
-    and its row of the category table ("row"); the chunk carries per-trade
+    curve as running dollars per trade type ("m", shipped in place of each
+    of "eq", "total", "types" and "dd" — the same curve — that the script
+    works out from it to exactly Python's values, _curve_series_from_m; and
+    only when it can be relied on, _mix_curve) and its row of the category
+    table ("row"); the chunk carries per-trade
     arrays (_mix_trade_arrays) and the base block the constants and markup
     Python renders with (_mix_base, "mix") and each tag group's raw k-hat
     counts.
@@ -10352,7 +10354,9 @@ def _view_payload(
             raw P&L) and, when the page can rely on it (_mix_curve), "m"
             ([[trade type label, sparse running P&L in dollars], ...]: the
             starting balance plus all of them is this view's curve —
-            _list_payload then drops the view's "eq", the same curve in cents).
+            _list_payload then drops each of the view's "eq", "total",
+            "types" and "dd" that the page's script works out from "m"
+            exactly; they are that same curve).
     """
     if len(axis):
         # A curve built after the page's own (a slice's, built here) can run
@@ -10584,9 +10588,15 @@ def _list_payload(
     script combines them into any mix of categories and tags a reader ticks
     (a view per combination would be far too many to ship). Each therefore
     carries its curve in dollars ("m") and the list carries per-trade
-    arrays (_mix_trade_arrays). When one tag's curve cannot be relied on
-    (_mix_curve) or a per-trade figure is not a number, no tag of the list
-    carries "m", and the page says a mix is not available for that list.
+    arrays (_mix_trade_arrays). A view that carries "m" leaves out the
+    series that are the same curve again (_MIX_CURVE_SERIES) — each one the
+    script's arithmetic rebuilds to exactly the values Python computed
+    (_curve_series_from_m; one with a value on a rounding tie that would
+    round the other way is kept) — and the script works those out from "m"
+    when it draws that one tag. When one tag's curve
+    cannot be relied on (_mix_curve) or a per-trade figure is not a number,
+    no tag of the list carries "m" — each keeps all four series as every
+    other view does — and the page says a mix is not available for that list.
 
     Args:
         trades (list[BacktestTrade]): The band's trades.
@@ -10620,7 +10630,11 @@ def _list_payload(
             "pr", "st", "en", "ex", "mo", "pb", "cp", "ca"), and "views":
             view key ("all", "c<category index>", "s<category · tag index>")
             -> _view_payload (each "s" view with its mix parts: "row", and
-            "m" in place of "eq" when the list's tags can be mixed).
+            — when the list's tags can be mixed — "m" in place of "eq",
+            "total", "types" and "dd", _MIX_CURVE_SERIES, which are that
+            same curve: each is left out where the script works exactly
+            its values out from "m", _curve_series_from_m, and kept where
+            a rounding tie would make it differ).
     """
     kelly_x, kelly_y = _kelly_points(trades, k)
     position = {id(t): i for i, t in enumerate(trades)}
@@ -10681,11 +10695,18 @@ def _list_payload(
         if mix_gaps is not None and tag_keys:
             mix_gaps.append(1)
     else:
-        # A tag's own curve in dollars ("eq") is its starting balance plus
-        # its "m" curves, which the script adds up and rounds to cents; the
-        # same curve is not shipped twice
+        # A tag's own curve in dollars ("eq"), its return and type lines and
+        # its drawdown are all its "m" curves again: the script works them
+        # out from "m" (its whole()), so the same curve is shipped once —
+        # each series only where the script's own arithmetic gives exactly
+        # the values shipped here (a value on a rounding tie can round the
+        # other way from "m", and that series is then kept)
         for key in tag_keys:
-            del views[key]["eq"]
+            view = views[key]
+            rebuilt = _curve_series_from_m(view["m"], len(axis), initial_balance)
+            for name in _MIX_CURVE_SERIES:
+                if _same_series(view[name], rebuilt[name], len(axis)):
+                    del view[name]
     return {
         # The histogram's x values, exactly as _section_diagnostics draws them
         "ret": [t.profit_ratio * 100 for t in trades],
@@ -10724,6 +10745,88 @@ def _case_twins(keys: list) -> list[list[int]]:
         groups.setdefault(key, []).append(i)
     return [group for group in groups.values() if len(group) > 1]
 
+
+# The series of a view that are its curve once more — the curve in dollars,
+# the total return, each trade type's line and the drawdown: a category · tag
+# view that ships its curve as "m" leaves out each one the page's script
+# works out from "m" exactly (_curve_series_from_m)
+_MIX_CURVE_SERIES = ("eq", "total", "types", "dd")
+
+
+def _sparse_as_floats(sparse: list[list], n: int) -> np.ndarray:
+    """
+    Put a sparse series back on every day, as floats.
+
+    Args:
+        sparse (list[list]): [[axis index, value], ...] (_sparse_on_axis); a
+            None value is a gap.
+        n (int): The number of days on the page's axis.
+
+    Returns:
+        np.ndarray: One float per day (_expand_sparse, the script's
+            expand()), NaN in a gap.
+    """
+    return np.array(_expand_sparse(sparse, n), dtype=float)
+
+
+def _curve_series_from_m(m: list[list], n: int, initial_balance: float) -> dict:
+    """
+    The four curve series of a category · tag view, as the page's script works them out.
+
+    The script rebuilds a tag view's curve from its "m" (each trade type's
+    running dollars) and derives the series it draws from that (_FILTER_JS's
+    addCurves, fallOf and curveSeries). This repeats that arithmetic step
+    for step — the same additions in the same order, the same rounding —
+    so _list_payload can tell, before leaving a series out, that the script
+    will arrive at exactly the values Python would have shipped.
+
+    Args:
+        m (list[list]): The view's "m": [[trade type label, sparse running
+            dollars], ...] in _TRADE_TYPE_LINES order.
+        n (int): The number of days on the page's axis.
+        initial_balance (float): Starting balance in dollars, above zero.
+
+    Returns:
+        dict: "eq" (the curve in dollars, to cents), "total" (the return in
+            percent of the starting balance, to four decimals), "dd" (the
+            drawdown from the running peak in percent, to four decimals) —
+            each one float per day — and "types" ([(label, that type's
+            return line in percent, to four decimals), ...]).
+    """
+    parts = [(label, _sparse_as_floats(series, n)) for label, series in m]
+    pnl = np.zeros(n)
+    for _, part in parts:
+        pnl = pnl + part
+    value = initial_balance + pnl
+    peak = np.maximum.accumulate(value)
+    return {
+        "eq": np.round(value, 2),
+        "total": np.round((value / initial_balance - 1) * 100, 4),
+        "dd": np.round((value - peak) / peak * 100, 4),
+        "types": [(label, np.round(part / initial_balance * 100, 4)) for label, part in parts],
+    }
+
+
+def _same_series(shipped, rebuilt, n: int) -> bool:
+    """
+    Whether a view's shipped curve series is exactly the one the script would rebuild.
+
+    Args:
+        shipped: The view's series as _view_payload ships it: a sparse list,
+            or for "types" [[label, sparse list], ...].
+        rebuilt: The same series from _curve_series_from_m: one float per
+            day, or for "types" [(label, one float per day), ...].
+        n (int): The number of days on the page's axis.
+
+    Returns:
+        bool: True only when every day's value is equal (and, for "types",
+            the labels are the same in the same order). A gap never is.
+    """
+    if isinstance(rebuilt, list):
+        return (len(shipped) == len(rebuilt)
+                and all(label == mine and np.array_equal(_sparse_as_floats(series, n), values)
+                        for (label, series), (mine, values) in zip(shipped, rebuilt, strict=True)))
+    return bool(np.array_equal(_sparse_as_floats(shipped, n), rebuilt))
 
 # The per-trade arrays of a mix that must hold a finite number for every trade
 # (the calibration pair "cp" / "ca" is null for a same-title trade by design)
@@ -11715,7 +11818,10 @@ def _pack_text(raw: str) -> str:
 # views — each one's curve as running dollars per trade type ("m") and its
 # row of the category table ("row") — and the chunk's per-trade arrays, with
 # the constants, colours and markup Python renders with (D.mix), by the rule
-# of the Python helper named beside each figure, and formats each number as
+# of the Python helper named beside each figure (one tag drawn alone is
+# Python's own view, of which only those of the curve's four series —
+# "total", "types", "dd" and "eq" — that Python left out are worked out
+# here, from the same "m", to exactly Python's values: whole), and formats each number as
 # Python's format() does (fixed: the exact value rounded half to even).
 # tests/test_dashboard.py's TestMixedSelection compares every part of a mix
 # with dashboard._view_payload over the same trades; what can still differ is
@@ -11842,20 +11948,9 @@ _FILTER_JS = r"""
     return (Math.abs(x - Math.trunc(x)) === 0.5 && r % 2 !== 0) ? r - 1 : r;
   }
   function roundTo(x, digits) { var p = Math.pow(10, digits); return rint(x * p) / p; }
-  // A view's own curve in dollars, on every date: its "eq" as shipped. A
-  // category · tag view whose tags can be mixed ships "m" in its place — its
-  // running P&L in dollars per trade type — and its curve is the starting
-  // balance plus all of them, rounded to cents as "eq" is
-  function curveOf(v) {
-    if (v.eq) { return expand(v.eq); }
-    var sum = new Array(N), i;
-    for (i = 0; i < N; i++) { sum[i] = 0; }
-    v.m.forEach(function(part) {
-      var y = expand(part[1]);
-      for (i = 0; i < N; i++) { sum[i] += y[i]; }
-    });
-    return sum.map(function(x) { return roundTo(D.mix.start + x, 2); });
-  }
+  // A view's own curve in dollars, on every date: its "eq" (shipped, or for
+  // a category · tag view that ships "m" in its place, worked out by whole())
+  function curveOf(v) { return expand(v.eq); }
 
   function bandIndex() { return parseInt(bandSel.value, 10); }
   function kIndex() { return parseInt(kSel.value, 10); }
@@ -12147,8 +12242,8 @@ _FILTER_JS = r"""
       .filter(function(k) { return !!L.views[k]; });
     if (!keys.length) { return D.empty; }
     if (!window.__dashForceMix) {
-      var whole = plainKey(L, keys);
-      if (whole) { return L.views[whole]; }
+      var plain = plainKey(L, keys);
+      if (plain) { return whole(L.views[plain]); }
     }
     return mixView(chunk, keys);
   }
@@ -12268,6 +12363,70 @@ _FILTER_JS = r"""
     }
     return cache.at[key];
   }
+  // Category · tag views' curves added up: each trade type's running dollars
+  // on every date ("m": parts, by label; labels in Python's order of the
+  // types) and the curve itself, the starting balance plus all of them
+  // (backtester._build_equity_curve; _return_by_trade_type)
+  function addCurves(views) {
+    var parts = {}, i;
+    views.forEach(function(a) {
+      a.m.forEach(function(part) {
+        var y = expand(part[1]), sum = parts[part[0]] || (parts[part[0]] = zeros(N));
+        for (var r = 0; r < N; r++) { sum[r] += y[r]; }
+      });
+    });
+    var labels = D.mix.types.filter(function(label) { return !!parts[label]; });
+    var V = new Array(N);
+    for (i = 0; i < N; i++) {
+      var pnl = 0;
+      for (var l = 0; l < labels.length; l++) { pnl += parts[labels[l]][i]; }
+      V[i] = D.mix.start + pnl;
+    }
+    return {labels: labels, parts: parts, V: V};
+  }
+  // _max_drawdown: each day's fall from the running peak, the deepest fall
+  // and its first day
+  function fallOf(V) {
+    var peak = -Infinity, fall = new Array(N), deepest = Infinity, when = 0;
+    for (var i = 0; i < N; i++) {
+      if (V[i] > peak) { peak = V[i]; }
+      fall[i] = (V[i] - peak) / peak;
+      if (fall[i] < deepest) { deepest = fall[i]; when = i; }
+    }
+    return {fall: fall, deepest: deepest, when: when};
+  }
+  // The four series a view draws its curve from, as _view_payload ships
+  // them (_performance_series and the curve itself, rounded as
+  // _sparse_on_axis rounds each): the total return and each trade type's
+  // line in percent of the starting balance, the drawdown in percent, and
+  // the curve in dollars
+  function curveSeries(c, fall) {
+    var start = D.mix.start;
+    return {
+      total: sparse(c.V.map(function(v) { return roundTo((v / start - 1) * 100, 4); })),
+      types: c.labels.map(function(label) {
+        return [label, sparse(c.parts[label].map(function(x) {
+          return roundTo(x / start * 100, 4);
+        }))];
+      }),
+      dd: sparse(fall.map(function(x) { return roundTo(x * 100, 4); })),
+      eq: sparse(c.V.map(function(v) { return roundTo(v, 2); }))
+    };
+  }
+  // One of Python's views, ready to draw. A category · tag view that ships
+  // its curve as "m" leaves out those of the four series above that this
+  // arithmetic gives exactly as Python computed them (Python checked, with
+  // the same steps: _curve_series_from_m): the ones left out are worked out
+  // here, once, and kept on the view
+  function whole(v) {
+    if (v.m && !(v.total && v.types && v.dd && v.eq)) {
+      var c = addCurves([v]), series = curveSeries(c, fallOf(c.V).fall);
+      Object.keys(series).forEach(function(name) {
+        if (!v[name]) { v[name] = series[name]; }
+      });
+    }
+    return v;
+  }
   // One mix, built once per chunk and set of tag views while it is among
   // the chunk's last MIXES
   function mixView(chunk, keys) {
@@ -12287,21 +12446,8 @@ _FILTER_JS = r"""
     function mine(arr) { return idx.map(function(t) { return arr[t]; }); }
 
     // The curve: the starting balance plus every tag's running dollars, kept
-    // per trade type (backtester._build_equity_curve; _return_by_trade_type)
-    var parts = {};
-    atoms.forEach(function(a) {
-      a.m.forEach(function(part) {
-        var y = expand(part[1]), sum = parts[part[0]] || (parts[part[0]] = zeros(N));
-        for (var r = 0; r < N; r++) { sum[r] += y[r]; }
-      });
-    });
-    var labels = M.types.filter(function(label) { return !!parts[label]; });
-    var V = new Array(N);
-    for (i = 0; i < N; i++) {
-      var pnl = 0;
-      for (var l = 0; l < labels.length; l++) { pnl += parts[labels[l]][i]; }
-      V[i] = M.start + pnl;
-    }
+    // per trade type
+    var curves = addCurves(atoms), V = curves.V;
 
     // Capital in open trades: the fee-inclusive stakes from each entry row
     // to its exit row (_capital_deployed), and what the curve itself carries
@@ -12348,13 +12494,8 @@ _FILTER_JS = r"""
       sortino = down > 0 ? mean / down * Math.sqrt(M.year) : 0;
     }
     // _max_drawdown: the deepest fall from a running peak, and its first day
-    var peak = -Infinity, fall = new Array(N), deepest = Infinity, when = 0;
-    for (i = 0; i < N; i++) {
-      if (V[i] > peak) { peak = V[i]; }
-      fall[i] = (V[i] - peak) / peak;
-      if (fall[i] < deepest) { deepest = fall[i]; when = i; }
-    }
-    var drawdown = pct(deepest, 1) + (deepest === 0 ? '' : ' (' + D.dates[when] + ')');
+    var falls = fallOf(V), deepest = falls.deepest;
+    var drawdown = pct(deepest, 1) + (deepest === 0 ? '' : ' (' + D.dates[falls.when] + ')');
     // _median_monthly_return: each month's last value over the one before,
     // the first month against the opening row
     var medianMonth = M.none;
@@ -12489,16 +12630,10 @@ _FILTER_JS = r"""
     var worst = ranked.slice(-M.top).map(function(t) { return worstRow[t]; });
     if (best.concat(worst).some(function(row) { return !row; })) { return null; }
 
+    var series = curveSeries(curves, falls.fall);
     return {
       n: n, idx: idx, kpi: kpi, mix: true,
-      total: sparse(V.map(function(v) { return roundTo((v / M.start - 1) * 100, 4); })),
-      types: labels.map(function(label) {
-        return [label, sparse(parts[label].map(function(x) {
-          return roundTo(x / M.start * 100, 4);
-        }))];
-      }),
-      dd: sparse(fall.map(function(x) { return roundTo(x * 100, 4); })),
-      eq: sparse(V.map(function(v) { return roundTo(v, 2); })),
+      total: series.total, types: series.types, dd: series.dd, eq: series.eq,
       dep: sparse(dep.map(function(x) { return roundTo(x, 2); })),
       // _strategy_row
       bench: {'return': signed(pct(V[N - 1] / M.start - 1, 1)), sharpe: fixed(sharpe, 2),

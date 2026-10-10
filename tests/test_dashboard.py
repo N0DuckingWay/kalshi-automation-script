@@ -4604,8 +4604,9 @@ def _mix_tag_trades(trades: list[BacktestTrade], si: int) -> list[BacktestTrade]
 class TestMixData:
     """What a chunk and the base block carry so the page can work out a mix
     of several categories and tags itself: per-trade arrays, each category ·
-    tag view's curve in dollars ("m", in place of "eq") and its table row,
-    and the constants and markup Python renders with."""
+    tag view's curve in dollars ("m", in place of the four series that are
+    the same curve: "eq", "total", "types" and "dd") and its table row, and
+    the constants and markup Python renders with."""
 
     @pytest.mark.parametrize("quoted", [False, True], ids=["at-cost", "at-market"])
     def test_the_per_trade_arrays_are_the_trades_own_figures(self, quoted):
@@ -4659,12 +4660,16 @@ class TestMixData:
             # Each tag's "m" is its own curve
             assert mine == pytest.approx(list(backtester._build_equity_curve(
                 own, _MIX_START, _MIX_BALANCE)["portfolio_value"]), abs=1e-6)
-            # ... split by trade type: each part is that type's line
-            lines = dict(views[key]["types"])
+            # ... split by trade type: each part is that type's line (the
+            # view ships no "types" of its own beside "m")
+            assert "types" not in views[key]
+            lines = {label: series for label, _, series in dashboard._return_by_trade_type(
+                own, backtester._build_equity_curve(own, _MIX_START, _MIX_BALANCE),
+                _MIX_BALANCE)}
             assert [label for label, _ in views[key]["m"]] == list(lines)
             for label, sparse in views[key]["m"]:
                 assert np.array(_expand(sparse, n)) / _MIX_BALANCE * 100 == pytest.approx(
-                    _expand(lines[label], n), abs=6e-5)
+                    lines[label], abs=1e-9)
             whole += mine - _MIX_BALANCE
             by_category[_MIX_CATEGORIES.index(_MIX_SUBCATS[si][0])] += mine - _MIX_BALANCE
         assert whole + _MIX_BALANCE == pytest.approx(list(curve["portfolio_value"]), abs=1e-6)
@@ -4677,7 +4682,7 @@ class TestMixData:
             assert np.round(pnl + _MIX_BALANCE, 2) == pytest.approx(
                 _expand(views[f"c{ci}"]["eq"], n), abs=0.0051)
 
-    def test_only_a_tag_view_changes_and_its_curve_replaces_eq(self):
+    def test_only_a_tag_view_changes_and_its_curve_replaces_its_series(self):
         trades = _mix_trades(4, quoted=True)
         lst, axis, _ = _mix_list(trades)
         n = len(axis)
@@ -4692,15 +4697,73 @@ class TestMixData:
             plain = dashboard._view_payload(
                 sel, idx, curve, axis, _MIX_BALANCE, _MIX_SERIES, kelly_x,
                 lambda t, which: [0, 0], dashboard._StringTable())
-            independent = [k for k in plain if k not in ("table", "best", "worst", "eq")]
+            # The four series that are the view's curve once more
+            curve_series = ("eq", "total", "types", "dd")
+            assert dashboard._MIX_CURVE_SERIES == curve_series
+            independent = [k for k in plain
+                           if k not in ("table", "best", "worst", *curve_series)]
             assert {k: view[k] for k in independent} == {k: plain[k] for k in independent}
             if key.startswith("s"):
                 assert set(view) - set(plain) == {"m", "row"}
-                assert set(plain) - set(view) == {"eq"}
-                # Its curve in cents is its "m" curve, rounded as "eq" was
-                assert list(np.round(_mix_curve_of(view, n), 2)) == _expand(plain["eq"], n)
+                assert set(plain) - set(view) == set(curve_series)
+                # Each is its "m" curve again, rounded as Python rounded it:
+                # the curve in cents, the return and the drawdown in percent
+                # to four decimals, and one line per trade type
+                value = _mix_curve_of(view, n)
+                assert list(np.round(value, 2)) == _expand(plain["eq"], n)
+                assert np.round((value / _MIX_BALANCE - 1.0) * 100, 4) == pytest.approx(
+                    _expand(plain["total"], n), abs=1e-9)
+                peak = np.maximum.accumulate(value)
+                assert np.round((value - peak) / peak * 100, 4) == pytest.approx(
+                    _expand(plain["dd"], n), abs=1e-9)
+                assert [label for label, _ in view["m"]] == [label for label, _ in plain["types"]]
+                for (_, dollars), (_, line) in zip(view["m"], plain["types"], strict=True):
+                    assert np.round(np.array(_expand(dollars, n)) / _MIX_BALANCE * 100, 4) \
+                        == pytest.approx(_expand(line, n), abs=1e-9)
             else:
-                assert set(view) == set(plain) and view["eq"] == plain["eq"]
+                assert set(view) == set(plain)
+                assert all(view[k] == plain[k] for k in curve_series)
+
+    def test_a_curve_series_is_left_out_only_where_the_script_rebuilds_it_exactly(self):
+        # Half-cent profits from $10,000 put many values on a rounding tie.
+        # Whatever a tag view leaves out, the script's arithmetic
+        # (_curve_series_from_m, its twin here) gives exactly; whatever it
+        # keeps is the view's own series, and differs from that arithmetic
+        rng = random.Random(83)
+        trades = []
+        for t in _mix_trades(83, n=60):
+            profit = rng.randint(-4000, 4000) * 5 / 1000
+            trades.append(dataclasses.replace(
+                t, profit=profit, actual_payoff=profit + t.total_cost + t.fees))
+        lst, axis, _ = _mix_list(trades)
+        n = len(axis)
+        kelly_x, _ = dashboard._kelly_points(trades, 0.75)
+        kept = dropped = 0
+        for key, view in lst["views"].items():
+            if not key.startswith("s"):
+                continue
+            sel = [trades[i] for i in view["idx"]]
+            plain = dashboard._view_payload(
+                sel, view["idx"], backtester._build_equity_curve(sel, _MIX_START, _MIX_BALANCE),
+                axis, _MIX_BALANCE, _MIX_SERIES, kelly_x, lambda t, which: [0, 0],
+                dashboard._StringTable())
+            rebuilt = dashboard._curve_series_from_m(view["m"], n, _MIX_BALANCE)
+            for name in dashboard._MIX_CURVE_SERIES:
+                same = dashboard._same_series(plain[name], rebuilt[name], n)
+                assert (name not in view) is same, (key, name)
+                if name in view:
+                    assert view[name] == plain[name]
+                kept += name in view
+                dropped += name not in view
+        assert kept and dropped
+        # The twin's pieces: a sparse series back on every day, gaps as NaN
+        expanded = dashboard._sparse_as_floats([[0, 1.5], [2, None], [3, -2.0]], 5)
+        assert list(expanded[:2]) == [1.5, 1.5] and np.isnan(expanded[2])
+        assert list(expanded[3:]) == [-2.0, -2.0]
+        assert not dashboard._same_series([[0, 1.5], [2, None]], expanded, 5)
+        assert dashboard._same_series([[0, 1.5]], np.full(5, 1.5), 5)
+        assert not dashboard._same_series([["A", [[0, 1.5]]]], [("B", np.full(5, 1.5))], 5)
+        assert not dashboard._same_series([["A", [[0, 1.5]]]], [], 5)
 
     def test_a_tags_row_is_its_line_of_the_category_table(self):
         trades = _mix_trades(5)
@@ -4735,6 +4798,8 @@ class TestMixData:
         lst, _, _ = _mix_list(trades, curve=long_curve, gaps=gaps)
         tags = [view for key, view in lst["views"].items() if key.startswith("s")]
         assert tags and all("m" not in view and "eq" in view and "row" in view for view in tags)
+        # Without "m" a tag view keeps every series of its curve, like any other view
+        assert all(name in view for view in tags for name in dashboard._MIX_CURVE_SERIES)
         # Counted once for the list, however many tags it holds
         assert gaps == [1]
         # A list that can be mixed counts nothing
@@ -12846,33 +12911,38 @@ class TestFilterPageSize:
 
     What the page needs to combine several categories and tags (per-trade
     arrays in every chunk; each category · tag view's curve in dollars, "m",
-    in place of its "eq", and its table row; the base block's "mix" and each
-    tag group's raw k-hat counts) adds 5% to 9%. Every variant re-measured
-    2026-10-10 (same environment), before and after, in the constants below;
-    with each tag view's "eq" kept beside "m" the growth was 11% to 15%, so
-    "eq" is left out wherever "m" is shipped. The check-box Category and Tag
-    menus and the part of the script that works a mix out add 30,310 bytes
-    to every variant, whatever its data (re-measured the same day)."""
+    and its table row; the base block's "mix" and each tag group's raw k-hat
+    counts) first added 5% to 9%, with "m" shipped in place of the view's
+    "eq" alone (with "eq" kept beside it, 11% to 15%). A tag view's return
+    line, type lines and drawdown are that same curve again, so they are now
+    left out too wherever the script rebuilds them exactly from "m": every
+    variant re-measured 2026-10-10 (same environment), in the constants
+    below — the pages at cost end 5.6% to 7.2% above the page before the mix
+    data, and the pages valued at market, whose curves move daily, 4.9% and
+    6.0% BELOW it. The check-box Category and Tag menus and the script that
+    works a mix out are about 34 KB of every variant, whatever its data."""
 
-    # 837,197 the same day before the mix data, 892,391 with it (+6.6%), and
-    # 922,701 with the menus and the script that combines them
-    PAGE_BYTES_MEASURED = 922_701
+    # 837,197 before the mix data; 922,701 with it, the menus and the mix
+    # script ("m" in place of "eq" alone); 897,445 with a tag view's other
+    # curve series left out as well (2026-10-10)
+    PAGE_BYTES_MEASURED = 897_445
     BUDGET = int(PAGE_BYTES_MEASURED * 1.2)
-    # 1,119,167 before, 1,203,601 with the mix data (+7.5%)
-    PAGE_BYTES_MEASURED_FAMILY = 1_233_927
+    # 1,119,167 before; 1,233,927; 1,193,307
+    PAGE_BYTES_MEASURED_FAMILY = 1_193_307
     BUDGET_FAMILY = int(PAGE_BYTES_MEASURED_FAMILY * 1.2)
     # The Add to held pairs view, where every band's add-on run trades yet
     # another list (a worst case: a real run's add-on lists mostly equal the
     # run as simulated and share its chunks): on its own it took the page
     # from 815,777 to 1,274,895 bytes, and beside the tier-floors-off family
     # (whose 18 binding bands each gain an add-on twin of their own) from
-    # 1,098,598 to 1,784,261 (2026-09-30). With the mix data: 1,393,892
-    # (1,289,102 the same day before it, +8.1%) and 1,957,630 (1,798,488,
-    # +8.8%); with the menus and the mix script, the constants below. Each
-    # budget is its measurement + 20%.
-    PAGE_BYTES_MEASURED_ADD_ON = 1_424_198
+    # 1,098,598 to 1,784,261 (2026-09-30). On 2026-10-10: 1,289,102 and
+    # 1,798,488 before the mix data; 1,424,198 and 1,987,940 with it, the
+    # menus and the mix script; and, with a tag view's other curve series
+    # left out as well, the constants below. Each budget is its measurement
+    # + 20%.
+    PAGE_BYTES_MEASURED_ADD_ON = 1_367_286
     BUDGET_ADD_ON = int(PAGE_BYTES_MEASURED_ADD_ON * 1.2)
-    PAGE_BYTES_MEASURED_ADD_ON_FAMILY = 1_987_940
+    PAGE_BYTES_MEASURED_ADD_ON_FAMILY = 1_899_628
     BUDGET_ADD_ON_FAMILY = int(PAGE_BYTES_MEASURED_ADD_ON_FAMILY * 1.2)
     # Every trade with quotes that move on most days it is held (a run valued
     # at market), the trade lists unchanged: each curve then changes on most
@@ -12881,12 +12951,13 @@ class TestFilterPageSize:
     # 1,397,952 bytes (823,634 at cost the same day, +70%), and with the
     # tier-floors-off family 1,969,146 (1,105,564 at cost, +78%). Curves stay
     # daily by choice, so each budget is its measurement + 20%, with no ceiling.
-    # With the mix data: 1,487,918 (1,411,508 the same day before it, +5.4%)
-    # and 2,100,100 (1,982,690, +5.9%); with the menus and the mix script,
-    # the constants below.
-    PAGE_BYTES_MEASURED_QUOTED = 1_518_228
+    # On 2026-10-10: 1,411,508 and 1,982,690 before the mix data; 1,518,228
+    # and 2,130,430 with it, the menus and the mix script; and, with a tag
+    # view's other curve series left out as well, the constants below (a
+    # curve that moves daily was the costly part of each tag view).
+    PAGE_BYTES_MEASURED_QUOTED = 1_342_624
     BUDGET_QUOTED = int(PAGE_BYTES_MEASURED_QUOTED * 1.2)
-    PAGE_BYTES_MEASURED_QUOTED_FAMILY = 2_130_430
+    PAGE_BYTES_MEASURED_QUOTED_FAMILY = 1_863_334
     BUDGET_QUOTED_FAMILY = int(PAGE_BYTES_MEASURED_QUOTED_FAMILY * 1.2)
 
     @pytest.mark.parametrize(
@@ -14531,9 +14602,20 @@ class TestOpenTradesAtMarket:
             {"CatA": 0, "CatB": 1}, {("CatA", "TagA"): 0, ("CatB", "TagB"): 1},
             dashboard._StringTable(), heads=dashboard._StringTable())
         views, n = payload["views"], len(axis)
+
+        def total(key: str) -> list:
+            """A view's return line in percent: shipped, or — for a tag view,
+            which ships its curve in dollars per trade type instead ("m") —
+            those dollars added up over the starting balance."""
+            view = views[key]
+            if "total" in view:
+                return _expand(view["total"], n)
+            return list(sum(np.array(_expand(part, n)) for _, part in view["m"]) / 1000.0 * 100)
+
+        assert "total" not in views["s0"] and "m" in views["s0"]
         whole = _expand(views["all"]["total"], n)
         for keys in (("c0", "c1"), ("s0", "s1")):
-            parts = [_expand(views[key]["total"], n) for key in keys]
+            parts = [total(key) for key in keys]
             # Each total is rounded to 4 decimals of a percent
             assert [a + b for a, b in zip(*parts, strict=True)] == pytest.approx(whole, abs=2e-4)
         # Exactly, on the curves the views are drawn from (each slice's own)
@@ -15006,6 +15088,105 @@ class TestMixedSelection:
                     for cats, tags in sets]
             assert [k["sharpe"] for k in charged] != [k["sharpe"] for k in free]
             assert [k["sortino"] for k in charged] != [k["sortino"] for k in free]
+
+    @staticmethod
+    def _each_tag_alone_is_pythons(monkeypatch, tmp_path, trades, *, rates=None,
+                                   balance=_MIX_BALANCE, end=None) -> dict:
+        """Tick each tag of a page of `trades` on its own and hold the series
+        the script draws for it — the return line, each trade type's line,
+        the drawdown and the curve in dollars — to the ones _view_payload
+        computes for that tag, rounded as Python rounds them. Returns the
+        list's tag views by tag index, as the page ships them."""
+        page = _mix_page(monkeypatch, tmp_path, trades, risk_free=rates, balance=balance,
+                         end=end)
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        lst, n = chunks[0]["list"], len(data["dates"])
+        steps = [["wait"]]
+        for si, (category, _) in enumerate(_MIX_SUBCATS):
+            assert "m" in lst["views"][f"s{si}"]
+            steps += _mix_tick_steps([_MIX_CATEGORIES.index(category)], [si], f"tag{si}")
+        snaps = _run_script(tmp_path, page, steps, strict=True)
+        exact = {"abs": 1e-9}
+        several = 0
+        for si, (category, _) in enumerate(_MIX_SUBCATS):
+            snap = snaps[f"tag{si}"]
+            ref = _mix_reference(data, trades, [_MIX_CATEGORIES.index(category)], [si],
+                                 risk_free=rates, balance=balance)
+            view = ref["view"]
+            assert view["n"] == lst["views"][f"s{si}"]["n"] > 0
+            # Python's own view of the tag, not a mix: its cards as shipped
+            assert data["text"]["mix_note"] not in snap["text"]["flt-summary"]
+            assert {k: snap["text"][f"kpi-{k}"] for k in view["kpi"]} == view["kpi"]
+            perf = _last_react(snap, "perf-cum")["data"]
+            assert perf[0]["y"] == pytest.approx(_expand(view["total"], n), **exact)
+            assert [trace["name"] for trace in perf[1:]] == [label for label, _ in view["types"]]
+            for trace, (_, series) in zip(perf[1:], view["types"], strict=True):
+                assert trace["y"] == pytest.approx(_expand(series, n), **exact)
+            assert _last_react(snap, "perf-dd")["data"][0]["y"] == pytest.approx(
+                _expand(view["dd"], n), **exact)
+            assert _last_react(snap, "bench-fig")["data"][0]["y"] == pytest.approx(
+                _expand(view["eq"], n), **exact)
+            several += len(view["types"]) > 1
+        assert several
+        return {si: lst["views"][f"s{si}"] for si in range(len(_MIX_SUBCATS))}
+
+    @pytest.mark.parametrize("fixture", sorted(FIXTURES))
+    def test_one_tag_alone_draws_the_series_python_computes_for_it(
+            self, monkeypatch, tmp_path, fixture):
+        # A tag's view ships its curve once, as dollars per trade type ("m"),
+        # and the script works the four series it draws out of that. For
+        # every tag of every parity fixture they are the very series
+        # _view_payload computes for that tag
+        seed, quoted, kind, balance, spread, end = self.FIXTURES[fixture]
+        views = self._each_tag_alone_is_pythons(
+            monkeypatch, tmp_path, _mix_trades(seed, n=60, quoted=quoted, spread=spread),
+            rates=self._rates(kind), balance=balance, end=end)
+        # None of the four is shipped beside "m" on these pages
+        assert not any(name in view for view in views.values()
+                       for name in dashboard._MIX_CURVE_SERIES)
+
+    @pytest.mark.parametrize("quoted", [False, True], ids=["at-cost", "at-market"])
+    def test_a_series_that_would_round_the_other_way_is_shipped_as_it_was(
+            self, monkeypatch, tmp_path, quoted):
+        # Profits on a half-cent grid from $10,000: many days' values sit
+        # exactly on a rounding tie (x.xx5 dollars; x.xxxx5 percent), where
+        # float noise decides which way Python rounded. A series the script
+        # would not rebuild to exactly Python's values stays in the view,
+        # so one tag alone is still drawn as Python computed it
+        rng = random.Random(81)
+        trades = []
+        for t in _mix_trades(81, n=60):
+            profit = rng.randint(-4000, 4000) * 5 / 1000
+            trades.append(dataclasses.replace(
+                t, profit=profit, actual_payoff=profit + t.total_cost + t.fees))
+        if quoted:
+            mark_rng = random.Random(82)
+            trades = [_random_marks(t, mark_rng) if i % 3 else t for i, t in enumerate(trades)]
+        views = self._each_tag_alone_is_pythons(monkeypatch, tmp_path, trades)
+        kept = [name for view in views.values() for name in dashboard._MIX_CURVE_SERIES
+                if name in view]
+        # Both happen on this page: series kept for a tie, and series left out
+        assert kept and len(kept) < len(views) * len(dashboard._MIX_CURVE_SERIES)
+
+    def test_a_tag_whose_list_cannot_be_mixed_is_drawn_from_its_shipped_series(
+            self, monkeypatch, tmp_path):
+        # No tag of this list carries "m" (the slices' curves open two days
+        # after the page's dates), so each keeps the four series Python
+        # shipped, and one tag alone is drawn from them as they stand
+        trades = _mix_trades(47, n=44)
+        page = _mix_page(monkeypatch, tmp_path, trades, start=_MIX_START + timedelta(days=2))
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        n, si = len(data["dates"]), 3
+        view = chunks[0]["list"]["views"][f"s{si}"]
+        assert "m" not in view and all(k in view for k in dashboard._MIX_CURVE_SERIES)
+        snap = _run_script(tmp_path, page, [
+            ["wait"], _tick_tag(si), ["settle"], ["snap", "tag"]], strict=True)["tag"]
+        perf = _last_react(snap, "perf-cum")["data"]
+        assert perf[0]["y"] == _expand(view["total"], n)
+        assert [(trace["name"], trace["y"]) for trace in perf[1:]] == [
+            (label, _expand(series, n)) for label, series in view["types"]]
+        assert _last_react(snap, "perf-dd")["data"][0]["y"] == _expand(view["dd"], n)
+        assert _last_react(snap, "bench-fig")["data"][0]["y"] == _expand(view["eq"], n)
 
     @pytest.mark.parametrize("quoted", [False, True], ids=["at-cost", "at-market"])
     def test_a_selection_python_has_a_view_of_is_drawn_alike_by_the_mix(
