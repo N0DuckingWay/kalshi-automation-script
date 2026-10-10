@@ -3629,20 +3629,26 @@ class TestTimeSeriesKellyParity:
         # value and the held stake (pinned in detail by
         # _backtest_add_on_problems)
         assert _function_calls(backtester, "_simulate_at_discount", "_open_value")
-        # Selling early: a market's bid, paid-out marker and modeled bid
-        # ladder are read in one place, _position_sale_value, which walks the
+        # Selling early: the sell rule reads a market's bid, paid-out marker
+        # and modeled bid ladder in one place, _position_sale_value, which walks the
         # ladder through _ladder_average; the ladder is built only by
         # LegQuotes.sale_ladder, from the bid it is handed. Every check the
         # sell rule reads — the checkpoint and the daily checks before it
-        # (TAKE_PROFIT_HOLD_DAYS) — comes from _hold_readings, the one caller
-        # of _position_sale_value, and the walk's sales, its quick test at a
+        # (TAKE_PROFIT_HOLD_DAYS) — comes from _hold_readings, the sell rule's
+        # one caller of _position_sale_value, and the walk's sales, its quick test at a
         # checkpoint with no candidate (_position_sells), the shortcut that
         # replays them (_sale_reach) and the reading of a run's own sales
         # (_sale_cover) all decide through
         # _reached_every_day, which tests every check with _sells_at: the
         # shortcut tests exactly the rule the walk applies. This checks which
         # function calls which; the behaviour tests (TestSaleNeedsDaysInARow)
-        # pin how many days a site checks
+        # pin how many days a site checks.
+        # The Kelly trim reads the same two things through two functions of
+        # its own: _fresh_bids (both sides' bids of both markets, for the
+        # chance the pair pays and its sale value at the best bids) and
+        # _kelly_trim, whose net_sale prices a part sale through
+        # _position_sale_value, so a trim and a take-profit sale walk one
+        # ladder with one fee rule
         sale_readers: dict[str, set] = {"bid_at_checkpoint": set(), "paid_at_checkpoint": set(),
                                         "sale_ladder": set(), "_position_sale_value": set(),
                                         "_sells_at": set()}
@@ -3655,10 +3661,11 @@ class TestTimeSeriesKellyParity:
                     name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
                     if name in sale_readers:
                         sale_readers[name].add(func.name)
-        assert sale_readers == {"bid_at_checkpoint": {"_position_sale_value"},
+        assert sale_readers == {"bid_at_checkpoint": {"_position_sale_value", "_fresh_bids"},
                                 "paid_at_checkpoint": {"_position_sale_value"},
                                 "sale_ladder": {"_position_sale_value"},
-                                "_position_sale_value": {"_hold_readings"},
+                                "_position_sale_value": {"_hold_readings", "_kelly_trim",
+                                                         "net_sale"},
                                 "_sells_at": {"_hold_readings", "_reached_every_day"}}
         assert _function_calls(backtester, "_position_sale_value", "_ladder_average")
         ladder_builders = {func.name for func in ast.walk(tree)
@@ -3674,6 +3681,46 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(backtester, "_simulate_at_discount", "_position_sells")
         for func in ("_simulate_at_discount", "_sale_reach"):
             assert _function_calls(backtester, func, "_positions"), func
+        # Trimming to Kelly: the walk decides every trim through _kelly_trim
+        # (called in one place, its planned_trims), which takes the chance
+        # the pair pays, the count to sell and the pair's cap from the
+        # functions live code can import (config.held_pair_win_prob,
+        # kelly_trim_count, pair_size_cap), and the walk records a part sale
+        # through _split_trade and _sold_copy, never a second BacktestTrade(
+        trim_callers = {func.name for func in ast.walk(tree)
+                        if isinstance(func, ast.FunctionDef)
+                        and any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                                and sub.func.id == "_kelly_trim" for sub in ast.walk(func))}
+        assert trim_callers == {"_simulate_at_discount", "planned_trims"}
+        # ... handed the checkpoint's own date and value and the run's own k
+        # and caps, and decided before the valuation the day's purchases are
+        # sized on (the one checkpoint_value assignment)
+        walk = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "_simulate_at_discount")
+        [decided] = _calls_to(walk, "_kelly_trim")
+        assert [ast.unparse(arg) for arg in decided.args] == [
+            "position", "d", "value", "effective_k", "cap", "st_cap"] and not decided.keywords
+        plans = _calls_to(walk, "planned_trims")
+        assert sorted(ast.unparse(call) for call in plans) == [
+            "planned_trims(d, value, open_now)",
+            "planned_trims(d, value_before_trims, open_trades)",
+            "planned_trims(d, value_before_trims, open_trades)"]
+        valued = [node.lineno for node in ast.walk(walk) if isinstance(node, ast.Assign)
+                  and ast.unparse(node.targets[0]) == "checkpoint_value"
+                  and ast.unparse(node.value) != "cash"]
+        sells = [call.lineno for call in _calls_to(walk, "sell")]
+        trims = [call.lineno for call in _calls_to(walk, "trim")]
+        # In each branch of the loop: sell, then trim; and at a checkpoint
+        # with candidates, both before the valuation
+        assert len(valued) == 1 and len(sells) == 2 and len(trims) == 2
+        assert sells[0] < trims[0] < sells[1] < trims[1] < valued[0]
+        for shared in ("held_pair_win_prob", "kelly_trim_count", "pair_size_cap", "_fresh_bids",
+                       "_exact_pair", "_last_bought_first", "fee_per_pair_approx"):
+            assert _function_calls(backtester, "_kelly_trim", shared), shared
+        for helper in ("_split_trade", "_sold_copy", "_sale_stream"):
+            assert _function_calls(backtester, "_simulate_at_discount", helper), helper
+        assert _function_calls(backtester, "_split_trade", "_settlement_receipt")
+        assert _function_calls(backtester, "_split_trade", "_paid_prices")
         # sold_grid and _sale_reach are the Sell family's one path: no
         # level-only shortcut or reader exists beside them
         assert not hasattr(backtester, "_highest_sale_level")

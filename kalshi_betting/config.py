@@ -38,7 +38,7 @@ Notes:
     days_to_maturity) live here, where seller.py may import them, so live
     selling and the backtest apply the same arithmetic. So does the rule that
     trims a held pair to its Kelly size (held_pair_win_prob,
-    kelly_hold_fraction, kelly_trim_count), which only the backtest reads today.
+    kelly_hold_fraction, kelly_trim_count), which the backtest reads.
 """
 import fcntl
 import json
@@ -3514,6 +3514,10 @@ def days_to_maturity(close_dates, day: date) -> int | None:
 # itself, since the error of a float division grows with its result
 _TRIM_COUNT_SLACK = 1e-9
 _TRIM_COUNT_RELATIVE_SLACK = 1e-12
+# How many counts above the one halving settles on kelly_trim_count also
+# tries: a fee rounded up to the cent weighs more on a small sale, so a count
+# can be wanted where a slightly smaller one is not
+_TRIM_COUNT_SCAN = 32
 
 
 def held_pair_win_prob(pair_type: str, yes_ask_a: float, no_ask_a: float,
@@ -3624,12 +3628,17 @@ def kelly_trim_count(count: int, portfolio_value: float, win_prob: float, cap: f
       2. A sale of several pairs walks down the bids, so it returns less per
          pair than the best bids do (net_sale). A worse price both raises the
          share Kelly lets the pair keep and makes each pair count for less,
-         so fewer pairs are wanted sold. The answer is the largest sale that
-         is still wanted at its own price: selling that many returns a price
-         per pair at which the pair wants at least that many sold. A count
-         the bids cannot take is never the answer.
-    So a thin or steep book sells fewer, never more. The largest such sale
-    is found by halving, and whatever count comes back was itself checked.
+         so fewer pairs are wanted sold. The answer is a sale that is still
+         wanted at its own price: selling that many returns a price per pair
+         at which the pair wants at least that many sold. A count the bids
+         cannot take is never the answer.
+    So a thin or steep book sells fewer, never more. The search halves its
+    way to a count that is still wanted next to one that is not, then tries
+    the _TRIM_COUNT_SCAN counts above it, largest first, because fees
+    rounded up to the cent make a few-pair sale cost more per pair than a
+    slightly larger one. Whatever count comes back was itself checked. It is
+    the largest still-wanted count whenever a larger sale never becomes
+    wanted again; where rounding breaks that, it can be a smaller one.
 
     Why cap_free_from is right: write share for kelly_hold_fraction at a
     price and held for count x that price / portfolio_value. A cap c changes
@@ -3693,6 +3702,10 @@ def kelly_trim_count(count: int, portfolio_value: float, win_prob: float, cap: f
             low = middle
         else:
             high = middle
+    # The counts just above, largest first (`most` itself was tried above)
+    for pairs in range(min(most - 1, low + _TRIM_COUNT_SCAN), low, -1):
+        if still_wanted(pairs):
+            return KellyTrim(pairs, max(levels))
     return KellyTrim(low, max(levels))
 
 

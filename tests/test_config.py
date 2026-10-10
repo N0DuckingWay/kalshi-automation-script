@@ -1837,6 +1837,25 @@ class TestKellyTrimCount:
             keep = math.floor(0.10 * 1_000.0 / price)
             assert (300 - keep >= pairs) is wanted
 
+    def test_a_small_excess_is_sold_though_a_smaller_sale_would_not_be_wanted(self):
+        # Two legs at 0.24 and 0.20, each sale's fee rounded up to the cent
+        # per leg. The cap wants 20 sold at the best bids. A sale of a few
+        # pairs nets too little per pair to be wanted (the two rounded fees
+        # weigh on it), so halving from 20 ends on none; 16 is wanted
+        def net_sale(pairs):
+            return sum(pairs * bid - config.fee_leg_exact(pairs, bid) for bid in (0.24, 0.20))
+        top = 0.44 - config.fee_per_pair_approx(0.24, 0.20)
+        count, value, cap = 4396, 18_207.29, 0.10
+        trim = config.kelly_trim_count(count, value, 0.9, cap, top, net_sale)
+
+        def wanted_at_its_own_price(pairs):
+            price = net_sale(pairs) / pairs
+            return count - math.floor(cap * value / price) >= pairs
+        assert trim.sell > 0 and wanted_at_its_own_price(trim.sell)
+        assert not wanted_at_its_own_price(1)
+        # ... and it is the largest such count
+        assert not any(wanted_at_its_own_price(pairs) for pairs in range(trim.sell + 1, 41))
+
     def test_a_better_real_price_never_sells_more_than_the_best_bids_asked_for(self):
         trim = config.kelly_trim_count(300, 1_000.0, 0.9, 0.10, 0.60, _flat_sale(0.70))
         assert trim.sell == 300 - 166
@@ -1849,8 +1868,9 @@ class TestKellyTrimCount:
             return None if pairs > 37 else pairs * 0.60
         trim = config.kelly_trim_count(300, 1_000.0, 0.9, 0.10, 0.60, net_sale)
         assert trim.sell == 37
-        # Found by halving, never one count at a time
-        assert len(asked) <= 12
+        # Found by halving, then a fixed number of counts above: never one
+        # count at a time over the whole range
+        assert len(asked) <= 12 + config._TRIM_COUNT_SCAN
 
     def test_bids_that_hold_nothing_sell_nothing(self):
         trim = config.kelly_trim_count(300, 1_000.0, 0.9, 0.10, 0.60, _flat_sale(0.60, depth=0))

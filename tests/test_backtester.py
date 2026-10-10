@@ -32,7 +32,7 @@ import pytest
 # /historical route through its own _signed_raw_get, since the pinned SDK has
 # no historical_api module at all), so backtester.py is always importable
 # and its pure-logic functions are unit-testable offline.
-from kalshi_betting import backtester, depth_model, historical, scanner
+from kalshi_betting import backtester, config, depth_model, historical, scanner
 from kalshi_betting.backtester import (
     _can_ever_enter,
     _extract_pairs,
@@ -20669,6 +20669,519 @@ class TestWalkedSales:
         # With no model the quiet day changes nothing: sold on Monday 2
         (plain,) = self._SUITE._sim(records(True, walked=False), 0.25).trades
         assert plain.sold and plain.exit_date == _LADDER_M2
+
+
+# ─── Trimming a held pair to its Kelly size ──────────────────────────────────
+
+def _label(cap: float) -> str:
+    """A k 0.75, band 0-1, "all" run's label at `cap`, as its log lines write it
+    (the run's own cap, backtester.BUDGET_FRACTION, is not named)."""
+    named = "" if cap == backtester.BUDGET_FRACTION else f", {backtester._cap_label(cap)}"
+    return f"k=0.750, band 0-1, all{named}"
+
+
+class TestTrimHelpers:
+    """The pieces the Kelly trim is built from: the four fresh bids it reads,
+    which positions are one exact pair, which trade's contracts go first, and
+    how a trade sold in part is split in two."""
+
+    def _pair(self, n: int, model=None):
+        return _held_trade(n, _sale_quotes("QA", 0.40, 0.58, model),
+                           _sale_quotes("QB", 0.44, 0.55, model))
+
+    def test_fresh_bids_are_both_sides_of_both_markets(self):
+        assert backtester._fresh_bids(self._pair(10), _LADDER_M2) == (0.40, 0.58, 0.44, 0.55)
+
+    def test_fresh_bids_need_quotes_and_every_bid(self):
+        trade = self._pair(10)
+        assert backtester._fresh_bids(dc_replace(trade, marks=None), _LADDER_M2) is None
+        # A week later the hand-built quotes hold no checkpoint: no bid
+        assert backtester._fresh_bids(trade, _LADDER_M3) is None
+        nan = float("nan")
+        for a, b in ((_sale_quotes("QA", nan, 0.58, None), _sale_quotes("QB", 0.44, 0.55, None)),
+                     (_sale_quotes("QA", 0.40, 0.58, None), _sale_quotes("QB", 0.44, nan, None))):
+            assert backtester._fresh_bids(_held_trade(10, a, b), _LADDER_M2) is None
+
+    def test_an_exact_pair_is_one_pair_bought_one_way_round(self):
+        first = self._pair(10)
+        assert backtester._exact_pair([first])
+        assert backtester._exact_pair([first, dc_replace(first, n=3, add_on=True)])
+        # A third market, the legs the other way round, or another pair type is not
+        assert not backtester._exact_pair([first, dc_replace(first, ticker_b="QC")])
+        assert not backtester._exact_pair(
+            [first, dc_replace(first, ticker_a="QB", ticker_b="QA")])
+        assert not backtester._exact_pair([first, dc_replace(first, pair_type="same_title")])
+
+    def test_the_latest_trade_is_sold_first(self):
+        position = [self._pair(100), self._pair(30), self._pair(20)]
+        assert backtester._last_bought_first(position, 10) == [0, 0, 10]
+        assert backtester._last_bought_first(position, 20) == [0, 0, 20]
+        assert backtester._last_bought_first(position, 45) == [0, 25, 20]
+        assert backtester._last_bought_first(position, 150) == [100, 30, 20]
+
+    def test_a_split_trade_s_two_parts_add_up_to_it(self):
+        whole = self._pair(250)
+        whole = dc_replace(whole, total_cost=250 * 0.70, fees=3.37, fill_price_a=0.30,
+                           fill_price_b=0.40, outcome_a="no", outcome_b="no", holding_days=40,
+                           actual_payoff=250.0, profit=250.0 - 250 * 0.70 - 3.37)
+        before = dc_replace(whole)
+        part = backtester._split_trade(whole, 90)
+        # `whole` is changed in place to what is left; `part` is a new record
+        assert (part.n, whole.n) == (90, 160)
+        assert part.total_cost + whole.total_cost == pytest.approx(before.total_cost, abs=1e-9)
+        assert part.fees + whole.fees == pytest.approx(before.fees, abs=1e-12)
+        assert part.total_cost == pytest.approx(90 * 0.70, abs=1e-9)
+        for piece in (part, whole):
+            # Each part pays out, and is figured, as a whole trade of its size
+            assert piece.actual_payoff == backtester._settlement_receipt(
+                piece.n, "no", "no", "time_series")
+            assert piece.profit == piece.actual_payoff - piece.total_cost - piece.fees
+            assert piece.profit_ratio == piece.profit / (piece.total_cost + piece.fees)
+            assert piece.monthly_profit_ratio == piece.profit_ratio * 30.0 / 40
+            assert piece.expected_payoff == piece.n * (1.0 - 0.30 - 0.40) - piece.fees
+            assert piece.slippage == piece.profit - piece.expected_payoff
+            # Everything about the entry and the markets is the trade's own
+            assert (piece.entry_date, piece.exit_date, piece.ticker_a, piece.ticker_b,
+                    piece.balance_at_entry, piece.marks) == (
+                before.entry_date, before.exit_date, before.ticker_a, before.ticker_b,
+                before.balance_at_entry, before.marks)
+        assert part.profit + whole.profit == pytest.approx(before.profit, abs=1e-9)
+
+    def test_a_position_that_is_not_one_exact_pair_is_left_alone(self):
+        first = self._pair(5000)
+        mixed = [first, dc_replace(first, ticker_b="QC")]
+        assert backtester._kelly_trim(mixed, _LADDER_M2, 100.0, 0.75, 0.05, 1.0) \
+            == (backtester._NO_TRIM, None)
+
+    def test_a_pair_with_a_paid_out_market_is_left_alone(self):
+        # Both bids are quoted, but market B has paid out: there is no pair to sell
+        a = _sale_quotes("QA", 0.40, 0.58, None)
+        b = _sale_quotes("QB", 0.44, 0.55, None, paid=True)
+        decision, sale = backtester._kelly_trim([_held_trade(5000, a, b)], _LADDER_M2,
+                                                100.0, 0.75, 0.05, 1.0)
+        assert decision.sell == 0 and sale is None
+
+    def test_the_decision_is_the_rule_s_on_what_the_position_shows(self):
+        # YES on QA (bid 0.40), NO on QB (bid 0.55); asks are 1 - the other side's bid
+        trade = self._pair(5000)
+        decision, (sold, per_trade) = backtester._kelly_trim(
+            [trade], _LADDER_M2, 10_000.0, 0.75, 0.20, 1.0)
+        win = config.held_pair_win_prob("time_series", 1 - 0.58, 1 - 0.40, 1 - 0.55, 1 - 0.44,
+                                        0.75)
+        top = 0.40 + 0.55 - fee_per_pair_approx(0.40, 0.55)
+        expected = config.kelly_trim_count(
+            5000, 10_000.0, win, 0.20, top,
+            lambda pairs: _sale_value(pairs, ("bid", 0.40), ("bid", 0.55)))
+        assert decision == expected and 0 < decision.sell < 5000
+        assert sold == [decision.sell]
+        ((value, _fees, prices),) = per_trade
+        assert prices == (0.40, 0.55)
+        assert value == _sale_value(decision.sell, ("bid", 0.40), ("bid", 0.55))
+
+    def test_with_no_cap_binding_kelly_s_share_decides_and_reads_k(self):
+        # 9,000 pairs are most of a $10,000 portfolio. With no cap, what may
+        # stay is Kelly's share, which rests on the chance the pair pays:
+        # 1 - k x the mid spread of these quotes. A smaller k believes less
+        # of that spread, so more may stay and fewer are sold
+        trade = self._pair(9000)
+        top = 0.40 + 0.55 - fee_per_pair_approx(0.40, 0.55)
+        sells = {}
+        for k in (0.75, 0.5):
+            decision, _sale = backtester._kelly_trim([trade], _LADDER_M2, 10_000.0, k, 1.0, 1.0)
+            win = config.held_pair_win_prob("time_series", 1 - 0.58, 1 - 0.40, 1 - 0.55,
+                                            1 - 0.44, k)
+            assert config.kelly_hold_fraction(win, top) < 0.9   # below the position's share
+            assert decision == config.kelly_trim_count(
+                9000, 10_000.0, win, 1.0, top,
+                lambda pairs: _sale_value(pairs, ("bid", 0.40), ("bid", 0.55)))
+            sells[k] = decision.sell
+        assert sells[0.75] > sells[0.5] > 0
+
+    def test_a_same_title_pair_is_capped_by_the_same_title_cap(self):
+        a, b = _sale_quotes("QA", 0.60, 0.30, None), _sale_quotes("QB", 0.25, 0.70, None)
+        trade = _held_trade(5000, a, b, pair_type="same_title")
+        loose, _ = backtester._kelly_trim([trade], _LADDER_M2, 10_000.0, 0.75, 1.0, 1.0)
+        tight, _ = backtester._kelly_trim([trade], _LADDER_M2, 10_000.0, 0.75, 1.0, 0.10)
+        assert tight.sell > loose.sell
+
+    def test_a_thin_ladder_sells_no_more_than_it_holds(self):
+        model = _ladder_model(((0.0, 100.0), (0.01, 200.0)))
+        decision, (sold, _per_trade) = backtester._kelly_trim(
+            [self._pair(5000, model)], _LADDER_M2, 10_000.0, 0.75, 0.05, 1.0)
+        # The modeled bids hold 300 contracts a market
+        assert decision.sell == 300 and sold == [300]
+
+
+class TestTrimToKelly:
+    """With trim_to_kelly, the cash walk sells part of a held pair once it is
+    worth more than its Kelly share of the portfolio value, each contract
+    pair counted at what selling it returns (the bids, less the fee). It
+    checks at every entry checkpoint, after the day's pay-outs and
+    take-profit sales and before the day's purchases are sized.
+
+    The fixture is TestSellAtShareOfPotentialProfit's pair: YES on SA at 0.20
+    and NO on SB at 0.40, bought on Monday 1; the bids rise on Monday 2 (YES
+    0.28 / NO 0.55) and Monday 3 (0.29 / 0.62), so the position grows past a
+    size cap it was bought at. Every simulation is handed k 0.75."""
+
+    _SUITE = TestSellAtShareOfPotentialProfit
+    _START = date(2026, 1, 1)
+    _BALANCE = 10_000.0
+    _LINE = "Positions trimmed to their Kelly size"
+
+    def _records(self, mondays=(_LADDER_M1,), candles=None):
+        return _quoted([self._SUITE._record(mondays)],
+                       self._SUITE._candles() if candles is None else candles)
+
+    def _sim(self, records, cap=0.20, **kw):
+        return backtester._simulate_at_discount(
+            records, self._START, self._BALANCE, k=0.75, size_cap=cap,
+            end_date=date(2026, 4, 1), **kw)
+
+    @staticmethod
+    def _same(point, base) -> None:
+        assert [astuple(t) for t in point.trades] == [astuple(t) for t in base.trades]
+        pd.testing.assert_frame_equal(point.equity_df, base.equity_df, check_exact=True)
+
+    def test_off_is_the_default(self):
+        default = inspect.signature(backtester._simulate_at_discount).parameters["trim_to_kelly"]
+        assert default.default is False and default.kind is default.KEYWORD_ONLY
+        records = self._records()
+        base, off = self._sim(records), self._sim(records, trim_to_kelly=False)
+        self._same(off, base)
+        assert base.trim_to_kelly is False and off.trim_to_kelly is False
+        assert self._sim(records, trim_to_kelly=True).trim_to_kelly is True
+
+    def test_a_run_in_which_nothing_is_trimmed_is_the_run_without_the_switch(self, caplog):
+        # With no cap the pair never outgrows its Kelly share: every figure
+        # of the run is the one it has without the switch
+        records = self._records((_LADDER_M1, _LADDER_M2, _LADDER_M3))
+        with caplog.at_level(logging.INFO):
+            base = self._sim(records, cap=1.0)
+            caplog.clear()
+            point = self._sim(records, cap=1.0, trim_to_kelly=True)
+        self._same(point, base)
+        assert self._LINE not in caplog.text
+        assert f"Backtest complete at {_label(1.0)}, trimming to Kelly:" in caplog.text
+        # A trade with no quotes cannot be priced, so it is never trimmed
+        bare = [self._SUITE._record()]
+        self._same(self._sim(bare, cap=0.05, trim_to_kelly=True), self._sim(bare, cap=0.05))
+
+    def test_a_pair_past_its_cap_is_sold_down_by_the_rule(self, caplog):
+        records = self._records()
+        (held,) = self._sim(records).trades
+        with caplog.at_level(logging.INFO):
+            point = self._sim(records, trim_to_kelly=True)
+        kept, first, second = point.trades
+        n = held.n
+        # Monday 2: the portfolio is the cash left plus the pair at its asks
+        # (YES 0.30 on SA, NO 0.57 on SB)
+        value = self._BALANCE - held.total_cost - held.fees + n * (0.30 + 0.57)
+        # ... its bids are YES 0.28 / NO 0.70 on SA and YES 0.43 / NO 0.55 on SB
+        win = config.held_pair_win_prob("time_series", 0.30, 0.72, 0.45, 0.57, 0.75)
+        top = 0.28 + 0.55 - fee_per_pair_approx(0.28, 0.55)
+        rule = config.kelly_trim_count(
+            n, value, win, 0.20, top,
+            lambda pairs: _sale_value(pairs, ("bid", 0.28), ("bid", 0.55)))
+        assert 0 < rule.sell < n and first.n == rule.sell
+        # What is left is within the cap at what it sells for, and one more pair is not
+        per_pair = _sale_value(first.n, ("bid", 0.28), ("bid", 0.55)) / first.n
+        assert (n - first.n) * per_pair <= 0.20 * value < (n - first.n + 1) * per_pair
+        # The part sold: a trade of its own, entered with the pair, sold on Monday 2
+        assert first.sold and (first.entry_date, first.exit_date) == (_LADDER_M1, _LADDER_M2)
+        assert (first.sale_price_a, first.sale_price_b) == (0.28, 0.55)
+        assert first.sale_fees == fee_leg_exact(first.n, 0.28) + fee_leg_exact(first.n, 0.55)
+        assert first.actual_payoff == _sale_value(first.n, ("bid", 0.28), ("bid", 0.55))
+        assert first.profit == first.actual_payoff - first.total_cost - first.fees
+        # Monday 3's higher bids trim it again; the rest is held to its pay-out
+        assert second.sold and second.exit_date == _LADDER_M3
+        assert (second.sale_price_a, second.sale_price_b) == (0.29, 0.62)
+        assert not kept.sold and kept.exit_date == held.exit_date
+        assert kept.actual_payoff == kept.n
+        # The three parts add up to the trade that was bought
+        assert kept.n + first.n + second.n == n
+        assert sum(t.total_cost for t in point.trades) == pytest.approx(held.total_cost, abs=1e-9)
+        assert sum(t.fees for t in point.trades) == pytest.approx(held.fees, abs=1e-9)
+        # ... and the curve still ends at the start plus every part's profit
+        assert point.equity_df["portfolio_value"].iloc[-1] == pytest.approx(
+            self._BALANCE + sum(t.profit for t in point.trades), abs=1e-9)
+        assert (f"{self._LINE} ({_label(0.20)}, trimming to Kelly): 2 "
+                f"(contract pairs sold: {first.n + second.n})") in caplog.text
+
+    def test_a_trim_s_cash_and_what_is_left_are_what_the_next_purchase_is_sized_on(self):
+        # A second pair qualifies on Monday 3 only; the first is trimmed on
+        # Monday 2 (no candidate there) and again on Monday 3, before it
+        other = _ladder_record(_ladder_market("OA", "EVO-1", "2026-02-10"),
+                               _ladder_market("OB", "EVO-2", "2026-03-20"), "other",
+                               (_LADDER_M3,))
+        candles = dict(self._SUITE._candles(),
+                       OA=[_candle(_ck(_LADDER_M3), 0.20, 0.82)],
+                       OB=[_candle(_ck(_LADDER_M3), 0.60, 0.42)])
+        point = self._sim(_quoted([self._SUITE._record(), other], candles), trim_to_kelly=True)
+        kept, first, second, bought = point.trades
+        assert (bought.ticker_a, bought.entry_date) == ("OA", _LADDER_M3)
+        parts = (kept, first, second)
+        cash = (self._BALANCE - sum(t.total_cost + t.fees for t in parts)
+                + first.actual_payoff + second.actual_payoff)
+        # What is left of the first pair, at Monday 3's asks (YES 0.31, NO 0.64)
+        assert bought.balance_at_entry == pytest.approx(cash + kept.n * (0.31 + 0.64), abs=1e-6)
+
+    def test_what_is_left_of_a_trimmed_trade_pays_out_its_own_smaller_receipt(self):
+        # A pair that qualifies only after the first has paid out (03-20) is
+        # sized on the cash alone: the start plus every part's profit
+        day = date(2026, 3, 23)
+        late = _ladder_record(_ladder_market("LA", "EVL-1", "2026-04-02"),
+                              _ladder_market("LB", "EVL-2", "2026-04-05"), "late", (day,))
+        candles = dict(self._SUITE._candles(), LA=[_candle(_ck(day), 0.20, 0.82)],
+                       LB=[_candle(_ck(day), 0.60, 0.42)])
+        point = backtester._simulate_at_discount(
+            _quoted([self._SUITE._record(), late], candles), self._START, self._BALANCE,
+            k=0.75, size_cap=0.20, end_date=date(2026, 4, 10), trim_to_kelly=True)
+        kept, first, second, bought = point.trades
+        assert bought.entry_date == day and first.sold and second.sold and not kept.sold
+        assert bought.balance_at_entry == pytest.approx(
+            self._BALANCE + kept.profit + first.profit + second.profit, abs=1e-6)
+
+    def test_a_pay_out_on_the_trim_s_monday_counts_in_the_value_it_is_sized_on(self):
+        # A second pair bought on Monday 1 pays out on Monday 2, where nothing
+        # is bought: its receipt is cash by the time the first pair is trimmed
+        early = _ladder_record(_ladder_market("PA", "EVP-1", "2026-01-12"),
+                               _ladder_market("PB", "EVP-2", "2026-01-12"), "early",
+                               (_LADDER_M1,))
+        candles = dict(self._SUITE._candles(), PA=[_candle(_ck(_LADDER_M1), 0.20, 0.82)],
+                       PB=[_candle(_ck(_LADDER_M1), 0.60, 0.42)])
+        point = self._sim(_quoted([self._SUITE._record(), early], candles), trim_to_kelly=True)
+        paid, kept, first, second = point.trades
+        assert paid.ticker_a == "PA" and paid.exit_date == _LADDER_M2
+        n = kept.n + first.n + second.n
+        spent = sum(t.total_cost + t.fees for t in point.trades)
+        win = config.held_pair_win_prob("time_series", 0.30, 0.72, 0.45, 0.57, 0.75)
+        top = 0.28 + 0.55 - fee_per_pair_approx(0.28, 0.55)
+
+        def rule(value: float) -> int:
+            return config.kelly_trim_count(
+                n, value, win, 0.20, top,
+                lambda pairs: _sale_value(pairs, ("bid", 0.28), ("bid", 0.55))).sell
+        before = self._BALANCE - spent + n * (0.30 + 0.57)
+        assert first.exit_date == _LADDER_M2
+        assert first.n == rule(before + paid.actual_payoff) != rule(before)
+
+    @pytest.mark.parametrize("candidate", [False, True])
+    def test_a_trim_is_sized_on_what_a_take_profit_sale_on_its_monday_left(self, candidate):
+        # Two pairs bought on Monday 1. On Monday 2 the second reaches its
+        # 50% take-profit level and is sold whole; the first is then trimmed
+        # on the portfolio the sale left (its cash, where it stood at its
+        # asks before). With `candidate`, a third pair is bought that Monday
+        two = _ladder_record(_ladder_market("UA", "EVU-1", "2026-02-10"),
+                             _ladder_market("UB", "EVU-2", "2026-03-20"), "two", (_LADDER_M1,))
+        records = [self._SUITE._record(), two]
+        candles = dict(self._SUITE._candles(),
+                       UA=[_candle(_ck(_LADDER_M1), 0.20, 0.82), *_held(_LADDER_M2, 0.31, 0.71)],
+                       UB=[_candle(_ck(_LADDER_M1), 0.60, 0.42), *_held(_LADDER_M2, 0.32, 0.70)])
+        if candidate:
+            records.append(_ladder_record(_ladder_market("XA", "EVX-1", "2026-02-10"),
+                                          _ladder_market("XB", "EVX-2", "2026-03-20"), "x",
+                                          (_LADDER_M2,)))
+            candles.update(XA=[_candle(_ck(_LADDER_M2), 0.20, 0.82)],
+                           XB=[_candle(_ck(_LADDER_M2), 0.60, 0.42)])
+        point = self._sim(_quoted(records, candles), cap=0.10, sell_at=0.5, trim_to_kelly=True)
+        rest, sold, part = point.trades[:3]
+        assert sold.ticker_a == "UA" and sold.sold and sold.exit_date == _LADDER_M2
+        assert part.ticker_a == "SA" and part.sold and part.exit_date == _LADDER_M2
+        n = rest.n + part.n
+        cash = (self._BALANCE - (rest.total_cost + rest.fees) - (part.total_cost + part.fees)
+                - (sold.total_cost + sold.fees))
+        win = config.held_pair_win_prob("time_series", 0.30, 0.72, 0.45, 0.57, 0.75)
+        top = 0.28 + 0.55 - fee_per_pair_approx(0.28, 0.55)
+
+        def rule(value: float) -> int:
+            return config.kelly_trim_count(
+                n, value, win, 0.10, top,
+                lambda pairs: _sale_value(pairs, ("bid", 0.28), ("bid", 0.55))).sell
+        after_the_sale = cash + sold.actual_payoff + n * (0.30 + 0.57)
+        before_the_sale = cash + sold.n * (0.31 + 0.70) + n * (0.30 + 0.57)
+        assert part.n == rule(after_the_sale) != rule(before_the_sale)
+        if candidate:
+            bought = point.trades[3]
+            assert (bought.ticker_a, bought.entry_date) == ("XA", _LADDER_M2)
+            # ... and the purchase is sized on what the sale and the trim left
+            assert bought.balance_at_entry == pytest.approx(
+                cash + sold.actual_payoff + part.actual_payoff + rest.n * (0.30 + 0.57),
+                abs=1e-6)
+
+    def test_between_the_size_sold_down_to_and_the_size_bought_up_to_nothing_trades(self):
+        # Trimmed on Monday 2; Monday 3 has the same quotes and the pair
+        # qualifies there, with adding on. It is neither trimmed again nor
+        # added to: it sits between the two sizes. On Monday 4 its prices
+        # fall and its quotes widen, and it is added to
+        candles = {"SA": [_candle(_ck(_LADDER_M1), 0.20, 0.82), *_held(_LADDER_M2, 0.30, 0.72),
+                          *_held(_LADDER_M3, 0.30, 0.72), *_held(_M4, 0.12, 0.90)],
+                   "SB": [_candle(_ck(_LADDER_M1), 0.60, 0.42), *_held(_LADDER_M2, 0.45, 0.57),
+                          *_held(_LADDER_M3, 0.45, 0.57), *_held(_M4, 0.70, 0.32)]}
+        mondays = (_LADDER_M1, (_LADDER_M2, 0.30, 0.45, 0.57), (_LADDER_M3, 0.30, 0.45, 0.57),
+                   (_M4, 0.12, 0.70, 0.32))
+        point = self._sim(self._records(mondays, candles), cap=0.10, add_to_held=True,
+                          trim_to_kelly=True)
+        kept, part, added = point.trades
+        assert part.sold and part.exit_date == _LADDER_M2
+        assert added.add_on and added.entry_date == _M4
+        # What the add-on may take is the pair's share less what is left of
+        # the trimmed trade stakes: its contracts at Monday 4's asks (YES
+        # 0.12, NO 0.32) plus its share of the fees paid
+        stake = kept.n * (0.12 + 0.32) + kept.fees
+        assert added.kelly_fraction == pytest.approx(
+            config.held_pair_fraction(0.10, stake, added.balance_at_entry), abs=1e-9)
+        # ... not what the whole purchase staked before it was trimmed
+        whole = stake + part.fees + part.n * (0.12 + 0.32)
+        assert added.kelly_fraction > config.held_pair_fraction(
+            0.10, whole, added.balance_at_entry) + 1e-4
+
+    def test_a_missing_or_crossed_quote_leaves_the_pair_alone_that_monday(self):
+        at = lambda series: next(i for i, c in enumerate(series)  # noqa: E731
+                                 if c["ts"] == _ck(_LADDER_M2))
+        # SB's Monday 2 candle is a period and a second old: no fresh bid there
+        stale = self._SUITE._candles()
+        stale["SB"][at(stale["SB"])] = dict(stale["SB"][at(stale["SB"])],
+                                            ts=_ck(_LADDER_M2) - 3601)
+        # SA's Monday 2 candle is crossed: its YES ask 0.30 under its YES bid 0.35
+        crossed = self._SUITE._candles()
+        crossed["SA"][at(crossed["SA"])] = _candle(_ck(_LADDER_M2), 0.30, 0.65)
+        for candles in (stale, crossed):
+            point = self._sim(self._records(candles=candles), trim_to_kelly=True)
+            assert [t.exit_date for t in point.trades if t.sold] == [_LADDER_M3]
+
+    def test_every_cap_at_or_above_cap_free_from_trades_as_no_cap_does(self):
+        # The size-cap sweep shares one simulation across those caps
+        records = self._records((_LADDER_M1, _LADDER_M2, _LADDER_M3))
+        free = self._sim(records, cap=1.0, trim_to_kelly=True)
+        assert free.cap_free_from > self._sim(records, cap=1.0).cap_free_from
+        shared = differing = 0
+        for cap in backtester.SIZE_CAP_SWEEP:
+            point = self._sim(records, cap=cap, trim_to_kelly=True)
+            if cap >= point.cap_free_from:
+                self._same(point, free)
+                shared += 1
+            else:
+                differing += [astuple(t) for t in point.trades] != [astuple(t)
+                                                                    for t in free.trades]
+        assert shared >= 2 and differing >= 2
+
+    def test_a_converged_same_title_pair_is_sold_whole_and_frees_its_markets(self, caplog):
+        # NO on TA and YES on TB, bought on Monday 1. On Monday 2 the two
+        # bids (0.52 and 0.49) come to more than the 0.95 the pair is
+        # expected to pay: there is nothing left to hold it for
+        a = _ladder_market("TA", "EVT-1", "2026-03-20", result="no")
+        b = _ladder_market("TB", "EVU-1", "2026-03-20", result="yes")
+        # A time-series pair on TA passes on Mondays 2 and 3
+        c = _ladder_market("TC", "EVV-1", "2026-03-25")
+        later = _ladder_record(a, c, "later", (_LADDER_M2, _LADDER_M3))
+        candles = {"TA": [_candle(_ck(_LADDER_M1), 0.70, 0.30), *_held(_LADDER_M2, 0.48, 0.54)],
+                   "TB": [_candle(_ck(_LADDER_M1), 0.40, 0.62), *_held(_LADDER_M2, 0.51, 0.51)],
+                   "TC": [_candle(_ck(_LADDER_M2), 0.60, 0.42)]}
+        records = _quoted([_ladder_same_title(a, b, (_LADDER_M1,)), later], candles)
+        base = self._sim(records, cap=0.10)
+        # Without the switch TA stays taken until it pays out: the second pair never trades
+        assert _traded(base) == [("TA", _LADDER_M1)]
+        with caplog.at_level(logging.INFO):
+            point = self._sim(records, cap=0.10, trim_to_kelly=True)
+        sold, bought = point.trades
+        assert sold.sold and sold.exit_date == _LADDER_M2 and sold.n == base.trades[0].n
+        assert (sold.sale_price_a, sold.sale_price_b) == (0.52, 0.49)
+        # TA is free again, but not at the checkpoint it was sold at
+        assert (bought.pair_type, bought.ticker_a, bought.entry_date) == (
+            "time_series", "TA", _LADDER_M3)
+        assert f"contract pairs sold: {sold.n})" in caplog.text
+
+    def test_with_adding_on_the_latest_contracts_are_sold_first(self):
+        # The pair is bought on Monday 1 and added to on Monday 2, when its
+        # quotes widen; on Monday 3 its bids are up and it is past its cap
+        candles = {"SA": [_candle(_ck(_LADDER_M1), 0.20, 0.82), *_held(_LADDER_M2, 0.15, 0.87),
+                          *_held(_LADDER_M3, 0.34, 0.68), *_held(_M4, 0.36, 0.66)],
+                   "SB": [_candle(_ck(_LADDER_M1), 0.60, 0.42), *_held(_LADDER_M2, 0.65, 0.37),
+                          *_held(_LADDER_M3, 0.40, 0.62), *_held(_M4, 0.38, 0.64)]}
+        mondays = (_LADDER_M1, (_LADDER_M2, 0.15, 0.65, 0.35), (_LADDER_M3, 0.34, 0.40, 0.62))
+        records = self._records(mondays, candles)
+        base = self._sim(records, cap=0.10, add_to_held=True)
+        bought, added = base.trades
+        assert added.add_on and added.entry_date == _LADDER_M2
+        point = self._sim(records, cap=0.10, add_to_held=True, trim_to_kelly=True)
+        kept, add_on, part, later = point.trades
+        # Monday 3: the add-on goes whole, then part of the first purchase
+        assert add_on.add_on and add_on.sold and add_on.exit_date == _LADDER_M3
+        assert add_on.n == added.n
+        assert part.sold and not part.add_on and part.exit_date == _LADDER_M3
+        assert later.sold and not later.add_on and later.exit_date == _M4
+        assert not kept.sold and kept.n + part.n + later.n == bought.n
+        # One price a market for everything sold that Monday
+        assert (add_on.sale_price_a, add_on.sale_price_b) == (
+            part.sale_price_a, part.sale_price_b)
+        # Nothing was added at the checkpoints it was trimmed at
+        assert [t.entry_date for t in point.trades] == [
+            _LADDER_M1, _LADDER_M2, _LADDER_M1, _LADDER_M1]
+        assert point.equity_df["portfolio_value"].iloc[-1] == pytest.approx(
+            self._BALANCE + sum(t.profit for t in point.trades), abs=1e-9)
+
+    def test_take_profit_sales_come_first(self, caplog):
+        # At a 25% level the whole pair is sold on Monday 2, so there is
+        # nothing left there for the trim
+        records = self._records()
+        with caplog.at_level(logging.INFO):
+            point = self._sim(records, sell_at=0.25, trim_to_kelly=True)
+        (sold,) = point.trades
+        assert sold.sold and sold.exit_date == _LADDER_M2
+        assert sold.n == self._sim(records).trades[0].n
+        assert "Positions sold before they paid out" in caplog.text
+        assert self._LINE not in caplog.text
+        self._same(point, self._sim(records, sell_at=0.25))
+        # At a level never reached, only the trim sells
+        high = self._sim(records, sell_at=1.0, trim_to_kelly=True)
+        self._same(high, self._sim(records, trim_to_kelly=True))
+
+    def test_a_modeled_ladder_bounds_what_a_trim_sells(self):
+        candles = _with_volume(self._SUITE._candles(), after=_ck(_LADDER_M1))
+        thin = [self._SUITE._record()]
+        backtester._attach_leg_quotes(thin, candles, self._START,
+                                      _ladder_model(((0.0, 50.0),)))
+        point = self._sim(thin, trim_to_kelly=True)
+        sold = [t for t in point.trades if t.sold]
+        # 50 contracts rest at the best bid: each trim sells that many, where
+        # with no model Monday 2 alone sells several hundred
+        assert [t.n for t in sold] == [50, 50]
+        assert [t.exit_date for t in sold] == [_LADDER_M2, _LADDER_M3]
+        bare = [t for t in self._sim(self._records(), trim_to_kelly=True).trades if t.sold]
+        assert bare[0].n > 300
+
+    def test_any_true_value_turns_it_on(self):
+        records = self._records()
+        on = self._sim(records, trim_to_kelly=True)
+        for value in (np.True_, 1):
+            point = self._sim(records, trim_to_kelly=value)
+            assert point.trim_to_kelly is True
+            self._same(point, on)
+
+    def test_sim_options_forwards_it_only_when_true(self):
+        assert backtester._sim_options(None, False, trim_to_kelly=False) == {}
+        assert backtester._sim_options(None, False, trim_to_kelly=True) == {
+            "trim_to_kelly": True}
+        assert backtester._sim_options(0.35, True, add_to_held=True, trim_to_kelly=True) == {
+            "size_cap": 0.35, "quiet": True, "add_to_held": True, "trim_to_kelly": True}
+
+    def test_the_checks_re_simulate_at_the_point_s_setting(self, monkeypatch):
+        records = self._records()
+        point = self._sim(records, trim_to_kelly=True)
+        seen = []
+        real = backtester._simulate_at_discount
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs.get("trim_to_kelly", False))
+            return real(*args, **kwargs)
+        monkeypatch.setattr(backtester, "_simulate_at_discount", spy)
+        backtester._ex_top_event(point, records, self._START, self._BALANCE, (0.0, 1.0))
+        backtester._half_split((records, []), self._START, self._BALANCE, 0.75, (0.0, 1.0),
+                               size_cap=0.20, trim_to_kelly=True)
+        backtester._half_split((records, []), self._START, self._BALANCE, 0.75, (0.0, 1.0),
+                               size_cap=0.20)
+        assert seen == [True, True, True, False, False]
 
 
 class _WalkedSellingGolden(_SellingGolden):
