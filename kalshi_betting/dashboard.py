@@ -72,6 +72,20 @@ Purpose:
     whose sweep has no such family, or whose family does not fit the grid,
     keeps the select disabled with a short note.
 
+    The bar's Trim to Kelly choice is "off" (the page as rendered) or "on
+    (sell down to the Kelly size)": the same scenario re-simulated so that,
+    at each weekly run, a held pair that has outgrown its Kelly size at that
+    day's sale prices (or the size cap) is sold down to it
+    (backtester._simulate_at_discount's trim_to_kelly). With Add to held
+    pairs on as well, a pair is topped up or sold down each week. The run
+    itself simulates none of them: the sweep carries a lazy family
+    (BacktestSweep.trim_sweep), and this module simulates every cell as the
+    page is built, the "all" population only (_with_trim, _walk_trim_cells).
+    The choice changes the trade sections and the header's trade count
+    only. While it is on, Sell is set to "no selling" and shut (a sell level
+    is not simulated together with trimming) and the save button is disabled
+    (live trading does not trim).
+
     The bar's Sell choice is "no selling" (the page as rendered) or one of the
     sell family's levels (backtester.SellSweep; config.TAKE_PROFIT_LEVELS,
     every 1% from 80% to 100%), and the "Min. days to maturity" select
@@ -6023,8 +6037,23 @@ _ADD_ON_NOTES = {
 # "off" turns adding off in the defaults
 _ADD_ON_SAVE_NOTE = ("The live defaults add to held pairs; saving with Add to held pairs "
                      "off here turns that off.")
-# The Trim to Kelly view's words. Appended to a scenario's summary phrase
-# when trimming is on
+# The Trim to Kelly view's words: the select's two options and its hover text
+_TRIM_OPTION_OFF = "off"
+_TRIM_OPTION_ON = "on (sell down to the Kelly size)"
+_TRIM_SELECT_TITLE = (
+    "off: a held pair is kept until it pays out. on: at each weekly run, a pair that "
+    "has grown past its Kelly size at that day's sale prices, or past the size cap, is "
+    "sold down to it, the latest purchase first; with Add to held pairs on as well, a "
+    "pair is topped up or sold down each week. Each part sold counts as a trade of its "
+    "own. While this is on, Sell is set to no selling (the two are not simulated "
+    "together) and Save as live defaults is unavailable (live trading does not trim). "
+    "The Scenario Explorer and Interval Discount sections always show it off.")
+# Beside the select when the page keeps it shut, by the payload's "trim_state"
+_TRIM_NOTES = {
+    "not simulated": "(not simulated in this backtest)",
+    "unavailable": "(not available on this page; see the log)",
+}
+# Appended to a scenario's summary phrase when trimming is on
 _TRIM_PHRASE = ", trimming to Kelly"
 # Added to the summary line while trimming is on: a part sold is a record of
 # its own in the trade counts and the Kelly chart
@@ -10931,7 +10960,8 @@ def _tier_off_where(label: str, primary: bool, same_as_tier_on: bool) -> str:
 
 def _filter_summary_text(text: dict, scenario: str, primary: bool,
                          selection: str | None, n: int, n_band: int, *,
-                         note: str | None = None, add_on: bool = False) -> str:
+                         note: str | None = None, add_on: bool = False,
+                         trim: bool = False) -> str:
     """
     Say, under the filter bar, what the page is showing.
 
@@ -10962,6 +10992,10 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
             on: the line then gains the "add_on_note" template (what an added
             purchase counts as) before its closing reach sentence, as the
             script adds it. False (default).
+        trim (bool): Keyword-only. Whether the Trim to Kelly choice is on:
+            the line then gains the "trim_note" template (what a part sold
+            counts as) after any add-on note, as the script adds it. False
+            (default).
 
     Returns:
         str: Plain text — escape it before putting it in HTML.
@@ -10974,15 +11008,16 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
     else:
         out = text["slice"].format(scenario=scenario, selection=selection, n=n,
                                    band_count=_trade_count(n_band))
-    return out + (text["add_on_note"] if add_on else "") + text["unfiltered"]
+    return (out + (text["add_on_note"] if add_on else "")
+            + (text["trim_note"] if trim else "") + text["unfiltered"])
 
 
 def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     """
-    Render the sticky filter bar: nine <select>s, the save button and a summary line.
+    Render the sticky filter bar: ten <select>s, the save button and a summary line.
 
-    Spread band, Tier floors, k, Size cap, Add to held pairs, Sell and Min.
-    days to maturity choose the scenario — each option one of the grid's axes, the run's own marked
+    Spread band, Tier floors, k, Size cap, Add to held pairs, Trim to Kelly,
+    Sell and Min. days to maturity choose the scenario — each option one of the grid's axes, the run's own marked
     " (primary)" (a band's option text is the payload's "option", which the
     script swaps for its tier-off one when the Tier floors choice changes) —
     and Category and Tag a slice of it. The Tier floors select offers each
@@ -10995,6 +11030,12 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     size cap)"), its title carrying the detail (_ADD_ON_SELECT_TITLE); a
     payload with no add-on view ("grid_add" null) puts a grey note beside it
     by its "add_state" (_ADD_ON_NOTES), and the script never enables it.
+    The Trim to Kelly select after it offers the run as simulated ("off",
+    selected) or the same scenario with held pairs sold down to their Kelly
+    size ("on (sell down to the Kelly size)"), its title carrying the detail
+    (_TRIM_SELECT_TITLE); a payload with no trim view ("grid_trim" null)
+    puts a grey note beside it by its "trim_state" (_TRIM_NOTES), and the
+    script never enables it.
     The Sell select offers "no selling" (selected) and every sell level the
     payload names (sell_levels), its title carrying the rule
     (_sell_select_title, at backtester.TAKE_PROFIT_HOLD_DAYS as the page's
@@ -11088,6 +11129,16 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                 f"{html.escape(_ADD_ON_NOTES.get(add_state, _ADD_ON_NOTES['not simulated']))}"
                 "</span>")
     add_title = html.escape(_ADD_ON_SELECT_TITLE)
+    # The Trim to Kelly choice: off (the page as rendered) or on; a page with
+    # no trim view says why beside the select it keeps shut
+    trim_opts = (f'<option value="off" selected>{html.escape(_TRIM_OPTION_OFF)}</option>'
+                 f'<option value="on">{html.escape(_TRIM_OPTION_ON)}</option>')
+    trim_state = payload.get("trim_state", "not simulated")
+    trim_note = ("" if trim_state == "shown" else
+                 '&nbsp;<span id="flt-trim-note" style="color:#9E9E9E; font-size:13px;">'
+                 f"{html.escape(_TRIM_NOTES.get(trim_state, _TRIM_NOTES['not simulated']))}"
+                 "</span>")
+    trim_title = html.escape(_TRIM_SELECT_TITLE)
     # The Sell choice: no selling (the page as rendered) or a level, each
     # option's value its index in the payload's sell_levels; a page with no
     # Sell view says why beside the select it keeps shut
@@ -11152,6 +11203,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         f'{options(payload["caps"], pc)}</select></label>&nbsp;&nbsp;'
         f'<label>Add to held pairs: <select id="flt-add" disabled autocomplete="off" '
         f'title="{add_title}">{add_opts}</select></label>{add_note}&nbsp;&nbsp;'
+        f'<label>Trim to Kelly: <select id="flt-trim" disabled autocomplete="off" '
+        f'title="{trim_title}">{trim_opts}</select></label>{trim_note}&nbsp;&nbsp;'
         f'<label>Sell: <select id="flt-sell" disabled autocomplete="off" '
         f'title="{sell_title}">{sell_opts}</select></label>{sell_note}&nbsp;&nbsp;'
         f'<label>Min. days to maturity: <select id="flt-days" disabled autocomplete="off" '
@@ -11344,7 +11397,16 @@ def _pack_text(raw: str) -> str:
 # to held pairs, neither select reaches the k-hat figures, the
 # interval-discount section nor the scenario explorer. A Sell block that
 # cannot be inflated puts every select back, as a chunk that cannot be
-# loaded does (putBack). A chunk at or past D.inline_chunks is a
+# loaded does (putBack). The Trim to Kelly select (SHOWN[9], appended
+# last) picks the same scenario with held pairs sold down to their Kelly
+# size: D.grid_trim, D.grid_trim_add with adding to held pairs on, and their
+# tier-floors-off twins (gridAt); it is enabled only when the base block
+# carries D.grid_trim. While it is on, Sell is set to "no selling" and shut
+# (refreshSell: no sell level is built for a trimming run) and the save
+# button stays disabled (saveHref: live trading does not trim); its phrase
+# and the summary line's note are Python's (D.text.trim, D.text.trim_note),
+# and it reaches neither the k-hat figures, the interval-discount section
+# nor the scenario explorer. A chunk at or past D.inline_chunks is a
 # sidecar file in D.sidecar_dir, loaded through a <script src> element whose
 # one call to window.__dashChunk hands over its packed text (sidecarText),
 # inflated by the same code as a block in the page (inflateText); a file
@@ -11394,15 +11456,19 @@ _FILTER_JS = r"""
   // must have left to be sold at its level (a value indexing D.sell_days);
   // it counts only while Sell names a level
   var daysSel = document.getElementById('flt-days');
-  if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !addSel || !sellSel || !daysSel
-      || !catSel || !tagSel) {
+  // "Trim to Kelly": the runs as simulated (off), or with each held pair
+  // sold down to its Kelly size at every weekly run (on, D.grid_trim)
+  var trimSel = document.getElementById('flt-trim');
+  if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !addSel || !trimSel || !sellSel
+      || !daysSel || !catSel || !tagSel) {
     return;
   }
   // The bar's save button: a button, not a select, so never in SELECTS
   // (whose reset reads .options); optional, since a page without it has
   // nothing to save from
   var saveBtn = document.getElementById('flt-save');
-  var SELECTS = [bandSel, tierSel, kSel, capSel, addSel, sellSel, daysSel, catSel, tagSel];
+  var SELECTS = [bandSel, tierSel, kSel, capSel, addSel, trimSel, sellSel, daysSel, catSel,
+                 tagSel];
   // The k-hat chart's own "Group by" select follows the bar's rules
   var khatGroup = document.getElementById('khat-group');
   if (khatGroup) { SELECTS.push(khatGroup); }
@@ -11414,8 +11480,9 @@ _FILTER_JS = r"""
   // indexes, the category and tag selects' values, the Tier floors choice
   // ("on" / "off"), the Add to held pairs choice ("off" / "on"), the Sell
   // choice ("none", or a level's index) and the Min. days to maturity choice
-  // (an index into D.sell_days), each appended after the others so the other
-  // indexes keep their meaning. SELL: every Sell block ("dash-sell-<i>")
+  // (an index into D.sell_days) and the Trim to Kelly choice ("off" / "on"),
+  // each appended after the others so the other indexes keep their meaning.
+  // SELL: every Sell block ("dash-sell-<i>")
   // inflated or inflating, by i — one band's chunk ids under one Tier floors
   // setting at every sell level and minimum of days, inflated the first time
   // a level is chosen there and then kept.
@@ -11451,6 +11518,9 @@ _FILTER_JS = r"""
   // The Add to held pairs choice reads "on" only on a page whose base block
   // carries its grid (the select stays disabled on any other)
   function addOn(a) { return !!(D.grid_add && a === 'on'); }
+  // The Trim to Kelly choice reads "on" only on a page whose base block
+  // carries its grid (the select stays disabled on any other)
+  function trimOn(r) { return !!(D.grid_trim && r === 'on'); }
   // The Sell choice s as a level's index into D.sell_levels, or null for
   // none (and on a page without the Sell view, whose select stays disabled)
   function sellAt(s) {
@@ -11464,24 +11534,32 @@ _FILTER_JS = r"""
     var id = D.sell_blocks[offAt(t) ? 1 : 0][b];
     return (id === null || id === undefined) ? null : id;
   }
-  // The grid of chunk ids for a Tier floors choice t and an Add to held
-  // pairs choice a, with no sell level: null when the page holds none (an
-  // add-on view with the tiers off, on a page with no tier-off add-on runs)
-  function gridAt(t, a) {
+  // The grid of chunk ids for a Tier floors choice t, an Add to held pairs
+  // choice a and a Trim to Kelly choice r, with no sell level: null when the
+  // page holds none (an add-on view with the tiers off, on a page with no
+  // tier-off add-on runs; trimming with adding on, on a page that built no
+  // such runs)
+  function gridAt(t, a, r) {
+    if (trimOn(r)) {
+      if (addOn(a)) { return offAt(t) ? D.grid_trim_add_off : D.grid_trim_add; }
+      return offAt(t) ? D.grid_trim_off : D.grid_trim;
+    }
     if (addOn(a)) { return offAt(t) ? D.grid_add_off : D.grid_add; }
     return offAt(t) ? D.grid_off : D.grid;
   }
   // The chunk id of a scenario: band b, k, cap c, Tier floors choice t, Add
-  // to held pairs choice a, Sell choice s and Min. days choice d. Three
-  // results: an id; null for a scenario the run never simulated (a whole
-  // grid missing included); or undefined while a sell level's band block is
-  // not yet inflated (choose() inflates it, then asks again). In a Sell
-  // block, -1 means the setting sells nothing: the scenario's own chunk.
-  function chunkAt(b, k, c, t, a, s, d) {
-    var g = gridAt(t, a), level = sellAt(s);
+  // to held pairs choice a, Sell choice s, Min. days choice d and Trim to
+  // Kelly choice r. Three results: an id; null for a scenario the run never
+  // simulated (a whole grid missing included, and any sell level of a
+  // trimming run, which the page never builds); or undefined while a sell
+  // level's band block is not yet inflated (choose() inflates it, then asks
+  // again). In a Sell block, -1 means the setting sells nothing: the
+  // scenario's own chunk.
+  function chunkAt(b, k, c, t, a, s, d, r) {
+    var g = gridAt(t, a, r), level = sellAt(s);
     if (level === null) { return g ? g[b][k][c] : null; }
     // No base view of the scenario: no sell level of it either
-    if (!g) { return null; }
+    if (!g || trimOn(r)) { return null; }
     var id = sellBlockId(t, b);
     if (id === null) { return null; }
     var entry = SELL[id];
@@ -11495,7 +11573,7 @@ _FILTER_JS = r"""
   }
   function cellChunk() {
     return chunkAt(bandIndex(), kIndex(), capIndex(), tierSel.value, addSel.value,
-                   sellSel.value, daysSel.value);
+                   sellSel.value, daysSel.value, trimSel.value);
   }
   // The page as rendered: the primary scenario with the tier floors on and
   // adding to held pairs off
@@ -11507,16 +11585,18 @@ _FILTER_JS = r"""
   // page holds no chunk for included), a band
   // the run did not record, a k or size cap the
   // run did not record or that is not above zero, or a category or tag on a
-  // page that does not file trades by Kalshi's series listing. A tag always goes with its category
+  // page that does not file trades by Kalshi's series listing, or a scenario
+  // that trims to Kelly (live trading does not trim, so there is no live
+  // setting to save it as). A tag always goes with its category
   // (the tag select sets the category too). The server refuses, with its
   // reason, any other value the live settings reject. Each number is written
   // by String(), whose shortest form reads back as the same number.
   function saveHref() {
-    if (!D || !D.save || !SHOWN || C === null) { return null; }
+    if (!D || !D.save || !SHOWN || C === null || trimOn(SHOWN[9])) { return null; }
     // null: never simulated; undefined: a sell level's block not inflated (a
     // scenario on screen has always inflated its own)
     var shownId = chunkAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7],
-                          SHOWN[8]);
+                          SHOWN[8], SHOWN[9]);
     if (shownId === null || shownId === undefined) { return null; }
     var band = D.bands[SHOWN[0]].value, k = D.ks[SHOWN[1]].value, cap = D.caps[SHOWN[2]].value;
     if (!band || !(k > 0) || !(cap > 0)) { return null; }
@@ -11562,11 +11642,11 @@ _FILTER_JS = r"""
   }
   // The run's own scenario: its cell, with the tiers on — or off at a band
   // the tiers do not reach (D.tier_binds false), whose off view IS that run —
-  // adding to held pairs off and no sell level (a run that adds, or sells,
-  // is never the run as rendered)
+  // adding to held pairs off, trimming off and no sell level (a run that
+  // adds, trims or sells is never the run as rendered)
   function isPrimary() {
-    return isPrimaryCell() && !addOn(addSel.value) && sellAt(sellSel.value) === null
-      && (!tiersOff() || !D.tier_binds[bandIndex()]);
+    return isPrimaryCell() && !addOn(addSel.value) && !trimOn(trimSel.value)
+      && sellAt(sellSel.value) === null && (!tiersOff() || !D.tier_binds[bandIndex()]);
   }
   function list() { return C ? C.list : null; }
   function viewKey() {
@@ -11595,19 +11675,21 @@ _FILTER_JS = r"""
   }
   // A scenario in the summary's words: Python's _scenario_phrase, its band
   // named as the Tier floors choice t reads it (_band_where, _tier_off_where),
-  // closed by Python's add-on phrase when the Add to held pairs choice a is on
-  // and, when the Sell choice s names a level, by that level's phrase and the
-  // phrase of the Min. days choice d
-  function scenarioAt(b, k, c, t, a, s, d) {
+  // closed by Python's add-on phrase when the Add to held pairs choice a is
+  // on, by its trim phrase when the Trim to Kelly choice r is on and, when the
+  // Sell choice s names a level, by that level's phrase and the phrase of the
+  // Min. days choice d
+  function scenarioAt(b, k, c, t, a, s, d, r) {
     var level = sellAt(s);
     return fill(D.text.scenario, {where: bandsAt(t)[b].where, k: D.ks[k].text,
                                   cap: D.caps[c].text}) + (addOn(a) ? D.text.add_on : '')
+      + (trimOn(r) ? D.text.trim : '')
       + (level !== null ? D.sell_levels[level].phrase
                           + D.sell_days[parseInt(d, 10)].phrase : '');
   }
   function scenario() {
     return scenarioAt(bandIndex(), kIndex(), capIndex(), tierSel.value, addSel.value,
-                      sellSel.value, daysSel.value);
+                      sellSel.value, daysSel.value, trimSel.value);
   }
   // The summary line: the templates _filter_summary_text fills for the view
   // Python rendered, filled here for every other one
@@ -11627,9 +11709,11 @@ _FILTER_JS = r"""
       text = fill(T.slice, {scenario: scenario(), selection: selectionName(key),
                             n: v.n, band_count: trades(count('all'))});
     }
-    // While adding is on, Python's note on what an added purchase counts as,
-    // and while a sell level is chosen its note on what a sale is
+    // While adding is on, Python's note on what an added purchase counts as;
+    // while trimming is on, its note on what a part sold counts as; and while
+    // a sell level is chosen its note on what a sale is
     setText('flt-summary', text + (addOn(addSel.value) && shown ? T.add_on_note : '')
+            + (trimOn(trimSel.value) && shown ? T.trim_note : '')
             + (sellAt(sellSel.value) !== null && shown ? T.sell_note : '') + T.unfiltered);
   }
 
@@ -12100,14 +12184,25 @@ _FILTER_JS = r"""
   function refreshDays() {
     daysSel.disabled = !D || !D.sell_blocks || sellAt(sellSel.value) === null;
   }
+  // No sell level is built for a run that trims to Kelly: while Trim to
+  // Kelly is on, Sell is set to no level and shut, and it opens again when
+  // trimming goes off. A page without the Sell view keeps Sell shut.
+  function refreshSell() {
+    if (D && D.sell_blocks) {
+      var trimming = trimOn(trimSel.value);
+      if (trimming) { sellSel.value = 'none'; }
+      sellSel.disabled = trimming;
+    }
+    refreshDays();
+  }
   // Draw the scenario the selects name, from C, and record it as SHOWN
   // (after the tag list is rebuilt, so the tag recorded is the one kept)
   function draw() {
     refreshOptions();
     SHOWN = [bandIndex(), kIndex(), capIndex(), catSel.value, tagSel.value, tierSel.value,
-             addSel.value, sellSel.value, daysSel.value];
+             addSel.value, sellSel.value, daysSel.value, trimSel.value];
     render();
-    refreshDays();
+    refreshSell();
     refreshSave();
   }
   // A chunk or Sell block that could not be loaded. The sections still show
@@ -12116,13 +12211,15 @@ _FILTER_JS = r"""
   // while the chunk was loading was never drawn either — the tag list
   // rebuilt for the category shown — and the line says which scenario could
   // not be loaded, in Python's words; the Tier floors, Add to held pairs,
-  // Sell and Min. days choices go back too, with the band options named for
-  // the first and the Min. days select shut again when Sell names none
+  // Trim to Kelly, Sell and Min. days choices go back too, with the band
+  // options named for the first, Sell shut again while trimming is shown and
+  // the Min. days select shut again when Sell names none
   function putBack(err) {
     var tried = scenario();
     bandSel.value = String(SHOWN[0]);
     tierSel.value = SHOWN[5];
     addSel.value = SHOWN[6];
+    trimSel.value = SHOWN[9];
     sellSel.value = SHOWN[7];
     daysSel.value = SHOWN[8];
     relabelBands();
@@ -12131,11 +12228,11 @@ _FILTER_JS = r"""
     catSel.value = SHOWN[3];
     refreshOptions();
     tagSel.value = SHOWN[4];
-    refreshDays();
+    refreshSell();
     setText('flt-summary', fill(D.text.unavailable, {
       failed: tried, reason: String(err),
       scenario: scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7],
-                           SHOWN[8])}));
+                           SHOWN[8], SHOWN[9])}));
     // The scenario still shown can be saved again
     refreshSave();
   }
@@ -12182,7 +12279,8 @@ _FILTER_JS = r"""
     SELECTS.forEach(function(s) { s.disabled = true; });
     if (saveBtn) { saveBtn.disabled = true; }
     if (D) {
-      var p = D.primary, here = scenarioAt(p[0], p[1], p[2], 'on', 'off', 'none', '0');
+      var p = D.primary;
+      var here = scenarioAt(p[0], p[1], p[2], 'on', 'off', 'none', '0', 'off');
       setText('flt-summary', fill(D.text.unavailable,
                                   {failed: here, reason: reason, scenario: here}));
       return;
@@ -12192,7 +12290,8 @@ _FILTER_JS = r"""
   }
   // A browser can restore a <select>'s last choice on a reload, or on going
   // back; the page as rendered is the primary scenario's unfiltered view with
-  // the tier floors on, adding to held pairs off and no sell level, so the
+  // the tier floors on, adding to held pairs off, trimming off and no sell
+  // level, so the
   // bar is set back to it. Python renders the selects disabled: they are enabled once the
   // base block and the primary scenario's chunk are inflated, so no choice
   // can be made (or lost) before it can be drawn — and a category or tag
@@ -12218,15 +12317,16 @@ _FILTER_JS = r"""
     if (SEQ === 0) {
       C = chunk;
       SHOWN = D.primary.concat([catSel.value, tagSel.value, tierSel.value, addSel.value,
-                                sellSel.value, daysSel.value]);
+                                sellSel.value, daysSel.value, trimSel.value]);
     }
-    // A run with no tier-off (or add-on, or Sell) view keeps that select
-    // disabled; the Min. days select opens only while Sell names a level
+    // A run with no tier-off (or add-on, or trim, or Sell) view keeps that
+    // select disabled; the Min. days select opens only while Sell names a
+    // level, and Sell is shut while a trimming scenario is chosen
     SELECTS.forEach(function(s) {
       s.disabled = (s === tierSel && !D.grid_off) || (s === addSel && !D.grid_add)
-        || (s === sellSel && !D.sell_blocks);
+        || (s === trimSel && !D.grid_trim) || (s === sellSel && !D.sell_blocks);
     });
-    refreshDays();
+    refreshSell();
     refreshSave();
   }, function(err) { unavailable(String(err)); });
 
@@ -12245,6 +12345,13 @@ _FILTER_JS = r"""
   addSel.addEventListener('change', function() {
     // Nothing to switch to without the add-on view (the select stays shut)
     if (!D || !D.grid_add) { return; }
+    choose();
+  });
+  trimSel.addEventListener('change', function() {
+    // Nothing to switch to without the trim view (the select stays shut)
+    if (!D || !D.grid_trim) { return; }
+    // Sell goes to no level and shuts while trimming is on
+    refreshSell();
     choose();
   });
   sellSel.addEventListener('change', function() {

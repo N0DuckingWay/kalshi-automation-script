@@ -5911,7 +5911,7 @@ class TestFilterScript:
         snap = _run_script(tmp_path, page, [["wait"], ["snap", "s"]],
                            no_decompression=True)["s"]
         assert all(snap["selects"][i]["disabled"]
-                   for i in (*_FLT_SELECTS, "flt-tier", "flt-add", "khat-group"))
+                   for i in (*_FLT_SELECTS, "flt-tier", "flt-add", "flt-trim", "khat-group"))
         assert snap["text"]["flt-summary"].startswith(
             "The filter could not load its data (this browser cannot decompress it)")
         assert snap["reacts"] == [] and snap["inflated"] == []
@@ -11067,6 +11067,418 @@ class TestAddOnEndToEnd:
         assert data["grid_add"] != data["grid"]
 
 
+_TRIM_NOT_SIMULATED = "(not simulated in this backtest)"
+_TRIM_UNAVAILABLE = "(not available on this page; see the log)"
+
+
+class TestTrimSelect:
+    """The bar's "Trim to Kelly" select as Python renders it: after Add to held
+    pairs and before Sell, shut, with its two options, its rule in the hover
+    text and, on a page without the view, the reason beside it."""
+
+    def test_the_select_follows_add_to_held_pairs_and_is_rendered_shut(
+            self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
+        ids = re.findall(r'<select id="(flt-[a-z]+)"', page)
+        assert ids == ["flt-band", "flt-tier", "flt-k", "flt-cap", "flt-add", "flt-trim",
+                       "flt-sell", "flt-days", "flt-cat", "flt-tag"]
+        assert "<label>Trim to Kelly: <select" in page
+        select = _page_elements(page)["selects"]["flt-trim"]
+        assert select == {"disabled": True, "options": [
+            {"value": "off", "text": "off", "selected": True},
+            {"value": "on", "text": "on (sell down to the Kelly size)", "selected": False}]}
+        title = re.search(r'<select id="flt-trim"[^>]*title="([^"]*)"', page).group(1)
+        assert html.unescape(title) == dashboard._TRIM_SELECT_TITLE
+        # The hover text says what the choice shuts, and why
+        for words in ("Sell is set to no selling", "live trading does not trim",
+                      "Each part sold counts as a trade of its own"):
+            assert words in dashboard._TRIM_SELECT_TITLE
+        # A page with the view has no note beside it
+        assert 'id="flt-trim-note"' not in page
+
+    @pytest.mark.parametrize("state, note", [
+        ("not simulated", _TRIM_NOT_SIMULATED),
+        ("unavailable", _TRIM_UNAVAILABLE),
+        ("something else", _TRIM_NOT_SIMULATED)])
+    def test_a_shut_select_says_why(self, state, note):
+        _, chunker, base = _tr_payload(_kc_sweep())
+        bar = dashboard._filter_bar_html({**base, "trim_state": state}, {"all": {"n": 3}})
+        assert f'id="flt-trim-note" style="color:#9E9E9E; font-size:13px;">{note}</span>' in bar
+        assert 'id="flt-trim" disabled' in bar
+        shown = dashboard._filter_bar_html({**base, "trim_state": "shown"}, {"all": {"n": 3}})
+        assert 'id="flt-trim-note"' not in shown
+
+    def test_a_page_says_which_of_the_two_reasons_applies(self, monkeypatch, tmp_path):
+        # No family: not simulated. A family the page could not use: see the log
+        bare = _ao_page(monkeypatch, tmp_path, _kc_sweep())
+        assert re.search(r'id="flt-trim-note"[^>]*>\(not simulated in this backtest\)</span>',
+                         bare)
+        sweep = _kc_sweep_trim()
+        sweep.trim_sweep.caps = (0.05, 0.2)
+        lost = _ao_page(monkeypatch, tmp_path, sweep)
+        assert re.search(
+            r'id="flt-trim-note"[^>]*>\(not available on this page; see the log\)</span>', lost)
+        assert TestFilterPage._data(lost)["trim_state"] == "unavailable"
+
+    def test_the_summary_text_gains_the_trim_note_after_the_add_on_one(self):
+        _, _, base = _tr_payload(_kc_sweep_trim(_kc_sweep_add_on()))
+        text = base["text"]
+        plain = dashboard._filter_summary_text(text, "S", False, None, 4, 4)
+        trimmed = dashboard._filter_summary_text(text, "S", False, None, 4, 4, trim=True)
+        both = dashboard._filter_summary_text(text, "S", False, None, 4, 4, add_on=True,
+                                              trim=True)
+        note = dashboard._TRIM_SUMMARY_NOTE
+        assert trimmed == plain[:-len(text["unfiltered"])] + note + text["unfiltered"]
+        assert both.endswith(dashboard._ADD_ON_SUMMARY_NOTE + note + text["unfiltered"])
+
+
+class TestTrimScript:
+    """The bar's Trim to Kelly select under the page script (run outside a
+    browser): enabled only with the view, "on" loads the trimming scenario's
+    chunk and words it with Python's phrase and note, with Add to held pairs
+    on it reads the grid of runs that do both, a chunk that cannot be loaded
+    puts the choice back, and while it is on Sell is shut at no selling and
+    nothing can be saved. The explorer never follows it. The harness's "wait"
+    does not wait on flt-trim (a page without the view keeps it shut), so
+    setup_js adds it. Skipped without a JavaScript runtime."""
+
+    WAIT = "__BAR.push('flt-trim');"
+    ON = [["set", "flt-trim", "on"], ["fire", "flt-trim"], ["settle"]]
+    OFF = [["set", "flt-trim", "off"], ["fire", "flt-trim"], ["settle"]]
+
+    @classmethod
+    def _run(cls, tmp_path, page, steps, **kwargs) -> dict:
+        """_run_script over a page, waiting on the trim select too."""
+        return _run_script(tmp_path, page, steps, setup_js=cls.WAIT + kwargs.pop("js", ""),
+                           **kwargs)
+
+    def test_the_select_is_enabled_only_with_the_view(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
+        snaps = self._run(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
+                          strict=True)
+        assert snaps["loaded"]["selects"]["flt-trim"]["disabled"] is True
+        ready = snaps["ready"]["selects"]["flt-trim"]
+        assert ready["disabled"] is False and ready["value"] == "off"
+        assert ready["options"] == [["off", "off"], ["on", "on (sell down to the Kelly size)"]]
+        # A page without the view keeps it shut, whatever else is chosen
+        bare = _ao_page(monkeypatch, tmp_path, _kc_sweep())
+        snap = _run_script(tmp_path, bare, [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], *self.ON,
+            ["snap", "s"]], strict=True)["s"]
+        assert snap["selects"]["flt-trim"]["disabled"] is True
+        # The change event on the shut select drew nothing more than the k's did
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-chunk-2"]
+        assert "trimming to Kelly" not in snap["text"]["flt-summary"]
+
+    def test_on_loads_the_trim_chunk_and_words_the_scenario(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        cid = data["grid_trim"][0][1][1]
+        assert cid not in _ao_ids(data["grid"])
+        scenario = _phrase(data, 0, 1, 1) + data["text"]["trim"]
+        assert scenario.endswith("20% cap per trade, trimming to Kelly")
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-trim", "on"], ["fire", "flt-trim"], ["snap", "loading"],
+            ["settle"], ["snap", "on"], *self.OFF, ["snap", "off"]], strict=True)
+        assert snaps["loading"]["text"]["flt-summary"] == data["text"]["loading"].format(
+            scenario=scenario)
+        snap = snaps["on"]
+        assert snap["inflated"] == ["dash-data", "dash-chunk-0", f"dash-chunk-{cid}"]
+        assert {r["id"] for r in snap["reacts"]} == _charts_redrawn()
+        view = chunks[cid]["list"]["views"]["all"]
+        # The primary cell with trimming on is its own simulation, and the line
+        # says what a part sold counts as, in Python's words
+        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], scenario, False, None, view["n"], view["n"], note="other_run",
+            trim=True)
+        assert snap["text"]["flt-summary"].endswith(
+            dashboard._TRIM_SUMMARY_NOTE + data["text"]["unfiltered"])
+        assert snap["text"]["hdr-trades"] == str(view["n"]) == "4"
+        assert _last_react(snap, "risk-kelly")["data"][0]["x"] == pytest.approx(
+            chunks[cid]["list"]["kx"])
+        # Off again is the page as rendered: the primary's chunk, kept
+        off = snaps["off"]
+        assert off["inflated"] == snap["inflated"]
+        assert off["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], _phrase(data, 0, 1, 1), True, None, 3, 3)
+        assert off["text"]["hdr-trades"] == "3"
+
+    def test_a_scenario_that_trimmed_nothing_shows_the_scenario_s_own_chunk(
+            self, monkeypatch, tmp_path):
+        # With no cap nothing is trimmed: the trimming run traded the list of
+        # the run without it, so no other chunk is loaded — and the line still
+        # names the choice
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
+        data = TestFilterPage._data(page)
+        assert data["grid_trim"][0][1][2] == data["grid"][0][1][2]
+        snap = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"],
+            ["snap", "plain"], *self.ON, ["snap", "on"]], strict=True)
+        assert snap["on"]["inflated"] == snap["plain"]["inflated"]
+        assert snap["on"]["text"]["hdr-trades"] == snap["plain"]["text"]["hdr-trades"]
+        assert data["text"]["trim"] in snap["on"]["text"]["flt-summary"]
+
+    def test_a_restored_on_is_set_back_to_off_and_loads_no_trim_chunk(
+            self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
+        snaps = self._run(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
+                          pre=(("flt-trim", "on"),), strict=True)
+        assert snaps["loaded"]["selects"]["flt-trim"]["value"] == "off"
+        ready = snaps["ready"]
+        assert ready["selects"]["flt-trim"]["value"] == "off"
+        assert ready["selects"]["flt-trim"]["disabled"] is False
+        assert ready["inflated"] == ["dash-data", "dash-chunk-0"] and ready["reacts"] == []
+
+    def test_with_adding_on_it_reads_the_grid_of_runs_that_do_both(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim(_kc_sweep_add_on()))
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        both = data["grid_trim_add"][0][1][1]
+        assert both not in (_ao_ids(data["grid"]) | _ao_ids(data["grid_add"])
+                            | _ao_ids(data["grid_trim"]))
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], *self.ON,
+            ["snap", "both"], ["set", "flt-add", "off"], ["fire", "flt-add"], ["settle"],
+            ["snap", "trim"]], js="__BAR.push('flt-add');", strict=True)
+        snap = snaps["both"]
+        assert f"dash-chunk-{both}" in snap["inflated"]
+        scenario = _phrase(data, 0, 1, 1) + data["text"]["add_on"] + data["text"]["trim"]
+        assert scenario.endswith(", adding to held pairs, trimming to Kelly")
+        view = chunks[both]["list"]["views"]["all"]["n"]
+        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], scenario, False, None, view, view, note="other_run", add_on=True,
+            trim=True)
+        # Adding off again: the trim-alone scenario's chunk
+        alone = data["grid_trim"][0][1][1]
+        assert f"dash-chunk-{alone}" in snaps["trim"]["inflated"]
+        assert snaps["trim"]["text"]["hdr-trades"] == str(
+            chunks[alone]["list"]["views"]["all"]["n"])
+
+    def test_tier_floors_off_reads_the_trim_off_grid(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim(_kc_sweep_tiers()))
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        binding, plain = data["grid_trim_off"][0][1][1], data["grid_trim_off"][1][1][1]
+        assert binding not in _ao_ids(data["grid_trim"]) and plain in _ao_ids(data["grid_trim"])
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], *self.ON,
+            ["snap", "binding"],
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "plain"]],
+            strict=True)
+        trim = data["text"]["trim"]
+        view = chunks[binding]["list"]["views"]["all"]["n"]
+        assert f"dash-chunk-{binding}" in snaps["binding"]["inflated"]
+        assert snaps["binding"]["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], _phrase_off(data, 0, 1, 1) + trim, False, None, view, view,
+            note="other_run", trim=True)
+        view = chunks[plain]["list"]["views"]["all"]["n"]
+        assert snaps["plain"]["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], _phrase_off(data, 1, 1, 1) + trim, False, None, view, view,
+            trim=True)
+
+    def test_a_scenario_the_family_never_simulated_reads_missing(self, monkeypatch, tmp_path):
+        # The family holds no run with the tier floors off: trimming at a band
+        # the tiers bind at, with them off, was never simulated
+        sweep = _kc_sweep_trim(_kc_sweep_tiers())
+        sweep.trim_sweep.off_bands = ()
+        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        snap = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], *self.ON,
+            ["snap", "missing"]], strict=True)["missing"]
+        scenario = _phrase_off(data, 0, 1, 1) + data["text"]["trim"]
+        # Nothing is shown, so nothing is said about what a part sold counts as
+        assert snap["text"]["flt-summary"] == data["text"]["missing"].format(
+            scenario=scenario) + data["text"]["unfiltered"]
+        assert snap["buttons"]["flt-save"] is True and snap["text"]["hdr-trades"] == "0"
+
+    def test_a_chunk_that_cannot_be_loaded_puts_the_choice_back(self, monkeypatch, tmp_path):
+        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, _kc_sweep_trim())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        cid = data["grid_trim"][0][1][1]
+        snaps = self._run(tmp_path, page, [
+            ["wait"], *self.ON, ["snap", "bad"], ["repair", f"dash-chunk-{cid}"], *self.ON,
+            ["snap", "good"]], strict=True, damaged=(f"dash-chunk-{cid}",))
+        bad = snaps["bad"]
+        assert bad["selects"]["flt-trim"]["value"] == "off" and bad["reacts"] == []
+        assert bad["text"]["flt-summary"] == data["text"]["unavailable"].format(
+            failed=_phrase(data, 0, 1, 1) + data["text"]["trim"],
+            reason=f"Error: damaged block dash-chunk-{cid}", scenario=_phrase(data, 0, 1, 1))
+        # The scenario still shown, which does not trim, can be saved again
+        assert bad["buttons"]["flt-save"] is False
+        good = snaps["good"]
+        assert good["selects"]["flt-trim"]["value"] == "on"
+        assert good["text"]["hdr-trades"] == str(chunks[cid]["list"]["views"]["all"]["n"])
+
+    # ─── Save and Sell while trimming ─────────────────────────────────────────
+
+    def test_nothing_can_be_saved_while_trimming_is_on(self, monkeypatch, tmp_path):
+        # Live trading does not trim, so a trimming scenario has no live
+        # settings to save: the button is shut, a click opens nothing, and it
+        # opens again with the choice off
+        save = TestSaveLiveDefaultsButton()
+        page = save._kc(monkeypatch, tmp_path, _kc_sweep_trim())
+        data = TestFilterPage._data(page)
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["snap", "before"], *self.ON, ["click", "flt-save"], ["snap", "on"],
+            # ... also where trimming changed nothing (no cap: the same chunk)
+            ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"], ["click", "flt-save"],
+            ["snap", "same"], *self.OFF, ["click", "flt-save"], ["snap", "off"]], strict=True)
+        assert snaps["before"]["buttons"]["flt-save"] is False
+        for name in ("on", "same"):
+            assert snaps[name]["buttons"]["flt-save"] is True and snaps[name]["opened"] == []
+        assert snaps["off"]["buttons"]["flt-save"] is False
+        [opened] = snaps["off"]["opened"]
+        query = save._query(data, opened)
+        save._assert_sends(data, query, 0, 1, 2)
+        assert not any("trim" in key for key in query)
+
+    def test_sell_is_shut_at_no_selling_while_trimming_is_on(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_trim(_kc_sweep_sell()))
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        cid = data["grid_trim"][0][1][1]
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
+            ["snap", "level"], *self.ON, ["snap", "on"], *self.OFF, ["snap", "off"]],
+            setup_js=self.WAIT + "__BAR.push('flt-sell');", files_root=tmp_path, strict=True)
+        level = snaps["level"]["selects"]
+        assert level["flt-sell"]["value"] == "0" and level["flt-days"]["disabled"] is False
+        on = snaps["on"]
+        # Sell went back to no selling and both its selects are shut ...
+        assert on["selects"]["flt-sell"]["value"] == "none"
+        assert on["selects"]["flt-sell"]["disabled"] is True
+        assert on["selects"]["flt-days"]["disabled"] is True
+        # ... and the scenario drawn is the trimming one, with no sale in its words
+        assert f"dash-chunk-{cid}" in on["inflated"]
+        view = chunks[cid]["list"]["views"]["all"]["n"]
+        assert on["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], _phrase(data, 0, 1, 1) + data["text"]["trim"], False, None, view,
+            view, note="other_run", trim=True)
+        assert data["text"]["sell_note"] not in on["text"]["flt-summary"]
+        # Trimming off: Sell opens again, still at no selling
+        off = snaps["off"]["selects"]
+        assert off["flt-sell"] == {**off["flt-sell"], "value": "none", "disabled": False}
+        assert off["flt-days"]["disabled"] is True
+
+    def test_a_failed_trim_chunk_gives_the_sell_level_back(self, monkeypatch, tmp_path):
+        # A sell level was on screen when trimming was chosen and its chunk
+        # could not be loaded: the level, its days and both selects come back
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_trim(_kc_sweep_sell()))
+        data = TestFilterPage._data(page)
+        cid = data["grid_trim"][0][1][1]
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
+            ["snap", "level"], *self.ON, ["snap", "back"]],
+            setup_js=self.WAIT + "__BAR.push('flt-sell');", files_root=tmp_path, strict=True,
+            damaged=(f"dash-chunk-{cid}",))
+        back = snaps["back"]["selects"]
+        assert back["flt-trim"]["value"] == "off"
+        assert back["flt-sell"]["value"] == "0" and back["flt-sell"]["disabled"] is False
+        assert back["flt-days"]["disabled"] is False
+        assert snaps["back"]["text"]["hdr-trades"] == snaps["level"]["text"]["hdr-trades"]
+
+    def test_a_page_without_the_sell_view_keeps_sell_shut_either_way(
+            self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
+        snaps = self._run(tmp_path, page, [["wait"], *self.ON, ["snap", "on"], *self.OFF,
+                                           ["snap", "off"]], strict=True)
+        for name in ("on", "off"):
+            assert snaps[name]["selects"]["flt-sell"]["disabled"] is True
+            assert snaps[name]["selects"]["flt-days"]["disabled"] is True
+
+    # ─── The explorer ─────────────────────────────────────────────────────────
+
+    def test_the_bar_s_call_to_the_explorer_keeps_its_four_arguments(
+            self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
+        data = TestFilterPage._data(page)
+        spy = ("window.dashScenarioSelect = function() { var el = document.getElementById("
+               "'__spy'); var seen = el.textContent ? JSON.parse(el.textContent) : []; "
+               "seen.push(Array.prototype.slice.call(arguments)); "
+               "el.textContent = JSON.stringify(seen); };")
+        snaps = self._run(tmp_path, page, [["wait"], *self.ON, *self.OFF, ["snap", "s"]],
+                          js=spy)
+        calls = json.loads(snaps["s"]["text"]["__spy"])
+        labels = [data["bands"][0]["label"], data["ks"][1]["label"], data["caps"][1]["label"],
+                  "on"]
+        assert calls == [labels, labels]
+        [call] = re.findall(r"window\.dashScenarioSelect\(([^;]*)\);", dashboard._FILTER_JS)
+        assert len(re.split(r",\s*(?![^\[]*\])", call)) == 4 and "SHOWN[9]" not in call
+
+    def test_the_explorer_s_selects_never_move_on_a_trim_change(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim(_ex_sweep_tiers()))
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["snap", "before"], *self.ON, ["snap", "on"], *self.OFF, ["snap", "off"]],
+            strict=True, explorer=True)
+        before, on, off = snaps["before"], snaps["on"], snaps["off"]
+        assert _scn_values(on) == _scn_values(off) == _scn_values(before)
+        for snap in (on, off):
+            assert _explorer_calls(snap) == []
+        assert on["selects"]["flt-trim"]["value"] == "on"
+
+
+class TestTrimEndToEnd:
+    """Real size-cap, add-on and trim sweeps over the backtester's trimming
+    fixture (TestTrimCapSweep's: a pair that outgrows its size cap, beside two
+    others), rendered through generate_dashboard: every cap's chunk, with
+    adding to held pairs off and on, is the scenario a fresh simulation that
+    trims at that cap produces, figure for figure."""
+
+    def test_real_trim_sweeps_page_every_cap_at_its_own_simulation(
+            self, monkeypatch, tmp_path):
+        fixture = _tb.TestTrimCapSweep()
+        entries = fixture._entries()
+        band, k, start, end = fixture._BAND, 0.75, fixture._START, fixture._END
+        caps = backtester.SIZE_CAP_SWEEP
+
+        def fresh(cap, **options):
+            return backtester._simulate_at_discount(
+                entries, start, 10_000.0, k=k, spread_band=band, size_cap=cap, quiet=True,
+                end_date=end, **options)
+
+        primary = fresh(0.20)
+        axes = {"caps": caps, "primary_cap": 0.20, "bands": (band,), "ks": (k,),
+                "primary_k": k, "start_date": start, "initial_balance": 10_000.0}
+        lazy = {**axes, "split_date": None, "checks": False,
+                "entries_by_band": {band: entries}, "st_entries": []}
+        days = {(band, k, "all"): end}
+        run = BacktestSweep(
+            primary=primary, points=[primary], calibration=None, scenarios=[primary],
+            calibrations_by_band={band: None}, same_event_ladders=True,
+            cap_sweep=backtester.CapSweep(**lazy, eager={(band, k, "all"): primary}),
+            add_on_cap_sweep=backtester.CapSweep(**lazy, eager={}, add_to_held=True,
+                                                 end_dates=days),
+            trim_sweep=backtester.TrimSweep(
+                **axes, off_bands=(), entries_by_band={band: entries},
+                off_entries_by_band={}, end_dates=days, off_end_dates={}))
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        page = dashboard.generate_dashboard(
+            primary.trades, primary.equity_df, start, 10_000.0,
+            sweep=run).read_text(encoding="utf-8")
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        assert data["trim_state"] == "shown" and data["add_state"] == "shown"
+        assert [c["value"] for c in data["caps"]] == list(caps) and len(caps) == 20
+        trimmed = {False: 0, True: 0}
+        for add, key in ((False, "grid_trim"), (True, "grid_trim_add")):
+            assert data[key] is not None
+            for ci, cap in enumerate(caps):
+                point = fresh(cap, add_to_held=add, trim_to_kelly=True)
+                view = chunks[data[key][0][0][ci]]["list"]["views"]["all"]
+                kpis = dashboard._performance_kpis(point.equity_df, point.trades, 10_000.0)
+                assert view["kpi"] == {name: value for name, _, value, _ in kpis}, (add, cap)
+                assert view["n"] == len(point.trades), (add, cap)
+                trimmed[add] += any(t.sold for t in point.trades)
+        # Not vacuous: at some caps a pair was trimmed, in both halves, and at
+        # others nothing was, so those scenarios share the chunk of the run
+        # without trimming
+        assert 0 < trimmed[False] < len(caps) and 0 < trimmed[True] < len(caps)
+        for with_trim, without in (("grid_trim", "grid"), ("grid_trim_add", "grid_add")):
+            pairs = list(zip(data[with_trim][0][0], data[without][0][0], strict=True))
+            assert any(a != b for a, b in pairs) and any(a == b for a, b in pairs)
+        # The select is there to reach them
+        assert 'id="flt-trim" disabled' in page and 'id="flt-trim-note"' not in page
+
+
 # ─── Sell: every sell level of every scenario (sidecar chunks) ───────────────
 
 _SELL_UNREAD = ("The selling simulations could not be read; the filter bar's Sell select "
@@ -12644,15 +13056,24 @@ class TestFilterPageSize:
     BUDGET_QUOTED = int(PAGE_BYTES_MEASURED_QUOTED * 1.2)
     PAGE_BYTES_MEASURED_QUOTED_FAMILY = 1_969_146
     BUDGET_QUOTED_FAMILY = int(PAGE_BYTES_MEASURED_QUOTED_FAMILY * 1.2)
+    # The Trim to Kelly view, where every band's trimming run trades yet
+    # another list (a worst case: a real trimming run mostly trades the list
+    # of the run without it and shares its chunk). Measured 1,286,299 bytes
+    # (2026-10-10, plotly 6.9.0 / pandas 3.0.3 / numpy 2.4.6); its budget is
+    # that + 20%.
+    PAGE_BYTES_MEASURED_TRIM = 1_286_299
+    BUDGET_TRIM = int(PAGE_BYTES_MEASURED_TRIM * 1.2)
 
     @pytest.mark.parametrize(
-        "family, add_on, quoted",
-        [(False, False, False), (True, False, False), (False, True, False),
-         (True, True, False), (False, False, True), (True, False, True)],
+        "family, add_on, quoted, trim",
+        [(False, False, False, False), (True, False, False, False),
+         (False, True, False, False), (True, True, False, False),
+         (False, False, True, False), (True, False, True, False),
+         (False, False, False, True)],
         ids=["tier-on-only", "tier-off-family", "add-on", "add-on-and-tier-off-family",
-             "quoted", "quoted-and-tier-off-family"])
+             "quoted", "quoted-and-tier-off-family", "trim"])
     def test_distinct_band_lists_stay_under_budget(self, monkeypatch, tmp_path, family,
-                                                   add_on, quoted):
+                                                   add_on, quoted, trim):
         import random
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
@@ -12729,6 +13150,19 @@ class TestFilterPageSize:
                 sweep, add_on_cap_sweep=fake_family(add_points, bands),
                 add_on_tier_off_cap_sweep=(fake_family(add_off_points, binding)
                                            if binding else None))
+        if trim:
+            # One more list per band: the band's list with its first pair sold
+            # in two parts, over the grid's one k and the run's own cap
+            def trimmed(base: SweepPoint) -> SweepPoint:
+                trades = sorted(_tr_split(base.trades), key=lambda t: t.entry_date)
+                return dataclasses.replace(
+                    base, trades=trades, trim_to_kelly=True,
+                    equity_df=backtester._build_equity_curve(trades, start, 10_000.0))
+            axes = {"bands": tuple(bands), "ks": (0.75,), "caps": (0.2,)}
+            sweep = dataclasses.replace(sweep, trim_sweep=_FakeTrimSweep({
+                (False, False): _FakeCapSweep(
+                    {(p.spread_band, 0.75, 0.2): trimmed(p) for p in scenarios}, **axes),
+                (True, False): _FakeCapSweep({}, **axes)}, **axes))
         out = dashboard.generate_dashboard(
             scenarios[0].trades, scenarios[0].equity_df, start, 10_000.0, sweep=sweep,
             interval_discount=0.75, series_categories=categories)
@@ -12736,7 +13170,7 @@ class TestFilterPageSize:
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         # Nothing collapsed: every list is its own
         assert len(chunks) == (54 if family else 36) + (
-            (36 + (18 if family else 0)) if add_on else 0)
+            (36 + (18 if family else 0)) if add_on else 0) + (36 if trim else 0)
         assert all(band is not None for band in data["khat"])
         if family:
             assert len(binding) == 18 and len(data["bands_off"]) == 36
@@ -12758,7 +13192,17 @@ class TestFilterPageSize:
             assert (data["grid_add_off"] is not None) is family
         else:
             assert data["grid_add"] is None and data["grid_add_off"] is None
-        if quoted:
+        if trim:
+            # The view is on the page, and each trimming list is a chunk of its own
+            assert data["trim_state"] == "shown"
+            assert len(_ao_ids(data["grid_trim"])) == 36
+            assert _ao_ids(data["grid_trim"]).isdisjoint(_ao_ids(data["grid"]))
+            assert data["grid_trim_add"] is None
+        else:
+            assert data["grid_trim"] is None and data["trim_state"] == "not simulated"
+        if trim:
+            budget = self.BUDGET_TRIM
+        elif quoted:
             budget = self.BUDGET_QUOTED_FAMILY if family else self.BUDGET_QUOTED
         elif add_on:
             budget = self.BUDGET_ADD_ON_FAMILY if family else self.BUDGET_ADD_ON
