@@ -41,20 +41,30 @@ Purpose:
     discount k and per-trade size cap, with or without adding to pairs the
     run still holds, holding every position to its pay-out or selling it at
     a share of its potential profit (no nearer to maturity than a number of
-    days), and/or one Kalshi category or
-    category · tag of it,
+    days), and/or any set of its Kalshi categories and category · tags
+    (the Category and Tag menus are check-box dropdowns: a ticked category
+    counts in full unless some of its tags are ticked, then only those —
+    the live filter's rule, config.trade_filter),
     and moves the k-hat breakdown and the performance section's k-hat cards
     to the same band, tier setting and selection (the breakdown's reference
     line to the same k), the interval-discount section to the same k and
     size cap (at the primary spread band, tier floors on), and the scenario
     explorer's band, Tier floors, k and size-cap selects to the same
-    scenario (they stay usable on their own). Every figure a selection shows
-    is computed here in
-    Python by the helpers the sections themselves render with, packed into
-    gzip + base64 data blocks — one base block (_filter_payload) and one
-    chunk per distinct scenario trade list (_ChunkVisitor) — and swapped in
-    by a small inline script (_FILTER_JS) that draws nothing of its own and
-    inflates a scenario's chunk only when a reader chooses it.
+    scenario (they stay usable on their own). Every figure of a scenario,
+    of one category of it and of one category · tag of it is computed here
+    in Python by the helpers the sections themselves render with, packed
+    into gzip + base64 data blocks — one base block (_filter_payload) and
+    one chunk per distinct scenario trade list (_ChunkVisitor) — and swapped
+    in by an inline script (_FILTER_JS) that inflates a scenario's chunk
+    only when a reader chooses it. A set of ticks that covers exactly one of
+    those views draws that view. Any other set is a mix, and there are far
+    too many mixes to ship a view of each, so the script works a mix out
+    itself (its mixView) from the category · tag views it covers, following
+    the Python helpers step by step, with Python's constants, markup and
+    words; tests/test_dashboard.py::TestMixedSelection holds what it draws
+    to what _view_payload computes for the same trades. A chunk whose
+    category · tag views cannot be combined ("m" left out, below) refuses a
+    mix: the ticks go back and the summary line says so.
 
     A chunk holds a view for the whole list, for each category and for each
     category · tag. The category · tag views partition the list's trades,
@@ -131,9 +141,14 @@ Purpose:
     DEFAULTS_SERVER_PORT) in a new tab, for the bar's scenario on screen —
     its spread band, Tier floors choice, k, size cap, Add to held pairs
     choice, Sell level and Min. days to maturity (each only on a page that
-    simulated it) and any category or tag, with this run's same-title cap when
-    the run recorded one — never
-    for the Scenario Explorer's own selects. That page compares the
+    simulated it) and the categories and tags ticked, with this run's
+    same-title cap when the run recorded one — never
+    for the Scenario Explorer's own selects. The address names each ticked
+    category once and each ticked tag once, as "Category · Tag" (the form
+    the live filter ties a tag to its category by), and never shortens a
+    category whose listed tags are all ticked to the category alone: the
+    page lists only the tags this backtest traded, so the category alone
+    would let a live run trade tags nobody ticked. That page compares the
     proposal with the live defaults in force and acts only when one of its
     buttons is pressed: Confirm and save saves it, Confirm and trade saves
     it and then runs the live bot with it, and Dry run runs the bot with it
@@ -142,9 +157,11 @@ Purpose:
     screen can become live settings (it was simulated, its band was
     recorded, and its k and size cap were recorded and are above zero),
     keeps it disabled while another scenario's
-    chunk loads, and, on a page that files trades by ticker prefix rather
-    than by Kalshi's series listing (which the live category and tag filter
-    reads), keeps it disabled for a category or tag. Beside it, a plain
+    chunk loads, with more categories and tags ticked than the confirmation
+    page accepts (config.DEFAULTS_SERVER_MAX_FILTER_NAMES), and, on a page
+    that files trades by ticker prefix rather than by Kalshi's series
+    listing (which the live category and tag filter reads), keeps it
+    disabled for a category or tag. Beside it, a plain
     "Trade using defaults…" link opens the server's trade page (the saved
     defaults, with Dry run and Confirm and trade) in a new tab; it needs no
     script. A page whose filter bar could not be built has no save button,
@@ -1119,11 +1136,17 @@ def _brier_score(obs: list[tuple[float, int]]) -> float | None:
     return float(np.mean([(prob - actual) ** 2 for prob, actual in obs]))
 
 
+# How far from 0 and 1 the log loss keeps a prediction (the log of 0 has no
+# value); the base block's "mix" carries it for the page's script.
+_LOG_LOSS_CLIP = 1e-7
+
+
 def _log_loss(obs: list[tuple[float, int]]) -> float | None:
     """
     Mean binary cross-entropy (log loss) of predictions against outcomes.
 
-    Probabilities are clipped to [1e-7, 1-1e-7] to avoid log(0).
+    Probabilities are clipped to [1e-7, 1-1e-7] (_LOG_LOSS_CLIP) to avoid
+    log(0).
 
     Args:
         obs (list[tuple[float, int]]): (predicted probability, outcome 0/1)
@@ -1135,7 +1158,7 @@ def _log_loss(obs: list[tuple[float, int]]) -> float | None:
     """
     if not obs:
         return None
-    eps = 1e-7
+    eps = _LOG_LOSS_CLIP
     losses = []
     for prob, actual in obs:
         p = max(eps, min(1 - eps, prob))
@@ -5614,6 +5637,9 @@ def _trade_row_tail(t: BacktestTrade) -> str:
 
 
 # Row backgrounds of the best- and worst-five trade tables.
+# How many trades each of the two tables lists (the base block's "mix"
+# carries it for the page's script).
+_BEST_WORST_ROWS = 5
 _BEST_ROW_COLOR = "#F9FBE7"
 _WORST_ROW_COLOR = "#FFF8F8"
 
@@ -5634,7 +5660,7 @@ def _best_and_worst(trades: list[BacktestTrade]) -> tuple[list, list]:
             the same descending order — the last one is the biggest loss).
     """
     sorted_trades = sorted(trades, key=lambda t: t.profit, reverse=True)
-    return sorted_trades[:5], sorted_trades[-5:]
+    return sorted_trades[:_BEST_WORST_ROWS], sorted_trades[-_BEST_WORST_ROWS:]
 
 
 def _section_diagnostics(trades: list[BacktestTrade]) -> str:
@@ -6379,6 +6405,34 @@ def _bar_reach(kd_follows: bool, explorer_follows: bool, *, explorer_caps: bool 
 # line while a level is chosen. "sidecar_missing" and "sidecar_empty" are a
 # sidecar chunk file's {reason} in "unavailable": it could not be loaded, or
 # it ran without handing anything over ({file}: the address asked for).
+# The Category and Tag menus of the filter bar: check-box dropdowns. The words
+# of the box that clears a menu (ticked exactly when nothing else is), the
+# hover text both menus carry (the rule a set of ticks follows, which is the
+# live filter's: config.trade_filter), how many ticked names the summary line
+# spells out before it counts the rest, and the menus' styling.
+_MENU_CAT_ALL = "All categories"
+_MENU_TAG_ALL = "All tags"
+_MENU_TITLE = ("Tick as many as you like. A ticked category counts in full unless some of "
+               "its tags are ticked; then only those count.")
+_SELECTION_NAMES_SHOWN = 3
+_MENU_STYLE = (
+    "<style>"
+    ".flt-multi{display:inline-block;position:relative;vertical-align:middle}"
+    ".flt-multi>summary{display:inline-block;list-style:none;cursor:pointer;"
+    "position:relative;padding:1px 20px 1px 6px;border:1px solid #767676;"
+    "border-radius:3px;background:#FFFFFF;min-width:96px;max-width:260px;"
+    "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}"
+    ".flt-multi>summary::-webkit-details-marker{display:none}"
+    ".flt-multi>summary::after{content:'\\25BE';position:absolute;right:6px}"
+    ".flt-multi.flt-off>summary{color:#9E9E9E;border-color:#C4C4C4;pointer-events:none}"
+    ".flt-multi>div{position:absolute;left:0;top:100%;z-index:1001;background:#FFFFFF;"
+    "border:1px solid #767676;border-radius:3px;box-shadow:0 2px 6px rgba(0,0,0,.2);"
+    "max-height:340px;overflow-y:auto;padding:4px 10px 4px 6px;white-space:nowrap}"
+    ".flt-multi label{display:block;padding:1px 0;font-size:13px}"
+    ".flt-multi label[hidden]{display:none}"
+    "</style>"
+)
+
 _SUMMARY_TEMPLATES = {
     "scenario": "{where}, {k}, {cap}",
     "all": "Showing every trade of the run at {scenario}: {count}.",
@@ -6399,6 +6453,25 @@ _SUMMARY_TEMPLATES = {
               "Sortino, the median monthly return, the benchmark's strategy row) is this "
               "selection's contribution: the starting balance plus these trades' P&L as "
               "that run booked it, not a standalone simulation."),
+    # A selection of several categories and tags, named: the ticked names
+    # joined by "names_join", and past _SELECTION_NAMES_SHOWN of them the
+    # first few and how many more (_selection_name)
+    "names_join": ", ",
+    "names_more": "{names}, +{n} more",
+    # Added to a slice's line when the page combined it from several tags'
+    # figures itself (a mix of categories and tags has no view of its own)
+    "mix_note": " Combined in the page from each tag's own figures.",
+    # In the line's place when the list on screen cannot be mixed: {selection}
+    # the ticks tried, {failed} the scenario they were tried at, {scenario}
+    # the one the sections still show
+    "mix_unavailable": ("Not available: {selection} cannot be combined at {failed} on this "
+                        "page (the log of its build says why); the sections show {scenario}."),
+    # The Category and Tag menus' buttons: nothing ticked, or how many (one
+    # ticked reads as its own name)
+    "menu_cat_all": _MENU_CAT_ALL,
+    "menu_cat_n": "{n} categories",
+    "menu_tag_all": _MENU_TAG_ALL,
+    "menu_tag_n": "{n} tags",
     # Every summary line ends with what the bar reaches beyond the sections
     # it re-scopes whole (the key keeps its first name, which the script
     # reads); _filter_payload swaps in _bar_reach's sentence for the page —
@@ -6422,16 +6495,18 @@ _SAVE_LABEL = "Save as live defaults…"
 _SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter bar's "
                "scenario on screen — its spread band, tier floors, k, size cap, its Add to "
                "held pairs choice (when this page simulated it), its Sell level and Min. "
-               "days to maturity (when this page simulated selling) and any "
-               "category or tag, with this run's same-title cap when the run recorded one; "
+               "days to maturity (when this page simulated selling) and the "
+               "categories and tags ticked (each ticked tag is saved under its own "
+               "category), with this run's same-title cap when the run recorded one; "
                "not the Scenario Explorer's own selects — with the live trading defaults. "
                "Nothing is saved until you press a button there: Confirm and save saves "
                "it; Confirm and trade saves it and then runs the live bot with it, placing "
                "real orders; Dry run runs the live bot with it without placing orders and "
                "saves nothing. It stays unavailable "
                "while a scenario loads, and for a scenario the run never simulated, "
-               "whose band, k or size cap the run did not record, or whose k or size "
-               "cap is not above zero.")
+               "whose band, k or size cap the run did not record, whose k or size "
+               "cap is not above zero, or with more categories and tags ticked than the "
+               "confirmation page takes.")
 # Added to the hover text on a page that filed trades by ticker prefix, not by
 # Kalshi's series listing (which the live category and tag filter reads)
 _SAVE_TITLE_UNFILED = (" A category or tag can be saved only from a page built with "
@@ -10644,13 +10719,16 @@ def _mix_base(axis: pd.DatetimeIndex, initial_balance: float,
             "loss" (_pnl_colors); "khat_delta" (_KHAT_DELTA_COLORS); "types"
             (the trade-type labels, in _TRADE_TYPE_LINES order); "buckets"
             (_PRICE_BUCKET_LABELS); "bins" (the reliability diagram's bin
-            edges) and "marker" (_CALIBRATION_MARKER); "sub_height"
+            edges), "marker" (_CALIBRATION_MARKER) and "log_clip"
+            (_LOG_LOSS_CLIP); "top" (_BEST_WORST_ROWS); "sub_height"
             (_SUBCATEGORY_HEIGHT); "k11" (_ONE_TO_ONE); "row", "table_head"
             and "table_foot" (the category table's templates) with "cells"
             (the order of a view's "row" cells, _MIX_ROW_CELLS); "none" (what
-            an undefined figure reads as); and "sep"
+            an undefined figure reads as); "sep"
             (config.TAG_SCOPE_SEPARATOR, between a category and its tag in a
-            saved filter).
+            name and in a saved filter); and "names"
+            (_SELECTION_NAMES_SHOWN: how many ticked names the summary line
+            spells out).
     """
     rates = None
     if risk_free is not None:
@@ -10671,6 +10749,8 @@ def _mix_base(axis: pd.DatetimeIndex, initial_balance: float,
         "buckets": list(_PRICE_BUCKET_LABELS),
         "bins": [float(edge) for edge in np.linspace(0, 1, _CALIBRATION_BINS + 1)],
         "marker": list(_CALIBRATION_MARKER),
+        "log_clip": _LOG_LOSS_CLIP,
+        "top": _BEST_WORST_ROWS,
         "sub_height": list(_SUBCATEGORY_HEIGHT),
         "k11": list(_ONE_TO_ONE),
         "row": _CATEGORY_ROW,
@@ -10679,6 +10759,7 @@ def _mix_base(axis: pd.DatetimeIndex, initial_balance: float,
         "cells": list(_MIX_ROW_CELLS),
         "none": _NO_FIGURE,
         "sep": TAG_SCOPE_SEPARATOR,
+        "names": _SELECTION_NAMES_SHOWN,
     }
 
 
@@ -11010,7 +11091,8 @@ def _tier_off_where(label: str, primary: bool, same_as_tier_on: bool) -> str:
 
 def _filter_summary_text(text: dict, scenario: str, primary: bool,
                          selection: str | None, n: int, n_band: int, *,
-                         note: str | None = None, add_on: bool = False) -> str:
+                         note: str | None = None, add_on: bool = False,
+                         mix: bool = False) -> str:
     """
     Say, under the filter bar, what the page is showing.
 
@@ -11027,8 +11109,9 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
         primary (bool): Whether it is the run's primary scenario (band, k
             and size cap all the run's own, with the tier floors on — or off
             at a band where they never bind).
-        selection (str | None): "Sports" or "Sports · Basketball", or None for
-            the whole run.
+        selection (str | None): "Sports" or "Sports · Basketball" — several
+            ticked categories and tags as _selection_name joins them — or
+            None for the whole run.
         n (int): Trades in the selection.
         n_band (int): Trades in the whole run at that scenario.
         note (str | None): Keyword-only. The whole-run view's closing note —
@@ -11041,6 +11124,10 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
             on: the line then gains the "add_on_note" template (what an added
             purchase counts as) before its closing reach sentence, as the
             script adds it. False (default).
+        mix (bool): Keyword-only. Whether the selection is a mix the page
+            worked out itself from several tags' figures: a slice's line then
+            gains the "mix_note" template, as the script adds it. False
+            (default).
 
     Returns:
         str: Plain text — escape it before putting it in HTML.
@@ -11053,18 +11140,81 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
     else:
         out = text["slice"].format(scenario=scenario, selection=selection, n=n,
                                    band_count=_trade_count(n_band))
+        out += text["mix_note"] if mix else ""
     return out + (text["add_on_note"] if add_on else "") + text["unfiltered"]
+
+
+def _selection_name(names: list[str], text: dict | None = None) -> str:
+    """
+    Name a selection of several categories and tags, as the summary line does.
+
+    The names are a ticked category's own ("Economics") where none of its
+    tags is ticked, else one "Category · Tag" per ticked tag, in menu order.
+    Up to _SELECTION_NAMES_SHOWN are spelled out; past that, the first few
+    and how many more. The page's script builds the same string from the
+    same templates (D.text.names_join, names_more).
+
+    Args:
+        names (list[str]): The selection's names, at least one.
+        text (dict | None): The templates (the payload's "text"); None
+            (default) reads _SUMMARY_TEMPLATES.
+
+    Returns:
+        str: "Economics", "Economics, Sports · Basketball", or e.g.
+            "A, B, C, +2 more".
+    """
+    text = _SUMMARY_TEMPLATES if text is None else text
+    shown = text["names_join"].join(names[:_SELECTION_NAMES_SHOWN])
+    more = len(names) - _SELECTION_NAMES_SHOWN
+    return shown if more <= 0 else text["names_more"].format(names=shown, n=more)
+
+
+def _menu_html(menu_id: str, all_label: str, rows: list[str]) -> str:
+    """
+    Render one check-box dropdown of the filter bar (the Category or the Tag menu).
+
+    A <details> element: its <summary> is the button (the script writes what
+    is ticked on it), and under it one box that clears the menu — ticked
+    exactly when nothing else is — and one box per row. Every box is rendered
+    disabled, and the menu greyed (class flt-off), until the script has
+    loaded its data, as the bar's selects are; autocomplete="off" so a
+    browser does not restore a stale tick on reload.
+
+    Args:
+        menu_id (str): "flt-cat" or "flt-tag": the <details> element's id.
+            The button is "<id>-label", the clearing box "<id>-all", row i's
+            box "<id>-<i>", its text "<id>-<i>-text" and the row itself
+            "<id>-<i>-row" (the script hides a tag row whose category is not
+            ticked).
+        all_label (str): The clearing box's words ("All categories").
+        rows (list[str]): Each row's text, already escaped, in index order.
+
+    Returns:
+        str: The menu's HTML.
+    """
+    boxes = "".join(
+        f'<label id="{menu_id}-{i}-row"><input type="checkbox" id="{menu_id}-{i}" disabled '
+        f'autocomplete="off"> <span id="{menu_id}-{i}-text">{text}</span></label>'
+        for i, text in enumerate(rows))
+    return (
+        f'<details id="{menu_id}" class="flt-multi flt-off" title="{html.escape(_MENU_TITLE)}">'
+        f'<summary id="{menu_id}-label">{html.escape(all_label)}</summary><div>'
+        f'<label><input type="checkbox" id="{menu_id}-all" checked disabled '
+        f'autocomplete="off"> {html.escape(all_label)}</label>'
+        f'{boxes}</div></details>')
 
 
 def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     """
-    Render the sticky filter bar: nine <select>s, the save button and a summary line.
+    Render the sticky filter bar: seven <select>s, two check-box menus, the save button and a summary line.
 
     Spread band, Tier floors, k, Size cap, Add to held pairs, Sell and Min.
     days to maturity choose the scenario — each option one of the grid's axes, the run's own marked
     " (primary)" (a band's option text is the payload's "option", which the
     script swaps for its tier-off one when the Tier floors choice changes) —
-    and Category and Tag a slice of it. The Tier floors select offers each
+    and Category and Tag a slice of it: two check-box dropdowns (_menu_html)
+    in which a reader ticks as many as they like, by one rule
+    (_MENU_TITLE, the hover text of both). The Tier floors select offers each
     band's run as simulated ("on", selected) or its tier-floors-off run
     ("off"), its title spelling out both rules (_TIER_SELECT_TITLE); a payload
     with no tier-floors-off view ("grid_off" null) puts a grey "(not
@@ -11084,15 +11234,16 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     the option's index, the first selected), its title carrying the rule
     (_SELL_DAYS_TITLE); the script enables it only while Sell names a
     level, since with no selling there is no sale to hold back.
-    Category and tag options carry the primary scenario's trade
-    counts; the script rewrites them whenever the scenario changes. Tag
-    options list every "Category · Tag" while the category is "All";
-    choosing one sets the category to match. The selects are rendered
+    Category and tag rows carry the primary scenario's trade
+    counts; the script rewrites them whenever the scenario changes. The Tag
+    menu lists every "Category · Tag" while no category is ticked (the
+    script then shows only the ticked categories' tags, and ticking a tag
+    ticks its category). The selects and both menus' boxes are rendered
     DISABLED, and autocomplete="off" so a browser does not restore a stale
     choice on reload: the script enables them once it has inflated the base
     block AND the primary scenario's chunk, so without it (or without a
     browser that can inflate them) they cannot promise a view the page will
-    not show. After the Tag select comes the save button, rendered disabled
+    not show. After the Tag menu comes the save button, rendered disabled
     too: the script enables it whenever the scenario on screen can become
     the live defaults, and a click opens the defaults server's confirmation
     page for that scenario in a new tab. Its hover text (_SAVE_TITLE) gains
@@ -11206,13 +11357,14 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     save_note += ('&nbsp;<span id="flt-sell-save-note" style="color:#9E9E9E; font-size:13px;">'
                   f"{html.escape(_SELL_SAVE_NOTE)}</span>" if save_sells else "")
 
-    cat_opts = '<option value="">All categories</option>' + "".join(
-        f'<option value="{i}">{html.escape(c)} ({count(f"c{i}")})</option>'
-        for i, c in enumerate(payload["categories"]))
-    tag_opts = '<option value="">All tags</option>' + "".join(
-        f'<option value="{i}">{html.escape(payload["categories"][ci] + " · " + tag)} '
-        f'({count(f"s{i}")})</option>'
-        for i, (ci, tag) in enumerate(payload["subcats"]))
+    # The two check-box menus: every category, and every category's tags
+    # named "Category · Tag" (the script shortens a tag's name while exactly
+    # one category is ticked), each with its trade count
+    cat_menu = _menu_html("flt-cat", _MENU_CAT_ALL, [
+        f'{html.escape(c)} ({count(f"c{i}")})' for i, c in enumerate(payload["categories"])])
+    tag_menu = _menu_html("flt-tag", _MENU_TAG_ALL, [
+        f'{html.escape(payload["categories"][ci] + TAG_SCOPE_SEPARATOR + tag)} '
+        f'({count(f"s{i}")})' for i, (ci, tag) in enumerate(payload["subcats"])])
     scenario = _scenario_phrase(payload["bands"][pb]["where"], payload["ks"][pk]["text"],
                                 payload["caps"][pc]["text"])
     summary = html.escape(_filter_summary_text(
@@ -11221,6 +11373,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         '<div id="flt-bar" style="position:sticky; top:0; z-index:1000; background:#FFFFFF;'
         ' border-bottom:1px solid #E0E0E0; padding:10px 0 8px; font-family:sans-serif;'
         ' font-size:14px;">'
+        # The two check-box menus' styling
+        f'{_MENU_STYLE}'
         f'<label>Spread band: <select id="flt-band" disabled autocomplete="off">'
         f'{options(payload["bands"], pb)}</select></label>&nbsp;&nbsp;'
         f'<label>Tier floors: <select id="flt-tier" disabled autocomplete="off" '
@@ -11235,10 +11389,10 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         f'title="{sell_title}">{sell_opts}</select></label>{sell_note}&nbsp;&nbsp;'
         f'<label>Min. days to maturity: <select id="flt-days" disabled autocomplete="off" '
         f'title="{days_title}">{days_opts}</select></label>&nbsp;&nbsp;'
-        f'<label>Category: <select id="flt-cat" disabled autocomplete="off">'
-        f'{cat_opts}</select></label>&nbsp;&nbsp;'
-        f'<label>Tag: <select id="flt-tag" disabled autocomplete="off">'
-        f'{tag_opts}</select></label>'
+        # Not inside a <label>, which would hand a click on the menu to its
+        # first box
+        f'<span>Category: </span>{cat_menu}&nbsp;&nbsp;'
+        f'<span>Tag: </span>{tag_menu}'
         # The save button, disabled like the selects (autocomplete="off": a
         # browser that restores a control's disabled state on reload must not)
         f'&nbsp;&nbsp;<button id="flt-save" type="button" disabled autocomplete="off" '
@@ -11384,7 +11538,8 @@ def _pack_text(raw: str) -> str:
 # base block (id="dash-data", built by _filter_payload) and, on demand, one
 # chunk per scenario (id="dash-chunk-N", built by _ChunkVisitor), all packed by
 # _packed_json_script, and draws nothing of its own: every figure it shows was
-# computed in Python, every sentence about the data is a Python template it
+# computed in Python — with ONE exception, a mix of several categories and
+# tags (below) — every sentence about the data is a Python template it
 # fills (D.text) — its only words of its own are the line it shows when the
 # base block cannot be loaded — every trace it draws copies the styling of a
 # trace Python drew (traceOf; the trade-type lines, which another scenario can
@@ -11430,6 +11585,27 @@ def _pack_text(raw: str) -> str:
 # that cannot be loaded, or hands nothing over, is named in Python's words
 # (D.text.sidecar_missing, sidecar_empty), and the selects go back to what
 # is still shown.
+# Category and Tag are two check-box menus (<details> elements; SHOWN[3] and
+# SHOWN[4] are the ticked indexes). A reader ticks as many boxes as they
+# like, and the ticks follow the live filter's rule (atomsOf, the page's twin
+# of config.trade_filter): a ticked category counts in full unless some of
+# its tags are ticked, then only those. Where the ticks cover exactly the
+# trades of one of Python's views — everything, one category, one tag — that
+# view is drawn as it stands. Any other set of ticks is a MIX, which has no
+# view of its own (the combinations are far too many to ship): the script
+# works it out (viewFor, mixView, buildMix) from the chunk's category · tag
+# views — each one's curve as running dollars per trade type ("m") and its
+# row of the category table ("row") — and the chunk's per-trade arrays, with
+# the constants, colours and markup Python renders with (D.mix), by the rule
+# of the Python helper named beside each figure, and formats each number as
+# Python's format() does (fixed: the exact value rounded half to even).
+# tests/test_dashboard.py's TestMixedSelection compares every part of a mix
+# with dashboard._view_payload over the same trades; what can still differ is
+# the last digit shown of a figure that sits within float rounding of a
+# rounding edge. A list whose tags Python could not vouch for carries no "m":
+# a mix asked for there is refused in Python's words (D.text.mix_unavailable)
+# and the bar is put back. The k-hat figures of a mix are the covered tags'
+# groups pooled from their raw counts (khatFor, pooledKhat).
 # The script also rewrites the performance section's two k-hat cards
 # (renderKhatCards, from the k-hat breakdown's group for the selection) and the
 # interval-discount section at the bar's k and size cap (renderKd, from
@@ -11458,8 +11634,14 @@ _FILTER_JS = r"""
 (function() {
   var dataEl = document.getElementById('dash-data');
   var bandSel = document.getElementById('flt-band'), kSel = document.getElementById('flt-k');
-  var capSel = document.getElementById('flt-cap'), catSel = document.getElementById('flt-cat');
-  var tagSel = document.getElementById('flt-tag');
+  var capSel = document.getElementById('flt-cap');
+  // "Category" and "Tag": two check-box menus (<details> elements), each
+  // with one box that clears it ("...-all", ticked exactly when nothing
+  // else is) and one box per category ("flt-cat-<i>") or per category · tag
+  // ("flt-tag-<i>")
+  var catMenu = document.getElementById('flt-cat'), tagMenu = document.getElementById('flt-tag');
+  var catAll = document.getElementById('flt-cat-all');
+  var tagAll = document.getElementById('flt-tag-all');
   // "Tier floors": each band's run as simulated (on), or its run with the
   // deadline-gap tier floors not applied (off, D.grid_off)
   var tierSel = document.getElementById('flt-tier');
@@ -11474,14 +11656,14 @@ _FILTER_JS = r"""
   // it counts only while Sell names a level
   var daysSel = document.getElementById('flt-days');
   if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !addSel || !sellSel || !daysSel
-      || !catSel || !tagSel) {
+      || !catMenu || !tagMenu || !catAll || !tagAll) {
     return;
   }
   // The bar's save button: a button, not a select, so never in SELECTS
   // (whose reset reads .options); optional, since a page without it has
   // nothing to save from
   var saveBtn = document.getElementById('flt-save');
-  var SELECTS = [bandSel, tierSel, kSel, capSel, addSel, sellSel, daysSel, catSel, tagSel];
+  var SELECTS = [bandSel, tierSel, kSel, capSel, addSel, sellSel, daysSel];
   // The k-hat chart's own "Group by" select follows the bar's rules
   var khatGroup = document.getElementById('khat-group');
   if (khatGroup) { SELECTS.push(khatGroup); }
@@ -11490,7 +11672,8 @@ _FILTER_JS = r"""
   // KEPT: the drawn chunks other than the primary's, least recently drawn
   // first. SEQ numbers the choices, so a chunk arriving after a later choice
   // is never drawn over it. SHOWN: what is on screen — the [band, k, cap]
-  // indexes, the category and tag selects' values, the Tier floors choice
+  // indexes, the ticked categories and the ticked tags (each a sorted list of
+  // indexes into D.categories / D.subcats), the Tier floors choice
   // ("on" / "off"), the Add to held pairs choice ("off" / "on"), the Sell
   // choice ("none", or a level's index) and the Min. days to maturity choice
   // (an index into D.sell_days), each appended after the others so the other
@@ -11501,6 +11684,9 @@ _FILTER_JS = r"""
   var D = null, N = 0, C = null, CHUNKS = {}, KEPT = [], SEQ = 0, SHOWN = null;
   var SELL = {};
   var KEEP = 16;                     // drawn chunks kept besides the primary
+  // PICK: the menus' ticks as last asked for (pickKey), so a click that
+  // leaves them as they were (the clearing box of an empty menu) redraws nothing
+  var PICK = '|';
 
   function byId(id) { return document.getElementById(id); }
   function setText(id, text) { var el = byId(id); if (el) { el.textContent = text; } }
@@ -11607,11 +11793,19 @@ _FILTER_JS = r"""
   // run never simulated (an Add to held pairs choice, or a Sell level, the
   // page holds no chunk for included), a band
   // the run did not record, a k or size cap the
-  // run did not record or that is not above zero, or a category or tag on a
-  // page that does not file trades by Kalshi's series listing. A tag always goes with its category
-  // (the tag select sets the category too). The server refuses, with its
-  // reason, any other value the live settings reject. Each number is written
-  // by String(), whose shortest form reads back as the same number.
+  // run did not record or that is not above zero, a category or tag on a
+  // page that does not file trades by Kalshi's series listing, or more
+  // categories or more tags than the server takes on one address
+  // (D.save.max_names). The address names every ticked category, and every
+  // ticked tag tied to its category ("Category · Tag", joined by D.mix.sep):
+  // the live filter then keeps a ticked category in full unless some of its
+  // tags are ticked, and then only those — the rule the page shows
+  // (atomsOf). A category whose listed tags are ALL ticked still sends each
+  // of them: the page lists only the tags this backtest saw, so naming the
+  // category alone would let a live run trade tags nobody ticked. The server
+  // refuses, with its reason, any other value the live settings reject. Each
+  // number is written by String(), whose shortest form reads back as the
+  // same number.
   function saveHref() {
     if (!D || !D.save || !SHOWN || C === null) { return null; }
     // null: never simulated; undefined: a sell level's block not inflated (a
@@ -11621,9 +11815,16 @@ _FILTER_JS = r"""
     if (shownId === null || shownId === undefined) { return null; }
     var band = D.bands[SHOWN[0]].value, k = D.ks[SHOWN[1]].value, cap = D.caps[SHOWN[2]].value;
     if (!band || !(k > 0) || !(cap > 0)) { return null; }
-    var sliced = SHOWN[3] !== '' || SHOWN[4] !== '';
-    if (sliced && !D.save.filed_by_listing) { return null; }
-    var q = [['tier_floors', offAt(SHOWN[5]) ? 'off' : 'on'], ['spread_min', band[0]],
+    var cats = SHOWN[3], tags = SHOWN[4];
+    if (cats.length && !D.save.filed_by_listing) { return null; }
+    var most = D.save.max_names;
+    if (typeof most === 'number' && (cats.length > most || tags.length > most)) { return null; }
+    // A category whose own name holds the separator could not be told from
+    // a tied tag's category: never sent
+    if (cats.some(function(c) { return D.categories[c].indexOf(D.mix.sep) >= 0; })) {
+      return null;
+    }
+    var q =[['tier_floors', offAt(SHOWN[5]) ? 'off' : 'on'], ['spread_min', band[0]],
              ['spread_max', band[1]], ['k', k], ['size_cap', cap]];
     // Left out when the run recorded none: the server then keeps the saved
     // same-title cap, or the seed's when none is saved
@@ -11642,12 +11843,8 @@ _FILTER_JS = r"""
              ['sell_min_days',
               level === null ? 'off' : D.sell_days[parseInt(SHOWN[8], 10)].value]);
     }
-    if (SHOWN[4] !== '') {
-      var sc = D.subcats[parseInt(SHOWN[4], 10)];
-      q.push(['category', D.categories[sc[0]]], ['tag', sc[1]]);
-    } else if (SHOWN[3] !== '') {
-      q.push(['category', D.categories[parseInt(SHOWN[3], 10)]]);
-    }
+    cats.forEach(function(c) { q.push(['category', D.categories[c]]); });
+    tags.forEach(function(t) { q.push(['tag', subName(t, true)]); });
     if (typeof D.save.source === 'string' && D.save.source !== '') {
       q.push(['source', D.save.source]);
     }
@@ -11670,20 +11867,476 @@ _FILTER_JS = r"""
       && (!tiersOff() || !D.tier_binds[bandIndex()]);
   }
   function list() { return C ? C.list : null; }
-  function viewKey() {
-    if (tagSel.value !== '') { return 's' + tagSel.value; }
-    if (catSel.value !== '') { return 'c' + catSel.value; }
-    return 'all';
-  }
   function count(key) { var L = list(), v = L && L.views[key]; return v ? v.n : 0; }
-  function currentView() { var L = list(); return (L && L.views[viewKey()]) || D.empty; }
+  // A tag by name, with or without its category in front — joined as a saved
+  // filter ties a tag to its category (D.mix.sep, config.TAG_SCOPE_SEPARATOR)
   function subName(i, withCategory) {
     var sc = D.subcats[i];
-    return (withCategory ? D.categories[sc[0]] + ' · ' : '') + sc[1];
+    return (withCategory ? D.categories[sc[0]] + D.mix.sep : '') + sc[1];
   }
-  function selectionName(key) {
-    if (key.charAt(0) === 'c') { return D.categories[parseInt(key.slice(1), 10)]; }
-    return subName(parseInt(key.slice(1), 10), true);
+  function ascending(a, b) { return a - b; }
+  // A sort that keeps equal items in the order given, whatever the engine's own does
+  function stableSort(items, compare) {
+    return items.map(function(item, i) { return [item, i]; }).sort(function(a, b) {
+      return compare(a[0], b[0]) || a[1] - b[1];
+    }).map(function(pair) { return pair[0]; });
+  }
+
+  // The Category and Tag menus. A menu's boxes as the page holds them (the
+  // clearing box first), and the indexes ticked in it.
+  function boxesOf(menu) {
+    return menu.querySelectorAll
+      ? Array.prototype.slice.call(menu.querySelectorAll('input')) : [];
+  }
+  function ticksOf(prefix, size) {
+    var out = [];
+    for (var i = 0; i < size; i++) {
+      var box = byId(prefix + i);
+      if (box && box.checked) { out.push(i); }
+    }
+    return out;
+  }
+  function catTicks() { return ticksOf('flt-cat-', D.categories.length); }
+  function tagTicks() { return ticksOf('flt-tag-', D.subcats.length); }
+  function setTicks(cats, tags) {
+    D.categories.forEach(function(_, i) {
+      var box = byId('flt-cat-' + i);
+      if (box) { box.checked = cats.indexOf(i) >= 0; }
+    });
+    D.subcats.forEach(function(_, i) {
+      var box = byId('flt-tag-' + i);
+      if (box) { box.checked = tags.indexOf(i) >= 0; }
+    });
+  }
+  // The ticks as one string, to tell whether a click changed them
+  function pickKey() { return catTicks().join(',') + '|' + tagTicks().join(','); }
+  // Before the data is in, a menu is cleared by its boxes alone (a browser
+  // can restore old ticks on a reload): only the clearing box stays ticked
+  function clearMenu(menu, allBox) {
+    boxesOf(menu).forEach(function(box) { box.checked = box === allBox; });
+  }
+  function menusDisabled(off) {
+    [catMenu, tagMenu].forEach(function(menu) {
+      boxesOf(menu).forEach(function(box) { box.disabled = off; });
+      menu.className = off ? 'flt-multi flt-off' : 'flt-multi';
+      if (off) { menu.open = false; }
+    });
+  }
+  // The category · tag views a set of ticks covers, as indexes into
+  // D.subcats: for each ticked category its ticked tags, or every one of its
+  // tags when none of them is ticked — the page's twin of the live filter's
+  // rule (config.trade_filter). null when nothing is ticked: everything.
+  function atomsOf(cats, tags) {
+    if (!cats.length) { return null; }
+    var out = [];
+    D.subcats.forEach(function(sc, i) {
+      if (cats.indexOf(sc[0]) < 0) { return; }
+      var narrowed = tags.some(function(t) { return D.subcats[t][0] === sc[0]; });
+      if (!narrowed || tags.indexOf(i) >= 0) { out.push(i); }
+    });
+    return out;
+  }
+  // A set of ticks by name (Python's _selection_name): a ticked category's
+  // own name where none of its tags is ticked, else each of its ticked tags
+  // with the category in front; the first D.mix.names of them, then how
+  // many more, in Python's words
+  function selectionName(cats, tags) {
+    var names = [];
+    cats.forEach(function(c) {
+      var own = tags.filter(function(t) { return D.subcats[t][0] === c; });
+      if (!own.length) { names.push(D.categories[c]); }
+      own.forEach(function(t) { names.push(subName(t, true)); });
+    });
+    var shown = names.slice(0, D.mix.names).join(D.text.names_join);
+    var more = names.length - D.mix.names;
+    return more <= 0 ? shown : fill(D.text.names_more, {names: shown, n: more});
+  }
+  // The view of a chunk's list for a set of ticks: one of Python's own views
+  // wherever the ticks cover exactly its trades (everything, one category,
+  // one tag), the empty view where they cover none, and otherwise a mix
+  // worked out here from the tags' views (mixView) — or null when this
+  // list's tags cannot be mixed. window.__dashForceMix (never set by the
+  // page; the tests set it) sends every selection with a trade through
+  // mixView, so a mix can be compared with the view Python built.
+  function tagKeysOf(L) {
+    if (!L._tags) {
+      L._tags = Object.keys(L.views).filter(function(k) { return k.charAt(0) === 's'; });
+    }
+    return L._tags;
+  }
+  function plainKey(L, keys) {
+    if (keys.length === 1) { return keys[0]; }
+    var every = tagKeysOf(L);
+    if (keys.length === every.length) { return 'all'; }
+    var c = D.subcats[parseInt(keys[0].slice(1), 10)][0];
+    function inCategory(k) { return D.subcats[parseInt(k.slice(1), 10)][0] === c; }
+    if (keys.every(inCategory) && keys.length === every.filter(inCategory).length
+        && L.views['c' + c]) {
+      return 'c' + c;
+    }
+    return null;
+  }
+  function viewFor(chunk, cats, tags) {
+    var L = chunk ? chunk.list : null;
+    if (!L) { return D.empty; }
+    var atoms = atomsOf(cats, tags);
+    if (atoms === null) { return L.views.all || D.empty; }
+    var keys = atoms.map(function(i) { return 's' + i; })
+      .filter(function(k) { return !!L.views[k]; });
+    if (!keys.length) { return D.empty; }
+    if (!window.__dashForceMix) {
+      var whole = plainKey(L, keys);
+      if (whole) { return L.views[whole]; }
+    }
+    return mixView(chunk, keys);
+  }
+
+  // ── A mix of several categories and tags, worked out in the page ─────────
+  // There are far too many combinations to ship a view of each, so a mix is
+  // built from the chunk's category · tag views ("m": each one's running P&L
+  // in dollars per trade type; "row": its line of the category table) and
+  // per-trade arrays, with the constants and markup Python renders with
+  // (D.mix) and Python's words (D.text). Each figure follows the Python
+  // helper named beside it, so a mix reads as _view_payload would have
+  // computed it for the same trades.
+
+  // numpy's sum of doubles (pairwise): plain below 8 values, eight running
+  // sums up to 128, halves beyond — so a mean here is the mean Python takes
+  function pairSum(a, lo, n) {
+    var i, res;
+    if (n < 8) {
+      res = 0;
+      for (i = 0; i < n; i++) { res += a[lo + i]; }
+      return res;
+    }
+    if (n <= 128) {
+      var r = a.slice(lo, lo + 8);
+      for (i = 8; i < n - (n % 8); i += 8) {
+        for (var j = 0; j < 8; j++) { r[j] += a[lo + i + j]; }
+      }
+      res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+      for (; i < n; i++) { res += a[lo + i]; }
+      return res;
+    }
+    var half = Math.floor(n / 2);
+    half -= half % 8;
+    return pairSum(a, lo, half) + pairSum(a, lo + half, n - half);
+  }
+  function npSum(a) { return pairSum(a, 0, a.length); }
+  // pandas' sum within a group (compensated): the decomposition's bars
+  function groupSum(values) {
+    var sum = 0, comp = 0;
+    values.forEach(function(v) {
+      var y = v - comp, t = sum + y;
+      comp = t - sum - y;
+      sum = t;
+    });
+    return sum;
+  }
+  // numpy's median: the middle value, or the mean of the two middle ones
+  function median(values) {
+    var s = values.slice().sort(ascending), mid = Math.floor(s.length / 2);
+    return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+  }
+  // A number with a fixed count of decimals as Python's format() writes it:
+  // the exact value rounded half to even (toFixed alone rounds an exact half
+  // up), and a negative that rounds to zero keeps its sign
+  function fixed(x, digits) {
+    if (!isFinite(x) || Math.abs(x) >= 1e21) { return String(x); }
+    var neg = x < 0 || (x === 0 && 1 / x < 0);
+    var s = Math.abs(x).toFixed(digits + 40), dot = s.indexOf('.');
+    var body = s.slice(0, dot) + s.slice(dot + 1, dot + 1 + digits);
+    var rest = s.slice(dot + 1 + digits), first = rest.charAt(0), up = first > '5';
+    if (first === '5') {
+      up = /[1-9]/.test(rest.slice(1)) || parseInt(body.charAt(body.length - 1), 10) % 2 === 1;
+    }
+    if (up) {
+      var d = body.split(''), i = d.length - 1;
+      while (i >= 0 && d[i] === '9') { d[i] = '0'; i--; }
+      if (i >= 0) { d[i] = String(parseInt(d[i], 10) + 1); } else { d.unshift('1'); }
+      body = d.join('');
+    }
+    var whole = body.slice(0, body.length - digits);
+    return (neg ? '-' : '') + whole + (digits ? '.' + body.slice(body.length - digits) : '');
+  }
+  // Python's "%" formats (the value times 100, then fixed) and its "+" flag
+  function pct(x, digits) { return fixed(x * 100, digits) + '%'; }
+  function signed(text) { return text.charAt(0) === '-' ? text : '+' + text; }
+  function zeros(n) {
+    var out = new Array(n);
+    for (var i = 0; i < n; i++) { out[i] = 0; }
+    return out;
+  }
+  // A series on every date back to change points, as _sparse_on_axis ships one
+  function sparse(values) {
+    var out = [], prev;
+    for (var i = 0; i < values.length; i++) {
+      var v = isFinite(values[i]) ? values[i] : null;
+      if (i === 0 || v !== prev) { out.push([i, v]); }
+      prev = v;
+    }
+    return out;
+  }
+  // _decomposition_frame's month of an entry date: "YYYY-MM"
+  function monthName(m) {
+    var year = Math.floor(m / 12), month = m % 12 + 1;
+    return ('000' + year).slice(-4) + '-' + (month < 10 ? '0' : '') + month;
+  }
+  function pnlColors(values) {
+    return values.map(function(v) { return v >= 0 ? D.mix.profit : D.mix.loss; });
+  }
+  // _khat_delta: a k-hat less a k, to three decimals, a difference shown as
+  // zero reading "+0.000"; red above zero, green otherwise
+  function khatDelta(khat, k) {
+    if (khat === null || k === null || k === undefined) {
+      return [D.mix.none, D.styles.kpi_default];
+    }
+    var digits = fixed(Math.abs(khat - k), 3), zero = !/[1-9]/.test(digits);
+    var up = !zero && khat - k > 0;
+    return [(zero || up ? '+' : '-') + digits, D.mix.khat_delta[up ? 0 : 1]];
+  }
+
+  // One mix, built once per chunk and set of tag views
+  function mixView(chunk, keys) {
+    var L = chunk.list, key = keys.join(',');
+    L._mix = L._mix || {};
+    if (!(key in L._mix)) { L._mix[key] = buildMix(chunk, keys); }
+    return L._mix[key];
+  }
+  function buildMix(chunk, keys) {
+    var L = chunk.list, M = D.mix, T = D.text, i;
+    var atoms = keys.map(function(k) { return L.views[k]; });
+    // A tag whose curve Python could not vouch for carries no "m": no mix
+    if (!atoms.every(function(a) { return !!a.m; })) { return null; }
+    var idx = [];
+    atoms.forEach(function(a) { idx = idx.concat(a.idx); });
+    idx.sort(ascending);
+    var n = idx.length;
+    function mine(arr) { return idx.map(function(t) { return arr[t]; }); }
+
+    // The curve: the starting balance plus every tag's running dollars, kept
+    // per trade type (backtester._build_equity_curve; _return_by_trade_type)
+    var parts = {};
+    atoms.forEach(function(a) {
+      a.m.forEach(function(part) {
+        var y = expand(part[1]), sum = parts[part[0]] || (parts[part[0]] = zeros(N));
+        for (var r = 0; r < N; r++) { sum[r] += y[r]; }
+      });
+    });
+    var labels = M.types.filter(function(label) { return !!parts[label]; });
+    var V = new Array(N);
+    for (i = 0; i < N; i++) {
+      var pnl = 0;
+      for (var l = 0; l < labels.length; l++) { pnl += parts[labels[l]][i]; }
+      V[i] = M.start + pnl;
+    }
+
+    // Capital in open trades: the fee-inclusive stakes from each entry row
+    // to its exit row (_capital_deployed), and what the curve itself carries
+    // in them (_open_capital_from_curve), which the hurdle is charged on
+    var entered = zeros(N), exited = zeros(N), paid = zeros(N);
+    idx.forEach(function(t) {
+      if (L.en[t] >= 0) { entered[L.en[t]] += L.st[t]; }
+      if (L.ex[t] >= 0) { exited[L.ex[t]] += L.st[t]; paid[L.ex[t]] += L.pf[t]; }
+    });
+    var dep = new Array(N), open = new Array(N), staked = 0, paidOut = 0;
+    for (i = 0; i < N; i++) {
+      staked += entered[i] - exited[i];
+      paidOut += paid[i];
+      dep[i] = staked > 0 ? staked : 0;
+      var carried = V[i] - M.start + staked - paidOut;
+      open[i] = carried > 0 ? carried : 0;
+    }
+
+    // Daily returns and what they are measured against (_rf_hurdle): the
+    // yield in force that day on the share of the value in open trades at
+    // the previous close; nothing without rates
+    var rates = M.rf ? expand(M.rf) : null, ret = new Array(N), excess = new Array(N);
+    var lo = Infinity, hi = -Infinity;
+    for (i = 0; i < N; i++) {
+      ret[i] = i === 0 ? 0 : V[i] / V[i - 1] - 1;
+      if (ret[i] !== ret[i]) { ret[i] = 0; }
+      var hurdle = (rates && i > 0 && V[i - 1] > 0) ? rates[i] * (open[i - 1] / V[i - 1]) : 0;
+      excess[i] = ret[i] - hurdle / M.year;
+      lo = Math.min(lo, ret[i]);
+      hi = Math.max(hi, ret[i]);
+    }
+    // _sharpe and _sortino; a curve that never moves reads 0 (_varies)
+    var sharpe = 0, sortino = 0;
+    if (hi - lo > M.flat) {
+      var mean = npSum(excess) / N;
+      var spread = Math.sqrt(npSum(excess.map(function(e) {
+        return (mean - e) * (mean - e);
+      })) / (N - 1));
+      var down = Math.sqrt(npSum(excess.map(function(e) {
+        var d = Math.min(e, 0);
+        return d * d;
+      })) / N);
+      sharpe = spread > 0 ? mean / spread * Math.sqrt(M.year) : 0;
+      sortino = down > 0 ? mean / down * Math.sqrt(M.year) : 0;
+    }
+    // _max_drawdown: the deepest fall from a running peak, and its first day
+    var peak = -Infinity, fall = new Array(N), deepest = Infinity, when = 0;
+    for (i = 0; i < N; i++) {
+      if (V[i] > peak) { peak = V[i]; }
+      fall[i] = (V[i] - peak) / peak;
+      if (fall[i] < deepest) { deepest = fall[i]; when = i; }
+    }
+    var drawdown = pct(deepest, 1) + (deepest === 0 ? '' : ' (' + D.dates[when] + ')');
+    // _median_monthly_return: each month's last value over the one before,
+    // the first month against the opening row
+    var medianMonth = M.none;
+    if (isFinite(V[0]) && V[0] > 0) {
+      var ends = [];
+      for (i = 0; i < N; i++) {
+        if (i === N - 1 || D.dates[i].slice(0, 7) !== D.dates[i + 1].slice(0, 7)) {
+          ends.push(V[i]);
+        }
+      }
+      var months = ends.map(function(v, j) { return v / (j === 0 ? V[0] : ends[j - 1]) - 1; })
+        .filter(function(r) { return isFinite(r); });
+      if (months.length) { medianMonth = signed(pct(median(months), 1)); }
+    }
+
+    // _performance_kpis' cards
+    var profits = mine(L.pf), ratios = mine(L.pr);
+    var wins = profits.filter(function(p) { return p > 0; }).length;
+    var kpi = {
+      total_return: signed(pct((V[N - 1] - M.start) / M.start, 1)),
+      sharpe: fixed(sharpe, 2),
+      sortino: fixed(sortino, 2),
+      max_drawdown: drawdown,
+      win_rate: pct(wins / n, 1),
+      avg_return: pct(npSum(ratios) / n, 1),
+      median_return: pct(median(ratios), 1),
+      median_monthly: medianMonth,
+      trades: String(n)
+    };
+
+    // _decomposition_aggregates' bars: P&L by entry month, category,
+    // category · tag and entry-price bucket
+    function sumsBy(keyOf) {
+      var groups = {}, order = [];
+      idx.forEach(function(t) {
+        var k = keyOf(t);
+        if (k === null) { return; }
+        if (!(k in groups)) { groups[k] = []; order.push(k); }
+        groups[k].push(L.pf[t]);
+      });
+      order.sort(ascending);
+      return {keys: order, sums: order.map(function(k) { return groupSum(groups[k]); })};
+    }
+    var byMonth = sumsBy(function(t) { return L.mo[t]; });
+    var monthly = {x: byMonth.keys.map(monthName), y: byMonth.sums, c: pnlColors(byMonth.sums)};
+    var byBucket = sumsBy(function(t) { return L.pb[t] < 0 ? null : L.pb[t]; });
+    var price = {x: byBucket.keys.map(function(b) { return M.buckets[b]; }), y: byBucket.sums,
+                 c: pnlColors(byBucket.sums)};
+    var categoryOf = {};
+    keys.forEach(function(k, j) {
+      var c = D.subcats[parseInt(k.slice(1), 10)][0];
+      atoms[j].idx.forEach(function(t) { categoryOf[t] = c; });
+    });
+    var byCategory = sumsBy(function(t) { return categoryOf[t]; });
+    // Smallest first, equal bars in name order (the categories are sorted)
+    var catBars = stableSort(byCategory.keys.map(function(c, j) {
+      return {name: D.categories[c], value: byCategory.sums[j]};
+    }), function(a, b) { return a.value - b.value; });
+    var cat = {x: catBars.map(function(b) { return b.value; }),
+               y: catBars.map(function(b) { return b.name; }),
+               c: pnlColors(catBars.map(function(b) { return b.value; }))};
+    // A tag's bar and table row are its own view's, in name order first
+    var tagRows = atoms.map(function(a) {
+      return {name: a.sub.y[0], value: a.sub.x[0], cells: a.row, pnl: a.row[M.cells.length],
+              n: a.n};
+    }).sort(function(a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+    var subBars = stableSort(tagRows, function(a, b) { return a.value - b.value; });
+    var sub = {x: subBars.map(function(b) { return b.value; }),
+               y: subBars.map(function(b) { return b.name; }),
+               c: pnlColors(subBars.map(function(b) { return b.value; })),
+               h: Math.max(M.sub_height[0], M.sub_height[1] * subBars.length + M.sub_height[2])};
+    // _category_table: the tags' rows, largest P&L first, each with its share
+    // of the mix's total (none of a zero total)
+    var total = npSum(profits);
+    var table = fill(M.table_head, {groups: tagRows.length})
+      + stableSort(tagRows, function(a, b) { return b.pnl - a.pnl; }).map(function(row) {
+        var cells = {trades: row.n, color: row.pnl >= 0 ? M.profit : M.loss,
+                     share: total === 0 ? M.none : pct(row.pnl / total, 0)};
+        M.cells.forEach(function(name, j) { cells[name] = row.cells[j]; });
+        return fill(M.row, cells);
+      }).join('') + M.table_foot;
+    chunk.strings.push(table);
+
+    // _reliability: the time-series trades' predictions against outcomes
+    var probs = [], hits = [];
+    idx.forEach(function(t) {
+      if (L.cp[t] !== null && L.cp[t] !== undefined) { probs.push(L.cp[t]); hits.push(L.ca[t]); }
+    });
+    var cal = {brier: M.none, log_loss: M.none, title: T.cal_title_none, x: [], y: [],
+               size: [], text: []};
+    if (probs.length) {
+      var brier = fixed(npSum(probs.map(function(p, j) {
+        return (p - hits[j]) * (p - hits[j]);
+      })) / probs.length, 4);
+      var logLoss = fixed(npSum(probs.map(function(p, j) {
+        var q = Math.max(M.log_clip, Math.min(1 - M.log_clip, p));
+        return -(hits[j] * Math.log(q) + (1 - hits[j]) * Math.log(1 - q));
+      })) / probs.length, 4);
+      cal.brier = brier;
+      cal.log_loss = logLoss;
+      cal.title = fill(T.cal_title, {brier: brier, log_loss: logLoss});
+      for (var b = 0; b + 1 < M.bins.length; b++) {
+        var inBin = [], binHits = [];
+        for (var j = 0; j < probs.length; j++) {
+          if (M.bins[b] <= probs[j] && probs[j] < M.bins[b + 1]) {
+            inBin.push(probs[j]);
+            binHits.push(hits[j]);
+          }
+        }
+        if (!inBin.length) { continue; }
+        cal.x.push(npSum(inBin) / inBin.length);
+        cal.y.push(npSum(binHits) / binHits.length);
+        cal.size.push(Math.max(M.marker[0], Math.floor(inBin.length / M.marker[1])));
+        cal.text.push(fill(T.cal_bin, {n: inBin.length}));
+      }
+    }
+
+    // _best_and_worst: the most and least profitable trades, equal profits in
+    // list order. A trade among the mix's first or last few is among its own
+    // tag's, whose rows Python rendered: tag by tag, the same order names
+    // the trade behind each row
+    function byProfit(trades_) {
+      return stableSort(trades_, function(a, b) { return L.pf[b] - L.pf[a]; });
+    }
+    var bestRow = {}, worstRow = {};
+    atoms.forEach(function(a) {
+      var order = byProfit(a.idx), from = Math.max(0, order.length - M.top);
+      a.best.forEach(function(row, j) { bestRow[order[j]] = row; });
+      a.worst.forEach(function(row, j) { worstRow[order[from + j]] = row; });
+    });
+    var ranked = byProfit(idx);
+    var best = ranked.slice(0, M.top).map(function(t) { return bestRow[t]; });
+    var worst = ranked.slice(-M.top).map(function(t) { return worstRow[t]; });
+    if (best.concat(worst).some(function(row) { return !row; })) { return null; }
+
+    return {
+      n: n, idx: idx, kpi: kpi, mix: true,
+      total: sparse(V.map(function(v) { return roundTo((v / M.start - 1) * 100, 4); })),
+      types: labels.map(function(label) {
+        return [label, sparse(parts[label].map(function(x) {
+          return roundTo(x / M.start * 100, 4);
+        }))];
+      }),
+      dd: sparse(fall.map(function(x) { return roundTo(x * 100, 4); })),
+      eq: sparse(V.map(function(v) { return roundTo(v, 2); })),
+      dep: sparse(dep.map(function(x) { return roundTo(x, 2); })),
+      // _strategy_row
+      bench: {'return': signed(pct(V[N - 1] / M.start - 1, 1)), sharpe: fixed(sharpe, 2),
+              max_dd: pct(deepest, 1)},
+      monthly: monthly, cat: cat, sub: sub, price: price, table: chunk.strings.length - 1,
+      cal: cal, best: best, worst: worst,
+      // _one_to_one_extent
+      k11: Math.max.apply(null, mine(L.kx).concat([M.k11[0]])) * M.k11[1]
+    };
   }
 
   // Python's _trade_count, and a template's {name} fields filled as
@@ -11711,22 +12364,25 @@ _FILTER_JS = r"""
                       sellSel.value, daysSel.value);
   }
   // The summary line: the templates _filter_summary_text fills for the view
-  // Python rendered, filled here for every other one
-  function summary(v) {
-    var key = viewKey(), T = D.text, text, id = cellChunk();
+  // Python rendered, filled here for every other one. With categories
+  // ticked it names them (selectionName) and, for a view worked out here
+  // (v.mix), closes on Python's note that the page combined it
+  function summary(v, cats, tags) {
+    var T = D.text, text, id = cellChunk();
     // Drawn only once a sell level's block is inflated, so never undefined
     // here; read as not shown should it be
     var shown = id !== null && id !== undefined;
     if (!shown) {
       text = fill(T.missing, {scenario: scenario()});
-    } else if (key === 'all') {
+    } else if (!cats.length) {
       text = fill(T.all, {scenario: scenario(), count: trades(v.n)});
       // Any other scenario closes on Python's other_scenario note — and the
       // primary cell with the tiers off at a binding band on other_run
       if (!isPrimary()) { text += isPrimaryCell() ? T.other_run : T.other_scenario; }
     } else {
-      text = fill(T.slice, {scenario: scenario(), selection: selectionName(key),
-                            n: v.n, band_count: trades(count('all'))});
+      text = fill(T.slice, {scenario: scenario(), selection: selectionName(cats, tags),
+                            n: v.n, band_count: trades(count('all'))})
+        + (v.mix ? T.mix_note : '');
     }
     // While adding is on, Python's note on what an added purchase counts as,
     // and while a sell level is chosen its note on what a sale is
@@ -11865,26 +12521,66 @@ _FILTER_JS = r"""
   // while a chosen scenario's chunk is still loading the other sections keep
   // showing the last one drawn, and a Group-by change meanwhile must draw
   // that one too — so a chunk that then fails to load leaves nothing behind.
-  // shownKey is viewKey for the category and tag drawn.
-  function shownKey() {
-    if (SHOWN[4] !== '') { return 's' + SHOWN[4]; }
-    if (SHOWN[3] !== '') { return 'c' + SHOWN[3]; }
-    return 'all';
+
+  // A band's k-hat figures for a set of ticks: Python's own group wherever
+  // the ticks are one of its groups (everything, one whole category, one
+  // tag), else the covered tags' groups pooled here from their raw counts —
+  // k-hat is the share of entries that settled in between over the mean
+  // implied gap, backtester._calibration_bucket's arithmetic, with the
+  // cells, bar label and k-hat − k per k written as Python writes them
+  // (_khat_cells, _khat_bar_text, _khat_delta). null with no entry.
+  function pooledKhat(band, atoms) {
+    var key = atoms.join(',');
+    band._pool = band._pool || {};
+    if (key in band._pool) { return band._pool[key]; }
+    var n = 0, events = 0, between = 0, gaps = 0;
+    atoms.forEach(function(i) {
+      var g = band.groups['s' + i];
+      if (!g || !g.raw) { return; }
+      n += g.n;
+      events += g.events;
+      between += g.raw[0];
+      gaps += g.raw[1];
+    });
+    var st = null;
+    if (n > 0) {
+      var rate = between / n, implied = gaps / n, k = implied > 0 ? rate / implied : null;
+      st = {n: n, events: events, rate: rate, implied: implied, k: k,
+            text: fill(D.text.khat_bar, {n: n, events: events}),
+            cells: [String(n), String(events), fixed(rate, 4), fixed(implied, 4),
+                    k === null ? D.mix.none : fixed(k, 3)],
+            delta: D.ks.map(function(kk) { return khatDelta(k, kk.value); })};
+    }
+    band._pool[key] = st;
+    return st;
+  }
+  function khatFor(band, cats, tags) {
+    if (!band) { return null; }
+    if (!cats.length) { return band.groups.all || null; }
+    var atoms = atomsOf(cats, tags);
+    if (cats.length === 1) {
+      var own = D.subcats.filter(function(sc) { return sc[0] === cats[0]; }).length;
+      // The whole category: none of its tags ticked, or every one of them
+      if (!tags.length || tags.length === own) { return band.groups['c' + cats[0]] || null; }
+      if (tags.length === 1) { return band.groups['s' + tags[0]] || null; }
+    }
+    return pooledKhat(band, atoms);
   }
   // The k-hat chart's rows for a grouping: [{label, st, kind}], kind "all"
-  // (the grouping's whole population), "selected" (the filter's choice on
-  // screen) or "bar". By category or tag: every group at the band shown
-  // (tags within the category shown); by band: every band for the category
-  // or tag shown — every band as the Tier floors choice shown reads it.
+  // (the grouping's whole population), "selected" (ticked in the filter on
+  // screen) or "bar". By category: every category at the band shown, each
+  // ticked one marked. By tag: with one category ticked its tags alone,
+  // under its own total, each ticked tag marked; otherwise every tag, those
+  // the ticks cover marked. By band: every band — as the Tier floors choice
+  // shown reads it — for the ticks shown (khatFor).
   // _section_khat renders the same rows for the default (by category,
   // primary band, tier floors on, no filter), from the same payload.
   function khatRows(group) {
-    var bi = SHOWN[0], cat = SHOWN[3], tag = SHOWN[4], T = D.text, out = [];
+    var bi = SHOWN[0], cats = SHOWN[3], tags = SHOWN[4], T = D.text, out = [];
     var B = bandsAt(SHOWN[5]), K = khatAt(SHOWN[5]);
     if (group === 'band') {
-      var key = shownKey();
       K.forEach(function(b, i) {
-        out.push({label: B[i].label, st: (b && b.groups[key]) || null,
+        out.push({label: B[i].label, st: khatFor(b, cats, tags),
                   kind: i === bi ? 'selected' : 'bar'});
       });
       return out;
@@ -11892,15 +12588,17 @@ _FILTER_JS = r"""
     var band = K[bi];
     if (!band) { return out; }
     if (group === 'tag') {
-      out.push({label: cat === '' ? T.khat_all_tags
-                                  : fill(T.khat_all_in, {category: D.categories[parseInt(cat, 10)]}),
-                st: band.groups[cat === '' ? 'all' : 'c' + cat] || null, kind: 'all'});
+      var one = cats.length === 1 ? cats[0] : null;
+      var marked = cats.length > 1 ? atomsOf(cats, tags) : tags;
+      out.push({label: one === null ? T.khat_all_tags
+                                    : fill(T.khat_all_in, {category: D.categories[one]}),
+                st: band.groups[one === null ? 'all' : 'c' + one] || null, kind: 'all'});
       D.subcats.forEach(function(sc, si) {
-        if (cat !== '' && String(sc[0]) !== cat) { return; }
+        if (one !== null && sc[0] !== one) { return; }
         var st = band.groups['s' + si];
         if (st) {
-          out.push({label: subName(si, cat === ''), st: st,
-                    kind: String(si) === tag ? 'selected' : 'bar'});
+          out.push({label: subName(si, one === null), st: st,
+                    kind: marked.indexOf(si) >= 0 ? 'selected' : 'bar'});
         }
       });
       return out;
@@ -11908,7 +12606,9 @@ _FILTER_JS = r"""
     out.push({label: T.khat_all_categories, st: band.groups.all || null, kind: 'all'});
     D.categories.forEach(function(name, ci) {
       var st = band.groups['c' + ci];
-      if (st) { out.push({label: name, st: st, kind: String(ci) === cat ? 'selected' : 'bar'}); }
+      if (st) {
+        out.push({label: name, st: st, kind: cats.indexOf(ci) >= 0 ? 'selected' : 'bar'});
+      }
     });
     return out;
   }
@@ -11919,8 +12619,7 @@ _FILTER_JS = r"""
   function khatTitle(group) {
     var T = D.text, scope;
     if (group === 'band') {
-      var key = shownKey();
-      scope = key === 'all' ? T.khat_every_category : selectionName(key);
+      scope = SHOWN[3].length ? selectionName(SHOWN[3], SHOWN[4]) : T.khat_every_category;
       if (offAt(SHOWN[5])) { scope = fill(T.khat_scope_tier_off, {scope: scope}); }
     } else {
       scope = bandsAt(SHOWN[5])[SHOWN[0]].where;
@@ -11981,17 +12680,16 @@ _FILTER_JS = r"""
   }
 
   // The Portfolio Performance section's k-hat cards, for what is ON SCREEN
-  // (SHOWN, like the k-hat chart): the k-hat breakdown's own group for the
-  // band, Tier floors choice and category or tag shown — its table cell —
-  // and its k-hat − k at the k shown, text and colour as Python formatted
-  // them (_khat_kpis).
+  // (SHOWN, like the k-hat chart): the k-hat figures of the band, Tier floors
+  // choice and ticks shown (khatFor: the k-hat breakdown's own group, or
+  // several tags' groups pooled) — its table cell — and its k-hat − k at
+  // the k shown, text and colour as Python formats them (_khat_kpis).
   // Nothing to show is the blank cell in the default colour. None of it is
   // on a page without the cards (no sweep): then nothing is done.
   function renderKhatCards() {
     var khat = byId('kpi-khat'), delta = byId('kpi-khat_delta');
     if (!khat || !delta) { return; }
-    var band = khatAt(SHOWN[5])[SHOWN[0]];
-    var st = band ? (band.groups[shownKey()] || null) : null;
+    var st = khatFor(khatAt(SHOWN[5])[SHOWN[0]], SHOWN[3], SHOWN[4]);
     var blank = [D.khat_blank[4], D.styles.kpi_default];
     var known = st !== null && st.k !== null;
     khat.textContent = st ? st.cells[4] : blank[0];
@@ -12040,21 +12738,29 @@ _FILTER_JS = r"""
     }
   }
 
-  // Option labels carry the scenario's trade counts; the tag list holds the
-  // selected category's tags, or every "Category · Tag" under "All".
-  function refreshOptions() {
-    for (var i = 1; i < catSel.options.length; i++) {
-      var ci = catSel.options[i].value;
-      catSel.options[i].text = D.categories[parseInt(ci, 10)] + ' (' + count('c' + ci) + ')';
-    }
-    var cat = catSel.value, keep = tagSel.value;
-    while (tagSel.options.length > 1) { tagSel.remove(1); }
-    D.subcats.forEach(function(sc, i) {
-      if (cat !== '' && String(sc[0]) !== cat) { return; }
-      tagSel.add(new Option(subName(i, cat === '') + ' (' + count('s' + i) + ')', String(i)));
+  // The two menus as their ticks stand: each row's text with the trade
+  // count of the scenario on screen; the Tag menu showing the ticked
+  // categories' tags only (every tag while no category is ticked), a tag
+  // named with its category unless exactly one category is ticked; each
+  // clearing box ticked exactly when nothing else in its menu is; and each
+  // button reading nothing ticked, the one ticked name, or how many — in
+  // Python's words (D.text.menu_*)
+  function refreshMenus() {
+    var cats = catTicks(), tags = tagTicks(), T = D.text, lone = cats.length === 1;
+    D.categories.forEach(function(name, i) {
+      setText('flt-cat-' + i + '-text', name + ' (' + count('c' + i) + ')');
     });
-    tagSel.value = keep;
-    if (tagSel.value !== keep) { tagSel.value = ''; }
+    D.subcats.forEach(function(sc, i) {
+      var row = byId('flt-tag-' + i + '-row');
+      if (row) { row.hidden = cats.length > 0 && cats.indexOf(sc[0]) < 0; }
+      setText('flt-tag-' + i + '-text', subName(i, !lone) + ' (' + count('s' + i) + ')');
+    });
+    catAll.checked = !cats.length;
+    tagAll.checked = !tags.length;
+    setText('flt-cat-label', !cats.length ? T.menu_cat_all
+      : (lone ? D.categories[cats[0]] : fill(T.menu_cat_n, {n: cats.length})));
+    setText('flt-tag-label', !tags.length ? T.menu_tag_all
+      : (tags.length === 1 ? subName(tags[0], !lone) : fill(T.menu_tag_n, {n: tags.length})));
   }
   // Each band option named as the Tier floors select reads it (Python's
   // "option" text: "max(tier,0.2)-0.6 (primary)" with the tiers on,
@@ -12066,9 +12772,9 @@ _FILTER_JS = r"""
     }
   }
 
-  function render() {
-    var v = currentView(), L = list(), has = v.n > 0;
-    summary(v);
+  function render(v, cats, tags) {
+    var L = list(), has = v.n > 0;
+    summary(v, cats, tags);
     setText('hdr-trades', String(v.n));
     // Shown before drawing, so every chart is laid out at its real width
     ['dec', 'cal', 'diag', 'risk'].forEach(function(p) { show(p, has); });
@@ -12201,26 +12907,35 @@ _FILTER_JS = r"""
   function refreshDays() {
     daysSel.disabled = !D || !D.sell_blocks || sellAt(sellSel.value) === null;
   }
-  // Draw the scenario the selects name, from C, and record it as SHOWN
-  // (after the tag list is rebuilt, so the tag recorded is the one kept)
-  function draw() {
-    refreshOptions();
-    SHOWN = [bandIndex(), kIndex(), capIndex(), catSel.value, tagSel.value, tierSel.value,
+  // Draw the scenario the selects and the menus' ticks name, from a chunk
+  // (null for a scenario the run never simulated), and record it as SHOWN
+  // with that chunk as C. False — nothing drawn, nothing recorded — when
+  // the ticks ask for a mix that chunk's list cannot give (viewFor)
+  function draw(chunk) {
+    var cats = catTicks(), tags = tagTicks();
+    var v = viewFor(chunk, cats, tags);
+    if (v === null) { return false; }
+    C = chunk;
+    refreshMenus();
+    SHOWN = [bandIndex(), kIndex(), capIndex(), cats, tags, tierSel.value,
              addSel.value, sellSel.value, daysSel.value];
-    render();
+    render(v, cats, tags);
     refreshDays();
     refreshSave();
+    return true;
   }
-  // A chunk or Sell block that could not be loaded. The sections still show
-  // the last scenario drawn (the k-hat chart included — it reads SHOWN):
-  // every select goes back to it, the category and tag too, since one chosen
-  // while the chunk was loading was never drawn either — the tag list
-  // rebuilt for the category shown — and the line says which scenario could
-  // not be loaded, in Python's words; the Tier floors, Add to held pairs,
-  // Sell and Min. days choices go back too, with the band options named for
-  // the first and the Min. days select shut again when Sell names none
+  // A scenario that could not be shown: a chunk or Sell block that could
+  // not be loaded (err: why), or ticks whose mix its list cannot give (err
+  // null). The sections still show the last scenario drawn (the k-hat chart
+  // included — it reads SHOWN): every select goes back to it, and the menus'
+  // ticks too, since ticks made while the chunk was loading were never
+  // drawn either — the menus rebuilt for the ticks shown — and the line
+  // says what could not be shown, in Python's words; the Tier floors, Add
+  // to held pairs, Sell and Min. days choices go back too, with the band
+  // options named for the first and the Min. days select shut again when
+  // Sell names none
   function putBack(err) {
-    var tried = scenario();
+    var tried = scenario(), ticks = selectionName(catTicks(), tagTicks());
     bandSel.value = String(SHOWN[0]);
     tierSel.value = SHOWN[5];
     addSel.value = SHOWN[6];
@@ -12229,19 +12944,28 @@ _FILTER_JS = r"""
     relabelBands();
     kSel.value = String(SHOWN[1]);
     capSel.value = String(SHOWN[2]);
-    catSel.value = SHOWN[3];
-    refreshOptions();
-    tagSel.value = SHOWN[4];
+    setTicks(SHOWN[3], SHOWN[4]);
+    refreshMenus();
+    PICK = pickKey();
     refreshDays();
-    setText('flt-summary', fill(D.text.unavailable, {
-      failed: tried, reason: String(err),
-      scenario: scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7],
-                           SHOWN[8])}));
+    var still = scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7],
+                           SHOWN[8]);
+    setText('flt-summary', err === null
+      ? fill(D.text.mix_unavailable, {selection: ticks, failed: tried, scenario: still})
+      : fill(D.text.unavailable, {failed: tried, reason: String(err), scenario: still}));
     // The scenario still shown can be saved again
     refreshSave();
   }
-  // The selects changed: draw their scenario — at once when its chunk is
-  // loaded (or it has none), else once it is; a later choice supersedes it
+  // A chunk whose list could not give the mix asked for was never drawn:
+  // dropped unless it is the page's own or one drawn before (KEPT bounds
+  // only those), then everything goes back
+  function refuseMix(id) {
+    if (id !== primaryChunk() && KEPT.indexOf(id) < 0) { delete CHUNKS[id]; }
+    putBack(null);
+  }
+  // The selects or the ticks changed: draw their scenario — at once when its
+  // chunk is loaded (or it has none), else once it is; a later choice
+  // supersedes it
   function choose() {
     var seq = ++SEQ, id = cellChunk();
     if (id === undefined) {
@@ -12257,9 +12981,12 @@ _FILTER_JS = r"""
       });
       return;
     }
-    if (id === null) { C = null; draw(); return; }
+    if (id === null) { draw(null); return; }
     var entry = CHUNKS[id];
-    if (entry && entry.data) { touch(id); C = entry.data; draw(); return; }
+    if (entry && entry.data) {
+      if (draw(entry.data)) { touch(id); } else { refuseMix(id); }
+      return;
+    }
     // While the chunk loads, the selects name a scenario the page does not
     // show yet, so nothing can be saved until it is drawn (or the choice is
     // put back)
@@ -12267,20 +12994,19 @@ _FILTER_JS = r"""
     setText('flt-summary', fill(D.text.loading, {scenario: scenario()}));
     load(id).then(function(chunk) {
       if (seq !== SEQ) { return; }
-      touch(id);
-      C = chunk;
-      draw();
+      if (draw(chunk)) { touch(id); } else { refuseMix(id); }
     }, function(err) {
       if (seq !== SEQ) { return; }
       putBack(err);
     });
   }
   // The bar cannot work: the base block, or the primary scenario's chunk,
-  // could not be loaded. Every select is disabled. The one sentence the
-  // script words itself is the line for a base block it could not read,
-  // which is where Python's templates are.
+  // could not be loaded. Every select and both menus are disabled. The one
+  // sentence the script words itself is the line for a base block it could
+  // not read, which is where Python's templates are.
   function unavailable(reason) {
     SELECTS.forEach(function(s) { s.disabled = true; });
+    menusDisabled(true);
     if (saveBtn) { saveBtn.disabled = true; }
     if (D) {
       var p = D.primary, here = scenarioAt(p[0], p[1], p[2], 'on', 'off', 'none', '0');
@@ -12291,19 +13017,23 @@ _FILTER_JS = r"""
     setText('flt-summary', 'The filter could not load its data (' + reason
       + '); every section shows the primary spread band’s full run.');
   }
-  // A browser can restore a <select>'s last choice on a reload, or on going
-  // back; the page as rendered is the primary scenario's unfiltered view with
-  // the tier floors on, adding to held pairs off and no sell level, so the
-  // bar is set back to it. Python renders the selects disabled: they are enabled once the
+  // A browser can restore a <select>'s last choice, or a box's tick, on a
+  // reload, or on going back; the page as rendered is the primary scenario's
+  // unfiltered view with the tier floors on, adding to held pairs off and no
+  // sell level, so the bar is set back to it: every select to its rendered
+  // option, both menus to nothing ticked. Python renders the selects and the
+  // menus' boxes disabled: they are enabled once the
   // base block and the primary scenario's chunk are inflated, so no choice
   // can be made (or lost) before it can be drawn — and a category or tag
-  // change never meets an unloaded chunk.
+  // tick never meets an unloaded chunk.
   SELECTS.forEach(function(s) {
     s.selectedIndex = 0;
     for (var i = 0; i < s.options.length; i++) {
       if (s.options[i].defaultSelected) { s.selectedIndex = i; }
     }
   });
+  clearMenu(catMenu, catAll);
+  clearMenu(tagMenu, tagAll);
   if (!window.DecompressionStream || !window.Response || !window.Blob) {
     unavailable('this browser cannot decompress it');
     return;
@@ -12318,8 +13048,9 @@ _FILTER_JS = r"""
   }).then(function(chunk) {
     if (SEQ === 0) {
       C = chunk;
-      SHOWN = D.primary.concat([catSel.value, tagSel.value, tierSel.value, addSel.value,
-                                sellSel.value, daysSel.value]);
+      // Nothing ticked: the two empty lists are SHOWN[3] and SHOWN[4]
+      SHOWN = D.primary.concat([[], [], tierSel.value, addSel.value, sellSel.value,
+                                daysSel.value]);
     }
     // A run with no tier-off (or add-on, or Sell) view keeps that select
     // disabled; the Min. days select opens only while Sell names a level
@@ -12327,6 +13058,7 @@ _FILTER_JS = r"""
       s.disabled = (s === tierSel && !D.grid_off) || (s === addSel && !D.grid_add)
         || (s === sellSel && !D.sell_blocks);
     });
+    menusDisabled(false);
     refreshDays();
     refreshSave();
   }, function(err) { unavailable(String(err)); });
@@ -12360,28 +13092,53 @@ _FILTER_JS = r"""
     if (!D || !D.sell_blocks || sellAt(sellSel.value) === null) { return; }
     choose();
   });
-  catSel.addEventListener('change', function() {
+  // A box of a menu was ticked or unticked (the event names the box). The
+  // ticks are put in order first: the clearing box empties its menu (the
+  // Category one both menus); unticking a category unticks its tags;
+  // ticking a tag ticks its category. Then the scenario is drawn again,
+  // unless the click left the ticks as they were. The menu stays open, so
+  // several boxes can be ticked in a row.
+  function onTick(menu, ev) {
     if (!D) { return; }
-    tagSel.value = '';
+    var id = (ev && ev.target && ev.target.id) || '';
+    var cats = catTicks(), tags = tagTicks();
+    if (menu === catMenu) {
+      if (id === 'flt-cat-all') { cats = []; }
+      tags = tags.filter(function(t) { return cats.indexOf(D.subcats[t][0]) >= 0; });
+    } else if (id === 'flt-tag-all') {
+      tags = [];
+    } else {
+      tags.forEach(function(t) {
+        if (cats.indexOf(D.subcats[t][0]) < 0) { cats.push(D.subcats[t][0]); }
+      });
+    }
+    setTicks(cats, tags);
+    refreshMenus();
+    var key = pickKey();
+    if (key === PICK) { return; }
+    PICK = key;
     choose();
-  });
+  }
+  catMenu.addEventListener('change', function(ev) { onTick(catMenu, ev); });
+  tagMenu.addEventListener('change', function(ev) { onTick(tagMenu, ev); });
+  // An open menu closes on a click outside it and on Escape (where the page
+  // can listen for them)
+  if (document.addEventListener) {
+    document.addEventListener('click', function(ev) {
+      [catMenu, tagMenu].forEach(function(menu) {
+        if (menu.open && !(menu.contains && menu.contains(ev.target))) { menu.open = false; }
+      });
+    });
+    document.addEventListener('keydown', function(ev) {
+      if (ev.key === 'Escape') { catMenu.open = false; tagMenu.open = false; }
+    });
+  }
   if (khatGroup) {
     khatGroup.addEventListener('change', function() {
       if (!D || !SHOWN) { return; }
       renderKhat();
     });
   }
-  tagSel.addEventListener('change', function() {
-    if (!D) { return; }
-    var t = tagSel.value;
-    if (t !== '' && catSel.value === '') {
-      // A "Category · Tag" picked under "All" selects its category too
-      catSel.value = String(D.subcats[parseInt(t, 10)][0]);
-      refreshOptions();
-      tagSel.value = t;
-    }
-    choose();
-  });
   // The save button opens the confirmation page for the scenario on screen
   // in a new tab; that page saves nothing until Confirm and save, or Confirm
   // and trade, is clicked there

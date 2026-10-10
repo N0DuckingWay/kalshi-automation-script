@@ -22,6 +22,16 @@
 // window.open records each call — {url, target, features} — in __opened and
 // opens nothing (it returns null, as a "noopener" open does).
 //
+// Check-box menus (page.menus): the filter bar's Category and Tag menus,
+// each a <details> element of check boxes (__menu below). A ["tick", id] step
+// is a reader clicking a box: it flips, and its change event runs the box's
+// listeners and then the menu's, unless the box is disabled. ["open", id]
+// opens a menu, ["outside", id] is a click somewhere on the page (on the
+// element named, or on nothing a script knows when id is ""), and ["key",
+// name] a key pressed, both handed to the listeners the script put on the
+// document. A snapshot's "menus" holds each menu's button text, whether it
+// is open, its class, and each row's text, tick and whether it is hidden.
+//
 // Strict mode (page.strict): getElementById returns null for an id the page
 // does not hold, as a browser's does, so a script that dereferences a missing
 // element fails the run. Otherwise any id asked for is created on the fly.
@@ -143,6 +153,83 @@ function __select(id, spec) {
   return el;
 }
 
+// A check-box menu (the filter bar's Category and Tag menus: a <details>
+// element) with the boxes, texts and attributes Python rendered: its button
+// (<summary>, "<id>-label"), the box that clears it ("<id>-all") and, per
+// row i, the box ("<id>-<i>"), its text ("<id>-<i>-text") and the row itself
+// ("<id>-<i>-row", which a script hides). A box has "checked" and "disabled";
+// a change event on a box runs the box's own listeners and then the menu's
+// (it bubbles), each handed {target: the box}. The menu answers
+// querySelectorAll with its boxes (the clearing box first) and contains()
+// for itself and its parts. For the tests' sake it also reads like a
+// <select>: "disabled" is its clearing box's, and "value" is the ticked row
+// indexes joined by commas ("" for none) — setting it ticks exactly those
+// rows, as a browser restoring a reader's old ticks would.
+var __MENUS = {};
+function __checkbox(id, spec) {
+  var el = __element(id, 'input');
+  el.type = 'checkbox';
+  el.checked = !!spec.checked;
+  el.disabled = !!spec.disabled;
+  __elements[id] = el;
+  return el;
+}
+function __menu(id, spec) {
+  var el = __element(id, 'details');
+  el.open = false;
+  el.className = spec.className || '';
+  var label = __element(id + '-label', 'summary');
+  label.textContent = spec.label;
+  __elements[id + '-label'] = label;
+  var all = __checkbox(id + '-all', spec.all);
+  var parts = [el, label, all];
+  var rows = spec.rows.map(function(row, i) {
+    var box = __checkbox(id + '-' + i, row);
+    var text = __element(id + '-' + i + '-text', 'span');
+    text.textContent = row.text;
+    __elements[id + '-' + i + '-text'] = text;
+    var line = __element(id + '-' + i + '-row', 'label');
+    line.hidden = !!row.hidden;
+    __elements[id + '-' + i + '-row'] = line;
+    parts.push(box, text, line);
+    return {box: box, text: text, line: line};
+  });
+  el.querySelectorAll = function() {
+    return [all].concat(rows.map(function(r) { return r.box; }));
+  };
+  el.contains = function(other) { return parts.indexOf(other) >= 0; };
+  Object.defineProperty(el, 'disabled', {
+    get: function() { return all.disabled; },
+    set: function() {}
+  });
+  Object.defineProperty(el, 'value', {
+    get: function() {
+      var out = [];
+      rows.forEach(function(r, i) { if (r.box.checked) { out.push(i); } });
+      return out.join(',');
+    },
+    set: function(v) {
+      var wanted = String(v) === '' ? [] : String(v).split(',');
+      rows.forEach(function(r, i) { r.box.checked = wanted.indexOf(String(i)) >= 0; });
+      all.checked = !wanted.length;
+    }
+  });
+  __MENUS[id] = {el: el, label: label, all: all, allText: spec.all.text, rows: rows};
+  return el;
+}
+// A change event on an element: its own listeners, then every menu's that
+// holds it (the event bubbles up to the <details>)
+function __change(el) {
+  var ev = {target: el};
+  (el._listeners.change || []).forEach(function(fn) { fn(ev); });
+  Object.keys(__MENUS).forEach(function(id) {
+    var menu = __MENUS[id].el;
+    if (menu !== el && menu.contains(el)) {
+      (menu._listeners.change || []).forEach(function(fn) { fn(ev); });
+    }
+  });
+}
+
 // A sidecar file loading: its call to window.__dashChunk runs (unless it
 // hands nothing over), with document.currentScript set to the element, then
 // the element's onload — or, for a file that cannot be loaded, its onerror
@@ -186,9 +273,16 @@ __HEAD.removeChild = function(el) {
   return el;
 };
 
+// Listeners a script puts on the document itself (a click anywhere, a key),
+// by event type; the ["outside"] and ["key"] steps call them
+var __DOC_LISTENERS = {};
+
 var document = {
   head: __HEAD,
   currentScript: null,
+  addEventListener: function(type, fn) {
+    (__DOC_LISTENERS[type] = __DOC_LISTENERS[type] || []).push(fn);
+  },
   getElementById: function(id) {
     if (!__elements[id]) {
       if (__STRICT && !__IDS[id]) { return null; }
@@ -319,7 +413,13 @@ function __setup(page) {
   __STRICT = !!page.strict;
   (page.ids || []).forEach(function(id) { __IDS[id] = true; });
   Object.keys(page.selects).forEach(function(id) {
+    // A check-box menu is listed among the selects too (its rows as
+    // options, for the tests to read): built as a menu, below
+    if (page.selects[id].menu) { return; }
     __elements[id] = __select(id, page.selects[id]);
+  });
+  Object.keys(page.menus || {}).forEach(function(id) {
+    __elements[id] = __menu(id, page.menus[id]);
   });
   Object.keys(page.buttons || {}).forEach(function(id) {
     var button = __element(id, 'button');
@@ -347,12 +447,31 @@ function __snapshot() {
   var snap = {reacts: __reacts, updates: __updates, inflated: __inflated.slice(),
               opened: __opened, files: __files.slice(),
               text: {}, html: {}, display: {}, heights: {}, ownHeights: {},
-              colors: {}, selects: {}, buttons: {}, rows: {}, weights: {},
+              colors: {}, selects: {}, menus: {}, buttons: {}, rows: {}, weights: {},
               layouts: {}, pending: Object.keys(__PENDING),
               pendingFiles: Object.keys(__FILE_PENDING)};
   __reacts = [];
   __updates = [];
   __opened = [];
+  // Each check-box menu: its button's text, whether it is open, greyed
+  // (className) and disabled, whether its clearing box is ticked, the row
+  // indexes ticked, and every row as [text, ticked, hidden] — and, read as a
+  // select, its value (the ticked indexes, comma-joined) and its options
+  // (the clearing box, then the rows not hidden)
+  Object.keys(__MENUS).forEach(function(id) {
+    var m = __MENUS[id], ticked = [], options = [['', m.allText]];
+    m.rows.forEach(function(r, i) {
+      if (r.box.checked) { ticked.push(i); }
+      if (!r.line.hidden) { options.push([String(i), r.text._text]); }
+    });
+    snap.menus[id] = {label: m.label._text, open: !!m.el.open, className: m.el.className,
+                      disabled: m.all.disabled, all: m.all.checked, ticked: ticked,
+                      boxesDisabled: m.rows.map(function(r) { return r.box.disabled; }),
+                      rows: m.rows.map(function(r) {
+                        return [r.text._text, r.box.checked, !!r.line.hidden];
+                      })};
+    snap.selects[id] = {value: m.el.value, disabled: m.all.disabled, options: options};
+  });
   Object.keys(__elements).forEach(function(id) {
     var el = __elements[id];
     if (el.layout) { snap.layouts[id] = JSON.parse(JSON.stringify(el.layout)); }
@@ -431,8 +550,10 @@ function __spin(ticks, next) {
 // ["call", name, args] (a page script's window function, called as another
 // script would — the filter's window.dashScenarioSelect call, with any
 // labels), ["click", id] (a reader clicking that element: its click
-// listeners run unless it is disabled), ["snap", name]. Emits every
-// snapshot, as JSON, once the steps are done.
+// listeners run unless it is disabled), ["tick", id] (a reader clicking a
+// check box of a menu), ["open", id] (a reader opening a menu), ["outside",
+// id] (a click elsewhere on the page), ["key", name] (a key pressed),
+// ["snap", name]. Emits every snapshot, as JSON, once the steps are done.
 function __step(steps, i) {
   if (i >= steps.length) {
     __emit(JSON.stringify(__snaps));
@@ -481,6 +602,23 @@ function __step(steps, i) {
     document.getElementById(s[1]).value = s[2];
   } else if (s[0] === 'fire') {
     (document.getElementById(s[1])._listeners.change || []).forEach(function(fn) { fn(); });
+  } else if (s[0] === 'tick') {
+    // A reader clicking a check box: it flips, then its change event runs —
+    // unless the box is disabled, which a browser leaves alone
+    var box = document.getElementById(s[1]);
+    if (!box.disabled) {
+      box.checked = !box.checked;
+      __change(box);
+    }
+  } else if (s[0] === 'open') {
+    document.getElementById(s[1]).open = true;
+  } else if (s[0] === 'outside') {
+    // A click somewhere on the page: on the element named, or on nothing a
+    // script knows
+    var clickedOn = s[1] ? document.getElementById(s[1]) : {};
+    (__DOC_LISTENERS.click || []).forEach(function(fn) { fn({target: clickedOn}); });
+  } else if (s[0] === 'key') {
+    (__DOC_LISTENERS.keydown || []).forEach(function(fn) { fn({key: s[1]}); });
   } else if (s[0] === 'zoom') {
     var gd = document.getElementById(s[1]);
     gd.layout = JSON.parse(JSON.stringify(gd.layout));
