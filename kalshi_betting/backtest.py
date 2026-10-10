@@ -8,7 +8,8 @@ Purpose:
     arguments (--start-date, --balance, --no-cache, --max-horizon-days,
     --interval-discount, --no-sweep, --same-event-ladders /
     --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
-    --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers),
+    --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers,
+    --no-trim-sweep),
     configures logging to kalshi_backtest.log, constructs the necessary API
     clients, works out the starting balance (--balance, or else what the Kalshi
     account is worth when the run starts), fits the depth model from the saved
@@ -190,6 +191,14 @@ Notes:
     reaches live trading by itself: a live run sells at its saved sell_at
     level (main.py --sell-at overrides it for one run), which the dashboard's
     Save as live defaults… can set.
+
+    The "Trim to Kelly" family is ON by default too (trim_sweep=True): the
+    result carries a lazy TrimSweep (BacktestSweep.trim_sweep) that
+    simulates, when the dashboard is built, every scenario again with held
+    pairs sold down to their Kelly size at each weekly checkpoint, adding to
+    held pairs or not (the dashboard's Trim to Kelly select). It simulates
+    nothing during the run; --no-trim-sweep skips it, leaving the select
+    disabled. Backtest only: live trading does not trim.
 
     The pre-fetch echo's "live rule=" clause names the saved live defaults'
     time-series rule and, when one is set, their category/tag filter (never
@@ -429,7 +438,7 @@ def main() -> None:
     --max-horizon-days, --interval-discount, --no-sweep,
     --same-event-ladders / --no-same-event-ladders, --spread-min,
     --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep,
-    --no-sell-sweep), configures logging, constructs historical and live
+    --no-sell-sweep, --no-trim-sweep), configures logging, constructs historical and live
     Kalshi API clients, works out the starting balance (--balance, or else the
     account's value now, read through _account_starting_balance; a read that
     fails, or comes to nothing, stops the run with exit 1 before the
@@ -453,8 +462,8 @@ def main() -> None:
     by the dashboard, which reads every cell as the page is built (its filter
     bar, Interval Discount section and scenario explorer); the lazily
     simulated add-on sweeps (result.add_on_cap_sweep, and
-    result.add_on_tier_off_cap_sweep) and sell family (result.sell_sweep) are
-    read the same way.
+    result.add_on_tier_off_cap_sweep), sell family (result.sell_sweep) and
+    Kelly-trim family (result.trim_sweep) are read the same way.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -564,6 +573,14 @@ def main() -> None:
              "Backtest only — a live run sells only at its saved sell_at level, "
              "which the dashboard's Save as live defaults… can set to a level "
              "shown here",
+    )
+    parser.add_argument(
+        "--no-trim-sweep", action="store_true",
+        help="Skip the dashboard's Trim to Kelly select (sell part of a held pair, "
+             "at each weekly checkpoint, once it is worth more than its Kelly share "
+             "of the portfolio): its simulations run only while the dashboard is "
+             "built, so skipping them makes that step faster and leaves the select "
+             "disabled. Backtest only — live trading does not trim",
     )
     parser.add_argument(
         "--sell-workers", type=int, default=None, metavar="N",
@@ -695,6 +712,8 @@ def main() -> None:
     add_on_sweep = not args.no_add_on_sweep
     # ON by default too, and lazy the same way: the dashboard simulates it
     sell_sweep = not args.no_sell_sweep
+    # ... and so is the Trim to Kelly select's family
+    trim_sweep = not args.no_trim_sweep
     # The dashboard simulates the Sell select in worker processes: one less
     # than the CPUs (the main process waits on them), within the config bound
     sell_workers = (args.sell_workers if args.sell_workers is not None
@@ -751,13 +770,14 @@ def main() -> None:
     logging.info(
         "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f | ladders=%s "
         "| spread band=%g-%g | band sweep=%s | cap sweep=%s | add-on sweep=%s "
-        "| sell sweep=%s | live rule=%s | fills=%s",
+        "| sell sweep=%s | trim sweep=%s | live rule=%s | fills=%s",
         start_date, start.dollars, "on" if use_cache else "off", effective_k,
         ladders_echo, echo_floor, echo_ceiling,
         "on" if band_sweep else "off", "on" if cap_sweep else "off",
         "on" if add_on_sweep else "off",
         f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
-        if sell_sweep else "off", live_rule_echo, _fills_echo(depth_model),
+        if sell_sweep else "off", "on" if trim_sweep else "off",
+        live_rule_echo, _fills_echo(depth_model),
     )
     # Warn on a ceiling that empties a tier. config.time_series_spread_band's
     # docstring asks a caller taking an operator-typed ceiling to warn when it
@@ -827,6 +847,8 @@ def main() -> None:
         add_on_sweep=add_on_sweep,
         # The dashboard's Sell select, lazy the same way
         sell_sweep=sell_sweep,
+        # ... and its Trim to Kelly select
+        trim_sweep=trim_sweep,
         # Every trade's order book is built from this table (None: top of book)
         depth_model=depth_model,
     )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy add-on sweeps (add_on_cap_sweep, and add_on_tier_off_cap_sweep with the band sweep) unless --no-add-on-sweep

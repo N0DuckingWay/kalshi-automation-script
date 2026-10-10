@@ -1949,6 +1949,272 @@ class TestDaysToMaturity:
                 config.days_to_maturity(closes, day)
 
 
+class TestHeldPairWinProb:
+    """config.held_pair_win_prob: the chance a held pair pays, at today's quotes.
+
+    It is the chance a new trade of the pair would be sized with, so a held
+    pair and a new one are never judged by two models.
+    """
+
+    def test_a_same_title_pair_has_the_fixed_chance(self):
+        assert config.held_pair_win_prob("same_title", 0.5, 0.5, 0.5, 0.5, 0.8) \
+            == config.SAME_TITLE_CO_RESOLVE_PROB
+        # Anything but the exact string "time_series" is same-title, whatever the quotes
+        assert config.held_pair_win_prob(None, float("nan"), 0, 0, 0, 0.8) \
+            == config.SAME_TITLE_CO_RESOLVE_PROB
+
+    def test_a_time_series_pair_reads_the_mid_spread(self):
+        quotes = (0.22, 0.80, 0.63, 0.40)
+        expected = config.time_series_profit_prob(config.time_series_mid_spread(*quotes), 0.8)
+        assert config.held_pair_win_prob("time_series", *quotes, 0.8) == expected
+        # mid A = (0.22 + 0.20) / 2 = 0.21, mid B = (0.63 + 0.60) / 2 = 0.615
+        assert expected == pytest.approx(1 - 0.8 * (0.615 - 0.21), abs=1e-12)
+
+    @pytest.mark.parametrize("quotes", [(0.30, 0.65, 0.60, 0.42), (0.30, 0.72, 0.60, 0.35)])
+    def test_a_crossed_book_on_either_market_has_no_chance_to_read(self, quotes):
+        # YES ask + NO ask under 1: the YES ask sits below the market's own YES bid
+        assert config.held_pair_win_prob("time_series", *quotes, 0.8) is None
+
+    @pytest.mark.parametrize("quotes", [(0.60, 0.45, 0.30, 0.75), (0.30, 0.72, 0.30, 0.72)])
+    def test_a_mid_spread_not_above_zero_has_no_chance_to_read(self, quotes):
+        # The model would read it as a sure win; a new trade is refused here too
+        assert config.time_series_mid_spread(*quotes) <= 0
+        assert config.held_pair_win_prob("time_series", *quotes, 0.8) is None
+
+    @pytest.mark.parametrize("k", [float("nan"), float("inf")])
+    def test_a_k_that_is_not_a_number_has_no_chance_to_read(self, k):
+        assert config.held_pair_win_prob("time_series", 0.22, 0.80, 0.63, 0.40, k) is None
+
+    def test_a_book_one_float_step_short_of_uncrossed_is_read(self):
+        quotes = (0.3, 1.0 - 0.3 - 1e-12, 0.6, 0.4)
+        assert config.held_pair_win_prob("time_series", *quotes, 0.8) is not None
+
+    @pytest.mark.parametrize("place", range(4))
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_a_quote_that_is_not_a_number_has_no_chance_to_read(self, place, bad):
+        quotes = [0.22, 0.80, 0.63, 0.40]
+        quotes[place] = bad
+        # Without the check a NaN quote reads as a mid spread of zero: a sure win
+        assert config.held_pair_win_prob("time_series", *quotes, 0.8) is None
+
+
+class TestKellyHoldFraction:
+    """config.kelly_hold_fraction: the share of the portfolio a held pair may keep.
+
+    Keeping a pair that sells for s is the bet of buying it at s, so the
+    share is Kelly's for that bet: (p - s) / (1 - s) at a $1 payout.
+    """
+
+    def test_it_is_kellys_share_for_a_bet_bought_at_the_sale_value(self):
+        # p - q / b with b = (1 - s) / s: 0.9 - 0.1 * 0.6 / 0.4
+        assert config.kelly_hold_fraction(0.9, 0.6) == pytest.approx(0.9 - 0.1 * 0.6 / 0.4)
+        assert config.kelly_hold_fraction(0.9, 0.6) == pytest.approx(0.75)
+
+    def test_a_better_sale_price_lets_the_pair_keep_less(self):
+        shares = [config.kelly_hold_fraction(0.9, s / 100) for s in range(1, 100)]
+        assert shares == sorted(shares, reverse=True)
+        assert all(0.0 <= share <= 1.0 for share in shares)
+
+    @pytest.mark.parametrize("sale", [0.9, 0.95, 1.0, 1.5])
+    def test_nothing_is_kept_once_the_sale_pays_what_holding_is_expected_to(self, sale):
+        assert config.kelly_hold_fraction(0.9, sale) == 0.0
+
+    @pytest.mark.parametrize("win, sale", [(1.5, 1.0), (3.0, 2.0), (1.2, 1.1)])
+    def test_a_sale_at_or_above_the_payout_keeps_nothing_whatever_the_chance(self, win, sale):
+        # Never a division by zero or a share below 0, even for a chance above 1
+        assert config.kelly_hold_fraction(win, sale) == 0.0
+
+    @pytest.mark.parametrize("sale", [0.0, -0.01])
+    def test_everything_is_kept_when_the_sale_returns_nothing(self, sale):
+        assert config.kelly_hold_fraction(0.9, sale) == 1.0
+
+    @pytest.mark.parametrize("win, sale", [(float("nan"), 0.5), (0.9, float("nan")),
+                                           (float("inf"), 0.5), (0.9, float("inf"))])
+    def test_everything_is_kept_when_a_number_cannot_be_read(self, win, sale):
+        assert config.kelly_hold_fraction(win, sale) == 1.0
+
+    def test_it_sits_above_the_share_a_new_trade_would_buy(self):
+        # Selling returns less than buying costs, so the size a run sells down
+        # to is above the size it buys up to: it never does both at one price
+        p, bid, ask = 0.9, 0.58, 0.62
+        buy = (p - ask) / (1 - ask)
+        assert config.kelly_hold_fraction(p, bid) > buy
+
+
+def _flat_sale(price: float, depth: int | None = None):
+    """A net_sale that sells any count at one net price, up to `depth` pairs."""
+    def net_sale(pairs: int) -> float | None:
+        if depth is not None and pairs > depth:
+            return None
+        return pairs * price
+    return net_sale
+
+
+class TestKellyTrimCount:
+    """config.kelly_trim_count: how many contract pairs of a held pair to sell.
+
+    The pair keeps at most min(cap, kelly_hold_fraction) of the portfolio
+    value, counted at what selling returns; a worse sale price only ever
+    lowers the count.
+    """
+
+    def test_a_pair_within_its_share_sells_nothing(self):
+        # 100 pairs worth $0.60 each are 6% of $1,000, under the 10% cap
+        trim = config.kelly_trim_count(100, 1_000.0, 0.9, 0.10, 0.60, _flat_sale(0.60))
+        assert trim.sell == 0
+
+    def test_a_pair_past_the_cap_is_sold_down_to_it(self):
+        # 300 pairs at $0.60 are 18% of $1,000; 10% keeps floor(100 / 0.60) = 166
+        trim = config.kelly_trim_count(300, 1_000.0, 0.9, 0.10, 0.60, _flat_sale(0.60))
+        assert trim.sell == 300 - 166
+        assert (300 - trim.sell) * 0.60 <= 0.10 * 1_000.0 < (300 - trim.sell + 1) * 0.60
+
+    def test_kelly_binds_when_it_is_below_the_cap(self):
+        # p 0.70, sale value 0.60: Kelly's share is 0.10 / 0.40 = 25%, under a 100% cap
+        trim = config.kelly_trim_count(1_000, 1_000.0, 0.70, 1.0, 0.60, _flat_sale(0.60))
+        assert trim.sell == 1_000 - math.floor(0.25 * 1_000.0 / 0.60 + 1e-9)
+
+    def test_a_pair_with_no_edge_left_is_sold_whole(self):
+        # Selling pays 0.96 a pair against a 0.95 chance of $1
+        trim = config.kelly_trim_count(40, 1_000.0, 0.95, 1.0, 0.96, _flat_sale(0.96))
+        assert trim == config.KellyTrim(40, 0.0)
+
+    def test_a_worse_real_price_sells_fewer(self):
+        # At the best bids (0.60) the cap keeps 166 of 300. The sale really
+        # nets 0.50 a pair, where 10% of $1,000 keeps 200
+        trim = config.kelly_trim_count(300, 1_000.0, 0.9, 0.10, 0.60, _flat_sale(0.50))
+        assert trim.sell == 100
+
+    def test_a_much_worse_real_price_sells_nothing(self):
+        # At 0.30 a pair the 300 pairs are 9% of the portfolio: within the cap
+        trim = config.kelly_trim_count(300, 1_000.0, 0.9, 0.10, 0.60, _flat_sale(0.30))
+        assert trim.sell == 0
+
+    def test_a_steep_book_sells_the_most_that_is_wanted_at_its_own_price(self):
+        # 50 pairs net 0.60 each, every one after them 0.20. At the best bids
+        # the cap wants 134 sold, but 134 would average 0.349 a pair, where
+        # the 300 are within the cap. 79 is the most still wanted at its own
+        # price (0.453 a pair keeps 220, so wants 80 sold); 80 is not
+        def net_sale(pairs):
+            return min(pairs, 50) * 0.60 + max(0, pairs - 50) * 0.20
+        trim = config.kelly_trim_count(300, 1_000.0, 0.9, 0.10, 0.60, net_sale)
+        assert trim.sell == 79
+        for pairs, wanted in ((79, True), (80, False)):
+            price = net_sale(pairs) / pairs
+            keep = math.floor(0.10 * 1_000.0 / price)
+            assert (300 - keep >= pairs) is wanted
+
+    def test_a_small_excess_is_sold_though_a_smaller_sale_would_not_be_wanted(self):
+        # Two legs at 0.24 and 0.20, each sale's fee rounded up to the cent
+        # per leg. The cap wants 20 sold at the best bids. A sale of a few
+        # pairs nets too little per pair to be wanted (the two rounded fees
+        # weigh on it), so halving from 20 ends on none; 16 is wanted
+        def net_sale(pairs):
+            return sum(pairs * bid - config.fee_leg_exact(pairs, bid) for bid in (0.24, 0.20))
+        top = 0.44 - config.fee_per_pair_approx(0.24, 0.20)
+        count, value, cap = 4396, 18_207.29, 0.10
+        trim = config.kelly_trim_count(count, value, 0.9, cap, top, net_sale)
+
+        def wanted_at_its_own_price(pairs):
+            price = net_sale(pairs) / pairs
+            return count - math.floor(cap * value / price) >= pairs
+        assert trim.sell > 0 and wanted_at_its_own_price(trim.sell)
+        assert not wanted_at_its_own_price(1)
+        # ... and it is the largest such count
+        assert not any(wanted_at_its_own_price(pairs) for pairs in range(trim.sell + 1, 41))
+
+    def test_a_better_real_price_never_sells_more_than_the_best_bids_asked_for(self):
+        trim = config.kelly_trim_count(300, 1_000.0, 0.9, 0.10, 0.60, _flat_sale(0.70))
+        assert trim.sell == 300 - 166
+
+    def test_thin_bids_sell_the_most_they_hold(self):
+        asked = []
+
+        def net_sale(pairs):
+            asked.append(pairs)
+            return None if pairs > 37 else pairs * 0.60
+        trim = config.kelly_trim_count(300, 1_000.0, 0.9, 0.10, 0.60, net_sale)
+        assert trim.sell == 37
+        # Found by halving, then a fixed number of counts above: never one
+        # count at a time over the whole range
+        assert len(asked) <= 12 + config._TRIM_COUNT_SCAN
+
+    def test_bids_that_hold_nothing_sell_nothing(self):
+        trim = config.kelly_trim_count(300, 1_000.0, 0.9, 0.10, 0.60, _flat_sale(0.60, depth=0))
+        assert trim.sell == 0
+
+    @pytest.mark.parametrize("cap", [0.0, -0.1, float("nan")])
+    def test_a_cap_that_is_not_above_zero_sells_nothing(self, cap):
+        assert config.kelly_trim_count(300, 1_000.0, 0.9, cap, 0.60, _flat_sale(0.60)) \
+            == config.KellyTrim(0, 0.0)
+
+    def test_a_large_position_keeps_a_whole_count_float_division_left_short(self):
+        # The cap is exactly the position's share, but cap x value / price
+        # comes back as 6116611.999999998: nothing is over the cap
+        price = 0.01449163128142346
+        trim = config.kelly_trim_count(6116612, 134602.51498764087, 1.0, 0.6585291946712062,
+                                       price, lambda pairs: pairs * price)
+        assert trim.sell == 0
+
+    @pytest.mark.parametrize("proceeds", [0.0, -1.0, float("nan"), float("inf")])
+    def test_a_sale_that_returns_nothing_sells_nothing(self, proceeds):
+        trim = config.kelly_trim_count(300, 1_000.0, 0.9, 0.10, 0.60, lambda pairs: proceeds)
+        assert trim.sell == 0
+
+    @pytest.mark.parametrize("count, value, win, top", [
+        (0, 1_000.0, 0.9, 0.6), (-5, 1_000.0, 0.9, 0.6), (300, 0.0, 0.9, 0.6),
+        (300, float("nan"), 0.9, 0.6), (300, float("inf"), 0.9, 0.6),
+        (300, 1_000.0, float("nan"), 0.6), (300, 1_000.0, 0.9, 0.0),
+        (300, 1_000.0, 0.9, float("nan")), (300, 1_000.0, 0.9, -0.2)])
+    def test_inputs_that_cannot_be_read_sell_nothing(self, count, value, win, top):
+        def never(pairs):
+            raise AssertionError("no sale should be priced")
+        assert config.kelly_trim_count(count, value, win, 0.10, top, never) \
+            == config.KellyTrim(0, 0.0)
+
+    def test_a_whole_count_a_float_hair_short_is_kept_whole(self):
+        # 0.1 * 3 / 0.1 is 3.0000000000000004 or 2.9999999999999996 by turns
+        # in floats; three pairs at $0.10 are exactly 10% of $3
+        trim = config.kelly_trim_count(3, 3.0, 0.9, 0.10, 0.1, _flat_sale(0.1))
+        assert trim.sell == 0
+
+    def test_the_cap_it_names_is_where_the_answer_stops_depending_on_the_cap(self):
+        """At every cap at or above cap_free_from the decision is the uncapped one.
+
+        The backtest's size-cap sweep shares one simulation across those
+        caps, so a cap_free_from that is too low would show one cap's trades
+        under another's name. Seeded cases over prices, sizes, thin and deep
+        bids and a real price better or worse than the best bids.
+        """
+        rng = random.Random(20261010)
+        caps = [round(0.05 * i, 2) for i in range(1, 21)]
+        trimmed = bound = 0
+        for _ in range(2_000):
+            count = rng.randint(1, 3_000)
+            value = rng.uniform(50.0, 5_000.0)
+            win = rng.uniform(0.3, 1.0)
+            top = rng.uniform(0.02, 0.99)
+            real = top * rng.uniform(0.4, 1.1)
+            depth = rng.choice([None, None, rng.randint(0, 3_000)])
+            # A ladder: the deeper the sale, the lower its average price
+            slope = rng.choice([0.0, real / 6_000.0])
+
+            def net_sale(pairs, real=real, depth=depth, slope=slope):
+                if depth is not None and pairs > depth:
+                    return None
+                return pairs * (real - slope * pairs)
+            free = config.kelly_trim_count(count, value, win, 1.0, top, net_sale)
+            trimmed += free.sell > 0
+            for cap in caps:
+                capped = config.kelly_trim_count(count, value, win, cap, top, net_sale)
+                if cap >= capped.cap_free_from:
+                    assert capped.sell == free.sell, (count, value, win, top, real, depth, cap)
+                else:
+                    bound += capped.sell != free.sell
+        # The cases cover both sides: pairs that are trimmed, and caps that bind
+        assert trimmed > 200 and bound > 200
+
+
 class TestDescribeTimeSeriesRule:
     """describe_time_series_rule says "no spread band" for (0, 1) alone and
     names any band with a floor or a ceiling of its own."""
