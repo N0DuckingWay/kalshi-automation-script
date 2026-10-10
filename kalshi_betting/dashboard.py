@@ -56,6 +56,16 @@ Purpose:
     by a small inline script (_FILTER_JS) that draws nothing of its own and
     inflates a scenario's chunk only when a reader chooses it.
 
+    A chunk holds a view for the whole list, for each category and for each
+    category · tag. The category · tag views partition the list's trades,
+    and each also carries what several of them can be combined from: its
+    curve as running dollars per trade type ("m", shipped in place of "eq",
+    the same curve in cents — and only when it can be relied on, _mix_curve)
+    and its row of the category table ("row"); the chunk carries per-trade
+    arrays (_mix_trade_arrays) and the base block the constants and markup
+    Python renders with (_mix_base, "mix") and each tag group's raw k-hat
+    counts.
+
     The bar's Add to held pairs choice is "off" (the page as rendered) or
     "on (up to the size cap)": the same scenario re-simulated with every pair
     the simulation still holds bought again on a later Monday, sized on the
@@ -520,6 +530,7 @@ from .config import (
     DASHBOARD_FILENAME,
     DASHBOARD_FILES_DIRNAME,
     DEFAULTS_SERVER_HOST,
+    DEFAULTS_SERVER_MAX_FILTER_NAMES,
     DEFAULTS_SERVER_PORT,
     FLAT_RETURN_TOLERANCE,
     LIVE_DEFAULTS_SOURCE_PATTERN,
@@ -532,6 +543,7 @@ from .config import (
     RISK_FREE_RATE_FIELD,
     SAME_TITLE_CO_RESOLVE_PROB,
     SHORT_DEADLINE_GAP_DAYS,
+    TAG_SCOPE_SEPARATOR,
     TRADING_DAYS_PER_YEAR,
     describe_time_series_rule,
     fee_per_pair_approx,
@@ -971,6 +983,7 @@ def _trade_type_label(trade: BacktestTrade) -> str:
 
 def _return_by_trade_type(
     trades: list[BacktestTrade], equity_df: pd.DataFrame, initial_balance: float,
+    *, dollars_out: dict[str, np.ndarray] | None = None,
 ) -> list[tuple[str, str, list[float]]]:
     """
     Attribute the equity curve's cumulative return to each trade type.
@@ -989,6 +1002,12 @@ def _return_by_trade_type(
         trades (list[BacktestTrade]): The run's completed trades.
         equity_df (pd.DataFrame): The run's equity curve (_build_equity_curve).
         initial_balance (float): Starting balance the percentages divide by.
+        dollars_out (dict[str, np.ndarray] | None): Keyword-only. When given,
+            it receives each type's running P&L in DOLLARS on the curve's
+            rows (label -> array), the figures the percent lines are made
+            from: a category · tag view of the page-wide filter ships them
+            (its "m"), so the page can add several tags' curves together.
+            Left untouched when nothing is returned. None (default) keeps none.
 
     Returns:
         list[tuple[str, str, list[float]]]: (label, colour, cumulative return in
@@ -1014,10 +1033,12 @@ def _return_by_trade_type(
                     dates, np.datetime64(pd.Timestamp(when)), side="left"))
             if i < len(dates):
                 row[i] += amount
-    return [
-        (label, color, list(np.cumsum(steps[label]) / initial_balance * 100))
-        for label, color in _TRADE_TYPE_LINES if label in steps
-    ]
+    running = {label: np.cumsum(steps[label]) for label, _ in _TRADE_TYPE_LINES
+               if label in steps}
+    if dollars_out is not None:
+        dollars_out.update(running)
+    return [(label, color, list(running[label] / initial_balance * 100))
+            for label, color in _TRADE_TYPE_LINES if label in running]
 
 
 def _median_monthly_return(equity_df: pd.DataFrame | None) -> float | None:
@@ -1432,6 +1453,8 @@ def _performance_series(
     equity_df: pd.DataFrame,
     trades: list[BacktestTrade],
     initial_balance: float,
+    *,
+    dollars_out: dict[str, np.ndarray] | None = None,
 ) -> tuple[pd.Series, list[tuple[str, str, list[float]]], pd.Series]:
     """
     Compute the Portfolio Performance charts' series, on equity_df's rows.
@@ -1440,6 +1463,9 @@ def _performance_series(
         equity_df (pd.DataFrame): Daily equity curve (_build_equity_curve).
         trades (list[BacktestTrade]): The trades the per-type lines attribute.
         initial_balance (float): Starting balance the percentages divide by.
+        dollars_out (dict[str, np.ndarray] | None): Keyword-only. Handed to
+            _return_by_trade_type, which fills it with each type's running
+            P&L in dollars. None (default) keeps none.
 
     Returns:
         tuple: (total, type_lines, drawdown) — the cumulative return in percent
@@ -1451,7 +1477,8 @@ def _performance_series(
     # the starting balance. The per-type lines attribute each trade exactly as
     # _build_equity_curve books it, so they add up to the total line.
     total = (equity_df["portfolio_value"] / initial_balance - 1.0) * 100
-    type_lines = _return_by_trade_type(trades, equity_df, initial_balance)
+    type_lines = _return_by_trade_type(trades, equity_df, initial_balance,
+                                       dollars_out=dollars_out)
     rolling_max = equity_df["portfolio_value"].cummax()
     drawdown = (equity_df["portfolio_value"] - rolling_max) / rolling_max * 100
     return total, type_lines, drawdown
@@ -1570,13 +1597,91 @@ def _trade_category(
     return category, f"{category} · {tag}"
 
 
-def _category_table(df: pd.DataFrame) -> str:
+# One row of the "Returns by category · tag" table and the table around its
+# rows, as templates: _category_table fills them, and so does the page's
+# filter script for a mix of categories and tags (the base block's "mix"
+# carries them), so both write the same markup.
+_CATEGORY_ROW = (
+    "<tr style='border-bottom:1px solid #E0E0E0'>"
+    "<td style='padding:4px 12px;'>{name}</td>"
+    "<td style='padding:4px 12px;'>{trades}</td>"
+    "<td style='padding:4px 12px;'>{win}</td>"
+    "<td style='padding:4px 12px;color:{color};'>{pnl}</td>"
+    "<td style='padding:4px 12px;'>{share}</td>"
+    "<td style='padding:4px 12px;'>{mean}</td>"
+    "<td style='padding:4px 12px;'>{median}</td></tr>"
+)
+_CATEGORY_TABLE_HEAD = (
+    "<div style='font-family:sans-serif;font-size:13px;margin:8px 0 16px;'>"
+    "<b>Returns by category · tag</b> ({groups} groups, Kalshi's own series "
+    "categories and tags)"
+    "<table style='border-collapse:collapse;margin-top:8px;width:auto;'>"
+    "<tr style='background:#E8F5E9;font-weight:bold;'>"
+    "<th style='padding:6px 12px;'>Category · tag</th><th style='padding:6px 12px;'>Trades</th>"
+    "<th style='padding:6px 12px;'>Win rate</th><th style='padding:6px 12px;'>P&amp;L</th>"
+    "<th style='padding:6px 12px;'>Share of P&amp;L</th>"
+    "<th style='padding:6px 12px;'>Mean/trade</th><th style='padding:6px 12px;'>Median/trade</th>"
+    "</tr>"
+)
+_CATEGORY_TABLE_FOOT = "</table></div>"
+# What a figure that cannot be worked out reads as (a share of a zero total)
+_NO_FIGURE = "—"
+
+
+def _category_groups(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sum the decomposition frame per category · tag, largest P&L first.
+
+    Args:
+        df (pd.DataFrame): One row per trade with columns subcategory, profit
+            and profit_ratio.
+
+    Returns:
+        pd.DataFrame: Indexed by subcategory, with trades, wins, pnl, mean_ret
+            and median_ret, sorted by pnl descending.
+    """
+    return df.groupby("subcategory").agg(
+        trades=("profit", "size"),
+        wins=("profit", lambda p: int((p > 0).sum())),
+        pnl=("profit", "sum"),
+        mean_ret=("profit_ratio", "mean"),
+        median_ret=("profit_ratio", "median"),
+    ).sort_values("pnl", ascending=False)
+
+
+def _category_row_cells(name, r) -> dict[str, str]:
+    """
+    Format one category · tag row's cells, all but its share of the total P&L.
+
+    Args:
+        name: The group's "category · tag" label.
+        r: Its row of _category_groups (trades, wins, pnl, mean_ret, median_ret).
+
+    Returns:
+        dict[str, str]: _CATEGORY_ROW's fields but "share": "name" (escaped),
+            "trades", "win" (win rate), "color" (profit or loss colour),
+            "pnl", "mean" and "median".
+    """
+    return {
+        "name": html.escape(str(name)),
+        "trades": str(int(r.trades)),
+        "win": f"{r.wins / r.trades:.0%}",
+        "color": _COLORS["profit"] if r.pnl >= 0 else _COLORS["loss"],
+        "pnl": f"${r.pnl:+,.2f}",
+        "mean": f"{r.mean_ret:+.1%}",
+        "median": f"{r.median_ret:+.1%}",
+    }
+
+
+def _category_table(df: pd.DataFrame, *, grouped: pd.DataFrame | None = None) -> str:
     """
     Tabulate returns per category · tag, largest P&L first.
 
     Args:
         df (pd.DataFrame): One row per trade with columns subcategory, profit
             and profit_ratio.
+        grouped (pd.DataFrame | None): Keyword-only. _category_groups(df)
+            when the caller already holds it; None (default) computes it.
 
     Returns:
         str: An HTML table: trades, win rate, P&L, share of total P&L, and the
@@ -1584,38 +1689,15 @@ def _category_table(df: pd.DataFrame) -> str:
             fee-inclusive stake).
     """
     total = df["profit"].sum()
-    grouped = df.groupby("subcategory").agg(
-        trades=("profit", "size"),
-        wins=("profit", lambda p: int((p > 0).sum())),
-        pnl=("profit", "sum"),
-        mean_ret=("profit_ratio", "mean"),
-        median_ret=("profit_ratio", "median"),
-    ).sort_values("pnl", ascending=False)
-    td = "<td style='padding:4px 12px;'>"
+    if grouped is None:
+        grouped = _category_groups(df)
     rows = "".join(
-        "<tr style='border-bottom:1px solid #E0E0E0'>"
-        + td + html.escape(str(name)) + "</td>"
-        + td + str(int(r.trades)) + "</td>"
-        + td + f"{r.wins / r.trades:.0%}</td>"
-        + f"<td style='padding:4px 12px;color:{_COLORS['profit'] if r.pnl >= 0 else _COLORS['loss']};'>"
-        + f"${r.pnl:+,.2f}</td>"
-        + td + ("—" if total == 0 else f"{r.pnl / total:.0%}") + "</td>"
-        + td + f"{r.mean_ret:+.1%}</td>"
-        + td + f"{r.median_ret:+.1%}</td></tr>"
+        _CATEGORY_ROW.format(
+            share=_NO_FIGURE if total == 0 else f"{r.pnl / total:.0%}",
+            **_category_row_cells(name, r))
         for name, r in grouped.iterrows()
     )
-    return (
-        "<div style='font-family:sans-serif;font-size:13px;margin:8px 0 16px;'>"
-        f"<b>Returns by category · tag</b> ({len(grouped)} groups, Kalshi's own series "
-        "categories and tags)"
-        "<table style='border-collapse:collapse;margin-top:8px;width:auto;'>"
-        "<tr style='background:#E8F5E9;font-weight:bold;'>"
-        "<th style='padding:6px 12px;'>Category · tag</th><th style='padding:6px 12px;'>Trades</th>"
-        "<th style='padding:6px 12px;'>Win rate</th><th style='padding:6px 12px;'>P&amp;L</th>"
-        "<th style='padding:6px 12px;'>Share of P&amp;L</th>"
-        "<th style='padding:6px 12px;'>Mean/trade</th><th style='padding:6px 12px;'>Median/trade</th>"
-        "</tr>" + rows + "</table></div>"
-    )
+    return _CATEGORY_TABLE_HEAD.format(groups=len(grouped)) + rows + _CATEGORY_TABLE_FOOT
 
 
 # Entry-price buckets of the decomposition's price chart: right-closed bins
@@ -1637,6 +1719,12 @@ def _pnl_colors(values) -> list[str]:
     return [_COLORS["profit"] if v >= 0 else _COLORS["loss"] for v in values]
 
 
+# The "P&L by Category · Tag" chart's height: (minimum, pixels per bar, room
+# for the axes) — read by _subcategory_chart_height and, through the base
+# block's "mix", by the page's script for a mix of categories and tags.
+_SUBCATEGORY_HEIGHT = (350, 28, 120)
+
+
 def _subcategory_chart_height(rows: int) -> int:
     """
     Height of the "P&L by Category · Tag" chart for a given number of bars.
@@ -1645,9 +1733,11 @@ def _subcategory_chart_height(rows: int) -> int:
         rows (int): Bars (category · tag groups) the chart draws.
 
     Returns:
-        int: Pixels — at least 350, and 28 per bar plus room for the axes.
+        int: Pixels — at least 350, and 28 per bar plus room for the axes
+            (_SUBCATEGORY_HEIGHT).
     """
-    return max(350, 28 * rows + 120)
+    least, per_row, axes = _SUBCATEGORY_HEIGHT
+    return max(least, per_row * rows + axes)
 
 
 # The decomposition frame's columns, named so an EMPTY trade list still yields
@@ -1831,7 +1921,7 @@ def _reliability(trades: list[BacktestTrade]) -> dict:
     actuals = [a for _, a in obs]
 
     # Reliability diagram — 10 equal-width bins
-    bins   = np.linspace(0, 1, 11)
+    bins   = np.linspace(0, 1, _CALIBRATION_BINS + 1)
     labels = []
     mean_pred, mean_act = [], []
     counts = []
@@ -1851,9 +1941,26 @@ def _reliability(trades: list[BacktestTrade]) -> dict:
         "mean_pred": mean_pred, "mean_act": mean_act, "counts": counts, "labels": labels,
         # How the diagram draws each bin: a marker growing with its count
         # (never below 6 px) and "n=<count>" on hover
-        "sizes": [max(6, c // 2) for c in counts],
-        "texts": [f"n={c}" for c in counts],
+        "sizes": [max(_CALIBRATION_MARKER[0], c // _CALIBRATION_MARKER[1]) for c in counts],
+        "texts": [_CALIBRATION_TEXT["cal_bin"].format(n=c) for c in counts],
     }
+
+
+# The reliability diagram's words, as templates: its title with the two scores
+# ({brier} and {log_loss}, each a _score_text), its title with no time-series
+# trade, and a bin's hover text. _reliability and _calibration_title fill
+# them, and so does the page's filter script for a mix of categories and tags
+# (D.text), so both read the same.
+_CALIBRATION_TEXT = {
+    "cal_title": "Calibration Curve (Brier={brier}, LogLoss={log_loss})",
+    "cal_title_none": "Calibration Curve (no time-series trades)",
+    "cal_bin": "n={n}",
+}
+# The diagram's bins (10 equal-width probability bins) and how a bin's marker
+# grows with its count: never below the first number of pixels, one more for
+# every second number of trades. The base block's "mix" carries both.
+_CALIBRATION_BINS = 10
+_CALIBRATION_MARKER = (6, 2)
 
 
 def _calibration_title(brier: float | None, log_loss: float | None) -> str:
@@ -1869,8 +1976,9 @@ def _calibration_title(brier: float | None, log_loss: float | None) -> str:
             "Calibration Curve (no time-series trades)" when either is None.
     """
     if brier is None or log_loss is None:
-        return "Calibration Curve (no time-series trades)"
-    return f"Calibration Curve (Brier={brier:.4f}, LogLoss={log_loss:.4f})"
+        return _CALIBRATION_TEXT["cal_title_none"]
+    return _CALIBRATION_TEXT["cal_title"].format(brier=_score_text(brier),
+                                                 log_loss=_score_text(log_loss))
 
 
 _CALIBRATION_CAPTION = (
@@ -2195,6 +2303,13 @@ def _khat_delta_value(khat: float | None, k: float | None) -> float | None:
     return round(khat - k, 3) or 0.0
 
 
+# The colours of a "k̂ − k" figure: red above zero (the sizer sized too big),
+# green at or below it. _khat_delta colours every such figure Python formats,
+# and the page's filter script the one it works out for a mix (the base
+# block's "mix" carries them).
+_KHAT_DELTA_COLORS = ("#F44336", "#4CAF50")
+
+
 def _khat_delta(khat: float | None, k: float | None) -> tuple[str, str]:
     """
     Format an empirical k-hat against a k, as a KPI card's value and colour.
@@ -2233,7 +2348,7 @@ def _khat_delta(khat: float | None, k: float | None) -> tuple[str, str]:
     delta = _khat_delta_value(khat, k)
     if delta is None:
         return "—", _KPI_DEFAULT_COLOR
-    return f"{delta:+.3f}", ("#F44336" if delta > 0 else "#4CAF50")
+    return f"{delta:+.3f}", (_KHAT_DELTA_COLORS[0] if delta > 0 else _KHAT_DELTA_COLORS[1])
 
 
 def _khat_card_color(tainted: bool) -> str:
@@ -2793,6 +2908,8 @@ _KHAT_TEXT = {
     # marks the k the page is showing — the run's own on the page as
     # rendered, the filter bar's k after a choice.
     "khat_sized_at": "sized at {k}",
+    # The label on a bar: its entries and its distinct events (_khat_bar_text)
+    "khat_bar": "n={n} · {events} ev",
 }
 
 # The k-hat chart's reference line, as drawn: a dashed vertical line and its
@@ -2846,7 +2963,7 @@ def _khat_bar_text(stat: dict | None) -> str:
     if stat is None:
         return ""
     events = "?" if stat["events"] is None else stat["events"]
-    return f"n={stat['n']} · {events} ev"
+    return _KHAT_TEXT["khat_bar"].format(n=stat["n"], events=events)
 
 
 def _khat_finish(stat: dict) -> dict:
@@ -3011,7 +3128,9 @@ def _khat_band(
     Returns:
         dict | None: None when the band has no calibration; otherwise
             "carried" and "groups" (view key -> _khat_stat, keys as the
-            filter's: "all", "c<i>", "s<i>"). A calibration that does not
+            filter's: "all", "c<i>", "s<i>"; each "s<i>" group also carries
+            "raw": [entries settled in between, sum of implied gaps], which
+            the page pools for a mix of several tags). A calibration that does not
             carry its population (len(observations) != pooled.n — a
             hand-built one) keeps only "all", taken from its pooled row, with
             "events" None, since there is nothing to break down.
@@ -3029,6 +3148,13 @@ def _khat_band(
             groups.setdefault(f"c{cat_index[category]}", []).append(o)
             groups.setdefault(f"s{sub_index[(category, tag)]}", []).append(o)
         stats.update((key, _khat_stat(members)) for key, members in groups.items())
+        for key, members in groups.items():
+            if key.startswith("s"):
+                # A category · tag group's raw counts, which the page pools
+                # for a mix of several: entries that settled in between, and
+                # the sum of the implied gaps (k-hat is their ratio)
+                stats[key]["raw"] = [sum(1 for o in members if o.in_between),
+                                     sum(o.implied for o in members)]
     if ks:
         for stat in stats.values():
             _khat_with_deltas(stat, ks)
@@ -5654,6 +5780,12 @@ def _kelly_points(trades: list[BacktestTrade],
     return kelly_fracs, actual_fracs
 
 
+# The Kelly scatter's 1:1 line: (the smallest "largest fraction" it is drawn
+# for, how far past the largest fraction it runs) — read by
+# _one_to_one_extent and, through the base block's "mix", by the page's script.
+_ONE_TO_ONE = (0.01, 1.1)
+
+
 def _one_to_one_extent(kelly_fracs: list[float]) -> float:
     """
     How far the Kelly scatter's dashed 1:1 reference line runs.
@@ -5663,9 +5795,11 @@ def _one_to_one_extent(kelly_fracs: list[float]) -> float:
 
     Returns:
         float: 10% past the largest Kelly fraction, and never less than 0.011
-            (the line is drawn even when every fraction is 0).
+            (the line is drawn even when every fraction is 0): _ONE_TO_ONE's
+            floor and factor.
     """
-    return max(kelly_fracs + [0.01]) * 1.1
+    least, factor = _ONE_TO_ONE
+    return max(kelly_fracs + [least]) * factor
 
 
 def _capital_deployed(trades: list[BacktestTrade], equity_df: pd.DataFrame) -> list[float]:
@@ -6399,7 +6533,9 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
             "live_adds_to_held_pairs" (whether the saved live defaults add to
             held pairs, as the run recorded them; the note beside the save
             button says so on a page with the Add to held pairs view);
-            "live_sells" (whether they sell: the Sell view's save note shows only then).
+            "live_sells" (whether they sell: the Sell view's save note shows only then);
+            "max_names" (config.DEFAULTS_SERVER_MAX_FILTER_NAMES: the most
+            categories, and the most tags, the server takes on one address).
     """
 
     def day(value: date) -> str:
@@ -6431,6 +6567,7 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
         "source": source,
         "live_adds_to_held_pairs": getattr(sweep, "live_add_to_held_pairs", None) is True,
         "live_sells": getattr(sweep, "live_sell_at", None) is not None,
+        "max_names": DEFAULTS_SERVER_MAX_FILTER_NAMES,
     }
 
 # Every compared field of a BacktestTrade, in declaration order: _list_key's
@@ -8666,6 +8803,9 @@ class _ChunkVisitor:
         self._off_mark: tuple[int, int] | None = None
         # The same for the first Add to held pairs cell, for reset_add
         self._add_mark: tuple[int, int] | None = None
+        # One item per packed list whose tags the page cannot combine into a
+        # mix (_list_payload's mix_gaps): generate_dashboard says so once
+        self.mix_gaps: list = []
 
     def reset_off(self, source: _GridSource) -> None:
         """
@@ -8904,7 +9044,7 @@ class _ChunkVisitor:
             lst = _list_payload(listed, curve, self.axis, self.start_date,
                                 self.initial_balance, self.series_categories, k,
                                 self.cat_index, self.sub_index, strings, heads=self.heads,
-                                risk_free=self.risk_free)
+                                risk_free=self.risk_free, mix_gaps=self.mix_gaps)
             cid = len(self.chunks)
             self.chunks.append(_packed_json_script(
                 f"dash-chunk-{cid}", {"list": lst, "strings": strings.items}))
@@ -9094,6 +9234,8 @@ class _SellResult:
         same (int): Cells that are exactly a run read earlier at the same cap
             (backtester.SameSale), so nothing was simulated for them.
         pruned (int): Cells that are the run without selling.
+        mix_gaps (int): The chunk files written whose tags the page cannot
+            combine into a mix (_list_payload's mix_gaps).
     """
     index: int
     keys: tuple
@@ -9103,6 +9245,7 @@ class _SellResult:
     reused: int
     same: int
     pruned: int
+    mix_gaps: int = 0
 
 
 @dataclass(frozen=True)
@@ -9139,12 +9282,15 @@ class _SellGrid:
             option's text, "phrase": what the summary phrase gains after the
             level's, "value": the number of days}.
         sidecars (int): The sidecar chunk files written.
+        mix_gaps (int): How many of them hold a list whose tags the page
+            cannot combine into a mix (_list_payload's mix_gaps).
     """
     blocks: list
     index: list | None
     levels: list
     days: list
     sidecars: int
+    mix_gaps: int = 0
 
 
 def _sell_option(level: float) -> str:
@@ -9246,16 +9392,16 @@ def _sell_chunk_file(out_dir: Path, chunk_id: int) -> Path:
     return out_dir / f"chunk-{chunk_id}.js"
 
 
-def _write_sell_chunk(task: _SellTask, key: str, k: float, point: SweepPoint) -> None:
+def _write_sell_chunk(task: _SellTask, key: str, k: float, point: SweepPoint) -> bool:
     """
     Write one sell run's trade list as a sidecar chunk file, atomically.
 
     The chunk holds what an inline chunk holds — the list's per-trade arrays
-    and every category / category · tag view of it (_list_payload) and its
-    strings — plus its own trade-row heads (a worker cannot add to the
-    page's shared table): {"list", "strings", "heads"}. Written to a
-    temporary name and renamed, so a file at the key's name is always whole;
-    two workers that write one key write the same bytes.
+    and every category / category · tag view of it (_list_payload, the mix
+    parts included) and its strings — plus its own trade-row heads (a worker
+    cannot add to the page's shared table): {"list", "strings", "heads"}.
+    Written to a temporary name and renamed, so a file at the key's name is
+    always whole; two workers that write one key write the same bytes.
 
     Args:
         task (_SellTask): The task (the page's axis, labels and rates, and the
@@ -9263,17 +9409,24 @@ def _write_sell_chunk(task: _SellTask, key: str, k: float, point: SweepPoint) ->
         key (str): The list's key.
         k (float): The cell's k, which the list's Kelly scatter is priced at.
         point (SweepPoint): The sell run, its curve cut to the page's axis.
+
+    Returns:
+        bool: Whether the list's tags can be combined into a mix on the page
+            (False when _list_payload had to leave their curves out).
     """
     strings, heads = _StringTable(), _StringTable()
+    gaps: list = []
     lst = _list_payload(point.trades, point.equity_df, task.axis, task.start_date,
                         task.initial_balance, task.series_categories, k, task.cat_index,
-                        task.sub_index, strings, heads=heads, risk_free=task.risk_free)
+                        task.sub_index, strings, heads=heads, risk_free=task.risk_free,
+                        mix_gaps=gaps)
     text = _sell_chunk_text(_pack_text(_strict_json(
         {"list": lst, "strings": strings.items, "heads": heads.items})))
     path = _sell_key_file(task.out_dir, key)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+    return not gaps
 
 
 def _run_sell_task(task: _SellTask) -> _SellResult:
@@ -9331,6 +9484,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     rows: dict[tuple[bool, int, int], array] = {}
     written: list[str] = []
     done: set[str] = set()
+    # Files written whose tags the page cannot combine into a mix
+    mix_gaps = 0
     for ki, k in enumerate(task.ks):
         for add in (False, True):
             wanted = [ci for ci in range(len(task.caps)) if (add, ki, ci) in task.cells]
@@ -9363,7 +9518,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
                     if key is None:
                         key = listed[id(point.trades)] = _list_key(k, point.trades)
                     if key not in task.inline_keys and key not in done:
-                        _write_sell_chunk(task, key, k, point)
+                        if not _write_sell_chunk(task, key, k, point):
+                            mix_gaps += 1
                         done.add(key)
                         written.append(key)
                     if key not in key_place:
@@ -9375,7 +9531,7 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
             for ci, row in cell_rows.items():
                 rows[(add, ki, ci)] = row
     return _SellResult(task.index, tuple(keys), rows, tuple(written), stats["simulated"],
-                       stats["reused"], stats["same"], stats["pruned"])
+                       stats["reused"], stats["same"], stats["pruned"], mix_gaps)
 
 
 def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: date,
@@ -9653,7 +9809,8 @@ def _build_sell_grid(
                  sum(r.pruned for r in results.values()), next_id - first_sidecar,
                  sizes / 1e6, folder)
     return _SellGrid(blocks=blocks, index=index, levels=levels, days=days,
-                     sidecars=next_id - first_sidecar)
+                     sidecars=next_id - first_sidecar,
+                     mix_gaps=sum(r.mix_gaps for r in results.values()))
 
 
 @contextlib.contextmanager
@@ -10005,6 +10162,7 @@ def _view_payload(
     strings: _StringTable,
     *,
     risk_free: RiskFreeRates | None = None,
+    atom: tuple[list[int], list[int]] | None = None,
 ) -> dict:
     """
     Compute everything the filtered sections show for one selection of trades.
@@ -10013,7 +10171,10 @@ def _view_payload(
     (_performance_kpis, _performance_series, _decomposition_aggregates,
     _category_table, _reliability, _best_and_worst, _capital_deployed,
     _strategy_row), so a view and the section it redraws cannot disagree on a
-    definition — the filter script only draws what this computes.
+    definition — the filter script only draws what this computes. The one
+    thing the script works out itself is a mix of several categories and
+    tags, which it builds from the category · tag views' extra parts
+    (`atom`), following these same helpers' rules.
 
     Args:
         sel (list[BacktestTrade]): The selection's trades, in list order.
@@ -10034,6 +10195,12 @@ def _view_payload(
             and Sortino cards and the benchmark row subtract, on the capital
             `sel` holds open — the slice's own trades, never the run's. None
             (default) subtracts nothing.
+        atom (tuple[list[int], list[int]] | None): Keyword-only. For a
+            category · tag view (the smallest slice, which the page combines
+            into mixes): the (entry rows, exit rows) of `sel`'s trades on the
+            axis, -1 for a date not on it. The view then carries the extra
+            parts below. None (default) for every other view, which carries
+            none.
 
     Returns:
         dict: "n", "idx", "kpi" (card key -> formatted value), the sparse
@@ -10042,7 +10209,12 @@ def _view_payload(
             "monthly", "cat", "sub", "price" (bar specs: x, y, colours c),
             "table" (string index), "cal", "best" and "worst" ([head, tail]
             index pairs, joined by the script into _trade_row's exact HTML)
-            and "k11".
+            and "k11". With `atom` and at least one trade, also "row" (the
+            view's one category-table row: _MIX_ROW_CELLS' cells, then its
+            raw P&L) and, when the page can rely on it (_mix_curve), "m"
+            ([[trade type label, sparse running P&L in dollars], ...]: the
+            starting balance plus all of them is this view's curve —
+            _list_payload then drops the view's "eq", the same curve in cents).
     """
     if len(axis):
         # A curve built after the page's own (a slice's, built here) can run
@@ -10051,7 +10223,10 @@ def _view_payload(
         equity_df = equity_df[pd.to_datetime(equity_df["date"]) <= axis[-1]]
     # Parsed once: every series below is placed on the axis by these dates
     dates = pd.DatetimeIndex(pd.to_datetime(list(equity_df["date"])))
-    total, type_lines, drawdown = _performance_series(equity_df, sel, initial_balance)
+    # Each trade type's running dollars, kept only for a category · tag view
+    dollars: dict[str, np.ndarray] = {}
+    total, type_lines, drawdown = _performance_series(
+        equity_df, sel, initial_balance, dollars_out=dollars if atom is not None else None)
     view = {
         "n": len(sel),
         "idx": idx,
@@ -10081,7 +10256,8 @@ def _view_payload(
                    "c": _pnl_colors(sub.values), "h": _subcategory_chart_height(len(sub))}
     view["price"] = {"x": [str(b) for b in price.index], "y": [float(v) for v in price.values],
                      "c": _pnl_colors(price.values)}
-    view["table"] = strings.add(_category_table(df))
+    grouped = _category_groups(df)
+    view["table"] = strings.add(_category_table(df, grouped=grouped))
 
     rel = _reliability(sel)
     view["cal"] = {
@@ -10094,7 +10270,136 @@ def _view_payload(
     view["best"] = [row_of(t, "best") for t in best]
     view["worst"] = [row_of(t, "worst") for t in worst]
     view["k11"] = _one_to_one_extent([kelly_x[i] for i in idx])
+    if atom is None:
+        return view
+
+    # A category · tag view: what the page needs to combine it with others.
+    # Its one table row, cell by cell (the page works out only the share of
+    # the mix's total), with the raw P&L the share and the row order read
+    name, r = next(grouped.iterrows())
+    cells = _category_row_cells(name, r)
+    view["row"] = [*(cells[key] for key in _MIX_ROW_CELLS), float(r.pnl)]
+    # Its curve by trade type, in dollars (left out when the page could not
+    # add it up exactly: _mix_curve)
+    curve = _mix_curve(sel, atom, dollars, equity_df, dates, axis, initial_balance, risk_free)
+    if curve is not None:
+        view["m"] = curve
     return view
+
+
+# The category-table cells a category · tag view ships for a mix, in order
+# (the view's "row" is these and then the raw P&L). The page fills the rest
+# of _CATEGORY_ROW itself: the trade count (the view's "n"), the P&L's colour
+# (by its sign, as _category_row_cells picks it) and the share of the mix's
+# total.
+_MIX_ROW_CELLS = ("name", "win", "pnl", "mean", "median")
+
+# How a category · tag view's dollar curve is shipped for a mix: rounded to
+# this many decimals (which drops float noise, so a curve of whole cents stays
+# short, and leaves a sum of many tags' curves exact to well under a cent),
+# and only when it rebuilds the view's own curve to within this many dollars.
+_MIX_DECIMALS = 9
+_MIX_TOLERANCE_DOLLARS = 1e-6
+
+
+def _open_capital_from_curve(value: np.ndarray, initial_balance: float,
+                             trades: list[BacktestTrade], entry_rows: list[int],
+                             exit_rows: list[int]) -> np.ndarray:
+    """
+    What a curve carries in open trades on each row, worked out from the curve itself.
+
+    A portfolio value is cash plus what is carried in open trades, and the
+    cash is the starting balance, less the cost and fees of every trade
+    still open, plus the profit of every trade paid out (a trade's payoff
+    less its cost and fees is its profit). So the carried value is the curve
+    less that cash: value - start + (cost + fees of the trades open) - (the
+    profits of the trades paid out). The page's filter script works a mix's
+    open capital out the same way (the risk-free hurdle is charged on it),
+    from the per-trade arrays a chunk ships ("st", "pf", "en", "ex");
+    _mix_curve checks it against _carried_on_days before a view may be mixed.
+
+    Args:
+        value (np.ndarray): The curve's portfolio value, one per row.
+        initial_balance (float): Starting balance in dollars.
+        trades (list[BacktestTrade]): The trades the curve was booked from.
+        entry_rows (list[int]): Each trade's entry row on the curve.
+        exit_rows (list[int]): Each trade's exit row on the curve.
+
+    Returns:
+        np.ndarray: One float per row, floored at 0.
+    """
+    stake = np.zeros(len(value))
+    paid_out = np.zeros(len(value))
+    for t, entered, exited in zip(trades, entry_rows, exit_rows, strict=True):
+        stake[entered] += t.total_cost + t.fees
+        stake[exited] -= t.total_cost + t.fees
+        paid_out[exited] += t.profit
+    carried = value - initial_balance + np.cumsum(stake) - np.cumsum(paid_out)
+    return np.where(carried > 0.0, carried, 0.0)
+
+
+def _mix_curve(
+    sel: list[BacktestTrade],
+    rows: tuple[list[int], list[int]],
+    dollars: dict[str, np.ndarray],
+    equity_df: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+    axis: pd.DatetimeIndex,
+    initial_balance: float,
+    risk_free: RiskFreeRates | None,
+) -> list[list] | None:
+    """
+    A category · tag view's curve, by trade type, as the page adds it to other tags' curves.
+
+    The page combines several tags by adding their curves, so each ships its
+    running P&L in dollars per trade type (the starting balance plus all of
+    them is the view's own curve; one type alone is that type's line). It is
+    shipped only when the page can rely on it — otherwise the view carries no
+    "m" and the page says a mix is not available there, rather than show a
+    wrong figure:
+      * the view's curve covers the page's dates exactly, day for day;
+      * the starting balance plus the types' dollars rebuilds that curve to
+        within _MIX_TOLERANCE_DOLLARS on every day;
+      * with risk-free rates on the page, every trade enters and pays out on
+        a day of the page, and the open capital worked out from the curve
+        (_open_capital_from_curve, the page's own way) equals what the
+        hurdle is charged on (_carried_on_days).
+
+    Args:
+        sel (list[BacktestTrade]): The view's trades.
+        rows (tuple[list[int], list[int]]): Their (entry rows, exit rows) on
+            the page's axis, -1 for a date not on it.
+        dollars (dict[str, np.ndarray]): Each trade type's running dollars on
+            equity_df's rows (_return_by_trade_type's dollars_out).
+        equity_df (pd.DataFrame): The view's curve, cut to the axis' end.
+        dates (pd.DatetimeIndex): Its dates.
+        axis (pd.DatetimeIndex): The page's shared date axis.
+        initial_balance (float): Starting balance in dollars.
+        risk_free (RiskFreeRates | None): The page's rates, or None.
+
+    Returns:
+        list[list] | None: [[trade type label, sparse series], ...] in
+            _TRADE_TYPE_LINES order (each series as _sparse_on_axis writes it,
+            to _MIX_DECIMALS), or None when the page cannot rely on it.
+    """
+    if not dollars or len(dates) != len(axis) or not (dates == axis).all():
+        return None
+    value = equity_df["portfolio_value"].to_numpy(dtype=float)
+    rebuilt = initial_balance + np.sum(list(dollars.values()), axis=0)
+    if not np.all(np.isfinite(rebuilt)) or not np.allclose(
+            rebuilt, value, rtol=0.0, atol=_MIX_TOLERANCE_DOLLARS):
+        return None
+    if risk_free is not None:
+        entry_rows, exit_rows = rows
+        if min(entry_rows) < 0 or min(exit_rows) < 0:
+            return None
+        derived = _open_capital_from_curve(value, initial_balance, sel, entry_rows, exit_rows)
+        # What the hurdle is charged on (_rf_hurdle reads the same figure)
+        carried = _carried_on_days(sel, day_numbers(equity_df["date"]))
+        if not np.allclose(derived, carried, rtol=1e-9, atol=_MIX_TOLERANCE_DOLLARS):
+            return None
+    return [[label, _sparse_on_axis(dates, dollars[label], axis, _MIX_DECIMALS)]
+            for label, _ in _TRADE_TYPE_LINES if label in dollars]
 
 
 def _list_payload(
@@ -10111,6 +10416,7 @@ def _list_payload(
     *,
     heads: _StringTable,
     risk_free: RiskFreeRates | None = None,
+    mix_gaps: list | None = None,
 ) -> dict:
     """
     Compute one distinct trade list's per-trade arrays and every view of it.
@@ -10121,6 +10427,14 @@ def _list_payload(
     starting balance plus those trades' P&L on the days the run booked it —
     so its return, drawdown and Sharpe are the slice's CONTRIBUTION to the
     run, not a standalone simulation (the sizes are the joint run's).
+
+    The category · tag views partition the list's trades, and the page's
+    script combines them into any mix of categories and tags a reader ticks
+    (a view per combination would be far too many to ship). Each therefore
+    carries its curve in dollars ("m") and the list carries per-trade
+    arrays (_mix_trade_arrays). When one tag's curve cannot be relied on
+    (_mix_curve) or a per-trade figure is not a number, no tag of the list
+    carries "m", and the page says a mix is not available for that list.
 
     Args:
         trades (list[BacktestTrade]): The band's trades.
@@ -10143,12 +10457,18 @@ def _list_payload(
         risk_free (RiskFreeRates | None): Keyword-only. The rates every
             view's Sharpe and Sortino subtract (_view_payload). None (default)
             subtracts nothing.
+        mix_gaps (list | None): Keyword-only. When given, one item is
+            appended to it if this list's tags cannot be mixed, so the caller
+            can say so once for the whole page. None (default) keeps no count.
 
     Returns:
         dict: Per-trade arrays "ret" (return in percent), "slip", "hold",
             "kx", "ky" and "kt" (Kelly scatter x, y and escaped hover text),
-            and "views": view key ("all", "c<category index>", "s<category ·
-            tag index>") -> _view_payload.
+            the arrays a mix is worked out from (_mix_trade_arrays: "pf",
+            "pr", "st", "en", "ex", "mo", "pb", "cp", "ca"), and "views":
+            view key ("all", "c<category index>", "s<category · tag index>")
+            -> _view_payload (each "s" view with its mix parts: "row", and
+            "m" in place of "eq" when the list's tags can be mixed).
     """
     kelly_x, kelly_y = _kelly_points(trades, k)
     position = {id(t): i for i, t in enumerate(trades)}
@@ -10174,11 +10494,17 @@ def _list_payload(
         return rows[key]
 
     groups: dict[str, list[int]] = {_ALL_VIEW: list(range(len(trades)))}
+    tag_keys: set[str] = set()
     for i, t in enumerate(trades):
         category, tag = _series_labels(t.event_ticker, t.category, series_categories)
         groups.setdefault(f"c{cat_index[category]}", []).append(i)
-        groups.setdefault(f"s{sub_index[(category, tag)]}", []).append(i)
+        tag_key = f"s{sub_index[(category, tag)]}"
+        groups.setdefault(tag_key, []).append(i)
+        tag_keys.add(tag_key)
 
+    # What the page's script needs, trade by trade, to work out a mix of
+    # categories and tags itself (_FILTER_JS's mixView)
+    mix = _mix_trade_arrays(trades, axis)
     views = {}
     for key, idx in groups.items():
         sel = [trades[i] for i in idx]
@@ -10186,9 +10512,28 @@ def _list_payload(
         # over the slice's trades alone: its contribution to the band's run
         curve = (equity_df if key == _ALL_VIEW
                  else _build_equity_curve(sel, start_date, initial_balance))
+        # A category · tag view is what a mix is built from: it also carries
+        # its curve in dollars, its table row and its rows' trade indexes
+        atom = (([mix["en"][i] for i in idx], [mix["ex"][i] for i in idx])
+                if key in tag_keys else None)
         views[key] = _view_payload(sel, idx, curve, axis, initial_balance,
                                    series_categories, kelly_x, row_of, strings,
-                                   risk_free=risk_free)
+                                   risk_free=risk_free, atom=atom)
+    # A mix needs every tag's curve and every figure below to be a number:
+    # when one is missing, no tag of this list is offered for mixing
+    whole = (all(_is_finite(v) for name in _MIX_FINITE_ARRAYS for v in mix[name])
+             and all(v is None or _is_finite(v) for v in mix["cp"]))
+    if not whole or any("m" not in views[key] for key in tag_keys):
+        for key in tag_keys:
+            views[key].pop("m", None)
+        if mix_gaps is not None and tag_keys:
+            mix_gaps.append(1)
+    else:
+        # A tag's own curve in dollars ("eq") is its starting balance plus
+        # its "m" curves, which the script adds up and rounds to cents; the
+        # same curve is not shipped twice
+        for key in tag_keys:
+            del views[key]["eq"]
     return {
         # The histogram's x values, exactly as _section_diagnostics draws them
         "ret": [t.profit_ratio * 100 for t in trades],
@@ -10197,7 +10542,143 @@ def _list_payload(
         "kx": kelly_x, "ky": kelly_y,
         # Hover text renders an HTML subset: escaped like _section_risk's
         "kt": [html.escape(t.title_a[:40]) for t in trades],
+        **mix,
         "views": views,
+    }
+
+
+# The per-trade arrays of a mix that must hold a finite number for every trade
+# (the calibration pair "cp" / "ca" is null for a same-title trade by design)
+_MIX_FINITE_ARRAYS = ("pf", "pr", "st", "mo")
+
+
+def _is_finite(value) -> bool:
+    """
+    Whether a value is a finite number.
+
+    Args:
+        value: Anything a per-trade array may hold.
+
+    Returns:
+        bool: False for None, a NaN, an infinity or anything that is not a number.
+    """
+    try:
+        return math.isfinite(value)
+    except TypeError:
+        return False
+
+
+def _mix_trade_arrays(trades: list[BacktestTrade], axis: pd.DatetimeIndex) -> dict:
+    """
+    One trade list's per-trade figures the page needs to work out a mix itself.
+
+    The page shows a mix of several categories and tags by combining their
+    category · tag views; whatever cannot be added up from those views it
+    computes from these arrays, restricted to the mix's trades, by the same
+    rules the Python helpers follow (each named below).
+
+    Args:
+        trades (list[BacktestTrade]): The list's trades, in order.
+        axis (pd.DatetimeIndex): The page's shared date axis.
+
+    Returns:
+        dict: One entry per trade in each of "pf" (profit in dollars), "pr"
+            (profit_ratio: _performance_kpis' mean and median), "st" (the
+            fee-inclusive stake, total_cost + fees: _capital_deployed), "en"
+            and "ex" (the entry and exit date's row on the axis, -1 for a
+            date not on it: _capital_deployed, and — with "st" and "pf" — the
+            open capital the risk-free hurdle is charged on,
+            _open_capital_from_curve), "mo" (the entry month as year x 12 +
+            month - 1, None for a missing date: _decomposition_frame's
+            month), "pb" (the entry-price bucket's index in
+            _PRICE_BUCKET_LABELS, -1 for none: _decomposition_aggregates'
+            buckets), and "cp" / "ca" (a time-series trade's
+            spread-calibration prediction and outcome, _spread_observations;
+            None for any other trade).
+    """
+    row_of_day = {d.toordinal(): i for i, d in enumerate(axis.date)}
+    # The same right-closed buckets _decomposition_aggregates cuts entry_pA into
+    buckets = (pd.cut(pd.Series([t.entry_pA for t in trades], dtype=float),
+                      bins=_PRICE_BUCKET_BINS, labels=_PRICE_BUCKET_LABELS).cat.codes.tolist()
+               if trades else [])
+    # One observation for a time-series trade, none for any other
+    observed = [_spread_observations([t]) for t in trades]
+    return {
+        "pf": [t.profit for t in trades],
+        "pr": [t.profit_ratio for t in trades],
+        # The fee-inclusive stake, as _deployed_on_days adds it up
+        "st": [t.total_cost + t.fees for t in trades],
+        "en": [row_of_day.get(_trade_day(t.entry_date), -1) for t in trades],
+        "ex": [row_of_day.get(_trade_day(t.exit_date), -1) for t in trades],
+        "mo": [t.entry_date.year * 12 + t.entry_date.month - 1
+               if isinstance(t.entry_date, date) else None for t in trades],
+        "pb": [int(code) for code in buckets],
+        "cp": [obs[0][0] if obs else None for obs in observed],
+        "ca": [obs[0][1] if obs else None for obs in observed],
+    }
+
+
+def _mix_base(axis: pd.DatetimeIndex, initial_balance: float,
+              risk_free: RiskFreeRates | None) -> dict:
+    """
+    What the page's script needs, besides a chunk, to work out a mix itself.
+
+    A mix of several categories and tags has no view of its own (there are
+    far too many combinations), so the script builds one from the category ·
+    tag views of the chunk on screen. Every constant, colour and piece of
+    markup it needs for that is Python's, shipped here once, so the script
+    spells none of its own: each entry names the helper whose rule the
+    script follows.
+
+    Args:
+        axis (pd.DatetimeIndex): The page's shared date axis.
+        initial_balance (float): Starting balance in dollars.
+        risk_free (RiskFreeRates | None): The page's rates, or None.
+
+    Returns:
+        dict: "start" (the starting balance every curve opens at); "rf" (the
+            annual risk-free rate in force on each day of the axis, as change
+            points [[row, rate], ...], or None without rates: _rf_hurdle's
+            rate); "flat" (config.FLAT_RETURN_TOLERANCE: _varies) and "year"
+            (config.CALENDAR_DAYS_PER_YEAR: _sharpe, _sortino); "profit" and
+            "loss" (_pnl_colors); "khat_delta" (_KHAT_DELTA_COLORS); "types"
+            (the trade-type labels, in _TRADE_TYPE_LINES order); "buckets"
+            (_PRICE_BUCKET_LABELS); "bins" (the reliability diagram's bin
+            edges) and "marker" (_CALIBRATION_MARKER); "sub_height"
+            (_SUBCATEGORY_HEIGHT); "k11" (_ONE_TO_ONE); "row", "table_head"
+            and "table_foot" (the category table's templates) with "cells"
+            (the order of a view's "row" cells, _MIX_ROW_CELLS); "none" (what
+            an undefined figure reads as); and "sep"
+            (config.TAG_SCOPE_SEPARATOR, between a category and its tag in a
+            saved filter).
+    """
+    rates = None
+    if risk_free is not None:
+        # The latest auction on or before each day of the axis (zeros when
+        # the rates are unavailable), kept where it changes
+        annual = risk_free.annual_on_days(day_numbers(axis))
+        rates = [[i, float(rate)] for i, rate in enumerate(annual)
+                 if i == 0 or rate != annual[i - 1]]
+    return {
+        "start": initial_balance,
+        "rf": rates,
+        "flat": FLAT_RETURN_TOLERANCE,
+        "year": CALENDAR_DAYS_PER_YEAR,
+        "profit": _COLORS["profit"],
+        "loss": _COLORS["loss"],
+        "khat_delta": list(_KHAT_DELTA_COLORS),
+        "types": [label for label, _ in _TRADE_TYPE_LINES],
+        "buckets": list(_PRICE_BUCKET_LABELS),
+        "bins": [float(edge) for edge in np.linspace(0, 1, _CALIBRATION_BINS + 1)],
+        "marker": list(_CALIBRATION_MARKER),
+        "sub_height": list(_SUBCATEGORY_HEIGHT),
+        "k11": list(_ONE_TO_ONE),
+        "row": _CATEGORY_ROW,
+        "table_head": _CATEGORY_TABLE_HEAD,
+        "table_foot": _CATEGORY_TABLE_FOOT,
+        "cells": list(_MIX_ROW_CELLS),
+        "none": _NO_FIGURE,
+        "sep": TAG_SCOPE_SEPARATOR,
     }
 
 
@@ -10310,9 +10791,11 @@ def _filter_payload(
             -> chunk id or null), "rows" (the shared trade-row heads),
             "categories" (sorted names), "subcats" ([[category index, tag],
             ...], sorted), "empty" (the view of a selection with no trade — a
-            flat curve, referencing no string), "text" (the templates:
+            flat curve, referencing no string), "mix" (_mix_base: what the
+            script works a mix of categories and tags out with), "text" (the templates:
             _SUMMARY_TEMPLATES — its "unfiltered" sentence chosen by kd,
-            explorer and explorer_caps (_bar_reach) — and _KHAT_TEXT), "styles" (the trade-type
+            explorer and explorer_caps (_bar_reach) — _KHAT_TEXT and
+            _CALIBRATION_TEXT), "styles" (the trade-type
             lines' and the k-hat bars' drawing, the k-hat chart's height
             formula and reference line, the KPI cards' default colour and a
             known k-hat's card colour), "khat" (_khat_band per band, in band
@@ -10377,12 +10860,15 @@ def _filter_payload(
         "categories": chunks.categories,
         "subcats": [[chunks.cat_index[c], tag] for c, tag in chunks.subcats],
         "empty": empty,
+        # What the script needs, besides a chunk, to work out a mix of
+        # several categories and tags itself
+        "mix": _mix_base(axis, initial_balance, chunks.risk_free),
         # The summary line's closing sentence says what the bar reaches on
         # THIS page: the interval-discount section follows its k and cap only
         # when that section's data was built (kd), and the scenario explorer's
         # selects only when the page carries its grid (explorer) — its cap
         # select only when its cap axis is this grid's (explorer_caps)
-        "text": {**_SUMMARY_TEMPLATES, **_KHAT_TEXT,
+        "text": {**_SUMMARY_TEMPLATES, **_KHAT_TEXT, **_CALIBRATION_TEXT,
                  "unfiltered": " " + _bar_reach(kd is not None, explorer,
                                                 explorer_caps=explorer_caps,
                                                 explorer_tiers=explorer_tiers)
@@ -11030,6 +11516,28 @@ _FILTER_JS = r"""
     return out;
   }
   function pick(arr, idx) { return idx.map(function(i) { return arr[i]; }); }
+  // A number rounded to the nearest whole, an exact half to the even one, and
+  // to a number of decimals the way Python's sparse series are rounded
+  // (numpy's round: scale, round half to even, scale back)
+  function rint(x) {
+    var r = Math.round(x);
+    return (Math.abs(x - Math.trunc(x)) === 0.5 && r % 2 !== 0) ? r - 1 : r;
+  }
+  function roundTo(x, digits) { var p = Math.pow(10, digits); return rint(x * p) / p; }
+  // A view's own curve in dollars, on every date: its "eq" as shipped. A
+  // category · tag view whose tags can be mixed ships "m" in its place — its
+  // running P&L in dollars per trade type — and its curve is the starting
+  // balance plus all of them, rounded to cents as "eq" is
+  function curveOf(v) {
+    if (v.eq) { return expand(v.eq); }
+    var sum = new Array(N), i;
+    for (i = 0; i < N; i++) { sum[i] = 0; }
+    v.m.forEach(function(part) {
+      var y = expand(part[1]);
+      for (i = 0; i < N; i++) { sum[i] += y[i]; }
+    });
+    return sum.map(function(x) { return roundTo(D.mix.start + x, 2); });
+  }
 
   function bandIndex() { return parseInt(bandSel.value, 10); }
   function kIndex() { return parseInt(kSel.value, 10); }
@@ -11348,7 +11856,7 @@ _FILTER_JS = r"""
     setText('bench-sharpe', v.bench.sharpe);
     setText('bench-max_dd', v.bench.max_dd);
     // The strategy trace is redrawn; the S&P trace after it keeps its data
-    var gd = byId('bench-fig'), traces = [traceOf('bench-fig', 0, {x: D.dates, y: expand(v.eq)})];
+    var gd = byId('bench-fig'), traces = [traceOf('bench-fig', 0, {x: D.dates, y: curveOf(v)})];
     for (var i = 1; gd && gd.data && i < gd.data.length; i++) { traces.push(traceOf('bench-fig', i, {})); }
     redraw('bench-fig', traces);
   }
@@ -12209,6 +12717,15 @@ def generate_dashboard(
                     # Nothing for the page to load from it
                     shutil.rmtree(build_folder, ignore_errors=True)
                     build_folder = None
+            # Said once for the whole page, never once per trade list
+            unmixable = len(chunker.mix_gaps) + (0 if sell_grid is None else sell_grid.mix_gaps)
+            if unmixable:
+                logging.warning(
+                    "The page cannot combine categories and tags for %d of its trade "
+                    "list(s): a tag's curve there does not cover the page's dates day for "
+                    "day, or could not be rebuilt exactly from its trades. Ticking more "
+                    "than one category or tag at such a scenario shows a 'not available' "
+                    "line; every single choice is unaffected.", unmixable)
             filter_data = _filter_payload(
                 source, chunker, start_date, initial_balance, series_categories, kd=kd,
                 tainted=tainted, explorer=explorer_grid,

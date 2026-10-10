@@ -40,6 +40,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -4450,6 +4451,425 @@ class TestFilterViews:
         assert dashboard._sparse_on_axis(dates, [1.0] * 4, pd.DatetimeIndex([]), 2) == []
 
 
+# ─── A mix of categories and tags: the data the page works one out from ──────
+
+# Seven series in three categories: Cat0 holds Tag0, Tag3 and Tag6, Cat1 Tag1
+# and Tag4, Cat2 Tag2 and Tag5
+_MIX_SERIES = {f"KXM{i}": (f"Cat{i % 3}", (f"Tag{i}",)) for i in range(7)}
+_MIX_CATEGORIES = sorted({category for category, _ in _MIX_SERIES.values()})
+_MIX_SUBCATS = sorted((category, tags[0]) for category, tags in _MIX_SERIES.values())
+_MIX_START = date(2026, 1, 5)
+_MIX_BALANCE = 10_000.0
+
+
+def _mix_trades(seed: int, n: int = 36, *, quoted: bool = False) -> list[BacktestTrade]:
+    """
+    Seeded trades over _MIX_SERIES' seven tags: both pair types and every
+    trade type, entry quotes on and between the price-bucket edges and in
+    several calibration bins, every settlement cell, trades entered and paid
+    out on one day, and profits that sit exactly on a rounding tie (12.5,
+    0.0). `quoted` gives three trades in four quotes that move while they are
+    held (a run valued at market); the fourth stays at cost.
+    """
+    rng = random.Random(seed)
+    mark_rng = random.Random(seed + 1000)
+    names = sorted(_MIX_SERIES)
+    trades = []
+    for i in range(n):
+        series = rng.choice(names)
+        entry = _MIX_START + timedelta(days=rng.randint(0, 60))
+        held = rng.choice([0, 1, 3, 8, 21])
+        time_series = rng.random() < 0.6
+        profit = rng.choice([round(rng.gauss(0.0, 20.0), 2), rng.gauss(0.0, 5.0), 12.5, -12.5, 0.0])
+        pA = rng.choice([0.05, 0.2, 0.25, 0.4, 0.55, 0.8, 0.9])
+        if time_series:
+            pB = min(0.95, round(pA + rng.choice([0.1, 0.15, 0.3]), 2))
+            outcomes = rng.choice([("yes", "yes"), ("no", "no"), ("no", "yes")])
+        else:
+            pB = round(max(0.03, pA - 0.1), 2)
+            outcomes = rng.choice([("yes", "yes"), ("no", "no")])
+        base = _typed_trade("time_series" if time_series else "same_title", rng.random() < 0.5,
+                            entry, entry + timedelta(days=held), profit)
+        trades.append(dataclasses.replace(
+            base, entry_pA=pA, entry_pB=pB,
+            entry_nA=round(1.0 - pA + rng.choice([0.0, 0.02]), 2),
+            entry_nB=round(1.0 - pB + rng.choice([0.0, 0.03]), 2),
+            outcome_a=outcomes[0], outcome_b=outcomes[1], event_ticker=f"{series}-{i}",
+            ticker_a=f"{series}-{i}A", ticker_b=f"{series}-{i}B", title_a=f"Question {i}?",
+            category="Other", holding_days=max(1, held), balance_at_entry=_MIX_BALANCE))
+    trades.sort(key=lambda t: t.entry_date)
+    if quoted:
+        trades = [_random_marks(t, mark_rng) if i % 4 else t for i, t in enumerate(trades)]
+    return trades
+
+
+def _mix_list(trades: list[BacktestTrade], *, risk_free=None, curve=None,
+              gaps: list | None = None) -> tuple[dict, pd.DatetimeIndex, list[str]]:
+    """(_list_payload of `trades` filed by _MIX_SERIES, the axis, the list's
+    strings) — the axis is `curve`'s dates, the trades' own curve by default."""
+    if curve is None:
+        curve = backtester._build_equity_curve(trades, _MIX_START, _MIX_BALANCE)
+    axis = pd.DatetimeIndex(pd.to_datetime(list(curve["date"])))
+    strings = dashboard._StringTable()
+    lst = dashboard._list_payload(
+        trades, curve, axis, _MIX_START, _MIX_BALANCE, _MIX_SERIES, 0.75,
+        {c: i for i, c in enumerate(_MIX_CATEGORIES)},
+        {pair: i for i, pair in enumerate(_MIX_SUBCATS)}, strings,
+        heads=dashboard._StringTable(), risk_free=risk_free, mix_gaps=gaps)
+    return lst, axis, strings.items
+
+
+def _mix_curve_of(view: dict, n: int) -> np.ndarray:
+    """A tag view's curve from its "m" parts: the starting balance plus every
+    trade type's running dollars, as the page's script adds them."""
+    total = np.full(n, _MIX_BALANCE)
+    for _, sparse in view["m"]:
+        total = total + np.array(_expand(sparse, n), dtype=float)
+    return total
+
+
+def _mix_tag_trades(trades: list[BacktestTrade], si: int) -> list[BacktestTrade]:
+    """The trades filed under one of _MIX_SUBCATS."""
+    return [t for t in trades
+            if dashboard._series_labels(t.event_ticker, t.category, _MIX_SERIES)
+            == _MIX_SUBCATS[si]]
+
+
+class TestMixData:
+    """What a chunk and the base block carry so the page can work out a mix
+    of several categories and tags itself: per-trade arrays, each category ·
+    tag view's curve in dollars ("m", in place of "eq") and its table row,
+    and the constants and markup Python renders with."""
+
+    @pytest.mark.parametrize("quoted", [False, True], ids=["at-cost", "at-market"])
+    def test_the_per_trade_arrays_are_the_trades_own_figures(self, quoted):
+        trades = _mix_trades(1, quoted=quoted)
+        lst, axis, _ = _mix_list(trades)
+        days = [d.date() for d in axis]
+        assert lst["pf"] == [t.profit for t in trades]
+        assert lst["pr"] == [t.profit_ratio for t in trades]
+        assert lst["st"] == [t.total_cost + t.fees for t in trades]
+        assert [days[i] for i in lst["en"]] == [t.entry_date for t in trades]
+        assert [days[i] for i in lst["ex"]] == [t.exit_date for t in trades]
+        # The entry month, as the decomposition frame names it
+        frame = dashboard._decomposition_frame(trades, _MIX_SERIES)
+        assert [f"{m // 12:04d}-{m % 12 + 1:02d}" for m in lst["mo"]] == list(frame["month"])
+        # The price bucket, as the decomposition's own cut files each trade
+        cut = pd.cut(frame["entry_pA"], bins=dashboard._PRICE_BUCKET_BINS,
+                     labels=dashboard._PRICE_BUCKET_LABELS)
+        assert [dashboard._PRICE_BUCKET_LABELS[b] for b in lst["pb"]] == list(cut)
+        assert {0, 1, 2, 3, 4} == set(lst["pb"])
+        # A time-series trade's calibration pair; none for a same-title one
+        obs = iter(dashboard._spread_observations(trades))
+        for t, cp, ca in zip(trades, lst["cp"], lst["ca"], strict=True):
+            assert ((cp, ca) == next(obs)) if t.pair_type == "time_series" \
+                else (cp is None and ca is None)
+        # Strict JSON, like everything a chunk holds
+        json.loads(dashboard._strict_json(lst), parse_constant=_fail_on_constant)
+
+    def test_a_date_off_the_axis_and_a_price_outside_every_bucket_read_minus_one(self):
+        trades = _mix_trades(2, n=6)
+        late = dataclasses.replace(trades[0], exit_date=date(2099, 1, 1), entry_pA=0.0)
+        lst, _, _ = _mix_list([late, *trades[1:]],
+                              curve=backtester._build_equity_curve(trades, _MIX_START,
+                                                                   _MIX_BALANCE))
+        assert lst["ex"][0] == -1 and lst["en"][0] >= 0
+        assert lst["pb"][0] == -1
+
+    @pytest.mark.parametrize("quoted", [False, True], ids=["at-cost", "at-market"])
+    def test_the_tags_curves_add_up_to_each_category_and_to_the_whole(self, quoted):
+        trades = _mix_trades(3, n=60, quoted=quoted)
+        curve = backtester._build_equity_curve(trades, _MIX_START, _MIX_BALANCE)
+        lst, axis, _ = _mix_list(trades, curve=curve)
+        n, views = len(axis), lst["views"]
+        tags = sorted(key for key in views if key.startswith("s"))
+        assert len(tags) == len(_MIX_SUBCATS)
+        whole = np.zeros(n)
+        by_category = {ci: np.zeros(n) for ci in range(len(_MIX_CATEGORIES))}
+        for key in tags:
+            si = int(key[1:])
+            own = _mix_tag_trades(trades, si)
+            mine = _mix_curve_of(views[key], n)
+            # Each tag's "m" is its own curve
+            assert mine == pytest.approx(list(backtester._build_equity_curve(
+                own, _MIX_START, _MIX_BALANCE)["portfolio_value"]), abs=1e-6)
+            # ... split by trade type: each part is that type's line
+            lines = dict(views[key]["types"])
+            assert [label for label, _ in views[key]["m"]] == list(lines)
+            for label, sparse in views[key]["m"]:
+                assert np.array(_expand(sparse, n)) / _MIX_BALANCE * 100 == pytest.approx(
+                    _expand(lines[label], n), abs=6e-5)
+            whole += mine - _MIX_BALANCE
+            by_category[_MIX_CATEGORIES.index(_MIX_SUBCATS[si][0])] += mine - _MIX_BALANCE
+        assert whole + _MIX_BALANCE == pytest.approx(list(curve["portfolio_value"]), abs=1e-6)
+        for ci, pnl in by_category.items():
+            own = [t for t in trades if dashboard._series_labels(
+                t.event_ticker, t.category, _MIX_SERIES)[0] == _MIX_CATEGORIES[ci]]
+            assert pnl + _MIX_BALANCE == pytest.approx(list(backtester._build_equity_curve(
+                own, _MIX_START, _MIX_BALANCE)["portfolio_value"]), abs=1e-6)
+            # ... which is the category view's own curve, to its cents
+            assert np.round(pnl + _MIX_BALANCE, 2) == pytest.approx(
+                _expand(views[f"c{ci}"]["eq"], n), abs=0.0051)
+
+    def test_only_a_tag_view_changes_and_its_curve_replaces_eq(self):
+        trades = _mix_trades(4, quoted=True)
+        lst, axis, _ = _mix_list(trades)
+        n = len(axis)
+        kelly_x, _ = dashboard._kelly_points(trades, 0.75)
+        for key, view in lst["views"].items():
+            idx = view["idx"]
+            sel = [trades[i] for i in idx]
+            curve = (backtester._build_equity_curve(trades, _MIX_START, _MIX_BALANCE)
+                     if key == "all"
+                     else backtester._build_equity_curve(sel, _MIX_START, _MIX_BALANCE))
+            # The view as it is built with no mix parts, into tables of its own
+            plain = dashboard._view_payload(
+                sel, idx, curve, axis, _MIX_BALANCE, _MIX_SERIES, kelly_x,
+                lambda t, which: [0, 0], dashboard._StringTable())
+            independent = [k for k in plain if k not in ("table", "best", "worst", "eq")]
+            assert {k: view[k] for k in independent} == {k: plain[k] for k in independent}
+            if key.startswith("s"):
+                assert set(view) - set(plain) == {"m", "row"}
+                assert set(plain) - set(view) == {"eq"}
+                # Its curve in cents is its "m" curve, rounded as "eq" was
+                assert list(np.round(_mix_curve_of(view, n), 2)) == _expand(plain["eq"], n)
+            else:
+                assert set(view) == set(plain) and view["eq"] == plain["eq"]
+
+    def test_a_tags_row_is_its_line_of_the_category_table(self):
+        trades = _mix_trades(5)
+        lst, _, _ = _mix_list(trades)
+        cells = dashboard._MIX_ROW_CELLS
+        assert cells == ("name", "win", "pnl", "mean", "median")
+        for si, (category, tag) in enumerate(_MIX_SUBCATS):
+            view = lst["views"][f"s{si}"]
+            row = dict(zip(cells, view["row"], strict=False))
+            pnl = view["row"][len(cells)]
+            assert len(view["row"]) == len(cells) + 1
+            own = _mix_tag_trades(trades, si)
+            assert pnl == pytest.approx(sum(t.profit for t in own))
+            assert row["name"] == html.escape(f"{category} · {tag}")
+            # The table of this tag alone: its one row, as the page fills the
+            # row template — the count from the view, the colour from the sign
+            # of the P&L, the share worked out (here the whole: 100%, or none)
+            table = dashboard._category_table(dashboard._decomposition_frame(own, _MIX_SERIES))
+            filled = dashboard._CATEGORY_ROW.format(
+                trades=view["n"], share="—" if pnl == 0 else "100%",
+                color=dashboard._COLORS["profit"] if pnl >= 0 else dashboard._COLORS["loss"],
+                **row)
+            assert table == (dashboard._CATEGORY_TABLE_HEAD.format(groups=1) + filled
+                             + dashboard._CATEGORY_TABLE_FOOT)
+
+    def test_a_curve_that_does_not_cover_the_axis_is_not_shipped(self):
+        trades = _mix_trades(6)
+        # The page's axis opens three days before the slices' own curves do
+        long_curve = backtester._build_equity_curve(
+            trades, _MIX_START - timedelta(days=3), _MIX_BALANCE)
+        gaps: list = []
+        lst, _, _ = _mix_list(trades, curve=long_curve, gaps=gaps)
+        tags = [view for key, view in lst["views"].items() if key.startswith("s")]
+        assert tags and all("m" not in view and "eq" in view and "row" in view for view in tags)
+        # Counted once for the list, however many tags it holds
+        assert gaps == [1]
+        # A list that can be mixed counts nothing
+        fine: list = []
+        _mix_list(trades, gaps=fine)
+        assert fine == []
+
+    def test_a_figure_that_is_not_a_number_keeps_every_tag_out_of_a_mix(self):
+        trades = _mix_trades(7)
+        for bad in (dataclasses.replace(trades[0], profit_ratio=float("nan")),
+                    dataclasses.replace(trades[0], profit_ratio=float("inf"))):
+            gaps: list = []
+            # The axis is the unchanged trades' own curve
+            lst, _, _ = _mix_list([bad, *trades[1:]], gaps=gaps,
+                                  curve=backtester._build_equity_curve(trades, _MIX_START,
+                                                                       _MIX_BALANCE))
+            assert gaps == [1]
+            assert not any("m" in view for view in lst["views"].values())
+
+    @pytest.mark.parametrize("quoted", [False, True], ids=["at-cost", "at-market"])
+    def test_open_capital_from_the_curve_is_what_the_hurdle_is_charged_on(self, quoted):
+        trades = _mix_trades(8, quoted=quoted)
+        lst, axis, _ = _mix_list(trades, risk_free=_rates())
+        days = day_numbers(axis)
+        n = len(axis)
+        assert quoted is any(t.marks is not None for t in trades)
+        for key, view in lst["views"].items():
+            if not key.startswith("s"):
+                continue
+            sel = [trades[i] for i in view["idx"]]
+            # From the shipped pieces alone, as the script works it out: the
+            # curve less the starting balance, plus the stakes of the trades
+            # open, less the profits of the trades paid out
+            value = _mix_curve_of(view, n)
+            stake, paid = np.zeros(n), np.zeros(n)
+            for i in view["idx"]:
+                stake[lst["en"][i]] += lst["st"][i]
+                stake[lst["ex"][i]] -= lst["st"][i]
+                paid[lst["ex"][i]] += lst["pf"][i]
+            derived = np.maximum(value - _MIX_BALANCE + np.cumsum(stake) - np.cumsum(paid), 0.0)
+            assert derived == pytest.approx(list(dashboard._carried_on_days(sel, days)), abs=1e-6)
+            # ... and for several tags at once it adds up the same way
+        mixed = [t for t in trades if dashboard._series_labels(
+            t.event_ticker, t.category, _MIX_SERIES)[0] != "Cat1"]
+        curve = backtester._build_equity_curve(mixed, _MIX_START, _MIX_BALANCE)
+        rows = {d.date(): i for i, d in enumerate(axis)}
+        derived = dashboard._open_capital_from_curve(
+            curve["portfolio_value"].to_numpy(dtype=float), _MIX_BALANCE, mixed,
+            [rows[t.entry_date] for t in mixed], [rows[t.exit_date] for t in mixed])
+        assert derived == pytest.approx(list(dashboard._carried_on_days(mixed, days)), abs=1e-6)
+
+    def test_with_rates_a_curve_whose_open_capital_cannot_be_rebuilt_is_not_shipped(self):
+        trades = _mix_trades(9)
+        # A trade whose profit is not its payoff less its cost and fees: the
+        # curve books the payoff, so open capital worked out from the profit
+        # is off by the difference from its pay-out day on
+        held = next(i for i, t in enumerate(trades) if t.exit_date > t.entry_date)
+        odd = dataclasses.replace(trades[held], profit=trades[held].profit + 3.0)
+        listed = [*trades[:held], odd, *trades[held + 1:]]
+        curve = backtester._build_equity_curve(listed, _MIX_START, _MIX_BALANCE)
+        with_rates: list = []
+        lst, _, _ = _mix_list(listed, risk_free=_rates(), curve=curve, gaps=with_rates)
+        assert with_rates == [1]
+        assert not any("m" in view for view in lst["views"].values())
+        # Without rates no hurdle is charged, so nothing reads that figure
+        without: list = []
+        _mix_list(listed, curve=curve, gaps=without)
+        assert without == []
+        # A trade paid out on a day the page does not have: with rates, no mix
+        late = dataclasses.replace(trades[held], exit_date=date(2099, 1, 1))
+        gone: list = []
+        _mix_list([*trades[:held], late, *trades[held + 1:]], risk_free=_rates(), gaps=gone,
+                  curve=backtester._build_equity_curve(trades, _MIX_START, _MIX_BALANCE))
+        assert gone == [1]
+
+    def test_the_type_lines_dollars_are_the_lines_before_the_percent(self):
+        trades = _mix_trades(10, quoted=True)
+        curve = backtester._build_equity_curve(trades, _MIX_START, _MIX_BALANCE)
+        dollars: dict = {}
+        lines = dashboard._return_by_trade_type(trades, curve, _MIX_BALANCE, dollars_out=dollars)
+        assert list(dollars) == [label for label, _, _ in lines]
+        for label, _, series in lines:
+            assert list(dollars[label] / _MIX_BALANCE * 100) == series
+        # The same lines with nothing asked for, and nothing written for no line
+        assert dashboard._return_by_trade_type(trades, curve, _MIX_BALANCE) == lines
+        untouched = {"kept": 1}
+        assert dashboard._return_by_trade_type([], curve, _MIX_BALANCE,
+                                               dollars_out=untouched) == []
+        assert untouched == {"kept": 1}
+
+    def test_the_base_block_carries_what_python_renders_with(self):
+        trades = _mix_trades(11)
+        curve = backtester._build_equity_curve(trades, _MIX_START, _MIX_BALANCE)
+        axis = pd.DatetimeIndex(pd.to_datetime(list(curve["date"])))
+        mix = dashboard._mix_base(axis, _MIX_BALANCE, None)
+        assert mix == {
+            "start": _MIX_BALANCE, "rf": None,
+            "flat": config.FLAT_RETURN_TOLERANCE, "year": config.CALENDAR_DAYS_PER_YEAR,
+            "profit": dashboard._COLORS["profit"], "loss": dashboard._COLORS["loss"],
+            "khat_delta": ["#F44336", "#4CAF50"],
+            "types": [label for label, _ in dashboard._TRADE_TYPE_LINES],
+            "buckets": dashboard._PRICE_BUCKET_LABELS,
+            "bins": [float(edge) for edge in np.linspace(0, 1, 11)],
+            "marker": [6, 2], "sub_height": [350, 28, 120], "k11": [0.01, 1.1],
+            "row": dashboard._CATEGORY_ROW, "table_head": dashboard._CATEGORY_TABLE_HEAD,
+            "table_foot": dashboard._CATEGORY_TABLE_FOOT,
+            "cells": list(dashboard._MIX_ROW_CELLS), "none": "—",
+            "sep": config.TAG_SCOPE_SEPARATOR,
+        }
+        # The helpers read the same constants
+        assert dashboard._subcategory_chart_height(3) == 350
+        assert dashboard._subcategory_chart_height(20) == 28 * 20 + 120
+        assert dashboard._one_to_one_extent([]) == pytest.approx(0.011)
+        assert dashboard._khat_delta(0.9, 0.75) == ("+0.150", "#F44336")
+        assert dashboard._khat_delta(0.6, 0.75) == ("-0.150", "#4CAF50")
+        # With rates: the yield in force on each day of the axis, where it changes
+        rates = _rates()
+        rf = dashboard._mix_base(axis, _MIX_BALANCE, rates)["rf"]
+        assert _expand(rf, len(axis)) == list(rates.annual_on(axis))
+        assert [i for i, _ in rf][0] == 0 and len(rf) == 2
+        # Unavailable rates charge nothing, on every day
+        none = RiskFreeRates((), SOURCE_UNAVAILABLE, None)
+        assert dashboard._mix_base(axis, _MIX_BALANCE, none)["rf"] == [[0, 0.0]]
+
+    def test_the_page_ships_it_and_the_words_the_script_fills(self):
+        _, _, base, chunks = _flt_payload()
+        assert base["mix"] == dashboard._mix_base(
+            pd.DatetimeIndex(pd.to_datetime(base["dates"])), 1000.0, None)
+        for key in ("cal_title", "cal_title_none", "cal_bin", "khat_bar"):
+            assert key in base["text"]
+        assert base["text"]["cal_title"].format(brier="0.1000", log_loss="0.2000") == \
+            dashboard._calibration_title(0.1, 0.2)
+        assert base["text"]["cal_title_none"] == dashboard._calibration_title(None, None)
+        assert base["text"]["khat_bar"].format(n=12, events=3) == dashboard._khat_bar_text(
+            {"n": 12, "events": 3})
+        # Every chunk on the page carries the mix parts
+        for chunk in chunks.values():
+            lst = chunk["list"]
+            assert all(len(lst[name]) == len(lst["ret"]) for name in (
+                "pf", "pr", "st", "en", "ex", "mo", "pb", "cp", "ca"))
+            for key, view in lst["views"].items():
+                assert ("m" in view and "row" in view and "eq" not in view) \
+                    is key.startswith("s")
+
+    def test_a_tag_groups_raw_khat_counts_are_its_observations(self):
+        sweep, _, base, _ = _flt_payload()
+        observations = sweep.calibrations_by_band[(0.0, 1.0)].observations
+        groups = base["khat"][0]["groups"]
+        assert any(key.startswith("s") for key in groups)
+        for key, stat in groups.items():
+            if not key.startswith("s"):
+                assert "raw" not in stat
+                continue
+            category, tag = base["subcats"][int(key[1:])]
+            members = [o for o in observations if dashboard._series_labels(
+                o.event_ticker, o.category, _FLT_SERIES)
+                == (base["categories"][category], tag)]
+            assert stat["raw"] == [sum(1 for o in members if o.in_between),
+                                   sum(o.implied for o in members)]
+            # k-hat is their ratio, as the bucket's own arithmetic has it
+            assert stat["k"] == pytest.approx(
+                (stat["raw"][0] / stat["n"]) / (stat["raw"][1] / stat["n"]))
+
+    def test_one_warning_for_the_whole_page_when_lists_cannot_be_mixed(
+            self, monkeypatch, tmp_path, caplog):
+        # The slices' curves open two days after the page's own: no list of
+        # the page can be mixed, and the log says so once
+        sweep = _flt_sweep()
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        with caplog.at_level(logging.WARNING):
+            page = dashboard.generate_dashboard(
+                sweep.primary.trades, sweep.primary.equity_df, _FLT_START + timedelta(days=2),
+                1000.0, sweep=sweep, interval_discount=0.75,
+                series_categories=_FLT_SERIES).read_text(encoding="utf-8")
+        said = [r for r in caplog.records if "cannot combine categories and tags" in r.getMessage()]
+        assert len(said) == 1
+        chunks = TestFilterPage._chunks(page)
+        assert len(chunks) > 1 and said[0].args[0] == len(chunks)
+        assert not any("m" in view for chunk in chunks.values()
+                       for view in chunk["list"]["views"].values())
+        # A page whose lists can all be mixed says nothing
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            TestFilterPage()._page(monkeypatch, tmp_path)
+        assert not [r for r in caplog.records
+                    if "cannot combine categories and tags" in r.getMessage()]
+
+    def test_a_sidecar_chunk_carries_the_same_parts(self, tmp_path):
+        _, chunker, grid = _sl_build(_kc_sweep_sell(), tmp_path / "f")
+        assert grid.sidecars and grid.mix_gaps == 0 and chunker.mix_gaps == []
+        inline = _unpack(chunker.chunks[0])["list"]
+        for chunk_id in range(len(chunker.chunks), len(chunker.chunks) + grid.sidecars):
+            lst = _sl_file(tmp_path / "f", chunk_id)["list"]
+            assert set(lst) == set(inline)
+            tags = [view for key, view in lst["views"].items() if key.startswith("s")]
+            assert tags and all("m" in view and "row" in view and "eq" not in view
+                                for view in tags)
+
+
 class TestTierOffGrid:
     """Which scenario each band's "Tier floors: off" choice shows (the grid's
     tier-off family: _tier_off_binds, _with_tier_off, the walk's off cells):
@@ -6999,7 +7419,9 @@ class TestSaveLiveDefaultsButton:
         assert target == {"url": _SAVE_URL, "same_title_size_cap": None,
                           "filed_by_listing": True,
                           "source": "backtest dashboard for 2026-01-05 to 2026-09-28",
-                          "live_adds_to_held_pairs": False, "live_sells": False}
+                          "live_adds_to_held_pairs": False, "live_sells": False,
+                          # The most categories, and tags, one address may name
+                          "max_names": config.DEFAULTS_SERVER_MAX_FILTER_NAMES}
         # ... which is True only for a run that recorded saved defaults adding
         for saved, said in ((True, True), (False, False), (None, False)):
             swept = dataclasses.replace(sweep, live_add_to_held_pairs=saved)
@@ -12190,21 +12612,33 @@ class TestFilterPageSize:
     with the family an "scn-off-cap-0" block of 3,712 bytes of base64)
     re-measured both the same day: 815,777 bytes without the family and
     1,098,598 with it. Each budget is its measurement + 20% (the curve runs
-    to today, so the page grows by a few bytes a day)."""
+    to today, so the page grows by a few bytes a day).
 
-    PAGE_BYTES_MEASURED = 815_777
+    What the page needs to combine several categories and tags (per-trade
+    arrays in every chunk; each category · tag view's curve in dollars, "m",
+    in place of its "eq", and its table row; the base block's "mix" and each
+    tag group's raw k-hat counts) adds 5% to 9%. Every variant re-measured
+    2026-10-10 (same environment), before and after, in the constants below;
+    with each tag view's "eq" kept beside "m" the growth was 11% to 15%, so
+    "eq" is left out wherever "m" is shipped."""
+
+    # 837,197 the same day before the mix data (+6.6%)
+    PAGE_BYTES_MEASURED = 892_391
     BUDGET = int(PAGE_BYTES_MEASURED * 1.2)
-    PAGE_BYTES_MEASURED_FAMILY = 1_098_598
+    # 1,119,167 before (+7.5%)
+    PAGE_BYTES_MEASURED_FAMILY = 1_203_601
     BUDGET_FAMILY = int(PAGE_BYTES_MEASURED_FAMILY * 1.2)
     # The Add to held pairs view, where every band's add-on run trades yet
     # another list (a worst case: a real run's add-on lists mostly equal the
-    # run as simulated and share its chunks): on its own it takes the page
+    # run as simulated and share its chunks): on its own it took the page
     # from 815,777 to 1,274,895 bytes, and beside the tier-floors-off family
     # (whose 18 binding bands each gain an add-on twin of their own) from
-    # 1,098,598 to 1,784,261. Each budget is its measurement + 20%.
-    PAGE_BYTES_MEASURED_ADD_ON = 1_274_895
+    # 1,098,598 to 1,784,261 (2026-09-30). With the mix data: 1,393,892
+    # (1,289,102 the same day before it, +8.1%) and 1,957,630 (1,798,488,
+    # +8.8%). Each budget is its measurement + 20%.
+    PAGE_BYTES_MEASURED_ADD_ON = 1_393_892
     BUDGET_ADD_ON = int(PAGE_BYTES_MEASURED_ADD_ON * 1.2)
-    PAGE_BYTES_MEASURED_ADD_ON_FAMILY = 1_784_261
+    PAGE_BYTES_MEASURED_ADD_ON_FAMILY = 1_957_630
     BUDGET_ADD_ON_FAMILY = int(PAGE_BYTES_MEASURED_ADD_ON_FAMILY * 1.2)
     # Every trade with quotes that move on most days it is held (a run valued
     # at market), the trade lists unchanged: each curve then changes on most
@@ -12213,9 +12647,11 @@ class TestFilterPageSize:
     # 1,397,952 bytes (823,634 at cost the same day, +70%), and with the
     # tier-floors-off family 1,969,146 (1,105,564 at cost, +78%). Curves stay
     # daily by choice, so each budget is its measurement + 20%, with no ceiling.
-    PAGE_BYTES_MEASURED_QUOTED = 1_397_952
+    # With the mix data: 1,487,918 (1,411,508 the same day before it, +5.4%)
+    # and 2,100,100 (1,982,690, +5.9%).
+    PAGE_BYTES_MEASURED_QUOTED = 1_487_918
     BUDGET_QUOTED = int(PAGE_BYTES_MEASURED_QUOTED * 1.2)
-    PAGE_BYTES_MEASURED_QUOTED_FAMILY = 1_969_146
+    PAGE_BYTES_MEASURED_QUOTED_FAMILY = 2_100_100
     BUDGET_QUOTED_FAMILY = int(PAGE_BYTES_MEASURED_QUOTED_FAMILY * 1.2)
 
     @pytest.mark.parametrize(
