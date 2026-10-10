@@ -10562,6 +10562,54 @@ class TestTrimView:
         assert no_view["grid_trim_off"] is None and no_view["grid_trim_add_off"] is None
         assert no_view["grid_trim"] is not None
 
+    def test_trimming_with_adding_needs_the_add_on_runs_with_the_tiers_off_too(self):
+        # The page has no add-on run with the tier floors off at the band the
+        # tiers bind at, so it shows no trimming-with-adding run there either,
+        # and simulates none
+        sweep = dataclasses.replace(
+            _kc_sweep_trim(_kc_sweep_add_on(_kc_sweep_tiers())), add_on_tier_off_cap_sweep=None)
+        _, _, base = _tr_payload(sweep)
+        assert base["grid_add_off"][0] == [[None] * 3, [None] * 3]
+        assert base["grid_trim_add_off"][0] == [[None] * 3, [None] * 3]
+        assert base["grid_trim_add_off"][1] == base["grid_trim_add"][1]
+        assert sweep.trim_sweep.sweeps[(True, True)].reads == []
+        # Trimming alone with the tier floors off is still shown there
+        assert all(c is not None for row in base["grid_trim_off"][0] for c in row)
+
+    def test_a_tier_off_half_that_cannot_be_read_says_so(self, caplog):
+        sweep = _kc_sweep_trim(_kc_sweep_tiers())
+        real = sweep.trim_sweep.sweep
+
+        def broken(*, tier_floors=True, add_to_held=False):
+            if not tier_floors:
+                raise ZeroDivisionError("off sweep")
+            return real(tier_floors=tier_floors, add_to_held=add_to_held)
+        sweep.trim_sweep.sweep = broken
+        with caplog.at_level(logging.WARNING):
+            walked, _, base = _tr_payload(sweep)
+        [warned] = [r for r in caplog.records if "Trim to Kelly" in r.getMessage()]
+        assert warned.exc_info is not None and warned.getMessage() == (
+            "The Trim to Kelly simulations with the tier floors off could not be read; with "
+            "the tier floors off, trimming is not shown")
+        assert walked.trim_cell is not None and walked.trim_off_cell is None
+        assert base["trim_state"] == "shown" and base["grid_trim"] is not None
+
+    def test_a_chunk_visitor_that_has_failed_simulates_no_trim_cell(self, monkeypatch, caplog):
+        # The bar is already lost (a chunk could not be built), so the page is
+        # written without it: the family's cells are not simulated for nothing
+        sweep = _kc_sweep_trim()
+        real = dashboard._ChunkVisitor.__call__
+
+        def failing(self, bi, ki, ci, pops):
+            real(self, bi, ki, ci, pops)
+            self.failed = True
+        monkeypatch.setattr(dashboard._ChunkVisitor, "__call__", failing)
+        trades, curve = sweep.primary.trades, sweep.primary.equity_df
+        source = dashboard._grid_source(sweep, trades, curve, 0.75)
+        dashboard._build_filter_grid(source, trades, curve, 0.75, _FLT_START, 1000.0,
+                                     _FLT_SERIES_TIERS)
+        assert all(capped.reads == [] for capped in sweep.trim_sweep.sweeps.values())
+
     def test_a_family_without_the_binding_bands_costs_the_tier_off_half_only(self, caplog):
         sweep = _kc_sweep_trim(_kc_sweep_tiers())
         sweep.trim_sweep.off_bands = ()
@@ -10692,7 +10740,7 @@ class TestTrimView:
             assert data[key] == clean_data[key]
         assert data["grid_add"] is not None and chunks == clean_chunks
         assert 'id="flt-bar"' in page
-        # The settings walked before the failing one were read in full
+        # The walk had begun on the family before the cell that raised
         assert sweep.trim_sweep.sweeps[(False, False)].reads[0] == (_KC_B0, 0.6)
 
     def test_a_failing_add_on_cell_keeps_the_trim_view_without_its_adding_half(self, caplog):

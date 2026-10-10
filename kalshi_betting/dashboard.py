@@ -6041,7 +6041,7 @@ _ADD_ON_SAVE_NOTE = ("The live defaults add to held pairs; saving with Add to he
 _TRIM_OPTION_OFF = "off"
 _TRIM_OPTION_ON = "on (sell down to the Kelly size)"
 _TRIM_SELECT_TITLE = (
-    "off: a held pair is kept until it pays out. on: at each weekly run, a pair that "
+    "off: no part of a held pair is sold to cut its size. on: at each weekly run, a pair that "
     "has grown past its Kelly size at that day's sale prices, or past the size cap, is "
     "sold down to it, the latest purchase first; with Add to held pairs on as well, a "
     "pair is topped up or sold down each week. Each part sold counts as a trade of its "
@@ -6057,9 +6057,9 @@ _TRIM_NOTES = {
 _TRIM_PHRASE = ", trimming to Kelly"
 # Added to the summary line while trimming is on: a part sold is a record of
 # its own in the trade counts and the Kelly chart
-_TRIM_SUMMARY_NOTE = (" Each sale that trims a held pair counts as a trade of its own; in "
-                      "the Kelly chart a pair that was trimmed shows as several smaller "
-                      "trades.")
+_TRIM_SUMMARY_NOTE = (" A part of a held pair that a trim sells counts as a trade of its "
+                      "own; in the Kelly chart a pair that was trimmed shows as several "
+                      "smaller trades.")
 # Closes the summary line's reach sentence on a page that has the trim view;
 # the second is for a page with no Scenario Explorer grid
 _TRIM_REACH = ("Trim to Kelly changes the trade sections only; the k̂ figures do not depend "
@@ -6999,7 +6999,8 @@ def _with_trim(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSour
     on, each with the tier floors on, and with them off when the grid
     carries the tier-off view and the family holds every band the tiers bind
     at. Anything else (a mismatched or unreadable family) gets no view, with
-    one WARNING, and the page offers that choice off only.
+    one WARNING, and the page offers that choice off only; a tier-floors-off
+    half that does not fit, or cannot be read, costs that half alone.
 
     The grid's off_fallback is re-wrapped to keep the family, as _with_add_on
     keeps its own.
@@ -7042,13 +7043,17 @@ def _with_trim(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSour
     if source.tier_binds is not None:
         binding = {band for band, own in zip(source.bands, source.tier_binds, strict=True)
                    if own}
+        unread = False
         try:
             fits = binding <= set(trim.off_bands)
             if fits:
                 for add in (False, True):
                     sweeps[(add, True)] = trim.sweep(tier_floors=False, add_to_held=add)
         except Exception:
-            fits = False
+            fits, unread = False, True
+            logging.warning("The Trim to Kelly simulations with the tier floors off "
+                            "could not be read; with the tier floors off, trimming is "
+                            "not shown", exc_info=True)
         if fits:
             def trim_off_cell(band, k, add) -> dict:
                 """
@@ -7067,9 +7072,10 @@ def _with_trim(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSour
                 return sweeps[(add, True)].cell(band, k) if band in binding else {}
         else:
             sweeps = {key: value for key, value in sweeps.items() if not key[1]}
-            logging.warning("The Trim to Kelly simulations with the tier floors off do "
-                            "not match the page's grid; with the tier floors off, trimming "
-                            "is not shown")
+            if not unread:
+                logging.warning("The Trim to Kelly simulations with the tier floors off "
+                                "do not match the page's grid; with the tier floors off, "
+                                "trimming is not shown")
 
     def trim_cell(band, k, add) -> dict:
         """
@@ -7314,7 +7320,10 @@ def _grid_source(
     size-cap sweep (when the run has one) was usable, and only if the family's
     bands, ks and caps are the grid's: a grid that set the size-cap sweep aside,
     and the walk's cap-axis fallback, never have that view, and each logs a
-    WARNING saying so (_warn_add_on_lost_with_the_cap_sweep). Every banded
+    WARNING saying so (_warn_add_on_lost_with_the_cap_sweep). The Trim to
+    Kelly family (_with_trim) is carried under the same conditions, with a
+    WARNING of its own where it is lost
+    (_warn_trim_lost_with_the_cap_sweep). Every banded
     shape, the walk's fallbacks included, carries the Sell family (_with_sell)
     when its bands and ks are the grid's and its caps include the grid's.
 
@@ -7331,11 +7340,13 @@ def _grid_source(
         equity_df (pd.DataFrame): Their equity curve.
         k_used (float | None): The k the page names (used without a sweep).
         use_cap_sweep (bool): Keyword-only. False ignores sweep.cap_sweep
-            and the Add to held pairs family — the walk's fallback.
+            and the Add to held pairs and Trim to Kelly families — the
+            walk's fallback.
 
     Returns:
-        _GridSource: The grid (with its tier-floors-off family and its Add to
-            held pairs family, when the page can show them).
+        _GridSource: The grid (with its tier-floors-off family, its Add to
+            held pairs family and its Trim to Kelly family, when the page can
+            show them).
     """
     if sweep is None or sweep.primary.spread_band is None:
         if use_cap_sweep and sweep is not None and sweep.cap_sweep is not None:
@@ -7798,7 +7809,9 @@ def _walk_trim_cells(source: _GridSource, trim_takers: list,
     tier-floors-off view and a family over it, every binding band's cell
     with them off; then the same two with adding to held pairs, only when
     the grid still carries the Add to held pairs view (source.add_cell: the
-    page cannot show adding on without it). Each cell is read (the family's
+    page cannot show adding on without it), and the second of them only
+    when it carries that view's tier-floors-off runs too
+    (source.add_off_cell). Each cell is read (the family's
     CapSweep simulates it here), cut to the page's axis (_cut_to_axis) and
     handed to each visitor's trim(band index, k index, cap index,
     {population: point}, add=..., off=...), one cell alive at a time, the
@@ -7822,7 +7835,9 @@ def _walk_trim_cells(source: _GridSource, trim_takers: list,
     phases = []
     for add in (False, True) if source.add_cell is not None else (False,):
         phases.append((add, False, source.trim_cell, every))
-        if binding:
+        # With adding on, the binding bands' cells only where the page also
+        # has the add-on runs with the tier floors off to show beside them
+        if binding and (not add or source.add_off_cell is not None):
             phases.append((add, True, source.trim_off_cell, binding))
     for add, off, read, cells in phases:
         capped = source.trim_sweeps.get((add, off))
@@ -7948,7 +7963,10 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
                 reset_add = getattr(visit, "reset_add", None)
                 if reset_add is not None:
                     reset_add(source)
-    trim_takers = [visit for visit in visitors if hasattr(visit, "trim")]
+    # A visitor that has already failed keeps nothing more, so its cells are
+    # not simulated for it
+    trim_takers = [visit for visit in visitors
+                   if hasattr(visit, "trim") and not getattr(visit, "failed", False)]
     if source.trim_cell is not None and trim_takers:
         error = _walk_trim_cells(source, trim_takers, axis_end)
         if error is not None:
@@ -7981,8 +7999,9 @@ def _walk_grid(source: _GridSource, visitors: list,
     Two layers keep a failure from costing more than the filter bar did
     before the size cap existed. This one: a size-cap cell that raises while
     it is simulated costs the cap axis only — ONE WARNING (with the
-    traceback; a second says the Add to held pairs view is lost with it, when
-    the grid carried that family), every visitor reset for the fallback grid,
+    traceback; one more each says the Add to held pairs view, and the Trim
+    to Kelly view, is lost with it, when the grid carried that family), every
+    visitor reset for the fallback grid,
     and a second walk over the eager points alone (source.fallback), whose
     cells are lookups.
     A tier-floors-off size-cap cell that raises costs less: only the off

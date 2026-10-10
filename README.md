@@ -1709,7 +1709,7 @@ the files' total size. `--no-sell-sweep` skips all of it.
 
 **`--no-trim-sweep` — the dashboard's Trim to Kelly select (backtest only; live
 trading does not trim a held pair).** The filter bar's Trim to Kelly select
-offers "off" — a held pair is kept until it pays out, as the run simulates it —
+offers "off" — no part of a held pair is sold to cut its size, as the run simulates it —
 and "on (sell down to the Kelly size)": the same scenario re-simulated so that,
 at each weekly run, a pair that has grown past its Kelly size, or past the size
 cap, is sold down to it. With Add to held pairs on as well, the page shows the
