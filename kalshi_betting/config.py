@@ -641,7 +641,8 @@ LIVE_DEFAULTS_FILE = PROJECT_ROOT / "live_defaults.json"
 # The format tag the saved file carries; a file with any other is refused.
 LIVE_DEFAULTS_FORMAT = "live-defaults-v1"
 
-# The largest saved file read; its record is well under 1 KB.
+# The largest saved file read; its record is well under 1 KB with a short
+# category/tag filter, and a few KB with a long one.
 LIVE_DEFAULTS_MAX_BYTES = 65_536
 
 # LiveSettings.origin for toggles built from this module's constants.
@@ -685,7 +686,8 @@ DEFAULTS_SERVER_HOST = "127.0.0.1"
 DEFAULTS_SERVER_PORT = 8765
 
 # The longest request (path plus body) the server reads. Its form is under 2 KB
-# with one category and tag, and about 6 KB with the most a link may name.
+# with one category and tag, and about 4 KB with the most names a link may
+# carry (DEFAULTS_SERVER_MAX_FILTER_NAMES of each, at ordinary lengths).
 DEFAULTS_SERVER_MAX_REQUEST_BYTES = 16_384
 
 # The most categories, and the most tags, one confirmation link may name.

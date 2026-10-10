@@ -102,10 +102,14 @@ Notes:
     moves under a habitual click. The source note a page proposes must be
     one of the two shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, or be
     left out, and the seed's note may label only the seed values, so a
-    crafted link cannot choose the note's words. Category and tag names are
-    checked for form only (one printable name each), so a link can still put
-    words of its own there: the page shows them as a highlighted change, and
-    a name no Kalshi series is filed under matches no pair. The headers never
+    crafted link cannot choose the note's words. A link may name several
+    categories and several tags (a category or tag field given more than
+    once, at most config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each, no name
+    twice). They are checked for form only (each one printable name; a tag
+    tied to a category, "Sports · Basketball", only with that category
+    named), so a link can still put words of its own there: the page shows
+    them as a highlighted change, and a name no Kalshi series is filed under
+    matches no pair. The headers never
     include "Referrer-Policy: no-referrer": under it a browser sends a POST's
     Origin as "null", and every honest save would be refused.
 
@@ -176,6 +180,7 @@ from .config import (
     DEFAULTS_SERVER_CONFIRM_ARM_MS,
     DEFAULTS_SERVER_HOST,
     DEFAULTS_SERVER_INDEX_RUNS,
+    DEFAULTS_SERVER_MAX_FILTER_NAMES,
     DEFAULTS_SERVER_MAX_REQUEST_BYTES,
     DEFAULTS_SERVER_PORT,
     DEFAULTS_SERVER_RUN_LOG_TAIL_BYTES,
@@ -214,10 +219,12 @@ _FIELDS = ("tier_floors", "spread_min", "spread_max", "k", "size_cap",
            "category", "tag", "source")
 # The fields a proposal must carry; every other one may be left out
 _REQUIRED = ("tier_floors", "spread_min", "spread_max", "k", "size_cap")
-# The largest number of fields a query or form may hold (its twelve fields plus
-# the fingerprint, nonce, token, action and acknowledgement, with room to
-# spare); more is refused unread
-_MAX_FIELDS = 20
+# The fields a request may give more than once: one per category or tag named
+_REPEATABLE = ("category", "tag")
+# The largest number of fields a query or form may hold: its twelve fields, the
+# fingerprint, nonce, token, action and acknowledgement (with room to spare),
+# plus the most categories and tags a link may name; more is refused unread
+_MAX_FIELDS = 20 + 2 * DEFAULTS_SERVER_MAX_FILTER_NAMES
 # A plain decimal number in ASCII digits: no underscores, spaces, digits of
 # other scripts, "nan" or "inf"
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", re.ASCII)
@@ -763,6 +770,37 @@ def _name(text: str, name: str) -> str:
     return text
 
 
+def _name_list(params: dict[str, list[str]], field_name: str) -> tuple[str, ...] | None:
+    """
+    Read every category, or every tag, a request names.
+
+    Args:
+        params (dict[str, list[str]]): The request's fields (_params).
+        field_name (str): "category" or "tag".
+
+    Returns:
+        tuple[str, ...] | None: The names in the order given, or None when
+            the request has no such field (any category, or any tag).
+
+    Raises:
+        ValueError: If a name is not one printable name (_name), or the same
+            name is given twice, in any letter case.
+    """
+    if field_name not in params:
+        return None
+    names: list[str] = []
+    seen: set[str] = set()
+    for text in params[field_name]:
+        name = _name(text, field_name)
+        # The live filter compares names without regard to case, so a second
+        # spelling of one name adds nothing
+        if name.casefold() in seen:
+            raise ValueError(f"{field_name} {name!r} is given twice")
+        seen.add(name.casefold())
+        names.append(name)
+    return tuple(names)
+
+
 def _whole_number(text: str, name: str) -> int:
     """
     Read a field as a plain whole number.
@@ -811,9 +849,13 @@ def _proposal(params: dict[str, list[str]],
     each then keeps the saved value, or the seed's when none is saved or
     (all but the same-title cap) on a link carrying the seed's note, so such a link still
     proposes exactly the seed, and the page shows the change against what is
-    saved. A missing category or tag means any, whatever is saved; a tag needs
-    its category. source is the note the saved file will keep: left out, it
-    is empty; given, it must be one of the two shapes
+    saved. A missing category or tag means any, whatever is saved. category
+    and tag may each be given more than once, one name per field (at most
+    config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each, no name twice in any
+    letter case); a tag needs at least one category, and a tag tied to a
+    category ("Sports · Basketball") needs that category named, which
+    LiveSettings checks. source is the note the saved file will keep: left
+    out, it is empty; given, it must be one of the two shapes
     config.LIVE_DEFAULTS_SOURCE_PATTERN allows, with ASCII digits only, and
     the seed's note (LIVE_DEFAULTS_SEED_SOURCE) may label only the seed
     values themselves.
@@ -828,22 +870,29 @@ def _proposal(params: dict[str, list[str]],
 
     Raises:
         ValueError: Naming the first rule the request breaks: an unknown,
-            repeated, blank or missing field, a value that is not a plain
-            number or a printable name, a tier_floors or add_to_held_pairs
-            other than on or off, a sell_at neither off nor a number, a sell_min_days
-            neither off nor one to six digits, a tag without a category, a source
-            of another shape, any value LiveSettings refuses, or the seed's
-            note on other values.
+            repeated, blank or missing field (a category or tag is repeated
+            only past the most a link may name), a value that is not a plain
+            number or a printable name, a category or tag named twice, a
+            tier_floors or add_to_held_pairs other than on or off, a sell_at
+            neither off nor a number, a sell_min_days neither off nor one to
+            six digits, a tag without a category, a source of another shape,
+            any value LiveSettings refuses, or the seed's note on other values.
     """
     unknown = sorted(set(params) - set(_FIELDS))
     if unknown:
         raise ValueError(f"unknown field {unknown[0]!r}")
     for field_name, values in params.items():
-        if len(values) != 1:
+        if field_name in _REPEATABLE:
+            if len(values) > DEFAULTS_SERVER_MAX_FILTER_NAMES:
+                raise ValueError(f"{field_name} is given {len(values)} times, more than "
+                                 f"{DEFAULTS_SERVER_MAX_FILTER_NAMES}")
+        elif len(values) != 1:
             raise ValueError(f"{field_name} is given {len(values)} times")
-        if values[0] == "":
+        if "" in values:
             raise ValueError(f"{field_name} is blank")
-    value = {field_name: values[0] for field_name, values in params.items()}
+    # The fields given once; the categories and tags are read by _name_list
+    value = {field_name: values[0] for field_name, values in params.items()
+             if field_name not in _REPEATABLE}
     missing = [field_name for field_name in _REQUIRED if field_name not in value]
     if missing:
         raise ValueError(f"{missing[0]} is missing")
@@ -873,10 +922,10 @@ def _proposal(params: dict[str, list[str]],
                          else _whole_number(value["sell_min_days"], "sell_min_days"))
     else:
         sell_min_days = _kept("sell_min_days", current, source)
-    if "tag" in value and "category" not in value:
+    if "tag" in params and "category" not in params:
         raise ValueError("a tag needs its category")
-    categories = (_name(value["category"], "category"),) if "category" in value else None
-    tags = (_name(value["tag"], "tag"),) if "tag" in value else None
+    categories = _name_list(params, "category")
+    tags = _name_list(params, "tag")
     # re.ASCII: the pattern's digits are 0-9 only, never a digit of another
     # script (which could show a date out of order on the page)
     if source and not re.fullmatch(LIVE_DEFAULTS_SOURCE_PATTERN, source, re.ASCII):
@@ -887,7 +936,7 @@ def _proposal(params: dict[str, list[str]],
     if live_defaults_source(source) != source:
         raise ValueError(f"source must have no spaces around it, got {source!r}")
     # LiveSettings validates every value (the band, k, each cap on its grid,
-    # the names), naming the field it refuses
+    # the names, a tied tag's category), naming the field it refuses
     settings = LiveSettings(
         tier_floors=value["tier_floors"] == "on",
         spread_band=(_number(value["spread_min"], "spread_min"),
@@ -986,9 +1035,10 @@ def _signed_text(purpose: str, fingerprint: str, nonce: str,
     The page's purpose ("confirm" or "trade", so one page's token cannot
     start the other page's action), the fingerprint of the defaults in force,
     the page's nonce, each on its own line, then every proposal field as the
-    request gave it, sorted and URL-encoded (none for /trade). The raw strings
-    are signed, never values re-rendered from LiveSettings, so the POST must
-    repeat exactly what the page showed.
+    request gave it, sorted by field name and URL-encoded (none for /trade); a
+    field given more than once (a category or tag) keeps its values in the
+    order given. The raw strings are signed, never values re-rendered from
+    LiveSettings, so the POST must repeat exactly what the page showed.
 
     Args:
         purpose (str): "confirm" or "trade".
@@ -1000,7 +1050,7 @@ def _signed_text(purpose: str, fingerprint: str, nonce: str,
     Returns:
         str: The text to sign.
     """
-    pairs = sorted((name, value) for name in _FIELDS for value in params.get(name, ()))
+    pairs = [(name, value) for name in sorted(_FIELDS) for value in params.get(name, ())]
     return "\n".join((purpose, fingerprint, nonce, urlencode(pairs)))
 
 
