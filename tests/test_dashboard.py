@@ -10317,6 +10317,433 @@ class TestAddOnView:
                 "this page has no Add to held pairs view</p>") in page
 
 
+_TRIM_MISMATCH = ("The Trim to Kelly simulations do not match the page's grid (its bands, ks "
+                  "or caps); the filter bar's Trim to Kelly select stays disabled")
+_TRIM_MISMATCH_OFF = ("The Trim to Kelly simulations with the tier floors off do not match the "
+                      "page's grid; with the tier floors off, trimming is not shown")
+_TRIM_UNREAD = ("The Trim to Kelly simulations could not be read; the filter bar's Trim to "
+                "Kelly select stays disabled")
+_TRIM_WARNING = "A Trim to Kelly simulation failed"
+_TRIM_NO_BAND = ("The Trim to Kelly simulations cannot be placed on a run whose primary records "
+                 "no spread band; the filter bar's Trim to Kelly select stays disabled")
+_TRIM_LOST_WITH_CAP_SWEEP = ("The Trim to Kelly simulations are not shown, because the size-cap "
+                             "sweep they are read with could not be used; the filter bar's Trim "
+                             "to Kelly select stays disabled")
+
+
+class _FakeTrimSweep:
+    """
+    A backtester.TrimSweep stand-in carrying what the dashboard reads of one:
+    bands, off_bands, ks, caps, sweep() and entry_events().
+
+    `sweeps` maps (adding to held pairs, tier floors off) to the _FakeCapSweep
+    sweep() hands back for that setting; `asked` records each sweep() call.
+    """
+
+    def __init__(self, sweeps: dict, *, bands=(_KC_B0, _KC_B1), off_bands=(),
+                 ks=(0.6, 0.75), caps=(0.05, 0.2, 1.0)):
+        self.sweeps = sweeps
+        self.bands, self.off_bands, self.ks, self.caps = bands, off_bands, ks, caps
+        self.asked: list = []
+
+    def sweep(self, *, tier_floors=True, add_to_held=False):
+        self.asked.append((add_to_held, not tier_floors))
+        return self.sweeps[(add_to_held, not tier_floors)]
+
+    def entry_events(self):
+        return {event for capped in self.sweeps.values() for event in capped.entry_events()}
+
+
+def _tr_split(trades: list, event: str | None = None) -> list:
+    """A list whose first pair was trimmed: that trade as two records of one
+    contract pair each (the part sold and the part kept), then the rest."""
+    part = _kc_resized(trades[0], 1)
+    if event is not None:
+        part = dataclasses.replace(part, event_ticker=event, ticker_a=f"{event}-A")
+    return [part, _kc_resized(trades[0], 1), *trades[1:]]
+
+
+def _kc_sweep_trim(base: BacktestSweep | None = None, *, raise_on: dict | None = None,
+                   event: str | None = None) -> BacktestSweep:
+    """
+    A size-cap sweep (_kc_sweep() unless `base`) plus the Trim to Kelly family.
+
+    Trimming alone, tier floors on: at k 0.60 nothing is trimmed, so each
+    point holds the base point's own list; at k 0.75 the primary band's 5%
+    and 20% caps each trim their first pair (a list of their own) while no
+    cap trims nothing, and the other band trims nothing at any cap. With an
+    Add to held pairs family on `base`, the adding-on half does the same over
+    that family's lists. With a tier-floors-off family on `base`, the binding
+    band's twins trim that family's list at every cap. `raise_on` maps a
+    setting (adding, tier floors off) to the cell whose read raises; `event`
+    files the 20%-cap part sold under another event.
+    """
+    sweep = base or _kc_sweep()
+    raise_on = raise_on or {}
+    curves: dict = {}
+
+    def stamped(point, trades=None, **more) -> SweepPoint:
+        if trades is None:
+            return dataclasses.replace(point, trim_to_kelly=True, **more)
+        if id(trades) not in curves:
+            curves[id(trades)] = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        return dataclasses.replace(point, trades=trades, equity_df=curves[id(trades)],
+                                   trim_to_kelly=True, **more)
+
+    def half(points: dict, add: bool) -> _FakeCapSweep:
+        small = _tr_split(points[(_KC_B0, 0.75, 0.05)].trades)
+        full = _tr_split(points[(_KC_B0, 0.75, 0.2)].trades, event)
+        family = {}
+        for cap in (0.05, 0.2, 1.0):
+            family[(_KC_B0, 0.6, cap)] = stamped(points[(_KC_B0, 0.6, cap)])
+            family[(_KC_B1, 0.75, cap)] = stamped(points[(_KC_B1, 0.75, cap)])
+        family[(_KC_B0, 0.75, 0.05)] = stamped(points[(_KC_B0, 0.75, 0.05)], small)
+        family[(_KC_B0, 0.75, 0.2)] = stamped(points[(_KC_B0, 0.75, 0.2)], full)
+        family[(_KC_B0, 0.75, 1.0)] = stamped(points[(_KC_B0, 0.75, 1.0)])
+        return _FakeCapSweep(family, raise_on=raise_on.get((add, False)))
+
+    own = {key: (p["all"] if isinstance(p, dict) else p)
+           for key, p in sweep.cap_sweep.points.items()}
+    sweeps = {(False, False): half(own, False)}
+    adding = getattr(sweep, "add_on_cap_sweep", None)
+    sweeps[(True, False)] = half(adding.points if adding is not None else own, True)
+    off_bands = ()
+    if sweep.tier_off_scenarios:
+        off_bands = (_KC_B0,)
+        off = sweep.tier_off_scenarios[0]
+        for add in (False, True):
+            listed = _tr_split([*off.trades, _ao_trade(off.trades[0])] if add else off.trades)
+            sweeps[(add, True)] = _FakeCapSweep(
+                {(_KC_B0, k, cap): stamped(off, listed, k=k, size_cap=cap, add_to_held=add)
+                 for k in (0.6, 0.75) for cap in (0.05, 0.2, 1.0)},
+                bands=(_KC_B0,), raise_on=raise_on.get((add, True)))
+    return dataclasses.replace(sweep, trim_sweep=_FakeTrimSweep(sweeps, off_bands=off_bands))
+
+
+def _tr_payload(sweep: BacktestSweep, state: str = "not simulated") -> tuple:
+    """(the grid walked, the chunk visitor, the base block) as generate_dashboard
+    builds them for a sweep, with the trim state the page would pass."""
+    trades, curve = sweep.primary.trades, sweep.primary.equity_df
+    source = dashboard._grid_source(sweep, trades, curve, 0.75)
+    walked, chunker, kd = dashboard._build_filter_grid(
+        source, trades, curve, 0.75, _FLT_START, 1000.0, _FLT_SERIES_TIERS)
+    base = dashboard._filter_payload(walked, chunker, _FLT_START, 1000.0, _FLT_SERIES_TIERS,
+                                     kd=kd.payload(), trim_state=state)
+    return walked, chunker, base
+
+
+def _tr_warnings(caplog) -> list[str]:
+    """Every WARNING that names the Trim to Kelly view."""
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "Trim to Kelly" in r.getMessage()]
+
+
+class TestTrimView:
+    """The page's Trim to Kelly data: a lazy family of trimming runs joins the
+    page's one walk after the add-on cells, every scenario of it is its own
+    run (or the scenario's own chunk, when nothing was trimmed), and a family
+    that does not fit, or cannot be simulated, costs that view alone."""
+
+    def test_the_family_joins_a_grid_it_fits(self):
+        sweep = _kc_sweep_trim()
+        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
+                                        0.75)
+        family = sweep.trim_sweep
+        assert source.trim_cell is not None and source.trim_off_cell is None
+        assert set(source.trim_sweeps) == {(False, False), (True, False)}
+        assert source.trim_sweeps[(False, False)] is family.sweeps[(False, False)]
+        assert source.events >= frozenset(family.entry_events())
+        # Attaching it simulates nothing
+        assert all(capped.reads == [] for capped in family.sweeps.values())
+
+    def test_an_event_only_a_trimming_run_trades_is_listed_up_front(self):
+        # The part sold is filed under an event no other scenario trades: the
+        # grid knows it before any cell is read
+        clean, sweep = _kc_sweep(), _kc_sweep_trim(event="KXONLYTRIM-1")
+        before = dashboard._grid_source(clean, clean.primary.trades, clean.primary.equity_df,
+                                        0.75)
+        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
+                                        0.75)
+        assert {event for event, _ in source.events - before.events} == {"KXONLYTRIM-1"}
+        assert all(capped.reads == [] for capped in sweep.trim_sweep.sweeps.values())
+
+    def test_every_trim_scenario_is_its_own_chunk_or_the_scenario_s_own(self):
+        sweep = _kc_sweep_trim()
+        _, source, base, chunks = _flt_payload(sweep)
+        assert base["grid"] == _KC_GRID
+        # k 0.60 and the other band trim nothing: the scenario's own chunk. At
+        # (0-1, 0.75) the 5% and 20% caps each sold part of a pair, so each has
+        # a list of its own; with no cap nothing is trimmed
+        assert base["grid_trim"] == [[[3, 2, 2], [6, 5, 0]], [[None, None, None], [4, 4, 4]]]
+        assert base["trim_state"] == "shown"
+        assert base["grid_trim_off"] is None
+        # The page has no Add to held pairs view, so no adding-on half either,
+        # and those cells were never simulated
+        assert base["grid_trim_add"] is None and base["grid_trim_add_off"] is None
+        assert sweep.trim_sweep.sweeps[(True, False)].reads == []
+        assert len(chunks) == 7
+        assert [chunks[c]["list"]["views"]["all"]["n"] for c in (5, 6)] == [4, 4]
+        # Each is priced at its own k, on its own trades
+        trimmed = sweep.trim_sweep.sweeps[(False, False)].points[(_KC_B0, 0.75, 0.2)].trades
+        assert chunks[5]["list"]["kx"] == pytest.approx(
+            dashboard._kelly_points(trimmed, 0.75)[0])
+        # Every cell read once, the page's own first
+        assert sweep.trim_sweep.sweeps[(False, False)].reads == [
+            (_KC_B0, 0.6), (_KC_B0, 0.75), (_KC_B1, 0.6), (_KC_B1, 0.75)]
+
+    def test_the_reach_sentence_says_what_the_choice_changes(self):
+        _, _, base = _tr_payload(_kc_sweep_trim())
+        assert base["text"]["unfiltered"].endswith(dashboard._TRIM_REACH_NO_EXPLORER)
+        assert base["text"]["trim"] == ", trimming to Kelly"
+        assert base["text"]["trim_note"] == dashboard._TRIM_SUMMARY_NOTE
+        _, _, clean = _tr_payload(_kc_sweep())
+        assert "Trim to Kelly" not in clean["text"]["unfiltered"]
+
+    def test_the_page_s_other_grids_and_chunks_are_unchanged_beside_it(self):
+        # The trim chunks come after every other chunk, so a page with the
+        # family holds the page without it, chunk for chunk, then its own
+        _, clean_chunker, clean_base = _ao_payload(_kc_sweep_add_on())
+        _, chunker, base = _tr_payload(_kc_sweep_trim(_kc_sweep_add_on()))
+        for key in ("grid", "grid_add", "grid_add_off", "add_state"):
+            assert base[key] == clean_base[key]
+        assert base["rows"][:len(clean_base["rows"])] == clean_base["rows"]
+        assert _ao_chunks(chunker)[:len(clean_chunker.chunks)] == _ao_chunks(clean_chunker)
+        assert len(chunker.chunks) > len(clean_chunker.chunks)
+
+    def test_with_the_add_on_view_the_adding_half_is_built_too(self):
+        sweep = _kc_sweep_trim(_kc_sweep_add_on())
+        walked, chunker, base = _tr_payload(sweep)
+        add, trim, both = base["grid_add"], base["grid_trim"], base["grid_trim_add"]
+        assert base["trim_state"] == "shown" and both is not None
+        # Nothing trimmed: the cell is the Add to held pairs scenario's own chunk
+        assert both[0][0] == add[0][0] and both[1] == add[1]
+        assert both[0][1][2] == add[0][1][2]
+        # Trimmed: a list neither the add-on scenario nor the trim-alone one traded
+        for ci in (0, 1):
+            assert both[0][1][ci] not in _ao_ids(add) | _ao_ids(trim) | _ao_ids(base["grid"])
+        assert sweep.trim_sweep.sweeps[(True, False)].reads == [
+            (_KC_B0, 0.6), (_KC_B0, 0.75), (_KC_B1, 0.6), (_KC_B1, 0.75)]
+
+    def test_without_the_family_the_payload_says_so(self):
+        _, _, base = _tr_payload(_kc_sweep())
+        assert [base[key] for key in ("grid_trim", "grid_trim_off", "grid_trim_add",
+                                      "grid_trim_add_off")] == [None] * 4
+        assert base["trim_state"] == "not simulated"
+        _, _, base = _tr_payload(_kc_sweep(), "unavailable")
+        assert base["grid_trim"] is None and base["trim_state"] == "unavailable"
+        _, _, base = _tr_payload(_kc_sweep_trim(), "unavailable")
+        assert base["trim_state"] == "shown" and base["grid_trim"] is not None
+
+    def test_a_grid_of_nothing_is_never_shown_as_a_view(self):
+        empty = {key: _FakeCapSweep({}) for key in ((False, False), (True, False))}
+        sweep = dataclasses.replace(_kc_sweep(), trim_sweep=_FakeTrimSweep(empty))
+        walked, chunker, base = _tr_payload(sweep, "unavailable")
+        assert walked.trim_cell is not None and chunker.trim_grid() is None
+        assert base["grid_trim"] is None and base["trim_state"] == "unavailable"
+
+    def test_the_tier_off_twins_pair_with_the_tier_off_view_only(self):
+        sweep = _kc_sweep_trim(_kc_sweep_add_on(_kc_sweep_tiers()))
+        walked, chunker, base = _tr_payload(sweep)
+        assert walked.tier_binds == (True, False) and walked.trim_off_cell is not None
+        for on_key, off_key in (("grid_trim", "grid_trim_off"),
+                                ("grid_trim_add", "grid_trim_add_off")):
+            on, off = base[on_key], base[off_key]
+            # A binding band's row is its own tier-floors-off chunks ...
+            assert all(c is not None for row in off[0] for c in row)
+            assert _ao_ids(off[:1]).isdisjoint(_ao_ids(on))
+            # ... and a band the tiers never bind at reads its tier-on row
+            assert off[1] == on[1]
+        assert _ao_ids(base["grid_trim_off"][:1]).isdisjoint(
+            _ao_ids(base["grid_trim_add_off"][:1]))
+        # Without a tier-off view beside them, no off grid is shipped
+        _, _, no_view = _tr_payload(dataclasses.replace(
+            sweep, tier_off_scenarios=[], tier_off_calibrations_by_band={},
+            add_on_tier_off_cap_sweep=None))
+        assert no_view["grid_trim_off"] is None and no_view["grid_trim_add_off"] is None
+        assert no_view["grid_trim"] is not None
+
+    def test_a_family_without_the_binding_bands_costs_the_tier_off_half_only(self, caplog):
+        sweep = _kc_sweep_trim(_kc_sweep_tiers())
+        sweep.trim_sweep.off_bands = ()
+        with caplog.at_level(logging.WARNING):
+            walked, _, base = _tr_payload(sweep)
+        assert _tr_warnings(caplog) == [_TRIM_MISMATCH_OFF]
+        assert walked.trim_cell is not None and walked.trim_off_cell is None
+        assert base["trim_state"] == "shown"
+        # With the tiers off, trimming reads "missing" at the band they bind at
+        assert base["grid_trim_off"][0] == [[None] * 3, [None] * 3]
+        assert base["grid_trim_off"][1] == base["grid_trim"][1]
+        assert sweep.trim_sweep.sweeps[(False, True)].reads == []
+
+    # ─── A family that does not fit ───────────────────────────────────────────
+
+    @pytest.mark.parametrize("axis, value", [("bands", (_KC_B0,)), ("ks", (0.75,)),
+                                             ("caps", (0.05, 0.2))])
+    def test_a_family_on_other_axes_gives_no_view(self, caplog, axis, value):
+        sweep = _kc_sweep_trim()
+        setattr(sweep.trim_sweep, axis, value)
+        with caplog.at_level(logging.WARNING):
+            walked, _, base = _tr_payload(sweep, "unavailable")
+        assert _tr_warnings(caplog) == [_TRIM_MISMATCH]
+        assert walked.trim_cell is None and walked.trim_sweeps == {}
+        assert base["grid_trim"] is None and base["trim_state"] == "unavailable"
+        assert base["grid"] == _KC_GRID
+        assert sweep.trim_sweep.asked == []
+
+    def test_a_family_that_cannot_be_read_gives_no_view(self, caplog):
+        sweep = _kc_sweep_trim()
+
+        def broken():
+            raise ZeroDivisionError("entry events")
+        sweep.trim_sweep.entry_events = broken
+        with caplog.at_level(logging.WARNING):
+            source = dashboard._grid_source(sweep, sweep.primary.trades,
+                                            sweep.primary.equity_df, 0.75)
+        assert source.trim_cell is None and source.cap_sweep is sweep.cap_sweep
+        [warned] = [r for r in caplog.records if "Trim to Kelly" in r.getMessage()]
+        assert warned.exc_info is not None and warned.getMessage() == _TRIM_UNREAD
+
+    def test_the_cap_axis_fallback_grid_has_no_view_and_no_warning(self, caplog):
+        sweep = _kc_sweep_trim()
+        with caplog.at_level(logging.WARNING):
+            fallback = dashboard._grid_source(sweep, sweep.primary.trades,
+                                              sweep.primary.equity_df, 0.75,
+                                              use_cap_sweep=False)
+        assert fallback.trim_cell is None and fallback.cap_sweep is None
+        assert _tr_warnings(caplog) == []
+        assert sweep.trim_sweep.asked == []
+
+    def test_a_lost_cap_axis_costs_the_trim_view_too(self, caplog):
+        sweep = _kc_sweep_trim(_kc_sweep(raise_on=(_KC_B1, 0.75)))
+        with caplog.at_level(logging.WARNING):
+            walked, _, base = _tr_payload(sweep, "unavailable")
+        assert walked.cap_sweep is None and walked.trim_cell is None
+        assert base["grid_trim"] is None and base["trim_state"] == "unavailable"
+        assert _tr_warnings(caplog) == [_TRIM_LOST_WITH_CAP_SWEEP]
+        assert all(capped.reads == [] for capped in sweep.trim_sweep.sweeps.values())
+
+    @pytest.mark.parametrize("how", ["unreadable", "without the primary"])
+    def test_a_size_cap_sweep_set_aside_says_what_it_costs_the_trim_view(self, caplog, how):
+        sweep = _kc_sweep_trim()
+        if how == "unreadable":
+            def broken():
+                raise ZeroDivisionError("entry events")
+            sweep.cap_sweep.entry_events = broken
+        else:
+            sweep.cap_sweep.bands = (_KC_B1,)
+        with caplog.at_level(logging.WARNING):
+            source = dashboard._grid_source(sweep, sweep.primary.trades,
+                                            sweep.primary.equity_df, 0.75)
+        assert source.cap_sweep is None and source.trim_cell is None
+        assert _tr_warnings(caplog) == [_TRIM_LOST_WITH_CAP_SWEEP]
+        assert sweep.trim_sweep.asked == []
+
+    def test_a_family_on_a_run_without_a_band_is_set_aside_and_said(self, caplog):
+        sweep = _kc_sweep_trim()
+        primary = dataclasses.replace(sweep.primary, spread_band=None)
+        sweep = dataclasses.replace(sweep, primary=primary, points=[primary], scenarios=[])
+        with caplog.at_level(logging.WARNING):
+            source = dashboard._grid_source(sweep, sweep.primary.trades,
+                                            sweep.primary.equity_df, 0.75)
+        assert source.trim_cell is None and _tr_warnings(caplog) == [_TRIM_NO_BAND]
+        assert sweep.trim_sweep.asked == []
+
+    def test_a_run_without_a_size_cap_sweep_offers_the_view_at_its_own_cap(self):
+        sweep = _flt_sweep()
+        primary = sweep.primary
+        trimmed = dataclasses.replace(primary, trades=_tr_split(primary.trades),
+                                      trim_to_kelly=True)
+        axes = {"bands": ((0.0, 1.0), (0.3, 0.6), (0.3, 1.0)), "ks": (0.6, 0.75, 1.0),
+                "caps": (0.2,)}
+        halves = {(False, False): _FakeCapSweep({((0.0, 1.0), 0.75, 0.2): trimmed}, **axes),
+                  (True, False): _FakeCapSweep({}, **axes)}
+        _, source, base, chunks = _flt_payload(dataclasses.replace(
+            sweep, trim_sweep=_FakeTrimSweep(halves, **axes)))
+        assert source.cap_sweep is None and source.trim_cell is not None
+        assert base["trim_state"] == "shown"
+        assert base["grid_trim"] == [[[None], [4], [None]], [[None]] * 3, [[None]] * 3]
+        assert chunks[4]["list"]["views"]["all"]["n"] == len(primary.trades) + 1
+
+    # ─── A cell that cannot be simulated ──────────────────────────────────────
+
+    @pytest.mark.parametrize("setting", [(False, False), (True, False), (False, True),
+                                         (True, True)])
+    def test_a_trim_cell_that_raises_costs_only_the_trim_view(
+            self, monkeypatch, tmp_path, caplog, setting):
+        # One cell of one setting raises after earlier trim cells were packed:
+        # every trim chunk and row head is dropped, and the page is the page it
+        # was without the family, chunk for chunk
+        base_sweep = _kc_sweep_add_on(_kc_sweep_tiers())
+        clean = _ao_page(monkeypatch, tmp_path, base_sweep)
+        sweep = _kc_sweep_trim(_kc_sweep_add_on(_kc_sweep_tiers()),
+                               raise_on={setting: (_KC_B0, 0.75)})
+        with caplog.at_level(logging.WARNING):
+            page = _ao_page(monkeypatch, tmp_path, sweep)
+        warned = [r for r in caplog.records if r.levelno == logging.WARNING
+                  and _TRIM_WARNING in r.getMessage()]
+        assert len(warned) == 1 and warned[0].exc_info is not None
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        clean_data, clean_chunks = TestFilterPage._data(clean), TestFilterPage._chunks(clean)
+        assert [data[key] for key in ("grid_trim", "grid_trim_off", "grid_trim_add",
+                                      "grid_trim_add_off")] == [None] * 4
+        assert data["trim_state"] == "unavailable"
+        for key in ("grid", "grid_off", "grid_add", "grid_add_off", "add_state", "rows",
+                    "text", "kd"):
+            assert data[key] == clean_data[key]
+        assert data["grid_add"] is not None and chunks == clean_chunks
+        assert 'id="flt-bar"' in page
+        # The settings walked before the failing one were read in full
+        assert sweep.trim_sweep.sweeps[(False, False)].reads[0] == (_KC_B0, 0.6)
+
+    def test_a_failing_add_on_cell_keeps_the_trim_view_without_its_adding_half(self, caplog):
+        # The Add to held pairs family cannot be simulated: its view goes, and
+        # the trim view is built for adding off alone — the adding-on cells are
+        # never read, since the page cannot show adding on
+        sweep = _kc_sweep_trim(_kc_sweep_add_on(raise_on=(_KC_B1, 0.75)))
+        with caplog.at_level(logging.WARNING):
+            walked, chunker, base = _tr_payload(sweep)
+        assert any(_ADD_WARNING in r.getMessage() for r in caplog.records)
+        assert _tr_warnings(caplog) == []
+        assert base["grid_add"] is None and base["trim_state"] == "shown"
+        assert base["grid_trim"] is not None and base["grid_trim_add"] is None
+        assert sweep.trim_sweep.sweeps[(True, False)].reads == []
+        # ... and the trim chunks sit right after the page's own
+        assert min(_ao_ids(base["grid_trim"]) - _ao_ids(base["grid"])) == 5
+
+    def test_a_failing_tier_off_size_cap_cell_keeps_the_trim_view(self, caplog):
+        # The walk swaps in the grid's eager tier-off lookup, which was built
+        # before the family was attached, and must still carry it
+        sweep = _kc_sweep_trim(_kc_sweep_tiers_capped(raise_on=(_KC_B0, 0.6)))
+        with caplog.at_level(logging.WARNING):
+            walked, chunker, base = _tr_payload(sweep)
+        assert any(_OFF_WARNING in r.getMessage() for r in caplog.records)
+        assert _tr_warnings(caplog) == []
+        assert walked.off_cap_sweep is None
+        assert walked.trim_cell is not None and walked.trim_off_cell is not None
+        assert base["trim_state"] == "shown"
+        assert base["grid_trim"] is not None and base["grid_trim_off"] is not None
+
+    def test_the_walk_reads_the_trim_cells_after_every_other_kind(self):
+        # The order the families are simulated in is what lets one family's
+        # chunks be dropped without cutting into another's
+        sweep = _kc_sweep_trim(_kc_sweep_add_on(_kc_sweep_tiers()))
+        order: list[str] = []
+        named = {"cap": sweep.cap_sweep, "add": sweep.add_on_cap_sweep,
+                 "add off": sweep.add_on_tier_off_cap_sweep,
+                 **{f"trim {key}": capped for key, capped in sweep.trim_sweep.sweeps.items()}}
+        for name, capped in named.items():
+            read = capped.cell
+
+            def cell(band, k, read=read, name=name):
+                if not order or order[-1] != name:
+                    order.append(name)
+                return read(band, k)
+            capped.cell = cell
+        _tr_payload(sweep)
+        assert order == ["cap", "add", "add off", "trim (False, False)", "trim (False, True)",
+                         "trim (True, False)", "trim (True, True)"]
+
+
 class TestAddOnScript:
     """The bar's Add to held pairs select under the page script (run outside a
     browser): enabled only with the view, "on" loads the add-on scenario's chunk

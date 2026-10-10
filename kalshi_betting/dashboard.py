@@ -6023,6 +6023,22 @@ _ADD_ON_NOTES = {
 # "off" turns adding off in the defaults
 _ADD_ON_SAVE_NOTE = ("The live defaults add to held pairs; saving with Add to held pairs "
                      "off here turns that off.")
+# The Trim to Kelly view's words. Appended to a scenario's summary phrase
+# when trimming is on
+_TRIM_PHRASE = ", trimming to Kelly"
+# Added to the summary line while trimming is on: a part sold is a record of
+# its own in the trade counts and the Kelly chart
+_TRIM_SUMMARY_NOTE = (" Each sale that trims a held pair counts as a trade of its own; in "
+                      "the Kelly chart a pair that was trimmed shows as several smaller "
+                      "trades.")
+# Closes the summary line's reach sentence on a page that has the trim view;
+# the second is for a page with no Scenario Explorer grid
+_TRIM_REACH = ("Trim to Kelly changes the trade sections only; the k̂ figures do not depend "
+               "on it, and the Scenario Explorer and Interval Discount sections always show "
+               "it off.")
+_TRIM_REACH_NO_EXPLORER = ("Trim to Kelly changes the trade sections only; the k̂ figures do "
+                           "not depend on it, and the Interval Discount section always "
+                           "shows it off.")
 # Beside the save button on a page with the Sell view whose saved live defaults sell
 _SELL_SAVE_NOTE = ('The live defaults sell; saving with Sell set to "no selling" turns live '
                    "selling off.")
@@ -6242,7 +6258,8 @@ def _bar_reach(kd_follows: bool, explorer_follows: bool, *, explorer_caps: bool 
 # is always its own simulation, so its whole-run view closes on "other_run"
 # at the primary band, k and size cap; so is one at a sell level, whose
 # phrase the base block's sell_levels carry, and "sell_note" is added to the
-# line while a level is chosen. "sidecar_missing" and "sidecar_empty" are a
+# line while a level is chosen. "trim" and "trim_note" do for the Trim to
+# Kelly choice what "add_on" and "add_on_note" do for adding. "sidecar_missing" and "sidecar_empty" are a
 # sidecar chunk file's {reason} in "unavailable": it could not be loaded, or
 # it ran without handing anything over ({file}: the address asked for).
 _SUMMARY_TEMPLATES = {
@@ -6253,6 +6270,8 @@ _SUMMARY_TEMPLATES = {
     "other_run": " This is its own simulation, not a slice of the primary run.",
     "add_on": _ADD_ON_PHRASE,
     "add_on_note": _ADD_ON_SUMMARY_NOTE,
+    "trim": _TRIM_PHRASE,
+    "trim_note": _TRIM_SUMMARY_NOTE,
     "sell_note": _SELL_SUMMARY_NOTE,
     "sidecar_missing": _SIDECAR_MISSING,
     "sidecar_empty": _SIDECAR_EMPTY,
@@ -6560,6 +6579,18 @@ class _GridSource:
             after the walk (_build_sell_grid), when its bands, ks and caps fit
             this grid (_with_sell); None without it. Its cells are never walked
             here: they are simulated in worker processes, level by level.
+        trim_cell: Callable (band, k, add) -> {cap: {population: SweepPoint}}
+            — the same cell simulated with held pairs trimmed to their Kelly
+            size, and with adding to held pairs when `add`
+            (BacktestSweep.trim_sweep's sweeps, run as the walk reads them,
+            so it may raise); None when the page has no Trim to Kelly view
+            (_with_trim).
+        trim_off_cell: The same over a binding band's tier-floors-off run; {}
+            for a band the tiers never bind at; None unless the grid has both
+            the tier-off view and a family over it.
+        trim_sweeps: (add, tier floors off) -> the CapSweep behind those
+            cells, read only for its simulated / reused counters in the
+            walk's log; empty without the view.
     """
     bands: tuple
     ks: tuple
@@ -6583,6 +6614,10 @@ class _GridSource:
     add_cap_sweep: object | None = None
     add_off_cap_sweep: object | None = None
     sell: object | None = None
+    trim_cell: Callable[[tuple[float, float] | None, float | None, bool], dict] | None = None
+    trim_off_cell: Callable[[tuple[float, float] | None, float | None, bool],
+                            dict] | None = None
+    trim_sweeps: dict = field(default_factory=dict)
 
 
 def _primary_calibration(sweep: BacktestSweep | None) -> IntervalCalibration | None:
@@ -6909,6 +6944,130 @@ def _with_add_on(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSo
         source.off_fallback(), **fields))
 
 
+def _warn_trim_lost_with_the_cap_sweep() -> None:
+    """
+    Log why the Trim to Kelly select stays disabled when the size-cap sweep is set aside.
+
+    Like the add-on simulations, the trimming ones are read on the size-cap
+    sweep's own grid, so a page that falls back to the eager points has no
+    Trim to Kelly view either. The size-cap sweep's own WARNING names its
+    failure; this one says what that costs the select.
+    """
+    logging.warning("The Trim to Kelly simulations are not shown, because the size-cap "
+                    "sweep they are read with could not be used; the filter bar's Trim to "
+                    "Kelly select stays disabled")
+
+
+def _with_trim(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSource":
+    """
+    Attach a sweep's Trim to Kelly family to a grid, when it fits.
+
+    The family (BacktestSweep.trim_sweep) is lazy only, like the Add to held
+    pairs one: every cell is simulated as the walk reads it, with no eager
+    point to stand in for one. It fits a grid on the very same bands, ks and
+    caps: the size-cap grid, or the eager grid of a run without a size-cap
+    sweep. It holds four lazy size-cap sweeps: adding to held pairs off or
+    on, each with the tier floors on, and with them off when the grid
+    carries the tier-off view and the family holds every band the tiers bind
+    at. Anything else (a mismatched or unreadable family) gets no view, with
+    one WARNING, and the page offers that choice off only.
+
+    The grid's off_fallback is re-wrapped to keep the family, as _with_add_on
+    keeps its own.
+
+    Args:
+        source (_GridSource): The grid, its tier-floors-off and Add to held
+            pairs families already attached.
+        sweep (BacktestSweep | None): The run's sweep, or None.
+
+    Returns:
+        _GridSource: The source itself when there is no family, no band or
+            no fit; else a copy carrying trim_cell (and trim_off_cell), their
+            sweeps and the events the family's trades can carry.
+    """
+    trim = getattr(sweep, "trim_sweep", None) if sweep is not None else None
+    if trim is None or source.bands == (None,):
+        return source
+    sweeps: dict = {}
+    try:
+        usable = (tuple(trim.bands) == tuple(source.bands)
+                  and tuple(trim.ks) == tuple(source.ks)
+                  and tuple(trim.caps) == tuple(source.caps))
+        if usable:
+            # Every entry's event, both Tier floors settings: a run whose cash
+            # differs can trade a pair no other scenario traded. The bar's
+            # labels read events and off_events together, so one set holds them
+            found = frozenset(trim.entry_events())
+            for add in (False, True):
+                sweeps[(add, False)] = trim.sweep(tier_floors=True, add_to_held=add)
+    except Exception:
+        logging.warning("The Trim to Kelly simulations could not be read; the filter "
+                        "bar's Trim to Kelly select stays disabled", exc_info=True)
+        return source
+    if not usable:
+        logging.warning("The Trim to Kelly simulations do not match the page's grid (its "
+                        "bands, ks or caps); the filter bar's Trim to Kelly select stays "
+                        "disabled")
+        return source
+    trim_off_cell = None
+    if source.tier_binds is not None:
+        binding = {band for band, own in zip(source.bands, source.tier_binds, strict=True)
+                   if own}
+        try:
+            fits = binding <= set(trim.off_bands)
+            if fits:
+                for add in (False, True):
+                    sweeps[(add, True)] = trim.sweep(tier_floors=False, add_to_held=add)
+        except Exception:
+            fits = False
+        if fits:
+            def trim_off_cell(band, k, add) -> dict:
+                """
+                One binding (band, k)'s trimming points with the tier floors off, at every cap.
+
+                Args:
+                    band: The cell's band.
+                    k: The cell's k.
+                    add: Whether the run also adds to held pairs.
+
+                Returns:
+                    dict: {cap: {population: point}} (backtester.CapSweep.cell,
+                        simulated as it is read — it may raise), or {} for a
+                        band the tiers never bind at.
+                """
+                return sweeps[(add, True)].cell(band, k) if band in binding else {}
+        else:
+            sweeps = {key: value for key, value in sweeps.items() if not key[1]}
+            logging.warning("The Trim to Kelly simulations with the tier floors off do "
+                            "not match the page's grid; with the tier floors off, trimming "
+                            "is not shown")
+
+    def trim_cell(band, k, add) -> dict:
+        """
+        One (band, k)'s trimming points with the tier floors on, at every cap.
+
+        Args:
+            band: The cell's band.
+            k: The cell's k.
+            add: Whether the run also adds to held pairs.
+
+        Returns:
+            dict: {cap: {population: point}} (backtester.CapSweep.cell,
+                simulated as it is read — it may raise).
+        """
+        return sweeps[(add, False)].cell(band, k)
+
+    fields = {"trim_cell": trim_cell, "trim_off_cell": trim_off_cell, "trim_sweeps": sweeps,
+              "events": source.events | found}
+    attached = dataclasses.replace(source, **fields)
+    if source.off_fallback is None:
+        return attached
+    # The walk swaps in off_fallback() when a tier-floors-off cell fails: it
+    # keeps the family, so the trim phase still runs on that grid
+    return dataclasses.replace(attached, off_fallback=lambda: dataclasses.replace(
+        source.off_fallback(), **fields))
+
+
 def _with_sell(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSource":
     """
     Attach a sweep's Sell family to a grid, when it fits.
@@ -7157,6 +7316,10 @@ def _grid_source(
             logging.warning("The Add to held pairs simulations cannot be placed on a run "
                             "whose primary records no spread band; the filter bar's Add to "
                             "held pairs select stays disabled")
+        if use_cap_sweep and getattr(sweep, "trim_sweep", None) is not None:
+            logging.warning("The Trim to Kelly simulations cannot be placed on a run "
+                            "whose primary records no spread band; the filter bar's Trim "
+                            "to Kelly select stays disabled")
         return _unbanded_source(sweep, trades, equity_df, k_used)
     capped = sweep.cap_sweep
     if use_cap_sweep and capped is not None:
@@ -7165,8 +7328,9 @@ def _grid_source(
             bands, ks, caps = tuple(capped.bands), tuple(capped.ks), tuple(capped.caps)
             if primary.spread_band in bands and primary.k in ks and capped.primary_cap in caps:
                 # The tier-floors-off family rides along (_with_tier_off), and
-                # so does the Add to held pairs family (_with_add_on)
-                return _with_sell(_with_add_on(_with_tier_off(_GridSource(
+                # so do the Add to held pairs family (_with_add_on) and the
+                # Trim to Kelly family (_with_trim)
+                return _with_sell(_with_trim(_with_add_on(_with_tier_off(_GridSource(
                     bands=bands, ks=ks, caps=caps,
                     primary=(bands.index(primary.spread_band), ks.index(primary.k),
                              caps.index(capped.primary_cap)),
@@ -7179,7 +7343,8 @@ def _grid_source(
                     events=frozenset(capped.entry_events()),
                     checks=bool(capped.checks), cap_sweep=capped,
                     fallback=lambda: _grid_source(sweep, trades, equity_df, k_used,
-                                                  use_cap_sweep=False)), sweep), sweep), sweep)
+                                                  use_cap_sweep=False)), sweep), sweep),
+                    sweep), sweep)
         except Exception:
             # The cap axis alone is lost, as when a cell cannot be simulated
             # in the walk: the eager points still give the bar every band and k
@@ -7187,6 +7352,8 @@ def _grid_source(
                             "the run's own cap only", exc_info=True)
             if getattr(sweep, "add_on_cap_sweep", None) is not None:
                 _warn_add_on_lost_with_the_cap_sweep()
+            if getattr(sweep, "trim_sweep", None) is not None:
+                _warn_trim_lost_with_the_cap_sweep()
             return _with_sell(_with_tier_off(_eager_source(sweep), sweep), sweep)
         logging.warning(
             "The size-cap sweep does not hold this run's primary scenario (band %s, "
@@ -7194,13 +7361,17 @@ def _grid_source(
             primary.spread_band, primary.k, capped.primary_cap)
         if getattr(sweep, "add_on_cap_sweep", None) is not None:
             _warn_add_on_lost_with_the_cap_sweep()
+        if getattr(sweep, "trim_sweep", None) is not None:
+            _warn_trim_lost_with_the_cap_sweep()
         return _with_sell(_with_tier_off(_eager_source(sweep), sweep), sweep)
     source = _with_tier_off(_eager_source(sweep), sweep)
     # The walk's cap-axis fallback (use_cap_sweep False) never carries the
-    # Add to held pairs view: the family's caps are the size-cap grid's, and
-    # the walk logs both the lost cap axis and the lost view. The Sell family
-    # fits the eager grid's one cap, so every shape keeps it
-    return _with_sell(_with_add_on(source, sweep) if use_cap_sweep else source, sweep)
+    # Add to held pairs view or the Trim to Kelly view: those families' caps
+    # are the size-cap grid's, and the walk logs both the lost cap axis and
+    # the lost views. The Sell family fits the eager grid's one cap, so every
+    # shape keeps it
+    return _with_sell(_with_trim(_with_add_on(source, sweep), sweep)
+                      if use_cap_sweep else source, sweep)
 
 
 def _filter_labels(
@@ -7588,10 +7759,72 @@ def _walk_add_cells(source: _GridSource, add_takers: list,
     return None
 
 
+def _walk_trim_cells(source: _GridSource, trim_takers: list,
+                     axis_end: pd.Timestamp | None) -> Exception | None:
+    """
+    Hand every Trim to Kelly scenario of a grid to the visitors that take it.
+
+    Up to four passes, each a setting of (adding to held pairs, tier floors
+    off): trimming alone with the tier floors on; then, when the grid has a
+    tier-floors-off view and a family over it, every binding band's cell
+    with them off; then the same two with adding to held pairs, only when
+    the grid still carries the Add to held pairs view (source.add_cell: the
+    page cannot show adding on without it). Each cell is read (the family's
+    CapSweep simulates it here), cut to the page's axis (_cut_to_axis) and
+    handed to each visitor's trim(band index, k index, cap index,
+    {population: point}, add=..., off=...), one cell alive at a time, the
+    primary cap first.
+
+    Args:
+        source (_GridSource): The grid (its trim_cell is not None).
+        trim_takers (list): The visitors with a `trim` method.
+        axis_end (pd.Timestamp | None): The page's last date.
+
+    Returns:
+        Exception | None: The exception a cell raised, which stops this
+            phase; None when every cell was visited.
+    """
+    pc = source.primary[2]
+    caps = [pc] + [ci for ci in range(len(source.caps)) if ci != pc]
+    every = [(bi, ki) for bi in range(len(source.bands)) for ki in range(len(source.ks))]
+    binding = ([] if source.tier_binds is None or source.trim_off_cell is None else
+               [(bi, ki) for bi, binds in enumerate(source.tier_binds) if binds
+                for ki in range(len(source.ks))])
+    phases = []
+    for add in (False, True) if source.add_cell is not None else (False,):
+        phases.append((add, False, source.trim_cell, every))
+        if binding:
+            phases.append((add, True, source.trim_off_cell, binding))
+    for add, off, read, cells in phases:
+        capped = source.trim_sweeps.get((add, off))
+        step = max(1, math.ceil(len(cells) / _WALK_PROGRESS_LINES))
+        for done, (bi, ki) in enumerate(cells, 1):
+            try:
+                by_cap = read(source.bands[bi], source.ks[ki], add)
+            except Exception as exc:
+                return exc
+            by_cap = _cut_to_axis(by_cap, axis_end)
+            for ci in caps:
+                pops = by_cap.get(source.caps[ci])
+                if pops:
+                    for visit in trim_takers:
+                        visit.trim(bi, ki, ci, pops, add=add, off=off)
+            del by_cap
+            if done % step == 0 or done == len(cells):
+                logging.info("Dashboard: %d/%d %s read from the Trim to Kelly size-cap sweep"
+                             "%s%s (%d cap points simulated, %d shared so far)",
+                             done, len(cells),
+                             "binding band x k cells" if off else "band x k cells",
+                             " with the tier floors off" if off else "",
+                             ", adding to held pairs" if add else "",
+                             getattr(capped, "simulated", 0), getattr(capped, "reused", 0))
+    return None
+
+
 def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
                ) -> tuple[Exception | None, _GridSource]:
     """
-    Hand every scenario of a grid to each visitor: tier-on, tier-off, add-on, same-title.
+    Hand every scenario of a grid to each visitor: tier-on, tier-off, add-on, trim, same-title.
 
     First the tier-on cells (_walk_cells: the primary cell and cap first, so
     the primary scenario's chunk is always chunk 0, one cell alive at a
@@ -7617,7 +7850,11 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
     choice alone: ONE WARNING (with the traceback), the grid returned without
     the family, and every add-taker's add-on state dropped (`reset_add(grid)`,
     on the visitors that define it), so every other choice keeps the chunks
-    and grids it built. Last, when some visitor shows it (one with a
+    and grids it built. Then the Trim to Kelly family (source.trim_cell) is
+    walked the same way for the visitors with a `trim` method
+    (_walk_trim_cells), after the add-on cells, so dropping either family's
+    chunks never cuts into the other's; a cell that raises costs that choice
+    alone (`reset_trim(grid)`). Last, when some visitor shows it (one with a
     same_title method), the band- and k-independent same-title population is
     read once
     (_same_title_points: source.same_title — a size-cap sweep simulates it
@@ -7633,10 +7870,12 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             same_title({cap: SweepPoint}) method, an off(band index,
             k index, cap index, {population: SweepPoint}) method taking the
             tier-floors-off cells, with a reset_off(grid) method dropping
-            what off() built, and an add(band index, k index, cap index,
+            what off() built, an add(band index, k index, cap index,
             {population: SweepPoint}, off=bool) method taking the Add to held
             pairs cells, with a reset_add(grid) method dropping what add()
-            built.
+            built, and a trim(band index, k index, cap index, {population:
+            SweepPoint}, add=bool, off=bool) method taking the Trim to Kelly
+            cells, with a reset_trim(grid) method dropping what trim() built.
         axis_end (pd.Timestamp | None): The page's last date.
 
     Returns:
@@ -7644,8 +7883,8 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             an off cell with no fallback to recover it) raised, which stops
             the walk, else None; and the grid walked — the source, its
             off_fallback when the tier-off size-cap sweep could not be read,
-            and without the Add to held pairs family when it could not be
-            simulated.
+            and without the Add to held pairs family, or the Trim to Kelly
+            family, when it could not be simulated.
     """
     error = _walk_cells(source, visitors, axis_end)
     if error is not None:
@@ -7680,6 +7919,19 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
                 reset_add = getattr(visit, "reset_add", None)
                 if reset_add is not None:
                     reset_add(source)
+    trim_takers = [visit for visit in visitors if hasattr(visit, "trim")]
+    if source.trim_cell is not None and trim_takers:
+        error = _walk_trim_cells(source, trim_takers, axis_end)
+        if error is not None:
+            # Costs the Trim to Kelly view alone, as an add-on failure costs its own
+            logging.warning("A Trim to Kelly simulation failed; the filter bar's Trim to "
+                            "Kelly select stays disabled", exc_info=error)
+            source = dataclasses.replace(source, trim_cell=None, trim_off_cell=None,
+                                         trim_sweeps={})
+            for visit in trim_takers:
+                reset_trim = getattr(visit, "reset_trim", None)
+                if reset_trim is not None:
+                    reset_trim(source)
     takers = [visit for visit in visitors if hasattr(visit, "same_title")]
     if takers:
         # Never raises: a failure falls back to the run's own point
@@ -7736,6 +7988,8 @@ def _walk_grid(source: _GridSource, visitors: list,
                     "run's own cap only", exc_info=error)
     if source.add_cell is not None:
         _warn_add_on_lost_with_the_cap_sweep()
+    if source.trim_cell is not None:
+        _warn_trim_lost_with_the_cap_sweep()
     fallback = source.fallback()
     for visitor in visitors:
         visitor.reset(fallback)
@@ -8560,6 +8814,14 @@ class _ChunkVisitor:
     reset_add() drops every chunk and row head packed for the add-on cells
     and both add-on grids, leaving everything else as it was.
 
+    A Trim to Kelly cell the walk hands to `trim` is packed the same way and
+    filed in grids_trim under (adding to held pairs, tier floors off); a
+    cell in which nothing was trimmed traded the list of the same scenario
+    without trimming, so it shares that scenario's chunk. trim_grid() and
+    trim_off_grid() read the grids as add_grid() and add_off_grid() read
+    the add-on ones, and reset_trim() drops what the trim cells packed,
+    leaving everything else as it was.
+
     A failure while building a chunk is caught here: one WARNING, and the
     visitor marks itself failed and drops what it built — the page is then
     written without the bar, as when the filter's data cannot be built.
@@ -8580,6 +8842,10 @@ class _ChunkVisitor:
         grid_add_off (list | None): The same for the add-on cells of the
             bands the tiers bind at with the tier floors off (other rows stay
             None until add_off_grid() aliases them); None without both views.
+        grids_trim (dict): (adding to held pairs, tier floors off) ->
+            [band][k][cap] -> chunk id or None, for the Trim to Kelly cells;
+            empty when the grid has no trim view, and without the tier-off
+            keys when it has no tier-off half.
         primary_views (dict | None): The primary chunk's view key -> {"n"},
             for the bar's option counts.
         risk_free (RiskFreeRates | None): The rates every view's Sharpe and
@@ -8652,13 +8918,22 @@ class _ChunkVisitor:
         self.grid_add_off = (None if source.add_off_cell is None else
                              [[[None] * len(source.caps) for _ in source.ks]
                               for _ in source.bands])
+        # The Trim to Kelly grids, by (adding to held pairs, tier floors off):
+        # none without the view, and no tier-off ones without that half
+        self.grids_trim: dict[tuple[bool, bool], list] = (
+            {} if source.trim_cell is None else
+            {(add, off): [[[None] * len(source.caps) for _ in source.ks]
+                          for _ in source.bands]
+             for add in (False, True) for off in (False, True)
+             if not off or source.trim_off_cell is not None})
         self.primary_views: dict | None = None
         self.failed = False
         # (phase, band, k) of the cell whose list keys are memoised: a cell's
         # caps at or above its sharing floor share one trade list, so its key is
         # computed once. The phase ("on", "off", "add" or "add_off") is part
         # of it: another phase's lists are new objects, whose ids may reuse
-        # those of the cell walked last
+        # those of the cell walked last. The Trim to Kelly cells' phases are
+        # "trim", "trim_off", "trim_add" and "trim_add_off"
         self._cell: tuple[str, int, int] | None = None
         self._keys: dict[tuple[int, float | None], str] = {}
         # (chunks, row heads) held when the first off cell was packed, so
@@ -8666,6 +8941,8 @@ class _ChunkVisitor:
         self._off_mark: tuple[int, int] | None = None
         # The same for the first Add to held pairs cell, for reset_add
         self._add_mark: tuple[int, int] | None = None
+        # ... and for the first Trim to Kelly cell, for reset_trim
+        self._trim_mark: tuple[int, int] | None = None
 
     def reset_off(self, source: _GridSource) -> None:
         """
@@ -8704,8 +8981,10 @@ class _ChunkVisitor:
             listed (list): The trade list.
             phase (str): Keyword-only. Which kind of cell it is: "on" (a
                 tier-on cell), "off" (tier floors off), "add" (adding to
-                held pairs) or "add_off" (both); each is a separate memo from
-                the others' cell of the same band and k. "on" (default).
+                held pairs), "add_off" (both), or one of the four Trim to
+                Kelly kinds ("trim", "trim_off", "trim_add", "trim_add_off");
+                each is a separate memo from the others' cell of the same
+                band and k. "on" (default).
 
         Returns:
             str: _list_key(k, listed).
@@ -8876,6 +9155,107 @@ class _ChunkVisitor:
         return [[list(row) for row in
                  ((self.grid_add_off[bi] if self.grid_add_off is not None else blank)
                   if binds else self.grid_add[bi])]
+                for bi, binds in enumerate(self.source.tier_binds)]
+
+    def trim(self, bi: int, ki: int, ci: int, pops: dict, *, add: bool = False,
+             off: bool = False) -> None:
+        """
+        Build (or share) the chunk of one Trim to Kelly scenario's "all" point.
+
+        Its own run, priced at the cell's k (never the page's trades); it
+        shares a chunk with any scenario that traded an equal list at an
+        equal k, so a cell in which nothing was trimmed costs one grid entry.
+
+        Args:
+            bi (int): Band index.
+            ki (int): k index.
+            ci (int): Cap index.
+            pops (dict): Population -> SweepPoint; a scenario with no "all"
+                point stays a null cell of its grid.
+            add (bool): Keyword-only. Whether the run also adds to held
+                pairs. False (default).
+            off (bool): Keyword-only. Whether the cell is a binding band's
+                with the tier floors off. False (default).
+        """
+        point = pops.get(_ALL_VIEW)
+        grid = self.grids_trim.get((add, off))
+        if point is None or self.failed or grid is None:
+            return
+        if self._trim_mark is None:
+            self._trim_mark = (len(self.chunks), len(self.heads.items))
+        try:
+            phase = "trim" + ("_add" if add else "") + ("_off" if off else "")
+            grid[bi][ki][ci] = self._chunk(bi, ki, self.source.ks[ki], point.trades,
+                                           point.equity_df, False, phase=phase)
+        except Exception:
+            self._fail()
+
+    def reset_trim(self, source: _GridSource) -> None:
+        """
+        Drop every Trim to Kelly chunk and grid.
+
+        Every chunk and row head packed since the first Trim to Kelly cell is
+        dropped (with its dedup key); those cells are walked after every
+        other kind, so the chunks before that mark and every other grid are
+        kept, as are the labels.
+
+        Args:
+            source (_GridSource): The grid walked from here on (without the
+                family).
+        """
+        self.source = source
+        if self._trim_mark is not None and not self.failed:
+            n_chunks, n_heads = self._trim_mark
+            del self.chunks[n_chunks:]
+            self.seen = {key: cid for key, cid in self.seen.items() if cid < n_chunks}
+            self.heads.truncate(n_heads)
+        self._trim_mark = None
+        self.grids_trim = {}
+        self._cell, self._keys = None, {}
+
+    def trim_grid(self, add: bool = False) -> list | None:
+        """
+        The Trim to Kelly grid with the tier floors on, adding to held pairs or not.
+
+        Args:
+            add (bool): Whether the runs also add to held pairs. False (default).
+
+        Returns:
+            list | None: [band][k][cap] -> chunk id or None; None when the
+                grid has no such view, none of its cells were simulated (an
+                all-empty grid is never shown as a view) or a chunk failed.
+        """
+        grid = self.grids_trim.get((add, False))
+        if grid is None or self.failed:
+            return None
+        if all(cid is None for band in grid for row in band for cid in row):
+            return None
+        return grid
+
+    def trim_off_grid(self, add: bool = False) -> list | None:
+        """
+        The Trim to Kelly grid with the tier floors off, adding to held pairs or not.
+
+        A binding band's row is its own tier-floors-off chunks (None where
+        the family has no point, or when the grid has no tier-off half),
+        every other band's its tier-on row — its off view IS its run, as
+        off_grid() has it.
+
+        Args:
+            add (bool): Whether the runs also add to held pairs. False (default).
+
+        Returns:
+            list | None: [band][k][cap] -> chunk id or None; None without the
+                tier-on view of the same setting or without a tier-floors-off
+                view to pair it with.
+        """
+        on = self.trim_grid(add)
+        if on is None or self.source.tier_binds is None:
+            return None
+        own = self.grids_trim.get((add, True))
+        blank = [[None] * len(self.source.caps) for _ in self.source.ks]
+        return [[list(row) for row in ((own[bi] if own is not None else blank)
+                                       if binds else on[bi])]
                 for bi, binds in enumerate(self.source.tier_binds)]
 
     def _chunk(self, bi: int, ki: int, k: float | None, listed: list,
@@ -10218,6 +10598,7 @@ def _filter_payload(
     sell: _SellGrid | None = None,
     sell_state: str = "not simulated",
     sidecar_dir: str | None = None,
+    trim_state: str = "not simulated",
 ) -> dict:
     """
     Build the base data block the page's filter bar and script read on load.
@@ -10292,6 +10673,10 @@ def _filter_payload(
             relative to the page ("backtest_dashboard_files/<build id>"), which
             the script loads every chunk at or past "inline_chunks" from; None
             (default) for a page with no sidecar chunk.
+        trim_state (str): Keyword-only. Why the page has no Trim to Kelly
+            view when it has none, worded as add_on_state is ("not simulated"
+            or "unavailable"); ignored when it has one. "not simulated"
+            (default).
 
     Returns:
         dict: "dates" (the shared axis, ISO dates), "bands" ([{label,
@@ -10333,7 +10718,13 @@ def _filter_payload(
             and per minimum of days, [] without the view), "sell_state"
             ("shown", else sell_state), "inline_chunks" (how many chunks the
             page holds itself: every id from there on is a sidecar file) and
-            "sidecar_dir" (above).
+            "sidecar_dir" (above), and the Trim to Kelly view's: "grid_trim"
+            (null, or [band][k][cap] -> chunk id or null: the scenario with
+            held pairs trimmed to their Kelly size, chunks.trim_grid()),
+            "grid_trim_off" (the same with the tier floors off, only with
+            both views), "grid_trim_add" and "grid_trim_add_off" (the same
+            two with adding to held pairs on, only on a page that also has
+            the add-on view) and "trim_state" ("shown", else trim_state).
     """
     axis = chunks.axis
     pb, pk, pc = source.primary
@@ -10351,6 +10742,11 @@ def _filter_payload(
     grid_add = chunks.add_grid() if source.add_cell is not None else None
     add_view = grid_add is not None
     sell_view = sell is not None and sell.index is not None
+    # The Trim to Kelly view, likewise only from a grid walked with its family;
+    # its adding-on half only on a page that also shows adding on
+    grid_trim = chunks.trim_grid() if source.trim_cell is not None else None
+    trim_view = grid_trim is not None
+    grid_trim_add = chunks.trim_grid(True) if (trim_view and add_view) else None
     return {
         "dates": [d.date().isoformat() for d in axis],
         "bands": [{"label": _band_option(band),
@@ -10389,7 +10785,9 @@ def _filter_payload(
                  + ("" if not add_view else
                     " " + (_ADD_ON_REACH if explorer else _ADD_ON_REACH_NO_EXPLORER))
                  + ("" if not sell_view else
-                    " " + (_SELL_REACH if explorer else _SELL_REACH_NO_EXPLORER))},
+                    " " + (_SELL_REACH if explorer else _SELL_REACH_NO_EXPLORER))
+                 + ("" if not trim_view else
+                    " " + (_TRIM_REACH if explorer else _TRIM_REACH_NO_EXPLORER))},
         "styles": {"types": {label: {"color": color, "width": _TYPE_LINE_WIDTH,
                                      "dash": _TYPE_LINE_DASH}
                              for label, color in _TRADE_TYPE_LINES},
@@ -10439,6 +10837,15 @@ def _filter_payload(
         "sell_levels": sell.levels if sell_view else [],
         "sell_days": sell.days if sell_view else [],
         "sell_state": "shown" if sell_view else sell_state,
+        # The Trim to Kelly view: its grid, the one with adding to held
+        # pairs on, their tier-floors-off twins (each null without its
+        # view), and why a page has none
+        "grid_trim": grid_trim,
+        "grid_trim_off": chunks.trim_off_grid() if (trim_view and off_view) else None,
+        "grid_trim_add": grid_trim_add,
+        "grid_trim_add_off": (chunks.trim_off_grid(True)
+                              if (grid_trim_add is not None and off_view) else None),
+        "trim_state": "shown" if trim_view else trim_state,
         # Every chunk id from here on is a sidecar file in sidecar_dir
         "inline_chunks": len(chunks.chunks),
         "sidecar_dir": sidecar_dir,
@@ -12235,7 +12642,10 @@ def generate_dashboard(
                 sell_state=("unavailable" if getattr(sweep, "sell_sweep", None) is not None
                             else "not simulated"),
                 sidecar_dir=(None if build_folder is None
-                             else f"{DASHBOARD_FILES_DIRNAME}/{build_folder.name}"))
+                             else f"{DASHBOARD_FILES_DIRNAME}/{build_folder.name}"),
+                # The same for the Trim to Kelly select
+                trim_state=("unavailable" if getattr(sweep, "trim_sweep", None) is not None
+                            else "not simulated"))
             filter_bar = _filter_bar_html(filter_data, chunker.primary_views or {})
             base_block = _packed_json_script("dash-data", filter_data)
             chunks = chunker.chunks
