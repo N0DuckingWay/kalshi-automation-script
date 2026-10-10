@@ -2306,6 +2306,7 @@ class TestTimeSeriesKellyParity:
             assert len([f for f in found if f[0] == name]) == len(every_call), name
             assert mids_in_defs == len(every_mid), name
         assert sorted(found) == [("backtester", "_simulate_at_discount"),
+                                 ("config", "held_pair_win_prob"),
                                  ("dashboard", "_kelly_fraction"),
                                  ("strategy", "_kelly_p_at")]
         # Every mid spread is worked out from the earlier market's YES ask and
@@ -2316,6 +2317,8 @@ class TestTimeSeriesKellyParity:
             ("scanner", "_enrich_pair"): [["yes_ask_a", "no_ask_a", "ref_yes",
                                            "no_levels[0][0]"]],
             ("backtester", "_candidate_pair"): [["c['pA']", "c['nA']", "c['pB']", "c['nB']"]],
+            ("config", "held_pair_win_prob"): [["yes_ask_a", "no_ask_a", "yes_ask_b",
+                                                 "no_ask_b"]],
             ("backtester", "_simulate_at_discount"): [["pA", "nA", "pB", "nB"]],
             ("backtester", "_interval_calibration"): [["entry['pA']", "entry['nA']",
                                                         "entry['pB']", "entry['nB']"]],
