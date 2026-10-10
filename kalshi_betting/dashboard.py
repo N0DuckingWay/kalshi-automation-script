@@ -32,8 +32,8 @@ Purpose:
     is written to PROJECT_ROOT and can be opened directly in any browser.
 
     A sticky filter bar at the top of the page — Spread band, Tier floors, k,
-    Size cap, Add to held pairs, Sell, Min. days to maturity, Category,
-    Tag — re-scopes every
+    Size cap, Add to held pairs, Trim to Kelly, Sell, Min. days to maturity,
+    Category, Tag — re-scopes every
     trade-derived section (performance, decomposition, calibration,
     diagnostics, risk, the benchmark's strategy row) to the run at another
     spread band, with the deadline-gap tier floors on (the run as simulated)

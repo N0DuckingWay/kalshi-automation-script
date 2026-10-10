@@ -36,9 +36,9 @@ Notes:
     LIVE_RUNS_DIR, which the server reads at call time, so tests redirect it.
     The sell rule's tests (take_profit_reached, reached_every_check,
     days_to_maturity) live here, where seller.py may import them, so live
-    selling and the backtest apply the same arithmetic. So does the rule that
-    trims a held pair to its Kelly size (held_pair_win_prob,
-    kelly_hold_fraction, kelly_trim_count), which the backtest reads.
+    selling and the backtest apply the same arithmetic. The rule that trims
+    a held pair to its Kelly size (held_pair_win_prob, kelly_hold_fraction,
+    kelly_trim_count) lives here too; only the backtest calls it.
 """
 import fcntl
 import json

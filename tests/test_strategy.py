@@ -3687,7 +3687,7 @@ class TestTimeSeriesKellyParity:
         # the pair pays, the count to sell and the pair's cap from the
         # functions live code can import (config.held_pair_win_prob,
         # kelly_trim_count, pair_size_cap), and the walk records a part sale
-        # through _split_trade and _sold_copy, never a second BacktestTrade(
+        # through _split_trade and _sold_copy
         trim_callers = {func.name for func in ast.walk(tree)
                         if isinstance(func, ast.FunctionDef)
                         and any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
@@ -3718,6 +3718,20 @@ class TestTimeSeriesKellyParity:
         for shared in ("held_pair_win_prob", "kelly_trim_count", "pair_size_cap", "_fresh_bids",
                        "_exact_pair", "_last_bought_first", "fee_per_pair_approx"):
             assert _function_calls(backtester, "_kelly_trim", shared), shared
+        # The four quotes go in as the forecast reads them: each market's YES
+        # ask, then its NO ask, an ask being 1 minus the other side's bid.
+        # Swapping two of them can keep the mid spread and still misread a
+        # crossed book, so the order is pinned as written
+        trim_rule = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                         and node.name == "_kelly_trim")
+        [forecast] = _calls_to(trim_rule, "held_pair_win_prob")
+        assert [ast.unparse(arg) for arg in forecast.args] == [
+            "first.pair_type", "1.0 - no_bid_a", "1.0 - yes_bid_a", "1.0 - no_bid_b",
+            "1.0 - yes_bid_b", "k"] and not forecast.keywords
+        unpacked = [node for node in ast.walk(trim_rule) if isinstance(node, ast.Assign)
+                    and ast.unparse(node.value) == "bids"]
+        assert [ast.unparse(node.targets[0]) for node in unpacked] == [
+            "(yes_bid_a, no_bid_a, yes_bid_b, no_bid_b)"]
         for helper in ("_split_trade", "_sold_copy", "_sale_stream"):
             assert _function_calls(backtester, "_simulate_at_discount", helper), helper
         assert _function_calls(backtester, "_split_trade", "_settlement_receipt")

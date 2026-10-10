@@ -2653,9 +2653,9 @@ class CapSweep:
             else:
                 # size_cap explicit (see _sim_options: a cap equal to
                 # BUDGET_FRACTION must still name itself); quiet, the pinned
-                # end date, this sweep's tier setting and its add-on setting
-                # through _sim_options, so a tier-on sweep that never adds
-                # forwards neither
+                # end date and this sweep's own settings (tier floors,
+                # adding, selling, trimming) through _sim_options, which
+                # forwards only the ones that differ from the defaults
                 point = _simulate_at_discount(
                     subset, self.start_date, self.initial_balance, k=k, spread_band=band,
                     population=population, size_cap=cap,
@@ -4447,8 +4447,8 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
     if not decision.sell:
         return decision, None
     if decision.sell not in sales:
-        # A safeguard: the rule only returns a count it priced, so this
-        # prices one it did not
+        # The rule returns only a count it priced; should it ever return
+        # another, price it here
         net_sale(decision.sell)
     return decision, sales.get(decision.sell)
 
