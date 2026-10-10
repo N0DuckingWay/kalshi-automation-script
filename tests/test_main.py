@@ -803,6 +803,97 @@ class TestLiveSettingsFlags:
         for word in words:
             assert word in err, (word, err)
 
+    _SAVED_TAG_REMEDY = (" — the saved defaults tie a tag to a category this run does not "
+                         "list: add --any-tag, or give this run's tags with --tag")
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("argv, flags", [
+        (["--category", "Economics"], "--category"),
+        (["--any-category"], "--any-category"),
+        # One of two saved tied tags still has its category: the other does not
+        (["--category", "Sports"], "--category"),
+        # Another flag beside it changes nothing
+        (["--category", "Economics", "--interval-discount", "0.6"],
+         "--interval-discount, --category"),
+    ])
+    def test_a_categories_flag_that_drops_a_saved_tied_category_names_the_remedy(
+        self, monkeypatch, capsys, mode, argv, flags,
+    ):
+        _save_live_defaults(categories=("Sports", "Politics"),
+                            tags=("Sports · Basketball", "politics · Fed"))
+        seen = _main_with(monkeypatch, ["--mode", mode, *argv])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        # argparse wraps nothing here, but compare words, not line breaks
+        err = " ".join(capsys.readouterr().err.split())
+        # The settings' own message, then the remedy, last
+        assert f"invalid live setting for this run ({flags}): tags: " in err, err
+        assert "which categories does not list" in err, err
+        assert err.endswith(self._SAVED_TAG_REMEDY.strip()), err
+
+    @pytest.mark.parametrize("argv, tags", [
+        (["--category", "Economics", "--any-tag"], None),
+        (["--any-category", "--any-tag"], None),
+        (["--category", "Economics", "--tag", "Fed"], ("Fed",)),
+        (["--category", "Economics", "--tag", "Economics · Fed"], ("Economics · Fed",)),
+    ])
+    def test_either_remedy_lets_the_run_start(self, monkeypatch, argv, tags):
+        _save_live_defaults(categories=("Sports",), tags=("Sports · Basketball",))
+        seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
+        assert seen["code"] == EXIT_OK
+        assert seen["settings"].tags == tags
+        assert seen["reference"].tags == ("Sports · Basketball",)
+
+    @pytest.mark.parametrize("argv, saved", [
+        # This run's own tag is the one refused: a --tag flag was given
+        (["--category", "Economics", "--tag", "Sports · Basketball"],
+         {"categories": ("Sports",), "tags": ("Sports · Basketball",)}),
+        (["--category", "Sports", "--tag", "Economics · Fed"], {}),
+        (["--tag", "Sports · Basketball"], {}),
+        # The saved tied tag keeps its category (in another letter case): the
+        # error is another field's
+        (["--category", "SPORTS", "--category", "Economics", "--spread-max", "0"],
+         {"categories": ("Sports",), "tags": ("Sports · Basketball",)}),
+        # No categories flag at all
+        (["--spread-max", "0"], {"categories": ("Sports",), "tags": ("Sports · Basketball",)}),
+        # A saved plain tag is tied to no category
+        (["--category", "Economics", "--spread-max", "0"],
+         {"categories": ("Sports",), "tags": ("Basketball",)}),
+        # The category flag is itself the mistake, and no tag is saved
+        (["--category", "Sports", "--category", "Sports · Basketball"], {}),
+    ])
+    def test_the_remedy_is_named_only_for_a_saved_tied_tag(
+        self, monkeypatch, capsys, argv, saved,
+    ):
+        if saved:
+            _save_live_defaults(**saved)
+        seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
+        assert seen["code"] == 2
+        err = capsys.readouterr().err
+        assert "invalid live setting for this run" in err, err
+        assert "the saved defaults tie a tag" not in err, err
+        assert "give this run's tags with --tag" not in err, err
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("argv", [
+        # With --any-tag this listed all of Sports while reading as if narrowed
+        ["--category", "Sports", "--category", "Sports · Basketball", "--any-tag"],
+        ["--category", "Sports · Basketball"],
+        ["--category", "Sports", "--category", "Sports · Basketball",
+         "--tag", "Sports · Basketball"],
+    ])
+    def test_a_category_written_as_a_tied_tag_is_a_usage_error(
+        self, monkeypatch, capsys, mode, argv,
+    ):
+        seen = _main_with(monkeypatch, ["--mode", mode, *argv])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = capsys.readouterr().err
+        assert ("categories: 'Sports · Basketball' is a tag tied to a category; "
+                "give it as a tag") in err, err
+        assert "--category" in err, err
+
     def test_a_saved_tied_tag_survives_a_flag_that_keeps_its_category(self, monkeypatch):
         saved = _save_live_defaults(categories=("Sports",), tags=("Sports · Basketball",))
         # No filter flag: the saved filter itself
@@ -815,6 +906,20 @@ class TestLiveSettingsFlags:
         # --any-tag beside --any-category clears both
         seen = _main_with(monkeypatch, ["--mode", "prod", "--any-category", "--any-tag"])
         assert seen["settings"].categories is None and seen["settings"].tags is None
+
+    def test_a_tag_flag_replaces_every_saved_tag(self, monkeypatch):
+        # One --tag is this run's whole tag list: the saved tag that narrowed
+        # Sports is gone, so Sports trades in full this run
+        _save_live_defaults(categories=("Sports", "Economics"), tags=("Sports · Basketball",))
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--tag", "Economics · Fed"])
+        assert seen["settings"].categories == ("Sports", "Economics")
+        assert seen["settings"].tags == ("Economics · Fed",)
+        keeps = config.trade_filter(seen["settings"])
+        assert keeps("Sports", "Soccer") and keeps("Sports", "Basketball")
+        assert keeps("Economics", "Fed") and not keeps("Economics", "Oil")
+        # ... and the run marks the field against the saved one
+        line = describe_live_settings(seen["settings"], seen["reference"])
+        assert "tags Economics · Fed (default: Sports · Basketball)" in line
 
     def test_two_cap_flags_share_one_unit_note(self, monkeypatch, capsys):
         seen = _main_with(monkeypatch, ["--mode", "prod", "--size-cap", "37",
@@ -840,6 +945,12 @@ class TestLiveSettingsFlags:
         # Every value flag defaults to the saved live defaults, never a config.py constant
         assert out.count("default: the saved live defaults") == 11
         assert out.count("whatever the saved live defaults say") == 4
+        # --category and --tag each replace the whole saved list, and say so
+        assert "Replaces every saved category for this run" in out
+        assert "Replaces every saved tag for this run" in out
+        # ... and both categories flags name what a saved tied tag then needs
+        assert out.count("the run exits 2 until") == 2
+        assert "under every category this run lists (its" in out
         assert "config.TIME_SERIES" not in out and "config.TRADE" not in out
         assert "config.BUDGET_FRACTION" not in out and "config.SAME_TITLE" not in out
         assert ("Override one live default for THIS run only, in either mode "
@@ -1494,7 +1605,9 @@ class TestCategoryFilter:
             assert sorted(self._tickers(kept)) == sorted(expected), category
 
     def test_a_tag_is_matched_under_every_category_and_in_any_case(self):
-        # Dashboard Tag options are category-scoped and case-exact; the filter's are not
+        # A plain tag is matched under every listed category, where a dashboard
+        # Tag option belongs to one category; and every tag, plain or tied, is
+        # matched in any letter case, where the options are case-exact
         listing = {"KXCLUBWC": ["Sports", ["Soccer"]], "KXHKANE": ["Economics", ["Soccer"]],
                    "KXANIMEB": ["Entertainment", ["Anime Awards"]],
                    "ANIMEB": ["Entertainment", ["Anime awards"]]}
@@ -1515,6 +1628,10 @@ class TestCategoryFilter:
         for spelling in ("Anime Awards", "Anime awards"):
             assert self._tickers(_filtered(pairs, categories=("Entertainment",),
                                            tags=(spelling,))) == ["KXANIMEB-1", "ANIMEB-1"]
+            # ... tied to its category too
+            assert self._tickers(_filtered(
+                pairs, categories=("Entertainment",),
+                tags=(f"entertainment · {spelling}",))) == ["KXANIMEB-1", "ANIMEB-1"]
 
     def test_dashboard_and_live_filter_share_one_filing_rule(self):
         assert dashboard._series_labels is historical.series_labels

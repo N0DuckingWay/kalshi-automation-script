@@ -1431,11 +1431,60 @@ class TestTradeFilter:
             _settings(categories=("Sports",), tags=(bad,))
 
     def test_a_dot_inside_a_plain_name_is_not_a_tie(self):
-        # Only a name that starts or ends with the dot is a tie with a blank half
+        # A tie with a blank half is the dot alone, or a name that starts with
+        # the dot and a space or ends with a space and the dot; any other dot
+        # is part of a plain tag's name
         s = _settings(tags=("A·B", "U.S.·ish", "Q·R S"))
         assert s.tags == ("A·B", "U.S.·ish", "Q·R S")
         assert config.trade_filter(s)("Sports", "a·b")
         assert not config.trade_filter(s)("Sports", "a")
+
+    @pytest.mark.parametrize("plain", ["·Basketball", "Sports·", "·Sports·", "··", "a ·b", "a· b"])
+    def test_a_dot_with_no_space_beside_it_at_either_end_is_a_plain_tag(self, plain):
+        # The boundary of the blank-half refusal: these have no category, listed or not
+        for categories in (None, ("Sports",)):
+            s = _settings(categories=categories, tags=(plain,))
+            assert s.tags == (plain,)
+            assert config.split_tag(plain) == (None, plain)
+            keeps = config.trade_filter(s)
+            assert keeps("Sports", plain.upper()) and not keeps("Sports", "Basketball")
+        # ... while one more space makes each a tie with a blank half
+        for bad in ("· Basketball", "Sports ·"):
+            with pytest.raises(ValueError, match="must read 'Category · Tag'"):
+                _settings(categories=("Sports",), tags=(bad,))
+
+    @pytest.mark.parametrize("bad", [
+        "Sports · Basketball", "Sports · ", " · Basketball", "Sports ·", "· Basketball",
+        " · ", "·", "A · B · C", "Sports  ·  Basketball",
+    ])
+    def test_a_category_written_as_a_tied_tag_is_refused(self, bad):
+        # With tags or without: listing it would read as "Sports narrowed to
+        # Basketball" while all of Sports traded
+        message = (rf"categories: {re.escape(repr(bad.strip()))} is a tag tied to a "
+                   r"category; give it as a tag")
+        for tags in (None, ("Basketball",), ("Sports · Basketball",)):
+            with pytest.raises(ValueError, match=message):
+                _settings(categories=("Sports", bad), tags=tags)
+            with pytest.raises(ValueError, match=message):
+                _settings(categories=(bad,), tags=tags)
+        # ... and when a field is replaced, as main.py lays --category over saved defaults
+        with pytest.raises(ValueError, match=message):
+            dataclasses.replace(_settings(categories=("Sports",)), categories=("Sports", bad))
+
+    @pytest.mark.parametrize("name", ["A·B", "·Sports", "Sports·", "U.S. - Politics", "Oil & Gas"])
+    def test_a_category_may_hold_a_dot_that_ties_nothing(self, name):
+        s = _settings(categories=(name,))
+        assert s.categories == (name,)
+        assert config.trade_filter(s)(name.upper(), "anything")
+
+    def test_a_saved_file_with_a_category_written_as_a_tied_tag_is_refused(self):
+        # A file edited by hand, with no tags at all
+        record = _with_toggles(categories=["Sports", "Sports · Basketball"], tags=None)
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(record))
+        for read in (config.read_saved_live_defaults, config.live_defaults):
+            with pytest.raises(config.LiveDefaultsError,
+                               match="'Sports · Basketball' is a tag tied to a category"):
+                read()
 
     def test_a_save_round_trips_tied_tags(self):
         settings = _settings(categories=("Economics", "Sports"),

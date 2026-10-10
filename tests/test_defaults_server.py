@@ -1378,7 +1378,7 @@ class TestConfirmRefusals:
 
     def test_the_refusal_names_the_rule(self):
         body = _get(_app(), "/confirm?" + _query(tag="Basketball")).body
-        assert "a tag needs its category" in body
+        assert "a tag needs a category" in body
 
     def test_the_seed_note_labels_the_seed_values_only(self):
         # The seed's values under its note are shown ...
@@ -1494,12 +1494,16 @@ class TestSeveralCategoriesAndTags:
         assert settings.categories is None and settings.tags is None
 
     @pytest.mark.parametrize("query, why", [
-        # The same name twice, in any letter case
-        (_filter_query(("Sports", "Economics", "sports")), "category &#x27;sports&#x27; "
+        # The very same name twice (another letter case is left out instead:
+        # test_a_second_spelling_in_another_letter_case_is_left_out)
+        (_filter_query(("Sports", "Economics", "Sports")), "category &#x27;Sports&#x27; "
                                                            "is given twice"),
-        (_filter_query(("Sports",), ("Basketball", "Soccer", "BASKETBALL")),
-         "tag &#x27;BASKETBALL&#x27; is given twice"),
-        (_filter_query(("Sports",), ("Sports · Soccer", "sports · soccer")), "is given twice"),
+        (_filter_query(("Sports",), ("Basketball", "Soccer", "Basketball")),
+         "tag &#x27;Basketball&#x27; is given twice"),
+        (_filter_query(("Sports",), ("Sports · Soccer", "Sports · Soccer")), "is given twice"),
+        # ... even when it repeats a spelling that was itself left out
+        (_filter_query(("Sports", "sports", "sports")), "category &#x27;sports&#x27; "
+                                                        "is given twice"),
         # A blank value among several
         (_filter_query(("Sports",)) + "&category=", "category is blank"),
         (_filter_query(("Sports",), ("Soccer",)) + "&tag=&tag=Basketball", "tag is blank"),
@@ -1514,8 +1518,26 @@ class TestSeveralCategoriesAndTags:
         (_filter_query(("Sports", "Politics"), ("Sports · Soccer", "Economics · Fed")),
          "which categories does not list"),
         # Tags, tied or plain, with no category at all
-        (_filter_query((), ("Sports · Basketball",)), "a tag needs its category"),
-        (_filter_query((), ("Basketball", "Soccer")), "a tag needs its category"),
+        (_filter_query((), ("Sports · Basketball",)), "a tag needs a category"),
+        (_filter_query((), ("Basketball", "Soccer")), "a tag needs a category"),
+        # A category written as a tied tag, with tags or without: it would read
+        # as "Sports narrowed to Basketball" while all of Sports traded
+        (_filter_query(("Sports", "Sports · Basketball")),
+         "categories: &#x27;Sports · Basketball&#x27; is a tag tied to a category; "
+         "give it as a tag"),
+        (_filter_query(("Sports", "Sports · Basketball"), ("Sports · Basketball",)),
+         "is a tag tied to a category; give it as a tag"),
+        (_filter_query(("Sports ·",)), "is a tag tied to a category; give it as a tag"),
+        # Two spaces in a row, which a browser would show as one: the name
+        # would look like another category's, or like a tag tied to it
+        (_filter_query(("Climate and Weather", "Climate  and Weather"),
+                       ("Climate  and Weather · Hurricanes",)),
+         "category must not hold two spaces in a row, got &#x27;Climate  and Weather&#x27;"),
+        (_filter_query(("Climate and Weather",), ("Climate  and Weather · Hurricanes",)),
+         "tag must not hold two spaces in a row"),
+        (_filter_query(("Sports",), ("Sports ·  Basketball",)),
+         "tag must not hold two spaces in a row"),
+        (_filter_query(("Sports",), ("Pro  Football",)), "tag must not hold two spaces in a row"),
         # A tied tag with a blank half is never read as a plain tag
         (_filter_query(("Sports",), ("Sports · ",)), "tag must be one printable name"),
         (_filter_query(("Sports",), (" · Basketball",)), "tag must be one printable name"),
@@ -1535,6 +1557,83 @@ class TestSeveralCategoriesAndTags:
         assert why in response.body, response.body
         assert "<form" not in response.body and "<button" not in response.body
         assert config.read_saved_live_defaults() is None
+
+    def test_a_second_spelling_in_another_letter_case_is_left_out(self):
+        # Kalshi spells a few tags two ways under one category, and a page that
+        # lists both may send both: the live filter ignores letter case, so the
+        # first spelling is kept and the link is not refused
+        query = _filter_query(("Health", "Sports", "health"),
+                              ("Health · COVID", "Health · Covid", "Basketball", "BASKETBALL"))
+        settings, _ = defaults_server._proposal(defaults_server._params(query), None)
+        assert settings.categories == ("Health", "Sports")
+        assert settings.tags == ("Health · COVID", "Basketball")
+        app = _app()
+        response = _get(app, f"/confirm?{query}")
+        assert response.status == 200
+        page = _parse(response.body)
+        assert page.cells["categories"][:3] == ["categories", "—", "Health, Sports"]
+        assert page.cells["tags"][:3] == ["tags", "—", "Health · COVID, Basketball"]
+        # The filter keeps either spelling's pairs
+        keeps = config.trade_filter(settings)
+        assert keeps("Health", "Covid") and keeps("Health", "COVID")
+        assert keeps("Sports", "Basketball") and not keeps("Health", "Flu")
+        # Saving the page's own form writes each name once
+        assert _post(app, _click(page, "confirm")).status == 303
+        saved = config.read_saved_live_defaults()
+        assert (saved.categories, saved.tags) == (settings.categories, settings.tags)
+
+    def test_the_cap_counts_the_names_sent(self):
+        # 41 spellings of one name are over the cap, though one would be kept
+        spellings = [f"{'s' * i}{'S' * (_MOST + 1 - i)}" for i in range(_MOST + 1)]
+        assert len({s.casefold() for s in spellings}) == 1 and len(set(spellings)) == _MOST + 1
+        response = _get(_app(), "/confirm?" + _filter_query(spellings))
+        assert response.status == 400
+        assert f"category is given {_MOST + 1} times, more than {_MOST}" in response.body
+        # ... while 40 of them are one category
+        settings, _ = defaults_server._proposal(defaults_server._params(
+            _filter_query(spellings[:_MOST])), None)
+        assert settings.categories == (spellings[0],)
+
+    @pytest.mark.parametrize("button_id", ["confirm", "confirm-trade", "confirm-dry-run"])
+    def test_a_form_with_several_names_posted_twice_does_its_work_once(self, monkeypatch,
+                                                                      button_id):
+        _save(_BASE_SETTINGS)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        saves = []
+        real_save = defaults_server.save_live_defaults
+
+        def counting_save(settings, *, source):
+            """
+            Count each save, then make it.
+
+            Args:
+                settings (LiveSettings): The defaults saved.
+                source (str): Their source note.
+
+            Returns:
+                LiveSettings: What the real save returns.
+            """
+            saves.append(settings)
+            return real_save(settings, source=source)
+
+        monkeypatch.setattr(defaults_server, "save_live_defaults", counting_save)
+        form = _page_form(app, _filter_query(self._CATEGORIES, self._TAGS), button_id)
+        first = _post(app, form)
+        assert first.status == 303
+        # The second POST of the same page is sent to what the first produced
+        second = _post(app, form)
+        assert second.status == 303 and second.location == first.location
+        assert defaults_server._STALE_BANNER not in second.body
+        dry_run = button_id == "confirm-dry-run"
+        assert saves == ([] if dry_run else [self._SETTINGS])
+        assert len(starter.calls) == (0 if button_id == "confirm" else 1)
+        assert config.read_saved_live_defaults() == (
+            _BASE_SETTINGS if dry_run else self._SETTINGS)
+        # ... and the one run, if any, got each name once
+        for argv, _ in starter.calls:
+            assert argv[5:argv.index("--result-file")] == config.live_settings_argv(
+                self._SETTINGS)
 
     def test_the_most_names_a_link_may_carry_fit_one_request(self):
         # 40 categories and 40 tags, each tag tied to its category
@@ -1902,7 +2001,7 @@ class TestSave:
             _get(_app(), "/confirm?" + _query(tag="Basketball"))
         [record] = caplog.records
         assert record.levelno == logging.WARNING
-        assert record.getMessage() == "Refused (400 Bad Request): a tag needs its category"
+        assert record.getMessage() == "Refused (400 Bad Request): a tag needs a category"
 
 
 class TestSavedPage:
@@ -2082,10 +2181,33 @@ class TestHelpers:
         assert defaults_server._name_list(params, "category") == ("Sports", "Economics")
         assert defaults_server._name_list(params, "tag") == ("Sports · Soccer",)
         assert defaults_server._name_list({"category": ["Sports"]}, "tag") is None
+        # Another letter case of an earlier name is left out; the first is kept
+        assert defaults_server._name_list(
+            {"category": ["Sports", "SPORTS", "Economics", "sports"]}, "category") == (
+                "Sports", "Economics")
+        assert defaults_server._name_list(
+            {"tag": ["Health · Covid", "Health · COVID"]}, "tag") == ("Health · Covid",)
+        # The very same name twice is refused, a left-out spelling included
+        with pytest.raises(ValueError, match="category 'Sports' is given twice"):
+            defaults_server._name_list({"category": ["Sports", "Sports"]}, "category")
         with pytest.raises(ValueError, match="category 'SPORTS' is given twice"):
-            defaults_server._name_list({"category": ["Sports", "SPORTS"]}, "category")
+            defaults_server._name_list({"category": ["Sports", "SPORTS", "SPORTS"]}, "category")
         with pytest.raises(ValueError, match="tag must be one printable name"):
             defaults_server._name_list({"tag": ["Soccer", " Fed"]}, "tag")
+        with pytest.raises(ValueError, match="tag must not hold two spaces in a row"):
+            defaults_server._name_list({"tag": ["Soccer", "Pro  Football"]}, "tag")
+
+    def test_a_name_may_hold_single_spaces_only(self):
+        for name in ("Climate and Weather", "Sports · Pro Football", "Oil & Gas", "A"):
+            assert defaults_server._name(name, "category") == name
+        for bad in ("Climate  and Weather", "Sports ·  Basketball", "Sports  · Basketball",
+                    "a   b"):
+            with pytest.raises(ValueError, match="category must not hold two spaces in a row"):
+                defaults_server._name(bad, "category")
+        # A tab or a no-break space is not printable, so it never gets that far
+        for bad in ("a\tb", "a b", "a  b"):
+            with pytest.raises(ValueError, match="category must be one printable name"):
+                defaults_server._name(bad, "category")
 
     def test_a_number_reads_plainly(self):
         assert defaults_server._number("-0", "k") == 0.0

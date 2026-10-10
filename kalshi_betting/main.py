@@ -139,6 +139,7 @@ from .config import (
     SAME_TITLE_MIN_PRICE_DIFF,
     SELL_AT_STEP,
     SIZE_CAP_STEP,
+    TAG_SCOPE_SEPARATOR,
     V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS,
     LiveDefaultsError,
     LiveDefaultsMissing,
@@ -961,7 +962,8 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
         if keeps(category, tag):
             kept.append(pair)
         else:
-            dropped[f"{category} · {tag}"] += 1
+            # The pair's category and tag, written as a filter ties a tag
+            dropped[f"{category}{TAG_SCOPE_SEPARATOR}{tag}"] += 1
     logging.info(
         "Category/tag filter (%s): kept %d of %d candidate pairs%s", wanted,
         len(kept), len(pairs),
@@ -1227,6 +1229,31 @@ _LIVE_FLAGS = (
 _LIVE_PERCENT_FLAGS = frozenset({"size_cap", "same_title_size_cap"})
 
 
+def _saved_tag_loses_its_category(reference: LiveSettings, categories) -> bool:
+    """
+    Say whether a saved tied tag names a category this run's categories leave out.
+
+    The saved defaults may tie a tag to a category ("Sports · Basketball").
+    A run whose --category flags do not list that category (or whose
+    --any-category lists none), and which keeps the saved tags, is refused by
+    LiveSettings; this tells _resolve_live_settings when to name the remedy.
+
+    Args:
+        reference (LiveSettings): The saved live defaults.
+        categories (tuple[str, ...] | None): This run's categories, as its
+            flags gave them (None for --any-category).
+
+    Returns:
+        bool: True when some saved tag is tied to a category not among them,
+            compared without regard to case.
+    """
+    listed = {name.strip().casefold() for name in categories or ()}
+    # Cross-module: split each saved tag as the filter itself splits it
+    # (config.split_tag); a plain tag has no category and never counts
+    return any(category is not None and category.casefold() not in listed
+               for category, _ in map(split_tag, reference.tags or ()))
+
+
 def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     """
     Resolve this run's LiveSettings: the saved live defaults, with each given flag laid over.
@@ -1237,8 +1264,11 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     fallback to config.py's toggle constants. LiveSettings validates the
     result (dataclasses.replace re-runs __post_init__), so a flag meets the
     same rule a saved value does; the result keeps the defaults' origin.
-    Called before logging is configured, so a refusal logs nothing and makes
-    no request.
+    --category and --tag each replace the whole saved list, so a run that
+    changes the categories and keeps saved tags tied to a category it no
+    longer lists is refused, and the message names the remedy (--any-tag, or
+    this run's own --tag). Called before logging is configured, so a refusal
+    logs nothing and makes no request.
 
     Args:
         args (argparse.Namespace): The parsed flags; a missing attribute reads
@@ -1325,6 +1355,11 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
             sell_step = f"{SELL_AT_STEP * 100:g}"
             message += (f" (--sell-at takes a whole percent, a multiple of {sell_step} "
                         f"from {sell_step} to 100, read as that percent / 100)")
+        if ("categories" in overrides and "tags" not in overrides
+                and _saved_tag_loses_its_category(reference, overrides["categories"])):
+            # The tag LiveSettings names is a saved one, which no flag of this run shows
+            message += (" — the saved defaults tie a tag to a category this run does "
+                        "not list: add --any-tag, or give this run's tags with --tag")
         parser.error(message)
 
 
@@ -2151,20 +2186,27 @@ def _build_parser() -> argparse.ArgumentParser:
     categories.add_argument(
         "--category", action="append", default=None, metavar="NAME",
         help="Trade only pairs filed under this Kalshi category, as the backtest "
-             "dashboard's Category select names it (repeatable; case-insensitive; "
-             "default: the saved live defaults)",
+             "dashboard's Category menu names it (repeatable; case-insensitive; "
+             "default: the saved live defaults). Replaces every saved category for "
+             "this run: if the saved defaults tie a tag to a category this run does "
+             "not list, the run exits 2 until --any-tag or this run's own --tag is given",
     )
     categories.add_argument(
         "--any-category", action="store_true", default=None,
-        help="Trade any category this run, whatever the saved live defaults say",
+        help="Trade any category this run, whatever the saved live defaults say (if "
+             "they tie a tag to a category, the run exits 2 until --any-tag or this "
+             "run's own --tag is given)",
     )
     tags = live.add_mutually_exclusive_group()
     tags.add_argument(
         "--tag", action="append", default=None, metavar="NAME",
         help="Trade only pairs whose series' FIRST Kalshi tag is NAME, under every "
-             "category --category lists (any category when none is listed); or give "
+             "category this run lists (its --category flags, else the saved "
+             "categories; any category when none is listed); or give "
              "\"Category · Tag\" to narrow that one listed category and leave the "
-             "others as they are (repeatable; case-insensitive; default: the saved "
+             "others as they are. Replaces every saved tag for this run, so a "
+             "category the saved tags narrowed trades in full unless this run's "
+             "tags narrow it (repeatable; case-insensitive; default: the saved "
              "live defaults)",
     )
     tags.add_argument(

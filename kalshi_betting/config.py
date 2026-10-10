@@ -543,7 +543,9 @@ TIME_SERIES_SPREAD_BAND = (0.0, 0.5)
 
 # Kalshi categories a pair may trade in ("Economics", ...), or None for
 # any: a non-empty tuple of names, matched case-insensitively against market A's
-# series category as the dashboard files it (historical.series_labels). Applied
+# series category as the dashboard files it (historical.series_labels). Each is
+# a category's name alone: one written as a tag tied to a category
+# ("Sports · Basketball") is refused, since it belongs among the tags. Applied
 # by main._filter_by_category, which fails CLOSED (no listing to file by: no
 # trades). A live run reads the saved live defaults' categories instead, which
 # main.py --category NAME (repeatable) / --any-category overrides for one run.
@@ -2649,9 +2651,10 @@ def split_tag(name: str) -> tuple[str | None, str]:
     A tag is tied to a category when its name holds TAG_SCOPE_SEPARATOR
     ("Sports · Basketball"); it is split at the first one, and each half is
     stripped. Any other name is a plain tag, which applies under every listed
-    category. LiveSettings' check of tied tags, trade_filter and
-    main._filter_by_category's typo check read a tag through this, so all
-    three agree on which tags are tied.
+    category. LiveSettings' check of tied tags, trade_filter,
+    main._filter_by_category's typo check and main.py's remedy for a saved
+    tied tag (_saved_tag_loses_its_category) read a tag through this, so all
+    of them agree on which tags are tied.
 
     Args:
         name (str): One name of a tags filter, as LiveSettings holds it.
@@ -2664,6 +2667,50 @@ def split_tag(name: str) -> tuple[str | None, str]:
     return (category.strip(), tag.strip()) if sep else (None, name)
 
 
+def _tie_with_a_blank_half(name: str) -> bool:
+    """
+    Say whether a stripped name is a tied tag with one half missing.
+
+    _names strips each name, which takes one space off the separator of a tied
+    tag with a blank half, so split_tag no longer finds the separator in it.
+    Such a name is the separator's dot alone ("·"), or starts with the dot and
+    a space ("· Basketball"), or ends with a space and the dot ("Sports ·"). A
+    dot with no space beside it is an ordinary character of a name:
+    "·Basketball", "Sports·" and "A·B" are not ties.
+
+    Args:
+        name (str): One name of a categories or tags filter, already stripped.
+
+    Returns:
+        bool: True for the three shapes above.
+    """
+    return (name == TAG_SCOPE_SEPARATOR.strip()
+            or name.startswith(TAG_SCOPE_SEPARATOR.lstrip())
+            or name.endswith(TAG_SCOPE_SEPARATOR.rstrip()))
+
+
+def _check_category_names(categories: tuple[str, ...] | None) -> None:
+    """
+    Refuse a category written as a tag tied to a category.
+
+    A category is a name alone. One that holds TAG_SCOPE_SEPARATOR
+    ("Sports · Basketball"), or is a tie with a blank half ("·",
+    "· Basketball", "Sports ·"), would match no pair, while the filter's own
+    text would read as if the category beside it were narrowed to that tag.
+    Checked whether or not any tag is set.
+
+    Args:
+        categories (tuple[str, ...] | None): The categories filter, validated by _names.
+
+    Raises:
+        ValueError: Naming the first category written that way.
+    """
+    for name in categories or ():
+        if TAG_SCOPE_SEPARATOR in name or _tie_with_a_blank_half(name):
+            raise ValueError(f"categories: {name!r} is a tag tied to a category; "
+                             "give it as a tag")
+
+
 def _check_tied_tags(categories: tuple[str, ...] | None,
                      tags: tuple[str, ...] | None) -> None:
     """
@@ -2673,9 +2720,10 @@ def _check_tied_tags(categories: tuple[str, ...] | None,
     refused when either half is blank, when its tag half reads "any", or when
     its category is not among the categories (compared without regard to case;
     with no categories listed, every tied tag is refused). It is never read as
-    a plain tag instead. A name that starts or ends with the separator's dot is
-    a tied tag whose blank half _names has already stripped, and is refused
-    the same way.
+    a plain tag instead. A tie whose blank half _names has already stripped
+    (_tie_with_a_blank_half: the dot alone, a name starting with "· " or ending
+    with " ·") is refused the same way; a dot with no space beside it
+    ("·Basketball", "Sports·") is part of a plain tag's name.
 
     Args:
         categories (tuple[str, ...] | None): The categories filter, validated by _names.
@@ -2685,14 +2733,10 @@ def _check_tied_tags(categories: tuple[str, ...] | None,
         ValueError: Naming the first tied tag that breaks a rule above.
     """
     listed = {c.casefold() for c in categories or ()}
-    dot = TAG_SCOPE_SEPARATOR.strip()
     for name in tags or ():
         category, tag = split_tag(name)
         if category is None:
-            # _names strips each name, which takes one space off the separator
-            # of a tied tag with a blank half ("· Basketball", "Sports ·")
-            if name == dot or name.startswith(TAG_SCOPE_SEPARATOR.lstrip()) \
-                    or name.endswith(TAG_SCOPE_SEPARATOR.rstrip()):
+            if _tie_with_a_blank_half(name):
                 raise ValueError(f"tags: {name!r} must read 'Category{TAG_SCOPE_SEPARATOR}Tag'")
             continue
         if not category or not tag:
@@ -2732,7 +2776,9 @@ class LiveSettings:
             SIZE_CAP_STEP grid; 1.0 is no cap.
         same_title_size_cap (float): The extra same-title cap, on the same
             grid; default 1.0 (no extra cap).
-        categories (tuple[str, ...] | None): Categories to trade; None (default) for any.
+        categories (tuple[str, ...] | None): Categories to trade; None (default)
+            for any. Each is a category's name alone: one written as a tag tied
+            to a category ("Sports · Basketball") is refused.
         tags (tuple[str, ...] | None): Series first tags to trade; None (default)
             for any. A plain name applies under every listed category; a name
             tied to a listed category ("Sports · Basketball") narrows that
@@ -2756,7 +2802,11 @@ class LiveSettings:
             main.py's flags laid over the defaults keep it.
 
     Raises:
-        ValueError: If any field is out of range or of the wrong type.
+        ValueError: If any field is out of range or of the wrong type; if a
+            category is written as a tag tied to a category
+            (_check_category_names); or if a tied tag has a blank half, names
+            "any" as its tag, or names a category that categories does not
+            list (_check_tied_tags).
     """
     tier_floors: bool
     spread_band: tuple[float, float]
@@ -2775,7 +2825,9 @@ class LiveSettings:
         Validate every field and normalise it in place (the object is frozen).
 
         Raises:
-            ValueError: If any field is out of range or of the wrong type.
+            ValueError: If any field is out of range or of the wrong type, a
+                category is written as a tied tag, or a tied tag cannot be
+                applied (see the class's Raises).
         """
         if type(self.tier_floors) is not bool:
             raise ValueError(f"tier_floors must be True or False, got {self.tier_floors!r}")
@@ -2801,6 +2853,8 @@ class LiveSettings:
                            _step_cap(self.same_title_size_cap, "same_title_size_cap"))
         object.__setattr__(self, "categories", _names(self.categories, "categories"))
         object.__setattr__(self, "tags", _names(self.tags, "tags"))
+        # With or without tags: a category written as a tied tag narrows nothing
+        _check_category_names(self.categories)
         _check_tied_tags(self.categories, self.tags)
         # A real bool, as tier_floors: a saved file's JSON 1 must be refused
         if type(self.add_to_held_pairs) is not bool:

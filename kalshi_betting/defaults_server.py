@@ -105,11 +105,13 @@ Notes:
     crafted link cannot choose the note's words. A link may name several
     categories and several tags (a category or tag field given more than
     once, at most config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each, no name
-    twice). They are checked for form only (each one printable name; a tag
-    tied to a category, "Sports · Basketball", only with that category
-    named), so a link can still put words of its own there: the page shows
-    them as a highlighted change, and a name no Kalshi series is filed under
-    matches no pair. The headers never
+    twice; a second spelling of one name in another letter case is left
+    out). They are checked for form only (each one printable name with no
+    two spaces in a row, which a browser would show as one; a category never
+    written as a tied tag; a tag tied to a category, "Sports · Basketball",
+    only with that category named), so a link can still put words of its
+    own there: the page shows them as a highlighted change, and a name no
+    Kalshi series is filed under matches no pair. The headers never
     include "Referrer-Policy: no-referrer": under it a browser sends a POST's
     Origin as "null", and every honest save would be refused.
 
@@ -200,6 +202,7 @@ from .config import (
     LIVE_TOGGLE_FIELDS,
     SCHEDULER_JOB_TIMEOUT_SECONDS,
     SCHEDULER_STATE_FILENAME,
+    TAG_SCOPE_SEPARATOR,
     LiveDefaultsError,
     LiveSettings,
     count_text,
@@ -753,6 +756,12 @@ def _name(text: str, name: str) -> str:
     """
     Read a category or tag field as one name.
 
+    A name with two spaces in a row is refused, for categories and tags
+    alike: a browser shows a run of spaces as one, so on the confirmation
+    page such a name would look exactly like the name spelled with single
+    spaces while being a different name to the filter. That also refuses a
+    tied tag written with a doubled space ("Sports ·  Basketball").
+
     Args:
         text (str): The field's value.
         name (str): The field's name, for the message.
@@ -762,11 +771,14 @@ def _name(text: str, name: str) -> str:
 
     Raises:
         ValueError: If the name is not one printable line (a zero-width or
-            text-direction character, say) or has spaces around it.
+            text-direction character, say), has spaces around it, or holds
+            two spaces in a row.
     """
     if not text.isprintable() or text != text.strip():
         raise ValueError(f"{name} must be one printable name with no spaces around it, "
                          f"got {text!r}")
+    if re.search(r"\s\s", text):
+        raise ValueError(f"{name} must not hold two spaces in a row, got {text!r}")
     return text
 
 
@@ -774,28 +786,39 @@ def _name_list(params: dict[str, list[str]], field_name: str) -> tuple[str, ...]
     """
     Read every category, or every tag, a request names.
 
+    The live filter compares names without regard to letter case, so a name
+    that repeats an earlier one in another case adds nothing and is left out
+    (the first spelling is kept). Kalshi spells a few tags two ways under one
+    category ("Health · COVID" and "Health · Covid"), and a page that lists
+    both may send both. The very same name twice is refused: no page sends
+    that.
+
     Args:
         params (dict[str, list[str]]): The request's fields (_params).
         field_name (str): "category" or "tag".
 
     Returns:
-        tuple[str, ...] | None: The names in the order given, or None when
-            the request has no such field (any category, or any tag).
+        tuple[str, ...] | None: The names in the order given, each once in
+            any letter case, or None when the request has no such field (any
+            category, or any tag).
 
     Raises:
-        ValueError: If a name is not one printable name (_name), or the same
-            name is given twice, in any letter case.
+        ValueError: If a name is not one printable name (_name), or the very
+            same name is given twice.
     """
     if field_name not in params:
         return None
     names: list[str] = []
+    # Every name as given, and each kept name without regard to case
+    given: set[str] = set()
     seen: set[str] = set()
     for text in params[field_name]:
         name = _name(text, field_name)
-        # The live filter compares names without regard to case, so a second
-        # spelling of one name adds nothing
-        if name.casefold() in seen:
+        if name in given:
             raise ValueError(f"{field_name} {name!r} is given twice")
+        given.add(name)
+        if name.casefold() in seen:
+            continue
         seen.add(name.casefold())
         names.append(name)
     return tuple(names)
@@ -851,10 +874,12 @@ def _proposal(params: dict[str, list[str]],
     proposes exactly the seed, and the page shows the change against what is
     saved. A missing category or tag means any, whatever is saved. category
     and tag may each be given more than once, one name per field (at most
-    config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each, no name twice in any
-    letter case); a tag needs at least one category, and a tag tied to a
-    category ("Sports · Basketball") needs that category named, which
-    LiveSettings checks. source is the note the saved file will keep: left
+    config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each as sent; the very same
+    name twice is refused, and a second spelling of one name in another
+    letter case is left out); a tag needs at least one category, and a tag
+    tied to a category ("Sports · Basketball") needs that category named,
+    which LiveSettings checks, as it checks that no category is written as
+    a tied tag. source is the note the saved file will keep: left
     out, it is empty; given, it must be one of the two shapes
     config.LIVE_DEFAULTS_SOURCE_PATTERN allows, with ASCII digits only, and
     the seed's note (LIVE_DEFAULTS_SEED_SOURCE) may label only the seed
@@ -872,7 +897,8 @@ def _proposal(params: dict[str, list[str]],
         ValueError: Naming the first rule the request breaks: an unknown,
             repeated, blank or missing field (a category or tag is repeated
             only past the most a link may name), a value that is not a plain
-            number or a printable name, a category or tag named twice, a
+            number or a printable name (or one with two spaces in a row),
+            the very same category or tag named twice, a
             tier_floors or add_to_held_pairs other than on or off, a sell_at
             neither off nor a number, a sell_min_days neither off nor one to
             six digits, a tag without a category, a source of another shape,
@@ -923,7 +949,7 @@ def _proposal(params: dict[str, list[str]],
     else:
         sell_min_days = _kept("sell_min_days", current, source)
     if "tag" in params and "category" not in params:
-        raise ValueError("a tag needs its category")
+        raise ValueError("a tag needs a category")
     categories = _name_list(params, "category")
     tags = _name_list(params, "tag")
     # re.ASCII: the pattern's digits are 0-9 only, never a digit of another
@@ -1984,7 +2010,7 @@ def _market_text(leg: dict | None) -> str:
 
 def _category_text(trade: dict) -> str:
     """
-    Name the Kalshi category a pair is filed under, as the backtest dashboard's Tag options do.
+    Name the Kalshi category and tag a pair is filed under, written as a filter ties a tag.
 
     Args:
         trade (dict): One pair of a run result (_read_result).
@@ -1996,7 +2022,9 @@ def _category_text(trade: dict) -> str:
     """
     if not trade["category"]:
         return "—"
-    return f"{trade['category']} · {trade['tag']}" if trade["tag"] else trade["category"]
+    if not trade["tag"]:
+        return trade["category"]
+    return f"{trade['category']}{TAG_SCOPE_SEPARATOR}{trade['tag']}"
 
 
 def _trades_html(trades: list[dict]) -> str:
