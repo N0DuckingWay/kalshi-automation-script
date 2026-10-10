@@ -44,7 +44,9 @@ Purpose:
     days), and/or any set of its Kalshi categories and category · tags
     (the Category and Tag menus are check-box dropdowns: a ticked category
     counts in full unless some of its tags are ticked, then only those —
-    the live filter's rule, config.trade_filter),
+    the live filter's rule, config.trade_filter; tags of one category whose
+    names differ only in letter case are one tag to that filter, so the
+    page ticks and unticks them together, _case_twins),
     and moves the k-hat breakdown and the performance section's k-hat cards
     to the same band, tier setting and selection (the breakdown's reference
     line to the same k), the interval-discount section to the same k and
@@ -1662,7 +1664,9 @@ def _category_groups(df: pd.DataFrame) -> pd.DataFrame:
 
     Returns:
         pd.DataFrame: Indexed by subcategory, with trades, wins, pnl, mean_ret
-            and median_ret, sorted by pnl descending.
+            and median_ret, sorted by pnl descending; groups with equal pnl
+            stay in name order (a stable sort), the order the page's script
+            gives a mix of categories and tags.
     """
     return df.groupby("subcategory").agg(
         trades=("profit", "size"),
@@ -1670,7 +1674,7 @@ def _category_groups(df: pd.DataFrame) -> pd.DataFrame:
         pnl=("profit", "sum"),
         mean_ret=("profit_ratio", "mean"),
         median_ret=("profit_ratio", "median"),
-    ).sort_values("pnl", ascending=False)
+    ).sort_values("pnl", ascending=False, kind="stable")
 
 
 def _category_row_cells(name, r) -> dict[str, str]:
@@ -1821,14 +1825,16 @@ def _decomposition_aggregates(df: pd.DataFrame) -> dict:
     Returns:
         dict: "monthly" — a frame of [month, profit] by entry month, in month
             order; "category" and "subcategory" — P&L per Kalshi category and
-            per category · tag, ascending; "price" — P&L per entry-price
-            bucket (_PRICE_BUCKET_LABELS), buckets with no trade omitted.
+            per category · tag, ascending, equal sums in name order (a stable
+            sort, the order the page's script gives a mix of categories and
+            tags); "price" — P&L per entry-price bucket
+            (_PRICE_BUCKET_LABELS), buckets with no trade omitted.
     """
     buckets = pd.cut(df["entry_pA"], bins=_PRICE_BUCKET_BINS, labels=_PRICE_BUCKET_LABELS)
     return {
         "monthly": df.groupby("month")["profit"].sum().reset_index(),
-        "category": df.groupby("category")["profit"].sum().sort_values(),
-        "subcategory": df.groupby("subcategory")["profit"].sum().sort_values(),
+        "category": df.groupby("category")["profit"].sum().sort_values(kind="stable"),
+        "subcategory": df.groupby("subcategory")["profit"].sum().sort_values(kind="stable"),
         "price": (df.assign(price_bucket=buckets)
                   .groupby("price_bucket", observed=True)["profit"].sum()),
     }
@@ -6500,10 +6506,14 @@ _SUMMARY_TEMPLATES = {
     # figures itself (a mix of categories and tags has no view of its own)
     "mix_note": " Combined in the page from each tag's own figures.",
     # In the line's place when the list on screen cannot be mixed: {selection}
-    # the ticks tried, {failed} the scenario they were tried at, {scenario}
-    # the one the sections still show
-    "mix_unavailable": ("Not available: {selection} cannot be combined at {failed} on this "
-                        "page (the log of its build says why); the sections show {scenario}."),
+    # the ticks tried, {failed} the scenario they were tried at, {shown} what
+    # is ticked again now (the names, or "mix_still_all" with nothing
+    # ticked) and {at} empty — or, when the selects went back to another
+    # scenario too, "mix_still_at" naming it
+    "mix_unavailable": ("Not available: {selection} cannot be shown together for {failed} "
+                        "(the page's build log says why). The page still shows {shown}{at}."),
+    "mix_still_all": "all categories",
+    "mix_still_at": " at {scenario}",
     # The Category and Tag menus' buttons: nothing ticked, or how many (one
     # ticked reads as its own name)
     "menu_cat_all": _MENU_CAT_ALL,
@@ -6550,6 +6560,21 @@ _SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter
 _SAVE_TITLE_UNFILED = (" A category or tag can be saved only from a page built with "
                        "Kalshi's series listing; this one files trades by ticker prefix.")
 _SAVE_NOTE = "(needs ./start_dashboard.sh running)"
+# The button's hover text while the ticks themselves are what cannot be
+# saved (the script swaps it in, and Python's own title back): more names
+# ticked than the confirmation page takes ({n} of each), a ticked category
+# whose name holds the separator a saved filter ties a tag to its category
+# with, or a ticked category another one on the page repeats in other letter
+# case (the live filter reads names without regard to case, so it would keep
+# both where the page shows one)
+_SAVE_BLOCKED_TEXT = {
+    "save_too_many": ("Cannot save: more than {n} categories, or more than {n} tags, are "
+                      "ticked. Untick some."),
+    "save_separator": ("Cannot save: a ticked category's name holds the mark that joins a "
+                       "category and its tag in a saved filter."),
+    "save_case_twin": ("Cannot save: a ticked category has a namesake on this page that "
+                       "differs only in letter case, and the live filter would keep both."),
+}
 
 # The bar's "Trade using defaults…" link: its label and its hover text. It
 # opens the defaults server's trade page, which shows the saved live defaults
@@ -10417,7 +10442,7 @@ _MIX_TOLERANCE_DOLLARS = 1e-6
 
 def _open_capital_from_curve(value: np.ndarray, initial_balance: float,
                              trades: list[BacktestTrade], entry_rows: list[int],
-                             exit_rows: list[int]) -> np.ndarray:
+                             exit_rows: list[int], *, floored: bool = True) -> np.ndarray:
     """
     What a curve carries in open trades on each row, worked out from the curve itself.
 
@@ -10437,9 +10462,13 @@ def _open_capital_from_curve(value: np.ndarray, initial_balance: float,
         trades (list[BacktestTrade]): The trades the curve was booked from.
         entry_rows (list[int]): Each trade's entry row on the curve.
         exit_rows (list[int]): Each trade's exit row on the curve.
+        floored (bool): Keyword-only. True (default) floors each row at 0, as
+            the page does. False returns the figure as worked out, which can
+            fall below 0 (a trade dated to pay out before it enters): what
+            _mix_curve reads to tell whether a floor would bind.
 
     Returns:
-        np.ndarray: One float per row, floored at 0.
+        np.ndarray: One float per row.
     """
     stake = np.zeros(len(value))
     paid_out = np.zeros(len(value))
@@ -10448,7 +10477,7 @@ def _open_capital_from_curve(value: np.ndarray, initial_balance: float,
         stake[exited] -= t.total_cost + t.fees
         paid_out[exited] += t.profit
     carried = value - initial_balance + np.cumsum(stake) - np.cumsum(paid_out)
-    return np.where(carried > 0.0, carried, 0.0)
+    return np.where(carried > 0.0, carried, 0.0) if floored else carried
 
 
 def _mix_curve(
@@ -10476,7 +10505,11 @@ def _mix_curve(
       * with risk-free rates on the page, every trade enters and pays out on
         a day of the page, and the open capital worked out from the curve
         (_open_capital_from_curve, the page's own way) equals what the
-        hurdle is charged on (_carried_on_days).
+        hurdle is charged on (_carried_on_days) and is never below zero by
+        more than _MIX_TOLERANCE_DOLLARS before any floor. The page floors
+        the SUM of a mix's tags at zero, while _carried_on_days floors the
+        trades valued at cost and those valued at market separately; with no
+        tag below zero no floor binds, and the two are the same sum.
 
     Args:
         sel (list[BacktestTrade]): The view's trades.
@@ -10506,10 +10539,16 @@ def _mix_curve(
         entry_rows, exit_rows = rows
         if min(entry_rows) < 0 or min(exit_rows) < 0:
             return None
-        derived = _open_capital_from_curve(value, initial_balance, sel, entry_rows, exit_rows)
+        derived = _open_capital_from_curve(value, initial_balance, sel, entry_rows, exit_rows,
+                                           floored=False)
+        # A tag whose own figure dips below zero would be floored there by
+        # Python and only in the sum by the page: not offered for mixing
+        if not np.all(derived >= -_MIX_TOLERANCE_DOLLARS):
+            return None
         # What the hurdle is charged on (_rf_hurdle reads the same figure)
         carried = _carried_on_days(sel, day_numbers(equity_df["date"]))
-        if not np.allclose(derived, carried, rtol=1e-9, atol=_MIX_TOLERANCE_DOLLARS):
+        if not np.allclose(np.where(derived > 0.0, derived, 0.0), carried, rtol=1e-9,
+                           atol=_MIX_TOLERANCE_DOLLARS):
             return None
     return [[label, _sparse_on_axis(dates, dollars[label], axis, _MIX_DECIMALS)]
             for label, _ in _TRADE_TYPE_LINES if label in dollars]
@@ -10658,6 +10697,32 @@ def _list_payload(
         **mix,
         "views": views,
     }
+
+
+def _case_twins(keys: list) -> list[list[int]]:
+    """
+    Group the positions of names that differ only in letter case.
+
+    The live filter compares category and tag names without regard to case
+    (config.trade_filter, by str.casefold), so two names the page lists
+    apart can be one name to it. The page's script reads these groups rather
+    than fold case itself, so both sides fold by the same rule.
+
+    Args:
+        keys (list): One hashable key per listed name, in list order, equal
+            exactly for names the live filter reads as one (a category: its
+            case-folded name; a tag: its category's index and its case-folded
+            name).
+
+    Returns:
+        list[list[int]]: Each group of two or more positions sharing a key,
+            ascending, the groups in order of their first position; empty
+            when every name is its own.
+    """
+    groups: dict = {}
+    for i, key in enumerate(keys):
+        groups.setdefault(key, []).append(i)
+    return [group for group in groups.values() if len(group) > 1]
 
 
 # The per-trade arrays of a mix that must hold a finite number for every trade
@@ -10909,7 +10974,11 @@ def _filter_payload(
             k, cap] indexes of the page as rendered), "grid" ([band][k][cap]
             -> chunk id or null), "rows" (the shared trade-row heads),
             "categories" (sorted names), "subcats" ([[category index, tag],
-            ...], sorted), "empty" (the view of a selection with no trade — a
+            ...], sorted), "tag_twins" and "category_twins" (_case_twins: the
+            indexes of tags of one category, and of categories, whose names
+            differ only in letter case — one name to the live filter — so
+            the script ticks such tags together and saves no tick on such a
+            category), "empty" (the view of a selection with no trade — a
             flat curve, referencing no string), "mix" (_mix_base: what the
             script works a mix of categories and tags out with), "text" (the templates:
             _SUMMARY_TEMPLATES — its "unfiltered" sentence chosen by kd,
@@ -10978,6 +11047,11 @@ def _filter_payload(
         "rows": chunks.heads.items,
         "categories": chunks.categories,
         "subcats": [[chunks.cat_index[c], tag] for c, tag in chunks.subcats],
+        # Names the live filter reads as one (it ignores letter case): tags
+        # of one category the script ticks together, and categories it will
+        # not save a tick on
+        "tag_twins": _case_twins([(c, tag.casefold()) for c, tag in chunks.subcats]),
+        "category_twins": _case_twins([c.casefold() for c in chunks.categories]),
         "empty": empty,
         # What the script needs, besides a chunk, to work out a mix of
         # several categories and tags itself
@@ -10987,7 +11061,8 @@ def _filter_payload(
         # when that section's data was built (kd), and the scenario explorer's
         # selects only when the page carries its grid (explorer) — its cap
         # select only when its cap axis is this grid's (explorer_caps)
-        "text": {**_SUMMARY_TEMPLATES, **_KHAT_TEXT, **_CALIBRATION_TEXT,
+        "text": {**_SUMMARY_TEMPLATES, **_SAVE_BLOCKED_TEXT, **_KHAT_TEXT,
+                 **_CALIBRATION_TEXT,
                  "unfiltered": " " + _bar_reach(kd is not None, explorer,
                                                 explorer_caps=explorer_caps,
                                                 explorer_tiers=explorer_tiers)
@@ -11287,7 +11362,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     page for that scenario in a new tab. Its hover text (_SAVE_TITLE) gains
     _SAVE_TITLE_UNFILED on a page that does not file trades by Kalshi's
     series listing (payload "save"), where a category or tag cannot be
-    saved. On a page with the add-on view whose saved live defaults add to
+    saved; while the ticks themselves are what cannot be saved, the script
+    shows one of _SAVE_BLOCKED_TEXT's reasons in its place. On a page with the add-on view whose saved live defaults add to
     held pairs (save["live_adds_to_held_pairs"]), a grey note
     (_ADD_ON_SAVE_NOTE) follows the button: saving with the Add to held
     pairs choice off turns that off. _SELL_SAVE_NOTE does the same for selling
@@ -11627,7 +11703,11 @@ def _pack_text(raw: str) -> str:
 # SHOWN[4] are the ticked indexes). A reader ticks as many boxes as they
 # like, and the ticks follow the live filter's rule (atomsOf, the page's twin
 # of config.trade_filter): a ticked category counts in full unless some of
-# its tags are ticked, then only those. Where the ticks cover exactly the
+# its tags are ticked, then only those. That filter reads names without
+# regard to letter case, so tags of one category that differ only in case
+# (Kalshi spells a few both ways) are one tag to it: their boxes are ticked
+# and unticked together (TWINS, from the groups Python folds, D.tag_twins),
+# and the page shows what a saved filter keeps. Where the ticks cover exactly the
 # trades of one of Python's views — everything, one category, one tag — that
 # view is drawn as it stands. Any other set of ticks is a MIX, which has no
 # view of its own (the combinations are far too many to ship): the script
@@ -11643,7 +11723,10 @@ def _pack_text(raw: str) -> str:
 # rounding edge. A list whose tags Python could not vouch for carries no "m":
 # a mix asked for there is refused in Python's words (D.text.mix_unavailable)
 # and the bar is put back. The k-hat figures of a mix are the covered tags'
-# groups pooled from their raw counts (khatFor, pooledKhat).
+# groups pooled from their raw counts (khatFor, pooledKhat). A chunk's list
+# remembers its last MIXES mixes, and a band its last MIXES pooled k-hat
+# figures (remember); an older one is worked out again when asked for. A
+# mix's category table is kept with the mix, never added to its chunk.
 # The script also rewrites the performance section's two k-hat cards
 # (renderKhatCards, from the k-hat breakdown's group for the selection) and the
 # interval-discount section at the bar's k and size cap (renderKd, from
@@ -11660,7 +11743,10 @@ def _pack_text(raw: str) -> str:
 # new tab (saveHref: D.save's address and the axes' values, with the Add to held pairs
 # choice on a page with the add-on view and the Sell level and minimum, or "off" for
 # both, on a page with the Sell view; the button's words are
-# Python's). On load it inflates the base block and the primary scenario's
+# Python's — its hover text too, which reads as Python rendered it except
+# while the ticks themselves cannot be saved: too many names, a category
+# whose name holds the separator, or one that another category repeats in
+# other letter case (ticksBlocked, D.text.save_*)). On load it inflates the base block and the primary scenario's
 # chunk, sets the bar back to the view Python rendered and enables it — it
 # redraws nothing until a <select> changes. A chunk is inflated when a
 # scenario needs it and kept while among the last KEEP drawn (the primary's
@@ -11722,6 +11808,14 @@ _FILTER_JS = r"""
   var D = null, N = 0, C = null, CHUNKS = {}, KEPT = [], SEQ = 0, SHOWN = null;
   var SELL = {};
   var KEEP = 16;                     // drawn chunks kept besides the primary
+  var MIXES = 16;                    // mixes kept per chunk, and pooled k-hats per band
+  // TWINS: for a tag whose name another tag of its category repeats in
+  // other letter case, every tag of that group (D.tag_twins) — one name to
+  // the live filter, so their boxes are ticked and unticked together.
+  // NO_SAVE: the categories another category repeats in other letter case
+  // (D.category_twins), on which no tick can be saved. SAVE_TITLE: the save
+  // button's hover text as Python rendered it.
+  var TWINS = {}, NO_SAVE = {}, SAVE_TITLE = null;
   // PICK: the menus' ticks as last asked for (pickKey), so a click that
   // leaves them as they were (the clearing box of an empty menu) redraws nothing
   var PICK = '|';
@@ -11832,13 +11926,14 @@ _FILTER_JS = r"""
   // page holds no chunk for included), a band
   // the run did not record, a k or size cap the
   // run did not record or that is not above zero, a category or tag on a
-  // page that does not file trades by Kalshi's series listing, or more
-  // categories or more tags than the server takes on one address
-  // (D.save.max_names). The address names every ticked category, and every
+  // page that does not file trades by Kalshi's series listing, or ticks
+  // that cannot be saved as they stand (ticksBlocked). The address names every ticked category, and every
   // ticked tag tied to its category ("Category · Tag", joined by D.mix.sep):
   // the live filter then keeps a ticked category in full unless some of its
   // tags are ticked, and then only those — the rule the page shows
-  // (atomsOf). A category whose listed tags are ALL ticked still sends each
+  // (atomsOf). Tags of one category that differ only in letter case are
+  // always ticked together (TWINS), so each spelling is sent and the server
+  // keeps the first. A category whose listed tags are ALL ticked still sends each
   // of them: the page lists only the tags this backtest saw, so naming the
   // category alone would let a live run trade tags nobody ticked. The server
   // refuses, with its reason, any other value the live settings reject. Each
@@ -11855,13 +11950,7 @@ _FILTER_JS = r"""
     if (!band || !(k > 0) || !(cap > 0)) { return null; }
     var cats = SHOWN[3], tags = SHOWN[4];
     if (cats.length && !D.save.filed_by_listing) { return null; }
-    var most = D.save.max_names;
-    if (typeof most === 'number' && (cats.length > most || tags.length > most)) { return null; }
-    // A category whose own name holds the separator could not be told from
-    // a tied tag's category: never sent
-    if (cats.some(function(c) { return D.categories[c].indexOf(D.mix.sep) >= 0; })) {
-      return null;
-    }
+    if (ticksBlocked(cats, tags) !== null) { return null; }
     var q =[['tier_floors', offAt(SHOWN[5]) ? 'off' : 'on'], ['spread_min', band[0]],
              ['spread_max', band[1]], ['k', k], ['size_cap', cap]];
     // Left out when the run recorded none: the server then keeps the saved
@@ -11890,8 +11979,33 @@ _FILTER_JS = r"""
       return encodeURIComponent(p[0]) + '=' + encodeURIComponent(String(p[1]));
     }).join('&');
   }
-  // The button is enabled exactly when the scenario on screen can be saved
-  function refreshSave() { if (saveBtn) { saveBtn.disabled = saveHref() === null; } }
+  // Why the ticks themselves cannot be saved, as the save button's hover
+  // text in Python's words (D.text.save_*), or null when they can: more
+  // categories, or more tags, than the server takes on one address
+  // (D.save.max_names — each ticked spelling counts, as the server counts
+  // them); a category whose own name holds the separator, which could not
+  // be told from a tied tag's category; or a category another one repeats
+  // in other letter case, which the live filter would keep too
+  function ticksBlocked(cats, tags) {
+    var most = D.save.max_names;
+    if (typeof most === 'number' && (cats.length > most || tags.length > most)) {
+      return fill(D.text.save_too_many, {n: most});
+    }
+    if (cats.some(function(c) { return D.categories[c].indexOf(D.mix.sep) >= 0; })) {
+      return D.text.save_separator;
+    }
+    if (cats.some(function(c) { return NO_SAVE[c]; })) { return D.text.save_case_twin; }
+    return null;
+  }
+  // The button is enabled exactly when the scenario on screen can be saved;
+  // while the ticks are what stops it, its hover text says why, and
+  // otherwise it reads as Python rendered it
+  function refreshSave() {
+    if (!saveBtn) { return; }
+    saveBtn.disabled = saveHref() === null;
+    var why = (D && D.save && SHOWN) ? ticksBlocked(SHOWN[3], SHOWN[4]) : null;
+    if (SAVE_TITLE !== null) { saveBtn.title = why === null ? SAVE_TITLE : why; }
+  }
   function isPrimaryCell() {
     var p = D.primary;
     return bandIndex() === p[0] && kIndex() === p[1] && capIndex() === p[2];
@@ -11936,7 +12050,17 @@ _FILTER_JS = r"""
   }
   function catTicks() { return ticksOf('flt-cat-', D.categories.length); }
   function tagTicks() { return ticksOf('flt-tag-', D.subcats.length); }
+  // Every tag of a twin group ticked as soon as one of them is
+  function withTwins(tags) {
+    var out = tags.slice();
+    tags.forEach(function(t) {
+      (TWINS[t] || []).forEach(function(j) { if (out.indexOf(j) < 0) { out.push(j); } });
+    });
+    return out;
+  }
+  // The menus' boxes set to these ticks, a tag's case twins with it
   function setTicks(cats, tags) {
+    tags = withTwins(tags);
     D.categories.forEach(function(_, i) {
       var box = byId('flt-cat-' + i);
       if (box) { box.checked = cats.indexOf(i) >= 0; }
@@ -12134,12 +12258,22 @@ _FILTER_JS = r"""
     return [(zero || up ? '+' : '-') + digits, D.mix.khat_delta[up ? 0 : 1]];
   }
 
-  // One mix, built once per chunk and set of tag views
+  // A small cache: what make() gave for a key, for the last MIXES keys
+  // asked for (the oldest forgotten first, and worked out again if asked for)
+  function remember(cache, key, make) {
+    if (!(key in cache.at)) {
+      cache.at[key] = make();
+      cache.keys.push(key);
+      if (cache.keys.length > MIXES) { delete cache.at[cache.keys.shift()]; }
+    }
+    return cache.at[key];
+  }
+  // One mix, built once per chunk and set of tag views while it is among
+  // the chunk's last MIXES
   function mixView(chunk, keys) {
-    var L = chunk.list, key = keys.join(',');
-    L._mix = L._mix || {};
-    if (!(key in L._mix)) { L._mix[key] = buildMix(chunk, keys); }
-    return L._mix[key];
+    var L = chunk.list;
+    L._mix = L._mix || {at: {}, keys: []};
+    return remember(L._mix, keys.join(','), function() { return buildMix(chunk, keys); });
   }
   function buildMix(chunk, keys) {
     var L = chunk.list, M = D.mix, T = D.text, i;
@@ -12302,7 +12436,6 @@ _FILTER_JS = r"""
         M.cells.forEach(function(name, j) { cells[name] = row.cells[j]; });
         return fill(M.row, cells);
       }).join('') + M.table_foot;
-    chunk.strings.push(table);
 
     // _reliability: the time-series trades' predictions against outcomes
     var probs = [], hits = [];
@@ -12370,7 +12503,9 @@ _FILTER_JS = r"""
       // _strategy_row
       bench: {'return': signed(pct(V[N - 1] / M.start - 1, 1)), sharpe: fixed(sharpe, 2),
               max_dd: pct(deepest, 1)},
-      monthly: monthly, cat: cat, sub: sub, price: price, table: chunk.strings.length - 1,
+      // The table's markup is kept with the mix (table_html), where one of
+      // Python's views names a string of its chunk (table)
+      monthly: monthly, cat: cat, sub: sub, price: price, table_html: table,
       cal: cal, best: best, worst: worst,
       // _one_to_one_extent
       k11: Math.max.apply(null, mine(L.kx).concat([M.k11[0]])) * M.k11[1]
@@ -12518,7 +12653,9 @@ _FILTER_JS = r"""
     sizeTo('dec-sub', v.sub.h);
     bars('dec-sub', v.sub, {height: v.sub.h});
     var table = byId('dec-table');
-    if (table) { table.innerHTML = C.strings[v.table]; }
+    if (table) {
+      table.innerHTML = v.table_html !== undefined ? v.table_html : C.strings[v.table];
+    }
     bars('dec-price', v.price);
     redraw('dec-hold', [traceOf('dec-hold', 0, {x: pick(L.hold, v.idx)})]);
   }
@@ -12568,29 +12705,25 @@ _FILTER_JS = r"""
   // cells, bar label and k-hat − k per k written as Python writes them
   // (_khat_cells, _khat_bar_text, _khat_delta). null with no entry.
   function pooledKhat(band, atoms) {
-    var key = atoms.join(',');
-    band._pool = band._pool || {};
-    if (key in band._pool) { return band._pool[key]; }
-    var n = 0, events = 0, between = 0, gaps = 0;
-    atoms.forEach(function(i) {
-      var g = band.groups['s' + i];
-      if (!g || !g.raw) { return; }
-      n += g.n;
-      events += g.events;
-      between += g.raw[0];
-      gaps += g.raw[1];
-    });
-    var st = null;
-    if (n > 0) {
+    band._pool = band._pool || {at: {}, keys: []};
+    return remember(band._pool, atoms.join(','), function() {
+      var n = 0, events = 0, between = 0, gaps = 0;
+      atoms.forEach(function(i) {
+        var g = band.groups['s' + i];
+        if (!g || !g.raw) { return; }
+        n += g.n;
+        events += g.events;
+        between += g.raw[0];
+        gaps += g.raw[1];
+      });
+      if (!(n > 0)) { return null; }
       var rate = between / n, implied = gaps / n, k = implied > 0 ? rate / implied : null;
-      st = {n: n, events: events, rate: rate, implied: implied, k: k,
-            text: fill(D.text.khat_bar, {n: n, events: events}),
-            cells: [String(n), String(events), fixed(rate, 4), fixed(implied, 4),
-                    k === null ? D.mix.none : fixed(k, 3)],
-            delta: D.ks.map(function(kk) { return khatDelta(k, kk.value); })};
-    }
-    band._pool[key] = st;
-    return st;
+      return {n: n, events: events, rate: rate, implied: implied, k: k,
+              text: fill(D.text.khat_bar, {n: n, events: events}),
+              cells: [String(n), String(events), fixed(rate, 4), fixed(implied, 4),
+                      k === null ? D.mix.none : fixed(k, 3)],
+              delta: D.ks.map(function(kk) { return khatDelta(k, kk.value); })};
+    });
   }
   function khatFor(band, cats, tags) {
     if (!band) { return null; }
@@ -12988,8 +13121,14 @@ _FILTER_JS = r"""
     refreshDays();
     var still = scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7],
                            SHOWN[8]);
+    // A mix that could not be shown: the ticks tried and the scenario they
+    // were tried at, then what is ticked again now — and at which scenario,
+    // when the selects went back to another one too
     setText('flt-summary', err === null
-      ? fill(D.text.mix_unavailable, {selection: ticks, failed: tried, scenario: still})
+      ? fill(D.text.mix_unavailable, {
+          selection: ticks, failed: tried,
+          shown: SHOWN[3].length ? selectionName(SHOWN[3], SHOWN[4]) : D.text.mix_still_all,
+          at: tried === still ? '' : fill(D.text.mix_still_at, {scenario: still})})
       : fill(D.text.unavailable, {failed: tried, reason: String(err), scenario: still}));
     // The scenario still shown can be saved again
     refreshSave();
@@ -13082,6 +13221,13 @@ _FILTER_JS = r"""
   Promise.resolve().then(function() { return inflate(dataEl); }).then(function(data) {
     D = data;
     N = D.dates.length;
+    (D.tag_twins || []).forEach(function(group) {
+      group.forEach(function(i) { TWINS[i] = group; });
+    });
+    (D.category_twins || []).forEach(function(group) {
+      group.forEach(function(c) { NO_SAVE[c] = true; });
+    });
+    if (saveBtn && typeof saveBtn.title === 'string') { SAVE_TITLE = saveBtn.title; }
     return load(primaryChunk());
   }).then(function(chunk) {
     if (SEQ === 0) {
@@ -13133,7 +13279,9 @@ _FILTER_JS = r"""
   // A box of a menu was ticked or unticked (the event names the box). The
   // ticks are put in order first: the clearing box empties its menu (the
   // Category one both menus); unticking a category unticks its tags;
-  // ticking a tag ticks its category. Then the scenario is drawn again,
+  // ticking a tag ticks its category, and ticking or unticking a tag does
+  // the same to every tag of its category that differs from it only in
+  // letter case (TWINS: the live filter reads them as one tag). Then the scenario is drawn again,
   // unless the click left the ticks as they were. The menu stays open, so
   // several boxes can be ticked in a row.
   function onTick(menu, ev) {
@@ -13146,6 +13294,13 @@ _FILTER_JS = r"""
     } else if (id === 'flt-tag-all') {
       tags = [];
     } else {
+      // The box clicked takes its case twins with it, ticked or unticked
+      var clicked = /^flt-tag-(\d+)$/.exec(id);
+      var twins = clicked ? (TWINS[parseInt(clicked[1], 10)] || []) : [];
+      if (twins.length && !ev.target.checked) {
+        tags = tags.filter(function(t) { return twins.indexOf(t) < 0; });
+      }
+      tags = withTwins(tags);
       tags.forEach(function(t) {
         if (cats.indexOf(D.subcats[t][0]) < 0) { cats.push(D.subcats[t][0]); }
       });

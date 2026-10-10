@@ -16,8 +16,10 @@
 // does nothing here. ES5 plus Promise and Object.assign, which both runtimes
 // have.
 //
-// Buttons (page.buttons): each is created with the disabled state Python
-// rendered, a ["click", id] step calls its click listeners unless it is
+// Buttons (page.buttons): each is created with the disabled state and the
+// hover text (page.titles) Python rendered — a snapshot's "titles" holds each
+// button's hover text as it stands — a ["click", id] step calls its click
+// listeners unless it is
 // disabled (as a browser ignores a click on a disabled button), and
 // window.open records each call — {url, target, features} — in __opened and
 // opens nothing (it returns null, as a "noopener" open does).
@@ -424,6 +426,7 @@ function __setup(page) {
   Object.keys(page.buttons || {}).forEach(function(id) {
     var button = __element(id, 'button');
     button.disabled = !!page.buttons[id].disabled;
+    button.title = (page.titles || {})[id] || '';
     __elements[id] = button;
   });
   Object.keys(page.charts).forEach(function(id) {
@@ -440,14 +443,15 @@ function __setup(page) {
 // Everything the scripts have drawn, changed and opened since the last
 // snapshot, and the state of every element they have touched: its text,
 // markup, display, heights and colour, a select's value and options, a
-// button's disabled state, a table body's rows (each cell's text, and each
+// button's disabled state and hover text, a table body's rows (each cell's text, and each
 // cell's font weight where the script set one), and a chart's layout copied
 // as it stands now, since a later step can still change it
 function __snapshot() {
   var snap = {reacts: __reacts, updates: __updates, inflated: __inflated.slice(),
               opened: __opened, files: __files.slice(),
               text: {}, html: {}, display: {}, heights: {}, ownHeights: {},
-              colors: {}, selects: {}, menus: {}, buttons: {}, rows: {}, weights: {},
+              colors: {}, selects: {}, menus: {}, buttons: {}, titles: {}, rows: {},
+              weights: {},
               layouts: {}, pending: Object.keys(__PENDING),
               pendingFiles: Object.keys(__FILE_PENDING)};
   __reacts = [];
@@ -485,7 +489,7 @@ function __snapshot() {
       snap.selects[id] = {value: el.value, disabled: el.disabled,
                           options: el.options.map(function(o) { return [o.value, o.text]; })};
     }
-    if (el.tagName === 'button') { snap.buttons[id] = el.disabled; }
+    if (el.tagName === 'button') { snap.buttons[id] = el.disabled; snap.titles[id] = el.title; }
     if (el.children.length) {
       snap.rows[id] = el.children.map(function(tr) {
         return tr.children.map(function(td) { return td._text; });
