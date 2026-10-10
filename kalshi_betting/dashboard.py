@@ -566,6 +566,7 @@ from .config import (
     fee_per_pair_approx,
     time_series_mid_spread,
     time_series_profit_prob,
+    trade_filter_for,
 )
 from .historical import series_labels as _series_labels
 from .scanner import leg_sides
@@ -4363,13 +4364,19 @@ def _run_settings_html(sweep: BacktestSweep | None, *,
     )
 
 
-def _live_filter_options(categories: tuple[str, ...] | None,
-                         tags: tuple[str, ...] | None, bar: dict) -> list[str]:
+def _live_filter_ticks(categories: tuple[str, ...] | None,
+                       tags: tuple[str, ...] | None,
+                       bar: dict) -> tuple[list[str], list[str]]:
     """
-    Name the filter bar's Category or Tag options a live category/tag filter covers.
+    Name what to tick in the filter bar's Category and Tag menus to show the live filter.
 
-    Matched as main._filter_by_category matches a pair (case-insensitive, AND across
-    the axes); with a tag set, the matching "Category · Tag" options.
+    Every (category, tag) the bar offers is asked of config.trade_filter_for,
+    the one rule the live run keeps a pair by (letter case ignored), so a plain
+    tag, a tied "Category · Tag" and a list of categories all read as the live
+    run reads them. A category the filter keeps whole needs only its own tick; a
+    category it narrows to some of the bar's tags needs those tags ticked too
+    (ticking a tag ticks its category). A category none of whose offered tags
+    the filter keeps is left out: this run filed no pair under it.
 
     Args:
         categories (tuple[str, ...] | None): BacktestSweep.live_categories; None = any.
@@ -4377,15 +4384,48 @@ def _live_filter_options(categories: tuple[str, ...] | None,
         bar (dict): _filter_payload's base block ("categories", "subcats").
 
     Returns:
-        list[str]: "Category <c>" or "Tag <c> · <t>" per option, in the bar's order.
+        tuple[list[str], list[str]]: The categories to tick, then the tags to
+            tick as "Category · Tag", both in the bar's order. Both empty when the
+            bar offers nothing the filter keeps.
     """
+    # Cross-module: the same rule the live run decides every pair by
+    keeps = trade_filter_for(categories, tags)
     names = bar["categories"]
-    wanted = None if categories is None else {c.casefold() for c in categories}
-    if tags is None:
-        return [f"Category {c}" for c in names if wanted is None or c.casefold() in wanted]
-    tagged = {t.casefold() for t in tags}
-    return [f"Tag {names[ci]} · {tag}" for ci, tag in bar["subcats"]
-            if (wanted is None or names[ci].casefold() in wanted) and tag.casefold() in tagged]
+    offered: dict[int, list[str]] = {}
+    for ci, tag in bar["subcats"]:
+        offered.setdefault(ci, []).append(tag)
+    ticked_categories: list[str] = []
+    ticked_tags: list[str] = []
+    for ci, name in enumerate(names):
+        own = offered.get(ci, [])
+        if not own:
+            # A category with no tag on the bar is kept as a whole or not at all
+            if keeps(name, ""):
+                ticked_categories.append(name)
+            continue
+        kept = [tag for tag in own if keeps(name, tag)]
+        if not kept:
+            continue
+        ticked_categories.append(name)
+        if len(kept) < len(own):
+            ticked_tags.extend(f"{name}{TAG_SCOPE_SEPARATOR}{tag}" for tag in kept)
+    return ticked_categories, ticked_tags
+
+
+def _tick_phrase(ticked: tuple[list[str], list[str]]) -> str:
+    """
+    Word what _live_filter_ticks returned as "Category A, B and Tag C · D".
+
+    Args:
+        ticked (tuple[list[str], list[str]]): The categories and the tags to tick.
+
+    Returns:
+        str: e.g. "Category Economics, Sports and Tag Sports · Basketball"; the
+            tags part is left out when no tag needs ticking.
+    """
+    categories, tags = ticked
+    phrase = "Category " + ", ".join(categories)
+    return phrase + (" and Tag " + ", ".join(tags) if tags else "")
 
 
 def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
@@ -4611,21 +4651,20 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
                       "same-title trades capped at the lower of the size cap shown and "
                       f"{_cap_percent(st_cap)}% ({own})")
 
-    # A live filter's one covered option is chosen with the band and tier (one_slice);
-    # several, none or no bar are said instead (slices)
-    options = ([] if not filtered or bar is None
-               else _live_filter_options(categories, tags, bar))
-    one_slice = options[0] if len(options) == 1 else None
-    if not filtered or one_slice is not None:
-        slices = ""
-    elif bar is None:
-        slices = ("; this page's filter bar could not be built, so no Category/Tag slice "
-                  "of it is shown")
-    elif not options:
-        slices = "; no scenario of this run has a pair filed under the live category/tag filter"
-    else:
-        slices = (f"; the live category/tag filter covers {', '.join(options)} — the filter "
-                  "bar shows one of them at a time, never their union")
+    # What to tick in the Category and Tag menus to show a live filter (ticks); when
+    # the bar cannot show it, why not (slices)
+    ticks = None
+    slices = ""
+    if filtered and bar is None:
+        slices = ("; this page's filter bar could not be built, so the live category/tag "
+                  "filter cannot be shown")
+    elif filtered:
+        ticked = _live_filter_ticks(categories, tags, bar)
+        if ticked[0]:
+            ticks = _tick_phrase(ticked)
+        else:
+            slices = ("; no scenario of this run has a pair filed under the live "
+                      "category/tag filter")
     # Tier floors off at a band no tier binds at: the tier-on cell holds it
     never_binds = ("" if sweep.live_tier_floors or not view.tier_floors else
                    " (no tier floor binds at this band, so off and on are one rule)")
@@ -4637,7 +4676,7 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     if view.where == _LIVE_RULE_NOT_SIMULATED:
         tail = "not simulated by this run"
     elif view.where == _LIVE_RULE_PRIMARY:
-        chosen = "" if one_slice is None else f", with {one_slice} chosen in the filter bar"
+        chosen = "" if ticks is None else f", with {ticks} ticked in the filter bar"
         tail = f"this run's primary{never_binds}{chosen}{slices}{ladders}"
         # The primary is a tier-on cell, at the band the page was rendered at
         shown = (None if bar is None else bar["primary"][0], True)
@@ -4656,10 +4695,9 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
             option = entries[index]["option"]
             choices = ([f"Spread band {option}", f"Tier floors on{never_binds}"]
                        if view.tier_floors else ["Tier floors off", f"Spread band {option}"])
-            if one_slice is not None:
-                choices.append(one_slice)
+            tick_clause = "" if ticks is None else f", and tick {ticks} there"
             tail = (f"choose {', '.join(choices[:-1])} and {choices[-1]} in the filter bar"
-                    f"{slices}{ladders}")
+                    f"{tick_clause}{slices}{ladders}")
             shown = (index, view.tier_floors)
     # The saved defaults' own sizing when it is not this run's, and where the bar shows it
     note = _live_sizing_note(sweep)

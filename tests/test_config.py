@@ -1349,6 +1349,27 @@ class TestTradeFilter:
     def test_the_truth_table(self, categories, tags, expected):
         assert self._kept(categories, tags) == expected
 
+    @pytest.mark.parametrize("categories, tags", [
+        (None, None), (("Economics",), None), (None, ("Basketball",)),
+        (("Sports", "Politics"), ("Sports · Basketball", "Politics · Fed")),
+        (("economics", "SPORTS"), ("Fed", "sports · soccer")),
+    ])
+    def test_the_two_field_entry_point_is_the_same_rule(self, categories, tags):
+        # The dashboard holds the recorded fields only; it asks the very rule a run's
+        # settings are kept by
+        by_settings = config.trade_filter(_settings(categories=categories, tags=tags))
+        by_fields = config.trade_filter_for(categories, tags)
+        assert all(by_fields(*pair) is by_settings(*pair) for pair in _FILED)
+        assert [pair for pair in _FILED if by_fields(*pair)] == self._kept(categories, tags)
+
+    def test_the_trade_filter_is_built_by_the_two_field_entry_point(self):
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(config.trade_filter))
+        called = {n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        assert "trade_filter_for" in called
+
     def test_names_are_compared_without_regard_to_case(self):
         # Both halves of a tied tag, the categories, and the pair's own labels
         assert self._kept(("sPORTS", "ECONOMICS"), ("SPORTS · basketBALL",)) == [

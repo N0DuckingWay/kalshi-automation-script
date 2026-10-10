@@ -3810,7 +3810,7 @@ def trade_filter(settings: LiveSettings) -> Callable[[str, str], bool]:
     a filter of plain tags alone keeps a pair when its category is listed (or
     none is) and its tag is listed. Names are compared without regard to case.
     This is the one definition of the filter: main._filter_by_category decides
-    every pair through it.
+    every pair through it, via trade_filter_for.
 
     Args:
         settings (LiveSettings): The run's toggles (categories and tags).
@@ -3819,10 +3819,32 @@ def trade_filter(settings: LiveSettings) -> Callable[[str, str], bool]:
         Callable[[str, str], bool]: keeps(category, tag), True when a pair
             filed under that category and first tag may trade.
     """
-    cats = None if settings.categories is None else {c.casefold() for c in settings.categories}
+    # The same test from the two fields alone, so a caller holding only the recorded
+    # filter (the backtest page) asks the very same rule
+    return trade_filter_for(settings.categories, settings.tags)
+
+
+def trade_filter_for(categories: tuple[str, ...] | None,
+                     tags: tuple[str, ...] | None) -> Callable[[str, str], bool]:
+    """
+    Build the category/tag filter from the two lists alone.
+
+    The body of trade_filter, for a caller that holds the two recorded fields
+    (BacktestSweep.live_categories / live_tags) rather than a LiveSettings.
+    The names are taken as validated: tied tags name a listed category.
+
+    Args:
+        categories (tuple[str, ...] | None): Listed categories; None = any.
+        tags (tuple[str, ...] | None): Listed tags, plain ("Basketball") or tied
+            ("Sports · Basketball"); None = any.
+
+    Returns:
+        Callable[[str, str], bool]: keeps(category, tag), as trade_filter returns.
+    """
+    cats = None if categories is None else {c.casefold() for c in categories}
     plain: set[str] = set()
     tied: dict[str, set[str]] = {}
-    for name in settings.tags or ():
+    for name in tags or ():
         category, tag = split_tag(name)
         if category is None:
             plain.add(tag.casefold())

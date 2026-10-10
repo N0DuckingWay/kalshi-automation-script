@@ -2505,27 +2505,81 @@ class TestLiveRuleHeader:
                           if bar else None)
 
     @pytest.mark.parametrize("categories, tags, tail", [
-        (("economics",), None, "this run's primary, with Category Economics chosen in the "
+        (("economics",), None, "this run's primary, with Category Economics ticked in the "
                                "filter bar"),
-        (("Economics",), ("fed",), "this run's primary, with Tag Economics · Fed chosen in "
-                                   "the filter bar"),
-        # A tag the bar lists under two categories: two options, one at a time
-        (None, ("Fed",), "this run's primary; the live category/tag filter covers Tag "
-                         "Economics · Fed, Tag Oil &amp; Gas · Fed — the filter bar shows "
-                         "one of them at a time, never their union"),
-        (("Economics", "Sports"), None, "this run's primary; the live category/tag filter "
-                                        "covers Category Economics, Category Sports — the "
-                                        "filter bar shows one of them at a time, never "
-                                        "their union"),
+        # A category narrowed to one of its two tags: tick the tag as well
+        (("Economics",), ("fed",), "this run's primary, with Category Economics and Tag "
+                                   "Economics · Fed ticked in the filter bar"),
+        # A plain tag under two categories: both are ticked, and only the category the
+        # tag narrows needs the tag ticked (Oil & Gas has no other tag)
+        (None, ("Fed",), "this run's primary, with Category Economics, Oil &amp; Gas and "
+                         "Tag Economics · Fed ticked in the filter bar"),
+        # Several categories at once are shown together
+        (("Economics", "Sports"), None, "this run's primary, with Category Economics, "
+                                        "Sports ticked in the filter bar"),
+        # A tied tag narrows its own category; the others count in full
+        (("Economics", "Oil & Gas"), ("Economics · Inflation",),
+         "this run's primary, with Category Economics, Oil &amp; Gas and Tag Economics · "
+         "Inflation ticked in the filter bar"),
         (("Politics",), None, "this run's primary; no scenario of this run has a pair filed "
                               "under the live category/tag filter"),
+        # A tag no pair of the run carries under that category
+        (("Economics",), ("Basketball",), "this run's primary; no scenario of this run has a "
+                                          "pair filed under the live category/tag filter"),
     ])
-    def test_a_filter_names_the_bars_own_options(self, categories, tags, tail):
+    def test_a_filter_names_what_to_tick(self, categories, tags, tail):
         text = self._filtered(categories, tags)
         words = backtester._live_filter_text(categories, tags)
         rule = config.describe_time_series_rule(True, (0.0, 1.0))
         assert text == (f"Live rule (saved live defaults): {rule}; category/tag filter "
                         f"({html.escape(words, quote=False)}); {self._CAP} — {tail}")
+        assert "never their union" not in text and "one of them at a time" not in text
+
+    _TICK_CATS = ("Economics", "Sports")
+    _TICK_SUBCATS = (("Economics", "Fed"), ("Sports", "Basketball"), ("Sports", "Soccer"))
+
+    @pytest.mark.parametrize("categories, tags, ticked", [
+        # The example of the multi-choice filter: one category whole, one narrowed
+        (("Economics", "Sports"), ("Sports · Basketball",),
+         (["Economics", "Sports"], ["Sports · Basketball"])),
+        # Letter case never matters, tied halves included
+        (("economics", "SPORTS"), ("sports · BASKETBALL",),
+         (["Economics", "Sports"], ["Sports · Basketball"])),
+        # Every tag of a category ticked is the category alone
+        (("Sports",), ("Sports · Basketball", "Sports · Soccer"), (["Sports"], [])),
+        # A plain tag is looked for under each listed category
+        (("Economics", "Sports"), ("Soccer",), (["Sports"], ["Sports · Soccer"])),
+        (None, ("Soccer",), (["Sports"], ["Sports · Soccer"])),
+        # No category listed and no tag kept: nothing to tick
+        (None, ("Nope",), ([], [])),
+        # A category the bar does not offer is left out
+        (("Economics", "Politics"), None, (["Economics"], [])),
+    ])
+    def test_the_ticks_follow_the_one_live_rule(self, categories, tags, ticked):
+        bar = self._bar(categories=self._TICK_CATS, subcats=self._TICK_SUBCATS)
+        assert dashboard._live_filter_ticks(categories, tags, bar) == ticked
+
+    def test_a_tied_tag_in_the_header_names_the_tag_to_tick(self):
+        sweep = self._sweep(live_categories=("Economics", "Sports"),
+                            live_tags=("Sports · Basketball",))
+        text = self._text(sweep, self._bar(categories=self._TICK_CATS,
+                                           subcats=self._TICK_SUBCATS))
+        assert text.endswith("— this run's primary, with Category Economics, Sports and Tag "
+                             "Sports · Basketball ticked in the filter bar")
+
+    def test_the_ticks_agree_with_the_rule_on_every_bar_pair(self):
+        # Whatever the ticks say, the pairs they show are exactly the pairs the live
+        # rule keeps (the page counts a ticked category in full unless a tag of it is ticked)
+        bar = self._bar(categories=self._TICK_CATS, subcats=self._TICK_SUBCATS)
+        for categories, tags in [(("Economics", "Sports"), ("Sports · Basketball",)),
+                                 (None, ("Soccer", "Fed")), (("Sports",), None)]:
+            keeps = config.trade_filter_for(categories, tags)
+            cats, ticked_tags = dashboard._live_filter_ticks(categories, tags, bar)
+            for ci, tag in bar["subcats"]:
+                name = bar["categories"][ci]
+                own = [t for c, t in map(config.split_tag, ticked_tags) if c == name]
+                shown = name in cats and (not own or tag in own)
+                assert shown == keeps(name, tag)
 
     def test_a_filter_on_a_grid_cell_follows_its_band_choice(self):
         sweep = self._sweep(live_spread_band=(0.3, 0.6), live_categories=("Sports",),
@@ -2533,8 +2587,8 @@ class TestLiveRuleHeader:
         bar = self._bar(bands=[(0.0, 1.0), (0.3, 0.6)], categories=self._CATS,
                         subcats=self._SUBCATS)
         assert self._text(sweep, bar).endswith(
-            "— choose Spread band max(tier,0.3)-0.6, Tier floors on and Category Sports in "
-            "the filter bar")
+            "— choose Spread band max(tier,0.3)-0.6 and Tier floors on in the filter bar, "
+            "and tick Category Sports there")
         # A bar that does not offer the band names no slice of it either
         bar = self._bar(categories=self._CATS, subcats=self._SUBCATS)
         assert self._text(sweep, bar).endswith(
@@ -2542,8 +2596,8 @@ class TestLiveRuleHeader:
 
     def test_without_a_bar_the_filters_slice_is_not_shown(self):
         assert self._filtered(("Economics",), None, bar=False).endswith(
-            "— this run's primary; this page's filter bar could not be built, so no "
-            "Category/Tag slice of it is shown")
+            "— this run's primary; this page's filter bar could not be built, so the live "
+            "category/tag filter cannot be shown")
 
     def test_no_filter_says_nothing_about_one(self):
         assert "categor" not in self._text(self._sweep(), self._bar(categories=self._CATS))

@@ -15359,30 +15359,47 @@ class TestLiveRuleLine:
         self._infeasible(monkeypatch, caplog)
         assert "categor" not in self._line(caplog)
 
-    @pytest.mark.parametrize("categories, tags, one", [
-        (("Economics",), None, True),
-        (("Economics",), ("Fed",), True),
-        (None, ("Fed",), False),
-        (("Economics", "Sports"), None, False),
-        (("Economics",), ("Fed", "CPI"), False),
+    @pytest.mark.parametrize("categories, tags", [
+        (("Economics",), None),
+        (("Economics",), ("Fed",)),
+        (None, ("Fed",)),
+        (("Economics", "Sports"), None),
+        (("Economics",), ("Fed", "CPI")),
+        # Tags tied to a category, alone and beside a plain one
+        (("Economics", "Sports"), ("Sports · Basketball",)),
+        (("Economics", "Sports"), ("Sports · Basketball", "Fed")),
     ])
     def test_a_filter_is_named_and_never_called_the_primary(
-        self, monkeypatch, caplog, categories, tags, one,
+        self, monkeypatch, caplog, categories, tags,
     ):
         from kalshi_betting import config
         rule = self._live(monkeypatch, True, (0.0, 1.0), categories, tags)
         res = self._infeasible(monkeypatch, caplog)
         words = config.describe_trade_filter(config.live_settings())
-        slices = ("; the dashboard's filter bar shows the live category/tag filter as one "
-                  "Category or Tag option of it (offered where this run filed a pair under "
-                  "it)" if one else
-                  "; the dashboard's filter bar shows the live category/tag filter one "
-                  "Category or Tag option of it at a time (each offered where this run filed "
-                  "a pair under it), never as their union")
+        # The line cannot name the menu boxes (only the page knows which it offers),
+        # so it says that ticking the filter's own categories and tags shows it
+        slices = ("; the dashboard's filter bar shows the live category/tag filter of it "
+                  "when its Category and Tag menus tick the categories and tags the filter "
+                  "lists (each offered where this run filed a pair under it)")
         assert self._line(caplog) == (
             f"Live time-series rule (saved live defaults): {rule}; category/tag filter ({words}) — "
             f"this run's primary scenario applies its time-series rule{slices}")
         assert (res.live_categories, res.live_tags) == (categories, tags)
+        assert "never as their union" not in self._line(caplog)
+
+    def test_a_grid_cell_names_its_scenario_in_the_filter_line(self, monkeypatch, caplog):
+        # A live band that is not the primary's: the filter clause speaks of that scenario
+        rule = self._live(monkeypatch, True, (0.35, 0.5), ("Economics", "Sports"),
+                          ("Sports · Basketball",))
+        self._feasible(monkeypatch, caplog, band_sweep=True)
+        assert self._line(caplog) == (
+            f"Live time-series rule (saved live defaults): {rule}; category/tag filter "
+            "(categories Economics, Sports; tags Sports · Basketball) — this run's primary "
+            "scenario does not (tier floors on, band 0-1); its grid simulated the live rule "
+            "as band 0.35-0.5 with the tier floors on, which the dashboard's filter bar "
+            "shows; the dashboard's filter bar shows the live category/tag filter of that "
+            "scenario when its Category and Tag menus tick the categories and tags the "
+            "filter lists (each offered where this run filed a pair under it)")
 
     def test_the_filter_words_are_describe_trade_filters(self):
         from kalshi_betting import config
