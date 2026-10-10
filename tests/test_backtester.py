@@ -20492,6 +20492,68 @@ class TestPositionSaleValueWalksTheLadder:
                 == backtester._position_sale_value([trade], _LADDER_M2))
 
 
+class TestPositionSaleValueSold:
+    """_position_sale_value(sold=...) sells only that many contract pairs of
+    each trade: the walk, the fee, the cost and the potential return all read
+    that count, and naming every trade's whole count is the default to the
+    last bit, so the take-profit sale is unchanged by the option."""
+
+    _LEVELS = TestPositionSaleValueWalksTheLadder._LEVELS
+
+    def _pair(self, model, n: int):
+        return TestPositionSaleValueWalksTheLadder()._pair(model, n)
+
+    def test_naming_every_whole_count_is_the_default(self):
+        model = _ladder_model(self._LEVELS)
+        first, second = self._pair(model, 250), self._pair(model, 37)
+        position = [first, second]
+        assert (backtester._position_sale_value(position, _LADDER_M2, sold=[250, 37])
+                == backtester._position_sale_value(position, _LADDER_M2))
+
+    def test_a_part_walks_and_pays_the_fee_on_that_many_contracts(self):
+        model = _ladder_model(self._LEVELS)
+        trade = self._pair(model, 1000)
+        per_trade, value, cost, potential = backtester._position_sale_value(
+            [trade], _LADDER_M2, sold=[250])
+        ((sale_value, fees, (price_a, price_b)),) = per_trade
+        # 250 of the 1,000 walk the ladder: 100 at the bid, 150 one cent down
+        assert price_a == pytest.approx(_walk_average(0.40, 250, self._LEVELS), abs=1e-12)
+        assert price_b == pytest.approx(_walk_average(0.55, 250, self._LEVELS), abs=1e-12)
+        assert fees == fee_leg_exact(250, price_a) + fee_leg_exact(250, price_b)
+        assert sale_value == value == _sale_value(250, ("bid", price_a), ("bid", price_b))
+        # A quarter of the trade: a quarter of its cost, 250 pairs' potential
+        assert cost == pytest.approx((trade.total_cost + trade.fees) / 4, abs=1e-12)
+        assert potential == 250.0
+
+    def test_a_part_the_ladder_holds_sells_where_the_whole_does_not(self):
+        model = _ladder_model(self._LEVELS)
+        trade = self._pair(model, 5000)
+        assert backtester._position_sale_value([trade], _LADDER_M2) is None
+        assert backtester._position_sale_value([trade], _LADDER_M2, sold=[1300]) is not None
+        assert backtester._position_sale_value([trade], _LADDER_M2, sold=[1301]) is None
+
+    def test_one_price_per_market_across_the_trades_that_sell(self):
+        model = _ladder_model(self._LEVELS)
+        first, second = self._pair(model, 500), self._pair(model, 200)
+        # 50 of the first and all 200 of the second: 250 contracts a market
+        per_trade, value, _cost, potential = backtester._position_sale_value(
+            [first, second], _LADDER_M2, sold=[50, 200])
+        price_a = _walk_average(0.40, 250, self._LEVELS)
+        assert [sale[2][0] for sale in per_trade] == [pytest.approx(price_a, abs=1e-12)] * 2
+        assert per_trade[0][1] == fee_leg_exact(50, per_trade[0][2][0]) \
+            + fee_leg_exact(50, per_trade[0][2][1])
+        assert value == per_trade[0][0] + per_trade[1][0]
+        assert potential == 250.0
+
+    def test_a_trade_that_sells_nothing_returns_nothing(self):
+        model = _ladder_model(self._LEVELS)
+        first, second = self._pair(model, 500), self._pair(model, 200)
+        per_trade, value, _cost, _potential = backtester._position_sale_value(
+            [first, second], _LADDER_M2, sold=[0, 120])
+        assert per_trade[0][:2] == (0.0, 0.0)
+        assert value == per_trade[1][0]
+
+
 def _with_volume(candles: dict, after: int | None = None, volume: float = 400.0) -> dict:
     """The candles, each ending after `after` (every one with None) carrying
     an hour's volume, so the depth model has a ladder at that checkpoint."""

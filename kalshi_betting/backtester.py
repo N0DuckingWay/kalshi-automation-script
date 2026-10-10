@@ -3807,12 +3807,15 @@ def _positions(open_trades: list[BacktestTrade]) -> list[list[BacktestTrade]]:
 
 
 def _position_sale_value(position: list[BacktestTrade], day: date,
-                         days_back: int = 0) -> tuple | None:
+                         days_back: int = 0, *, sold: list[int] | None = None) -> tuple | None:
     """
-    What selling a whole position at the checkpoint on `day` would return, and what it cost and could pay.
+    What selling a position at the checkpoint on `day` would return, and what it cost and could pay.
 
-    The one valuation a sale decides on (and _sale_reach replays).
-    The position's contracts are totalled per market (by ticker and side
+    The one valuation a sale decides on (and _sale_reach replays). By default
+    the whole position is sold; with `sold`, only that many contract pairs of
+    each trade are, and everything below reads that count in place of the
+    trade's own.
+    The contracts sold are totalled per market (by ticker and side
     held: an add-on to a lone leg can hold one market as A in one trade and
     as B in another), and each market gets one sale price:
       * a market that had paid out by the check
@@ -3828,7 +3831,8 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
     Each trade's leg returns its contracts at that price, less the taker fee
     on selling them (config.fee_leg_exact). The cost is each trade's
     contracts plus entry fees, and the potential total return each trade's
-    contract pairs times CONTRACT_PAYOUT_DOLLARS — what one leg pays in a win.
+    contract pairs times CONTRACT_PAYOUT_DOLLARS — what one leg pays in a win
+    (both for the share of the trade sold).
     With days_back, everything is read at the sell rule's daily check that
     many days before the checkpoint (TAKE_PROFIT_HOLD_DAYS): what a sale then
     would have returned. _hold_readings is its only caller.
@@ -3838,6 +3842,10 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
         day (date): A checkpoint date on the legs' weekly grid.
         days_back (int): 0 (the default) for the checkpoint; 1 to
             _HOLD_DAYS_MAX - 1 for a daily check before it.
+        sold (list[int] | None): Keyword-only. How many contract pairs of
+            each trade are sold, in the position's order, each from 0 to the
+            trade's n, with at least one contract sold on every market the
+            position holds; None (the default) sells every trade whole.
 
     Returns:
         tuple | None: (each trade's sale as (value, fees, (market A's sale
@@ -3860,11 +3868,13 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
         # Which side each leg holds (scanner.leg_sides, the one definition)
         legs.append(list(zip((trade.ticker_a, trade.ticker_b), trade.marks,
                              leg_sides(trade.pair_type), strict=True)))
-    # The contracts held on each market, and its quotes
+    # How many contract pairs each trade sells: all of them unless told otherwise
+    counts = [trade.n for trade in position] if sold is None else sold
+    # The contracts sold on each market, and its quotes
     held: dict[tuple[str, str], list] = {}
-    for trade, trade_legs in zip(position, legs, strict=True):
+    for count, trade_legs in zip(counts, legs, strict=True):
         for ticker, quotes, side in trade_legs:
-            held.setdefault((ticker, side), [quotes, 0])[1] += trade.n
+            held.setdefault((ticker, side), [quotes, 0])[1] += count
     # One sale price per market; None when it has paid out
     prices: dict[tuple[str, str], float | None] = {}
     for (ticker, side), (quotes, contracts) in held.items():
@@ -3883,26 +3893,29 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
         prices[(ticker, side)] = price
     per_trade = []
     value = cost = potential = 0.0
-    for trade, trade_legs in zip(position, legs, strict=True):
+    for trade, count, trade_legs in zip(position, counts, legs, strict=True):
         trade_value = fees = 0.0
         sale_prices: list[float | None] = []
         for ticker, quotes, side in trade_legs:
             price = prices[(ticker, side)]
             if price is None:
                 # Paid out: worth its payout, with nothing to sell
-                trade_value += trade.n * (quotes.paid_yes if side == "yes" else quotes.paid_no)
+                trade_value += count * (quotes.paid_yes if side == "yes" else quotes.paid_no)
                 sale_prices.append(None)
                 continue
-            # config.fee_leg_exact: the taker fee on selling n contracts at the price
-            fee = fee_leg_exact(trade.n, price)
-            trade_value += trade.n * price - fee
+            # config.fee_leg_exact: the taker fee on selling the contracts at the price
+            fee = fee_leg_exact(count, price)
+            trade_value += count * price - fee
             fees += fee
             sale_prices.append(price)
         sale = (trade_value, fees, (sale_prices[0], sale_prices[1]))
         per_trade.append(sale)
         value += sale[0]
-        cost += trade.total_cost + trade.fees
-        potential += trade.n * CONTRACT_PAYOUT_DOLLARS
+        # The share of the trade sold: exactly 1.0 for a whole trade, so a
+        # whole sale's cost is the trade's own to the last bit
+        share = count / trade.n
+        cost += (trade.total_cost + trade.fees) * share
+        potential += count * CONTRACT_PAYOUT_DOLLARS
     return per_trade, value, cost, potential
 
 
@@ -9459,6 +9472,55 @@ def _simulate_at_discount(
                 else:
                     del open_legs[ticker]
 
+    def drop(sold_ids: set[int]) -> None:
+        """
+        Take sold trades out of every record the walk keeps of its open trades.
+
+        A sold trade pays out no more and holds no market or ladder. A sale
+        can leave other trades of the same pair open (only part of a position
+        was sold): a market one of those still holds stays taken, and the
+        pair's add-on record keeps them.
+
+        Args:
+            sold_ids (set[int]): id() of each trade sold whole.
+        """
+        nonlocal pending_exits, open_trades, active_until, ladders_until
+        pending_exits = [row for row in pending_exits if id(row[2]) not in sold_ids]
+        open_trades = [t for t in open_trades if id(t) not in sold_ids]
+        freed = {tk for _ed, tk, t in active_until if id(t) in sold_ids}
+        active_until = [row for row in active_until if id(row[2]) not in sold_ids]
+        # A market another open trade of the pair still holds is not freed
+        active_tickers.difference_update(freed - {tk for _ed, tk, _t in active_until})
+        still_held = []
+        for row in ladders_until:
+            if id(row[2]) not in sold_ids:
+                still_held.append(row)
+                continue
+            # Its pair's add-on record, if it has one, gives up the same holds
+            record = open_pairs.get(pair_of[id(row[2])]) if add_to_held else None
+            for key in row[1]:
+                open_ladders[key] -= 1
+                if not open_ladders[key]:
+                    del open_ladders[key]
+                if record is not None:
+                    record["ladders"][key] -= 1
+        ladders_until = still_held
+        if add_to_held:
+            # Each pair's record keeps only its trades still open, and goes
+            # when none is; so does each market's list of open legs
+            for pid in list(open_pairs):
+                kept = [row for row in open_pairs[pid]["trades"] if id(row[0]) not in sold_ids]
+                if kept:
+                    open_pairs[pid]["trades"] = kept
+                else:
+                    del open_pairs[pid]
+            for ticker in list(open_legs):
+                legs = [leg for leg in open_legs[ticker] if id(leg["trade"]) not in sold_ids]
+                if legs:
+                    open_legs[ticker] = legs
+                else:
+                    del open_legs[ticker]
+
     def sell(d: date) -> None:
         """
         Sell, whole, every open position that has stayed at sell_at of its potential profit for hold_days days.
@@ -9466,15 +9528,15 @@ def _simulate_at_discount(
         A position with fewer than min_days days left before it matures is
         skipped before it is valued (_far_enough). Each sold trade's proceeds
         come in now, its record is replaced by its sold copy (_sold_copy),
-        its pay-out, markets and ladder labels are freed, and its pair may be
-        bought again at a later checkpoint (never at this one: its markets go
-        into sold_here). Each position sold adds a SaleCheck to sale_checks.
+        its pay-out, markets and ladder labels are freed (drop), and its pair
+        may be bought again at a later checkpoint (never at this one: its
+        markets go into sold_here). Each position sold adds a SaleCheck to
+        sale_checks.
 
         Args:
             d (date): The checkpoint date, after its pay-outs.
         """
-        nonlocal cash, pending_exits, open_trades, active_until, ladders_until
-        nonlocal positions_sold
+        nonlocal cash, positions_sold
         sold_here.clear()
         sold_ids: set[int] = set()
         for position in _positions(open_trades):
@@ -9498,36 +9560,10 @@ def _simulate_at_discount(
                 # Free to trade again, at a later checkpoint only
                 traded_pairs.discard(pair_of[id(trade)])
                 sold_pairs.add(pair_of[id(trade)])
-        if not sold_ids:
-            return
-        # A sold trade pays out no more, and holds no market or ladder: a
-        # position is all the trades sharing its markets, so no open trade
-        # still holds any of them
-        pending_exits = [row for row in pending_exits if id(row[2]) not in sold_ids]
-        open_trades = [t for t in open_trades if id(t) not in sold_ids]
-        active_tickers.difference_update(tk for _ed, tk, t in active_until if id(t) in sold_ids)
-        active_until = [row for row in active_until if id(row[2]) not in sold_ids]
-        still_held = []
-        for row in ladders_until:
-            if id(row[2]) not in sold_ids:
-                still_held.append(row)
-                continue
-            for key in row[1]:
-                open_ladders[key] -= 1
-                if not open_ladders[key]:
-                    del open_ladders[key]
-        ladders_until = still_held
-        if add_to_held:
-            # Its pairs' records and its legs go too: nothing is held to add to
-            for pid in [pid for pid, rec in open_pairs.items()
-                        if any(id(t) in sold_ids for t, _paid in rec["trades"])]:
-                del open_pairs[pid]
-            for ticker in list(open_legs):
-                legs = [leg for leg in open_legs[ticker] if id(leg["trade"]) not in sold_ids]
-                if legs:
-                    open_legs[ticker] = legs
-                else:
-                    del open_legs[ticker]
+        if sold_ids:
+            # A position is all the trades sharing its markets, so no open
+            # trade still holds any of a sold position's
+            drop(sold_ids)
 
     # Without selling, the candidates alone; with it, every other checkpoint
     # too, up to the last pay-out (_sale_stream), so a position can be sold
