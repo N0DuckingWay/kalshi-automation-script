@@ -1359,7 +1359,9 @@ class TestConfirmRefusals:
         _query(source=DASHBOARD_NOTE.translate(_FULL_WIDTH)),
         _query() + "&category=Fútbol",                # not percent-encoded
         _query(nonce="0" * 32), _query(action="trade"),  # not proposal fields
-        "k", "&&", _query() + "&" + "&".join(f"x{i}=1" for i in range(20)),
+        # More fields than a request may hold
+        "k", "&&", _query() + "&" + "&".join(
+            f"x{i}=1" for i in range(defaults_server._MAX_FIELDS)),
     ])
     def test_it_is_refused(self, query):
         response = _get(_app(start_process=_Starter()), f"/confirm?{query}")
@@ -1376,7 +1378,7 @@ class TestConfirmRefusals:
 
     def test_the_refusal_names_the_rule(self):
         body = _get(_app(), "/confirm?" + _query(tag="Basketball")).body
-        assert "a tag needs its category" in body
+        assert "a tag needs a category" in body
 
     def test_the_seed_note_labels_the_seed_values_only(self):
         # The seed's values under its note are shown ...
@@ -1414,6 +1416,340 @@ class TestConfirmRefusals:
         assert response.status == 400
         assert "These settings cannot be saved" in response.body
         assert app._start_process.calls == []
+
+
+def _filter_query(categories=(), tags=(), **changes) -> str:
+    """
+    Build a confirmation query that names several categories and tags.
+
+    Args:
+        categories: The category names, one field each, in order.
+        tags: The tag names, one field each, in order.
+        **changes: Other fields to set or (with None) remove, as _query takes them.
+
+    Returns:
+        str: The query string.
+    """
+    names = [("category", name) for name in categories] + [("tag", name) for name in tags]
+    return _query(**changes) + ("&" + urlencode(names) if names else "")
+
+
+# The most names a link may carry: 40 categories, and one tag tied to each
+_MOST = config.DEFAULTS_SERVER_MAX_FILTER_NAMES
+_MOST_CATEGORIES = tuple(f"Climate and Weather {i:02d}" for i in range(_MOST))
+_MOST_TAGS = tuple(f"{name} · Hurricanes and Storms" for name in _MOST_CATEGORIES)
+
+
+class TestSeveralCategoriesAndTags:
+    """A link may name several categories and tags, one field each: the page
+    proposes exactly them, a save writes them and a run gets one flag each."""
+
+    _CATEGORIES = ("Economics", "Sports", "Climate and Weather")
+    _TAGS = ("Sports · Basketball", "Sports · Pro Football", "climate and weather · Hurricanes")
+    _SETTINGS = replace(_BASE_SETTINGS, categories=_CATEGORIES, tags=_TAGS)
+
+    def test_the_page_proposes_every_name_in_order(self):
+        query = _filter_query(self._CATEGORIES, self._TAGS)
+        assert defaults_server._proposal(defaults_server._params(query), None) == (
+            self._SETTINGS, "")
+        response = _get(_app(), f"/confirm?{query}")
+        assert response.status == 200
+        page = _parse(response.body)
+        assert page.cells["categories"][:3] == [
+            "categories", "—", "Economics, Sports, Climate and Weather"]
+        assert page.cells["tags"][:3] == [
+            "tags", "—", "Sports · Basketball, Sports · Pro Football, "
+            "climate and weather · Hurricanes"]
+        # The form carries one hidden field per name, in the link's order
+        assert [v for n, v in page.hidden if n == "category"] == list(self._CATEGORIES)
+        assert [v for n, v in page.hidden if n == "tag"] == list(self._TAGS)
+
+    def test_the_filter_it_proposes_is_the_rule_s(self):
+        settings, _ = defaults_server._proposal(defaults_server._params(
+            _filter_query(("Economics", "Sports"), ("Sports · Basketball",))), None)
+        keeps = config.trade_filter(settings)
+        assert keeps("Economics", "Fed") and keeps("Sports", "Basketball")
+        assert not keeps("Sports", "Soccer") and not keeps("Politics", "Basketball")
+
+    def test_a_link_with_one_category_and_one_plain_tag_still_means_the_same(self):
+        # The address a dashboard built before several names could be sent
+        for query in (_query(category="Sports", tag="Basketball"),
+                      _filter_query(("Sports",), ("Basketball",))):
+            settings, _ = defaults_server._proposal(defaults_server._params(query), None)
+            assert settings == replace(_BASE_SETTINGS, categories=("Sports",),
+                                       tags=("Basketball",))
+            assert _get(_app(), f"/confirm?{query}").status == 200
+        # Categories alone, and a plain tag beside a tied one
+        settings, _ = defaults_server._proposal(defaults_server._params(
+            _filter_query(("Sports", "Economics"))), None)
+        assert (settings.categories, settings.tags) == (("Sports", "Economics"), None)
+        settings, _ = defaults_server._proposal(defaults_server._params(
+            _filter_query(("Sports", "Economics"), ("Fed", "Sports · Soccer"))), None)
+        assert settings.tags == ("Fed", "Sports · Soccer")
+
+    def test_a_missing_filter_still_means_any_whatever_is_saved(self):
+        _save(self._SETTINGS)
+        settings, _ = defaults_server._proposal(defaults_server._params(_query()),
+                                                config.read_saved_live_defaults())
+        assert settings.categories is None and settings.tags is None
+
+    @pytest.mark.parametrize("query, why", [
+        # The very same name twice (another letter case is left out instead:
+        # test_a_second_spelling_in_another_letter_case_is_left_out)
+        (_filter_query(("Sports", "Economics", "Sports")), "category &#x27;Sports&#x27; "
+                                                           "is given twice"),
+        (_filter_query(("Sports",), ("Basketball", "Soccer", "Basketball")),
+         "tag &#x27;Basketball&#x27; is given twice"),
+        (_filter_query(("Sports",), ("Sports · Soccer", "Sports · Soccer")), "is given twice"),
+        # ... even when it repeats a spelling that was itself left out
+        (_filter_query(("Sports", "sports", "sports")), "category &#x27;sports&#x27; "
+                                                        "is given twice"),
+        # A blank value among several
+        (_filter_query(("Sports",)) + "&category=", "category is blank"),
+        (_filter_query(("Sports",), ("Soccer",)) + "&tag=&tag=Basketball", "tag is blank"),
+        # More names than a link may carry
+        (_filter_query([f"C{i}" for i in range(_MOST + 1)]),
+         f"category is given {_MOST + 1} times, more than {_MOST}"),
+        (_filter_query(("Sports",), [f"T{i}" for i in range(_MOST + 1)]),
+         f"tag is given {_MOST + 1} times, more than {_MOST}"),
+        # A tag tied to a category the link does not name
+        (_filter_query(("Sports",), ("Economics · Fed",)),
+         "names the category &#x27;Economics&#x27;, which categories does not list"),
+        (_filter_query(("Sports", "Politics"), ("Sports · Soccer", "Economics · Fed")),
+         "which categories does not list"),
+        # Tags, tied or plain, with no category at all
+        (_filter_query((), ("Sports · Basketball",)), "a tag needs a category"),
+        (_filter_query((), ("Basketball", "Soccer")), "a tag needs a category"),
+        # A category written as a tied tag, with tags or without: it would read
+        # as "Sports narrowed to Basketball" while all of Sports traded
+        (_filter_query(("Sports", "Sports · Basketball")),
+         "categories: &#x27;Sports · Basketball&#x27; is a tag tied to a category; "
+         "give it as a tag"),
+        (_filter_query(("Sports", "Sports · Basketball"), ("Sports · Basketball",)),
+         "is a tag tied to a category; give it as a tag"),
+        (_filter_query(("Sports ·",)), "is a tag tied to a category; give it as a tag"),
+        # Two spaces in a row, which a browser would show as one: the name
+        # would look like another category's, or like a tag tied to it
+        (_filter_query(("Climate and Weather", "Climate  and Weather"),
+                       ("Climate  and Weather · Hurricanes",)),
+         "category must not hold two spaces in a row, got &#x27;Climate  and Weather&#x27;"),
+        (_filter_query(("Climate and Weather",), ("Climate  and Weather · Hurricanes",)),
+         "tag must not hold two spaces in a row"),
+        (_filter_query(("Sports",), ("Sports ·  Basketball",)),
+         "tag must not hold two spaces in a row"),
+        (_filter_query(("Sports",), ("Pro  Football",)), "tag must not hold two spaces in a row"),
+        # A tied tag with a blank half is never read as a plain tag
+        (_filter_query(("Sports",), ("Sports · ",)), "tag must be one printable name"),
+        (_filter_query(("Sports",), (" · Basketball",)), "tag must be one printable name"),
+        (_filter_query(("Sports",), ("Sports ·",)), "must read &#x27;Category · Tag&#x27;"),
+        (_filter_query(("Sports",), ("· Basketball",)), "must read &#x27;Category · Tag&#x27;"),
+        # One bad name refuses the whole link
+        (_filter_query(("Sports", "any")), "categories cannot hold the name"),
+        (_filter_query(("Sports", " Economics")), "category must be one printable name"),
+        (_filter_query(("Sports",), ("Soccer", "Bask‮etball")),
+         "tag must be one printable name"),
+        # A single-valued field still may not repeat
+        (_filter_query(("Sports",)) + "&k=0.8", "k is given 2 times"),
+    ])
+    def test_a_bad_list_is_refused_with_the_reason(self, query, why):
+        response = _get(_app(start_process=_Starter()), f"/confirm?{query}")
+        assert response.status == 400, query
+        assert why in response.body, response.body
+        assert "<form" not in response.body and "<button" not in response.body
+        assert config.read_saved_live_defaults() is None
+
+    def test_a_second_spelling_in_another_letter_case_is_left_out(self):
+        # Kalshi spells a few tags two ways under one category, and a page that
+        # lists both may send both: the live filter ignores letter case, so the
+        # first spelling is kept and the link is not refused
+        query = _filter_query(("Health", "Sports", "health"),
+                              ("Health · COVID", "Health · Covid", "Basketball", "BASKETBALL"))
+        settings, _ = defaults_server._proposal(defaults_server._params(query), None)
+        assert settings.categories == ("Health", "Sports")
+        assert settings.tags == ("Health · COVID", "Basketball")
+        app = _app()
+        response = _get(app, f"/confirm?{query}")
+        assert response.status == 200
+        page = _parse(response.body)
+        assert page.cells["categories"][:3] == ["categories", "—", "Health, Sports"]
+        assert page.cells["tags"][:3] == ["tags", "—", "Health · COVID, Basketball"]
+        # The filter keeps either spelling's pairs
+        keeps = config.trade_filter(settings)
+        assert keeps("Health", "Covid") and keeps("Health", "COVID")
+        assert keeps("Sports", "Basketball") and not keeps("Health", "Flu")
+        # Saving the page's own form writes each name once
+        assert _post(app, _click(page, "confirm")).status == 303
+        saved = config.read_saved_live_defaults()
+        assert (saved.categories, saved.tags) == (settings.categories, settings.tags)
+
+    def test_the_cap_counts_the_names_sent(self):
+        # 41 spellings of one name are over the cap, though one would be kept
+        spellings = [f"{'s' * i}{'S' * (_MOST + 1 - i)}" for i in range(_MOST + 1)]
+        assert len({s.casefold() for s in spellings}) == 1 and len(set(spellings)) == _MOST + 1
+        response = _get(_app(), "/confirm?" + _filter_query(spellings))
+        assert response.status == 400
+        assert f"category is given {_MOST + 1} times, more than {_MOST}" in response.body
+        # ... while 40 of them are one category
+        settings, _ = defaults_server._proposal(defaults_server._params(
+            _filter_query(spellings[:_MOST])), None)
+        assert settings.categories == (spellings[0],)
+
+    @pytest.mark.parametrize("button_id", ["confirm", "confirm-trade", "confirm-dry-run"])
+    def test_a_form_with_several_names_posted_twice_does_its_work_once(self, monkeypatch,
+                                                                      button_id):
+        _save(_BASE_SETTINGS)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        saves = []
+        real_save = defaults_server.save_live_defaults
+
+        def counting_save(settings, *, source):
+            """
+            Count each save, then make it.
+
+            Args:
+                settings (LiveSettings): The defaults saved.
+                source (str): Their source note.
+
+            Returns:
+                LiveSettings: What the real save returns.
+            """
+            saves.append(settings)
+            return real_save(settings, source=source)
+
+        monkeypatch.setattr(defaults_server, "save_live_defaults", counting_save)
+        form = _page_form(app, _filter_query(self._CATEGORIES, self._TAGS), button_id)
+        first = _post(app, form)
+        assert first.status == 303
+        # The second POST of the same page is sent to what the first produced
+        second = _post(app, form)
+        assert second.status == 303 and second.location == first.location
+        assert defaults_server._STALE_BANNER not in second.body
+        dry_run = button_id == "confirm-dry-run"
+        assert saves == ([] if dry_run else [self._SETTINGS])
+        assert len(starter.calls) == (0 if button_id == "confirm" else 1)
+        assert config.read_saved_live_defaults() == (
+            _BASE_SETTINGS if dry_run else self._SETTINGS)
+        # ... and the one run, if any, got each name once
+        for argv, _ in starter.calls:
+            assert argv[5:argv.index("--result-file")] == config.live_settings_argv(
+                self._SETTINGS)
+
+    def test_the_most_names_a_link_may_carry_fit_one_request(self):
+        # 40 categories and 40 tags, each tag tied to its category
+        query = _filter_query(_MOST_CATEGORIES, _MOST_TAGS, source=DASHBOARD_NOTE)
+        app = _app()
+        target = f"/confirm?{query}"
+        response = _get(app, target)
+        assert response.status == 200
+        form = _click(response.body, "confirm", ack=False)
+        body = urlencode(form).encode("ascii")
+        # Well inside the handler's limit on a request (its path plus its body)
+        assert len(target) < config.DEFAULTS_SERVER_MAX_REQUEST_BYTES // 2
+        assert len("/confirm") + len(body) < config.DEFAULTS_SERVER_MAX_REQUEST_BYTES // 2
+        assert len(form) <= defaults_server._MAX_FIELDS - 2
+        assert _post(app, form).status == 303
+        saved = config.read_saved_live_defaults()
+        assert saved.categories == _MOST_CATEGORIES and saved.tags == _MOST_TAGS
+
+    def test_the_field_limit_covers_the_fullest_form(self):
+        # Every proposal field once, the most categories and tags, the three
+        # signed fields, the action and the acknowledgement
+        fullest = (len(defaults_server._FIELDS) - 2) + 2 * _MOST + 5
+        assert fullest <= defaults_server._MAX_FIELDS
+        fields = "&".join(f"x{i}=1" for i in range(defaults_server._MAX_FIELDS))
+        assert len(defaults_server._params(fields)) == defaults_server._MAX_FIELDS
+        with pytest.raises(ValueError):
+            defaults_server._params(fields + "&y=1")
+
+    def test_confirm_and_save_writes_every_name(self):
+        app = _app()
+        form = _page_form(app, _filter_query(self._CATEGORIES, self._TAGS))
+        response = _post(app, form)
+        assert response.status == 303
+        saved = config.read_saved_live_defaults()
+        assert saved == self._SETTINGS
+        assert (saved.categories, saved.tags) == (self._CATEGORIES, self._TAGS)
+        stored = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))["settings"]
+        assert stored["categories"] == list(self._CATEGORIES)
+        assert stored["tags"] == list(self._TAGS)
+        # The saved page names them
+        body = _get(app, "/saved").body
+        assert "Economics, Sports, Climate and Weather" in body
+        assert "Sports · Basketball, Sports · Pro Football" in body
+
+    @pytest.mark.parametrize("button, dry_run", [("confirm-dry-run", True),
+                                                 ("confirm-trade", False)])
+    def test_a_run_gets_one_flag_per_name(self, button, dry_run):
+        # A dry run needs saved defaults; these name no category or tag
+        _save(_BASE_SETTINGS)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        form = _page_form(app, _filter_query(self._CATEGORIES, self._TAGS), button)
+        _run_id(_post(app, form))
+        [(argv, _)] = starter.calls
+        assert ("--dry-run" in argv) is dry_run
+        assert [a for a in argv if a.startswith(("--category", "--tag", "--any"))] == [
+            "--category=Economics", "--category=Sports", "--category=Climate and Weather",
+            "--tag=Sports · Basketball", "--tag=Sports · Pro Football",
+            "--tag=climate and weather · Hurricanes"]
+        flags = argv[5:argv.index("--result-file")]
+        assert flags == config.live_settings_argv(self._SETTINGS)
+        # A dry run saves nothing; Confirm and trade saved before it started
+        assert config.read_saved_live_defaults() == (
+            _BASE_SETTINGS if dry_run else self._SETTINGS)
+
+    def test_the_trade_page_runs_saved_names(self):
+        saved = _save(self._SETTINGS)
+        starter = _Starter()
+        app = _app(start_process=starter)
+        _run_id(_post(app, _trade_form(app, "confirm-dry-run"), target="/trade"))
+        [(argv, _)] = starter.calls
+        assert argv[5:argv.index("--result-file")] == config.live_settings_argv(saved)
+        assert "--tag=Sports · Basketball" in argv and "--category=Economics" in argv
+
+    def test_the_token_covers_every_name_and_its_place(self):
+        app = _app(start_process=_Starter())
+        form = _page_form(app, _filter_query(("Economics", "Sports"), ("Sports · Soccer",)))
+
+        def changed(edit):
+            """A copy of the form with its (name, value) pairs passed through edit."""
+            return edit(list(form))
+
+        def without(pairs, pair):
+            pairs.remove(pair)
+            return pairs
+
+        def swapped(pairs):
+            a, b = pairs.index(("category", "Economics")), pairs.index(("category", "Sports"))
+            pairs[a], pairs[b] = pairs[b], pairs[a]
+            return pairs
+
+        for tampered in (
+            changed(lambda p: without(p, ("category", "Economics"))),
+            changed(lambda p: without(p, ("tag", "Sports · Soccer"))),
+            changed(lambda p: p + [("category", "Politics")]),
+            changed(lambda p: p + [("tag", "Sports · Basketball")]),
+            changed(swapped),
+        ):
+            assert _post(app, tampered).status == 403, tampered
+        assert config.read_saved_live_defaults() is None
+        # The page's own form is still good afterwards
+        assert _post(app, form).status == 303
+        assert config.read_saved_live_defaults().categories == ("Economics", "Sports")
+
+    def test_a_stale_page_is_shown_again_with_every_name(self):
+        app = _app()
+        form = _page_form(app, _filter_query(self._CATEGORIES, self._TAGS))
+        _save(LiveSettings(True, (0.0, 1.0), 0.8, 0.1, 0.5))
+        response = _post(app, form)
+        assert response.status == 409
+        page = _parse(response.body)
+        assert [v for n, v in page.hidden if n == "category"] == list(self._CATEGORIES)
+        assert [v for n, v in page.hidden if n == "tag"] == list(self._TAGS)
+        # The fresh page's form saves them
+        assert _post(app, _click(page, "confirm")).status == 303
+        assert config.read_saved_live_defaults().tags == self._TAGS
 
 
 class TestRefusedFile:
@@ -1665,7 +2001,7 @@ class TestSave:
             _get(_app(), "/confirm?" + _query(tag="Basketball"))
         [record] = caplog.records
         assert record.levelno == logging.WARNING
-        assert record.getMessage() == "Refused (400 Bad Request): a tag needs its category"
+        assert record.getMessage() == "Refused (400 Bad Request): a tag needs a category"
 
 
 class TestSavedPage:
@@ -1828,6 +2164,50 @@ class TestHelpers:
             "confirm\n" + "f" * 64 + "\n" + "n" * 32 + "\ncategory=A+B&k=0.80&tier_floors=off")
         assert defaults_server._signed_text("trade", "f" * 64, "n" * 32, {}) == (
             "trade\n" + "f" * 64 + "\n" + "n" * 32 + "\n")
+
+    def test_the_signed_text_keeps_a_repeated_field_s_values_in_order(self):
+        # Field names are sorted; the categories and tags stay as the page listed them
+        params = {"tag": ["Sports · Soccer", "Fed"], "k": ["0.8"],
+                  "category": ["Sports", "Economics"]}
+        assert defaults_server._signed_text("confirm", "f" * 64, "n" * 32, params) == (
+            "confirm\n" + "f" * 64 + "\n" + "n" * 32
+            + "\ncategory=Sports&category=Economics&k=0.8&tag=Sports+%C2%B7+Soccer&tag=Fed")
+        other = {**params, "category": ["Economics", "Sports"]}
+        assert defaults_server._signed_text("confirm", "f" * 64, "n" * 32, other) != (
+            defaults_server._signed_text("confirm", "f" * 64, "n" * 32, params))
+
+    def test_a_name_list_reads_each_name_once(self):
+        params = {"category": ["Sports", "Economics"], "tag": ["Sports · Soccer"]}
+        assert defaults_server._name_list(params, "category") == ("Sports", "Economics")
+        assert defaults_server._name_list(params, "tag") == ("Sports · Soccer",)
+        assert defaults_server._name_list({"category": ["Sports"]}, "tag") is None
+        # Another letter case of an earlier name is left out; the first is kept
+        assert defaults_server._name_list(
+            {"category": ["Sports", "SPORTS", "Economics", "sports"]}, "category") == (
+                "Sports", "Economics")
+        assert defaults_server._name_list(
+            {"tag": ["Health · Covid", "Health · COVID"]}, "tag") == ("Health · Covid",)
+        # The very same name twice is refused, a left-out spelling included
+        with pytest.raises(ValueError, match="category 'Sports' is given twice"):
+            defaults_server._name_list({"category": ["Sports", "Sports"]}, "category")
+        with pytest.raises(ValueError, match="category 'SPORTS' is given twice"):
+            defaults_server._name_list({"category": ["Sports", "SPORTS", "SPORTS"]}, "category")
+        with pytest.raises(ValueError, match="tag must be one printable name"):
+            defaults_server._name_list({"tag": ["Soccer", " Fed"]}, "tag")
+        with pytest.raises(ValueError, match="tag must not hold two spaces in a row"):
+            defaults_server._name_list({"tag": ["Soccer", "Pro  Football"]}, "tag")
+
+    def test_a_name_may_hold_single_spaces_only(self):
+        for name in ("Climate and Weather", "Sports · Pro Football", "Oil & Gas", "A"):
+            assert defaults_server._name(name, "category") == name
+        for bad in ("Climate  and Weather", "Sports ·  Basketball", "Sports  · Basketball",
+                    "a   b"):
+            with pytest.raises(ValueError, match="category must not hold two spaces in a row"):
+                defaults_server._name(bad, "category")
+        # A tab or a no-break space is not printable, so it never gets that far
+        for bad in ("a\tb", "a b", "a  b"):
+            with pytest.raises(ValueError, match="category must be one printable name"):
+                defaults_server._name(bad, "category")
 
     def test_a_number_reads_plainly(self):
         assert defaults_server._number("-0", "k") == 0.0
@@ -3448,6 +3828,19 @@ class TestOverASocket:
         status, _, body = _request(port, "GET", "/saved")
         assert status == 200 and "Saved and verified:" in body
         assert config.read_saved_live_defaults() == _BASE_SETTINGS
+
+    def test_the_most_categories_and_tags_fit_a_page_and_its_save(self, live_server):
+        # 40 categories and 40 tied tags, through the handler's request-size limit
+        port = live_server.server_address[1]
+        query = _filter_query(_MOST_CATEGORIES, _MOST_TAGS, source=DASHBOARD_NOTE)
+        status, _, body = _request(port, "GET", f"/confirm?{query}")
+        assert status == 200
+        form = urlencode(_click(body, "confirm")).encode("ascii")
+        status, headers, _ = _request(port, "POST", "/confirm", body=form, headers={
+            "Origin": f"http://127.0.0.1:{port}", "Content-Type": FORM})
+        assert status == 303 and headers["Location"] == "/saved"
+        saved = config.read_saved_live_defaults()
+        assert saved.categories == _MOST_CATEGORIES and saved.tags == _MOST_TAGS
 
     def test_a_dry_run_round_trip_starts_a_process_and_shows_its_result(self, live_server):
         port = live_server.server_address[1]

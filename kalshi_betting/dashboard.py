@@ -41,20 +41,44 @@ Purpose:
     discount k and per-trade size cap, with or without adding to pairs the
     run still holds, holding every position to its pay-out or selling it at
     a share of its potential profit (no nearer to maturity than a number of
-    days), and/or one Kalshi category or
-    category · tag of it,
+    days), and/or any set of its Kalshi categories and category · tags
+    (the Category and Tag menus are check-box dropdowns: a ticked category
+    counts in full unless some of its tags are ticked, then only those —
+    the live filter's rule, config.trade_filter; tags of one category whose
+    names differ only in letter case are one tag to that filter, so the
+    page ticks and unticks them together, _case_twins),
     and moves the k-hat breakdown and the performance section's k-hat cards
     to the same band, tier setting and selection (the breakdown's reference
     line to the same k), the interval-discount section to the same k and
     size cap (at the primary spread band, tier floors on), and the scenario
     explorer's band, Tier floors, k and size-cap selects to the same
-    scenario (they stay usable on their own). Every figure a selection shows
-    is computed here in
-    Python by the helpers the sections themselves render with, packed into
-    gzip + base64 data blocks — one base block (_filter_payload) and one
-    chunk per distinct scenario trade list (_ChunkVisitor) — and swapped in
-    by a small inline script (_FILTER_JS) that draws nothing of its own and
-    inflates a scenario's chunk only when a reader chooses it.
+    scenario (they stay usable on their own). Every figure of a scenario,
+    of one category of it and of one category · tag of it is computed here
+    in Python by the helpers the sections themselves render with, packed
+    into gzip + base64 data blocks — one base block (_filter_payload) and
+    one chunk per distinct scenario trade list (_ChunkVisitor) — and swapped
+    in by an inline script (_FILTER_JS) that inflates a scenario's chunk
+    only when a reader chooses it. A set of ticks that covers exactly one of
+    those views draws that view. Any other set is a mix, and there are far
+    too many mixes to ship a view of each, so the script works a mix out
+    itself (its mixView) from the category · tag views it covers, following
+    the Python helpers step by step, with Python's constants, markup and
+    words; tests/test_dashboard.py::TestMixedSelection holds what it draws
+    to what _view_payload computes for the same trades. A chunk whose
+    category · tag views cannot be combined ("m" left out, below) refuses a
+    mix: the ticks go back and the summary line says so.
+
+    A chunk holds a view for the whole list, for each category and for each
+    category · tag. The category · tag views partition the list's trades,
+    and each also carries what several of them can be combined from: its
+    curve as running dollars per trade type ("m", shipped in place of each
+    of "eq", "total", "types" and "dd" — the same curve — that the script
+    works out from it to exactly Python's values, _curve_series_from_m; and
+    only when it can be relied on, _mix_curve) and its row of the category
+    table ("row"); the chunk carries per-trade
+    arrays (_mix_trade_arrays) and the base block the constants and markup
+    Python renders with (_mix_base, "mix") and each tag group's raw k-hat
+    counts.
 
     The bar's Add to held pairs choice is "off" (the page as rendered) or
     "on (up to the size cap)": the same scenario re-simulated with every pair
@@ -135,9 +159,14 @@ Purpose:
     DEFAULTS_SERVER_PORT) in a new tab, for the bar's scenario on screen —
     its spread band, Tier floors choice, k, size cap, Add to held pairs
     choice, Sell level and Min. days to maturity (each only on a page that
-    simulated it) and any category or tag, with this run's same-title cap when
-    the run recorded one — never
-    for the Scenario Explorer's own selects. That page compares the
+    simulated it) and the categories and tags ticked, with this run's
+    same-title cap when the run recorded one — never
+    for the Scenario Explorer's own selects. The address names each ticked
+    category once and each ticked tag once, as "Category · Tag" (the form
+    the live filter ties a tag to its category by), and never shortens a
+    category whose listed tags are all ticked to the category alone: the
+    page lists only the tags this backtest traded, so the category alone
+    would let a live run trade tags nobody ticked. That page compares the
     proposal with the live defaults in force and acts only when one of its
     buttons is pressed: Confirm and save saves it, Confirm and trade saves
     it and then runs the live bot with it, and Dry run runs the bot with it
@@ -146,9 +175,11 @@ Purpose:
     screen can become live settings (it was simulated, its band was
     recorded, and its k and size cap were recorded and are above zero),
     keeps it disabled while another scenario's
-    chunk loads, and, on a page that files trades by ticker prefix rather
-    than by Kalshi's series listing (which the live category and tag filter
-    reads), keeps it disabled for a category or tag. Beside it, a plain
+    chunk loads, with more categories and tags ticked than the confirmation
+    page accepts (config.DEFAULTS_SERVER_MAX_FILTER_NAMES), and, on a page
+    that files trades by ticker prefix rather than by Kalshi's series
+    listing (which the live category and tag filter reads), keeps it
+    disabled for a category or tag. Beside it, a plain
     "Trade using defaults…" link opens the server's trade page (the saved
     defaults, with Dry run and Confirm and trade) in a new tab; it needs no
     script. A page whose filter bar could not be built has no save button,
@@ -534,6 +565,7 @@ from .config import (
     DASHBOARD_FILENAME,
     DASHBOARD_FILES_DIRNAME,
     DEFAULTS_SERVER_HOST,
+    DEFAULTS_SERVER_MAX_FILTER_NAMES,
     DEFAULTS_SERVER_PORT,
     FLAT_RETURN_TOLERANCE,
     LIVE_DEFAULTS_SOURCE_PATTERN,
@@ -546,11 +578,13 @@ from .config import (
     RISK_FREE_RATE_FIELD,
     SAME_TITLE_CO_RESOLVE_PROB,
     SHORT_DEADLINE_GAP_DAYS,
+    TAG_SCOPE_SEPARATOR,
     TRADING_DAYS_PER_YEAR,
     describe_time_series_rule,
     fee_per_pair_approx,
     time_series_mid_spread,
     time_series_profit_prob,
+    trade_filter_for,
 )
 from .historical import series_labels as _series_labels
 from .scanner import leg_sides
@@ -985,6 +1019,7 @@ def _trade_type_label(trade: BacktestTrade) -> str:
 
 def _return_by_trade_type(
     trades: list[BacktestTrade], equity_df: pd.DataFrame, initial_balance: float,
+    *, dollars_out: dict[str, np.ndarray] | None = None,
 ) -> list[tuple[str, str, list[float]]]:
     """
     Attribute the equity curve's cumulative return to each trade type.
@@ -1003,6 +1038,12 @@ def _return_by_trade_type(
         trades (list[BacktestTrade]): The run's completed trades.
         equity_df (pd.DataFrame): The run's equity curve (_build_equity_curve).
         initial_balance (float): Starting balance the percentages divide by.
+        dollars_out (dict[str, np.ndarray] | None): Keyword-only. When given,
+            it receives each type's running P&L in DOLLARS on the curve's
+            rows (label -> array), the figures the percent lines are made
+            from: a category · tag view of the page-wide filter ships them
+            (its "m"), so the page can add several tags' curves together.
+            Left untouched when nothing is returned. None (default) keeps none.
 
     Returns:
         list[tuple[str, str, list[float]]]: (label, colour, cumulative return in
@@ -1028,10 +1069,12 @@ def _return_by_trade_type(
                     dates, np.datetime64(pd.Timestamp(when)), side="left"))
             if i < len(dates):
                 row[i] += amount
-    return [
-        (label, color, list(np.cumsum(steps[label]) / initial_balance * 100))
-        for label, color in _TRADE_TYPE_LINES if label in steps
-    ]
+    running = {label: np.cumsum(steps[label]) for label, _ in _TRADE_TYPE_LINES
+               if label in steps}
+    if dollars_out is not None:
+        dollars_out.update(running)
+    return [(label, color, list(running[label] / initial_balance * 100))
+            for label, color in _TRADE_TYPE_LINES if label in running]
 
 
 def _median_monthly_return(equity_df: pd.DataFrame | None) -> float | None:
@@ -1112,11 +1155,17 @@ def _brier_score(obs: list[tuple[float, int]]) -> float | None:
     return float(np.mean([(prob - actual) ** 2 for prob, actual in obs]))
 
 
+# How far from 0 and 1 the log loss keeps a prediction (the log of 0 has no
+# value); the base block's "mix" carries it for the page's script.
+_LOG_LOSS_CLIP = 1e-7
+
+
 def _log_loss(obs: list[tuple[float, int]]) -> float | None:
     """
     Mean binary cross-entropy (log loss) of predictions against outcomes.
 
-    Probabilities are clipped to [1e-7, 1-1e-7] to avoid log(0).
+    Probabilities are clipped to [1e-7, 1-1e-7] (_LOG_LOSS_CLIP) to avoid
+    log(0).
 
     Args:
         obs (list[tuple[float, int]]): (predicted probability, outcome 0/1)
@@ -1128,7 +1177,7 @@ def _log_loss(obs: list[tuple[float, int]]) -> float | None:
     """
     if not obs:
         return None
-    eps = 1e-7
+    eps = _LOG_LOSS_CLIP
     losses = []
     for prob, actual in obs:
         p = max(eps, min(1 - eps, prob))
@@ -1446,6 +1495,8 @@ def _performance_series(
     equity_df: pd.DataFrame,
     trades: list[BacktestTrade],
     initial_balance: float,
+    *,
+    dollars_out: dict[str, np.ndarray] | None = None,
 ) -> tuple[pd.Series, list[tuple[str, str, list[float]]], pd.Series]:
     """
     Compute the Portfolio Performance charts' series, on equity_df's rows.
@@ -1454,6 +1505,9 @@ def _performance_series(
         equity_df (pd.DataFrame): Daily equity curve (_build_equity_curve).
         trades (list[BacktestTrade]): The trades the per-type lines attribute.
         initial_balance (float): Starting balance the percentages divide by.
+        dollars_out (dict[str, np.ndarray] | None): Keyword-only. Handed to
+            _return_by_trade_type, which fills it with each type's running
+            P&L in dollars. None (default) keeps none.
 
     Returns:
         tuple: (total, type_lines, drawdown) — the cumulative return in percent
@@ -1465,7 +1519,8 @@ def _performance_series(
     # the starting balance. The per-type lines attribute each trade exactly as
     # _build_equity_curve books it, so they add up to the total line.
     total = (equity_df["portfolio_value"] / initial_balance - 1.0) * 100
-    type_lines = _return_by_trade_type(trades, equity_df, initial_balance)
+    type_lines = _return_by_trade_type(trades, equity_df, initial_balance,
+                                       dollars_out=dollars_out)
     rolling_max = equity_df["portfolio_value"].cummax()
     drawdown = (equity_df["portfolio_value"] - rolling_max) / rolling_max * 100
     return total, type_lines, drawdown
@@ -1584,13 +1639,93 @@ def _trade_category(
     return category, f"{category} · {tag}"
 
 
-def _category_table(df: pd.DataFrame) -> str:
+# One row of the "Returns by category · tag" table and the table around its
+# rows, as templates: _category_table fills them, and so does the page's
+# filter script for a mix of categories and tags (the base block's "mix"
+# carries them), so both write the same markup.
+_CATEGORY_ROW = (
+    "<tr style='border-bottom:1px solid #E0E0E0'>"
+    "<td style='padding:4px 12px;'>{name}</td>"
+    "<td style='padding:4px 12px;'>{trades}</td>"
+    "<td style='padding:4px 12px;'>{win}</td>"
+    "<td style='padding:4px 12px;color:{color};'>{pnl}</td>"
+    "<td style='padding:4px 12px;'>{share}</td>"
+    "<td style='padding:4px 12px;'>{mean}</td>"
+    "<td style='padding:4px 12px;'>{median}</td></tr>"
+)
+_CATEGORY_TABLE_HEAD = (
+    "<div style='font-family:sans-serif;font-size:13px;margin:8px 0 16px;'>"
+    "<b>Returns by category · tag</b> ({groups} groups, Kalshi's own series "
+    "categories and tags)"
+    "<table style='border-collapse:collapse;margin-top:8px;width:auto;'>"
+    "<tr style='background:#E8F5E9;font-weight:bold;'>"
+    "<th style='padding:6px 12px;'>Category · tag</th><th style='padding:6px 12px;'>Trades</th>"
+    "<th style='padding:6px 12px;'>Win rate</th><th style='padding:6px 12px;'>P&amp;L</th>"
+    "<th style='padding:6px 12px;'>Share of P&amp;L</th>"
+    "<th style='padding:6px 12px;'>Mean/trade</th><th style='padding:6px 12px;'>Median/trade</th>"
+    "</tr>"
+)
+_CATEGORY_TABLE_FOOT = "</table></div>"
+# What a figure that cannot be worked out reads as (a share of a zero total)
+_NO_FIGURE = "—"
+
+
+def _category_groups(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sum the decomposition frame per category · tag, largest P&L first.
+
+    Args:
+        df (pd.DataFrame): One row per trade with columns subcategory, profit
+            and profit_ratio.
+
+    Returns:
+        pd.DataFrame: Indexed by subcategory, with trades, wins, pnl, mean_ret
+            and median_ret, sorted by pnl descending; groups with equal pnl
+            stay in name order (a stable sort), the order the page's script
+            gives a mix of categories and tags.
+    """
+    return df.groupby("subcategory").agg(
+        trades=("profit", "size"),
+        wins=("profit", lambda p: int((p > 0).sum())),
+        pnl=("profit", "sum"),
+        mean_ret=("profit_ratio", "mean"),
+        median_ret=("profit_ratio", "median"),
+    ).sort_values("pnl", ascending=False, kind="stable")
+
+
+def _category_row_cells(name, r) -> dict[str, str]:
+    """
+    Format one category · tag row's cells, all but its share of the total P&L.
+
+    Args:
+        name: The group's "category · tag" label.
+        r: Its row of _category_groups (trades, wins, pnl, mean_ret, median_ret).
+
+    Returns:
+        dict[str, str]: _CATEGORY_ROW's fields but "share": "name" (escaped),
+            "trades", "win" (win rate), "color" (profit or loss colour),
+            "pnl", "mean" and "median".
+    """
+    return {
+        "name": html.escape(str(name)),
+        "trades": str(int(r.trades)),
+        "win": f"{r.wins / r.trades:.0%}",
+        "color": _COLORS["profit"] if r.pnl >= 0 else _COLORS["loss"],
+        "pnl": f"${r.pnl:+,.2f}",
+        "mean": f"{r.mean_ret:+.1%}",
+        "median": f"{r.median_ret:+.1%}",
+    }
+
+
+def _category_table(df: pd.DataFrame, *, grouped: pd.DataFrame | None = None) -> str:
     """
     Tabulate returns per category · tag, largest P&L first.
 
     Args:
         df (pd.DataFrame): One row per trade with columns subcategory, profit
             and profit_ratio.
+        grouped (pd.DataFrame | None): Keyword-only. _category_groups(df)
+            when the caller already holds it; None (default) computes it.
 
     Returns:
         str: An HTML table: trades, win rate, P&L, share of total P&L, and the
@@ -1598,38 +1733,15 @@ def _category_table(df: pd.DataFrame) -> str:
             fee-inclusive stake).
     """
     total = df["profit"].sum()
-    grouped = df.groupby("subcategory").agg(
-        trades=("profit", "size"),
-        wins=("profit", lambda p: int((p > 0).sum())),
-        pnl=("profit", "sum"),
-        mean_ret=("profit_ratio", "mean"),
-        median_ret=("profit_ratio", "median"),
-    ).sort_values("pnl", ascending=False)
-    td = "<td style='padding:4px 12px;'>"
+    if grouped is None:
+        grouped = _category_groups(df)
     rows = "".join(
-        "<tr style='border-bottom:1px solid #E0E0E0'>"
-        + td + html.escape(str(name)) + "</td>"
-        + td + str(int(r.trades)) + "</td>"
-        + td + f"{r.wins / r.trades:.0%}</td>"
-        + f"<td style='padding:4px 12px;color:{_COLORS['profit'] if r.pnl >= 0 else _COLORS['loss']};'>"
-        + f"${r.pnl:+,.2f}</td>"
-        + td + ("—" if total == 0 else f"{r.pnl / total:.0%}") + "</td>"
-        + td + f"{r.mean_ret:+.1%}</td>"
-        + td + f"{r.median_ret:+.1%}</td></tr>"
+        _CATEGORY_ROW.format(
+            share=_NO_FIGURE if total == 0 else f"{r.pnl / total:.0%}",
+            **_category_row_cells(name, r))
         for name, r in grouped.iterrows()
     )
-    return (
-        "<div style='font-family:sans-serif;font-size:13px;margin:8px 0 16px;'>"
-        f"<b>Returns by category · tag</b> ({len(grouped)} groups, Kalshi's own series "
-        "categories and tags)"
-        "<table style='border-collapse:collapse;margin-top:8px;width:auto;'>"
-        "<tr style='background:#E8F5E9;font-weight:bold;'>"
-        "<th style='padding:6px 12px;'>Category · tag</th><th style='padding:6px 12px;'>Trades</th>"
-        "<th style='padding:6px 12px;'>Win rate</th><th style='padding:6px 12px;'>P&amp;L</th>"
-        "<th style='padding:6px 12px;'>Share of P&amp;L</th>"
-        "<th style='padding:6px 12px;'>Mean/trade</th><th style='padding:6px 12px;'>Median/trade</th>"
-        "</tr>" + rows + "</table></div>"
-    )
+    return _CATEGORY_TABLE_HEAD.format(groups=len(grouped)) + rows + _CATEGORY_TABLE_FOOT
 
 
 # Entry-price buckets of the decomposition's price chart: right-closed bins
@@ -1651,6 +1763,12 @@ def _pnl_colors(values) -> list[str]:
     return [_COLORS["profit"] if v >= 0 else _COLORS["loss"] for v in values]
 
 
+# The "P&L by Category · Tag" chart's height: (minimum, pixels per bar, room
+# for the axes) — read by _subcategory_chart_height and, through the base
+# block's "mix", by the page's script for a mix of categories and tags.
+_SUBCATEGORY_HEIGHT = (350, 28, 120)
+
+
 def _subcategory_chart_height(rows: int) -> int:
     """
     Height of the "P&L by Category · Tag" chart for a given number of bars.
@@ -1659,9 +1777,11 @@ def _subcategory_chart_height(rows: int) -> int:
         rows (int): Bars (category · tag groups) the chart draws.
 
     Returns:
-        int: Pixels — at least 350, and 28 per bar plus room for the axes.
+        int: Pixels — at least 350, and 28 per bar plus room for the axes
+            (_SUBCATEGORY_HEIGHT).
     """
-    return max(350, 28 * rows + 120)
+    least, per_row, axes = _SUBCATEGORY_HEIGHT
+    return max(least, per_row * rows + axes)
 
 
 # The decomposition frame's columns, named so an EMPTY trade list still yields
@@ -1721,14 +1841,16 @@ def _decomposition_aggregates(df: pd.DataFrame) -> dict:
     Returns:
         dict: "monthly" — a frame of [month, profit] by entry month, in month
             order; "category" and "subcategory" — P&L per Kalshi category and
-            per category · tag, ascending; "price" — P&L per entry-price
-            bucket (_PRICE_BUCKET_LABELS), buckets with no trade omitted.
+            per category · tag, ascending, equal sums in name order (a stable
+            sort, the order the page's script gives a mix of categories and
+            tags); "price" — P&L per entry-price bucket
+            (_PRICE_BUCKET_LABELS), buckets with no trade omitted.
     """
     buckets = pd.cut(df["entry_pA"], bins=_PRICE_BUCKET_BINS, labels=_PRICE_BUCKET_LABELS)
     return {
         "monthly": df.groupby("month")["profit"].sum().reset_index(),
-        "category": df.groupby("category")["profit"].sum().sort_values(),
-        "subcategory": df.groupby("subcategory")["profit"].sum().sort_values(),
+        "category": df.groupby("category")["profit"].sum().sort_values(kind="stable"),
+        "subcategory": df.groupby("subcategory")["profit"].sum().sort_values(kind="stable"),
         "price": (df.assign(price_bucket=buckets)
                   .groupby("price_bucket", observed=True)["profit"].sum()),
     }
@@ -1845,7 +1967,7 @@ def _reliability(trades: list[BacktestTrade]) -> dict:
     actuals = [a for _, a in obs]
 
     # Reliability diagram — 10 equal-width bins
-    bins   = np.linspace(0, 1, 11)
+    bins   = np.linspace(0, 1, _CALIBRATION_BINS + 1)
     labels = []
     mean_pred, mean_act = [], []
     counts = []
@@ -1865,9 +1987,26 @@ def _reliability(trades: list[BacktestTrade]) -> dict:
         "mean_pred": mean_pred, "mean_act": mean_act, "counts": counts, "labels": labels,
         # How the diagram draws each bin: a marker growing with its count
         # (never below 6 px) and "n=<count>" on hover
-        "sizes": [max(6, c // 2) for c in counts],
-        "texts": [f"n={c}" for c in counts],
+        "sizes": [max(_CALIBRATION_MARKER[0], c // _CALIBRATION_MARKER[1]) for c in counts],
+        "texts": [_CALIBRATION_TEXT["cal_bin"].format(n=c) for c in counts],
     }
+
+
+# The reliability diagram's words, as templates: its title with the two scores
+# ({brier} and {log_loss}, each a _score_text), its title with no time-series
+# trade, and a bin's hover text. _reliability and _calibration_title fill
+# them, and so does the page's filter script for a mix of categories and tags
+# (D.text), so both read the same.
+_CALIBRATION_TEXT = {
+    "cal_title": "Calibration Curve (Brier={brier}, LogLoss={log_loss})",
+    "cal_title_none": "Calibration Curve (no time-series trades)",
+    "cal_bin": "n={n}",
+}
+# The diagram's bins (10 equal-width probability bins) and how a bin's marker
+# grows with its count: never below the first number of pixels, one more for
+# every second number of trades. The base block's "mix" carries both.
+_CALIBRATION_BINS = 10
+_CALIBRATION_MARKER = (6, 2)
 
 
 def _calibration_title(brier: float | None, log_loss: float | None) -> str:
@@ -1883,8 +2022,9 @@ def _calibration_title(brier: float | None, log_loss: float | None) -> str:
             "Calibration Curve (no time-series trades)" when either is None.
     """
     if brier is None or log_loss is None:
-        return "Calibration Curve (no time-series trades)"
-    return f"Calibration Curve (Brier={brier:.4f}, LogLoss={log_loss:.4f})"
+        return _CALIBRATION_TEXT["cal_title_none"]
+    return _CALIBRATION_TEXT["cal_title"].format(brier=_score_text(brier),
+                                                 log_loss=_score_text(log_loss))
 
 
 _CALIBRATION_CAPTION = (
@@ -2209,6 +2349,13 @@ def _khat_delta_value(khat: float | None, k: float | None) -> float | None:
     return round(khat - k, 3) or 0.0
 
 
+# The colours of a "k̂ − k" figure: red above zero (the sizer sized too big),
+# green at or below it. _khat_delta colours every such figure Python formats,
+# and the page's filter script the one it works out for a mix (the base
+# block's "mix" carries them).
+_KHAT_DELTA_COLORS = ("#F44336", "#4CAF50")
+
+
 def _khat_delta(khat: float | None, k: float | None) -> tuple[str, str]:
     """
     Format an empirical k-hat against a k, as a KPI card's value and colour.
@@ -2247,7 +2394,7 @@ def _khat_delta(khat: float | None, k: float | None) -> tuple[str, str]:
     delta = _khat_delta_value(khat, k)
     if delta is None:
         return "—", _KPI_DEFAULT_COLOR
-    return f"{delta:+.3f}", ("#F44336" if delta > 0 else "#4CAF50")
+    return f"{delta:+.3f}", (_KHAT_DELTA_COLORS[0] if delta > 0 else _KHAT_DELTA_COLORS[1])
 
 
 def _khat_card_color(tainted: bool) -> str:
@@ -2807,6 +2954,8 @@ _KHAT_TEXT = {
     # marks the k the page is showing — the run's own on the page as
     # rendered, the filter bar's k after a choice.
     "khat_sized_at": "sized at {k}",
+    # The label on a bar: its entries and its distinct events (_khat_bar_text)
+    "khat_bar": "n={n} · {events} ev",
 }
 
 # The k-hat chart's reference line, as drawn: a dashed vertical line and its
@@ -2860,7 +3009,7 @@ def _khat_bar_text(stat: dict | None) -> str:
     if stat is None:
         return ""
     events = "?" if stat["events"] is None else stat["events"]
-    return f"n={stat['n']} · {events} ev"
+    return _KHAT_TEXT["khat_bar"].format(n=stat["n"], events=events)
 
 
 def _khat_finish(stat: dict) -> dict:
@@ -3025,7 +3174,9 @@ def _khat_band(
     Returns:
         dict | None: None when the band has no calibration; otherwise
             "carried" and "groups" (view key -> _khat_stat, keys as the
-            filter's: "all", "c<i>", "s<i>"). A calibration that does not
+            filter's: "all", "c<i>", "s<i>"; each "s<i>" group also carries
+            "raw": [entries settled in between, sum of implied gaps], which
+            the page pools for a mix of several tags). A calibration that does not
             carry its population (len(observations) != pooled.n — a
             hand-built one) keeps only "all", taken from its pooled row, with
             "events" None, since there is nothing to break down.
@@ -3043,6 +3194,13 @@ def _khat_band(
             groups.setdefault(f"c{cat_index[category]}", []).append(o)
             groups.setdefault(f"s{sub_index[(category, tag)]}", []).append(o)
         stats.update((key, _khat_stat(members)) for key, members in groups.items())
+        for key, members in groups.items():
+            if key.startswith("s"):
+                # A category · tag group's raw counts, which the page pools
+                # for a mix of several: entries that settled in between, and
+                # the sum of the implied gaps (k-hat is their ratio)
+                stats[key]["raw"] = [sum(1 for o in members if o.in_between),
+                                     sum(o.implied for o in members)]
     if ks:
         for stat in stats.values():
             _khat_with_deltas(stat, ks)
@@ -4228,13 +4386,19 @@ def _run_settings_html(sweep: BacktestSweep | None, *,
     )
 
 
-def _live_filter_options(categories: tuple[str, ...] | None,
-                         tags: tuple[str, ...] | None, bar: dict) -> list[str]:
+def _live_filter_ticks(categories: tuple[str, ...] | None,
+                       tags: tuple[str, ...] | None,
+                       bar: dict) -> tuple[list[str], list[str]]:
     """
-    Name the filter bar's Category or Tag options a live category/tag filter covers.
+    Name what to tick in the filter bar's Category and Tag menus to show the live filter.
 
-    Matched as main._filter_by_category matches a pair (case-insensitive, AND across
-    the axes); with a tag set, the matching "Category · Tag" options.
+    Every (category, tag) the bar offers is asked of config.trade_filter_for,
+    the one rule the live run keeps a pair by (letter case ignored), so a plain
+    tag, a tied "Category · Tag" and a list of categories all read as the live
+    run reads them. A category the filter keeps whole needs only its own tick; a
+    category it narrows to some of the bar's tags needs those tags ticked too
+    (ticking a tag ticks its category). A category none of whose offered tags
+    the filter keeps is left out: this run filed no pair under it.
 
     Args:
         categories (tuple[str, ...] | None): BacktestSweep.live_categories; None = any.
@@ -4242,15 +4406,48 @@ def _live_filter_options(categories: tuple[str, ...] | None,
         bar (dict): _filter_payload's base block ("categories", "subcats").
 
     Returns:
-        list[str]: "Category <c>" or "Tag <c> · <t>" per option, in the bar's order.
+        tuple[list[str], list[str]]: The categories to tick, then the tags to
+            tick as "Category · Tag", both in the bar's order. Both empty when the
+            bar offers nothing the filter keeps.
     """
+    # Cross-module: the same rule the live run decides every pair by
+    keeps = trade_filter_for(categories, tags)
     names = bar["categories"]
-    wanted = None if categories is None else {c.casefold() for c in categories}
-    if tags is None:
-        return [f"Category {c}" for c in names if wanted is None or c.casefold() in wanted]
-    tagged = {t.casefold() for t in tags}
-    return [f"Tag {names[ci]} · {tag}" for ci, tag in bar["subcats"]
-            if (wanted is None or names[ci].casefold() in wanted) and tag.casefold() in tagged]
+    offered: dict[int, list[str]] = {}
+    for ci, tag in bar["subcats"]:
+        offered.setdefault(ci, []).append(tag)
+    ticked_categories: list[str] = []
+    ticked_tags: list[str] = []
+    for ci, name in enumerate(names):
+        own = offered.get(ci, [])
+        if not own:
+            # A category with no tag on the bar is kept as a whole or not at all
+            if keeps(name, ""):
+                ticked_categories.append(name)
+            continue
+        kept = [tag for tag in own if keeps(name, tag)]
+        if not kept:
+            continue
+        ticked_categories.append(name)
+        if len(kept) < len(own):
+            ticked_tags.extend(f"{name}{TAG_SCOPE_SEPARATOR}{tag}" for tag in kept)
+    return ticked_categories, ticked_tags
+
+
+def _tick_phrase(ticked: tuple[list[str], list[str]]) -> str:
+    """
+    Word what _live_filter_ticks returned as "Category A, B and Tag C · D".
+
+    Args:
+        ticked (tuple[list[str], list[str]]): The categories and the tags to tick.
+
+    Returns:
+        str: e.g. "Category Economics, Sports and Tag Sports · Basketball"; the
+            tags part is left out when no tag needs ticking.
+    """
+    categories, tags = ticked
+    phrase = "Category " + ", ".join(categories)
+    return phrase + (" and Tag " + ", ".join(tags) if tags else "")
 
 
 def _live_sizing_bar_clause(sweep: BacktestSweep, bar: dict | None,
@@ -4476,21 +4673,20 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
                       "same-title trades capped at the lower of the size cap shown and "
                       f"{_cap_percent(st_cap)}% ({own})")
 
-    # A live filter's one covered option is chosen with the band and tier (one_slice);
-    # several, none or no bar are said instead (slices)
-    options = ([] if not filtered or bar is None
-               else _live_filter_options(categories, tags, bar))
-    one_slice = options[0] if len(options) == 1 else None
-    if not filtered or one_slice is not None:
-        slices = ""
-    elif bar is None:
-        slices = ("; this page's filter bar could not be built, so no Category/Tag slice "
-                  "of it is shown")
-    elif not options:
-        slices = "; no scenario of this run has a pair filed under the live category/tag filter"
-    else:
-        slices = (f"; the live category/tag filter covers {', '.join(options)} — the filter "
-                  "bar shows one of them at a time, never their union")
+    # What to tick in the Category and Tag menus to show a live filter (ticks); when
+    # the bar cannot show it, why not (slices)
+    ticks = None
+    slices = ""
+    if filtered and bar is None:
+        slices = ("; this page's filter bar could not be built, so the live category/tag "
+                  "filter cannot be shown")
+    elif filtered:
+        ticked = _live_filter_ticks(categories, tags, bar)
+        if ticked[0]:
+            ticks = _tick_phrase(ticked)
+        else:
+            slices = ("; no scenario of this run has a pair filed under the live "
+                      "category/tag filter")
     # Tier floors off at a band no tier binds at: the tier-on cell holds it
     never_binds = ("" if sweep.live_tier_floors or not view.tier_floors else
                    " (no tier floor binds at this band, so off and on are one rule)")
@@ -4502,7 +4698,7 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     if view.where == _LIVE_RULE_NOT_SIMULATED:
         tail = "not simulated by this run"
     elif view.where == _LIVE_RULE_PRIMARY:
-        chosen = "" if one_slice is None else f", with {one_slice} chosen in the filter bar"
+        chosen = "" if ticks is None else f", with {ticks} ticked in the filter bar"
         tail = f"this run's primary{never_binds}{chosen}{slices}{ladders}"
         # The primary is a tier-on cell, at the band the page was rendered at
         shown = (None if bar is None else bar["primary"][0], True)
@@ -4521,10 +4717,9 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
             option = entries[index]["option"]
             choices = ([f"Spread band {option}", f"Tier floors on{never_binds}"]
                        if view.tier_floors else ["Tier floors off", f"Spread band {option}"])
-            if one_slice is not None:
-                choices.append(one_slice)
+            tick_clause = "" if ticks is None else f", and tick {ticks} there"
             tail = (f"choose {', '.join(choices[:-1])} and {choices[-1]} in the filter bar"
-                    f"{slices}{ladders}")
+                    f"{tick_clause}{slices}{ladders}")
             shown = (index, view.tier_floors)
     # The saved defaults' own sizing when it is not this run's, and where the bar shows it
     note = _live_sizing_note(sweep)
@@ -5502,6 +5697,9 @@ def _trade_row_tail(t: BacktestTrade) -> str:
 
 
 # Row backgrounds of the best- and worst-five trade tables.
+# How many trades each of the two tables lists (the base block's "mix"
+# carries it for the page's script).
+_BEST_WORST_ROWS = 5
 _BEST_ROW_COLOR = "#F9FBE7"
 _WORST_ROW_COLOR = "#FFF8F8"
 
@@ -5522,7 +5720,7 @@ def _best_and_worst(trades: list[BacktestTrade]) -> tuple[list, list]:
             the same descending order — the last one is the biggest loss).
     """
     sorted_trades = sorted(trades, key=lambda t: t.profit, reverse=True)
-    return sorted_trades[:5], sorted_trades[-5:]
+    return sorted_trades[:_BEST_WORST_ROWS], sorted_trades[-_BEST_WORST_ROWS:]
 
 
 def _section_diagnostics(trades: list[BacktestTrade]) -> str:
@@ -5668,6 +5866,12 @@ def _kelly_points(trades: list[BacktestTrade],
     return kelly_fracs, actual_fracs
 
 
+# The Kelly scatter's 1:1 line: (the smallest "largest fraction" it is drawn
+# for, how far past the largest fraction it runs) — read by
+# _one_to_one_extent and, through the base block's "mix", by the page's script.
+_ONE_TO_ONE = (0.01, 1.1)
+
+
 def _one_to_one_extent(kelly_fracs: list[float]) -> float:
     """
     How far the Kelly scatter's dashed 1:1 reference line runs.
@@ -5677,9 +5881,11 @@ def _one_to_one_extent(kelly_fracs: list[float]) -> float:
 
     Returns:
         float: 10% past the largest Kelly fraction, and never less than 0.011
-            (the line is drawn even when every fraction is 0).
+            (the line is drawn even when every fraction is 0): _ONE_TO_ONE's
+            floor and factor.
     """
-    return max(kelly_fracs + [0.01]) * 1.1
+    least, factor = _ONE_TO_ONE
+    return max(kelly_fracs + [least]) * factor
 
 
 def _capital_deployed(trades: list[BacktestTrade], equity_df: pd.DataFrame) -> list[float]:
@@ -6291,6 +6497,34 @@ def _bar_reach(kd_follows: bool, explorer_follows: bool, *, explorer_caps: bool 
 # Kelly choice what "add_on" and "add_on_note" do for adding. "sidecar_missing" and "sidecar_empty" are a
 # sidecar chunk file's {reason} in "unavailable": it could not be loaded, or
 # it ran without handing anything over ({file}: the address asked for).
+# The Category and Tag menus of the filter bar: check-box dropdowns. The words
+# of the box that clears a menu (ticked exactly when nothing else is), the
+# hover text both menus carry (the rule a set of ticks follows, which is the
+# live filter's: config.trade_filter), how many ticked names the summary line
+# spells out before it counts the rest, and the menus' styling.
+_MENU_CAT_ALL = "All categories"
+_MENU_TAG_ALL = "All tags"
+_MENU_TITLE = ("Tick as many as you like. A ticked category counts in full unless some of "
+               "its tags are ticked; then only those count.")
+_SELECTION_NAMES_SHOWN = 3
+_MENU_STYLE = (
+    "<style>"
+    ".flt-multi{display:inline-block;position:relative;vertical-align:middle}"
+    ".flt-multi>summary{display:inline-block;list-style:none;cursor:pointer;"
+    "position:relative;padding:1px 20px 1px 6px;border:1px solid #767676;"
+    "border-radius:3px;background:#FFFFFF;min-width:96px;max-width:260px;"
+    "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}"
+    ".flt-multi>summary::-webkit-details-marker{display:none}"
+    ".flt-multi>summary::after{content:'\\25BE';position:absolute;right:6px}"
+    ".flt-multi.flt-off>summary{color:#9E9E9E;border-color:#C4C4C4;pointer-events:none}"
+    ".flt-multi>div{position:absolute;left:0;top:100%;z-index:1001;background:#FFFFFF;"
+    "border:1px solid #767676;border-radius:3px;box-shadow:0 2px 6px rgba(0,0,0,.2);"
+    "max-height:340px;overflow-y:auto;padding:4px 10px 4px 6px;white-space:nowrap}"
+    ".flt-multi label{display:block;padding:1px 0;font-size:13px}"
+    ".flt-multi label[hidden]{display:none}"
+    "</style>"
+)
+
 _SUMMARY_TEMPLATES = {
     "scenario": "{where}, {k}, {cap}",
     "all": "Showing every trade of the run at {scenario}: {count}.",
@@ -6313,6 +6547,29 @@ _SUMMARY_TEMPLATES = {
               "Sortino, the median monthly return, the benchmark's strategy row) is this "
               "selection's contribution: the starting balance plus these trades' P&L as "
               "that run booked it, not a standalone simulation."),
+    # A selection of several categories and tags, named: the ticked names
+    # joined by "names_join", and past _SELECTION_NAMES_SHOWN of them the
+    # first few and how many more (_selection_name)
+    "names_join": ", ",
+    "names_more": "{names}, +{n} more",
+    # Added to a slice's line when the page combined it from several tags'
+    # figures itself (a mix of categories and tags has no view of its own)
+    "mix_note": " Combined in the page from each tag's own figures.",
+    # In the line's place when the list on screen cannot be mixed: {selection}
+    # the ticks tried, {failed} the scenario they were tried at, {shown} what
+    # is ticked again now (the names, or "mix_still_all" with nothing
+    # ticked) and {at} empty — or, when the selects went back to another
+    # scenario too, "mix_still_at" naming it
+    "mix_unavailable": ("Not available: {selection} cannot be shown together for {failed} "
+                        "(the page's build log says why). The page still shows {shown}{at}."),
+    "mix_still_all": "all categories",
+    "mix_still_at": " at {scenario}",
+    # The Category and Tag menus' buttons: nothing ticked, or how many (one
+    # ticked reads as its own name)
+    "menu_cat_all": _MENU_CAT_ALL,
+    "menu_cat_n": "{n} categories",
+    "menu_tag_all": _MENU_TAG_ALL,
+    "menu_tag_n": "{n} tags",
     # Every summary line ends with what the bar reaches beyond the sections
     # it re-scopes whole (the key keeps its first name, which the script
     # reads); _filter_payload swaps in _bar_reach's sentence for the page —
@@ -6336,21 +6593,38 @@ _SAVE_LABEL = "Save as live defaults…"
 _SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter bar's "
                "scenario on screen — its spread band, tier floors, k, size cap, its Add to "
                "held pairs choice (when this page simulated it), its Sell level and Min. "
-               "days to maturity (when this page simulated selling) and any "
-               "category or tag, with this run's same-title cap when the run recorded one; "
+               "days to maturity (when this page simulated selling) and the "
+               "categories and tags ticked (each ticked tag is saved under its own "
+               "category), with this run's same-title cap when the run recorded one; "
                "not the Scenario Explorer's own selects — with the live trading defaults. "
                "Nothing is saved until you press a button there: Confirm and save saves "
                "it; Confirm and trade saves it and then runs the live bot with it, placing "
                "real orders; Dry run runs the live bot with it without placing orders and "
                "saves nothing. It stays unavailable "
                "while a scenario loads, and for a scenario the run never simulated, "
-               "whose band, k or size cap the run did not record, or whose k or size "
-               "cap is not above zero.")
+               "whose band, k or size cap the run did not record, whose k or size "
+               "cap is not above zero, or with more categories and tags ticked than the "
+               "confirmation page takes.")
 # Added to the hover text on a page that filed trades by ticker prefix, not by
 # Kalshi's series listing (which the live category and tag filter reads)
 _SAVE_TITLE_UNFILED = (" A category or tag can be saved only from a page built with "
                        "Kalshi's series listing; this one files trades by ticker prefix.")
 _SAVE_NOTE = "(needs ./start_dashboard.sh running)"
+# The button's hover text while the ticks themselves are what cannot be
+# saved (the script swaps it in, and Python's own title back): more names
+# ticked than the confirmation page takes ({n} of each), a ticked category
+# whose name holds the separator a saved filter ties a tag to its category
+# with, or a ticked category another one on the page repeats in other letter
+# case (the live filter reads names without regard to case, so it would keep
+# both where the page shows one)
+_SAVE_BLOCKED_TEXT = {
+    "save_too_many": ("Cannot save: more than {n} categories, or more than {n} tags, are "
+                      "ticked. Untick some."),
+    "save_separator": ("Cannot save: a ticked category's name holds the mark that joins a "
+                       "category and its tag in a saved filter."),
+    "save_case_twin": ("Cannot save: a ticked category has a namesake on this page that "
+                       "differs only in letter case, and the live filter would keep both."),
+}
 
 # The bar's "Trade using defaults…" link: its label and its hover text. It
 # opens the defaults server's trade page, which shows the saved live defaults
@@ -6447,7 +6721,9 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
             "live_adds_to_held_pairs" (whether the saved live defaults add to
             held pairs, as the run recorded them; the note beside the save
             button says so on a page with the Add to held pairs view);
-            "live_sells" (whether they sell: the Sell view's save note shows only then).
+            "live_sells" (whether they sell: the Sell view's save note shows only then);
+            "max_names" (config.DEFAULTS_SERVER_MAX_FILTER_NAMES: the most
+            categories, and the most tags, the server takes on one address).
     """
 
     def day(value: date) -> str:
@@ -6479,6 +6755,7 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
         "source": source,
         "live_adds_to_held_pairs": getattr(sweep, "live_add_to_held_pairs", None) is True,
         "live_sells": getattr(sweep, "live_sell_at", None) is not None,
+        "max_names": DEFAULTS_SERVER_MAX_FILTER_NAMES,
     }
 
 # Every compared field of a BacktestTrade, in declaration order: _list_key's
@@ -8991,6 +9268,9 @@ class _ChunkVisitor:
         self._add_mark: tuple[int, int] | None = None
         # ... and for the first Trim to Kelly cell, for reset_trim
         self._trim_mark: tuple[int, int] | None = None
+        # One item per packed list whose tags the page cannot combine into a
+        # mix (_list_payload's mix_gaps): generate_dashboard says so once
+        self.mix_gaps: list = []
 
     def reset_off(self, source: _GridSource) -> None:
         """
@@ -9332,7 +9612,7 @@ class _ChunkVisitor:
             lst = _list_payload(listed, curve, self.axis, self.start_date,
                                 self.initial_balance, self.series_categories, k,
                                 self.cat_index, self.sub_index, strings, heads=self.heads,
-                                risk_free=self.risk_free)
+                                risk_free=self.risk_free, mix_gaps=self.mix_gaps)
             cid = len(self.chunks)
             self.chunks.append(_packed_json_script(
                 f"dash-chunk-{cid}", {"list": lst, "strings": strings.items}))
@@ -9522,6 +9802,8 @@ class _SellResult:
         same (int): Cells that are exactly a run read earlier at the same cap
             (backtester.SameSale), so nothing was simulated for them.
         pruned (int): Cells that are the run without selling.
+        mix_gaps (int): The chunk files written whose tags the page cannot
+            combine into a mix (_list_payload's mix_gaps).
     """
     index: int
     keys: tuple
@@ -9531,6 +9813,7 @@ class _SellResult:
     reused: int
     same: int
     pruned: int
+    mix_gaps: int = 0
 
 
 @dataclass(frozen=True)
@@ -9567,12 +9850,15 @@ class _SellGrid:
             option's text, "phrase": what the summary phrase gains after the
             level's, "value": the number of days}.
         sidecars (int): The sidecar chunk files written.
+        mix_gaps (int): How many of them hold a list whose tags the page
+            cannot combine into a mix (_list_payload's mix_gaps).
     """
     blocks: list
     index: list | None
     levels: list
     days: list
     sidecars: int
+    mix_gaps: int = 0
 
 
 def _sell_option(level: float) -> str:
@@ -9674,16 +9960,16 @@ def _sell_chunk_file(out_dir: Path, chunk_id: int) -> Path:
     return out_dir / f"chunk-{chunk_id}.js"
 
 
-def _write_sell_chunk(task: _SellTask, key: str, k: float, point: SweepPoint) -> None:
+def _write_sell_chunk(task: _SellTask, key: str, k: float, point: SweepPoint) -> bool:
     """
     Write one sell run's trade list as a sidecar chunk file, atomically.
 
     The chunk holds what an inline chunk holds — the list's per-trade arrays
-    and every category / category · tag view of it (_list_payload) and its
-    strings — plus its own trade-row heads (a worker cannot add to the
-    page's shared table): {"list", "strings", "heads"}. Written to a
-    temporary name and renamed, so a file at the key's name is always whole;
-    two workers that write one key write the same bytes.
+    and every category / category · tag view of it (_list_payload, the mix
+    parts included) and its strings — plus its own trade-row heads (a worker
+    cannot add to the page's shared table): {"list", "strings", "heads"}.
+    Written to a temporary name and renamed, so a file at the key's name is
+    always whole; two workers that write one key write the same bytes.
 
     Args:
         task (_SellTask): The task (the page's axis, labels and rates, and the
@@ -9691,17 +9977,24 @@ def _write_sell_chunk(task: _SellTask, key: str, k: float, point: SweepPoint) ->
         key (str): The list's key.
         k (float): The cell's k, which the list's Kelly scatter is priced at.
         point (SweepPoint): The sell run, its curve cut to the page's axis.
+
+    Returns:
+        bool: Whether the list's tags can be combined into a mix on the page
+            (False when _list_payload had to leave their curves out).
     """
     strings, heads = _StringTable(), _StringTable()
+    gaps: list = []
     lst = _list_payload(point.trades, point.equity_df, task.axis, task.start_date,
                         task.initial_balance, task.series_categories, k, task.cat_index,
-                        task.sub_index, strings, heads=heads, risk_free=task.risk_free)
+                        task.sub_index, strings, heads=heads, risk_free=task.risk_free,
+                        mix_gaps=gaps)
     text = _sell_chunk_text(_pack_text(_strict_json(
         {"list": lst, "strings": strings.items, "heads": heads.items})))
     path = _sell_key_file(task.out_dir, key)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+    return not gaps
 
 
 def _run_sell_task(task: _SellTask) -> _SellResult:
@@ -9759,6 +10052,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     rows: dict[tuple[bool, int, int], array] = {}
     written: list[str] = []
     done: set[str] = set()
+    # Files written whose tags the page cannot combine into a mix
+    mix_gaps = 0
     for ki, k in enumerate(task.ks):
         for add in (False, True):
             wanted = [ci for ci in range(len(task.caps)) if (add, ki, ci) in task.cells]
@@ -9791,7 +10086,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
                     if key is None:
                         key = listed[id(point.trades)] = _list_key(k, point.trades)
                     if key not in task.inline_keys and key not in done:
-                        _write_sell_chunk(task, key, k, point)
+                        if not _write_sell_chunk(task, key, k, point):
+                            mix_gaps += 1
                         done.add(key)
                         written.append(key)
                     if key not in key_place:
@@ -9803,7 +10099,7 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
             for ci, row in cell_rows.items():
                 rows[(add, ki, ci)] = row
     return _SellResult(task.index, tuple(keys), rows, tuple(written), stats["simulated"],
-                       stats["reused"], stats["same"], stats["pruned"])
+                       stats["reused"], stats["same"], stats["pruned"], mix_gaps)
 
 
 def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: date,
@@ -10081,7 +10377,8 @@ def _build_sell_grid(
                  sum(r.pruned for r in results.values()), next_id - first_sidecar,
                  sizes / 1e6, folder)
     return _SellGrid(blocks=blocks, index=index, levels=levels, days=days,
-                     sidecars=next_id - first_sidecar)
+                     sidecars=next_id - first_sidecar,
+                     mix_gaps=sum(r.mix_gaps for r in results.values()))
 
 
 @contextlib.contextmanager
@@ -10433,6 +10730,7 @@ def _view_payload(
     strings: _StringTable,
     *,
     risk_free: RiskFreeRates | None = None,
+    atom: tuple[list[int], list[int]] | None = None,
 ) -> dict:
     """
     Compute everything the filtered sections show for one selection of trades.
@@ -10441,7 +10739,10 @@ def _view_payload(
     (_performance_kpis, _performance_series, _decomposition_aggregates,
     _category_table, _reliability, _best_and_worst, _capital_deployed,
     _strategy_row), so a view and the section it redraws cannot disagree on a
-    definition — the filter script only draws what this computes.
+    definition — the filter script only draws what this computes. The one
+    thing the script works out itself is a mix of several categories and
+    tags, which it builds from the category · tag views' extra parts
+    (`atom`), following these same helpers' rules.
 
     Args:
         sel (list[BacktestTrade]): The selection's trades, in list order.
@@ -10462,6 +10763,12 @@ def _view_payload(
             and Sortino cards and the benchmark row subtract, on the capital
             `sel` holds open — the slice's own trades, never the run's. None
             (default) subtracts nothing.
+        atom (tuple[list[int], list[int]] | None): Keyword-only. For a
+            category · tag view (the smallest slice, which the page combines
+            into mixes): the (entry rows, exit rows) of `sel`'s trades on the
+            axis, -1 for a date not on it. The view then carries the extra
+            parts below. None (default) for every other view, which carries
+            none.
 
     Returns:
         dict: "n", "idx", "kpi" (card key -> formatted value), the sparse
@@ -10470,7 +10777,14 @@ def _view_payload(
             "monthly", "cat", "sub", "price" (bar specs: x, y, colours c),
             "table" (string index), "cal", "best" and "worst" ([head, tail]
             index pairs, joined by the script into _trade_row's exact HTML)
-            and "k11".
+            and "k11". With `atom` and at least one trade, also "row" (the
+            view's one category-table row: _MIX_ROW_CELLS' cells, then its
+            raw P&L) and, when the page can rely on it (_mix_curve), "m"
+            ([[trade type label, sparse running P&L in dollars], ...]: the
+            starting balance plus all of them is this view's curve —
+            _list_payload then drops each of the view's "eq", "total",
+            "types" and "dd" that the page's script works out from "m"
+            exactly; they are that same curve).
     """
     if len(axis):
         # A curve built after the page's own (a slice's, built here) can run
@@ -10479,7 +10793,10 @@ def _view_payload(
         equity_df = equity_df[pd.to_datetime(equity_df["date"]) <= axis[-1]]
     # Parsed once: every series below is placed on the axis by these dates
     dates = pd.DatetimeIndex(pd.to_datetime(list(equity_df["date"])))
-    total, type_lines, drawdown = _performance_series(equity_df, sel, initial_balance)
+    # Each trade type's running dollars, kept only for a category · tag view
+    dollars: dict[str, np.ndarray] = {}
+    total, type_lines, drawdown = _performance_series(
+        equity_df, sel, initial_balance, dollars_out=dollars if atom is not None else None)
     view = {
         "n": len(sel),
         "idx": idx,
@@ -10509,7 +10826,8 @@ def _view_payload(
                    "c": _pnl_colors(sub.values), "h": _subcategory_chart_height(len(sub))}
     view["price"] = {"x": [str(b) for b in price.index], "y": [float(v) for v in price.values],
                      "c": _pnl_colors(price.values)}
-    view["table"] = strings.add(_category_table(df))
+    grouped = _category_groups(df)
+    view["table"] = strings.add(_category_table(df, grouped=grouped))
 
     rel = _reliability(sel)
     view["cal"] = {
@@ -10522,7 +10840,150 @@ def _view_payload(
     view["best"] = [row_of(t, "best") for t in best]
     view["worst"] = [row_of(t, "worst") for t in worst]
     view["k11"] = _one_to_one_extent([kelly_x[i] for i in idx])
+    if atom is None:
+        return view
+
+    # A category · tag view: what the page needs to combine it with others.
+    # Its one table row, cell by cell (the page works out only the share of
+    # the mix's total), with the raw P&L the share and the row order read
+    name, r = next(grouped.iterrows())
+    cells = _category_row_cells(name, r)
+    view["row"] = [*(cells[key] for key in _MIX_ROW_CELLS), float(r.pnl)]
+    # Its curve by trade type, in dollars (left out when the page could not
+    # add it up exactly: _mix_curve)
+    curve = _mix_curve(sel, atom, dollars, equity_df, dates, axis, initial_balance, risk_free)
+    if curve is not None:
+        view["m"] = curve
     return view
+
+
+# The category-table cells a category · tag view ships for a mix, in order
+# (the view's "row" is these and then the raw P&L). The page fills the rest
+# of _CATEGORY_ROW itself: the trade count (the view's "n"), the P&L's colour
+# (by its sign, as _category_row_cells picks it) and the share of the mix's
+# total.
+_MIX_ROW_CELLS = ("name", "win", "pnl", "mean", "median")
+
+# How a category · tag view's dollar curve is shipped for a mix: rounded to
+# this many decimals (which drops float noise, so a curve of whole cents stays
+# short, and leaves a sum of many tags' curves exact to well under a cent),
+# and only when it rebuilds the view's own curve to within this many dollars.
+_MIX_DECIMALS = 9
+_MIX_TOLERANCE_DOLLARS = 1e-6
+
+
+def _open_capital_from_curve(value: np.ndarray, initial_balance: float,
+                             trades: list[BacktestTrade], entry_rows: list[int],
+                             exit_rows: list[int], *, floored: bool = True) -> np.ndarray:
+    """
+    What a curve carries in open trades on each row, worked out from the curve itself.
+
+    A portfolio value is cash plus what is carried in open trades, and the
+    cash is the starting balance, less the cost and fees of every trade
+    still open, plus the profit of every trade paid out (a trade's payoff
+    less its cost and fees is its profit). So the carried value is the curve
+    less that cash: value - start + (cost + fees of the trades open) - (the
+    profits of the trades paid out). The page's filter script works a mix's
+    open capital out the same way (the risk-free hurdle is charged on it),
+    from the per-trade arrays a chunk ships ("st", "pf", "en", "ex");
+    _mix_curve checks it against _carried_on_days before a view may be mixed.
+
+    Args:
+        value (np.ndarray): The curve's portfolio value, one per row.
+        initial_balance (float): Starting balance in dollars.
+        trades (list[BacktestTrade]): The trades the curve was booked from.
+        entry_rows (list[int]): Each trade's entry row on the curve.
+        exit_rows (list[int]): Each trade's exit row on the curve.
+        floored (bool): Keyword-only. True (default) floors each row at 0, as
+            the page does. False returns the figure as worked out, which can
+            fall below 0 (a trade dated to pay out before it enters): what
+            _mix_curve reads to tell whether a floor would bind.
+
+    Returns:
+        np.ndarray: One float per row.
+    """
+    stake = np.zeros(len(value))
+    paid_out = np.zeros(len(value))
+    for t, entered, exited in zip(trades, entry_rows, exit_rows, strict=True):
+        stake[entered] += t.total_cost + t.fees
+        stake[exited] -= t.total_cost + t.fees
+        paid_out[exited] += t.profit
+    carried = value - initial_balance + np.cumsum(stake) - np.cumsum(paid_out)
+    return np.where(carried > 0.0, carried, 0.0) if floored else carried
+
+
+def _mix_curve(
+    sel: list[BacktestTrade],
+    rows: tuple[list[int], list[int]],
+    dollars: dict[str, np.ndarray],
+    equity_df: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+    axis: pd.DatetimeIndex,
+    initial_balance: float,
+    risk_free: RiskFreeRates | None,
+) -> list[list] | None:
+    """
+    A category · tag view's curve, by trade type, as the page adds it to other tags' curves.
+
+    The page combines several tags by adding their curves, so each ships its
+    running P&L in dollars per trade type (the starting balance plus all of
+    them is the view's own curve; one type alone is that type's line). It is
+    shipped only when the page can rely on it — otherwise the view carries no
+    "m" and the page says a mix is not available there, rather than show a
+    wrong figure:
+      * the view's curve covers the page's dates exactly, day for day;
+      * the starting balance plus the types' dollars rebuilds that curve to
+        within _MIX_TOLERANCE_DOLLARS on every day;
+      * with risk-free rates on the page, every trade enters and pays out on
+        a day of the page, and the open capital worked out from the curve
+        (_open_capital_from_curve, the page's own way) equals what the
+        hurdle is charged on (_carried_on_days) and is never below zero by
+        more than _MIX_TOLERANCE_DOLLARS before any floor. The page floors
+        the SUM of a mix's tags at zero, while _carried_on_days floors the
+        trades valued at cost and those valued at market separately; with no
+        tag below zero no floor binds, and the two are the same sum.
+
+    Args:
+        sel (list[BacktestTrade]): The view's trades.
+        rows (tuple[list[int], list[int]]): Their (entry rows, exit rows) on
+            the page's axis, -1 for a date not on it.
+        dollars (dict[str, np.ndarray]): Each trade type's running dollars on
+            equity_df's rows (_return_by_trade_type's dollars_out).
+        equity_df (pd.DataFrame): The view's curve, cut to the axis' end.
+        dates (pd.DatetimeIndex): Its dates.
+        axis (pd.DatetimeIndex): The page's shared date axis.
+        initial_balance (float): Starting balance in dollars.
+        risk_free (RiskFreeRates | None): The page's rates, or None.
+
+    Returns:
+        list[list] | None: [[trade type label, sparse series], ...] in
+            _TRADE_TYPE_LINES order (each series as _sparse_on_axis writes it,
+            to _MIX_DECIMALS), or None when the page cannot rely on it.
+    """
+    if not dollars or len(dates) != len(axis) or not (dates == axis).all():
+        return None
+    value = equity_df["portfolio_value"].to_numpy(dtype=float)
+    rebuilt = initial_balance + np.sum(list(dollars.values()), axis=0)
+    if not np.all(np.isfinite(rebuilt)) or not np.allclose(
+            rebuilt, value, rtol=0.0, atol=_MIX_TOLERANCE_DOLLARS):
+        return None
+    if risk_free is not None:
+        entry_rows, exit_rows = rows
+        if min(entry_rows) < 0 or min(exit_rows) < 0:
+            return None
+        derived = _open_capital_from_curve(value, initial_balance, sel, entry_rows, exit_rows,
+                                           floored=False)
+        # A tag whose own figure dips below zero would be floored there by
+        # Python and only in the sum by the page: not offered for mixing
+        if not np.all(derived >= -_MIX_TOLERANCE_DOLLARS):
+            return None
+        # What the hurdle is charged on (_rf_hurdle reads the same figure)
+        carried = _carried_on_days(sel, day_numbers(equity_df["date"]))
+        if not np.allclose(np.where(derived > 0.0, derived, 0.0), carried, rtol=1e-9,
+                           atol=_MIX_TOLERANCE_DOLLARS):
+            return None
+    return [[label, _sparse_on_axis(dates, dollars[label], axis, _MIX_DECIMALS)]
+            for label, _ in _TRADE_TYPE_LINES if label in dollars]
 
 
 def _list_payload(
@@ -10539,6 +11000,7 @@ def _list_payload(
     *,
     heads: _StringTable,
     risk_free: RiskFreeRates | None = None,
+    mix_gaps: list | None = None,
 ) -> dict:
     """
     Compute one distinct trade list's per-trade arrays and every view of it.
@@ -10549,6 +11011,20 @@ def _list_payload(
     starting balance plus those trades' P&L on the days the run booked it —
     so its return, drawdown and Sharpe are the slice's CONTRIBUTION to the
     run, not a standalone simulation (the sizes are the joint run's).
+
+    The category · tag views partition the list's trades, and the page's
+    script combines them into any mix of categories and tags a reader ticks
+    (a view per combination would be far too many to ship). Each therefore
+    carries its curve in dollars ("m") and the list carries per-trade
+    arrays (_mix_trade_arrays). A view that carries "m" leaves out the
+    series that are the same curve again (_MIX_CURVE_SERIES) — each one the
+    script's arithmetic rebuilds to exactly the values Python computed
+    (_curve_series_from_m; one with a value on a rounding tie that would
+    round the other way is kept) — and the script works those out from "m"
+    when it draws that one tag. When one tag's curve
+    cannot be relied on (_mix_curve) or a per-trade figure is not a number,
+    no tag of the list carries "m" — each keeps all four series as every
+    other view does — and the page says a mix is not available for that list.
 
     Args:
         trades (list[BacktestTrade]): The band's trades.
@@ -10571,12 +11047,22 @@ def _list_payload(
         risk_free (RiskFreeRates | None): Keyword-only. The rates every
             view's Sharpe and Sortino subtract (_view_payload). None (default)
             subtracts nothing.
+        mix_gaps (list | None): Keyword-only. When given, one item is
+            appended to it if this list's tags cannot be mixed, so the caller
+            can say so once for the whole page. None (default) keeps no count.
 
     Returns:
         dict: Per-trade arrays "ret" (return in percent), "slip", "hold",
             "kx", "ky" and "kt" (Kelly scatter x, y and escaped hover text),
-            and "views": view key ("all", "c<category index>", "s<category ·
-            tag index>") -> _view_payload.
+            the arrays a mix is worked out from (_mix_trade_arrays: "pf",
+            "pr", "st", "en", "ex", "mo", "pb", "cp", "ca"), and "views":
+            view key ("all", "c<category index>", "s<category · tag index>")
+            -> _view_payload (each "s" view with its mix parts: "row", and
+            — when the list's tags can be mixed — "m" in place of "eq",
+            "total", "types" and "dd", _MIX_CURVE_SERIES, which are that
+            same curve: each is left out where the script works exactly
+            its values out from "m", _curve_series_from_m, and kept where
+            a rounding tie would make it differ).
     """
     kelly_x, kelly_y = _kelly_points(trades, k)
     position = {id(t): i for i, t in enumerate(trades)}
@@ -10602,11 +11088,17 @@ def _list_payload(
         return rows[key]
 
     groups: dict[str, list[int]] = {_ALL_VIEW: list(range(len(trades)))}
+    tag_keys: set[str] = set()
     for i, t in enumerate(trades):
         category, tag = _series_labels(t.event_ticker, t.category, series_categories)
         groups.setdefault(f"c{cat_index[category]}", []).append(i)
-        groups.setdefault(f"s{sub_index[(category, tag)]}", []).append(i)
+        tag_key = f"s{sub_index[(category, tag)]}"
+        groups.setdefault(tag_key, []).append(i)
+        tag_keys.add(tag_key)
 
+    # What the page's script needs, trade by trade, to work out a mix of
+    # categories and tags itself (_FILTER_JS's mixView)
+    mix = _mix_trade_arrays(trades, axis)
     views = {}
     for key, idx in groups.items():
         sel = [trades[i] for i in idx]
@@ -10614,9 +11106,35 @@ def _list_payload(
         # over the slice's trades alone: its contribution to the band's run
         curve = (equity_df if key == _ALL_VIEW
                  else _build_equity_curve(sel, start_date, initial_balance))
+        # A category · tag view is what a mix is built from: it also carries
+        # its curve in dollars, its table row and its rows' trade indexes
+        atom = (([mix["en"][i] for i in idx], [mix["ex"][i] for i in idx])
+                if key in tag_keys else None)
         views[key] = _view_payload(sel, idx, curve, axis, initial_balance,
                                    series_categories, kelly_x, row_of, strings,
-                                   risk_free=risk_free)
+                                   risk_free=risk_free, atom=atom)
+    # A mix needs every tag's curve and every figure below to be a number:
+    # when one is missing, no tag of this list is offered for mixing
+    whole = (all(_is_finite(v) for name in _MIX_FINITE_ARRAYS for v in mix[name])
+             and all(v is None or _is_finite(v) for v in mix["cp"]))
+    if not whole or any("m" not in views[key] for key in tag_keys):
+        for key in tag_keys:
+            views[key].pop("m", None)
+        if mix_gaps is not None and tag_keys:
+            mix_gaps.append(1)
+    else:
+        # A tag's own curve in dollars ("eq"), its return and type lines and
+        # its drawdown are all its "m" curves again: the script works them
+        # out from "m" (its whole()), so the same curve is shipped once —
+        # each series only where the script's own arithmetic gives exactly
+        # the values shipped here (a value on a rounding tie can round the
+        # other way from "m", and that series is then kept)
+        for key in tag_keys:
+            view = views[key]
+            rebuilt = _curve_series_from_m(view["m"], len(axis), initial_balance)
+            for name in _MIX_CURVE_SERIES:
+                if _same_series(view[name], rebuilt[name], len(axis)):
+                    del view[name]
     return {
         # The histogram's x values, exactly as _section_diagnostics draws them
         "ret": [t.profit_ratio * 100 for t in trades],
@@ -10625,7 +11143,257 @@ def _list_payload(
         "kx": kelly_x, "ky": kelly_y,
         # Hover text renders an HTML subset: escaped like _section_risk's
         "kt": [html.escape(t.title_a[:40]) for t in trades],
+        **mix,
         "views": views,
+    }
+
+
+def _case_twins(keys: list) -> list[list[int]]:
+    """
+    Group the positions of names that differ only in letter case.
+
+    The live filter compares category and tag names without regard to case
+    (config.trade_filter, by str.casefold), so two names the page lists
+    apart can be one name to it. The page's script reads these groups rather
+    than fold case itself, so both sides fold by the same rule.
+
+    Args:
+        keys (list): One hashable key per listed name, in list order, equal
+            exactly for names the live filter reads as one (a category: its
+            case-folded name; a tag: its category's index and its case-folded
+            name).
+
+    Returns:
+        list[list[int]]: Each group of two or more positions sharing a key,
+            ascending, the groups in order of their first position; empty
+            when every name is its own.
+    """
+    groups: dict = {}
+    for i, key in enumerate(keys):
+        groups.setdefault(key, []).append(i)
+    return [group for group in groups.values() if len(group) > 1]
+
+
+# The series of a view that are its curve once more — the curve in dollars,
+# the total return, each trade type's line and the drawdown: a category · tag
+# view that ships its curve as "m" leaves out each one the page's script
+# works out from "m" exactly (_curve_series_from_m)
+_MIX_CURVE_SERIES = ("eq", "total", "types", "dd")
+
+
+def _sparse_as_floats(sparse: list[list], n: int) -> np.ndarray:
+    """
+    Put a sparse series back on every day, as floats.
+
+    Args:
+        sparse (list[list]): [[axis index, value], ...] (_sparse_on_axis); a
+            None value is a gap.
+        n (int): The number of days on the page's axis.
+
+    Returns:
+        np.ndarray: One float per day (_expand_sparse, the script's
+            expand()), NaN in a gap.
+    """
+    return np.array(_expand_sparse(sparse, n), dtype=float)
+
+
+def _curve_series_from_m(m: list[list], n: int, initial_balance: float) -> dict:
+    """
+    The four curve series of a category · tag view, as the page's script works them out.
+
+    The script rebuilds a tag view's curve from its "m" (each trade type's
+    running dollars) and derives the series it draws from that (_FILTER_JS's
+    addCurves, fallOf and curveSeries). This repeats that arithmetic step
+    for step — the same additions in the same order, the same rounding —
+    so _list_payload can tell, before leaving a series out, that the script
+    will arrive at exactly the values Python would have shipped.
+
+    Args:
+        m (list[list]): The view's "m": [[trade type label, sparse running
+            dollars], ...] in _TRADE_TYPE_LINES order.
+        n (int): The number of days on the page's axis.
+        initial_balance (float): Starting balance in dollars, above zero.
+
+    Returns:
+        dict: "eq" (the curve in dollars, to cents), "total" (the return in
+            percent of the starting balance, to four decimals), "dd" (the
+            drawdown from the running peak in percent, to four decimals) —
+            each one float per day — and "types" ([(label, that type's
+            return line in percent, to four decimals), ...]).
+    """
+    parts = [(label, _sparse_as_floats(series, n)) for label, series in m]
+    pnl = np.zeros(n)
+    for _, part in parts:
+        pnl = pnl + part
+    value = initial_balance + pnl
+    peak = np.maximum.accumulate(value)
+    return {
+        "eq": np.round(value, 2),
+        "total": np.round((value / initial_balance - 1) * 100, 4),
+        "dd": np.round((value - peak) / peak * 100, 4),
+        "types": [(label, np.round(part / initial_balance * 100, 4)) for label, part in parts],
+    }
+
+
+def _same_series(shipped, rebuilt, n: int) -> bool:
+    """
+    Whether a view's shipped curve series is exactly the one the script would rebuild.
+
+    Args:
+        shipped: The view's series as _view_payload ships it: a sparse list,
+            or for "types" [[label, sparse list], ...].
+        rebuilt: The same series from _curve_series_from_m: one float per
+            day, or for "types" [(label, one float per day), ...].
+        n (int): The number of days on the page's axis.
+
+    Returns:
+        bool: True only when every day's value is equal (and, for "types",
+            the labels are the same in the same order). A gap never is.
+    """
+    if isinstance(rebuilt, list):
+        return (len(shipped) == len(rebuilt)
+                and all(label == mine and np.array_equal(_sparse_as_floats(series, n), values)
+                        for (label, series), (mine, values) in zip(shipped, rebuilt, strict=True)))
+    return bool(np.array_equal(_sparse_as_floats(shipped, n), rebuilt))
+
+# The per-trade arrays of a mix that must hold a finite number for every trade
+# (the calibration pair "cp" / "ca" is null for a same-title trade by design)
+_MIX_FINITE_ARRAYS = ("pf", "pr", "st", "mo")
+
+
+def _is_finite(value) -> bool:
+    """
+    Whether a value is a finite number.
+
+    Args:
+        value: Anything a per-trade array may hold.
+
+    Returns:
+        bool: False for None, a NaN, an infinity or anything that is not a number.
+    """
+    try:
+        return math.isfinite(value)
+    except TypeError:
+        return False
+
+
+def _mix_trade_arrays(trades: list[BacktestTrade], axis: pd.DatetimeIndex) -> dict:
+    """
+    One trade list's per-trade figures the page needs to work out a mix itself.
+
+    The page shows a mix of several categories and tags by combining their
+    category · tag views; whatever cannot be added up from those views it
+    computes from these arrays, restricted to the mix's trades, by the same
+    rules the Python helpers follow (each named below).
+
+    Args:
+        trades (list[BacktestTrade]): The list's trades, in order.
+        axis (pd.DatetimeIndex): The page's shared date axis.
+
+    Returns:
+        dict: One entry per trade in each of "pf" (profit in dollars), "pr"
+            (profit_ratio: _performance_kpis' mean and median), "st" (the
+            fee-inclusive stake, total_cost + fees: _capital_deployed), "en"
+            and "ex" (the entry and exit date's row on the axis, -1 for a
+            date not on it: _capital_deployed, and — with "st" and "pf" — the
+            open capital the risk-free hurdle is charged on,
+            _open_capital_from_curve), "mo" (the entry month as year x 12 +
+            month - 1, None for a missing date: _decomposition_frame's
+            month), "pb" (the entry-price bucket's index in
+            _PRICE_BUCKET_LABELS, -1 for none: _decomposition_aggregates'
+            buckets), and "cp" / "ca" (a time-series trade's
+            spread-calibration prediction and outcome, _spread_observations;
+            None for any other trade).
+    """
+    row_of_day = {d.toordinal(): i for i, d in enumerate(axis.date)}
+    # The same right-closed buckets _decomposition_aggregates cuts entry_pA into
+    buckets = (pd.cut(pd.Series([t.entry_pA for t in trades], dtype=float),
+                      bins=_PRICE_BUCKET_BINS, labels=_PRICE_BUCKET_LABELS).cat.codes.tolist()
+               if trades else [])
+    # One observation for a time-series trade, none for any other
+    observed = [_spread_observations([t]) for t in trades]
+    return {
+        "pf": [t.profit for t in trades],
+        "pr": [t.profit_ratio for t in trades],
+        # The fee-inclusive stake, as _deployed_on_days adds it up
+        "st": [t.total_cost + t.fees for t in trades],
+        "en": [row_of_day.get(_trade_day(t.entry_date), -1) for t in trades],
+        "ex": [row_of_day.get(_trade_day(t.exit_date), -1) for t in trades],
+        "mo": [t.entry_date.year * 12 + t.entry_date.month - 1
+               if isinstance(t.entry_date, date) else None for t in trades],
+        "pb": [int(code) for code in buckets],
+        "cp": [obs[0][0] if obs else None for obs in observed],
+        "ca": [obs[0][1] if obs else None for obs in observed],
+    }
+
+
+def _mix_base(axis: pd.DatetimeIndex, initial_balance: float,
+              risk_free: RiskFreeRates | None) -> dict:
+    """
+    What the page's script needs, besides a chunk, to work out a mix itself.
+
+    A mix of several categories and tags has no view of its own (there are
+    far too many combinations), so the script builds one from the category ·
+    tag views of the chunk on screen. Every constant, colour and piece of
+    markup it needs for that is Python's, shipped here once, so the script
+    spells none of its own: each entry names the helper whose rule the
+    script follows.
+
+    Args:
+        axis (pd.DatetimeIndex): The page's shared date axis.
+        initial_balance (float): Starting balance in dollars.
+        risk_free (RiskFreeRates | None): The page's rates, or None.
+
+    Returns:
+        dict: "start" (the starting balance every curve opens at); "rf" (the
+            annual risk-free rate in force on each day of the axis, as change
+            points [[row, rate], ...], or None without rates: _rf_hurdle's
+            rate); "flat" (config.FLAT_RETURN_TOLERANCE: _varies) and "year"
+            (config.CALENDAR_DAYS_PER_YEAR: _sharpe, _sortino); "profit" and
+            "loss" (_pnl_colors); "khat_delta" (_KHAT_DELTA_COLORS); "types"
+            (the trade-type labels, in _TRADE_TYPE_LINES order); "buckets"
+            (_PRICE_BUCKET_LABELS); "bins" (the reliability diagram's bin
+            edges), "marker" (_CALIBRATION_MARKER) and "log_clip"
+            (_LOG_LOSS_CLIP); "top" (_BEST_WORST_ROWS); "sub_height"
+            (_SUBCATEGORY_HEIGHT); "k11" (_ONE_TO_ONE); "row", "table_head"
+            and "table_foot" (the category table's templates) with "cells"
+            (the order of a view's "row" cells, _MIX_ROW_CELLS); "none" (what
+            an undefined figure reads as); "sep"
+            (config.TAG_SCOPE_SEPARATOR, between a category and its tag in a
+            name and in a saved filter); and "names"
+            (_SELECTION_NAMES_SHOWN: how many ticked names the summary line
+            spells out).
+    """
+    rates = None
+    if risk_free is not None:
+        # The latest auction on or before each day of the axis (zeros when
+        # the rates are unavailable), kept where it changes
+        annual = risk_free.annual_on_days(day_numbers(axis))
+        rates = [[i, float(rate)] for i, rate in enumerate(annual)
+                 if i == 0 or rate != annual[i - 1]]
+    return {
+        "start": initial_balance,
+        "rf": rates,
+        "flat": FLAT_RETURN_TOLERANCE,
+        "year": CALENDAR_DAYS_PER_YEAR,
+        "profit": _COLORS["profit"],
+        "loss": _COLORS["loss"],
+        "khat_delta": list(_KHAT_DELTA_COLORS),
+        "types": [label for label, _ in _TRADE_TYPE_LINES],
+        "buckets": list(_PRICE_BUCKET_LABELS),
+        "bins": [float(edge) for edge in np.linspace(0, 1, _CALIBRATION_BINS + 1)],
+        "marker": list(_CALIBRATION_MARKER),
+        "log_clip": _LOG_LOSS_CLIP,
+        "top": _BEST_WORST_ROWS,
+        "sub_height": list(_SUBCATEGORY_HEIGHT),
+        "k11": list(_ONE_TO_ONE),
+        "row": _CATEGORY_ROW,
+        "table_head": _CATEGORY_TABLE_HEAD,
+        "table_foot": _CATEGORY_TABLE_FOOT,
+        "cells": list(_MIX_ROW_CELLS),
+        "none": _NO_FIGURE,
+        "sep": TAG_SCOPE_SEPARATOR,
+        "names": _SELECTION_NAMES_SHOWN,
     }
 
 
@@ -10742,10 +11510,16 @@ def _filter_payload(
             k, cap] indexes of the page as rendered), "grid" ([band][k][cap]
             -> chunk id or null), "rows" (the shared trade-row heads),
             "categories" (sorted names), "subcats" ([[category index, tag],
-            ...], sorted), "empty" (the view of a selection with no trade — a
-            flat curve, referencing no string), "text" (the templates:
+            ...], sorted), "tag_twins" and "category_twins" (_case_twins: the
+            indexes of tags of one category, and of categories, whose names
+            differ only in letter case — one name to the live filter — so
+            the script ticks such tags together and saves no tick on such a
+            category), "empty" (the view of a selection with no trade — a
+            flat curve, referencing no string), "mix" (_mix_base: what the
+            script works a mix of categories and tags out with), "text" (the templates:
             _SUMMARY_TEMPLATES — its "unfiltered" sentence chosen by kd,
-            explorer and explorer_caps (_bar_reach) — and _KHAT_TEXT), "styles" (the trade-type
+            explorer and explorer_caps (_bar_reach) — _KHAT_TEXT and
+            _CALIBRATION_TEXT), "styles" (the trade-type
             lines' and the k-hat bars' drawing, the k-hat chart's height
             formula and reference line, the KPI cards' default colour and a
             known k-hat's card colour), "khat" (_khat_band per band, in band
@@ -10820,13 +11594,22 @@ def _filter_payload(
         "rows": chunks.heads.items,
         "categories": chunks.categories,
         "subcats": [[chunks.cat_index[c], tag] for c, tag in chunks.subcats],
+        # Names the live filter reads as one (it ignores letter case): tags
+        # of one category the script ticks together, and categories it will
+        # not save a tick on
+        "tag_twins": _case_twins([(c, tag.casefold()) for c, tag in chunks.subcats]),
+        "category_twins": _case_twins([c.casefold() for c in chunks.categories]),
         "empty": empty,
+        # What the script needs, besides a chunk, to work out a mix of
+        # several categories and tags itself
+        "mix": _mix_base(axis, initial_balance, chunks.risk_free),
         # The summary line's closing sentence says what the bar reaches on
         # THIS page: the interval-discount section follows its k and cap only
         # when that section's data was built (kd), and the scenario explorer's
         # selects only when the page carries its grid (explorer) — its cap
         # select only when its cap axis is this grid's (explorer_caps)
-        "text": {**_SUMMARY_TEMPLATES, **_KHAT_TEXT,
+        "text": {**_SUMMARY_TEMPLATES, **_SAVE_BLOCKED_TEXT, **_KHAT_TEXT,
+                 **_CALIBRATION_TEXT,
                  "unfiltered": " " + _bar_reach(kd is not None, explorer,
                                                 explorer_caps=explorer_caps,
                                                 explorer_tiers=explorer_tiers)
@@ -10980,7 +11763,7 @@ def _tier_off_where(label: str, primary: bool, same_as_tier_on: bool) -> str:
 def _filter_summary_text(text: dict, scenario: str, primary: bool,
                          selection: str | None, n: int, n_band: int, *,
                          note: str | None = None, add_on: bool = False,
-                         trim: bool = False) -> str:
+                         mix: bool = False, trim: bool = False) -> str:
     """
     Say, under the filter bar, what the page is showing.
 
@@ -10997,8 +11780,9 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
         primary (bool): Whether it is the run's primary scenario (band, k
             and size cap all the run's own, with the tier floors on — or off
             at a band where they never bind).
-        selection (str | None): "Sports" or "Sports · Basketball", or None for
-            the whole run.
+        selection (str | None): "Sports" or "Sports · Basketball" — several
+            ticked categories and tags as _selection_name joins them — or
+            None for the whole run.
         n (int): Trades in the selection.
         n_band (int): Trades in the whole run at that scenario.
         note (str | None): Keyword-only. The whole-run view's closing note —
@@ -11011,6 +11795,10 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
             on: the line then gains the "add_on_note" template (what an added
             purchase counts as) before its closing reach sentence, as the
             script adds it. False (default).
+        mix (bool): Keyword-only. Whether the selection is a mix the page
+            worked out itself from several tags' figures: a slice's line then
+            gains the "mix_note" template, as the script adds it. False
+            (default).
         trim (bool): Keyword-only. Whether the Trim to Kelly choice is on:
             the line then gains the "trim_note" template (what a part sold
             counts as) after any add-on note, as the script adds it. False
@@ -11027,19 +11815,82 @@ def _filter_summary_text(text: dict, scenario: str, primary: bool,
     else:
         out = text["slice"].format(scenario=scenario, selection=selection, n=n,
                                    band_count=_trade_count(n_band))
+        out += text["mix_note"] if mix else ""
     return (out + (text["add_on_note"] if add_on else "")
             + (text["trim_note"] if trim else "") + text["unfiltered"])
 
 
+def _selection_name(names: list[str], text: dict | None = None) -> str:
+    """
+    Name a selection of several categories and tags, as the summary line does.
+
+    The names are a ticked category's own ("Economics") where none of its
+    tags is ticked, else one "Category · Tag" per ticked tag, in menu order.
+    Up to _SELECTION_NAMES_SHOWN are spelled out; past that, the first few
+    and how many more. The page's script builds the same string from the
+    same templates (D.text.names_join, names_more).
+
+    Args:
+        names (list[str]): The selection's names, at least one.
+        text (dict | None): The templates (the payload's "text"); None
+            (default) reads _SUMMARY_TEMPLATES.
+
+    Returns:
+        str: "Economics", "Economics, Sports · Basketball", or e.g.
+            "A, B, C, +2 more".
+    """
+    text = _SUMMARY_TEMPLATES if text is None else text
+    shown = text["names_join"].join(names[:_SELECTION_NAMES_SHOWN])
+    more = len(names) - _SELECTION_NAMES_SHOWN
+    return shown if more <= 0 else text["names_more"].format(names=shown, n=more)
+
+
+def _menu_html(menu_id: str, all_label: str, rows: list[str]) -> str:
+    """
+    Render one check-box dropdown of the filter bar (the Category or the Tag menu).
+
+    A <details> element: its <summary> is the button (the script writes what
+    is ticked on it), and under it one box that clears the menu — ticked
+    exactly when nothing else is — and one box per row. Every box is rendered
+    disabled, and the menu greyed (class flt-off), until the script has
+    loaded its data, as the bar's selects are; autocomplete="off" so a
+    browser does not restore a stale tick on reload.
+
+    Args:
+        menu_id (str): "flt-cat" or "flt-tag": the <details> element's id.
+            The button is "<id>-label", the clearing box "<id>-all", row i's
+            box "<id>-<i>", its text "<id>-<i>-text" and the row itself
+            "<id>-<i>-row" (the script hides a tag row whose category is not
+            ticked).
+        all_label (str): The clearing box's words ("All categories").
+        rows (list[str]): Each row's text, already escaped, in index order.
+
+    Returns:
+        str: The menu's HTML.
+    """
+    boxes = "".join(
+        f'<label id="{menu_id}-{i}-row"><input type="checkbox" id="{menu_id}-{i}" disabled '
+        f'autocomplete="off"> <span id="{menu_id}-{i}-text">{text}</span></label>'
+        for i, text in enumerate(rows))
+    return (
+        f'<details id="{menu_id}" class="flt-multi flt-off" title="{html.escape(_MENU_TITLE)}">'
+        f'<summary id="{menu_id}-label">{html.escape(all_label)}</summary><div>'
+        f'<label><input type="checkbox" id="{menu_id}-all" checked disabled '
+        f'autocomplete="off"> {html.escape(all_label)}</label>'
+        f'{boxes}</div></details>')
+
+
 def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     """
-    Render the sticky filter bar: ten <select>s, the save button and a summary line.
+    Render the sticky filter bar: eight <select>s, two check-box menus, the save button and a summary line.
 
     Spread band, Tier floors, k, Size cap, Add to held pairs, Trim to Kelly,
     Sell and Min. days to maturity choose the scenario — each option one of the grid's axes, the run's own marked
     " (primary)" (a band's option text is the payload's "option", which the
     script swaps for its tier-off one when the Tier floors choice changes) —
-    and Category and Tag a slice of it. The Tier floors select offers each
+    and Category and Tag a slice of it: two check-box dropdowns (_menu_html)
+    in which a reader ticks as many as they like, by one rule
+    (_MENU_TITLE, the hover text of both). The Tier floors select offers each
     band's run as simulated ("on", selected) or its tier-floors-off run
     ("off"), its title spelling out both rules (_TIER_SELECT_TITLE); a payload
     with no tier-floors-off view ("grid_off" null) puts a grey "(not
@@ -11065,21 +11916,23 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     the option's index, the first selected), its title carrying the rule
     (_SELL_DAYS_TITLE); the script enables it only while Sell names a
     level, since with no selling there is no sale to hold back.
-    Category and tag options carry the primary scenario's trade
-    counts; the script rewrites them whenever the scenario changes. Tag
-    options list every "Category · Tag" while the category is "All";
-    choosing one sets the category to match. The selects are rendered
+    Category and tag rows carry the primary scenario's trade
+    counts; the script rewrites them whenever the scenario changes. The Tag
+    menu lists every "Category · Tag" while no category is ticked (the
+    script then shows only the ticked categories' tags, and ticking a tag
+    ticks its category). The selects and both menus' boxes are rendered
     DISABLED, and autocomplete="off" so a browser does not restore a stale
     choice on reload: the script enables them once it has inflated the base
     block AND the primary scenario's chunk, so without it (or without a
     browser that can inflate them) they cannot promise a view the page will
-    not show. After the Tag select comes the save button, rendered disabled
+    not show. After the Tag menu comes the save button, rendered disabled
     too: the script enables it whenever the scenario on screen can become
     the live defaults, and a click opens the defaults server's confirmation
     page for that scenario in a new tab. Its hover text (_SAVE_TITLE) gains
     _SAVE_TITLE_UNFILED on a page that does not file trades by Kalshi's
     series listing (payload "save"), where a category or tag cannot be
-    saved. On a page with the add-on view whose saved live defaults add to
+    saved; while the ticks themselves are what cannot be saved, the script
+    shows one of _SAVE_BLOCKED_TEXT's reasons in its place. On a page with the add-on view whose saved live defaults add to
     held pairs (save["live_adds_to_held_pairs"]), a grey note
     (_ADD_ON_SAVE_NOTE) follows the button: saving with the Add to held
     pairs choice off turns that off. _SELL_SAVE_NOTE does the same for selling
@@ -11197,13 +12050,14 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     save_note += ('&nbsp;<span id="flt-sell-save-note" style="color:#9E9E9E; font-size:13px;">'
                   f"{html.escape(_SELL_SAVE_NOTE)}</span>" if save_sells else "")
 
-    cat_opts = '<option value="">All categories</option>' + "".join(
-        f'<option value="{i}">{html.escape(c)} ({count(f"c{i}")})</option>'
-        for i, c in enumerate(payload["categories"]))
-    tag_opts = '<option value="">All tags</option>' + "".join(
-        f'<option value="{i}">{html.escape(payload["categories"][ci] + " · " + tag)} '
-        f'({count(f"s{i}")})</option>'
-        for i, (ci, tag) in enumerate(payload["subcats"]))
+    # The two check-box menus: every category, and every category's tags
+    # named "Category · Tag" (the script shortens a tag's name while exactly
+    # one category is ticked), each with its trade count
+    cat_menu = _menu_html("flt-cat", _MENU_CAT_ALL, [
+        f'{html.escape(c)} ({count(f"c{i}")})' for i, c in enumerate(payload["categories"])])
+    tag_menu = _menu_html("flt-tag", _MENU_TAG_ALL, [
+        f'{html.escape(payload["categories"][ci] + TAG_SCOPE_SEPARATOR + tag)} '
+        f'({count(f"s{i}")})' for i, (ci, tag) in enumerate(payload["subcats"])])
     scenario = _scenario_phrase(payload["bands"][pb]["where"], payload["ks"][pk]["text"],
                                 payload["caps"][pc]["text"])
     summary = html.escape(_filter_summary_text(
@@ -11212,6 +12066,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         '<div id="flt-bar" style="position:sticky; top:0; z-index:1000; background:#FFFFFF;'
         ' border-bottom:1px solid #E0E0E0; padding:10px 0 8px; font-family:sans-serif;'
         ' font-size:14px;">'
+        # The two check-box menus' styling
+        f'{_MENU_STYLE}'
         f'<label>Spread band: <select id="flt-band" disabled autocomplete="off">'
         f'{options(payload["bands"], pb)}</select></label>&nbsp;&nbsp;'
         f'<label>Tier floors: <select id="flt-tier" disabled autocomplete="off" '
@@ -11228,10 +12084,10 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         f'title="{sell_title}">{sell_opts}</select></label>{sell_note}&nbsp;&nbsp;'
         f'<label>Min. days to maturity: <select id="flt-days" disabled autocomplete="off" '
         f'title="{days_title}">{days_opts}</select></label>&nbsp;&nbsp;'
-        f'<label>Category: <select id="flt-cat" disabled autocomplete="off">'
-        f'{cat_opts}</select></label>&nbsp;&nbsp;'
-        f'<label>Tag: <select id="flt-tag" disabled autocomplete="off">'
-        f'{tag_opts}</select></label>'
+        # Not inside a <label>, which would hand a click on the menu to its
+        # first box
+        f'<span>Category: </span>{cat_menu}&nbsp;&nbsp;'
+        f'<span>Tag: </span>{tag_menu}'
         # The save button, disabled like the selects (autocomplete="off": a
         # browser that restores a control's disabled state on reload must not)
         f'&nbsp;&nbsp;<button id="flt-save" type="button" disabled autocomplete="off" '
@@ -11377,7 +12233,8 @@ def _pack_text(raw: str) -> str:
 # base block (id="dash-data", built by _filter_payload) and, on demand, one
 # chunk per scenario (id="dash-chunk-N", built by _ChunkVisitor), all packed by
 # _packed_json_script, and draws nothing of its own: every figure it shows was
-# computed in Python, every sentence about the data is a Python template it
+# computed in Python — with ONE exception, a mix of several categories and
+# tags (below) — every sentence about the data is a Python template it
 # fills (D.text) — its only words of its own are the line it shows when the
 # base block cannot be loaded — every trace it draws copies the styling of a
 # trace Python drew (traceOf; the trade-type lines, which another scenario can
@@ -11432,6 +12289,37 @@ def _pack_text(raw: str) -> str:
 # that cannot be loaded, or hands nothing over, is named in Python's words
 # (D.text.sidecar_missing, sidecar_empty), and the selects go back to what
 # is still shown.
+# Category and Tag are two check-box menus (<details> elements; SHOWN[3] and
+# SHOWN[4] are the ticked indexes). A reader ticks as many boxes as they
+# like, and the ticks follow the live filter's rule (atomsOf, the page's twin
+# of config.trade_filter): a ticked category counts in full unless some of
+# its tags are ticked, then only those. That filter reads names without
+# regard to letter case, so tags of one category that differ only in case
+# (Kalshi spells a few both ways) are one tag to it: their boxes are ticked
+# and unticked together (TWINS, from the groups Python folds, D.tag_twins),
+# and the page shows what a saved filter keeps. Where the ticks cover exactly the
+# trades of one of Python's views — everything, one category, one tag — that
+# view is drawn as it stands. Any other set of ticks is a MIX, which has no
+# view of its own (the combinations are far too many to ship): the script
+# works it out (viewFor, mixView, buildMix) from the chunk's category · tag
+# views — each one's curve as running dollars per trade type ("m") and its
+# row of the category table ("row") — and the chunk's per-trade arrays, with
+# the constants, colours and markup Python renders with (D.mix), by the rule
+# of the Python helper named beside each figure (one tag drawn alone is
+# Python's own view, of which only those of the curve's four series —
+# "total", "types", "dd" and "eq" — that Python left out are worked out
+# here, from the same "m", to exactly Python's values: whole), and formats each number as
+# Python's format() does (fixed: the exact value rounded half to even).
+# tests/test_dashboard.py's TestMixedSelection compares every part of a mix
+# with dashboard._view_payload over the same trades; what can still differ is
+# the last digit shown of a figure that sits within float rounding of a
+# rounding edge. A list whose tags Python could not vouch for carries no "m":
+# a mix asked for there is refused in Python's words (D.text.mix_unavailable)
+# and the bar is put back. The k-hat figures of a mix are the covered tags'
+# groups pooled from their raw counts (khatFor, pooledKhat). A chunk's list
+# remembers its last MIXES mixes, and a band its last MIXES pooled k-hat
+# figures (remember); an older one is worked out again when asked for. A
+# mix's category table is kept with the mix, never added to its chunk.
 # The script also rewrites the performance section's two k-hat cards
 # (renderKhatCards, from the k-hat breakdown's group for the selection) and the
 # interval-discount section at the bar's k and size cap (renderKd, from
@@ -11448,7 +12336,10 @@ def _pack_text(raw: str) -> str:
 # new tab (saveHref: D.save's address and the axes' values, with the Add to held pairs
 # choice on a page with the add-on view and the Sell level and minimum, or "off" for
 # both, on a page with the Sell view; the button's words are
-# Python's). On load it inflates the base block and the primary scenario's
+# Python's — its hover text too, which reads as Python rendered it except
+# while the ticks themselves cannot be saved: too many names, a category
+# whose name holds the separator, or one that another category repeats in
+# other letter case (ticksBlocked, D.text.save_*)). On load it inflates the base block and the primary scenario's
 # chunk, sets the bar back to the view Python rendered and enables it — it
 # redraws nothing until a <select> changes. A chunk is inflated when a
 # scenario needs it and kept while among the last KEEP drawn (the primary's
@@ -11460,8 +12351,14 @@ _FILTER_JS = r"""
 (function() {
   var dataEl = document.getElementById('dash-data');
   var bandSel = document.getElementById('flt-band'), kSel = document.getElementById('flt-k');
-  var capSel = document.getElementById('flt-cap'), catSel = document.getElementById('flt-cat');
-  var tagSel = document.getElementById('flt-tag');
+  var capSel = document.getElementById('flt-cap');
+  // "Category" and "Tag": two check-box menus (<details> elements), each
+  // with one box that clears it ("...-all", ticked exactly when nothing
+  // else is) and one box per category ("flt-cat-<i>") or per category · tag
+  // ("flt-tag-<i>")
+  var catMenu = document.getElementById('flt-cat'), tagMenu = document.getElementById('flt-tag');
+  var catAll = document.getElementById('flt-cat-all');
+  var tagAll = document.getElementById('flt-tag-all');
   // "Tier floors": each band's run as simulated (on), or its run with the
   // deadline-gap tier floors not applied (off, D.grid_off)
   var tierSel = document.getElementById('flt-tier');
@@ -11479,15 +12376,14 @@ _FILTER_JS = r"""
   // sold down to its Kelly size at every weekly run (on, D.grid_trim)
   var trimSel = document.getElementById('flt-trim');
   if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !addSel || !trimSel || !sellSel
-      || !daysSel || !catSel || !tagSel) {
+      || !daysSel || !catMenu || !tagMenu || !catAll || !tagAll) {
     return;
   }
   // The bar's save button: a button, not a select, so never in SELECTS
   // (whose reset reads .options); optional, since a page without it has
   // nothing to save from
   var saveBtn = document.getElementById('flt-save');
-  var SELECTS = [bandSel, tierSel, kSel, capSel, addSel, trimSel, sellSel, daysSel, catSel,
-                 tagSel];
+  var SELECTS = [bandSel, tierSel, kSel, capSel, addSel, trimSel, sellSel, daysSel];
   // The k-hat chart's own "Group by" select follows the bar's rules
   var khatGroup = document.getElementById('khat-group');
   if (khatGroup) { SELECTS.push(khatGroup); }
@@ -11496,7 +12392,8 @@ _FILTER_JS = r"""
   // KEPT: the drawn chunks other than the primary's, least recently drawn
   // first. SEQ numbers the choices, so a chunk arriving after a later choice
   // is never drawn over it. SHOWN: what is on screen — the [band, k, cap]
-  // indexes, the category and tag selects' values, the Tier floors choice
+  // indexes, the ticked categories and the ticked tags (each a sorted list of
+  // indexes into D.categories / D.subcats), the Tier floors choice
   // ("on" / "off"), the Add to held pairs choice ("off" / "on"), the Sell
   // choice ("none", or a level's index) and the Min. days to maturity choice
   // (an index into D.sell_days) and the Trim to Kelly choice ("off" / "on"),
@@ -11508,6 +12405,17 @@ _FILTER_JS = r"""
   var D = null, N = 0, C = null, CHUNKS = {}, KEPT = [], SEQ = 0, SHOWN = null;
   var SELL = {};
   var KEEP = 16;                     // drawn chunks kept besides the primary
+  var MIXES = 16;                    // mixes kept per chunk, and pooled k-hats per band
+  // TWINS: for a tag whose name another tag of its category repeats in
+  // other letter case, every tag of that group (D.tag_twins) — one name to
+  // the live filter, so their boxes are ticked and unticked together.
+  // NO_SAVE: the categories another category repeats in other letter case
+  // (D.category_twins), on which no tick can be saved. SAVE_TITLE: the save
+  // button's hover text as Python rendered it.
+  var TWINS = {}, NO_SAVE = {}, SAVE_TITLE = null;
+  // PICK: the menus' ticks as last asked for (pickKey), so a click that
+  // leaves them as they were (the clearing box of an empty menu) redraws nothing
+  var PICK = '|';
 
   function byId(id) { return document.getElementById(id); }
   function setText(id, text) { var el = byId(id); if (el) { el.textContent = text; } }
@@ -11523,6 +12431,17 @@ _FILTER_JS = r"""
     return out;
   }
   function pick(arr, idx) { return idx.map(function(i) { return arr[i]; }); }
+  // A number rounded to the nearest whole, an exact half to the even one, and
+  // to a number of decimals the way Python's sparse series are rounded
+  // (numpy's round: scale, round half to even, scale back)
+  function rint(x) {
+    var r = Math.round(x);
+    return (Math.abs(x - Math.trunc(x)) === 0.5 && r % 2 !== 0) ? r - 1 : r;
+  }
+  function roundTo(x, digits) { var p = Math.pow(10, digits); return rint(x * p) / p; }
+  // A view's own curve in dollars, on every date: its "eq" (shipped, or for
+  // a category · tag view that ships "m" in its place, worked out by whole())
+  function curveOf(v) { return expand(v.eq); }
 
   function bandIndex() { return parseInt(bandSel.value, 10); }
   function kIndex() { return parseInt(kSel.value, 10); }
@@ -11603,13 +12522,22 @@ _FILTER_JS = r"""
   // run never simulated (an Add to held pairs choice, or a Sell level, the
   // page holds no chunk for included), a band
   // the run did not record, a k or size cap the
-  // run did not record or that is not above zero, or a category or tag on a
-  // page that does not file trades by Kalshi's series listing, or a scenario
-  // that trims to Kelly (live trading does not trim, so there is no live
-  // setting to save it as). A tag always goes with its category
-  // (the tag select sets the category too). The server refuses, with its
-  // reason, any other value the live settings reject. Each number is written
-  // by String(), whose shortest form reads back as the same number.
+  // run did not record or that is not above zero, a category or tag on a
+  // page that does not file trades by Kalshi's series listing, ticks
+  // that cannot be saved as they stand (ticksBlocked), or a scenario that
+  // trims to Kelly (live trading does not trim, so there is no live setting
+  // to save it as). The address names every ticked category, and every
+  // ticked tag tied to its category ("Category · Tag", joined by D.mix.sep):
+  // the live filter then keeps a ticked category in full unless some of its
+  // tags are ticked, and then only those — the rule the page shows
+  // (atomsOf). Tags of one category that differ only in letter case are
+  // always ticked together (TWINS), so each spelling is sent and the server
+  // keeps the first. A category whose listed tags are ALL ticked still sends each
+  // of them: the page lists only the tags this backtest saw, so naming the
+  // category alone would let a live run trade tags nobody ticked. The server
+  // refuses, with its reason, any other value the live settings reject. Each
+  // number is written by String(), whose shortest form reads back as the
+  // same number.
   function saveHref() {
     if (!D || !D.save || !SHOWN || C === null || trimOn(SHOWN[9])) { return null; }
     // null: never simulated; undefined: a sell level's block not inflated (a
@@ -11619,9 +12547,10 @@ _FILTER_JS = r"""
     if (shownId === null || shownId === undefined) { return null; }
     var band = D.bands[SHOWN[0]].value, k = D.ks[SHOWN[1]].value, cap = D.caps[SHOWN[2]].value;
     if (!band || !(k > 0) || !(cap > 0)) { return null; }
-    var sliced = SHOWN[3] !== '' || SHOWN[4] !== '';
-    if (sliced && !D.save.filed_by_listing) { return null; }
-    var q = [['tier_floors', offAt(SHOWN[5]) ? 'off' : 'on'], ['spread_min', band[0]],
+    var cats = SHOWN[3], tags = SHOWN[4];
+    if (cats.length && !D.save.filed_by_listing) { return null; }
+    if (ticksBlocked(cats, tags) !== null) { return null; }
+    var q =[['tier_floors', offAt(SHOWN[5]) ? 'off' : 'on'], ['spread_min', band[0]],
              ['spread_max', band[1]], ['k', k], ['size_cap', cap]];
     // Left out when the run recorded none: the server then keeps the saved
     // same-title cap, or the seed's when none is saved
@@ -11640,12 +12569,8 @@ _FILTER_JS = r"""
              ['sell_min_days',
               level === null ? 'off' : D.sell_days[parseInt(SHOWN[8], 10)].value]);
     }
-    if (SHOWN[4] !== '') {
-      var sc = D.subcats[parseInt(SHOWN[4], 10)];
-      q.push(['category', D.categories[sc[0]]], ['tag', sc[1]]);
-    } else if (SHOWN[3] !== '') {
-      q.push(['category', D.categories[parseInt(SHOWN[3], 10)]]);
-    }
+    cats.forEach(function(c) { q.push(['category', D.categories[c]]); });
+    tags.forEach(function(t) { q.push(['tag', subName(t, true)]); });
     if (typeof D.save.source === 'string' && D.save.source !== '') {
       q.push(['source', D.save.source]);
     }
@@ -11653,8 +12578,33 @@ _FILTER_JS = r"""
       return encodeURIComponent(p[0]) + '=' + encodeURIComponent(String(p[1]));
     }).join('&');
   }
-  // The button is enabled exactly when the scenario on screen can be saved
-  function refreshSave() { if (saveBtn) { saveBtn.disabled = saveHref() === null; } }
+  // Why the ticks themselves cannot be saved, as the save button's hover
+  // text in Python's words (D.text.save_*), or null when they can: more
+  // categories, or more tags, than the server takes on one address
+  // (D.save.max_names — each ticked spelling counts, as the server counts
+  // them); a category whose own name holds the separator, which could not
+  // be told from a tied tag's category; or a category another one repeats
+  // in other letter case, which the live filter would keep too
+  function ticksBlocked(cats, tags) {
+    var most = D.save.max_names;
+    if (typeof most === 'number' && (cats.length > most || tags.length > most)) {
+      return fill(D.text.save_too_many, {n: most});
+    }
+    if (cats.some(function(c) { return D.categories[c].indexOf(D.mix.sep) >= 0; })) {
+      return D.text.save_separator;
+    }
+    if (cats.some(function(c) { return NO_SAVE[c]; })) { return D.text.save_case_twin; }
+    return null;
+  }
+  // The button is enabled exactly when the scenario on screen can be saved;
+  // while the ticks are what stops it, its hover text says why, and
+  // otherwise it reads as Python rendered it
+  function refreshSave() {
+    if (!saveBtn) { return; }
+    saveBtn.disabled = saveHref() === null;
+    var why = (D && D.save && SHOWN) ? ticksBlocked(SHOWN[3], SHOWN[4]) : null;
+    if (SAVE_TITLE !== null) { saveBtn.title = why === null ? SAVE_TITLE : why; }
+  }
   function isPrimaryCell() {
     var p = D.primary;
     return bandIndex() === p[0] && kIndex() === p[1] && capIndex() === p[2];
@@ -11668,20 +12618,537 @@ _FILTER_JS = r"""
       && sellAt(sellSel.value) === null && (!tiersOff() || !D.tier_binds[bandIndex()]);
   }
   function list() { return C ? C.list : null; }
-  function viewKey() {
-    if (tagSel.value !== '') { return 's' + tagSel.value; }
-    if (catSel.value !== '') { return 'c' + catSel.value; }
-    return 'all';
-  }
   function count(key) { var L = list(), v = L && L.views[key]; return v ? v.n : 0; }
-  function currentView() { var L = list(); return (L && L.views[viewKey()]) || D.empty; }
+  // A tag by name, with or without its category in front — joined as a saved
+  // filter ties a tag to its category (D.mix.sep, config.TAG_SCOPE_SEPARATOR)
   function subName(i, withCategory) {
     var sc = D.subcats[i];
-    return (withCategory ? D.categories[sc[0]] + ' · ' : '') + sc[1];
+    return (withCategory ? D.categories[sc[0]] + D.mix.sep : '') + sc[1];
   }
-  function selectionName(key) {
-    if (key.charAt(0) === 'c') { return D.categories[parseInt(key.slice(1), 10)]; }
-    return subName(parseInt(key.slice(1), 10), true);
+  function ascending(a, b) { return a - b; }
+  // A sort that keeps equal items in the order given, whatever the engine's own does
+  function stableSort(items, compare) {
+    return items.map(function(item, i) { return [item, i]; }).sort(function(a, b) {
+      return compare(a[0], b[0]) || a[1] - b[1];
+    }).map(function(pair) { return pair[0]; });
+  }
+
+  // The Category and Tag menus. A menu's boxes as the page holds them (the
+  // clearing box first), and the indexes ticked in it.
+  function boxesOf(menu) {
+    return menu.querySelectorAll
+      ? Array.prototype.slice.call(menu.querySelectorAll('input')) : [];
+  }
+  function ticksOf(prefix, size) {
+    var out = [];
+    for (var i = 0; i < size; i++) {
+      var box = byId(prefix + i);
+      if (box && box.checked) { out.push(i); }
+    }
+    return out;
+  }
+  function catTicks() { return ticksOf('flt-cat-', D.categories.length); }
+  function tagTicks() { return ticksOf('flt-tag-', D.subcats.length); }
+  // Every tag of a twin group ticked as soon as one of them is
+  function withTwins(tags) {
+    var out = tags.slice();
+    tags.forEach(function(t) {
+      (TWINS[t] || []).forEach(function(j) { if (out.indexOf(j) < 0) { out.push(j); } });
+    });
+    return out;
+  }
+  // The menus' boxes set to these ticks, a tag's case twins with it
+  function setTicks(cats, tags) {
+    tags = withTwins(tags);
+    D.categories.forEach(function(_, i) {
+      var box = byId('flt-cat-' + i);
+      if (box) { box.checked = cats.indexOf(i) >= 0; }
+    });
+    D.subcats.forEach(function(_, i) {
+      var box = byId('flt-tag-' + i);
+      if (box) { box.checked = tags.indexOf(i) >= 0; }
+    });
+  }
+  // The ticks as one string, to tell whether a click changed them
+  function pickKey() { return catTicks().join(',') + '|' + tagTicks().join(','); }
+  // Before the data is in, a menu is cleared by its boxes alone (a browser
+  // can restore old ticks on a reload): only the clearing box stays ticked
+  function clearMenu(menu, allBox) {
+    boxesOf(menu).forEach(function(box) { box.checked = box === allBox; });
+  }
+  function menusDisabled(off) {
+    [catMenu, tagMenu].forEach(function(menu) {
+      boxesOf(menu).forEach(function(box) { box.disabled = off; });
+      menu.className = off ? 'flt-multi flt-off' : 'flt-multi';
+      if (off) { menu.open = false; }
+    });
+  }
+  // The category · tag views a set of ticks covers, as indexes into
+  // D.subcats: for each ticked category its ticked tags, or every one of its
+  // tags when none of them is ticked — the page's twin of the live filter's
+  // rule (config.trade_filter). null when nothing is ticked: everything.
+  function atomsOf(cats, tags) {
+    if (!cats.length) { return null; }
+    var out = [];
+    D.subcats.forEach(function(sc, i) {
+      if (cats.indexOf(sc[0]) < 0) { return; }
+      var narrowed = tags.some(function(t) { return D.subcats[t][0] === sc[0]; });
+      if (!narrowed || tags.indexOf(i) >= 0) { out.push(i); }
+    });
+    return out;
+  }
+  // A set of ticks by name (Python's _selection_name): a ticked category's
+  // own name where none of its tags is ticked, else each of its ticked tags
+  // with the category in front; the first D.mix.names of them, then how
+  // many more, in Python's words
+  function selectionName(cats, tags) {
+    var names = [];
+    cats.forEach(function(c) {
+      var own = tags.filter(function(t) { return D.subcats[t][0] === c; });
+      if (!own.length) { names.push(D.categories[c]); }
+      own.forEach(function(t) { names.push(subName(t, true)); });
+    });
+    var shown = names.slice(0, D.mix.names).join(D.text.names_join);
+    var more = names.length - D.mix.names;
+    return more <= 0 ? shown : fill(D.text.names_more, {names: shown, n: more});
+  }
+  // The view of a chunk's list for a set of ticks: one of Python's own views
+  // wherever the ticks cover exactly its trades (everything, one category,
+  // one tag), the empty view where they cover none, and otherwise a mix
+  // worked out here from the tags' views (mixView) — or null when this
+  // list's tags cannot be mixed. window.__dashForceMix (never set by the
+  // page; the tests set it) sends every selection with a trade through
+  // mixView, so a mix can be compared with the view Python built.
+  function tagKeysOf(L) {
+    if (!L._tags) {
+      L._tags = Object.keys(L.views).filter(function(k) { return k.charAt(0) === 's'; });
+    }
+    return L._tags;
+  }
+  function plainKey(L, keys) {
+    if (keys.length === 1) { return keys[0]; }
+    var every = tagKeysOf(L);
+    if (keys.length === every.length) { return 'all'; }
+    var c = D.subcats[parseInt(keys[0].slice(1), 10)][0];
+    function inCategory(k) { return D.subcats[parseInt(k.slice(1), 10)][0] === c; }
+    if (keys.every(inCategory) && keys.length === every.filter(inCategory).length
+        && L.views['c' + c]) {
+      return 'c' + c;
+    }
+    return null;
+  }
+  function viewFor(chunk, cats, tags) {
+    var L = chunk ? chunk.list : null;
+    if (!L) { return D.empty; }
+    var atoms = atomsOf(cats, tags);
+    if (atoms === null) { return L.views.all || D.empty; }
+    var keys = atoms.map(function(i) { return 's' + i; })
+      .filter(function(k) { return !!L.views[k]; });
+    if (!keys.length) { return D.empty; }
+    if (!window.__dashForceMix) {
+      var plain = plainKey(L, keys);
+      if (plain) { return whole(L.views[plain]); }
+    }
+    return mixView(chunk, keys);
+  }
+
+  // ── A mix of several categories and tags, worked out in the page ─────────
+  // There are far too many combinations to ship a view of each, so a mix is
+  // built from the chunk's category · tag views ("m": each one's running P&L
+  // in dollars per trade type; "row": its line of the category table) and
+  // per-trade arrays, with the constants and markup Python renders with
+  // (D.mix) and Python's words (D.text). Each figure follows the Python
+  // helper named beside it, so a mix reads as _view_payload would have
+  // computed it for the same trades.
+
+  // numpy's sum of doubles (pairwise): plain below 8 values, eight running
+  // sums up to 128, halves beyond — so a mean here is the mean Python takes
+  function pairSum(a, lo, n) {
+    var i, res;
+    if (n < 8) {
+      res = 0;
+      for (i = 0; i < n; i++) { res += a[lo + i]; }
+      return res;
+    }
+    if (n <= 128) {
+      var r = a.slice(lo, lo + 8);
+      for (i = 8; i < n - (n % 8); i += 8) {
+        for (var j = 0; j < 8; j++) { r[j] += a[lo + i + j]; }
+      }
+      res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+      for (; i < n; i++) { res += a[lo + i]; }
+      return res;
+    }
+    var half = Math.floor(n / 2);
+    half -= half % 8;
+    return pairSum(a, lo, half) + pairSum(a, lo + half, n - half);
+  }
+  function npSum(a) { return pairSum(a, 0, a.length); }
+  // pandas' sum within a group (compensated): the decomposition's bars
+  function groupSum(values) {
+    var sum = 0, comp = 0;
+    values.forEach(function(v) {
+      var y = v - comp, t = sum + y;
+      comp = t - sum - y;
+      sum = t;
+    });
+    return sum;
+  }
+  // numpy's median: the middle value, or the mean of the two middle ones
+  function median(values) {
+    var s = values.slice().sort(ascending), mid = Math.floor(s.length / 2);
+    return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+  }
+  // A number with a fixed count of decimals as Python's format() writes it:
+  // the exact value rounded half to even (toFixed alone rounds an exact half
+  // up), and a negative that rounds to zero keeps its sign
+  function fixed(x, digits) {
+    if (!isFinite(x) || Math.abs(x) >= 1e21) { return String(x); }
+    var neg = x < 0 || (x === 0 && 1 / x < 0);
+    var s = Math.abs(x).toFixed(digits + 40), dot = s.indexOf('.');
+    var body = s.slice(0, dot) + s.slice(dot + 1, dot + 1 + digits);
+    var rest = s.slice(dot + 1 + digits), first = rest.charAt(0), up = first > '5';
+    if (first === '5') {
+      up = /[1-9]/.test(rest.slice(1)) || parseInt(body.charAt(body.length - 1), 10) % 2 === 1;
+    }
+    if (up) {
+      var d = body.split(''), i = d.length - 1;
+      while (i >= 0 && d[i] === '9') { d[i] = '0'; i--; }
+      if (i >= 0) { d[i] = String(parseInt(d[i], 10) + 1); } else { d.unshift('1'); }
+      body = d.join('');
+    }
+    var whole = body.slice(0, body.length - digits);
+    return (neg ? '-' : '') + whole + (digits ? '.' + body.slice(body.length - digits) : '');
+  }
+  // Python's "%" formats (the value times 100, then fixed) and its "+" flag
+  function pct(x, digits) { return fixed(x * 100, digits) + '%'; }
+  function signed(text) { return text.charAt(0) === '-' ? text : '+' + text; }
+  function zeros(n) {
+    var out = new Array(n);
+    for (var i = 0; i < n; i++) { out[i] = 0; }
+    return out;
+  }
+  // A series on every date back to change points, as _sparse_on_axis ships one
+  function sparse(values) {
+    var out = [], prev;
+    for (var i = 0; i < values.length; i++) {
+      var v = isFinite(values[i]) ? values[i] : null;
+      if (i === 0 || v !== prev) { out.push([i, v]); }
+      prev = v;
+    }
+    return out;
+  }
+  // _decomposition_frame's month of an entry date: "YYYY-MM"
+  function monthName(m) {
+    var year = Math.floor(m / 12), month = m % 12 + 1;
+    return ('000' + year).slice(-4) + '-' + (month < 10 ? '0' : '') + month;
+  }
+  function pnlColors(values) {
+    return values.map(function(v) { return v >= 0 ? D.mix.profit : D.mix.loss; });
+  }
+  // _khat_delta: a k-hat less a k, to three decimals, a difference shown as
+  // zero reading "+0.000"; red above zero, green otherwise
+  function khatDelta(khat, k) {
+    if (khat === null || k === null || k === undefined) {
+      return [D.mix.none, D.styles.kpi_default];
+    }
+    var digits = fixed(Math.abs(khat - k), 3), zero = !/[1-9]/.test(digits);
+    var up = !zero && khat - k > 0;
+    return [(zero || up ? '+' : '-') + digits, D.mix.khat_delta[up ? 0 : 1]];
+  }
+
+  // A small cache: what make() gave for a key, for the last MIXES keys
+  // asked for (the oldest forgotten first, and worked out again if asked for)
+  function remember(cache, key, make) {
+    if (!(key in cache.at)) {
+      cache.at[key] = make();
+      cache.keys.push(key);
+      if (cache.keys.length > MIXES) { delete cache.at[cache.keys.shift()]; }
+    }
+    return cache.at[key];
+  }
+  // Category · tag views' curves added up: each trade type's running dollars
+  // on every date ("m": parts, by label; labels in Python's order of the
+  // types) and the curve itself, the starting balance plus all of them
+  // (backtester._build_equity_curve; _return_by_trade_type)
+  function addCurves(views) {
+    var parts = {}, i;
+    views.forEach(function(a) {
+      a.m.forEach(function(part) {
+        var y = expand(part[1]), sum = parts[part[0]] || (parts[part[0]] = zeros(N));
+        for (var r = 0; r < N; r++) { sum[r] += y[r]; }
+      });
+    });
+    var labels = D.mix.types.filter(function(label) { return !!parts[label]; });
+    var V = new Array(N);
+    for (i = 0; i < N; i++) {
+      var pnl = 0;
+      for (var l = 0; l < labels.length; l++) { pnl += parts[labels[l]][i]; }
+      V[i] = D.mix.start + pnl;
+    }
+    return {labels: labels, parts: parts, V: V};
+  }
+  // _max_drawdown: each day's fall from the running peak, the deepest fall
+  // and its first day
+  function fallOf(V) {
+    var peak = -Infinity, fall = new Array(N), deepest = Infinity, when = 0;
+    for (var i = 0; i < N; i++) {
+      if (V[i] > peak) { peak = V[i]; }
+      fall[i] = (V[i] - peak) / peak;
+      if (fall[i] < deepest) { deepest = fall[i]; when = i; }
+    }
+    return {fall: fall, deepest: deepest, when: when};
+  }
+  // The four series a view draws its curve from, as _view_payload ships
+  // them (_performance_series and the curve itself, rounded as
+  // _sparse_on_axis rounds each): the total return and each trade type's
+  // line in percent of the starting balance, the drawdown in percent, and
+  // the curve in dollars
+  function curveSeries(c, fall) {
+    var start = D.mix.start;
+    return {
+      total: sparse(c.V.map(function(v) { return roundTo((v / start - 1) * 100, 4); })),
+      types: c.labels.map(function(label) {
+        return [label, sparse(c.parts[label].map(function(x) {
+          return roundTo(x / start * 100, 4);
+        }))];
+      }),
+      dd: sparse(fall.map(function(x) { return roundTo(x * 100, 4); })),
+      eq: sparse(c.V.map(function(v) { return roundTo(v, 2); }))
+    };
+  }
+  // One of Python's views, ready to draw. A category · tag view that ships
+  // its curve as "m" leaves out those of the four series above that this
+  // arithmetic gives exactly as Python computed them (Python checked, with
+  // the same steps: _curve_series_from_m): the ones left out are worked out
+  // here, once, and kept on the view
+  function whole(v) {
+    if (v.m && !(v.total && v.types && v.dd && v.eq)) {
+      var c = addCurves([v]), series = curveSeries(c, fallOf(c.V).fall);
+      Object.keys(series).forEach(function(name) {
+        if (!v[name]) { v[name] = series[name]; }
+      });
+    }
+    return v;
+  }
+  // One mix, built once per chunk and set of tag views while it is among
+  // the chunk's last MIXES
+  function mixView(chunk, keys) {
+    var L = chunk.list;
+    L._mix = L._mix || {at: {}, keys: []};
+    return remember(L._mix, keys.join(','), function() { return buildMix(chunk, keys); });
+  }
+  function buildMix(chunk, keys) {
+    var L = chunk.list, M = D.mix, T = D.text, i;
+    var atoms = keys.map(function(k) { return L.views[k]; });
+    // A tag whose curve Python could not vouch for carries no "m": no mix
+    if (!atoms.every(function(a) { return !!a.m; })) { return null; }
+    var idx = [];
+    atoms.forEach(function(a) { idx = idx.concat(a.idx); });
+    idx.sort(ascending);
+    var n = idx.length;
+    function mine(arr) { return idx.map(function(t) { return arr[t]; }); }
+
+    // The curve: the starting balance plus every tag's running dollars, kept
+    // per trade type
+    var curves = addCurves(atoms), V = curves.V;
+
+    // Capital in open trades: the fee-inclusive stakes from each entry row
+    // to its exit row (_capital_deployed), and what the curve itself carries
+    // in them (_open_capital_from_curve), which the hurdle is charged on
+    var entered = zeros(N), exited = zeros(N), paid = zeros(N);
+    idx.forEach(function(t) {
+      if (L.en[t] >= 0) { entered[L.en[t]] += L.st[t]; }
+      if (L.ex[t] >= 0) { exited[L.ex[t]] += L.st[t]; paid[L.ex[t]] += L.pf[t]; }
+    });
+    var dep = new Array(N), open = new Array(N), staked = 0, paidOut = 0;
+    for (i = 0; i < N; i++) {
+      staked += entered[i] - exited[i];
+      paidOut += paid[i];
+      dep[i] = staked > 0 ? staked : 0;
+      var carried = V[i] - M.start + staked - paidOut;
+      open[i] = carried > 0 ? carried : 0;
+    }
+
+    // Daily returns and what they are measured against (_rf_hurdle): the
+    // yield in force that day on the share of the value in open trades at
+    // the previous close; nothing without rates
+    var rates = M.rf ? expand(M.rf) : null, ret = new Array(N), excess = new Array(N);
+    var lo = Infinity, hi = -Infinity;
+    for (i = 0; i < N; i++) {
+      ret[i] = i === 0 ? 0 : V[i] / V[i - 1] - 1;
+      if (ret[i] !== ret[i]) { ret[i] = 0; }
+      var hurdle = (rates && i > 0 && V[i - 1] > 0) ? rates[i] * (open[i - 1] / V[i - 1]) : 0;
+      excess[i] = ret[i] - hurdle / M.year;
+      lo = Math.min(lo, ret[i]);
+      hi = Math.max(hi, ret[i]);
+    }
+    // _sharpe and _sortino; a curve that never moves reads 0 (_varies)
+    var sharpe = 0, sortino = 0;
+    if (hi - lo > M.flat) {
+      var mean = npSum(excess) / N;
+      var spread = Math.sqrt(npSum(excess.map(function(e) {
+        return (mean - e) * (mean - e);
+      })) / (N - 1));
+      var down = Math.sqrt(npSum(excess.map(function(e) {
+        var d = Math.min(e, 0);
+        return d * d;
+      })) / N);
+      sharpe = spread > 0 ? mean / spread * Math.sqrt(M.year) : 0;
+      sortino = down > 0 ? mean / down * Math.sqrt(M.year) : 0;
+    }
+    // _max_drawdown: the deepest fall from a running peak, and its first day
+    var falls = fallOf(V), deepest = falls.deepest;
+    var drawdown = pct(deepest, 1) + (deepest === 0 ? '' : ' (' + D.dates[falls.when] + ')');
+    // _median_monthly_return: each month's last value over the one before,
+    // the first month against the opening row
+    var medianMonth = M.none;
+    if (isFinite(V[0]) && V[0] > 0) {
+      var ends = [];
+      for (i = 0; i < N; i++) {
+        if (i === N - 1 || D.dates[i].slice(0, 7) !== D.dates[i + 1].slice(0, 7)) {
+          ends.push(V[i]);
+        }
+      }
+      var months = ends.map(function(v, j) { return v / (j === 0 ? V[0] : ends[j - 1]) - 1; })
+        .filter(function(r) { return isFinite(r); });
+      if (months.length) { medianMonth = signed(pct(median(months), 1)); }
+    }
+
+    // _performance_kpis' cards
+    var profits = mine(L.pf), ratios = mine(L.pr);
+    var wins = profits.filter(function(p) { return p > 0; }).length;
+    var kpi = {
+      total_return: signed(pct((V[N - 1] - M.start) / M.start, 1)),
+      sharpe: fixed(sharpe, 2),
+      sortino: fixed(sortino, 2),
+      max_drawdown: drawdown,
+      win_rate: pct(wins / n, 1),
+      avg_return: pct(npSum(ratios) / n, 1),
+      median_return: pct(median(ratios), 1),
+      median_monthly: medianMonth,
+      trades: String(n)
+    };
+
+    // _decomposition_aggregates' bars: P&L by entry month, category,
+    // category · tag and entry-price bucket
+    function sumsBy(keyOf) {
+      var groups = {}, order = [];
+      idx.forEach(function(t) {
+        var k = keyOf(t);
+        if (k === null) { return; }
+        if (!(k in groups)) { groups[k] = []; order.push(k); }
+        groups[k].push(L.pf[t]);
+      });
+      order.sort(ascending);
+      return {keys: order, sums: order.map(function(k) { return groupSum(groups[k]); })};
+    }
+    var byMonth = sumsBy(function(t) { return L.mo[t]; });
+    var monthly = {x: byMonth.keys.map(monthName), y: byMonth.sums, c: pnlColors(byMonth.sums)};
+    var byBucket = sumsBy(function(t) { return L.pb[t] < 0 ? null : L.pb[t]; });
+    var price = {x: byBucket.keys.map(function(b) { return M.buckets[b]; }), y: byBucket.sums,
+                 c: pnlColors(byBucket.sums)};
+    var categoryOf = {};
+    keys.forEach(function(k, j) {
+      var c = D.subcats[parseInt(k.slice(1), 10)][0];
+      atoms[j].idx.forEach(function(t) { categoryOf[t] = c; });
+    });
+    var byCategory = sumsBy(function(t) { return categoryOf[t]; });
+    // Smallest first, equal bars in name order (the categories are sorted)
+    var catBars = stableSort(byCategory.keys.map(function(c, j) {
+      return {name: D.categories[c], value: byCategory.sums[j]};
+    }), function(a, b) { return a.value - b.value; });
+    var cat = {x: catBars.map(function(b) { return b.value; }),
+               y: catBars.map(function(b) { return b.name; }),
+               c: pnlColors(catBars.map(function(b) { return b.value; }))};
+    // A tag's bar and table row are its own view's, in name order first
+    var tagRows = atoms.map(function(a) {
+      return {name: a.sub.y[0], value: a.sub.x[0], cells: a.row, pnl: a.row[M.cells.length],
+              n: a.n};
+    }).sort(function(a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+    var subBars = stableSort(tagRows, function(a, b) { return a.value - b.value; });
+    var sub = {x: subBars.map(function(b) { return b.value; }),
+               y: subBars.map(function(b) { return b.name; }),
+               c: pnlColors(subBars.map(function(b) { return b.value; })),
+               h: Math.max(M.sub_height[0], M.sub_height[1] * subBars.length + M.sub_height[2])};
+    // _category_table: the tags' rows, largest P&L first, each with its share
+    // of the mix's total (none of a zero total)
+    var total = npSum(profits);
+    var table = fill(M.table_head, {groups: tagRows.length})
+      + stableSort(tagRows, function(a, b) { return b.pnl - a.pnl; }).map(function(row) {
+        var cells = {trades: row.n, color: row.pnl >= 0 ? M.profit : M.loss,
+                     share: total === 0 ? M.none : pct(row.pnl / total, 0)};
+        M.cells.forEach(function(name, j) { cells[name] = row.cells[j]; });
+        return fill(M.row, cells);
+      }).join('') + M.table_foot;
+
+    // _reliability: the time-series trades' predictions against outcomes
+    var probs = [], hits = [];
+    idx.forEach(function(t) {
+      if (L.cp[t] !== null && L.cp[t] !== undefined) { probs.push(L.cp[t]); hits.push(L.ca[t]); }
+    });
+    var cal = {brier: M.none, log_loss: M.none, title: T.cal_title_none, x: [], y: [],
+               size: [], text: []};
+    if (probs.length) {
+      var brier = fixed(npSum(probs.map(function(p, j) {
+        return (p - hits[j]) * (p - hits[j]);
+      })) / probs.length, 4);
+      var logLoss = fixed(npSum(probs.map(function(p, j) {
+        var q = Math.max(M.log_clip, Math.min(1 - M.log_clip, p));
+        return -(hits[j] * Math.log(q) + (1 - hits[j]) * Math.log(1 - q));
+      })) / probs.length, 4);
+      cal.brier = brier;
+      cal.log_loss = logLoss;
+      cal.title = fill(T.cal_title, {brier: brier, log_loss: logLoss});
+      for (var b = 0; b + 1 < M.bins.length; b++) {
+        var inBin = [], binHits = [];
+        for (var j = 0; j < probs.length; j++) {
+          if (M.bins[b] <= probs[j] && probs[j] < M.bins[b + 1]) {
+            inBin.push(probs[j]);
+            binHits.push(hits[j]);
+          }
+        }
+        if (!inBin.length) { continue; }
+        cal.x.push(npSum(inBin) / inBin.length);
+        cal.y.push(npSum(binHits) / binHits.length);
+        cal.size.push(Math.max(M.marker[0], Math.floor(inBin.length / M.marker[1])));
+        cal.text.push(fill(T.cal_bin, {n: inBin.length}));
+      }
+    }
+
+    // _best_and_worst: the most and least profitable trades, equal profits in
+    // list order. A trade among the mix's first or last few is among its own
+    // tag's, whose rows Python rendered: tag by tag, the same order names
+    // the trade behind each row
+    function byProfit(trades_) {
+      return stableSort(trades_, function(a, b) { return L.pf[b] - L.pf[a]; });
+    }
+    var bestRow = {}, worstRow = {};
+    atoms.forEach(function(a) {
+      var order = byProfit(a.idx), from = Math.max(0, order.length - M.top);
+      a.best.forEach(function(row, j) { bestRow[order[j]] = row; });
+      a.worst.forEach(function(row, j) { worstRow[order[from + j]] = row; });
+    });
+    var ranked = byProfit(idx);
+    var best = ranked.slice(0, M.top).map(function(t) { return bestRow[t]; });
+    var worst = ranked.slice(-M.top).map(function(t) { return worstRow[t]; });
+    if (best.concat(worst).some(function(row) { return !row; })) { return null; }
+
+    var series = curveSeries(curves, falls.fall);
+    return {
+      n: n, idx: idx, kpi: kpi, mix: true,
+      total: series.total, types: series.types, dd: series.dd, eq: series.eq,
+      dep: sparse(dep.map(function(x) { return roundTo(x, 2); })),
+      // _strategy_row
+      bench: {'return': signed(pct(V[N - 1] / M.start - 1, 1)), sharpe: fixed(sharpe, 2),
+              max_dd: pct(deepest, 1)},
+      // The table's markup is kept with the mix (table_html), where one of
+      // Python's views names a string of its chunk (table)
+      monthly: monthly, cat: cat, sub: sub, price: price, table_html: table,
+      cal: cal, best: best, worst: worst,
+      // _one_to_one_extent
+      k11: Math.max.apply(null, mine(L.kx).concat([M.k11[0]])) * M.k11[1]
+    };
   }
 
   // Python's _trade_count, and a template's {name} fields filled as
@@ -11711,22 +13178,25 @@ _FILTER_JS = r"""
                       sellSel.value, daysSel.value, trimSel.value);
   }
   // The summary line: the templates _filter_summary_text fills for the view
-  // Python rendered, filled here for every other one
-  function summary(v) {
-    var key = viewKey(), T = D.text, text, id = cellChunk();
+  // Python rendered, filled here for every other one. With categories
+  // ticked it names them (selectionName) and, for a view worked out here
+  // (v.mix), closes on Python's note that the page combined it
+  function summary(v, cats, tags) {
+    var T = D.text, text, id = cellChunk();
     // Drawn only once a sell level's block is inflated, so never undefined
     // here; read as not shown should it be
     var shown = id !== null && id !== undefined;
     if (!shown) {
       text = fill(T.missing, {scenario: scenario()});
-    } else if (key === 'all') {
+    } else if (!cats.length) {
       text = fill(T.all, {scenario: scenario(), count: trades(v.n)});
       // Any other scenario closes on Python's other_scenario note — and the
       // primary cell with the tiers off at a binding band on other_run
       if (!isPrimary()) { text += isPrimaryCell() ? T.other_run : T.other_scenario; }
     } else {
-      text = fill(T.slice, {scenario: scenario(), selection: selectionName(key),
-                            n: v.n, band_count: trades(count('all'))});
+      text = fill(T.slice, {scenario: scenario(), selection: selectionName(cats, tags),
+                            n: v.n, band_count: trades(count('all'))})
+        + (v.mix ? T.mix_note : '');
     }
     // While adding is on, Python's note on what an added purchase counts as;
     // while trimming is on, its note on what a part sold counts as; and while
@@ -11826,7 +13296,9 @@ _FILTER_JS = r"""
     sizeTo('dec-sub', v.sub.h);
     bars('dec-sub', v.sub, {height: v.sub.h});
     var table = byId('dec-table');
-    if (table) { table.innerHTML = C.strings[v.table]; }
+    if (table) {
+      table.innerHTML = v.table_html !== undefined ? v.table_html : C.strings[v.table];
+    }
     bars('dec-price', v.price);
     redraw('dec-hold', [traceOf('dec-hold', 0, {x: pick(L.hold, v.idx)})]);
   }
@@ -11858,7 +13330,7 @@ _FILTER_JS = r"""
     setText('bench-sharpe', v.bench.sharpe);
     setText('bench-max_dd', v.bench.max_dd);
     // The strategy trace is redrawn; the S&P trace after it keeps its data
-    var gd = byId('bench-fig'), traces = [traceOf('bench-fig', 0, {x: D.dates, y: expand(v.eq)})];
+    var gd = byId('bench-fig'), traces = [traceOf('bench-fig', 0, {x: D.dates, y: curveOf(v)})];
     for (var i = 1; gd && gd.data && i < gd.data.length; i++) { traces.push(traceOf('bench-fig', i, {})); }
     redraw('bench-fig', traces);
   }
@@ -11867,26 +13339,62 @@ _FILTER_JS = r"""
   // while a chosen scenario's chunk is still loading the other sections keep
   // showing the last one drawn, and a Group-by change meanwhile must draw
   // that one too — so a chunk that then fails to load leaves nothing behind.
-  // shownKey is viewKey for the category and tag drawn.
-  function shownKey() {
-    if (SHOWN[4] !== '') { return 's' + SHOWN[4]; }
-    if (SHOWN[3] !== '') { return 'c' + SHOWN[3]; }
-    return 'all';
+
+  // A band's k-hat figures for a set of ticks: Python's own group wherever
+  // the ticks are one of its groups (everything, one whole category, one
+  // tag), else the covered tags' groups pooled here from their raw counts —
+  // k-hat is the share of entries that settled in between over the mean
+  // implied gap, backtester._calibration_bucket's arithmetic, with the
+  // cells, bar label and k-hat − k per k written as Python writes them
+  // (_khat_cells, _khat_bar_text, _khat_delta). null with no entry.
+  function pooledKhat(band, atoms) {
+    band._pool = band._pool || {at: {}, keys: []};
+    return remember(band._pool, atoms.join(','), function() {
+      var n = 0, events = 0, between = 0, gaps = 0;
+      atoms.forEach(function(i) {
+        var g = band.groups['s' + i];
+        if (!g || !g.raw) { return; }
+        n += g.n;
+        events += g.events;
+        between += g.raw[0];
+        gaps += g.raw[1];
+      });
+      if (!(n > 0)) { return null; }
+      var rate = between / n, implied = gaps / n, k = implied > 0 ? rate / implied : null;
+      return {n: n, events: events, rate: rate, implied: implied, k: k,
+              text: fill(D.text.khat_bar, {n: n, events: events}),
+              cells: [String(n), String(events), fixed(rate, 4), fixed(implied, 4),
+                      k === null ? D.mix.none : fixed(k, 3)],
+              delta: D.ks.map(function(kk) { return khatDelta(k, kk.value); })};
+    });
+  }
+  function khatFor(band, cats, tags) {
+    if (!band) { return null; }
+    if (!cats.length) { return band.groups.all || null; }
+    var atoms = atomsOf(cats, tags);
+    if (cats.length === 1) {
+      var own = D.subcats.filter(function(sc) { return sc[0] === cats[0]; }).length;
+      // The whole category: none of its tags ticked, or every one of them
+      if (!tags.length || tags.length === own) { return band.groups['c' + cats[0]] || null; }
+      if (tags.length === 1) { return band.groups['s' + tags[0]] || null; }
+    }
+    return pooledKhat(band, atoms);
   }
   // The k-hat chart's rows for a grouping: [{label, st, kind}], kind "all"
-  // (the grouping's whole population), "selected" (the filter's choice on
-  // screen) or "bar". By category or tag: every group at the band shown
-  // (tags within the category shown); by band: every band for the category
-  // or tag shown — every band as the Tier floors choice shown reads it.
+  // (the grouping's whole population), "selected" (ticked in the filter on
+  // screen) or "bar". By category: every category at the band shown, each
+  // ticked one marked. By tag: with one category ticked its tags alone,
+  // under its own total, each ticked tag marked; otherwise every tag, those
+  // the ticks cover marked. By band: every band — as the Tier floors choice
+  // shown reads it — for the ticks shown (khatFor).
   // _section_khat renders the same rows for the default (by category,
   // primary band, tier floors on, no filter), from the same payload.
   function khatRows(group) {
-    var bi = SHOWN[0], cat = SHOWN[3], tag = SHOWN[4], T = D.text, out = [];
+    var bi = SHOWN[0], cats = SHOWN[3], tags = SHOWN[4], T = D.text, out = [];
     var B = bandsAt(SHOWN[5]), K = khatAt(SHOWN[5]);
     if (group === 'band') {
-      var key = shownKey();
       K.forEach(function(b, i) {
-        out.push({label: B[i].label, st: (b && b.groups[key]) || null,
+        out.push({label: B[i].label, st: khatFor(b, cats, tags),
                   kind: i === bi ? 'selected' : 'bar'});
       });
       return out;
@@ -11894,15 +13402,17 @@ _FILTER_JS = r"""
     var band = K[bi];
     if (!band) { return out; }
     if (group === 'tag') {
-      out.push({label: cat === '' ? T.khat_all_tags
-                                  : fill(T.khat_all_in, {category: D.categories[parseInt(cat, 10)]}),
-                st: band.groups[cat === '' ? 'all' : 'c' + cat] || null, kind: 'all'});
+      var one = cats.length === 1 ? cats[0] : null;
+      var marked = cats.length > 1 ? atomsOf(cats, tags) : tags;
+      out.push({label: one === null ? T.khat_all_tags
+                                    : fill(T.khat_all_in, {category: D.categories[one]}),
+                st: band.groups[one === null ? 'all' : 'c' + one] || null, kind: 'all'});
       D.subcats.forEach(function(sc, si) {
-        if (cat !== '' && String(sc[0]) !== cat) { return; }
+        if (one !== null && sc[0] !== one) { return; }
         var st = band.groups['s' + si];
         if (st) {
-          out.push({label: subName(si, cat === ''), st: st,
-                    kind: String(si) === tag ? 'selected' : 'bar'});
+          out.push({label: subName(si, one === null), st: st,
+                    kind: marked.indexOf(si) >= 0 ? 'selected' : 'bar'});
         }
       });
       return out;
@@ -11910,7 +13420,9 @@ _FILTER_JS = r"""
     out.push({label: T.khat_all_categories, st: band.groups.all || null, kind: 'all'});
     D.categories.forEach(function(name, ci) {
       var st = band.groups['c' + ci];
-      if (st) { out.push({label: name, st: st, kind: String(ci) === cat ? 'selected' : 'bar'}); }
+      if (st) {
+        out.push({label: name, st: st, kind: cats.indexOf(ci) >= 0 ? 'selected' : 'bar'});
+      }
     });
     return out;
   }
@@ -11921,8 +13433,7 @@ _FILTER_JS = r"""
   function khatTitle(group) {
     var T = D.text, scope;
     if (group === 'band') {
-      var key = shownKey();
-      scope = key === 'all' ? T.khat_every_category : selectionName(key);
+      scope = SHOWN[3].length ? selectionName(SHOWN[3], SHOWN[4]) : T.khat_every_category;
       if (offAt(SHOWN[5])) { scope = fill(T.khat_scope_tier_off, {scope: scope}); }
     } else {
       scope = bandsAt(SHOWN[5])[SHOWN[0]].where;
@@ -11983,17 +13494,16 @@ _FILTER_JS = r"""
   }
 
   // The Portfolio Performance section's k-hat cards, for what is ON SCREEN
-  // (SHOWN, like the k-hat chart): the k-hat breakdown's own group for the
-  // band, Tier floors choice and category or tag shown — its table cell —
-  // and its k-hat − k at the k shown, text and colour as Python formatted
-  // them (_khat_kpis).
+  // (SHOWN, like the k-hat chart): the k-hat figures of the band, Tier floors
+  // choice and ticks shown (khatFor: the k-hat breakdown's own group, or
+  // several tags' groups pooled) — its table cell — and its k-hat − k at
+  // the k shown, text and colour as Python formats them (_khat_kpis).
   // Nothing to show is the blank cell in the default colour. None of it is
   // on a page without the cards (no sweep): then nothing is done.
   function renderKhatCards() {
     var khat = byId('kpi-khat'), delta = byId('kpi-khat_delta');
     if (!khat || !delta) { return; }
-    var band = khatAt(SHOWN[5])[SHOWN[0]];
-    var st = band ? (band.groups[shownKey()] || null) : null;
+    var st = khatFor(khatAt(SHOWN[5])[SHOWN[0]], SHOWN[3], SHOWN[4]);
     var blank = [D.khat_blank[4], D.styles.kpi_default];
     var known = st !== null && st.k !== null;
     khat.textContent = st ? st.cells[4] : blank[0];
@@ -12042,21 +13552,29 @@ _FILTER_JS = r"""
     }
   }
 
-  // Option labels carry the scenario's trade counts; the tag list holds the
-  // selected category's tags, or every "Category · Tag" under "All".
-  function refreshOptions() {
-    for (var i = 1; i < catSel.options.length; i++) {
-      var ci = catSel.options[i].value;
-      catSel.options[i].text = D.categories[parseInt(ci, 10)] + ' (' + count('c' + ci) + ')';
-    }
-    var cat = catSel.value, keep = tagSel.value;
-    while (tagSel.options.length > 1) { tagSel.remove(1); }
-    D.subcats.forEach(function(sc, i) {
-      if (cat !== '' && String(sc[0]) !== cat) { return; }
-      tagSel.add(new Option(subName(i, cat === '') + ' (' + count('s' + i) + ')', String(i)));
+  // The two menus as their ticks stand: each row's text with the trade
+  // count of the scenario on screen; the Tag menu showing the ticked
+  // categories' tags only (every tag while no category is ticked), a tag
+  // named with its category unless exactly one category is ticked; each
+  // clearing box ticked exactly when nothing else in its menu is; and each
+  // button reading nothing ticked, the one ticked name, or how many — in
+  // Python's words (D.text.menu_*)
+  function refreshMenus() {
+    var cats = catTicks(), tags = tagTicks(), T = D.text, lone = cats.length === 1;
+    D.categories.forEach(function(name, i) {
+      setText('flt-cat-' + i + '-text', name + ' (' + count('c' + i) + ')');
     });
-    tagSel.value = keep;
-    if (tagSel.value !== keep) { tagSel.value = ''; }
+    D.subcats.forEach(function(sc, i) {
+      var row = byId('flt-tag-' + i + '-row');
+      if (row) { row.hidden = cats.length > 0 && cats.indexOf(sc[0]) < 0; }
+      setText('flt-tag-' + i + '-text', subName(i, !lone) + ' (' + count('s' + i) + ')');
+    });
+    catAll.checked = !cats.length;
+    tagAll.checked = !tags.length;
+    setText('flt-cat-label', !cats.length ? T.menu_cat_all
+      : (lone ? D.categories[cats[0]] : fill(T.menu_cat_n, {n: cats.length})));
+    setText('flt-tag-label', !tags.length ? T.menu_tag_all
+      : (tags.length === 1 ? subName(tags[0], !lone) : fill(T.menu_tag_n, {n: tags.length})));
   }
   // Each band option named as the Tier floors select reads it (Python's
   // "option" text: "max(tier,0.2)-0.6 (primary)" with the tiers on,
@@ -12068,9 +13586,9 @@ _FILTER_JS = r"""
     }
   }
 
-  function render() {
-    var v = currentView(), L = list(), has = v.n > 0;
-    summary(v);
+  function render(v, cats, tags) {
+    var L = list(), has = v.n > 0;
+    summary(v, cats, tags);
     setText('hdr-trades', String(v.n));
     // Shown before drawing, so every chart is laid out at its real width
     ['dec', 'cal', 'diag', 'risk'].forEach(function(p) { show(p, has); });
@@ -12214,27 +13732,36 @@ _FILTER_JS = r"""
     }
     refreshDays();
   }
-  // Draw the scenario the selects name, from C, and record it as SHOWN
-  // (after the tag list is rebuilt, so the tag recorded is the one kept)
-  function draw() {
-    refreshOptions();
-    SHOWN = [bandIndex(), kIndex(), capIndex(), catSel.value, tagSel.value, tierSel.value,
+  // Draw the scenario the selects and the menus' ticks name, from a chunk
+  // (null for a scenario the run never simulated), and record it as SHOWN
+  // with that chunk as C. False — nothing drawn, nothing recorded — when
+  // the ticks ask for a mix that chunk's list cannot give (viewFor)
+  function draw(chunk) {
+    var cats = catTicks(), tags = tagTicks();
+    var v = viewFor(chunk, cats, tags);
+    if (v === null) { return false; }
+    C = chunk;
+    refreshMenus();
+    SHOWN = [bandIndex(), kIndex(), capIndex(), cats, tags, tierSel.value,
              addSel.value, sellSel.value, daysSel.value, trimSel.value];
-    render();
+    render(v, cats, tags);
     refreshSell();
     refreshSave();
+    return true;
   }
-  // A chunk or Sell block that could not be loaded. The sections still show
-  // the last scenario drawn (the k-hat chart included — it reads SHOWN):
-  // every select goes back to it, the category and tag too, since one chosen
-  // while the chunk was loading was never drawn either — the tag list
-  // rebuilt for the category shown — and the line says which scenario could
-  // not be loaded, in Python's words; the Tier floors, Add to held pairs,
-  // Trim to Kelly, Sell and Min. days choices go back too, with the band
-  // options named for the first, Sell shut again while trimming is shown and
-  // the Min. days select shut again when Sell names none
+  // A scenario that could not be shown: a chunk or Sell block that could
+  // not be loaded (err: why), or ticks whose mix its list cannot give (err
+  // null). The sections still show the last scenario drawn (the k-hat chart
+  // included — it reads SHOWN): every select goes back to it, and the menus'
+  // ticks too, since ticks made while the chunk was loading were never
+  // drawn either — the menus rebuilt for the ticks shown — and the line
+  // says what could not be shown, in Python's words; the Tier floors, Add
+  // to held pairs, Trim to Kelly, Sell and Min. days choices go back too,
+  // with the band options named for the first, Sell shut again while
+  // trimming is shown and the Min. days select shut again when Sell names
+  // none
   function putBack(err) {
-    var tried = scenario();
+    var tried = scenario(), ticks = selectionName(catTicks(), tagTicks());
     bandSel.value = String(SHOWN[0]);
     tierSel.value = SHOWN[5];
     addSel.value = SHOWN[6];
@@ -12244,19 +13771,34 @@ _FILTER_JS = r"""
     relabelBands();
     kSel.value = String(SHOWN[1]);
     capSel.value = String(SHOWN[2]);
-    catSel.value = SHOWN[3];
-    refreshOptions();
-    tagSel.value = SHOWN[4];
+    setTicks(SHOWN[3], SHOWN[4]);
+    refreshMenus();
+    PICK = pickKey();
     refreshSell();
-    setText('flt-summary', fill(D.text.unavailable, {
-      failed: tried, reason: String(err),
-      scenario: scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7],
-                           SHOWN[8], SHOWN[9])}));
+    var still = scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7],
+                           SHOWN[8], SHOWN[9]);
+    // A mix that could not be shown: the ticks tried and the scenario they
+    // were tried at, then what is ticked again now — and at which scenario,
+    // when the selects went back to another one too
+    setText('flt-summary', err === null
+      ? fill(D.text.mix_unavailable, {
+          selection: ticks, failed: tried,
+          shown: SHOWN[3].length ? selectionName(SHOWN[3], SHOWN[4]) : D.text.mix_still_all,
+          at: tried === still ? '' : fill(D.text.mix_still_at, {scenario: still})})
+      : fill(D.text.unavailable, {failed: tried, reason: String(err), scenario: still}));
     // The scenario still shown can be saved again
     refreshSave();
   }
-  // The selects changed: draw their scenario — at once when its chunk is
-  // loaded (or it has none), else once it is; a later choice supersedes it
+  // A chunk whose list could not give the mix asked for was never drawn:
+  // dropped unless it is the page's own or one drawn before (KEPT bounds
+  // only those), then everything goes back
+  function refuseMix(id) {
+    if (id !== primaryChunk() && KEPT.indexOf(id) < 0) { delete CHUNKS[id]; }
+    putBack(null);
+  }
+  // The selects or the ticks changed: draw their scenario — at once when its
+  // chunk is loaded (or it has none), else once it is; a later choice
+  // supersedes it
   function choose() {
     var seq = ++SEQ, id = cellChunk();
     if (id === undefined) {
@@ -12272,9 +13814,12 @@ _FILTER_JS = r"""
       });
       return;
     }
-    if (id === null) { C = null; draw(); return; }
+    if (id === null) { draw(null); return; }
     var entry = CHUNKS[id];
-    if (entry && entry.data) { touch(id); C = entry.data; draw(); return; }
+    if (entry && entry.data) {
+      if (draw(entry.data)) { touch(id); } else { refuseMix(id); }
+      return;
+    }
     // While the chunk loads, the selects name a scenario the page does not
     // show yet, so nothing can be saved until it is drawn (or the choice is
     // put back)
@@ -12282,20 +13827,19 @@ _FILTER_JS = r"""
     setText('flt-summary', fill(D.text.loading, {scenario: scenario()}));
     load(id).then(function(chunk) {
       if (seq !== SEQ) { return; }
-      touch(id);
-      C = chunk;
-      draw();
+      if (draw(chunk)) { touch(id); } else { refuseMix(id); }
     }, function(err) {
       if (seq !== SEQ) { return; }
       putBack(err);
     });
   }
   // The bar cannot work: the base block, or the primary scenario's chunk,
-  // could not be loaded. Every select is disabled. The one sentence the
-  // script words itself is the line for a base block it could not read,
-  // which is where Python's templates are.
+  // could not be loaded. Every select and both menus are disabled. The one
+  // sentence the script words itself is the line for a base block it could
+  // not read, which is where Python's templates are.
   function unavailable(reason) {
     SELECTS.forEach(function(s) { s.disabled = true; });
+    menusDisabled(true);
     if (saveBtn) { saveBtn.disabled = true; }
     if (D) {
       var p = D.primary;
@@ -12307,20 +13851,23 @@ _FILTER_JS = r"""
     setText('flt-summary', 'The filter could not load its data (' + reason
       + '); every section shows the primary spread band’s full run.');
   }
-  // A browser can restore a <select>'s last choice on a reload, or on going
-  // back; the page as rendered is the primary scenario's unfiltered view with
-  // the tier floors on, adding to held pairs off, trimming off and no sell
-  // level, so the
-  // bar is set back to it. Python renders the selects disabled: they are enabled once the
+  // A browser can restore a <select>'s last choice, or a box's tick, on a
+  // reload, or on going back; the page as rendered is the primary scenario's
+  // unfiltered view with the tier floors on, adding to held pairs off,
+  // trimming off and no sell level, so the bar is set back to it: every select to its rendered
+  // option, both menus to nothing ticked. Python renders the selects and the
+  // menus' boxes disabled: they are enabled once the
   // base block and the primary scenario's chunk are inflated, so no choice
   // can be made (or lost) before it can be drawn — and a category or tag
-  // change never meets an unloaded chunk.
+  // tick never meets an unloaded chunk.
   SELECTS.forEach(function(s) {
     s.selectedIndex = 0;
     for (var i = 0; i < s.options.length; i++) {
       if (s.options[i].defaultSelected) { s.selectedIndex = i; }
     }
   });
+  clearMenu(catMenu, catAll);
+  clearMenu(tagMenu, tagAll);
   if (!window.DecompressionStream || !window.Response || !window.Blob) {
     unavailable('this browser cannot decompress it');
     return;
@@ -12331,12 +13878,20 @@ _FILTER_JS = r"""
   Promise.resolve().then(function() { return inflate(dataEl); }).then(function(data) {
     D = data;
     N = D.dates.length;
+    (D.tag_twins || []).forEach(function(group) {
+      group.forEach(function(i) { TWINS[i] = group; });
+    });
+    (D.category_twins || []).forEach(function(group) {
+      group.forEach(function(c) { NO_SAVE[c] = true; });
+    });
+    if (saveBtn && typeof saveBtn.title === 'string') { SAVE_TITLE = saveBtn.title; }
     return load(primaryChunk());
   }).then(function(chunk) {
     if (SEQ === 0) {
       C = chunk;
-      SHOWN = D.primary.concat([catSel.value, tagSel.value, tierSel.value, addSel.value,
-                                sellSel.value, daysSel.value, trimSel.value]);
+      // Nothing ticked: the two empty lists are SHOWN[3] and SHOWN[4]
+      SHOWN = D.primary.concat([[], [], tierSel.value, addSel.value, sellSel.value,
+                                daysSel.value, trimSel.value]);
     }
     // A run with no tier-off (or add-on, or trim, or Sell) view keeps that
     // select disabled; the Min. days select opens only while Sell names a
@@ -12345,6 +13900,7 @@ _FILTER_JS = r"""
       s.disabled = (s === tierSel && !D.grid_off) || (s === addSel && !D.grid_add)
         || (s === trimSel && !D.grid_trim) || (s === sellSel && !D.sell_blocks);
     });
+    menusDisabled(false);
     refreshSell();
     refreshSave();
   }, function(err) { unavailable(String(err)); });
@@ -12385,28 +13941,62 @@ _FILTER_JS = r"""
     if (!D || !D.sell_blocks || sellAt(sellSel.value) === null) { return; }
     choose();
   });
-  catSel.addEventListener('change', function() {
+  // A box of a menu was ticked or unticked (the event names the box). The
+  // ticks are put in order first: the clearing box empties its menu (the
+  // Category one both menus); unticking a category unticks its tags;
+  // ticking a tag ticks its category, and ticking or unticking a tag does
+  // the same to every tag of its category that differs from it only in
+  // letter case (TWINS: the live filter reads them as one tag). Then the scenario is drawn again,
+  // unless the click left the ticks as they were. The menu stays open, so
+  // several boxes can be ticked in a row.
+  function onTick(menu, ev) {
     if (!D) { return; }
-    tagSel.value = '';
+    var id = (ev && ev.target && ev.target.id) || '';
+    var cats = catTicks(), tags = tagTicks();
+    if (menu === catMenu) {
+      if (id === 'flt-cat-all') { cats = []; }
+      tags = tags.filter(function(t) { return cats.indexOf(D.subcats[t][0]) >= 0; });
+    } else if (id === 'flt-tag-all') {
+      tags = [];
+    } else {
+      // The box clicked takes its case twins with it, ticked or unticked
+      var clicked = /^flt-tag-(\d+)$/.exec(id);
+      var twins = clicked ? (TWINS[parseInt(clicked[1], 10)] || []) : [];
+      if (twins.length && !ev.target.checked) {
+        tags = tags.filter(function(t) { return twins.indexOf(t) < 0; });
+      }
+      tags = withTwins(tags);
+      tags.forEach(function(t) {
+        if (cats.indexOf(D.subcats[t][0]) < 0) { cats.push(D.subcats[t][0]); }
+      });
+    }
+    setTicks(cats, tags);
+    refreshMenus();
+    var key = pickKey();
+    if (key === PICK) { return; }
+    PICK = key;
     choose();
-  });
+  }
+  catMenu.addEventListener('change', function(ev) { onTick(catMenu, ev); });
+  tagMenu.addEventListener('change', function(ev) { onTick(tagMenu, ev); });
+  // An open menu closes on a click outside it and on Escape (where the page
+  // can listen for them)
+  if (document.addEventListener) {
+    document.addEventListener('click', function(ev) {
+      [catMenu, tagMenu].forEach(function(menu) {
+        if (menu.open && !(menu.contains && menu.contains(ev.target))) { menu.open = false; }
+      });
+    });
+    document.addEventListener('keydown', function(ev) {
+      if (ev.key === 'Escape') { catMenu.open = false; tagMenu.open = false; }
+    });
+  }
   if (khatGroup) {
     khatGroup.addEventListener('change', function() {
       if (!D || !SHOWN) { return; }
       renderKhat();
     });
   }
-  tagSel.addEventListener('change', function() {
-    if (!D) { return; }
-    var t = tagSel.value;
-    if (t !== '' && catSel.value === '') {
-      // A "Category · Tag" picked under "All" selects its category too
-      catSel.value = String(D.subcats[parseInt(t, 10)][0]);
-      refreshOptions();
-      tagSel.value = t;
-    }
-    choose();
-  });
   // The save button opens the confirmation page for the scenario on screen
   // in a new tab; that page saves nothing until Confirm and save, or Confirm
   // and trade, is clicked there
@@ -12742,6 +14332,15 @@ def generate_dashboard(
                     # Nothing for the page to load from it
                     shutil.rmtree(build_folder, ignore_errors=True)
                     build_folder = None
+            # Said once for the whole page, never once per trade list
+            unmixable = len(chunker.mix_gaps) + (0 if sell_grid is None else sell_grid.mix_gaps)
+            if unmixable:
+                logging.warning(
+                    "The page cannot combine categories and tags for %d of its trade "
+                    "list(s): a tag's curve there does not cover the page's dates day for "
+                    "day, or could not be rebuilt exactly from its trades. Ticking more "
+                    "than one category or tag at such a scenario shows a 'not available' "
+                    "line; every single choice is unaffected.", unmixable)
             filter_data = _filter_payload(
                 source, chunker, start_date, initial_balance, series_categories, kd=kd,
                 tainted=tainted, explorer=explorer_grid,

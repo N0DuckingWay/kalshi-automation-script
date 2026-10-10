@@ -1275,6 +1275,273 @@ class TestLiveSettings:
             live_settings()
 
 
+# Pairs as (category, first tag) for TestTradeFilter's truth table
+_FILED = (("Economics", "Fed"), ("Economics", "Oil"), ("Sports", "Basketball"),
+          ("Sports", "Soccer"), ("Politics", "Fed"), ("Politics", "Basketball"))
+
+
+class TestTradeFilter:
+    """config.trade_filter, the one definition of the category/tag filter: a
+    listed category trades in full unless a tag narrows it, where a plain tag
+    narrows every listed category and a tag tied to a category
+    ("Sports · Basketball") narrows that one alone."""
+
+    @staticmethod
+    def _kept(categories, tags):
+        """The pairs of _FILED the filter keeps, in order."""
+        keeps = config.trade_filter(_settings(categories=categories, tags=tags))
+        return [pair for pair in _FILED if keeps(*pair)]
+
+    def test_the_separator_is_a_spaced_middle_dot(self):
+        assert config.TAG_SCOPE_SEPARATOR == " · "
+
+    @pytest.mark.parametrize("name, expected", [
+        ("Sports · Basketball", ("Sports", "Basketball")),
+        ("Basketball", (None, "Basketball")),
+        # Only the spaced middle dot ties a tag
+        ("Sports·Basketball", (None, "Sports·Basketball")),
+        ("Sports - Basketball", (None, "Sports - Basketball")),
+        ("Sports . Basketball", (None, "Sports . Basketball")),
+        # Each half is stripped; the split is at the first separator
+        ("Sports  ·  Basketball", ("Sports", "Basketball")),
+        ("Climate and Weather · Oil & Gas", ("Climate and Weather", "Oil & Gas")),
+        ("A · B · C", ("A", "B · C")),
+    ])
+    def test_split_tag(self, name, expected):
+        assert config.split_tag(name) == expected
+
+    @pytest.mark.parametrize("categories, tags, expected", [
+        # No filter keeps everything
+        (None, None, list(_FILED)),
+        # Categories only: each listed category in full
+        (("Economics",), None, [("Economics", "Fed"), ("Economics", "Oil")]),
+        (("Economics", "Sports"), None, list(_FILED[:4])),
+        # Plain tags only: that tag under every category
+        (None, ("Basketball",), [("Sports", "Basketball"), ("Politics", "Basketball")]),
+        (None, ("Fed", "Soccer"),
+         [("Economics", "Fed"), ("Sports", "Soccer"), ("Politics", "Fed")]),
+        # A plain tag narrows every listed category
+        (("Sports",), ("Basketball",), [("Sports", "Basketball")]),
+        (("Economics", "Sports"), ("Fed",), [("Economics", "Fed")]),
+        # Tied tags only
+        (("Sports",), ("Sports · Basketball",), [("Sports", "Basketball")]),
+        (("Sports",), ("Sports · Basketball", "Sports · Soccer"),
+         [("Sports", "Basketball"), ("Sports", "Soccer")]),
+        # A tied tag never applies under another category
+        (("Sports", "Politics"), ("Sports · Basketball", "Politics · Fed"),
+         [("Sports", "Basketball"), ("Politics", "Fed")]),
+        # A category in full beside a narrowed one
+        (("Economics", "Sports"), ("Sports · Basketball",),
+         [("Economics", "Fed"), ("Economics", "Oil"), ("Sports", "Basketball")]),
+        (("Sports", "Politics", "Economics"), ("Politics · Basketball",),
+         [("Economics", "Fed"), ("Economics", "Oil"), ("Sports", "Basketball"),
+          ("Sports", "Soccer"), ("Politics", "Basketball")]),
+        # Plain and tied together: the plain tag applies under every listed
+        # category, the tied one adds to its own category alone
+        (("Economics", "Sports", "Politics"), ("Fed", "Sports · Basketball"),
+         [("Economics", "Fed"), ("Sports", "Basketball"), ("Politics", "Fed")]),
+        (("Economics", "Sports"), ("Soccer", "Sports · Basketball"),
+         [("Sports", "Basketball"), ("Sports", "Soccer")]),
+        # A filter that names what no pair is filed under keeps nothing
+        (("World",), None, []),
+        (("Sports",), ("Sports · Hockey",), []),
+    ])
+    def test_the_truth_table(self, categories, tags, expected):
+        assert self._kept(categories, tags) == expected
+
+    @pytest.mark.parametrize("categories, tags", [
+        (None, None), (("Economics",), None), (None, ("Basketball",)),
+        (("Sports", "Politics"), ("Sports · Basketball", "Politics · Fed")),
+        (("economics", "SPORTS"), ("Fed", "sports · soccer")),
+    ])
+    def test_the_two_field_entry_point_is_the_same_rule(self, categories, tags):
+        # The dashboard holds the recorded fields only; it asks the very rule a run's
+        # settings are kept by
+        by_settings = config.trade_filter(_settings(categories=categories, tags=tags))
+        by_fields = config.trade_filter_for(categories, tags)
+        assert all(by_fields(*pair) is by_settings(*pair) for pair in _FILED)
+        assert [pair for pair in _FILED if by_fields(*pair)] == self._kept(categories, tags)
+
+    def test_the_trade_filter_is_built_by_the_two_field_entry_point(self):
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(config.trade_filter))
+        called = {n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        assert "trade_filter_for" in called
+
+    def test_names_are_compared_without_regard_to_case(self):
+        # Both halves of a tied tag, the categories, and the pair's own labels
+        assert self._kept(("sPORTS", "ECONOMICS"), ("SPORTS · basketBALL",)) == [
+            ("Economics", "Fed"), ("Economics", "Oil"), ("Sports", "Basketball")]
+        keeps = config.trade_filter(
+            _settings(categories=("Sports", "Economics"), tags=("Sports · Basketball",)))
+        assert keeps("sports", "BASKETBALL") and keeps("SPORTS", "basketball")
+        assert keeps("ECONOMICS", "anything")
+        assert not keeps("sports", "SOCCER") and not keeps("POLITICS", "basketball")
+        # Casefold, as the filter always compared: "ß" matches "SS"
+        assert config.trade_filter(_settings(tags=("Fußball",)))("Sports", "FUSSBALL")
+
+    def test_plain_tags_keep_exactly_what_the_two_axis_rule_kept(self):
+        # With no tied tag the filter is the rule it replaced: the category is
+        # listed (or none is) AND the tag is listed (or none is), in any case
+        rng = random.Random(20261010)
+        categories = ("Economics", "Sports", "Politics", "World", "Climate and Weather")
+        tags = ("Basketball", "Soccer", "Fed", "General", "Oil & Gas", "Sports", "COVID")
+
+        def recase(name):
+            return rng.choice((name, name.upper(), name.lower(), name.swapcase()))
+
+        def draw(pool):
+            if rng.random() < 0.25:
+                return None
+            return tuple(recase(n) for n in rng.sample(pool, rng.randint(1, len(pool))))
+
+        filters = 0
+        kept = 0
+        for _ in range(2000):
+            settings = _settings(categories=draw(categories), tags=draw(tags))
+            keeps = config.trade_filter(settings)
+            cats = (None if settings.categories is None
+                    else {c.casefold() for c in settings.categories})
+            wanted = None if settings.tags is None else {t.casefold() for t in settings.tags}
+            for c in categories:
+                for t in tags:
+                    for category, tag in ((c, t), (recase(c), recase(t))):
+                        old = ((cats is None or category.casefold() in cats)
+                               and (wanted is None or tag.casefold() in wanted))
+                        assert keeps(category, tag) is old, (settings, category, tag)
+                        kept += old
+            filters += 1
+        # Both verdicts were exercised
+        assert filters == 2000 and 0 < kept < 2000 * len(categories) * len(tags) * 2
+
+    @pytest.mark.parametrize("categories", [None, ("Economics",), ("Economics", "Politics")])
+    def test_a_tied_tag_needs_its_category_listed(self, categories):
+        with pytest.raises(ValueError, match=r"tags: 'Sports · Basketball' names the category "
+                                             r"'Sports', which categories does not list"):
+            _settings(categories=categories, tags=("Sports · Basketball",))
+        # One bad tag refuses the whole filter, wherever it sits
+        with pytest.raises(ValueError, match="does not list"):
+            _settings(categories=categories, tags=("Fed", "Sports · Basketball"))
+
+    def test_a_tied_tag_is_checked_again_when_a_field_is_replaced(self):
+        s = _settings(categories=("sports",), tags=("SPORTS · Basketball",))
+        assert s.tags == ("SPORTS · Basketball",)
+        # main.py lays --category over saved defaults this way
+        for categories in (None, ("Economics",)):
+            with pytest.raises(ValueError, match="tags: .*does not list"):
+                dataclasses.replace(s, categories=categories)
+        assert dataclasses.replace(s, categories=("Economics",), tags=None).tags is None
+
+    @pytest.mark.parametrize("bad", [
+        "Sports · ", " · Basketball", "Sports ·", "· Basketball", " · ", "·",
+        "Sports ·  ", "  · Basketball", " ·  · ",
+    ])
+    def test_a_tied_tag_with_a_blank_half_is_refused(self, bad):
+        # Never read as a plain tag, with its category listed or not
+        for categories in (("Sports",), None):
+            with pytest.raises(ValueError, match="tags: .* must read 'Category · Tag'"):
+                _settings(categories=categories, tags=(bad,))
+            with pytest.raises(ValueError, match="must read 'Category · Tag'"):
+                _settings(categories=categories, tags=("Basketball", bad))
+
+    @pytest.mark.parametrize("bad", ["Sports · any", "Sports · ANY", "Sports ·  Any "])
+    def test_a_tied_tag_cannot_name_any(self, bad):
+        with pytest.raises(ValueError, match="tags: .* names no tag"):
+            _settings(categories=("Sports",), tags=(bad,))
+
+    def test_a_dot_inside_a_plain_name_is_not_a_tie(self):
+        # A tie with a blank half is the dot alone, or a name that starts with
+        # the dot and a space or ends with a space and the dot; any other dot
+        # is part of a plain tag's name
+        s = _settings(tags=("A·B", "U.S.·ish", "Q·R S"))
+        assert s.tags == ("A·B", "U.S.·ish", "Q·R S")
+        assert config.trade_filter(s)("Sports", "a·b")
+        assert not config.trade_filter(s)("Sports", "a")
+
+    @pytest.mark.parametrize("plain", ["·Basketball", "Sports·", "·Sports·", "··", "a ·b", "a· b"])
+    def test_a_dot_with_no_space_beside_it_at_either_end_is_a_plain_tag(self, plain):
+        # The boundary of the blank-half refusal: these have no category, listed or not
+        for categories in (None, ("Sports",)):
+            s = _settings(categories=categories, tags=(plain,))
+            assert s.tags == (plain,)
+            assert config.split_tag(plain) == (None, plain)
+            keeps = config.trade_filter(s)
+            assert keeps("Sports", plain.upper()) and not keeps("Sports", "Basketball")
+        # ... while one more space makes each a tie with a blank half
+        for bad in ("· Basketball", "Sports ·"):
+            with pytest.raises(ValueError, match="must read 'Category · Tag'"):
+                _settings(categories=("Sports",), tags=(bad,))
+
+    @pytest.mark.parametrize("bad", [
+        "Sports · Basketball", "Sports · ", " · Basketball", "Sports ·", "· Basketball",
+        " · ", "·", "A · B · C", "Sports  ·  Basketball",
+    ])
+    def test_a_category_written_as_a_tied_tag_is_refused(self, bad):
+        # With tags or without: listing it would read as "Sports narrowed to
+        # Basketball" while all of Sports traded
+        message = (rf"categories: {re.escape(repr(bad.strip()))} is a tag tied to a "
+                   r"category; give it as a tag")
+        for tags in (None, ("Basketball",), ("Sports · Basketball",)):
+            with pytest.raises(ValueError, match=message):
+                _settings(categories=("Sports", bad), tags=tags)
+            with pytest.raises(ValueError, match=message):
+                _settings(categories=(bad,), tags=tags)
+        # ... and when a field is replaced, as main.py lays --category over saved defaults
+        with pytest.raises(ValueError, match=message):
+            dataclasses.replace(_settings(categories=("Sports",)), categories=("Sports", bad))
+
+    @pytest.mark.parametrize("name", ["A·B", "·Sports", "Sports·", "U.S. - Politics", "Oil & Gas"])
+    def test_a_category_may_hold_a_dot_that_ties_nothing(self, name):
+        s = _settings(categories=(name,))
+        assert s.categories == (name,)
+        assert config.trade_filter(s)(name.upper(), "anything")
+
+    def test_a_saved_file_with_a_category_written_as_a_tied_tag_is_refused(self):
+        # A file edited by hand, with no tags at all
+        record = _with_toggles(categories=["Sports", "Sports · Basketball"], tags=None)
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(record))
+        for read in (config.read_saved_live_defaults, config.live_defaults):
+            with pytest.raises(config.LiveDefaultsError,
+                               match="'Sports · Basketball' is a tag tied to a category"):
+                read()
+
+    def test_a_save_round_trips_tied_tags(self):
+        settings = _settings(categories=("Economics", "Sports"),
+                             tags=("Sports · Basketball", "Sports · Pro Football"))
+        saved = config.save_live_defaults(settings, source="")
+        assert saved == settings and saved.tags == settings.tags
+        again = config.read_saved_live_defaults()
+        assert again == settings
+        # The file still holds a plain list of names, the tie written as text
+        stored = json.loads(config.LIVE_DEFAULTS_FILE.read_text(encoding="utf-8"))["settings"]
+        assert stored["categories"] == ["Economics", "Sports"]
+        assert stored["tags"] == ["Sports · Basketball", "Sports · Pro Football"]
+        # The read-back filter is the same test
+        keeps = config.trade_filter(again)
+        assert [pair for pair in _FILED if keeps(*pair)] == [
+            ("Economics", "Fed"), ("Economics", "Oil"), ("Sports", "Basketball")]
+
+    def test_a_saved_file_with_an_untied_tag_is_refused(self):
+        # A file edited by hand: the reader applies LiveSettings' own check
+        record = _with_toggles(categories=["Economics"], tags=["Sports · Basketball"])
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(record))
+        with pytest.raises(config.LiveDefaultsError, match="does not list"):
+            config.read_saved_live_defaults()
+        with pytest.raises(config.LiveDefaultsError, match="does not list"):
+            config.live_defaults()
+
+    def test_the_argv_spells_a_tied_tag_as_one_flag(self):
+        settings = _settings(categories=("Economics", "Sports"),
+                             tags=("Sports · Basketball", "Fed"))
+        assert config.live_settings_argv(settings)[-4:] == [
+            "--category=Economics", "--category=Sports",
+            "--tag=Sports · Basketball", "--tag=Fed"]
+        assert config.describe_trade_filter(settings) == (
+            "categories Economics, Sports; tags Sports · Basketball, Fed")
+
+
 class TestTimeSeriesSpreadRefusal:
     """The live spread rule: positivity, the entry floor, then the band's
     ceiling, with backtester._find_entry's order and PRICE_EPSILON placement."""
