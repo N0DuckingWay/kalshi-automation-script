@@ -2543,9 +2543,15 @@ class CapSweep:
             ValueError: If add_to_held, sell_at or trim_to_kelly is set and
                 eager is not empty or same_title_eager is not None, if
                 sell_at is not a share in (0, 1], if sell_min_days is set
-                without sell_at or is not a whole number of at least 1, or
-                if trim_to_kelly is set with checks (see the class docstring).
+                without sell_at or is not a whole number of at least 1, if
+                trim_to_kelly is not True or False, or if it is set with
+                checks (see the class docstring).
         """
+        if not isinstance(self.trim_to_kelly, bool):
+            # Only an actual True reaches the simulations (_sim_options), so
+            # any other truthy value would name a sweep that never trims
+            raise ValueError(
+                f"CapSweep trim_to_kelly must be True or False, got {self.trim_to_kelly!r}")
         if self.sell_at is not None:
             # Checked as the simulation checks it, before any cell is read
             _resolve_sell_at(self.sell_at)
@@ -2700,8 +2706,9 @@ class CapSweep:
 
         Raises:
             KeyError: If band is not one of self.bands.
-            ValueError: If this sweep adds to held pairs and end_dates has no
-                day for one of the cell's populations (see _by_cap).
+            ValueError: If this sweep adds to held pairs, sells early or
+                trims to Kelly and end_dates has no day for one of the cell's
+                populations (see _by_cap).
         """
         entries = self.entries_by_band[band]
         subsets = [("all", entries)]
@@ -2730,8 +2737,9 @@ class CapSweep:
                 had no same-title population either.
 
         Raises:
-            ValueError: If this sweep adds to held pairs and end_dates has no
-                day for (None, primary_k, "same_title") (see _by_cap).
+            ValueError: If this sweep adds to held pairs or sells early and
+                end_dates has no day for (None, primary_k, "same_title") (see
+                _by_cap).
         """
         if not (self.checks and self.st_entries):
             return {}
@@ -3148,8 +3156,9 @@ class TrimSweep:
     walk stops depending on (SweepPoint.cap_free_from), which every larger
     cap shares.
 
-    Retention: none of its own. Its entry maps are the very objects
-    BacktestSweep's size-cap and add-on families already hold.
+    Retention: its entry maps are the very objects BacktestSweep's size-cap,
+    add-on and sell families hold, so beside any of them it keeps nothing
+    more alive; on a run with none of them it is what keeps those entries.
 
     Attributes:
         caps (tuple[float, ...]): The size caps of every scenario (the
@@ -11991,8 +12000,8 @@ def _sweep_from_candidates(
     # carries it, resolved at simulation time) unioned into SIZE_CAP_SWEEP, as
     # the k grid unions its primary, so the eager points are always exact
     # members. Read by the size-cap sweeps and, with the size-cap sweep on, by
-    # the add-on sweeps; a run without the size-cap sweep never reads a
-    # point's stamped cap here.
+    # the add-on, sell and trim families; a run without the size-cap sweep
+    # never reads a point's stamped cap here.
     caps = (tuple(sorted(set(SIZE_CAP_SWEEP) | {primary.size_cap}))
             if cap_sweep else ())
     capped = None

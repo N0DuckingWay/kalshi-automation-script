@@ -21280,6 +21280,13 @@ class TestTrimCapSweep:
         with pytest.raises(ValueError, match="runs no split-half or top-event check"):
             self._sweep(self._entries(), (0.75,), checks=True)
 
+    @pytest.mark.parametrize("value", [1, "yes", np.True_])
+    def test_the_switch_is_true_or_false_and_nothing_else(self, value):
+        # Only an actual True reaches the simulations, so a value that is
+        # merely truthy would build a sweep that says it trims and never does
+        with pytest.raises(ValueError, match="trim_to_kelly must be True or False"):
+            self._sweep(self._entries(), (0.75,), trim_to_kelly=value)
+
     def test_a_cell_without_an_end_day_is_refused(self):
         cs = self._sweep(self._entries(), (0.75,), end_dates={})
         with pytest.raises(ValueError, match="CapSweep trims to Kelly but end_dates has no day"):
