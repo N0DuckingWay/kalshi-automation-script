@@ -153,6 +153,8 @@ from .config import (
     live_rule_warnings,
     live_settings,
     order_api_version_error,
+    split_tag,
+    trade_filter,
 )
 from .historical import infer_category, load_series_categories, series_labels
 from .reporter import (
@@ -903,12 +905,20 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
     Keep only the pairs filed under the run's categories and tags.
 
     Files each pair by MARKET A's series through historical.series_labels,
-    the dashboard's filing rule. Matching is case-insensitive, the two axes
-    combine by AND (None = any), and a tag matches under EVERY category, unlike
-    the dashboard's category-scoped Tag options. Fails CLOSED: with no
-    listing nothing is kept, rather than filing nearly every KX ticker as "Other",
-    and its WARNING is the one line saying why, since the run exits EXIT_OK.
-    A name matching no listed label and no pair draws a typo WARNING.
+    the dashboard's filing rule, and keeps it by config.trade_filter, the one
+    definition of the filter: the pair's category is listed (or no category
+    is listed) and, of the tags that apply to that category, either none
+    applies or the pair's tag is one of them. A plain tag ("Basketball")
+    applies to every listed category; a tag tied to a category
+    ("Sports · Basketball") applies to that category alone. So a listed
+    category trades in full unless a tag narrows it. Names are compared
+    without regard to case.
+
+    Fails CLOSED: with no listing nothing is kept, rather than filing nearly
+    every KX ticker as "Other", and its WARNING is the one line saying why,
+    since the run exits EXIT_OK. A category or plain tag that no listed series
+    and no pair of this run carries draws a typo WARNING, and so does a tied
+    tag whose category and tag are not one series' labels together.
 
     Args:
         pairs (list): CandidatePairs after dedup, before enrichment.
@@ -938,19 +948,17 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
             "Category/tag filter (%s) is set but %s — no pair can be filed, so this "
             "run trades none", wanted, where)
         return []
-    cats = None if settings.categories is None else {c.casefold() for c in settings.categories}
-    tags = None if settings.tags is None else {t.casefold() for t in settings.tags}
+    # Cross-module: the one definition of the filter (config.trade_filter)
+    keeps = trade_filter(settings)
     kept: list = []
     dropped: Counter = Counter()
-    filed_cats: set = set()
-    filed_tags: set = set()
+    # Every (category, tag) a pair of this run was filed under, case-folded
+    filed: set = set()
     for pair in pairs:
         # Filed exactly as the dashboard files a trade of this event
         category, tag = _pair_labels(pair, series_categories)
-        filed_cats.add(category.casefold())
-        filed_tags.add(tag.casefold())
-        if ((cats is None or category.casefold() in cats)
-                and (tags is None or tag.casefold() in tags)):
+        filed.add((category.casefold(), tag.casefold()))
+        if keeps(category, tag):
             kept.append(pair)
         else:
             dropped[f"{category} · {tag}"] += 1
@@ -959,11 +967,13 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
         len(kept), len(pairs),
         "" if not dropped else " — dropped " + ", ".join(
             f"{name} {n}" for name, n in dropped.most_common()))
-    # A name matching no listed label and no pair is almost certainly a typo
-    known_cats = filed_cats | {(c or "Uncategorised").casefold()
-                               for c, _ in series_categories.values()}
-    known_tags = filed_tags | {(t[0] if t else "General").casefold()
-                               for _, t in series_categories.values()}
+    # A name matching no listed label and no pair is almost certainly a typo.
+    # Known labels: each listed series' category and first tag, filed as
+    # series_labels files them, plus what this run's pairs were filed under
+    known = filed | {((c or "Uncategorised").casefold(), (t[0] if t else "General").casefold())
+                     for c, t in series_categories.values()}
+    known_cats = {c for c, _ in known}
+    known_tags = {t for _, t in known}
     for name in settings.categories or ():
         if name.casefold() not in known_cats:
             logging.warning(
@@ -971,17 +981,21 @@ def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
                 "any this run's pairs were filed under — check the spelling; it "
                 "matches nothing", name, len(series_categories))
     for name in settings.tags or ():
-        if name.casefold() not in known_tags:
-            hint = ""
-            if " · " in name:
-                # The dashboard's Tag select names "category · tag"
-                category, _, tag = name.partition(" · ")
-                hint = (f" (the dashboard's Tag option {name!r} is --category "
-                        f"{category!r} --tag {tag!r})")
+        # Cross-module: the category a tag is tied to (None for a plain tag),
+        # split as the filter itself splits it
+        category, tag = split_tag(name)
+        if category is None:
+            if tag.casefold() not in known_tags:
+                logging.warning(
+                    "Tag %r is no series' first tag in Kalshi's listing of %d series, nor "
+                    "any this run's pairs were filed under — check the spelling; it "
+                    "matches nothing", name, len(series_categories))
+        elif (category.casefold(), tag.casefold()) not in known:
+            # A tied tag has to be one series' category and first tag together
             logging.warning(
-                "Tag %r is no series' first tag in Kalshi's listing of %d series, nor "
-                "any this run's pairs were filed under — check the spelling; it "
-                "matches nothing%s", name, len(series_categories), hint)
+                "Tag %r is no series' category and first tag in Kalshi's listing of %d "
+                "series, nor any this run's pairs were filed under — check the "
+                "spelling; it matches nothing", name, len(series_categories))
     return kept
 
 
@@ -2147,10 +2161,11 @@ def _build_parser() -> argparse.ArgumentParser:
     tags = live.add_mutually_exclusive_group()
     tags.add_argument(
         "--tag", action="append", default=None, metavar="NAME",
-        help="Trade only pairs whose series' FIRST Kalshi tag is NAME, under ANY "
-             "category unless --category narrows it: the backtest dashboard's Tag "
-             "option \"C · T\" is --category C --tag T (repeatable; case-insensitive; "
-             "combined with --category by AND; default: the saved live defaults)",
+        help="Trade only pairs whose series' FIRST Kalshi tag is NAME, under every "
+             "category --category lists (any category when none is listed); or give "
+             "\"Category · Tag\" to narrow that one listed category and leave the "
+             "others as they are (repeatable; case-insensitive; default: the saved "
+             "live defaults)",
     )
     tags.add_argument(
         "--any-tag", action="store_true", default=None,

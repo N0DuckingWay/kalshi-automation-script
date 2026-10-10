@@ -2647,8 +2647,9 @@ def split_tag(name: str) -> tuple[str | None, str]:
     A tag is tied to a category when its name holds TAG_SCOPE_SEPARATOR
     ("Sports · Basketball"); it is split at the first one, and each half is
     stripped. Any other name is a plain tag, which applies under every listed
-    category. LiveSettings' check of tied tags and trade_filter read a tag
-    through this, so both agree on which tags are tied.
+    category. LiveSettings' check of tied tags, trade_filter and
+    main._filter_by_category's typo check read a tag through this, so all
+    three agree on which tags are tied.
 
     Args:
         name (str): One name of a tags filter, as LiveSettings holds it.
@@ -3752,7 +3753,8 @@ def trade_filter(settings: LiveSettings) -> Callable[[str, str], bool]:
     of them. So a listed category trades in full unless a tag narrows it, and
     a filter of plain tags alone keeps a pair when its category is listed (or
     none is) and its tag is listed. Names are compared without regard to case.
-    This is the one definition of the filter.
+    This is the one definition of the filter: main._filter_by_category decides
+    every pair through it.
 
     Args:
         settings (LiveSettings): The run's toggles (categories and tags).
