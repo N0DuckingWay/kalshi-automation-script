@@ -1196,8 +1196,10 @@ class TestCategoryFilter:
             caplog.text)
         caplog.clear()
         # A dashboard Tag option ("category · tag"): the warning spells it as flags
+        # (LiveSettings takes a tag written this way only with its category listed)
         with caplog.at_level(logging.WARNING):
-            assert _filtered(self._pairs(), tags=("Sports · Soccer",)) == []
+            assert _filtered(self._pairs(), categories=("Sports",),
+                             tags=("Sports · Soccer",)) == []
         assert "Tag 'Sports · Soccer' is no series' first tag" in caplog.text
         assert "is --category 'Sports' --tag 'Soccer'" in caplog.text
         caplog.clear()
@@ -7886,6 +7888,13 @@ _ARGV_TARGETS = {
         tier_floors=False, spread_band=(0.05, 0.5), interval_discount=0.8,
         size_cap=0.2, same_title_size_cap=0.2, categories=None,
         tags=("Soccer", "Basketball", "--double dash")),
+    # Tags tied to a category ("Category · Tag"), beside a plain one
+    "tags-tied-to-a-category": LiveSettings(
+        tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+        size_cap=0.1, same_title_size_cap=0.2,
+        categories=("Economics", "Sports", "Climate and Weather"),
+        tags=("Sports · Basketball", "Sports · Pro Football",
+              "climate and weather · Hurricanes", "Fed")),
     # Selling on: a level and a minimum, the smallest and the largest level, and
     # a level alone (so --no-sell-min-days has to clear a saved minimum)
     "selling-at-85-with-a-minimum": LiveSettings(

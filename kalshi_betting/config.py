@@ -45,6 +45,7 @@ import numbers
 import os
 import pathlib
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -549,11 +550,18 @@ TIME_SERIES_SPREAD_BAND = (0.0, 0.5)
 TRADE_CATEGORIES: tuple[str, ...] | None = None
 
 # Kalshi tags a pair may trade in, or None for any: matched like
-# TRADE_CATEGORIES against the series' FIRST tag under every category, and ANDed
-# with it (so the dashboard's category-scoped Tag option "Sports · Basketball"
-# is both filters set). A live run reads the saved live defaults' tags instead,
-# which main.py --tag NAME (repeatable) / --any-tag overrides for one run.
+# TRADE_CATEGORIES against the series' FIRST tag. A plain name ("Basketball")
+# applies under every listed category; a name tied to a category
+# ("Sports · Basketball") narrows that category alone, and a listed category no
+# tag applies to trades in full (trade_filter is the rule). A live run reads the
+# saved live defaults' tags instead, which main.py --tag NAME (repeatable) /
+# --any-tag overrides for one run.
 TRADE_TAGS: tuple[str, ...] | None = None
+
+# How a filter ties a tag to one category: "Sports · Basketball" (a space, a
+# middle dot, a space). The dashboard's Tag menu, the filter's log line and the
+# run page print a category and its tag the same way.
+TAG_SCOPE_SEPARATOR = " · "
 
 # Whether a live run may add to a pair the account already holds: exactly the
 # same two markets, buying the same side on each (scanner.held_pairs: two held
@@ -676,8 +684,12 @@ LIVE_DEFAULTS_SOURCE_PATTERN = (
 DEFAULTS_SERVER_HOST = "127.0.0.1"
 DEFAULTS_SERVER_PORT = 8765
 
-# The longest request (path plus body) the server reads; its form is under 2 KB.
+# The longest request (path plus body) the server reads. Its form is under 2 KB
+# with one category and tag, and about 6 KB with the most a link may name.
 DEFAULTS_SERVER_MAX_REQUEST_BYTES = 16_384
+
+# The most categories, and the most tags, one confirmation link may name.
+DEFAULTS_SERVER_MAX_FILTER_NAMES = 40
 
 # Seconds the server waits on a silent connection before dropping it: it
 # answers one request at a time, and a browser can hold a connection open
@@ -2628,6 +2640,68 @@ def _names(value, name: str) -> tuple[str, ...] | None:
     return tuple(names)
 
 
+def split_tag(name: str) -> tuple[str | None, str]:
+    """
+    Split a filter's tag into the category it is tied to and the tag itself.
+
+    A tag is tied to a category when its name holds TAG_SCOPE_SEPARATOR
+    ("Sports · Basketball"); it is split at the first one, and each half is
+    stripped. Any other name is a plain tag, which applies under every listed
+    category. LiveSettings' check of tied tags and trade_filter read a tag
+    through this, so both agree on which tags are tied.
+
+    Args:
+        name (str): One name of a tags filter, as LiveSettings holds it.
+
+    Returns:
+        tuple[str | None, str]: ("Sports", "Basketball") for
+            "Sports · Basketball"; (None, name) for a plain tag.
+    """
+    category, sep, tag = name.partition(TAG_SCOPE_SEPARATOR)
+    return (category.strip(), tag.strip()) if sep else (None, name)
+
+
+def _check_tied_tags(categories: tuple[str, ...] | None,
+                     tags: tuple[str, ...] | None) -> None:
+    """
+    Refuse a tag tied to a category that the filter cannot apply.
+
+    A tied tag ("Sports · Basketball") narrows one listed category, so it is
+    refused when either half is blank, when its tag half reads "any", or when
+    its category is not among the categories (compared without regard to case;
+    with no categories listed, every tied tag is refused). It is never read as
+    a plain tag instead. A name that starts or ends with the separator's dot is
+    a tied tag whose blank half _names has already stripped, and is refused
+    the same way.
+
+    Args:
+        categories (tuple[str, ...] | None): The categories filter, validated by _names.
+        tags (tuple[str, ...] | None): The tags filter, validated by _names.
+
+    Raises:
+        ValueError: Naming the first tied tag that breaks a rule above.
+    """
+    listed = {c.casefold() for c in categories or ()}
+    dot = TAG_SCOPE_SEPARATOR.strip()
+    for name in tags or ():
+        category, tag = split_tag(name)
+        if category is None:
+            # _names strips each name, which takes one space off the separator
+            # of a tied tag with a blank half ("· Basketball", "Sports ·")
+            if name == dot or name.startswith(TAG_SCOPE_SEPARATOR.lstrip()) \
+                    or name.endswith(TAG_SCOPE_SEPARATOR.rstrip()):
+                raise ValueError(f"tags: {name!r} must read 'Category{TAG_SCOPE_SEPARATOR}Tag'")
+            continue
+        if not category or not tag:
+            raise ValueError(f"tags: {name!r} must read 'Category{TAG_SCOPE_SEPARATOR}Tag'")
+        if tag.casefold() == "any":
+            raise ValueError(f"tags: {name!r} names no tag; for any tag of {category!r}, "
+                             "list the category alone")
+        if category.casefold() not in listed:
+            raise ValueError(f"tags: {name!r} names the category {category!r}, which "
+                             "categories does not list")
+
+
 @dataclass(frozen=True)
 class LiveSettings:
     """
@@ -2656,7 +2730,11 @@ class LiveSettings:
         same_title_size_cap (float): The extra same-title cap, on the same
             grid; default 1.0 (no extra cap).
         categories (tuple[str, ...] | None): Categories to trade; None (default) for any.
-        tags (tuple[str, ...] | None): Series first tags, ANDed with categories; None for any.
+        tags (tuple[str, ...] | None): Series first tags to trade; None (default)
+            for any. A plain name applies under every listed category; a name
+            tied to a listed category ("Sports · Basketball") narrows that
+            category alone (trade_filter is the rule). A tied tag whose
+            category is not listed is refused.
         add_to_held_pairs (bool): Whether a production run may add to a pair
             the account already holds (exactly the same two markets, the same
             side on each), with Kelly sizing the whole position; a real bool.
@@ -2720,6 +2798,7 @@ class LiveSettings:
                            _step_cap(self.same_title_size_cap, "same_title_size_cap"))
         object.__setattr__(self, "categories", _names(self.categories, "categories"))
         object.__setattr__(self, "tags", _names(self.tags, "tags"))
+        _check_tied_tags(self.categories, self.tags)
         # A real bool, as tier_floors: a saved file's JSON 1 must be refused
         if type(self.add_to_held_pairs) is not bool:
             raise ValueError(
@@ -3661,6 +3740,55 @@ _LIVE_SETTING_FIELDS = (
     ("sell at", "sell_at", _sell_at_text),
     ("min days to maturity", "sell_min_days", lambda v: "any" if v is None else str(v)),
 )
+
+
+def trade_filter(settings: LiveSettings) -> Callable[[str, str], bool]:
+    """
+    Build a run's category/tag filter as one test of a pair's category and tag.
+
+    The rule: keep a pair when its category is listed (or no category is
+    listed) and, looking only at the tags that apply to that category (plain
+    tags, plus tags tied to it), either none applies or the pair's tag is one
+    of them. So a listed category trades in full unless a tag narrows it, and
+    a filter of plain tags alone keeps a pair when its category is listed (or
+    none is) and its tag is listed. Names are compared without regard to case.
+    This is the one definition of the filter.
+
+    Args:
+        settings (LiveSettings): The run's toggles (categories and tags).
+
+    Returns:
+        Callable[[str, str], bool]: keeps(category, tag), True when a pair
+            filed under that category and first tag may trade.
+    """
+    cats = None if settings.categories is None else {c.casefold() for c in settings.categories}
+    plain: set[str] = set()
+    tied: dict[str, set[str]] = {}
+    for name in settings.tags or ():
+        category, tag = split_tag(name)
+        if category is None:
+            plain.add(tag.casefold())
+        else:
+            tied.setdefault(category.casefold(), set()).add(tag.casefold())
+
+    def keeps(category: str, tag: str) -> bool:
+        """
+        Say whether a pair filed under this category and tag may trade.
+
+        Args:
+            category (str): The pair's Kalshi category.
+            tag (str): The pair's series' first tag.
+
+        Returns:
+            bool: True when the filter keeps the pair.
+        """
+        c = category.casefold()
+        if cats is not None and c not in cats:
+            return False
+        applies = plain | tied.get(c, set())
+        return not applies or tag.casefold() in applies
+
+    return keeps
 
 
 def describe_trade_filter(settings: LiveSettings) -> str:
