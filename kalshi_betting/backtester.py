@@ -107,7 +107,7 @@ Dependencies:
     rule's report that dashboard._live_rule_html shares with this module's
     log line — _live_rule_view with its _LIVE_RULE_PRIMARY and
     _LIVE_RULE_NOT_SIMULATED verdicts, _live_rule_ladder_note,
-    _live_filter_text, _live_sizing_note, _live_add_on_note,
+    _live_filter_text, _live_sizing_note, _live_add_on_note, _live_sell_note,
     _LIVE_RULE_LABEL and _LIVE_RULE_NONE; an
     IntervalCalibration carries the CalibrationObservations its pooled row
     was reduced from, so a report can regroup that population through
@@ -265,7 +265,10 @@ Notes:
     simulates only the (level, minimum) settings that differ: one no position
     of the no-selling run would sell at is that run (_sale_reach), and one at
     least as strict as a run it already simulated, when every sale of that run
-    also meets it, is that run (_sale_cover, yielded as a SameSale).
+    also meets it, is that run (_sale_cover, yielded as a SameSale). The
+    sell rule's arithmetic lives in config, scanner and historical, shared
+    with live selling; _sells_at, _days_left, _ladder_average, _usable_ask and
+    _leg_quotes call it there.
 
     An ENTRY CHECKPOINT is a moment at which the backtest may open a
     simulated trade: the live bot's weekly run time (config.SCHEDULED_RUN,
@@ -354,6 +357,7 @@ from .config import (
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
     BACKTEST_RECORD_BYTES_ESTIMATE,
     BUDGET_FRACTION,
+    CANDLE_NO_ASK_CEILING,
     CANDLESTICK_FETCH_MAX_WORKERS,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     CONTRACT_PAYOUT_DOLLARS,
@@ -370,6 +374,7 @@ from .config import (
     SPREAD_BAND_SWEEP_CEILINGS,
     SPREAD_BAND_SWEEP_FLOORS,
     TAKE_PROFIT_HOLD_DAYS,
+    TAKE_PROFIT_HOLD_DAYS_MAX,
     TAKE_PROFIT_LEVELS,
     TAKE_PROFIT_MIN_DAYS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
@@ -382,6 +387,7 @@ from .config import (
     _exact_number,
     _names_text,
     _step_cap,
+    days_to_maturity,
     describe_time_series_rule,
     fee_leg_exact,
     fee_per_pair_approx,
@@ -390,6 +396,7 @@ from .config import (
     max_kelly_fraction,
     min_price_diff_for_gap,
     pair_size_cap,
+    take_profit_reached,
     time_series_mid_spread,
     time_series_profit_prob,
     time_series_spread_band,
@@ -400,10 +407,12 @@ from .depth_model import book as _synthetic_book
 from .historical import (
     CorpusProvenance,
     SettledCorpus,
+    candle_sale_bids,
     fetch_all_settled_markets,
     fetch_candlesticks,
     infer_category,
     series_ticker,
+    usable_candle_ask,
 )
 from .scanner import (
     DEADLINE_CUMULATIVE,
@@ -432,6 +441,7 @@ from .scanner import (
     same_event_ladder,
     stated_deadline,
     time_series_group_key,
+    walk_bids,
 )
 from .strategy import TradeSpec, compute_trade
 
@@ -445,11 +455,8 @@ _DAY_SECONDS = 86_400
 _SCHEDULE_CHECK_DAYS_AHEAD = 3_653
 
 # The top of the range historical.fetch_candlesticks clamps a candle's NO ask
-# into: it stores the NO ask as 1 - the YES bid, held within [0.01, 0.99], so a
-# YES-bid book with no bids reads as a NO ask of 0.99, exactly like a real
-# one-cent bid. A NO ask at this value is therefore no usable quote
-# (_usable_ask): the NO leg keeps its last usable NO ask instead.
-_CANDLE_NO_ASK_CEILING = 0.99
+# into (config.CANDLE_NO_ASK_CEILING); a NO ask there is no usable quote (_usable_ask).
+_CANDLE_NO_ASK_CEILING = CANDLE_NO_ASK_CEILING
 
 # How old, in days, the candle behind a leg's day-end value may be before
 # _attach_leg_quotes counts the leg on its DEBUG line of legs valued on old
@@ -461,7 +468,7 @@ _STALE_QUOTE_DAYS = 7
 # previous checkpoint, so every trade the position holds at the sale was
 # already held at each daily check (trades are bought only at checkpoints);
 # the rule values those trades at every check.
-_HOLD_DAYS_MAX = 7
+_HOLD_DAYS_MAX = TAKE_PROFIT_HOLD_DAYS_MAX
 
 # date.toordinal() of 1970-01-01, so a UTC midnight's Unix time is
 # (ordinal - _EPOCH_ORDINAL) * _DAY_SECONDS.
@@ -3219,6 +3226,11 @@ class BacktestSweep:
         live_add_to_held_pairs (bool | None): Whether the saved live defaults
             add to held pairs, from the same read; reporting only (this run's
             own points never do).
+        live_sell_at (float | None): The saved live defaults' sell level, a
+            share of potential profit; None if they never sell (or not recorded).
+            Reporting only: this run's own points never sell.
+        live_sell_min_days (int | None): Their minimum of days before
+            maturity; None for no minimum (or not recorded).
         entry_checkpoint (str | None): SCHEDULED_RUN.label() of the schedule
             the entry checkpoints were placed by (e.g. "Monday 09:00
             America/Los_Angeles"), for the dashboard header. None = not
@@ -3266,8 +3278,10 @@ class BacktestSweep:
     # and the same over the tier-floors-off family's binding bands
     add_on_cap_sweep: CapSweep | None = None
     add_on_tier_off_cap_sweep: CapSweep | None = None
-    # The saved live defaults' add_to_held_pairs, recorded with the other live_* fields
+    # The saved live defaults' add_to_held_pairs, sell_at and sell_min_days
     live_add_to_held_pairs: bool | None = None
+    live_sell_at: float | None = None
+    live_sell_min_days: int | None = None
     # The dashboard's "Sell" family, lazy (None unless run_backtest_sweep(sell_sweep=True))
     sell_sweep: SellSweep | None = None
     # The depth model the trades' synthetic books came from (None: top of the book)
@@ -3540,6 +3554,7 @@ def _resolve_hold_days() -> int:
     backtester's, never config's). Read wherever the sell rule is applied
     (_simulate_at_discount with sell_at, _sale_reach) and by
     run_backtest_sweep before its fetch when the sell family is on.
+    seller._hold_days repeats this check for live selling: change both together.
 
     Returns:
         int: A whole number from 1 to _HOLD_DAYS_MAX.
@@ -3664,12 +3679,11 @@ def _days_left(position: list[BacktestTrade], day: date) -> int | None:
     Returns:
         int | None: The days left; None when any trade lacks a close date
             (only a hand-built trade can: _simulate_at_discount gives every
-            trade both).
+            trade both) or the position is empty (the walk never passes one).
     """
-    closes = [d for t in position for d in (t.close_date_a, t.close_date_b)]
-    if any(d is None for d in closes):
-        return None
-    return (max(closes) - day).days
+    # config.days_to_maturity, which live selling reads too
+    return days_to_maturity([d for t in position for d in (t.close_date_a, t.close_date_b)],
+                            day)
 
 
 def _far_enough(position: list[BacktestTrade], day: date, min_days: int | None) -> bool:
@@ -3746,20 +3760,9 @@ def _ladder_average(ladder: list[list[float]], contracts: float) -> float | None
             level holds them all); None when the ladder holds fewer contracts
             than that.
     """
-    left = contracts
-    proceeds = 0.0
-    used = 0
-    for price, size in ladder:
-        take = min(size, left)
-        proceeds += take * price
-        left -= take
-        used += 1
-        if left <= 0:
-            break
-    # Ladder sizes carry six decimals, so anything finer is float noise
-    if round(left, 6) > 0:
-        return None
-    return ladder[0][0] if used == 1 else proceeds / contracts
+    # scanner.walk_bids, which live selling walks a real book with too
+    walked = walk_bids(ladder, contracts)
+    return None if walked is None else walked[0]
 
 
 def _positions(open_trades: list[BacktestTrade]) -> list[list[BacktestTrade]]:
@@ -3924,7 +3927,8 @@ def _sells_at(sell_at: float, realized: float, potential: float) -> bool:
     Returns:
         bool: True when the position sells.
     """
-    return potential > 0 and realized >= sell_at * potential - PRICE_EPSILON
+    # config.take_profit_reached, which live selling decides a sale with too
+    return take_profit_reached(sell_at, realized, potential)
 
 
 def _hold_readings(position: list[BacktestTrade], day: date, hold_days: int, *,
@@ -5832,13 +5836,8 @@ def _usable_ask(raw: Any, side: str) -> float:
         float: The ask when usable; NaN otherwise, which _leg_quotes skips,
             so the side keeps its last usable ask.
     """
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return float("nan")
-    top = 1.0 if side == "yes" else _CANDLE_NO_ASK_CEILING
-    # A NaN fails both comparisons, so it stays unusable too
-    return value if PRICE_EPSILON < value < top - PRICE_EPSILON else float("nan")
+    # historical.usable_candle_ask, which live selling reads candles with too
+    return usable_candle_ask(raw, side)
 
 
 def _leg_quotes(market: dict, candles: list[dict], start_date: date,
@@ -6002,12 +6001,10 @@ def _leg_quotes(market: dict, candles: list[dict], start_date: date,
                 yes_out.append(float("nan"))
                 no_out.append(float("nan"))
                 continue
-            no_ask = _usable_ask(candle.get("no_ask_close"), "no")
-            yes_ask = _usable_ask(candle.get("yes_ask_close"), "yes")
-            # Rounded to 6 decimals so float noise (1 - 0.43 = 0.5700000000000001)
-            # never reaches a price; a NaN ask leaves a NaN bid
-            yes_out.append(round(1.0 - no_ask, 6))
-            no_out.append(round(1.0 - yes_ask, 6))
+            # historical.candle_sale_bids, which live selling reads candles with too
+            yes_bid, no_bid = candle_sale_bids(candle)
+            yes_out.append(yes_bid)
+            no_out.append(no_bid)
         return yes_out, no_out, paid_out
 
     yes_days, no_days, stale_days = sample(day_ends, True)
@@ -7957,14 +7954,14 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
     Name the BacktestSweep keywords that record the saved live defaults.
 
     Both production BacktestSweep constructions spread this (beside
-    same_title_size_cap), so the nine fields are recorded together from one
+    same_title_size_cap), so the eleven fields are recorded together from one
     read or not at all.
 
     Args:
         live (LiveSettings | None): _live_settings_for_report()'s result.
 
     Returns:
-        dict: The nine live_* keywords from live; {} when live is None.
+        dict: The eleven live_* keywords from live; {} when live is None.
     """
     if live is None:
         return {}
@@ -7973,7 +7970,8 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
             "live_origin": live.origin, "live_interval_discount": live.interval_discount,
             "live_size_cap": live.size_cap,
             "live_same_title_size_cap": live.same_title_size_cap,
-            "live_add_to_held_pairs": live.add_to_held_pairs}
+            "live_add_to_held_pairs": live.add_to_held_pairs,
+            "live_sell_at": live.sell_at, "live_sell_min_days": live.sell_min_days}
 
 
 # The label a recorded live rule is named with, in the log line and page header
@@ -8052,6 +8050,30 @@ def _live_add_on_note(sweep: BacktestSweep) -> str:
     if sweep.live_add_to_held_pairs is not True:
         return ""
     return "; the live defaults add to held pairs, which this run's primary does not"
+
+
+def _live_sell_note(sweep: BacktestSweep) -> str:
+    """
+    Say when the saved live defaults sell held positions and this run's headline figures do not.
+
+    _live_rule_line and dashboard._live_rule_html add it to the live-rule line.
+
+    Args:
+        sweep (BacktestSweep): The run's sweep.
+
+    Returns:
+        str: "; the live defaults sell at 85% of potential profit (at least 3
+            days before maturity), which this run's primary does not" (the
+            parenthesis only with a minimum), or "" when live_sell_at is None.
+    """
+    level = sweep.live_sell_at
+    if level is None:
+        return ""
+    days = sweep.live_sell_min_days
+    after = ("" if days is None else
+             f" (at least {days} day{'' if days == 1 else 's'} before maturity)")
+    return (f"; the live defaults sell at {_cap_percent(level)}% of potential profit{after}, "
+            "which this run's primary does not")
 
 
 def _live_filter_text(categories: tuple[str, ...] | None,
@@ -8176,6 +8198,7 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
     recorded it says so (_LIVE_RULE_NONE). A recorded rule's line ends with
     _live_sizing_note when the saved defaults size differently from this
     run's primary, then _live_add_on_note when they add to held pairs.
+    _live_sell_note comes last, when they sell.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
@@ -8194,7 +8217,7 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
         rule += f"; category/tag filter ({_live_filter_text(categories, tags)})"
     if view.where == _LIVE_RULE_NOT_SIMULATED:
         return (f"{prefix}{rule} — not simulated by this run{_live_sizing_note(sweep)}"
-                f"{_live_add_on_note(sweep)}")
+                f"{_live_add_on_note(sweep)}{_live_sell_note(sweep)}")
     # Tier floors off at a band no tier binds at: the tier-on cell holds it
     never_binds = ("" if sweep.live_tier_floors or not view.tier_floors else
                    " (no tier floor binds at this band, so off and on are one rule)")
@@ -8220,7 +8243,7 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
                  f"Category or Tag option of {subject} at a time (each offered where this "
                  "run filed a pair under it), never as their union")
     return (f"{prefix}{rule} — {tail}{_live_rule_ladder_note(sweep)}"
-            f"{_live_sizing_note(sweep)}{_live_add_on_note(sweep)}")
+            f"{_live_sizing_note(sweep)}{_live_add_on_note(sweep)}{_live_sell_note(sweep)}")
 
 
 def _tier_floors_bind(band: tuple[float, float]) -> bool:
@@ -10970,7 +10993,7 @@ def _sweep_from_candidates(
             configured switch, read beside same_event_ladders's
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
             cap_sweep, tier_off_cap_sweep, add_on_cap_sweep,
-            add_on_tier_off_cap_sweep, same_title_size_cap, the nine live_*
+            add_on_tier_off_cap_sweep, same_title_size_cap, the eleven live_*
             fields, entry_checkpoint, sell_sweep and depth_model — see
             BacktestSweep.
 
@@ -11550,9 +11573,9 @@ def run_backtest_sweep(
     here reaches live.
 
     It reports the saved live defaults' time-series rule, category/tag filter,
-    k and caps: one fail-soft read before the fetch, recorded on the nine
-    live_* fields and, worded by _live_rule_line, logged last ("none
-    recorded" when no usable defaults are saved).
+    k, caps, add-to-held and sell settings: one fail-soft read before the fetch,
+    recorded on the live_* fields and, worded by _live_rule_line, logged last
+    ("none recorded" when no usable defaults are saved).
 
     With add_on_sweep, the result also carries the dashboard's "Add to held
     pairs" family (BacktestSweep.add_on_cap_sweep, and
@@ -11649,7 +11672,7 @@ def run_backtest_sweep(
             every minimum of days of config.TAKE_PROFIT_MIN_DAYS. The flag
             adds no simulation to the run itself. False (default)
             returns None, as does the infeasible window. Backtest-only: live
-            trading never sells.
+            selling never reads it.
         depth_model (DepthModel | None): Keyword-only. The depth model every
             trade's synthetic order book is built from
             (depth_model.load_depth_model()); None (default) fills every trade

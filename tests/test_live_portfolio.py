@@ -34,7 +34,16 @@ import pandas as pd
 import pytest
 from kalshi_python_sync.exceptions import ApiException
 
-from kalshi_betting import auth, config, dashboard, historical, live_portfolio, reporter, treasury
+from kalshi_betting import (
+    auth,
+    config,
+    dashboard,
+    historical,
+    live_portfolio,
+    reporter,
+    seller,
+    treasury,
+)
 from kalshi_betting.live_portfolio import (
     OTHER_BETS,
     Account,
@@ -523,15 +532,57 @@ def pacific():
         yield
 
 
-def _write_run(monkeypatch, at: datetime, results: list, cash_before: float) -> None:
-    """Have reporter append one run to the trade log as if its clock read `at`."""
+def _write_run(monkeypatch, at: datetime, results: list, cash_before: float, *,
+               sales: list = (), cash_after: float | None = None) -> None:
+    """
+    Have reporter append one run to the trade log as if its clock read `at`.
+
+    With sales, these are written as a run that sells writes them: a banner
+    of their own, then one row per sale (pass results=[] for that call, as
+    main._record_sales does). cash_after is the banner's cash after (the
+    cash before when None).
+    """
     class _Clock(datetime):
         @classmethod
         def now(cls, tz=None):
             return at if tz is None else at.astimezone(tz)
 
     monkeypatch.setattr(reporter, "datetime", _Clock)
-    reporter.append_to_prod_log(results, cash_before, cash_before)
+    reporter.append_to_prod_log(results, cash_before,
+                                cash_before if cash_after is None else cash_after, sales=sales)
+
+
+def _sale(held: tuple[str, ...], partner: str | None = None, *, status: str = "sold",
+          count: int = 13, sold: dict | None = None) -> reporter.SaleResult:
+    """
+    A sale of a held position as trader.sell_positions hands reporter one.
+
+    held names the markets the account holds: YES on the first, NO on the
+    second. For a lone held market, partner names the market it was bought
+    with, which has paid out (the sale row lists it as market B). Each held
+    market is priced to sell at an average bid of 0.45. A "sold" or
+    "simulated" sale sold every contract, a "partly_sold" one half of them,
+    and any other none that is known, unless `sold` names the counts.
+    """
+    def market(ticker):
+        return ApiMarket(ticker=ticker, event_ticker=f"EV-{ticker}", title=f"Will {ticker}?",
+                         subtitle="", status="active", close_time=None)
+    legs = [seller.SaleLeg(ticker, f"EV-{ticker}", ("yes", "no")[i], count, 4.55,
+                           market=market(ticker))
+            for i, ticker in enumerate(held)]
+    if partner is not None:
+        legs.append(seller.SaleLeg(partner, f"EV-{partner}", "no", count, 4.55,
+                                   payout_dollars=0.0, paid_at=T0))
+    plan = seller.SalePlan(
+        title=f"Will {held[0]}?", legs=tuple(legs), count=count, cost_dollars=9.10,
+        ladders={t: [[0.45, 100.0]] for t in held}, walked=dict.fromkeys(held, (0.45, 0.45)),
+        proceeds_dollars=11.30, profits=((2.20, 3.90),) * 3, days_left=9, level=0.50)
+    if sold is None:
+        sold = {"sold": dict.fromkeys(held, count), "simulated": dict.fromkeys(held, count),
+                "partly_sold": dict.fromkeys(held, count // 2)}.get(status, {})
+    return reporter.SaleResult(plan=plan, status=status, sold=sold,
+                               error=None if status in ("sold", "simulated")
+                               else "the account read back less than was sent")
 
 
 class TestReadTradeLogs:
@@ -563,6 +614,61 @@ class TestReadTradeLogs:
         assert (review.logged_at, review.run_after) == (run2, run1)
         assert [(s.logged_at, s.run_after, s.cash_before) for s in starts] == [
             (run1, run1 - window, D("132.45")), (run2, run1, D("110.07"))]
+
+    def test_a_runs_sales_are_a_log_time_of_their_own(self, log_paths, pacific, monkeypatch):
+        # Run 1 buys; a dry run would have sold; run 2 sells three positions
+        # (a pair, a lone held market whose partner paid out, and a pair left
+        # for a person to check), writes them, then buys
+        run1, dry = T0, T0 + timedelta(hours=1)
+        sold, bought = T0 + timedelta(hours=2), T0 + timedelta(hours=2, minutes=1)
+        _write_run(monkeypatch, run1, [_trade_result("A1", "B1", "executed")], 132.45)
+        _write_run(monkeypatch, dry, [], 120.00, sales=[_sale(("A1", "B1"), status="simulated")])
+        _write_run(monkeypatch, sold, [], 120.00, cash_after=131.30, sales=[
+            _sale(("SA", "SB")),
+            _sale(("LA",), partner="LB", status="partly_sold"),
+            _sale(("MA", "MB"), status="manual_review")])
+        _write_run(monkeypatch, bought, [_trade_result("A2", "B2", "executed"),
+                                         _trade_result("A3", "B3", "failed")], 131.30)
+        # The sale rows as reporter writes them: plain status words, "[sale: " notes
+        book = openpyxl.load_workbook(log_paths)
+        rows = list(book.active.iter_rows(values_only=True))
+        book.close()
+        assert [(r[3], r[5], r[16]) for r in rows[4:5] + rows[6:9]] == [
+            ("A1", "B1", "simulated"), ("SA", "SB", "sold"), ("LA", "LB", "partly sold"),
+            ("MA", "MB", "check")]
+        assert all(r[17].startswith("[sale: ") for r in rows[4:5] + rows[6:9])
+        trades, starts, warnings = live_portfolio.read_trade_logs([log_paths])
+        # A sale row is neither a purchase nor a status this page does not know
+        assert warnings == []
+        assert [(t.trade_id, t.status) for t in trades] == [
+            ("trade_log.xlsx#3", "executed"), ("trade_log.xlsx#11", "executed")]
+        after_sales = trades[1]
+        assert after_sales.legs == (BotLeg("A2", "yes", D(13)), BotLeg("B2", "no", D(13)))
+        # Run 2's purchases are looked for after its sales were logged
+        assert (after_sales.logged_at, after_sales.run_after) == (bought, sold)
+        # The dry run's sales are skipped, as every simulated row is: no run
+        # of its own, and run 2's window still opens at run 1's log time
+        window = timedelta(seconds=config.LIVE_BOT_RUN_WINDOW_SECONDS)
+        # The sales' RunStart names the markets their orders may have filled
+        # on: not LB, the lone held market's paid-out partner; MA and MB,
+        # whose counts are not known, are named
+        assert starts == [
+            RunStart(run1 - window, run1, D("132.45")),
+            RunStart(run1, sold, D("120.00"), frozenset({"SA", "SB", "LA", "MA", "MB"})),
+            RunStart(sold, bought, D("131.30"))]
+
+    def test_a_sale_that_sold_nothing_on_a_market_names_no_order_there(
+            self, log_paths, pacific, monkeypatch):
+        # A pair whose orders were never sent ("not sold", its counts blank),
+        # a pair whose second order filled nothing ("unbalanced": 13 sold on
+        # UA, 0 on UB) and a lone held market whose partner paid out
+        _write_run(monkeypatch, T0, [], 120.00, sales=[
+            _sale(("NA", "NB"), status="not_sold"),
+            _sale(("UA", "UB"), status="unbalanced", sold={"UA": 13, "UB": 0}),
+            _sale(("LA",), partner="LB")])
+        _, [start], warnings = live_portfolio.read_trade_logs([log_paths])
+        assert warnings == []
+        assert start.sold_markets == frozenset({"UA", "LA"})
 
     def test_an_old_header_workbook_is_read(self, log_paths, pacific, monkeypatch):
         _write_run(monkeypatch, T0, [_trade_result("A1", "B1", "executed")], 50.0)
@@ -2160,6 +2266,126 @@ class TestCheckLoggedCash:
         miss = self._check("23.20", first=None, logged=before)
         assert miss.misses == ((before, D("23.20"), D("23.2275")),)
 
+    # A run that sells writes its sales under a banner of their own, logged
+    # at SOLD_LOGGED; run 1's purchase was logged at T0
+    SALE = T0 + timedelta(days=1)
+    SOLD_LOGGED = SALE + timedelta(minutes=1)
+
+    def _sold_pair(self, *later: Fill, owners=None,
+                   bought=(T0 - timedelta(seconds=2), T0 - timedelta(seconds=1)),
+                   sold=(SALE, SALE + timedelta(seconds=5))):
+        """
+        The account around a run that sold the bot's pair, from $20.00 of cash.
+
+        Run 1 (logged at T0) bought 10 NO B at 0.40 and 10 YES A at 0.30
+        ($7.00, leaving $13.00), at the two times in `bought`. The next run
+        sold both a day later (at the two times in `sold`), each 10 at 0.45
+        less a $0.05 fee ($8.90 back, $21.90): its sale orders are Kalshi
+        fills no purchase owns. `later` adds fills; owners gives their bot
+        owners (fill_id -> trade_id).
+        """
+        fills = [_fill("bot-b", "B", bought[0], False, 10, "0.60"),
+                 _fill("bot-a", "A", bought[1], True, 10, "0.30"),
+                 _fill("sell-a", "A", sold[0], False, 10, "0.45", "0.05"),
+                 _fill("sell-b", "B", sold[1], True, 10, "0.55", "0.05"),
+                 *later]
+        fills.sort(key=lambda f: (f.time, f.fill_id))
+        ledger = _ledger(fills, {"bot-b": "T1", "bot-a": "T1", **(owners or {})},
+                         legs={"T1": frozenset({"A", "B"}), "T2": frozenset({"C", "D"})})
+        return dataclasses.replace(_after(D("20.00"), ledger), fills=tuple(fills)), ledger
+
+    def test_a_sales_banner_is_checked_just_before_its_first_sale(self):
+        account, ledger = self._sold_pair()
+        assert account.cash == D("21.90")
+        # The banner's cash is the cash before the sale orders: $13.00
+        sales = RunStart(T0, self.SOLD_LOGGED, D("13.00"), frozenset({"A", "B"}))
+        check = live_portfolio.check_logged_cash(account, ledger, [sales], {})
+        assert (check.matched, check.checked, check.worst, check.misses) == (1, 1, D(0), ())
+        # Checked at its log time instead, after the sales, it would be a miss
+        unnamed = dataclasses.replace(sales, sold_markets=frozenset())
+        miss = live_portfolio.check_logged_cash(account, ledger, [unnamed], {})
+        assert miss.misses == ((self.SOLD_LOGGED, D("13.00"), D("21.90")),)
+
+    def test_fills_on_the_sold_markets_outside_its_run_are_left_out(self):
+        # A later run that tried to sell A and B again and filled nothing. Its
+        # window opens when the selling run was logged, so the fills on A and
+        # B before that (the purchase and the sales) are not its own; an hour
+        # after it was logged you buy 5 YES A yourself, after $1.00 of X.
+        # With no fill of its own on A or B, its cash is checked at its log
+        # time: $21.90, not the $20.90 before your bet on A
+        nothing_sold = self.SOLD_LOGGED + timedelta(days=1)
+        account, ledger = self._sold_pair(
+            _fill("mine-x", "X", nothing_sold + timedelta(minutes=30), True, 5, "0.20"),
+            _fill("mine-a", "A", nothing_sold + timedelta(hours=1), True, 5, "0.40"))
+        run = RunStart(self.SOLD_LOGGED, nothing_sold, D("21.90"), frozenset({"A", "B"}))
+        check = live_portfolio.check_logged_cash(account, ledger, [run], {})
+        assert (check.matched, check.checked, check.misses) == (1, 1, ())
+        # The window is what leaves the earlier fills out: opened before the
+        # bot's purchase, its first fill on A or B is that purchase, and the
+        # cash before it is $20.00
+        early = dataclasses.replace(run, run_after=T0 - timedelta(hours=1))
+        assert live_portfolio.check_logged_cash(account, ledger, [early], {}).misses == (
+            (nothing_sold, D("21.90"), D("20.00")),)
+
+    def test_fills_in_the_previous_runs_logged_second_are_that_runs(self):
+        # The trade log keeps whole seconds, so run 1, logged at T0, wrote its
+        # row within the second its own fills landed in (T0 + 0.3 s and
+        # T0 + 0.6 s): those fills are run 1's, not the selling run's first
+        account, ledger = self._sold_pair(bought=(T0 + timedelta(milliseconds=300),
+                                                  T0 + timedelta(milliseconds=600)))
+        sales = RunStart(T0, self.SOLD_LOGGED, D("13.00"), frozenset({"A", "B"}))
+        check = live_portfolio.check_logged_cash(account, ledger, [sales], {})
+        assert (check.matched, check.checked, check.misses) == (1, 1, ())
+
+    def test_a_sale_in_its_own_logged_second_is_found(self):
+        # The run sold and bought within the second it then logged both in
+        # (the log keeps whole seconds): its sale orders land 0.2 s and
+        # 0.4 s after that second began, its purchase of 10 YES C at 0.20
+        # 0.6 s after. The cash before its first fill, the sale on A, is
+        # $13.00; after both sales it would be $21.90
+        logged = self.SALE
+        account, ledger = self._sold_pair(
+            _fill("bot-c", "C", logged + timedelta(milliseconds=600), True, 10, "0.20"),
+            owners={"bot-c": "T2"},
+            sold=(logged + timedelta(milliseconds=200), logged + timedelta(milliseconds=400)))
+        run = RunStart(T0, logged, D("13.00"), frozenset({"A", "B"}))
+        first_bot = {logged: logged + timedelta(milliseconds=600)}
+        check = live_portfolio.check_logged_cash(account, ledger, [run], first_bot)
+        assert (check.matched, check.checked, check.misses) == (1, 1, ())
+
+    def test_the_bots_own_purchase_fills_are_never_a_sale(self):
+        # This computer's clock ran behind Kalshi's when run 1 logged, so its
+        # purchase on A and B landed 3 s and 4 s after its logged second:
+        # inside the selling run's window, on the markets it sold. Those
+        # fills are run 1's purchase (match_bot_fills claims them), not a
+        # sale, so the selling run's cash is checked just before its sale on
+        # A: $13.00, not the $20.00 before run 1's purchase
+        account, ledger = self._sold_pair(bought=(T0 + timedelta(seconds=3),
+                                                  T0 + timedelta(seconds=4)))
+        sales = RunStart(T0, self.SOLD_LOGGED, D("13.00"), frozenset({"A", "B"}))
+        check = live_portfolio.check_logged_cash(account, ledger, [sales], {},
+                                                 bot_fill_ids=frozenset({"bot-a", "bot-b"}))
+        assert (check.matched, check.checked, check.misses) == (1, 1, ())
+        # Read as a sale, run 1's purchase would set the time of the check
+        assert live_portfolio.check_logged_cash(account, ledger, [sales], {}).misses == (
+            (self.SOLD_LOGGED, D("13.00"), D("20.00")),)
+
+    @pytest.mark.parametrize("bot_at", [
+        -10,    # its first bot fill, 10 s before its first sale
+        +10,    # its first sale, 10 s before its first bot fill
+    ])
+    def test_the_earlier_of_its_first_bot_fill_and_its_first_sale_is_used(self, bot_at):
+        # A bot purchase of 10 YES C at 0.20 ($2.00) logged with the sales:
+        # either way the cash before the run's first fill is $13.00 (after
+        # the purchase alone it is $11.00; after the sales alone, $21.90)
+        bot_time = self.SALE + timedelta(seconds=bot_at)
+        account, ledger = self._sold_pair(_fill("bot-c", "C", bot_time, True, 10, "0.20"),
+                                          owners={"bot-c": "T2"})
+        run = RunStart(T0, self.SOLD_LOGGED, D("13.00"), frozenset({"A", "B"}))
+        check = live_portfolio.check_logged_cash(account, ledger, [run],
+                                                 {self.SOLD_LOGGED: bot_time})
+        assert (check.matched, check.checked, check.misses) == (1, 1, ())
+
     def test_a_miss_is_one_sentence_with_the_rebuilt_cash_to_the_hundredth_of_a_cent(self):
         logged = _utc(2026, 9, 28, 7, 11, 35)
         check = live_portfolio.CashCheck(0, 2, D("1.004999999999"), (
@@ -2299,6 +2525,70 @@ class TestBuildLiveView:
         assert {t for p in fake.batches() for t in p["market_tickers"].split(",")} == {
             "A1", "B1", "X"}
         assert view.changing is False
+
+    @pytest.mark.parametrize("late", [False, True])
+    def test_a_run_that_sells_then_buys(self, late, whole_account, log_paths, pacific,
+                                        monkeypatch):
+        # Run 1 bought the pair (13 YES A1, 13 NO B1, $9.10). A day later run 2
+        # sells it: a bid buying the 13 NO B1 back at a YES price of 0.55 (NO
+        # at 0.45), then an ask selling the 13 YES A1 at 0.45, each less a
+        # $0.20 fee, so $11.30 comes back. It logs the sales with the cash
+        # before them ($90.9050, $90.90 to the cent), then buys 10 YES C1 at
+        # 0.50 and 10 NO D1 at 0.30 ($8.00) and logs that with the cash
+        # after the sales ($102.2050, $102.20 to the cent). With late, run 2
+        # sells an hour after run 1 instead, and this computer's clock ran
+        # behind Kalshi's when run 1 logged, so run 1's purchase landed 3 s
+        # and 4 s after its logged second: inside run 2's window, on the
+        # markets run 2 sold, where it is still run 1's purchase
+        kalshi, fake = whole_account
+        self._account(kalshi, fake, positions={"C1": "10.00", "D1": "-10.00", "X": "5.00"})
+        sold = T0 + (timedelta(hours=1) if late else timedelta(days=1))
+        bought = sold + timedelta(minutes=2)
+        kalshi.rows["/portfolio/fills"] = [
+            fill_row("bot-c", "C1", bought - timedelta(seconds=2), "bid", 10, "0.50"),
+            fill_row("bot-d", "D1", bought - timedelta(seconds=3), "ask", 10, "0.70"),
+            fill_row("sell-a", "A1", sold - timedelta(seconds=15), "ask", 13, "0.45",
+                     fee="0.2000"),
+            fill_row("sell-b", "B1", sold - timedelta(seconds=20), "bid", 13, "0.55",
+                     fee="0.2000"),
+            *kalshi.rows["/portfolio/fills"]]
+        if late:
+            moved = {"bot-a": T0 + timedelta(seconds=4), "bot-b": T0 + timedelta(seconds=3)}
+            for row in kalshi.rows["/portfolio/fills"]:
+                if row["fill_id"] in moved:
+                    row["created_time"] = _iso(moved[row["fill_id"]])
+        kalshi.balance = {"balance_breakdown": [{"exchange_index": 0,
+                                                 "balance_dollars": "94.2050"}],
+                          "portfolio_value": 1025}
+        kalshi.rows["/markets"] += [_market_row("C1", "KXCRYPTO-26NOV", "0.55", "0.65"),
+                                    _market_row("D1", "KXCRYPTO-26NOV30", "0.65", "0.75")]
+        closes = live_portfolio.day_ends(T0 - timedelta(days=3), datetime.now(UTC))
+        fake.batch["C1"] = [_candle(c, "0.55", "0.65") for c in closes]
+        fake.batch["D1"] = [_candle(c, "0.65", "0.75") for c in closes]
+        _write_run(monkeypatch, T0, [_trade_result("A1", "B1", "executed")], 100.00)
+        _write_run(monkeypatch, sold, [], 90.90, cash_after=102.20,
+                   sales=[_sale(("A1", "B1"))])
+        _write_run(monkeypatch, bought, [_trade_result("C1", "D1", "executed", count=10)],
+                   102.20)
+        view = live_portfolio.build_live_view(
+            object(), risk_free=None, series_categories=self.CATEGORIES,
+            trade_logs=live_portfolio.trade_log_paths())
+        # No status this page does not know, no logged cash it cannot rebuild,
+        # and the ledger holds what Kalshi holds: A1 and B1 are sold
+        assert view.warnings == ()
+        assert (view.cash_check.matched, view.cash_check.checked) == (3, 3)
+        assert [(h.ticker, h.group, h.side, h.contracts, h.value) for h in view.holdings] == [
+            ("C1", "Crypto", "yes", D(10), D("6.00")), ("D1", "Crypto", "no", D(10), D("3.00")),
+            ("X", OTHER_BETS, "yes", D(5), D("1.25"))]
+        first, second = view.trades
+        assert first.trade_id == "trade_log.xlsx#3"
+        # The sales' $11.30 is the first purchase's cash back: it spent $9.10
+        assert first.ret == pytest.approx((-9.10 + 13 * 0.45 - 0.20 + 13 * 0.45 - 0.20) / 9.10)
+        assert (first.open_pairs, first.still_open) == (D(0), False)
+        # The second, still held: $8.00 spent, worth $6.00 + $3.00 now
+        assert second.trade_id == "trade_log.xlsx#7"
+        assert second.ret == pytest.approx((-8.00 + 6.00 + 3.00) / 8.00)
+        assert (second.open_pairs, second.still_open) == (D(10), True)
 
     def _two_categories(self, kalshi, fake):
         """

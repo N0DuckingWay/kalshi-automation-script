@@ -3,6 +3,8 @@ import copy
 import gzip
 import json
 import logging
+import math
+import random
 import threading
 import weakref
 import zlib
@@ -3527,6 +3529,162 @@ class TestFetchCandlesticksEndpoints:
         assert [c["ts"] for c in out] == endpoints.archive.served(self.OPEN, close)
 
 
+class TestRecentCandles:
+    """recent_candles reads a held market's last few days of candles for live
+    selling: the live endpoint first and the archive on a 404, parsed exactly
+    as fetch_candlesticks parses them, and never read from or written to the
+    candle cache, so a live run touches nothing under backtest_cache/."""
+
+    OPEN = 1_700_000_000 - 1_700_000_000 % _HOUR
+    CLOSE = OPEN + 72 * _HOUR
+    EVENT = "KXSERIES-26OCT08"
+
+    @pytest.fixture(autouse=True)
+    def _no_cache(self, monkeypatch, tmp_path):
+        """Point every cache path at a fresh folder and make any cache access fail."""
+        # Kept so a test can compare with fetch_candlesticks, which caches
+        self.real_cache = (historical._load_json_cache, historical._save_json_cache)
+        monkeypatch.setattr(historical, "CACHE_DIR", tmp_path / "cache")
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "cache" / "candlesticks")
+
+        def refuse(*_args, **_kwargs):
+            raise AssertionError("recent_candles touched the candle cache")
+
+        monkeypatch.setattr(historical, "_load_json_cache", refuse)
+        monkeypatch.setattr(historical, "_save_json_cache", refuse)
+        yield
+        # Nothing was written: not the candle folder, not the cache folder
+        assert not (tmp_path / "cache").exists()
+
+    def _recent(self, monkeypatch, endpoints, **kw):
+        monkeypatch.setattr(historical, "_signed_raw_get", endpoints)
+        return historical.recent_candles(
+            MagicMock(), "T1", kw.pop("event_ticker", self.EVENT),
+            kw.pop("start_ts", self.OPEN), kw.pop("end_ts", self.CLOSE))
+
+    def test_parses_like_fetch_candlesticks(self, monkeypatch, tmp_path, caplog):
+        payload = {"candlesticks": [
+            # The live reply's shape: dollar strings under close_dollars, volume_fp
+            {"end_period_ts": self.OPEN + _HOUR, "volume_fp": "0.00",
+             "yes_ask": {"close_dollars": "0.2000"}, "yes_bid": {"close_dollars": "0.1200"}},
+            {"end_period_ts": self.OPEN + 5 * _HOUR, "volume_fp": "3.00",
+             "yes_ask": {"close_dollars": "0.4500"}, "yes_bid": {"close_dollars": "0.0050"}},
+            # Unparseable: left out and counted, as fetch_candlesticks does
+            {"end_period_ts": self.OPEN + 6 * _HOUR,
+             "yes_ask": {"close": "x"}, "yes_bid": {"close": "0.10"}},
+        ]}
+        endpoint = MagicMock(return_value=_raw_resp(payload))
+        with caplog.at_level(logging.WARNING):
+            recent = self._recent(monkeypatch, endpoint)
+        assert recent == [
+            {"ts": self.OPEN + _HOUR, "yes_ask_close": 0.2, "no_ask_close": 0.88,
+             "volume": 0.0},
+            {"ts": self.OPEN + 5 * _HOUR, "yes_ask_close": 0.45,
+             "no_ask_close": historical.CANDLE_NO_ASK_CEILING, "volume": 3.0},
+        ]
+        assert "T1: dropped 1/3 malformed candles" in caplog.text
+        # Hourly, over the window asked for
+        _, params = endpoint.call_args
+        assert (params["start_ts"], params["end_ts"]) == (self.OPEN, self.CLOSE)
+        assert params["period_interval"] == historical.CANDLESTICK_PERIOD_INTERVAL_MINUTES
+        # fetch_candlesticks reads the same reply to the same candles
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(historical, "_load_json_cache", self.real_cache[0])
+            mp.setattr(historical, "_save_json_cache", self.real_cache[1])
+            mp.setattr(historical, "_CANDLES_DIR", tmp_path / "elsewhere")
+            mp.setattr(historical, "_signed_raw_get",
+                       MagicMock(return_value=_raw_resp(payload)))
+            cached = historical.fetch_candlesticks(
+                MagicMock(), "T1", self.OPEN, self.CLOSE, use_cache=False,
+                rate_limit_sleep=0.0, series="KXSERIES", live_first=True)
+        assert recent == cached
+
+    def test_asks_the_live_endpoint_first_and_stops_there(self, monkeypatch):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds={"live", "historical"})
+        out = self._recent(monkeypatch, endpoints)
+        assert [name for name, *_ in endpoints.calls] == ["live"]
+        assert [c["ts"] for c in out] == endpoints.archive.served(self.OPEN, self.CLOSE)
+
+    def test_a_404_from_the_live_endpoint_asks_the_archive(self, monkeypatch):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds={"historical"})
+        out = self._recent(monkeypatch, endpoints)
+        assert [name for name, *_ in endpoints.calls] == ["live", "historical"]
+        assert [c["ts"] for c in out] == endpoints.archive.served(self.OPEN, self.CLOSE)
+
+    def test_another_failure_gives_none_in_one_line_without_the_archive(
+        self, monkeypatch, caplog,
+    ):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds=set(), fail_status=400)
+        with caplog.at_level(logging.WARNING):
+            assert self._recent(monkeypatch, endpoints) is None
+        assert [name for name, *_ in endpoints.calls] == ["live"]
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert msgs == ["Recent candles could not be read for T1: HTTP 400 Bad Request "
+                        "(live endpoint)"]
+
+    def test_a_404_from_both_gives_none(self, monkeypatch, caplog):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds=set())
+        with caplog.at_level(logging.WARNING):
+            assert self._recent(monkeypatch, endpoints) is None
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert msgs == ["Recent candles could not be read for T1: HTTP 404 Not Found "
+                        "(live then historical endpoint)"]
+
+    def test_a_failure_on_a_later_page_names_the_request(self, monkeypatch, caplog):
+        close = self.OPEN + 400 * 86_400
+        endpoints = _TwoCandleEndpoints(self.OPEN, close, holds={"live"}, fail_status=400)
+        # The live endpoint holds the market, but its second page is refused
+        endpoints.archive.fail_on_call = {2: 1}
+        endpoints.archive.fail_status = 400
+        with caplog.at_level(logging.WARNING):
+            assert self._recent(monkeypatch, endpoints, end_ts=close) is None
+        assert ("Recent candles could not be read for T1: HTTP 400 Injected "
+                "(request 2 of 2) (live endpoint)") in caplog.text
+
+    def test_no_candles_in_the_window_is_an_empty_list(self, monkeypatch):
+        endpoint = MagicMock(return_value=_raw_resp({"candlesticks": []}))
+        assert self._recent(monkeypatch, endpoint) == []
+
+    @pytest.mark.parametrize("end", [None, "1700003600", True, 1_700_003_600.0, [1]])
+    def test_a_candle_with_no_integer_end_time_gives_none(self, monkeypatch, caplog, end):
+        # The shared parser copies the end time as sent, and bid_before would
+        # raise comparing a null with a moment; the reply is not used at all
+        payload = {"candlesticks": [
+            {"end_period_ts": self.OPEN + _HOUR, "volume_fp": "0.00",
+             "yes_ask": {"close_dollars": "0.2000"}, "yes_bid": {"close_dollars": "0.1200"}},
+            {"end_period_ts": end, "volume_fp": "0.00",
+             "yes_ask": {"close_dollars": "0.3000"}, "yes_bid": {"close_dollars": "0.2200"}},
+        ]}
+        endpoint = MagicMock(return_value=_raw_resp(payload))
+        with caplog.at_level(logging.WARNING):
+            assert self._recent(monkeypatch, endpoint) is None
+        msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert msgs == ["Recent candles could not be read for T1: 1 of 2 candles have an "
+                        "end time that is not an integer number of seconds"]
+
+    def test_a_long_window_is_paged(self, monkeypatch):
+        close = self.OPEN + 400 * 86_400
+        endpoints = _TwoCandleEndpoints(self.OPEN, close, holds={"live"})
+        out = self._recent(monkeypatch, endpoints, end_ts=close)
+        assert [name for name, *_ in endpoints.calls] == ["live", "live"]
+        assert [c["ts"] for c in out] == endpoints.archive.served(self.OPEN, close)
+
+    def test_without_a_series_only_the_archive_is_asked(self, monkeypatch):
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds={"historical"})
+        out = self._recent(monkeypatch, endpoints, event_ticker=None)
+        assert [name for name, *_ in endpoints.calls] == ["historical"]
+        assert len(out) == len(endpoints.archive.served(self.OPEN, self.CLOSE))
+
+    def test_each_request_pauses_for_the_configured_time(self, monkeypatch):
+        sleeps: list = []
+        monkeypatch.setattr(historical.time, "sleep", sleeps.append)
+        endpoints = _TwoCandleEndpoints(self.OPEN, self.CLOSE, holds={"historical"})
+        self._recent(monkeypatch, endpoints)
+        # The failed live request, then the archive's one request
+        assert sleeps == [historical.RECENT_CANDLES_RATE_LIMIT_SLEEP_SECONDS] * 2
+        assert historical.RECENT_CANDLES_RATE_LIMIT_SLEEP_SECONDS == 0.05
+
+
 class TestCandleRequestWindows:
     """historical._candle_request_windows: one request unless the window is
     longer than the endpoint serves, then overlapping requests within the cap."""
@@ -6544,3 +6702,167 @@ class TestLoadSeriesCategories:
         monkeypatch.setattr(historical, "_historical_get", fake_get)
         assert set(historical.load_series_categories(MagicMock())) == {"KXA", "KXB"}
         assert calls == [{}, {"cursor": "c1"}]
+
+
+# ─── What a sale would fetch, read from candles ───────────────────────────────
+
+def _bid_candle(ts: int, yes_ask, no_ask) -> dict:
+    """One candle as fetch_candlesticks returns it (no volume needed here)."""
+    return {"ts": ts, "yes_ask_close": yes_ask, "no_ask_close": no_ask}
+
+
+class TestUsableCandleAsk:
+    """usable_candle_ask: a candle close is an ask that can value or sell a
+    leg when it is strictly between 0 and 1 (a NO ask also below the 0.99 an
+    empty YES-bid book is clamped to), each bound held PRICE_EPSILON inside."""
+
+    @pytest.mark.parametrize("raw, side, usable", [
+        (0.5, "yes", True), (0.0001, "yes", True), (0.9999, "yes", True), ("0.42", "yes", True),
+        (1.0, "yes", False), (1.0 - 1e-9, "yes", False), (0.0, "yes", False),
+        (1e-9, "yes", False), (-0.1, "yes", False), (1.5, "yes", False),
+        (float("nan"), "yes", False), ("x", "yes", False), (None, "yes", False),
+        ([0.5], "yes", False),
+        (0.98, "no", True), (0.01, "no", True), (0.99, "no", False),
+        (0.99 - 1e-9, "no", False), (1.0, "no", False), (0.0, "no", False)])
+    def test_which_asks_are_usable(self, raw, side, usable):
+        value = historical.usable_candle_ask(raw, side)
+        assert (value == value) is usable
+        if usable:
+            assert value == float(raw)
+
+    def test_the_no_ask_ceiling(self):
+        from kalshi_betting import config
+
+        assert historical.CANDLE_NO_ASK_CEILING == 0.99
+        # One definition, config's
+        assert historical.CANDLE_NO_ASK_CEILING is config.CANDLE_NO_ASK_CEILING
+
+    def test_an_empty_yes_bid_book_is_no_quote(self, tmp_path, monkeypatch):
+        # fetch_candlesticks clamps a candle's NO ask (1 - its YES bid) to the
+        # ceiling, so a YES bid of 0 reads as exactly CANDLE_NO_ASK_CEILING —
+        # the value usable_candle_ask refuses — and a YES bid of a cent
+        # reads the same way
+        monkeypatch.setattr(historical, "_CANDLES_DIR", tmp_path / "candles")
+        for yes_bid in ("0.00", "0.01"):
+            _patch_candle_fetch(monkeypatch, 1_700_000_000, yes_bid=yes_bid)
+            out = historical.fetch_candlesticks(
+                MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False,
+                rate_limit_sleep=0.0)
+            assert out[0]["no_ask_close"] == historical.CANDLE_NO_ASK_CEILING
+            assert math.isnan(historical.usable_candle_ask(out[0]["no_ask_close"], "no"))
+        # The clamp follows the ceiling: it reads the same binding
+        monkeypatch.setattr(historical, "CANDLE_NO_ASK_CEILING", 0.98)
+        _patch_candle_fetch(monkeypatch, 1_700_000_000, yes_bid="0.00")
+        out = historical.fetch_candlesticks(
+            MagicMock(), "T1", open_ts=0, close_ts=2, use_cache=False, rate_limit_sleep=0.0)
+        assert out[0]["no_ask_close"] == 0.98
+        assert math.isnan(historical.usable_candle_ask(out[0]["no_ask_close"], "no"))
+
+
+class TestCandleSaleBids:
+    """candle_sale_bids: a candle's YES bid is 1 - its usable NO ask and its
+    NO bid 1 - its usable YES ask, to six decimals; an unusable ask leaves no
+    bid (NaN) on the other side."""
+
+    def test_one_less_the_other_sides_ask_to_six_decimals(self):
+        # 1 - 0.57 is not 0.43 in floats, nor 1 - 0.43 0.57: rounding fixes both
+        assert 1.0 - 0.43 != 0.57
+        assert historical.candle_sale_bids(_bid_candle(1, 0.43, 0.57)) == (0.43, 0.57)
+        assert historical.candle_sale_bids(_bid_candle(1, 0.30, 0.72)) == (0.28, 0.70)
+        assert historical.candle_sale_bids(_bid_candle(1, "0.40", "0.61")) == (0.39, 0.6)
+
+    @pytest.mark.parametrize("yes_ask, no_ask, yes_bid, no_bid", [
+        (1.00, 0.40, 0.60, None),   # no one offers YES: no NO bid
+        (0.30, 0.99, None, 0.70),   # the NO ask at its clamp: no YES bid
+        ("x", None, None, None),
+        (float("nan"), float("nan"), None, None),
+        (0.0001, 0.98, 0.02, 0.9999),
+    ])
+    def test_an_unusable_ask_leaves_no_bid_on_the_other_side(self, yes_ask, no_ask,
+                                                              yes_bid, no_bid):
+        got = historical.candle_sale_bids(_bid_candle(1, yes_ask, no_ask))
+        for value, expected in zip(got, (yes_bid, no_bid), strict=True):
+            assert math.isnan(value) if expected is None else value == expected
+
+    def test_a_candle_missing_an_ask(self):
+        yes_bid, no_bid = historical.candle_sale_bids({"ts": 1, "yes_ask_close": 0.30})
+        assert math.isnan(yes_bid) and no_bid == 0.70
+
+
+class TestBidBefore:
+    """bid_before: one side's bid from the last candle that ended at or
+    before a moment, only when it ended less than `window` seconds before it
+    (a candle exactly that old is not read), never carried forward. The
+    candle is found as the backtest finds one: stepping through the candles
+    in their own order up to the first that ends after the moment."""
+
+    _DAY = 86_400
+    _T = 1_768_000_000
+
+    def test_the_latest_candle_at_or_before_the_moment(self):
+        t = self._T
+        candles = [_bid_candle(t - 7200, 0.30, 0.72), _bid_candle(t - 3600, 0.40, 0.61),
+                   _bid_candle(t + 1, 0.50, 0.51)]
+        assert historical.bid_before(candles, t, "yes", window=self._DAY) == 0.39
+        assert historical.bid_before(candles, t, "no", window=self._DAY) == 0.6
+        # A candle ending exactly at the moment is read
+        assert historical.bid_before(candles, t + 1, "yes", window=self._DAY) == 0.49
+
+    def test_the_window_boundary(self):
+        t, day = self._T, self._DAY
+        # Exactly a window old: not read (it belongs to the check before)
+        assert math.isnan(historical.bid_before([_bid_candle(t - day, 0.40, 0.61)], t, "yes",
+                                                window=day))
+        # One second younger: read
+        assert historical.bid_before([_bid_candle(t - day + 1, 0.40, 0.61)], t, "yes",
+                                     window=day) == 0.39
+        # A newer candle after the moment does not stand in for an old one
+        stale = [_bid_candle(t - day, 0.40, 0.61), _bid_candle(t + 60, 0.45, 0.56)]
+        assert math.isnan(historical.bid_before(stale, t, "no", window=day))
+
+    def test_no_candle_or_none_yet(self):
+        t = self._T
+        assert math.isnan(historical.bid_before([], t, "yes", window=self._DAY))
+        assert math.isnan(historical.bid_before([_bid_candle(t + 1, 0.4, 0.6)], t, "yes",
+                                                window=self._DAY))
+
+    def test_an_unusable_ask_gives_no_bid(self):
+        t = self._T
+        candles = [_bid_candle(t - 7200, 0.30, 0.72), _bid_candle(t - 60, 1.00, 0.99)]
+        # The latest candle has no usable ask on either side, and the older
+        # one is not carried forward
+        assert math.isnan(historical.bid_before(candles, t, "yes", window=self._DAY))
+        assert math.isnan(historical.bid_before(candles, t, "no", window=self._DAY))
+
+    def test_candles_out_of_order_are_read_in_their_own_order(self):
+        t = self._T
+        # The walk stops at the first candle that ends after the moment, so
+        # the out-of-order candle behind it is never reached
+        candles = [_bid_candle(t - 7200, 0.30, 0.72), _bid_candle(t + 3600, 0.50, 0.51),
+                   _bid_candle(t - 60, 0.40, 0.61)]
+        assert historical.bid_before(candles, t, "yes", window=self._DAY) == 0.28
+        # In time order, the same candles give the latest one
+        ordered = sorted(candles, key=lambda c: c["ts"])
+        assert historical.bid_before(ordered, t, "yes", window=self._DAY) == 0.39
+
+    def test_it_matches_a_brute_force_reading_of_sorted_candles(self):
+        rng = random.Random(5150)
+        asks = [0.30, 0.43, 0.57, 0.99, 1.00, 0.0001, "x", None, float("nan"), 0.72]
+        for _ in range(300):
+            stamps = sorted(rng.sample(range(self._T - 4 * self._DAY, self._T + self._DAY, 900),
+                                       rng.randint(0, 12)))
+            candles = [_bid_candle(ts, rng.choice(asks), rng.choice(asks)) for ts in stamps]
+            moment = rng.choice(stamps + [self._T]) - rng.choice([0, 1, 899, self._DAY])
+            for side, index in (("yes", 0), ("no", 1)):
+                got = historical.bid_before(candles, moment, side, window=self._DAY)
+                before = [c for c in candles if c["ts"] <= moment]
+                if not before or moment - before[-1]["ts"] >= self._DAY:
+                    assert math.isnan(got)
+                    continue
+                expected = historical.candle_sale_bids(before[-1])[index]
+                assert (math.isnan(got) and math.isnan(expected)) or got == expected
+
+    @pytest.mark.parametrize("side", ["YES", "", None, "both"])
+    def test_an_unknown_side_is_refused(self, side):
+        with pytest.raises(ValueError, match="side"):
+            historical.bid_before([], self._T, side, window=self._DAY)

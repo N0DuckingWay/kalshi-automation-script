@@ -110,8 +110,8 @@ Purpose:
     writing). The two choices change the
     trade sections and the header's trade count; the k-hat figures do not
     depend on them, and the Scenario Explorer and the Interval Discount
-    section never follow them. Save as live defaults… stays disabled while a
-    level is chosen, since live trading never sells. A page whose sweep has
+    section never follow them. Save as live defaults… saves the level and
+    minimum shown for live runs to sell at ("no selling" turns it off). A page whose sweep has
     no Sell family, or whose family does not fit the grid or cannot be
     built, keeps the select disabled with a short note.
 
@@ -120,8 +120,9 @@ Purpose:
     started by ./start_dashboard.sh, on config.DEFAULTS_SERVER_HOST and
     DEFAULTS_SERVER_PORT) in a new tab, for the bar's scenario on screen —
     its spread band, Tier floors choice, k, size cap, Add to held pairs
-    choice (only on a page that simulated it) and any category or
-    tag, with this run's same-title cap when the run recorded one — never
+    choice, Sell level and Min. days to maturity (each only on a page that
+    simulated it) and any category or tag, with this run's same-title cap when
+    the run recorded one — never
     for the Scenario Explorer's own selects. That page compares the
     proposal with the live defaults in force and acts only when one of its
     buttons is pressed: Confirm and save saves it, Confirm and trade saves
@@ -165,7 +166,7 @@ Dependencies:
     whole off view is withheld — the family's calibration keys, never this
     test, decide which bands were simulated again), _live_rule_view() with
     its _LIVE_RULE_* verdicts, _live_rule_ladder_note(), _live_filter_text(),
-    _live_sizing_note(), _live_add_on_note(), _LIVE_RULE_LABEL and
+    _live_sizing_note(), _live_add_on_note(), _live_sell_note(), _LIVE_RULE_LABEL and
     _LIVE_RULE_NONE (the live-rule line's pieces, shared with the run's log
     line, which names the saved live defaults) — and reads
     BacktestSweep.cap_sweep, tier_off_cap_sweep, add_on_cap_sweep and
@@ -505,6 +506,7 @@ from .backtester import (
     _live_filter_text,
     _live_rule_ladder_note,
     _live_rule_view,
+    _live_sell_note,
     _live_sizing_note,
     _paid_prices,
     _tier_floors_bind,
@@ -524,6 +526,7 @@ from .config import (
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
     MIN_PRICE_DIFF_SHORT_GAP,
+    PRICE_EPSILON,
     PROJECT_ROOT,
     RISK_FREE_BILL_TERM,
     RISK_FREE_RATE_FIELD,
@@ -4360,6 +4363,52 @@ def _add_on_shown_at(bar: dict | None, band_index: int | None, tier_on: bool) ->
     return any(cid is not None for row in grid[band_index] for cid in row)
 
 
+def _sell_choice_in_bar(sweep: BacktestSweep, bar: dict | None, band_index: int | None,
+                        tier_on: bool) -> str | None:
+    """
+    Name the filter bar's Sell options that show the saved defaults' sell rule at one band.
+
+    Args:
+        sweep (BacktestSweep): The run's sweep (live_sell_at, live_sell_min_days).
+        bar (dict | None): _filter_payload's base block ("sell_blocks":
+            [tier on/off][band] -> block or null; "sell_levels", "sell_days":
+            [{label, value}]), or None without a filter bar.
+        band_index (int | None): The band's index in the bar (None with no bar).
+        tier_on (bool): True for the Tier floors on blocks, False for the off ones.
+
+    Returns:
+        str | None: e.g. 'Sell "sell at 85% of potential profit" and Min. days to
+            maturity "3 days"'; with no saved minimum, the smallest option followed by
+            " (the nearest to no minimum)"; None when the page cannot show that level
+            and minimum.
+
+    Raises:
+        Nothing.
+    """
+    level = sweep.live_sell_at
+    if bar is None or band_index is None or level is None:
+        return None
+    blocks = bar.get("sell_blocks")
+    if not blocks:
+        return None
+    row = blocks[0 if tier_on else 1]
+    if not 0 <= band_index < len(row) or row[band_index] is None:
+        return None
+    # Levels are the page's own floats; the saved level sits on the same 1% grid
+    level_entry = next((e for e in bar.get("sell_levels") or []
+                        if abs(e["value"] - level) <= PRICE_EPSILON), None)
+    options = bar.get("sell_days") or []
+    if level_entry is None or not options:
+        return None
+    days = sweep.live_sell_min_days
+    days_entry = options[0] if days is None else next(
+        (e for e in options if e["value"] == days), None)
+    if days_entry is None:
+        return None
+    return (f'Sell "{level_entry["label"]}" and Min. days to maturity '
+            f'"{days_entry["label"]}"' + (" (the nearest to no minimum)" if days is None else ""))
+
+
 def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     """
     Render the page-header line naming the saved live defaults' rule, and where this page shows it.
@@ -4375,7 +4424,9 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     the saved defaults add to held pairs, which no primary does, it says so
     too (backtester._live_add_on_note) and, where the page shows the rule,
     whether the filter bar's Add to held pairs choice shows it at that band
-    and Tier floors setting (_add_on_shown_at).
+    and Tier floors setting (_add_on_shown_at). When they sell, it says so
+    too (backtester._live_sell_note) and, where the page shows the rule,
+    which Sell options show it, if any (_sell_choice_in_bar).
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
@@ -4385,7 +4436,7 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     Returns:
         str: One <p>, its text escaped: the rule, any live filter, the same-title cap
             and where (or whether) the page shows the rule, plus any ladder-departure,
-            sizing and adding-to-held-pairs notes; "Live rule: not recorded" when
+            sizing, adding-to-held-pairs and selling notes; "Live rule: not recorded" when
             sweep is None, and backtester._LIVE_RULE_NONE's words when the run
             recorded no live rule.
     """
@@ -4472,7 +4523,14 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
         add_note += (" — choose Add to held pairs on in the filter bar to see it"
                      if _add_on_shown_at(bar, *shown)
                      else " — this page has no Add to held pairs view")
-    text = f"Live rule ({_LIVE_RULE_LABEL}): {rule}; {cap_clause} — {tail}{sizing}{add_note}"
+    # Selling, likewise: the Sell options are named only where the line shows the rule
+    sell_note = _live_sell_note(sweep)
+    if sell_note and shown is not None:
+        choice = _sell_choice_in_bar(sweep, bar, *shown)
+        sell_note += (f" — choose {choice} in the filter bar to see it" if choice is not None
+                      else " — this page cannot show that Sell level and minimum of days")
+    text = (f"Live rule ({_LIVE_RULE_LABEL}): {rule}; {cap_clause} — {tail}{sizing}"
+            f"{add_note}{sell_note}")
     return f"{style}{html.escape(text, quote=False)}</p>"
 
 
@@ -5965,6 +6023,9 @@ _ADD_ON_NOTES = {
 # "off" turns adding off in the defaults
 _ADD_ON_SAVE_NOTE = ("The live defaults add to held pairs; saving with Add to held pairs "
                      "off here turns that off.")
+# Beside the save button on a page with the Sell view whose saved live defaults sell
+_SELL_SAVE_NOTE = ('The live defaults sell; saving with Sell set to "no selling" turns live '
+                   "selling off.")
 
 # The filter bar's "Sell" choice: the runs as simulated ("no selling"), or the
 # same scenario with each position sold whole once it has held a share of its
@@ -5985,26 +6046,30 @@ def _sell_select_title(hold_days: int) -> str:
 
     Returns:
         str: The rule in plain words; with more than one day, how the days
-            are checked.
+            are checked, and what saving a level as the live defaults does.
     """
     if hold_days == 1:
         rule = ("reaches that share of its potential profit (its contract pairs at "
                 f"${CONTRACT_PAYOUT_DOLLARS:.2f} each, less what it cost).")
+        live_rule = "reaches its level"
     else:
         rule = ("has stayed at or above that share of its potential profit (its contract "
                 f"pairs at ${CONTRACT_PAYOUT_DOLLARS:.2f} each, less what it cost) for "
                 f"{hold_days} days in a row: it is checked once a day, 24 hours apart, the "
                 "last check at the checkpoint, and each earlier check reads the last quote "
                 "of the 24 hours before it.")
+        live_rule = (f"has held its level for {hold_days} days in a row (read on Kalshi's "
+                     "hourly candles for the days before the run)")
     return ("no selling: every position is held until its markets pay out. A level: at each "
             "weekly checkpoint (the live run's time), a position (a pair and everything "
             "added to it) is sold whole once its realized profit (what selling it at the "
             f"bids would return, after the sale's fees, less what it cost) {rule} It is sold "
             "only while at least the days the Min. days to maturity select names remain "
             "before its last market stops trading. A position sold at a checkpoint is not "
-            "bought again or added to there. Live trading never sells, so Save as live "
-            "defaults… is off while a level is chosen; the Scenario Explorer and Interval "
-            "Discount sections always show no selling.")
+            "bought again or added to there. Save as live defaults… saves the level and "
+            "minimum shown: a live run then sells at them, on real order books, once a "
+            f"position {live_rule}. The Scenario Explorer and Interval Discount sections "
+            "always show no selling.")
 
 
 # The "Min. days to maturity" select's hover text: the rule its days set
@@ -6016,14 +6081,15 @@ _SELL_DAYS_TITLE = (
     "the latest close date among its markets less the checkpoint's date. Nearer to "
     "maturity than that, it is held until it pays out. The backtest reads when each "
     "market actually stopped trading, so an event decided early counts as maturing "
-    "early. Used only while Sell names a level.")
+    "early; a live run reads each market's scheduled close instead. Used only while "
+    "Sell names a level.")
 
 
 # Added to the summary line while a sell level is chosen
 _SELL_SUMMARY_NOTE = (" A sale ends its trade on the sale day: its profit is what the sale "
                       "returned, after the sale's fees, less what it cost, and its slippage "
-                      "is how far that falls short of its profit had it won. Live trading "
-                      "never sells, so Save as live defaults… is off.")
+                      "is how far that falls short of its profit had it won. Save as live "
+                      "defaults… saves this level and minimum, so a live run sells at them.")
 # Closes the summary line's reach sentence on a page that has the Sell view
 # (the Sell and Min. days to maturity selects reach the same sections); the
 # second is for a page with no Scenario Explorer grid
@@ -6221,7 +6287,8 @@ _FILTER_UNAVAILABLE_HTML = (
 _SAVE_LABEL = "Save as live defaults…"
 _SAVE_TITLE = ("Open a confirmation page, in a new tab, that compares the filter bar's "
                "scenario on screen — its spread band, tier floors, k, size cap, its Add to "
-               "held pairs choice (when this page simulated it) and any "
+               "held pairs choice (when this page simulated it), its Sell level and Min. "
+               "days to maturity (when this page simulated selling) and any "
                "category or tag, with this run's same-title cap when the run recorded one; "
                "not the Scenario Explorer's own selects — with the live trading defaults. "
                "Nothing is saved until you press a button there: Confirm and save saves "
@@ -6299,8 +6366,8 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
     What the filter bar's save button sends besides the scenario on screen.
 
     The button opens the defaults server's confirmation page with the bar's
-    scenario in the address (its spread band, Tier floors choice, k, size cap
-    and Add to held pairs choice, and any category or tag); this is the rest
+    scenario in the address (its spread band, Tier floors choice, k, size cap, Add to
+    held pairs choice, Sell level, Min. days to maturity and any category or tag); this is the rest
     of that address, fixed when the page is built. The server accepts no source note but one of the
     shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, so the note is checked
     against that pattern here, as the server checks it (whole, ASCII digits
@@ -6331,7 +6398,8 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
             bot's; None if it would not match the pattern);
             "live_adds_to_held_pairs" (whether the saved live defaults add to
             held pairs, as the run recorded them; the note beside the save
-            button says so on a page with the Add to held pairs view).
+            button says so on a page with the Add to held pairs view);
+            "live_sells" (whether they sell: the Sell view's save note shows only then).
     """
 
     def day(value: date) -> str:
@@ -6362,6 +6430,7 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
         "filed_by_listing": bool(series_categories),
         "source": source,
         "live_adds_to_held_pairs": getattr(sweep, "live_add_to_held_pairs", None) is True,
+        "live_sells": getattr(sweep, "live_sell_at", None) is not None,
     }
 
 # Every compared field of a BacktestTrade, in declaration order: _list_key's
@@ -10203,7 +10272,7 @@ def _filter_payload(
             besides the scenario on screen (_save_target): the confirmation
             page's address, the run's same-title cap, whether trades are filed
             by Kalshi's series listing, the source note and whether the saved
-            defaults add to held pairs. None (default) ships null, and the
+            defaults add to held pairs and whether they sell. None (default) ships null, and the
             script then keeps the button disabled.
         add_on_state (str): Keyword-only. Why the page has no Add to held
             pairs view when it has none: "not simulated" (the run carried no
@@ -10546,7 +10615,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     saved. On a page with the add-on view whose saved live defaults add to
     held pairs (save["live_adds_to_held_pairs"]), a grey note
     (_ADD_ON_SAVE_NOTE) follows the button: saving with the Add to held
-    pairs choice off turns that off. Then the "Trade using defaults…" link
+    pairs choice off turns that off. _SELL_SAVE_NOTE does the same for selling
+    on a page with the Sell view (save["live_sells"]). Then the "Trade using defaults…" link
     (_trade_link_html), which the script never touches, and the note that
     both need the defaults server running.
 
@@ -10644,6 +10714,11 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                  and (payload.get("save") or {}).get("live_adds_to_held_pairs") is True)
     save_note = ('&nbsp;<span id="flt-add-save-note" style="color:#9E9E9E; font-size:13px;">'
                  f"{html.escape(_ADD_ON_SAVE_NOTE)}</span>" if save_adds else "")
+    # The same for selling: saving with "no selling" shown turns it off
+    save_sells = (sell_state == "shown"
+                  and (payload.get("save") or {}).get("live_sells") is True)
+    save_note += ('&nbsp;<span id="flt-sell-save-note" style="color:#9E9E9E; font-size:13px;">'
+                  f"{html.escape(_SELL_SAVE_NOTE)}</span>" if save_sells else "")
 
     cat_opts = '<option value="">All categories</option>' + "".join(
         f'<option value="{i}">{html.escape(c)} ({count(f"c{i}")})</option>'
@@ -10857,8 +10932,8 @@ def _pack_text(raw: str) -> str:
 # keeps (SELL, loadSell); while it inflates, chunkAt answers undefined and
 # choose() waits for it. Sell is enabled only when the base block names
 # those blocks; the level's and the minimum's phrases and the summary line's
-# note are Python's (D.sell_levels, D.sell_days, D.text.sell_note); a level
-# keeps the save button disabled (live trading never sells), and, like Add
+# note are Python's (D.sell_levels, D.sell_days, D.text.sell_note); the level
+# and the minimum shown go into the save button's address (saveHref), and, like Add
 # to held pairs, neither select reaches the k-hat figures, the
 # interval-discount section nor the scenario explorer. A Sell block that
 # cannot be inflated puts every select back, as a chunk that cannot be
@@ -10882,8 +10957,9 @@ def _pack_text(raw: str) -> str:
 # live defaults…" button whenever the scenario on screen (SHOWN, never the
 # selects' choice while a chunk loads) can become the live defaults, and a
 # click opens the defaults server's confirmation page for that scenario in a
-# new tab (saveHref: D.save's address and the axes' values — on a page with
-# the add-on view, adding to held pairs off among them; the button's words are
+# new tab (saveHref: D.save's address and the axes' values, with the Add to held pairs
+# choice on a page with the add-on view and the Sell level and minimum, or "off" for
+# both, on a page with the Sell view; the button's words are
 # Python's). On load it inflates the base block and the primary scenario's
 # chunk, sets the bar back to the view Python rendered and enables it — it
 # redraws nothing until a <select> changes. A chunk is inflated when a
@@ -11020,8 +11096,8 @@ _FILTER_JS = r"""
   // The filter bar's scenario ON SCREEN (SHOWN) as the defaults server's
   // confirmation-page address, or null when it cannot become live settings:
   // nothing drawn yet, no save target on the page (D.save), a scenario the
-  // run never simulated (an Add to held pairs choice the page holds no grid
-  // for included), a scenario that sells (live trading never sells), a band
+  // run never simulated (an Add to held pairs choice, or a Sell level, the
+  // page holds no chunk for included), a band
   // the run did not record, a k or size cap the
   // run did not record or that is not above zero, or a category or tag on a
   // page that does not file trades by Kalshi's series listing. A tag always goes with its category
@@ -11030,12 +11106,11 @@ _FILTER_JS = r"""
   // by String(), whose shortest form reads back as the same number.
   function saveHref() {
     if (!D || !D.save || !SHOWN || C === null) { return null; }
-    // Live trading never sells a position: no live setting can carry a level
-    if (sellAt(SHOWN[7]) !== null) { return null; }
-    if (chunkAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7],
-                SHOWN[8]) === null) {
-      return null;
-    }
+    // null: never simulated; undefined: a sell level's block not inflated (a
+    // scenario on screen has always inflated its own)
+    var shownId = chunkAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7],
+                          SHOWN[8]);
+    if (shownId === null || shownId === undefined) { return null; }
     var band = D.bands[SHOWN[0]].value, k = D.ks[SHOWN[1]].value, cap = D.caps[SHOWN[2]].value;
     if (!band || !(k > 0) || !(cap > 0)) { return null; }
     var sliced = SHOWN[3] !== '' || SHOWN[4] !== '';
@@ -11050,6 +11125,15 @@ _FILTER_JS = r"""
     // Sent only by a page that simulated the choice: otherwise the server keeps
     // the saved value (or the seed's), as for an unrecorded same-title cap
     if (D.grid_add) { q.push(['add_to_held_pairs', addOn(SHOWN[6]) ? 'on' : 'off']); }
+    // Likewise sent only by a page with the Sell view: the level shown and the
+    // minimum of days shown, or off for both when Sell shows no level (the
+    // server refuses a minimum without a level)
+    if (D.sell_blocks) {
+      var level = sellAt(SHOWN[7]);
+      q.push(['sell_at', level === null ? 'off' : D.sell_levels[level].value],
+             ['sell_min_days',
+              level === null ? 'off' : D.sell_days[parseInt(SHOWN[8], 10)].value]);
+    }
     if (SHOWN[4] !== '') {
       var sc = D.subcats[parseInt(SHOWN[4], 10)];
       q.push(['category', D.categories[sc[0]]], ['tag', sc[1]]);

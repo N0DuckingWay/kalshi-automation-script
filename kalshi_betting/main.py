@@ -34,10 +34,10 @@ Purpose:
 
     With --result-file PATH (prod only) the run deletes any file at PATH, then
     writes a JSON summary there when it ends: its exit code, closing line,
-    balances, whether it began sending orders, each pair's outcome with the
-    Kalshi category and tag it is filed under, its warnings and any error. A
-    usage error before logging starts, or a kill signal, leaves no file, so a
-    caller reads the exit code first.
+    balances, whether it began sending orders, each sale's outcome, each pair's
+    outcome with the Kalshi category and tag it is filed under, its warnings
+    and any error. A usage error before logging starts, or a kill signal,
+    leaves no file, so a caller reads the exit code first.
 
     The live settings come from the saved live defaults (live_defaults.json);
     a toggle flag overrides one of them for this run only. With no saved
@@ -45,6 +45,11 @@ Purpose:
     anything; it never falls back to config.py's values. The scheduler passes
     no toggle flags. Between finding pairs and pricing them, _dedup_pairs and
     _filter_by_category trim the list.
+
+    A production run with sell_at set sells, before it buys, each held position
+    (an exact held pair, or a lone held market whose partner has paid out)
+    that has stayed at or above that share of its potential profit (what it
+    pays if it wins, less its cost); see CLAUDE.md, live selling.
 
     A production run keeps every market the account holds out of new trades,
     except, when the run's add_to_held_pairs setting is on, the markets it
@@ -62,9 +67,10 @@ Dependencies:
     for the category/tag filter and each trade's category in the run summary),
     reporter.py (Excel output and the run summary), _http.py (a one-line
     description of an error), scanner.py (finding markets and pairs, and
-    pricing them from the order book), strategy.py (sizing and choosing
-    trades), trader.py (sending orders) and run_lock.py (the
-    one-real-money-run-at-a-time lock). Run as `python3 -m kalshi_betting.main`.
+    pricing them from the order book), seller.py (which held positions to
+    sell), strategy.py (sizing and choosing trades), trader.py (sending orders)
+    and run_lock.py (the one-real-money-run-at-a-time lock). Run as
+    `python3 -m kalshi_betting.main`.
 
     To add to held pairs it also reads scanner.get_held_positions,
     resolve_held_ladders and held_pairs (the positions, their ladders and the
@@ -103,9 +109,11 @@ import argparse
 import contextlib
 import logging
 import logging.handlers
+import math
 import os
 import pathlib
 import sys
+import time
 from collections import Counter
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime
@@ -126,9 +134,12 @@ from .config import (
     LIVE_DEFAULTS_FROM_CONFIG,
     MIN_BALANCE_CENTS,
     PROJECT_ROOT,
+    SALE_READ_BACK_RECHECK_SECONDS,
     SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
     SAME_TITLE_MIN_PRICE_DIFF,
+    SELL_AT_STEP,
     SIZE_CAP_STEP,
+    V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS,
     LiveDefaultsError,
     LiveDefaultsMissing,
     LiveSettings,
@@ -136,6 +147,7 @@ from .config import (
     describe_live_settings,
     describe_time_series_rule,
     describe_trade_filter,
+    fee_leg_exact,
     held_pair_fraction,
     live_defaults,
     live_rule_warnings,
@@ -147,6 +159,7 @@ from .reporter import (
     RunReport,
     RunReportHandler,
     append_to_prod_log,
+    report_sales,
     report_trades,
     write_dev_simulation,
     write_run_report,
@@ -168,11 +181,13 @@ from .scanner import (
     pair_held,
     resolve_held_ladders,
 )
+from .seller import plan_sales
 from .strategy import compute_trade, select_portfolio
 from .trader import (
     ensure_shard_collateral,
     execute_trades,
     pre_execution_check,
+    sell_positions,
 )
 
 
@@ -230,7 +245,9 @@ def _bankroll_cents(cash_cents: int, positions_value_cents: int | None) -> int:
 
 
 def _checked_positions_value(cash_cents: int, positions_value_cents: int | None,
-                             held_positions: dict, listing_complete: bool) -> int | None:
+                             held_positions: dict, listing_complete: bool, *,
+                             not_shown: list | tuple = (),
+                             value_before_sales: int | None = None) -> int | None:
     """
     Return Kalshi's value of the open positions if the contracts held can back it.
 
@@ -243,7 +260,9 @@ def _checked_positions_value(cash_cents: int, positions_value_cents: int | None,
     counted it as $0 and said so. Any other value is refused: one WARNING
     names it, the contracts held and the reason, and the run sizes on the
     cash alone. The check keeps a value in the wrong unit, or otherwise too
-    large, from making every trade too big.
+    large, from making every trade too big. After a live run's sales it is
+    also refused while a sale does not show yet (not_shown), or when it is not
+    below value_before_sales, since it may still count what was sold.
 
     Args:
         cash_cents (int): The cash on every shard together, in cents, named in the WARNING.
@@ -251,6 +270,9 @@ def _checked_positions_value(cash_cents: int, positions_value_cents: int | None,
             positions, in cents; None when the balance reply had none.
         held_positions (dict): scanner.get_held_positions' result, ticker -> HeldPosition.
         listing_complete (bool): Whether that listing was read to its end.
+        not_shown (list | tuple): Keyword-only. Markets whose sale the listing does not show yet.
+        value_before_sales (int | None): Keyword-only. The value kept at the run's start,
+            in cents, when a sale sold or may have sold contracts; else None.
 
     Returns:
         int | None: positions_value_cents when it may count in the portfolio
@@ -263,6 +285,15 @@ def _checked_positions_value(cash_cents: int, positions_value_cents: int | None,
     if not listing_complete:
         reason = ("the list of the account's positions was cut short, so not every "
                   "contract held is known")
+    elif not_shown:
+        reason = (f"the list of the account's positions does not yet show this run's "
+                  f"sales on {', '.join(not_shown)}, so the value may still count what "
+                  f"was sold")
+    elif value_before_sales is not None and positions_value_cents >= value_before_sales:
+        # Selling turns positions into cash, so the value should have fallen
+        reason = (f"this run's sales sold, or may have sold, contracts, yet it is not "
+                  f"below the ${value_before_sales / 100:.2f} it was before them, so it "
+                  f"may still count what was sold")
     elif None in counts:
         reason = (f"the contract count of {sum(c is None for c in counts)} held "
                   f"market(s) could not be read")
@@ -280,6 +311,359 @@ def _checked_positions_value(cash_cents: int, positions_value_cents: int | None,
         positions_value_cents / 100, reason, cash_cents / 100,
     )
     return None
+
+
+# Sale statuses that need a person: a pair left uneven, or an unknown outcome
+_SALE_ATTENTION_STATUSES = ("unbalanced", "manual_review")
+
+# Slack for comparing contract counts, which are whole but parsed as floats
+_COUNT_TOLERANCE = 1e-6
+
+
+def _sold_tickers(sales: list, *, dry_run: bool) -> set:
+    """
+    The held markets this run's sales keep out of every purchase for the rest of the run.
+
+    A dry run: every held market of a "simulated" sale. A live run: every
+    market an order sold on, plus every held market of a sale left for a
+    person (_SALE_ATTENTION_STATUSES).
+
+    Args:
+        sales (list): trader.sell_positions' results.
+        dry_run (bool): Keyword-only. True for a run that sends no orders.
+
+    Returns:
+        set: Their tickers.
+    """
+    tickers: set = set()
+    for sale in sales:
+        if dry_run:
+            if sale.status == "simulated":
+                tickers |= set(sale.sold)
+            continue
+        tickers |= {ticker for ticker, count in sale.sold.items() if count}
+        if sale.status in _SALE_ATTENTION_STATUSES:
+            tickers |= {leg.ticker for leg in getattr(sale.plan, "legs", ())
+                        if getattr(leg, "market", None) is not None}
+    return tickers
+
+
+def _planned_tickers(sales: list) -> set:
+    """
+    Every held market of every position the take-profit rule picked this run.
+
+    Such a position is not added to this run even when its orders sold
+    nothing, so a live run and a dry run of one account offer the same add-ons.
+
+    Args:
+        sales (list): trader.sell_positions' results.
+
+    Returns:
+        set: Their tickers (a paid-out partner has no market and is left out).
+    """
+    return {leg.ticker for sale in sales for leg in getattr(sale.plan, "legs", ())
+            if getattr(leg, "market", None) is not None}
+
+
+def _account_decided_short(sales: list) -> list:
+    """
+    The markets of sales whose count an account reading decided and came up short.
+
+    When a sale's reply does not say how many sold, the account's position
+    decides (SaleResult.decided_by_account); a ledger trailing the fills shows
+    too few, so one that reads partly sold, not sold or unbalanced may have sold more.
+
+    Args:
+        sales (list): A live run's sale results.
+
+    Returns:
+        list: Those sales' held tickers, sorted.
+    """
+    return sorted({ticker for sale in sales
+                   if getattr(sale, "decided_by_account", False) is True
+                   and sale.status in ("partly_sold", "not_sold", "unbalanced")
+                   for ticker in sale.sold}, key=str)
+
+
+def _sale_attention_note(sales: list) -> str:
+    """
+    Give the words a run's closing line ends with when a sale needs a person to check it.
+
+    Args:
+        sales (list): trader.sell_positions' results.
+
+    Returns:
+        str: " Sales that need a person to check: N (see the CRITICAL lines above)."
+            when a sale's status is in _SALE_ATTENTION_STATUSES; "" otherwise.
+    """
+    count = sum(1 for sale in sales if sale.status in _SALE_ATTENTION_STATUSES)
+    return (f" Sales that need a person to check: {count} (see the CRITICAL lines above)."
+            if count else "")
+
+
+def _with_simulated_proceeds(sales: list, cash_cents: int,
+                             shard_balances: dict) -> tuple[int, dict]:
+    """
+    Add what a dry run's sales would return to the cash, as if they had filled.
+
+    Each held market of a "simulated" sale adds its count times the average
+    bid it was priced at (SalePlan.walked), less the taker fee, floored to the
+    whole cent, to the cash total and to its own shard.
+
+    Args:
+        sales (list): trader.sell_positions' results in a dry run.
+        cash_cents (int): The cash on every shard together, in cents.
+        shard_balances (dict): Exchange index -> cash on that shard, in cents.
+
+    Returns:
+        tuple[int, dict]: The new cash and a new per-shard dict (the input is unchanged).
+    """
+    shards = dict(shard_balances)
+    added = 0
+    for sale in sales:
+        if sale.status != "simulated":
+            continue
+        plan = sale.plan
+        for leg in plan.legs:
+            if leg.market is None:
+                continue  # a paid-out partner has nothing to sell
+            count = sale.sold.get(leg.ticker, 0)
+            average = plan.walked[leg.ticker][0]
+            # Cross-module: the one fee rule, on selling `count` at that price
+            dollars = count * average - fee_leg_exact(count, average)
+            # Rounded to 6 places first so float noise never costs a cent, then floored
+            cents = max(0, math.floor(round(dollars * 100, 6)))
+            shard = leg.market.exchange_index
+            shards[shard] = shards.get(shard, 0) + cents
+            added += cents
+    return cash_cents + added, shards
+
+
+def _record_sales(sales: list, cash_before_cents: int, cash_after_cents: int,
+                  run_note: str) -> None:
+    """
+    Add this run's sales to the trade log, or dump them to the log if that fails.
+
+    Called before anything is bought, so a filled sale is on record however
+    the run ends. A failed write dumps every sale as a CRITICAL RESCUE line and
+    raises again, which stops the run before it buys.
+
+    Args:
+        sales (list): trader.sell_positions' results; not empty.
+        cash_before_cents (int): The cash on every shard before the sales, in cents.
+        cash_after_cents (int): The cash after them, in cents (a dry run's is the cash before).
+        run_note (str): The trade log banner's note for this run.
+
+    Raises:
+        Exception: Whatever writing the trade log raised, after the rescue dump.
+    """
+    try:
+        # Cross-module: one banner row, then one row per sale (reporter._sale_to_row)
+        append_to_prod_log([], cash_before_cents / 100, cash_after_cents / 100,
+                           run_note=run_note, sales=sales)
+    except Exception as exc:
+        logging.critical("Failed to write the sales to the trade log: %s — rescue dump "
+                         "follows", exc)
+        for sale in sales:
+            logging.critical("  RESCUE SALE | %s | %s | sold %s | %s",
+                             sale.status, getattr(sale.plan, "title", sale.plan),
+                             sale.sold, sale.error or "")
+        raise
+
+
+def _listing_misses_sales(sales: list, before: dict, positions: dict, *,
+                          listing_complete: bool = True) -> tuple[list, list]:
+    """
+    Compare the listed positions with what this run's sales recorded as sold there.
+
+    A market an order sold n contracts on should now hold n fewer than at the
+    run's start. If the listing shows fewer sold than that, the sale does not
+    show yet (the positions ledger trails a fill). If it shows more sold, then
+    for a sale whose count an account reading decided
+    (SaleResult.decided_by_account; checked even where it recorded 0) that
+    reading trailed the fills, and for any other sale it does not show yet.
+    Unreadable or unknown counts, and markets missing from a listing cut short, are skipped.
+
+    Args:
+        sales (list): A live run's sale results.
+        before (dict): The listing read at the start of the run, ticker -> HeldPosition.
+        positions (dict): The listing read after the sales, the same shape.
+        listing_complete (bool): Keyword-only. Whether that listing was read to its end.
+
+    Returns:
+        tuple[list, list]: The markets whose sale does not show yet, and the
+            markets of account-decided sales showing more sold; each sorted.
+    """
+    not_shown, more_sold = set(), set()
+    for sale in sales:
+        by_account = getattr(sale, "decided_by_account", False) is True
+        for ticker, count in sale.sold.items():
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                continue
+            if count == 0 and not by_account:
+                continue
+            held = before.get(ticker)
+            now = positions.get(ticker)
+            if held is None or held.count is None or (now is not None and now.count is None):
+                continue
+            if now is None and not listing_complete:
+                continue
+            # How far the position moved toward zero (a YES count falls, a NO count rises)
+            shown = ((held.count - (0.0 if now is None else now.count))
+                     * math.copysign(1.0, held.count))
+            if shown < count - _COUNT_TOLERANCE:
+                not_shown.add(ticker)
+            elif shown > count + _COUNT_TOLERANCE:
+                (more_sold if by_account else not_shown).add(ticker)
+    return sorted(not_shown, key=str), sorted(more_sold, key=str)
+
+
+def _positions_after_sales(client, sales: list, before: dict,
+                           held_listing: dict) -> tuple[dict, list, list]:
+    """
+    Read the positions again after a live run's sales, waiting while a sale may not show yet.
+
+    Kalshi's positions ledger can trail a fill. When the listing differs from
+    what the sales recorded it is read once more after
+    config.SALE_READ_BACK_RECHECK_SECONDS; when an account-decided count came
+    up short (_account_decided_short) it is read after each pause of
+    config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS instead, stopping early once
+    a read after a pause shows more sold. A ledger still trailing after the
+    last pause leaves a short count standing, unflagged.
+
+    Args:
+        client: The production KalshiClient.
+        sales (list): The run's sale results.
+        before (dict): The positions listing read at the start of the run.
+        held_listing (dict): Its "complete" key is set to whether the last read reached the end.
+
+    Returns:
+        tuple[dict, list, list]: The last positions read (ticker -> HeldPosition)
+            and _listing_misses_sales' two lists for them.
+    """
+    # Cross-module: the one reader of the positions listing, as at the start of the run
+    positions = get_held_positions(client, complete_out=held_listing)
+    not_shown, more_sold = _listing_misses_sales(
+        sales, before, positions, listing_complete=held_listing.get("complete") is True)
+    short = _account_decided_short(sales)
+    if short:
+        pauses = V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS
+    elif not_shown or more_sold:
+        pauses = (SALE_READ_BACK_RECHECK_SECONDS,)
+    else:
+        pauses = ()
+    for number, pause in enumerate(pauses):
+        if number and more_sold:
+            # A read after a pause shows more sold: nothing left to wait for
+            break
+        if not_shown:
+            logging.info("The positions listing does not yet show this run's sales on %s; "
+                         "reading it again in %g s", ", ".join(not_shown), pause)
+        elif more_sold:
+            logging.info("The positions listing shows more sold than this run recorded on "
+                         "%s; reading it again in %g s", ", ".join(more_sold), pause)
+        else:
+            logging.info("This run's sales on %s were counted from the account's "
+                         "positions, which can trail a fill; reading the positions "
+                         "listing again in %g s to check them", ", ".join(short), pause)
+        time.sleep(pause)
+        positions = get_held_positions(client, complete_out=held_listing)
+        not_shown, more_sold = _listing_misses_sales(
+            sales, before, positions, listing_complete=held_listing.get("complete") is True)
+    return positions, not_shown, more_sold
+
+
+def _flag_sales_sold_more(sales: list, more_sold: list, before: dict,
+                          positions: dict) -> list:
+    """
+    Turn each sale the listing shows more sold on than recorded into one a person must check.
+
+    Its count came from an account reading that trailed the fills, so the position may
+    now be uneven. Each logs one CRITICAL, saying it replaces every earlier line about it,
+    and becomes "manual_review" with an error naming what was recorded and what shows.
+
+    Args:
+        sales (list): A live run's sale results.
+        more_sold (list): The markets the listing shows more sold on than recorded.
+        before (dict): The positions listing read at the start of the run.
+        positions (dict): The listing read after the sales.
+
+    Returns:
+        list: The sales in order, each flagged one replaced by a "manual_review" copy.
+    """
+    flagged = []
+    for sale in sales:
+        tickers = sorted((t for t in sale.sold if t in more_sold), key=str)
+        if not tickers:
+            flagged.append(sale)
+            continue
+        parts = []
+        for ticker in tickers:
+            held = before[ticker].count
+            now = positions.get(ticker)
+            # Missing only from a complete listing (_listing_misses_sales): holds nothing
+            left = 0.0 if now is None else now.count
+            side = "YES" if held > 0 else "NO"
+            # config.count_text: a contract count written exactly
+            parts.append(f"{ticker} held {count_text(abs(held))} {side}: this run recorded "
+                         f"{count_text(sale.sold[ticker])} sold, the account now shows "
+                         f"{count_text(abs(left))} left "
+                         f"({count_text(abs(held) - abs(left))} sold)")
+        mismatch = "the account shows more sold than recorded: " + "; ".join(parts)
+        logging.critical(
+            "SALE RECORDED SHORT for '%s': %s. The count was read from the account's "
+            "positions, which trailed the fills, so the position may now be uneven. "
+            "This replaces every earlier line about this sale, including any extra it "
+            "said to sell by hand: read what each of its markets holds now in the Kalshi "
+            "UI before acting; none is traded again this run. Manual review required.",
+            getattr(sale.plan, "title", sale.plan), "; ".join(parts),
+        )
+        error = (mismatch if not sale.error
+                 else f"{mismatch} (this replaces what was recorded before the check: "
+                      f"{sale.error})")
+        flagged.append(dc_replace(sale, status="manual_review", error=error))
+    return flagged
+
+
+def _value_after_sales(cash_cents: int, positions_value_cents: int | None,
+                       held_positions: dict, listing_complete: bool,
+                       not_shown: list, *,
+                       value_before_sales: int | None = None) -> tuple[int | None, int]:
+    """
+    Check the open positions' value after a live run's sales, and work out the portfolio value.
+
+    The portfolio value is the cash plus the value _checked_positions_value
+    keeps, or the cash alone. The minimum-balance check is not applied again,
+    since a sale only turns a position into cash. Logs one INFO line.
+
+    Args:
+        cash_cents (int): The cash on every shard, read after the sales, in cents.
+        positions_value_cents (int | None): Kalshi's value of the open
+            positions from that same read, in cents; None when not read.
+        held_positions (dict): The listing read after the sales, ticker -> HeldPosition.
+        listing_complete (bool): Whether that listing was read to its end.
+        not_shown (list): Passed on to _checked_positions_value.
+        value_before_sales (int | None): Keyword-only. Passed on to _checked_positions_value.
+
+    Returns:
+        tuple[int | None, int]: The value kept (None when not read or refused)
+            and the portfolio value, in cents.
+    """
+    checked_value_cents = _checked_positions_value(
+        cash_cents, positions_value_cents, held_positions, listing_complete,
+        not_shown=not_shown, value_before_sales=value_before_sales,
+    )
+    if positions_value_cents is not None and checked_value_cents is None:
+        # Refused (its WARNING is logged): the cash alone, as at the start
+        portfolio_value_cents = cash_cents
+        counted = "not used (counted as $0.00)"
+    else:
+        portfolio_value_cents = _bankroll_cents(cash_cents, positions_value_cents)
+        counted = ("not read (counted as $0.00)" if positions_value_cents is None
+                   else f"${positions_value_cents / 100:.2f}")
+    logging.info("After the sales: portfolio value $%.2f = cash $%.2f + open positions %s",
+                 portfolio_value_cents / 100, cash_cents / 100, counted)
+    return checked_value_cents, portfolio_value_cents
 
 
 def _display_specs(trade_specs: dict, portfolio: list) -> dict:
@@ -815,6 +1199,10 @@ _LIVE_FLAGS = (
     ("size_cap", "--size-cap"),
     ("same_title_size_cap", "--same-title-size-cap"),
     ("add_to_held_pairs", "--add-to-held-pairs/--no-add-to-held-pairs"),
+    ("sell_at", "--sell-at"),
+    ("no_sell", "--no-sell"),
+    ("sell_min_days", "--sell-min-days"),
+    ("no_sell_min_days", "--no-sell-min-days"),
     ("category", "--category"),
     ("any_category", "--any-category"),
     ("tag", "--tag"),
@@ -880,6 +1268,17 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["same_title_size_cap"] = args.same_title_size_cap / 100
     if getattr(args, "add_to_held_pairs", None) is not None:
         overrides["add_to_held_pairs"] = args.add_to_held_pairs
+    # --no-sell clears the level and the minimum of days; --sell-at and
+    # --sell-min-days then set one each (LiveSettings refuses a minimum with no level)
+    if getattr(args, "no_sell", None):
+        overrides["sell_at"] = None
+        overrides["sell_min_days"] = None
+    if getattr(args, "sell_at", None) is not None:
+        overrides["sell_at"] = args.sell_at / 100
+    if getattr(args, "no_sell_min_days", None):
+        overrides["sell_min_days"] = None
+    if getattr(args, "sell_min_days", None) is not None:
+        overrides["sell_min_days"] = args.sell_min_days
     # --category / --tag (repeatable) set the filter; --any-category / --any-tag
     # clear the saved one (argparse keeps each pair mutually exclusive)
     if getattr(args, "category", None) is not None:
@@ -907,6 +1306,11 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
             message += (f" ({' and '.join(percent)} take{'s' if len(percent) == 1 else ''} "
                         f"a whole percent, a multiple of {step} from {step} to 100, read "
                         "as that percent / 100)")
+        if any(dest == "sell_at" for dest, _ in given):
+            # --sell-at's unit, from its grid definition (SELL_AT_STEP)
+            sell_step = f"{SELL_AT_STEP * 100:g}"
+            message += (f" (--sell-at takes a whole percent, a multiple of {sell_step} "
+                        f"from {sell_step} to 100, read as that percent / 100)")
         parser.error(message)
 
 
@@ -1093,6 +1497,13 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     and adds the results to trade_log.xlsx. With --dry-run everything runs
     except sending orders.
 
+    With settings.sell_at set it sells before it buys: seller.plan_sales picks
+    the positions, trader.sell_positions sends the orders, the trade log records
+    them, and the buys are sized on what is left (a dry run adds the estimated
+    proceeds to the cash). The markets sold, and those of a sale left for a
+    person, are not bought; no position picked for sale is added to; nothing
+    is sold when a held market was not identified or the listing was cut short.
+
     Each trade bets a share of the portfolio value (the cash plus Kalshi's
     value of the open positions) but never spends more than the cash left.
     The minimum-balance check reads the portfolio value; low cash alone only
@@ -1102,8 +1513,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
 
     Kalshi's value of the open positions counts only if the contracts held
     can back it (_checked_positions_value, once the positions are read); a
-    refused value leaves the cash alone as the portfolio value, and the
-    minimum-balance check is applied to it again.
+    value refused at the start of the run leaves the cash alone as the
+    portfolio value, and the minimum-balance check is applied to it again.
 
     With settings.add_to_held_pairs on, it may add to an exact held pair
     (scanner.held_pairs: the same two markets, the same side on each) or to a
@@ -1132,7 +1543,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         int: EXIT_SKIPPED_LOW_BALANCE if the portfolio value (the cash alone
             when Kalshi's value of the open positions is refused) is below
             MIN_BALANCE_CENTS; EXIT_NO_TRADEABLE_SHARDS if nothing could be
-            scanned; EXIT_TRADES_NEED_ATTENTION if a trade needs a person to
+            scanned; EXIT_TRADES_NEED_ATTENTION if a trade or sale needs a person to
             check it; otherwise EXIT_TIME_SERIES_SKIPPED if a held market
             could not be identified; else EXIT_OK.
 
@@ -1255,8 +1666,111 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # Every market by ticker, before held ones are dropped: held_pairs reads
     # each held market's ask from it, to value a held pair at today's prices
     markets_by_ticker = {m.ticker: m for m in markets}
+    # The trade-log banners' note: the toggles a flag moved and the saved defaults the
+    # run started from, so the workbook tells rows sent under a flag from rows sent
+    # under the defaults, and one set of saved defaults from the next
+    run_note = (f"settings: {describe_live_settings(settings, reference)}"
+                + ("" if reference.origin == LIVE_DEFAULTS_FROM_CONFIG
+                   else f" | defaults: {reference.origin}"))
+
+    # Sales come before every purchase: the cash they free funds this run's buys
+    sales: list = []
+    sold_tickers: set = set()
+    # A dry run's estimated sale proceeds, in the cash it sizes on (0 in a live run)
+    simulated_cents = 0
+    if settings.sell_at is not None:
+        if held_ladders is None or held_listing.get("complete") is not True:
+            # Fails closed: a held market not identified or not listed could be on the
+            # same ladder as any position
+            logging.warning("Not selling this run: %s",
+                            "a market the account holds could not be looked up"
+                            if held_ladders is None
+                            else "the list of the account's positions was cut short")
+        else:
+            cash_before_sales = cash_cents
+            # Cross-module: the positions the take-profit rule sells (read-only requests)
+            plans = plan_sales(client, held_positions, held_labels, markets_by_ticker,
+                               settings=settings, now=datetime.now(UTC))
+            if plans and not args.dry_run:
+                # Recorded before the first sale order, as before the first buy
+                report.submission_started = True
+            # Cross-module: one position at a time, each order sent once; a dry run sends none
+            sales = sell_positions(client, plans, dry_run=args.dry_run)
+            # The sales for the run result; never raises
+            report.sales = report_sales(sales)
+            sold_tickers = _sold_tickers(sales, dry_run=args.dry_run)
+            # A live run reads its account back when anything sold or was left for a
+            # person, or when an account reading decided a sale's count (even none)
+            read_back = not args.dry_run and (
+                bool(sold_tickers)
+                or any(getattr(sale, "decided_by_account", False) is True for sale in sales))
+            if args.dry_run:
+                cash_cents, shard_balances = _with_simulated_proceeds(
+                    sales, cash_cents, shard_balances)
+                simulated_cents = cash_cents - cash_before_sales
+                # A portfolio value read as the cash alone grows with the proceeds
+                portfolio_value_cents = max(portfolio_value_cents, cash_cents)
+                if sold_tickers:
+                    logging.info("Dry run: sizing as if the sales filled — cash $%.2f "
+                                 "(+$%.2f)", cash_cents / 100, simulated_cents / 100)
+            elif read_back:
+                positions_before_sales = held_positions
+                # Positions first, then the balance, so it no longer counts what was sold
+                try:
+                    held_positions, not_shown, more_sold = _positions_after_sales(
+                        client, sales, positions_before_sales, held_listing)
+                    account = read_account_balance(client)
+                except Exception:
+                    # The sales go on record before the error stops the run
+                    _record_sales(sales, cash_before_sales, cash_before_sales, run_note)
+                    raise
+                if more_sold:
+                    # A sale counted short from a trailing ledger: a person must check it
+                    sales = _flag_sales_sold_more(sales, more_sold, positions_before_sales,
+                                                  held_positions)
+                    report.sales = report_sales(sales)
+                    sold_tickers = _sold_tickers(sales, dry_run=False)
+                shard_balances = account.shard_cash_cents
+                cash_cents = sum(shard_balances.values())
+                positions_value_cents = account.positions_value_cents
+            if sales:
+                report.cash_after_sales = cash_cents / 100
+                # On record before any buy (a dry run's banner shows the cash before)
+                _record_sales(sales, cash_before_sales,
+                              cash_before_sales if args.dry_run else cash_cents, run_note)
+            if read_back or (args.dry_run and sold_tickers):
+                if not args.dry_run:
+                    # The portfolio value the buys are sized on; once contracts were, or may
+                    # have been, sold, Kalshi's value of the open positions is refused when
+                    # not below the one kept at the start (if one was kept)
+                    checked_value_cents, portfolio_value_cents = _value_after_sales(
+                        cash_cents, positions_value_cents, held_positions,
+                        held_listing.get("complete") is True, not_shown,
+                        value_before_sales=checked_value_cents if sold_tickers else None)
+                    # A listing cut short may leave out a market still held, so then every
+                    # market held before counts as still held (fails closed)
+                    held_tickers = set(held_positions) | (
+                        set() if held_listing.get("complete") is True else held_tickers)
+                # Dry run: take out what it would have sold; live: what the new listing shows
+                still_held = (held_tickers - sold_tickers) if args.dry_run else held_tickers
+                unknown = sorted((t for t in still_held if t not in held_labels), key=str)
+                if unknown:
+                    # Only a position opened elsewhere since the run started is unknown
+                    logging.error(
+                        "Held market %r was not held when this run started, so its ladder "
+                        "is unknown and no time-series trade will be made this run",
+                        unknown[0])
+                    held_ladders = None
+                else:
+                    # A sold position's ladders are free; sold_tickers still blocks its markets
+                    held_ladders = frozenset().union(*(held_labels[t] for t in still_held))
     # The exit code of every clean return below
-    clean_exit        = EXIT_OK if held_ladders is not None else EXIT_TIME_SERIES_SKIPPED
+    clean_exit        = (EXIT_TRADES_NEED_ATTENTION
+                         if any(s.status in _SALE_ATTENTION_STATUSES for s in sales)
+                         else EXIT_OK if held_ladders is not None
+                         else EXIT_TIME_SERIES_SKIPPED)
+    # Added to the run's closing line when a sale needs a person
+    sale_note         = _sale_attention_note(sales)
     # What this run may add to (exact held pairs, and lone legs whose partner
     # has paid out): only with the setting on, and only when every held
     # market was listed and identified, since an unknown one could share a
@@ -1298,11 +1812,21 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
                              "run: %d", len(full))
                 add_on_pairs = {key: pair for key, pair in add_on_pairs.items()
                                 if key not in full}
+            # No position picked for sale is added to (_planned_tickers)
+            if sales:
+                planned = _planned_tickers(sales) | sold_tickers
+                picked = {key for key in add_on_pairs if key & planned}
+                if picked:
+                    logging.info("Held pairs picked for sale this run, not added to: %d",
+                                 len(picked))
+                    add_on_pairs = {key: pair for key, pair in add_on_pairs.items()
+                                    if key not in picked}
     # The markets of those pairs and lone legs stay in (a pair's market pairs
     # only with its own partner, a lone leg only with a market not held);
     # every other held market is dropped
+    # (and every market sold this run, which a live run may no longer hold)
     add_on_tickers    = {ticker for key in add_on_pairs for ticker in key}
-    blocked_tickers   = held_tickers - add_on_tickers
+    blocked_tickers   = (held_tickers - add_on_tickers) | sold_tickers
     markets           = [m for m in markets if m.ticker not in blocked_tickers]
 
     # Optional opt-in cap so both bet types only see markets closing within
@@ -1340,7 +1864,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
 
     if not candidate_pairs:
         # Names the run's entry rule, or says time-series was not searched
-        message = _no_pairs_msg(settings=settings, time_series_searched=held_ladders is not None)
+        message = (_no_pairs_msg(settings=settings,
+                                 time_series_searched=held_ladders is not None)
+                   + sale_note)
         logging.info("%s", message)
         report.message = message
         return clean_exit
@@ -1359,7 +1885,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     print_pairs_table(candidate_pairs, display_specs)
 
     if not portfolio:
-        message = "No executable trades found."
+        message = "No executable trades found." + sale_note
         logging.info("%s", message)
         report.message = message
         return clean_exit
@@ -1369,7 +1895,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # Re-fetch each pair's books and drop any that moved, under the run's rule
     portfolio = pre_execution_check(client, portfolio, settings=settings)
     if not portfolio:
-        message = "All selected pairs failed pre-execution price check — no trades submitted."
+        message = ("All selected pairs failed pre-execution price check — no trades "
+                   "submitted." + sale_note)
         logging.info("%s", message)
         report.message = message
         return clean_exit
@@ -1381,6 +1908,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     if not portfolio:
         message = (
             "No selected pair could be funded on its exchange shard — no trades submitted."
+            + sale_note
         )
         logging.info("%s", message)
         report.message = message
@@ -1408,6 +1936,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         labels_of=(lambda pair: _pair_labels(pair, series_categories))
         if series_categories else None)
 
+    # The cash Kalshi holds before trading: a dry run's estimated proceeds left out
+    cash_read_cents = cash_cents - simulated_cents
     # Read the cash after trading for the trade log; if that fails, use the cash before
     try:
         balance_after = sum(read_account_balance(client).shard_cash_cents.values()) / 100
@@ -1417,24 +1947,16 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.error(
             "Post-trade balance fetch failed: %s — logging with pre-trade balance", exc,
         )
-        balance_after = cash_cents / 100
+        balance_after = cash_read_cents / 100
 
     # Append this run's results to the cumulative trade_log.xlsx file. If the
     # write fails (e.g. the file is open in Excel), dump every result to the log
     # so the record of real fills is never lost, then re-raise.
     try:
         # append_to_prod_log() already logs "Trade log updated: %s (%d new row(s))"
-        # itself (BS-26) — don't duplicate that line here. The note marks the
-        # toggles a flag moved and names the saved defaults the run started
-        # from, so the workbook tells rows traded under a flag from rows traded
-        # under the defaults, and one set of saved defaults from the next
+        # itself (BS-26) — don't duplicate that line here.
         # The separator row shows the cash before and after trading
-        append_to_prod_log(
-            results, cash_cents / 100, balance_after,
-            run_note=(f"settings: {describe_live_settings(settings, reference)}"
-                      + ("" if reference.origin == LIVE_DEFAULTS_FROM_CONFIG
-                         else f" | defaults: {reference.origin}")),
-        )
+        append_to_prod_log(results, cash_read_cents / 100, balance_after, run_note=run_note)
     except Exception as exc:
         logging.critical("Failed to write trade log: %s — rescue dump follows", exc)
         for r in results:
@@ -1459,7 +1981,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         raise
 
     if args.dry_run:
-        message = "[DRY RUN] No orders were actually submitted."
+        message = "[DRY RUN] No orders were actually submitted." + sale_note
         logging.info("%s", message)
         report.message = message
         return clean_exit
@@ -1476,7 +1998,7 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     n_unknown  = sum(1 for r in results if r.status == "manual_review")
     message = (f"Submitted {n_ok} of {len(results)} order pair(s) successfully. "
                f"{n_rolled} rolled back, {n_orphaned} rollback failure(s), "
-               f"{n_unknown} unknown fill state(s).")
+               f"{n_unknown} unknown fill state(s).{sale_note}")
     logging.info("%s", message)
     report.message = message
     if n_orphaned or n_unknown:
@@ -1539,8 +2061,8 @@ def _build_parser() -> argparse.ArgumentParser:
     live = parser.add_argument_group(
         "live trading toggles",
         "Override one live default for THIS run only, in either mode "
-        "(adding to held pairs: production runs only). The live defaults "
-        "are the ones saved through python3 -m kalshi_betting.defaults_server "
+        "(adding to held pairs and selling: production runs only). The live "
+        "defaults are the ones saved through python3 -m kalshi_betting.defaults_server "
         "(live_defaults.json); a run refuses to start without them. The weekly scheduler "
         "passes none of these flags, so a scheduled run trades exactly the saved defaults.",
     )
@@ -1585,6 +2107,30 @@ def _build_parser() -> argparse.ArgumentParser:
              "prices plus the fees paid for them). --no-add-to-held-pairs never "
              "trades a held market. Production runs only: a dev run holds nothing "
              "(default: the saved live defaults)",
+    )
+    sell_level = live.add_mutually_exclusive_group()
+    sell_level.add_argument(
+        "--sell-at", type=int, default=None, metavar="PCT",
+        help="Sell a held position once it has stayed at or above PCT%% of its potential profit "
+             "for config.TAKE_PROFIT_HOLD_DAYS days in a row; a whole percent from 1 to "
+             "100. Production runs only (default: the saved live defaults)",
+    )
+    sell_level.add_argument(
+        "--no-sell", action="store_true", default=None,
+        help="Sell nothing this run, whatever the saved live defaults say (also clears "
+             "the saved minimum of days; cannot be combined with --sell-min-days)",
+    )
+    sell_days = live.add_mutually_exclusive_group()
+    sell_days.add_argument(
+        "--sell-min-days", type=int, default=None, metavar="N",
+        help="Sell a position only while at least N days (1 or more) remain before "
+             "its last market stops trading; needs a sell level, saved or given with "
+             "--sell-at (default: the saved live defaults)",
+    )
+    sell_days.add_argument(
+        "--no-sell-min-days", action="store_true", default=None,
+        help="Set no minimum of days to maturity this run, whatever the saved live "
+             "defaults say",
     )
     # Filed as the backtest dashboard files a trade (_filter_by_category)
     categories = live.add_mutually_exclusive_group()

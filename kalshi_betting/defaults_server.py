@@ -8,8 +8,8 @@ Purpose:
     (config.LIVE_DEFAULTS_FILE, live_defaults.json), which every live run
     starts from, and starts live trading runs with them. Run by a person,
     deliberately, from a terminal, through the launcher at the checkout's
-    root (./start_dashboard.sh [--seed], which first checks that its Python
-    can import the live bot) or directly:
+    root (./start_dashboard.sh [--seed] [--no-browser], which checks that its
+    Python can import the live bot and starts the live dashboard too) or directly:
 
         python3 -m kalshi_betting.defaults_server [--seed] [--no-browser]
 
@@ -20,7 +20,8 @@ Purpose:
     checkout's own server, running this checkout's current code, it opens
     that page from the running server and exits, starting nothing; when the
     port is held by that server running older code, by another checkout's
-    server, or by anything else, it refuses (exit 2).
+    server, or by anything else, it refuses (exit 2). With --no-browser it
+    opens no page; the launcher passes it when the live dashboard opens one.
 
     Its pages:
       - /confirm, opened with the proposed settings in its address (by the
@@ -47,7 +48,7 @@ Purpose:
         port).
 
     Each run is its own `python -m kalshi_betting.main --mode prod` process,
-    started with all eight toggles as explicit flags (config.live_settings_argv)
+    started with all ten toggles as explicit flags (config.live_settings_argv)
     so it trades exactly what its page showed, in a new session (so Ctrl-C on
     this server, or closing its terminal, never reaches it), from
     config.PROJECT_ROOT, writing everything it prints to its own folder under
@@ -55,7 +56,7 @@ Purpose:
 
 Dependencies:
     Imports config and run_lock only (besides the standard library). From
-    config: LiveSettings, LIVE_TOGGLE_FIELDS (the eight toggle names the
+    config: LiveSettings, LIVE_TOGGLE_FIELDS (the ten toggle names the
     fingerprint reads), LiveDefaultsError (a refused saved file) and the
     saved-defaults helpers (read_saved_live_defaults, save_live_defaults,
     live_settings_changes, describe_live_settings, live_rule_warnings,
@@ -209,16 +210,19 @@ from .config import (
 # The fields a confirmation request carries, in the GET query and repeated in
 # the POST body; the signed text is built from exactly these, as raw strings
 _FIELDS = ("tier_floors", "spread_min", "spread_max", "k", "size_cap",
-           "same_title_size_cap", "add_to_held_pairs", "category", "tag", "source")
+           "same_title_size_cap", "add_to_held_pairs", "sell_at", "sell_min_days",
+           "category", "tag", "source")
 # The fields a proposal must carry; every other one may be left out
 _REQUIRED = ("tier_floors", "spread_min", "spread_max", "k", "size_cap")
-# The largest number of fields a query or form may hold (its ten fields plus
+# The largest number of fields a query or form may hold (its twelve fields plus
 # the fingerprint, nonce, token, action and acknowledgement, with room to
 # spare); more is refused unread
 _MAX_FIELDS = 20
 # A plain decimal number in ASCII digits: no underscores, spaces, digits of
 # other scripts, "nan" or "inf"
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", re.ASCII)
+# A whole number of days: one to six ASCII digits, with no sign or spaces
+_WHOLE_NUMBER = re.compile(r"\d{1,6}", re.ASCII)
 # A token or fingerprint: 64 lower-case hex digits (a SHA-256 hex digest)
 _HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 # A page's one-time nonce: 32 lower-case hex digits
@@ -386,6 +390,19 @@ _EACH_PAIR_BELOW = "Each pair's status and error are listed below."
 _ATTENTION_STATUSES = ("rollback_failed", "manual_review")
 _TRADE_GROUPS = (("Needs attention", _ATTENTION_STATUSES), ("Completed", ("executed",)),
                  ("Would have traded", ("simulated",)))
+
+# Sale (take-profit) statuses that need a person: a pair left uneven, or an unknown outcome
+_SALE_ATTENTION_STATUSES = ("unbalanced", "manual_review")
+
+# A sale's status in plain words, as the trade log's Status column words it
+_SALE_STATUS_WORDS = {"sold": "sold", "partly_sold": "partly sold", "not_sold": "not sold",
+                      "unbalanced": "unbalanced", "manual_review": "check",
+                      "simulated": "simulated"}
+
+# What a run page says under its Sales table
+_SALE_PROFIT_NOTE = ("Profit is what selling the whole position realizes at the bids the "
+                     "sale was priced at, after fees; it is shown only for a position that "
+                     "sold in full (or, in a dry run, would have).")
 
 # The exit code argparse gives a command line it refuses: the run stopped
 # before it logged anything, so it sent nothing
@@ -604,7 +621,7 @@ class _LastRun:
     Attributes:
         finished (datetime): When it ended, timezone-aware; the newest run decides.
         verdict (str): "clean" (it finished trading with nothing left to
-            check), "attention" (a pair needs a person) or "unclean" (it ended
+            check), "attention" (a pair or sale needs a person) or "unclean" (it ended
             without a clean result, so orders may have been placed).
         why (str): How it ended, in words, e.g. "exit 20" or "it wrote no result".
         where (str): Which run, as plain text; a scheduled run, which has no
@@ -746,20 +763,53 @@ def _name(text: str, name: str) -> str:
     return text
 
 
+def _whole_number(text: str, name: str) -> int:
+    """
+    Read a field as a plain whole number.
+
+    Args:
+        text (str): The field's value.
+        name (str): The field's name, for the message.
+
+    Returns:
+        int: The number.
+
+    Raises:
+        ValueError: If the value is not one to six ASCII digits.
+    """
+    if not _WHOLE_NUMBER.fullmatch(text):
+        raise ValueError(f"{name} must be a whole number of at most six digits, got {text!r}")
+    return int(text)
+
+
+def _kept(name: str, current: LiveSettings | None, source: str) -> object:
+    """
+    Return the value of a setting a request left out.
+
+    Args:
+        name (str): The LiveSettings field's name.
+        current (LiveSettings | None): The live defaults in force, or None if none are saved.
+        source (str): The request's source note ("" when it has none).
+
+    Returns:
+        object: The saved value, or the seed's when none is saved or source is the seed's note.
+    """
+    if current is not None and source != LIVE_DEFAULTS_SEED_SOURCE:
+        return getattr(current, name)
+    return getattr(LIVE_DEFAULTS_SEED, name)
+
+
 def _proposal(params: dict[str, list[str]],
               current: LiveSettings | None) -> tuple[LiveSettings, str]:
     """
     Turn a confirmation request's fields into the proposed live defaults.
 
     tier_floors ("on" / "off"), spread_min, spread_max, k and size_cap (a
-    fraction, e.g. 0.2) are required. same_title_size_cap and
-    add_to_held_pairs ("on" / "off") may be left out, and each then keeps the
-    saved value (or the seed's when none is saved); they are the only two
-    fields that fall back to what is saved, so a link that leaves one out
-    keeps it as it is (the dashboard's save button leaves the same-title cap
-    out when its run recorded none, and the add-to-held choice out on a page
-    that does not show it). One exception: a link carrying the seed's note
-    that leaves add_to_held_pairs out takes the seed's value, so it still
+    fraction, e.g. 0.2) are required. same_title_size_cap,
+    add_to_held_pairs ("on" / "off"), sell_at ("off" or a share in (0, 1])
+    and sell_min_days ("off" or a whole number of days) may be left out:
+    each then keeps the saved value, or the seed's when none is saved or
+    (all but the same-title cap) on a link carrying the seed's note, so such a link still
     proposes exactly the seed, and the page shows the change against what is
     saved. A missing category or tag means any, whatever is saved; a tag needs
     its category. source is the note the saved file will keep: left out, it
@@ -780,7 +830,8 @@ def _proposal(params: dict[str, list[str]],
         ValueError: Naming the first rule the request breaks: an unknown,
             repeated, blank or missing field, a value that is not a plain
             number or a printable name, a tier_floors or add_to_held_pairs
-            other than on or off, a tag without a category, a source
+            other than on or off, a sell_at neither off nor a number, a sell_min_days
+            neither off nor one to six digits, a tag without a category, a source
             of another shape, any value LiveSettings refuses, or the seed's
             note on other values.
     """
@@ -804,22 +855,28 @@ def _proposal(params: dict[str, list[str]],
         same_title = current.same_title_size_cap
     else:
         same_title = LIVE_DEFAULTS_SEED.same_title_size_cap
+    source = value.get("source", "")
     if "add_to_held_pairs" in value:
         if value["add_to_held_pairs"] not in ("on", "off"):
             raise ValueError("add_to_held_pairs must be on or off, got "
                              f"{value['add_to_held_pairs']!r}")
         add_on = value["add_to_held_pairs"] == "on"
-    elif current is not None and value.get("source") != LIVE_DEFAULTS_SEED_SOURCE:
-        add_on = current.add_to_held_pairs
     else:
-        # No defaults saved, or a seed link: the seed's value, so a seed link
-        # that leaves the field out still proposes exactly the seed
-        add_on = LIVE_DEFAULTS_SEED.add_to_held_pairs
+        add_on = _kept("add_to_held_pairs", current, source)
+    # "off" means never selling, or no minimum of days
+    if "sell_at" in value:
+        sell_at = None if value["sell_at"] == "off" else _number(value["sell_at"], "sell_at")
+    else:
+        sell_at = _kept("sell_at", current, source)
+    if "sell_min_days" in value:
+        sell_min_days = (None if value["sell_min_days"] == "off"
+                         else _whole_number(value["sell_min_days"], "sell_min_days"))
+    else:
+        sell_min_days = _kept("sell_min_days", current, source)
     if "tag" in value and "category" not in value:
         raise ValueError("a tag needs its category")
     categories = (_name(value["category"], "category"),) if "category" in value else None
     tags = (_name(value["tag"], "tag"),) if "tag" in value else None
-    source = value.get("source", "")
     # re.ASCII: the pattern's digits are 0-9 only, never a digit of another
     # script (which could show a date out of order on the page)
     if source and not re.fullmatch(LIVE_DEFAULTS_SOURCE_PATTERN, source, re.ASCII):
@@ -841,6 +898,8 @@ def _proposal(params: dict[str, list[str]],
         categories=categories,
         tags=tags,
         add_to_held_pairs=add_on,
+        sell_at=sell_at,
+        sell_min_days=sell_min_days,
     )
     # The seed's note names the seed values, so it may label nothing else
     if source == LIVE_DEFAULTS_SEED_SOURCE and settings != LIVE_DEFAULTS_SEED:
@@ -856,6 +915,7 @@ def _seed_query() -> str:
     Each number is written as its repr (the exact float), adding to held
     pairs as on or off, the source note is LIVE_DEFAULTS_SEED_SOURCE, and a
     category or tag is added only when the seed sets one (it sets none: any).
+    The sell level and the minimum of days are written as off when unset.
 
     Returns:
         str: The query string, without the "?".
@@ -869,6 +929,8 @@ def _seed_query() -> str:
         ("size_cap", repr(seed.size_cap)),
         ("same_title_size_cap", repr(seed.same_title_size_cap)),
         ("add_to_held_pairs", "on" if seed.add_to_held_pairs else "off"),
+        ("sell_at", "off" if seed.sell_at is None else repr(seed.sell_at)),
+        ("sell_min_days", "off" if seed.sell_min_days is None else str(seed.sell_min_days)),
     ]
     pairs += [("category", name) for name in seed.categories or ()]
     pairs += [("tag", name) for name in seed.tags or ()]
@@ -904,7 +966,7 @@ def _fingerprint(current: LiveSettings | None) -> str:
         current (LiveSettings | None): The saved defaults, or None when none are saved.
 
     Returns:
-        str: The SHA-256 hex digest of "none", or of the origin and the eight
+        str: The SHA-256 hex digest of "none", or of the origin and the ten
             toggles as JSON.
     """
     if current is None:
@@ -1385,6 +1447,44 @@ def _leg(value) -> dict | None:
             "price": _finite(value.get("price"))}
 
 
+def _sale_leg(value) -> dict | None:
+    """
+    Read one held market of a sale in a run result, each field checked for its type.
+
+    Args:
+        value: The recorded market.
+
+    Returns:
+        dict | None: ticker, side, held, sold, price (None if unreadable); None if not an object.
+    """
+    if not isinstance(value, dict):
+        return None
+    return {"ticker": _text(value.get("ticker")), "side": _text(value.get("side")),
+            "held": _int(value.get("held")), "sold": _int(value.get("sold")),
+            "price": _finite(value.get("price"))}
+
+
+def _sale(value) -> dict | None:
+    """
+    Read one sale in a run result, each field checked for its type.
+
+    Args:
+        value: The recorded sale.
+
+    Returns:
+        dict | None: title, status ("unknown" if unreadable), error, profit and
+            legs (the readable ones, each _sale_leg); None if not an object.
+    """
+    if not isinstance(value, dict):
+        return None
+    legs = value.get("legs") if isinstance(value.get("legs"), list) else []
+    return {"title": _text(value.get("title")),
+            "status": _text(value.get("status")) or "unknown",
+            "error": _text(value.get("error")),
+            "profit": _finite(value.get("profit")),
+            "legs": [leg for leg in (_sale_leg(item) for item in legs) if leg is not None]}
+
+
 def _read_result(folder: Path) -> _Result:
     """
     Read a run's result file strictly: the record's type-checked fields, or why there are none.
@@ -1393,6 +1493,7 @@ def _read_result(folder: Path) -> _Result:
     bool dry_run and an int or null exit_code; otherwise it is "unreadable".
     Every other field is kept only when it has its type (a pair's fields
     too), so a hand-edited or damaged file never breaks a page.
+    A sale's fields are read the same way; a result with no list of sales has none.
 
     Args:
         folder (Path): The run's folder.
@@ -1426,6 +1527,8 @@ def _read_result(folder: Path) -> _Result:
                        "adds_to_held": _finite(trade.get("adds_to_held")),
                        "category": _text(trade.get("category")),
                        "tag": _text(trade.get("tag"))})
+    listed = raw.get("sales") if isinstance(raw.get("sales"), list) else []
+    sales = [sale for sale in (_sale(item) for item in listed) if sale is not None]
     warnings = raw.get("warnings") if isinstance(raw.get("warnings"), list) else []
     dropped = _int(raw.get("warnings_dropped"))
     return _Result("ok", {
@@ -1439,6 +1542,8 @@ def _read_result(folder: Path) -> _Result:
         "balance_after": _finite(raw.get("balance_after")),
         "portfolio_value_before": _finite(raw.get("portfolio_value_before")),
         "trades": trades,
+        "sales": sales,
+        "cash_after_sales": _finite(raw.get("cash_after_sales")),
         "warnings": [line for line in warnings if isinstance(line, str)],
         "warnings_dropped": dropped if dropped is not None and dropped > 0 else 0,
     })
@@ -1643,7 +1748,7 @@ def _folder_last_run(folder: Path, process: subprocess.Popen | None) -> _LastRun
     run still going, one that could not be started, one its argument parser
     refused, and one that stopped before it could send an order
     (_NO_ORDER_EXITS, or an error before its first order). Of the rest, a pair
-    left for a person, or exit EXIT_TRADES_NEED_ATTENTION, is "attention"; a
+    (or a sale) left for a person, or exit EXIT_TRADES_NEED_ATTENTION, is "attention"; a
     run with no readable result, stopped by a signal, stopped by an error
     while or after sending orders, or ended with any other code but a clean
     one, is "unclean"; a clean exit (_CLEAN_EXITS) is "clean".
@@ -1679,9 +1784,12 @@ def _folder_last_run(folder: Path, process: subprocess.Popen | None) -> _LastRun
                or (process is None and code is None and _refused_to_start(_log_tail(folder))))
     if result.state == "missing" and refused:
         return None  # its argument parser refused it before it logged anything
-    if (any(t["status"] in _ATTENTION_STATUSES for t in trades)
+    sale_attention = any(s["status"] in _SALE_ATTENTION_STATUSES
+                         for s in record.get("sales", []))
+    if (any(t["status"] in _ATTENTION_STATUSES for t in trades) or sale_attention
             or code == EXIT_TRADES_NEED_ATTENTION):
         verdict = ("attention", f"exit {code}" if code == EXIT_TRADES_NEED_ATTENTION
+                   else "a sale was left for a person to check" if sale_attention
                    else "a pair was left for a person to check")
     elif result.state != "ok":
         if code in _NO_ORDER_EXITS:
@@ -1886,6 +1994,55 @@ def _trades_html(trades: list[dict]) -> str:
     return "\n".join(parts)
 
 
+def _sold_text(leg: dict) -> str:
+    """
+    Say what one held market of a sale sold, as "30 of 30 YES on KX-A".
+
+    Args:
+        leg (dict): The market (_sale_leg).
+
+    Returns:
+        str: That text, with "?" for anything not recorded.
+    """
+    sold = "?" if leg["sold"] is None else str(leg["sold"])
+    held = "?" if leg["held"] is None else str(leg["held"])
+    side = "?" if leg["side"] is None else leg["side"].upper()
+    return f"{sold} of {held} {side} on {leg['ticker'] or '?'}"
+
+
+def _sales_html(sales: list[dict], cash_after: float | None, *, dry_run: bool) -> str:
+    """
+    Show a run's sales (the take-profit rule) as one short table, with the cash they left.
+
+    Args:
+        sales (list[dict]): The run result's sales (_sale).
+        cash_after (float | None): The cash after the sales, in dollars, or None.
+        dry_run (bool): Keyword-only. A dry run's cash after the sales is an estimate.
+
+    Returns:
+        str: The table's HTML; "" when there are no sales.
+    """
+    if not sales:
+        return ""
+    head = "<tr><th>Position</th><th>Status</th><th>Sold</th><th>Profit</th></tr>"
+    body = []
+    for sale in sales:
+        status = _SALE_STATUS_WORDS.get(sale["status"], sale["status"])
+        sold = ", ".join(_sold_text(leg) for leg in sale["legs"]) or "—"
+        if sale["error"]:
+            sold += f" ({sale['error']})"
+        profit = (_money(sale["profit"]) if sale["status"] in ("sold", "simulated")
+                  else "—")
+        cells = (sale["title"] or "—", status, sold, profit)
+        body.append("<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in cells) + "</tr>")
+    parts = [f"<h2>Sales</h2>\n<table>{head}{''.join(body)}</table>",
+             f"<p class=\"note\">{html.escape(_SALE_PROFIT_NOTE)}</p>"]
+    if cash_after is not None:
+        parts.append(f"<p>Cash after the sales {_money(cash_after)}"
+                     + (" (estimated: nothing was sent)" if dry_run else "") + "</p>")
+    return "\n".join(parts)
+
+
 def _outcome(run: _Run, exit_code: int | None, result: _Result, lines: list[str]) -> _Outcome:
     """
     Sum up a run that has ended: the first rule of the run page's table that applies.
@@ -1917,10 +2074,11 @@ def _outcome(run: _Run, exit_code: int | None, result: _Result, lines: list[str]
         return _Outcome("The run refused to start", "warn",
                         f"<p>{html.escape(error_line or 'No reason was printed.')}</p>"
                         "<p>Nothing was sent.</p>")
-    # 1: a pair needs a person
+    # 1: a pair or a sale needs a person
     if (any(t["status"] in _ATTENTION_STATUSES for t in trades)
+            or any(s["status"] in _SALE_ATTENTION_STATUSES for s in record.get("sales", []))
             or exit_code == EXIT_TRADES_NEED_ATTENTION):
-        return _Outcome("Trades need your attention", "banner",
+        return _Outcome("Trades or sales need your attention", "banner",
                         "<p>Check these positions in the Kalshi UI. Do not start another "
                         "real-money run — from this page, the dashboard, a terminal or the "
                         "scheduler — until this is understood.</p>"
@@ -1955,6 +2113,14 @@ def _outcome(run: _Run, exit_code: int | None, result: _Result, lines: list[str]
                 "identified.</p>" if exit_code == EXIT_TIME_SERIES_SKIPPED else "")
         # 7: nothing to trade
         if not trades:
+            sales = record.get("sales", [])
+            if any(s["status"] in ("sold", "partly_sold") for s in sales):
+                return _Outcome("Positions sold; no trades to complete", "ok",
+                                message + note)
+            if sales and all(s["status"] == "simulated" for s in sales):
+                return _Outcome("Dry run finished — no orders were sent", "",
+                                "<p>These positions would have been sold:</p>"
+                                + message + note)
             return _Outcome("No trades to complete", "", message + note)
         # 4, 5, 6 (and 8, the same with exit 40's note)
         if executed:
@@ -2050,8 +2216,16 @@ def _run_html(run: _Run) -> str:
     if record.get("portfolio_value_before") is not None:
         # Cash plus open positions, read before trading: what the run sizes on
         # (worded so it also fits a run that stopped at the minimum)
+        # A run that sold sizes on what its sales left, so this is the value before them
         parts.append(f"<p>Portfolio value {_money(record['portfolio_value_before'])} "
-                     f"(cash {_money(record.get('balance_before'))}) — what Kelly sizes on</p>")
+                     f"(cash {_money(record.get('balance_before'))}) — "
+                     + ("before the sales" if record.get("sales")
+                        else "what Kelly sizes on") + "</p>")
+    # The sales come first, as the run made them before it bought anything
+    sales = _sales_html(record.get("sales", []), record.get("cash_after_sales"),
+                        dry_run=run.dry_run)
+    if sales:
+        parts.append(sales)
     trades = _trades_html(record.get("trades", []))
     if trades:
         parts.append(trades)
@@ -2851,7 +3025,7 @@ class _App:
         The one place the server starts a process. It makes the run's folder
         under config.LIVE_RUNS_DIR, writes run.json (what the run is) before
         anything starts, locks output.log and starts
-        `python -m kalshi_betting.main --mode prod` with all eight toggles as
+        `python -m kalshi_betting.main --mode prod` with all ten toggles as
         flags (config.live_settings_argv), --result-file in the folder and,
         for a dry run, --dry-run, from config.PROJECT_ROOT, its output going
         to output.log. The process inherits the lock through its output, so
@@ -2880,7 +3054,7 @@ class _App:
         started = datetime.now(UTC)
         folder = config.LIVE_RUNS_DIR / f"{started.strftime(_FOLDER_TIME)}-{run_id}"
         folder.mkdir(parents=True)
-        # All eight toggles as flags, so the run trades exactly these settings
+        # All ten toggles as flags, so the run trades exactly these settings
         argv = [sys.executable, "-m", "kalshi_betting.main", "--mode", "prod",
                 *live_settings_argv(settings), "--result-file", str(folder / _RESULT_NAME)]
         if dry_run:

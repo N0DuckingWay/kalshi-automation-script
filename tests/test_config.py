@@ -67,14 +67,16 @@ from .conftest import apply_pre_toggle_defaults
 
 
 def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
-              same_title_size_cap=1.0, categories=None, tags=None, add_to_held_pairs=False):
+              same_title_size_cap=1.0, categories=None, tags=None, add_to_held_pairs=False,
+              sell_at=None, sell_min_days=None):
     """A LiveSettings with every toggle named, defaulting to the pre-toggle
-    values conftest's apply_pre_toggle_defaults pins."""
+    values conftest's apply_pre_toggle_defaults pins (and no selling)."""
     return LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
                         interval_discount=interval_discount, size_cap=size_cap,
                         same_title_size_cap=same_title_size_cap,
                         categories=categories, tags=tags,
-                        add_to_held_pairs=add_to_held_pairs)
+                        add_to_held_pairs=add_to_held_pairs,
+                        sell_at=sell_at, sell_min_days=sell_min_days)
 
 
 # An origin as read_saved_live_defaults writes it: any origin but config.py's
@@ -1017,6 +1019,64 @@ class TestLiveSettings:
         assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2).add_to_held_pairs is False
         assert _settings(add_to_held_pairs=True).add_to_held_pairs is True
 
+    # 1e-7 and 1e-6 round to zero steps (within PRICE_EPSILON of 0); 0.855 sits
+    # between two 1% steps
+    @pytest.mark.parametrize("bad", [0, 0.0, -0.05, 1.01, 2, 0.855, 0.001, 1e-7, 1e-6,
+                                     float("nan"), float("inf"), True, False, "0.85", [0.85]])
+    def test_sell_at_off_the_grid_or_out_of_range_is_refused(self, bad):
+        with pytest.raises(ValueError, match="sell_at"):
+            _settings(sell_at=bad)
+        with pytest.raises(ValueError, match="sell_at"):
+            dataclasses.replace(_settings(), sell_at=bad)
+
+    @pytest.mark.parametrize("level", [0.01, 0.29, 0.5, 0.8, 0.85, 0.99, 1.0, 1])
+    def test_sell_at_on_the_grid_is_accepted_as_a_float(self, level):
+        s = _settings(sell_at=level)
+        assert s.sell_at == level and type(s.sell_at) is float
+
+    def test_sell_at_is_normalised_onto_the_grid(self):
+        # 0.01 * 35 is not the float 0.35; every level from any source is
+        # float-equal to its percent over 100, which is how
+        # TAKE_PROFIT_LEVELS spells them
+        for percent in range(1, 101):
+            assert _settings(sell_at=0.01 * percent).sell_at == percent / 100
+            assert _settings(sell_at=percent / 100).sell_at == percent / 100
+        for level in config.TAKE_PROFIT_LEVELS:
+            assert _settings(sell_at=level).sell_at == level
+
+    def test_sell_at_defaults_to_never_selling(self):
+        s = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
+        assert s.sell_at is None and s.sell_min_days is None
+        assert _settings().sell_at is None and _settings().sell_min_days is None
+        # None is a value, and replace takes it back
+        on = _settings(sell_at=0.85, sell_min_days=3)
+        assert dataclasses.replace(on, sell_at=None, sell_min_days=None) == _settings()
+
+    @pytest.mark.parametrize("bad", [0, -1, 1.0, 3.0, 2.5, True, False, "3", [3],
+                                     float("nan"), float("inf")])
+    def test_sell_min_days_must_be_a_whole_number_of_days_one_or_more(self, bad):
+        # A bool is an int in Python and a float such as 1.0 an int in JSON's
+        # eyes: neither may pass for a day count
+        with pytest.raises(ValueError, match="sell_min_days"):
+            _settings(sell_at=0.85, sell_min_days=bad)
+        with pytest.raises(ValueError, match="sell_min_days"):
+            dataclasses.replace(_settings(sell_at=0.85), sell_min_days=bad)
+
+    @pytest.mark.parametrize("days", [1, 2, 7, 14, 21, 365])
+    def test_sell_min_days_is_accepted_with_a_level(self, days):
+        s = _settings(sell_at=0.85, sell_min_days=days)
+        assert s.sell_min_days == days and type(s.sell_min_days) is int
+
+    def test_sell_min_days_without_a_level_is_refused(self):
+        with pytest.raises(ValueError, match="sell_min_days needs a sell level"):
+            _settings(sell_min_days=3)
+        # replace re-validates: taking the level away from a minimum is refused too
+        on = _settings(sell_at=0.85, sell_min_days=3)
+        with pytest.raises(ValueError, match="sell_min_days needs a sell level"):
+            dataclasses.replace(on, sell_at=None)
+        # A level without a minimum is fine
+        assert dataclasses.replace(on, sell_min_days=None).sell_at == 0.85
+
     def test_every_optional_toggle_is_a_field_with_a_default_at_the_end(self):
         # A toggle a saved file may leave out must have a default to read as,
         # and sit after every required toggle, so a positional construction
@@ -1106,9 +1166,12 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "TRADE_CATEGORIES", ("Economics",))
         monkeypatch.setattr(config, "TRADE_TAGS", ["Oil & Gas"])
         monkeypatch.setattr(config, "ADD_TO_HELD_PAIRS", not config.ADD_TO_HELD_PAIRS)
+        monkeypatch.setattr(config, "SELL_AT", 0.85)
+        monkeypatch.setattr(config, "SELL_MIN_DAYS", 3)
         expected = _settings(True, (0.1, 0.6), 0.6, 0.35, 0.25,
                              ("Economics",), ("Oil & Gas",),
-                             add_to_held_pairs=not shipped.add_to_held_pairs)
+                             add_to_held_pairs=not shipped.add_to_held_pairs,
+                             sell_at=0.85, sell_min_days=3)
         assert live_settings() == expected
         assert all(getattr(expected, name) != getattr(shipped, name)
                    for name in config.LIVE_TOGGLE_FIELDS)
@@ -1134,8 +1197,19 @@ class TestLiveSettings:
             categories=config.TRADE_CATEGORIES,
             tags=config.TRADE_TAGS,
             add_to_held_pairs=config.ADD_TO_HELD_PAIRS,
+            sell_at=config.SELL_AT,
+            sell_min_days=config.SELL_MIN_DAYS,
         )
         assert type(s.tier_floors) is bool and type(s.add_to_held_pairs) is bool
+
+    def test_live_settings_refuses_an_invalid_sell_constant(self, monkeypatch):
+        monkeypatch.setattr(config, "SELL_AT", 0.855)
+        with pytest.raises(ValueError, match="sell_at"):
+            live_settings()
+        monkeypatch.setattr(config, "SELL_AT", None)
+        monkeypatch.setattr(config, "SELL_MIN_DAYS", 3)
+        with pytest.raises(ValueError, match="sell_min_days needs a sell level"):
+            live_settings()
 
     @pytest.mark.parametrize("cap", [0, 0.37, 1.01, float("nan"), True, "0.2", None, 1e-7])
     def test_same_title_cap_off_the_grid_or_out_of_range_is_refused(self, cap):
@@ -1183,11 +1257,12 @@ class TestLiveSettings:
         s = LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0)
         assert s.categories is None and s.tags is None
         assert s.add_to_held_pairs is False
+        assert s.sell_at is None and s.sell_min_days is None
         # Defaulted and last of the toggles: the first five fields keep their
-        # positions, so a positional construction of up to seven still builds;
+        # positions, so a positional construction of up to nine still builds;
         # origin, not a toggle, comes after them
-        assert list(config.LIVE_TOGGLE_FIELDS)[-3:] == [
-            "categories", "tags", "add_to_held_pairs"]
+        assert list(config.LIVE_TOGGLE_FIELDS)[-5:] == [
+            "categories", "tags", "add_to_held_pairs", "sell_at", "sell_min_days"]
         assert [f.name for f in dataclasses.fields(LiveSettings)][-1] == "origin"
         assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, ("Sports",),
                             ("Hockey",)).tags == ("Hockey",)
@@ -1475,6 +1550,138 @@ class TestTakeProfitLevelsAndMinDays:
         assert all(type(days) is int for days in config.TAKE_PROFIT_MIN_DAYS)
 
 
+class TestCandleNoAskCeiling:
+    """CANDLE_NO_ASK_CEILING: the highest NO ask a candle can carry, which is
+    no quote. historical clamps to it and refuses it; the backtester's alias
+    is the same object."""
+
+    def test_one_value_everywhere(self):
+        from kalshi_betting import historical
+
+        assert config.CANDLE_NO_ASK_CEILING == 0.99
+        assert historical.CANDLE_NO_ASK_CEILING is config.CANDLE_NO_ASK_CEILING
+        assert backtester._CANDLE_NO_ASK_CEILING is config.CANDLE_NO_ASK_CEILING
+
+
+class TestTakeProfitReached:
+    """take_profit_reached: the sell rule's one test at a check — a position
+    with a potential profit sells once its realized profit reaches sell_at of
+    it, less PRICE_EPSILON of float noise. backtester._sells_at decides with
+    it, so it is the backtest's rule exactly."""
+
+    def test_at_and_around_the_level(self):
+        # 80% of a $10 potential profit is $8
+        assert config.take_profit_reached(0.8, 8.0, 10.0) is True
+        assert config.take_profit_reached(0.8, 9.5, 10.0) is True
+        # Float noise below the level still reaches it ...
+        assert config.take_profit_reached(0.8, 8.0 - PRICE_EPSILON, 10.0) is True
+        assert config.take_profit_reached(0.8, 8.0 - PRICE_EPSILON / 2, 10.0) is True
+        # ... a real shortfall does not
+        assert config.take_profit_reached(0.8, 8.0 - 2 * PRICE_EPSILON, 10.0) is False
+        assert config.take_profit_reached(0.8, 7.99, 10.0) is False
+        # 0.1 + 0.2 is 0.30000000000000004 and 0.3 is a hair below it: both reach 0.3
+        assert config.take_profit_reached(0.3, 0.1 + 0.2, 1.0) is True
+        assert config.take_profit_reached(1.0, 0.3, 0.1 + 0.2) is True
+
+    @pytest.mark.parametrize("potential", [0.0, -0.0, -0.01, -5.0])
+    def test_no_potential_profit_never_sells(self, potential):
+        assert config.take_profit_reached(0.8, 100.0, potential) is False
+        assert config.take_profit_reached(0.01, 0.0, potential) is False
+
+    def test_it_is_the_backtests_test(self):
+        rng = random.Random(1207)
+        for _ in range(2000):
+            level = rng.choice(config.TAKE_PROFIT_LEVELS)
+            potential = rng.uniform(-1.0, 20.0)
+            realized = level * potential + rng.choice([-1, 1]) * rng.choice(
+                [0.0, PRICE_EPSILON / 2, PRICE_EPSILON, 2 * PRICE_EPSILON, rng.uniform(0, 1)])
+            assert (config.take_profit_reached(level, realized, potential)
+                    is backtester._sells_at(level, realized, potential))
+            assert config.take_profit_reached(level, realized, potential) is (
+                potential > 0 and realized >= level * potential - PRICE_EPSILON)
+
+    def test_a_level_reached_is_reached_at_every_lower_level(self):
+        rng = random.Random(1208)
+        levels = config.TAKE_PROFIT_LEVELS
+        for _ in range(500):
+            potential = rng.uniform(0.01, 20.0)
+            realized = rng.uniform(0.7, 1.05) * potential
+            reached = [config.take_profit_reached(level, realized, potential) for level in levels]
+            # True for a prefix of the ascending levels, then False
+            assert reached == sorted(reached, reverse=True)
+
+
+class TestReachedEveryCheck:
+    """reached_every_check: take_profit_reached at every daily check."""
+
+    def test_every_check_must_reach_the_level(self):
+        assert config.reached_every_check(0.8, [(8.0, 10.0), (9.0, 10.0), (8.5, 10.0)]) is True
+        assert config.reached_every_check(0.8, [(8.0, 10.0), (7.0, 10.0), (8.5, 10.0)]) is False
+        # One check with no potential profit holds the sale back
+        assert config.reached_every_check(0.8, [(8.0, 10.0), (1.0, 0.0)]) is False
+
+    @pytest.mark.parametrize("checks", [[], (), iter([])])
+    def test_no_checks_never_sells(self, checks):
+        # A position that was never valued has shown nothing: fail closed,
+        # where all() of nothing would read as a sale
+        assert config.reached_every_check(0.8, checks) is False
+        assert config.reached_every_check(0.01, checks) is False
+
+    def test_any_iterable_of_checks(self):
+        checks = [(8.0, 10.0), (9.0, 10.0)]
+        assert config.reached_every_check(0.8, iter(checks)) is True
+        assert config.reached_every_check(0.8, tuple(checks)) is True
+
+    def test_it_is_the_backtests_rule(self):
+        rng = random.Random(1209)
+        for _ in range(500):
+            level = rng.choice(config.TAKE_PROFIT_LEVELS)
+            checks = [(rng.uniform(-2.0, 10.0), rng.uniform(-1.0, 10.0))
+                      for _ in range(rng.randint(1, 4))]
+            assert (config.reached_every_check(level, checks)
+                    is backtester._reached_every_day(level, checks))
+
+
+class TestDaysToMaturity:
+    """days_to_maturity: whole days from a date to a position's last close
+    date — what the sell rule's minimum of days reads. Unknown when any close
+    date is (a position whose maturity cannot be read is never sold under a
+    minimum)."""
+
+    def test_the_latest_close_date_decides(self):
+        day = date(2026, 1, 12)
+        assert config.days_to_maturity([date(2026, 1, 20), date(2026, 2, 2)], day) == 21
+        assert config.days_to_maturity([date(2026, 2, 2), date(2026, 1, 20)], day) == 21
+        assert config.days_to_maturity([date(2026, 1, 13)], day) == 1
+
+    def test_zero_on_the_closing_date_and_negative_after_it(self):
+        day = date(2026, 1, 12)
+        assert config.days_to_maturity([date(2026, 1, 12), date(2026, 1, 5)], day) == 0
+        assert config.days_to_maturity([date(2026, 1, 10), date(2026, 1, 5)], day) == -2
+
+    @pytest.mark.parametrize("closes", [[], [None], [date(2026, 2, 2), None],
+                                        [None, date(2026, 2, 2)]])
+    def test_unknown_when_any_date_is_or_there_are_none(self, closes):
+        assert config.days_to_maturity(closes, date(2026, 1, 12)) is None
+
+    def test_any_iterable_of_dates(self):
+        closes = (d for d in [date(2026, 1, 20), date(2026, 2, 2)])
+        assert config.days_to_maturity(closes, date(2026, 1, 12)) == 21
+
+    def test_a_datetime_is_refused(self):
+        # Two datetimes differ by whole 24-hour spans: a close at 08:00 three
+        # calendar days after a 16:00 check would read 2 days, not 3. A
+        # datetime is a date by subclass, so it is refused by name
+        close = datetime(2026, 1, 15, 8, 0, tzinfo=UTC)
+        now = datetime(2026, 1, 12, 16, 0, tzinfo=UTC)
+        assert config.days_to_maturity([close.date()], now.date()) == 3
+        for closes, day in (([close], now), ([close], now.date()),
+                            ([close.date()], now), ([date(2026, 2, 2), close], now.date()),
+                            ([None, close], now.date())):
+            with pytest.raises(TypeError, match="calendar dates"):
+                config.days_to_maturity(closes, day)
+
+
 class TestDescribeTimeSeriesRule:
     """describe_time_series_rule says "no spread band" for (0, 1) alone and
     names any band with a floor or a ceiling of its own."""
@@ -1519,7 +1726,7 @@ class TestDescribeLiveSettings:
         assert config.describe_live_settings(s, s) == (
             "tier floors on | spread band none | k 0.75 | per-trade cap 20% | "
             "same-title cap 100% (no extra cap) | categories any | tags any | "
-            "add to held pairs off")
+            "add to held pairs off | sell at off | min days to maturity any")
         assert config.describe_live_settings(s) == config.describe_live_settings(s, s)
 
     def test_the_shipped_values_render_with_no_mark(self):
@@ -1528,7 +1735,10 @@ class TestDescribeLiveSettings:
 
     # One departing value per live toggle (config.LIVE_TOGGLE_FIELDS) and the
     # mark it must carry; a new toggle fails test_every_field_has_a_departure_row
-    # until it has a row
+    # until it has a row. Each departs from _REFERENCE, which sells at 85%: a
+    # minimum of days has no meaning without a level, and the level's own
+    # departure is to selling nothing
+    _REFERENCE = _settings(sell_at=0.85)
     _DEPARTURES = {
         "tier_floors": (False, "tier floors off (config: on)"),
         "spread_band": ((0.1, 1.0), "spread band 0.1-1 (config: none)"),
@@ -1538,6 +1748,8 @@ class TestDescribeLiveSettings:
         "categories": (("Economics",), "categories Economics (config: any)"),
         "tags": (("Oil & Gas", "Energy"), "tags Oil & Gas, Energy (config: any)"),
         "add_to_held_pairs": (True, "add to held pairs on (config: off)"),
+        "sell_at": (None, "sell at off (config: 85% of potential profit)"),
+        "sell_min_days": (3, "min days to maturity 3 (config: any)"),
     }
 
     def test_every_field_has_a_departure_row(self):
@@ -1550,13 +1762,23 @@ class TestDescribeLiveSettings:
             "tier floors off (config: on) | spread band 0-0.5 (config: none) | "
             "k 0.8 (config: 0.75) | per-trade cap 100% (no cap) (config: 20%) | "
             "same-title cap 20% (config: 100% (no extra cap)) | categories any | tags any | "
-            "add to held pairs off")
+            "add to held pairs off | sell at off | min days to maturity any")
         for name in config.LIVE_TOGGLE_FIELDS:
             value, mark = self._DEPARTURES[name]
             line = config.describe_live_settings(
-                dataclasses.replace(ref, **{name: value}), ref)
+                dataclasses.replace(self._REFERENCE, **{name: value}), self._REFERENCE)
             assert line.count("(config:") == 1, line
             assert mark in line, (name, line)
+
+    def test_selling_renders_the_exact_whole_percent(self):
+        # Off, then each level of the 1% grid as its whole percent: 0.29 * 100
+        # is 28.999999999999996, which must never print as anything but 29
+        assert "sell at off |" in config.describe_live_settings(_settings())
+        for percent in range(1, 101):
+            line = config.describe_live_settings(_settings(sell_at=percent / 100))
+            assert f"sell at {percent}% of potential profit |" in line, (percent, line)
+        line = config.describe_live_settings(_settings(sell_at=0.85, sell_min_days=7))
+        assert line.endswith("sell at 85% of potential profit | min days to maturity 7")
 
     def test_k_renders_exactly(self):
         # 0.751 and 0.75 must never print alike: a departure would read as none
@@ -1576,7 +1798,8 @@ class TestDescribeLiveSettings:
         assert "(config:" not in line
         assert line == ("tier floors off | spread band 0-0.5 | k 0.8 | "
                         "per-trade cap 100% (no cap) | same-title cap 20% | "
-                        "categories any | tags any | add to held pairs off")
+                        "categories any | tags any | add to held pairs off | "
+                        "sell at off | min days to maturity any")
 
     def test_a_filter_renders_its_names_and_any_for_none(self):
         # Each field renders the run's value, then config's in the mark; None is "any"
@@ -1616,13 +1839,14 @@ class TestDescribeLiveSettings:
             "tier floors off (default: on) | spread band 0-0.5 (default: none) | "
             "k 0.8 (default: 0.75) | per-trade cap 100% (no cap) (default: 20%) | "
             "same-title cap 20% (default: 100% (no extra cap)) | categories any | tags any | "
-            "add to held pairs off")
+            "add to held pairs off | sell at off | min days to maturity any")
         assert "(config:" not in line
         # Every field's mark follows the reference's origin, one mark per departure
+        saved = dataclasses.replace(self._REFERENCE, origin=_SAVED_ORIGIN)
         for name in config.LIVE_TOGGLE_FIELDS:
             value, mark = self._DEPARTURES[name]
             line = config.describe_live_settings(
-                dataclasses.replace(ref, **{name: value}), ref)
+                dataclasses.replace(saved, **{name: value}), saved)
             assert line.count("(default:") == 1 and "(config:" not in line, line
             assert mark.replace("(config:", "(default:") in line, (name, line)
         # Equal toggles mark nothing, whatever either origin says
@@ -1773,8 +1997,8 @@ class TestShippedLiveToggles:
         assert (config.TIME_SERIES_TIER_FLOORS, config.TIME_SERIES_SPREAD_BAND,
                 config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.BUDGET_FRACTION,
                 config.SAME_TITLE_SIZE_CAP, config.TRADE_CATEGORIES, config.TRADE_TAGS,
-                config.ADD_TO_HELD_PAIRS) == (
-            False, (0.0, 0.5), 0.80, 1.0, 0.20, None, None, True)
+                config.ADD_TO_HELD_PAIRS, config.SELL_AT, config.SELL_MIN_DAYS) == (
+            False, (0.0, 0.5), 0.80, 1.0, 0.20, None, None, True, None, None)
         # ... and the seed proposes adding to held pairs too
         assert config.LIVE_DEFAULTS_SEED.add_to_held_pairs is True
 
@@ -1921,7 +2145,7 @@ class TestPreToggleDefaults:
     _TOGGLES = frozenset({
         "TIME_SERIES_TIER_FLOORS", "TIME_SERIES_SPREAD_BAND",
         "TIME_SERIES_INTERVAL_PROB_DISCOUNT", "BUDGET_FRACTION", "SAME_TITLE_SIZE_CAP",
-        "TRADE_CATEGORIES", "TRADE_TAGS", "ADD_TO_HELD_PAIRS"})
+        "TRADE_CATEGORIES", "TRADE_TAGS", "ADD_TO_HELD_PAIRS", "SELL_AT", "SELL_MIN_DAYS"})
 
     @classmethod
     def _by_value_binders(cls, directory: pathlib.Path) -> list[tuple[str, str, str]]:
@@ -1945,7 +2169,8 @@ class TestPreToggleDefaults:
         apply_pre_toggle_defaults(monkeypatch)
         assert live_settings() == LiveSettings(
             tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
-            same_title_size_cap=1.0, categories=None, tags=None, add_to_held_pairs=False)
+            same_title_size_cap=1.0, categories=None, tags=None, add_to_held_pairs=False,
+            sell_at=None, sell_min_days=None)
         for module, bound, toggle in binders:
             assert getattr(importlib.import_module(f"kalshi_betting.{module}"), bound) == (
                 getattr(config, toggle)), (module, toggle)
@@ -2131,10 +2356,15 @@ class TestLiveSettingsOrigin:
         assert dataclasses.replace(s, size_cap=0.35).origin == _SAVED_ORIGIN
         assert dataclasses.replace(s, categories=("Sports",)).origin == _SAVED_ORIGIN
 
-    def test_the_toggle_fields_are_the_eight(self):
+    def test_the_toggle_fields_are_the_ten(self):
         assert config.LIVE_TOGGLE_FIELDS == (
             "tier_floors", "spread_band", "interval_discount", "size_cap",
-            "same_title_size_cap", "categories", "tags", "add_to_held_pairs")
+            "same_title_size_cap", "categories", "tags", "add_to_held_pairs",
+            "sell_at", "sell_min_days")
+        # The three a saved file may leave out, in field order, at the end
+        assert config._OPTIONAL_TOGGLES == ("add_to_held_pairs", "sell_at", "sell_min_days")
+        assert config._TOGGLE_DEFAULTS == {
+            "add_to_held_pairs": False, "sell_at": None, "sell_min_days": None}
         assert [f.name for f in dataclasses.fields(LiveSettings)] == [
             *config.LIVE_TOGGLE_FIELDS, "origin"]
 
@@ -2162,8 +2392,8 @@ def _valid_record(**changes) -> dict:
     Build a saved-defaults record the reader accepts, then apply changes.
 
     Its toggles are LIVE_DEFAULTS_SEED's, saved at 2026-09-27T21:05:13Z with
-    no source note, with add_to_held_pairs left out (the seven-toggle shape),
-    which reads as _SEED_ADD_ON_OFF.
+    no source note, with add_to_held_pairs, sell_at and sell_min_days left out
+    (the seven-toggle shape), which reads as _SEED_ADD_ON_OFF.
 
     Args:
         **changes: Top-level keys to replace; a value of _DROP removes the key.
@@ -2210,13 +2440,15 @@ def _with_toggles(**changes) -> dict:
 # Marks a key _valid_record / _with_toggles should remove
 _DROP = object()
 
-# LIVE_DEFAULTS_SEED with adding to held pairs off: what _valid_record's
-# seven-toggle file reads as, and what a save of it writes as seven toggles
+# LIVE_DEFAULTS_SEED with adding to held pairs off (and, as ever, no selling):
+# what _valid_record's seven-toggle file reads as, and what a save of it
+# writes as seven toggles
 _SEED_ADD_ON_OFF = dataclasses.replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False)
 
 # The exact bytes a save of _SEED_ADD_ON_OFF writes, with the seed's note, at
-# _FrozenDatetime's instant: add_to_held_pairs is left out, so code that does
-# not know the toggle can read a file saved with it off
+# _FrozenDatetime's instant: add_to_held_pairs, sell_at and sell_min_days are
+# left out, so code that does not know those toggles can read a file saved
+# with them off
 _SEVEN_TOGGLE_BYTES = (
     b'{\n'
     b'  "format": "live-defaults-v1",\n'
@@ -2317,6 +2549,47 @@ class TestSavedLiveDefaults:
             b'    "tags": null,\n    "add_to_held_pairs": true\n')
         assert config.read_saved_live_defaults() == config.LIVE_DEFAULTS_SEED
 
+    def test_selling_off_writes_exactly_the_bytes_written_before_it_existed(self, monkeypatch):
+        # sell_at and sell_min_days at their defaults are not in the file at
+        # all, whether adding to held pairs is off or on
+        monkeypatch.setattr(config, "datetime", _FrozenDatetime)
+        for settings in (_SEED_ADD_ON_OFF, config.LIVE_DEFAULTS_SEED):
+            config.save_live_defaults(settings, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+            text = config.LIVE_DEFAULTS_FILE.read_text()
+            assert "sell_at" not in text and "sell_min_days" not in text
+        assert config.LIVE_DEFAULTS_FILE.read_bytes().endswith(
+            b'    "tags": null,\n    "add_to_held_pairs": true\n  }\n}\n')
+
+    def test_a_selling_save_writes_its_keys_last_in_field_order(self, monkeypatch):
+        monkeypatch.setattr(config, "datetime", _FrozenDatetime)
+        # A level and a minimum, after adding to held pairs
+        both = dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3)
+        config.save_live_defaults(both, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+            b'    "tags": null\n',
+            b'    "tags": null,\n    "add_to_held_pairs": true,\n'
+            b'    "sell_at": 0.85,\n    "sell_min_days": 3\n')
+        assert config.read_saved_live_defaults() == both
+        # A level alone leaves the minimum out; adding off leaves its key out too
+        level = dataclasses.replace(_SEED_ADD_ON_OFF, sell_at=0.5)
+        config.save_live_defaults(level, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+            b'    "tags": null\n', b'    "tags": null,\n    "sell_at": 0.5\n')
+        assert config.read_saved_live_defaults() == level
+        # Every level of the grid round-trips as the same float
+        for percent in range(1, 101):
+            wanted = dataclasses.replace(_SEED_ADD_ON_OFF, sell_at=percent / 100,
+                                         sell_min_days=percent)
+            assert config.save_live_defaults(wanted, source="") == wanted
+            assert config.read_saved_live_defaults().sell_at == percent / 100
+
+    def test_a_save_round_trips_the_sell_settings(self):
+        settings = dataclasses.replace(self._SETTINGS, sell_at=0.9, sell_min_days=14)
+        saved = config.save_live_defaults(settings, source="a note")
+        assert saved == settings
+        assert (saved.sell_at, saved.sell_min_days) == (0.9, 14)
+        assert config.read_saved_live_defaults() == settings
+
     def test_a_seven_toggle_file_reads_with_add_on_off(self):
         # A file that leaves add_to_held_pairs out reads as the same
         # settings, adding to held pairs off (nobody confirmed a value for
@@ -2324,6 +2597,8 @@ class TestSavedLiveDefaults:
         config.LIVE_DEFAULTS_FILE.write_bytes(_SEVEN_TOGGLE_BYTES)
         saved = config.read_saved_live_defaults()
         assert saved == _SEED_ADD_ON_OFF and saved.add_to_held_pairs is False
+        # ... and it reads selling off, the same way
+        assert saved.sell_at is None and saved.sell_min_days is None
         assert config.ADD_TO_HELD_PAIRS is True
         assert config.LIVE_DEFAULTS_SEED.add_to_held_pairs is True
         assert saved.origin == ("live_defaults.json, saved 2026-09-27T21:05:13Z from "
@@ -2335,6 +2610,26 @@ class TestSavedLiveDefaults:
         config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(add_to_held_pairs=value)))
         assert config.read_saved_live_defaults() == dataclasses.replace(
             _SEED_ADD_ON_OFF, add_to_held_pairs=value)
+
+    def test_a_file_that_leaves_selling_out_reads_it_off(self):
+        # Neither key is there (a file saved before they existed), so nobody
+        # confirmed a value: never selling, whatever config.py ships
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(add_to_held_pairs=True)))
+        saved = config.read_saved_live_defaults()
+        assert saved.sell_at is None and saved.sell_min_days is None
+        assert config.SELL_AT is None and config.LIVE_DEFAULTS_SEED.sell_at is None
+
+    @pytest.mark.parametrize("changes, expected", [
+        ({"sell_at": 0.85}, {"sell_at": 0.85}),
+        ({"sell_at": 0.85, "sell_min_days": 3}, {"sell_at": 0.85, "sell_min_days": 3}),
+        ({"sell_at": 1}, {"sell_at": 1.0}),
+        # Written as null by hand, a setting reads as off
+        ({"sell_at": None, "sell_min_days": None}, {}),
+    ])
+    def test_a_file_naming_the_sell_settings_reads_them(self, changes, expected):
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(**changes)))
+        assert config.read_saved_live_defaults() == dataclasses.replace(
+            _SEED_ADD_ON_OFF, **expected)
 
     def test_the_origin_names_the_file_the_time_and_the_source(self, monkeypatch):
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
@@ -2606,6 +2901,22 @@ class TestSavedLiveDefaults:
         ("add to held pairs as 1", _text(_with_toggles(add_to_held_pairs=1))),
         ("add to held pairs as a string", _text(_with_toggles(add_to_held_pairs="true"))),
         ("add to held pairs as null", _text(_with_toggles(add_to_held_pairs=None))),
+        # Selling: a JSON true is a Python bool, and a float is not a day count
+        ("a sell level of true", _text(_with_toggles(sell_at=True))),
+        ("a sell level of false", _text(_with_toggles(sell_at=False))),
+        ("a sell level of zero", _text(_with_toggles(sell_at=0))),
+        ("a sell level above 100%", _text(_with_toggles(sell_at=1.01))),
+        ("a sell level between two percents", _text(_with_toggles(sell_at=0.855))),
+        ("a sell level as a string", _text(_with_toggles(sell_at="0.85"))),
+        ("a sell level that is NaN", _text(_with_toggles(sell_at=float("nan")))),
+        ("a sell minimum of true", _text(_with_toggles(sell_at=0.85, sell_min_days=True))),
+        ("a sell minimum of false", _text(_with_toggles(sell_at=0.85, sell_min_days=False))),
+        ("a sell minimum as a float", _text(_with_toggles(sell_at=0.85, sell_min_days=1.0))),
+        ("a sell minimum of zero", _text(_with_toggles(sell_at=0.85, sell_min_days=0))),
+        ("a sell minimum as a string", _text(_with_toggles(sell_at=0.85, sell_min_days="3"))),
+        ("a sell minimum with no level", _text(_with_toggles(sell_min_days=3))),
+        ("a sell minimum with a null level",
+         _text(_with_toggles(sell_at=None, sell_min_days=3))),
         # Category and tag names
         ("the name any", _text(_with_toggles(categories=["any"]))),
         ("an empty name", _text(_with_toggles(tags=[""]))),
@@ -2640,7 +2951,15 @@ class TestSavedLiveDefaults:
              '"spread_band" must be [floor, ceiling]'),
             (_text(_with_toggles(add_to_held_pairs=1)), "add_to_held_pairs must be True or False"),
             (_text(_with_toggles(tags=_DROP)),
-             "(add_to_held_pairs may be left out, and then reads as off)"),
+             "(add_to_held_pairs, sell_at, sell_min_days may be left out, and then each "
+             "reads as off)"),
+            (_text(_with_toggles(sell_at=True)), '"sell_at" must be a number or null'),
+            (_text(_with_toggles(sell_at=0.85, sell_min_days=False)),
+             '"sell_min_days" must be a number or null'),
+            (_text(_with_toggles(sell_at=0.85, sell_min_days=1.0)),
+             "sell_min_days must be a whole number of days"),
+            (_text(_with_toggles(sell_min_days=3)), "sell_min_days needs a sell level"),
+            (_text(_with_toggles(sell_at=0.855)), "sell_at must be a multiple of 1%"),
         ]:
             path.write_bytes(data)
             with pytest.raises(config.LiveDefaultsError, match=re.escape(words)):
@@ -2848,10 +3167,12 @@ class TestLiveSettingsChanges:
             ("categories", "Sports", "any", True),
             ("tags", "Basketball", "any", True),
             ("add to held pairs", "off", "off", False),
+            ("sell at", "off", "off", False),
+            ("min days to maturity", "any", "any", False),
         ]
 
     def test_changed_flags_exactly_the_fields_that_differ(self):
-        ref = _settings()
+        ref = TestDescribeLiveSettings._REFERENCE
         for name in config.LIVE_TOGGLE_FIELDS:
             value, _ = TestDescribeLiveSettings._DEPARTURES[name]
             rows = config.live_settings_changes(ref, dataclasses.replace(ref, **{name: value}))
@@ -2867,10 +3188,22 @@ class TestLiveSettingsChanges:
 
     def test_no_current_defaults_changes_every_row(self):
         rows = config.live_settings_changes(None, config.LIVE_DEFAULTS_SEED)
-        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 8
+        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 10
         assert all(old == "—" and changed for _, old, _, changed in rows)
         assert [new for _, _, new, _ in rows] == [
-            "off", "0-0.5", "0.8", "10%", "20%", "any", "any", "on"]
+            "off", "0-0.5", "0.8", "10%", "20%", "any", "any", "on", "off", "any"]
+
+    def test_turning_selling_on_shows_as_the_two_sell_rows(self):
+        on = dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3)
+        rows = config.live_settings_changes(config.LIVE_DEFAULTS_SEED, on)
+        assert [row for row in rows if row[3]] == [
+            ("sell at", "off", "85% of potential profit", True),
+            ("min days to maturity", "any", "3", True)]
+        # ... and back off again
+        rows = config.live_settings_changes(on, config.LIVE_DEFAULTS_SEED)
+        assert [row for row in rows if row[3]] == [
+            ("sell at", "85% of potential profit", "off", True),
+            ("min days to maturity", "3", "any", True)]
 
     def test_a_seven_toggle_file_shows_turning_add_on_on_as_a_change(self):
         # A file that leaves the toggle out reads it as off; the seed proposes on

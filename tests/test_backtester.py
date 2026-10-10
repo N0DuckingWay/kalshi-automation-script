@@ -14874,16 +14874,19 @@ class TestLiveRuleLine:
 
     @staticmethod
     def _live(monkeypatch, tier_floors, band, categories=None, tags=None, *,
-              add_to_held=False):
+              add_to_held=False, sell_at=None, sell_min_days=None):
         """Save config.py's toggles with this rule and filter as the live
-        defaults. Adding to held pairs is saved off unless asked for, so a
-        line's note about it appears only in the tests that name it."""
+        defaults. Adding to held pairs and selling are saved off unless asked
+        for, so a line's note about either appears only in the tests that
+        name it."""
         from kalshi_betting import config
         monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", tier_floors)
         monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", band)
         monkeypatch.setattr(config, "TRADE_CATEGORIES", categories)
         monkeypatch.setattr(config, "TRADE_TAGS", tags)
         monkeypatch.setattr(config, "ADD_TO_HELD_PAIRS", add_to_held)
+        monkeypatch.setattr(config, "SELL_AT", sell_at)
+        monkeypatch.setattr(config, "SELL_MIN_DAYS", sell_min_days)
         save_config_live_defaults()
         return config.describe_time_series_rule(tier_floors, band)
 
@@ -14925,10 +14928,11 @@ class TestLiveRuleLine:
         assert messages[-1].startswith(self._PREFIX)
         assert any(m.startswith("Size-cap sweep:") for m in messages[:-1])
 
-    # The nine fields a saved-defaults read records, all or none
+    # The eleven fields a saved-defaults read records, all or none
     _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_categories", "live_tags",
                     "live_origin", "live_interval_discount", "live_size_cap",
-                    "live_same_title_size_cap", "live_add_to_held_pairs")
+                    "live_same_title_size_cap", "live_add_to_held_pairs", "live_sell_at",
+                    "live_sell_min_days")
 
     @pytest.mark.parametrize("feasible", [False, True])
     def test_a_refused_file_records_none_and_warns_once(self, monkeypatch, caplog, feasible):
@@ -14965,10 +14969,11 @@ class TestLiveRuleLine:
             "when this run started, and live runs refuse to start without them")
         assert bool(res.calibrations_by_band) is feasible
 
-    def test_the_nine_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
+    def test_the_eleven_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
         from kalshi_betting import config
         saved = config.save_live_defaults(
-            config.LiveSettings(False, (0.1, 0.8), 0.6, 0.35, 0.25, ("Economics",), ("Fed",)),
+            config.LiveSettings(False, (0.1, 0.8), 0.6, 0.35, 0.25, ("Economics",), ("Fed",),
+                                sell_at=0.85, sell_min_days=3),
             source="a note")
         reads: list = []
         real = config.read_saved_live_defaults
@@ -14992,9 +14997,9 @@ class TestLiveRuleLine:
             "live_categories": ("Economics",), "live_tags": ("Fed",),
             "live_origin": saved.origin, "live_interval_discount": 0.6,
             "live_size_cap": 0.35, "live_same_title_size_cap": 0.25,
-            "live_add_to_held_pairs": False}
+            "live_add_to_held_pairs": False, "live_sell_at": 0.85, "live_sell_min_days": 3}
 
-    def test_the_live_rule_fields_are_nine_keys_or_none(self):
+    def test_the_live_rule_fields_are_eleven_keys_or_none(self):
         from kalshi_betting import config
         assert backtester._live_rule_fields(None) == {}
         fields = backtester._live_rule_fields(config.LIVE_DEFAULTS_SEED)
@@ -15006,6 +15011,14 @@ class TestLiveRuleLine:
         off = backtester._live_rule_fields(dc_replace(config.LIVE_DEFAULTS_SEED,
                                                       add_to_held_pairs=False))
         assert off["live_add_to_held_pairs"] is False
+        # The seed sells nothing; defaults that do record the level and the minimum
+        assert fields["live_sell_at"] is None and fields["live_sell_min_days"] is None
+        selling = backtester._live_rule_fields(dc_replace(
+            config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3))
+        assert (selling["live_sell_at"], selling["live_sell_min_days"]) == (0.85, 3)
+        level_only = backtester._live_rule_fields(dc_replace(
+            config.LIVE_DEFAULTS_SEED, sell_at=0.85))
+        assert (level_only["live_sell_at"], level_only["live_sell_min_days"]) == (0.85, None)
 
     def test_a_direct_sweep_from_candidates_reads_the_toggles_itself(self, monkeypatch):
         # Handed nothing, _sweep_from_candidates takes one read of its own
@@ -15260,6 +15273,84 @@ class TestLiveRuleLine:
         for recorded, note in ((None, ""), (False, ""), (True, self._ADD_ON_NOTE)):
             changed = dc_replace(sweep, live_add_to_held_pairs=recorded)
             assert backtester._live_add_on_note(changed) == note, recorded
+
+    # ── Selling ─────────────────────────────────────────────────────────────
+
+    _SELL_NOTE = ("; the live defaults sell at 85% of potential profit (at least 3 days "
+                  "before maturity), which this run's primary does not")
+
+    def test_the_sell_note_is_named_when_the_saved_defaults_sell(self, monkeypatch, caplog):
+        rule = self._live(monkeypatch, True, (0.0, 1.0), sell_at=0.85, sell_min_days=3)
+        res = self._infeasible(monkeypatch, caplog)
+        assert (res.live_sell_at, res.live_sell_min_days) == (0.85, 3)
+        assert self._line(caplog) == (
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary "
+            f"scenario applies it{self._SELL_NOTE}")
+        # ... on the line that says the rule was not simulated too
+        rule = self._live(monkeypatch, True, (0.35, 0.5), sell_at=0.85, sell_min_days=3)
+        self._feasible(monkeypatch, caplog, band_sweep=False)
+        assert self._line(caplog) == (
+            f"Live time-series rule (saved live defaults): {rule} — not simulated by this "
+            f"run{self._SELL_NOTE}")
+
+    def test_the_sell_note_words_the_minimum_of_days(self, monkeypatch, caplog):
+        # No minimum: the level alone; one day in the singular; a level is
+        # named in the exact percent the dashboard's Sell options use
+        for level, days, words in (
+                (0.85, None, "85% of potential profit"),
+                (0.85, 1, "85% of potential profit (at least 1 day before maturity)"),
+                (0.81, 14, "81% of potential profit (at least 14 days before maturity)"),
+                (1.0, 7, "100% of potential profit (at least 7 days before maturity)")):
+            self._live(monkeypatch, True, (0.0, 1.0), sell_at=level, sell_min_days=days)
+            self._infeasible(monkeypatch, caplog)
+            assert self._line(caplog).endswith(
+                f"; the live defaults sell at {words}, which this run's primary does not")
+
+    def test_no_sell_note_when_the_saved_defaults_do_not_sell(self, monkeypatch, caplog):
+        self._live(monkeypatch, True, (0.0, 1.0))
+        res = self._infeasible(monkeypatch, caplog)
+        assert (res.live_sell_at, res.live_sell_min_days) == (None, None)
+        assert "sell" not in self._line(caplog)
+
+    def test_the_sell_note_comes_after_the_add_on_note(self, monkeypatch, caplog):
+        # After the ladder departure's clause, the sizing clause and the add-on clause
+        rule = self._live(monkeypatch, True, (0.0, 1.0), add_to_held=True, sell_at=0.85,
+                          sell_min_days=3)
+        configured = backtester.TIME_SERIES_SAME_EVENT_LADDERS
+        res = self._infeasible(monkeypatch, caplog, same_event_ladders=not configured)
+        assert self._line(caplog) == (
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary "
+            f"scenario applies it; this run's same-event ladders are "
+            f"{'off' if configured else 'on'} and config.py's {'on' if configured else 'off'}, "
+            f"so its pairs are not the live bot's{self._ADD_ON_NOTE}{self._SELL_NOTE}")
+        assert (res.live_add_to_held_pairs, res.live_sell_at) == (True, 0.85)
+
+    def test_the_sell_note_needs_a_recorded_level(self):
+        point = backtester._simulate_at_discount([], date(2026, 1, 5), 1000.0)
+        sweep = backtester.BacktestSweep(primary=point, points=[point], calibration=None)
+        assert (sweep.live_sell_at, sweep.live_sell_min_days) == (None, None)
+        assert backtester._live_sell_note(sweep) == ""
+        # A minimum alone is no sale (LiveSettings refuses one without a level)
+        assert backtester._live_sell_note(dc_replace(sweep, live_sell_min_days=3)) == ""
+        assert backtester._live_sell_note(dc_replace(
+            sweep, live_sell_at=0.85, live_sell_min_days=3)) == self._SELL_NOTE
+
+    def test_the_infeasible_window_records_the_saved_sell_setting(self, monkeypatch, caplog):
+        from kalshi_betting import config
+        self._live(monkeypatch, True, (0.0, 1.0), sell_at=0.9, sell_min_days=5)
+        res = self._infeasible(monkeypatch, caplog)
+        assert (res.live_sell_at, res.live_sell_min_days) == (0.9, 5)
+        # A later save without selling is recorded as such
+        config.save_live_defaults(dc_replace(config.LIVE_DEFAULTS_SEED, sell_at=None,
+                                             sell_min_days=None), source="")
+        res = self._infeasible(monkeypatch, caplog)
+        assert (res.live_sell_at, res.live_sell_min_days) == (None, None)
+
+    def test_a_feasible_run_records_the_saved_sell_setting(self, monkeypatch, caplog):
+        self._live(monkeypatch, True, (0.0, 1.0), sell_at=0.85, sell_min_days=3)
+        res = self._feasible(monkeypatch, caplog)
+        assert (res.live_sell_at, res.live_sell_min_days) == (0.85, 3)
+        assert self._line(caplog).endswith(self._SELL_NOTE)
 
     # ── The category/tag filter ─────────────────────────────────────────────
 
@@ -17376,6 +17467,96 @@ class TestLegQuotesBids:
                                     date(2026, 1, 5), [0.3, 0.3], [0.7, 0.7], 1.0, 0.0)
         assert math.isnan(bare.bid_at_checkpoint(date(2026, 1, 12), "yes", 1))
         assert not bare.paid_at_checkpoint(date(2026, 1, 12), 1)
+
+
+class TestTheSellRuleIsShared:
+    """The sell rule's pieces live where live code may import them, and the
+    backtest reads them there: its daily-check bids are exactly
+    historical.bid_before's (one day's window), its candle bids
+    historical.candle_sale_bids', its ladder walk scanner.walk_bids', its
+    test config.take_profit_reached and its days to maturity
+    config.days_to_maturity. So a live sale can apply the backtest's rule
+    with no arithmetic of its own."""
+
+    # Paid out long after every check below, so no check reads a payout
+    _MARKET = {"ticker": "Q", "settlement_ts": "2026-07-01T00:00:00Z", "result": "yes"}
+    _START = date(2025, 12, 1)
+    _ASKS = (0.30, 0.43, 0.57, 0.72, 0.99, 1.00, 0.0001, 0.9999, 0.98, 0.01, "x", None,
+             float("nan"))
+
+    @staticmethod
+    def _same(got: float, want: float) -> bool:
+        """Equal floats, NaN equal to NaN."""
+        return (math.isnan(got) and math.isnan(want)) or got == want
+
+    def _series(self, rng: random.Random) -> list[dict]:
+        """Hourly candles with random gaps over six weeks (one series in two
+        spans a clock change), with candles placed on the daily checks'
+        boundaries — a day old, a second younger, at the check itself — and
+        now and then a repeated hour or two neighbours out of order."""
+        first = rng.choice([date(2026, 1, 1), date(2026, 2, 23)])
+        t0 = int(datetime(first.year, first.month, first.day, tzinfo=UTC).timestamp())
+        stamps = {t0 + hour * 3600 for hour in range(6 * 7 * 24)
+                  if rng.random() < 0.3}
+        mondays = [first + timedelta(days=(7 - first.weekday()) % 7 + 7 * w) for w in range(6)]
+        for day in rng.sample(mondays, 3):
+            for back in range(0, backtester._HOLD_DAYS_MAX):
+                moment = _ck(day) - back * 86_400
+                stamps.add(moment - rng.choice([86_400, 86_399, 3_601, 3_600, 1, 0]))
+        candles = [_candle(ts, rng.choice(self._ASKS), rng.choice(self._ASKS))
+                   for ts in sorted(stamps)]
+        for _ in range(rng.randint(0, 3)):
+            i = rng.randrange(len(candles))
+            if rng.random() < 0.5:
+                # Two candles for one hour: the later one in the list is read
+                candles.insert(i + 1, _candle(candles[i]["ts"], rng.choice(self._ASKS),
+                                              rng.choice(self._ASKS)))
+            elif i + 1 < len(candles):
+                candles[i], candles[i + 1] = candles[i + 1], candles[i]
+        return candles
+
+    def test_bid_before_is_the_backtests_daily_check_bid(self):
+        rng = random.Random(9001)
+        period = backtester.CANDLESTICK_PERIOD_INTERVAL_MINUTES * 60
+        compared = bids = 0
+        for _ in range(40):
+            candles = self._series(rng)
+            quotes, _stale = backtester._leg_quotes(self._MARKET, candles, self._START)
+            last = datetime.fromtimestamp(max(c["ts"] for c in candles), UTC).date()
+            day = quotes.first_checkpoint
+            while day <= last + timedelta(days=8):
+                for side in ("yes", "no"):
+                    # Each daily check before the checkpoint: a day's window
+                    for back in range(1, backtester._HOLD_DAYS_MAX):
+                        want = quotes.bid_at_checkpoint(day, side, back)
+                        got = historical.bid_before(candles, _ck(day) - back * 86_400, side,
+                                                    window=86_400)
+                        assert self._same(got, want), (day, side, back, got, want)
+                        compared += 1
+                        bids += want == want
+                    # The checkpoint itself: a candle at most one period old
+                    want = quotes.bid_at_checkpoint(day, side)
+                    got = historical.bid_before(candles, _ck(day), side, window=period + 1)
+                    assert self._same(got, want), (day, side, 0, got, want)
+                day += timedelta(days=7)
+        # Bids and no-bids both occur, so the comparison is not vacuous
+        assert compared > 2000 and 500 < bids < compared
+
+    def test_the_wrappers_read_the_shared_definitions(self):
+        rng = random.Random(9002)
+        for _ in range(300):
+            ladder = [[price, round(rng.uniform(0.01, 50.0), rng.choice([0, 2, 6]))]
+                      for price in sorted({rng.randint(1, 9999) / 10_000 for _ in range(4)},
+                                          reverse=True)]
+            contracts = rng.uniform(0.5, 120.0)
+            walked = scanner.walk_bids(ladder, contracts)
+            assert backtester._ladder_average(ladder, contracts) == (
+                None if walked is None else walked[0])
+        for raw in self._ASKS:
+            for side in ("yes", "no"):
+                assert self._same(backtester._usable_ask(raw, side),
+                                  historical.usable_candle_ask(raw, side))
+        assert backtester._CANDLE_NO_ASK_CEILING == historical.CANDLE_NO_ASK_CEILING
 
 
 class TestSellAtShareOfPotentialProfit:

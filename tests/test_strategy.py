@@ -1424,10 +1424,12 @@ def _add_on_unblocking_problems(source: str) -> list[str]:
     A held market is kept out of both finders only by blocked_tickers (the
     same-title finder has no ladder refusal of its own), so the markets the
     run lets back in must be exactly those of the add_on_pairs it hands the
-    finders, as that dict stands after its last change (the drop of pairs
-    already at their size cap). A set built from held_pairs' own result, or
-    before the drop, lets a full pair's markets back in with nothing to
-    protect them: an ordinary pair could then buy more of a held market.
+    finders, as that dict stands after its last change (the drops of pairs
+    already at their size cap and of pairs sold this run). A set built from
+    held_pairs' own result, or before the drops, lets a full pair's markets
+    back in with nothing to protect them: an ordinary pair could then buy
+    more of a held market. Every market sold this run (sold_tickers) stays
+    blocked too, since a live run may no longer hold it.
 
     Args:
         source (str): Source text holding a def _run_prod (main.py's own, or
@@ -1462,8 +1464,9 @@ def _add_on_unblocking_problems(source: str) -> list[str]:
     if any(line > tickers_line for line, _ in assigned.get("add_on_pairs", [])):
         problems.append("add_on_pairs changes after add_on_tickers is built")
     blocked = assigned.get("blocked_tickers", [])
-    if [ast.unparse(value) for _, value in blocked] != ["held_tickers - add_on_tickers"]:
-        problems.append("blocked_tickers is not held_tickers - add_on_tickers")
+    if [ast.unparse(value) for _, value in blocked] != [
+            "held_tickers - add_on_tickers | sold_tickers"]:
+        problems.append("blocked_tickers is not (held_tickers - add_on_tickers) | sold_tickers")
     # Both finders take the blocked set as their held-markets argument, and
     # the market list they read is filtered by it
     for finder in ("find_time_series_pairs", "find_same_title_pairs"):
@@ -2779,6 +2782,8 @@ class TestTimeSeriesKellyParity:
             "TRADE_CATEGORIES",
             "TRADE_TAGS",
             "ADD_TO_HELD_PAIRS",
+            "SELL_AT",
+            "SELL_MIN_DAYS",
         } | self._SAVED_FILE_INTERNALS
         resolver = "live_settings"
         # (module, exempted name) -> references found, so no exemption outlives its use
@@ -3680,6 +3685,48 @@ class TestTimeSeriesKellyParity:
         for func in ("_far_enough", "_sale_reach"):
             assert _function_calls(backtester, func, "_days_left"), func
 
+    def test_ast_the_backtest_reads_the_sell_rule_where_live_code_can(self):
+        # The sell rule's arithmetic lives in config, scanner and historical,
+        # which a live module may import (none may import the backtester).
+        # The backtester's own names for it are thin wrappers that call the
+        # shared definitions, so a live sale and a backtest sale can never
+        # apply different arithmetic
+        from kalshi_betting import historical
+
+        wrappers = {"_sells_at": ("take_profit_reached", 1),
+                    "_ladder_average": ("walk_bids", 2),
+                    "_days_left": ("days_to_maturity", 1),
+                    "_usable_ask": ("usable_candle_ask", 1)}
+        source = inspect.getsource(backtester)
+        for name, (shared, statements) in wrappers.items():
+            assert _function_calls(backtester, name, shared), name
+            body = _def_named(source, name).body
+            # The docstring, then the call and nothing else
+            assert isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+            assert len(body) - 1 == statements, name
+        # The candle bid rule: _leg_quotes records each sale bid through
+        # candle_sale_bids, and the backtester works out no bid as
+        # round(1.0 - an ask, ...) of its own
+        assert _function_calls(backtester, "_leg_quotes", "candle_sale_bids")
+
+        def own_bids(module) -> list[str]:
+            """Every round(1 - x, ...) call in a module's source."""
+            return [ast.unparse(n) for n in ast.walk(ast.parse(inspect.getsource(module)))
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id == "round" and n.args
+                    and isinstance(n.args[0], ast.BinOp) and isinstance(n.args[0].op, ast.Sub)
+                    and isinstance(n.args[0].left, ast.Constant) and n.args[0].left.value == 1]
+
+        assert own_bids(backtester) == []
+        # Non-vacuous: the shared rule is found where it lives
+        assert len(own_bids(historical)) == 2
+        assert _function_calls(historical, "candle_sale_bids", "usable_candle_ask")
+        assert _function_calls(historical, "bid_before", "candle_sale_bids")
+        # The NO ask's ceiling has one value, config's, which historical and
+        # the backtester both import
+        assert backtester._CANDLE_NO_ASK_CEILING is config.CANDLE_NO_ASK_CEILING
+        assert historical.CANDLE_NO_ASK_CEILING is config.CANDLE_NO_ASK_CEILING
+
     def test_ast_the_price_paid_and_the_book_each_have_one_reader(self):
         # What a backtest trade paid (fill_price_a/_b) is read only through
         # _paid_prices, and every valuation that falls back on the price paid
@@ -3950,8 +3997,12 @@ class TestTimeSeriesKellyParity:
                 "add_on_pairs.items() if key}"),
             # Every held market let back in
             "all held": source.replace(
-                "blocked_tickers   = held_tickers - add_on_tickers",
-                "blocked_tickers   = held_tickers - held_tickers"),
+                "blocked_tickers   = (held_tickers - add_on_tickers) | sold_tickers",
+                "blocked_tickers   = (held_tickers - held_tickers) | sold_tickers"),
+            # The markets sold this run let back in
+            "sold let in": source.replace(
+                "blocked_tickers   = (held_tickers - add_on_tickers) | sold_tickers",
+                "blocked_tickers   = held_tickers - add_on_tickers"),
             # One finder handed the full held set instead of the blocked one
             "finder held set": source.replace(
                 "find_same_title_pairs(markets, blocked_tickers,",
@@ -3960,6 +4011,46 @@ class TestTimeSeriesKellyParity:
         for name, mutant in mutants.items():
             assert mutant != source, name
             assert _add_on_unblocking_problems(mutant), name
+
+    def test_ast_the_live_run_sells_before_it_buys(self):
+        # main._run_prod plans and sends its sales before either finder runs
+        # and before it looks for held pairs to add to, as the backtest sells
+        # before it buys; a dry run sends no sale order; the markets it sold
+        # stay blocked from both finders
+        [plan] = _call_nodes(main, "_run_prod", "plan_sales")
+        [sell] = _call_nodes(main, "_run_prod", "sell_positions")
+        [settings_value] = [k.value for k in plan.keywords if k.arg == "settings"]
+        assert ast.unparse(settings_value) == "settings"
+        [dry_run_value] = [k.value for k in sell.keywords if k.arg == "dry_run"]
+        assert ast.unparse(dry_run_value) == "args.dry_run"
+        assert plan.lineno < sell.lineno
+        later = (_call_nodes(main, "_run_prod", "find_time_series_pairs")
+                 + _call_nodes(main, "_run_prod", "find_same_title_pairs")
+                 + _call_nodes(main, "_run_prod", "held_pairs")
+                 + _call_nodes(main, "_run_prod", "execute_trades"))
+        assert len(later) == 4
+        assert all(sell.lineno < call.lineno for call in later)
+        # A live run's positions are read again after the sales through the
+        # one positions reader, then the balance (the cash the buys spend and
+        # Kalshi's value of what is left), then that value is checked through
+        # the one value check, all before held pairs are looked for
+        [after] = _call_nodes(main, "_run_prod", "_positions_after_sales")
+        [value] = _call_nodes(main, "_run_prod", "_value_after_sales")
+        [pairs] = _call_nodes(main, "_run_prod", "held_pairs")
+        assert sell.lineno < after.lineno < value.lineno < pairs.lineno
+        assert _function_calls(main, "_positions_after_sales", "get_held_positions")
+        assert _function_calls(main, "_value_after_sales", "_checked_positions_value")
+        balances = _call_nodes(main, "_run_prod", "read_account_balance")
+        assert any(after.lineno < call.lineno < value.lineno for call in balances)
+        # The markets sold are blocked
+        tree = ast.parse(inspect.getsource(main))
+        [func] = [n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_run_prod"]
+        [blocked] = [n for n in ast.walk(func) if isinstance(n, ast.Assign)
+                     and any(isinstance(t, ast.Name) and t.id == "blocked_tickers"
+                             for t in n.targets)]
+        assert "sold_tickers" in {n.id for n in ast.walk(blocked.value)
+                                  if isinstance(n, ast.Name)}
 
     def test_ast_the_backtest_reads_ladders_through_the_one_definition(self):
         # The backtest's one-open-trade-per-ladder rule labels each market

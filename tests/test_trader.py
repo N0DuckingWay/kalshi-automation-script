@@ -18,10 +18,14 @@ TestV2IsTheOnlyOrderPath checks, on the syntax tree, that nothing reaches the
 SDK's create-order methods, that only config.py reads ORDER_API_VERSION, and
 that no code string starts with the retired /portfolio/orders path.
 
-The write pacer (trader._WritePacer) is covered from `class _FakeClock` to
-the end. Single-thread tests use _FakeClock; multi-thread tests use _SimTime,
+The write pacer (trader._WritePacer) is covered from `class _FakeClock` on.
+Single-thread tests use _FakeClock; multi-thread tests use _SimTime,
 simulated time that only moves once every thread is blocked, so their times
 are exact on any machine.
+
+The sale of held positions (sell_positions: its prices, order bodies and
+outcomes) is covered from `_SALE_GRIDS` to the end, against _SaleExchange, a
+stand-in order endpoint and positions ledger.
 """
 import ast
 import copy
@@ -36,7 +40,8 @@ import textwrap
 import threading
 import time
 import uuid
-from decimal import Decimal
+from datetime import UTC, datetime
+from decimal import ROUND_FLOOR, Decimal
 from json import JSONDecodeError
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,16 +50,23 @@ from unittest.mock import MagicMock, patch
 import pytest
 from kalshi_python_sync.exceptions import ApiException
 
-from kalshi_betting import _http, config, trader
+from kalshi_betting import _http, config, seller, trader
 from kalshi_betting.config import (
     BUY_SLIPPAGE_TICKS,
     DEFAULT_EXCHANGE_INDEX,
     ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT,
+    SALE_HEDGE_SLIPPAGE_TICKS,
     TRANSFER_PATH,
     V2_ORDER_PATH,
 )
-from kalshi_betting.reporter import TradeResult
-from kalshi_betting.scanner import HeldPair, PriceRange
+from kalshi_betting.reporter import SaleResult, TradeResult
+from kalshi_betting.scanner import (
+    ApiMarket,
+    HeldPair,
+    PriceRange,
+    tick_size_for_price,
+    walk_bids,
+)
 from kalshi_betting.trader import (
     _await_transfer_settlement,
     _build_no_order_v2,
@@ -1349,7 +1361,7 @@ class TestEnsureShardCollateral:
     def test_transfer_path_bypasses_the_retry_wrapper_entirely(self):
         # Checked per function: order and transfer POSTs never go through the
         # retry wrapper, while the read-only position lookup does
-        for fn in (trader._submit_order_v2, trader._execute_transfer):
+        for fn in (trader._submit_order_v2, trader._submit_sale_v2, trader._execute_transfer):
             assert not _calls_retry_wrapper(fn), (
                 f"{fn.__name__} must not be wrapped in retry/backoff — "
                 "a retried submission can double-fill and a retried transfer "
@@ -1360,8 +1372,11 @@ class TestEnsureShardCollateral:
         assert _calls_retry_wrapper(trader._position_count)
 
     def test_order_submission_call_sites_bypass_the_retry_wrapper(self):
-        # Neither caller of _submit_order_v2 retries it
-        for fn in (trader._execute_one, trader._rollback_no_leg):
+        # Neither caller of _submit_order_v2 retries it, and nothing on the
+        # sale path retries _submit_sale_v2
+        for fn in (trader._execute_one, trader._rollback_no_leg, trader._sell_leg,
+                   trader._sell_lone, trader._sell_pair, trader._sell_one,
+                   trader.sell_positions):
             assert not _calls_retry_wrapper(fn), (
                 f"{fn.__name__} must not wrap an order submission in "
                 "retry/backoff — a retried order POST can fill twice"
@@ -1607,11 +1622,14 @@ class TestV2OrderBuilders:
 
     @staticmethod
     def _all_v2_bodies(spec) -> list[dict]:
-        """The three V2 bodies _execute_one can send for one spec."""
+        """Every V2 body the trader can send on one spec's markets: the three
+        _execute_one sends, and a sale of a held YES and of a held NO."""
         return [
             _build_no_order_v2(_no_leg(spec)),
             _build_yes_order_v2(_yes_leg(spec)),
             _build_rollback_order_v2(_no_leg(spec)),
+            trader._build_sale_order_v2(spec.pair.market_a, "yes", 5, Decimal("0.45")),
+            trader._build_sale_order_v2(spec.pair.market_b, "no", 5, Decimal("0.55")),
         ]
 
     def test_every_v2_body_carries_the_documented_required_fields(self):
@@ -6229,3 +6247,1041 @@ class TestFailedRequestsAreLoggedOnOneLine:
                     and parent.func.id in allowed
                     and parent.args[:1] == [node]
                 ), f"line {node.lineno}: {handler.name} used as {ast.unparse(parent)}"
+
+
+# ─── Selling held positions (sell_positions) ──────────────────────────────────
+
+# Tick grids for the sale price tests: (name, price_level_structure, bands).
+# "asymmetric" has a fine band at the bottom only, so a NO price and its
+# YES-book price (1 minus it) sit on different steps.
+_SALE_GRIDS = [
+    ("cent", "linear_cent", None),
+    ("deci-cent", "deci_cent", DECI_CENT_BANDS),
+    ("centi-cent edges", "center_deci_edge_centi_cent", CENTER_DECI_EDGE_CENTI_BANDS),
+    ("tapered", "tapered_deci_cent", [
+        PriceRange(start=0.0, end=0.05, step=0.001),
+        PriceRange(start=0.05, end=0.95, step=0.01),
+        PriceRange(start=0.95, end=1.0, step=0.001),
+    ]),
+    ("asymmetric", "tapered_deci_cent", [
+        PriceRange(start=0.0, end=0.1, step=0.001),
+        PriceRange(start=0.1, end=1.0, step=0.01),
+    ]),
+]
+
+
+def _grid_levels(bands) -> list[Decimal]:
+    """Every tradeable level of a grid, lowest first: each band's multiples of
+    its step, strictly between 0 and 1 (no bands: the cent grid)."""
+    if bands is None:
+        return [Decimal(k) / 100 for k in range(1, 100)]
+    levels = set()
+    for band in bands:
+        step = Decimal(str(band.step))
+        k = math.ceil(Decimal(str(band.start)) / step)
+        while k * step <= Decimal(str(band.end)):
+            if 0 < k * step < 1:
+                levels.add(k * step)
+            k += 1
+    return sorted(levels)
+
+
+class TestTopOfGridFloorsThroughScanner:
+    """_v2_top_of_grid_price rounds down with scanner.floor_to_tick, the one
+    rounding-down onto a grid, and gives what its own inline floor gave."""
+
+    def test_it_calls_floor_to_tick_and_rounds_nothing_itself(self):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(trader._v2_top_of_grid_price)))
+        called = {node.func.id for node in ast.walk(tree)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        assert "floor_to_tick" in called
+        names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        attrs = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+        assert "ROUND_FLOOR" not in names
+        assert "to_integral_value" not in attrs
+
+    @pytest.mark.parametrize("name, structure, bands", _SALE_GRIDS)
+    def test_it_is_the_grids_highest_level(self, name, structure, bands):
+        market = make_market(structure, bands)
+        top = _v2_top_of_grid_price(market)
+        assert top == _grid_levels(bands)[-1]
+        # What the inline floor it replaced gave
+        target = Decimal(config.V2_ROLLBACK_BID_PRICE_DOLLARS)
+        tick = tick_size_for_price(market, float(target))
+        assert top == (target / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+
+
+class TestSaleLimit:
+    """_sale_limit: a YES is sold by an ask rounded UP onto the grid, a NO by
+    a YES bid rounded DOWN, so neither sells below its floor: the walked bid
+    less the slippage, in ticks of the grid at that bid."""
+
+    @pytest.mark.parametrize("name, structure, bands", _SALE_GRIDS)
+    def test_every_level_sells_at_its_floor_rounded_the_safe_way(
+        self, name, structure, bands,
+    ):
+        market = make_market(structure, bands)
+        levels = _grid_levels(bands)
+        for i, level in enumerate(levels):
+            below = levels[i - 1] if i else level
+            above = levels[i + 1] if i + 1 < len(levels) else level
+            tick = tick_size_for_price(market, float(level))
+            # A held YES walked to `level` is sold by an ask there; with one
+            # tick of slippage, by the lowest level at or above level - tick
+            # (the floor): never below it, and never more than one level down
+            assert trader._sale_limit(market, "yes", float(level), 0) == level, level
+            ask = trader._sale_limit(market, "yes", float(level), 1)
+            assert ask == min(lv for lv in levels if lv >= level - tick), level
+            assert ask >= level - tick and ask in (below, level), level
+            # A held NO walked to 1 - level is sold by a YES bid at `level`;
+            # with slippage, by the highest level at or below level + tick, so
+            # the NO never fetches less than its walked bid less one tick
+            assert trader._sale_limit(market, "no", float(1 - level), 0) == level, level
+            bid = trader._sale_limit(market, "no", float(1 - level), 1)
+            assert bid == max(lv for lv in levels if lv <= level + tick), level
+            assert 1 - bid >= (1 - level) - tick and bid in (level, above), level
+
+    @pytest.mark.parametrize("name, structure, bands", _SALE_GRIDS)
+    def test_an_off_grid_walked_bid_is_rounded_the_safe_way(self, name, structure, bands):
+        market = make_market(structure, bands)
+        levels = _grid_levels(bands)
+        rng = random.Random(5)
+        for _ in range(300):
+            walked = rng.uniform(float(levels[0]), float(levels[-1]))
+            quantized = Decimal(str(walked)).quantize(Decimal("0.000001"))
+            ask = trader._sale_limit(market, "yes", walked, 0)
+            # The lowest level at or above the walked bid: the YES never sells below it
+            assert ask == min(level for level in levels if level >= quantized), walked
+            bid = trader._sale_limit(market, "no", walked, 0)
+            # The highest level at or below 1 minus it: the NO never fetches less
+            assert bid == max(level for level in levels if level <= 1 - quantized), walked
+            assert 1 - bid >= quantized
+
+    def test_an_ask_rounds_up_and_a_no_sales_bid_rounds_down(self):
+        market = make_market("linear_cent")
+        # 0.4537 lies between two cent levels: the ask goes to the one above
+        assert trader._sale_limit(market, "yes", 0.4537, 0) == Decimal("0.46")
+        # A NO walked to 0.4537 closes by a YES bid at or below 0.5463: 0.54
+        assert trader._sale_limit(market, "no", 0.4537, 0) == Decimal("0.54")
+
+    def test_at_a_band_boundary_the_slippage_is_the_finer_bands_tick(self):
+        market = make_market("center_deci_edge_centi_cent", CENTER_DECI_EDGE_CENTI_BANDS)
+        # 0.99 begins the 0.0001 band, so one tick below it is 0.9899, which
+        # lies inside the 0.001 band; rounded UP onto that band it is 0.99
+        # itself, so the YES never sells below 0.9899
+        assert trader._sale_limit(market, "yes", 0.99, 1) == Decimal("0.99")
+        # 0.01 ends the 0.0001 band below it: one tick down is a level there
+        assert trader._sale_limit(market, "yes", 0.01, 1) == Decimal("0.0099")
+        # One coarse tick above a boundary: one coarse tick down lands on it
+        assert trader._sale_limit(market, "yes", 0.011, 1) == Decimal("0.010")
+        # A NO walked to 0.99 trades as a YES bid at 0.01; one 0.0001 tick up
+        # is 0.0101, inside the 0.001 band, rounded DOWN to 0.01 itself
+        assert trader._sale_limit(market, "no", 0.99, 1) == Decimal("0.010")
+        # A NO walked to 0.01 is a YES bid at 0.99, which slips up a level of
+        # the 0.0001 band
+        assert trader._sale_limit(market, "no", 0.01, 1) == Decimal("0.9901")
+        # With no slippage each sells at the walked bid itself
+        assert trader._sale_limit(market, "yes", 0.99, 0) == Decimal("0.99")
+        assert trader._sale_limit(market, "yes", 0.01, 0) == Decimal("0.01")
+        assert trader._sale_limit(market, "no", 0.99, 0) == Decimal("0.01")
+        assert trader._sale_limit(market, "no", 0.01, 0) == Decimal("0.99")
+
+    def test_a_cent_market_at_0_01_and_0_99(self):
+        market = make_market("linear_cent")
+        assert trader._sale_limit(market, "yes", 0.99, 0) == Decimal("0.99")
+        assert trader._sale_limit(market, "yes", 0.99, 1) == Decimal("0.98")
+        # There is no level below 0.01, so slippage leaves it there
+        assert trader._sale_limit(market, "yes", 0.01, 0) == Decimal("0.01")
+        assert trader._sale_limit(market, "yes", 0.01, 1) == Decimal("0.01")
+        assert trader._sale_limit(market, "no", 0.99, 0) == Decimal("0.01")
+        assert trader._sale_limit(market, "no", 0.99, 1) == Decimal("0.02")
+        # Nor a level above 0.99
+        assert trader._sale_limit(market, "no", 0.01, 0) == Decimal("0.99")
+        assert trader._sale_limit(market, "no", 0.01, 1) == Decimal("0.99")
+
+    def test_the_asymmetric_grid_slips_by_the_yes_books_own_step(self):
+        # A NO at 0.95 trades as a YES bid at 0.05, on the 0.001 band: one
+        # tick of slippage is 0.001, not the 0.01 step at YES price 0.95
+        market = make_market("tapered_deci_cent", _SALE_GRIDS[4][2])
+        assert trader._sale_limit(market, "no", 0.95, 1) == Decimal("0.051")
+        # A NO at 0.90 is a YES bid at 0.10, a boundary: one 0.001 tick up is
+        # 0.101, inside the 0.01 band, rounded DOWN to 0.10 itself
+        assert trader._sale_limit(market, "no", 0.90, 1) == Decimal("0.10")
+        # A NO at 0.02 is a YES bid at 0.98, on the 0.01 band: one tick up
+        assert trader._sale_limit(market, "no", 0.02, 1) == Decimal("0.99")
+
+    def test_float_noise_does_not_move_the_price_a_level(self):
+        market = make_market("linear_cent")
+        # 1 - 0.43 is 0.5700000000000001: still an ask at 0.57, not 0.58, and
+        # a NO walked to it is still a YES bid at 0.43, not 0.42
+        assert trader._sale_limit(market, "yes", 1.0 - 0.43, 0) == Decimal("0.57")
+        assert trader._sale_limit(market, "no", 1.0 - 0.43, 0) == Decimal("0.43")
+        # 1 - 0.55 is 0.44999999999999996
+        assert trader._sale_limit(market, "yes", 1.0 - 0.55, 0) == Decimal("0.45")
+        assert trader._sale_limit(market, "no", 1.0 - 0.55, 0) == Decimal("0.55")
+
+    def test_the_price_stays_within_the_grids_tradeable_levels(self):
+        # The clamp moves a price past its floor only when the floor lies
+        # beyond the grid's own levels (no bid can rest there on this grid)
+        market = make_market("linear_cent")
+        assert trader._sale_limit(market, "yes", 0.0001, 0) == Decimal("0.01")
+        assert trader._sale_limit(market, "yes", 0.9999, 0) == Decimal("0.99")
+        assert trader._sale_limit(market, "no", 0.9999, 0) == Decimal("0.01")
+        assert trader._sale_limit(market, "no", 0.0001, 0) == Decimal("0.99")
+
+    def test_a_side_other_than_yes_or_no_is_refused(self):
+        with pytest.raises(ValueError):
+            trader._sale_limit(make_market(), "maybe", 0.5, 0)
+
+
+def _sale_market(ticker: str, *, structure: str = "linear_cent", ranges=None,
+                 shard: int = 0) -> ApiMarket:
+    """A held market as this run's market list carries it."""
+    return ApiMarket(
+        ticker=ticker, event_ticker="KX-EV", title=f"Will {ticker} happen?", subtitle="",
+        status="active", close_time=None, price_level_structure=structure,
+        price_ranges=ranges, exchange_index=shard,
+    )
+
+
+def _held(ticker: str, side: str, count: int = 5, **market) -> seller.SaleLeg:
+    """A held market of a position."""
+    return seller.SaleLeg(ticker=ticker, event_ticker="KX-EV", side=side, count=count,
+                          cost_dollars=2.0, market=_sale_market(ticker, **market))
+
+
+def _paid_out(ticker: str, side: str, count: int = 5) -> seller.SaleLeg:
+    """A lone held market's partner that has paid out (nothing to sell)."""
+    return seller.SaleLeg(ticker=ticker, event_ticker="KX-EV", side=side, count=count,
+                          cost_dollars=2.0, payout_dollars=0.0,
+                          paid_at=datetime(2026, 10, 1, tzinfo=UTC))
+
+
+def _sale_plan(*held, partner=None, title: str = "Test position") -> seller.SalePlan:
+    """A SalePlan from (held leg, its bid ladder) pairs, walked as seller walks them."""
+    legs = tuple(leg for leg, _ in held) + ((partner,) if partner is not None else ())
+    ladders = {leg.ticker: ladder for leg, ladder in held}
+    walked = {leg.ticker: walk_bids(ladder, leg.count) for leg, ladder in held}
+    assert all(walk is not None for walk in walked.values())
+    return seller.SalePlan(
+        title=title, legs=legs, count=held[0][0].count, cost_dollars=4.0,
+        ladders=ladders, walked=walked, proceeds_dollars=0.0, profits=(),
+        days_left=10, level=0.8,
+    )
+
+
+# KX-A: YES held, 5 contracts; its walk for 5 reaches 0.44, leaving 8 on the
+# walked bids. KX-B: NO held, 5 contracts; its walk for 5 reaches 0.50,
+# leaving none, so KX-B is the thinner book and is sold first.
+_LADDER_A = [[0.45, 3], [0.44, 10]]
+_LADDER_B = [[0.50, 5], [0.49, 1]]
+
+
+def _pair_plan(**kwargs) -> seller.SalePlan:
+    """The standard exact pair: YES on KX-A, NO on KX-B, 5 contracts each."""
+    return _sale_plan((_held("KX-A", "yes", **kwargs), _LADDER_A),
+                      (_held("KX-B", "no", **kwargs), _LADDER_B))
+
+
+class _SaleExchange:
+    """A V2 order endpoint and positions ledger for sale orders.
+
+    The ledger starts from `positions` (signed: YES positive, NO negative). A
+    filled bid raises a ticker's position and a filled ask lowers it; as a
+    reduce_only order, neither fills past zero. `fills` caps what the order
+    on a ticker fills (default: all it asks for). `reply` says what that order
+    answers: "fill" (a 2xx with the fill count, the default), "raise" (it
+    fills, then the client sees a transport error), "no-fill-count" (it fills,
+    then a 2xx with no count), "over" (it fills, then a 2xx count above the
+    request) or "error" (an HTTP 400; nothing fills). `outside` moves a
+    ticker's position by that much right after its order, as a trade outside
+    this run would. A ticker in `lag` reads its old position once after its
+    order, as a lagging ledger does, and one in `lag_reads` for that many
+    reads; one in `unreadable` reads fine before its order and fails after
+    it; one in `down` never reads. Every read, pacer place and POST is
+    recorded in `events`, in order, and every body in `bodies`.
+    """
+
+    def __init__(self, positions, *, fills=None, reply=None, outside=None, lag=(),
+                 unreadable=(), down=(), part=None, lag_reads=None, part_reads=None):
+        self.positions = dict(positions)
+        self.fills = dict(fills or {})
+        self.reply = dict(reply or {})
+        self.outside = dict(outside or {})
+        self.lag = set(lag)
+        # Ticker -> how many reads after its order still show its old position
+        self.lag_reads = dict(lag_reads or {})
+        # Ticker -> the position its first read after its order shows, as a
+        # ledger that has recorded only part of the order's fills does
+        self.part = dict(part or {})
+        # Ticker -> how many reads after its order show that part (default 1)
+        self.part_reads = dict(part_reads or {})
+        self.unreadable = set(unreadable)
+        self.down = set(down)
+        self.posted: set = set()
+        # Ticker -> [the position its next reads show, how many reads left]
+        self.stale: dict = {}
+        self.events: list = []
+        self.bodies: list = []
+
+    def post(self, client, method, path, body):
+        """Stand-in for trader.signed_request_json."""
+        assert (method, path) == ("POST", V2_ORDER_PATH)
+        assert body["reduce_only"] is True
+        ticker = body["ticker"]
+        self.events.append(("post", ticker))
+        self.bodies.append(dict(body))
+        self.posted.add(ticker)
+        asked = int(Decimal(body["count"]))
+        reply = self.reply.get(ticker, "fill")
+        if reply == "error":
+            raise sdk_error(400, "Bad Request", '{"error":{"code":"bad_request","message":"bad"}}')
+        held = self.positions.get(ticker, 0)
+        # reduce_only: an ask closes YES, a bid closes NO, never past zero
+        room = held if body["side"] == "ask" else -held
+        filled = max(0, min(asked, room, self.fills.get(ticker, asked)))
+        if ticker in self.lag:
+            self.stale[ticker] = [held, 1]
+        if ticker in self.lag_reads:
+            self.stale[ticker] = [held, self.lag_reads[ticker]]
+        if ticker in self.part:
+            self.stale[ticker] = [self.part[ticker], self.part_reads.get(ticker, 1)]
+        self.positions[ticker] = (held + (filled if body["side"] == "bid" else -filled)
+                                  + self.outside.get(ticker, 0))
+        if reply == "raise":
+            raise ConnectionError("connection reset after the fill")
+        if reply == "no-fill-count":
+            return {"order": {"order_id": "ord-1"}}
+        if reply == "over":
+            return v2_resp(asked + 2, asked)
+        return v2_resp(filled, asked)
+
+    def read(self, **kwargs):
+        """Stand-in for client.get_positions_without_preload_content."""
+        ticker = kwargs["ticker"]
+        self.events.append(("read", ticker))
+        if ticker in self.down or (ticker in self.unreadable and ticker in self.posted):
+            raise RuntimeError("positions endpoint down")
+        if ticker in self.stale:
+            shown, left = self.stale[ticker]
+            if left <= 1:
+                del self.stale[ticker]
+            else:
+                self.stale[ticker][1] = left - 1
+            return positions_resp(ticker, shown)
+        return positions_resp(ticker, self.positions.get(ticker, 0))
+
+
+class TestBuildSaleOrderV2:
+    """The body that sells held contracts: reduce_only and immediate_or_cancel,
+    an ask for a held YES and a YES bid for a held NO."""
+
+    def test_a_yes_sale_is_a_reduce_only_ask(self):
+        body = trader._build_sale_order_v2(_sale_market("KX-A", shard=2), "yes", 5,
+                                           Decimal("0.45"))
+        uuid.UUID(body.pop("client_order_id"))
+        assert body == {
+            "ticker": "KX-A", "side": "ask", "price": "0.4500", "count": "5.00",
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": config.V2_SELF_TRADE_PREVENTION_TYPE,
+            "exchange_index": 2, "reduce_only": True, "post_only": False,
+        }
+
+    def test_a_no_sale_is_a_reduce_only_yes_bid(self):
+        body = trader._build_sale_order_v2(_sale_market("KX-B", shard=3), "no", 7,
+                                           Decimal("0.5600"))
+        uuid.UUID(body.pop("client_order_id"))
+        assert body == {
+            "ticker": "KX-B", "side": "bid", "price": "0.5600", "count": "7.00",
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": config.V2_SELF_TRADE_PREVENTION_TYPE,
+            "exchange_index": 3, "reduce_only": True, "post_only": False,
+        }
+
+    def test_the_sides_come_from_the_one_side_table(self):
+        assert trader._V2_LEG_SIDE["close_yes"] == "ask"
+        assert trader._V2_LEG_SIDE["close_no"] == "bid"
+
+    def test_a_side_other_than_yes_or_no_is_refused(self):
+        with pytest.raises(ValueError):
+            trader._build_sale_order_v2(_sale_market("KX-A"), "maybe", 5, Decimal("0.45"))
+
+
+class TestSaleFillCount:
+    """_sale_fill_count reads a sale order's reply: any whole count from 0 to
+    the count asked is an answer (a partial fill is normal); anything else is
+    unknown (None). It never raises."""
+
+    @pytest.mark.parametrize("data, expected", [
+        ({"order": {"fill_count": 5}}, 5),
+        ({"order": {"fill_count": 3}}, 3),
+        ({"order": {"fill_count": 0}}, 0),
+        ({"order": {"fill_count_fp": "4.00"}}, 4),
+        ({"fill_count": 2}, 2),
+        ({"order": "not an order", "fill_count": 2}, 2),
+        ({"order": {"fill_count": 6}}, None),
+        ({"order": {"fill_count": -1}}, None),
+        ({"order": {"fill_count_fp": "2.5"}}, None),
+        ({"order": {"fill_count_fp": "NaN"}}, None),
+        ({"order": {"fill_count_fp": "Infinity"}}, None),
+        ({"order": {"fill_count": "many"}}, None),
+        ({"order": {}}, None),
+        ([], None),
+        ("accepted", None),
+        (None, None),
+    ])
+    def test_it_reads_a_whole_count_in_range(self, data, expected):
+        assert trader._sale_fill_count(data, 5) == expected
+
+
+class TestSellPositions:
+    """sell_positions sells each plan with reduce_only immediate_or_cancel
+    orders, one place on the write pacer per POST, never retried; an unclear
+    reply is judged by how the account's position moved."""
+
+    @pytest.fixture
+    def sleeps(self, monkeypatch):
+        """The pauses taken, instead of waiting."""
+        taken: list = []
+        monkeypatch.setattr(trader.time, "sleep", taken.append)
+        return taken
+
+    @staticmethod
+    def _sell(monkeypatch, exchange, plans, *, dry_run=False):
+        """Run sell_positions against the exchange, with a pacer that records places."""
+        monkeypatch.setattr(trader, "signed_request_json", exchange.post)
+        pacer = MagicMock()
+        pacer.acquire.side_effect = lambda: exchange.events.append(("pace",)) or 0.0
+        monkeypatch.setattr(trader, "_ORDER_WRITE_PACER", pacer)
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=exchange.read)
+        results = trader.sell_positions(client, plans, dry_run=dry_run)
+        # Every place is in turn: nothing takes the hedge lane or holds a place
+        pacer.acquire_hedge.assert_not_called()
+        pacer.acquire_with_hold.assert_not_called()
+        return results
+
+    def test_no_plans_send_nothing(self, monkeypatch):
+        exchange = _SaleExchange({})
+        assert self._sell(monkeypatch, exchange, []) == []
+        assert exchange.events == []
+
+    def test_a_held_yes_is_sold_by_an_ask_and_a_held_no_by_a_yes_bid(
+        self, monkeypatch, caplog,
+    ):
+        yes_plan = _sale_plan((_held("KX-A", "yes", shard=2), [[0.45, 10]]),
+                              partner=_paid_out("KX-P", "no"))
+        no_plan = _sale_plan((_held("KX-B", "no", shard=3), [[0.30, 10]]),
+                             partner=_paid_out("KX-Q", "yes"))
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5})
+        with caplog.at_level(logging.INFO):
+            results = self._sell(monkeypatch, exchange, [yes_plan, no_plan])
+        assert [(r.plan, r.status, r.sold, r.error) for r in results] == [
+            (yes_plan, "sold", {"KX-A": 5}, None),
+            (no_plan, "sold", {"KX-B": 5}, None),
+        ]
+        assert all(isinstance(r, SaleResult) for r in results)
+        # Only the held markets get orders, in the plans' order
+        yes_body, no_body = exchange.bodies
+        assert (yes_body["ticker"], yes_body["side"], yes_body["price"],
+                yes_body["exchange_index"]) == ("KX-A", "ask", "0.4500", 2)
+        assert (no_body["ticker"], no_body["side"], no_body["price"],
+                no_body["exchange_index"]) == ("KX-B", "bid", "0.7000", 3)
+        for body in exchange.bodies:
+            assert body["count"] == "5.00"
+            assert body["reduce_only"] is True
+            assert body["time_in_force"] == "immediate_or_cancel"
+            assert body["self_trade_prevention_type"] == config.V2_SELF_TRADE_PREVENTION_TYPE
+        assert exchange.positions == {"KX-A": 0, "KX-B": 0}
+        lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Sold ")]
+        assert lines == [
+            "Sold 'Test position': 5 of 5 YES on KX-A sold (ask at 0.4500)",
+            "Sold 'Test position': 5 of 5 NO on KX-B sold (YES bid at 0.7000, so"
+            " 0.3000 or more a NO contract)",
+        ]
+
+    def test_the_read_before_the_post_comes_before_its_pacer_place(self, monkeypatch):
+        plan = _sale_plan((_held("KX-A", "yes"), [[0.45, 10]]),
+                          partner=_paid_out("KX-P", "no"))
+        exchange = _SaleExchange({"KX-A": 5})
+        self._sell(monkeypatch, exchange, [plan])
+        assert exchange.events == [("read", "KX-A"), ("pace",), ("post", "KX-A")]
+
+    def test_a_full_pair_sells_the_thinner_book_first_then_the_same_count(
+        self, monkeypatch, caplog,
+    ):
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5})
+        plan = _pair_plan()
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [plan])
+        assert (result.status, result.sold, result.error) == (
+            "sold", {"KX-B": 5, "KX-A": 5}, None)
+        first, second = exchange.bodies
+        # KX-B leaves nothing on its walked bids: it goes first, at its walked bid
+        assert (first["ticker"], first["side"], first["price"], first["count"]) == (
+            "KX-B", "bid", "0.5000", "5.00")
+        # KX-A's walk for 5 reaches 0.44; one level of slippage below it
+        assert (second["ticker"], second["side"], second["price"], second["count"]) == (
+            "KX-A", "ask", "0.4300", "5.00")
+        assert SALE_HEDGE_SLIPPAGE_TICKS == 1
+        assert exchange.positions == {"KX-A": 0, "KX-B": 0}
+        [line] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Sold ")]
+        assert line == (
+            "Sold 'Test position': 5 of 5 NO on KX-B sold (YES bid at 0.5000, so 0.5000"
+            " or more a NO contract), then 5 of 5 YES on KX-A sold (ask at 0.4300)"
+        )
+
+    def test_one_pacer_place_right_before_each_post(self, monkeypatch):
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5})
+        self._sell(monkeypatch, exchange, [_pair_plan()])
+        writes = [event for event in exchange.events if event[0] != "read"]
+        assert writes == [("pace",), ("post", "KX-B"), ("pace",), ("post", "KX-A")]
+        # Both markets are read before the first place is taken, so no
+        # retried read stands between the two orders
+        assert exchange.events == [
+            ("read", "KX-B"), ("read", "KX-A"),
+            ("pace",), ("post", "KX-B"), ("pace",), ("post", "KX-A"),
+        ]
+
+    def test_the_real_pacer_gives_one_place_per_post(self, monkeypatch):
+        # conftest gives a fresh pacer; count its in-turn places
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5})
+        monkeypatch.setattr(trader, "signed_request_json", exchange.post)
+        spy = MagicMock(wraps=trader._ORDER_WRITE_PACER.acquire)
+        monkeypatch.setattr(trader._ORDER_WRITE_PACER, "acquire", spy)
+        client = MagicMock()
+        client.get_positions_without_preload_content = MagicMock(side_effect=exchange.read)
+        [result] = trader.sell_positions(client, [_pair_plan()], dry_run=False)
+        assert result.status == "sold"
+        assert spy.call_count == len(exchange.bodies) == 2
+
+    def test_a_partial_first_order_means_the_second_sells_the_same_count(
+        self, monkeypatch, caplog,
+    ):
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, fills={"KX-B": 3})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("partly_sold", {"KX-B": 3, "KX-A": 3})
+        assert result.error == "sold 3 of 5 on each market"
+        second = exchange.bodies[1]
+        # KX-A's walk for 3 stays on its 0.45 level; one level below it
+        assert (second["ticker"], second["count"], second["price"]) == ("KX-A", "3.00", "0.4400")
+        # What is left is still an exact pair
+        assert exchange.positions == {"KX-A": 2, "KX-B": -2}
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("still held, as an exact pair" in w for w in warnings)
+
+    def test_a_second_order_that_falls_short_is_unbalanced(self, monkeypatch, caplog):
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, fills={"KX-A": 2})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("unbalanced", {"KX-B": 5, "KX-A": 2})
+        assert result.error == (
+            "sold 5 NO on KX-B but only 2 YES on KX-A: KX-B holds nothing,"
+            " KX-A holds 3 YES contracts"
+        )
+        assert exchange.positions == {"KX-A": 3, "KX-B": 0}
+        [critical] = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert critical.startswith("SALE LEFT A PAIR UNBALANCED for 'Test position'")
+        assert "KX-B now holds nothing and KX-A holds 3 YES contracts" in critical
+        assert "Sell the extra 3 YES contracts on KX-A by hand in the Kalshi UI" in critical
+
+    def test_a_first_order_that_fills_nothing_sends_no_second(self, monkeypatch):
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, fills={"KX-B": 0})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("not_sold", {"KX-B": 0, "KX-A": 0})
+        assert [body["ticker"] for body in exchange.bodies] == ["KX-B"]
+
+    def test_a_raise_with_a_moved_position_counts_the_move(self, monkeypatch, sleeps, caplog):
+        plan = _sale_plan((_held("KX-A", "yes"), [[0.45, 10]]),
+                          partner=_paid_out("KX-P", "no"))
+        exchange = _SaleExchange({"KX-A": 5}, fills={"KX-A": 4}, reply={"KX-A": "raise"})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [plan])
+        assert (result.status, result.sold) == ("partly_sold", {"KX-A": 4})
+        # The count came from the account, not the reply
+        assert result.decided_by_account is True
+        # The account is read after the raise and, since it moved less than
+        # the whole order, read again after each pause of the schedule; the
+        # last reading decides
+        assert exchange.events == [("read", "KX-A"), ("pace",), ("post", "KX-A"),
+                                   ("read", "KX-A"), ("read", "KX-A"), ("read", "KX-A"),
+                                   ("read", "KX-A")]
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
+        # The error is logged on one line
+        assert any(r.getMessage() == (
+            "Sale order on KX-A raised, so the account decides how many sold:"
+            " ConnectionError: connection reset after the fill") for r in caplog.records)
+
+    def test_a_raise_then_a_lagging_ledger_is_read_again(self, monkeypatch, sleeps):
+        plan = _sale_plan((_held("KX-A", "yes"), [[0.45, 10]]),
+                          partner=_paid_out("KX-P", "no"))
+        exchange = _SaleExchange({"KX-A": 5}, reply={"KX-A": "raise"}, lag={"KX-A"})
+        [result] = self._sell(monkeypatch, exchange, [plan])
+        # The first read after the order still shows 5; the re-read shows the
+        # sale, and no further re-read is made
+        assert (result.status, result.sold) == ("sold", {"KX-A": 5})
+        assert result.decided_by_account is True
+        assert sleeps == [config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS[0]]
+        assert exchange.events[-2:] == [("read", "KX-A"), ("read", "KX-A")]
+
+    def test_a_ledger_that_lags_past_the_first_re_read_is_read_again(self, monkeypatch,
+                                                                     sleeps):
+        # The pair's first order fills all 5 and its reply raises, and the
+        # ledger shows nothing sold for two reads after it: the third reading
+        # shows the sale, so the second order sells 5 too and the pair stays
+        # balanced (one re-read would have read 0 and sent nothing on KX-A,
+        # leaving KX-A's 5 YES held alone)
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-B": "raise"},
+                                 lag_reads={"KX-B": 2})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("sold", {"KX-B": 5, "KX-A": 5})
+        assert result.decided_by_account is True
+        # It stops at the reading that shows the whole count
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS[:2])
+        assert [(b["ticker"], b["count"]) for b in exchange.bodies] == [
+            ("KX-B", "5.00"), ("KX-A", "5.00")]
+        assert exchange.positions == {"KX-A": 0, "KX-B": 0}
+
+    def test_a_ledger_that_lags_through_every_re_read_decides_on_its_last_reading(
+        self, monkeypatch, sleeps,
+    ):
+        # Past the schedule the last reading decides: here it still shows
+        # nothing sold, so nothing is sent on KX-A. The sale is marked as
+        # decided by the account, which main._run_prod then checks against
+        # the positions listing
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-B": "raise"},
+                                 lag_reads={"KX-B": 4})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("not_sold", {"KX-B": 0, "KX-A": 0})
+        assert result.decided_by_account is True
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
+        assert [b["ticker"] for b in exchange.bodies] == ["KX-B"]
+
+    def test_a_reply_that_says_how_many_sold_is_not_decided_by_the_account(
+        self, monkeypatch, sleeps,
+    ):
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, fills={"KX-B": 3})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.decided_by_account) == ("partly_sold", False)
+        assert sleeps == []
+
+    def test_an_error_reply_with_an_unmoved_position_sold_nothing(self, monkeypatch, sleeps):
+        plan = _sale_plan((_held("KX-A", "yes"), [[0.45, 10]]),
+                          partner=_paid_out("KX-P", "no"))
+        exchange = _SaleExchange({"KX-A": 5}, reply={"KX-A": "error"})
+        [result] = self._sell(monkeypatch, exchange, [plan])
+        assert (result.status, result.sold, result.error) == (
+            "not_sold", {"KX-A": 0}, "the sale order filled nothing")
+        assert result.decided_by_account is True
+        # Read again after each pause before it counts as nothing sold
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
+
+    @pytest.mark.parametrize("reply", ["over", "no-fill-count"])
+    def test_a_reply_without_a_usable_count_reads_the_account(self, monkeypatch, sleeps,
+                                                              reply):
+        plan = _sale_plan((_held("KX-A", "yes"), [[0.45, 10]]),
+                          partner=_paid_out("KX-P", "no"))
+        exchange = _SaleExchange({"KX-A": 5}, reply={"KX-A": reply})
+        [result] = self._sell(monkeypatch, exchange, [plan])
+        assert (result.status, result.sold) == ("sold", {"KX-A": 5})
+        assert result.decided_by_account is True
+        assert exchange.events[-1] == ("read", "KX-A")
+
+    def test_an_unreadable_position_is_manual_review_with_no_second_order(
+        self, monkeypatch, sleeps, caplog,
+    ):
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-B": "raise"},
+                                 unreadable={"KX-B"})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("manual_review", {"KX-A": 0})
+        assert [body["ticker"] for body in exchange.bodies] == ["KX-B"]
+        # The read after the raise failed at once: read outside the except
+        # clause, its error does not carry the transport error as its cause,
+        # so it is not retried with pauses as a passing network fault
+        assert sleeps == []
+        [critical] = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert critical.startswith("SALE OUTCOME UNKNOWN for 'Test position'")
+        assert "an unknown number of 5 NO on KX-B sold" in critical
+        assert "nothing sent on KX-A, which still holds 5 YES contracts" in critical
+        assert "Kalshi UI" in critical
+
+    def test_an_unknown_second_order_is_manual_review_naming_both_markets(
+        self, monkeypatch, sleeps, caplog,
+    ):
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-A": "raise"},
+                                 unreadable={"KX-A"})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("manual_review", {"KX-B": 5})
+        [critical] = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert "5 of 5 NO on KX-B sold" in critical
+        assert "an unknown number of 5 YES on KX-A sold" in critical
+        assert "Check both positions in the Kalshi UI" in critical
+
+    def test_a_lone_order_that_cannot_be_judged_is_manual_review(self, monkeypatch, sleeps,
+                                                                 caplog):
+        plan = _sale_plan((_held("KX-A", "yes"), [[0.45, 10]]),
+                          partner=_paid_out("KX-P", "no"))
+        exchange = _SaleExchange({"KX-A": 5}, reply={"KX-A": "raise"}, unreadable={"KX-A"})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [plan])
+        assert (result.status, result.sold) == ("manual_review", {})
+        [critical] = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert "check the position on KX-A in the Kalshi UI" in critical
+
+    def test_a_held_no_whose_reply_raised_counts_its_move_toward_zero(
+        self, monkeypatch, sleeps,
+    ):
+        # KX-B (NO, -5) goes first; 3 fill, then the reply raises. The account
+        # reads -2: a move of 3 toward zero, so 3 are sold on each market
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, fills={"KX-B": 3},
+                                 reply={"KX-B": "raise"})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("partly_sold", {"KX-B": 3, "KX-A": 3})
+        assert [(b["ticker"], b["count"]) for b in exchange.bodies] == [
+            ("KX-B", "5.00"), ("KX-A", "3.00")]
+        assert exchange.positions == {"KX-A": 2, "KX-B": -2}
+        # A move short of the whole order is read again after each pause
+        # before it counts
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
+
+    def test_a_partly_recorded_fill_is_read_again_before_the_second_order(
+        self, monkeypatch, sleeps,
+    ):
+        # KX-B's order fills all 5 but the reply raises, and the first read
+        # after it shows only 2 of them (-3): the re-read shows all 5, so the
+        # second order sells 5 too and the pair stays balanced
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-B": "raise"},
+                                 part={"KX-B": -3})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("sold", {"KX-B": 5, "KX-A": 5})
+        assert [(b["ticker"], b["count"]) for b in exchange.bodies] == [
+            ("KX-B", "5.00"), ("KX-A", "5.00")]
+        assert sleeps == [config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS[0]]
+        assert exchange.positions == {"KX-A": 0, "KX-B": 0}
+
+    def test_a_fill_recorded_in_part_past_the_first_re_read_is_read_again(
+        self, monkeypatch, sleeps,
+    ):
+        # The first two readings after KX-B's order show only 2 of its 5
+        # fills: the third shows all 5, so the second order sells 5 (one
+        # re-read would have sold 2 on KX-A, leaving 3 YES on KX-A held alone
+        # while the run reported a balanced part-sale)
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-B": "raise"},
+                                 part={"KX-B": -3}, part_reads={"KX-B": 2})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("sold", {"KX-B": 5, "KX-A": 5})
+        assert [(b["ticker"], b["count"]) for b in exchange.bodies] == [
+            ("KX-B", "5.00"), ("KX-A", "5.00")]
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS[:2])
+        assert exchange.positions == {"KX-A": 0, "KX-B": 0}
+
+    def test_a_failed_read_after_short_readings_is_manual_review(self, monkeypatch, sleeps):
+        # Two readings show only 2 of KX-B's 5 sold, then the positions
+        # endpoint fails: no reading is safe to act on, so the count is
+        # unknown and nothing is sent on KX-A
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-B": "raise"},
+                                 part={"KX-B": -3}, part_reads={"KX-B": 2})
+        original = exchange.read
+        reads = {"KX-B": 0}
+
+        def read(**kwargs):
+            """Fail KX-B's fourth read: the before-read, two short reads, then down."""
+            if kwargs["ticker"] == "KX-B":
+                reads["KX-B"] += 1
+                if reads["KX-B"] == 4:
+                    exchange.events.append(("read", "KX-B"))
+                    raise RuntimeError("positions endpoint down")
+            return original(**kwargs)
+
+        exchange.read = read
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("manual_review", {"KX-A": 0})
+        assert result.decided_by_account is True
+        assert [b["ticker"] for b in exchange.bodies] == ["KX-B"]
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS[:2])
+
+    def test_a_partial_move_then_a_failed_re_read_is_manual_review(
+        self, monkeypatch, sleeps,
+    ):
+        # The first read after KX-B's order shows a partial move, then the
+        # positions endpoint fails: neither reading is safe to act on, so the
+        # count is unknown and the second order is not sent
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-B": "raise"},
+                                 part={"KX-B": -3})
+        original = exchange.read
+        reads = {"KX-B": 0}
+
+        def read(**kwargs):
+            """Fail KX-B's third read: the before-read, the partial read, then down."""
+            if kwargs["ticker"] == "KX-B":
+                reads["KX-B"] += 1
+                if reads["KX-B"] == 3:
+                    exchange.events.append(("read", "KX-B"))
+                    raise RuntimeError("positions endpoint down")
+            return original(**kwargs)
+
+        exchange.read = read
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert result.status == "manual_review"
+        assert [b["ticker"] for b in exchange.bodies] == ["KX-B"]
+
+    @pytest.mark.parametrize("reply", ["raise", "no-fill-count"])
+    def test_a_held_no_read_again_through_a_lagging_ledger(self, monkeypatch, sleeps, reply):
+        # The first read after KX-B's order still shows -5; the re-read shows 0
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-B": reply},
+                                 lag={"KX-B"})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("sold", {"KX-B": 5, "KX-A": 5})
+        assert sleeps == [config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS[0]]
+        assert exchange.positions == {"KX-A": 0, "KX-B": 0}
+
+    @pytest.mark.parametrize("outside", [
+        # A YES bought outside the run: the position moves away from zero
+        3,
+        # More sold than the order asked for
+        -2,
+    ])
+    def test_a_lone_move_the_order_cannot_explain_is_manual_review(
+        self, monkeypatch, sleeps, caplog, outside,
+    ):
+        plan = _sale_plan((_held("KX-A", "yes"), [[0.45, 10]]),
+                          partner=_paid_out("KX-P", "no"))
+        exchange = _SaleExchange({"KX-A": 5}, fills={"KX-A": 5 if outside < 0 else 0},
+                                 reply={"KX-A": "raise"}, outside={"KX-A": outside})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [plan])
+        assert (result.status, result.sold) == ("manual_review", {})
+        assert len(exchange.bodies) == 1
+        assert any(r.levelno == logging.CRITICAL for r in caplog.records)
+
+    @pytest.mark.parametrize("outside", [2, -9])
+    def test_a_first_move_the_order_cannot_explain_sends_no_second(
+        self, monkeypatch, sleeps, outside,
+    ):
+        # KX-B (NO, -5) fills all 5, then reads 2 (a move of 7) or -9 (a move
+        # of -4, away from zero): neither is a count the order could have sold
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5}, reply={"KX-B": "raise"},
+                                 outside={"KX-B": outside})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold) == ("manual_review", {"KX-A": 0})
+        assert [body["ticker"] for body in exchange.bodies] == ["KX-B"]
+
+    @pytest.mark.parametrize("positions, error", [
+        ({"KX-A": 5, "KX-B": -3},
+         "not sent: KX-B now holds 3 NO contracts; the plan holds 5 NO contracts"),
+        ({"KX-A": 3, "KX-B": -5},
+         "not sent: KX-A now holds 3 YES contracts; the plan holds 5 YES contracts"),
+        ({"KX-A": 5, "KX-B": 5},
+         "not sent: KX-B now holds 5 YES contracts; the plan holds 5 NO contracts"),
+    ])
+    def test_a_pair_whose_holding_changed_sends_nothing(self, monkeypatch, caplog,
+                                                        positions, error):
+        exchange = _SaleExchange(positions)
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold, result.error) == (
+            "not_sold", {"KX-B": 0, "KX-A": 0}, error)
+        # Both markets are read; nothing is sent
+        assert exchange.events == [("read", "KX-B"), ("read", "KX-A")]
+        assert exchange.positions == positions
+        assert any(r.levelno == logging.WARNING and r.getMessage() == (
+            f"Not sold 'Test position': {error[len('not sent: '):]}; nothing sent")
+            for r in caplog.records)
+
+    def test_a_lone_market_that_cannot_be_read_first_sends_nothing(self, monkeypatch):
+        plan = _sale_plan((_held("KX-A", "yes"), [[0.45, 10]]),
+                          partner=_paid_out("KX-P", "no"))
+        exchange = _SaleExchange({"KX-A": 5}, down={"KX-A"})
+        [result] = self._sell(monkeypatch, exchange, [plan])
+        assert (result.status, result.sold, result.error) == (
+            "not_sold", {"KX-A": 0}, "not sent: the position on KX-A could not be read")
+        assert exchange.bodies == []
+
+    def test_a_sub_cent_grid_sells_at_its_own_levels(self, monkeypatch):
+        grid = {"structure": "center_deci_edge_centi_cent",
+                "ranges": CENTER_DECI_EDGE_CENTI_BANDS}
+        # A lone YES walked to 0.0098, on the 0.0001 band at the bottom
+        lone = _sale_plan((_held("KX-C", "yes", **grid), [[0.0099, 2], [0.0098, 10]]),
+                          partner=_paid_out("KX-P", "no"))
+        # A pair at the 0.99 boundary: KX-B (NO walked to 0.0099, a YES bid at
+        # 0.9901) is the thinner book and goes first; KX-A's walk for 5
+        # reaches 0.99, and one 0.0001 tick below it rounds back up to 0.99
+        pair = _sale_plan((_held("KX-A", "yes", **grid), [[0.9902, 2], [0.99, 10]]),
+                          (_held("KX-B", "no", **grid), [[0.0099, 5]]))
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5, "KX-C": 5})
+        results = self._sell(monkeypatch, exchange, [lone, pair])
+        assert [r.status for r in results] == ["sold", "sold"]
+        assert [(b["ticker"], b["side"], b["price"]) for b in exchange.bodies] == [
+            ("KX-C", "ask", "0.0098"), ("KX-B", "bid", "0.9901"), ("KX-A", "ask", "0.9900")]
+
+    def test_a_dry_run_sends_and_reads_nothing(self, monkeypatch, caplog):
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_pair_plan()], dry_run=True)
+        assert (result.status, result.sold, result.error) == (
+            "simulated", {"KX-B": 5, "KX-A": 5}, None)
+        assert exchange.events == []
+        [line] = [r.getMessage() for r in caplog.records if "[DRY RUN]" in r.getMessage()]
+        assert line == (
+            "[DRY RUN] Would sell 'Test position': 5 NO contracts on KX-B (YES bid at"
+            " 0.5000, so 0.5000 or more a NO contract), then 5 YES contracts on KX-A"
+            " (ask at 0.4300)"
+        )
+
+    def test_nothing_is_sent_once_the_no_leg_mapping_is_disproven(self, monkeypatch):
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", True)
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5})
+        [result] = self._sell(monkeypatch, exchange, [_pair_plan()])
+        assert (result.status, result.sold, result.error) == (
+            "not_sold", {"KX-B": 0, "KX-A": 0},
+            "not sent: V2 NO-leg mapping disproven earlier in this run")
+        assert exchange.events == []
+
+    def test_on_equal_depth_the_first_ticker_goes_first(self, monkeypatch):
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5})
+        plan = _sale_plan((_held("KX-B", "no"), [[0.50, 5]]),
+                          (_held("KX-A", "yes"), [[0.45, 5]]))
+        self._sell(monkeypatch, exchange, [plan])
+        assert [body["ticker"] for body in exchange.bodies] == ["KX-A", "KX-B"]
+
+    def test_the_thinner_book_goes_first_whichever_side_it_is(self, monkeypatch):
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": -5})
+        plan = _sale_plan((_held("KX-A", "yes"), [[0.45, 5]]),
+                          (_held("KX-B", "no"), [[0.50, 40]]))
+        self._sell(monkeypatch, exchange, [plan])
+        assert [body["ticker"] for body in exchange.bodies] == ["KX-A", "KX-B"]
+
+    @pytest.mark.parametrize("plan", [
+        # No held market
+        seller.SalePlan(title="Test position", legs=(_paid_out("KX-P", "no"),), count=5,
+                        cost_dollars=2.0, ladders={}, walked={}, proceeds_dollars=0.0,
+                        profits=(), days_left=10, level=0.8),
+        # A count that is not a whole number
+        dataclasses.replace(
+            _sale_plan((_held("KX-A", "yes"), [[0.45, 10]])),
+            legs=(dataclasses.replace(_held("KX-A", "yes"), count=5.0),)),
+        # No walked bid for the held market
+        dataclasses.replace(_sale_plan((_held("KX-A", "yes"), [[0.45, 10]])), walked={}),
+        # Two held markets on one side
+        _sale_plan((_held("KX-A", "yes"), [[0.45, 10]]), (_held("KX-B", "yes"), [[0.45, 10]])),
+    ])
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_a_plan_its_orders_cannot_be_built_for_sends_nothing(self, monkeypatch, caplog,
+                                                                 plan, dry_run):
+        # A dry run checks the plan too, so it reports a sale only where a
+        # live run would try one
+        exchange = _SaleExchange({"KX-A": 5, "KX-B": 5})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [plan], dry_run=dry_run)
+        assert (result.status, result.sold) == ("not_sold", {})
+        assert result.error.startswith("not sent: ")
+        assert exchange.events == []
+        assert not any("[DRY RUN]" in r.getMessage() for r in caplog.records)
+        assert any(r.levelno == logging.ERROR and r.getMessage().startswith("Not sold ")
+                   for r in caplog.records)
+
+    def test_an_unexpected_error_is_recorded_and_the_rest_still_sell(self, monkeypatch, caplog):
+        real = trader._sell_one
+        broken = _pair_plan()
+
+        def sell_one(client, plan, *, dry_run):
+            if plan is broken:
+                raise RuntimeError("boom")
+            return real(client, plan, dry_run=dry_run)
+
+        monkeypatch.setattr(trader, "_sell_one", sell_one)
+        other = _sale_plan((_held("KX-C", "yes"), [[0.45, 10]]),
+                           partner=_paid_out("KX-P", "no"))
+        exchange = _SaleExchange({"KX-C": 5})
+        with caplog.at_level(logging.INFO):
+            results = self._sell(monkeypatch, exchange, [broken, other])
+        assert [(r.status, r.sold) for r in results] == [
+            ("manual_review", {}), ("sold", {"KX-C": 5})]
+        assert results[0].error == "unexpected error: RuntimeError: boom"
+        assert any(r.levelno == logging.CRITICAL and "UNKNOWN" in r.getMessage()
+                   for r in caplog.records)
+
+
+class TestSaleCountHelpers:
+    """The account's evidence for an unclear sale: the move toward zero
+    (_contracts_sold), read as a whole count from 0 to what was asked
+    (_whole_count), and the check that a market still holds the plan's
+    count before any order (_holding_problem)."""
+
+    @pytest.mark.parametrize("before, after, side, expected", [
+        (5.0, 2.0, "yes", 3.0),
+        (-5.0, -2.0, "no", 3.0),
+        (5.0, 8.0, "yes", -3.0),
+        (-5.0, -8.0, "no", -3.0),
+        (None, 2.0, "yes", None),
+        (5.0, None, "no", None),
+        (5.0, float("nan"), "yes", None),
+        (float("inf"), 2.0, "yes", None),
+    ])
+    def test_contracts_sold_is_the_move_toward_zero(self, before, after, side, expected):
+        assert trader._contracts_sold(before, after, side) == expected
+
+    @pytest.mark.parametrize("value, expected", [
+        (0.0, 0), (3.0, 3), (5.0, 5), (3.0000001, 3),
+        (-1.0, None), (6.0, None), (2.5, None), (None, None),
+    ])
+    def test_whole_count_is_a_whole_number_from_zero_to_the_count(self, value, expected):
+        assert trader._whole_count(value, 5) == expected
+
+    @pytest.mark.parametrize("side, before, expected", [
+        ("yes", 5.0, None),
+        ("no", -5.0, None),
+        ("yes", 5.0000001, None),
+        ("no", 5.0, "KX-A now holds 5 YES contracts; the plan holds 5 NO contracts"),
+        ("yes", 4.0, "KX-A now holds 4 YES contracts; the plan holds 5 YES contracts"),
+        ("yes", 0.0, "KX-A now holds nothing; the plan holds 5 YES contracts"),
+        ("yes", None, "the position on KX-A could not be read"),
+        ("no", float("nan"), "the position on KX-A could not be read"),
+    ])
+    def test_holding_problem_wants_the_plans_count_on_its_side(self, side, before, expected):
+        assert trader._holding_problem(_held("KX-A", side), before) == expected
+
+
+class TestSaleOrdersAreSentOnce:
+    """Syntax-tree checks: a sale order is one POST after one pacer place,
+    never retried, and the sale path never reads a reply as a buy leg's."""
+
+    _SALE_FUNCTIONS = ("sell_positions", "_sell_one", "_sell_lone", "_sell_pair",
+                       "_simulate_sale", "_sell_leg", "_submit_sale_v2", "_sale_fill_count")
+
+    @staticmethod
+    def _calls(fn) -> list[ast.Call]:
+        return [node for node in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(fn))))
+                if isinstance(node, ast.Call)]
+
+    def test_submit_sale_v2_makes_one_post_after_one_pacer_place(self):
+        calls = self._calls(trader._submit_sale_v2)
+        posts = [c for c in calls
+                 if isinstance(c.func, ast.Name) and c.func.id == "signed_request_json"]
+        places = [c for c in calls
+                  if isinstance(c.func, ast.Attribute) and c.func.attr == "acquire"
+                  and isinstance(c.func.value, ast.Name)
+                  and c.func.value.id == "_ORDER_WRITE_PACER"]
+        assert len(posts) == 1 and len(places) == 1
+        assert places[0].lineno < posts[0].lineno
+        tree = ast.parse(textwrap.dedent(inspect.getsource(trader._submit_sale_v2)))
+        assert not any(isinstance(node, (ast.For, ast.While, ast.Try)) for node in ast.walk(tree))
+        assert not _calls_retry_wrapper(trader._submit_sale_v2)
+
+    def test_only_submit_sale_v2_posts_on_the_sale_path(self):
+        for name in self._SALE_FUNCTIONS:
+            if name == "_submit_sale_v2":
+                continue
+            called = {c.func.id for c in self._calls(getattr(trader, name))
+                      if isinstance(c.func, ast.Name)}
+            assert "signed_request_json" not in called, name
+
+    def test_the_sale_path_never_reads_a_reply_as_a_buy_leg(self):
+        # _v2_fill_status raises on a partial fill, a normal outcome for a sale
+        for name in self._SALE_FUNCTIONS:
+            called = {c.func.id for c in self._calls(getattr(trader, name))
+                      if isinstance(c.func, ast.Name)}
+            assert not called & {"_v2_fill_status", "_submit_order_v2"}, name

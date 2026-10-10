@@ -12,7 +12,9 @@ Purpose:
     that made it; every other fill in the account counts as "Other bets"
     (your own trades). Then every fill and payout is replayed, oldest first,
     into a ledger of the contracts each owner bought, sold and was paid for,
-    with the cash each one moved.
+    with the cash each one moved. The bot's sale orders are Other bets fills,
+    read as sales by hand: a held pair's two sale orders, within
+    config.LIVE_MANUAL_PAIR_SECONDS of each other, close its purchase first.
 
     From the ledger it values the account over time: the cash, and each
     holding at its midpoint, just before the bot's first trade, at each of
@@ -120,6 +122,10 @@ _PAIR_STATUSES = frozenset({"executed", "manual_review"})
 # The start of a trade-log row's Notes: "[time_series: YES A / NO B ..."
 _NOTE = re.compile(r"^\[(\w+): (YES|NO) A / (YES|NO) B")
 
+# The start of a sale row's Notes (a held position the bot sold), exactly as
+# reporter._sale_to_row writes it. A sale row is never read as a purchase.
+_SALE_NOTE = "[sale: "
+
 # The trade-log header cells this module reads (0-based column: header).
 # Columns 11 and 12 (the counts) are left out: older logs name them
 # differently, and their place has never changed.
@@ -128,6 +134,7 @@ _LOG_HEADERS = {0: "Date", 1: "Time", 2: "Market A", 3: "Ticker A", 5: "Ticker B
 
 # Column positions in a trade-log row (0-based)
 _COL_DATE, _COL_TIME, _COL_TITLE, _COL_TICKER_A, _COL_TICKER_B = 0, 1, 2, 3, 5
+_COL_MARKET_B = 4
 _COL_COUNT_A, _COL_COUNT_B, _COL_STATUS, _COL_NOTES = 11, 12, 16, 17
 _LOG_COLUMNS = 18
 
@@ -754,10 +761,14 @@ class RunStart:
         logged_at (datetime): When the run wrote the log (UTC).
         cash_before (Decimal): The banner's "Balance before": the cash before
             the run traded, each shard rounded down to the cent.
+        sold_markets (frozenset[str]): For the banner above a run's sales, the
+            markets its sale orders may have filled on; empty for a banner above
+            purchases.
     """
     run_after: datetime
     logged_at: datetime
     cash_before: Decimal
+    sold_markets: frozenset[str] = frozenset()
 
 
 def trade_log_paths() -> list[Path]:
@@ -824,6 +835,36 @@ def _status(row: tuple) -> str:
         str: The status ("" for an empty cell).
     """
     return str(row[_COL_STATUS] or "").strip()
+
+
+def _sale_markets(row: tuple) -> set[str]:
+    """
+    The markets a sale row's orders may have filled on.
+
+    A held market counts unless its count reads 0 or less; a paid-out partner
+    (Market cell reporter.PAID_OUT_MARKET) and a "not sold" row's markets never do.
+
+    Args:
+        row (tuple): A sale row's values.
+
+    Returns:
+        set[str]: The tickers.
+    """
+    if _status(row) == reporter._SALE_STATUS_WORDS["not_sold"]:
+        return set()
+    markets = set()
+    for market_col, ticker_col, count_col in ((_COL_TITLE, _COL_TICKER_A, _COL_COUNT_A),
+                                              (_COL_MARKET_B, _COL_TICKER_B, _COL_COUNT_B)):
+        if not row[ticker_col] or row[market_col] == reporter.PAID_OUT_MARKET:
+            continue
+        count = row[count_col]
+        try:
+            if count not in (None, "") and _dec(count) <= 0:
+                continue
+        except ValueError:
+            pass                                      # unreadable: it may have sold
+        markets.add(str(row[ticker_col]))
+    return markets
 
 
 class _NotATradeLog(Exception):
@@ -894,19 +935,24 @@ def read_trade_logs(paths: Iterable[Path]) -> tuple[list[BotTrade], list[RunStar
     Read the bot's purchases and real runs from its trade logs.
 
     A row is a real run's when its status is anything but "simulated" (a dry
-    run's rows are simulated and never bound a window). Each real run's
+    run's rows are simulated, but for a "not sold" or "check" sale row). Each real run's
     orders are looked for after the previous real run's log time (and at
     most config.LIVE_BOT_RUN_WINDOW_SECONDS before its own). A row repeated
     exactly, in the same log or another, is read once. A file or row that
     cannot be read, or a status this does not know, is a warning, never an
     exception: those trades then count as Other bets.
 
+    A sale row (Notes starting _SALE_NOTE) is never a purchase or a warning.
+    A run that sells logs its sales before its purchases, under a banner and
+    log time of their own, so its sales and its purchases each get a RunStart
+    (the sales' carries sold_markets).
+
     Args:
         paths (Iterable[Path]): The trade logs, e.g. trade_log_paths().
 
     Returns:
         tuple: The bot's purchases (rows whose status is in _BOT_STATUSES),
-            oldest first; one RunStart per real run whose banner row gives
+            oldest first; one RunStart per real run's log time whose banner row gives
             its cash before; and the warnings.
     """
     entries: list[tuple] = []
@@ -933,15 +979,19 @@ def read_trade_logs(paths: Iterable[Path]) -> tuple[list[BotTrade], list[RunStar
     window = timedelta(seconds=config.LIVE_BOT_RUN_WINDOW_SECONDS)
     after = {t: max(real[i - 1], t - window) if i else t - window for i, t in enumerate(real)}
     trades: list[BotTrade] = []
-    starts: list[RunStart] = []
-    started: set[datetime] = set()
+    # By log time: the banner cash (from the first row with one) and the markets sold
+    cash_before: dict[datetime, Decimal] = {}
+    sold_markets: dict[datetime, set[str]] = defaultdict(set)
     for logged, _, trade_id, row, banner_cash in sorted(entries, key=lambda e: (e[0], e[1])):
         status = _status(row)
         if status == "simulated":
             continue
-        if logged not in started and banner_cash is not None:
-            starts.append(RunStart(after[logged], logged, banner_cash))
-            started.add(logged)
+        if logged not in cash_before and banner_cash is not None:
+            cash_before[logged] = banner_cash
+        if str(row[_COL_NOTES] or "").startswith(_SALE_NOTE):
+            # A sale, not a purchase: record only the markets its orders may have filled on
+            sold_markets[logged].update(_sale_markets(row))
+            continue
         if status not in _BOT_STATUSES:
             if status not in _OTHER_STATUSES:
                 warnings.append(f"{trade_id}: its status {status!r} is not one this page "
@@ -959,6 +1009,8 @@ def read_trade_logs(paths: Iterable[Path]) -> tuple[list[BotTrade], list[RunStar
             continue
         trades.append(BotTrade(trade_id, status, str(row[_COL_TITLE] or row[_COL_TICKER_A]),
                                legs, after[logged], logged))
+    starts = [RunStart(after[logged], logged, cash, frozenset(sold_markets.get(logged, ())))
+              for logged, cash in cash_before.items()]
     return trades, starts, warnings
 
 
@@ -1267,7 +1319,7 @@ def _close_rank(lot: _Lot, owner: str, partners: frozenset[str],
     The bot's own close (an unwind) takes its own lots first. Your own sale
     takes, first, the lots of a bot purchase whose other market you also
     sold within config.LIVE_MANUAL_PAIR_SECONDS (one pair sold by hand),
-    then your own lots, then the oldest.
+    then your own lots, then the oldest. The bot's sale orders rank as your own sales.
 
     Args:
         lot (_Lot): The open lot.
@@ -2468,13 +2520,18 @@ class CashCheck:
 
 
 def check_logged_cash(account: Account, ledger: Ledger, runs: list[RunStart],
-                      first_bot_fill: dict[datetime, datetime]) -> CashCheck:
+                      first_bot_fill: dict[datetime, datetime], *,
+                      bot_fill_ids: frozenset[str] = frozenset()) -> CashCheck:
     """
     Check each real run's logged "Balance before" against the cash rebuilt from Kalshi's records.
 
     Every real run is checked, those before the bot's first fill included:
     the cash is rebuilt (cash_at, which holds at any moment) just before the
-    run's first bot fill, or at its log time when it had none. The logged
+    run's first bot fill, or at its log time when it had none. For a banner
+    above a run's sales (RunStart.sold_markets), it is rebuilt just before the
+    earlier of that fill and its first fill on a market it sold, in the window
+    match_bot_fills reads purchases in; a fill the bot's purchases own
+    (bot_fill_ids) is never taken for a sale. The logged
     figure rounds each shard's cash down to the cent, so it matches when the
     rebuilt cash is at most config.LIVE_CASH_CHECK_BELOW_DOLLARS below it and
     less than config.LIVE_CASH_CHECK_ABOVE_PER_SHARD_DOLLARS per shard above
@@ -2490,11 +2547,13 @@ def check_logged_cash(account: Account, ledger: Ledger, runs: list[RunStart],
         runs (list[RunStart]): The real runs, from read_trade_logs.
         first_bot_fill (dict[datetime, datetime]): Each run's first bot fill,
             by the run's log time.
+        bot_fill_ids (frozenset[str]): Keyword-only. The fills the bot's purchases own.
 
     Returns:
         CashCheck: The result.
     """
     cash_then = _cash_reader(account, ledger)
+    step = timedelta(seconds=config.LIVE_TRADE_LOG_TIME_STEP_SECONDS)
     low = -Decimal(config.LIVE_CASH_CHECK_BELOW_DOLLARS)
     high = Decimal(config.LIVE_CASH_CHECK_ABOVE_PER_SHARD_DOLLARS) * max(1, account.shards)
     matched = checked = 0
@@ -2502,6 +2561,13 @@ def check_logged_cash(account: Account, ledger: Ledger, runs: list[RunStart],
     misses: list[tuple[datetime, Decimal, Decimal]] = []
     for run in runs:
         first = first_bot_fill.get(run.logged_at)
+        if run.sold_markets:
+            sale = min((f.time for f in account.fills if f.ticker in run.sold_markets
+                        and f.fill_id not in bot_fill_ids
+                        and run.run_after + step < f.time <= run.logged_at + step),
+                       default=None)
+            if sale is not None and (first is None or sale < first):
+                first = sale
         rebuilt = cash_then(first - timedelta(microseconds=1) if first else run.logged_at)
         gap = rebuilt - run.cash_before
         checked += 1
@@ -2852,7 +2918,9 @@ def build_live_view(client: Any, *, risk_free: treasury.RiskFreeRates | None,
     for fill in bot_fills:
         run = run_of[owner_by_fill[fill.fill_id]]
         first_bot_fill.setdefault(run, fill.time)          # bot_fills are oldest first
-    cash_check = check_logged_cash(account, ledger, runs, first_bot_fill)
+    # The bot's purchases' own fills are never read as a run's sale orders
+    cash_check = check_logged_cash(account, ledger, runs, first_bot_fill,
+                                   bot_fill_ids=frozenset(owner_by_fill))
     cash_warnings = _cash_miss_warnings(cash_check)
 
     changing = (["The account kept changing while it was read: the figures may not all be "

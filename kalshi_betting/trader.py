@@ -88,6 +88,10 @@ Purpose:
     and waits until the money has arrived; trades on a shard it could not
     fund are dropped. main._run_prod calls it right after pre_execution_check.
 
+    sell_positions() sells the held positions seller.plan_sales picked, before
+    main._run_prod buys anything: one reduce_only, immediate_or_cancel order
+    per held market (see CLAUDE.md, live selling).
+
 Dependencies:
     Imports from config.py (the order, transfer and write-pacing settings,
     LiveSettings, live_settings, leg_cash_cents, which rounds a leg's cost up
@@ -100,11 +104,13 @@ Dependencies:
     the kalshi_python_sync SDK. scanner's ceil_to_tick and v2_limit_price are
     re-exported here as _ceil_to_tick and _v2_limit_price. Called by main.py
     after select_portfolio() picks the trades.
+    Selling also uses config.SALE_HEDGE_SLIPPAGE_TICKS, scanner.walk_bids and
+    reporter.SaleResult, and reads seller.py's plans by field (never importing seller).
 
 Notes:
     Never retry an order or a collateral transfer: a resent order can fill
     twice or at a worse price, and a resent transfer moves the money twice.
-    _submit_order_v2 and _execute_transfer call signed_request_json directly
+    _submit_order_v2, _submit_sale_v2 and _execute_transfer call signed_request_json directly
     and must never be wrapped in api_call_with_retry. Each POST first takes
     one place on _ORDER_WRITE_PACER (a YES leg uses the place its NO leg held
     for it); that only delays the request, which is still sent once. An HTTP
@@ -154,7 +160,7 @@ Notes:
     themselves (_read_position), because the SDK's position model cannot read
     live replies. The SDK has no method for the V2 order route, so the
     _build_*_order_v2 functions build the JSON body and _submit_order_v2 sends
-    it through _http.signed_request_json.
+    it through _http.signed_request_json (_submit_sale_v2 sends a sale's).
 
     All V2 price math is done in Decimal, never float: the endpoint takes
     dollar-string prices, and binary float noise would produce a string the
@@ -170,7 +176,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import wait as wait_for_futures
 from dataclasses import dataclass
-from decimal import ROUND_FLOOR, Decimal, Inexact, localcontext
+from decimal import Decimal, Inexact, localcontext
 from json import JSONDecodeError
 from typing import Any
 
@@ -187,7 +193,9 @@ from .auth import read_shard_balances
 from .config import (
     ORDER_WRITE_BURST,
     ORDER_WRITES_PER_SECOND,
+    PRICE_EPSILON,
     ROLLBACK_MAX_LOSS_CENTS_PER_CONTRACT,
+    SALE_HEDGE_SLIPPAGE_TICKS,
     TRADER_MAX_WORKERS,
     TRANSFER_PATH,
     TRANSFER_POLL_INTERVAL_SECONDS,
@@ -205,15 +213,19 @@ from .config import (
     leg_cash_cents,
     live_settings,
 )
-from .reporter import TradeResult
+from .reporter import SaleResult, TradeResult
 from .scanner import (
+    _SCANNED_PRICE_QUANTUM,
     ceil_to_tick,
+    floor_to_tick,
     leg_prices,
     leg_sides,
     pair_held,
     tick_size_for_price,
+    v2_bottom_of_grid_price,
     v2_limit_price,
     validate_pair_price,
+    walk_bids,
 )
 from .strategy import TradeSpec
 
@@ -241,13 +253,15 @@ _DELTA_EPS = 1e-6
 #   buying NO         = ASKING (selling YES you do not hold) at 1 - the NO
 #                       price — a short YES position IS a long NO position;
 #   closing a held NO = buying that YES short back, i.e. a reduce-only BID.
+#   closing a held YES = selling it, i.e. a reduce-only ASK.
 # Kept as one table so the mapping is a SINGLE point of correction: if the
-# first live submission shows the exchange interprets a leg the other way
-# round, only these three values change — no builder logic moves.
+# exchange is found to read an order the other way round, only these values
+# change — no builder logic moves.
 _V2_LEG_SIDE: dict[str, str] = {
-    "buy_yes":  "bid",  # buy YES n @ p   -> bid at capped p
-    "buy_no":   "ask",  # buy NO n @ p    -> ask at 1 - capped p
-    "close_no": "bid",  # unwind held NO  -> reduce-only bid at an aggressive price
+    "buy_yes":   "bid",  # buy YES n @ p   -> bid at capped p
+    "buy_no":    "ask",  # buy NO n @ p    -> ask at 1 - capped p
+    "close_no":  "bid",  # close held NO   -> reduce-only YES bid (unwind or sale)
+    "close_yes": "ask",  # sell held YES   -> reduce-only ask on the YES book
 }
 
 
@@ -821,8 +835,9 @@ def _v2_top_of_grid_price(market: Any) -> Decimal:
     linear-cent grid, 0.999 on deci-cent, 0.9999 on a centi-cent edge band.
 
     Split out of _v2_rollback_price so the top-of-grid level has ONE definition:
-    the rollback uses it as the upper clamp on its loss-floored bid, and the
-    human-run V2 probe's unfillable-ask step submits at exactly this level.
+    the rollback uses it as the upper clamp on its loss-floored bid, _sale_limit
+    as the upper clamp on a sale's price, and the human-run V2 probe's
+    unfillable-ask step submits at exactly this level.
     (Named without the module reference on purpose — a pipeline module must
     stay textually as well as structurally free of that tool; a test asserts
     it.) A flat 0.99 would fail to cross asks resting in (0.99, 1) on sub-cent
@@ -836,8 +851,8 @@ def _v2_top_of_grid_price(market: Any) -> Decimal:
         Decimal: The highest valid price level on this market's grid.
     """
     target = Decimal(V2_ROLLBACK_BID_PRICE_DOLLARS)
-    tick = tick_size_for_price(market, float(target))
-    return (target / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+    # Cross-module: scanner's rounding down onto a grid, which a NO sale's bid uses too
+    return floor_to_tick(target, tick_size_for_price(market, float(target)))
 
 
 def _v2_rollback_price(no_leg: _Leg) -> Decimal:
@@ -1218,7 +1233,7 @@ def _submit_order_v2(
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
-        body (dict): Request body from one of the _build_*_order_v2 builders.
+        body (dict): Request body from a buy-leg or unwind builder (never a sale's).
         pace (Callable[[], float] | None): Keyword-only. Called once, right
             before the POST, to wait for its place on the write pacer (e.g. a
             _PairWrites method from _execute_one). None takes a place in turn
@@ -3199,4 +3214,734 @@ def execute_trades(client: Any, specs: list, dry_run: bool = False) -> list:
                     )
                 )
 
+    return results
+
+
+# ─── Selling held positions (sell_positions and its helpers) ─────────────────
+
+
+def _sale_limit(market: Any, side: str, lowest_bid: float, slippage_ticks: int) -> Decimal:
+    """
+    The limit price of a sale order, on the market's own grid.
+
+    The floor is the lowest bid reached selling the sale's count down the
+    market's bids, best first (the "walk"), less `slippage_ticks` ticks. A
+    held YES is sold by an ask at the floor rounded UP onto the grid, a held
+    NO by a YES bid at 1 minus the floor rounded DOWN, so neither sells
+    below the floor. The price is then clamped to the grid's lowest and
+    highest levels; a clamp can pass the floor only where no bid can rest.
+
+    Args:
+        market (Any): The held market (an ApiMarket), whose grid is used.
+        side (str): The side held, "yes" or "no".
+        lowest_bid (float): The walk's lowest bid, a dollar price of the side held;
+            in (0, 1).
+        slippage_ticks (int): Ticks below that bid it may fill; 0 or more.
+
+    Returns:
+        Decimal: The ask (held YES) or YES bid (held NO), a level of the grid.
+
+    Raises:
+        ValueError: For a side other than "yes" or "no".
+    """
+    if side not in ("yes", "no"):
+        raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+    # Six decimals first: no Kalshi price has a seventh, and float noise
+    # (1 - 0.43 is 0.5700000000000001) would move the price a tick in the rounding below
+    walked = Decimal(str(lowest_bid)).quantize(_SCANNED_PRICE_QUANTUM)
+    if side == "yes":
+        # Cross-module: the floor, slippage_ticks of the market's ticks below the bid
+        # (scanner's lookup); at least 0, so the next tick lookup reads a price in [0, 1]
+        floor_price = max(
+            walked - slippage_ticks * tick_size_for_price(market, float(walked)),
+            Decimal("0"),
+        )
+        # Cross-module: rounded UP, so the YES never sells below the floor
+        price = ceil_to_tick(floor_price, tick_size_for_price(market, float(floor_price)))
+    else:
+        level = Decimal("1") - walked
+        # Cross-module: 1 minus the floor: the YES-book price of the walked NO bid,
+        # plus slippage_ticks ticks of the grid there; kept at 1 or less so the
+        # next tick lookup reads a price in [0, 1]
+        cap = min(
+            level + slippage_ticks * tick_size_for_price(market, float(level)),
+            Decimal("1"),
+        )
+        # Cross-module: rounded DOWN, so the NO never sells below the floor
+        price = floor_to_tick(cap, tick_size_for_price(market, float(cap)))
+    # Cross-module: the grid's lowest tradeable level (a buy leg's lower clamp too)
+    bottom = v2_bottom_of_grid_price(market)
+    return min(max(price, bottom), _v2_top_of_grid_price(market))
+
+
+def _build_sale_order_v2(market: Any, side: str, count: int, limit: Decimal) -> dict:
+    """
+    Build the V2 order body that sells `count` held contracts of one side.
+
+    Args:
+        market (Any): The held market (an ApiMarket): ticker and shard.
+        side (str): The side held, "yes" or "no".
+        count (int): Whole contracts to sell; 1 up to the count held.
+        limit (Decimal): The price from _sale_limit.
+
+    Returns:
+        dict: JSON body for POST config.V2_ORDER_PATH.
+
+    Raises:
+        ValueError: For a side other than "yes" or "no".
+    """
+    if side not in ("yes", "no"):
+        raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+    return {
+        "ticker": market.ticker,
+        "client_order_id": str(uuid.uuid4()),
+        "side": _V2_LEG_SIDE["close_yes" if side == "yes" else "close_no"],
+        "price": _format_price(limit),
+        "count": _format_count(count),
+        # The only time in force the endpoint accepts with reduce_only
+        "time_in_force": "immediate_or_cancel",
+        # Required by the V2 endpoint — see config.V2_SELF_TRADE_PREVENTION_TYPE
+        "self_trade_prevention_type": V2_SELF_TRADE_PREVENTION_TYPE,
+        # This market's own shard, never the -1 auto-route — see _build_no_order_v2
+        "exchange_index": market.exchange_index,
+        # Can only shrink the position held, never open one
+        "reduce_only": True,
+        "post_only": False,
+    }
+
+
+def _submit_sale_v2(client: Any, body: dict) -> Any:
+    """
+    Send one sale order, never retried (a resent sale could sell twice).
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        body (dict): Request body from _build_sale_order_v2.
+
+    Returns:
+        Any: The parsed reply body (normally a dict carrying the order).
+
+    Raises:
+        Exception: Whatever the POST raises: ApiException on an error reply
+            (HTTP 429 included), a transport error, or JSONDecodeError.
+    """
+    # One pacer place per POST, taken before logging so the log time is the send time
+    _ORDER_WRITE_PACER.acquire()
+    # Logged first: its client_order_id finds the order if the outcome is unclear
+    logging.info(
+        "Submitting V2 sale order: ticker=%s side=%s price=%s count=%s client_order_id=%s",
+        body["ticker"], body["side"], body["price"], body["count"], body["client_order_id"],
+    )
+    # Retry-free by design; signed_request_json has no retry logic of its own
+    return signed_request_json(client, "POST", V2_ORDER_PATH, body=body)
+
+
+def _sale_fill_count(data: Any, requested: int) -> int | None:
+    """
+    Read how many contracts a sale order sold from its reply.
+
+    A partial fill is normal for an immediate-or-cancel order, so this is
+    deliberately not _v2_fill_status, which raises on one.
+
+    Args:
+        data (Any): The parsed reply (the order under "order" or at the top).
+        requested (int): The contracts the order asked to sell.
+
+    Returns:
+        int | None: The whole count sold, 0 to `requested`, or None when the
+            reply gives no such count. Never raises.
+    """
+    try:
+        if not isinstance(data, dict):
+            return None
+        inner = data.get("order")
+        order = inner if isinstance(inner, dict) else data
+        fill = _parse_fixed_point(order, "fill_count")
+        if fill is None or not fill.is_finite() or fill != fill.to_integral_value():
+            return None
+        if not 0 <= fill <= requested:
+            return None
+        return int(fill)
+    except Exception:
+        return None
+
+
+def _contracts_sold(before: float | None, after: float | None, side: str) -> float | None:
+    """
+    How far a held position moved toward zero between two readings.
+
+    Args:
+        before (float | None): The signed position before (YES positive, NO negative), or None.
+        after (float | None): The signed position after, or None.
+        side (str): The side held, "yes" or "no".
+
+    Returns:
+        float | None: The contracts sold, or None when a reading is missing
+            or the move is not finite.
+    """
+    delta = _fill_delta(before, after)
+    if delta is None:
+        return None
+    # Toward zero: down for a held YES, up for a held NO
+    moved = -delta if side == "yes" else delta
+    return moved if math.isfinite(moved) else None
+
+
+def _whole_count(value: float | None, most: int) -> int | None:
+    """
+    Read a position move as a whole number of contracts from 0 to `most`.
+
+    Args:
+        value (float | None): The move (_contracts_sold), or None.
+        most (int): The most contracts the order could have sold.
+
+    Returns:
+        int | None: The whole count, or None when the value is missing, not
+            within _DELTA_EPS of a whole number, or outside 0 to `most`.
+    """
+    if value is None:
+        return None
+    whole = round(value)
+    if abs(value - whole) >= _DELTA_EPS or not 0 <= whole <= most:
+        return None
+    return int(whole)
+
+
+def _holding_problem(leg: Any, before: float | None) -> str | None:
+    """
+    Say why a held market must not be sold now, or None when it may.
+
+    Just before a position's first order, each held market must still hold
+    the plan's count (+count YES, -count NO). If one changed since the plan
+    was made (a trade by hand, say), or cannot be read, nothing of the
+    position is sold.
+
+    Args:
+        leg (Any): A held market's seller.SaleLeg (checked by _sale_problem).
+        before (float | None): Its signed position read just now, or None.
+
+    Returns:
+        str | None: The reason (e.g. "KX-B now holds 3 NO contracts; the plan
+            holds 5 NO contracts"), or None when it still holds the plan's count.
+    """
+    expected = leg.count if leg.side == "yes" else -leg.count
+    if before is None or not math.isfinite(before):
+        return f"the position on {leg.ticker} could not be read"
+    if abs(before - expected) >= _DELTA_EPS:
+        return (f"{leg.ticker} now holds {_held_words(before)};"
+                f" the plan holds {_held_words(expected)}")
+    return None
+
+
+def _sell_leg(client: Any, leg: Any, count: int, limit: Decimal,
+              before: float) -> tuple[int | None, bool]:
+    """
+    Send one sale order for a held market and find out how many contracts it sold.
+
+    The order is sent once, never retried. A usable fill count in a 2xx
+    reply decides; otherwise the account does, by how far the position moved
+    toward zero from `before`. The ledger can lag a fill, so while that move
+    is short of the whole count the position is read again after each pause
+    of config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS; the last reading
+    decides, and a failed reading leaves the count unknown.
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        leg (Any): The held market's seller.SaleLeg: ticker, side and market.
+        count (int): Whole contracts to sell; at least 1.
+        limit (Decimal): The order's price, from _sale_limit.
+        before (float): Its signed position before this position's orders.
+
+    Returns:
+        tuple[int | None, bool]: (contracts sold, or None when unknown;
+            whether the account decided it, which main._run_prod re-checks).
+    """
+    ticker = leg.ticker
+    body = _build_sale_order_v2(leg.market, leg.side, count, limit)
+    try:
+        reply = _submit_sale_v2(client, body)
+    except Exception as exc:
+        # One-line description of the error
+        logging.warning(
+            "Sale order on %s raised, so the account decides how many sold: %s",
+            ticker, api_error_summary(exc),
+        )
+    else:
+        sold = _sale_fill_count(reply, count)
+        if sold is not None:
+            return sold, False
+        logging.warning(
+            "Sale order reply on %s did not say how many sold, so the account decides",
+            ticker,
+        )
+    # Read outside the except clause: inside it a failed read would chain the order's
+    # error and could be retried as a network fault. The change, not the holding, counts.
+    moved = _contracts_sold(before, _position_count(client, ticker), leg.side)
+    for pause in V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS:
+        if moved is None or moved >= count - _DELTA_EPS:
+            break
+        time.sleep(pause)
+        moved = _contracts_sold(before, _position_count(client, ticker), leg.side)
+    sold = _whole_count(moved, count)
+    if sold is None:
+        logging.warning(
+            "Could not tell how many contracts the sale order on %s sold (position"
+            " before: %s, moved toward zero by: %s)", ticker, before, moved,
+        )
+    else:
+        logging.info("The account shows the sale order on %s sold %d of %d",
+                     ticker, sold, count)
+    return sold, True
+
+
+def _contracts_text(count: int, side: str) -> str:
+    """
+    Say a number of contracts of one side in plain words.
+
+    Args:
+        count (int): Contracts; 0 or more.
+        side (str): "yes" or "no".
+
+    Returns:
+        str: "nothing", "1 YES contract" or "5 NO contracts".
+    """
+    return _held_words(count if side == "yes" else -count)
+
+
+def _limit_text(side: str, limit: Decimal) -> str:
+    """
+    Say a sale order's limit price in plain words.
+
+    Args:
+        side (str): The side held, "yes" or "no".
+        limit (Decimal): The price sent (_sale_limit).
+
+    Returns:
+        str: "ask at 0.4500", or "YES bid at 0.5600, so 0.4400 or more a NO contract".
+    """
+    if side == "yes":
+        return f"ask at {_format_price(limit)}"
+    return (f"YES bid at {_format_price(limit)}, so {_format_price(Decimal('1') - limit)}"
+            " or more a NO contract")
+
+
+def _order_text(leg: Any, sold: int | None, asked: int, limit: Decimal) -> str:
+    """
+    Describe one sale order and its outcome for a log line.
+
+    Args:
+        leg (Any): The held market's seller.SaleLeg.
+        sold (int | None): Contracts it sold, or None when not known.
+        asked (int): Contracts it asked to sell.
+        limit (Decimal): The price sent.
+
+    Returns:
+        str: e.g. "3 of 5 YES on KX-A sold (ask at 0.4500)".
+    """
+    done = "an unknown number" if sold is None else str(sold)
+    return (f"{done} of {asked} {leg.side.upper()} on {leg.ticker} sold"
+            f" ({_limit_text(leg.side, limit)})")
+
+
+def _walked_lowest(plan: Any, ticker: str) -> float | None:
+    """
+    The lowest bid a plan's walk reached on one held market.
+
+    Args:
+        plan (Any): The seller.SalePlan.
+        ticker (str): A held market's ticker.
+
+    Returns:
+        float | None: SalePlan.walked[ticker][1], or None unless it is in (0, 1).
+    """
+    try:
+        lowest = float(plan.walked[ticker][1])
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+        return None
+    # A NaN fails this comparison, so it is refused too
+    return lowest if 0.0 < lowest < 1.0 else None
+
+
+def _ladder(plan: Any, ticker: str) -> list | None:
+    """
+    A held market's bids for the side held, as the plan read them.
+
+    Args:
+        plan (Any): The seller.SalePlan.
+        ticker (str): A held market's ticker.
+
+    Returns:
+        list | None: [[price, quantity], ...], best first, or None when missing,
+            empty, or any price is outside (0, 1) or quantity outside (0, inf).
+    """
+    try:
+        levels = [[float(price), float(size)] for price, size in plan.ladders[ticker]]
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    if not levels or not all(0.0 < p < 1.0 and 0.0 < s < math.inf for p, s in levels):
+        return None
+    return levels
+
+
+def _sale_problem(plan: Any, leg: Any, *, need_ladder: bool) -> str | None:
+    """
+    Check that a held market of a plan carries everything its sale order needs.
+
+    Args:
+        plan (Any): The seller.SalePlan.
+        leg (Any): One of its held markets (a seller.SaleLeg with a market).
+        need_ladder (bool): Keyword-only. True for a pair, whose orders read the ladder.
+
+    Returns:
+        str | None: Why the market cannot be sold, or None when it can.
+    """
+    if leg.side not in ("yes", "no"):
+        return f"{leg.ticker} has no readable side held"
+    count = leg.count
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        return f"{leg.ticker} has no whole count of contracts held"
+    market = leg.market
+    if getattr(market, "ticker", None) != leg.ticker:
+        return f"{leg.ticker}'s market is not the one held"
+    shard = getattr(market, "exchange_index", None)
+    if isinstance(shard, bool) or not isinstance(shard, int):
+        return f"{leg.ticker} has no readable shard"
+    if _walked_lowest(plan, leg.ticker) is None:
+        return f"{leg.ticker} has no readable walked bid"
+    if need_ladder and _ladder(plan, leg.ticker) is None:
+        return f"{leg.ticker} has no readable bid ladder"
+    return None
+
+
+def _depth_left(plan: Any, leg: Any) -> float:
+    """
+    How many contracts a held market's bids hold past what its sale walks.
+
+    Args:
+        plan (Any): The seller.SalePlan.
+        leg (Any): One of its held markets (checked by _sale_problem).
+
+    Returns:
+        float: Contracts resting at or above the walk's lowest bid, less the
+            contracts held there.
+    """
+    lowest = _walked_lowest(plan, leg.ticker)
+    # PRICE_EPSILON: a level priced at the walked bid itself counts
+    depth = sum(size for price, size in _ladder(plan, leg.ticker)
+                if price >= lowest - PRICE_EPSILON)
+    return depth - leg.count
+
+
+def _sale_legs(plan: Any) -> tuple[list | None, str | None]:
+    """
+    The held markets of a plan, in the order their sale orders are sent.
+
+    A position has one held market (its partner has paid out) or two (an
+    exact pair: one YES and one NO of equal count). A pair sells first the
+    market with less depth left past its walk (_depth_left; ties by ticker),
+    whose order is likelier to fall short; the other is sold to match it.
+
+    Args:
+        plan (Any): The seller.SalePlan.
+
+    Returns:
+        tuple[list | None, str | None]: (the held markets in sending order,
+            None), or (None, why nothing can be sent).
+    """
+    try:
+        held = [leg for leg in plan.legs if leg.market is not None]
+    except (AttributeError, TypeError):
+        return None, "its markets cannot be read"
+    if len(held) not in (1, 2):
+        return None, f"it has {len(held)} held markets, not 1 or 2"
+    for leg in held:
+        problem = _sale_problem(plan, leg, need_ladder=len(held) == 2)
+        if problem is not None:
+            return None, problem
+    if len(held) == 2:
+        if held[0].count != held[1].count or held[0].side == held[1].side:
+            return None, "its two held markets are not one YES and one NO of equal count"
+        held.sort(key=lambda leg: (_depth_left(plan, leg), leg.ticker))
+    return held, None
+
+
+def _hedge_lowest(plan: Any, leg: Any, count: int) -> float:
+    """
+    The lowest bid reached selling `count` contracts down a pair's second market.
+
+    Args:
+        plan (Any): The seller.SalePlan.
+        leg (Any): The pair's second held market (checked by _sale_problem).
+        count (int): Contracts the first order sold; at least 1.
+
+    Returns:
+        float: The walk's lowest bid for `count` on the plan's ladder, or the
+            plan's own walked bid if that ladder is too thin.
+    """
+    # Cross-module: the same bid walk the plan was priced with
+    walk = walk_bids(_ladder(plan, leg.ticker), count)
+    return walk[1] if walk is not None else _walked_lowest(plan, leg.ticker)
+
+
+def _sale_result(plan: Any, status: str, sold: dict, error: str | None,
+                 level: int, line: str, *, decided_by_account: bool = False) -> SaleResult:
+    """
+    Log one position's sale outcome on one line and return its record.
+
+    Args:
+        plan (Any): The seller.SalePlan.
+        status (str): The SaleResult status.
+        sold (dict): Held ticker -> contracts known to be sold.
+        error (str | None): The SaleResult error.
+        level (int): The logging level of the line.
+        line (str): The whole line.
+        decided_by_account (bool): Keyword-only. True when the account decided an order's count.
+
+    Returns:
+        SaleResult: The record for the run.
+    """
+    logging.log(level, "%s", line)
+    return SaleResult(plan=plan, status=status, sold=sold, error=error,
+                      decided_by_account=decided_by_account)
+
+
+def _sell_lone(client: Any, plan: Any, leg: Any, before: float) -> SaleResult:
+    """
+    Sell a lone held market (its partner has paid out) with one order.
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        plan (Any): The seller.SalePlan.
+        leg (Any): Its one held market (checked by _sale_problem).
+        before (float): Its signed position, read just before this sale.
+
+    Returns:
+        SaleResult: "sold", "partly_sold", "not_sold" or "manual_review".
+    """
+    limit = _sale_limit(leg.market, leg.side, _walked_lowest(plan, leg.ticker), 0)
+    sold, by_account = _sell_leg(client, leg, leg.count, limit, before)
+    text = _order_text(leg, sold, leg.count, limit)
+    if sold is None:
+        return _sale_result(
+            plan, "manual_review", {},
+            f"could not tell how many of {leg.count} {leg.side.upper()} on {leg.ticker} sold",
+            logging.CRITICAL,
+            f"SALE OUTCOME UNKNOWN for '{plan.title}': {text} — check the position on"
+            f" {leg.ticker} in the Kalshi UI. Manual review required.",
+            decided_by_account=by_account,
+        )
+    if sold == 0:
+        return _sale_result(plan, "not_sold", {leg.ticker: 0}, "the sale order filled nothing",
+                            logging.WARNING, f"Not sold '{plan.title}': {text}",
+                            decided_by_account=by_account)
+    if sold < leg.count:
+        return _sale_result(
+            plan, "partly_sold", {leg.ticker: sold}, f"sold {sold} of {leg.count}",
+            logging.WARNING,
+            f"Partly sold '{plan.title}': {text}; still held:"
+            f" {_contracts_text(leg.count - sold, leg.side)} on {leg.ticker}",
+            decided_by_account=by_account,
+        )
+    return _sale_result(plan, "sold", {leg.ticker: sold}, None, logging.INFO,
+                        f"Sold '{plan.title}': {text}", decided_by_account=by_account)
+
+
+def _sell_pair(client: Any, plan: Any, first: Any, other: Any,
+               befores: dict[str, float]) -> SaleResult:
+    """
+    Sell an exact held pair with two orders, keeping it balanced.
+
+    The first order sells all of `first`'s contracts at no worse than its
+    walked bid; the second sells exactly as many of `other`'s, at most
+    config.SALE_HEDGE_SLIPPAGE_TICKS ticks below the bid its walk reaches for
+    that count, so what is left is still an exact pair. No second order is
+    sent when the first sells nothing or its count is unknown.
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        plan (Any): The seller.SalePlan.
+        first (Any): The held market sold first (_sale_legs' order).
+        other (Any): The other held market.
+        befores (dict[str, float]): Each held ticker's signed position before the sale.
+
+    Returns:
+        SaleResult: "sold", "partly_sold", "not_sold", "unbalanced" or
+            "manual_review".
+    """
+    count = first.count
+    limit_first = _sale_limit(first.market, first.side, _walked_lowest(plan, first.ticker), 0)
+    first_sold, first_by_account = _sell_leg(client, first, count, limit_first,
+                                             befores[first.ticker])
+    first_text = _order_text(first, first_sold, count, limit_first)
+    if first_sold is None:
+        return _sale_result(
+            plan, "manual_review", {other.ticker: 0},
+            f"could not tell how many of {count} {first.side.upper()} on {first.ticker} sold;"
+            f" nothing sent on {other.ticker}",
+            logging.CRITICAL,
+            f"SALE OUTCOME UNKNOWN for '{plan.title}': {first_text}; nothing sent on"
+            f" {other.ticker}, which still holds {_contracts_text(other.count, other.side)}."
+            " Check both positions in the Kalshi UI: the pair may no longer be balanced."
+            " Manual review required.",
+            decided_by_account=first_by_account,
+        )
+    if first_sold == 0:
+        return _sale_result(
+            plan, "not_sold", {first.ticker: 0, other.ticker: 0},
+            "the first sale order filled nothing", logging.WARNING,
+            f"Not sold '{plan.title}': {first_text}; nothing sent on {other.ticker}",
+            decided_by_account=first_by_account,
+        )
+
+    limit_other = _sale_limit(other.market, other.side,
+                              _hedge_lowest(plan, other, first_sold), SALE_HEDGE_SLIPPAGE_TICKS)
+    other_sold, other_by_account = _sell_leg(client, other, first_sold, limit_other,
+                                             befores[other.ticker])
+    by_account = first_by_account or other_by_account
+    text = f"{first_text}, then {_order_text(other, other_sold, first_sold, limit_other)}"
+    if other_sold is None:
+        return _sale_result(
+            plan, "manual_review", {first.ticker: first_sold},
+            f"sold {first_sold} {first.side.upper()} on {first.ticker}; could not tell how"
+            f" many of {first_sold} {other.side.upper()} on {other.ticker} sold",
+            logging.CRITICAL,
+            f"SALE OUTCOME UNKNOWN for '{plan.title}': {text}. Check both positions in the"
+            " Kalshi UI: the pair may no longer be balanced. Manual review required.",
+            decided_by_account=by_account,
+        )
+    if other_sold < first_sold:
+        left_first = _contracts_text(count - first_sold, first.side)
+        left_other = _contracts_text(other.count - other_sold, other.side)
+        extra = _contracts_text(first_sold - other_sold, other.side)
+        return _sale_result(
+            plan, "unbalanced", {first.ticker: first_sold, other.ticker: other_sold},
+            f"sold {first_sold} {first.side.upper()} on {first.ticker} but only"
+            f" {other_sold} {other.side.upper()} on {other.ticker}: {first.ticker} holds"
+            f" {left_first}, {other.ticker} holds {left_other}",
+            logging.CRITICAL,
+            f"SALE LEFT A PAIR UNBALANCED for '{plan.title}': {text}. {first.ticker} now"
+            f" holds {left_first} and {other.ticker} holds {left_other}, so the pair is no"
+            f" longer balanced. Sell the extra {extra} on {other.ticker} by hand in the"
+            " Kalshi UI, or leave them to pay out.",
+            decided_by_account=by_account,
+        )
+    sold = {first.ticker: first_sold, other.ticker: other_sold}
+    if first_sold < count:
+        return _sale_result(
+            plan, "partly_sold", sold, f"sold {first_sold} of {count} on each market",
+            logging.WARNING,
+            f"Partly sold '{plan.title}': {text}; the other {count - first_sold} on each"
+            " market are still held, as an exact pair",
+            decided_by_account=by_account,
+        )
+    return _sale_result(plan, "sold", sold, None, logging.INFO, f"Sold '{plan.title}': {text}",
+                        decided_by_account=by_account)
+
+
+def _simulate_sale(plan: Any, legs: list) -> SaleResult:
+    """
+    Log the orders a dry run would send for one position, sending nothing.
+
+    Args:
+        plan (Any): The seller.SalePlan.
+        legs (list): Its held markets in sending order (_sale_legs).
+
+    Returns:
+        SaleResult: "simulated", with every held market's full count as sold.
+    """
+    first = legs[0]
+    limit = _sale_limit(first.market, first.side, _walked_lowest(plan, first.ticker), 0)
+    orders = [f"{_contracts_text(first.count, first.side)} on {first.ticker}"
+              f" ({_limit_text(first.side, limit)})"]
+    if len(legs) == 2:
+        other = legs[1]
+        limit = _sale_limit(other.market, other.side, _hedge_lowest(plan, other, first.count),
+                            SALE_HEDGE_SLIPPAGE_TICKS)
+        orders.append(f"{_contracts_text(other.count, other.side)} on {other.ticker}"
+                      f" ({_limit_text(other.side, limit)})")
+    logging.info("[DRY RUN] Would sell '%s': %s", plan.title, ", then ".join(orders))
+    return SaleResult(plan=plan, status="simulated",
+                      sold={leg.ticker: leg.count for leg in legs})
+
+
+def _sell_one(client: Any, plan: Any, *, dry_run: bool) -> SaleResult:
+    """
+    Sell one position, or log what a dry run would send.
+
+    A plan whose orders cannot be built (_sale_legs) is "not_sold", in a dry
+    run too. Before any order, every held market is read and must still hold
+    the plan's count (_holding_problem); otherwise nothing is sent.
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        plan (Any): The seller.SalePlan.
+        dry_run (bool): Keyword-only. True sends and reads nothing.
+
+    Returns:
+        SaleResult: The outcome (see sell_positions).
+    """
+    legs, problem = _sale_legs(plan)
+    if legs is None:
+        return _sale_result(plan, "not_sold", {}, f"not sent: {problem}", logging.ERROR,
+                            f"Not sold '{getattr(plan, 'title', plan)}': {problem};"
+                            " nothing sent")
+    if dry_run:
+        return _simulate_sale(plan, legs)
+    if _V2_NO_MAPPING_DISPROVEN:
+        return _sale_result(
+            plan, "not_sold", {leg.ticker: 0 for leg in legs},
+            "not sent: V2 NO-leg mapping disproven earlier in this run", logging.WARNING,
+            f"Not sold '{plan.title}': the V2 NO-leg mapping was disproven earlier in this"
+            " run; nothing sent",
+        )
+    # Read before any order: the check below, and the baselines _sell_leg judges by
+    befores = {leg.ticker: _position_count(client, leg.ticker) for leg in legs}
+    for leg in legs:
+        changed = _holding_problem(leg, befores[leg.ticker])
+        if changed is not None:
+            return _sale_result(
+                plan, "not_sold", {held.ticker: 0 for held in legs}, f"not sent: {changed}",
+                logging.WARNING, f"Not sold '{plan.title}': {changed}; nothing sent",
+            )
+    if len(legs) == 1:
+        return _sell_lone(client, plan, legs[0], befores[legs[0].ticker])
+    return _sell_pair(client, plan, legs[0], legs[1], befores)
+
+
+def sell_positions(client: Any, plans: list, *, dry_run: bool) -> list[SaleResult]:
+    """
+    Sell the held positions the take-profit rule picked, one at a time, in order.
+
+    main._run_prod calls this before it buys anything. Each held market gets
+    at most one order (a partner that has paid out gets none), sent once,
+    never retried; nothing is sent for a position whose markets no longer
+    hold the plan's count, or while the V2 NO-leg mapping stands disproven
+    (_V2_NO_MAPPING_DISPROVEN).
+
+    Args:
+        client (Any): Authenticated KalshiClient from auth.build_client().
+        plans (list): seller.SalePlan objects, in the order to sell them.
+        dry_run (bool): Keyword-only. True sends no request: each plan whose
+            orders can be built is logged and reported "simulated".
+
+    Returns:
+        list[SaleResult]: One per plan, in order: "sold", "partly_sold" (a
+            pair's rest is still an exact pair), "not_sold" (nothing sold or
+            sent), "unbalanced" (a pair's second order sold fewer than its
+            first), "manual_review" (an order's count is unknown) or
+            "simulated"; "unbalanced" and "manual_review" log a CRITICAL.
+    """
+    results = []
+    for plan in plans:
+        try:
+            results.append(_sell_one(client, plan, dry_run=dry_run))
+        except Exception as exc:
+            # A raise must not end the run's sales unrecorded; what sold is unknown
+            logging.critical(
+                "Unexpected error selling '%s' — what was sold is UNKNOWN; check its"
+                " positions in the Kalshi UI. Manual review required: %s",
+                getattr(plan, "title", plan), api_error_summary(exc), exc_info=True,
+            )
+            results.append(SaleResult(plan=plan, status="manual_review", sold={},
+                                      error=f"unexpected error: {api_error_summary(exc)}"))
     return results
