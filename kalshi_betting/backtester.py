@@ -8094,25 +8094,6 @@ def _live_filter_text(categories: tuple[str, ...] | None,
     return f"categories {_names_text(categories)}; tags {_names_text(tags)}"
 
 
-def _live_filter_is_one_slice(categories: tuple[str, ...] | None,
-                              tags: tuple[str, ...] | None) -> bool:
-    """
-    Say whether a live category/tag filter is ONE of the filter bar's options.
-
-    The bar offers one Category, or one "C · T" Tag option, at a time: one
-    category with at most one tag is one option; anything else may span
-    several.
-
-    Args:
-        categories (tuple[str, ...] | None): The live categories, None for any.
-        tags (tuple[str, ...] | None): The live tags, None for any.
-
-    Returns:
-        bool: True when the filter is one Category or one Tag option.
-    """
-    return categories is not None and len(categories) == 1 and len(tags or ()) <= 1
-
-
 # _LiveRuleView.where: this run's primary scenario holds the saved live
 # defaults' time-series rule, another cell of its grid does, or none does.
 _LIVE_RULE_PRIMARY = "primary"
@@ -8234,14 +8215,10 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
                 "which the dashboard's filter bar shows")
         subject = "that scenario"
     if filtered:
-        # Only the page knows which options the bar offers, so it names them
-        tail += ("; the dashboard's filter bar shows the live category/tag filter as one "
-                 f"Category or Tag option of {subject} (offered where this run filed a "
-                 "pair under it)"
-                 if _live_filter_is_one_slice(categories, tags) else
-                 "; the dashboard's filter bar shows the live category/tag filter one "
-                 f"Category or Tag option of {subject} at a time (each offered where this "
-                 "run filed a pair under it), never as their union")
+        # Only the page knows which boxes its menus offer, so it names them
+        tail += ("; the dashboard's filter bar shows the live category/tag filter of "
+                 f"{subject} when its Category and Tag menus tick the categories and tags "
+                 "the filter lists (each offered where this run filed a pair under it)")
     return (f"{prefix}{rule} — {tail}{_live_rule_ladder_note(sweep)}"
             f"{_live_sizing_note(sweep)}{_live_add_on_note(sweep)}{_live_sell_note(sweep)}")
 
