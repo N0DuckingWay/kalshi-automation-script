@@ -278,6 +278,13 @@ Notes:
     with live selling; _sells_at, _days_left, _ladder_average, _usable_ask and
     _leg_quotes call it there.
 
+    With trim_sweep, it also returns the dashboard's "Trim to Kelly" family
+    (BacktestSweep.trim_sweep, a TrimSweep): every scenario of the same grid
+    with held pairs sold down to their Kelly size (_simulate_at_discount's
+    trim_to_kelly), tier floors on and off, adding to held pairs or not.
+    Like the add-on family it simulates nothing during the run; each cell is
+    simulated when the dashboard reads it.
+
     An ENTRY CHECKPOINT is a moment at which the backtest may open a
     simulated trade: the live bot's weekly run time (config.SCHEDULED_RUN,
     Monday 09:00 America/Los_Angeles) on each run weekday. The backtest keeps
@@ -2273,8 +2280,8 @@ class CapSweep:
     to summarise each cell and drop it; nothing here is memoised, so asking
     for a cell twice simulates it twice.
 
-    Seeded from the eager point. A point's peak_kelly_fraction (its "peak"
-    below; with a walked book, the larger cap_free_from — _sharing_floor
+    Seeded from the eager point. An eager point's peak_kelly_fraction (its
+    "peak" below; with a walked book, the larger cap_free_from — _sharing_floor
     reads whichever applies) does not depend on the cap, and every cap at or
     above it sizes the point's entries identically — provided
     SAME_TITLE_SIZE_CAP, read at call time, is not rebound between the eager
@@ -2297,6 +2304,14 @@ class CapSweep:
     the live enrichment averages a book. The halves and the
     excluding-top-event run use subsets of the point's candidates, whose
     floors are no higher.
+    A sweep that trims to Kelly (trim_to_kelly) has no eager point. Each of
+    its simulations reads its own cap_free_from off its own walk — a trim
+    reads the cap too — and that number certifies sharing only for the run
+    it came from: a run whose cap is at or above it made no decision that
+    depended on the cap, so every larger cap makes the same run. A run
+    over a subset of the entries has a different portfolio value, so its
+    trims can depend on the cap where the full run's do not; such a sweep
+    therefore runs no split-half or top-event check (checks must be False).
     A simulated cap runs quiet — its completion line and its
     premise-violation WARNING go to DEBUG, since the primary-cap run already
     reported the same count and ~10 repeats per cell would flood the log
@@ -2449,13 +2464,17 @@ class CapSweep:
             it runs, and its checks, to sell it (_simulate_at_discount's
             sell_min_days). Needs sell_at. Forwarded only when set. Default
             None (no minimum).
+        trim_to_kelly (bool): Whether every simulation it runs, and its
+            checks, sells held pairs down to their Kelly size
+            (_simulate_at_discount's trim_to_kelly). Forwarded only when
+            True. Default False.
         end_dates (dict): (band, k, population) -> the day that population's
             curves end on, for a cell with no eager point (the eager map is
             empty for a sweep whose setting no eager run shares: one that
-            adds to held pairs or sells early); a cell with an eager point
-            ends where that point's curve ended. A cell in neither map ends
-            on today (UTC) on a sweep that neither adds to held pairs nor
-            sells, and is refused (ValueError) on one that does. The keys
+            adds to held pairs, sells early or trims to Kelly); a cell with
+            an eager point ends where that point's curve ended. A cell in
+            neither map ends on today (UTC) on a sweep that does none of
+            those, and is refused (ValueError) on one that does. The keys
             must be the exact band and k objects the cells are read with.
             Not in repr.
         simulated (int): Simulations this object has run (each cap point
@@ -2489,34 +2508,60 @@ class CapSweep:
     sell_at: float | None = None
     # The fewest days before maturity a sale needs (None: no minimum)
     sell_min_days: int | None = None
+    # Whether every simulation sells held pairs down to their Kelly size
+    trim_to_kelly: bool = False
+
+    def _own_setting(self) -> str | None:
+        """
+        What this sweep's simulations do that no eager run does, in words; None when nothing.
+
+        A sweep that adds to held pairs, sells early or trims to Kelly has no
+        eager point to start from, so it must be built without any and every
+        cell needs its end day (end_dates). The words name the first of the
+        three it does, for the error messages.
+
+        Returns:
+            str | None: "adds to held pairs", "sells early", "trims to Kelly", or None.
+        """
+        if self.add_to_held:
+            return "adds to held pairs"
+        if self.sell_at is not None:
+            return "sells early"
+        return "trims to Kelly" if self.trim_to_kelly else None
 
     def __post_init__(self) -> None:
         """
-        Refuse an add-to-held or selling sweep that was handed eager points, or a bad sell setting.
+        Refuse a sweep with a setting of its own that was handed eager points, or a bad sell setting.
 
-        Every eager point was simulated without adding to held pairs and
-        without selling, and _by_cap returns the eager point itself at the
-        primary cap (and copies of it above its peak), so such a sweep holding
-        one would hand back points that never added or sold, stamped as if
-        they had.
+        Every eager point was simulated without adding to held pairs,
+        selling or trimming, and _by_cap returns the eager point itself at
+        the primary cap (and copies of it above its peak), so a sweep that
+        does one of those and holds an eager point would hand back points
+        that never did it, stamped as if they had.
 
         Raises:
-            ValueError: If add_to_held or sell_at is set and eager is not
-                empty or same_title_eager is not None, if sell_at is not a
-                share in (0, 1], or if sell_min_days is set without sell_at
-                or is not a whole number of at least 1.
+            ValueError: If add_to_held, sell_at or trim_to_kelly is set and
+                eager is not empty or same_title_eager is not None, if
+                sell_at is not a share in (0, 1], if sell_min_days is set
+                without sell_at or is not a whole number of at least 1, or
+                if trim_to_kelly is set with checks (see the class docstring).
         """
         if self.sell_at is not None:
             # Checked as the simulation checks it, before any cell is read
             _resolve_sell_at(self.sell_at)
         # The days rule, checked the same way (it needs a sell level)
         _resolve_sell_min_days(self.sell_min_days, self.sell_at)
-        if ((self.add_to_held or self.sell_at is not None)
+        if (self._own_setting() is not None
                 and (self.eager or self.same_title_eager is not None)):
             raise ValueError(
-                "a CapSweep that adds to held pairs or sells early simulates every cap "
-                "itself: it takes no eager points (eager must be {} and same_title_eager "
-                "None)")
+                "a CapSweep that adds to held pairs, sells early or trims to Kelly "
+                "simulates every cap itself: it takes no eager points (eager must be {} "
+                "and same_title_eager None)")
+        if self.trim_to_kelly and self.checks:
+            raise ValueError(
+                "a CapSweep that trims to Kelly runs no split-half or top-event check "
+                "(checks must be False): a half's trims can depend on the cap at a cap "
+                "the full run shares from")
 
     def _by_cap(
         self,
@@ -2536,8 +2581,8 @@ class CapSweep:
         at or above the cap it shares from;
         else a quiet simulation, pinned to the eager point's end date (with
         no eager point, to end_dates' day for this cell) and run at this
-        sweep's Tier floors, add-on and sell settings (tier_floors,
-        add_to_held, sell_at, sell_min_days), with the split-half and
+        sweep's Tier floors, add-on, sell and Kelly-trim settings (tier_floors,
+        add_to_held, sell_at, sell_min_days, trim_to_kelly), with the split-half and
         top-event checks — at those settings too — when the band sweep ran
         and the population carries them.
 
@@ -2558,15 +2603,16 @@ class CapSweep:
                 with this sweep's tier_floors and add_to_held).
 
         Raises:
-            ValueError: If this sweep adds to held pairs or sells early and
+            ValueError: If this sweep adds to held pairs, sells early or
+                trims to Kelly and
                 end_dates has no day for (band, k, population): its curves
                 would otherwise end on whatever day (UTC) the cell happens to
                 be read.
         """
         out: dict[float, SweepPoint] = {}
         # The eager point is the one the backtest simulated during the run, at
-        # its own cap; the cap it shares from does not depend on the cap, so
-        # it is this subset's too
+        # its own cap; an eager run never trims, so the cap it shares from
+        # does not depend on the cap and is this subset's too
         seed = _sharing_floor(eager_point)
         # Every simulated cap ends its curve where the eager point's ended, not
         # on whatever day (UTC) this cell happens to be read; a cell with no
@@ -2575,12 +2621,12 @@ class CapSweep:
             end_date = _curve_end_date(eager_point)
         else:
             end_date = self.end_dates.get((band, k, population))
-            if end_date is None and (self.add_to_held or self.sell_at is not None):
-                # An add-on or selling sweep has no eager point to fall back
-                # on, so a missing day (a key off by float noise included) is
-                # refused
+            if end_date is None and self._own_setting() is not None:
+                # A sweep with a setting of its own has no eager point to fall
+                # back on, so a missing day (a key off by float noise
+                # included) is refused
                 raise ValueError(
-                    f"CapSweep {'adds to held pairs' if self.add_to_held else 'sells early'} "
+                    f"CapSweep {self._own_setting()} "
                     f"but end_dates has no day for (band, k, population) = "
                     f"{(band, k, population)!r}")
         # The eager point sizes as every cap at or above the seed ONLY if its
@@ -2611,7 +2657,8 @@ class CapSweep:
                                    tier_floors=self.tier_floors,
                                    add_to_held=self.add_to_held,
                                    sell_at=self.sell_at,
-                                   sell_min_days=self.sell_min_days))
+                                   sell_min_days=self.sell_min_days,
+                                   trim_to_kelly=self.trim_to_kelly))
                 self.simulated += 1
                 if self.checks and population in _CHECKED_POPULATIONS:
                     point.halves = _half_split(
@@ -2619,7 +2666,8 @@ class CapSweep:
                         self.initial_balance, k, band, population=population,
                         tier_floors=self.tier_floors, size_cap=cap, quiet=True,
                         end_date=end_date, add_to_held=self.add_to_held,
-                        sell_at=self.sell_at, sell_min_days=self.sell_min_days)
+                        sell_at=self.sell_at, sell_min_days=self.sell_min_days,
+                        trim_to_kelly=self.trim_to_kelly)
                     point.ex_top_event = _ex_top_event(
                         point, subset, self.start_date, self.initial_balance, band,
                         population=population, tier_floors=self.tier_floors, quiet=True,
@@ -3079,6 +3127,107 @@ class SellSweep:
                 yield level, min_days, cells_at(li, level, min_days)
 
 
+@dataclass(frozen=True)
+class TrimSweep:
+    """
+    The dashboard's "Trim to Kelly" family: every scenario with held pairs sold down to their Kelly size, simulated on demand.
+
+    The backtest dashboard's Trim to Kelly select offers "off" (the scenario
+    as simulated) and "on": the same scenario with trim_to_kelly
+    (_simulate_at_discount), where at every weekly checkpoint a held pair
+    worth more than its Kelly share of the portfolio is sold down to it. It
+    covers every band, Tier floors setting, k and size cap the filter bar
+    shows, with adding to held pairs off or on (on, the two together
+    rebalance a pair both ways). Nothing is simulated while the backtest
+    runs: sweep() builds, for one Tier floors and add-on setting, a CapSweep
+    over the same entries the size-cap and add-on families hold, whose cells
+    a report reads one (band, k) at a time, every cap, the "all" population
+    only. Like the add-on family it has no eager point to start from, so
+    each cell's curves end on the day its eager twin's did (end_dates /
+    off_end_dates), and each cap is simulated until one reaches the cap the
+    walk stops depending on (SweepPoint.cap_free_from), which every larger
+    cap shares.
+
+    Retention: none of its own. Its entry maps are the very objects
+    BacktestSweep's size-cap and add-on families already hold.
+
+    Attributes:
+        caps (tuple[float, ...]): The size caps of every scenario (the
+            size-cap sweep's, or the run's own alone).
+        primary_cap (float): The run's own cap.
+        bands (tuple): The tier-on bands.
+        off_bands (tuple): The bands a deadline-gap tier binds at, re-run
+            with the tier floors off; () without the tier-floors-off family.
+        ks (tuple[float, ...]): The k grid.
+        primary_k (float): The run's own k.
+        start_date (date): The backtest's start date.
+        initial_balance (float): The balance every simulation starts from.
+        entries_by_band (dict): Band -> tier-on entries. Not in repr.
+        off_entries_by_band (dict): Binding band -> tier-off entries. Not in repr.
+        end_dates (dict): (band, k, "all") -> the day the tier-on eager
+            point's curve ended. Not in repr.
+        off_end_dates (dict): The same for the tier-off family. Not in repr.
+    """
+    caps: tuple[float, ...]
+    primary_cap: float
+    bands: tuple
+    off_bands: tuple
+    ks: tuple[float, ...]
+    primary_k: float
+    start_date: date
+    initial_balance: float
+    entries_by_band: dict = field(repr=False)
+    off_entries_by_band: dict = field(repr=False)
+    end_dates: dict = field(repr=False)
+    off_end_dates: dict = field(repr=False)
+
+    def sweep(self, *, tier_floors: bool = True, add_to_held: bool = False) -> CapSweep:
+        """
+        The lazy size-cap sweep that trims to Kelly under one Tier floors and add-on setting.
+
+        Args:
+            tier_floors (bool): Keyword-only. True (default) for the tier-on
+                bands; False for the bands the tiers bind at, re-run with the
+                tier floors off.
+            add_to_held (bool): Keyword-only. Whether every simulation may
+                also add to a pair it still holds. Default False.
+
+        Returns:
+            CapSweep: Over that setting's bands and entries, every k and cap,
+                the "all" population only, trimming to Kelly; nothing is
+                simulated until one of its cells is read.
+
+        Raises:
+            ValueError: For tier_floors False on a family with no
+                tier-floors-off bands.
+        """
+        if not tier_floors and not self.off_bands:
+            raise ValueError("this run has no tier-floors-off family to trim in")
+        return CapSweep(
+            caps=self.caps, primary_cap=self.primary_cap,
+            bands=tuple(self.bands if tier_floors else self.off_bands), ks=self.ks,
+            primary_k=self.primary_k, start_date=self.start_date,
+            initial_balance=self.initial_balance, split_date=None, checks=False,
+            entries_by_band=self.entries_by_band if tier_floors else self.off_entries_by_band,
+            st_entries=[], eager={}, tier_floors=tier_floors, add_to_held=add_to_held,
+            end_dates=self.end_dates if tier_floors else self.off_end_dates,
+            trim_to_kelly=True)
+
+    def entry_events(self) -> set[tuple[str, str]]:
+        """
+        Every (event ticker, fallback category) a trimming run's trades could carry.
+
+        Over both Tier floors settings' entries, every qualifying Monday of
+        each (_entry_events): a trim frees cash, so a trimming run can trade
+        a pair no other scenario traded, and a report must list its category
+        and tag before any cell is simulated.
+
+        Returns:
+            set[tuple[str, str]]: (event ticker, category) pairs.
+        """
+        return _entry_events(self.entries_by_band) | _entry_events(self.off_entries_by_band)
+
+
 @dataclass
 class BacktestSweep:
     """
@@ -3277,6 +3426,11 @@ class BacktestSweep:
             days before maturity (config.TAKE_PROFIT_MIN_DAYS), of every
             scenario, simulated when the dashboard reads it. None unless
             run_backtest_sweep(sell_sweep=True) ran on a feasible window.
+        trim_sweep (TrimSweep | None): The dashboard's "Trim to Kelly"
+            family: every scenario with held pairs sold down to their Kelly
+            size, with adding to held pairs off or on, simulated when the
+            dashboard reads it. None unless
+            run_backtest_sweep(trim_sweep=True) ran on a feasible window.
         depth_model (DepthModel | None): The depth model every trade's
             synthetic order book came from (which snapshots, how many
             ladders, when they were taken), for the page's header; None when
@@ -3323,6 +3477,8 @@ class BacktestSweep:
     sell_sweep: SellSweep | None = None
     # The depth model the trades' synthetic books came from (None: top of the book)
     depth_model: DepthModel | None = None
+    # The dashboard's "Trim to Kelly" family, lazy (None unless run_backtest_sweep(trim_sweep=True))
+    trim_sweep: TrimSweep | None = None
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -11259,6 +11415,7 @@ def _sweep_from_candidates(
     sell_sweep: bool = False,
     live: LiveSettings | None | object = _LIVE_NOT_READ,
     depth_model: DepthModel | None = None,
+    trim_sweep: bool = False,
 ) -> BacktestSweep:
     """
     Run every entry pass and every simulation of one backtest over one fetch.
@@ -11379,6 +11536,10 @@ def _sweep_from_candidates(
     on and off, with the same end-date maps, announced by one INFO line. It
     too simulates nothing here.
 
+    With trim_sweep, a TrimSweep is returned (BacktestSweep.trim_sweep) the
+    same way: the same entries, caps, bands, k grid and end-date maps,
+    announced by one INFO line, nothing simulated here.
+
     Args:
         candidates (_Candidates): _prepare_candidates() output. CONSUMED: its
             candles_by_ticker and all_pairs attributes are deleted after
@@ -11431,6 +11592,9 @@ def _sweep_from_candidates(
         depth_model (DepthModel | None): Keyword-only. The depth model every
             entry's quotes carry, so every simulation's trades walk synthetic
             books; None (default) fills every trade at the top of the book.
+        trim_sweep (bool): Keyword-only. When True, also return the Kelly-trim
+            family described above on BacktestSweep.trim_sweep (the same caps
+            as the add-on family). False (default) returns None.
 
     Returns:
         BacktestSweep: primary, points (the primary band's k sweep),
@@ -11442,8 +11606,8 @@ def _sweep_from_candidates(
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
             cap_sweep, tier_off_cap_sweep, add_on_cap_sweep,
             add_on_tier_off_cap_sweep, same_title_size_cap, the eleven live_*
-            fields, entry_checkpoint, sell_sweep and depth_model — see
-            BacktestSweep.
+            fields, entry_checkpoint, sell_sweep, depth_model and trim_sweep
+            — see BacktestSweep.
 
     Raises:
         ValueError: If tier_off_sweep is set without band_sweep (the tier-off
@@ -11703,12 +11867,12 @@ def _sweep_from_candidates(
     # it holds references to points already kept above, never a copy.
     eager: dict[tuple, SweepPoint] = {}
     # (band, k, "all") -> the last day the eager "all" point's curve ends on.
-    # The add-on and sell sweeps end every cell's curves there too, so a cell
-    # and its eager twin cover one span. Filled only with add_on_sweep or
-    # sell_sweep (the tier-off loop fills its own map, since the two share keys).
+    # The add-on, sell and Kelly-trim sweeps end every cell's curves there
+    # too, so a cell and its eager twin cover one span. Filled only with one of
+    # those sweeps (the tier-off loop fills its own map, since the two share keys).
     add_on_end_dates: dict[tuple, date | None] = {}
     add_on_off_end_dates: dict[tuple, date | None] = {}
-    lazy_families = add_on_sweep or sell_sweep
+    lazy_families = add_on_sweep or sell_sweep or trim_sweep
     for bi, band in enumerate(bands, start=1):
         entries = entries_by_band[band]
         # The primary's is the object already measured and logged above.
@@ -11914,6 +12078,23 @@ def _sweep_from_candidates(
                      len(sold.levels), len(sold.min_days), len(sell_caps), len(bands),
                      len(tier_off_bands), len(grid))
 
+    trimmed = None
+    if trim_sweep:
+        # Every scenario again with held pairs sold down to their Kelly size,
+        # over the same grid as the add-on family, tier floors on and off,
+        # adding to held pairs or not; nothing simulated here
+        trim_caps = caps if cap_sweep else (primary.size_cap,)
+        trimmed = TrimSweep(
+            caps=trim_caps, primary_cap=primary.size_cap, bands=tuple(bands),
+            off_bands=tuple(tier_off_bands), ks=tuple(grid), primary_k=effective_k,
+            start_date=start_date, initial_balance=initial_balance,
+            entries_by_band=entries_by_band, off_entries_by_band=tier_off_entries,
+            end_dates=add_on_end_dates, off_end_dates=add_on_off_end_dates)
+        logging.info("Trimming to Kelly: %d size cap(s) x %d band(s) (%d with the tier "
+                     "floors off) x %d k, adding to held pairs or not, each simulated "
+                     "when the dashboard reads it",
+                     len(trim_caps), len(bands), len(tier_off_bands), len(grid))
+
     return BacktestSweep(
         primary=primary, points=points, calibration=calibration,
         label_coverage=candidates.label_coverage,
@@ -11941,6 +12122,7 @@ def _sweep_from_candidates(
         sell_sweep=sold,
         # Where every trade's synthetic book came from, for the page's header
         depth_model=depth_model,
+        trim_sweep=trimmed,
     )
 
 
@@ -11962,6 +12144,7 @@ def run_backtest_sweep(
     sell_sweep: bool = False,
     *,
     depth_model: DepthModel | None = None,
+    trim_sweep: bool = False,
 ) -> BacktestSweep:
     """
     Replay both pair strategies at one interval discount, or at a grid of them —
@@ -12040,6 +12223,14 @@ def run_backtest_sweep(
     over the same grid, tier floors on and off, adding to held pairs or not,
     simulated only when the dashboard reads it. The run logs one setting line
     for it and, from _sweep_from_candidates, one summary line.
+
+    With trim_sweep, the result also carries the dashboard's "Trim to Kelly"
+    family (BacktestSweep.trim_sweep): every scenario of the same grid with
+    held pairs sold down to their Kelly size at each weekly checkpoint
+    (_simulate_at_discount's trim_to_kelly), tier floors on and off, adding
+    to held pairs or not, simulated only when the dashboard reads it. The run
+    logs one setting line for it and, from _sweep_from_candidates, one
+    summary line.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -12121,6 +12312,12 @@ def run_backtest_sweep(
             adds no simulation to the run itself. False (default)
             returns None, as does the infeasible window. Backtest-only: live
             selling never reads it.
+        trim_sweep (bool): Keyword-only. When True, also return
+            BacktestSweep.trim_sweep — a lazy TrimSweep over the same grid,
+            every simulation selling held pairs down to their Kelly size.
+            The flag adds no simulation to the run itself. False (default)
+            returns None, as does the infeasible window. Backtest-only: live
+            trading does not trim.
         depth_model (DepthModel | None): Keyword-only. The depth model every
             trade's synthetic order book is built from
             (depth_model.load_depth_model()); None (default) fills every trade
@@ -12141,8 +12338,8 @@ def run_backtest_sweep(
             tier_off_sweep, the lazy cap_sweep and tier_off_cap_sweep, the
             lazy add-on family (add_on_cap_sweep and
             add_on_tier_off_cap_sweep), same_title_size_cap, the live_*
-            fields, entry_checkpoint, the lazy sell_sweep and depth_model —
-            see BacktestSweep.
+            fields, entry_checkpoint, the lazy sell_sweep, depth_model and
+            the lazy trim_sweep — see BacktestSweep.
 
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
@@ -12290,6 +12487,13 @@ def run_backtest_sweep(
         "when the dashboard is built"
         if sell_sweep else "off — the dashboard's Sell select stays disabled",
     )
+    # And for the Kelly-trim family, the same way
+    logging.info(
+        "Trimming to Kelly (backtest): %s",
+        "on — the dashboard's Trim to Kelly select is simulated when the "
+        "dashboard is built" if trim_sweep else
+        "off — the dashboard's Trim to Kelly select stays disabled",
+    )
     # And the depth model this run builds every trade's synthetic book from
     # (load_depth_model's own line says it was loaded)
     if depth_model is None:
@@ -12345,7 +12549,7 @@ def run_backtest_sweep(
             spread_band=primary_band, band_sweep=band_sweep,
             tier_off_sweep=tier_off_sweep, cap_sweep=cap_sweep,
             add_on_sweep=add_on_sweep, sell_sweep=sell_sweep, live=live,
-            depth_model=depth_model,
+            depth_model=depth_model, trim_sweep=trim_sweep,
         )
     # On every path, "none recorded" included, so the report never omits it
     logging.info("%s", _live_rule_line(result))

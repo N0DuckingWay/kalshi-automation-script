@@ -21184,6 +21184,286 @@ class TestTrimToKelly:
         assert seen == [True, True, True, False, False]
 
 
+class TestTrimCapSweep:
+    """A CapSweep that trims to Kelly (trim_to_kelly=True) has no eager point
+    (it refuses any) and runs no split-half or top-event check. A trim reads
+    the size cap, so each simulation's cap_free_from also covers the largest
+    cap any of its trim decisions depended on, and a simulation is shared
+    only by the caps above one that reached its own. The gate: every cap of
+    SIZE_CAP_SWEEP equals a fresh _simulate_at_discount(...,
+    trim_to_kelly=True, size_cap=cap) on trades and equity.
+
+    The fixture is TestTrimToKelly's pair, qualifying on Mondays 1-3, with a
+    second pair that pays out on Monday 2 and a third bought on Monday 3."""
+
+    _START = date(2026, 1, 1)
+    _END = date(2026, 4, 1)
+    _BAND = (0.0, 1.0)
+    _SUITE = TestSellAtShareOfPotentialProfit
+
+    def _entries(self) -> list[dict]:
+        early = _ladder_record(_ladder_market("PA", "EVP-1", "2026-01-12"),
+                               _ladder_market("PB", "EVP-2", "2026-01-12"), "early",
+                               (_LADDER_M1,))
+        other = _ladder_record(_ladder_market("OA", "EVO-1", "2026-02-10"),
+                               _ladder_market("OB", "EVO-2", "2026-03-20"), "other",
+                               (_LADDER_M3,))
+        candles = dict(self._SUITE._candles(),
+                       PA=[_candle(_ck(_LADDER_M1), 0.20, 0.82)],
+                       PB=[_candle(_ck(_LADDER_M1), 0.60, 0.42)],
+                       OA=[_candle(_ck(_LADDER_M3), 0.20, 0.82)],
+                       OB=[_candle(_ck(_LADDER_M3), 0.60, 0.42)])
+        first = self._SUITE._record((_LADDER_M1, _LADDER_M2, _LADDER_M3))
+        return _quoted([first, early, other], candles)
+
+    def _sweep(self, entries, ks, *, add=False, **kw):
+        options = {
+            "caps": backtester.SIZE_CAP_SWEEP, "primary_cap": 0.20, "bands": (self._BAND,),
+            "ks": tuple(ks), "primary_k": ks[0], "start_date": self._START,
+            "initial_balance": 10_000.0, "split_date": None, "checks": False,
+            "entries_by_band": {self._BAND: entries}, "st_entries": [], "eager": {},
+            "add_to_held": add, "trim_to_kelly": True,
+            "end_dates": {(self._BAND, k, "all"): self._END for k in ks}, **kw}
+        return backtester.CapSweep(**options)
+
+    def _fresh(self, entries, k, cap, add=False, trim=True):
+        return backtester._simulate_at_discount(
+            entries, self._START, 10_000.0, k=k, spread_band=self._BAND, size_cap=cap,
+            quiet=True, end_date=self._END, add_to_held=add, trim_to_kelly=trim)
+
+    @pytest.mark.parametrize("add", [False, True])
+    def test_every_cap_equals_a_fresh_simulation(self, add):
+        entries = self._entries()
+        cs = self._sweep(entries, (0.5, 0.75), add=add)
+        trimmed = cap_bound = 0
+        for k in cs.ks:
+            cell = cs.cell(self._BAND, k)
+            assert all(set(cell[cap]) == {"all"} for cap in cs.caps)
+            free = cell[1.0]["all"]
+            for cap in cs.caps:
+                point, fresh = cell[cap]["all"], self._fresh(entries, k, cap, add)
+                assert (point.size_cap, point.trim_to_kelly, point.add_to_held) == (
+                    cap, True, add)
+                assert [astuple(t) for t in point.trades] == [
+                    astuple(t) for t in fresh.trades], (k, cap)
+                pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df)
+                trimmed += any(t.sold for t in point.trades)
+                # A cap no purchase depends on, where a trim still does: the
+                # run is not the no-cap run, so it must not be shared with it
+                if (cap >= point.peak_kelly_fraction and [astuple(t) for t in point.trades]
+                        != [astuple(t) for t in free.trades]):
+                    cap_bound += 1
+                    assert cap < point.cap_free_from
+                    assert point.trades is not free.trades
+        # The fixture trims, some caps share a simulation, and at some cap a
+        # trim alone (no purchase) depends on the cap
+        assert trimmed > 0 and cs.reused > 0 and cap_bound > 0
+        assert cs.simulated + cs.reused == len(cs.ks) * len(cs.caps)
+
+    def test_the_cells_are_the_trimming_runs_not_the_plain_ones(self):
+        entries = self._entries()
+        cell = self._sweep(entries, (0.75,)).cell(self._BAND, 0.75)
+        plain = self._fresh(entries, 0.75, 0.10, trim=False)
+        assert [astuple(t) for t in cell[0.10]["all"].trades] != [astuple(t)
+                                                                  for t in plain.trades]
+
+    def test_it_takes_no_eager_point(self):
+        entries = self._entries()
+        eager = self._fresh(entries, 0.75, 0.20, trim=False)
+        with pytest.raises(ValueError, match="trims to Kelly simulates every cap itself"):
+            self._sweep(entries, (0.75,), eager={(self._BAND, 0.75, "all"): eager})
+        with pytest.raises(ValueError, match="takes no eager points"):
+            self._sweep(entries, (0.75,), same_title_eager=eager)
+
+    def test_it_runs_no_checks(self):
+        # A half's trims can depend on the cap where the full run's do not
+        with pytest.raises(ValueError, match="runs no split-half or top-event check"):
+            self._sweep(self._entries(), (0.75,), checks=True)
+
+    def test_a_cell_without_an_end_day_is_refused(self):
+        cs = self._sweep(self._entries(), (0.75,), end_dates={})
+        with pytest.raises(ValueError, match="CapSweep trims to Kelly but end_dates has no day"):
+            cs.cell(self._BAND, 0.75)
+
+    def test_the_other_sweeps_keep_their_words(self):
+        entries = self._entries()
+        adds = self._sweep(entries, (0.75,), add=True, end_dates={})
+        with pytest.raises(ValueError, match="CapSweep adds to held pairs but end_dates"):
+            adds.cell(self._BAND, 0.75)
+        sells = self._sweep(entries, (0.75,), trim_to_kelly=False, sell_at=0.25, end_dates={})
+        with pytest.raises(ValueError, match="CapSweep sells early but end_dates"):
+            sells.cell(self._BAND, 0.75)
+
+
+@pytest.fixture(scope="class")
+def trim_run():
+    """The golden band sweep with the Kelly-trim family, over add_on_run's
+    narrowed grid (4 bands x 3 k, two of the bands re-run with the tier floors
+    off), beside the same run with the flag off, one with it left out, one
+    without the size-cap sweep and one without the band sweep. Every
+    simulation during the runs goes through a spy that records its keywords,
+    and each run's INFO log is kept; the spy is undone before any cell is
+    read. The clock is frozen while the runs go. Pins
+    apply_pre_toggle_defaults on its own MonkeyPatch, as add_on_run does."""
+    toggles = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
+        apply_pre_toggle_defaults(toggles)
+        golden = TestPrepareEntriesGolden()
+        golden._patch(mp)
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0, 0.35))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (0.5, 1.0))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5, 1.0))
+        mp.setattr(backtester, "datetime", type(
+            "Clock", (TestCapSweepEndDate._Clock,),
+            {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC)}))
+        sims: list = []
+        real = backtester._simulate_at_discount
+
+        def simulate_spy(raw_entries, start_date, initial_balance, k=None,
+                         spread_band=None, population="all", **kw):
+            sims.append((spread_band, k, population, len(raw_entries), tuple(sorted(kw))))
+            return real(raw_entries, start_date, initial_balance, k=k,
+                        spread_band=spread_band, population=population, **kw)
+
+        mp.setattr(backtester, "_simulate_at_discount", simulate_spy)
+
+        def run(**kw):
+            sims.clear()
+            handler = _LogCapture()
+            root = logging.getLogger()
+            old_level = root.level
+            root.setLevel(logging.INFO)
+            root.addHandler(handler)
+            try:
+                res = run_backtest_sweep(
+                    hist_client=MagicMock(), live_client=MagicMock(),
+                    start_date=golden._START, initial_balance=10_000.0,
+                    same_event_ladders=True, **kw)
+            finally:
+                root.removeHandler(handler)
+                root.setLevel(old_level)
+            return res, list(sims), list(handler.messages)
+
+        every = {"band_sweep": True, "tier_off_sweep": True, "cap_sweep": True}
+        on, sims_on, msgs_on = run(trim_sweep=True, **every)
+        off, sims_off, msgs_off = run(trim_sweep=False, **every)
+        default, sims_default, _ = run(**every)
+        no_cap, _, _ = run(band_sweep=True, tier_off_sweep=True, trim_sweep=True)
+        single, _, _ = run(band_sweep=False, trim_sweep=True)
+        mp.undo()
+        yield SimpleNamespace(
+            on=on, off=off, default=default, no_cap=no_cap, single=single,
+            sims_on=sims_on, sims_off=sims_off, sims_default=sims_default,
+            msgs_on=msgs_on, msgs_off=msgs_off, start=golden._START)
+    finally:
+        mp.undo()
+        toggles.undo()
+
+
+@pytest.mark.usefixtures("trim_run")
+class TestTrimSweep:
+    """run_backtest_sweep(trim_sweep=True): the dashboard's "Trim to Kelly"
+    family, a TrimSweep that builds, for one Tier floors and add-on setting, a
+    lazy CapSweep whose every simulation trims to Kelly. The run itself
+    simulates nothing extra: its points, simulations and INFO log are those
+    of a run without the flag, but for the setting line and the summary
+    line."""
+
+    _TRIMMING = "Trimming to Kelly"
+
+    @staticmethod
+    def _trades(point) -> list:
+        return [astuple(t) for t in point.trades]
+
+    @classmethod
+    def _others(cls, messages) -> list:
+        return [m for m in messages if not m.startswith((cls._TRIMMING, "Peak RSS"))]
+
+    def test_off_is_the_default_and_builds_nothing(self, trim_run):
+        default = inspect.signature(run_backtest_sweep).parameters["trim_sweep"]
+        assert default.default is False and default.kind is default.KEYWORD_ONLY
+        assert trim_run.off.trim_sweep is None and trim_run.default.trim_sweep is None
+
+    def test_on_adds_no_simulation_and_no_run_figure(self, trim_run):
+        assert trim_run.sims_on == trim_run.sims_off == trim_run.sims_default
+        on, off = trim_run.on, trim_run.off
+        assert self._trades(on.primary) == self._trades(off.primary)
+        pd.testing.assert_frame_equal(on.primary.equity_df, off.primary.equity_df)
+        for mine, theirs in ((on.points, off.points), (on.scenarios, off.scenarios),
+                             (on.tier_off_scenarios, off.tier_off_scenarios)):
+            assert len(mine) == len(theirs) > 0
+            for a, b in zip(mine, theirs, strict=True):
+                assert self._trades(a) == self._trades(b)
+                assert a.trim_to_kelly is False
+
+    def test_on_adds_no_info_line_but_its_own(self, trim_run):
+        trimming = [m for m in trim_run.msgs_on if m.startswith(self._TRIMMING)]
+        assert trimming == [
+            f"{self._TRIMMING} (backtest): on — the dashboard's Trim to Kelly select is "
+            "simulated when the dashboard is built",
+            f"{self._TRIMMING}: 20 size cap(s) x 4 band(s) (2 with the tier floors off) x 3 k, "
+            "adding to held pairs or not, each simulated when the dashboard reads it"]
+        assert self._others(trim_run.msgs_on) == self._others(trim_run.msgs_off)
+        assert [m for m in trim_run.msgs_off if m.startswith(self._TRIMMING)] == [
+            f"{self._TRIMMING} (backtest): off — the dashboard's Trim to Kelly select "
+            "stays disabled"]
+
+    def test_the_family_s_axes_are_the_grid_s(self, trim_run):
+        on = trim_run.on
+        family = on.trim_sweep
+        assert isinstance(family, backtester.TrimSweep)
+        assert family.caps == on.cap_sweep.caps and len(family.caps) == 20
+        assert family.bands == on.cap_sweep.bands and family.ks == on.cap_sweep.ks
+        assert family.off_bands == on.tier_off_cap_sweep.bands
+        assert (family.primary_cap, family.primary_k) == (on.primary.size_cap, on.primary.k)
+        # Over the very entries the size-cap sweeps keep (one retention)
+        assert family.entries_by_band is on.cap_sweep.entries_by_band
+        assert family.off_entries_by_band is on.tier_off_cap_sweep.entries_by_band
+        for tier, add in ((True, False), (True, True), (False, False), (False, True)):
+            cs = family.sweep(tier_floors=tier, add_to_held=add)
+            assert (cs.trim_to_kelly, cs.tier_floors, cs.add_to_held, cs.checks) == (
+                True, tier, add, False)
+            assert cs.eager == {} and cs.same_title_eager is None and cs.split_date is None
+            assert cs.bands == (family.bands if tier else family.off_bands)
+            assert cs.caps == family.caps and cs.ks == family.ks
+            # Every cell has the day its eager twin's curve ended on
+            assert all((band, k, "all") in cs.end_dates for band in cs.bands for k in cs.ks)
+        assert family.entry_events() == (on.cap_sweep.entry_events()
+                                         | on.tier_off_cap_sweep.entry_events())
+
+    def test_without_the_size_cap_sweep_the_run_s_own_cap_is_the_axis(self, trim_run):
+        res = trim_run.no_cap
+        assert res.cap_sweep is None
+        assert res.trim_sweep.caps == (res.primary.size_cap,)
+        assert len(res.trim_sweep.off_bands) == 2
+
+    def test_a_single_band_run_has_no_tier_floors_off_half(self, trim_run):
+        family = trim_run.single.trim_sweep
+        assert family.bands == (BACKTEST_DEFAULT_SPREAD_BAND,) and family.off_bands == ()
+        with pytest.raises(ValueError, match="no tier-floors-off family to trim in"):
+            family.sweep(tier_floors=False)
+
+    @pytest.mark.parametrize(("tier", "add"), [(True, False), (True, True), (False, False),
+                                               (False, True)])
+    def test_a_cell_is_a_fresh_trimming_simulation_at_every_cap(self, trim_run, tier, add):
+        on = trim_run.on
+        cs = on.trim_sweep.sweep(tier_floors=tier, add_to_held=add)
+        band, k = cs.bands[0], 0.5
+        cell = cs.cell(band, k)
+        end = cs.end_dates[(band, k, "all")]
+        for cap in cs.caps:
+            point = cell[cap]["all"]
+            fresh = backtester._simulate_at_discount(
+                cs.entries_by_band[band], trim_run.start, 10_000.0, k=k, spread_band=band,
+                size_cap=cap, quiet=True, end_date=end, tier_floors=tier, add_to_held=add,
+                trim_to_kelly=True)
+            assert (point.size_cap, point.trim_to_kelly, point.add_to_held,
+                    point.tier_floors) == (cap, True, add, tier)
+            assert self._trades(point) == self._trades(fresh), cap
+            pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df)
+
+
 class _WalkedSellingGolden(_SellingGolden):
     """The selling golden fixture whose candles carry each hour's volume, so
     buys and sales walk the depth model's books."""

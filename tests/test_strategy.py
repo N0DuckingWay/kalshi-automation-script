@@ -2608,11 +2608,12 @@ class TestTimeSeriesKellyParity:
                          "_ex_top_event", "_entry_events"):
             assert _function_calls(backtester, function, "_entry_mondays"), function
         # ... the census being _entry_events, which every sweep's
-        # entry_events (the size-cap family's and the sell family's) calls
+        # entry_events (the size-cap family's, the sell family's and the
+        # Kelly-trim family's) calls
         census_readers = [
             node for node in ast.walk(ast.parse(inspect.getsource(backtester)))
             if isinstance(node, ast.FunctionDef) and node.name == "entry_events"]
-        assert len(census_readers) == 2
+        assert len(census_readers) == 3
         for node in census_readers:
             assert any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
                        and sub.func.id == "_entry_events"
