@@ -36,7 +36,9 @@ Notes:
     LIVE_RUNS_DIR, which the server reads at call time, so tests redirect it.
     The sell rule's tests (take_profit_reached, reached_every_check,
     days_to_maturity) live here, where seller.py may import them, so live
-    selling and the backtest apply the same arithmetic.
+    selling and the backtest apply the same arithmetic. The rule that trims
+    a held pair to its Kelly size (held_pair_win_prob, kelly_hold_fraction,
+    kelly_trim_count) lives here too; only the backtest calls it.
 """
 import fcntl
 import json
@@ -49,7 +51,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, NamedTuple
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -3626,6 +3628,220 @@ def days_to_maturity(close_dates, day: date) -> int | None:
     if not dates or any(d is None for d in dates):
         return None
     return (max(dates) - day).days
+
+
+# ── Trimming a held pair to its Kelly size ────────────────────────────────────
+#
+# A held pair (the same two markets, one side of each, in equal counts) can
+# grow past the share of the portfolio Kelly would give it: its price rises,
+# or the rest of the portfolio shrinks. Trimming sells part of it back down.
+# The pair is priced at what selling it returns now (the bids, less the
+# sale's fee), not at what buying it costs, so the size a run sells down to
+# sits above the size it would buy up to (held_pair_fraction), and a run
+# never sells and buys the same pair over the same prices.
+#
+# The three functions below are the whole rule. The backtest decides with
+# them (backtester._kelly_trim); they live here, not in strategy.py, so
+# seller.py may import them too.
+
+# A whole count that float arithmetic left a hair short still counts as whole:
+# this much is added before rounding down, plus this share of the count
+# itself, since the error of a float division grows with its result
+_TRIM_COUNT_SLACK = 1e-9
+_TRIM_COUNT_RELATIVE_SLACK = 1e-12
+# How many counts above the one halving settles on kelly_trim_count also
+# tries: a fee rounded up to the cent weighs more on a small sale, so a count
+# can be wanted where a slightly smaller one is not
+_TRIM_COUNT_SCAN = 32
+
+
+def held_pair_win_prob(pair_type: str, yes_ask_a: float, no_ask_a: float,
+                       yes_ask_b: float, no_ask_b: float, k: float) -> float | None:
+    """
+    Return the chance a held pair pays, read at today's four quotes.
+
+    The same model a new trade is sized with: a time-series pair (market A
+    the earlier deadline, B the later) pays unless the event lands between
+    its two deadlines, a chance of k times the mid spread
+    (time_series_mid_spread, time_series_profit_prob); a same-title pair has
+    the fixed SAME_TITLE_CO_RESOLVE_PROB. Anything but the exact string
+    "time_series" reads as same-title (scanner.leg_sides' rule).
+
+    Args:
+        pair_type (str): The pair's type.
+        yes_ask_a (float): Market A's best YES ask, in dollars.
+        no_ask_a (float): Market A's best NO ask (1 minus its best YES bid).
+        yes_ask_b (float): Market B's best YES ask.
+        no_ask_b (float): Market B's best NO ask.
+        k (float): The share of the mid spread the model believes, in (0, 1].
+
+    Returns:
+        float | None: The chance, in [0, 1]. None for a time-series pair
+            whose chance cannot be read, as a new trade of it would not be
+            sized: a quote or k is not a finite number, a market's book is
+            crossed (its YES ask sits below its own YES bid), or the mid
+            spread is not above zero (the model would read that as a sure
+            win; scanner.pair_mid_spread refuses it the same way).
+    """
+    if pair_type != "time_series":
+        return SAME_TITLE_CO_RESOLVE_PROB
+    quotes = (yes_ask_a, no_ask_a, yes_ask_b, no_ask_b)
+    # Tested first: a quote that is not a number would read as a mid spread
+    # of zero, which the model takes as a sure win
+    if not all(math.isfinite(quote) for quote in (*quotes, k)):
+        return None
+    if (yes_ask_a + no_ask_a < 1.0 - PRICE_EPSILON
+            or yes_ask_b + no_ask_b < 1.0 - PRICE_EPSILON):
+        return None
+    spread = time_series_mid_spread(yes_ask_a, no_ask_a, yes_ask_b, no_ask_b)
+    if not spread > PRICE_EPSILON:
+        return None
+    return time_series_profit_prob(spread, k)
+
+
+def kelly_hold_fraction(win_prob: float, sale_value: float) -> float:
+    """
+    Return the share of the portfolio value Kelly lets a held pair keep.
+
+    Keeping one contract pair that could be sold now for sale_value is the
+    same bet as buying it at that price: it pays CONTRACT_PAYOUT_DOLLARS with
+    chance win_prob and nothing otherwise. Kelly's share for that bet is
+    (win_prob x payout - sale_value) / (payout - sale_value). It falls as the
+    sale value rises, and is zero once selling returns at least what keeping
+    the pair is expected to pay.
+
+    Args:
+        win_prob (float): The chance the pair pays (held_pair_win_prob).
+        sale_value (float): What selling one contract pair returns now, after
+            the sale's fee, in dollars.
+
+    Returns:
+        float: The share, in [0, 1]. 1.0 (keep everything) when either number
+            is not finite or the sale would return nothing; 0.0 (keep
+            nothing) when the sale value is at least win_prob x the payout,
+            or at least the payout itself.
+    """
+    if not (math.isfinite(win_prob) and math.isfinite(sale_value)) or sale_value <= 0:
+        return 1.0
+    edge = win_prob * CONTRACT_PAYOUT_DOLLARS - sale_value
+    # The second test also keeps the division below away from zero
+    if edge <= 0 or sale_value >= CONTRACT_PAYOUT_DOLLARS:
+        return 0.0
+    return min(1.0, edge / (CONTRACT_PAYOUT_DOLLARS - sale_value))
+
+
+class KellyTrim(NamedTuple):
+    """
+    What kelly_trim_count decided for one held pair.
+
+    Attributes:
+        sell (int): Contract pairs to sell; 0 keeps the whole position.
+        cap_free_from (float): A size cap that settles whether the cap
+            mattered: when the cap the decision was made under is at or
+            above it, the decision is the one made with no cap at all (and
+            so the one made under any other cap at or above it). When the
+            cap is below it, the cap shaped the decision and the number says
+            nothing more. The backtest's size-cap sweep reads it to know
+            which caps share one simulation; a caller with one cap can
+            ignore it.
+    """
+    sell: int
+    cap_free_from: float
+
+
+def kelly_trim_count(count: int, portfolio_value: float, win_prob: float, cap: float,
+                     top_value: float,
+                     net_sale: Callable[[int], float | None]) -> KellyTrim:
+    """
+    Return how many contract pairs of a held pair to sell so the rest is within its Kelly share.
+
+    The pair may keep min(cap, kelly_hold_fraction) of the portfolio value,
+    each contract pair counted at what selling it returns. At one price per
+    pair that fixes how many pairs it wants sold. Two steps:
+      1. At the best bids (top_value per pair): the pairs it wants sold there
+         are the most this ever sells.
+      2. A sale of several pairs walks down the bids, so it returns less per
+         pair than the best bids do (net_sale). A worse price both raises the
+         share Kelly lets the pair keep and makes each pair count for less,
+         so fewer pairs are wanted sold. The answer is a sale that is still
+         wanted at its own price: selling that many returns a price per pair
+         at which the pair wants at least that many sold. A count the bids
+         cannot take is never the answer.
+    So a thin or steep book sells fewer, never more. The search halves its
+    way to a count that is still wanted next to one that is not, then tries
+    the _TRIM_COUNT_SCAN counts above it, largest first, because fees
+    rounded up to the cent make a few-pair sale cost more per pair than a
+    slightly larger one. Whatever count comes back was itself checked. It is
+    the largest still-wanted count whenever a larger sale never becomes
+    wanted again; where rounding breaks that, it can be a smaller one.
+
+    Why cap_free_from is right: write share for kelly_hold_fraction at a
+    price and held for count x that price / portfolio_value. A cap c changes
+    how many pairs are wanted sold at that price only when c is below both:
+    with c >= share the cap is not the smaller of the two, and with c >= held
+    the pair keeps every contract with or without the cap. cap_free_from is
+    the largest min(share, held) over every price this call looked at, so
+    under a cap at or above it every step went as it would with no cap.
+
+    Args:
+        count (int): Contract pairs held.
+        portfolio_value (float): The value the run sizes on, in dollars: cash
+            plus open positions.
+        win_prob (float): The chance the pair pays (held_pair_win_prob), a
+            number: a pair whose chance cannot be read is not passed here.
+        cap (float): The pair's size cap (pair_size_cap), in (0, 1].
+        top_value (float): What selling one contract pair at the best bids
+            returns, after the fee, in dollars.
+        net_sale (Callable[[int], float | None]): pairs -> what selling that
+            many returns in all, after fees; None when the bids hold fewer.
+            It is asked only about counts from 1 to `count`.
+
+    Returns:
+        KellyTrim: The pairs to sell and the cap the decision stops depending
+            on. Sells nothing when count is not above 0, when portfolio_value
+            or top_value is not a positive, finite number, when win_prob is
+            not finite, when cap is not above 0, or when no sale returns
+            anything.
+    """
+    # `not ... > 0` is also true for NaN
+    if (count <= 0 or not (math.isfinite(portfolio_value) and portfolio_value > 0)
+            or not (math.isfinite(top_value) and top_value > 0)
+            or not math.isfinite(win_prob) or not cap > 0):
+        return KellyTrim(0, 0.0)
+    # min(share, held) at every price looked at (see the docstring)
+    levels = []
+
+    def wanted(value: float) -> int:
+        """How many pairs the pair wants sold when each counts at `value`."""
+        share = kelly_hold_fraction(win_prob, value)
+        levels.append(min(share, count * value / portfolio_value))
+        kept = min(cap, share) * portfolio_value / value
+        keep = math.floor(kept * (1.0 + _TRIM_COUNT_RELATIVE_SLACK) + _TRIM_COUNT_SLACK)
+        return max(0, count - keep)
+
+    def still_wanted(pairs: int) -> bool:
+        """Whether a sale of `pairs` is still wanted at the price it would get."""
+        proceeds = net_sale(pairs)
+        if proceeds is None or not (math.isfinite(proceeds) and proceeds > 0):
+            return False
+        return wanted(proceeds / pairs) >= pairs
+
+    most = wanted(top_value)
+    if most == 0 or still_wanted(most):
+        return KellyTrim(most, max(levels))
+    # Selling nothing is always allowed; `most` is not wanted at its own price
+    low, high = 0, most
+    while high - low > 1:
+        middle = (low + high) // 2
+        if still_wanted(middle):
+            low = middle
+        else:
+            high = middle
+    # The counts just above, largest first (`most` itself was tried above)
+    for pairs in range(min(most - 1, low + _TRIM_COUNT_SCAN), low, -1):
+        if still_wanted(pairs):
+            return KellyTrim(pairs, max(levels))
+    return KellyTrim(low, max(levels))
 
 
 def _exact_number(value: float) -> str:

@@ -170,6 +170,14 @@ Notes:
     open trade shares one of its ladders, as live adds only to a held pair no
     other held market shares a ladder with.
 
+    A simulation run with trim_to_kelly (off unless a caller asks) sells part
+    of a held pair once it is worth more than its Kelly share of the
+    portfolio value, each contract pair counted at what selling it returns
+    (config.kelly_trim_count, with the chance it pays from
+    config.held_pair_win_prob). It checks at every entry checkpoint, after
+    the day's pay-outs and take-profit sales and before its purchases. With
+    add_to_held as well, a pair is rebalanced both ways.
+
     The work is split at two boundaries. _prepare_candidates() is the half
     that depends on neither the backtest's time-series spread band nor the
     interval discount k — fetch, prefilter, census, grouping, pair extraction
@@ -269,6 +277,13 @@ Notes:
     sell rule's arithmetic lives in config, scanner and historical, shared
     with live selling; _sells_at, _days_left, _ladder_average, _usable_ask and
     _leg_quotes call it there.
+
+    With trim_sweep, it also returns the dashboard's "Trim to Kelly" family
+    (BacktestSweep.trim_sweep, a TrimSweep): every scenario of the same grid
+    with held pairs sold down to their Kelly size (_simulate_at_discount's
+    trim_to_kelly), tier floors on and off, adding to held pairs or not.
+    Like the add-on family it simulates nothing during the run; each cell is
+    simulated when the dashboard reads it.
 
     An ENTRY CHECKPOINT is a moment at which the backtest may open a
     simulated trade: the live bot's weekly run time (config.SCHEDULED_RUN,
@@ -379,6 +394,7 @@ from .config import (
     TAKE_PROFIT_MIN_DAYS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     TIME_SERIES_SAME_EVENT_LADDERS,
+    KellyTrim,
     LiveDefaultsError,
     LiveDefaultsMissing,
     LiveSettings,
@@ -392,6 +408,8 @@ from .config import (
     fee_leg_exact,
     fee_per_pair_approx,
     held_pair_fraction,
+    held_pair_win_prob,
+    kelly_trim_count,
     live_defaults,
     max_kelly_fraction,
     min_price_diff_for_gap,
@@ -642,7 +660,8 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
                  tier_floors: bool = True,
                  add_to_held: bool = False,
                  sell_at: float | None = None,
-                 sell_min_days: int | None = None) -> dict:
+                 sell_min_days: int | None = None,
+                 trim_to_kelly: bool = False) -> dict:
     """
     Build the keyword arguments a sweep helper forwards to _simulate_at_discount.
 
@@ -677,7 +696,9 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
     tier_floors=False. add_to_held is forwarded only when it is exactly True
     (a CapSweep that adds to held pairs), and sell_at and sell_min_days each
     only when it is set (a CapSweep that sells early, with or without a
-    minimum of days before maturity), so every other call is unchanged.
+    minimum of days before maturity), and trim_to_kelly only when it is
+    exactly True (a split-half or excluding-top-event check of a point that
+    trims held pairs to their Kelly size), so every other call is unchanged.
 
     Args:
         size_cap (float | None): The cap the caller simulates under; None or
@@ -702,12 +723,16 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
             must have left before its last market stops trading for the
             simulation to sell it (see _simulate_at_discount); forwarded only
             when it is not None. Default None, not forwarded.
+        trim_to_kelly (bool): Keyword-only. Whether the simulation sells a
+            held pair down to its Kelly size (see _simulate_at_discount);
+            forwarded (as True) only when it is exactly True. Default False,
+            not forwarded.
 
     Returns:
         dict: {} on a default call; otherwise "size_cap", "quiet",
             "end_date", "tier_floors" (always False when present),
-            "add_to_held" (always True when present), "sell_at" and/or
-            "sell_min_days".
+            "add_to_held" (always True when present), "sell_at",
+            "sell_min_days" and/or "trim_to_kelly" (always True when present).
     """
     out: dict = {}
     if size_cap is not None and size_cap != BUDGET_FRACTION:
@@ -725,6 +750,8 @@ def _sim_options(size_cap: float | None, quiet: bool, *,
         out["sell_at"] = sell_at
     if sell_min_days is not None:
         out["sell_min_days"] = sell_min_days
+    if trim_to_kelly is True:
+        out["trim_to_kelly"] = True
     return out
 
 # ─── Data structures ──────────────────────────────────────────────────────────
@@ -1499,11 +1526,14 @@ class BacktestTrade:
             still held — the same two markets, bought the same way round, while
             an earlier trade of the pair was open (only a simulation run with
             add_to_held makes one). It is a trade of its own, with its own
-            count, cost, fees and payout; the earlier trade is never changed.
+            count, cost, fees and payout; adding never changes the earlier
+            trade (a Kelly trim can shrink it, _split_trade).
             Reporting only. False by default, so every other construction
             still builds.
-        sold (bool): True when the trade's position was sold before it paid
-            out (only a simulation run with sell_at sells): exit_date is then
+        sold (bool): True when the trade was sold before it paid out: its
+            whole position by a simulation run with sell_at, or by one run
+            with trim_to_kelly, whose record of a part sale is the part sold
+            (the rest stays in the trade it came from). exit_date is then
             the sale day, actual_payoff what the sale returned after its fees
             (each leg at its sale price less config.fee_leg_exact on the sale,
             a leg whose market had already paid out at its payout), and
@@ -1594,8 +1624,8 @@ class BacktestTrade:
     # Whether this trade added to a pair the simulation still held (only with
     # _simulate_at_discount(add_to_held=True)); reporting only
     add_on: bool = False
-    # Whether its position was sold early (only with _simulate_at_discount's
-    # sell_at), at what price each leg sold (None: not sold, or that market had
+    # Whether it was sold early (only with _simulate_at_discount's sell_at or
+    # trim_to_kelly), at what price each leg sold (None: not sold, or that market had
     # already paid out) and the fees the sale paid; defaulted so every other
     # construction still builds
     sold: bool = False
@@ -1724,8 +1754,10 @@ class SweepPoint:
             config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.py's k, which the
             backtest defaults to (a live run prices at the saved live
             defaults' k instead).
-        trades (list[BacktestTrade]): One record per entered pair, in
-            entry-date order; empty if nothing was ever entered.
+        trades (list[BacktestTrade]): One record per purchase, in
+            entry-date order; a run that trims to Kelly adds one record per
+            part a trim sold, appended when it was sold. Empty if nothing
+            was ever entered.
         equity_df (pd.DataFrame): Daily equity curve with columns
             [date, portfolio_value, daily_return], opening one row before the
             run's start_date at the initial balance and flat at it when trades
@@ -1786,8 +1818,8 @@ class SweepPoint:
             with no walked book every cap at or above it sizes the point the
             same way — an add-on's size included, since the cap reaches it
             only through min(pair cap, f*) — so CapSweep reuses one
-            simulation for all of them (with a walked book, from
-            cap_free_from).
+            simulation for all of them (with a walked book, or on a run that
+            trims to Kelly, from cap_free_from).
         add_to_held (bool): True when the simulation could add to a pair it
             still held (_simulate_at_discount(add_to_held=True)). Not only a
             label: _ex_top_event re-simulates the point at this setting, so its
@@ -1806,6 +1838,11 @@ class SweepPoint:
             could walk a synthetic book, the cap above which the live search
             range stops moving (round(1 - k, 12) for time-series,
             min(same-title cap, SAME_TITLE_CO_RESOLVE_PROB) for same-title).
+            On a run that trims to Kelly it is also at least the largest
+            cap any of that run's trim decisions depended on
+            (config.KellyTrim.cap_free_from), which is read off the run's own
+            walk: it says the run is the one every larger cap gives only
+            when the run's own cap is at or above it.
             CapSweep shares one simulation only at caps at or above it. None
             on a hand-built point, which shares from peak_kelly_fraction.
         sell_min_days (int | None): The fewest days a position had to have
@@ -1815,13 +1852,19 @@ class SweepPoint:
             _ex_top_event re-simulate the point at this setting. Defaulted,
             so every existing construction still builds as a point with no
             minimum.
-        sales (tuple[SaleCheck, ...] | None): One SaleCheck per position the
-            simulation sold, in the order it sold them: () when it could sell
-            and sold nothing, None when it never sells (sell_at None) or the
+        sales (tuple[SaleCheck, ...] | None): One SaleCheck per position a
+            take-profit sale sold (a Kelly trim records none), in the order
+            they were sold: () when it could sell early
+            and sold nothing, None when it never sells early (sell_at None) or the
             point was built by hand. A copy CapSweep shares at another cap
             keeps it, since its walk, and so its sales, are the same. Not in
             repr and not compared: it describes how the trades came about,
             which the trades themselves already record.
+        trim_to_kelly (bool): True when the simulation could sell held pairs
+            down to their Kelly size (_simulate_at_discount(trim_to_kelly=True)),
+            whether or not any was. Like add_to_held, _ex_top_event
+            re-simulates the point at this setting. Defaults to False: a
+            point that never trims.
     """
     k: float
     trades: list[BacktestTrade]
@@ -1838,6 +1881,7 @@ class SweepPoint:
     cap_free_from: float | None = None
     sell_min_days: int | None = None
     sales: tuple[SaleCheck, ...] | None = field(default=None, repr=False, compare=False)
+    trim_to_kelly: bool = False
 
 
 @dataclass(frozen=True)
@@ -2236,8 +2280,8 @@ class CapSweep:
     to summarise each cell and drop it; nothing here is memoised, so asking
     for a cell twice simulates it twice.
 
-    Seeded from the eager point. A point's peak_kelly_fraction (its "peak"
-    below; with a walked book, the larger cap_free_from — _sharing_floor
+    Seeded from the eager point. An eager point's peak_kelly_fraction (its
+    "peak" below; with a walked book, the larger cap_free_from — _sharing_floor
     reads whichever applies) does not depend on the cap, and every cap at or
     above it sizes the point's entries identically — provided
     SAME_TITLE_SIZE_CAP, read at call time, is not rebound between the eager
@@ -2260,6 +2304,14 @@ class CapSweep:
     the live enrichment averages a book. The halves and the
     excluding-top-event run use subsets of the point's candidates, whose
     floors are no higher.
+    A sweep that trims to Kelly (trim_to_kelly) has no eager point. Each of
+    its simulations reads its own cap_free_from off its own walk — a trim
+    reads the cap too — and that number certifies sharing only for the run
+    it came from: a run whose cap is at or above it made no decision that
+    depended on the cap, so every larger cap makes the same run. A run
+    over a subset of the entries has a different portfolio value, so its
+    trims can depend on the cap where the full run's do not; such a sweep
+    therefore runs no split-half or top-event check (checks must be False).
     A simulated cap runs quiet — its completion line and its
     premise-violation WARNING go to DEBUG, since the primary-cap run already
     reported the same count and ~10 repeats per cell would flood the log
@@ -2412,13 +2464,17 @@ class CapSweep:
             it runs, and its checks, to sell it (_simulate_at_discount's
             sell_min_days). Needs sell_at. Forwarded only when set. Default
             None (no minimum).
+        trim_to_kelly (bool): Whether every simulation it runs, and its
+            checks, sells held pairs down to their Kelly size
+            (_simulate_at_discount's trim_to_kelly). Forwarded only when
+            True. Default False.
         end_dates (dict): (band, k, population) -> the day that population's
             curves end on, for a cell with no eager point (the eager map is
             empty for a sweep whose setting no eager run shares: one that
-            adds to held pairs or sells early); a cell with an eager point
-            ends where that point's curve ended. A cell in neither map ends
-            on today (UTC) on a sweep that neither adds to held pairs nor
-            sells, and is refused (ValueError) on one that does. The keys
+            adds to held pairs, sells early or trims to Kelly); a cell with
+            an eager point ends where that point's curve ended. A cell in
+            neither map ends on today (UTC) on a sweep that does none of
+            those, and is refused (ValueError) on one that does. The keys
             must be the exact band and k objects the cells are read with.
             Not in repr.
         simulated (int): Simulations this object has run (each cap point
@@ -2452,34 +2508,66 @@ class CapSweep:
     sell_at: float | None = None
     # The fewest days before maturity a sale needs (None: no minimum)
     sell_min_days: int | None = None
+    # Whether every simulation sells held pairs down to their Kelly size
+    trim_to_kelly: bool = False
+
+    def _own_setting(self) -> str | None:
+        """
+        What this sweep's simulations do that no eager run does, in words; None when nothing.
+
+        A sweep that adds to held pairs, sells early or trims to Kelly has no
+        eager point to start from, so it must be built without any and every
+        cell needs its end day (end_dates). The words name the first of the
+        three it does, for the error messages.
+
+        Returns:
+            str | None: "adds to held pairs", "sells early", "trims to Kelly", or None.
+        """
+        if self.add_to_held:
+            return "adds to held pairs"
+        if self.sell_at is not None:
+            return "sells early"
+        return "trims to Kelly" if self.trim_to_kelly else None
 
     def __post_init__(self) -> None:
         """
-        Refuse an add-to-held or selling sweep that was handed eager points, or a bad sell setting.
+        Refuse a sweep with a setting of its own that was handed eager points, or a bad sell setting.
 
-        Every eager point was simulated without adding to held pairs and
-        without selling, and _by_cap returns the eager point itself at the
-        primary cap (and copies of it above its peak), so such a sweep holding
-        one would hand back points that never added or sold, stamped as if
-        they had.
+        Every eager point was simulated without adding to held pairs,
+        selling or trimming, and _by_cap returns the eager point itself at
+        the primary cap (and copies of it above its peak), so a sweep that
+        does one of those and holds an eager point would hand back points
+        that never did it, stamped as if they had.
 
         Raises:
-            ValueError: If add_to_held or sell_at is set and eager is not
-                empty or same_title_eager is not None, if sell_at is not a
-                share in (0, 1], or if sell_min_days is set without sell_at
-                or is not a whole number of at least 1.
+            ValueError: If add_to_held, sell_at or trim_to_kelly is set and
+                eager is not empty or same_title_eager is not None, if
+                sell_at is not a share in (0, 1], if sell_min_days is set
+                without sell_at or is not a whole number of at least 1, if
+                trim_to_kelly is not True or False, or if it is set with
+                checks (see the class docstring).
         """
+        if not isinstance(self.trim_to_kelly, bool):
+            # Only an actual True reaches the simulations (_sim_options), so
+            # any other truthy value would name a sweep that never trims
+            raise ValueError(
+                f"CapSweep trim_to_kelly must be True or False, got {self.trim_to_kelly!r}")
         if self.sell_at is not None:
             # Checked as the simulation checks it, before any cell is read
             _resolve_sell_at(self.sell_at)
         # The days rule, checked the same way (it needs a sell level)
         _resolve_sell_min_days(self.sell_min_days, self.sell_at)
-        if ((self.add_to_held or self.sell_at is not None)
+        if (self._own_setting() is not None
                 and (self.eager or self.same_title_eager is not None)):
             raise ValueError(
-                "a CapSweep that adds to held pairs or sells early simulates every cap "
-                "itself: it takes no eager points (eager must be {} and same_title_eager "
-                "None)")
+                "a CapSweep that adds to held pairs, sells early or trims to Kelly "
+                "simulates every cap itself: it takes no eager points (eager must be {} "
+                "and same_title_eager None)")
+        if self.trim_to_kelly and self.checks:
+            raise ValueError(
+                "a CapSweep that trims to Kelly runs no split-half or top-event check "
+                "(checks must be False): a half's trims can depend on the cap at a cap "
+                "the full run shares from")
 
     def _by_cap(
         self,
@@ -2499,8 +2587,8 @@ class CapSweep:
         at or above the cap it shares from;
         else a quiet simulation, pinned to the eager point's end date (with
         no eager point, to end_dates' day for this cell) and run at this
-        sweep's Tier floors, add-on and sell settings (tier_floors,
-        add_to_held, sell_at, sell_min_days), with the split-half and
+        sweep's Tier floors, add-on, sell and Kelly-trim settings (tier_floors,
+        add_to_held, sell_at, sell_min_days, trim_to_kelly), with the split-half and
         top-event checks — at those settings too — when the band sweep ran
         and the population carries them.
 
@@ -2521,15 +2609,16 @@ class CapSweep:
                 with this sweep's tier_floors and add_to_held).
 
         Raises:
-            ValueError: If this sweep adds to held pairs or sells early and
+            ValueError: If this sweep adds to held pairs, sells early or
+                trims to Kelly and
                 end_dates has no day for (band, k, population): its curves
                 would otherwise end on whatever day (UTC) the cell happens to
                 be read.
         """
         out: dict[float, SweepPoint] = {}
         # The eager point is the one the backtest simulated during the run, at
-        # its own cap; the cap it shares from does not depend on the cap, so
-        # it is this subset's too
+        # its own cap; an eager run never trims, so the cap it shares from
+        # does not depend on the cap and is this subset's too
         seed = _sharing_floor(eager_point)
         # Every simulated cap ends its curve where the eager point's ended, not
         # on whatever day (UTC) this cell happens to be read; a cell with no
@@ -2538,12 +2627,12 @@ class CapSweep:
             end_date = _curve_end_date(eager_point)
         else:
             end_date = self.end_dates.get((band, k, population))
-            if end_date is None and (self.add_to_held or self.sell_at is not None):
-                # An add-on or selling sweep has no eager point to fall back
-                # on, so a missing day (a key off by float noise included) is
-                # refused
+            if end_date is None and self._own_setting() is not None:
+                # A sweep with a setting of its own has no eager point to fall
+                # back on, so a missing day (a key off by float noise
+                # included) is refused
                 raise ValueError(
-                    f"CapSweep {'adds to held pairs' if self.add_to_held else 'sells early'} "
+                    f"CapSweep {self._own_setting()} "
                     f"but end_dates has no day for (band, k, population) = "
                     f"{(band, k, population)!r}")
         # The eager point sizes as every cap at or above the seed ONLY if its
@@ -2564,9 +2653,9 @@ class CapSweep:
             else:
                 # size_cap explicit (see _sim_options: a cap equal to
                 # BUDGET_FRACTION must still name itself); quiet, the pinned
-                # end date, this sweep's tier setting and its add-on setting
-                # through _sim_options, so a tier-on sweep that never adds
-                # forwards neither
+                # end date and this sweep's own settings (tier floors,
+                # adding, selling, trimming) through _sim_options, which
+                # forwards only the ones that differ from the defaults
                 point = _simulate_at_discount(
                     subset, self.start_date, self.initial_balance, k=k, spread_band=band,
                     population=population, size_cap=cap,
@@ -2574,7 +2663,8 @@ class CapSweep:
                                    tier_floors=self.tier_floors,
                                    add_to_held=self.add_to_held,
                                    sell_at=self.sell_at,
-                                   sell_min_days=self.sell_min_days))
+                                   sell_min_days=self.sell_min_days,
+                                   trim_to_kelly=self.trim_to_kelly))
                 self.simulated += 1
                 if self.checks and population in _CHECKED_POPULATIONS:
                     point.halves = _half_split(
@@ -2582,7 +2672,8 @@ class CapSweep:
                         self.initial_balance, k, band, population=population,
                         tier_floors=self.tier_floors, size_cap=cap, quiet=True,
                         end_date=end_date, add_to_held=self.add_to_held,
-                        sell_at=self.sell_at, sell_min_days=self.sell_min_days)
+                        sell_at=self.sell_at, sell_min_days=self.sell_min_days,
+                        trim_to_kelly=self.trim_to_kelly)
                     point.ex_top_event = _ex_top_event(
                         point, subset, self.start_date, self.initial_balance, band,
                         population=population, tier_floors=self.tier_floors, quiet=True,
@@ -2615,8 +2706,9 @@ class CapSweep:
 
         Raises:
             KeyError: If band is not one of self.bands.
-            ValueError: If this sweep adds to held pairs and end_dates has no
-                day for one of the cell's populations (see _by_cap).
+            ValueError: If this sweep adds to held pairs, sells early or
+                trims to Kelly and end_dates has no day for one of the cell's
+                populations (see _by_cap).
         """
         entries = self.entries_by_band[band]
         subsets = [("all", entries)]
@@ -2645,8 +2737,9 @@ class CapSweep:
                 had no same-title population either.
 
         Raises:
-            ValueError: If this sweep adds to held pairs and end_dates has no
-                day for (None, primary_k, "same_title") (see _by_cap).
+            ValueError: If this sweep adds to held pairs or sells early and
+                end_dates has no day for (None, primary_k, "same_title") (see
+                _by_cap).
         """
         if not (self.checks and self.st_entries):
             return {}
@@ -3042,6 +3135,108 @@ class SellSweep:
                 yield level, min_days, cells_at(li, level, min_days)
 
 
+@dataclass(frozen=True)
+class TrimSweep:
+    """
+    The dashboard's "Trim to Kelly" family: every scenario with held pairs sold down to their Kelly size, simulated on demand.
+
+    The backtest dashboard's Trim to Kelly select offers "off" (the scenario
+    as simulated) and "on": the same scenario with trim_to_kelly
+    (_simulate_at_discount), where at every weekly checkpoint a held pair
+    worth more than its Kelly share of the portfolio is sold down to it. It
+    covers every band, Tier floors setting, k and size cap the filter bar
+    shows, with adding to held pairs off or on (on, the two together
+    rebalance a pair both ways). Nothing is simulated while the backtest
+    runs: sweep() builds, for one Tier floors and add-on setting, a CapSweep
+    over the same entries the size-cap and add-on families hold, whose cells
+    a report reads one (band, k) at a time, every cap, the "all" population
+    only. Like the add-on family it has no eager point to start from, so
+    each cell's curves end on the day its eager twin's did (end_dates /
+    off_end_dates), and each cap is simulated until one reaches the cap the
+    walk stops depending on (SweepPoint.cap_free_from), which every larger
+    cap shares.
+
+    Retention: its entry maps are the very objects BacktestSweep's size-cap,
+    add-on and sell families hold, so beside any of them it keeps nothing
+    more alive; on a run with none of them it is what keeps those entries.
+
+    Attributes:
+        caps (tuple[float, ...]): The size caps of every scenario (the
+            size-cap sweep's, or the run's own alone).
+        primary_cap (float): The run's own cap.
+        bands (tuple): The tier-on bands.
+        off_bands (tuple): The bands a deadline-gap tier binds at, re-run
+            with the tier floors off; () without the tier-floors-off family.
+        ks (tuple[float, ...]): The k grid.
+        primary_k (float): The run's own k.
+        start_date (date): The backtest's start date.
+        initial_balance (float): The balance every simulation starts from.
+        entries_by_band (dict): Band -> tier-on entries. Not in repr.
+        off_entries_by_band (dict): Binding band -> tier-off entries. Not in repr.
+        end_dates (dict): (band, k, "all") -> the day the tier-on eager
+            point's curve ended. Not in repr.
+        off_end_dates (dict): The same for the tier-off family. Not in repr.
+    """
+    caps: tuple[float, ...]
+    primary_cap: float
+    bands: tuple
+    off_bands: tuple
+    ks: tuple[float, ...]
+    primary_k: float
+    start_date: date
+    initial_balance: float
+    entries_by_band: dict = field(repr=False)
+    off_entries_by_band: dict = field(repr=False)
+    end_dates: dict = field(repr=False)
+    off_end_dates: dict = field(repr=False)
+
+    def sweep(self, *, tier_floors: bool = True, add_to_held: bool = False) -> CapSweep:
+        """
+        The lazy size-cap sweep that trims to Kelly under one Tier floors and add-on setting.
+
+        Args:
+            tier_floors (bool): Keyword-only. True (default) for the tier-on
+                bands; False for the bands the tiers bind at, re-run with the
+                tier floors off.
+            add_to_held (bool): Keyword-only. Whether every simulation may
+                also add to a pair it still holds. Default False.
+
+        Returns:
+            CapSweep: Over that setting's bands and entries, every k and cap,
+                the "all" population only, trimming to Kelly; nothing is
+                simulated until one of its cells is read.
+
+        Raises:
+            ValueError: For tier_floors False on a family with no
+                tier-floors-off bands.
+        """
+        if not tier_floors and not self.off_bands:
+            raise ValueError("this run has no tier-floors-off family to trim in")
+        return CapSweep(
+            caps=self.caps, primary_cap=self.primary_cap,
+            bands=tuple(self.bands if tier_floors else self.off_bands), ks=self.ks,
+            primary_k=self.primary_k, start_date=self.start_date,
+            initial_balance=self.initial_balance, split_date=None, checks=False,
+            entries_by_band=self.entries_by_band if tier_floors else self.off_entries_by_band,
+            st_entries=[], eager={}, tier_floors=tier_floors, add_to_held=add_to_held,
+            end_dates=self.end_dates if tier_floors else self.off_end_dates,
+            trim_to_kelly=True)
+
+    def entry_events(self) -> set[tuple[str, str]]:
+        """
+        Every (event ticker, fallback category) a trimming run's trades could carry.
+
+        Over both Tier floors settings' entries, every qualifying Monday of
+        each (_entry_events): a trim frees cash, so a trimming run can trade
+        a pair no other scenario traded, and a report must list its category
+        and tag before any cell is simulated.
+
+        Returns:
+            set[tuple[str, str]]: (event ticker, category) pairs.
+        """
+        return _entry_events(self.entries_by_band) | _entry_events(self.off_entries_by_band)
+
+
 @dataclass
 class BacktestSweep:
     """
@@ -3240,6 +3435,11 @@ class BacktestSweep:
             days before maturity (config.TAKE_PROFIT_MIN_DAYS), of every
             scenario, simulated when the dashboard reads it. None unless
             run_backtest_sweep(sell_sweep=True) ran on a feasible window.
+        trim_sweep (TrimSweep | None): The dashboard's "Trim to Kelly"
+            family: every scenario with held pairs sold down to their Kelly
+            size, with adding to held pairs off or on, simulated when the
+            dashboard reads it. None unless
+            run_backtest_sweep(trim_sweep=True) ran on a feasible window.
         depth_model (DepthModel | None): The depth model every trade's
             synthetic order book came from (which snapshots, how many
             ladders, when they were taken), for the page's header; None when
@@ -3286,6 +3486,8 @@ class BacktestSweep:
     sell_sweep: SellSweep | None = None
     # The depth model the trades' synthetic books came from (None: top of the book)
     depth_model: DepthModel | None = None
+    # The dashboard's "Trim to Kelly" family, lazy (None unless run_backtest_sweep(trim_sweep=True))
+    trim_sweep: TrimSweep | None = None
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -3473,8 +3675,9 @@ def _open_leg_stake(trade: BacktestTrade, ticker: str, day: date) -> float:
     leg at its own worth plus its own fees (the other leg's payout is already
     cash). The leg counts at the latest usable ask of the side it holds
     (LegQuotes.at_checkpoint), or at the price it paid when the trade has no
-    quotes, plus the exact fee paid on it (config.fee_leg_exact at the price
-    paid, the fee the trade was charged for that leg).
+    quotes, plus the exact fee on it (config.fee_leg_exact at the price
+    paid: the fee the trade was charged for that leg, or, for a trade a
+    Kelly trim has split, the fee a trade of what is left would be charged).
 
     Args:
         trade (BacktestTrade): An open trade with a leg on `ticker`.
@@ -3773,7 +3976,7 @@ def _positions(open_trades: list[BacktestTrade]) -> list[list[BacktestTrade]]:
     two open trades share a market. With it, an add-on shares both markets
     with the pair it adds to, and an add-on to a lone leg shares that leg's
     market, so a position is a pair with everything added to it — what a
-    sale sells whole.
+    take-profit sale sells whole and a Kelly trim sells part of.
 
     Args:
         open_trades (list[BacktestTrade]): The open trades, in the order they were made.
@@ -3807,12 +4010,15 @@ def _positions(open_trades: list[BacktestTrade]) -> list[list[BacktestTrade]]:
 
 
 def _position_sale_value(position: list[BacktestTrade], day: date,
-                         days_back: int = 0) -> tuple | None:
+                         days_back: int = 0, *, sold: list[int] | None = None) -> tuple | None:
     """
-    What selling a whole position at the checkpoint on `day` would return, and what it cost and could pay.
+    What selling a position at the checkpoint on `day` would return, and what it cost and could pay.
 
-    The one valuation a sale decides on (and _sale_reach replays).
-    The position's contracts are totalled per market (by ticker and side
+    The one valuation a sale decides on (and _sale_reach replays). By default
+    the whole position is sold; with `sold`, only that many contract pairs of
+    each trade are, and everything below reads that count in place of the
+    trade's own.
+    The contracts sold are totalled per market (by ticker and side
     held: an add-on to a lone leg can hold one market as A in one trade and
     as B in another), and each market gets one sale price:
       * a market that had paid out by the check
@@ -3828,16 +4034,22 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
     Each trade's leg returns its contracts at that price, less the taker fee
     on selling them (config.fee_leg_exact). The cost is each trade's
     contracts plus entry fees, and the potential total return each trade's
-    contract pairs times CONTRACT_PAYOUT_DOLLARS — what one leg pays in a win.
+    contract pairs times CONTRACT_PAYOUT_DOLLARS — what one leg pays in a win
+    (both for the share of the trade sold).
     With days_back, everything is read at the sell rule's daily check that
     many days before the checkpoint (TAKE_PROFIT_HOLD_DAYS): what a sale then
-    would have returned. _hold_readings is its only caller.
+    would have returned. The sell rule reads it through _hold_readings, the
+    Kelly trim (which passes `sold`) through _kelly_trim.
 
     Args:
         position (list[BacktestTrade]): One position's open trades (_positions).
         day (date): A checkpoint date on the legs' weekly grid.
         days_back (int): 0 (the default) for the checkpoint; 1 to
             _HOLD_DAYS_MAX - 1 for a daily check before it.
+        sold (list[int] | None): Keyword-only. How many contract pairs of
+            each trade are sold, in the position's order, each from 0 to the
+            trade's n, with at least one contract sold on every market the
+            position holds; None (the default) sells every trade whole.
 
     Returns:
         tuple | None: (each trade's sale as (value, fees, (market A's sale
@@ -3860,11 +4072,13 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
         # Which side each leg holds (scanner.leg_sides, the one definition)
         legs.append(list(zip((trade.ticker_a, trade.ticker_b), trade.marks,
                              leg_sides(trade.pair_type), strict=True)))
-    # The contracts held on each market, and its quotes
+    # How many contract pairs each trade sells: all of them unless told otherwise
+    counts = [trade.n for trade in position] if sold is None else sold
+    # The contracts sold on each market, and its quotes
     held: dict[tuple[str, str], list] = {}
-    for trade, trade_legs in zip(position, legs, strict=True):
+    for count, trade_legs in zip(counts, legs, strict=True):
         for ticker, quotes, side in trade_legs:
-            held.setdefault((ticker, side), [quotes, 0])[1] += trade.n
+            held.setdefault((ticker, side), [quotes, 0])[1] += count
     # One sale price per market; None when it has paid out
     prices: dict[tuple[str, str], float | None] = {}
     for (ticker, side), (quotes, contracts) in held.items():
@@ -3883,26 +4097,29 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
         prices[(ticker, side)] = price
     per_trade = []
     value = cost = potential = 0.0
-    for trade, trade_legs in zip(position, legs, strict=True):
+    for trade, count, trade_legs in zip(position, counts, legs, strict=True):
         trade_value = fees = 0.0
         sale_prices: list[float | None] = []
         for ticker, quotes, side in trade_legs:
             price = prices[(ticker, side)]
             if price is None:
                 # Paid out: worth its payout, with nothing to sell
-                trade_value += trade.n * (quotes.paid_yes if side == "yes" else quotes.paid_no)
+                trade_value += count * (quotes.paid_yes if side == "yes" else quotes.paid_no)
                 sale_prices.append(None)
                 continue
-            # config.fee_leg_exact: the taker fee on selling n contracts at the price
-            fee = fee_leg_exact(trade.n, price)
-            trade_value += trade.n * price - fee
+            # config.fee_leg_exact: the taker fee on selling the contracts at the price
+            fee = fee_leg_exact(count, price)
+            trade_value += count * price - fee
             fees += fee
             sale_prices.append(price)
         sale = (trade_value, fees, (sale_prices[0], sale_prices[1]))
         per_trade.append(sale)
         value += sale[0]
-        cost += trade.total_cost + trade.fees
-        potential += trade.n * CONTRACT_PAYOUT_DOLLARS
+        # The share of the trade sold: exactly 1.0 for a whole trade, so a
+        # whole sale's cost is the trade's own to the last bit
+        share = count / trade.n
+        cost += (trade.total_cost + trade.fees) * share
+        potential += count * CONTRACT_PAYOUT_DOLLARS
     return per_trade, value, cost, potential
 
 
@@ -4041,7 +4258,10 @@ def _position_sells(sell_at: float, position: list[BacktestTrade], day: date,
 
 def _sold_copy(trade: BacktestTrade, day: date, sale: tuple) -> BacktestTrade:
     """
-    The record of a trade sold at the checkpoint on `day`, replacing the trade's own.
+    The record of a trade sold at the checkpoint on `day`.
+
+    For a trade sold whole it replaces the trade's own record; for the part
+    of a trade a Kelly trim sold (_split_trade) it is a record beside it.
 
     The sale is the trade's exit: exit_date is the sale day, actual_payoff
     the sale's value after its fees, and the figures read off them (profit,
@@ -4070,6 +4290,212 @@ def _sold_copy(trade: BacktestTrade, day: date, sale: tuple) -> BacktestTrade:
         slippage=profit - trade.expected_payoff, holding_days=holding_days,
         sold=True, sale_price_a=price_a, sale_price_b=price_b, sale_fees=fees,
     )
+
+
+# ─── Trimming a held pair to its Kelly size ───────────────────────────────────
+
+# The decision for a position the Kelly trim leaves alone
+_NO_TRIM = KellyTrim(0, 0.0)
+
+
+def _fresh_bids(trade: BacktestTrade, day: date) -> tuple[float, float, float, float] | None:
+    """
+    Both markets' fresh bids at the checkpoint on `day`, or None when any is missing.
+
+    The Kelly trim (_kelly_trim) reads all four: the two sides the pair holds
+    price a sale, and with the other two they give each market's YES ask and
+    NO ask (an ask is 1 minus the other side's bid), which the chance of
+    profit is read from. Fresh means from a candle within one candle period
+    of the checkpoint (LegQuotes.bid_at_checkpoint), as a sale needs.
+
+    Args:
+        trade (BacktestTrade): An open trade.
+        day (date): A checkpoint date on its legs' weekly grid.
+
+    Returns:
+        tuple[float, float, float, float] | None: (market A's YES bid, its NO
+            bid, market B's YES bid, its NO bid), in dollars; None for a trade
+            with no quotes, or when a side of either market has no fresh bid.
+
+    Raises:
+        ValueError: From LegQuotes, for a day off the legs' checkpoint grid.
+    """
+    if trade.marks is None:
+        return None
+    bids = [quotes.bid_at_checkpoint(day, side) for quotes in trade.marks
+            for side in ("yes", "no")]
+    # A missing bid is NaN, which is not equal to itself
+    if any(bid != bid for bid in bids):
+        return None
+    return bids[0], bids[1], bids[2], bids[3]
+
+
+def _exact_pair(position: list[BacktestTrade]) -> bool:
+    """
+    Whether every trade of a position is the same two markets bought the same way round.
+
+    Such a position is one pair with whatever was added to it, held in equal
+    counts on both markets: what the Kelly trim sells part of. A position
+    that also holds an add-on to a lone leg (a third market) is not one.
+
+    Args:
+        position (list[BacktestTrade]): One position's open trades (_positions).
+
+    Returns:
+        bool: True when all its trades share pair type and both tickers, in order.
+    """
+    first = position[0]
+    return all((trade.pair_type, trade.ticker_a, trade.ticker_b)
+               == (first.pair_type, first.ticker_a, first.ticker_b) for trade in position)
+
+
+def _last_bought_first(position: list[BacktestTrade], pairs: int) -> list[int]:
+    """
+    How many contract pairs each trade of a position gives up when `pairs` are sold.
+
+    The latest trade is sold first, so what was added last goes first and the
+    pair's first purchase goes last. Which trade gives up the contracts
+    decides whose cost the sale is set against; it moves the proceeds only by
+    a cent or two of fee rounding, since each trade's fee on the sale is
+    rounded up on its own.
+
+    Args:
+        position (list[BacktestTrade]): One position's open trades, oldest first.
+        pairs (int): Contract pairs to sell, at most the position's total.
+
+    Returns:
+        list[int]: One count per trade, in the position's order, summing to `pairs`.
+    """
+    out = [0] * len(position)
+    left = pairs
+    for index in range(len(position) - 1, -1, -1):
+        out[index] = min(position[index].n, left)
+        left -= out[index]
+    return out
+
+
+def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float,
+                k: float, cap: float, st_cap: float) -> tuple[KellyTrim, tuple | None]:
+    """
+    What the Kelly trim sells of one position at the checkpoint on `day`.
+
+    A held pair is sold down when it is worth more than its Kelly share of
+    the portfolio value, each contract pair counted at what selling it
+    returns now (config.kelly_trim_count, the rule; this function gathers
+    what it reads). The chance the pair pays comes from the four fresh quotes
+    as a new trade's would (config.held_pair_win_prob), one pair's sale value
+    from the best bids of the two sides held less the fee on selling them,
+    and the real proceeds of a sale from _position_sale_value, which walks
+    the modeled bid ladder. The latest trade's contracts go first
+    (_last_bought_first).
+
+    Left alone, with nothing sold: a position that is not one exact pair
+    (_exact_pair), one with no quotes or without a fresh bid on both sides of
+    both markets, a time-series pair whose chance of paying cannot be read (a
+    crossed quote, or a mid spread not above zero), and one with a market
+    that has paid out.
+
+    Args:
+        position (list[BacktestTrade]): One position's open trades (_positions).
+        day (date): A checkpoint date on its legs' weekly grid.
+        portfolio_value (float): The portfolio value at the checkpoint, in dollars.
+        k (float): The simulation's interval discount.
+        cap (float): The simulation's per-trade size cap.
+        st_cap (float): The extra cap on same-title pairs.
+
+    Returns:
+        tuple[KellyTrim, tuple | None]: (the decision; its sale as (how many
+            contract pairs each trade sells, each trade's sale as
+            _position_sale_value gives it), or None when nothing is sold).
+    """
+    first = position[0]
+    bids = _fresh_bids(first, day) if _exact_pair(position) else None
+    if bids is None:
+        return _NO_TRIM, None
+    yes_bid_a, no_bid_a, yes_bid_b, no_bid_b = bids
+    # config.held_pair_win_prob: the chance a new trade of the pair is sized
+    # with, at these quotes; each ask is 1 minus the other side's bid
+    win_prob = held_pair_win_prob(first.pair_type, 1.0 - no_bid_a, 1.0 - yes_bid_a,
+                                  1.0 - no_bid_b, 1.0 - yes_bid_b, k)
+    if win_prob is None:
+        return _NO_TRIM, None
+    # The best bid of the side each leg holds (scanner.leg_sides), and what
+    # one contract pair sells for there after the fee
+    side_a, side_b = leg_sides(first.pair_type)
+    bid_a = yes_bid_a if side_a == "yes" else no_bid_a
+    bid_b = yes_bid_b if side_b == "yes" else no_bid_b
+    top_value = bid_a + bid_b - fee_per_pair_approx(bid_a, bid_b)
+    # Each sale the rule asks about, kept so the one it picks is not valued twice
+    sales: dict[int, tuple] = {}
+
+    def net_sale(pairs: int) -> float | None:
+        """What selling `pairs` contract pairs returns after fees; None when it cannot be sold."""
+        sold = _last_bought_first(position, pairs)
+        valued = _position_sale_value(position, day, sold=sold)
+        # None: the bids hold fewer. A leg with no sale price has paid out,
+        # so there is no pair left to sell
+        if valued is None or any(None in sale[2] for sale in valued[0]):
+            return None
+        sales[pairs] = (sold, valued[0])
+        return valued[1]
+
+    # config.kelly_trim_count: the rule, capped as a new trade of this pair
+    # type is (config.pair_size_cap)
+    decision = kelly_trim_count(sum(trade.n for trade in position), portfolio_value,
+                                win_prob, pair_size_cap(first.pair_type, cap, st_cap),
+                                top_value, net_sale)
+    if not decision.sell:
+        return decision, None
+    if decision.sell not in sales:
+        # The rule returns only a count it priced; should it ever return
+        # another, price it here
+        net_sale(decision.sell)
+    return decision, sales.get(decision.sell)
+
+
+def _split_trade(trade: BacktestTrade, pairs: int) -> BacktestTrade:
+    """
+    Take `pairs` contract pairs out of an open trade, as a trade record of their own.
+
+    The Kelly trim sells part of a trade. The part sold becomes its own
+    record (which _sold_copy then marks sold), and `trade` itself is changed
+    in place to hold what is left, so every record the cash walk keeps of it
+    stays valid. The cost and entry fees are divided in proportion, so the
+    two parts add up to the trade (to float rounding); pay-out, profit and the figures
+    read off them are worked out again for each part as the cash walk works
+    them out for a whole trade.
+
+    Args:
+        trade (BacktestTrade): An open trade; changed in place.
+        pairs (int): Contract pairs to take out: at least 1, fewer than trade.n.
+
+    Returns:
+        BacktestTrade: The part taken out, still unsold, with the trade's
+            entry, markets and quotes.
+    """
+    share = pairs / trade.n
+    part_cost, part_fees = trade.total_cost * share, trade.fees * share
+    # What each contract pair paid, for the profit a win pays
+    price_a, price_b = _paid_prices(trade)
+
+    def figures(n: int, cost: float, fees: float) -> dict:
+        """A part's count, cost, fees, pay-out and the figures read off them."""
+        receipt = _settlement_receipt(n, trade.outcome_a, trade.outcome_b, trade.pair_type)
+        profit = receipt - cost - fees
+        expected = n * (1.0 - price_a - price_b) - fees
+        invested = cost + fees
+        ratio = profit / invested if invested > 0 else 0.0
+        return {"n": n, "total_cost": cost, "fees": fees, "actual_payoff": receipt,
+                "profit": profit, "profit_ratio": ratio,
+                "monthly_profit_ratio": ratio * 30.0 / trade.holding_days,
+                "expected_payoff": expected, "slippage": profit - expected}
+
+    part = replace(trade, **figures(pairs, part_cost, part_fees))
+    # What is left keeps the rest of the cost and fees
+    for name, value in figures(trade.n - pairs, trade.total_cost - part_cost,
+                               trade.fees - part_fees).items():
+        setattr(trade, name, value)
+    return part
 
 
 def _sale_checkpoints(first: date, last: date) -> list[date]:
@@ -8810,6 +9236,7 @@ def _simulate_at_discount(
     add_to_held: bool = False,
     sell_at: float | None = None,
     sell_min_days: int | None = None,
+    trim_to_kelly: bool = False,
 ) -> SweepPoint:
     """
     Choose, size and settle trades from prepared entries at one interval
@@ -8912,6 +9339,37 @@ def _simulate_at_discount(
     Every position sold is recorded as a SaleCheck on the returned point's
     sales.
 
+    trim_to_kelly sells part of a held pair when it has grown past its Kelly
+    size (False, the default, never trims):
+      * at every entry checkpoint from the first candidate's to the last
+        pay-out, after the day's pay-outs and any take-profit sales and
+        before the valuation the day's purchases are sized on, each open
+        position is checked (_kelly_trim);
+      * a pair may keep min(its size cap, Kelly's share) of the portfolio
+        value, each contract pair counted at what selling it returns now (the
+        bids, less the sale's fee), with the chance it pays read from that
+        checkpoint's fresh quotes. What is beyond that is sold, the latest
+        contracts bought first, down the modeled bid ladder (at the bid
+        itself, in any size, where there is no ladder); a worse price or a
+        thinner ladder sells fewer, never more (config.kelly_trim_count);
+      * selling is priced at the bids and buying at the asks, so the size a
+        pair is sold down to sits above the size add_to_held buys up to, and
+        between the two nothing trades;
+      * only one exact pair is trimmed: every open trade of the position the
+        same two markets the same way round, neither paid out, with a fresh
+        bid on both sides of both. A lone leg, a position holding a third
+        market, and a time-series pair whose chance of paying cannot be read
+        (a crossed quote, or a mid spread not above zero) are left alone;
+      * the part sold is a trade record of its own, exiting at the trim
+        (_split_trade, _sold_copy), and the trade it came from keeps the
+        rest. A position sold whole is freed as a take-profit sale frees it.
+        Either way its markets are not bought or added to at that checkpoint.
+    A checkpoint with no candidate changes nothing unless a position is
+    trimmed or sold there, so a run in which nothing is trimmed makes exactly
+    the trades of one that cannot trim. The size cap enters each trim, so
+    the returned cap_free_from also covers the largest cap any trim decision
+    depended on (KellyTrim.cap_free_from).
+
     Args:
         raw_entries (list[dict]): Prepared entries, one record per pair.
         start_date (date): First trading date of the window.
@@ -8933,14 +9391,18 @@ def _simulate_at_discount(
             left before its last market stops trading to be sold (see above): a whole
             number of at least 1, set only with sell_at; None sets no minimum. Set, it
             adds ", at least <N> day(s) before maturity" to the label.
+        trim_to_kelly (bool): Keyword-only. Whether a held pair is sold down to its
+            Kelly size (see above); True ends the completion line's label with
+            ", trimming to Kelly".
 
     Returns:
         SweepPoint: The trades and daily equity curve, stamped with the resolved
             k and size cap, the band, population, tier setting, the largest
             Kelly fraction seen, whether it could add to held pairs, the
-            level it sold at and its minimum of days, the cap it is the same
-            at and above (cap_free_from), and, when it could sell, a
-            SaleCheck per position sold (sales).
+            level it sold at and its minimum of days, whether it could trim
+            to Kelly, the cap it is the same at and above (cap_free_from),
+            and, when it could sell early, a SaleCheck per position a
+            take-profit sale sold (sales).
 
     Raises:
         ValueError: For an unknown population, a bad spread band, a bad size
@@ -9267,7 +9729,8 @@ def _simulate_at_discount(
             " [tier floors off]" if tier_floors is False else "",
         )
 
-    # The cap at and above which no trade here depends on the cap. A walked
+    # The cap at and above which no purchase here depends on the cap (a
+    # trim's own dependence on it is added after the walk, trim_floor). A walked
     # book is also averaged only as deep as config.max_kelly_fraction allows,
     # which stops moving once the cap reaches the pair type's own ceiling
     # (its value with no per-trade cap)
@@ -9332,7 +9795,7 @@ def _simulate_at_discount(
     # As live, a market is in the open trades of at most one pair (freed when
     # that pair pays out) and at most one time-series pair is open per ladder
     # (freed the day each market pays out). Nothing is sold before it pays
-    # out unless sell_at is set (see the docstring). With add_to_held, a pair
+    # out unless sell_at or trim_to_kelly is set (see the docstring). With add_to_held, a pair
     # still held may trade again as a new trade of its own, and a new pair may
     # add to a held leg whose partner has paid out (see the docstring).
     trades: list[BacktestTrade] = []
@@ -9365,8 +9828,8 @@ def _simulate_at_discount(
     # does — what a later add-on to a lone leg (its partner paid out) reads
     open_legs: dict[str, list[dict]] = {}
     add_ons = add_on_cap_skips = add_on_ladder_skips = 0
-    # Selling early (filled only when sell_at is set, so the off path records
-    # nothing new): each trade's pair, the sold copy that replaces a sold
+    # Selling early or trimming (filled only when sell_at or trim_to_kelly
+    # is set): each trade's pair, the sold copy that replaces a sold
     # trade in the results, the markets sold at the current checkpoint (not
     # bought again there), every pair ever sold, and the counts it logs
     pair_of: dict[int, int] = {}
@@ -9376,6 +9839,13 @@ def _simulate_at_discount(
     positions_sold = bought_again = 0
     # One SaleCheck per position sold, in the order sold (SweepPoint.sales)
     sale_checks: list[SaleCheck] = []
+    # Trimming to Kelly: whether it is on, the counts it logs, and the largest
+    # size cap any trim decision depended on (KellyTrim.cap_free_from)
+    trimming = bool(trim_to_kelly)
+    positions_trimmed = pairs_trimmed = 0
+    trim_floor = 0.0
+    # Selling of either kind visits every checkpoint, and needs each trade's pair
+    selling = sell_level is not None or trimming
     # The live code's market objects, built once per record (_candidate_pair),
     # trades filled at the top of the book, walked books' refusals by reason,
     # and walked candidates the cash left could not buy one contract pair of
@@ -9436,6 +9906,55 @@ def _simulate_at_discount(
                 else:
                     del open_legs[ticker]
 
+    def drop(sold_ids: set[int]) -> None:
+        """
+        Take sold trades out of every record the walk keeps of its open trades.
+
+        A sold trade pays out no more and holds no market or ladder. A sale
+        can leave other trades of the same pair open (only part of a position
+        was sold): a market one of those still holds stays taken, and the
+        pair's add-on record keeps them.
+
+        Args:
+            sold_ids (set[int]): id() of each trade sold whole.
+        """
+        nonlocal pending_exits, open_trades, active_until, ladders_until
+        pending_exits = [row for row in pending_exits if id(row[2]) not in sold_ids]
+        open_trades = [t for t in open_trades if id(t) not in sold_ids]
+        freed = {tk for _ed, tk, t in active_until if id(t) in sold_ids}
+        active_until = [row for row in active_until if id(row[2]) not in sold_ids]
+        # A market another open trade of the pair still holds is not freed
+        active_tickers.difference_update(freed - {tk for _ed, tk, _t in active_until})
+        still_held = []
+        for row in ladders_until:
+            if id(row[2]) not in sold_ids:
+                still_held.append(row)
+                continue
+            # Its pair's add-on record, if it has one, gives up the same holds
+            record = open_pairs.get(pair_of[id(row[2])]) if add_to_held else None
+            for key in row[1]:
+                open_ladders[key] -= 1
+                if not open_ladders[key]:
+                    del open_ladders[key]
+                if record is not None:
+                    record["ladders"][key] -= 1
+        ladders_until = still_held
+        if add_to_held:
+            # Each pair's record keeps only its trades still open, and goes
+            # when none is; so does each market's list of open legs
+            for pid in list(open_pairs):
+                kept = [row for row in open_pairs[pid]["trades"] if id(row[0]) not in sold_ids]
+                if kept:
+                    open_pairs[pid]["trades"] = kept
+                else:
+                    del open_pairs[pid]
+            for ticker in list(open_legs):
+                legs = [leg for leg in open_legs[ticker] if id(leg["trade"]) not in sold_ids]
+                if legs:
+                    open_legs[ticker] = legs
+                else:
+                    del open_legs[ticker]
+
     def sell(d: date) -> None:
         """
         Sell, whole, every open position that has stayed at sell_at of its potential profit for hold_days days.
@@ -9443,15 +9962,15 @@ def _simulate_at_discount(
         A position with fewer than min_days days left before it matures is
         skipped before it is valued (_far_enough). Each sold trade's proceeds
         come in now, its record is replaced by its sold copy (_sold_copy),
-        its pay-out, markets and ladder labels are freed, and its pair may be
-        bought again at a later checkpoint (never at this one: its markets go
-        into sold_here). Each position sold adds a SaleCheck to sale_checks.
+        its pay-out, markets and ladder labels are freed (drop), and its pair
+        may be bought again at a later checkpoint (never at this one: its
+        markets go into sold_here). Each position sold adds a SaleCheck to
+        sale_checks.
 
         Args:
             d (date): The checkpoint date, after its pay-outs.
         """
-        nonlocal cash, pending_exits, open_trades, active_until, ladders_until
-        nonlocal positions_sold
+        nonlocal cash, positions_sold
         sold_here.clear()
         sold_ids: set[int] = set()
         for position in _positions(open_trades):
@@ -9475,62 +9994,135 @@ def _simulate_at_discount(
                 # Free to trade again, at a later checkpoint only
                 traded_pairs.discard(pair_of[id(trade)])
                 sold_pairs.add(pair_of[id(trade)])
-        if not sold_ids:
-            return
-        # A sold trade pays out no more, and holds no market or ladder: a
-        # position is all the trades sharing its markets, so no open trade
-        # still holds any of them
-        pending_exits = [row for row in pending_exits if id(row[2]) not in sold_ids]
-        open_trades = [t for t in open_trades if id(t) not in sold_ids]
-        active_tickers.difference_update(tk for _ed, tk, t in active_until if id(t) in sold_ids)
-        active_until = [row for row in active_until if id(row[2]) not in sold_ids]
-        still_held = []
-        for row in ladders_until:
-            if id(row[2]) not in sold_ids:
-                still_held.append(row)
-                continue
-            for key in row[1]:
-                open_ladders[key] -= 1
-                if not open_ladders[key]:
-                    del open_ladders[key]
-        ladders_until = still_held
-        if add_to_held:
-            # Its pairs' records and its legs go too: nothing is held to add to
-            for pid in [pid for pid, rec in open_pairs.items()
-                        if any(id(t) in sold_ids for t, _paid in rec["trades"])]:
-                del open_pairs[pid]
-            for ticker in list(open_legs):
-                legs = [leg for leg in open_legs[ticker] if id(leg["trade"]) not in sold_ids]
-                if legs:
-                    open_legs[ticker] = legs
-                else:
-                    del open_legs[ticker]
+        if sold_ids:
+            # A position is all the trades sharing its markets, so no open
+            # trade still holds any of a sold position's
+            drop(sold_ids)
 
-    # Without selling, the candidates alone; with it, every other checkpoint
-    # too, up to the last pay-out (_sale_stream), so a position can be sold
-    # on a Monday nothing is bought
-    stream = (((c["entry_date"], c) for c in candidates) if sell_level is None
-              else _sale_stream(candidates))
+    def planned_trims(d: date, value: float, open_now: list[BacktestTrade]) -> list:
+        """
+        The Kelly trim's decision for every open position at the checkpoint on `d`.
+
+        Args:
+            d (date): The checkpoint date.
+            value (float): The portfolio value there, after its pay-outs and
+                take-profit sales, in dollars.
+            open_now (list[BacktestTrade]): The trades open there.
+
+        Returns:
+            list: (position, its sale) for each position that sells something
+                (_kelly_trim); empty when none does.
+        """
+        nonlocal trim_floor
+        planned = []
+        for position in _positions(open_now):
+            decision, sale = _kelly_trim(position, d, value, effective_k, cap, st_cap)
+            # Kept for every position looked at, trimmed or not: at another
+            # cap this one might have been
+            trim_floor = max(trim_floor, decision.cap_free_from)
+            if sale is not None:
+                planned.append((position, sale))
+        return planned
+
+    def trim(d: date, planned: list) -> None:
+        """
+        Sell what the Kelly trim decided at the checkpoint on `d`.
+
+        Each trade's proceeds come in now. A trade sold whole is replaced by
+        its sold copy and dropped from the walk's records, as a take-profit
+        sale's is; a trade sold in part is split (_split_trade): the part
+        sold is recorded as a trade of its own, and what is left pays out
+        less and stakes less of its pair. The position's markets go into
+        sold_here, so nothing is bought or added on them at this checkpoint.
+        With nothing planned it changes nothing.
+
+        Args:
+            d (date): The checkpoint date.
+            planned (list): planned_trims' result.
+        """
+        nonlocal cash, pending_exits, positions_trimmed, pairs_trimmed
+        if not planned:
+            return
+        sold_ids: set[int] = set()
+        for position, (sold, per_trade) in planned:
+            positions_trimmed += 1
+            whole = sum(sold) == sum(trade.n for trade in position)
+            for trade, pairs, sale in zip(position, sold, per_trade, strict=True):
+                if not pairs:
+                    continue
+                pairs_trimmed += pairs
+                cash += sale[0]
+                sold_here.update((trade.ticker_a, trade.ticker_b))
+                if pairs == trade.n:
+                    sold_copies[id(trade)] = _sold_copy(trade, d, sale)
+                    sold_ids.add(id(trade))
+                    continue
+                before = trade.n
+                trades.append(_sold_copy(_split_trade(trade, pairs), d, sale))
+                # What is left pays out its own, smaller receipt...
+                pending_exits = [(ed, t.actual_payoff if t is trade else amount, t)
+                                 for ed, amount, t in pending_exits]
+                # ...and stakes that much less of what its pair paid
+                record = open_pairs.get(pair_of[id(trade)])
+                if record is not None:
+                    record["trades"] = [(t, paid * t.n / before if t is trade else paid)
+                                        for t, paid in record["trades"]]
+            if whole:
+                # Nothing of the pair is held: free to trade again, at a later checkpoint
+                traded_pairs.discard(pair_of[id(position[0])])
+                sold_pairs.add(pair_of[id(position[0])])
+        if sold_ids:
+            drop(sold_ids)
+
+    # Without selling or trimming, the candidates alone; with either, every
+    # other checkpoint too, up to the last pay-out (_sale_stream), so a
+    # position can be sold or trimmed on a Monday nothing is bought
+    stream = (_sale_stream(candidates) if selling
+              else ((c["entry_date"], c) for c in candidates))
     for d, c in stream:
         if c is None:
-            # A checkpoint with no candidate, visited only to sell. Nothing
-            # changes here unless a position sells, so a run that never sells
-            # makes exactly the moves of one that cannot (_sale_reach)
+            # A checkpoint with no candidate, visited only to sell or trim.
+            # Nothing changes here unless a position sells or is trimmed, so
+            # a run in which none is makes exactly the moves of one that
+            # cannot (_sale_reach)
             open_now = [t for t in open_trades if t.exit_date > d]
-            if not any(_position_sells(sell_level, position, d, hold_days, min_days)
-                       for position in _positions(open_now)):
+            sells = sell_level is not None and any(
+                _position_sells(sell_level, position, d, hold_days, min_days)
+                for position in _positions(open_now))
+            planned = []
+            if trimming and not sells:
+                # The portfolio value a trim here is sized on: the cash after
+                # the day's pay-outs plus every open trade at market, as
+                # release() and then the valuation would make it
+                value = ((cash + sum(amount for ed, amount, _t in pending_exits if ed <= d))
+                         + sum(_open_value(t, d) for t in open_now))
+                planned = planned_trims(d, value, open_now)
+            if not sells and not planned:
                 continue
             release(d)
-            sell(d)
+            sold_here.clear()
+            if sells:
+                sell(d)
+                if trimming:
+                    # Decided after the sales, on what they left
+                    value_before_trims = cash + sum(_open_value(t, d) for t in open_trades)
+                    planned = planned_trims(d, value_before_trims, open_trades)
+            trim(d, planned)
             continue
         release(d)
 
         if d != checkpoint_date:
+            sold_here.clear()
             if sell_level is not None:
                 # Sales come after the day's pay-outs and before its valuation
                 # and every candidate (new pairs and add-ons alike), so a
                 # sale's cash funds this checkpoint's trades
                 sell(d)
+            if trimming:
+                # Trims come after the sales and before the valuation the
+                # day's purchases are sized on, so their cash funds those too
+                value_before_trims = cash + sum(_open_value(t, d) for t in open_trades)
+                trim(d, planned_trims(d, value_before_trims, open_trades))
             # New checkpoint: value the portfolio as cash plus every open trade
             # at market (_open_value, the one valuation; a trade with no
             # quotes counts at its cost)
@@ -9738,7 +10330,7 @@ def _simulate_at_discount(
         active_until.append((c["exit_date"], mA["ticker"], trade))
         active_until.append((c["exit_date"], mB["ticker"], trade))
 
-        if sell_level is not None:
+        if selling:
             # Which pair the trade belongs to, for a sale to free; a new trade
             # (not an add-on) of a pair sold before is it bought again
             pair_of[id(trade)] = c["pair_id"]
@@ -9775,7 +10367,8 @@ def _simulate_at_discount(
             ladders_until.append((paid_out, keys, trade))
 
     if sold_copies:
-        # Each sold trade's record is its sold copy, in the order it was made
+        # Each trade sold whole is recorded as its sold copy, in the trade's
+        # own place (a part a trim sold was appended when it was sold)
         trades = [sold_copies.get(id(t), t) for t in trades]
 
     # Named with the RESOLVED discount, the resolved band and the population.
@@ -9795,9 +10388,10 @@ def _simulate_at_discount(
     # line is byte-identical and the population stays the last ", "-separated
     # field of a default-cap prefix that does not add to held pairs. A run
     # that adds to held pairs ends its prefix on ", adding to held pairs",
-    # after the cap, so it never shares a prefix with one that does not. The
-    # lazy size-cap runs are quiet (DEBUG).
-    run_label = "k={}, band {}{}, {}{}{}{}".format(
+    # after the cap, so it never shares a prefix with one that does not; a
+    # run that sells early names its level next, and one that trims to Kelly
+    # ends on ", trimming to Kelly". The lazy size-cap runs are quiet (DEBUG).
+    run_label = "k={}, band {}{}, {}{}{}{}{}".format(
         _exact_label(effective_k, ".3f"),
         _band_label((band_lo, band_hi)),
         " with the tier floors off" if tier_floors is False else "",
@@ -9805,6 +10399,7 @@ def _simulate_at_discount(
         "" if cap == BUDGET_FRACTION else f", {_cap_label(cap)}",
         ", adding to held pairs" if add_to_held else "",
         "" if sell_level is None else f", {_sale_label(sell_level, min_days)}",
+        ", trimming to Kelly" if trimming else "",
     )
     # Once per pair per Monday the Kelly gate skipped for a crossed quote
     # (silent at zero)
@@ -9844,8 +10439,9 @@ def _simulate_at_discount(
             "two markets share no ladder (%s): %d",
             run_label, add_on_ladder_skips,
         )
-    # Selling early: positions sold, and pairs bought again after one (each
-    # silent at zero, and never logged with sell_at unset)
+    # Selling early: positions a take-profit sale sold, and pairs bought
+    # again after being sold whole, by such a sale or by a Kelly trim (each
+    # silent at zero)
     if positions_sold:
         logging.log(
             logging.DEBUG if quiet else logging.INFO,
@@ -9857,6 +10453,14 @@ def _simulate_at_discount(
             logging.DEBUG if quiet else logging.INFO,
             "Pairs bought again after a sale (%s): %d",
             run_label, bought_again,
+        )
+    # Trimming to Kelly: how many times a position was sold down, and the
+    # contract pairs that sold (silent at zero)
+    if positions_trimmed:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Positions trimmed to their Kelly size (%s): %d (contract pairs sold: %d)",
+            run_label, positions_trimmed, pairs_trimmed,
         )
     # How trades were sized: at the top of the book (no depth model, or no
     # volume data for a leg that Monday), walked books' refusals by reason,
@@ -9900,9 +10504,12 @@ def _simulate_at_discount(
         tier_floors=tier_floors is not False,
         size_cap=cap, peak_kelly_fraction=peak_kelly,
         add_to_held=bool(add_to_held), sell_at=sell_level,
-        cap_free_from=cap_free_from, sell_min_days=min_days,
+        # A trim reads the cap too, so the cap the walk stops depending on
+        # is at least the largest any trim decision depended on
+        cap_free_from=max(cap_free_from, trim_floor), sell_min_days=min_days,
         # Recorded only by a run that could sell
         sales=None if sell_level is None else tuple(sale_checks),
+        trim_to_kelly=trimming,
     )
 
 
@@ -10300,7 +10907,7 @@ def run_backtest(
 
     Returns:
         tuple[list[BacktestTrade], pd.DataFrame]: (trades, equity_df).
-            trades is one BacktestTrade per entered pair, in entry-date order
+            trades is one BacktestTrade per purchase, in entry-date order
             (empty if none were ever entered). equity_df has columns
             [date, portfolio_value, daily_return], one row per day from
             start_date - 1 day (the untouched initial balance) through today,
@@ -10487,13 +11094,14 @@ def _half_split(
     add_to_held: bool = False,
     sell_at: float | None = None,
     sell_min_days: int | None = None,
+    trim_to_kelly: bool = False,
 ) -> HalfSplit:
     """
     Simulate each half of one scenario's entries alone and keep three numbers each.
 
     Both halves are simulated at the scenario's own size cap, tier-floor
-    setting, add-on setting, sell level and minimum of days before maturity,
-    forwarded through _sim_options — which
+    setting, add-on setting, sell level, minimum of days before maturity and
+    Kelly-trim setting, forwarded through _sim_options — which
     forwards NOTHING on a default call, so the eager tier-on band sweep calls
     _simulate_at_discount with exactly the keywords it always did.
 
@@ -10532,6 +11140,9 @@ def _half_split(
         sell_min_days (int | None): Keyword-only. The fewest days before
             maturity at which both halves sell a position, as the scenario
             did; forwarded only when set. Default None.
+        trim_to_kelly (bool): Keyword-only. Whether both halves sell held
+            pairs down to their Kelly size, as the scenario did; forwarded
+            only when True. Default False.
 
     Returns:
         HalfSplit: Each half's total return, trade count and entry count. The
@@ -10543,7 +11154,7 @@ def _half_split(
     # byte-for-byte the call it always was
     options = _sim_options(size_cap, quiet, end_date=end_date, tier_floors=tier_floors,
                            add_to_held=add_to_held, sell_at=sell_at,
-                           sell_min_days=sell_min_days)
+                           sell_min_days=sell_min_days, trim_to_kelly=trim_to_kelly)
     h1 = _simulate_at_discount(first, start_date, initial_balance, k=k,
                                spread_band=band, population=f"{population}/H1", **options)
     h2 = _simulate_at_discount(second, start_date, initial_balance, k=k,
@@ -10582,7 +11193,8 @@ def _ex_top_event(
     sized differently without it. The re-run also adds to held pairs exactly
     when the point did (point.add_to_held), and sells early at the point's
     level and minimum of days before maturity (point.sell_at,
-    point.sell_min_days).
+    point.sell_min_days), and trims to Kelly when the point did
+    (point.trim_to_kelly).
 
     Args:
         point (SweepPoint): The scenario's "all" or "time_series" point.
@@ -10621,7 +11233,8 @@ def _ex_top_event(
                                                    tier_floors=tier_floors,
                                                    add_to_held=point.add_to_held,
                                                    sell_at=point.sell_at,
-                                                   sell_min_days=point.sell_min_days))
+                                                   sell_min_days=point.sell_min_days,
+                                                   trim_to_kelly=point.trim_to_kelly))
     return top, _total_return(without, initial_balance)
 
 
@@ -10788,6 +11401,7 @@ def _sweep_from_candidates(
     sell_sweep: bool = False,
     live: LiveSettings | None | object = _LIVE_NOT_READ,
     depth_model: DepthModel | None = None,
+    trim_sweep: bool = False,
 ) -> BacktestSweep:
     """
     Run every entry pass and every simulation of one backtest over one fetch.
@@ -10908,6 +11522,10 @@ def _sweep_from_candidates(
     on and off, with the same end-date maps, announced by one INFO line. It
     too simulates nothing here.
 
+    With trim_sweep, a TrimSweep is returned (BacktestSweep.trim_sweep) the
+    same way: the same entries, caps, bands, k grid and end-date maps,
+    announced by one INFO line, nothing simulated here.
+
     Args:
         candidates (_Candidates): _prepare_candidates() output. CONSUMED: its
             candles_by_ticker and all_pairs attributes are deleted after
@@ -10960,6 +11578,9 @@ def _sweep_from_candidates(
         depth_model (DepthModel | None): Keyword-only. The depth model every
             entry's quotes carry, so every simulation's trades walk synthetic
             books; None (default) fills every trade at the top of the book.
+        trim_sweep (bool): Keyword-only. When True, also return the Kelly-trim
+            family described above on BacktestSweep.trim_sweep (the same caps
+            as the add-on family). False (default) returns None.
 
     Returns:
         BacktestSweep: primary, points (the primary band's k sweep),
@@ -10971,8 +11592,8 @@ def _sweep_from_candidates(
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
             cap_sweep, tier_off_cap_sweep, add_on_cap_sweep,
             add_on_tier_off_cap_sweep, same_title_size_cap, the eleven live_*
-            fields, entry_checkpoint, sell_sweep and depth_model — see
-            BacktestSweep.
+            fields, entry_checkpoint, sell_sweep, depth_model and trim_sweep
+            — see BacktestSweep.
 
     Raises:
         ValueError: If tier_off_sweep is set without band_sweep (the tier-off
@@ -11232,12 +11853,12 @@ def _sweep_from_candidates(
     # it holds references to points already kept above, never a copy.
     eager: dict[tuple, SweepPoint] = {}
     # (band, k, "all") -> the last day the eager "all" point's curve ends on.
-    # The add-on and sell sweeps end every cell's curves there too, so a cell
-    # and its eager twin cover one span. Filled only with add_on_sweep or
-    # sell_sweep (the tier-off loop fills its own map, since the two share keys).
+    # The add-on, sell and Kelly-trim sweeps end every cell's curves there
+    # too, so a cell and its eager twin cover one span. Filled only with one of
+    # those sweeps (the tier-off loop fills its own map, since the two share keys).
     add_on_end_dates: dict[tuple, date | None] = {}
     add_on_off_end_dates: dict[tuple, date | None] = {}
-    lazy_families = add_on_sweep or sell_sweep
+    lazy_families = add_on_sweep or sell_sweep or trim_sweep
     for bi, band in enumerate(bands, start=1):
         entries = entries_by_band[band]
         # The primary's is the object already measured and logged above.
@@ -11356,8 +11977,8 @@ def _sweep_from_candidates(
     # carries it, resolved at simulation time) unioned into SIZE_CAP_SWEEP, as
     # the k grid unions its primary, so the eager points are always exact
     # members. Read by the size-cap sweeps and, with the size-cap sweep on, by
-    # the add-on sweeps; a run without the size-cap sweep never reads a
-    # point's stamped cap here.
+    # the add-on, sell and trim families; a run without the size-cap sweep
+    # never reads a point's stamped cap here.
     caps = (tuple(sorted(set(SIZE_CAP_SWEEP) | {primary.size_cap}))
             if cap_sweep else ())
     capped = None
@@ -11443,6 +12064,23 @@ def _sweep_from_candidates(
                      len(sold.levels), len(sold.min_days), len(sell_caps), len(bands),
                      len(tier_off_bands), len(grid))
 
+    trimmed = None
+    if trim_sweep:
+        # Every scenario again with held pairs sold down to their Kelly size,
+        # over the same grid as the add-on family, tier floors on and off,
+        # adding to held pairs or not; nothing simulated here
+        trim_caps = caps if cap_sweep else (primary.size_cap,)
+        trimmed = TrimSweep(
+            caps=trim_caps, primary_cap=primary.size_cap, bands=tuple(bands),
+            off_bands=tuple(tier_off_bands), ks=tuple(grid), primary_k=effective_k,
+            start_date=start_date, initial_balance=initial_balance,
+            entries_by_band=entries_by_band, off_entries_by_band=tier_off_entries,
+            end_dates=add_on_end_dates, off_end_dates=add_on_off_end_dates)
+        logging.info("Trimming to Kelly: %d size cap(s) x %d band(s) (%d with the tier "
+                     "floors off) x %d k, adding to held pairs or not, each simulated "
+                     "when the dashboard reads it",
+                     len(trim_caps), len(bands), len(tier_off_bands), len(grid))
+
     return BacktestSweep(
         primary=primary, points=points, calibration=calibration,
         label_coverage=candidates.label_coverage,
@@ -11470,6 +12108,7 @@ def _sweep_from_candidates(
         sell_sweep=sold,
         # Where every trade's synthetic book came from, for the page's header
         depth_model=depth_model,
+        trim_sweep=trimmed,
     )
 
 
@@ -11491,6 +12130,7 @@ def run_backtest_sweep(
     sell_sweep: bool = False,
     *,
     depth_model: DepthModel | None = None,
+    trim_sweep: bool = False,
 ) -> BacktestSweep:
     """
     Replay both pair strategies at one interval discount, or at a grid of them —
@@ -11569,6 +12209,14 @@ def run_backtest_sweep(
     over the same grid, tier floors on and off, adding to held pairs or not,
     simulated only when the dashboard reads it. The run logs one setting line
     for it and, from _sweep_from_candidates, one summary line.
+
+    With trim_sweep, the result also carries the dashboard's "Trim to Kelly"
+    family (BacktestSweep.trim_sweep): every scenario of the same grid with
+    held pairs sold down to their Kelly size at each weekly checkpoint
+    (_simulate_at_discount's trim_to_kelly), tier floors on and off, adding
+    to held pairs or not, simulated only when the dashboard reads it. The run
+    logs one setting line for it and, from _sweep_from_candidates, one
+    summary line.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -11650,6 +12298,12 @@ def run_backtest_sweep(
             adds no simulation to the run itself. False (default)
             returns None, as does the infeasible window. Backtest-only: live
             selling never reads it.
+        trim_sweep (bool): Keyword-only. When True, also return
+            BacktestSweep.trim_sweep — a lazy TrimSweep over the same grid,
+            every simulation selling held pairs down to their Kelly size.
+            The flag adds no simulation to the run itself. False (default)
+            returns None, as does the infeasible window. Backtest-only: live
+            trading does not trim.
         depth_model (DepthModel | None): Keyword-only. The depth model every
             trade's synthetic order book is built from
             (depth_model.load_depth_model()); None (default) fills every trade
@@ -11670,8 +12324,8 @@ def run_backtest_sweep(
             tier_off_sweep, the lazy cap_sweep and tier_off_cap_sweep, the
             lazy add-on family (add_on_cap_sweep and
             add_on_tier_off_cap_sweep), same_title_size_cap, the live_*
-            fields, entry_checkpoint, the lazy sell_sweep and depth_model —
-            see BacktestSweep.
+            fields, entry_checkpoint, the lazy sell_sweep, depth_model and
+            the lazy trim_sweep — see BacktestSweep.
 
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
@@ -11819,6 +12473,13 @@ def run_backtest_sweep(
         "when the dashboard is built"
         if sell_sweep else "off — the dashboard's Sell select stays disabled",
     )
+    # And for the Kelly-trim family, the same way
+    logging.info(
+        "Trimming to Kelly (backtest): %s",
+        "on — the dashboard's Trim to Kelly select is simulated when the "
+        "dashboard is built" if trim_sweep else
+        "off — the dashboard's Trim to Kelly select stays disabled",
+    )
     # And the depth model this run builds every trade's synthetic book from
     # (load_depth_model's own line says it was loaded)
     if depth_model is None:
@@ -11874,7 +12535,7 @@ def run_backtest_sweep(
             spread_band=primary_band, band_sweep=band_sweep,
             tier_off_sweep=tier_off_sweep, cap_sweep=cap_sweep,
             add_on_sweep=add_on_sweep, sell_sweep=sell_sweep, live=live,
-            depth_model=depth_model,
+            depth_model=depth_model, trim_sweep=trim_sweep,
         )
     # On every path, "none recorded" included, so the report never omits it
     logging.info("%s", _live_rule_line(result))
