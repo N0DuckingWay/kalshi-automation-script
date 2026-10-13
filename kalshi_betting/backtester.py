@@ -290,7 +290,14 @@ Notes:
     with held pairs sold down to their Kelly size (_simulate_at_discount's
     trim_to_kelly), tier floors on and off, adding to held pairs or not.
     Like the add-on family it simulates nothing during the run; each cell is
-    simulated when the dashboard reads it.
+    simulated when the dashboard reads it. With trim_rise_sweep too, the
+    family also covers every minimum price rise of
+    config.TRIM_MIN_PRICE_RISES (trim_min_rise). Every trimming run records
+    how far a pair's price had risen before each trim it made
+    (SweepPoint.trim_rises), which is how TrimSweep.rise_grid simulates only
+    the minimums that differ: a larger minimum that still lets through every
+    trim a run made (config.trim_rise_reached) is that run, yielded as a
+    SameTrim.
 
     An ENTRY CHECKPOINT is a moment at which the backtest may open a
     simulated trade: the live bot's weekly run time (config.SCHEDULED_RUN,
@@ -363,7 +370,7 @@ import statistics
 import sys
 from array import array
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -401,6 +408,7 @@ from .config import (
     TAKE_PROFIT_MIN_DAYS,
     TIME_SERIES_INTERVAL_PROB_DISCOUNT,
     TIME_SERIES_SAME_EVENT_LADDERS,
+    TRIM_MIN_PRICE_RISES,
     KellyTrim,
     LiveDefaultsError,
     LiveDefaultsMissing,
@@ -1896,8 +1904,9 @@ class SweepPoint:
             only a run with no minimum does. () when it could trim and
             trimmed nothing, None when it never trims (trim_to_kelly False)
             or the point was built by hand. A copy CapSweep shares at another
-            cap keeps it, since its walk, and so its trims, are the same. Not
-            in repr and not compared, like sales.
+            cap keeps it, since its walk, and so its trims, are the same.
+            TrimSweep.rise_grid reads it to tell which larger minimums give
+            this same run. Not in repr and not compared, like sales.
     """
     k: float
     trades: list[BacktestTrade]
@@ -2865,6 +2874,26 @@ class SameSale:
 
 
 @dataclass(frozen=True)
+class SameTrim:
+    """
+    A minimum-price-rise cell that is exactly a run TrimSweep.rise_grid already has, at the same size cap.
+
+    rise_grid yields one of these, instead of a point, for a (minimum price
+    rise, cap) that walks exactly as a run of the same cell and cap at a
+    smaller minimum, or at no minimum: every trim that run made came after a
+    rise this minimum also lets through, so the two runs make the same trades
+    (rise_grid says why). A reader reuses whatever it made of that earlier
+    run; nothing is simulated or kept for this one.
+
+    Attributes:
+        min_rise (float | None): The minimum the earlier run was simulated
+            at, which rise_grid yielded as a point for this cap; None for the
+            Trim to Kelly run with no minimum (the run rise_grid starts from).
+    """
+    min_rise: float | None
+
+
+@dataclass(frozen=True)
 class SellSweep:
     """
     The dashboard's "Sell" family: every sell level and minimum of days of every scenario, simulated on demand.
@@ -3210,6 +3239,15 @@ class TrimSweep:
     walk stops depending on (SweepPoint.cap_free_from), which every larger
     cap shares.
 
+    With min_rises (config.TRIM_MIN_PRICE_RISES on a run that asked for
+    them), the family also covers the dashboard's Min. price rise choice:
+    the same scenarios with a held pair trimmed only once its total price
+    has risen that far since the last trade on it (_simulate_at_discount's
+    trim_min_rise). sweep(min_rise=...) is the CapSweep at one minimum, and
+    rise_grid() reads one (band, k) cell at every minimum while simulating
+    only the runs that differ: a minimum that holds back none of the trims a
+    run at a smaller minimum made is that run, yielded as a SameTrim.
+
     Retention: its entry maps are the very objects BacktestSweep's size-cap,
     add-on and sell families hold, so beside any of them it keeps nothing
     more alive; on a run with none of them it is what keeps those entries.
@@ -3230,6 +3268,11 @@ class TrimSweep:
         end_dates (dict): (band, k, "all") -> the day the tier-on eager
             point's curve ended. Not in repr.
         off_end_dates (dict): The same for the tier-off family. Not in repr.
+        min_rises (tuple[float, ...]): The minimum price rises the family
+            covers, in dollars, ascending, distinct, each in (0, 1]
+            (_resolve_trim_min_rises). Empty (default) on a family built
+            without them: sweep() then takes no minimum and rise_grid()
+            yields nothing.
     """
     caps: tuple[float, ...]
     primary_cap: float
@@ -3243,10 +3286,33 @@ class TrimSweep:
     off_entries_by_band: dict = field(repr=False)
     end_dates: dict = field(repr=False)
     off_end_dates: dict = field(repr=False)
+    # The minimum price rises the dashboard offers (empty: none simulated)
+    min_rises: tuple[float, ...] = ()
 
-    def sweep(self, *, tier_floors: bool = True, add_to_held: bool = False) -> CapSweep:
+    def __post_init__(self) -> None:
         """
-        The lazy size-cap sweep that trims to Kelly under one Tier floors and add-on setting.
+        Refuse minimum price rises that are not ascending amounts in (0, 1].
+
+        rise_grid reads the minimums in the order they are held and lets a
+        run stand for the minimums after it, which is exact only when each
+        is larger than the one before.
+
+        Raises:
+            ValueError: If a value of min_rises is not a real number in
+                (0, 1], or the values are not strictly ascending.
+        """
+        checked = [_validated_cap(rise, "each of TrimSweep's min_rises")
+                   for rise in self.min_rises]
+        # Ascending with none repeated is the sorted list of its distinct values
+        if checked != sorted(set(checked)):
+            raise ValueError("TrimSweep's min_rises must be in ascending order, each named "
+                             f"once, got {self.min_rises!r}")
+
+    def sweep(self, *, tier_floors: bool = True, add_to_held: bool = False,
+              min_rise: float | None = None,
+              caps: Iterable[float] | None = None) -> CapSweep:
+        """
+        The lazy size-cap sweep that trims to Kelly under one Tier floors, add-on and price-rise setting.
 
         Args:
             tier_floors (bool): Keyword-only. True (default) for the tier-on
@@ -3254,27 +3320,188 @@ class TrimSweep:
                 tier floors off.
             add_to_held (bool): Keyword-only. Whether every simulation may
                 also add to a pair it still holds. Default False.
+            min_rise (float | None): Keyword-only. One of self.min_rises:
+                trim a held pair only once its total price has risen that
+                many dollars since the last trade on it. None (default) sets
+                no minimum.
+            caps (Iterable[float] | None): Keyword-only. The caps to simulate,
+                each one of self.caps; None (default) means every one. A cap
+                left out is not simulated, and the caps that cannot change a
+                run still share one simulation among those kept.
 
         Returns:
-            CapSweep: Over that setting's bands and entries, every k and cap,
-                the "all" population only, trimming to Kelly; nothing is
+            CapSweep: Over that setting's bands and entries, every k and the
+                caps chosen, the "all" population only, trimming to Kelly
+                (after that price rise, when one is given); nothing is
                 simulated until one of its cells is read.
 
         Raises:
             ValueError: For tier_floors False on a family with no
-                tier-floors-off bands.
+                tier-floors-off bands, a minimum not in self.min_rises, or a
+                cap not in self.caps.
         """
         if not tier_floors and not self.off_bands:
             raise ValueError("this run has no tier-floors-off family to trim in")
+        if min_rise is not None and min_rise not in self.min_rises:
+            raise ValueError(
+                f"minimum price rise {min_rise!r} is not one of {self.min_rises}")
+        chosen = self.caps if caps is None else tuple(sorted(set(caps)))
+        if any(cap not in self.caps for cap in chosen):
+            raise ValueError(f"size caps {chosen!r} are not all among {self.caps}")
         return CapSweep(
-            caps=self.caps, primary_cap=self.primary_cap,
+            caps=chosen, primary_cap=self.primary_cap,
             bands=tuple(self.bands if tier_floors else self.off_bands), ks=self.ks,
             primary_k=self.primary_k, start_date=self.start_date,
             initial_balance=self.initial_balance, split_date=None, checks=False,
             entries_by_band=self.entries_by_band if tier_floors else self.off_entries_by_band,
             st_entries=[], eager={}, tier_floors=tier_floors, add_to_held=add_to_held,
             end_dates=self.end_dates if tier_floors else self.off_end_dates,
-            trim_to_kelly=True)
+            trim_to_kelly=True, trim_min_rise=min_rise)
+
+    def rise_grid(self, band: tuple[float, float], k: float, *, tier_floors: bool = True,
+                  add_to_held: bool = False, caps: Iterable[float] | None = None,
+                  start: Mapping[float, tuple[float, ...]] | None = None,
+                  stats: dict | None = None,
+                  ) -> Iterator[tuple[float, dict[float, SweepPoint | SameTrim]]]:
+        """
+        Every minimum price rise of one (band, k) cell, simulating only the runs that differ.
+
+        The minimums (self.min_rises) are read in ascending order. For each
+        size cap the grid keeps one run in hand: at first the Trim to Kelly
+        run with no minimum, later the last run it simulated for that cap.
+        All it keeps of a run is the minimum it was simulated at and how far
+        the pair's price had risen before each trim it made
+        (SweepPoint.trim_rises). Every (minimum, cap) is then one of two
+        things:
+          * SameTrim(m0) — exactly the run in hand, which was simulated at
+            the smaller minimum m0 (None: no minimum): every trim that run
+            made came after a rise this minimum lets through too
+            (config.trim_rise_reached, the test the walk itself asks before
+            a trim). A run that made no trim always qualifies. Nothing is
+            simulated;
+          * a point — simulated at this minimum, the caps that cannot change
+            the run sharing one simulation (CapSweep). It becomes the run in
+            hand for its cap.
+
+        Why a SameTrim is exact. Follow the run in hand and a run at the
+        larger minimum side by side, one weekly checkpoint at a time. While
+        they have made the same trades they hold the same pairs, each last
+        traded on the same day, so each pair's price rise reads the same in
+        both. A pair the smaller minimum holds back, the larger one holds
+        back too: the test only gets harder as the minimum grows. A pair the
+        run in hand trimmed is let through by the larger minimum as well
+        (that is the condition above) and, everything else being equal, is
+        trimmed by the same amount. A pair the run in hand looked at and did
+        not trim is not trimmed under the larger minimum either, whether it
+        is looked at there or held back. So both make the same trades at
+        that checkpoint, and at the next, to the end. The day a pair's rise
+        is measured from moves only when the pair is traded, so it never
+        differs between the two. A run with no minimum that trimmed a pair
+        after its price fell stands for no minimum: every minimum holds that
+        trim back, so each one is simulated until a run makes only trims the
+        next minimum lets through.
+
+        The test reads prices and trade dates, never the size cap, so the
+        sharing across caps inside each CapSweep is as it is without a
+        minimum. Only one minimum's points are alive at a time: between
+        yields the generator keeps, per cap, a minimum and a tuple of rises,
+        never a point.
+
+        Args:
+            band (tuple[float, float]): One of the setting's bands.
+            k (float): One of self.ks.
+            tier_floors (bool): Keyword-only. The Tier floors setting.
+            add_to_held (bool): Keyword-only. The Add to held pairs setting.
+            caps (Iterable[float] | None): Keyword-only. The caps to cover,
+                each one of self.caps; None (default) means every one.
+            start (Mapping[float, tuple[float, ...]] | None): Keyword-only.
+                For each cap covered, the trim_rises of this cell's Trim to
+                Kelly run with no minimum, for a caller that has already
+                read that run. None (default) simulates it here.
+            stats (dict | None): Keyword-only. When given, its "simulated"
+                and "reused" counts are raised by the cap points this call
+                simulated and shared across caps (CapSweep's counters, the
+                run with no minimum included when it is simulated here) and
+                its "same" count by the cells yielded as SameTrim, for a
+                report's log line.
+
+        Yields:
+            tuple[float, dict[float, SweepPoint | SameTrim]]: (minimum, cap
+                -> the "all" point trimming only after that rise, or a
+                SameTrim naming the earlier run it equals), for every
+                minimum of self.min_rises, ascending. Nothing on a family
+                without minimums.
+
+        Raises:
+            ValueError: On the first step: as sweep(); for a `start` that
+                lacks a cap covered or holds None for one (the rises of a
+                run that does not trim); and from CapSweep, for a cell with
+                no end day.
+            KeyError: On the first step, for a band the setting does not hold.
+        """
+        # Checked as sweep() checks them, here because with `start` given no
+        # sweep may be built at all; its caps are the ones asked for, ascending
+        setting = self.sweep(tier_floors=tier_floors, add_to_held=add_to_held, caps=caps)
+        chosen = setting.caps
+        if band not in setting.entries_by_band:
+            raise KeyError(band)
+        if stats is not None:
+            for key in ("simulated", "reused", "same"):
+                stats.setdefault(key, 0)
+        if not self.min_rises:
+            return
+
+        def read(min_rise: float | None, wanted) -> dict:
+            """One sweep's cell at one minimum over the caps wanted, counted into stats."""
+            swept = self.sweep(tier_floors=tier_floors, add_to_held=add_to_held,
+                               min_rise=min_rise, caps=wanted)
+            cell = swept.cell(band, k)
+            if stats is not None:
+                stats["simulated"] += swept.simulated
+                stats["reused"] += swept.reused
+            return cell
+
+        if start is None:
+            base = read(None, chosen)
+            start = {cap: base[cap]["all"].trim_rises for cap in chosen}
+            del base
+        missing = [cap for cap in chosen if start.get(cap) is None]
+        if missing:
+            raise ValueError(
+                f"start has no trim rises for size cap(s) {missing!r}: it must give, for "
+                "every cap covered, the trim_rises of the Trim to Kelly run with no minimum "
+                "(None is a run that does not trim)")
+        # Per cap, the run in hand: the minimum it was simulated at (None: no
+        # minimum) and the rise behind each trim it made
+        runs: dict[float, tuple[float | None, tuple[float, ...]]] = {
+            cap: (None, tuple(start[cap])) for cap in chosen}
+
+        def cells_at(min_rise: float) -> dict:
+            """Every cap of one minimum: a SameTrim, or a simulated point."""
+            out: dict[float, SweepPoint | SameTrim] = {}
+            needed = []
+            for cap in chosen:
+                at, rises = runs[cap]
+                # config.trim_rise_reached, the walk's own test: every trim
+                # that run made is still let through (a run that made none
+                # included), and what it held back stays held back
+                if all(trim_rise_reached(rise, min_rise) for rise in rises):
+                    out[cap] = SameTrim(at)
+                else:
+                    needed.append(cap)
+            if needed:
+                cell = read(min_rise, needed)
+                for cap in needed:
+                    point = cell[cap]["all"]
+                    runs[cap] = (min_rise, point.trim_rises)
+                    out[cap] = point
+            if stats is not None:
+                stats["same"] += sum(isinstance(v, SameTrim) for v in out.values())
+            return {cap: out[cap] for cap in chosen}
+
+        for min_rise in self.min_rises:
+            # Built inside the call, so between yields this frame holds no point
+            yield min_rise, cells_at(min_rise)
 
     def entry_events(self) -> set[tuple[str, str]]:
         """
@@ -3494,6 +3721,9 @@ class BacktestSweep:
             size, with adding to held pairs off or on, simulated when the
             dashboard reads it. None unless
             run_backtest_sweep(trim_sweep=True) ran on a feasible window.
+            With trim_rise_sweep=True too, its min_rises hold every minimum
+            price rise of config.TRIM_MIN_PRICE_RISES a trim can be made to
+            wait for; otherwise they are empty.
         depth_model (DepthModel | None): The depth model every trade's
             synthetic order book came from (which snapshots, how many
             ladders, when they were taken), for the page's header; None when
@@ -3914,6 +4144,56 @@ def _resolve_min_days_options() -> tuple[int, ...]:
     if len(set(checked)) != len(checked):
         raise ValueError(f"TAKE_PROFIT_MIN_DAYS names a value twice: {options!r}")
     return tuple(sorted(checked))
+
+
+def _resolve_trim_min_rises() -> tuple[float, ...]:
+    """
+    Check the minimum price rises the Trim to Kelly family offers, and return them in ascending order.
+
+    Reads this module's TRIM_MIN_PRICE_RISES when called (patch backtester's,
+    never config's). run_backtest_sweep calls it before its fetch when the
+    family's minimum price rises are on, so a bad value is refused in
+    milliseconds rather than after the fetch, and _sweep_from_candidates
+    calls it again to build the TrimSweep's min_rises. Each value is checked
+    as one simulation's minimum is (_resolve_trim_min_rise's rule,
+    _validated_cap). A value named twice is refused: a report finds each
+    minimum's place among the options by its value.
+
+    Returns:
+        tuple[float, ...]: The minimums, in dollars, ascending, as builtin floats.
+
+    Raises:
+        ValueError: If TRIM_MIN_PRICE_RISES is not a collection, is empty,
+            holds a value that is not a real number in (0, 1] (a bool or NaN
+            included), or names one value twice.
+    """
+    try:
+        rises = tuple(TRIM_MIN_PRICE_RISES)
+    except TypeError:
+        raise ValueError("TRIM_MIN_PRICE_RISES must be a tuple of dollar amounts in (0, 1], "
+                         f"got {TRIM_MIN_PRICE_RISES!r}") from None
+    if not rises:
+        raise ValueError("TRIM_MIN_PRICE_RISES must name at least one minimum price rise")
+    checked = [_validated_cap(rise, "each of TRIM_MIN_PRICE_RISES") for rise in rises]
+    if len(set(checked)) != len(checked):
+        raise ValueError(f"TRIM_MIN_PRICE_RISES names a value twice: {rises!r}")
+    return tuple(sorted(checked))
+
+
+def _trim_rises_span(rises: Sequence[float]) -> str:
+    """
+    Name the range a set of minimum price rises covers, in cents, for a log line.
+
+    Args:
+        rises (Sequence[float]): The minimums, in dollars, ascending and not
+            empty (_resolve_trim_min_rises).
+
+    Returns:
+        str: "<lowest>c to <highest>c" through _cap_percent, e.g. "5c to 95c";
+            "<value>c" alone when there is one minimum.
+    """
+    lowest, highest = _cap_percent(rises[0]), _cap_percent(rises[-1])
+    return f"{lowest}c" if lowest == highest else f"{lowest}c to {highest}c"
 
 
 def _days_left(position: list[BacktestTrade], day: date) -> int | None:
@@ -11647,6 +11927,7 @@ def _sweep_from_candidates(
     live: LiveSettings | None | object = _LIVE_NOT_READ,
     depth_model: DepthModel | None = None,
     trim_sweep: bool = False,
+    trim_rise_sweep: bool = False,
 ) -> BacktestSweep:
     """
     Run every entry pass and every simulation of one backtest over one fetch.
@@ -11769,7 +12050,10 @@ def _sweep_from_candidates(
 
     With trim_sweep, a TrimSweep is returned (BacktestSweep.trim_sweep) the
     same way: the same entries, caps, bands, k grid and end-date maps,
-    announced by one INFO line, nothing simulated here.
+    announced by one INFO line, nothing simulated here. With trim_rise_sweep
+    as well it carries the minimum price rises the dashboard offers
+    (TrimSweep.min_rises, from _resolve_trim_min_rises), which are simulated
+    only when a report reads TrimSweep.rise_grid.
 
     Args:
         candidates (_Candidates): _prepare_candidates() output. CONSUMED: its
@@ -11826,6 +12110,10 @@ def _sweep_from_candidates(
         trim_sweep (bool): Keyword-only. When True, also return the Kelly-trim
             family described above on BacktestSweep.trim_sweep (the same caps
             as the add-on family). False (default) returns None.
+        trim_rise_sweep (bool): Keyword-only. When True (trim_sweep
+            required), the Kelly-trim family also carries the minimum price
+            rises of this module's TRIM_MIN_PRICE_RISES (TrimSweep.min_rises).
+            False (default) leaves them empty.
 
     Returns:
         BacktestSweep: primary, points (the primary band's k sweep),
@@ -11843,9 +12131,13 @@ def _sweep_from_candidates(
     Raises:
         ValueError: If tier_off_sweep is set without band_sweep (the tier-off
             family is a band-sweep family: its split date, rescans and cells
-            are the band sweep's), checked first; from
-            config.time_series_spread_band for an invalid band; or from the
-            first simulation, for a bad SAME_TITLE_SIZE_CAP.
+            are the band sweep's), checked first; if trim_rise_sweep is set
+            without trim_sweep (the minimum price rises are part of the
+            Kelly-trim family), checked next; from
+            config.time_series_spread_band for an invalid band; from the
+            first simulation, for a bad SAME_TITLE_SIZE_CAP; or, with
+            trim_rise_sweep, from _resolve_trim_min_rises for a bad
+            TRIM_MIN_PRICE_RISES.
         AttributeError: If candidates has already fed a sweep (its
             all_pairs and candles_by_ticker were deleted) — loud rather than
             a silent sweep with no pairs and therefore no entries.
@@ -11853,6 +12145,9 @@ def _sweep_from_candidates(
     if tier_off_sweep and not band_sweep:
         raise ValueError("tier_off_sweep needs band_sweep: the tier-off family "
                          "re-runs the band sweep's binding bands")
+    if trim_rise_sweep and not trim_sweep:
+        raise ValueError("trim_rise_sweep needs trim_sweep: the minimum price rises "
+                         "are part of the Trim to Kelly family")
     start_date = candidates.start_date
     primary_band = time_series_spread_band(spread_band)
     # The saved live defaults: run_backtest_sweep's read, or our own for a
@@ -12313,14 +12608,16 @@ def _sweep_from_candidates(
     if trim_sweep:
         # Every scenario again with held pairs sold down to their Kelly size,
         # over the same grid as the add-on family, tier floors on and off,
-        # adding to held pairs or not; nothing simulated here
+        # adding to held pairs or not, and, when asked for, with each minimum
+        # price rise a trim can be made to wait for; nothing simulated here
         trim_caps = caps if cap_sweep else (primary.size_cap,)
         trimmed = TrimSweep(
             caps=trim_caps, primary_cap=primary.size_cap, bands=tuple(bands),
             off_bands=tuple(tier_off_bands), ks=tuple(grid), primary_k=effective_k,
             start_date=start_date, initial_balance=initial_balance,
             entries_by_band=entries_by_band, off_entries_by_band=tier_off_entries,
-            end_dates=add_on_end_dates, off_end_dates=add_on_off_end_dates)
+            end_dates=add_on_end_dates, off_end_dates=add_on_off_end_dates,
+            min_rises=_resolve_trim_min_rises() if trim_rise_sweep else ())
         logging.info("Trimming to Kelly: %d size cap(s) x %d band(s) (%d with the tier "
                      "floors off) x %d k, adding to held pairs or not, each simulated "
                      "when the dashboard reads it",
@@ -12376,6 +12673,7 @@ def run_backtest_sweep(
     *,
     depth_model: DepthModel | None = None,
     trim_sweep: bool = False,
+    trim_rise_sweep: bool = False,
 ) -> BacktestSweep:
     """
     Replay both pair strategies at one interval discount, or at a grid of them —
@@ -12461,7 +12759,13 @@ def run_backtest_sweep(
     (_simulate_at_discount's trim_to_kelly), tier floors on and off, adding
     to held pairs or not, simulated only when the dashboard reads it. The run
     logs one setting line for it and, from _sweep_from_candidates, one
-    summary line.
+    summary line. With trim_rise_sweep as well, that family also covers the
+    dashboard's Min. price rise choice: every minimum of
+    config.TRIM_MIN_PRICE_RISES, where a held pair is trimmed only once its
+    total price has risen that far since the last trade on it
+    (TrimSweep.min_rises, read through TrimSweep.rise_grid). It too is
+    simulated only when the dashboard reads it. A run with trim_sweep logs
+    one more setting line saying whether the minimum price rises are on.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -12549,6 +12853,12 @@ def run_backtest_sweep(
             The flag adds no simulation to the run itself. False (default)
             returns None, as does the infeasible window. Backtest-only: live
             trading does not trim.
+        trim_rise_sweep (bool): Keyword-only. When True (trim_sweep
+            required), BacktestSweep.trim_sweep also carries every minimum
+            price rise of config.TRIM_MIN_PRICE_RISES (TrimSweep.min_rises).
+            The flag adds no simulation to the run itself. False (default)
+            leaves min_rises empty. Validated at the TOP of this function,
+            before anything is logged or fetched. Backtest-only.
         depth_model (DepthModel | None): Keyword-only. The depth model every
             trade's synthetic order book is built from
             (depth_model.load_depth_model()); None (default) fills every trade
@@ -12574,14 +12884,17 @@ def run_backtest_sweep(
 
     Raises:
         ValueError: Before any fetch or log line, if tier_off_sweep is set
-            without band_sweep, if interval_discount is not a number in
+            without band_sweep, if trim_rise_sweep is set without
+            trim_sweep, if interval_discount is not a number in
             (0, 1], if this module's SAME_TITLE_SIZE_CAP is not on the 5%
             grid in (0, 1], if sell_sweep is set and this module's
             TAKE_PROFIT_HOLD_DAYS is not a whole number from 1 to
             _HOLD_DAYS_MAX, its TAKE_PROFIT_LEVELS is not a non-empty
             collection of distinct real numbers in (0, 1] or its
             TAKE_PROFIT_MIN_DAYS is not a non-empty collection of distinct
-            whole numbers of at least 1, or if
+            whole numbers of at least 1, if trim_rise_sweep is set and this
+            module's TRIM_MIN_PRICE_RISES is not a non-empty collection of
+            distinct real numbers in (0, 1], or if
             spread_band is not a valid band; and,
             before any fetch, from _prepare_candidates() when SCHEDULED_RUN
             cannot place the entry checkpoints (a configuration error).
@@ -12620,6 +12933,11 @@ def run_backtest_sweep(
     if tier_off_sweep and not band_sweep:
         raise ValueError("tier_off_sweep needs band_sweep: the tier-off family "
                          "re-runs the band sweep's binding bands")
+    # ... and for the minimum price rises, which are part of the Kelly-trim
+    # family: without that family there is no trim for a minimum to hold back
+    if trim_rise_sweep and not trim_sweep:
+        raise ValueError("trim_rise_sweep needs trim_sweep: the minimum price rises "
+                         "are part of the Trim to Kelly family")
     # The same for the extra same-title cap: refused here, not after the fetch
     same_title_cap = _resolve_same_title_size_cap()
     # ... and, when the sell family rides the result, for the sell rule's day
@@ -12629,6 +12947,9 @@ def run_backtest_sweep(
     if sell_sweep:
         _resolve_sell_levels()
         _resolve_min_days_options()
+    # ... and, when the Kelly-trim family carries them, for the minimum price
+    # rises, which the dashboard likewise reads only after the run
+    trim_rises = _resolve_trim_min_rises() if trim_rise_sweep else ()
     # And for k: every simulation hands it to the live sizer, whose
     # LiveSettings takes only a k in (0, 1]
     if interval_discount is not None and (
@@ -12725,6 +13046,16 @@ def run_backtest_sweep(
         "dashboard is built" if trim_sweep else
         "off — the dashboard's Trim to Kelly select stays disabled",
     )
+    # ... and, on a run with that family, whether it also carries the minimum
+    # price rises a trim can be made to wait for, named by the range they span
+    if trim_sweep:
+        logging.info(
+            "Trimming to Kelly (backtest): minimum price rises %s",
+            f"on — the dashboard's Min. price rise select ({_trim_rises_span(trim_rises)}, "
+            "config.TRIM_MIN_PRICE_RISES) is simulated when the dashboard is built"
+            if trim_rise_sweep else
+            "off — the dashboard's Min. price rise select stays disabled",
+        )
     # And the depth model this run builds every trade's synthetic book from
     # (load_depth_model's own line says it was loaded)
     if depth_model is None:
@@ -12781,6 +13112,7 @@ def run_backtest_sweep(
             tier_off_sweep=tier_off_sweep, cap_sweep=cap_sweep,
             add_on_sweep=add_on_sweep, sell_sweep=sell_sweep, live=live,
             depth_model=depth_model, trim_sweep=trim_sweep,
+            trim_rise_sweep=trim_rise_sweep,
         )
     # On every path, "none recorded" included, so the report never omits it
     logging.info("%s", _live_rule_line(result))
