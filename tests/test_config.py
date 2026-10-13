@@ -2215,6 +2215,100 @@ class TestKellyTrimCount:
         assert trimmed > 200 and bound > 200
 
 
+class TestTrimMinPriceRises:
+    """config.TRIM_MIN_PRICE_RISES: the minimum price rises the dashboard's
+    Min. price rise select offers, every 5c from 5c to 95c."""
+
+    def test_every_five_cents_from_5c_to_95c(self):
+        rises = config.TRIM_MIN_PRICE_RISES
+        assert isinstance(rises, tuple) and len(rises) == 19
+        assert config.TRIM_PRICE_RISE_STEP_CENTS == 5
+        # Each is the float nearest its cents over 100, so 15c is exactly 0.15
+        assert list(rises) == [cents / 100 for cents in range(5, 100, 5)]
+        assert rises[0] == 0.05 and rises[2] == 0.15 and rises[-1] == 0.95
+
+    def test_they_are_distinct_ascending_shares_of_a_dollar(self):
+        rises = config.TRIM_MIN_PRICE_RISES
+        assert list(rises) == sorted(set(rises))
+        assert all(0.0 < rise <= 1.0 for rise in rises)
+
+
+class TestPairPriceRise:
+    """config.pair_price_rise: how far a held pair's total price has risen
+    since the last trade on it, the one place the direction is decided."""
+
+    def test_a_rise_is_above_zero_and_a_fall_below(self):
+        assert config.pair_price_rise(0.62, 0.87) == pytest.approx(0.25)
+        assert config.pair_price_rise(0.87, 0.77) == pytest.approx(-0.10)
+        assert config.pair_price_rise(0.70, 0.70) == 0.0
+
+    def test_it_is_the_price_now_less_the_price_then(self):
+        rng = random.Random(20261013)
+        for _ in range(200):
+            then, now = rng.uniform(0.0, 1.0), rng.uniform(0.0, 1.0)
+            assert config.pair_price_rise(then, now) == now - then
+
+
+class TestTrimRiseReached:
+    """config.trim_rise_reached: whether a held pair's price has risen far
+    enough for a Kelly trim to be considered. A fall never counts."""
+
+    def test_no_minimum_passes_anything(self):
+        for rise in (0.5, 0.0, -0.9, float("nan")):
+            assert config.trim_rise_reached(rise, None) is True
+
+    def test_a_rise_at_or_above_the_minimum_passes(self):
+        assert config.trim_rise_reached(0.10, 0.10)
+        assert config.trim_rise_reached(0.33, 0.30)
+        assert not config.trim_rise_reached(0.08, 0.10)
+        assert not config.trim_rise_reached(0.0, 0.05)
+
+    def test_a_rise_exactly_on_the_minimum_passes_through_float_noise(self):
+        # 87c less 62c is the 25c minimum, whatever the floats make of it
+        assert config.trim_rise_reached(config.pair_price_rise(0.62, 0.87), 0.25)
+        assert config.trim_rise_reached(config.pair_price_rise(0.30, 0.35), 0.05)
+        # One real cent short is short
+        assert not config.trim_rise_reached(config.pair_price_rise(0.62, 0.86), 0.25)
+
+    def test_a_fall_never_passes_any_minimum(self):
+        for fall in (-0.01, -0.10, -0.50, -0.95):
+            for minimum in config.TRIM_MIN_PRICE_RISES:
+                assert not config.trim_rise_reached(fall, minimum)
+
+    def test_a_rise_or_a_minimum_that_is_not_a_number_holds_the_trim_back(self):
+        assert not config.trim_rise_reached(float("nan"), 0.05)
+        assert not config.trim_rise_reached(0.50, float("nan"))
+        assert not config.trim_rise_reached(0.50, float("inf"))
+
+    def test_a_larger_minimum_never_passes_what_a_smaller_one_held_back(self):
+        # What lets one run's result stand for a stricter minimum: the test
+        # only ever gets harder to pass as the minimum grows
+        rng = random.Random(20261013)
+        minimums = config.TRIM_MIN_PRICE_RISES
+        for _ in range(500):
+            rise = rng.uniform(-1.0, 1.0)
+            passed = [config.trim_rise_reached(rise, minimum) for minimum in minimums]
+            # Once it fails it fails at every larger minimum
+            assert passed == sorted(passed, reverse=True)
+
+    def test_the_rule_reads_only_what_it_is_handed(self):
+        # Plain arithmetic on its arguments, so a live seller can call it with
+        # its own prices: no name from outside but math and PRICE_EPSILON
+        source = pathlib.Path(config.__file__).read_text()
+        tree = ast.parse(source)
+        allowed = {"pair_price_rise": set(), "trim_rise_reached": {"math", "PRICE_EPSILON"}}
+        found = 0
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in allowed:
+                found += 1
+                params = {arg.arg for arg in node.args.args}
+                # The body alone: the signature's type names are not reads
+                names = {sub.id for statement in node.body for sub in ast.walk(statement)
+                         if isinstance(sub, ast.Name)}
+                assert names - params <= allowed[node.name], node.name
+        assert found == 2
+
+
 class TestDescribeTimeSeriesRule:
     """describe_time_series_rule says "no spread band" for (0, 1) alone and
     names any band with a floor or a ceiling of its own."""
