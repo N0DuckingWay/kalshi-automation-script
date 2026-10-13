@@ -660,7 +660,7 @@ class TestTrimRiseSweepArgument:
         assert "| trim sweep=on | live rule=" in default_echo
         assert self._echo(caplog) == default_echo.replace(
             "| trim sweep=on | live rule=",
-            "| trim sweep=on (no price-rise thresholds) | live rule=")
+            "| trim sweep=on (no minimum price rises) | live rule=")
 
     @pytest.mark.parametrize("flags", [("--no-trim-sweep",),
                                        ("--no-trim-sweep", "--no-trim-rise-sweep")])

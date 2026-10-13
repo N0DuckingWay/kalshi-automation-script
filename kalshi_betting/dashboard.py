@@ -6272,7 +6272,8 @@ _TRIM_SELECT_TITLE = (
     "off: no part of a held pair is sold to cut its size. on: at each weekly run, a pair that "
     "has grown past its Kelly size at that day's sale prices, or past the size cap, is "
     "sold down to it, the latest purchase first; with Add to held pairs on as well, a "
-    "pair is topped up or sold down each week. Each part sold counts as a trade of its "
+    "pair is topped up or sold down each week. Min. price rise can make a trim wait "
+    "until the pair's price has gone up. Each part sold counts as a trade of its "
     "own. While this is on, Sell is set to no selling (the two are not simulated "
     "together) and Save as live defaults is unavailable (live trading does not trim). "
     "The Scenario Explorer and Interval Discount sections always show it off.")
@@ -6303,12 +6304,11 @@ _TRIM_REACH_NO_EXPLORER = ("Trim to Kelly changes the trade sections only; the k
 # "trim_rise_state"
 _TRIM_RISE_OPTION_ANY = "any"
 _TRIM_RISE_TITLE = (
-    "Used only while Trim to Kelly is on. A held pair is trimmed only once its total "
-    "price — the price of the sides it holds, added: YES on the earlier market and NO on "
-    "the later one for a time-series pair — is at least this many cents above where it "
-    "stood at the last trade on that pair: its purchase, an add-on (Add to held pairs) or "
-    "an earlier trim. A fall never counts. any: no minimum. Prices are the asks at the "
-    "weekly checkpoint, which the backtest values an open pair at.")
+    "Used only while Trim to Kelly is on. A held pair is trimmed only if its price has "
+    "risen at least this many cents since the last trade on it: its purchase, an add-on "
+    "(Add to held pairs) or an earlier trim. The price is the two sides held, added: for "
+    "a time-series pair, YES on the earlier market plus NO on the later one. A fall never "
+    "counts. any: no minimum, so a pair can be trimmed whichever way its price moved.")
 _TRIM_RISE_NOTES = {
     "not simulated": "(not simulated in this backtest)",
     "unavailable": "(not available on this page; see the log)",
@@ -8340,7 +8340,8 @@ def _walk_trim_rise_cells(source: _GridSource, rise_takers: list,
             this phase — a run that could not be simulated, a `start` the
             family refuses (a cap with no point, or a point that records no
             rises), or a minimum the grid does not name; None when every
-            cell was visited.
+            cell was visited, or when every visitor had failed and the rest
+            were left unread.
     """
     pc = source.primary[2]
     caps = [pc] + [ci for ci in range(len(source.caps)) if ci != pc]
@@ -8352,6 +8353,10 @@ def _walk_trim_rise_cells(source: _GridSource, rise_takers: list,
     for (add, off), cells in settings.items():
         step = max(1, math.ceil(len(cells) / _WALK_PROGRESS_LINES))
         for done, (bi, ki, start) in enumerate(cells, 1):
+            if all(getattr(visit, "failed", False) for visit in rise_takers):
+                # A visitor that has failed keeps nothing it is handed, so
+                # no further run is simulated for it
+                return None
             try:
                 steps = (source.trim_rise_cell(source.bands[bi], source.ks[ki], add, off, start)
                          if start else ())
@@ -8376,7 +8381,7 @@ def _walk_trim_rise_cells(source: _GridSource, rise_takers: list,
                 counts = source.trim_rise_stats.get((add, off), {})
                 logging.info("Dashboard: %d/%d %s read from the Trim to Kelly minimum price "
                              "rises%s%s (%d cap points simulated, %d shared across caps, %d "
-                             "the same run as a lower minimum so far)",
+                             "the same run as a lower minimum or none so far)",
                              done, len(cells),
                              "binding band x k cells" if off else "band x k cells",
                              " with the tier floors off" if off else "",

@@ -2604,8 +2604,9 @@ class CapSweep:
                 sell_at is not a share in (0, 1], if sell_min_days is set
                 without sell_at or is not a whole number of at least 1, if
                 trim_to_kelly is not True or False, if trim_min_rise is set
-                without trim_to_kelly or is not a number in (0, 1], or if
-                trim_to_kelly is set with checks (see the class docstring).
+                without trim_to_kelly or is not a number from the finest
+                price step to 1, or if trim_to_kelly is set with checks (see
+                the class docstring).
         """
         if not isinstance(self.trim_to_kelly, bool):
             # Only an actual True reaches the simulations (_sim_options), so
@@ -4182,8 +4183,8 @@ def _resolve_trim_min_rises() -> tuple[float, ...]:
     try:
         rises = tuple(TRIM_MIN_PRICE_RISES)
     except TypeError:
-        raise ValueError("TRIM_MIN_PRICE_RISES must be a tuple of dollar amounts in (0, 1], "
-                         f"got {TRIM_MIN_PRICE_RISES!r}") from None
+        raise ValueError("TRIM_MIN_PRICE_RISES must be a tuple of dollar amounts from the "
+                         f"finest price step to 1, got {TRIM_MIN_PRICE_RISES!r}") from None
     if not rises:
         raise ValueError("TRIM_MIN_PRICE_RISES must name at least one minimum price rise")
     checked = [_checked_min_rise(rise, "each of TRIM_MIN_PRICE_RISES") for rise in rises]

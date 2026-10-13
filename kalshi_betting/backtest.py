@@ -800,7 +800,7 @@ def main() -> None:
         if sell_sweep else "off",
         # A default run reads "on"; the family without its minimum price rises says so
         "off" if not trim_sweep else "on" if trim_rise_sweep
-        else "on (no price-rise thresholds)",
+        else "on (no minimum price rises)",
         live_rule_echo, _fills_echo(depth_model),
     )
     # Warn on a ceiling that empties a tier. config.time_series_spread_band's
