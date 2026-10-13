@@ -40,12 +40,16 @@ Notes:
     a held pair to its Kelly size (held_pair_win_prob, kelly_hold_fraction,
     kelly_trim_count) lives here too, with the test that can hold a trim
     back until the pair's price has risen (pair_price_rise,
-    trim_rise_reached); only the backtest calls them.
+    trim_rise_reached); only the backtest calls them. Beside them is the
+    test that can hold a trim back until enough calendar days have passed
+    since the pair's last trade (kelly_trim_min_days, trade_day,
+    kelly_trim_rested, with KELLY_TRIM_MIN_DAYS_SINCE_TRADE).
 """
 import fcntl
 import json
 import math
 import numbers
+import operator
 import os
 import pathlib
 import stat
@@ -526,6 +530,23 @@ TAKE_PROFIT_HOLD_DAYS_MAX = 7
 TRIM_PRICE_RISE_STEP_CENTS = 5
 TRIM_MIN_PRICE_RISES = tuple(
     cents / 100 for cents in range(TRIM_PRICE_RISE_STEP_CENTS, 100, TRIM_PRICE_RISE_STEP_CENTS))
+
+# How many calendar days must have passed since the last trade of any sort on
+# a held pair (a purchase, an add-on, a sale or an earlier trim, on either of
+# its two markets) before a Kelly trim may sell part of it. Days are counted
+# on the bot's own clock (trade_day), and the test (kelly_trim_rested) reads
+# no schedule: a pair traded on a Tuesday may be trimmed from the next Tuesday
+# on, however often the bot runs. A whole number from 0 (no wait) to the
+# maximum below, which kelly_trim_min_days checks. A module that applies the
+# wait binds this by value and checks its own binding when it reads it, so a
+# test patches that module's binding, never config's.
+KELLY_TRIM_MIN_DAYS_SINCE_TRADE = 7
+
+# The most KELLY_TRIM_MIN_DAYS_SINCE_TRADE may be. A live run can tell when a
+# pair last traded only as far back as Kalshi's list of the account's fills
+# reaches, and Kalshi moves its oldest fills out of that list into an archive,
+# so the wait is kept short enough for the list to cover it.
+KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX = 30
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
@@ -3664,6 +3685,13 @@ def days_to_maturity(close_dates, day: date) -> int | None:
 # trim_rise_reached, are a test a run may ask first: has the pair's price
 # risen far enough since the last trade on it for a trim to be considered at
 # all? They take plain prices, so a live seller can call them with its own.
+# The last three, kelly_trim_min_days, trade_day and kelly_trim_rested, are a
+# second such test: have enough calendar days passed since the last trade on
+# the pair (KELLY_TRIM_MIN_DAYS_SINCE_TRADE)? kelly_trim_rested takes two
+# plain dates and a number of days, which kelly_trim_min_days checks, and
+# reads no schedule, so the answer is the same however often a run happens.
+# trade_day turns a time into such a date, on the zone of the schedule it is
+# handed, and reads nothing else of that schedule.
 
 # A whole count that float arithmetic left a hair short still counts as whole:
 # this much is added before rounding down, plus this share of the count
@@ -3914,6 +3942,116 @@ def trim_rise_reached(rise: float, min_rise: float | None) -> bool:
         return True
     # A rise that is not a number compares False, which holds the trim back
     return math.isfinite(min_rise) and rise >= min_rise - PRICE_EPSILON
+
+
+def kelly_trim_min_days(days) -> int:
+    """
+    Check the days a held pair must go without a trade before a Kelly trim, and return them.
+
+    The number is KELLY_TRIM_MIN_DAYS_SINCE_TRADE as the calling module holds
+    it. A module that applies the wait hands its own copy in before it acts
+    on it, so a mistyped constant stops the run instead of shortening the
+    wait, and kelly_trim_rested checks the number it is handed the same way.
+
+    Args:
+        days: The days to check: a whole number from 0 (no wait) to
+            KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX. True and False are refused,
+            and so is a float, even a whole one such as 7.0, and a numpy
+            duration (timedelta64), whatever its unit.
+
+    Returns:
+        int: The same number of days, as a plain int.
+
+    Raises:
+        ValueError: When `days` is anything else.
+    """
+    whole = None
+    if not isinstance(days, bool) and isinstance(days, numbers.Integral):
+        try:
+            # operator.index, not int(): numpy counts a duration (timedelta64)
+            # as a whole number, and int() reads one written in months, years
+            # or nanoseconds as that many days. operator.index refuses every
+            # duration with a TypeError
+            whole = operator.index(days)
+        except TypeError:
+            whole = None
+    if whole is None or not 0 <= whole <= KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX:
+        raise ValueError("KELLY_TRIM_MIN_DAYS_SINCE_TRADE must be a whole number from 0 to "
+                         f"{KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX}, got {days!r}")
+    return whole
+
+
+def trade_day(moment: datetime, run: ScheduledRun) -> date:
+    """
+    Return the calendar day a moment falls on, on the bot's own clock.
+
+    The bot's own clock is the time zone of its schedule (run.zone(): Pacific
+    time for SCHEDULED_RUN). A trade at 5:01pm Pacific belongs to that Pacific
+    day, although the same moment is already the next day in UTC. The wait
+    before a Kelly trim (kelly_trim_rested) counts the days between two of
+    these. Only the zone of `run` is read: its weekday and its time of day
+    play no part.
+
+    Args:
+        moment (datetime): A time that carries its zone. Any zone will do
+            (Kalshi's timestamps are UTC): the moment is the same.
+        run (ScheduledRun): The schedule whose zone is the bot's clock.
+
+    Returns:
+        date: The day, as a plain datetime.date.
+
+    Raises:
+        TypeError: When `moment` is not a datetime, or carries no zone: the
+            day a time with no zone falls on cannot be known. Also when
+            `run` is not a ScheduledRun, so no other object can stand in
+            for the bot's clock.
+        zoneinfo.ZoneInfoNotFoundError, ValueError, OSError: As ScheduledRun.zone().
+        OverflowError: The moment is outside datetime's range in that zone.
+    """
+    if not isinstance(moment, datetime) or moment.utcoffset() is None:
+        raise TypeError(f"trade_day reads a time with a zone, got {moment!r}")
+    if not isinstance(run, ScheduledRun):
+        raise TypeError(f"trade_day reads the zone of a ScheduledRun, got {run!r}")
+    return moment.astimezone(run.zone()).date()
+
+
+def kelly_trim_rested(last_trade: date, day: date, min_days: int) -> bool:
+    """
+    Return whether a held pair has gone enough days without a trade for a Kelly trim.
+
+    A pair is looked at for trimming on `day` only when at least `min_days`
+    calendar days lie between its last trade and `day`: with 7, a pair last
+    traded on a Tuesday may be trimmed from the next Tuesday on. The two
+    dates are all it reads, so it holds whether runs are a week apart, a day
+    apart or several in one day. A last trade dated after `day` never counts
+    as rested.
+
+    Both dates must be days on the same clock (trade_day of each time). A
+    last trade is required: a caller that does not know when a pair last
+    traded must not ask, because no value here stands for "never traded".
+
+    Args:
+        last_trade (date): The day of the last trade of any sort on the pair.
+        day (date): The day the trim would happen.
+        min_days (int): The days that must have passed
+            (KELLY_TRIM_MIN_DAYS_SINCE_TRADE); 0 for no wait.
+
+    Returns:
+        bool: True when `day` is at least `min_days` days after `last_trade`.
+
+    Raises:
+        TypeError: When either date is not a plain datetime.date. A datetime
+            is refused too: two datetimes differ by whole 24-hour spans,
+            which can be a day short of the calendar days between them.
+        ValueError: When `min_days` is not a whole number kelly_trim_min_days
+            accepts.
+    """
+    # Exactly a date each: a datetime is a date by subclass, and None is not
+    # "never traded"
+    if type(last_trade) is not date or type(day) is not date:
+        raise TypeError("kelly_trim_rested reads two calendar dates (trade_day of each "
+                        f"time), got {last_trade!r} and {day!r}")
+    return (day - last_trade).days >= kelly_trim_min_days(min_days)
 
 
 def _exact_number(value: float) -> str:

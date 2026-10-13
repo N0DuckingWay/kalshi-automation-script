@@ -2,25 +2,29 @@
 leg-side tuples, the deadline-gap tier (with the backtest's spread band and
 tier-floors switch), the live toggles (LiveSettings and its helpers), the saved
 live defaults (their file's reader and writer, the seed, and the comparison of
-two sets of defaults), the weekly run schedule (ScheduledRun), the values
+two sets of defaults), the weekly run schedule (ScheduledRun), the wait a
+Kelly trim observes after a trade (kelly_trim_rested, kelly_trim_min_days,
+trade_day), the values
 config.py ships, conftest's apply_pre_toggle_defaults, the V2 order path's
 self-trade-prevention value, the startup check that refuses any order path but
 "v2" (order_api_version_error), the order-write pacer's budget, the live-run
 lock's exit code, file and waits, and PROJECT_ROOT."""
 import ast
 import dataclasses
+import enum
 import importlib
 import importlib.util
 import json
 import logging
 import math
+import numbers
 import os
 import pathlib
 import random
 import re
 import sys
 import threading
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -2307,6 +2311,468 @@ class TestTrimRiseReached:
                          if isinstance(sub, ast.Name)}
                 assert names - params <= allowed[node.name], node.name
         assert found == 2
+
+
+# The message kelly_trim_min_days refuses a bad number of days with
+_BAD_TRIM_DAYS = r"KELLY_TRIM_MIN_DAYS_SINCE_TRADE must be a whole number from 0 to 30, got "
+
+
+class TestKellyTrimRested:
+    """config.kelly_trim_rested and config.kelly_trim_min_days: the wait a
+    Kelly trim observes after any trade on a held pair.
+
+    The rule is a test of two calendar dates against a checked whole number
+    of days (KELLY_TRIM_MIN_DAYS_SINCE_TRADE, 7). It reads no schedule and no
+    clock, so it holds whether runs are a week apart, a day apart or several
+    in one day. Nothing but two plain dates and such a number gets an answer:
+    a missing last trade is an error, never "rested".
+    """
+
+    def test_seven_days_ship(self):
+        assert config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE == 7
+        assert type(config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE) is int
+        assert config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX == 30
+        assert type(config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX) is int
+        # The shipped wait passes its own check
+        assert config.kelly_trim_min_days(config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE) == 7
+
+    @pytest.mark.parametrize("gap", range(0, 9))
+    def test_every_gap_from_0_to_8_days(self, gap):
+        # Bought on a Tuesday: not rested the same day or on any of the next
+        # six, rested from the next Tuesday on
+        last = date(2026, 10, 6)
+        assert last.weekday() == 1
+        day = last + timedelta(days=gap)
+        assert config.kelly_trim_rested(last, day, 7) is (gap >= 7)
+
+    def test_the_gap_alone_decides_from_any_start_day(self):
+        # Every start day of two years (a leap day, the year's end and both
+        # clock-change days among them), every gap up to 32 days, every wait
+        # the tests use: the answer is the calendar gap against the wait
+        first = date(2027, 1, 1)
+        assert date(2028, 2, 29) > first  # 2028 is a leap year
+        for offset in range(731):
+            last = first + timedelta(days=offset)
+            for gap in range(33):
+                day = last + timedelta(days=gap)
+                for wait in (0, 1, 7, 8, 14, 15, 30):
+                    assert config.kelly_trim_rested(last, day, wait) is (gap >= wait), (
+                        last, day, wait)
+
+    @pytest.mark.parametrize("wait", [0, 1, 7, 30])
+    @pytest.mark.parametrize("ahead", [1, 2, 7, 8, 30, 365])
+    def test_a_last_trade_after_the_day_never_rests(self, ahead, wait):
+        # A date in the future is no evidence of rest, even with no wait
+        day = date(2026, 10, 13)
+        assert config.kelly_trim_rested(day + timedelta(days=ahead), day, wait) is False
+
+    def test_no_wait_rests_from_the_day_of_the_trade(self):
+        day = date(2026, 10, 13)
+        assert config.kelly_trim_rested(day, day, 0) is True
+        assert config.kelly_trim_rested(day, day, 1) is False
+        assert config.kelly_trim_rested(day - timedelta(days=1), day, 1) is True
+
+    def test_once_rested_a_pair_stays_rested_and_a_longer_wait_never_rests_sooner(self):
+        last = date(2026, 10, 6)
+        for wait in range(0, 31):
+            rested = [config.kelly_trim_rested(last, last + timedelta(days=gap), wait)
+                      for gap in range(0, 40)]
+            # False for the first `wait` days, True from then on
+            assert rested == [False] * wait + [True] * (40 - wait)
+
+    def test_the_worked_example(self):
+        # Bought on Tuesday the 6th: runs on the 7th through the 12th do not
+        # trim it, a run on Tuesday the 13th may
+        bought = date(2026, 10, 6)
+        for run_day in range(7, 13):
+            assert not config.kelly_trim_rested(bought, date(2026, 10, run_day), 7)
+        assert config.kelly_trim_rested(bought, date(2026, 10, 13), 7)
+        # Trimmed on the 13th: a second run that day and runs on the 14th
+        # through the 19th leave it alone
+        trimmed = date(2026, 10, 13)
+        for run_day in range(13, 20):
+            assert not config.kelly_trim_rested(trimmed, date(2026, 10, run_day), 7)
+        assert config.kelly_trim_rested(trimmed, date(2026, 10, 20), 7)
+        # An add-on on Friday the 9th instead moves the first day to Friday the 16th
+        added = date(2026, 10, 9)
+        assert not config.kelly_trim_rested(added, date(2026, 10, 13), 7)
+        assert not config.kelly_trim_rested(added, date(2026, 10, 15), 7)
+        assert config.kelly_trim_rested(added, date(2026, 10, 16), 7)
+
+    def test_a_missing_last_trade_is_an_error_never_rested(self):
+        day = date(2026, 10, 13)
+        # Not with the shipped wait, and not with no wait either
+        for wait in (7, 0):
+            with pytest.raises(TypeError, match="two calendar dates"):
+                config.kelly_trim_rested(None, day, wait)
+            with pytest.raises(TypeError, match="two calendar dates"):
+                config.kelly_trim_rested(day, None, wait)
+
+    def test_a_datetime_is_refused(self):
+        # Two datetimes differ by whole 24-hour spans: a trade at 11pm on the
+        # 6th and a run at 9am on the 13th are 7 calendar days apart but only
+        # 6 such spans. A datetime is a date by subclass, so it is refused
+        last = datetime(2026, 10, 6, 23, 0, tzinfo=UTC)
+        now = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
+        assert (now - last).days == 6
+        assert config.kelly_trim_rested(last.date(), now.date(), 7) is True
+        for last_trade, day in ((last, now), (last, now.date()), (last.date(), now),
+                                (last.replace(tzinfo=None), now.date())):
+            with pytest.raises(TypeError, match="two calendar dates"):
+                config.kelly_trim_rested(last_trade, day, 7)
+
+    def test_anything_but_a_plain_date_is_refused(self):
+        class _Day(date):
+            """A date by subclass, as a clock-freezing stand-in might be."""
+
+        good = date(2026, 10, 13)
+        for bad in ("2026-10-06", 20261006, 1791244800.0, (2026, 10, 6), _Day(2026, 10, 6),
+                    MagicMock(), timedelta(days=7)):
+            for last_trade, day in ((bad, good), (good, bad), (bad, bad)):
+                with pytest.raises(TypeError, match="two calendar dates"):
+                    config.kelly_trim_rested(last_trade, day, 7)
+
+    @pytest.mark.parametrize("bad", [True, False, 7.0, 7.5, -1, 31, None, "7", float("nan")],
+                             ids=repr)
+    def test_a_wait_that_is_not_a_checked_whole_number_gets_no_answer(self, bad):
+        # Checked on every call: a negative wait would rest a pair traded
+        # tomorrow, and True would read as one day
+        for last, day in ((date(2026, 10, 6), date(2026, 10, 13)),
+                          (date(2026, 10, 13), date(2026, 10, 13)),
+                          (date(2026, 10, 14), date(2026, 10, 13))):
+            with pytest.raises(ValueError, match=_BAD_TRIM_DAYS):
+                config.kelly_trim_rested(last, day, bad)
+
+    @pytest.mark.parametrize("days", [0, 1, 7, 8, 14, 15, 30])
+    def test_min_days_returns_a_whole_number_in_range_as_a_plain_int(self, days):
+        checked = config.kelly_trim_min_days(days)
+        assert checked == days and type(checked) is int
+
+    @pytest.mark.parametrize("bad", [True, False, 7.0, 7.5, -1, 31, 1000, None, "7", b"7", [7],
+                                     float("nan"), float("inf")], ids=repr)
+    def test_min_days_refuses_anything_else(self, bad):
+        with pytest.raises(ValueError, match=_BAD_TRIM_DAYS) as refused:
+            config.kelly_trim_min_days(bad)
+        # The message shows what was handed in
+        assert str(refused.value).endswith(f"got {bad!r}")
+
+    def test_min_days_reads_numpy_numbers_by_kind(self):
+        import numpy as np
+
+        # A numpy whole number is a whole number, and comes back a plain int
+        for good in (np.int64(7), np.uint8(7), np.int8(7), np.int32(7)):
+            checked = config.kelly_trim_min_days(good)
+            assert checked == 7 and type(checked) is int
+        for bad in (np.bool_(True), np.float64(7.0), np.int64(31), np.int64(-1)):
+            with pytest.raises(ValueError, match=_BAD_TRIM_DAYS):
+                config.kelly_trim_min_days(bad)
+
+    @pytest.mark.parametrize("unit", [None, "ns", "us", "ms", "s", "m", "h", "D", "W", "M", "Y"],
+                             ids=str)
+    def test_min_days_refuses_a_numpy_duration(self, unit):
+        import numpy as np
+
+        # numpy counts a duration (timedelta64) as a whole number, but 7
+        # nanoseconds, 7 months and 7 ticks with no unit are not 7 days, and
+        # 7 days written as a duration is not the plain number the wait is
+        duration = np.timedelta64(7) if unit is None else np.timedelta64(7, unit)
+        assert isinstance(duration, numbers.Integral)
+        with pytest.raises(ValueError, match=_BAD_TRIM_DAYS) as refused:
+            config.kelly_trim_min_days(duration)
+        assert str(refused.value).endswith(f"got {duration!r}")
+
+    def test_a_wait_written_as_a_month_is_not_read_as_one_day(self):
+        import numpy as np
+
+        # A pair traded yesterday is never rested against a wait of a month
+        day = date(2026, 10, 13)
+        for wait in (np.timedelta64(1, "M"), np.timedelta64(1, "Y"), np.timedelta64(7, "ns"),
+                     np.timedelta64(1), np.timedelta64(1, "D")):
+            for last in (day - timedelta(days=1), day - timedelta(days=7), day):
+                with pytest.raises(ValueError, match=_BAD_TRIM_DAYS):
+                    config.kelly_trim_rested(last, day, wait)
+
+    def test_min_days_reads_a_whole_number_by_subclass_as_a_plain_int(self):
+        class _Days(enum.IntEnum):
+            """A whole number by subclass of int."""
+
+            WEEK = 7
+
+        checked = config.kelly_trim_min_days(_Days.WEEK)
+        assert checked == 7 and type(checked) is int
+
+    def test_the_maximum_is_read_when_the_check_runs(self, monkeypatch):
+        monkeypatch.setattr(config, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX", 10)
+        assert config.kelly_trim_min_days(10) == 10
+        with pytest.raises(ValueError, match="whole number from 0 to 10, got 11"):
+            config.kelly_trim_min_days(11)
+
+    def test_the_rule_reads_only_what_it_is_handed(self):
+        # The wait is a test of two dates and a number: no schedule, no clock
+        # and no weekday is read, so it holds however often a run happens.
+        # trade_day reads the zone of the schedule it is handed and no more
+        tree = ast.parse(pathlib.Path(config.__file__).read_text())
+        allowed = {
+            "kelly_trim_min_days": {"isinstance", "bool", "numbers", "operator", "TypeError",
+                                    "ValueError", "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX"},
+            "trade_day": {"isinstance", "datetime", "ScheduledRun", "TypeError"},
+            "kelly_trim_rested": {"type", "date", "TypeError", "kelly_trim_min_days"},
+        }
+        # What each function may read off a name it is allowed: trade_day only
+        # the zone of its schedule, and kelly_trim_min_days only operator.index,
+        # which refuses a numpy duration where int() would read one as days
+        attributes = {("trade_day", "run"): {"zone"},
+                      ("kelly_trim_min_days", "operator"): {"index"}}
+        found = 0
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in allowed:
+                found += 1
+                # The body alone: the signature's type names are not reads
+                inside = [sub for statement in node.body for sub in ast.walk(statement)]
+                names = [sub for sub in inside if isinstance(sub, ast.Name)]
+                # Its parameters and the names it assigns are its own
+                own = ({arg.arg for arg in node.args.args}
+                       | {sub.id for sub in names if isinstance(sub.ctx, ast.Store)})
+                assert {sub.id for sub in names} - own <= allowed[node.name], node.name
+                for (function, name), expected in attributes.items():
+                    if function == node.name:
+                        read = {sub.attr for sub in inside if isinstance(sub, ast.Attribute)
+                                and isinstance(sub.value, ast.Name) and sub.value.id == name}
+                        assert read == expected, (function, name)
+        assert found == 3
+
+
+_PACIFIC = ZoneInfo("America/Los_Angeles")
+
+
+def _pacific_day_by_hand(moment: datetime) -> date:
+    """
+    Work out the Pacific calendar day of a 2026 moment without the tz database.
+
+    Pacific daylight time (UTC-7) runs from 10:00 UTC on 2026-03-08 to 09:00
+    UTC on 2026-11-01; standard time (UTC-8) holds outside it.
+
+    Args:
+        moment (datetime): A UTC time in 2026.
+
+    Returns:
+        date: The day a Pacific wall clock shows at that moment.
+    """
+    daylight = (datetime(2026, 3, 8, 10, 0, tzinfo=UTC) <= moment
+                < datetime(2026, 11, 1, 9, 0, tzinfo=UTC))
+    return (moment.replace(tzinfo=None) - timedelta(hours=7 if daylight else 8)).date()
+
+
+class TestTradeDay:
+    """config.trade_day: the calendar day a moment falls on, on the bot's own
+    clock (the zone of its schedule, Pacific time as shipped).
+
+    The wait before a Kelly trim counts days between two of these, so a trade
+    late in the Pacific evening belongs to that evening's day although it is
+    already the next day in UTC. A time with no zone has no knowable day and
+    is refused.
+    """
+
+    def test_1159pm_and_1201am_pacific_are_two_days(self):
+        before = datetime(2026, 10, 13, 23, 59, tzinfo=_PACIFIC)
+        after = datetime(2026, 10, 14, 0, 1, tzinfo=_PACIFIC)
+        assert config.trade_day(before, SCHEDULED_RUN) == date(2026, 10, 13)
+        assert config.trade_day(after, SCHEDULED_RUN) == date(2026, 10, 14)
+        # The same two moments as Kalshi stamps them, in UTC (one UTC date)
+        before_utc, after_utc = before.astimezone(UTC), after.astimezone(UTC)
+        assert before_utc.date() == after_utc.date() == date(2026, 10, 14)
+        assert config.trade_day(before_utc, SCHEDULED_RUN) == date(2026, 10, 13)
+        assert config.trade_day(after_utc, SCHEDULED_RUN) == date(2026, 10, 14)
+
+    def test_459pm_and_501pm_pacific_are_one_day(self):
+        # Under daylight time 5pm Pacific is midnight UTC, so the two straddle it
+        before = datetime(2026, 10, 13, 16, 59, tzinfo=_PACIFIC)
+        after = datetime(2026, 10, 13, 17, 1, tzinfo=_PACIFIC)
+        before_utc, after_utc = before.astimezone(UTC), after.astimezone(UTC)
+        assert (before_utc.date(), after_utc.date()) == (date(2026, 10, 13), date(2026, 10, 14))
+        for moment in (before, after, before_utc, after_utc):
+            assert config.trade_day(moment, SCHEDULED_RUN) == date(2026, 10, 13)
+        # Under standard time midnight UTC is 4pm Pacific
+        winter_before = datetime(2026, 12, 15, 23, 59, tzinfo=UTC)   # 3:59pm Pacific
+        winter_after = datetime(2026, 12, 16, 0, 1, tzinfo=UTC)      # 4:01pm Pacific
+        assert config.trade_day(winter_before, SCHEDULED_RUN) == date(2026, 12, 15)
+        assert config.trade_day(winter_after, SCHEDULED_RUN) == date(2026, 12, 15)
+
+    @pytest.mark.parametrize(
+        ("moment", "expected"),
+        [
+            # Spring, 2026-03-08: Pacific clocks jump from 2:00am to 3:00am.
+            # Midnight Pacific is 08:00 UTC before the change and 07:00 UTC after
+            (datetime(2026, 3, 8, 7, 59, tzinfo=UTC), date(2026, 3, 7)),    # 11:59pm Saturday
+            (datetime(2026, 3, 8, 8, 1, tzinfo=UTC), date(2026, 3, 8)),     # 12:01am Sunday
+            (datetime(2026, 3, 8, 9, 59, tzinfo=UTC), date(2026, 3, 8)),    # 1:59am, before the jump
+            (datetime(2026, 3, 8, 10, 1, tzinfo=UTC), date(2026, 3, 8)),    # 3:01am, after it
+            (datetime(2026, 3, 9, 6, 59, tzinfo=UTC), date(2026, 3, 8)),    # 11:59pm Sunday
+            (datetime(2026, 3, 9, 7, 1, tzinfo=UTC), date(2026, 3, 9)),     # 12:01am Monday
+            (datetime(2026, 3, 9, 7, 30, tzinfo=UTC), date(2026, 3, 9)),    # 12:30am Monday ...
+            (datetime(2026, 3, 8, 7, 30, tzinfo=UTC), date(2026, 3, 7)),    # ... 11:30pm a day before
+            # Autumn, 2026-11-01: 2:00am goes back to 1:00am. Midnight Pacific
+            # is 07:00 UTC before the change and 08:00 UTC after
+            (datetime(2026, 11, 1, 6, 59, tzinfo=UTC), date(2026, 10, 31)),  # 11:59pm Saturday
+            (datetime(2026, 11, 1, 7, 1, tzinfo=UTC), date(2026, 11, 1)),    # 12:01am Sunday
+            (datetime(2026, 11, 1, 8, 30, tzinfo=UTC), date(2026, 11, 1)),   # 1:30am, the first time
+            (datetime(2026, 11, 1, 9, 30, tzinfo=UTC), date(2026, 11, 1)),   # 1:30am, the second
+            (datetime(2026, 11, 2, 7, 59, tzinfo=UTC), date(2026, 11, 1)),   # 11:59pm Sunday
+            (datetime(2026, 11, 2, 8, 1, tzinfo=UTC), date(2026, 11, 2)),    # 12:01am Monday
+            (datetime(2026, 11, 2, 7, 30, tzinfo=UTC), date(2026, 11, 1)),   # 11:30pm Sunday ...
+            (datetime(2026, 11, 1, 7, 30, tzinfo=UTC), date(2026, 11, 1)),   # ... 12:30am that day
+        ],
+        ids=lambda value: value.isoformat() if isinstance(value, datetime) else None,
+    )
+    def test_across_both_clock_changes(self, moment, expected):
+        assert config.trade_day(moment, SCHEDULED_RUN) == expected
+        assert _pacific_day_by_hand(moment) == expected
+
+    def test_a_repeated_wall_time_is_one_day_either_time(self):
+        # 1:30am happens twice on the autumn clock-change day
+        first = datetime(2026, 11, 1, 1, 30, tzinfo=_PACIFIC)
+        second = first.replace(fold=1)
+        assert first.astimezone(UTC) != second.astimezone(UTC)
+        assert config.trade_day(first, SCHEDULED_RUN) == date(2026, 11, 1)
+        assert config.trade_day(second, SCHEDULED_RUN) == date(2026, 11, 1)
+
+    def test_every_hour_of_a_year_matches_the_pacific_wall_clock(self):
+        # Each hour of 2026 at 29 minutes past, so no moment sits on a change
+        moment = datetime(2026, 1, 1, 0, 29, tzinfo=UTC)
+        while moment.year == 2026:
+            assert config.trade_day(moment, SCHEDULED_RUN) == _pacific_day_by_hand(moment), moment
+            moment += timedelta(hours=1)
+
+    def test_the_same_moment_in_any_zone_is_the_same_day(self):
+        moment = datetime(2026, 10, 14, 6, 30, tzinfo=UTC)   # 11:30pm Tuesday Pacific
+        zones = [ZoneInfo(name) for name in ("UTC", "America/Los_Angeles", "America/New_York",
+                                             "Asia/Tokyo", "Australia/Sydney")]
+        zones.append(timezone(timedelta(hours=5, minutes=30)))
+        for zone in zones:
+            assert config.trade_day(moment.astimezone(zone), SCHEDULED_RUN) == date(2026, 10, 13)
+
+    def test_the_day_is_read_on_the_schedules_zone_and_nothing_else_of_it(self):
+        moment = datetime(2026, 10, 14, 0, 30, tzinfo=UTC)   # 5:30pm Tuesday Pacific
+        assert config.trade_day(moment, SCHEDULED_RUN) == date(2026, 10, 13)
+        assert config.trade_day(moment, ScheduledRun(0, 9, 0, "UTC")) == date(2026, 10, 14)
+        assert config.trade_day(moment, ScheduledRun(0, 9, 0, "Asia/Tokyo")) == date(2026, 10, 14)
+        # The schedule's weekday and time of day play no part
+        for weekday, hour, minute in ((0, 9, 0), (3, 23, 59), (6, 0, 0)):
+            run = ScheduledRun(weekday, hour, minute, "America/Los_Angeles")
+            assert config.trade_day(moment, run) == date(2026, 10, 13)
+
+    def test_it_returns_a_plain_date_even_from_a_datetime_subclass(self):
+        class _Moment(datetime):
+            """A datetime by subclass, as a clock-freezing stand-in is."""
+
+        day = config.trade_day(_Moment(2026, 10, 14, 0, 30, tzinfo=UTC), SCHEDULED_RUN)
+        # Exactly what kelly_trim_rested accepts
+        assert type(day) is date and day == date(2026, 10, 13)
+        assert config.kelly_trim_rested(day, day, 0) is True
+
+    def test_a_time_with_no_zone_is_refused(self):
+        class _NoOffset(tzinfo):
+            """A zone object that gives no offset, so the time is still zoneless."""
+
+            def utcoffset(self, dt):
+                return None
+
+            def dst(self, dt):
+                return None
+
+            def tzname(self, dt):
+                return "none"
+
+        for bad in (datetime(2026, 10, 13, 9, 0), datetime(2026, 10, 13, 9, 0, tzinfo=_NoOffset()),
+                    date(2026, 10, 13), None, "2026-10-13T16:00:00Z", 1791907200, 1791907200.0):
+            with pytest.raises(TypeError, match="trade_day reads a time with a zone"):
+                config.trade_day(bad, SCHEDULED_RUN)
+
+    def test_an_unknown_zone_is_an_error(self):
+        with pytest.raises(ZoneInfoNotFoundError):
+            config.trade_day(datetime(2026, 10, 13, 16, 0, tzinfo=UTC),
+                             ScheduledRun(0, 9, 0, "No/Such_Zone"))
+
+    def test_only_a_schedule_can_be_the_bots_clock(self):
+        class _NoZone:
+            """Has a zone() like a schedule's, but it names no zone."""
+
+            def zone(self):
+                return None
+
+        moment = datetime(2026, 10, 14, 0, 30, tzinfo=UTC)
+        # A stand-in whose zone() gives None would otherwise be read on
+        # whatever zone this computer keeps
+        for bad in (None, "America/Los_Angeles", _PACIFIC, UTC, _NoZone(), MagicMock()):
+            with pytest.raises(TypeError, match="trade_day reads the zone of a ScheduledRun"):
+                config.trade_day(moment, bad)
+
+    def test_evening_trades_on_either_side_of_midnight_pacific(self):
+        def rested(fill: datetime, run: datetime) -> bool:
+            return config.kelly_trim_rested(config.trade_day(fill, SCHEDULED_RUN),
+                                            config.trade_day(run, SCHEDULED_RUN), 7)
+
+        # Traded at 11:59pm on Tuesday the 6th: a run just after midnight on
+        # Tuesday the 13th may trim, a little under 7 x 24 hours later
+        late = datetime(2026, 10, 6, 23, 59, tzinfo=_PACIFIC)
+        early_run = datetime(2026, 10, 13, 0, 1, tzinfo=_PACIFIC)
+        assert early_run - late < timedelta(days=7)
+        assert rested(late, early_run) is True
+        assert rested(late, datetime(2026, 10, 12, 23, 59, tzinfo=_PACIFIC)) is False
+        # Traded two minutes later, at 12:01am on Wednesday the 7th: no run on
+        # Tuesday the 13th may, not even its last minute
+        after_midnight = datetime(2026, 10, 7, 0, 1, tzinfo=_PACIFIC)
+        assert rested(after_midnight, early_run) is False
+        assert rested(after_midnight, datetime(2026, 10, 13, 23, 59, tzinfo=_PACIFIC)) is False
+        assert rested(after_midnight, datetime(2026, 10, 14, 0, 1, tzinfo=_PACIFIC)) is True
+
+    def test_an_evening_trade_counts_on_its_pacific_day_not_its_utc_day(self):
+        # 5:01pm Pacific on Tuesday the 6th is already Wednesday the 7th in UTC
+        fill = datetime(2026, 10, 7, 0, 1, tzinfo=UTC)
+        run = datetime(2026, 10, 13, 16, 0, tzinfo=UTC)     # 9am Pacific, Tuesday the 13th
+        last, today = config.trade_day(fill, SCHEDULED_RUN), config.trade_day(run, SCHEDULED_RUN)
+        assert (last, today) == (date(2026, 10, 6), date(2026, 10, 13))
+        assert config.kelly_trim_rested(last, today, 7) is True
+        # On a UTC clock the same two moments are six days apart
+        utc_clock = ScheduledRun(0, 9, 0, "UTC")
+        assert config.kelly_trim_rested(config.trade_day(fill, utc_clock),
+                                        config.trade_day(run, utc_clock), 7) is False
+
+    def test_a_run_at_any_hour_of_days_1_to_8_after_a_purchase(self):
+        # Bought at any hour of Tuesday the 6th; runs at any hour of the 7th
+        # through the 14th: only the two dates decide
+        for bought_hour in (0, 9, 16, 17, 23):
+            fill = datetime(2026, 10, 6, bought_hour, 30, tzinfo=_PACIFIC)
+            last = config.trade_day(fill, SCHEDULED_RUN)
+            for days_after in range(1, 9):
+                for run_hour in (0, 9, 16, 17, 23):
+                    run = datetime(2026, 10, 6 + days_after, run_hour, 15, tzinfo=_PACIFIC)
+                    today = config.trade_day(run, SCHEDULED_RUN)
+                    assert config.kelly_trim_rested(last, today, 7) is (days_after >= 7), (
+                        fill, run)
+
+    def test_the_wait_at_any_two_moments_of_a_year(self):
+        # Fills stamped in UTC at any second of 2026, runs up to ten days
+        # later: rested exactly when the Pacific dates are 7 or more apart
+        rng = random.Random(20261013)
+        start = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+        rested_count = 0
+        for _ in range(4000):
+            fill = start + timedelta(seconds=rng.randrange(0, 350 * 86_400))
+            run = fill + timedelta(seconds=rng.randrange(0, 10 * 86_400))
+            rested = config.kelly_trim_rested(config.trade_day(fill, SCHEDULED_RUN),
+                                              config.trade_day(run, SCHEDULED_RUN), 7)
+            by_hand = (_pacific_day_by_hand(run) - _pacific_day_by_hand(fill)).days >= 7
+            assert rested is by_hand, (fill, run)
+            # Calendar days, so the wait is never under six days less the hour
+            # a clock change can take, and never over seven days plus that hour
+            if rested:
+                assert run - fill > timedelta(days=6) - timedelta(hours=1), (fill, run)
+            if run - fill >= timedelta(days=7, hours=1):
+                assert rested, (fill, run)
+            rested_count += rested
+        # Both answers are well covered
+        assert 500 < rested_count < 3500
 
 
 class TestDescribeTimeSeriesRule:
