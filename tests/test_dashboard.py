@@ -6626,7 +6626,8 @@ class TestFilterScript:
         snap = _run_script(tmp_path, page, [["wait"], ["snap", "s"]],
                            no_decompression=True)["s"]
         assert all(snap["selects"][i]["disabled"]
-                   for i in (*_FLT_SELECTS, "flt-tier", "flt-add", "flt-trim", "khat-group"))
+                   for i in (*_FLT_SELECTS, "flt-tier", "flt-add", "flt-trim", "flt-rise",
+                             "khat-group"))
         assert snap["text"]["flt-summary"].startswith(
             "The filter could not load its data (this browser cannot decompress it)")
         assert snap["reacts"] == [] and snap["inflated"] == []
@@ -12421,7 +12422,7 @@ class TestTrimSelect:
         page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
         ids = re.findall(r'<select id="(flt-[a-z]+)"', page)
         assert ids == ["flt-band", "flt-tier", "flt-k", "flt-cap", "flt-add", "flt-trim",
-                       "flt-sell", "flt-days"]
+                       "flt-rise", "flt-sell", "flt-days"]
         # ... and before the Category and Tag menus
         bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
         assert bar.index('id="flt-trim"') < bar.index('id="flt-cat"') < bar.index('id="flt-tag"')
@@ -12473,6 +12474,164 @@ class TestTrimSelect:
         note = dashboard._TRIM_SUMMARY_NOTE
         assert trimmed == plain[:-len(text["unfiltered"])] + note + text["unfiltered"]
         assert both.endswith(dashboard._ADD_ON_SUMMARY_NOTE + note + text["unfiltered"])
+
+
+class TestTrimRiseSelect:
+    """The bar's "Min. price rise" select as Python renders it: right after
+    Trim to Kelly and before Sell, on every page, shut, with "any" and one
+    option per minimum the page carries, its rule in the hover text and, on a
+    page that shows Trim to Kelly without the minimums, the reason beside it."""
+
+    @staticmethod
+    def _select(page: str):
+        """The select's attributes and its options' markup on a page (or a bar)."""
+        return re.search(r'<select id="flt-rise"([^>]*)>(.*?)</select>', page)
+
+    def test_the_select_follows_trim_to_kelly_with_any_and_every_minimum(
+            self, monkeypatch, tmp_path):
+        rises = tuple(config.TRIM_MIN_PRICE_RISES)
+        assert len(rises) == 19
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(min_rises=rises))
+        # Right after Trim to Kelly and before Sell
+        ids = re.findall(r'<(?:select|details) id="(flt-[a-z]+)"', page)
+        at = ids.index("flt-trim")
+        assert ids[at:at + 3] == ["flt-trim", "flt-rise", "flt-sell"]
+        # ... with nothing but the gap between Trim to Kelly's label and its own
+        assert ('</select></label>&nbsp;&nbsp;<label>Min. price rise: <select id="flt-rise" '
+                'disabled autocomplete="off" title="') in page
+        select = self._select(page)
+        assert " disabled" in select.group(1) and 'autocomplete="off"' in select.group(1)
+        # "any" first and selected, then every 5c from 5c to 95c
+        cents = [f"{c}c" for c in range(5, 100, 5)]
+        assert [dashboard._trim_rise_option(rise) for rise in rises] == cents
+        assert re.findall(r'<option value="([^"]*)"( selected)?>(.*?)</option>',
+                          select.group(2)) == [
+            ("0", " selected", "any"), *((str(i + 1), "", c) for i, c in enumerate(cents))]
+        # ... every one of which the page-script tests can read
+        assert _page_elements(page)["selects"]["flt-rise"] == {"disabled": True, "options": [
+            {"value": "0", "text": "any", "selected": True},
+            *({"value": str(i + 1), "text": c, "selected": False}
+              for i, c in enumerate(cents))]}
+        # Each option is the base block's own entry, in order
+        data = TestFilterPage._data(page)
+        assert [entry["label"] for entry in data["trim_rises"]] == cents
+        assert [entry["value"] for entry in data["trim_rises"]] == list(rises)
+        title = re.search(r'title="([^"]*)"', select.group(1)).group(1)
+        assert html.unescape(title) == dashboard._TRIM_RISE_TITLE
+        # The hover text says when it counts, which price, and that a fall never does
+        for words in ("Used only while Trim to Kelly is on", "YES on the earlier market and "
+                      "NO on the later one", "A fall never counts", "any: no minimum",
+                      "its purchase, an add-on (Add to held pairs) or an earlier trim"):
+            assert words in dashboard._TRIM_RISE_TITLE
+        # A page with the view has no note beside either select
+        assert 'id="flt-rise-note"' not in page and 'id="flt-trim-note"' not in page
+        # Trim to Kelly keeps its two options
+        assert [o["text"] for o in _page_elements(page)["selects"]["flt-trim"]["options"]] == [
+            "off", "on (sell down to the Kelly size)"]
+
+    def test_a_page_without_the_minimums_renders_any_alone(self, monkeypatch, tmp_path):
+        # The select is on every page (the script looks for it), with one option
+        for sweep in (_kc_sweep_trim(), _kc_sweep()):
+            page = _ao_page(monkeypatch, tmp_path, sweep)
+            select = self._select(page)
+            assert " disabled" in select.group(1)
+            assert select.group(2) == '<option value="0" selected>any</option>'
+            assert TestFilterPage._data(page)["trim_rises"] == []
+
+    @pytest.mark.parametrize("trim_state, rise_state, note", [
+        # Trim to Kelly is shown and the minimums are not: this select says why
+        ("shown", "not simulated", _TRIM_NOT_SIMULATED),
+        ("shown", "unavailable", _TRIM_UNAVAILABLE),
+        ("shown", "something else", _TRIM_NOT_SIMULATED),
+        # Both shown: nothing to explain
+        ("shown", "shown", None),
+        # Trim to Kelly is not shown: its own note covers both selects
+        ("not simulated", "not simulated", None),
+        ("unavailable", "unavailable", None),
+        ("not simulated", "unavailable", None),
+        ("something else", "not simulated", None)])
+    def test_the_note_is_said_only_beside_a_shown_trim_to_kelly(self, trim_state, rise_state,
+                                                                note):
+        _, _, base = _tr_payload(_kc_sweep())
+        bar = dashboard._filter_bar_html(
+            {**base, "trim_state": trim_state, "trim_rise_state": rise_state},
+            {"all": {"n": 3}})
+        assert 'id="flt-rise" disabled' in bar
+        if note is None:
+            assert 'id="flt-rise-note"' not in bar
+        else:
+            # Right after the select, in the Trim to Kelly note's own style
+            assert ('</select></label>&nbsp;<span id="flt-rise-note" style="color:#9E9E9E; '
+                    f'font-size:13px;">{note}</span>&nbsp;&nbsp;<label>Sell: ') in bar
+        assert ('id="flt-trim-note"' in bar) is (trim_state != "shown")
+
+    def test_a_payload_without_the_state_reads_as_not_simulated(self):
+        _, _, base = _tr_payload(_kc_sweep_trim())
+        del base["trim_rise_state"], base["trim_rises"]
+        bar = dashboard._filter_bar_html(base, {"all": {"n": 3}})
+        assert ('id="flt-rise-note" style="color:#9E9E9E; font-size:13px;">'
+                f"{_TRIM_NOT_SIMULATED}</span>") in bar
+        assert self._select(bar).group(2) == '<option value="0" selected>any</option>'
+
+    def test_a_page_says_which_of_the_two_reasons_applies(self, monkeypatch, tmp_path):
+        def note(page: str) -> str | None:
+            found = re.search(r'<span id="flt-rise-note"[^>]*>([^<]*)</span>', page)
+            return found.group(1) if found else None
+
+        # A family without minimums: not simulated
+        assert note(_ao_page(monkeypatch, tmp_path, _kc_sweep_trim())) == _TRIM_NOT_SIMULATED
+        # A family whose minimums could not be read: see the log, and Trim to
+        # Kelly itself is still shown
+        lost = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(
+            rise_raise=((False, False, _KC_B0, 0.6), 0)))
+        assert note(lost) == _TRIM_UNAVAILABLE and 'id="flt-trim-note"' not in lost
+        assert TestFilterPage._data(lost)["trim_rise_state"] == "unavailable"
+        # No family at all, or one the page could not use: Trim to Kelly's own
+        # note says why, and this select has none
+        bare = _ao_page(monkeypatch, tmp_path, _kc_sweep())
+        assert note(bare) is None and 'id="flt-trim-note"' in bare
+        unfit = _kc_sweep_trim_rise()
+        unfit.trim_sweep.caps = (0.05, 0.2)
+        page = _ao_page(monkeypatch, tmp_path, unfit)
+        assert note(page) is None
+        assert re.search(
+            r'id="flt-trim-note"[^>]*>\(not available on this page; see the log\)</span>', page)
+
+    def test_the_reach_sentence_names_both_selects_only_with_the_minimums(
+            self, monkeypatch, tmp_path):
+        # Without an explorer grid (the payload built here has none) ...
+        _, _, base = _tr_payload(_kc_sweep_trim_rise())
+        closing = base["text"]["unfiltered"]
+        assert closing.endswith(" " + dashboard._TRIM_RISE_REACH_NO_EXPLORER)
+        assert dashboard._TRIM_REACH_NO_EXPLORER not in closing
+        assert dashboard._TRIM_RISE_REACH not in closing
+        # ... and with one (a band sweep's populations, so the page carries its grid)
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(_ex_sweep()))
+        closing = TestFilterPage._data(page)["text"]["unfiltered"]
+        assert closing.endswith(" " + dashboard._TRIM_RISE_REACH)
+        assert dashboard._TRIM_REACH not in closing
+        assert html.escape(dashboard._TRIM_RISE_REACH) in page
+        # A page that shows Trim to Kelly without the minimums names it alone
+        for sweep in (_kc_sweep_trim(),
+                      _kc_sweep_trim_rise(rise_raise=((False, False, _KC_B0, 0.6), 0))):
+            _, _, base = _tr_payload(sweep, rise_state="unavailable")
+            closing = base["text"]["unfiltered"]
+            assert closing.endswith(" " + dashboard._TRIM_REACH_NO_EXPLORER)
+            assert "Min. price rise" not in closing
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim(_ex_sweep()))
+        closing = TestFilterPage._data(page)["text"]["unfiltered"]
+        assert closing.endswith(" " + dashboard._TRIM_REACH) and "Min. price rise" not in closing
+        # A page with neither names neither
+        _, _, clean = _tr_payload(_kc_sweep())
+        assert "Trim to Kelly" not in clean["text"]["unfiltered"]
+        # Both sentences say what the pair of selects leaves alone
+        for words in (dashboard._TRIM_RISE_REACH, dashboard._TRIM_RISE_REACH_NO_EXPLORER):
+            assert words.startswith("Trim to Kelly and Min. price rise change the trade "
+                                    "sections only; the k̂ figures do not depend on them")
+            assert words.endswith("always show trimming off.") or words.endswith(
+                "always shows trimming off.")
+        assert "Scenario Explorer" in dashboard._TRIM_RISE_REACH
+        assert "Scenario Explorer" not in dashboard._TRIM_RISE_REACH_NO_EXPLORER
 
 
 class TestTrimScript:
@@ -12783,6 +12942,462 @@ class TestTrimScript:
         assert on["selects"]["flt-trim"]["value"] == "on"
 
 
+class TestTrimRiseScript:
+    """The bar's Min. price rise select under the page script (run outside a
+    browser): shut on load and while Trim to Kelly is off, open while it is
+    on; a minimum that makes a run of its own loads that run's chunk and
+    words the scenario with Python's phrase; one that changes nothing shows
+    the Trim to Kelly chunk, and one that holds every trim back the plain
+    run's; with adding on or the tier floors off it reads that setting's own
+    grid; Trim to Kelly off shows the plain run and keeps the minimum for
+    when it goes on again; a chunk that cannot be loaded puts the choice
+    back; and at any minimum Sell stays shut and nothing can be saved. The
+    explorer never follows it. flt-rise is shut on load, so these tests wait
+    on flt-trim (setup_js adds it to the harness's wait list) and never on
+    flt-rise. Skipped without a JavaScript runtime.
+
+    The page is _kc_sweep_trim_rise()'s: at (0-1, k 0.75) the 5% cap shows
+    its Trim to Kelly chunk at 5c and 10c and the plain run's at 25c, the 20%
+    cap (the page's own) its Trim to Kelly chunk at 5c and a chunk of its own
+    at 10c and 25c, and with no cap, as in every other cell, no minimum
+    changes anything. The select's values: "0" any, "1" 5c, "2" 10c, "3" 25c."""
+
+    WAIT = TestTrimScript.WAIT
+    ON, OFF = TestTrimScript.ON, TestTrimScript.OFF
+
+    @staticmethod
+    def _rise(value) -> list:
+        """The steps of a reader choosing one option of the Min. price rise select."""
+        return [["set", "flt-rise", str(value)], ["fire", "flt-rise"], ["settle"]]
+
+    @classmethod
+    def _run(cls, tmp_path, page, steps, **kwargs) -> dict:
+        """_run_script over a page, waiting on the trim select too."""
+        return _run_script(tmp_path, page, steps, setup_js=cls.WAIT + kwargs.pop("js", ""),
+                           **kwargs)
+
+    @staticmethod
+    def _scenario(data: dict, bi: int, ki: int, ci: int, ri: int | None = None, *,
+                  add: bool = False, off: bool = False) -> str:
+        """A trimming scenario in the summary's words, as the script builds it:
+        the band, k and cap, then Python's phrases for adding, for trimming
+        and for the minimum at index ri of the base block's trim_rises (None:
+        any, which adds no words)."""
+        return ((_phrase_off if off else _phrase)(data, bi, ki, ci)
+                + (data["text"]["add_on"] if add else "") + data["text"]["trim"]
+                + ("" if ri is None else data["trim_rises"][ri]["phrase"]))
+
+    def test_it_is_shut_on_load_and_while_trim_to_kelly_is_off(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        snaps = self._run(tmp_path, page, [
+            ["snap", "loaded"], ["wait"], ["snap", "ready"], *self._rise(2), ["snap", "ignored"],
+            *self._rise(0), *self.ON, ["snap", "on"], *self.OFF, ["snap", "off"]], strict=True)
+        assert snaps["loaded"]["selects"]["flt-rise"]["disabled"] is True
+        ready = snaps["ready"]["selects"]
+        assert ready["flt-rise"]["disabled"] is True and ready["flt-rise"]["value"] == "0"
+        assert ready["flt-rise"]["options"] == [["0", "any"], ["1", "5c"], ["2", "10c"],
+                                                ["3", "25c"]]
+        # Trim to Kelly beside it is open
+        assert ready["flt-trim"]["disabled"] is False
+        # A change event on the shut select draws nothing and loads nothing
+        ignored = snaps["ignored"]
+        assert ignored["reacts"] == [] and ignored["inflated"] == ["dash-data", "dash-chunk-0"]
+        assert ignored["text"].get("flt-summary") == snaps["ready"]["text"].get("flt-summary")
+        assert ignored["selects"]["flt-rise"]["disabled"] is True
+        # It opens with Trim to Kelly and shuts with it
+        assert snaps["on"]["selects"]["flt-rise"]["disabled"] is False
+        assert snaps["on"]["selects"]["flt-rise"]["value"] == "0"
+        assert snaps["off"]["selects"]["flt-rise"]["disabled"] is True
+
+    def test_a_minimum_loads_its_own_chunk_and_words_the_scenario(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        trim, cid = data["grid_trim"][0][1][1], data["grid_trim_rise"][0][1][1][1]
+        # The 10c run at the 20% cap trades a list no other scenario does
+        assert cid not in _ao_ids(data["grid"]) | _ao_ids(data["grid_trim"])
+        scenario = self._scenario(data, 0, 1, 1, 1)
+        assert scenario.endswith(
+            "20% cap per trade, trimming to Kelly only after a 10c price rise")
+        snaps = self._run(tmp_path, page, [
+            ["wait"], *self.ON, ["snap", "trim"], ["set", "flt-rise", "2"],
+            ["fire", "flt-rise"], ["snap", "loading"], ["settle"], ["snap", "rise"]],
+            strict=True)
+        # While its chunk inflates, the line says so, in Python's words
+        assert snaps["loading"]["text"]["flt-summary"] == data["text"]["loading"].format(
+            scenario=scenario)
+        snap = snaps["rise"]
+        # Exactly its chunk was loaded, after the Trim to Kelly one
+        assert snaps["trim"]["inflated"] == ["dash-data", "dash-chunk-0", f"dash-chunk-{trim}"]
+        assert snap["inflated"] == [*snaps["trim"]["inflated"], f"dash-chunk-{cid}"]
+        assert {r["id"] for r in snap["reacts"]} == _charts_redrawn()
+        view = chunks[cid]["list"]["views"]["all"]
+        # Its own simulation, with Trim to Kelly's note on what a part sold counts as
+        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], scenario, False, None, view["n"], view["n"], note="other_run",
+            trim=True)
+        assert snap["text"]["hdr-trades"] == str(view["n"])
+        assert {key: snap["text"][f"kpi-{key}"] for key in view["kpi"]} == view["kpi"]
+        assert _last_react(snap, "risk-kelly")["data"][0]["x"] == pytest.approx(
+            chunks[cid]["list"]["kx"])
+        assert snap["selects"]["flt-rise"]["value"] == "2"
+        assert snap["selects"]["flt-rise"]["disabled"] is False
+
+    def test_a_ticked_category_is_read_from_the_minimum_s_chunk(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        views = chunks[data["grid_trim_rise"][0][1][1][1]]["list"]["views"]
+        sports = _key(data, "Sports")
+        snap = self._run(tmp_path, page, [
+            ["wait"], *self.ON, *self._rise(2), _tick_category(sports[1:]), ["settle"],
+            ["snap", "sports"]], strict=True)["sports"]
+        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], self._scenario(data, 0, 1, 1, 1), False, "Sports",
+            views[sports]["n"], views["all"]["n"], trim=True)
+        assert snap["text"]["hdr-trades"] == str(views[sports]["n"])
+
+    def test_a_minimum_that_changes_nothing_shows_the_trim_to_kelly_chunk(
+            self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        trim = data["grid_trim"][0][1]
+        # With no cap the cell is null (no minimum changes the run); at the
+        # 20% cap the 5c entry is the Trim to Kelly chunk's own id
+        assert data["grid_trim_rise"][0][1][2] is None
+        assert data["grid_trim_rise"][0][1][1][0] == trim[1]
+        snaps = self._run(tmp_path, page, [
+            ["wait"], *self.ON, ["snap", "trim"], *self._rise(1), ["snap", "five"],
+            ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"], ["snap", "null"],
+            *self._rise(3), ["snap", "null 25c"]], strict=True)
+        for name, ci, ri in (("five", 1, 0), ("null", 2, 0), ("null 25c", 2, 2)):
+            snap = snaps[name]
+            # Nothing was loaded for it (no cap trims nothing, and shows the
+            # page's own chunk): the Trim to Kelly chunk, under the minimum's name
+            assert snap["inflated"] == snaps["trim"]["inflated"], name
+            n = chunks[trim[ci]]["list"]["views"]["all"]["n"]
+            assert snap["text"]["hdr-trades"] == str(n), name
+            assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+                data["text"], self._scenario(data, 0, 1, ci, ri), False, None, n, n,
+                note="other_run" if ci == 1 else None, trim=True), name
+        # It was drawn again all the same (the words changed)
+        assert {r["id"] for r in snaps["five"]["reacts"]} == _charts_redrawn()
+
+    def test_a_null_cell_elsewhere_on_the_grid_shows_its_trim_to_kelly_chunk(
+            self, monkeypatch, tmp_path):
+        # k 0.60 trims nothing at any cap: every minimum is the cell's own chunk
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        data = TestFilterPage._data(page)
+        assert data["grid_trim_rise"][0][0] == [None, None, None]
+        assert data["grid_trim"][0][0] == data["grid"][0][0]
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "plain"],
+            *self.ON, *self._rise(2), ["snap", "rise"]], strict=True)
+        assert snaps["rise"]["inflated"] == snaps["plain"]["inflated"]
+        assert snaps["rise"]["text"]["hdr-trades"] == snaps["plain"]["text"]["hdr-trades"]
+        assert self._scenario(data, 0, 0, 1, 1) in snaps["rise"]["text"]["flt-summary"]
+
+    def test_a_minimum_that_holds_every_trim_back_shows_the_plain_run_s_chunk(
+            self, monkeypatch, tmp_path):
+        # At the 5% cap, 25c holds the one trim back: the run trades the list
+        # of the run without trimming, whose chunk the page already has
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        plain, trim = data["grid"][0][1][0], data["grid_trim"][0][1][0]
+        assert data["grid_trim_rise"][0][1][0] == [trim, trim, plain] and plain != trim
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], ["snap", "plain"],
+            *self.ON, ["snap", "trim"], *self._rise(3), ["snap", "rise"]], strict=True)
+        rise = snaps["rise"]
+        assert rise["inflated"] == snaps["trim"]["inflated"] == [
+            *snaps["plain"]["inflated"], f"dash-chunk-{trim}"]
+        n = chunks[plain]["list"]["views"]["all"]["n"]
+        assert n != chunks[trim]["list"]["views"]["all"]["n"]
+        assert rise["text"]["hdr-trades"] == snaps["plain"]["text"]["hdr-trades"] == str(n)
+        # The line still names the choice: the run was simulated, and trimmed nothing
+        assert rise["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], self._scenario(data, 0, 1, 0, 2), False, None, n, n, trim=True)
+
+    def test_trim_to_kelly_off_shows_the_plain_run_and_on_again_the_kept_minimum(
+            self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        data = TestFilterPage._data(page)
+        snaps = self._run(tmp_path, page, [
+            ["wait"], *self.ON, *self._rise(2), ["snap", "rise"], *self.OFF, ["snap", "off"],
+            *self.ON, ["snap", "again"]], strict=True)
+        rise, off, again = snaps["rise"], snaps["off"], snaps["again"]
+        # Off: the page as rendered, the select shut with its choice kept
+        assert off["selects"]["flt-rise"] == {**rise["selects"]["flt-rise"], "disabled": True}
+        assert off["selects"]["flt-rise"]["value"] == "2"
+        assert off["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], _phrase(data, 0, 1, 1), True, None, 3, 3)
+        assert off["text"]["hdr-trades"] == "3"
+        # On again: straight back to the minimum it still names, nothing loaded anew
+        assert again["selects"]["flt-rise"] == rise["selects"]["flt-rise"]
+        assert again["text"]["flt-summary"] == rise["text"]["flt-summary"]
+        assert again["text"]["hdr-trades"] == rise["text"]["hdr-trades"] != "3"
+        assert again["inflated"] == rise["inflated"]
+
+    def test_a_later_choice_supersedes_a_minimum_still_loading(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        data = TestFilterPage._data(page)
+        cid = data["grid_trim_rise"][0][1][1][1]
+        snaps = self._run(tmp_path, page, [
+            ["wait"], *self.ON, *self._rise(2), ["snap", "loading"], *self._rise(1),
+            ["snap", "five"], ["resolve", f"dash-chunk-{cid}"], ["snap", "arrived"]],
+            strict=True, deferred=(f"dash-chunk-{cid}",))
+        assert snaps["loading"]["pending"] == [f"dash-chunk-{cid}"]
+        assert snaps["loading"]["text"]["flt-summary"] == data["text"]["loading"].format(
+            scenario=self._scenario(data, 0, 1, 1, 1))
+        five, arrived = snaps["five"], snaps["arrived"]
+        assert self._scenario(data, 0, 1, 1, 0) in five["text"]["flt-summary"]
+        # The 10c chunk arrives after 5c was chosen: it is not drawn over it
+        assert arrived["reacts"] == []
+        assert arrived["text"]["flt-summary"] == five["text"]["flt-summary"]
+        assert arrived["selects"]["flt-rise"]["value"] == "1"
+
+    # ─── Adding to held pairs, and the tier floors off ───────────────────────
+
+    def test_with_adding_on_it_reads_the_adding_grid(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(_kc_sweep_add_on()))
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        cid = data["grid_trim_rise_add"][0][1][1][1]
+        assert cid not in (_ao_ids(data["grid"]) | _ao_ids(data["grid_add"])
+                           | _ao_ids(data["grid_trim"]) | _ao_ids(data["grid_trim_add"]))
+        assert cid != data["grid_trim_rise"][0][1][1][1]
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], *self.ON,
+            *self._rise(2), ["snap", "both"], ["set", "flt-add", "off"], ["fire", "flt-add"],
+            ["settle"], ["snap", "alone"]], js="__BAR.push('flt-add');", strict=True)
+        snap = snaps["both"]
+        assert f"dash-chunk-{cid}" in snap["inflated"]
+        scenario = self._scenario(data, 0, 1, 1, 1, add=True)
+        assert scenario.endswith(
+            ", adding to held pairs, trimming to Kelly only after a 10c price rise")
+        n = chunks[cid]["list"]["views"]["all"]["n"]
+        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], scenario, False, None, n, n, note="other_run", add_on=True, trim=True)
+        assert snap["text"]["hdr-trades"] == str(n)
+        # Adding off again: the same minimum of the trim-alone scenario
+        alone = data["grid_trim_rise"][0][1][1][1]
+        assert f"dash-chunk-{alone}" in snaps["alone"]["inflated"]
+        assert snaps["alone"]["text"]["hdr-trades"] == str(
+            chunks[alone]["list"]["views"]["all"]["n"])
+        assert snaps["alone"]["selects"]["flt-rise"]["value"] == "2"
+
+    def test_tier_floors_off_reads_the_tier_off_grid(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(_kc_sweep_tiers()))
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        # At the band the tiers bind at, 5c is a run of its own; at the other
+        # band the off view is its tier-on run, which no minimum changes
+        binding = data["grid_trim_rise_off"][0][1][1][0]
+        assert binding not in _ao_ids(data["grid_trim_off"]) | _ao_ids(data["grid_trim"])
+        assert data["grid_trim_rise_off"][1][1][1] is None
+        plain = data["grid_trim_off"][1][1][1]
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], *self.ON,
+            *self._rise(1), ["snap", "binding"],
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "plain"]],
+            strict=True)
+        n = chunks[binding]["list"]["views"]["all"]["n"]
+        assert f"dash-chunk-{binding}" in snaps["binding"]["inflated"]
+        assert snaps["binding"]["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], self._scenario(data, 0, 1, 1, 0, off=True), False, None, n, n,
+            note="other_run", trim=True)
+        n = chunks[plain]["list"]["views"]["all"]["n"]
+        assert snaps["plain"]["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], self._scenario(data, 1, 1, 1, 0, off=True), False, None, n, n,
+            trim=True)
+        assert snaps["plain"]["text"]["hdr-trades"] == str(n)
+
+    def test_with_both_it_reads_the_grid_of_runs_that_do_both(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path,
+                        _kc_sweep_trim_rise(_kc_sweep_add_on(_kc_sweep_tiers())))
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        cid = data["grid_trim_rise_add_off"][0][1][1][0]
+        assert cid not in {data["grid_trim_rise_off"][0][1][1][0],
+                           data["grid_trim_rise_add"][0][1][1][0],
+                           data["grid_trim_add_off"][0][1][1]}
+        snap = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
+            ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], *self.ON, *self._rise(1),
+            ["snap", "both"]], js="__BAR.push('flt-add');", strict=True)["both"]
+        assert f"dash-chunk-{cid}" in snap["inflated"]
+        n = chunks[cid]["list"]["views"]["all"]["n"]
+        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], self._scenario(data, 0, 1, 1, 0, add=True, off=True), False, None,
+            n, n, note="other_run", add_on=True, trim=True)
+
+    # ─── A chunk that cannot be loaded, and a restored choice ────────────────
+
+    def test_a_chunk_that_cannot_be_loaded_puts_the_choice_back(self, monkeypatch, tmp_path):
+        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        cid = data["grid_trim_rise"][0][1][1][1]
+        snaps = self._run(tmp_path, page, [
+            ["wait"], *self.ON, ["snap", "trim"], *self._rise(2), ["snap", "bad"],
+            # ... and from another minimum, back to that one
+            *self._rise(1), ["snap", "five"], *self._rise(3), ["snap", "bad again"],
+            ["repair", f"dash-chunk-{cid}"], *self._rise(2), ["snap", "good"]],
+            strict=True, damaged=(f"dash-chunk-{cid}",))
+        reason = f"Error: damaged block dash-chunk-{cid}"
+        bad = snaps["bad"]
+        # The select goes back to the minimum still shown (any), open, and
+        # the line says what could not be shown, in Python's words
+        assert bad["selects"]["flt-rise"]["value"] == "0" and bad["reacts"] == []
+        assert bad["selects"]["flt-rise"]["disabled"] is False
+        assert bad["selects"]["flt-trim"]["value"] == "on"
+        assert bad["text"]["flt-summary"] == data["text"]["unavailable"].format(
+            failed=self._scenario(data, 0, 1, 1, 1), reason=reason,
+            scenario=self._scenario(data, 0, 1, 1))
+        # The scenario still shown trims, so there is still nothing to save
+        assert bad["buttons"]["flt-save"] is True
+        # 25c is that same chunk: the choice goes back to 5c, which was shown
+        again = snaps["bad again"]
+        assert again["selects"]["flt-rise"]["value"] == "1" and again["reacts"] == []
+        assert again["text"]["flt-summary"] == data["text"]["unavailable"].format(
+            failed=self._scenario(data, 0, 1, 1, 2), reason=reason,
+            scenario=self._scenario(data, 0, 1, 1, 0))
+        assert again["text"]["hdr-trades"] == snaps["five"]["text"]["hdr-trades"]
+        # Repaired, choosing it again works
+        good = snaps["good"]
+        assert good["selects"]["flt-rise"]["value"] == "2"
+        assert good["text"]["hdr-trades"] == str(chunks[cid]["list"]["views"]["all"]["n"])
+
+    def test_a_failed_trim_chunk_shuts_the_select_again(self, monkeypatch, tmp_path):
+        # Trim to Kelly was chosen and its chunk could not be loaded: Trim to
+        # Kelly goes back to off, and the select it had opened shuts with it
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        data = TestFilterPage._data(page)
+        cid = data["grid_trim"][0][1][1]
+        snap = self._run(tmp_path, page, [["wait"], *self.ON, ["snap", "back"]],
+                         strict=True, damaged=(f"dash-chunk-{cid}",))["back"]
+        assert snap["selects"]["flt-trim"]["value"] == "off"
+        assert snap["selects"]["flt-rise"]["disabled"] is True
+        assert snap["selects"]["flt-rise"]["value"] == "0"
+        assert snap["text"]["flt-summary"] == data["text"]["unavailable"].format(
+            failed=self._scenario(data, 0, 1, 1),
+            reason=f"Error: damaged block dash-chunk-{cid}", scenario=_phrase(data, 0, 1, 1))
+
+    def test_a_restored_minimum_is_set_back_to_any(self, monkeypatch, tmp_path):
+        # A browser restoring a reader's last choices on reload: both go back
+        # to the page as rendered, and no trimming chunk is loaded
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        snaps = self._run(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
+                          pre=(("flt-trim", "on"), ("flt-rise", "3")), strict=True)
+        assert snaps["loaded"]["selects"]["flt-rise"]["value"] == "0"
+        ready = snaps["ready"]
+        assert ready["selects"]["flt-rise"]["value"] == "0"
+        assert ready["selects"]["flt-rise"]["disabled"] is True
+        assert ready["selects"]["flt-trim"]["value"] == "off"
+        assert ready["inflated"] == ["dash-data", "dash-chunk-0"] and ready["reacts"] == []
+
+    # ─── A page without the minimums ─────────────────────────────────────────
+
+    @pytest.mark.parametrize("view", ["trim without minimums", "no trim"])
+    def test_a_page_without_the_minimums_keeps_it_shut(self, monkeypatch, tmp_path, view):
+        page = _ao_page(monkeypatch, tmp_path,
+                        _kc_sweep_trim() if view == "trim without minimums" else _kc_sweep())
+        # A page with no Trim to Kelly view never opens flt-trim: not waited on
+        run = self._run if view == "trim without minimums" else _run_script
+        snaps = run(tmp_path, page, [
+            ["snap", "loaded"], ["wait"], *self.ON, ["snap", "on"], *self._rise(0),
+            ["snap", "fired"]], strict=True)
+        for name in ("loaded", "on", "fired"):
+            select = snaps[name]["selects"]["flt-rise"]
+            assert select["disabled"] is True and select["options"] == [["0", "any"]], name
+        # A change event on the shut select draws nothing
+        assert snaps["fired"]["reacts"] == []
+        assert snaps["fired"]["inflated"] == snaps["on"]["inflated"]
+        assert "price rise" not in snaps["on"]["text"].get("flt-summary", "")
+        assert ("trimming to Kelly" in snaps["on"]["text"].get("flt-summary", "")) is (
+            view == "trim without minimums")
+
+    # ─── Save and Sell at a minimum ──────────────────────────────────────────
+
+    def test_nothing_can_be_saved_at_any_minimum(self, monkeypatch, tmp_path):
+        save = TestSaveLiveDefaultsButton()
+        page = save._kc(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        data = TestFilterPage._data(page)
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["snap", "before"], *self.ON, *self._rise(2), ["click", "flt-save"],
+            ["snap", "own"],
+            # ... also where the minimum shows the plain run's own chunk (5% cap, 25c)
+            ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], *self._rise(3),
+            ["click", "flt-save"], ["snap", "plain chunk"],
+            *self.OFF, ["click", "flt-save"], ["snap", "off"]], strict=True)
+        assert snaps["before"]["buttons"]["flt-save"] is False
+        for name in ("own", "plain chunk"):
+            assert snaps[name]["buttons"]["flt-save"] is True and snaps[name]["opened"] == []
+        # Trimming off: the plain scenario can be saved, and its address says
+        # nothing of trimming or of the minimum the shut select still names
+        assert snaps["off"]["buttons"]["flt-save"] is False
+        assert snaps["off"]["selects"]["flt-rise"]["value"] == "3"
+        [opened] = snaps["off"]["opened"]
+        query = save._query(data, opened)
+        save._assert_sends(data, query, 0, 1, 0)
+        assert not any("trim" in key or "rise" in key for key in query)
+
+    def test_sell_stays_shut_at_a_minimum(self, monkeypatch, tmp_path):
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(_kc_sweep_sell()))
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        cid = data["grid_trim_rise"][0][1][1][1]
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
+            ["snap", "level"], *self.ON, *self._rise(2), ["snap", "rise"], *self.OFF,
+            ["snap", "off"]],
+            setup_js=self.WAIT + "__BAR.push('flt-sell');", files_root=tmp_path, strict=True)
+        assert snaps["level"]["selects"]["flt-sell"]["value"] == "0"
+        rise = snaps["rise"]
+        # Sell is at no selling, and it and Min. days are shut; the minimum is open
+        assert rise["selects"]["flt-sell"]["value"] == "none"
+        assert rise["selects"]["flt-sell"]["disabled"] is True
+        assert rise["selects"]["flt-days"]["disabled"] is True
+        assert rise["selects"]["flt-rise"]["disabled"] is False
+        # The scenario drawn is the minimum's, with no sale in its words
+        assert f"dash-chunk-{cid}" in rise["inflated"] and rise["files"] == snaps["level"]["files"]
+        n = chunks[cid]["list"]["views"]["all"]["n"]
+        assert rise["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], self._scenario(data, 0, 1, 1, 1), False, None, n, n,
+            note="other_run", trim=True)
+        assert data["text"]["sell_note"] not in rise["text"]["flt-summary"]
+        # Trimming off: Sell opens again and the minimum shuts
+        off = snaps["off"]["selects"]
+        assert off["flt-sell"]["value"] == "none" and off["flt-sell"]["disabled"] is False
+        assert off["flt-rise"]["disabled"] is True
+
+    # ─── The explorer ────────────────────────────────────────────────────────
+
+    def test_the_bar_s_call_to_the_explorer_keeps_its_four_arguments(
+            self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        data = TestFilterPage._data(page)
+        spy = ("window.dashScenarioSelect = function() { var el = document.getElementById("
+               "'__spy'); var seen = el.textContent ? JSON.parse(el.textContent) : []; "
+               "seen.push(Array.prototype.slice.call(arguments)); "
+               "el.textContent = JSON.stringify(seen); };")
+        snaps = self._run(tmp_path, page, [["wait"], *self.ON, *self._rise(2), *self.OFF,
+                                           ["snap", "s"]], js=spy)
+        calls = json.loads(snaps["s"]["text"]["__spy"])
+        labels = [data["bands"][0]["label"], data["ks"][1]["label"], data["caps"][1]["label"],
+                  "on"]
+        # One call per redraw, none of them naming trimming or the minimum
+        assert calls == [labels, labels, labels]
+        [call] = re.findall(r"window\.dashScenarioSelect\(([^;]*)\);", dashboard._FILTER_JS)
+        assert len(re.split(r",\s*(?![^\[]*\])", call)) == 4
+        assert "SHOWN[9]" not in call and "SHOWN[10]" not in call
+
+    def test_the_explorer_s_selects_never_move_on_a_minimum_change(self, monkeypatch, tmp_path):
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(_ex_sweep_tiers()))
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["snap", "before"], *self.ON, ["snap", "on"], *self._rise(2),
+            ["snap", "rise"]], strict=True, explorer=True)
+        before, on, rise = snaps["before"], snaps["on"], snaps["rise"]
+        assert _scn_values(rise) == _scn_values(on) == _scn_values(before)
+        for snap in (on, rise):
+            assert _explorer_calls(snap) == []
+        assert rise["selects"]["flt-rise"]["value"] == "2"
+        assert "only after a 10c price rise" in rise["text"]["flt-summary"]
+
+
 class TestTrimEndToEnd:
     """Real size-cap, add-on and trim sweeps over the backtester's trimming
     fixture (TestTrimCapSweep's: a pair that outgrows its size cap, beside two
@@ -12944,6 +13559,84 @@ class TestTrimRiseEndToEnd:
             simulated, shared, same = map(int, match.groups())
             assert simulated > 0 and same > 0
             assert simulated + shared + same == len(self._RISES) * len(caps)
+
+    def test_the_selects_draw_each_minimum_s_own_simulation(self, monkeypatch, tmp_path):
+        # The same real page, driven through its script: Trim to Kelly on,
+        # then a size cap and a minimum of each kind of cell. What is drawn is
+        # the chunk the base block's grids name, and that chunk is the run a
+        # fresh simulation at that cap and minimum produces. Skipped without
+        # a JavaScript runtime.
+        fixture = _tb.TestTrimCapSweep()
+        entries = fixture._entries()
+        band, k, start, end = fixture._BAND, 0.75, fixture._START, fixture._END
+        caps = backtester.SIZE_CAP_SWEEP
+
+        def fresh(cap, **options):
+            return backtester._simulate_at_discount(
+                entries, start, 10_000.0, k=k, spread_band=band, size_cap=cap, quiet=True,
+                end_date=end, **options)
+
+        primary = fresh(0.20)
+        axes = {"caps": caps, "primary_cap": 0.20, "bands": (band,), "ks": (k,),
+                "primary_k": k, "start_date": start, "initial_balance": 10_000.0}
+        lazy = {**axes, "split_date": None, "checks": False,
+                "entries_by_band": {band: entries}, "st_entries": []}
+        days = {(band, k, "all"): end}
+        run = BacktestSweep(
+            primary=primary, points=[primary], calibration=None, scenarios=[primary],
+            calibrations_by_band={band: None}, same_event_ladders=True,
+            cap_sweep=backtester.CapSweep(**lazy, eager={(band, k, "all"): primary}),
+            trim_sweep=backtester.TrimSweep(
+                **axes, off_bands=(), entries_by_band={band: entries},
+                off_entries_by_band={}, end_dates=days, off_end_dates={},
+                min_rises=self._RISES))
+        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(dashboard.yf, "download",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        page = dashboard.generate_dashboard(
+            primary.trades, primary.equity_df, start, 10_000.0,
+            sweep=run).read_text(encoding="utf-8")
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        plain, trim, rises = (data[key][0][0] for key in ("grid", "grid_trim", "grid_trim_rise"))
+        # One (cap, minimum) of each kind of cell the page holds
+        picks: dict[str, tuple[int, int]] = {}
+        for ci, cell in enumerate(rises):
+            if cell is None:
+                # No minimum changes this cap's run: the cell is null
+                picks.setdefault("a null cell", (ci, 1))
+                continue
+            for ri, cid in enumerate(cell):
+                picks.setdefault(
+                    "the Trim to Kelly chunk" if cid == trim[ci] else
+                    "the plain run's chunk" if cid == plain[ci] else
+                    "another minimum's chunk" if cid in cell[:ri] else
+                    "a chunk of its own", (ci, ri))
+        assert set(picks) == {"a null cell", "the Trim to Kelly chunk", "the plain run's chunk",
+                              "another minimum's chunk", "a chunk of its own"}
+        steps = [["wait"], *TestTrimScript.ON]
+        for kind, (ci, ri) in picks.items():
+            steps += [["set", "flt-cap", str(ci)], ["fire", "flt-cap"], ["settle"],
+                      ["set", "flt-rise", str(ri + 1)], ["fire", "flt-rise"], ["settle"],
+                      ["snap", kind]]
+        snaps = _run_script(tmp_path, page, steps, setup_js=TestTrimScript.WAIT, strict=True)
+        for kind, (ci, ri) in picks.items():
+            snap = snaps[kind]
+            cid = trim[ci] if rises[ci] is None else rises[ci][ri]
+            view = chunks[cid]["list"]["views"]["all"]
+            point = fresh(caps[ci], trim_to_kelly=True, trim_min_rise=self._RISES[ri])
+            # The selects name the pick, and the chunk the grids resolve it to is drawn
+            assert snap["selects"]["flt-cap"]["value"] == str(ci), kind
+            assert snap["selects"]["flt-rise"]["value"] == str(ri + 1), kind
+            assert _last_react(snap, "risk-kelly")["data"][0]["x"] == pytest.approx(
+                chunks[cid]["list"]["kx"]), kind
+            assert {key: snap["text"][f"kpi-{key}"] for key in view["kpi"]} == view["kpi"], kind
+            assert data["trim_rises"][ri]["phrase"] in snap["text"]["flt-summary"], kind
+            # ... which is that cap's run at that minimum, simulated afresh
+            assert snap["text"]["hdr-trades"] == str(view["n"]) == str(len(point.trades)), kind
+            kpis = dashboard._performance_kpis(point.equity_df, point.trades, 10_000.0)
+            assert view["kpi"] == {name: value for name, _, value, _ in kpis}, kind
+        # Not vacuous: the picks do not all draw one trade count
+        assert len({snaps[kind]["text"]["hdr-trades"] for kind in picks}) > 1
 
 
 # ─── Sell: every sell level of every scenario (sidecar chunks) ───────────────
@@ -14510,15 +15203,21 @@ class TestFilterPageSize:
     below — the pages at cost end 5.6% to 7.2% above the page before the mix
     data, and the pages valued at market, whose curves move daily, 4.9% and
     6.0% BELOW it. The check-box Category and Tag menus and the script that
-    works a mix out are about 34 KB of every variant, whatever its data."""
+    works a mix out are about 34 KB of every variant, whatever its data.
+
+    The Min. price rise select (its options and hover text, and the script
+    that reads it) is about 3.5 KB of every variant: each re-measured
+    2026-10-13 (same environment), in the constants below, beside its size
+    the same day before the select."""
 
     # 837,197 before the mix data; 922,701 with it, the menus and the mix
     # script ("m" in place of "eq" alone); 897,445 with a tag view's other
-    # curve series left out as well (2026-10-10)
-    PAGE_BYTES_MEASURED = 897_445
+    # curve series left out as well (2026-10-10); 905,055 with the Min. price
+    # rise select (2026-10-13; 901,542 the same day before it)
+    PAGE_BYTES_MEASURED = 905_055
     BUDGET = int(PAGE_BYTES_MEASURED * 1.2)
-    # 1,119,167 before; 1,233,927; 1,193,307
-    PAGE_BYTES_MEASURED_FAMILY = 1_193_307
+    # 1,119,167 before; 1,233,927; 1,193,307; 1,200,909 (1,197,396)
+    PAGE_BYTES_MEASURED_FAMILY = 1_200_909
     BUDGET_FAMILY = int(PAGE_BYTES_MEASURED_FAMILY * 1.2)
     # The Add to held pairs view, where every band's add-on run trades yet
     # another list (a worst case: a real run's add-on lists mostly equal the
@@ -14528,11 +15227,12 @@ class TestFilterPageSize:
     # 1,098,598 to 1,784,261 (2026-09-30). On 2026-10-10: 1,289,102 and
     # 1,798,488 before the mix data; 1,424,198 and 1,987,940 with it, the
     # menus and the mix script; and, with a tag view's other curve series
-    # left out as well, the constants below. Each budget is its measurement
-    # + 20%.
-    PAGE_BYTES_MEASURED_ADD_ON = 1_367_286
+    # left out as well, 1,367,286 and 1,899,628. On 2026-10-13, with the Min.
+    # price rise select, the constants below (1,371,379 and 1,903,729 the
+    # same day before it). Each budget is its measurement + 20%.
+    PAGE_BYTES_MEASURED_ADD_ON = 1_374_892
     BUDGET_ADD_ON = int(PAGE_BYTES_MEASURED_ADD_ON * 1.2)
-    PAGE_BYTES_MEASURED_ADD_ON_FAMILY = 1_899_628
+    PAGE_BYTES_MEASURED_ADD_ON_FAMILY = 1_907_242
     BUDGET_ADD_ON_FAMILY = int(PAGE_BYTES_MEASURED_ADD_ON_FAMILY * 1.2)
     # Every trade with quotes that move on most days it is held (a run valued
     # at market), the trade lists unchanged: each curve then changes on most
@@ -14543,18 +15243,22 @@ class TestFilterPageSize:
     # daily by choice, so each budget is its measurement + 20%, with no ceiling.
     # On 2026-10-10: 1,411,508 and 1,982,690 before the mix data; 1,518,228
     # and 2,130,430 with it, the menus and the mix script; and, with a tag
-    # view's other curve series left out as well, the constants below (a
-    # curve that moves daily was the costly part of each tag view).
-    PAGE_BYTES_MEASURED_QUOTED = 1_342_624
+    # view's other curve series left out as well, 1,342,624 and 1,863,334 (a
+    # curve that moves daily was the costly part of each tag view). On
+    # 2026-10-13, with the Min. price rise select, the constants below
+    # (1,346,640 and 1,867,390 the same day before it).
+    PAGE_BYTES_MEASURED_QUOTED = 1_350_153
     BUDGET_QUOTED = int(PAGE_BYTES_MEASURED_QUOTED * 1.2)
-    PAGE_BYTES_MEASURED_QUOTED_FAMILY = 1_863_334
+    PAGE_BYTES_MEASURED_QUOTED_FAMILY = 1_870_903
     BUDGET_QUOTED_FAMILY = int(PAGE_BYTES_MEASURED_QUOTED_FAMILY * 1.2)
     # The Trim to Kelly view, where every band's trimming run trades yet
     # another list (a worst case: a real trimming run mostly trades the list
     # of the run without it and shares its chunk). Measured 1,286,299 bytes
-    # (2026-10-10, plotly 6.9.0 / pandas 3.0.3 / numpy 2.4.6); its budget is
-    # that + 20%.
-    PAGE_BYTES_MEASURED_TRIM = 1_286_299
+    # (2026-10-10, plotly 6.9.0 / pandas 3.0.3 / numpy 2.4.6). Re-measured
+    # 2026-10-13 (same environment): 1,365,630 before the Min. price rise
+    # select and 1,369,252 with it — shut on this page, whose family carries
+    # no minimum, with its note beside it. Its budget is that + 20%.
+    PAGE_BYTES_MEASURED_TRIM = 1_369_252
     BUDGET_TRIM = int(PAGE_BYTES_MEASURED_TRIM * 1.2)
 
     @pytest.mark.parametrize(

@@ -32,8 +32,8 @@ Purpose:
     is written to PROJECT_ROOT and can be opened directly in any browser.
 
     A sticky filter bar at the top of the page — Spread band, Tier floors, k,
-    Size cap, Add to held pairs, Trim to Kelly, Sell, Min. days to maturity,
-    Category, Tag — re-scopes every
+    Size cap, Add to held pairs, Trim to Kelly, Min. price rise, Sell, Min.
+    days to maturity, Category, Tag — re-scopes every
     trade-derived section (performance, decomposition, calibration,
     diagnostics, risk, the benchmark's strategy row) to the run at another
     spread band, with the deadline-gap tier floors on (the run as simulated)
@@ -119,7 +119,14 @@ Purpose:
     that repeats another stores that run's chunk id. The base block carries
     the minimums ("trim_rises") and, per scenario, each minimum's chunk id
     ("grid_trim_rise" and its tier-floors-off and adding-on twins), where a
-    null cell means every minimum shows the Trim to Kelly cell itself.
+    null cell means every minimum shows the Trim to Kelly cell itself. The
+    bar's "Min. price rise" select, right after Trim to Kelly, picks one:
+    "any" (no minimum: the Trim to Kelly run itself) or one of the minimums
+    ("5c", "10c", ...). It is on every page and open only while Trim to
+    Kelly is on, on a page that carries the minimums; a page that shows Trim
+    to Kelly without them says why in a short note beside it. Like Trim to
+    Kelly it changes the trade sections and the header's trade count only,
+    and Sell stays shut and the save button disabled at any minimum.
 
     The bar's Sell choice is "no selling" (the page as rendered) or one of the
     sell family's levels (backtester.SellSweep; config.TAKE_PROFIT_LEVELS,
@@ -6289,6 +6296,32 @@ _TRIM_REACH = ("Trim to Kelly changes the trade sections only; the k̂ figures d
 _TRIM_REACH_NO_EXPLORER = ("Trim to Kelly changes the trade sections only; the k̂ figures do "
                            "not depend on it, and the Interval Discount section always "
                            "shows it off.")
+# The "Min. price rise" select beside Trim to Kelly: its first option (no
+# minimum: the Trim to Kelly run itself; the others are _trim_rise_option's,
+# one per minimum the base block names), its hover text, and the note beside
+# it when the page shows Trim to Kelly without the minimums, by the payload's
+# "trim_rise_state"
+_TRIM_RISE_OPTION_ANY = "any"
+_TRIM_RISE_TITLE = (
+    "Used only while Trim to Kelly is on. A held pair is trimmed only once its total "
+    "price — the price of the sides it holds, added: YES on the earlier market and NO on "
+    "the later one for a time-series pair — is at least this many cents above where it "
+    "stood at the last trade on that pair: its purchase, an add-on (Add to held pairs) or "
+    "an earlier trim. A fall never counts. any: no minimum. Prices are the asks at the "
+    "weekly checkpoint, which the backtest values an open pair at.")
+_TRIM_RISE_NOTES = {
+    "not simulated": "(not simulated in this backtest)",
+    "unavailable": "(not available on this page; see the log)",
+}
+# The reach sentence in _TRIM_REACH's place on a page that also shows the
+# minimum price rises (both selects reach the same sections); the second is
+# for a page with no Scenario Explorer grid
+_TRIM_RISE_REACH = ("Trim to Kelly and Min. price rise change the trade sections only; the "
+                    "k̂ figures do not depend on them, and the Scenario Explorer and "
+                    "Interval Discount sections always show trimming off.")
+_TRIM_RISE_REACH_NO_EXPLORER = ("Trim to Kelly and Min. price rise change the trade sections "
+                                "only; the k̂ figures do not depend on them, and the "
+                                "Interval Discount section always shows trimming off.")
 
 
 def _trim_rise_option(rise: float) -> str:
@@ -6547,7 +6580,9 @@ def _bar_reach(kd_follows: bool, explorer_follows: bool, *, explorer_caps: bool 
 # at the primary band, k and size cap; so is one at a sell level, whose
 # phrase the base block's sell_levels carry, and "sell_note" is added to the
 # line while a level is chosen. "trim" and "trim_note" do for the Trim to
-# Kelly choice what "add_on" and "add_on_note" do for adding. "sidecar_missing" and "sidecar_empty" are a
+# Kelly choice what "add_on" and "add_on_note" do for adding; a minimum price
+# rise's phrase, which the base block's trim_rises carry, follows "trim".
+# "sidecar_missing" and "sidecar_empty" are a
 # sidecar chunk file's {reason} in "unavailable": it could not be loaded, or
 # it ran without handing anything over ({file}: the address asked for).
 # The Category and Tag menus of the filter bar: check-box dropdowns. The words
@@ -11960,7 +11995,11 @@ def _filter_payload(
             flat curve, referencing no string), "mix" (_mix_base: what the
             script works a mix of categories and tags out with), "text" (the templates:
             _SUMMARY_TEMPLATES — its "unfiltered" sentence chosen by kd,
-            explorer and explorer_caps (_bar_reach) — _KHAT_TEXT and
+            explorer and explorer_caps (_bar_reach), then closed by one
+            sentence per view the page has: _ADD_ON_REACH, _SELL_REACH and
+            _TRIM_REACH, or _TRIM_RISE_REACH in its place when the page also
+            shows the minimum price rises (each one's _NO_EXPLORER twin
+            without the explorer) — _KHAT_TEXT and
             _CALIBRATION_TEXT), "styles" (the trade-type
             lines' and the k-hat bars' drawing, the k-hat chart's height
             formula and reference line, the KPI cards' default colour and a
@@ -12077,8 +12116,12 @@ def _filter_payload(
                     " " + (_ADD_ON_REACH if explorer else _ADD_ON_REACH_NO_EXPLORER))
                  + ("" if not sell_view else
                     " " + (_SELL_REACH if explorer else _SELL_REACH_NO_EXPLORER))
-                 + ("" if not trim_view else
-                    " " + (_TRIM_REACH if explorer else _TRIM_REACH_NO_EXPLORER))},
+                 # Trim to Kelly alone, or with Min. price rise where the
+                 # page shows the minimums too
+                 + ("" if not trim_view else " " + (
+                     (_TRIM_RISE_REACH if explorer else _TRIM_RISE_REACH_NO_EXPLORER)
+                     if rise_view else
+                     (_TRIM_REACH if explorer else _TRIM_REACH_NO_EXPLORER)))},
         "styles": {"types": {label: {"color": color, "width": _TYPE_LINE_WIDTH,
                                      "dash": _TYPE_LINE_DASH}
                              for label, color in _TRADE_TYPE_LINES},
@@ -12356,10 +12399,11 @@ def _menu_html(menu_id: str, all_label: str, rows: list[str]) -> str:
 
 def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     """
-    Render the sticky filter bar: eight <select>s, two check-box menus, the save button and a summary line.
+    Render the sticky filter bar: nine <select>s, two check-box menus, the save button and a summary line.
 
     Spread band, Tier floors, k, Size cap, Add to held pairs, Trim to Kelly,
-    Sell and Min. days to maturity choose the scenario — each option one of the grid's axes, the run's own marked
+    Min. price rise, Sell and Min. days to maturity choose the scenario —
+    each option one of the grid's axes, the run's own marked
     " (primary)" (a band's option text is the payload's "option", which the
     script swaps for its tier-off one when the Tier floors choice changes) —
     and Category and Tag a slice of it: two check-box dropdowns (_menu_html)
@@ -12380,6 +12424,16 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     (_TRIM_SELECT_TITLE); a payload with no trim view ("grid_trim" null)
     puts a grey note beside it by its "trim_state" (_TRIM_NOTES), and the
     script never enables it.
+    The "Min. price rise" select after it offers "any" (selected: no
+    minimum, the Trim to Kelly run itself; value "0") and every minimum
+    price rise the payload names (trim_rises: "5c", "10c", ...; an option's
+    value is its place in that list plus one), its title carrying the rule
+    (_TRIM_RISE_TITLE). It is on every page, so the script always finds it;
+    the script opens it only while Trim to Kelly is on, on a page whose
+    payload carries the minimums ("grid_trim_rise"). A payload that shows
+    Trim to Kelly without them puts a grey note beside it by its
+    "trim_rise_state" (_TRIM_RISE_NOTES); where Trim to Kelly itself is not
+    shown, that select's own note says why and this one has none.
     The Sell select offers "no selling" (selected) and every sell level the
     payload names (sell_levels), its title carrying the rule
     (_sell_select_title, at backtester.TAKE_PROFIT_HOLD_DAYS as the page's
@@ -12485,6 +12539,19 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                  f"{html.escape(_TRIM_NOTES.get(trim_state, _TRIM_NOTES['not simulated']))}"
                  "</span>")
     trim_title = html.escape(_TRIM_SELECT_TITLE)
+    # The Min. price rise choice: any (no minimum, value "0") or a minimum,
+    # each option's value its place in the payload's trim_rises plus one
+    rise_opts = (f'<option value="0" selected>{html.escape(_TRIM_RISE_OPTION_ANY)}</option>'
+                 + "".join(f'<option value="{i + 1}">{html.escape(entry["label"])}</option>'
+                           for i, entry in enumerate(payload.get("trim_rises") or [])))
+    rise_state = payload.get("trim_rise_state", "not simulated")
+    # Said only where Trim to Kelly itself is shown: a page without it says
+    # why beside that select, which covers this one too
+    rise_why = _TRIM_RISE_NOTES.get(rise_state, _TRIM_RISE_NOTES["not simulated"])
+    rise_note = ("" if trim_state != "shown" or rise_state == "shown" else
+                 '&nbsp;<span id="flt-rise-note" style="color:#9E9E9E; font-size:13px;">'
+                 f"{html.escape(rise_why)}</span>")
+    rise_title = html.escape(_TRIM_RISE_TITLE)
     # The Sell choice: no selling (the page as rendered) or a level, each
     # option's value its index in the payload's sell_levels; a page with no
     # Sell view says why beside the select it keeps shut
@@ -12554,6 +12621,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
         f'title="{add_title}">{add_opts}</select></label>{add_note}&nbsp;&nbsp;'
         f'<label>Trim to Kelly: <select id="flt-trim" disabled autocomplete="off" '
         f'title="{trim_title}">{trim_opts}</select></label>{trim_note}&nbsp;&nbsp;'
+        f'<label>Min. price rise: <select id="flt-rise" disabled autocomplete="off" '
+        f'title="{rise_title}">{rise_opts}</select></label>{rise_note}&nbsp;&nbsp;'
         f'<label>Sell: <select id="flt-sell" disabled autocomplete="off" '
         f'title="{sell_title}">{sell_opts}</select></label>{sell_note}&nbsp;&nbsp;'
         f'<label>Min. days to maturity: <select id="flt-days" disabled autocomplete="off" '
@@ -12733,7 +12802,7 @@ def _pack_text(raw: str) -> str:
 # no part of it, and window.dashScenarioSelect still gets four arguments).
 # The Sell select, appended after it (SHOWN[7]), picks between the grids as
 # they stand and a sell level; the "Min. days to maturity" select after it
-# (SHOWN[8], appended last) picks the fewest days before maturity a sale
+# (SHOWN[8]) picks the fewest days before maturity a sale
 # needs, and is enabled only while Sell names a level (refreshDays). A level's
 # chunk ids are not in the base block: D.sell_blocks[tier][band] names the
 # packed block "dash-sell-<i>" holding that band's ids ([add][k][cap] -> one
@@ -12747,8 +12816,8 @@ def _pack_text(raw: str) -> str:
 # to held pairs, neither select reaches the k-hat figures, the
 # interval-discount section nor the scenario explorer. A Sell block that
 # cannot be inflated puts every select back, as a chunk that cannot be
-# loaded does (putBack). The Trim to Kelly select (SHOWN[9], appended
-# last) picks the same scenario with held pairs sold down to their Kelly
+# loaded does (putBack). The Trim to Kelly select (SHOWN[9]) picks the same
+# scenario with held pairs sold down to their Kelly
 # size: D.grid_trim, D.grid_trim_add with adding to held pairs on, and their
 # tier-floors-off twins (gridAt); it is enabled only when the base block
 # carries D.grid_trim. While it is on, Sell is set to "no selling" and shut
@@ -12756,6 +12825,20 @@ def _pack_text(raw: str) -> str:
 # button stays disabled (saveHref: live trading does not trim); its phrase
 # and the summary line's note are Python's (D.text.trim, D.text.trim_note),
 # and it reaches neither the k-hat figures, the interval-discount section
+# nor the scenario explorer. The "Min. price rise" select after it
+# (SHOWN[10], appended last, so every other index keeps its meaning) picks
+# the least rise in a held pair's price a trim waits for: "0" is any (the
+# Trim to Kelly run itself), and i names D.trim_rises[i - 1]. It counts, and
+# is open, only while Trim to Kelly is on, on a page whose base block
+# carries D.grid_trim_rise (refreshRise, riseAt); shut, it keeps its value,
+# so trimming switched on again shows the minimum it still names. A
+# scenario's chunk at a minimum is that minimum's entry in the scenario's
+# cell of D.grid_trim_rise (or of its adding-on or tier-floors-off twin, as
+# gridAt picks the trim grid: riseGridAt), and where that cell is null — no
+# minimum changes the run — the Trim to Kelly chunk itself (chunkAt). Its
+# phrase is Python's (D.trim_rises[i - 1].phrase, after D.text.trim). Sell
+# stays shut and the save button disabled at any minimum, and like Trim to
+# Kelly it reaches neither the k-hat figures, the interval-discount section
 # nor the scenario explorer. A chunk at or past D.inline_chunks is a
 # sidecar file in D.sidecar_dir, loaded through a <script src> element whose
 # one call to window.__dashChunk hands over its packed text (sidecarText),
@@ -12849,15 +12932,19 @@ _FILTER_JS = r"""
   // "Trim to Kelly": the runs as simulated (off), or with each held pair
   // sold down to its Kelly size at every weekly run (on, D.grid_trim)
   var trimSel = document.getElementById('flt-trim');
-  if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !addSel || !trimSel || !sellSel
-      || !daysSel || !catMenu || !tagMenu || !catAll || !tagAll) {
+  // "Min. price rise": the least rise in a held pair's price a trim waits
+  // for ("0": any; i: D.trim_rises[i - 1]); it counts only while Trim to
+  // Kelly is on
+  var riseSel = document.getElementById('flt-rise');
+  if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !addSel || !trimSel || !riseSel
+      || !sellSel || !daysSel || !catMenu || !tagMenu || !catAll || !tagAll) {
     return;
   }
   // The bar's save button: a button, not a select, so never in SELECTS
   // (whose reset reads .options); optional, since a page without it has
   // nothing to save from
   var saveBtn = document.getElementById('flt-save');
-  var SELECTS = [bandSel, tierSel, kSel, capSel, addSel, trimSel, sellSel, daysSel];
+  var SELECTS = [bandSel, tierSel, kSel, capSel, addSel, trimSel, riseSel, sellSel, daysSel];
   // The k-hat chart's own "Group by" select follows the bar's rules
   var khatGroup = document.getElementById('khat-group');
   if (khatGroup) { SELECTS.push(khatGroup); }
@@ -12869,9 +12956,11 @@ _FILTER_JS = r"""
   // indexes, the ticked categories and the ticked tags (each a sorted list of
   // indexes into D.categories / D.subcats), the Tier floors choice
   // ("on" / "off"), the Add to held pairs choice ("off" / "on"), the Sell
-  // choice ("none", or a level's index) and the Min. days to maturity choice
-  // (an index into D.sell_days) and the Trim to Kelly choice ("off" / "on"),
-  // each appended after the others so the other indexes keep their meaning.
+  // choice ("none", or a level's index), the Min. days to maturity choice
+  // (an index into D.sell_days), the Trim to Kelly choice ("off" / "on") and
+  // the Min. price rise choice ("0" for any, or a minimum's place in
+  // D.trim_rises plus one), each appended after the others so the other
+  // indexes keep their meaning.
   // SELL: every Sell block ("dash-sell-<i>")
   // inflated or inflating, by i — one band's chunk ids under one Tier floors
   // setting at every sell level and minimum of days, inflated the first time
@@ -12959,17 +13048,46 @@ _FILTER_JS = r"""
     if (addOn(a)) { return offAt(t) ? D.grid_add_off : D.grid_add; }
     return offAt(t) ? D.grid_off : D.grid;
   }
+  // The Min. price rise choice m counts only while the Trim to Kelly choice
+  // r is on, on a page whose base block carries the minimums: 0 is "any"
+  // (no minimum), i the i-th entry of D.trim_rises
+  function riseAt(r, m) {
+    if (!trimOn(r) || !D.grid_trim_rise) { return 0; }
+    var i = parseInt(m, 10);
+    return (i > 0 && i <= D.trim_rises.length) ? i : 0;
+  }
+  // The grid of per-minimum chunk ids beside the Trim to Kelly grid gridAt
+  // picks for a Tier floors choice t and an Add to held pairs choice a:
+  // [band][k][cap] -> null (every minimum shows the Trim to Kelly cell) or
+  // one id per entry of D.trim_rises; null when the page holds none
+  function riseGridAt(t, a) {
+    if (addOn(a)) { return offAt(t) ? D.grid_trim_rise_add_off : D.grid_trim_rise_add; }
+    return offAt(t) ? D.grid_trim_rise_off : D.grid_trim_rise;
+  }
   // The chunk id of a scenario: band b, k, cap c, Tier floors choice t, Add
-  // to held pairs choice a, Sell choice s, Min. days choice d and Trim to
-  // Kelly choice r. Three results: an id; null for a scenario the run never
-  // simulated (a whole grid missing included, and any sell level of a
-  // trimming run, which the page never builds); or undefined while a sell
-  // level's band block is not yet inflated (choose() inflates it, then asks
-  // again). In a Sell block, -1 means the setting sells nothing: the
-  // scenario's own chunk.
-  function chunkAt(b, k, c, t, a, s, d, r) {
+  // to held pairs choice a, Sell choice s, Min. days choice d, Trim to Kelly
+  // choice r and Min. price rise choice m. Three results: an id; null for a
+  // scenario the run never simulated (a whole grid missing included, and
+  // any sell level of a trimming run, which the page never builds); or
+  // undefined while a sell level's band block is not yet inflated (choose()
+  // inflates it, then asks again). In a Sell block, -1 means the setting
+  // sells nothing: the scenario's own chunk. With trimming on and a minimum
+  // chosen, the id is that minimum's in the scenario's cell of riseGridAt's
+  // grid (null when the page holds no such grid), or the Trim to Kelly
+  // cell's own where that cell is null.
+  function chunkAt(b, k, c, t, a, s, d, r, m) {
     var g = gridAt(t, a, r), level = sellAt(s);
-    if (level === null) { return g ? g[b][k][c] : null; }
+    if (level === null) {
+      if (!g) { return null; }
+      var ri = riseAt(r, m);
+      if (ri > 0) {
+        var rg = riseGridAt(t, a);
+        if (!rg) { return null; }
+        var ids = rg[b][k][c];
+        if (ids) { return typeof ids[ri - 1] === 'number' ? ids[ri - 1] : null; }
+      }
+      return g[b][k][c];
+    }
     // No base view of the scenario: no sell level of it either
     if (!g || trimOn(r)) { return null; }
     var id = sellBlockId(t, b);
@@ -12985,7 +13103,7 @@ _FILTER_JS = r"""
   }
   function cellChunk() {
     return chunkAt(bandIndex(), kIndex(), capIndex(), tierSel.value, addSel.value,
-                   sellSel.value, daysSel.value, trimSel.value);
+                   sellSel.value, daysSel.value, trimSel.value, riseSel.value);
   }
   // The page as rendered: the primary scenario with the tier floors on and
   // adding to held pairs off
@@ -13017,7 +13135,7 @@ _FILTER_JS = r"""
     // null: never simulated; undefined: a sell level's block not inflated (a
     // scenario on screen has always inflated its own)
     var shownId = chunkAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7],
-                          SHOWN[8], SHOWN[9]);
+                          SHOWN[8], SHOWN[9], SHOWN[10]);
     if (shownId === null || shownId === undefined) { return null; }
     var band = D.bands[SHOWN[0]].value, k = D.ks[SHOWN[1]].value, cap = D.caps[SHOWN[2]].value;
     if (!band || !(k > 0) || !(cap > 0)) { return null; }
@@ -13636,20 +13754,21 @@ _FILTER_JS = r"""
   // A scenario in the summary's words: Python's _scenario_phrase, its band
   // named as the Tier floors choice t reads it (_band_where, _tier_off_where),
   // closed by Python's add-on phrase when the Add to held pairs choice a is
-  // on, by its trim phrase when the Trim to Kelly choice r is on and, when the
-  // Sell choice s names a level, by that level's phrase and the phrase of the
-  // Min. days choice d
-  function scenarioAt(b, k, c, t, a, s, d, r) {
-    var level = sellAt(s);
+  // on, by its trim phrase when the Trim to Kelly choice r is on — followed
+  // by the phrase of the minimum the Min. price rise choice m names, if any —
+  // and, when the Sell choice s names a level, by that level's phrase and the
+  // phrase of the Min. days choice d
+  function scenarioAt(b, k, c, t, a, s, d, r, m) {
+    var level = sellAt(s), ri = riseAt(r, m);
     return fill(D.text.scenario, {where: bandsAt(t)[b].where, k: D.ks[k].text,
                                   cap: D.caps[c].text}) + (addOn(a) ? D.text.add_on : '')
-      + (trimOn(r) ? D.text.trim : '')
+      + (trimOn(r) ? D.text.trim + (ri > 0 ? D.trim_rises[ri - 1].phrase : '') : '')
       + (level !== null ? D.sell_levels[level].phrase
                           + D.sell_days[parseInt(d, 10)].phrase : '');
   }
   function scenario() {
     return scenarioAt(bandIndex(), kIndex(), capIndex(), tierSel.value, addSel.value,
-                      sellSel.value, daysSel.value, trimSel.value);
+                      sellSel.value, daysSel.value, trimSel.value, riseSel.value);
   }
   // The summary line: the templates _filter_summary_text fills for the view
   // Python rendered, filled here for every other one. With categories
@@ -14195,9 +14314,16 @@ _FILTER_JS = r"""
   function refreshDays() {
     daysSel.disabled = !D || !D.sell_blocks || sellAt(sellSel.value) === null;
   }
+  // The Min. price rise select counts only while Trim to Kelly is on: it is
+  // shut while trimming is off, and on a page whose base block carries no
+  // minimum. Shut, it keeps its value.
+  function refreshRise() {
+    riseSel.disabled = !D || !D.grid_trim_rise || !trimOn(trimSel.value);
+  }
   // No sell level is built for a run that trims to Kelly: while Trim to
   // Kelly is on, Sell is set to no level and shut, and it opens again when
-  // trimming goes off. A page without the Sell view keeps Sell shut.
+  // trimming goes off. A page without the Sell view keeps Sell shut. The
+  // Min. days and Min. price rise selects are opened or shut to match.
   function refreshSell() {
     if (D && D.sell_blocks) {
       var trimming = trimOn(trimSel.value);
@@ -14205,6 +14331,7 @@ _FILTER_JS = r"""
       sellSel.disabled = trimming;
     }
     refreshDays();
+    refreshRise();
   }
   // Draw the scenario the selects and the menus' ticks name, from a chunk
   // (null for a scenario the run never simulated), and record it as SHOWN
@@ -14217,7 +14344,7 @@ _FILTER_JS = r"""
     C = chunk;
     refreshMenus();
     SHOWN = [bandIndex(), kIndex(), capIndex(), cats, tags, tierSel.value,
-             addSel.value, sellSel.value, daysSel.value, trimSel.value];
+             addSel.value, sellSel.value, daysSel.value, trimSel.value, riseSel.value];
     render(v, cats, tags);
     refreshSell();
     refreshSave();
@@ -14230,16 +14357,18 @@ _FILTER_JS = r"""
   // ticks too, since ticks made while the chunk was loading were never
   // drawn either — the menus rebuilt for the ticks shown — and the line
   // says what could not be shown, in Python's words; the Tier floors, Add
-  // to held pairs, Trim to Kelly, Sell and Min. days choices go back too,
-  // with the band options named for the first, Sell shut again while
-  // trimming is shown and the Min. days select shut again when Sell names
-  // none
+  // to held pairs, Trim to Kelly, Min. price rise, Sell and Min. days
+  // choices go back too, with the band options named for the first, Sell
+  // shut again while trimming is shown, the Min. price rise select shut
+  // again when it is not, and the Min. days select shut again when Sell
+  // names none
   function putBack(err) {
     var tried = scenario(), ticks = selectionName(catTicks(), tagTicks());
     bandSel.value = String(SHOWN[0]);
     tierSel.value = SHOWN[5];
     addSel.value = SHOWN[6];
     trimSel.value = SHOWN[9];
+    riseSel.value = SHOWN[10];
     sellSel.value = SHOWN[7];
     daysSel.value = SHOWN[8];
     relabelBands();
@@ -14250,7 +14379,7 @@ _FILTER_JS = r"""
     PICK = pickKey();
     refreshSell();
     var still = scenarioAt(SHOWN[0], SHOWN[1], SHOWN[2], SHOWN[5], SHOWN[6], SHOWN[7],
-                           SHOWN[8], SHOWN[9]);
+                           SHOWN[8], SHOWN[9], SHOWN[10]);
     // A mix that could not be shown: the ticks tried and the scenario they
     // were tried at, then what is ticked again now — and at which scenario,
     // when the selects went back to another one too
@@ -14317,7 +14446,7 @@ _FILTER_JS = r"""
     if (saveBtn) { saveBtn.disabled = true; }
     if (D) {
       var p = D.primary;
-      var here = scenarioAt(p[0], p[1], p[2], 'on', 'off', 'none', '0', 'off');
+      var here = scenarioAt(p[0], p[1], p[2], 'on', 'off', 'none', '0', 'off', '0');
       setText('flt-summary', fill(D.text.unavailable,
                                   {failed: here, reason: reason, scenario: here}));
       return;
@@ -14328,7 +14457,8 @@ _FILTER_JS = r"""
   // A browser can restore a <select>'s last choice, or a box's tick, on a
   // reload, or on going back; the page as rendered is the primary scenario's
   // unfiltered view with the tier floors on, adding to held pairs off,
-  // trimming off and no sell level, so the bar is set back to it: every select to its rendered
+  // trimming off, no minimum price rise and no sell level, so the bar is
+  // set back to it: every select to its rendered
   // option, both menus to nothing ticked. Python renders the selects and the
   // menus' boxes disabled: they are enabled once the
   // base block and the primary scenario's chunk are inflated, so no choice
@@ -14365,11 +14495,13 @@ _FILTER_JS = r"""
       C = chunk;
       // Nothing ticked: the two empty lists are SHOWN[3] and SHOWN[4]
       SHOWN = D.primary.concat([[], [], tierSel.value, addSel.value, sellSel.value,
-                                daysSel.value, trimSel.value]);
+                                daysSel.value, trimSel.value, riseSel.value]);
     }
     // A run with no tier-off (or add-on, or trim, or Sell) view keeps that
     // select disabled; the Min. days select opens only while Sell names a
-    // level, and Sell is shut while a trimming scenario is chosen
+    // level, the Min. price rise select only while trimming is on, and Sell
+    // is shut while a trimming scenario is chosen (refreshSell, just below,
+    // shuts what this loop opened)
     SELECTS.forEach(function(s) {
       s.disabled = (s === tierSel && !D.grid_off) || (s === addSel && !D.grid_add)
         || (s === trimSel && !D.grid_trim) || (s === sellSel && !D.sell_blocks);
@@ -14399,8 +14531,15 @@ _FILTER_JS = r"""
   trimSel.addEventListener('change', function() {
     // Nothing to switch to without the trim view (the select stays shut)
     if (!D || !D.grid_trim) { return; }
-    // Sell goes to no level and shuts while trimming is on
+    // Sell goes to no level and shuts while trimming is on, and the Min.
+    // price rise select opens with it
     refreshSell();
+    choose();
+  });
+  riseSel.addEventListener('change', function() {
+    // The minimum counts only while trimming is on, on a page that carries
+    // the minimums (the select is shut otherwise)
+    if (!D || !D.grid_trim_rise || !trimOn(trimSel.value)) { return; }
     choose();
   });
   sellSel.addEventListener('change', function() {
