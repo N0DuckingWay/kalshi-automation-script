@@ -21495,6 +21495,22 @@ class TestTrimMinRise:
                            match=r"trim_min_rise must be (a real number )?in \(0, 1\]"):
             self._sim([{}], trim_min_rise=bad)
 
+    @pytest.mark.parametrize("tiny", [1e-9, 5e-7, 0.00009])
+    def test_a_minimum_under_one_price_step_is_refused(self, tiny):
+        # Under the float slack the rule allows, a flat price would read as a
+        # rise: config.trim_rise_reached(0.0, 1e-9) is true
+        with pytest.raises(ValueError, match=r"trim_min_rise must be at least 0\.0001 dollars"):
+            self._sim([{}], trim_min_rise=tiny)
+
+    def test_the_finest_price_step_is_a_minimum_and_a_flat_price_does_not_pass_it(self):
+        step = config.MIN_ACTIVE_PRICE_DOLLARS
+        point = self._sim(self._records(), trim_min_rise=step)
+        assert point.trim_min_rise == step
+        assert not config.trim_rise_reached(0.0, step)
+        assert not config.trim_rise_reached(-step, step)
+        # So under any minimum a run accepts, no trim follows a fall
+        assert all(rise > 0 for rise in point.trim_rises)
+
     def test_a_numpy_number_and_a_whole_dollar_are_minimums(self):
         records = self._records()
         point = self._sim(records, trim_min_rise=np.float64(0.10))
@@ -22115,6 +22131,10 @@ class TestTrimRiseGrid:
         with pytest.raises(ValueError, match=r"start has no trim rises for size cap\(s\) "
                                              r"\[1\.0\]"):
             next(family.rise_grid(self._BAND, 0.75, start=dict(rises) | {1.0: None}))
+        # A k the family does not hold, though with this start no run would
+        # ever be simulated to find it out
+        with pytest.raises(ValueError, match=r"k 0\.6 is not one of"):
+            next(family.rise_grid(self._BAND, 0.6, start={0.05: (), 0.30: (), 1.0: ()}))
         # A cap the caller does not cover needs no start
         (first, by_cap), *_rest = family.rise_grid(self._BAND, 0.75, caps=(0.30, 1.0),
                                                    start={0.30: (), 1.0: ()})
@@ -22122,7 +22142,7 @@ class TestTrimRiseGrid:
         assert by_cap == {0.30: backtester.SameTrim(None), 1.0: backtester.SameTrim(None)}
 
     @pytest.mark.parametrize("bad", [(0.10, 0.05), (0.05, 0.05), (0.0, 0.05), (0.05, 1.5),
-                                     (True,), (float("nan"),), ("0.05",)])
+                                     (True,), (float("nan"),), ("0.05",), (1e-9, 0.05)])
     def test_a_family_s_minimums_are_ascending_amounts(self, bad):
         with pytest.raises(ValueError, match="min_rises"):
             self._family(self._entries(), bad)
@@ -22433,6 +22453,7 @@ class TestTrimSweep:
                            ((0.05, 0.05), "names a value twice"),
                            (5, "must be a tuple of dollar amounts"),
                            ((0.05, 1.5), r"each of TRIM_MIN_PRICE_RISES must be in \(0, 1\]"),
+                           ((1e-9, 0.05), "each of TRIM_MIN_PRICE_RISES must be at least"),
                            ((True,), "each of TRIM_MIN_PRICE_RISES must be a real number")):
             with monkeypatch.context() as mp:
                 mp.setattr(backtester, "TRIM_MIN_PRICE_RISES", bad)

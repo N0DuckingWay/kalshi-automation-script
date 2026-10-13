@@ -182,8 +182,9 @@ Notes:
     — is at least that many dollars above where it stood at the checkpoint
     of the last trade on the pair: its latest purchase or add-on, or a later
     trim (_price_rise, through config.pair_price_rise and
-    config.trim_rise_reached). A fall never counts, and buying is not
-    affected.
+    config.trim_rise_reached). A fall never counts. The rules for buying
+    are the same with it; what a run goes on to buy can still differ, since
+    a trim it did not make leaves it less cash and a larger holding.
 
     The work is split at two boundaries. _prepare_candidates() is the half
     that depends on neither the backtest's time-series spread band nor the
@@ -393,6 +394,7 @@ from .config import (
     INTERVAL_DISCOUNT_SWEEP,
     LARGE_GROUP_WARN_THRESHOLD,
     MAX_DEADLINE_GAP_DAYS,
+    MIN_ACTIVE_PRICE_DOLLARS,
     PRICE_EPSILON,
     SAME_TITLE_CO_RESOLVE_PROB,
     SAME_TITLE_MIN_PRICE_DIFF,
@@ -3291,17 +3293,18 @@ class TrimSweep:
 
     def __post_init__(self) -> None:
         """
-        Refuse minimum price rises that are not ascending amounts in (0, 1].
+        Refuse minimum price rises that are not ascending amounts from the finest price step to 1.
 
         rise_grid reads the minimums in the order they are held and lets a
         run stand for the minimums after it, which is exact only when each
         is larger than the one before.
 
         Raises:
-            ValueError: If a value of min_rises is not a real number in
-                (0, 1], or the values are not strictly ascending.
+            ValueError: If a value of min_rises is not a real number from
+                the finest price step to 1 (_checked_min_rise), or the
+                values are not strictly ascending.
         """
-        checked = [_validated_cap(rise, "each of TrimSweep's min_rises")
+        checked = [_checked_min_rise(rise, "each of TrimSweep's min_rises")
                    for rise in self.min_rises]
         # Ascending with none repeated is the sorted list of its distinct values
         if checked != sorted(set(checked)):
@@ -3417,7 +3420,11 @@ class TrimSweep:
             start (Mapping[float, tuple[float, ...]] | None): Keyword-only.
                 For each cap covered, the trim_rises of this cell's Trim to
                 Kelly run with no minimum, for a caller that has already
-                read that run. None (default) simulates it here.
+                read that run. They must be that very run's — the same
+                band, k, Tier floors setting, add-on setting and cap — since
+                every SameTrim is decided from them and nothing here can
+                check where they came from. None (default) simulates the
+                run here.
             stats (dict | None): Keyword-only. When given, its "simulated"
                 and "reused" counts are raised by the cap points this call
                 simulated and shared across caps (CapSweep's counters, the
@@ -3433,10 +3440,12 @@ class TrimSweep:
                 without minimums.
 
         Raises:
-            ValueError: On the first step: as sweep(); for a `start` that
-                lacks a cap covered or holds None for one (the rises of a
-                run that does not trim); and from CapSweep, for a cell with
-                no end day.
+            ValueError: On the first step: as sweep(); for a k the family
+                does not hold; and for a `start` that lacks a cap covered or
+                holds None for one (the rises of a run that does not trim).
+                From CapSweep, for a cell with no end day, at the first
+                simulation the cell needs: the first step without `start`,
+                a later one (or none) with it.
             KeyError: On the first step, for a band the setting does not hold.
         """
         # Checked as sweep() checks them, here because with `start` given no
@@ -3445,6 +3454,10 @@ class TrimSweep:
         chosen = setting.caps
         if band not in setting.entries_by_band:
             raise KeyError(band)
+        if k not in setting.ks:
+            # With `start` given a cell may need no simulation at all, so a k
+            # the family does not hold is refused here rather than never
+            raise ValueError(f"k {k!r} is not one of {setting.ks}")
         if stats is not None:
             for key in ("simulated", "reused", "same"):
                 stats.setdefault(key, 0)
@@ -4155,8 +4168,7 @@ def _resolve_trim_min_rises() -> tuple[float, ...]:
     family's minimum price rises are on, so a bad value is refused in
     milliseconds rather than after the fetch, and _sweep_from_candidates
     calls it again to build the TrimSweep's min_rises. Each value is checked
-    as one simulation's minimum is (_resolve_trim_min_rise's rule,
-    _validated_cap). A value named twice is refused: a report finds each
+    as one simulation's minimum is (_checked_min_rise). A value named twice is refused: a report finds each
     minimum's place among the options by its value.
 
     Returns:
@@ -4164,8 +4176,8 @@ def _resolve_trim_min_rises() -> tuple[float, ...]:
 
     Raises:
         ValueError: If TRIM_MIN_PRICE_RISES is not a collection, is empty,
-            holds a value that is not a real number in (0, 1] (a bool or NaN
-            included), or names one value twice.
+            holds a value that is not a real number from the finest price
+            step to 1 (a bool or NaN included), or names one value twice.
     """
     try:
         rises = tuple(TRIM_MIN_PRICE_RISES)
@@ -4174,7 +4186,7 @@ def _resolve_trim_min_rises() -> tuple[float, ...]:
                          f"got {TRIM_MIN_PRICE_RISES!r}") from None
     if not rises:
         raise ValueError("TRIM_MIN_PRICE_RISES must name at least one minimum price rise")
-    checked = [_validated_cap(rise, "each of TRIM_MIN_PRICE_RISES") for rise in rises]
+    checked = [_checked_min_rise(rise, "each of TRIM_MIN_PRICE_RISES") for rise in rises]
     if len(set(checked)) != len(checked):
         raise ValueError(f"TRIM_MIN_PRICE_RISES names a value twice: {rises!r}")
     return tuple(sorted(checked))
@@ -4807,7 +4819,7 @@ def _pair_price(trade: BacktestTrade, day: date) -> float:
 
     Raises:
         ValueError: From LegQuotes.at_checkpoint, for a day off the legs'
-            checkpoint grid.
+            checkpoint grid, or before a leg's quotes begin.
     """
     return _leg_mark(trade, 0, day) + _leg_mark(trade, 1, day)
 
@@ -4840,7 +4852,10 @@ def _price_rise(position: list[BacktestTrade], day: date,
 
     Raises:
         ValueError: From LegQuotes.at_checkpoint, for a day off the legs'
-            checkpoint grid.
+            checkpoint grid, or when a leg's quotes begin after the day the
+            pair was last traded on. Quotes the backtest builds
+            (_attach_leg_quotes) begin on or before every entry day, since an
+            entry needs a candle there; only hand-built quotes can begin later.
     """
     latest = position[-1]
     if latest.marks is None or not _exact_pair(position):
@@ -4864,8 +4879,9 @@ def _resolve_trim_min_rise(min_rise: float | None, trim_to_kelly: Any) -> float 
     refused there.
 
     Args:
-        min_rise (float | None): A number of dollars in (0, 1] (0.10 is ten
-            cents), or None for no minimum.
+        min_rise (float | None): A number of dollars from the finest price
+            step (MIN_ACTIVE_PRICE_DOLLARS) to 1 (0.10 is ten cents), or None
+            for no minimum.
         trim_to_kelly (Any): The run's Kelly-trim switch; any true value
             means it trims.
 
@@ -4874,14 +4890,41 @@ def _resolve_trim_min_rise(min_rise: float | None, trim_to_kelly: Any) -> float 
 
     Raises:
         ValueError: If min_rise is set while trim_to_kelly is off, or is a
-            bool, not a real number, NaN or outside (0, 1].
+            bool, not a real number, NaN, below the finest price step or
+            above 1.
     """
     if min_rise is None:
         return None
     if not trim_to_kelly:
         raise ValueError("trim_min_rise needs trim_to_kelly: a run that never trims "
                          "has no trim to hold back")
-    return _validated_cap(min_rise, "trim_min_rise")
+    return _checked_min_rise(min_rise, "trim_min_rise")
+
+
+def _checked_min_rise(value: Any, name: str) -> float:
+    """
+    Check one minimum price rise: a dollar amount from the finest price step to 1.
+
+    A rise smaller than one price step is no price move, and a minimum
+    that small would sit inside the float slack config.trim_rise_reached
+    allows, where a flat price would pass as a rise.
+
+    Args:
+        value (Any): The minimum, in dollars.
+        name (str): What the value is called in the error message.
+
+    Returns:
+        float: The minimum as a builtin float.
+
+    Raises:
+        ValueError: If value is a bool, not a real number, NaN, below
+            MIN_ACTIVE_PRICE_DOLLARS or above 1.
+    """
+    checked = _validated_cap(value, name)
+    if checked < MIN_ACTIVE_PRICE_DOLLARS:
+        raise ValueError(f"{name} must be at least {MIN_ACTIVE_PRICE_DOLLARS!r} dollars "
+                         f"(the finest price step), got {value!r}")
+    return checked
 
 
 def _trim_rise_label(min_rise: float) -> str:
