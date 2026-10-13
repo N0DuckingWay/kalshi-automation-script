@@ -110,6 +110,17 @@ Purpose:
     is not simulated together with trimming) and the save button is disabled
     (live trading does not trim).
 
+    When that family carries minimum price rises
+    (backtester.TrimSweep.min_rises: trim a held pair only once its total
+    price has risen that far since the last trade on it), the walk's last
+    phase reads every Trim to Kelly scenario at each of them
+    (_walk_trim_rise_cells, through TrimSweep.rise_grid, which simulates
+    only the runs that differ). A run of its own is packed as a chunk; a run
+    that repeats another stores that run's chunk id. The base block carries
+    the minimums ("trim_rises") and, per scenario, each minimum's chunk id
+    ("grid_trim_rise" and its tier-floors-off and adding-on twins), where a
+    null cell means every minimum shows the Trim to Kelly cell itself.
+
     The bar's Sell choice is "no selling" (the page as rendered) or one of the
     sell family's levels (backtester.SellSweep; config.TAKE_PROFIT_LEVELS,
     every 1% from 80% to 100%), and the "Min. days to maturity" select
@@ -215,11 +226,14 @@ Dependencies:
     _LIVE_RULE_NONE (the live-rule line's pieces, shared with the run's log
     line, which names the saved live defaults) — and reads
     BacktestSweep.cap_sweep, tier_off_cap_sweep, add_on_cap_sweep and
-    add_on_tier_off_cap_sweep (each a backtester.CapSweep) and sell_sweep (a
-    backtester.SellSweep) by their attributes; imports backtester itself to
+    add_on_tier_off_cap_sweep (each a backtester.CapSweep), sell_sweep (a
+    backtester.SellSweep) and trim_sweep (a backtester.TrimSweep, whose
+    rise_grid hands back a backtester.SameTrim for a minimum price rise that
+    repeats another run) by their attributes; imports backtester itself to
     read, and in a worker process install, its SAME_TITLE_SIZE_CAP,
     SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS (_run_sell_task; the last also
-    names the Sell select's rule, _sell_select_title) — and
+    names the Sell select's rule, _sell_select_title), and to word a minimum
+    price rise as a run's label does (_trim_rise_label) — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
     page's file name, which defaults_server opens when run on its own and
     live_dashboard serves as its Backtest tab), DASHBOARD_FILES_DIRNAME
@@ -540,6 +554,7 @@ from .backtester import (
     IntervalCalibration,
     OutcomeLabelCoverage,
     SameSale,
+    SameTrim,
     SweepPoint,
     _band_label,
     _build_equity_curve,
@@ -6274,6 +6289,44 @@ _TRIM_REACH = ("Trim to Kelly changes the trade sections only; the k̂ figures d
 _TRIM_REACH_NO_EXPLORER = ("Trim to Kelly changes the trade sections only; the k̂ figures do "
                            "not depend on it, and the Interval Discount section always "
                            "shows it off.")
+
+
+def _trim_rise_option(rise: float) -> str:
+    """
+    Name a minimum price rise in a few characters, in cents.
+
+    The base block ships it as each minimum's "label" (_filter_payload's
+    "trim_rises").
+
+    Args:
+        rise (float): The minimum, in dollars, in (0, 1].
+
+    Returns:
+        str: "<cents>c", e.g. "5c" for 0.05 (backtester._cap_percent prints
+            every digit that tells two values apart, so no two minimums read
+            alike).
+    """
+    return f"{_cap_percent(rise)}c"
+
+
+def _trim_rise_phrase(rise: float) -> str:
+    """
+    Name a minimum price rise as it follows the Trim to Kelly phrase in a scenario's summary.
+
+    The words are the backtester's own (backtester._trim_rise_label), so the
+    page names a run as that run's log line does. The base block ships it as
+    each minimum's "phrase".
+
+    Args:
+        rise (float): The minimum, in dollars, in (0, 1].
+
+    Returns:
+        str: " only after a <cents>c price rise", e.g. " only after a 5c
+            price rise" for 0.05.
+    """
+    return _backtester._trim_rise_label(rise)
+
+
 # Beside the save button on a page with the Sell view whose saved live defaults sell
 _SELL_SAVE_NOTE = ('The live defaults sell; saving with Sell set to "no selling" turns live '
                    "selling off.")
@@ -6897,6 +6950,27 @@ class _GridSource:
         trim_sweeps: (add, tier floors off) -> the CapSweep behind those
             cells, read only for its simulated / reused counters in the
             walk's log; empty without the view.
+        trim_rises (tuple[float, ...]): The minimum price rises the Trim to
+            Kelly family covers (backtester.TrimSweep.min_rises), in
+            dollars, ascending: with one, a held pair is trimmed only once
+            its total price has risen that far since the last trade on it.
+            Empty when the family carries none, or the page has no Trim to
+            Kelly view.
+        trim_rise_cell: Callable (band, k, add, tier floors off, start) ->
+            an iterator of (minimum price rise, {cap: SweepPoint | SameTrim}),
+            one per minimum of trim_rises, ascending
+            (backtester.TrimSweep.rise_grid over the grid's caps). `start`
+            is {cap: the trim_rises of that cell's Trim to Kelly point}, so
+            the run with no minimum is not simulated again. A SweepPoint is
+            the "all" point of a run simulated at that minimum; a
+            SameTrim(None) says the cap's run is its Trim to Kelly run, and
+            a SameTrim(m) that it is the point yielded earlier at minimum m.
+            The runs are simulated as the iterator is read, so it may raise.
+            None without trim_rises.
+        trim_rise_stats (dict): (add, tier floors off) -> the "simulated",
+            "reused" and "same" counts trim_rise_cell's reads have added up
+            for that setting, read only for the walk's log; empty until a
+            cell is read.
     """
     bands: tuple
     ks: tuple
@@ -6924,6 +6998,9 @@ class _GridSource:
     trim_off_cell: Callable[[tuple[float, float] | None, float | None, bool],
                             dict] | None = None
     trim_sweeps: dict = field(default_factory=dict)
+    trim_rises: tuple[float, ...] = ()
+    trim_rise_cell: Callable | None = None
+    trim_rise_stats: dict = field(default_factory=dict)
 
 
 def _primary_calibration(sweep: BacktestSweep | None) -> IntervalCalibration | None:
@@ -7279,6 +7356,13 @@ def _with_trim(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSour
     one WARNING, and the page offers that choice off only; a tier-floors-off
     half that does not fit, or cannot be read, costs that half alone.
 
+    A family that carries minimum price rises (its min_rises) also gives the
+    grid trim_rises and trim_rise_cell, the reader of one cell at every
+    minimum (the family's rise_grid over the grid's caps), whose counts add
+    up in trim_rise_stats for the walk's log. A family without them, or a
+    stand-in with no such attribute, gets no reader: trim_rises stays empty
+    and trim_rise_cell None.
+
     The grid's off_fallback is re-wrapped to keep the family, as _with_add_on
     keeps its own.
 
@@ -7290,7 +7374,8 @@ def _with_trim(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSour
     Returns:
         _GridSource: The source itself when there is no family, no band or
             no fit; else a copy carrying trim_cell (and trim_off_cell), their
-            sweeps and the events the family's trades can carry.
+            sweeps, the events the family's trades can carry and, when the
+            family covers minimum price rises, those and their reader.
     """
     trim = getattr(sweep, "trim_sweep", None) if sweep is not None else None
     if trim is None or source.bands == (None,):
@@ -7307,6 +7392,9 @@ def _with_trim(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSour
             found = frozenset(trim.entry_events())
             for add in (False, True):
                 sweeps[(add, False)] = trim.sweep(tier_floors=True, add_to_held=add)
+            # The minimum price rises the family covers: none on a family
+            # built without them, or on a stand-in with no such attribute
+            rises = tuple(getattr(trim, "min_rises", ()) or ())
     except Exception:
         logging.warning("The Trim to Kelly simulations could not be read; the filter "
                         "bar's Trim to Kelly select stays disabled", exc_info=True)
@@ -7369,8 +7457,35 @@ def _with_trim(source: "_GridSource", sweep: BacktestSweep | None) -> "_GridSour
         """
         return sweeps[(add, False)].cell(band, k)
 
+    # Per (adding to held pairs, tier floors off): what reading that setting's
+    # minimum price rises has cost so far, for the walk's progress line
+    rise_stats: dict = {}
+
+    def trim_rise_cell(band, k, add, off, start):
+        """
+        One (band, k)'s trimming runs at every minimum price rise, at every cap.
+
+        Args:
+            band: The cell's band.
+            k: The cell's k.
+            add: Whether the runs also add to held pairs.
+            off: Whether the tier floors are off (a band the tiers bind at).
+            start: {cap: the trim_rises of the cell's Trim to Kelly point},
+                which the walk has already read.
+
+        Returns:
+            Iterator: (minimum, {cap: SweepPoint | SameTrim}) per minimum,
+                ascending (backtester.TrimSweep.rise_grid). A run is
+                simulated when its step is read, so reading it may raise.
+        """
+        return trim.rise_grid(band, k, tier_floors=not off, add_to_held=add,
+                              caps=source.caps, start=start,
+                              stats=rise_stats.setdefault((add, off), {}))
+
     fields = {"trim_cell": trim_cell, "trim_off_cell": trim_off_cell, "trim_sweeps": sweeps,
-              "events": source.events | found}
+              "events": source.events | found, "trim_rises": rises,
+              "trim_rise_cell": trim_rise_cell if rises else None,
+              "trim_rise_stats": rise_stats}
     attached = dataclasses.replace(source, **fields)
     if source.off_fallback is None:
         return attached
@@ -8077,7 +8192,8 @@ def _walk_add_cells(source: _GridSource, add_takers: list,
 
 
 def _walk_trim_cells(source: _GridSource, trim_takers: list,
-                     axis_end: pd.Timestamp | None) -> Exception | None:
+                     axis_end: pd.Timestamp | None,
+                     starts: dict | None = None) -> Exception | None:
     """
     Hand every Trim to Kelly scenario of a grid to the visitors that take it.
 
@@ -8094,10 +8210,21 @@ def _walk_trim_cells(source: _GridSource, trim_takers: list,
     {population: point}, add=..., off=...), one cell alive at a time, the
     primary cap first.
 
+    With `starts`, each cell also leaves behind what its minimum price rises
+    start from: per cap, how far the pair's price had risen before each trim
+    that cap's run made (SweepPoint.trim_rises). _walk_trim_rise_cells reads
+    the cells back in this order, and hands each cell's entry to
+    TrimSweep.rise_grid so the run with no minimum is not simulated twice.
+
     Args:
         source (_GridSource): The grid (its trim_cell is not None).
         trim_takers (list): The visitors with a `trim` method.
         axis_end (pd.Timestamp | None): The page's last date.
+        starts (dict | None): Filled, when given, with (add, tier floors
+            off, band index, k index) -> {cap: the trim_rises of that cap's
+            "all" point} for every cell read, in the order read (a cap
+            without an "all" point is left out). None (default) records
+            nothing.
 
     Returns:
         Exception | None: The exception a cell raised, which stops this
@@ -8125,6 +8252,11 @@ def _walk_trim_cells(source: _GridSource, trim_takers: list,
             except Exception as exc:
                 return exc
             by_cap = _cut_to_axis(by_cap, axis_end)
+            if starts is not None:
+                # The rises behind each cap's trims: where its minimums start
+                starts[(add, off, bi, ki)] = {
+                    cap: pops[_ALL_VIEW].trim_rises for cap, pops in by_cap.items()
+                    if pops.get(_ALL_VIEW) is not None}
             for ci in caps:
                 pops = by_cap.get(source.caps[ci])
                 if pops:
@@ -8142,10 +8274,87 @@ def _walk_trim_cells(source: _GridSource, trim_takers: list,
     return None
 
 
+def _walk_trim_rise_cells(source: _GridSource, rise_takers: list,
+                          axis_end: pd.Timestamp | None, starts: dict) -> Exception | None:
+    """
+    Hand every minimum price rise of every Trim to Kelly scenario to the visitors that take it.
+
+    The cells are the ones the Trim to Kelly walk read (the keys of
+    `starts`), in the same order: each (adding to held pairs, tier floors
+    off) setting in turn, one (band, k) at a time. A cell is read one
+    minimum at a time (source.trim_rise_cell — the family simulates the runs
+    that differ as each step is read), ascending. At each minimum every
+    simulated point's curve is cut to the page's axis (_cut_to_axis) and
+    every cap's entry — the cut point, or the SameTrim naming the run that
+    cap repeats — is handed to each visitor's trim_rise(band index, k index,
+    cap index, minimum index, entry, add=..., off=...), the primary cap
+    first. Only one minimum's points are alive at a time. A cell in which
+    the Trim to Kelly walk found no point has no minimum to read and is
+    passed over.
+
+    Args:
+        source (_GridSource): The grid (its trim_rise_cell is not None).
+        rise_takers (list): The visitors with a `trim_rise` method.
+        axis_end (pd.Timestamp | None): The page's last date.
+        starts (dict): (add, tier floors off, band index, k index) -> {cap:
+            the trim_rises of that cell's Trim to Kelly point}, as
+            _walk_trim_cells recorded it.
+
+    Returns:
+        Exception | None: The exception reading a cell raised, which stops
+            this phase — a run that could not be simulated, a `start` the
+            family refuses (a cap with no point, or a point that records no
+            rises), or a minimum the grid does not name; None when every
+            cell was visited.
+    """
+    pc = source.primary[2]
+    caps = [pc] + [ci for ci in range(len(source.caps)) if ci != pc]
+    places = {rise: ri for ri, rise in enumerate(source.trim_rises)}
+    # Each setting's cells, in the order the Trim to Kelly walk read them
+    settings: dict[tuple[bool, bool], list] = {}
+    for (add, off, bi, ki), start in starts.items():
+        settings.setdefault((add, off), []).append((bi, ki, start))
+    for (add, off), cells in settings.items():
+        step = max(1, math.ceil(len(cells) / _WALK_PROGRESS_LINES))
+        for done, (bi, ki, start) in enumerate(cells, 1):
+            try:
+                steps = (source.trim_rise_cell(source.bands[bi], source.ks[ki], add, off, start)
+                         if start else ())
+                for rise, by_cap in steps:
+                    ri = places[rise]
+                    # A SameTrim holds no curve: only the simulated points are cut
+                    cut = _cut_to_axis({cap: {_ALL_VIEW: entry} for cap, entry in by_cap.items()
+                                        if not isinstance(entry, SameTrim)}, axis_end)
+                    entries = {cap: cut[cap][_ALL_VIEW] if cap in cut else entry
+                               for cap, entry in by_cap.items()}
+                    del by_cap, cut
+                    for ci in caps:
+                        if source.caps[ci] in entries:
+                            for visit in rise_takers:
+                                visit.trim_rise(bi, ki, ci, ri, entries[source.caps[ci]],
+                                                add=add, off=off)
+                    # One minimum's points at a time: gone before the next is simulated
+                    del entries
+            except Exception as exc:
+                return exc
+            if done % step == 0 or done == len(cells):
+                counts = source.trim_rise_stats.get((add, off), {})
+                logging.info("Dashboard: %d/%d %s read from the Trim to Kelly minimum price "
+                             "rises%s%s (%d cap points simulated, %d shared across caps, %d "
+                             "the same run as a lower minimum so far)",
+                             done, len(cells),
+                             "binding band x k cells" if off else "band x k cells",
+                             " with the tier floors off" if off else "",
+                             ", adding to held pairs" if add else "",
+                             counts.get("simulated", 0), counts.get("reused", 0),
+                             counts.get("same", 0))
+    return None
+
+
 def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | None
                ) -> tuple[Exception | None, _GridSource]:
     """
-    Hand every scenario of a grid to each visitor: tier-on, tier-off, add-on, trim, same-title.
+    Hand every scenario of a grid to each visitor: tier-on, tier-off, add-on, trim, price rises, same-title.
 
     First the tier-on cells (_walk_cells: the primary cell and cap first, so
     the primary scenario's chunk is always chunk 0, one cell alive at a
@@ -8175,7 +8384,16 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
     walked the same way for the visitors with a `trim` method
     (_walk_trim_cells), after the add-on cells, so dropping either family's
     chunks never cuts into the other's; a cell that raises costs that choice
-    alone (`reset_trim(grid)`). Last, when some visitor shows it (one with a
+    alone (`reset_trim(grid)`), the minimum price rises with it. Then, when
+    the family carries minimum price rises (source.trim_rise_cell) and its
+    cells were walked, every one of those cells is read again at each
+    minimum for the visitors with a `trim_rise` method
+    (_walk_trim_rise_cells). These are the last cells to pack a chunk, so
+    dropping what they packed cuts into nothing else: a cell that raises
+    there costs the minimum price rises alone — ONE WARNING (with the
+    traceback), the grid returned without them, and `reset_trim_rise(grid)`
+    on each taker — while the Trim to Kelly view keeps its chunks and grids.
+    Last, when some visitor shows it (one with a
     same_title method), the band- and k-independent same-title population is
     read once
     (_same_title_points: source.same_title — a size-cap sweep simulates it
@@ -8196,7 +8414,11 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             pairs cells, with a reset_add(grid) method dropping what add()
             built, and a trim(band index, k index, cap index, {population:
             SweepPoint}, add=bool, off=bool) method taking the Trim to Kelly
-            cells, with a reset_trim(grid) method dropping what trim() built.
+            cells, with a reset_trim(grid) method dropping what trim() built
+            — and, beside trim, a trim_rise(band index, k index, cap index,
+            minimum index, SweepPoint | SameTrim, add=bool, off=bool) method
+            taking each minimum price rise of those cells, with a
+            reset_trim_rise(grid) method dropping what trim_rise() built.
         axis_end (pd.Timestamp | None): The page's last date.
 
     Returns:
@@ -8204,8 +8426,9 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
             an off cell with no fallback to recover it) raised, which stops
             the walk, else None; and the grid walked — the source, its
             off_fallback when the tier-off size-cap sweep could not be read,
-            and without the Add to held pairs family, or the Trim to Kelly
-            family, when it could not be simulated.
+            and without the Add to held pairs family, the Trim to Kelly
+            family, or that family's minimum price rises, when it could not
+            be simulated.
     """
     error = _walk_cells(source, visitors, axis_end)
     if error is not None:
@@ -8244,18 +8467,39 @@ def _walk_once(source: _GridSource, visitors: list, axis_end: pd.Timestamp | Non
     # not simulated for it
     trim_takers = [visit for visit in visitors
                    if hasattr(visit, "trim") and not getattr(visit, "failed", False)]
+    # What each Trim to Kelly cell's minimum price rises start from, filled as
+    # those cells are walked; None on a grid that carries no minimum
+    starts: dict | None = {} if source.trim_rise_cell is not None else None
     if source.trim_cell is not None and trim_takers:
-        error = _walk_trim_cells(source, trim_takers, axis_end)
+        error = _walk_trim_cells(source, trim_takers, axis_end, starts)
         if error is not None:
-            # Costs the Trim to Kelly view alone, as an add-on failure costs its own
+            # Costs the Trim to Kelly view alone, as an add-on failure costs its
+            # own; the minimum price rises are part of that view and go with it
             logging.warning("A Trim to Kelly simulation failed; the filter bar's Trim to "
                             "Kelly select stays disabled", exc_info=error)
             source = dataclasses.replace(source, trim_cell=None, trim_off_cell=None,
-                                         trim_sweeps={})
+                                         trim_sweeps={}, trim_rises=(), trim_rise_cell=None,
+                                         trim_rise_stats={})
             for visit in trim_takers:
                 reset_trim = getattr(visit, "reset_trim", None)
                 if reset_trim is not None:
                     reset_trim(source)
+    # The last cells to pack a chunk, so dropping them cuts into nothing else.
+    # A visitor that failed while it took the Trim to Kelly cells takes none
+    rise_takers = [visit for visit in trim_takers
+                   if hasattr(visit, "trim_rise") and not getattr(visit, "failed", False)]
+    if source.trim_cell is not None and source.trim_rise_cell is not None and rise_takers:
+        error = _walk_trim_rise_cells(source, rise_takers, axis_end, starts)
+        if error is not None:
+            # Costs the Min. price rise view alone: Trim to Kelly keeps what it built
+            logging.warning("A Trim to Kelly price-rise simulation failed; the filter bar's "
+                            "Min. price rise select stays disabled", exc_info=error)
+            source = dataclasses.replace(source, trim_rises=(), trim_rise_cell=None,
+                                         trim_rise_stats={})
+            for visit in rise_takers:
+                reset_trim_rise = getattr(visit, "reset_trim_rise", None)
+                if reset_trim_rise is not None:
+                    reset_trim_rise(source)
     takers = [visit for visit in visitors if hasattr(visit, "same_title")]
     if takers:
         # Never raises: a failure falls back to the run's own point
@@ -8283,7 +8527,12 @@ def _walk_grid(source: _GridSource, visitors: list,
     cells are lookups.
     A tier-floors-off size-cap cell that raises costs less: only the off
     view's other caps, recovered inside the walk (_walk_once, off_fallback),
-    with the tier-on cap axis kept. (The size-cap sweep's same-title
+    with the tier-on cap axis kept. One walk reads, in order, the tier-on
+    cells, the tier-floors-off ones, the Add to held pairs ones, the Trim to
+    Kelly ones, each Trim to Kelly cell's minimum price rises, and the
+    same-title population (_walk_once); an add-on, Trim to Kelly or
+    price-rise cell that raises costs its own view alone, inside the walk.
+    (The size-cap sweep's same-title
     population costs less still: only the same-title rows at the other caps
     — _same_title_points.) The fallback grid carries the same
     tier-floors-off family, at the run's own cap (_grid_source attaches it
@@ -9147,6 +9396,17 @@ class _ChunkVisitor:
     the add-on ones, and reset_trim() drops what the trim cells packed,
     leaving everything else as it was.
 
+    Each minimum price rise of a Trim to Kelly cell the walk hands to
+    `trim_rise` is filed in grids_trim_rise, one chunk id per minimum: a run
+    simulated at that minimum is packed the same way (sharing a chunk with
+    any equal list at an equal k), and a run that repeats another
+    (backtester.SameTrim) stores that run's id with nothing packed.
+    trim_rise_grid() and trim_rise_off_grid() read those grids for the page,
+    a cell null where every minimum shows the Trim to Kelly cell's own
+    chunk. These cells are the last the walk packs, so reset_trim_rise()
+    drops what they packed and leaves everything else, the Trim to Kelly
+    grids included, as it was.
+
     A failure while building a chunk is caught here: one WARNING, and the
     visitor marks itself failed and drops what it built — the page is then
     written without the bar, as when the filter's data cannot be built.
@@ -9171,6 +9431,10 @@ class _ChunkVisitor:
             [band][k][cap] -> chunk id or None, for the Trim to Kelly cells;
             empty when the grid has no trim view, and without the tier-off
             keys when it has no tier-off half.
+        grids_trim_rise (dict): The same keys -> [band][k][cap] -> None
+            until the cell's minimum price rises are read, then one chunk id
+            per minimum of source.trim_rises (None for one not read); empty
+            when the grid carries no minimum.
         primary_views (dict | None): The primary chunk's view key -> {"n"},
             for the bar's option counts.
         risk_free (RiskFreeRates | None): The rates every view's Sharpe and
@@ -9251,6 +9515,13 @@ class _ChunkVisitor:
                           for _ in source.bands]
              for add in (False, True) for off in (False, True)
              if not off or source.trim_off_cell is not None})
+        # Each Trim to Kelly cell's chunk id at every minimum price rise, under
+        # the same keys: a cell stays None until its minimums are read. Empty
+        # on a grid that carries no minimum
+        self.grids_trim_rise: dict[tuple[bool, bool], list] = (
+            {} if source.trim_rise_cell is None else
+            {key: [[[None] * len(source.caps) for _ in source.ks] for _ in source.bands]
+             for key in self.grids_trim})
         self.primary_views: dict | None = None
         self.failed = False
         # (phase, band, k) of the cell whose list keys are memoised: a cell's
@@ -9258,7 +9529,10 @@ class _ChunkVisitor:
         # computed once. The phase ("on", "off", "add" or "add_off") is part
         # of it: another phase's lists are new objects, whose ids may reuse
         # those of the cell walked last. The Trim to Kelly cells' phases are
-        # "trim", "trim_off", "trim_add" and "trim_add_off"
+        # "trim", "trim_off", "trim_add" and "trim_add_off", and each minimum
+        # price rise of such a cell has a phase of its own ("trim_rise<i>"
+        # before the same endings), since one minimum's lists are gone before
+        # the next minimum's are made
         self._cell: tuple[str, int, int] | None = None
         self._keys: dict[tuple[int, float | None], str] = {}
         # (chunks, row heads) held when the first off cell was packed, so
@@ -9268,6 +9542,8 @@ class _ChunkVisitor:
         self._add_mark: tuple[int, int] | None = None
         # ... and for the first Trim to Kelly cell, for reset_trim
         self._trim_mark: tuple[int, int] | None = None
+        # ... and for the first minimum price rise packed, for reset_trim_rise
+        self._trim_rise_mark: tuple[int, int] | None = None
         # One item per packed list whose tags the page cannot combine into a
         # mix (_list_payload's mix_gaps): generate_dashboard says so once
         self.mix_gaps: list = []
@@ -9309,10 +9585,11 @@ class _ChunkVisitor:
             listed (list): The trade list.
             phase (str): Keyword-only. Which kind of cell it is: "on" (a
                 tier-on cell), "off" (tier floors off), "add" (adding to
-                held pairs), "add_off" (both), or one of the four Trim to
-                Kelly kinds ("trim", "trim_off", "trim_add", "trim_add_off");
-                each is a separate memo from the others' cell of the same
-                band and k. "on" (default).
+                held pairs), "add_off" (both), one of the four Trim to
+                Kelly kinds ("trim", "trim_off", "trim_add", "trim_add_off"),
+                or one of those at one minimum price rise ("trim_rise<i>"
+                with the same endings); each is a separate memo from the
+                others' cell of the same band and k. "on" (default).
 
         Returns:
             str: _list_key(k, listed).
@@ -9524,21 +9801,26 @@ class _ChunkVisitor:
 
         Every chunk and row head packed since the first Trim to Kelly cell is
         dropped (with its dedup key); those cells are walked after every
-        other kind, so the chunks before that mark and every other grid are
-        kept, as are the labels.
+        other kind but their own minimum price rises, which go with them
+        (their chunks come later still, and their grids are dropped too), so
+        the chunks before that mark and every other grid are kept, as are
+        the labels.
 
         Args:
             source (_GridSource): The grid walked from here on (without the
                 family).
         """
         self.source = source
-        if self._trim_mark is not None and not self.failed:
-            n_chunks, n_heads = self._trim_mark
+        # The Trim to Kelly cells are packed before their minimum price rises,
+        # so the earlier of the two marks covers both
+        mark = self._trim_mark if self._trim_mark is not None else self._trim_rise_mark
+        if mark is not None and not self.failed:
+            n_chunks, n_heads = mark
             del self.chunks[n_chunks:]
             self.seen = {key: cid for key, cid in self.seen.items() if cid < n_chunks}
             self.heads.truncate(n_heads)
-        self._trim_mark = None
-        self.grids_trim = {}
+        self._trim_mark = self._trim_rise_mark = None
+        self.grids_trim, self.grids_trim_rise = {}, {}
         self._cell, self._keys = None, {}
 
     def trim_grid(self, add: bool = False) -> list | None:
@@ -9585,6 +9867,159 @@ class _ChunkVisitor:
         return [[list(row) for row in ((own[bi] if own is not None else blank)
                                        if binds else on[bi])]
                 for bi, binds in enumerate(self.source.tier_binds)]
+
+    def trim_rise(self, bi: int, ki: int, ci: int, ri: int, entry: SweepPoint | SameTrim, *,
+                  add: bool = False, off: bool = False) -> None:
+        """
+        Keep one minimum price rise of one Trim to Kelly scenario: its own chunk, or the chunk of the run it repeats.
+
+        A run simulated at the minimum is packed like any scenario (priced
+        at the cell's k, sharing a chunk with any equal list at an equal k).
+        A SameTrim is a run the page already has, so its chunk id is copied
+        and nothing is packed: the Trim to Kelly cell's own for
+        SameTrim(None), or the id this cell stored at the smaller minimum it
+        names.
+
+        Args:
+            bi (int): Band index.
+            ki (int): k index.
+            ci (int): Cap index.
+            ri (int): The minimum's index in source.trim_rises.
+            entry (SweepPoint | SameTrim): The "all" point of the run
+                trimming only after that rise, or the run it repeats.
+            add (bool): Keyword-only. Whether the run also adds to held
+                pairs. False (default).
+            off (bool): Keyword-only. Whether the cell is a binding band's
+                with the tier floors off. False (default).
+
+        Raises:
+            ValueError: If a SameTrim names a minimum the grid does not
+                carry (never from backtester.TrimSweep.rise_grid). The walk
+                reads it as a cell that cannot be read.
+        """
+        grid = self.grids_trim_rise.get((add, off))
+        if self.failed or grid is None:
+            return
+        cell = grid[bi][ki][ci]
+        if cell is None:
+            cell = grid[bi][ki][ci] = [None] * len(self.source.trim_rises)
+        if isinstance(entry, SameTrim):
+            # The run with no minimum is the Trim to Kelly cell itself
+            cell[ri] = (self.grids_trim[(add, off)][bi][ki][ci] if entry.min_rise is None
+                        else cell[self.source.trim_rises.index(entry.min_rise)])
+            return
+        if self._trim_rise_mark is None:
+            self._trim_rise_mark = (len(self.chunks), len(self.heads.items))
+        try:
+            # The minimum is part of the phase, so a key memoised for another
+            # minimum's list (an object since freed) is never read for this one
+            phase = f"trim_rise{ri}" + ("_add" if add else "") + ("_off" if off else "")
+            cell[ri] = self._chunk(bi, ki, self.source.ks[ki], entry.trades,
+                                   entry.equity_df, False, phase=phase)
+        except Exception:
+            self._fail()
+
+    def reset_trim_rise(self, source: _GridSource) -> None:
+        """
+        Drop every minimum-price-rise chunk and grid.
+
+        Every chunk and row head packed since the first minimum price rise
+        is dropped (with its dedup key). Those are the last cells the walk
+        packs, so every chunk before that mark and every other grid — the
+        Trim to Kelly ones included — are kept, as are the labels.
+
+        Args:
+            source (_GridSource): The grid walked from here on (without the
+                minimums).
+        """
+        self.source = source
+        if self._trim_rise_mark is not None and not self.failed:
+            n_chunks, n_heads = self._trim_rise_mark
+            del self.chunks[n_chunks:]
+            self.seen = {key: cid for key, cid in self.seen.items() if cid < n_chunks}
+            self.heads.truncate(n_heads)
+        self._trim_rise_mark = None
+        self.grids_trim_rise = {}
+        self._cell, self._keys = None, {}
+
+    @staticmethod
+    def _rise_ids(cell: list | None, own: int | None) -> list | None:
+        """
+        One scenario's chunk ids at every minimum price rise, as the page reads them.
+
+        Args:
+            cell (list | None): The ids trim_rise stored, one per minimum;
+                None for a cell whose minimums were never read.
+            own (int | None): The chunk id of the same scenario's Trim to
+                Kelly cell.
+
+        Returns:
+            list | None: None when the minimums were never read, or every
+                one of them shows the Trim to Kelly cell's own chunk (the
+                page then reads that cell at any minimum); else a copy of
+                the ids.
+        """
+        if cell is None or all(cid == own for cid in cell):
+            return None
+        return list(cell)
+
+    def trim_rise_grid(self, add: bool = False) -> list | None:
+        """
+        The minimum-price-rise grid with the tier floors on, adding to held pairs or not.
+
+        Args:
+            add (bool): Whether the runs also add to held pairs. False (default).
+
+        Returns:
+            list | None: [band][k][cap] -> None where every minimum shows
+                the Trim to Kelly cell itself (or the cell was never read),
+                else one chunk id per minimum of source.trim_rises. A grid
+                of nothing but None is still a view: no minimum changed any
+                run. None when the grid carries no minimum, their cells
+                could not be read, a chunk failed, or there is no Trim to
+                Kelly grid of the same setting to read them beside.
+        """
+        on = self.trim_grid(add)
+        grid = self.grids_trim_rise.get((add, False))
+        if on is None or grid is None:
+            return None
+        return [[[self._rise_ids(cell, own) for cell, own in zip(cells, owns, strict=True)]
+                 for cells, owns in zip(band, own_band, strict=True)]
+                for band, own_band in zip(grid, on, strict=True)]
+
+    def trim_rise_off_grid(self, add: bool = False) -> list | None:
+        """
+        The minimum-price-rise grid with the tier floors off, adding to held pairs or not.
+
+        A binding band's row is its own tier-floors-off cells (None where
+        the grid has no tier-off half), every other band's its tier-on row —
+        its off view IS its run, as trim_off_grid() has it.
+
+        Args:
+            add (bool): Whether the runs also add to held pairs. False (default).
+
+        Returns:
+            list | None: [band][k][cap] -> None or one chunk id per minimum,
+                as trim_rise_grid() gives them; None without the tier-on
+                grid of the same setting or without a tier-floors-off view
+                to pair it with.
+        """
+        on = self.trim_rise_grid(add)
+        if on is None or self.source.tier_binds is None:
+            return None
+        own, own_trim = self.grids_trim_rise.get((add, True)), self.grids_trim.get((add, True))
+        blank = [[None] * len(self.source.caps) for _ in self.source.ks]
+        rows = []
+        for bi, binds in enumerate(self.source.tier_binds):
+            if not binds:
+                rows.append(on[bi])
+            elif own is None or own_trim is None:
+                rows.append([list(row) for row in blank])
+            else:
+                rows.append([[self._rise_ids(cell, cid)
+                              for cell, cid in zip(cells, cids, strict=True)]
+                             for cells, cids in zip(own[bi], own_trim[bi], strict=True)])
+        return rows
 
     def _chunk(self, bi: int, ki: int, k: float | None, listed: list,
                curve: pd.DataFrame, primary: bool, *, phase: str = "on") -> int:
@@ -11415,6 +11850,7 @@ def _filter_payload(
     sell_state: str = "not simulated",
     sidecar_dir: str | None = None,
     trim_state: str = "not simulated",
+    trim_rise_state: str = "not simulated",
 ) -> dict:
     """
     Build the base data block the page's filter bar and script read on load.
@@ -11493,6 +11929,12 @@ def _filter_payload(
             view when it has none, worded as add_on_state is ("not simulated"
             or "unavailable"); ignored when it has one. "not simulated"
             (default).
+        trim_rise_state (str): Keyword-only. Why the page has no view of the
+            Trim to Kelly family's minimum price rises when it has none:
+            "not simulated" (the run's family carried no minimum) or
+            "unavailable" (it carried some, and the page could not read
+            them or has no Trim to Kelly view to show them beside); ignored
+            when it has the view. "not simulated" (default).
 
     Returns:
         dict: "dates" (the shared axis, ISO dates), "bands" ([{label,
@@ -11546,7 +11988,19 @@ def _filter_payload(
             "grid_trim_off" (the same with the tier floors off, only with
             both views), "grid_trim_add" and "grid_trim_add_off" (the same
             two with adding to held pairs on, only on a page that also has
-            the add-on view) and "trim_state" ("shown", else trim_state).
+            the add-on view) and "trim_state" ("shown", else trim_state),
+            and the view of that family's minimum price rises: "trim_rises"
+            ([{label, phrase, value}] per minimum — _trim_rise_option's
+            "5c", _trim_rise_phrase's words after the Trim to Kelly phrase
+            and the minimum itself in dollars; [] without the view),
+            "grid_trim_rise" (null without the view, else [band][k][cap] ->
+            null where every minimum shows that scenario's "grid_trim"
+            chunk, else one chunk id per minimum, in "trim_rises" order —
+            chunks.trim_rise_grid()), "grid_trim_rise_off",
+            "grid_trim_rise_add" and "grid_trim_rise_add_off" (the same
+            beside "grid_trim_off", "grid_trim_add" and "grid_trim_add_off",
+            each null wherever that grid is) and "trim_rise_state" ("shown",
+            else trim_rise_state).
     """
     axis = chunks.axis
     pb, pk, pc = source.primary
@@ -11569,6 +12023,12 @@ def _filter_payload(
     grid_trim = chunks.trim_grid() if source.trim_cell is not None else None
     trim_view = grid_trim is not None
     grid_trim_add = chunks.trim_grid(True) if (trim_view and add_view) else None
+    # Each trim scenario at every minimum price rise, only from a grid whose
+    # walk read them: a grid of nothing but nulls is still the view (no
+    # minimum changed any run), while a walk that could not read them has none
+    grid_rise = (chunks.trim_rise_grid()
+                 if (trim_view and source.trim_rise_cell is not None) else None)
+    rise_view = grid_rise is not None
     return {
         "dates": [d.date().isoformat() for d in axis],
         "bands": [{"label": _band_option(band),
@@ -11677,6 +12137,20 @@ def _filter_payload(
         "grid_trim_add_off": (chunks.trim_off_grid(True)
                               if (grid_trim_add is not None and off_view) else None),
         "trim_state": "shown" if trim_view else trim_state,
+        # The same scenarios at each minimum price rise: the minimums' names,
+        # each trim grid's chunk ids per minimum (a null cell: every minimum
+        # shows the Trim to Kelly cell; a null grid wherever its trim grid is
+        # null), and why a page has none
+        "trim_rises": ([{"label": _trim_rise_option(rise), "phrase": _trim_rise_phrase(rise),
+                         "value": rise} for rise in source.trim_rises] if rise_view else []),
+        "grid_trim_rise": grid_rise,
+        "grid_trim_rise_off": (chunks.trim_rise_off_grid()
+                               if (rise_view and off_view) else None),
+        "grid_trim_rise_add": (chunks.trim_rise_grid(True)
+                               if (rise_view and grid_trim_add is not None) else None),
+        "grid_trim_rise_add_off": (chunks.trim_rise_off_grid(True) if (
+            rise_view and grid_trim_add is not None and off_view) else None),
+        "trim_rise_state": "shown" if rise_view else trim_rise_state,
         # Every chunk id from here on is a sidecar file in sidecar_dir
         "inline_chunks": len(chunks.chunks),
         "sidecar_dir": sidecar_dir,
@@ -14370,7 +14844,12 @@ def generate_dashboard(
                              else f"{DASHBOARD_FILES_DIRNAME}/{build_folder.name}"),
                 # The same for the Trim to Kelly select
                 trim_state=("unavailable" if getattr(sweep, "trim_sweep", None) is not None
-                            else "not simulated"))
+                            else "not simulated"),
+                # ... and for that family's minimum price rises: a run whose
+                # family carried some but whose page shows none could not
+                # read them (the log says why)
+                trim_rise_state=("unavailable" if getattr(
+                    getattr(sweep, "trim_sweep", None), "min_rises", ()) else "not simulated"))
             filter_bar = _filter_bar_html(filter_data, chunker.primary_views or {})
             base_block = _packed_json_script("dash-data", filter_data)
             chunks = chunker.chunks
