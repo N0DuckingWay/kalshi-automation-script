@@ -21201,6 +21201,366 @@ class TestTrimToKelly:
         assert seen == [True, True, True, False, False]
 
 
+class TestTrimMinRise:
+    """With trim_to_kelly and a trim_min_rise, a held pair is looked at for
+    trimming only once its total price — the ask of the side held on each of
+    its two markets, added — is at least that many dollars above where it
+    stood at the checkpoint of the last trade on the pair: its latest
+    purchase or add-on, or a later trim. A fall never counts. Only trims are
+    held back, and None is the run with no minimum.
+
+    The fixture is TestTrimToKelly's pair: YES on SA and NO on SB, bought on
+    Monday 1. Its total ask is 0.62 there, 0.87 on Monday 2, 0.95 on Monday 3
+    and 0.77 on Monday 4, and with no minimum it is trimmed on Mondays 2 and
+    3. Every simulation is handed k 0.75, and a 20% cap unless it names
+    another."""
+
+    _TRIM = TestTrimToKelly
+    _PAIR = ("SA", "SB")
+    _ASKS = {_LADDER_M1: 0.62, _LADDER_M2: 0.87, _LADDER_M3: 0.95, _M4: 0.77}
+    _HELD_BACK = ("Held pairs not checked for a trim, a pair counted each week its "
+                  "price had not risen")
+
+    def _records(self, *args, **kw):
+        return self._TRIM()._records(*args, **kw)
+
+    def _plain(self, records, cap=0.20, **kw):
+        """The run that cannot trim."""
+        return self._TRIM()._sim(records, cap, **kw)
+
+    def _sim(self, records, cap=0.20, **kw):
+        """The run that trims, with whatever minimum `kw` names."""
+        return self._TRIM()._sim(records, cap, trim_to_kelly=True, **kw)
+
+    @staticmethod
+    def _sold_on(point) -> list[date]:
+        return [t.exit_date for t in point.trades if t.sold]
+
+    def test_the_pair_s_price_is_the_ask_of_each_side_it_holds(self):
+        candles = self._TRIM._SUITE._candles()
+        (held,) = self._plain(self._records()).trades
+        same_title = dc_replace(held, pair_type="same_title")
+        for day, total in self._ASKS.items():
+            (a,) = [c for c in candles["SA"] if c["ts"] == _ck(day)]
+            (b,) = [c for c in candles["SB"] if c["ts"] == _ck(day)]
+            # A time-series pair holds YES on its first market and NO on its second
+            assert a["yes_ask_close"] + b["no_ask_close"] == pytest.approx(total, abs=1e-12)
+            assert backtester._pair_price(held, day) == a["yes_ask_close"] + b["no_ask_close"]
+            # ... and a same-title pair NO on its first and YES on its second
+            assert backtester._pair_price(same_title, day) == (
+                a["no_ask_close"] + b["yes_ask_close"])
+        # With no later candle the last asks stand; once SA has paid out
+        # (02-10, "no"), its YES leg counts at its payout, nothing
+        assert backtester._pair_price(held, date(2026, 2, 2)) == pytest.approx(0.77, abs=1e-12)
+        assert backtester._pair_price(held, date(2026, 2, 16)) == pytest.approx(0.52, abs=1e-12)
+
+    def test_no_minimum_is_the_default_and_the_run_without_the_keyword(self, caplog):
+        default = inspect.signature(backtester._simulate_at_discount).parameters["trim_min_rise"]
+        assert default.default is None and default.kind is default.KEYWORD_ONLY
+        records = self._records()
+        with caplog.at_level(logging.DEBUG):
+            base = self._sim(records)
+            lines = [r.getMessage() for r in caplog.records]
+            caplog.clear()
+            none = self._sim(records, trim_min_rise=None)
+        self._TRIM._same(none, base)
+        assert [r.getMessage() for r in caplog.records] == lines
+        assert not any(self._HELD_BACK in line for line in lines)
+        assert base.trim_min_rise is None and none.trim_min_rise is None
+        assert none.trim_rises == base.trim_rises
+        assert none.cap_free_from == base.cap_free_from
+
+    def test_a_run_that_trims_records_the_rise_behind_each_trim(self, caplog):
+        records = self._records()
+        with caplog.at_level(logging.INFO):
+            point = self._sim(records)
+        assert self._sold_on(point) == [_LADDER_M2, _LADDER_M3]
+        # Monday 2 is measured from the purchase, Monday 3 from Monday 2's trim
+        assert point.trim_rises == pytest.approx((0.87 - 0.62, 0.95 - 0.87), abs=1e-12)
+        assert type(point.trim_rises) is tuple
+        # One figure per position trimmed
+        assert f"{self._TRIM._LINE} ({_label(0.20)}, trimming to Kelly): 2 " in caplog.text
+        # A run that could trim and trimmed nothing; a run that cannot trim;
+        # a point built by hand
+        assert self._sim(records, cap=1.0).trim_rises == ()
+        plain = self._plain(records)
+        assert plain.trim_rises is None and plain.trim_min_rise is None
+        bare = backtester.SweepPoint(0.75, [], pd.DataFrame())
+        assert bare.trim_rises is None and bare.trim_min_rise is None
+        # Like sales: how the trades came about, so not shown and not compared
+        rises = next(f for f in fields(backtester.SweepPoint) if f.name == "trim_rises")
+        assert rises.repr is False and rises.compare is False
+
+    @pytest.mark.parametrize("min_rise, trimmed_on, rises", [
+        (0.05, [_LADDER_M2, _LADDER_M3], (0.25, 0.08)),
+        (0.10, [_LADDER_M2], (0.25,)),
+        # Monday 2's rise is exactly 25c, float noise aside (0.87 - 0.62)
+        (0.25, [_LADDER_M2], (0.25,)),
+        (0.30, [_LADDER_M3], (0.33,)),
+        (0.35, [], ()),
+    ])
+    def test_a_pair_is_trimmed_only_after_its_price_has_risen_the_minimum(
+            self, caplog, min_rise, trimmed_on, rises):
+        records = self._records()
+        with caplog.at_level(logging.INFO):
+            point = self._sim(records, trim_min_rise=min_rise)
+        assert point.trim_min_rise == min_rise and point.trim_to_kelly is True
+        assert self._sold_on(point) == trimmed_on
+        assert point.trim_rises == pytest.approx(rises, abs=1e-12)
+        # The walk looks at the pair on every checkpoint from Monday 2 to its
+        # pay-out on 03-20 (ten of them), and holds it back wherever it is
+        # not trimmed: from Monday 4 on its price is below the last trade's
+        checkpoints = backtester._sale_checkpoints(_LADDER_M2, date(2026, 3, 20))
+        assert len(checkpoints) == 10 and checkpoints[:3] == [_LADDER_M2, _LADDER_M3, _M4]
+        cents = backtester._cap_percent(min_rise)
+        label = f"{_label(0.20)}, trimming to Kelly only after a {cents}c price rise"
+        assert (f"{self._HELD_BACK} {cents}c since its last trade ({label}): "
+                f"{len(checkpoints) - len(trimmed_on)}") in [
+            r.getMessage() for r in caplog.records]
+
+    def test_a_low_minimum_changes_nothing_and_a_high_one_never_trims(self):
+        records = self._records()
+        base, plain = self._sim(records), self._plain(records)
+        # Both trims came after more than 5c: the same run
+        low = self._sim(records, trim_min_rise=0.05)
+        self._TRIM._same(low, base)
+        assert low.cap_free_from == base.cap_free_from
+        # No Monday is 35c above the purchase: the run that cannot trim.
+        # A pair held back is asked for no decision, so the cap the run stops
+        # depending on is the purchases' own, below the trimming run's
+        high = self._sim(records, trim_min_rise=0.35)
+        self._TRIM._same(high, plain)
+        assert high.cap_free_from == plain.cap_free_from < base.cap_free_from
+
+    def test_a_trim_moves_the_price_the_next_rise_is_measured_from(self):
+        records = self._records()
+        base = self._sim(records)
+        _kept, first, second = base.trades
+        # At 10c, Monday 2 trims as it does with no minimum. Monday 3 is 33c
+        # above the purchase but only 8c above Monday 2's trim: held back
+        point = self._sim(records, trim_min_rise=0.10)
+        kept, part = point.trades
+        assert part.sold and part.exit_date == _LADDER_M2 and part.n == first.n
+        assert (part.sale_price_a, part.sale_price_b) == (0.28, 0.55)
+        assert not kept.sold and kept.n == _kept.n + second.n
+        rise = backtester._price_rise
+        assert rise([kept], _LADDER_M3, {}) == pytest.approx(0.33, abs=1e-12)
+        assert rise([kept], _LADDER_M3, {self._PAIR: _LADDER_M2}) == pytest.approx(
+            0.08, abs=1e-12)
+        assert not config.trim_rise_reached(rise([kept], _LADDER_M3, {self._PAIR: _LADDER_M2}),
+                                            0.10)
+
+    def test_a_monday_it_was_held_back_on_does_not_move_that_price(self):
+        records = self._records()
+        (held,) = self._plain(records).trades
+        # At 30c, Monday 2 (+25c) is held back. Monday 3 is still measured
+        # from the purchase (+33c) and trims, on the whole purchase
+        point = self._sim(records, trim_min_rise=0.30)
+        kept, part = point.trades
+        assert part.sold and part.exit_date == _LADDER_M3
+        assert (part.sale_price_a, part.sale_price_b) == (0.29, 0.62)
+        assert kept.n + part.n == held.n
+        # What Monday 3's trim sells is the rule's, on the pair nothing was
+        # sold from: the cash left plus the whole pair at Monday 3's asks
+        value = self._TRIM._BALANCE - held.total_cost - held.fees + held.n * (0.31 + 0.64)
+        win = config.held_pair_win_prob("time_series", 0.31, 0.71, 0.38, 0.64, 0.75)
+        top = 0.29 + 0.62 - fee_per_pair_approx(0.29, 0.62)
+        assert part.n == config.kelly_trim_count(
+            held.n, value, win, 0.20, top,
+            lambda pairs: _sale_value(pairs, ("bid", 0.29), ("bid", 0.62))).sell
+
+    def test_a_fall_never_opens_a_trim(self):
+        records = self._records()
+        base = self._sim(records)
+        kept = base.trades[0]
+        # Monday 4 is 18c below Monday 3's trim. With no minimum the pair is
+        # looked at there and not trimmed (it is back within its size); with
+        # one it is not looked at
+        fall = backtester._price_rise([kept], _M4, {self._PAIR: _LADDER_M3})
+        assert fall == pytest.approx(0.77 - 0.95, abs=1e-12)
+        assert not any(config.trim_rise_reached(fall, minimum) for minimum in (1e-9, 0.05, 1.0))
+        assert config.trim_rise_reached(fall, None)
+        assert _M4 not in self._sold_on(base)
+
+        # A pair past its size cap whose price fell: on Monday 3 its quotes
+        # narrow, so the asks of the sides held come down (0.34 + 0.61 to
+        # 0.31 + 0.61) while their bids go up (0.28 + 0.55 to 0.30 + 0.60),
+        # and its bids are what a trim sizes on
+        candles = {"SA": [_candle(_ck(_LADDER_M1), 0.20, 0.82), *_held(_LADDER_M2, 0.34, 0.72),
+                          *_held(_LADDER_M3, 0.31, 0.70)],
+                   "SB": [_candle(_ck(_LADDER_M1), 0.60, 0.42), *_held(_LADDER_M2, 0.45, 0.61),
+                          *_held(_LADDER_M3, 0.40, 0.61)]}
+        any_rise = self._sim(self._records(candles=candles))
+        # With no minimum it is trimmed on both Mondays, the second after a fall
+        assert self._sold_on(any_rise) == [_LADDER_M2, _LADDER_M3]
+        assert any_rise.trim_rises == pytest.approx((0.95 - 0.62, 0.92 - 0.95), abs=1e-12)
+        assert any_rise.trim_rises[1] < 0
+        for minimum in (0.01, 0.05, 0.30):
+            point = self._sim(self._records(candles=candles), trim_min_rise=minimum)
+            # Monday 2's trim, and nothing after the fall
+            assert self._sold_on(point) == [_LADDER_M2]
+            assert point.trim_rises == pytest.approx((0.33,), abs=1e-12)
+            assert point.trades[1].n == any_rise.trades[1].n
+
+    def test_an_add_on_moves_the_price_the_next_rise_is_measured_from(self):
+        # TestTrimToKelly's add-on fixture: bought on Monday 1 (total ask
+        # 0.62), added to on Monday 2 when its price falls (0.52), then up on
+        # Monday 3 (0.96) and Monday 4 (1.00)
+        candles = {"SA": [_candle(_ck(_LADDER_M1), 0.20, 0.82), *_held(_LADDER_M2, 0.15, 0.87),
+                          *_held(_LADDER_M3, 0.34, 0.68), *_held(_M4, 0.36, 0.66)],
+                   "SB": [_candle(_ck(_LADDER_M1), 0.60, 0.42), *_held(_LADDER_M2, 0.65, 0.37),
+                          *_held(_LADDER_M3, 0.40, 0.62), *_held(_M4, 0.38, 0.64)]}
+        mondays = (_LADDER_M1, (_LADDER_M2, 0.15, 0.65, 0.35), (_LADDER_M3, 0.34, 0.40, 0.62))
+
+        def run(**kw):
+            return self._sim(self._records(mondays, candles), cap=0.10, add_to_held=True, **kw)
+        bought, added = self._plain(self._records(mondays, candles), cap=0.10,
+                                    add_to_held=True).trades
+        assert added.add_on and added.entry_date == _LADDER_M2
+        prices = [backtester._pair_price(bought, day)
+                  for day in (_LADDER_M1, _LADDER_M2, _LADDER_M3, _M4)]
+        assert prices == pytest.approx([0.62, 0.52, 0.96, 1.00], abs=1e-12)
+        # With no minimum: trimmed on Monday 3 (44c above the add-on) and
+        # again on Monday 4 (4c above that trim)
+        base = run()
+        assert self._sold_on(base) == [_LADDER_M3, _LADDER_M3, _M4]
+        assert base.trim_rises == pytest.approx((0.96 - 0.52, 1.00 - 0.96), abs=1e-12)
+        # At 40c Monday 3 still trims: 44c above the add-on, where it is only
+        # 34c above the first purchase. Monday 4 (+4c) is held back
+        at_40 = run(trim_min_rise=0.40)
+        assert self._sold_on(at_40) == [_LADDER_M3, _LADDER_M3]
+        assert at_40.trim_rises == pytest.approx((0.44,), abs=1e-12)
+        # At 45c Monday 3 (+44c) is held back and Monday 4 trims, 48c above
+        # the add-on (38c above the first purchase)
+        at_45 = run(trim_min_rise=0.45)
+        assert self._sold_on(at_45) == [_M4, _M4]
+        assert at_45.trim_rises == pytest.approx((0.48,), abs=1e-12)
+        # Buying is not held back: on Monday 2, below the minimum either
+        # way, the add-on is bought exactly as the run that cannot trim buys it
+        for point in (base, at_40, at_45):
+            add_on = next(t for t in point.trades if t.add_on)
+            assert (add_on.n, add_on.entry_date, add_on.total_cost, add_on.fees) == (
+                added.n, added.entry_date, added.total_cost, added.fees)
+
+    def test_the_rise_is_measured_from_the_latest_purchase_add_on_or_trim(self):
+        (held,) = self._plain(self._records()).trades
+        rise = backtester._price_rise
+        # From the purchase, through config's own measure
+        assert rise([held], _LADDER_M2, {}) == config.pair_price_rise(
+            backtester._pair_price(held, _LADDER_M1), backtester._pair_price(held, _LADDER_M2))
+        assert rise([held], _LADDER_M2, {}) == pytest.approx(0.25, abs=1e-12)
+        assert rise([held], _M4, {}) == pytest.approx(0.15, abs=1e-12)
+        # An add-on is a later trade of the pair
+        added = dc_replace(held, entry_date=_LADDER_M2, add_on=True)
+        assert rise([held, added], _LADDER_M3, {}) == pytest.approx(0.08, abs=1e-12)
+        # A trim counts when it is the later of the two, and not otherwise
+        assert rise([held], _LADDER_M3, {self._PAIR: _LADDER_M2}) == pytest.approx(
+            0.08, abs=1e-12)
+        assert rise([held, added], _M4, {self._PAIR: _LADDER_M3}) == pytest.approx(
+            -0.18, abs=1e-12)
+        assert rise([held, added], _M4, {self._PAIR: _LADDER_M1}) == pytest.approx(
+            -0.10, abs=1e-12)
+        # Another pair's trim, or these two markets the other way round, is not this pair's
+        others = {("SB", "SA"): _LADDER_M2, ("XA", "XB"): _LADDER_M2}
+        assert rise([held], _LADDER_M3, others) == pytest.approx(0.33, abs=1e-12)
+
+    def test_a_position_the_trim_leaves_alone_has_no_rise(self):
+        (held,) = self._plain(self._records()).trades
+        rise = backtester._price_rise
+        # No quotes, or not one exact pair (a third market; another way round)
+        assert rise([dc_replace(held, marks=None)], _LADDER_M2, {}) is None
+        assert rise([held, dc_replace(held, ticker_b="SC")], _LADDER_M2, {}) is None
+        assert rise([held, dc_replace(held, ticker_a="SB", ticker_b="SA")], _LADDER_M2,
+                    {}) is None
+        # ... so the minimum never holds one back, and it is asked as before:
+        # a trade with no quotes under a minimum is the run that cannot trim
+        bare = [self._TRIM._SUITE._record()]
+        point = self._sim(bare, cap=0.05, trim_min_rise=0.05)
+        self._TRIM._same(point, self._plain(bare, cap=0.05))
+        assert point.trim_rises == ()
+
+    def test_a_minimum_needs_a_run_that_trims(self):
+        # [{}] raises KeyError the moment Pass 1b scores it (checked last),
+        # so a ValueError here was raised before any entry was scored
+        for off in ({}, {"trim_to_kelly": False}):
+            with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly"):
+                self._plain([{}], trim_min_rise=0.10, **off)
+        with pytest.raises(KeyError):
+            self._sim([{}], trim_min_rise=0.10)
+
+    @pytest.mark.parametrize("bad", [0, 0.0, -0.05, 1.5, True, np.bool_(True), float("nan"),
+                                     "0.1", Decimal("0.1")])
+    def test_a_bad_minimum_is_refused_before_any_entry_is_scored(self, bad):
+        with pytest.raises(ValueError,
+                           match=r"trim_min_rise must be (a real number )?in \(0, 1\]"):
+            self._sim([{}], trim_min_rise=bad)
+
+    def test_a_numpy_number_and_a_whole_dollar_are_minimums(self):
+        records = self._records()
+        point = self._sim(records, trim_min_rise=np.float64(0.10))
+        assert point.trim_min_rise == 0.10 and type(point.trim_min_rise) is float
+        self._TRIM._same(point, self._sim(records, trim_min_rise=0.10))
+        # A whole dollar is the top of the range: no pair's price rises that far
+        assert self._sim(records, trim_min_rise=1.0).trim_rises == ()
+        assert self._sim(records, trim_min_rise=1).trim_min_rise == 1.0
+
+    def test_the_label_names_the_minimum(self, caplog):
+        records = self._records()
+        with caplog.at_level(logging.INFO):
+            point = self._sim(records, trim_min_rise=0.10)
+        _kept, part = point.trades
+        label = f"{_label(0.20)}, trimming to Kelly only after a 10c price rise"
+        assert _completion_lines(caplog) == [
+            f"Backtest complete at {label}: 2 trades, 2 profitable"]
+        lines = {r.getMessage(): r.levelno for r in caplog.records}
+        assert lines[f"{self._TRIM._LINE} ({label}): 1 "
+                     f"(contract pairs sold: {part.n})"] == logging.INFO
+        held_back = f"{self._HELD_BACK} 10c since its last trade ({label}): 9"
+        assert lines[held_back] == logging.INFO
+        # A quiet run (a lazy size-cap cell) logs the same lines at DEBUG
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            self._sim(records, trim_min_rise=0.10, quiet=True)
+        quiet = {r.getMessage(): r.levelno for r in caplog.records}
+        assert quiet[held_back] == logging.DEBUG
+        assert quiet[f"Backtest complete at {label}: 2 trades, 2 profitable"] == logging.DEBUG
+        # The words, on their own: cents, with every digit that tells two minimums apart
+        assert backtester._trim_rise_label(0.05) == " only after a 5c price rise"
+        assert backtester._trim_rise_label(0.125) == " only after a 12.5c price rise"
+        assert backtester._trim_rise_label(1.0) == " only after a 100c price rise"
+
+    def test_sim_options_forwards_it_only_when_set(self):
+        assert backtester._sim_options(None, False, trim_min_rise=None) == {}
+        assert backtester._sim_options(None, False, trim_to_kelly=True, trim_min_rise=None) == {
+            "trim_to_kelly": True}
+        assert backtester._sim_options(None, False, trim_to_kelly=True, trim_min_rise=0.10) == {
+            "trim_to_kelly": True, "trim_min_rise": 0.10}
+        assert backtester._sim_options(0.35, True, add_to_held=True, trim_to_kelly=True,
+                                       trim_min_rise=0.05) == {
+            "size_cap": 0.35, "quiet": True, "add_to_held": True, "trim_to_kelly": True,
+            "trim_min_rise": 0.05}
+
+    def test_the_checks_re_simulate_at_the_point_s_minimum(self, monkeypatch):
+        records = self._records()
+        point = self._sim(records, trim_min_rise=0.10)
+        seen = []
+        real = backtester._simulate_at_discount
+
+        def spy(*args, **kwargs):
+            seen.append((kwargs.get("trim_to_kelly", False),
+                         kwargs.get("trim_min_rise", "not forwarded")))
+            return real(*args, **kwargs)
+        monkeypatch.setattr(backtester, "_simulate_at_discount", spy)
+        start, balance = self._TRIM._START, self._TRIM._BALANCE
+        backtester._ex_top_event(point, records, start, balance, (0.0, 1.0))
+        backtester._half_split((records, []), start, balance, 0.75, (0.0, 1.0),
+                               size_cap=0.20, trim_to_kelly=True, trim_min_rise=0.10)
+        backtester._half_split((records, []), start, balance, 0.75, (0.0, 1.0),
+                               size_cap=0.20, trim_to_kelly=True)
+        assert seen == [(True, 0.10), (True, 0.10), (True, 0.10),
+                        (True, "not forwarded"), (True, "not forwarded")]
+
+
 class TestTrimCapSweep:
     """A CapSweep that trims to Kelly (trim_to_kelly=True) has no eager point
     (it refuses any) and runs no split-half or top-event check. A trim reads
@@ -21276,6 +21636,51 @@ class TestTrimCapSweep:
         # trim alone (no purchase) depends on the cap
         assert trimmed > 0 and cs.reused > 0 and cap_bound > 0
         assert cs.simulated + cs.reused == len(cs.ks) * len(cs.caps)
+
+    @pytest.mark.parametrize("add", [False, True])
+    def test_every_cap_with_a_minimum_price_rise_equals_a_fresh_simulation(self, add):
+        # A sweep that trims only after a 10c price rise: the minimum reaches
+        # every simulation, and a simulation is still shared only by the caps
+        # that make the same run
+        entries = self._entries()
+        cs = self._sweep(entries, (0.5, 0.75), add=add, trim_min_rise=0.10)
+        assert cs.trim_min_rise == 0.10
+        trimmed = held_back = 0
+        for k in cs.ks:
+            cell = cs.cell(self._BAND, k)
+            for cap in cs.caps:
+                point = cell[cap]["all"]
+                fresh = backtester._simulate_at_discount(
+                    entries, self._START, 10_000.0, k=k, spread_band=self._BAND, size_cap=cap,
+                    quiet=True, end_date=self._END, add_to_held=add, trim_to_kelly=True,
+                    trim_min_rise=0.10)
+                assert (point.size_cap, point.trim_to_kelly, point.trim_min_rise,
+                        point.add_to_held) == (cap, True, 0.10, add)
+                assert [astuple(t) for t in point.trades] == [
+                    astuple(t) for t in fresh.trades], (k, cap)
+                pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df)
+                # A shared copy carries the rises of the run it shares
+                assert point.trim_rises == fresh.trim_rises
+                trimmed += bool(point.trim_rises)
+                # Where the minimum holds a trim back, the run is not the
+                # no-minimum run's
+                held_back += [astuple(t) for t in point.trades] != [
+                    astuple(t) for t in self._fresh(entries, k, cap, add).trades]
+        # The fixture trims under the minimum, the minimum changes some
+        # caps' runs, and some caps share a simulation
+        assert trimmed > 0 and held_back > 0 and cs.reused > 0
+        assert cs.simulated + cs.reused == len(cs.ks) * len(cs.caps)
+
+    def test_a_minimum_price_rise_needs_a_sweep_that_trims(self):
+        entries = self._entries()
+        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly"):
+            self._sweep(entries, (0.75,), trim_to_kelly=False, trim_min_rise=0.1)
+        # ... and is checked as one simulation's is, before any cell is read
+        for bad in (0, 1.5, True, float("nan"), "0.1"):
+            with pytest.raises(ValueError, match="trim_min_rise must be"):
+                self._sweep(entries, (0.75,), trim_min_rise=bad)
+        # No minimum is the sweep it was
+        assert self._sweep(entries, (0.75,)).trim_min_rise is None
 
     def test_the_cells_are_the_trimming_runs_not_the_plain_ones(self):
         entries = self._entries()

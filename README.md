@@ -1797,6 +1797,16 @@ defaults…" is disabled, since live trading has no such setting. The Scenario
 Explorer, the Interval Discount (k) section and the k̂ figures do not follow the
 choice.
 
+The simulator can also make a trim wait for a price rise (`trim_min_rise` in
+`backtester._simulate_at_discount`, used together with trimming). With a
+minimum set, a held pair is looked at for trimming only once its total price —
+the price of the side held on each of its two markets, added — is at least
+that many dollars above where it stood at the last trade on that pair: its
+purchase, an add-on, or an earlier trim. A fall never counts, and buying is not
+affected. Both prices are the asks the backtest already values an open pair at,
+read the same way at both moments, so the gap between a market's bid and ask is
+never taken for a rise.
+
 The simulations run only while the dashboard is built, one per scenario and
 size cap, sharing one simulation across the size caps that cannot change it.
 A scenario in which nothing was trimmed shows the run without trimming.
