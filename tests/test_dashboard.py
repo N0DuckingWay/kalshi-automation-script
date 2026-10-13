@@ -12506,14 +12506,66 @@ class TestTrimSelect:
             {"value": "off", "text": "off", "selected": True},
             {"value": "on", "text": "on (sell down to the Kelly size)", "selected": False}]}
         title = re.search(r'<select id="flt-trim"[^>]*title="([^"]*)"', page).group(1)
-        assert html.unescape(title) == dashboard._TRIM_SELECT_TITLE
-        # The hover text says what the choice shuts, and why
+        # The hover text, at the wait after a trade the page's trim runs read
+        assert backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE == 7
+        shipped = dashboard._trim_select_title(backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE)
+        assert html.unescape(title) == shipped
+        # It says what the choice shuts, and why
         for words in ("Sell is set to no selling", "live trading does not trim",
                       "Each part sold counts as a trade of its own",
                       "Min. price rise can make a trim wait"):
-            assert words in dashboard._TRIM_SELECT_TITLE
+            assert words in shipped
         # A page with the view has no note beside it
         assert 'id="flt-trim-note"' not in page
+
+    def test_the_title_names_the_wait_after_a_trade(self, monkeypatch, tmp_path):
+        title = dashboard._trim_select_title
+        rule = ("each week. A pair is trimmed only when at least {} passed since its last "
+                "purchase, add-on or trim{} Min. price rise can make a trim wait")
+        # Weekly runs are 7 days apart, so a wait of 7 days or fewer holds
+        # no trim back on the page, and the text says so
+        weekly = "; weekly runs are 7 days apart, so this never holds a trim back here."
+        assert rule.format("7 days have", weekly) in title(7)
+        assert rule.format("1 day has", weekly) in title(1)
+        assert rule.format("6 days have", weekly) in title(6)
+        # A longer wait does hold trims back, so nothing of the kind is said
+        for days in (8, 14, 30):
+            assert rule.format(f"{days} days have", ".") in title(days)
+            assert "never holds a trim back" not in title(days)
+        # With no wait there is nothing to count
+        assert ("each week. A pair can be trimmed at any weekly run after a trade on it. "
+                "Min. price rise can make a trim wait") in title(0)
+        assert "days have passed" not in title(0)
+        # Nothing but the wait's sentence differs between two waits
+        assert title(7).replace(rule.format("7 days have", weekly),
+                                rule.format("14 days have", ".")) == title(14)
+        # The week is the gap between two of the backtest's checkpoints
+        first, second = backtester._sale_checkpoints(date(2026, 1, 5), date(2026, 1, 12))
+        assert (second - first).days == dashboard._DAYS_BETWEEN_WEEKLY_RUNS == 7
+        # The page names the wait its trim runs read
+        monkeypatch.setattr(backtester, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", 14)
+        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
+        shown = re.search(r'<select id="flt-trim"[^>]*title="([^"]*)"', page).group(1)
+        assert html.unescape(shown) == title(14)
+
+    @pytest.mark.parametrize("bad", [True, 7.5, 31, -1, "7", None, float("nan"), [7],
+                                     Decimal("NaN"), Decimal("sNaN")])
+    def test_a_bad_wait_never_stops_the_bar_being_drawn(self, bad):
+        # The backtest refuses such a number before it runs; the hover text
+        # is still built from whatever it is handed, and claims nothing
+        # about the week for a value it cannot compare with one (a decimal
+        # NaN raises when it is ordered, and a signalling one when it is
+        # compared at all)
+        text = dashboard._trim_select_title(bad)
+        assert text.startswith("off: no part of a held pair is sold to cut its size.")
+        assert text.endswith("always show it off.")
+        if not isinstance(bad, (int, float)):
+            assert "never holds a trim back" not in text
+        _, _, base = _tr_payload(_kc_sweep())
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(backtester, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", bad)
+            bar = dashboard._filter_bar_html(base, {"all": {"n": 3}})
+        assert f'title="{html.escape(text)}"' in bar
 
     @pytest.mark.parametrize("state, note", [
         ("not simulated", _TRIM_NOT_SIMULATED),

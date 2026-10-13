@@ -100,8 +100,13 @@ Purpose:
     (sell down to the Kelly size)": the same scenario re-simulated so that,
     at each weekly run, a held pair that has outgrown its Kelly size at that
     day's sale prices (or the size cap) is sold down to it
-    (backtester._simulate_at_discount's trim_to_kelly). With Add to held
-    pairs on as well, a pair is topped up or sold down each week. The run
+    (backtester._simulate_at_discount's trim_to_kelly). A pair is trimmed
+    only when at least backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE calendar
+    days have passed since the last trade on it. The weekly runs are 7 days
+    apart, so the shipped 7 days hold no trim back on the page; the select's
+    hover text names the number and says so (_trim_select_title). With Add
+    to held pairs on as well, a pair is topped up or sold down each week.
+    The run
     itself simulates none of them: the sweep carries a lazy family
     (BacktestSweep.trim_sweep), and this module simulates every cell as the
     page is built, the "all" population only (_with_trim, _walk_trim_cells).
@@ -239,7 +244,10 @@ Dependencies:
     repeats another run) by their attributes; imports backtester itself to
     read, and in a worker process install, its SAME_TITLE_SIZE_CAP,
     SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS (_run_sell_task; the last also
-    names the Sell select's rule, _sell_select_title), and to word a minimum
+    names the Sell select's rule, _sell_select_title), to read its
+    KELLY_TRIM_MIN_DAYS_SINCE_TRADE (the days a pair must go without a trade
+    before a Kelly trim, which the Trim to Kelly select's hover text names,
+    _trim_select_title), and to word a minimum
     price rise as a run's label does (_trim_rise_label) — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
     page's file name, which defaults_server opens when run on its own and
@@ -6265,18 +6273,67 @@ _ADD_ON_NOTES = {
 # "off" turns adding off in the defaults
 _ADD_ON_SAVE_NOTE = ("The live defaults add to held pairs; saving with Add to held pairs "
                      "off here turns that off.")
-# The Trim to Kelly view's words: the select's two options and its hover text
+# The Trim to Kelly view's words: the select's two options (its hover text
+# is _trim_select_title's)
 _TRIM_OPTION_OFF = "off"
 _TRIM_OPTION_ON = "on (sell down to the Kelly size)"
-_TRIM_SELECT_TITLE = (
-    "off: no part of a held pair is sold to cut its size. on: at each weekly run, a pair that "
-    "has grown past its Kelly size at that day's sale prices, or past the size cap, is "
-    "sold down to it, the latest purchase first; with Add to held pairs on as well, a "
-    "pair is topped up or sold down each week. Min. price rise can make a trim wait "
-    "until the pair's price has gone up. Each part sold counts as a trade of its "
-    "own. While this is on, Sell is set to no selling (the two are not simulated "
-    "together) and Save as live defaults is unavailable (live trading does not trim). "
-    "The Scenario Explorer and Interval Discount sections always show it off.")
+# The days between two of the backtest's weekly runs (its checkpoints step a
+# week at a time, backtester._sale_checkpoints). A wait after a trade that is
+# no longer than this never holds a Kelly trim back on the page, and the
+# Trim to Kelly select's hover text says so
+_DAYS_BETWEEN_WEEKLY_RUNS = timedelta(weeks=1).days
+
+
+def _trim_select_title(days) -> str:
+    """
+    The Trim to Kelly select's hover text: what "on" does, and how long a trim waits after a trade.
+
+    The number is not checked here: the backtest checks it before it runs
+    (backtester._resolve_trim_min_days). A value that is no number (a string,
+    None, a list), or one that cannot be compared with a number of days (a
+    decimal NaN), still gives a text, so drawing the filter bar does not
+    fail over it.
+
+    Args:
+        days: How many calendar days a held pair must go without a trade
+            before it is trimmed (backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE,
+            as the page's trim runs read it), as it stands.
+
+    Returns:
+        str: The rule in plain words. With a wait, a pair is trimmed only
+            when at least that many days have passed since its last
+            purchase, add-on or trim; with a wait no longer than the week
+            between runs, the text adds that it never holds a trim back on
+            this page. With 0, a pair can be trimmed at any weekly run.
+    """
+    try:
+        # No wait at all, a single day, and whether the week between two
+        # runs already covers the wait
+        none, one = bool(days == 0), bool(days == 1)
+        covered = bool(days <= _DAYS_BETWEEN_WEEKLY_RUNS)
+    except (TypeError, ValueError, ArithmeticError):
+        # Not a number a week can be compared with (a decimal NaN raises an
+        # ArithmeticError when it is ordered): nothing is claimed of it
+        none = one = covered = False
+    if none:
+        wait = "A pair can be trimmed at any weekly run after a trade on it. "
+    else:
+        passed = "day has" if one else "days have"
+        wait = (f"A pair is trimmed only when at least {days} {passed} passed since its "
+                "last purchase, add-on or trim"
+                + (f"; weekly runs are {_DAYS_BETWEEN_WEEKLY_RUNS} days apart, so this never "
+                   "holds a trim back here. " if covered else ". "))
+    return ("off: no part of a held pair is sold to cut its size. on: at each weekly run, a "
+            "pair that has grown past its Kelly size at that day's sale prices, or past the "
+            "size cap, is sold down to it, the latest purchase first; with Add to held pairs "
+            f"on as well, a pair is topped up or sold down each week. {wait}Min. price rise "
+            "can make a trim wait until the pair's price has gone up. Each part sold counts "
+            "as a trade of its own. While this is on, Sell is set to no selling (the two "
+            "are not simulated together) and Save as live defaults is unavailable (live "
+            "trading does not trim). The Scenario Explorer and Interval Discount sections "
+            "always show it off.")
+
+
 # Beside the select when the page keeps it shut, by the payload's "trim_state"
 _TRIM_NOTES = {
     "not simulated": "(not simulated in this backtest)",
@@ -12426,7 +12483,8 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     The Trim to Kelly select after it offers the run as simulated ("off",
     selected) or the same scenario with held pairs sold down to their Kelly
     size ("on (sell down to the Kelly size)"), its title carrying the detail
-    (_TRIM_SELECT_TITLE); a payload with no trim view ("grid_trim" null)
+    (_trim_select_title, at backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE as
+    the page's trim runs read it); a payload with no trim view ("grid_trim" null)
     puts a grey note beside it by its "trim_state" (_TRIM_NOTES), and the
     script never enables it.
     The "Min. price rise" select after it offers "any" (selected: no
@@ -12543,7 +12601,9 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                  '&nbsp;<span id="flt-trim-note" style="color:#9E9E9E; font-size:13px;">'
                  f"{html.escape(_TRIM_NOTES.get(trim_state, _TRIM_NOTES['not simulated']))}"
                  "</span>")
-    trim_title = html.escape(_TRIM_SELECT_TITLE)
+    # The rule names how many days a pair must go without a trade before it
+    # is trimmed, read as the page's trim runs read it
+    trim_title = html.escape(_trim_select_title(_backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE))
     # The Min. price rise choice: any (no minimum, value "0") or a minimum,
     # each option's value its place in the payload's trim_rises plus one
     rise_opts = (f'<option value="0" selected>{html.escape(_TRIM_RISE_OPTION_ANY)}</option>'

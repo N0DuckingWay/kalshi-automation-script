@@ -1,6 +1,7 @@
 """Tests for backtester.py — grouping helpers, P&L math, and entry direction."""
 import ast
 import copy
+import functools
 import gc
 import hashlib
 import inspect
@@ -22155,6 +22156,636 @@ class TestTrimRiseGrid:
             backtester.SameTrim(0.05).min_rise = 0.10
 
 
+_TRIM_WAIT_LINE = "Exact pairs the Kelly trim left alone because they traded fewer than"
+_BAD_TRIM_WAIT = r"KELLY_TRIM_MIN_DAYS_SINCE_TRADE must be a whole number from 0 to 30, got "
+
+
+class TestTrimWait:
+    """A Kelly trim waits until enough calendar days have passed since the
+    last trade on the pair: backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE days
+    (config's 7, read through _resolve_trim_min_days when a run starts)
+    since its latest purchase or add-on, or a later trim (_last_trade_day).
+    The walk asks config.kelly_trim_rested about those two dates before it
+    looks at the pair's price or size, and counts a pair that is waiting on
+    a log line of its own. Only trims wait; buying is untouched.
+
+    The backtest trades once a week, so at 7 days or fewer no trim is ever
+    held back. The tests therefore set the wait to 8, 14, 15 and more, and
+    check the date test itself on days 1 to 8 apart.
+
+    The main fixture is TestTrimToKelly's pair (YES on SA, NO on SB, bought
+    on Monday 1) with prices that rise 6c every week: its total ask is 0.62
+    at its purchase and 0.72, 0.78, 0.84, 0.90 and 0.96 on Mondays 2 to 6.
+    With no wait and a 10% cap it is trimmed on each of those five Mondays.
+    Every simulation is handed k 0.75, and a 10% cap unless it names
+    another."""
+
+    _SUITE = TestSellAtShareOfPotentialProfit
+    _START = date(2026, 1, 1)
+    _END = date(2026, 4, 1)
+    # Mondays 1 to 6: 2026-01-05 to 2026-02-09 (SA pays out on 02-10)
+    _M = tuple(_LADDER_M1 + timedelta(weeks=week) for week in range(6))
+    # (YES ask, NO ask) of SA, then of SB, on Mondays 2 to 6: SA's YES price
+    # creeps up while SB's comes down, so the sides held (YES on SA, NO on
+    # SB) gain 6c a week together
+    _RISING = {_M[1]: ((0.24, 0.78), (0.54, 0.48)), _M[2]: ((0.26, 0.76), (0.50, 0.52)),
+               _M[3]: ((0.28, 0.74), (0.46, 0.56)), _M[4]: ((0.30, 0.72), (0.42, 0.60)),
+               _M[5]: ((0.32, 0.70), (0.38, 0.64))}
+    # The same pair with a dip first: its price falls on Monday 2 (0.52, when
+    # a run that adds to held pairs buys more) and then rises 5c a week from
+    # 0.82 on Monday 3
+    _DIP = {_M[1]: ((0.15, 0.87), (0.65, 0.37)), _M[2]: ((0.30, 0.72), (0.50, 0.52)),
+            _M[3]: ((0.32, 0.70), (0.47, 0.55)), _M[4]: ((0.34, 0.68), (0.44, 0.58)),
+            _M[5]: ((0.36, 0.66), (0.41, 0.61))}
+    # The pair passes again on Monday 2 at the dip's quotes (pA, pB, nB)
+    _DIP_MONDAYS = (_M[0], (_M[1], 0.15, 0.65, 0.35))
+
+    @staticmethod
+    def _wait(monkeypatch, days) -> None:
+        """Set the wait the backtester reads (its own binding, never config's)."""
+        monkeypatch.setattr(backtester, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", days)
+
+    @classmethod
+    def _candles(cls, path=None) -> dict:
+        out = {"SA": [_candle(_ck(cls._M[0]), 0.20, 0.82)],
+               "SB": [_candle(_ck(cls._M[0]), 0.60, 0.42)]}
+        for day, (a, b) in (cls._RISING if path is None else path).items():
+            out["SA"].append(_candle(_ck(day), *a))
+            out["SB"].append(_candle(_ck(day), *b))
+        return out
+
+    @classmethod
+    def _records(cls, mondays=(_LADDER_M1,), path=None) -> list[dict]:
+        return _quoted([cls._SUITE._record(mondays)], cls._candles(path))
+
+    @classmethod
+    def _three_pairs(cls, mondays, path=None) -> list[dict]:
+        """The pair with TestTrimCapSweep's two others: one that pays out on
+        Monday 2 and one bought on Monday 3."""
+        early = _ladder_record(_ladder_market("PA", "EVP-1", "2026-01-12"),
+                               _ladder_market("PB", "EVP-2", "2026-01-12"), "early",
+                               (cls._M[0],))
+        other = _ladder_record(_ladder_market("OA", "EVO-1", "2026-02-10"),
+                               _ladder_market("OB", "EVO-2", "2026-03-20"), "other",
+                               (cls._M[2],))
+        candles = dict(cls._candles(path),
+                       PA=[_candle(_ck(cls._M[0]), 0.20, 0.82)],
+                       PB=[_candle(_ck(cls._M[0]), 0.60, 0.42)],
+                       OA=[_candle(_ck(cls._M[2]), 0.20, 0.82)],
+                       OB=[_candle(_ck(cls._M[2]), 0.60, 0.42)])
+        return _quoted([cls._SUITE._record(mondays), early, other], candles)
+
+    def _sim(self, records, cap=0.10, **kw):
+        return backtester._simulate_at_discount(
+            records, self._START, 10_000.0, k=0.75, size_cap=cap, end_date=self._END,
+            trim_to_kelly=True, **kw)
+
+    @staticmethod
+    def _sold_on(point) -> list[date]:
+        """The checkpoints a trim sold at, in order, each once."""
+        return sorted({t.exit_date for t in point.trades if t.sold})
+
+    @staticmethod
+    def _waiting(caplog) -> list[str]:
+        """Every "left alone because they traded fewer than" line logged."""
+        return [r.getMessage() for r in caplog.records
+                if r.getMessage().startswith(_TRIM_WAIT_LINE)]
+
+    @staticmethod
+    def _same(point, other) -> None:
+        assert [astuple(t) for t in point.trades] == [astuple(t) for t in other.trades]
+        pd.testing.assert_frame_equal(point.equity_df, other.equity_df, check_exact=True)
+        assert point.trim_rises == other.trim_rises
+
+    @staticmethod
+    def _position(*entry_days) -> list:
+        """One exact pair's open trades (QA / QB), entered on these days,
+        every one after the first an add-on."""
+        first = _held_trade(100, _sale_quotes("QA", 0.40, 0.58, None),
+                            _sale_quotes("QB", 0.44, 0.55, None))
+        return [dc_replace(first, entry_date=day, add_on=index > 0)
+                for index, day in enumerate(entry_days)]
+
+    # ── The number of days, and the day they count from ──
+
+    def test_the_wait_is_config_s_seven_days_read_from_this_module_when_called(
+            self, monkeypatch):
+        assert backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE == 7
+        assert backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE is config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE
+        assert backtester._resolve_trim_min_days() == 7
+        # config's binding is not the one read
+        monkeypatch.setattr(config, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", 3)
+        assert backtester._resolve_trim_min_days() == 7
+        for days in (0, 8, 30, np.int64(14)):
+            self._wait(monkeypatch, days)
+            resolved = backtester._resolve_trim_min_days()
+            assert resolved == days and type(resolved) is int
+        # The check, and the rule itself, are config's own
+        assert backtester.kelly_trim_min_days is config.kelly_trim_min_days
+        assert backtester.kelly_trim_rested is config.kelly_trim_rested
+
+    def test_the_last_trade_is_the_latest_purchase_add_on_or_trim(self):
+        last = backtester._last_trade_day
+        pair = ("QA", "QB")
+        bought, added, trimmed = date(2026, 1, 6), date(2026, 1, 9), date(2026, 1, 15)
+        # A purchase alone; an add-on is a later trade of the pair
+        assert last(self._position(bought), {}) == bought
+        assert last(self._position(bought, added), {}) == added
+        # A trim counts when it is the later of the two, and not otherwise
+        assert last(self._position(bought, added), {pair: trimmed}) == trimmed
+        assert last(self._position(bought, added), {pair: date(2026, 1, 8)}) == added
+        assert last(self._position(bought, added), {pair: added}) == added
+        # Once a trim has sold the add-on whole, only the first purchase is
+        # open: the trim, not that purchase, is still the pair's last trade
+        assert last(self._position(bought), {pair: trimmed}) == trimmed
+        # Another pair's trim, or these two markets the other way round, is not this pair's
+        others = {("QB", "QA"): trimmed, ("XA", "XB"): trimmed}
+        assert last(self._position(bought, added), others) == added
+        # A plain date, which is all config.kelly_trim_rested accepts
+        assert type(last(self._position(bought, added), {pair: trimmed})) is date
+
+    def test_the_price_rise_is_measured_from_that_same_day(self):
+        # One reading of the day for both waits: _price_rise's two prices are
+        # the pair's price on _last_trade_day and on the day looked at
+        (held,) = backtester._simulate_at_discount(
+            self._records(), self._START, 10_000.0, k=0.75, size_cap=0.10,
+            end_date=self._END).trades
+        added = dc_replace(held, entry_date=self._M[1], add_on=True)
+        for position, trims in (([held], {}), ([held, added], {}),
+                                ([held], {("SA", "SB"): self._M[2]}),
+                                ([held, added], {("SA", "SB"): self._M[3]})):
+            day = self._M[4]
+            since = backtester._last_trade_day(position, trims)
+            assert backtester._price_rise(position, day, trims) == config.pair_price_rise(
+                backtester._pair_price(held, since), backtester._pair_price(held, day))
+
+    @pytest.mark.parametrize("last_trade", ["purchase", "add-on", "trim"])
+    @pytest.mark.parametrize("gap", range(1, 9))
+    def test_the_check_is_a_test_of_two_dates_not_a_skipped_week(self, last_trade, gap):
+        # The pair last traded `gap` days before the day it is looked at, a
+        # Tuesday, which is no checkpoint: 1 to 8 days apart, not weeks
+        day = date(2026, 1, 20)
+        then = day - timedelta(days=gap)
+        long_ago = then - timedelta(days=30)
+        if last_trade == "purchase":
+            position, trims = self._position(then), {}
+        elif last_trade == "add-on":
+            position, trims = self._position(long_ago, then), {}
+        else:
+            position, trims = self._position(long_ago), {("QA", "QB"): then}
+        last_day = backtester._last_trade_day(position, trims)
+        assert last_day == then
+        # Not rested through day 6, rested from day 7
+        assert backtester.kelly_trim_rested(last_day, day, 7) is (gap >= 7)
+        # ... and at any other wait the same two dates decide
+        for wait in (0, 1, 6, 8, 14):
+            assert backtester.kelly_trim_rested(last_day, day, wait) is (gap >= wait)
+
+    @pytest.mark.parametrize("days_after_monday", range(0, 7))
+    def test_through_the_walk_a_pair_waits_by_the_days_since_it_was_bought(
+            self, monkeypatch, caplog, days_after_monday):
+        # A pair bought 0 to 6 days after Monday 1 is first looked at on
+        # Monday 2, 7 down to 1 days later. Whether it waits there is those
+        # days against the wait, whatever weekday it was bought on. (It has
+        # no quotes, so it is never trimmed: the count on the line is what
+        # shows the walk's answer.)
+        bought = self._M[0] + timedelta(days=days_after_monday)
+        gap = 7 - days_after_monday
+        asked: list = []
+        real = backtester.kelly_trim_rested
+
+        def spy(last_trade, day, min_days):
+            asked.append((last_trade, day, min_days))
+            return real(last_trade, day, min_days)
+
+        monkeypatch.setattr(backtester, "kelly_trim_rested", spy)
+        for wait in range(0, 9):
+            self._wait(monkeypatch, wait)
+            asked.clear()
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                point = self._sim([self._SUITE._record((bought,))], cap=0.20)
+            assert _traded(point) == [("SA", bought)]
+            # Asked about the day it was bought, on Monday 2 and then a week later
+            assert asked[:2] == [(bought, self._M[1], wait), (bought, self._M[2], wait)]
+            lines = self._waiting(caplog)
+            if gap < wait:
+                assert lines == [f"{_TRIM_WAIT_LINE} {wait} days before "
+                                 f"({_label(0.20)}, trimming to Kelly): 1"], (gap, wait)
+            else:
+                assert lines == [], (gap, wait)
+
+    # ── A week or less holds nothing back; more does ──
+
+    @pytest.mark.parametrize("wait", [0, 1, 6, 7])
+    def test_a_wait_of_a_week_or_less_holds_no_trim_back(self, monkeypatch, caplog, wait):
+        records = self._records()
+        self._wait(monkeypatch, 0)
+        base = self._sim(records)
+        assert self._sold_on(base) == list(self._M[1:])
+        assert base.trim_rises == pytest.approx((0.10, 0.06, 0.06, 0.06, 0.06), abs=1e-12)
+        self._wait(monkeypatch, wait)
+        with caplog.at_level(logging.DEBUG):
+            point = self._sim(records)
+        self._same(point, base)
+        assert point.cap_free_from == base.cap_free_from
+        assert self._waiting(caplog) == []
+
+    def test_at_8_days_a_pair_is_first_trimmed_two_weeks_after_it_was_bought(
+            self, monkeypatch, caplog):
+        records = self._records()
+        (held,) = backtester._simulate_at_discount(
+            records, self._START, 10_000.0, k=0.75, size_cap=0.10, end_date=self._END).trades
+        base = self._sim(records)
+        self._wait(monkeypatch, 8)
+        with caplog.at_level(logging.INFO):
+            point = self._sim(records)
+        # Bought on Monday 1: Monday 2 is 7 days on, one short. Monday 3
+        # trims. That trim blocks Monday 4, Monday 5 trims, and that trim
+        # blocks Monday 6
+        assert self._sold_on(point) == [self._M[2], self._M[4]]
+        kept, first, second = point.trades
+        assert (first.exit_date, second.exit_date) == (self._M[2], self._M[4])
+        assert not kept.sold and kept.n + first.n + second.n == held.n
+        # Each rise is measured from the last trade: the purchase (0.62 to
+        # 0.78), then Monday 3's trim (0.78 to 0.90)
+        assert point.trim_rises == pytest.approx((0.16, 0.12), abs=1e-12)
+        # Monday 3's trim is on the pair nothing was sold from, so it sells
+        # more than the run with no wait sells there
+        assert first.n > next(t.n for t in base.trades if t.exit_date == self._M[2])
+        # The pair waited on Mondays 2, 4 and 6; from Monday 7 it has rested
+        # (and has no fresh quote to be trimmed on)
+        line = f"{_TRIM_WAIT_LINE} 8 days before ({_label(0.10)}, trimming to Kelly): 3"
+        assert self._waiting(caplog) == [line]
+        assert {r.getMessage(): r.levelno for r in caplog.records}[line] == logging.INFO
+        # A quiet run (a lazy size-cap cell) logs it at DEBUG
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            self._same(self._sim(records, quiet=True), point)
+        assert {r.getMessage(): r.levelno for r in caplog.records}[line] == logging.DEBUG
+
+    @pytest.mark.parametrize("wait, trimmed_on, waited", [
+        # Two weeks is 14 days: Monday 3, then Monday 5
+        (14, [2, 4], 3),
+        # A wait longer than two weeks: Monday 4 is the first 15 days on, and
+        # the next, Monday 7, has no fresh quote
+        (15, [3], 4),
+        (21, [3], 4),
+        (22, [4], 6),
+        # config's longest wait: Monday 6, 35 days on
+        (30, [5], 8),
+    ])
+    def test_a_longer_wait_trims_the_first_monday_that_many_days_on(
+            self, monkeypatch, caplog, wait, trimmed_on, waited):
+        self._wait(monkeypatch, wait)
+        with caplog.at_level(logging.INFO):
+            point = self._sim(self._records())
+        assert self._sold_on(point) == [self._M[index] for index in trimmed_on]
+        assert self._waiting(caplog) == [
+            f"{_TRIM_WAIT_LINE} {wait} days before ({_label(0.10)}, trimming to Kelly): "
+            f"{waited}"]
+
+    def test_an_add_on_restarts_the_wait_and_so_does_a_trim_that_sells_it_whole(
+            self, monkeypatch, caplog):
+        # The pair's price dips on Monday 2, where a run that adds to held
+        # pairs buys more of it, then rises every week
+        def run(**kw):
+            return self._sim(self._records(self._DIP_MONDAYS, self._DIP), **kw)
+
+        # With no wait: trimmed on Mondays 3 to 6, adding or not
+        self._wait(monkeypatch, 0)
+        assert self._sold_on(run()) == list(self._M[2:])
+        assert self._sold_on(run(add_to_held=True)) == list(self._M[2:])
+        self._wait(monkeypatch, 8)
+        # Without the add-on the purchase is 14 days old on Monday 3: trimmed
+        # there, and then on Monday 5
+        assert self._sold_on(run()) == [self._M[2], self._M[4]]
+        with caplog.at_level(logging.INFO):
+            point = run(add_to_held=True)
+        kept, add_on, part, later = point.trades
+        assert add_on.add_on and add_on.entry_date == self._M[1]
+        # The add-on on Monday 2 blocks Monday 3. Monday 4's trim sells the
+        # add-on whole and part of the first purchase
+        assert (add_on.sold, add_on.exit_date) == (True, self._M[3])
+        assert (part.sold, part.add_on, part.exit_date) == (True, False, self._M[3])
+        # Only the purchase of Monday 1 is open after that, but the pair
+        # last traded at Monday 4's trim: Monday 5 is blocked, Monday 6 trims
+        assert (later.sold, later.add_on, later.exit_date) == (True, False, self._M[5])
+        assert not kept.sold and kept.entry_date == self._M[0]
+        assert self._sold_on(point) == [self._M[3], self._M[5]]
+        assert point.trim_rises == pytest.approx((0.87 - 0.52, 0.97 - 0.87), abs=1e-12)
+        # It waited on Monday 2 (before the add-on was bought), 3, 5 and 7
+        assert [line.rsplit(": ", 1)[1] for line in self._waiting(caplog)] == ["4"]
+        # Buying is not held back: the add-on is the one the run with no wait buys
+        self._wait(monkeypatch, 0)
+        added = next(t for t in run(add_to_held=True).trades if t.add_on)
+        assert (add_on.n, add_on.entry_date, add_on.total_cost, add_on.fees) == (
+            added.n, added.entry_date, added.total_cost, added.fees)
+
+    def test_the_line_counts_exact_pairs_only(self, monkeypatch, caplog):
+        # TestAddToALoneLeg's fixture: P (YES PA / NO PB) bought on Monday 1,
+        # PA paying out on 01-10; on Monday 2 Q (YES QA / NO PB) adds to the
+        # leg left open. From then on the position holds a third market, so
+        # it is not one exact pair
+        pb = _ladder_market("PB", "EVB-1", "2026-03-20")
+        p = _ladder_record(_ladder_market("PA", "EVA-1", "2026-01-10"), pb, "q",
+                           [(self._M[0], 0.20, 0.45, 0.55)])
+        q = _ladder_record(_ladder_market("QA", "EVQ-1", "2026-03-20"), pb, "q",
+                           [(self._M[1], 0.20, 0.70, 0.30)])
+        self._wait(monkeypatch, 15)
+        with caplog.at_level(logging.INFO):
+            point = backtester._simulate_at_discount(
+                [p, q], self._START, 10_000.0, k=0.85, size_cap=0.20, end_date=self._END,
+                add_to_held=True, trim_to_kelly=True)
+        first, add = point.trades
+        assert _traded(point) == [("PA", self._M[0]), ("QA", self._M[1])]
+        assert add.add_on and not backtester._exact_pair([first, add])
+        # Counted once: P alone on Monday 2, 7 days after it was bought. On
+        # Mondays 3 and 4 the add-on is 7 and 14 days old, short of the 15,
+        # but the position is no exact pair, so it is not counted
+        (line,) = self._waiting(caplog)
+        assert line.startswith(f"{_TRIM_WAIT_LINE} 15 days before (k=0.850, band 0-1, all")
+        assert line.endswith(", adding to held pairs, trimming to Kelly): 1")
+
+    @pytest.mark.parametrize("wait, waited, held_back", [(7, 0, 10), (8, 1, 9), (15, 2, 8)])
+    def test_a_waiting_pair_is_not_counted_on_the_price_rise_line(
+            self, monkeypatch, caplog, wait, waited, held_back):
+        # Under a 95c minimum no Monday ever trims. The pair is looked at on
+        # each of the ten checkpoints from Monday 2 to its pay-out, and each
+        # is counted on one line or the other, never both
+        assert len(backtester._sale_checkpoints(self._M[1], date(2026, 3, 20))) == 10
+        self._wait(monkeypatch, wait)
+        with caplog.at_level(logging.INFO):
+            point = self._sim(self._records(), trim_min_rise=0.95)
+        assert point.trim_rises == ()
+        label = f"{_label(0.10)}, trimming to Kelly only after a 95c price rise"
+        messages = [r.getMessage() for r in caplog.records]
+        assert self._waiting(caplog) == (
+            [f"{_TRIM_WAIT_LINE} {wait} days before ({label}): {waited}"] if waited else [])
+        assert (f"{TestTrimMinRise._HELD_BACK} 95c since its last trade ({label}): "
+                f"{held_back}") in messages
+        # The wait is asked first, so its line comes first
+        if waited:
+            assert messages.index(self._waiting(caplog)[0]) < next(
+                i for i, m in enumerate(messages) if m.startswith(TestTrimMinRise._HELD_BACK))
+
+    def test_with_a_minimum_price_rise_too_each_trim_needs_both(self, monkeypatch, caplog):
+        records = self._records()
+        # With no wait and a 15c minimum: Monday 3 (+16c since the purchase),
+        # then Monday 6 (+18c since that trim)
+        self._wait(monkeypatch, 0)
+        base = self._sim(records, trim_min_rise=0.15)
+        assert self._sold_on(base) == [self._M[2], self._M[5]]
+        # At 8 days the same two Mondays have both: the wait only holds back
+        # Mondays the minimum would have held back anyway, so it is that run
+        self._wait(monkeypatch, 8)
+        with caplog.at_level(logging.INFO):
+            point = self._sim(records, trim_min_rise=0.15)
+        self._same(point, base)
+        label = f"{_label(0.10)}, trimming to Kelly only after a 15c price rise"
+        messages = [r.getMessage() for r in caplog.records]
+        # Ten checkpoints: two trims, three waiting (Mondays 2, 4 and 7) and
+        # five short of the minimum
+        assert f"{_TRIM_WAIT_LINE} 8 days before ({label}): 3" in messages
+        assert f"{TestTrimMinRise._HELD_BACK} 15c since its last trade ({label}): 5" in messages
+        # At 15 days Monday 3 is too soon: Monday 4 trims (+22c since the purchase)
+        self._wait(monkeypatch, 15)
+        later = self._sim(records, trim_min_rise=0.15)
+        assert self._sold_on(later) == [self._M[3]]
+        assert later.trim_rises == pytest.approx((0.22,), abs=1e-12)
+
+    def test_a_run_in_which_every_trim_waits_is_the_run_that_cannot_trim(self, monkeypatch):
+        # TestTrimToKelly's pair has fresh quotes on Mondays 2 to 4 only: at
+        # 30 days nothing is ever trimmed, and the run is the one without the
+        # switch. A waiting pair is asked for no decision, so the cap the run
+        # stops depending on is the purchases' own
+        records = TestTrimToKelly()._records()
+        plain = backtester._simulate_at_discount(
+            records, self._START, 10_000.0, k=0.75, size_cap=0.20, end_date=self._END)
+        self._wait(monkeypatch, 0)
+        trimming = self._sim(records, cap=0.20)
+        assert trimming.trim_rises and trimming.cap_free_from > plain.cap_free_from
+        self._wait(monkeypatch, 30)
+        point = self._sim(records, cap=0.20)
+        assert [astuple(t) for t in point.trades] == [astuple(t) for t in plain.trades]
+        pd.testing.assert_frame_equal(point.equity_df, plain.equity_df, check_exact=True)
+        assert point.trim_rises == () and point.trim_to_kelly is True
+        assert point.cap_free_from == plain.cap_free_from
+
+    # ── The dashboard's shortcuts stay exact under a wait ──
+
+    def _parity_entries(self, fixture: str) -> list[dict]:
+        if fixture == "TestTrimCapSweep's three pairs":
+            return TestTrimCapSweep()._entries()
+        if fixture == "rising":
+            return self._three_pairs((self._M[0], self._M[1], self._M[2]))
+        return self._three_pairs(self._DIP_MONDAYS, self._DIP)
+
+    @pytest.mark.parametrize("fixture, add", [
+        ("TestTrimCapSweep's three pairs", False), ("TestTrimCapSweep's three pairs", True),
+        ("rising", False), ("rising", True), ("dip", False), ("dip", True)])
+    @pytest.mark.parametrize("wait", [8, 15])
+    def test_under_a_wait_every_cap_of_a_trimming_cap_sweep_equals_a_fresh_simulation(
+            self, monkeypatch, wait, fixture, add):
+        caps = TestTrimCapSweep()
+        entries = self._parity_entries(fixture)
+        # The runs at the shipped 7 days, which hold no trim back
+        seven = {(k, cap): caps._fresh(entries, k, cap, add)
+                 for k in (0.5, 0.75) for cap in backtester.SIZE_CAP_SWEEP}
+        self._wait(monkeypatch, wait)
+        cs = caps._sweep(entries, (0.5, 0.75), add=add)
+        trimmed = changed = 0
+        for k in cs.ks:
+            cell = cs.cell(caps._BAND, k)
+            for cap in cs.caps:
+                point, fresh = cell[cap]["all"], caps._fresh(entries, k, cap, add)
+                assert (point.size_cap, point.trim_to_kelly, point.add_to_held) == (
+                    cap, True, add)
+                assert [astuple(t) for t in point.trades] == [
+                    astuple(t) for t in fresh.trades], (k, cap)
+                pd.testing.assert_frame_equal(point.equity_df, fresh.equity_df)
+                assert point.trim_rises == fresh.trim_rises
+                trimmed += bool(point.trim_rises)
+                changed += [astuple(t) for t in fresh.trades] != [
+                    astuple(t) for t in seven[(k, cap)].trades]
+        # Not vacuous: the fixture still trims under the wait, the wait
+        # changes some caps' runs, and some caps share a simulation
+        assert trimmed > 0 and changed > 0 and cs.reused > 0
+        assert cs.simulated + cs.reused == len(cs.ks) * len(cs.caps)
+
+    @pytest.mark.parametrize("wait", [8, 15])
+    def test_under_a_wait_every_minimum_and_cap_of_the_rise_grid_equals_a_fresh_simulation(
+            self, monkeypatch, wait):
+        # TestTrimRiseGrid's parity check (every cell against a fresh
+        # simulation at that minimum and cap, a SameTrim through the run it
+        # names), over its three fixtures and this class's two
+        grid = TestTrimRiseGrid()
+        self._wait(monkeypatch, wait)
+        kinds: Counter = Counter()
+        for entries, rises, caps in (
+                (grid._entries(), grid._SHORT, backtester.SIZE_CAP_SWEEP),
+                (grid._add_on_entries(), (0.05, 0.40, 0.45, 0.50), (0.10, 0.20)),
+                (grid._fall_entries(), (0.01, 0.02, 0.05, 0.30, 0.35), (0.10, 0.20)),
+                (self._parity_entries("rising"), (0.05, 0.10, 0.15, 0.20, 0.30, 0.35),
+                 backtester.SIZE_CAP_SWEEP),
+                (self._parity_entries("dip"), (0.05, 0.10, 0.15, 0.20, 0.30, 0.35),
+                 backtester.SIZE_CAP_SWEEP)):
+            family = grid._family(entries, rises, caps=caps)
+            for k in grid._KS:
+                for add in (False, True):
+                    kinds += grid._parity(family, entries, k, add)
+        # Not vacuous: runs simulated, some still trimming and some no
+        # longer, and runs stood in for by the run with no minimum and by a
+        # run at a smaller minimum
+        for kind in ("point that trims", "point that trims nothing", "same as no minimum",
+                     "same as a smaller minimum"):
+            assert kinds[kind] > 0, (kind, kinds)
+
+    # ── A bad number of days ──
+
+    @pytest.mark.parametrize("bad", [True, False, 7.5, 7.0, 31, -1, "7", None])
+    def test_a_bad_wait_is_refused_before_any_entry_is_scored(self, monkeypatch, bad):
+        self._wait(monkeypatch, bad)
+        # [{}] raises KeyError the moment Pass 1b scores it, so a ValueError
+        # here was raised before any entry was scored
+        with pytest.raises(ValueError, match=_BAD_TRIM_WAIT):
+            self._sim([{}])
+        with pytest.raises(ValueError, match=_BAD_TRIM_WAIT):
+            backtester._resolve_trim_min_days()
+        # A run that does not trim never reads it
+        with pytest.raises(KeyError):
+            backtester._simulate_at_discount([{}], self._START, 10_000.0, k=0.75,
+                                             size_cap=0.10, end_date=self._END)
+        point = backtester._simulate_at_discount(
+            self._records(), self._START, 10_000.0, k=0.75, size_cap=0.10, end_date=self._END)
+        assert point.trim_to_kelly is False and point.trim_rises is None
+
+    @pytest.mark.parametrize("options", [
+        {}, {"trim_sweep": False}, {"trim_sweep": True},
+        {"trim_sweep": True, "trim_rise_sweep": True},
+        {"band_sweep": True, "cap_sweep": True, "sell_sweep": True}])
+    @pytest.mark.parametrize("bad", [True, 7.5, 31, -1, "7"])
+    def test_a_bad_wait_is_refused_before_the_fetch_on_every_run(self, monkeypatch, caplog,
+                                                                  bad, options):
+        # With the Trim to Kelly family or without it: the dashboard names
+        # the number on every page
+        self._wait(monkeypatch, bad)
+        monkeypatch.setattr(backtester, "_prepare_candidates",
+                            lambda *a, **k: pytest.fail("fetched"))
+        with caplog.at_level(logging.INFO), pytest.raises(ValueError, match=_BAD_TRIM_WAIT):
+            run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                               start_date=date(2026, 1, 1), **options)
+        # Refused before the run's first line
+        assert not caplog.records
+
+    # ── What the walk hands the rule ──
+
+    def test_the_walk_hands_the_rule_plain_dates_and_the_wait_it_resolved(self, monkeypatch):
+        # Entries from the real entry pass (the golden fixture), so the dates
+        # are the ones a backtest run makes: config.kelly_trim_rested takes
+        # nothing but two plain dates
+        golden = TestPrepareEntriesGolden()
+        with monkeypatch.context() as mp:
+            golden._patch(mp)
+            entries, _ = backtester._prepare_entries(MagicMock(), MagicMock(), golden._START,
+                                                     True, None, same_event_ladders=True)
+        asked: list = []
+        real = backtester.kelly_trim_rested
+
+        def spy(last_trade, day, min_days):
+            asked.append((last_trade, day, min_days))
+            return real(last_trade, day, min_days)
+
+        monkeypatch.setattr(backtester, "kelly_trim_rested", spy)
+        for wait in (7, 8):
+            self._wait(monkeypatch, wait)
+            asked.clear()
+            point = backtester._simulate_at_discount(
+                entries, golden._START, 10_000.0, k=0.5, size_cap=0.05,
+                end_date=date(2026, 9, 30), add_to_held=True, trim_to_kelly=True)
+            assert point.trades and asked
+            for last_trade, day, min_days in asked:
+                assert type(last_trade) is date and type(day) is date
+                assert last_trade < day
+                assert min_days == wait and type(min_days) is int
+            # Every day it asks about is a weekly checkpoint, and so is
+            # every day a pair last traded on
+            weekday = backtester.SCHEDULED_RUN.weekday
+            assert {day.weekday() for _last, day, _days in asked} == {weekday}
+            assert {last.weekday() for last, _day, _days in asked} == {weekday}
+
+
+class _AlsoWithNoWait:
+    """Mixed into a trim test class to run its tests once more with every
+    trimming simulation made twice: at the shipped wait of 7 days, and again
+    with no wait at all. The two must be one run, trade for trade and curve
+    for curve, with the same trim_rises, and no pair may be found waiting at
+    either setting (so the waiting line is never logged). A week between
+    checkpoints already covers a wait of 7 days, so the wait changes nothing
+    any of these classes' fixtures show."""
+
+    @pytest.fixture(autouse=True)
+    def _every_trimming_run_is_made_again_with_no_wait(self, monkeypatch):
+        assert backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE == 7
+        walk = backtester._simulate_at_discount
+        rule = backtester.kelly_trim_rested
+        self.compared = 0
+
+        def rested(last_trade, day, min_days):
+            answer = rule(last_trade, day, min_days)
+            assert answer, f"a pair last traded {last_trade} waited on {day} ({min_days} days)"
+            return answer
+
+        # Wrapped, so a test that reads the walk's signature still reads it
+        @functools.wraps(walk)
+        def both(*args, **kwargs):
+            point = walk(*args, **kwargs)
+            if not kwargs.get("trim_to_kelly"):
+                return point
+            # The same run with no wait, its log lines kept out of the test's own
+            muted = logging.root.manager.disable
+            with monkeypatch.context() as mp:
+                mp.setattr(backtester, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", 0)
+                logging.disable(logging.CRITICAL)
+                try:
+                    again = walk(*args, **kwargs)
+                finally:
+                    logging.disable(muted)
+            assert [astuple(t) for t in again.trades] == [astuple(t) for t in point.trades]
+            pd.testing.assert_frame_equal(again.equity_df, point.equity_df, check_exact=True)
+            assert again.trim_rises == point.trim_rises
+            assert again.cap_free_from == point.cap_free_from
+            self.compared += 1
+            return point
+
+        monkeypatch.setattr(backtester, "kelly_trim_rested", rested)
+        monkeypatch.setattr(backtester, "_simulate_at_discount", both)
+
+    def test_a_trimming_run_here_is_compared_with_the_run_with_no_wait(self):
+        # The mixin's own check: it does compare, and a run that cannot trim
+        # is left alone
+        records = TestTrimToKelly()._records()
+        TestTrimToKelly()._sim(records)
+        assert self.compared == 0
+        point = TestTrimToKelly()._sim(records, trim_to_kelly=True)
+        assert self.compared == 1 and point.trim_rises
+
+
+class TestTrimWaitOfAWeekChangesNoTrimToKellyRun(_AlsoWithNoWait, TestTrimToKelly):
+    """Every TestTrimToKelly test again, each trimming simulation compared
+    with the same one made with no wait (_AlsoWithNoWait)."""
+
+
+class TestTrimWaitOfAWeekChangesNoTrimMinRiseRun(_AlsoWithNoWait, TestTrimMinRise):
+    """Every TestTrimMinRise test again, each trimming simulation compared
+    with the same one made with no wait (_AlsoWithNoWait)."""
+
+
+class TestTrimWaitOfAWeekChangesNoTrimCapSweepRun(_AlsoWithNoWait, TestTrimCapSweep):
+    """Every TestTrimCapSweep test again, each trimming simulation compared
+    with the same one made with no wait (_AlsoWithNoWait)."""
+
+
 @pytest.fixture(scope="class")
 def trim_run():
     """The golden band sweep with the Kelly-trim family, over add_on_run's
@@ -22236,8 +22867,10 @@ class TestTrimSweep:
     with nothing simulated during the run."""
 
     _TRIMMING = "Trimming to Kelly"
-    _SETTING_ON = (f"{_TRIMMING} (backtest): on — the dashboard's Trim to Kelly select is "
-                   "simulated when the dashboard is built")
+    _SETTING_ON = (f"{_TRIMMING} (backtest): on — a held pair is trimmed only when at least 7 "
+                   "days have passed since the last trade on it "
+                   "(config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE); the dashboard's Trim to Kelly "
+                   "select is simulated when the dashboard is built")
     _SUMMARY = (f"{_TRIMMING}: 20 size cap(s) x 4 band(s) (2 with the tier floors off) x 3 k, "
                 "adding to held pairs or not, each simulated when the dashboard reads it")
 
@@ -22395,6 +23028,30 @@ class TestTrimSweep:
                 r.getMessage() for r in caplog.records]
         assert backtester._trim_rises_span((0.05, 0.95)) == "5c to 95c"
         assert backtester._trim_rises_span((0.125, 1.0)) == "12.5c to 100c"
+
+    def test_the_setting_line_names_the_wait_after_a_trade_it_resolved(self, monkeypatch,
+                                                                         caplog):
+        monkeypatch.setattr(backtester, "_prepare_candidates", lambda *a, **k: None)
+        for days, words in ((0, "with no wait after a trade on it"),
+                            (1, "only when at least 1 day has passed since the last trade on it"),
+                            (14, "only when at least 14 days have passed since the last trade "
+                                 "on it")):
+            monkeypatch.setattr(backtester, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", days)
+            assert backtester._trim_wait_text(days) == words
+            caplog.clear()
+            with caplog.at_level(logging.INFO):
+                run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                   start_date=date(2026, 1, 1), trim_sweep=True)
+                # A run without the family says nothing about the wait
+                run_backtest_sweep(hist_client=MagicMock(), live_client=MagicMock(),
+                                   start_date=date(2026, 1, 1))
+            assert [r.getMessage() for r in caplog.records
+                    if r.getMessage().startswith(f"{self._TRIMMING} (backtest): o")] == [
+                f"{self._TRIMMING} (backtest): on — a held pair is trimmed {words} "
+                "(config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE); the dashboard's Trim to Kelly "
+                "select is simulated when the dashboard is built",
+                f"{self._TRIMMING} (backtest): off — the dashboard's Trim to Kelly select "
+                "stays disabled"]
 
     @pytest.mark.parametrize("entry", ["run_backtest_sweep", "_sweep_from_candidates"])
     def test_the_minimum_price_rises_need_the_family(self, monkeypatch, caplog, entry):
