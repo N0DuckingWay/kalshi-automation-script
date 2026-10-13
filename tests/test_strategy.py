@@ -3750,6 +3750,107 @@ class TestTimeSeriesKellyParity:
         for func in ("_far_enough", "_sale_reach"):
             assert _function_calls(backtester, func, "_days_left"), func
 
+    def test_ast_a_trim_waits_for_a_price_rise_through_one_definition(self):
+        # With a minimum price rise (trim_min_rise), the walk asks one
+        # question before it sizes a trim: has the pair's total price risen
+        # far enough since the last trade on it? The answer comes from
+        # config's two functions, which live code can import
+        # (pair_price_rise for the rise, trim_rise_reached for the test), and
+        # the two prices from the quote an open trade is valued at: _price_rise
+        # reads the pair's price at both moments through _pair_price, which
+        # reads each leg through _leg_mark, the one reader of a checkpoint quote
+        assert backtester.pair_price_rise is config.pair_price_rise
+        assert backtester.trim_rise_reached is config.trim_rise_reached
+        assert _function_calls(backtester, "planned_trims", "_price_rise")
+        assert _function_calls(backtester, "planned_trims", "trim_rise_reached")
+        assert _function_calls(backtester, "_price_rise", "_pair_price")
+        assert _function_calls(backtester, "_price_rise", "pair_price_rise")
+        assert _function_calls(backtester, "_pair_price", "_leg_mark")
+        # A position the trim leaves alone has no rise to test
+        assert _function_calls(backtester, "_price_rise", "_exact_pair")
+        # The walk measures every pair's rise in one place, and asks before
+        # the trim is sized: a pair short of the minimum is never handed to
+        # _kelly_trim
+        tree = ast.parse(inspect.getsource(backtester))
+        rise_callers = {func.name for func in ast.walk(tree)
+                        if isinstance(func, ast.FunctionDef)
+                        and any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                                and sub.func.id == "_price_rise" for sub in ast.walk(func))}
+        assert rise_callers == {"_simulate_at_discount", "planned_trims"}
+        plan = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                    and node.name == "planned_trims")
+        [measured] = _calls_to(plan, "_price_rise")
+        [tested] = _calls_to(plan, "trim_rise_reached")
+        [decided] = _calls_to(plan, "_kelly_trim")
+        assert measured.lineno < tested.lineno < decided.lineno
+        assert [ast.unparse(arg) for arg in measured.args] == ["position", "d", "last_trim"]
+        assert [ast.unparse(arg) for arg in tested.args] == ["rise", "min_rise"]
+        # ... and the trim that is carried out notes its checkpoint, the day
+        # the pair's next rise is measured from
+        carry_out = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                         and node.name == "trim")
+        noted = [node for node in ast.walk(carry_out) if isinstance(node, ast.Assign)
+                 and isinstance(node.targets[0], ast.Subscript)
+                 and ast.unparse(node.targets[0].value) == "last_trim"]
+        assert [ast.unparse(node.value) for node in noted] == ["d"]
+        # The minimum is checked where the other options are, before any
+        # entry is scored, and a CapSweep checks it as it is built
+        assert _function_calls(backtester, "_simulate_at_discount", "_resolve_trim_min_rise")
+        cap_sweep = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                         and node.name == "CapSweep")
+        built = next(node for node in cap_sweep.body if isinstance(node, ast.FunctionDef)
+                     and node.name == "__post_init__")
+        assert _calls_to(built, "_resolve_trim_min_rise")
+
+    def test_ast_a_run_stands_for_a_larger_minimum_through_the_walk_s_own_test(self):
+        # TrimSweep.rise_grid lets a run it already has stand for a larger
+        # minimum price rise only when every trim that run made would still
+        # be made there. It asks config.trim_rise_reached about each of the
+        # run's rises: the function the walk itself holds a trim back with
+        # (planned_trims), so the two cannot disagree at a boundary
+        assert backtester.trim_rise_reached is config.trim_rise_reached
+        tree = ast.parse(inspect.getsource(backtester))
+        family = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                      and node.name == "TrimSweep")
+        grid = next(node for node in family.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "rise_grid")
+        [covered] = _calls_to(grid, "trim_rise_reached")
+        assert [ast.unparse(arg) for arg in covered.args] == ["rise", "min_rise"]
+        # ... for every trim the run made: the call is what all(...) tests,
+        # over the rises kept of that run
+        [every] = [node for node in ast.walk(grid) if isinstance(node, ast.Call)
+                   and isinstance(node.func, ast.Name) and node.func.id == "all"
+                   and any(sub is covered for sub in ast.walk(node))]
+        [tested] = every.args
+        assert isinstance(tested, ast.GeneratorExp) and tested.elt is covered
+        [loop] = tested.generators
+        assert (ast.unparse(loop.target), ast.unparse(loop.iter), loop.ifs) == (
+            "rise", "rises", [])
+        # Only the walk and the grid ask it (each named with the function it sits in)
+        askers = {func.name for func in ast.walk(tree) if isinstance(func, ast.FunctionDef)
+                  and _calls_to(func, "trim_rise_reached")}
+        assert askers == {"_simulate_at_discount", "planned_trims", "rise_grid", "cells_at"}
+
+        def rise_comparisons(source_tree: ast.AST) -> list[str]:
+            """Every <, <=, > or >= with a side that names a price rise."""
+            def names_a_rise(node: ast.AST) -> bool:
+                names = [sub.id if isinstance(sub, ast.Name) else sub.attr
+                         for sub in ast.walk(node) if isinstance(sub, (ast.Name, ast.Attribute))]
+                return any({"rise", "rises"} & set(name.split("_")) for name in names)
+            return [ast.unparse(node) for node in ast.walk(source_tree)
+                    if isinstance(node, ast.Compare)
+                    and any(isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)) for op in node.ops)
+                    and any(names_a_rise(side) for side in (node.left, *node.comparators))]
+
+        # ... and nothing in the module compares a rise with a minimum itself
+        assert rise_comparisons(tree) == []
+        # The check finds such a comparison when one is written
+        for written in ("def f(rise, min_rise):\n    return rise >= min_rise - 1e-6\n",
+                        "def f(run, minimum):\n    return min(run.trim_rises) < minimum\n",
+                        "def f(rises, m):\n    return all(m <= r for r in rises) or m > rises[0]\n"):
+            assert rise_comparisons(ast.parse(written)), written
+        assert rise_comparisons(ast.parse("def f(min_rise):\n    return min_rise is None\n")) == []
+
     def test_ast_the_backtest_reads_the_sell_rule_where_live_code_can(self):
         # The sell rule's arithmetic lives in config, scanner and historical,
         # which a live module may import (none may import the backtester).

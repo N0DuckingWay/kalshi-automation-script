@@ -9,7 +9,7 @@ Purpose:
     --interval-discount, --no-sweep, --same-event-ladders /
     --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
     --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers,
-    --no-trim-sweep),
+    --no-trim-sweep, --no-trim-rise-sweep),
     configures logging to kalshi_backtest.log, constructs the necessary API
     clients, works out the starting balance (--balance, or else what the Kalshi
     account is worth when the run starts), fits the depth model from the saved
@@ -199,6 +199,14 @@ Notes:
     held pairs or not (the dashboard's Trim to Kelly select). It simulates
     nothing during the run; --no-trim-sweep skips it, leaving the select
     disabled. Backtest only: live trading does not trim.
+
+    The family's minimum price rises are ON by default with it
+    (trim_rise_sweep=True): the TrimSweep also carries every minimum of
+    config.TRIM_MIN_PRICE_RISES (TrimSweep.min_rises), where a held pair is
+    trimmed only once its total price has risen that many cents since the
+    last trade on it (the dashboard's Min. price rise select). They too are
+    simulated only when the dashboard is built. --no-trim-rise-sweep skips
+    them and still builds Trim to Kelly itself; --no-trim-sweep skips both.
 
     The pre-fetch echo's "live rule=" clause names the saved live defaults'
     time-series rule and, when one is set, their category/tag filter (never
@@ -438,7 +446,8 @@ def main() -> None:
     --max-horizon-days, --interval-discount, --no-sweep,
     --same-event-ladders / --no-same-event-ladders, --spread-min,
     --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep,
-    --no-sell-sweep, --no-trim-sweep), configures logging, constructs historical and live
+    --no-sell-sweep, --no-trim-sweep, --no-trim-rise-sweep), configures
+    logging, constructs historical and live
     Kalshi API clients, works out the starting balance (--balance, or else the
     account's value now, read through _account_starting_balance; a read that
     fails, or comes to nothing, stops the run with exit 1 before the
@@ -463,7 +472,8 @@ def main() -> None:
     bar, Interval Discount section and scenario explorer); the lazily
     simulated add-on sweeps (result.add_on_cap_sweep, and
     result.add_on_tier_off_cap_sweep), sell family (result.sell_sweep) and
-    Kelly-trim family (result.trim_sweep) are read the same way.
+    Kelly-trim family (result.trim_sweep, with its minimum price rises) are
+    read the same way.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -581,6 +591,13 @@ def main() -> None:
              "of the portfolio): its simulations run only while the dashboard is "
              "built, so skipping them makes that step faster and leaves the select "
              "disabled. Backtest only — live trading does not trim",
+    )
+    parser.add_argument(
+        "--no-trim-rise-sweep", action="store_true",
+        help="Skip the dashboard's Min. price rise select (with Trim to Kelly on, trim a "
+             "held pair only once its total price has risen a chosen number of cents since "
+             "the last trade on it): its simulations run only while the dashboard is built. "
+             "Trim to Kelly itself is still built. Backtest only",
     )
     parser.add_argument(
         "--sell-workers", type=int, default=None, metavar="N",
@@ -714,6 +731,10 @@ def main() -> None:
     sell_sweep = not args.no_sell_sweep
     # ... and so is the Trim to Kelly select's family
     trim_sweep = not args.no_trim_sweep
+    # ... and, as part of that family, the minimum price rises its trims can
+    # be made to wait for (the Min. price rise select): on with it unless
+    # opted out, and off whenever the family itself is
+    trim_rise_sweep = trim_sweep and not args.no_trim_rise_sweep
     # The dashboard simulates the Sell select in worker processes: one less
     # than the CPUs (the main process waits on them), within the config bound
     sell_workers = (args.sell_workers if args.sell_workers is not None
@@ -776,7 +797,10 @@ def main() -> None:
         "on" if band_sweep else "off", "on" if cap_sweep else "off",
         "on" if add_on_sweep else "off",
         f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
-        if sell_sweep else "off", "on" if trim_sweep else "off",
+        if sell_sweep else "off",
+        # A default run reads "on"; the family without its minimum price rises says so
+        "off" if not trim_sweep else "on" if trim_rise_sweep
+        else "on (no minimum price rises)",
         live_rule_echo, _fills_echo(depth_model),
     )
     # Warn on a ceiling that empties a tier. config.time_series_spread_band's
@@ -849,6 +873,8 @@ def main() -> None:
         sell_sweep=sell_sweep,
         # ... and its Trim to Kelly select
         trim_sweep=trim_sweep,
+        # ... with the Min. price rise select's minimums, part of that family
+        trim_rise_sweep=trim_rise_sweep,
         # Every trade's order book is built from this table (None: top of book)
         depth_model=depth_model,
     )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy add-on sweeps (add_on_cap_sweep, and add_on_tier_off_cap_sweep with the band sweep) unless --no-add-on-sweep

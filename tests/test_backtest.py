@@ -27,6 +27,8 @@ default (add_on_sweep=True), the flag threads add_on_sweep=False, and the echo
 line names the setting right after the cap sweep's. --no-sell-sweep does the
 same for the Sell family (sell_sweep), named right after the add-on sweep, and
 --no-trim-sweep for the Trim to Kelly family (trim_sweep), named after that.
+--no-trim-rise-sweep leaves that family on without its minimum price rises
+(trim_rise_sweep=False), and changes only the echo's trim clause.
 
 And the echo's "live rule=" clause: the saved live defaults' rule (with their
 origin), "none saved" with no file, "not recorded" with a refused one — a read
@@ -614,6 +616,70 @@ class TestTrimSweepArgument:
         assert (kwargs["trim_sweep"], kwargs["sell_sweep"], kwargs["add_on_sweep"],
                 kwargs["band_sweep"], kwargs["cap_sweep"]) == (False, True, True, True, True)
         assert ") | trim sweep=off | live rule=" in caplog.text
+
+
+class TestTrimRiseSweepArgument:
+    """--no-trim-rise-sweep: the Trim to Kelly family's minimum price rises
+    (the dashboard's Min. price rise select) are ON with the family by
+    default; the flag threads trim_rise_sweep=False into run_backtest_sweep
+    and leaves the family itself on, and --no-trim-sweep turns both off. The
+    echo's trim clause says which, and a default run's echo is unchanged."""
+
+    @staticmethod
+    def _echo(caplog) -> str:
+        (line,) = [r.getMessage() for r in caplog.records
+                   if r.getMessage().startswith("Backtest config:")]
+        return line
+
+    def test_the_minimum_price_rises_are_on_with_the_family_by_default(self, cli, monkeypatch,
+                                                                         caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        kwargs = cli["sweep_kwargs"]
+        assert (kwargs["trim_sweep"], kwargs["trim_rise_sweep"]) == (True, True)
+        assert ") | trim sweep=on | live rule=" in self._echo(caplog)
+
+    def test_no_trim_rise_sweep_turns_only_them_off(self, cli, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        default_kwargs, default_echo = cli["sweep_kwargs"], self._echo(caplog)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--no-trim-rise-sweep")
+        kwargs = cli["sweep_kwargs"]
+        assert (kwargs["trim_rise_sweep"], kwargs["trim_sweep"], kwargs["sell_sweep"],
+                kwargs["add_on_sweep"], kwargs["band_sweep"], kwargs["cap_sweep"]) == (
+            False, True, True, True, True, True)
+        # No other keyword moves (each run builds a client of its own)
+        skipped = {"trim_rise_sweep", "hist_client"}
+        assert set(kwargs) == set(default_kwargs)
+        assert ({key: value for key, value in kwargs.items() if key not in skipped}
+                == {key: value for key, value in default_kwargs.items()
+                    if key not in skipped})
+        # ... and only the echo's trim clause does
+        assert "| trim sweep=on | live rule=" in default_echo
+        assert self._echo(caplog) == default_echo.replace(
+            "| trim sweep=on | live rule=",
+            "| trim sweep=on (no minimum price rises) | live rule=")
+
+    @pytest.mark.parametrize("flags", [("--no-trim-sweep",),
+                                       ("--no-trim-sweep", "--no-trim-rise-sweep")])
+    def test_no_trim_sweep_turns_both_off(self, cli, monkeypatch, caplog, flags):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, *flags)
+        kwargs = cli["sweep_kwargs"]
+        assert (kwargs["trim_sweep"], kwargs["trim_rise_sweep"]) == (False, False)
+        assert ") | trim sweep=off | live rule=" in self._echo(caplog)
+
+    def test_the_help_names_the_select_it_skips(self, cli, monkeypatch, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--help")
+        assert exc.value.code == 0
+        text = " ".join(capsys.readouterr().out.split())
+        assert "--no-trim-rise-sweep" in text
+        assert "Skip the dashboard's Min. price rise select" in text
+        assert "Trim to Kelly itself is still built" in text
+        assert "sweep_kwargs" not in cli
 
 
 class TestSellWorkersArgument:

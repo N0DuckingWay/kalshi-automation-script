@@ -38,7 +38,9 @@ Notes:
     days_to_maturity) live here, where seller.py may import them, so live
     selling and the backtest apply the same arithmetic. The rule that trims
     a held pair to its Kelly size (held_pair_win_prob, kelly_hold_fraction,
-    kelly_trim_count) lives here too; only the backtest calls it.
+    kelly_trim_count) lives here too, with the test that can hold a trim
+    back until the pair's price has risen (pair_price_rise,
+    trim_rise_reached); only the backtest calls them.
 """
 import fcntl
 import json
@@ -508,6 +510,22 @@ TAKE_PROFIT_HOLD_DAYS = 3
 # a backtest sale falls after the previous entry checkpoint and the position
 # held each of its trades at every check (trades are bought only at checkpoints).
 TAKE_PROFIT_HOLD_DAYS_MAX = 7
+
+# The price rises the backtest dashboard's "Min. price rise" select offers
+# beside "any": with Trim to Kelly on, a held pair is trimmed only once its
+# total price (the price of the side held on each of its two markets, added)
+# is at least this many dollars above where it stood at the last trade on the
+# pair (its purchase, an add-on or an earlier trim). A fall never counts.
+# Every 5c from 5c to 95c, 19 values, each the float nearest its cents over
+# 100 (so 15c is exactly the float 0.15). BACKTEST-ONLY: live trading does not
+# trim, and no live module reads this. Distinct values in (0, 1]. Read by
+# backtester.run_backtest_sweep(trim_rise_sweep=True), which checks them
+# before its fetch. TRIM_PRICE_RISE_STEP_CENTS is the step a minimum sits on;
+# a live setting for it would be held to that step, as the size caps are to
+# SIZE_CAP_STEP.
+TRIM_PRICE_RISE_STEP_CENTS = 5
+TRIM_MIN_PRICE_RISES = tuple(
+    cents / 100 for cents in range(TRIM_PRICE_RISE_STEP_CENTS, 100, TRIM_PRICE_RISE_STEP_CENTS))
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
@@ -3640,9 +3658,12 @@ def days_to_maturity(close_dates, day: date) -> int | None:
 # sits above the size it would buy up to (held_pair_fraction), and a run
 # never sells and buys the same pair over the same prices.
 #
-# The three functions below are the whole rule. The backtest decides with
-# them (backtester._kelly_trim); they live here, not in strategy.py, so
-# seller.py may import them too.
+# The first three functions below are the sizing rule. The backtest decides
+# with them (backtester._kelly_trim); they live here, not in strategy.py, so
+# seller.py may import them too. The two after them, pair_price_rise and
+# trim_rise_reached, are a test a run may ask first: has the pair's price
+# risen far enough since the last trade on it for a trim to be considered at
+# all? They take plain prices, so a live seller can call them with its own.
 
 # A whole count that float arithmetic left a hair short still counts as whole:
 # this much is added before rounding down, plus this share of the count
@@ -3842,6 +3863,57 @@ def kelly_trim_count(count: int, portfolio_value: float, win_prob: float, cap: f
         if still_wanted(pairs):
             return KellyTrim(pairs, max(levels))
     return KellyTrim(low, max(levels))
+
+
+def pair_price_rise(price_then: float, price_now: float) -> float:
+    """
+    Return how far a held pair's total price has risen since the last trade on it.
+
+    A pair's total price is the price of the side held on each of its two
+    markets, added: YES on the earlier market plus NO on the later one for a
+    time-series pair, NO on the first plus YES on the second for a same-title
+    pair. Both prices must be the same kind of quote (two asks, say), so the
+    gap between a market's bid and ask never reads as a rise. This is the one
+    place the direction is decided: a caller hands in the two prices and never
+    subtracts them itself.
+
+    Args:
+        price_then (float): The pair's total price at the last trade on it
+            (its purchase, an add-on or an earlier trim), in dollars.
+        price_now (float): The pair's total price now, in dollars.
+
+    Returns:
+        float: price_now less price_then, in dollars: above zero for a rise,
+            below zero for a fall.
+    """
+    return price_now - price_then
+
+
+def trim_rise_reached(rise: float, min_rise: float | None) -> bool:
+    """
+    Return whether a held pair's price has risen far enough for a Kelly trim to be considered.
+
+    With a minimum set, a pair is looked at for trimming only once its total
+    price is at least that far above where it stood at the last trade on it.
+    A fall never counts, however large. The comparison allows PRICE_EPSILON
+    of float noise, so a rise that is exactly the minimum (0.87 - 0.62
+    against 0.25) passes.
+
+    Args:
+        rise (float): How far the pair's total price has risen
+            (pair_price_rise), in dollars; negative for a fall.
+        min_rise (float | None): The least rise a trim needs, in dollars; None
+            for no minimum.
+
+    Returns:
+        bool: True with no minimum, whatever the rise. With one: whether the
+            rise is at least the minimum. False when the rise or the minimum
+            is not a number.
+    """
+    if min_rise is None:
+        return True
+    # A rise that is not a number compares False, which holds the trim back
+    return math.isfinite(min_rise) and rise >= min_rise - PRICE_EPSILON
 
 
 def _exact_number(value: float) -> str:
