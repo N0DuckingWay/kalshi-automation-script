@@ -4290,6 +4290,13 @@ class TestTimeSeriesKellyParity:
         # result, never the value as read), leaving out what the take-profit plans sell
         [trims] = _call_nodes(main, "_run_prod", "plan_trims")
         assert plan.lineno < trims.lineno < sell.lineno
+        # ... once no order rests on the account: Kalshi holds cash for one in
+        # neither its balance nor its value of the open positions. Read once,
+        # between the take-profit plans and the trims, with the client only
+        [resting] = _call_nodes(main, "_run_prod", "get_resting_orders")
+        assert plan.lineno < resting.lineno < trims.lineno
+        assert [ast.unparse(arg) for arg in resting.args] == ["client"]
+        assert not resting.keywords
         trim_keywords = {k.arg: ast.unparse(k.value) for k in trims.keywords}
         assert trim_keywords["settings"] == "settings"
         assert trim_keywords["cash_cents"] == "cash_cents"

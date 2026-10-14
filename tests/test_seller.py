@@ -1583,6 +1583,20 @@ class TestPlanTrims:
                 in caplog.text)
         assert "Pairs to trim this run: 0 of 1" in caplog.text
 
+    def test_a_lower_cap_or_a_higher_k_sells_a_pair_the_settings_before_kept(
+            self, monkeypatch):
+        # What config.trim_change_warnings tells the person changing them: with
+        # the trim on, a lower cap (20% to 10% of $200) or a higher k (0.7 to
+        # 0.8, on a pair past its Kelly share of $50) sells part of a pair
+        assert _TrimCase().live(monkeypatch, 20_000, cap=0.20) == []
+        (plan,) = _TrimCase().live(monkeypatch, 20_000, cap=0.10)
+        assert (plan.kind, plan.count) == (config.SALE_KIND_KELLY_TRIM, 8)
+        assert [leg.held for leg in plan.legs] == [30, 30]
+        quotes = {"a_now": (0.30, 0.72), "b_now": (0.62, 0.40)}
+        assert _TrimCase(**quotes).live(monkeypatch, 5_000, k=0.7) == []
+        (plan,) = _TrimCase(**quotes).live(monkeypatch, 5_000, k=0.8)
+        assert plan.count == 6 and [leg.held for leg in plan.legs] == [30, 30]
+
     def test_a_pair_sold_whole_still_names_what_it_held(self, monkeypatch):
         build, value_cents, caps = _TRIM_PARITY_CASES["a converged same-title pair"]
         (plan,) = build().live(monkeypatch, value_cents, **caps)
@@ -1833,17 +1847,19 @@ class TestPlanTrims:
         (warning,) = _warnings(caplog)
         top = 0.42 + 0.52 - config.fee_per_pair_approx(0.42, 0.52)
         assert warning == (
-            "Not trimming any held pair this run: YES KXSNOW20-26 / NO KXSNOW25-26 alone "
-            f"would fetch ${40 * top:.2f} at its best bids (40 contract pairs at ${top:.2f} "
-            "each), more than the $30.00 all open positions are valued at, so that value "
-            "cannot be right, and a trim sized on too small a value would sell too much")
+            "Not trimming any held pair this run, including any marked '-> sell' above: YES "
+            f"KXSNOW20-26 / NO KXSNOW25-26 alone would fetch ${40 * top:.2f} at its best bids "
+            f"(40 contract pairs at ${top:.2f} each), more than the $30.00 all open positions "
+            "are valued at, so that value cannot be right, and a trim sized on too small a "
+            "value would sell too much")
         assert "Pairs to trim this run: 0 of 2" in caplog.text
-        # The rain pair was judged, and would have been trimmed
+        # The rain pair was judged, and its line reads "-> sell": the WARNING
+        # after it says that no such verdict stands
         assert "YES KXRAIN20-26 / NO KXRAIN25-26 (time-series), 30 each" in caplog.text
         assert "-> sell" in caplog.text
-        # With a value that covers the snow pair, both trim
+        # With a value that covers both pairs (about $63 at their best bids), both trim
         assert len(world.trims(monkeypatch, settings, cash_cents=5_000,
-                               positions_value_cents=4_000)) == 2
+                               positions_value_cents=6_400)) == 2
 
     def test_a_minimum_price_rise_never_lets_through_a_trim_the_value_guard_stops(
             self, monkeypatch, caplog):
@@ -1869,10 +1885,10 @@ class TestPlanTrims:
         assert "YES KXSNOW20-26 / NO KXSNOW25-26 alone would fetch" in warning
         assert "so that value cannot be right" in warning
         assert "Pairs to trim this run: 0 of 2" in caplog.text
-        # Not vacuous: on a value that covers the snow pair, the minimum holds the
+        # Not vacuous: on a value that covers both pairs, the minimum holds the
         # snow pair back and the rain pair alone is trimmed
         plans = world.trims(monkeypatch, _trim_settings(cap=0.05, min_rise=0.10),
-                            cash_cents=5_000, positions_value_cents=4_000)
+                            cash_cents=5_000, positions_value_cents=6_400)
         assert [plan.legs[0].ticker for plan in plans] == [rain[0]]
 
     def test_a_crossed_book_on_the_outsized_pair_still_stops_every_trim(self, monkeypatch,
@@ -1890,6 +1906,42 @@ class TestPlanTrims:
         (warning,) = _warnings(caplog)
         assert "YES KXSNOW20-26 / NO KXSNOW25-26 alone would fetch" in warning
         assert "so that value cannot be right" in warning
+
+    def test_pairs_together_worth_more_than_every_open_position_stop_every_trim(
+            self, monkeypatch, caplog):
+        # Three pairs the run's list does not quote (the floor counts them at $0):
+        # each alone fetches about $27 at its best bids, under the $30 Kalshi
+        # values every open position at, but together about $81. Each would be
+        # trimmed on $530 where, on a value that counts them, it would sell less
+        world = _World()
+        world.fills = _fills()
+        for name in ("hail", "rain", "snow"):
+            _weather_pair(world, name, 30, quotes=False)
+        top = 0.42 + 0.52 - config.fee_per_pair_approx(0.42, 0.52)
+        assert 30 * top < 30 < 3 * 30 * top
+        with caplog.at_level(logging.INFO):
+            assert world.trims(monkeypatch, _trim_settings(cap=0.05), cash_cents=50_000,
+                               positions_value_cents=3_000) == []
+        (warning,) = _warnings(caplog)
+        assert warning == (
+            "Not trimming any held pair this run, including any marked '-> sell' above: the "
+            f"3 pairs whose order books were read would fetch ${90 * top:.2f} at their best "
+            "bids together, more than the $30.00 all open positions are valued at, so that "
+            "value cannot be right, and a trim sized on too small a value would sell too much")
+        assert "Pairs to trim this run: 0 of 3" in caplog.text
+        # Each pair alone passed, so all three were judged (and each, on $530,
+        # would have sold one): the WARNING says none of those verdicts stands
+        checks = [r.getMessage() for r in caplog.records
+                  if r.getMessage().startswith("Kelly trim check: ")]
+        assert len(checks) == 3 and all(check.endswith("-> sell 1") for check in checks)
+        # Not vacuous: with $100 of cash, on a value that covers the three
+        # together ($82), each is trimmed by the shared rule at that value, and
+        # the understated value would have sold more of each
+        plans = world.trims(monkeypatch, _trim_settings(cap=0.05), cash_cents=10_000,
+                            positions_value_cents=8_200)
+        sold = _weather_sell(30, 182.0, 0.05)
+        assert [plan.count for plan in plans] == [sold] * 3
+        assert 0 < sold < _weather_sell(30, 130.0, 0.05)
 
     # ── Each step of one pair ────────────────────────────────────────────────
 

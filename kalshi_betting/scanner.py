@@ -72,7 +72,9 @@ Dependencies:
     seller.plan_trims: get_fill_times (when each market last traded, as a
     FillTimes), held_positions_bid_value (what the held markets would fetch
     at this run's bids) and held_pair_kind (whether two held markets are a
-    same-title or a time-series pair, and which is market A).
+    same-title or a time-series pair, and which is market A). One more, read
+    by main._run_prod before it asks for the trims: get_resting_orders (how
+    many orders rest on the account; a run trims nothing while one does).
     Depends on the KalshiClient produced by auth.py.
 
 Notes:
@@ -177,6 +179,7 @@ from .config import (
     MIN_ACTIVE_PRICE_DOLLARS,
     MVE_MAX_EMPTY_PAGES,
     MVE_SERIES_FAMILY_PREFIX,
+    ORDERS_PAGE_SIZE,
     POSITION_PAGE_SIZE,
     PRICE_EPSILON,
     SAME_TITLE_LEG_SIDES,
@@ -3261,6 +3264,97 @@ def get_fill_times(client: Any) -> FillTimes | None:
         logging.info("Fills read: %d on %d market(s), %s to %s (UTC)", fills, len(latest),
                      oldest.date().isoformat(), newest.date().isoformat())
     return FillTimes(latest=latest, oldest=oldest)
+
+
+# Every status GET /portfolio/orders gives an order (the pinned SDK's
+# OrderStatus): only a resting order is still waiting to fill
+_ORDER_STATUSES = ("resting", "canceled", "executed")
+
+
+def get_resting_orders(client: Any) -> int | None:
+    """
+    Count the orders resting on the account (GET /portfolio/orders).
+
+    A resting order is one placed and not yet filled or canceled. The bot
+    never leaves one (its buys are fill-or-kill and its sales
+    immediate-or-cancel), so any is an order placed by hand or by another
+    program. Kalshi holds cash for a resting buy, and that cash is in neither
+    the balance reply's cash (the amount available for trading) nor its value
+    of the open positions, so a value worked out from the two leaves it out:
+    main._run_prod trims nothing while one rests.
+
+    Each page is a retried, read-only GET on the SDK's raw-response variant,
+    asked for with status "resting", a page size and a cursor. Fails closed,
+    as get_fill_times does: returns None, with one WARNING, when a page cannot
+    be read or has no "orders" list, a cursor repeats, SCANNER_MAX_PAGES cuts
+    the list short, or an order's status is not one the endpoint gives
+    (resting, canceled or executed). Only a resting order is counted, so a
+    reply that left the filter out could not count a filled or canceled one.
+
+    Args:
+        client (Any): An authenticated KalshiClient from auth.build_client().
+
+    Returns:
+        int | None: How many orders rest on the account (0 when none); None
+            (with a WARNING) when the list could not be read whole.
+    """
+    resting = 0
+    cursor: str | None = None
+    # Every cursor requested, so a cycle (A, B, A, B, ...) is caught too
+    seen_cursors: set[str] = set()
+    pages = 0
+    while True:
+        kwargs: dict = {"status": "resting", "limit": ORDERS_PAGE_SIZE}
+        if cursor:
+            kwargs["cursor"] = cursor
+        try:
+            # Raw, retried read-only GET; a non-2xx reply raises here
+            data = api_call_with_retry(
+                fetch_json_page, client.get_orders_without_preload_content, **kwargs
+            )
+        except Exception as exc:
+            # One line, never the SDK's multi-line text with every header
+            logging.warning("Could not read the account's resting orders (page %d): %s",
+                            pages + 1, api_error_summary(exc))
+            return None
+        pages += 1
+        rows = data.get("orders") if isinstance(data, dict) else None
+        new_cursor = data.get("cursor") if isinstance(data, dict) else None
+        # A null list is a page with none; any other shape fails closed
+        if (not isinstance(data, dict) or "orders" not in data
+                or not isinstance(rows, (list, type(None)))
+                or not isinstance(new_cursor, (str, type(None)))):
+            logging.warning("Could not read the account's resting orders: page %d is not "
+                            "a list of orders with a cursor", pages)
+            return None
+        for row in rows or []:
+            status = row.get("status") if isinstance(row, dict) else None
+            if status not in _ORDER_STATUSES:
+                # Stop at the first: the answer is already None. The value is cut
+                # short, so one odd record cannot fill the log
+                logging.warning(
+                    "Could not read the account's resting orders: an order on page %d has "
+                    "no readable status (%.80r)", pages, status)
+                return None
+            if status == "resting":
+                resting += 1
+        if new_cursor and new_cursor in seen_cursors:
+            logging.warning(
+                "Resting orders fetch: cursor did not advance (repeated) on page %d — "
+                "stopping; the list may be incomplete", pages)
+            return None
+        # A list that ends on the last allowed page was not cut short
+        if new_cursor and pages >= SCANNER_MAX_PAGES:
+            logging.warning(
+                "Resting orders fetch: reached SCANNER_MAX_PAGES (%d) — stopping; the list "
+                "may be incomplete", SCANNER_MAX_PAGES)
+            return None
+        if not new_cursor:
+            break
+        seen_cursors.add(new_cursor)
+        cursor = new_cursor
+    logging.info("Resting orders on the account: %d", resting)
+    return resting
 
 
 @dataclass

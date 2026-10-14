@@ -883,6 +883,54 @@ class TestConfirmPage:
     def test_no_warning_for_the_seed(self):
         assert 'class="warn"' not in _get(_app(), "/confirm?" + _query()).body
 
+    # A per-trade and a same-title cap of 20%, k 0.8, with the Kelly trim on or off
+    _TRIM_SAVED = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True)
+
+    @pytest.mark.parametrize("link, named", [
+        ({"size_cap": "0.1", "same_title_size_cap": "0.2"},
+         "the time-series size cap goes from 20% to 10% and the same-title size cap goes "
+         "from 20% to 10%"),
+        ({"k": "0.9", "size_cap": "0.2", "same_title_size_cap": "0.2"},
+         "k goes from 0.8 to 0.9, which lowers a time-series pair&#x27;s chance of paying"),
+        ({"size_cap": "0.2", "same_title_size_cap": "0.1"},
+         "the same-title size cap goes from 20% to 10%"),
+    ], ids=["per-trade cap", "k", "same-title cap"])
+    def test_with_trimming_on_a_lower_cap_or_a_higher_k_is_said_to_sell(self, link, named):
+        # The next run trims before it buys, and these settings sell more of the
+        # held pairs than the ones in force: the page says so in red
+        _save(self._TRIM_SAVED)
+        response = _get(_app(), "/confirm?" + _query(**link))
+        assert response.status == 200
+        [warning] = re.findall(r'<p class="warn">(.*?)</p>', response.body)
+        assert warning == (
+            "Warning: with the Kelly trim on, these settings can sell more of the held pairs: "
+            f"{named}; each exact held pair worth more than its new Kelly size is sold down "
+            "to it before anything is bought, once the wait since its last trade has passed.")
+
+    @pytest.mark.parametrize("saved, link", [
+        # Trimming saved off, so kept off by links that do not name it
+        (dataclasses.replace(_TRIM_SAVED, trim_to_kelly=False),
+         {"size_cap": "0.1", "same_title_size_cap": "0.2"}),
+        (dataclasses.replace(_TRIM_SAVED, trim_to_kelly=False),
+         {"k": "0.9", "size_cap": "0.2", "same_title_size_cap": "0.2"}),
+        (dataclasses.replace(_TRIM_SAVED, trim_to_kelly=False),
+         {"size_cap": "0.2", "same_title_size_cap": "0.1"}),
+        # Trimming turned off by the link itself
+        (_TRIM_SAVED, {"size_cap": "0.1", "same_title_size_cap": "0.2", "trim_to_kelly": "off"}),
+        # A cap raised, and k lowered: nothing more is sold
+        (_TRIM_SAVED, {"size_cap": "0.3", "same_title_size_cap": "0.2"}),
+        (_TRIM_SAVED, {"k": "0.7", "size_cap": "0.2", "same_title_size_cap": "0.2"}),
+        # A lower same-title cap the per-trade cap already holds below
+        (dataclasses.replace(_TRIM_SAVED, same_title_size_cap=1.0),
+         {"size_cap": "0.2", "same_title_size_cap": "0.5"}),
+    ], ids=["off, cap", "off, k", "off, same-title cap", "link turns it off", "cap raised",
+            "k lowered", "same-title cap held below"])
+    def test_no_warning_when_no_more_is_sold(self, saved, link):
+        _save(saved)
+        response = _get(_app(), "/confirm?" + _query(**link))
+        assert response.status == 200
+        assert 'class="warn"' not in response.body
+
     def test_a_missing_same_title_cap_keeps_the_saved_value(self):
         _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.5))
         page = _parse(_get(_app(), "/confirm?" + _query()).body)

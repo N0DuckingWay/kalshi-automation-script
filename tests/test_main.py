@@ -1112,6 +1112,12 @@ class TestLiveSettingsFlags:
         assert out.count(f"in {config.SIZE_CAP_STEP * 100:g}% steps") == 2
         assert "100 = no cap" in out
         assert "100 = no extra cap beyond --size-cap" in out
+        # With the Kelly trim on, a lower cap or a higher k sells more of the held
+        # pairs, and the two caps' flags and k's say so
+        assert out.count("a lower cap also sells: each exact held") == 2
+        assert out.count("a higher k also sells: each exact held") == 1
+        assert out.count("worth more than its new Kelly size is sold down to it before "
+                         "anything is bought, once its wait has passed") == 3
         assert "Production runs only: a dev run holds nothing" in out
         assert "config.ADD_TO_HELD_PAIRS" not in out
         # The sell flags: a whole percent from 1 to 100 (argparse %-formats help,
@@ -1320,6 +1326,62 @@ class TestLogLiveSettings:
         assert warned == [
             "This PRODUCTION run overrides the saved live defaults (see the \"(default: …)\" "
             "marks on the line above): its trades follow the flags, not the saved defaults"]
+
+    @staticmethod
+    def _trim_lines(caplog) -> list:
+        """The WARNING lines that say new settings sell more of the held pairs."""
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                and "can sell more of the held pairs" in r.getMessage()]
+
+    @pytest.mark.parametrize("change, named", [
+        ({"size_cap": 0.10}, "the time-series size cap goes from 20% to 10% and the "
+                             "same-title size cap goes from 20% to 10%"),
+        ({"same_title_size_cap": 0.10}, "the same-title size cap goes from 20% to 10%"),
+        ({"interval_discount": 0.9}, "k goes from 0.8 to 0.9, which lowers a time-series "
+                                     "pair's chance of paying"),
+    ], ids=["per-trade cap", "same-title cap", "k"])
+    def test_with_trimming_on_a_lower_cap_or_a_higher_k_is_said_to_sell(self, caplog, change,
+                                                                        named):
+        # The run trims before it buys, so its log says so before the trims
+        saved = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True,
+                             origin=self._ORIGIN)
+        with caplog.at_level(logging.INFO):
+            main._log_live_settings(dataclasses.replace(saved, **change), saved,
+                                    real_money=True)
+        assert self._trim_lines(caplog) == [
+            "Live settings: with the Kelly trim on, these settings can sell more of the held "
+            f"pairs: {named}; each exact held pair worth more than its new Kelly size is sold "
+            "down to it before anything is bought, once the wait since its last trade has "
+            "passed"]
+        # ... after the WARNING that the flags override the saved defaults
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings.index(self._trim_lines(caplog)[0]) > [
+            i for i, w in enumerate(warnings) if "PRODUCTION run overrides" in w][0]
+
+    @pytest.mark.parametrize("saved, run, real_money", [
+        # Trimming off: a lower cap only makes purchases smaller
+        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2),
+         LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2), True),
+        # A cap raised, and k lowered: nothing more is sold
+        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True),
+         LiveSettings(False, (0.0, 0.5), 0.8, 0.3, 0.2, trim_to_kelly=True), True),
+        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True),
+         LiveSettings(False, (0.0, 0.5), 0.7, 0.2, 0.2, trim_to_kelly=True), True),
+        # A lower same-title cap the per-trade cap already holds below
+        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 1.0, trim_to_kelly=True),
+         LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.5, trim_to_kelly=True), True),
+        # The seed, as saved and run
+        (config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED, True),
+        # A dry run sends no order
+        (LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True),
+         LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, trim_to_kelly=True), False),
+    ], ids=["trimming off", "cap raised", "k lowered", "same-title cap held below",
+            "seed", "dry run"])
+    def test_nothing_is_said_when_no_more_is_sold(self, caplog, saved, run, real_money):
+        with caplog.at_level(logging.INFO):
+            main._log_live_settings(run, dataclasses.replace(saved, origin=self._ORIGIN),
+                                    real_money=real_money)
+        assert self._trim_lines(caplog) == []
 
 
 def _saved_record(**toggles) -> str:
@@ -2433,6 +2495,11 @@ def _live_shape_client(
 
     client.get_market_orderbook_without_preload_content = MagicMock(
         side_effect=_orderbook_side_effect
+    )
+
+    # No order rests on the account (read only by a run about to trim)
+    client.get_orders_without_preload_content = MagicMock(
+        return_value=_raw_json_response({"orders": [], "cursor": None})
     )
 
     # Never called: every order goes through signed_request_json
@@ -4869,12 +4936,13 @@ class _SellExchange:
     until set_balance swaps them), the positions listing and each market's
     position from the ledger, the order books, hourly candles for the
     sellable pair (and any market `candles` names), an empty settlements
-    list, the account's fills listing, and the orders. An order fills in full
+    list, the account's fills listing, the orders resting on the account (none
+    unless `resting_orders` names some), and the orders. An order fills in full
     unless `fills` says otherwise, moves its market's position (a bid by
     +count, an ask by -count) and, when it fills anything, adds a fill to the
     listing at the exchange's clock (`now`, else the real time). Every balance
-    read, listing read, fills read, candle request and order is recorded in
-    `events`, in order.
+    read, listing read, fills read, resting-orders read, candle request and
+    order is recorded in `events`, in order.
 
     Attributes:
         client (MagicMock): The KalshiClient.
@@ -4882,8 +4950,9 @@ class _SellExchange:
         fill_rows (list): The fills listing's records (_fill_row), oldest first.
         now (datetime | None): The exchange's clock for the fills its orders
             add; None reads the real time.
-        events (list): ("balance",), ("listing",), ("fills",), ("candles", ticker)
-            and ("order", body), in the order they happened.
+        events (list): ("balance",), ("listing",), ("fills",), ("orders", the
+            read's query), ("candles", ticker) and ("order", body), in the
+            order they happened.
     """
 
     def __init__(self, monkeypatch, *, held_rows: tuple, before: dict,
@@ -4891,7 +4960,8 @@ class _SellExchange:
                  fills_then_raises=(), unreadable_after: dict | None = None,
                  include_time_series: bool = False, fill_rows: tuple = (),
                  fills_unreadable: bool = False, candles: dict | None = None,
-                 books: dict | None = None):
+                 books: dict | None = None, resting_orders: tuple = (),
+                 orders_unreadable: str | None = None):
         """
         Build the exchange and its client.
 
@@ -4913,6 +4983,12 @@ class _SellExchange:
             candles (dict | None): Ticker -> (YES ask close, YES bid close) of
                 every hourly candle, over _SELL_CANDLES' own.
             books (dict | None): Ticker -> order book reply, over the defaults.
+            resting_orders (tuple): The orders resting on the account
+                (_resting_order rows), all on one page.
+            orders_unreadable (str | None): How every read of the resting
+                orders fails: "error" (an HTTP 500), "not a list" (a page whose
+                orders are no list) or "repeated cursor" (every page names the
+                same next page); None reads `resting_orders`.
         """
         self.ledger = {r["ticker"]: Decimal(r["position_fp"]) for r in held_rows}
         self.costs = {r["ticker"]: (r.get("market_exposure_dollars"),
@@ -4923,6 +4999,8 @@ class _SellExchange:
         self.unreadable_after = dict(unreadable_after or {})
         self.fill_rows = list(fill_rows)
         self.fills_unreadable = fills_unreadable
+        self.resting_orders = list(resting_orders)
+        self.orders_unreadable = orders_unreadable
         self.candles = {**_SELL_CANDLES, **(candles or {})}
         self.now: datetime | None = None
         self.reads: Counter = Counter()
@@ -4946,6 +5024,7 @@ class _SellExchange:
         client.get_settlements_without_preload_content = MagicMock(
             return_value=_raw_json_response({"settlements": [], "cursor": None}))
         client.get_fills_without_preload_content = MagicMock(side_effect=self._fills_page)
+        client.get_orders_without_preload_content = MagicMock(side_effect=self._orders_page)
         client.rest_client.request = MagicMock(side_effect=self._request)
         self.client = client
 
@@ -4967,6 +5046,18 @@ class _SellExchange:
                                       reason="Bad Request")
         rows = sorted(self.fill_rows, key=lambda row: row["created_time"], reverse=True)
         return _raw_json_response({"fills": rows, "cursor": None})
+
+    def _orders_page(self, **kwargs):
+        """Serve the orders resting on the account, on one page, or a reply that cannot be read."""
+        self.events.append(("orders", dict(kwargs)))
+        if self.orders_unreadable == "error":
+            return _raw_json_response({"error": "internal"}, status=500,
+                                      reason="Internal Server Error")
+        if self.orders_unreadable == "not a list":
+            return _raw_json_response({"orders": "x", "cursor": None})
+        if self.orders_unreadable == "repeated cursor":
+            return _raw_json_response({"orders": [], "cursor": "C1"})
+        return _raw_json_response({"orders": list(self.resting_orders), "cursor": None})
 
     def _positions(self, **kwargs):
         """Serve one market's position, or the whole listing, from the ledger."""
@@ -5537,9 +5628,10 @@ class TestRunProdSellsInADryRun:
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True)
         assert code == EXIT_OK
         lines = [(r.levelno, r.getMessage()) for r in caplog.records]
-        # The seller was never asked, and nothing it reads was requested
+        # The seller was never asked, and nothing it reads was requested, nor
+        # the orders resting on the account a run about to trim reads
         assert seen["plan_sales"] == [] and seen["plan_trims"] == []
-        assert not [e for e in exchange.events if e[0] in ("candles", "fills")]
+        assert not [e for e in exchange.events if e[0] in ("candles", "fills", "orders")]
         exchange.client.get_settlements_without_preload_content.assert_not_called()
         assert report.sales == [] and report.cash_after_sales is None
         assert [len(call[3]) for call in seen["log"]] == [0]
@@ -5556,7 +5648,8 @@ class TestRunProdSellsInADryRun:
                      "_sold_tickers", "_with_simulated_proceeds", "_record_sales",
                      "_positions_after_sales", "_listing_misses_sales", "_value_after_sales",
                      "_planned_tickers", "_plan_tickers", "_emptied_tickers", "_is_trim",
-                     "_account_decided_short", "_flag_sales_sold_more"):
+                     "_account_decided_short", "_flag_sales_sold_more",
+                     "get_resting_orders"):
             monkeypatch.setattr(main, name, never)
         again = _SellExchange(monkeypatch, held_rows=_SELL_ROWS + _HELD_TS_PAIR,
                               before=self._BEFORE, include_time_series=True)
@@ -6378,6 +6471,18 @@ def _fills_reads(exchange: _SellExchange) -> int:
     return sum(1 for event in exchange.events if event[0] == "fills")
 
 
+def _orders_reads(exchange: _SellExchange) -> list:
+    """Each read of the orders resting on the account: its query, in order."""
+    return [event[1] for event in exchange.events if event[0] == "orders"]
+
+
+def _resting_order(ticker: str, count: str = "50.00", price: str = "0.5000") -> dict:
+    """An order resting on the account, as /portfolio/orders sends it: a buy of
+    `count` YES at `price`, placed by hand (Kalshi holds its cash, $25.00 by default)."""
+    return {"order_id": f"HAND-{ticker}", "ticker": ticker, "side": "yes", "action": "buy",
+            "status": "resting", "yes_price_dollars": price, "remaining_count_fp": count}
+
+
 def _warning_lines(caplog) -> list:
     """Every WARNING line the run logged, as text."""
     return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
@@ -6429,6 +6534,11 @@ class TestRunProdTrimsInADryRun:
         assert (trims["cash_cents"], trims["positions_value_cents"], trims["skip"]) == (
             _TRIM_CASH_CENTS, 3_000, frozenset())
         assert _fills_reads(exchange) == 1
+        # One read of the orders resting on the account, which found none, before
+        # the planner was asked
+        assert _orders_reads(exchange) == [{"status": "resting", "limit": 200}]
+        assert ([e[0] for e in exchange.events].index("orders")
+                < [e[0] for e in exchange.events].index("fills"))
         assert not [e for e in exchange.events if e[0] == "candles"]
         assert exchange.orders() == ([], [])
         # The buys are sized on the cash plus the trim's estimated proceeds,
@@ -6519,22 +6629,30 @@ class TestRunProdTrimsInADryRun:
             f"Not trimming this run: Kalshi's value of the open positions {why}, and a trim "
             "sized on a value that leaves them out would sell too much"]
         assert seen["plan_trims"] == [] and _fills_reads(exchange) == 0
+        # The resting orders are read only once every other gate has passed
+        assert _orders_reads(exchange) == []
         assert report.sales == [] and exchange.orders() == ([], [])
 
-    @pytest.mark.parametrize("breakdown", [
+    @pytest.mark.parametrize("breakdown, left_out", [
         # Shard 0's balance cannot be read: the read counts $20.00 of the $60.00
         # (with a WARNING of its own)
-        [{"exchange_index": 0, "balance": "forty"}, {"exchange_index": 1, "balance": "20.0000"}],
-        # Its index cannot be read: the same $20.00, and the read says nothing
-        [{"exchange_index": None, "balance": "40.0000"}, {"exchange_index": 1, "balance": "20.0000"}],
+        ([{"exchange_index": 0, "balance": "forty"},
+          {"exchange_index": 1, "balance": "20.0000"}], "shard 0: no readable balance"),
+        # Its index cannot be read: the same $20.00, and only this line names it
+        ([{"exchange_index": None, "balance": "40.0000"},
+          {"exchange_index": 1, "balance": "20.0000"}],
+         "entry 0 names no readable exchange_index"),
         # A repeated index: the earlier entry's $40.00 is left out
-        [{"exchange_index": 0, "balance": "40.0000"}, {"exchange_index": 0, "balance": "20.0000"}],
+        ([{"exchange_index": 0, "balance": "40.0000"},
+          {"exchange_index": 0, "balance": "20.0000"}],
+         "shard 0: an earlier entry, replaced by a later one"),
     ], ids=["balance unreadable", "index unreadable", "index repeated"])
     @pytest.mark.parametrize("dry_run", [True, False], ids=["dry", "live"])
     def test_cash_on_a_shard_that_cannot_be_read_trims_nothing(self, monkeypatch, caplog,
-                                                              breakdown, dry_run):
+                                                              breakdown, left_out, dry_run):
         # Sized on $50.00 instead of $90.00, the trim would sell 20 of the 30, not 11:
-        # the planner is not even asked, and the fills listing is not read
+        # the planner is not even asked, and the fills listing is not read. The
+        # line names the entry left out, and says the rest of the cash was read
         exchange = _trim_exchange(monkeypatch,
                                   before={**_TRIM_BEFORE, "balance_breakdown": breakdown},
                                   after=_AFTER_TRIM_BALANCE)
@@ -6545,10 +6663,27 @@ class TestRunProdTrimsInADryRun:
                                           trim_to_kelly=True)
         assert code == EXIT_OK
         assert [w for w in _warning_lines(caplog) if w.startswith("Not trimming")] == [
-            "Not trimming this run: the cash on every shard could not be read, and a trim "
-            "sized on too little cash would sell too much"]
+            "Not trimming this run: the balance reply had a shard entry whose cash could not "
+            f"be counted ({left_out}), so the cash may be short, and a trim sized on too "
+            "little cash would sell too much"]
         assert seen["plan_trims"] == [] and _fills_reads(exchange) == 0
+        assert _orders_reads(exchange) == []
         assert report.sales == [] and exchange.orders() == ([], [])
+
+    def test_several_shard_entries_left_out_are_named_by_the_first_and_a_count(
+            self, monkeypatch, caplog):
+        breakdown = [{"exchange_index": 0, "balance": "forty"}, "not-an-entry",
+                     {"exchange_index": 1, "balance": "20.0000"}]
+        exchange = _trim_exchange(monkeypatch,
+                                  before={**_TRIM_BEFORE, "balance_breakdown": breakdown})
+        code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
+                                           trim_to_kelly=True)
+        assert code == EXIT_OK
+        assert [w for w in _warning_lines(caplog) if w.startswith("Not trimming")] == [
+            "Not trimming this run: the balance reply had 2 shard entries whose cash could "
+            "not be counted (shard 0: no readable balance, and 1 more), so the cash may be "
+            "short, and a trim sized on too little cash would sell too much"]
+        assert seen["plan_trims"] == [] and _orders_reads(exchange) == []
 
     @pytest.mark.parametrize("problem", ["unreadable", "too short", "empty"])
     def test_a_fills_list_that_cannot_rule_out_a_recent_trade_trims_nothing(
@@ -6593,6 +6728,7 @@ class TestRunProdTrimsInADryRun:
         # No sell level: no word about selling
         assert not any(w.startswith("Not selling") for w in warnings)
         assert seen["plan_trims"] == [] and _fills_reads(exchange) == 0
+        assert _orders_reads(exchange) == []
         assert report.sales == []
 
     def test_nothing_is_trimmed_when_the_positions_listing_was_cut_short(self, monkeypatch,
@@ -6612,6 +6748,7 @@ class TestRunProdTrimsInADryRun:
         assert [w for w in _warning_lines(caplog) if w.startswith("Not trimming")] == [
             "Not trimming this run: the list of the account's positions was cut short"]
         assert seen["plan_trims"] == [] and _fills_reads(exchange) == 0
+        assert _orders_reads(exchange) == []
         assert report.sales == []
 
     def test_with_a_sell_level_too_the_pair_sold_whole_is_not_trimmed(self, monkeypatch,
@@ -6660,6 +6797,7 @@ class TestRunProdTrimsInADryRun:
                                           trim_to_kelly=True)
         assert code == EXIT_OK
         assert seen["plan_trims"] == [] and _fills_reads(exchange) == 0
+        assert _orders_reads(exchange) == []
         assert report.sales == []
         assert not [m for m in _messages(caplog)
                     if "trim" in m.lower() and not m.startswith("Live settings:")]
@@ -6686,6 +6824,8 @@ class TestRunProdTrimsLive:
             (_TICKER_SELL_LATE, "bid", "11.00", "immediate_or_cancel")]
         assert exchange.ledger[_TICKER_SELL_EARLY] == 19
         assert exchange.ledger[_TICKER_SELL_LATE] == -19
+        # One read of the orders resting on the account, which found none
+        assert _orders_reads(exchange) == [{"status": "resting", "limit": 200}]
         # Every sale order before the first buy order, and between them the
         # positions listing and the balance read again
         _sales, buys = exchange.orders()
@@ -6830,6 +6970,56 @@ class TestRunProdTrimsLive:
         [ladders] = seen["ladders"]
         assert ("event", "EVS-SELL-EARLY") not in ladders
         assert ("event", "EVT-TS-EARLY") in ladders
+
+    @pytest.mark.parametrize("dry_run", [True, False], ids=["dry", "live"])
+    def test_an_order_resting_on_the_account_trims_nothing(self, monkeypatch, caplog,
+                                                           dry_run):
+        # A buy of 50 YES at $0.50 placed by hand rests on another market: Kalshi
+        # holds its $25.00, which is in neither the $60.00 of cash nor the $30.00
+        # it values the open positions at. Sized on $90.00 instead of the $115.00
+        # the account is worth, the trim would sell 11 of the 30, not 6: nothing
+        # is trimmed, the planner is not asked and the fills are never read
+        assert config.kelly_trim_count(
+            30, 115.0, 0.9925, 0.20, 0.935623, lambda n: n * 0.935623).sell == 6
+        exchange = _trim_exchange(monkeypatch, after=_AFTER_TRIM_BALANCE,
+                                  resting_orders=(_resting_order("OTHER-MKT"),))
+        # Nothing is bought, so a trim's would be the run's only orders
+        monkeypatch.setattr(main, "find_same_title_pairs",
+                            lambda markets, held, *, add_on_pairs=None: [])
+        code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=dry_run,
+                                          trim_to_kelly=True)
+        assert code == EXIT_OK
+        assert _sale_orders(exchange) == [] and exchange.orders() == ([], [])
+        assert seen["plan_trims"] == [] and report.sales == []
+        assert [w for w in _warning_lines(caplog) if w.startswith("Not trimming")] == [
+            "Not trimming this run: 1 order(s) rest on the account, and the cash Kalshi "
+            "holds for a resting order is in neither its balance nor its value of the open "
+            "positions, so a trim sized on those would sell too much"]
+        assert _fills_reads(exchange) == 0
+        assert _orders_reads(exchange) == [{"status": "resting", "limit": 200}]
+        assert "Resting orders on the account: 1" in _messages(caplog)
+
+    @pytest.mark.parametrize("unreadable", ["error", "not a list", "repeated cursor"])
+    def test_resting_orders_that_cannot_be_read_trim_nothing(self, monkeypatch, caplog,
+                                                             unreadable):
+        # A server error is retried first, as every read-only GET is
+        monkeypatch.setattr("kalshi_betting._http.time.sleep", lambda seconds: None)
+        exchange = _trim_exchange(monkeypatch, after=_AFTER_TRIM_BALANCE,
+                                  orders_unreadable=unreadable)
+        monkeypatch.setattr(main, "find_same_title_pairs",
+                            lambda markets, held, *, add_on_pairs=None: [])
+        code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
+                                          trim_to_kelly=True)
+        assert code == EXIT_OK
+        assert exchange.orders() == ([], [])
+        assert seen["plan_trims"] == [] and report.sales == []
+        assert [w for w in _warning_lines(caplog) if w.startswith("Not trimming")] == [
+            "Not trimming this run: the account's resting orders could not be read, and the "
+            "cash Kalshi holds for a resting order is in neither its balance nor its value "
+            "of the open positions, so a trim sized on those would sell too much"]
+        assert _fills_reads(exchange) == 0
+        reads = _orders_reads(exchange)
+        assert reads and all(read["status"] == "resting" for read in reads)
 
 
 @pytest.mark.usefixtures("pinned_config_toggles")

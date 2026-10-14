@@ -17,8 +17,9 @@ Purpose:
     shard's cash together with Kalshi's value of the open positions
     (_positions_value_cents: integer cents, or a dollar string by presence,
     None whenever the reply carries nothing readable or a value outside
-    0 to 2**53 cents) and whether that cash counts every balance_breakdown
-    entry (cash_complete, from _balance_cents_by_shard's left_out).
+    0 to 2**53 cents) and each balance_breakdown entry that cash leaves out
+    (cash_left_out, from _balance_cents_by_shard's left_out; cash_complete is
+    True when it names none).
 
 Dependencies:
     Imports the kalshi_betting.auth and kalshi_betting._http modules
@@ -701,34 +702,45 @@ class TestReadAccountBalance:
         with pytest.raises(dataclasses.FrozenInstanceError):
             result.positions_value_cents = 0
 
-    @pytest.mark.parametrize("breakdown, complete", [
+    @pytest.mark.parametrize("breakdown, left_out", [
         ([{"exchange_index": 0, "balance": "40.0000"},
-          {"exchange_index": 1, "balance": "20.0000"}], True),
+          {"exchange_index": 1, "balance": "20.0000"}], ()),
         ([{"exchange_index": 0, "balance": "forty"},
-          {"exchange_index": 1, "balance": "20.0000"}], False),
+          {"exchange_index": 1, "balance": "20.0000"}], ("shard 0: no readable balance",)),
         ([{"exchange_index": None, "balance": "40.0000"},
-          {"exchange_index": 1, "balance": "20.0000"}], False),
-        (["not-a-dict", {"exchange_index": 1, "balance": "20.0000"}], False),
+          {"exchange_index": 1, "balance": "20.0000"}],
+         ("entry 0 names no readable exchange_index",)),
+        (["not-a-dict", {"exchange_index": 1, "balance": "20.0000"}],
+         ("entry 0 is not an object",)),
         ([{"exchange_index": 0, "balance": "40.0000"},
-          {"exchange_index": 0, "balance": "20.0000"}], False),
+          {"exchange_index": 0, "balance": "20.0000"}],
+         ("shard 0: an earlier entry, replaced by a later one",)),
+        # Two left out, each named, in the reply's order
+        ([{"exchange_index": 0, "balance": "forty"}, "not-a-dict",
+          {"exchange_index": 1, "balance": "20.0000"}],
+         ("shard 0: no readable balance", "entry 1 is not an object")),
         # Nothing parsed: the aggregate, which counts every shard, is read
-        ([{"exchange_index": "x", "balance": "40.0000"}], True),
+        ([{"exchange_index": "x", "balance": "40.0000"}], ()),
         # No breakdown at all: the aggregate again
-        ([], True),
+        ([], ()),
     ], ids=["clean", "balance unreadable", "index unreadable", "not an object",
-            "index repeated", "aggregate after nothing parsed", "no breakdown"])
-    def test_cash_complete_says_whether_every_entry_was_counted(self, breakdown, complete):
+            "index repeated", "two left out", "aggregate after nothing parsed",
+            "no breakdown"])
+    def test_cash_complete_says_whether_every_entry_was_counted(self, breakdown, left_out):
         # A Kelly trim grows as the value it is sized on shrinks, so the read
-        # says when a shard's cash was left out of the dict it returns
+        # says when a shard's cash was left out of the dict it returns, and
+        # names each entry left out, for the run's "Not trimming" line
         account = read_account_balance(_balance_client(
             {"balance_dollars": "60.0000", "balance_breakdown": breakdown}))
-        assert account.cash_complete is complete
+        assert account.cash_left_out == left_out
+        assert account.cash_complete is (not left_out)
 
     def test_the_live_reply_and_the_sandbox_shape_count_every_shard(self):
         assert read_account_balance(_balance_client(LIVE_PAYLOAD)).cash_complete is True
         assert read_account_balance(_balance_client({"balance": 5000})).cash_complete is True
         # A positional construction keeps the default, so the read's == pins hold
         assert AccountBalance({0: 1}, None).cash_complete is True
+        assert AccountBalance({0: 1}, None).cash_left_out == ()
 
     def test_integer_cents_are_read_as_is_and_zero_is_an_answer(self):
         assert _positions_value_cents({"portfolio_value": 39796}) == 39796

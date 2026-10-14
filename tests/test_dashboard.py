@@ -12578,6 +12578,16 @@ class TestTrimSelect:
         assert ("each week. A pair can be trimmed at any weekly run after a trade on it. "
                 "Min. price rise can make a trim wait") in title(0)
         assert "days have passed" not in title(0)
+        # A live run counts the wait from every fill on either market, and needs
+        # Kalshi's list of fills to reach back that far; with no wait it counts none
+        live = ("Each part sold counts as a trade of its own. A live run counts the wait in "
+                "calendar days on the bot's own clock from the last fill of any sort on "
+                "either market, a trade by hand included, and trims nothing while Kalshi's "
+                "list of the account's fills does not reach back that far. While this is on,")
+        for days in (1, 7, 14):
+            assert live in title(days)
+        assert "A live run" not in title(0)
+        assert ("Each part sold counts as a trade of its own. While this is on,") in title(0)
         # Nothing but the wait's sentence differs between two waits
         assert title(7).replace(rule.format("7 days have", weekly),
                                 rule.format("14 days have", ".")) == title(14)
@@ -12694,11 +12704,15 @@ class TestTrimRiseSelect:
                       "trimmed whichever way its price moved"):
             assert words in dashboard._TRIM_RISE_TITLE
         # ... and ends with what saving saves, from a page with the Trim to
-        # Kelly view and from any other
+        # Kelly view and from any other, and which pairs a live run cannot
+        # measure a rise for (their last fill is older than Kalshi's list)
         assert dashboard._TRIM_RISE_TITLE.endswith(
             " whichever way its price moved. From a page that simulated trimming, Save as live "
             "defaults saves the minimum shown, for live runs to wait for (any, or Trim to Kelly "
-            "off, saves none); from any other page it keeps the saved one.")
+            "off, saves none); from any other page it keeps the saved one. A live run reads "
+            "the price at the pair's last fill on Kalshi, so with a minimum set it does not "
+            "trim a pair whose last fill is older than Kalshi's list of the account's fills "
+            "reaches.")
         # A page with the view has no note beside either select
         assert 'id="flt-rise-note"' not in page and 'id="flt-trim-note"' not in page
         # Trim to Kelly keeps its two options

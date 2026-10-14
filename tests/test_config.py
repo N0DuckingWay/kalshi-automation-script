@@ -3292,6 +3292,74 @@ class TestLiveRuleWarnings:
         assert len(out) == 2 and all("above the 10%" in text for text in out)
 
 
+class TestTrimChangeWarnings:
+    """trim_change_warnings: with the Kelly trim on, a lower size cap for
+    either pair type, or a higher k, sells more of the held pairs than the
+    settings in force would, before anything is bought. One sentence names
+    every such change; nothing else is said."""
+
+    # A per-trade and a same-title cap of 20%, k 0.8, the Kelly trim on
+    _NOW = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True)
+
+    @staticmethod
+    def _sentence(named: str) -> list:
+        return [f"with the Kelly trim on, these settings can sell more of the held pairs: "
+                f"{named}; each exact held pair worth more than its new Kelly size is sold "
+                "down to it before anything is bought, once the wait since its last trade "
+                "has passed"]
+
+    def test_each_change_that_sells_is_named(self):
+        new = dataclasses.replace
+        assert config.trim_change_warnings(self._NOW, new(self._NOW, size_cap=0.1)) == (
+            self._sentence("the time-series size cap goes from 20% to 10% and the "
+                           "same-title size cap goes from 20% to 10%"))
+        assert config.trim_change_warnings(
+            self._NOW, new(self._NOW, same_title_size_cap=0.1)) == self._sentence(
+                "the same-title size cap goes from 20% to 10%")
+        assert config.trim_change_warnings(
+            self._NOW, new(self._NOW, interval_discount=0.85)) == self._sentence(
+                "k goes from 0.8 to 0.85, which lowers a time-series pair's chance of paying")
+        # Three at once: a comma, then "and" before the last
+        assert config.trim_change_warnings(
+            self._NOW, new(self._NOW, size_cap=0.1, interval_discount=0.9)) == self._sentence(
+                "the time-series size cap goes from 20% to 10%, the same-title size cap goes "
+                "from 20% to 10% and k goes from 0.8 to 0.9, which lowers a time-series "
+                "pair's chance of paying")
+        # No cap at all reads as such
+        uncapped = new(self._NOW, size_cap=1.0, same_title_size_cap=1.0)
+        assert config.trim_change_warnings(uncapped, new(uncapped, size_cap=0.5)) == (
+            self._sentence("the time-series size cap goes from 100% (no cap) to 50% and the "
+                           "same-title size cap goes from 100% (no cap) to 50%"))
+
+    @pytest.mark.parametrize("change", [
+        # Trimming off in the proposed settings: nothing is trimmed at all
+        {"trim_to_kelly": False, "size_cap": 0.1},
+        # A cap raised, k lowered, or nothing changed: nothing more is sold
+        {"size_cap": 0.3}, {"interval_discount": 0.7}, {},
+        # Settings that only buy differently
+        {"tier_floors": True, "spread_band": (0.0, 1.0), "add_to_held_pairs": True},
+        # A minimum price rise only holds a trim back
+        {"trim_min_rise": 0.1},
+    ])
+    def test_nothing_is_said_when_no_more_is_sold(self, change):
+        assert config.trim_change_warnings(
+            self._NOW, dataclasses.replace(self._NOW, **change)) == []
+
+    def test_a_same_title_cap_held_below_by_the_per_trade_cap_moves_nothing(self):
+        # The same-title cap a pair is trimmed to is the lower of the two
+        before = dataclasses.replace(self._NOW, same_title_size_cap=1.0)
+        after = dataclasses.replace(before, same_title_size_cap=0.5)
+        assert config.pair_size_cap("same_title", 0.2, 1.0) == config.pair_size_cap(
+            "same_title", 0.2, 0.5)
+        assert config.trim_change_warnings(before, after) == []
+
+    def test_turning_trimming_on_is_judged_by_the_settings_it_trims_by(self):
+        # Saved off, proposed on with a lower cap: the new cap is what the
+        # first trims read, so the change is named
+        off = dataclasses.replace(self._NOW, trim_to_kelly=False)
+        assert config.trim_change_warnings(off, dataclasses.replace(self._NOW, size_cap=0.1))
+
+
 class TestShippedLiveToggles:
     """The live toggles config.py ships, read unpatched end to end: any
     positive time-series spread up to 0.5 is admitted, books price up to a

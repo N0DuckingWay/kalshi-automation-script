@@ -297,13 +297,24 @@ class AccountBalance:
     Attributes:
         shard_cash_cents (dict[int, int]): Cash in whole cents, keyed by shard number.
         positions_value_cents (int | None): The open positions' worth in whole cents; None if unreadable.
-        cash_complete (bool): False when the reply's balance_breakdown carried
-            an entry whose cash is not in shard_cash_cents, so the cash may be
-            understated. Default True.
+        cash_left_out (tuple[str, ...]): One short text for each entry of the
+            reply's balance_breakdown whose cash is not in shard_cash_cents
+            (e.g. "shard 0: no readable balance"), so the cash may be
+            understated. Default (): every entry was counted.
     """
     shard_cash_cents: dict[int, int]
     positions_value_cents: int | None
-    cash_complete: bool = True
+    cash_left_out: tuple[str, ...] = ()
+
+    @property
+    def cash_complete(self) -> bool:
+        """
+        Whether the cash counts every shard entry of the reply.
+
+        Returns:
+            bool: False when cash_left_out names an entry, else True.
+        """
+        return not self.cash_left_out
 
 
 def _positions_value_cents(data: dict) -> int | None:
@@ -358,7 +369,7 @@ def read_account_balance(client: KalshiClient) -> AccountBalance:
 
     Returns:
         AccountBalance: Each shard's cash, the positions' value (None if
-            unreadable) and whether that cash counts every shard entry of the reply.
+            unreadable) and each shard entry of the reply that cash leaves out.
 
     Raises:
         ApiException: If Kalshi answers with an error status, e.g. 401 for bad credentials.
@@ -377,7 +388,7 @@ def read_account_balance(client: KalshiClient) -> AccountBalance:
         sum(shard_balances.values()) / 100,
     )
     return AccountBalance(shard_balances, _positions_value_cents(data),
-                          cash_complete=not left_out)
+                          cash_left_out=tuple(left_out))
 
 
 def verify_auth(client: KalshiClient) -> dict[int, int]:

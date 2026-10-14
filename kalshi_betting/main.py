@@ -57,10 +57,12 @@ Purpose:
     plans and before any sale order is sent, never on a pair they sell),
     once enough calendar days have passed since the pair's last trade and,
     with trim_min_rise set, once its price has risen that far. It trims
-    nothing when the cash on a shard could not be read, or when Kalshi's
-    value of the open positions was not read, was refused or is $0: a trim
-    grows as the value it is sized on shrinks, so a value that leaves out
-    cash or positions would sell too much. A pair trimmed in part is still
+    nothing when the cash on a shard could not be read, when Kalshi's value
+    of the open positions was not read, was refused or is $0, or when an
+    order rests on the account (or the resting orders could not be read),
+    since Kalshi holds cash for a resting order outside both of those: a
+    trim grows as the value it is sized on shrinks, so a value that leaves
+    out cash or positions would sell too much. A pair trimmed in part is still
     held: its ladder stays held, in a dry run as in a live run
     (_emptied_tickers). One trimmed whole (when Kelly keeps none of it)
     frees its ladder, as a take-profit sale does. Either way it is neither
@@ -174,6 +176,7 @@ from .config import (
     order_api_version_error,
     split_tag,
     trade_filter,
+    trim_change_warnings,
 )
 from .historical import infer_category, load_series_categories, series_labels
 from .reporter import (
@@ -196,6 +199,7 @@ from .scanner import (
     find_same_title_pairs,
     find_time_series_pairs,
     get_held_positions,
+    get_resting_orders,
     held_pairs,
     inactive_shard_indexes,
     leg_sides,
@@ -1474,7 +1478,10 @@ def _log_live_settings(settings: LiveSettings, reference: LiveSettings, *,
     reference: "(default: X)" when reference is the saved live defaults, as a
     live run's always is, "(config: X)" when it was built from config.py's
     constants (a reference a test or direct call builds, e.g. with
-    config.live_settings()). Only a real-money run WARNs on a departure.
+    config.live_settings()). Only a real-money run WARNs on a departure, and
+    then also when, with the Kelly trim on, the departure (a lower size cap or
+    a higher k) makes the trim sell more of the held pairs
+    (config.trim_change_warnings), before the trims are made.
     Resolves neither object itself (TestLiveSettingsReachEverySite).
 
     Args:
@@ -1500,6 +1507,11 @@ def _log_live_settings(settings: LiveSettings, reference: LiveSettings, *,
                 "This PRODUCTION run overrides the saved live defaults (see the "
                 "\"(default: …)\" marks on the line above): its trades follow the "
                 "flags, not the saved defaults")
+    if real_money:
+        # With the Kelly trim on, a lower cap or a higher k sells more of the held
+        # pairs; said here, before any trim is made
+        for text in trim_change_warnings(reference, settings):
+            logging.warning("Live settings: %s", text)
     # A setting that empties part of the strategy or lifts one pair's stake
     for text in live_rule_warnings(settings):
         logging.warning("Live settings: %s", text)
@@ -1661,8 +1673,11 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     run, and trader.sell_positions sends them after the take-profit sales.
     Nothing is trimmed, with one WARNING, when a held market was not
     identified, the listing was cut short, the cash on a shard could not be
-    read, or Kalshi's value of the open positions was not read, was refused
-    or is $0. No pair picked for a trim is added to this run. A pair trimmed
+    read, Kalshi's value of the open positions was not read, was refused or
+    is $0, or (read last, once the rest hold) an order rests on the account
+    or the account's resting orders could not be read: Kalshi holds cash for
+    a resting order outside both its balance and its value of the open
+    positions. No pair picked for a trim is added to this run. A pair trimmed
     in part is still held, so its ladder stays held; one trimmed whole frees
     its ladder, as after a take-profit sale, and its markets stay out of
     every purchase.
@@ -1731,10 +1746,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     shard_balances = account.shard_cash_cents
     # Cash to spend: all shards together, as cash is moved between shards before trading
     cash_cents = sum(shard_balances.values())
-    # False when a shard's entry in the reply could not be counted, so cash_cents may
+    # Each shard entry of the reply whose cash could not be counted, so cash_cents may
     # be short: a purchase only comes out smaller, but a Kelly trim would sell more.
     # Kept from this read, the one every trim is sized on
-    cash_complete = account.cash_complete
+    cash_left_out = account.cash_left_out
     # The portfolio value each trade bets a share of (just the cash if positions are unread)
     positions_value_cents = account.positions_value_cents
     portfolio_value_cents = _bankroll_cents(cash_cents, positions_value_cents)
@@ -1866,12 +1881,18 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             plans = plan_sales(client, held_positions, held_labels, markets_by_ticker,
                                settings=settings, now=moment)
             if trimming:
-                if not cash_complete:
+                if cash_left_out:
                     # A trim grows as the value it is sized on shrinks: cash that a
-                    # shard's unreadable entry left out would make it sell too much
-                    logging.warning("Not trimming this run: the cash on every shard could not "
-                                    "be read, and a trim sized on too little cash would sell "
-                                    "too much")
+                    # shard's unreadable entry left out would make it sell too much.
+                    # The first entry is named, so one odd reply cannot fill the line
+                    logging.warning(
+                        "Not trimming this run: the balance reply had %s whose cash could not "
+                        "be counted (%s), so the cash may be short, and a trim sized on too "
+                        "little cash would sell too much",
+                        "a shard entry" if len(cash_left_out) == 1
+                        else f"{len(cash_left_out)} shard entries",
+                        cash_left_out[0] if len(cash_left_out) == 1
+                        else f"{cash_left_out[0]}, and {len(cash_left_out) - 1} more")
                 elif not checked_value_cents:
                     # A trim grows as the value it is sized on shrinks: a value that
                     # leaves the open positions out (not read, refused or $0) would
@@ -1883,6 +1904,17 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
                         "could not be read" if positions_value_cents is None
                         else "was refused" if checked_value_cents is None
                         else "is $0.00")
+                # Cross-module: the orders resting on the account (read-only requests),
+                # read last, once every other gate has passed. Kalshi holds cash for a
+                # resting order, and that cash is in neither its balance nor its value
+                # of the open positions, so a trim sized on the two would sell too much
+                elif (resting := get_resting_orders(client)) is None or resting > 0:
+                    logging.warning(
+                        "Not trimming this run: %s, and the cash Kalshi holds for a resting "
+                        "order is in neither its balance nor its value of the open "
+                        "positions, so a trim sized on those would sell too much",
+                        "the account's resting orders could not be read" if resting is None
+                        else f"{resting} order(s) rest on the account")
                 else:
                     # Cross-module: the part sales of the exact held pairs that have
                     # outgrown their Kelly share (read-only requests), never of a pair
@@ -2293,23 +2325,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Time-series spread-band CEILING on pB - pA, 0-1 "
              "(default: the saved live defaults)",
     )
+    # With the Kelly trim on, a lower cap or a higher k also sells held pairs: the
+    # end of each of those three flags' help says so
+    trim_sells = ("With the Kelly trim on (saved, or given with --trim-to-kelly), a {} "
+                  "also sells: each exact held {}pair worth more than its new Kelly size is "
+                  "sold down to it before anything is bought, once its wait has passed")
     live.add_argument(
         "--interval-discount", type=float, default=None, metavar="K",
         help="Time-series interval discount k, in (0, 1] "
-             "(default: the saved live defaults)",
+             "(default: the saved live defaults). "
+             + trim_sells.format("higher k", "time-series "),
     )
     # The caps' grid step in percent (SIZE_CAP_STEP); argparse %-formats help, hence "%%"
     cap_step = f"{SIZE_CAP_STEP * 100:g}"
     live.add_argument(
         "--size-cap", type=int, default=None, metavar="PCT",
         help=f"Per-trade Kelly cap for every pair, in whole percent, in {cap_step}%% "
-             "steps; 100 = no cap (default: the saved live defaults)",
+             "steps; 100 = no cap (default: the saved live defaults). "
+             + trim_sells.format("lower cap", ""),
     )
     live.add_argument(
         "--same-title-size-cap", type=int, default=None, metavar="PCT",
         help=f"Extra per-trade cap on same-title pairs, in whole percent, in {cap_step}%% "
              "steps; 100 = no extra cap beyond --size-cap "
-             "(default: the saved live defaults)",
+             "(default: the saved live defaults). "
+             + trim_sells.format("lower cap", "same-title "),
     )
     live.add_argument(
         "--add-to-held-pairs", action=argparse.BooleanOptionalAction, default=None,

@@ -60,10 +60,10 @@ Dependencies:
     fingerprint reads), LiveDefaultsError (a refused saved file) and the
     saved-defaults helpers (read_saved_live_defaults, save_live_defaults,
     live_settings_changes, describe_live_settings, live_rule_warnings,
-    live_defaults_source), live_settings_argv (a run's flags), the seed values
-    and their source note, the source-note pattern, the exit codes, the run
-    result's format tag and the DEFAULTS_SERVER_*, DASHBOARD_FILENAME,
-    DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_* constants, count_text
+    trim_change_warnings, live_defaults_source), live_settings_argv (a run's
+    flags), the seed values and their source note, the source-note pattern,
+    the exit codes, the run result's format tag and the DEFAULTS_SERVER_*,
+    DASHBOARD_FILENAME, DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_* constants, count_text
     (a run page writes an add-on's held count exactly) and
     SALE_KIND_KELLY_TRIM (a run page marks a sale that is a Kelly trim, which
     sold a held pair down to its Kelly size). From run_lock:
@@ -216,6 +216,7 @@ from .config import (
     live_settings_changes,
     read_saved_live_defaults,
     save_live_defaults,
+    trim_change_warnings,
 )
 
 # The fields a confirmation request carries, in the GET query and repeated in
@@ -1303,8 +1304,11 @@ def _confirm_html(current: LiveSettings | None, settings: LiveSettings, source: 
     Build the confirmation page: the defaults in force beside the proposed ones.
 
     Every row whose value changes is highlighted, with the new value in bold
-    and a "changed" tag; any live_rule_warnings sentence is shown in red.
-    The form posts back every proposal field as the request gave it, with the
+    and a "changed" tag; any live_rule_warnings sentence is shown in red, and
+    so, against the defaults in force, is trim_change_warnings' (with the
+    Kelly trim on, a lower size cap or a higher k sells more of the held
+    pairs at the next run). The form posts back every proposal field as the
+    request gave it, with the
     fingerprint, nonce and token, through three buttons rendered disabled
     (the page script arms them): Dry run, Confirm and save, and, set apart
     below a red line, Confirm and trade. A button that does not apply is a
@@ -1350,6 +1354,11 @@ def _confirm_html(current: LiveSettings | None, settings: LiveSettings, source: 
     # The same warnings a live run on these settings would log
     for warning in live_rule_warnings(settings):
         parts.append(f"<p class=\"warn\">Warning: {html.escape(warning)}.</p>")
+    if current is not None:
+        # With the Kelly trim on, a lower size cap or a higher k than the defaults
+        # in force sells more of the held pairs at the next run
+        for warning in trim_change_warnings(current, settings):
+            parts.append(f"<p class=\"warn\">Warning: {html.escape(warning)}.</p>")
     if not changes:
         parts.append("<p>These are already the live defaults — nothing to save.</p>")
     parts.append(_notes_html(confirming=True))

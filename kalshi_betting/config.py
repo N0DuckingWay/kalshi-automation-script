@@ -1724,6 +1724,11 @@ SETTLEMENT_PAGE_SIZE = 200
 # most the pinned SDK lets one request ask for.
 FILLS_PAGE_SIZE = 200
 
+# Orders per page from /portfolio/orders (scanner.get_resting_orders, which
+# counts the orders resting on the account before a run trims); 200 is the most
+# the pinned SDK lets one request ask for.
+ORDERS_PAGE_SIZE = 200
+
 # The earliest year a fill's time may fall in, in UTC, for
 # scanner.get_fill_times to take it as a real time. Kalshi lists no market
 # created before the middle of 2021 (see ARCHIVE_FIRST_CREATED_DATE), so no
@@ -1734,8 +1739,8 @@ FILLS_PAGE_SIZE = 200
 FILLS_EARLIEST_YEAR = 2021
 
 # Hard ceiling on pages walked by scanner.py's cursor loops (open events, MVE
-# events, positions, settlements, fills). The stuck-cursor guard catches a
-# cursor that repeats consecutively, but a keyset cycling with period > 1
+# events, positions, settlements, fills, resting orders). The stuck-cursor
+# guard catches a cursor that repeats consecutively, but a keyset cycling with period > 1
 # (A, B, A, B, ...) never does; the guard now remembers every cursor it has
 # used, and this cap bounds the walk regardless (TS-05). At MARKET_PAGE_SIZE
 # (200) this is 1,000,000 markets; a 2026-09 prod ingest is ~135k markets
@@ -4662,6 +4667,7 @@ def live_rule_warnings(settings: LiveSettings) -> list[str]:
     checks, and the add-on itself never stakes more than a new pair would.
     The Kelly trim (trim_to_kelly, trim_min_rise) adds no sentence either: a
     trim only sells, so it can neither empty a gap range nor lift a stake.
+    What a change of settings makes a trim sell is trim_change_warnings'.
 
     Args:
         settings (LiveSettings): The run's toggles.
@@ -4711,6 +4717,53 @@ def live_rule_warnings(settings: LiveSettings) -> list[str]:
         out.append(f"k = {settings.interval_discount!r}: time-series Kelly cannot be "
                    "positive, so no time-series trade can size")
     return out
+
+
+def trim_change_warnings(current: LiveSettings, proposed: LiveSettings) -> list[str]:
+    """
+    Say when moving from one set of live settings to another also sells held pairs.
+
+    With the Kelly trim on, a run sells part of each exact held pair worth
+    more than its Kelly size: the lower of the pair's size cap and Kelly's own
+    share, which reads k for a time-series pair. So when the proposed settings
+    trim, a lower size cap for either pair type (pair_size_cap, so lowering a
+    same-title cap that the per-trade cap already holds below changes
+    nothing) or a higher k (which lowers a time-series pair's chance of
+    paying; a same-title pair's is fixed) sells pairs the current settings
+    would keep, before anything is bought, once each pair's wait has passed.
+    main._log_live_settings logs the sentence as a WARNING on a real-money run
+    whose flags depart from the saved live defaults, and the defaults server's
+    confirmation page shows it in red.
+
+    Args:
+        current (LiveSettings): The settings in force (the saved live defaults).
+        proposed (LiveSettings): The run's settings, or what a save would write.
+
+    Returns:
+        list[str]: One sentence naming every change that sells, when the
+            proposed settings trim and at least one setting moves that way;
+            empty otherwise.
+    """
+    if not proposed.trim_to_kelly:
+        return []
+    changes = []
+    for pair_type, label in (("time_series", "time-series"), ("same_title", "same-title")):
+        # The cap each pair type is trimmed to, as a new trade of it is capped
+        before = pair_size_cap(pair_type, current.size_cap, current.same_title_size_cap)
+        after = pair_size_cap(pair_type, proposed.size_cap, proposed.same_title_size_cap)
+        if after < before:
+            changes.append(f"the {label} size cap goes from {_cap_text(before, 'no cap')} to "
+                           f"{_cap_text(after, 'no cap')}")
+    if proposed.interval_discount > current.interval_discount:
+        changes.append(f"k goes from {_exact_number(current.interval_discount)} to "
+                       f"{_exact_number(proposed.interval_discount)}, which lowers a "
+                       "time-series pair's chance of paying")
+    if not changes:
+        return []
+    named = changes[0] if len(changes) == 1 else ", ".join(changes[:-1]) + " and " + changes[-1]
+    return [f"with the Kelly trim on, these settings can sell more of the held pairs: {named}; "
+            "each exact held pair worth more than its new Kelly size is sold down to it before "
+            "anything is bought, once the wait since its last trade has passed"]
 
 
 def order_api_version_error() -> str | None:

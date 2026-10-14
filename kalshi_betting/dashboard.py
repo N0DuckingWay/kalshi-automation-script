@@ -6398,7 +6398,10 @@ def _trim_select_title(days) -> str:
             when at least that many days have passed since its last
             purchase, add-on or trim; with a wait no longer than the week
             between runs, the text adds that it never holds a trim back on
-            this page. With 0, a pair can be trimmed at any weekly run. It
+            this page, and, after the part about trades, how a live run
+            counts the wait (every fill on either market, by hand too, and
+            no trim while Kalshi's list of fills does not reach back that
+            far). With 0, a pair can be trimmed at any weekly run. It
             then says what Save as live defaults saves: from a page that
             simulated trimming, this choice and the Min. price rise shown
             (from any other page, the saved ones are kept), and, with this
@@ -6418,18 +6421,25 @@ def _trim_select_title(days) -> str:
         none = one = covered = False
     if none:
         wait = "A pair can be trimmed at any weekly run after a trade on it. "
+        # No wait for a live run to count either
+        live = ""
     else:
         passed = "day has" if one else "days have"
         wait = (f"A pair is trimmed only when at least {days} {passed} passed since its "
                 "last purchase, add-on or trim"
                 + (f"; weekly runs are {_DAYS_BETWEEN_WEEKLY_RUNS} days apart, so this never "
                    "holds a trim back here. " if covered else ". "))
+        # A live run reads its trades from Kalshi's list of the account's fills
+        live = ("A live run counts the wait in calendar days on the bot's own clock from "
+                "the last fill of any sort on either market, a trade by hand included, and "
+                "trims nothing while Kalshi's list of the account's fills does not reach "
+                "back that far. ")
     return ("off: no part of a held pair is sold to cut its size. on: at each weekly run, a "
             "pair that has grown past its Kelly size at that day's sale prices, or past the "
             "size cap, is sold down to it, the latest purchase first; with Add to held pairs "
             f"on as well, a pair is topped up or sold down each week. {wait}Min. price rise "
             "can make a trim wait until the pair's price has gone up. Each part sold counts "
-            "as a trade of its own. While this is on, Sell is set to no selling (the two "
+            f"as a trade of its own. {live}While this is on, Sell is set to no selling (the two "
             "are not simulated together). From a page that simulated trimming, Save as live "
             "defaults saves this choice and the Min. price rise shown, for live runs to trim "
             "by; from any other page it keeps the saved ones. With this on, saving from a "
@@ -6472,7 +6482,9 @@ _TRIM_RISE_TITLE = (
     "counts. any: no minimum, so a pair can be trimmed whichever way its price moved. "
     "From a page that simulated trimming, Save as live defaults saves the minimum shown, "
     "for live runs to wait for (any, or Trim to Kelly off, saves none); from any other "
-    "page it keeps the saved one.")
+    "page it keeps the saved one. A live run reads the price at the pair's last fill on "
+    "Kalshi, so with a minimum set it does not trim a pair whose last fill is older than "
+    "Kalshi's list of the account's fills reaches.")
 _TRIM_RISE_NOTES = {
     "not simulated": "(not simulated in this backtest)",
     "unavailable": "(not available on this page; see the log)",

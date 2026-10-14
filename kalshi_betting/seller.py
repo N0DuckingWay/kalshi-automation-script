@@ -865,7 +865,8 @@ def _log_trim_summary(trimmed: int, considered: int) -> None:
 
 def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
               settings: LiveSettings, min_days: int, now_date: date, utc_date: date,
-              value: float, positions_value: float) -> tuple[SalePlan | None, str | None]:
+              value: float, positions_value: float,
+              fetched: list) -> tuple[SalePlan | None, str | None]:
     """
     Judge one exact held pair for a Kelly trim, logging its verdict, and plan the part sale.
 
@@ -886,7 +887,9 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
          is judged only on quotes the backtest could have judged it on. Then
          what one contract pair sells for at the best bids after the fee: a
          pair that alone would fetch more than all open positions are valued
-         at stops every trim of the run (see Returns).
+         at stops every trim of the run (see Returns), and what it would
+         fetch goes into `fetched`, for plan_trims' test of all the pairs
+         together.
       5. With a minimum price rise set: the pair's total price (the ask of
          the side held on each market, added) now, against the same at its
          last fill (config.pair_price_rise, config.trim_rise_reached).
@@ -913,6 +916,9 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
         value (float): Keyword-only. The value the trim is sized on, in dollars: cash
             plus open positions.
         positions_value (float): Keyword-only. The open positions' share of that value.
+        fetched (list): Keyword-only. Once the pair's four best bids are read,
+            what it would fetch at its best bids after the fee, in dollars, is
+            added to this list.
 
     Returns:
         tuple[SalePlan | None, str | None]: (the plan, None) when part of the
@@ -1019,6 +1025,8 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
     # plan_trims that the value cannot be right
     # Cross-module: the fee on selling one contract of each side at those bids
     top_value = bid_a + bid_b - fee_per_pair_approx(bid_a, bid_b)
+    # For plan_trims, which tests every pair whose books were read together
+    fetched.append(count * top_value)
     if count * top_value > positions_value:
         # One pair cannot be worth more than every open position together
         return None, (f"{text} alone would fetch {_dollars(count * top_value)} at its best "
@@ -1148,9 +1156,10 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
         readable kind and a best bid on all four sides that a candle could
         show) would alone fetch more at its best bids than all open
         positions are valued at (_trim_one tells, before its price-rise and
-        chance steps): that value cannot then be right, and no pair is
-        trimmed. A pair stopped before its books are read is not seen by
-        this check.
+        chance steps), and those pairs would not together either: that
+        value cannot then be right, and no pair is trimmed, those whose
+        "Kelly trim check" line already reads "-> sell" included. A pair
+        stopped before its books are read is not seen by this check.
 
     The value a trim is sized on is the cash plus the larger of Kalshi's
     value of the open positions and what every held market would fetch at
@@ -1278,21 +1287,32 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
     utc_date = now.astimezone(UTC).date()
     plans: list[SalePlan] = []
     doubts: list[str] = []
+    # What each pair whose books were read would fetch at its best bids after the fee
+    fetched: list[float] = []
     for key in sorted(pairs, key=sorted):
         plan, doubt = _trim_one(pairs[key], reads, fills, settings=settings,
                                 min_days=min_days, now_date=now_date, utc_date=utc_date,
-                                value=value, positions_value=positions_value)
+                                value=value, positions_value=positions_value,
+                                fetched=fetched)
         if doubt is not None:
             doubts.append(doubt)
         elif plan is not None:
             plans.append(plan)
+    total = sum(fetched)
+    if not doubts and total > positions_value:
+        # No pair alone, but those pairs together, are worth more than every open
+        # position: the value is just as wrong
+        doubts.append(f"the {len(fetched)} pairs whose order books were read would fetch "
+                      f"{_dollars(total)} at their best bids together, more than the "
+                      f"{_dollars(positions_value)} all open positions are valued at")
     if doubts:
-        # One pair worth more than all open positions: the value every trim above
-        # was sized on is too small, so none of them stands
+        # The value every trim above was sized on is too small, so none of them
+        # stands, whatever its "Kelly trim check" line said
         more = f" (and {len(doubts) - 1} more pair(s) alike)" if len(doubts) > 1 else ""
         logging.warning(
-            "Not trimming any held pair this run: %s%s, so that value cannot be right, and "
-            "a trim sized on too small a value would sell too much", doubts[0], more)
+            "Not trimming any held pair this run, including any marked '-> sell' above: "
+            "%s%s, so that value cannot be right, and a trim sized on too small a value "
+            "would sell too much", doubts[0], more)
         _log_trim_summary(0, len(pairs))
         return []
     _log_trim_summary(len(plans), len(pairs))

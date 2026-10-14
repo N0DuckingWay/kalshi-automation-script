@@ -8921,6 +8921,177 @@ class TestGetFillTimes:
         assert set(got.latest) == {"KXGTATRAILER-26NOVE"}
 
 
+def _order_row(status: str = "resting", **extra) -> dict:
+    """One order as /portfolio/orders sends it; only its status is read."""
+    return {"order_id": f"O-{status}", "ticker": "KXA-1", "side": "yes", "action": "buy",
+            "status": status, "yes_price_dollars": "0.5000", "remaining_count_fp": "50.00",
+            **extra}
+
+
+def _orders_page(rows, cursor=None) -> SimpleNamespace:
+    """Raw-response stand-in for one /portfolio/orders page holding `rows`."""
+    return _json_reply({"orders": rows, "cursor": cursor})
+
+
+def _orders_client(*pages) -> MagicMock:
+    """A client whose orders listing serves `pages` in order."""
+    client = MagicMock()
+    client.get_orders_without_preload_content = MagicMock(side_effect=list(pages))
+    return client
+
+
+class TestGetRestingOrders:
+    """get_resting_orders counts the orders resting on the account. Kalshi
+    holds cash for a resting order in neither its balance nor its value of
+    the open positions, so a run trims nothing while one rests: anything short
+    of the whole list, every status read, gives None, and the run then trims
+    nothing too."""
+
+    def test_two_pages_are_counted_and_the_filter_is_sent(self, caplog):
+        client = _orders_client(_orders_page([_order_row(), _order_row()], cursor="C1"),
+                                _orders_page([_order_row()], cursor=""))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) == 3
+        # Resting orders only, the largest page the SDK allows, then the cursor
+        assert [c.kwargs for c in client.get_orders_without_preload_content.call_args_list] == [
+            {"status": "resting", "limit": 200},
+            {"status": "resting", "limit": 200, "cursor": "C1"}]
+        assert config.ORDERS_PAGE_SIZE == 200
+        assert [r.getMessage() for r in caplog.records] == ["Resting orders on the account: 3"]
+
+    @pytest.mark.parametrize("body", [
+        {"orders": [], "cursor": ""}, {"orders": None, "cursor": None}, {"orders": []},
+    ])
+    def test_no_order_is_a_count_of_zero(self, body, caplog):
+        client = MagicMock()
+        client.get_orders_without_preload_content.return_value = _json_reply(body)
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) == 0
+        assert [r.getMessage() for r in caplog.records] == ["Resting orders on the account: 0"]
+
+    def test_an_order_that_no_longer_rests_is_not_counted(self):
+        # A reply that left the filter out: a filled or canceled order holds no cash
+        client = _orders_client(_orders_page(
+            [_order_row("executed"), _order_row("canceled"), _order_row()]))
+        assert scanner.get_resting_orders(client) == 1
+        client = _orders_client(_orders_page([_order_row("executed"), _order_row("canceled")]))
+        assert scanner.get_resting_orders(client) == 0
+
+    def test_it_only_reads(self):
+        client = _orders_client(_orders_page([_order_row()]))
+        scanner.get_resting_orders(client)
+        assert [call[0] for call in client.method_calls] == [
+            "get_orders_without_preload_content"]
+
+    @pytest.mark.parametrize("status", [None, "", "Resting", "open", "pending", 5, True,
+                                        ["resting"], {"status": "resting"}])
+    def test_an_order_whose_status_cannot_be_read_gives_none(self, status, caplog):
+        row = _order_row()
+        row["status"] = status
+        client = _orders_client(_orders_page([_order_row(), row]))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) is None
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning == ("Could not read the account's resting orders: an order on page 1 "
+                           f"has no readable status ({status!r:.80})")
+        assert "Resting orders on the account" not in caplog.text
+
+    @pytest.mark.parametrize("record", ["x", None, [], 5, {"order_id": "O-1"}])
+    def test_a_record_with_no_status_gives_none(self, record, caplog):
+        client = _orders_client(_orders_page([_order_row(), record]))
+        with caplog.at_level(logging.WARNING):
+            assert scanner.get_resting_orders(client) is None
+        assert "has no readable status (None)" in caplog.text
+
+    def test_an_odd_status_cannot_fill_the_log(self, caplog):
+        client = _orders_client(_orders_page([_order_row("X" * 5000)]))
+        with caplog.at_level(logging.WARNING):
+            assert scanner.get_resting_orders(client) is None
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning) < 300
+
+    @pytest.mark.parametrize("body", [
+        [], "ok", None, 5, {"orders": {}}, {"orders": "x"}, {"orders": 0},
+        {"orders": [], "cursor": 5}, {"orders": [], "cursor": ["C1"]},
+        # No "orders" key at all: a renamed key, not an account with none
+        {}, {"cursor": ""}, {"Orders": [], "cursor": ""},
+    ])
+    def test_a_page_that_is_not_a_list_of_orders_gives_none(self, body, caplog):
+        client = MagicMock()
+        client.get_orders_without_preload_content.return_value = _json_reply(body)
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings == ["Could not read the account's resting orders: page 1 is not a "
+                            "list of orders with a cursor"]
+        assert "Resting orders on the account" not in caplog.text
+
+    @pytest.mark.parametrize("cursors", [["C1", "C1"], ["C1", "C2", "C1"]])
+    def test_a_repeated_cursor_stops_and_gives_none(self, cursors, caplog):
+        client = _orders_client(*[_orders_page([_order_row()], cursor=c) for c in cursors])
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) is None
+        assert client.get_orders_without_preload_content.call_count == len(cursors)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and "cursor did not advance" in warnings[0]
+        assert "Resting orders on the account" not in caplog.text
+
+    def test_the_page_cap_gives_none(self, monkeypatch, caplog):
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 2)
+        client = _orders_client(_orders_page([], cursor="C1"), _orders_page([], cursor="C2"))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and "SCANNER_MAX_PAGES (2)" in warnings[0]
+
+    def test_a_list_that_ends_on_the_last_allowed_page_is_complete(self, monkeypatch):
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 2)
+        client = _orders_client(_orders_page([_order_row()], cursor="C1"),
+                                _orders_page([_order_row()], cursor=None))
+        assert scanner.get_resting_orders(client) == 2
+
+    @pytest.mark.parametrize("page, reply", [
+        (1, _error_reply(404, "Not Found")),
+        (1, _error_reply(400, "Bad Request")),
+    ])
+    def test_a_failed_page_gives_none_in_one_line(self, page, reply, caplog):
+        client = _orders_client(reply)
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) is None
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning.startswith(f"Could not read the account's resting orders (page {page}): "
+                                  "HTTP ")
+        assert "\n" not in warning and "HEADER-DUMP" not in caplog.text
+        assert "Resting orders on the account" not in caplog.text
+
+    def test_a_later_page_that_fails_gives_none_not_a_partial_count(self, caplog):
+        client = _orders_client(_orders_page([_order_row()], cursor="C1"),
+                                _error_reply(400, "Bad Request"))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) is None
+        assert "(page 2): HTTP 400 Bad Request" in caplog.text
+
+    def test_a_server_error_is_retried_then_gives_none(self, caplog):
+        client = MagicMock()
+        client.get_orders_without_preload_content.return_value = _error_reply(
+            500, "Internal Server Error")
+        with patch.object(_http.time, "sleep"), caplog.at_level(logging.WARNING):
+            assert scanner.get_resting_orders(client) is None
+        # Retried like every read-only GET
+        assert client.get_orders_without_preload_content.call_count > 1
+        assert "(page 1): HTTP 500 Internal Server Error" in caplog.text
+
+    def test_a_connection_failure_is_retried_then_gives_none(self, caplog):
+        client = MagicMock()
+        client.get_orders_without_preload_content.side_effect = ProtocolError(
+            "Connection broken: IncompleteRead(0 bytes read)")
+        with patch.object(_http.time, "sleep"), caplog.at_level(logging.WARNING):
+            assert scanner.get_resting_orders(client) is None
+        assert client.get_orders_without_preload_content.call_count > 1
+        assert ("ProtocolError: Connection broken: IncompleteRead(0 bytes read)"
+                in caplog.text)
+
+
 _RUNG_EARLY = "KXSTAR-14-MAR01"
 _RUNG_LATE = "KXSTAR-14-MAR20"
 
