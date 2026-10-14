@@ -31,11 +31,14 @@ Purpose:
 Dependencies:
     Imports the standard library, config, scanner and historical only, never
     trader, strategy, the backtester or main (pinned by tests/test_seller.py).
-    main.py alone imports it, and calls plan_sales before it buys anything.
-    No run calls plan_trims.
+    main.py alone imports it. A production run calls plan_sales before it
+    buys anything and, with trim_to_kelly on, plan_trims right after it,
+    leaving out the pairs plan_sales picked.
 
 Notes:
-    Every request is a read-only GET, made at most once per run. It fails
+    Every request is a read-only GET, made at most once by each of
+    plan_sales and plan_trims: a run that sells and trims may read the order
+    books of a pair the take-profit rule keeps once in each. It fails
     closed: anything unknown or unreadable means no sale and no trim, with a
     log line.
 """
@@ -351,7 +354,7 @@ def _settled_count(settlement: Settlement, side: str) -> float:
 
 class _Reads:
     """
-    This run's reads beyond the positions listing, each made once, when first needed.
+    One planner call's reads beyond the positions listing, each made once, when first needed.
 
     Attributes:
         client (Any): The authenticated Kalshi client.

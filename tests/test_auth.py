@@ -17,7 +17,8 @@ Purpose:
     shard's cash together with Kalshi's value of the open positions
     (_positions_value_cents: integer cents, or a dollar string by presence,
     None whenever the reply carries nothing readable or a value outside
-    0 to 2**53 cents).
+    0 to 2**53 cents) and whether that cash counts every balance_breakdown
+    entry (cash_complete, from _balance_cents_by_shard's left_out).
 
 Dependencies:
     Imports the kalshi_betting.auth and kalshi_betting._http modules
@@ -340,6 +341,41 @@ class TestBalanceCentsByShard:
             "balance_dollars": "999.00",
         }
         assert _balance_cents_by_shard(payload) == {1: 200}
+
+    def test_left_out_names_each_entry_whose_cash_is_not_counted(self):
+        payload = {
+            "balance_breakdown": [
+                "not-a-dict",
+                {"exchange_index": None, "balance": "9.99"},
+                {"exchange_index": 0, "balance": "garbage"},
+                {"exchange_index": 1, "balance": "1.00"},
+                {"exchange_index": 1, "balance": "2.00"},
+                {"exchange_index": 2, "balance": "3.00"},
+            ],
+            "balance_dollars": "999.00",
+        }
+        left_out: list = []
+        # The dict is the one returned without the list: only the report is new
+        assert (_balance_cents_by_shard(payload, left_out=left_out)
+                == _balance_cents_by_shard(payload) == {1: 200, 2: 300})
+        assert left_out == ["entry 0 is not an object",
+                            "entry 1 names no readable exchange_index",
+                            "shard 0: no readable balance",
+                            "shard 1: an earlier entry, replaced by a later one"]
+
+    @pytest.mark.parametrize("payload", [
+        # Nothing in the breakdown parsed, so the aggregate is returned
+        {"balance_breakdown": [{"exchange_index": "x", "balance": "1.00"}],
+         "balance_dollars": "5.00"},
+        {"balance_dollars": "5.00"},
+        {"balance": 500},
+    ])
+    def test_left_out_stays_empty_when_the_aggregate_is_returned(self, payload):
+        # The aggregate counts every shard, so no shard's cash is missing from it
+        left_out: list = []
+        assert _balance_cents_by_shard(payload, left_out=left_out) == {
+            DEFAULT_EXCHANGE_INDEX: 500}
+        assert left_out == []
 
     def test_empty_payload_raises(self):
         with pytest.raises(ValueError):
@@ -664,6 +700,35 @@ class TestReadAccountBalance:
         result = read_account_balance(_balance_client(LIVE_PAYLOAD))
         with pytest.raises(dataclasses.FrozenInstanceError):
             result.positions_value_cents = 0
+
+    @pytest.mark.parametrize("breakdown, complete", [
+        ([{"exchange_index": 0, "balance": "40.0000"},
+          {"exchange_index": 1, "balance": "20.0000"}], True),
+        ([{"exchange_index": 0, "balance": "forty"},
+          {"exchange_index": 1, "balance": "20.0000"}], False),
+        ([{"exchange_index": None, "balance": "40.0000"},
+          {"exchange_index": 1, "balance": "20.0000"}], False),
+        (["not-a-dict", {"exchange_index": 1, "balance": "20.0000"}], False),
+        ([{"exchange_index": 0, "balance": "40.0000"},
+          {"exchange_index": 0, "balance": "20.0000"}], False),
+        # Nothing parsed: the aggregate, which counts every shard, is read
+        ([{"exchange_index": "x", "balance": "40.0000"}], True),
+        # No breakdown at all: the aggregate again
+        ([], True),
+    ], ids=["clean", "balance unreadable", "index unreadable", "not an object",
+            "index repeated", "aggregate after nothing parsed", "no breakdown"])
+    def test_cash_complete_says_whether_every_entry_was_counted(self, breakdown, complete):
+        # A Kelly trim grows as the value it is sized on shrinks, so the read
+        # says when a shard's cash was left out of the dict it returns
+        account = read_account_balance(_balance_client(
+            {"balance_dollars": "60.0000", "balance_breakdown": breakdown}))
+        assert account.cash_complete is complete
+
+    def test_the_live_reply_and_the_sandbox_shape_count_every_shard(self):
+        assert read_account_balance(_balance_client(LIVE_PAYLOAD)).cash_complete is True
+        assert read_account_balance(_balance_client({"balance": 5000})).cash_complete is True
+        # A positional construction keeps the default, so the read's == pins hold
+        assert AccountBalance({0: 1}, None).cash_complete is True
 
     def test_integer_cents_are_read_as_is_and_zero_is_an_answer(self):
         assert _positions_value_cents({"portfolio_value": 39796}) == 39796

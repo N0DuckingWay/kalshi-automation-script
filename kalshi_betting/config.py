@@ -53,7 +53,8 @@ Notes:
     LiveSettings also holds a Kelly-trim switch and the least price rise a
     trim needs (trim_to_kelly, trim_min_rise): they are validated, saved,
     shown and spelled as flags like every other toggle. seller.plan_trims
-    reads them, and no run calls it, so no run acts on them.
+    reads them, and a production run with the switch on calls it before it
+    buys (main._run_prod).
     SALE_KIND_TAKE_PROFIT and SALE_KIND_KELLY_TRIM name the two reasons a
     plan sells held contracts.
 """
@@ -533,8 +534,9 @@ TAKE_PROFIT_HOLD_DAYS_MAX = 7
 # is at least this many dollars above where it stood at the last trade on the
 # pair (its purchase, an add-on or an earlier trim). A fall never counts.
 # Every 5c from 5c to 95c, 19 values, each the float nearest its cents over
-# 100 (so 15c is exactly the float 0.15). BACKTEST-ONLY: live trading does not
-# trim, and no live module reads this. Distinct values in (0, 1]. Read by
+# 100 (so 15c is exactly the float 0.15). BACKTEST-ONLY: no live module reads
+# this; a live run trims after its own saved minimum (LiveSettings.trim_min_rise).
+# Distinct values in (0, 1]. Read by
 # backtester.run_backtest_sweep(trim_rise_sweep=True), which checks them
 # before its fetch. TRIM_PRICE_RISE_STEP_CENTS is the step a minimum sits on:
 # the live setting for one (LiveSettings.trim_min_rise, checked by _step_rise)
@@ -679,9 +681,9 @@ SELL_AT_STEP = 0.01
 # once the pair has outgrown its Kelly size. A live run reads the saved live
 # defaults' trim_to_kelly instead (a saved file that leaves the key out reads
 # it as off), which main.py --trim-to-kelly / --no-trim-to-kelly overrides for
-# one run. The setting is validated, saved and shown. seller.plan_trims plans
-# the trims it asks for, and no run calls that function: a run with it on
-# trades as one with it off. The backtest never reads this constant.
+# one run. With it on, a production run sells, before it buys, part of each
+# exact held pair that has outgrown its Kelly size (main._run_prod, through
+# seller.plan_trims). The backtest never reads this constant.
 TRIM_TO_KELLY = False
 
 # The least rise in a held pair's total price since the last trade on it
@@ -2951,8 +2953,8 @@ class LiveSettings:
         trim_to_kelly (bool): The Kelly-trim switch: on asks for part of an
             exact held pair to be sold once it has outgrown its Kelly size; a
             real bool. Default False, which is also what a saved file that
-            leaves it out reads as. seller.plan_trims plans the trims; no
-            run calls it.
+            leaves it out reads as. A production run with it on trims before
+            it buys (main._run_prod, through seller.plan_trims).
         trim_min_rise (float | None): The least rise in a held pair's total
             price since the last trade on it that a trim asks for, in dollars
             on the 5c grid from 5c to $1 (0.1 for 10c); None (default) is no

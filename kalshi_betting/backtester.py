@@ -13060,8 +13060,9 @@ def run_backtest_sweep(
             BacktestSweep.trim_sweep — a lazy TrimSweep over the same grid,
             every simulation selling held pairs down to their Kelly size.
             The flag adds no simulation to the run itself. False (default)
-            returns None, as does the infeasible window. Backtest-only: live
-            trading does not trim.
+            returns None, as does the infeasible window. Backtest-only: a
+            live run trims by its own saved trim_to_kelly
+            (seller.plan_trims), never by this family.
         trim_rise_sweep (bool): Keyword-only. When True (trim_sweep
             required), BacktestSweep.trim_sweep also carries every minimum
             price rise of config.TRIM_MIN_PRICE_RISES (TrimSweep.min_rises).

@@ -88,13 +88,13 @@ Purpose:
     and waits until the money has arrived; trades on a shard it could not
     fund are dropped. main._run_prod calls it right after pre_execution_check.
 
-    sell_positions() sells the held positions seller.plan_sales picked, before
-    main._run_prod buys anything: one reduce_only, immediate_or_cancel order
-    per held market (see CLAUDE.md, live selling). A plan may also sell only
-    part of what a market holds (a Kelly trim, from seller.plan_trims): its
-    legs then name the contracts held apart from the contracts to sell
-    (_plan_holding), and the orders, their prices and the reading of their
-    fills are the same.
+    sell_positions() sells what seller.plan_sales and seller.plan_trims
+    planned, before main._run_prod buys anything: one reduce_only,
+    immediate_or_cancel order per held market (see CLAUDE.md, live
+    selling). A Kelly trim's plan (seller.plan_trims) may sell only part of
+    what a market holds: its legs then name the contracts held apart from
+    the contracts to sell (_plan_holding), and the orders, their prices and
+    the reading of their fills are the same.
 
 Dependencies:
     Imports from config.py (the order, transfer and write-pacing settings,

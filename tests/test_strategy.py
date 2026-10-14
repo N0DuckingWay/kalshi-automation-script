@@ -4284,6 +4284,18 @@ class TestTimeSeriesKellyParity:
         [dry_run_value] = [k.value for k in sell.keywords if k.arg == "dry_run"]
         assert ast.unparse(dry_run_value) == "args.dry_run"
         assert plan.lineno < sell.lineno
+        # The Kelly trims are planned once, after the take-profit plans and before
+        # the one call that sends every sale, on the run's settings, its cash and
+        # the positions value kept at the start of the run (the value check's own
+        # result, never the value as read), leaving out what the take-profit plans sell
+        [trims] = _call_nodes(main, "_run_prod", "plan_trims")
+        assert plan.lineno < trims.lineno < sell.lineno
+        trim_keywords = {k.arg: ast.unparse(k.value) for k in trims.keywords}
+        assert trim_keywords["settings"] == "settings"
+        assert trim_keywords["cash_cents"] == "cash_cents"
+        assert trim_keywords["positions_value_cents"] == "checked_value_cents"
+        assert trim_keywords["skip"] == "_plan_tickers(plans)"
+        assert _function_calls(main, "_run_prod", "_emptied_tickers")
         later = (_call_nodes(main, "_run_prod", "find_time_series_pairs")
                  + _call_nodes(main, "_run_prod", "find_same_title_pairs")
                  + _call_nodes(main, "_run_prod", "held_pairs")
