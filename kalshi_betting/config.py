@@ -44,6 +44,9 @@ Notes:
     test that can hold a trim back until enough calendar days have passed
     since the pair's last trade (kelly_trim_min_days, trade_day,
     kelly_trim_rested, with KELLY_TRIM_MIN_DAYS_SINCE_TRADE).
+    TRIM_PRICE_THEN_MAX_AGE_DAYS is how far back historical.ask_before is
+    meant to look for the price a held market stood at at a past moment; no
+    module calls that reader or reads the constant.
 """
 import fcntl
 import json
@@ -547,6 +550,16 @@ KELLY_TRIM_MIN_DAYS_SINCE_TRADE = 7
 # reaches, and Kalshi moves its oldest fills out of that list into an archive,
 # so the wait is kept short enough for the list to cover it.
 KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX = 30
+
+# How many days old, at most, the quote may be that says what a held market's
+# price was at a past moment (the time its pair last traded). The price is the
+# asking price of the side held on the market's latest hourly candle with a
+# usable ask that ended at or before that moment (historical.ask_before, which
+# is meant to be handed this many days, in seconds, as its window; no module
+# calls it or reads this constant). A quiet market has hours with no candle,
+# so the reader may look back this far; with no usable quote in that time the
+# price then is unknown.
+TRIM_PRICE_THEN_MAX_AGE_DAYS = 7
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
@@ -1652,13 +1665,27 @@ POSITION_PAGE_SIZE = 500
 # 200 is the endpoint's maximum.
 SETTLEMENT_PAGE_SIZE = 200
 
+# Fills per page from /portfolio/fills (scanner.get_fill_times); 200 is the
+# most the pinned SDK lets one request ask for.
+FILLS_PAGE_SIZE = 200
+
+# The earliest year a fill's time may fall in, in UTC, for
+# scanner.get_fill_times to take it as a real time. Kalshi lists no market
+# created before the middle of 2021 (see ARCHIVE_FIRST_CREATED_DATE), so no
+# fill is older than that. A time in an earlier year is what a server writes
+# when it has no time to give (year 1, or 1970): taken as real, it would make
+# the list of fills look as if it reached decades back. The reader treats
+# such a fill as one it cannot read.
+FILLS_EARLIEST_YEAR = 2021
+
 # Hard ceiling on pages walked by scanner.py's cursor loops (open events, MVE
-# events, positions). The stuck-cursor guard catches a cursor that repeats
-# consecutively, but a keyset cycling with period > 1 (A, B, A, B, ...) never
-# does; the guard now remembers every cursor it has used, and this cap bounds
-# the walk regardless (TS-05). At MARKET_PAGE_SIZE (200) this is 1,000,000
-# markets; a 2026-09 prod ingest is ~135k markets (~700 pages). Same
-# bound-the-work-then-say-so idiom as EVENT_TITLE_FALLBACK_MAX_LOOKUPS.
+# events, positions, settlements, fills). The stuck-cursor guard catches a
+# cursor that repeats consecutively, but a keyset cycling with period > 1
+# (A, B, A, B, ...) never does; the guard now remembers every cursor it has
+# used, and this cap bounds the walk regardless (TS-05). At MARKET_PAGE_SIZE
+# (200) this is 1,000,000 markets; a 2026-09 prod ingest is ~135k markets
+# (~700 pages). Same bound-the-work-then-say-so idiom as
+# EVENT_TITLE_FALLBACK_MAX_LOOKUPS.
 SCANNER_MAX_PAGES  = 5000
 
 # Cap on the number of multivariate-events pages the backtester's event-title

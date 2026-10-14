@@ -51,7 +51,10 @@ Dependencies:
     walking a SettledCorpus raises when its file cannot be read.
     Also exports the candle bid rule a sale reads: usable_candle_ask and candle_sale_bids
     (read by backtester.py, and by bid_before) and bid_before (seller.py only), plus
-    recent_candles, seller.py's never-cached candle fetch.
+    recent_candles, seller.py's never-cached candle fetch. Two more readers of that
+    rule have no caller in the package: ask_before (one side's latest usable ask at
+    a past moment, with an age limit) and candle_reads_bid (whether a candle could
+    show a given best bid).
 
 Notes:
     Historical market data only exists on the production API — the sandbox does
@@ -6272,3 +6275,85 @@ def bid_before(candles: list[dict], moment: int, side: str, *, window: int) -> f
     if not moment - candle["ts"] < window:
         return float("nan")
     return candle_sale_bids(candle)[index]
+
+
+def ask_before(candles: list[dict], moment: int, side: str, *, window: int) -> float:
+    """
+    One side's latest usable ask on a candle that ended at or before `moment`, if recent enough.
+
+    What one contract of that side cost at a past moment: the price a held
+    market stood at when its pair last traded, say. It is read as the backtest
+    reads a held leg's price at a checkpoint (backtester._leg_quotes): the
+    latest ask of that side that can value a leg (usable_candle_ask), so a
+    candle whose book was empty or whose close cannot be read is passed over
+    for the one before it. Unlike the backtest's reading, the quote has an age
+    limit, `window`, since a live reader fetches only a few days of candles.
+
+    Args:
+        candles (list[dict]): One market's candles ("ts": the end of its hour,
+            Unix seconds), normally in time order. They are read in their own
+            order, as bid_before reads them, and reading stops at the first
+            that ended after `moment`.
+        moment (int): The past moment, in Unix seconds.
+        side (str): The side whose ask to read, "yes" or "no".
+        window (int): Keyword-only. The candle must have ended less than this
+            many seconds before `moment`.
+
+    Returns:
+        float: The ask, in dollars; NaN when no candle that ended at or before
+            `moment`, and less than `window` seconds before it, carries a
+            usable ask of that side.
+
+    Raises:
+        ValueError: For a side other than "yes" or "no".
+    """
+    if side not in ("yes", "no"):
+        raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+    key = "yes_ask_close" if side == "yes" else "no_ask_close"
+    found = float("nan")
+    for candle in candles:
+        # A candle that ended after the moment says nothing about it; nor does any behind it
+        if candle["ts"] > moment:
+            break
+        if moment - candle["ts"] < window:
+            # A missing close reads as no quote, as candle_sale_bids reads it
+            ask = usable_candle_ask(candle.get(key), side)
+            # A NaN is never equal to itself: only a usable ask is kept
+            if ask == ask:
+                found = ask
+    return found
+
+
+def candle_reads_bid(bid: Any, side: str) -> bool:
+    """
+    Whether a candle could show this best bid of `side`.
+
+    A candle holds asks, and a side's bid is 1 minus the other side's ask
+    (candle_sale_bids), so a bid shows only when that ask is usable
+    (usable_candle_ask, the one candle rule). The backtest decides every
+    trim on bids read that way; a live reader asks this of an order book's
+    best bid to keep to what the backtest could have seen. A YES bid of 1c
+    or less fails: its NO ask sits at CANDLE_NO_ASK_CEILING, which is also
+    what an empty YES-bid book reads as.
+
+    Args:
+        bid (Any): The best bid, in dollars (normally a float).
+        side (str): The side bid for, "yes" or "no".
+
+    Returns:
+        bool: True when 1 minus the bid is a usable ask of the other side;
+            False otherwise, and for a bid that is not a number.
+
+    Raises:
+        ValueError: For a side other than "yes" or "no".
+    """
+    if side not in ("yes", "no"):
+        raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+    try:
+        other_ask = 1.0 - float(bid)
+    except (TypeError, ValueError, OverflowError):
+        # Not a number, or a whole number too large for a float: no candle shows it
+        return False
+    ask = usable_candle_ask(other_ask, "no" if side == "yes" else "yes")
+    # A NaN is never equal to itself: usable_candle_ask answers NaN for "not usable"
+    return ask == ask

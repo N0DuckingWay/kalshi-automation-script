@@ -68,6 +68,11 @@ Dependencies:
     market's real bids) and walk_bids (a sale's walk down them, shared with
     the backtest), floor_to_tick and v2_bottom_of_grid_price (sale prices),
     and get_settlements and market_for_labels (paid-out partners).
+    Three read-only helpers about what the account holds have no caller in
+    the package: get_fill_times (when each market last traded, as a
+    FillTimes), held_positions_bid_value (what the held markets would fetch
+    at this run's bids) and held_pair_kind (whether two held markets are a
+    same-title or a time-series pair, and which is market A).
     Depends on the KalshiClient produced by auth.py.
 
 Notes:
@@ -163,6 +168,8 @@ from .config import (
     EXCHANGE_FLAG_FALSE_TOKENS,
     EXCHANGE_FLAG_NULL_TOKENS,
     EXCHANGE_FLAG_TRUE_TOKENS,
+    FILLS_EARLIEST_YEAR,
+    FILLS_PAGE_SIZE,
     INCLUDE_MVE_MARKETS,
     MARKET_PAGE_SIZE,
     MAX_ACTIVE_PRICE_DOLLARS,
@@ -2962,8 +2969,10 @@ def _settled_at(raw: Any) -> datetime | None:
     """
     Read a settlement's settled_time as a UTC datetime, or None when it cannot be read.
 
+    get_fill_times reads a fill's created_time through it too.
+
     Args:
-        raw (Any): The settled_time value as the reply sent it.
+        raw (Any): The settled_time (or created_time) value as the reply sent it.
 
     Returns:
         datetime | None: The time in UTC; None when it has no UTC offset or UTC cannot hold it.
@@ -3109,6 +3118,149 @@ def get_settlements(client: Any, *, unreadable_out: dict | None = None,
     if unreadable_out is not None:
         unreadable_out["unreadable"] = unreadable
     return settlements
+
+
+@dataclass(frozen=True)
+class FillTimes:
+    """
+    When the account last traded each market, as GET /portfolio/fills reports it.
+
+    A fill is one execution of one of the account's orders, whether the bot
+    or a person placed it. Every time here carries its zone (UTC) and falls
+    in FILLS_EARLIEST_YEAR or later, so a reader can take its calendar day
+    on the bot's own clock (config.trade_day) or use the moment itself.
+
+    Attributes:
+        latest (dict[str, datetime]): Market ticker -> the time of the newest
+            fill listed on that market.
+        oldest (datetime | None): The time of the oldest fill in the whole
+            list, on any market; None when the list holds no fill. A market
+            with no entry in `latest` has no fill newer than this time (see
+            get_fill_times for what that rests on).
+    """
+    latest: dict[str, datetime]
+    oldest: datetime | None
+
+
+def get_fill_times(client: Any) -> FillTimes | None:
+    """
+    Read when the account last traded each market (GET /portfolio/fills).
+
+    Walks the whole list of the account's fills and keeps, for each market,
+    the time of its newest fill, plus the time of the oldest fill in the
+    list. Each page is a retried, read-only GET on the SDK's raw-response
+    variant, asked for with a page size and a cursor only: no time filter is
+    sent, so the times are worked out here from each record's own "ticker"
+    and "created_time".
+
+    Fails closed, as get_settlements does: returns None, with one WARNING,
+    when a page cannot be read or has no "fills" list, a cursor repeats, or
+    SCANNER_MAX_PAGES cuts the list short. Unlike get_settlements it leaves
+    no record out: one fill whose ticker or time cannot be read also gives
+    None, since that fill may be the newest on its market and a list missing
+    it would show the market as untraded since an earlier time. A time in a
+    year before FILLS_EARLIEST_YEAR (in UTC) counts as one that cannot be
+    read: it is what a server writes when it has no time to give, and taken
+    as real it would put the list's oldest fill decades back.
+
+    A list with no fill at all is a valid read (empty `latest`, `oldest`
+    None); a caller that needs the list to reach back some way must refuse
+    it itself.
+
+    What `oldest` can tell a caller rests on one assumption: the list holds
+    every fill newer than its oldest one. Kalshi moves the account's oldest
+    fills out of this list into an archive (GET /historical/fills, which
+    this read skips; live_portfolio reads both), oldest first, so the fills
+    left are the newest ones without a gap. On that assumption a market
+    with no fill listed has not traded since `oldest`.
+
+    Args:
+        client (Any): An authenticated KalshiClient from auth.build_client().
+
+    Returns:
+        FillTimes | None: Each traded market's newest fill time and the
+            list's oldest fill time, all in UTC; None (with a WARNING) when
+            the list could not be read whole.
+    """
+    latest: dict[str, datetime] = {}
+    oldest: datetime | None = None
+    newest: datetime | None = None
+    fills = 0
+    cursor: str | None = None
+    # Every cursor requested, so a cycle (A, B, A, B, ...) is caught too
+    seen_cursors: set[str] = set()
+    pages = 0
+    while True:
+        kwargs: dict = {"limit": FILLS_PAGE_SIZE}
+        if cursor:
+            kwargs["cursor"] = cursor
+        try:
+            # Raw, retried read-only GET; a non-2xx reply raises here
+            data = api_call_with_retry(
+                fetch_json_page, client.get_fills_without_preload_content, **kwargs
+            )
+        except Exception as exc:
+            # One line, never the SDK's multi-line text with every header
+            logging.warning("Could not read the account's fills (page %d): %s",
+                            pages + 1, api_error_summary(exc))
+            return None
+        pages += 1
+        rows = data.get("fills") if isinstance(data, dict) else None
+        new_cursor = data.get("cursor") if isinstance(data, dict) else None
+        # A null list is a page with none; any other shape fails closed
+        if (not isinstance(data, dict) or "fills" not in data
+                or not isinstance(rows, (list, type(None)))
+                or not isinstance(new_cursor, (str, type(None)))):
+            logging.warning("Could not read the account's fills: page %d is not "
+                            "a list of fills with a cursor", pages)
+            return None
+        for row in rows or []:
+            raw_ticker = row.get("ticker") if isinstance(row, dict) else None
+            raw_time = row.get("created_time") if isinstance(row, dict) else None
+            # The reader settlement times go through: an ISO time with a UTC
+            # offset, handed back in UTC; anything else is None
+            when = _settled_at(raw_time)
+            # A time before the first year a fill can carry is a server's "no
+            # time" (year 1, or 1970), not a moment the market traded at
+            if (not isinstance(raw_ticker, str) or not raw_ticker or when is None
+                    or when.year < FILLS_EARLIEST_YEAR):
+                # Stop at the first: the answer is already None. Each value
+                # is cut short, so one odd record cannot fill the log
+                logging.warning(
+                    "Could not read the account's fills: a fill on page %d has no readable "
+                    "market ticker or time (ticker %.80r, created_time %.80r), so when each "
+                    "market last traded is not known this run", pages, raw_ticker, raw_time)
+                return None
+            fills += 1
+            if raw_ticker not in latest or when > latest[raw_ticker]:
+                latest[raw_ticker] = when
+            if oldest is None or when < oldest:
+                oldest = when
+            if newest is None or when > newest:
+                newest = when
+        if new_cursor and new_cursor in seen_cursors:
+            logging.warning(
+                "Fills fetch: cursor did not advance (repeated) on page %d — "
+                "stopping; the list may be incomplete, so no fill time is used this run",
+                pages)
+            return None
+        # A list that ends on the last allowed page was not cut short
+        if new_cursor and pages >= SCANNER_MAX_PAGES:
+            logging.warning(
+                "Fills fetch: reached SCANNER_MAX_PAGES (%d) — stopping; the list "
+                "may be incomplete, so no fill time is used this run", SCANNER_MAX_PAGES)
+            return None
+        if not new_cursor:
+            break
+        seen_cursors.add(new_cursor)
+        cursor = new_cursor
+    if oldest is None or newest is None:
+        logging.info("Fills read: 0 on 0 market(s)")
+    else:
+        # The days are UTC dates; a caller counts days on the bot's own clock
+        logging.info("Fills read: %d on %d market(s), %s to %s (UTC)", fills, len(latest),
+                     oldest.date().isoformat(), newest.date().isoformat())
+    return FillTimes(latest=latest, oldest=oldest)
 
 
 @dataclass
@@ -3558,6 +3710,211 @@ def held_pairs(positions: dict, labels_by_ticker: dict, markets_by_ticker: dict,
     if lone:
         logging.info("Held markets to add to whose partner has paid out: %d", lone)
     return pairs
+
+
+def _unit_quote(raw: Any) -> float | None:
+    """
+    Read one quote from the market list as dollars, or None when it is not a usable price.
+
+    Read as _held_leg_worth reads an ask: a dollar string or a plain number
+    (never a JSON true or false), strictly between 0 and 1.
+
+    Args:
+        raw (Any): A market's yes_bid_dollars or yes_ask_dollars, as listed.
+
+    Returns:
+        float | None: The price in dollars; None when it is missing, not a
+            number, or not strictly between 0 and 1.
+    """
+    # A dollar string or a plain number only (Python counts True as the number 1)
+    if not isinstance(raw, (str, int, float)) or isinstance(raw, bool):
+        return None
+    try:
+        price = float(raw)
+    except (ValueError, OverflowError):
+        # Not a number, or an integer too large for a float
+        return None
+    # Strictly inside (0, 1): 0 or 1 is no quote, and NaN fails both tests
+    return price if 0.0 < price < 1.0 else None
+
+
+def held_positions_bid_value(positions: dict, markets_by_ticker: dict) -> float:
+    """
+    Return what the held markets would fetch if sold at this run's bids, in dollars.
+
+    Each held market's contracts times the bid for the side held there, from
+    this run's market list (no request is made): yes_bid_dollars for a YES
+    holding (a count above 0), and 1 minus yes_ask_dollars for a NO holding
+    (a count below 0), since the best bid for NO is 1 minus the YES ask.
+
+    It is a floor, so everything it cannot read counts as $0: a market
+    missing from the list, a count that is None or not a finite number, and
+    a quote that is None, not a number, or not strictly between 0 and 1. It
+    never falls back to what a position cost (as _held_leg_worth does), which
+    could put the total above what the positions would fetch.
+
+    Args:
+        positions (dict): get_held_positions' result, ticker -> HeldPosition.
+        markets_by_ticker (dict): ticker -> market for this run's whole
+            market list, read before held markets are dropped from it.
+
+    Returns:
+        float: The total in dollars, 0.0 or more.
+    """
+    total = 0.0
+    for ticker, position in positions.items():
+        count = position.count
+        # An unreadable count is held, but how many contracts is not known
+        if (not isinstance(count, (int, float)) or isinstance(count, bool)
+                or not math.isfinite(count)):
+            continue
+        market = markets_by_ticker.get(ticker)
+        if market is None:
+            continue
+        if count > 0:
+            # YES held: what a buyer bids for YES
+            bid = _unit_quote(getattr(market, "yes_bid_dollars", None))
+        else:
+            # NO held: the NO bid is 1 minus the YES ask
+            yes_ask = _unit_quote(getattr(market, "yes_ask_dollars", None))
+            bid = None if yes_ask is None else 1.0 - yes_ask
+        if bid is not None:
+            total += abs(count) * bid
+    return total
+
+
+def _stated(market: Any, profile: tuple) -> date | None:
+    """
+    A market's stated deadline, read as find_time_series_pairs reads a ladder rung's.
+
+    Args:
+        market (Any): A market from the market list (.title, .subtitle and
+            optionally ._event_title, each read with a "" default).
+        profile (tuple): The market's (verdict, spans) from _market_deadline_profile.
+
+    Returns:
+        date | None: The last calendar day its deadline includes, or None
+            when its wording names no single day (stated_deadline).
+    """
+    return stated_deadline(profile, getattr(market, "_event_title", "") or "",
+                           getattr(market, "title", "") or "",
+                           getattr(market, "subtitle", "") or "")
+
+
+def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | None:
+    """
+    Read which kind of pair two held markets are, and which is market A.
+
+    The account's positions do not record whether a held pair was bought as
+    a same-title pair or a time-series pair, and the two are priced by
+    different models. This reads the kind back from the two markets by the
+    finders' own tests, given which market is held YES and which NO, and
+    answers only when the sides held are the sides that kind buys
+    (leg_sides): NO on market A and YES on market B for a same-title pair,
+    YES on the earlier deadline (A) and NO on the later (B) for a
+    time-series pair. Anything it cannot show is None, never a guess.
+
+    Both markets must carry an event ticker. With one missing, nothing shows
+    whether the two are separate events or two rungs of one event, which are
+    ordered by different rules (below), so the pair is refused. The
+    time-series finder is wider here: it compares the two event tickers and
+    takes a blank one beside a real one as two events.
+
+    Same-title (find_same_title_pairs' rules): identical title, subtitle and
+    event title, with a title or subtitle to compare; two different event
+    tickers of two different series; closes within the same-title bound
+    (_closes_apart).
+
+    Time-series (find_time_series_pairs' rules): one time-series group key
+    (time_series_group_key), and both markets worded as cumulative deadlines
+    stating two different ones (cumulative_deadline_pair). Then:
+
+    - Two rungs of one event are ordered on their stated deadlines alone
+      (stated_deadline, same_event_ladder): both must read to a calendar day,
+      the two days must differ, and the market held YES must state the
+      earlier one.
+    - Across two events the finder orders the pair on close time, so the
+      market held YES must close strictly before the other. This reader is
+      narrower than the finder there, three ways, because a same-title pair
+      whose wording was respelled on one market would otherwise read as a
+      time-series pair: equal closes are refused; stated days that both read
+      must differ and agree with the close order; and when a stated day
+      cannot be read, the closes must be further apart than the same-title
+      bound.
+
+    It applies no price test and no deadline-gap cap, and it does not read
+    TIME_SERIES_SAME_EVENT_LADDERS: those decide what may be bought, and
+    this reads what is already held.
+
+    Args:
+        yes_market (Any): The market held YES, from the market list.
+        no_market (Any): The market held NO, from the market list.
+
+    Returns:
+        tuple[str, Any, Any] | None: (pair type, market A, market B), the
+            pair type "same_title" or "time_series"; None when the two
+            markets cannot be shown to be a pair of either kind held that
+            way round.
+    """
+    by_side = {"yes": yes_market, "no": no_market}
+    # Both events must be known: with an event ticker missing, nothing shows
+    # whether these are two events or two rungs of one
+    if not all(isinstance(market.event_ticker, str) and market.event_ticker
+               for market in (yes_market, no_market)):
+        return None
+    same_event = yes_market.event_ticker == no_market.event_ticker
+    if _identical_wording(yes_market, no_market):
+        # The same-title finder groups a market only by a title or a subtitle
+        if not ((getattr(yes_market, "title", "") or "")
+                or (getattr(yes_market, "subtitle", "") or "")):
+            return None
+        # Two events, two series, one closing moment. Identical wording
+        # states one deadline, so it is never a time-series pair either
+        if (same_event or _same_series(yes_market, no_market)
+                or _closes_apart(yes_market, no_market)):
+            return None
+        side_a, side_b = leg_sides("same_title")
+        return "same_title", by_side[side_a], by_side[side_b]
+
+    # One question at two cumulative deadlines: the finder's group key first
+    keys = [time_series_group_key(pair_key(market), getattr(market, "subtitle", "") or "")
+            for market in (yes_market, no_market)]
+    if not keys[0] or keys[0] != keys[1]:
+        return None
+    side_a, side_b = leg_sides("time_series")
+    market_a, market_b = by_side[side_a], by_side[side_b]
+    profile_a = _market_deadline_profile(market_a)
+    profile_b = _market_deadline_profile(market_b)
+    if not cumulative_deadline_pair(profile_a, profile_b):
+        return None
+    # (swap, gap) when both stated days read and differ, where swap means B
+    # states the earlier day; SAME_DAY when they are one day; None when either
+    # cannot be read
+    ladder = same_event_ladder(_stated(market_a, profile_a), _stated(market_b, profile_b))
+    if same_event:
+        # One event's rungs are ordered on their stated deadlines alone (DR-73)
+        if ladder is None or ladder is SAME_DAY or ladder[0]:
+            return None
+        return "time_series", market_a, market_b
+    # Across events the finder orders on close time. Stated days that can be
+    # read must not contradict it: one day spelled two ways, or the later
+    # day on the market held YES
+    if ladder is SAME_DAY or (ladder is not None and ladder[0]):
+        return None
+    # No stated days to tell two deadlines apart, and closes within the
+    # same-title bound: this could be a same-title pair whose wording was
+    # respelled on one market
+    if ladder is None and not _closes_apart(market_a, market_b):
+        return None
+    close_a = getattr(market_a, "close_time", None)
+    close_b = getattr(market_b, "close_time", None)
+    # Two comparable close times, A strictly first: equal closes give the
+    # finder no order to read
+    if (not isinstance(close_a, datetime) or not isinstance(close_b, datetime)
+            or (close_a.utcoffset() is None) != (close_b.utcoffset() is None)
+            or not close_a < close_b):
+        return None
+    return "time_series", market_a, market_b
 
 
 def _shard_index(m: dict) -> int:

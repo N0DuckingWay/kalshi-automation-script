@@ -1932,7 +1932,8 @@ def _mk_market(
         "close_time": close_time,
         "yes_ask_dollars": yes_ask,
         "no_ask_dollars": no_ask,
-        "yes_bid_dollars": no_ask,
+        # The YES bid is 1 minus the NO ask, as a real book quotes it
+        "yes_bid_dollars": str(round(1.0 - float(no_ask), 4)),
         "price_level_structure": price_level_structure,
         "exchange_index": exchange_index,
     }
