@@ -53,6 +53,7 @@ Notes:
     skip when neither node nor jsc is present.
 """
 import ast
+import dataclasses
 import errno
 import fcntl
 import hashlib
@@ -3740,6 +3741,143 @@ class TestRunPage:
         body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
         assert self._headline(body) == "No trades to complete"
         assert "<td>not sold</td><td>0 of 30 YES on SELL-A (filled nothing)</td>" in body
+
+    # One Kelly trim, as a run result records it: 13 of the 30 contracts held
+    # on each market of a pair sold, with no sell level
+    _TRIMMED = {"title": "Trimmed pair", "status": "sold", "kind": "kelly_trim", "level": None,
+                "days_left": 9, "cost": 8.15, "proceeds": 12.15, "profit": 4.0,
+                "realized_percent": None, "error": None,
+                "legs": [{"ticker": "TRIM-A", "side": "yes", "held": 30, "sold": 13,
+                          "price": 0.55},
+                         {"ticker": "TRIM-B", "side": "no", "held": 30, "sold": 13,
+                          "price": 0.42}]}
+
+    def test_a_kelly_trim_is_marked_and_shows_what_sold_of_what_was_held(self):
+        # Beside a take-profit sale, whose row is what it always was
+        _disk_run(result=_result(exit_code=0, sales=[self._SOLD, self._TRIMMED],
+                                 trades=[_trade("executed")]))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert ("<td>Trimmed pair (Kelly trim)</td><td>sold</td>"
+                "<td>13 of 30 YES on TRIM-A, 13 of 30 NO on TRIM-B</td><td>$4.00</td>") in body
+        assert ("<td>Pair</td><td>sold</td><td>30 of 30 YES on SELL-A</td>"
+                "<td>$9.26</td>") in body
+        assert body.count("(Kelly trim)") == 1
+        # The note under the table covers both: a trim's profit is on what it sold
+        assert defaults_server._SALE_PROFIT_NOTE in body
+        assert ("A Kelly trim sells a held pair down to its Kelly size: part of it, or all "
+                "of it when Kelly keeps none.") in body
+        assert "for a Kelly trim, less what the contract pairs sold cost" in body
+
+    def test_the_profit_note_is_true_of_a_lone_market_sold_with_its_paid_out_partner(self):
+        # A lone held market's Profit is its proceeds plus its partner's payout, less the
+        # cost of both markets (seller._plan_one, reporter.sale_record): the partner's
+        # contracts were not sold, and no sale returned its payout
+        note = defaults_server._SALE_PROFIT_NOTE
+        assert "less what the contracts sold cost" not in note
+        assert "plus the payout of a partner that has already paid out" in note
+        assert "less what the whole position cost" in note
+        # A trim's profit is still on the part it sold
+        assert "for a Kelly trim, less what the contract pairs sold cost" in note
+        # The row the note sits under: one market sold, the partner's cost in the figure.
+        # 30 YES sold at 0.96 return $28.71 after the fee, the partner paid $0 and both
+        # markets cost $18.80, so the profit is $9.91 (less the sold market's cost alone
+        # it would read $22.41)
+        lone = {"title": "Lone", "status": "sold", "level": 0.8, "days_left": 9, "cost": 18.8,
+                "proceeds": 28.71, "profit": 9.91, "realized_percent": 88.48, "error": None,
+                "legs": [{"ticker": "SELL-A", "side": "yes", "held": 30, "sold": 30,
+                          "price": 0.96}]}
+        _disk_run(result=_result(exit_code=0, sales=[lone], trades=[_trade("executed")]))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert "<td>Lone</td><td>sold</td><td>30 of 30 YES on SELL-A</td><td>$9.91</td>" in body
+        assert note in body
+
+    def test_a_trim_that_sells_a_whole_pair_is_not_said_to_keep_the_rest(self):
+        # The rule sells a pair whole when Kelly keeps none of it (30 of 30)
+        whole = dict(self._TRIMMED, status="simulated",
+                     legs=[dict(leg, sold=30) for leg in self._TRIMMED["legs"]])
+        _disk_run(dry_run=True, result=_result(dry_run=True, exit_code=0, sales=[whole]))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert "30 of 30 YES on TRIM-A, 30 of 30 NO on TRIM-B" in body
+        assert "Part of each of these held pairs would have been sold" not in body
+        assert "keeps the rest" not in body
+        assert ("These held pairs would have been sold down to their Kelly size (a Kelly "
+                "trim):") in body
+
+    def test_a_trim_recorded_by_the_reporter_is_read_as_one(self):
+        # The kind the reporter writes is the kind this page reads
+        reporter = importlib.import_module("kalshi_betting.reporter")
+        record = reporter.SaleRecord(
+            title="Trimmed pair", status="simulated", level=None, days_left=9, cost=8.15,
+            proceeds=12.15, profit=4.0, realized_percent=None, error=None,
+            legs=(reporter.SaleLegRecord("TRIM-A", "yes", 30, 13, 0.55),),
+            kind=config.SALE_KIND_KELLY_TRIM)
+        sale = json.loads(json.dumps(dataclasses.asdict(record)))
+        _disk_run(dry_run=True, result=_result(dry_run=True, exit_code=0, sales=[sale]))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert ("<td>Trimmed pair (Kelly trim)</td><td>simulated</td>"
+                "<td>13 of 30 YES on TRIM-A</td><td>$4.00</td>") in body
+
+    @pytest.mark.parametrize("kind", ["take_profit", None, 5, "KELLY_TRIM", ""])
+    def test_only_a_kelly_trim_is_marked(self, kind):
+        # A result written before the kind was recorded, or one damaged, reads
+        # as a take-profit sale
+        _disk_run(result=_result(exit_code=0, sales=[dict(self._TRIMMED, kind=kind)]))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert "(Kelly trim)" not in body
+        assert "<td>Trimmed pair</td><td>sold</td>" in body
+        assert self._headline(body) == "Positions sold; no trades to complete"
+        no_kind = {key: value for key, value in self._TRIMMED.items() if key != "kind"}
+        _disk_run("00000000000000aa", result=_result(exit_code=0, sales=[no_kind]))
+        assert "(Kelly trim)" not in _get(_app(), "/runs/00000000000000aa").body
+
+    @pytest.mark.parametrize("status", ["sold", "partly_sold"])
+    def test_a_run_that_only_trimmed_says_so(self, status):
+        # Each pair was sold down to its Kelly size (most often part of it, the
+        # rest still held), so the headline does not say positions were sold
+        trim = dict(self._TRIMMED, status=status)
+        _disk_run(result=_result(exit_code=0, sales=[trim], cash_after_sales=112.15,
+                                 balance_before=100.0, portfolio_value_before=150.0))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert self._headline(body) == "Held pairs trimmed; no trades to complete"
+        assert "Portfolio value $150.00 (cash $100.00) — before the sales" in body
+
+    def test_a_run_that_sold_a_position_and_trimmed_a_pair_says_positions_sold(self):
+        _disk_run(result=_result(exit_code=0, sales=[self._TRIMMED, self._SOLD]))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert self._headline(body) == "Positions sold; no trades to complete"
+        # A trim that filled nothing beside a take-profit sale that did: the same
+        _disk_run("00000000000000bb", result=_result(exit_code=0, sales=[
+            dict(self._TRIMMED, status="not_sold", profit=None), self._SOLD]))
+        assert self._headline(_get(_app(), "/runs/00000000000000bb").body) == \
+            "Positions sold; no trades to complete"
+
+    def test_a_dry_run_that_would_only_have_trimmed_says_so(self):
+        trim = dict(self._TRIMMED, status="simulated")
+        _disk_run(dry_run=True, result=_result(dry_run=True, exit_code=0, sales=[trim],
+                                               cash_after_sales=112.15))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert self._headline(body) == "Dry run finished — no orders were sent"
+        assert ("These held pairs would have been sold down to their Kelly size (a Kelly "
+                "trim):") in body
+        assert "These positions would have been sold:" not in body
+        # With a take-profit sale beside it, the positions line stands
+        sold = dict(self._SOLD, status="simulated")
+        _disk_run("00000000000000cc", dry_run=True,
+                  result=_result(dry_run=True, exit_code=0, sales=[trim, sold]))
+        body = html.unescape(_get(_app(), "/runs/00000000000000cc").body)
+        assert "These positions would have been sold:" in body
+        assert "would have been sold down to their Kelly size" not in body
+
+    def test_a_trim_left_for_a_person_needs_attention(self):
+        trim = dict(self._TRIMMED, status="unbalanced", profit=None, error="uneven",
+                    legs=[dict(self._TRIMMED["legs"][0], sold=13),
+                          dict(self._TRIMMED["legs"][1], sold=9)])
+        _disk_run(result=_result(exit_code=0, sales=[trim]))
+        body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
+        assert self._headline(body) == "Trades or sales need your attention"
+        assert ("<td>Trimmed pair (Kelly trim)</td><td>unbalanced</td>"
+                "<td>13 of 30 YES on TRIM-A, 9 of 30 NO on TRIM-B (uneven)</td><td>—</td>"
+                ) in body
 
     def test_every_exit_code_has_a_rule_of_its_own(self):
         codes = {name: getattr(config, name) for name in dir(config)

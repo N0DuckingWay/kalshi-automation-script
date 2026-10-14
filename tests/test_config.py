@@ -2346,6 +2346,66 @@ class TestKellyTrimCount:
         assert trimmed > 200 and bound > 200
 
 
+class TestKellyTrimBids:
+    """config.kelly_trim_bids: the bids of a held side a live Kelly trim may
+    sell into, those within KELLY_TRIM_MAX_BID_DROP of the best bid."""
+
+    def test_the_reach_is_the_backtests_modeled_ladders(self):
+        # The backtest's modeled ladder ends at the last of DEPTH_MODEL_DISTANCES
+        # below the best bid, so it can never sell lower than that
+        assert config.KELLY_TRIM_MAX_BID_DROP == config.DEPTH_MODEL_DISTANCES[-1] == 0.20
+        assert max(config.DEPTH_MODEL_DISTANCES) == config.DEPTH_MODEL_DISTANCES[-1]
+
+    def test_bids_further_below_the_best_bid_are_left_out(self):
+        ladder = [[0.42, 1], [0.22, 2], [0.21, 3]]
+        assert config.kelly_trim_bids(ladder, 0.20) == [[0.42, 1], [0.22, 2]]
+        # A gap: one contract at the best bid, then a stub far below
+        assert config.kelly_trim_bids([[0.42, 1.0], [0.02, 100_000.0]], 0.20) == [[0.42, 1.0]]
+        # Nothing below the reach: the whole ladder
+        assert config.kelly_trim_bids([[0.52, 1], [0.45, 2], [0.32, 2]], 0.20) == [
+            [0.52, 1], [0.45, 2], [0.32, 2]]
+
+    def test_it_hands_back_the_very_levels_in_a_new_list(self):
+        ladder = [[0.42, 1], [0.30, 2], [0.10, 3]]
+        kept = config.kelly_trim_bids(ladder, 0.20)
+        assert kept is not ladder and len(ladder) == 3
+        assert kept[0] is ladder[0] and kept[1] is ladder[1]
+
+    def test_a_bid_exactly_the_reach_below_is_kept_on_every_whole_cent(self):
+        # In floats 0.55 - 0.20 is a hair above 0.35 and 0.42 - 0.20 a hair below
+        # 0.22: the bid exactly 20c under the best one is kept either way, and
+        # the one a cent lower is not
+        assert 0.55 - 0.20 > 0.35 and 0.42 - 0.20 < 0.22
+        for cents in range(22, 100):
+            best, at, under = cents / 100, (cents - 20) / 100, (cents - 21) / 100
+            assert config.kelly_trim_bids([[best, 1], [at, 2], [under, 3]], 0.20) == [
+                [best, 1], [at, 2]], cents
+
+    def test_a_tick_past_the_reach_is_left_out_on_the_finest_grid(self):
+        # The float allowance is far under Kalshi's finest step ($0.0001)
+        assert config.kelly_trim_bids([[0.42, 1], [0.2199, 2]], 0.20) == [[0.42, 1]]
+        assert config.kelly_trim_bids([[0.9999, 1], [0.7999, 2], [0.7998, 3]], 0.20) == [
+            [0.9999, 1], [0.7999, 2]]
+
+    def test_no_reach_keeps_only_the_best_bids_own_price(self):
+        assert config.kelly_trim_bids([[0.42, 1], [0.42, 4], [0.41, 2]], 0) == [
+            [0.42, 1], [0.42, 4]]
+
+    def test_the_best_bid_is_always_kept_and_an_empty_ladder_is_empty(self):
+        assert config.kelly_trim_bids([[0.05, 7]], 0.20) == [[0.05, 7]]
+        assert config.kelly_trim_bids([], 0.20) == []
+        assert config.kelly_trim_bids((), 0.20) == []
+
+    @pytest.mark.parametrize("drop", [None, True, False, "0.2", -0.01, float("nan"),
+                                      float("inf")])
+    def test_a_bad_reach_is_refused(self, drop):
+        with pytest.raises(ValueError, match="KELLY_TRIM_MAX_BID_DROP"):
+            config.kelly_trim_bids([[0.42, 1]], drop)
+        # ... even when there is nothing to cut
+        with pytest.raises(ValueError, match="KELLY_TRIM_MAX_BID_DROP"):
+            config.kelly_trim_bids([], drop)
+
+
 class TestTrimMinPriceRises:
     """config.TRIM_MIN_PRICE_RISES: the minimum price rises the dashboard's
     Min. price rise select offers, every 5c from 5c to 95c."""

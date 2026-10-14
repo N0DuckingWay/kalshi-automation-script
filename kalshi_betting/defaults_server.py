@@ -63,8 +63,10 @@ Dependencies:
     live_defaults_source), live_settings_argv (a run's flags), the seed values
     and their source note, the source-note pattern, the exit codes, the run
     result's format tag and the DEFAULTS_SERVER_*, DASHBOARD_FILENAME,
-    DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_* constants, and count_text
-    (a run page writes an add-on's held count exactly). From run_lock:
+    DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_* constants, count_text
+    (a run page writes an add-on's held count exactly) and
+    SALE_KIND_KELLY_TRIM (a run page marks a sale that is a Kelly trim, which
+    sold a held pair down to its Kelly size). From run_lock:
     held() and holder(), to refuse a real-money run while another live
     trading run holds the machine's lock.
     It reads config.LIVE_DEFAULTS_FILE, config.PROJECT_ROOT,
@@ -200,6 +202,7 @@ from .config import (
     LIVE_DEFAULTS_SOURCE_PATTERN,
     LIVE_RUN_RESULT_FORMAT,
     LIVE_TOGGLE_FIELDS,
+    SALE_KIND_KELLY_TRIM,
     SCHEDULER_JOB_TIMEOUT_SECONDS,
     SCHEDULER_STATE_FILENAME,
     TAG_SCOPE_SEPARATOR,
@@ -401,7 +404,8 @@ _ATTENTION_STATUSES = ("rollback_failed", "manual_review")
 _TRADE_GROUPS = (("Needs attention", _ATTENTION_STATUSES), ("Completed", ("executed",)),
                  ("Would have traded", ("simulated",)))
 
-# Sale (take-profit) statuses that need a person: a pair left uneven, or an unknown outcome
+# Sale statuses (a take-profit sale's or a Kelly trim's) that need a person: a
+# pair left uneven, or an unknown outcome
 _SALE_ATTENTION_STATUSES = ("unbalanced", "manual_review")
 
 # A sale's status in plain words, as the trade log's Status column words it
@@ -410,9 +414,16 @@ _SALE_STATUS_WORDS = {"sold": "sold", "partly_sold": "partly sold", "not_sold": 
                       "simulated": "simulated"}
 
 # What a run page says under its Sales table
-_SALE_PROFIT_NOTE = ("Profit is what selling the whole position realizes at the bids the "
-                     "sale was priced at, after fees; it is shown only for a position that "
-                     "sold in full (or, in a dry run, would have).")
+_SALE_PROFIT_NOTE = ("Profit is what the sale returns at the bids it was priced at, after "
+                     "fees, plus the payout of a partner that has already paid out, less "
+                     "what the whole position cost (for a Kelly trim, less what the contract "
+                     "pairs sold cost); it is shown only when everything the sale set out to "
+                     "sell was sold (or, in a dry run, would have been). A Kelly trim sells "
+                     "a held pair down to its Kelly size: part of it, or all of it when "
+                     "Kelly keeps none.")
+
+# What the Position cell of a Kelly trim's row adds after the pair's title
+_KELLY_TRIM_MARK = " (Kelly trim)"
 
 # The exit code argparse gives a command line it refuses: the run stopped
 # before it logged anything, so it sent nothing
@@ -1573,7 +1584,8 @@ def _sale(value) -> dict | None:
         value: The recorded sale.
 
     Returns:
-        dict | None: title, status ("unknown" if unreadable), error, profit and
+        dict | None: title, status ("unknown" if unreadable), error, profit, kind
+            (None if not recorded, which reads as a take-profit sale) and
             legs (the readable ones, each _sale_leg); None if not an object.
     """
     if not isinstance(value, dict):
@@ -1583,6 +1595,7 @@ def _sale(value) -> dict | None:
             "status": _text(value.get("status")) or "unknown",
             "error": _text(value.get("error")),
             "profit": _finite(value.get("profit")),
+            "kind": _text(value.get("kind")),
             "legs": [leg for leg in (_sale_leg(item) for item in legs) if leg is not None]}
 
 
@@ -2113,9 +2126,27 @@ def _sold_text(leg: dict) -> str:
     return f"{sold} of {held} {side} on {leg['ticker'] or '?'}"
 
 
+def _only_trims(sales: list[dict]) -> bool:
+    """
+    Say whether every one of some sales is a Kelly trim.
+
+    Args:
+        sales (list[dict]): Sales of a run result (_sale).
+
+    Returns:
+        bool: True when there is at least one and each is a Kelly trim, which
+            sells a held pair down to its Kelly size (part of it, or all of it).
+    """
+    return bool(sales) and all(s["kind"] == SALE_KIND_KELLY_TRIM for s in sales)
+
+
 def _sales_html(sales: list[dict], cash_after: float | None, *, dry_run: bool) -> str:
     """
-    Show a run's sales (the take-profit rule) as one short table, with the cash they left.
+    Show a run's sales as one short table, with the cash they left.
+
+    A sale is a take-profit sale of a whole position or a Kelly trim of a
+    held pair (part of it, or all of it); a trim's Position cell says so, and
+    its Sold cell reads what sold of what each market held.
 
     Args:
         sales (list[dict]): The run result's sales (_sale).
@@ -2136,7 +2167,9 @@ def _sales_html(sales: list[dict], cash_after: float | None, *, dry_run: bool) -
             sold += f" ({sale['error']})"
         profit = (_money(sale["profit"]) if sale["status"] in ("sold", "simulated")
                   else "—")
-        cells = (sale["title"] or "—", status, sold, profit)
+        position = (sale["title"] or "—") + (
+            _KELLY_TRIM_MARK if sale["kind"] == SALE_KIND_KELLY_TRIM else "")
+        cells = (position, status, sold, profit)
         body.append("<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in cells) + "</tr>")
     parts = [f"<h2>Sales</h2>\n<table>{head}{''.join(body)}</table>",
              f"<p class=\"note\">{html.escape(_SALE_PROFIT_NOTE)}</p>"]
@@ -2217,12 +2250,18 @@ def _outcome(run: _Run, exit_code: int | None, result: _Result, lines: list[str]
         # 7: nothing to trade
         if not trades:
             sales = record.get("sales", [])
-            if any(s["status"] in ("sold", "partly_sold") for s in sales):
-                return _Outcome("Positions sold; no trades to complete", "ok",
+            done = [s for s in sales if s["status"] in ("sold", "partly_sold")]
+            if done:
+                # Trims alone: each pair was sold down to its Kelly size
+                return _Outcome("Held pairs trimmed; no trades to complete"
+                                if _only_trims(done) else
+                                "Positions sold; no trades to complete", "ok",
                                 message + note)
             if sales and all(s["status"] == "simulated" for s in sales):
                 return _Outcome("Dry run finished — no orders were sent", "",
-                                "<p>These positions would have been sold:</p>"
+                                ("<p>These held pairs would have been sold down to their "
+                                 "Kelly size (a Kelly trim):</p>" if _only_trims(sales) else
+                                 "<p>These positions would have been sold:</p>")
                                 + message + note)
             return _Outcome("No trades to complete", "", message + note)
         # 4, 5, 6 (and 8, the same with exit 40's note)

@@ -40,17 +40,22 @@ Notes:
     a held pair to its Kelly size (held_pair_win_prob, kelly_hold_fraction,
     kelly_trim_count) lives here too, with the test that can hold a trim
     back until the pair's price has risen (pair_price_rise,
-    trim_rise_reached); only the backtest calls them. Beside them is the
-    test that can hold a trim back until enough calendar days have passed
-    since the pair's last trade (kelly_trim_min_days, trade_day,
-    kelly_trim_rested, with KELLY_TRIM_MIN_DAYS_SINCE_TRADE).
-    TRIM_PRICE_THEN_MAX_AGE_DAYS is how far back historical.ask_before is
-    meant to look for the price a held market stood at at a past moment; no
-    module calls that reader or reads the constant.
+    trim_rise_reached). Beside them is the test that can hold a trim back
+    until enough calendar days have passed since the pair's last trade
+    (kelly_trim_min_days, trade_day, kelly_trim_rested, with
+    KELLY_TRIM_MIN_DAYS_SINCE_TRADE). The backtest decides its trims with
+    them, and so does seller.plan_trims, which plans a live account's trims.
+    TRIM_PRICE_THEN_MAX_AGE_DAYS is how far back seller.plan_trims lets
+    historical.ask_before look for the price a held market stood at when
+    its pair last traded. KELLY_TRIM_MAX_BID_DROP is how far below a held
+    side's best bid a live trim may sell, and kelly_trim_bids leaves out
+    the bids below that, so a live trim never sells into a gap in a book.
     LiveSettings also holds a Kelly-trim switch and the least price rise a
     trim needs (trim_to_kelly, trim_min_rise): they are validated, saved,
-    shown and spelled as flags like every other toggle, and no live module
-    acts on them.
+    shown and spelled as flags like every other toggle. seller.plan_trims
+    reads them, and no run calls it, so no run acts on them.
+    SALE_KIND_TAKE_PROFIT and SALE_KIND_KELLY_TRIM name the two reasons a
+    plan sells held contracts.
 """
 import fcntl
 import json
@@ -559,11 +564,28 @@ KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX = 30
 # price was at a past moment (the time its pair last traded). The price is the
 # asking price of the side held on the market's latest hourly candle with a
 # usable ask that ended at or before that moment (historical.ask_before, which
-# is meant to be handed this many days, in seconds, as its window; no module
-# calls it or reads this constant). A quiet market has hours with no candle,
-# so the reader may look back this far; with no usable quote in that time the
-# price then is unknown.
+# seller.plan_trims hands this many days, in seconds, as its window, when a
+# minimum price rise is set). A quiet market has hours with no candle, so the
+# reader may look back this far; with no usable quote in that time the price
+# then is unknown, and the pair is not trimmed.
 TRIM_PRICE_THEN_MAX_AGE_DAYS = 7
+
+# How far below a held side's best bid a live Kelly trim may sell, in dollars.
+# seller.plan_trims sizes and prices a trim only on the bids within this
+# distance of the side's best bid (kelly_trim_bids). A bid further below is
+# left out, so a trim sells what the bids within reach hold and never sells
+# into a gap in the book: with one contract bid at 42c above a stub bid at
+# 2c, only that one contract is sold. The reach is what bounds the price,
+# because under a binding size cap the rule (kelly_trim_count) still wants a
+# sale at a very poor price. It is the reach of the backtest's modeled bid
+# ladder (the last of DEPTH_MODEL_DISTANCES; tests/test_config.py pins the two
+# equal), so a live trim is planned no further under its best bid than a
+# backtest trim can sell. (A pair's second sale order may still fill
+# SALE_HEDGE_SLIPPAGE_TICKS below the lowest bid its walk reached, as in every
+# live sale.) seller.py binds this by value and reads its own binding when it
+# cuts a ladder, so a test patches seller's, never config's. A finite number
+# at least 0 (0: only the bids at the best bid's own price).
+KELLY_TRIM_MAX_BID_DROP = 0.20
 
 # ── Live trading toggles ──────────────────────────────────────────────────────
 #
@@ -657,9 +679,9 @@ SELL_AT_STEP = 0.01
 # once the pair has outgrown its Kelly size. A live run reads the saved live
 # defaults' trim_to_kelly instead (a saved file that leaves the key out reads
 # it as off), which main.py --trim-to-kelly / --no-trim-to-kelly overrides for
-# one run. The setting is validated, saved and shown, and no live module acts
-# on it: a run with it on trades as one with it off. The backtest never reads
-# this constant.
+# one run. The setting is validated, saved and shown. seller.plan_trims plans
+# the trims it asks for, and no run calls that function: a run with it on
+# trades as one with it off. The backtest never reads this constant.
 TRIM_TO_KELLY = False
 
 # The least rise in a held pair's total price since the last trade on it
@@ -669,6 +691,16 @@ TRIM_TO_KELLY = False
 # trim_min_rise instead (main.py --trim-min-rise CENTS / --no-trim-min-rise
 # for one run).
 TRIM_MIN_RISE: float | None = None
+
+# Why a plan sells held contracts (seller.SalePlan.kind). A take-profit sale
+# sells a whole position that has reached its sell level (seller.plan_sales).
+# A Kelly trim sells part of an exact held pair that has outgrown its Kelly
+# size (seller.plan_trims). trader.py sends both with the same orders;
+# reporter.py and the defaults server's run page read the kind to word a
+# sale's row, and a run result written before the kind was recorded reads as
+# a take-profit sale.
+SALE_KIND_TAKE_PROFIT = "take_profit"
+SALE_KIND_KELLY_TRIM = "kelly_trim"
 
 # The most settled markets live selling (seller.plan_sales) looks up on the
 # exchange in one run (one or two read-only requests each) to find a held
@@ -2919,7 +2951,8 @@ class LiveSettings:
         trim_to_kelly (bool): The Kelly-trim switch: on asks for part of an
             exact held pair to be sold once it has outgrown its Kelly size; a
             real bool. Default False, which is also what a saved file that
-            leaves it out reads as. No live module acts on it.
+            leaves it out reads as. seller.plan_trims plans the trims; no
+            run calls it.
         trim_min_rise (float | None): The least rise in a held pair's total
             price since the last trade on it that a trim asks for, in dollars
             on the 5c grid from 5c to $1 (0.1 for 10c); None (default) is no
@@ -3787,11 +3820,15 @@ def days_to_maturity(close_dates, day: date) -> int | None:
 # never sells and buys the same pair over the same prices.
 #
 # The first three functions below are the sizing rule. The backtest decides
-# with them (backtester._kelly_trim); they live here, not in strategy.py, so
-# seller.py may import them too. The two after them, pair_price_rise and
-# trim_rise_reached, are a test a run may ask first: has the pair's price
-# risen far enough since the last trade on it for a trim to be considered at
-# all? They take plain prices, so a live seller can call them with its own.
+# with them (backtester._kelly_trim), and so does the plan of a live
+# account's trims (seller._trim_one); they live here, not in strategy.py, so
+# seller.py may import them. kelly_trim_bids, after them, is the live plan's
+# alone: it leaves out the bids too far below a held side's best bid before
+# the rule walks them (the backtest's modeled ladder already ends there). The
+# two after it, pair_price_rise and trim_rise_reached, are a test a run may
+# ask first: has the pair's price risen far enough since the last trade on it
+# for a trim to be considered at all? They take plain prices, so the live
+# seller calls them with its own.
 # The last three, kelly_trim_min_days, trade_day and kelly_trim_rested, are a
 # second such test: have enough calendar days passed since the last trade on
 # the pair (KELLY_TRIM_MIN_DAYS_SINCE_TRADE)? kelly_trim_rested takes two
@@ -3998,6 +4035,44 @@ def kelly_trim_count(count: int, portfolio_value: float, win_prob: float, cap: f
         if still_wanted(pairs):
             return KellyTrim(pairs, max(levels))
     return KellyTrim(low, max(levels))
+
+
+def kelly_trim_bids(ladder, max_drop: float) -> list:
+    """
+    Return the bids of a held side that a live Kelly trim may sell into.
+
+    A trim sells down a side's resting bids, best first. Under a binding size
+    cap the rule (kelly_trim_count) still wants a sale at a very poor price,
+    so on a book with a gap (one contract bid at 42c, then nothing until a
+    stub bid at 2c) it would sell into the stub. This keeps only the bids
+    priced within max_drop of the best bid; the rule then sells what those
+    hold, and no more. The best bid itself is always kept. The comparison
+    allows PRICE_EPSILON of float noise, so a bid exactly max_drop below the
+    best one (0.22 under 0.42 at 0.20) is kept.
+
+    Args:
+        ladder: One side's bids, [[price in dollars, quantity], ...], best
+            (highest) price first, as scanner.bid_ladder returns them.
+        max_drop (float): How far below the best bid a kept bid may be priced,
+            in dollars (KELLY_TRIM_MAX_BID_DROP as the calling module holds
+            it); 0 keeps only the bids at the best bid's own price.
+
+    Returns:
+        list: The kept levels, in the ladder's order (the very level objects
+            handed in, in a new list); empty for an empty ladder.
+
+    Raises:
+        ValueError: When max_drop is not a finite number at least 0 (a bool
+            is refused too).
+    """
+    if (isinstance(max_drop, bool) or not isinstance(max_drop, numbers.Real)
+            or not math.isfinite(max_drop) or max_drop < 0):
+        raise ValueError("KELLY_TRIM_MAX_BID_DROP must be a finite number at least 0, "
+                         f"got {max_drop!r}")
+    if len(ladder) == 0:
+        return []
+    lowest = ladder[0][0] - max_drop - PRICE_EPSILON
+    return [level for level in ladder if level[0] >= lowest]
 
 
 def pair_price_rise(price_then: float, price_now: float) -> float:

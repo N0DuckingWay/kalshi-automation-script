@@ -585,6 +585,23 @@ def _sale(held: tuple[str, ...], partner: str | None = None, *, status: str = "s
                                else "the account read back less than was sent")
 
 
+def _trim(held: tuple[str, str], *, sell: int = 13, of: int = 30, status: str = "sold",
+          sold: dict | None = None) -> reporter.SaleResult:
+    """
+    A Kelly trim of a held pair as trader.sell_positions hands reporter one.
+
+    The account holds `of` contracts on each of the two markets (YES on the
+    first, NO on the second) and the trim sells `sell` of each: its legs count
+    the contracts sold and carry the contracts held apart, and its plan has
+    no sell level.
+    """
+    sale = _sale(held, status=status, count=sell, sold=sold)
+    legs = tuple(dataclasses.replace(leg, held=of) for leg in sale.plan.legs)
+    plan = dataclasses.replace(sale.plan, legs=legs, level=None, profits=((2.20, 3.90),),
+                               kind=config.SALE_KIND_KELLY_TRIM)
+    return dataclasses.replace(sale, plan=plan)
+
+
 class TestReadTradeLogs:
     def test_runs_trades_and_windows(self, log_paths, pacific, monkeypatch):
         run1, dry, run2 = T0, T0 + timedelta(hours=1), T0 + timedelta(hours=2)
@@ -669,6 +686,42 @@ class TestReadTradeLogs:
         _, [start], warnings = live_portfolio.read_trade_logs([log_paths])
         assert warnings == []
         assert start.sold_markets == frozenset({"UA", "LA"})
+
+    def test_a_kelly_trim_row_is_read_as_a_sale_row(self, log_paths, pacific, monkeypatch):
+        # Run 1 buys the pair A1/B1. Run 2 trims it (13 of the 30 held on each
+        # market), trims a second pair only in part, writes both, then buys
+        run1 = T0
+        trimmed, bought = T0 + timedelta(hours=2), T0 + timedelta(hours=2, minutes=1)
+        _write_run(monkeypatch, run1, [_trade_result("A1", "B1", "executed")], 132.45)
+        _write_run(monkeypatch, trimmed, [], 120.00, cash_after=131.30, sales=[
+            _trim(("A1", "B1")),
+            _trim(("PA", "PB"), status="partly_sold", sold={"PA": 10, "PB": 10})])
+        _write_run(monkeypatch, bought, [_trade_result("A2", "B2", "executed")], 131.30)
+        # The trim rows as reporter writes them: the sale row's Notes start, then
+        # how many of the pairs held the trim sells
+        book = openpyxl.load_workbook(log_paths)
+        rows = list(book.active.iter_rows(values_only=True))
+        book.close()
+        trims = [r for r in rows if isinstance(r[17], str)
+                 and r[17].startswith(live_portfolio._SALE_NOTE)]
+        assert [(r[3], r[5], r[11], r[12], r[16]) for r in trims] == [
+            ("A1", "B1", 13, 13, "sold"), ("PA", "PB", 10, 10, "partly sold")]
+        assert all(r[17].startswith("[sale: YES A / NO B, Kelly trim: 13 of 30 contract pairs, ")
+                   for r in trims)
+        trades, starts, warnings = live_portfolio.read_trade_logs([log_paths])
+        # A trim row is neither a purchase nor a status this page does not know
+        assert warnings == []
+        assert [(t.trade_id, t.status) for t in trades] == [
+            ("trade_log.xlsx#3", "executed"), ("trade_log.xlsx#8", "executed")]
+        # The purchase the pair was bought with keeps its own 13 contracts a side
+        assert trades[0].legs == (BotLeg("A1", "yes", D(13)), BotLeg("B1", "no", D(13)))
+        window = timedelta(seconds=config.LIVE_BOT_RUN_WINDOW_SECONDS)
+        # The trims' RunStart names the markets their orders may have filled on,
+        # and run 2's purchases are looked for after the trims were logged
+        assert starts == [
+            RunStart(run1 - window, run1, D("132.45")),
+            RunStart(run1, trimmed, D("120.00"), frozenset({"A1", "B1", "PA", "PB"})),
+            RunStart(trimmed, bought, D("131.30"))]
 
     def test_an_old_header_workbook_is_read(self, log_paths, pacific, monkeypatch):
         _write_run(monkeypatch, T0, [_trade_result("A1", "B1", "executed")], 50.0)

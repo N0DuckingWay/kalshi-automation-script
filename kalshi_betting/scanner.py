@@ -68,8 +68,8 @@ Dependencies:
     market's real bids) and walk_bids (a sale's walk down them, shared with
     the backtest), floor_to_tick and v2_bottom_of_grid_price (sale prices),
     and get_settlements and market_for_labels (paid-out partners).
-    Three read-only helpers about what the account holds have no caller in
-    the package: get_fill_times (when each market last traded, as a
+    Three read-only helpers about what the account holds serve
+    seller.plan_trims: get_fill_times (when each market last traded, as a
     FillTimes), held_positions_bid_value (what the held markets would fetch
     at this run's bids) and held_pair_kind (whether two held markets are a
     same-title or a time-series pair, and which is market A).

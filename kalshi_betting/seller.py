@@ -16,14 +16,28 @@ Purpose:
     config.TAKE_PROFIT_HOLD_DAYS daily checks, the last one now. The rule in
     full, and where it differs from the backtest: CLAUDE.md (live selling).
 
+    It also plans Kelly trims (plan_trims): selling part of an exact held pair
+    that is worth more than its Kelly share of the portfolio value, by the
+    rule the backtest trims with (config.kelly_trim_count). A pair is looked
+    at only when enough calendar days have passed since the last fill on
+    either of its markets (config.kelly_trim_rested), and, when
+    LiveSettings.trim_min_rise is set, once its price has risen that far
+    since that fill (config.trim_rise_reached). A trim sells only into the
+    bids within config.KELLY_TRIM_MAX_BID_DROP of each held side's best bid
+    (config.kelly_trim_bids), so it never sells into a gap in a book. A
+    trim's plan is a SalePlan whose legs name the contracts to sell and,
+    apart, the contracts held.
+
 Dependencies:
     Imports the standard library, config, scanner and historical only, never
     trader, strategy, the backtester or main (pinned by tests/test_seller.py).
     main.py alone imports it, and calls plan_sales before it buys anything.
+    No run calls plan_trims.
 
 Notes:
     Every request is a read-only GET, made at most once per run. It fails
-    closed: anything unknown or unreadable means no sale, with a log line.
+    closed: anything unknown or unreadable means no sale and no trim, with a
+    log line.
 """
 import logging
 import math
@@ -36,28 +50,50 @@ from typing import Any
 from .config import (
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     CONTRACT_PAYOUT_DOLLARS,
+    KELLY_TRIM_MAX_BID_DROP,
+    KELLY_TRIM_MIN_DAYS_SINCE_TRADE,
     MIN_ACTIVE_PRICE_DOLLARS,
+    SALE_KIND_KELLY_TRIM,
+    SALE_KIND_TAKE_PROFIT,
     SALE_PARTNER_MAX_AGE_DAYS,
     SALE_PARTNER_MAX_LOOKUPS,
+    SCHEDULED_RUN,
     TAKE_PROFIT_HOLD_DAYS,
     TAKE_PROFIT_HOLD_DAYS_MAX,
+    TRIM_PRICE_THEN_MAX_AGE_DAYS,
     LiveSettings,
     count_text,
     days_to_maturity,
     fee_leg_exact,
+    fee_per_pair_approx,
+    held_pair_win_prob,
+    kelly_hold_fraction,
+    kelly_trim_bids,
+    kelly_trim_count,
+    kelly_trim_min_days,
+    kelly_trim_rested,
+    pair_price_rise,
+    pair_size_cap,
     reached_every_check,
     take_profit_reached,
+    trade_day,
+    trim_rise_reached,
 )
-from .historical import bid_before, recent_candles
+from .historical import ask_before, bid_before, candle_reads_bid, recent_candles
 from .scanner import (
+    FillTimes,
     HeldPair,
     HeldPosition,
     Settlement,
     _fetch_orderbook,
     bid_ladder,
     display_title,
+    get_fill_times,
     get_settlements,
+    held_pair_kind,
     held_pairs,
+    held_positions_bid_value,
+    leg_sides,
     market_for_labels,
     market_ladder_keys,
     walk_bids,
@@ -82,11 +118,16 @@ class SaleLeg:
         ticker (str): The market's ticker.
         event_ticker (str): Its event's ticker.
         side (str): "yes" or "no": the side held (for a partner, before it paid out).
-        count (int): Contracts held: the position's contract pairs.
+        count (int): Contracts held: the position's contract pairs. For a Kelly trim,
+            the contracts the plan sells there, which can be fewer than are held
+            (see held).
         cost_dollars (float): What they cost, fees included.
         market (Any): The ApiMarket from this run's market list while held; None for a partner.
         payout_dollars (float | None): What a partner paid when it settled; None while held.
         paid_at (datetime | None): When a partner settled (UTC); None while held.
+        held (int | None): Contracts held there when the plan was made, for a plan
+            that may sell only part of them (a Kelly trim); None when `count` is
+            everything held.
     """
     ticker: str
     event_ticker: str
@@ -96,24 +137,36 @@ class SaleLeg:
     market: Any = None
     payout_dollars: float | None = None
     paid_at: datetime | None = None
+    held: int | None = None
 
 
 @dataclass(frozen=True)
 class SalePlan:
     """
-    A position the take-profit rule sells this run, with what its sale orders need.
+    Held contracts a run sells, with what the sale orders need.
+
+    Two kinds. A take-profit sale (plan_sales) sells a whole position that has
+    reached its sell level. A Kelly trim (plan_trims) sells part of an exact
+    held pair: its count and money figures are those of the part sold, and
+    each leg's `held` says how many contracts the account holds.
 
     Attributes:
         title (str): The first held market's display title.
         legs (tuple[SaleLeg, ...]): Its held markets in ticker order, then its partner if any.
-        count (int): Its contract pairs (the contracts held on each market).
-        cost_dollars (float): What the whole position cost, fees included.
-        ladders (dict): Held ticker -> bids for the side held, best first ([[price, qty], ...]).
+        count (int): Its contract pairs (the contracts held on each market); for a
+            Kelly trim, the contract pairs sold.
+        cost_dollars (float): What the whole position cost, fees included; for a Kelly
+            trim, what the contract pairs sold cost.
+        ladders (dict): Held ticker -> bids for the side held, best first ([[price, qty], ...]);
+            for a Kelly trim, only the bids within reach of the best one (config.kelly_trim_bids).
         walked (dict): Held ticker -> (average, lowest price reached) selling the count down them.
-        proceeds_dollars (float): What selling the held markets now returns after fees.
-        profits (tuple): (realized, potential profit) at each check, now first.
+        proceeds_dollars (float): What selling the count on the held markets now returns after fees.
+        profits (tuple): (realized, potential profit) at each check, now first; a Kelly
+            trim has one check, now.
         days_left (int | None): Days from today (UTC) until its last held market closes, if known.
-        level (float): The share of potential profit it sold at (LiveSettings.sell_at).
+        level (float | None): The share of potential profit a take-profit sale sold at
+            (LiveSettings.sell_at); None for a Kelly trim, which has no level.
+        kind (str): config.SALE_KIND_TAKE_PROFIT or config.SALE_KIND_KELLY_TRIM.
     """
     title: str
     legs: tuple[SaleLeg, ...]
@@ -124,7 +177,8 @@ class SalePlan:
     proceeds_dollars: float
     profits: tuple
     days_left: int | None
-    level: float
+    level: float | None
+    kind: str = SALE_KIND_TAKE_PROFIT
 
 
 def _hold_days() -> int:
@@ -146,6 +200,59 @@ def _hold_days() -> int:
         raise ValueError(f"TAKE_PROFIT_HOLD_DAYS must be a whole number from 1 to "
                          f"{TAKE_PROFIT_HOLD_DAYS_MAX}, got {days!r}")
     return int(days)
+
+
+def _trim_min_days() -> int:
+    """
+    Check how many days a held pair must go without a trade before a Kelly trim.
+
+    Reads seller.KELLY_TRIM_MIN_DAYS_SINCE_TRADE when called (a test patches it
+    there, never config's), as backtester._resolve_trim_min_days reads the
+    backtest's own.
+
+    Returns:
+        int: A whole number from 0 (no wait) to config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX.
+
+    Raises:
+        ValueError: For any other value, a bool or a float included.
+    """
+    # Cross-module: config's one check of the number, which the rule repeats on what it is handed
+    return kelly_trim_min_days(KELLY_TRIM_MIN_DAYS_SINCE_TRADE)
+
+
+def _day(moment: datetime) -> date:
+    """
+    The calendar day a moment falls on, on the bot's own clock.
+
+    The bot's own clock is the time zone of its schedule. It reads
+    seller.SCHEDULED_RUN when called (a test patches it there, never config's).
+    Every day the wait before a Kelly trim counts between is read here: the
+    run's own moment and each fill's.
+
+    Args:
+        moment (datetime): A time that carries its zone.
+
+    Returns:
+        date: The day, as a plain datetime.date.
+
+    Raises:
+        TypeError: When the moment carries no zone (config.trade_day).
+    """
+    # Cross-module: config's one reading of a time as a day on the schedule's zone
+    return trade_day(moment, SCHEDULED_RUN)
+
+
+def _other(side: str) -> str:
+    """
+    The other side of a market's book.
+
+    Args:
+        side (str): "yes" or "no".
+
+    Returns:
+        str: "no" for "yes", "yes" for "no".
+    """
+    return _OTHER_SIDE[side]
 
 
 def _utc_date(close_time: Any) -> date | None:
@@ -251,7 +358,8 @@ class _Reads:
         held_positions (dict): Ticker -> HeldPosition for every held market.
         markets_by_ticker (dict): This run's whole market list by ticker.
         now_ts (float): The run's moment, in Unix seconds.
-        hold_days (int): How many daily checks there are.
+        hold_days (int): How many daily checks there are (0 for the Kelly trims'
+            reads, which make no daily check).
         lookups (int): Label lookups from the exchange so far (SALE_PARTNER_MAX_LOOKUPS at most).
     """
 
@@ -265,6 +373,7 @@ class _Reads:
         self.hold_days = hold_days
         self.lookups = 0
         self._candles: dict = {}
+        self._then_candles: dict = {}
         self._settlements: list | None = None
         self._settlements_read = False
         self._settlements_problem = ""
@@ -289,6 +398,41 @@ class _Reads:
             self._candles[ticker] = recent_candles(self.client, ticker, event_ticker,
                                                    start, end)
         return self._candles[ticker]
+
+    def ask_then(self, market: Any, side: str, moment: int) -> float:
+        """
+        What one contract of a side of a market cost at a past moment, from its hourly candles.
+
+        The Kelly trim's minimum price rise compares a pair's price now with
+        its price when it last traded. This reads one market's share of the
+        price then: its candles over the config.TRIM_PRICE_THEN_MAX_AGE_DAYS
+        before the moment, fetched once, and the latest usable ask of the side
+        on a candle that ended at or before it.
+
+        Args:
+            market (Any): The held market (its ticker, and its event ticker,
+                whose series names the candle path).
+            side (str): The side held there, "yes" or "no".
+            moment (int): The past moment, in Unix seconds.
+
+        Returns:
+            float: The ask, in dollars; NaN when the candles could not be read
+                or hold no usable ask of that side in those days.
+        """
+        window = TRIM_PRICE_THEN_MAX_AGE_DAYS * _DAY_SECONDS
+        key = (market.ticker, moment)
+        if key not in self._then_candles:
+            # Cross-module: hourly candles read fresh, never from the backtest's candle
+            # cache; one candle period more, so none the window reaches is cut off
+            self._then_candles[key] = recent_candles(
+                self.client, market.ticker, market.event_ticker,
+                moment - window - _CANDLE_PERIOD_SECONDS, moment)
+        candles = self._then_candles[key]
+        if candles is None:
+            return float("nan")
+        # Cross-module: the side's latest usable ask at or before the moment, as the
+        # backtest reads a held leg's price at a checkpoint
+        return ask_before(candles, moment, side, window=window)
 
     def settlements(self) -> tuple[list | None, str]:
         """
@@ -661,3 +805,492 @@ def _log_summary(sold: int, considered: int, never: Counter) -> None:
                      sold, considered, sum(never.values()), reasons)
     else:
         logging.info("Positions to sell this run: %d of %d", sold, considered)
+
+
+# ─── Trimming a held pair to its Kelly size ───────────────────────────────────
+
+# A pair's kind as a log line names it
+_KIND_WORDS = {"time_series": "time-series", "same_title": "same-title"}
+
+
+def _cents_text(dollars: float) -> str:
+    """
+    Write a change in a price in cents with its sign, for a log line.
+
+    Whole cents are written as such. A change that is not whole cents is
+    written to the hundredth of a cent, the finest step a Kalshi price moves
+    in, so a rise just short of a minimum never reads as the minimum.
+
+    Args:
+        dollars (float): The change, in dollars.
+
+    Returns:
+        str: e.g. "+13c" for a rise of $0.13, "-5c" for a fall of $0.05,
+            "+9.6c" for a rise of $0.096; a change of under a hundredth of a
+            cent is "+0c", never "-0c".
+    """
+    cents = f"{abs(dollars) * 100:.2f}".rstrip("0").rstrip(".")
+    sign = "-" if dollars < 0 and cents != "0" else "+"
+    return f"{sign}{cents}c"
+
+
+def _price_text(dollars: float) -> str:
+    """
+    Write a price for a log line: in cents, or finer when it is not whole cents.
+
+    Args:
+        dollars (float): The price, in dollars.
+
+    Returns:
+        str: e.g. "$0.97", or "$0.874" for a price on a tenth-of-a-cent grid;
+            never finer than a hundredth of a cent, Kalshi's finest step.
+    """
+    whole, _, part = f"{dollars:.4f}".partition(".")
+    return f"${whole}.{part.rstrip('0').ljust(2, '0')}"
+
+
+def _log_trim_summary(trimmed: int, considered: int) -> None:
+    """
+    Log how many held pairs the run trims.
+
+    Args:
+        trimmed (int): Pairs part of which is sold.
+        considered (int): Exact held pairs not picked for a take-profit sale.
+    """
+    logging.info("Pairs to trim this run: %d of %d", trimmed, considered)
+
+
+def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
+              settings: LiveSettings, min_days: int, now_date: date, utc_date: date,
+              value: float, positions_value: float) -> tuple[SalePlan | None, str | None]:
+    """
+    Judge one exact held pair for a Kelly trim, logging its verdict, and plan the part sale.
+
+    The pair is sold down when it is worth more than its Kelly share of the
+    portfolio value, each contract pair counted at what selling it returns
+    now (config.kelly_trim_count, the rule the backtest trims with; this
+    function gathers what the rule reads, as backtester._kelly_trim does).
+    It stops at its first failed step, with one "Not trimming" line:
+
+      1. A whole count, and both markets in this run's market list.
+      2. The wait: enough calendar days since the last fill on either market
+         (config.kelly_trim_rested). A pair with no fill listed last traded
+         no later than the list's oldest fill.
+      3. Its kind (same-title or time-series) and which market is A, read
+         from the two markets (scanner.held_pair_kind).
+      4. Both order books: a best bid on both sides of both, each one an
+         hourly candle could show (historical.candle_reads_bid), so the pair
+         is judged only on quotes the backtest could have judged it on. Then
+         what one contract pair sells for at the best bids after the fee: a
+         pair that alone would fetch more than all open positions are valued
+         at stops every trim of the run (see Returns).
+      5. With a minimum price rise set: the pair's total price (the ask of
+         the side held on each market, added) now, against the same at its
+         last fill (config.pair_price_rise, config.trim_rise_reached).
+      6. The chance it pays (config.held_pair_win_prob).
+
+    The rule then sizes the sale on the bids of each held side that lie
+    within KELLY_TRIM_MAX_BID_DROP of its best bid (config.kelly_trim_bids,
+    at seller's own binding of the distance, which a test patches here). A
+    bid further below is left out of the walk and of the plan's ladders, so
+    the pair sells what the bids within reach hold and never sells into a
+    gap under the best bid. The backtest's modeled ladder ends at that same
+    distance.
+
+    Args:
+        pair (HeldPair): An exact held pair (held_pairs), never a lone market.
+        reads (_Reads): This run's reads.
+        fills (FillTimes | None): When each market last traded; None only when
+            neither wait needs it (no wait in days and no minimum price rise).
+        settings (LiveSettings): Keyword-only. The run's settings: k, both size
+            caps and the minimum price rise.
+        min_days (int): Keyword-only. Days a pair must go without a trade (_trim_min_days).
+        now_date (date): Keyword-only. Today on the bot's own clock (_day).
+        utc_date (date): Keyword-only. Today in UTC, for the days left before maturity.
+        value (float): Keyword-only. The value the trim is sized on, in dollars: cash
+            plus open positions.
+        positions_value (float): Keyword-only. The open positions' share of that value.
+
+    Returns:
+        tuple[SalePlan | None, str | None]: (the plan, None) when part of the
+            pair is sold; (None, None) when it is kept; (None, why) when the
+            pair alone would fetch more at its best bids than all open
+            positions are valued at, so that value cannot be right
+            (plan_trims then trims nothing this run). That is told as soon
+            as the four best bids are read, whatever the pair's own price
+            rise or chance of paying.
+
+    Raises:
+        ValueError: When KELLY_TRIM_MAX_BID_DROP is not a finite number at
+            least 0 (config.kelly_trim_bids).
+    """
+    text = _sides_text(pair.sides)
+
+    def not_trimming(reason: str) -> None:
+        """Log why this pair is not trimmed."""
+        logging.info("Not trimming %s: %s", text, reason)
+
+    count_value = pair.count
+    if not float(count_value).is_integer():
+        # config.count_text: a contract count written exactly
+        not_trimming(f"its count {count_text(count_value)} is not a whole number of contracts")
+        return None, None
+    count = int(count_value)
+    missing = [ticker for ticker, _side in pair.sides if ticker not in reads.markets_by_ticker]
+    if missing:
+        not_trimming(f"{missing[0]} is not in this run's market list")
+        return None, None
+    markets = {ticker: reads.markets_by_ticker[ticker] for ticker, _side in pair.sides}
+
+    # When the pair last traded: the latest fill on either market (None: none is
+    # listed). Both waits count from it: the days since a trade, and the price rise
+    listed = ([fills.latest[ticker] for ticker, _side in pair.sides if ticker in fills.latest]
+              if fills is not None else [])
+    last_fill = max(listed) if listed else None
+    if min_days == 0:
+        waited = "no wait"
+    else:
+        # No fill listed: its last trade is no later than the list's oldest fill
+        since = last_fill if listed else (fills.oldest if fills is not None else None)
+        if since is None:
+            not_trimming("when it last traded is not known")
+            return None, None
+        last = _day(since)
+        days = (now_date - last).days
+        # Cross-module: config's one test of the wait, on two days of the bot's own clock
+        if not kelly_trim_rested(last, now_date, min_days):
+            ago = (f"{days} day(s) ago" if days >= 0
+                   else f"after today ({now_date}) on the bot's own clock")
+            not_trimming(f"it last traded {last}, {ago}, and a trim waits until {min_days} "
+                         "day(s) have passed since a pair's last trade")
+            return None, None
+        waited = (f"last traded {last}, {days} day(s) ago" if listed
+                  else f"no fill listed (the fills list starts {last})")
+
+    by_side = {side: markets[ticker] for ticker, side in pair.sides}
+    # Cross-module: the pair's kind and which market is A, by the finders' own tests
+    kind = held_pair_kind(by_side["yes"], by_side["no"])
+    if kind is None:
+        not_trimming("its two markets cannot be shown to be a same-title or a time-series "
+                     "pair held this way round, so its chance of paying cannot be read")
+        return None, None
+    pair_type, market_a, market_b = kind
+    # Cross-module: which side each market's leg holds, the one definition
+    side_a, side_b = leg_sides(pair_type)
+
+    # Both sides' bids on both books, best first: the sides held price a sale, and
+    # with the other two they give each market's YES ask and NO ask
+    bids: dict = {}
+    for market in (market_a, market_b):
+        # Cross-module: the market's order book, a retried read-only GET
+        book = _fetch_orderbook(reads.client, market.ticker)
+        if book is None:
+            not_trimming(f"the order book of {market.ticker} could not be read")
+            return None, None
+        for side in ("yes", "no"):
+            # Cross-module: the side's usable bids, best first
+            ladder = bid_ladder(book, side, ticker=market.ticker)
+            if not ladder:
+                not_trimming(f"{market.ticker} has no {side.upper()} bid")
+                return None, None
+            # Cross-module: whether an hourly candle could show this best bid
+            if not candle_reads_bid(ladder[0][0], side):
+                not_trimming(f"the best {side.upper()} bid on {market.ticker} "
+                             f"(${ladder[0][0]:.4f}) is one the hourly price history cannot "
+                             "show (a YES bid of 1c or less), and the backtest never trims "
+                             "on such a quote")
+                return None, None
+            bids[(market.ticker, side)] = ladder
+    yes_bid_a, no_bid_a = bids[(market_a.ticker, "yes")][0][0], bids[(market_a.ticker, "no")][0][0]
+    yes_bid_b, no_bid_b = bids[(market_b.ticker, "yes")][0][0], bids[(market_b.ticker, "no")][0][0]
+
+    # The bids a trim may sell into on the side each market holds: those within
+    # reach of that side's best bid, so a gap in the book is never sold into
+    # Cross-module: config's one cut of a ladder, at seller's own binding of the reach
+    ladders = {market.ticker: kelly_trim_bids(bids[(market.ticker, side)],
+                                              KELLY_TRIM_MAX_BID_DROP)
+               for market, side in ((market_a, side_a), (market_b, side_b))}
+    bid_a, bid_b = ladders[market_a.ticker][0][0], ladders[market_b.ticker][0][0]
+    # What the pair alone fetches at its best bids after the fee, tested before the
+    # price rise and the chance: a pair either of those holds back still tells
+    # plan_trims that the value cannot be right
+    # Cross-module: the fee on selling one contract of each side at those bids
+    top_value = bid_a + bid_b - fee_per_pair_approx(bid_a, bid_b)
+    if count * top_value > positions_value:
+        # One pair cannot be worth more than every open position together
+        return None, (f"{text} alone would fetch {_dollars(count * top_value)} at its best "
+                      f"bids ({count_text(count)} contract pairs at {_dollars(top_value)} "
+                      f"each), more than the {_dollars(positions_value)} all open positions "
+                      "are valued at")
+
+    rise_text = ""
+    if settings.trim_min_rise is not None:
+        # With a minimum price rise, a pair is looked at only once its total price (the
+        # ask of the side held on each market, added) has gone up that far since its
+        # last trade
+        if last_fill is None:
+            not_trimming("no fill is listed on either market, so its price when it last "
+                         "traded cannot be read, and a minimum price rise is set")
+            return None, None
+        moment = math.floor(last_fill.timestamp())
+        # Then: each side's latest usable ask on an hourly candle that ended at or
+        # before the last trade
+        then_a = reads.ask_then(market_a, side_a, moment)
+        then_b = reads.ask_then(market_b, side_b, moment)
+        # A NaN is never equal to itself: no usable quote, or candles that could not be read
+        if then_a != then_a or then_b != then_b:
+            unread, side = (market_a, side_a) if then_a != then_a else (market_b, side_b)
+            not_trimming(f"the {side.upper()} ask on {unread.ticker} when the pair last "
+                         f"traded ({_day(last_fill)}) cannot be read (no usable quote in the "
+                         f"{TRIM_PRICE_THEN_MAX_AGE_DAYS} days before it, or its price "
+                         "history could not be read), and a minimum price rise is set")
+            return None, None
+        # Now: on the books just read, a side's ask is 1 minus the other side's best bid
+        now_a = 1.0 - bids[(market_a.ticker, _other(side_a))][0][0]
+        now_b = 1.0 - bids[(market_b.ticker, _other(side_b))][0][0]
+        # Cross-module: config's one measure of a rise, and the one test the backtest asks
+        rise = pair_price_rise(then_a + then_b, now_a + now_b)
+        prices = (f"price {_price_text(then_a + then_b)} then, {_price_text(now_a + now_b)} now "
+                  f"({_cents_text(rise)}, minimum {settings.trim_min_rise * 100:.0f}c)")
+        if not trim_rise_reached(rise, settings.trim_min_rise):
+            not_trimming("its total price has not risen by the minimum since it last "
+                         f"traded: {prices}")
+            return None, None
+        rise_text = prices + ", "
+
+    # Cross-module: the chance a new trade of the pair is sized with; each ask is 1
+    # minus the other side's bid
+    win_prob = held_pair_win_prob(pair_type, 1.0 - no_bid_a, 1.0 - yes_bid_a,
+                                  1.0 - no_bid_b, 1.0 - yes_bid_b, settings.interval_discount)
+    if win_prob is None:
+        not_trimming("its chance of paying cannot be read from its quotes (a market's YES "
+                     "ask sits below its own YES bid, or the two markets' midpoints leave "
+                     "no gap between them)")
+        return None, None
+
+    def net_sale(pairs: int) -> float | None:
+        """What selling `pairs` contract pairs returns after fees; None when the bids
+        within reach hold fewer."""
+        total = 0.0
+        for ladder in ladders.values():
+            # Cross-module: the one bid walk, then the taker fee on that market's sale
+            walk = walk_bids(ladder, pairs)
+            if walk is None:
+                return None
+            total += pairs * walk[0] - fee_leg_exact(pairs, walk[0])
+        return total
+
+    # Cross-module: the pair's size cap, as a new trade of its kind is capped
+    cap = pair_size_cap(pair_type, settings.size_cap, settings.same_title_size_cap)
+    # Cross-module: the rule itself, the one the backtest trims with
+    decision = kelly_trim_count(count, value, win_prob, cap, top_value, net_sale)
+    # Cross-module: the share Kelly lets the pair keep at its best bids, for the log line
+    keep = min(cap, kelly_hold_fraction(win_prob, top_value))
+    head = (f"Kelly trim check: {text} ({_KIND_WORDS.get(pair_type, pair_type)}), "
+            f"{count_text(count)} each, {waited}, {rise_text}pays {win_prob:.1%}, "
+            f"{_dollars(top_value)} a pair at the best bids, may keep {keep:.1%} of "
+            f"{_dollars(value)}")
+    sell = decision.sell
+    if not sell:
+        logging.info("%s -> keep", head)
+        return None, None
+    walked = {ticker: walk_bids(ladder, sell) for ticker, ladder in ladders.items()}
+    proceeds = net_sale(sell)
+    if proceeds is None or None in walked.values():
+        # The rule returns only a count the bids can take; should it ever return another
+        not_trimming(f"the bids within reach hold fewer than the {sell} contract pairs a "
+                     "trim would sell")
+        return None, None
+    logging.info("%s -> sell %d", head, sell)
+
+    # The sold share of each market's cost; the account still holds `count` there
+    legs = tuple(
+        SaleLeg(ticker, markets[ticker].event_ticker, side, sell,
+                (reads.held_positions[ticker].exposure_dollars
+                 + reads.held_positions[ticker].fees_dollars) * sell / count,
+                market=markets[ticker], held=count)
+        for ticker, side in pair.sides)
+    cost = sum(leg.cost_dollars for leg in legs)
+    # Cross-module: days to maturity from each held market's scheduled close date
+    days_left = days_to_maturity([_utc_date(m.close_time) for m in markets.values()], utc_date)
+    # Cross-module: the held market's title as the run's tables show it
+    title = display_title(markets[pair.sides[0][0]])
+    return SalePlan(title=title, legs=legs, count=sell, cost_dollars=cost, ladders=ladders,
+                    walked=walked, proceeds_dollars=proceeds,
+                    profits=((proceeds - cost, sell * CONTRACT_PAYOUT_DOLLARS - cost),),
+                    days_left=days_left, level=None, kind=SALE_KIND_KELLY_TRIM), None
+
+
+def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_ticker: dict,
+               *, settings: LiveSettings, now: datetime, cash_cents: float,
+               positions_value_cents: float | None,
+               skip: frozenset = frozenset()) -> list[SalePlan]:
+    """
+    Find the exact held pairs the Kelly trim sells part of this run, and plan each part sale.
+
+    A pair that has outgrown its Kelly share of the portfolio value is sold
+    down to it (_trim_one, by config.kelly_trim_count). Fails closed: nothing
+    is trimmed, with one log line saying why, unless all of these hold.
+
+      - Kalshi's value of the open positions is known and above zero. A trim
+        grows as the value it is sized on shrinks, so a missing or
+        understated value would sell too much.
+      - Every held market's ladder is known (it has labels).
+      - When a wait in days or a minimum price rise is set, the account's
+        fills could be read (scanner.get_fill_times), and, with a wait in
+        days, the list reaches back at least that many days: otherwise a
+        trade inside the wait could not be ruled out. With neither set the
+        fills are not read at all.
+      - No pair whose order books were read (one past the wait, with a
+        readable kind and a best bid on all four sides that a candle could
+        show) would alone fetch more at its best bids than all open
+        positions are valued at (_trim_one tells, before its price-rise and
+        chance steps): that value cannot then be right, and no pair is
+        trimmed. A pair stopped before its books are read is not seen by
+        this check.
+
+    The value a trim is sized on is the cash plus the larger of Kalshi's
+    value of the open positions and what every held market would fetch at
+    this run's bids (scanner.held_positions_bid_value), which can only make a
+    trim smaller. Only exact pairs are trimmed, never a lone held market.
+
+    Args:
+        client (Any): The authenticated production Kalshi client, only read from.
+        held_positions (dict): Ticker -> HeldPosition for every held market.
+        held_labels (dict): Ticker -> ladder labels (scanner.resolve_held_ladders' labels_out).
+        markets_by_ticker (dict): This run's whole market list by ticker, held markets included.
+        settings (LiveSettings): Keyword-only. trim_to_kelly (off: trim nothing, read
+            nothing), trim_min_rise, k and both size caps.
+        now (datetime): Keyword-only. The run's moment, timezone-aware.
+        cash_cents (float): Keyword-only. The account's cash on every shard, in cents.
+        positions_value_cents (float | None): Keyword-only. Kalshi's value of the open
+            positions, in cents; None when it was not read or was refused.
+        skip (frozenset): Keyword-only. Held tickers of positions picked for a
+            take-profit sale this run: a pair with one is not looked at.
+
+    Returns:
+        list[SalePlan]: The part sales, in ticker order, each with kind
+            config.SALE_KIND_KELLY_TRIM; empty when none.
+
+    Raises:
+        ValueError: When now is not timezone-aware, cash_cents is not a finite
+            number at least 0, or KELLY_TRIM_MIN_DAYS_SINCE_TRADE is invalid
+            (all three before any request); or, once a pair's books are read,
+            when KELLY_TRIM_MAX_BID_DROP is invalid.
+    """
+    if not settings.trim_to_kelly:
+        return []
+    # Checked first: a bad number of days stops the run before any request or order
+    min_days = _trim_min_days()
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise ValueError(f"now must be a timezone-aware datetime, got {now!r}")
+    if (isinstance(cash_cents, bool) or not isinstance(cash_cents, numbers.Real)
+            or not math.isfinite(cash_cents) or cash_cents < 0):
+        raise ValueError(f"cash_cents must be a finite number at least 0, got {cash_cents!r}")
+    if not held_positions:
+        _log_trim_summary(0, 0)
+        return []
+    # `not ... > 0` is also true for NaN
+    if (isinstance(positions_value_cents, bool)
+            or not isinstance(positions_value_cents, numbers.Real)
+            or not positions_value_cents > 0 or not math.isfinite(positions_value_cents)):
+        logging.warning(
+            "Not trimming any held pair this run: Kalshi's value of the open positions is "
+            "not known or is not above $0, and a trim sized on too small a value would "
+            "sell too much")
+        _log_trim_summary(0, 0)
+        return []
+    unknown = sorted((t for t in held_positions if not held_labels.get(t)), key=str)
+    if unknown:
+        # An unknown ladder could be any pair's, so no pair is provably alone on its ladder
+        logging.info("Not trimming this run: the ladder of %d held market(s) is unknown (%s)",
+                     len(unknown), ", ".join(str(t) for t in unknown))
+        _log_trim_summary(0, 0)
+        return []
+
+    # Cross-module: the one definition of exact held pairs and lone held markets, quietly
+    found = held_pairs(held_positions, held_labels, markets_by_ticker, log=False)
+    # Exact pairs only, and none whose markets a take-profit sale already takes
+    pairs = {key: pair for key, pair in found.items() if not pair.lone and not key & skip}
+    for key in sorted(found, key=sorted):
+        if not found[key].lone and key & skip:
+            logging.info("Not trimming %s: it is picked for a take-profit sale this run",
+                         _sides_text(found[key].sides))
+    if not pairs:
+        _log_trim_summary(0, 0)
+        return []
+
+    # Today on the bot's own clock, the clock every fill's day is read on
+    now_date = _day(now)
+    fills = None
+    if min_days > 0 or settings.trim_min_rise is not None:
+        # Cross-module: one read of the account's fills serves both waits
+        fills = get_fill_times(client)
+        if fills is None:
+            logging.warning(
+                "Not trimming any held pair this run: the account's fills could not be "
+                "read, so when each pair last traded is not known")
+            _log_trim_summary(0, len(pairs))
+            return []
+    if min_days > 0:
+        logging.info(
+            "Kelly trim: a pair is looked at once %d day(s) have passed since its last "
+            "trade, counted in calendar days on the bot's own clock (%s), where today is %s",
+            min_days, SCHEDULED_RUN.timezone, now_date)
+        # The list must reach back past the wait: a market with no fill listed has
+        # not traded since the list's oldest fill, and no earlier day is known
+        problem = None
+        if fills.oldest is None:
+            problem = "the account's fills list is empty"
+        # Cross-module: config's one test of the wait, asked of the list's oldest day
+        elif not kelly_trim_rested(_day(fills.oldest), now_date, min_days):
+            problem = (f"the account's fills list starts {_day(fills.oldest)} on the bot's "
+                       f"own clock, fewer than {min_days} day(s) ago")
+        if problem is not None:
+            logging.warning(
+                "Not trimming any held pair this run: %s, so a trade in the last %d day(s) "
+                "cannot be ruled out", problem, min_days)
+            _log_trim_summary(0, len(pairs))
+            return []
+
+    # Cross-module: what the held markets would fetch at this run's bids; a trim is
+    # sized on the larger of that and Kalshi's value, which can only trim less
+    floor = held_positions_bid_value(held_positions, markets_by_ticker)
+    kalshi_value = positions_value_cents / 100
+    positions_value = max(kalshi_value, floor)
+    value = cash_cents / 100 + positions_value
+    logging.info(
+        "Kelly trim sizes on %s = cash %s + open positions %s (Kalshi's value %s; %s at "
+        "this run's bids)", _dollars(value), _dollars(cash_cents / 100),
+        _dollars(positions_value), _dollars(kalshi_value), _dollars(floor))
+    if kalshi_value < floor:
+        logging.warning(
+            "Kalshi's value of the open positions (%s) is below what they would fetch at "
+            "this run's bids (%s): the Kelly trim is sized on the larger, so it can only "
+            "sell less", _dollars(kalshi_value), _dollars(floor))
+
+    # No daily checks: a trim reads the books now and, with a minimum price rise,
+    # each market's price at its pair's last trade
+    reads = _Reads(client, held_positions, markets_by_ticker, now.timestamp(), 0)
+    utc_date = now.astimezone(UTC).date()
+    plans: list[SalePlan] = []
+    doubts: list[str] = []
+    for key in sorted(pairs, key=sorted):
+        plan, doubt = _trim_one(pairs[key], reads, fills, settings=settings,
+                                min_days=min_days, now_date=now_date, utc_date=utc_date,
+                                value=value, positions_value=positions_value)
+        if doubt is not None:
+            doubts.append(doubt)
+        elif plan is not None:
+            plans.append(plan)
+    if doubts:
+        # One pair worth more than all open positions: the value every trim above
+        # was sized on is too small, so none of them stands
+        more = f" (and {len(doubts) - 1} more pair(s) alike)" if len(doubts) > 1 else ""
+        logging.warning(
+            "Not trimming any held pair this run: %s%s, so that value cannot be right, and "
+            "a trim sized on too small a value would sell too much", doubts[0], more)
+        _log_trim_summary(0, len(pairs))
+        return []
+    _log_trim_summary(len(plans), len(pairs))
+    return plans

@@ -9,7 +9,9 @@ Purpose:
     A dev run writes a new timestamped file with two sheets: the simulated
     trades and every candidate pair found.
 
-    A run that sells writes its sales to the log first, a row each (_sale_to_row).
+    A run that sells writes its sales to the log first, a row each (_sale_to_row):
+    a take-profit sale of a whole position, or a Kelly trim, which sells part
+    of a held pair.
 
     It also writes the run result of a production run started with
     `main.py --result-file`: a RunReport that main.py fills in as the run goes
@@ -26,7 +28,8 @@ Dependencies:
     the "adds to N held" marker) from scanner.py and TradeSpec from
     strategy.py.
     Imports PROJECT_ROOT, create_new_output, count_text (writes the held
-    count of an add-on exactly), fee_leg_exact (a sale row's fees) and the
+    count of an add-on exactly), fee_leg_exact (a sale row's fees), the two
+    kinds of sale (SALE_KIND_TAKE_PROFIT, SALE_KIND_KELLY_TRIM) and the
     run result's constants (LIVE_RUN_RESULT_FORMAT, RUN_REPORT_MAX_WARNINGS,
     RUN_REPORT_LINE_MAX_CHARS) from config.py. Exports the TradeResult and
     SaleResult dataclasses (built by trader.py), the two public write
@@ -105,6 +108,8 @@ from .config import (
     PROJECT_ROOT,
     RUN_REPORT_LINE_MAX_CHARS,
     RUN_REPORT_MAX_WARNINGS,
+    SALE_KIND_KELLY_TRIM,
+    SALE_KIND_TAKE_PROFIT,
     count_text,
     create_new_output,
     fee_leg_exact,
@@ -213,8 +218,9 @@ class SaleResult:
     The outcome of one held position's sale (trader.sell_positions makes one per SalePlan).
 
     Attributes:
-        plan (Any): The seller.SalePlan sold or simulated.
-        status (str): "sold" (all of it); "partly_sold" (some; a pair's rest is
+        plan (Any): The seller.SalePlan sold or simulated: a take-profit sale of a
+            whole position, or a Kelly trim of part of a held pair.
+        status (str): "sold" (all the plan set out to sell); "partly_sold" (some; a pair's rest is
             still an exact pair); "not_sold" (nothing sold or sent, error says
             which; also a dry run whose orders cannot be built); "unbalanced" (a
             pair's second order sold fewer than its first); "manual_review" (an
@@ -244,8 +250,8 @@ _SALE_STATUS_WORDS = {
     "simulated":     "simulated",
 }
 
-# Statuses in which the whole position sold (or would have, in a dry run),
-# so the plan's profit is what the sale realized
+# Statuses in which everything the plan set out to sell was sold (or would
+# have been, in a dry run), so the plan's profit is what the sale realized
 _SALE_WHOLE_STATUSES = ("sold", "simulated")
 
 # Market cell of a paid-out partner (the settled other market of a lone held
@@ -365,6 +371,35 @@ def _days_left_text(days_left: Any) -> str:
     return f"{days_left} day{'' if days_left == 1 else 's'} left"
 
 
+def _is_kelly_trim(plan: Any) -> bool:
+    """
+    Say whether a plan is a Kelly trim (part of a held pair) and not a take-profit sale.
+
+    Args:
+        plan (Any): A seller.SalePlan, or anything standing in for one.
+
+    Returns:
+        bool: True only when its kind is config.SALE_KIND_KELLY_TRIM; a plan
+            with no kind is a take-profit sale.
+    """
+    return getattr(plan, "kind", None) == SALE_KIND_KELLY_TRIM
+
+
+def _leg_holding(leg: Any) -> Any:
+    """
+    The contracts a plan says one held market holds.
+
+    Args:
+        leg (Any): A seller.SaleLeg.
+
+    Returns:
+        Any: leg.held when the leg carries one (a plan that may sell only
+            part of the holding), else leg.count, which is then all of it.
+    """
+    held = getattr(leg, "held", None)
+    return leg.count if held is None else held
+
+
 def _sale_leg_cells(leg: Any, plan: Any, sold: dict) -> list:
     """
     The five trade-log cells one market of a sold position fills.
@@ -402,6 +437,12 @@ def _sale_to_row(sale: SaleResult, run_ts: datetime) -> list:
     days left, fees=$0.42] " (potential profit: its payout if it wins, less
     its cost; fees: planned, on each held market's whole sale), then any error.
 
+    A Kelly trim sells part of a held pair, so its cost, profit and fees are
+    those of the contract pairs it set out to sell, and its Notes read
+    "[sale: YES A / NO B, Kelly trim: 13 of 30 contract pairs, 9 days left,
+    fees=$0.42] ": how many of the pairs held it sells. Both kinds start
+    "[sale: ", which is how live_portfolio tells a sale row.
+
     Args:
         sale (SaleResult): The sale, from trader.sell_positions.
         run_ts (datetime): This run's time, for the Date and Time columns.
@@ -420,8 +461,13 @@ def _sale_to_row(sale: SaleResult, run_ts: datetime) -> list:
                for leg in legs if leg.market is not None)
     realized, potential = plan.profits[0]
     whole = sale.status in _SALE_WHOLE_STATUSES
-    notes = (f"[sale: {sides}, {realized / potential:.0%} of potential profit "
-             f"(level {plan.level:.0%}), {_days_left_text(plan.days_left)}, "
+    if _is_kelly_trim(plan):
+        # A trim has no sell level: it says how many of the pairs held it sells
+        why = (f"Kelly trim: {count_text(plan.count)} of "
+               f"{count_text(_leg_holding(legs[0]))} contract pairs")
+    else:
+        why = f"{realized / potential:.0%} of potential profit (level {plan.level:.0%})"
+    notes = (f"[sale: {sides}, {why}, {_days_left_text(plan.days_left)}, "
              f"fees=${fees:.2f}] " + (sale.error or ""))
     return [
         run_ts.strftime("%Y-%m-%d"),
@@ -982,8 +1028,10 @@ class SaleLegRecord:
     Attributes:
         ticker (str): The market's ticker.
         side (str | None): "yes" or "no", the side held there.
-        held (int | None): The contracts held there when the sale was planned.
-        sold (int | None): Contracts known sold there (all, in a dry run); None if unknown.
+        held (int | None): The contracts held there when the sale was planned (for
+            a Kelly trim, at least what it set out to sell).
+        sold (int | None): Contracts known sold there (all the plan set out to sell,
+            in a dry run); None if unknown.
         price (float | None): Its average bid (SalePlan.walked), in dollars; None if not finite.
     """
     ticker: str
@@ -998,19 +1046,26 @@ class SaleRecord:
     """
     One held position's sale as a run result records it; money figures are the plan's.
 
+    For a Kelly trim (kind), which sells part of a held pair, the cost,
+    proceeds and profit are those of the contract pairs it set out to sell.
+
     Attributes:
         title (str | None): The position's title (SalePlan.title).
         status (str): The SaleResult status (how much really sold), or "unknown" if unreadable.
-        level (float | None): The share of potential profit it sells at (e.g. 0.8).
+        level (float | None): The share of potential profit it sells at (e.g. 0.8);
+            None for a Kelly trim, which has no level.
         days_left (int | None): Days before its last held market stops trading.
         cost (float | None): What the whole position cost, fees included, in dollars.
         proceeds (float | None): What selling every held market returns after fees, in dollars.
         profit (float | None): Proceeds plus a paid-out partner's payout, less
             the cost, in dollars; None unless the status is "sold" or "simulated".
         realized_percent (float | None): The plan's profit as a share of its potential
-            profit, in percent (e.g. 84.0): what the take-profit rule checked.
+            profit, in percent (e.g. 84.0): what the take-profit rule checked; None
+            for a Kelly trim, which checks no such share.
         legs (tuple[SaleLegRecord, ...]): Its held markets, in plan order (no paid-out partner).
         error (str | None): The trader's one-line error, if any.
+        kind (str): config.SALE_KIND_TAKE_PROFIT (the default) or
+            config.SALE_KIND_KELLY_TRIM.
     """
     title: str | None
     status: str
@@ -1022,6 +1077,7 @@ class SaleRecord:
     realized_percent: float | None
     legs: tuple[SaleLegRecord, ...]
     error: str | None
+    kind: str = SALE_KIND_TAKE_PROFIT
 
 
 @dataclass
@@ -1317,6 +1373,9 @@ def sale_record(sale: SaleResult) -> SaleRecord:
     """
     Describe one held position's sale for a RunReport, a non-finite figure as None.
 
+    A Kelly trim is recorded with its kind, no level and no realized share
+    (it has neither), and each held market's holding beside what sold there.
+
     Args:
         sale (SaleResult): The trader's result for one position.
 
@@ -1329,23 +1388,27 @@ def sale_record(sale: SaleResult) -> SaleRecord:
     plan = sale.plan
     sold = sale.sold if isinstance(sale.sold, dict) else {}
     realized, potential = plan.profits[0]
+    trim = _is_kelly_trim(plan)
     legs = tuple(
-        SaleLegRecord(str(leg.ticker), _text_or_none(leg.side), _int_or_none(leg.count),
+        SaleLegRecord(str(leg.ticker), _text_or_none(leg.side),
+                      _int_or_none(_leg_holding(leg)),
                       _int_or_none(sold.get(leg.ticker)),
                       _json_number(plan.walked[leg.ticker][0], 4))
         for leg in plan.legs if leg.market is not None)
     return SaleRecord(
         title=_text_or_none(plan.title),
         status=str(sale.status),
-        level=_json_number(plan.level, 4),
+        # A trim has no sell level and checks no share of potential profit
+        level=None if trim else _json_number(plan.level, 4),
         days_left=_int_or_none(plan.days_left),
         cost=_json_number(plan.cost_dollars, 2),
         proceeds=_json_number(plan.proceeds_dollars, 2),
         profit=(_json_number(realized, 2) if sale.status in _SALE_WHOLE_STATUSES
                 else None),
-        realized_percent=_json_number(100.0 * realized / potential, 2),
+        realized_percent=None if trim else _json_number(100.0 * realized / potential, 2),
         legs=legs,
         error=None if sale.error is None else str(sale.error),
+        kind=SALE_KIND_KELLY_TRIM if trim else SALE_KIND_TAKE_PROFIT,
     )
 
 
@@ -1369,12 +1432,15 @@ def report_sales(sales: list) -> list[SaleRecord]:
         except Exception as exc:
             logging.error("Could not describe a sale for the run result: %s", exc)
         try:
+            plan = getattr(sale, "plan", None)
             records.append(SaleRecord(
-                title=_text_or_none(getattr(getattr(sale, "plan", None), "title", None)),
+                title=_text_or_none(getattr(plan, "title", None)),
                 status=_text_or_none(getattr(sale, "status", None)) or "unknown",
                 level=None, days_left=None, cost=None, proceeds=None, profit=None,
                 realized_percent=None, legs=(),
-                error=_text_or_none(getattr(sale, "error", None))))
+                error=_text_or_none(getattr(sale, "error", None)),
+                # Still told apart from a take-profit sale when its kind can be read
+                kind=SALE_KIND_KELLY_TRIM if _is_kelly_trim(plan) else SALE_KIND_TAKE_PROFIT))
         except Exception:
             # A field that raises when read: keep the sale's place, status unknown
             records.append(SaleRecord(
