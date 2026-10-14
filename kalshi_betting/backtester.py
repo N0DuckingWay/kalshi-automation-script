@@ -9097,8 +9097,8 @@ def _live_trim_note(sweep: BacktestSweep) -> str:
 
     The backtest's own simulations (its primary scenario and every scenario
     it runs) never trim. Only the dashboard's "Trim to Kelly: on" view does,
-    simulated when the page is built. _live_rule_line adds this clause to the
-    live-rule log line.
+    simulated when the page is built. _live_rule_line and
+    dashboard._live_rule_html add this clause to the live-rule line.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
