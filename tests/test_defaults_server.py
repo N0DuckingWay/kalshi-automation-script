@@ -98,14 +98,16 @@ KEY = b"k" * 32
 _REAL_POPEN = subprocess.Popen
 # A source note of the dashboard's shape
 DASHBOARD_NOTE = "backtest dashboard for 2025-09-24 to 2026-09-27"
-# The ten rows of a comparison, in their order on the page
+# The twelve rows of a comparison, in their order on the page
 LABELS = ["tier floors", "spread band", "k", "per-trade cap", "same-title cap",
-          "categories", "tags", "add to held pairs", "sell at", "min days to maturity"]
+          "categories", "tags", "add to held pairs", "sell at", "min days to maturity",
+          "trim to Kelly", "min price rise"]
 # A proposal's fields: the seed's values, spelled as the dashboard spells them
 _BASE = {"tier_floors": "off", "spread_min": "0", "spread_max": "0.5", "k": "0.8",
          "size_cap": "0.1"}
 # The settings _BASE proposes when nothing is saved: the seed's (its same-title
-# cap, adding to held pairs on and no selling, the fields a proposal may leave out)
+# cap, adding to held pairs on, no selling and no trimming, the fields a
+# proposal may leave out)
 _BASE_SETTINGS = LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, add_to_held_pairs=True)
 # The ASCII digits as Arabic-Indic and as full-width digits (str.translate tables)
 _ARABIC_INDIC = str.maketrans("0123456789", "".join(chr(0x0660 + i) for i in range(10)))
@@ -834,7 +836,7 @@ class TestConfirmPage:
         assert changed == {"tier floors", "spread band"}
         assert all(css == "same" for label, css in page.rows.items() if label not in changed)
         assert response.body.count('<span class="tag">changed</span>') == 2
-        assert "2 of 10 settings change." in response.body
+        assert "2 of 12 settings change." in response.body
         assert "Overwrite the live trading defaults?" in response.body
         assert f"This writes <code>{config.LIVE_DEFAULTS_FILE.absolute()}</code>" \
             in response.body
@@ -860,13 +862,15 @@ class TestConfirmPage:
         assert "none saved — live runs refuse to start until defaults are saved" in response.body
         assert set(page.rows.values()) == {"changed"}
         assert all(cells[1] == "—" for cells in page.cells.values())
-        assert "10 of 10 settings change." in response.body
-        # The same-title cap, adding to held pairs and the two sell settings
-        # fall back to the seed's
+        assert "12 of 12 settings change." in response.body
+        # The same-title cap, adding to held pairs, the two sell settings and
+        # the two trim settings fall back to the seed's
         assert page.cells["same-title cap"][2] == "20%"
         assert page.cells["add to held pairs"][2] == "on"
         assert page.cells["sell at"][2] == "off"
         assert page.cells["min days to maturity"][2] == "any"
+        assert page.cells["trim to Kelly"][2] == "off"
+        assert page.cells["min price rise"][2] == "any"
 
     def test_the_exposure_warning_shows(self):
         response = _get(_app(), "/confirm?" + _query(k="0.4", size_cap="1"))
@@ -973,6 +977,97 @@ class TestConfirmPage:
         assert "sell_min_days needs a sell level" in html.unescape(response.body)
         assert "<form" not in response.body
 
+    @pytest.mark.parametrize("saved", [
+        {}, {"trim_to_kelly": True}, {"trim_to_kelly": True, "trim_min_rise": 0.25}])
+    def test_missing_trim_settings_keep_the_saved_values(self, saved):
+        # A link that names neither (the dashboard's save button, a hand-made
+        # link) leaves trimming exactly as saved, shown as no change
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, **saved))
+        page = _parse(_get(_app(), "/confirm?" + _query()).body)
+        assert page.rows["trim to Kelly"] == page.rows["min price rise"] == "same"
+        assert page.cells["trim to Kelly"][1] == page.cells["trim to Kelly"][2] == (
+            "on" if saved.get("trim_to_kelly") else "off")
+        assert page.cells["min price rise"][1] == page.cells["min price rise"][2] == (
+            "25c" if "trim_min_rise" in saved else "any")
+        proposed, _ = defaults_server._proposal(defaults_server._params(_query()),
+                                                config.read_saved_live_defaults())
+        assert (proposed.trim_to_kelly, proposed.trim_min_rise) == (
+            saved.get("trim_to_kelly", False), saved.get("trim_min_rise"))
+
+    def test_missing_trim_settings_with_none_saved_are_the_seed_s(self):
+        settings, _ = defaults_server._proposal(defaults_server._params(_query()), None)
+        assert settings.trim_to_kelly is config.LIVE_DEFAULTS_SEED.trim_to_kelly is False
+        assert settings.trim_min_rise is config.LIVE_DEFAULTS_SEED.trim_min_rise is None
+
+    @pytest.mark.parametrize("given, expected", [
+        ({"trim_to_kelly": "on"}, (True, None)),
+        ({"trim_to_kelly": "on", "trim_min_rise": "0.1"}, (True, 0.10)),
+        ({"trim_to_kelly": "on", "trim_min_rise": "0.10"}, (True, 0.10)),
+        ({"trim_to_kelly": "on", "trim_min_rise": "0.05"}, (True, 0.05)),
+        ({"trim_to_kelly": "on", "trim_min_rise": "0.15"}, (True, 0.15)),
+        ({"trim_to_kelly": "on", "trim_min_rise": "1"}, (True, 1.0)),
+        ({"trim_to_kelly": "on", "trim_min_rise": "1e-1"}, (True, 0.10)),
+        ({"trim_to_kelly": "on", "trim_min_rise": "off"}, (True, None)),
+        ({"trim_to_kelly": "off"}, (False, None)),
+        ({"trim_to_kelly": "off", "trim_min_rise": "off"}, (False, None)),
+        ({"trim_min_rise": "off"}, (False, None)),
+    ])
+    def test_named_trim_settings_are_proposed(self, given, expected):
+        # With nothing saved, so a field a link leaves out is the seed's (off)
+        settings, _ = defaults_server._proposal(defaults_server._params(_query(**given)), None)
+        assert (settings.trim_to_kelly, settings.trim_min_rise) == expected
+        page = _parse(_get(_app(), "/confirm?" + _query(**given)).body)
+        rise = "any" if expected[1] is None else f"{round(expected[1] * 100)}c"
+        assert page.cells["trim to Kelly"][1:3] == ["—", "on" if expected[0] else "off"]
+        assert page.cells["min price rise"][1:3] == ["—", rise]
+
+    def test_a_link_s_dollars_and_a_flag_s_cents_are_one_minimum(self):
+        # 0.1 on a link is ten cents, the same float as the 0.10 a save holds
+        settings, _ = defaults_server._proposal(
+            defaults_server._params(_query(trim_to_kelly="on", trim_min_rise="0.1")), None)
+        assert settings.trim_min_rise == 0.10 == 10 / 100
+        assert "--trim-min-rise=10" in config.live_settings_argv(settings)
+
+    def test_a_named_minimum_rise_over_a_saved_one_is_a_change(self):
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, trim_to_kelly=True,
+                           trim_min_rise=0.25))
+        page = _parse(_get(_app(), "/confirm?" + _query(trim_min_rise="0.1")).body)
+        assert page.rows["min price rise"] == "changed"
+        assert page.cells["min price rise"][1:3] == ["25c", "10c"]
+        # The switch was left out, so it stays as saved
+        assert page.rows["trim to Kelly"] == "same"
+        page = _parse(_get(_app(), "/confirm?" + _query(
+            trim_to_kelly="off", trim_min_rise="off")).body)
+        assert [label for label, css in page.rows.items() if css == "changed"] == [
+            "trim to Kelly", "min price rise"]
+        assert page.cells["trim to Kelly"][1:3] == ["on", "off"]
+        assert page.cells["min price rise"][1:3] == ["25c", "any"]
+
+    def test_turning_trimming_off_but_keeping_a_saved_minimum_is_refused_with_the_reason(self):
+        # The minimum was left out, so it stays at the saved 25c with trimming off
+        _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, trim_to_kelly=True,
+                           trim_min_rise=0.25))
+        response = _get(_app(), "/confirm?" + _query(trim_to_kelly="off"))
+        assert response.status == 400
+        assert "trim_min_rise needs trim_to_kelly on" in html.unescape(response.body)
+        assert "<form" not in response.body
+
+    @pytest.mark.parametrize("given", [
+        # None saved and the switch left out (the seed's is off), or named off
+        {"trim_min_rise": "0.1"}, {"trim_to_kelly": "off", "trim_min_rise": "0.1"}])
+    def test_a_minimum_rise_with_trimming_off_is_refused_with_the_reason(self, given):
+        response = _get(_app(), "/confirm?" + _query(**given))
+        assert response.status == 400
+        assert "trim_min_rise needs trim_to_kelly on" in html.unescape(response.body)
+        assert "<form" not in response.body and "<button" not in response.body
+        assert config.read_saved_live_defaults() is None
+
+    def test_a_minimum_rise_off_the_grid_is_refused_with_the_reason(self):
+        response = _get(_app(), "/confirm?" + _query(trim_to_kelly="on", trim_min_rise="0.07"))
+        assert response.status == 400
+        assert "trim_min_rise must be a multiple of 5c from 5c to $1" in html.unescape(
+            response.body)
+
     def test_a_missing_category_or_tag_proposes_any(self):
         _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, ("Sports",), ("Basketball",)))
         page = _parse(_get(_app(), "/confirm?" + _query(same_title_size_cap="0.2")).body)
@@ -1012,7 +1107,7 @@ class TestConfirmPage:
         assert page.buttons[1] == {"type": "button", "disabled": None}
         assert html.escape(defaults_server._NOTHING_TO_SAVE) in response.body
         assert "These are already the live defaults — nothing to save." in response.body
-        assert "0 of 10 settings change." in response.body
+        assert "0 of 12 settings change." in response.body
         # With nothing to save, the page does not say it writes
         assert "This writes" not in response.body
         assert str(config.LIVE_DEFAULTS_FILE.absolute()) in response.body
@@ -1340,6 +1435,38 @@ class TestConfirmRefusals:
         # A minimum with no level: none given and none saved (the seed's is off),
         # or the level named off
         _query(sell_min_days="3"), _query(sell_at="off", sell_min_days="3"),
+        # Trimming: on or off, spelled exactly so
+        _query(trim_to_kelly="maybe"), _query(trim_to_kelly="true"),
+        _query(trim_to_kelly="1"), _query(trim_to_kelly="On"), _query(trim_to_kelly="OFF"),
+        # A minimum price rise: plain decimal dollars on the 5c grid from 5c to
+        # $1, or off
+        _query(trim_to_kelly="on", trim_min_rise="maybe"),
+        _query(trim_to_kelly="on", trim_min_rise="Off"),
+        _query(trim_to_kelly="on", trim_min_rise="on"),
+        _query(trim_to_kelly="on", trim_min_rise="0"),
+        _query(trim_to_kelly="on", trim_min_rise="-0.1"),
+        _query(trim_to_kelly="on", trim_min_rise="1.05"),
+        _query(trim_to_kelly="on", trim_min_rise="10"),
+        _query(trim_to_kelly="on", trim_min_rise="5"),
+        _query(trim_to_kelly="on", trim_min_rise="0.07"),
+        _query(trim_to_kelly="on", trim_min_rise="0.125"),
+        _query(trim_to_kelly="on", trim_min_rise="0.01"),
+        _query(trim_to_kelly="on", trim_min_rise="10c"),
+        _query(trim_to_kelly="on", trim_min_rise="nan"),
+        _query(trim_to_kelly="on", trim_min_rise="inf"),
+        _query(trim_to_kelly="on", trim_min_rise="0_1"),
+        _query(trim_to_kelly="on", trim_min_rise="０.1"),
+        _query(trim_to_kelly="on", trim_min_rise="٠.1"),
+        _query(trim_to_kelly="on", trim_min_rise=" 0.1"),
+        _query(trim_to_kelly="on", trim_min_rise="0x1"),
+        _query(trim_to_kelly="on", trim_min_rise="1e-400"),
+        _query(trim_to_kelly="on", trim_min_rise="1e400"),
+        # A minimum with trimming off: neither given nor saved (the seed's is
+        # off), or the switch named off
+        _query(trim_min_rise="0.1"), _query(trim_to_kelly="off", trim_min_rise="0.1"),
+        # Either trim field given twice
+        _query(trim_to_kelly="on") + "&trim_to_kelly=on",
+        _query(trim_to_kelly="on", trim_min_rise="0.1") + "&trim_min_rise=0.1",
         _query(k="nan"), _query(k="inf"), _query(k="0_8"), _query(k="1e-400"),
         _query(k="1e400"), _query(k="０.8"), _query(k=" 0.8"), _query(k="0"),
         _query(k="1.5"), _query(k="0x1"),
@@ -1402,6 +1529,19 @@ class TestConfirmRefusals:
         assert _get(_app(), "/confirm?" + _query(
             source=config.LIVE_DEFAULTS_SEED_SOURCE, sell_at="off",
             sell_min_days="off")).status == 200
+
+    def test_the_seed_note_labels_no_trimming_settings(self):
+        # The seed trims nothing: its note on a link that trims is refused
+        for given in ({"trim_to_kelly": "on"},
+                      {"trim_to_kelly": "on", "trim_min_rise": "0.1"}):
+            response = _get(_app(), "/confirm?" + _query(
+                source=config.LIVE_DEFAULTS_SEED_SOURCE, **given))
+            assert response.status == 400, given
+            assert "may label only the seed values" in response.body
+        # ... and a seed link that names trimming off is the seed
+        assert _get(_app(), "/confirm?" + _query(
+            source=config.LIVE_DEFAULTS_SEED_SOURCE, trim_to_kelly="off",
+            trim_min_rise="off")).status == 200
 
     def test_an_invalid_proposal_is_refused_on_the_post_too(self):
         # A form carrying a proposal no page would render, signed as a page would sign it
@@ -2055,6 +2195,51 @@ class TestSeed:
         assert config.LIVE_DEFAULTS_SEED.sell_at is None
         assert config.LIVE_DEFAULTS_SEED.sell_min_days is None
 
+    def test_the_seed_query_spells_trimming_off(self):
+        pairs = dict(defaults_server._params(defaults_server._seed_query()))
+        assert pairs["trim_to_kelly"] == ["off"] and pairs["trim_min_rise"] == ["off"]
+        assert config.LIVE_DEFAULTS_SEED.trim_to_kelly is False
+        assert config.LIVE_DEFAULTS_SEED.trim_min_rise is None
+
+    def test_the_seed_page_turns_off_trimming_that_is_saved(self):
+        # The seed link names trimming off, so it proposes exactly the seed
+        # over defaults that trim: both rows change
+        _save(replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True, trim_min_rise=0.25))
+        response = _get(_app(), "/confirm?" + defaults_server._seed_query())
+        page = _parse(response.body)
+        assert [label for label, css in page.rows.items() if css == "changed"] == [
+            "trim to Kelly", "min price rise"]
+        assert page.cells["trim to Kelly"][1:3] == ["on", "off"]
+        assert page.cells["min price rise"][1:3] == ["25c", "any"]
+        assert "2 of 12 settings change." in response.body
+
+    def test_a_seed_link_that_leaves_trimming_out_still_proposes_the_seed(self):
+        # A seed link with no trim fields, opened over defaults that trim: the
+        # seed's off, shown as changes, never refused for putting the seed's
+        # note on other values, and never refused for keeping a saved minimum
+        # with trimming off
+        _save(replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True, trim_min_rise=0.25))
+        stale = "&".join(part for part in defaults_server._seed_query().split("&")
+                         if not part.startswith(("trim_to_kelly=", "trim_min_rise=")))
+        assert "trim" not in stale and "source=" in stale
+        params = defaults_server._params(stale)
+        assert defaults_server._proposal(params, config.read_saved_live_defaults()) == (
+            config.LIVE_DEFAULTS_SEED, config.LIVE_DEFAULTS_SEED_SOURCE)
+        app = _app()
+        response = _get(app, "/confirm?" + stale)
+        assert response.status == 200
+        page = _parse(response.body)
+        assert [label for label, css in page.rows.items() if css == "changed"] == [
+            "trim to Kelly", "min price rise"]
+        assert _post(app, _click(response.body, "confirm")).status == 303
+        assert config.live_defaults() == config.LIVE_DEFAULTS_SEED
+        # Control: the same link without the seed's note keeps what is saved
+        plain = "&".join(part for part in stale.split("&") if not part.startswith("source="))
+        kept, _ = defaults_server._proposal(
+            defaults_server._params(plain),
+            replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True, trim_min_rise=0.25))
+        assert (kept.trim_to_kelly, kept.trim_min_rise) == (True, 0.25)
+
     def test_the_seed_page_turns_off_selling_that_is_saved(self):
         # The seed link names selling off, so it proposes exactly the seed over
         # defaults that sell: both rows change
@@ -2063,7 +2248,7 @@ class TestSeed:
         page = _parse(response.body)
         assert [label for label, css in page.rows.items() if css == "changed"] == [
             "sell at", "min days to maturity"]
-        assert "2 of 10 settings change." in response.body
+        assert "2 of 12 settings change." in response.body
 
     def test_a_seed_link_that_leaves_selling_out_still_proposes_the_seed(self):
         # A seed link from before selling existed (no sell fields), opened over
@@ -2101,7 +2286,7 @@ class TestSeed:
         assert [label for label, css in page.rows.items() if css == "changed"] == [
             "add to held pairs"]
         assert page.cells["add to held pairs"][1:3] == ["off", "on"]
-        assert "1 of 10 settings change." in response.body
+        assert "1 of 12 settings change." in response.body
 
     def test_a_seed_link_that_leaves_out_adding_to_held_pairs_still_proposes_the_seed(self):
         # A seed link without the add_to_held_pairs field, opened while a file
@@ -2590,6 +2775,36 @@ class TestActions:
         [(argv, _)] = starter.calls
         assert "--no-sell" in argv and "--no-sell-min-days" in argv
         assert not any(arg.startswith(("--sell-at", "--sell-min-days")) for arg in argv)
+
+    def test_confirming_trimming_saves_it_and_a_run_is_started_with_its_flags(self):
+        starter = _Starter()
+        app = _app(start_process=starter)
+        form = _page_form(app, _query(trim_to_kelly="on", trim_min_rise="0.1"), "confirm-trade")
+        # The page carried both fields, as the link named them
+        assert ("trim_to_kelly", "on") in form and ("trim_min_rise", "0.1") in form
+        run_id = _run_id(_post(app, form))
+        saved = config.read_saved_live_defaults()
+        assert (saved.trim_to_kelly, saved.trim_min_rise) == (True, 0.10)
+        # The two keys are the file's last, in field order
+        text = config.LIVE_DEFAULTS_FILE.read_text()
+        assert text.rstrip().endswith('"trim_to_kelly": true,\n    "trim_min_rise": 0.1\n  }\n}')
+        [(argv, _)] = starter.calls
+        assert argv[5:-2] == config.live_settings_argv(saved)
+        assert "--trim-to-kelly" in argv and "--trim-min-rise=10" in argv
+        assert "--no-trim-to-kelly" not in argv and "--no-trim-min-rise" not in argv
+        record = json.loads((_run_folder(run_id) / "run.json").read_text())
+        assert record["settings"].endswith("trim to Kelly on | min price rise 10c")
+
+    def test_a_run_from_defaults_that_do_not_trim_says_so_in_its_flags(self):
+        starter = _Starter()
+        app = _app(start_process=starter)
+        _post(app, _page_form(app, _query(), "confirm-trade"))
+        [(argv, _)] = starter.calls
+        assert "--no-trim-to-kelly" in argv and "--no-trim-min-rise" in argv
+        assert "--trim-to-kelly" not in argv
+        assert not any(arg.startswith("--trim-min-rise") for arg in argv)
+        # ... and the saved file, with trimming off, names neither key
+        assert "trim" not in config.LIVE_DEFAULTS_FILE.read_text()
 
     def test_trade_saves_then_starts_exactly_the_page_s_settings(self):
         starter = _Starter()

@@ -3731,6 +3731,11 @@ class BacktestSweep:
             Reporting only: this run's own points never sell.
         live_sell_min_days (int | None): Their minimum of days before
             maturity; None for no minimum (or not recorded).
+        live_trim_to_kelly (bool | None): Whether the saved live defaults
+            trim held pairs to their Kelly size, from the same read; None if
+            not recorded. Reporting only: this run's own points never trim.
+        live_trim_min_rise (float | None): Their minimum price rise before a
+            trim, in dollars; None for no minimum (or not recorded).
         entry_checkpoint (str | None): SCHEDULED_RUN.label() of the schedule
             the entry checkpoints were placed by (e.g. "Monday 09:00
             America/Los_Angeles"), for the dashboard header. None = not
@@ -3796,6 +3801,9 @@ class BacktestSweep:
     depth_model: DepthModel | None = None
     # The dashboard's "Trim to Kelly" family, lazy (None unless run_backtest_sweep(trim_sweep=True))
     trim_sweep: TrimSweep | None = None
+    # The saved live defaults' trim_to_kelly and trim_min_rise
+    live_trim_to_kelly: bool | None = None
+    live_trim_min_rise: float | None = None
 
 
 def _settlement_receipt(n: int, outcome_a: str, outcome_b: str, pair_type: str) -> float:
@@ -8959,14 +8967,14 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
     Name the BacktestSweep keywords that record the saved live defaults.
 
     Both production BacktestSweep constructions spread this (beside
-    same_title_size_cap), so the eleven fields are recorded together from one
-    read or not at all.
+    same_title_size_cap), so the thirteen fields are recorded together from
+    one read or not at all.
 
     Args:
         live (LiveSettings | None): _live_settings_for_report()'s result.
 
     Returns:
-        dict: The eleven live_* keywords from live; {} when live is None.
+        dict: The thirteen live_* keywords from live; {} when live is None.
     """
     if live is None:
         return {}
@@ -8976,7 +8984,9 @@ def _live_rule_fields(live: LiveSettings | None) -> dict:
             "live_size_cap": live.size_cap,
             "live_same_title_size_cap": live.same_title_size_cap,
             "live_add_to_held_pairs": live.add_to_held_pairs,
-            "live_sell_at": live.sell_at, "live_sell_min_days": live.sell_min_days}
+            "live_sell_at": live.sell_at, "live_sell_min_days": live.sell_min_days,
+            "live_trim_to_kelly": live.trim_to_kelly,
+            "live_trim_min_rise": live.trim_min_rise}
 
 
 # The label a recorded live rule is named with, in the log line and page header
@@ -9081,6 +9091,31 @@ def _live_sell_note(sweep: BacktestSweep) -> str:
             "which this run's primary does not")
 
 
+def _live_trim_note(sweep: BacktestSweep) -> str:
+    """
+    Say when the saved live defaults trim held pairs to Kelly and this run's headline figures do not.
+
+    The backtest's own simulations (its primary scenario and every scenario
+    it runs) never trim. Only the dashboard's "Trim to Kelly: on" view does,
+    simulated when the page is built. _live_rule_line adds this clause to the
+    live-rule log line.
+
+    Args:
+        sweep (BacktestSweep): The run's sweep.
+
+    Returns:
+        str: "; the live defaults trim to Kelly (only after a 10c price
+            rise), which this run's primary does not" (the parenthesis only
+            with a minimum price rise, in _trim_rise_label's words), or ""
+            when live_trim_to_kelly is not True (off, or not recorded).
+    """
+    if sweep.live_trim_to_kelly is not True:
+        return ""
+    rise = sweep.live_trim_min_rise
+    after = "" if rise is None else f" ({_trim_rise_label(rise).strip()})"
+    return f"; the live defaults trim to Kelly{after}, which this run's primary does not"
+
+
 def _live_filter_text(categories: tuple[str, ...] | None,
                       tags: tuple[str, ...] | None) -> str:
     """
@@ -9183,8 +9218,9 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
     Always a line, so a report never silently omits the live rule: with none
     recorded it says so (_LIVE_RULE_NONE). A recorded rule's line ends with
     _live_sizing_note when the saved defaults size differently from this
-    run's primary, then _live_add_on_note when they add to held pairs.
-    _live_sell_note comes last, when they sell.
+    run's primary, then _live_add_on_note when they add to held pairs,
+    then _live_sell_note when they sell. _live_trim_note comes last, when
+    they trim to Kelly.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
@@ -9203,7 +9239,7 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
         rule += f"; category/tag filter ({_live_filter_text(categories, tags)})"
     if view.where == _LIVE_RULE_NOT_SIMULATED:
         return (f"{prefix}{rule} — not simulated by this run{_live_sizing_note(sweep)}"
-                f"{_live_add_on_note(sweep)}{_live_sell_note(sweep)}")
+                f"{_live_add_on_note(sweep)}{_live_sell_note(sweep)}{_live_trim_note(sweep)}")
     # Tier floors off at a band no tier binds at: the tier-on cell holds it
     never_binds = ("" if sweep.live_tier_floors or not view.tier_floors else
                    " (no tier floor binds at this band, so off and on are one rule)")
@@ -9225,7 +9261,8 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
                  f"{subject} when its Category and Tag menus tick the categories and tags "
                  "the filter lists (each offered where this run filed a pair under it)")
     return (f"{prefix}{rule} — {tail}{_live_rule_ladder_note(sweep)}"
-            f"{_live_sizing_note(sweep)}{_live_add_on_note(sweep)}{_live_sell_note(sweep)}")
+            f"{_live_sizing_note(sweep)}{_live_add_on_note(sweep)}{_live_sell_note(sweep)}"
+            f"{_live_trim_note(sweep)}")
 
 
 def _tier_floors_bind(band: tuple[float, float]) -> bool:
@@ -12295,7 +12332,7 @@ def _sweep_from_candidates(
             configured switch, read beside same_event_ladders's
             resolution), tier_off_scenarios, tier_off_calibrations_by_band,
             cap_sweep, tier_off_cap_sweep, add_on_cap_sweep,
-            add_on_tier_off_cap_sweep, same_title_size_cap, the eleven live_*
+            add_on_tier_off_cap_sweep, same_title_size_cap, the thirteen live_*
             fields, entry_checkpoint, sell_sweep, depth_model and trim_sweep
             — see BacktestSweep.
 
@@ -12904,7 +12941,7 @@ def run_backtest_sweep(
     here reaches live.
 
     It reports the saved live defaults' time-series rule, category/tag filter,
-    k, caps, add-to-held and sell settings: one fail-soft read before the fetch,
+    k, caps, add-to-held, sell and trim settings: one fail-soft read before the fetch,
     recorded on the live_* fields and, worded by _live_rule_line, logged last
     ("none recorded" when no usable defaults are saved).
 

@@ -51,6 +51,10 @@ Purpose:
     that has stayed at or above that share of its potential profit (what it
     pays if it wins, less its cost); see CLAUDE.md, live selling.
 
+    The Kelly-trim settings (trim_to_kelly and trim_min_rise; --trim-to-kelly
+    and --trim-min-rise) are resolved, checked and logged with the other
+    toggles, and no run mode acts on them.
+
     A production run keeps every market the account holds out of new trades,
     except, when the run's add_to_held_pairs setting is on, the markets it
     may add to (scanner.held_pairs): the two markets of an exact held pair,
@@ -140,6 +144,7 @@ from .config import (
     SELL_AT_STEP,
     SIZE_CAP_STEP,
     TAG_SCOPE_SEPARATOR,
+    TRIM_PRICE_RISE_STEP_CENTS,
     V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS,
     LiveDefaultsError,
     LiveDefaultsMissing,
@@ -1219,6 +1224,9 @@ _LIVE_FLAGS = (
     ("no_sell", "--no-sell"),
     ("sell_min_days", "--sell-min-days"),
     ("no_sell_min_days", "--no-sell-min-days"),
+    ("trim_to_kelly", "--trim-to-kelly/--no-trim-to-kelly"),
+    ("trim_min_rise", "--trim-min-rise"),
+    ("no_trim_min_rise", "--no-trim-min-rise"),
     ("category", "--category"),
     ("any_category", "--any-category"),
     ("tag", "--tag"),
@@ -1267,8 +1275,10 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     --category and --tag each replace the whole saved list, so a run that
     changes the categories and keeps saved tags tied to a category it no
     longer lists is refused, and the message names the remedy (--any-tag, or
-    this run's own --tag). Called before logging is configured, so a refusal
-    logs nothing and makes no request.
+    this run's own --tag). --no-sell also clears the saved minimum of days,
+    and --no-trim-to-kelly the saved minimum price rise, since each minimum
+    is refused without its switch. Called before logging is configured, so a
+    refusal logs nothing and makes no request.
 
     Args:
         args (argparse.Namespace): The parsed flags; a missing attribute reads
@@ -1323,6 +1333,18 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["sell_min_days"] = None
     if getattr(args, "sell_min_days", None) is not None:
         overrides["sell_min_days"] = args.sell_min_days
+    # --no-trim-to-kelly clears the minimum price rise too; --trim-min-rise then
+    # sets one (LiveSettings refuses a minimum with trimming off)
+    trim = getattr(args, "trim_to_kelly", None)
+    if trim is not None:
+        overrides["trim_to_kelly"] = trim
+        if not trim:
+            overrides["trim_min_rise"] = None
+    if getattr(args, "no_trim_min_rise", None):
+        overrides["trim_min_rise"] = None
+    if getattr(args, "trim_min_rise", None) is not None:
+        # The flag takes whole cents; LiveSettings holds dollars
+        overrides["trim_min_rise"] = args.trim_min_rise / 100
     # --category / --tag (repeatable) set the filter; --any-category / --any-tag
     # clear the saved one (argparse keeps each pair mutually exclusive)
     if getattr(args, "category", None) is not None:
@@ -1355,6 +1377,11 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
             sell_step = f"{SELL_AT_STEP * 100:g}"
             message += (f" (--sell-at takes a whole percent, a multiple of {sell_step} "
                         f"from {sell_step} to 100, read as that percent / 100)")
+        if any(dest == "trim_min_rise" for dest, _ in given):
+            # --trim-min-rise's unit, from its grid definition (TRIM_PRICE_RISE_STEP_CENTS)
+            message += (" (--trim-min-rise takes whole cents, a multiple of "
+                        f"{TRIM_PRICE_RISE_STEP_CENTS} from {TRIM_PRICE_RISE_STEP_CENTS} to "
+                        "100, read as that many cents / 100 dollars)")
         if ("categories" in overrides and "tags" not in overrides
                 and _saved_tag_loses_its_category(reference, overrides["categories"])):
             # The tag LiveSettings names is a saved one, which no flag of this run shows
@@ -2110,7 +2137,7 @@ def _build_parser() -> argparse.ArgumentParser:
     live = parser.add_argument_group(
         "live trading toggles",
         "Override one live default for THIS run only, in either mode "
-        "(adding to held pairs and selling: production runs only). The live "
+        "(adding to held pairs, selling and trimming: production runs only). The live "
         "defaults are the ones saved through python3 -m kalshi_betting.defaults_server "
         "(live_defaults.json); a run refuses to start without them. The weekly scheduler "
         "passes none of these flags, so a scheduled run trades exactly the saved defaults.",
@@ -2180,6 +2207,29 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-sell-min-days", action="store_true", default=None,
         help="Set no minimum of days to maturity this run, whatever the saved live "
              "defaults say",
+    )
+    live.add_argument(
+        "--trim-to-kelly", action=argparse.BooleanOptionalAction, default=None,
+        help="Set the Kelly trim on for this run: selling part of an exact held pair "
+             "that has outgrown its Kelly size. --no-trim-to-kelly sets it off and "
+             "clears the saved minimum price rise too. The setting is checked and "
+             "shown on the run's settings line, and no run acts on it "
+             "(default: the saved live defaults)",
+    )
+    # The minimum's grid step in whole cents (TRIM_PRICE_RISE_STEP_CENTS)
+    rise_step = TRIM_PRICE_RISE_STEP_CENTS
+    trim_rise = live.add_mutually_exclusive_group()
+    trim_rise.add_argument(
+        "--trim-min-rise", type=int, default=None, metavar="CENTS",
+        help="The least rise, in whole cents, in a held pair's total price since the "
+             "last trade on it before the Kelly trim may sell part of it; a multiple "
+             f"of {rise_step} from {rise_step} to 100. Needs the Kelly trim on, saved "
+             "or given with --trim-to-kelly (default: the saved live defaults)",
+    )
+    trim_rise.add_argument(
+        "--no-trim-min-rise", action="store_true", default=None,
+        help="Set no minimum price rise for the Kelly trim this run, whatever the saved "
+             "live defaults say",
     )
     # Filed as the backtest dashboard files a trade (_filter_by_category)
     categories = live.add_mutually_exclusive_group()

@@ -350,7 +350,7 @@ class TestNoPairsMsg:
 @pytest.fixture
 def pinned_config_toggles(monkeypatch, _isolate_live_defaults):
     """
-    Pin the ten live toggles and save them as this test's live defaults.
+    Pin the twelve live toggles and save them as this test's live defaults.
 
     Through conftest's apply_pre_toggle_defaults, the one definition of their
     values, then save_config_live_defaults into the test's own path (requested
@@ -501,6 +501,7 @@ class TestLiveSettingsFlags:
         (["--sell-at", "85"], "sell_at", 0.85),
         (["--sell-at", "1"], "sell_at", 0.01),
         (["--sell-at", "100"], "sell_at", 1.0),
+        (["--trim-to-kelly"], "trim_to_kelly", True),
     ])
     def test_each_flag_overrides_only_its_own_field(self, monkeypatch, mode, argv, field, value):
         seen = _main_with(monkeypatch, ["--mode", mode, *argv])
@@ -646,6 +647,145 @@ class TestLiveSettingsFlags:
         assert "not allowed with argument" in err, err
         for word in words:
             assert word in err, (word, err)
+
+    @pytest.mark.parametrize("mode", ["dev", "prod"])
+    @pytest.mark.parametrize("argv, saved, expected", [
+        # The switch alone, over nothing saved and over a saved on
+        (["--trim-to-kelly"], {}, {"trim_to_kelly": True}),
+        (["--trim-to-kelly"], {"trim_to_kelly": True}, {"trim_to_kelly": True}),
+        # The switch keeps a saved minimum; a minimum keeps the saved switch
+        (["--trim-to-kelly"], {"trim_to_kelly": True, "trim_min_rise": 0.25},
+         {"trim_to_kelly": True, "trim_min_rise": 0.25}),
+        (["--trim-min-rise", "10"], {"trim_to_kelly": True},
+         {"trim_to_kelly": True, "trim_min_rise": 0.10}),
+        (["--trim-min-rise", "10"], {"trim_to_kelly": True, "trim_min_rise": 0.25},
+         {"trim_to_kelly": True, "trim_min_rise": 0.10}),
+        # Both given, over nothing saved; whole cents read as dollars
+        (["--trim-to-kelly", "--trim-min-rise", "10"], {},
+         {"trim_to_kelly": True, "trim_min_rise": 0.10}),
+        (["--trim-to-kelly", "--trim-min-rise", "5"], {},
+         {"trim_to_kelly": True, "trim_min_rise": 0.05}),
+        (["--trim-to-kelly", "--trim-min-rise", "15"], {},
+         {"trim_to_kelly": True, "trim_min_rise": 0.15}),
+        (["--trim-to-kelly", "--trim-min-rise", "100"], {},
+         {"trim_to_kelly": True, "trim_min_rise": 1.0}),
+        # --no-trim-min-rise keeps the switch; --no-trim-to-kelly clears both
+        (["--no-trim-min-rise"], {"trim_to_kelly": True, "trim_min_rise": 0.25},
+         {"trim_to_kelly": True}),
+        (["--no-trim-to-kelly"], {"trim_to_kelly": True, "trim_min_rise": 0.25}, {}),
+        (["--no-trim-to-kelly"], {"trim_to_kelly": True}, {}),
+        (["--no-trim-to-kelly", "--no-trim-min-rise"],
+         {"trim_to_kelly": True, "trim_min_rise": 0.25}, {}),
+        # ... and with nothing saved they change nothing
+        (["--no-trim-to-kelly"], {}, {}),
+        (["--no-trim-min-rise"], {}, {}),
+    ])
+    def test_the_trim_flags_lay_over_the_saved_switch_and_minimum(
+        self, monkeypatch, mode, argv, saved, expected,
+    ):
+        _save_live_defaults(**saved)
+        seen = _main_with(monkeypatch, ["--mode", mode, *argv])
+        assert seen["code"] == EXIT_OK and seen["mode"] == mode
+        settings, reference = seen["settings"], seen["reference"]
+        assert (reference.trim_to_kelly, reference.trim_min_rise) == (
+            saved.get("trim_to_kelly", False), saved.get("trim_min_rise"))
+        assert (settings.trim_to_kelly, settings.trim_min_rise) == (
+            expected.get("trim_to_kelly", False), expected.get("trim_min_rise"))
+        # Nothing but the two trim settings moved
+        for other in config.LIVE_TOGGLE_FIELDS:
+            if other not in ("trim_to_kelly", "trim_min_rise"):
+                assert getattr(settings, other) == getattr(reference, other), other
+
+    def test_no_trim_to_kelly_turns_a_saved_on_off_for_one_run_and_marks_it(self, monkeypatch):
+        _save_live_defaults(trim_to_kelly=True, trim_min_rise=0.10)
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-trim-to-kelly"])
+        assert seen["settings"] == dataclasses.replace(
+            seen["reference"], trim_to_kelly=False, trim_min_rise=None)
+        line = describe_live_settings(seen["settings"], seen["reference"])
+        assert "trim to Kelly off (default: on)" in line
+        assert "min price rise any (default: 10c)" in line
+        assert line.count("(default:") == 2
+        # No flag keeps the saved switch and minimum
+        kept = _main_with(monkeypatch, ["--mode", "prod"])["settings"]
+        assert (kept.trim_to_kelly, kept.trim_min_rise) == (True, 0.10)
+
+    @pytest.mark.parametrize("argv, saved, words", [
+        # A minimum needs trimming on: none saved, none given, or
+        # --no-trim-to-kelly turning it off
+        (["--trim-min-rise", "10"], {},
+         ["(--trim-min-rise):", "trim_min_rise needs trim_to_kelly on"]),
+        (["--no-trim-to-kelly", "--trim-min-rise", "10"], {"trim_to_kelly": True},
+         ["(--trim-to-kelly/--no-trim-to-kelly, --trim-min-rise):",
+          "trim_min_rise needs trim_to_kelly on"]),
+        (["--no-trim-to-kelly", "--trim-min-rise", "10"],
+         {"trim_to_kelly": True, "trim_min_rise": 0.25},
+         ["trim_min_rise needs trim_to_kelly on"]),
+        # A minimum off the 5c grid, or outside 5c to $1
+        (["--trim-to-kelly", "--trim-min-rise", "7"], {},
+         ["--trim-min-rise", "trim_min_rise must be a multiple of 5c from 5c to $1"]),
+        (["--trim-to-kelly", "--trim-min-rise", "0"], {},
+         ["--trim-min-rise", "trim_min_rise must be a multiple of 5c from 5c to $1"]),
+        (["--trim-to-kelly", "--trim-min-rise", "105"], {},
+         ["--trim-min-rise", "trim_min_rise must be a multiple of 5c from 5c to $1"]),
+        (["--trim-min-rise", "-5"], {"trim_to_kelly": True},
+         ["--trim-min-rise", "trim_min_rise must be a multiple of 5c from 5c to $1"]),
+        (["--trim-min-rise", "1"], {"trim_to_kelly": True},
+         ["--trim-min-rise", "trim_min_rise must be a multiple of 5c from 5c to $1"]),
+    ])
+    def test_a_trim_flag_the_settings_refuse_is_a_usage_error(
+        self, monkeypatch, capsys, argv, saved, words,
+    ):
+        _save_live_defaults(**saved)
+        seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
+        assert seen["code"] == 2
+        # Refused before logging, the client and either run mode
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "settings" not in seen
+        err = capsys.readouterr().err
+        for word in words:
+            assert word in err, (word, err)
+
+    def test_a_minimum_rise_flag_names_its_own_unit(self, monkeypatch, capsys):
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--trim-to-kelly",
+                                        "--trim-min-rise", "7"])
+        assert seen["code"] == 2
+        err = " ".join(capsys.readouterr().err.split())
+        step = config.TRIM_PRICE_RISE_STEP_CENTS
+        assert (f"(--trim-min-rise takes whole cents, a multiple of {step} from {step} to "
+                "100, read as that many cents / 100 dollars)") in err, err
+        # It is no percent: the cap flags' and the sell level's notes are not borrowed
+        assert "whole percent" not in err, err
+        # ... and the switch alone, which takes no number, says nothing about cents
+        _save_live_defaults(trim_to_kelly=True, trim_min_rise=0.25)
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--no-trim-to-kelly",
+                                        "--spread-max", "0"])
+        assert seen["code"] == 2
+        assert "whole cents" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize("argv", [
+        ["--trim-min-rise", "12.5"], ["--trim-min-rise", "0.1"], ["--trim-min-rise", "ten"],
+        ["--trim-min-rise", "10c"],
+    ])
+    def test_a_fractional_or_non_numeric_minimum_rise_is_a_usage_error(
+        self, monkeypatch, capsys, argv,
+    ):
+        # argparse's own int check: whole cents only, so 0.1 (dollars) is never
+        # read as a tenth of a cent
+        _save_live_defaults(trim_to_kelly=True)
+        seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        assert "invalid int value" in capsys.readouterr().err
+
+    def test_a_minimum_rise_and_its_off_twin_are_mutually_exclusive(self, monkeypatch, capsys):
+        _save_live_defaults(trim_to_kelly=True)
+        seen = _main_with(monkeypatch, ["--mode", "prod", "--trim-min-rise", "10",
+                                        "--no-trim-min-rise"])
+        assert seen["code"] == 2
+        assert not seen["logging_set_up"] and not seen["client_built"]
+        err = capsys.readouterr().err
+        assert "not allowed with argument" in err, err
+        assert "--trim-min-rise" in err and "--no-trim-min-rise" in err
 
     def test_no_flag_hands_the_run_the_saved_defaults_themselves(self, monkeypatch):
         # The scheduler's exact argv (tests/test_scheduler.py pins it)
@@ -940,11 +1080,13 @@ class TestLiveSettingsFlags:
                      "--interval-discount", "--size-cap", "--same-title-size-cap",
                      "--add-to-held-pairs", "--no-add-to-held-pairs",
                      "--sell-at", "--no-sell", "--sell-min-days", "--no-sell-min-days",
+                     "--trim-to-kelly", "--no-trim-to-kelly", "--trim-min-rise",
+                     "--no-trim-min-rise",
                      "--category", "--any-category", "--tag", "--any-tag"):
             assert flag in out, flag
         # Every value flag defaults to the saved live defaults, never a config.py constant
-        assert out.count("default: the saved live defaults") == 11
-        assert out.count("whatever the saved live defaults say") == 4
+        assert out.count("default: the saved live defaults") == 13
+        assert out.count("whatever the saved live defaults say") == 5
         # --category and --tag each replace the whole saved list, and say so
         assert "Replaces every saved category for this run" in out
         assert "Replaces every saved tag for this run" in out
@@ -954,7 +1096,7 @@ class TestLiveSettingsFlags:
         assert "config.TIME_SERIES" not in out and "config.TRADE" not in out
         assert "config.BUDGET_FRACTION" not in out and "config.SAME_TITLE" not in out
         assert ("Override one live default for THIS run only, in either mode "
-                "(adding to held pairs and selling: production runs only). The live "
+                "(adding to held pairs, selling and trimming: production runs only). The live "
                 "defaults are the ones saved through python3 -m "
                 "kalshi_betting.defaults_server (live_defaults.json); a run refuses to "
                 "start without them. The weekly scheduler passes none of these flags, so "
@@ -972,6 +1114,18 @@ class TestLiveSettingsFlags:
         assert "Sell nothing this run, whatever the saved live defaults say" in out
         assert "Sell a position only while at least N days (1 or more) remain" in out
         assert "config.SELL_AT" not in out and "config.SELL_MIN_DAYS" not in out
+        # The trim flags: the switch (which clears the saved minimum when off)
+        # and the minimum in whole cents on the 5c grid, with its off twin.
+        # argparse may wrap a flag's name at one of its hyphens, so the pinned
+        # words stop short of one
+        assert "sets it off and clears the saved minimum price rise too." in out
+        assert "checked and shown on the run's settings line, and no run acts on it" in out
+        step = config.TRIM_PRICE_RISE_STEP_CENTS
+        assert (f"a multiple of {step} from {step} to 100. Needs the Kelly trim on, saved or "
+                "given with") in out
+        assert ("Set no minimum price rise for the Kelly trim this run, whatever the saved "
+                "live defaults say") in out
+        assert "config.TRIM_TO_KELLY" not in out and "config.TRIM_MIN_RISE" not in out
         assert "live trading toggles" in out
 
     def test_the_echo_marks_exactly_the_departing_fields(self, monkeypatch):
@@ -1044,10 +1198,14 @@ class TestLogLiveSettings:
         "add_to_held_pairs": (["--add-to-held-pairs"], "add to held pairs on (default: off)"),
         "sell_at": (["--sell-at", "85"], "sell at 85% of potential profit (default: off)"),
         "sell_min_days": (["--sell-min-days", "3"], "min days to maturity 3 (default: any)"),
+        "trim_to_kelly": (["--trim-to-kelly"], "trim to Kelly on (default: off)"),
+        "trim_min_rise": (["--trim-min-rise", "10"], "min price rise 10c (default: any)"),
     }
     # What the saved defaults hold under a field's flag when the flag needs more
-    # than the pinned constants: a minimum of days needs a saved sell level
-    _SAVED_FOR_FIELD = {"sell_min_days": {"sell_at": 0.85}}
+    # than the pinned constants: a minimum of days needs a saved sell level,
+    # and a minimum price rise needs trimming saved on
+    _SAVED_FOR_FIELD = {"sell_min_days": {"sell_at": 0.85},
+                        "trim_min_rise": {"trim_to_kelly": True}}
 
     def test_every_field_has_a_departing_flag(self):
         # A new toggle needs a row, so its departure WARNING is tested
@@ -3098,7 +3256,8 @@ class TestLiveSettingsReachEverySite:
                              interval_discount=0.6, size_cap=0.35, same_title_size_cap=0.25,
                              categories=("economics", "POLITICS"),
                              tags=("Inflation", "elections"), add_to_held_pairs=True,
-                             sell_at=0.85, sell_min_days=3)
+                             sell_at=0.85, sell_min_days=3,
+                             trim_to_kelly=True, trim_min_rise=0.10)
 
     # The cached /series listing (SHARDAEVT and HELDAEVT unlisted: filed as Other)
     _LISTING = {
@@ -3322,13 +3481,13 @@ class TestLiveSettingsReachEverySite:
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 10
+        assert echo in caplog.text and echo.count("(config:") == 12
         assert "This PRODUCTION run overrides" not in caplog.text
         assert "one time-series pair may stake up to 35%" in caplog.text
         assert "one same-title pair may stake up to 25%" in caplog.text
         # The workbook's separator row carries the same marked line
         assert captured["run_note"] == f"settings: {describe_live_settings(settings, reference)}"
-        assert captured["run_note"].count("(config:") == 10
+        assert captured["run_note"].count("(config:") == 12
 
     def test_a_dev_run_handed_its_settings_reads_them_at_every_site(self, monkeypatch, caplog):
         settings, reference, calls, captured = self._run_under_the_tripwire(
@@ -3348,9 +3507,53 @@ class TestLiveSettingsReachEverySite:
         assert ("Time-series entry rule: "
                 + config.describe_time_series_rule(False, (0.05, 0.9))) in caplog.text
         echo = f"Live settings: {describe_live_settings(settings, reference)}"
-        assert echo in caplog.text and echo.count("(config:") == 10
+        assert echo in caplog.text and echo.count("(config:") == 12
         # Dev never submits an order, so never the production WARNING
         assert "This PRODUCTION run overrides" not in caplog.text
+
+    @pytest.mark.parametrize("mode", ["prod", "dev"])
+    def test_the_trim_settings_move_a_run_s_settings_texts_and_nothing_else(
+        self, monkeypatch, caplog, mode,
+    ):
+        # No run mode acts on trim_to_kelly or trim_min_rise: the same run
+        # with trimming on (and a minimum) and with both off finds, sizes and
+        # simulates the same trades and logs the same lines, but for the line
+        # and the trade-log note that name the settings
+        reference = live_settings()
+        on = self._SETTINGS
+        off = dataclasses.replace(on, trim_to_kelly=False, trim_min_rise=None)
+        assert (on.trim_to_kelly, on.trim_min_rise) == (True, 0.10)
+        seen: dict = {}
+        for name, settings in (("on", on), ("off", off)):
+            caplog.clear()
+            # A patcher of its own per run, undone before the next one
+            with monkeypatch.context() as patcher:
+                _, _, _, captured = self._run_under_the_tripwire(
+                    patcher, caplog, mode, settings=settings, reference=reference)
+            trades = [(r.status, r.spec.pair.pair_type, r.spec.pair.market_a.ticker,
+                       r.spec.pair.market_b.ticker, r.spec.x, r.spec.y,
+                       r.spec.total_cost_with_fees, r.spec.kelly_fraction)
+                      for r in captured["results"]]
+            # The line that names every setting; the rule warnings, which
+            # start "Live settings:" too, are among the other lines
+            echo = "Live settings: tier floors"
+            settings_lines = [r.getMessage() for r in caplog.records
+                              if r.getMessage().startswith(echo)]
+            other_lines = [(r.levelno, r.getMessage()) for r in caplog.records
+                           if not r.getMessage().startswith(echo)]
+            seen[name] = (trades, other_lines, settings_lines, captured.get("run_note"))
+        assert seen["on"][0] == seen["off"][0] and len(seen["on"][0]) == 2
+        assert seen["on"][1] == seen["off"][1] and seen["on"][1]
+        # The settings line alone tells the two runs apart, in its last two fields
+        (line_on,), (line_off,) = seen["on"][2], seen["off"][2]
+        assert line_on.endswith("trim to Kelly on (config: off) | min price rise 10c "
+                                "(config: any)")
+        assert line_off.endswith("trim to Kelly off | min price rise any")
+        assert line_on.split(" | trim to Kelly ")[0] == line_off.split(" | trim to Kelly ")[0]
+        if mode == "prod":
+            # ... and so does the trade log's note, which is that line again
+            assert seen["on"][3] == line_on.replace("Live settings:", "settings:")
+            assert seen["off"][3] == line_off.replace("Live settings:", "settings:")
 
     def _saved_and_resolved(self) -> tuple[LiveSettings, LiveSettings]:
         """
@@ -8151,7 +8354,7 @@ class TestResultFile:
 
 def _other_toggles(target: LiveSettings) -> LiveSettings:
     """
-    Build live defaults that differ from target in every one of the ten toggles.
+    Build live defaults that differ from target in every one of the twelve toggles.
 
     Args:
         target (LiveSettings): The settings a run should trade.
@@ -8174,6 +8377,12 @@ def _other_toggles(target: LiveSettings) -> LiveSettings:
         # --no-sell-min-days to win over them
         sell_at=0.5 if target.sell_at != 0.5 else 0.6,
         sell_min_days=2 if target.sell_min_days != 2 else 3,
+        # Trimming with a minimum unless the target trims, so a target that
+        # trims nothing needs --no-trim-to-kelly and --no-trim-min-rise to win
+        # over them. A target that trims must name a minimum of its own: with
+        # trimming off these defaults can hold none to differ from it
+        trim_to_kelly=not target.trim_to_kelly,
+        trim_min_rise=None if target.trim_to_kelly else 0.25,
     )
     for name in config.LIVE_TOGGLE_FIELDS:
         assert getattr(other, name) != getattr(target, name), name
@@ -8220,6 +8429,19 @@ _ARGV_TARGETS = {
         tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
         size_cap=1.0, same_title_size_cap=0.2, add_to_held_pairs=True,
         sell_at=1.0, sell_min_days=1),
+    # Trimming on with a minimum price rise: the smallest step, a middle step
+    # (15c), and a whole dollar beside selling
+    "trimming-after-a-5c-rise": LiveSettings(
+        tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+        size_cap=0.1, same_title_size_cap=0.2, trim_to_kelly=True, trim_min_rise=0.05),
+    "trimming-after-a-15c-rise": LiveSettings(
+        tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75,
+        size_cap=0.2, same_title_size_cap=1.0, add_to_held_pairs=True,
+        trim_to_kelly=True, trim_min_rise=0.15),
+    "selling-and-trimming-after-a-dollar": LiveSettings(
+        tier_floors=False, spread_band=(0.0, 0.5), interval_discount=0.8,
+        size_cap=0.1, same_title_size_cap=0.2, sell_at=0.85, sell_min_days=7,
+        trim_to_kelly=True, trim_min_rise=1.0),
 }
 
 
@@ -8261,13 +8483,58 @@ class TestLiveSettingsArgv:
         else:
             assert args.sell_min_days == target.sell_min_days
             assert args.no_sell_min_days is None
+        # The trim settings are given either way too: the switch on or off,
+        # whole cents or --no-trim-min-rise
+        assert args.trim_to_kelly is target.trim_to_kelly
+        if target.trim_min_rise is None:
+            assert args.trim_min_rise is None and args.no_trim_min_rise is True
+        else:
+            assert args.trim_min_rise == round(target.trim_min_rise * 100)
+            assert args.no_trim_min_rise is None
 
     def test_the_seed_is_spelled_flag_by_flag(self):
         assert config.live_settings_argv(config.LIVE_DEFAULTS_SEED) == [
             "--no-tier-floors", "--spread-min=0.0", "--spread-max=0.5",
             "--interval-discount=0.8", "--size-cap=10", "--same-title-size-cap=20",
             "--add-to-held-pairs", "--no-sell", "--no-sell-min-days",
+            "--no-trim-to-kelly", "--no-trim-min-rise",
             "--any-category", "--any-tag"]
+
+    def test_trimming_is_spelled_as_a_switch_and_whole_cents(self):
+        argv = config.live_settings_argv(_ARGV_TARGETS["trimming-after-a-15c-rise"])
+        assert argv[argv.index("--no-sell-min-days"):][:3] == [
+            "--no-sell-min-days", "--trim-to-kelly", "--trim-min-rise=15"]
+        # Every step of the 5c grid is spelled as its exact whole cents (one
+        # step's dollars times 100 is not whole: 0.55 * 100 is
+        # 55.00000000000001) and reads back as the same minimum
+        assert [c for c in range(5, 101, 5) if c / 100 * 100 != c] == [55]
+        parser = main._build_parser()
+        for cents in range(5, 101, 5):
+            target = dataclasses.replace(_ARGV_TARGETS["seed"], trim_to_kelly=True,
+                                         trim_min_rise=cents / 100)
+            argv = config.live_settings_argv(target)
+            assert "--trim-to-kelly" in argv and f"--trim-min-rise={cents}" in argv
+            assert "--no-trim-to-kelly" not in argv and "--no-trim-min-rise" not in argv
+            args = parser.parse_args(["--mode", "prod", *argv])
+            assert args.trim_min_rise / 100 == target.trim_min_rise
+
+    def test_trimming_with_no_minimum_clears_a_saved_one(self):
+        # A target that trims with no minimum is spelled --trim-to-kelly
+        # --no-trim-min-rise, which has to win over a saved minimum (saved
+        # defaults that trim cannot differ from it in the switch, so this
+        # target is not among _ARGV_TARGETS)
+        target = dataclasses.replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True)
+        argv = config.live_settings_argv(target)
+        assert argv[argv.index("--trim-to-kelly"):][:2] == [
+            "--trim-to-kelly", "--no-trim-min-rise"]
+        saved = config.save_live_defaults(
+            dataclasses.replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True,
+                                trim_min_rise=0.25), source="")
+        parser = main._build_parser()
+        args = parser.parse_args(["--mode", "prod", *argv])
+        settings, reference = main._resolve_live_settings(args, parser)
+        assert settings == target and settings.trim_min_rise is None
+        assert reference == saved and reference.trim_min_rise == 0.25
 
     def test_selling_is_spelled_as_whole_percents_and_days(self):
         argv = config.live_settings_argv(_ARGV_TARGETS["selling-at-85-with-a-minimum"])

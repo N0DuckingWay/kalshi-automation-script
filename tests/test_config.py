@@ -72,15 +72,16 @@ from .conftest import apply_pre_toggle_defaults
 
 def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
               same_title_size_cap=1.0, categories=None, tags=None, add_to_held_pairs=False,
-              sell_at=None, sell_min_days=None):
+              sell_at=None, sell_min_days=None, trim_to_kelly=False, trim_min_rise=None):
     """A LiveSettings with every toggle named, defaulting to the pre-toggle
-    values conftest's apply_pre_toggle_defaults pins (and no selling)."""
+    values conftest's apply_pre_toggle_defaults pins (no selling, no trimming)."""
     return LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
                         interval_discount=interval_discount, size_cap=size_cap,
                         same_title_size_cap=same_title_size_cap,
                         categories=categories, tags=tags,
                         add_to_held_pairs=add_to_held_pairs,
-                        sell_at=sell_at, sell_min_days=sell_min_days)
+                        sell_at=sell_at, sell_min_days=sell_min_days,
+                        trim_to_kelly=trim_to_kelly, trim_min_rise=trim_min_rise)
 
 
 # An origin as read_saved_live_defaults writes it: any origin but config.py's
@@ -1081,6 +1082,110 @@ class TestLiveSettings:
         # A level without a minimum is fine
         assert dataclasses.replace(on, sell_min_days=None).sell_at == 0.85
 
+    @pytest.mark.parametrize("bad", [1, 0, None, "True", "on", 1.0])
+    def test_trim_to_kelly_must_be_exactly_a_bool(self, bad):
+        # A saved file's JSON 1 or "true" must never read as on
+        with pytest.raises(ValueError, match="trim_to_kelly must be True or False"):
+            _settings(trim_to_kelly=bad)
+        with pytest.raises(ValueError, match="trim_to_kelly must be True or False"):
+            dataclasses.replace(_settings(), trim_to_kelly=bad)
+
+    def test_trimming_defaults_to_off_with_no_minimum(self):
+        # A construction that names neither reads trimming as off (a saved
+        # file that leaves them out: TestSavedLiveDefaults)
+        s = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
+        assert s.trim_to_kelly is False and s.trim_min_rise is None
+        assert _settings().trim_to_kelly is False and _settings().trim_min_rise is None
+        on = _settings(trim_to_kelly=True)
+        assert on.trim_to_kelly is True and on.trim_min_rise is None
+        # None is a value, and replace takes both back
+        both = _settings(trim_to_kelly=True, trim_min_rise=0.10)
+        assert dataclasses.replace(both, trim_to_kelly=False, trim_min_rise=None) == _settings()
+
+    # 0.07 and 0.125 sit between two 5c steps; 1e-7 and 1e-6 round to zero
+    # steps (within PRICE_EPSILON of 0); 1.05 is one step past $1; 10 is ten
+    # dollars, not ten cents
+    @pytest.mark.parametrize("bad", [
+        0, 0.0, -0.05, 0.01, 0.07, 0.125, 0.049, 1.05, 1.01, 2, 10, 100, 1e-7, 1e-6,
+        float("nan"), float("inf"), float("-inf"), 1e308, 10 ** 400, True, False,
+        "0.10", "10c", [0.10], (0.10,)])
+    def test_trim_min_rise_off_the_5c_grid_or_out_of_range_is_refused(self, bad):
+        with pytest.raises(ValueError, match="trim_min_rise"):
+            _settings(trim_to_kelly=True, trim_min_rise=bad)
+        with pytest.raises(ValueError, match="trim_min_rise"):
+            dataclasses.replace(_settings(trim_to_kelly=True), trim_min_rise=bad)
+
+    def test_trim_min_rise_names_its_grid_or_its_type(self):
+        # A number off the grid names the grid; anything that is no number
+        # (a bool included) says a number of dollars is wanted
+        with pytest.raises(ValueError, match=re.escape(
+                "trim_min_rise must be a multiple of 5c from 5c to $1, got 0.07")):
+            _settings(trim_to_kelly=True, trim_min_rise=0.07)
+        for bad in (True, "0.10"):
+            with pytest.raises(ValueError, match=re.escape(
+                    f"trim_min_rise must be a number of dollars, got {bad!r}")):
+                _settings(trim_to_kelly=True, trim_min_rise=bad)
+
+    def test_trim_min_rise_on_the_grid_is_accepted_as_a_float(self):
+        # Every 5c step from 5c to $1, as its cents over 100
+        step = config.TRIM_PRICE_RISE_STEP_CENTS
+        assert step == 5
+        for cents in range(step, 101, step):
+            s = _settings(trim_to_kelly=True, trim_min_rise=cents / 100)
+            assert s.trim_min_rise == cents / 100 and type(s.trim_min_rise) is float
+        # A whole dollar given as an int reads as the float 1.0
+        one = _settings(trim_to_kelly=True, trim_min_rise=1)
+        assert one.trim_min_rise == 1.0 and type(one.trim_min_rise) is float
+
+    def test_trim_min_rise_is_normalised_onto_the_grid(self):
+        # 0.05 * 3 is 0.15000000000000002; a minimum from any source is
+        # float-equal to its cents over 100, which is how the dashboard's
+        # Min. price rise options (TRIM_MIN_PRICE_RISES) spell them
+        assert 0.05 * 3 != 0.15
+        assert _settings(trim_to_kelly=True, trim_min_rise=0.05 * 3).trim_min_rise == 0.15
+        for steps in range(1, 21):
+            assert _settings(trim_to_kelly=True,
+                             trim_min_rise=0.05 * steps).trim_min_rise == steps * 5 / 100
+        for rise in config.TRIM_MIN_PRICE_RISES:
+            assert _settings(trim_to_kelly=True, trim_min_rise=rise).trim_min_rise == rise
+        # Float noise well inside PRICE_EPSILON snaps to the step
+        assert _settings(trim_to_kelly=True, trim_min_rise=0.1 + 1e-9).trim_min_rise == 0.1
+
+    def test_trim_min_rise_with_trimming_off_is_refused(self):
+        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly on"):
+            _settings(trim_min_rise=0.10)
+        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly on"):
+            _settings(trim_to_kelly=False, trim_min_rise=0.10)
+        # replace re-validates: turning trimming off under a minimum is refused too
+        on = _settings(trim_to_kelly=True, trim_min_rise=0.10)
+        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly on"):
+            dataclasses.replace(on, trim_to_kelly=False)
+        # Trimming with no minimum is fine, and so is turning both off together
+        assert dataclasses.replace(on, trim_min_rise=None).trim_to_kelly is True
+        assert dataclasses.replace(on, trim_to_kelly=False, trim_min_rise=None) == _settings()
+
+    def test_a_bad_minimum_is_named_before_the_switch_it_needs(self):
+        # Off the grid with trimming off: the value itself is refused first,
+        # so the message never asks for trimming to hold a minimum that is no minimum
+        with pytest.raises(ValueError, match="multiple of 5c"):
+            _settings(trim_min_rise=0.07)
+
+    @pytest.mark.parametrize("doc, stale", [
+        ("README.md", "since live trading has no such setting"),
+        ("CLAUDE.md", "there is no live setting to save it as"),
+        ("CLAUDE.md", "What is missing: a toggle on `LiveSettings`"),
+        ("CLAUDE.md", "missing for the minimum: a `trim_min_rise` setting on `LiveSettings`"),
+    ])
+    def test_the_docs_do_not_say_live_has_no_trim_setting(self, doc, stale):
+        # trim_to_kelly and trim_min_rise are live settings (saved, shown and
+        # passed as flags), so neither document may say live trading has no
+        # setting for trimming or for its minimum price rise
+        assert {"trim_to_kelly", "trim_min_rise"} <= set(config.LIVE_TOGGLE_FIELDS)
+        text = (pathlib.Path(__file__).resolve().parent.parent / doc).read_text(
+            encoding="utf-8")
+        # Whitespace is collapsed, so a sentence wrapped over two lines is still read
+        assert stale not in " ".join(text.split())
+
     def test_every_optional_toggle_is_a_field_with_a_default_at_the_end(self):
         # A toggle a saved file may leave out must have a default to read as,
         # and sit after every required toggle, so a positional construction
@@ -1172,10 +1277,13 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "ADD_TO_HELD_PAIRS", not config.ADD_TO_HELD_PAIRS)
         monkeypatch.setattr(config, "SELL_AT", 0.85)
         monkeypatch.setattr(config, "SELL_MIN_DAYS", 3)
+        monkeypatch.setattr(config, "TRIM_TO_KELLY", not config.TRIM_TO_KELLY)
+        monkeypatch.setattr(config, "TRIM_MIN_RISE", 0.10)
         expected = _settings(True, (0.1, 0.6), 0.6, 0.35, 0.25,
                              ("Economics",), ("Oil & Gas",),
                              add_to_held_pairs=not shipped.add_to_held_pairs,
-                             sell_at=0.85, sell_min_days=3)
+                             sell_at=0.85, sell_min_days=3,
+                             trim_to_kelly=True, trim_min_rise=0.10)
         assert live_settings() == expected
         assert all(getattr(expected, name) != getattr(shipped, name)
                    for name in config.LIVE_TOGGLE_FIELDS)
@@ -1203,8 +1311,11 @@ class TestLiveSettings:
             add_to_held_pairs=config.ADD_TO_HELD_PAIRS,
             sell_at=config.SELL_AT,
             sell_min_days=config.SELL_MIN_DAYS,
+            trim_to_kelly=config.TRIM_TO_KELLY,
+            trim_min_rise=config.TRIM_MIN_RISE,
         )
         assert type(s.tier_floors) is bool and type(s.add_to_held_pairs) is bool
+        assert type(s.trim_to_kelly) is bool
 
     def test_live_settings_refuses_an_invalid_sell_constant(self, monkeypatch):
         monkeypatch.setattr(config, "SELL_AT", 0.855)
@@ -1213,6 +1324,20 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "SELL_AT", None)
         monkeypatch.setattr(config, "SELL_MIN_DAYS", 3)
         with pytest.raises(ValueError, match="sell_min_days needs a sell level"):
+            live_settings()
+
+    def test_live_settings_refuses_an_invalid_trim_constant(self, monkeypatch):
+        monkeypatch.setattr(config, "TRIM_TO_KELLY", 1)
+        with pytest.raises(ValueError, match="trim_to_kelly"):
+            live_settings()
+        # A minimum off the 5c grid, then one with trimming off
+        monkeypatch.setattr(config, "TRIM_TO_KELLY", True)
+        monkeypatch.setattr(config, "TRIM_MIN_RISE", 0.07)
+        with pytest.raises(ValueError, match="trim_min_rise must be a multiple of 5c"):
+            live_settings()
+        monkeypatch.setattr(config, "TRIM_TO_KELLY", False)
+        monkeypatch.setattr(config, "TRIM_MIN_RISE", 0.10)
+        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly on"):
             live_settings()
 
     @pytest.mark.parametrize("cap", [0, 0.37, 1.01, float("nan"), True, "0.2", None, 1e-7])
@@ -1262,11 +1387,13 @@ class TestLiveSettings:
         assert s.categories is None and s.tags is None
         assert s.add_to_held_pairs is False
         assert s.sell_at is None and s.sell_min_days is None
+        assert s.trim_to_kelly is False and s.trim_min_rise is None
         # Defaulted and last of the toggles: the first five fields keep their
         # positions, so a positional construction of up to nine still builds;
         # origin, not a toggle, comes after them
-        assert list(config.LIVE_TOGGLE_FIELDS)[-5:] == [
-            "categories", "tags", "add_to_held_pairs", "sell_at", "sell_min_days"]
+        assert list(config.LIVE_TOGGLE_FIELDS)[-7:] == [
+            "categories", "tags", "add_to_held_pairs", "sell_at", "sell_min_days",
+            "trim_to_kelly", "trim_min_rise"]
         assert [f.name for f in dataclasses.fields(LiveSettings)][-1] == "origin"
         assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, ("Sports",),
                             ("Hockey",)).tags == ("Hockey",)
@@ -2819,7 +2946,8 @@ class TestDescribeLiveSettings:
         assert config.describe_live_settings(s, s) == (
             "tier floors on | spread band none | k 0.75 | per-trade cap 20% | "
             "same-title cap 100% (no extra cap) | categories any | tags any | "
-            "add to held pairs off | sell at off | min days to maturity any")
+            "add to held pairs off | sell at off | min days to maturity any | "
+            "trim to Kelly off | min price rise any")
         assert config.describe_live_settings(s) == config.describe_live_settings(s, s)
 
     def test_the_shipped_values_render_with_no_mark(self):
@@ -2828,10 +2956,11 @@ class TestDescribeLiveSettings:
 
     # One departing value per live toggle (config.LIVE_TOGGLE_FIELDS) and the
     # mark it must carry; a new toggle fails test_every_field_has_a_departure_row
-    # until it has a row. Each departs from _REFERENCE, which sells at 85%: a
-    # minimum of days has no meaning without a level, and the level's own
-    # departure is to selling nothing
-    _REFERENCE = _settings(sell_at=0.85)
+    # until it has a row. Each departs from _REFERENCE, which sells at 85% and
+    # trims to Kelly: a minimum of days has no meaning without a level, nor a
+    # minimum price rise without trimming, so the level's own departure is to
+    # selling nothing and the trim switch's is to off
+    _REFERENCE = _settings(sell_at=0.85, trim_to_kelly=True)
     _DEPARTURES = {
         "tier_floors": (False, "tier floors off (config: on)"),
         "spread_band": ((0.1, 1.0), "spread band 0.1-1 (config: none)"),
@@ -2843,6 +2972,8 @@ class TestDescribeLiveSettings:
         "add_to_held_pairs": (True, "add to held pairs on (config: off)"),
         "sell_at": (None, "sell at off (config: 85% of potential profit)"),
         "sell_min_days": (3, "min days to maturity 3 (config: any)"),
+        "trim_to_kelly": (False, "trim to Kelly off (config: on)"),
+        "trim_min_rise": (0.10, "min price rise 10c (config: any)"),
     }
 
     def test_every_field_has_a_departure_row(self):
@@ -2855,13 +2986,40 @@ class TestDescribeLiveSettings:
             "tier floors off (config: on) | spread band 0-0.5 (config: none) | "
             "k 0.8 (config: 0.75) | per-trade cap 100% (no cap) (config: 20%) | "
             "same-title cap 20% (config: 100% (no extra cap)) | categories any | tags any | "
-            "add to held pairs off | sell at off | min days to maturity any")
+            "add to held pairs off | sell at off | min days to maturity any | "
+            "trim to Kelly off | min price rise any")
         for name in config.LIVE_TOGGLE_FIELDS:
             value, mark = self._DEPARTURES[name]
             line = config.describe_live_settings(
                 dataclasses.replace(self._REFERENCE, **{name: value}), self._REFERENCE)
             assert line.count("(config:") == 1, line
             assert mark in line, (name, line)
+
+    def test_trimming_renders_on_or_off_and_the_rise_in_whole_cents(self):
+        # Off with no minimum, on with none, then every 5c step as its whole
+        # cents. One step's dollars times 100 is not whole (0.55 * 100 is
+        # 55.00000000000001), so each must print as its exact cents
+        assert [c for c in range(5, 101, 5) if c / 100 * 100 != c] == [55]
+        assert config.describe_live_settings(_settings()).endswith(
+            "trim to Kelly off | min price rise any")
+        assert config.describe_live_settings(_settings(trim_to_kelly=True)).endswith(
+            "trim to Kelly on | min price rise any")
+        for cents in range(5, 101, 5):
+            line = config.describe_live_settings(
+                _settings(trim_to_kelly=True, trim_min_rise=cents / 100))
+            assert line.endswith(f"trim to Kelly on | min price rise {cents}c"), (cents, line)
+        # Turning a minimum on over trimming with none marks that one field
+        ref = _settings(trim_to_kelly=True)
+        line = config.describe_live_settings(
+            _settings(trim_to_kelly=True, trim_min_rise=0.25), ref)
+        assert line.endswith("trim to Kelly on | min price rise 25c (config: any)")
+        assert line.count("(config:") == 1
+        # Turning trimming on with a minimum, over trimming off, marks both
+        line = config.describe_live_settings(
+            _settings(trim_to_kelly=True, trim_min_rise=0.10), _settings())
+        assert line.endswith(
+            "trim to Kelly on (config: off) | min price rise 10c (config: any)")
+        assert line.count("(config:") == 2
 
     def test_selling_renders_the_exact_whole_percent(self):
         # Off, then each level of the 1% grid as its whole percent: 0.29 * 100
@@ -2871,7 +3029,8 @@ class TestDescribeLiveSettings:
             line = config.describe_live_settings(_settings(sell_at=percent / 100))
             assert f"sell at {percent}% of potential profit |" in line, (percent, line)
         line = config.describe_live_settings(_settings(sell_at=0.85, sell_min_days=7))
-        assert line.endswith("sell at 85% of potential profit | min days to maturity 7")
+        assert line.endswith("sell at 85% of potential profit | min days to maturity 7 | "
+                             "trim to Kelly off | min price rise any")
 
     def test_k_renders_exactly(self):
         # 0.751 and 0.75 must never print alike: a departure would read as none
@@ -2892,7 +3051,8 @@ class TestDescribeLiveSettings:
         assert line == ("tier floors off | spread band 0-0.5 | k 0.8 | "
                         "per-trade cap 100% (no cap) | same-title cap 20% | "
                         "categories any | tags any | add to held pairs off | "
-                        "sell at off | min days to maturity any")
+                        "sell at off | min days to maturity any | "
+                        "trim to Kelly off | min price rise any")
 
     def test_a_filter_renders_its_names_and_any_for_none(self):
         # Each field renders the run's value, then config's in the mark; None is "any"
@@ -2932,7 +3092,8 @@ class TestDescribeLiveSettings:
             "tier floors off (default: on) | spread band 0-0.5 (default: none) | "
             "k 0.8 (default: 0.75) | per-trade cap 100% (no cap) (default: 20%) | "
             "same-title cap 20% (default: 100% (no extra cap)) | categories any | tags any | "
-            "add to held pairs off | sell at off | min days to maturity any")
+            "add to held pairs off | sell at off | min days to maturity any | "
+            "trim to Kelly off | min price rise any")
         assert "(config:" not in line
         # Every field's mark follows the reference's origin, one mark per departure
         saved = dataclasses.replace(self._REFERENCE, origin=_SAVED_ORIGIN)
@@ -3090,10 +3251,15 @@ class TestShippedLiveToggles:
         assert (config.TIME_SERIES_TIER_FLOORS, config.TIME_SERIES_SPREAD_BAND,
                 config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.BUDGET_FRACTION,
                 config.SAME_TITLE_SIZE_CAP, config.TRADE_CATEGORIES, config.TRADE_TAGS,
-                config.ADD_TO_HELD_PAIRS, config.SELL_AT, config.SELL_MIN_DAYS) == (
-            False, (0.0, 0.5), 0.80, 1.0, 0.20, None, None, True, None, None)
+                config.ADD_TO_HELD_PAIRS, config.SELL_AT, config.SELL_MIN_DAYS,
+                config.TRIM_TO_KELLY, config.TRIM_MIN_RISE) == (
+            False, (0.0, 0.5), 0.80, 1.0, 0.20, None, None, True, None, None, False, None)
         # ... and the seed proposes adding to held pairs too
         assert config.LIVE_DEFAULTS_SEED.add_to_held_pairs is True
+        # Trimming ships off, with no minimum price rise, in config.py and the seed
+        assert (self._SHIPPED.trim_to_kelly, self._SHIPPED.trim_min_rise) == (False, None)
+        assert (config.LIVE_DEFAULTS_SEED.trim_to_kelly,
+                config.LIVE_DEFAULTS_SEED.trim_min_rise) == (False, None)
 
     def test_the_finder_admits_any_positive_spread_up_to_the_ceiling(self, caplog):
         # 0.10 at 10 days and 0.20 at 20 days sit under their tiers and are
@@ -3238,7 +3404,8 @@ class TestPreToggleDefaults:
     _TOGGLES = frozenset({
         "TIME_SERIES_TIER_FLOORS", "TIME_SERIES_SPREAD_BAND",
         "TIME_SERIES_INTERVAL_PROB_DISCOUNT", "BUDGET_FRACTION", "SAME_TITLE_SIZE_CAP",
-        "TRADE_CATEGORIES", "TRADE_TAGS", "ADD_TO_HELD_PAIRS", "SELL_AT", "SELL_MIN_DAYS"})
+        "TRADE_CATEGORIES", "TRADE_TAGS", "ADD_TO_HELD_PAIRS", "SELL_AT", "SELL_MIN_DAYS",
+        "TRIM_TO_KELLY", "TRIM_MIN_RISE"})
 
     @classmethod
     def _by_value_binders(cls, directory: pathlib.Path) -> list[tuple[str, str, str]]:
@@ -3263,7 +3430,7 @@ class TestPreToggleDefaults:
         assert live_settings() == LiveSettings(
             tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
             same_title_size_cap=1.0, categories=None, tags=None, add_to_held_pairs=False,
-            sell_at=None, sell_min_days=None)
+            sell_at=None, sell_min_days=None, trim_to_kelly=False, trim_min_rise=None)
         for module, bound, toggle in binders:
             assert getattr(importlib.import_module(f"kalshi_betting.{module}"), bound) == (
                 getattr(config, toggle)), (module, toggle)
@@ -3449,17 +3616,45 @@ class TestLiveSettingsOrigin:
         assert dataclasses.replace(s, size_cap=0.35).origin == _SAVED_ORIGIN
         assert dataclasses.replace(s, categories=("Sports",)).origin == _SAVED_ORIGIN
 
-    def test_the_toggle_fields_are_the_ten(self):
+    def test_the_toggle_fields_are_the_twelve(self):
         assert config.LIVE_TOGGLE_FIELDS == (
             "tier_floors", "spread_band", "interval_discount", "size_cap",
             "same_title_size_cap", "categories", "tags", "add_to_held_pairs",
-            "sell_at", "sell_min_days")
-        # The three a saved file may leave out, in field order, at the end
-        assert config._OPTIONAL_TOGGLES == ("add_to_held_pairs", "sell_at", "sell_min_days")
+            "sell_at", "sell_min_days", "trim_to_kelly", "trim_min_rise")
+        assert len(config.LIVE_TOGGLE_FIELDS) == 12
+        # The five a saved file may leave out, in field order, at the end
+        assert config._OPTIONAL_TOGGLES == ("add_to_held_pairs", "sell_at", "sell_min_days",
+                                            "trim_to_kelly", "trim_min_rise")
         assert config._TOGGLE_DEFAULTS == {
-            "add_to_held_pairs": False, "sell_at": None, "sell_min_days": None}
+            "add_to_held_pairs": False, "sell_at": None, "sell_min_days": None,
+            "trim_to_kelly": False, "trim_min_rise": None}
         assert [f.name for f in dataclasses.fields(LiveSettings)] == [
             *config.LIVE_TOGGLE_FIELDS, "origin"]
+
+    def test_every_toggle_count_the_package_states_is_the_number_of_toggles(self):
+        # Wherever a module's comments, docstrings or messages count the toggles
+        # ("the twelve toggles", "twelve live toggles", "twelve toggle names"),
+        # the count is the number of toggle fields, or the number a saved file
+        # must hold (the optional ones may be left out). A comment's lines are
+        # joined first, so a count split over a line break is still read
+        names = ("one two three four five six seven eight nine ten eleven twelve "
+                 "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty").split()
+        total = len(config.LIVE_TOGGLE_FIELDS)
+        required = total - len(config._OPTIONAL_TOGGLES)
+        allowed = {names[total - 1], names[required - 1]}
+        # Counts below the required number ("these two toggles") name a few
+        # toggles, not all of them, and are left alone
+        counted = re.compile(r"\b(" + "|".join(names[required - 1:])
+                             + r")[\s-]+(?:live\s+)?toggles?\b", re.IGNORECASE)
+        stated: dict[str, set[str]] = {}
+        for path in sorted(pathlib.Path(config.__file__).parent.glob("*.py")):
+            source = re.sub(r"\n[ \t]*#[ \t]*", " ", path.read_text(encoding="utf-8"))
+            for match in counted.finditer(source):
+                stated.setdefault(match.group(1).lower(), set()).add(path.name)
+        # The scan reads the counts config.py and the defaults server state
+        assert {"config.py", "defaults_server.py"} <= stated.get(names[total - 1], set())
+        assert set(stated) <= allowed, {
+            word: sorted(files) for word, files in stated.items() if word not in allowed}
 
 
 class _FrozenDatetime(datetime):
@@ -3485,8 +3680,9 @@ def _valid_record(**changes) -> dict:
     Build a saved-defaults record the reader accepts, then apply changes.
 
     Its toggles are LIVE_DEFAULTS_SEED's, saved at 2026-09-27T21:05:13Z with
-    no source note, with add_to_held_pairs, sell_at and sell_min_days left out
-    (the seven-toggle shape), which reads as _SEED_ADD_ON_OFF.
+    no source note, with add_to_held_pairs, sell_at, sell_min_days,
+    trim_to_kelly and trim_min_rise left out (the seven-toggle shape), which
+    reads as _SEED_ADD_ON_OFF.
 
     Args:
         **changes: Top-level keys to replace; a value of _DROP removes the key.
@@ -3533,15 +3729,15 @@ def _with_toggles(**changes) -> dict:
 # Marks a key _valid_record / _with_toggles should remove
 _DROP = object()
 
-# LIVE_DEFAULTS_SEED with adding to held pairs off (and, as ever, no selling):
-# what _valid_record's seven-toggle file reads as, and what a save of it
-# writes as seven toggles
+# LIVE_DEFAULTS_SEED with adding to held pairs off (and, as ever, no selling
+# and no trimming): what _valid_record's seven-toggle file reads as, and what
+# a save of it writes as seven toggles
 _SEED_ADD_ON_OFF = dataclasses.replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False)
 
 # The exact bytes a save of _SEED_ADD_ON_OFF writes, with the seed's note, at
-# _FrozenDatetime's instant: add_to_held_pairs, sell_at and sell_min_days are
-# left out, so code that does not know those toggles can read a file saved
-# with them off
+# _FrozenDatetime's instant: add_to_held_pairs, sell_at, sell_min_days,
+# trim_to_kelly and trim_min_rise are left out, so code that does not know
+# those toggles can read a file saved with them off
 _SEVEN_TOGGLE_BYTES = (
     b'{\n'
     b'  "format": "live-defaults-v1",\n'
@@ -3683,6 +3879,69 @@ class TestSavedLiveDefaults:
         assert (saved.sell_at, saved.sell_min_days) == (0.9, 14)
         assert config.read_saved_live_defaults() == settings
 
+    def test_trimming_off_writes_exactly_the_bytes_written_before_it_existed(self, monkeypatch):
+        # trim_to_kelly and trim_min_rise at their defaults are not in the file
+        # at all, whether adding to held pairs is off or on: with adding off the
+        # file is byte for byte the seven-toggle one
+        monkeypatch.setattr(config, "datetime", _FrozenDatetime)
+        assert (_SEED_ADD_ON_OFF.trim_to_kelly, _SEED_ADD_ON_OFF.trim_min_rise) == (False, None)
+        config.save_live_defaults(
+            dataclasses.replace(_SEED_ADD_ON_OFF, trim_to_kelly=False, trim_min_rise=None),
+            source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES
+        for settings in (_SEED_ADD_ON_OFF, config.LIVE_DEFAULTS_SEED,
+                         dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85,
+                                             sell_min_days=3)):
+            config.save_live_defaults(settings, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+            assert b"trim" not in config.LIVE_DEFAULTS_FILE.read_bytes()
+        assert config.LIVE_DEFAULTS_FILE.read_bytes().endswith(
+            b'    "sell_at": 0.85,\n    "sell_min_days": 3\n  }\n}\n')
+
+    def test_a_trimming_save_writes_its_keys_last_in_field_order(self, monkeypatch):
+        monkeypatch.setattr(config, "datetime", _FrozenDatetime)
+        # The switch alone, with adding off: the one key, after the other seven
+        on = dataclasses.replace(_SEED_ADD_ON_OFF, trim_to_kelly=True)
+        config.save_live_defaults(on, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+            b'    "tags": null\n', b'    "tags": null,\n    "trim_to_kelly": true\n')
+        assert config.read_saved_live_defaults() == on
+        # With a minimum, after adding to held pairs and the two sell keys
+        everything = dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85,
+                                         sell_min_days=3, trim_to_kelly=True,
+                                         trim_min_rise=0.10)
+        config.save_live_defaults(everything, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+            b'    "tags": null\n',
+            b'    "tags": null,\n    "add_to_held_pairs": true,\n'
+            b'    "sell_at": 0.85,\n    "sell_min_days": 3,\n'
+            b'    "trim_to_kelly": true,\n    "trim_min_rise": 0.1\n')
+        assert config.read_saved_live_defaults() == everything
+        # Every 5c step round-trips as the same float
+        for cents in range(5, 101, 5):
+            wanted = dataclasses.replace(_SEED_ADD_ON_OFF, trim_to_kelly=True,
+                                         trim_min_rise=cents / 100)
+            assert config.save_live_defaults(wanted, source="") == wanted
+            assert config.read_saved_live_defaults().trim_min_rise == cents / 100
+
+    def test_a_save_round_trips_the_trim_settings(self):
+        settings = dataclasses.replace(self._SETTINGS, trim_to_kelly=True, trim_min_rise=0.25)
+        saved = config.save_live_defaults(settings, source="a note")
+        assert saved == settings
+        assert (saved.trim_to_kelly, saved.trim_min_rise) == (True, 0.25)
+        assert config.read_saved_live_defaults() == settings
+
+    def test_a_minimum_with_trimming_off_is_never_written(self):
+        # LiveSettings refuses the pair, so no such settings exist to save; a
+        # record that holds it is refused by the reader's own parse before
+        # anything replaces the file in place
+        config.save_live_defaults(config.LIVE_DEFAULTS_SEED, source="")
+        before = config.LIVE_DEFAULTS_FILE.read_bytes()
+        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly on"):
+            dataclasses.replace(config.LIVE_DEFAULTS_SEED, trim_min_rise=0.10)
+        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly on"):
+            config._settings_from_bytes(_text(_with_toggles(trim_min_rise=0.10)))
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+
     def test_a_seven_toggle_file_reads_with_add_on_off(self):
         # A file that leaves add_to_held_pairs out reads as the same
         # settings, adding to held pairs off (nobody confirmed a value for
@@ -3692,6 +3951,8 @@ class TestSavedLiveDefaults:
         assert saved == _SEED_ADD_ON_OFF and saved.add_to_held_pairs is False
         # ... and it reads selling off, the same way
         assert saved.sell_at is None and saved.sell_min_days is None
+        # ... and trimming off, with no minimum price rise
+        assert saved.trim_to_kelly is False and saved.trim_min_rise is None
         assert config.ADD_TO_HELD_PAIRS is True
         assert config.LIVE_DEFAULTS_SEED.add_to_held_pairs is True
         assert saved.origin == ("live_defaults.json, saved 2026-09-27T21:05:13Z from "
@@ -3711,6 +3972,38 @@ class TestSavedLiveDefaults:
         saved = config.read_saved_live_defaults()
         assert saved.sell_at is None and saved.sell_min_days is None
         assert config.SELL_AT is None and config.LIVE_DEFAULTS_SEED.sell_at is None
+
+    def test_a_file_that_leaves_trimming_out_reads_it_off(self):
+        # Neither key is there (a file saved before they existed), so nobody
+        # confirmed a value: never trimming, whatever config.py ships
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(
+            add_to_held_pairs=True, sell_at=0.85, sell_min_days=3)))
+        saved = config.read_saved_live_defaults()
+        assert saved.trim_to_kelly is False and saved.trim_min_rise is None
+        assert saved == dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85,
+                                            sell_min_days=3)
+
+    @pytest.mark.parametrize("changes, expected", [
+        ({"trim_to_kelly": False}, {}),
+        ({"trim_to_kelly": True}, {"trim_to_kelly": True}),
+        ({"trim_to_kelly": True, "trim_min_rise": 0.1},
+         {"trim_to_kelly": True, "trim_min_rise": 0.10}),
+        ({"trim_to_kelly": True, "trim_min_rise": 0.25},
+         {"trim_to_kelly": True, "trim_min_rise": 0.25}),
+        # A whole dollar written as the JSON integer 1
+        ({"trim_to_kelly": True, "trim_min_rise": 1},
+         {"trim_to_kelly": True, "trim_min_rise": 1.0}),
+        # Written as null by hand, the minimum reads as none, on or off
+        ({"trim_to_kelly": True, "trim_min_rise": None}, {"trim_to_kelly": True}),
+        ({"trim_to_kelly": False, "trim_min_rise": None}, {}),
+        ({"trim_min_rise": None}, {}),
+    ])
+    def test_a_file_naming_the_trim_settings_reads_them(self, changes, expected):
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(**changes)))
+        saved = config.read_saved_live_defaults()
+        assert saved == dataclasses.replace(_SEED_ADD_ON_OFF, **expected)
+        assert type(saved.trim_to_kelly) is bool
+        assert saved.trim_min_rise is None or type(saved.trim_min_rise) is float
 
     @pytest.mark.parametrize("changes, expected", [
         ({"sell_at": 0.85}, {"sell_at": 0.85}),
@@ -4010,6 +4303,30 @@ class TestSavedLiveDefaults:
         ("a sell minimum with no level", _text(_with_toggles(sell_min_days=3))),
         ("a sell minimum with a null level",
          _text(_with_toggles(sell_at=None, sell_min_days=3))),
+        # Trimming: the switch is true or false only, the minimum a number of
+        # dollars on the 5c grid from 5c to $1, and only with the switch on
+        ("trim to Kelly as 1", _text(_with_toggles(trim_to_kelly=1))),
+        ("trim to Kelly as a string", _text(_with_toggles(trim_to_kelly="true"))),
+        ("trim to Kelly as null", _text(_with_toggles(trim_to_kelly=None))),
+        ("a minimum rise of true", _text(_with_toggles(trim_to_kelly=True, trim_min_rise=True))),
+        ("a minimum rise of false",
+         _text(_with_toggles(trim_to_kelly=True, trim_min_rise=False))),
+        ("a minimum rise of zero", _text(_with_toggles(trim_to_kelly=True, trim_min_rise=0))),
+        ("a minimum rise above a dollar",
+         _text(_with_toggles(trim_to_kelly=True, trim_min_rise=1.05))),
+        ("a minimum rise in cents", _text(_with_toggles(trim_to_kelly=True, trim_min_rise=10))),
+        ("a minimum rise between two steps",
+         _text(_with_toggles(trim_to_kelly=True, trim_min_rise=0.07))),
+        ("a minimum rise as a string",
+         _text(_with_toggles(trim_to_kelly=True, trim_min_rise="0.10"))),
+        ("a minimum rise that is NaN",
+         _text(_with_toggles(trim_to_kelly=True, trim_min_rise=float("nan")))),
+        ("a minimum rise too large to count",
+         _text(_with_toggles(trim_to_kelly=True)).replace(
+             b'"trim_to_kelly": true', b'"trim_to_kelly": true, "trim_min_rise": 1' + b"0" * 400)),
+        ("a minimum rise with trimming left out", _text(_with_toggles(trim_min_rise=0.10))),
+        ("a minimum rise with trimming off",
+         _text(_with_toggles(trim_to_kelly=False, trim_min_rise=0.10))),
         # Category and tag names
         ("the name any", _text(_with_toggles(categories=["any"]))),
         ("an empty name", _text(_with_toggles(tags=[""]))),
@@ -4044,8 +4361,8 @@ class TestSavedLiveDefaults:
              '"spread_band" must be [floor, ceiling]'),
             (_text(_with_toggles(add_to_held_pairs=1)), "add_to_held_pairs must be True or False"),
             (_text(_with_toggles(tags=_DROP)),
-             "(add_to_held_pairs, sell_at, sell_min_days may be left out, and then each "
-             "reads as off)"),
+             "(add_to_held_pairs, sell_at, sell_min_days, trim_to_kelly, trim_min_rise may "
+             "be left out, and then each reads as off)"),
             (_text(_with_toggles(sell_at=True)), '"sell_at" must be a number or null'),
             (_text(_with_toggles(sell_at=0.85, sell_min_days=False)),
              '"sell_min_days" must be a number or null'),
@@ -4053,6 +4370,18 @@ class TestSavedLiveDefaults:
              "sell_min_days must be a whole number of days"),
             (_text(_with_toggles(sell_min_days=3)), "sell_min_days needs a sell level"),
             (_text(_with_toggles(sell_at=0.855)), "sell_at must be a multiple of 1%"),
+            (_text(_with_toggles(trim_to_kelly=1)), "trim_to_kelly must be True or False"),
+            (_text(_with_toggles(trim_to_kelly=True, trim_min_rise=True)),
+             '"trim_min_rise" must be a number or null'),
+            (_text(_with_toggles(trim_to_kelly=True, trim_min_rise=False)),
+             '"trim_min_rise" must be a number or null'),
+            (_text(_with_toggles(trim_to_kelly=True, trim_min_rise=0.07)),
+             "trim_min_rise must be a multiple of 5c from 5c to $1"),
+            (_text(_with_toggles(trim_to_kelly=True, trim_min_rise="0.10")),
+             "trim_min_rise must be a number of dollars"),
+            (_text(_with_toggles(trim_min_rise=0.10)), "trim_min_rise needs trim_to_kelly on"),
+            (_text(_with_toggles(trim_to_kelly=False, trim_min_rise=0.10)),
+             "trim_min_rise needs trim_to_kelly on"),
         ]:
             path.write_bytes(data)
             with pytest.raises(config.LiveDefaultsError, match=re.escape(words)):
@@ -4262,6 +4591,8 @@ class TestLiveSettingsChanges:
             ("add to held pairs", "off", "off", False),
             ("sell at", "off", "off", False),
             ("min days to maturity", "any", "any", False),
+            ("trim to Kelly", "off", "off", False),
+            ("min price rise", "any", "any", False),
         ]
 
     def test_changed_flags_exactly_the_fields_that_differ(self):
@@ -4281,10 +4612,11 @@ class TestLiveSettingsChanges:
 
     def test_no_current_defaults_changes_every_row(self):
         rows = config.live_settings_changes(None, config.LIVE_DEFAULTS_SEED)
-        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 10
+        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 12
         assert all(old == "—" and changed for _, old, _, changed in rows)
         assert [new for _, _, new, _ in rows] == [
-            "off", "0-0.5", "0.8", "10%", "20%", "any", "any", "on", "off", "any"]
+            "off", "0-0.5", "0.8", "10%", "20%", "any", "any", "on", "off", "any",
+            "off", "any"]
 
     def test_turning_selling_on_shows_as_the_two_sell_rows(self):
         on = dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3)
@@ -4297,6 +4629,23 @@ class TestLiveSettingsChanges:
         assert [row for row in rows if row[3]] == [
             ("sell at", "85% of potential profit", "off", True),
             ("min days to maturity", "3", "any", True)]
+
+    def test_turning_trimming_on_shows_as_the_two_trim_rows(self):
+        on = dataclasses.replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True,
+                                 trim_min_rise=0.10)
+        rows = config.live_settings_changes(config.LIVE_DEFAULTS_SEED, on)
+        assert [row for row in rows if row[3]] == [
+            ("trim to Kelly", "off", "on", True),
+            ("min price rise", "any", "10c", True)]
+        # ... and back off again
+        rows = config.live_settings_changes(on, config.LIVE_DEFAULTS_SEED)
+        assert [row for row in rows if row[3]] == [
+            ("trim to Kelly", "on", "off", True),
+            ("min price rise", "10c", "any", True)]
+        # Trimming on with no minimum changes the one row
+        plain = dataclasses.replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True)
+        rows = config.live_settings_changes(config.LIVE_DEFAULTS_SEED, plain)
+        assert [row for row in rows if row[3]] == [("trim to Kelly", "off", "on", True)]
 
     def test_a_seven_toggle_file_shows_turning_add_on_on_as_a_change(self):
         # A file that leaves the toggle out reads it as off; the seed proposes on

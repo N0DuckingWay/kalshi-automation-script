@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import logging
 import math
+import pathlib
 import pickle
 import random
 import re
@@ -14875,11 +14876,12 @@ class TestLiveRuleLine:
 
     @staticmethod
     def _live(monkeypatch, tier_floors, band, categories=None, tags=None, *,
-              add_to_held=False, sell_at=None, sell_min_days=None):
+              add_to_held=False, sell_at=None, sell_min_days=None,
+              trim_to_kelly=False, trim_min_rise=None):
         """Save config.py's toggles with this rule and filter as the live
-        defaults. Adding to held pairs and selling are saved off unless asked
-        for, so a line's note about either appears only in the tests that
-        name it."""
+        defaults. Adding to held pairs, selling and trimming to Kelly are
+        saved off unless asked for, so a line's note about any of them
+        appears only in the tests that name it."""
         from kalshi_betting import config
         monkeypatch.setattr(config, "TIME_SERIES_TIER_FLOORS", tier_floors)
         monkeypatch.setattr(config, "TIME_SERIES_SPREAD_BAND", band)
@@ -14888,6 +14890,8 @@ class TestLiveRuleLine:
         monkeypatch.setattr(config, "ADD_TO_HELD_PAIRS", add_to_held)
         monkeypatch.setattr(config, "SELL_AT", sell_at)
         monkeypatch.setattr(config, "SELL_MIN_DAYS", sell_min_days)
+        monkeypatch.setattr(config, "TRIM_TO_KELLY", trim_to_kelly)
+        monkeypatch.setattr(config, "TRIM_MIN_RISE", trim_min_rise)
         save_config_live_defaults()
         return config.describe_time_series_rule(tier_floors, band)
 
@@ -14929,11 +14933,11 @@ class TestLiveRuleLine:
         assert messages[-1].startswith(self._PREFIX)
         assert any(m.startswith("Size-cap sweep:") for m in messages[:-1])
 
-    # The eleven fields a saved-defaults read records, all or none
+    # The thirteen fields a saved-defaults read records, all or none
     _LIVE_FIELDS = ("live_tier_floors", "live_spread_band", "live_categories", "live_tags",
                     "live_origin", "live_interval_discount", "live_size_cap",
                     "live_same_title_size_cap", "live_add_to_held_pairs", "live_sell_at",
-                    "live_sell_min_days")
+                    "live_sell_min_days", "live_trim_to_kelly", "live_trim_min_rise")
 
     @pytest.mark.parametrize("feasible", [False, True])
     def test_a_refused_file_records_none_and_warns_once(self, monkeypatch, caplog, feasible):
@@ -14970,11 +14974,12 @@ class TestLiveRuleLine:
             "when this run started, and live runs refuse to start without them")
         assert bool(res.calibrations_by_band) is feasible
 
-    def test_the_eleven_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
+    def test_the_thirteen_fields_are_recorded_from_one_read(self, monkeypatch, caplog):
         from kalshi_betting import config
         saved = config.save_live_defaults(
             config.LiveSettings(False, (0.1, 0.8), 0.6, 0.35, 0.25, ("Economics",), ("Fed",),
-                                sell_at=0.85, sell_min_days=3),
+                                sell_at=0.85, sell_min_days=3,
+                                trim_to_kelly=True, trim_min_rise=0.10),
             source="a note")
         reads: list = []
         real = config.read_saved_live_defaults
@@ -14998,13 +15003,16 @@ class TestLiveRuleLine:
             "live_categories": ("Economics",), "live_tags": ("Fed",),
             "live_origin": saved.origin, "live_interval_discount": 0.6,
             "live_size_cap": 0.35, "live_same_title_size_cap": 0.25,
-            "live_add_to_held_pairs": False, "live_sell_at": 0.85, "live_sell_min_days": 3}
+            "live_add_to_held_pairs": False, "live_sell_at": 0.85, "live_sell_min_days": 3,
+            "live_trim_to_kelly": True, "live_trim_min_rise": 0.10}
 
-    def test_the_live_rule_fields_are_eleven_keys_or_none(self):
+    def test_the_live_rule_fields_are_thirteen_keys_or_none(self):
         from kalshi_betting import config
         assert backtester._live_rule_fields(None) == {}
         fields = backtester._live_rule_fields(config.LIVE_DEFAULTS_SEED)
-        assert tuple(fields) == self._LIVE_FIELDS
+        assert tuple(fields) == self._LIVE_FIELDS and len(fields) == 13
+        # Every one is a BacktestSweep field, so both constructions can spread them
+        assert set(fields) <= set(backtester.BacktestSweep.__dataclass_fields__)
         assert fields["live_origin"] == config.LIVE_DEFAULTS_SEED.origin
         assert fields["live_size_cap"] == 0.10
         # The seed proposes adding to held pairs on, and the field says so
@@ -15020,6 +15028,27 @@ class TestLiveRuleLine:
         level_only = backtester._live_rule_fields(dc_replace(
             config.LIVE_DEFAULTS_SEED, sell_at=0.85))
         assert (level_only["live_sell_at"], level_only["live_sell_min_days"]) == (0.85, None)
+        # The seed trims nothing; defaults that do record the switch and the minimum
+        assert fields["live_trim_to_kelly"] is False and fields["live_trim_min_rise"] is None
+        trimming = backtester._live_rule_fields(dc_replace(
+            config.LIVE_DEFAULTS_SEED, trim_to_kelly=True, trim_min_rise=0.10))
+        assert (trimming["live_trim_to_kelly"], trimming["live_trim_min_rise"]) == (True, 0.10)
+        switch_only = backtester._live_rule_fields(dc_replace(
+            config.LIVE_DEFAULTS_SEED, trim_to_kelly=True))
+        assert (switch_only["live_trim_to_kelly"],
+                switch_only["live_trim_min_rise"]) == (True, None)
+
+    def test_claude_md_spells_every_backtest_sweep_field(self):
+        # CLAUDE.md writes BacktestSweep out field by field, in the dataclass's
+        # own order, so a field added here (a live_* one, say) belongs there too
+        text = (pathlib.Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text(
+            encoding="utf-8")
+        signature = re.search(r"`BacktestSweep\(primary, points, calibration,[^`]*\)`", text)
+        assert signature, "CLAUDE.md no longer writes out BacktestSweep's fields"
+        # Each name, with or without a default after it, up to its comma or the bracket
+        named = re.findall(r"(\w+)(?:=[^,)]*)?[,)]", signature.group(0))
+        assert named == [f.name for f in fields(backtester.BacktestSweep)]
+        assert [name for name in named if name.startswith("live_")] == list(self._LIVE_FIELDS)
 
     def test_a_direct_sweep_from_candidates_reads_the_toggles_itself(self, monkeypatch):
         # Handed nothing, _sweep_from_candidates takes one read of its own
@@ -15352,6 +15381,87 @@ class TestLiveRuleLine:
         res = self._feasible(monkeypatch, caplog)
         assert (res.live_sell_at, res.live_sell_min_days) == (0.85, 3)
         assert self._line(caplog).endswith(self._SELL_NOTE)
+
+    # ── Trimming to Kelly ───────────────────────────────────────────────────
+
+    _TRIM_NOTE = ("; the live defaults trim to Kelly (only after a 10c price rise), which "
+                  "this run's primary does not")
+    _TRIM_NOTE_NO_MINIMUM = ("; the live defaults trim to Kelly, which this run's primary "
+                             "does not")
+
+    def test_the_trim_note_is_named_when_the_saved_defaults_trim(self, monkeypatch, caplog):
+        rule = self._live(monkeypatch, True, (0.0, 1.0), trim_to_kelly=True,
+                          trim_min_rise=0.10)
+        res = self._infeasible(monkeypatch, caplog)
+        assert (res.live_trim_to_kelly, res.live_trim_min_rise) == (True, 0.10)
+        assert self._line(caplog) == (
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary "
+            f"scenario applies it{self._TRIM_NOTE}")
+        # ... on the line that says the rule was not simulated too
+        rule = self._live(monkeypatch, True, (0.35, 0.5), trim_to_kelly=True,
+                          trim_min_rise=0.10)
+        self._feasible(monkeypatch, caplog, band_sweep=False)
+        assert self._line(caplog) == (
+            f"Live time-series rule (saved live defaults): {rule} — not simulated by this "
+            f"run{self._TRIM_NOTE}")
+
+    def test_the_trim_note_words_the_minimum_price_rise(self, monkeypatch, caplog):
+        # No minimum: the switch alone; a minimum is named in the cents the
+        # dashboard's Min. price rise options use
+        for rise, note in ((None, self._TRIM_NOTE_NO_MINIMUM),
+                           (0.10, self._TRIM_NOTE),
+                           (0.05, self._TRIM_NOTE.replace("10c", "5c")),
+                           (0.15, self._TRIM_NOTE.replace("10c", "15c")),
+                           (1.0, self._TRIM_NOTE.replace("10c", "100c"))):
+            self._live(monkeypatch, True, (0.0, 1.0), trim_to_kelly=True, trim_min_rise=rise)
+            self._infeasible(monkeypatch, caplog)
+            assert self._line(caplog).endswith(f"scenario applies it{note}"), rise
+
+    def test_no_trim_note_when_the_saved_defaults_do_not_trim(self, monkeypatch, caplog):
+        self._live(monkeypatch, True, (0.0, 1.0))
+        res = self._infeasible(monkeypatch, caplog)
+        assert (res.live_trim_to_kelly, res.live_trim_min_rise) == (False, None)
+        assert "trim" not in self._line(caplog)
+
+    def test_the_trim_note_comes_last(self, monkeypatch, caplog):
+        # After the ladder departure's clause, the add-on clause and the sell clause
+        rule = self._live(monkeypatch, True, (0.0, 1.0), add_to_held=True, sell_at=0.85,
+                          sell_min_days=3, trim_to_kelly=True, trim_min_rise=0.10)
+        configured = backtester.TIME_SERIES_SAME_EVENT_LADDERS
+        res = self._infeasible(monkeypatch, caplog, same_event_ladders=not configured)
+        assert self._line(caplog) == (
+            f"Live time-series rule (saved live defaults): {rule} — this run's primary "
+            f"scenario applies it; this run's same-event ladders are "
+            f"{'off' if configured else 'on'} and config.py's {'on' if configured else 'off'}, "
+            f"so its pairs are not the live bot's{self._ADD_ON_NOTE}{self._SELL_NOTE}"
+            f"{self._TRIM_NOTE}")
+        assert (res.live_add_to_held_pairs, res.live_sell_at, res.live_trim_to_kelly) == (
+            True, 0.85, True)
+
+    def test_the_trim_note_needs_a_recorded_true(self):
+        point = backtester._simulate_at_discount([], date(2026, 1, 5), 1000.0)
+        sweep = backtester.BacktestSweep(primary=point, points=[point], calibration=None)
+        assert (sweep.live_trim_to_kelly, sweep.live_trim_min_rise) == (None, None)
+        for recorded, note in ((None, ""), (False, ""), (True, self._TRIM_NOTE_NO_MINIMUM)):
+            changed = dc_replace(sweep, live_trim_to_kelly=recorded)
+            assert backtester._live_trim_note(changed) == note, recorded
+        # A minimum alone is no trim (LiveSettings refuses one with trimming off)
+        assert backtester._live_trim_note(dc_replace(sweep, live_trim_min_rise=0.10)) == ""
+        assert backtester._live_trim_note(dc_replace(
+            sweep, live_trim_to_kelly=True, live_trim_min_rise=0.10)) == self._TRIM_NOTE
+
+    def test_a_feasible_run_records_the_saved_trim_setting(self, monkeypatch, caplog):
+        from kalshi_betting import config
+        self._live(monkeypatch, True, (0.0, 1.0), trim_to_kelly=True, trim_min_rise=0.25)
+        res = self._feasible(monkeypatch, caplog)
+        assert (res.live_trim_to_kelly, res.live_trim_min_rise) == (True, 0.25)
+        assert self._line(caplog).endswith(self._TRIM_NOTE.replace("10c", "25c"))
+        # A later save without trimming is recorded as such, with no note
+        config.save_live_defaults(dc_replace(config.live_settings(), trim_to_kelly=False,
+                                             trim_min_rise=None), source="")
+        res = self._infeasible(monkeypatch, caplog)
+        assert (res.live_trim_to_kelly, res.live_trim_min_rise) == (False, None)
+        assert "trim" not in self._line(caplog)
 
     # ── The category/tag filter ─────────────────────────────────────────────
 
