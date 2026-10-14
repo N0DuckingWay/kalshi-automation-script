@@ -7052,6 +7052,17 @@ class TestLiveTrimTextsSayWhatARunDoes:
         path = pathlib.Path(__file__).resolve().parent.parent / doc
         return " ".join(path.read_text(encoding="utf-8").split())
 
+    @staticmethod
+    def _lines(doc: str) -> list[str]:
+        """A document of the repo root, as its lines."""
+        path = pathlib.Path(__file__).resolve().parent.parent / doc
+        return path.read_text(encoding="utf-8").splitlines()
+
+    @classmethod
+    def _readme_section(cls, heading: str) -> str:
+        """One section of README.md, from its heading to the next heading of its level."""
+        return "\n".join(cls._lines("README.md")).split(heading, 1)[1].split("\n### ", 1)[0]
+
     def test_only_a_pair_trimmed_in_part_is_said_to_stay_held(self):
         # Kelly keeps nothing once a pair's sale value reaches its chance of
         # paying, so a trim can sell all 30, and a dry run then frees the pair's
@@ -7075,6 +7086,150 @@ class TestLiveTrimTextsSayWhatARunDoes:
     ])
     def test_the_docs_do_not_say_a_live_run_cannot_trim(self, doc, stale):
         assert stale not in self._text(doc)
+
+    @staticmethod
+    def _running_text(path: pathlib.Path) -> str:
+        """A document or a module as running text: string literals that sit side by
+        side are joined, and line breaks (with a comment marker after them) and
+        runs of spaces become single spaces, so a sentence wrapped over two lines
+        or two literals is one sentence."""
+        text = path.read_text(encoding="utf-8")
+        text = re.sub(r'(?<!\\)"\s*\n\s*(?:f|r|rf|fr)?"', "", text)
+        text = re.sub(r"\s*\n\s*(?:#\s*)?", " ", text)
+        return re.sub(r"\s+", " ", text)
+
+    @pytest.mark.parametrize("stale", [
+        # What the backtest's help, its header and the docs said while only the
+        # backtest trimmed
+        r"\b(live|production)( trading| runs?)? (does|do|did) not (yet )?trim",
+        r"\bno run acts on\b",
+        r"\bBringing it to live\b",
+        r"\bonly the backtest (calls|decides|trims)\b",
+        r"\b(is|are) called by no run\b",
+        r"\bnothing (yet )?calls (it|them)\b",
+    ])
+    def test_no_document_or_module_says_live_trading_does_not_trim(self, stale):
+        root = pathlib.Path(__file__).resolve().parent.parent
+        paths = [root / "README.md", root / "CLAUDE.md",
+                 *sorted((root / "kalshi_betting").glob("*.py"))]
+        for path in paths:
+            found = re.search(stale, self._running_text(path), re.IGNORECASE)
+            assert found is None, f"{path.name} still says {found.group(0)!r}"
+
+    def test_the_run_commands_and_the_first_run_steps_cover_trimming(self):
+        # CLAUDE.md's Run Commands give a trimming dry run, with and without a
+        # minimum price rise, and the first-run order for turning trimming on;
+        # README gives the same steps in a section beside live selling's
+        claude = self._text("CLAUDE.md")
+        for command in ("python3 -m kalshi_betting.main --mode prod --dry-run --trim-to-kelly ",
+                        "python3 -m kalshi_betting.main --mode prod --dry-run --trim-to-kelly "
+                        "--trim-min-rise 10 ",
+                        "python3 -m kalshi_betting.main --mode prod --dry-run --no-trim-to-kelly "):
+            assert command in claude
+        assert "**First-run order for trimming.**" in claude
+        # ... whose first step is the probe's yes-close step, since a trim sends the
+        # same order shapes live selling does, and whose last is the first live trim
+        lines = (pathlib.Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text(
+            encoding="utf-8").splitlines()
+        [steps] = [line for line in lines if line.startswith("**First-run order for trimming.**")]
+        assert steps.index("(1) you run `python3 -m kalshi_betting.v2_probe") < steps.index(
+            "--step yes-close` (about one cent") < steps.index(
+            "(2) run `python3 -m kalshi_betting.main --mode prod --dry-run --trim-to-kelly "
+            "--trim-min-rise 10`") < steps.index(
+            "(3) rebuild the dashboard") < steps.index(
+            "`Live settings:` line ends `trim to Kelly on | min price rise 10c`") < steps.index(
+            "(4) after the first live trim")
+        readme = self._text("README.md")
+        assert "### Turn on live trimming" in readme
+        assert ("python3 -m kalshi_betting.main --mode prod --dry-run --trim-to-kelly "
+                "--trim-min-rise 10") in readme
+        # The data-flow diagram has the trim step between the take-profit plans and the sales
+        assert (readme.index("seller.plan_sales()")
+                < readme.index("seller.plan_trims()")
+                < readme.index("trader.sell_positions()"))
+
+    def test_each_save_step_says_what_the_button_does_to_the_other_setting(self):
+        # Trim to Kelly on shuts Sell at "no selling", and Sell shows a level only
+        # with Trim to Kelly off, so from a page that shows both the button saves
+        # the other one off; the /confirm link leaves it out, and a field left out
+        # keeps its saved value. The save step of each first-run order says so
+        claude = self._lines("CLAUDE.md")
+        [trim] = [x for x in claude if x.startswith("**First-run order for trimming.**")]
+        [sell] = [x for x in claude
+                  if x.startswith("**Measured and first-run order for selling.**")]
+
+        def readme_step(heading: str, start: str) -> str:
+            [line] = [x for x in self._readme_section(heading).splitlines()
+                      if x.startswith(start)]
+            return line
+
+        for step in (trim.split("(3) ", 1)[1].split("(4) ", 1)[0],
+                     readme_step("### Turn on live trimming", "3. **Save the setting.**")):
+            assert "also sends no selling" in step
+            assert "names no sell level" in step
+        for step in (sell.split("(3) ", 1)[1],
+                     readme_step("### Turn on live selling", "3. **Save the level.**")):
+            assert "also sends trimming off" in step
+            assert "names no trim setting" in step
+
+    def test_the_save_button_is_said_to_send_the_trim_choices(self):
+        # From a page that simulated trimming the button sends the Trim to Kelly
+        # choice and the Min. price rise, so saving a scenario with Trim to Kelly
+        # off turns a saved live trim off
+        section = self._readme_section("### Dashboard buttons")
+        bullet = " ".join(section.split("- **Save as live defaults…**", 1)[1]
+                          .split("- **Trade using defaults…**", 1)[0].split())
+        assert "add to held pairs, trim to Kelly and Min. price rise, Sell level" in bullet
+        assert "the Trim to Kelly choice with the Min. price rise shown" in bullet
+
+    def test_the_live_tab_counts_a_trim_among_the_bots_sales(self):
+        # A run with trim_to_kelly on and no sell level sells part of held pairs
+        # before it buys, and its trim rows start "[sale: " like any sale row
+        section = " ".join(self._readme_section("### Live trading tab").split())
+        assert "(a run with a sell level saved sells before it buys)" not in section
+        bullet = section.split("- **The bot's sales**", 1)[1].split(" - **", 1)[0]
+        assert "`trim_to_kelly`" in bullet
+
+    @pytest.mark.parametrize("doc", ["CLAUDE.md", "README.md"])
+    def test_the_config_rows_say_a_live_run_reads_the_saved_trim_settings(self, doc):
+        # plan_trims reads the run's LiveSettings.trim_to_kelly / .trim_min_rise and
+        # names neither constant: TRIM_TO_KELLY and TRIM_MIN_RISE are config.py's own
+        # values, which test_strategy's live-toggle AST pin keeps off the live path
+        source = inspect.getsource(seller_mod)
+        assert "TRIM_TO_KELLY" not in source and "TRIM_MIN_RISE" not in source
+        [row] = [x for x in self._lines(doc) if x.startswith("| `config.py` |")]
+        trim = row.split("`TRIM_MIN_RISE` (whether", 1)[1].split(")", 1)[0]
+        assert "`seller.plan_trims` reads" not in trim
+        assert "`LiveSettings.trim_to_kelly`" in trim
+
+    def test_the_historical_row_names_the_trims_read_of_recent_candles(self):
+        # The trim's price then reads a held market's candles over the days before
+        # its pair's last fill, which can be weeks back, through recent_candles
+        assert "recent_candles(" in inspect.getsource(seller_mod._Reads.ask_then)
+        [row] = [x for x in self._lines("README.md") if x.startswith("| `historical.py` |")]
+        candles = row.split("`recent_candles()`", 1)[1]
+        assert "last few days" not in candles
+        assert "a trim's price then" in candles
+
+    def test_claude_md_names_this_class_among_the_tests_that_read_the_docs(self):
+        # This class reads README.md, CLAUDE.md and every module's text, so an edit
+        # to any of them can fail it; CLAUDE.md's list of such tests names it, gives
+        # no count that a new test would make wrong, and names only tests that exist
+        [line] = [x for x in self._lines("CLAUDE.md") if "read the project's own text" in x]
+        assert re.match(r"- (\d+|two|three|four|five|six|seven|eight|nine|ten) tests ",
+                        line, re.IGNORECASE) is None
+        named = re.findall(r"`tests/(test_\w+\.py)::(\w+)(?:::(\w+))?`", line)
+        assert ("test_main.py", "TestLiveTrimTextsSayWhatARunDoes", "") in named
+        assert ("test_v2_probe.py", "TestYesCloseDispatch",
+                "test_the_header_the_help_and_the_closing_line_name_trimming_beside_selling"
+                ) in named
+        tests = pathlib.Path(__file__).resolve().parent
+        for module, cls, test in named:
+            text = (tests / module).read_text(encoding="utf-8")
+            assert re.search(rf"^class {cls}\b", text, re.M), f"{module} has no class {cls}"
+            # A reference to a whole class names no test of its own
+            assert not test or re.search(rf"^\s+def {test}\(", text, re.M), (
+                f"{module} has no test {test}")
 
     def test_claude_md_names_plan_trims_among_the_live_settings_sites(self):
         # plan_trims reads the trim settings, k and both caps off the run's one
