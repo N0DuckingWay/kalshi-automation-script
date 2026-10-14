@@ -8638,11 +8638,9 @@ _LIVE_FILLS = [
 
 
 class TestGetFillTimes:
-    """get_fill_times reads when the account last traded each market. A Kelly
-    trim may sell part of a pair only when the pair has gone some days without
-    a trade, so a read that skipped a fill, or stopped part way, could call a
-    pair rested that traded yesterday: anything short of the whole list, every
-    record read, gives None."""
+    """get_fill_times: when the account last traded each market. A Kelly trim
+    waits days after a pair's last trade, so a missed fill could make a busy
+    pair look rested: anything short of every fill read gives None."""
 
     def test_each_markets_newest_fill_and_the_oldest_of_all(self, caplog):
         client = _fills_client(_fills_page(_LIVE_FILLS, cursor=""))
@@ -8654,10 +8652,10 @@ class TestGetFillTimes:
                 "KXGTATRAILER-26DEC": datetime(2026, 10, 6, 16, 26, 30, 120000, tzinfo=UTC),
                 "KXSTAR-14-MAR20": datetime(2026, 10, 1, 9, 0, 5, tzinfo=UTC)},
             oldest=datetime(2026, 9, 28, 9, 26, 11, tzinfo=UTC))
-        # Every time carries its zone, so a caller can take its calendar day
+        # Times carry their zone, so a caller can take the calendar day
         assert all(when.tzinfo is UTC for when in got.latest.values())
         assert got.oldest.tzinfo is UTC
-        # One page of the largest size the SDK allows, and nothing else asked for
+        # One page, the largest the SDK allows, with no other filter
         client.get_fills_without_preload_content.assert_called_once_with(
             limit=config.FILLS_PAGE_SIZE)
         assert config.FILLS_PAGE_SIZE == 200
@@ -8671,8 +8669,8 @@ class TestGetFillTimes:
 
     @pytest.mark.parametrize("order", ["newest-first", "oldest-first", "shuffled"])
     def test_several_fills_on_one_market_on_one_day(self, order):
-        # Four fills of one order book walk, and one from the week before: the
-        # newest decides, whatever order the listing sends them in
+        # Four fills on one day and one a week earlier: the newest wins, in
+        # any listing order
         rows = [_fill_row("KXA-1", f"2026-10-06T16:26:{second}Z")
                 for second in ("31.5", "31.25", "30", "05")]
         rows.append(_fill_row("KXA-1", "2026-09-29T16:00:00Z"))
@@ -8685,9 +8683,8 @@ class TestGetFillTimes:
         assert got.oldest == datetime(2026, 9, 29, 16, tzinfo=UTC)
 
     def test_a_time_with_an_offset_is_read_in_utc(self):
-        # 9:35pm Pacific on the 7th is already the 8th in UTC: the time is
-        # handed back in UTC with its zone, and the bot's own clock still
-        # places it on the 7th
+        # 9:35pm Pacific on the 7th is the 8th in UTC; the bot's own clock
+        # still calls it the 7th
         row = _fill_row("KXA-1", "2026-10-07T21:35:27-07:00")
         got = scanner.get_fill_times(_fills_client(_fills_page([row])))
         assert got.latest["KXA-1"] == datetime(2026, 10, 8, 4, 35, 27, tzinfo=UTC)
@@ -8722,8 +8719,7 @@ class TestGetFillTimes:
         {"fills": [], "cursor": ""}, {"fills": None, "cursor": None}, {"fills": []},
     ])
     def test_no_fills_is_an_empty_read(self, body, caplog):
-        # A valid read of an account with no fill listed: the caller decides
-        # what an empty list means (it cannot show a pair has rested)
+        # No fills is a valid, empty read; the caller decides what it means
         client = MagicMock()
         client.get_fills_without_preload_content.return_value = _json_reply(body)
         with caplog.at_level(logging.INFO):
@@ -8734,7 +8730,7 @@ class TestGetFillTimes:
     @pytest.mark.parametrize("body", [
         [], "ok", None, 5, {"fills": {}}, {"fills": "x"}, {"fills": 0},
         {"fills": [], "cursor": 5}, {"fills": [], "cursor": ["C1"]},
-        # No "fills" key at all: a renamed key, not an account with none
+        # No "fills" key: a renamed key, not an account with none
         {}, {"cursor": ""}, {"Fills": [], "cursor": ""}, {"market_fills": []},
     ])
     def test_a_page_that_is_not_a_list_of_fills_gives_none(self, body, caplog):
@@ -8751,15 +8747,14 @@ class TestGetFillTimes:
         {"ticker": None}, {"ticker": ""}, {"ticker": 5}, {"ticker": ["KXA-1"]},
         {"ticker": True},
         {"created_time": None}, {"created_time": ""}, {"created_time": "garbage"},
-        # No UTC offset: which moment it names is not known
+        # No UTC offset, so the moment is unknown
         {"created_time": "2026-10-06T16:26:31"}, {"created_time": "2026-10-06"},
-        # A Unix time is not the field's shape
+        # Not a text time at all (a Unix time, a bool, a list)
         {"created_time": 1791217591}, {"created_time": True},
         {"created_time": ["2026-10-06T16:26:31Z"]},
     ])
     def test_one_unreadable_fill_gives_none(self, change, caplog):
-        # Left out, that fill could be the newest on its market, and the
-        # market would read as untraded since an earlier day
+        # Skipped, that fill could have been its market's newest
         bad = dict(_LIVE_FILLS[1], **change)
         client = _fills_client(_fills_page([_LIVE_FILLS[0], bad, _LIVE_FILLS[2]]))
         with caplog.at_level(logging.INFO):
@@ -8776,15 +8771,15 @@ class TestGetFillTimes:
 
     @pytest.mark.parametrize("created", [
         "0001-01-01T00:00:00Z", "1970-01-01T00:00:00Z",
-        # The last second before the first year a fill can carry
+        # One second before 2021, the first year a fill may carry
         "2020-12-31T23:59:59Z",
-        # The same year once the time is read in UTC
+        # 2020 once read in UTC
         "2021-01-01T00:30:00+01:00",
     ])
     def test_a_zero_time_is_not_a_fill_time(self, created, caplog):
-        # What a server writes for "no time". Taken as a real time it puts the
-        # list's oldest fill decades back, so the list reads as reaching past
-        # any wait, and config.trade_day cannot place the first of them
+        # A server's stand-in for "no time". Read as real, it would make the
+        # list seem to reach back past any wait, and year 1 has no day on the
+        # bot's own clock (config.trade_day raises)
         assert config.FILLS_EARLIEST_YEAR == 2021
         bad = dict(_LIVE_FILLS[1], created_time=created)
         client = _fills_client(_fills_page([_LIVE_FILLS[0], bad, _LIVE_FILLS[2]]))
@@ -8803,7 +8798,7 @@ class TestGetFillTimes:
     def test_the_first_year_a_fill_can_carry_is_read(self, created, when):
         got = scanner.get_fill_times(_fills_client(_fills_page([_fill_row("KXA-1", created)])))
         assert got == scanner.FillTimes(latest={"KXA-1": when}, oldest=when)
-        # Every time a read hands back has a calendar day on the bot's own clock
+        # Even the earliest time read has a day on the bot's own clock
         assert config.trade_day(got.oldest, config.SCHEDULED_RUN) == date(2020, 12, 31)
 
     @pytest.mark.parametrize("field", ["ticker", "created_time"])
@@ -8814,8 +8809,7 @@ class TestGetFillTimes:
         assert "has no readable market ticker or time" in caplog.text
 
     def test_the_older_spellings_alone_are_not_read(self, caplog):
-        # market_ticker and ts are the SDK's older names for the two fields;
-        # a record carrying only those is refused rather than guessed at
+        # Only the SDK's older names (market_ticker, ts): refused, not guessed at
         row = {k: v for k, v in _LIVE_FILLS[0].items() if k not in ("ticker", "created_time")}
         row.update(market_ticker="KXA-1", ts=1791217591)
         with caplog.at_level(logging.WARNING):
@@ -8830,8 +8824,7 @@ class TestGetFillTimes:
         assert "has no readable market ticker or time" in caplog.text
 
     def test_an_unreadable_fill_on_a_later_page_still_gives_none(self, caplog):
-        # Two good pages do not make an answer when the third holds a fill
-        # that cannot be read: never a read of the pages before it
+        # A bad fill on page 3 voids the two good pages before it
         bad = dict(_LIVE_FILLS[4], created_time="2026-09-28T09:26:11")
         client = _fills_client(_fills_page(_LIVE_FILLS[:2], cursor="C1"),
                                _fills_page(_LIVE_FILLS[2:4], cursor="C2"),
@@ -8941,18 +8934,17 @@ def _orders_client(*pages) -> MagicMock:
 
 
 class TestGetRestingOrders:
-    """get_resting_orders counts the orders resting on the account. Kalshi
-    holds cash for a resting order in neither its balance nor its value of
-    the open positions, so a run trims nothing while one rests: anything short
-    of the whole list, every status read, gives None, and the run then trims
-    nothing too."""
+    """get_resting_orders counts orders waiting on the account. Their cash is in
+    neither Kalshi's balance nor its positions value, so a run trims nothing
+    while one rests. Anything short of the whole list with every status read
+    gives None, and the run then trims nothing either."""
 
     def test_two_pages_are_counted_and_the_filter_is_sent(self, caplog):
         client = _orders_client(_orders_page([_order_row(), _order_row()], cursor="C1"),
                                 _orders_page([_order_row()], cursor=""))
         with caplog.at_level(logging.INFO):
             assert scanner.get_resting_orders(client) == 3
-        # Resting orders only, the largest page the SDK allows, then the cursor
+        # Resting orders only, the largest page allowed, then the cursor
         assert [c.kwargs for c in client.get_orders_without_preload_content.call_args_list] == [
             {"status": "resting", "limit": 200},
             {"status": "resting", "limit": 200, "cursor": "C1"}]
@@ -8970,7 +8962,7 @@ class TestGetRestingOrders:
         assert [r.getMessage() for r in caplog.records] == ["Resting orders on the account: 0"]
 
     def test_an_order_that_no_longer_rests_is_not_counted(self):
-        # A reply that left the filter out: a filled or canceled order holds no cash
+        # Even if a reply ignores the filter, filled or canceled orders hold no cash
         client = _orders_client(_orders_page(
             [_order_row("executed"), _order_row("canceled"), _order_row()]))
         assert scanner.get_resting_orders(client) == 1
@@ -9013,7 +9005,7 @@ class TestGetRestingOrders:
     @pytest.mark.parametrize("body", [
         [], "ok", None, 5, {"orders": {}}, {"orders": "x"}, {"orders": 0},
         {"orders": [], "cursor": 5}, {"orders": [], "cursor": ["C1"]},
-        # No "orders" key at all: a renamed key, not an account with none
+        # No "orders" key: a renamed key, not an account with none
         {}, {"cursor": ""}, {"Orders": [], "cursor": ""},
     ])
     def test_a_page_that_is_not_a_list_of_orders_gives_none(self, body, caplog):
@@ -9376,11 +9368,10 @@ _NO_QUOTE_IDS = ["none", "empty", "text", "zero", "zero-dollars", "one", "one-do
 
 
 class TestHeldPositionsBidValue:
-    """held_positions_bid_value says what the held markets would fetch at this
-    run's bids. A Kelly trim sizes on the larger of Kalshi's own value of the
-    positions and this floor, so the floor must never come out too high: every
-    held market counts at the bid for the side held, and anything that cannot
-    be read counts as nothing, never at what it cost."""
+    """held_positions_bid_value: what the held markets would fetch at this
+    run's bids. A Kelly trim sizes on the larger of this and Kalshi's own
+    value, so it must never come out too high: each market counts at the bid
+    of the side held, and anything unreadable counts $0, never its cost."""
 
     @staticmethod
     def _markets() -> dict:
@@ -9407,12 +9398,12 @@ class TestHeldPositionsBidValue:
         assert value == 30.0 * 0.29 + 30.0 * (1.0 - 0.56)
         assert value == pytest.approx(8.70 + 13.20)
         assert isinstance(value, float)
-        # It reads the market list it is handed and says nothing
+        # It logs nothing
         assert caplog.records == []
 
     def test_it_is_below_the_worth_at_the_asks(self):
-        # held_pairs values the same two markets at the asks an add-on pays
-        # (0.30 and 0.45): a sale fetches the bids, which are lower
+        # held_pairs values them at the asks (0.30 and 0.45); a sale gets the
+        # lower bids
         positions, markets = self._positions(), self._markets()
         labels = {m.ticker: market_ladder_keys(m) for m in markets.values()}
         [pair] = held_pairs(positions, labels, markets, log=False).values()
@@ -9421,8 +9412,7 @@ class TestHeldPositionsBidValue:
 
     def test_the_side_held_decides_which_quote_is_read(self):
         markets = self._markets()
-        # The same two markets held the other way round: NO on the early
-        # rung (1 - 0.30), YES on the late one (0.55)
+        # Held the other way round: NO early (1 - 0.30), YES late (0.55)
         flipped = {_RUNG_EARLY: _held(_RUNG_EARLY, -30.0, 21.0, 0.4),
                    _RUNG_LATE: _held(_RUNG_LATE, 30.0, 16.8, 0.5)}
         assert scanner.held_positions_bid_value(flipped, markets) == (
@@ -9446,8 +9436,7 @@ class TestHeldPositionsBidValue:
     def test_a_yes_holding_with_no_usable_bid_counts_nothing(self, raw):
         markets = self._markets()
         markets[_RUNG_EARLY].yes_bid_dollars = raw
-        # Only the late rung's NO holding is left, and never the early
-        # rung's $6.00 cost in its place
+        # Only the late rung counts; the early rung's $6.00 cost never stands in
         assert scanner.held_positions_bid_value(self._positions(), markets) == (
             30.0 * (1.0 - 0.56))
 
@@ -9475,9 +9464,8 @@ class TestHeldPositionsBidValue:
             assert value == 0.0 and isinstance(value, float)
 
     def test_it_never_falls_back_to_what_a_position_cost(self):
-        # held_pairs values a market with no usable ask at its exposure; the
-        # floor must not, or one stale cost could lift it above what the
-        # positions would fetch
+        # Unlike held_pairs, a missing quote is never filled in with the cost:
+        # a stale cost could lift the value above what a sale would fetch
         positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 29.0, 0.4),
                      _RUNG_LATE: _held(_RUNG_LATE, -30.0, 29.5, 0.5)}
         markets = self._markets()
@@ -9491,10 +9479,9 @@ class TestHeldPositionsBidValue:
         assert scanner.held_positions_bid_value(positions, self._markets()) == 0.01 * 0.29
 
     def test_it_never_exceeds_the_worth_at_the_asks_on_uncrossed_quotes(self):
-        # Seeded sweep: with a YES bid at or under the YES ask and the two
-        # asks summing to $1 or more (a book that is not crossed), no holding
-        # fetches more at the bid than held_pairs' worth at the ask, and the
-        # total never exceeds $1 a contract
+        # Seeded sweep over uncrossed quotes (YES bid <= YES ask, the asks
+        # summing to $1 or more): the value never tops the worth at the asks,
+        # nor $1 a contract
         rng = random.Random(4242)
         for _ in range(300):
             positions, markets, at_asks, contracts = {}, {}, 0.0, 0.0
@@ -9534,13 +9521,11 @@ def _cross(ticker, event, deadline_text, close, *, yes_ask=0.20, no_ask=None, ti
 
 
 class TestHeldPairKind:
-    """held_pair_kind reads, from two held markets alone, whether they are a
-    same-title or a time-series pair and which is market A. The two kinds are
-    priced by different models, so a pair read as the wrong kind, or the wrong
-    way round, would be trimmed on the wrong chance of paying. It answers by
-    the finders' own tests and gives None for anything it cannot show. Every
-    pair below that a finder forms is first asserted to form, so a None is
-    this reader's refusal and not a fixture that stopped pairing."""
+    """held_pair_kind tells, from two held markets alone, a same-title from a
+    time-series pair and which is market A. A wrong answer would trim on the
+    wrong chance of paying, so it uses the finders' own tests and gives None
+    when unsure. Pairs a finder forms are asserted to form first, so a None
+    here is this reader's refusal."""
 
     _WIU = TestSameTitleCloseGap._wiu_markets
 
@@ -9570,7 +9555,7 @@ class TestHeldPairKind:
         assert pair.pair_type == "same_title"
         kind = _kind_of(pair)
         assert kind is not None and kind[0] == "same_title"
-        # A is the market bought NO, B the one bought YES: the finder's own
+        # A is the market held NO, B the one held YES, as the finder has them
         assert kind[1] is pair.market_a and kind[2] is pair.market_b
         assert (kind[1], kind[2]) == (mens, womens)
 
@@ -9587,14 +9572,13 @@ class TestHeldPairKind:
             no_ask=0.65, close_time=close)
         [pair] = find_same_title_pairs([weekly, monthly])
         assert _kind_of(pair) == ("same_title", weekly, monthly)
-        # Its wording is a snapshot ("price on <date>"), which is no
-        # time-series pair: the kind comes from the identical wording alone
+        # Snapshot wording ("price on <date>") is never time-series: the
+        # identical wording alone makes it same-title
         assert scanner._market_deadline_profile(weekly)[0] == scanner.DEADLINE_SNAPSHOT
 
     def test_a_same_title_pair_is_read_from_the_sides_held(self):
-        # The finder's A is the pricier market TODAY. A pair bought when the
-        # prices stood the other way round holds NO on today's cheaper
-        # market, and A is still the market held NO (leg_sides)
+        # A is the market held NO (leg_sides), even where today's prices would
+        # make the other one the finder's A
         mens, womens = self._WIU(womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
         assert leg_sides("same_title") == ("no", "yes")
         assert scanner.held_pair_kind(yes_market=mens, no_market=womens) == (
@@ -9605,8 +9589,8 @@ class TestHeldPairKind:
     @pytest.mark.parametrize("gap_seconds, reads", [(0, True), (3_600, True), (3_601, False),
                                                     (9_000, False)])
     def test_identical_wording_closing_apart_is_no_pair(self, gap_seconds, reads):
-        # The same-title close gate, bound included; and identical wording
-        # states one deadline, so it is never read as a time-series pair either
+        # The same-title close gate, bound included; identical wording is never
+        # time-series either
         mens, womens = self._WIU(
             womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC)
             - timedelta(seconds=gap_seconds))
@@ -9689,7 +9673,7 @@ class TestHeldPairKind:
         kind = scanner.held_pair_kind(yes_market=early, no_market=late)
         assert kind == ("time_series", early, late)
         assert kind[1] is early and kind[2] is late
-        # YES on the later deadline is not the trade: never read the other way round
+        # YES on the later deadline is not the trade
         assert scanner.held_pair_kind(yes_market=late, no_market=early) is None
 
     @pytest.mark.parametrize("close_a, close_b", [
@@ -9775,8 +9759,8 @@ class TestHeldPairKind:
         assert scanner.held_pair_kind(yes_market=late, no_market=early) is None
 
     def test_a_cross_event_pair_reads_without_a_price_or_gap_test(self, monkeypatch):
-        # 45 days apart, and the earlier market now the dearer: nothing a run
-        # would buy, and still the pair that is held
+        # 45 days apart and the earlier market now dearer: no run would buy
+        # it, but it is still the pair held
         early, late = _ts_pair_markets(gap_days=45, pA=0.70, pB=0.30)
         assert self._ts([early, late], monkeypatch) == []
         assert scanner.held_pair_kind(early, late) == ("time_series", early, late)
@@ -9796,8 +9780,8 @@ class TestHeldPairKind:
 
     def test_dated_deadlines_that_agree_with_the_closes_read_even_minutes_apart(self,
                                                                                monkeypatch):
-        # Both stated days read and run the way the closes do, so the pair is
-        # two deadlines however near the two closes sit
+        # Both stated days read and agree with the close order: two deadlines,
+        # however near the closes
         early = _cross("X-A", "KXAA-1", "by March 1, 2026",
                        datetime(2026, 3, 20, 12, tzinfo=UTC))
         late = _cross("X-B", "KXBB-1", "by March 9, 2026",
@@ -9808,8 +9792,8 @@ class TestHeldPairKind:
         assert scanner.held_pair_kind(late, early) is None
 
     def test_equal_closes_across_events_give_no_order(self, monkeypatch):
-        # The finder orders a cross-event pair on close time; with one close
-        # for both it takes them in listing order, which says nothing
+        # With equal closes the finder keeps listing order, which says nothing
+        # about which deadline comes first
         close = datetime(2026, 3, 20, tzinfo=UTC)
         early = _cross("X-A", "KXAA-1", "by March 1, 2026", close)
         late = _cross("X-B", "KXBB-1", "by March 20, 2026", close, yes_ask=0.60)
@@ -9829,8 +9813,8 @@ class TestHeldPairKind:
     ])
     def test_one_day_spelled_two_ways_across_events_is_no_pair(self, monkeypatch, wording_a,
                                                                wording_b):
-        # The finder compares the two deadlines as text, so it reads two;
-        # as calendar days they are one, which is a same-title pair respelled
+        # Two deadlines as text (the finder's view), one as calendar days: a
+        # same-title pair respelled
         a = _cross("X-A", "KXAA-1", wording_a, datetime(2027, 3, 1, tzinfo=UTC))
         b = _cross("X-B", "KXBB-1", wording_b, datetime(2027, 3, 9, tzinfo=UTC), yes_ask=0.60)
         [pair] = self._ts([a, b], monkeypatch)
@@ -9842,9 +9826,8 @@ class TestHeldPairKind:
         assert scanner.held_pair_kind(b, a) is None
 
     def test_by_one_day_beside_before_the_next_is_no_pair(self, monkeypatch):
-        # "by Mar 31, 2027" and "before Apr 1, 2027" name one last day. Across
-        # two events the two prepositions keep them out of one group, so no
-        # finder pairs them and they read as no pair
+        # Both name Mar 31 as the last day, but the two prepositions keep them
+        # in separate groups, so no finder pairs them
         a = _cross("X-A", "KXAA-1", "by Mar 31, 2027", datetime(2027, 3, 31, tzinfo=UTC))
         b = _cross("X-B", "KXBB-1", "before Apr 1, 2027", datetime(2027, 4, 1, tzinfo=UTC),
                    yes_ask=0.60)
@@ -9876,9 +9859,8 @@ class TestHeldPairKind:
                                                     (3_601, True), (7_200, True)])
     def test_an_unread_stated_day_needs_closes_past_the_same_title_bound(
             self, monkeypatch, wording_a, wording_b, gap_seconds, reads):
-        # With no stated days to tell two deadlines apart, two markets closing
-        # within the same-title bound could be one question whose wording was
-        # respelled on one market: not shown to be a time-series pair
+        # With no stated day to tell them apart, closes within the same-title
+        # bound could be one question respelled: not shown to be time-series
         close = datetime(2027, 3, 31, 12, tzinfo=UTC)
         a = _cross("X-A", "KXAA-1", wording_a, close)
         b = _cross("X-B", "KXBB-1", wording_b, close + timedelta(seconds=gap_seconds),
@@ -9894,11 +9876,9 @@ class TestHeldPairKind:
                                                     (3_601, True)])
     def test_a_respelled_same_title_pair_with_a_year_less_deadline_is_no_pair(
             self, monkeypatch, gap_seconds, reads):
-        # One question listed by two series, closing half an hour apart: a
-        # same-title pair until one listing's outcome label drops its year.
-        # The two labels then differ as text, so the finder forms a
-        # time-series pair; one label states no calendar day, so nothing here
-        # shows two deadlines, and inside the same-title bound it is no pair
+        # One question on two series, one label respelled without its year:
+        # the finder sees two deadlines, but one states no calendar day, so
+        # within the same-title bound it is no pair
         close = datetime(2027, 3, 31, 12, tzinfo=UTC)
 
         def listing(ticker, event, label, close_time, yes_ask):
@@ -9918,8 +9898,8 @@ class TestHeldPairKind:
             "time_series", dated, respelled)
         assert _kind_of(pair) == (("time_series", dated, respelled) if reads else None)
         assert scanner.held_pair_kind(respelled, dated) is None
-        # Spelled alike on both listings, the same two markets are the
-        # same-title pair this could have been bought as, inside the bound
+        # Spelled alike, they are the same-title pair they may have been bought
+        # as, inside the bound
         respelled.subtitle = dated.subtitle
         assert scanner.held_pair_kind(respelled, dated) == (
             None if reads else ("same_title", dated, respelled))
@@ -9955,9 +9935,8 @@ class TestHeldPairKind:
         ("by March 1, 2026", "by March 9, 2026"), ("by March 1", "by March 9")])
     def test_a_time_series_pair_needs_two_known_events(self, monkeypatch, event_a, event_b,
                                                        wording_a, wording_b):
-        # With one event ticker missing, nothing shows whether these are two
-        # events (ordered on close time) or two rungs of one (ordered on
-        # stated days alone, where year-less rungs are refused)
+        # With an event ticker missing, two events (ordered on closes) cannot
+        # be told from two rungs of one (ordered on stated days)
         a = _cross("X-A", "KXAA-1", wording_a, datetime(2026, 3, 1, tzinfo=UTC))
         b = _cross("X-B", "KXBB-1", wording_b, datetime(2026, 3, 9, tzinfo=UTC), yes_ask=0.60)
         # Control: with both events named the pair reads
@@ -9992,8 +9971,8 @@ class TestHeldPairKind:
         assert scanner.held_pair_kind(b, a) is None
 
     def test_two_strikes_of_one_deadline_family_are_no_pair(self, monkeypatch):
-        # A daily family shares one title and differs in its outcome label,
-        # which is half of the group key (DR-01)
+        # Two strikes of one daily family differ in their outcome label, which
+        # is part of the group key (DR-01)
         def strike(ticker, event, day, label, yes_ask):
             return _ingest_market(
                 ticker, event, f"Bitcoin high by March {day}, 2026?", "Bitcoin record",
@@ -10014,13 +9993,12 @@ class TestHeldPairKind:
     # ── every pair the finders form ─────────────────────────────────────────
 
     def test_every_pair_the_finders_form_reads_as_its_own_kind(self, monkeypatch):
-        # A seeded sweep over the three shapes a run can hold. Every
-        # same-title pair and every same-event ladder the finders form reads
-        # as its own kind with the finder's A and B. A cross-event pair reads
-        # as time-series exactly when its stated days both read, differ and
-        # agree with its closes, or (a stated day unread) its closes are past
-        # the same-title bound; otherwise it reads as no pair. No pair ever
-        # reads as the other kind, and no time-series pair the other way round
+        # Seeded sweep of the three shapes a run can hold. Same-title pairs and
+        # ladders read as their own kind, A and B as the finder has them. A
+        # cross-event pair reads as time-series exactly when its stated days
+        # read, differ and agree with its closes, or (a day unread) its closes
+        # are past the same-title bound; otherwise as no pair. Never the other
+        # kind, and a time-series pair held the other way round never reads
         rng = random.Random(2026)
         base = datetime(2026, 3, 1, 12, tzinfo=UTC)
         bound = config.SAME_TITLE_MAX_CLOSE_GAP_SECONDS
@@ -10035,8 +10013,7 @@ class TestHeldPairKind:
             p_high = round(p_low + rng.randint(6, 45) / 100, 2)
             jitter = timedelta(seconds=rng.choice([0, 1, 1_800, 3_600, 3_601, 86_400 * 3]))
             if shape == "same_title":
-                # One question listed by two series; the two closes sit at
-                # most the bound apart, so the finder pairs them
+                # One question on two series, closing within the bound
                 close_gap = timedelta(seconds=rng.choice([0, 60, 3_600]))
                 dear = _mock_market(ticker=f"ST{n}-A", event_ticker=f"KXSTA{n}-1",
                                     title=f"Who wins game {n}?", subtitle="Home",
@@ -10071,8 +10048,8 @@ class TestHeldPairKind:
                 assert find_same_title_pairs([early, late]) == []
                 seen["ladder"] += 1
                 continue
-            # One question listed by two events: the finder orders on close
-            # time, the first-closing market cheap so the pair forms
+            # One question on two events: the first to close is the cheaper,
+            # so the finder forms the pair
             dated = rng.random() < 0.6
             reversed_days = rng.random() < 0.25
             first_day, second_day = (day_b, day_a) if reversed_days else (day_a, day_b)

@@ -106,9 +106,8 @@ LABELS = ["tier floors", "spread band", "k", "per-trade cap", "same-title cap",
 # A proposal's fields: the seed's values, spelled as the dashboard spells them
 _BASE = {"tier_floors": "off", "spread_min": "0", "spread_max": "0.5", "k": "0.8",
          "size_cap": "0.1"}
-# The settings _BASE proposes when nothing is saved: the seed's (its same-title
-# cap, adding to held pairs on, no selling and no trimming, the fields a
-# proposal may leave out)
+# What _BASE proposes with nothing saved: the fields it leaves out take the
+# seed's values (20% same-title cap, adding on, no selling, no trimming)
 _BASE_SETTINGS = LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, add_to_held_pairs=True)
 # The ASCII digits as Arabic-Indic and as full-width digits (str.translate tables)
 _ARABIC_INDIC = str.maketrans("0123456789", "".join(chr(0x0660 + i) for i in range(10)))
@@ -864,8 +863,7 @@ class TestConfirmPage:
         assert set(page.rows.values()) == {"changed"}
         assert all(cells[1] == "—" for cells in page.cells.values())
         assert "12 of 12 settings change." in response.body
-        # The same-title cap, adding to held pairs, the two sell settings and
-        # the two trim settings fall back to the seed's
+        # The fields the link leaves out take the seed's values
         assert page.cells["same-title cap"][2] == "20%"
         assert page.cells["add to held pairs"][2] == "on"
         assert page.cells["sell at"][2] == "off"
@@ -883,7 +881,7 @@ class TestConfirmPage:
     def test_no_warning_for_the_seed(self):
         assert 'class="warn"' not in _get(_app(), "/confirm?" + _query()).body
 
-    # A per-trade and a same-title cap of 20%, k 0.8, with the Kelly trim on or off
+    # Saved defaults that trim: k 0.8, 20% per-trade and same-title caps
     _TRIM_SAVED = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True)
 
     @pytest.mark.parametrize("link, named", [
@@ -896,8 +894,7 @@ class TestConfirmPage:
          "the same-title size cap goes from 20% to 10%"),
     ], ids=["per-trade cap", "k", "same-title cap"])
     def test_with_trimming_on_a_lower_cap_or_a_higher_k_is_said_to_sell(self, link, named):
-        # The next run trims before it buys, and these settings sell more of the
-        # held pairs than the ones in force: the page says so in red
+        # These settings can sell more of the held pairs: the page warns in red
         _save(self._TRIM_SAVED)
         response = _get(_app(), "/confirm?" + _query(**link))
         assert response.status == 200
@@ -908,7 +905,7 @@ class TestConfirmPage:
             "to it before anything is bought, once the wait since its last trade has passed.")
 
     @pytest.mark.parametrize("saved, link", [
-        # Trimming saved off, so kept off by links that do not name it
+        # Trimming saved off, and the link leaves it off
         (dataclasses.replace(_TRIM_SAVED, trim_to_kelly=False),
          {"size_cap": "0.1", "same_title_size_cap": "0.2"}),
         (dataclasses.replace(_TRIM_SAVED, trim_to_kelly=False),
@@ -920,7 +917,7 @@ class TestConfirmPage:
         # A cap raised, and k lowered: nothing more is sold
         (_TRIM_SAVED, {"size_cap": "0.3", "same_title_size_cap": "0.2"}),
         (_TRIM_SAVED, {"k": "0.7", "size_cap": "0.2", "same_title_size_cap": "0.2"}),
-        # A lower same-title cap the per-trade cap already holds below
+        # A lower same-title cap that is still above the per-trade cap
         (dataclasses.replace(_TRIM_SAVED, same_title_size_cap=1.0),
          {"size_cap": "0.2", "same_title_size_cap": "0.5"}),
     ], ids=["off, cap", "off, k", "off, same-title cap", "link turns it off", "cap raised",
@@ -1029,8 +1026,7 @@ class TestConfirmPage:
     @pytest.mark.parametrize("saved", [
         {}, {"trim_to_kelly": True}, {"trim_to_kelly": True, "trim_min_rise": 0.25}])
     def test_missing_trim_settings_keep_the_saved_values(self, saved):
-        # A link that names neither (the dashboard's save button, a hand-made
-        # link) leaves trimming exactly as saved, shown as no change
+        # A link that names neither trim field keeps both as saved (no change)
         _save(LiveSettings(False, (0.0, 0.5), 0.8, 0.1, 0.2, **saved))
         page = _parse(_get(_app(), "/confirm?" + _query()).body)
         assert page.rows["trim to Kelly"] == page.rows["min price rise"] == "same"
@@ -1071,7 +1067,7 @@ class TestConfirmPage:
         assert page.cells["min price rise"][1:3] == ["—", rise]
 
     def test_a_link_s_dollars_and_a_flag_s_cents_are_one_minimum(self):
-        # 0.1 on a link is ten cents, the same float as the 0.10 a save holds
+        # A link's 0.1 (dollars) is the flag's 10 (cents)
         settings, _ = defaults_server._proposal(
             defaults_server._params(_query(trim_to_kelly="on", trim_min_rise="0.1")), None)
         assert settings.trim_min_rise == 0.10 == 10 / 100
@@ -1487,8 +1483,7 @@ class TestConfirmRefusals:
         # Trimming: on or off, spelled exactly so
         _query(trim_to_kelly="maybe"), _query(trim_to_kelly="true"),
         _query(trim_to_kelly="1"), _query(trim_to_kelly="On"), _query(trim_to_kelly="OFF"),
-        # A minimum price rise: plain decimal dollars on the 5c grid from 5c to
-        # $1, or off
+        # A minimum price rise: plain dollars on the 5c grid, 5c to $1, or off
         _query(trim_to_kelly="on", trim_min_rise="maybe"),
         _query(trim_to_kelly="on", trim_min_rise="Off"),
         _query(trim_to_kelly="on", trim_min_rise="on"),
@@ -1510,8 +1505,7 @@ class TestConfirmRefusals:
         _query(trim_to_kelly="on", trim_min_rise="0x1"),
         _query(trim_to_kelly="on", trim_min_rise="1e-400"),
         _query(trim_to_kelly="on", trim_min_rise="1e400"),
-        # A minimum with trimming off: neither given nor saved (the seed's is
-        # off), or the switch named off
+        # A minimum with trimming off: the switch left out (the seed's: off) or named off
         _query(trim_min_rise="0.1"), _query(trim_to_kelly="off", trim_min_rise="0.1"),
         # Either trim field given twice
         _query(trim_to_kelly="on") + "&trim_to_kelly=on",
@@ -2251,8 +2245,8 @@ class TestSeed:
         assert config.LIVE_DEFAULTS_SEED.trim_min_rise is None
 
     def test_the_seed_page_turns_off_trimming_that_is_saved(self):
-        # The seed link names trimming off, so it proposes exactly the seed
-        # over defaults that trim: both rows change
+        # Over saved defaults that trim, the seed link turns trimming off:
+        # both rows change
         _save(replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True, trim_min_rise=0.25))
         response = _get(_app(), "/confirm?" + defaults_server._seed_query())
         page = _parse(response.body)
@@ -2263,10 +2257,9 @@ class TestSeed:
         assert "2 of 12 settings change." in response.body
 
     def test_a_seed_link_that_leaves_trimming_out_still_proposes_the_seed(self):
-        # A seed link with no trim fields, opened over defaults that trim: the
-        # seed's off, shown as changes, never refused for putting the seed's
-        # note on other values, and never refused for keeping a saved minimum
-        # with trimming off
+        # Over defaults that trim, a seed link with no trim fields still
+        # proposes the seed (trimming off): it is not refused for the seed's note
+        # on other values, nor for a saved minimum kept with trimming off
         _save(replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True, trim_min_rise=0.25))
         stale = "&".join(part for part in defaults_server._seed_query().split("&")
                          if not part.startswith(("trim_to_kelly=", "trim_min_rise=")))
@@ -3790,8 +3783,8 @@ class TestRunPage:
         assert self._headline(body) == "No trades to complete"
         assert "<td>not sold</td><td>0 of 30 YES on SELL-A (filled nothing)</td>" in body
 
-    # One Kelly trim, as a run result records it: 13 of the 30 contracts held
-    # on each market of a pair sold, with no sell level
+    # One Kelly trim in a run result: 13 of the 30 contracts held on each
+    # market sold (a trim has no sell level)
     _TRIMMED = {"title": "Trimmed pair", "status": "sold", "kind": "kelly_trim", "level": None,
                 "days_left": 9, "cost": 8.15, "proceeds": 12.15, "profit": 4.0,
                 "realized_percent": None, "error": None,
@@ -3801,7 +3794,7 @@ class TestRunPage:
                           "price": 0.42}]}
 
     def test_a_kelly_trim_is_marked_and_shows_what_sold_of_what_was_held(self):
-        # Beside a take-profit sale, whose row is what it always was
+        # Beside a take-profit sale, whose row carries no trim mark
         _disk_run(result=_result(exit_code=0, sales=[self._SOLD, self._TRIMMED],
                                  trades=[_trade("executed")]))
         body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
@@ -3817,19 +3810,17 @@ class TestRunPage:
         assert "for a Kelly trim, less what the contract pairs sold cost" in body
 
     def test_the_profit_note_is_true_of_a_lone_market_sold_with_its_paid_out_partner(self):
-        # A lone held market's Profit is its proceeds plus its partner's payout, less the
-        # cost of both markets (seller._plan_one, reporter.sale_record): the partner's
-        # contracts were not sold, and no sale returned its payout
+        # A lone held market's profit is its proceeds plus its paid-out partner's
+        # payout, less what both markets cost (seller._plan_one, reporter.sale_record).
+        # The partner was never sold, so the note cannot say "what the contracts sold cost"
         note = defaults_server._SALE_PROFIT_NOTE
         assert "less what the contracts sold cost" not in note
         assert "plus the payout of a partner that has already paid out" in note
         assert "less what the whole position cost" in note
         # A trim's profit is still on the part it sold
         assert "for a Kelly trim, less what the contract pairs sold cost" in note
-        # The row the note sits under: one market sold, the partner's cost in the figure.
-        # 30 YES sold at 0.96 return $28.71 after the fee, the partner paid $0 and both
-        # markets cost $18.80, so the profit is $9.91 (less the sold market's cost alone
-        # it would read $22.41)
+        # A row the note sits under: 30 YES sold return $28.71 after the fee, the
+        # partner paid $0, both markets cost $18.80, so the profit is $9.91
         lone = {"title": "Lone", "status": "sold", "level": 0.8, "days_left": 9, "cost": 18.8,
                 "proceeds": 28.71, "profit": 9.91, "realized_percent": 88.48, "error": None,
                 "legs": [{"ticker": "SELL-A", "side": "yes", "held": 30, "sold": 30,
@@ -3867,8 +3858,7 @@ class TestRunPage:
 
     @pytest.mark.parametrize("kind", ["take_profit", None, 5, "KELLY_TRIM", ""])
     def test_only_a_kelly_trim_is_marked(self, kind):
-        # A result written before the kind was recorded, or one damaged, reads
-        # as a take-profit sale
+        # A missing or unknown kind reads as a take-profit sale
         _disk_run(result=_result(exit_code=0, sales=[dict(self._TRIMMED, kind=kind)]))
         body = html.unescape(_get(_app(), "/runs/0123456789abcdef").body)
         assert "(Kelly trim)" not in body
@@ -3880,8 +3870,8 @@ class TestRunPage:
 
     @pytest.mark.parametrize("status", ["sold", "partly_sold"])
     def test_a_run_that_only_trimmed_says_so(self, status):
-        # Each pair was sold down to its Kelly size (most often part of it, the
-        # rest still held), so the headline does not say positions were sold
+        # A trim usually sells only part of a pair, so the headline says
+        # "trimmed", not "positions sold"
         trim = dict(self._TRIMMED, status=status)
         _disk_run(result=_result(exit_code=0, sales=[trim], cash_after_sales=112.15,
                                  balance_before=100.0, portfolio_value_before=150.0))

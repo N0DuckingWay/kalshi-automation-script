@@ -100,22 +100,18 @@ Purpose:
     (sell down to the Kelly size)": the same scenario re-simulated so that,
     at each weekly run, a held pair that has outgrown its Kelly size at that
     day's sale prices (or the size cap) is sold down to it
-    (backtester._simulate_at_discount's trim_to_kelly). A pair is trimmed
-    only when at least backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE calendar
-    days have passed since the last trade on it. The weekly runs are 7 days
-    apart, so the shipped 7 days hold no trim back on the page; the select's
-    hover text names the number and says so (_trim_select_title). With Add
-    to held pairs on as well, a pair is topped up or sold down each week.
-    The run
-    itself simulates none of them: the sweep carries a lazy family
+    (backtester._simulate_at_discount's trim_to_kelly), but only once
+    backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE calendar days have passed
+    since its last trade (at weekly runs the shipped 7 days never hold a
+    trim back; the select's hover text says so, _trim_select_title). With
+    Add to held pairs on as well, a pair is topped up or sold down each week.
+    The run itself simulates none of them: the sweep carries a lazy family
     (BacktestSweep.trim_sweep), and this module simulates every cell as the
     page is built, the "all" population only (_with_trim, _walk_trim_cells).
     The choice changes the trade sections and the header's trade count
     only. While it is on, Sell is set to "no selling" and shut (a sell level
     is not simulated together with trimming). Save as live defaults… saves
-    the choice as the live defaults' trim_to_kelly: a live run with it on
-    sells part of each held pair that has outgrown its Kelly size, by this
-    rule, before it buys.
+    the choice as the live defaults' trim_to_kelly, which live runs trim by.
 
     When that family carries minimum price rises
     (backtester.TrimSweep.min_rises: trim a held pair only once its total
@@ -134,8 +130,8 @@ Purpose:
     to Kelly without them says why in a short note beside it. Like Trim to
     Kelly it changes the trade sections and the header's trade count only,
     and Sell stays shut at any minimum. Save as live defaults… saves the
-    minimum shown as the live defaults' trim_min_rise, always beside the
-    Trim to Kelly choice ("any", or Trim to Kelly off, saves no minimum).
+    minimum shown as trim_min_rise, always beside the Trim to Kelly choice
+    ("any", or Trim to Kelly off, saves none).
 
     The bar's Sell choice is "no selling" (the page as rendered) or one of the
     sell family's levels (backtester.SellSweep; config.TAKE_PROFIT_LEVELS,
@@ -186,9 +182,9 @@ Purpose:
     DEFAULTS_SERVER_PORT) in a new tab, for the bar's scenario on screen —
     its spread band, Tier floors choice, k, size cap, Add to held pairs
     choice, Sell level and Min. days to maturity, Trim to Kelly choice and
-    Min. price rise (each only on a page that simulated it, the last two
-    always together, so an address never asks for a minimum with trimming
-    off) and the categories and tags ticked, with this run's
+    Min. price rise (each only on a page that simulated it; the last two
+    always together, so a minimum is never sent with trimming off) and the
+    categories and tags ticked, with this run's
     same-title cap when the run recorded one — never
     for the Scenario Explorer's own selects. The address names each ticked
     category once and each ticked tag once, as "Category · Tag" (the form
@@ -252,9 +248,8 @@ Dependencies:
     read, and in a worker process install, its SAME_TITLE_SIZE_CAP,
     SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS (_run_sell_task; the last also
     names the Sell select's rule, _sell_select_title), to read its
-    KELLY_TRIM_MIN_DAYS_SINCE_TRADE (the days a pair must go without a trade
-    before a Kelly trim, which the Trim to Kelly select's hover text names,
-    _trim_select_title), and to word a minimum
+    KELLY_TRIM_MIN_DAYS_SINCE_TRADE (named in the Trim to Kelly select's
+    hover text, _trim_select_title), and to word a minimum
     price rise as a run's label does (_trim_rise_label) — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
     page's file name, which defaults_server opens when run on its own and
@@ -4663,24 +4658,17 @@ def _trim_choice_in_bar(bar: dict | None, band_index: int | None, tier_on: bool,
     """
     Say how the filter bar shows the saved defaults' Kelly trim at one band, or why it cannot.
 
-    The live-rule line names where the bar shows the saved defaults' rule (a
-    band and a Tier floors setting); when they trim to Kelly, this says which
-    Trim to Kelly and Min. price rise choices show the trim there. It reads
-    the trim grids the script reads (gridAt and riseGridAt in _FILTER_JS):
-    the ones with adding to held pairs on when the saved defaults add to held
-    pairs, else the others, each with the tier floors on or off. A minimum
-    is shown at the band only where some k and cap of it has a chunk at that
-    minimum: the minimum's own entry in the cell, or the Trim to Kelly cell
-    itself where no minimum changes that cell's run (a null cell), as the
-    script's chunkAt picks it.
+    Part of the live-rule line, at the band and Tier floors setting where it
+    says the bar shows the rule. It reads the trim grids the page script
+    reads (gridAt, riseGridAt), the adding-on ones when the saved defaults
+    add to held pairs. A minimum counts as shown when some k and cap of the
+    band has a chunk for it: its own entry, or the Trim to Kelly chunk
+    where the cell is null (no minimum changes that run), as chunkAt picks.
 
     Args:
-        bar (dict | None): _filter_payload's base block ("grid_trim",
-            "grid_trim_off", "grid_trim_add" and "grid_trim_add_off", each
-            [band][k][cap] -> chunk id or null, or null when the page has no
-            such view; "trim_rises": [{label, value}] per minimum the page
-            offers; "grid_trim_rise" and its three twins: [band][k][cap] ->
-            null or one chunk id per minimum), or None without a filter bar.
+        bar (dict | None): _filter_payload's base block (the "grid_trim*"
+            and "grid_trim_rise*" grids and "trim_rises"), or None without a
+            filter bar.
         band_index (int | None): The band's index in the bar (None with no bar).
         tier_on (bool): True for the Tier floors on grids, False for the off ones.
         adds (bool): Whether the saved defaults add to held pairs.
@@ -4689,18 +4677,15 @@ def _trim_choice_in_bar(bar: dict | None, band_index: int | None, tier_on: bool,
 
     Returns:
         str: 'choose Trim to Kelly on and Min. price rise "10c" in the filter
-            bar to see it' ("any" with no saved minimum); "this page has no
-            Trim to Kelly view" (ending " with Add to held pairs on" when the
-            saved defaults add to held pairs) when that setting's trim grid
-            holds no chunk at the band; "this page cannot show that minimum
-            price rise" when the page does not offer the saved minimum, or
-            no chunk of the band shows it.
+            bar to see it' ("any" with no minimum); "this page has no Trim to
+            Kelly view" (plus " with Add to held pairs on" when they add)
+            when the grid holds no chunk at the band; or "this page cannot
+            show that minimum price rise".
 
     Raises:
         Nothing. It only reads the bar's entries.
     """
-    # The grids the script reads for this setting: adding to held pairs on or
-    # off, the tier floors on or off
+    # The grids the script reads for this setting
     suffix = ("_add" if adds else "") + ("" if tier_on else "_off")
     grid = None if bar is None else bar.get("grid_trim" + suffix)
     row = (grid[band_index] if grid is not None and band_index is not None
@@ -4746,10 +4731,9 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
     which Sell options show it, if any (_sell_choice_in_bar). When they trim
     to Kelly, it says so last (backtester._live_trim_note) and, where the
     page shows the rule, which Trim to Kelly and Min. price rise choices show
-    the trim, or why they cannot (_trim_choice_in_bar). The page never shows
-    trimming and selling together (Trim to Kelly on shuts Sell), so when the
-    saved defaults do both, the trim clause says so, and the Sell clause
-    offers the selling alone instead of the whole rule.
+    it, or why they cannot (_trim_choice_in_bar). The page never shows trimming and selling
+    together, so when the defaults do both the trim clause says so and the
+    Sell clause offers the selling alone.
 
     Args:
         sweep (BacktestSweep | None): The run's sweep payload, or None.
@@ -4844,9 +4828,8 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
         add_note += (" — choose Add to held pairs on in the filter bar to see it"
                      if _add_on_shown_at(bar, *shown)
                      else " — this page has no Add to held pairs view")
-    # Selling, likewise: the Sell options are named only where the line shows
-    # the rule. With trimming saved too, they show the selling alone: the page
-    # never shows a sell level and trimming together
+    # Selling, likewise. With trimming saved too, the Sell options show the
+    # selling alone: the page never shows the two together
     sell_note = _live_sell_note(sweep)
     trim_note = _live_trim_note(sweep)
     if sell_note and shown is not None:
@@ -4854,8 +4837,8 @@ def _live_rule_html(sweep: BacktestSweep | None, *, bar: dict | None) -> str:
         seen = "the selling alone" if trim_note else "it"
         sell_note += (f" — choose {choice} in the filter bar to see {seen}" if choice is not None
                       else " — this page cannot show that Sell level and minimum of days")
-    # Trimming to Kelly, last, as on the run's log line: the Trim to Kelly and
-    # Min. price rise choices are named only where the line shows the rule
+    # Trimming to Kelly, last, as on the run's log line; its choices are named
+    # only where the line shows the rule
     if trim_note and shown is not None:
         trim_note += " — " + ("this page cannot show trimming together with selling"
                               if sell_note else
@@ -6371,10 +6354,8 @@ _ADD_ON_SAVE_NOTE = ("The live defaults add to held pairs; saving with Add to he
 # is _trim_select_title's)
 _TRIM_OPTION_OFF = "off"
 _TRIM_OPTION_ON = "on (sell down to the Kelly size)"
-# The days between two of the backtest's weekly runs (its checkpoints step a
-# week at a time, backtester._sale_checkpoints). A wait after a trade that is
-# no longer than this never holds a Kelly trim back on the page, and the
-# Trim to Kelly select's hover text says so
+# Days between two of the backtest's weekly runs: a wait after a trade no
+# longer than this never holds a Kelly trim back on the page
 _DAYS_BETWEEN_WEEKLY_RUNS = timedelta(weeks=1).days
 
 
@@ -6382,42 +6363,27 @@ def _trim_select_title(days) -> str:
     """
     The Trim to Kelly select's hover text: what "on" does, and how long a trim waits after a trade.
 
-    The number is not checked here: the backtest checks it before it runs
-    (backtester._resolve_trim_min_days). A value that is no number (a string,
-    None, a list), or one that cannot be compared with a number of days (a
-    decimal NaN), still gives a text, so drawing the filter bar does not
-    fail over it.
+    The number is not checked here (the backtest checks it before it runs).
+    A value that cannot be compared with a number of days still gives a
+    text, so drawing the filter bar never fails over it.
 
     Args:
-        days: How many calendar days a held pair must go without a trade
-            before it is trimmed (backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE,
-            as the page's trim runs read it), as it stands.
+        days: Calendar days a held pair must go without a trade before a
+            trim (backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE), as it stands.
 
     Returns:
-        str: The rule in plain words. With a wait, a pair is trimmed only
-            when at least that many days have passed since its last
-            purchase, add-on or trim; with a wait no longer than the week
-            between runs, the text adds that it never holds a trim back on
-            this page, and, after the part about trades, how a live run
-            counts the wait (every fill on either market, by hand too, and
-            no trim while Kalshi's list of fills does not reach back that
-            far). With 0, a pair can be trimmed at any weekly run. It
-            then says what Save as live defaults saves: from a page that
-            simulated trimming, this choice and the Min. price rise shown
-            (from any other page, the saved ones are kept), and, with this
-            on, no selling from a page that simulated selling (Sell is shut
-            at no selling) or the saved sell level from one that did not
-            (the address then names no sell level). It ends with the
+        str: The rule in plain words: the wait (at a week or less, that it
+            never holds a trim back here) and, when there is one, how a live
+            run counts it; what Save as live defaults saves; and the
             sections that always show trimming off.
     """
     try:
-        # No wait at all, a single day, and whether the week between two
-        # runs already covers the wait
+        # No wait, a one-day wait, and whether the week between runs covers it
         none, one = bool(days == 0), bool(days == 1)
         covered = bool(days <= _DAYS_BETWEEN_WEEKLY_RUNS)
     except (TypeError, ValueError, ArithmeticError):
-        # Not a number a week can be compared with (a decimal NaN raises an
-        # ArithmeticError when it is ordered): nothing is claimed of it
+        # Not comparable with a number of days (a decimal NaN raises
+        # ArithmeticError): claim nothing about it
         none = one = covered = False
     if none:
         wait = "A pair can be trimmed at any weekly run after a trade on it. "
@@ -6536,9 +6502,8 @@ def _trim_rise_phrase(rise: float) -> str:
     return _backtester._trim_rise_label(rise)
 
 
-# Beside the save button on a page with the Trim to Kelly view whose saved
-# live defaults trim to Kelly: saving from the bar sends the choice shown, and
-# "off" turns live trimming off in the defaults
+# Beside the save button on a page with the Trim to Kelly view, when the saved
+# live defaults trim: saving with "off" shown turns live trimming off
 _TRIM_SAVE_NOTE = ("The live defaults trim to Kelly; saving with Trim to Kelly off here turns "
                    "that off.")
 
@@ -6959,11 +6924,12 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
     What the filter bar's save button sends besides the scenario on screen.
 
     The button opens the defaults server's confirmation page with the bar's
-    scenario in the address (its spread band, Tier floors choice, k, size cap, Add to
-    held pairs choice, Sell level, Min. days to maturity, Trim to Kelly choice, Min.
-    price rise and any category or tag); this is the rest
-    of that address, fixed when the page is built. The server accepts no source note but one of the
-    shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows, so the note is checked
+    scenario in the address (its spread band, Tier floors choice, k, size
+    cap, Add to held pairs choice, Sell level, Min. days to maturity, Trim
+    to Kelly choice, Min. price rise and any category or tag); this is the
+    rest of that address, fixed when the page is built. The server accepts
+    no source note but one of the shapes
+    config.LIVE_DEFAULTS_SOURCE_PATTERN allows, so the note is checked
     against that pattern here, as the server checks it (whole, ASCII digits
     only), and left out should it ever not match.
 
@@ -6994,8 +6960,8 @@ def _save_target(sweep: BacktestSweep | None, start_date: date, today: date,
             held pairs, as the run recorded them; the note beside the save
             button says so on a page with the Add to held pairs view);
             "live_sells" (whether they sell: the Sell view's save note shows only then);
-            "live_trims" (whether they trim to Kelly: the Trim to Kelly view's
-            save note shows only then);
+            "live_trims" (whether they trim: the Trim to Kelly view's save
+            note shows only then);
             "max_names" (config.DEFAULTS_SERVER_MAX_FILTER_NAMES: the most
             categories, and the most tags, the server takes on one address).
     """
@@ -12614,8 +12580,7 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     The Trim to Kelly select after it offers the run as simulated ("off",
     selected) or the same scenario with held pairs sold down to their Kelly
     size ("on (sell down to the Kelly size)"), its title carrying the detail
-    (_trim_select_title, at backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE as
-    the page's trim runs read it); a payload with no trim view ("grid_trim" null)
+    (_trim_select_title); a payload with no trim view ("grid_trim" null)
     puts a grey note beside it by its "trim_state" (_TRIM_NOTES), and the
     script never enables it.
     The "Min. price rise" select after it offers "any" (selected: no
@@ -12657,11 +12622,10 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
     shows one of _SAVE_BLOCKED_TEXT's reasons in its place. On a page with the add-on view whose saved live defaults add to
     held pairs (save["live_adds_to_held_pairs"]), a grey note
     (_ADD_ON_SAVE_NOTE) follows the button: saving with the Add to held
-    pairs choice off turns that off. _TRIM_SAVE_NOTE does the same for
-    trimming to Kelly on a page with the Trim to Kelly view
-    (save["live_trims"]), and _SELL_SAVE_NOTE for selling on a page with the
-    Sell view (save["live_sells"]), in the order of their selects. Then the
-    "Trade using defaults…" link
+    pairs choice off turns that off. _TRIM_SAVE_NOTE (save["live_trims"])
+    and _SELL_SAVE_NOTE (save["live_sells"]) do the same for trimming and
+    selling, in the order of their selects. Then the "Trade using
+    defaults…" link
     (_trade_link_html), which the script never touches, and the note that
     both need the defaults server running.
 
@@ -12735,8 +12699,7 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                  '&nbsp;<span id="flt-trim-note" style="color:#9E9E9E; font-size:13px;">'
                  f"{html.escape(_TRIM_NOTES.get(trim_state, _TRIM_NOTES['not simulated']))}"
                  "</span>")
-    # The rule names how many days a pair must go without a trade before it
-    # is trimmed, read as the page's trim runs read it
+    # The hover text names the wait after a trade, as the page's trim runs read it
     trim_title = html.escape(_trim_select_title(_backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE))
     # The Min. price rise choice: any (no minimum, value "0") or a minimum,
     # each option's value its place in the payload's trim_rises plus one
@@ -13041,11 +13004,10 @@ def _pack_text(raw: str) -> str:
 # gridAt picks the trim grid: riseGridAt), and where that cell is null — no
 # minimum changes the run — the Trim to Kelly chunk itself (chunkAt). Its
 # phrase is Python's (D.trim_rises[i - 1].phrase, after D.text.trim). Sell
-# stays shut at any minimum; the minimum shown goes into the save button's
-# address beside the Trim to Kelly choice (saveHref: trim_min_rise, "off"
-# for any and while trimming is off), and like Trim to
-# Kelly it reaches neither the k-hat figures, the interval-discount section
-# nor the scenario explorer. A chunk at or past D.inline_chunks is a
+# stays shut at any minimum; the minimum goes into the save button's address
+# (saveHref: trim_min_rise, "off" for any or with trimming off), and like
+# Trim to Kelly it reaches neither the k-hat figures, the interval-discount
+# section nor the scenario explorer. A chunk at or past D.inline_chunks is a
 # sidecar file in D.sidecar_dir, loaded through a <script src> element whose
 # one call to window.__dashChunk hands over its packed text (sidecarText),
 # inflated by the same code as a block in the page (inflateText); a file
@@ -13096,17 +13058,16 @@ def _pack_text(raw: str) -> str:
 # live defaults…" button whenever the scenario on screen (SHOWN, never the
 # selects' choice while a chunk loads) can become the live defaults, and a
 # click opens the defaults server's confirmation page for that scenario in a
-# new tab (saveHref: D.save's address and the axes' values, with the Add to held pairs
-# choice on a page with the add-on view, the Sell level and minimum, or "off" for
-# both, on a page with the Sell view, and the Trim to Kelly choice and the
-# minimum price rise, always together, on a page with the Trim to Kelly view;
-# the button's words are
-# Python's — its hover text too, which reads as Python rendered it except
-# while the ticks themselves cannot be saved: too many names, a category
-# whose name holds the separator, or one that another category repeats in
-# other letter case (ticksBlocked, D.text.save_*)). On load it inflates the base block and the primary scenario's
-# chunk, sets the bar back to the view Python rendered and enables it — it
-# redraws nothing until a <select> changes. A chunk is inflated when a
+# new tab (saveHref: D.save's address and the axes' values, plus each of the
+# Add to held pairs choice, the Sell level and minimum ("off" for both under
+# no selling) and the Trim to Kelly choice with its minimum price rise, on a
+# page with that view; the button's words are Python's — its hover text too,
+# which reads as Python rendered it except while the ticks themselves cannot
+# be saved: too many names, a category whose name holds the separator, or one
+# that another category repeats in other letter case (ticksBlocked,
+# D.text.save_*)). On load it inflates the base block and the primary
+# scenario's chunk, sets the bar back to the view Python rendered and enables
+# it — it redraws nothing until a <select> changes. A chunk is inflated when a
 # scenario needs it and kept while among the last KEEP drawn (the primary's
 # always); a choice made while a chunk is still inflating supersedes it (SEQ),
 # and a chunk that cannot be loaded puts every select back on the scenario

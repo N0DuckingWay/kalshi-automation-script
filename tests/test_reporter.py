@@ -866,17 +866,17 @@ def make_sale(status: str = "sold", *, sold: dict | None = None, error: str | No
 def make_trim(status: str = "sold", *, sold: dict | None = None, error: str | None = None,
               sell: int = 13, held: int = 30) -> reporter.SaleResult:
     """
-    Build a Kelly trim of make_sale's pair as trader.sell_positions returns it.
+    Build a Kelly trim of make_sale's pair, as trader.sell_positions returns it.
 
-    The account holds `held` (30) YES on SELL-A and NO on SELL-B, which cost
-    $18.80 in all; the trim sells `sell` (13) of each, at average bids of 0.55
-    and 0.42. Its cost is the sold share of the pair's, 18.80 x 13 / 30, and
-    selling returns 13 x 0.55 - 0.23 + 13 x 0.42 - 0.23 = $12.15 after the fees.
+    The account holds `held` YES on SELL-A and NO on SELL-B, costing $18.80 in
+    all; the trim sells `sell` of each at bids of 0.55 and 0.42. At the defaults
+    (13 of 30) its cost is 18.80 x 13 / 30 and it returns
+    13 x 0.55 + 13 x 0.42 - $0.46 of fees = $12.15.
 
     Args:
         status (str): The sale's status.
-        sold (dict | None): Keyword-only. Contracts sold per held ticker;
-            None for `sell` on each market.
+        sold (dict | None): Keyword-only. Contracts sold per ticker; None for
+            `sell` on each.
         error (str | None): Keyword-only. The sale's error.
         sell (int): Keyword-only. Contract pairs the trim sells.
         held (int): Keyword-only. Contract pairs the account holds.
@@ -954,9 +954,8 @@ class TestSaleRows:
 
     def test_a_kelly_trim_says_how_many_of_the_pairs_held_it_sells(self):
         row = reporter._sale_to_row(make_trim(), datetime(2026, 10, 8, 16, 0, tzinfo=UTC))
-        # The fee on each market's sale of the 13 sold, by hand:
-        # 0.07 x 13 x 0.55 x 0.45 = 0.2252 and 0.07 x 13 x 0.42 x 0.58 = 0.2217,
-        # each rounded up to the cent
+        # Each market's fee on selling 13, by hand, rounded up to the cent:
+        # 0.07 x 13 x 0.55 x 0.45 = 0.2252 and 0.07 x 13 x 0.42 x 0.58 = 0.2217
         assert (config.fee_leg_exact(13, 0.55), config.fee_leg_exact(13, 0.42)) == (0.23, 0.23)
         cost = 18.80 * 13 / 30
         realized = 13 * 0.55 + 13 * 0.42 - 0.46 - cost
@@ -971,7 +970,7 @@ class TestSaleRows:
         ]
         assert (round(cost, 2), round(realized, 2)) == (8.15, 4.0)
         assert len(row) == len(reporter._TRADE_COLUMNS)
-        # Not the fee on the 30 held, which a take-profit sale of the pair pays
+        # Not the fee on all 30 held, which a take-profit sale of the pair pays
         assert "fees=$1.04" in reporter._sale_to_row(make_sale(), datetime(2026, 10, 8,
                                                                            tzinfo=UTC))[17]
 
@@ -997,7 +996,7 @@ class TestSaleRows:
                            "9 days left, fees=$1.04] ")
 
     def test_a_plan_with_no_kind_is_a_take_profit_sale(self):
-        # A plan object from before the kind existed reads as it always did
+        # A plan with no `kind` field is written as a take-profit sale
         sale = make_sale()
         bare = SimpleNamespace(**{name: getattr(sale.plan, name) for name in (
             "title", "legs", "count", "cost_dollars", "ladders", "walked",

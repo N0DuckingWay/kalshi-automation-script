@@ -2,9 +2,8 @@
 leg-side tuples, the deadline-gap tier (with the backtest's spread band and
 tier-floors switch), the live toggles (LiveSettings and its helpers), the saved
 live defaults (their file's reader and writer, the seed, and the comparison of
-two sets of defaults), the weekly run schedule (ScheduledRun), the wait a
-Kelly trim observes after a trade (kelly_trim_rested, kelly_trim_min_days,
-trade_day), the values
+two sets of defaults), the weekly run schedule (ScheduledRun), the wait
+before a Kelly trim (kelly_trim_rested, kelly_trim_min_days, trade_day), the values
 config.py ships, conftest's apply_pre_toggle_defaults, the V2 order path's
 self-trade-prevention value, the startup check that refuses any order path but
 "v2" (order_api_version_error), the order-write pacer's budget, the live-run
@@ -1091,20 +1090,18 @@ class TestLiveSettings:
             dataclasses.replace(_settings(), trim_to_kelly=bad)
 
     def test_trimming_defaults_to_off_with_no_minimum(self):
-        # A construction that names neither reads trimming as off (a saved
-        # file that leaves them out: TestSavedLiveDefaults)
+        # Naming neither reads trimming as off
         s = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
         assert s.trim_to_kelly is False and s.trim_min_rise is None
         assert _settings().trim_to_kelly is False and _settings().trim_min_rise is None
         on = _settings(trim_to_kelly=True)
         assert on.trim_to_kelly is True and on.trim_min_rise is None
-        # None is a value, and replace takes both back
+        # replace can turn both back off
         both = _settings(trim_to_kelly=True, trim_min_rise=0.10)
         assert dataclasses.replace(both, trim_to_kelly=False, trim_min_rise=None) == _settings()
 
-    # 0.07 and 0.125 sit between two 5c steps; 1e-7 and 1e-6 round to zero
-    # steps (within PRICE_EPSILON of 0); 1.05 is one step past $1; 10 is ten
-    # dollars, not ten cents
+    # 0.07 and 0.125 sit between 5c steps; 1e-7 and 1e-6 round to zero steps;
+    # 1.05 is past $1; 10 is ten dollars, not ten cents
     @pytest.mark.parametrize("bad", [
         0, 0.0, -0.05, 0.01, 0.07, 0.125, 0.049, 1.05, 1.01, 2, 10, 100, 1e-7, 1e-6,
         float("nan"), float("inf"), float("-inf"), 1e308, 10 ** 400, True, False,
@@ -1116,8 +1113,7 @@ class TestLiveSettings:
             dataclasses.replace(_settings(trim_to_kelly=True), trim_min_rise=bad)
 
     def test_trim_min_rise_names_its_grid_or_its_type(self):
-        # A number off the grid names the grid; anything that is no number
-        # (a bool included) says a number of dollars is wanted
+        # Off the grid names the grid; a non-number (a bool too) asks for dollars
         with pytest.raises(ValueError, match=re.escape(
                 "trim_min_rise must be a multiple of 5c from 5c to $1, got 0.07")):
             _settings(trim_to_kelly=True, trim_min_rise=0.07)
@@ -1138,9 +1134,8 @@ class TestLiveSettings:
         assert one.trim_min_rise == 1.0 and type(one.trim_min_rise) is float
 
     def test_trim_min_rise_is_normalised_onto_the_grid(self):
-        # 0.05 * 3 is 0.15000000000000002; a minimum from any source is
-        # float-equal to its cents over 100, which is how the dashboard's
-        # Min. price rise options (TRIM_MIN_PRICE_RISES) spell them
+        # 0.05 * 3 is 0.15000000000000002; every minimum comes back as its cents
+        # over 100, as the dashboard's options (TRIM_MIN_PRICE_RISES) spell them
         assert 0.05 * 3 != 0.15
         assert _settings(trim_to_kelly=True, trim_min_rise=0.05 * 3).trim_min_rise == 0.15
         for steps in range(1, 21):
@@ -1165,8 +1160,7 @@ class TestLiveSettings:
         assert dataclasses.replace(on, trim_to_kelly=False, trim_min_rise=None) == _settings()
 
     def test_a_bad_minimum_is_named_before_the_switch_it_needs(self):
-        # Off the grid with trimming off: the value itself is refused first,
-        # so the message never asks for trimming to hold a minimum that is no minimum
+        # Off the grid with trimming off: the bad value is named first
         with pytest.raises(ValueError, match="multiple of 5c"):
             _settings(trim_min_rise=0.07)
 
@@ -1177,13 +1171,12 @@ class TestLiveSettings:
         ("CLAUDE.md", "missing for the minimum: a `trim_min_rise` setting on `LiveSettings`"),
     ])
     def test_the_docs_do_not_say_live_has_no_trim_setting(self, doc, stale):
-        # trim_to_kelly and trim_min_rise are live settings (saved, shown and
-        # passed as flags), so neither document may say live trading has no
-        # setting for trimming or for its minimum price rise
+        # Both trim settings are live settings, so neither document may say
+        # live trading lacks them
         assert {"trim_to_kelly", "trim_min_rise"} <= set(config.LIVE_TOGGLE_FIELDS)
         text = (pathlib.Path(__file__).resolve().parent.parent / doc).read_text(
             encoding="utf-8")
-        # Whitespace is collapsed, so a sentence wrapped over two lines is still read
+        # Whitespace is collapsed, so a sentence wrapped over lines still matches
         assert stale not in " ".join(text.split())
 
     def test_every_optional_toggle_is_a_field_with_a_default_at_the_end(self):
@@ -2347,12 +2340,12 @@ class TestKellyTrimCount:
 
 
 class TestKellyTrimBids:
-    """config.kelly_trim_bids: the bids of a held side a live Kelly trim may
-    sell into, those within KELLY_TRIM_MAX_BID_DROP of the best bid."""
+    """config.kelly_trim_bids: which bids of a held side a live Kelly trim may
+    sell into (those within KELLY_TRIM_MAX_BID_DROP, 20c, of the best bid)."""
 
     def test_the_reach_is_the_backtests_modeled_ladders(self):
-        # The backtest's modeled ladder ends at the last of DEPTH_MODEL_DISTANCES
-        # below the best bid, so it can never sell lower than that
+        # Live reaches as deep as the backtest's modeled bid ladder, whose last
+        # step is the last of DEPTH_MODEL_DISTANCES
         assert config.KELLY_TRIM_MAX_BID_DROP == config.DEPTH_MODEL_DISTANCES[-1] == 0.20
         assert max(config.DEPTH_MODEL_DISTANCES) == config.DEPTH_MODEL_DISTANCES[-1]
 
@@ -2372,9 +2365,8 @@ class TestKellyTrimBids:
         assert kept[0] is ladder[0] and kept[1] is ladder[1]
 
     def test_a_bid_exactly_the_reach_below_is_kept_on_every_whole_cent(self):
-        # In floats 0.55 - 0.20 is a hair above 0.35 and 0.42 - 0.20 a hair below
-        # 0.22: the bid exactly 20c under the best one is kept either way, and
-        # the one a cent lower is not
+        # Float subtraction lands a hair either side of the cent; a bid exactly
+        # 20c under the best is kept either way, one a cent lower is not
         assert 0.55 - 0.20 > 0.35 and 0.42 - 0.20 < 0.22
         for cents in range(22, 100):
             best, at, under = cents / 100, (cents - 20) / 100, (cents - 21) / 100
@@ -2505,14 +2497,12 @@ _BAD_TRIM_DAYS = r"KELLY_TRIM_MIN_DAYS_SINCE_TRADE must be a whole number from 0
 
 
 class TestKellyTrimRested:
-    """config.kelly_trim_rested and config.kelly_trim_min_days: the wait a
-    Kelly trim observes after any trade on a held pair.
+    """config.kelly_trim_rested and config.kelly_trim_min_days: the calendar
+    days a held pair must go without a trade before a Kelly trim (7 as shipped).
 
-    The rule is a test of two calendar dates against a checked whole number
-    of days (KELLY_TRIM_MIN_DAYS_SINCE_TRADE, 7). It reads no schedule and no
-    clock, so it holds whether runs are a week apart, a day apart or several
-    in one day. Nothing but two plain dates and such a number gets an answer:
-    a missing last trade is an error, never "rested".
+    The rule compares two plain dates with a checked number of days and reads
+    no clock or schedule, so it holds however often runs happen. A missing
+    last trade is an error, never "rested".
     """
 
     def test_seven_days_ship(self):
@@ -2533,9 +2523,8 @@ class TestKellyTrimRested:
         assert config.kelly_trim_rested(last, day, 7) is (gap >= 7)
 
     def test_the_gap_alone_decides_from_any_start_day(self):
-        # Every start day of two years (a leap day, the year's end and both
-        # clock-change days among them), every gap up to 32 days, every wait
-        # the tests use: the answer is the calendar gap against the wait
+        # Every start day of 2027-2028 (a leap day and clock changes among
+        # them), gaps up to 32 days, several waits: only the calendar gap decides
         first = date(2027, 1, 1)
         assert date(2028, 2, 29) > first  # 2028 is a leap year
         for offset in range(731):
@@ -2549,7 +2538,7 @@ class TestKellyTrimRested:
     @pytest.mark.parametrize("wait", [0, 1, 7, 30])
     @pytest.mark.parametrize("ahead", [1, 2, 7, 8, 30, 365])
     def test_a_last_trade_after_the_day_never_rests(self, ahead, wait):
-        # A date in the future is no evidence of rest, even with no wait
+        # A last trade dated after the day never counts as rested, even with no wait
         day = date(2026, 10, 13)
         assert config.kelly_trim_rested(day + timedelta(days=ahead), day, wait) is False
 
@@ -2596,9 +2585,8 @@ class TestKellyTrimRested:
                 config.kelly_trim_rested(day, None, wait)
 
     def test_a_datetime_is_refused(self):
-        # Two datetimes differ by whole 24-hour spans: a trade at 11pm on the
-        # 6th and a run at 9am on the 13th are 7 calendar days apart but only
-        # 6 such spans. A datetime is a date by subclass, so it is refused
+        # Datetimes count 24-hour spans, not calendar days (11pm on the 6th to
+        # 9am on the 13th is 6 spans but 7 days), so they are refused
         last = datetime(2026, 10, 6, 23, 0, tzinfo=UTC)
         now = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
         assert (now - last).days == 6
@@ -2659,9 +2647,8 @@ class TestKellyTrimRested:
     def test_min_days_refuses_a_numpy_duration(self, unit):
         import numpy as np
 
-        # numpy counts a duration (timedelta64) as a whole number, but 7
-        # nanoseconds, 7 months and 7 ticks with no unit are not 7 days, and
-        # 7 days written as a duration is not the plain number the wait is
+        # numpy counts a duration (timedelta64) as a whole number, but it is
+        # not a plain number of days, so it is refused in any unit
         duration = np.timedelta64(7) if unit is None else np.timedelta64(7, unit)
         assert isinstance(duration, numbers.Integral)
         with pytest.raises(ValueError, match=_BAD_TRIM_DAYS) as refused:
@@ -2671,7 +2658,7 @@ class TestKellyTrimRested:
     def test_a_wait_written_as_a_month_is_not_read_as_one_day(self):
         import numpy as np
 
-        # A pair traded yesterday is never rested against a wait of a month
+        # A duration gets no answer, so a month is never read as one day
         day = date(2026, 10, 13)
         for wait in (np.timedelta64(1, "M"), np.timedelta64(1, "Y"), np.timedelta64(7, "ns"),
                      np.timedelta64(1), np.timedelta64(1, "D")):
@@ -2695,9 +2682,9 @@ class TestKellyTrimRested:
             config.kelly_trim_min_days(11)
 
     def test_the_rule_reads_only_what_it_is_handed(self):
-        # The wait is a test of two dates and a number: no schedule, no clock
-        # and no weekday is read, so it holds however often a run happens.
-        # trade_day reads the zone of the schedule it is handed and no more
+        # Each function may read only the names listed: no clock, no weekday,
+        # and no schedule but the one handed to trade_day, so the wait holds
+        # however often runs happen
         tree = ast.parse(pathlib.Path(config.__file__).read_text())
         allowed = {
             "kelly_trim_min_days": {"isinstance", "bool", "numbers", "operator", "TypeError",
@@ -2705,9 +2692,8 @@ class TestKellyTrimRested:
             "trade_day": {"isinstance", "datetime", "ScheduledRun", "TypeError"},
             "kelly_trim_rested": {"type", "date", "TypeError", "kelly_trim_min_days"},
         }
-        # What each function may read off a name it is allowed: trade_day only
-        # the zone of its schedule, and kelly_trim_min_days only operator.index,
-        # which refuses a numpy duration where int() would read one as days
+        # Attributes allowed: trade_day reads only its schedule's zone, and
+        # kelly_trim_min_days only operator.index (which refuses a numpy duration)
         attributes = {("trade_day", "run"): {"zone"},
                       ("kelly_trim_min_days", "operator"): {"index"}}
         found = 0
@@ -2734,10 +2720,10 @@ _PACIFIC = ZoneInfo("America/Los_Angeles")
 
 def _pacific_day_by_hand(moment: datetime) -> date:
     """
-    Work out the Pacific calendar day of a 2026 moment without the tz database.
+    Work out a 2026 moment's Pacific day by hand, as a check on trade_day.
 
-    Pacific daylight time (UTC-7) runs from 10:00 UTC on 2026-03-08 to 09:00
-    UTC on 2026-11-01; standard time (UTC-8) holds outside it.
+    Daylight time (UTC-7) runs from 10:00 UTC on 2026-03-08 to 09:00 UTC on
+    2026-11-01; standard time (UTC-8) holds otherwise.
 
     Args:
         moment (datetime): A UTC time in 2026.
@@ -2751,13 +2737,11 @@ def _pacific_day_by_hand(moment: datetime) -> date:
 
 
 class TestTradeDay:
-    """config.trade_day: the calendar day a moment falls on, on the bot's own
-    clock (the zone of its schedule, Pacific time as shipped).
+    """config.trade_day: the calendar day a moment falls on, in the zone of the
+    bot's schedule (Pacific as shipped).
 
-    The wait before a Kelly trim counts days between two of these, so a trade
-    late in the Pacific evening belongs to that evening's day although it is
-    already the next day in UTC. A time with no zone has no knowable day and
-    is refused.
+    The trim wait counts these days, so a late-evening Pacific trade counts on
+    that evening's day, not the next UTC day. A time with no zone is refused.
     """
 
     def test_1159pm_and_1201am_pacific_are_two_days(self):
@@ -2888,8 +2872,8 @@ class TestTradeDay:
                 return None
 
         moment = datetime(2026, 10, 14, 0, 30, tzinfo=UTC)
-        # A stand-in whose zone() gives None would otherwise be read on
-        # whatever zone this computer keeps
+        # Only a real ScheduledRun is accepted: a stand-in whose zone() returns
+        # None would put the day in this computer's own time zone
         for bad in (None, "America/Los_Angeles", _PACIFIC, UTC, _NoZone(), MagicMock()):
             with pytest.raises(TypeError, match="trade_day reads the zone of a ScheduledRun"):
                 config.trade_day(moment, bad)
@@ -2951,8 +2935,8 @@ class TestTradeDay:
                                               config.trade_day(run, SCHEDULED_RUN), 7)
             by_hand = (_pacific_day_by_hand(run) - _pacific_day_by_hand(fill)).days >= 7
             assert rested is by_hand, (fill, run)
-            # Calendar days, so the wait is never under six days less the hour
-            # a clock change can take, and never over seven days plus that hour
+            # In elapsed time, rested needs over 6 days less an hour, and 7 days
+            # plus an hour is always enough (a clock change moves an hour)
             if rested:
                 assert run - fill > timedelta(days=6) - timedelta(hours=1), (fill, run)
             if run - fill >= timedelta(days=7, hours=1):
@@ -3016,10 +3000,9 @@ class TestDescribeLiveSettings:
 
     # One departing value per live toggle (config.LIVE_TOGGLE_FIELDS) and the
     # mark it must carry; a new toggle fails test_every_field_has_a_departure_row
-    # until it has a row. Each departs from _REFERENCE, which sells at 85% and
-    # trims to Kelly: a minimum of days has no meaning without a level, nor a
-    # minimum price rise without trimming, so the level's own departure is to
-    # selling nothing and the trim switch's is to off
+    # until it has a row. _REFERENCE sells and trims, since a minimum of days
+    # needs a sell level and a minimum price rise needs trimming; those two
+    # depart by turning off
     _REFERENCE = _settings(sell_at=0.85, trim_to_kelly=True)
     _DEPARTURES = {
         "tier_floors": (False, "tier floors off (config: on)"),
@@ -3056,9 +3039,7 @@ class TestDescribeLiveSettings:
             assert mark in line, (name, line)
 
     def test_trimming_renders_on_or_off_and_the_rise_in_whole_cents(self):
-        # Off with no minimum, on with none, then every 5c step as its whole
-        # cents. One step's dollars times 100 is not whole (0.55 * 100 is
-        # 55.00000000000001), so each must print as its exact cents
+        # Each 5c step prints as its exact cents (0.55 * 100 is 55.00000000000001)
         assert [c for c in range(5, 101, 5) if c / 100 * 100 != c] == [55]
         assert config.describe_live_settings(_settings()).endswith(
             "trim to Kelly off | min price rise any")
@@ -3293,10 +3274,9 @@ class TestLiveRuleWarnings:
 
 
 class TestTrimChangeWarnings:
-    """trim_change_warnings: with the Kelly trim on, a lower size cap for
-    either pair type, or a higher k, sells more of the held pairs than the
-    settings in force would, before anything is bought. One sentence names
-    every such change; nothing else is said."""
+    """trim_change_warnings: with the Kelly trim on, a lower size cap or a
+    higher k can sell more of the held pairs. One sentence names every such
+    change, and nothing else is warned about."""
 
     # A per-trade and a same-title cap of 20%, k 0.8, the Kelly trim on
     _NOW = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True)
@@ -3354,8 +3334,8 @@ class TestTrimChangeWarnings:
         assert config.trim_change_warnings(before, after) == []
 
     def test_turning_trimming_on_is_judged_by_the_settings_it_trims_by(self):
-        # Saved off, proposed on with a lower cap: the new cap is what the
-        # first trims read, so the change is named
+        # Saved off, proposed on with a lower cap: the first trims use the new
+        # cap, so it is named
         off = dataclasses.replace(self._NOW, trim_to_kelly=False)
         assert config.trim_change_warnings(off, dataclasses.replace(self._NOW, size_cap=0.1))
 
@@ -3762,9 +3742,8 @@ class TestLiveSettingsOrigin:
     def test_every_toggle_count_the_package_states_is_the_number_of_toggles(self):
         # Wherever a module's comments, docstrings or messages count the toggles
         # ("the twelve toggles", "twelve live toggles", "twelve toggle names"),
-        # the count is the number of toggle fields, or the number a saved file
-        # must hold (the optional ones may be left out). A comment's lines are
-        # joined first, so a count split over a line break is still read
+        # the count is the number of toggle fields or the number a saved file
+        # must hold. Comment lines are joined first, so a split count is found
         names = ("one two three four five six seven eight nine ten eleven twelve "
                  "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty").split()
         total = len(config.LIVE_TOGGLE_FIELDS)
@@ -3779,7 +3758,7 @@ class TestLiveSettingsOrigin:
             source = re.sub(r"\n[ \t]*#[ \t]*", " ", path.read_text(encoding="utf-8"))
             for match in counted.finditer(source):
                 stated.setdefault(match.group(1).lower(), set()).add(path.name)
-        # The scan reads the counts config.py and the defaults server state
+        # The scan finds the counts config.py and defaults_server.py state
         assert {"config.py", "defaults_server.py"} <= stated.get(names[total - 1], set())
         assert set(stated) <= allowed, {
             word: sorted(files) for word, files in stated.items() if word not in allowed}
@@ -3808,9 +3787,8 @@ def _valid_record(**changes) -> dict:
     Build a saved-defaults record the reader accepts, then apply changes.
 
     Its toggles are LIVE_DEFAULTS_SEED's, saved at 2026-09-27T21:05:13Z with
-    no source note, with add_to_held_pairs, sell_at, sell_min_days,
-    trim_to_kelly and trim_min_rise left out (the seven-toggle shape), which
-    reads as _SEED_ADD_ON_OFF.
+    no source note and the optional toggles left out (the seven-toggle
+    shape), so it reads as _SEED_ADD_ON_OFF.
 
     Args:
         **changes: Top-level keys to replace; a value of _DROP removes the key.
@@ -3857,15 +3835,14 @@ def _with_toggles(**changes) -> dict:
 # Marks a key _valid_record / _with_toggles should remove
 _DROP = object()
 
-# LIVE_DEFAULTS_SEED with adding to held pairs off (and, as ever, no selling
-# and no trimming): what _valid_record's seven-toggle file reads as, and what
-# a save of it writes as seven toggles
+# LIVE_DEFAULTS_SEED with adding to held pairs off (no selling or trimming
+# either): what _valid_record's seven-toggle file reads as, and what a save of
+# it writes as seven toggles
 _SEED_ADD_ON_OFF = dataclasses.replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False)
 
 # The exact bytes a save of _SEED_ADD_ON_OFF writes, with the seed's note, at
-# _FrozenDatetime's instant: add_to_held_pairs, sell_at, sell_min_days,
-# trim_to_kelly and trim_min_rise are left out, so code that does not know
-# those toggles can read a file saved with them off
+# _FrozenDatetime's instant: the optional toggles are left out while off, so
+# code that does not know them can still read the file
 _SEVEN_TOGGLE_BYTES = (
     b'{\n'
     b'  "format": "live-defaults-v1",\n'
@@ -4008,9 +3985,8 @@ class TestSavedLiveDefaults:
         assert config.read_saved_live_defaults() == settings
 
     def test_trimming_off_writes_exactly_the_bytes_written_before_it_existed(self, monkeypatch):
-        # trim_to_kelly and trim_min_rise at their defaults are not in the file
-        # at all, whether adding to held pairs is off or on: with adding off the
-        # file is byte for byte the seven-toggle one
+        # Trim settings at their defaults are left out of the file; with adding
+        # off it is byte for byte the seven-toggle file
         monkeypatch.setattr(config, "datetime", _FrozenDatetime)
         assert (_SEED_ADD_ON_OFF.trim_to_kelly, _SEED_ADD_ON_OFF.trim_min_rise) == (False, None)
         config.save_live_defaults(
@@ -4059,9 +4035,8 @@ class TestSavedLiveDefaults:
         assert config.read_saved_live_defaults() == settings
 
     def test_a_minimum_with_trimming_off_is_never_written(self):
-        # LiveSettings refuses the pair, so no such settings exist to save; a
-        # record that holds it is refused by the reader's own parse before
-        # anything replaces the file in place
+        # LiveSettings and the saved file's parser both refuse a minimum with
+        # trimming off, and the file on disk is left as it was
         config.save_live_defaults(config.LIVE_DEFAULTS_SEED, source="")
         before = config.LIVE_DEFAULTS_FILE.read_bytes()
         with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly on"):
@@ -4102,8 +4077,8 @@ class TestSavedLiveDefaults:
         assert config.SELL_AT is None and config.LIVE_DEFAULTS_SEED.sell_at is None
 
     def test_a_file_that_leaves_trimming_out_reads_it_off(self):
-        # Neither key is there (a file saved before they existed), so nobody
-        # confirmed a value: never trimming, whatever config.py ships
+        # Neither key is in the file, so nobody chose to trim: it reads as
+        # off, whatever config.py ships
         config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(
             add_to_held_pairs=True, sell_at=0.85, sell_min_days=3)))
         saved = config.read_saved_live_defaults()
@@ -4431,8 +4406,8 @@ class TestSavedLiveDefaults:
         ("a sell minimum with no level", _text(_with_toggles(sell_min_days=3))),
         ("a sell minimum with a null level",
          _text(_with_toggles(sell_at=None, sell_min_days=3))),
-        # Trimming: the switch is true or false only, the minimum a number of
-        # dollars on the 5c grid from 5c to $1, and only with the switch on
+        # Trimming: the switch is true or false; the minimum is dollars on the
+        # 5c grid from 5c to $1, and needs the switch on
         ("trim to Kelly as 1", _text(_with_toggles(trim_to_kelly=1))),
         ("trim to Kelly as a string", _text(_with_toggles(trim_to_kelly="true"))),
         ("trim to Kelly as null", _text(_with_toggles(trim_to_kelly=None))),

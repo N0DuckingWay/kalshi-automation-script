@@ -2344,9 +2344,8 @@ class TestYesCloseDispatch:
     def test_the_header_the_help_and_the_closing_line_name_trimming_beside_selling(
         self, capsys,
     ):
-        # A trim sends the same two order shapes live selling does (the reduce-only
-        # ask that sells a held YES and the reduce-only YES bid that sells a held NO),
-        # so the step that verifies the first of them is a prerequisite of both
+        # A trim sends the same reduce-only sale orders live selling does, so the
+        # step that checks the YES sale must PASS before either is turned on
         header = " ".join(v2_probe.__doc__.split())
         assert "live selling or live trimming on" in header
         assert "what live selling and live trimming wait for" in header

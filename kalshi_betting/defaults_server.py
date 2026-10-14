@@ -62,11 +62,10 @@ Dependencies:
     live_settings_changes, describe_live_settings, live_rule_warnings,
     trim_change_warnings, live_defaults_source), live_settings_argv (a run's
     flags), the seed values and their source note, the source-note pattern,
-    the exit codes, the run result's format tag and the DEFAULTS_SERVER_*,
-    DASHBOARD_FILENAME, DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_* constants, count_text
-    (a run page writes an add-on's held count exactly) and
-    SALE_KIND_KELLY_TRIM (a run page marks a sale that is a Kelly trim, which
-    sold a held pair down to its Kelly size). From run_lock:
+    the exit codes, the run result's format tag, the DEFAULTS_SERVER_*,
+    DASHBOARD_FILENAME, DASHBOARD_MARKER_SCAN_BYTES and SCHEDULER_*
+    constants, count_text (a run page writes an add-on's held count exactly)
+    and SALE_KIND_KELLY_TRIM (a run page marks a Kelly trim). From run_lock:
     held() and holder(), to refuse a real-money run while another live
     trading run holds the machine's lock.
     It reads config.LIVE_DEFAULTS_FILE, config.PROJECT_ROOT,
@@ -405,8 +404,7 @@ _ATTENTION_STATUSES = ("rollback_failed", "manual_review")
 _TRADE_GROUPS = (("Needs attention", _ATTENTION_STATUSES), ("Completed", ("executed",)),
                  ("Would have traded", ("simulated",)))
 
-# Sale statuses (a take-profit sale's or a Kelly trim's) that need a person: a
-# pair left uneven, or an unknown outcome
+# Sale statuses that need a person: a pair left uneven, or an unknown outcome
 _SALE_ATTENTION_STATUSES = ("unbalanced", "manual_review")
 
 # A sale's status in plain words, as the trade log's Status column words it
@@ -423,7 +421,7 @@ _SALE_PROFIT_NOTE = ("Profit is what the sale returns at the bids it was priced 
                      "a held pair down to its Kelly size: part of it, or all of it when "
                      "Kelly keeps none.")
 
-# What the Position cell of a Kelly trim's row adds after the pair's title
+# Added after the title in a Kelly trim's Position cell
 _KELLY_TRIM_MARK = " (Kelly trim)"
 
 # The exit code argparse gives a command line it refuses: the run stopped
@@ -877,28 +875,26 @@ def _proposal(params: dict[str, list[str]],
     """
     Turn a confirmation request's fields into the proposed live defaults.
 
-    tier_floors ("on" / "off"), spread_min, spread_max, k and size_cap (a
-    fraction, e.g. 0.2) are required. same_title_size_cap,
-    add_to_held_pairs ("on" / "off"), sell_at ("off" or a share in (0, 1]),
-    sell_min_days ("off" or a whole number of days), trim_to_kelly ("on" /
-    "off") and trim_min_rise ("off" or a number of dollars, e.g. 0.1 for 10c)
-    may be left out: each then keeps the saved value, or the seed's when none
-    is saved or (all but the same-title cap) on a link carrying the seed's
-    note, so such a link still proposes exactly the seed, and the page shows
-    the change against what is saved. A minimum price rise kept or given
-    while trimming is off is refused, as a minimum of days is without a sell
-    level. A missing category or tag means any, whatever is saved. category
-    and tag may each be given more than once, one name per field (at most
-    config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each as sent; the very same
-    name twice is refused, and a second spelling of one name in another
-    letter case is left out); a tag needs at least one category, and a tag
-    tied to a category ("Sports · Basketball") needs that category named,
-    which LiveSettings checks, as it checks that no category is written as
-    a tied tag. source is the note the saved file will keep: left
-    out, it is empty; given, it must be one of the two shapes
-    config.LIVE_DEFAULTS_SOURCE_PATTERN allows, with ASCII digits only, and
-    the seed's note (LIVE_DEFAULTS_SEED_SOURCE) may label only the seed
-    values themselves.
+    Required: tier_floors ("on"/"off"), spread_min, spread_max, k and
+    size_cap (a fraction, e.g. 0.2). Optional: same_title_size_cap,
+    add_to_held_pairs ("on"/"off"), sell_at ("off" or a share in (0, 1]),
+    sell_min_days ("off" or whole days), trim_to_kelly ("on"/"off") and
+    trim_min_rise ("off" or dollars, e.g. 0.1 for 10c). One left out keeps
+    the saved value, or takes the seed's when none is saved or (all but
+    same_title_size_cap) when the link carries the seed's note, so such a
+    link still proposes exactly the seed. LiveSettings refuses a minimum
+    price rise with trimming off, as it refuses a minimum of days with no
+    sell level.
+
+    category and tag may each repeat, one name per field, at most
+    config.DEFAULTS_SERVER_MAX_FILTER_NAMES of each as sent; a missing one
+    means any, whatever is saved. The same name twice is refused; a second
+    spelling in another letter case is left out. A tag needs a category, and
+    a tag tied to one ("Sports · Basketball") needs that category named;
+    LiveSettings checks this, and refuses a category written as a tied tag.
+    source is the note the saved file keeps: empty when left out, else one of
+    the two shapes config.LIVE_DEFAULTS_SOURCE_PATTERN allows (ASCII digits
+    only); the seed's note may label only the seed values.
 
     Args:
         params (dict[str, list[str]]): The request's fields (_params).
@@ -910,16 +906,11 @@ def _proposal(params: dict[str, list[str]],
 
     Raises:
         ValueError: Naming the first rule the request breaks: an unknown,
-            repeated, blank or missing field (a category or tag is repeated
-            only past the most a link may name), a value that is not a plain
-            number or a printable name (or one with two spaces in a row),
-            the very same category or tag named twice, a
-            tier_floors, add_to_held_pairs or trim_to_kelly other than on or
-            off, a sell_at or trim_min_rise neither off nor a number, a
-            sell_min_days neither off nor one to six digits, a tag without a
-            category, a source of another shape, any value LiveSettings
-            refuses (a minimum price rise with trimming off among them), or
-            the seed's note on other values.
+            blank or missing field; a field given more than once (a category
+            or tag only past the cap); a malformed value (two spaces in a row
+            included); the same category or tag twice; a tag with no
+            category; a source of another shape; anything LiveSettings
+            refuses; or the seed's note on other values.
     """
     unknown = sorted(set(params) - set(_FIELDS))
     if unknown:
@@ -991,8 +982,8 @@ def _proposal(params: dict[str, list[str]],
     # applies them
     if live_defaults_source(source) != source:
         raise ValueError(f"source must have no spaces around it, got {source!r}")
-    # LiveSettings validates every value (the band, k, each cap on its grid,
-    # the names, a tied tag's category, a minimum without its switch), naming
+    # LiveSettings checks every value (the band, k, each cap on its grid, the
+    # names and a tied tag's category, a minimum without its switch) and names
     # the field it refuses
     settings = LiveSettings(
         tier_floors=value["tier_floors"] == "on",
@@ -1020,12 +1011,10 @@ def _seed_query() -> str:
     """
     Build the confirmation page's query that proposes LIVE_DEFAULTS_SEED.
 
-    Each number is written as its repr (the exact float), adding to held
-    pairs as on or off, the source note is LIVE_DEFAULTS_SEED_SOURCE, and a
-    category or tag is added only when the seed sets one (it sets none: any).
-    The sell level and the minimum of days are written as off when unset,
-    trimming to Kelly as on or off, and the minimum price rise as off when
-    unset.
+    Numbers are written as their repr (the exact float), switches as on or
+    off, an unset sell level, minimum of days or minimum price rise as off,
+    and a category or tag only when the seed sets one (it sets none: any).
+    The source note is LIVE_DEFAULTS_SEED_SOURCE.
 
     Returns:
         str: The query string, without the "?".
@@ -1303,16 +1292,15 @@ def _confirm_html(current: LiveSettings | None, settings: LiveSettings, source: 
     """
     Build the confirmation page: the defaults in force beside the proposed ones.
 
-    Every row whose value changes is highlighted, with the new value in bold
-    and a "changed" tag; any live_rule_warnings sentence is shown in red, and
-    so, against the defaults in force, is trim_change_warnings' (with the
-    Kelly trim on, a lower size cap or a higher k sells more of the held
-    pairs at the next run). The form posts back every proposal field as the
-    request gave it, with the
-    fingerprint, nonce and token, through three buttons rendered disabled
-    (the page script arms them): Dry run, Confirm and save, and, set apart
-    below a red line, Confirm and trade. A button that does not apply is a
-    placeholder with its reason.
+    Every changed row is highlighted, the new value in bold with a "changed"
+    tag. In red: any live_rule_warnings sentence, and trim_change_warnings'
+    against the defaults in force (with trimming on, a lower size cap or a
+    higher k sells more of the held pairs at the next run). The form posts
+    back every proposal field as the request gave it, with the fingerprint,
+    nonce and token, through three buttons rendered disabled (the page script
+    arms them): Dry run, Confirm and save, and, set apart below a red line,
+    Confirm and trade. A button that does not apply is a placeholder with its
+    reason.
 
     Args:
         current (LiveSettings | None): The live defaults in force, or None when none are saved.
@@ -1355,8 +1343,7 @@ def _confirm_html(current: LiveSettings | None, settings: LiveSettings, source: 
     for warning in live_rule_warnings(settings):
         parts.append(f"<p class=\"warn\">Warning: {html.escape(warning)}.</p>")
     if current is not None:
-        # With the Kelly trim on, a lower size cap or a higher k than the defaults
-        # in force sells more of the held pairs at the next run
+        # Changes that would sell more of the held pairs once trimming is on
         for warning in trim_change_warnings(current, settings):
             parts.append(f"<p class=\"warn\">Warning: {html.escape(warning)}.</p>")
     if not changes:
@@ -1594,8 +1581,8 @@ def _sale(value) -> dict | None:
 
     Returns:
         dict | None: title, status ("unknown" if unreadable), error, profit, kind
-            (None if not recorded, which reads as a take-profit sale) and
-            legs (the readable ones, each _sale_leg); None if not an object.
+            (None if not recorded: a take-profit sale) and legs (the readable
+            ones, each _sale_leg); None if not an object.
     """
     if not isinstance(value, dict):
         return None
@@ -2137,14 +2124,13 @@ def _sold_text(leg: dict) -> str:
 
 def _only_trims(sales: list[dict]) -> bool:
     """
-    Say whether every one of some sales is a Kelly trim.
+    Say whether a run's sales are all Kelly trims.
 
     Args:
         sales (list[dict]): Sales of a run result (_sale).
 
     Returns:
-        bool: True when there is at least one and each is a Kelly trim, which
-            sells a held pair down to its Kelly size (part of it, or all of it).
+        bool: True when there is at least one sale and every one is a Kelly trim.
     """
     return bool(sales) and all(s["kind"] == SALE_KIND_KELLY_TRIM for s in sales)
 
@@ -2153,9 +2139,8 @@ def _sales_html(sales: list[dict], cash_after: float | None, *, dry_run: bool) -
     """
     Show a run's sales as one short table, with the cash they left.
 
-    A sale is a take-profit sale of a whole position or a Kelly trim of a
-    held pair (part of it, or all of it); a trim's Position cell says so, and
-    its Sold cell reads what sold of what each market held.
+    A Kelly trim's Position cell is marked "(Kelly trim)"; each Sold cell
+    reads what sold of what each market held.
 
     Args:
         sales (list[dict]): The run result's sales (_sale).
@@ -2261,7 +2246,7 @@ def _outcome(run: _Run, exit_code: int | None, result: _Result, lines: list[str]
             sales = record.get("sales", [])
             done = [s for s in sales if s["status"] in ("sold", "partly_sold")]
             if done:
-                # Trims alone: each pair was sold down to its Kelly size
+                # Kelly trims alone read as "trimmed"
                 return _Outcome("Held pairs trimmed; no trades to complete"
                                 if _only_trims(done) else
                                 "Positions sold; no trades to complete", "ok",
@@ -3180,9 +3165,10 @@ class _App:
         flags (config.live_settings_argv), --result-file in the folder and,
         for a dry run, --dry-run, from config.PROJECT_ROOT, its output going
         to output.log. The process inherits the lock through its output, so
-        _run_alive can tell it is still going however long it runs, across a
-        restart of the server. Its own session keeps Ctrl-C on this server, or
-        closing its terminal, from reaching it.
+        _run_alive can tell it is still going however long it runs, even after
+        the server restarts.
+        Its own session keeps Ctrl-C on this server, or closing its terminal,
+        from reaching it.
 
         Args:
             settings (LiveSettings): The run's settings.

@@ -588,12 +588,10 @@ def _sale(held: tuple[str, ...], partner: str | None = None, *, status: str = "s
 def _trim(held: tuple[str, str], *, sell: int = 13, of: int = 30, status: str = "sold",
           sold: dict | None = None) -> reporter.SaleResult:
     """
-    A Kelly trim of a held pair as trader.sell_positions hands reporter one.
+    A Kelly trim as trader.sell_positions hands it to reporter.
 
-    The account holds `of` contracts on each of the two markets (YES on the
-    first, NO on the second) and the trim sells `sell` of each: its legs count
-    the contracts sold and carry the contracts held apart, and its plan has
-    no sell level.
+    It sells `sell` of the `of` contracts held on each market (YES on the
+    first, NO on the second), and has no sell level.
     """
     sale = _sale(held, status=status, count=sell, sold=sold)
     legs = tuple(dataclasses.replace(leg, held=of) for leg in sale.plan.legs)
@@ -688,8 +686,8 @@ class TestReadTradeLogs:
         assert start.sold_markets == frozenset({"UA", "LA"})
 
     def test_a_kelly_trim_row_is_read_as_a_sale_row(self, log_paths, pacific, monkeypatch):
-        # Run 1 buys the pair A1/B1. Run 2 trims it (13 of the 30 held on each
-        # market), trims a second pair only in part, writes both, then buys
+        # Run 1 buys A1/B1. Run 2 trims it (13 of the 30 held a side), trims a
+        # second pair that only partly sells, then buys
         run1 = T0
         trimmed, bought = T0 + timedelta(hours=2), T0 + timedelta(hours=2, minutes=1)
         _write_run(monkeypatch, run1, [_trade_result("A1", "B1", "executed")], 132.45)
@@ -697,8 +695,8 @@ class TestReadTradeLogs:
             _trim(("A1", "B1")),
             _trim(("PA", "PB"), status="partly_sold", sold={"PA": 10, "PB": 10})])
         _write_run(monkeypatch, bought, [_trade_result("A2", "B2", "executed")], 131.30)
-        # The trim rows as reporter writes them: the sale row's Notes start, then
-        # how many of the pairs held the trim sells
+        # The trim rows as reporter writes them: a sale row's Notes, naming how
+        # many of the pairs held each trim set out to sell
         book = openpyxl.load_workbook(log_paths)
         rows = list(book.active.iter_rows(values_only=True))
         book.close()
@@ -716,8 +714,8 @@ class TestReadTradeLogs:
         # The purchase the pair was bought with keeps its own 13 contracts a side
         assert trades[0].legs == (BotLeg("A1", "yes", D(13)), BotLeg("B1", "no", D(13)))
         window = timedelta(seconds=config.LIVE_BOT_RUN_WINDOW_SECONDS)
-        # The trims' RunStart names the markets their orders may have filled on,
-        # and run 2's purchases are looked for after the trims were logged
+        # The trims' RunStart names the markets their orders may have filled on;
+        # run 2's purchases are looked for after the trims' log time
         assert starts == [
             RunStart(run1 - window, run1, D("132.45")),
             RunStart(run1, trimmed, D("120.00"), frozenset({"A1", "B1", "PA", "PB"})),

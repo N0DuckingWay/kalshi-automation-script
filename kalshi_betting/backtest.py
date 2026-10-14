@@ -198,12 +198,9 @@ Notes:
     pairs sold down to their Kelly size at each weekly checkpoint, adding to
     held pairs or not (the dashboard's Trim to Kelly select). It simulates
     nothing during the run; --no-trim-sweep skips it, leaving the select
-    disabled. Nothing here reaches live trading by itself: a live run trims
-    only when its saved trim_to_kelly is on (main.py --trim-to-kelly
-    overrides it for one run), which the dashboard's Save as live defaults…
-    can set to the choice shown there. A live trim waits, as the backtest's
-    does, config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE calendar days after any
-    trade on the pair.
+    disabled. A live run trims only by its own saved trim_to_kelly
+    (main.py --trim-to-kelly for one run), which the dashboard's Save as
+    live defaults… can set.
 
     The family's minimum price rises are ON by default with it
     (trim_rise_sweep=True): the TrimSweep also carries every minimum of
@@ -212,9 +209,8 @@ Notes:
     last trade on it (the dashboard's Min. price rise select). They too are
     simulated only when the dashboard is built. --no-trim-rise-sweep skips
     them and still builds Trim to Kelly itself; --no-trim-sweep skips both.
-    A live run waits for a price rise only by its own saved trim_min_rise
-    (main.py --trim-min-rise overrides it for one run), which Save as live
-    defaults… sets from the minimum shown.
+    A live run uses its own saved trim_min_rise (main.py --trim-min-rise
+    for one run).
 
     The pre-fetch echo's "live rule=" clause names the saved live defaults'
     time-series rule and, when one is set, their category/tag filter (never

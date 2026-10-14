@@ -88,13 +88,11 @@ Purpose:
     and waits until the money has arrived; trades on a shard it could not
     fund are dropped. main._run_prod calls it right after pre_execution_check.
 
-    sell_positions() sells what seller.plan_sales and seller.plan_trims
+    sell_positions() sends what seller.plan_sales and seller.plan_trims
     planned, before main._run_prod buys anything: one reduce_only,
     immediate_or_cancel order per held market (see CLAUDE.md, live
-    selling). A Kelly trim's plan (seller.plan_trims) may sell only part of
-    what a market holds: its legs then name the contracts held apart from
-    the contracts to sell (_plan_holding), and the orders, their prices and
-    the reading of their fills are the same.
+    selling). A Kelly trim may sell only part of what a market holds; its
+    legs then carry the holding apart from the count to sell (_plan_holding).
 
 Dependencies:
     Imports from config.py (the order, transfer and write-pacing settings,
@@ -3415,15 +3413,14 @@ def _plan_holding(leg: Any) -> int:
     """
     The contracts a plan expects the account to hold on one market.
 
-    A take-profit sale sells everything held, so its leg's count is the
-    holding. A Kelly trim sells only part: its leg's count is the contracts
-    to sell, and its `held` the contracts held when the plan was made.
+    A Kelly trim's leg carries the holding as `held` (its count is what it
+    sells); a take-profit leg sells all it holds, so its count is the holding.
 
     Args:
         leg (Any): A held market's seller.SaleLeg.
 
     Returns:
-        int: leg.held when the leg carries one, else leg.count.
+        int: leg.held if set, else leg.count.
     """
     held = getattr(leg, "held", None)
     return leg.count if held is None else held
@@ -3431,14 +3428,13 @@ def _plan_holding(leg: Any) -> int:
 
 def _held_note(leg: Any) -> str:
     """
-    Say how many contracts a market holds, for a log line about a sale of only part of them.
+    The " (of N held)" note for a log line about a sale of part of a holding.
 
     Args:
         leg (Any): A held market's seller.SaleLeg (checked by _sale_problem).
 
     Returns:
-        str: " (of 30 held)" when the plan sells fewer contracts than the
-            market holds; "" when it sells them all.
+        str: e.g. " (of 30 held)" when the plan sells fewer than the market holds; else "".
     """
     holding = _plan_holding(leg)
     return f" (of {holding} held)" if holding != leg.count else ""
@@ -3449,9 +3445,8 @@ def _holding_problem(leg: Any, before: float | None) -> str | None:
     Say why a held market must not be sold now, or None when it may.
 
     Just before a position's first order, each held market must still hold
-    what the plan was made on (_plan_holding: +that many YES, or -that many
-    NO), whether the plan sells all of it or part. If one changed since the
-    plan was made (a trade by hand, say), or cannot be read, nothing of the
+    what the plan was made on (_plan_holding: +N for YES, -N for NO). If one
+    changed (a trade by hand, say) or cannot be read, nothing of the
     position is sold.
 
     Args:
@@ -3460,8 +3455,7 @@ def _holding_problem(leg: Any, before: float | None) -> str | None:
 
     Returns:
         str | None: The reason (e.g. "KX-B now holds 3 NO contracts; the plan
-            holds 5 NO contracts"), or None when it still holds what the plan
-            was made on (_plan_holding).
+            holds 5 NO contracts"), or None when it still holds that.
     """
     holding = _plan_holding(leg)
     expected = holding if leg.side == "yes" else -holding
@@ -3576,9 +3570,8 @@ def _order_text(leg: Any, sold: int | None, asked: int, limit: Decimal) -> str:
         limit (Decimal): The price sent.
 
     Returns:
-        str: e.g. "3 of 5 YES on KX-A sold (ask at 0.4500)"; for a plan that
-            sells only part of what the market holds, "3 of 5 YES (of 30
-            held) on KX-A sold (ask at 0.4500)".
+        str: e.g. "3 of 5 YES on KX-A sold (ask at 0.4500)", with " (of 30
+            held)" after YES when the plan sells only part of the holding.
     """
     done = "an unknown number" if sold is None else str(sold)
     return (f"{done} of {asked} {leg.side.upper()}{_held_note(leg)} on {leg.ticker} sold"
@@ -3642,8 +3635,7 @@ def _sale_problem(plan: Any, leg: Any, *, need_ladder: bool) -> str | None:
     count = leg.count
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
         return f"{leg.ticker} has no whole count of contracts held"
-    # A plan that sells part of a holding names the holding too: a whole
-    # number of contracts, at least the count it sells
+    # A part sale's holding (SaleLeg.held) must be a whole number, at least the count sold
     held = getattr(leg, "held", None)
     if held is not None and (isinstance(held, bool) or not isinstance(held, int)
                              or held < count):
@@ -3686,7 +3678,7 @@ def _sale_legs(plan: Any) -> tuple[list | None, str | None]:
     The held markets of a plan, in the order their sale orders are sent.
 
     A position has one held market (its partner has paid out) or two (an
-    exact pair: one YES and one NO of equal count, holding equal numbers of
+    exact pair: one YES and one NO, selling and holding equal numbers of
     contracts). A pair sells first the market with less depth left past its
     walk (_depth_left; ties by ticker), whose order is likelier to fall
     short; the other is sold to match it.
@@ -3762,8 +3754,8 @@ def _sell_lone(client: Any, plan: Any, leg: Any, before: float) -> SaleResult:
     """
     Sell a lone held market (its partner has paid out) with one order.
 
-    The order sells the plan's count, which may be part of what the market
-    holds (_plan_holding).
+    The order sells the plan's count, which for a Kelly trim may be only
+    part of the holding (_plan_holding).
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -3807,14 +3799,13 @@ def _sell_pair(client: Any, plan: Any, first: Any, other: Any,
     """
     Sell an exact held pair with two orders, keeping it balanced.
 
-    The first order sells the plan's count of `first`'s contracts (all it
-    holds, or the part a Kelly trim sells) at no worse than its walked bid;
-    the second sells exactly as many of `other`'s, at most
-    config.SALE_HEDGE_SLIPPAGE_TICKS ticks below the bid its walk reaches for
-    that count, so what is left is still an exact pair. No second order is
-    sent when the first sells nothing or its count is unknown. What each
-    market still holds afterwards is counted from what the plan says it held
-    (_plan_holding), never from the count sold.
+    The first order sells the plan's count on `first` (all it holds, or a
+    Kelly trim's part) at no worse than its walked bid; the second sells
+    exactly as many on `other`, at most config.SALE_HEDGE_SLIPPAGE_TICKS
+    ticks below the bid its walk reaches for that count, so what is left is
+    still an exact pair. No second order is sent when the first sells
+    nothing or its count is unknown. What a market still holds is the plan's
+    holding (_plan_holding) less what sold.
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -3974,12 +3965,12 @@ def sell_positions(client: Any, plans: list, *, dry_run: bool) -> list[SaleResul
     Sell the held contracts each plan names, one plan at a time, in order.
 
     A plan is a take-profit sale of a whole position, or a Kelly trim, which
-    sells an exact held pair down to its Kelly size and leaves any rest held.
-    main._run_prod calls this before it buys anything. Each held market gets
-    at most one order (a partner that has paid out gets none), sent once,
-    never retried; nothing is sent for a position whose markets no longer
-    hold what the plan was made on, or while the V2 NO-leg mapping stands
-    disproven (_V2_NO_MAPPING_DISPROVEN).
+    sells an exact held pair down to its Kelly size. main._run_prod calls
+    this before it buys anything. Each held market gets at most one order (a
+    partner that has paid out gets none), sent once, never retried; nothing
+    is sent for a position whose markets no longer hold what the plan was
+    made on, or while the V2 NO-leg mapping stands disproven
+    (_V2_NO_MAPPING_DISPROVEN).
 
     Args:
         client (Any): Authenticated KalshiClient from auth.build_client().
@@ -3988,12 +3979,12 @@ def sell_positions(client: Any, plans: list, *, dry_run: bool) -> list[SaleResul
             orders can be built is logged and reported "simulated".
 
     Returns:
-        list[SaleResult]: One per plan, in order: "sold" (everything the plan
-            set out to sell), "partly_sold" (a pair's rest is still an exact
-            pair), "not_sold" (nothing sold or sent), "unbalanced" (a pair's
-            second order sold fewer than its first), "manual_review" (an
-            order's count is unknown) or "simulated"; "unbalanced" and
-            "manual_review" log a CRITICAL.
+        list[SaleResult]: One per plan, in order: "sold" (all the plan set out
+            to sell), "partly_sold" (a pair's rest is still an exact pair),
+            "not_sold" (nothing sold or sent), "unbalanced" (a pair's second
+            order sold fewer than its first), "manual_review" (an order's count
+            is unknown) or "simulated"; "unbalanced" and "manual_review" log a
+            CRITICAL.
     """
     results = []
     for plan in plans:

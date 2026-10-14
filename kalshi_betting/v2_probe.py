@@ -35,9 +35,9 @@ Purpose:
     to flatten on its own, since a position there could be the bot's.
 
     It also checks the reduce-only ASK that live selling and live trimming
-    send to sell a held YES (--step yes-close): it buys 0.01 YES, sells it back
-    with that ask, and PASSes only when the account reads flat and the sale's
-    reply reports the 0.01 sold. Run it, and see it PASS, before turning live
+    send to sell a held YES (--step yes-close): it buys 0.01 YES, sells it
+    back with that ask, and PASSes only when the account reads flat and the
+    sale's reply reports the 0.01 sold. See it PASS before turning live
     selling or live trimming on.
 
     *** REAL MONEY. *** Every step here submits live orders (or moves live
@@ -170,23 +170,19 @@ Notes:
     and the operator has typed "yes" — unless --yes was passed, which is for a
     second or third run once the operator has already seen the bodies.
 
-    EXIT CODES: 0 = the executed step PASSED, 1 = something FAILED, 2 =
-    NEUTRAL (the step could not be run to a conclusion — a TRUE kill with
-    nothing filled and the account flat, no liquidity, the OPENING confirmation
-    was declined, or a skipped transfer step, including a --dest-shard that IS
-    the source shard, refused before any POST — DR-22). A PARTIAL or
-    otherwise non-conforming fill-or-kill response is NOT neutral: it is the
-    protocol violation the probe exists to catch, so it is a FAIL that names
-    the counts and re-reads the account (DR-20). A
-    prompt declined once a position is already open (e.g. the unfillable-ask
-    step's closing confirmation) is scored FAIL, not NEUTRAL — declining to
-    close a real open position is not a neutral outcome, and the printed
-    message tells the operator to flatten it manually. Only a 0 from BOTH
-    mapping steps (--step no-mapping and --step unfillable-ask) is evidence
-    that the V2 order path may be trusted to run unsupervised, and a 0 from
-    --step yes-close is what live selling and live trimming wait for. A bad
-    argument, or an ORDER_API_VERSION other than "v2", also exits 2 before any
-    step runs.
+    EXIT CODES: 0 = the step PASSED, 1 = something FAILED, 2 = NEUTRAL (no
+    conclusion: a TRUE kill with nothing filled and the account flat, no
+    liquidity, the OPENING confirmation declined, or a skipped transfer step,
+    a --dest-shard equal to the source shard included, refused before any
+    POST — DR-22). A partial or otherwise non-conforming fill-or-kill
+    response is a FAIL that names the counts and reads the account, not a
+    NEUTRAL: it is the violation the probe exists to catch (DR-20). A prompt
+    declined once a position is open is a FAIL too; its message says to
+    flatten it by hand. Only a 0 from BOTH mapping steps (--step no-mapping
+    and --step unfillable-ask) is evidence that the V2 order path may run
+    unsupervised; a 0 from --step yes-close is what live selling and live
+    trimming wait for. A bad argument, or an ORDER_API_VERSION other than
+    "v2", also exits 2 before any step runs.
 """
 import argparse
 import json
@@ -1505,10 +1501,9 @@ def _sale_reply_problem(data: Any) -> str | None:
     Say how the YES sale's reply fails to report the 0.01 the account shows
     sold; None when it reports fill_count 0.01 and remaining_count 0.
 
-    Live selling and live trimming take a sale's count from the reply's
-    fill_count when they can read one (trader._sale_fill_count), so the reply
-    must report this sale; remaining_count is checked too, as for the probe's
-    buys. Never raises.
+    Live selling and trimming read a sale's count from the reply's fill_count
+    when they can (trader._sale_fill_count), so the reply must report this
+    sale; remaining_count is checked too. Never raises.
 
     Args:
         data (Any): The parsed 2xx reply to the sale.
@@ -1538,8 +1533,7 @@ def _sale_reply_problem(data: Any) -> str | None:
 
 def _step_yes_close(client: Any, ticker: str, assume_yes: bool, dest_shard: int) -> str:
     """
-    Verify the order live selling and live trimming send to sell a held YES: a
-    reduce-only ask.
+    Verify the reduce-only ask that live selling and trimming send to sell a held YES.
 
     Against the live account, which must start FLAT on the ticker:
       1. Stop at NEUTRAL, before submitting anything, unless the order book
@@ -1554,10 +1548,10 @@ def _step_yes_close(client: Any, ticker: str, assume_yes: bool, dest_shard: int)
       5. With the account flat, the sale's reply must report fill_count 0.01
          and remaining_count 0 (_sale_reply_problem), else FAIL.
 
-    Each submission error is handled after its except clause has ended, so a
-    position read made then cannot pick the error up as its cause: the retried
-    read would take a fatal lookup error for a network fault and wait out its
-    backoff.
+    Each submission error is handled after its except clause ends, so a
+    position read then cannot inherit the error as its cause (the retried
+    read would mistake a fatal lookup error for a network fault and wait out
+    its backoff).
 
     Args:
         client (Any): Authenticated prod KalshiClient.
@@ -2043,13 +2037,12 @@ def main(argv: list | None = None) -> int:
         argv (list | None): Argument vector for testing. None reads sys.argv.
 
     Returns:
-        int: 0 when the step PASSED, 1 when it FAILED, 2 when it was NEUTRAL
-            (no verdict reached — a TRUE kill with the account flat, no
-            liquidity, skipped, or aborted at the confirmation prompt; a
-            partial or otherwise non-conforming fill-or-kill response is a
-            FAIL, not a NEUTRAL — DR-20). Only a 0 from BOTH no-mapping and
-            unfillable-ask is evidence that the V2 order path may be trusted
-            to run unsupervised; a 0 from yes-close is what live selling and
+        int: 0 when the step PASSED, 1 when it FAILED, 2 when NEUTRAL (no
+            verdict: a TRUE kill on a flat account, no liquidity, skipped, or
+            declined at the opening confirmation; a non-conforming
+            fill-or-kill response is a FAIL — DR-20). Only a 0 from BOTH
+            no-mapping and unfillable-ask is evidence that the V2 order path
+            may run unsupervised; a 0 from yes-close is what live selling and
             live trimming wait for.
 
     Raises:

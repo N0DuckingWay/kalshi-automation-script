@@ -175,21 +175,16 @@ Notes:
     portfolio value, each contract pair counted at what selling it returns
     (config.kelly_trim_count, with the chance it pays from
     config.held_pair_win_prob). It checks at every entry checkpoint, after
-    the day's pay-outs and take-profit sales and before its purchases. A
-    pair is looked at only when at least KELLY_TRIM_MIN_DAYS_SINCE_TRADE
-    calendar days have passed since the last trade on it: its latest
-    purchase or add-on, or a later trim (_last_trade_day). That is a test of
-    two dates alone (config.kelly_trim_rested, kept in config where live
-    code may import it). Checkpoints are a week apart, so the shipped 7 days
-    hold no trim back here. With add_to_held as well, a pair is rebalanced
-    both ways. With trim_min_rise too, a held pair is looked at for trimming
-    only once its total price — the ask of the side held on each of its two
-    markets, added (_pair_price) — is at least that many dollars above where
-    it stood at the checkpoint of that last trade (_price_rise, through
-    config.pair_price_rise and config.trim_rise_reached). A fall never
-    counts. The rules for buying are the same with it; what a run goes on to
-    buy can still differ, since a trim it did not make leaves it less cash
-    and a larger holding.
+    the day's pay-outs and take-profit sales and before its purchases, and
+    only once KELLY_TRIM_MIN_DAYS_SINCE_TRADE calendar days have passed
+    since the pair's last trade: its latest purchase, add-on or trim
+    (_last_trade_day, config.kelly_trim_rested). Checkpoints are a week
+    apart, so the shipped 7 days hold no trim back here. With add_to_held as
+    well, a pair is rebalanced both ways. With trim_min_rise too, a pair is
+    trimmed only once its total price (the asks of the sides held, added)
+    has risen at least that many dollars since that last trade
+    (_price_rise); a fall never counts. Buying rules are unchanged, though a
+    trim held back leaves less cash and a larger holding.
 
     The work is split at two boundaries. _prepare_candidates() is the half
     that depends on neither the backtest's time-series spread band nor the
@@ -4848,28 +4843,22 @@ def _last_trade_day(position: list[BacktestTrade],
     """
     The day of the last trade on a held pair: its latest purchase or add-on, or a later trim.
 
-    The one reading of that day. Both things a Kelly trim can be made to
-    wait for count from it: a rise in the pair's price (_price_rise) and the
-    days since a trade (config.kelly_trim_rested, asked by the cash walk),
-    so the two can never disagree about when a pair last traded.
-
-    The open trades alone would miss a purchase that is no longer open, so a
-    trim is counted too. A purchase leaves the open trades in one of three
-    ways. A trim sold it, and the walk noted that trim's day in `last_trim`,
-    which is later than the purchase. A take-profit sale sold it, and then
-    the whole pair is gone. Or it paid out, and its pair with it. A pair sold
-    whole and bought again has a new purchase later than any earlier trim.
+    The one definition of that day, so the wait after a trade
+    (config.kelly_trim_rested) and the price rise (_price_rise) count from
+    the same day. A trim counts as a trade on the pair. The open trades are
+    enough for the purchases: one that left them was sold by a trim (noted
+    in last_trim, which is later) or left with its whole pair (a
+    take-profit sale or a pay-out).
 
     Args:
         position (list[BacktestTrade]): The open trades of one exact pair
-            (_exact_pair), oldest first.
-        last_trim (dict[tuple[str, str], date]): (market A's ticker, market
-            B's ticker) -> the last checkpoint a trim sold part of that pair
-            at; a pair never trimmed is not a key.
+            (the same two markets, bought the same way round), oldest first.
+        last_trim (dict[tuple[str, str], date]): (ticker A, ticker B) -> the
+            last checkpoint a trim sold part of that pair at.
 
     Returns:
-        date: The latest entry date among the open trades, or the pair's last
-            trim when that is later.
+        date: The latest entry date among the open trades, or the last trim
+            if that is later.
     """
     latest = position[-1]
     last_day = max(trade.entry_date for trade in position)
@@ -4916,7 +4905,7 @@ def _price_rise(position: list[BacktestTrade], day: date,
     latest = position[-1]
     if latest.marks is None or not _exact_pair(position):
         return None
-    # The day both waits count from: the price rise and the days since a trade
+    # The same day the wait after a trade counts from
     last_day = _last_trade_day(position, last_trim)
     # config.pair_price_rise: the shared rule's own measure of a rise
     return pair_price_rise(_pair_price(latest, last_day), _pair_price(latest, day))
@@ -4927,12 +4916,9 @@ def _resolve_trim_min_days() -> int:
     Check how many days a held pair must go without a trade before a Kelly trim may sell part of it.
 
     Reads this module's KELLY_TRIM_MIN_DAYS_SINCE_TRADE when called (patch
-    backtester's, never config's). Read by every simulation that trims
-    (_simulate_at_discount with trim_to_kelly), before any entry is scored,
-    and by run_backtest_sweep before its fetch on every run: the dashboard
-    names the number on every page, so a bad one stops the run at once.
-    The check is config's own (kelly_trim_min_days), which the rule itself
-    repeats on the number it is handed (config.kelly_trim_rested).
+    backtester's, never config's). Called by every simulation that trims,
+    before any entry is scored, and by run_backtest_sweep before its fetch,
+    so a bad value stops the run at once.
 
     Returns:
         int: A whole number from 0 (no wait) to
@@ -9095,10 +9081,9 @@ def _live_trim_note(sweep: BacktestSweep) -> str:
     """
     Say when the saved live defaults trim held pairs to Kelly and this run's headline figures do not.
 
-    The backtest's own simulations (its primary scenario and every scenario
-    it runs) never trim. Only the dashboard's "Trim to Kelly: on" view does,
-    simulated when the page is built. _live_rule_line and
-    dashboard._live_rule_html add this clause to the live-rule line.
+    The run's own scenarios never trim; only the dashboard's Trim to Kelly
+    view does. _live_rule_line and dashboard._live_rule_html add it to the
+    live-rule line.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
@@ -9106,8 +9091,8 @@ def _live_trim_note(sweep: BacktestSweep) -> str:
     Returns:
         str: "; the live defaults trim to Kelly (only after a 10c price
             rise), which this run's primary does not" (the parenthesis only
-            with a minimum price rise, in _trim_rise_label's words), or ""
-            when live_trim_to_kelly is not True (off, or not recorded).
+            with a minimum price rise), or "" when live_trim_to_kelly is not
+            True.
     """
     if sweep.live_trim_to_kelly is not True:
         return ""
@@ -9218,9 +9203,8 @@ def _live_rule_line(sweep: BacktestSweep) -> str:
     Always a line, so a report never silently omits the live rule: with none
     recorded it says so (_LIVE_RULE_NONE). A recorded rule's line ends with
     _live_sizing_note when the saved defaults size differently from this
-    run's primary, then _live_add_on_note when they add to held pairs,
-    then _live_sell_note when they sell. _live_trim_note comes last, when
-    they trim to Kelly.
+    run's primary, then _live_add_on_note, _live_sell_note and
+    _live_trim_note when they add to held pairs, sell or trim to Kelly.
 
     Args:
         sweep (BacktestSweep): The run's sweep.
@@ -9981,15 +9965,12 @@ def _simulate_at_discount(
         (_split_trade, _sold_copy), and the trade it came from keeps the
         rest. A position sold whole is freed as a take-profit sale frees it.
         Either way its markets are not bought or added to at that checkpoint;
-      * a pair is looked at only when at least KELLY_TRIM_MIN_DAYS_SINCE_TRADE
-        calendar days (this module's binding, _resolve_trim_min_days) lie
-        between the last trade on it and the checkpoint's date
-        (config.kelly_trim_rested). The last trade is its latest purchase or
-        add-on, or a later trim (_last_trade_day). The test reads those two
-        dates and no schedule. Checkpoints are a week apart, so a wait of 7
-        days or fewer holds no trim back here, and a longer one does. A pair
-        that is waiting is not asked for a trim decision. Only trims wait:
-        buying and adding follow the same rules;
+      * a pair is looked at only once KELLY_TRIM_MIN_DAYS_SINCE_TRADE
+        calendar days (this module's binding) have passed since its last
+        trade: its latest purchase, add-on or trim (_last_trade_day,
+        config.kelly_trim_rested). Checkpoints are a week apart, so a wait
+        of 7 days or fewer holds no trim back here. Only trims wait; buying
+        and adding are unchanged;
       * trim_min_rise (None, the default, sets no minimum) makes a trim wait
         for a price rise. A held pair is looked at only once its total price
         — the ask of the side held on each of its two markets, added
@@ -10085,8 +10066,7 @@ def _simulate_at_discount(
     # The least price rise a Kelly trim needs (None: any), refused on a run
     # that does not trim
     min_rise = _resolve_trim_min_rise(trim_min_rise, trim_to_kelly)
-    # The days a pair must go without a trade before a trim (read only when
-    # trimming, so a run that never trims never reads it)
+    # Days a pair must go without a trade before a trim (read only when trimming)
     trim_min_days = _resolve_trim_min_days() if trim_to_kelly else 0
     # The live code's settings for this simulation: its k and caps, and the
     # band and tier setting the entries were found under (validated here,
@@ -10504,9 +10484,8 @@ def _simulate_at_discount(
     last_trim: dict[tuple[str, str], date] = {}
     held_back = 0
     trim_rises: list[float] = []
-    # Trimming only after a wait: how many times an exact pair was not looked
-    # at because it had traded too few days before (once per pair per
-    # checkpoint it waited at)
+    # Times an exact pair was skipped for trading too recently (once per pair
+    # per checkpoint)
     pairs_waiting = 0
     # Selling of either kind visits every checkpoint, and needs each trade's pair
     selling = sell_level is not None or trimming
@@ -10667,14 +10646,12 @@ def _simulate_at_discount(
         """
         The Kelly trim's decision for every open position at the checkpoint on `d`.
 
-        An exact pair whose last trade (_last_trade_day) is fewer than
-        trim_min_days calendar days before `d` is skipped first, whatever
-        its price did, and counted in pairs_waiting. With a minimum price
-        rise (min_rise), a pair whose total price has not risen that far
-        since that trade is skipped next, and counted in held_back. Neither
-        is asked for a decision. Each sale planned adds the pair's rise to
-        trim_rises; the caller hands every plan to trim, which carries it
-        out.
+        A pair is skipped, with no decision asked, when it traded fewer than
+        trim_min_days days before `d` (checked first, counted in
+        pairs_waiting) or else, with a minimum price rise, when its price
+        has not risen that far since (counted in held_back). Each sale
+        planned adds the pair's rise to trim_rises; the caller hands every
+        plan to trim.
 
         Args:
             d (date): The checkpoint date.
@@ -10689,8 +10666,7 @@ def _simulate_at_discount(
         nonlocal trim_floor, held_back, pairs_waiting
         planned = []
         for position in _positions(open_now):
-            # A pair that traded too few days ago is not looked at
-            # (config.kelly_trim_rested, a test of the two dates alone)
+            # Skip a pair that traded too recently (config.kelly_trim_rested)
             if _exact_pair(position) and not kelly_trim_rested(
                     _last_trade_day(position, last_trim), d, trim_min_days):
                 pairs_waiting += 1
@@ -10724,10 +10700,9 @@ def _simulate_at_discount(
         sold is recorded as a trade of its own, and what is left pays out
         less and stakes less of its pair. The position's markets go into
         sold_here, so nothing is bought or added on them at this checkpoint.
-        Each pair trimmed is noted in last_trim, so its price rise is
-        measured, and its days without a trade are counted, from this
-        checkpoint until its next trade.
-        With nothing planned it changes nothing.
+        Each pair trimmed is noted in last_trim, so its wait and its price
+        rise count from this checkpoint. With nothing planned it changes
+        nothing.
 
         Args:
             d (date): The checkpoint date.
@@ -10739,8 +10714,7 @@ def _simulate_at_discount(
         sold_ids: set[int] = set()
         for position, (sold, per_trade) in planned:
             positions_trimmed += 1
-            # The pair's price rise and its days without a trade are counted
-            # from this trim until its next trade
+            # The pair's wait and price rise now count from this trim
             last_trim[(position[0].ticker_a, position[0].ticker_b)] = d
             whole = sum(sold) == sum(trade.n for trade in position)
             for trade, pairs, sale in zip(position, sold, per_trade, strict=True):
@@ -11161,12 +11135,9 @@ def _simulate_at_discount(
             "Positions trimmed to their Kelly size (%s): %d (contract pairs sold: %d)",
             run_label, positions_trimmed, pairs_trimmed,
         )
-    # Trimming only after a wait: once per exact pair per checkpoint it was
-    # not looked at because it had traded too few days before (silent at
-    # zero). Every entry the backtest finds, and every trim, is dated on a
-    # weekly checkpoint, so a wait of a week or less never logs it for
-    # them; at such a wait only a hand-built entry dated between two
-    # checkpoints is counted here
+    # Pairs skipped for trading too recently (silent at zero). Real entries
+    # and trims fall on weekly checkpoints, so at a wait of a week or less
+    # only a hand-built entry dated between checkpoints is counted
     if pairs_waiting:
         logging.log(
             logging.DEBUG if quiet else logging.INFO,
@@ -12940,10 +12911,11 @@ def run_backtest_sweep(
     --interval-discount) whatever is passed here; no band or tier setting
     here reaches live.
 
-    It reports the saved live defaults' time-series rule, category/tag filter,
-    k, caps, add-to-held, sell and trim settings: one fail-soft read before the fetch,
-    recorded on the live_* fields and, worded by _live_rule_line, logged last
-    ("none recorded" when no usable defaults are saved).
+    It reports the saved live defaults' time-series rule, category/tag
+    filter, k, caps, add-to-held, sell and trim settings: one fail-soft read
+    before the fetch, recorded on the live_* fields and, worded by
+    _live_rule_line, logged last ("none recorded" when no usable defaults
+    are saved).
 
     With add_on_sweep, the result also carries the dashboard's "Add to held
     pairs" family (BacktestSweep.add_on_cap_sweep, and
@@ -12965,16 +12937,12 @@ def run_backtest_sweep(
     family (BacktestSweep.trim_sweep): every scenario of the same grid with
     held pairs sold down to their Kelly size at each weekly checkpoint
     (_simulate_at_discount's trim_to_kelly), tier floors on and off, adding
-    to held pairs or not, simulated only when the dashboard reads it. The run
-    logs one setting line for it, which names how many days a pair must go
-    without a trade before it is trimmed (KELLY_TRIM_MIN_DAYS_SINCE_TRADE),
-    and, from _sweep_from_candidates, one summary line. With trim_rise_sweep
-    as well, that family also covers the dashboard's Min. price rise choice:
-    every minimum of config.TRIM_MIN_PRICE_RISES, where a held pair is
-    trimmed only once its total price has risen that far since the last
-    trade on it (TrimSweep.min_rises, read through TrimSweep.rise_grid). It
-    too is simulated only when the dashboard reads it. A run with trim_sweep
-    logs one more setting line saying whether the minimum price rises are on.
+    to held pairs or not, simulated only when the dashboard reads it. With
+    trim_rise_sweep as well, it also covers every minimum price rise of
+    config.TRIM_MIN_PRICE_RISES (TrimSweep.min_rises). The run logs a
+    setting line for the family (naming the wait after a trade,
+    KELLY_TRIM_MIN_DAYS_SINCE_TRADE), one saying whether the minimum price
+    rises are on, and, from _sweep_from_candidates, one summary line.
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
@@ -13060,9 +13028,8 @@ def run_backtest_sweep(
             BacktestSweep.trim_sweep — a lazy TrimSweep over the same grid,
             every simulation selling held pairs down to their Kelly size.
             The flag adds no simulation to the run itself. False (default)
-            returns None, as does the infeasible window. Backtest-only: a
-            live run trims by its own saved trim_to_kelly
-            (seller.plan_trims), never by this family.
+            returns None, as does the infeasible window. A live run trims by
+            its own saved trim_to_kelly, never by this family.
         trim_rise_sweep (bool): Keyword-only. When True (trim_sweep
             required), BacktestSweep.trim_sweep also carries every minimum
             price rise of config.TRIM_MIN_PRICE_RISES (TrimSweep.min_rises).
@@ -13099,8 +13066,8 @@ def run_backtest_sweep(
             (0, 1], if this module's SAME_TITLE_SIZE_CAP is not on the 5%
             grid in (0, 1], if this module's KELLY_TRIM_MIN_DAYS_SINCE_TRADE
             is not a whole number from 0 to
-            config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX (on every run, with or
-            without trim_sweep), if sell_sweep is set and this module's
+            config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX (checked on every
+            run), if sell_sweep is set and this module's
             TAKE_PROFIT_HOLD_DAYS is not a whole number from 1 to
             _HOLD_DAYS_MAX, its TAKE_PROFIT_LEVELS is not a non-empty
             collection of distinct real numbers in (0, 1] or its
@@ -13153,8 +13120,8 @@ def run_backtest_sweep(
                          "are part of the Trim to Kelly family")
     # The same for the extra same-title cap: refused here, not after the fetch
     same_title_cap = _resolve_same_title_size_cap()
-    # ... and for the days a held pair must go without a trade before a Kelly
-    # trim, on every run: the dashboard names the number on every page
+    # ... and for the Kelly trim's wait after a trade, on every run, since the
+    # dashboard names it on every page
     trim_wait_days = _resolve_trim_min_days()
     # ... and, when the sell family rides the result, for the sell rule's day
     # count, the sell levels and the minimum-days options, which the
@@ -13255,8 +13222,7 @@ def run_backtest_sweep(
         "when the dashboard is built"
         if sell_sweep else "off — the dashboard's Sell select stays disabled",
     )
-    # And for the Kelly-trim family, the same way, with how long a pair must
-    # go without a trade before it is trimmed
+    # And for the Kelly-trim family, naming its wait after a trade
     logging.info(
         "Trimming to Kelly (backtest): %s",
         f"on — a held pair is trimmed {_trim_wait_text(trim_wait_days)} "

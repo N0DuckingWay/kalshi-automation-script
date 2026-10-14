@@ -4,22 +4,16 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Offline unit tests for kalshi_betting.auth — client construction (dev-key
-    fallback semantics) and the shard-aware balance parsing added when Kalshi
-    scoped GET /portfolio/balance per exchange shard (2026-08-13). Covers the
-    BS-19 fix (an eager .get() default crashed dev-only setups), the BS-10 fix
-    (verify_auth's modeled get_balance() raises pydantic ValidationError on
-    live 2026-07+ responses, so it reads the raw body instead), the
-    dollar-string -> floored-cents converter, the tiered fallback chain in
-    _balance_cents_by_shard (full breakdown -> aggregate balance_dollars ->
-    legacy integer cents), verify_auth end-to-end against a faked raw
-    response, and read_account_balance — the same one read returning each
-    shard's cash together with Kalshi's value of the open positions
-    (_positions_value_cents: integer cents, or a dollar string by presence,
-    None whenever the reply carries nothing readable or a value outside
-    0 to 2**53 cents) and each balance_breakdown entry that cash leaves out
-    (cash_left_out, from _balance_cents_by_shard's left_out; cash_complete is
-    True when it names none).
+    Offline unit tests for kalshi_betting.auth: client construction (the
+    dev-key fallback, BS-19), the dollar-string -> floored-cents converter,
+    and the per-shard balance read from the raw reply body (BS-10) —
+    _balance_cents_by_shard's fallback chain (per-shard breakdown -> aggregate
+    balance_dollars -> legacy integer cents), verify_auth against a faked raw
+    response, and read_account_balance, which returns each shard's cash,
+    Kalshi's value of the open positions (_positions_value_cents: integer
+    cents, a dollar string by presence, or None when unreadable or outside
+    0 to 2**53 cents) and the breakdown entries whose cash was left out
+    (cash_left_out; cash_complete is True when there are none).
 
 Dependencies:
     Imports the kalshi_betting.auth and kalshi_betting._http modules
@@ -356,7 +350,7 @@ class TestBalanceCentsByShard:
             "balance_dollars": "999.00",
         }
         left_out: list = []
-        # The dict is the one returned without the list: only the report is new
+        # Passing the list adds the report and never changes the cash returned
         assert (_balance_cents_by_shard(payload, left_out=left_out)
                 == _balance_cents_by_shard(payload) == {1: 200, 2: 300})
         assert left_out == ["entry 0 is not an object",
@@ -727,9 +721,8 @@ class TestReadAccountBalance:
             "index repeated", "two left out", "aggregate after nothing parsed",
             "no breakdown"])
     def test_cash_complete_says_whether_every_entry_was_counted(self, breakdown, left_out):
-        # A Kelly trim grows as the value it is sized on shrinks, so the read
-        # says when a shard's cash was left out of the dict it returns, and
-        # names each entry left out, for the run's "Not trimming" line
+        # A trim sized on cash that misses a shard would sell too much, so the
+        # read names each entry whose cash it left out (the run then trims nothing)
         account = read_account_balance(_balance_client(
             {"balance_dollars": "60.0000", "balance_breakdown": breakdown}))
         assert account.cash_left_out == left_out
@@ -738,7 +731,8 @@ class TestReadAccountBalance:
     def test_the_live_reply_and_the_sandbox_shape_count_every_shard(self):
         assert read_account_balance(_balance_client(LIVE_PAYLOAD)).cash_complete is True
         assert read_account_balance(_balance_client({"balance": 5000})).cash_complete is True
-        # A positional construction keeps the default, so the read's == pins hold
+        # Built from two arguments it counts as complete, so tests comparing a
+        # read with AccountBalance(cash, value) still hold
         assert AccountBalance({0: 1}, None).cash_complete is True
         assert AccountBalance({0: 1}, None).cash_left_out == ()
 

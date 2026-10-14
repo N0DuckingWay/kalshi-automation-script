@@ -3805,52 +3805,46 @@ class TestTimeSeriesKellyParity:
         assert _calls_to(built, "_resolve_trim_min_rise")
 
     def test_ast_a_trim_waits_days_after_a_trade_through_one_definition(self):
-        # The cash walk looks at a held pair for trimming only when enough
-        # calendar days have passed since the last trade on it. The answer is
-        # config's (kelly_trim_rested, which live code can import), asked
-        # about the day _last_trade_day works out. The pair's price rise is
-        # measured from that same day, so the two things a trim can wait for
-        # cannot disagree about when a pair last traded
+        # The backtest trims a held pair only once enough days have passed since
+        # its last trade: config.kelly_trim_rested (shared with live code) decides,
+        # on the day _last_trade_day finds. The price rise counts from that same day
         assert backtester.kelly_trim_rested is config.kelly_trim_rested
         assert backtester.kelly_trim_min_days is config.kelly_trim_min_days
         source = inspect.getsource(backtester)
         tree = ast.parse(source)
 
         def callers(callee: str) -> set:
-            """Every function (named with the one it sits in) that calls `callee`."""
+            """Names of every function that calls `callee`; a call in a nested function
+            counts for the function around it too."""
             return {func.name for func in ast.walk(tree) if isinstance(func, ast.FunctionDef)
                     and _calls_to(func, callee)}
 
         plan = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
                     and node.name == "planned_trims")
-        # planned_trims decides with exactly this call: the two dates and the
-        # run's checked number of days
+        # planned_trims asks with exactly this call
         [rested] = _calls_to(plan, "kelly_trim_rested")
         asked = "kelly_trim_rested(_last_trade_day(position, last_trim), d, trim_min_days)"
         assert ast.unparse(rested) == asked
         [day] = _calls_to(plan, "_last_trade_day")
         assert rested.args[0] is day
-        # ... of an exact pair only. A pair that has not rested is counted
-        # and skipped there, with nothing else done to it
+        # ... for an exact pair only; a pair still waiting is counted and skipped
         [gate] = [node for node in ast.walk(plan) if isinstance(node, ast.If)
                   and any(sub is rested for sub in ast.walk(node.test))]
         assert ast.unparse(gate.test) == ast.unparse(ast.parse(
             f"_exact_pair(position) and not {asked}", mode="eval").body)
         assert [ast.unparse(stmt) for stmt in gate.body] == ["pairs_waiting += 1", "continue"]
         assert not gate.orelse
-        # ... before the pair's price rise is measured or a trim is sized,
-        # so a waiting pair is counted on no other line and asked for no decision
+        # ... before the price rise or trim size is worked out, so a waiting pair is
+        # counted on no other line and adds nothing to cap_free_from
         [measured] = _calls_to(plan, "_price_rise")
         [tested] = _calls_to(plan, "trim_rise_reached")
         [decided] = _calls_to(plan, "_kelly_trim")
         assert gate.lineno < gate.end_lineno < measured.lineno < tested.lineno < decided.lineno
-        # The walk alone asks the rule, and nothing here turns a time into a
-        # day for it (config.trade_day is for live code: the walk's
-        # checkpoint dates already are those days)
+        # Only the walk asks the rule. It needs no config.trade_day: its
+        # checkpoints are already dates
         assert callers("kelly_trim_rested") == {"_simulate_at_discount", "planned_trims"}
         assert not hasattr(backtester, "trade_day")
-        # One definition of the day: the price rise reads it there too, and
-        # no other function reads a pair's last trim
+        # The price rise reads the same day, and only _last_trade_day reads last_trim
         assert callers("_last_trade_day") == {"_simulate_at_discount", "planned_trims",
                                               "_price_rise"}
         rise = _def_named(source, "_price_rise")
@@ -3867,9 +3861,8 @@ class TestTimeSeriesKellyParity:
                                 and ast.unparse(sub.func.value) == "last_trim"
                                 for sub in ast.walk(func))}
         assert trim_readers == {"_last_trade_day"}
-        # The number of days is this module's own binding, checked by
-        # config's check: by a run that trims before any entry is scored, and
-        # by run_backtest_sweep on every run, before its fetch
+        # The wait is backtester's own binding, checked by config.kelly_trim_min_days:
+        # by a trimming run before it scores any entry, and by every sweep before its fetch
         resolve = _def_named(source, "_resolve_trim_min_days")
         assert ast.unparse(resolve.body[-1]) == (
             "return kelly_trim_min_days(KELLY_TRIM_MIN_DAYS_SINCE_TRADE)")
@@ -4284,15 +4277,14 @@ class TestTimeSeriesKellyParity:
         [dry_run_value] = [k.value for k in sell.keywords if k.arg == "dry_run"]
         assert ast.unparse(dry_run_value) == "args.dry_run"
         assert plan.lineno < sell.lineno
-        # The Kelly trims are planned once, after the take-profit plans and before
-        # the one call that sends every sale, on the run's settings, its cash and
-        # the positions value kept at the start of the run (the value check's own
-        # result, never the value as read), leaving out what the take-profit plans sell
+        # Kelly trims are planned once, between the take-profit plans and the one
+        # call that sends every sale, on the checked positions value (never the
+        # raw one), skipping what the take-profit plans sell
         [trims] = _call_nodes(main, "_run_prod", "plan_trims")
         assert plan.lineno < trims.lineno < sell.lineno
-        # ... once no order rests on the account: Kalshi holds cash for one in
-        # neither its balance nor its value of the open positions. Read once,
-        # between the take-profit plans and the trims, with the client only
+        # Nothing is trimmed while an order rests or the list cannot be read: Kalshi
+        # counts a resting order's cash in neither the balance nor the positions value.
+        # Read once, between the take-profit plans and the trims
         [resting] = _call_nodes(main, "_run_prod", "get_resting_orders")
         assert plan.lineno < resting.lineno < trims.lineno
         assert [ast.unparse(arg) for arg in resting.args] == ["client"]

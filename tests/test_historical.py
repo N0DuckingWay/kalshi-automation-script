@@ -6869,12 +6869,10 @@ class TestBidBefore:
 
 
 class TestAskBefore:
-    """ask_before: one side's latest usable ask on a candle that ended at or
-    before a moment and less than `window` seconds before it. It is the price
-    a held market stood at at a past moment, read as the backtest reads a
-    leg's price at a checkpoint, with an age limit. A candle from after the
-    moment must never be read: it would measure a price rise from the wrong
-    starting price."""
+    """ask_before: a held market's price at a past moment, the latest usable ask
+    on a candle that ended at or before it and less than `window` seconds
+    before it. A later candle is never read, or a price rise would be measured
+    from the wrong starting price."""
 
     _DAY = 86_400
     _WEEK = 7 * 86_400
@@ -6935,8 +6933,8 @@ class TestAskBefore:
 
     def test_candles_out_of_order_never_yield_one_from_after_the_moment(self):
         t = self._T
-        # Reading stops at the first candle that ended after the moment, as
-        # bid_before's does, so the out-of-order candle behind it is not reached
+        # Reading stops at the first candle that ended after the moment (as in
+        # bid_before), so the out-of-order candle behind it is never reached
         candles = [_bid_candle(t - 7200, 0.30, 0.72), _bid_candle(t + 3600, 0.50, 0.51),
                    _bid_candle(t - 60, 0.40, 0.61)]
         assert historical.ask_before(candles, t, "yes", window=self._WEEK) == 0.30
@@ -6969,8 +6967,7 @@ class TestAskBefore:
     def test_the_shipped_window_is_seven_days(self):
         from kalshi_betting import config
 
-        # How old the quote may be is config's, in whole days; a caller hands
-        # it over in seconds
+        # config gives the age limit in whole days; callers pass it in seconds
         assert config.TRIM_PRICE_THEN_MAX_AGE_DAYS == 7
         assert type(config.TRIM_PRICE_THEN_MAX_AGE_DAYS) is int
         t, window = self._T, config.TRIM_PRICE_THEN_MAX_AGE_DAYS * self._DAY
@@ -6982,8 +6979,8 @@ class TestAskBefore:
 
     def test_a_no_ask_at_the_ceiling_is_no_quote(self):
         t = self._T
-        # 0.99 is what an empty YES-bid book reads as, so it is not a price;
-        # the same number is a usable YES ask
+        # A NO ask of 0.99 is what an empty YES-bid book reads as, so it is no
+        # price; a YES ask of 0.99 is one
         assert math.isnan(historical.ask_before([_bid_candle(t, 0.50, 0.99)], t, "no",
                                                 window=self._WEEK))
         assert historical.ask_before([_bid_candle(t, 0.99, 0.98)], t, "yes",
@@ -7019,10 +7016,9 @@ class TestAskBefore:
         assert read_something > 100
 
     def test_it_reads_what_the_backtest_reads_at_a_checkpoint(self):
-        # The backtest values a held leg at a weekly checkpoint at the latest
-        # usable ask of its side on a candle that ended at or before it
-        # (LegQuotes, built by backtester._leg_quotes). With a window wider
-        # than the candles reach, ask_before reads the same number
+        # With a window longer than the candles span, ask_before reads the price
+        # the backtest values a held leg at on each weekly checkpoint
+        # (backtester._leg_quotes)
         from kalshi_betting import backtester
 
         rng = random.Random(1917)
@@ -7047,18 +7043,17 @@ class TestAskBefore:
                     mark = float(marks[index])
                     assert (math.isnan(got) and math.isnan(mark)) or got == mark
                     compared += 1
-                    # The age limit is the one difference: a mark read from a
-                    # candle older than the window is no price here
+                    # The age limit is the one difference: a candle older than
+                    # the window gives no price here
                     recent = historical.ask_before(candles, moment, side, window=3 * 3600)
                     differing += math.isnan(recent) and not math.isnan(mark)
         assert compared >= 250 and differing > 0
 
 
 class TestCandleReadsBid:
-    """candle_reads_bid: whether a candle could show a best bid. A candle
-    holds asks, so a side's bid shows only as 1 minus the other side's usable
-    ask. A YES bid of 1c or less sits behind a NO ask of 0.99, which is also
-    what an empty YES-bid book reads as, so no candle shows it."""
+    """candle_reads_bid: whether a candle could show a best bid. A candle holds
+    only asks, so a bid shows as 1 minus the other side's usable ask; a YES bid
+    of 1c or less never shows, since its NO ask would sit at the 0.99 cap."""
 
     @pytest.mark.parametrize("bid, side, shows", [
         (0.01, "yes", False), (0.0101, "yes", True), (0.02, "yes", True),
@@ -7084,12 +7079,11 @@ class TestCandleReadsBid:
             historical.candle_reads_bid(0.5, side)
 
     def test_it_agrees_with_the_candle_a_book_would_be_stored_as(self):
-        # fetch_candlesticks stores a book as its YES ask and, for the NO ask,
-        # 1 minus the YES bid held within [0.01, the ceiling]. A bid shows
-        # exactly when candle_sale_bids reads a bid of that side back from
-        # the candle (a YES bid above 99c reads back as 99c: shown, at the
-        # clamp). Every bid a book can hold is below $1, so the sweep stops
-        # at the finest grid's top level
+        # Each bid stored as fetch_candlesticks would store it (YES ask = 1 minus
+        # a NO bid; NO ask = 1 minus a YES bid, held to 0.01..ceiling): a bid
+        # shows exactly when candle_sale_bids reads a bid of that side from the
+        # candle (a YES bid above 99c reads as 99c, at the clamp). Bids run to
+        # $0.9999, the finest grid's top level
         ceiling = historical.CANDLE_NO_ASK_CEILING
         ticks = [n / 10_000 for n in range(0, 10_000)]
         shown = {"yes": 0, "no": 0}

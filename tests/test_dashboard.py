@@ -7367,11 +7367,9 @@ class TestSaveLiveDefaultsButton:
 
         Each number must read back as the base block's own value, and the
         query must carry the run's same-title cap, the source note and the
-        category and tag given, and no other field. add_to_held_pairs,
-        sell_at, sell_min_days, trim_to_kelly and trim_min_rise may be
-        present (a page with the Add to held pairs, Sell or Trim to Kelly view
-        sends them) and are not checked here: their values are the caller's
-        to check.
+        category and tag given, and no other field. The adding, selling and
+        trimming fields may also be present (pages with those views send
+        them); the caller checks their values.
 
         Args:
             data (dict): The page's base block.
@@ -7385,8 +7383,7 @@ class TestSaveLiveDefaultsButton:
             tag (str | None): Keyword-only. The tag sent, or None for none.
 
         Raises:
-            AssertionError: If any field differs from the expected value, or
-                the query carries a field not listed above.
+            AssertionError: If a field differs, or an unknown field is sent.
         """
         expected = self._expected(data, bi, ki, ci, tier)
         assert query["tier_floors"] == expected.pop("tier_floors")
@@ -7399,8 +7396,8 @@ class TestSaveLiveDefaultsButton:
                  "same_title_size_cap", "source", "category", "tag", "add_to_held_pairs",
                  "sell_at", "sell_min_days", "trim_to_kelly", "trim_min_rise"}
         assert set(query) <= known
-        # The two trim fields only ever go together: a minimum without its
-        # switch would be refused by the server
+        # The two trim fields are always sent together: a minimum sent alone is
+        # paired with the saved switch, and the server refuses a minimum with trimming off
         assert ("trim_to_kelly" in query) is ("trim_min_rise" in query)
 
     def test_the_button_is_rendered_disabled_with_its_words(self, monkeypatch, tmp_path):
@@ -7906,8 +7903,7 @@ class TestSaveLiveDefaultsButton:
         assert (settings.sell_at, settings.sell_min_days) == (0.9, 5)
 
     def test_a_page_without_the_trim_view_sends_neither_trim_field(self, monkeypatch, tmp_path):
-        # The server then keeps the saved Kelly trim and its minimum price
-        # rise, as it keeps the saved sell level from a page without that view
+        # With neither field sent, the server keeps the saved trim settings
         config.save_live_defaults(
             dataclasses.replace(config.live_settings(), trim_to_kelly=True, trim_min_rise=0.1),
             source="")
@@ -12539,15 +12535,11 @@ class TestTrimSelect:
             {"value": "off", "text": "off", "selected": True},
             {"value": "on", "text": "on (sell down to the Kelly size)", "selected": False}]}
         title = re.search(r'<select id="flt-trim"[^>]*title="([^"]*)"', page).group(1)
-        # The hover text, at the wait after a trade the page's trim runs read
+        # The hover text, at the wait the page's trim runs use
         assert backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE == 7
         shipped = dashboard._trim_select_title(backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE)
         assert html.unescape(title) == shipped
-        # It says what the choice shuts, and why, and what saving it saves:
-        # the choice and the minimum shown from a page with this view (the
-        # saved ones from any other, which sends neither), and, with it on,
-        # no selling from a page with the Sell view or the saved sell level
-        # from one without
+        # It says what the choice shuts and why, and what Save saves
         for words in ("Sell is set to no selling", "Each part sold counts as a trade of its own",
                       "Min. price rise can make a trim wait",
                       "From a page that simulated trimming, Save as live defaults saves this "
@@ -12564,8 +12556,8 @@ class TestTrimSelect:
         title = dashboard._trim_select_title
         rule = ("each week. A pair is trimmed only when at least {} passed since its last "
                 "purchase, add-on or trim{} Min. price rise can make a trim wait")
-        # Weekly runs are 7 days apart, so a wait of 7 days or fewer holds
-        # no trim back on the page, and the text says so
+        # Weekly runs are 7 days apart: a wait of 7 days or fewer holds no
+        # trim back, and the text says so
         weekly = "; weekly runs are 7 days apart, so this never holds a trim back here."
         assert rule.format("7 days have", weekly) in title(7)
         assert rule.format("1 day has", weekly) in title(1)
@@ -12578,8 +12570,7 @@ class TestTrimSelect:
         assert ("each week. A pair can be trimmed at any weekly run after a trade on it. "
                 "Min. price rise can make a trim wait") in title(0)
         assert "days have passed" not in title(0)
-        # A live run counts the wait from every fill on either market, and needs
-        # Kalshi's list of fills to reach back that far; with no wait it counts none
+        # How a live run counts the wait: said only when there is a wait
         live = ("Each part sold counts as a trade of its own. A live run counts the wait in "
                 "calendar days on the bot's own clock from the last fill of any sort on "
                 "either market, a trade by hand included, and trims nothing while Kalshi's "
@@ -12603,11 +12594,9 @@ class TestTrimSelect:
     @pytest.mark.parametrize("bad", [True, 7.5, 31, -1, "7", None, float("nan"), [7],
                                      Decimal("NaN"), Decimal("sNaN")])
     def test_a_bad_wait_never_stops_the_bar_being_drawn(self, bad):
-        # The backtest refuses such a number before it runs; the hover text
-        # is still built from whatever it is handed, and claims nothing
-        # about the week for a value it cannot compare with one (a decimal
-        # NaN raises when it is ordered, and a signalling one when it is
-        # compared at all)
+        # A backtest refuses these before it runs, but the hover text must
+        # still build, and says nothing about the week for a value it cannot
+        # compare with a number of days (a string, None, a decimal NaN)
         text = dashboard._trim_select_title(bad)
         assert text.startswith("off: no part of a held pair is sold to cut its size.")
         assert text.endswith("always show it off.")
@@ -12703,9 +12692,8 @@ class TestTrimRiseSelect:
                       "its purchase, an add-on (Add to held pairs) or an earlier trim",
                       "trimmed whichever way its price moved"):
             assert words in dashboard._TRIM_RISE_TITLE
-        # ... and ends with what saving saves, from a page with the Trim to
-        # Kelly view and from any other, and which pairs a live run cannot
-        # measure a rise for (their last fill is older than Kalshi's list)
+        # ... and ends with what Save saves, and which pairs a live run cannot
+        # measure a rise for
         assert dashboard._TRIM_RISE_TITLE.endswith(
             " whichever way its price moved. From a page that simulated trimming, Save as live "
             "defaults saves the minimum shown, for live runs to wait for (any, or Trim to Kelly "
@@ -12788,15 +12776,10 @@ class TestTrimRiseSelect:
             r'id="flt-trim-note"[^>]*>\(not available on this page; see the log\)</span>', page)
 
     def test_the_hover_texts_say_what_save_sends_on_every_page(self, monkeypatch, tmp_path):
-        # Both selects carry one hover text on every page, so what it says
-        # about saving must hold on each. From a page with the Trim to Kelly
-        # view, Save sends the choice and the minimum shown, and no minimum
-        # at "any" or while trimming is off, though the shut select can still
-        # name one (TestTrimRiseScript.test_a_save_sends_the_minimum_shown).
-        # From a page without that view, Save sends neither and the saved
-        # ones are kept (TestSaveLiveDefaultsButton.
-        # test_a_page_without_the_trim_view_sends_neither_trim_field), so the
-        # text must not promise there that the choice shown is saved
+        # Each select has one hover text on every page, so what it says about
+        # Save must hold on pages with and without the Trim to Kelly view
+        # (what Save sends: TestTrimRiseScript.test_a_save_sends_the_minimum_shown,
+        # TestSaveLiveDefaultsButton.test_a_page_without_the_trim_view_sends_neither_trim_field)
         trim_save = ("From a page that simulated trimming, Save as live defaults saves this "
                      "choice and the Min. price rise shown, for live runs to trim by; from any "
                      "other page it keeps the saved ones.")
@@ -12853,14 +12836,12 @@ class TestTrimRiseSelect:
 
 class TestTrimScript:
     """The bar's Trim to Kelly select under the page script (run outside a
-    browser): enabled only with the view, "on" loads the trimming scenario's
-    chunk and words it with Python's phrase and note, with Add to held pairs
-    on it reads the grid of runs that do both, a chunk that cannot be loaded
-    puts the choice back, while it is on Sell is shut at no selling, and Save
-    sends the choice shown with the minimum price rise beside it, which the
-    defaults server reads back as the scenario's own live settings. The
-    explorer never follows it. The harness's "wait" does not wait on flt-trim
-    (a page without the view keeps it shut), so setup_js adds it. Skipped
+    browser): enabled only with the view, "on" loads and words the trimming
+    scenario (with Add to held pairs on, the runs that do both), a chunk that
+    cannot be loaded puts the choice back, Sell is shut while it is on, and
+    Save sends the choice and the minimum price rise, which the defaults
+    server reads back. The explorer never follows it. setup_js adds flt-trim
+    to the harness's "wait" (a page without the view keeps it shut). Skipped
     without a JavaScript runtime."""
 
     WAIT = "__BAR.push('flt-trim');"
@@ -13049,8 +13030,8 @@ class TestTrimScript:
         assert bad["text"]["flt-summary"] == data["text"]["unavailable"].format(
             failed=_phrase(data, 0, 1, 1) + data["text"]["trim"],
             reason=f"Error: damaged block dash-chunk-{cid}", scenario=_phrase(data, 0, 1, 1))
-        # The scenario still shown, which does not trim, can be saved again,
-        # and a click sends it, not the trimming one that failed to load
+        # Save sends the scenario still shown (no trimming), not the one that
+        # failed to load
         assert bad["buttons"]["flt-save"] is False
         save = TestSaveLiveDefaultsButton()
         [opened] = snaps["bad click"]["opened"]
@@ -13065,15 +13046,10 @@ class TestTrimScript:
 
     @pytest.mark.parametrize("sell_view", [False, True], ids=["no-sell-view", "sell-view"])
     def test_a_save_sends_the_trim_choice(self, monkeypatch, tmp_path, sell_view):
-        # A trimming scenario can become the live settings: a click sends the
-        # Trim to Kelly choice with the minimum price rise beside it (off on
-        # a page without the minimums), trimming on and off, also where
-        # trimming changed nothing (no cap: the same chunk). Over saved
-        # defaults that sell: a page with the Sell view sends no selling
-        # (Sell is shut there while trimming is on), so saving turns live
-        # selling off; one without it sends no sell field, and the server
-        # keeps the saved sell level. Each address goes to the server's own
-        # application and parser.
+        # Save sends the Trim to Kelly choice and the minimum rise ("off": this
+        # page has no minimums), and the defaults server reads it back. Over
+        # saved defaults that sell, a page with the Sell view also sends no
+        # selling (Sell is shut while trimming); one without keeps the saved level
         config.save_live_defaults(
             dataclasses.replace(config.live_settings(), sell_at=0.9, sell_min_days=5),
             source="")
@@ -13209,19 +13185,15 @@ class TestTrimScript:
 
 class TestTrimRiseScript:
     """The bar's Min. price rise select under the page script (run outside a
-    browser): shut on load and while Trim to Kelly is off, open while it is
-    on; a minimum that makes a run of its own loads that run's chunk and
-    words the scenario with Python's phrase; one that changes nothing shows
-    the Trim to Kelly chunk, and one that holds every trim back the plain
-    run's; with adding on or the tier floors off it reads that setting's own
-    grid; Trim to Kelly off shows the plain run and keeps the minimum for
-    when it goes on again; a chunk that cannot be loaded puts the choice
-    back; at any minimum Sell stays shut; and Save sends the minimum shown
-    beside the Trim to Kelly choice ("off" for any, and while Trim to Kelly
-    is off), which the defaults server reads back as that very minimum. The
-    explorer never follows it. flt-rise is shut on load, so these tests wait
-    on flt-trim (setup_js adds it to the harness's wait list) and never on
-    flt-rise. Skipped without a JavaScript runtime.
+    browser): open only while Trim to Kelly is on; a minimum shows its own
+    run's chunk, or the Trim to Kelly chunk when it changes nothing, or the
+    plain run's when it holds every trim back; adding on and tier floors off
+    read their own grids; Trim to Kelly off shows the plain run and keeps the
+    minimum; a chunk that cannot be loaded puts the choice back; Sell stays
+    shut; and Save sends the minimum shown ("off" for any, or with Trim to
+    Kelly off), which the defaults server reads back. The explorer never
+    follows it. flt-rise is shut on load, so these tests wait on flt-trim
+    (setup_js adds it). Skipped without a JavaScript runtime.
 
     The page is _kc_sweep_trim_rise()'s: at (0-1, k 0.75) the 5% cap shows
     its Trim to Kelly chunk at 5c and 10c and the plain run's at 25c, the 20%
@@ -13517,8 +13489,8 @@ class TestTrimRiseScript:
         assert bad["text"]["flt-summary"] == data["text"]["unavailable"].format(
             failed=self._scenario(data, 0, 1, 1, 1), reason=reason,
             scenario=self._scenario(data, 0, 1, 1))
-        # The scenario still shown (trimming at any minimum) can be saved, and
-        # a click sends its choices, not the 10c that could not be loaded
+        # Save sends the scenario still shown (trimming, any minimum), not the
+        # 10c that failed to load
         assert bad["buttons"]["flt-save"] is False
         save = TestSaveLiveDefaultsButton()
         [opened] = snaps["bad click"]["opened"]
@@ -13595,12 +13567,10 @@ class TestTrimRiseScript:
     # ─── Save and Sell at a minimum ──────────────────────────────────────────
 
     def test_a_save_sends_the_minimum_shown(self, monkeypatch, tmp_path):
-        # At any, trim_min_rise=off; at each minimum, its value in dollars,
-        # which the server reads back as that very LiveSettings.trim_min_rise
-        # (also where the minimum shows the plain run's own chunk: 5% cap,
-        # 25c); and with Trim to Kelly switched off while the shut select
-        # still names a minimum, both fields off. A page with Trim to Kelly but
-        # no minimums sends off too (TestTrimScript's save test).
+        # trim_min_rise is "off" at any, else the minimum in dollars, which the
+        # server reads back exactly (also at 5% cap, 25c, the plain run's
+        # chunk). With Trim to Kelly off, both fields are "off", though the
+        # shut select still names a minimum
         save = TestSaveLiveDefaultsButton()
         page = save._kc(monkeypatch, tmp_path, _kc_sweep_trim_rise())
         data = TestFilterPage._data(page)
@@ -13639,10 +13609,8 @@ class TestTrimRiseScript:
             **snaps["off"]["selects"]["flt-rise"], "value": "3", "disabled": True}
 
     def test_a_minimum_the_page_never_simulated_cannot_be_saved(self, monkeypatch, tmp_path):
-        # The family holds no run with the tier floors off: at the band the
-        # tiers bind at, trimming with them off was never simulated at any
-        # minimum, so nothing can be saved there; with the tiers on again,
-        # the same minimum is saved
+        # No trim runs with the tier floors off: there, at a band the tiers
+        # bind at, Save stays shut; with the tiers on, the same minimum saves
         sweep = _kc_sweep_trim_rise(_kc_sweep_tiers())
         sweep.trim_sweep.off_bands = ()
         save = TestSaveLiveDefaultsButton()
@@ -14870,12 +14838,11 @@ class TestLiveSellRule:
 
 
 class TestLiveTrimRule:
-    """The backtest report and the filter bar when the saved live defaults trim
-    to Kelly: a grey note beside the save button warning that saving with
-    Trim to Kelly off turns live trimming off (only on a page with the Trim to
-    Kelly view), and the page-header line naming the Trim to Kelly and Min.
-    price rise choices that show the trim at the live rule's band — or why
-    the page cannot show it, trimming together with selling included."""
+    """The page when the saved live defaults trim to Kelly: a grey note by the
+    save button on a page with the Trim to Kelly view (saving with Trim to
+    Kelly off turns live trimming off), and the header line naming the
+    choices that show the trim, or why the page cannot (trimming with
+    selling included)."""
 
     _NOTE = "; the live defaults trim to Kelly, which this run's primary does not"
     _NOTE_10C = ("; the live defaults trim to Kelly (only after a 10c price rise), which this "
@@ -14892,15 +14859,11 @@ class TestLiveTrimRule:
         The Trim to Kelly keys of a filter bar's base block, as _filter_payload ships them.
 
         Args:
-            trim (list | None): The trim grid, [band][k][cap] -> chunk id or
-                None; None for no grid.
-            rise (list | None): The minimums' grid, [band][k][cap] -> None
-                (every minimum shows the trim cell) or one id (or None) per
-                minimum; None for no grid.
-            rises (list | None): Keyword-only. The minimums offered; None
-                offers 5c and 10c.
-            suffix (str): Keyword-only. The setting the grids are for, named
-                as the script names them: "", "_off", "_add" or "_add_off".
+            trim (list | None): The trim grid ([band][k][cap] -> chunk id); None for none.
+            rise (list | None): The minimums' grid (a cell holds one id per
+                minimum, or None when every minimum shows the trim cell); None for none.
+            rises (list | None): The minimums offered; None for 5c and 10c.
+            suffix (str): Which grids: "", "_off", "_add" or "_add_off".
 
         Returns:
             dict: "grid_trim<suffix>", "trim_rises" and "grid_trim_rise<suffix>".

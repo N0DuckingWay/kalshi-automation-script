@@ -48,13 +48,13 @@ Purpose:
     for a person exits 20, and with selling off the run logs exactly what it
     logs with every selling step replaced by one that fails the test.
 
-    On the Kelly trim: TestRunProdTrimsInADryRun, TestRunProdTrimsLive,
-    TestRunProdTrimsAfterAPriceRise and TestRunProdTrimsOnAnyDay run the same
-    stand-in exchange, which also serves the account's fills (a fill is added
-    whenever an order fills): a held pair past its Kelly share is sold down
-    before anything is bought, stays held and is not added to, each case that
-    cannot be read trims nothing with its WARNING, and a run on each of the
-    eight days after a purchase trims only on the seventh.
+    On the Kelly trim (selling part of a held pair that has grown bigger than
+    Kelly bet sizing allows): TestRunProdTrimsInADryRun, TestRunProdTrimsLive,
+    TestRunProdTrimsAfterAPriceRise and TestRunProdTrimsOnAnyDay run
+    _SellExchange, which also lists the account's fills. Such a pair is sold
+    down before any buy, stays held and is not added to; anything unreadable
+    means no trim and a WARNING; of runs on the eight days after a purchase,
+    only the seventh trims.
 
     On the run result: TestResultFile runs main() with --result-file PATH
     (in each test's tmp_path) down every way a production run ends and reads
@@ -761,9 +761,9 @@ class TestLiveSettingsFlags:
         step = config.TRIM_PRICE_RISE_STEP_CENTS
         assert (f"(--trim-min-rise takes whole cents, a multiple of {step} from {step} to "
                 "100, read as that many cents / 100 dollars)") in err, err
-        # It is no percent: the cap flags' and the sell level's notes are not borrowed
+        # Not the percent note the cap and sell-level flags carry
         assert "whole percent" not in err, err
-        # ... and the switch alone, which takes no number, says nothing about cents
+        # Given only the switch, which takes no number, a refused run says nothing about cents
         _save_live_defaults(trim_to_kelly=True, trim_min_rise=0.25)
         seen = _main_with(monkeypatch, ["--mode", "prod", "--no-trim-to-kelly",
                                         "--spread-max", "0"])
@@ -777,8 +777,8 @@ class TestLiveSettingsFlags:
     def test_a_fractional_or_non_numeric_minimum_rise_is_a_usage_error(
         self, monkeypatch, capsys, argv,
     ):
-        # argparse's own int check: whole cents only, so 0.1 (dollars) is never
-        # read as a tenth of a cent
+        # Whole cents only (argparse's int check): a dollar figure like 0.1 is
+        # refused, never read as a tenth of a cent
         _save_live_defaults(trim_to_kelly=True)
         seen = _main_with(monkeypatch, ["--mode", "prod", *argv])
         assert seen["code"] == 2
@@ -1112,8 +1112,7 @@ class TestLiveSettingsFlags:
         assert out.count(f"in {config.SIZE_CAP_STEP * 100:g}% steps") == 2
         assert "100 = no cap" in out
         assert "100 = no extra cap beyond --size-cap" in out
-        # With the Kelly trim on, a lower cap or a higher k sells more of the held
-        # pairs, and the two caps' flags and k's say so
+        # The two cap flags and k's flag warn that, with the Kelly trim on, they can sell
         assert out.count("a lower cap also sells: each exact held") == 2
         assert out.count("a higher k also sells: each exact held") == 1
         assert out.count("worth more than its new Kelly size is sold down to it before "
@@ -1128,10 +1127,8 @@ class TestLiveSettingsFlags:
         assert "Sell nothing this run, whatever the saved live defaults say" in out
         assert "Sell a position only while at least N days (1 or more) remain" in out
         assert "config.SELL_AT" not in out and "config.SELL_MIN_DAYS" not in out
-        # The trim flags: the switch (which clears the saved minimum when off)
-        # and the minimum in whole cents on the 5c grid, with its off twin.
-        # argparse may wrap a flag's name at one of its hyphens, so the pinned
-        # words stop short of one
+        # The trim flags. argparse may wrap a flag's name at a hyphen, so the
+        # pinned words stop short of one
         assert ("before buying, sell part of each exact held pair that has outgrown its "
                 "Kelly size, once config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE calendar days have "
                 "passed since the pair's last trade.") in out
@@ -1218,9 +1215,8 @@ class TestLogLiveSettings:
         "trim_to_kelly": (["--trim-to-kelly"], "trim to Kelly on (default: off)"),
         "trim_min_rise": (["--trim-min-rise", "10"], "min price rise 10c (default: any)"),
     }
-    # What the saved defaults hold under a field's flag when the flag needs more
-    # than the pinned constants: a minimum of days needs a saved sell level,
-    # and a minimum price rise needs trimming saved on
+    # Extra saved defaults a flag needs: a minimum of days needs a sell level,
+    # a minimum price rise needs trimming on
     _SAVED_FOR_FIELD = {"sell_min_days": {"sell_at": 0.85},
                         "trim_min_rise": {"trim_to_kelly": True}}
 
@@ -1342,7 +1338,7 @@ class TestLogLiveSettings:
     ], ids=["per-trade cap", "same-title cap", "k"])
     def test_with_trimming_on_a_lower_cap_or_a_higher_k_is_said_to_sell(self, caplog, change,
                                                                         named):
-        # The run trims before it buys, so its log says so before the trims
+        # A real-money run whose flags lower a cap or raise k warns that it can sell
         saved = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True,
                              origin=self._ORIGIN)
         with caplog.at_level(logging.INFO):
@@ -3328,8 +3324,9 @@ class TestLiveSettingsReachEverySite:
     the saved file or the reference raises or hands a spy the wrong value. It runs
     twice: with config.py's toggles as the reference, and with _SETTINGS saved as the
     live defaults and resolved as main() resolves them. _SETTINGS keeps both pairs
-    trading, the time-series f* between the 0.25 same-title and 0.35 per-trade caps,
-    and trims; the seller's two planners are handed the run's settings too."""
+    trading (the time-series pair's Kelly fraction sits between the 0.25 same-title
+    and 0.35 per-trade caps) and turns trimming on; both seller planners get the
+    run's settings too."""
 
     _SETTINGS = LiveSettings(tier_floors=False, spread_band=(0.05, 0.9),
                              interval_discount=0.6, size_cap=0.35, same_title_size_cap=0.25,
@@ -3361,11 +3358,10 @@ class TestLiveSettingsReachEverySite:
         """
         Run one mode under the tripwire, recording every _SPIED call.
 
-        The account holds HELD-A (3 YES contracts, no cost listed). On the
-        live-shape balance Kalshi's value of the open positions is $0, so a
-        production run that trims stops at the run's value gate: one "Not
-        trimming this run" WARNING, seller.plan_trims never asked and no
-        fills listing read. With a value above $0 the planner is asked once.
+        The account holds HELD-A (3 YES, no cost listed). On the default
+        balance Kalshi values the open positions at $0, so a production run
+        that trims logs one "Not trimming this run" WARNING and never asks
+        seller.plan_trims; with a value above $0 it asks once.
 
         Args:
             monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
@@ -3383,8 +3379,9 @@ class TestLiveSettingsReachEverySite:
         Returns:
             tuple: (settings, reference, calls, captured) — calls maps (module
                 short name, function name) to each call's (args, kwargs);
-                captured holds "results", "filter", "enriched", "client" and,
-                in prod, "run_note" and "plan_trims" (each call's keywords).
+                captured holds "results", "filter", "enriched", "client",
+                "plan_trims" (each trim planner call's keywords) and, in prod,
+                "run_note".
         """
         settings = self._SETTINGS if settings is None else settings
         balance_payload = _LIVE_BALANCE_PAYLOAD if balance_payload is None else balance_payload
@@ -3504,8 +3501,8 @@ class TestLiveSettingsReachEverySite:
             assert settings.sell_at is not None
         else:
             assert "plan_sales" not in captured
-        # The trim planner: a production run that trims asks it once when Kalshi's
-        # value of the open positions is above $0, and otherwise says why it does not
+        # A production run that trims asks the trim planner once when Kalshi's
+        # positions value is above $0, and otherwise says why not
         not_trimming = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
                         and r.getMessage().startswith("Not trimming this run")]
         if mode == "prod" and settings.trim_to_kelly and not balance_payload["portfolio_value"]:
@@ -3627,10 +3624,9 @@ class TestLiveSettingsReachEverySite:
     def test_the_trim_planner_is_handed_the_runs_settings_cash_and_value(
         self, monkeypatch, caplog, mode,
     ):
-        # Kalshi's value of the open positions is $1.50 here (the 3 contracts
-        # held can back up to $3.00, so it is kept): a production run that
-        # trims hands the planner its one settings object, the cash on every
-        # shard and that value. A dev run holds nothing and never trims
+        # Kalshi values the positions at $1.50 (kept: 3 contracts can back $3.00).
+        # Production hands the trim planner its settings, the cash on every shard
+        # and that value; dev holds nothing and never trims
         balance = {**_LIVE_BALANCE_PAYLOAD, "portfolio_value": 150}
         settings, _reference, calls, captured = self._run_under_the_tripwire(
             monkeypatch, caplog, mode, balance_payload=balance)
@@ -3644,8 +3640,8 @@ class TestLiveSettingsReachEverySite:
         assert call["cash_cents"] == 1_024_900 and call["positions_value_cents"] == 150
         # No take-profit plan, so no pair is left out of the trim
         assert call["skip"] == frozenset()
-        # HELD-A, held with no cost listed, is no exact pair: nothing is
-        # trimmed, and the fills listing is not read
+        # HELD-A, held alone with no cost listed, is no pair: nothing is trimmed
+        # and the fills are not read
         assert "Pairs to trim this run: 0 of 0" in caplog.text
         captured["client"].get_fills_without_preload_content.assert_not_called()
 
@@ -4932,17 +4928,13 @@ class _SellExchange:
     """
     A stand-in exchange for a run that sells, keeping a ledger of positions.
 
-    It serves the balance (the first read, then `after` for every later one,
-    until set_balance swaps them), the positions listing and each market's
-    position from the ledger, the order books, hourly candles for the
-    sellable pair (and any market `candles` names), an empty settlements
-    list, the account's fills listing, the orders resting on the account (none
-    unless `resting_orders` names some), and the orders. An order fills in full
-    unless `fills` says otherwise, moves its market's position (a bid by
-    +count, an ask by -count) and, when it fills anything, adds a fill to the
-    listing at the exchange's clock (`now`, else the real time). Every balance
-    read, listing read, fills read, resting-orders read, candle request and
-    order is recorded in `events`, in order.
+    It serves the balance (`before`, then `after`, until set_balance swaps
+    them), positions from the ledger, order books, hourly candles, an empty
+    settlements list, the account's fills, the orders resting on the account,
+    and order submission. An order fills in full unless `fills` says
+    otherwise, moves its market's position (a bid by +count, an ask by -count)
+    and, if anything filled, adds a fill dated `now` (else the real time). The
+    requests listed under `events` are recorded there, in order.
 
     Attributes:
         client (MagicMock): The KalshiClient.
@@ -4978,17 +4970,14 @@ class _SellExchange:
                 position succeed; every later one gets an HTTP 400.
             include_time_series (bool): Whether the market list carries TS-EARLY/TS-LATE.
             fill_rows (tuple): The fills listing's records the account starts with.
-            fills_unreadable (bool): Whether every read of the fills listing
-                gets an HTTP 400.
-            candles (dict | None): Ticker -> (YES ask close, YES bid close) of
-                every hourly candle, over _SELL_CANDLES' own.
+            fills_unreadable (bool): Whether every fills read gets an HTTP 400.
+            candles (dict | None): Ticker -> (YES ask, YES bid) of every hourly
+                candle, over _SELL_CANDLES (a ticker named here replaces its entry).
             books (dict | None): Ticker -> order book reply, over the defaults.
-            resting_orders (tuple): The orders resting on the account
-                (_resting_order rows), all on one page.
-            orders_unreadable (str | None): How every read of the resting
-                orders fails: "error" (an HTTP 500), "not a list" (a page whose
-                orders are no list) or "repeated cursor" (every page names the
-                same next page); None reads `resting_orders`.
+            resting_orders (tuple): Orders resting on the account (_resting_order rows).
+            orders_unreadable (str | None): How every resting-orders read fails:
+                "error" (HTTP 500), "not a list", or "repeated cursor" (each page
+                names the same next page); None serves `resting_orders`.
         """
         self.ledger = {r["ticker"]: Decimal(r["position_fp"]) for r in held_rows}
         self.costs = {r["ticker"]: (r.get("market_exposure_dollars"),
@@ -5185,8 +5174,8 @@ def _run_selling(exchange: _SellExchange, monkeypatch, caplog, *, dry_run: bool,
     Returns:
         tuple[int, dict, RunReport]: The exit code; what the run handed on:
             "plan_sales" (each call's settings), "plan_trims" (each call's
-            settings, cash, positions value and skip set, as a dict), "enrich"
-            and "specs" (each call's portfolio value and cash), "portfolio"
+            keywords, as a dict), "enrich" and "specs" (each call's portfolio
+            value and cash), "portfolio"
             (select_portfolio's cash), "shards" (the shard cash handed to
             ensure_shard_collateral), "ts" and "st" (each finder call's blocked
             set, market tickers and add_on_pairs), "ladders" (each time-series
@@ -5300,8 +5289,9 @@ def _helper_sale(status: str, sold: dict, *, lone: bool = False) -> reporter.Sal
 
 def _helper_trim(status: str, count: int) -> reporter.SaleResult:
     """
-    A Kelly trim selling `count` of the 30 YES held on SELL-A and of the 30 NO
-    on SELL-B, as _helper_sale's markets; a dry run records the count as sold.
+    A Kelly trim selling `count` of the 30 held on each of _helper_sale's markets.
+
+    A "simulated" (dry-run) trim records the count as sold.
 
     Args:
         status (str): The sale's status.
@@ -5628,8 +5618,8 @@ class TestRunProdSellsInADryRun:
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True)
         assert code == EXIT_OK
         lines = [(r.levelno, r.getMessage()) for r in caplog.records]
-        # The seller was never asked, and nothing it reads was requested, nor
-        # the orders resting on the account a run about to trim reads
+        # Neither planner was asked, and nothing they read was requested (nor
+        # the resting orders, read only before a trim)
         assert seen["plan_sales"] == [] and seen["plan_trims"] == []
         assert not [e for e in exchange.events if e[0] in ("candles", "fills", "orders")]
         exchange.client.get_settlements_without_preload_content.assert_not_called()
@@ -6320,12 +6310,10 @@ class TestLiveAndDryRunsAgree:
                                                                   [(cash, cash)])
 
     def test_a_trimmed_pair_stays_held_and_is_not_added_to_in_both(self, monkeypatch, caplog):
-        # With no size cap, Kelly's own share binds the trim of the 90-contract
-        # time-series pair (31 of the 90 are sold), so the pair still has room
-        # under the cap an add-on reads. Live, its two sale orders fill; a dry
-        # run simulates them. Both keep its ladder held, keep its markets out
-        # of both finders and do not add to it. (A 20% same-title cap keeps the
-        # buys within the cash on their shard, so no cash is moved.)
+        # With no size cap, Kelly's own share sets the trim (31 of the 90 sold),
+        # so the pair is not at its cap: only the trim rule keeps an add-on off
+        # it, live and dry alike. (A 20% same-title cap keeps the buys within
+        # their shard's cash, so no cash is moved.)
         changes = {"trim_to_kelly": True, "size_cap": 1.0, "same_title_size_cap": 0.20,
                    "add_to_held_pairs": True}
         ts = {_TICKER_TS_EARLY, _TICKER_TS_LATE}
@@ -6360,16 +6348,13 @@ class TestLiveAndDryRunsAgree:
 # ─── Trimming a held pair to its Kelly size (the Kelly trim) ──────────────────
 #
 # The account holds the sellable pair (YES SELL-EARLY, NO SELL-LATE, 30 each)
-# in a small account: $60.00 of cash ($40.00 on shard 0, $20.00 on shard 1)
-# and Kalshi's value of the open positions $30.00 (the 60 contracts held back
-# up to $60). The held markets' bids on the run's market list come to $29.10
-# (30 x 0.55 + 30 x 0.42), below Kalshi's value, so a trim is sized on
-# $90.00. On the books one contract pair sells for $0.935623 after the fee
-# (0.55 + 0.42 - 0.07 x (0.55 x 0.45 + 0.42 x 0.58)), $28.07 for the 30. It
-# pays with a chance of 99.25% (mid spread 0.57 - 0.56 = 0.01, k 0.75), so
-# Kelly would keep 88% of the portfolio value, and the 20% cap binds: it may
-# keep $18.00, 19 contract pairs, and 11 are sold. Both of its markets last
-# traded ten days ago, and the fills list reaches back thirty.
+# and $60.00 of cash ($40.00 on shard 0, $20.00 on shard 1); Kalshi values the
+# positions at $30.00, more than their bids ($29.10), so a trim is sized on
+# $90.00. One contract pair sells for $0.935623 after the fee
+# (0.55 + 0.42 - 0.07 x (0.55 x 0.45 + 0.42 x 0.58)) and pays with a chance of
+# 99.25% (mid spread 0.01, k 0.75), so Kelly would keep 88% of the $90.00 and
+# the 20% cap binds: $18.00 kept is 19 contract pairs, and 11 are sold. Both
+# markets last traded ten days ago; the fills list reaches back thirty.
 _TRIM_BEFORE = {
     "balance": 114, "balance_dollars": "60.0000",
     "balance_breakdown": [{"exchange_index": 0, "balance": "40.0000"},
@@ -6438,9 +6423,10 @@ def _trim_fills(*tickers: str, days_ago: float = 10, oldest_days_ago: float = 30
 def _trim_exchange(monkeypatch, *, held_rows: tuple = _SELL_ROWS, before: dict = _TRIM_BEFORE,
                    fill_rows: tuple | None = None, **kwargs) -> _SellExchange:
     """
-    A _SellExchange for a Kelly trim: the account holds `held_rows` (the
-    sellable pair by default), every held market of which last traded ten
-    days ago, with the fills list reaching back thirty.
+    A _SellExchange for a Kelly trim, holding `held_rows` (the sellable pair by default).
+
+    By default every held market last traded ten days ago, and the fills list
+    reaches back thirty.
 
     Args:
         monkeypatch (pytest.MonkeyPatch): pytest's per-test patcher.
@@ -6477,8 +6463,8 @@ def _orders_reads(exchange: _SellExchange) -> list:
 
 
 def _resting_order(ticker: str, count: str = "50.00", price: str = "0.5000") -> dict:
-    """An order resting on the account, as /portfolio/orders sends it: a buy of
-    `count` YES at `price`, placed by hand (Kalshi holds its cash, $25.00 by default)."""
+    """A hand-placed buy of `count` YES at `price` resting on the account, as
+    /portfolio/orders lists it (Kalshi holds its cash: $25.00 by default)."""
     return {"order_id": f"HAND-{ticker}", "ticker": ticker, "side": "yes", "action": "buy",
             "status": "resting", "yes_price_dollars": price, "remaining_count_fp": count}
 
@@ -6502,12 +6488,11 @@ def _books_read(exchange: _SellExchange) -> set:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestRunProdTrimsInADryRun:
-    """A production dry run with trim_to_kelly on plans the Kelly trims after
-    the take-profit sales and sizes its buys as if they filled, sending
-    nothing. A pair trimmed in part is still held: its ladder stays held, its
-    markets stay out of every purchase, and it is not added to. Anything the
-    trim needs that cannot be read means no trim, with one WARNING naming
-    why; an account holding nothing trims nothing and says nothing of it."""
+    """A production dry run with trim_to_kelly on plans its Kelly trims, sends
+    nothing, and sizes its buys as if the trims filled. A pair trimmed in part
+    stays held: its ladder and markets stay blocked and it is not added to.
+    Anything unreadable means no trim and one WARNING saying why; an account
+    holding nothing trims nothing, silently."""
 
     def test_a_pair_past_its_share_is_trimmed_before_anything_is_bought(self, monkeypatch,
                                                                         caplog):
@@ -6527,15 +6512,14 @@ class TestRunProdTrimsInADryRun:
         assert "11 YES contracts (of 30 held) on SELL-EARLY" in would
         assert "11 NO contracts (of 30 held) on SELL-LATE" in would
         assert _trim_or_value_warnings(caplog) == []
-        # The planner was asked once, with the run's cash and the value kept at
-        # the start; one fills read, no candle (no minimum price rise), nothing sent
+        # Asked once, with the cash and the positions value read at the start;
+        # one fills read, no candles (no minimum price rise), nothing sent
         [trims] = seen["plan_trims"]
         assert trims["settings"].trim_to_kelly is True
         assert (trims["cash_cents"], trims["positions_value_cents"], trims["skip"]) == (
             _TRIM_CASH_CENTS, 3_000, frozenset())
         assert _fills_reads(exchange) == 1
-        # One read of the orders resting on the account, which found none, before
-        # the planner was asked
+        # One resting-orders read (none found), before the fills read
         assert _orders_reads(exchange) == [{"status": "resting", "limit": 200}]
         assert ([e[0] for e in exchange.events].index("orders")
                 < [e[0] for e in exchange.events].index("fills"))
@@ -6547,8 +6531,8 @@ class TestRunProdTrimsInADryRun:
         assert seen["enrich"] == [(9_000, cash)] and seen["portfolio"] == [cash]
         assert seen["shards"] == [{0: 4_000 + _TRIM_PROCEEDS_CENTS, 1: 2_000}]
         assert "Dry run: sizing as if the sales filled — cash $70.28 (+$10.28)" in messages
-        # The pair is still held: its ladder stays held, as a live run reads it
-        # held again, and its markets stay out of both finders
+        # The pair stays held, as a live run would read it back: its ladder
+        # stays held and its markets stay out of both finders
         [ladders] = seen["ladders"]
         assert {("event", "EVS-SELL-EARLY"), ("event", "EVS-SELL-LATE")} <= ladders
         for blocked, markets, _pairs in seen["ts"] + seen["st"]:
@@ -6569,9 +6553,8 @@ class TestRunProdTrimsInADryRun:
         assert row[17].startswith("[sale: YES A / NO B, Kelly trim: 11 of 30 contract pairs, ")
 
     def test_a_pair_trimmed_is_not_added_to(self, monkeypatch, caplog):
-        # With no size cap, Kelly's own share binds the trim, so the pair still
-        # has room under the cap an add-on reads: it is left out as picked for
-        # a Kelly trim, and its markets stay blocked
+        # With no size cap, Kelly's own share sets the trim, so the pair is not at
+        # its cap: it is left out as picked for a trim, its markets blocked
         exchange = _trim_exchange(monkeypatch, held_rows=_HELD_TS_PAIR_90,
                                   before=_TS90_BEFORE, include_time_series=True)
         code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
@@ -6619,8 +6602,8 @@ class TestRunProdTrimsInADryRun:
     ], ids=["not read", "refused", "zero"])
     def test_a_value_that_leaves_the_positions_out_trims_nothing(self, monkeypatch, caplog,
                                                                  before, why):
-        # A trim grows as the value it is sized on shrinks: the planner is not
-        # even asked, and the fills listing is not read
+        # A trim grows as the value it is sized on shrinks, so no trim is
+        # planned and the fills are not read
         exchange = _trim_exchange(monkeypatch, before=before)
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
                                           trim_to_kelly=True)
@@ -6650,13 +6633,13 @@ class TestRunProdTrimsInADryRun:
     @pytest.mark.parametrize("dry_run", [True, False], ids=["dry", "live"])
     def test_cash_on_a_shard_that_cannot_be_read_trims_nothing(self, monkeypatch, caplog,
                                                               breakdown, left_out, dry_run):
-        # Sized on $50.00 instead of $90.00, the trim would sell 20 of the 30, not 11:
-        # the planner is not even asked, and the fills listing is not read. The
-        # line names the entry left out, and says the rest of the cash was read
+        # Sized on $50.00 instead of $90.00, the trim would sell 20 of the 30, not
+        # 11, so no trim is planned and the fills are not read. The WARNING names
+        # the entry left out
         exchange = _trim_exchange(monkeypatch,
                                   before={**_TRIM_BEFORE, "balance_breakdown": breakdown},
                                   after=_AFTER_TRIM_BALANCE)
-        # Nothing is bought, so the trim's would be the run's only orders
+        # Nothing is bought, so a trim's orders would be the run's only ones
         monkeypatch.setattr(main, "find_same_title_pairs",
                             lambda markets, held, *, add_on_pairs=None: [])
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=dry_run,
@@ -6753,9 +6736,8 @@ class TestRunProdTrimsInADryRun:
 
     def test_with_a_sell_level_too_the_pair_sold_whole_is_not_trimmed(self, monkeypatch,
                                                                       caplog):
-        # The sellable pair is at its take-profit level and is sold whole; the
-        # time-series pair is below its level and past its 10% cap of $112.00,
-        # so it is trimmed: 14 of its 30 are sold
+        # The sellable pair reaches its take-profit level and is sold whole; the
+        # time-series pair, past its 10% cap of $112.00, has 14 of its 30 trimmed
         exchange = _trim_exchange(monkeypatch, held_rows=_SELL_ROWS + _HELD_TS_PAIR,
                                   before=_TWO_PAIRS_BEFORE, include_time_series=True)
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=True,
@@ -6806,10 +6788,10 @@ class TestRunProdTrimsInADryRun:
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestRunProdTrimsLive:
     """A live production run with trim_to_kelly on sends each trim's two
-    reduce-only orders, sized to the part sold, before any buy order, then
-    reads its positions and balance again and sizes its buys on what is left.
-    The pair stays held, its ladder held. A trim left uneven, or whose outcome
-    cannot be known, makes the run exit 20."""
+    reduce-only orders (they can only shrink a position), sized to the part
+    sold, before any buy; then it reads its positions and balance again and
+    sizes its buys on what is left. The pair stays held. A trim left uneven,
+    or of unknown outcome, makes the run exit 20."""
 
     def test_a_trim_is_sent_before_every_buy_and_the_account_is_read_again(
             self, monkeypatch, caplog):
@@ -6824,7 +6806,7 @@ class TestRunProdTrimsLive:
             (_TICKER_SELL_LATE, "bid", "11.00", "immediate_or_cancel")]
         assert exchange.ledger[_TICKER_SELL_EARLY] == 19
         assert exchange.ledger[_TICKER_SELL_LATE] == -19
-        # One read of the orders resting on the account, which found none
+        # One resting-orders read, which found none
         assert _orders_reads(exchange) == [{"status": "resting", "limit": 200}]
         # Every sale order before the first buy order, and between them the
         # positions listing and the balance read again
@@ -6841,7 +6823,7 @@ class TestRunProdTrimsLive:
         assert seen["enrich"] == [(cash + 1_900, cash)] and seen["portfolio"] == [cash]
         assert ("After the sales: portfolio value $89.28 = cash $70.28 + open positions "
                 "$19.00") in _messages(caplog)
-        # No word against the trim or the value it and the buys are sized on
+        # No WARNING about the trim or the value it is sized on
         assert _trim_or_value_warnings(caplog) == []
         # The 19 of each left are still held: the ladder stays held, and the
         # markets stay out of every purchase
@@ -6863,7 +6845,7 @@ class TestRunProdTrimsLive:
         assert filled.count(_TICKER_SELL_EARLY) == filled.count(_TICKER_SELL_LATE) == 2
 
     def test_a_trims_only_run_writes_its_result(self, monkeypatch, caplog, tmp_path):
-        # Nothing is bought, so the trim's are the run's only orders
+        # Nothing is bought, so the trim's orders are the run's only ones
         exchange = _trim_exchange(monkeypatch, after=_AFTER_TRIM_BALANCE)
         monkeypatch.setattr(main, "find_same_title_pairs",
                             lambda markets, held, *, add_on_pairs=None: [])
@@ -6919,11 +6901,10 @@ class TestRunProdTrimsLive:
     @pytest.mark.parametrize("value_after", [3_000, 3_001], ids=["equal", "a cent higher"])
     def test_a_value_that_did_not_fall_after_a_trim_sizes_the_buys_on_cash_alone(
             self, monkeypatch, caplog, value_after):
-        # The recorded residual: the check that Kalshi's value of the open
-        # positions fell after contracts were sold reads the whole account,
-        # so after a small trim ordinary price moves can trip it. The two
-        # orders still go out; the buys are then sized on the cash alone, and
-        # nothing is added to
+        # A known limit: the check that Kalshi's positions value fell after a
+        # sale reads the whole account, so ordinary price moves can trip it
+        # after a small trim. The trim still goes out; the buys are sized on
+        # cash alone and nothing is added to
         exchange = _trim_exchange(
             monkeypatch, after={**_AFTER_TRIM_BALANCE, "portfolio_value": value_after})
         code, seen, _report = _run_selling(exchange, monkeypatch, caplog, dry_run=False,
@@ -6974,16 +6955,15 @@ class TestRunProdTrimsLive:
     @pytest.mark.parametrize("dry_run", [True, False], ids=["dry", "live"])
     def test_an_order_resting_on_the_account_trims_nothing(self, monkeypatch, caplog,
                                                            dry_run):
-        # A buy of 50 YES at $0.50 placed by hand rests on another market: Kalshi
-        # holds its $25.00, which is in neither the $60.00 of cash nor the $30.00
-        # it values the open positions at. Sized on $90.00 instead of the $115.00
-        # the account is worth, the trim would sell 11 of the 30, not 6: nothing
-        # is trimmed, the planner is not asked and the fills are never read
+        # A hand-placed buy rests on another market, and Kalshi holds its $25.00
+        # in neither the cash nor the positions value. Sized on $90.00, not the
+        # $115.00 the account is worth, the trim would sell 11 of the 30, not 6,
+        # so nothing is trimmed and the fills are never read
         assert config.kelly_trim_count(
             30, 115.0, 0.9925, 0.20, 0.935623, lambda n: n * 0.935623).sell == 6
         exchange = _trim_exchange(monkeypatch, after=_AFTER_TRIM_BALANCE,
                                   resting_orders=(_resting_order("OTHER-MKT"),))
-        # Nothing is bought, so a trim's would be the run's only orders
+        # Nothing is bought, so a trim's orders would be the run's only ones
         monkeypatch.setattr(main, "find_same_title_pairs",
                             lambda markets, held, *, add_on_pairs=None: [])
         code, seen, report = _run_selling(exchange, monkeypatch, caplog, dry_run=dry_run,
@@ -7024,15 +7004,13 @@ class TestRunProdTrimsLive:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestRunProdTrimsAfterAPriceRise:
-    """main.py --trim-min-rise CENTS holds a pair's trim back until its total
-    price (the asking price of the side held on each market, added) has risen
-    that far since its last fill. The sellable pair is up 13c since then
-    ($0.88 then, $1.01 now) and the time-series pair 8c ($0.62 then, $0.70
-    now); with a 10% cap of $112.00 both have outgrown their share."""
+    """--trim-min-rise CENTS holds back a pair's trim until its total price (the
+    ask of the side held on each market, added) has risen that far since its
+    last fill. The sellable pair is up 13c and the time-series pair 8c; under a
+    10% cap of $112.00 both have outgrown their share."""
 
     # Each market's hourly candles before the last fill: (YES ask, YES bid). A
-    # NO ask is 1 minus the YES bid, so SELL-LATE's NO stood at 0.38 and
-    # TS-LATE's at 0.36
+    # NO ask is 1 minus the YES bid (SELL-LATE's NO stood at 0.38, TS-LATE's at 0.36)
     _CANDLES_THEN = {_TICKER_SELL_EARLY: ("0.50", "0.48"), _TICKER_SELL_LATE: ("0.64", "0.62"),
                      _TICKER_TS_EARLY: ("0.26", "0.24"), _TICKER_TS_LATE: ("0.66", "0.64")}
 
@@ -7046,9 +7024,9 @@ class TestRunProdTrimsAfterAPriceRise:
             argv (list): The minimum price rise's flags.
 
         Returns:
-            tuple: (the exchange, what the run handed on: "plan_sales" and
-                "plan_trims", each call's settings and keywords, and "log",
-                each trade-log write's sales; main's exit code).
+            tuple: (the exchange, seen, main's exit code); seen holds
+                "plan_sales" (each call's settings), "plan_trims" (each call's
+                keywords) and "log" (each trade-log write's sales).
         """
         exchange = _trim_exchange(monkeypatch, held_rows=_SELL_ROWS + _HELD_TS_PAIR,
                                   before=_TWO_PAIRS_BEFORE, include_time_series=True,
@@ -7132,11 +7110,10 @@ class _Clock:
 
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestRunProdTrimsOnAnyDay:
-    """The wait before a Kelly trim counts calendar days on the bot's own clock
-    since the pair's last fill, whoever made it, and reads no schedule: it
-    holds however often the bot runs, and each run sees the fills of the runs
-    before it. Each run here is a live run on one account, the exchange's
-    clock and main's moving together."""
+    """The wait before a Kelly trim counts calendar days, on the bot's own clock,
+    since the pair's last fill by anyone. It reads no schedule, so it holds
+    however often the bot runs. Each run here is a live run on one account,
+    with the exchange's clock and main's moving together."""
 
     _ZONE = config.SCHEDULED_RUN.zone()
 
@@ -7183,10 +7160,10 @@ class TestRunProdTrimsOnAnyDay:
         assert exchange.ledger[_TICKER_SELL_EARLY] == 19
 
     def test_a_purchase_holds_back_the_trim_of_a_run_an_hour_later(self, monkeypatch, caplog):
-        # A live run buys the same-title pair; a run an hour later, with a cap
-        # it has outgrown, does not trim it, since the purchase's own fills are
-        # its last trade; a run a week after the purchase does. Both books
-        # have bids on both sides, which a trim reads
+        # A live run buys the same-title pair. A run an hour later, under a cap
+        # the pair has outgrown, does not trim it (the purchase's own fills are
+        # its last trade); a run a week later does. A trim needs bids on both
+        # sides of both books
         books = {_TICKER_SAME_EXP: {"orderbook_fp": {"yes_dollars": [["0.55", "100"]],
                                                      "no_dollars": [["0.43", "100"]]}},
                  _TICKER_SAME_CHEAP: {"orderbook_fp": {"yes_dollars": [["0.18", "100"]],
@@ -7230,11 +7207,10 @@ class TestRunProdTrimsOnAnyDay:
 
 
 class TestLiveTrimTextsSayWhatARunDoes:
-    """Once a production run trims, the texts about it must say what it does:
-    a pair trimmed whole is not still held, trims are planned before any sale
-    order goes out, a live run can sell with no sell level saved, and both
-    planners read for themselves. Whitespace is collapsed before each check,
-    so a sentence wrapped over two lines is still read."""
+    """The docs and docstrings must describe what a trimming run does: a pair
+    trimmed whole is no longer held, trims are planned before any sale is
+    sent, a live run can sell with no sell level saved, and each planner does
+    its own reads. Whitespace is collapsed first, so wrapped sentences match."""
 
     @staticmethod
     def _text(doc: str) -> str:
@@ -7279,18 +7255,16 @@ class TestLiveTrimTextsSayWhatARunDoes:
 
     @staticmethod
     def _running_text(path: pathlib.Path) -> str:
-        """A document or a module as running text: string literals that sit side by
-        side are joined, and line breaks (with a comment marker after them) and
-        runs of spaces become single spaces, so a sentence wrapped over two lines
-        or two literals is one sentence."""
+        """A file as running text: a string literal continued on the next line is
+        joined to it, and line breaks (with any comment marker after them) and runs
+        of spaces become single spaces, so a sentence wrapped over lines reads as one."""
         text = path.read_text(encoding="utf-8")
         text = re.sub(r'(?<!\\)"\s*\n\s*(?:f|r|rf|fr)?"', "", text)
         text = re.sub(r"\s*\n\s*(?:#\s*)?", " ", text)
         return re.sub(r"\s+", " ", text)
 
     @pytest.mark.parametrize("stale", [
-        # What the backtest's help, its header and the docs said while only the
-        # backtest trimmed
+        # Phrases that would say live trading cannot trim
         r"\b(live|production)( trading| runs?)? (does|do|did) not (yet )?trim",
         r"\bno run acts on\b",
         r"\bBringing it to live\b",
@@ -7339,10 +7313,9 @@ class TestLiveTrimTextsSayWhatARunDoes:
                 < readme.index("trader.sell_positions()"))
 
     def test_each_save_step_says_what_the_button_does_to_the_other_setting(self):
-        # Trim to Kelly on shuts Sell at "no selling", and Sell shows a level only
-        # with Trim to Kelly off, so from a page that shows both the button saves
-        # the other one off; the /confirm link leaves it out, and a field left out
-        # keeps its saved value. The save step of each first-run order says so
+        # On a page showing both, the Save button saves the other setting off
+        # (Trim to Kelly shuts Sell, and Sell needs Trim to Kelly off); a
+        # /confirm link that leaves it out keeps it. Each save step says so
         claude = self._lines("CLAUDE.md")
         [trim] = [x for x in claude if x.startswith("**First-run order for trimming.**")]
         [sell] = [x for x in claude
@@ -7382,9 +7355,8 @@ class TestLiveTrimTextsSayWhatARunDoes:
 
     @pytest.mark.parametrize("doc", ["CLAUDE.md", "README.md"])
     def test_the_config_rows_say_a_live_run_reads_the_saved_trim_settings(self, doc):
-        # plan_trims reads the run's LiveSettings.trim_to_kelly / .trim_min_rise and
-        # names neither constant: TRIM_TO_KELLY and TRIM_MIN_RISE are config.py's own
-        # values, which test_strategy's live-toggle AST pin keeps off the live path
+        # The live trim reads the run's LiveSettings, never config.py's own
+        # TRIM_TO_KELLY or TRIM_MIN_RISE, and the config.py rows must say so
         source = inspect.getsource(seller_mod)
         assert "TRIM_TO_KELLY" not in source and "TRIM_MIN_RISE" not in source
         [row] = [x for x in self._lines(doc) if x.startswith("| `config.py` |")]
@@ -7402,9 +7374,9 @@ class TestLiveTrimTextsSayWhatARunDoes:
         assert "a trim's price then" in candles
 
     def test_claude_md_names_this_class_among_the_tests_that_read_the_docs(self):
-        # This class reads README.md, CLAUDE.md and every module's text, so an edit
-        # to any of them can fail it; CLAUDE.md's list of such tests names it, gives
-        # no count that a new test would make wrong, and names only tests that exist
+        # This class reads the docs and every module, so an edit can fail it.
+        # CLAUDE.md's list of such tests must name it, give no count a new test
+        # would make wrong, and name only tests that exist
         [line] = [x for x in self._lines("CLAUDE.md") if "read the project's own text" in x]
         assert re.match(r"- (\d+|two|three|four|five|six|seven|eight|nine|ten) tests ",
                         line, re.IGNORECASE) is None
@@ -9737,10 +9709,8 @@ def _other_toggles(target: LiveSettings) -> LiveSettings:
         # --no-sell-min-days to win over them
         sell_at=0.5 if target.sell_at != 0.5 else 0.6,
         sell_min_days=2 if target.sell_min_days != 2 else 3,
-        # Trimming with a minimum unless the target trims, so a target that
-        # trims nothing needs --no-trim-to-kelly and --no-trim-min-rise to win
-        # over them. A target that trims must name a minimum of its own: with
-        # trimming off these defaults can hold none to differ from it
+        # The opposite trim switch; a 25c minimum when trimming here. A target
+        # that trims must name its own minimum, since these defaults then hold none
         trim_to_kelly=not target.trim_to_kelly,
         trim_min_rise=None if target.trim_to_kelly else 0.25,
     )
@@ -9864,9 +9834,8 @@ class TestLiveSettingsArgv:
         argv = config.live_settings_argv(_ARGV_TARGETS["trimming-after-a-15c-rise"])
         assert argv[argv.index("--no-sell-min-days"):][:3] == [
             "--no-sell-min-days", "--trim-to-kelly", "--trim-min-rise=15"]
-        # Every step of the 5c grid is spelled as its exact whole cents (one
-        # step's dollars times 100 is not whole: 0.55 * 100 is
-        # 55.00000000000001) and reads back as the same minimum
+        # Every 5c step is spelled as exact whole cents and reads back the same
+        # (0.55 * 100 is 55.00000000000001, so a plain product would not do)
         assert [c for c in range(5, 101, 5) if c / 100 * 100 != c] == [55]
         parser = main._build_parser()
         for cents in range(5, 101, 5):
@@ -9879,10 +9848,9 @@ class TestLiveSettingsArgv:
             assert args.trim_min_rise / 100 == target.trim_min_rise
 
     def test_trimming_with_no_minimum_clears_a_saved_one(self):
-        # A target that trims with no minimum is spelled --trim-to-kelly
-        # --no-trim-min-rise, which has to win over a saved minimum (saved
-        # defaults that trim cannot differ from it in the switch, so this
-        # target is not among _ARGV_TARGETS)
+        # Trimming with no minimum is spelled --trim-to-kelly --no-trim-min-rise,
+        # which must clear a saved minimum. (Not in _ARGV_TARGETS: saved defaults
+        # holding a minimum must trim too, so the switch could not differ.)
         target = dataclasses.replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True)
         argv = config.live_settings_argv(target)
         assert argv[argv.index("--trim-to-kelly"):][:2] == [

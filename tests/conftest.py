@@ -98,15 +98,13 @@ def apply_pre_toggle_defaults(mp) -> None:
     Pin every binding of the twelve live toggles to fixed values.
 
     Tier floors on, no spread band, k 0.75, a 20% per-trade cap, no extra
-    same-title cap, no category or tag filter, no adding to held pairs, no
-    selling (a sell level of None and no minimum of days) and no trimming to
-    Kelly (off, with no minimum price rise). The writer leaves the keys of
-    the last five out while they are off, so a file saved from these values
-    holds only the other seven toggles. Patches config's constants,
-    read at call time, AND the by-value copies backtester and backtest bind at
-    import, or a test would price with one value and size with another; no
-    other module binds one by value (pinned by test_config.py's
-    TestPreToggleDefaults).
+    same-title cap, no category or tag filter, and no adding to held pairs,
+    selling or trimming. A file saved from these values holds only the other
+    seven toggles, since the last five are left out while off. Patches
+    config's constants, read at call time, AND the by-value copies backtester
+    and backtest bind at import, or a test would price with one value and size
+    with another; no other module binds one by value (pinned by
+    test_config.py's TestPreToggleDefaults).
 
     Args:
         mp (pytest.MonkeyPatch): The patcher; a class-scoped fixture passes its

@@ -7205,17 +7205,16 @@ class TestSellPositions:
                    for r in caplog.records)
 
 
-# A Kelly trim's ladders: KX-A's walk for 13 stays on its 0.45 level, leaving 7
-# there; KX-B's walk for 13 takes all of its 0.50 level, so KX-B is the thinner
-# book and is sold first
+# Bid ladders for selling 13 a side: KX-A's 13 stay on its 0.45 level (7 left
+# there); KX-B's take its whole 0.50 level, so KX-B is thinner and is sold first
 _TRIM_LADDER_A = [[0.45, 20], [0.44, 30]]
 _TRIM_LADDER_B = [[0.50, 13], [0.49, 5]]
 
 
 def _trim_plan(sell: int = 13, held: int | None = 30, *, held_b: int | None = None,
                title: str = "Test position") -> seller.SalePlan:
-    """A Kelly trim's plan: YES on KX-A and NO on KX-B, `held` contracts each
-    (`held_b` on KX-B when given), of which it sells `sell` on each market."""
+    """A Kelly trim's plan: sells `sell` of the `held` YES on KX-A and NO on KX-B
+    (`held_b` on KX-B when given)."""
     a = dataclasses.replace(_held("KX-A", "yes", sell), held=held)
     b = dataclasses.replace(_held("KX-B", "no", sell), held=held if held_b is None else held_b)
     plan = _sale_plan((a, _TRIM_LADDER_A), (b, _TRIM_LADDER_B), title=title)
@@ -7223,17 +7222,16 @@ def _trim_plan(sell: int = 13, held: int | None = 30, *, held_b: int | None = No
 
 
 class TestSellPartOfAHolding:
-    """A plan may sell only part of what a market holds (a Kelly trim): its
-    legs carry the contracts to sell (count) apart from the contracts held
-    (held). The orders are sized on the count; the account must still hold
-    exactly what the plan was made on; and what is left is counted from the
-    holding, never from the count sold."""
+    """Selling part of a holding (a Kelly trim): a leg's `count` is the contracts
+    to sell and `held` the contracts held. Orders are sized on `count`, the
+    account must still hold exactly `held`, and what is left is counted from
+    `held`."""
 
     _sell = staticmethod(TestSellPositions._sell)
 
     @pytest.fixture
     def sleeps(self, monkeypatch):
-        """The pauses taken, instead of waiting."""
+        """Records each pause instead of sleeping."""
         taken: list = []
         monkeypatch.setattr(trader.time, "sleep", taken.append)
         return taken
@@ -7330,8 +7328,8 @@ class TestSellPartOfAHolding:
 
     def test_an_unreadable_reply_is_judged_by_how_far_the_position_moved(self, monkeypatch,
                                                                          sleeps):
-        # The first order fills all 13 and its reply is lost: the account shows
-        # KX-B moved from -30 to -17, which is the whole order, though far from flat
+        # The first order fills all 13 but its reply is lost: KX-B moving from -30
+        # to -17 shows the whole order filled, though the market is far from flat
         exchange = _SaleExchange({"KX-A": 30, "KX-B": -30}, reply={"KX-B": "raise"})
         [result] = self._sell(monkeypatch, exchange, [_trim_plan()])
         assert (result.status, result.sold) == ("sold", {"KX-B": 13, "KX-A": 13})
@@ -7365,8 +7363,8 @@ class TestSellPartOfAHolding:
         assert "nothing sent on KX-A, which still holds 30 YES contracts." in critical
 
     def test_a_move_past_the_order_is_not_a_count_it_sold(self, monkeypatch, sleeps):
-        # The reply is lost and the position reads -15: a move of 15, more than
-        # the 13 the order asked to sell (something else traded)
+        # The reply is lost and the position moved 15, more than the 13 asked
+        # (something else traded)
         exchange = _SaleExchange({"KX-A": 30, "KX-B": -30}, reply={"KX-B": "raise"},
                                  outside={"KX-B": 2})
         [result] = self._sell(monkeypatch, exchange, [_trim_plan()])
@@ -7431,8 +7429,8 @@ class TestSellPartOfAHolding:
     def test_a_lone_market_sold_in_part_counts_what_is_left_from_its_holding(
         self, monkeypatch, caplog,
     ):
-        # No plan sells part of a lone held market today; the trader still
-        # reads its holding where it has one
+        # The seller never trims a lone market, but the trader still reads a
+        # leg's holding when it carries one
         leg = dataclasses.replace(_held("KX-A", "yes", 4), held=10)
         plan = _sale_plan((leg, [[0.45, 10]]), partner=_paid_out("KX-P", "no"))
         exchange = _SaleExchange({"KX-A": 10}, fills={"KX-A": 3})
