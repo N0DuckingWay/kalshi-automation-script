@@ -7205,6 +7205,259 @@ class TestSellPositions:
                    for r in caplog.records)
 
 
+# Bid ladders for selling 13 a side: KX-A's 13 stay on its 0.45 level (7 left
+# there); KX-B's take its whole 0.50 level, so KX-B is thinner and is sold first
+_TRIM_LADDER_A = [[0.45, 20], [0.44, 30]]
+_TRIM_LADDER_B = [[0.50, 13], [0.49, 5]]
+
+
+def _trim_plan(sell: int = 13, held: int | None = 30, *, held_b: int | None = None,
+               title: str = "Test position") -> seller.SalePlan:
+    """A Kelly trim's plan: sells `sell` of the `held` YES on KX-A and NO on KX-B
+    (`held_b` on KX-B when given)."""
+    a = dataclasses.replace(_held("KX-A", "yes", sell), held=held)
+    b = dataclasses.replace(_held("KX-B", "no", sell), held=held if held_b is None else held_b)
+    plan = _sale_plan((a, _TRIM_LADDER_A), (b, _TRIM_LADDER_B), title=title)
+    return dataclasses.replace(plan, level=None, kind=config.SALE_KIND_KELLY_TRIM)
+
+
+class TestSellPartOfAHolding:
+    """Selling part of a holding (a Kelly trim): a leg's `count` is the contracts
+    to sell and `held` the contracts held. Orders are sized on `count`, the
+    account must still hold exactly `held`, and what is left is counted from
+    `held`."""
+
+    _sell = staticmethod(TestSellPositions._sell)
+
+    @pytest.fixture
+    def sleeps(self, monkeypatch):
+        """Records each pause instead of sleeping."""
+        taken: list = []
+        monkeypatch.setattr(trader.time, "sleep", taken.append)
+        return taken
+
+    def test_thirteen_of_thirty_are_sold_on_each_market(self, monkeypatch, caplog):
+        exchange = _SaleExchange({"KX-A": 30, "KX-B": -30})
+        plan = _trim_plan()
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [plan])
+        assert (result.plan, result.status, result.sold, result.error) == (
+            plan, "sold", {"KX-B": 13, "KX-A": 13}, None)
+        assert result.decided_by_account is False
+        first, second = exchange.bodies
+        # Both orders are sized 13, never the 30 held: the thinner book first at
+        # its walked bid, then the other one tick below the bid its walk reaches
+        assert (first["ticker"], first["side"], first["price"], first["count"]) == (
+            "KX-B", "bid", "0.5000", "13.00")
+        assert (second["ticker"], second["side"], second["price"], second["count"]) == (
+            "KX-A", "ask", "0.4400", "13.00")
+        for body in exchange.bodies:
+            assert body["reduce_only"] is True
+            assert body["time_in_force"] == "immediate_or_cancel"
+        # Seventeen are still held on each side
+        assert exchange.positions == {"KX-A": 17, "KX-B": -17}
+        # Each market was read once, before the first order, and never after
+        assert exchange.events == [
+            ("read", "KX-B"), ("read", "KX-A"),
+            ("pace",), ("post", "KX-B"), ("pace",), ("post", "KX-A"),
+        ]
+        [line] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Sold ")]
+        assert line == (
+            "Sold 'Test position': 13 of 13 NO (of 30 held) on KX-B sold (YES bid at 0.5000,"
+            " so 0.5000 or more a NO contract), then 13 of 13 YES (of 30 held) on KX-A sold"
+            " (ask at 0.4400)"
+        )
+
+    @pytest.mark.parametrize("positions, error", [
+        # Holding exactly what the plan sells is not holding what it was made on
+        ({"KX-A": 30, "KX-B": -13},
+         "not sent: KX-B now holds 13 NO contracts; the plan holds 30 NO contracts"),
+        ({"KX-A": 13, "KX-B": -30},
+         "not sent: KX-A now holds 13 YES contracts; the plan holds 30 YES contracts"),
+        ({"KX-A": 29, "KX-B": -30},
+         "not sent: KX-A now holds 29 YES contracts; the plan holds 30 YES contracts"),
+        ({"KX-A": 30, "KX-B": -31},
+         "not sent: KX-B now holds 31 NO contracts; the plan holds 30 NO contracts"),
+        ({"KX-A": 30, "KX-B": 30},
+         "not sent: KX-B now holds 30 YES contracts; the plan holds 30 NO contracts"),
+        ({"KX-A": 30},
+         "not sent: KX-B now holds nothing; the plan holds 30 NO contracts"),
+    ])
+    def test_a_holding_that_is_not_the_plans_sends_nothing(self, monkeypatch, caplog,
+                                                           positions, error):
+        exchange = _SaleExchange(positions)
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_trim_plan()])
+        assert (result.status, result.sold, result.error) == (
+            "not_sold", {"KX-B": 0, "KX-A": 0}, error)
+        assert exchange.events == [("read", "KX-B"), ("read", "KX-A")]
+        assert exchange.bodies == [] and exchange.positions == positions
+
+    def test_a_first_order_that_fills_part_leaves_an_exact_pair(self, monkeypatch, caplog):
+        exchange = _SaleExchange({"KX-A": 30, "KX-B": -30}, fills={"KX-B": 10})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_trim_plan()])
+        assert (result.status, result.sold) == ("partly_sold", {"KX-B": 10, "KX-A": 10})
+        assert result.error == "sold 10 of 13 on each market"
+        assert exchange.bodies[1]["count"] == "10.00"
+        assert exchange.positions == {"KX-A": 20, "KX-B": -20}
+        # What is still held is counted from the 30 held, not from the 13 asked
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning == (
+            "Partly sold 'Test position': 10 of 13 NO (of 30 held) on KX-B sold (YES bid at"
+            " 0.5000, so 0.5000 or more a NO contract), then 10 of 10 YES (of 30 held) on"
+            " KX-A sold (ask at 0.4400); the other 20 on each market are still held, as an"
+            " exact pair"
+        )
+
+    def test_a_second_order_that_falls_short_names_what_each_market_holds(self, monkeypatch,
+                                                                          caplog):
+        exchange = _SaleExchange({"KX-A": 30, "KX-B": -30}, fills={"KX-A": 9})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_trim_plan()])
+        assert (result.status, result.sold) == ("unbalanced", {"KX-B": 13, "KX-A": 9})
+        assert result.error == (
+            "sold 13 NO on KX-B but only 9 YES on KX-A: KX-B holds 17 NO contracts,"
+            " KX-A holds 21 YES contracts"
+        )
+        assert exchange.positions == {"KX-A": 21, "KX-B": -17}
+        [critical] = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert critical.startswith("SALE LEFT A PAIR UNBALANCED for 'Test position'")
+        assert "KX-B now holds 17 NO contracts and KX-A holds 21 YES contracts" in critical
+        assert "Sell the extra 4 YES contracts on KX-A by hand in the Kalshi UI" in critical
+
+    def test_an_unreadable_reply_is_judged_by_how_far_the_position_moved(self, monkeypatch,
+                                                                         sleeps):
+        # The first order fills all 13 but its reply is lost: KX-B moving from -30
+        # to -17 shows the whole order filled, though the market is far from flat
+        exchange = _SaleExchange({"KX-A": 30, "KX-B": -30}, reply={"KX-B": "raise"})
+        [result] = self._sell(monkeypatch, exchange, [_trim_plan()])
+        assert (result.status, result.sold) == ("sold", {"KX-B": 13, "KX-A": 13})
+        assert result.decided_by_account is True
+        # The move was the whole order at the first read: no pause, no re-read
+        assert sleeps == []
+        assert exchange.positions == {"KX-A": 17, "KX-B": -17}
+
+    def test_an_unreadable_reply_after_a_part_fill_sells_the_same_part(self, monkeypatch,
+                                                                       sleeps):
+        exchange = _SaleExchange({"KX-A": 30, "KX-B": -30}, fills={"KX-B": 10},
+                                 reply={"KX-B": "no-fill-count"})
+        [result] = self._sell(monkeypatch, exchange, [_trim_plan()])
+        assert (result.status, result.sold) == ("partly_sold", {"KX-B": 10, "KX-A": 10})
+        assert result.decided_by_account is True
+        # Short of the 13 asked, so the account is read again after each pause
+        assert sleeps == list(config.V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS)
+        assert exchange.bodies[1]["count"] == "10.00"
+        assert exchange.positions == {"KX-A": 20, "KX-B": -20}
+
+    def test_an_unknown_first_order_names_the_whole_holding_left_on_the_other(
+        self, monkeypatch, sleeps, caplog,
+    ):
+        exchange = _SaleExchange({"KX-A": 30, "KX-B": -30}, reply={"KX-B": "raise"},
+                                 unreadable={"KX-B"})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_trim_plan()])
+        assert (result.status, result.sold) == ("manual_review", {"KX-A": 0})
+        assert [body["ticker"] for body in exchange.bodies] == ["KX-B"]
+        [critical] = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert "nothing sent on KX-A, which still holds 30 YES contracts." in critical
+
+    def test_a_move_past_the_order_is_not_a_count_it_sold(self, monkeypatch, sleeps):
+        # The reply is lost and the position moved 15, more than the 13 asked
+        # (something else traded)
+        exchange = _SaleExchange({"KX-A": 30, "KX-B": -30}, reply={"KX-B": "raise"},
+                                 outside={"KX-B": 2})
+        [result] = self._sell(monkeypatch, exchange, [_trim_plan()])
+        assert (result.status, result.sold) == ("manual_review", {"KX-A": 0})
+        assert [body["ticker"] for body in exchange.bodies] == ["KX-B"]
+
+    def test_a_dry_run_names_the_part_and_the_holding(self, monkeypatch, caplog):
+        exchange = _SaleExchange({"KX-A": 30, "KX-B": -30})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_trim_plan()], dry_run=True)
+        # The plan's count, never the holding, is what a dry run reports as sold
+        assert (result.status, result.sold, result.error) == (
+            "simulated", {"KX-B": 13, "KX-A": 13}, None)
+        assert exchange.events == []
+        [line] = [r.getMessage() for r in caplog.records if "[DRY RUN]" in r.getMessage()]
+        assert line == (
+            "[DRY RUN] Would sell 'Test position': 13 NO contracts (of 30 held) on KX-B (YES"
+            " bid at 0.5000, so 0.5000 or more a NO contract), then 13 YES contracts (of 30"
+            " held) on KX-A (ask at 0.4400)"
+        )
+
+    def test_a_trim_that_sells_the_whole_holding_reads_as_a_whole_sale(self, monkeypatch,
+                                                                       caplog):
+        # held equal to count: every line is the one a take-profit sale logs
+        exchange = _SaleExchange({"KX-A": 13, "KX-B": -13})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_trim_plan(13, 13)])
+        assert (result.status, result.sold) == ("sold", {"KX-B": 13, "KX-A": 13})
+        assert exchange.positions == {"KX-A": 0, "KX-B": 0}
+        [line] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Sold ")]
+        assert line == (
+            "Sold 'Test position': 13 of 13 NO on KX-B sold (YES bid at 0.5000, so 0.5000"
+            " or more a NO contract), then 13 of 13 YES on KX-A sold (ask at 0.4400)"
+        )
+        assert "held)" not in caplog.text
+
+    @pytest.mark.parametrize("held", [12, 0, -30, 30.0, True, "30"])
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_a_holding_that_does_not_cover_the_sale_sends_nothing(self, monkeypatch, caplog,
+                                                                  held, dry_run):
+        # Fewer contracts held than sold, or a holding that is not a whole number
+        exchange = _SaleExchange({"KX-A": 30, "KX-B": -30})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [_trim_plan(13, held)],
+                                  dry_run=dry_run)
+        assert (result.status, result.sold) == ("not_sold", {})
+        assert result.error == ("not sent: KX-A has no whole number of contracts held that"
+                                " covers the 13 to sell")
+        assert exchange.events == []
+        assert not any("[DRY RUN]" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_two_markets_holding_different_numbers_send_nothing(self, monkeypatch, dry_run):
+        exchange = _SaleExchange({"KX-A": 30, "KX-B": -40})
+        [result] = self._sell(monkeypatch, exchange, [_trim_plan(13, 30, held_b=40)],
+                              dry_run=dry_run)
+        assert (result.status, result.sold) == ("not_sold", {})
+        assert result.error == ("not sent: its two held markets do not hold the same number"
+                                " of contracts")
+        assert exchange.events == []
+
+    def test_a_lone_market_sold_in_part_counts_what_is_left_from_its_holding(
+        self, monkeypatch, caplog,
+    ):
+        # The seller never trims a lone market, but the trader still reads a
+        # leg's holding when it carries one
+        leg = dataclasses.replace(_held("KX-A", "yes", 4), held=10)
+        plan = _sale_plan((leg, [[0.45, 10]]), partner=_paid_out("KX-P", "no"))
+        exchange = _SaleExchange({"KX-A": 10}, fills={"KX-A": 3})
+        with caplog.at_level(logging.INFO):
+            [result] = self._sell(monkeypatch, exchange, [plan])
+        assert (result.status, result.sold, result.error) == (
+            "partly_sold", {"KX-A": 3}, "sold 3 of 4")
+        assert exchange.bodies[0]["count"] == "4.00"
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning == (
+            "Partly sold 'Test position': 3 of 4 YES (of 10 held) on KX-A sold (ask at"
+            " 0.4500); still held: 7 YES contracts on KX-A"
+        )
+        # Sold in full, six are left and the sale is "sold"
+        exchange = _SaleExchange({"KX-A": 10})
+        [result] = self._sell(monkeypatch, exchange, [plan])
+        assert (result.status, result.sold) == ("sold", {"KX-A": 4})
+        assert exchange.positions == {"KX-A": 6}
+
+    def test_nothing_is_sent_once_the_no_leg_mapping_is_disproven(self, monkeypatch):
+        monkeypatch.setattr(trader, "_V2_NO_MAPPING_DISPROVEN", True)
+        exchange = _SaleExchange({"KX-A": 30, "KX-B": -30})
+        [result] = self._sell(monkeypatch, exchange, [_trim_plan()])
+        assert (result.status, result.sold) == ("not_sold", {"KX-B": 0, "KX-A": 0})
+        assert exchange.events == []
+
+
 class TestSaleCountHelpers:
     """The account's evidence for an unclear sale: the move toward zero
     (_contracts_sold), read as a whole count from 0 to what was asked
@@ -7244,13 +7497,39 @@ class TestSaleCountHelpers:
     def test_holding_problem_wants_the_plans_count_on_its_side(self, side, before, expected):
         assert trader._holding_problem(_held("KX-A", side), before) == expected
 
+    @pytest.mark.parametrize("side, before, expected", [
+        ("yes", 30.0, None),
+        ("no", -30.0, None),
+        # Exactly the 13 the plan sells is not the 30 it was made on
+        ("yes", 13.0, "KX-A now holds 13 YES contracts; the plan holds 30 YES contracts"),
+        ("no", -13.0, "KX-A now holds 13 NO contracts; the plan holds 30 NO contracts"),
+        ("yes", 31.0, "KX-A now holds 31 YES contracts; the plan holds 30 YES contracts"),
+        ("no", 30.0, "KX-A now holds 30 YES contracts; the plan holds 30 NO contracts"),
+        ("yes", None, "the position on KX-A could not be read"),
+    ])
+    def test_holding_problem_wants_the_holding_of_a_part_sale(self, side, before, expected):
+        # A plan that sells 13 of 30: the account must still hold the 30
+        leg = dataclasses.replace(_held("KX-A", side, 13), held=30)
+        assert trader._holding_problem(leg, before) == expected
+
+    def test_plan_holding_is_the_held_count_when_a_leg_carries_one(self):
+        whole = _held("KX-A", "yes", 5)
+        part = dataclasses.replace(whole, held=30)
+        assert (trader._plan_holding(whole), trader._plan_holding(part)) == (5, 30)
+        # A leg with no such field at all sells everything it counts
+        assert trader._plan_holding(SimpleNamespace(count=7)) == 7
+        # The note a log line adds appears only when part is sold
+        assert (trader._held_note(whole), trader._held_note(part)) == ("", " (of 30 held)")
+        assert trader._held_note(dataclasses.replace(whole, held=5)) == ""
+
 
 class TestSaleOrdersAreSentOnce:
     """Syntax-tree checks: a sale order is one POST after one pacer place,
     never retried, and the sale path never reads a reply as a buy leg's."""
 
     _SALE_FUNCTIONS = ("sell_positions", "_sell_one", "_sell_lone", "_sell_pair",
-                       "_simulate_sale", "_sell_leg", "_submit_sale_v2", "_sale_fill_count")
+                       "_simulate_sale", "_sell_leg", "_submit_sale_v2", "_sale_fill_count",
+                       "_plan_holding", "_held_note", "_holding_problem")
 
     @staticmethod
     def _calls(fn) -> list[ast.Call]:

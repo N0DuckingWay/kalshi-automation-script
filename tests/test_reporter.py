@@ -863,6 +863,45 @@ def make_sale(status: str = "sold", *, sold: dict | None = None, error: str | No
                                error=error)
 
 
+def make_trim(status: str = "sold", *, sold: dict | None = None, error: str | None = None,
+              sell: int = 13, held: int = 30) -> reporter.SaleResult:
+    """
+    Build a Kelly trim of make_sale's pair, as trader.sell_positions returns it.
+
+    The account holds `held` YES on SELL-A and NO on SELL-B, costing $18.80 in
+    all; the trim sells `sell` of each at bids of 0.55 and 0.42. At the defaults
+    (13 of 30) its cost is 18.80 x 13 / 30 and it returns
+    13 x 0.55 + 13 x 0.42 - $0.46 of fees = $12.15.
+
+    Args:
+        status (str): The sale's status.
+        sold (dict | None): Keyword-only. Contracts sold per ticker; None for
+            `sell` on each.
+        error (str | None): Keyword-only. The sale's error.
+        sell (int): Keyword-only. Contract pairs the trim sells.
+        held (int): Keyword-only. Contract pairs the account holds.
+
+    Returns:
+        reporter.SaleResult: The trim.
+    """
+    share = sell / held
+    a = seller.SaleLeg("SELL-A", "EV-SELL-A", "yes", sell, 6.30 * share,
+                       market=_sale_market("SELL-A", 1), held=held)
+    b = seller.SaleLeg("SELL-B", "EV-SELL-B", "no", sell, 12.50 * share,
+                       market=_sale_market("SELL-B", 6), held=held)
+    walked = {"SELL-A": (0.55, 0.55), "SELL-B": (0.42, 0.42)}
+    cost = 18.80 * share
+    proceeds = sum(sell * bid - config.fee_leg_exact(sell, bid) for bid, _ in walked.values())
+    plan = seller.SalePlan(
+        title="Will S happen by November 1, 2026?", legs=(a, b), count=sell, cost_dollars=cost,
+        ladders={t: [[w[0], 100.0]] for t, w in walked.items()}, walked=walked,
+        proceeds_dollars=proceeds, profits=((proceeds - cost, sell * 1.0 - cost),),
+        days_left=9, level=None, kind=config.SALE_KIND_KELLY_TRIM)
+    return reporter.SaleResult(plan=plan, status=status,
+                               sold={"SELL-A": sell, "SELL-B": sell} if sold is None else sold,
+                               error=error)
+
+
 class TestSaleRows:
     """A sale's row in the trade log, under the trade columns: the position's
     markets, the bids it was priced at, the contracts sold, its cost and the
@@ -913,6 +952,59 @@ class TestSaleRows:
         assert row[11:13] == ["", 0]
         assert row[17].endswith("days left unknown, fees=$1.04] could not tell how many sold")
 
+    def test_a_kelly_trim_says_how_many_of_the_pairs_held_it_sells(self):
+        row = reporter._sale_to_row(make_trim(), datetime(2026, 10, 8, 16, 0, tzinfo=UTC))
+        # Each market's fee on selling 13, by hand, rounded up to the cent:
+        # 0.07 x 13 x 0.55 x 0.45 = 0.2252 and 0.07 x 13 x 0.42 x 0.58 = 0.2217
+        assert (config.fee_leg_exact(13, 0.55), config.fee_leg_exact(13, 0.42)) == (0.23, 0.23)
+        cost = 18.80 * 13 / 30
+        realized = 13 * 0.55 + 13 * 0.42 - 0.46 - cost
+        assert row == [
+            "2026-10-08", "16:00:00",
+            "Will S happen by November 1, 2026?", "SELL-A",
+            "Will S happen by November 6, 2026?", "SELL-B",
+            "2026-11-01", "2026-11-06", 0.55, 0.42, "", 13, 13,
+            round(cost, 2), round(realized, 2), round(realized / cost, 4), "sold",
+            "[sale: YES A / NO B, Kelly trim: 13 of 30 contract pairs, 9 days left, "
+            "fees=$0.46] ",
+        ]
+        assert (round(cost, 2), round(realized, 2)) == (8.15, 4.0)
+        assert len(row) == len(reporter._TRADE_COLUMNS)
+        # Not the fee on all 30 held, which a take-profit sale of the pair pays
+        assert "fees=$1.04" in reporter._sale_to_row(make_sale(), datetime(2026, 10, 8,
+                                                                           tzinfo=UTC))[17]
+
+    def test_a_kelly_trim_that_sold_less_shows_what_sold_and_no_profit(self):
+        trim = make_trim("partly_sold", sold={"SELL-A": 10, "SELL-B": 10},
+                         error="sold 10 of 13 on each market")
+        row = reporter._sale_to_row(trim, datetime(2026, 10, 8, tzinfo=UTC))
+        assert row[11:13] == [10, 10]
+        assert row[14:17] == ["", "", "partly sold"]
+        # The Notes still name what it set out to sell of what was held
+        assert row[17] == ("[sale: YES A / NO B, Kelly trim: 13 of 30 contract pairs, "
+                           "9 days left, fees=$0.46] sold 10 of 13 on each market")
+
+    def test_every_sale_row_starts_as_the_live_trading_tab_reads_it(self):
+        # live_portfolio tells a sale row by this start of its Notes, whatever its kind
+        for sale in (make_sale(), make_sale(lone=True), make_trim(), make_trim(sell=30)):
+            assert reporter._sale_to_row(sale, datetime(2026, 10, 8, tzinfo=UTC))[17].startswith(
+                "[sale: ")
+
+    def test_a_trim_of_every_pair_held_is_still_a_trim(self):
+        row = reporter._sale_to_row(make_trim(sell=30), datetime(2026, 10, 8, tzinfo=UTC))
+        assert row[17] == ("[sale: YES A / NO B, Kelly trim: 30 of 30 contract pairs, "
+                           "9 days left, fees=$1.04] ")
+
+    def test_a_plan_with_no_kind_is_a_take_profit_sale(self):
+        # A plan with no `kind` field is written as a take-profit sale
+        sale = make_sale()
+        bare = SimpleNamespace(**{name: getattr(sale.plan, name) for name in (
+            "title", "legs", "count", "cost_dollars", "ladders", "walked",
+            "proceeds_dollars", "profits", "days_left", "level")})
+        at = datetime(2026, 10, 8, tzinfo=UTC)
+        assert reporter._sale_to_row(dataclasses.replace(sale, plan=bare), at) == (
+            reporter._sale_to_row(sale, at))
+
     def test_sales_go_in_the_log_under_their_own_banner(self, reporter_paths):
         log_path, _ = reporter_paths
         reporter.append_to_prod_log([], 100.0, 128.06, run_note="settings: x",
@@ -959,6 +1051,55 @@ class TestReportSales:
     def test_a_paid_out_partner_is_not_a_leg(self):
         [record] = reporter.report_sales([make_sale(lone=True)])
         assert [leg.ticker for leg in record.legs] == ["SELL-A"]
+
+    def test_a_take_profit_sale_is_recorded_as_one(self):
+        [record] = reporter.report_sales([make_sale()])
+        assert record.kind == config.SALE_KIND_TAKE_PROFIT == "take_profit"
+        assert (record.level, record.realized_percent) == (0.8, 82.68)
+
+    def test_a_kelly_trim_is_recorded_with_what_it_held_and_no_level(self):
+        [record] = reporter.report_sales([make_trim()])
+        cost = 18.80 * 13 / 30
+        # A trim has no sell level and checks no share of potential profit
+        assert record == reporter.SaleRecord(
+            title="Will S happen by November 1, 2026?", status="sold", level=None,
+            days_left=9, cost=round(cost, 2), proceeds=12.15,
+            profit=round(12.15 - cost, 2), realized_percent=None,
+            legs=(reporter.SaleLegRecord("SELL-A", "yes", 30, 13, 0.55),
+                  reporter.SaleLegRecord("SELL-B", "no", 30, 13, 0.42)),
+            error=None, kind="kelly_trim")
+        assert record.kind == config.SALE_KIND_KELLY_TRIM
+
+    def test_a_kelly_trim_that_sold_less_records_no_profit(self):
+        [record] = reporter.report_sales([make_trim(
+            "unbalanced", sold={"SELL-A": 13, "SELL-B": 9}, error="uneven")])
+        assert (record.kind, record.profit, record.status) == ("kelly_trim", None, "unbalanced")
+        assert [(leg.held, leg.sold) for leg in record.legs] == [(30, 13), (30, 9)]
+
+    def test_a_trim_that_cannot_be_described_is_still_a_trim(self, caplog):
+        broken = reporter.SaleResult(
+            plan=SimpleNamespace(title="Broken", kind=config.SALE_KIND_KELLY_TRIM),
+            status="not_sold", sold={}, error="not sent")
+        with caplog.at_level(logging.ERROR):
+            [record] = reporter.report_sales([broken])
+        assert record == reporter.SaleRecord(
+            title="Broken", status="not_sold", level=None, days_left=None, cost=None,
+            proceeds=None, profit=None, realized_percent=None, legs=(), error="not sent",
+            kind="kelly_trim")
+
+    def test_the_run_result_carries_a_trims_kind_and_holding(self, tmp_path):
+        path = tmp_path / "result.json"
+        report = _run_report(sales=reporter.report_sales([make_sale(), make_trim()]),
+                             cash_after_sales=140.21)
+        reporter.write_run_report(path, report, 0)
+        sale, trim = _strict_json(path)["sales"]
+        assert (sale["kind"], sale["level"], sale["realized_percent"]) == (
+            "take_profit", 0.8, 82.68)
+        assert (trim["kind"], trim["level"], trim["realized_percent"]) == (
+            "kelly_trim", None, None)
+        assert trim["legs"] == [
+            {"ticker": "SELL-A", "side": "yes", "held": 30, "sold": 13, "price": 0.55},
+            {"ticker": "SELL-B", "side": "no", "held": 30, "sold": 13, "price": 0.42}]
 
     def test_a_sale_that_cannot_be_described_keeps_its_place(self, caplog):
         broken = reporter.SaleResult(plan=SimpleNamespace(title="Broken"), status="not_sold",

@@ -8607,6 +8607,483 @@ class TestGetSettlements:
         assert "Settlements read: 0 (0 unreadable)" in caplog.text
 
 
+def _fill_row(ticker, created, **extra) -> dict:
+    """One fill as /portfolio/fills sends it; only its ticker and time are read."""
+    return {"fill_id": f"F-{ticker}-{created}", "order_id": "O-1", "ticker": ticker,
+            "created_time": created, "book_side": "bid", "count_fp": "5.00",
+            "yes_price_dollars": "0.3000", "no_price_dollars": "0.7000",
+            "fee_cost": "0.0700", **extra}
+
+
+def _fills_page(rows, cursor=None) -> SimpleNamespace:
+    """Raw-response stand-in for one /portfolio/fills page holding `rows`."""
+    return _json_reply({"fills": rows, "cursor": cursor})
+
+
+def _fills_client(*pages) -> MagicMock:
+    """A client whose fills listing serves `pages` in order."""
+    client = MagicMock()
+    client.get_fills_without_preload_content = MagicMock(side_effect=list(pages))
+    return client
+
+
+# Three markets' fills, newest first as the listing sends them
+_LIVE_FILLS = [
+    _fill_row("KXGTATRAILER-26NOVE", "2026-10-06T16:26:31.482913Z"),
+    _fill_row("KXGTATRAILER-26DEC", "2026-10-06T16:26:30.120000Z"),
+    _fill_row("KXSTAR-14-MAR20", "2026-10-01T09:00:05Z"),
+    _fill_row("KXGTATRAILER-26NOVE", "2026-09-28T09:26:12.5Z"),
+    _fill_row("KXGTATRAILER-26DEC", "2026-09-28T09:26:11Z"),
+]
+
+
+class TestGetFillTimes:
+    """get_fill_times: when the account last traded each market. A Kelly trim
+    waits days after a pair's last trade, so a missed fill could make a busy
+    pair look rested: anything short of every fill read gives None."""
+
+    def test_each_markets_newest_fill_and_the_oldest_of_all(self, caplog):
+        client = _fills_client(_fills_page(_LIVE_FILLS, cursor=""))
+        with caplog.at_level(logging.INFO):
+            got = scanner.get_fill_times(client)
+        assert got == scanner.FillTimes(
+            latest={
+                "KXGTATRAILER-26NOVE": datetime(2026, 10, 6, 16, 26, 31, 482913, tzinfo=UTC),
+                "KXGTATRAILER-26DEC": datetime(2026, 10, 6, 16, 26, 30, 120000, tzinfo=UTC),
+                "KXSTAR-14-MAR20": datetime(2026, 10, 1, 9, 0, 5, tzinfo=UTC)},
+            oldest=datetime(2026, 9, 28, 9, 26, 11, tzinfo=UTC))
+        # Times carry their zone, so a caller can take the calendar day
+        assert all(when.tzinfo is UTC for when in got.latest.values())
+        assert got.oldest.tzinfo is UTC
+        # One page, the largest the SDK allows, with no other filter
+        client.get_fills_without_preload_content.assert_called_once_with(
+            limit=config.FILLS_PAGE_SIZE)
+        assert config.FILLS_PAGE_SIZE == 200
+        assert [r.getMessage() for r in caplog.records] == [
+            "Fills read: 5 on 3 market(s), 2026-09-28 to 2026-10-06 (UTC)"]
+
+    def test_the_result_cannot_be_reassigned(self):
+        got = scanner.get_fill_times(_fills_client(_fills_page(_LIVE_FILLS)))
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            got.oldest = None
+
+    @pytest.mark.parametrize("order", ["newest-first", "oldest-first", "shuffled"])
+    def test_several_fills_on_one_market_on_one_day(self, order):
+        # Four fills on one day and one a week earlier: the newest wins, in
+        # any listing order
+        rows = [_fill_row("KXA-1", f"2026-10-06T16:26:{second}Z")
+                for second in ("31.5", "31.25", "30", "05")]
+        rows.append(_fill_row("KXA-1", "2026-09-29T16:00:00Z"))
+        if order == "oldest-first":
+            rows.reverse()
+        elif order == "shuffled":
+            random.Random(3).shuffle(rows)
+        got = scanner.get_fill_times(_fills_client(_fills_page(rows)))
+        assert got.latest == {"KXA-1": datetime(2026, 10, 6, 16, 26, 31, 500000, tzinfo=UTC)}
+        assert got.oldest == datetime(2026, 9, 29, 16, tzinfo=UTC)
+
+    def test_a_time_with_an_offset_is_read_in_utc(self):
+        # 9:35pm Pacific on the 7th is the 8th in UTC; the bot's own clock
+        # still calls it the 7th
+        row = _fill_row("KXA-1", "2026-10-07T21:35:27-07:00")
+        got = scanner.get_fill_times(_fills_client(_fills_page([row])))
+        assert got.latest["KXA-1"] == datetime(2026, 10, 8, 4, 35, 27, tzinfo=UTC)
+        assert got.latest["KXA-1"].tzinfo is UTC
+        assert got.oldest == got.latest["KXA-1"]
+        assert config.trade_day(got.oldest, config.SCHEDULED_RUN) == date(2026, 10, 7)
+
+    def test_pages_follow_the_cursor_and_no_time_filter_is_sent(self, caplog):
+        client = _fills_client(_fills_page(_LIVE_FILLS[:2], cursor="C1"),
+                               _fills_page(_LIVE_FILLS[2:4], cursor="C2"),
+                               _fills_page(_LIVE_FILLS[4:], cursor=""))
+        with caplog.at_level(logging.INFO):
+            got = scanner.get_fill_times(client)
+        assert set(got.latest) == {"KXGTATRAILER-26NOVE", "KXGTATRAILER-26DEC",
+                                   "KXSTAR-14-MAR20"}
+        # The oldest fill sits on the last page
+        assert got.oldest == datetime(2026, 9, 28, 9, 26, 11, tzinfo=UTC)
+        # A page size and a cursor only: no min_ts, max_ts or ticker filter
+        assert [c.kwargs for c in client.get_fills_without_preload_content.call_args_list] == [
+            {"limit": 200}, {"limit": 200, "cursor": "C1"}, {"limit": 200, "cursor": "C2"}]
+        assert all(c.args == () for c in client.get_fills_without_preload_content.call_args_list)
+        assert "Fills read: 5 on 3 market(s)" in caplog.text
+
+    def test_it_only_reads(self):
+        # The fills listing is the one thing asked of the client
+        client = _fills_client(_fills_page(_LIVE_FILLS))
+        scanner.get_fill_times(client)
+        assert [call[0] for call in client.method_calls] == [
+            "get_fills_without_preload_content"]
+
+    @pytest.mark.parametrize("body", [
+        {"fills": [], "cursor": ""}, {"fills": None, "cursor": None}, {"fills": []},
+    ])
+    def test_no_fills_is_an_empty_read(self, body, caplog):
+        # No fills is a valid, empty read; the caller decides what it means
+        client = MagicMock()
+        client.get_fills_without_preload_content.return_value = _json_reply(body)
+        with caplog.at_level(logging.INFO):
+            got = scanner.get_fill_times(client)
+        assert got == scanner.FillTimes(latest={}, oldest=None)
+        assert [r.getMessage() for r in caplog.records] == ["Fills read: 0 on 0 market(s)"]
+
+    @pytest.mark.parametrize("body", [
+        [], "ok", None, 5, {"fills": {}}, {"fills": "x"}, {"fills": 0},
+        {"fills": [], "cursor": 5}, {"fills": [], "cursor": ["C1"]},
+        # No "fills" key: a renamed key, not an account with none
+        {}, {"cursor": ""}, {"Fills": [], "cursor": ""}, {"market_fills": []},
+    ])
+    def test_a_page_that_is_not_a_list_of_fills_gives_none(self, body, caplog):
+        client = MagicMock()
+        client.get_fills_without_preload_content.return_value = _json_reply(body)
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_fill_times(client) is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings == ["Could not read the account's fills: page 1 is not a list of "
+                            "fills with a cursor"]
+        assert "Fills read" not in caplog.text
+
+    @pytest.mark.parametrize("change", [
+        {"ticker": None}, {"ticker": ""}, {"ticker": 5}, {"ticker": ["KXA-1"]},
+        {"ticker": True},
+        {"created_time": None}, {"created_time": ""}, {"created_time": "garbage"},
+        # No UTC offset, so the moment is unknown
+        {"created_time": "2026-10-06T16:26:31"}, {"created_time": "2026-10-06"},
+        # Not a text time at all (a Unix time, a bool, a list)
+        {"created_time": 1791217591}, {"created_time": True},
+        {"created_time": ["2026-10-06T16:26:31Z"]},
+    ])
+    def test_one_unreadable_fill_gives_none(self, change, caplog):
+        # Skipped, that fill could have been its market's newest
+        bad = dict(_LIVE_FILLS[1], **change)
+        client = _fills_client(_fills_page([_LIVE_FILLS[0], bad, _LIVE_FILLS[2]]))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_fill_times(client) is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].startswith(
+            "Could not read the account's fills: a fill on page 1 has no readable market "
+            "ticker or time (ticker ")
+        assert warnings[0].endswith(
+            "so when each market last traded is not known this run")
+        assert "\n" not in warnings[0]
+        assert "Fills read" not in caplog.text
+
+    @pytest.mark.parametrize("created", [
+        "0001-01-01T00:00:00Z", "1970-01-01T00:00:00Z",
+        # One second before 2021, the first year a fill may carry
+        "2020-12-31T23:59:59Z",
+        # 2020 once read in UTC
+        "2021-01-01T00:30:00+01:00",
+    ])
+    def test_a_zero_time_is_not_a_fill_time(self, created, caplog):
+        # A server's stand-in for "no time". Read as real, it would make the
+        # list seem to reach back past any wait, and year 1 has no day on the
+        # bot's own clock (config.trade_day raises)
+        assert config.FILLS_EARLIEST_YEAR == 2021
+        bad = dict(_LIVE_FILLS[1], created_time=created)
+        client = _fills_client(_fills_page([_LIVE_FILLS[0], bad, _LIVE_FILLS[2]]))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_fill_times(client) is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "has no readable market ticker or time" in warnings[0]
+        assert repr(created) in warnings[0]
+        assert "Fills read" not in caplog.text
+
+    @pytest.mark.parametrize("created, when", [
+        ("2021-01-01T00:00:00Z", datetime(2021, 1, 1, tzinfo=UTC)),
+        ("2020-12-31T23:30:00-01:00", datetime(2021, 1, 1, 0, 30, tzinfo=UTC)),
+    ])
+    def test_the_first_year_a_fill_can_carry_is_read(self, created, when):
+        got = scanner.get_fill_times(_fills_client(_fills_page([_fill_row("KXA-1", created)])))
+        assert got == scanner.FillTimes(latest={"KXA-1": when}, oldest=when)
+        # Even the earliest time read has a day on the bot's own clock
+        assert config.trade_day(got.oldest, config.SCHEDULED_RUN) == date(2020, 12, 31)
+
+    @pytest.mark.parametrize("field", ["ticker", "created_time"])
+    def test_a_missing_field_is_unreadable(self, field, caplog):
+        row = {k: v for k, v in _LIVE_FILLS[0].items() if k != field}
+        with caplog.at_level(logging.WARNING):
+            assert scanner.get_fill_times(_fills_client(_fills_page([row]))) is None
+        assert "has no readable market ticker or time" in caplog.text
+
+    def test_the_older_spellings_alone_are_not_read(self, caplog):
+        # Only the SDK's older names (market_ticker, ts): refused, not guessed at
+        row = {k: v for k, v in _LIVE_FILLS[0].items() if k not in ("ticker", "created_time")}
+        row.update(market_ticker="KXA-1", ts=1791217591)
+        with caplog.at_level(logging.WARNING):
+            assert scanner.get_fill_times(_fills_client(_fills_page([row]))) is None
+        assert "has no readable market ticker or time" in caplog.text
+
+    @pytest.mark.parametrize("record", ["x", None, [], 5, True])
+    def test_a_record_that_is_not_an_object_gives_none(self, record, caplog):
+        client = _fills_client(_fills_page([_LIVE_FILLS[0], record]))
+        with caplog.at_level(logging.WARNING):
+            assert scanner.get_fill_times(client) is None
+        assert "has no readable market ticker or time" in caplog.text
+
+    def test_an_unreadable_fill_on_a_later_page_still_gives_none(self, caplog):
+        # A bad fill on page 3 voids the two good pages before it
+        bad = dict(_LIVE_FILLS[4], created_time="2026-09-28T09:26:11")
+        client = _fills_client(_fills_page(_LIVE_FILLS[:2], cursor="C1"),
+                               _fills_page(_LIVE_FILLS[2:4], cursor="C2"),
+                               _fills_page([bad], cursor=""))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_fill_times(client) is None
+        assert "a fill on page 3 has no readable market ticker or time" in caplog.text
+        assert "Fills read" not in caplog.text
+
+    def test_reading_stops_at_the_first_unreadable_fill(self):
+        # The answer is already None, so no further page is asked for
+        bad = dict(_LIVE_FILLS[0], ticker=None)
+        client = _fills_client(_fills_page([bad], cursor="C1"),
+                               _fills_page(_LIVE_FILLS[1:], cursor=""))
+        assert scanner.get_fill_times(client) is None
+        assert client.get_fills_without_preload_content.call_count == 1
+
+    def test_an_odd_value_cannot_fill_the_log(self, caplog):
+        bad = dict(_LIVE_FILLS[0], ticker=["X" * 5000], created_time="Y" * 5000)
+        with caplog.at_level(logging.WARNING):
+            assert scanner.get_fill_times(_fills_client(_fills_page([bad]))) is None
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning) < 500
+
+    @pytest.mark.parametrize("cursors", [["C1", "C1"], ["C1", "C2", "C1"]])
+    def test_a_repeated_cursor_stops_and_gives_none(self, cursors, caplog):
+        client = _fills_client(*[_fills_page(_LIVE_FILLS[:1], cursor=c) for c in cursors])
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_fill_times(client) is None
+        assert client.get_fills_without_preload_content.call_count == len(cursors)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and "cursor did not advance" in warnings[0]
+        assert "Fills read" not in caplog.text
+
+    def test_the_page_cap_gives_none(self, monkeypatch, caplog):
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 2)
+        client = _fills_client(_fills_page(_LIVE_FILLS[:1], cursor="C1"),
+                               _fills_page(_LIVE_FILLS[1:2], cursor="C2"))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_fill_times(client) is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and "SCANNER_MAX_PAGES (2)" in warnings[0]
+        assert "Fills read" not in caplog.text
+
+    def test_a_list_that_ends_on_the_last_allowed_page_is_complete(self, monkeypatch):
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 2)
+        client = _fills_client(_fills_page(_LIVE_FILLS[:1], cursor="C1"),
+                               _fills_page(_LIVE_FILLS[1:2], cursor=None))
+        got = scanner.get_fill_times(client)
+        assert set(got.latest) == {"KXGTATRAILER-26NOVE", "KXGTATRAILER-26DEC"}
+
+    def test_a_failed_page_gives_none_in_one_line(self, caplog):
+        client = MagicMock()
+        client.get_fills_without_preload_content.return_value = _error_reply(404, "Not Found")
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_fill_times(client) is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "Could not read the account's fills (page 1): HTTP 404 Not Found" in warnings[0]
+        assert "\n" not in warnings[0] and "HEADER-DUMP" not in caplog.text
+        assert "Fills read" not in caplog.text
+
+    def test_a_later_page_that_fails_gives_none_not_a_partial_read(self, caplog):
+        client = _fills_client(_fills_page(_LIVE_FILLS[:2], cursor="C1"),
+                               _error_reply(400, "Bad Request"))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_fill_times(client) is None
+        assert "(page 2): HTTP 400 Bad Request" in caplog.text
+        assert "Fills read" not in caplog.text
+
+    def test_a_connection_failure_is_retried_then_gives_none(self, caplog):
+        client = MagicMock()
+        client.get_fills_without_preload_content.side_effect = ProtocolError(
+            "Connection broken: IncompleteRead(0 bytes read)")
+        with patch.object(_http.time, "sleep"), caplog.at_level(logging.WARNING):
+            assert scanner.get_fill_times(client) is None
+        # Retried like every read-only GET
+        assert client.get_fills_without_preload_content.call_count > 1
+        assert ("ProtocolError: Connection broken: IncompleteRead(0 bytes read)"
+                in caplog.text)
+
+    def test_a_rate_limited_page_is_retried(self):
+        client = _fills_client(_error_reply(429, "Too Many Requests"),
+                               _fills_page(_LIVE_FILLS[:1]))
+        with patch.object(_http.time, "sleep"):
+            got = scanner.get_fill_times(client)
+        assert set(got.latest) == {"KXGTATRAILER-26NOVE"}
+
+
+def _order_row(status: str = "resting", **extra) -> dict:
+    """One order as /portfolio/orders sends it; only its status is read."""
+    return {"order_id": f"O-{status}", "ticker": "KXA-1", "side": "yes", "action": "buy",
+            "status": status, "yes_price_dollars": "0.5000", "remaining_count_fp": "50.00",
+            **extra}
+
+
+def _orders_page(rows, cursor=None) -> SimpleNamespace:
+    """Raw-response stand-in for one /portfolio/orders page holding `rows`."""
+    return _json_reply({"orders": rows, "cursor": cursor})
+
+
+def _orders_client(*pages) -> MagicMock:
+    """A client whose orders listing serves `pages` in order."""
+    client = MagicMock()
+    client.get_orders_without_preload_content = MagicMock(side_effect=list(pages))
+    return client
+
+
+class TestGetRestingOrders:
+    """get_resting_orders counts orders waiting on the account. Their cash is in
+    neither Kalshi's balance nor its positions value, so a run trims nothing
+    while one rests. Anything short of the whole list with every status read
+    gives None, and the run then trims nothing either."""
+
+    def test_two_pages_are_counted_and_the_filter_is_sent(self, caplog):
+        client = _orders_client(_orders_page([_order_row(), _order_row()], cursor="C1"),
+                                _orders_page([_order_row()], cursor=""))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) == 3
+        # Resting orders only, the largest page allowed, then the cursor
+        assert [c.kwargs for c in client.get_orders_without_preload_content.call_args_list] == [
+            {"status": "resting", "limit": 200},
+            {"status": "resting", "limit": 200, "cursor": "C1"}]
+        assert config.ORDERS_PAGE_SIZE == 200
+        assert [r.getMessage() for r in caplog.records] == ["Resting orders on the account: 3"]
+
+    @pytest.mark.parametrize("body", [
+        {"orders": [], "cursor": ""}, {"orders": None, "cursor": None}, {"orders": []},
+    ])
+    def test_no_order_is_a_count_of_zero(self, body, caplog):
+        client = MagicMock()
+        client.get_orders_without_preload_content.return_value = _json_reply(body)
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) == 0
+        assert [r.getMessage() for r in caplog.records] == ["Resting orders on the account: 0"]
+
+    def test_an_order_that_no_longer_rests_is_not_counted(self):
+        # Even if a reply ignores the filter, filled or canceled orders hold no cash
+        client = _orders_client(_orders_page(
+            [_order_row("executed"), _order_row("canceled"), _order_row()]))
+        assert scanner.get_resting_orders(client) == 1
+        client = _orders_client(_orders_page([_order_row("executed"), _order_row("canceled")]))
+        assert scanner.get_resting_orders(client) == 0
+
+    def test_it_only_reads(self):
+        client = _orders_client(_orders_page([_order_row()]))
+        scanner.get_resting_orders(client)
+        assert [call[0] for call in client.method_calls] == [
+            "get_orders_without_preload_content"]
+
+    @pytest.mark.parametrize("status", [None, "", "Resting", "open", "pending", 5, True,
+                                        ["resting"], {"status": "resting"}])
+    def test_an_order_whose_status_cannot_be_read_gives_none(self, status, caplog):
+        row = _order_row()
+        row["status"] = status
+        client = _orders_client(_orders_page([_order_row(), row]))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) is None
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning == ("Could not read the account's resting orders: an order on page 1 "
+                           f"has no readable status ({status!r:.80})")
+        assert "Resting orders on the account" not in caplog.text
+
+    @pytest.mark.parametrize("record", ["x", None, [], 5, {"order_id": "O-1"}])
+    def test_a_record_with_no_status_gives_none(self, record, caplog):
+        client = _orders_client(_orders_page([_order_row(), record]))
+        with caplog.at_level(logging.WARNING):
+            assert scanner.get_resting_orders(client) is None
+        assert "has no readable status (None)" in caplog.text
+
+    def test_an_odd_status_cannot_fill_the_log(self, caplog):
+        client = _orders_client(_orders_page([_order_row("X" * 5000)]))
+        with caplog.at_level(logging.WARNING):
+            assert scanner.get_resting_orders(client) is None
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning) < 300
+
+    @pytest.mark.parametrize("body", [
+        [], "ok", None, 5, {"orders": {}}, {"orders": "x"}, {"orders": 0},
+        {"orders": [], "cursor": 5}, {"orders": [], "cursor": ["C1"]},
+        # No "orders" key: a renamed key, not an account with none
+        {}, {"cursor": ""}, {"Orders": [], "cursor": ""},
+    ])
+    def test_a_page_that_is_not_a_list_of_orders_gives_none(self, body, caplog):
+        client = MagicMock()
+        client.get_orders_without_preload_content.return_value = _json_reply(body)
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings == ["Could not read the account's resting orders: page 1 is not a "
+                            "list of orders with a cursor"]
+        assert "Resting orders on the account" not in caplog.text
+
+    @pytest.mark.parametrize("cursors", [["C1", "C1"], ["C1", "C2", "C1"]])
+    def test_a_repeated_cursor_stops_and_gives_none(self, cursors, caplog):
+        client = _orders_client(*[_orders_page([_order_row()], cursor=c) for c in cursors])
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) is None
+        assert client.get_orders_without_preload_content.call_count == len(cursors)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and "cursor did not advance" in warnings[0]
+        assert "Resting orders on the account" not in caplog.text
+
+    def test_the_page_cap_gives_none(self, monkeypatch, caplog):
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 2)
+        client = _orders_client(_orders_page([], cursor="C1"), _orders_page([], cursor="C2"))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and "SCANNER_MAX_PAGES (2)" in warnings[0]
+
+    def test_a_list_that_ends_on_the_last_allowed_page_is_complete(self, monkeypatch):
+        monkeypatch.setattr(scanner, "SCANNER_MAX_PAGES", 2)
+        client = _orders_client(_orders_page([_order_row()], cursor="C1"),
+                                _orders_page([_order_row()], cursor=None))
+        assert scanner.get_resting_orders(client) == 2
+
+    @pytest.mark.parametrize("page, reply", [
+        (1, _error_reply(404, "Not Found")),
+        (1, _error_reply(400, "Bad Request")),
+    ])
+    def test_a_failed_page_gives_none_in_one_line(self, page, reply, caplog):
+        client = _orders_client(reply)
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) is None
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning.startswith(f"Could not read the account's resting orders (page {page}): "
+                                  "HTTP ")
+        assert "\n" not in warning and "HEADER-DUMP" not in caplog.text
+        assert "Resting orders on the account" not in caplog.text
+
+    def test_a_later_page_that_fails_gives_none_not_a_partial_count(self, caplog):
+        client = _orders_client(_orders_page([_order_row()], cursor="C1"),
+                                _error_reply(400, "Bad Request"))
+        with caplog.at_level(logging.INFO):
+            assert scanner.get_resting_orders(client) is None
+        assert "(page 2): HTTP 400 Bad Request" in caplog.text
+
+    def test_a_server_error_is_retried_then_gives_none(self, caplog):
+        client = MagicMock()
+        client.get_orders_without_preload_content.return_value = _error_reply(
+            500, "Internal Server Error")
+        with patch.object(_http.time, "sleep"), caplog.at_level(logging.WARNING):
+            assert scanner.get_resting_orders(client) is None
+        # Retried like every read-only GET
+        assert client.get_orders_without_preload_content.call_count > 1
+        assert "(page 1): HTTP 500 Internal Server Error" in caplog.text
+
+    def test_a_connection_failure_is_retried_then_gives_none(self, caplog):
+        client = MagicMock()
+        client.get_orders_without_preload_content.side_effect = ProtocolError(
+            "Connection broken: IncompleteRead(0 bytes read)")
+        with patch.object(_http.time, "sleep"), caplog.at_level(logging.WARNING):
+            assert scanner.get_resting_orders(client) is None
+        assert client.get_orders_without_preload_content.call_count > 1
+        assert ("ProtocolError: Connection broken: IncompleteRead(0 bytes read)"
+                in caplog.text)
+
+
 _RUNG_EARLY = "KXSTAR-14-MAR01"
 _RUNG_LATE = "KXSTAR-14-MAR20"
 
@@ -8880,6 +9357,718 @@ class TestHeldPairs:
             assert held_pairs({}, {}, {}) == {}
         assert [r.getMessage() for r in caplog.records] == [
             "Held pairs to add to: 0 (other held markets, never added to: 0)"]
+
+
+# Every quote that is not a price strictly between 0 and 1
+_NO_QUOTE = [None, "", "abc", "0", "0.0000", "1", "1.0000", "1.5", "-0.20", "nan", "inf",
+             True, False, 10 ** 400, [], {"bid": "0.29"}]
+_NO_QUOTE_IDS = ["none", "empty", "text", "zero", "zero-dollars", "one", "one-dollar",
+                 "above-one", "negative", "nan", "inf", "true", "false", "huge-int", "list",
+                 "dict"]
+
+
+class TestHeldPositionsBidValue:
+    """held_positions_bid_value: what the held markets would fetch at this
+    run's bids. A Kelly trim sizes on the larger of this and Kalshi's own
+    value, so it must never come out too high: each market counts at the bid
+    of the side held, and anything unreadable counts $0, never its cost."""
+
+    @staticmethod
+    def _markets() -> dict:
+        """Two rungs as this run lists them.
+
+        Early: YES bid 0.29, YES ask 0.30. Late: YES bid 0.55, YES ask 0.56,
+        NO ask 0.45 (so its NO bid is 0.44).
+        """
+        early = _priced_rung(_RUNG_EARLY, "Mar 1, 2026", yes_ask="0.30", no_ask="0.71")
+        late = _priced_rung(_RUNG_LATE, "Mar 20, 2026", yes_ask="0.56", no_ask="0.45")
+        assert (early.yes_bid_dollars, late.yes_bid_dollars) == ("0.29", "0.55")
+        return {early.ticker: early, late.ticker: late}
+
+    @staticmethod
+    def _positions() -> dict:
+        """30 YES held on the early rung and 30 NO on the late one."""
+        return {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 6.0, 0.4),
+                _RUNG_LATE: _held(_RUNG_LATE, -30.0, 12.0, 0.5)}
+
+    def test_each_market_at_the_bid_for_the_side_held(self, caplog):
+        with caplog.at_level(logging.DEBUG):
+            value = scanner.held_positions_bid_value(self._positions(), self._markets())
+        # YES held: the YES bid. NO held: 1 minus the YES ask
+        assert value == 30.0 * 0.29 + 30.0 * (1.0 - 0.56)
+        assert value == pytest.approx(8.70 + 13.20)
+        assert isinstance(value, float)
+        # It logs nothing
+        assert caplog.records == []
+
+    def test_it_is_below_the_worth_at_the_asks(self):
+        # held_pairs values them at the asks (0.30 and 0.45); a sale gets the
+        # lower bids
+        positions, markets = self._positions(), self._markets()
+        labels = {m.ticker: market_ladder_keys(m) for m in markets.values()}
+        [pair] = held_pairs(positions, labels, markets, log=False).values()
+        assert pair.value_dollars == 22.5
+        assert scanner.held_positions_bid_value(positions, markets) < pair.value_dollars
+
+    def test_the_side_held_decides_which_quote_is_read(self):
+        markets = self._markets()
+        # Held the other way round: NO early (1 - 0.30), YES late (0.55)
+        flipped = {_RUNG_EARLY: _held(_RUNG_EARLY, -30.0, 21.0, 0.4),
+                   _RUNG_LATE: _held(_RUNG_LATE, 30.0, 16.8, 0.5)}
+        assert scanner.held_positions_bid_value(flipped, markets) == (
+            30.0 * (1.0 - 0.30) + 30.0 * 0.55)
+        # The NO ask is never read: moving it changes nothing
+        markets[_RUNG_EARLY].no_ask_dollars = "0.99"
+        markets[_RUNG_LATE].no_ask_dollars = "0.01"
+        assert scanner.held_positions_bid_value(flipped, markets) == (
+            30.0 * (1.0 - 0.30) + 30.0 * 0.55)
+        assert scanner.held_positions_bid_value(self._positions(), markets) == (
+            30.0 * 0.29 + 30.0 * (1.0 - 0.56))
+
+    def test_a_plain_number_reads_as_its_dollar_string_does(self):
+        markets = self._markets()
+        markets[_RUNG_EARLY].yes_bid_dollars = 0.29
+        markets[_RUNG_LATE].yes_ask_dollars = 0.56
+        assert scanner.held_positions_bid_value(self._positions(), markets) == (
+            30.0 * 0.29 + 30.0 * (1.0 - 0.56))
+
+    @pytest.mark.parametrize("raw", _NO_QUOTE, ids=_NO_QUOTE_IDS)
+    def test_a_yes_holding_with_no_usable_bid_counts_nothing(self, raw):
+        markets = self._markets()
+        markets[_RUNG_EARLY].yes_bid_dollars = raw
+        # Only the late rung counts; the early rung's $6.00 cost never stands in
+        assert scanner.held_positions_bid_value(self._positions(), markets) == (
+            30.0 * (1.0 - 0.56))
+
+    @pytest.mark.parametrize("raw", _NO_QUOTE, ids=_NO_QUOTE_IDS)
+    def test_a_no_holding_with_no_usable_yes_ask_counts_nothing(self, raw):
+        markets = self._markets()
+        markets[_RUNG_LATE].yes_ask_dollars = raw
+        assert scanner.held_positions_bid_value(self._positions(), markets) == 30.0 * 0.29
+
+    @pytest.mark.parametrize("count", [None, float("nan"), float("inf"), float("-inf"), True,
+                                       "30"])
+    def test_a_count_that_cannot_be_read_counts_nothing(self, count):
+        positions = self._positions()
+        positions[_RUNG_LATE] = _held(_RUNG_LATE, count, 12.0, 0.5)
+        value = scanner.held_positions_bid_value(positions, self._markets())
+        assert value == 30.0 * 0.29
+
+    def test_a_market_not_listed_counts_nothing(self):
+        markets = self._markets()
+        del markets[_RUNG_LATE]
+        assert scanner.held_positions_bid_value(self._positions(), markets) == 30.0 * 0.29
+        # Nothing listed, or nothing held: zero, as a float
+        for positions, listed in ((self._positions(), {}), ({}, self._markets()), ({}, {})):
+            value = scanner.held_positions_bid_value(positions, listed)
+            assert value == 0.0 and isinstance(value, float)
+
+    def test_it_never_falls_back_to_what_a_position_cost(self):
+        # Unlike held_pairs, a missing quote is never filled in with the cost:
+        # a stale cost could lift the value above what a sale would fetch
+        positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 30.0, 29.0, 0.4),
+                     _RUNG_LATE: _held(_RUNG_LATE, -30.0, 29.5, 0.5)}
+        markets = self._markets()
+        markets[_RUNG_EARLY].yes_bid_dollars = None
+        markets[_RUNG_LATE].yes_ask_dollars = "1.0000"
+        assert scanner.held_positions_bid_value(positions, markets) == 0.0
+        assert scanner.held_positions_bid_value(positions, {}) == 0.0
+
+    def test_a_fractional_holding_counts_its_own_size(self):
+        positions = {_RUNG_EARLY: _held(_RUNG_EARLY, 0.01, 0.003, 0.0)}
+        assert scanner.held_positions_bid_value(positions, self._markets()) == 0.01 * 0.29
+
+    def test_it_never_exceeds_the_worth_at_the_asks_on_uncrossed_quotes(self):
+        # Seeded sweep over uncrossed quotes (YES bid <= YES ask, the asks
+        # summing to $1 or more): the value never tops the worth at the asks,
+        # nor $1 a contract
+        rng = random.Random(4242)
+        for _ in range(300):
+            positions, markets, at_asks, contracts = {}, {}, 0.0, 0.0
+            for i in range(rng.randint(1, 6)):
+                ticker = f"KXSWEEP-{i}"
+                yes_bid = rng.randint(0, 99) / 100
+                yes_ask = rng.randint(max(1, round(yes_bid * 100)), 100) / 100
+                no_ask = rng.randint(round((1.0 - yes_ask) * 100), 100) / 100
+                count = rng.choice([-1, 1]) * rng.randint(1, 500)
+                market = _ingest_market(ticker, "KXSWEEP", "Will S happen?", "Sweep",
+                                        yes_ask=str(yes_ask), no_ask=str(no_ask))
+                market.yes_bid_dollars = str(yes_bid)
+                position = _held(ticker, float(count), 123.0, 0.0)
+                positions[ticker], markets[ticker] = position, market
+                contracts += abs(count)
+                side = "yes" if count > 0 else "no"
+                ask = float(getattr(market, f"{side}_ask_dollars"))
+                # Only a holding whose ask is a price is compared at the ask
+                at_asks += abs(count) * (ask if 0.0 < ask < 1.0 else 1.0)
+            floor = scanner.held_positions_bid_value(positions, markets)
+            assert 0.0 <= floor <= at_asks + 1e-9
+            assert floor <= contracts
+
+
+def _kind_of(pair):
+    """held_pair_kind for a pair a finder formed, held as that pair type buys it."""
+    held = dict(zip(leg_sides(pair.pair_type), (pair.market_a, pair.market_b), strict=True))
+    return scanner.held_pair_kind(held["yes"], held["no"])
+
+
+def _cross(ticker, event, deadline_text, close, *, yes_ask=0.20, no_ask=None, title="X"):
+    """One deadline of a question listed by its own event (a cross-event leg)."""
+    return _mock_market(
+        ticker=ticker, event_ticker=event, title=f"Will {title} happen {deadline_text}?",
+        yes_ask=yes_ask, no_ask=round(1.0 - yes_ask, 4) if no_ask is None else no_ask,
+        close_time=close)
+
+
+class TestHeldPairKind:
+    """held_pair_kind tells, from two held markets alone, a same-title from a
+    time-series pair and which is market A. A wrong answer would trim on the
+    wrong chance of paying, so it uses the finders' own tests and gives None
+    when unsure. Pairs a finder forms are asserted to form first, so a None
+    here is this reader's refusal."""
+
+    _WIU = TestSameTitleCloseGap._wiu_markets
+
+    @staticmethod
+    def _ts(markets, monkeypatch, *, ladders=True):
+        """The time-series pairs of `markets`, with same-event ladders on or off."""
+        monkeypatch.setattr(scanner, "TIME_SERIES_SAME_EVENT_LADDERS", ladders)
+        return find_time_series_pairs(MagicMock(), held_tickers=set(), markets=list(markets),
+                                      settings=_live(tier_floors=False))
+
+    @staticmethod
+    def _rungs(early="by March 1, 2026", late="by March 20, 2026", *,
+               close_a=datetime(2026, 3, 1, tzinfo=UTC),
+               close_b=datetime(2026, 3, 20, tzinfo=UTC), event="KXSTARSHIP-14",
+               event_title=""):
+        """Two rungs of one event's ladder: the early one cheap, the late one dear."""
+        return (_ladder_rung("RUNG-EARLY", early, yes_ask=0.20, no_ask=0.80, close=close_a,
+                             event=event, event_title=event_title),
+                _ladder_rung("RUNG-LATE", late, yes_ask=0.60, no_ask=0.40, close=close_b,
+                             event=event, event_title=event_title))
+
+    # ── same-title ──────────────────────────────────────────────────────────
+
+    def test_a_same_title_pair_reads_as_same_title_with_the_finders_a_and_b(self):
+        mens, womens = self._WIU(womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
+        [pair] = find_same_title_pairs([mens, womens])
+        assert pair.pair_type == "same_title"
+        kind = _kind_of(pair)
+        assert kind is not None and kind[0] == "same_title"
+        # A is the market held NO, B the one held YES, as the finder has them
+        assert kind[1] is pair.market_a and kind[2] is pair.market_b
+        assert (kind[1], kind[2]) == (mens, womens)
+
+    def test_a_weekly_and_a_monthly_listing_at_one_close(self):
+        close = datetime(2026, 9, 25, 21, tzinfo=UTC)
+        title = "Brent crude oil price on Sep 25, 2026?"
+        weekly = _mock_market(
+            ticker="KXBRENTW-26SEP25-T70", event_ticker="KXBRENTW-26SEP25", title=title,
+            subtitle="$70 or above", event_title="Brent crude oil price", yes_ask=0.45,
+            no_ask=0.55, close_time=close)
+        monthly = _mock_market(
+            ticker="KXBRENTMON-26SEP-T70", event_ticker="KXBRENTMON-26SEP", title=title,
+            subtitle="$70 or above", event_title="Brent crude oil price", yes_ask=0.35,
+            no_ask=0.65, close_time=close)
+        [pair] = find_same_title_pairs([weekly, monthly])
+        assert _kind_of(pair) == ("same_title", weekly, monthly)
+        # Snapshot wording ("price on <date>") is never time-series: the
+        # identical wording alone makes it same-title
+        assert scanner._market_deadline_profile(weekly)[0] == scanner.DEADLINE_SNAPSHOT
+
+    def test_a_same_title_pair_is_read_from_the_sides_held(self):
+        # A is the market held NO (leg_sides), even where today's prices would
+        # make the other one the finder's A
+        mens, womens = self._WIU(womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC))
+        assert leg_sides("same_title") == ("no", "yes")
+        assert scanner.held_pair_kind(yes_market=mens, no_market=womens) == (
+            "same_title", womens, mens)
+        assert scanner.held_pair_kind(yes_market=womens, no_market=mens) == (
+            "same_title", mens, womens)
+
+    @pytest.mark.parametrize("gap_seconds, reads", [(0, True), (3_600, True), (3_601, False),
+                                                    (9_000, False)])
+    def test_identical_wording_closing_apart_is_no_pair(self, gap_seconds, reads):
+        # The same-title close gate, bound included; identical wording is never
+        # time-series either
+        mens, womens = self._WIU(
+            womens_close=datetime(2026, 1, 28, 1, 30, tzinfo=UTC)
+            - timedelta(seconds=gap_seconds))
+        assert len(find_same_title_pairs([mens, womens])) == (1 if reads else 0)
+        for held in ((mens, womens), (womens, mens)):
+            kind = scanner.held_pair_kind(*held)
+            assert (kind is not None) is reads
+            assert kind is None or kind[0] == "same_title"
+
+    def test_identical_wording_in_one_series_is_no_pair(self):
+        # Two game days of one recurring fixture (DR-02): two questions
+        close = datetime(2026, 9, 16, 5, tzinfo=UTC)
+        one = _mock_market(ticker="KXNPBRFI-26SEP160500FUKORI-Y",
+                           event_ticker="KXNPBRFI-26SEP160500FUKORI", title="Run in the first?",
+                           subtitle="Yes", yes_ask=0.60, no_ask=0.40, close_time=close)
+        two = _mock_market(ticker="KXNPBRFI-26SEP150500FUKORI-Y",
+                           event_ticker="KXNPBRFI-26SEP150500FUKORI", title="Run in the first?",
+                           subtitle="Yes", yes_ask=0.30, no_ask=0.70, close_time=close)
+        assert scanner._same_series(one, two) and not scanner._closes_apart(one, two)
+        assert find_same_title_pairs([one, two]) == []
+        assert scanner.held_pair_kind(one, two) is None
+        assert scanner.held_pair_kind(two, one) is None
+        # Control: the same two markets on two series are a same-title pair
+        two.event_ticker = "KXNPBALT-26SEP150500FUKORI"
+        assert len(find_same_title_pairs([one, two])) == 1
+        assert scanner.held_pair_kind(two, one) == ("same_title", one, two)
+
+    @pytest.mark.parametrize("event_a, event_b", [
+        ("KXAA-1", "KXAA-1"),    # one event's own markets
+        ("", ""),                # no event ticker at all
+        ("KXAA-1", ""),          # one series unknown
+        ("", "KXBB-1"),
+        ("-LEADING", "KXBB-1"),  # a ticker that names no series
+    ])
+    def test_identical_wording_needs_two_known_series(self, event_a, event_b):
+        close = datetime(2026, 9, 25, 21, tzinfo=UTC)
+        a = _mock_market(ticker="T-A", event_ticker=event_a, title="Same question?",
+                         subtitle="Yes", yes_ask=0.60, no_ask=0.40, close_time=close)
+        b = _mock_market(ticker="T-B", event_ticker=event_b, title="Same question?",
+                         subtitle="Yes", yes_ask=0.30, no_ask=0.70, close_time=close)
+        assert find_same_title_pairs([a, b]) == []
+        assert scanner.held_pair_kind(a, b) is None
+        assert scanner.held_pair_kind(b, a) is None
+
+    def test_identical_blank_wording_is_no_pair(self):
+        # The same-title finder groups a market only by a title or a subtitle
+        close = datetime(2026, 9, 25, 21, tzinfo=UTC)
+        a = _mock_market(ticker="T-A", event_ticker="KXAA-1", yes_ask=0.60, no_ask=0.40,
+                         close_time=close)
+        b = _mock_market(ticker="T-B", event_ticker="KXBB-1", yes_ask=0.30, no_ask=0.70,
+                         close_time=close)
+        assert scanner._identical_wording(a, b)
+        assert find_same_title_pairs([a, b]) == []
+        assert scanner.held_pair_kind(a, b) is None
+        assert scanner.held_pair_kind(b, a) is None
+        # Control: a subtitle alone is wording enough, as it is for the finder
+        a.subtitle = b.subtitle = "Team A"
+        assert len(find_same_title_pairs([a, b])) == 1
+        assert scanner.held_pair_kind(b, a) == ("same_title", a, b)
+
+    def test_one_market_is_never_its_own_pair(self):
+        mens, _womens = self._WIU()
+        assert scanner.held_pair_kind(mens, mens) is None
+
+    # ── two rungs of one event ──────────────────────────────────────────────
+
+    @pytest.mark.parametrize("ladders", [True, False])
+    def test_a_ladder_reads_as_time_series_whatever_the_ladder_switch(self, monkeypatch,
+                                                                      ladders):
+        early, late = self._rungs()
+        _assert_one_ladder_group(early, late)
+        pairs = self._ts([early, late], monkeypatch, ladders=ladders)
+        if ladders:
+            [pair] = pairs
+            assert pair.stated_gap_days == 19
+            assert _kind_of(pair) == ("time_series", pair.market_a, pair.market_b)
+        else:
+            # The switch decides what may be bought; this reads what is held
+            assert pairs == []
+        kind = scanner.held_pair_kind(yes_market=early, no_market=late)
+        assert kind == ("time_series", early, late)
+        assert kind[1] is early and kind[2] is late
+        # YES on the later deadline is not the trade
+        assert scanner.held_pair_kind(yes_market=late, no_market=early) is None
+
+    @pytest.mark.parametrize("close_a, close_b", [
+        # Every rung closes at one instant (a settled event)
+        (datetime(2026, 3, 20, tzinfo=UTC), datetime(2026, 3, 20, tzinfo=UTC)),
+        # The closes run the opposite way to the stated deadlines
+        (datetime(2026, 4, 1, tzinfo=UTC), datetime(2026, 3, 5, tzinfo=UTC)),
+        # A close that cannot be read is not what orders a ladder
+        (None, datetime(2026, 3, 5, tzinfo=UTC)),
+    ], ids=["one-instant", "reversed", "unread"])
+    def test_a_ladder_is_ordered_on_its_stated_deadlines_alone(self, monkeypatch, close_a,
+                                                               close_b):
+        early, late = self._rungs(close_a=close_a or datetime(2026, 3, 1, tzinfo=UTC),
+                                  close_b=close_b)
+        [pair] = self._ts([early, late], monkeypatch)
+        assert (pair.market_a, pair.market_b) == (early, late)
+        if close_a is None:
+            early.close_time = None
+        assert scanner.held_pair_kind(early, late) == ("time_series", early, late)
+        assert scanner.held_pair_kind(late, early) is None
+
+    def test_a_ladder_wider_than_the_gap_cap_still_reads(self, monkeypatch):
+        # The 30-day cap decides what may be bought; a pair already held is
+        # read by its wording alone
+        early, late = self._rungs(late="by June 30, 2026",
+                                  close_b=datetime(2026, 6, 30, tzinfo=UTC))
+        assert self._ts([early, late], monkeypatch) == []
+        assert scanner.held_pair_kind(early, late) == ("time_series", early, late)
+
+    @pytest.mark.parametrize("early, late, event, event_title", [
+        # Year-less wording states no calendar day to order the rungs by
+        ("by November 4", "by December 4", "KXSTARSHIP-14", ""),
+        # One day spelled two ways is one deadline, not two rungs
+        ("by December 2026", "by December 31, 2026", "KXSTARSHIP-14", ""),
+        # A stale event title names a day neither rung can mean
+        ("by October 1, 2026", "by October 21, 2026", "KXSTARSHIP-14",
+         "Starship flights before 2026"),
+        # A shared EMPTY event ticker names no event
+        ("by March 1, 2026", "by March 20, 2026", "", ""),
+    ], ids=["year-less", "same-day", "fields-disagree", "no-event-ticker"])
+    def test_a_ladder_the_finder_refuses_is_no_pair(self, monkeypatch, early, late, event,
+                                                    event_title):
+        rungs = self._rungs(early, late, event=event, event_title=event_title)
+        _assert_one_ladder_group(*rungs)
+        assert self._ts(rungs, monkeypatch) == []
+        assert scanner.held_pair_kind(*rungs) is None
+        assert scanner.held_pair_kind(*reversed(rungs)) is None
+
+    def test_the_refused_ladders_have_a_control(self, monkeypatch):
+        # Each refusal above differs from this admitted ladder in one thing
+        for rungs in (self._rungs("by November 4, 2026", "by December 4, 2026",
+                                  close_a=datetime(2026, 11, 4, tzinfo=UTC),
+                                  close_b=datetime(2026, 12, 4, tzinfo=UTC)),
+                      self._rungs("by October 1, 2026", "by October 21, 2026",
+                                  event_title="Starship flights")):
+            [pair] = self._ts(rungs, monkeypatch)
+            assert _kind_of(pair) == ("time_series", *rungs)
+
+    def test_snapshot_rungs_of_one_event_are_no_pair(self, monkeypatch):
+        one = _mock_market(ticker="S1", event_ticker="KXSNAP-1",
+                           title="Starship flights on March 1, 2026", yes_ask=0.20,
+                           no_ask=0.80, close_time=datetime(2026, 3, 1, tzinfo=UTC))
+        two = _mock_market(ticker="S2", event_ticker="KXSNAP-1",
+                           title="Starship flights on March 20, 2026", yes_ask=0.60,
+                           no_ask=0.40, close_time=datetime(2026, 3, 20, tzinfo=UTC))
+        assert time_series_group_key(pair_key(one), "") == time_series_group_key(
+            pair_key(two), "")
+        assert self._ts([one, two], monkeypatch) == []
+        assert scanner.held_pair_kind(one, two) is None
+        assert scanner.held_pair_kind(two, one) is None
+
+    # ── one question listed by two events ───────────────────────────────────
+
+    def test_a_cross_event_pair_reads_as_time_series_with_the_finders_a_and_b(self,
+                                                                             monkeypatch):
+        early, late = _ts_pair_markets(gap_days=10, pA=0.20, pB=0.60)
+        [pair] = self._ts([late, early], monkeypatch)
+        assert pair.stated_gap_days is None and pair.pair_type == "time_series"
+        kind = _kind_of(pair)
+        assert kind == ("time_series", early, late)
+        assert kind[1] is pair.market_a and kind[2] is pair.market_b
+        # YES on the later deadline is not the trade
+        assert scanner.held_pair_kind(yes_market=late, no_market=early) is None
+
+    def test_a_cross_event_pair_reads_without_a_price_or_gap_test(self, monkeypatch):
+        # 45 days apart and the earlier market now dearer: no run would buy
+        # it, but it is still the pair held
+        early, late = _ts_pair_markets(gap_days=45, pA=0.70, pB=0.30)
+        assert self._ts([early, late], monkeypatch) == []
+        assert scanner.held_pair_kind(early, late) == ("time_series", early, late)
+        assert scanner.held_pair_kind(late, early) is None
+
+    def test_year_less_deadlines_closing_days_apart_read_on_the_close_order(self,
+                                                                           monkeypatch):
+        early = _cross("X-A", "KXAA-1", "by March 1", datetime(2026, 3, 1, tzinfo=UTC))
+        late = _cross("X-B", "KXBB-1", "by March 9", datetime(2026, 3, 9, tzinfo=UTC),
+                      yes_ask=0.60)
+        # Neither stated day can be read, so only the closes order the pair
+        assert scanner._stated(early, scanner._market_deadline_profile(early)) is None
+        assert scanner._stated(late, scanner._market_deadline_profile(late)) is None
+        [pair] = self._ts([early, late], monkeypatch)
+        assert _kind_of(pair) == ("time_series", early, late)
+        assert scanner.held_pair_kind(late, early) is None
+
+    def test_dated_deadlines_that_agree_with_the_closes_read_even_minutes_apart(self,
+                                                                               monkeypatch):
+        # Both stated days read and agree with the close order: two deadlines,
+        # however near the closes
+        early = _cross("X-A", "KXAA-1", "by March 1, 2026",
+                       datetime(2026, 3, 20, 12, tzinfo=UTC))
+        late = _cross("X-B", "KXBB-1", "by March 9, 2026",
+                      datetime(2026, 3, 20, 12, 30, tzinfo=UTC), yes_ask=0.60)
+        assert not scanner._closes_apart(early, late)
+        [pair] = self._ts([early, late], monkeypatch)
+        assert _kind_of(pair) == ("time_series", early, late)
+        assert scanner.held_pair_kind(late, early) is None
+
+    def test_equal_closes_across_events_give_no_order(self, monkeypatch):
+        # With equal closes the finder keeps listing order, which says nothing
+        # about which deadline comes first
+        close = datetime(2026, 3, 20, tzinfo=UTC)
+        early = _cross("X-A", "KXAA-1", "by March 1, 2026", close)
+        late = _cross("X-B", "KXBB-1", "by March 20, 2026", close, yes_ask=0.60)
+        [pair] = self._ts([early, late], monkeypatch)
+        assert (pair.market_a, pair.market_b) == (early, late)
+        assert _kind_of(pair) is None
+        assert scanner.held_pair_kind(late, early) is None
+        # Control: one second between the closes and the pair reads
+        late.close_time = close + timedelta(seconds=1)
+        [pair] = self._ts([early, late], monkeypatch)
+        assert _kind_of(pair) == ("time_series", early, late)
+
+    @pytest.mark.parametrize("wording_a, wording_b", [
+        ("by December 2026", "by December 31, 2026"),
+        ("by March 31, 2027", "by Mar 31, 2027"),
+        ("by March 31, 2027", "by 2027-03-31"),
+    ])
+    def test_one_day_spelled_two_ways_across_events_is_no_pair(self, monkeypatch, wording_a,
+                                                               wording_b):
+        # Two deadlines as text (the finder's view), one as calendar days: a
+        # same-title pair respelled
+        a = _cross("X-A", "KXAA-1", wording_a, datetime(2027, 3, 1, tzinfo=UTC))
+        b = _cross("X-B", "KXBB-1", wording_b, datetime(2027, 3, 9, tzinfo=UTC), yes_ask=0.60)
+        [pair] = self._ts([a, b], monkeypatch)
+        assert (pair.market_a, pair.market_b) == (a, b)
+        assert scanner.same_event_ladder(
+            scanner._stated(a, scanner._market_deadline_profile(a)),
+            scanner._stated(b, scanner._market_deadline_profile(b))) is scanner.SAME_DAY
+        assert _kind_of(pair) is None
+        assert scanner.held_pair_kind(b, a) is None
+
+    def test_by_one_day_beside_before_the_next_is_no_pair(self, monkeypatch):
+        # Both name Mar 31 as the last day, but the two prepositions keep them
+        # in separate groups, so no finder pairs them
+        a = _cross("X-A", "KXAA-1", "by Mar 31, 2027", datetime(2027, 3, 31, tzinfo=UTC))
+        b = _cross("X-B", "KXBB-1", "before Apr 1, 2027", datetime(2027, 4, 1, tzinfo=UTC),
+                   yes_ask=0.60)
+        assert scanner._stated(a, scanner._market_deadline_profile(a)) == date(2027, 3, 31)
+        assert scanner._stated(b, scanner._market_deadline_profile(b)) == date(2027, 3, 31)
+        assert self._ts([a, b], monkeypatch) == []
+        assert scanner.held_pair_kind(a, b) is None
+        assert scanner.held_pair_kind(b, a) is None
+
+    def test_stated_days_that_contradict_the_closes_are_no_pair(self, monkeypatch):
+        # The market that closes first states the LATER day
+        first = _cross("X-A", "KXAA-1", "by March 20, 2026", datetime(2026, 3, 1, tzinfo=UTC))
+        second = _cross("X-B", "KXBB-1", "by March 1, 2026", datetime(2026, 3, 20, tzinfo=UTC),
+                        yes_ask=0.60)
+        [pair] = self._ts([first, second], monkeypatch)
+        # The finder goes by the closes
+        assert (pair.market_a, pair.market_b) == (first, second)
+        assert _kind_of(pair) is None
+        assert scanner.held_pair_kind(second, first) is None
+
+    @pytest.mark.parametrize("wording_a, wording_b", [
+        # One stated day cannot be placed (a numeric date)
+        ("by March 31, 2027", "by 3/31/2027"),
+        # Neither can (no year, a quarter)
+        ("by March 1", "by March 9"),
+        ("by Q1 2027", "by Q2 2027"),
+    ])
+    @pytest.mark.parametrize("gap_seconds, reads", [(1_800, False), (3_600, False),
+                                                    (3_601, True), (7_200, True)])
+    def test_an_unread_stated_day_needs_closes_past_the_same_title_bound(
+            self, monkeypatch, wording_a, wording_b, gap_seconds, reads):
+        # With no stated day to tell them apart, closes within the same-title
+        # bound could be one question respelled: not shown to be time-series
+        close = datetime(2027, 3, 31, 12, tzinfo=UTC)
+        a = _cross("X-A", "KXAA-1", wording_a, close)
+        b = _cross("X-B", "KXBB-1", wording_b, close + timedelta(seconds=gap_seconds),
+                   yes_ask=0.60)
+        assert config.SAME_TITLE_MAX_CLOSE_GAP_SECONDS == 3_600
+        # The finder forms the pair either way
+        [pair] = self._ts([a, b], monkeypatch)
+        assert (pair.market_a, pair.market_b) == (a, b)
+        assert _kind_of(pair) == (("time_series", a, b) if reads else None)
+        assert scanner.held_pair_kind(b, a) is None
+
+    @pytest.mark.parametrize("gap_seconds, reads", [(1_800, False), (3_600, False),
+                                                    (3_601, True)])
+    def test_a_respelled_same_title_pair_with_a_year_less_deadline_is_no_pair(
+            self, monkeypatch, gap_seconds, reads):
+        # One question on two series, one label respelled without its year:
+        # the finder sees two deadlines, but one states no calendar day, so
+        # within the same-title bound it is no pair
+        close = datetime(2027, 3, 31, 12, tzinfo=UTC)
+
+        def listing(ticker, event, label, close_time, yes_ask):
+            return _mock_market(ticker=ticker, event_ticker=event, title="Bitcoin high?",
+                                subtitle=label, yes_ask=yes_ask,
+                                no_ask=round(1.0 - yes_ask, 2), close_time=close_time)
+
+        dated = listing("X-A", "KXAA-1", "$80,000 by March 31, 2027", close, 0.20)
+        respelled = listing("X-B", "KXBB-1", "$80,000 by Mar 31",
+                            close + timedelta(seconds=gap_seconds), 0.60)
+        assert scanner._stated(dated, scanner._market_deadline_profile(dated)) == date(
+            2027, 3, 31)
+        assert scanner._stated(respelled, scanner._market_deadline_profile(respelled)) is None
+        # The finder pairs them as two deadlines at every close gap
+        [pair] = self._ts([dated, respelled], monkeypatch)
+        assert (pair.pair_type, pair.market_a, pair.market_b) == (
+            "time_series", dated, respelled)
+        assert _kind_of(pair) == (("time_series", dated, respelled) if reads else None)
+        assert scanner.held_pair_kind(respelled, dated) is None
+        # Spelled alike, they are the same-title pair they may have been bought
+        # as, inside the bound
+        respelled.subtitle = dated.subtitle
+        assert scanner.held_pair_kind(respelled, dated) == (
+            None if reads else ("same_title", dated, respelled))
+
+    @pytest.mark.parametrize("close_a, close_b", [
+        (None, datetime(2026, 3, 9, tzinfo=UTC)),
+        (datetime(2026, 3, 1, tzinfo=UTC), None),
+        ("2026-03-01T00:00:00Z", datetime(2026, 3, 9, tzinfo=UTC)),
+        # One close with a zone and one without cannot be compared
+        (datetime(2026, 3, 1), datetime(2026, 3, 9, tzinfo=UTC)),
+        (datetime(2026, 3, 1, tzinfo=UTC), datetime(2026, 3, 9)),
+    ])
+    @pytest.mark.parametrize("wording_a, wording_b", [
+        ("by March 1, 2026", "by March 9, 2026"), ("by March 1", "by March 9")])
+    def test_a_close_that_cannot_be_compared_is_no_pair(self, close_a, close_b, wording_a,
+                                                        wording_b):
+        a = _cross("X-A", "KXAA-1", wording_a, datetime(2026, 3, 1, tzinfo=UTC))
+        b = _cross("X-B", "KXBB-1", wording_b, datetime(2026, 3, 9, tzinfo=UTC), yes_ask=0.60)
+        # Control: with both closes readable the pair reads
+        assert scanner.held_pair_kind(a, b) == ("time_series", a, b)
+        a.close_time, b.close_time = close_a, close_b
+        assert scanner.held_pair_kind(a, b) is None
+        assert scanner.held_pair_kind(b, a) is None
+
+    def test_two_naive_closes_compare_as_the_finder_compares_them(self):
+        a = _cross("X-A", "KXAA-1", "by March 1", datetime(2026, 3, 1))
+        b = _cross("X-B", "KXBB-1", "by March 9", datetime(2026, 3, 9), yes_ask=0.60)
+        assert scanner.held_pair_kind(a, b) == ("time_series", a, b)
+
+    @pytest.mark.parametrize("event_a, event_b", [
+        ("", "KXBB-1"), ("KXAA-1", ""), (None, "KXBB-1"), ("KXAA-1", None)])
+    @pytest.mark.parametrize("wording_a, wording_b", [
+        ("by March 1, 2026", "by March 9, 2026"), ("by March 1", "by March 9")])
+    def test_a_time_series_pair_needs_two_known_events(self, monkeypatch, event_a, event_b,
+                                                       wording_a, wording_b):
+        # With an event ticker missing, two events (ordered on closes) cannot
+        # be told from two rungs of one (ordered on stated days)
+        a = _cross("X-A", "KXAA-1", wording_a, datetime(2026, 3, 1, tzinfo=UTC))
+        b = _cross("X-B", "KXBB-1", wording_b, datetime(2026, 3, 9, tzinfo=UTC), yes_ask=0.60)
+        # Control: with both events named the pair reads
+        assert scanner.held_pair_kind(a, b) == ("time_series", a, b)
+        a.event_ticker, b.event_ticker = event_a, event_b
+        if isinstance(event_a, str) and isinstance(event_b, str):
+            # The finder forms the pair: across events it asks for no event ticker
+            [pair] = self._ts([a, b], monkeypatch)
+            assert (pair.market_a, pair.market_b) == (a, b)
+        assert scanner.held_pair_kind(a, b) is None
+        assert scanner.held_pair_kind(b, a) is None
+
+    @pytest.mark.parametrize("title_a, title_b", [
+        # Snapshot wording: a price on a day does not nest
+        ("Bitcoin price on Sep 15, 2026?", "Bitcoin price on Sep 18, 2026?"),
+        # One leg names no deadline
+        ("Will X happen by March 1?", "Will X happen Mar 9?"),
+        # A window, not a deadline
+        ("Will X be top 10 in October 2026?", "Will X be top 10 in November 2026?"),
+        # Two different questions
+        ("Will X happen by March 1, 2026?", "Will Y happen by March 9, 2026?"),
+    ], ids=["snapshot", "undated", "window", "two-questions"])
+    def test_wording_that_is_not_two_cumulative_deadlines_is_no_pair(self, monkeypatch,
+                                                                     title_a, title_b):
+        a = _mock_market(ticker="X-A", event_ticker="KXAA-1", title=title_a, yes_ask=0.20,
+                         no_ask=0.80, close_time=datetime(2026, 3, 1, tzinfo=UTC))
+        b = _mock_market(ticker="X-B", event_ticker="KXBB-1", title=title_b, yes_ask=0.60,
+                         no_ask=0.40, close_time=datetime(2026, 3, 9, tzinfo=UTC))
+        assert self._ts([a, b], monkeypatch) == []
+        assert find_same_title_pairs([a, b]) == []
+        assert scanner.held_pair_kind(a, b) is None
+        assert scanner.held_pair_kind(b, a) is None
+
+    def test_two_strikes_of_one_deadline_family_are_no_pair(self, monkeypatch):
+        # Two strikes of one daily family differ in their outcome label, which
+        # is part of the group key (DR-01)
+        def strike(ticker, event, day, label, yes_ask):
+            return _ingest_market(
+                ticker, event, f"Bitcoin high by March {day}, 2026?", "Bitcoin record",
+                subtitle=label, close=f"2026-03-{day:02d}T00:00:00Z", yes_ask=str(yes_ask),
+                no_ask=str(round(1.0 - yes_ask, 2)))
+
+        low = strike("KXBTC-A-80", "KXBTCA-1", 1, "$80,000 or above", 0.20)
+        high = strike("KXBTC-B-90", "KXBTCB-1", 9, "$90,000 or above", 0.60)
+        assert pair_key(low) == pair_key(high).replace("March 9", "March 1")
+        assert self._ts([low, high], monkeypatch) == []
+        assert scanner.held_pair_kind(low, high) is None
+        assert scanner.held_pair_kind(high, low) is None
+        # Control: one strike at the two deadlines is the pair
+        same = strike("KXBTC-B-80", "KXBTCB-1", 9, "$80,000 or above", 0.60)
+        [pair] = self._ts([low, same], monkeypatch)
+        assert _kind_of(pair) == ("time_series", low, same)
+
+    # ── every pair the finders form ─────────────────────────────────────────
+
+    def test_every_pair_the_finders_form_reads_as_its_own_kind(self, monkeypatch):
+        # Seeded sweep of the three shapes a run can hold. Same-title pairs and
+        # ladders read as their own kind, A and B as the finder has them. A
+        # cross-event pair reads as time-series exactly when its stated days
+        # read, differ and agree with its closes, or (a day unread) its closes
+        # are past the same-title bound; otherwise as no pair. Never the other
+        # kind, and a time-series pair held the other way round never reads
+        rng = random.Random(2026)
+        base = datetime(2026, 3, 1, 12, tzinfo=UTC)
+        bound = config.SAME_TITLE_MAX_CLOSE_GAP_SECONDS
+        seen = {"same_title": 0, "ladder": 0, "cross_read": 0, "cross_refused": 0}
+
+        def spelled(day, dated):
+            return f"by {day:%B} {day.day}, {day.year}" if dated else f"by {day:%B} {day.day}"
+
+        for n in range(240):
+            shape = ("same_title", "ladder", "cross")[n % 3]
+            p_low = rng.randint(5, 40) / 100
+            p_high = round(p_low + rng.randint(6, 45) / 100, 2)
+            jitter = timedelta(seconds=rng.choice([0, 1, 1_800, 3_600, 3_601, 86_400 * 3]))
+            if shape == "same_title":
+                # One question on two series, closing within the bound
+                close_gap = timedelta(seconds=rng.choice([0, 60, 3_600]))
+                dear = _mock_market(ticker=f"ST{n}-A", event_ticker=f"KXSTA{n}-1",
+                                    title=f"Who wins game {n}?", subtitle="Home",
+                                    event_title=f"Game {n}", yes_ask=p_high,
+                                    no_ask=round(1.0 - p_high, 2), close_time=base)
+                cheap = _mock_market(ticker=f"ST{n}-B", event_ticker=f"KXSTB{n}-1",
+                                     title=f"Who wins game {n}?", subtitle="Home",
+                                     event_title=f"Game {n}", yes_ask=p_low,
+                                     no_ask=round(1.0 - p_low, 2), close_time=base + close_gap)
+                [pair] = find_same_title_pairs(rng.sample([dear, cheap], 2))
+                assert _kind_of(pair) == ("same_title", dear, cheap)
+                assert self._ts([dear, cheap], monkeypatch) == []
+                seen["same_title"] += 1
+                continue
+            day_a = date(2026, 3, 1) + timedelta(days=rng.randint(0, 20))
+            day_b = day_a + timedelta(days=rng.randint(1, 9))
+            if shape == "ladder":
+                # Two rungs of one event: the closes are anything at all
+                closes = rng.choice([(base, base), (base + jitter, base), (base, base + jitter)])
+                early = _mock_market(ticker=f"LD{n}-A", event_ticker=f"KXLD{n}-1",
+                                     title=f"Will L{n} happen {spelled(day_a, True)}?",
+                                     yes_ask=p_low, no_ask=round(1.0 - p_low, 2),
+                                     close_time=closes[0])
+                late = _mock_market(ticker=f"LD{n}-B", event_ticker=f"KXLD{n}-1",
+                                    title=f"Will L{n} happen {spelled(day_b, True)}?",
+                                    yes_ask=p_high, no_ask=round(1.0 - p_high, 2),
+                                    close_time=closes[1])
+                [pair] = self._ts(rng.sample([early, late], 2), monkeypatch)
+                assert pair.stated_gap_days == (day_b - day_a).days
+                assert _kind_of(pair) == ("time_series", early, late)
+                assert scanner.held_pair_kind(late, early) is None
+                assert find_same_title_pairs([early, late]) == []
+                seen["ladder"] += 1
+                continue
+            # One question on two events: the first to close is the cheaper,
+            # so the finder forms the pair
+            dated = rng.random() < 0.6
+            reversed_days = rng.random() < 0.25
+            first_day, second_day = (day_b, day_a) if reversed_days else (day_a, day_b)
+            first = _mock_market(ticker=f"CR{n}-A", event_ticker=f"KXCRA{n}-1",
+                                 title=f"Will C{n} happen {spelled(first_day, dated)}?",
+                                 yes_ask=p_low, no_ask=round(1.0 - p_low, 2), close_time=base)
+            second = _mock_market(ticker=f"CR{n}-B", event_ticker=f"KXCRB{n}-1",
+                                  title=f"Will C{n} happen {spelled(second_day, dated)}?",
+                                  yes_ask=p_high, no_ask=round(1.0 - p_high, 2),
+                                  close_time=base + jitter)
+            [pair] = self._ts([first, second], monkeypatch)
+            assert (pair.market_a, pair.market_b) == (first, second)
+            gap = jitter.total_seconds()
+            expected = (not reversed_days and gap > 0) if dated else gap > bound
+            assert _kind_of(pair) == (("time_series", first, second) if expected else None)
+            assert scanner.held_pair_kind(second, first) is None
+            seen["cross_read" if expected else "cross_refused"] += 1
+        assert seen["same_title"] == seen["ladder"] == 80
+        assert seen["cross_read"] >= 20 and seen["cross_refused"] >= 20
 
 
 def _named(ticker: str) -> SimpleNamespace:

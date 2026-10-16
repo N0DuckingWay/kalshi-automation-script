@@ -10,9 +10,10 @@ Purpose:
     uses a client made here.
 
     It also reads the account balance, which doubles as a check that the login
-    works. One read gives two things: the cash on each shard (one of the
-    exchange's separate sections, each holding its own cash) and what Kalshi
-    says the open positions are worth.
+    works. One read gives the cash on each shard (one of the exchange's
+    separate sections, each holding its own cash), what Kalshi says the open
+    positions are worth, and any entry of the reply's per-shard list whose
+    cash could not be counted.
 
 Dependencies:
     Imports file paths, site addresses and DEFAULT_EXCHANGE_INDEX from config.py,
@@ -37,6 +38,10 @@ Notes:
       them the same way.
     - The positions value is optional: when it cannot be read it is None,
       never an error.
+    - A shard entry whose cash cannot be read is left out of the cash and
+      named in AccountBalance.cash_left_out. Less cash only makes a purchase
+      smaller, but would make a Kelly trim (selling part of a held pair) sell
+      more, so main.py trims nothing that run.
 """
 import json
 import logging
@@ -151,55 +156,51 @@ def _dollar_str_to_cents(value) -> int | None:
         return None
 
 
-def _balance_cents_by_shard(data: dict) -> dict[int, int]:
+def _balance_cents_by_shard(data: dict, *, left_out: list | None = None) -> dict[int, int]:
     """
-    Extract the spendable balance in cents PER SHARD from a raw
-    /portfolio/balance body.
+    Read the spendable cash, in cents, on each shard from a raw /portfolio/balance reply.
 
-    Kalshi's 2026-08-13 change scoped the balance per exchange shard, so the
-    body now carries a balance_breakdown list alongside the aggregate. Unlike
-    the single-shard predecessor of this function, every parseable shard is
-    returned — a later collateral-transfer planner and a shard coverage check
-    both need the full picture, not just the routable shard. The preference
-    order (tiers 2 and 3 only apply when the breakdown is absent or entirely
-    unparseable):
+    Every shard is returned, since the collateral transfers and the shard
+    coverage check need them all. Tiers 2 and 3 apply only when the
+    breakdown is missing or none of its entries can be read:
 
-      1. Every balance_breakdown entry that parses: {exchange_index: cents}
-         for each entry, keyed by its own exchange_index (not just
-         DEFAULT_EXCHANGE_INDEX). Entries carry the dollar string under the
-         key "balance" (NOT "balance_dollars").
-      2. Top-level balance_dollars — the fixed-point aggregate across shards
-         — attributed to DEFAULT_EXCHANGE_INDEX, used only when the
-         breakdown is missing/empty or nothing in it parsed.
-      3. Legacy top-level integer balance, already in cents, attributed to
-         DEFAULT_EXCHANGE_INDEX. This is the sandbox shape and the
-         pre-drift production shape; it is returned as-is and must NOT be
-         run through the dollar converter.
+      1. Each readable balance_breakdown entry, keyed by its own
+         exchange_index. An entry's "balance" is a DOLLAR string.
+      2. Top-level balance_dollars (the total across shards), filed under
+         DEFAULT_EXCHANGE_INDEX.
+      3. Top-level integer balance, already in CENTS (the sandbox shape),
+         filed under DEFAULT_EXCHANGE_INDEX; never run through the dollar
+         converter.
 
     Args:
         data (dict): Parsed JSON body of GET /portfolio/balance.
+        left_out (list | None): Keyword-only. If given, gets one short text per
+            breakdown entry whose cash is not returned (no readable shard or
+            balance, or the earlier of two entries for one shard). Nothing is
+            added for tiers 2 and 3, which count every shard.
 
     Returns:
-        dict[int, int]: Spendable balance in whole cents, keyed by
-            exchange_index. Callers that need a single number for Kelly
-            sizing must sum this dict themselves — sizing is deliberately
-            portfolio-wide, not per-shard.
+        dict[int, int]: Cash in whole cents by exchange_index. Callers sum it:
+            sizing is across all shards.
 
     Raises:
-        ValueError: If no balance field in the payload parses. This is the
-            deliberate loud-failure carve-out to the project's
-            return-None-on-validation-failure convention: sizing real trades
-            against an unknown balance is worse than aborting the run.
+        ValueError: If no balance field parses. A deliberate loud failure:
+            sizing real trades on an unknown balance is worse than stopping.
     """
     breakdown = data.get("balance_breakdown") or []
     by_shard: dict[int, int] = {}
-    for entry in breakdown:
+    # Entries whose cash the loop below does not count, for left_out
+    dropped: list[str] = []
+    for position, entry in enumerate(breakdown):
         try:
             # A non-dict entry raises AttributeError on .get and a missing /
             # non-numeric exchange_index raises TypeError/ValueError — a
             # malformed entry must never abort the scan of the good ones.
             idx = int(entry.get("exchange_index"))
         except (TypeError, ValueError, AttributeError):
+            dropped.append(f"entry {position} " + ("names no readable exchange_index"
+                                                   if isinstance(entry, dict)
+                                                   else "is not an object"))
             continue
         # Inside a breakdown entry "balance" is a DOLLAR STRING (unlike the
         # top-level "balance", which is integer cents) — hence the dollar
@@ -217,26 +218,28 @@ def _balance_cents_by_shard(data: dict) -> dict[int, int]:
         if cents is not None:
             if idx in by_shard:
                 # A repeated index means the payload shape changed (a
-                # per-subaccount split, say). Last-win matches the previous
-                # behaviour and is as defensible as first-win; being SILENT
-                # about it is not.
+                # per-subaccount split, say): keep the last entry, say so, and
+                # leave the earlier entry's cash uncounted.
                 logging.warning(
                     "balance_breakdown lists exchange_index %d more than once — "
                     "keeping the last entry; earlier entry discarded", idx,
                 )
+                dropped.append(f"shard {idx}: an earlier entry, replaced by a later one")
             by_shard[idx] = cents
         else:
-            # A parseable shard index with an unparseable balance means that
-            # shard's REAL funds silently vanish from sizing, the coverage
-            # audit, and the transfer planner — exactly the drift failure
-            # class this codebase keeps hitting. Under-sizing is safe, but it
-            # must never be invisible.
+            # A readable shard with an unreadable balance: its real cash drops
+            # out of sizing, the coverage check and the transfers, so warn, and
+            # name it in left_out (main.py then trims nothing this run)
             logging.warning(
                 "balance_breakdown entry for shard %d carried no parseable "
                 "balance (keys=%s) — that shard's funds are NOT counted",
                 idx, sorted(entry),
             )
+            dropped.append(f"shard {idx}: no readable balance")
     if by_shard:
+        if left_out is not None:
+            # Only here: the top-level totals the tiers below fall back to count every shard
+            left_out.extend(dropped)
         return by_shard
     if breakdown:
         # Breakdown present but nothing in it parsed: fall through to the
@@ -272,9 +275,23 @@ class AccountBalance:
     Attributes:
         shard_cash_cents (dict[int, int]): Cash in whole cents, keyed by shard number.
         positions_value_cents (int | None): The open positions' worth in whole cents; None if unreadable.
+        cash_left_out (tuple[str, ...]): One short text per balance_breakdown entry
+            whose cash is missing from shard_cash_cents (e.g. "shard 0: no
+            readable balance"); () when every entry was counted.
     """
     shard_cash_cents: dict[int, int]
     positions_value_cents: int | None
+    cash_left_out: tuple[str, ...] = ()
+
+    @property
+    def cash_complete(self) -> bool:
+        """
+        Whether the cash counts every shard entry of the reply.
+
+        Returns:
+            bool: False when cash_left_out names an entry, else True.
+        """
+        return not self.cash_left_out
 
 
 def _positions_value_cents(data: dict) -> int | None:
@@ -328,7 +345,8 @@ def read_account_balance(client: KalshiClient) -> AccountBalance:
         client (KalshiClient): A client made by build_client().
 
     Returns:
-        AccountBalance: Each shard's cash and the positions' value (None if unreadable).
+        AccountBalance: Each shard's cash, the positions' value (None if
+            unreadable) and the shard entries left out of that cash.
 
     Raises:
         ApiException: If Kalshi answers with an error status, e.g. 401 for bad credentials.
@@ -337,14 +355,17 @@ def read_account_balance(client: KalshiClient) -> AccountBalance:
     """
     # One retried read of the raw reply; an error status raises ApiException
     data = api_call_with_retry(fetch_json_page, client.get_balance_without_preload_content)
-    # The cash per shard; raises ValueError if the reply has none
-    shard_balances = _balance_cents_by_shard(data)
+    # The cash per shard (ValueError if the reply has none); entries it leaves
+    # out are named in left_out
+    left_out: list = []
+    shard_balances = _balance_cents_by_shard(data, left_out=left_out)
     logging.info(
         "Auth OK — balance by shard: %s (total $%.2f)",
         shard_balances,
         sum(shard_balances.values()) / 100,
     )
-    return AccountBalance(shard_balances, _positions_value_cents(data))
+    return AccountBalance(shard_balances, _positions_value_cents(data),
+                          cash_left_out=tuple(left_out))
 
 
 def verify_auth(client: KalshiClient) -> dict[int, int]:

@@ -34,10 +34,11 @@ Purpose:
     flatten that ticker by hand (_REMEDY); main()'s closing line never says
     to flatten on its own, since a position there could be the bot's.
 
-    It also checks the reduce-only ASK live selling sends to sell a held YES
-    (--step yes-close): it buys 0.01 YES, sells it back with that ask, and
-    PASSes only when the account reads flat and the sale's reply reports the
-    0.01 sold. Run it, and see it PASS, before turning live selling on.
+    It also checks the reduce-only ASK that live selling and live trimming
+    send to sell a held YES (--step yes-close): it buys 0.01 YES, sells it
+    back with that ask, and PASSes only when the account reads flat and the
+    sale's reply reports the 0.01 sold. See it PASS before turning live
+    selling or live trimming on.
 
     *** REAL MONEY. *** Every step here submits live orders (or moves live
     collateral) against the PRODUCTION account. Worst-case exposure is the V2
@@ -169,23 +170,19 @@ Notes:
     and the operator has typed "yes" — unless --yes was passed, which is for a
     second or third run once the operator has already seen the bodies.
 
-    EXIT CODES: 0 = the executed step PASSED, 1 = something FAILED, 2 =
-    NEUTRAL (the step could not be run to a conclusion — a TRUE kill with
-    nothing filled and the account flat, no liquidity, the OPENING confirmation
-    was declined, or a skipped transfer step, including a --dest-shard that IS
-    the source shard, refused before any POST — DR-22). A PARTIAL or
-    otherwise non-conforming fill-or-kill response is NOT neutral: it is the
-    protocol violation the probe exists to catch, so it is a FAIL that names
-    the counts and re-reads the account (DR-20). A
-    prompt declined once a position is already open (e.g. the unfillable-ask
-    step's closing confirmation) is scored FAIL, not NEUTRAL — declining to
-    close a real open position is not a neutral outcome, and the printed
-    message tells the operator to flatten it manually. Only a 0 from BOTH
-    mapping steps (--step no-mapping and --step unfillable-ask) is evidence
-    that the V2 order path may be trusted to run unsupervised, and a 0 from
-    --step yes-close is what live selling waits for. A bad argument,
-    or an ORDER_API_VERSION other than "v2", also exits 2 before any step
-    runs.
+    EXIT CODES: 0 = the step PASSED, 1 = something FAILED, 2 = NEUTRAL (no
+    conclusion: a TRUE kill with nothing filled and the account flat, no
+    liquidity, the OPENING confirmation declined, or a skipped transfer step,
+    a --dest-shard equal to the source shard included, refused before any
+    POST — DR-22). A partial or otherwise non-conforming fill-or-kill
+    response is a FAIL that names the counts and reads the account, not a
+    NEUTRAL: it is the violation the probe exists to catch (DR-20). A prompt
+    declined once a position is open is a FAIL too; its message says to
+    flatten it by hand. Only a 0 from BOTH mapping steps (--step no-mapping
+    and --step unfillable-ask) is evidence that the V2 order path may run
+    unsupervised; a 0 from --step yes-close is what live selling and live
+    trimming wait for. A bad argument, or an ORDER_API_VERSION other than
+    "v2", also exits 2 before any step runs.
 """
 import argparse
 import json
@@ -258,7 +255,9 @@ _BOTH_STEPS_MUST_PASS = (
     "Both --step no-mapping and --step unfillable-ask have to PASS before the V2 order "
     "path should be trusted to run unsupervised."
 )
-_YES_CLOSE_MUST_PASS = "--step yes-close has to PASS before live selling is turned on."
+_YES_CLOSE_MUST_PASS = (
+    "--step yes-close has to PASS before live selling or trimming is turned on."
+)
 _STEPS_MUST_PASS = f"{_BOTH_STEPS_MUST_PASS} {_YES_CLOSE_MUST_PASS}"
 # main()'s closing line after any step PASSes.
 _PASS_CLOSING = (
@@ -1502,9 +1501,9 @@ def _sale_reply_problem(data: Any) -> str | None:
     Say how the YES sale's reply fails to report the 0.01 the account shows
     sold; None when it reports fill_count 0.01 and remaining_count 0.
 
-    Live selling takes a sale's count from the reply's fill_count when it can
-    read one (trader._sale_fill_count), so the reply must report this sale;
-    remaining_count is checked too, as for the probe's buys. Never raises.
+    Live selling and trimming read a sale's count from the reply's fill_count
+    when they can (trader._sale_fill_count), so the reply must report this
+    sale; remaining_count is checked too. Never raises.
 
     Args:
         data (Any): The parsed 2xx reply to the sale.
@@ -1534,7 +1533,7 @@ def _sale_reply_problem(data: Any) -> str | None:
 
 def _step_yes_close(client: Any, ticker: str, assume_yes: bool, dest_shard: int) -> str:
     """
-    Verify the order live selling sends to sell a held YES: a reduce-only ask.
+    Verify the reduce-only ask that live selling and trimming send to sell a held YES.
 
     Against the live account, which must start FLAT on the ticker:
       1. Stop at NEUTRAL, before submitting anything, unless the order book
@@ -1549,10 +1548,10 @@ def _step_yes_close(client: Any, ticker: str, assume_yes: bool, dest_shard: int)
       5. With the account flat, the sale's reply must report fill_count 0.01
          and remaining_count 0 (_sale_reply_problem), else FAIL.
 
-    Each submission error is handled after its except clause has ended, so a
-    position read made then cannot pick the error up as its cause: the retried
-    read would take a fatal lookup error for a network fault and wait out its
-    backoff.
+    Each submission error is handled after its except clause ends, so a
+    position read then cannot inherit the error as its cause (the retried
+    read would mistake a fatal lookup error for a network fault and wait out
+    its backoff).
 
     Args:
         client (Any): Authenticated prod KalshiClient.
@@ -1747,9 +1746,10 @@ def _step_yes_close(client: Any, ticker: str, assume_yes: bool, dest_shard: int)
         f"({after})."
     )
 
-    # The order under test: the reduce-only ask live selling sends.
+    # The order under test: the reduce-only ask live selling and live trimming send.
     close_body = _yes_close_body(market)
-    _emit("REQUEST BODY (YES sale — the reduce-only ask live selling sends)", close_body)
+    _emit("REQUEST BODY (YES sale — the reduce-only ask live selling and trimming send)",
+          close_body)
     if not _confirm(
         assume_yes,
         f"Submit an {close_body['side'].upper()} on {ticker} for {PROBE_COUNT_STR} "
@@ -1806,18 +1806,19 @@ def _step_yes_close(client: Any, ticker: str, assume_yes: bool, dest_shard: int)
         print(
             f"{_FAIL}: the reduce-only ask returned the account to flat, so the {after} YES "
             f"was sold and there is nothing to flatten — but {reply_problem}. Live selling "
-            "takes the number a sale sold from its reply's fill_count when it can read "
-            "one (trader._sale_fill_count), and reads the account only when it cannot, so "
-            "do not turn live selling on until this reply is understood."
+            "and live trimming take the number a sale sold from its reply's fill_count "
+            "when they can read one (trader._sale_fill_count), and read the account only "
+            "when they cannot, so do not turn live selling or trimming on until this reply "
+            "is understood."
         )
         return _FAIL
 
     print(
         f"{_PASS}: a fill-or-kill bid opened a YES position, a reduce-only "
         "immediate-or-cancel ask sold it back to flat, and the sale's reply reported the "
-        f"{PROBE_COUNT_STR} sold. The order live selling sends for a held YES "
-        "(trader._build_sale_order_v2), and the fill_count it reads from the reply, are "
-        "confirmed against the live API."
+        f"{PROBE_COUNT_STR} sold. The order live selling and live trimming send for a "
+        "held YES (trader._build_sale_order_v2), and the fill_count they read from the "
+        "reply, are confirmed against the live API."
     )
     return _PASS
 
@@ -2036,13 +2037,13 @@ def main(argv: list | None = None) -> int:
         argv (list | None): Argument vector for testing. None reads sys.argv.
 
     Returns:
-        int: 0 when the step PASSED, 1 when it FAILED, 2 when it was NEUTRAL
-            (no verdict reached — a TRUE kill with the account flat, no
-            liquidity, skipped, or aborted at the confirmation prompt; a
-            partial or otherwise non-conforming fill-or-kill response is a
-            FAIL, not a NEUTRAL — DR-20). Only a 0 from BOTH no-mapping and
-            unfillable-ask is evidence that the V2 order path may be trusted
-            to run unsupervised; a 0 from yes-close is what live selling waits for.
+        int: 0 when the step PASSED, 1 when it FAILED, 2 when NEUTRAL (no
+            verdict: a TRUE kill on a flat account, no liquidity, skipped, or
+            declined at the opening confirmation; a non-conforming
+            fill-or-kill response is a FAIL — DR-20). Only a 0 from BOTH
+            no-mapping and unfillable-ask is evidence that the V2 order path
+            may run unsupervised; a 0 from yes-close is what live selling and
+            live trimming wait for.
 
     Raises:
         SystemExit: Status 2 on an invalid argument or on any
@@ -2052,9 +2053,9 @@ def main(argv: list | None = None) -> int:
         prog="python3 -m kalshi_betting.v2_probe",
         description=(
             "Live verification probe for the V2 order path's NO-leg mapping and for the "
-            "reduce-only ask live selling sends. SUBMITS REAL ORDERS against the production "
-            "account (0.01 contracts, ~1c of exposure). Run by hand; never wired into the "
-            "pipeline."
+            "reduce-only ask live selling and live trimming send. SUBMITS REAL ORDERS "
+            "against the production account (0.01 contracts, ~1c of exposure). Run by "
+            "hand; never wired into the pipeline."
         ),
     )
     parser.add_argument(
@@ -2068,8 +2069,8 @@ def main(argv: list | None = None) -> int:
         "--step", choices=sorted(_STEPS), default="no-mapping",
         help=(
             "Which check to run. Default: no-mapping (the V2 gate itself). yes-close buys "
-            "0.01 YES and sells it with the reduce-only ask live selling sends; run it "
-            "before turning selling on."
+            "0.01 YES and sells it with the reduce-only ask live selling and live trimming "
+            "send; run it before turning selling or trimming on."
         ),
     )
     parser.add_argument(

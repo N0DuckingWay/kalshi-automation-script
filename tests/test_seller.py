@@ -8,8 +8,14 @@ same verdict at 50%, at the highest 1% level the backtest sells at, and at
 the level just above it. Everything runs offline: the exchange reads
 (order books, candles, settlements, market lookups) are stubs on the seller
 module, and the client is a MagicMock that is never called.
+
+seller.plan_trims (selling part of a held pair that has outgrown the size the
+Kelly rule allows) is checked the same way: one pair, live and in the
+backtest, must sell the count backtester._kelly_trim sells. Its 7-day wait
+after a trade is tested on each of the 8 days after a purchase.
 """
 import ast
+import dataclasses
 import inspect
 import logging
 import math
@@ -17,13 +23,15 @@ import sys
 from dataclasses import replace as dc_replace
 from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from kalshi_betting import backtester, config, seller
+from kalshi_betting import backtester, config, depth_model, seller
 from kalshi_betting.config import fee_leg_exact
 from kalshi_betting.scanner import (
     ApiMarket,
+    FillTimes,
     HeldPosition,
     Settlement,
     leg_sides,
@@ -90,6 +98,9 @@ class _World:
         lookup (dict): Ticker -> market the exchange returns on a lookup.
         calls (dict): Every stubbed read made, by kind ("min_ts": each
             settlements call's window).
+        fills (FillTimes | None): When each market last traded (None: the
+            account's list of fills, its completed trades, cannot be read).
+        fill_reads (int): How many times that list was read.
     """
 
     def __init__(self) -> None:
@@ -104,6 +115,8 @@ class _World:
         self.lookup: dict = {}
         self.calls: dict = {"book": [], "candles": [], "settlements": 0, "lookup": [],
                             "min_ts": []}
+        self.fills: FillTimes | None = None
+        self.fill_reads = 0
 
     def list(self, market: ApiMarket) -> None:
         """Put a market in this run's market list."""
@@ -161,6 +174,46 @@ class _World:
         # Every read went through a stub: the client itself is never touched
         assert client.mock_calls == []
         return plans
+
+    def trims(self, monkeypatch, settings: config.LiveSettings | None = None, *,
+              now: datetime = _NOW, cash_cents: float = 5_000,
+              positions_value_cents: float | None = 5_000, skip=frozenset(),
+              labels: dict | None = None) -> list:
+        """Run seller.plan_trims against this world, its reads stubbed and recorded.
+
+        By default trimming is on with no minimum price rise, with $50 of cash and
+        $50 as Kalshi's value of the open positions."""
+        def book(client, ticker):
+            self.calls["book"].append(ticker)
+            return self.books.get(ticker)
+
+        def candles(client, ticker, event_ticker, start, end):
+            self.calls["candles"].append((ticker, event_ticker, start, end))
+            return self.candles.get(ticker)
+
+        def fills(client):
+            self.fill_reads += 1
+            return self.fills
+
+        monkeypatch.setattr(seller, "_fetch_orderbook", book)
+        monkeypatch.setattr(seller, "recent_candles", candles)
+        monkeypatch.setattr(seller, "get_fill_times", fills)
+        client = MagicMock()
+        plans = seller.plan_trims(
+            client, dict(self.positions), self.labels() if labels is None else labels,
+            dict(self.markets), settings=_trim_settings() if settings is None else settings,
+            now=now, cash_cents=cash_cents, positions_value_cents=positions_value_cents,
+            skip=skip)
+        # Every read went through a stub: the client itself is never touched
+        assert client.mock_calls == []
+        return plans
+
+
+def _trim_settings(*, k: float = 0.8, cap: float = 1.0, st_cap: float = 0.2,
+                   min_rise: float | None = None, on: bool = True) -> config.LiveSettings:
+    """The run's settings with the Kelly trim on (or off), and its k, caps and minimum rise."""
+    return dc_replace(config.live_settings(), trim_to_kelly=on, trim_min_rise=min_rise,
+                      interval_discount=k, size_cap=cap, same_title_size_cap=st_cap)
 
 
 # ─── The same position, in the backtest and live ──────────────────────────────
@@ -957,20 +1010,1222 @@ class TestHeldPairsQuietForSelling:
             assert caplog.records == []
 
 
+# ─── Trimming a held pair to its Kelly size ───────────────────────────────────
+
+# When the standard pair last traded: the previous Monday's run, 7 days before _NOW
+_BOUGHT = datetime.fromtimestamp(_FIRST, UTC)
+# The oldest fill in the account's list: 30 days back, so the list covers the wait
+_LONG_AGO = _NOW - timedelta(days=30)
+_PACIFIC = ZoneInfo("America/Los_Angeles")
+
+# The standard time-series pair's quotes at the run, (YES ask, NO ask) per
+# market. It holds YES on A (best YES bid 0.42) and NO on B (best NO bid 0.52),
+# so one contract pair sells for $0.94 before the fee
+_A_NOW = (0.44, 0.58)
+_B_NOW = (0.48, 0.53)
+
+
+def _fills(latest: dict | None = None, oldest: datetime | None = _LONG_AGO) -> FillTimes:
+    """The account's fill times, as scanner.get_fill_times returns them."""
+    return FillTimes(latest=dict(latest or {}), oldest=oldest)
+
+
+def _ladder_model(levels) -> depth_model.DepthModel:
+    """A depth model whose every bid ladder holds `levels`: (distance below
+    the best bid, contracts), each distance one of DEPTH_MODEL_DISTANCES."""
+    ladder = [[round(0.50 - distance, 2), contracts] for distance, contracts in levels]
+    model = depth_model.fit([{"ticker": "L", "taken_at": "2026-09-28T16:00:00Z",
+                              "volume_24h": 400.0, "yes": ladder, "no": ladder}])
+    assert model is not None
+    return model
+
+
+class _TrimCase:
+    """
+    One exact held pair (two markets, YES on one and NO on the other, equal
+    counts) built twice: as a backtest trade priced from its candles, and as
+    the live account holding it. The live order books' best bids are the
+    candles' at the backtest's checkpoint, and both read the same candles.
+    The pair was bought, and last traded, at the previous Monday's run.
+
+    Attributes:
+        n (int): Contract pairs held.
+        trade (BacktestTrade): The pair as the backtest holds it.
+        world (_World): The live account and exchange.
+        positions_cents (int): What Kalshi values the open positions at, in cents.
+    """
+
+    def __init__(self, pair_type: str = "time_series", a_now: tuple = _A_NOW,
+                 b_now: tuple = _B_NOW, *, n: int = 30, a_then: tuple | None = None,
+                 b_then: tuple | None = None, model=None, price_a: float = 0.30,
+                 price_b: float = 0.40, positions_cents: int = 5_000) -> None:
+        self.n = n
+        self.positions_cents = positions_cents
+        self.side_a, self.side_b = leg_sides(pair_type)
+        if pair_type == "time_series":
+            market_a = _rung(_A, _EV_A, "Jan 20, 2026", _A_CLOSE)
+            market_b = _rung(_B, _EV_B, "Jan 25, 2026", _B_CLOSE)
+        else:
+            # One question listed on two series, both closing at one moment
+            market_a = _rung(_A, _EV_A, "", _B_CLOSE, title="Who wins the game?",
+                             subtitle="Team A")
+            market_b = _rung(_B, _EV_B, "", _B_CLOSE, title="Who wins the game?",
+                             subtitle="Team A")
+        candles_a = [_candle(_FIRST, *(a_then or a_now)), _candle(_CK, *a_now)]
+        candles_b = [_candle(_FIRST, *(b_then or b_now)), _candle(_CK, *b_now)]
+        # The backtest: one trade, each market's quotes from its candles
+        quotes_a, _ = backtester._leg_quotes(
+            {"ticker": _A, "settlement_ts": "2026-02-20T12:00:00+00:00", "result": "no"},
+            candles_a, _START, model)
+        quotes_b, _ = backtester._leg_quotes(
+            {"ticker": _B, "settlement_ts": "2026-02-25T12:00:00+00:00", "result": "yes"},
+            candles_b, _START, model)
+        fee_a, fee_b = fee_leg_exact(n, price_a), fee_leg_exact(n, price_b)
+        self.trade = backtester.BacktestTrade(
+            pair_type=pair_type, ticker_a=_A, ticker_b=_B, title_a="", title_b="",
+            category="Other", entry_date=date(2026, 1, 5), exit_date=date(2026, 2, 25),
+            entry_pA=price_a, entry_pB=1 - price_b, entry_nA=1 - price_a, entry_nB=price_b,
+            n=n, total_cost=n * price_a + n * price_b, fees=fee_a + fee_b,
+            outcome_a="no", outcome_b="yes", actual_payoff=0.0, profit=0.0,
+            profit_ratio=0.0, monthly_profit_ratio=0.0, kelly_fraction=0.1,
+            expected_payoff=0.0, slippage=0.0, holding_days=10, balance_at_entry=10_000.0,
+            close_date_a=_A_CLOSE.date(), close_date_b=_B_CLOSE.date(),
+            marks=(quotes_a, quotes_b))
+        # Live: the same two markets held, with both sides of both books
+        self.world = _World()
+        signed = {"yes": n, "no": -n}
+        self.world.hold(market_a, signed[self.side_a], n * price_a, fee_a)
+        self.world.hold(market_b, signed[self.side_b], n * price_b, fee_b)
+        for ticker, quotes, held_side, (yes_ask, no_ask) in (
+                (_A, quotes_a, self.side_a, a_now), (_B, quotes_b, self.side_b, b_now)):
+            # A side's best bid is 1 minus the other side's ask, as a candle shows it
+            best = {"yes": round(1.0 - no_ask, 6), "no": round(1.0 - yes_ask, 6)}
+            book = {}
+            for side in ("yes", "no"):
+                fresh = quotes.bid_at_checkpoint(_D, side)
+                # Where the backtest has a bid, the book's best bid is that very number
+                assert fresh != fresh or fresh == best[side]
+                # The side held gets the backtest's modeled bid ladder when it has
+                # one, else one deep bid, as the backtest sells
+                ladder = quotes.sale_ladder(_D, best[side]) if side == held_side else None
+                book[side] = ladder if ladder is not None else [[best[side], 100_000.0]]
+            self.world.books[ticker] = book
+        self.world.candles = {_A: candles_a, _B: candles_b}
+        self.world.fills = _fills({_A: _BOUGHT, _B: _BOUGHT})
+
+    def value(self, value_cents: int) -> float:
+        """The portfolio value, in dollars, that plan_trims sizes on for `value_cents` in all."""
+        return (value_cents - self.positions_cents) / 100 + self.positions_cents / 100
+
+    def backtest(self, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
+                 st_cap: float = 0.2):
+        """backtester._kelly_trim's (decision, sale) for the pair at one portfolio value."""
+        return backtester._kelly_trim([self.trade], _D, self.value(value_cents), k, cap, st_cap)
+
+    def live(self, monkeypatch, value_cents: int, *, k: float = 0.8, cap: float = 1.0,
+             st_cap: float = 0.2, min_rise: float | None = None, **kwargs) -> list:
+        """seller.plan_trims' plans for the pair at the same portfolio value."""
+        return self.world.trims(
+            monkeypatch, _trim_settings(k=k, cap=cap, st_cap=st_cap, min_rise=min_rise),
+            cash_cents=value_cents - self.positions_cents,
+            positions_value_cents=self.positions_cents, **kwargs)
+
+
+# Each case: (pair builder, portfolio value in cents, caps). Live and the
+# backtest must sell the same number of contract pairs
+_TRIM_PARITY_CASES = {
+    # Worth $27 of a $100 portfolio under a 10% cap: sold down to the cap
+    "a time-series pair past its size cap": (
+        lambda: _TrimCase(), 10_000, {"cap": 0.10}),
+    # No cap in the way: Kelly's own share of a $50 portfolio is the limit
+    "a time-series pair past its Kelly share, under its cap": (
+        lambda: _TrimCase(a_now=(0.30, 0.72), b_now=(0.62, 0.40)), 5_000, {}),
+    "a time-series pair within its share": (
+        lambda: _TrimCase(), 100_000, {}),
+    # NO on A (best NO bid 0.50) and YES on B (best YES bid 0.40): held to the
+    # 20% same-title cap of a $100 portfolio
+    "a same-title pair past its size cap": (
+        lambda: _TrimCase("same_title", a_now=(0.50, 0.52), b_now=(0.42, 0.60)), 10_000, {}),
+    # Selling returns more than the pair is expected to pay: nothing is kept
+    "a converged same-title pair": (
+        lambda: _TrimCase("same_title", a_now=(0.03, 0.98), b_now=(0.03, 0.98)), 10_000, {}),
+    # Market A's YES ask (0.40) sits below its own YES bid (0.45)
+    "a crossed book": (
+        lambda: _TrimCase(a_now=(0.40, 0.55)), 10_000, {"cap": 0.10}),
+    # The bids hold 14 contracts a market, fewer than the 19 the best bids want sold
+    "a thin ladder": (
+        lambda: _TrimCase(model=_ladder_model(((0.0, 5.0), (0.01, 5.0), (0.02, 4.0)))),
+        10_000, {"cap": 0.10}),
+    # Five contracts at each best bid, the rest 20c below: the deepest level the
+    # backtest models, which live must still sell into
+    "a ladder that reaches its last modeled distance": (
+        lambda: _TrimCase(b_now=(0.45, 0.56),
+                          model=_ladder_model(((0.0, 5.0), (0.20, 100.0)))),
+        10_000, {"cap": 0.10}),
+    # A YES bid of 1c: a candle's NO ask of 0.99 is no quote, so neither side sees a bid
+    "a 1c YES bid on market A": (
+        lambda: _TrimCase(a_now=(0.02, 0.99)), 10_000, {"cap": 0.10}),
+    "a 1c YES bid on market B": (
+        lambda: _TrimCase(b_now=(0.02, 0.99)), 10_000, {"cap": 0.10}),
+}
+
+# What each case sells (none, part or all of the pair), so no case passes by
+# selling nothing on both paths
+_TRIM_PARITY_SELLS = {
+    "a time-series pair past its size cap": "part",
+    "a time-series pair past its Kelly share, under its cap": "part",
+    "a time-series pair within its share": "none",
+    "a same-title pair past its size cap": "part",
+    "a converged same-title pair": "all",
+    "a crossed book": "none",
+    "a thin ladder": "part",
+    "a ladder that reaches its last modeled distance": "part",
+    "a 1c YES bid on market A": "none",
+    "a 1c YES bid on market B": "none",
+}
+
+
+class TestTrimParityWithTheBacktest:
+    """seller.plan_trims sells the count backtester._kelly_trim sells of the same
+    pair at the same quotes, portfolio value, k and caps, and values the sale alike."""
+
+    @pytest.mark.parametrize("name", list(_TRIM_PARITY_CASES))
+    def test_the_same_count_and_the_same_sale(self, monkeypatch, name):
+        build, value_cents, caps = _TRIM_PARITY_CASES[name]
+        case = build()
+        decision, sale = case.backtest(value_cents, **caps)
+        plans = case.live(monkeypatch, value_cents, **caps)
+        assert [plan.count for plan in plans] == ([decision.sell] if decision.sell else [])
+        expected = {"none": 0, "all": case.n}.get(_TRIM_PARITY_SELLS[name])
+        if expected is None:
+            assert 0 < decision.sell < case.n, name
+        else:
+            assert decision.sell == expected, name
+        if not decision.sell:
+            return
+        (plan,) = plans
+        assert plan.kind == config.SALE_KIND_KELLY_TRIM and plan.level is None
+        # Each leg's count is the part sold; its `held` is what the account holds
+        assert [(leg.count, leg.held) for leg in plan.legs] == [(decision.sell, case.n)] * 2
+        # The backtest's own valuation of selling that many
+        sold, per_trade = sale
+        assert sold == [decision.sell]
+        ((sale_value, _fees, (price_a, price_b)),) = per_trade
+        _, value, cost, potential = backtester._position_sale_value(
+            [case.trade], _D, sold=[decision.sell])
+        assert plan.proceeds_dollars == pytest.approx(sale_value, abs=1e-9)
+        assert plan.proceeds_dollars == pytest.approx(value, abs=1e-9)
+        assert plan.cost_dollars == pytest.approx(cost, abs=1e-9)
+        assert plan.profits == ((pytest.approx(value - cost, abs=1e-9),
+                                 pytest.approx(potential - cost, abs=1e-9)),)
+        assert plan.walked[_A][0] == pytest.approx(price_a, abs=1e-12)
+        assert plan.walked[_B][0] == pytest.approx(price_b, abs=1e-12)
+
+    def test_a_thin_ladder_sells_fewer_than_the_best_bids_want(self, monkeypatch):
+        # With deep bids the same pair sells 19; the thin ladder's 14 contracts a
+        # market hold it to 14
+        _, value_cents, caps = _TRIM_PARITY_CASES["a thin ladder"]
+        deep = _TrimCase().backtest(value_cents, **caps)[0].sell
+        thin_case = _TRIM_PARITY_CASES["a thin ladder"][0]()
+        thin = thin_case.backtest(value_cents, **caps)[0].sell
+        assert (deep, thin) == (19, 14)
+        (plan,) = thin_case.live(monkeypatch, value_cents, **caps)
+        assert plan.count == 14
+        # The walk reached the ladder's third level on both markets
+        assert plan.walked[_A][1] == pytest.approx(0.40) and plan.walked[_B][1] == pytest.approx(0.50)
+        assert plan.walked[_A][0] < 0.42 and plan.walked[_B][0] < 0.52
+
+    def test_the_deepest_level_the_backtest_models_is_walked_live(self, monkeypatch):
+        # Each side's second level sits exactly 20c below its best bid. In floats
+        # 0.55 - 0.20 is a hair above 0.35, so the live cut needs its float-noise
+        # allowance to keep B's level: 15 sold, as in the backtest, not 5
+        build, value_cents, caps = _TRIM_PARITY_CASES[
+            "a ladder that reaches its last modeled distance"]
+        case = build()
+        assert case.world.books[_A]["yes"] == [[0.42, 5.0], [0.22, 100.0]]
+        assert case.world.books[_B]["no"] == [[0.55, 5.0], [0.35, 100.0]]
+        assert 0.55 - seller.KELLY_TRIM_MAX_BID_DROP > 0.35
+        (plan,) = case.live(monkeypatch, value_cents, **caps)
+        assert plan.count == case.backtest(value_cents, **caps)[0].sell == 15
+        assert plan.walked[_A][1] == pytest.approx(0.22)
+        assert plan.walked[_B][1] == pytest.approx(0.35)
+        assert plan.ladders == {_A: [[0.42, 5.0], [0.22, 100.0]],
+                                _B: [[0.55, 5.0], [0.35, 100.0]]}
+
+    @pytest.mark.parametrize("ticker, side, book, sells, lowest", [
+        # One contract at the best bid, then nothing until a stub bid far below
+        (_A, "yes", [[0.42, 1.0], [0.02, 100_000.0]], 1, 0.42),
+        (_A, "yes", [[0.42, 5.0], [0.10, 100_000.0]], 5, 0.42),
+        # A bid exactly the reach below the best bid is still walked; a cent lower is not
+        (_A, "yes", [[0.42, 1.0], [0.22, 100_000.0]], 17, 0.22),
+        (_A, "yes", [[0.42, 1.0], [0.21, 100_000.0]], 1, 0.42),
+        (_B, "no", [[0.52, 1.0], [0.32, 100_000.0]], 17, 0.32),
+        (_B, "no", [[0.52, 1.0], [0.31, 100_000.0]], 1, 0.52),
+    ])
+    def test_a_trim_does_not_sell_into_a_gap_under_the_best_bid(
+            self, monkeypatch, ticker, side, book, sells, lowest):
+        # The backtest's modeled ladder ends 20c below the best bid. Live leaves
+        # out bids further down and sells only what the bids within reach hold
+        # (the best bids alone would sell 19)
+        assert seller.KELLY_TRIM_MAX_BID_DROP == config.DEPTH_MODEL_DISTANCES[-1] == 0.20
+        case = _TrimCase()
+        case.world.books[ticker][side] = book
+        (plan,) = case.live(monkeypatch, 10_000, cap=0.10)
+        assert plan.count == sells
+        assert [leg.count for leg in plan.legs] == [sells, sells]
+        assert plan.walked[ticker][1] == pytest.approx(lowest)
+        # The ladder the trader prices the second order on ends there too
+        assert min(price for price, _size in plan.ladders[ticker]) == pytest.approx(lowest)
+        assert all(price >= 0.42 - 0.20 - 1e-9 for price, _size in plan.ladders[_A])
+        # The other market sells at its one deep best bid
+        other = _B if ticker == _A else _A
+        assert plan.walked[other][0] == plan.walked[other][1]
+
+    def test_the_reach_under_the_best_bid_is_sellers_own_binding(self, monkeypatch):
+        # Widened to 40c, the reach takes in the stub bid at 2c and 12 pairs are
+        # sold into it: the sale the 20c reach exists to stop
+        case = _TrimCase()
+        case.world.books[_A]["yes"] = [[0.42, 1.0], [0.02, 100_000.0]]
+        monkeypatch.setattr(seller, "KELLY_TRIM_MAX_BID_DROP", 0.40)
+        (plan,) = case.live(monkeypatch, 10_000, cap=0.10)
+        assert plan.count == 12 and plan.walked[_A][1] == pytest.approx(0.02)
+        # A reach of 0 sells only at the best bid's own price
+        monkeypatch.setattr(seller, "KELLY_TRIM_MAX_BID_DROP", 0)
+        (plan,) = case.live(monkeypatch, 10_000, cap=0.10)
+        assert plan.count == 1 and plan.ladders[_A] == [[0.42, 1.0]]
+        # A value that is no distance stops the plan, before any order exists
+        monkeypatch.setattr(seller, "KELLY_TRIM_MAX_BID_DROP", None)
+        with pytest.raises(ValueError, match="KELLY_TRIM_MAX_BID_DROP"):
+            case.live(monkeypatch, 10_000, cap=0.10)
+
+    def test_the_live_price_rise_is_the_backtests(self, monkeypatch):
+        # The pair's total price (YES ask on A plus NO ask on B) was 0.77 when
+        # bought and is 0.97 now. The backtest reads both from candles; live
+        # reads "then" from the candle at the last fill and "now" from the books
+        case = _TrimCase(a_then=(0.34, 0.68), b_then=(0.58, 0.43))
+        expected = backtester._price_rise([case.trade], _D, {})
+        assert expected == pytest.approx(0.20, abs=1e-9)
+        measured = []
+        real = seller.pair_price_rise
+
+        def spy(then, now):
+            measured.append(real(then, now))
+            return measured[-1]
+
+        monkeypatch.setattr(seller, "pair_price_rise", spy)
+        # A 20c rise meets a 20c minimum, on both paths
+        assert config.trim_rise_reached(expected, 0.20)
+        (plan,) = case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.20)
+        assert measured == [pytest.approx(expected, abs=1e-9)]
+        assert plan.count == case.backtest(10_000, cap=0.10)[0].sell == 19
+        # ... and falls short of a 25c one, on both paths
+        assert not config.trim_rise_reached(expected, 0.25)
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.25) == []
+        # Each market's price then comes from its candles over the week before the last fill
+        week = config.TRIM_PRICE_THEN_MAX_AGE_DAYS * _DAY
+        assert case.world.calls["candles"][:2] == [
+            (_A, _EV_A, _FIRST - week - 3600, _FIRST), (_B, _EV_B, _FIRST - week - 3600, _FIRST)]
+
+
+# ─── The wait after a trade, however often the bot runs ───────────────────────
+
+def _pacific(month: int, day: int, hour: int, minute: int = 0) -> datetime:
+    """A moment of 2026 on the bot's own clock (Los Angeles time)."""
+    return datetime(2026, month, day, hour, minute, tzinfo=_PACIFIC)
+
+
+def _waiting_case(*fills_at: datetime, only: str | None = None) -> _TrimCase:
+    """The standard pair (19 of 30 trimmed under a 10% cap once rested), last
+    traded at the latest of `fills_at`: on both markets, or on `only` that one
+    (the other then at the earliest)."""
+    case = _TrimCase()
+    first, last = min(fills_at), max(fills_at)
+    latest = {_A: last, _B: last}
+    if only is not None:
+        latest = {_A: first, _B: first, only: last}
+    case.world.fills = _fills(latest, oldest=first - timedelta(days=30))
+    return case
+
+
+def _trims_at(case: _TrimCase, monkeypatch, now: datetime) -> list:
+    """The run's trims at `now`, sized so the standard pair sells once it has rested."""
+    return case.live(monkeypatch, 10_000, cap=0.10, now=now)
+
+
+class TestTrimWaitAtAnyFrequency:
+    """A pair is trimmed only once 7 calendar days (KELLY_TRIM_MIN_DAYS_SINCE_TRADE),
+    on the bot's own clock, have passed since the last fill on either market.
+    The rule compares two dates and reads only the schedule's time zone, never its
+    run days, so it holds however often the bot runs."""
+
+    @pytest.mark.parametrize("days_after", range(1, 9))
+    def test_a_run_on_each_of_the_eight_days_after_a_purchase(self, monkeypatch, caplog,
+                                                              days_after):
+        # Bought Tuesday January 6 at 10:00; a run at 09:00 on each later day
+        case = _waiting_case(_pacific(1, 6, 10))
+        with caplog.at_level(logging.INFO):
+            plans = _trims_at(case, monkeypatch, _pacific(1, 6 + days_after, 9))
+        # Days 1 to 6: left alone. Day 7 (the next Tuesday) and day 8: trimmed
+        assert bool(plans) == (days_after >= 7)
+        if plans:
+            assert plans[0].count == 19
+            assert f"last traded 2026-01-06, {days_after} day(s) ago" in caplog.text
+        else:
+            assert (f"it last traded 2026-01-06, {days_after} day(s) ago, and a trim waits "
+                    "until 7 day(s) have passed") in caplog.text
+            # Refused before any order book is read
+            assert case.world.calls["book"] == []
+
+    @pytest.mark.parametrize("what, only", [
+        ("an add-on (a fill on both markets)", None),
+        ("a trim (a fill on both markets)", None),
+        ("a fill by hand on market A alone", _A),
+        ("a fill by hand on market B alone", _B),
+    ])
+    def test_any_fill_on_day_three_moves_the_first_trim_to_day_ten(self, monkeypatch, what,
+                                                                    only):
+        # Bought on January 6; on January 9 (day 3) the pair trades again.
+        # Kalshi's fills list does not say why, and the rule does not ask
+        case = _waiting_case(_pacific(1, 6, 10), _pacific(1, 9, 14), only=only)
+        for day, trims in ((13, False), (15, False), (16, True), (17, True)):
+            assert bool(_trims_at(case, monkeypatch, _pacific(1, day, 9))) == trims, (what, day)
+
+    def test_a_second_run_the_same_day_sees_the_firsts_fills(self, monkeypatch):
+        case = _waiting_case(_pacific(1, 6, 10))
+        morning = _pacific(1, 13, 9)
+        assert _trims_at(case, monkeypatch, morning)
+        # The morning run's trim filled at 09:01 on both markets
+        case.world.fills = _fills({_A: morning + timedelta(minutes=1),
+                                   _B: morning + timedelta(minutes=1)})
+        assert _trims_at(case, monkeypatch, _pacific(1, 13, 15)) == []
+        # ... and the pair rests again until the same weekday a week later
+        assert _trims_at(case, monkeypatch, _pacific(1, 19, 15)) == []
+        assert _trims_at(case, monkeypatch, _pacific(1, 20, 6))
+
+    def test_late_evening_to_just_after_midnight_counts_calendar_days(self, monkeypatch):
+        # A fill at 11:50pm on January 5; a run at 12:10am seven dates later is
+        # allowed (a little under 7 x 24 hours), six dates later is not
+        case = _waiting_case(_pacific(1, 5, 23, 50))
+        assert _trims_at(case, monkeypatch, _pacific(1, 11, 0, 10)) == []
+        assert _trims_at(case, monkeypatch, _pacific(1, 12, 0, 10))
+
+    def test_an_evening_fill_belongs_to_its_pacific_day(self, monkeypatch):
+        # A fill at 6pm Pacific on Monday January 5 is already Tuesday in UTC;
+        # the run at 9am the next Monday still finds seven days gone
+        bought = _pacific(1, 5, 18)
+        assert bought.astimezone(UTC).date() == date(2026, 1, 6)
+        case = _waiting_case(bought)
+        assert _trims_at(case, monkeypatch, _pacific(1, 12, 9))
+
+    def test_the_days_follow_the_schedules_own_zone(self, monkeypatch):
+        # The same moments with the bot's clock set to UTC: the 6pm Pacific fill
+        # is a Tuesday there, so the next Monday morning is only six days on
+        utc_run = config.ScheduledRun(weekday=0, hour=9, minute=0, timezone="UTC")
+        evening = _waiting_case(_pacific(1, 5, 18))
+        late = _waiting_case(_pacific(1, 5, 23, 50))
+        # The reverse, allowed on UTC's clock but not Pacific's: a fill at 3pm
+        # Pacific on January 5, a run at 5pm Pacific on January 11 (12th in UTC)
+        afternoon = _waiting_case(_pacific(1, 5, 15))
+        assert _trims_at(afternoon, monkeypatch, _pacific(1, 11, 17)) == []
+        monkeypatch.setattr(seller, "SCHEDULED_RUN", utc_run)
+        assert _trims_at(evening, monkeypatch, _pacific(1, 12, 9)) == []
+        assert _trims_at(late, monkeypatch, _pacific(1, 12, 0, 10)) == []
+        assert _trims_at(afternoon, monkeypatch, _pacific(1, 11, 17))
+        # config's own schedule is not what the seller reads
+        assert config.SCHEDULED_RUN.timezone == "America/Los_Angeles"
+
+
+# ─── plan_trims: each gate and each step ──────────────────────────────────────
+
+_NO_READS = {"book": [], "candles": [], "settlements": 0, "lookup": [], "min_ts": []}
+_PAIR_TEXT = f"YES {_A} / NO {_B}"
+
+
+def _warnings(caplog) -> list[str]:
+    """Every WARNING line logged."""
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def _weather_sell(n: int, value: float, cap: float) -> int:
+    """What config.kelly_trim_count sells of an `n`-pair _weather_pair at its default
+    bids (0.42 YES, 0.52 NO) and k 0.8, on `value` dollars under a size cap of `cap`."""
+    win = config.held_pair_win_prob("time_series", 0.44, 0.58, 0.48, 0.53, 0.8)
+    top = 0.42 + 0.52 - config.fee_per_pair_approx(0.42, 0.52)
+
+    def net_sale(pairs):
+        return (pairs * 0.42 - fee_leg_exact(pairs, 0.42)
+                + pairs * 0.52 - fee_leg_exact(pairs, 0.52))
+
+    return config.kelly_trim_count(n, value, win, cap, top, net_sale).sell
+
+
+def _weather_pair(world: _World, name: str, n: int, *, quotes: bool = True,
+                  yes_bid: str = "0.42", no_bid: str = "0.52") -> tuple[str, str]:
+    """Hold one more time-series pair on a ladder of its own and return its tickers:
+    YES on the January 20 market, NO on the January 25 one, `n` contracts each.
+    Each held side's book is deep at its best bid (`yes_bid` for YES, `no_bid` for NO);
+    with `quotes` the market list shows those bids too."""
+    tickers = []
+    for day, close, held, count in ((20, _A_CLOSE, "yes", n), (25, _B_CLOSE, "no", -n)):
+        ticker, event = f"KX{name.upper()}{day}-26", f"KX{name.upper()}{day}"
+        market = ApiMarket(
+            ticker=ticker, event_ticker=event, title=f"Will it {name} by Jan {day}, 2026?",
+            subtitle="", status="active", close_time=close,
+            # The list's YES bid, and the YES ask whose complement is the NO bid
+            yes_bid_dollars=yes_bid if quotes else None,
+            yes_ask_dollars=str(round(1 - float(no_bid), 4)) if quotes else None)
+        world.hold(market, count, n * 0.35, 0.50)
+        # The side not held: A's NO bid (so its YES ask is 0.44) and B's YES bid
+        other = "0.56" if held == "yes" else "0.47"
+        world.books[ticker] = {"yes": [[yes_bid if held == "yes" else other, "100000"]],
+                               "no": [[no_bid if held == "no" else other, "100000"]]}
+        tickers.append(ticker)
+    return tickers[0], tickers[1]
+
+
+class TestPlanTrims:
+    """seller.plan_trims: nothing is trimmed unless every run-wide check passes,
+    each pair stops at its first failed step with one line saying why, and a
+    plan names the contracts sold apart from those held."""
+
+    def test_the_standard_pair_is_sold_down_to_its_cap(self, monkeypatch, caplog):
+        case = _TrimCase()
+        with caplog.at_level(logging.INFO):
+            (plan,) = case.live(monkeypatch, 10_000, cap=0.10)
+        lines = [r.getMessage() for r in caplog.records]
+        assert ("Kelly trim sizes on $100.00 = cash $50.00 + open positions $50.00 "
+                "(Kalshi's value $50.00; $0.00 at this run's bids)") in lines
+        assert ("Kelly trim: a pair is looked at once 7 day(s) have passed since its last "
+                "trade, counted in calendar days on the bot's own clock "
+                "(America/Los_Angeles), where today is 2026-01-12") in lines
+        assert (f"Kelly trim check: {_PAIR_TEXT} (time-series), 30 each, last traded "
+                "2026-01-05, 7 day(s) ago, pays 96.4%, $0.91 a pair at the best bids, "
+                "may keep 10.0% of $100.00 -> sell 19") in lines
+        assert lines[-1] == "Pairs to trim this run: 1 of 1"
+        assert _warnings(caplog) == []
+        # The plan: the 19 sold, with the 30 held on each leg
+        assert plan.title == "Will the rocket launch by Jan 20, 2026?"
+        assert (plan.kind, plan.level, plan.count, plan.days_left) == (
+            config.SALE_KIND_KELLY_TRIM, None, 19, 13)
+        assert [(leg.ticker, leg.side, leg.count, leg.held) for leg in plan.legs] == [
+            (_A, "yes", 19, 30), (_B, "no", 19, 30)]
+        assert all(leg.market is case.world.markets[leg.ticker] for leg in plan.legs)
+        # Each leg's cost is the sold share of what its market cost, fees included
+        cost_a = (30 * 0.30 + fee_leg_exact(30, 0.30)) * 19 / 30
+        cost_b = (30 * 0.40 + fee_leg_exact(30, 0.40)) * 19 / 30
+        assert [leg.cost_dollars for leg in plan.legs] == [pytest.approx(cost_a),
+                                                           pytest.approx(cost_b)]
+        assert plan.cost_dollars == pytest.approx(cost_a + cost_b)
+        # Sold at the best bids, less the fee on each market's sale of 19
+        assert plan.ladders == {_A: [[0.42, 100_000.0]], _B: [[0.52, 100_000.0]]}
+        assert plan.walked == {_A: (0.42, 0.42), _B: (0.52, 0.52)}
+        proceeds = (19 * 0.42 - fee_leg_exact(19, 0.42)) + (19 * 0.52 - fee_leg_exact(19, 0.52))
+        assert plan.proceeds_dollars == pytest.approx(proceeds, abs=1e-12)
+        assert plan.profits == ((pytest.approx(proceeds - plan.cost_dollars),
+                                 pytest.approx(19 * 1.0 - plan.cost_dollars)),)
+        # One fills read, each book once, and no candle (no minimum price rise)
+        assert case.world.fill_reads == 1
+        assert case.world.calls["book"] == [_A, _B] and case.world.calls["candles"] == []
+
+    def test_the_count_is_the_shared_rules(self, monkeypatch):
+        # config.kelly_trim_count, handed what the books show
+        case = _TrimCase()
+        (plan,) = case.live(monkeypatch, 10_000, cap=0.10)
+        win = config.held_pair_win_prob("time_series", 0.44, 0.58, 0.48, 0.53, 0.8)
+        top = 0.42 + 0.52 - config.fee_per_pair_approx(0.42, 0.52)
+
+        def net_sale(pairs):
+            return (pairs * 0.42 - fee_leg_exact(pairs, 0.42)
+                    + pairs * 0.52 - fee_leg_exact(pairs, 0.52))
+
+        assert plan.count == config.kelly_trim_count(30, 100.0, win, 0.10, top, net_sale).sell
+
+    def test_the_plan_is_one_the_trader_and_the_reporter_read(self, monkeypatch, caplog):
+        # The real plan, handed on as a run would: the trader builds its two
+        # orders (a dry run sends neither) and the reporter writes its row and record
+        from kalshi_betting import reporter, trader
+
+        (plan,) = _TrimCase().live(monkeypatch, 10_000, cap=0.10)
+        legs, problem = trader._sale_legs(plan)
+        assert problem is None and sorted(leg.ticker for leg in legs) == [_A, _B]
+        assert [trader._plan_holding(leg) for leg in legs] == [30, 30]
+        with caplog.at_level(logging.INFO):
+            [result] = trader.sell_positions(MagicMock(), [plan], dry_run=True)
+        assert (result.status, result.sold) == ("simulated", {_A: 19, _B: 19})
+        assert ("19 YES contracts (of 30 held) on " + _A) in caplog.text
+        assert ("19 NO contracts (of 30 held) on " + _B) in caplog.text
+        fees = fee_leg_exact(19, 0.42) + fee_leg_exact(19, 0.52)
+        row = reporter._sale_to_row(result, _NOW)
+        assert row[17] == ("[sale: YES A / NO B, Kelly trim: 19 of 30 contract pairs, "
+                           f"13 days left, fees=${fees:.2f}] ")
+        assert row[11:13] == [19, 19] and row[13] == round(plan.cost_dollars, 2)
+        [record] = reporter.report_sales([result])
+        assert (record.kind, record.level, record.realized_percent) == (
+            config.SALE_KIND_KELLY_TRIM, None, None)
+        assert [(leg.ticker, leg.held, leg.sold) for leg in record.legs] == [
+            (_A, 30, 19), (_B, 30, 19)]
+        assert record.profit == round(plan.profits[0][0], 2)
+
+    def test_a_pair_within_its_share_is_kept(self, monkeypatch, caplog):
+        case = _TrimCase()
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 100_000) == []
+        assert ("$0.91 a pair at the best bids, may keep 61.9% of $1000.00 -> keep"
+                in caplog.text)
+        assert "Pairs to trim this run: 0 of 1" in caplog.text
+
+    def test_a_lower_cap_or_a_higher_k_sells_a_pair_the_settings_before_kept(
+            self, monkeypatch):
+        # What config.trim_change_warnings warns about: with trimming on, a lower
+        # cap (20% to 10% of $200) or a higher k (0.7 to 0.8, on a $50 portfolio)
+        # sells part of a pair the old settings kept
+        assert _TrimCase().live(monkeypatch, 20_000, cap=0.20) == []
+        (plan,) = _TrimCase().live(monkeypatch, 20_000, cap=0.10)
+        assert (plan.kind, plan.count) == (config.SALE_KIND_KELLY_TRIM, 8)
+        assert [leg.held for leg in plan.legs] == [30, 30]
+        quotes = {"a_now": (0.30, 0.72), "b_now": (0.62, 0.40)}
+        assert _TrimCase(**quotes).live(monkeypatch, 5_000, k=0.7) == []
+        (plan,) = _TrimCase(**quotes).live(monkeypatch, 5_000, k=0.8)
+        assert plan.count == 6 and [leg.held for leg in plan.legs] == [30, 30]
+
+    def test_a_pair_sold_whole_still_names_what_it_held(self, monkeypatch):
+        build, value_cents, caps = _TRIM_PARITY_CASES["a converged same-title pair"]
+        (plan,) = build().live(monkeypatch, value_cents, **caps)
+        assert [(leg.ticker, leg.side, leg.count, leg.held) for leg in plan.legs] == [
+            (_A, "no", 30, 30), (_B, "yes", 30, 30)]
+        assert plan.kind == config.SALE_KIND_KELLY_TRIM
+
+    # ── Switched off, and what stops the run ─────────────────────────────────
+
+    def test_off_reads_nothing_and_checks_nothing(self, monkeypatch, caplog):
+        case = _TrimCase()
+        # Not even the number of days is checked: a run that does not trim never stops on it
+        monkeypatch.setattr(seller, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", 99)
+        with caplog.at_level(logging.DEBUG):
+            assert case.world.trims(monkeypatch, _trim_settings(on=False)) == []
+        assert case.world.calls == _NO_READS and case.world.fill_reads == 0
+        assert caplog.records == []
+
+    @pytest.mark.parametrize("days", [True, 7.5, -1, 31, None, "7"])
+    def test_a_bad_number_of_days_stops_the_run_before_any_request(self, monkeypatch, days):
+        monkeypatch.setattr(seller, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", days)
+        case = _TrimCase()
+        with pytest.raises(ValueError, match="KELLY_TRIM_MIN_DAYS_SINCE_TRADE must be a "
+                                             "whole number from 0 to 30"):
+            case.live(monkeypatch, 10_000, cap=0.10)
+        assert case.world.calls == _NO_READS and case.world.fill_reads == 0
+
+    def test_now_must_carry_a_time_zone(self, monkeypatch):
+        with pytest.raises(ValueError, match="timezone-aware"):
+            _TrimCase().live(monkeypatch, 10_000, now=_NOW.replace(tzinfo=None))
+
+    @pytest.mark.parametrize("cash", [None, True, -1, float("nan"), float("inf"), "5000"])
+    def test_cash_that_is_not_an_amount_is_refused(self, monkeypatch, cash):
+        with pytest.raises(ValueError, match="cash_cents must be a finite number"):
+            _TrimCase().world.trims(monkeypatch, cash_cents=cash)
+
+    # ── The run-level gates ──────────────────────────────────────────────────
+
+    def test_nothing_held_trims_nothing(self, monkeypatch, caplog):
+        world = _World()
+        with caplog.at_level(logging.INFO):
+            assert world.trims(monkeypatch, positions_value_cents=None) == []
+        assert [r.getMessage() for r in caplog.records] == ["Pairs to trim this run: 0 of 0"]
+        assert world.fill_reads == 0
+
+    @pytest.mark.parametrize("value", [None, 0, -5, float("nan"), float("inf"), True, "5000"])
+    def test_an_unknown_positions_value_trims_nothing(self, monkeypatch, caplog, value):
+        # A trim grows as the value shrinks, so a missing value is never read as $0
+        case = _TrimCase()
+        with caplog.at_level(logging.INFO):
+            assert case.world.trims(monkeypatch, positions_value_cents=value) == []
+        assert _warnings(caplog) == [
+            "Not trimming any held pair this run: Kalshi's value of the open positions is "
+            "not known or is not above $0, and a trim sized on too small a value would "
+            "sell too much"]
+        assert case.world.calls == _NO_READS and case.world.fill_reads == 0
+
+    def test_an_unknown_ladder_trims_nothing(self, monkeypatch, caplog):
+        case = _TrimCase()
+        labels = case.world.labels()
+        labels[_B] = frozenset()
+        with caplog.at_level(logging.INFO):
+            assert case.world.trims(monkeypatch, labels=labels) == []
+        assert (f"Not trimming this run: the ladder of 1 held market(s) is unknown ({_B})"
+                in caplog.text)
+        assert case.world.calls == _NO_READS and case.world.fill_reads == 0
+
+    def test_a_lone_held_market_is_never_trimmed(self, monkeypatch, caplog):
+        world = _lone_world(_settled(_SAME_EVENT, _EV_B))
+        world.fills = _fills()
+        with caplog.at_level(logging.INFO):
+            assert world.trims(monkeypatch) == []
+        assert "Pairs to trim this run: 0 of 0" in caplog.text
+        assert world.calls == _NO_READS and world.fill_reads == 0
+
+    @pytest.mark.parametrize("skip", [frozenset({_A}), frozenset({_B}), frozenset({_A, _B, "X"})])
+    def test_a_pair_picked_for_a_take_profit_sale_is_not_looked_at(self, monkeypatch, caplog,
+                                                                    skip):
+        case = _TrimCase()
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10, skip=skip) == []
+        assert (f"Not trimming {_PAIR_TEXT}: it is picked for a take-profit sale this run"
+                in caplog.text)
+        assert "Pairs to trim this run: 0 of 0" in caplog.text
+        assert case.world.calls == _NO_READS and case.world.fill_reads == 0
+        # A ticker of another position skips nothing
+        assert case.live(monkeypatch, 10_000, cap=0.10, skip=frozenset({"X"}))
+
+    def test_unreadable_fills_trim_nothing(self, monkeypatch, caplog):
+        case = _TrimCase()
+        case.world.fills = None
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10) == []
+        assert _warnings(caplog) == [
+            "Not trimming any held pair this run: the account's fills could not be read, "
+            "so when each pair last traded is not known"]
+        assert "Pairs to trim this run: 0 of 1" in caplog.text
+        assert case.world.fill_reads == 1 and case.world.calls == _NO_READS
+
+    def test_an_empty_fills_list_trims_nothing(self, monkeypatch, caplog):
+        case = _TrimCase()
+        case.world.fills = _fills(oldest=None)
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10) == []
+        assert _warnings(caplog) == [
+            "Not trimming any held pair this run: the account's fills list is empty, so a "
+            "trade in the last 7 day(s) cannot be ruled out"]
+        assert case.world.calls == _NO_READS
+
+    @pytest.mark.parametrize("days_back, trims", [(3, False), (6, False), (7, True), (30, True)])
+    def test_the_fills_list_must_reach_back_past_the_wait(self, monkeypatch, caplog,
+                                                          days_back, trims):
+        # With no fill listed, the pair last traded no later than the list's
+        # oldest fill, so the list must start at least 7 days back
+        case = _TrimCase()
+        case.world.fills = _fills(oldest=_NOW - timedelta(days=days_back))
+        with caplog.at_level(logging.INFO):
+            plans = case.live(monkeypatch, 10_000, cap=0.10)
+        assert bool(plans) == trims
+        start = (_NOW - timedelta(days=days_back)).astimezone(_PACIFIC).date()
+        if trims:
+            assert f"30 each, no fill listed (the fills list starts {start}), pays" in caplog.text
+        else:
+            assert _warnings(caplog) == [
+                f"Not trimming any held pair this run: the account's fills list starts {start} "
+                f"on the bot's own clock, fewer than 7 day(s) ago, so a trade in the last 7 "
+                "day(s) cannot be ruled out"]
+            assert case.world.calls == _NO_READS
+
+    def test_the_fills_lists_start_is_a_day_on_the_bots_own_clock(self, monkeypatch, caplog):
+        # 01:00 UTC on January 6 is still January 5 in Los Angeles: seven days
+        # before a run on the 12th there, though only six UTC dates before it
+        case = _TrimCase()
+        case.world.fills = _fills(oldest=datetime(2026, 1, 6, 1, tzinfo=UTC))
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10)
+        assert "no fill listed (the fills list starts 2026-01-05)" in caplog.text
+
+    # ── The wait, per pair ───────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("market", [_A, _B])
+    def test_a_fill_on_either_market_six_days_ago_blocks(self, monkeypatch, caplog, market):
+        case = _TrimCase()
+        recent = _NOW - timedelta(days=6)
+        case.world.fills = _fills({_A: _BOUGHT, _B: _BOUGHT, market: recent})
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10) == []
+        assert (f"Not trimming {_PAIR_TEXT}: it last traded 2026-01-06, 6 day(s) ago, and a "
+                "trim waits until 7 day(s) have passed since a pair's last trade"
+                in caplog.text)
+        assert case.world.calls["book"] == []
+        # Seven days ago on that market: trimmed
+        case.world.fills = _fills({_A: _BOUGHT, _B: _BOUGHT, market: _NOW - timedelta(days=7)})
+        assert case.live(monkeypatch, 10_000, cap=0.10)
+
+    def test_a_fill_listed_on_one_market_alone_is_the_pairs_last_trade(self, monkeypatch,
+                                                                       caplog):
+        case = _TrimCase()
+        case.world.fills = _fills({_B: _NOW - timedelta(days=9)})
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10)
+        assert "30 each, last traded 2026-01-03, 9 day(s) ago, pays" in caplog.text
+
+    def test_a_fill_dated_after_the_run_blocks(self, monkeypatch, caplog):
+        case = _TrimCase()
+        case.world.fills = _fills({_A: _NOW + timedelta(days=1)})
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10) == []
+        assert ("it last traded 2026-01-13, after today (2026-01-12) on the bot's own clock"
+                in caplog.text)
+
+    def test_a_wait_of_eight_days_blocks_a_fill_seven_days_old(self, monkeypatch):
+        monkeypatch.setattr(seller, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", 8)
+        case = _TrimCase()
+        assert case.live(monkeypatch, 10_000, cap=0.10) == []
+        assert case.live(monkeypatch, 10_000, cap=0.10, now=_NOW + timedelta(days=1))
+        # config's own number is not what the seller reads
+        assert config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE == 7
+
+    def test_no_wait_asks_for_no_fills(self, monkeypatch, caplog):
+        monkeypatch.setattr(seller, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", 0)
+        case = _TrimCase()
+        # Traded a minute ago, and the fills list could not even be read
+        case.world.fills = None
+        with caplog.at_level(logging.INFO):
+            (plan,) = case.live(monkeypatch, 10_000, cap=0.10)
+        assert plan.count == 19 and case.world.fill_reads == 0
+        assert f"Kelly trim check: {_PAIR_TEXT} (time-series), 30 each, no wait, pays" in (
+            caplog.text)
+        assert "a pair is looked at once" not in caplog.text
+
+    # ── The value a trim is sized on ─────────────────────────────────────────
+
+    @pytest.mark.parametrize("share", [0.10, 0.50])
+    def test_a_kalshi_value_below_the_bids_is_raised_to_them(self, monkeypatch, caplog, share):
+        # Three pairs, 450 contracts a side in all, worth $423 at the market
+        # list's bids (0.42 YES, 0.52 NO). Kalshi values them at a tenth, or half
+        world = _World()
+        world.fills = _fills()
+        held = {"hail": 200, "rain": 100, "snow": 150}
+        for name, n in held.items():
+            _weather_pair(world, name, n)
+        floor = 450 * 0.42 + 450 * 0.52
+        cash = 100_000
+        settings = _trim_settings(cap=0.05)
+        with caplog.at_level(logging.INFO):
+            low = world.trims(monkeypatch, settings, cash_cents=cash,
+                              positions_value_cents=int(floor * 100 * share))
+        assert _warnings(caplog) == [
+            f"Kalshi's value of the open positions (${floor * share:.2f}) is below what they "
+            f"would fetch at this run's bids (${floor:.2f}): the Kelly trim is sized on the "
+            "larger, so it can only sell less"]
+        assert (f"Kelly trim sizes on ${cash / 100 + floor:.2f} = cash $1000.00 + open "
+                f"positions ${floor:.2f} (Kalshi's value ${floor * share:.2f}; ${floor:.2f} "
+                "at this run's bids)") in caplog.text
+        # The same trims as when Kalshi's value matches the bids (a cent over, so
+        # no warning)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            at_floor = world.trims(monkeypatch, settings, cash_cents=cash,
+                                   positions_value_cents=math.ceil(floor * 100) + 1)
+        assert _warnings(caplog) == []
+        assert [(p.legs[0].ticker, p.count) for p in low] == [
+            (p.legs[0].ticker, p.count) for p in at_floor]
+        # ... which is what the shared rule sells of each pair at cash plus the floor
+        value = cash / 100 + floor
+        assert [p.count for p in low] == [_weather_sell(n, value, 0.05) for n in held.values()]
+        # Sized on Kalshi's lower value, every pair would sell more
+        understated = cash / 100 + floor * share
+        for plan, n in zip(low, held.values(), strict=True):
+            assert 0 < plan.count < _weather_sell(n, understated, 0.05) < n
+
+    def test_a_pair_worth_more_than_every_open_position_stops_every_trim(self, monkeypatch,
+                                                                         caplog):
+        # The rain pair would trim. The snow pair has no quotes on the market list
+        # (so its value there is $0), but its books put it alone at about $36,
+        # above the $30 Kalshi gives all open positions: that value cannot be right
+        world = _World()
+        world.fills = _fills()
+        _weather_pair(world, "rain", 30)
+        _weather_pair(world, "snow", 40, quotes=False)
+        settings = _trim_settings(cap=0.05)
+        with caplog.at_level(logging.INFO):
+            assert world.trims(monkeypatch, settings, cash_cents=5_000,
+                               positions_value_cents=3_000) == []
+        (warning,) = _warnings(caplog)
+        top = 0.42 + 0.52 - config.fee_per_pair_approx(0.42, 0.52)
+        assert warning == (
+            "Not trimming any held pair this run, including any marked '-> sell' above: YES "
+            f"KXSNOW20-26 / NO KXSNOW25-26 alone would fetch ${40 * top:.2f} at its best bids "
+            f"(40 contract pairs at ${top:.2f} each), more than the $30.00 all open positions "
+            "are valued at, so that value cannot be right, and a trim sized on too small a "
+            "value would sell too much")
+        assert "Pairs to trim this run: 0 of 2" in caplog.text
+        # The rain pair's check line still reads "-> sell"; the WARNING says no
+        # such verdict stands
+        assert "YES KXRAIN20-26 / NO KXRAIN25-26 (time-series), 30 each" in caplog.text
+        assert "-> sell" in caplog.text
+        # With a value that covers both pairs (about $63 at their best bids), both trim
+        assert len(world.trims(monkeypatch, settings, cash_cents=5_000,
+                               positions_value_cents=6_400)) == 2
+
+    def test_a_minimum_price_rise_never_lets_through_a_trim_the_value_guard_stops(
+            self, monkeypatch, caplog):
+        # The snow pair alone fetches about $36, above the $30 all open positions
+        # are valued at, so nothing trims. A minimum price rise may only hold trims
+        # back: holding the snow pair (no rise) back must not let the rain pair
+        # (up 20c) trim on that bad value
+        world = _World()
+        rain = _weather_pair(world, "rain", 30)
+        snow = _weather_pair(world, "snow", 40, quotes=False)
+        world.fills = _fills(dict.fromkeys((*rain, *snow), _BOUGHT))
+        world.candles = {rain[0]: [_candle(_FIRST, 0.34, 0.68)],
+                         rain[1]: [_candle(_FIRST, 0.58, 0.43)],
+                         snow[0]: [_candle(_FIRST, 0.44, 0.58)],
+                         snow[1]: [_candle(_FIRST, 0.48, 0.53)]}
+        sized = {"cash_cents": 5_000, "positions_value_cents": 3_000}
+        assert world.trims(monkeypatch, _trim_settings(cap=0.05), **sized) == []
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert world.trims(monkeypatch, _trim_settings(cap=0.05, min_rise=0.10),
+                               **sized) == []
+        (warning,) = _warnings(caplog)
+        assert "YES KXSNOW20-26 / NO KXSNOW25-26 alone would fetch" in warning
+        assert "so that value cannot be right" in warning
+        assert "Pairs to trim this run: 0 of 2" in caplog.text
+        # On a value that covers both pairs, the minimum holds the snow pair back
+        # and only the rain pair trims
+        plans = world.trims(monkeypatch, _trim_settings(cap=0.05, min_rise=0.10),
+                            cash_cents=5_000, positions_value_cents=6_400)
+        assert [plan.legs[0].ticker for plan in plans] == [rain[0]]
+
+    def test_a_crossed_book_on_the_outsized_pair_still_stops_every_trim(self, monkeypatch,
+                                                                        caplog):
+        world = _World()
+        world.fills = _fills()
+        _weather_pair(world, "rain", 30)
+        snow = _weather_pair(world, "snow", 40, quotes=False)
+        # A NO bid of 0.60 beside the YES bid of 0.42: the YES ask sits under its own
+        # bid, so the snow pair's chance cannot be read
+        world.books[snow[0]]["no"] = [["0.60", "100000"]]
+        with caplog.at_level(logging.INFO):
+            assert world.trims(monkeypatch, _trim_settings(cap=0.05), cash_cents=5_000,
+                               positions_value_cents=3_000) == []
+        (warning,) = _warnings(caplog)
+        assert "YES KXSNOW20-26 / NO KXSNOW25-26 alone would fetch" in warning
+        assert "so that value cannot be right" in warning
+
+    def test_pairs_together_worth_more_than_every_open_position_stop_every_trim(
+            self, monkeypatch, caplog):
+        # Three pairs with no quotes on the market list: each alone fetches about
+        # $27 at its best bids, under the $30 Kalshi gives all open positions, but
+        # together about $81. Sized on that bad value, each would sell too much
+        world = _World()
+        world.fills = _fills()
+        for name in ("hail", "rain", "snow"):
+            _weather_pair(world, name, 30, quotes=False)
+        top = 0.42 + 0.52 - config.fee_per_pair_approx(0.42, 0.52)
+        assert 30 * top < 30 < 3 * 30 * top
+        with caplog.at_level(logging.INFO):
+            assert world.trims(monkeypatch, _trim_settings(cap=0.05), cash_cents=50_000,
+                               positions_value_cents=3_000) == []
+        (warning,) = _warnings(caplog)
+        assert warning == (
+            "Not trimming any held pair this run, including any marked '-> sell' above: the "
+            f"3 pairs whose order books were read would fetch ${90 * top:.2f} at their best "
+            "bids together, more than the $30.00 all open positions are valued at, so that "
+            "value cannot be right, and a trim sized on too small a value would sell too much")
+        assert "Pairs to trim this run: 0 of 3" in caplog.text
+        # Each pair alone passed the value check, so all three were judged ("-> sell 1"
+        # on $530); the WARNING cancels those verdicts
+        checks = [r.getMessage() for r in caplog.records
+                  if r.getMessage().startswith("Kelly trim check: ")]
+        assert len(checks) == 3 and all(check.endswith("-> sell 1") for check in checks)
+        # With $100 of cash and a value that covers all three ($82), each trims by
+        # the shared rule on $182, selling less than it would on the understated $130
+        plans = world.trims(monkeypatch, _trim_settings(cap=0.05), cash_cents=10_000,
+                            positions_value_cents=8_200)
+        sold = _weather_sell(30, 182.0, 0.05)
+        assert [plan.count for plan in plans] == [sold] * 3
+        assert 0 < sold < _weather_sell(30, 130.0, 0.05)
+
+    # ── Each step of one pair ────────────────────────────────────────────────
+
+    def test_a_count_that_is_not_whole_is_not_trimmed(self, monkeypatch, caplog):
+        case = _TrimCase()
+        case.world.positions[_A] = HeldPosition(_A, 30.5, 9.15, 0.45)
+        case.world.positions[_B] = HeldPosition(_B, -30.5, 12.2, 0.51)
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10) == []
+        assert (f"Not trimming {_PAIR_TEXT}: its count 30.5 is not a whole number of "
+                "contracts") in caplog.text
+
+    def test_a_market_missing_from_the_market_list_is_not_trimmed(self, monkeypatch, caplog):
+        case = _TrimCase()
+        del case.world.markets[_B]
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10) == []
+        assert f"Not trimming {_PAIR_TEXT}: {_B} is not in this run's market list" in caplog.text
+        assert case.world.calls["book"] == []
+
+    def test_a_pair_whose_kind_cannot_be_read_is_not_trimmed(self, monkeypatch, caplog):
+        # NO on the earlier deadline and YES on the later: no pair the bot buys
+        case = _TrimCase()
+        case.world.positions[_A] = HeldPosition(_A, -30.0, 9.0, 0.45)
+        case.world.positions[_B] = HeldPosition(_B, 30.0, 12.0, 0.51)
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10) == []
+        assert (f"Not trimming NO {_A} / YES {_B}: its two markets cannot be shown to be a "
+                "same-title or a time-series pair held this way round") in caplog.text
+        assert case.world.calls["book"] == []
+
+    def test_a_book_that_cannot_be_read_is_not_trimmed(self, monkeypatch, caplog):
+        case = _TrimCase()
+        del case.world.books[_B]
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10) == []
+        assert f"Not trimming {_PAIR_TEXT}: the order book of {_B} could not be read" in (
+            caplog.text)
+
+    @pytest.mark.parametrize("ticker, side", [(_A, "yes"), (_A, "no"), (_B, "yes"), (_B, "no")])
+    def test_a_missing_bid_on_any_of_the_four_sides_is_not_trimmed(self, monkeypatch, caplog,
+                                                                    ticker, side):
+        # The two sides held price the sale; the other two give each market's asks
+        case = _TrimCase()
+        case.world.books[ticker][side] = []
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10) == []
+        assert f"Not trimming {_PAIR_TEXT}: {ticker} has no {side.upper()} bid" in caplog.text
+
+    @pytest.mark.parametrize("ticker", [_A, _B])
+    @pytest.mark.parametrize("bid, trims", [(0.01, False), (0.0099, False), (0.0101, True),
+                                            (0.02, True)])
+    def test_a_yes_bid_of_one_cent_or_less_is_not_trimmed(self, monkeypatch, caplog, ticker,
+                                                          bid, trims):
+        # The backtest's candles cannot show such a bid, so it never trims on one
+        case = _TrimCase()
+        case.world.books[ticker]["yes"] = [[bid, 100_000.0]]
+        with caplog.at_level(logging.INFO):
+            plans = case.live(monkeypatch, 100_000_000, cap=0.05)
+        refused = (f"Not trimming {_PAIR_TEXT}: the best YES bid on {ticker} (${bid:.4f}) is "
+                   "one the hourly price history cannot show")
+        assert (refused in caplog.text) == (not trims)
+        assert plans == []
+        # A NO bid of 1c is one a candle shows (its YES ask is 0.99)
+        assert "the best NO bid" not in caplog.text
+
+    def test_a_no_bid_of_one_cent_is_read(self, monkeypatch, caplog):
+        case = _TrimCase()
+        case.world.books[_A]["no"] = [[0.01, 100_000.0]]
+        with caplog.at_level(logging.INFO):
+            case.live(monkeypatch, 10_000, cap=0.10)
+        assert "hourly price history cannot show" not in caplog.text
+        assert "Kelly trim check" in caplog.text or "chance of paying" in caplog.text
+
+    def test_a_crossed_book_is_not_trimmed(self, monkeypatch, caplog):
+        build, value_cents, caps = _TRIM_PARITY_CASES["a crossed book"]
+        with caplog.at_level(logging.INFO):
+            assert build().live(monkeypatch, value_cents, **caps) == []
+        assert (f"Not trimming {_PAIR_TEXT}: its chance of paying cannot be read from its "
+                "quotes") in caplog.text
+
+    def test_pairs_are_judged_in_ticker_order_each_on_its_own(self, monkeypatch, caplog):
+        # Two pairs past the cap and one that waits: the plans come in ticker order
+        world = _World()
+        hail, rain, snow = (_weather_pair(world, name, 60) for name in ("hail", "rain", "snow"))
+        world.fills = _fills({rain[0]: _NOW - timedelta(days=2)})
+        with caplog.at_level(logging.INFO):
+            plans = world.trims(monkeypatch, _trim_settings(cap=0.05), cash_cents=5_000,
+                                positions_value_cents=20_000)
+        assert [plan.legs[0].ticker for plan in plans] == [hail[0], snow[0]]
+        assert "Pairs to trim this run: 2 of 3" in caplog.text
+        assert f"Not trimming YES {rain[0]} / NO {rain[1]}: it last traded 2026-01-10" in (
+            caplog.text)
+        # The waiting pair's books were never read
+        assert world.calls["book"] == [*hail, *snow]
+
+    # ── The minimum price rise ───────────────────────────────────────────────
+
+    @staticmethod
+    def _risen(cents_a: int, cents_b: int = 0) -> _TrimCase:
+        """The standard pair ($0.97 now: YES ask 0.44 on A plus NO ask 0.53 on B),
+        with each held side's ask that many cents lower when it last traded."""
+        return _TrimCase(a_then=(round(0.44 - cents_a / 100, 2), 0.58),
+                         b_then=(0.48, round(0.53 - cents_b / 100, 2)))
+
+    @pytest.mark.parametrize("cents, trims", [(9, False), (10, True), (11, True), (-5, False),
+                                              (0, False)])
+    def test_a_rise_under_at_and_over_the_minimum(self, monkeypatch, caplog, cents, trims):
+        case = self._risen(cents)
+        with caplog.at_level(logging.INFO):
+            plans = case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10)
+        assert bool(plans) == trims
+        then = 0.97 - cents / 100
+        prices = f"price ${then:.2f} then, $0.97 now ({cents:+d}c, minimum 10c)"
+        if trims:
+            assert (f"30 each, last traded 2026-01-05, 7 day(s) ago, {prices}, pays 96.4%"
+                    in caplog.text)
+            assert plans[0].count == 19
+        else:
+            assert (f"Not trimming {_PAIR_TEXT}: its total price has not risen by the minimum "
+                    f"since it last traded: {prices}") in caplog.text
+
+    @pytest.mark.parametrize("yes_ask_then, prices", [
+        # Prices on a grid finer than a cent: the rise is short of the 10c
+        # minimum by 0.4c, by a tenth of a cent and by a hundredth of a cent
+        (0.344, "price $0.874 then, $0.97 now (+9.6c, minimum 10c)"),
+        (0.341, "price $0.871 then, $0.97 now (+9.9c, minimum 10c)"),
+        (0.3401, "price $0.8701 then, $0.97 now (+9.99c, minimum 10c)"),
+    ])
+    def test_a_rise_just_short_of_the_minimum_is_not_written_as_the_minimum(
+            self, monkeypatch, caplog, yes_ask_then, prices):
+        case = _TrimCase(a_then=(yes_ask_then, 0.58), b_then=(0.48, 0.53))
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        (line,) = [r.getMessage() for r in caplog.records
+                   if "has not risen by the minimum" in r.getMessage()]
+        assert "(+10c, minimum 10c)" not in line
+        assert line.endswith(f"since it last traded: {prices}")
+
+    def test_a_change_in_price_is_written_exactly(self):
+        # Whole cents stay whole; anything finer is written to the hundredth of a cent
+        assert [seller._cents_text(d) for d in (0.13, -0.05, 0.0, -0.0, 0.10, 1.0)] == [
+            "+13c", "-5c", "+0c", "+0c", "+10c", "+100c"]
+        assert [seller._cents_text(d) for d in (0.096, 0.099, 0.0999, -0.0001, 0.2001)] == [
+            "+9.6c", "+9.9c", "+9.99c", "-0.01c", "+20.01c"]
+        # Float noise around a whole cent is a whole cent, and never "-0c"
+        assert seller._cents_text(0.97 - 0.87) == "+10c"
+        assert seller._cents_text(0.87 - 0.97) == "-10c"
+        assert seller._cents_text(-1e-9) == "+0c"
+        assert [seller._price_text(d) for d in (0.97, 0.874, 0.8701, 1.0, 0.5, 0.34 + 0.53)] == [
+            "$0.97", "$0.874", "$0.8701", "$1.00", "$0.50", "$0.87"]
+
+    def test_the_rise_is_the_two_markets_together(self, monkeypatch):
+        # 6c on one market and 4c on the other is a 10c rise of the pair
+        assert self._risen(6, 4).live(monkeypatch, 10_000, cap=0.10, min_rise=0.10)
+        assert self._risen(6, 3).live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        # A rise on one market is offset by a fall on the other
+        assert self._risen(15, -6).live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+
+    def test_the_rise_is_measured_from_the_later_of_the_two_markets_fills(self, monkeypatch):
+        # The pair stood at $0.77 two weeks ago and $0.92 a week ago. B's fill a
+        # week ago is the later one, so the rise is 5c, not 20c
+        case = _TrimCase()
+        earlier = _FIRST - 7 * _DAY
+        case.world.candles = {
+            _A: [_candle(earlier, 0.34, 0.68), _candle(_FIRST, 0.42, 0.60), _candle(_CK, *_A_NOW)],
+            _B: [_candle(earlier, 0.58, 0.43), _candle(_FIRST, 0.51, 0.50), _candle(_CK, *_B_NOW)]}
+        case.world.fills = _fills({_A: datetime.fromtimestamp(earlier, UTC), _B: _BOUGHT})
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.05)
+        # Both markets' prices were read at that one moment
+        assert {(t, end) for t, _e, _s, end in case.world.calls["candles"]} == {
+            (_A, _FIRST), (_B, _FIRST)}
+
+    def test_after_a_trim_the_rise_is_measured_from_the_trim(self, monkeypatch):
+        # Bought at $0.77; a trim on January 5 sold part of it at $0.92. A run
+        # two weeks after the purchase measures from the trim: 5c, not 20c
+        case = _TrimCase()
+        bought = _FIRST - 7 * _DAY
+        case.world.candles = {
+            _A: [_candle(bought, 0.34, 0.68), _candle(_FIRST, 0.42, 0.60), _candle(_CK, *_A_NOW)],
+            _B: [_candle(bought, 0.58, 0.43), _candle(_FIRST, 0.51, 0.50), _candle(_CK, *_B_NOW)]}
+        # Kalshi lists each market's latest fill: the trim's
+        case.world.fills = _fills({_A: _BOUGHT, _B: _BOUGHT})
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        # Had it not been trimmed, the same run would measure from the purchase
+        case.world.fills = _fills({_A: datetime.fromtimestamp(bought, UTC),
+                                   _B: datetime.fromtimestamp(bought, UTC)})
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10)
+
+    def test_no_fill_listed_is_not_trimmed_and_reads_no_candle(self, monkeypatch, caplog):
+        # The pair's last fill is older than the fills list reaches: it has
+        # rested, but its price then cannot be read
+        case = self._risen(20)
+        case.world.fills = _fills()
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        assert (f"Not trimming {_PAIR_TEXT}: no fill is listed on either market, so its price "
+                "when it last traded cannot be read, and a minimum price rise is set"
+                in caplog.text)
+        assert case.world.calls["candles"] == []
+        # With no minimum the same pair trims
+        assert case.live(monkeypatch, 10_000, cap=0.10)
+
+    @pytest.mark.parametrize("ticker, side", [(_A, "YES"), (_B, "NO")])
+    def test_candles_that_cannot_be_read_are_not_a_rise(self, monkeypatch, caplog, ticker, side):
+        case = self._risen(20)
+        del case.world.candles[ticker]
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        assert (f"Not trimming {_PAIR_TEXT}: the {side} ask on {ticker} when the pair last "
+                "traded (2026-01-05) cannot be read (no usable quote in the 7 days before "
+                "it, or its price history could not be read), and a minimum price rise is "
+                "set") in caplog.text
+
+    def test_no_usable_quote_in_the_week_before_is_not_a_rise(self, monkeypatch, caplog):
+        # Market A's only candle before the pair's last fill ended eight days
+        # before it, and the one at the fill itself has an empty YES ask book
+        case = self._risen(20)
+        case.world.candles[_A] = [_candle(_FIRST - 8 * _DAY, 0.24, 0.78),
+                                  _candle(_FIRST, 1.00, 0.58), _candle(_CK, *_A_NOW)]
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        assert f"the YES ask on {_A} when the pair last traded (2026-01-05) cannot be read" in (
+            caplog.text)
+        # A usable quote six days before the fill is read
+        case.world.candles[_A].insert(1, _candle(_FIRST - 6 * _DAY, 0.24, 0.78))
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10)
+
+    def test_a_candle_after_the_last_fill_is_never_the_price_then(self, monkeypatch):
+        # An hour after the fill the ask had jumped: the price then is still the
+        # one at the fill, so the rise since is 20c
+        case = self._risen(20)
+        case.world.candles[_A].insert(1, _candle(_FIRST + 3600, 0.44, 0.58))
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.20)
+
+    def test_with_no_minimum_no_candle_is_read(self, monkeypatch):
+        case = self._risen(-30)
+        # Not even readable: nothing asks for them
+        case.world.candles = {}
+        assert case.live(monkeypatch, 10_000, cap=0.10)
+        assert case.world.calls["candles"] == []
+
+    def test_a_minimum_with_no_wait_still_reads_the_fills(self, monkeypatch, caplog):
+        monkeypatch.setattr(seller, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", 0)
+        case = self._risen(20)
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10)
+        assert case.world.fill_reads == 1
+        assert "30 each, no wait, price $0.77 then, $0.97 now (+20c, minimum 10c), pays" in (
+            caplog.text)
+        # Unreadable fills: nothing is trimmed, wait or no wait
+        case.world.fills = None
+        assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        # An empty list is a valid read with no wait; the pair has no fill listed
+        case.world.fills = _fills(oldest=None)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10) == []
+        assert "no fill is listed on either market" in caplog.text
+
+    def test_each_markets_price_then_is_read_once(self, monkeypatch):
+        case = self._risen(20)
+        case.live(monkeypatch, 10_000, cap=0.10, min_rise=0.10)
+        week = config.TRIM_PRICE_THEN_MAX_AGE_DAYS * _DAY
+        assert case.world.calls["candles"] == [
+            (_A, _EV_A, _FIRST - week - 3600, _FIRST), (_B, _EV_B, _FIRST - week - 3600, _FIRST)]
+        assert all(type(value) is int for call in case.world.calls["candles"]
+                   for value in call[2:])
+
+
 # ─── The module's shape ───────────────────────────────────────────────────────
 
 def _tree():
     return ast.parse(inspect.getsource(seller))
 
 
-def _calls(func_name: str) -> set[str]:
-    """Every name a function of seller calls, bare or as an attribute."""
+def _def(func_name: str) -> ast.FunctionDef:
+    """One function (or method) of seller, as its syntax tree."""
     for node in ast.walk(_tree()):
         if isinstance(node, ast.FunctionDef) and node.name == func_name:
-            return {(sub.func.id if isinstance(sub.func, ast.Name)
-                     else getattr(sub.func, "attr", None))
-                    for sub in ast.walk(node) if isinstance(sub, ast.Call)}
+            return node
     raise AssertionError(f"seller.{func_name} not found")
+
+
+def _calls(func_name: str) -> set[str]:
+    """Every name a function of seller calls, bare or as an attribute."""
+    return {(sub.func.id if isinstance(sub.func, ast.Name)
+             else getattr(sub.func, "attr", None))
+            for sub in ast.walk(_def(func_name)) if isinstance(sub, ast.Call)}
+
+
+def _calls_of(func_name: str, callee: str) -> list[ast.Call]:
+    """Every call a function of seller makes to `callee`, bare or as an attribute."""
+    return [sub for sub in ast.walk(_def(func_name)) if isinstance(sub, ast.Call)
+            and (sub.func.id if isinstance(sub.func, ast.Name)
+                 else getattr(sub.func, "attr", None)) == callee]
 
 
 class TestIsolation:
@@ -1046,6 +2301,101 @@ class TestIsolation:
         assert settings.default is inspect.Parameter.empty
         assert signature.parameters["now"].default is inspect.Parameter.empty
 
+    def test_plan_trims_requires_the_runs_settings_and_both_amounts(self):
+        # Nothing a trim is sized on has a default: the run's settings, its
+        # moment, its cash and Kalshi's value of the open positions
+        signature = inspect.signature(seller.plan_trims)
+        for name in ("settings", "now", "cash_cents", "positions_value_cents"):
+            parameter = signature.parameters[name]
+            assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, name
+            assert parameter.default is inspect.Parameter.empty, name
+        # Only `skip` (the markets a take-profit sale already takes) has a default
+        assert signature.parameters["skip"].default == frozenset()
+
+    def test_a_trim_is_decided_through_the_shared_rule(self):
+        # The rule, the forecast, the wait, the price rise and the cap are config's
+        # own functions, the ones the backtest trims with
+        for name in ("kelly_trim_count", "kelly_trim_bids", "held_pair_win_prob",
+                     "kelly_trim_rested", "kelly_trim_min_days", "trade_day", "pair_price_rise",
+                     "trim_rise_reached", "pair_size_cap", "fee_per_pair_approx"):
+            assert getattr(seller, name) is getattr(config, name), name
+            assert getattr(backtester, name, getattr(config, name)) is getattr(config, name)
+        trim_one = _calls("_trim_one")
+        assert {"kelly_trim_count", "kelly_trim_bids", "held_pair_win_prob",
+                "kelly_trim_rested", "pair_price_rise", "trim_rise_reached", "pair_size_cap",
+                "fee_per_pair_approx", "fee_leg_exact", "walk_bids", "bid_ladder",
+                "candle_reads_bid", "held_pair_kind", "leg_sides", "_fetch_orderbook",
+                "ask_then", "_day", "_other"} <= trim_one
+        # It reads no candle or fills list itself, and turns a time into a day
+        # only through _day
+        assert not {"recent_candles", "ask_before", "get_fill_times", "trade_day"} & trim_one
+        assert {"recent_candles", "ask_before"} <= _calls("ask_then")
+        assert {"get_fill_times", "held_positions_bid_value", "held_pairs", "_trim_min_days",
+                "kelly_trim_rested", "_day", "_trim_one"} <= _calls("plan_trims")
+        # Once per run: one fills read, one valuation at the bids, one read of the
+        # wait's number of days
+        for callee in ("get_fill_times", "held_positions_bid_value", "_trim_min_days"):
+            assert len(_calls_of("plan_trims", callee)) == 1, callee
+        # The wait's number of days is seller's own binding, checked by config
+        assert ast.unparse(_def("_trim_min_days").body[-1]) == (
+            "return kelly_trim_min_days(KELLY_TRIM_MIN_DAYS_SINCE_TRADE)")
+        # ... and a day is read on seller's own binding of the schedule
+        assert ast.unparse(_def("_day").body[-1]) == "return trade_day(moment, SCHEDULED_RUN)"
+
+    def test_the_trims_steps_come_in_the_rules_order(self):
+        # The wait before any order book is read; the price rise measured, then
+        # tested, before the trim is sized
+        (rested,) = _calls_of("_trim_one", "kelly_trim_rested")
+        (kind,) = _calls_of("_trim_one", "held_pair_kind")
+        (book,) = _calls_of("_trim_one", "_fetch_orderbook")
+        (measured,) = _calls_of("_trim_one", "pair_price_rise")
+        (tested,) = _calls_of("_trim_one", "trim_rise_reached")
+        (forecast,) = _calls_of("_trim_one", "held_pair_win_prob")
+        (decided,) = _calls_of("_trim_one", "kelly_trim_count")
+        assert (rested.lineno < kind.lineno < book.lineno < measured.lineno < tested.lineno
+                < forecast.lineno < decided.lineno)
+        # What the pair alone fetches, and its check against the value of all open
+        # positions, come after the books and before the price rise and the forecast
+        (valued,) = _calls_of("_trim_one", "fee_per_pair_approx")
+        (guard,) = [node for node in ast.walk(_def("_trim_one")) if isinstance(node, ast.Compare)
+                    and ast.unparse(node) == "count * top_value > positions_value"]
+        assert book.lineno < valued.lineno < guard.lineno < measured.lineno
+        # Bids too far below the best bid are cut before anything is valued or
+        # sized, using seller's own binding of the reach
+        (reach,) = _calls_of("_trim_one", "kelly_trim_bids")
+        assert book.lineno < reach.lineno < valued.lineno < decided.lineno
+        assert ast.unparse(reach.args[1]) == "KELLY_TRIM_MAX_BID_DROP"
+        # The rise goes from the price then to the price now, and is tested
+        # against the run's own minimum
+        assert [ast.unparse(arg) for arg in measured.args] == [
+            "then_a + then_b", "now_a + now_b"]
+        assert [ast.unparse(arg) for arg in tested.args] == ["rise", "settings.trim_min_rise"]
+        assert ast.unparse(rested) == "kelly_trim_rested(last, now_date, min_days)"
+
+    def test_the_four_quotes_go_in_as_the_backtest_hands_them(self):
+        # Each market's YES ask, then its NO ask (an ask is 1 minus the other
+        # side's bid), in backtester._kelly_trim's order. A swap can keep the
+        # mid spread yet misread a crossed book
+        (forecast,) = _calls_of("_trim_one", "held_pair_win_prob")
+        assert [ast.unparse(arg) for arg in forecast.args] == [
+            "pair_type", "1.0 - no_bid_a", "1.0 - yes_bid_a", "1.0 - no_bid_b",
+            "1.0 - yes_bid_b", "settings.interval_discount"] and not forecast.keywords
+        source = ast.parse(inspect.getsource(backtester))
+        (theirs,) = [sub for node in ast.walk(source)
+                     if isinstance(node, ast.FunctionDef) and node.name == "_kelly_trim"
+                     for sub in ast.walk(node) if isinstance(sub, ast.Call)
+                     and isinstance(sub.func, ast.Name) and sub.func.id == "held_pair_win_prob"]
+        assert [ast.unparse(arg) for arg in theirs.args][1:5] == [
+            ast.unparse(arg) for arg in forecast.args][1:5]
+        # The rule's own arguments, in its order
+        (decided,) = _calls_of("_trim_one", "kelly_trim_count")
+        assert [ast.unparse(arg) for arg in decided.args] == [
+            "count", "value", "win_prob", "cap", "top_value", "net_sale"]
+        assert not decided.keywords
+        (cap,) = _calls_of("_trim_one", "pair_size_cap")
+        assert [ast.unparse(arg) for arg in cap.args] == [
+            "pair_type", "settings.size_cap", "settings.same_title_size_cap"]
+
 
 def test_plans_are_frozen():
     leg = seller.SaleLeg("T", "E", "yes", 1, 0.5)
@@ -1056,3 +2406,10 @@ def test_plans_are_frozen():
     with pytest.raises(AttributeError):
         plan.count = 2
     assert timedelta(seconds=seller._DAY_SECONDS) == timedelta(days=1)
+    # Built without them, a leg's count is everything held and the plan is a
+    # take-profit sale: the Kelly-trim fields come last, with defaults
+    assert leg.held is None and plan.kind == config.SALE_KIND_TAKE_PROFIT and plan.level == 0.2
+    assert [f.name for f in dataclasses.fields(seller.SaleLeg)][-1] == "held"
+    assert [f.name for f in dataclasses.fields(seller.SalePlan)][-2:] == ["level", "kind"]
+    assert (config.SALE_KIND_TAKE_PROFIT, config.SALE_KIND_KELLY_TRIM) == (
+        "take_profit", "kelly_trim")

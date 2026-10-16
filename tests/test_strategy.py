@@ -2788,6 +2788,8 @@ class TestTimeSeriesKellyParity:
             "ADD_TO_HELD_PAIRS",
             "SELL_AT",
             "SELL_MIN_DAYS",
+            "TRIM_TO_KELLY",
+            "TRIM_MIN_RISE",
         } | self._SAVED_FILE_INTERNALS
         resolver = "live_settings"
         # (module, exempted name) -> references found, so no exemption outlives its use
@@ -3802,6 +3804,91 @@ class TestTimeSeriesKellyParity:
                      and node.name == "__post_init__")
         assert _calls_to(built, "_resolve_trim_min_rise")
 
+    def test_ast_a_trim_waits_days_after_a_trade_through_one_definition(self):
+        # The backtest trims a held pair only once enough days have passed since
+        # its last trade: config.kelly_trim_rested (shared with live code) decides,
+        # on the day _last_trade_day finds. The price rise counts from that same day
+        assert backtester.kelly_trim_rested is config.kelly_trim_rested
+        assert backtester.kelly_trim_min_days is config.kelly_trim_min_days
+        source = inspect.getsource(backtester)
+        tree = ast.parse(source)
+
+        def callers(callee: str) -> set:
+            """Names of every function that calls `callee`; a call in a nested function
+            counts for the function around it too."""
+            return {func.name for func in ast.walk(tree) if isinstance(func, ast.FunctionDef)
+                    and _calls_to(func, callee)}
+
+        plan = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                    and node.name == "planned_trims")
+        # planned_trims asks with exactly this call
+        [rested] = _calls_to(plan, "kelly_trim_rested")
+        asked = "kelly_trim_rested(_last_trade_day(position, last_trim), d, trim_min_days)"
+        assert ast.unparse(rested) == asked
+        [day] = _calls_to(plan, "_last_trade_day")
+        assert rested.args[0] is day
+        # ... for an exact pair only; a pair still waiting is counted and skipped
+        [gate] = [node for node in ast.walk(plan) if isinstance(node, ast.If)
+                  and any(sub is rested for sub in ast.walk(node.test))]
+        assert ast.unparse(gate.test) == ast.unparse(ast.parse(
+            f"_exact_pair(position) and not {asked}", mode="eval").body)
+        assert [ast.unparse(stmt) for stmt in gate.body] == ["pairs_waiting += 1", "continue"]
+        assert not gate.orelse
+        # ... before the price rise or trim size is worked out, so a waiting pair is
+        # counted on no other line and adds nothing to cap_free_from
+        [measured] = _calls_to(plan, "_price_rise")
+        [tested] = _calls_to(plan, "trim_rise_reached")
+        [decided] = _calls_to(plan, "_kelly_trim")
+        assert gate.lineno < gate.end_lineno < measured.lineno < tested.lineno < decided.lineno
+        # Only the walk asks the rule. It needs no config.trade_day: its
+        # checkpoints are already dates
+        assert callers("kelly_trim_rested") == {"_simulate_at_discount", "planned_trims"}
+        assert not hasattr(backtester, "trade_day")
+        # The price rise reads the same day, and only _last_trade_day reads last_trim
+        assert callers("_last_trade_day") == {"_simulate_at_discount", "planned_trims",
+                                              "_price_rise"}
+        rise = _def_named(source, "_price_rise")
+        [since] = _calls_to(rise, "_last_trade_day")
+        assert [ast.unparse(arg) for arg in since.args] == ["position", "last_trim"]
+        [assigned] = [node for node in ast.walk(rise) if isinstance(node, ast.Assign)
+                      and node.value is since]
+        assert ast.unparse(assigned.targets[0]) == "last_day"
+        then, now = _calls_to(rise, "_pair_price")
+        assert [ast.unparse(call.args[1]) for call in (then, now)] == ["last_day", "day"]
+        trim_readers = {func.name for func in ast.walk(tree) if isinstance(func, ast.FunctionDef)
+                        and any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                                and sub.func.attr == "get"
+                                and ast.unparse(sub.func.value) == "last_trim"
+                                for sub in ast.walk(func))}
+        assert trim_readers == {"_last_trade_day"}
+        # The wait is backtester's own binding, checked by config.kelly_trim_min_days:
+        # by a trimming run before it scores any entry, and by every sweep before its fetch
+        resolve = _def_named(source, "_resolve_trim_min_days")
+        assert ast.unparse(resolve.body[-1]) == (
+            "return kelly_trim_min_days(KELLY_TRIM_MIN_DAYS_SINCE_TRADE)")
+        assert len(resolve.body) == 2 and isinstance(resolve.body[0].value, ast.Constant)
+        walk = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "_simulate_at_discount")
+        [days] = [node for node in walk.body if isinstance(node, ast.Assign)
+                  and ast.unparse(node.targets[0]) == "trim_min_days"]
+        assert ast.unparse(days.value) == "_resolve_trim_min_days() if trim_to_kelly else 0"
+        scored = next(node.lineno for node in walk.body if isinstance(node, ast.Assign)
+                      and ast.unparse(node.targets[0]) == "candidates")
+        assert days.lineno < scored
+        assert [node.lineno for node in ast.walk(walk) if isinstance(node, ast.Assign)
+                and ast.unparse(node.targets[0]) == "trim_min_days"] == [days.lineno]
+        sweep = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name == "run_backtest_sweep")
+        # A statement of the function's own body, so no flag can skip it
+        [checked] = [node for node in sweep.body if isinstance(node, ast.Assign)
+                     and ast.unparse(node.value) == "_resolve_trim_min_days()"]
+        [fetched] = _calls_to(sweep, "_prepare_candidates")
+        [first_line] = [call for call in _calls_to(sweep, "info")
+                        if ast.unparse(call.args[0]).startswith("'Starting backtest")]
+        assert checked.lineno < first_line.lineno < fetched.lineno
+        assert callers("_resolve_trim_min_days") == {"_simulate_at_discount",
+                                                     "run_backtest_sweep"}
+
     def test_ast_a_run_stands_for_a_larger_minimum_through_the_walk_s_own_test(self):
         # TrimSweep.rise_grid lets a run it already has stand for a larger
         # minimum price rise only when every trim that run made would still
@@ -4190,6 +4277,24 @@ class TestTimeSeriesKellyParity:
         [dry_run_value] = [k.value for k in sell.keywords if k.arg == "dry_run"]
         assert ast.unparse(dry_run_value) == "args.dry_run"
         assert plan.lineno < sell.lineno
+        # Kelly trims are planned once, between the take-profit plans and the one
+        # call that sends every sale, on the checked positions value (never the
+        # raw one), skipping what the take-profit plans sell
+        [trims] = _call_nodes(main, "_run_prod", "plan_trims")
+        assert plan.lineno < trims.lineno < sell.lineno
+        # Nothing is trimmed while an order rests or the list cannot be read: Kalshi
+        # counts a resting order's cash in neither the balance nor the positions value.
+        # Read once, between the take-profit plans and the trims
+        [resting] = _call_nodes(main, "_run_prod", "get_resting_orders")
+        assert plan.lineno < resting.lineno < trims.lineno
+        assert [ast.unparse(arg) for arg in resting.args] == ["client"]
+        assert not resting.keywords
+        trim_keywords = {k.arg: ast.unparse(k.value) for k in trims.keywords}
+        assert trim_keywords["settings"] == "settings"
+        assert trim_keywords["cash_cents"] == "cash_cents"
+        assert trim_keywords["positions_value_cents"] == "checked_value_cents"
+        assert trim_keywords["skip"] == "_plan_tickers(plans)"
+        assert _function_calls(main, "_run_prod", "_emptied_tickers")
         later = (_call_nodes(main, "_run_prod", "find_time_series_pairs")
                  + _call_nodes(main, "_run_prod", "find_same_title_pairs")
                  + _call_nodes(main, "_run_prod", "held_pairs")

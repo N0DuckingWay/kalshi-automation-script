@@ -195,6 +195,30 @@ def _run(monkeypatch, *argv: str) -> None:
     backtest.main()
 
 
+def _option_help(monkeypatch, capsys, option: str, next_option: str) -> str:
+    """
+    Return one option's --help text, its whitespace collapsed.
+
+    The terminal is made wide first, so argparse never splits a flag's name
+    at a hyphen when it wraps.
+
+    Args:
+        option (str): The option whose help is read.
+        next_option (str): The option listed right after it, where its help ends.
+
+    Returns:
+        str: The text between the two option names in the options list.
+    """
+    monkeypatch.setenv("COLUMNS", "1000")
+    with pytest.raises(SystemExit) as exc:
+        _run(monkeypatch, "--help")
+    assert exc.value.code == 0
+    text = " ".join(capsys.readouterr().out.split())
+    # Skip the usage line, which names every option too
+    listed = text.split("options:", 1)[1]
+    return listed.split(f" {option} ", 1)[1].split(f" {next_option} ", 1)[0]
+
+
 class TestIntervalDiscountArgument:
     """--interval-discount is optional, range-checked, and passed through."""
 
@@ -617,6 +641,15 @@ class TestTrimSweepArgument:
                 kwargs["band_sweep"], kwargs["cap_sweep"]) == (False, True, True, True, True)
         assert ") | trim sweep=off | live rule=" in caplog.text
 
+    def test_the_help_names_the_flag_that_makes_one_live_run_trim(self, cli, monkeypatch,
+                                                                    capsys):
+        # The help names main.py --trim-to-kelly, which makes one live run trim
+        # whatever is saved
+        text = _option_help(monkeypatch, capsys, "--no-trim-sweep", "--no-trim-rise-sweep")
+        assert text.startswith("Skip the dashboard's Trim to Kelly select")
+        assert "trims only when its saved trim_to_kelly is on" not in text
+        assert "trims by its own saved trim_to_kelly (main.py --trim-to-kelly for one run)" in text
+
 
 class TestTrimRiseSweepArgument:
     """--no-trim-rise-sweep: the Trim to Kelly family's minimum price rises
@@ -680,6 +713,14 @@ class TestTrimRiseSweepArgument:
         assert "Skip the dashboard's Min. price rise select" in text
         assert "Trim to Kelly itself is still built" in text
         assert "sweep_kwargs" not in cli
+
+    def test_the_help_names_the_flag_that_sets_one_live_runs_minimum(self, cli, monkeypatch,
+                                                                       capsys):
+        # The help names main.py --trim-min-rise, which sets one live run's minimum
+        text = _option_help(monkeypatch, capsys, "--no-trim-rise-sweep", "--sell-workers")
+        assert text.startswith("Skip the dashboard's Min. price rise select")
+        assert text.endswith("waits for a price rise by its own saved trim_min_rise "
+                             "(main.py --trim-min-rise for one run)")
 
 
 class TestSellWorkersArgument:

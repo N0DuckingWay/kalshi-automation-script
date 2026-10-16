@@ -2,25 +2,28 @@
 leg-side tuples, the deadline-gap tier (with the backtest's spread band and
 tier-floors switch), the live toggles (LiveSettings and its helpers), the saved
 live defaults (their file's reader and writer, the seed, and the comparison of
-two sets of defaults), the weekly run schedule (ScheduledRun), the values
+two sets of defaults), the weekly run schedule (ScheduledRun), the wait
+before a Kelly trim (kelly_trim_rested, kelly_trim_min_days, trade_day), the values
 config.py ships, conftest's apply_pre_toggle_defaults, the V2 order path's
 self-trade-prevention value, the startup check that refuses any order path but
 "v2" (order_api_version_error), the order-write pacer's budget, the live-run
 lock's exit code, file and waits, and PROJECT_ROOT."""
 import ast
 import dataclasses
+import enum
 import importlib
 import importlib.util
 import json
 import logging
 import math
+import numbers
 import os
 import pathlib
 import random
 import re
 import sys
 import threading
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -68,15 +71,16 @@ from .conftest import apply_pre_toggle_defaults
 
 def _settings(tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
               same_title_size_cap=1.0, categories=None, tags=None, add_to_held_pairs=False,
-              sell_at=None, sell_min_days=None):
+              sell_at=None, sell_min_days=None, trim_to_kelly=False, trim_min_rise=None):
     """A LiveSettings with every toggle named, defaulting to the pre-toggle
-    values conftest's apply_pre_toggle_defaults pins (and no selling)."""
+    values conftest's apply_pre_toggle_defaults pins (no selling, no trimming)."""
     return LiveSettings(tier_floors=tier_floors, spread_band=spread_band,
                         interval_discount=interval_discount, size_cap=size_cap,
                         same_title_size_cap=same_title_size_cap,
                         categories=categories, tags=tags,
                         add_to_held_pairs=add_to_held_pairs,
-                        sell_at=sell_at, sell_min_days=sell_min_days)
+                        sell_at=sell_at, sell_min_days=sell_min_days,
+                        trim_to_kelly=trim_to_kelly, trim_min_rise=trim_min_rise)
 
 
 # An origin as read_saved_live_defaults writes it: any origin but config.py's
@@ -1077,6 +1081,104 @@ class TestLiveSettings:
         # A level without a minimum is fine
         assert dataclasses.replace(on, sell_min_days=None).sell_at == 0.85
 
+    @pytest.mark.parametrize("bad", [1, 0, None, "True", "on", 1.0])
+    def test_trim_to_kelly_must_be_exactly_a_bool(self, bad):
+        # A saved file's JSON 1 or "true" must never read as on
+        with pytest.raises(ValueError, match="trim_to_kelly must be True or False"):
+            _settings(trim_to_kelly=bad)
+        with pytest.raises(ValueError, match="trim_to_kelly must be True or False"):
+            dataclasses.replace(_settings(), trim_to_kelly=bad)
+
+    def test_trimming_defaults_to_off_with_no_minimum(self):
+        # Naming neither reads trimming as off
+        s = LiveSettings(True, (0.0, 1.0), 0.75, 0.2)
+        assert s.trim_to_kelly is False and s.trim_min_rise is None
+        assert _settings().trim_to_kelly is False and _settings().trim_min_rise is None
+        on = _settings(trim_to_kelly=True)
+        assert on.trim_to_kelly is True and on.trim_min_rise is None
+        # replace can turn both back off
+        both = _settings(trim_to_kelly=True, trim_min_rise=0.10)
+        assert dataclasses.replace(both, trim_to_kelly=False, trim_min_rise=None) == _settings()
+
+    # 0.07 and 0.125 sit between 5c steps; 1e-7 and 1e-6 round to zero steps;
+    # 1.05 is past $1; 10 is ten dollars, not ten cents
+    @pytest.mark.parametrize("bad", [
+        0, 0.0, -0.05, 0.01, 0.07, 0.125, 0.049, 1.05, 1.01, 2, 10, 100, 1e-7, 1e-6,
+        float("nan"), float("inf"), float("-inf"), 1e308, 10 ** 400, True, False,
+        "0.10", "10c", [0.10], (0.10,)])
+    def test_trim_min_rise_off_the_5c_grid_or_out_of_range_is_refused(self, bad):
+        with pytest.raises(ValueError, match="trim_min_rise"):
+            _settings(trim_to_kelly=True, trim_min_rise=bad)
+        with pytest.raises(ValueError, match="trim_min_rise"):
+            dataclasses.replace(_settings(trim_to_kelly=True), trim_min_rise=bad)
+
+    def test_trim_min_rise_names_its_grid_or_its_type(self):
+        # Off the grid names the grid; a non-number (a bool too) asks for dollars
+        with pytest.raises(ValueError, match=re.escape(
+                "trim_min_rise must be a multiple of 5c from 5c to $1, got 0.07")):
+            _settings(trim_to_kelly=True, trim_min_rise=0.07)
+        for bad in (True, "0.10"):
+            with pytest.raises(ValueError, match=re.escape(
+                    f"trim_min_rise must be a number of dollars, got {bad!r}")):
+                _settings(trim_to_kelly=True, trim_min_rise=bad)
+
+    def test_trim_min_rise_on_the_grid_is_accepted_as_a_float(self):
+        # Every 5c step from 5c to $1, as its cents over 100
+        step = config.TRIM_PRICE_RISE_STEP_CENTS
+        assert step == 5
+        for cents in range(step, 101, step):
+            s = _settings(trim_to_kelly=True, trim_min_rise=cents / 100)
+            assert s.trim_min_rise == cents / 100 and type(s.trim_min_rise) is float
+        # A whole dollar given as an int reads as the float 1.0
+        one = _settings(trim_to_kelly=True, trim_min_rise=1)
+        assert one.trim_min_rise == 1.0 and type(one.trim_min_rise) is float
+
+    def test_trim_min_rise_is_normalised_onto_the_grid(self):
+        # 0.05 * 3 is 0.15000000000000002; every minimum comes back as its cents
+        # over 100, as the dashboard's options (TRIM_MIN_PRICE_RISES) spell them
+        assert 0.05 * 3 != 0.15
+        assert _settings(trim_to_kelly=True, trim_min_rise=0.05 * 3).trim_min_rise == 0.15
+        for steps in range(1, 21):
+            assert _settings(trim_to_kelly=True,
+                             trim_min_rise=0.05 * steps).trim_min_rise == steps * 5 / 100
+        for rise in config.TRIM_MIN_PRICE_RISES:
+            assert _settings(trim_to_kelly=True, trim_min_rise=rise).trim_min_rise == rise
+        # Float noise well inside PRICE_EPSILON snaps to the step
+        assert _settings(trim_to_kelly=True, trim_min_rise=0.1 + 1e-9).trim_min_rise == 0.1
+
+    def test_trim_min_rise_with_trimming_off_is_refused(self):
+        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly on"):
+            _settings(trim_min_rise=0.10)
+        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly on"):
+            _settings(trim_to_kelly=False, trim_min_rise=0.10)
+        # replace re-validates: turning trimming off under a minimum is refused too
+        on = _settings(trim_to_kelly=True, trim_min_rise=0.10)
+        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly on"):
+            dataclasses.replace(on, trim_to_kelly=False)
+        # Trimming with no minimum is fine, and so is turning both off together
+        assert dataclasses.replace(on, trim_min_rise=None).trim_to_kelly is True
+        assert dataclasses.replace(on, trim_to_kelly=False, trim_min_rise=None) == _settings()
+
+    def test_a_bad_minimum_is_named_before_the_switch_it_needs(self):
+        # Off the grid with trimming off: the bad value is named first
+        with pytest.raises(ValueError, match="multiple of 5c"):
+            _settings(trim_min_rise=0.07)
+
+    @pytest.mark.parametrize("doc, stale", [
+        ("README.md", "since live trading has no such setting"),
+        ("CLAUDE.md", "there is no live setting to save it as"),
+        ("CLAUDE.md", "What is missing: a toggle on `LiveSettings`"),
+        ("CLAUDE.md", "missing for the minimum: a `trim_min_rise` setting on `LiveSettings`"),
+    ])
+    def test_the_docs_do_not_say_live_has_no_trim_setting(self, doc, stale):
+        # Both trim settings are live settings, so neither document may say
+        # live trading lacks them
+        assert {"trim_to_kelly", "trim_min_rise"} <= set(config.LIVE_TOGGLE_FIELDS)
+        text = (pathlib.Path(__file__).resolve().parent.parent / doc).read_text(
+            encoding="utf-8")
+        # Whitespace is collapsed, so a sentence wrapped over lines still matches
+        assert stale not in " ".join(text.split())
+
     def test_every_optional_toggle_is_a_field_with_a_default_at_the_end(self):
         # A toggle a saved file may leave out must have a default to read as,
         # and sit after every required toggle, so a positional construction
@@ -1168,10 +1270,13 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "ADD_TO_HELD_PAIRS", not config.ADD_TO_HELD_PAIRS)
         monkeypatch.setattr(config, "SELL_AT", 0.85)
         monkeypatch.setattr(config, "SELL_MIN_DAYS", 3)
+        monkeypatch.setattr(config, "TRIM_TO_KELLY", not config.TRIM_TO_KELLY)
+        monkeypatch.setattr(config, "TRIM_MIN_RISE", 0.10)
         expected = _settings(True, (0.1, 0.6), 0.6, 0.35, 0.25,
                              ("Economics",), ("Oil & Gas",),
                              add_to_held_pairs=not shipped.add_to_held_pairs,
-                             sell_at=0.85, sell_min_days=3)
+                             sell_at=0.85, sell_min_days=3,
+                             trim_to_kelly=True, trim_min_rise=0.10)
         assert live_settings() == expected
         assert all(getattr(expected, name) != getattr(shipped, name)
                    for name in config.LIVE_TOGGLE_FIELDS)
@@ -1199,8 +1304,11 @@ class TestLiveSettings:
             add_to_held_pairs=config.ADD_TO_HELD_PAIRS,
             sell_at=config.SELL_AT,
             sell_min_days=config.SELL_MIN_DAYS,
+            trim_to_kelly=config.TRIM_TO_KELLY,
+            trim_min_rise=config.TRIM_MIN_RISE,
         )
         assert type(s.tier_floors) is bool and type(s.add_to_held_pairs) is bool
+        assert type(s.trim_to_kelly) is bool
 
     def test_live_settings_refuses_an_invalid_sell_constant(self, monkeypatch):
         monkeypatch.setattr(config, "SELL_AT", 0.855)
@@ -1209,6 +1317,20 @@ class TestLiveSettings:
         monkeypatch.setattr(config, "SELL_AT", None)
         monkeypatch.setattr(config, "SELL_MIN_DAYS", 3)
         with pytest.raises(ValueError, match="sell_min_days needs a sell level"):
+            live_settings()
+
+    def test_live_settings_refuses_an_invalid_trim_constant(self, monkeypatch):
+        monkeypatch.setattr(config, "TRIM_TO_KELLY", 1)
+        with pytest.raises(ValueError, match="trim_to_kelly"):
+            live_settings()
+        # A minimum off the 5c grid, then one with trimming off
+        monkeypatch.setattr(config, "TRIM_TO_KELLY", True)
+        monkeypatch.setattr(config, "TRIM_MIN_RISE", 0.07)
+        with pytest.raises(ValueError, match="trim_min_rise must be a multiple of 5c"):
+            live_settings()
+        monkeypatch.setattr(config, "TRIM_TO_KELLY", False)
+        monkeypatch.setattr(config, "TRIM_MIN_RISE", 0.10)
+        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly on"):
             live_settings()
 
     @pytest.mark.parametrize("cap", [0, 0.37, 1.01, float("nan"), True, "0.2", None, 1e-7])
@@ -1258,11 +1380,13 @@ class TestLiveSettings:
         assert s.categories is None and s.tags is None
         assert s.add_to_held_pairs is False
         assert s.sell_at is None and s.sell_min_days is None
+        assert s.trim_to_kelly is False and s.trim_min_rise is None
         # Defaulted and last of the toggles: the first five fields keep their
         # positions, so a positional construction of up to nine still builds;
         # origin, not a toggle, comes after them
-        assert list(config.LIVE_TOGGLE_FIELDS)[-5:] == [
-            "categories", "tags", "add_to_held_pairs", "sell_at", "sell_min_days"]
+        assert list(config.LIVE_TOGGLE_FIELDS)[-7:] == [
+            "categories", "tags", "add_to_held_pairs", "sell_at", "sell_min_days",
+            "trim_to_kelly", "trim_min_rise"]
         assert [f.name for f in dataclasses.fields(LiveSettings)][-1] == "origin"
         assert LiveSettings(True, (0.0, 1.0), 0.75, 0.2, 1.0, ("Sports",),
                             ("Hockey",)).tags == ("Hockey",)
@@ -2215,6 +2339,65 @@ class TestKellyTrimCount:
         assert trimmed > 200 and bound > 200
 
 
+class TestKellyTrimBids:
+    """config.kelly_trim_bids: which bids of a held side a live Kelly trim may
+    sell into (those within KELLY_TRIM_MAX_BID_DROP, 20c, of the best bid)."""
+
+    def test_the_reach_is_the_backtests_modeled_ladders(self):
+        # Live reaches as deep as the backtest's modeled bid ladder, whose last
+        # step is the last of DEPTH_MODEL_DISTANCES
+        assert config.KELLY_TRIM_MAX_BID_DROP == config.DEPTH_MODEL_DISTANCES[-1] == 0.20
+        assert max(config.DEPTH_MODEL_DISTANCES) == config.DEPTH_MODEL_DISTANCES[-1]
+
+    def test_bids_further_below_the_best_bid_are_left_out(self):
+        ladder = [[0.42, 1], [0.22, 2], [0.21, 3]]
+        assert config.kelly_trim_bids(ladder, 0.20) == [[0.42, 1], [0.22, 2]]
+        # A gap: one contract at the best bid, then a stub far below
+        assert config.kelly_trim_bids([[0.42, 1.0], [0.02, 100_000.0]], 0.20) == [[0.42, 1.0]]
+        # Nothing below the reach: the whole ladder
+        assert config.kelly_trim_bids([[0.52, 1], [0.45, 2], [0.32, 2]], 0.20) == [
+            [0.52, 1], [0.45, 2], [0.32, 2]]
+
+    def test_it_hands_back_the_very_levels_in_a_new_list(self):
+        ladder = [[0.42, 1], [0.30, 2], [0.10, 3]]
+        kept = config.kelly_trim_bids(ladder, 0.20)
+        assert kept is not ladder and len(ladder) == 3
+        assert kept[0] is ladder[0] and kept[1] is ladder[1]
+
+    def test_a_bid_exactly_the_reach_below_is_kept_on_every_whole_cent(self):
+        # Float subtraction lands a hair either side of the cent; a bid exactly
+        # 20c under the best is kept either way, one a cent lower is not
+        assert 0.55 - 0.20 > 0.35 and 0.42 - 0.20 < 0.22
+        for cents in range(22, 100):
+            best, at, under = cents / 100, (cents - 20) / 100, (cents - 21) / 100
+            assert config.kelly_trim_bids([[best, 1], [at, 2], [under, 3]], 0.20) == [
+                [best, 1], [at, 2]], cents
+
+    def test_a_tick_past_the_reach_is_left_out_on_the_finest_grid(self):
+        # The float allowance is far under Kalshi's finest step ($0.0001)
+        assert config.kelly_trim_bids([[0.42, 1], [0.2199, 2]], 0.20) == [[0.42, 1]]
+        assert config.kelly_trim_bids([[0.9999, 1], [0.7999, 2], [0.7998, 3]], 0.20) == [
+            [0.9999, 1], [0.7999, 2]]
+
+    def test_no_reach_keeps_only_the_best_bids_own_price(self):
+        assert config.kelly_trim_bids([[0.42, 1], [0.42, 4], [0.41, 2]], 0) == [
+            [0.42, 1], [0.42, 4]]
+
+    def test_the_best_bid_is_always_kept_and_an_empty_ladder_is_empty(self):
+        assert config.kelly_trim_bids([[0.05, 7]], 0.20) == [[0.05, 7]]
+        assert config.kelly_trim_bids([], 0.20) == []
+        assert config.kelly_trim_bids((), 0.20) == []
+
+    @pytest.mark.parametrize("drop", [None, True, False, "0.2", -0.01, float("nan"),
+                                      float("inf")])
+    def test_a_bad_reach_is_refused(self, drop):
+        with pytest.raises(ValueError, match="KELLY_TRIM_MAX_BID_DROP"):
+            config.kelly_trim_bids([[0.42, 1]], drop)
+        # ... even when there is nothing to cut
+        with pytest.raises(ValueError, match="KELLY_TRIM_MAX_BID_DROP"):
+            config.kelly_trim_bids([], drop)
+
+
 class TestTrimMinPriceRises:
     """config.TRIM_MIN_PRICE_RISES: the minimum price rises the dashboard's
     Min. price rise select offers, every 5c from 5c to 95c."""
@@ -2309,6 +2492,460 @@ class TestTrimRiseReached:
         assert found == 2
 
 
+# The message kelly_trim_min_days refuses a bad number of days with
+_BAD_TRIM_DAYS = r"KELLY_TRIM_MIN_DAYS_SINCE_TRADE must be a whole number from 0 to 30, got "
+
+
+class TestKellyTrimRested:
+    """config.kelly_trim_rested and config.kelly_trim_min_days: the calendar
+    days a held pair must go without a trade before a Kelly trim (7 as shipped).
+
+    The rule compares two plain dates with a checked number of days and reads
+    no clock or schedule, so it holds however often runs happen. A missing
+    last trade is an error, never "rested".
+    """
+
+    def test_seven_days_ship(self):
+        assert config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE == 7
+        assert type(config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE) is int
+        assert config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX == 30
+        assert type(config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX) is int
+        # The shipped wait passes its own check
+        assert config.kelly_trim_min_days(config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE) == 7
+
+    @pytest.mark.parametrize("gap", range(0, 9))
+    def test_every_gap_from_0_to_8_days(self, gap):
+        # Bought on a Tuesday: not rested the same day or on any of the next
+        # six, rested from the next Tuesday on
+        last = date(2026, 10, 6)
+        assert last.weekday() == 1
+        day = last + timedelta(days=gap)
+        assert config.kelly_trim_rested(last, day, 7) is (gap >= 7)
+
+    def test_the_gap_alone_decides_from_any_start_day(self):
+        # Every start day of 2027-2028 (a leap day and clock changes among
+        # them), gaps up to 32 days, several waits: only the calendar gap decides
+        first = date(2027, 1, 1)
+        assert date(2028, 2, 29) > first  # 2028 is a leap year
+        for offset in range(731):
+            last = first + timedelta(days=offset)
+            for gap in range(33):
+                day = last + timedelta(days=gap)
+                for wait in (0, 1, 7, 8, 14, 15, 30):
+                    assert config.kelly_trim_rested(last, day, wait) is (gap >= wait), (
+                        last, day, wait)
+
+    @pytest.mark.parametrize("wait", [0, 1, 7, 30])
+    @pytest.mark.parametrize("ahead", [1, 2, 7, 8, 30, 365])
+    def test_a_last_trade_after_the_day_never_rests(self, ahead, wait):
+        # A last trade dated after the day never counts as rested, even with no wait
+        day = date(2026, 10, 13)
+        assert config.kelly_trim_rested(day + timedelta(days=ahead), day, wait) is False
+
+    def test_no_wait_rests_from_the_day_of_the_trade(self):
+        day = date(2026, 10, 13)
+        assert config.kelly_trim_rested(day, day, 0) is True
+        assert config.kelly_trim_rested(day, day, 1) is False
+        assert config.kelly_trim_rested(day - timedelta(days=1), day, 1) is True
+
+    def test_once_rested_a_pair_stays_rested_and_a_longer_wait_never_rests_sooner(self):
+        last = date(2026, 10, 6)
+        for wait in range(0, 31):
+            rested = [config.kelly_trim_rested(last, last + timedelta(days=gap), wait)
+                      for gap in range(0, 40)]
+            # False for the first `wait` days, True from then on
+            assert rested == [False] * wait + [True] * (40 - wait)
+
+    def test_the_worked_example(self):
+        # Bought on Tuesday the 6th: runs on the 7th through the 12th do not
+        # trim it, a run on Tuesday the 13th may
+        bought = date(2026, 10, 6)
+        for run_day in range(7, 13):
+            assert not config.kelly_trim_rested(bought, date(2026, 10, run_day), 7)
+        assert config.kelly_trim_rested(bought, date(2026, 10, 13), 7)
+        # Trimmed on the 13th: a second run that day and runs on the 14th
+        # through the 19th leave it alone
+        trimmed = date(2026, 10, 13)
+        for run_day in range(13, 20):
+            assert not config.kelly_trim_rested(trimmed, date(2026, 10, run_day), 7)
+        assert config.kelly_trim_rested(trimmed, date(2026, 10, 20), 7)
+        # An add-on on Friday the 9th instead moves the first day to Friday the 16th
+        added = date(2026, 10, 9)
+        assert not config.kelly_trim_rested(added, date(2026, 10, 13), 7)
+        assert not config.kelly_trim_rested(added, date(2026, 10, 15), 7)
+        assert config.kelly_trim_rested(added, date(2026, 10, 16), 7)
+
+    def test_a_missing_last_trade_is_an_error_never_rested(self):
+        day = date(2026, 10, 13)
+        # Not with the shipped wait, and not with no wait either
+        for wait in (7, 0):
+            with pytest.raises(TypeError, match="two calendar dates"):
+                config.kelly_trim_rested(None, day, wait)
+            with pytest.raises(TypeError, match="two calendar dates"):
+                config.kelly_trim_rested(day, None, wait)
+
+    def test_a_datetime_is_refused(self):
+        # Datetimes count 24-hour spans, not calendar days (11pm on the 6th to
+        # 9am on the 13th is 6 spans but 7 days), so they are refused
+        last = datetime(2026, 10, 6, 23, 0, tzinfo=UTC)
+        now = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
+        assert (now - last).days == 6
+        assert config.kelly_trim_rested(last.date(), now.date(), 7) is True
+        for last_trade, day in ((last, now), (last, now.date()), (last.date(), now),
+                                (last.replace(tzinfo=None), now.date())):
+            with pytest.raises(TypeError, match="two calendar dates"):
+                config.kelly_trim_rested(last_trade, day, 7)
+
+    def test_anything_but_a_plain_date_is_refused(self):
+        class _Day(date):
+            """A date by subclass, as a clock-freezing stand-in might be."""
+
+        good = date(2026, 10, 13)
+        for bad in ("2026-10-06", 20261006, 1791244800.0, (2026, 10, 6), _Day(2026, 10, 6),
+                    MagicMock(), timedelta(days=7)):
+            for last_trade, day in ((bad, good), (good, bad), (bad, bad)):
+                with pytest.raises(TypeError, match="two calendar dates"):
+                    config.kelly_trim_rested(last_trade, day, 7)
+
+    @pytest.mark.parametrize("bad", [True, False, 7.0, 7.5, -1, 31, None, "7", float("nan")],
+                             ids=repr)
+    def test_a_wait_that_is_not_a_checked_whole_number_gets_no_answer(self, bad):
+        # Checked on every call: a negative wait would rest a pair traded
+        # tomorrow, and True would read as one day
+        for last, day in ((date(2026, 10, 6), date(2026, 10, 13)),
+                          (date(2026, 10, 13), date(2026, 10, 13)),
+                          (date(2026, 10, 14), date(2026, 10, 13))):
+            with pytest.raises(ValueError, match=_BAD_TRIM_DAYS):
+                config.kelly_trim_rested(last, day, bad)
+
+    @pytest.mark.parametrize("days", [0, 1, 7, 8, 14, 15, 30])
+    def test_min_days_returns_a_whole_number_in_range_as_a_plain_int(self, days):
+        checked = config.kelly_trim_min_days(days)
+        assert checked == days and type(checked) is int
+
+    @pytest.mark.parametrize("bad", [True, False, 7.0, 7.5, -1, 31, 1000, None, "7", b"7", [7],
+                                     float("nan"), float("inf")], ids=repr)
+    def test_min_days_refuses_anything_else(self, bad):
+        with pytest.raises(ValueError, match=_BAD_TRIM_DAYS) as refused:
+            config.kelly_trim_min_days(bad)
+        # The message shows what was handed in
+        assert str(refused.value).endswith(f"got {bad!r}")
+
+    def test_min_days_reads_numpy_numbers_by_kind(self):
+        import numpy as np
+
+        # A numpy whole number is a whole number, and comes back a plain int
+        for good in (np.int64(7), np.uint8(7), np.int8(7), np.int32(7)):
+            checked = config.kelly_trim_min_days(good)
+            assert checked == 7 and type(checked) is int
+        for bad in (np.bool_(True), np.float64(7.0), np.int64(31), np.int64(-1)):
+            with pytest.raises(ValueError, match=_BAD_TRIM_DAYS):
+                config.kelly_trim_min_days(bad)
+
+    @pytest.mark.parametrize("unit", [None, "ns", "us", "ms", "s", "m", "h", "D", "W", "M", "Y"],
+                             ids=str)
+    def test_min_days_refuses_a_numpy_duration(self, unit):
+        import numpy as np
+
+        # numpy counts a duration (timedelta64) as a whole number, but it is
+        # not a plain number of days, so it is refused in any unit
+        duration = np.timedelta64(7) if unit is None else np.timedelta64(7, unit)
+        assert isinstance(duration, numbers.Integral)
+        with pytest.raises(ValueError, match=_BAD_TRIM_DAYS) as refused:
+            config.kelly_trim_min_days(duration)
+        assert str(refused.value).endswith(f"got {duration!r}")
+
+    def test_a_wait_written_as_a_month_is_not_read_as_one_day(self):
+        import numpy as np
+
+        # A duration gets no answer, so a month is never read as one day
+        day = date(2026, 10, 13)
+        for wait in (np.timedelta64(1, "M"), np.timedelta64(1, "Y"), np.timedelta64(7, "ns"),
+                     np.timedelta64(1), np.timedelta64(1, "D")):
+            for last in (day - timedelta(days=1), day - timedelta(days=7), day):
+                with pytest.raises(ValueError, match=_BAD_TRIM_DAYS):
+                    config.kelly_trim_rested(last, day, wait)
+
+    def test_min_days_reads_a_whole_number_by_subclass_as_a_plain_int(self):
+        class _Days(enum.IntEnum):
+            """A whole number by subclass of int."""
+
+            WEEK = 7
+
+        checked = config.kelly_trim_min_days(_Days.WEEK)
+        assert checked == 7 and type(checked) is int
+
+    def test_the_maximum_is_read_when_the_check_runs(self, monkeypatch):
+        monkeypatch.setattr(config, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX", 10)
+        assert config.kelly_trim_min_days(10) == 10
+        with pytest.raises(ValueError, match="whole number from 0 to 10, got 11"):
+            config.kelly_trim_min_days(11)
+
+    def test_the_rule_reads_only_what_it_is_handed(self):
+        # Each function may read only the names listed: no clock, no weekday,
+        # and no schedule but the one handed to trade_day, so the wait holds
+        # however often runs happen
+        tree = ast.parse(pathlib.Path(config.__file__).read_text())
+        allowed = {
+            "kelly_trim_min_days": {"isinstance", "bool", "numbers", "operator", "TypeError",
+                                    "ValueError", "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX"},
+            "trade_day": {"isinstance", "datetime", "ScheduledRun", "TypeError"},
+            "kelly_trim_rested": {"type", "date", "TypeError", "kelly_trim_min_days"},
+        }
+        # Attributes allowed: trade_day reads only its schedule's zone, and
+        # kelly_trim_min_days only operator.index (which refuses a numpy duration)
+        attributes = {("trade_day", "run"): {"zone"},
+                      ("kelly_trim_min_days", "operator"): {"index"}}
+        found = 0
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in allowed:
+                found += 1
+                # The body alone: the signature's type names are not reads
+                inside = [sub for statement in node.body for sub in ast.walk(statement)]
+                names = [sub for sub in inside if isinstance(sub, ast.Name)]
+                # Its parameters and the names it assigns are its own
+                own = ({arg.arg for arg in node.args.args}
+                       | {sub.id for sub in names if isinstance(sub.ctx, ast.Store)})
+                assert {sub.id for sub in names} - own <= allowed[node.name], node.name
+                for (function, name), expected in attributes.items():
+                    if function == node.name:
+                        read = {sub.attr for sub in inside if isinstance(sub, ast.Attribute)
+                                and isinstance(sub.value, ast.Name) and sub.value.id == name}
+                        assert read == expected, (function, name)
+        assert found == 3
+
+
+_PACIFIC = ZoneInfo("America/Los_Angeles")
+
+
+def _pacific_day_by_hand(moment: datetime) -> date:
+    """
+    Work out a 2026 moment's Pacific day by hand, as a check on trade_day.
+
+    Daylight time (UTC-7) runs from 10:00 UTC on 2026-03-08 to 09:00 UTC on
+    2026-11-01; standard time (UTC-8) holds otherwise.
+
+    Args:
+        moment (datetime): A UTC time in 2026.
+
+    Returns:
+        date: The day a Pacific wall clock shows at that moment.
+    """
+    daylight = (datetime(2026, 3, 8, 10, 0, tzinfo=UTC) <= moment
+                < datetime(2026, 11, 1, 9, 0, tzinfo=UTC))
+    return (moment.replace(tzinfo=None) - timedelta(hours=7 if daylight else 8)).date()
+
+
+class TestTradeDay:
+    """config.trade_day: the calendar day a moment falls on, in the zone of the
+    bot's schedule (Pacific as shipped).
+
+    The trim wait counts these days, so a late-evening Pacific trade counts on
+    that evening's day, not the next UTC day. A time with no zone is refused.
+    """
+
+    def test_1159pm_and_1201am_pacific_are_two_days(self):
+        before = datetime(2026, 10, 13, 23, 59, tzinfo=_PACIFIC)
+        after = datetime(2026, 10, 14, 0, 1, tzinfo=_PACIFIC)
+        assert config.trade_day(before, SCHEDULED_RUN) == date(2026, 10, 13)
+        assert config.trade_day(after, SCHEDULED_RUN) == date(2026, 10, 14)
+        # The same two moments as Kalshi stamps them, in UTC (one UTC date)
+        before_utc, after_utc = before.astimezone(UTC), after.astimezone(UTC)
+        assert before_utc.date() == after_utc.date() == date(2026, 10, 14)
+        assert config.trade_day(before_utc, SCHEDULED_RUN) == date(2026, 10, 13)
+        assert config.trade_day(after_utc, SCHEDULED_RUN) == date(2026, 10, 14)
+
+    def test_459pm_and_501pm_pacific_are_one_day(self):
+        # Under daylight time 5pm Pacific is midnight UTC, so the two straddle it
+        before = datetime(2026, 10, 13, 16, 59, tzinfo=_PACIFIC)
+        after = datetime(2026, 10, 13, 17, 1, tzinfo=_PACIFIC)
+        before_utc, after_utc = before.astimezone(UTC), after.astimezone(UTC)
+        assert (before_utc.date(), after_utc.date()) == (date(2026, 10, 13), date(2026, 10, 14))
+        for moment in (before, after, before_utc, after_utc):
+            assert config.trade_day(moment, SCHEDULED_RUN) == date(2026, 10, 13)
+        # Under standard time midnight UTC is 4pm Pacific
+        winter_before = datetime(2026, 12, 15, 23, 59, tzinfo=UTC)   # 3:59pm Pacific
+        winter_after = datetime(2026, 12, 16, 0, 1, tzinfo=UTC)      # 4:01pm Pacific
+        assert config.trade_day(winter_before, SCHEDULED_RUN) == date(2026, 12, 15)
+        assert config.trade_day(winter_after, SCHEDULED_RUN) == date(2026, 12, 15)
+
+    @pytest.mark.parametrize(
+        ("moment", "expected"),
+        [
+            # Spring, 2026-03-08: Pacific clocks jump from 2:00am to 3:00am.
+            # Midnight Pacific is 08:00 UTC before the change and 07:00 UTC after
+            (datetime(2026, 3, 8, 7, 59, tzinfo=UTC), date(2026, 3, 7)),    # 11:59pm Saturday
+            (datetime(2026, 3, 8, 8, 1, tzinfo=UTC), date(2026, 3, 8)),     # 12:01am Sunday
+            (datetime(2026, 3, 8, 9, 59, tzinfo=UTC), date(2026, 3, 8)),    # 1:59am, before the jump
+            (datetime(2026, 3, 8, 10, 1, tzinfo=UTC), date(2026, 3, 8)),    # 3:01am, after it
+            (datetime(2026, 3, 9, 6, 59, tzinfo=UTC), date(2026, 3, 8)),    # 11:59pm Sunday
+            (datetime(2026, 3, 9, 7, 1, tzinfo=UTC), date(2026, 3, 9)),     # 12:01am Monday
+            (datetime(2026, 3, 9, 7, 30, tzinfo=UTC), date(2026, 3, 9)),    # 12:30am Monday ...
+            (datetime(2026, 3, 8, 7, 30, tzinfo=UTC), date(2026, 3, 7)),    # ... 11:30pm a day before
+            # Autumn, 2026-11-01: 2:00am goes back to 1:00am. Midnight Pacific
+            # is 07:00 UTC before the change and 08:00 UTC after
+            (datetime(2026, 11, 1, 6, 59, tzinfo=UTC), date(2026, 10, 31)),  # 11:59pm Saturday
+            (datetime(2026, 11, 1, 7, 1, tzinfo=UTC), date(2026, 11, 1)),    # 12:01am Sunday
+            (datetime(2026, 11, 1, 8, 30, tzinfo=UTC), date(2026, 11, 1)),   # 1:30am, the first time
+            (datetime(2026, 11, 1, 9, 30, tzinfo=UTC), date(2026, 11, 1)),   # 1:30am, the second
+            (datetime(2026, 11, 2, 7, 59, tzinfo=UTC), date(2026, 11, 1)),   # 11:59pm Sunday
+            (datetime(2026, 11, 2, 8, 1, tzinfo=UTC), date(2026, 11, 2)),    # 12:01am Monday
+            (datetime(2026, 11, 2, 7, 30, tzinfo=UTC), date(2026, 11, 1)),   # 11:30pm Sunday ...
+            (datetime(2026, 11, 1, 7, 30, tzinfo=UTC), date(2026, 11, 1)),   # ... 12:30am that day
+        ],
+        ids=lambda value: value.isoformat() if isinstance(value, datetime) else None,
+    )
+    def test_across_both_clock_changes(self, moment, expected):
+        assert config.trade_day(moment, SCHEDULED_RUN) == expected
+        assert _pacific_day_by_hand(moment) == expected
+
+    def test_a_repeated_wall_time_is_one_day_either_time(self):
+        # 1:30am happens twice on the autumn clock-change day
+        first = datetime(2026, 11, 1, 1, 30, tzinfo=_PACIFIC)
+        second = first.replace(fold=1)
+        assert first.astimezone(UTC) != second.astimezone(UTC)
+        assert config.trade_day(first, SCHEDULED_RUN) == date(2026, 11, 1)
+        assert config.trade_day(second, SCHEDULED_RUN) == date(2026, 11, 1)
+
+    def test_every_hour_of_a_year_matches_the_pacific_wall_clock(self):
+        # Each hour of 2026 at 29 minutes past, so no moment sits on a change
+        moment = datetime(2026, 1, 1, 0, 29, tzinfo=UTC)
+        while moment.year == 2026:
+            assert config.trade_day(moment, SCHEDULED_RUN) == _pacific_day_by_hand(moment), moment
+            moment += timedelta(hours=1)
+
+    def test_the_same_moment_in_any_zone_is_the_same_day(self):
+        moment = datetime(2026, 10, 14, 6, 30, tzinfo=UTC)   # 11:30pm Tuesday Pacific
+        zones = [ZoneInfo(name) for name in ("UTC", "America/Los_Angeles", "America/New_York",
+                                             "Asia/Tokyo", "Australia/Sydney")]
+        zones.append(timezone(timedelta(hours=5, minutes=30)))
+        for zone in zones:
+            assert config.trade_day(moment.astimezone(zone), SCHEDULED_RUN) == date(2026, 10, 13)
+
+    def test_the_day_is_read_on_the_schedules_zone_and_nothing_else_of_it(self):
+        moment = datetime(2026, 10, 14, 0, 30, tzinfo=UTC)   # 5:30pm Tuesday Pacific
+        assert config.trade_day(moment, SCHEDULED_RUN) == date(2026, 10, 13)
+        assert config.trade_day(moment, ScheduledRun(0, 9, 0, "UTC")) == date(2026, 10, 14)
+        assert config.trade_day(moment, ScheduledRun(0, 9, 0, "Asia/Tokyo")) == date(2026, 10, 14)
+        # The schedule's weekday and time of day play no part
+        for weekday, hour, minute in ((0, 9, 0), (3, 23, 59), (6, 0, 0)):
+            run = ScheduledRun(weekday, hour, minute, "America/Los_Angeles")
+            assert config.trade_day(moment, run) == date(2026, 10, 13)
+
+    def test_it_returns_a_plain_date_even_from_a_datetime_subclass(self):
+        class _Moment(datetime):
+            """A datetime by subclass, as a clock-freezing stand-in is."""
+
+        day = config.trade_day(_Moment(2026, 10, 14, 0, 30, tzinfo=UTC), SCHEDULED_RUN)
+        # Exactly what kelly_trim_rested accepts
+        assert type(day) is date and day == date(2026, 10, 13)
+        assert config.kelly_trim_rested(day, day, 0) is True
+
+    def test_a_time_with_no_zone_is_refused(self):
+        class _NoOffset(tzinfo):
+            """A zone object that gives no offset, so the time is still zoneless."""
+
+            def utcoffset(self, dt):
+                return None
+
+            def dst(self, dt):
+                return None
+
+            def tzname(self, dt):
+                return "none"
+
+        for bad in (datetime(2026, 10, 13, 9, 0), datetime(2026, 10, 13, 9, 0, tzinfo=_NoOffset()),
+                    date(2026, 10, 13), None, "2026-10-13T16:00:00Z", 1791907200, 1791907200.0):
+            with pytest.raises(TypeError, match="trade_day reads a time with a zone"):
+                config.trade_day(bad, SCHEDULED_RUN)
+
+    def test_an_unknown_zone_is_an_error(self):
+        with pytest.raises(ZoneInfoNotFoundError):
+            config.trade_day(datetime(2026, 10, 13, 16, 0, tzinfo=UTC),
+                             ScheduledRun(0, 9, 0, "No/Such_Zone"))
+
+    def test_only_a_schedule_can_be_the_bots_clock(self):
+        class _NoZone:
+            """Has a zone() like a schedule's, but it names no zone."""
+
+            def zone(self):
+                return None
+
+        moment = datetime(2026, 10, 14, 0, 30, tzinfo=UTC)
+        # Only a real ScheduledRun is accepted: a stand-in whose zone() returns
+        # None would put the day in this computer's own time zone
+        for bad in (None, "America/Los_Angeles", _PACIFIC, UTC, _NoZone(), MagicMock()):
+            with pytest.raises(TypeError, match="trade_day reads the zone of a ScheduledRun"):
+                config.trade_day(moment, bad)
+
+    def test_evening_trades_on_either_side_of_midnight_pacific(self):
+        def rested(fill: datetime, run: datetime) -> bool:
+            return config.kelly_trim_rested(config.trade_day(fill, SCHEDULED_RUN),
+                                            config.trade_day(run, SCHEDULED_RUN), 7)
+
+        # Traded at 11:59pm on Tuesday the 6th: a run just after midnight on
+        # Tuesday the 13th may trim, a little under 7 x 24 hours later
+        late = datetime(2026, 10, 6, 23, 59, tzinfo=_PACIFIC)
+        early_run = datetime(2026, 10, 13, 0, 1, tzinfo=_PACIFIC)
+        assert early_run - late < timedelta(days=7)
+        assert rested(late, early_run) is True
+        assert rested(late, datetime(2026, 10, 12, 23, 59, tzinfo=_PACIFIC)) is False
+        # Traded two minutes later, at 12:01am on Wednesday the 7th: no run on
+        # Tuesday the 13th may, not even its last minute
+        after_midnight = datetime(2026, 10, 7, 0, 1, tzinfo=_PACIFIC)
+        assert rested(after_midnight, early_run) is False
+        assert rested(after_midnight, datetime(2026, 10, 13, 23, 59, tzinfo=_PACIFIC)) is False
+        assert rested(after_midnight, datetime(2026, 10, 14, 0, 1, tzinfo=_PACIFIC)) is True
+
+    def test_an_evening_trade_counts_on_its_pacific_day_not_its_utc_day(self):
+        # 5:01pm Pacific on Tuesday the 6th is already Wednesday the 7th in UTC
+        fill = datetime(2026, 10, 7, 0, 1, tzinfo=UTC)
+        run = datetime(2026, 10, 13, 16, 0, tzinfo=UTC)     # 9am Pacific, Tuesday the 13th
+        last, today = config.trade_day(fill, SCHEDULED_RUN), config.trade_day(run, SCHEDULED_RUN)
+        assert (last, today) == (date(2026, 10, 6), date(2026, 10, 13))
+        assert config.kelly_trim_rested(last, today, 7) is True
+        # On a UTC clock the same two moments are six days apart
+        utc_clock = ScheduledRun(0, 9, 0, "UTC")
+        assert config.kelly_trim_rested(config.trade_day(fill, utc_clock),
+                                        config.trade_day(run, utc_clock), 7) is False
+
+    def test_a_run_at_any_hour_of_days_1_to_8_after_a_purchase(self):
+        # Bought at any hour of Tuesday the 6th; runs at any hour of the 7th
+        # through the 14th: only the two dates decide
+        for bought_hour in (0, 9, 16, 17, 23):
+            fill = datetime(2026, 10, 6, bought_hour, 30, tzinfo=_PACIFIC)
+            last = config.trade_day(fill, SCHEDULED_RUN)
+            for days_after in range(1, 9):
+                for run_hour in (0, 9, 16, 17, 23):
+                    run = datetime(2026, 10, 6 + days_after, run_hour, 15, tzinfo=_PACIFIC)
+                    today = config.trade_day(run, SCHEDULED_RUN)
+                    assert config.kelly_trim_rested(last, today, 7) is (days_after >= 7), (
+                        fill, run)
+
+    def test_the_wait_at_any_two_moments_of_a_year(self):
+        # Fills stamped in UTC at any second of 2026, runs up to ten days
+        # later: rested exactly when the Pacific dates are 7 or more apart
+        rng = random.Random(20261013)
+        start = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+        rested_count = 0
+        for _ in range(4000):
+            fill = start + timedelta(seconds=rng.randrange(0, 350 * 86_400))
+            run = fill + timedelta(seconds=rng.randrange(0, 10 * 86_400))
+            rested = config.kelly_trim_rested(config.trade_day(fill, SCHEDULED_RUN),
+                                              config.trade_day(run, SCHEDULED_RUN), 7)
+            by_hand = (_pacific_day_by_hand(run) - _pacific_day_by_hand(fill)).days >= 7
+            assert rested is by_hand, (fill, run)
+            # In elapsed time, rested needs over 6 days less an hour, and 7 days
+            # plus an hour is always enough (a clock change moves an hour)
+            if rested:
+                assert run - fill > timedelta(days=6) - timedelta(hours=1), (fill, run)
+            if run - fill >= timedelta(days=7, hours=1):
+                assert rested, (fill, run)
+            rested_count += rested
+        # Both answers are well covered
+        assert 500 < rested_count < 3500
+
+
 class TestDescribeTimeSeriesRule:
     """describe_time_series_rule says "no spread band" for (0, 1) alone and
     names any band with a floor or a ceiling of its own."""
@@ -2353,7 +2990,8 @@ class TestDescribeLiveSettings:
         assert config.describe_live_settings(s, s) == (
             "tier floors on | spread band none | k 0.75 | per-trade cap 20% | "
             "same-title cap 100% (no extra cap) | categories any | tags any | "
-            "add to held pairs off | sell at off | min days to maturity any")
+            "add to held pairs off | sell at off | min days to maturity any | "
+            "trim to Kelly off | min price rise any")
         assert config.describe_live_settings(s) == config.describe_live_settings(s, s)
 
     def test_the_shipped_values_render_with_no_mark(self):
@@ -2362,10 +3000,10 @@ class TestDescribeLiveSettings:
 
     # One departing value per live toggle (config.LIVE_TOGGLE_FIELDS) and the
     # mark it must carry; a new toggle fails test_every_field_has_a_departure_row
-    # until it has a row. Each departs from _REFERENCE, which sells at 85%: a
-    # minimum of days has no meaning without a level, and the level's own
-    # departure is to selling nothing
-    _REFERENCE = _settings(sell_at=0.85)
+    # until it has a row. _REFERENCE sells and trims, since a minimum of days
+    # needs a sell level and a minimum price rise needs trimming; those two
+    # depart by turning off
+    _REFERENCE = _settings(sell_at=0.85, trim_to_kelly=True)
     _DEPARTURES = {
         "tier_floors": (False, "tier floors off (config: on)"),
         "spread_band": ((0.1, 1.0), "spread band 0.1-1 (config: none)"),
@@ -2377,6 +3015,8 @@ class TestDescribeLiveSettings:
         "add_to_held_pairs": (True, "add to held pairs on (config: off)"),
         "sell_at": (None, "sell at off (config: 85% of potential profit)"),
         "sell_min_days": (3, "min days to maturity 3 (config: any)"),
+        "trim_to_kelly": (False, "trim to Kelly off (config: on)"),
+        "trim_min_rise": (0.10, "min price rise 10c (config: any)"),
     }
 
     def test_every_field_has_a_departure_row(self):
@@ -2389,13 +3029,38 @@ class TestDescribeLiveSettings:
             "tier floors off (config: on) | spread band 0-0.5 (config: none) | "
             "k 0.8 (config: 0.75) | per-trade cap 100% (no cap) (config: 20%) | "
             "same-title cap 20% (config: 100% (no extra cap)) | categories any | tags any | "
-            "add to held pairs off | sell at off | min days to maturity any")
+            "add to held pairs off | sell at off | min days to maturity any | "
+            "trim to Kelly off | min price rise any")
         for name in config.LIVE_TOGGLE_FIELDS:
             value, mark = self._DEPARTURES[name]
             line = config.describe_live_settings(
                 dataclasses.replace(self._REFERENCE, **{name: value}), self._REFERENCE)
             assert line.count("(config:") == 1, line
             assert mark in line, (name, line)
+
+    def test_trimming_renders_on_or_off_and_the_rise_in_whole_cents(self):
+        # Each 5c step prints as its exact cents (0.55 * 100 is 55.00000000000001)
+        assert [c for c in range(5, 101, 5) if c / 100 * 100 != c] == [55]
+        assert config.describe_live_settings(_settings()).endswith(
+            "trim to Kelly off | min price rise any")
+        assert config.describe_live_settings(_settings(trim_to_kelly=True)).endswith(
+            "trim to Kelly on | min price rise any")
+        for cents in range(5, 101, 5):
+            line = config.describe_live_settings(
+                _settings(trim_to_kelly=True, trim_min_rise=cents / 100))
+            assert line.endswith(f"trim to Kelly on | min price rise {cents}c"), (cents, line)
+        # Turning a minimum on over trimming with none marks that one field
+        ref = _settings(trim_to_kelly=True)
+        line = config.describe_live_settings(
+            _settings(trim_to_kelly=True, trim_min_rise=0.25), ref)
+        assert line.endswith("trim to Kelly on | min price rise 25c (config: any)")
+        assert line.count("(config:") == 1
+        # Turning trimming on with a minimum, over trimming off, marks both
+        line = config.describe_live_settings(
+            _settings(trim_to_kelly=True, trim_min_rise=0.10), _settings())
+        assert line.endswith(
+            "trim to Kelly on (config: off) | min price rise 10c (config: any)")
+        assert line.count("(config:") == 2
 
     def test_selling_renders_the_exact_whole_percent(self):
         # Off, then each level of the 1% grid as its whole percent: 0.29 * 100
@@ -2405,7 +3070,8 @@ class TestDescribeLiveSettings:
             line = config.describe_live_settings(_settings(sell_at=percent / 100))
             assert f"sell at {percent}% of potential profit |" in line, (percent, line)
         line = config.describe_live_settings(_settings(sell_at=0.85, sell_min_days=7))
-        assert line.endswith("sell at 85% of potential profit | min days to maturity 7")
+        assert line.endswith("sell at 85% of potential profit | min days to maturity 7 | "
+                             "trim to Kelly off | min price rise any")
 
     def test_k_renders_exactly(self):
         # 0.751 and 0.75 must never print alike: a departure would read as none
@@ -2426,7 +3092,8 @@ class TestDescribeLiveSettings:
         assert line == ("tier floors off | spread band 0-0.5 | k 0.8 | "
                         "per-trade cap 100% (no cap) | same-title cap 20% | "
                         "categories any | tags any | add to held pairs off | "
-                        "sell at off | min days to maturity any")
+                        "sell at off | min days to maturity any | "
+                        "trim to Kelly off | min price rise any")
 
     def test_a_filter_renders_its_names_and_any_for_none(self):
         # Each field renders the run's value, then config's in the mark; None is "any"
@@ -2466,7 +3133,8 @@ class TestDescribeLiveSettings:
             "tier floors off (default: on) | spread band 0-0.5 (default: none) | "
             "k 0.8 (default: 0.75) | per-trade cap 100% (no cap) (default: 20%) | "
             "same-title cap 20% (default: 100% (no extra cap)) | categories any | tags any | "
-            "add to held pairs off | sell at off | min days to maturity any")
+            "add to held pairs off | sell at off | min days to maturity any | "
+            "trim to Kelly off | min price rise any")
         assert "(config:" not in line
         # Every field's mark follows the reference's origin, one mark per departure
         saved = dataclasses.replace(self._REFERENCE, origin=_SAVED_ORIGIN)
@@ -2605,6 +3273,73 @@ class TestLiveRuleWarnings:
         assert len(out) == 2 and all("above the 10%" in text for text in out)
 
 
+class TestTrimChangeWarnings:
+    """trim_change_warnings: with the Kelly trim on, a lower size cap or a
+    higher k can sell more of the held pairs. One sentence names every such
+    change, and nothing else is warned about."""
+
+    # A per-trade and a same-title cap of 20%, k 0.8, the Kelly trim on
+    _NOW = LiveSettings(False, (0.0, 0.5), 0.8, 0.2, 0.2, trim_to_kelly=True)
+
+    @staticmethod
+    def _sentence(named: str) -> list:
+        return [f"with the Kelly trim on, these settings can sell more of the held pairs: "
+                f"{named}; each exact held pair worth more than its new Kelly size is sold "
+                "down to it before anything is bought, once the wait since its last trade "
+                "has passed"]
+
+    def test_each_change_that_sells_is_named(self):
+        new = dataclasses.replace
+        assert config.trim_change_warnings(self._NOW, new(self._NOW, size_cap=0.1)) == (
+            self._sentence("the time-series size cap goes from 20% to 10% and the "
+                           "same-title size cap goes from 20% to 10%"))
+        assert config.trim_change_warnings(
+            self._NOW, new(self._NOW, same_title_size_cap=0.1)) == self._sentence(
+                "the same-title size cap goes from 20% to 10%")
+        assert config.trim_change_warnings(
+            self._NOW, new(self._NOW, interval_discount=0.85)) == self._sentence(
+                "k goes from 0.8 to 0.85, which lowers a time-series pair's chance of paying")
+        # Three at once: a comma, then "and" before the last
+        assert config.trim_change_warnings(
+            self._NOW, new(self._NOW, size_cap=0.1, interval_discount=0.9)) == self._sentence(
+                "the time-series size cap goes from 20% to 10%, the same-title size cap goes "
+                "from 20% to 10% and k goes from 0.8 to 0.9, which lowers a time-series "
+                "pair's chance of paying")
+        # No cap at all reads as such
+        uncapped = new(self._NOW, size_cap=1.0, same_title_size_cap=1.0)
+        assert config.trim_change_warnings(uncapped, new(uncapped, size_cap=0.5)) == (
+            self._sentence("the time-series size cap goes from 100% (no cap) to 50% and the "
+                           "same-title size cap goes from 100% (no cap) to 50%"))
+
+    @pytest.mark.parametrize("change", [
+        # Trimming off in the proposed settings: nothing is trimmed at all
+        {"trim_to_kelly": False, "size_cap": 0.1},
+        # A cap raised, k lowered, or nothing changed: nothing more is sold
+        {"size_cap": 0.3}, {"interval_discount": 0.7}, {},
+        # Settings that only buy differently
+        {"tier_floors": True, "spread_band": (0.0, 1.0), "add_to_held_pairs": True},
+        # A minimum price rise only holds a trim back
+        {"trim_min_rise": 0.1},
+    ])
+    def test_nothing_is_said_when_no_more_is_sold(self, change):
+        assert config.trim_change_warnings(
+            self._NOW, dataclasses.replace(self._NOW, **change)) == []
+
+    def test_a_same_title_cap_held_below_by_the_per_trade_cap_moves_nothing(self):
+        # The same-title cap a pair is trimmed to is the lower of the two
+        before = dataclasses.replace(self._NOW, same_title_size_cap=1.0)
+        after = dataclasses.replace(before, same_title_size_cap=0.5)
+        assert config.pair_size_cap("same_title", 0.2, 1.0) == config.pair_size_cap(
+            "same_title", 0.2, 0.5)
+        assert config.trim_change_warnings(before, after) == []
+
+    def test_turning_trimming_on_is_judged_by_the_settings_it_trims_by(self):
+        # Saved off, proposed on with a lower cap: the first trims use the new
+        # cap, so it is named
+        off = dataclasses.replace(self._NOW, trim_to_kelly=False)
+        assert config.trim_change_warnings(off, dataclasses.replace(self._NOW, size_cap=0.1))
+
+
 class TestShippedLiveToggles:
     """The live toggles config.py ships, read unpatched end to end: any
     positive time-series spread up to 0.5 is admitted, books price up to a
@@ -2624,10 +3359,15 @@ class TestShippedLiveToggles:
         assert (config.TIME_SERIES_TIER_FLOORS, config.TIME_SERIES_SPREAD_BAND,
                 config.TIME_SERIES_INTERVAL_PROB_DISCOUNT, config.BUDGET_FRACTION,
                 config.SAME_TITLE_SIZE_CAP, config.TRADE_CATEGORIES, config.TRADE_TAGS,
-                config.ADD_TO_HELD_PAIRS, config.SELL_AT, config.SELL_MIN_DAYS) == (
-            False, (0.0, 0.5), 0.80, 1.0, 0.20, None, None, True, None, None)
+                config.ADD_TO_HELD_PAIRS, config.SELL_AT, config.SELL_MIN_DAYS,
+                config.TRIM_TO_KELLY, config.TRIM_MIN_RISE) == (
+            False, (0.0, 0.5), 0.80, 1.0, 0.20, None, None, True, None, None, False, None)
         # ... and the seed proposes adding to held pairs too
         assert config.LIVE_DEFAULTS_SEED.add_to_held_pairs is True
+        # Trimming ships off, with no minimum price rise, in config.py and the seed
+        assert (self._SHIPPED.trim_to_kelly, self._SHIPPED.trim_min_rise) == (False, None)
+        assert (config.LIVE_DEFAULTS_SEED.trim_to_kelly,
+                config.LIVE_DEFAULTS_SEED.trim_min_rise) == (False, None)
 
     def test_the_finder_admits_any_positive_spread_up_to_the_ceiling(self, caplog):
         # 0.10 at 10 days and 0.20 at 20 days sit under their tiers and are
@@ -2772,7 +3512,8 @@ class TestPreToggleDefaults:
     _TOGGLES = frozenset({
         "TIME_SERIES_TIER_FLOORS", "TIME_SERIES_SPREAD_BAND",
         "TIME_SERIES_INTERVAL_PROB_DISCOUNT", "BUDGET_FRACTION", "SAME_TITLE_SIZE_CAP",
-        "TRADE_CATEGORIES", "TRADE_TAGS", "ADD_TO_HELD_PAIRS", "SELL_AT", "SELL_MIN_DAYS"})
+        "TRADE_CATEGORIES", "TRADE_TAGS", "ADD_TO_HELD_PAIRS", "SELL_AT", "SELL_MIN_DAYS",
+        "TRIM_TO_KELLY", "TRIM_MIN_RISE"})
 
     @classmethod
     def _by_value_binders(cls, directory: pathlib.Path) -> list[tuple[str, str, str]]:
@@ -2797,7 +3538,7 @@ class TestPreToggleDefaults:
         assert live_settings() == LiveSettings(
             tier_floors=True, spread_band=(0.0, 1.0), interval_discount=0.75, size_cap=0.20,
             same_title_size_cap=1.0, categories=None, tags=None, add_to_held_pairs=False,
-            sell_at=None, sell_min_days=None)
+            sell_at=None, sell_min_days=None, trim_to_kelly=False, trim_min_rise=None)
         for module, bound, toggle in binders:
             assert getattr(importlib.import_module(f"kalshi_betting.{module}"), bound) == (
                 getattr(config, toggle)), (module, toggle)
@@ -2983,17 +3724,44 @@ class TestLiveSettingsOrigin:
         assert dataclasses.replace(s, size_cap=0.35).origin == _SAVED_ORIGIN
         assert dataclasses.replace(s, categories=("Sports",)).origin == _SAVED_ORIGIN
 
-    def test_the_toggle_fields_are_the_ten(self):
+    def test_the_toggle_fields_are_the_twelve(self):
         assert config.LIVE_TOGGLE_FIELDS == (
             "tier_floors", "spread_band", "interval_discount", "size_cap",
             "same_title_size_cap", "categories", "tags", "add_to_held_pairs",
-            "sell_at", "sell_min_days")
-        # The three a saved file may leave out, in field order, at the end
-        assert config._OPTIONAL_TOGGLES == ("add_to_held_pairs", "sell_at", "sell_min_days")
+            "sell_at", "sell_min_days", "trim_to_kelly", "trim_min_rise")
+        assert len(config.LIVE_TOGGLE_FIELDS) == 12
+        # The five a saved file may leave out, in field order, at the end
+        assert config._OPTIONAL_TOGGLES == ("add_to_held_pairs", "sell_at", "sell_min_days",
+                                            "trim_to_kelly", "trim_min_rise")
         assert config._TOGGLE_DEFAULTS == {
-            "add_to_held_pairs": False, "sell_at": None, "sell_min_days": None}
+            "add_to_held_pairs": False, "sell_at": None, "sell_min_days": None,
+            "trim_to_kelly": False, "trim_min_rise": None}
         assert [f.name for f in dataclasses.fields(LiveSettings)] == [
             *config.LIVE_TOGGLE_FIELDS, "origin"]
+
+    def test_every_toggle_count_the_package_states_is_the_number_of_toggles(self):
+        # Wherever a module's comments, docstrings or messages count the toggles
+        # ("the twelve toggles", "twelve live toggles", "twelve toggle names"),
+        # the count is the number of toggle fields or the number a saved file
+        # must hold. Comment lines are joined first, so a split count is found
+        names = ("one two three four five six seven eight nine ten eleven twelve "
+                 "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty").split()
+        total = len(config.LIVE_TOGGLE_FIELDS)
+        required = total - len(config._OPTIONAL_TOGGLES)
+        allowed = {names[total - 1], names[required - 1]}
+        # Counts below the required number ("these two toggles") name a few
+        # toggles, not all of them, and are left alone
+        counted = re.compile(r"\b(" + "|".join(names[required - 1:])
+                             + r")[\s-]+(?:live\s+)?toggles?\b", re.IGNORECASE)
+        stated: dict[str, set[str]] = {}
+        for path in sorted(pathlib.Path(config.__file__).parent.glob("*.py")):
+            source = re.sub(r"\n[ \t]*#[ \t]*", " ", path.read_text(encoding="utf-8"))
+            for match in counted.finditer(source):
+                stated.setdefault(match.group(1).lower(), set()).add(path.name)
+        # The scan finds the counts config.py and defaults_server.py state
+        assert {"config.py", "defaults_server.py"} <= stated.get(names[total - 1], set())
+        assert set(stated) <= allowed, {
+            word: sorted(files) for word, files in stated.items() if word not in allowed}
 
 
 class _FrozenDatetime(datetime):
@@ -3019,8 +3787,8 @@ def _valid_record(**changes) -> dict:
     Build a saved-defaults record the reader accepts, then apply changes.
 
     Its toggles are LIVE_DEFAULTS_SEED's, saved at 2026-09-27T21:05:13Z with
-    no source note, with add_to_held_pairs, sell_at and sell_min_days left out
-    (the seven-toggle shape), which reads as _SEED_ADD_ON_OFF.
+    no source note and the optional toggles left out (the seven-toggle
+    shape), so it reads as _SEED_ADD_ON_OFF.
 
     Args:
         **changes: Top-level keys to replace; a value of _DROP removes the key.
@@ -3067,15 +3835,14 @@ def _with_toggles(**changes) -> dict:
 # Marks a key _valid_record / _with_toggles should remove
 _DROP = object()
 
-# LIVE_DEFAULTS_SEED with adding to held pairs off (and, as ever, no selling):
-# what _valid_record's seven-toggle file reads as, and what a save of it
-# writes as seven toggles
+# LIVE_DEFAULTS_SEED with adding to held pairs off (no selling or trimming
+# either): what _valid_record's seven-toggle file reads as, and what a save of
+# it writes as seven toggles
 _SEED_ADD_ON_OFF = dataclasses.replace(config.LIVE_DEFAULTS_SEED, add_to_held_pairs=False)
 
 # The exact bytes a save of _SEED_ADD_ON_OFF writes, with the seed's note, at
-# _FrozenDatetime's instant: add_to_held_pairs, sell_at and sell_min_days are
-# left out, so code that does not know those toggles can read a file saved
-# with them off
+# _FrozenDatetime's instant: the optional toggles are left out while off, so
+# code that does not know them can still read the file
 _SEVEN_TOGGLE_BYTES = (
     b'{\n'
     b'  "format": "live-defaults-v1",\n'
@@ -3217,6 +3984,67 @@ class TestSavedLiveDefaults:
         assert (saved.sell_at, saved.sell_min_days) == (0.9, 14)
         assert config.read_saved_live_defaults() == settings
 
+    def test_trimming_off_writes_exactly_the_bytes_written_before_it_existed(self, monkeypatch):
+        # Trim settings at their defaults are left out of the file; with adding
+        # off it is byte for byte the seven-toggle file
+        monkeypatch.setattr(config, "datetime", _FrozenDatetime)
+        assert (_SEED_ADD_ON_OFF.trim_to_kelly, _SEED_ADD_ON_OFF.trim_min_rise) == (False, None)
+        config.save_live_defaults(
+            dataclasses.replace(_SEED_ADD_ON_OFF, trim_to_kelly=False, trim_min_rise=None),
+            source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES
+        for settings in (_SEED_ADD_ON_OFF, config.LIVE_DEFAULTS_SEED,
+                         dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85,
+                                             sell_min_days=3)):
+            config.save_live_defaults(settings, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+            assert b"trim" not in config.LIVE_DEFAULTS_FILE.read_bytes()
+        assert config.LIVE_DEFAULTS_FILE.read_bytes().endswith(
+            b'    "sell_at": 0.85,\n    "sell_min_days": 3\n  }\n}\n')
+
+    def test_a_trimming_save_writes_its_keys_last_in_field_order(self, monkeypatch):
+        monkeypatch.setattr(config, "datetime", _FrozenDatetime)
+        # The switch alone, with adding off: the one key, after the other seven
+        on = dataclasses.replace(_SEED_ADD_ON_OFF, trim_to_kelly=True)
+        config.save_live_defaults(on, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+            b'    "tags": null\n', b'    "tags": null,\n    "trim_to_kelly": true\n')
+        assert config.read_saved_live_defaults() == on
+        # With a minimum, after adding to held pairs and the two sell keys
+        everything = dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85,
+                                         sell_min_days=3, trim_to_kelly=True,
+                                         trim_min_rise=0.10)
+        config.save_live_defaults(everything, source=config.LIVE_DEFAULTS_SEED_SOURCE)
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == _SEVEN_TOGGLE_BYTES.replace(
+            b'    "tags": null\n',
+            b'    "tags": null,\n    "add_to_held_pairs": true,\n'
+            b'    "sell_at": 0.85,\n    "sell_min_days": 3,\n'
+            b'    "trim_to_kelly": true,\n    "trim_min_rise": 0.1\n')
+        assert config.read_saved_live_defaults() == everything
+        # Every 5c step round-trips as the same float
+        for cents in range(5, 101, 5):
+            wanted = dataclasses.replace(_SEED_ADD_ON_OFF, trim_to_kelly=True,
+                                         trim_min_rise=cents / 100)
+            assert config.save_live_defaults(wanted, source="") == wanted
+            assert config.read_saved_live_defaults().trim_min_rise == cents / 100
+
+    def test_a_save_round_trips_the_trim_settings(self):
+        settings = dataclasses.replace(self._SETTINGS, trim_to_kelly=True, trim_min_rise=0.25)
+        saved = config.save_live_defaults(settings, source="a note")
+        assert saved == settings
+        assert (saved.trim_to_kelly, saved.trim_min_rise) == (True, 0.25)
+        assert config.read_saved_live_defaults() == settings
+
+    def test_a_minimum_with_trimming_off_is_never_written(self):
+        # LiveSettings and the saved file's parser both refuse a minimum with
+        # trimming off, and the file on disk is left as it was
+        config.save_live_defaults(config.LIVE_DEFAULTS_SEED, source="")
+        before = config.LIVE_DEFAULTS_FILE.read_bytes()
+        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly on"):
+            dataclasses.replace(config.LIVE_DEFAULTS_SEED, trim_min_rise=0.10)
+        with pytest.raises(ValueError, match="trim_min_rise needs trim_to_kelly on"):
+            config._settings_from_bytes(_text(_with_toggles(trim_min_rise=0.10)))
+        assert config.LIVE_DEFAULTS_FILE.read_bytes() == before
+
     def test_a_seven_toggle_file_reads_with_add_on_off(self):
         # A file that leaves add_to_held_pairs out reads as the same
         # settings, adding to held pairs off (nobody confirmed a value for
@@ -3226,6 +4054,8 @@ class TestSavedLiveDefaults:
         assert saved == _SEED_ADD_ON_OFF and saved.add_to_held_pairs is False
         # ... and it reads selling off, the same way
         assert saved.sell_at is None and saved.sell_min_days is None
+        # ... and trimming off, with no minimum price rise
+        assert saved.trim_to_kelly is False and saved.trim_min_rise is None
         assert config.ADD_TO_HELD_PAIRS is True
         assert config.LIVE_DEFAULTS_SEED.add_to_held_pairs is True
         assert saved.origin == ("live_defaults.json, saved 2026-09-27T21:05:13Z from "
@@ -3245,6 +4075,38 @@ class TestSavedLiveDefaults:
         saved = config.read_saved_live_defaults()
         assert saved.sell_at is None and saved.sell_min_days is None
         assert config.SELL_AT is None and config.LIVE_DEFAULTS_SEED.sell_at is None
+
+    def test_a_file_that_leaves_trimming_out_reads_it_off(self):
+        # Neither key is in the file, so nobody chose to trim: it reads as
+        # off, whatever config.py ships
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(
+            add_to_held_pairs=True, sell_at=0.85, sell_min_days=3)))
+        saved = config.read_saved_live_defaults()
+        assert saved.trim_to_kelly is False and saved.trim_min_rise is None
+        assert saved == dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85,
+                                            sell_min_days=3)
+
+    @pytest.mark.parametrize("changes, expected", [
+        ({"trim_to_kelly": False}, {}),
+        ({"trim_to_kelly": True}, {"trim_to_kelly": True}),
+        ({"trim_to_kelly": True, "trim_min_rise": 0.1},
+         {"trim_to_kelly": True, "trim_min_rise": 0.10}),
+        ({"trim_to_kelly": True, "trim_min_rise": 0.25},
+         {"trim_to_kelly": True, "trim_min_rise": 0.25}),
+        # A whole dollar written as the JSON integer 1
+        ({"trim_to_kelly": True, "trim_min_rise": 1},
+         {"trim_to_kelly": True, "trim_min_rise": 1.0}),
+        # Written as null by hand, the minimum reads as none, on or off
+        ({"trim_to_kelly": True, "trim_min_rise": None}, {"trim_to_kelly": True}),
+        ({"trim_to_kelly": False, "trim_min_rise": None}, {}),
+        ({"trim_min_rise": None}, {}),
+    ])
+    def test_a_file_naming_the_trim_settings_reads_them(self, changes, expected):
+        config.LIVE_DEFAULTS_FILE.write_bytes(_text(_with_toggles(**changes)))
+        saved = config.read_saved_live_defaults()
+        assert saved == dataclasses.replace(_SEED_ADD_ON_OFF, **expected)
+        assert type(saved.trim_to_kelly) is bool
+        assert saved.trim_min_rise is None or type(saved.trim_min_rise) is float
 
     @pytest.mark.parametrize("changes, expected", [
         ({"sell_at": 0.85}, {"sell_at": 0.85}),
@@ -3544,6 +4406,30 @@ class TestSavedLiveDefaults:
         ("a sell minimum with no level", _text(_with_toggles(sell_min_days=3))),
         ("a sell minimum with a null level",
          _text(_with_toggles(sell_at=None, sell_min_days=3))),
+        # Trimming: the switch is true or false; the minimum is dollars on the
+        # 5c grid from 5c to $1, and needs the switch on
+        ("trim to Kelly as 1", _text(_with_toggles(trim_to_kelly=1))),
+        ("trim to Kelly as a string", _text(_with_toggles(trim_to_kelly="true"))),
+        ("trim to Kelly as null", _text(_with_toggles(trim_to_kelly=None))),
+        ("a minimum rise of true", _text(_with_toggles(trim_to_kelly=True, trim_min_rise=True))),
+        ("a minimum rise of false",
+         _text(_with_toggles(trim_to_kelly=True, trim_min_rise=False))),
+        ("a minimum rise of zero", _text(_with_toggles(trim_to_kelly=True, trim_min_rise=0))),
+        ("a minimum rise above a dollar",
+         _text(_with_toggles(trim_to_kelly=True, trim_min_rise=1.05))),
+        ("a minimum rise in cents", _text(_with_toggles(trim_to_kelly=True, trim_min_rise=10))),
+        ("a minimum rise between two steps",
+         _text(_with_toggles(trim_to_kelly=True, trim_min_rise=0.07))),
+        ("a minimum rise as a string",
+         _text(_with_toggles(trim_to_kelly=True, trim_min_rise="0.10"))),
+        ("a minimum rise that is NaN",
+         _text(_with_toggles(trim_to_kelly=True, trim_min_rise=float("nan")))),
+        ("a minimum rise too large to count",
+         _text(_with_toggles(trim_to_kelly=True)).replace(
+             b'"trim_to_kelly": true', b'"trim_to_kelly": true, "trim_min_rise": 1' + b"0" * 400)),
+        ("a minimum rise with trimming left out", _text(_with_toggles(trim_min_rise=0.10))),
+        ("a minimum rise with trimming off",
+         _text(_with_toggles(trim_to_kelly=False, trim_min_rise=0.10))),
         # Category and tag names
         ("the name any", _text(_with_toggles(categories=["any"]))),
         ("an empty name", _text(_with_toggles(tags=[""]))),
@@ -3578,8 +4464,8 @@ class TestSavedLiveDefaults:
              '"spread_band" must be [floor, ceiling]'),
             (_text(_with_toggles(add_to_held_pairs=1)), "add_to_held_pairs must be True or False"),
             (_text(_with_toggles(tags=_DROP)),
-             "(add_to_held_pairs, sell_at, sell_min_days may be left out, and then each "
-             "reads as off)"),
+             "(add_to_held_pairs, sell_at, sell_min_days, trim_to_kelly, trim_min_rise may "
+             "be left out, and then each reads as off)"),
             (_text(_with_toggles(sell_at=True)), '"sell_at" must be a number or null'),
             (_text(_with_toggles(sell_at=0.85, sell_min_days=False)),
              '"sell_min_days" must be a number or null'),
@@ -3587,6 +4473,18 @@ class TestSavedLiveDefaults:
              "sell_min_days must be a whole number of days"),
             (_text(_with_toggles(sell_min_days=3)), "sell_min_days needs a sell level"),
             (_text(_with_toggles(sell_at=0.855)), "sell_at must be a multiple of 1%"),
+            (_text(_with_toggles(trim_to_kelly=1)), "trim_to_kelly must be True or False"),
+            (_text(_with_toggles(trim_to_kelly=True, trim_min_rise=True)),
+             '"trim_min_rise" must be a number or null'),
+            (_text(_with_toggles(trim_to_kelly=True, trim_min_rise=False)),
+             '"trim_min_rise" must be a number or null'),
+            (_text(_with_toggles(trim_to_kelly=True, trim_min_rise=0.07)),
+             "trim_min_rise must be a multiple of 5c from 5c to $1"),
+            (_text(_with_toggles(trim_to_kelly=True, trim_min_rise="0.10")),
+             "trim_min_rise must be a number of dollars"),
+            (_text(_with_toggles(trim_min_rise=0.10)), "trim_min_rise needs trim_to_kelly on"),
+            (_text(_with_toggles(trim_to_kelly=False, trim_min_rise=0.10)),
+             "trim_min_rise needs trim_to_kelly on"),
         ]:
             path.write_bytes(data)
             with pytest.raises(config.LiveDefaultsError, match=re.escape(words)):
@@ -3796,6 +4694,8 @@ class TestLiveSettingsChanges:
             ("add to held pairs", "off", "off", False),
             ("sell at", "off", "off", False),
             ("min days to maturity", "any", "any", False),
+            ("trim to Kelly", "off", "off", False),
+            ("min price rise", "any", "any", False),
         ]
 
     def test_changed_flags_exactly_the_fields_that_differ(self):
@@ -3815,10 +4715,11 @@ class TestLiveSettingsChanges:
 
     def test_no_current_defaults_changes_every_row(self):
         rows = config.live_settings_changes(None, config.LIVE_DEFAULTS_SEED)
-        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 10
+        assert len(rows) == len(config.LIVE_TOGGLE_FIELDS) == 12
         assert all(old == "—" and changed for _, old, _, changed in rows)
         assert [new for _, _, new, _ in rows] == [
-            "off", "0-0.5", "0.8", "10%", "20%", "any", "any", "on", "off", "any"]
+            "off", "0-0.5", "0.8", "10%", "20%", "any", "any", "on", "off", "any",
+            "off", "any"]
 
     def test_turning_selling_on_shows_as_the_two_sell_rows(self):
         on = dataclasses.replace(config.LIVE_DEFAULTS_SEED, sell_at=0.85, sell_min_days=3)
@@ -3831,6 +4732,23 @@ class TestLiveSettingsChanges:
         assert [row for row in rows if row[3]] == [
             ("sell at", "85% of potential profit", "off", True),
             ("min days to maturity", "3", "any", True)]
+
+    def test_turning_trimming_on_shows_as_the_two_trim_rows(self):
+        on = dataclasses.replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True,
+                                 trim_min_rise=0.10)
+        rows = config.live_settings_changes(config.LIVE_DEFAULTS_SEED, on)
+        assert [row for row in rows if row[3]] == [
+            ("trim to Kelly", "off", "on", True),
+            ("min price rise", "any", "10c", True)]
+        # ... and back off again
+        rows = config.live_settings_changes(on, config.LIVE_DEFAULTS_SEED)
+        assert [row for row in rows if row[3]] == [
+            ("trim to Kelly", "on", "off", True),
+            ("min price rise", "10c", "any", True)]
+        # Trimming on with no minimum changes the one row
+        plain = dataclasses.replace(config.LIVE_DEFAULTS_SEED, trim_to_kelly=True)
+        rows = config.live_settings_changes(config.LIVE_DEFAULTS_SEED, plain)
+        assert [row for row in rows if row[3]] == [("trim to Kelly", "off", "on", True)]
 
     def test_a_seven_toggle_file_shows_turning_add_on_on_as_a_change(self):
         # A file that leaves the toggle out reads it as off; the seed proposes on

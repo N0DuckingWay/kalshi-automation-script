@@ -6866,3 +6866,251 @@ class TestBidBefore:
     def test_an_unknown_side_is_refused(self, side):
         with pytest.raises(ValueError, match="side"):
             historical.bid_before([], self._T, side, window=self._DAY)
+
+
+class TestAskBefore:
+    """ask_before: a held market's price at a past moment, the latest usable ask
+    on a candle that ended at or before it and less than `window` seconds
+    before it. A later candle is never read, or a price rise would be measured
+    from the wrong starting price."""
+
+    _DAY = 86_400
+    _WEEK = 7 * 86_400
+    _T = 1_768_000_000
+
+    def test_the_latest_usable_ask_at_or_before_the_moment(self):
+        t = self._T
+        candles = [_bid_candle(t - 7200, 0.30, 0.72), _bid_candle(t - 3600, 0.40, 0.61),
+                   _bid_candle(t + 1, 0.50, 0.51)]
+        assert historical.ask_before(candles, t, "yes", window=self._WEEK) == 0.40
+        assert historical.ask_before(candles, t, "no", window=self._WEEK) == 0.61
+        # A candle ending exactly at the moment is read
+        assert historical.ask_before(candles, t + 1, "yes", window=self._WEEK) == 0.50
+        # A dollar string reads as its number
+        assert historical.ask_before([_bid_candle(t, "0.42", "0.59")], t, "yes",
+                                     window=self._WEEK) == 0.42
+
+    @pytest.mark.parametrize("unusable_yes, unusable_no", [
+        (1.00, 0.99),            # an empty book on each side
+        ("x", None),             # closes that cannot be read
+        (float("nan"), 1.5),
+        (0.0, 0.0),
+    ])
+    def test_an_unusable_candle_is_passed_over_for_the_one_before_it(self, unusable_yes,
+                                                                     unusable_no):
+        t = self._T
+        candles = [_bid_candle(t - 7200, 0.30, 0.72),
+                   _bid_candle(t - 3600, unusable_yes, unusable_no),
+                   _bid_candle(t - 60, unusable_yes, unusable_no)]
+        assert historical.ask_before(candles, t, "yes", window=self._WEEK) == 0.30
+        assert historical.ask_before(candles, t, "no", window=self._WEEK) == 0.72
+
+    def test_each_side_keeps_its_own_latest_usable_ask(self):
+        t = self._T
+        # The newest candle has a usable YES ask and no usable NO ask
+        candles = [_bid_candle(t - 7200, 0.30, 0.72), _bid_candle(t - 60, 0.35, 0.99)]
+        assert historical.ask_before(candles, t, "yes", window=self._WEEK) == 0.35
+        assert historical.ask_before(candles, t, "no", window=self._WEEK) == 0.72
+
+    def test_a_candle_missing_an_ask_is_no_quote(self):
+        t = self._T
+        candles = [_bid_candle(t - 7200, 0.30, 0.72), {"ts": t - 60, "yes_ask_close": 0.35}]
+        assert historical.ask_before(candles, t, "yes", window=self._WEEK) == 0.35
+        assert historical.ask_before(candles, t, "no", window=self._WEEK) == 0.72
+
+    def test_a_candle_ending_after_the_moment_is_never_read(self):
+        t = self._T
+        # The only usable asks ended after the moment: nothing to read
+        after = [_bid_candle(t - 60, 1.00, 0.99), _bid_candle(t + 1, 0.50, 0.51),
+                 _bid_candle(t + 3600, 0.55, 0.46)]
+        assert math.isnan(historical.ask_before(after, t, "yes", window=self._WEEK))
+        assert math.isnan(historical.ask_before(after, t, "no", window=self._WEEK))
+        assert math.isnan(historical.ask_before([_bid_candle(t + 1, 0.5, 0.51)], t, "yes",
+                                                window=self._WEEK))
+        # A later price does not replace the earlier one either
+        both = [_bid_candle(t - 60, 0.30, 0.72), _bid_candle(t + 1, 0.50, 0.51)]
+        assert historical.ask_before(both, t, "yes", window=self._WEEK) == 0.30
+
+    def test_candles_out_of_order_never_yield_one_from_after_the_moment(self):
+        t = self._T
+        # Reading stops at the first candle that ended after the moment (as in
+        # bid_before), so the out-of-order candle behind it is never reached
+        candles = [_bid_candle(t - 7200, 0.30, 0.72), _bid_candle(t + 3600, 0.50, 0.51),
+                   _bid_candle(t - 60, 0.40, 0.61)]
+        assert historical.ask_before(candles, t, "yes", window=self._WEEK) == 0.30
+        # In time order, the same candles give the latest one before the moment
+        ordered = sorted(candles, key=lambda c: c["ts"])
+        assert historical.ask_before(ordered, t, "yes", window=self._WEEK) == 0.40
+
+    def test_the_window_boundary(self):
+        t, day = self._T, self._DAY
+        # Exactly a window old: not read
+        assert math.isnan(historical.ask_before([_bid_candle(t - day, 0.40, 0.61)], t, "yes",
+                                                window=day))
+        # One second younger: read
+        assert historical.ask_before([_bid_candle(t - day + 1, 0.40, 0.61)], t, "yes",
+                                     window=day) == 0.40
+
+    def test_nothing_usable_inside_the_window_is_no_price(self):
+        t, day = self._T, self._DAY
+        # A usable ask from before the window is not carried into it, whether
+        # the window holds no candle at all or only unusable ones
+        old = _bid_candle(t - 8 * day, 0.30, 0.72)
+        assert math.isnan(historical.ask_before([old], t, "yes", window=7 * day))
+        quiet = [old, _bid_candle(t - 3600, 1.00, 0.99), _bid_candle(t - 60, None, "x")]
+        assert math.isnan(historical.ask_before(quiet, t, "yes", window=7 * day))
+        assert math.isnan(historical.ask_before(quiet, t, "no", window=7 * day))
+        # Control: a wider window reaches it
+        assert historical.ask_before(quiet, t, "yes", window=9 * day) == 0.30
+        assert math.isnan(historical.ask_before([], t, "yes", window=7 * day))
+
+    def test_the_shipped_window_is_seven_days(self):
+        from kalshi_betting import config
+
+        # config gives the age limit in whole days; callers pass it in seconds
+        assert config.TRIM_PRICE_THEN_MAX_AGE_DAYS == 7
+        assert type(config.TRIM_PRICE_THEN_MAX_AGE_DAYS) is int
+        t, window = self._T, config.TRIM_PRICE_THEN_MAX_AGE_DAYS * self._DAY
+        assert window == self._WEEK
+        assert historical.ask_before([_bid_candle(t - window + 1, 0.40, 0.61)], t, "no",
+                                     window=window) == 0.61
+        assert math.isnan(historical.ask_before([_bid_candle(t - window, 0.40, 0.61)], t, "no",
+                                                window=window))
+
+    def test_a_no_ask_at_the_ceiling_is_no_quote(self):
+        t = self._T
+        # A NO ask of 0.99 is what an empty YES-bid book reads as, so it is no
+        # price; a YES ask of 0.99 is one
+        assert math.isnan(historical.ask_before([_bid_candle(t, 0.50, 0.99)], t, "no",
+                                                window=self._WEEK))
+        assert historical.ask_before([_bid_candle(t, 0.99, 0.98)], t, "yes",
+                                     window=self._WEEK) == 0.99
+        assert historical.ask_before([_bid_candle(t, 0.99, 0.98)], t, "no",
+                                     window=self._WEEK) == 0.98
+
+    @pytest.mark.parametrize("side", ["YES", "", None, "both"])
+    def test_an_unknown_side_is_refused(self, side):
+        with pytest.raises(ValueError, match="side"):
+            historical.ask_before([], self._T, side, window=self._WEEK)
+
+    def test_it_matches_a_brute_force_reading_of_sorted_candles(self):
+        rng = random.Random(8086)
+        asks = [0.30, 0.43, 0.57, 0.99, 1.00, 0.0001, "x", None, float("nan"), 0.72, 0.98]
+        read_something = 0
+        for _ in range(400):
+            stamps = sorted(rng.sample(range(self._T - 10 * self._DAY, self._T + self._DAY, 900),
+                                       rng.randint(0, 14)))
+            candles = [_bid_candle(ts, rng.choice(asks), rng.choice(asks)) for ts in stamps]
+            moment = rng.choice(stamps + [self._T]) - rng.choice([0, 1, 899, self._DAY])
+            window = rng.choice([3600, self._DAY, self._WEEK])
+            for side, key in (("yes", "yes_ask_close"), ("no", "no_ask_close")):
+                got = historical.ask_before(candles, moment, side, window=window)
+                usable = [ask for c in candles
+                          if c["ts"] <= moment and moment - c["ts"] < window
+                          and not math.isnan(ask := historical.usable_candle_ask(c[key], side))]
+                if usable:
+                    assert got == usable[-1]
+                    read_something += 1
+                else:
+                    assert math.isnan(got)
+        assert read_something > 100
+
+    def test_it_reads_what_the_backtest_reads_at_a_checkpoint(self):
+        # With a window longer than the candles span, ask_before reads the price
+        # the backtest values a held leg at on each weekly checkpoint
+        # (backtester._leg_quotes)
+        from kalshi_betting import backtester
+
+        rng = random.Random(1917)
+        asks = [0.30, 0.43, 0.57, 0.99, 1.00, 0.0001, "x", None, float("nan"), 0.72, 0.98]
+        start = date(2026, 1, 1)
+        first = int(datetime(2026, 1, 2, tzinfo=UTC).timestamp())
+        compared = differing = 0
+        for _ in range(25):
+            # Hourly candles over six weeks, with gaps and unusable closes
+            stamps = sorted(rng.sample(range(first, first + 42 * self._DAY, 3600), 150))
+            candles = [_bid_candle(ts, rng.choice(asks), rng.choice(asks)) for ts in stamps]
+            # No settlement, so every checkpoint sample is a candle's ask
+            market = {"ticker": "Q", "settlement_ts": None, "result": None}
+            quotes, _stale = backtester._leg_quotes(market, candles, start)
+            assert len(quotes.yes_checkpoints) >= 5
+            for index in range(len(quotes.yes_checkpoints)):
+                day = quotes.first_checkpoint + timedelta(weeks=index)
+                moment = int(backtester._checkpoint_datetime(day).timestamp())
+                for side, marks in (("yes", quotes.yes_checkpoints),
+                                    ("no", quotes.no_checkpoints)):
+                    got = historical.ask_before(candles, moment, side, window=10 ** 9)
+                    mark = float(marks[index])
+                    assert (math.isnan(got) and math.isnan(mark)) or got == mark
+                    compared += 1
+                    # The age limit is the one difference: a candle older than
+                    # the window gives no price here
+                    recent = historical.ask_before(candles, moment, side, window=3 * 3600)
+                    differing += math.isnan(recent) and not math.isnan(mark)
+        assert compared >= 250 and differing > 0
+
+
+class TestCandleReadsBid:
+    """candle_reads_bid: whether a candle could show a best bid. A candle holds
+    only asks, so a bid shows as 1 minus the other side's usable ask; a YES bid
+    of 1c or less never shows, since its NO ask would sit at the 0.99 cap."""
+
+    @pytest.mark.parametrize("bid, side, shows", [
+        (0.01, "yes", False), (0.0101, "yes", True), (0.02, "yes", True),
+        (0.0, "yes", False), (0.005, "yes", False), (0.50, "yes", True),
+        (0.99, "yes", True), (0.9999, "yes", True), (1.0, "yes", False),
+        # A NO bid sits behind a YES ask, which has no such ceiling
+        (0.01, "no", True), (0.0001, "no", True), (0.0, "no", False), (0.50, "no", True),
+        (0.99, "no", True), (0.9999, "no", True), (1.0, "no", False),
+        (-0.10, "no", False), (1.5, "yes", False),
+    ])
+    def test_which_bids_a_candle_shows(self, bid, side, shows):
+        assert historical.candle_reads_bid(bid, side) is shows
+
+    @pytest.mark.parametrize("bid", [None, "abc", "", float("nan"), [0.5], {"bid": 0.5},
+                                     10 ** 400])
+    @pytest.mark.parametrize("side", ["yes", "no"])
+    def test_a_bid_that_is_not_a_price_shows_on_no_candle(self, bid, side):
+        assert historical.candle_reads_bid(bid, side) is False
+
+    @pytest.mark.parametrize("side", ["YES", "", None, "both"])
+    def test_an_unknown_side_is_refused(self, side):
+        with pytest.raises(ValueError, match="side"):
+            historical.candle_reads_bid(0.5, side)
+
+    def test_it_agrees_with_the_candle_a_book_would_be_stored_as(self):
+        # Each bid stored as fetch_candlesticks would store it (YES ask = 1 minus
+        # a NO bid; NO ask = 1 minus a YES bid, held to 0.01..ceiling): a bid
+        # shows exactly when candle_sale_bids reads a bid of that side from the
+        # candle (a YES bid above 99c reads as 99c, at the clamp). Bids run to
+        # $0.9999, the finest grid's top level
+        ceiling = historical.CANDLE_NO_ASK_CEILING
+        ticks = [n / 10_000 for n in range(0, 10_000)]
+        shown = {"yes": 0, "no": 0}
+        for bid in ticks[::7] + [0.0, 0.0099, 0.01, 0.0101, 0.99, 0.9999]:
+            stored = {"ts": 1, "yes_ask_close": 1.0 - bid,
+                      "no_ask_close": max(0.01, min(ceiling, 1.0 - bid))}
+            yes_bid, no_bid = historical.candle_sale_bids(stored)
+            # The YES bid shows through the stored NO ask, the NO bid through
+            # the stored YES ask
+            assert historical.candle_reads_bid(bid, "yes") is (not math.isnan(yes_bid))
+            assert historical.candle_reads_bid(bid, "no") is (not math.isnan(no_bid))
+            shown["yes"] += not math.isnan(yes_bid)
+            shown["no"] += not math.isnan(no_bid)
+        assert shown["yes"] > 1000 and shown["no"] > shown["yes"]
+
+    def test_it_reads_the_one_candle_rule(self):
+        # The ceiling it holds a YES bid to is usable_candle_ask's own
+        calls = []
+        real = historical.usable_candle_ask
+
+        def spy(raw, side):
+            calls.append((raw, side))
+            return real(raw, side)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(historical, "usable_candle_ask", spy)
+            assert historical.candle_reads_bid(0.25, "yes") is True
+            assert historical.candle_reads_bid(0.25, "no") is True
+        # Each bid is asked about as the other side's ask
+        assert calls == [(0.75, "no"), (0.75, "yes")]

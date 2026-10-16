@@ -51,6 +51,21 @@ Purpose:
     that has stayed at or above that share of its potential profit (what it
     pays if it wins, less its cost); see CLAUDE.md, live selling.
 
+    A production run with trim_to_kelly on also sells, before it buys, part
+    of each exact held pair (one YES and one NO of equal size on one
+    question) that has grown past its Kelly share of the portfolio value
+    (seller.plan_trims, planned right after the take-profit plans and before
+    any sale order is sent; never a pair the take-profit rule sells). A pair
+    waits a set number of calendar days after its last trade and, with
+    trim_min_rise set, until its price has risen that far. Nothing is
+    trimmed when a shard's cash or Kalshi's value of the open positions
+    cannot be counted (or that value is $0), when an order rests on the
+    account (Kalshi counts a resting order's cash in neither the balance nor
+    the positions value) or when the resting orders cannot be read: a trim
+    sized on too small a value would sell too much. A pair trimmed in part
+    stays held, in a dry run too (_emptied_tickers); one trimmed whole does
+    not. Either way it is neither bought nor added to that run.
+
     A production run keeps every market the account holds out of new trades,
     except, when the run's add_to_held_pairs setting is on, the markets it
     may add to (scanner.held_pairs): the two markets of an exact held pair,
@@ -68,8 +83,9 @@ Dependencies:
     reporter.py (Excel output and the run summary), _http.py (a one-line
     description of an error), scanner.py (finding markets and pairs, and
     pricing them from the order book), seller.py (which held positions to
-    sell), strategy.py (sizing and choosing trades), trader.py (sending orders)
-    and run_lock.py (the one-real-money-run-at-a-time lock). Run as
+    sell, and which held pairs to trim), strategy.py (sizing and choosing
+    trades), trader.py (sending orders) and run_lock.py (the
+    one-real-money-run-at-a-time lock). Run as
     `python3 -m kalshi_betting.main`.
 
     To add to held pairs it also reads scanner.get_held_positions,
@@ -134,12 +150,14 @@ from .config import (
     LIVE_DEFAULTS_FROM_CONFIG,
     MIN_BALANCE_CENTS,
     PROJECT_ROOT,
+    SALE_KIND_KELLY_TRIM,
     SALE_READ_BACK_RECHECK_SECONDS,
     SAME_TITLE_MAX_CLOSE_GAP_SECONDS,
     SAME_TITLE_MIN_PRICE_DIFF,
     SELL_AT_STEP,
     SIZE_CAP_STEP,
     TAG_SCOPE_SEPARATOR,
+    TRIM_PRICE_RISE_STEP_CENTS,
     V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS,
     LiveDefaultsError,
     LiveDefaultsMissing,
@@ -156,6 +174,7 @@ from .config import (
     order_api_version_error,
     split_tag,
     trade_filter,
+    trim_change_warnings,
 )
 from .historical import infer_category, load_series_categories, series_labels
 from .reporter import (
@@ -178,13 +197,14 @@ from .scanner import (
     find_same_title_pairs,
     find_time_series_pairs,
     get_held_positions,
+    get_resting_orders,
     held_pairs,
     inactive_shard_indexes,
     leg_sides,
     pair_held,
     resolve_held_ladders,
 )
-from .seller import plan_sales
+from .seller import plan_sales, plan_trims
 from .strategy import compute_trade, select_portfolio
 from .trader import (
     ensure_shard_collateral,
@@ -353,7 +373,7 @@ def _sold_tickers(sales: list, *, dry_run: bool) -> set:
 
 def _planned_tickers(sales: list) -> set:
     """
-    Every held market of every position the take-profit rule picked this run.
+    Every held market of every position picked for a take-profit sale or a Kelly trim.
 
     Such a position is not added to this run even when its orders sold
     nothing, so a live run and a dry run of one account offer the same add-ons.
@@ -366,6 +386,63 @@ def _planned_tickers(sales: list) -> set:
     """
     return {leg.ticker for sale in sales for leg in getattr(sale.plan, "legs", ())
             if getattr(leg, "market", None) is not None}
+
+
+def _plan_tickers(plans: list) -> frozenset:
+    """
+    The held markets some sale plans would sell on.
+
+    _run_prod passes the take-profit plans' markets to seller.plan_trims as
+    `skip`, so no pair is both sold and trimmed in one run.
+
+    Args:
+        plans (list): seller.SalePlan objects.
+
+    Returns:
+        frozenset: Their tickers (a paid-out partner has no market and is left out).
+    """
+    return frozenset(leg.ticker for plan in plans for leg in getattr(plan, "legs", ())
+                     if getattr(leg, "market", None) is not None)
+
+
+def _is_trim(sale) -> bool:
+    """
+    Say whether a sale is a Kelly trim rather than a take-profit sale.
+
+    Args:
+        sale: One of trader.sell_positions' results.
+
+    Returns:
+        bool: True only when its plan's kind is config.SALE_KIND_KELLY_TRIM.
+    """
+    return getattr(getattr(sale, "plan", None), "kind", None) == SALE_KIND_KELLY_TRIM
+
+
+def _emptied_tickers(sales: list) -> set:
+    """
+    The held markets a dry run's "simulated" sales would leave holding nothing.
+
+    A take-profit sale sells all a market holds; a Kelly trim may sell only
+    part, and then the market stays held, as a live run's read-back would show.
+
+    Args:
+        sales (list): trader.sell_positions' results in a dry run.
+
+    Returns:
+        set: Their tickers (a paid-out partner holds nothing and is left out).
+    """
+    emptied: set = set()
+    for sale in sales:
+        if sale.status != "simulated":
+            continue
+        for leg in getattr(sale.plan, "legs", ()):
+            if getattr(leg, "market", None) is None:
+                continue
+            # SaleLeg.held: the holding, on a trim's leg; None: the plan sells it all
+            held = getattr(leg, "held", None)
+            if held is None or held == sale.sold.get(leg.ticker):
+                emptied.add(leg.ticker)
+    return emptied
 
 
 def _account_decided_short(sales: list) -> list:
@@ -1219,6 +1296,9 @@ _LIVE_FLAGS = (
     ("no_sell", "--no-sell"),
     ("sell_min_days", "--sell-min-days"),
     ("no_sell_min_days", "--no-sell-min-days"),
+    ("trim_to_kelly", "--trim-to-kelly/--no-trim-to-kelly"),
+    ("trim_min_rise", "--trim-min-rise"),
+    ("no_trim_min_rise", "--no-trim-min-rise"),
     ("category", "--category"),
     ("any_category", "--any-category"),
     ("tag", "--tag"),
@@ -1258,17 +1338,16 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
     """
     Resolve this run's LiveSettings: the saved live defaults, with each given flag laid over.
 
-    The run's one read of the defaults (config.live_defaults, the one caller
-    the AST pin test_ast_live_path_reads_toggles_only_through_live_settings
-    allows); exits 2 when none are saved or the file is refused. There is no
-    fallback to config.py's toggle constants. LiveSettings validates the
-    result (dataclasses.replace re-runs __post_init__), so a flag meets the
-    same rule a saved value does; the result keeps the defaults' origin.
-    --category and --tag each replace the whole saved list, so a run that
-    changes the categories and keeps saved tags tied to a category it no
-    longer lists is refused, and the message names the remedy (--any-tag, or
-    this run's own --tag). Called before logging is configured, so a refusal
-    logs nothing and makes no request.
+    The run's one read of the saved defaults (config.live_defaults; the AST
+    pin test_ast_live_path_reads_toggles_only_through_live_settings allows no
+    other caller); there is no fallback to config.py's toggle constants. LiveSettings re-validates the
+    result, so a flag meets the same rules as a saved value, and the result
+    keeps the defaults' origin. --category and --tag each replace the whole
+    saved list; a run that drops the category of a saved tag tied to one is
+    refused, naming the remedy. --no-sell also clears the minimum of days, and
+    --no-trim-to-kelly the minimum price rise, since neither minimum is
+    allowed without its switch. Runs before logging is set up, so a refusal
+    logs nothing and sends no request.
 
     Args:
         args (argparse.Namespace): The parsed flags; a missing attribute reads
@@ -1323,6 +1402,18 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
         overrides["sell_min_days"] = None
     if getattr(args, "sell_min_days", None) is not None:
         overrides["sell_min_days"] = args.sell_min_days
+    # --no-trim-to-kelly clears the minimum price rise too; --trim-min-rise then
+    # sets one (LiveSettings refuses a minimum with trimming off)
+    trim = getattr(args, "trim_to_kelly", None)
+    if trim is not None:
+        overrides["trim_to_kelly"] = trim
+        if not trim:
+            overrides["trim_min_rise"] = None
+    if getattr(args, "no_trim_min_rise", None):
+        overrides["trim_min_rise"] = None
+    if getattr(args, "trim_min_rise", None) is not None:
+        # The flag takes whole cents; LiveSettings holds dollars
+        overrides["trim_min_rise"] = args.trim_min_rise / 100
     # --category / --tag (repeatable) set the filter; --any-category / --any-tag
     # clear the saved one (argparse keeps each pair mutually exclusive)
     if getattr(args, "category", None) is not None:
@@ -1355,6 +1446,11 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
             sell_step = f"{SELL_AT_STEP * 100:g}"
             message += (f" (--sell-at takes a whole percent, a multiple of {sell_step} "
                         f"from {sell_step} to 100, read as that percent / 100)")
+        if any(dest == "trim_min_rise" for dest, _ in given):
+            # --trim-min-rise's unit, from its grid definition (TRIM_PRICE_RISE_STEP_CENTS)
+            message += (" (--trim-min-rise takes whole cents, a multiple of "
+                        f"{TRIM_PRICE_RISE_STEP_CENTS} from {TRIM_PRICE_RISE_STEP_CENTS} to "
+                        "100, read as that many cents / 100 dollars)")
         if ("categories" in overrides and "tags" not in overrides
                 and _saved_tag_loses_its_category(reference, overrides["categories"])):
             # The tag LiveSettings names is a saved one, which no flag of this run shows
@@ -1368,12 +1464,12 @@ def _log_live_settings(settings: LiveSettings, reference: LiveSettings, *,
     """
     Log the run's defaults' origin, its toggles, any departure, and every rule warning.
 
-    One INFO line names the defaults' origin (the saved file, when and from
-    what it was saved). One INFO line marks each field that departs from
-    reference: "(default: X)" when reference is the saved live defaults, as a
-    live run's always is, "(config: X)" when it was built from config.py's
-    constants (a reference a test or direct call builds, e.g. with
-    config.live_settings()). Only a real-money run WARNs on a departure.
+    One INFO line names where the defaults came from; one marks each field
+    that departs from reference: "(default: X)" against the saved live
+    defaults, "(config: X)" against a reference built from config.py (tests
+    and direct calls only). Only a real-money run WARNs about a departure,
+    and, with the Kelly trim on, when a lower size cap or a higher k would
+    make it sell more of the held pairs (config.trim_change_warnings).
     Resolves neither object itself (TestLiveSettingsReachEverySite).
 
     Args:
@@ -1399,6 +1495,11 @@ def _log_live_settings(settings: LiveSettings, reference: LiveSettings, *,
                 "This PRODUCTION run overrides the saved live defaults (see the "
                 "\"(default: …)\" marks on the line above): its trades follow the "
                 "flags, not the saved defaults")
+    if real_money:
+        # With the Kelly trim on, a lower cap or a higher k sells more of the held
+        # pairs: warn before any trim is made
+        for text in trim_change_warnings(reference, settings):
+            logging.warning("Live settings: %s", text)
     # A setting that empties part of the strategy or lifts one pair's stake
     for text in live_rule_warnings(settings):
         logging.warning("Live settings: %s", text)
@@ -1553,6 +1654,19 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     person, are not bought; no position picked for sale is added to; nothing
     is sold when a held market was not identified or the listing was cut short.
 
+    With settings.trim_to_kelly on and anything held, the same step also
+    trims: seller.plan_trims plans part sales of the exact held pairs grown
+    past their Kelly share (never a pair the take-profit rule sells), sized on
+    the cash and positions value read at the start, and trader.sell_positions
+    sends them after the take-profit sales. Nothing is trimmed, with one
+    WARNING, when a held market was not identified, the listing was cut
+    short, a shard's cash could not be read, Kalshi's value of the open
+    positions is unread, refused or $0, or (checked last) an order rests on
+    the account or the resting orders cannot be read. A pair picked for a
+    trim is not added to this run and its markets are not bought; one trimmed
+    in part stays held, so its ladder stays blocked, while one trimmed whole
+    frees its ladder.
+
     Each trade bets a share of the portfolio value (the cash plus Kalshi's
     value of the open positions) but never spends more than the cash left.
     The minimum-balance check reads the portfolio value; low cash alone only
@@ -1617,6 +1731,9 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     shard_balances = account.shard_cash_cents
     # Cash to spend: all shards together, as cash is moved between shards before trading
     cash_cents = sum(shard_balances.values())
+    # Shard entries left out of cash_cents; any one stops the Kelly trim, which is
+    # sized on this read and would sell too much on short cash
+    cash_left_out = account.cash_left_out
     # The portfolio value each trade bets a share of (just the cash if positions are unread)
     positions_value_cents = account.positions_value_cents
     portfolio_value_cents = _bankroll_cents(cash_cents, positions_value_cents)
@@ -1722,24 +1839,71 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
                 + ("" if reference.origin == LIVE_DEFAULTS_FROM_CONFIG
                    else f" | defaults: {reference.origin}"))
 
-    # Sales come before every purchase: the cash they free funds this run's buys
+    # Sales, Kelly trims included, come before every purchase: the cash they free
+    # funds this run's buys. Holding nothing, a run trims nothing and logs no trim line
     sales: list = []
     sold_tickers: set = set()
     # A dry run's estimated sale proceeds, in the cash it sizes on (0 in a live run)
     simulated_cents = 0
-    if settings.sell_at is not None:
+    trimming = settings.trim_to_kelly and bool(held_positions)
+    if settings.sell_at is not None or trimming:
         if held_ladders is None or held_listing.get("complete") is not True:
             # Fails closed: a held market not identified or not listed could be on the
             # same ladder as any position
-            logging.warning("Not selling this run: %s",
-                            "a market the account holds could not be looked up"
-                            if held_ladders is None
-                            else "the list of the account's positions was cut short")
+            why = ("a market the account holds could not be looked up" if held_ladders is None
+                   else "the list of the account's positions was cut short")
+            if settings.sell_at is not None:
+                logging.warning("Not selling this run: %s", why)
+            if trimming:
+                logging.warning("Not trimming this run: %s", why)
         else:
             cash_before_sales = cash_cents
+            # The run's moment, the last check of every sale and trim planned below
+            moment = datetime.now(UTC)
             # Cross-module: the positions the take-profit rule sells (read-only requests)
             plans = plan_sales(client, held_positions, held_labels, markets_by_ticker,
-                               settings=settings, now=datetime.now(UTC))
+                               settings=settings, now=moment)
+            if trimming:
+                # Each gate below fails closed: a trim grows as the value it is sized
+                # on shrinks, so a value missing cash or positions would sell too much
+                if cash_left_out:
+                    # Only the first entry is named, so one odd reply cannot flood the line
+                    logging.warning(
+                        "Not trimming this run: the balance reply had %s whose cash could not "
+                        "be counted (%s), so the cash may be short, and a trim sized on too "
+                        "little cash would sell too much",
+                        "a shard entry" if len(cash_left_out) == 1
+                        else f"{len(cash_left_out)} shard entries",
+                        cash_left_out[0] if len(cash_left_out) == 1
+                        else f"{cash_left_out[0]}, and {len(cash_left_out) - 1} more")
+                elif not checked_value_cents:
+                    # Kalshi's value of the open positions not read, refused or $0
+                    logging.warning(
+                        "Not trimming this run: Kalshi's value of the open positions %s, "
+                        "and a trim sized on a value that leaves them out would sell too "
+                        "much",
+                        "could not be read" if positions_value_cents is None
+                        else "was refused" if checked_value_cents is None
+                        else "is $0.00")
+                # Cross-module: the orders resting on the account (read-only requests),
+                # read last, once every other gate has passed. Kalshi counts a resting
+                # order's cash in neither its balance nor its value of the open positions
+                elif (resting := get_resting_orders(client)) is None or resting > 0:
+                    logging.warning(
+                        "Not trimming this run: %s, and the cash Kalshi holds for a resting "
+                        "order is in neither its balance nor its value of the open "
+                        "positions, so a trim sized on those would sell too much",
+                        "the account's resting orders could not be read" if resting is None
+                        else f"{resting} order(s) rest on the account")
+                else:
+                    # Cross-module: part sales of the exact held pairs grown past their
+                    # Kelly share (read-only requests), sized on the start-of-run cash and
+                    # value, skipping the take-profit plans' pairs, whose sales go first
+                    plans = plans + plan_trims(
+                        client, held_positions, held_labels, markets_by_ticker,
+                        settings=settings, now=moment, cash_cents=cash_cents,
+                        positions_value_cents=checked_value_cents,
+                        skip=_plan_tickers(plans))
             if plans and not args.dry_run:
                 # Recorded before the first sale order, as before the first buy
                 report.submission_started = True
@@ -1800,8 +1964,10 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
                     # market held before counts as still held (fails closed)
                     held_tickers = set(held_positions) | (
                         set() if held_listing.get("complete") is True else held_tickers)
-                # Dry run: take out what it would have sold; live: what the new listing shows
-                still_held = (held_tickers - sold_tickers) if args.dry_run else held_tickers
+                # Dry run: drop only what its sales would empty (a pair trimmed in part
+                # stays held); live run: what the new listing shows
+                still_held = ((held_tickers - _emptied_tickers(sales)) if args.dry_run
+                              else held_tickers)
                 unknown = sorted((t for t in still_held if t not in held_labels), key=str)
                 if unknown:
                     # Only a position opened elsewhere since the run started is unknown
@@ -1861,13 +2027,20 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
                              "run: %d", len(full))
                 add_on_pairs = {key: pair for key, pair in add_on_pairs.items()
                                 if key not in full}
-            # No position picked for sale is added to (_planned_tickers)
+            # No position picked for a sale or a Kelly trim is added to (_planned_tickers)
             if sales:
                 planned = _planned_tickers(sales) | sold_tickers
                 picked = {key for key in add_on_pairs if key & planned}
                 if picked:
-                    logging.info("Held pairs picked for sale this run, not added to: %d",
-                                 len(picked))
+                    # Counted apart: the pairs picked for a Kelly trim, and the rest
+                    trimmed = _planned_tickers([sale for sale in sales if _is_trim(sale)])
+                    for_trim = {key for key in picked if key & trimmed}
+                    if picked - for_trim:
+                        logging.info("Held pairs picked for sale this run, not added to: %d",
+                                     len(picked - for_trim))
+                    if for_trim:
+                        logging.info("Held pairs picked for a Kelly trim this run, not added "
+                                     "to: %d", len(for_trim))
                     add_on_pairs = {key: pair for key, pair in add_on_pairs.items()
                                     if key not in picked}
     # The markets of those pairs and lone legs stay in (a pair's market pairs
@@ -2110,7 +2283,7 @@ def _build_parser() -> argparse.ArgumentParser:
     live = parser.add_argument_group(
         "live trading toggles",
         "Override one live default for THIS run only, in either mode "
-        "(adding to held pairs and selling: production runs only). The live "
+        "(adding to held pairs, selling and trimming: production runs only). The live "
         "defaults are the ones saved through python3 -m kalshi_betting.defaults_server "
         "(live_defaults.json); a run refuses to start without them. The weekly scheduler "
         "passes none of these flags, so a scheduled run trades exactly the saved defaults.",
@@ -2130,23 +2303,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Time-series spread-band CEILING on pB - pA, 0-1 "
              "(default: the saved live defaults)",
     )
+    # Help ending for --interval-discount and both cap flags: with the Kelly trim
+    # on, a higher k or a lower cap also sells held pairs
+    trim_sells = ("With the Kelly trim on (saved, or given with --trim-to-kelly), a {} "
+                  "also sells: each exact held {}pair worth more than its new Kelly size is "
+                  "sold down to it before anything is bought, once its wait has passed")
     live.add_argument(
         "--interval-discount", type=float, default=None, metavar="K",
         help="Time-series interval discount k, in (0, 1] "
-             "(default: the saved live defaults)",
+             "(default: the saved live defaults). "
+             + trim_sells.format("higher k", "time-series "),
     )
     # The caps' grid step in percent (SIZE_CAP_STEP); argparse %-formats help, hence "%%"
     cap_step = f"{SIZE_CAP_STEP * 100:g}"
     live.add_argument(
         "--size-cap", type=int, default=None, metavar="PCT",
         help=f"Per-trade Kelly cap for every pair, in whole percent, in {cap_step}%% "
-             "steps; 100 = no cap (default: the saved live defaults)",
+             "steps; 100 = no cap (default: the saved live defaults). "
+             + trim_sells.format("lower cap", ""),
     )
     live.add_argument(
         "--same-title-size-cap", type=int, default=None, metavar="PCT",
         help=f"Extra per-trade cap on same-title pairs, in whole percent, in {cap_step}%% "
              "steps; 100 = no extra cap beyond --size-cap "
-             "(default: the saved live defaults)",
+             "(default: the saved live defaults). "
+             + trim_sells.format("lower cap", "same-title "),
     )
     live.add_argument(
         "--add-to-held-pairs", action=argparse.BooleanOptionalAction, default=None,
@@ -2180,6 +2361,30 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-sell-min-days", action="store_true", default=None,
         help="Set no minimum of days to maturity this run, whatever the saved live "
              "defaults say",
+    )
+    live.add_argument(
+        "--trim-to-kelly", action=argparse.BooleanOptionalAction, default=None,
+        help="Set the Kelly trim on for this run: before buying, sell part of each "
+             "exact held pair that has outgrown its Kelly size, once "
+             "config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE calendar days have passed since "
+             "the pair's last trade. --no-trim-to-kelly sets it off and clears the "
+             "saved minimum price rise too. Production runs only: a dev run holds "
+             "nothing (default: the saved live defaults)",
+    )
+    # The minimum's grid step in whole cents (TRIM_PRICE_RISE_STEP_CENTS)
+    rise_step = TRIM_PRICE_RISE_STEP_CENTS
+    trim_rise = live.add_mutually_exclusive_group()
+    trim_rise.add_argument(
+        "--trim-min-rise", type=int, default=None, metavar="CENTS",
+        help="The least rise, in whole cents, in a held pair's total price since the "
+             "last trade on it before the Kelly trim may sell part of it; a multiple "
+             f"of {rise_step} from {rise_step} to 100. Needs the Kelly trim on, saved "
+             "or given with --trim-to-kelly (default: the saved live defaults)",
+    )
+    trim_rise.add_argument(
+        "--no-trim-min-rise", action="store_true", default=None,
+        help="Set no minimum price rise for the Kelly trim this run, whatever the saved "
+             "live defaults say",
     )
     # Filed as the backtest dashboard files a trade (_filter_by_category)
     categories = live.add_mutually_exclusive_group()
