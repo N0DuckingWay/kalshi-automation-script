@@ -28,8 +28,10 @@ Purpose:
 Dependencies:
     Imports run_backtest_sweep and BacktestSweep from backtester.py,
     generate_dashboard from dashboard.py, build_historical_client /
-    build_prod_live_client / load_series_categories (the dashboard's
-    returns-by-category labels) from historical.py, load_risk_free_rates
+    build_prod_live_client / load_series_categories (Kalshi's /series
+    listing, read once and handed to both the sweep, whose same-title sport
+    check files each series by it, and the dashboard's returns-by-category
+    labels) from historical.py, load_risk_free_rates
     (the T-bill yields the page's Sharpe and Sortino subtract) from
     treasury.py, load_depth_model (the table every trade's modeled order book
     is built from; the backtest's fills line names it) from depth_model.py,
@@ -858,6 +860,11 @@ def main() -> None:
             " (the band sweep's grid bands are unaffected)" if band_sweep else "",
         )
 
+    # Kalshi's /series listing, read once: the same-title sport check files
+    # each series by it (DR-79), and the dashboard files each trade under its
+    # series' category and tags. One cached read-only GET of /series, which
+    # never raises (it falls back to a stale copy or to {})
+    series_categories = load_series_categories(live_client)
     result = run_backtest_sweep(
         hist_client=hist_client,
         live_client=live_client,
@@ -885,6 +892,8 @@ def main() -> None:
         trim_rise_sweep=trim_rise_sweep,
         # Every trade's order book is built from this table (None: top of book)
         depth_model=depth_model,
+        # The listing the same-title label check files each series by
+        series_categories=series_categories,
     )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy add-on sweeps (add_on_cap_sweep, and add_on_tier_off_cap_sweep with the band sweep) unless --no-add-on-sweep
     # Everything below reports the PRIMARY point, so the summary block and the
     # dashboard's other six sections read exactly as they did before the sweep
@@ -938,10 +947,10 @@ def main() -> None:
     # interval_discount is the resolved k these trades were sized at, which
     # the Risk section's Kelly scatter must price on
     #
-    # series_categories files each trade under Kalshi's own series category and
-    # tags for the Returns Decomposition breakdown: one cached read-only GET of
-    # /series, which never raises (it falls back to a stale copy or to {})
-    series_categories = load_series_categories(live_client)
+    # series_categories (read above, the same copy the sweep's pairs were
+    # filed by) files each trade under Kalshi's own series category and tags
+    # for the Returns Decomposition breakdown.
+
     # The T-bill yields every Sharpe and Sortino on the page subtracts; never
     # raises (falls back to the saved copy, then "unavailable"), but an
     # unresponsive single-address host can cost about 4 minutes first

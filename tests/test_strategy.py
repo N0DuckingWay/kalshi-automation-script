@@ -17,7 +17,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kalshi_betting import backtester, config, dashboard, main, scanner, strategy, trader
+from kalshi_betting import (
+    backtester,
+    config,
+    dashboard,
+    historical,
+    main,
+    scanner,
+    strategy,
+    trader,
+)
 from kalshi_betting.config import (
     SAME_TITLE_CO_RESOLVE_PROB,
     LiveSettings,
@@ -2587,6 +2596,46 @@ class TestTimeSeriesKellyParity:
                    and node.name == "_run_dev")
         [dev_read] = _calls_to(dev, "load_series_categories")
         assert ast.unparse(dev_read) == "load_series_categories(None)"
+
+    def test_ast_the_backtest_applies_the_sport_check(self):
+        # DR-79's backtest half, through the definitions the live finder uses:
+        # the label half inside _extract_pairs' same-title branch, right after
+        # the close gate, over historical.series_labels' filing
+        tree = ast.parse(inspect.getsource(backtester))
+        extract = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                       and node.name == "_extract_pairs")
+        assert _function_calls(backtester, "_extract_pairs", "series_labels")
+        [labels] = _calls_to(extract, "labels_differ")
+        [closes] = _calls_to(extract, "closes_apart")
+        assert closes.lineno < labels.lineno
+        # The competition half, on the extracted same-title pairs
+        assert _function_calls(backtester, "_refuse_other_competitions", "competitions_differ")
+        prepare = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                       and node.name == "_prepare_candidates")
+        [read] = _calls_to(prepare, "load_event_competitions")
+        [refuse] = _calls_to(prepare, "_refuse_other_competitions")
+        [candles] = _calls_to(prepare, "_fetch_candles_parallel")
+        extracts = _calls_to(prepare, "_extract_pairs")
+        # Read after both extractions, refused before any candle is fetched
+        assert all(call.lineno < read.lineno for call in extracts)
+        assert read.lineno < refuse.lineno < candles.lineno
+        # The same-title extraction is handed the listing; the time-series one
+        # needs none (identical wording is never a time-series pair, DR-67)
+        handed = [[ast.unparse(k.value) for k in call.keywords if k.arg == "series_categories"]
+                  for call in extracts]
+        assert sorted(handed) == [[], ["series_categories"]]
+        # The labels are read as live ingest reads them
+        assert _function_calls(historical, "load_event_competitions",
+                               "_fetch_event_competition")
+        assert _function_calls(historical, "_fetch_event_competition", "event_competition")
+        # Every entry point hands its listing on to _prepare_candidates
+        for entry in ("run_backtest_sweep", "_prepare_entries"):
+            assert [ast.unparse(v) for v in _keyword_values(
+                backtester, entry, "_prepare_candidates", "series_categories")] == [
+                "series_categories"], entry
+        assert [ast.unparse(v) for v in _keyword_values(
+            backtester, "run_backtest", "_prepare_entries", "series_categories")] == [
+            "series_categories"]
 
     def test_ast_backtest_band_reaches_find_entry_through_config(self):
         # The backtest band's halves each have ONE home in config: the band is

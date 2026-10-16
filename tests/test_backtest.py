@@ -1144,9 +1144,24 @@ class TestDashboardHandoff:
         assert kwargs["interval_discount"] == result.primary.k
 
     def test_the_series_categories_are_passed_through(self, cli, monkeypatch):
+        # One read of the listing, before the sweep: the sweep's same-title
+        # sport check files each series by it (DR-79), and the dashboard files
+        # each trade by the same object
+        reads: list = []
+
+        def load(client):
+            reads.append(client)
+            cli["order"].append("load_series_categories")
+            return cli["series_categories"]
+
+        monkeypatch.setattr(backtest, "load_series_categories", load)
         _run(monkeypatch)
         _, kwargs = cli["dashboard"]
         assert kwargs["series_categories"] is cli["series_categories"]
+        assert cli["sweep_kwargs"]["series_categories"] is cli["series_categories"]
+        assert reads == [cli["live_client"]]
+        assert cli["order"].index("load_series_categories") < cli["order"].index(
+            "run_backtest_sweep")
 
     def test_the_risk_free_rates_are_passed_through(self, cli, monkeypatch):
         _run(monkeypatch)

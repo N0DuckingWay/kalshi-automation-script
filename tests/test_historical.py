@@ -6704,6 +6704,254 @@ class TestLoadSeriesCategories:
         assert calls == [{}, {"cursor": "c1"}]
 
 
+# ─── load_event_competitions: each event's competition, for the sport check ───
+
+# The real reader, taken at import (collection runs before any fixture): the
+# suite's session guard replaces it with a stub answering "", and these tests
+# put the real one back to read through a fake _historical_get
+_REAL_FETCH_EVENT_COMPETITION = historical._fetch_event_competition
+
+
+class TestLoadEventCompetitions:
+    """DR-79's backtest half: each event's product_metadata.competition, read
+    once from /events/{ticker} and cached in event_competitions.json. Only
+    answers Kalshi gave are kept; anything unknown is left out, so its
+    same-title pairs are refused, and it never raises."""
+
+    REPLIES = {
+        "KXNCAAWVMATCH-26OCT161900UKOU": {"event": {
+            "title": "Kentucky vs Oklahoma",
+            "product_metadata": {"competition": " NCAA Volleyball (W) "}}},
+        "KXNCAAFGAME-26OCT16UKOKLA": {"event": {
+            "title": "Kentucky vs Oklahoma",
+            "product_metadata": {"competition": "NCAA Football"}}},
+        "KXBRENTW-26MAR13": {"event": {"title": "Brent weekly"}},   # names none
+    }
+
+    @pytest.fixture
+    def cache(self, tmp_path):
+        # conftest already points the cache at this test's tmp_path
+        assert historical._EVENT_COMPETITIONS_CACHE == tmp_path / "event_competitions.json"
+        return historical._EVENT_COMPETITIONS_CACHE
+
+    @pytest.fixture
+    def reads(self, monkeypatch):
+        """The real reader over a fake GET: each event's REPLIES entry, an
+        exception to raise, or anything else as the reply. Records each path
+        read and each pause taken."""
+        record = {"paths": [], "pauses": [], "replies": dict(self.REPLIES)}
+
+        def fake_get(client, path, **params):
+            record["paths"].append(path)
+            reply = record["replies"][path.rsplit("/", 1)[1]]
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        monkeypatch.setattr(historical, "_fetch_event_competition",
+                            _REAL_FETCH_EVENT_COMPETITION)
+        monkeypatch.setattr(historical, "_historical_get", fake_get)
+        monkeypatch.setattr(historical.time, "sleep", record["pauses"].append)
+        return record
+
+    def test_a_miss_is_read_and_saved(self, cache, reads, caplog):
+        wanted = ["KXNCAAWVMATCH-26OCT161900UKOU", "KXNCAAFGAME-26OCT16UKOKLA",
+                  "KXBRENTW-26MAR13"]
+        with caplog.at_level(logging.INFO):
+            got = historical.load_event_competitions(MagicMock(), wanted)
+        assert got == {"KXNCAAWVMATCH-26OCT161900UKOU": "NCAA Volleyball (W)",
+                       "KXNCAAFGAME-26OCT16UKOKLA": "NCAA Football",
+                       "KXBRENTW-26MAR13": ""}
+        assert sorted(reads["paths"]) == sorted(f"/trade-api/v2/events/{t}" for t in wanted)
+        # One pause after every read
+        assert reads["pauses"] == [historical.EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS] * 3
+        assert json.loads(cache.read_text()) == {"competitions": got}
+        assert caplog.messages[-1] == (
+            "Event competitions: 3 events, 0 from the cache, 3 read from Kalshi, 0 unknown")
+
+    def test_a_cache_hit_makes_no_request(self, cache, reads, caplog):
+        cache.write_text(json.dumps({"competitions": {
+            "KXNCAAFGAME-26OCT16UKOKLA": "NCAA Football", "KXBRENTW-26MAR13": ""}}))
+        before = cache.read_text()
+        with caplog.at_level(logging.INFO):
+            got = historical.load_event_competitions(
+                MagicMock(), {"KXNCAAFGAME-26OCT16UKOKLA", "KXBRENTW-26MAR13"})
+        assert got == {"KXNCAAFGAME-26OCT16UKOKLA": "NCAA Football", "KXBRENTW-26MAR13": ""}
+        assert reads["paths"] == [] and reads["pauses"] == []
+        assert cache.read_text() == before
+        assert caplog.messages[-1] == (
+            "Event competitions: 2 events, 2 from the cache, 0 read from Kalshi, 0 unknown")
+
+    def test_a_new_answer_is_merged_into_the_cache(self, cache, reads):
+        cache.write_text(json.dumps({"competitions": {"KXOTHER-1": "EPL"}}))
+        historical.load_event_competitions(MagicMock(), ["KXNCAAFGAME-26OCT16UKOKLA"])
+        assert json.loads(cache.read_text()) == {"competitions": {
+            "KXOTHER-1": "EPL", "KXNCAAFGAME-26OCT16UKOKLA": "NCAA Football"}}
+
+    @pytest.mark.parametrize("reply", [
+        RuntimeError("offline"),
+        ["a list"],                       # not an object
+        {"events": []},                   # no event object
+        {"event": "Kentucky vs Oklahoma"},
+    ])
+    def test_a_failed_read_is_left_out_and_not_saved(self, cache, reads, caplog, reply):
+        reads["replies"]["KXNCAAFGAME-26OCT16UKOKLA"] = reply
+        with caplog.at_level(logging.INFO):
+            got = historical.load_event_competitions(
+                MagicMock(), ["KXNCAAWVMATCH-26OCT161900UKOU", "KXNCAAFGAME-26OCT16UKOKLA"])
+        assert got == {"KXNCAAWVMATCH-26OCT161900UKOU": "NCAA Volleyball (W)"}
+        assert json.loads(cache.read_text()) == {"competitions": got}
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        [line] = warnings
+        assert line.startswith("Could not read the competition of event "
+                               "KXNCAAFGAME-26OCT16UKOKLA: HTTP ")
+        assert line.endswith("its same-title pairs are refused this run")
+        assert "\n" not in line
+        # Paced after the failed read too
+        assert len(reads["pauses"]) == 2
+        assert caplog.messages[-1] == (
+            "Event competitions: 2 events, 0 from the cache, 1 read from Kalshi, 1 unknown")
+
+    @pytest.mark.parametrize("meta", [{"competition": 7}, {"competition": ["NCAA"]},
+                                      "NCAA Football"])
+    def test_a_label_that_is_not_text_is_left_out_and_not_saved(self, cache, reads,
+                                                                caplog, meta):
+        # scanner.event_competition reads it as None: unknown, never "names none"
+        reads["replies"]["KXNCAAFGAME-26OCT16UKOKLA"] = {"event": {"product_metadata": meta}}
+        with caplog.at_level(logging.WARNING):
+            got = historical.load_event_competitions(MagicMock(), ["KXNCAAFGAME-26OCT16UKOKLA"])
+        assert got == {}
+        assert not cache.exists()
+        assert caplog.messages == [
+            "The competition label of event KXNCAAFGAME-26OCT16UKOKLA is not text — its "
+            "same-title pairs are refused this run"]
+
+    def test_a_reader_that_answers_none_is_left_out(self, cache, monkeypatch):
+        # The same rule one level up: whatever the reader hands back that is
+        # not a string is no answer
+        monkeypatch.setattr(historical, "_fetch_event_competition", lambda c, t: None)
+        assert historical.load_event_competitions(MagicMock(), ["KXA-1"]) == {}
+        assert not cache.exists()
+
+    def test_the_cap_reads_the_first_events_and_warns(self, cache, reads, monkeypatch,
+                                                      caplog):
+        monkeypatch.setattr(historical, "EVENT_COMPETITION_MAX_LOOKUPS", 2)
+        wanted = ["KXNCAAWVMATCH-26OCT161900UKOU", "KXNCAAFGAME-26OCT16UKOKLA",
+                  "KXBRENTW-26MAR13"]
+        with caplog.at_level(logging.INFO):
+            got = historical.load_event_competitions(MagicMock(), wanted)
+        # Ticker order: KXBRENTW..., KXNCAAFGAME... are read, KXNCAAWVMATCH... is not
+        assert got == {"KXBRENTW-26MAR13": "", "KXNCAAFGAME-26OCT16UKOKLA": "NCAA Football"}
+        assert sorted(reads["paths"]) == ["/trade-api/v2/events/KXBRENTW-26MAR13",
+                                          "/trade-api/v2/events/KXNCAAFGAME-26OCT16UKOKLA"]
+        assert ("Event competitions: 3 events are not in the cache, more than the cap "
+                "EVENT_COMPETITION_MAX_LOOKUPS=2; reading the first 2 in ticker order and "
+                "leaving the other 1 unknown, so their same-title pairs are refused this "
+                "run") in caplog.messages
+        assert caplog.messages[-1] == (
+            "Event competitions: 3 events, 0 from the cache, 2 read from Kalshi, 1 unknown")
+
+    @pytest.mark.parametrize("given", ["reversed", "set"])
+    def test_the_cap_reads_the_first_events_in_ticker_order(self, cache, reads,
+                                                           monkeypatch, given):
+        # Forty events, the cap at twenty: only the twenty that sort first
+        # are read, whatever order (or set iteration order) they arrive in
+        monkeypatch.setattr(historical, "EVENT_COMPETITION_MAX_LOOKUPS", 20)
+        tickers = [f"KXEV{i:02d}-1" for i in range(40)]
+        for t in tickers:
+            reads["replies"][t] = {"event": {"title": t}}
+        wanted = list(reversed(tickers)) if given == "reversed" else set(tickers)
+        got = historical.load_event_competitions(MagicMock(), wanted)
+        assert sorted(got) == tickers[:20]
+        assert sorted(reads["paths"]) == [f"/trade-api/v2/events/{t}" for t in tickers[:20]]
+
+    def test_cached_events_do_not_count_toward_the_cap(self, cache, reads, monkeypatch,
+                                                       caplog):
+        # The two cached events sort first; the cap of one is spent on the
+        # first event NOT in the cache
+        monkeypatch.setattr(historical, "EVENT_COMPETITION_MAX_LOOKUPS", 1)
+        cache.write_text(json.dumps({"competitions": {"KXA-1": "", "KXB-1": "EPL"}}))
+        for t in ("KXC-1", "KXD-1"):
+            reads["replies"][t] = {"event": {"title": t}}
+        with caplog.at_level(logging.INFO):
+            got = historical.load_event_competitions(
+                MagicMock(), ["KXD-1", "KXC-1", "KXB-1", "KXA-1"])
+        assert got == {"KXA-1": "", "KXB-1": "EPL", "KXC-1": ""}
+        assert reads["paths"] == ["/trade-api/v2/events/KXC-1"]
+        assert ("Event competitions: 2 events are not in the cache, more than the cap "
+                "EVENT_COMPETITION_MAX_LOOKUPS=1; reading the first 1 in ticker order and "
+                "leaving the other 1 unknown, so their same-title pairs are refused this "
+                "run") in caplog.messages
+        assert caplog.messages[-1] == (
+            "Event competitions: 4 events, 2 from the cache, 1 read from Kalshi, 1 unknown")
+
+    def test_no_client_reads_the_cache_only(self, cache, reads, caplog):
+        cache.write_text(json.dumps({"competitions": {"KXNCAAFGAME-26OCT16UKOKLA": "NCAA Football"}}))
+        with caplog.at_level(logging.INFO):
+            got = historical.load_event_competitions(
+                None, ["KXNCAAFGAME-26OCT16UKOKLA", "KXBRENTW-26MAR13"])
+        assert got == {"KXNCAAFGAME-26OCT16UKOKLA": "NCAA Football"}
+        assert reads["paths"] == []
+        assert ("Event competitions: 1 events are not in the cache and no client was "
+                "given, so their labels are unknown and their same-title pairs are "
+                "refused") in caplog.messages
+
+    def test_cached_values_that_are_not_strings_are_read_again(self, cache, reads):
+        cache.write_text(json.dumps({"competitions": {
+            "KXNCAAFGAME-26OCT16UKOKLA": 5, "KXBRENTW-26MAR13": None,
+            "KXNCAAWVMATCH-26OCT161900UKOU": "NCAA Volleyball (W)"}}))
+        got = historical.load_event_competitions(MagicMock(), [
+            "KXNCAAFGAME-26OCT16UKOKLA", "KXBRENTW-26MAR13", "KXNCAAWVMATCH-26OCT161900UKOU"])
+        assert got["KXNCAAFGAME-26OCT16UKOKLA"] == "NCAA Football"
+        assert got["KXBRENTW-26MAR13"] == ""
+        assert sorted(reads["paths"]) == ["/trade-api/v2/events/KXBRENTW-26MAR13",
+                                          "/trade-api/v2/events/KXNCAAFGAME-26OCT16UKOKLA"]
+
+    @pytest.mark.parametrize("content", ["not json", "[1, 2]", '{"competitions": [1]}'])
+    def test_a_damaged_cache_reads_as_empty_and_is_replaced(self, cache, reads, content):
+        cache.write_text(content)
+        got = historical.load_event_competitions(MagicMock(), ["KXBRENTW-26MAR13"])
+        assert got == {"KXBRENTW-26MAR13": ""}
+        assert json.loads(cache.read_text()) == {"competitions": got}
+
+    def test_a_cache_whose_read_raises_is_left_as_it_is(self, cache, reads, monkeypatch,
+                                                        caplog):
+        cache.write_text(json.dumps({"competitions": {"KXOTHER-1": "EPL"}}))
+        before = cache.read_text()
+
+        def unreadable(path):
+            raise PermissionError("folder cannot be searched")
+
+        monkeypatch.setattr(historical, "_load_json_cache", unreadable)
+        with caplog.at_level(logging.WARNING):
+            got = historical.load_event_competitions(MagicMock(), ["KXBRENTW-26MAR13"])
+        assert got == {"KXBRENTW-26MAR13": ""}
+        assert cache.read_text() == before
+        assert "could not read the cached labels" in caplog.text
+
+    def test_a_save_that_fails_still_returns_the_answers(self, cache, reads, monkeypatch,
+                                                         caplog):
+        def disk_full(path, data):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(historical, "_save_json_cache", disk_full)
+        with caplog.at_level(logging.WARNING):
+            got = historical.load_event_competitions(MagicMock(), ["KXNCAAFGAME-26OCT16UKOKLA"])
+        assert got == {"KXNCAAFGAME-26OCT16UKOKLA": "NCAA Football"}
+        assert "could not save the cached labels" in caplog.text
+        assert "still uses the 1 it read" in caplog.text
+
+    def test_no_event_wanted_reads_nothing_and_logs_nothing(self, cache, reads, monkeypatch,
+                                                            caplog):
+        def no_read(path):
+            raise AssertionError("the cache was read for an empty request")
+
+        monkeypatch.setattr(historical, "_load_json_cache", no_read)
+        with caplog.at_level(logging.DEBUG):
+            assert historical.load_event_competitions(MagicMock(), [None, "", 7]) == {}
+        assert reads["paths"] == [] and caplog.messages == []
+
+
 # ─── What a sale would fetch, read from candles ───────────────────────────────
 
 def _bid_candle(ts: int, yes_ask, no_ask) -> dict:

@@ -49,7 +49,10 @@ Dependencies:
     competitions_differ are the same-title sport check (DR-79), and
     event_competition reads the competition an event names.
     main._attach_series_labels sets each market's _series_labels, which the
-    sport check compares.
+    sport check compares. backtester.py imports labels_differ and
+    competitions_differ too, so both paths refuse the same two-sport and
+    two-competition pairs, and historical.py imports event_competition, so
+    load_event_competitions reads a label as ingest does.
     pair_gap_days() is the single reader of that gap for everything
     downstream of pair formation, and pair_mid_spread() the single reader of
     the mid spread on a time-series pair (the later market's midpoint minus
@@ -118,7 +121,8 @@ Notes:
     and a football game and a women's volleyball match of the same two schools
     can close within an hour of each other. Both checks sit on the same-title
     finder and held_pair_kind only, for the same reason as the close gate, and
-    fail closed — see CLAUDE.md's DR-79 gotcha.
+    fail closed; the backtester applies the same two definitions — see
+    CLAUDE.md's DR-79 gotcha.
 
     The time-series finder additionally requires both legs to be CUMULATIVE-
     deadline markets stating two DIFFERENT deadlines (deadline_phrasing,
@@ -1566,7 +1570,8 @@ def event_competition(event: Any) -> str | None:
     (a men's and a women's game of one sport are two competitions); most
     other events carry none. fetch_open_events_with_markets attaches it to
     every market it parses, as ApiMarket._event_competition, for the
-    same-title competition check (competitions_differ, DR-79).
+    same-title competition check (competitions_differ, DR-79), and
+    historical.load_event_competitions reads the backtest's labels with it.
 
     An event that names no competition (no product_metadata, or none in it,
     or a null one) reads as "". A label that is there but cannot be read (a
@@ -1620,7 +1625,8 @@ def labels_differ(labels_a: Any, labels_b: Any) -> bool:
     Sports · Volleyball. The labels are historical.series_labels'
     (category, tag), the filing rule the dashboard and the live category/tag
     filter use, compared without regard to letter case. find_same_title_pairs
-    and held_pair_kind read it through _labels_differ.
+    and held_pair_kind read it through _labels_differ; backtester._extract_pairs
+    calls it directly, on the labels it files each cached series by.
 
     Fails closed: anything that is not a (category, tag) pair of strings
     reads as different, so a market whose labels were never attached is
@@ -1650,7 +1656,9 @@ def competitions_differ(competition_a: Any, competition_b: Any) -> bool:
     apart by the competition each event names (event_competition). One event
     naming a competition and the other naming none counts as different.
     Letter case and surrounding spaces are ignored. find_same_title_pairs and
-    held_pair_kind read it through _competitions_differ.
+    held_pair_kind read it through _competitions_differ;
+    backtester._refuse_other_competitions calls it directly, on the labels
+    historical.load_event_competitions reads.
 
     Fails closed: anything that is not a str (an unknown label, such as the
     None event_competition gives for one it cannot read) reads as different.

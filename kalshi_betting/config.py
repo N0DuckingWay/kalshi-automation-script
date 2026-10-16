@@ -226,10 +226,11 @@ SAME_TITLE_MIN_PRICE_DIFF     = 0.05
 # tickers belong to two DIFFERENT series (the one-series rule, DR-02/DR-54),
 # its two markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other
 # (DR-74), and both series are filed under one Kalshi category and first tag
-# while both events name the same competition, or neither names one (DR-79;
-# the live finder applies this third rule, while backtester._extract_pairs
-# applies the first two only). Identical wording that fails any of them is
-# two different games or questions, for which this prior is simply false.
+# while both events name the same competition, or neither names one (DR-79).
+# The live finder and the backtest apply all three (the backtest's competition
+# check runs on the pairs _extract_pairs returns, once their events' labels
+# are read). Identical wording that fails any of them is two different games
+# or questions, for which this prior is simply false.
 SAME_TITLE_CO_RESOLVE_PROB    = 0.95
 
 # Largest gap between the two markets' close times that a same-title pair may
@@ -2027,8 +2028,9 @@ SETTLED_PREFILTER_CACHE_TAG = "checkpoint-v3"
 # How long historical.load_series_categories reuses its cached copy of Kalshi's
 # /series listing (every series' official category and tags — 14,391 series in
 # ONE response, measured 2026-09-25) before fetching it again. It feeds the
-# backtest dashboard's category/tag views, every live run's same-title sport
-# check (main._attach_series_labels, DR-79) and, with a live filter set,
+# backtest dashboard's category/tag views, the same-title sport check of every
+# live run (main._attach_series_labels, DR-79) and of every backtest
+# (backtester._extract_pairs) and, with a live filter set,
 # main._filter_by_category (a dev run reads the cached copy however old). A
 # series' category rarely changes, so a week is plenty; a series the copy lacks
 # is filed by historical.series_labels' fallback until the next refresh.
@@ -2102,6 +2104,18 @@ EVENT_TITLE_FALLBACK_MAX_WORKERS = 8
 # not a guarantee of zero 429s. What removes the storm at bulk-window volume is
 # the budget rule above: combo tickers no longer reach the fallback at all.
 EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS = 0.15
+
+# Most events a backtest reads its competition label for from Kalshi in one run
+# (historical.load_event_competitions, DR-79); events already in its cache
+# file do not count. Cached markets carry no competition, so the backtest asks
+# Kalshi for the events of the same-title pairs backtester._extract_pairs
+# returns (every pairing check passed, before any price filter): about 28
+# events for the 365-day window, and each answer is cached, so a later run asks
+# only for new events. The reads use the event-title fallback's workers and
+# pause (EVENT_TITLE_FALLBACK_MAX_WORKERS,
+# EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS).
+# An event past the cap has no known label, so its pairs are refused.
+EVENT_COMPETITION_MAX_LOOKUPS = 2_000
 
 # Abandon a bulk event listing after this many CONSECUTIVE pages that resolve
 # no new titles. Same "productivity bail-out" idiom as MVE_MAX_EMPTY_PAGES.
