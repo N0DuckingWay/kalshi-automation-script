@@ -2534,6 +2534,60 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(scanner, "find_same_title_pairs", "close_gap_bound_text")
         assert _function_calls(backtester, "_extract_pairs", "close_gap_bound_text")
 
+    def test_ast_both_same_title_readers_apply_the_sport_check(self):
+        # DR-79: identical wording on two series that close together is one
+        # question only when both series are filed alike and both events name
+        # one competition. The finder and held_pair_kind (which live trimming
+        # reads) are the two live readers of the same-title rules; leaving
+        # held_pair_kind out would let a trim price a held football/volleyball
+        # pair on the same-title chance of paying
+        for reader in ("find_same_title_pairs", "held_pair_kind"):
+            assert _function_calls(scanner, reader, "_labels_differ"), reader
+            assert _function_calls(scanner, reader, "_competitions_differ"), reader
+        # Each live reader goes through the one definition
+        assert _function_calls(scanner, "_labels_differ", "labels_differ")
+        assert _function_calls(scanner, "_competitions_differ", "competitions_differ")
+        # Never on the time-series finder: identical wording is never a
+        # time-series pair (DR-67), and two rungs of one question are filed alike
+        for callee in ("_labels_differ", "labels_differ", "_competitions_differ",
+                       "competitions_differ"):
+            assert not _function_calls(scanner, "find_time_series_pairs", callee), callee
+        # Ingest reads each event's competition through the one reader
+        assert _function_calls(scanner, "fetch_open_events_with_markets", "event_competition")
+
+    def test_ast_both_run_modes_file_every_market_before_they_pair(self):
+        # The labels the sport check compares are attached once per run, from
+        # the one filing rule, before the finders, and in production before the
+        # sale block too (seller.plan_trims reads them through held_pair_kind)
+        assert _function_calls(main, "_attach_series_labels", "series_labels")
+        tree = ast.parse(inspect.getsource(main))
+        for mode, before in (("_run_prod", ("plan_trims", "find_time_series_pairs",
+                                            "find_same_title_pairs", "_filter_by_category")),
+                             ("_run_dev", ("find_time_series_pairs", "find_same_title_pairs",
+                                           "_filter_by_category"))):
+            func = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == mode)
+            [read] = _calls_to(func, "load_series_categories")
+            [attach] = _calls_to(func, "_attach_series_labels")
+            # The listing just read, handed to the attach
+            assert [ast.unparse(arg) for arg in attach.args] == [
+                "markets", "series_categories"], mode
+            assert read.lineno < attach.lineno, mode
+            for callee in before:
+                calls = _calls_to(func, callee)
+                assert calls, (mode, callee)
+                assert all(attach.lineno < call.lineno for call in calls), (mode, callee)
+            # The filter is handed that same listing, never reads its own
+            [category_filter] = _calls_to(func, "_filter_by_category")
+            assert [ast.unparse(k.value) for k in category_filter.keywords
+                    if k.arg == "series_categories"] == ["series_categories"], mode
+        # Dev reads the cached copy only: the sandbox key never signs a
+        # production request
+        dev = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                   and node.name == "_run_dev")
+        [dev_read] = _calls_to(dev, "load_series_categories")
+        assert ast.unparse(dev_read) == "load_series_categories(None)"
+
     def test_ast_backtest_band_reaches_find_entry_through_config(self):
         # The backtest band's halves each have ONE home in config: the band is
         # resolved and validated by time_series_spread_band, its floor is

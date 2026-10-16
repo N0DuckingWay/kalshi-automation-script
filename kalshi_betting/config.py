@@ -222,11 +222,14 @@ SAME_TITLE_MIN_PRICE_DIFF     = 0.05
 
 # Prior probability that a same-title pair co-resolves (i.e. both YES or both NO).
 # Set at 95% — divergence is an anomaly, so we assume high correlation by default.
-# It applies only to a pair that passed BOTH pairing rules: its two event
+# It applies only to a pair that passed all three pairing rules: its two event
 # tickers belong to two DIFFERENT series (the one-series rule, DR-02/DR-54),
-# and its two markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each
-# other (DR-74). Identical wording that fails either rule is two different
-# fixtures of one question, for which this prior is simply false.
+# its two markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other
+# (DR-74), and both series are filed under one Kalshi category and first tag
+# while both events name the same competition, or neither names one (DR-79;
+# the live finder applies this third rule, while backtester._extract_pairs
+# applies the first two only). Identical wording that fails any of them is
+# two different games or questions, for which this prior is simply false.
 SAME_TITLE_CO_RESOLVE_PROB    = 0.95
 
 # Largest gap between the two markets' close times that a same-title pair may
@@ -2024,7 +2027,8 @@ SETTLED_PREFILTER_CACHE_TAG = "checkpoint-v3"
 # How long historical.load_series_categories reuses its cached copy of Kalshi's
 # /series listing (every series' official category and tags — 14,391 series in
 # ONE response, measured 2026-09-25) before fetching it again. It feeds the
-# backtest dashboard's category/tag views and, with a live filter set,
+# backtest dashboard's category/tag views, every live run's same-title sport
+# check (main._attach_series_labels, DR-79) and, with a live filter set,
 # main._filter_by_category (a dev run reads the cached copy however old). A
 # series' category rarely changes, so a week is plenty; a series the copy lacks
 # is filed by historical.series_labels' fallback until the next refresh.

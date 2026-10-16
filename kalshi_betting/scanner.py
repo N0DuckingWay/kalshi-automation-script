@@ -17,7 +17,8 @@ Purpose:
     stripping would otherwise collapse into one group; and (2)
     same-title pairs — contracts with identical title and subtitle on
     different event tickers of DIFFERENT event series whose two markets close
-    within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (DR-74), traded as a
+    within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (DR-74) and are
+    about one sport or subject in one competition (DR-79), traded as a
     near-arbitrage (NO on the pricier, YES on the cheaper) when their prices
     diverge. Both paths then check the live order book to replace best-ask
     prices with depth-weighted fill prices and confirm the edge survives real
@@ -44,7 +45,11 @@ Dependencies:
     same-event deadline ladder's leg order and gap (DR-73), and closes_apart,
     the one definition of the same-title close gate, with
     close_gap_bound_text, the bound its refusal line prints (DR-74), and
-    ladder_keys, which ladders a market is on).
+    ladder_keys, which ladders a market is on). labels_differ and
+    competitions_differ are the same-title sport check (DR-79), and
+    event_competition reads the competition an event names.
+    main._attach_series_labels sets each market's _series_labels, which the
+    sport check compares.
     pair_gap_days() is the single reader of that gap for everything
     downstream of pair formation, and pair_mid_spread() the single reader of
     the mid spread on a time-series pair (the later market's midpoint minus
@@ -105,6 +110,15 @@ Notes:
     (DR-67), so it cannot relabel the trade. It fails closed on a close time
     it cannot compare, and the backtester mirrors it through the same
     closes_apart — see CLAUDE.md's DR-74 gotcha.
+
+    Closing together is still not sufficient: the two series must be filed
+    under one Kalshi category and first tag (labels_differ) and the two events
+    must name one competition, or neither name one (competitions_differ),
+    because "<Team> wins" under "A vs B" names neither the sport nor the date
+    and a football game and a women's volleyball match of the same two schools
+    can close within an hour of each other. Both checks sit on the same-title
+    finder and held_pair_kind only, for the same reason as the close gate, and
+    fail closed — see CLAUDE.md's DR-79 gotcha.
 
     The time-series finder additionally requires both legs to be CUMULATIVE-
     deadline markets stating two DIFFERENT deadlines (deadline_phrasing,
@@ -1542,6 +1556,155 @@ def close_gap_bound_text(seconds: int | None = None) -> str:
         minutes = bound // 60
         return f"{minutes} minute{'' if minutes == 1 else 's'}"
     return f"{bound} second{'' if bound == 1 else 's'}"
+
+
+def event_competition(event: Any) -> str | None:
+    """
+    The competition an event names, such as "NCAA Football" or "NCAA Volleyball (W)".
+
+    Kalshi keeps it in the event's product_metadata. Sports events carry it
+    (a men's and a women's game of one sport are two competitions); most
+    other events carry none. fetch_open_events_with_markets attaches it to
+    every market it parses, as ApiMarket._event_competition, for the
+    same-title competition check (competitions_differ, DR-79).
+
+    An event that names no competition (no product_metadata, or none in it,
+    or a null one) reads as "". A label that is there but cannot be read (a
+    product_metadata that is not an object, a competition that is not a
+    string, or an event that is not an object at all) reads as None, which
+    competitions_differ treats as unknown, so a reshaped payload refuses
+    pairs rather than letting two events read as naming none.
+
+    Args:
+        event (Any): One event object from an /events reply.
+
+    Returns:
+        str | None: The label with surrounding spaces removed; "" when the
+            event names none; None when the label cannot be read.
+    """
+    if not isinstance(event, dict):
+        return None
+    meta = event.get("product_metadata")
+    if meta is None:
+        return ""
+    if not isinstance(meta, dict):
+        return None
+    label = meta.get("competition")
+    if label is None:
+        return ""
+    return label.strip() if isinstance(label, str) else None
+
+
+def _is_label_pair(labels: Any) -> bool:
+    """
+    True for a (category, tag) tuple of two strings, the shape series_labels returns.
+
+    Args:
+        labels (Any): A market's ._series_labels, or anything else.
+
+    Returns:
+        bool: True only for a tuple of exactly two strings.
+    """
+    return (isinstance(labels, tuple) and len(labels) == 2
+            and all(isinstance(part, str) for part in labels))
+
+
+def labels_differ(labels_a: Any, labels_b: Any) -> bool:
+    """
+    True unless two series are filed under one Kalshi category and first tag.
+
+    Half of the same-title sport check (DR-79). Identical wording on two
+    series is one question only when both series are about the same thing:
+    "Kentucky vs Oklahoma: Kentucky wins" is a football game in one series
+    and a women's volleyball match in another, filed Sports · Football and
+    Sports · Volleyball. The labels are historical.series_labels'
+    (category, tag), the filing rule the dashboard and the live category/tag
+    filter use, compared without regard to letter case. find_same_title_pairs
+    and held_pair_kind read it through _labels_differ.
+
+    Fails closed: anything that is not a (category, tag) pair of strings
+    reads as different, so a market whose labels were never attached is
+    never paired.
+
+    Args:
+        labels_a (Any): The first series' (category, tag).
+        labels_b (Any): The second series' (category, tag).
+
+    Returns:
+        bool: False only when both are (category, tag) pairs of strings that
+            match once letter case is ignored.
+    """
+    if not (_is_label_pair(labels_a) and _is_label_pair(labels_b)):
+        return True
+    return (tuple(part.casefold() for part in labels_a)
+            != tuple(part.casefold() for part in labels_b))
+
+
+def competitions_differ(competition_a: Any, competition_b: Any) -> bool:
+    """
+    True unless two events name the same competition, or neither names one.
+
+    The other half of the same-title sport check (DR-79). Two series of one
+    sport share a tag ("Basketball", "Soccer"), so a men's and a women's
+    game, two leagues, or a league and a cup fixture of one matchup are told
+    apart by the competition each event names (event_competition). One event
+    naming a competition and the other naming none counts as different.
+    Letter case and surrounding spaces are ignored. find_same_title_pairs and
+    held_pair_kind read it through _competitions_differ.
+
+    Fails closed: anything that is not a str (an unknown label, such as the
+    None event_competition gives for one it cannot read) reads as different.
+
+    Args:
+        competition_a (Any): The first event's label; "" when it names none.
+        competition_b (Any): The second event's label, same shape.
+
+    Returns:
+        bool: False only when both are strings that match once letter case
+            and surrounding spaces are ignored (two "" match).
+    """
+    if not isinstance(competition_a, str) or not isinstance(competition_b, str):
+        return True
+    return competition_a.strip().casefold() != competition_b.strip().casefold()
+
+
+def _labels_differ(mA: Any, mB: Any) -> bool:
+    """
+    Live reader of labels_differ over each market's ._series_labels.
+
+    main._attach_series_labels sets that attribute on every market of a run
+    before either finder runs. A market without it (or a MagicMock, whose
+    auto-attribute is not a tuple) fails closed.
+
+    Args:
+        mA (Any): First market object.
+        mB (Any): Second market object.
+
+    Returns:
+        bool: labels_differ of the two markets' labels, a missing one read as None.
+    """
+    return labels_differ(getattr(mA, "_series_labels", None),
+                         getattr(mB, "_series_labels", None))
+
+
+def _competitions_differ(mA: Any, mB: Any) -> bool:
+    """
+    Live reader of competitions_differ over each market's ._event_competition.
+
+    fetch_open_events_with_markets sets that attribute on every market it
+    parses ("" for an event that names no competition, None for one whose
+    label cannot be read). None, a market without the attribute, or a
+    MagicMock (whose auto-attribute is not a str) fails closed.
+
+    Args:
+        mA (Any): First market object.
+        mB (Any): Second market object.
+
+    Returns:
+        bool: competitions_differ of the two markets' labels, a missing one read as None.
+    """
+    return competitions_differ(getattr(mA, "_event_competition", None),
+                               getattr(mB, "_event_competition", None))
 
 
 def _field_phrasing(text: Any) -> str | None:
@@ -3368,6 +3531,14 @@ class ApiMarket:
             its own market's shard (see trader._build_no_order_v2).
             DEFAULT_EXCHANGE_INDEX when the payload omits the field.
         _event_title (str): Parent event title attached for pair_key grouping.
+        _event_competition (str | None): The competition the parent event
+            names (event_competition), "" when it names none, None when its
+            label cannot be read. Read by the same-title competition check
+            (_competitions_differ), which refuses None.
+        _series_labels: The (category, tag) the market's series is filed
+            under in Kalshi's /series listing (historical.series_labels),
+            set by main._attach_series_labels; None until then, which the
+            same-title sport check (_labels_differ) reads as unknown.
     """
     ticker: str
     event_ticker: str
@@ -3382,9 +3553,13 @@ class ApiMarket:
     price_ranges: Any = None  # list[PriceRange] | None — None = unknown
     exchange_index: int = DEFAULT_EXCHANGE_INDEX
     _event_title: str = field(default="")
+    _event_competition: str | None = field(default="")
+    # (category, tag); main._attach_series_labels sets it
+    _series_labels: Any = field(default=None)
 
 
-def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
+def _market_from_dict(m: dict, event_title: str,
+                      event_competition: str | None = "") -> ApiMarket:
     """
     Build an ApiMarket from one raw market JSON dict.
 
@@ -3396,6 +3571,10 @@ def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
     Args:
         m (dict): One market from a raw market or event reply.
         event_title (str): Parent event's title, attached as _event_title.
+        event_competition (str | None): The competition the parent event
+            names (event_competition), attached as _event_competition. ""
+            (the default) when it names none or the caller did not read it;
+            None when it could not be read.
 
     Returns:
         ApiMarket: Parsed market ready for the pair-detection pipeline.
@@ -3427,6 +3606,7 @@ def _market_from_dict(m: dict, event_title: str) -> ApiMarket:
         # planner read it later
         exchange_index=_shard_index(m),
         _event_title=event_title,
+        _event_competition=event_competition,
     )
 
 
@@ -3463,16 +3643,18 @@ def _error_text(exc: BaseException) -> str:
 def _fetch_held_market(client: Any, ticker: str, event_titles: dict, *,
                        noun: str = "held market") -> ApiMarket | None:
     """
-    Ask the exchange for one held market and its event's title.
+    Ask the exchange for one held market and its event's title and competition.
 
     The event title is part of the question label, so without it the label
-    would not match the market's ladder-mates. `event_titles` caches titles
-    by event.
+    would not match the market's ladder-mates. The competition is kept as the
+    market list keeps it (event_competition), for the same-title sport check.
+    `event_titles` caches both by event.
 
     Args:
         client (Any): An authenticated Kalshi client.
         ticker (str): The held market's ticker.
-        event_titles (dict): Event titles already fetched, by event ticker.
+        event_titles (dict): Each event already fetched, by event ticker:
+            its (title, competition).
         noun (str): Keyword-only. What the failure lines call the market:
             "held market", or "market" for one that may no longer be held.
 
@@ -3502,10 +3684,13 @@ def _fetch_held_market(client: Any, ticker: str, event_titles: dict, *,
                 logging.warning("Could not look up %s %s: the reply for its event "
                                 "%s had no event", noun, ticker, event_ticker)
                 return None
-            # A title-less event reads as "", as in the market list
-            event_titles[event_ticker] = event.get("title") or ""
+            # A title-less event reads as "", as in the market list, and its
+            # competition is read as the market list reads it
+            event_titles[event_ticker] = (event.get("title") or "",
+                                          event_competition(event))
+        title, competition = event_titles[event_ticker]
         # Parsed like the market list, so its labels match its ladder-mates'
-        return _market_from_dict(raw, event_titles[event_ticker])
+        return _market_from_dict(raw, title, competition)
     except Exception as exc:
         logging.warning("Could not look up %s %s: %s", noun, ticker, _error_text(exc))
         return None
@@ -3525,7 +3710,8 @@ def market_for_labels(client: Any, ticker: Any, markets_by_ticker: dict,
         ticker (Any): The market's ticker; anything but a non-empty string
             names no market.
         markets_by_ticker (dict): This run's markets by ticker, before held ones are removed.
-        event_titles (dict): Event titles by event ticker; a lookup adds to it.
+        event_titles (dict): Each looked-up event's (title, competition), by
+            event ticker; a lookup adds to it.
 
     Returns:
         ApiMarket | None: The market, or None when the ticker names none or
@@ -3881,7 +4067,11 @@ def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | No
 
     Same-title (find_same_title_pairs' rules): identical title, subtitle and
     event title (with a title or subtitle to compare), on two different series,
-    closing within the same-title bound.
+    closing within the same-title bound, both series filed under one Kalshi
+    category and tag, and both events naming the same competition or neither
+    naming one (DR-79). A held pair from two sports or two competitions is
+    therefore no known kind, and is never trimmed on the same-title chance of
+    paying.
 
     Time-series (find_time_series_pairs' rules): one group key and two
     different cumulative deadlines, then:
@@ -3917,10 +4107,13 @@ def held_pair_kind(yes_market: Any, no_market: Any) -> tuple[str, Any, Any] | No
         if not ((getattr(yes_market, "title", "") or "")
                 or (getattr(yes_market, "subtitle", "") or "")):
             return None
-        # Two events on two series, closing within the bound. Identical
-        # wording states one deadline, so it is never a time-series pair
+        # Two events on two series, closing within the bound, filed alike and
+        # naming one competition. Identical wording states one deadline, so it
+        # is never a time-series pair
         if (same_event or _same_series(yes_market, no_market)
-                or _closes_apart(yes_market, no_market)):
+                or _closes_apart(yes_market, no_market)
+                or _labels_differ(yes_market, no_market)
+                or _competitions_differ(yes_market, no_market)):
             return None
         side_a, side_b = leg_sides("same_title")
         return "same_title", by_side[side_a], by_side[side_b]
@@ -4376,7 +4569,10 @@ def fetch_open_events_with_markets(
     allows MVE (multivariate) markets to be safely scanned: pair-grouping uses
     `event_title + market_title`, so cross-event option-label collisions (e.g.
     "Trump" in two unrelated events) no longer false-positive into a same-title
-    or time-series pair.
+    or time-series pair. Each market also gets the competition its event names
+    (event_competition: "" for none, None for a label it cannot read) as
+    `_event_competition`, which the same-title sport check compares; one
+    always-logged line counts the markets whose event names one.
 
     Uses the SDK's raw-response variants + ApiMarket parsing instead of the
     modeled `get_events` call — the pinned SDK's Market model can no longer
@@ -4414,8 +4610,10 @@ def fetch_open_events_with_markets(
     Returns:
         list: Flat list of ApiMarket objects for all open markets, each with
             `_event_title` set to its parent event's full title (may be empty
-            string if the event had no title) and `exchange_index` set to its
-            shard. May contain thousands of items.
+            string if the event had no title), `_event_competition` set to the
+            competition that event names ("" for none, None when unreadable)
+            and `exchange_index` set to its shard. May contain thousands of
+            items.
     """
     markets: list = []
     # Normalize once so both loops below do a plain set membership test
@@ -4446,6 +4644,8 @@ def fetch_open_events_with_markets(
         pages += 1
         for ev in data.get("events") or []:
             ev_title = ev.get("title") or ""
+            # The competition the event names, for the same-title sport check
+            ev_competition = event_competition(ev)
             for m in ev.get("markets") or []:
                 # An "open" event can still nest closed/settled/determined markets
                 # (e.g. one option in a multi-choice event already resolved while
@@ -4462,8 +4662,8 @@ def fetch_open_events_with_markets(
                     skipped_shard += 1
                     continue
                 # Parse into ApiMarket with the parent event title attached so
-                # pair_key()/display_title() can find it
-                markets.append(_market_from_dict(m, ev_title))
+                # pair_key()/display_title() can find it, and its competition
+                markets.append(_market_from_dict(m, ev_title, ev_competition))
         if pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
             logging.info("Open-events fetch: %d pages, %d markets so far", pages, len(markets))
         new_cursor = data.get("cursor")
@@ -4531,6 +4731,8 @@ def fetch_open_events_with_markets(
             page_active_count = 0
             for ev in events:
                 ev_title = ev.get("title") or ""
+                # The competition the event names, as in the standard loop
+                ev_competition = event_competition(ev)
                 for m in ev.get("markets") or []:
                     # Only include markets that are still open — MVE response may
                     # include closed/settled options inside an otherwise-open event.
@@ -4543,7 +4745,7 @@ def fetch_open_events_with_markets(
                         if _shard_index(m) in inactive:
                             skipped_shard += 1
                             continue
-                        markets.append(_market_from_dict(m, ev_title))
+                        markets.append(_market_from_dict(m, ev_title, ev_competition))
                         mve_market_count += 1
                         page_active_count += 1
             if mve_pages % SCANNER_PROGRESS_LOG_EVERY_PAGES == 0:
@@ -4607,6 +4809,19 @@ def fetch_open_events_with_markets(
         "Ingested markets by shard: %s",
         dict(sorted(Counter(m.exchange_index for m in markets).items())),
     )
+    # How many markets' events name a competition, which the same-title sport
+    # check compares. Always logged, so a label Kalshi moved or renamed (every
+    # event then reads as naming none) shows as a count near zero
+    logging.info(
+        "Markets whose event names a competition: %d of %d",
+        sum(1 for m in markets if m._event_competition), len(markets),
+    )
+    unreadable_competitions = sum(1 for m in markets if m._event_competition is None)
+    if unreadable_competitions:
+        logging.warning(
+            "Markets whose event's competition label is not text: %d (read as "
+            "unknown, so none of them forms a same-title pair)", unreadable_competitions,
+        )
     logging.info("Fetched %d open markets (MVE included: %s)", len(markets), INCLUDE_MVE_MARKETS)
     return markets
 
@@ -5504,6 +5719,21 @@ def find_same_title_pairs(
     on the backtest's unreadable line there (see _closes_apart). Both paths
     print its bound through close_gap_bound_text, from this module's binding.
 
+    Closing together is not enough either: the two markets must be about the
+    same sport or subject in the same competition (DR-79). Both series must be
+    filed under one Kalshi category and first tag (_labels_differ, over the
+    labels main._attach_series_labels sets from Kalshi's /series listing), and
+    both events must name the same competition, or neither name one
+    (_competitions_differ, over the label fetch_open_events_with_markets sets
+    from the event's product_metadata). Kalshi titles a game "<Team> wins"
+    under an event "A vs B", which names neither the sport nor the date, so
+    the same two schools word a football game and a women's volleyball match
+    identically, and a scheduled close is the start time plus a fixed offset,
+    so two sports starting within an hour of each other pass the close gate.
+    Each check fails closed (a market with no labels, or a label that is not
+    a string, is never paired), and each has an INFO line of its own after
+    the close-gap line, silent at zero.
+
     Grouping key is (event_title, title, subtitle). The event_title component is
     what prevents cross-event option-label collisions in MVE markets — e.g. two
     markets both titled "Trump" in unrelated events will have different event
@@ -5517,7 +5747,9 @@ def find_same_title_pairs(
     Filters: different event_ticker (to exclude multi-choice options), different
     event SERIES (to exclude two instances of one recurring fixture), closes
     within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (to exclude two
-    different games or instants on two series, DR-74), both actively priced
+    different games or instants on two series, DR-74), one Kalshi category,
+    tag and competition (to exclude two sports or two competitions, DR-79),
+    both actively priced
     (1%-99%), not in held_tickers. One best pair per title group — so refusing
     a group's best candidate PROMOTES its runner-up.
 
@@ -5548,7 +5780,8 @@ def find_same_title_pairs(
             group that produced a pair, each carrying pair_type="same_title".
             Empty if no group has two markets on different event_tickers of
             different event series that close within
-            SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other.
+            SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other and share a
+            category, tag and competition.
     """
     # Remove markets already held and those priced at 0¢/100¢ (settled/illiquid)
     # warn_missing_close=False: both run modes call find_time_series_pairs on
@@ -5588,9 +5821,14 @@ def find_same_title_pairs(
     # Two different series whose markets close more than
     # SAME_TITLE_MAX_CLOSE_GAP_SECONDS apart (DR-74) — two games or two
     # instants that share every word of the key. Counted after the series test,
-    # so each candidate lands on exactly one of the three lines below and the
+    # so each candidate lands on exactly one of the refusal lines below and the
     # two older counts do not move.
     close_gap_skips = 0
+    # Two series filed under different Kalshi categories or tags, and two
+    # events naming different competitions (DR-79). Counted after the close
+    # gate, so every candidate still lands on exactly one line
+    label_skips = 0
+    competition_skips = 0
     # Candidates touching one market of a held pair the run may add to, other
     # than that pair itself; and held pairs whose prices would buy them the
     # other way round
@@ -5646,6 +5884,17 @@ def find_same_title_pairs(
                 # wording cannot form a time-series pair (DR-67).
                 if _closes_apart(m_outer, m_inner):
                     close_gap_skips += 1
+                    continue
+
+                # Same wording on two series is one question only when both
+                # series are filed alike and both events name one competition
+                # (DR-79): the same two schools meet in football and in
+                # women's volleyball on one evening, under one event title
+                if _labels_differ(m_outer, m_inner):
+                    label_skips += 1
+                    continue
+                if _competitions_differ(m_outer, m_inner):
+                    competition_skips += 1
                     continue
 
                 try:
@@ -5738,6 +5987,20 @@ def find_same_title_pairs(
             "than %s apart (two different games or instants, not one "
             "question listed twice): %d",
             close_gap_bound_text(), close_gap_skips,
+        )
+    # Each with a prefix of its own, and none of the substrings other tests
+    # pin as absent ("one event series", "same event ticker", "close more than")
+    if label_skips:
+        logging.info(
+            "Same-title candidates refused because the two series are filed under "
+            "different Kalshi categories or tags (two different sports or subjects, "
+            "not one question listed twice): %d", label_skips,
+        )
+    if competition_skips:
+        logging.info(
+            "Same-title candidates refused because the two events name different "
+            "competitions (two leagues, genders or formats, not one question listed "
+            "twice): %d", competition_skips,
         )
     if held_skips:
         logging.info(

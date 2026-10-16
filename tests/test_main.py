@@ -295,11 +295,14 @@ class TestNoPairsMsg:
             assert f"{MIN_PRICE_DIFF_SHORT_GAP:.0%}" in msg
             assert f"{MIN_PRICE_DIFF_LONG_GAP:.0%}" in msg
             assert f"{SAME_TITLE_MIN_PRICE_DIFF:.0%}" in msg
-            # DR-74: the same-title rule also needs two different series whose
-            # markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS — named in
-            # the message, with the minutes derived from the constant.
+            # DR-74 and DR-79: the same-title rule also needs two different
+            # series filed under one Kalshi category, tag and competition,
+            # whose markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS —
+            # named in the message, with the minutes derived from the constant.
             assert (
-                f"on two different series closing within "
+                f"same-title: ≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff on two "
+                f"different series filed under one Kalshi category, tag and "
+                f"competition, closing within "
                 f"{SAME_TITLE_MAX_CLOSE_GAP_SECONDS // 60} minutes"
             ) in msg
 
@@ -2452,6 +2455,13 @@ def _live_shape_client(
     else:
         monkeypatch.setattr(scanner_mod, "INCLUDE_MVE_MARKETS", False)
 
+    # A fresh cached /series listing, which every run reads right after the
+    # market fetch: a production run then makes no listing request, so
+    # client.rest_client.request serves the order POSTs alone. It lists no
+    # series of the fixed set, so each market is filed by its ticker prefix,
+    # every pair's two markets alike; a test seeds its own listing to file them
+    _seed_series_listing({"KXNOTLISTED": ["Other", []]})
+
     client = MagicMock()
 
     client.get_events_without_preload_content = MagicMock(
@@ -2982,6 +2992,182 @@ class TestRunProdDryRunLiveShapeReplay:
         assert client.rest_client.request.call_count == 0
 
 
+class TestSeriesLabelsAreAttached:
+    """DR-79's wiring in both run modes: every run reads Kalshi's /series
+    listing once, right after the market fetch (production with its own
+    client, dev from the cached copy only), files every market by it
+    (main._attach_series_labels) before the sale block and both finders, and
+    hands the same copy to the category/tag filter. The same-title finder and
+    held_pair_kind then compare those labels (scanner._labels_differ)."""
+
+    @staticmethod
+    def _spy(monkeypatch) -> list:
+        """
+        Record, in order, each listing read, trim plan, finder call and filter call.
+
+        Each finder and the trim planner records whether every market it was
+        handed carries a (category, tag) pair of strings; the filter records the
+        listing it was handed.
+
+        Args:
+            monkeypatch (pytest.MonkeyPatch): For the spies.
+
+        Returns:
+            list: The events, filled in as the run goes.
+        """
+        events: list = []
+        real_load = main.load_series_categories
+
+        def load(client):
+            listing = real_load(client)
+            events.append(("listing", client, listing))
+            return listing
+
+        def labelled(markets) -> bool:
+            return bool(markets) and all(
+                scanner_mod._is_label_pair(getattr(m, "_series_labels", None))
+                for m in markets)
+
+        real_ts, real_st = main.find_time_series_pairs, main.find_same_title_pairs
+
+        def time_series(*args, **kwargs):
+            # Production passes the markets third, dev by keyword
+            markets = kwargs["markets"] if "markets" in kwargs else args[2]
+            events.append(("time_series", labelled(markets)))
+            return real_ts(*args, **kwargs)
+
+        def same_title(markets, *args, **kwargs):
+            events.append(("same_title", labelled(markets)))
+            return real_st(markets, *args, **kwargs)
+
+        real_filter = main._filter_by_category
+
+        def category_filter(pairs, settings, listing_client, **kwargs):
+            events.append(("filter", kwargs.get("series_categories")))
+            return real_filter(pairs, settings, listing_client, **kwargs)
+
+        def plan_trims(client, held_positions, held_labels, markets_by_ticker, **kwargs):
+            events.append(("plan_trims", labelled(list(markets_by_ticker.values()))))
+            return []
+
+        monkeypatch.setattr(main, "load_series_categories", load)
+        monkeypatch.setattr(main, "find_time_series_pairs", time_series)
+        monkeypatch.setattr(main, "find_same_title_pairs", same_title)
+        monkeypatch.setattr(main, "_filter_by_category", category_filter)
+        monkeypatch.setattr(main, "plan_trims", plan_trims)
+        monkeypatch.setattr(main, "append_to_prod_log",
+                            lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"))
+        return events
+
+    def test_a_production_run_files_every_market_before_it_trims_or_pairs(
+        self, monkeypatch, caplog,
+    ):
+        # Kalshi values HELD-A at $1.50, so a run that trims asks the planner
+        balance = {**_LIVE_BALANCE_PAYLOAD, "portfolio_value": 150}
+        client = _live_shape_client(monkeypatch, balance_payload=balance,
+                                    include_time_series=True)
+        events = self._spy(monkeypatch)
+        settings = dataclasses.replace(live_settings(), trim_to_kelly=True)
+        with caplog.at_level(logging.INFO):
+            main._run_prod(client, _args(dry_run=True), settings)
+        # One read, with the run's own client
+        reads = [event for event in events if event[0] == "listing"]
+        assert len(reads) == 1 and reads[0][1] is client
+        listing = reads[0][2]
+        # The listing first, then the trim planner and both finders, every
+        # market filed, then the filter, handed the very same copy
+        assert [event[0] for event in events] == [
+            "listing", "plan_trims", "time_series", "same_title", "filter"]
+        assert events[1:4] == [("plan_trims", True), ("time_series", True),
+                               ("same_title", True)]
+        assert events[4][1] is listing
+
+    def test_a_dev_run_reads_the_cached_copy_once_and_files_every_market(
+        self, monkeypatch, caplog,
+    ):
+        client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD,
+                                    include_time_series=True)
+        _capture_dev_simulation(monkeypatch)
+        events = self._spy(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0,
+                                                  max_horizon_days=None))
+        # No listing client: the sandbox key never signs a production request
+        reads = [event for event in events if event[0] == "listing"]
+        assert len(reads) == 1 and reads[0][1] is None
+        assert [event[0] for event in events] == [
+            "listing", "time_series", "same_title", "filter"]
+        assert events[1:3] == [("time_series", True), ("same_title", True)]
+        assert events[3][1] is reads[0][2]
+
+    _NO_LISTING = ("Same-title sport check: no /series listing this run, so every series "
+                   "is filed by its ticker prefix and only the competition check tells "
+                   "two series apart")
+
+    def test_no_listing_files_by_ticker_prefix_and_says_so(self, caplog):
+        markets = [SimpleNamespace(event_ticker="KXBTCD-26SEP1517"),
+                   SimpleNamespace(event_ticker="KXNCAAFGAME-26OCT16UKOKLA")]
+        with caplog.at_level(logging.INFO):
+            main._attach_series_labels(markets, {})
+        assert [m._series_labels for m in markets] == [
+            (infer_category("KXBTCD-26SEP1517"), "General"),
+            (infer_category("KXNCAAFGAME-26OCT16UKOKLA"), "General")]
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert [r.getMessage() for r in warnings] == [self._NO_LISTING]
+
+    def test_a_listing_draws_no_warning(self, caplog):
+        markets = [SimpleNamespace(event_ticker="KXNCAAFGAME-26OCT16UKOKLA")]
+        with caplog.at_level(logging.INFO):
+            main._attach_series_labels(markets, {"KXNCAAFGAME": ("Sports", ("Football",))})
+        assert markets[0]._series_labels == ("Sports", "Football")
+        assert self._NO_LISTING not in caplog.messages
+
+    def test_a_dev_run_with_no_cached_listing_says_so_once(self, monkeypatch, caplog):
+        client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD)
+        # No cached copy at all: a dev run makes no request, so it has no listing
+        historical._SERIES_CATEGORIES_CACHE.unlink()
+        _capture_dev_simulation(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0,
+                                                  max_horizon_days=None))
+        assert caplog.messages.count(self._NO_LISTING) == 1
+
+    def test_two_series_filed_differently_form_no_same_title_pair(self, monkeypatch, caplog):
+        # The live-shape fixture's one tradeable pair (SAME-EXP / SAME-CHEAP)
+        # with its two series filed under two different tags: the finder
+        # refuses it on its label line, and nothing is traded
+        client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD)
+        _seed_series_listing({"EXPEVT": ["Sports", ["Football"]],
+                              "CHEAPEVT": ["Sports", ["Volleyball"]]})
+        found: list = []
+        real_st = main.find_same_title_pairs
+
+        def same_title(markets, *args, **kwargs):
+            pairs = real_st(markets, *args, **kwargs)
+            found.extend(pairs)
+            return pairs
+
+        captured: dict = {}
+
+        def append(results, *args, **kwargs):
+            captured["results"] = results
+            return pathlib.Path("/fake/trade_log.xlsx")
+
+        monkeypatch.setattr(main, "find_same_title_pairs", same_title)
+        monkeypatch.setattr(main, "append_to_prod_log", append)
+        with caplog.at_level(logging.INFO):
+            main._run_prod(client, _args(dry_run=True))
+        assert ("Same-title candidates refused because the two series are filed under "
+                "different Kalshi categories or tags (two different sports or subjects, "
+                "not one question listed twice): 1") in caplog.messages
+        assert _TICKER_SAME_EXP not in _candidate_tickers(found)
+        # The fixture's other same-title groups still pair, filed alike by prefix
+        assert _candidate_tickers(found) == {_TICKER_TICK_A, _TICKER_TICK_B,
+                                             _TICKER_SHARD_A, _TICKER_SHARD_B}
+        assert "results" not in captured
+        assert client.rest_client.request.call_count == 0
+
+
 class TestRunProdLiveV2Replay:
     """dry_run=False replays of the shipped V2 order path end to end.
     Every test tunes the market set down to exactly one tradeable,
@@ -3335,11 +3521,16 @@ class TestLiveSettingsReachEverySite:
                              sell_at=0.85, sell_min_days=3,
                              trim_to_kelly=True, trim_min_rise=0.10)
 
-    # The cached /series listing (SHARDAEVT and HELDAEVT unlisted: filed as Other)
+    # The cached /series listing. Each same-title pair's two series are filed
+    # alike, since the same-title sport check refuses two series filed
+    # differently (SHARDAEVT/SHARDBEVT and HELDAEVT/HELDBEVT unlisted: all
+    # filed as Other)
     _LISTING = {
         "EVT": ["Economics", ["Inflation", "Fed"]],
         "EXPEVT": ["Politics", ["Elections"]],
+        "CHEAPEVT": ["Politics", ["Elections"]],
         "TICKAEVT": ["Sports", ["Soccer"]],
+        "TICKBEVT": ["Sports", ["Soccer"]],
     }
 
     # (module, spied name) — the CONSUMING modules' own bindings, and
@@ -7984,9 +8175,11 @@ class TestSizesOnPortfolioValue:
             TradeResult(spec=s, status="simulated" if dry_run else "executed")
             for s in portfolio])
         monkeypatch.setattr(main, "append_to_prod_log", trade_log)
-        # Kalshi's /series listing, which a run handed a report reads to file
-        # its trades: none here, so no request reaches the fake client
-        monkeypatch.setattr(main, "load_series_categories", lambda client: {})
+        # Kalshi's /series listing, which every run reads right after the
+        # market fetch: a stand-in listing no market of the run, so no request
+        # reaches the fake client and the run has a listing to file by
+        monkeypatch.setattr(main, "load_series_categories",
+                            lambda client: {"KXNOTLISTED": ("Other", ())})
         with caplog.at_level(logging.INFO):
             code = main._run_prod(MagicMock(), _args(dry_run=dry_run), report=report)
         return code, seen
@@ -8911,8 +9104,8 @@ class TestResultFile:
     checking the exit code, the message (the line the run logged, word for
     word), the trades and the balances; then an exception, a run stopped
     while sending orders, an undescribable pair, the Kalshi category and tag
-    each trade is filed under (Kalshi's /series listing read once, only by a
-    run with a result to fill and candidate pairs), a lock refusal, a usage
+    each trade is filed under (Kalshi's /series listing, read once by every
+    run, right after the market fetch), a lock refusal, a usage
     error (exit 2, no file, an older one removed), the flag in dev, no flag,
     and the handler's removal.
     """
@@ -9550,26 +9743,31 @@ class TestResultFile:
         assert seen["code"] == result["exit_code"] == EXIT_OK
         assert result["trades"] == [{**self._trade("executed"), "category": None, "tag": None}]
 
-    def test_a_run_with_no_candidate_pairs_reads_no_listing(self, monkeypatch, tmp_path,
-                                                            caplog):
+    def test_a_run_with_no_candidate_pairs_reads_the_listing_once(self, monkeypatch,
+                                                                  tmp_path, caplog):
+        # Every run reads the listing once, right after the market fetch: the
+        # same-title sport check files each market by it before any pair is
+        # found, so a run that finds none still read it
         reads = []
         seen, result, _ = self._run(
             monkeypatch, tmp_path, caplog,
             find_same_title_pairs=lambda markets, held, *, add_on_pairs=None: [],
             load_series_categories=lambda client: reads.append(client) or {})
         assert seen["code"] == result["exit_code"] == EXIT_OK
-        assert reads == [] and result["trades"] == []
+        assert len(reads) == 1 and result["trades"] == []
 
-    def test_a_run_without_the_flag_reads_no_listing(self, monkeypatch, tmp_path, caplog):
-        # A scheduled run writes no result, so with no category/tag filter set
-        # it has nothing to read the listing for
+    def test_a_run_without_the_flag_reads_the_listing_once(self, monkeypatch, tmp_path,
+                                                           caplog):
+        # A scheduled run writes no result and sets no category/tag filter, and
+        # still reads the listing once (a cached copy, refreshed once a week),
+        # for the same-title sport check
         reads = []
         seen, result, _ = self._run(
             monkeypatch, tmp_path, caplog, result_file=False,
             load_series_categories=lambda client: reads.append(client) or {})
         assert seen["code"] == EXIT_OK and result is None
-        assert reads == []
-        # ... though it traded and wrote its trade log as before
+        assert len(reads) == 1
+        # ... and it traded and wrote its trade log as before
         assert len(seen["trade_log_calls"]) == 1
         assert not (tmp_path / "result.json").exists()
 

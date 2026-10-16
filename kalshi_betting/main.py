@@ -46,6 +46,12 @@ Purpose:
     no toggle flags. Between finding pairs and pricing them, _dedup_pairs and
     _filter_by_category trim the list.
 
+    Every run reads Kalshi's /series listing once, right after the market
+    fetch, and files each market under its series' category and first tag
+    (_attach_series_labels): the same-title finder, and held_pair_kind for
+    live trimming, refuse two markets filed differently (DR-79). The
+    category/tag filter and the run summary read the same copy.
+
     A production run with sell_at set sells, before it buys, each held position
     (an exact held pair, or a lone held market whose partner has paid out)
     that has stayed at or above that share of its potential profit (what it
@@ -79,7 +85,8 @@ Dependencies:
     Imports auth.py (the client, and the one balance read, which also checks
     the credentials), config.py (constants, exit codes, the order-path check
     and the live-settings helpers), historical.py (Kalshi's series categories,
-    for the category/tag filter and each trade's category in the run summary),
+    for the same-title sport check, the category/tag filter and each trade's
+    category in the run summary),
     reporter.py (Excel output and the run summary), _http.py (a one-line
     description of an error), scanner.py (finding markets and pairs, and
     pricing them from the order book), seller.py (which held positions to
@@ -859,11 +866,11 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None, *
     does, and names the cumulative-deadline requirement so a reader does not
     blame the price rule for what the wording decided. Names the
     same-title pairing rules for the same reason: a same-title pair also needs
-    two different event series whose markets close within
-    SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (DR-02/DR-54, DR-74), with
-    the bound read from that constant and rendered by
-    scanner.close_gap_bound_text. A set category/tag filter is named too,
-    since it can empty the list on its own.
+    two different event series, filed under one Kalshi category, tag and
+    competition, whose markets close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS
+    of each other (DR-02/DR-54, DR-79, DR-74), with the bound read from that
+    constant and rendered by scanner.close_gap_bound_text. A set category/tag
+    filter is named too, since it can empty the list on its own.
 
     Args:
         sandbox (bool): True to phrase the message for a dev/sandbox run
@@ -896,6 +903,7 @@ def _no_pairs_msg(sandbox: bool = False, settings: LiveSettings | None = None, *
         f"{time_series}"
         " — or same-title: "
         f"≥{SAME_TITLE_MIN_PRICE_DIFF:.0%} price diff on two different series "
+        "filed under one Kalshi category, tag and competition, "
         # This module's own binding, like the same-title threshold above; the scanner
         # helper only renders it, in the words the refusal lines use.
         f"closing within {close_gap_bound_text(SAME_TITLE_MAX_CLOSE_GAP_SECONDS)}"
@@ -975,6 +983,44 @@ def _pair_labels(pair, series_categories: dict) -> tuple[str, str]:
     event = pair.market_a.event_ticker
     # Cross-module: the one filing rule the dashboard and the live filter share
     return series_labels(event, infer_category(event), series_categories)
+
+
+def _attach_series_labels(markets: list, series_categories: dict) -> None:
+    """
+    Attach to every market the Kalshi category and first tag its series is filed under.
+
+    The same-title sport check compares the two markets' labels
+    (scanner._labels_differ) in find_same_title_pairs and in held_pair_kind,
+    which live trimming reads, and refuses a market that has none. The labels
+    come from historical.series_labels, the rule the dashboard and the
+    category/tag filter file by: a series the listing lacks is filed under
+    its ticker-prefix category (infer_category) and "General".
+
+    With no listing at all (no cached copy, and a read that failed or, in
+    dev, none made), every series is filed by its ticker prefix, so nearly
+    every pair of series is filed alike and only the competition check tells
+    them apart; one WARNING says so.
+
+    Args:
+        markets (list): The run's markets, before any is dropped; each gets
+            a _series_labels attribute.
+        series_categories (dict): Kalshi's /series listing (load_series_categories).
+    """
+    if not series_categories:
+        logging.warning(
+            "Same-title sport check: no /series listing this run, so every series is "
+            "filed by its ticker prefix and only the competition check tells two "
+            "series apart")
+    # Many markets share an event, so each event is filed once
+    by_event: dict = {}
+    for market in markets:
+        # A market with no event ticker is filed under "" (infer_category's
+        # "Other"); the same-title finder refuses it on its series anyway
+        event = getattr(market, "event_ticker", "") or ""
+        if event not in by_event:
+            # Cross-module: the one filing rule the dashboard and the live filter share
+            by_event[event] = series_labels(event, infer_category(event), series_categories)
+        market._series_labels = by_event[event]
 
 
 def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
@@ -1566,6 +1612,12 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
         logging.warning("%s", blind_reason)
         return EXIT_NO_TRADEABLE_SHARDS
 
+    # Kalshi's /series listing, the cached copy only (the sandbox key never signs
+    # a production request): each market's category and tag, which the
+    # same-title sport check compares, and what the category/tag filter files by
+    series_categories = load_series_categories(None)
+    _attach_series_labels(markets, series_categories)
+
     # Optional opt-in cap so both bet types only see markets closing within
     # the requested window — a no-op (returns markets unchanged) when unset
     markets = filter_markets_within_horizon(markets, args.max_horizon_days)
@@ -1580,8 +1632,10 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
     same_title_pairs  = find_same_title_pairs(markets, held_tickers=set())
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
-    # Category/tag filter; no listing client, so the sandbox key never signs a prod request
-    candidate_pairs   = _filter_by_category(candidate_pairs, settings, None)
+    # Category/tag filter, on the listing read above; no listing client, so the
+    # sandbox key never signs a prod request
+    candidate_pairs   = _filter_by_category(candidate_pairs, settings, None,
+                                            series_categories=series_categories)
     # Price each pair from its order book, up to what one trade's budget could buy
     candidate_pairs   = enrich_with_orderbook_prices(
         client, candidate_pairs, portfolio_value_cents, settings=settings,
@@ -1689,11 +1743,12 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     a pair whose stake (its worth at today's prices plus the fees paid for
     it) already fills its per-trade cap of the portfolio value.
 
-    Handed a report (--result-file), a run that finds candidate pairs reads
-    Kalshi's /series listing once, right after it merges the two finders'
-    pairs, and records each trade's category and tag in the report; with no
-    listing a trade's category is left unknown. Without a report it reads the
-    listing only when a category/tag filter is set.
+    Every run reads Kalshi's /series listing once, right after the market
+    fetch (a cached copy, refreshed once a week): it files each market under
+    its category and tag for the same-title sport check
+    (_attach_series_labels), and the category/tag filter and, handed a report
+    (--result-file), each trade's category and tag in the report read the
+    same copy. With no listing a trade's category is left unknown.
 
     Args:
         client: KalshiClient for production, from auth.build_client("prod").
@@ -1713,9 +1768,6 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     Raises:
         ValueError: When settings is None and a config.py toggle is invalid.
     """
-    # A run started with --result-file (every run the defaults server starts)
-    # records its trades' categories; a scheduled run has no result to fill in
-    records_result = report is not None
     # What the run did, for main.py --result-file; without it nothing reads this one
     report = RunReport(dry_run=args.dry_run, started_at=datetime.now(UTC)) if report is None else report
     # Resolved ONCE, before any request, and handed to every site below that reads a toggle
@@ -1822,6 +1874,13 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
         logging.warning("%s", blind_reason)
         report.message = blind_reason
         return EXIT_NO_TRADEABLE_SHARDS
+
+    # Kalshi's /series listing, once per run (cached a week): each market's
+    # category and tag, which the same-title sport check compares (before the
+    # sale block, since live trimming reads it through held_pair_kind), and
+    # what the category/tag filter and the run result file a pair by
+    series_categories = load_series_categories(client)
+    _attach_series_labels(markets, series_categories)
 
     # Our positions' ladders, read before held markets are dropped; None
     # means one could not be identified, so no time-series trade this run.
@@ -2070,12 +2129,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
                                               add_on_pairs=add_on_pairs)
     # Merge both lists, preferring same_title when both scanners found the same pair
     candidate_pairs   = _dedup_pairs(same_title_pairs, time_series_pairs)
-    # Kalshi's /series listing, read once for a run that records its trades'
-    # categories, here before pricing so the read never delays an order or the
-    # trade log; None lets the filter read it itself when a filter is set
-    series_categories = (load_series_categories(client)
-                         if records_result and candidate_pairs else None)
-    # Category/tag filter, before enrichment so a dropped pair costs no book request
+    # Category/tag filter, on the listing read above, before enrichment so a
+    # dropped pair costs no book request
     candidate_pairs   = _filter_by_category(candidate_pairs, settings, client,
                                             series_categories=series_categories)
     # Price each pair from its order book, up to what one trade's budget could buy

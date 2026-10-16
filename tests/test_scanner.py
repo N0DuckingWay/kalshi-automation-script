@@ -213,12 +213,18 @@ def _mock_market(
     yes_ask: float = 0.50,
     no_ask: float = 0.50,
     close_time=None,
+    series_labels=("Test", "General"),
+    competition="",
 ):
     """Build a SimpleNamespace Kalshi-market stand-in with the fields the scanner reads.
 
     SimpleNamespace (not MagicMock) is used so that `getattr(m, "_event_title", "")`
     returns the empty string when no event title was attached — MagicMock would
     auto-vivify a child mock and break the pair_key fallback.
+
+    Every stand-in carries the same series labels and no competition by
+    default, so the same-title sport check (DR-79) passes and each fixture
+    keeps meaning what it meant; a test of that check passes its own values.
     """
     from datetime import UTC, datetime
     attrs = {
@@ -230,6 +236,8 @@ def _mock_market(
         "no_ask_dollars": str(no_ask),
         "yes_bid_dollars": str(max(yes_ask - 0.02, 0.01)),
         "close_time": close_time or datetime(2026, 6, 1, tzinfo=UTC),
+        "_series_labels": series_labels,
+        "_event_competition": competition,
     }
     if event_title is not None:
         attrs["_event_title"] = event_title
@@ -1350,6 +1358,533 @@ class TestClosesApart:
         # reads as None. Both fail closed.
         assert scanner._closes_apart(dated, MagicMock()) is True
         assert scanner._closes_apart(dated, SimpleNamespace()) is True
+
+
+# The two events of the 2026-10-16 incident, as Kalshi's /events replies
+# carried them (the fields the finder reads). One title, "Kentucky vs
+# Oklahoma", over a women's college volleyball match and a college football
+# game; only the events' product_metadata and the series' tags tell them apart.
+_VOLLEYBALL_EVENT = {
+    "event_ticker": "KXNCAAWVMATCH-26OCT161900UKOU",
+    "series_ticker": "KXNCAAWVMATCH",
+    "title": "Kentucky vs Oklahoma",
+    "sub_title": "UK vs OU (Oct 16)",
+    "category": "Sports",
+    "product_metadata": {"competition": "NCAA Volleyball (W)", "competition_scope": "Game"},
+    "markets": [
+        {"ticker": "KXNCAAWVMATCH-26OCT161900UKOU-UK",
+         "event_ticker": "KXNCAAWVMATCH-26OCT161900UKOU", "title": "Kentucky wins",
+         "yes_sub_title": "Kentucky", "no_sub_title": "Kentucky", "status": "active",
+         "close_time": "2026-10-18T23:00:00Z", "yes_ask_dollars": "0.9600",
+         "no_ask_dollars": "0.2900", "yes_bid_dollars": "0.7100", "exchange_index": 0,
+         "price_level_structure": "linear_cent",
+         "price_ranges": [{"end": "1.0000", "start": "0.0000", "step": "0.0100"}]},
+        {"ticker": "KXNCAAWVMATCH-26OCT161900UKOU-OU",
+         "event_ticker": "KXNCAAWVMATCH-26OCT161900UKOU", "title": "Oklahoma wins",
+         "yes_sub_title": "Oklahoma", "no_sub_title": "Oklahoma", "status": "active",
+         "close_time": "2026-10-18T23:00:00Z", "yes_ask_dollars": "0.1700",
+         "no_ask_dollars": "0.9600", "yes_bid_dollars": "0.0400", "exchange_index": 0,
+         "price_level_structure": "linear_cent",
+         "price_ranges": [{"end": "1.0000", "start": "0.0000", "step": "0.0100"}]},
+    ],
+}
+_FOOTBALL_EVENT = {
+    "event_ticker": "KXNCAAFGAME-26OCT16UKOKLA",
+    "series_ticker": "KXNCAAFGAME",
+    "title": "Kentucky vs Oklahoma",
+    "sub_title": "UK vs OKLA (Oct 16)",
+    "category": "Sports",
+    "product_metadata": {"competition": "NCAA Football", "competition_scope": "Game"},
+    "markets": [
+        {"ticker": "KXNCAAFGAME-26OCT16UKOKLA-UK",
+         "event_ticker": "KXNCAAFGAME-26OCT16UKOKLA", "title": "Kentucky wins",
+         "yes_sub_title": "Kentucky", "no_sub_title": "Kentucky", "status": "active",
+         "close_time": "2026-10-19T00:00:00Z", "yes_ask_dollars": "0.3200",
+         "no_ask_dollars": "0.6900", "yes_bid_dollars": "0.3100", "exchange_index": 0,
+         "price_level_structure": "linear_cent",
+         "price_ranges": [{"end": "1.0000", "start": "0.0000", "step": "0.0100"}]},
+        {"ticker": "KXNCAAFGAME-26OCT16UKOKLA-OKLA",
+         "event_ticker": "KXNCAAFGAME-26OCT16UKOKLA", "title": "Oklahoma wins",
+         "yes_sub_title": "Oklahoma", "no_sub_title": "Oklahoma", "status": "active",
+         "close_time": "2026-10-19T00:00:00Z", "yes_ask_dollars": "0.6900",
+         "no_ask_dollars": "0.3200", "yes_bid_dollars": "0.6800", "exchange_index": 0,
+         "price_level_structure": "linear_cent",
+         "price_ranges": [{"end": "1.0000", "start": "0.0000", "step": "0.0100"}]},
+    ],
+}
+# The two series as the cached /series listing files them (category, tags)
+_INCIDENT_LISTING = {"KXNCAAWVMATCH": ("Sports", ("Volleyball",)),
+                     "KXNCAAFGAME": ("Sports", ("Football",))}
+
+
+class TestSameTitleSportCheck:
+    """DR-79: identical wording on two series that close together is one
+    question only when both series are filed under one Kalshi category and
+    first tag, and both events name the same competition or neither names one.
+
+    Rebuilt from the real payloads of the 2026-10-16 incident, parsed as
+    fetch_open_events_with_markets parses them (_market_from_dict with the
+    event's title and competition) and filed as main._attach_series_labels
+    files a run's markets. Kentucky vs Oklahoma in women's volleyball and in
+    football share every word ("Kentucky vs Oklahoma: Kentucky wins") on two
+    series, and their scheduled closes sit exactly 3,600 s apart, which the
+    close gate admits."""
+
+    _LABEL_LINE = (
+        "Same-title candidates refused because the two series are filed under "
+        "different Kalshi categories or tags (two different sports or subjects, "
+        "not one question listed twice): "
+    )
+    _COMPETITION_LINE = (
+        "Same-title candidates refused because the two events name different "
+        "competitions (two leagues, genders or formats, not one question listed "
+        "twice): "
+    )
+
+    @staticmethod
+    def _incident_markets() -> list:
+        """The four incident markets, parsed and filed as a production run has them."""
+        from kalshi_betting import main
+        markets = [scanner._market_from_dict(m, ev["title"], scanner.event_competition(ev))
+                   for ev in (_VOLLEYBALL_EVENT, _FOOTBALL_EVENT) for m in ev["markets"]]
+        main._attach_series_labels(markets, _INCIDENT_LISTING)
+        return markets
+
+    @classmethod
+    def _sport_lines(cls, caplog) -> list[str]:
+        return [m for m in caplog.messages
+                if m.startswith((cls._LABEL_LINE, cls._COMPETITION_LINE))]
+
+    @staticmethod
+    def _game(ticker, event, *, labels, competition, yes_ask, close, title="Kentucky wins",
+              event_title="Kentucky vs Oklahoma", subtitle="Kentucky"):
+        """One market of a game, as _mock_market builds it, with its labels and competition."""
+        return _mock_market(ticker=ticker, event_ticker=event, title=title, subtitle=subtitle,
+                            event_title=event_title, yes_ask=yes_ask, no_ask=1 - yes_ask,
+                            close_time=close, series_labels=labels, competition=competition)
+
+    def test_the_incident_markets_carry_their_labels(self):
+        by_ticker = {m.ticker: m for m in self._incident_markets()}
+        volleyball = by_ticker["KXNCAAWVMATCH-26OCT161900UKOU-UK"]
+        football = by_ticker["KXNCAAFGAME-26OCT16UKOKLA-UK"]
+        assert volleyball._event_competition == "NCAA Volleyball (W)"
+        assert football._event_competition == "NCAA Football"
+        assert volleyball._series_labels == ("Sports", "Volleyball")
+        assert football._series_labels == ("Sports", "Football")
+        # Every older same-title check passes: the shape only this check catches
+        assert scanner._identical_wording(volleyball, football)
+        assert not scanner._same_series(volleyball, football)
+        assert not scanner._closes_apart(volleyball, football)
+        assert (football.close_time - volleyball.close_time).total_seconds() == 3_600
+
+    def test_both_incident_pairs_are_refused_on_the_label_line(self, caplog):
+        with caplog.at_level(logging.INFO):
+            assert find_same_title_pairs(self._incident_markets()) == []
+        # "Kentucky wins" and "Oklahoma wins": two candidates, each counted
+        # once, on the label line (the competition check is never reached)
+        assert self._sport_lines(caplog) == [self._LABEL_LINE + "2"]
+        assert not any("close more than" in m for m in caplog.messages)
+
+    def test_with_labels_and_competitions_alike_the_incident_markets_pair(self):
+        # Control: file both series alike and give both events one competition,
+        # and both pairs form, so the refusal above is this check
+        markets = self._incident_markets()
+        for m in markets:
+            m._series_labels = ("Sports", "Football")
+            m._event_competition = "NCAA Football"
+        pairs = find_same_title_pairs(markets)
+        assert sorted(p.market_a.ticker for p in pairs) == [
+            "KXNCAAFGAME-26OCT16UKOKLA-OKLA", "KXNCAAWVMATCH-26OCT161900UKOU-UK"]
+
+    def test_one_tag_and_two_competitions_is_refused_on_the_competition_line(self, caplog):
+        # A men's and a women's game at ONE scheduled close, both series tagged
+        # Basketball: only the competitions tell them apart (stand-in labels)
+        close = datetime(2026, 1, 28, 1, 30, tzinfo=UTC)
+        mens = self._game("KXNCAAMBGAME-26JAN27WIUEIU-WIU", "KXNCAAMBGAME-26JAN27WIUEIU",
+                          labels=("Sports", "Basketball"), competition="NCAA Basketball (M)",
+                          yes_ask=0.40, close=close)
+        womens = self._game("KXNCAAWBGAME-26JAN27WIUEIU-WIU", "KXNCAAWBGAME-26JAN27WIUEIU",
+                            labels=("Sports", "Basketball"),
+                            competition="NCAA Basketball (W)", yes_ask=0.25, close=close)
+        with caplog.at_level(logging.INFO):
+            assert find_same_title_pairs([mens, womens]) == []
+        assert self._sport_lines(caplog) == [self._COMPETITION_LINE + "1"]
+
+    def test_one_event_naming_a_competition_and_the_other_none_is_refused(self, caplog):
+        close = datetime(2026, 12, 1, tzinfo=UTC)
+        named = self._game("KXA-1-Y", "KXA-1", labels=("Sports", "Football"),
+                           competition="NCAA Football", yes_ask=0.60, close=close)
+        unnamed = self._game("KXB-1-Y", "KXB-1", labels=("Sports", "Football"),
+                             competition="", yes_ask=0.30, close=close)
+        with caplog.at_level(logging.INFO):
+            assert find_same_title_pairs([named, unnamed]) == []
+        assert self._sport_lines(caplog) == [self._COMPETITION_LINE + "1"]
+
+    def test_labels_and_competitions_that_differ_only_in_letter_case_pair(self, caplog):
+        close = datetime(2026, 12, 1, tzinfo=UTC)
+        a = self._game("KXA-1-Y", "KXA-1", labels=("Sports", "Football"),
+                       competition="NCAA Football", yes_ask=0.60, close=close)
+        b = self._game("KXB-1-Y", "KXB-1", labels=("SPORTS", "football"),
+                       competition=" ncaa football ", yes_ask=0.30, close=close)
+        with caplog.at_level(logging.INFO):
+            assert len(find_same_title_pairs([a, b])) == 1
+        assert self._sport_lines(caplog) == []
+
+    def test_weekly_and_monthly_brent_listings_still_pair(self, caplog):
+        # One question on a weekly and a monthly series, filed alike, whose
+        # events name no competition
+        close = datetime(2026, 9, 25, 21, tzinfo=UTC)
+        title = "Brent crude oil price on Sep 25, 2026?"
+        weekly = self._game("KXBRENTW-26SEP25-T70", "KXBRENTW-26SEP25",
+                            labels=("Commodities", "Oil & Gas"), competition="",
+                            yes_ask=0.45, close=close, title=title,
+                            event_title="Brent crude oil price", subtitle="$70 or above")
+        monthly = self._game("KXBRENTMON-26SEP-T70", "KXBRENTMON-26SEP",
+                             labels=("Commodities", "Oil & Gas"), competition="",
+                             yes_ask=0.35, close=close, title=title,
+                             event_title="Brent crude oil price", subtitle="$70 or above")
+        with caplog.at_level(logging.INFO):
+            assert len(find_same_title_pairs([weekly, monthly])) == 1
+        assert self._sport_lines(caplog) == []
+        # held_pair_kind reads the held pair as same-title too
+        assert scanner.held_pair_kind(yes_market=monthly, no_market=weekly) == (
+            "same_title", weekly, monthly)
+
+    def test_weekly_and_monthly_copper_listings_still_pair(self, caplog):
+        # The same shape on copper, filed Commodities · Metals on both series
+        # (the first of their several tags), with no competition
+        from kalshi_betting import main
+        close = datetime(2026, 10, 16, 21, tzinfo=UTC)
+        title = "Copper price on Oct 16, 2026?"
+        weekly = self._game("KXCOPPERW-26OCT16-T5.10", "KXCOPPERW-26OCT16",
+                            labels=None, competition="", yes_ask=0.55, close=close,
+                            title=title, event_title="Copper price", subtitle="$5.10 or above")
+        monthly = self._game("KXCOPPERMON-26OCT-T5.10", "KXCOPPERMON-26OCT",
+                             labels=None, competition="", yes_ask=0.45, close=close,
+                             title=title, event_title="Copper price", subtitle="$5.10 or above")
+        tags = ("Metals", "Copper", "Industrial Metals")
+        main._attach_series_labels([weekly, monthly],
+                                   {"KXCOPPERW": ("Commodities", tags),
+                                    "KXCOPPERMON": ("Commodities", tags)})
+        assert weekly._series_labels == monthly._series_labels == ("Commodities", "Metals")
+        with caplog.at_level(logging.INFO):
+            assert len(find_same_title_pairs([weekly, monthly])) == 1
+        assert self._sport_lines(caplog) == []
+
+    @pytest.mark.parametrize("missing", [None, ("Sports",), ["Sports", "Football"],
+                                         ("Sports", None), "Sports"])
+    def test_a_market_without_readable_labels_is_refused(self, caplog, missing):
+        markets = self._incident_markets()
+        for m in markets:
+            m._series_labels = ("Sports", "Football")
+            m._event_competition = "NCAA Football"
+        markets[0]._series_labels = missing
+        with caplog.at_level(logging.INFO):
+            pairs = find_same_title_pairs(markets)
+        # The volleyball Kentucky market has no readable labels: its pair is
+        # refused, the Oklahoma pair still forms
+        assert [p.market_a.ticker for p in pairs] == ["KXNCAAFGAME-26OCT16UKOKLA-OKLA"]
+        assert self._sport_lines(caplog) == [self._LABEL_LINE + "1"]
+
+    def test_an_apimarket_never_filed_is_refused(self):
+        # ApiMarket's own default: no labels until main attaches them
+        markets = [scanner._market_from_dict(m, ev["title"], scanner.event_competition(ev))
+                   for ev in (_VOLLEYBALL_EVENT, _FOOTBALL_EVENT) for m in ev["markets"]]
+        assert all(m._series_labels is None for m in markets)
+        assert find_same_title_pairs(markets) == []
+
+    def test_a_competition_that_is_not_a_string_is_refused(self, caplog):
+        markets = self._incident_markets()
+        for m in markets:
+            m._series_labels = ("Sports", "Football")
+            m._event_competition = "NCAA Football"
+        markets[0]._event_competition = None
+        with caplog.at_level(logging.INFO):
+            pairs = find_same_title_pairs(markets)
+        assert [p.market_a.ticker for p in pairs] == ["KXNCAAFGAME-26OCT16UKOKLA-OKLA"]
+        assert self._sport_lines(caplog) == [self._COMPETITION_LINE + "1"]
+
+    def test_both_lines_are_silent_at_zero_and_avoid_the_pinned_substrings(self, caplog):
+        with caplog.at_level(logging.INFO):
+            find_same_title_pairs(self._incident_markets())
+        markets = self._incident_markets()
+        for m in markets:
+            m._series_labels = ("Sports", "Football")
+        with caplog.at_level(logging.INFO):
+            find_same_title_pairs(markets)
+        lines = self._sport_lines(caplog)
+        assert lines == [self._LABEL_LINE + "2", self._COMPETITION_LINE + "2"]
+        for line in lines:
+            for pinned in ("one event series", "same event ticker", "close more than"):
+                assert pinned not in line
+        caplog.clear()
+        close = datetime(2026, 12, 1, tzinfo=UTC)
+        a = self._game("KXA-1-Y", "KXA-1", labels=("Sports", "Football"), competition="",
+                       yes_ask=0.60, close=close)
+        b = self._game("KXB-1-Y", "KXB-1", labels=("Sports", "Football"), competition="",
+                       yes_ask=0.30, close=close)
+        with caplog.at_level(logging.INFO):
+            assert len(find_same_title_pairs([a, b])) == 1
+        assert self._sport_lines(caplog) == []
+
+    def test_each_candidate_is_counted_once_on_one_line(self, caplog):
+        # Five groups of two identically worded markets, each candidate failing
+        # every rule from its line onward, and a sixth that passes them all.
+        # Each lands on the FIRST line its rules reach, once: the five lines
+        # partition the refusals
+        close = datetime(2026, 12, 1, tzinfo=UTC)
+        later = close + timedelta(days=1)
+        football, volleyball = ("Sports", "Football"), ("Sports", "Volleyball")
+
+        def group(question, first, second):
+            # (event ticker, labels, competition, close) for each market
+            return [self._game(f"{event}-{question}", event, labels=labels,
+                               competition=competition, yes_ask=price, close=when,
+                               title=f"{question} wins", subtitle=question)
+                    for (event, labels, competition, when), price
+                    in ((first, 0.60), (second, 0.30))]
+
+        markets = (
+            # One event's own markets (and every later rule broken too)
+            group("Q1", ("KXA-1", football, "NCAA Football", close),
+                  ("KXA-1", volleyball, "NCAA Volleyball (W)", later))
+            # Two events of one series
+            + group("Q2", ("KXA-2", football, "NCAA Football", close),
+                    ("KXA-3", volleyball, "NCAA Volleyball (W)", later))
+            # Two series closing a day apart
+            + group("Q3", ("KXA-4", football, "NCAA Football", close),
+                    ("KXB-4", volleyball, "NCAA Volleyball (W)", later))
+            # Two series at one close, filed differently
+            + group("Q4", ("KXA-5", football, "NCAA Football", close),
+                    ("KXB-5", volleyball, "NCAA Volleyball (W)", close))
+            # Two series at one close, filed alike, two competitions
+            + group("Q5", ("KXA-6", football, "NCAA Football", close),
+                    ("KXB-6", football, "NCAA Volleyball (W)", close))
+            # Every rule passed
+            + group("Q6", ("KXA-7", football, "NCAA Football", close),
+                    ("KXB-7", football, "NCAA Football", close)))
+        with caplog.at_level(logging.INFO):
+            [pair] = find_same_title_pairs(markets)
+        assert pair.market_a.ticker == "KXA-7-Q6"
+        refusals = [m for m in caplog.messages if m.startswith("Same-title candidates")]
+        assert sorted(refusals) == sorted([
+            "Same-title candidates skipped because both markets carry the same event "
+            "ticker (one event's own markets, not one question listed by two events): 1",
+            "Same-title candidates skipped as two instances of one event series "
+            "(identical wording, different fixture): 1",
+            "Same-title candidates refused because the two markets close more than "
+            "60 minutes apart (two different games or instants, not one question "
+            "listed twice): 1",
+            self._LABEL_LINE + "1",
+            self._COMPETITION_LINE + "1",
+        ])
+
+    def test_held_pair_kind_reads_a_held_incident_pair_as_no_kind(self):
+        by_ticker = {m.ticker: m for m in self._incident_markets()}
+        volleyball = by_ticker["KXNCAAWVMATCH-26OCT161900UKOU-UK"]
+        football = by_ticker["KXNCAAFGAME-26OCT16UKOKLA-UK"]
+        # Held either way round, the pair is no known kind, so it is never
+        # trimmed on the same-title chance of paying
+        assert scanner.held_pair_kind(yes_market=football, no_market=volleyball) is None
+        assert scanner.held_pair_kind(yes_market=volleyball, no_market=football) is None
+        # Each check refuses on its own. One competition, filed differently:
+        volleyball._event_competition = football._event_competition
+        assert scanner.held_pair_kind(yes_market=football, no_market=volleyball) is None
+        # Filed alike, naming two competitions:
+        volleyball._event_competition = "NCAA Volleyball (W)"
+        volleyball._series_labels = football._series_labels
+        assert scanner.held_pair_kind(yes_market=football, no_market=volleyball) is None
+        # Control: filed alike and one competition, and it reads as same-title
+        volleyball._event_competition = football._event_competition
+        assert scanner.held_pair_kind(yes_market=football, no_market=volleyball) == (
+            "same_title", volleyball, football)
+
+    def test_ingest_attaches_each_events_competition(self, monkeypatch, caplog):
+        # Both event loops read the competition from product_metadata: an event
+        # with none gives "", and one whose label is not a string gives None
+        # (unknown), which the competition check refuses
+        monkeypatch.setattr(scanner, "INCLUDE_MVE_MARKETS", True)
+        standard = [
+            _VOLLEYBALL_EVENT,
+            {"title": "Weather Event", "markets": [_raw_market("STD-NONE", "Rain tomorrow")]},
+            {"title": "Odd Event", "product_metadata": {"competition": 7},
+             "markets": [_raw_market("STD-ODD", "Snow tomorrow")]},
+        ]
+        mve = [
+            {"title": "Parlay", "product_metadata": {"competition": "  NBA  "},
+             "markets": [_raw_market("MVE-NBA", "All legs hit")]},
+            {"title": "Parlay 2", "markets": [_raw_market("MVE-NONE", "All legs hit")]},
+        ]
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page(standard))
+        client.get_multivariate_events_without_preload_content = MagicMock(
+            return_value=_raw_page(mve))
+        with caplog.at_level(logging.INFO):
+            by_ticker = {m.ticker: m for m in fetch_open_events_with_markets(client)}
+        assert {t: m._event_competition for t, m in by_ticker.items()} == {
+            "KXNCAAWVMATCH-26OCT161900UKOU-UK": "NCAA Volleyball (W)",
+            "KXNCAAWVMATCH-26OCT161900UKOU-OU": "NCAA Volleyball (W)",
+            "STD-NONE": "", "STD-ODD": None, "MVE-NBA": "NBA", "MVE-NONE": ""}
+        # Ingest leaves the series labels to main
+        assert all(m._series_labels is None for m in by_ticker.values())
+        # One always-logged count of the markets whose event names a
+        # competition, and a WARNING for the label it could not read
+        assert "Markets whose event names a competition: 3 of 6" in caplog.messages
+        assert ("Markets whose event's competition label is not text: 1 (read as "
+                "unknown, so none of them forms a same-title pair)") in caplog.messages
+
+    def test_the_competition_count_is_logged_at_zero_with_no_warning(self, monkeypatch,
+                                                                     caplog):
+        # Every event naming none: the count reads 0, the shape a label Kalshi
+        # moved or renamed would show, and nothing is unreadable
+        monkeypatch.setattr(scanner, "INCLUDE_MVE_MARKETS", False)
+        client = MagicMock()
+        client.get_events_without_preload_content = MagicMock(return_value=_raw_page([
+            {"title": "Weather Event", "markets": [_raw_market("STD-NONE", "Rain tomorrow")]},
+        ]))
+        with caplog.at_level(logging.INFO):
+            fetch_open_events_with_markets(client)
+        assert "Markets whose event names a competition: 0 of 1" in caplog.messages
+        assert not any("competition label is not text" in m for m in caplog.messages)
+
+    def test_two_events_whose_competition_is_not_text_form_no_pair(self, caplog):
+        # A payload whose competition is reshaped (a list here) on both events
+        # reads as unknown on both, never as "names none", so the pair is still
+        # refused, on the competition line, even with both series filed alike
+        def reshaped(event):
+            return {**event, "product_metadata": {
+                "competition": [event["product_metadata"]["competition"]]}}
+
+        markets = [scanner._market_from_dict(m, ev["title"], scanner.event_competition(ev))
+                   for ev in map(reshaped, (_VOLLEYBALL_EVENT, _FOOTBALL_EVENT))
+                   for m in ev["markets"]]
+        assert all(m._event_competition is None for m in markets)
+        for m in markets:
+            m._series_labels = ("Sports", "Football")
+        with caplog.at_level(logging.INFO):
+            assert find_same_title_pairs(markets) == []
+        assert self._sport_lines(caplog) == [self._COMPETITION_LINE + "2"]
+
+    def test_a_looked_up_held_market_carries_its_events_competition(self):
+        # A held market missing from the run's list is read with its event, as
+        # the market list reads it, so its competition is the event's own
+        raw = dict(_FOOTBALL_EVENT["markets"][0])
+        event = {k: v for k, v in _FOOTBALL_EVENT.items() if k != "markets"}
+        client = MagicMock()
+        client.get_market_without_preload_content.return_value = _json_reply({"market": raw})
+        client.get_event_without_preload_content.return_value = _json_reply({"event": event})
+        memo: dict = {}
+        market = scanner.market_for_labels(client, raw["ticker"], {}, memo)
+        assert market._event_competition == "NCAA Football"
+        assert memo == {raw["event_ticker"]: ("Kentucky vs Oklahoma", "NCAA Football")}
+
+
+class TestEventCompetition:
+    """scanner.event_competition: the competition an event names, "" when it
+    names none, and None when a label is there but cannot be read."""
+
+    @pytest.mark.parametrize("event,label", [
+        ({"product_metadata": {"competition": "NCAA Football"}}, "NCAA Football"),
+        ({"product_metadata": {"competition": "  NCAA Basketball (W)\n"}},
+         "NCAA Basketball (W)"),
+        ({"product_metadata": {"competition": ""}}, ""),
+        ({"product_metadata": {"cadence": "weekly"}}, ""),
+        ({"product_metadata": {"competition": None}}, ""),
+        ({"product_metadata": {"competition": "   "}}, ""),
+        ({"product_metadata": None}, ""),
+        ({"title": "No metadata"}, ""),
+        ({}, ""),
+        # A label that is there but is not text: unknown, never "names none"
+        ({"product_metadata": {"competition": 3}}, None),
+        ({"product_metadata": {"competition": ["NCAA Football"]}}, None),
+        ({"product_metadata": {"competition": {"name": "NCAA Football"}}}, None),
+        ({"product_metadata": {"competition": True}}, None),
+        ({"product_metadata": ["competition"]}, None),
+        ({"product_metadata": "NCAA Football"}, None),
+        (None, None),
+        ([], None),
+        ("NCAA Football", None),
+    ])
+    def test_it_reads_a_string_label_and_nothing_else(self, event, label):
+        assert scanner.event_competition(event) == label
+
+    def test_a_mock_event_reads_as_unknown(self):
+        assert scanner.event_competition(MagicMock()) is None
+
+
+class TestLabelsDiffer:
+    """scanner.labels_differ and its live reader _labels_differ: two series
+    are alike only when both are filed under one (category, tag)."""
+
+    @pytest.mark.parametrize("a,b,differ", [
+        (("Sports", "Football"), ("Sports", "Football"), False),
+        (("Sports", "Football"), ("sports", "FOOTBALL"), False),
+        (("Sports", "Football"), ("Sports", "Volleyball"), True),
+        (("Sports", "Football"), ("Politics", "Football"), True),
+        (("Commodities", "Oil & Gas"), ("Commodities", "Oil & Gas"), False),
+        # Fails closed on anything that is not a (category, tag) pair of strings
+        (None, ("Sports", "Football"), True),
+        (("Sports", "Football"), None, True),
+        (None, None, True),
+        (["Sports", "Football"], ["Sports", "Football"], True),
+        (("Sports",), ("Sports",), True),
+        (("Sports", "Football", "x"), ("Sports", "Football", "x"), True),
+        (("Sports", None), ("Sports", None), True),
+        ("Sports", "Sports", True),
+    ])
+    def test_two_series_are_alike_only_on_one_category_and_tag(self, a, b, differ):
+        assert scanner.labels_differ(a, b) is differ
+        assert scanner.labels_differ(b, a) is differ
+
+    def test_spaces_are_not_ignored(self):
+        # Labels come straight from Kalshi's listing, compared as written but for case
+        assert scanner.labels_differ(("Sports", "Football"), ("Sports", " Football")) is True
+
+    def test_the_live_reader_reads_series_labels_by_type(self):
+        filed = SimpleNamespace(_series_labels=("Sports", "Football"))
+        assert scanner._labels_differ(filed, SimpleNamespace(
+            _series_labels=("Sports", "Football"))) is False
+        # A missing attribute, and a MagicMock's auto-attribute, fail closed
+        assert scanner._labels_differ(filed, SimpleNamespace()) is True
+        assert scanner._labels_differ(filed, MagicMock()) is True
+
+
+class TestCompetitionsDiffer:
+    """scanner.competitions_differ and its live reader _competitions_differ:
+    two events are alike only when they name one competition, or neither
+    names one."""
+
+    @pytest.mark.parametrize("a,b,differ", [
+        ("", "", False),
+        ("NCAA Football", "NCAA Football", False),
+        ("NCAA Football", " ncaa football ", False),
+        ("NCAA Basketball (M)", "NCAA Basketball (W)", True),
+        ("NCAA Football", "NCAA Volleyball (W)", True),
+        # One event naming a competition and the other none counts as different
+        ("NCAA Football", "", True),
+        ("", "NCAA Football", True),
+        ("  ", "", False),
+        # Fails closed on anything that is not a str
+        (None, "", True),
+        ("", None, True),
+        (None, None, True),
+        (0, 0, True),
+        (["NCAA Football"], "NCAA Football", True),
+    ])
+    def test_two_events_are_alike_only_on_one_competition(self, a, b, differ):
+        assert scanner.competitions_differ(a, b) is differ
+        assert scanner.competitions_differ(b, a) is differ
+
+    def test_the_live_reader_reads_event_competition_by_type(self):
+        named = SimpleNamespace(_event_competition="NCAA Football")
+        assert scanner._competitions_differ(named, SimpleNamespace(
+            _event_competition="NCAA Football")) is False
+        assert scanner._competitions_differ(
+            SimpleNamespace(_event_competition=""),
+            SimpleNamespace(_event_competition="")) is False
+        # A missing attribute, and a MagicMock's auto-attribute, fail closed
+        assert scanner._competitions_differ(named, SimpleNamespace()) is True
+        assert scanner._competitions_differ(named, MagicMock()) is True
 
 
 class TestTimeSeriesGroupKey:
@@ -8241,7 +8776,8 @@ class TestMarketForLabels:
         # Its labels are its listed ladder-mate's: the same event and question
         assert market_ladder_keys(got) == market_ladder_keys(
             _star_rung(_RUNG_EARLY, "Mar 1, 2026"))
-        assert titles == {_STAR_EVENT: _STAR_TITLE}
+        # The memo keeps each event's title and the competition it names
+        assert titles == {_STAR_EVENT: (_STAR_TITLE, "")}
 
     def test_one_event_is_asked_about_once(self):
         raws = {t: _star_raw(t, d) for t, d in
@@ -10833,7 +11369,13 @@ class TestSameTitleSubtitleDiscriminator:
         client.get_multivariate_events_without_preload_content = MagicMock(
             return_value=_raw_page([])
         )
-        return fetch_open_events_with_markets(client)
+        markets = fetch_open_events_with_markets(client)
+        # A run files every market under its series' labels before pairing
+        # (main._attach_series_labels); both series here are filed alike, so
+        # the subtitle stays the only thing that tells the two apart
+        for m in markets:
+            m._series_labels = ("Politics", "General")
+        return markets
 
     def test_distinct_outcomes_under_shared_title_do_not_pair(self):
         # RE-PINNED (DR-02/DR-54): the fixture used EVT-A/EVT-B, one series, so
