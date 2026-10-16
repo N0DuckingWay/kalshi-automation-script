@@ -6684,7 +6684,7 @@ def _refuse_other_competitions(pairs: list, competitions: dict) -> list:
     scanner.find_same_title_pairs, through the same scanner.competitions_differ:
     two series of one sport share a tag, so a men's and a women's game, or two
     leagues of one matchup, are told apart by the competition each event names
-    ("NCAA Basketball (M)" and "NCAA Basketball (W)"). One event naming a
+    ("College Basketball (M)" and "College Basketball (W)"). One event naming a
     competition and the other none counts as different. It runs on
     _extract_pairs' same-title output, because cached markets carry no
     competition and historical.load_event_competitions reads the labels only

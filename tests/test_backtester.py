@@ -1424,8 +1424,8 @@ class TestSameTitleSportCheckBacktest:
     _COMPETITIONS = {
         "KXNCAAWVMATCH-26OCT161900UKOU": "NCAA Volleyball (W)",
         "KXNCAAFGAME-26OCT16UKOKLA": "NCAA Football",
-        "KXNCAAMBGAME-26JAN27WIUEIU": "NCAA Basketball (M)",
-        "KXNCAAWBGAME-26JAN27WIUEIU": "NCAA Basketball (W)",
+        "KXNCAAMBGAME-26JAN27WIUEIU": "College Basketball (M)",
+        "KXNCAAWBGAME-26JAN27WIUEIU": "College Basketball (W)",
         "KXBRENTW-26SEP25": "",
         "KXBRENTMON-26SEP": "",
     }
@@ -1508,7 +1508,7 @@ class TestSameTitleSportCheckBacktest:
                                 series_categories=self.LISTING)
                  + _extract_pairs(_group_by_exact_title(self._basketball()),
                                   series_categories=self.LISTING))
-        same = dict.fromkeys(self._COMPETITIONS, "NCAA Basketball (M)")
+        same = dict.fromkeys(self._COMPETITIONS, "College Basketball (M)")
         kept = backtester._refuse_other_competitions(pairs, same)
         assert kept == pairs and kept[0] is pairs[0]
 

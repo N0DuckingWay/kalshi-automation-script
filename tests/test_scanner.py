@@ -1501,11 +1501,11 @@ class TestSameTitleSportCheck:
         # Basketball: only the competitions tell them apart (stand-in labels)
         close = datetime(2026, 1, 28, 1, 30, tzinfo=UTC)
         mens = self._game("KXNCAAMBGAME-26JAN27WIUEIU-WIU", "KXNCAAMBGAME-26JAN27WIUEIU",
-                          labels=("Sports", "Basketball"), competition="NCAA Basketball (M)",
+                          labels=("Sports", "Basketball"), competition="College Basketball (M)",
                           yes_ask=0.40, close=close)
         womens = self._game("KXNCAAWBGAME-26JAN27WIUEIU-WIU", "KXNCAAWBGAME-26JAN27WIUEIU",
                             labels=("Sports", "Basketball"),
-                            competition="NCAA Basketball (W)", yes_ask=0.25, close=close)
+                            competition="College Basketball (W)", yes_ask=0.25, close=close)
         with caplog.at_level(logging.INFO):
             assert find_same_title_pairs([mens, womens]) == []
         assert self._sport_lines(caplog) == [self._COMPETITION_LINE + "1"]
@@ -1785,8 +1785,8 @@ class TestEventCompetition:
 
     @pytest.mark.parametrize("event,label", [
         ({"product_metadata": {"competition": "NCAA Football"}}, "NCAA Football"),
-        ({"product_metadata": {"competition": "  NCAA Basketball (W)\n"}},
-         "NCAA Basketball (W)"),
+        ({"product_metadata": {"competition": "  College Basketball (W)\n"}},
+         "College Basketball (W)"),
         ({"product_metadata": {"competition": ""}}, ""),
         ({"product_metadata": {"cadence": "weekly"}}, ""),
         ({"product_metadata": {"competition": None}}, ""),
@@ -1858,7 +1858,7 @@ class TestCompetitionsDiffer:
         ("", "", False),
         ("NCAA Football", "NCAA Football", False),
         ("NCAA Football", " ncaa football ", False),
-        ("NCAA Basketball (M)", "NCAA Basketball (W)", True),
+        ("College Basketball (M)", "College Basketball (W)", True),
         ("NCAA Football", "NCAA Volleyball (W)", True),
         # One event naming a competition and the other none counts as different
         ("NCAA Football", "", True),
