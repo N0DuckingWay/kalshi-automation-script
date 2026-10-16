@@ -5,6 +5,7 @@ import functools
 import gc
 import hashlib
 import inspect
+import json
 import logging
 import math
 import pathlib
@@ -438,6 +439,13 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
         assert _extract_pairs(_group_by_exact_title(recs)) == []
         assert _extract_pairs(_group_by_normalized_title(recs)) == []
 
+    # Both Fed series filed alike, as Kalshi's /series listing files one
+    # question's two listings (DR-79): with no listing, KXFEDDEC falls back to
+    # infer_category's "Economics" and the others to "Other"
+    _FED_LISTING = {"KXFEDDEC": ("Economics", ("Fed",)),
+                    "KXMVPAWARD": ("Economics", ("Fed",)),
+                    "FEDCUTDEC": ("Economics", ("Fed",))}
+
     def test_a_non_mve_series_pair_is_untouched_by_the_family_collapse(self):
         # GUARD on the collapse's blast radius: only KXMVE* collapses, so two
         # ordinary series still read as different and still pair.
@@ -450,7 +458,8 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
                       event_title="Fed December decision"),
         ]
         assert backtester._same_series_dicts(recs[0], recs[1]) is False
-        assert len(_extract_pairs(_group_by_exact_title(recs))) == 1
+        assert len(_extract_pairs(_group_by_exact_title(recs),
+                                  series_categories=self._FED_LISTING)) == 1
 
     def test_two_different_series_asking_one_question_still_pair(self):
         recs = [
@@ -461,7 +470,8 @@ class TestOneEventSeriesIsTwoFixturesBacktest:
                       "Fed cuts rates in December?", "2026-12-10T19:00:00Z",
                       event_title="Fed December decision"),
         ]
-        pairs = _extract_pairs(_group_by_exact_title(recs))
+        pairs = _extract_pairs(_group_by_exact_title(recs),
+                               series_categories=self._FED_LISTING)
         assert len(pairs) == 1
         assert {pairs[0][0]["ticker"], pairs[0][1]["ticker"]} == {
             "KXFEDDEC-26-T25", "FEDCUTDEC-26-T25"
@@ -797,6 +807,16 @@ _ST_SERIES = "Same-title candidates skipped as two instances of one event series
 # read as the other.
 _ST_CLOSE_GAP = "Same-title candidates refused because the two markets close more than"
 _ST_UNDATED = "Same-title candidate pairs refused because a market's close_time"
+# DR-79: the same-title sport check's three lines — the label refusal
+# (_extract_pairs, verbatim with find_same_title_pairs'), the competition
+# refusal (_refuse_other_competitions, verbatim with the live one) and the
+# backtest-only unknown-competition one.
+_ST_LABEL = ("Same-title candidates refused because the two series are filed under "
+             "different Kalshi categories or tags")
+_ST_COMPETITION = ("Same-title candidates refused because the two events name "
+                   "different competitions")
+_ST_UNKNOWN_COMPETITION = ("Same-title candidate pairs refused because an event's "
+                           "competition could not be read from Kalshi")
 _TS_WORDING = "Time-series candidates refused because"
 _LADDER_REFUSED = "Same-event ladder candidates refused because"
 _LADDER_GAP_CAP = "Same-event ladder candidates worded as two different cumulative"
@@ -814,8 +834,8 @@ def _logged_counts(caplog) -> dict[str, int]:
     """
     out: dict[str, int] = defaultdict(int)
     prefixes = (_TS_UNDATED, _TS_BEYOND, _TS_SAME_EVENT, _TS_SERIES, _ST_SAME_EVENT,
-                _ST_SERIES, _ST_CLOSE_GAP, _ST_UNDATED, _TS_WORDING, _LADDER_REFUSED,
-                _LADDER_GAP_CAP, _LADDER_FORMED)
+                _ST_SERIES, _ST_CLOSE_GAP, _ST_UNDATED, _ST_LABEL, _TS_WORDING,
+                _LADDER_REFUSED, _LADDER_GAP_CAP, _LADDER_FORMED)
     for message in caplog.messages:
         for prefix in prefixes:
             if message.startswith(prefix):
@@ -837,6 +857,8 @@ class TestOneSeriesAndSameEventCounts:
     added two more same-title lines, counted after the series test: a pair
     whose two markets close more than SAME_TITLE_MAX_CLOSE_GAP_SECONDS apart,
     and (backtest-only) a pair whose close_time cannot be read or compared.
+    DR-79 added one more, counted after the close gate: a pair whose two
+    series are filed under different Kalshi categories or tags.
     Counting must move no control flow: the pair lists are pinned by every
     other test in this module, and the partition test below proves that the
     counts and the returned pairs together account for each pair exactly
@@ -978,7 +1000,8 @@ class TestOneSeriesAndSameEventCounts:
             _extract_pairs(grouping(recs), same_event_ladders=False)
         counts = _logged_counts(caplog)
         for prefix in (_TS_UNDATED, _TS_BEYOND, _TS_SAME_EVENT, _TS_SERIES,
-                       _ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP, _ST_UNDATED):
+                       _ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP, _ST_UNDATED,
+                       _ST_LABEL):
             assert prefix not in counts
 
     @pytest.mark.parametrize("ladders", [False, True])
@@ -1113,6 +1136,10 @@ class TestOneSeriesAndSameEventCounts:
         margin = timedelta(days=MAX_DEADLINE_GAP_DAYS + 1)
         ts_groups = _group_by_normalized_title(recs)
         st_groups = _group_by_exact_title(recs)
+        # A listing that files KXAA apart from every other series, which fall
+        # back to their ticker prefix and so file alike: some same-title
+        # candidates are refused on the label line (DR-79), the rest survive
+        listing = {"KXAA": ("Sports", ("Football",))}
 
         cross = same_event_in_window = ladder_population = 0
         undated = beyond = dated_pairs = 0
@@ -1141,7 +1168,8 @@ class TestOneSeriesAndSameEventCounts:
         ts = _logged_counts(caplog)
         caplog.clear()
         with caplog.at_level(logging.INFO):
-            st_pairs = _extract_pairs(st_groups, same_event_ladders=ladders)
+            st_pairs = _extract_pairs(st_groups, same_event_ladders=ladders,
+                                      series_categories=listing)
         st = _logged_counts(caplog)
 
         ladder_pairs = ts[_LADDER_FORMED]
@@ -1150,7 +1178,7 @@ class TestOneSeriesAndSameEventCounts:
         # close_times set above supply the unreadable ones, and the fuzz's
         # uncopied closes the ones more than an hour apart.
         assert ts[_TS_SERIES] and st[_ST_SERIES] and st[_ST_SAME_EVENT]
-        assert st[_ST_UNDATED] and st[_ST_CLOSE_GAP]
+        assert st[_ST_UNDATED] and st[_ST_CLOSE_GAP] and st[_ST_LABEL]
         assert len(ts_pairs) and len(st_pairs)
         # What the sweep set aside before visiting anything, and the whole
         # partition of the dated members' pairs: beyond the window, or
@@ -1169,7 +1197,7 @@ class TestOneSeriesAndSameEventCounts:
             assert ladder_pairs == 0
         assert st_candidates == (
             len(st_pairs) + st[_ST_SAME_EVENT] + st[_ST_SERIES]
-            + st[_ST_UNDATED] + st[_ST_CLOSE_GAP]
+            + st[_ST_UNDATED] + st[_ST_CLOSE_GAP] + st[_ST_LABEL]
         )
 
 
@@ -1336,6 +1364,363 @@ class TestSameTitleCloseGapBacktest:
         ca, cb = out
         assert ca == _parse_iso_datetime(a["close_time"])
         assert cb == _parse_iso_datetime(b["close_time"])
+
+
+class TestSameTitleSportCheckBacktest:
+    """DR-79 mirror: the backtest refuses identical wording from two sports or
+    two competitions as the live finder does.
+
+    The label half is in _extract_pairs' same-title branch, right after the
+    close gate, through scanner.labels_differ over historical.series_labels
+    (from the listing handed in); the competition half is
+    _refuse_other_competitions, through scanner.competitions_differ, over the
+    labels historical.load_event_competitions read for the pairs' events. A
+    pair whose event's label is unknown is refused on a backtest-only line.
+    Mirror of test_scanner.py::TestSameTitleSportCheck; the backtest reads
+    REALIZED closes, so the incident is placed at one close instant here,
+    where only this check can refuse it."""
+
+    # The listing as Kalshi's /series files these series (category, tags)
+    LISTING = {
+        "KXNCAAWVMATCH": ("Sports", ("Volleyball",)),
+        "KXNCAAFGAME": ("Sports", ("Football",)),
+        "KXNCAAMBGAME": ("Sports", ("Basketball",)),
+        "KXNCAAWBGAME": ("Sports", ("Basketball",)),
+        "KXBRENTW": ("Commodities", ("Oil & Gas",)),
+        "KXBRENTMON": ("Commodities", ("Oil & Gas",)),
+    }
+
+    @staticmethod
+    def _rec(ticker, event_ticker, title, subtitle, event_title, close):
+        return {"ticker": ticker, "event_ticker": event_ticker, "event_title": event_title,
+                "title": title, "subtitle": subtitle, "close_time": close}
+
+    @classmethod
+    def _incident(cls, close="2026-10-19T00:00:00Z"):
+        """The 2026-10-16 incident's four markets, all closing at one instant."""
+        out = []
+        for event in ("KXNCAAWVMATCH-26OCT161900UKOU", "KXNCAAFGAME-26OCT16UKOKLA"):
+            for team, code in (("Kentucky", "UK"), ("Oklahoma", "OU")):
+                out.append(cls._rec(f"{event}-{code}", event, f"{team} wins", team,
+                                    "Kentucky vs Oklahoma", close))
+        return out
+
+    @classmethod
+    def _basketball(cls):
+        """A men's and a women's game of one matchup at one close, both tagged Basketball."""
+        title = "Western Illinois at Eastern Illinois Winner?"
+        return [cls._rec(f"{event}-WIU", event, title, "Western Illinois",
+                         "Western Illinois at Eastern Illinois", "2026-01-28T01:30:00Z")
+                for event in ("KXNCAAMBGAME-26JAN27WIUEIU", "KXNCAAWBGAME-26JAN27WIUEIU")]
+
+    @classmethod
+    def _brent(cls):
+        """One question on a weekly and a monthly series, filed alike."""
+        title = "Brent crude oil price on Sep 25, 2026?"
+        return [cls._rec(f"{event}-T70", event, title, "$70 or above",
+                         "Brent crude oil price", "2026-09-25T21:00:00Z")
+                for event in ("KXBRENTW-26SEP25", "KXBRENTMON-26SEP")]
+
+    _COMPETITIONS = {
+        "KXNCAAWVMATCH-26OCT161900UKOU": "NCAA Volleyball (W)",
+        "KXNCAAFGAME-26OCT16UKOKLA": "NCAA Football",
+        "KXNCAAMBGAME-26JAN27WIUEIU": "College Basketball (M)",
+        "KXNCAAWBGAME-26JAN27WIUEIU": "College Basketball (W)",
+        "KXBRENTW-26SEP25": "",
+        "KXBRENTMON-26SEP": "",
+    }
+
+    @staticmethod
+    def _sport_lines(caplog) -> list[str]:
+        return [m for m in caplog.messages
+                if m.startswith((_ST_LABEL, _ST_COMPETITION, _ST_UNKNOWN_COMPETITION))]
+
+    def test_the_incident_at_one_close_is_refused_on_the_label_line(self, caplog):
+        groups = _group_by_exact_title(self._incident())
+        with caplog.at_level(logging.INFO):
+            assert _extract_pairs(groups, series_categories=self.LISTING) == []
+        # "Kentucky wins" and "Oklahoma wins", each counted once; every older
+        # check passed (no series, close-gap or unreadable-close line)
+        assert self._sport_lines(caplog) == [
+            "Same-title candidates refused because the two series are filed under "
+            "different Kalshi categories or tags (two different sports or subjects, "
+            "not one question listed twice): 2"]
+        counts = _logged_counts(caplog)
+        for prefix in (_ST_SAME_EVENT, _ST_SERIES, _ST_CLOSE_GAP, _ST_UNDATED):
+            assert prefix not in counts
+
+    def test_with_no_listing_the_incident_pairs_form(self):
+        # Control: with no listing every series falls back to its ticker
+        # prefix and files alike, so the refusal above is the label check
+        groups = _group_by_exact_title(self._incident())
+        assert len(_extract_pairs(groups)) == 2
+        assert len(_extract_pairs(groups, series_categories={})) == 2
+
+    def test_labels_are_compared_without_regard_to_letter_case(self):
+        listing = dict(self.LISTING, KXNCAAWVMATCH=("SPORTS", ("football",)))
+        groups = _group_by_exact_title(self._incident())
+        assert len(_extract_pairs(groups, series_categories=listing)) == 2
+
+    def test_mens_and_womens_basketball_are_refused_on_the_competition_line(self, caplog):
+        groups = _group_by_exact_title(self._basketball())
+        # One tag: the label half lets the pair through
+        pairs = _extract_pairs(groups, series_categories=self.LISTING)
+        assert len(pairs) == 1
+        with caplog.at_level(logging.INFO):
+            assert backtester._refuse_other_competitions(pairs, self._COMPETITIONS) == []
+        assert self._sport_lines(caplog) == [
+            "Same-title candidates refused because the two events name different "
+            "competitions (two leagues, genders or formats, not one question listed "
+            "twice): 1"]
+
+    def test_one_event_naming_a_competition_and_the_other_none_is_refused(self, caplog):
+        pairs = _extract_pairs(_group_by_exact_title(self._basketball()),
+                               series_categories=self.LISTING)
+        competitions = dict(self._COMPETITIONS, **{"KXNCAAWBGAME-26JAN27WIUEIU": ""})
+        with caplog.at_level(logging.INFO):
+            assert backtester._refuse_other_competitions(pairs, competitions) == []
+        assert self._sport_lines(caplog) == [_ST_COMPETITION + " (two leagues, genders or "
+                                             "formats, not one question listed twice): 1"]
+
+    def test_weekly_and_monthly_brent_are_kept(self, caplog):
+        with caplog.at_level(logging.INFO):
+            pairs = _extract_pairs(_group_by_exact_title(self._brent()),
+                                   series_categories=self.LISTING)
+            assert len(pairs) == 1
+            assert backtester._refuse_other_competitions(pairs, self._COMPETITIONS) == pairs
+        # Silent at zero
+        assert self._sport_lines(caplog) == []
+
+    @pytest.mark.parametrize("missing", ["KXBRENTW-26SEP25", "KXBRENTMON-26SEP"])
+    def test_an_unknown_competition_is_refused_on_the_backtest_only_line(self, caplog,
+                                                                          missing):
+        pairs = _extract_pairs(_group_by_exact_title(self._brent()),
+                               series_categories=self.LISTING)
+        competitions = {k: v for k, v in self._COMPETITIONS.items() if k != missing}
+        with caplog.at_level(logging.INFO):
+            assert backtester._refuse_other_competitions(pairs, competitions) == []
+        assert self._sport_lines(caplog) == [
+            "Same-title candidate pairs refused because an event's competition could "
+            "not be read from Kalshi (fail closed): 1"]
+
+    def test_the_kept_pairs_keep_their_order(self):
+        pairs = (_extract_pairs(_group_by_exact_title(self._brent()),
+                                series_categories=self.LISTING)
+                 + _extract_pairs(_group_by_exact_title(self._basketball()),
+                                  series_categories=self.LISTING))
+        same = dict.fromkeys(self._COMPETITIONS, "College Basketball (M)")
+        kept = backtester._refuse_other_competitions(pairs, same)
+        assert kept == pairs and kept[0] is pairs[0]
+
+    def test_the_lines_are_the_live_finders_verbatim(self, caplog):
+        # The incident (two label refusals) and the basketball pair (one
+        # competition refusal) through both paths: the live finder gets
+        # markets filed as main._attach_series_labels files them, the
+        # backtest the dicts, and the two print the same lines, counts included
+        recs = self._incident() + self._basketball() + self._brent()
+        live = []
+        for r in recs:
+            event = r["event_ticker"]
+            live.append(SimpleNamespace(
+                ticker=r["ticker"], event_ticker=event, title=r["title"],
+                subtitle=r["subtitle"], _event_title=r["event_title"],
+                yes_ask_dollars="0.50", no_ask_dollars="0.50",
+                close_time=_parse_iso_datetime(r["close_time"]),
+                _series_labels=historical.series_labels(
+                    event, historical.infer_category(event), self.LISTING),
+                _event_competition=self._COMPETITIONS[event]))
+        with caplog.at_level(logging.INFO):
+            scanner.find_same_title_pairs(live)
+        live_lines = self._sport_lines(caplog)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            pairs = _extract_pairs(_group_by_exact_title(recs), series_categories=self.LISTING)
+            backtester._refuse_other_competitions(pairs, self._COMPETITIONS)
+        backtest_lines = self._sport_lines(caplog)
+        assert live_lines == [
+            _ST_LABEL + " (two different sports or subjects, not one question listed "
+            "twice): 2",
+            _ST_COMPETITION + " (two leagues, genders or formats, not one question "
+            "listed twice): 1",
+        ]
+        assert backtest_lines == live_lines
+
+    def test_prepare_candidates_reads_the_labels_and_refuses_both_shapes(
+        self, monkeypatch, caplog,
+    ):
+        # Through the real _prepare_candidates: the listing handed in files
+        # the series, the competitions come from load_event_competitions (its
+        # reader stubbed to this fixture's labels), and only Brent is left
+        # to count and to fetch candles for
+        corpus = [
+            _ss1_record(r["ticker"], r["event_ticker"], r["title"], subtitle=r["subtitle"],
+                        event_title=r["event_title"])
+            for r in self._incident() + self._basketball() + self._brent()]
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        asked: list = []
+
+        def read(client, event_ticker):
+            asked.append(event_ticker)
+            return self._COMPETITIONS[event_ticker]
+
+        monkeypatch.setattr(historical, "_fetch_event_competition", read)
+        fetched: list = []
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda client, ticker, *a, **k: fetched.append(ticker) or [])
+        with caplog.at_level(logging.INFO):
+            candidates = backtester._prepare_candidates(
+                MagicMock(), MagicMock(), _SS1_START, True, None,
+                series_categories=self.LISTING)
+        assert [p[0][0]["event_ticker"] for p in candidates.all_pairs] == ["KXBRENTW-26SEP25"]
+        # Only the events of pairs the label half kept were asked for
+        assert sorted(asked) == sorted(["KXNCAAMBGAME-26JAN27WIUEIU",
+                                        "KXNCAAWBGAME-26JAN27WIUEIU",
+                                        "KXBRENTW-26SEP25", "KXBRENTMON-26SEP"])
+        assert sorted(fetched) == ["KXBRENTMON-26SEP-T70", "KXBRENTW-26SEP25-T70"]
+        messages = caplog.messages
+        label_at = next(i for i, m in enumerate(messages) if m.startswith(_ST_LABEL))
+        competition_at = next(i for i, m in enumerate(messages)
+                              if m.startswith(_ST_COMPETITION))
+        pairs_at = messages.index("Potential pairs: 0 time-series, 1 same-title")
+        assert label_at < competition_at < pairs_at
+
+    def test_prepare_candidates_reads_the_cached_listing_with_none(self, monkeypatch):
+        # None reads the cached copy only (no client), as a dev run does
+        historical._SERIES_CATEGORIES_CACHE.write_text(json.dumps({
+            "fetched_at": "2020-01-01T00:00:00+00:00",
+            "series": {k: [v[0], list(v[1])] for k, v in self.LISTING.items()}}))
+        corpus = [_ss1_record(r["ticker"], r["event_ticker"], r["title"],
+                              subtitle=r["subtitle"], event_title=r["event_title"])
+                  for r in self._incident()]
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        seen: list = []
+        real_load = historical.load_series_categories
+
+        def spy(client, *a, **k):
+            seen.append(client)
+            return real_load(client, *a, **k)
+
+        monkeypatch.setattr(backtester, "load_series_categories", spy)
+        candidates = backtester._prepare_candidates(MagicMock(), MagicMock(), _SS1_START,
+                                                    True, None)
+        assert seen == [None]
+        assert candidates.all_pairs == []
+
+    def test_an_unknown_competition_in_prepare_candidates_refuses_the_pair(
+        self, monkeypatch, caplog,
+    ):
+        corpus = [_ss1_record(r["ticker"], r["event_ticker"], r["title"],
+                              subtitle=r["subtitle"], event_title=r["event_title"])
+                  for r in self._brent()]
+        TestGroupableSubset._patch(monkeypatch, corpus)
+
+        def offline(client, event_ticker):
+            raise RuntimeError("offline")
+
+        monkeypatch.setattr(historical, "_fetch_event_competition", offline)
+        with caplog.at_level(logging.INFO):
+            candidates = backtester._prepare_candidates(
+                MagicMock(), MagicMock(), _SS1_START, True, None,
+                series_categories=self.LISTING)
+        assert candidates.all_pairs == []
+        assert self._sport_lines(caplog) == [
+            "Same-title candidate pairs refused because an event's competition could "
+            "not be read from Kalshi (fail closed): 1"]
+
+    _NO_LISTING = "Same-title sport check: no /series listing"
+
+    @classmethod
+    def _no_listing_warnings(cls, caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records
+                if r.levelno == logging.WARNING and r.getMessage().startswith(cls._NO_LISTING)]
+
+    @pytest.mark.parametrize("listing", [{}, None])
+    def test_an_empty_listing_is_named_in_the_live_runs_words(self, monkeypatch, caplog,
+                                                             listing):
+        # {} (backtest.py's read failed with no cached copy) and None with no
+        # cached copy (a direct caller) both file every series by its ticker
+        # prefix, so the incident pairs form: one WARNING says so, in the
+        # words main._attach_series_labels uses for the same state live
+        from kalshi_betting import main as live_main
+
+        assert not historical._SERIES_CATEGORIES_CACHE.exists()
+        corpus = [_ss1_record(r["ticker"], r["event_ticker"], r["title"],
+                              subtitle=r["subtitle"], event_title=r["event_title"])
+                  for r in self._incident()]
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        with caplog.at_level(logging.INFO):
+            candidates = backtester._prepare_candidates(
+                MagicMock(), MagicMock(), _SS1_START, True, None, series_categories=listing)
+        assert len(candidates.all_pairs) == 2
+        [backtest_line] = self._no_listing_warnings(caplog)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            live_main._attach_series_labels([], {})
+        assert self._no_listing_warnings(caplog) == [backtest_line]
+
+    def test_a_listing_draws_no_such_warning(self, monkeypatch, caplog):
+        corpus = [_ss1_record(r["ticker"], r["event_ticker"], r["title"],
+                              subtitle=r["subtitle"], event_title=r["event_title"])
+                  for r in self._brent()]
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        with caplog.at_level(logging.INFO):
+            backtester._prepare_candidates(MagicMock(), MagicMock(), _SS1_START, True, None,
+                                           series_categories=self.LISTING)
+        assert self._no_listing_warnings(caplog) == []
+
+    def test_no_same_title_group_draws_no_such_warning(self, monkeypatch, caplog):
+        # Nothing for the label check to file: an empty listing is not worth a word
+        corpus = [_ss1_record("KXBRENTW-26SEP25-T70", "KXBRENTW-26SEP25",
+                              "Brent crude oil price on Sep 25, 2026?",
+                              subtitle="$70 or above")]
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        with caplog.at_level(logging.INFO):
+            backtester._prepare_candidates(MagicMock(), MagicMock(), _SS1_START, True, None,
+                                           series_categories={})
+        assert self._no_listing_warnings(caplog) == []
+
+
+class TestSeriesCategoriesReachPrepareCandidates:
+    """DR-79: the /series listing backtest.py reads is the one the same-title
+    label check files by, so every entry point hands it, unchanged, to
+    _prepare_candidates; None (a direct caller's default) arrives as None,
+    which _prepare_candidates turns into the cached copy."""
+
+    LISTING = {"KXA": ("Sports", ("Football",))}
+
+    @staticmethod
+    def _spy(monkeypatch):
+        seen: list = []
+
+        def fake(*args, **kwargs):
+            seen.append(kwargs.get("series_categories", "MISSING"))
+            return None
+
+        monkeypatch.setattr(backtester, "_prepare_candidates", fake)
+        return seen
+
+    @pytest.mark.parametrize("passed", [None, LISTING])
+    def test_run_backtest_sweep_hands_the_listing_over(self, monkeypatch, passed):
+        seen = self._spy(monkeypatch)
+        backtester.run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                                      sweep=False, series_categories=passed)
+        assert seen == [passed] and (passed is None or seen[0] is passed)
+
+    @pytest.mark.parametrize("passed", [None, LISTING])
+    def test_run_backtest_and_prepare_entries_hand_the_listing_over(self, monkeypatch,
+                                                                     passed):
+        seen = self._spy(monkeypatch)
+        run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                     start_date=date(2026, 1, 1), initial_balance=1000.0,
+                     series_categories=passed)
+        assert seen == [passed] and (passed is None or seen[0] is passed)
+
+    def test_the_listing_is_keyword_only_everywhere(self):
+        for func in (backtester._prepare_candidates, backtester._prepare_entries,
+                     run_backtest, run_backtest_sweep):
+            param = inspect.signature(func).parameters["series_categories"]
+            assert param.kind is inspect.Parameter.KEYWORD_ONLY, func.__name__
+            assert param.default is None, func.__name__
 
 
 class TestDeadlineProfileParity:
@@ -4116,7 +4501,7 @@ class TestPrepareEntriesThreadsTheLadderFlag:
     def test_both_callees_receive_the_same_sentinel(self, monkeypatch, passed):
         seen: dict = {"extract": [], "entry": []}
 
-        def _fake_extract(groups, *, same_event_ladders=None):
+        def _fake_extract(groups, *, same_event_ladders=None, series_categories=None):
             seen["extract"].append(same_event_ladders)
             return []
 

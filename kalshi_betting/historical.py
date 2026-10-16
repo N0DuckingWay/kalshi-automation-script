@@ -12,17 +12,22 @@ Purpose:
     the week when each pair first became tradeable. All data is cached to JSON
     (or gzipped JSON-lines) files on disk so re-runs do not re-fetch from the
     API. It also loads Kalshi's series categories and holds series_labels, the
-    one category/tag filing rule the dashboard and the live filter share.
+    one category/tag filing rule the dashboard, the live filter and both
+    paths' same-title sport check share, and reads each event's competition
+    label for the backtest's half of that check (load_event_competitions).
 
 Dependencies:
     Imports build_client from auth.py; api_call_with_retry and fetch_json_page
     from _http.py; event_series from scanner.py (the one definition of an
     event's series identity, so the event-title fallback's combo test — DR-51 —
-    can never disagree with the one-series rule about what a combo is); and
+    can never disagree with the one-series rule about what a combo is) and
+    event_competition (the one reading of an event's competition label, so
+    load_event_competitions reads a label as live ingest does); and
     PROJECT_ROOT plus a dozen-plus tuning constants
     (MARKET_PAGE_SIZE, MVE_TITLE_LOOKUP_MAX_PAGES, SETTLED_FETCH_MAX_WORKERS,
     SETTLED_FETCH_CHUNK_RECORDS, ARCHIVE_MAX_BARREN_PAGES,
-    ARCHIVE_FIRST_CREATED_DATE, EVENT_TITLE_FALLBACK_MAX_LOOKUPS, EVENT_TITLE_FALLBACK_MAX_WORKERS,
+    ARCHIVE_FIRST_CREATED_DATE, EVENT_COMPETITION_MAX_LOOKUPS,
+    EVENT_TITLE_FALLBACK_MAX_LOOKUPS, EVENT_TITLE_FALLBACK_MAX_WORKERS,
     EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS,
     EVENT_TITLE_LISTING_MAX_BARREN_PAGES, MVE_SERIES_FAMILY_PREFIX,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
@@ -36,8 +41,10 @@ Dependencies:
     fetch_all_settled_markets(), fetch_candlesticks(), and infer_category(),
     all called by backtester.py (infer_category() by main.py and
     live_portfolio.py too). load_series_categories() is called by
-    backtest.py, main.py and live_dashboard.py, series_labels() by
-    dashboard.py, main.py and live_portfolio.py. live_portfolio.py (the Live
+    backtest.py, backtester.py, main.py and live_dashboard.py, series_labels()
+    by backtester.py, dashboard.py, main.py and live_portfolio.py, and
+    load_event_competitions() (each event's competition label, for the
+    backtest's same-title sport check, DR-79) by backtester.py. live_portfolio.py (the Live
     trading tab, which only reads) also reads _historical_get with
     _API_PREFIX, its only way to Kalshi, _candle_close, and _load_json_cache
     and _save_json_cache for the finalized markets' daily prices it keeps.
@@ -176,6 +183,7 @@ from .config import (
     CANDLESTICK_CACHE_FIELDS_VERSION,
     CANDLESTICK_MAX_CANDLES_PER_REQUEST,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
+    EVENT_COMPETITION_MAX_LOOKUPS,
     EVENT_TITLE_FALLBACK_MAX_LOOKUPS,
     EVENT_TITLE_FALLBACK_MAX_WORKERS,
     EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS,
@@ -192,7 +200,7 @@ from .config import (
     SETTLED_FETCH_CHUNK_RECORDS,
     SETTLED_FETCH_MAX_WORKERS,
 )
-from .scanner import event_series
+from .scanner import event_competition, event_series
 
 # Optional acceleration for the day-slice store, which serializes and re-parses
 # tens of millions of compact market dicts per full-history fetch. orjson is an
@@ -291,9 +299,12 @@ def series_labels(
     The one filing rule behind the backtest dashboard's categories and tags,
     main._filter_by_category's live filter (which states its own matching),
     each trade's category and tag in a production run's result (both through
-    main._pair_labels) and the Live trading tab's categories
-    (live_portfolio.build_live_view, which takes the category alone). First
-    tag only, so every breakdown partitions what it breaks down.
+    main._pair_labels), the Live trading tab's categories
+    (live_portfolio.build_live_view, which takes the category alone) and the
+    same-title sport check (DR-79), which refuses two series filed under
+    different labels: live, through main._attach_series_labels, and in the
+    backtest, in backtester._extract_pairs. First tag only, so every
+    breakdown partitions what it breaks down.
 
     Args:
         event_ticker (str): The event whose series (series_ticker) is looked up.
@@ -354,8 +365,10 @@ def load_series_categories(
     nearly every trade under "Other". Nothing is priced, sized or settled on
     these labels; they file the dashboard's trades, decide which pairs a
     live category/tag filter keeps, file each trade of a production run's
-    result (main.py --result-file), and file the bot's purchases on the live
-    dashboard's Live trading tab.
+    result (main.py --result-file), file the bot's purchases on the live
+    dashboard's Live trading tab, and feed the same-title sport check of
+    every live run and every backtest (DR-79: two series filed under
+    different labels never form a same-title pair).
 
     The listing is cached in backtest_cache/series_categories.json and reused
     while younger than max_age_seconds. It is one read-only GET (retried like
@@ -441,6 +454,172 @@ def load_series_categories(
             "still files by the %d series it fetched", _exception_summary(exc), len(fresh))
     logging.info("Series categories: %d series from Kalshi's /series listing", len(fresh))
     return fresh
+
+
+# Each event's competition label as the backtest's same-title check read it
+# (load_event_competitions): {"competitions": {event_ticker: label}}, "" for an
+# event that names none. Only answers Kalshi gave are kept: an event whose read
+# failed, or whose label is not text, is not stored, so a later run asks again.
+_EVENT_COMPETITIONS_CACHE = CACHE_DIR / "event_competitions.json"
+
+
+def _fetch_event_competition(client: Any, event_ticker: str) -> str | None:
+    """
+    Read one event's competition label from /events/{ticker}, then pause.
+
+    One read-only GET through _historical_get (retried on 429/5xx), whose
+    event object is read by scanner.event_competition, the reading live
+    ingest uses, so the two paths read a label alike. Each read, whether it
+    succeeds or fails, is followed by an
+    EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS pause, so the worker
+    threads of load_event_competitions are paced as the event-title
+    fallback's are.
+
+    Args:
+        client (Any): The production live client.
+        event_ticker (str): The event to read.
+
+    Returns:
+        str | None: The label, "" when the event names none, or None when
+            the label is there but is not text (see scanner.event_competition).
+
+    Raises:
+        ValueError: When the reply carries no event object.
+        Exception: Whatever the read itself raises once its retries are spent.
+    """
+    try:
+        data = _historical_get(client, f"{_API_PREFIX}/events/{event_ticker}")
+        event = data.get("event") if isinstance(data, dict) else None
+        if not isinstance(event, dict):
+            raise ValueError(f"/events/{event_ticker} returned no event object")
+        # Cross-module: the one reading of the label, shared with live ingest
+        return event_competition(event)
+    finally:
+        # Paced after every read, as the event-title fallback's lookups are
+        time.sleep(EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS)
+
+
+def load_event_competitions(client: Any, event_tickers: Iterable[str]) -> dict[str, str]:
+    """
+    The competition label of each event, from the cache or one read-only GET each.
+
+    The backtest's half of the same-title competition check (DR-79). Cached
+    markets carry no competition, so backtester._prepare_candidates asks for
+    the events of the same-title pairs backtester._extract_pairs returns
+    (every pairing check passed, before any price filter), and
+    backtester._refuse_other_competitions compares the labels. An event
+    already in backtest_cache/event_competitions.json costs no request. The
+    others are read on EVENT_TITLE_FALLBACK_MAX_WORKERS threads, each read
+    followed by a pause (_fetch_event_competition), at most
+    EVENT_COMPETITION_MAX_LOOKUPS per call, in ticker order; any beyond the
+    cap are left out, with one WARNING. A read that fails, or a label that
+    is not text, is one WARNING line and is left out too. An event left out
+    has no known label, so its pairs are refused, and it is not stored, so
+    a later run asks again. New answers are merged into the cache file (a
+    save that fails is a WARNING, and the answers are still returned). A
+    damaged cache file reads as empty and is replaced; one whose reading
+    raised (a folder that cannot be searched, a file nested too deeply) is
+    left as it is. One INFO line counts where the labels came from. Never
+    raises.
+
+    Args:
+        client (Any): The production live client, or None to use the cache
+            only, with no request made.
+        event_tickers (Iterable[str]): The events wanted. A blank or
+            non-string ticker names no event and is left out.
+
+    Returns:
+        dict[str, str]: Each wanted event whose label is known -> its label
+            ("" when it names none). An event missing from it is unknown.
+    """
+    wanted = sorted({t for t in event_tickers if isinstance(t, str) and t})
+    if not wanted:
+        return {}
+    cached: dict[str, str] = {}
+    cache_readable = True
+    try:
+        raw = _load_json_cache(_EVENT_COMPETITIONS_CACHE)
+        block = raw.get("competitions") if isinstance(raw, dict) else None
+        if isinstance(block, dict):
+            # A value that is not a string is no answer, so it is not used
+            cached = {t: label for t, label in block.items()
+                      if isinstance(t, str) and isinstance(label, str)}
+    except Exception as exc:  # a folder that cannot be searched, a file nested too deeply
+        logging.warning(
+            "Event competitions: could not read the cached labels (%s) — reading "
+            "the wanted events from Kalshi, and leaving the cache file as it is",
+            _exception_summary(exc))
+        cached, cache_readable = {}, False
+
+    found = {t: cached[t] for t in wanted if t in cached}
+    missing = [t for t in wanted if t not in found]
+    if client is None:
+        to_read: list[str] = []
+        if missing:
+            logging.warning(
+                "Event competitions: %d events are not in the cache and no client "
+                "was given, so their labels are unknown and their same-title pairs "
+                "are refused", len(missing))
+    else:
+        to_read = missing[:EVENT_COMPETITION_MAX_LOOKUPS]
+        if len(missing) > len(to_read):
+            logging.warning(
+                "Event competitions: %d events are not in the cache, more than the "
+                "cap EVENT_COMPETITION_MAX_LOOKUPS=%d; reading the first %d in ticker "
+                "order and leaving the other %d unknown, so their same-title pairs "
+                "are refused this run", len(missing), EVENT_COMPETITION_MAX_LOOKUPS,
+                len(to_read), len(missing) - len(to_read))
+
+    def _read_one(ticker: str) -> tuple[str, Any, BaseException | None]:
+        """One event's read, with its failure kept rather than raised."""
+        try:
+            return ticker, _fetch_event_competition(client, ticker), None
+        except Exception as exc:
+            return ticker, None, exc
+
+    fresh: dict[str, str] = {}
+    if to_read:
+        try:
+            started = time.monotonic()
+            done = 0
+            with ThreadPoolExecutor(
+                    max_workers=min(EVENT_TITLE_FALLBACK_MAX_WORKERS, len(to_read))) as pool:
+                for ticker, label, exc in pool.map(_read_one, to_read):
+                    done += 1
+                    if exc is not None:
+                        # One line, never the SDK's multi-line text (TS-02)
+                        logging.warning(
+                            "Could not read the competition of event %s: HTTP %s %s — "
+                            "its same-title pairs are refused this run", ticker,
+                            getattr(exc, "status", "?"), _exception_summary(exc))
+                    elif not isinstance(label, str):
+                        logging.warning(
+                            "The competition label of event %s is not text — its "
+                            "same-title pairs are refused this run", ticker)
+                    else:
+                        fresh[ticker] = label
+                    if done % 500 == 0:
+                        elapsed = max(time.monotonic() - started, 1e-9)
+                        logging.info("Event competitions: %d/%d read (ETA %s)", done,
+                                     len(to_read),
+                                     _format_duration((len(to_read) - done) / (done / elapsed)))
+        except Exception as exc:  # a pool that cannot start: keep what was read
+            logging.warning("Event competitions: the reads stopped (%s) — the events "
+                            "not read are unknown", _exception_summary(exc))
+
+    if fresh and cache_readable:
+        try:
+            _save_json_cache(_EVENT_COMPETITIONS_CACHE,
+                             {"competitions": {**cached, **fresh}})
+        except Exception as exc:  # the labels are in hand: a failed write costs the cache only
+            logging.warning(
+                "Event competitions: could not save the cached labels (%s) — this run "
+                "still uses the %d it read", _exception_summary(exc), len(fresh))
+    found.update(fresh)
+    logging.info("Event competitions: %d events, %d from the cache, %d read from "
+                 "Kalshi, %d unknown", len(wanted), len(wanted) - len(missing),
+                 len(fresh), len(wanted) - len(found))
+    return found
 
 
 def _signed_raw_get(client: Any, path: str, **params):

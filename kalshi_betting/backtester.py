@@ -34,8 +34,11 @@ Dependencies:
     so the two paths can never disagree about which cross-series pair closes
     at one moment) with close_gap_bound_text (the bound its refusal line
     prints, read from the same scanner binding the gate reads, so the line
-    stays the live one's verbatim twin), and ladder_keys (which ladders a
-    market is on, shared with the live rule), from
+    stays the live one's verbatim twin), ladder_keys (which ladders a
+    market is on, shared with the live rule), and labels_differ and
+    competitions_differ (the single definitions of the same-title sport
+    check, DR-79, so the two paths refuse the same two-sport and
+    two-competition pairs), from
     scanner.py; fee/model helpers
     (fee_leg_exact, fee_per_pair_approx, min_price_diff_for_gap — whose
     spread_min and tier_floors keywords apply this module's bands and
@@ -73,7 +76,11 @@ Dependencies:
     config.*), SETTLED_PREFILTER_CACHE_TAG (the prefilter's version name),
     SHORT_DEADLINE_GAP_DAYS, TIME_SERIES_INTERVAL_PROB_DISCOUNT and
     TIME_SERIES_SAME_EVENT_LADDERS from config.py; fetch_all_settled_markets(),
-    fetch_candlesticks(), and infer_category() from historical.py, plus its
+    fetch_candlesticks(), and infer_category() from historical.py, with
+    series_labels() and load_series_categories() (the filing rule and the
+    /series listing the same-title label check reads, the dashboard's own)
+    and load_event_competitions() (each event's competition label, read and
+    cached for the same-title competition check), plus its
     SettledCorpus (read by TYPE, to take the corpus's provenance) and
     CorpusProvenance (carried out on
     BacktestSweep.corpus_provenance and re-exported to dashboard.py, which
@@ -451,6 +458,9 @@ from .historical import (
     fetch_all_settled_markets,
     fetch_candlesticks,
     infer_category,
+    load_event_competitions,
+    load_series_categories,
+    series_labels,
     series_ticker,
     usable_candle_ask,
 )
@@ -471,10 +481,12 @@ from .scanner import (
     _market_from_dict,
     close_gap_bound_text,
     closes_apart,
+    competitions_differ,
     cumulative_deadline_pair,
     deadline_pair_refusal,
     deadline_profile,
     event_series,
+    labels_differ,
     ladder_keys,
     leg_prices,
     leg_sides,
@@ -5811,14 +5823,16 @@ def _drop_cross_type_duplicates(candidates: list[dict]) -> list[dict]:
 
 def _extract_pairs(
     groups: dict, *, same_event_ladders: bool | None = None,
+    series_categories: dict | None = None,
 ) -> list[tuple[dict, dict, str, object]]:
     """
     Return list of (market_a, market_b, canonical_title, group_key) tuples where
     the two markets have different event_tickers — or, with same-event deadline
     ladders enabled, are two dated cumulative rungs of ONE event — AND are not
     two events of one series worded identically, AND, for a same-title group,
-    close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (DR-74). No
-    price filtering at this stage.
+    close within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other (DR-74) and
+    belong to two series filed under one Kalshi category and first tag
+    (DR-79). No price filtering at this stage.
 
     The one-series rule (DR-02, DR-54) mirrors both live finders through
     _same_series_dicts / _identical_wording_dicts: two events resolving to one
@@ -5842,6 +5856,18 @@ def _extract_pairs(
     twin. The backtest reads REALIZED closes where the live finder reads
     SCHEDULED ones (see CLAUDE.md's DR-74 gotcha for what that difference
     admits and refuses).
+
+    The same-title sport check's label half (DR-79) runs right after the
+    close gate, through the ONE definition scanner.labels_differ: both
+    series must be filed under one Kalshi category and first tag, worked out
+    by historical.series_labels (the filing rule the live run attaches to
+    its markets) from series_categories, once per series. "Kentucky vs
+    Oklahoma: Kentucky wins" is a football game in one series and a women's
+    volleyball match in another, filed Sports · Football and Sports ·
+    Volleyball. Its other half, the competition each event names, is not
+    here: cached markets carry no competition, so _prepare_candidates reads
+    the labels for the pairs this function returns and drops the
+    mismatches in _refuse_other_competitions.
 
     For string-keyed (time-series) groups only, both legs must also be
     CUMULATIVE-deadline markets ("will X happen BY <date>") stating two
@@ -5901,8 +5927,10 @@ def _extract_pairs(
       - a same-title group is swept naively, so each of its pairs is visited
         and is either returned or refused as both markets on one event
         ticker, as two events of one series (DR-02, DR-54), as two markets
-        whose close_time cannot be read or compared, or as two markets
-        closing more than SAME_TITLE_MAX_CLOSE_GAP_SECONDS apart (DR-74);
+        whose close_time cannot be read or compared, as two markets
+        closing more than SAME_TITLE_MAX_CLOSE_GAP_SECONDS apart (DR-74), or
+        as two series filed under different Kalshi categories or tags
+        (DR-79);
       - a time-series group first sets aside its members with no readable
         close_time (counted as MEMBERS, not pairs — no pair involving one is
         ever formed), then splits the pairs of the rest at the sweep's
@@ -5939,7 +5967,8 @@ def _extract_pairs(
     (DR-74's close gate, which came later, is a new check and does refuse
     pairs). The same-title one-series line is the verbatim mirror of
     scanner.find_same_title_pairs', and so is the same-title close-gap line
-    (DR-74) for READABLE closes; the same-title close-time readability line
+    (DR-74) for READABLE closes, and so is the same-title label line (DR-79);
+    the same-title close-time readability line
     has no live twin, because the live finder drops a market without a
     close_time before grouping and so never reaches such a pair (and
     Kalshi's live close strings are all aware) — a naive close beside an
@@ -6025,6 +6054,13 @@ def _extract_pairs(
             that helper lives in config.py and reads config's own global. Has
             no effect on 3-tuple-keyed (same-title) groups, which have no
             deadline concept.
+        series_categories (dict | None): Keyword-only. Kalshi's /series
+            listing (historical.load_series_categories), which files each
+            same-title market's series for the label check. None (the
+            default) or {} files every series by its ticker prefix
+            (historical.series_labels' fallback), so nearly every pair of
+            series is filed alike. Has no effect on string-keyed
+            (time-series) groups.
 
     Returns:
         list[tuple[dict, dict, str, object]]: One (market_a, market_b,
@@ -6034,10 +6070,26 @@ def _extract_pairs(
             on different event_tickers of different event series whose
             wording, for a string-keyed group, states two different cumulative
             deadlines, or whose closes, for a 3-tuple-keyed group, are readable
-            and within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other, and no
-            group holds an admissible ladder.
+            and within SAME_TITLE_MAX_CLOSE_GAP_SECONDS of each other and whose
+            series are filed alike, and no group holds an admissible ladder.
     """
     pairs = []
+    # Each series' (category, tag), worked out once per series for the
+    # same-title label check (DR-79); an empty listing files every series by
+    # its ticker prefix, as historical.series_labels does
+    listing = series_categories or {}
+    labels_by_series: dict[str, tuple[str, str]] = {}
+
+    def _labels(m: dict) -> tuple[str, str]:
+        """The (category, tag) a market's series is filed under."""
+        event = m.get("event_ticker") or ""
+        series = series_ticker(event)
+        if series not in labels_by_series:
+            # Cross-module: the one filing rule the live run attaches to its
+            # markets (main._attach_series_labels) and the dashboard files by
+            labels_by_series[series] = series_labels(event, infer_category(event), listing)
+        return labels_by_series[series]
+
     # Resolved at CALL time, never bound as a def-time default: the constant
     # is what a test monkeypatches and what --same-event-ladders overrides for
     # one run, and a `same_event_ladders: bool = TIME_SERIES_SAME_EVENT_LADDERS`
@@ -6080,6 +6132,9 @@ def _extract_pairs(
     # twin of the live finder's close-gap count.
     st_undated_skips = 0
     st_close_gap_skips = 0
+    # The same-title label check (DR-79), counted after the close gate so the
+    # counts above do not move; the verbatim twin of the live finder's count
+    st_label_skips = 0
     # The two things the time-series sweep drops BEFORE any candidate is
     # visited (M10), so that a zero caused by them has a cause in the log
     # too. ts_undated_members counts MEMBERS (a member without a readable
@@ -6407,6 +6462,13 @@ def _extract_pairs(
                     if closes_apart(*closes):
                         st_close_gap_skips += 1
                         continue
+                    # Mirror of find_same_title_pairs' label check (DR-79),
+                    # through the same scanner.labels_differ: same wording on two
+                    # series closing together is one question only when both
+                    # series are filed under one Kalshi category and tag
+                    if labels_differ(_labels(mA), _labels(mB)):
+                        st_label_skips += 1
+                        continue
                     pair_key = frozenset([mA["ticker"], mB["ticker"]])
                     if pair_key in seen:
                         continue
@@ -6492,6 +6554,13 @@ def _extract_pairs(
             "than %s apart (two different games or instants, not one "
             "question listed twice): %d",
             close_gap_bound_text(), st_close_gap_skips,
+        )
+    if st_label_skips:
+        # Verbatim twin of find_same_title_pairs' label line (DR-79)
+        logging.info(
+            "Same-title candidates refused because the two series are filed under "
+            "different Kalshi categories or tags (two different sports or subjects, "
+            "not one question listed twice): %d", st_label_skips,
         )
     if st_undated_skips:
         # Backtest-only (DR-74): the live finder never reaches a market
@@ -6605,6 +6674,65 @@ def _extract_pairs(
             ladder_pairs,
         )
     return pairs
+
+
+def _refuse_other_competitions(pairs: list, competitions: dict) -> list:
+    """
+    Drop the same-title pairs whose two events name different competitions (DR-79).
+
+    The backtest's twin of the competition check in
+    scanner.find_same_title_pairs, through the same scanner.competitions_differ:
+    two series of one sport share a tag, so a men's and a women's game, or two
+    leagues of one matchup, are told apart by the competition each event names
+    ("College Basketball (M)" and "College Basketball (W)"). One event naming a
+    competition and the other none counts as different. It runs on
+    _extract_pairs' same-title output, because cached markets carry no
+    competition and historical.load_event_competitions reads the labels only
+    for the events those pairs touch. A pair with an event whose label is not
+    known (its read failed, or was not made) is refused on a backtest-only
+    line: live ingest reads every event's label as it lists the markets, and
+    refuses a label it cannot read on the competition line, so this line has
+    no live twin. Each line is silent at zero.
+
+    Args:
+        pairs (list): _extract_pairs' same-title (market_a, market_b,
+            canonical_title, group_key) tuples.
+        competitions (dict): event ticker -> label ("" when the event names
+            none), from load_event_competitions; an event missing from it is
+            unknown.
+
+    Returns:
+        list: The pairs kept, in their order.
+    """
+    kept = []
+    competition_skips = 0
+    unknown_skips = 0
+    for pair in pairs:
+        event_a = pair[0].get("event_ticker") or ""
+        event_b = pair[1].get("event_ticker") or ""
+        if event_a not in competitions or event_b not in competitions:
+            # Fail closed: a label that was never read cannot show one competition
+            unknown_skips += 1
+            continue
+        # Cross-module: the ONE definition the live finder compares labels with
+        if competitions_differ(competitions[event_a], competitions[event_b]):
+            competition_skips += 1
+            continue
+        kept.append(pair)
+    if competition_skips:
+        # Verbatim twin of find_same_title_pairs' competition line
+        logging.info(
+            "Same-title candidates refused because the two events name different "
+            "competitions (two leagues, genders or formats, not one question listed "
+            "twice): %d", competition_skips,
+        )
+    if unknown_skips:
+        # Backtest-only: the live finder reads every event's label at ingest
+        logging.info(
+            "Same-title candidate pairs refused because an event's competition could "
+            "not be read from Kalshi (fail closed): %d", unknown_skips,
+        )
+    return kept
 
 
 # ─── Entry point detection from candlestick data ──────────────────────────────
@@ -8546,6 +8674,8 @@ def _prepare_candidates(
     use_cache: bool,
     max_horizon_days: int | None,
     same_event_ladders: bool | None = None,
+    *,
+    series_categories: dict | None = None,
 ) -> _Candidates | None:
     """
     Run the half of the backtest that depends on neither the band nor k.
@@ -8556,6 +8686,16 @@ def _prepare_candidates(
     traded, not on the spread band or k, so one call can feed an entry pass
     per band through _entries_for_band().
 
+    The same-title sport check (DR-79) runs here as it does live. Its label
+    half is inside the same-title _extract_pairs call, over
+    series_categories; its competition half reads the competition each
+    event of the surviving same-title pairs names
+    (historical.load_event_competitions, cached, through live_client) and
+    drops the mismatches (_refuse_other_competitions) before the "Potential
+    pairs" count, so no candle is fetched for a refused pair. With an empty
+    listing and same-title groups to check, one WARNING says that every
+    series is filed by its ticker prefix, in the words the live run uses.
+
     The corpus (the settled markets the fetch returns, normally streamed off
     disk) is walked TWICE: _index_eligible_keys counts it, prefilters it,
     feeds the census and hashes each eligible record's two grouping keys;
@@ -8565,7 +8705,9 @@ def _prepare_candidates(
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
-        live_client: Client passed through to fetch_all_settled_markets.
+        live_client: Client passed through to fetch_all_settled_markets, and
+            the one the same-title competition labels are read with
+            (historical.load_event_competitions).
         start_date (date): Earliest settlement date to include.
         use_cache (bool): Whether to reuse the disk-cached assembled market list.
         max_horizon_days (int | None): Optional opt-in bet-horizon cap. Not
@@ -8581,6 +8723,12 @@ def _prepare_candidates(
             _entries_for_band() reads it for every _find_entry() call. That is
             load-bearing: the two must agree, or a pair this function proposes
             is replayed under the other rule's ordering.
+        series_categories (dict | None): Keyword-only. Kalshi's /series
+            listing the same-title label check files each series by.
+            backtest.py hands in the copy it reads with the production client
+            (the one the dashboard files trades by). None (the default) reads
+            the cached copy only (historical.load_series_categories(None)),
+            with no request.
 
     Returns:
         _Candidates | None: The candidate pairs (in scan order: time-series,
@@ -8785,6 +8933,19 @@ def _prepare_candidates(
         len(ts_groups), sum(len(v) for v in ts_groups.values()),
         len(same_groups), sum(len(v) for v in same_groups.values()),
     )
+    # The listing the same-title label check files each series by (DR-79).
+    # Cross-module: None reads the cached copy only, making no request
+    if series_categories is None:
+        series_categories = load_series_categories(None)
+    if not series_categories and same_groups:
+        # With no listing every series is filed by its ticker prefix, so
+        # nearly every pair of series is filed alike and only the competition
+        # check tells them apart. The same words as main._attach_series_labels'
+        # WARNING, so a reader learns it on either path
+        logging.warning(
+            "Same-title sport check: no /series listing this run, so every series is "
+            "filed by its ticker prefix and only the competition check tells two "
+            "series apart")
     # The ladder flag rides through unresolved (None included): the two calls
     # here and every _find_entry call of every later entry pass (it is carried
     # on the returned _Candidates) receive the same argument and resolve the
@@ -8793,7 +8954,14 @@ def _prepare_candidates(
     # same-title call takes it too, for signature uniformity — 3-tuple-keyed
     # groups have no deadline concept and the flag is inert there.
     ts_pairs     = _extract_pairs(ts_groups, same_event_ladders=same_event_ladders)
-    same_pairs   = _extract_pairs(same_groups, same_event_ladders=same_event_ladders)
+    same_pairs   = _extract_pairs(same_groups, same_event_ladders=same_event_ladders,
+                                  series_categories=series_categories)
+    # The competition half of the check (DR-79). Cross-module: cached markets
+    # carry no competition, so it is read from Kalshi for these pairs' events
+    # only (one cached read-only GET per new event), then compared
+    competitions = load_event_competitions(
+        live_client, {m.get("event_ticker") for pair in same_pairs for m in pair[:2]})
+    same_pairs   = _refuse_other_competitions(same_pairs, competitions)
     # Release the group maps AND the groupable subset together, before the
     # candlestick pool spawns CANDLESTICK_FETCH_MAX_WORKERS threads rather than
     # at function exit. Nothing below reads any of them — the pair lists carry
@@ -9483,6 +9651,7 @@ def _prepare_entries(
     same_event_ladders: bool | None = None,
     *,
     depth_model: DepthModel | None = None,
+    series_categories: dict | None = None,
 ) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
     """
     Run the half of the backtest that does not depend on the interval discount.
@@ -9497,7 +9666,9 @@ def _prepare_entries(
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
-        live_client: Client passed through to fetch_all_settled_markets.
+        live_client: Client passed through to fetch_all_settled_markets
+            and to the same-title competition reads
+            (historical.load_event_competitions).
         start_date (date): Earliest settlement date to include.
         use_cache (bool): Whether to reuse the disk-cached assembled market list.
         max_horizon_days (int | None): Optional opt-in bet-horizon cap mirroring
@@ -9519,6 +9690,10 @@ def _prepare_entries(
         depth_model (DepthModel | None): Keyword-only. The depth model the
             entries' quotes carry, so their trades walk synthetic books; None
             (default) fills every trade at the top of the book.
+        series_categories (dict | None): Keyword-only. Kalshi's /series
+            listing, handed straight to _prepare_candidates() for the
+            same-title label check (DR-79); None (default) reads the cached
+            copy there.
 
     Returns:
         tuple[list[dict] | None, OutcomeLabelCoverage | None]: The prepared
@@ -9558,7 +9733,7 @@ def _prepare_entries(
     # pre-check failed and nothing was fetched — so no census either.
     candidates = _prepare_candidates(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
-        same_event_ladders=same_event_ladders,
+        same_event_ladders=same_event_ladders, series_categories=series_categories,
     )
     if candidates is None:
         return None, None
@@ -11551,6 +11726,8 @@ def run_backtest(
     initial_balance: float = 10_000.0,
     use_cache: bool = True,
     max_horizon_days: int | None = None,
+    *,
+    series_categories: dict | None = None,
 ) -> tuple[list[BacktestTrade], pd.DataFrame]:
     """
     Replay both pair strategies on all settled Kalshi markets from start_date.
@@ -11590,7 +11767,9 @@ def run_backtest(
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
-        live_client: Client passed through to fetch_all_settled_markets.
+        live_client: Client passed through to fetch_all_settled_markets
+            and to the same-title competition reads
+            (historical.load_event_competitions).
         start_date (date): Earliest settlement date to include.
         initial_balance (float): Simulated starting cash balance in dollars.
         use_cache (bool): Whether to reuse the disk-cached assembled market list.
@@ -11600,6 +11779,10 @@ def run_backtest(
             checkpoint, a pair can only enter if the later-closing leg
             closes within max_horizon_days of THAT checkpoint. None (default)
             applies no cap. Passed straight through to _find_entry().
+        series_categories (dict | None): Keyword-only. Kalshi's /series
+            listing for the same-title label check (DR-79), handed through
+            _prepare_entries() to _prepare_candidates(); None (default)
+            reads the cached copy there.
 
     Returns:
         tuple[list[BacktestTrade], pd.DataFrame]: (trades, equity_df).
@@ -11639,8 +11822,8 @@ def run_backtest(
     # this entry point returns the historical two-tuple and feeds no dashboard,
     # so it is discarded here — the census has already logged itself.
     #
-    # No same_event_ladders argument, deliberately: this function keeps its
-    # exact pre-DR-73 signature for every existing caller, and omitting the
+    # No same_event_ladders argument, deliberately: this function takes no
+    # ladder parameter (every existing caller passes none), and omitting the
     # keyword leaves _prepare_entries' None sentinel to resolve this module's
     # TIME_SERIES_SAME_EVENT_LADDERS (bound from config at import) at call
     # time — the value the live finder uses. A harness that wants ladders on or
@@ -11648,8 +11831,10 @@ def run_backtest(
     # backtester.TIME_SERIES_SAME_EVENT_LADDERS, not the config attribute, which
     # this module never reads; the supported lever is
     # run_backtest_sweep(same_event_ladders=...), which needs no patching.
+    # The /series listing rides through for the same-title label check (DR-79)
     raw_entries, _ = _prepare_entries(
-        hist_client, live_client, start_date, use_cache, max_horizon_days
+        hist_client, live_client, start_date, use_cache, max_horizon_days,
+        series_categories=series_categories,
     )
     if raw_entries is None:
         # Same empty-result shape the zero-trade path produces, so backtest.py
@@ -12853,6 +13038,7 @@ def run_backtest_sweep(
     depth_model: DepthModel | None = None,
     trim_sweep: bool = False,
     trim_rise_sweep: bool = False,
+    series_categories: dict | None = None,
 ) -> BacktestSweep:
     """
     Replay both pair strategies at one interval discount, or at a grid of them —
@@ -12946,7 +13132,9 @@ def run_backtest_sweep(
 
     Args:
         hist_client (Any): Signed client for the historical archive/live endpoints.
-        live_client: Client passed through to fetch_all_settled_markets.
+        live_client: Client passed through to fetch_all_settled_markets
+            and to the same-title competition reads
+            (historical.load_event_competitions).
         start_date (date): Earliest settlement date to include.
         initial_balance (float): Simulated starting cash balance in dollars.
         use_cache (bool): Whether to reuse the disk-cached assembled market list.
@@ -13041,6 +13229,11 @@ def run_backtest_sweep(
             (depth_model.load_depth_model()); None (default) fills every trade
             at the top of the book. Recorded on BacktestSweep.depth_model and
             named on one log line.
+        series_categories (dict | None): Keyword-only. Kalshi's /series
+            listing the same-title label check files each series by (DR-79),
+            handed straight to _prepare_candidates(); backtest.py passes the
+            copy the dashboard files trades by. None (default) reads the
+            cached copy there.
 
     Returns:
         BacktestSweep: primary (the effective-discount, primary-band result),
@@ -13255,10 +13448,11 @@ def run_backtest_sweep(
     # The band- and k-independent half — one fetch, one pairing, one candle
     # fetch, reused by every band and every point below. None means the
     # feasibility pre-check failed. The ladder flag rides through unresolved
-    # and is carried on the result to every entry pass (DR-73c).
+    # and is carried on the result to every entry pass (DR-73c), and the
+    # /series listing to the same-title label check (DR-79).
     candidates = _prepare_candidates(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
-        same_event_ladders=same_event_ladders,
+        same_event_ladders=same_event_ladders, series_categories=series_categories,
     )
     if candidates is None:
         # Nothing can be simulated at any discount or band. Build the empty

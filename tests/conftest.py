@@ -4,15 +4,21 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Suite-wide pytest fixtures and two helpers. Eight autouse guards
-    (_isolate_event_title_accumulator, _isolate_treasury_rates,
+    Suite-wide pytest fixtures and two helpers. Nine autouse guards
+    (_offline_event_competitions_for_the_session,
+    _isolate_event_title_accumulator, _isolate_treasury_rates,
     _fresh_order_write_pacer, _fresh_v2_mapping_disproof_state,
     _isolate_live_defaults_for_the_session, _isolate_live_defaults,
     _isolate_live_runs and _isolate_live_dashboard, in the order described
-    here): one points
-    the event-title accumulator and Kalshi's cached /series listing at a
+    here): one answers every event-competition read with "" (an event naming
+    no competition) and points the competition cache and Kalshi's cached
+    /series listing at an empty session directory, in force during class
+    setup too, so no test reaches Kalshi for a label and no class-scoped
+    backtest reads the operator's listing; one points
+    the event-title accumulator, Kalshi's cached /series listing and the
+    event-competition cache at a
     per-test tmp_path, so no test can touch the operator's real event-title
-    accumulators or series_categories.json; one keeps every test off the
+    accumulators, series_categories.json or event_competitions.json; one keeps every test off the
     Treasury API and the real rates cache; one gives every test a full,
     fresh order-write pacer, so no test waits on writes an earlier test made;
     one clears trader's disproven-mapping latch and its record of unchecked
@@ -38,7 +44,8 @@ Purpose:
     the live defaults, for a test that needs a saved file.
 
 Dependencies:
-    Imports kalshi_betting.historical (the three cache paths),
+    Imports kalshi_betting.historical (the four cache paths, and
+    _fetch_event_competition, which the session guard replaces),
     kalshi_betting.treasury (its _RATES_CACHE path and _get_json),
     kalshi_betting.trader (its _WritePacer, _ORDER_WRITE_PACER,
     _V2_NO_MAPPING_DISPROVEN, _V2_UNCHECKED_NO_LEGS and
@@ -69,21 +76,62 @@ Notes:
     same two names to the same tmp_path and returns the v2 path.
 
     A test that needs a /series listing seeds historical._SERIES_CATEGORIES_CACHE
-    (its tmp_path) itself.
+    (its tmp_path) itself, or hands the listing in. A test of the
+    event-competition read replaces historical._fetch_event_competition with
+    its own monkeypatch, or puts back the real reader (taken at import, as
+    test_historical.py's _REAL_FETCH_EVENT_COMPETITION) and patches
+    historical._historical_get beneath it; patching _historical_get alone
+    changes nothing, since the session stub never calls it. The session stub
+    returns once the test's monkeypatch is undone.
 """
 import pytest
 
 from kalshi_betting import backtest, backtester, config, historical, reporter, trader, treasury
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _offline_event_competitions_for_the_session(tmp_path_factory):
+    """
+    Answer every event-competition read with "" and keep the label caches off the checkout.
+
+    The backtest reads each same-title pair's events' competition labels from
+    Kalshi (historical.load_event_competitions, through
+    _fetch_event_competition) and files each series by the cached /series
+    listing. Session-scoped, like the saved live defaults' redirect below,
+    because the backtester's class-scoped sweep fixtures run whole backtests
+    before any function-scoped fixture is active. The stub answers "" (an
+    event that names no competition), so every existing same-title fixture
+    keeps pairing exactly as before; a test of the read itself replaces it.
+    The two caches point at an empty session directory, so class setup never
+    reads the operator's series_categories.json or writes an
+    event_competitions.json into the checkout; each test body sees its own
+    tmp_path (the redirect below).
+
+    Args:
+        tmp_path_factory (pytest.TempPathFactory): pytest's session-wide
+            temporary-directory maker.
+
+    Yields:
+        None: The stub and the redirect hold until the session ends.
+    """
+    mp = pytest.MonkeyPatch()
+    folder = tmp_path_factory.mktemp("label-caches")
+    mp.setattr(historical, "_EVENT_COMPETITIONS_CACHE", folder / "event_competitions.json")
+    mp.setattr(historical, "_SERIES_CATEGORIES_CACHE", folder / "series_categories.json")
+    mp.setattr(historical, "_fetch_event_competition", lambda client, event_ticker: "")
+    yield
+    mp.undo()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_event_title_accumulator(tmp_path, monkeypatch):
     """
-    Redirect both event-title accumulator paths and the /series listing to tmp_path.
+    Redirect both event-title accumulator paths, the /series listing and the
+    event-competition cache to tmp_path.
 
     Args:
         tmp_path (Path): pytest's per-test temporary directory.
-        monkeypatch (pytest.MonkeyPatch): Restores the real paths afterwards.
+        monkeypatch (pytest.MonkeyPatch): Restores the session paths afterwards.
     """
     monkeypatch.setattr(historical, "_EVENT_TITLES_CACHE",
                         tmp_path / "event_titles_v2.json")
@@ -91,6 +139,8 @@ def _isolate_event_title_accumulator(tmp_path, monkeypatch):
                         tmp_path / "event_titles.json")
     monkeypatch.setattr(historical, "_SERIES_CATEGORIES_CACHE",
                         tmp_path / "series_categories.json")
+    monkeypatch.setattr(historical, "_EVENT_COMPETITIONS_CACHE",
+                        tmp_path / "event_competitions.json")
 
 
 def apply_pre_toggle_defaults(mp) -> None:

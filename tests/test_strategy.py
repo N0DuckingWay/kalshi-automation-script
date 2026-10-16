@@ -17,7 +17,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kalshi_betting import backtester, config, dashboard, main, scanner, strategy, trader
+from kalshi_betting import (
+    backtester,
+    config,
+    dashboard,
+    historical,
+    main,
+    scanner,
+    strategy,
+    trader,
+)
 from kalshi_betting.config import (
     SAME_TITLE_CO_RESOLVE_PROB,
     LiveSettings,
@@ -2533,6 +2542,100 @@ class TestTimeSeriesKellyParity:
         # verbatim twins under a patched bound.
         assert _function_calls(scanner, "find_same_title_pairs", "close_gap_bound_text")
         assert _function_calls(backtester, "_extract_pairs", "close_gap_bound_text")
+
+    def test_ast_both_same_title_readers_apply_the_sport_check(self):
+        # DR-79: identical wording on two series that close together is one
+        # question only when both series are filed alike and both events name
+        # one competition. The finder and held_pair_kind (which live trimming
+        # reads) are the two live readers of the same-title rules; leaving
+        # held_pair_kind out would let a trim price a held football/volleyball
+        # pair on the same-title chance of paying
+        for reader in ("find_same_title_pairs", "held_pair_kind"):
+            assert _function_calls(scanner, reader, "_labels_differ"), reader
+            assert _function_calls(scanner, reader, "_competitions_differ"), reader
+        # Each live reader goes through the one definition
+        assert _function_calls(scanner, "_labels_differ", "labels_differ")
+        assert _function_calls(scanner, "_competitions_differ", "competitions_differ")
+        # Never on the time-series finder: identical wording is never a
+        # time-series pair (DR-67), and two rungs of one question are filed alike
+        for callee in ("_labels_differ", "labels_differ", "_competitions_differ",
+                       "competitions_differ"):
+            assert not _function_calls(scanner, "find_time_series_pairs", callee), callee
+        # Ingest reads each event's competition through the one reader
+        assert _function_calls(scanner, "fetch_open_events_with_markets", "event_competition")
+
+    def test_ast_both_run_modes_file_every_market_before_they_pair(self):
+        # The labels the sport check compares are attached once per run, from
+        # the one filing rule, before the finders, and in production before the
+        # sale block too (seller.plan_trims reads them through held_pair_kind)
+        assert _function_calls(main, "_attach_series_labels", "series_labels")
+        tree = ast.parse(inspect.getsource(main))
+        for mode, before in (("_run_prod", ("plan_trims", "find_time_series_pairs",
+                                            "find_same_title_pairs", "_filter_by_category")),
+                             ("_run_dev", ("find_time_series_pairs", "find_same_title_pairs",
+                                           "_filter_by_category"))):
+            func = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == mode)
+            [read] = _calls_to(func, "load_series_categories")
+            [attach] = _calls_to(func, "_attach_series_labels")
+            # The listing just read, handed to the attach
+            assert [ast.unparse(arg) for arg in attach.args] == [
+                "markets", "series_categories"], mode
+            assert read.lineno < attach.lineno, mode
+            for callee in before:
+                calls = _calls_to(func, callee)
+                assert calls, (mode, callee)
+                assert all(attach.lineno < call.lineno for call in calls), (mode, callee)
+            # The filter is handed that same listing, never reads its own
+            [category_filter] = _calls_to(func, "_filter_by_category")
+            assert [ast.unparse(k.value) for k in category_filter.keywords
+                    if k.arg == "series_categories"] == ["series_categories"], mode
+        # Dev reads the cached copy only: the sandbox key never signs a
+        # production request
+        dev = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                   and node.name == "_run_dev")
+        [dev_read] = _calls_to(dev, "load_series_categories")
+        assert ast.unparse(dev_read) == "load_series_categories(None)"
+
+    def test_ast_the_backtest_applies_the_sport_check(self):
+        # DR-79's backtest half, through the definitions the live finder uses:
+        # the label half inside _extract_pairs' same-title branch, right after
+        # the close gate, over historical.series_labels' filing
+        tree = ast.parse(inspect.getsource(backtester))
+        extract = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                       and node.name == "_extract_pairs")
+        assert _function_calls(backtester, "_extract_pairs", "series_labels")
+        [labels] = _calls_to(extract, "labels_differ")
+        [closes] = _calls_to(extract, "closes_apart")
+        assert closes.lineno < labels.lineno
+        # The competition half, on the extracted same-title pairs
+        assert _function_calls(backtester, "_refuse_other_competitions", "competitions_differ")
+        prepare = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                       and node.name == "_prepare_candidates")
+        [read] = _calls_to(prepare, "load_event_competitions")
+        [refuse] = _calls_to(prepare, "_refuse_other_competitions")
+        [candles] = _calls_to(prepare, "_fetch_candles_parallel")
+        extracts = _calls_to(prepare, "_extract_pairs")
+        # Read after both extractions, refused before any candle is fetched
+        assert all(call.lineno < read.lineno for call in extracts)
+        assert read.lineno < refuse.lineno < candles.lineno
+        # The same-title extraction is handed the listing; the time-series one
+        # needs none (identical wording is never a time-series pair, DR-67)
+        handed = [[ast.unparse(k.value) for k in call.keywords if k.arg == "series_categories"]
+                  for call in extracts]
+        assert sorted(handed) == [[], ["series_categories"]]
+        # The labels are read as live ingest reads them
+        assert _function_calls(historical, "load_event_competitions",
+                               "_fetch_event_competition")
+        assert _function_calls(historical, "_fetch_event_competition", "event_competition")
+        # Every entry point hands its listing on to _prepare_candidates
+        for entry in ("run_backtest_sweep", "_prepare_entries"):
+            assert [ast.unparse(v) for v in _keyword_values(
+                backtester, entry, "_prepare_candidates", "series_categories")] == [
+                "series_categories"], entry
+        assert [ast.unparse(v) for v in _keyword_values(
+            backtester, "run_backtest", "_prepare_entries", "series_categories")] == [
+            "series_categories"]
 
     def test_ast_backtest_band_reaches_find_entry_through_config(self):
         # The backtest band's halves each have ONE home in config: the band is

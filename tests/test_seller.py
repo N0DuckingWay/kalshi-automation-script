@@ -1071,6 +1071,9 @@ class _TrimCase:
                              subtitle="Team A")
             market_b = _rung(_B, _EV_B, "", _B_CLOSE, title="Who wins the game?",
                              subtitle="Team A")
+            # Both series filed alike, as a run files its markets before it
+            # trims (main._attach_series_labels)
+            market_a._series_labels = market_b._series_labels = ("Sports", "Football")
         candles_a = [_candle(_FIRST, *(a_then or a_now)), _candle(_CK, *a_now)]
         candles_b = [_candle(_FIRST, *(b_then or b_now)), _candle(_CK, *b_now)]
         # The backtest: one trade, each market's quotes from its candles
