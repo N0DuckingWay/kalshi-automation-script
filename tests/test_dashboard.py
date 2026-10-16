@@ -6172,6 +6172,8 @@ class TestFilterScript:
                     elif key in trace:
                         assert got[key] == trace[key], (cid, i, key)
         kpis = dict(re.findall(r'<div id="kpi-([a-z_]+)" style="[^"]*">(.*?)</div>', page))
+        # And the line under the k-hat card, which carries a hover text
+        kpis["khat_note"] = _ci_note(page)[0]
         assert {k[4:]: v for k, v in snap["text"].items() if k.startswith("kpi-")} == kpis
         assert snap["text"]["hdr-trades"] == "5"
         assert html.escape(snap["text"]["flt-summary"]) in page
@@ -6423,6 +6425,9 @@ class TestFilterScript:
         assert off_all["cells"][4] != on_all["cells"][4]
         assert snaps["off"]["text"]["kpi-khat"] == off_all["cells"][4]
         assert snaps["off"]["text"]["kpi-khat_delta"] == off_all["delta"][1][0]
+        # The line under it: the tier-off group's confidence interval
+        assert off_all["ci"] != on_all["ci"]
+        assert snaps["off"]["text"]["kpi-khat_note"] == off_all["ci"]
 
     def test_with_the_tiers_off_a_slice_and_another_band_read_as_python_words_them(
             self, monkeypatch, tmp_path):
@@ -6548,13 +6553,14 @@ class TestFilterScript:
                         assert got[key] == trace[key], (cid, i, key)
         kpis = dict(re.findall(r'<div id="kpi-([a-z_]+)" style="[^"]*">(.*?)</div>',
                                python_page))
-        khat = {"khat", "khat_delta"}
+        khat = {"khat", "khat_delta", "khat_note"}
         shown = {k[4:]: v for k, v in snap["text"].items() if k.startswith("kpi-")}
         assert {k: v for k, v in shown.items() if k not in khat and not k.startswith("kd_")} \
             == {k: v for k, v in kpis.items() if k not in khat and not k.startswith("kd_")}
         off_all = data["khat_off"][0]["groups"]["all"]
         assert (shown["khat"], shown["khat_delta"]) == (off_all["cells"][4],
                                                         off_all["delta"][1][0])
+        assert shown["khat_note"] == off_all["ci"]
         assert snap["text"]["hdr-trades"] == str(len(off.trades)) == "6"
         assert f'<div id="dec-table">{snap["html"]["dec-table"]}</div>' in python_page
         for part in ("diag-best", "diag-worst"):
@@ -8596,7 +8602,9 @@ class TestKhatBreakdown:
         band = dashboard._khat_band(cal, None, {}, {})
         assert band == {"carried": False, "groups": {"all": {
             "n": 12, "events": None, "rate": 0.25, "implied": 0.5, "k": 0.5,
-            "text": "n=12 · ? ev", "cells": ["12", "—", "0.2500", "0.5000", "0.500"]}}}
+            "text": "n=12 · ? ev", "cells": ["12", "—", "0.2500", "0.5000", "0.500"],
+            # No events to count: no confidence interval
+            "ci": "95% CI: —"}}}
         assert dashboard._khat_band(None, None, {}, {}) is None
 
     def test_the_payload_carries_every_band_in_band_order(self):
@@ -8951,6 +8959,327 @@ class TestKhatCards:
         blank = data["khat_blank"][4]
         assert snap["text"]["kpi-khat"] == snap["text"]["kpi-khat_delta"] == blank
         assert snap["colors"]["kpi-khat"] == data["styles"]["kpi_default"]
+
+
+def _ci_obs(event: str, implied: float, between: bool) -> backtester.CalibrationObservation:
+    """One k-hat observation of an event, for the confidence-interval tests."""
+    return backtester.CalibrationObservation(5, implied, between, event, "Other")
+
+
+def _ci_note(page: str) -> tuple[str, str]:
+    """(text, hover text) of the line under the "Empirical k̂" card as Python
+    rendered it."""
+    m = re.search(r'<div id="kpi-khat_note" title="([^"]*)" style="[^"]*">(.*?)</div>', page)
+    assert m
+    return html.unescape(m.group(2)), html.unescape(m.group(1))
+
+
+class TestKhatConfidenceInterval:
+    """The line under the "Empirical k̂" card: k-hat's confidence interval,
+    counting each event once (_khat_interval), rendered for the primary view
+    and rewritten by the script for every band, category, tag and mix."""
+
+    # Three events, two of them with several rungs: k-hat = 3 / 2.35
+    OBS = (_ci_obs("E1", 0.30, True), _ci_obs("E1", 0.45, True), _ci_obs("E2", 0.20, False),
+           _ci_obs("E3", 0.50, True), _ci_obs("E3", 0.60, False), _ci_obs("E2", 0.30, False))
+
+    @staticmethod
+    def _direct(observations) -> tuple[float, float]:
+        """The interval worked out the long way: each event's residual
+        Y_e − k̂·X_e computed and squared, never from the expanded sums."""
+        events: dict[str, list[float]] = {}
+        for o in observations:
+            e = events.setdefault(o.event_ticker, [0.0, 0.0])
+            e[0] += o.in_between
+            e[1] += o.implied
+        y = sum(e[0] for e in events.values())
+        x = sum(e[1] for e in events.values())
+        k = y / x
+        g = len(events)
+        resid = sum((ye - k * xe) ** 2 for ye, xe in events.values())
+        se = math.sqrt(g / (g - 1) * resid) / x
+        from scipy.stats import t
+        half = t.ppf(0.5 + config.KHAT_CONFIDENCE_LEVEL / 2, g - 1) * se
+        return max(0.0, k - half), k + half
+
+    def test_the_interval_matches_the_residuals_worked_out_directly(self):
+        obs = self.OBS
+        bucket = backtester._calibration_bucket("", 0.0, obs)
+        interval = dashboard._khat_interval(bucket.empirical_k, sum(o.implied for o in obs),
+                                            dashboard._khat_cluster_sums(obs), 3)
+        assert interval == pytest.approx(self._direct(obs), abs=1e-12)
+        # The rungs of E1 settle together: their sums are the event's
+        assert dashboard._khat_cluster_sums(obs) == pytest.approx(
+            [2 ** 2 + 0 + 1, 2 * 0.75 + 0 + 1 * 1.10, 0.75 ** 2 + 0.5 ** 2 + 1.10 ** 2])
+        # A wider set, seeded: still the direct figure, and the text shows it
+        rng = random.Random(7)
+        wide = tuple(_ci_obs(f"E{rng.randint(0, 11)}", rng.uniform(0.05, 0.7),
+                             rng.random() < 0.45) for _ in range(80))
+        stat = dashboard._khat_stat(wide)
+        lo, hi = self._direct(wide)
+        assert stat["ci"] == f"95% CI: {lo:.3f}–{hi:.3f}"
+
+    def test_the_level_comes_from_config(self, monkeypatch):
+        assert config.KHAT_CONFIDENCE_LEVEL == 0.95
+        assert dashboard._KHAT_TEXT["khat_ci"] == "95% CI: {lo}–{hi}"
+        assert dashboard._KHAT_TEXT["khat_ci_blank"] == "95% CI: —"
+        assert "95 times out of 100" in dashboard._KHAT_CI_TITLE
+        assert "95% confidence interval, counting each event once" in \
+            dashboard._KHAT_CARDS_CAPTION
+        from scipy.stats import t
+        assert dashboard._khat_t_quantile(10) == pytest.approx(t.ppf(0.975, 10), abs=1e-15)
+        # The quantile reads the level when called
+        monkeypatch.setattr(dashboard, "KHAT_CONFIDENCE_LEVEL", 0.90)
+        assert dashboard._khat_t_quantile(10) == pytest.approx(t.ppf(0.95, 10), abs=1e-15)
+
+    def test_the_interval_holds_the_true_k_about_95_times_in_100(self):
+        # Ladder-like events: every rung of one event is decided by one draw,
+        # so the rungs settle together, and the share that settles in between
+        # is k times the mid spread on average — the true k is known. Counting
+        # each event once, the 95% interval holds it close to 95% of the time;
+        # counting each entry as its own event, far less often.
+        rng = random.Random(20261016)
+        true_k, events, runs = 0.8, 40, 2000
+        clustered = by_entry = 0
+        for _ in range(runs):
+            rows = []
+            for e in range(events):
+                draw = rng.random()
+                for _ in range(rng.randint(1, 6)):
+                    spread = rng.uniform(0.05, 0.6)
+                    rows.append((e, spread, draw < true_k * spread))
+            obs = [_ci_obs(f"E{e}", s, b) for e, s, b in rows]
+            alone = [_ci_obs(f"N{i}", s, b) for i, (_, s, b) in enumerate(rows)]
+            k = backtester._calibration_bucket("", 0.0, obs).empirical_k
+            gaps = sum(o.implied for o in obs)
+            lo, hi = dashboard._khat_interval(k, gaps, dashboard._khat_cluster_sums(obs), events)
+            clustered += lo <= true_k <= hi
+            lo, hi = dashboard._khat_interval(k, gaps, dashboard._khat_cluster_sums(alone),
+                                              len(alone))
+            by_entry += lo <= true_k <= hi
+        assert 0.92 <= clustered / runs <= 0.98
+        assert by_entry / runs < 0.85
+
+    def test_no_interval_without_two_events_a_khat_or_a_population(self):
+        blank = "95% CI: —"
+        # One event, however many rungs
+        assert dashboard._khat_stat([_ci_obs("E1", 0.3, True), _ci_obs("E1", 0.4, False)])[
+            "ci"] == blank
+        # No positive gap: no k-hat
+        assert dashboard._khat_stat([_ci_obs("E1", 0.0, True), _ci_obs("E2", 0.0, False)])[
+            "ci"] == blank
+        assert dashboard._khat_interval(None, 1.0, [1.0, 1.0, 1.0], 5) is None
+        assert dashboard._khat_interval(1.0, 1.0, [1.0, 1.0, 1.0], None) is None
+        assert dashboard._khat_interval(1.0, 0.0, [1.0, 1.0, 1.0], 5) is None
+        assert dashboard._khat_ci_text(None) == blank
+        # None settled in between: k-hat is 0 and every event's residual is
+        # 0, so the range would have no width — no interval, never "0.000–0.000"
+        none_between = [_ci_obs("E1", 0.3, False), _ci_obs("E1", 0.4, False),
+                        _ci_obs("E2", 0.2, False), _ci_obs("E3", 0.5, False)]
+        stat = dashboard._khat_stat(none_between)
+        assert stat["k"] == 0.0 and stat["events"] == 3
+        assert stat["ci"] == blank
+        assert dashboard._khat_interval(0.0, 1.4, dashboard._khat_cluster_sums(none_between),
+                                        3) is None
+        # A hand-built calibration carries no events to count
+        cal = IntervalCalibration(
+            pooled=IntervalCalibrationBucket("POOLED", 0.0, 12, 0.25, 0.5, 0.5),
+            buckets=[], excluded_premise_violations=0)
+        assert dashboard._calibration_khat_stat(cal)["ci"] == blank
+
+    def test_the_low_end_is_held_at_zero(self):
+        # Two events, one settled in between: a range wider than k-hat itself
+        lo, hi = dashboard._khat_interval(1.0, 1.0, [1.0, 0.5, 0.5], 2)
+        assert lo == 0.0 and hi > 1.0
+        assert dashboard._khat_ci_text((lo, hi)) == f"95% CI: 0.000–{hi:.3f}"
+
+    def test_every_event_sits_in_one_tag_group(self):
+        # A mix's sums are its tags' sums added, which holds only because an
+        # event's category and tag follow from its ticker alone
+        observations = _mix_observations(61)
+        categories, subcats = _mix_axes(_MIX_SERIES)
+        band = dashboard._khat_band(
+            _flt_calibration_of(observations), _MIX_SERIES,
+            {c: i for i, c in enumerate(categories)},
+            {sc: i for i, sc in enumerate(subcats)})
+        tags_of: dict[str, set] = {}
+        for o in observations:
+            tags_of.setdefault(o.event_ticker, set()).add(
+                dashboard._series_labels(o.event_ticker, o.category, _MIX_SERIES))
+        assert all(len(tags) == 1 for tags in tags_of.values())
+        tag_groups = [g for key, g in band["groups"].items() if key.startswith("s")]
+        whole = band["groups"]["all"]
+        assert sum(g["events"] for g in tag_groups) == whole["events"] == len(tags_of)
+        added = [sum(g["ci_raw"][i] for g in tag_groups) for i in range(3)]
+        assert added == pytest.approx(dashboard._khat_cluster_sums(observations), abs=1e-12)
+        # Only tag groups carry the sums the page pools
+        assert all("ci_raw" not in g for key, g in band["groups"].items()
+                   if not key.startswith("s"))
+
+    def test_the_card_carries_the_line_only_when_given(self):
+        trades, curve = _flt_trades(), _flt_sweep().primary.equity_df
+        cards = [("khat", "Empirical k̂", "3.333", "#2196F3"),
+                 ("khat_delta", "k̂ − k (this selection)", "+2.583", "#F44336")]
+        plain = dashboard._section_performance(curve, trades, _FLT_START, 1000.0,
+                                               extra_kpis=cards)
+        assert "_note" not in plain
+        assert dashboard._section_performance(curve, trades, _FLT_START, 1000.0,
+                                              extra_kpis=cards, kpi_notes=None) == plain
+        noted = dashboard._section_performance(
+            curve, trades, _FLT_START, 1000.0, extra_kpis=cards,
+            kpi_notes={"khat": ("95% CI: 0.690–1.160", "A <range>")})
+        assert _ci_note(noted) == ("95% CI: 0.690–1.160", "A <range>")
+        assert noted.replace(dashboard._KPI_NOTE_TEMPLATE.format(
+            note_attr=' id="kpi-khat_note"', title="A &lt;range&gt;",
+            note="95% CI: 0.690–1.160"), "") == plain
+        # A card with no note is the card as it always was
+        assert dashboard._kpi("L", "V", key="x") == (
+            '\n<div style="display:inline-block; margin:12px 16px 12px 0; padding:16px 24px;'
+            '\n            background:#F5F5F5; border-radius:10px; min-width:140px;'
+            '\n            font-family:sans-serif;">'
+            '\n  <div style="font-size:12px; color:#757575; text-transform:uppercase;'
+            '\n              letter-spacing:0.5px;">L</div>'
+            '\n  <div id="kpi-x" style="font-size:26px; font-weight:700; color:#212121;">V</div>'
+            '\n</div>\n')
+
+    def test_the_page_shows_the_primary_group_s_interval(self, monkeypatch, tmp_path):
+        sweep = _flt_sweep()
+        page = TestFilterPage()._page(monkeypatch, tmp_path, sweep)
+        stat = dashboard._khat_stat(sweep.calibration.observations)
+        assert stat["ci"].startswith("95% CI: ") and stat["ci"] != "95% CI: —"
+        assert _ci_note(page) == (stat["ci"], dashboard._KHAT_CI_TITLE)
+        data = TestFilterPage._data(page)
+        assert data["khat"][data["primary"][0]]["groups"]["all"]["ci"] == stat["ci"]
+        # The quantiles the script looks up: one per degree of freedom it can meet
+        from scipy.stats import t
+        events = stat["events"]
+        assert data["khat_t"][0] is None and len(data["khat_t"]) == events
+        assert data["khat_t"][1:] == [float(t.ppf(0.975, d)) for d in range(1, events)]
+
+    def test_no_calibration_shows_the_blank_line(self, monkeypatch, tmp_path):
+        sweep = dataclasses.replace(_flt_sweep(), calibration=None, calibrations_by_band={})
+        page = TestFilterPage()._page(monkeypatch, tmp_path, sweep)
+        assert _ci_note(page)[0] == "95% CI: —"
+
+    # ─── The script over the line ────────────────────────────────────────────
+
+    def test_the_line_follows_the_band_and_category(self, monkeypatch, tmp_path):
+        page = _kc_page(monkeypatch, tmp_path)
+        data = TestFilterPage._data(page)
+        sports = data["categories"].index("Sports")
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], _tick_category(str(sports)), ["settle"], ["snap", "cat"],
+            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "band"],
+            ["set", "flt-band", "0"], ["fire", "flt-band"], ["settle"],
+            _tick_category(""), ["settle"], ["snap", "back"]], strict=True)
+        assert snaps["cat"]["text"]["kpi-khat_note"] == \
+            data["khat"][0]["groups"][f"c{sports}"]["ci"]
+        # A band with no k-hat population: the blank line
+        assert data["khat"][1] is None
+        assert snaps["band"]["text"]["kpi-khat_note"] == data["text"]["khat_ci_blank"]
+        assert snaps["back"]["text"]["kpi-khat_note"] == _ci_note(page)[0]
+
+    def test_a_tag_a_category_and_a_mix_show_python_s_own_figure(self, monkeypatch, tmp_path):
+        observations = _mix_observations(61)
+        trades = _mix_trades(61, n=44)
+        page = _mix_page(monkeypatch, tmp_path, trades, observations=observations)
+        data = TestFilterPage._data(page)
+        cat0 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat0"]
+        cases = {"mix": ([0, 1], [cat0[0], cat0[2]]), "two_whole": ([1, 2], []),
+                 "category": ([2], []), "tag": ([0], [cat0[1]])}
+        steps = [["wait"]]
+        for name, (cats, tags) in cases.items():
+            steps += _mix_tick_steps(cats, tags, name)
+        # Every selection with a trade worked out as a mix by the script
+        snaps = _run_script(tmp_path, page, steps, strict=True, setup_js=_FORCE_MIX)
+        groups = data["khat"][0]["groups"]
+        assert snaps["category"]["text"]["kpi-khat_note"] == groups["c2"]["ci"]
+        assert snaps["tag"]["text"]["kpi-khat_note"] == groups[f"s{cat0[1]}"]["ci"]
+        for name, (cats, tags) in cases.items():
+            keeps = _mix_kept(cats, tags)
+            joined = [o for o in observations if keeps(*dashboard._series_labels(
+                o.event_ticker, o.category, _MIX_SERIES))]
+            expected = dashboard._khat_stat(joined)["ci"]
+            assert expected != data["text"]["khat_ci_blank"], name
+            assert snaps[name]["text"]["kpi-khat_note"] == expected, name
+
+
+    def test_a_mix_where_none_settled_in_between_shows_the_blank_line(
+            self, monkeypatch, tmp_path):
+        # Cat0 and Cat1 events never settle in between, so a mix of their tags
+        # has k-hat 0 and no range; Cat2's do, so the whole population has one
+        def series(o):
+            return _MIX_SERIES[o.event_ticker.split("-")[0]][0]
+        observations = tuple(
+            dataclasses.replace(o, in_between=False) if series(o) != "Cat2" else o
+            for o in _mix_observations(61))
+        page = _mix_page(monkeypatch, tmp_path, _mix_trades(61, n=44),
+                         observations=observations)
+        data = TestFilterPage._data(page)
+        blank = data["text"]["khat_ci_blank"]
+        cat0 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat0"]
+        cases = {"mix": ([0, 1], [cat0[0], cat0[2]]), "zero": ([0, 1], []),
+                 "two": ([1, 2], [])}
+        steps = [["wait"]]
+        for name, (cats, tags) in cases.items():
+            steps += _mix_tick_steps(cats, tags, name)
+        snaps = _run_script(tmp_path, page, steps, strict=True, setup_js=_FORCE_MIX)
+        for name in ("mix", "zero"):
+            assert snaps[name]["text"]["kpi-khat"] == "0.000", name
+            assert snaps[name]["text"]["kpi-khat_note"] == blank, name
+        # A mix with Cat2 in it still has a range, Python's own
+        keeps = _mix_kept(*cases["two"])
+        joined = [o for o in observations if keeps(*dashboard._series_labels(
+            o.event_ticker, o.category, _MIX_SERIES))]
+        expected = dashboard._khat_stat(joined)["ci"]
+        assert expected != blank
+        assert snaps["two"]["text"]["kpi-khat_note"] == expected
+
+    def test_a_mix_pooling_a_tag_without_its_sums_shows_the_blank_line(
+            self, monkeypatch, tmp_path):
+        # A tag group the page carries without its per-event sums: a mix that
+        # pools it would leave its events out of the range, so it shows none
+        observations = _mix_observations(61)
+        cat0 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat0"]
+        dropped = f"s{cat0[0]}"
+        band_of = dashboard._khat_band
+
+        def without_sums(*args, **kwargs):
+            band = band_of(*args, **kwargs)
+            if band is not None and dropped in band["groups"]:
+                del band["groups"][dropped]["ci_raw"]
+            return band
+
+        monkeypatch.setattr(dashboard, "_khat_band", without_sums)
+        page = _mix_page(monkeypatch, tmp_path, _mix_trades(61, n=44),
+                         observations=observations)
+        data = TestFilterPage._data(page)
+        groups = data["khat"][0]["groups"]
+        assert "ci_raw" not in groups[dropped] and "ci_raw" in groups[f"s{cat0[1]}"]
+        cases = {"with": ([0, 1], [cat0[0], cat0[2]]), "without": ([0, 1], [cat0[1], cat0[2]])}
+        steps = [["wait"]]
+        for name, (cats, tags) in cases.items():
+            steps += _mix_tick_steps(cats, tags, name)
+        snaps = _run_script(tmp_path, page, steps, strict=True, setup_js=_FORCE_MIX)
+        assert snaps["with"]["text"]["kpi-khat_note"] == data["text"]["khat_ci_blank"]
+        # k-hat itself still pools every tag
+        keeps = _mix_kept(*cases["with"])
+        joined = [o for o in observations if keeps(*dashboard._series_labels(
+            o.event_ticker, o.category, _MIX_SERIES))]
+        assert snaps["with"]["text"]["kpi-khat"] == dashboard._khat_stat(joined)["cells"][4]
+        keeps = _mix_kept(*cases["without"])
+        joined = [o for o in observations if keeps(*dashboard._series_labels(
+            o.event_ticker, o.category, _MIX_SERIES))]
+        expected = dashboard._khat_stat(joined)["ci"]
+        assert expected != data["text"]["khat_ci_blank"]
+        assert snaps["without"]["text"]["kpi-khat_note"] == expected
+
+
+def _flt_calibration_of(observations: tuple) -> IntervalCalibration:
+    """A calibration carrying exactly these observations."""
+    return IntervalCalibration(pooled=backtester._calibration_bucket("POOLED", 0.0, observations),
+                               buckets=[], excluded_premise_violations=0,
+                               observations=observations)
 
 
 class TestIntervalDiscountFollowsTheBar:

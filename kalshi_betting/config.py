@@ -1968,6 +1968,12 @@ TREASURY_API_MAX_PAGES: int = 20
 # $0.00000001 on $10,000, far below any real day's move and far above the
 # float noise the equity curve can carry (~1e-16 of the balance).
 FLAT_RETURN_TOLERANCE: float = 1e-12
+# The confidence level of the range shown under the backtest dashboard's
+# "Empirical k̂" card (dashboard._khat_interval): 0.95 is a 95% interval. The
+# card's label, its hover text and the Student-t quantile it uses are all
+# built from this one number. Reporting only: nothing sizes, prices or trades
+# on it.
+KHAT_CONFIDENCE_LEVEL: float = 0.95
 
 # Number of worker threads used by trader.py for both of its pools: the
 # pre-execution order-book re-checks (pre_execution_check) and the per-pair
