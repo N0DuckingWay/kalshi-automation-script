@@ -831,6 +831,24 @@ EDA_LIFETIME_EDGES_HOURS = (1, 6, 24, 72, 168, 720)
 # first edge is 0, so the first bucket holds the markets settled BEFORE their
 # listed close (an event decided early).
 EDA_LAG_EDGES_HOURS = (0, 1, 6, 24, 72, 168)
+# Width, in dollars, of the price bins of the calibration chart: a market's
+# midpoint price a set time before close is filed in the bin that holds it,
+# and each bin reports how many markets it holds and how many settled Yes.
+EDA_CALIBRATION_BIN = 0.05
+# How many hours before a market's close its price is read for the calibration
+# chart: the last hourly candle that ended at or before close minus this.
+EDA_PRICE_LEADS_HOURS = (1, 24, 168)
+# A candle price counts for a lead only when its candle ended no more than this
+# many hours before the moment the lead names (close minus the lead); an older
+# last candle gives no price at that lead (the market had gone quiet).
+EDA_PRICE_MAX_AGE_HOURS = 24
+# Bump when the per-file candle facts (<cache>/eda_days/candles.json) change
+# shape: only the candle files are read again, never the day slices.
+EDA_CANDLE_FACTS_VERSION = 1
+# Width, in dollars, of the mid-spread bins of the k view: a deadline pair's
+# mid spread at entry is filed in the bin that holds it, and each bin reports
+# how often such pairs settled in between.
+EDA_KHAT_SPREAD_BIN = 0.05
 
 # A build folder under DASHBOARD_FILES_DIRNAME still marked as being written
 # (its ".writing" file) is left alone while the mark is younger than this many

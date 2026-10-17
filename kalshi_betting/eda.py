@@ -34,18 +34,41 @@ Purpose:
     with infer_category as the fallback) from the listing it is handed, so a
     new listing re-files every summary without reading a slice again.
 
+    Three more readers sit beside the day-slice counts. summarise_candles()
+    reads the hourly candle files under backtest_cache/candlesticks/ and, for
+    the markets merge() joined to a result, works out each market's YES ask
+    (and, where both sides are usable, its midpoint) 1 hour, 24 hours and 7
+    days (config.EDA_PRICE_LEADS_HOURS) before it closed; it files those prices
+    into price bins per category (the reliability chart and the
+    favourite-longshot gap), sums the Brier score per category
+    and the traded volume per category, and counts the candle files by field
+    version, empty and unreadable. inventory() lists everything at the top of
+    the cache folder: size, file count, date range, a plain description, the
+    meta line of each assembled corpus and the depth snapshot count. khat_view()
+    reduces a backtest's k-hat observations to the figures of the k view
+    (mid-spread bins against the realised in-between rate, k-hat with its 95%
+    interval by gap band and by category); save_khat() and load_khat() keep it
+    in <cache>/eda_days/khat.json so a rebuild without a backtest can show it.
+
 Dependencies:
     The standard library, config (EDA_SUMMARY_DIRNAME, EDA_SUMMARY_VERSION,
     EDA_MAX_WORKERS, EDA_WORKER_START_TIMEOUT_SECONDS,
-    EDA_LIFETIME_EDGES_HOURS, EDA_LAG_EDGES_HOURS and
+    EDA_LIFETIME_EDGES_HOURS, EDA_LAG_EDGES_HOURS, EDA_CALIBRATION_BIN,
+    EDA_PRICE_LEADS_HOURS, EDA_PRICE_MAX_AGE_HOURS, EDA_CANDLE_FACTS_VERSION,
+    EDA_KHAT_SPREAD_BIN, KHAT_CONFIDENCE_LEVEL,
+    CANDLESTICK_CACHE_FIELDS_VERSION, DEPTH_SNAPSHOTS_DIRNAME and
     MVE_SERIES_FAMILY_PREFIX), historical (the slice reader _day_store_iter,
     _SliceUnreadable, _iso_epoch, _read_title_file with _TITLE_FILE_ABSENT,
     the file names of _EVENT_TITLES_CACHE and _CANDLES_DIR, series_labels,
-    series_ticker, infer_category) and scanner (event_series,
-    deadline_profile, stated_deadline, DEADLINE_CUMULATIVE). Imports no
-    order-path module (trader, main, scheduler, run_lock, defaults_server,
-    v2_probe, seller), and no module of the package imports this one
-    (tests/test_eda.py::TestIsolation).
+    series_ticker, infer_category, usable_candle_ask) and scanner
+    (event_series, deadline_profile, stated_deadline, DEADLINE_CUMULATIVE).
+    Imports no order-path module (trader, main, scheduler, run_lock,
+    defaults_server, v2_probe, seller), and no module of the package imports
+    this one (tests/test_eda.py::TestIsolation). The one exception to "only
+    the standard library, config, historical and scanner" is khat_view(),
+    which imports backtester and dashboard INSIDE the function, so the
+    worker processes that count the day slices (which import this module
+    afresh) never load pandas or plotly.
 
 Notes:
     Which slice counts which market. The archive phase of a fetch holds only
@@ -103,12 +126,46 @@ Notes:
     `if __name__ == "__main__":`. Workers that do not start (that guard
     missing, or a sandbox refusing new processes) or that die are replaced by
     counting the remaining slices in this process, with one WARNING.
+
+    Candle files. Each is read once and its facts (the YES ask and midpoint at
+    each lead, whether that lead is stale, the traded volume, the field
+    version, whether it is empty) are kept in
+    <cache>/eda_days/candles.json under the file name, with the file's size
+    and modification time, the market close time the leads were worked out
+    from and config.EDA_CANDLE_FACTS_VERSION (its own version, so changing the
+    facts never rebuilds the day-slice summaries); a file whose key no longer
+    matches
+    is read again, and the join with a market's result and category happens
+    after that cache, so a new category listing or result needs no re-read.
+    Only markets that are not combos are calibrated or counted for volume (a
+    combo's price is not what the strategy trades), and the number left out
+    is reported. A candle's "ts" is the END of its hour. A candle price is
+    used only when historical.usable_candle_ask accepts it (an ask of 1.00,
+    or a NO ask at the 0.99 clamp, is no quote). The primary price is the YES
+    ask, what betting Yes costs. The midpoint, halfway between the YES ask and
+    the YES bid (1 minus the NO ask), is a second figure that exists only where
+    both sides are usable: a long shot's YES bid is under a cent, so its NO ask
+    sits at the clamp and it has an ask but no midpoint, which is why the
+    midpoint alone would drop most long shots. The price for a lead must come
+    from a candle that ended within config.EDA_PRICE_MAX_AGE_HOURS before
+    close minus the lead; an older last candle gives no price (counted as
+    stale). The close time used is the market's REALIZED close (the cache
+    records when the market actually closed), so where trading carries on after
+    the outcome is known, the 1 hour price can already reflect the outcome. The
+    candles are those the backtest priced, so they are not a random sample of
+    the markets.
+
+    The cache folder is listed with os.scandir, once for the candle folder
+    and once per top-level entry for inventory(); nothing globs or sorts the
+    candle folder. The candle files are read in this process, one at a time.
 """
 import gzip
 import json
 import logging
+import math
 import multiprocessing
 import os
+import re
 import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
@@ -1221,3 +1278,893 @@ def merge(summaries: list[dict], *, series_categories: dict | None,
         "coverage": _coverage(cutoff, live_days, skipped, gone),
         "unreadable": unreadable,
     }
+
+
+# ─── Candle calibration ───────────────────────────────────────────────────────
+
+# The per-file candle facts and the saved k view live in the summary folder
+# under these names (<cache>/<config.EDA_SUMMARY_DIRNAME>/<name>).
+_CANDLE_CACHE_NAME = "candles.json"
+_KHAT_NAME = "khat.json"
+# Added to a price before it is floored onto the bin grid, so that a price on a
+# bin edge (0.30 / 0.05 is 5.999999999999999) lands in the bin above the edge.
+_BIN_ROUNDING_DIGITS = 9
+
+
+def _bin_count(width: float) -> int:
+    """
+    How many bins of a given width cover the dollar range 0 to 1.
+
+    Args:
+        width (float): The bin width in dollars (for example 0.05).
+
+    Returns:
+        int: round(1 / width), at least 1.
+    """
+    return max(1, round(1.0 / width))
+
+
+def _bin_index(value: float, width: float, count: int) -> int:
+    """
+    The bin a price falls in.
+
+    Args:
+        value (float): The price, in dollars.
+        width (float): The bin width.
+        count (int): How many bins there are.
+
+    Returns:
+        int: floor(value / width), held to 0 .. count - 1 (a price of exactly 1
+            goes in the last bin). The division is rounded to nine decimals
+            first, so a price on a bin edge goes in the bin above it.
+    """
+    return min(count - 1, max(0, math.floor(round(value / width, _BIN_ROUNDING_DIGITS))))
+
+
+def _finite(value: Any) -> float | None:
+    """
+    A number as a float, None when it is not a finite real number.
+
+    Args:
+        value (Any): Anything.
+
+    Returns:
+        float | None: float(value) for an int or float that is finite (a bool
+            is not a number here), otherwise None.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _candle_prices(candle: Any) -> tuple[float | None, float | None]:
+    """
+    The two prices one candle gives: the YES ask, and the midpoint.
+
+    The YES ask is what betting Yes costs. The midpoint is halfway between the
+    YES ask and the YES bid (1 minus the NO ask). Each ask counts only when
+    historical.usable_candle_ask accepts it (strictly between 0 and 1, and a
+    NO ask also below the 0.99 clamp that stands for an empty book). A long
+    shot's YES bid is under a cent, so its NO ask sits at the clamp: it still
+    has a YES ask but no midpoint.
+
+    Args:
+        candle (Any): One candle of a candle file.
+
+    Returns:
+        tuple[float | None, float | None]: (YES ask, midpoint); each None when
+            not usable. A midpoint is never given without a YES ask.
+    """
+    if not isinstance(candle, dict):
+        return None, None
+    yes = historical.usable_candle_ask(candle.get("yes_ask_close"), "yes")
+    if math.isnan(yes):
+        return None, None
+    no = historical.usable_candle_ask(candle.get("no_ask_close"), "no")
+    if math.isnan(no):
+        return yes, None
+    return yes, (yes + (1.0 - no)) / 2.0
+
+
+def _read_candle_file(path: Path, close_epoch: float | None, leads: tuple) -> dict:
+    """
+    Read one candle file and work out everything the page needs from it.
+
+    For each lead, the candle used is the last one whose end "ts" is at or
+    before close - lead; when that candle ended more than
+    config.EDA_PRICE_MAX_AGE_HOURS before that moment the lead is "stale" and
+    has no price.
+
+    Args:
+        path (Path): The candle file (historical.fetch_candlesticks' format:
+            {"open_ts", "close_ts", "period_interval", "fields", "candles"}; a
+            bare list is the oldest format; a file with no "fields" key
+            predates the traded volume and counts as field version 1).
+        close_epoch (float | None): The market's close time in epoch seconds,
+            or None when unknown (then no lead has a price).
+        leads (tuple): Hours before close at which a price is read.
+
+    Returns:
+        dict: "f" (field version: the file's "fields" if a whole number, 1
+            when absent, 0 for anything else), "e" (True when the file holds
+            no candle), "vol" (the traded volume summed over the candles that
+            state one, None when none does), "asks" and "mids" (per lead, the
+            candle's YES ask and midpoint, or None) and "stale" (per lead,
+            True when the last candle at or before the lead's moment is too
+            old to use).
+
+    Raises:
+        Exception: When the file cannot be read or is not a candle file; the
+            caller counts it as unreadable.
+    """
+    data = json.loads(path.read_bytes())
+    if isinstance(data, list):
+        candles, fields = data, 1
+    elif isinstance(data, dict) and isinstance(data.get("candles"), list):
+        candles = data["candles"]
+        raw = data.get("fields", 1)
+        fields = raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
+    else:
+        raise ValueError("not a candle file")
+    targets = [None if close_epoch is None else close_epoch - lead * _SECONDS_PER_HOUR
+               for lead in leads]
+    best_ts: list[float | None] = [None] * len(leads)
+    best: list[Any] = [None] * len(leads)
+    volume = 0.0
+    has_volume = False
+    for candle in candles:
+        if not isinstance(candle, dict):
+            continue
+        number = _finite(candle.get("volume"))
+        if number is not None:
+            volume += number
+            has_volume = True
+        ts = _finite(candle.get("ts"))
+        if ts is None:
+            continue
+        for i, target in enumerate(targets):
+            if target is not None and ts <= target and (best_ts[i] is None or ts >= best_ts[i]):
+                best_ts[i], best[i] = ts, candle
+    max_age = config.EDA_PRICE_MAX_AGE_HOURS * _SECONDS_PER_HOUR
+    stale = [best_ts[i] is not None and best_ts[i] <= targets[i] - max_age
+             for i in range(len(leads))]
+    prices = [(None, None) if stale[i] else _candle_prices(best[i]) for i in range(len(leads))]
+    return {"f": fields, "e": not candles, "vol": volume if has_volume else None,
+            "asks": [p[0] for p in prices], "mids": [p[1] for p in prices], "stale": stale}
+
+
+def _load_candle_cache(path: Path, leads: tuple) -> dict:
+    """
+    The saved per-file candle facts, or nothing when they cannot be trusted.
+
+    Args:
+        path (Path): <cache>/eda_days/candles.json.
+        leads (tuple): The leads the facts must have been worked out for.
+
+    Returns:
+        dict: file name -> facts; empty when the file is absent, damaged, of
+            another config.EDA_CANDLE_FACTS_VERSION or built for other leads
+            or another config.EDA_PRICE_MAX_AGE_HOURS.
+    """
+    try:
+        saved = json.loads(path.read_text())
+        if (saved.get("version") != config.EDA_CANDLE_FACTS_VERSION
+                or saved.get("leads") != list(leads)
+                or saved.get("max_age_hours") != config.EDA_PRICE_MAX_AGE_HOURS
+                or not isinstance(saved.get("files"), dict)):
+            return {}
+        return saved["files"]
+    except Exception:
+        return {}
+
+
+def _write_candle_cache(path: Path, leads: tuple, files: dict) -> None:
+    """
+    Save the per-file candle facts atomically, logging (never raising) a failure.
+
+    Args:
+        path (Path): <cache>/eda_days/candles.json.
+        leads (tuple): The leads the facts were worked out for.
+        files (dict): file name -> facts.
+    """
+    try:
+        _write_summary(path, {"version": config.EDA_CANDLE_FACTS_VERSION, "leads": list(leads),
+                              "max_age_hours": config.EDA_PRICE_MAX_AGE_HOURS, "files": files})
+    except (OSError, ValueError, TypeError) as exc:
+        logging.warning("Data page: the candle summary could not be saved (%s); the candle "
+                        "files are read again next run", _one_line(exc))
+
+
+def _is_int(value: Any) -> bool:
+    """
+    Whether a value is a whole number (a bool is not).
+
+    Args:
+        value (Any): Anything.
+
+    Returns:
+        bool: True for an int that is not a bool.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _price_list(value: Any, count: int) -> bool:
+    """
+    Whether a value is a list of `count` prices, each None or a finite number in (0, 1).
+
+    Args:
+        value (Any): A saved list of prices.
+        count (int): How many leads there are.
+
+    Returns:
+        bool: True when it is well formed.
+    """
+    if not isinstance(value, list) or len(value) != count:
+        return False
+    for item in value:
+        if item is None:
+            continue
+        number = _finite(item)
+        if number is None or not 0.0 < number < 1.0:
+            return False
+    return True
+
+
+def _fact_matches(fact: Any, size: int, mtime_ns: int, close: Any, leads: tuple) -> bool:
+    """
+    Whether a saved per-file fact still describes the file and the close time used.
+
+    A fact is also refused when it is not well formed (a hand-edited or
+    damaged entry), so it is simply read again rather than raising later.
+
+    Args:
+        fact (Any): The saved entry.
+        size (int): The file's size now.
+        mtime_ns (int): Its modification time now.
+        close (Any): The market's close time text now (None when unjoined).
+        leads (tuple): The leads in force.
+
+    Returns:
+        bool: True when size, time, close time and version all match and the
+            entry is well formed: "f" a whole number, "e" a bool, "vol" None
+            or a finite number, "asks" and "mids" lists of one price (None or
+            a finite number in (0, 1)) per lead, "stale" a list of one bool
+            per lead.
+    """
+    if not isinstance(fact, dict):
+        return False
+    if not (fact.get("s") == size and fact.get("m") == mtime_ns and fact.get("c") == close
+            and fact.get("v") == config.EDA_CANDLE_FACTS_VERSION):
+        return False
+    count = len(leads)
+    stale = fact.get("stale")
+    return (_is_int(fact.get("f")) and isinstance(fact.get("e"), bool)
+            and "vol" in fact and (fact["vol"] is None or _finite(fact["vol"]) is not None)
+            and _price_list(fact.get("asks"), count) and _price_list(fact.get("mids"), count)
+            and isinstance(stale, list) and len(stale) == count
+            and all(isinstance(x, bool) for x in stale))
+
+
+def _new_cell(nbins: int) -> dict:
+    """
+    An empty calibration cell.
+
+    Args:
+        nbins (int): How many price bins.
+
+    Returns:
+        dict: {"bins": [[markets, yes], ...], "n": 0, "brier_sum": 0.0}.
+    """
+    return {"bins": [[0, 0] for _ in range(nbins)], "n": 0, "brier_sum": 0.0}
+
+
+def _add_price(cell: dict, price: float, outcome: float, width: float) -> None:
+    """
+    File one market's price and outcome into a calibration cell.
+
+    Args:
+        cell (dict): A _new_cell.
+        price (float): The price, in dollars.
+        outcome (float): 1.0 if the market settled Yes, 0.0 if No.
+        width (float): The bin width.
+    """
+    slot = cell["bins"][_bin_index(price, width, len(cell["bins"]))]
+    slot[0] += 1
+    slot[1] += int(outcome)
+    cell["n"] += 1
+    cell["brier_sum"] += (price - outcome) ** 2
+
+
+def summarise_candles(cache_dir: Path, candles: dict) -> dict:
+    """
+    Calibrate the cached candles against how their markets settled.
+
+    Lists <cache_dir>/candlesticks/ once with os.scandir, reads each file
+    whose saved facts no longer match (or has none), and adds up, per market
+    that merge() joined (`candles`: ticker -> [result, close_time,
+    settlement_ts, category, tag, combo]) and is not a combo, for each lead in
+    config.EDA_PRICE_LEADS_HOURS: the YES ask (the primary price: what betting
+    Yes costs) and the midpoint (only where the NO side is usable too) of the
+    last candle at or before close - lead, used only when it ended within
+    config.EDA_PRICE_MAX_AGE_HOURS of that moment. Each price is filed in a
+    bin of config.EDA_CALIBRATION_BIN dollars with how many of its markets
+    settled Yes, and its Brier sum (price - outcome)^2 is kept, for a market
+    whose result is "yes" or "no". The traded volume per category comes from
+    files at config.CANDLESTICK_CACHE_FIELDS_VERSION only. Every file, joined
+    or not, is counted by field version, and as empty or unreadable. A file
+    that cannot be read is counted and skipped; this never raises for one.
+
+    Args:
+        cache_dir (Path): The cache folder (backtest_cache/).
+        candles (dict): merge()'s "candles" map; the close time is its
+            second entry (an ISO text), the category its fourth, the combo
+            flag its sixth.
+
+    Returns:
+        dict: "leads" (the hours), "bin_width", "bins" (the bin count),
+            "calibration" (str(lead) -> category -> {"ask": cell, "mid": cell},
+            a cell being {"bins": [[markets, yes], ...], "n": markets priced,
+            "brier_sum": float}; a category appears at a lead once one of its
+            markets has an ask there), "coverage" (str(lead) -> {"markets":
+            joined non-combo markets with a yes or no result, "no_ask": of
+            them with no YES ask price at the lead, "no_mid": with no
+            midpoint, "stale": whose last candle was too old}), "volume"
+            (category -> contracts), "volume_files" (files that added to it),
+            "files" (candle files seen), "by_fields" (field version as text,
+            "0" for an odd one -> files), "empty", "unreadable", "unjoined"
+            (files whose ticker no summary joined), "combos_left_out" (joined
+            combos not calibrated), "read" and "reused" (files read now, and
+            kept from the saved facts), and "folder_error" (None, or why the
+            candle folder could not be listed).
+    """
+    cache_dir = Path(cache_dir)
+    leads = tuple(config.EDA_PRICE_LEADS_HOURS)
+    width = config.EDA_CALIBRATION_BIN
+    nbins = _bin_count(width)
+    folder = cache_dir / historical._CANDLES_DIR.name
+    cache_path = cache_dir / config.EDA_SUMMARY_DIRNAME / _CANDLE_CACHE_NAME
+    saved = _load_candle_cache(cache_path, leads)
+    fresh: dict[str, dict] = {}
+    calibration: dict[str, dict[str, dict]] = {str(lead): {} for lead in leads}
+    coverage = {str(lead): {"markets": 0, "no_ask": 0, "no_mid": 0, "stale": 0}
+                for lead in leads}
+    volume: dict[str, float] = {}
+    out = {"leads": list(leads), "bin_width": width, "bins": nbins,
+           "calibration": calibration, "coverage": coverage, "volume": volume,
+           "volume_files": 0, "files": 0, "by_fields": {}, "empty": 0, "unreadable": 0,
+           "unjoined": 0, "combos_left_out": 0, "read": 0, "reused": 0, "folder_error": None}
+    current = config.CANDLESTICK_CACHE_FIELDS_VERSION
+    try:
+        scan = os.scandir(folder)
+    except FileNotFoundError:
+        return out
+    except OSError as exc:
+        out["folder_error"] = f"{folder.name}/: {_one_line(exc)}"
+        return out
+    with scan:
+        for entry in scan:
+            name = entry.name
+            if not name.endswith(_CANDLE_SUFFIX):
+                continue
+            try:
+                if not entry.is_file():
+                    continue
+                st = entry.stat()
+            except OSError:
+                out["files"] += 1
+                out["unreadable"] += 1
+                continue
+            out["files"] += 1
+            info = candles.get(name[: -len(_CANDLE_SUFFIX)])
+            close = info[1] if info and isinstance(info[1], str) else None
+            fact = saved.get(name)
+            if _fact_matches(fact, st.st_size, st.st_mtime_ns, close, leads):
+                out["reused"] += 1
+            else:
+                try:
+                    fact = _read_candle_file(Path(entry.path), historical._iso_epoch(close),
+                                             leads)
+                except Exception:
+                    out["unreadable"] += 1
+                    continue
+                fact.update(s=st.st_size, m=st.st_mtime_ns, c=close,
+                            v=config.EDA_CANDLE_FACTS_VERSION)
+                out["read"] += 1
+            fresh[name] = fact
+            fields_key = str(fact["f"])
+            out["by_fields"][fields_key] = out["by_fields"].get(fields_key, 0) + 1
+            out["empty"] += bool(fact["e"])
+            if info is None:
+                out["unjoined"] += 1
+                continue
+            if info[5]:
+                out["combos_left_out"] += 1
+                continue
+            category = info[3]
+            if fact["f"] == current and fact["vol"] is not None:
+                volume[category] = volume.get(category, 0.0) + fact["vol"]
+                out["volume_files"] += 1
+            outcome = 1.0 if info[0] == "yes" else 0.0 if info[0] == "no" else None
+            if outcome is None:
+                continue
+            for i, lead in enumerate(leads):
+                seen = coverage[str(lead)]
+                seen["markets"] += 1
+                seen["stale"] += bool(fact["stale"][i])
+                ask, mid = fact["asks"][i], fact["mids"][i]
+                seen["no_ask"] += ask is None
+                seen["no_mid"] += mid is None
+                if ask is None and mid is None:
+                    continue
+                cell = calibration[str(lead)].setdefault(
+                    category, {"ask": _new_cell(nbins), "mid": _new_cell(nbins)})
+                if ask is not None:
+                    _add_price(cell["ask"], ask, outcome, width)
+                if mid is not None:
+                    _add_price(cell["mid"], mid, outcome, width)
+    if out["read"] or set(fresh) != set(saved):
+        _write_candle_cache(cache_path, leads, fresh)
+    logging.info("Data page: %d candle files: %d read, %d reused, %d unreadable, %d with no "
+                 "joined market", out["files"], out["read"], out["reused"], out["unreadable"],
+                 out["unjoined"])
+    return out
+
+
+# ─── Inventory of the cache folder ────────────────────────────────────────────
+
+# The word for an entry this module has no description of (a file or folder
+# another part of the project added): it is listed, never skipped.
+INVENTORY_NOT_DESCRIBED = "not described"
+# One plain line per known top-level entry of the cache folder, shown by the page.
+INVENTORY_DESCRIPTIONS = {
+    "archive_days": ("Settled markets from Kalshi's archive, one file per day the "
+                     "market was created, kept only up to the archive cutoff."),
+    "live_days": ("Markets settled since the archive cutoff, one file per settlement day, "
+                  "from Kalshi's live listing."),
+    "candlesticks": ("Hourly price candles (YES and NO ask, hourly volume) for the markets "
+                     "the backtest priced, one file per market."),
+    config.DEPTH_SNAPSHOTS_DIRNAME: ("Saved copies of live order books, used to model how many "
+                                     "contracts rest near the best price."),
+    config.EDA_SUMMARY_DIRNAME: ("This page's own small summaries of the day slices and "
+                                 "candles, and the saved k view."),
+    "event_titles_v2.json": ("Event titles looked up for event tickers, so markets can be "
+                             "grouped by event."),
+    "event_titles.json": ("The older event title file, read once to bring its titles into "
+                          "event_titles_v2.json; no longer read."),
+    "event_competitions.json": ("The competition each event names (a league, for example), "
+                                "used by the same-title sport check."),
+    "series_categories.json": "Kalshi's category and tags for each series, refreshed weekly.",
+    "treasury_bill_rates.json": ("The 8-week Treasury bill auction yields the dashboards "
+                                 "subtract from Sharpe and Sortino."),
+    "live_marks": ("Daily prices of finalized markets the Live trading tab has read, kept so "
+                   "they are not fetched again."),
+}
+# Assembled corpora: settled_markets_<start date>[...].jsonl.gz, and the older
+# single-document form of the same.
+INVENTORY_CORPUS_DESCRIPTION = ("An assembled set of settled markets for one backtest start "
+                                "date, already filtered to markets that could be traded.")
+INVENTORY_LEGACY_CORPUS_DESCRIPTION = ("The older single-document form of an assembled set "
+                                       "of settled markets; no longer read.")
+_CORPUS_PREFIX = "settled_markets_"
+_CORPUS_SUFFIX = ".jsonl.gz"
+_LEGACY_CORPUS_SUFFIX = ".json"
+# The meta keys of an assembled corpus the page shows.
+_CORPUS_META_KEYS = ("start_date", "prefilter_tag", "assembled_at", "assembly_counts")
+# A day file's name: "<YYYY-MM-DD>.json" or "<YYYY-MM-DD>.json.gz".
+_DAY_FILE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.json(?:\.gz)?$")
+# A depth snapshot's name: the UTC time it was taken.
+_SNAPSHOT_FILE = re.compile(r"^(\d{8}T\d{6}Z)\.json\.gz$")
+
+
+def _inventory_row(name: str, kind: str, **fields: Any) -> dict:
+    """
+    One inventory row with every field present.
+
+    Args:
+        name (str): The entry's name.
+        kind (str): "folder" or "file".
+        **fields: Any of files, bytes, first_day, last_day, description,
+            detail, error.
+
+    Returns:
+        dict: name, kind, files (file count; 1 for a file), bytes, first_day,
+            last_day (the ISO dates of the oldest and newest day file inside
+            a folder, else None), description (a plain line, or
+            INVENTORY_NOT_DESCRIBED), detail (a dict of extra facts, or None)
+            and error (None, or why the entry could not be read).
+    """
+    row = {"name": name, "kind": kind, "files": None, "bytes": None, "first_day": None,
+           "last_day": None, "description": INVENTORY_NOT_DESCRIBED, "detail": None,
+           "error": None}
+    row.update(fields)
+    return row
+
+
+def _walk_folder(path: str, top_names: list | None = None
+                 ) -> tuple[int, int, str | None, str | None, int]:
+    """
+    Count the files in a folder and all below it, one os.scandir pass per folder.
+
+    Args:
+        path (str): The folder.
+        top_names (list | None): When given, the names of the files directly in
+            the folder are appended to it (so one pass also serves the depth
+            snapshot count).
+
+    Returns:
+        tuple: (files, bytes, oldest day file's ISO date, newest, folders
+            that could not be listed below the first). Symbolic links are not
+            followed. Day files are those named <YYYY-MM-DD>.json[.gz].
+
+    Raises:
+        OSError: When the folder itself cannot be listed.
+    """
+    files = total = skipped = 0
+    first = last = None
+    stack = [(path, True)]
+    while stack:
+        current, top = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append((entry.path, False))
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        skipped += 1
+                        continue
+                    files += 1
+                    if top and top_names is not None:
+                        top_names.append(entry.name)
+                    match = _DAY_FILE.match(entry.name)
+                    if match:
+                        day = match.group(1)
+                        first = day if first is None or day < first else first
+                        last = day if last is None or day > last else last
+        except OSError:
+            if top:
+                raise
+            skipped += 1
+    return files, total, first, last, skipped
+
+
+def _corpus_meta(path: str) -> dict:
+    """
+    The meta block of an assembled corpus, read from its first line only.
+
+    Args:
+        path (str): The settled_markets_*.jsonl.gz file.
+
+    Returns:
+        dict: The keys of _CORPUS_META_KEYS that the meta block has, or
+            {"meta_error": "<one-line reason>"} when the first line cannot be
+            read or is not a meta line.
+    """
+    try:
+        with gzip.open(path, "rb") as fh:
+            line = fh.readline(_META_LINE_MAX_BYTES)
+        head = json.loads(line)
+        meta = head.get("meta") if isinstance(head, dict) else None
+        if not isinstance(meta, dict):
+            return {"meta_error": "the first line is not a meta block"}
+        return {key: meta[key] for key in _CORPUS_META_KEYS if key in meta}
+    except Exception as exc:
+        return {"meta_error": _one_line(exc)}
+
+
+def _snapshot_detail(names: list) -> dict:
+    """
+    How many depth snapshots a folder holds and when the newest was taken.
+
+    Args:
+        names (list): The names of the files directly in the depth snapshot
+            folder (collected by _walk_folder's one pass).
+
+    Returns:
+        dict: {"snapshots": count of <UTC time>.json.gz files, "newest": the
+            newest one's UTC time (from its file name) as an ISO text, or
+            None}.
+    """
+    stamps = [m.group(1) for m in map(_SNAPSHOT_FILE.match, names) if m]
+    newest = None
+    if stamps:
+        try:
+            newest = datetime.strptime(max(stamps), "%Y%m%dT%H%M%SZ").replace(
+                tzinfo=UTC).isoformat()
+        except ValueError:
+            newest = None
+    return {"snapshots": len(stamps), "newest": newest}
+
+
+def _describe(name: str, is_dir: bool) -> str:
+    """
+    The plain line for a known top-level entry.
+
+    Args:
+        name (str): The entry's name.
+        is_dir (bool): Whether it is a folder.
+
+    Returns:
+        str: Its description, or INVENTORY_NOT_DESCRIBED.
+    """
+    if name in INVENTORY_DESCRIPTIONS:
+        return INVENTORY_DESCRIPTIONS[name]
+    if not is_dir and name.startswith(_CORPUS_PREFIX):
+        if name.endswith(_CORPUS_SUFFIX):
+            return INVENTORY_CORPUS_DESCRIPTION
+        if name.endswith(_LEGACY_CORPUS_SUFFIX):
+            return INVENTORY_LEGACY_CORPUS_DESCRIPTION
+    return INVENTORY_NOT_DESCRIBED
+
+
+def inventory(cache_dir: Path) -> list[dict]:
+    """
+    One row per top-level entry of the cache folder.
+
+    A folder is walked with one os.scandir pass per folder (the candle folder,
+    over 100,000 files, is one pass). For each assembled corpus
+    (settled_markets_*.jsonl.gz) only the first line is read, for its meta
+    block; for the depth snapshot folder the snapshots are counted and the
+    newest one's time is taken from its file name. An entry this module does
+    not know is listed with INVENTORY_NOT_DESCRIBED, never skipped, and an
+    entry that cannot be read gets a row whose "error" says so. A name that
+    starts with "." (.DS_Store, a tool's hidden folder) is not part of the
+    cache and is left out. Never raises.
+
+    Args:
+        cache_dir (Path): The cache folder (backtest_cache/).
+
+    Returns:
+        list[dict]: _inventory_row rows, sorted by name; a single row naming
+            the cache folder with an "error" when the folder cannot be listed.
+    """
+    cache_dir = Path(cache_dir)
+    try:
+        with os.scandir(cache_dir) as listing:
+            entries = sorted(listing, key=lambda e: e.name)
+    except OSError as exc:
+        return [_inventory_row(cache_dir.name or str(cache_dir), "folder",
+                               error=_one_line(exc))]
+    rows = []
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        try:
+            rows.append(_row_for(entry))
+        except Exception as exc:
+            rows.append(_inventory_row(entry.name, "file", error=_one_line(exc)))
+    return rows
+
+
+def _row_for(entry: os.DirEntry) -> dict:
+    """
+    The inventory row of one top-level entry.
+
+    Args:
+        entry (os.DirEntry): The entry.
+
+    Returns:
+        dict: Its row; a folder or file that cannot be read has "error" set.
+    """
+    name = entry.name
+    if entry.is_dir(follow_symlinks=False):
+        row = _inventory_row(name, "folder", description=_describe(name, True))
+        depth = name == config.DEPTH_SNAPSHOTS_DIRNAME
+        top_names: list = []
+        try:
+            files, total, first, last, skipped = _walk_folder(
+                entry.path, top_names if depth else None)
+        except OSError as exc:
+            row["error"] = _one_line(exc)
+            return row
+        row.update(files=files, bytes=total, first_day=first, last_day=last)
+        detail: dict = {}
+        if skipped:
+            detail["unreadable_parts"] = skipped
+        if depth:
+            detail.update(_snapshot_detail(top_names))
+        row["detail"] = detail or None
+        return row
+    row = _inventory_row(name, "file", files=1, description=_describe(name, False))
+    try:
+        row["bytes"] = entry.stat(follow_symlinks=False).st_size
+    except OSError as exc:
+        row["error"] = _one_line(exc)
+        return row
+    if name.startswith(_CORPUS_PREFIX) and name.endswith(_CORPUS_SUFFIX):
+        row["detail"] = _corpus_meta(entry.path)
+    return row
+
+
+# ─── The k view ───────────────────────────────────────────────────────────────
+
+def _khat_stat(label: str, observations: list, backtester: Any, dashboard: Any) -> dict:
+    """
+    Reduce a group of k-hat observations to numbers.
+
+    The arithmetic is the backtest page's own: backtester._calibration_bucket
+    for the rate, the mean mid spread and k-hat, and dashboard._khat_interval
+    over dashboard._khat_cluster_sums for the interval (each event counted
+    once), so a group holding a band's whole population reproduces its card.
+
+    Args:
+        label (str): The group's name.
+        observations (list): backtester.CalibrationObservation records.
+        backtester (Any): The backtester module (imported by the caller).
+        dashboard (Any): The dashboard module (imported by the caller).
+
+    Returns:
+        dict: "label", "n", "events" (distinct market-A events), "rate"
+            (realised in-between rate), "implied" (mean mid spread), "k" (k-hat,
+            None when the mean mid spread is not above 0), "ci_low" and
+            "ci_high" (the 95% interval, None when there is none); a number
+            that is not finite is None.
+    """
+    bucket = backtester._calibration_bucket(label, 0.0, observations)
+    events = len({o.event_ticker for o in observations})
+    gaps = sum(o.implied for o in observations)
+    interval = dashboard._khat_interval(bucket.empirical_k, gaps,
+                                        dashboard._khat_cluster_sums(observations), events)
+    return {"label": label, "n": bucket.n, "events": events,
+            "rate": _finite(bucket.realised_rate), "implied": _finite(bucket.mean_implied),
+            "k": _finite(bucket.empirical_k),
+            "ci_low": _finite(interval[0]) if interval else None,
+            "ci_high": _finite(interval[1]) if interval else None}
+
+
+def khat_view(sweep: Any, *, series_categories: dict | None = None) -> dict | None:
+    """
+    The figures of the k view, from a backtest's own k-hat observations.
+
+    Uses the primary band's calibration (dashboard._primary_calibration, the
+    backtest page's one reading of it) and its carried
+    observations: one per time-series entry with a binary settlement. Returns
+    mid-spread bins (config.EDA_KHAT_SPREAD_BIN wide, entries with a mid spread
+    above 0; one that is not above 0, a NaN included, is counted in `non_positive`) with how many entries and how often they settled in between;
+    the pooled k-hat with its confidence interval (config.KHAT_CONFIDENCE_LEVEL)
+    next to the run's k (sweep.primary.k); and k-hat with its interval by
+    deadline-gap band and by Kalshi category (filed as the backtest page files
+    trades: historical.series_labels over `series_categories`, the ticker-prefix
+    category when a series is missing or no listing is given).
+
+    backtester and dashboard are imported inside this function, so the worker
+    processes that count day slices (which import this module) never load
+    pandas or plotly.
+
+    Args:
+        sweep (Any): A backtester.BacktestSweep, or None.
+        series_categories (dict | None): Kalshi's /series listing, or None.
+
+    Returns:
+        dict | None: "k", "confidence_level", "spread_bin", "observations",
+            "non_positive" (entries whose mid spread is not above 0, NaN
+            included, left out of the bins), "excluded_premise_violations",
+            "pooled" (a _khat_stat), "bins" (non-empty ones, ascending:
+            "lo", "hi", "n", "in_between", "rate", "implied"), "gap_bands"
+            and "categories" (lists of _khat_stat). None when the sweep has no
+            calibration or it carries no observation.
+    """
+    if sweep is None:
+        return None
+    from . import backtester, dashboard  # local: keeps pandas and plotly out of the workers
+
+    calibration = dashboard._primary_calibration(sweep)
+    observations = tuple(getattr(calibration, "observations", None) or ())
+    if not observations:
+        return None
+
+    width = config.EDA_KHAT_SPREAD_BIN
+    nbins = _bin_count(width)
+    slots: dict[int, list] = {}
+    non_positive = 0
+    for o in observations:
+        if not o.implied > 0:
+            non_positive += 1
+            continue
+        slot = slots.setdefault(_bin_index(o.implied, width, nbins), [0, 0, 0.0])
+        slot[0] += 1
+        slot[1] += int(bool(o.in_between))
+        slot[2] += o.implied
+    bins = [{"lo": round(i * width, 9), "hi": round((i + 1) * width, 9), "n": n,
+             "in_between": hits, "rate": hits / n, "implied": gap / n}
+            for i, (n, hits, gap) in sorted(slots.items())]
+    bands = []
+    for lo, hi in backtester._CALIBRATION_GAP_BANDS:
+        members = [o for o in observations if o.gap_days is not None and lo <= o.gap_days <= hi]
+        if members:
+            bands.append(_khat_stat(f"{lo}-{hi}d", members, backtester, dashboard))
+    by_category: dict[str, list] = {}
+    for o in observations:
+        category, _ = historical.series_labels(o.event_ticker, o.category, series_categories)
+        by_category.setdefault(category, []).append(o)
+    categories = [_khat_stat(name, members, backtester, dashboard)
+                  for name, members in sorted(by_category.items())]
+    return {
+        "k": _finite(getattr(getattr(sweep, "primary", None), "k", None)),
+        "confidence_level": config.KHAT_CONFIDENCE_LEVEL,
+        "spread_bin": width,
+        "observations": len(observations),
+        "non_positive": non_positive,
+        "excluded_premise_violations": getattr(calibration, "excluded_premise_violations", None),
+        "pooled": _khat_stat("POOLED", list(observations), backtester, dashboard),
+        "bins": bins,
+        "gap_bands": bands,
+        "categories": categories,
+    }
+
+
+def _khat_path(cache_dir: Path) -> Path:
+    """
+    Where the saved k view is kept.
+
+    Args:
+        cache_dir (Path): The cache folder.
+
+    Returns:
+        Path: <cache_dir>/<config.EDA_SUMMARY_DIRNAME>/khat.json.
+    """
+    return Path(cache_dir) / config.EDA_SUMMARY_DIRNAME / _KHAT_NAME
+
+
+def save_khat(cache_dir: Path, view: dict) -> None:
+    """
+    Save the k view atomically as strict JSON.
+
+    Args:
+        cache_dir (Path): The cache folder.
+        view (dict): khat_view's result.
+
+    Raises:
+        ValueError: When the view holds a NaN or infinite number (strict JSON
+            has none); nothing is written and any earlier file stays.
+        OSError: When the file cannot be written.
+    """
+    text = json.dumps(view, allow_nan=False, separators=(",", ":"))
+    path = _khat_path(cache_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + _TMP_SUFFIX)
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _refuse_constant(name: str) -> None:
+    """
+    json.loads' hook for NaN and Infinity, which strict JSON does not have.
+
+    Args:
+        name (str): The constant's text.
+
+    Raises:
+        ValueError: Always.
+    """
+    raise ValueError(f"not strict JSON: {name}")
+
+
+def load_khat(cache_dir: Path) -> dict | None:
+    """
+    The saved k view.
+
+    Args:
+        cache_dir (Path): The cache folder.
+
+    Returns:
+        dict | None: The view, or None when the file is missing, cannot be
+            read, is not strict JSON or is not a JSON object.
+    """
+    try:
+        view = json.loads(_khat_path(cache_dir).read_text(), parse_constant=_refuse_constant)
+    except Exception:
+        return None
+    return view if isinstance(view, dict) else None
