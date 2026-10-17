@@ -78,14 +78,10 @@ from .treasury import load_risk_free_rates
 @dataclass(frozen=True)
 class StartingBalance:
     """
-    The amount a backtest starts with, and where that amount came from.
+    The amount a backtest starts with, all of it cash, and where it came from.
 
-    main() works it out before the fetch: from --balance when the flag is
-    given, otherwise from the Kalshi account (_account_starting_balance). The
-    simulation starts with the amount, all of it cash, so its trade sizes
-    follow from it, and the dashboard's total return and cumulative-return
-    charts are measured from it. The source is printed beside it in the log
-    and in the dashboard's header.
+    Trade sizes and every return on the dashboard are measured from this
+    amount. The source is shown beside it in the log and the dashboard.
 
     Attributes:
         dollars (float): The starting balance in dollars; a finite amount above 0.
@@ -98,7 +94,7 @@ class StartingBalance:
     source: str
 
     def __post_init__(self) -> None:
-        # A run cannot start from nothing, and its returns are measured from this amount
+        # Returns are measured against this amount, so it must be a real amount above 0
         if not (math.isfinite(self.dollars) and self.dollars > 0):
             raise ValueError(
                 f"a starting balance must be a finite amount above 0, not {self.dollars!r}")
@@ -108,8 +104,7 @@ class StartingBalanceError(Exception):
     """
     The account gave no amount a backtest can start from; the message says why.
 
-    Raised by _account_starting_balance. main() turns it into a stop before
-    the fetch (exit 1), adding that --balance chooses an amount instead.
+    main() stops the run when this is raised (exit 1) and suggests --balance.
     """
 
 
