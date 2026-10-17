@@ -4,226 +4,40 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Command-line entry point for the Kalshi backtester. Parses CLI
-    arguments (--start-date, --balance, --no-cache, --max-horizon-days,
-    --interval-discount, --no-sweep, --same-event-ladders /
-    --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
-    --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers,
-    --no-trim-sweep, --no-trim-rise-sweep),
-    configures logging to kalshi_backtest.log, constructs the necessary API
-    clients, works out the starting balance (--balance, or else what the Kalshi
-    account is worth when the run starts), fits the depth model from the saved
-    order-book snapshots (depth_model.load_depth_model) so each trade is sized
-    over a modeled book, delegates the full backtest
-    simulation to backtester.run_backtest_sweep(), and then calls
-    dashboard.generate_dashboard() to produce the interactive HTML report and,
-    when the sell family is on, the sidecar chunk files its Sell select loads
-    (a folder beside the page, config.DASHBOARD_FILES_DIRNAME, which must be
-    kept with it).
-    Prints a summary of key metrics (trade count, win rate, total return) to
-    the log on completion, closed on every run by what settled-market corpus
-    the run read (its assembly time, whether it was cached, and the archive
-    cutoff as of assembly, as information).
+    The command line for the backtester (`python3 -m kalshi_betting.backtest`).
+    It reads the options, works out the starting balance, replays the
+    strategy on past Kalshi markets (backtester.run_backtest_sweep), writes
+    the HTML dashboard (dashboard.generate_dashboard) and logs a short
+    summary to kalshi_backtest.log.
 
 Dependencies:
-    Imports run_backtest_sweep and BacktestSweep from backtester.py,
-    generate_dashboard from dashboard.py, build_historical_client /
-    build_prod_live_client / load_series_categories (Kalshi's /series
-    listing, read once and handed to both the sweep, whose same-title sport
-    check files each series by it, and the dashboard's returns-by-category
-    labels) from historical.py, load_risk_free_rates
-    (the T-bill yields the page's Sharpe and Sortino subtract) from
-    treasury.py, load_depth_model (the table every trade's modeled order book
-    is built from; the backtest's fills line names it) from depth_model.py,
-    read_account_balance (the account's cash and open positions,
-    the starting balance when --balance is not given) from auth.py, and
-    api_error_summary (the one-line reason a failed balance read is reported
-    with) from _http.py.
-    Imports from config.py:
-    PROJECT_ROOT, DASHBOARD_SELL_MAX_WORKERS (the --sell-workers default's
-    bound), MIN_BALANCE_CENTS (the low starting-balance WARNING),
-    TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS
-    (the pre-fetch echo and the flag's help text), the deadline-gap tier constants
-    MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS,
-    MAX_DEADLINE_GAP_DAYS and PRICE_EPSILON (the spread-band tier WARNING),
-    the band helpers time_series_spread_band and
-    time_series_spread_too_wide — backtest is one of the four band readers
-    tests/test_strategy.py::TestTimeSeriesKellyParity::
-    test_ast_live_path_reads_toggles_only_through_live_settings allows — and
-    live_defaults with its LiveDefaultsError / LiveDefaultsMissing refusals,
-    describe_time_series_rule and describe_trade_filter (the pre-fetch echo's
-    "live rule=" clause, which names the saved live defaults). Entry point for
-    `python3 -m kalshi_betting.backtest`.
+    backtester (runs the backtest), dashboard (writes the page), historical
+    (the API clients and Kalshi's list of series and their categories),
+    auth (reads the account's balance), depth_model (the model of how deep
+    order books are), treasury (T-bill yields for the Sharpe and Sortino
+    ratios), _http (one-line error text) and config (settings and checks).
+    Nothing in the package imports this module.
 
 Notes:
-    Historical data only exists on the production Kalshi API, so both API clients
-    always use prod credentials regardless of what mode the live bot was run in.
-    The backtest reads market data and, unless --balance is given, the
-    account balance, but never submits any orders.
-
-    The starting balance is the amount the simulation starts with, all of it
-    cash: its trade sizes follow from it, and the dashboard's total return and
-    cumulative-return charts are measured from it. --balance DOLLARS sets it.
-    Without the flag the run reads, once and before the fetch, what the
-    production account is worth now: the cash on every shard plus what Kalshi
-    says the open positions are worth — the portfolio value a live run sizes
-    its trades on — so the backtest's trades are sized for the account as it
-    stands. When Kalshi's reply has no readable positions value the cash
-    alone is used, with a WARNING. A balance that cannot be read, or a read
-    that comes to nothing, stops the run before anything is fetched (exit 1,
-    the reason on stderr and in the log), since a starting balance nobody
-    chose would size every simulated trade for some other account; --balance
-    then runs without the read. A starting balance below
-    config.MIN_BALANCE_CENTS, the value below which a live run does not
-    trade, draws a WARNING, since the backtest trades from it anyway. The
-    log's "Starting balance" line and the dashboard's header say where the
-    amount came from.
-
-    --sell-workers N sets how many worker processes the dashboard simulates
-    its Sell select in (default: one less than the CPU count, at most
-    config.DASHBOARD_SELL_MAX_WORKERS; 1 runs it in the main process). The
-    workers are spawned, so they re-import this module: main() must only ever
-    run under the `if __name__ == "__main__"` guard at the bottom of the file.
-
-    The depth model is fitted before the fetch from the order-book snapshots
-    saved by `python3 -m kalshi_betting.depth_model snapshot`, and handed to
-    run_backtest_sweep, which sizes each trade over a modeled book built from
-    it. With no usable snapshot every trade fills at the top of the book, in
-    any size. The config echo's fills= clause says which, and the log names
-    the reason.
-
-    --interval-discount overrides the time-series interval discount k for this
-    run ONLY: no live module imports this one (main.py's --interval-discount is
-    a separate flag), and nothing here writes config.py or the saved live
-    defaults — the calibration the run reports is a recommendation for a human
-    to act on.
-
-    --same-event-ladders / --no-same-event-ladders (DR-73) is the same kind of
-    one-run override for config.TIME_SERIES_SAME_EVENT_LADDERS, and also never
-    reaches the live finder — scanner.py binds that constant at import. Unlike
-    k, it changes WHICH PAIRS EXIST rather than how they are priced, so it
-    applies identically to every swept discount and a run with it on is not
-    comparable to a baseline taken without it. The switch is on by the
-    operator's 2026-09-26 decision, so a default run pairs ladders and
-    --no-same-event-ladders replays the rule as it stood before it.
-
-    That setting reaches kalshi_backtest.log (the pre-fetch echo below and
-    run_backtest_sweep's resolved line) AND the HTML dashboard's own page
-    header: dashboard._run_settings_html(sweep) prints "same-event ladders:
-    on / off / not recorded" (BacktestSweep.same_event_ladders), a recorded
-    on/off followed by its reading against the configured switch, beside the
-    primary spread band, under the "Period:" line, above every section — so a
-    ladder-enabled run's dashboard is no longer indistinguishable from a
-    switch-off one and needs no hand labelling. Unlike DR-66b's
-    subtitle-coverage caveat, this setting is chosen by the operator on the
-    command line rather than discovered by the run, which is why it is named
-    rather than banner-flagged. When a run's resolved setting departs from
-    the switch this checkout's config sets, all three places say so: the
-    echo below appends " (config: on|off)" from this module's binding,
-    run_backtest_sweep's own ladder line names the departure in its source
-    clause from backtester's, and the header reads backtester's binding
-    through BacktestSweep.config_same_event_ladders beside
-    same_event_ladders.
-
-    --spread-min/--spread-max set the PRIMARY scenario's backtest-only
-    time-series spread band (floor, ceiling) on pB - pA. Once
-    config.time_series_spread_band() has resolved and validated it,
-    backtester._find_entry layers the floor on the deadline-gap tier through
-    config.min_price_diff_for_gap(spread_min=) and refuses a spread above the
-    ceiling through config.time_series_spread_too_wide(). They never reach live
-    trading (main.py's same-named flags are separate). Either flag may be given
-    alone; the omitted side comes from config.BACKTEST_DEFAULT_SPREAD_BAND,
-    read through config.time_series_spread_band(None) at call time. Both
-    omitted passes spread_band=None, the no-override sentinel, which
-    run_backtest_sweep resolves to config.BACKTEST_DEFAULT_SPREAD_BAND and
-    logs with that source. The flags (each in [0, 1], and the resolved floor
-    strictly less than the resolved ceiling) and the configured default
-    band are all validated BEFORE logging is configured (TS-20), so a
-    rejected value leaves kalshi_backtest.log untouched. A ceiling at or
-    below a deadline-gap tier empties that tier in the primary scenario (or,
-    sitting on it, keeps only spreads exactly on it), whatever the floor;
-    that is an advisory rather than a rejected value, so it is a WARNING
-    logged after logging is configured. The band sweep is ON by default, so
-    a default run also simulates every band of the
-    config.SPREAD_BAND_SWEEP_FLOORS x SPREAD_BAND_SWEEP_CEILINGS grid (no
-    grid ceiling sits at or below either tier) — and, with it, every band
-    whose floor sits below a deadline-gap tier a second time with the tier
-    floors off (tier_off_sweep=band_sweep: the band's floor alone gates the
-    spread and sets the leg-price-sum ceiling, 1 − floor, backtest only);
-    --no-band-sweep skips that grid and those
-    tier-floors-off runs (band_sweep=False, tier_off_sweep=False): the
-    primary scenario still runs, but the dashboard's scenario explorer has no
-    scenarios to show, and its filter bar offers the primary band only, with
-    the Tier floors select disabled. There is no separate flag for the
-    tier-off runs.
-
-    The per-trade size-cap sweep is ON by default too (cap_sweep=True): the
-    result carries a lazy backtester.CapSweep over backtester.SIZE_CAP_SWEEP
-    (5%..95% and no cap), whose cells are simulated only when a report reads
-    them — the run itself simulates nothing extra, and every point it returns,
-    the summary block included, is sized at the run's own cap,
-    config.BUDGET_FRACTION. The dashboard reads every cell as it is built,
-    for its filter bar's Size cap select, the Interval Discount section and
-    the scenario explorer's cap axis. With the band sweep's tier-floors-off
-    runs on too (the default), a second lazy CapSweep
-    (BacktestSweep.tier_off_cap_sweep) covers them at every cap as well, so
-    every tier x band x k x cap scenario the page offers is a real
-    simulation.
-    --no-cap-sweep returns cap_sweep=None, and the dashboard then offers the
-    run's own cap only — a far smaller page, built far faster. Like the band
-    and k sweeps it is backtest-only: live sizing reads
-    its caps from its run's config.LiveSettings, built from the saved live
-    defaults.
-
-    The "Add to held pairs" family is ON by default too (add_on_sweep=True):
-    the result carries two more lazy CapSweeps (BacktestSweep.add_on_cap_sweep,
-    and add_on_tier_off_cap_sweep over the tier-floors-off runs) whose every
-    simulation adds to pairs it still holds, for the "all" population only.
-    Like the cap sweeps they simulate nothing during the run — every figure and
-    point the run returns is unchanged — and each cell is simulated only when
-    the dashboard is built, so --no-add-on-sweep makes that step faster.
-
-    The "Sell" family is ON by default too (sell_sweep=True): the result
-    carries a lazy SellSweep (BacktestSweep.sell_sweep) that simulates, when
-    the dashboard is built, every scenario selling a position early at each
-    level of config.TAKE_PROFIT_LEVELS with each minimum of days before
-    maturity of config.TAKE_PROFIT_MIN_DAYS (the dashboard's Sell and Min.
-    days to maturity selects). It simulates nothing during the run;
-    --no-sell-sweep skips it, leaving both selects disabled. Nothing here
-    reaches live trading by itself: a live run sells at its saved sell_at
-    level (main.py --sell-at overrides it for one run), which the dashboard's
-    Save as live defaults… can set.
-
-    The "Trim to Kelly" family is ON by default too (trim_sweep=True): the
-    result carries a lazy TrimSweep (BacktestSweep.trim_sweep) that
-    simulates, when the dashboard is built, every scenario again with held
-    pairs sold down to their Kelly size at each weekly checkpoint, adding to
-    held pairs or not (the dashboard's Trim to Kelly select). It simulates
-    nothing during the run; --no-trim-sweep skips it, leaving the select
-    disabled. A live run trims only by its own saved trim_to_kelly
-    (main.py --trim-to-kelly for one run), which the dashboard's Save as
-    live defaults… can set.
-
-    The family's minimum price rises are ON by default with it
-    (trim_rise_sweep=True): the TrimSweep also carries every minimum of
-    config.TRIM_MIN_PRICE_RISES (TrimSweep.min_rises), where a held pair is
-    trimmed only once its total price has risen that many cents since the
-    last trade on it (the dashboard's Min. price rise select). They too are
-    simulated only when the dashboard is built. --no-trim-rise-sweep skips
-    them and still builds Trim to Kelly itself; --no-trim-sweep skips both.
-    A live run uses its own saved trim_min_rise (main.py --trim-min-rise
-    for one run).
-
-    The pre-fetch echo's "live rule=" clause names the saved live defaults'
-    time-series rule and, when one is set, their category/tag filter (never
-    main.py's per-run overrides), from a read of its own, failing soft;
-    run_backtest_sweep reads them again and logs where THIS run's grid holds
-    that rule. Only the dashboard's "Save as live defaults…" button (or
-    ./start_dashboard.sh --seed), confirmed through defaults_server, sets the
-    live defaults; nothing else chosen here reaches live trading. The run's
-    last line says how: run ./start_dashboard.sh (it starts the defaults
-    server and the live dashboard, whose Backtest tab is the page), then use
-    the filter bar's Save as live defaults… or Trade using defaults… button.
+    - It reads production data only, since past markets exist only there.
+      It never places an order.
+    - Starting balance: --balance, or else what the account is worth now
+      (its cash plus Kalshi's value of its open positions). If that cannot
+      be read, the run stops (exit 1) rather than guess an amount.
+    - --sell-workers starts worker processes that re-import this module, so
+      main() must only run under the `if __name__ == "__main__"` guard.
+    - With no saved order-book snapshots, every trade fills at the best
+      price in any size; the "Backtest config" line says which.
+    - --interval-discount, --same-event-ladders and --spread-min/--spread-max
+      change this backtest only. Nothing here changes live trading: the
+      live settings change only when someone saves a scenario from the
+      dashboard (run ./start_dashboard.sh, then "Save as live defaults…").
+    - The dashboard's extra views are all on by default. The spread-band
+      grid (--no-band-sweep) is simulated during the run; the size caps,
+      adding to held pairs, selling, trimming and its minimum price rises
+      (--no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --no-trim-sweep,
+      --no-trim-rise-sweep) are simulated only while the dashboard is built.
+      Each --no-… option skips its view, making the page smaller and faster.
 """
 import argparse
 import logging
