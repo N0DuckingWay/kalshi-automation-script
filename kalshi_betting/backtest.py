@@ -22,22 +22,25 @@ Notes:
     - It reads production data only, since past markets exist only there.
       It never places an order.
     - Starting balance: --balance, or else what the account is worth now
-      (its cash plus Kalshi's value of its open positions). If that cannot
-      be read, the run stops (exit 1) rather than guess an amount.
-    - --sell-workers starts worker processes that re-import this module, so
-      main() must only run under the `if __name__ == "__main__"` guard.
-    - With no saved order-book snapshots, every trade fills at the best
-      price in any size; the "Backtest config" line says which.
+      (its cash plus Kalshi's value of its open positions; the cash alone,
+      with a WARNING, if that value is missing). If the balance cannot be
+      read, or comes to nothing, the run stops (exit 1) rather than guess.
+    - The dashboard builds its Sell view in worker processes (by default one
+      fewer than the CPU count; --sell-workers sets it). Each worker
+      re-imports this module, so main() must only run under the
+      `if __name__ == "__main__"` guard.
+    - With no usable saved order-book snapshot, every trade fills at the
+      best price in any size; the "Backtest config" line says which.
     - --interval-discount, --same-event-ladders and --spread-min/--spread-max
-      change this backtest only. Nothing here changes live trading: the
-      live settings change only when someone saves a scenario from the
-      dashboard (run ./start_dashboard.sh, then "Save as live defaults…").
-    - The dashboard's extra views are all on by default. The spread-band
-      grid (--no-band-sweep) is simulated during the run; the size caps,
-      adding to held pairs, selling, trimming and its minimum price rises
-      (--no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --no-trim-sweep,
-      --no-trim-rise-sweep) are simulated only while the dashboard is built.
-      Each --no-… option skips its view, making the page smaller and faster.
+      change this backtest only. Nothing here changes live trading, which
+      reads the saved live defaults (changed only through the defaults
+      server, e.g. the dashboard's "Save as live defaults…") and config.py.
+    - The dashboard's extra views are all on by default. The k grid
+      (--no-sweep) and the spread-band grid (--no-band-sweep) are simulated
+      during the run; the size caps, adding to held pairs, selling, trimming
+      and its minimum price rises (--no-cap-sweep, --no-add-on-sweep,
+      --no-sell-sweep, --no-trim-sweep, --no-trim-rise-sweep) only while the
+      dashboard is built. Each --no-… option skips its view.
 """
 import argparse
 import logging
@@ -113,8 +116,9 @@ def _account_starting_balance(client) -> StartingBalance:
     Read what the Kalshi account is worth now, the starting balance when --balance is not given.
 
     The amount is the account's cash plus what Kalshi says its open positions
-    are worth, the same figure a live run sizes its trades on. If Kalshi does
-    not report the positions' value, the cash alone is used, with a WARNING.
+    are worth. (A live run also checks that value against the contracts held;
+    this does not.) If Kalshi does not report the positions' value, the cash
+    alone is used, with a WARNING.
     Makes one read-only request, retried on temporary errors.
 
     Args:
@@ -130,7 +134,7 @@ def _account_starting_balance(client) -> StartingBalance:
             positions value).
     """
     try:
-        # One retried read: the cash on each shard and Kalshi's value of the open positions
+        # One retried read: the account's cash and Kalshi's value of the open positions
         account = read_account_balance(client)
     except Exception as e:
         # Describe the failure in one short line rather than the SDK's long error text
@@ -187,7 +191,7 @@ def _fills_echo(depth_model: DepthModel | None) -> str:
 
 def _log_corpus_provenance(sweep: BacktestSweep) -> None:
     """
-    Log, as the run's last report line, which past-market data it used.
+    Log, right after the summary, which past-market data the run used.
 
     The data holds no market settled after it was put together, so this says
     when that was and whether this run built it, extended it or reused a
@@ -238,12 +242,14 @@ def main() -> None:
     Run the backtester from the command line.
 
     In order: read and check the options (a bad one stops the run before the
-    log file is touched), set up logging to kalshi_backtest.log (there is no
-    console output), work out the starting balance, run the backtest, log a
-    summary and write the HTML dashboard.
+    log file is touched), set up logging to kalshi_backtest.log (log lines go
+    only there; only a usage error or a failed balance read prints to the
+    terminal), work out the starting balance, run the backtest, log a summary
+    and write the HTML dashboard.
 
-    The summary reports the run's main scenario: the chosen k, spread band and
-    size cap. The other scenarios the run works out are shown on the dashboard.
+    The summary reports the run's main scenario: its interval discount k and
+    spread band (from the options, or config) at config's per-trade size cap.
+    The other scenarios the run works out are shown on the dashboard.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -385,7 +391,8 @@ def main() -> None:
         parser.error("--max-horizon-days must be a positive integer")
     if args.sell_workers is not None and args.sell_workers < 1:
         parser.error("--sell-workers must be a positive integer")
-    # k = 0 would treat every time-series pair as risk-free
+    # An interval discount k of 0 would treat every time-series pair as
+    # risk-free, and the live sizing code the backtest uses refuses it
     if args.interval_discount is not None and not (0.0 < args.interval_discount <= 1.0):
         parser.error("--interval-discount must be above 0 and at most 1")
     if args.spread_min is not None and not (0.0 <= args.spread_min <= 1.0):
@@ -394,7 +401,7 @@ def main() -> None:
         parser.error("--spread-max must be between 0 and 1")
 
     # The spread band. Reading config's default band also checks it, so a bad
-    # default stops the run here rather than hours in. With neither flag given
+    # default stops the run here, before logging starts. With neither flag given
     # the backtest uses the default itself (None); with one or both, the floor
     # must be below the ceiling. Values print exactly, so the error never shows
     # two numbers that look equal
@@ -414,8 +421,8 @@ def main() -> None:
             )
         spread_band = (resolved_floor, resolved_ceiling)
 
-    # Also checked before logging starts: otherwise a bad date could create, or
-    # rotate away, the log of earlier runs for a run that never happened
+    # Also checked before logging starts, so a bad date leaves no trace in the
+    # log (delay=True below is a second guard)
     try:
         start_date = date.fromisoformat(args.start_date)
     except ValueError:
@@ -438,13 +445,12 @@ def main() -> None:
 
     use_cache = not args.no_cache
 
-    # The values below are worked out now only so the "Backtest config" line,
-    # logged before the long data download, can show them: a run set up wrong
-    # can then be stopped early. The backtest works them out again itself.
-    # k, from the flag or else config
+    # k, the ladder setting and the spread band are worked out here only so the
+    # "Backtest config" line, logged before the long data download, can show
+    # them: a run set up wrong can then be stopped early. The backtest works
+    # them out again itself
     effective_k = (TIME_SERIES_INTERVAL_PROB_DISCOUNT if args.interval_discount is None
                    else args.interval_discount)
-    # Same-event ladders, from the flag or else config
     effective_ladders = (TIME_SERIES_SAME_EVENT_LADDERS if args.same_event_ladders is None
                          else args.same_event_ladders)
     # Say so when the run differs from config, since it then does not replay the live rule
@@ -454,9 +460,9 @@ def main() -> None:
     # The spread band, read the same way the backtest reads it (already checked above)
     echo_floor, echo_ceiling = time_series_spread_band(spread_band)
     # The dashboard's extra views, each on unless its --no-… option was given.
-    # Only the band grid is simulated during the run; the others are simulated
-    # while the dashboard is built. The minimum price rises are part of the
-    # trim view, so they are off whenever it is
+    # The band grid is simulated during the run; the others only while the
+    # dashboard is built. The minimum price rises are part of the trim view,
+    # so they are off whenever it is (the backtest refuses one without the other)
     band_sweep = not args.no_band_sweep
     cap_sweep = not args.no_cap_sweep
     add_on_sweep = not args.no_add_on_sweep
@@ -472,7 +478,6 @@ def main() -> None:
     try:
         _live = live_defaults()
         live_rule_echo = describe_time_series_rule(_live.tier_floors, _live.spread_band)
-        # Add the category/tag filter only when one is set
         if _live.categories is not None or _live.tags is not None:
             live_rule_echo += f"; category/tag filter ({describe_trade_filter(_live)})"
         # Which saved file, and when it was saved
@@ -522,7 +527,6 @@ def main() -> None:
         "on" if add_on_sweep else "off",
         f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
         if sell_sweep else "off",
-        # The trim view, saying when it runs without its minimum price rises
         "off" if not trim_sweep else "on" if trim_rise_sweep
         else "on (no minimum price rises)",
         live_rule_echo, _fills_echo(depth_model),
@@ -557,10 +561,11 @@ def main() -> None:
             " (the band sweep's grid bands are unaffected)" if band_sweep else "",
         )
 
-    # Kalshi's list of series and their categories, read once (a saved copy is
-    # reused for a week). The backtest uses it to tell two sports apart when
-    # pairing same-title markets, and the dashboard to group trades by category.
-    # Never fails: it falls back to an older copy, or to an empty list
+    # Kalshi's list of series and their categories, read once (a saved copy
+    # under a week old is reused). The backtest uses it to tell two sports
+    # apart when pairing same-title markets, and the dashboard to group trades
+    # by category. Never fails: if the download fails it uses the saved copy
+    # however old, or none at all
     series_categories = load_series_categories(live_client)
     # Run the backtest. It returns the main scenario's result plus everything
     # the dashboard needs for its other views
@@ -576,16 +581,17 @@ def main() -> None:
         same_event_ladders=args.same_event_ladders,
         spread_band=spread_band,
         band_sweep=band_sweep,
-        # With the band grid, also run its bands with the price-gap minimums
-        # switched off (the dashboard's Tier floors view)
+        # With the band grid, also re-run the bands where the price-gap
+        # minimums matter with them switched off (the dashboard's Tier floors
+        # view). This needs the band grid, so it follows it
         tier_off_sweep=band_sweep,
         cap_sweep=cap_sweep,
         add_on_sweep=add_on_sweep,
         sell_sweep=sell_sweep,
         trim_sweep=trim_sweep,
         trim_rise_sweep=trim_rise_sweep,
-        # Each trade is sized on an order book built from this model (None:
-        # trades fill at the best price, in any size)
+        # Trades are sized on order books built from this model where volume
+        # data allows (None, or no volume data: the best price, in any size)
         depth_model=depth_model,
         series_categories=series_categories,
     )
@@ -612,8 +618,8 @@ def main() -> None:
     _log_corpus_provenance(result)
 
     # T-bill yields, which the dashboard's Sharpe and Sortino ratios subtract.
-    # Never fails (it falls back to a saved copy), but a download that hangs
-    # can take a few minutes first
+    # Never fails: it falls back to a saved copy or, with none, the dashboard
+    # subtracts 0%. A download that hangs can take a few minutes first
     risk_free = load_risk_free_rates()
     # Write the dashboard (it logs where). It is given the full result for its
     # views, the k the trades were sized at, and where the balance came from
