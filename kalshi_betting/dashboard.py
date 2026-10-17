@@ -601,6 +601,7 @@ from .config import (
     DEFAULTS_SERVER_MAX_FILTER_NAMES,
     DEFAULTS_SERVER_PORT,
     FLAT_RETURN_TOLERANCE,
+    KHAT_CONFIDENCE_LEVEL,
     LIVE_DEFAULTS_SOURCE_PATTERN,
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
@@ -1362,9 +1363,15 @@ _KPI_TEMPLATE = """
             font-family:sans-serif;">
   <div style="font-size:12px; color:#757575; text-transform:uppercase;
               letter-spacing:0.5px;">{label}</div>
-  <div{value_attr} style="font-size:26px; font-weight:700; color:{color};">{value}</div>
+  <div{value_attr} style="font-size:26px; font-weight:700; color:{color};">{value}</div>{note}
 </div>
 """
+
+# A short grey line under a KPI card's value (_kpi's note). Its id is
+# "kpi-<key>_note" on a keyed card, so the page's filter script can rewrite it,
+# and its title is the hover text that explains it.
+_KPI_NOTE_TEMPLATE = ('\n  <div{note_attr} title="{title}" style="font-size:12px; '
+                      'color:#757575; margin-top:4px;">{note}</div>')
 
 
 # The default colour of a KPI card's value, spelled once: _kpi's default, and
@@ -1373,7 +1380,7 @@ _KPI_DEFAULT_COLOR = "#212121"
 
 
 def _kpi(label: str, value: str, color: str = _KPI_DEFAULT_COLOR,
-         key: str | None = None) -> str:
+         key: str | None = None, note: str | None = None, note_title: str = "") -> str:
     """
     Render a single KPI card as an HTML snippet using the _KPI_TEMPLATE.
 
@@ -1384,13 +1391,21 @@ def _kpi(label: str, value: str, color: str = _KPI_DEFAULT_COLOR,
         key (str | None): When given, the value element carries id="kpi-<key>",
             so the page's filter script can rewrite it for another selection.
             None (default) renders the card exactly as before, with no id.
+        note (str | None): A short grey line shown under the value
+            (_KPI_NOTE_TEMPLATE), with id="kpi-<key>_note" when the card has
+            a key. None (default) adds nothing, so the card's HTML is exactly
+            what it is without a note.
+        note_title (str): The note's hover text (escaped here).
 
     Returns:
         str: Rendered HTML string for one KPI card block.
     """
     value_attr = f' id="kpi-{key}"' if key else ""
+    note_html = "" if note is None else _KPI_NOTE_TEMPLATE.format(
+        note_attr=f' id="kpi-{key}_note"' if key else "",
+        title=html.escape(note_title, quote=True), note=html.escape(note, quote=False))
     return _KPI_TEMPLATE.format(label=label, value=value, color=color,
-                                value_attr=value_attr)
+                                value_attr=value_attr, note=note_html)
 
 
 def _filterable_body(prefix: str, has_trades: bool, body: str) -> str:
@@ -1566,6 +1581,7 @@ def _section_performance(
     initial_balance: float,
     *,
     extra_kpis: list[tuple[str, str, str, str]] | None = None,
+    kpi_notes: dict[str, tuple[str, str]] | None = None,
     risk_free: RiskFreeRates | None = None,
 ) -> str:
     """
@@ -1591,6 +1607,10 @@ def _section_performance(
             k-hat cards (_khat_kpis). None (default) renders the section
             exactly as it was before those cards existed: no card and no
             caption.
+        kpi_notes (dict | None): Keyword-only. A grey line under some of the
+            extra_kpis cards, keyed by the card's key: (note, hover text) —
+            generate_dashboard's k-hat confidence interval under "Empirical
+            k̂". None (default), or a key it does not name, adds no line.
         risk_free (RiskFreeRates | None): Keyword-only. The rates the Sharpe
             and Sortino cards subtract (_performance_kpis). None (default)
             subtracts nothing.
@@ -1605,7 +1625,10 @@ def _section_performance(
     if extra_kpis is not None:
         # Keyed too: the filter script rewrites the k-hat cards for the band,
         # category or tag and k on screen (renderKhatCards)
-        kpis += "".join(_kpi(label, value, color, key=key)
+        notes = kpi_notes or {}
+        kpis += "".join(_kpi(label, value, color, key=key,
+                             note=notes[key][0] if key in notes else None,
+                             note_title=notes[key][1] if key in notes else "")
                         for key, label, value, color in extra_kpis)
         kpis += _KHAT_CARDS_CAPTION
     total, type_lines, drawdown = _performance_series(equity_df, trades, initial_balance)
@@ -2352,6 +2375,9 @@ _KHAT_CARDS_CAPTION = (
     "size cap. k&#770; − k is that figure minus the k shown: positive means the in-between "
     "outcome landed more often than the sizer assumed, i.e. it sized too big. The Empirical "
     "k&#770; section below breaks the same figure down by category, tag and spread band. "
+    f"The small line under Empirical k&#770; is its {KHAT_CONFIDENCE_LEVEL * 100:g}% "
+    "confidence interval, counting each event once (— when there is no k&#770;, fewer than "
+    "two events, or none settled in between). "
     f"Recommendation only: live sizing reads {_LIVE_K_READ}.</p>")
 
 
@@ -2989,7 +3015,18 @@ _KHAT_TEXT = {
     "khat_sized_at": "sized at {k}",
     # The label on a bar: its entries and its distinct events (_khat_bar_text)
     "khat_bar": "n={n} · {events} ev",
+    # The line under the "Empirical k̂" card: k-hat's confidence interval
+    # (_khat_ci_text), or a dash where there is none
+    "khat_ci": f"{KHAT_CONFIDENCE_LEVEL * 100:g}% CI: {{lo}}–{{hi}}",
+    "khat_ci_blank": f"{KHAT_CONFIDENCE_LEVEL * 100:g}% CI: —",
 }
+
+# The hover text on that line: what the range means, in plain words
+_KHAT_CI_TITLE = (
+    f"A range built to hold the true k about {KHAT_CONFIDENCE_LEVEL * 100:g} times out of "
+    "100 (less often when there are few events). Each event counts once, since the rungs "
+    "of one ladder settle together, so few events give a wide range. Shows — when there "
+    "are fewer than two events or none settled in between.")
 
 # The k-hat chart's reference line, as drawn: a dashed vertical line and its
 # label above the plot, with no x (the k) and no label text — _section_khat
@@ -3061,6 +3098,135 @@ def _khat_finish(stat: dict) -> dict:
     return stat
 
 
+def _khat_t_quantile(df: int) -> float:
+    """
+    The Student-t quantile a KHAT_CONFIDENCE_LEVEL two-sided interval uses.
+
+    scipy is imported here, when a page is built, rather than at the top of
+    the module: the live dashboard imports this module for its Sharpe and
+    Sortino and never needs scipy.
+
+    Args:
+        df (int): Degrees of freedom (events − 1), at least 1.
+
+    Returns:
+        float: t such that a Student-t variable with df degrees of freedom
+            lies within ±t with probability KHAT_CONFIDENCE_LEVEL.
+    """
+    from scipy.stats import t as student_t
+    return float(student_t.ppf(0.5 + KHAT_CONFIDENCE_LEVEL / 2, df))
+
+
+def _khat_cluster_sums(observations) -> list[float]:
+    """
+    The per-event sums a k-hat confidence interval is built from.
+
+    For each event (market A's event ticker; a missing ticker is one ""
+    event, as _khat_stat counts it), Y is its entries that settled in
+    between and X the sum of their mid spreads. Returned are ΣY², ΣY·X and
+    ΣX² over the events. These add across groups whose events do not
+    overlap, which is how the page's script works out the interval for a
+    mix of several tags (each event sits in exactly one tag).
+
+    Args:
+        observations: backtester.CalibrationObservation records.
+
+    Returns:
+        list[float]: [ΣY², ΣY·X, ΣX²] over the events, in the order each
+            event first appears.
+    """
+    per_event: dict[str, list[float]] = {}
+    for o in observations:
+        event = per_event.setdefault(o.event_ticker, [0.0, 0.0])
+        event[0] += 1.0 if o.in_between else 0.0
+        event[1] += o.implied
+    syy = sxy = sxx = 0.0
+    for y, x in per_event.values():
+        syy += y * y
+        sxy += y * x
+        sxx += x * x
+    return [syy, sxy, sxx]
+
+
+def _khat_interval(k: float | None, gaps: float, sums: list[float],
+                   events: int | None) -> tuple[float, float] | None:
+    """
+    The KHAT_CONFIDENCE_LEVEL confidence interval around k-hat, counting each
+    event as one piece of evidence.
+
+    k-hat is Y / X: entries that settled in between over the sum of their
+    mid spreads. The rungs of one ladder settle together, so they are not
+    independent; each event is treated as one cluster. The spread of k-hat
+    is then sqrt(G / (G − 1) · Σ (Y_e − k̂·X_e)²) / X over the G events, and
+    the interval is k-hat ± the Student-t quantile with G − 1 degrees of
+    freedom times that spread, its lower end held at 0. Σ (Y_e − k̂·X_e)² is
+    worked out from the three sums of _khat_cluster_sums. When it is 0 — no
+    entry settled in between, so k-hat is 0 and every Y_e is 0 — the range
+    would have no width, which reads as certainty, so there is no interval.
+    The page's script (khatCiText) uses the same formula in the same order,
+    from the tag groups' sums added together, so a mix's line can differ
+    from Python's only by float rounding at a three-decimal tie, as every
+    figure of a mix can.
+
+    Args:
+        k (float | None): k-hat, or None when it is not known.
+        gaps (float): X, the sum of the mid spreads.
+        sums (list[float]): [ΣY², ΣY·X, ΣX²] over the events.
+        events (int | None): G, the number of events (None when not known).
+
+    Returns:
+        tuple[float, float] | None: (low, high), or None with no k-hat,
+            fewer than two events, no positive sum of mid spreads, or a
+            Σ (Y_e − k̂·X_e)² that is not above 0 (none settled in between).
+    """
+    if k is None or events is None or events < 2 or not gaps > 0:
+        return None
+    syy, sxy, sxx = sums
+    spread = max(0.0, syy - 2.0 * k * sxy + k * k * sxx)
+    if not spread > 0:
+        return None
+    half = _khat_t_quantile(events - 1) * (math.sqrt(events / (events - 1) * spread) / gaps)
+    return (max(0.0, k - half), k + half)
+
+
+def _khat_t_table(bands: list) -> list:
+    """
+    The Student-t quantiles the page's script needs for k-hat intervals.
+
+    A mix of several tags never holds more events than its band's whole
+    population, so the table runs up to the most events any band's "all"
+    group holds.
+
+    Args:
+        bands (list): _khat_band results (None for a band with none).
+
+    Returns:
+        list: [None, t(1), t(2), …] — index d is _khat_t_quantile(d) — up
+            to one less than the largest event count; [None] when no band
+            has two events.
+    """
+    most = max((b["groups"]["all"]["events"] or 0 for b in bands
+                if b is not None and b["groups"].get("all")), default=0)
+    return [None] + [_khat_t_quantile(df) for df in range(1, most)]
+
+
+def _khat_ci_text(interval: tuple[float, float] | None) -> str:
+    """
+    The line under the "Empirical k̂" card, for an interval.
+
+    Args:
+        interval (tuple | None): A _khat_interval, or None.
+
+    Returns:
+        str: "95% CI: 0.690–1.160" (three decimals, the level from
+            KHAT_CONFIDENCE_LEVEL), or "95% CI: —" with no interval.
+    """
+    if interval is None:
+        return _KHAT_TEXT["khat_ci_blank"]
+    return _KHAT_TEXT["khat_ci"].format(lo=format(interval[0], ".3f"),
+                                        hi=format(interval[1], ".3f"))
+
+
 def _khat_stat(observations) -> dict:
     """
     Reduce a group of k-hat observations to the figures the chart shows.
@@ -3084,12 +3250,20 @@ def _khat_stat(observations) -> dict:
             to how much evidence a bar holds than the entry count — the
             rungs of one ladder share one event and settle together — but it
             is not a count of independent outcomes: one question listed as
-            several events (Oct, Nov, Dec) still counts each.
+            several events (Oct, Nov, Dec) still counts each. Also "ci":
+            the line under the "Empirical k̂" card, k-hat's confidence
+            interval counting each event once (_khat_interval,
+            _khat_ci_text).
     """
     bucket = _calibration_bucket("", 0.0, observations)
-    return _khat_finish({"n": bucket.n, "events": len({o.event_ticker for o in observations}),
+    events = len({o.event_ticker for o in observations})
+    stat = _khat_finish({"n": bucket.n, "events": events,
                          "rate": bucket.realised_rate, "implied": bucket.mean_implied,
                          "k": bucket.empirical_k})
+    gaps = sum(o.implied for o in observations)
+    stat["ci"] = _khat_ci_text(_khat_interval(bucket.empirical_k, gaps,
+                                              _khat_cluster_sums(observations), events))
+    return stat
 
 
 def _calibration_khat_stat(calibration: IntervalCalibration | None) -> dict | None:
@@ -3111,15 +3285,18 @@ def _calibration_khat_stat(calibration: IntervalCalibration | None) -> dict | No
             put back together: only it reproduces the pooled row to the last
             bit — or, for a calibration that does not carry its population
             (len(observations) != pooled.n — a hand-built one), its pooled
-            row, with "events" None.
+            row, with "events" None and no confidence interval ("ci" the
+            blank line), since there are no events to count.
     """
     if calibration is None:
         return None
     observations = calibration.observations
     if len(observations) != calibration.pooled.n:
         pooled = calibration.pooled
-        return _khat_finish({"n": pooled.n, "events": None, "rate": pooled.realised_rate,
+        stat = _khat_finish({"n": pooled.n, "events": None, "rate": pooled.realised_rate,
                              "implied": pooled.mean_implied, "k": pooled.empirical_k})
+        stat["ci"] = _khat_ci_text(None)
+        return stat
     return _khat_stat(observations)
 
 
@@ -3208,8 +3385,9 @@ def _khat_band(
         dict | None: None when the band has no calibration; otherwise
             "carried" and "groups" (view key -> _khat_stat, keys as the
             filter's: "all", "c<i>", "s<i>"; each "s<i>" group also carries
-            "raw": [entries settled in between, sum of implied gaps], which
-            the page pools for a mix of several tags). A calibration that does not
+            "raw": [entries settled in between, sum of implied gaps] and
+            "ci_raw" (_khat_cluster_sums of its observations), which the page
+            pools for a mix of several tags). A calibration that does not
             carry its population (len(observations) != pooled.n — a
             hand-built one) keeps only "all", taken from its pooled row, with
             "events" None, since there is nothing to break down.
@@ -3234,6 +3412,10 @@ def _khat_band(
                 # the sum of the implied gaps (k-hat is their ratio)
                 stats[key]["raw"] = [sum(1 for o in members if o.in_between),
                                      sum(o.implied for o in members)]
+                # And its per-event sums, from which the page works out the
+                # mix's confidence interval: each event sits in one tag, so
+                # a mix's sums are its tags' sums added
+                stats[key]["ci_raw"] = _khat_cluster_sums(members)
     if ks:
         for stat in stats.values():
             _khat_with_deltas(stat, ks)
@@ -12166,7 +12348,9 @@ def _filter_payload(
             order, every group carrying "delta" per k), "khat_off" (null, or
             the same per band with the tier floors off: a binding band's
             tier-off calibration, every other band's own), "khat_blank" (the
-            table cells of a group with no k-hat), "kd" and "save" (both
+            table cells of a group with no k-hat), "khat_t" (_khat_t_table:
+            the Student-t quantile of the k-hat interval by degrees of
+            freedom), "kd" and "save" (both
             above), "grid_add" (null, or [band][k][cap] -> chunk id or null,
             the Add to held pairs grid, chunks.add_grid()), "grid_add_off"
             (null, or the same with the tier floors off, present only with
@@ -12227,6 +12411,20 @@ def _filter_payload(
     grid_rise = (chunks.trim_rise_grid()
                  if (trim_view and source.trim_rise_cell is not None) else None)
     rise_view = grid_rise is not None
+    # Per band, its k-hat population broken down like its trades
+    # (_khat_band) — each group with its k-hat − k at every k of the bar,
+    # for the performance section's cards
+    khat = [_khat_band(source.calibrations.get(band), series_categories,
+                       chunks.cat_index, chunks.sub_index, ks=source.ks)
+            for band in source.bands]
+    # The same with the tier floors off: a binding band regroups its
+    # tier-off run's calibration, every other band its own
+    khat_off = (None if not off_view else
+                [_khat_band(source.off_calibrations.get(band) if binds[i]
+                            else source.calibrations.get(band),
+                            series_categories, chunks.cat_index, chunks.sub_index,
+                            ks=source.ks)
+                 for i, band in enumerate(source.bands)])
     return {
         "dates": [d.date().isoformat() for d in axis],
         "bands": [{"label": _band_option(band),
@@ -12296,22 +12494,15 @@ def _filter_payload(
                    # A known k-hat on the performance section's card: the
                    # colour _khat_kpis gives it (red on a tainted corpus)
                    "khat_card": _khat_card_color(tainted)},
-        # Per band, its k-hat population broken down like its trades
-        # (_khat_band) — each group with its k-hat − k at every k of the bar,
-        # for the performance section's cards — and the cells of a group
-        # with none
-        "khat": [_khat_band(source.calibrations.get(band), series_categories,
-                            chunks.cat_index, chunks.sub_index, ks=source.ks)
-                 for band in source.bands],
-        # The same with the tier floors off: a binding band regroups its
-        # tier-off run's calibration, every other band its own
-        "khat_off": (None if not off_view else
-                     [_khat_band(source.off_calibrations.get(band) if binds[i]
-                                 else source.calibrations.get(band),
-                                 series_categories, chunks.cat_index, chunks.sub_index,
-                                 ks=source.ks)
-                      for i, band in enumerate(source.bands)]),
+        # The k-hat breakdown per band (above), with the tier floors on and
+        # off, and the cells of a group with none
+        "khat": khat,
+        "khat_off": khat_off,
         "khat_blank": _khat_cells(None),
+        # The Student-t quantile of the k-hat confidence interval for each
+        # count of events the script can meet (index = degrees of freedom),
+        # so the script looks it up rather than computing it
+        "khat_t": _khat_t_table(khat + (khat_off or [])),
         # The interval-discount section at every k and cap (the page's axis
         # is "dates" above, so the section's own copy of it is not shipped)
         "kd": None if kd is None else {key: value for key, value in kd.items()
@@ -14122,7 +14313,7 @@ _FILTER_JS = r"""
   function pooledKhat(band, atoms) {
     band._pool = band._pool || {at: {}, keys: []};
     return remember(band._pool, atoms.join(','), function() {
-      var n = 0, events = 0, between = 0, gaps = 0;
+      var n = 0, events = 0, between = 0, gaps = 0, s = [0, 0, 0], ciKnown = true;
       atoms.forEach(function(i) {
         var g = band.groups['s' + i];
         if (!g || !g.raw) { return; }
@@ -14130,6 +14321,13 @@ _FILTER_JS = r"""
         events += g.events;
         between += g.raw[0];
         gaps += g.raw[1];
+        if (g.ci_raw) {
+          for (var j = 0; j < 3; j++) { s[j] += g.ci_raw[j]; }
+        } else {
+          // A tag pooled without its per-event sums: the interval would
+          // leave its events out and read too narrow, so there is none
+          ciKnown = false;
+        }
       });
       if (!(n > 0)) { return null; }
       var rate = between / n, implied = gaps / n, k = implied > 0 ? rate / implied : null;
@@ -14137,8 +14335,28 @@ _FILTER_JS = r"""
               text: fill(D.text.khat_bar, {n: n, events: events}),
               cells: [String(n), String(events), fixed(rate, 4), fixed(implied, 4),
                       k === null ? D.mix.none : fixed(k, 3)],
-              delta: D.ks.map(function(kk) { return khatDelta(k, kk.value); })};
+              delta: D.ks.map(function(kk) { return khatDelta(k, kk.value); }),
+              ci: ciKnown ? khatCiText(k, gaps, s, events) : D.text.khat_ci_blank};
     });
+  }
+  // The line under the k-hat card for a mix of tags: k-hat's confidence
+  // interval, counting each event once. It uses _khat_interval's formula in
+  // the same order, with _khat_ci_text's words, from the per-event sums the
+  // tag groups carry (ci_raw; each event sits in one tag, so a mix's sums
+  // are its tags' sums added) and the Student-t quantiles Python looked up
+  // (khat_t). Its figure can differ from Python's only by float rounding at
+  // a three-decimal tie, as every figure of a mix can. A dash with no
+  // k-hat, fewer than two events, no positive gap, or none settled in
+  // between (a range of no width)
+  function khatCiText(k, gaps, s, events) {
+    var t = D.khat_t ? D.khat_t[events - 1] : null;
+    if (k === null || !(events >= 2) || !(gaps > 0) || typeof t !== 'number') {
+      return D.text.khat_ci_blank;
+    }
+    var spread = Math.max(0, s[0] - 2 * k * s[1] + k * k * s[2]);
+    if (!(spread > 0)) { return D.text.khat_ci_blank; }
+    var half = t * (Math.sqrt(events / (events - 1) * spread) / gaps);
+    return fill(D.text.khat_ci, {lo: fixed(Math.max(0, k - half), 3), hi: fixed(k + half, 3)});
   }
   function khatFor(band, cats, tags) {
     if (!band) { return null; }
@@ -14269,12 +14487,14 @@ _FILTER_JS = r"""
   // (SHOWN, like the k-hat chart): the k-hat figures of the band, Tier floors
   // choice and ticks shown (khatFor: the k-hat breakdown's own group, or
   // several tags' groups pooled) — its table cell — and its k-hat − k at
-  // the k shown, text and colour as Python formats them (_khat_kpis).
+  // the k shown, text and colour as Python formats them (_khat_kpis), and
+  // the line under k-hat, its confidence interval (the group's "ci").
   // Nothing to show is the blank cell in the default colour. None of it is
   // on a page without the cards (no sweep): then nothing is done.
   function renderKhatCards() {
     var khat = byId('kpi-khat'), delta = byId('kpi-khat_delta');
     if (!khat || !delta) { return; }
+    var note = byId('kpi-khat_note');
     var st = khatFor(khatAt(SHOWN[5])[SHOWN[0]], SHOWN[3], SHOWN[4]);
     var blank = [D.khat_blank[4], D.styles.kpi_default];
     var known = st !== null && st.k !== null;
@@ -14283,6 +14503,8 @@ _FILTER_JS = r"""
     var d = (st && st.delta) ? st.delta[SHOWN[1]] : blank;
     delta.textContent = d[0];
     delta.style.color = d[1];
+    // The line under k-hat: the same group's confidence interval
+    if (note) { note.textContent = (st && st.ci) ? st.ci : D.text.khat_ci_blank; }
   }
   // One row of the interval-discount section's per-k table: Python's cells
   // (_kd_cells), the k shown in bold — the row _kd_row_html renders
@@ -15035,11 +15257,15 @@ def generate_dashboard(
     # the interval-discount section's own k-hat − k card — then agree; they
     # are one and the same value on every production call, where the two ks
     # are equal. No sweep, no k-hat at all: no cards.
-    khat_cards = None
+    khat_cards = khat_notes = None
     if sweep is not None:
         stat = _calibration_khat_stat(_primary_calibration(sweep))
         khat_cards = _khat_kpis(
             None if stat is None else _khat_with_deltas(stat, (sweep.primary.k,)), 0, tainted)
+        # The grey line under "Empirical k̂": the same group's confidence
+        # interval, which the script rewrites with the card
+        khat_notes = {"khat": (_khat_ci_text(None) if stat is None else stat["ci"],
+                               _KHAT_CI_TITLE)}
 
     # The page-wide filter: every spread band x k x size cap scenario's own
     # run, and within it every Kalshi category and category · tag, each view
@@ -15232,7 +15458,8 @@ def generate_dashboard(
     sections = (
         # The two k-hat cards ride along (None without a sweep: no cards)
         lambda: _section_performance(equity_df, trades, start_date, initial_balance,
-                                     extra_kpis=khat_cards, risk_free=risk_free),
+                                     extra_kpis=khat_cards, kpi_notes=khat_notes,
+                                     risk_free=risk_free),
         lambda: _section_decomposition(trades, series_categories),
         lambda: _section_calibration(trades),
         # Takes the sweep whole (calibration + every point + the primary k),
