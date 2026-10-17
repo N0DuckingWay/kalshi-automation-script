@@ -438,101 +438,78 @@ def main() -> None:
 
     use_cache = not args.no_cache
 
-    # Resolve --interval-discount's "no override" sentinel the same way
-    # run_backtest_sweep does, purely so the echo lands BEFORE a multi-hour
-    # fetch. result.primary.k below is the authoritative resolved copy and is
-    # what the dashboard is handed.
+    # The values below are worked out now only so the "Backtest config" line,
+    # logged before the long data download, can show them: a run set up wrong
+    # can then be stopped early. The backtest works them out again itself.
+    # k, from the flag or else config
     effective_k = (TIME_SERIES_INTERVAL_PROB_DISCOUNT if args.interval_discount is None
                    else args.interval_discount)
-    # Same pre-fetch echo, same reason, for DR-73's switch: run_backtest_sweep
-    # logs the authoritative resolved value with its source, but this line
-    # lands BEFORE a multi-hour fetch so an operator can abort a run configured
-    # the wrong way round.
+    # Same-event ladders, from the flag or else config
     effective_ladders = (TIME_SERIES_SAME_EVENT_LADDERS if args.same_event_ladders is None
                          else args.same_event_ladders)
-    # Named against the config when the run departs from it, so the line read
-    # before a multi-hour fetch says the run will not replay the live rule.
+    # Say so when the run differs from config, since it then does not replay the live rule
     ladders_echo = "on" if effective_ladders else "off"
     if bool(effective_ladders) != bool(TIME_SERIES_SAME_EVENT_LADDERS):
         ladders_echo += f" (config: {'on' if TIME_SERIES_SAME_EVENT_LADDERS else 'off'})"
-    # Same pre-fetch echo, same reason, for the spread band: the VALUE is
-    # resolved through the same config function run_backtest_sweep calls
-    # (never a by-value copy of BACKTEST_DEFAULT_SPREAD_BAND), so it cannot
-    # resolve a different band. Both the configured default and any flag
-    # were validated above, so this call only reads them back and cannot
-    # raise here. It is RENDERED with %g, like k's %.3f beside it, so two
-    # bands differing below %g's six significant digits print alike;
-    # run_backtest_sweep's own "Time-series spread band" line, also logged
-    # before any fetch, renders the resolved band exactly.
+    # The spread band, read the same way the backtest reads it (already checked above)
     echo_floor, echo_ceiling = time_series_spread_band(spread_band)
+    # The dashboard's extra views, each on unless its --no-… option was given.
+    # Only the band grid is simulated during the run; the others are simulated
+    # while the dashboard is built. The minimum price rises are part of the
+    # trim view, so they are off whenever it is
     band_sweep = not args.no_band_sweep
-    # ON by default, like the band sweep: it simulates nothing during the run
-    # (each cell is simulated lazily, only when a report reads it), so the
-    # opt-out saves nothing in the run itself — only the time and size of
-    # whatever report reads the cells, and the entries kept alive for it
     cap_sweep = not args.no_cap_sweep
-    # ON by default, like the cap sweep, and for the same reason: nothing is
-    # simulated during the run, so the opt-out saves only the dashboard step
     add_on_sweep = not args.no_add_on_sweep
-    # ON by default too, and lazy the same way: the dashboard simulates it
     sell_sweep = not args.no_sell_sweep
-    # ... and so is the Trim to Kelly select's family
     trim_sweep = not args.no_trim_sweep
-    # ... and, as part of that family, the minimum price rises its trims can
-    # be made to wait for (the Min. price rise select): on with it unless
-    # opted out, and off whenever the family itself is
     trim_rise_sweep = trim_sweep and not args.no_trim_rise_sweep
-    # The dashboard simulates the Sell select in worker processes: one less
-    # than the CPUs (the main process waits on them), within the config bound
+    # Worker processes for the dashboard's Sell view: one fewer than the CPUs
+    # (the main process waits on them), up to the config limit
     sell_workers = (args.sell_workers if args.sell_workers is not None
                     else max(1, min((os.cpu_count() or 1) - 1, DASHBOARD_SELL_MAX_WORKERS)))
-    # The saved live defaults' rule and filter, for the echo only: a read of its
-    # own, separate from run_backtest_sweep's (which logs the INFO or WARNING).
-    # Fails soft, unlike the checks above (one echo clause must not abort a run)
+    # The saved live settings, shown on the config line for comparison only.
+    # A problem reading them is shown there, never allowed to stop the run
     try:
         _live = live_defaults()
         live_rule_echo = describe_time_series_rule(_live.tier_floors, _live.spread_band)
-        # The category/tag filter only when one is set, in the live run's words
+        # Add the category/tag filter only when one is set
         if _live.categories is not None or _live.tags is not None:
             live_rule_echo += f"; category/tag filter ({describe_trade_filter(_live)})"
-        # Which saved file, when and from what
+        # Which saved file, and when it was saved
         live_rule_echo += f" ({_live.origin})"
     except LiveDefaultsMissing:
         live_rule_echo = "none saved (live runs refuse to start)"
     except LiveDefaultsError as e:
         live_rule_echo = f"not recorded — the saved live defaults are refused ({e})"
 
-    # Always uses prod API — historical data only exists there.
-    hist_client = build_historical_client()  # authenticated prod KalshiClient for /historical raw GETs
-    live_client = build_prod_live_client()  # returns KalshiClient pointed at prod for recently-settled market fetching
+    # Past market data exists only on the production API
+    hist_client = build_historical_client()  # client for the archive of past markets
+    live_client = build_prod_live_client()  # client for recently settled markets and the account
 
-    # The starting balance, before the fetch so the echo below can name it:
-    # --balance when given, otherwise what the account is worth now
+    # The starting balance: --balance if given, otherwise the account's value now
     if args.balance is not None:
         start = StartingBalance(args.balance, "set by --balance")
     else:
         try:
-            # One read-only GET of the production account's balance
+            # One read-only request for the production account's balance
             start = _account_starting_balance(live_client)
         except StartingBalanceError as e:
-            # Stop rather than guess an amount: the run's trade sizes and
-            # returns follow from it. The log has no console handler, so the
-            # reason is printed to stderr too (SystemExit with a message, exit 1)
+            # Stop rather than guess an amount. The log file is not shown on
+            # screen, so the reason is also printed there (exit 1)
             message = f"{e}; pass --balance DOLLARS to choose a starting balance"
             logging.error("Backtest not run: %s", message)
             raise SystemExit(f"backtest: {message}") from None
     logging.info("Starting balance: $%s (%s)", f"{start.dollars:,.2f}", start.source)
     if start.dollars < MIN_BALANCE_CENTS / 100:
-        # A live run does not trade below this value; the backtest has no such stop
+        # A live run would not trade from this little; the backtest still does
         logging.warning(
             "Starting balance $%s is below the $%s minimum (config.MIN_BALANCE_CENTS) "
             "below which a live run does not trade; the backtest trades from it anyway",
             f"{start.dollars:,.2f}", f"{MIN_BALANCE_CENTS / 100:,.2f}",
         )
 
-    # Fit the depth table from the saved order-book snapshots before the fetch,
-    # so the echo below can say how trades will fill; never raises (with no
-    # usable snapshot it returns None and logs why)
+    # Build the order-book depth model from saved snapshots. Never fails: with
+    # none usable it returns None and logs why
     depth_model = load_depth_model()
 
     logging.info(
@@ -545,39 +522,22 @@ def main() -> None:
         "on" if add_on_sweep else "off",
         f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
         if sell_sweep else "off",
-        # A default run reads "on"; the family without its minimum price rises says so
+        # The trim view, saying when it runs without its minimum price rises
         "off" if not trim_sweep else "on" if trim_rise_sweep
         else "on (no minimum price rises)",
         live_rule_echo, _fills_echo(depth_model),
     )
-    # Warn on a ceiling that empties a tier. config.time_series_spread_band's
-    # docstring asks a caller taking an operator-typed ceiling to warn when it
-    # sits at or below a deadline-gap tier, so an emptied tier is not read as
-    # a strategy result. TS-20 does not apply — this is an advisory, not a
-    # rejected argument — so the WARNING is deliberately AFTER logging is
-    # configured, unlike the parser.error() checks above. The floor is
-    # irrelevant: the effective floor is max(tier, floor) and the floor sits
-    # below the ceiling. Each tier is judged on a spread sitting exactly on
-    # it, the smallest real spread that tier's floor keeps. Two outcomes are
-    # warned:
-    #   - EMPTIED: config.time_series_spread_too_wide refuses even that
-    #     spread. That function is the one place the ceiling's PRICE_EPSILON
-    #     lives, and _find_entry refuses on the same predicate, so this
-    #     cannot drift from what the backtest does.
-    #   - ON THE TIER: the ceiling is within PRICE_EPSILON of the tier. The
-    #     tier then keeps only spreads sitting exactly on it, since no price
-    #     grid is fine enough to put a real spread within 2 x PRICE_EPSILON
-    #     above it.
-    # Only the PRIMARY scenario is affected: every band of the sweep grid
-    # sits above both tiers (config.SPREAD_BAND_SWEEP_CEILINGS), so the
-    # message says so when that grid runs. Tier labels come from the config
-    # day counts, never a literal.
+    # A time-series pair needs a minimum price gap, set in config by how far
+    # apart its deadlines are. If the spread band's upper limit is at or below
+    # one of those minimums, no pair (or almost none) of that kind can enter in
+    # the main scenario, so warn that its result for them means nothing. It uses
+    # the backtest's own upper-limit test, so it cannot disagree with the run
     tier_notes = []
     for tier_days, tier in (
         (f"0-{SHORT_DEADLINE_GAP_DAYS}-day", MIN_PRICE_DIFF_SHORT_GAP),
         (f"{SHORT_DEADLINE_GAP_DAYS + 1}-{MAX_DEADLINE_GAP_DAYS}-day", MIN_PRICE_DIFF_LONG_GAP),
     ):
-        # The backtest's own ceiling test, applied to an on-tier spread
+        # Is even a gap exactly at this minimum over the upper limit?
         if time_series_spread_too_wide(tier, echo_ceiling):
             tier_notes.append(
                 f"no {tier_days}-gap time-series candidate can enter "
