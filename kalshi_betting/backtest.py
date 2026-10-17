@@ -376,16 +376,16 @@ def main() -> None:
              "entries, so memory grows with the count",
     )
     args = parser.parse_args()
-    # Every return is measured against the starting balance, so it must be a
-    # real amount above 0 (float() also reads "nan" and "inf")
+    # Every option is checked here, before logging starts, so a bad one leaves
+    # no log file behind. The balance must be a real amount above 0 (float()
+    # also accepts "nan" and "inf")
     if args.balance is not None and not (math.isfinite(args.balance) and args.balance > 0):
         parser.error("--balance must be a positive number of dollars")
     if args.max_horizon_days is not None and args.max_horizon_days < 1:
         parser.error("--max-horizon-days must be a positive integer")
     if args.sell_workers is not None and args.sell_workers < 1:
         parser.error("--sell-workers must be a positive integer")
-    # Above 0, as the live sizer the backtest sizes through requires (k = 0
-    # would price every time-series pair as riskless)
+    # k = 0 would treat every time-series pair as risk-free
     if args.interval_discount is not None and not (0.0 < args.interval_discount <= 1.0):
         parser.error("--interval-discount must be above 0 and at most 1")
     if args.spread_min is not None and not (0.0 <= args.spread_min <= 1.0):
@@ -393,20 +393,11 @@ def main() -> None:
     if args.spread_max is not None and not (0.0 <= args.spread_max <= 1.0):
         parser.error("--spread-max must be between 0 and 1")
 
-    # Resolved here, BEFORE logging is configured (TS-20 — see the comment
-    # below). The configured default is read and validated on EVERY run,
-    # flags or not, through config's own function at call time (never a
-    # by-value copy of BACKTEST_DEFAULT_SPREAD_BAND): an invalid default then
-    # raises here, before any log file exists, rather than after basicConfig
-    # in the echo below; and it supplies the side a lone flag omits. Both
-    # flags omitted still hands run_backtest_sweep None, the "no override"
-    # sentinel it resolves to the configured default itself and logs with
-    # that source; either flag given hands it a (floor, ceiling) validated
-    # here against the same rule config.time_series_spread_band enforces
-    # (0 <= floor < ceiling <= 1, NaN refused by every comparison), so that
-    # function's own ValueError can never fire out of a multi-hour run. The
-    # bounds print with repr, which is exact, so a rejection can never read
-    # "floor 0.3 must be strictly less than the ceiling 0.3".
+    # The spread band. Reading config's default band also checks it, so a bad
+    # default stops the run here rather than hours in. With neither flag given
+    # the backtest uses the default itself (None); with one or both, the floor
+    # must be below the ceiling. Values print exactly, so the error never shows
+    # two numbers that look equal
     default_floor, default_ceiling = time_series_spread_band(None)
     if args.spread_min is None and args.spread_max is None:
         spread_band = None
@@ -423,12 +414,8 @@ def main() -> None:
             )
         spread_band = (resolved_floor, resolved_ceiling)
 
-    # Validated BEFORE logging is configured, alongside the other argument
-    # checks above, so a rejected argument leaves no trace: parser.error
-    # exits, and doing this after basicConfig created kalshi_backtest.log for
-    # a run that never happened — or, worse, ROTATED it, evicting real
-    # history to record nothing (TS-20). delay=True on the handler below is
-    # the belt to this brace, matching main.py and scheduler.py.
+    # Also checked before logging starts: otherwise a bad date could create, or
+    # rotate away, the log of earlier runs for a run that never happened
     try:
         start_date = date.fromisoformat(args.start_date)
     except ValueError:
@@ -439,17 +426,9 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
-            # BS-25: a single unrotated FileHandler grew to 398MB during one backtest
-            # sweep. 20MB/3 backups is logging infra sized for this CLI's own verbosity,
-            # not a strategy constant, so it stays inline rather than in config.py.
-            # TS-02: that budget only holds many runs because the per-ticker
-            # candlestick failure is now ONE line (no HTTP header dump) and the
-            # misses are summarized once per run by _fetch_candles_parallel.
-            # Before that, 99.5% of this file was that single warning and a
-            # sweep evicted ~419 MB of pre-sweep history through this rotation.
-            # delay=True: the file is opened on the first emit, not at
-            # construction, so a run that exits before logging anything leaves
-            # no file behind. Matches main.py and scheduler.py (TS-20).
+            # The log starts a new file at 20 MB and keeps the 3 before it, so it
+            # cannot grow without limit. delay=True opens the file only when
+            # something is first written to it
             logging.handlers.RotatingFileHandler(
                 PROJECT_ROOT / "kalshi_backtest.log", maxBytes=20 * 1024 * 1024,
                 backupCount=3, delay=True,
