@@ -557,11 +557,13 @@ def main() -> None:
             " (the band sweep's grid bands are unaffected)" if band_sweep else "",
         )
 
-    # Kalshi's /series listing, read once: the same-title sport check files
-    # each series by it (DR-79), and the dashboard files each trade under its
-    # series' category and tags. One cached read-only GET of /series, which
-    # never raises (it falls back to a stale copy or to {})
+    # Kalshi's list of series and their categories, read once (a saved copy is
+    # reused for a week). The backtest uses it to tell two sports apart when
+    # pairing same-title markets, and the dashboard to group trades by category.
+    # Never fails: it falls back to an older copy, or to an empty list
     series_categories = load_series_categories(live_client)
+    # Run the backtest. It returns the main scenario's result plus everything
+    # the dashboard needs for its other views
     result = run_backtest_sweep(
         hist_client=hist_client,
         live_client=live_client,
@@ -574,37 +576,20 @@ def main() -> None:
         same_event_ladders=args.same_event_ladders,
         spread_band=spread_band,
         band_sweep=band_sweep,
-        # The dashboard's "Tier floors: off" view: the band sweep's
-        # tier-bound bands simulated again with the tiers off (needs the grid)
+        # With the band grid, also run its bands with the price-gap minimums
+        # switched off (the dashboard's Tier floors view)
         tier_off_sweep=band_sweep,
         cap_sweep=cap_sweep,
-        # The dashboard's "Add to held pairs: on" views, simulated lazily when
-        # the page is built (no simulation during the run)
         add_on_sweep=add_on_sweep,
-        # The dashboard's Sell select, lazy the same way
         sell_sweep=sell_sweep,
-        # ... and its Trim to Kelly select
         trim_sweep=trim_sweep,
-        # ... with the Min. price rise select's minimums, part of that family
         trim_rise_sweep=trim_rise_sweep,
-        # Every trade's order book is built from this table (None: top of book)
+        # Each trade is sized on an order book built from this model (None:
+        # trades fill at the best price, in any size)
         depth_model=depth_model,
-        # The listing the same-title label check files each series by
         series_categories=series_categories,
-    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy add-on sweeps (add_on_cap_sweep, and add_on_tier_off_cap_sweep with the band sweep) unless --no-add-on-sweep
-    # Everything below reports the PRIMARY point, so the summary block and the
-    # dashboard's other six sections read exactly as they did before the sweep
-    # existed. The remaining k points are read by the filter bar's k select
-    # (which the Interval Discount section follows), the band-sweep payload by
-    # the dashboard's scenario explorer, filter bar and k-hat breakdown, the
-    # tier-floors-off family by that filter bar, k-hat breakdown and scenario
-    # explorer too (their Tier floors choice), and the lazy size-cap sweeps
-    # (result.cap_sweep and, over the
-    # tier-floors-off family, result.tier_off_cap_sweep, simulated only when
-    # a cell is read) only by the dashboard, whose one grid walk reads
-    # every cell as the page is built (filter bar, Interval Discount section
-    # and scenario explorer). The add-on sweeps (result.add_on_cap_sweep and
-    # result.add_on_tier_off_cap_sweep) are lazy the same way.
+    )
+    # The summary reports the main scenario; the rest is for the dashboard
     trades, equity_df = result.primary.trades, result.primary.equity_df
 
     if not trades:
@@ -614,54 +599,31 @@ def main() -> None:
         total_return = (final_value - start.dollars) / start.dollars
         n_win        = sum(1 for t in trades if t.profit > 0)
         logging.info("Backtest Summary")
-        # UTC, matching the window the backtester actually simulates
-        # (_prepare_candidates' feasibility end and _build_equity_curve's last
-        # row are both UTC dates) — a local date here would print a period
-        # the run did not cover (TS-13).
+        # Today's date in UTC, the time zone the simulation's dates use
         logging.info("  Period:        %s → %s", start_date, datetime.now(UTC).date())
         logging.info("  Total trades:  %d", len(trades))
         logging.info("  Win rate:      %.1f%%", n_win / len(trades) * 100)
         logging.info("  Total return:  %+.1f%%", total_return * 100)
-        # %-style logging has no thousands-separator flag — pre-format the value
+        # Formatted first, to get the thousands separators
         logging.info("  Final balance: $%s", f"{final_value:,.2f}")
 
-    # After either branch: the window (the Period line, when printed) runs to
-    # today but the corpus only to its assembly — say so beside the result
-    # rather than only at the top of a long log (DR-13)
+    # Say when the past-market data was put together: the period above runs to
+    # today, but the data holds nothing that settled after that
     _log_corpus_provenance(result)
 
-    # generate_dashboard() already logs "Dashboard written: %s" itself (BS-26) —
-    # don't duplicate that line here, just point the user at the file.
-    #
-    # sweep carries the calibration and every swept point for the k
-    # selectors, the scenario explorer's band x k payload, the filter bar,
-    # the k-hat breakdown, both Tier floors views (the bar's and the
-    # explorer's, from its tier-floors-off family), the lazy size-cap sweeps
-    # (cap_sweep and tier_off_cap_sweep, None under --no-cap-sweep — every
-    # cell of them is simulated here, in the page's one grid walk), the lazy
-    # add-on sweeps (add_on_cap_sweep and add_on_tier_off_cap_sweep, None
-    # under --no-add-on-sweep) and the header's run-settings line;
-    # interval_discount is the resolved k these trades were sized at, which
-    # the Risk section's Kelly scatter must price on
-    #
-    # series_categories (read above, the same copy the sweep's pairs were
-    # filed by) files each trade under Kalshi's own series category and tags
-    # for the Returns Decomposition breakdown.
-
-    # The T-bill yields every Sharpe and Sortino on the page subtracts; never
-    # raises (falls back to the saved copy, then "unavailable"), but an
-    # unresponsive single-address host can cost about 4 minutes first
+    # T-bill yields, which the dashboard's Sharpe and Sortino ratios subtract.
+    # Never fails (it falls back to a saved copy), but a download that hangs
+    # can take a few minutes first
     risk_free = load_risk_free_rates()
-    # balance_source: the header says where the starting balance came from
+    # Write the dashboard (it logs where). It is given the full result for its
+    # views, the k the trades were sized at, and where the balance came from
     generate_dashboard(trades, equity_df, start_date, start.dollars,
                        sweep=result, interval_discount=result.primary.k,
                        series_categories=series_categories, risk_free=risk_free,
                        sell_workers=sell_workers, balance_source=start.source)
     logging.info("Open the HTML file in a browser to view the interactive charts.")
-    # How a scenario on the page becomes the live defaults, or is traded: the
-    # page cannot write files or start runs, so its buttons open the defaults
-    # server's pages (started by ./start_dashboard.sh, beside the live
-    # dashboard, whose Backtest tab shows this page)
+    # The page cannot save settings or start runs itself; its buttons open the
+    # pages of the server ./start_dashboard.sh starts
     logging.info("To save the filter bar's scenario as the live defaults, or to trade: run "
                  "./start_dashboard.sh (it starts the defaults server and the live dashboard, "
                  "whose Backtest tab is this page), then use the filter bar's Save as live "
