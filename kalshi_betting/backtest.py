@@ -9,17 +9,20 @@ Purpose:
     --interval-discount, --no-sweep, --same-event-ladders /
     --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
     --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers,
-    --no-trim-sweep, --no-trim-rise-sweep),
+    --no-trim-sweep, --no-trim-rise-sweep, --dashboard-only,
+    --accept-changed-simulator),
     configures logging to kalshi_backtest.log, constructs the necessary API
     clients, works out the starting balance (--balance, or else what the Kalshi
     account is worth when the run starts), fits the depth model from the saved
     order-book snapshots (depth_model.load_depth_model) so each trade is sized
     over a modeled book, delegates the full backtest
-    simulation to backtester.run_backtest_sweep(), and then calls
+    simulation to backtester.run_backtest_sweep(), saves what the dashboard is
+    handed (config.BACKTEST_SWEEP_FILENAME), and then calls
     dashboard.generate_dashboard() to produce the interactive HTML report and,
     when the sell family is on, the sidecar chunk files its Sell select loads
     (a folder beside the page, config.DASHBOARD_FILES_DIRNAME, which must be
-    kept with it).
+    kept with it). With --dashboard-only it runs no backtest: it rebuilds the
+    page from the inputs the last full run saved.
     Prints a summary of key metrics (trade count, win rate, total return) to
     the log on completion, closed on every run by what settled-market corpus
     the run read (its assembly time, whether it was cached, and the archive
@@ -37,11 +40,17 @@ Dependencies:
     is built from; the backtest's fills line names it) from depth_model.py,
     read_account_balance (the account's cash and open positions,
     the starting balance when --balance is not given) from auth.py, and
-    api_error_summary (the one-line reason a failed balance read is reported
-    with) from _http.py.
+    api_error_summary (the one-line reason a failed balance read, or a failed
+    save or load of the saved sweep file, is reported with) from _http.py.
+    It reads, but does not import, the source files of the simulator modules
+    (backtester, strategy, scanner, depth_model, historical) and config.py,
+    to fingerprint the code a saved sweep was simulated with.
     Imports from config.py:
     PROJECT_ROOT, DASHBOARD_SELL_MAX_WORKERS (the --sell-workers default's
-    bound), MIN_BALANCE_CENTS (the low starting-balance WARNING),
+    bound), BACKTEST_SWEEP_FILENAME, BACKTEST_SWEEP_FORMAT and
+    BACKTEST_SWEEP_HEADER_MAX_BYTES (the saved sweep file: where it goes, the
+    format tag it is written in, the most of its first line a rebuild reads),
+    MIN_BALANCE_CENTS (the low starting-balance WARNING),
     TIME_SERIES_INTERVAL_PROB_DISCOUNT and TIME_SERIES_SAME_EVENT_LADDERS
     (the pre-fetch echo and the flag's help text), the deadline-gap tier constants
     MIN_PRICE_DIFF_SHORT_GAP, MIN_PRICE_DIFF_LONG_GAP, SHORT_DEADLINE_GAP_DAYS,
@@ -214,6 +223,41 @@ Notes:
     A live run uses its own saved trim_min_rise (main.py --trim-min-rise
     for one run).
 
+    Every full run saves what it hands generate_dashboard, right after the
+    sweep and before the page is built, in config.BACKTEST_SWEEP_FILENAME in
+    PROJECT_ROOT (gitignored): the BacktestSweep with every lazy family, the
+    start date, the starting balance and where it came from, the /series
+    listing, the primary k and the window's last day (the UTC day the sweep
+    finished, which the page's Period line names). The file is a gzip stream:
+    one line of JSON (the format tag, the simulator fingerprint with a digest
+    per module, when it was saved, the Python version and the start date),
+    then the inputs pickled; it is written to a ".tmp" file renamed over the
+    old one. A save that fails (an object that cannot be pickled, a full disk)
+    is one WARNING: the page is still built, and any earlier run's file is
+    deleted, since it no longer matches the page.
+
+    --dashboard-only rebuilds the page from that file, with no fetch and no
+    Kalshi request: it reads the T-bill yields again and calls
+    generate_dashboard with the run's own arguments and its own
+    --sell-workers. The flags that shape a run (--start-date, --balance,
+    --no-cache, --max-horizon-days, --interval-discount, --no-sweep, the
+    ladder flags, --spread-min/--spread-max, --no-band-sweep) are refused with
+    it; the other --no-*-sweep flags drop their lazy family from the loaded
+    sweep (_without_families), giving the page a run with those flags would
+    have built, and without the size-cap sweep the families that stay are
+    kept at the run's own cap, as such a run builds them. The fingerprint
+    (_simulator_fingerprint_parts) is a SHA-256 per simulator module over its
+    parsed code with docstrings left out, plus one over the config.py
+    statements those modules read and everything those statements use, so
+    comments, docstrings, layout and dashboard-only constants never count.
+    The lazy families simulate their cells while the page is built, with the
+    code as it is then, so a rebuild whose fingerprint differs from the
+    file's is refused (exit 2) unless --accept-changed-simulator is given:
+    the run's own figures and those cells would come from two different
+    versions of the code. A missing file exits 2; a file that cannot be read
+    or loaded exits 1. Loading a pickle runs the code its objects name, so
+    only a file this program wrote should be loaded.
+
     The pre-fetch echo's "live rule=" clause names the saved live defaults'
     time-series rule and, when one is set, their category/tag filter (never
     main.py's per-run overrides), from a read of its own, failing soft;
@@ -226,17 +270,32 @@ Notes:
     the filter bar's Save as live defaults… or Trade using defaults… button.
 """
 import argparse
+import ast
+import functools
+import gzip
+import hashlib
+import json
 import logging
 import logging.handlers
 import math
 import os
-from dataclasses import dataclass
+import pickle
+import platform
+import time
+import zlib
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
+from pathlib import Path
+from typing import Any
 
 from ._http import api_error_summary
 from .auth import read_account_balance
 from .backtester import BacktestSweep, run_backtest_sweep
 from .config import (
+    BACKTEST_SWEEP_FILENAME,
+    BACKTEST_SWEEP_FORMAT,
+    BACKTEST_SWEEP_HEADER_MAX_BYTES,
     DASHBOARD_SELL_MAX_WORKERS,
     MAX_DEADLINE_GAP_DAYS,
     MIN_BALANCE_CENTS,
@@ -444,42 +503,646 @@ def _log_corpus_provenance(sweep: BacktestSweep) -> None:
     )
 
 
-def main() -> None:
+# The modules whose code decides what a backtest simulates: during the run, and
+# again while its dashboard is built, when the lazy families (the size caps,
+# Add to held pairs, Sell and Trim to Kelly) simulate their cells. With the
+# parts of config.py they read, they make up the simulator fingerprint a saved
+# sweep is stamped with. dashboard.py is not among them: changing it is what a
+# rebuild from the saved sweep is for.
+_SIMULATOR_MODULES = ("backtester", "strategy", "scanner", "depth_model", "historical")
+
+# What a full run saves for the dashboard, by key: exactly what main() hands
+# generate_dashboard but the T-bill yields (read again by a rebuild) and the
+# worker count (a rebuild's own --sell-workers). The trades and the equity
+# curve are the sweep's primary point's, so they are not saved twice.
+_DASHBOARD_INPUT_KEYS = frozenset({
+    "sweep", "start_date", "initial_balance", "balance_source", "series_categories",
+    "interval_discount", "period_end",
+})
+
+# The flags that only shape a run (what it fetches, simulates and sizes).
+# --dashboard-only refuses each one left away from its default, since a page
+# rebuilt from a saved run shows that run's own settings; every other option
+# is one a rebuild reads (tests/test_backtest.py checks that the two lists
+# together cover the parser).
+_RUN_ONLY_FLAGS = (
+    ("start_date", "--start-date"), ("balance", "--balance"), ("no_cache", "--no-cache"),
+    ("max_horizon_days", "--max-horizon-days"), ("interval_discount", "--interval-discount"),
+    ("no_sweep", "--no-sweep"),
+    ("same_event_ladders", "--same-event-ladders / --no-same-event-ladders"),
+    ("spread_min", "--spread-min"), ("spread_max", "--spread-max"),
+    ("no_band_sweep", "--no-band-sweep"),
+)
+
+
+class SavedSweepError(Exception):
     """
-    CLI entry point for the Kalshi backtester.
+    The saved sweep file cannot be used for a rebuild; the message says why.
 
-    Parses command-line arguments (--start-date, --balance, --no-cache,
-    --max-horizon-days, --interval-discount, --no-sweep,
-    --same-event-ladders / --no-same-event-ladders, --spread-min,
-    --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep,
-    --no-sell-sweep, --no-trim-sweep, --no-trim-rise-sweep), configures
-    logging, constructs historical and live
-    Kalshi API clients, works out the starting balance (--balance, or else the
-    account's value now, read through _account_starting_balance; a read that
-    fails, or comes to nothing, stops the run with exit 1 before the
-    fetch), runs the full backtest simulation via run_backtest_sweep(), and generates
-    an interactive HTML dashboard via generate_dashboard(). Logs a summary
-    table of key metrics to
-    kalshi_backtest.log on completion (this module installs only a
-    RotatingFileHandler, no console handler, so nothing reaches stdout).
+    Raised by _read_saved_header and _load_saved_inputs. main() turns it into
+    a stop (exit 1) that says to run the backtest again.
+    """
 
-    The summary block reports the PRIMARY point of the sweep — the run at the
-    effective interval discount, the primary spread band and the run's own
-    per-trade size cap — so a default run's summary block reads exactly as
-    the plain run_backtest() path's did. The other swept discounts and bands
-    exist for the dashboard (its page-wide filter bar, whose k select the
-    Interval Discount section follows, its scenario explorer and k-hat
-    breakdown) and the calibration report; the tier-floors-off family is read
-    by the dashboard's filter bar, k-hat breakdown and scenario explorer
-    (their Tier floors choice), carried to generate_dashboard on the sweep;
-    and the lazily simulated size caps (result.cap_sweep, and the
-    tier-floors-off family's at every cap, result.tier_off_cap_sweep) only
-    by the dashboard, which reads every cell as the page is built (its filter
-    bar, Interval Discount section and scenario explorer); the lazily
-    simulated add-on sweeps (result.add_on_cap_sweep, and
-    result.add_on_tier_off_cap_sweep), sell family (result.sell_sweep) and
-    Kelly-trim family (result.trim_sweep, with its minimum price rises) are
-    read the same way.
+
+def _without_docstrings(tree: ast.Module) -> ast.Module:
+    """
+    Remove every docstring from a parsed module, so a fingerprint reads its code alone.
+
+    A docstring is the string a module, class or function body opens with.
+    Comments are never in the parsed tree, and ast.dump ignores line numbers
+    and layout, so with docstrings gone an edit to wording alone leaves the
+    fingerprint as it was.
+
+    Args:
+        tree (ast.Module): A freshly parsed module; changed in place.
+
+    Returns:
+        ast.Module: The same tree, without docstrings.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                # A body cannot be empty, so a docstring alone becomes "pass"
+                node.body = body[1:] or [ast.Pass()]
+    return tree
+
+
+def _config_names_read(tree: ast.Module) -> set[str]:
+    """
+    The names a simulator module reads from config.py.
+
+    A module reads them as `from .config import NAME` (anywhere in it) or as
+    `config.NAME` after `from . import config`, the two ways the package
+    reaches config (tests/test_backtest.py checks that the simulator modules
+    use no other). A star import reads every name: "*" stands for that.
+
+    Args:
+        tree (ast.Module): The module, parsed.
+
+    Returns:
+        set[str]: The config names it reads.
+    """
+    names: set[str] = set()
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or node.level != 1:
+            continue
+        if node.module == "config":
+            names.update(alias.name for alias in node.names)
+        elif node.module is None:
+            # `from . import config [as name]`: config.NAME is read through the alias
+            aliases.update(alias.asname or alias.name for alias in node.names
+                           if alias.name == "config")
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and node.value.id in aliases):
+            names.add(node.attr)
+    return names
+
+
+def _config_closure(tree: ast.Module, names: set[str]) -> list[tuple[str, str]]:
+    """
+    The config.py statements that define the names read, and every config name they use.
+
+    A constant defined from other constants, a function calling other
+    functions, a class whose fields default to constants: each brings in the
+    statements its own names come from, until nothing new is reached. A name
+    config.py does not define at its top level (an import such as UTC) is
+    left out, since its definition is not config's code.
+
+    Args:
+        tree (ast.Module): config.py, parsed, its docstrings removed.
+        names (set[str]): The names read ("*" for every one).
+
+    Returns:
+        list[tuple[str, str]]: Each name reached, in name order, with the
+            ast.dump of the statement(s) defining it.
+    """
+    defined: dict[str, list[ast.stmt]] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound = {stmt.name}
+        else:
+            # An assignment, or any other top-level statement: the names it stores
+            bound = {node.id for node in ast.walk(stmt)
+                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+        for name in bound:
+            defined.setdefault(name, []).append(stmt)
+    todo = sorted(defined) if "*" in names else sorted(names)
+    reached: dict[str, str] = {}
+    while todo:
+        name = todo.pop()
+        if name in reached or name not in defined:
+            continue
+        reached[name] = "\n".join(ast.dump(stmt) for stmt in defined[name])
+        for stmt in defined[name]:
+            todo.extend(node.id for node in ast.walk(stmt)
+                        if isinstance(node, ast.Name) and node.id in defined
+                        and node.id not in reached)
+    return sorted(reached.items())
+
+
+def _simulator_fingerprint_parts(sources: Mapping[str, str]) -> dict[str, str]:
+    """
+    Fingerprint the simulator's code, module by module.
+
+    Each module of _SIMULATOR_MODULES is fingerprinted as the SHA-256 of its
+    parsed code (ast.dump, docstrings removed, so comments, docstrings and
+    layout never count), and config.py as that of the statements those
+    modules read, with everything they use in turn (_config_closure). An edit
+    to config.py that no simulator module reads, a dashboard constant say,
+    leaves it unchanged. ast.dump's form can change between Python versions,
+    so the same code under another Python can fingerprint differently.
+
+    Args:
+        sources (Mapping[str, str]): The source text of each of
+            _SIMULATOR_MODULES and of "config".
+
+    Returns:
+        dict[str, str]: Module name ("config" included) -> hex digest.
+
+    Raises:
+        SyntaxError: If a source cannot be parsed.
+        KeyError: If a module's source is missing.
+    """
+    parts: dict[str, str] = {}
+    read: set[str] = set()
+    for name in _SIMULATOR_MODULES:
+        tree = _without_docstrings(ast.parse(sources[name]))
+        read |= _config_names_read(tree)
+        parts[name] = hashlib.sha256(ast.dump(tree).encode("utf-8")).hexdigest()
+    digest = hashlib.sha256()
+    for name, dump in _config_closure(_without_docstrings(ast.parse(sources["config"])), read):
+        digest.update(f"{name}\0{dump}\0".encode())
+    parts["config"] = digest.hexdigest()
+    return parts
+
+
+def _fingerprint_of(parts: Mapping[str, str]) -> str:
+    """
+    Combine the per-module digests into one fingerprint.
+
+    Args:
+        parts (Mapping[str, str]): _simulator_fingerprint_parts' result.
+
+    Returns:
+        str: The SHA-256 hex digest over every module's name and digest.
+    """
+    return hashlib.sha256("".join(
+        f"{name}={value}\n" for name, value in sorted(parts.items())).encode()).hexdigest()
+
+
+@functools.cache
+def _loaded_simulator_fingerprint() -> tuple[tuple[str, str], ...]:
+    """
+    Fingerprint the simulator's code as it is on disk now, once per process.
+
+    main() asks for it as soon as a run starts, so it describes the code the
+    run imported moments before; cached, since the code a process runs does
+    not change while it runs.
+
+    Returns:
+        tuple[tuple[str, str], ...]: (module name, hex digest) pairs, in name order.
+
+    Raises:
+        OSError: If a module's file cannot be read.
+        SyntaxError: If a module cannot be parsed.
+    """
+    here = Path(__file__).parent
+    sources = {name: (here / f"{name}.py").read_text(encoding="utf-8")
+               for name in (*_SIMULATOR_MODULES, "config")}
+    return tuple(sorted(_simulator_fingerprint_parts(sources).items()))
+
+
+def _changed_modules(saved: Mapping[str, Any], now: Mapping[str, str]) -> list[str]:
+    """
+    Name the simulator files whose fingerprint differs between a saved run and this code.
+
+    Args:
+        saved (Mapping[str, Any]): The saved file's per-module digests.
+        now (Mapping[str, str]): This code's.
+
+    Returns:
+        list[str]: "<module>.py" for each one that differs, in a fixed order.
+    """
+    return [f"{name}.py" for name in (*_SIMULATOR_MODULES, "config")
+            if saved.get(name) != now.get(name)]
+
+
+def _dashboard_inputs(sweep: BacktestSweep, start_date: date, start: StartingBalance,
+                      series_categories: dict, period_end: date) -> dict[str, Any]:
+    """
+    Gather what main() hands generate_dashboard, as a full run saves it.
+
+    Args:
+        sweep (BacktestSweep): run_backtest_sweep's result.
+        start_date (date): The run's first day.
+        start (StartingBalance): Its starting balance and where it came from.
+        series_categories (dict): Kalshi's /series listing, as the run read it.
+        period_end (date): The window's last day (the UTC day the sweep finished).
+
+    Returns:
+        dict[str, Any]: One value per key of _DASHBOARD_INPUT_KEYS.
+    """
+    return {
+        "sweep": sweep, "start_date": start_date, "initial_balance": start.dollars,
+        "balance_source": start.source, "series_categories": series_categories,
+        # The k the plotted trades were sized at, read back off the point
+        "interval_discount": sweep.primary.k, "period_end": period_end,
+    }
+
+
+def _build_dashboard(inputs: Mapping[str, Any], *, risk_free, sell_workers: int) -> Path:
+    """
+    Write the dashboard from a run's inputs: the one call a full run and a rebuild share.
+
+    Args:
+        inputs (Mapping[str, Any]): _dashboard_inputs' result, or a saved copy of it.
+        risk_free: treasury.load_risk_free_rates' bill yields.
+        sell_workers (int): The most worker processes the Sell select is built in.
+
+    Returns:
+        Path: The page written.
+    """
+    sweep = inputs["sweep"]
+    # balance_source: the header says where the starting balance came from;
+    # period_end: the window's last day, the run's own even on a later rebuild
+    return generate_dashboard(sweep.primary.trades, sweep.primary.equity_df,
+                              inputs["start_date"], inputs["initial_balance"],
+                              sweep=sweep, interval_discount=inputs["interval_discount"],
+                              series_categories=inputs["series_categories"],
+                              risk_free=risk_free, sell_workers=sell_workers,
+                              balance_source=inputs["balance_source"],
+                              period_end=inputs["period_end"])
+
+
+def _save_dashboard_inputs(path: Path, inputs: Mapping[str, Any],
+                           parts: Mapping[str, str] | None) -> None:
+    """
+    Save a run's dashboard inputs for --dashboard-only, never stopping the run.
+
+    The file is a gzip stream: one line of JSON (the format tag, the simulator
+    fingerprint with its per-module digests, when it was saved, the Python
+    version and the run's start date), then the inputs pickled. It is written
+    to a sibling ".tmp" file renamed over the old one, so a file at the path
+    is always a whole one. Saving can fail (an object that cannot be pickled,
+    a full disk): one WARNING then says so, the leftover file and any earlier
+    run's file are deleted, since that one no longer matches the page this run
+    builds, and the run goes on to build its page.
+
+    Args:
+        path (Path): Where the file goes (PROJECT_ROOT / BACKTEST_SWEEP_FILENAME).
+        inputs (Mapping[str, Any]): _dashboard_inputs' result.
+        parts (Mapping[str, str] | None): The simulator's per-module digests
+            when the run started; None when they could not be computed, which
+            saves nothing.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    logging.info("Saving this run's dashboard inputs to %s, for --dashboard-only", path)
+    started = time.perf_counter()
+    try:
+        if parts is None:
+            raise ValueError("the simulator's code could not be fingerprinted when the run "
+                             "started (see the WARNING above)")
+        header = {
+            "format": BACKTEST_SWEEP_FORMAT,
+            "fingerprint": _fingerprint_of(parts),
+            "fingerprint_parts": dict(parts),
+            "saved_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "python": platform.python_version(),
+            "start_date": inputs["start_date"].isoformat(),
+        }
+        # compresslevel 1, like the day slices: the file is large and written once
+        with gzip.open(tmp, "wb", compresslevel=1) as handle:
+            handle.write(json.dumps(header, sort_keys=True).encode("utf-8") + b"\n")
+            pickle.dump(dict(inputs), handle, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(path)
+    except Exception as e:
+        for leftover in (tmp, path):
+            try:
+                leftover.unlink(missing_ok=True)
+            except OSError:
+                pass
+        logging.warning(
+            "Could not save this run's dashboard inputs (%s): the page is still built, but "
+            "--dashboard-only cannot rebuild it from this run, and any earlier run's saved "
+            "file was removed since it no longer matches the page", api_error_summary(e))
+        return
+    logging.info(
+        "Saved this run's dashboard inputs (%.1f MB in %.1f s): python3 -m "
+        "kalshi_betting.backtest --dashboard-only rebuilds the page from them",
+        path.stat().st_size / 1e6, time.perf_counter() - started)
+
+
+def _read_header_line(handle) -> dict[str, Any]:
+    """
+    Read and check a saved sweep file's first line, from its open gzip stream.
+
+    Args:
+        handle: The file, opened with gzip.open(path, "rb"), at its start.
+
+    Returns:
+        dict[str, Any]: The header: its format is BACKTEST_SWEEP_FORMAT, its
+            fingerprint a string and its fingerprint_parts a dict of strings.
+
+    Raises:
+        SavedSweepError: If the line is not a saved sweep's header in this format.
+    """
+    line = handle.readline(BACKTEST_SWEEP_HEADER_MAX_BYTES + 1)
+    if not line.endswith(b"\n"):
+        raise SavedSweepError("it does not start with a saved backtest's header line")
+    try:
+        header = json.loads(line)
+    except ValueError:
+        raise SavedSweepError("its header line is not JSON") from None
+    if not isinstance(header, dict):
+        raise SavedSweepError("its header line is not a JSON object")
+    if header.get("format") != BACKTEST_SWEEP_FORMAT:
+        raise SavedSweepError(f"it is in format {header.get('format')!r}, and this code "
+                              f"reads {BACKTEST_SWEEP_FORMAT!r}")
+    parts = header.get("fingerprint_parts")
+    if (not isinstance(header.get("fingerprint"), str) or not isinstance(parts, dict)
+            or not all(isinstance(k, str) and isinstance(v, str) for k, v in parts.items())):
+        raise SavedSweepError("its header line names no simulator fingerprint")
+    return header
+
+
+def _read_saved_header(path: Path) -> dict[str, Any]:
+    """
+    Read a saved sweep file's header line alone, without loading the run.
+
+    Args:
+        path (Path): The saved file.
+
+    Returns:
+        dict[str, Any]: The checked header (_read_header_line).
+
+    Raises:
+        SavedSweepError: If the file cannot be read or its header is not one
+            in this format.
+    """
+    try:
+        with gzip.open(path, "rb") as handle:
+            return _read_header_line(handle)
+    except (OSError, EOFError, zlib.error) as e:
+        # gzip.BadGzipFile is an OSError; zlib.error a damaged stream
+        raise SavedSweepError(f"it cannot be read ({api_error_summary(e)})") from e
+
+
+def _load_saved_inputs(path: Path) -> dict[str, Any]:
+    """
+    Load the dashboard inputs a full run saved, checking their shape.
+
+    Loading a pickle runs the code its objects name, so only a file this
+    program wrote should ever be loaded: the file lives in the checkout's own
+    folder and is gitignored.
+
+    Args:
+        path (Path): The saved file.
+
+    Returns:
+        dict[str, Any]: One value per key of _DASHBOARD_INPUT_KEYS, the sweep
+            a BacktestSweep and both dates real dates.
+
+    Raises:
+        SavedSweepError: If the file cannot be read or unpickled with this
+            code, or what it holds is not a run's dashboard inputs.
+    """
+    try:
+        with gzip.open(path, "rb") as handle:
+            _read_header_line(handle)
+            inputs = pickle.load(handle)
+    except SavedSweepError:
+        raise
+    except Exception as e:
+        # A truncated or damaged stream, or a class this code no longer has
+        raise SavedSweepError(f"its saved run could not be loaded ({api_error_summary(e)})") from e
+    if not isinstance(inputs, dict) or set(inputs) != _DASHBOARD_INPUT_KEYS:
+        raise SavedSweepError("it does not hold a run's dashboard inputs")
+    if not (isinstance(inputs["sweep"], BacktestSweep)
+            and isinstance(inputs["start_date"], date)
+            and isinstance(inputs["period_end"], date)):
+        raise SavedSweepError("its sweep or its dates are not what a run saves")
+    return inputs
+
+
+def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, add_on_sweep: bool,
+                      sell_sweep: bool, trim_sweep: bool,
+                      trim_rise_sweep: bool) -> tuple[BacktestSweep, list[str]]:
+    """
+    Drop lazy families from a loaded sweep, as a run given the matching --no-*-sweep flags builds it.
+
+    Each flag that is False drops its family, so the rebuilt page leaves its
+    select disabled and skips its simulations: a quick page for checking a
+    change. Without the size-cap sweep, a run builds the add-on, Sell and Trim
+    to Kelly families at its own cap alone, so those that stay are narrowed
+    to it too. Without the minimum price rises, the Trim to Kelly family stays
+    and carries none.
+
+    Args:
+        sweep (BacktestSweep): The loaded sweep; left as it is.
+        cap_sweep, add_on_sweep, sell_sweep, trim_sweep, trim_rise_sweep
+            (bool): Whether each family stays.
+
+    Returns:
+        tuple[BacktestSweep, list[str]]: The sweep the page is built from
+            (the same object when nothing is dropped), and a short note per
+            family dropped, for the log.
+    """
+    changes: dict[str, Any] = {}
+    dropped: list[str] = []
+    if not cap_sweep:
+        if sweep.cap_sweep is not None or sweep.tier_off_cap_sweep is not None:
+            changes.update(cap_sweep=None, tier_off_cap_sweep=None)
+            dropped.append("the size caps (--no-cap-sweep)")
+        # The other lazy families at the run's own cap, as a run without the
+        # size-cap sweep builds them
+        for name in ("add_on_cap_sweep", "add_on_tier_off_cap_sweep", "sell_sweep",
+                     "trim_sweep"):
+            family = getattr(sweep, name)
+            if family is not None and family.caps != (family.primary_cap,):
+                changes[name] = replace(family, caps=(family.primary_cap,))
+    if not add_on_sweep and (sweep.add_on_cap_sweep is not None
+                             or sweep.add_on_tier_off_cap_sweep is not None):
+        changes.update(add_on_cap_sweep=None, add_on_tier_off_cap_sweep=None)
+        dropped.append("Add to held pairs (--no-add-on-sweep)")
+    if not sell_sweep and sweep.sell_sweep is not None:
+        changes["sell_sweep"] = None
+        dropped.append("Sell (--no-sell-sweep)")
+    if not trim_sweep and sweep.trim_sweep is not None:
+        changes["trim_sweep"] = None
+        dropped.append("Trim to Kelly (--no-trim-sweep)")
+    elif not trim_rise_sweep and sweep.trim_sweep is not None and sweep.trim_sweep.min_rises:
+        trimmed = changes.get("trim_sweep", sweep.trim_sweep)
+        changes["trim_sweep"] = replace(trimmed, min_rises=())
+        dropped.append("Min. price rise (--no-trim-rise-sweep)")
+    return (replace(sweep, **changes) if changes else sweep), dropped
+
+
+def _configure_logging() -> None:
+    """
+    Send the log to kalshi_backtest.log in PROJECT_ROOT, as every run of this CLI does.
+
+    No console handler: nothing reaches stdout.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            # BS-25: a single unrotated FileHandler grew to 398MB during one backtest
+            # sweep. 20MB/3 backups is logging infra sized for this CLI's own verbosity,
+            # not a strategy constant, so it stays inline rather than in config.py.
+            # TS-02: that budget only holds many runs because the per-ticker
+            # candlestick failure is now ONE line (no HTTP header dump) and the
+            # misses are summarized once per run by _fetch_candles_parallel.
+            # Before that, 99.5% of this file was that single warning and a
+            # sweep evicted ~419 MB of pre-sweep history through this rotation.
+            # delay=True: the file is opened on the first emit, not at
+            # construction, so a run that exits before logging anything leaves
+            # no file behind. Matches main.py and scheduler.py (TS-20).
+            logging.handlers.RotatingFileHandler(
+                PROJECT_ROOT / "kalshi_backtest.log", maxBytes=20 * 1024 * 1024,
+                backupCount=3, delay=True,
+            ),
+        ],
+    )
+
+
+def _sell_workers(requested: int | None) -> int:
+    """
+    The worker processes the dashboard builds its Sell select in.
+
+    Args:
+        requested (int | None): --sell-workers, or None when not given.
+
+    Returns:
+        int: The flag's value, or one less than the CPU count (the main
+            process waits on them), at least 1 and at most
+            config.DASHBOARD_SELL_MAX_WORKERS.
+    """
+    if requested is not None:
+        return requested
+    return max(1, min((os.cpu_count() or 1) - 1, DASHBOARD_SELL_MAX_WORKERS))
+
+
+def _log_how_to_open() -> None:
+    """Close a run, or a rebuild, by saying how to view the page and use its buttons."""
+    logging.info("Open the HTML file in a browser to view the interactive charts.")
+    # How a scenario on the page becomes the live defaults, or is traded: the
+    # page cannot write files or start runs, so its buttons open the defaults
+    # server's pages (started by ./start_dashboard.sh, beside the live
+    # dashboard, whose Backtest tab shows this page)
+    logging.info("To save the filter bar's scenario as the live defaults, or to trade: run "
+                 "./start_dashboard.sh (it starts the defaults server and the live dashboard, "
+                 "whose Backtest tab is this page), then use the filter bar's Save as live "
+                 "defaults… or Trade using defaults… button.")
+
+
+def _rebuild_dashboard(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """
+    Rebuild the dashboard from the inputs the last full run saved (--dashboard-only).
+
+    Fetches nothing and makes no Kalshi request: it loads the saved file,
+    reads the T-bill yields again (treasury.load_risk_free_rates) and calls
+    generate_dashboard as the run did, with this command's --sell-workers.
+    Each --no-*-sweep flag drops its lazy family first (_without_families).
+
+    The lazy families simulate their cells while the page is built, with the
+    code as it is then, so after a change to the simulator (the modules of
+    _SIMULATOR_MODULES or the config they read) the run's own figures and
+    those cells would come from two versions of the code. A file whose
+    simulator fingerprint differs from this code's is therefore refused
+    (exit 2) unless --accept-changed-simulator is given, and then a WARNING
+    names the files that changed.
+
+    Exits 2, before logging is configured, for a run-only flag, a bad
+    --sell-workers, a missing file or a refused fingerprint; exits 1 for a
+    file that cannot be read or loaded (its header before logging is
+    configured, the run itself after, with an ERROR in the log).
+
+    Args:
+        parser (argparse.ArgumentParser): The CLI's parser, for its errors.
+        args (argparse.Namespace): The parsed arguments.
+    """
+    given = [flag for dest, flag in _RUN_ONLY_FLAGS
+             if getattr(args, dest) != parser.get_default(dest)]
+    if given:
+        parser.error(f"{', '.join(given)} cannot be used with --dashboard-only: the page is "
+                     "rebuilt from the saved run, with that run's settings")
+    if args.sell_workers is not None and args.sell_workers < 1:
+        parser.error("--sell-workers must be a positive integer")
+    path = PROJECT_ROOT / BACKTEST_SWEEP_FILENAME
+    if not path.exists():
+        parser.exit(2, f"backtest: no saved backtest at {path}: a full run "
+                       "(python3 -m kalshi_betting.backtest) saves one\n")
+    try:
+        header = _read_saved_header(path)
+    except SavedSweepError as e:
+        raise SystemExit(f"backtest: {path} cannot be used: {e}; run the backtest again "
+                         "to save a new one") from None
+    try:
+        now_parts = dict(_loaded_simulator_fingerprint())
+    except (OSError, SyntaxError) as e:
+        raise SystemExit("backtest: the simulator's code could not be fingerprinted "
+                         f"({api_error_summary(e)})") from None
+    changed = _changed_modules(header["fingerprint_parts"], now_parts)
+    python_note = ("" if header.get("python") == platform.python_version()
+                   else f" (under Python {header.get('python')}; this is Python "
+                        f"{platform.python_version()}, and the fingerprint reads code "
+                        "through Python's own parser, so that alone can change it)")
+    if changed and not args.accept_changed_simulator:
+        parser.exit(2, (
+            f"backtest: the run saved at {path} ({header.get('saved_at')}) was simulated by "
+            f"other code: {', '.join(changed)} changed since it was saved{python_note}. "
+            "A rebuild simulates the size caps, Add to held pairs, Sell and Trim to Kelly "
+            "cells while the page is built, with the code as it is now, so the run's own "
+            "figures and those cells would come from two different versions of the code. "
+            "Run the backtest again, or pass --accept-changed-simulator to build the page "
+            "anyway.\n"))
+
+    _configure_logging()
+    logging.info("Dashboard rebuild from %s: saved %s by a run that started %s (%.1f MB)",
+                 path, header.get("saved_at"), header.get("start_date"),
+                 path.stat().st_size / 1e6)
+    if changed:
+        logging.warning(
+            "The simulator's code changed since this run was saved (%s)%s: the page's "
+            "lazily simulated cells (size caps, Add to held pairs, Sell, Trim to Kelly) "
+            "come from this code and its other figures from the run's "
+            "(--accept-changed-simulator)", ", ".join(changed), python_note)
+    started = time.perf_counter()
+    try:
+        inputs = _load_saved_inputs(path)
+    except SavedSweepError as e:
+        message = f"{path} cannot be used: {e}; run the backtest again to save a new one"
+        logging.error("Dashboard not rebuilt: %s", message)
+        raise SystemExit(f"backtest: {message}") from None
+    logging.info("Loaded the saved run in %.1f s", time.perf_counter() - started)
+    sweep, dropped = _without_families(
+        inputs["sweep"], cap_sweep=not args.no_cap_sweep, add_on_sweep=not args.no_add_on_sweep,
+        sell_sweep=not args.no_sell_sweep, trim_sweep=not args.no_trim_sweep,
+        trim_rise_sweep=not args.no_trim_rise_sweep)
+    if dropped:
+        logging.info("Dashboard rebuilt without: %s", "; ".join(dropped))
+    # The T-bill yields, read again: never raises (see the full run's read)
+    risk_free = load_risk_free_rates()
+    _build_dashboard({**inputs, "sweep": sweep}, risk_free=risk_free,
+                     sell_workers=_sell_workers(args.sell_workers))
+    _log_how_to_open()
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """
+    Build the CLI's argument parser (main() parses with it; tests read its options).
+
+    Returns:
+        argparse.ArgumentParser: Every option of `python3 -m kalshi_betting.backtest`.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -617,7 +1280,75 @@ def main() -> None:
              "1 runs them in the main process. Each worker holds one spread band's "
              "entries, so memory grows with the count",
     )
+    parser.add_argument(
+        "--dashboard-only", action="store_true",
+        help="Rebuild the dashboard from the inputs the last full run saved "
+             f"({BACKTEST_SWEEP_FILENAME} in the repo root) instead of running the "
+             "backtest: no fetch and no Kalshi request. --sell-workers applies, and each "
+             "--no-*-sweep flag but --no-band-sweep drops its family from the saved run "
+             "for a quicker page; the flags that shape a run are refused",
+    )
+    parser.add_argument(
+        "--accept-changed-simulator", action="store_true",
+        help="With --dashboard-only: build the page even though the simulator's code "
+             "(backtester, strategy, scanner, depth_model, historical, or the config they "
+             "read) changed since the run was saved. The size caps, Add to held pairs, "
+             "Sell and Trim to Kelly cells are simulated while the page is built, so they "
+             "then come from this code and the run's other figures from the old code",
+    )
+    return parser
+
+
+def main() -> None:
+    """
+    CLI entry point for the Kalshi backtester.
+
+    Parses command-line arguments (--start-date, --balance, --no-cache,
+    --max-horizon-days, --interval-discount, --no-sweep,
+    --same-event-ladders / --no-same-event-ladders, --spread-min,
+    --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep,
+    --no-sell-sweep, --no-trim-sweep, --no-trim-rise-sweep, --sell-workers,
+    --dashboard-only, --accept-changed-simulator); with --dashboard-only it
+    hands over to _rebuild_dashboard, which rebuilds the page from the saved
+    inputs and runs nothing below. Otherwise it configures
+    logging, constructs historical and live
+    Kalshi API clients, works out the starting balance (--balance, or else the
+    account's value now, read through _account_starting_balance; a read that
+    fails, or comes to nothing, stops the run with exit 1 before the
+    fetch), runs the full backtest simulation via run_backtest_sweep(), saves
+    what the dashboard is handed (_save_dashboard_inputs, for a later
+    --dashboard-only), and generates
+    an interactive HTML dashboard via generate_dashboard(). Logs a summary
+    table of key metrics to
+    kalshi_backtest.log on completion (this module installs only a
+    RotatingFileHandler, no console handler, so nothing reaches stdout).
+
+    The summary block reports the PRIMARY point of the sweep — the run at the
+    effective interval discount, the primary spread band and the run's own
+    per-trade size cap — so a default run's summary block reads exactly as
+    the plain run_backtest() path's did. The other swept discounts and bands
+    exist for the dashboard (its page-wide filter bar, whose k select the
+    Interval Discount section follows, its scenario explorer and k-hat
+    breakdown) and the calibration report; the tier-floors-off family is read
+    by the dashboard's filter bar, k-hat breakdown and scenario explorer
+    (their Tier floors choice), carried to generate_dashboard on the sweep;
+    and the lazily simulated size caps (result.cap_sweep, and the
+    tier-floors-off family's at every cap, result.tier_off_cap_sweep) only
+    by the dashboard, which reads every cell as the page is built (its filter
+    bar, Interval Discount section and scenario explorer); the lazily
+    simulated add-on sweeps (result.add_on_cap_sweep, and
+    result.add_on_tier_off_cap_sweep), sell family (result.sell_sweep) and
+    Kelly-trim family (result.trim_sweep, with its minimum price rises) are
+    read the same way.
+    """
+    parser = _build_parser()
     args = parser.parse_args()
+    if args.dashboard_only:
+        # Rebuild the page from the saved run and stop: nothing below runs
+        _rebuild_dashboard(parser, args)
+        return
+    if args.accept_changed_simulator:
+        parser.error("--accept-changed-simulator applies only with --dashboard-only")
     # Every return is measured against the starting balance, so it must be a
     # real amount above 0 (float() also reads "nan" and "inf")
     if args.balance is not None and not (math.isfinite(args.balance) and args.balance > 0):
@@ -676,28 +1407,15 @@ def main() -> None:
     except ValueError:
         parser.error(f"Invalid --start-date: {args.start_date!r}. Use YYYY-MM-DD format.")
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            # BS-25: a single unrotated FileHandler grew to 398MB during one backtest
-            # sweep. 20MB/3 backups is logging infra sized for this CLI's own verbosity,
-            # not a strategy constant, so it stays inline rather than in config.py.
-            # TS-02: that budget only holds many runs because the per-ticker
-            # candlestick failure is now ONE line (no HTTP header dump) and the
-            # misses are summarized once per run by _fetch_candles_parallel.
-            # Before that, 99.5% of this file was that single warning and a
-            # sweep evicted ~419 MB of pre-sweep history through this rotation.
-            # delay=True: the file is opened on the first emit, not at
-            # construction, so a run that exits before logging anything leaves
-            # no file behind. Matches main.py and scheduler.py (TS-20).
-            logging.handlers.RotatingFileHandler(
-                PROJECT_ROOT / "kalshi_backtest.log", maxBytes=20 * 1024 * 1024,
-                backupCount=3, delay=True,
-            ),
-        ],
-    )
+    _configure_logging()
+    # The simulator's code as this run imported it, for the saved sweep's
+    # stamp; a failure saves no sweep file, never stops the run
+    try:
+        simulator_parts: dict[str, str] | None = dict(_loaded_simulator_fingerprint())
+    except (OSError, SyntaxError) as e:
+        simulator_parts = None
+        logging.warning("The simulator's code could not be fingerprinted (%s): this run "
+                        "saves no inputs for --dashboard-only", api_error_summary(e))
 
     use_cache = not args.no_cache
 
@@ -747,8 +1465,7 @@ def main() -> None:
     trim_rise_sweep = trim_sweep and not args.no_trim_rise_sweep
     # The dashboard simulates the Sell select in worker processes: one less
     # than the CPUs (the main process waits on them), within the config bound
-    sell_workers = (args.sell_workers if args.sell_workers is not None
-                    else max(1, min((os.cpu_count() or 1) - 1, DASHBOARD_SELL_MAX_WORKERS)))
+    sell_workers = _sell_workers(args.sell_workers)
     # The saved live defaults' rule and filter, for the echo only: a read of its
     # own, separate from run_backtest_sweep's (which logs the INFO or WARNING).
     # Fails soft, unlike the checks above (one echo clause must not abort a run)
@@ -895,6 +1612,14 @@ def main() -> None:
         # The listing the same-title label check files each series by
         series_categories=series_categories,
     )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy add-on sweeps (add_on_cap_sweep, and add_on_tier_off_cap_sweep with the band sweep) unless --no-add-on-sweep
+    # What the dashboard is handed, saved before the page is built, so
+    # --dashboard-only can rebuild the page (or finish a build that stopped)
+    # without running the backtest again. period_end is the window's last day,
+    # read now so the page and any later rebuild name the same day
+    inputs = _dashboard_inputs(result, start_date, start, series_categories,
+                               datetime.now(UTC).date())
+    _save_dashboard_inputs(PROJECT_ROOT / BACKTEST_SWEEP_FILENAME, inputs, simulator_parts)
+
     # Everything below reports the PRIMARY point, so the summary block and the
     # dashboard's other six sections read exactly as they did before the sweep
     # existed. The remaining k points are read by the filter bar's k select
@@ -955,20 +1680,9 @@ def main() -> None:
     # raises (falls back to the saved copy, then "unavailable"), but an
     # unresponsive single-address host can cost about 4 minutes first
     risk_free = load_risk_free_rates()
-    # balance_source: the header says where the starting balance came from
-    generate_dashboard(trades, equity_df, start_date, start.dollars,
-                       sweep=result, interval_discount=result.primary.k,
-                       series_categories=series_categories, risk_free=risk_free,
-                       sell_workers=sell_workers, balance_source=start.source)
-    logging.info("Open the HTML file in a browser to view the interactive charts.")
-    # How a scenario on the page becomes the live defaults, or is traded: the
-    # page cannot write files or start runs, so its buttons open the defaults
-    # server's pages (started by ./start_dashboard.sh, beside the live
-    # dashboard, whose Backtest tab shows this page)
-    logging.info("To save the filter bar's scenario as the live defaults, or to trade: run "
-                 "./start_dashboard.sh (it starts the defaults server and the live dashboard, "
-                 "whose Backtest tab is this page), then use the filter bar's Save as live "
-                 "defaults… or Trade using defaults… button.")
+    # The one call a rebuild from the saved inputs makes too
+    _build_dashboard(inputs, risk_free=risk_free, sell_workers=sell_workers)
+    _log_how_to_open()
 
 
 if __name__ == "__main__":

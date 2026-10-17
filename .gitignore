@@ -31,6 +31,11 @@ backtest_dashboard*.html
 # The dashboard's sidecar data (config.DASHBOARD_FILES_DIRNAME): the chunks its
 # Sell select loads, one folder per build, kept beside the page
 /backtest_dashboard_files/
+# What a full backtest run saves for the dashboard (config.BACKTEST_SWEEP_FILENAME):
+# `python3 -m kalshi_betting.backtest --dashboard-only` rebuilds the page from it.
+# Large, specific to one run, and a pickle (loading one runs code), so never shared
+/backtest_sweep.pkl.gz
+/backtest_sweep.pkl.gz.tmp
 
 # Saved live trading defaults (operator state, written by
 # config.save_live_defaults when defaults_server's confirmation page is

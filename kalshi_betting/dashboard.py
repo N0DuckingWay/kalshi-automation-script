@@ -15040,6 +15040,7 @@ def generate_dashboard(
     risk_free: RiskFreeRates | None = None,
     sell_workers: int = 1,
     balance_source: str | None = None,
+    period_end: date | None = None,
 ) -> Path:
     """
     Assemble all nine dashboard sections into a single self-contained HTML file.
@@ -15191,15 +15192,20 @@ def generate_dashboard(
             open positions; its cash alone when Kalshi's positions value could
             not be read; or "set by --balance". None (default) shows the
             amount alone.
+        period_end (date | None): The window's last day, for the Period line
+            and the save button's source note. backtest.py passes the UTC day
+            its run finished the sweep on, which it also saves, so a page
+            rebuilt from the saved sweep on a later day (--dashboard-only)
+            still names the run's own last day. None (default) is today (UTC).
 
     Returns:
         Path: Absolute path to the HTML file written,
             PROJECT_ROOT / "backtest_dashboard.html".
     """
     out_path = PROJECT_ROOT / DASHBOARD_FILENAME
-    # The window's last day for the Period line. UTC, like every other
-    # "today" the backtest reads (TS-13).
-    today = datetime.now(UTC).date()
+    # The window's last day for the Period line: the day handed in, else
+    # today. UTC, like every other "today" the backtest reads (TS-13).
+    today = datetime.now(UTC).date() if period_end is None else period_end
 
     # A label-less corpus taints EVERY section, not just the interval-discount
     # one: it changes which pairs were formed, so the trades, the returns and

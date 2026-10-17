@@ -52,6 +52,19 @@ fetch; and a balance below config.MIN_BALANCE_CENTS draws a WARNING. The
 amount reaches the sweep, the log, the summary block and the dashboard, and
 where it came from reaches the log and the dashboard.
 
+And the saved sweep: every full run saves what it hands generate_dashboard
+(config.BACKTEST_SWEEP_FILENAME, a JSON header line with the simulator
+fingerprint, then the inputs pickled) right after the sweep and before the
+page is built, a save that fails costs only the file; --dashboard-only builds
+the page from it with the run's own arguments and no Kalshi request, refuses
+the flags that shape a run, a missing file (exit 2), a damaged one (exit 1)
+and a file from other simulator code (exit 2, unless
+--accept-changed-simulator); its --no-*-sweep flags drop their family as a run
+given them builds it; the fingerprint counts code, never comments,
+docstrings or config the simulator does not read; and, on the backtester's
+selling golden fixture with every lazy family on, the rebuilt page and its
+sidecar files are byte for byte the run's.
+
 Fully offline: run_backtest_sweep, generate_dashboard, both client builders,
 read_account_balance, load_risk_free_rates and load_depth_model are monkeypatched, so no network
 call, no credential read and no real backtest happen. PROJECT_ROOT is redirected at tmp_path and
@@ -59,10 +72,15 @@ logging.basicConfig is stubbed, so the run's RotatingFileHandler can neither
 write into the repo root nor leak a handler onto the root logger for the rest
 of the session.
 """
+import ast
 import dataclasses
+import gzip
+import json
 import logging
+import pickle
 import sys
 from datetime import UTC, date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -70,9 +88,16 @@ import pandas as pd
 import pytest
 from kalshi_python_sync.exceptions import ApiException
 
-from kalshi_betting import backtest, config
+from kalshi_betting import backtest, backtester, config, dashboard
 from kalshi_betting.auth import AccountBalance
-from kalshi_betting.backtester import BacktestSweep, CorpusProvenance, SweepPoint
+from kalshi_betting.backtester import (
+    BacktestSweep,
+    CapSweep,
+    CorpusProvenance,
+    SellSweep,
+    SweepPoint,
+    TrimSweep,
+)
 from kalshi_betting.config import (
     MAX_DEADLINE_GAP_DAYS,
     MIN_PRICE_DIFF_LONG_GAP,
@@ -85,7 +110,8 @@ from kalshi_betting.config import (
 from kalshi_betting.depth_model import DepthModel
 from kalshi_betting.treasury import SOURCE_API, RiskFreeRates
 
-from .conftest import save_config_live_defaults
+from . import test_backtester as _tb
+from .conftest import apply_pre_toggle_defaults, save_config_live_defaults
 
 
 def _equity(final_value: float = 10_691.38) -> pd.DataFrame:
@@ -1548,3 +1574,638 @@ class TestRejectedArgumentLeavesNoLogFile:
             self, tmp_path, monkeypatch):
         self._run(["backtest", "--spread-min", "1.0"], tmp_path, monkeypatch)
         assert not (tmp_path / "kalshi_backtest.log").exists()
+
+
+def _saved_header_and_inputs(path) -> tuple[dict, dict]:
+    """Read a saved sweep file as a rebuild does: its header line, then its pickled inputs."""
+    with gzip.open(path, "rb") as handle:
+        header = json.loads(handle.readline())
+        inputs = pickle.load(handle)
+    return header, inputs
+
+
+def _rewrite_header(path, **changes) -> None:
+    """Change fields of a saved sweep file's header line, keeping its pickled inputs."""
+    with gzip.open(path, "rb") as handle:
+        header = json.loads(handle.readline())
+        rest = handle.read()
+    header.update(changes)
+    with gzip.open(path, "wb") as handle:
+        handle.write(json.dumps(header).encode("utf-8") + b"\n" + rest)
+
+
+def _changed_part(path, module: str) -> None:
+    """Make a saved file's fingerprint say one simulator module's code differed."""
+    with gzip.open(path, "rb") as handle:
+        parts = json.loads(handle.readline())["fingerprint_parts"]
+    parts[module] = "0" * 64
+    _rewrite_header(path, fingerprint_parts=parts,
+                    fingerprint=backtest._fingerprint_of(parts))
+
+
+@pytest.fixture
+def rebuild(cli, monkeypatch, tmp_path):
+    """A full run's saved file, then nothing a rebuild may not do: every collaborator
+    that reads the account, the market data or the corpus fails the test if called.
+
+    Returns the cli dict, the full run's generate_dashboard call moved to
+    "full_dashboard" and the saved file's path at "path".
+    """
+    _run(monkeypatch)
+    cli["full_dashboard"] = cli.pop("dashboard")
+    cli["path"] = tmp_path / config.BACKTEST_SWEEP_FILENAME
+
+    def forbidden(name):
+        def call(*args, **kwargs):
+            raise AssertionError(f"--dashboard-only called {name}")
+        return call
+
+    for name in ("build_historical_client", "build_prod_live_client", "read_account_balance",
+                 "run_backtest_sweep", "load_series_categories", "load_depth_model"):
+        monkeypatch.setattr(backtest, name, forbidden(name))
+    return cli
+
+
+class TestTheFullRunSavesItsDashboardInputs:
+    """Every full run saves what it hands generate_dashboard, right after the
+    sweep and before the page is built, in config.BACKTEST_SWEEP_FILENAME:
+    one JSON header line (format, simulator fingerprint, save time, Python,
+    start date), then the inputs pickled. A save that fails never stops the
+    run, and leaves no file behind — not even an earlier run's."""
+
+    def test_the_file_holds_what_the_dashboard_is_handed(self, cli, monkeypatch, tmp_path):
+        _run(monkeypatch)
+        path = tmp_path / config.BACKTEST_SWEEP_FILENAME
+        header, inputs = _saved_header_and_inputs(path)
+        args, kwargs = cli["dashboard"]
+        assert header["format"] == config.BACKTEST_SWEEP_FORMAT
+        parts = dict(backtest._loaded_simulator_fingerprint())
+        assert header["fingerprint_parts"] == parts
+        assert header["fingerprint"] == backtest._fingerprint_of(parts)
+        assert header["start_date"] == "2024-01-01"
+        assert set(inputs) == backtest._DASHBOARD_INPUT_KEYS
+        assert (inputs["start_date"], inputs["initial_balance"]) == (args[2], args[3])
+        for key in ("interval_discount", "series_categories", "balance_source", "period_end"):
+            assert inputs[key] == kwargs[key], key
+        saved = inputs["sweep"]
+        assert isinstance(saved, BacktestSweep)
+        assert saved.primary.k == kwargs["sweep"].primary.k
+        pd.testing.assert_frame_equal(saved.primary.equity_df, args[1])
+        assert not path.with_name(path.name + ".tmp").exists()
+
+    def test_the_window_ends_on_the_day_the_sweep_finished(self, cli, monkeypatch, tmp_path):
+        # The page's Period line and the saved file name one day, read when
+        # the sweep returns, so a later rebuild still names the run's day
+        monkeypatch.setattr(backtest, "datetime", _FrozenNow)
+        _run(monkeypatch)
+        _, kwargs = cli["dashboard"]
+        assert kwargs["period_end"] == date(2026, 10, 2)
+        _, inputs = _saved_header_and_inputs(tmp_path / config.BACKTEST_SWEEP_FILENAME)
+        assert inputs["period_end"] == date(2026, 10, 2)
+
+    def test_it_is_saved_before_the_page_is_built(self, cli, monkeypatch, tmp_path):
+        # So a page build that stops part way can be finished by a rebuild
+        path = tmp_path / config.BACKTEST_SWEEP_FILENAME
+        seen: list = []
+
+        def dashboard(*args, **kwargs):
+            seen.append(_saved_header_and_inputs(path)[1]["start_date"])
+            return tmp_path / "dashboard.html"
+
+        monkeypatch.setattr(backtest, "generate_dashboard", dashboard)
+        _run(monkeypatch, "--start-date", "2025-09-24")
+        assert seen == [date(2025, 9, 24)]
+
+    def test_it_replaces_an_earlier_runs_file(self, cli, monkeypatch, tmp_path):
+        path = tmp_path / config.BACKTEST_SWEEP_FILENAME
+        path.write_bytes(b"an earlier run")
+        _run(monkeypatch)
+        assert _saved_header_and_inputs(path)[0]["format"] == config.BACKTEST_SWEEP_FORMAT
+
+    def test_a_run_that_cannot_be_saved_still_builds_its_page(
+            self, cli, monkeypatch, tmp_path, caplog):
+        # A function cannot be pickled: the save fails, the run goes on, and an
+        # earlier run's file goes too, since it no longer matches the page
+        path = tmp_path / config.BACKTEST_SWEEP_FILENAME
+        path.write_bytes(b"an earlier run")
+        cli["series_categories"] = {"KXTEST": lambda: None}
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert "dashboard" in cli
+        assert not path.exists()
+        assert not path.with_name(path.name + ".tmp").exists()
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(m.startswith("Could not save this run's dashboard inputs (")
+                   and "any earlier run's saved file was removed" in m for m in warnings)
+
+    def test_code_that_cannot_be_fingerprinted_saves_nothing(
+            self, cli, monkeypatch, tmp_path, caplog):
+        def unreadable():
+            raise OSError("no such file")
+
+        monkeypatch.setattr(backtest, "_loaded_simulator_fingerprint", unreadable)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch)
+        assert "dashboard" in cli
+        assert not (tmp_path / config.BACKTEST_SWEEP_FILENAME).exists()
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(m.startswith("The simulator's code could not be fingerprinted")
+                   for m in warnings)
+        assert any("could not be fingerprinted when the run started" in m for m in warnings)
+
+
+class TestDashboardOnly:
+    """--dashboard-only rebuilds the page from the saved inputs: no fetch and
+    no Kalshi request, the T-bill yields read again, generate_dashboard called
+    with the run's own arguments and this command's --sell-workers."""
+
+    def test_it_hands_generate_dashboard_what_the_run_did(self, rebuild, monkeypatch):
+        _run(monkeypatch, "--dashboard-only", "--sell-workers", "3")
+        args, kwargs = rebuild["dashboard"]
+        full_args, full_kwargs = rebuild["full_dashboard"]
+        assert args[2:] == full_args[2:]
+        pd.testing.assert_frame_equal(args[1], full_args[1])
+        assert args[0] is kwargs["sweep"].primary.trades
+        assert set(kwargs) == set(full_kwargs)
+        for key in set(kwargs) - {"sweep", "risk_free", "sell_workers"}:
+            assert kwargs[key] == full_kwargs[key], key
+        assert kwargs["sweep"].primary.k == full_kwargs["sweep"].primary.k
+        assert kwargs["risk_free"] is rebuild["risk_free"]
+        assert kwargs["sell_workers"] == 3
+
+    def test_the_default_workers_are_the_full_runs(self, rebuild, monkeypatch):
+        _run(monkeypatch, "--dashboard-only")
+        assert (rebuild["dashboard"][1]["sell_workers"]
+                == rebuild["full_dashboard"][1]["sell_workers"])
+
+    def test_the_rebuild_says_what_it_read(self, rebuild, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--dashboard-only")
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(m.startswith(f"Dashboard rebuild from {rebuild['path']}: saved ")
+                   and "by a run that started 2024-01-01" in m for m in messages)
+        assert messages[-2] == "Open the HTML file in a browser to view the interactive charts."
+
+    def test_a_missing_file_exits_2(self, cli, monkeypatch, tmp_path, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--dashboard-only")
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert f"no saved backtest at {tmp_path / config.BACKTEST_SWEEP_FILENAME}" in err
+        assert "python3 -m kalshi_betting.backtest" in err
+        assert "dashboard" not in cli and "sweep_kwargs" not in cli
+
+    @pytest.mark.parametrize("damage", ["not gzip", "no header line", "header not json",
+                                        "other format", "no fingerprint"])
+    def test_a_file_whose_header_cannot_be_read_exits_1(self, rebuild, monkeypatch, damage):
+        path = rebuild["path"]
+        if damage == "not gzip":
+            path.write_bytes(b"not a gzip stream")
+        elif damage == "no header line":
+            with gzip.open(path, "wb") as handle:
+                handle.write(b"{" * 10)
+        elif damage == "header not json":
+            with gzip.open(path, "wb") as handle:
+                handle.write(b"not json\n")
+        elif damage == "other format":
+            _rewrite_header(path, format="backtest-sweep-v0")
+        else:
+            _rewrite_header(path, fingerprint_parts=None)
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--dashboard-only")
+        # A message, so exit 1, with the reason and what to do
+        assert isinstance(exc.value.code, str)
+        assert exc.value.code.startswith(f"backtest: {path} cannot be used: ")
+        assert exc.value.code.endswith("run the backtest again to save a new one")
+        if damage == "other format":
+            assert "'backtest-sweep-v0'" in exc.value.code
+            assert repr(config.BACKTEST_SWEEP_FORMAT) in exc.value.code
+        assert "dashboard" not in rebuild
+
+    @pytest.mark.parametrize("damage", ["cut short", "not the inputs"])
+    def test_a_run_that_cannot_be_loaded_exits_1(self, rebuild, monkeypatch, caplog, damage):
+        path = rebuild["path"]
+        with gzip.open(path, "rb") as handle:
+            line, rest = handle.readline(), handle.read()
+        payload = (rest[: len(rest) // 2] if damage == "cut short"
+                   else pickle.dumps({"sweep": 1}))
+        with gzip.open(path, "wb") as handle:
+            handle.write(line + payload)
+        with caplog.at_level(logging.INFO), pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--dashboard-only")
+        assert isinstance(exc.value.code, str) and "cannot be used" in exc.value.code
+        assert any(r.levelno == logging.ERROR
+                   and r.getMessage().startswith("Dashboard not rebuilt: ")
+                   for r in caplog.records)
+        assert "dashboard" not in rebuild
+
+    def test_a_changed_simulator_is_refused(self, rebuild, monkeypatch, capsys):
+        _changed_part(rebuild["path"], "backtester")
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--dashboard-only")
+        assert exc.value.code == 2
+        err = " ".join(capsys.readouterr().err.split())
+        assert "was simulated by other code: backtester.py changed since it was saved." in err
+        assert "two different versions of the code" in err
+        assert "--accept-changed-simulator" in err
+        assert "Python" not in err
+        assert "dashboard" not in rebuild
+
+    def test_the_refusal_names_a_different_python(self, rebuild, monkeypatch, capsys):
+        _changed_part(rebuild["path"], "config")
+        _rewrite_header(rebuild["path"], python="3.0.0")
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--dashboard-only")
+        assert exc.value.code == 2
+        err = " ".join(capsys.readouterr().err.split())
+        assert "config.py changed since it was saved (under Python 3.0.0; this is Python" in err
+
+    def test_accept_changed_simulator_builds_the_page_with_a_warning(
+            self, rebuild, monkeypatch, caplog):
+        _changed_part(rebuild["path"], "scanner")
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--dashboard-only", "--accept-changed-simulator")
+        assert "dashboard" in rebuild
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(m.startswith("The simulator's code changed since this run was saved "
+                                "(scanner.py)") for m in warnings)
+
+    def test_accept_changed_simulator_alone_is_refused(self, cli, monkeypatch, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--accept-changed-simulator")
+        assert exc.value.code == 2
+        assert "--accept-changed-simulator applies only with --dashboard-only" in (
+            capsys.readouterr().err)
+        assert "sweep_kwargs" not in cli
+
+    @pytest.mark.parametrize("argv", [
+        ["--start-date", "2025-01-01"], ["--balance", "100"], ["--no-cache"],
+        ["--max-horizon-days", "5"], ["--interval-discount", "0.5"], ["--no-sweep"],
+        ["--same-event-ladders"], ["--no-same-event-ladders"], ["--spread-min", "0.1"],
+        ["--spread-max", "0.9"], ["--no-band-sweep"],
+    ])
+    def test_a_flag_that_shapes_a_run_is_refused(self, rebuild, monkeypatch, capsys, argv):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--dashboard-only", *argv)
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "cannot be used with --dashboard-only" in err
+        assert argv[0] in err
+        assert "dashboard" not in rebuild
+
+    def test_every_option_is_a_run_flag_or_one_a_rebuild_reads(self):
+        # A new option must be put on one side or the other, so --dashboard-only
+        # never quietly ignores it
+        dests = {a.dest for a in backtest._build_parser()._actions} - {"help"}
+        run_only = {dest for dest, _ in backtest._RUN_ONLY_FLAGS}
+        rebuild = {"dashboard_only", "accept_changed_simulator", "sell_workers",
+                   "no_cap_sweep", "no_add_on_sweep", "no_sell_sweep", "no_trim_sweep",
+                   "no_trim_rise_sweep"}
+        assert run_only | rebuild == dests
+        assert not run_only & rebuild
+
+    def test_a_bad_worker_count_is_refused(self, rebuild, monkeypatch):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "--dashboard-only", "--sell-workers", "0")
+        assert exc.value.code == 2
+
+    def test_the_skip_flags_drop_their_families(self, cli, monkeypatch, tmp_path, caplog):
+        # The saved sweep carries a stand-in for every family each flag drops
+        cli["result"] = dataclasses.replace(
+            _sweep(), add_on_cap_sweep=SimpleNamespace(), add_on_tier_off_cap_sweep=None,
+            sell_sweep=SimpleNamespace(), trim_sweep=SimpleNamespace())
+        _run(monkeypatch)
+        with caplog.at_level(logging.INFO):
+            _run(monkeypatch, "--dashboard-only", "--no-add-on-sweep", "--no-sell-sweep",
+                 "--no-trim-sweep")
+        sweep = cli["dashboard"][1]["sweep"]
+        assert (sweep.add_on_cap_sweep, sweep.sell_sweep, sweep.trim_sweep) == (None,) * 3
+        assert any(r.getMessage() == (
+            "Dashboard rebuilt without: Add to held pairs (--no-add-on-sweep); "
+            "Sell (--no-sell-sweep); Trim to Kelly (--no-trim-sweep)")
+            for r in caplog.records)
+
+
+def _families() -> dict:
+    """One small real family of each lazy kind, at two caps (the run's own 20%, and 10%)."""
+    common = {"primary_cap": 0.2, "ks": (0.5,), "primary_k": 0.5,
+              "start_date": date(2026, 1, 5), "initial_balance": 1000.0}
+    band = ((0.0, 1.0),)
+    lazy = {"split_date": None, "checks": False, "entries_by_band": {}, "st_entries": [],
+            "eager": {}}
+    lists = {"off_bands": (), "entries_by_band": {}, "off_entries_by_band": {},
+             "end_dates": {}, "off_end_dates": {}}
+    return {
+        "cap_sweep": CapSweep(caps=(0.1, 0.2), bands=band, **lazy, **common),
+        "add_on_cap_sweep": CapSweep(caps=(0.1, 0.2), bands=band, add_to_held=True, **lazy,
+                                     **common),
+        "sell_sweep": SellSweep(levels=(0.5,), min_days=(1,), caps=(0.1, 0.2), bands=band,
+                                **lists, **common),
+        "trim_sweep": TrimSweep(caps=(0.1, 0.2), bands=band, min_rises=(0.05, 0.1),
+                                **lists, **common),
+    }
+
+
+class TestWithoutFamilies:
+    """_without_families drops each family its flag names and, without the
+    size-cap sweep, keeps the others at the run's own cap, as a run given the
+    same flags builds them; the loaded sweep itself is left as it was."""
+
+    @staticmethod
+    def _sweep():
+        return dataclasses.replace(_sweep(), **_families())
+
+    @staticmethod
+    def _call(sweep, **off):
+        flags = {"cap_sweep": True, "add_on_sweep": True, "sell_sweep": True,
+                 "trim_sweep": True, "trim_rise_sweep": True}
+        flags.update(dict.fromkeys(off, False))
+        return backtest._without_families(sweep, **flags)
+
+    def test_no_flag_keeps_the_sweep(self):
+        sweep = self._sweep()
+        assert self._call(sweep) == (sweep, [])
+        assert self._call(sweep)[0] is sweep
+
+    def test_without_the_cap_sweep_the_others_keep_the_runs_own_cap(self):
+        sweep = self._sweep()
+        out, notes = self._call(sweep, cap_sweep=False)
+        assert out.cap_sweep is None and out.tier_off_cap_sweep is None
+        for name in ("add_on_cap_sweep", "sell_sweep", "trim_sweep"):
+            assert getattr(out, name) == dataclasses.replace(getattr(sweep, name), caps=(0.2,))
+        assert notes == ["the size caps (--no-cap-sweep)"]
+        # The loaded sweep is left as it was
+        assert sweep.cap_sweep.caps == (0.1, 0.2) and sweep.sell_sweep.caps == (0.1, 0.2)
+
+    @pytest.mark.parametrize("flag, names, note", [
+        ("add_on_sweep", ("add_on_cap_sweep", "add_on_tier_off_cap_sweep"),
+         "Add to held pairs (--no-add-on-sweep)"),
+        ("sell_sweep", ("sell_sweep",), "Sell (--no-sell-sweep)"),
+        ("trim_sweep", ("trim_sweep",), "Trim to Kelly (--no-trim-sweep)"),
+    ])
+    def test_each_flag_drops_its_family(self, flag, names, note):
+        out, notes = self._call(self._sweep(), **{flag: False})
+        assert all(getattr(out, name) is None for name in names)
+        assert notes == [note]
+
+    def test_without_the_minimum_price_rises_trimming_stays(self):
+        sweep = self._sweep()
+        out, notes = self._call(sweep, trim_rise_sweep=False)
+        assert out.trim_sweep == dataclasses.replace(sweep.trim_sweep, min_rises=())
+        assert notes == ["Min. price rise (--no-trim-rise-sweep)"]
+        # Dropping trimming drops its minimums with it, named once
+        out, notes = self._call(sweep, trim_sweep=False, trim_rise_sweep=False)
+        assert out.trim_sweep is None and notes == ["Trim to Kelly (--no-trim-sweep)"]
+
+    def test_a_family_the_run_did_not_build_is_not_named(self):
+        out, notes = self._call(_sweep(), cap_sweep=False, add_on_sweep=False,
+                                sell_sweep=False, trim_sweep=False)
+        assert notes == []
+
+
+class TestSimulatorFingerprint:
+    """The saved file's simulator fingerprint: one digest per module of
+    _SIMULATOR_MODULES over its parsed code, docstrings left out, and one over
+    the config.py statements those modules read, with everything they use."""
+
+    @staticmethod
+    def _sources() -> dict[str, str]:
+        here = Path(backtest.__file__).parent
+        return {name: (here / f"{name}.py").read_text(encoding="utf-8")
+                for name in (*backtest._SIMULATOR_MODULES, "config")}
+
+    @staticmethod
+    def _changed(before: dict, after: dict) -> set[str]:
+        return {name for name in before if before[name] != after[name]}
+
+    def test_the_loaded_fingerprint_is_the_files_own(self):
+        assert (dict(backtest._loaded_simulator_fingerprint())
+                == backtest._simulator_fingerprint_parts(self._sources()))
+
+    def test_it_covers_the_simulator_and_not_the_dashboard(self):
+        assert backtest._SIMULATOR_MODULES == (
+            "backtester", "strategy", "scanner", "depth_model", "historical")
+        assert set(backtest._simulator_fingerprint_parts(self._sources())) == {
+            *backtest._SIMULATOR_MODULES, "config"}
+
+    def test_comments_docstrings_and_layout_do_not_count(self):
+        sources = self._sources()
+        base = backtest._simulator_fingerprint_parts(sources)
+        edited = dict(sources)
+        backtester_doc = "Simulate (or share) one population of one cell at every cap."
+        assert backtester_doc in sources["backtester"]
+        edited["backtester"] = (sources["backtester"].replace(
+            backtester_doc, "Reworded, as a docstring edit would.")
+            .replace("File: backtester.py", "File: backtester.py (reworded)", 1)
+            + "\n\n# A comment added at the end\n")
+        edited["config"] = sources["config"].replace(
+            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE = 7",
+            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE = (\n    7  # spread over two lines\n)")
+        assert edited["config"] != sources["config"]
+        assert backtest._simulator_fingerprint_parts(edited) == base
+
+    @pytest.mark.parametrize("module", ["backtester", "strategy", "scanner", "depth_model",
+                                        "historical"])
+    def test_a_code_edit_changes_its_modules_part_alone(self, module):
+        sources = self._sources()
+        base = backtest._simulator_fingerprint_parts(sources)
+        edited = {**sources, module: sources[module] + "\n_FINGERPRINT_PROBE = 1\n"}
+        assert self._changed(base, backtest._simulator_fingerprint_parts(edited)) == {module}
+
+    def test_a_config_value_the_simulator_reads_changes_the_config_part(self):
+        sources = self._sources()
+        base = backtest._simulator_fingerprint_parts(sources)
+        edited = {**sources, "config": sources["config"].replace(
+            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE = 7", "KELLY_TRIM_MIN_DAYS_SINCE_TRADE = 8")}
+        assert self._changed(base, backtest._simulator_fingerprint_parts(edited)) == {"config"}
+
+    def test_a_config_value_reached_through_another_changes_it_too(self):
+        # Read by config.kelly_trim_min_days, which the backtester calls; no
+        # simulator module names it itself
+        sources = self._sources()
+        read = set().union(*(backtest._config_names_read(ast.parse(sources[name]))
+                             for name in backtest._SIMULATOR_MODULES))
+        assert "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX" not in read
+        base = backtest._simulator_fingerprint_parts(sources)
+        edited = {**sources, "config": sources["config"].replace(
+            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX = 30",
+            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX = 31")}
+        assert self._changed(base, backtest._simulator_fingerprint_parts(edited)) == {"config"}
+
+    def test_config_the_simulator_never_reads_does_not_count(self):
+        # A dashboard constant, a changed one and a new one: rebuilding the
+        # page after such an edit is what the saved file is for
+        sources = self._sources()
+        base = backtest._simulator_fingerprint_parts(sources)
+        assert "KHAT_CONFIDENCE_LEVEL: float = 0.95" in sources["config"]
+        edited = {**sources, "config": sources["config"].replace(
+            "KHAT_CONFIDENCE_LEVEL: float = 0.95", "KHAT_CONFIDENCE_LEVEL: float = 0.9")
+            + "\nDASHBOARD_PROBE = 1\n"}
+        assert backtest._simulator_fingerprint_parts(edited) == base
+
+    def test_the_simulator_reaches_config_only_as_the_fingerprint_reads(self):
+        # _config_names_read sees `from .config import NAME` and `config.NAME`
+        # after `from . import config`; any other way would leave names out
+        for name in backtest._SIMULATOR_MODULES:
+            tree = ast.parse(self._sources()[name])
+            aliases = {alias.asname or alias.name for node in ast.walk(tree)
+                       if isinstance(node, ast.ImportFrom) and node.level == 1
+                       and node.module is None
+                       for alias in node.names if alias.name == "config"}
+            parents = {child: node for node in ast.walk(tree)
+                       for child in ast.iter_child_nodes(node)}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    assert not any("config" in alias.name for alias in node.names), name
+                if isinstance(node, ast.ImportFrom) and node.level == 0:
+                    assert "kalshi_betting" not in (node.module or ""), name
+                if isinstance(node, ast.Name) and node.id in aliases:
+                    # Only ever read as config.NAME
+                    parent = parents[node]
+                    assert isinstance(parent, ast.Attribute) and parent.value is node, (
+                        name, node.lineno)
+
+
+@pytest.fixture(scope="class")
+def saved_golden_run(tmp_path_factory):
+    """The backtester's selling golden fixture through run_backtest_sweep with every
+    lazy family on, on a narrowed grid (band 0-1, k 0.5, four sell levels, three
+    minimum-days options, three minimum price rises), saved by the full run's own
+    save and loaded back by the rebuild's own load, then paged twice: once from the
+    run's inputs as a full run pages them, once from the loaded copy.
+
+    The patches stay on until the class is done, so a test can run the fixture again
+    with other flags. Each page is written in a folder of its own, with its Sell
+    build folder renamed to one fixed name, so two pages can be compared byte for
+    byte. Yields the run, the saved file, the loaded inputs, a page builder and the
+    two pages (each a (page path, folder) pair).
+    """
+    toggles = pytest.MonkeyPatch()
+    mp = pytest.MonkeyPatch()
+    try:
+        apply_pre_toggle_defaults(toggles)
+        golden = _tb._SellingGolden()
+        golden._patch(mp)
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        mp.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        mp.setattr(backtester, "TAKE_PROFIT_LEVELS", (0.05, 0.25, 0.5, 1.0))
+        mp.setattr(backtester, "TAKE_PROFIT_MIN_DAYS", (1, 14, 30))
+        mp.setattr(backtester, "TRIM_MIN_PRICE_RISES", (0.05, 0.1, 0.3))
+        # One clock for every run of the class, so their curves end on one day
+        mp.setattr(backtester, "datetime", type(
+            "Clock", (_tb.TestCapSweepEndDate._Clock,),
+            {"moment": datetime(2026, 9, 26, 12, 0, tzinfo=UTC)}))
+        mp.setattr(dashboard.yf, "download",
+                   lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        new_build_folder = dashboard._new_build_folder
+
+        def fixed_build_folder(page):
+            folder = new_build_folder(page)
+            return folder.rename(folder.with_name("build"))
+
+        mp.setattr(dashboard, "_new_build_folder", fixed_build_folder)
+
+        def run(**flags):
+            options = {"band_sweep": True, "tier_off_sweep": True, "cap_sweep": True,
+                       "add_on_sweep": True, "sell_sweep": True, "trim_sweep": True,
+                       "trim_rise_sweep": True}
+            options.update(flags)
+            # As backtest.py sets it: the minimum price rises go with their family
+            options["trim_rise_sweep"] = options["trim_rise_sweep"] and options["trim_sweep"]
+            return backtester.run_backtest_sweep(
+                MagicMock(), MagicMock(), golden._START, 10_000.0, same_event_ladders=True,
+                interval_discount=0.5, **options)
+
+        def inputs_of(sweep):
+            return backtest._dashboard_inputs(
+                sweep, golden._START, backtest.StartingBalance(10_000.0, "set by --balance"),
+                {}, date(2026, 9, 26))
+
+        def page(inputs, label):
+            folder = tmp_path_factory.mktemp(label)
+            mp.setattr(dashboard, "PROJECT_ROOT", folder)
+            return backtest._build_dashboard(inputs, risk_free=None, sell_workers=1), folder
+
+        swept = run()
+        inputs = inputs_of(swept)
+        path = tmp_path_factory.mktemp("saved") / config.BACKTEST_SWEEP_FILENAME
+        backtest._save_dashboard_inputs(path, inputs,
+                                        dict(backtest._loaded_simulator_fingerprint()))
+        loaded = backtest._load_saved_inputs(path)
+        yield SimpleNamespace(run=run, swept=swept, path=path, loaded=loaded,
+                              inputs_of=inputs_of, page=page,
+                              live_page=page(inputs, "live"), loaded_page=page(loaded, "loaded"))
+    finally:
+        mp.undo()
+        toggles.undo()
+
+
+def _page_and_sidecars(page) -> tuple[bytes, dict]:
+    """A page's bytes, and each sidecar chunk file beside it by its path under the page's folder."""
+    html, folder = page
+    files = {str(f.relative_to(folder)): f.read_bytes()
+             for f in (folder / config.DASHBOARD_FILES_DIRNAME).rglob("*.js")}
+    return html.read_bytes(), files
+
+
+@pytest.mark.usefixtures("saved_golden_run")
+class TestRebuildFromTheSavedSweep:
+    """A page rebuilt from the saved file is the page the run built: every lazy
+    family survives the round trip, and each --no-*-sweep flag gives the page a
+    run given that flag builds."""
+
+    def test_every_lazy_family_is_saved(self, saved_golden_run):
+        swept, loaded = saved_golden_run.swept, saved_golden_run.loaded["sweep"]
+        for name in ("cap_sweep", "tier_off_cap_sweep", "add_on_cap_sweep",
+                     "add_on_tier_off_cap_sweep", "sell_sweep", "trim_sweep"):
+            assert getattr(swept, name) is not None, name
+            assert type(getattr(loaded, name)) is type(getattr(swept, name)), name
+        assert loaded.trim_sweep.min_rises == swept.trim_sweep.min_rises == (0.05, 0.1, 0.3)
+        assert loaded.sell_sweep.levels == swept.sell_sweep.levels
+
+    def test_the_rebuilt_page_is_byte_identical(self, saved_golden_run):
+        live = _page_and_sidecars(saved_golden_run.live_page)
+        rebuilt = _page_and_sidecars(saved_golden_run.loaded_page)
+        # Not vacuous: the Sell select wrote its chunk files
+        assert live[1]
+        assert rebuilt == live
+
+    @pytest.mark.parametrize("off", [
+        ("cap_sweep", "trim_rise_sweep"),
+        ("add_on_sweep", "sell_sweep", "trim_sweep"),
+    ])
+    def test_the_skip_flags_build_the_page_a_run_with_them_builds(self, saved_golden_run, off):
+        flags = dict.fromkeys(off, False)
+        ran = saved_golden_run.run(**flags)
+        expected = _page_and_sidecars(saved_golden_run.page(saved_golden_run.inputs_of(ran),
+                                                            "run-with-flags"))
+        kept = {"cap_sweep": True, "add_on_sweep": True, "sell_sweep": True,
+                "trim_sweep": True, "trim_rise_sweep": True}
+        kept.update(flags)
+        loaded = saved_golden_run.loaded
+        sweep, dropped = backtest._without_families(loaded["sweep"], **kept)
+        assert dropped
+        rebuilt = _page_and_sidecars(saved_golden_run.page({**loaded, "sweep": sweep},
+                                                           "rebuilt-with-flags"))
+        assert rebuilt == expected
+
+    def test_the_file_holds_only_the_backtests_data(self, saved_golden_run):
+        # No client, credential or other live object is pickled: every class
+        # the file names is the backtest's own, or plain data
+        named: set[str] = set()
+
+        class Recording(pickle.Unpickler):
+            def find_class(self, module, name):
+                named.add(module)
+                return super().find_class(module, name)
+
+        with gzip.open(saved_golden_run.path, "rb") as handle:
+            handle.readline()
+            Recording(handle).load()
+        allowed = ("kalshi_betting.backtester", "kalshi_betting.depth_model",
+                   "kalshi_betting.historical", "builtins", "datetime", "numpy", "pandas",
+                   "copyreg", "collections", "_codecs")
+        assert "kalshi_betting.backtester" in named
+        assert all(any(module == prefix or module.startswith(prefix + ".") for prefix in allowed)
+                   for module in named), sorted(named)
