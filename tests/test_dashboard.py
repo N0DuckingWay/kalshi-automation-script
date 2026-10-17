@@ -6097,15 +6097,21 @@ _FLT_SELECTS = ("flt-band", "flt-k", "flt-cap", "flt-cat", "flt-tag")
 
 def _tick_category(index) -> list:
     """The step of a reader clicking one box of the Category menu: that
-    category's (its index, a number or its text), or with "" the box that
-    clears the menu ("All categories")."""
+    category's (its index, a number or its text), or with "" its "All
+    categories" box."""
     return ["tick", "flt-cat-all" if index == "" else f"flt-cat-{index}"]
+
+
+def _clear_menus() -> list:
+    """The steps that untick every box of both menus whatever is ticked: the
+    state "All categories" leaves when clicked with every category ticked
+    (nothing ticked, everything shown)."""
+    return [["set", "flt-cat", ""], ["fire", "flt-cat"]]
 
 
 def _tick_tag(index) -> list:
     """The step of a reader clicking one box of the Tag menu: that tag's (its
-    index in the base block's subcats), or with "" the box that clears the
-    menu ("All tags")."""
+    index in the base block's subcats), or with "" its "All tags" box."""
     return ["tick", "flt-tag-all" if index == "" else f"flt-tag-{index}"]
 
 
@@ -7476,8 +7482,8 @@ class TestSaveLiveDefaultsButton:
             ["wait"],
             _tick_category(str(sports)), ["settle"],
             ["click", "flt-save"], ["snap", "category"],
-            _tick_category(""), ["settle"],
-            # A "Category · Tag" chosen under "All" sets its category too
+            *_clear_menus(), ["settle"],
+            # A "Category · Tag" chosen with nothing ticked sets its category too
             _tick_tag(basketball), ["settle"],
             ["click", "flt-save"], ["snap", "tag"],
             _tick_category(""), ["settle"],
@@ -18008,7 +18014,7 @@ def _mix_tick_sets(seed: int, count: int,
 def _mix_tick_steps(cats: list[int], tags: list[int], name: str) -> list:
     """The steps of a reader clearing the Category menu, ticking these
     categories and tags, and the snapshot taken once they are drawn."""
-    return [_tick_category(""), *(_tick_category(c) for c in cats),
+    return [*_clear_menus(), *(_tick_category(c) for c in cats),
             *(_tick_tag(t) for t in tags), ["settle"], ["snap", name]]
 
 
@@ -18471,7 +18477,8 @@ class TestMixedSelection:
             for key, value in expected[name]["kpi"].items():
                 assert plain[name]["text"][f"kpi-{key}"] == value, (name, key)
             assert note not in plain[name]["text"]["flt-summary"]
-            assert note in mixed[name]["text"]["flt-summary"]
+            # Every category ticked is "All categories": the whole run, never a mix
+            assert (note in mixed[name]["text"]["flt-summary"]) == (name != "every_category")
 
     def test_ticks_follow_the_rule_and_the_menus_say_what_is_ticked(
             self, monkeypatch, tmp_path):
@@ -18491,11 +18498,12 @@ class TestMixedSelection:
             _tick_tag(cat1[0]), _tick_tag(cat0[2]), ["settle"], ["snap", "narrowed"],
             # Unticking a category unticks its tags
             _tick_category(0), ["settle"], ["snap", "dropped"],
-            # The Tag menu's clearing box clears the tags alone
+            # The Tag menu's "All" box ticks every tag it shows: the category whole
             _tick_tag(""), ["settle"], ["snap", "tags_cleared"],
-            # Clicked again with nothing to clear, it changes and redraws nothing
+            # Clicked again with every tag ticked, it unticks them: whole again
             _tick_tag(""), ["settle"], ["snap", "again"],
-            # The Category menu's clearing box clears both menus
+            # The Category menu's "All" box ticks every category and unticks
+            # every tag: everything
             _tick_tag(cat1[1]), _tick_category(""), ["settle"], ["snap", "cleared"]],
             strict=True, pre=(("flt-cat", "0,2"), ("flt-tag", "1")))
         loaded, ready = snaps["loaded"], snaps["ready"]
@@ -18553,18 +18561,65 @@ class TestMixedSelection:
             data["text"], _phrase(data, 0, 0, 0), True, " · ".join(_MIX_SUBCATS[cat1[0]]),
             n[f"s{cat1[0]}"], n["all"])
         cleared = snaps["tags_cleared"]
-        assert state(cleared) == ([1], [], "Cat1", "All tags")
+        assert state(cleared) == ([1], cat1, "Cat1", f"{len(cat1)} tags")
         assert cleared["menus"]["flt-tag"]["all"] and cleared["reacts"]
         assert cleared["text"]["hdr-trades"] == str(n["c1"])
         again = snaps["again"]
-        assert state(again) == state(cleared) and again["menus"]["flt-tag"]["all"]
-        assert again["reacts"] == []
+        assert state(again) == ([1], [], "Cat1", "All tags")
+        assert again["menus"]["flt-tag"]["all"]
+        assert again["text"]["hdr-trades"] == str(n["c1"])
         done = snaps["cleared"]
-        assert state(done) == ([], [], "All categories", "All tags")
+        assert state(done) == (list(range(len(data["categories"]))), [],
+                               "All categories", "All tags")
         assert done["menus"]["flt-cat"]["all"] and done["menus"]["flt-tag"]["all"]
         assert shown_tags(done) == list(range(len(_MIX_SUBCATS)))
         assert done["text"]["hdr-trades"] == str(n["all"])
         assert html.escape(done["text"]["flt-summary"]) in page
+
+    def test_all_ticks_every_row_and_unticking_one_unticks_all(self, monkeypatch, tmp_path):
+        trades = _mix_trades(41, n=44)
+        page = _mix_page(monkeypatch, tmp_path, trades)
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        views = chunks[0]["list"]["views"]
+        n = {key: view["n"] for key, view in views.items()}
+        every_cat = list(range(len(data["categories"])))
+        cat0 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat0"]
+        snaps = _run_script(tmp_path, page, [
+            ["wait"], _tick_category(1), ["settle"], ["snap", "one"],
+            # "All categories" ticks every category: everything again
+            _tick_category(""), ["settle"], ["snap", "all"],
+            # Unticking one category unticks "All categories"
+            _tick_category(1), ["settle"], ["snap", "but_one"],
+            # Ticking it again ticks "All categories" again
+            _tick_category(1), ["settle"], ["snap", "all_again"],
+            # Clicked with every category ticked, it unticks them all
+            _tick_category(""), ["settle"], ["snap", "none"],
+            # "All tags" with one category ticked ticks every tag it shows
+            _tick_category(0), _tick_tag(""), ["settle"], ["snap", "tags"],
+            # Unticking one tag unticks "All tags" and narrows the category
+            _tick_tag(cat0[0]), ["settle"], ["snap", "tag_out"]], strict=True)
+
+        def menu(snap, which) -> tuple:
+            m = snap["menus"][which]
+            return m["ticked"], m["all"], m["label"]
+
+        assert menu(snaps["one"], "flt-cat") == ([1], False, "Cat1")
+        every_label = "All categories"
+        assert menu(snaps["all"], "flt-cat") == (every_cat, True, every_label)
+        assert snaps["all"]["text"]["hdr-trades"] == str(n["all"])
+        but_one = [i for i in every_cat if i != 1]
+        assert menu(snaps["but_one"], "flt-cat")[:2] == (but_one, False)
+        assert snaps["but_one"]["text"]["hdr-trades"] == str(n["all"] - n["c1"])
+        assert menu(snaps["all_again"], "flt-cat") == (every_cat, True, every_label)
+        assert snaps["all_again"]["text"]["hdr-trades"] == str(n["all"])
+        assert menu(snaps["none"], "flt-cat") == ([], True, "All categories")
+        assert snaps["none"]["text"]["hdr-trades"] == str(n["all"])
+        assert menu(snaps["tags"], "flt-cat") == ([0], False, "Cat0")
+        assert menu(snaps["tags"], "flt-tag")[:2] == (cat0, True)
+        assert snaps["tags"]["text"]["hdr-trades"] == str(n["c0"])
+        ticked, all_box, _ = menu(snaps["tag_out"], "flt-tag")
+        assert ticked == cat0[1:] and not all_box
+        assert snaps["tag_out"]["text"]["hdr-trades"] == str(n["c0"] - n[f"s{cat0[0]}"])
 
     def test_more_than_three_names_are_counted_not_listed(self, monkeypatch, tmp_path):
         page = _mix_page(monkeypatch, tmp_path, _mix_trades(42, n=44))
@@ -18700,11 +18755,14 @@ class TestMixedSelection:
             query = opened["url"].partition("?")[2]
             sent = parse_qs(query, strict_parsing=True)
             categories, tied, _ = _mix_names(cats, tags)
+            # Every category ticked and no tag is "All categories": no filter
+            if len(cats) == len(_MIX_CATEGORIES) and not tags:
+                categories = []
             # One category per ticked category, one tied tag per ticked tag
-            assert sent["category"] == categories
+            assert sent.get("category", []) == categories
             assert sent.get("tag", []) == tied
             settings, _ = defaults_server._proposal(defaults_server._params(query), current)
-            assert settings.categories == tuple(categories)
+            assert settings.categories == (tuple(categories) or None)
             assert settings.tags == (tuple(tied) or None)
             keeps = config.trade_filter(settings)
             kept = [si for si, pair in enumerate(pairs) if keeps(*pair)]
@@ -18740,7 +18798,7 @@ class TestMixedSelection:
         assert len(sports_tags) == 2
         snaps = _run_script(tmp_path, page, [
             ["wait"], _tick_tag(oil), ["settle"], ["click", "flt-save"], ["snap", "one_tag"],
-            _tick_category(""), *(_tick_tag(t) for t in sports_tags), ["settle"],
+            *_clear_menus(), *(_tick_tag(t) for t in sports_tags), ["settle"],
             ["click", "flt-save"], ["snap", "both_tags"],
             _tick_tag(""), ["settle"], ["click", "flt-save"], ["snap", "whole"]], strict=True)
         expected = {
@@ -18769,6 +18827,8 @@ class TestMixedSelection:
 
     def test_more_names_than_the_server_takes_cannot_be_saved(self, monkeypatch, tmp_path):
         # The page carries the server's own limit; past it the button is shut
+        # (One under the limit's least: every category ticked reads as "All
+        # categories", which names none)
         monkeypatch.setattr(dashboard, "DEFAULTS_SERVER_MAX_FILTER_NAMES", 2)
         page = _mix_page(monkeypatch, tmp_path, _mix_trades(52, n=44))
         data = TestFilterPage._data(page)
@@ -18776,8 +18836,10 @@ class TestMixedSelection:
         cat0 = [i for i, (name, _) in enumerate(_MIX_SUBCATS) if name == "Cat0"]
         snaps = _run_script(tmp_path, page, [
             ["wait"], _tick_category(0), _tick_category(1), ["settle"], ["snap", "two"],
-            _tick_category(2), ["settle"], ["click", "flt-save"], ["snap", "three"],
-            _tick_category(2), _tick_category(1), *(_tick_tag(t) for t in cat0), ["settle"],
+            _tick_category(2), _tick_tag(cat0[0]), ["settle"], ["click", "flt-save"],
+            ["snap", "three"],
+            _tick_tag(cat0[0]), _tick_category(2), _tick_category(1),
+            *(_tick_tag(t) for t in cat0), ["settle"],
             ["click", "flt-save"], ["snap", "three_tags"],
             _tick_tag(cat0[0]), ["settle"], ["snap", "two_tags"]], strict=True)
         assert not snaps["two"]["buttons"]["flt-save"]
@@ -18898,7 +18960,7 @@ class TestMixedSelection:
             cleared menus: the steps, and the ticks the menus' rule leaves."""
             cats: set = set()
             tags: set = set()
-            steps = [_tick_category("")]
+            steps = _clear_menus()
             for kind, i in boxes:
                 if kind == "c":
                     steps.append(_tick_category(i))
@@ -18947,8 +19009,10 @@ class TestMixedSelection:
             [opened] = snap["opened"]
             query = opened["url"].partition("?")[2]
             sent = parse_qs(query, strict_parsing=True)
-            # Every ticked name is sent, both spellings of a twin included
-            assert sent.get("category", []) == [categories[c] for c in cats]
+            # Every ticked name is sent, both spellings of a twin included —
+            # but every category ticked with no tag is "All categories"
+            names = [] if len(cats) == len(categories) and not tags else cats
+            assert sent.get("category", []) == [categories[c] for c in names]
             assert sent.get("tag", []) == [config.TAG_SCOPE_SEPARATOR.join(pairs[t])
                                            for t in tags]
             settings, _ = defaults_server._proposal(defaults_server._params(query), current)
@@ -19077,7 +19141,7 @@ class TestMixedSelection:
             _tick_category(1), ["settle"], ["click", "flt-save"], ["snap", "twin"],
             _tick_category(1), ["settle"], ["snap", "sports_again"],
             _tick_category(0), ["settle"], ["click", "flt-save"], ["snap", "separator"],
-            _tick_category(""), _tick_category(3), ["settle"], ["click", "flt-save"],
+            *_clear_menus(), _tick_category(3), ["settle"], ["click", "flt-save"],
             ["snap", "other_twin"]], strict=True)
         usual = dashboard._SAVE_TITLE
         for name in ("loaded", "ready", "sports", "sports_again"):
