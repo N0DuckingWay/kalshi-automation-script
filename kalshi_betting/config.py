@@ -814,6 +814,26 @@ DASHBOARD_FILES_DIRNAME = "backtest_dashboard_files"
 # estimate: the 365-day page's Sell select at under an hour).
 DASHBOARD_BUILD_STALE_SECONDS = 2 * 86_400
 
+# The file in PROJECT_ROOT (gitignored) where every full backtest run saves
+# what it hands the dashboard, right after the sweep: the BacktestSweep, the
+# start date, the starting balance and where it came from, Kalshi's /series
+# listing, the primary k and the window's last day. `python3 -m
+# kalshi_betting.backtest --dashboard-only` rebuilds the page from it without
+# running the backtest again. Each full run replaces it.
+BACKTEST_SWEEP_FILENAME = "backtest_sweep.pkl.gz"
+
+# The format the saved sweep file is written in: a gzip stream holding one
+# line of JSON (this tag, the simulator fingerprint, when it was saved,
+# under which Python, and the run's start date) and then the pickled inputs. A rebuild refuses a file
+# with any other tag; change it whenever the line's keys or the pickled
+# inputs' keys change, so an older file is refused rather than misread.
+BACKTEST_SWEEP_FORMAT = "backtest-sweep-v1"
+
+# The most bytes a rebuild reads for the saved sweep file's first line (the
+# JSON one): the real line is a few hundred bytes, so a file that runs past
+# this without a line break is not a saved sweep.
+BACKTEST_SWEEP_HEADER_MAX_BYTES = 65_536
+
 # How much of the dashboard file, from its start, defaults_server reads to tell
 # whether the page has the filter bar's Save and Trade buttons (it looks for
 # the Trade link's id). The bar sits in the page's opening part, before every
