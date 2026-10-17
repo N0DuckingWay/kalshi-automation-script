@@ -187,19 +187,12 @@ def _fills_echo(depth_model: DepthModel | None) -> str:
 
 def _log_corpus_provenance(sweep: BacktestSweep) -> None:
     """
-    Close the run's report with what settled-market corpus it read.
+    Log, as the run's last report line, which past-market data it used.
 
-    The "Period:" line prints start_date → today (the simulated window), and
-    the corpus holds no market settled after its assembly. Every run brings
-    its corpus up to date — a cache from an earlier UTC day is extended
-    through today, so a cached corpus is at most a few hours old (assembled
-    earlier the same UTC day) — and this line says which it was (DR-13).
-    Logged on every run, "not recorded" included — absence must never be the
-    only signal (DR-66). A cache from an earlier day that could not be
-    brought up to date (CorpusProvenance.stale: the cutoff read or the
-    extension failed, each with its WARNING) is named as that, never as
-    today's. The archive cutoff is information only: a market
-    settled after it is priced from Kalshi's live candlestick endpoint.
+    The data holds no market settled after it was put together, so this says
+    when that was and whether this run built it, extended it or reused a
+    saved copy. It is logged on every run, even when nothing is known, so a
+    missing line is never mistaken for good news.
 
     Args:
         sweep (BacktestSweep): The run's result. Its corpus_provenance is None
