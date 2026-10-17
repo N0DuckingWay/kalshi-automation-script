@@ -113,6 +113,15 @@ config.py (constants), _http.py (retry + raw-response fetch + one-line error tex
                                        imports it; backtester.py and
                                        backtest.py do)
 
+    historical.py ──→ eda.py  (counts what backtest_cache/ holds: each archive
+    scanner.py ──→ eda.py      and live day slice is summarised once into a
+                               small file under backtest_cache/eda_days/ and
+                               the summaries are merged; scanner.py's
+                               event_series, deadline_profile and
+                               stated_deadline sort combos and deadline
+                               wording. Reporting only: it imports no
+                               order-path module, and no module imports it)
+
     (historical.py also imports auth.py's build_client for its own client
      builders, _http.py directly for its raw signed GETs, and scanner.py's
      event_series so the event-title lookup budget's combo test agrees with

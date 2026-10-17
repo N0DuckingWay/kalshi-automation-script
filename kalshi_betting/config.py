@@ -806,6 +806,32 @@ DASHBOARD_FILENAME = "backtest_dashboard.html"
 # deletes the folders of earlier builds when it replaces the page.
 DASHBOARD_FILES_DIRNAME = "backtest_dashboard_files"
 
+# ─── Exploratory data summaries (eda.py; reporting only) ──────────────────────
+# Nothing that trades, sizes or backtests reads any of these; eda.py reads all
+# of them.
+# The folder under backtest_cache/ where each day slice's small summary is kept
+# (<this folder>/archive/<day>.json and <this folder>/live/<day>.json), so a
+# later run reads only the slices that are new or changed.
+EDA_SUMMARY_DIRNAME = "eda_days"
+# Bump when a summary gains or changes a field: every summary is then rebuilt.
+EDA_SUMMARY_VERSION = 2
+# The most worker processes the summaries are built in; each reads one slice
+# at a time, so memory grows with this number only by the record in hand.
+EDA_MAX_WORKERS = 4
+# How long to wait for the first worker process to answer before counting
+# every slice in the calling process instead (a worker that cannot start, for
+# example because the calling script lacks an `if __name__ == "__main__":`
+# guard, would otherwise be waited on for ever).
+EDA_WORKER_START_TIMEOUT_SECONDS = 120
+# Bucket edges, in hours, for a market's lifetime (close minus open). A
+# lifetime falls in the first bucket below the first edge, in the last at or
+# above the last edge, and otherwise in [edge, next edge).
+EDA_LIFETIME_EDGES_HOURS = (1, 6, 24, 72, 168, 720)
+# Bucket edges, in hours, for the settlement lag (settlement minus close). The
+# first edge is 0, so the first bucket holds the markets settled BEFORE their
+# listed close (an event decided early).
+EDA_LAG_EDGES_HOURS = (0, 1, 6, 24, 72, 168)
+
 # A build folder under DASHBOARD_FILES_DIRNAME still marked as being written
 # (its ".writing" file) is left alone while the mark is younger than this many
 # seconds — another backtest may be building its page at the same time — and
