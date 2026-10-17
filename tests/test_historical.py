@@ -6931,6 +6931,283 @@ class TestLoadSeriesCategories:
 _REAL_FETCH_EVENT_COMPETITION = historical._fetch_event_competition
 
 
+class TestLoadSeriesFeeMultipliers:
+    """The fee settings the /series listing carries (fee_type and fee_multiplier):
+    kept in a "fees" block of the same cache file as the categories, read by
+    load_series_fee_multipliers, fetched together with the categories (one
+    request per run), and nothing else about load_series_categories moves.
+    The fee reader never refreshes a missing or stale file itself (the
+    categories reader does, just before it); it only upgrades a current file
+    that has no "fees" block."""
+
+    LISTING = {"series": [
+        {"ticker": "KXMLBGAME", "category": "Sports", "tags": ["Baseball"],
+         "fee_type": "quadratic_with_maker_fees", "fee_multiplier": 0.5},
+        {"ticker": "KXBTCY", "category": "Crypto", "tags": ["BTC"],
+         "fee_type": "quadratic", "fee_multiplier": 0},
+        {"ticker": "KXFULL", "category": "Politics", "tags": [],
+         "fee_type": "quadratic", "fee_multiplier": 1},
+        {"ticker": "KXNOFEE", "category": "Politics", "tags": []},
+    ]}
+
+    @pytest.fixture
+    def cache(self, monkeypatch, tmp_path):
+        path = tmp_path / "series_categories.json"
+        monkeypatch.setattr(historical, "_SERIES_CATEGORIES_CACHE", path)
+        return path
+
+    @staticmethod
+    def _stub(monkeypatch, response):
+        calls = []
+
+        def fake_get(client, path, **params):
+            calls.append((path, params))
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        monkeypatch.setattr(historical, "_historical_get", fake_get)
+        return calls
+
+    @staticmethod
+    def _write(cache, **blocks):
+        cache.write_text(json.dumps({"fetched_at": datetime.now(UTC).isoformat(), **blocks}))
+
+    def test_the_fee_block_round_trips(self, cache, monkeypatch):
+        calls = self._stub(monkeypatch, self.LISTING)
+        client = MagicMock()
+        historical.load_series_categories(client)
+        got = historical.load_series_fee_multipliers(client)
+        # A series with no multiplier is unknown, so it is left out
+        assert got == {"KXMLBGAME": 0.5, "KXBTCY": 0.0, "KXFULL": 1.0}
+        assert all(isinstance(m, float) for m in got.values())
+        assert calls == [("/trade-api/v2/series", {})]
+        on_disk = json.loads(cache.read_text())
+        assert on_disk["fees"] == {
+            "KXMLBGAME": ["quadratic_with_maker_fees", 0.5], "KXBTCY": ["quadratic", 0],
+            "KXFULL": ["quadratic", 1], "KXNOFEE": ["", None]}
+        assert on_disk["series"]["KXMLBGAME"] == ["Sports", ["Baseball"]]
+        # Read back from the file with no client: the same map, no request
+        assert historical.load_series_fee_multipliers(None) == got
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("bad", [True, False, "0.5", float("nan"), float("inf"), -1, -0.01,
+                                     2, 1.01, None, [1], {"a": 1}])
+    def test_a_bad_multiplier_reads_as_unknown(self, cache, monkeypatch, bad):
+        self._stub(monkeypatch, {"series": [
+            {"ticker": "KXBAD", "category": "Sports", "tags": [], "fee_multiplier": bad},
+            {"ticker": "KXGOOD", "category": "Sports", "tags": [], "fee_multiplier": 0.5}]})
+        client = MagicMock()
+        historical.load_series_categories(client)
+        assert historical.load_series_fee_multipliers(client) == {"KXGOOD": 0.5}
+        assert json.loads(cache.read_text())["fees"]["KXBAD"][1] is None
+
+    def test_a_bad_value_in_a_cached_fee_block_reads_as_unknown(self, cache):
+        self._write(cache, series={"KXA": ["Sports", []]},
+                    fees={"KXA": ["quadratic", True], "KXB": ["quadratic", 7],
+                          "KXC": ["quadratic", 0.5], "KXD": "not a list", "KXF": [5, 1],
+                          "KXE": ["quadratic", None]})
+        assert historical.load_series_fee_multipliers(None) == {"KXC": 0.5}
+
+    def test_an_old_cache_without_fees_still_reads_for_categories(self, cache, monkeypatch):
+        self._write(cache, series={"KXA": ["Sports", ["Soccer"]]})
+        calls = self._stub(monkeypatch, self.LISTING)
+        # Fresh for categories: no request
+        assert historical.load_series_categories(MagicMock()) == {"KXA": ("Sports", ("Soccer",))}
+        assert calls == []
+
+    def test_a_current_cache_without_fees_is_upgraded_by_one_request(self, cache, monkeypatch):
+        self._write(cache, series={"KXA": ["Sports", ["Soccer"]]})
+        calls = self._stub(monkeypatch, self.LISTING)
+        # No client: nothing to fetch with, so nothing is known
+        assert historical.load_series_fee_multipliers(None) == {}
+        assert calls == []
+        # With a client but no opt-in (a live run): the file only, no request
+        assert historical.load_series_fee_multipliers(MagicMock()) == {}
+        assert calls == []
+        # Opted in (the backtest): one request, which also refreshes the categories
+        assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True) == {
+            "KXMLBGAME": 0.5, "KXBTCY": 0.0, "KXFULL": 1.0}
+        assert len(calls) == 1
+        assert "KXMLBGAME" in historical.load_series_categories(MagicMock())
+        assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True)["KXBTCY"] == 0.0
+        assert len(calls) == 1
+
+    def test_a_stale_cache_is_left_to_the_categories_reader(self, cache, monkeypatch):
+        old = datetime.now(UTC) - timedelta(
+            seconds=historical.SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS + 1)
+        for blocks in ({"series": {"KXA": ["Sports", []]}},
+                       {"series": {"KXA": ["Sports", []]}, "fees": {"KXA": ["quadratic", 0.5]}}):
+            cache.write_text(json.dumps({"fetched_at": old.isoformat(), **blocks}))
+            calls = self._stub(monkeypatch, self.LISTING)
+            got = historical.load_series_fee_multipliers(MagicMock(), upgrade=True)
+            # No request of its own: the file as it stands, however old
+            assert calls == []
+            assert got == ({"KXA": 0.5} if "fees" in blocks else {})
+        # ... and the categories reader's fetch refreshes both blocks
+        historical.load_series_categories(MagicMock())
+        assert len(calls) == 1
+        assert historical.load_series_fee_multipliers(MagicMock())["KXMLBGAME"] == 0.5
+        assert len(calls) == 1
+
+    def test_no_cache_at_all_makes_no_request_here(self, cache, monkeypatch):
+        calls = self._stub(monkeypatch, self.LISTING)
+        assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True) == {}
+        assert calls == []
+        assert not cache.exists()
+
+    def test_a_fresh_cache_with_fees_makes_no_request(self, cache, monkeypatch):
+        self._write(cache, series={"KXA": ["Sports", []]}, fees={"KXA": ["quadratic", 0.5]})
+        calls = self._stub(monkeypatch, self.LISTING)
+        assert historical.load_series_fee_multipliers(MagicMock()) == {"KXA": 0.5}
+        assert calls == []
+
+    def test_both_readers_on_a_stale_cache_make_one_request(self, cache, monkeypatch):
+        calls = self._stub(monkeypatch, self.LISTING)
+        client = MagicMock()
+        cats = historical.load_series_categories(client)
+        fees = historical.load_series_fee_multipliers(client)
+        assert len(calls) == 1
+        assert set(cats) == {"KXMLBGAME", "KXBTCY", "KXFULL", "KXNOFEE"}
+        assert fees == {"KXMLBGAME": 0.5, "KXBTCY": 0.0, "KXFULL": 1.0}
+
+    def test_the_categories_are_what_they_were_with_or_without_fee_fields(
+        self, cache, monkeypatch,
+    ):
+        stripped = {"series": [{k: v for k, v in s.items() if not k.startswith("fee_")}
+                               for s in self.LISTING["series"]]}
+        self._stub(monkeypatch, self.LISTING)
+        with_fees = historical.load_series_categories(MagicMock())
+        cache.unlink()
+        self._stub(monkeypatch, stripped)
+        assert historical.load_series_categories(MagicMock()) == with_fees == {
+            "KXMLBGAME": ("Sports", ("Baseball",)), "KXBTCY": ("Crypto", ("BTC",)),
+            "KXFULL": ("Politics", ()), "KXNOFEE": ("Politics", ())}
+
+    def test_a_failed_categories_fetch_leaves_the_fee_reader_quiet(
+        self, cache, monkeypatch, caplog,
+    ):
+        # The fee reader adds no request and no WARNING to the categories
+        # reader's own failure, with a stale copy or none
+        old = datetime(2020, 1, 1, tzinfo=UTC)
+        cache.write_text(json.dumps({"fetched_at": old.isoformat(),
+                                     "series": {"KXA": ["Sports", []]},
+                                     "fees": {"KXA": ["quadratic", 0.5]}}))
+        calls = self._stub(monkeypatch, RuntimeError("offline"))
+        client = MagicMock()
+        with caplog.at_level(logging.INFO):
+            historical.load_series_categories(client)
+            caplog.clear()
+            assert historical.load_series_fee_multipliers(client) == {"KXA": 0.5}
+        assert len(calls) == 1
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        cache.unlink()
+        assert historical.load_series_fee_multipliers(client) == {}
+        assert len(calls) == 1
+
+    def test_a_failed_upgrade_fetch_falls_back_to_no_multipliers(
+        self, cache, monkeypatch, caplog,
+    ):
+        self._write(cache, series={"KXA": ["Sports", []]})
+        calls = self._stub(monkeypatch, RuntimeError("offline"))
+        with caplog.at_level(logging.INFO):
+            assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True) == {}
+        assert len(calls) == 1
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+        assert "every series is charged the full fee" in caplog.text
+
+    def test_an_unreadable_cache_is_missing_not_an_error(self, cache, monkeypatch):
+        cache.write_text("{not json")
+        calls = self._stub(monkeypatch, self.LISTING)
+        assert historical.load_series_fee_multipliers(None) == {}
+        assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True) == {}
+        assert calls == []
+
+    def test_an_upgrade_is_used_when_its_cache_cannot_be_written(
+        self, cache, monkeypatch, caplog,
+    ):
+        self._write(cache, series={"KXA": ["Sports", []]})
+        self._stub(monkeypatch, self.LISTING)
+
+        def broken(path, data):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(historical, "_save_json_cache", broken)
+        with caplog.at_level(logging.INFO):
+            assert historical.load_series_fee_multipliers(
+                MagicMock(), upgrade=True)["KXMLBGAME"] == 0.5
+        assert "could not cache" in caplog.text
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_a_corrupt_cache_file_is_warned_about_once(self, cache, monkeypatch, caplog):
+        # The categories reader reports the corrupt file; the fee reader parses it
+        # on its own and says nothing at WARNING
+        cache.write_text("{not json")
+        self._stub(monkeypatch, RuntimeError("offline"))
+        with caplog.at_level(logging.INFO):
+            historical.load_series_categories(None)
+            warnings_after_categories = [r for r in caplog.records
+                                         if r.levelno >= logging.WARNING]
+            assert historical.load_series_fee_multipliers(None) == {}
+            assert historical.load_series_fee_multipliers(MagicMock(), upgrade=True) == {}
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == (
+            warnings_after_categories)
+        assert len(warnings_after_categories) == 1
+
+    def test_a_live_style_read_never_upgrades(self, cache, monkeypatch):
+        # The default (a live run): a current file without fees gives {} and no request
+        self._write(cache, series={"KXA": ["Sports", []]})
+        calls = self._stub(monkeypatch, self.LISTING)
+        assert historical.load_series_fee_multipliers(MagicMock()) == {}
+        assert historical.load_series_fee_multipliers(MagicMock(), upgrade=False) == {}
+        assert calls == []
+        assert "fees" not in json.loads(cache.read_text())
+
+    def test_the_upgrade_is_keyword_only_and_off_by_default(self):
+        import inspect
+        param = inspect.signature(historical.load_series_fee_multipliers).parameters["upgrade"]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY and param.default is False
+
+    @pytest.mark.parametrize("series", [{}, None, [], "x", {"KXA": "not a pair"}])
+    def test_a_current_file_whose_series_block_is_empty_is_not_upgraded(
+        self, cache, monkeypatch, series,
+    ):
+        # The categories reader would not serve this file as current, so its
+        # failed fetch must not be followed by a second request here
+        blocks = {} if series is None else {"series": series}
+        self._write(cache, **blocks)
+        calls = self._stub(monkeypatch, RuntimeError("offline"))
+        client = MagicMock()
+        assert historical.load_series_categories(client) == {}
+        assert len(calls) == 1
+        assert historical.load_series_fee_multipliers(client, upgrade=True) == {}
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("huge", [10 ** 400, -(10 ** 400)])
+    def test_a_huge_integer_multiplier_is_unknown_not_an_error(self, cache, monkeypatch, huge):
+        # float() of a 400-digit integer raises OverflowError; it must not cost the listing
+        assert historical._fee_multiplier(huge) is None
+        self._stub(monkeypatch, {"series": [
+            {"ticker": "KXHUGE", "category": "Sports", "tags": [], "fee_multiplier": huge},
+            {"ticker": "KXGOOD", "category": "Sports", "tags": [], "fee_multiplier": 0.5}]})
+        client = MagicMock()
+        assert set(historical.load_series_categories(client)) == {"KXHUGE", "KXGOOD"}
+        assert historical.load_series_fee_multipliers(client) == {"KXGOOD": 0.5}
+
+    def test_one_info_line_counts_the_listed_series(self, cache, monkeypatch, caplog):
+        self._stub(monkeypatch, {"series": [
+            {"ticker": "A", "fee_multiplier": 1}, {"ticker": "B", "fee_multiplier": 0.5},
+            {"ticker": "C", "fee_multiplier": 0.5}, {"ticker": "D", "fee_multiplier": 0},
+            {"ticker": "E", "fee_multiplier": 0.25}, {"ticker": "F"}]})
+        client = MagicMock()
+        historical.load_series_categories(client)
+        with caplog.at_level(logging.INFO):
+            historical.load_series_fee_multipliers(client)
+        lines = [m for m in caplog.messages if m.startswith("Series fee multipliers:")]
+        assert lines == ["Series fee multipliers: 5 series listed, 4 below 1 "
+                         "(2 at 0.5, 1 at 0, 1 other)"]
+
+
 class TestLoadEventCompetitions:
     """DR-79's backtest half: each event's product_metadata.competition, read
     once from /events/{ticker} and cached in event_competitions.json. Only

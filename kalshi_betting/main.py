@@ -50,7 +50,10 @@ Purpose:
     fetch, and files each market under its series' category and first tag
     (_attach_series_labels): the same-title finder, and held_pair_kind for
     live trimming, refuse two markets filed differently (DR-79). The
-    category/tag filter and the run summary read the same copy.
+    category/tag filter and the run summary read the same copy. The same
+    listing's fee multipliers are read beside it
+    (historical.load_series_fee_multipliers) and set on each market as
+    _fee_multiplier; nothing uses them for a fee yet.
 
     A production run with sell_at set sells, before it buys, each held position
     (an exact held pair, or a lone held market whose partner has paid out)
@@ -183,7 +186,13 @@ from .config import (
     trade_filter,
     trim_change_warnings,
 )
-from .historical import infer_category, load_series_categories, series_labels
+from .historical import (
+    infer_category,
+    load_series_categories,
+    load_series_fee_multipliers,
+    series_labels,
+    series_ticker,
+)
 from .reporter import (
     RunReport,
     RunReportHandler,
@@ -985,7 +994,8 @@ def _pair_labels(pair, series_categories: dict) -> tuple[str, str]:
     return series_labels(event, infer_category(event), series_categories)
 
 
-def _attach_series_labels(markets: list, series_categories: dict) -> None:
+def _attach_series_labels(markets: list, series_categories: dict, *,
+                          fee_multipliers: dict | None = None) -> None:
     """
     Attach to every market the Kalshi category and first tag its series is filed under.
 
@@ -1005,6 +1015,11 @@ def _attach_series_labels(markets: list, series_categories: dict) -> None:
         markets (list): The run's markets, before any is dropped; each gets
             a _series_labels attribute.
         series_categories (dict): Kalshi's /series listing (load_series_categories).
+        fee_multipliers (dict | None): Keyword-only. series ticker -> fee
+            multiplier (historical.load_series_fee_multipliers). Each market
+            also gets a _fee_multiplier attribute from it: its series'
+            multiplier, or 1.0 (the full fee) for a series the map lacks or
+            when no map is given. Carried only; nothing reads it for a fee yet.
     """
     if not series_categories:
         logging.warning(
@@ -1021,6 +1036,8 @@ def _attach_series_labels(markets: list, series_categories: dict) -> None:
             # Cross-module: the one filing rule the dashboard and the live filter share
             by_event[event] = series_labels(event, infer_category(event), series_categories)
         market._series_labels = by_event[event]
+        # The series' fee multiplier; the full fee when the listing gives none
+        market._fee_multiplier = (fee_multipliers or {}).get(series_ticker(event), 1.0)
 
 
 def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
@@ -1616,7 +1633,9 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
     # a production request): each market's category and tag, which the
     # same-title sport check compares, and what the category/tag filter files by
     series_categories = load_series_categories(None)
-    _attach_series_labels(markets, series_categories)
+    # Each series' fee multiplier, from the same cached copy (carried only)
+    fee_multipliers = load_series_fee_multipliers(None)
+    _attach_series_labels(markets, series_categories, fee_multipliers=fee_multipliers)
 
     # Optional opt-in cap so both bet types only see markets closing within
     # the requested window — a no-op (returns markets unchanged) when unset
@@ -1880,7 +1899,11 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # sale block, since live trimming reads it through held_pair_kind), and
     # what the category/tag filter and the run result file a pair by
     series_categories = load_series_categories(client)
-    _attach_series_labels(markets, series_categories)
+    # Each series' fee multiplier (carried only), read from the cache file the
+    # listing above refreshed: no request of its own on a live run, so an old
+    # file without fees gives {} (every market the full fee)
+    fee_multipliers = load_series_fee_multipliers(client)
+    _attach_series_labels(markets, series_categories, fee_multipliers=fee_multipliers)
 
     # Our positions' ladders, read before held markets are dropped; None
     # means one could not be identified, so no time-series trade this run.

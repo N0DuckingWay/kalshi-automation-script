@@ -462,6 +462,7 @@ from .historical import (
     infer_category,
     load_event_competitions,
     load_series_categories,
+    load_series_fee_multipliers,
     series_labels,
     series_ticker,
     usable_candle_ask,
@@ -2283,6 +2284,11 @@ class _Candidates:
         candle_failures (dict): Ticker -> (failure count, up to
             INTEGRITY_MAX_EXAMPLES sentences) for the candle series whose
             open/high/low/close order does not hold; absent tickers passed.
+        fee_multipliers (dict): Series ticker -> fee multiplier, from Kalshi's
+            /series listing (historical.load_series_fee_multipliers); a
+            series it lacks is charged the full fee (_fee_multiplier_of
+            reads 1.0). Carried only: nothing reads it for a decision yet.
+            Empty on a hand-built instance.
     """
     all_pairs: list
     candles_by_ticker: dict
@@ -2294,6 +2300,26 @@ class _Candidates:
     details: dict = field(default_factory=dict)
     trade_summaries: dict = field(default_factory=dict)
     candle_failures: dict = field(default_factory=dict)
+    fee_multipliers: dict = field(default_factory=dict)
+
+
+def _fee_multiplier_of(market: dict, fee_multipliers: dict | None) -> float:
+    """
+    Read the fee multiplier of a cached market record's series.
+
+    Looks the record's series (historical.series_ticker of its event ticker)
+    up in the multipliers map; 1.0, the full fee, when the map or the series
+    is missing. Carried only: nothing in the backtest prices a fee with it yet.
+
+    Args:
+        market (dict): A cached market record (its event_ticker is read).
+        fee_multipliers (dict | None): series ticker -> multiplier
+            (historical.load_series_fee_multipliers), or None.
+
+    Returns:
+        float: The series' multiplier, or 1.0 when it is not known.
+    """
+    return (fee_multipliers or {}).get(series_ticker(market.get("event_ticker") or ""), 1.0)
 
 
 def _curve_end_date(point: SweepPoint | None) -> date | None:
@@ -8924,6 +8950,7 @@ def _prepare_candidates(
     same_event_ladders: bool | None = None,
     *,
     series_categories: dict | None = None,
+    fee_multipliers: dict | None = None,
 ) -> _Candidates | None:
     """
     Run the half of the backtest that depends on neither the band nor k.
@@ -8977,6 +9004,11 @@ def _prepare_candidates(
             (the one the dashboard files trades by). None (the default) reads
             the cached copy only (historical.load_series_categories(None)),
             with no request.
+        fee_multipliers (dict | None): Keyword-only. series ticker -> fee
+            multiplier (historical.load_series_fee_multipliers); backtest.py
+            hands in the copy it reads with the production client. None (the
+            default) reads the cached copy only, with no request. Stored on
+            the result; nothing reads it for a decision yet.
 
     Returns:
         _Candidates | None: The candidate pairs (in scan order: time-series,
@@ -9185,6 +9217,9 @@ def _prepare_candidates(
     # Cross-module: None reads the cached copy only, making no request
     if series_categories is None:
         series_categories = load_series_categories(None)
+    # Each series' fee multiplier, carried on the result (nothing reads it yet)
+    if fee_multipliers is None:
+        fee_multipliers = load_series_fee_multipliers(None)
     if not series_categories and same_groups:
         # With no listing every series is filed by its ticker prefix, so
         # nearly every pair of series is filed alike and only the competition
@@ -9289,6 +9324,7 @@ def _prepare_candidates(
         details=details,
         trade_summaries=trade_summaries,
         candle_failures=candle_failures,
+        fee_multipliers=fee_multipliers,
     )
 
 
@@ -9920,6 +9956,7 @@ def _prepare_entries(
     *,
     depth_model: DepthModel | None = None,
     series_categories: dict | None = None,
+    fee_multipliers: dict | None = None,
 ) -> tuple[list[dict] | None, OutcomeLabelCoverage | None]:
     """
     Run the half of the backtest that does not depend on the interval discount.
@@ -9962,6 +9999,9 @@ def _prepare_entries(
             listing, handed straight to _prepare_candidates() for the
             same-title label check (DR-79); None (default) reads the cached
             copy there.
+        fee_multipliers (dict | None): Keyword-only. series ticker -> fee
+            multiplier, handed straight to _prepare_candidates(); None
+            (default) reads the cached copy there.
 
     Returns:
         tuple[list[dict] | None, OutcomeLabelCoverage | None]: The prepared
@@ -10002,6 +10042,7 @@ def _prepare_entries(
     candidates = _prepare_candidates(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
         same_event_ladders=same_event_ladders, series_categories=series_categories,
+        fee_multipliers=fee_multipliers,
     )
     if candidates is None:
         return None, None
@@ -11996,6 +12037,7 @@ def run_backtest(
     max_horizon_days: int | None = None,
     *,
     series_categories: dict | None = None,
+    fee_multipliers: dict | None = None,
 ) -> tuple[list[BacktestTrade], pd.DataFrame]:
     """
     Replay both pair strategies on all settled Kalshi markets from start_date.
@@ -12051,6 +12093,10 @@ def run_backtest(
             listing for the same-title label check (DR-79), handed through
             _prepare_entries() to _prepare_candidates(); None (default)
             reads the cached copy there.
+        fee_multipliers (dict | None): Keyword-only. series ticker -> fee
+            multiplier, handed through _prepare_entries() to
+            _prepare_candidates(); None (default) reads the cached copy
+            there. Carried only; no fee reads it yet.
 
     Returns:
         tuple[list[BacktestTrade], pd.DataFrame]: (trades, equity_df).
@@ -12102,7 +12148,7 @@ def run_backtest(
     # The /series listing rides through for the same-title label check (DR-79)
     raw_entries, _ = _prepare_entries(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
-        series_categories=series_categories,
+        series_categories=series_categories, fee_multipliers=fee_multipliers,
     )
     if raw_entries is None:
         # Same empty-result shape the zero-trade path produces, so backtest.py
@@ -13307,6 +13353,7 @@ def run_backtest_sweep(
     trim_sweep: bool = False,
     trim_rise_sweep: bool = False,
     series_categories: dict | None = None,
+    fee_multipliers: dict | None = None,
 ) -> BacktestSweep:
     """
     Replay both pair strategies at one interval discount, or at a grid of them —
@@ -13502,6 +13549,11 @@ def run_backtest_sweep(
             handed straight to _prepare_candidates(); backtest.py passes the
             copy the dashboard files trades by. None (default) reads the
             cached copy there.
+        fee_multipliers (dict | None): Keyword-only. series ticker -> fee
+            multiplier (historical.load_series_fee_multipliers), handed
+            straight to _prepare_candidates(); backtest.py passes the copy it
+            read with the production client. None (default) reads the cached
+            copy there. Carried only; no fee reads it yet.
 
     Returns:
         BacktestSweep: primary (the effective-discount, primary-band result),
@@ -13721,6 +13773,7 @@ def run_backtest_sweep(
     candidates = _prepare_candidates(
         hist_client, live_client, start_date, use_cache, max_horizon_days,
         same_event_ladders=same_event_ladders, series_categories=series_categories,
+        fee_multipliers=fee_multipliers,
     )
     if candidates is None:
         # Nothing can be simulated at any discount or band. Build the empty

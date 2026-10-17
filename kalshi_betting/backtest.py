@@ -34,7 +34,9 @@ Dependencies:
     build_prod_live_client / load_series_categories (Kalshi's /series
     listing, read once and handed to both the sweep, whose same-title sport
     check files each series by it, and the dashboard's returns-by-category
-    labels) from historical.py, load_risk_free_rates
+    labels) / load_series_fee_multipliers (each series' fee multiplier from
+    the same listing, handed to the sweep and carried, not yet used) from
+    historical.py, load_risk_free_rates
     (the T-bill yields the page's Sharpe and Sortino subtract) from
     treasury.py, load_depth_model (the table every trade's modeled order book
     is built from; the backtest's fills line names it) from depth_model.py,
@@ -316,7 +318,12 @@ from .config import (
 )
 from .dashboard import generate_dashboard
 from .depth_model import DepthModel, load_depth_model
-from .historical import build_historical_client, build_prod_live_client, load_series_categories
+from .historical import (
+    build_historical_client,
+    build_prod_live_client,
+    load_series_categories,
+    load_series_fee_multipliers,
+)
 from .treasury import load_risk_free_rates
 
 
@@ -1600,6 +1607,11 @@ def main() -> None:
     # series' category and tags. One cached read-only GET of /series, which
     # never raises (it falls back to a stale copy or to {})
     series_categories = load_series_categories(live_client)
+    # ... and each series' fee multiplier from the same cache file (the line
+    # above's refresh writes both; upgrade=True makes the one fetch that adds
+    # the fees to a current file from before they were kept). Carried by the
+    # sweep; no fee reads it yet
+    fee_multipliers = load_series_fee_multipliers(live_client, upgrade=True)
     result = run_backtest_sweep(
         hist_client=hist_client,
         live_client=live_client,
@@ -1629,6 +1641,8 @@ def main() -> None:
         depth_model=depth_model,
         # The listing the same-title label check files each series by
         series_categories=series_categories,
+        # Each series' fee multiplier (carried only)
+        fee_multipliers=fee_multipliers,
     )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy add-on sweeps (add_on_cap_sweep, and add_on_tier_off_cap_sweep with the band sweep) unless --no-add-on-sweep
     # What the dashboard is handed, saved before the page is built, so
     # --dashboard-only can rebuild the page (or finish a build that stopped)

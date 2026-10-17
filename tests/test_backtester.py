@@ -1724,6 +1724,101 @@ class TestSeriesCategoriesReachPrepareCandidates:
             assert param.default is None, func.__name__
 
 
+class TestFeeMultipliersReachPrepareCandidates:
+    """Each series' fee multiplier (historical.load_series_fee_multipliers) is
+    read beside the /series listing and carried on _Candidates; every entry
+    point hands it, unchanged, to _prepare_candidates (None, a direct caller's
+    default, becomes the cached copy there). Nothing reads it for a decision."""
+
+    MULTIPLIERS = {"KXMLBGAME": 0.5, "KXBTCY": 0.0}
+
+    @staticmethod
+    def _spy(monkeypatch):
+        seen: list = []
+
+        def fake(*args, **kwargs):
+            seen.append(kwargs.get("fee_multipliers", "MISSING"))
+            return None
+
+        monkeypatch.setattr(backtester, "_prepare_candidates", fake)
+        return seen
+
+    @pytest.mark.parametrize("passed", [None, MULTIPLIERS])
+    def test_run_backtest_sweep_hands_the_multipliers_over(self, monkeypatch, passed):
+        seen = self._spy(monkeypatch)
+        backtester.run_backtest_sweep(MagicMock(), MagicMock(), date(2026, 1, 1), 1000.0,
+                                      sweep=False, fee_multipliers=passed)
+        assert seen == [passed] and (passed is None or seen[0] is passed)
+
+    @pytest.mark.parametrize("passed", [None, MULTIPLIERS])
+    def test_run_backtest_and_prepare_entries_hand_the_multipliers_over(
+        self, monkeypatch, passed,
+    ):
+        seen = self._spy(monkeypatch)
+        run_backtest(hist_client=MagicMock(), live_client=MagicMock(),
+                     start_date=date(2026, 1, 1), initial_balance=1000.0,
+                     fee_multipliers=passed)
+        assert seen == [passed] and (passed is None or seen[0] is passed)
+
+    def test_the_multipliers_are_keyword_only_everywhere(self):
+        for func in (backtester._prepare_candidates, backtester._prepare_entries,
+                     run_backtest, run_backtest_sweep):
+            param = inspect.signature(func).parameters["fee_multipliers"]
+            assert param.kind is inspect.Parameter.KEYWORD_ONLY, func.__name__
+            assert param.default is None, func.__name__
+
+    def _prepare(self, monkeypatch, **kwargs):
+        corpus = [_ss1_record("A-1", "KXMLBGAME-26OCT16LADNYM", "Q one"),
+                  _ss1_record("B-1", "KXBTCY-26DEC31", "Q two")]
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        return backtester._prepare_candidates(
+            MagicMock(), MagicMock(), _SS1_START, True, None, **kwargs)
+
+    def test_the_multipliers_given_are_carried_unchanged(self, monkeypatch):
+        reads: list = []
+        monkeypatch.setattr(backtester, "load_series_fee_multipliers",
+                            lambda client: reads.append(client))
+        candidates = self._prepare(monkeypatch, fee_multipliers=self.MULTIPLIERS)
+        assert candidates.fee_multipliers is self.MULTIPLIERS
+        assert reads == []
+
+    def test_none_reads_the_cached_copy_only(self, monkeypatch):
+        historical._SERIES_CATEGORIES_CACHE.write_text(json.dumps({
+            "fetched_at": "2020-01-01T00:00:00+00:00", "series": {},
+            "fees": {"KXMLBGAME": ["quadratic_with_maker_fees", 0.5],
+                     "KXFULL": ["quadratic", 1]}}))
+        seen: list = []
+        real = historical.load_series_fee_multipliers
+
+        def spy(client, *a, **k):
+            seen.append(client)
+            return real(client, *a, **k)
+
+        monkeypatch.setattr(backtester, "load_series_fee_multipliers", spy)
+        candidates = self._prepare(monkeypatch)
+        assert seen == [None]
+        assert candidates.fee_multipliers == {"KXMLBGAME": 0.5, "KXFULL": 1.0}
+
+    def test_no_cached_copy_carries_an_empty_map(self, monkeypatch):
+        assert not historical._SERIES_CATEGORIES_CACHE.exists()
+        assert self._prepare(monkeypatch).fee_multipliers == {}
+
+    def test_a_hand_built_instance_carries_none(self):
+        field = backtester._Candidates.__dataclass_fields__["fee_multipliers"]
+        assert field.default_factory() == {}
+
+    def test_a_records_series_multiplier(self):
+        of = backtester._fee_multiplier_of
+        assert of({"event_ticker": "KXMLBGAME-26OCT16LADNYM"}, self.MULTIPLIERS) == 0.5
+        assert of({"event_ticker": "KXBTCY-26DEC31"}, self.MULTIPLIERS) == 0.0
+        # Unknown series, a missing or blank event ticker, and no map: the full fee
+        assert of({"event_ticker": "KXOTHER-1"}, self.MULTIPLIERS) == 1.0
+        assert of({"event_ticker": None}, self.MULTIPLIERS) == 1.0
+        assert of({}, self.MULTIPLIERS) == 1.0
+        assert of({"event_ticker": "KXMLBGAME-1"}, None) == 1.0
+        assert of({"event_ticker": "KXMLBGAME-1"}, {}) == 1.0
+
+
 class TestDeadlineProfileParity:
     """The live scanner (attribute-based) and the backtester (dict-based)
     field extraction must agree on every input, since only the field

@@ -196,6 +196,10 @@ def cli(monkeypatch, tmp_path):
     calls["series_categories"] = {"KXTEST": ("Sports", ("Basketball",))}
     monkeypatch.setattr(backtest, "load_series_categories",
                         lambda client: calls["series_categories"])
+    # ... and for the series fee multipliers (carried by the sweep, unused)
+    calls["fee_multipliers"] = {"KXTEST": 0.5}
+    monkeypatch.setattr(backtest, "load_series_fee_multipliers",
+                        lambda client, **kwargs: calls["fee_multipliers"])
     # Never read the real backtest_cache or the network for the risk-free rate
     calls["risk_free"] = RiskFreeRates(
         ((date(2026, 1, 5), 0.04),), SOURCE_API, datetime(2026, 9, 27, tzinfo=UTC),
@@ -1189,6 +1193,21 @@ class TestDashboardHandoff:
         assert cli["order"].index("load_series_categories") < cli["order"].index(
             "run_backtest_sweep")
 
+    def test_the_fee_multipliers_are_read_once_and_passed_to_the_sweep(self, cli, monkeypatch):
+        # Read with the production client beside the listing, handed to the
+        # sweep (which carries them; no fee reads them yet)
+        reads: list = []
+
+        def load(client, **kwargs):
+            reads.append((client, kwargs))
+            return cli["fee_multipliers"]
+
+        monkeypatch.setattr(backtest, "load_series_fee_multipliers", load)
+        _run(monkeypatch)
+        # The backtest alone may upgrade a current file that has no fees
+        assert reads == [(cli["live_client"], {"upgrade": True})]
+        assert cli["sweep_kwargs"]["fee_multipliers"] is cli["fee_multipliers"]
+
     def test_the_risk_free_rates_are_passed_through(self, cli, monkeypatch):
         _run(monkeypatch)
         _, kwargs = cli["dashboard"]
@@ -1621,7 +1640,8 @@ def rebuild(cli, monkeypatch, tmp_path):
         return call
 
     for name in ("build_historical_client", "build_prod_live_client", "read_account_balance",
-                 "run_backtest_sweep", "load_series_categories", "load_depth_model"):
+                 "run_backtest_sweep", "load_series_categories",
+                 "load_series_fee_multipliers", "load_depth_model"):
         monkeypatch.setattr(backtest, name, forbidden(name))
     return cli
 

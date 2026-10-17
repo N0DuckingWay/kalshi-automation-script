@@ -3547,6 +3547,11 @@ class ApiMarket:
             under in Kalshi's /series listing (historical.series_labels),
             set by main._attach_series_labels; None until then, which the
             same-title sport check (_labels_differ) reads as unknown.
+        _fee_multiplier (float): The fee multiplier of the market's series in
+            Kalshi's /series listing (historical.load_series_fee_multipliers),
+            set by main._attach_series_labels; 1.0, the full fee, for a series
+            the listing does not give one for and until it is set. Carried
+            only: nothing reads it for a fee yet.
     """
     ticker: str
     event_ticker: str
@@ -3564,6 +3569,8 @@ class ApiMarket:
     _event_competition: str | None = field(default="")
     # (category, tag); main._attach_series_labels sets it
     _series_labels: Any = field(default=None)
+    # main._attach_series_labels sets it; 1.0 (the full fee) until then
+    _fee_multiplier: float = field(default=1.0)
 
 
 def _market_from_dict(m: dict, event_title: str,

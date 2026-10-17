@@ -41,7 +41,10 @@ Dependencies:
     fetch_all_settled_markets(), fetch_candlesticks(), and infer_category(),
     all called by backtester.py (infer_category() by main.py and
     live_portfolio.py too). load_series_categories() is called by
-    backtest.py, backtester.py, main.py and live_dashboard.py, series_labels()
+    backtest.py, backtester.py, main.py and live_dashboard.py,
+    load_series_fee_multipliers() (each series' fee multiplier from the same
+    cached listing; carried, not yet used for a fee) by backtest.py,
+    backtester.py and main.py, series_labels()
     by backtester.py, dashboard.py, main.py and live_portfolio.py, and
     load_event_competitions() (each event's competition label, for the
     backtest's same-title sport check, DR-79) by backtester.py. live_portfolio.py (the Live
@@ -326,7 +329,10 @@ def series_labels(
 
 
 # Disk copy of Kalshi's /series listing: {"fetched_at": ISO, "series":
-# {series_ticker: [category, [tags...]]}}. See load_series_categories.
+# {series_ticker: [category, [tags...]]}, "fees": {series_ticker:
+# [fee_type, multiplier-or-null]}}. See load_series_categories and
+# load_series_fee_multipliers. A file written before the "fees" block existed
+# still reads for categories; for fees it counts as stale.
 _SERIES_CATEGORIES_CACHE = CACHE_DIR / "series_categories.json"
 # /series served every series in one response when checked (2026-09-25, no
 # cursor); should it ever paginate, this bounds the walk.
@@ -352,6 +358,148 @@ def _parse_series_categories(raw: Any) -> dict[str, tuple[str, tuple[str, ...]]]
                 and isinstance(value[0], str) and isinstance(value[1], list)):
             out[ticker] = (value[0], tuple(t for t in value[1] if isinstance(t, str)))
     return out
+
+
+def _fee_type(raw: Any) -> str:
+    """
+    Read a series' fee_type: its text, or "" when it is not text.
+
+    Kalshi lists "quadratic" (15,024 of 15,187 series on 2026-10-16),
+    "quadratic_with_maker_fees" (160) and "quadratic_with_combo_maker_fees"
+    (3). Nothing reads it yet; it is kept so a later change can.
+
+    Args:
+        raw (Any): The listing's fee_type value.
+
+    Returns:
+        str: The fee type, or "" when the value is not a string.
+    """
+    return raw if isinstance(raw, str) else ""
+
+
+def _fee_multiplier(raw: Any) -> float | None:
+    """
+    Read a series' fee_multiplier: a finite real number from 0 to 1, else unknown.
+
+    The listing gave 1 on 15,154 series, 0.5 on 19 and 0 on 14 (2026-10-16),
+    as JSON numbers. Anything else (a bool, a string such as "0.5", NaN or
+    infinity, a number outside 0 to 1, a missing value) is not a multiplier
+    this code can trust, so it reads as unknown (None) and a reader charges
+    the full fee for that series. (Events can carry a fee_multiplier_override
+    and fee_type_override of their own; 4 of 500 events sampled did, all with
+    a multiplier of 1. Nothing here reads events.)
+
+    Args:
+        raw (Any): The listing's fee_multiplier value.
+
+    Returns:
+        float | None: The multiplier, or None when unknown.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    try:
+        value = float(raw)
+    except OverflowError:  # a JSON integer of hundreds of digits
+        return None
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        return None
+    return value
+
+
+def _parse_series_fees(raw: Any) -> dict[str, tuple[str, float | None]] | None:
+    """
+    Read a series_categories.json "fees" block back into (fee_type, multiplier).
+
+    Args:
+        raw (Any): The cached "fees" value. Anything but a dict gives None,
+            which tells the caller the file has no usable fee block.
+
+    Returns:
+        dict[str, tuple[str, float | None]] | None: series ticker ->
+            (fee type, multiplier or None when unknown), skipping any entry
+            that is not [str, number-or-null]; each multiplier is checked
+            again, so a hand-edited bad one reads as unknown.
+    """
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, tuple[str, float | None]] = {}
+    for ticker, value in raw.items():
+        if (isinstance(ticker, str) and isinstance(value, list) and len(value) == 2
+                and isinstance(value[0], str)):
+            out[ticker] = (value[0], _fee_multiplier(value[1]))
+    return out
+
+
+def _fetch_series_listing(
+    client: Any,
+) -> tuple[dict[str, tuple[str, tuple[str, ...]]], dict[str, tuple[str, float | None]]]:
+    """
+    Read Kalshi's /series listing once: each series' labels and fee settings.
+
+    One read-only GET through _historical_get (retried on 429/5xx; the
+    response is about 19 MB and breaks part-way about one time in three, which
+    that retry covers), shared by load_series_categories and
+    load_series_fee_multipliers so one run's two readers make one request.
+
+    Args:
+        client (Any): A KalshiClient pointed at prod.
+
+    Returns:
+        tuple: (series ticker -> (category, tags), series ticker ->
+            (fee_type, multiplier or None)), the same tickers in both.
+
+    Raises:
+        ValueError: The reply is not an object or lists no series.
+        Exception: Whatever the retried GET raises once its retries run out.
+    """
+    fresh: dict[str, tuple[str, tuple[str, ...]]] = {}
+    fees: dict[str, tuple[str, float | None]] = {}
+    cursor, seen = None, set()
+    for _ in range(_SERIES_LIST_MAX_PAGES):
+        params = {"cursor": cursor} if cursor else {}
+        data = _historical_get(client, f"{_API_PREFIX}/series", **params)
+        if not isinstance(data, dict):
+            raise ValueError(f"/series returned a {type(data).__name__}, not an object")
+        for s in data.get("series") or []:
+            if isinstance(s, dict) and isinstance(s.get("ticker"), str) and s["ticker"]:
+                tags = s.get("tags") if isinstance(s.get("tags"), list) else []
+                fresh[s["ticker"]] = (
+                    s.get("category") if isinstance(s.get("category"), str) else "",
+                    tuple(t for t in tags if isinstance(t, str)),
+                )
+                fees[s["ticker"]] = (
+                    _fee_type(s.get("fee_type")), _fee_multiplier(s.get("fee_multiplier")))
+        cursor = data.get("cursor")
+        if not cursor or cursor in seen:
+            break
+        seen.add(cursor)
+    if not fresh:
+        raise ValueError("/series returned no series")
+    return fresh, fees
+
+
+def _save_series_listing(
+    now: datetime,
+    fresh: dict[str, tuple[str, tuple[str, ...]]],
+    fees: dict[str, tuple[str, float | None]],
+) -> None:
+    """
+    Write a fetched /series listing to backtest_cache/series_categories.json.
+
+    Args:
+        now (datetime): The fetch time, stored as "fetched_at".
+        fresh (dict): series ticker -> (category, tags).
+        fees (dict): series ticker -> (fee_type, multiplier or None); the
+            multiplier is written as JSON null when unknown.
+
+    Raises:
+        Exception: Whatever _save_json_cache raises; callers log it and go on.
+    """
+    _save_json_cache(_SERIES_CATEGORIES_CACHE, {
+        "fetched_at": now.isoformat(),
+        "series": {t: [cat, list(tags)] for t, (cat, tags) in fresh.items()},
+        "fees": {t: [ft, m] for t, (ft, m) in fees.items()},
+    })
 
 
 def load_series_categories(
@@ -417,26 +565,7 @@ def load_series_categories(
             and 0 <= (now - fetched_at).total_seconds() < max_age_seconds):
         return cached_map
     try:
-        fresh: dict[str, tuple[str, tuple[str, ...]]] = {}
-        cursor, seen = None, set()
-        for _ in range(_SERIES_LIST_MAX_PAGES):
-            params = {"cursor": cursor} if cursor else {}
-            data = _historical_get(client, f"{_API_PREFIX}/series", **params)
-            if not isinstance(data, dict):
-                raise ValueError(f"/series returned a {type(data).__name__}, not an object")
-            for s in data.get("series") or []:
-                if isinstance(s, dict) and isinstance(s.get("ticker"), str) and s["ticker"]:
-                    tags = s.get("tags") if isinstance(s.get("tags"), list) else []
-                    fresh[s["ticker"]] = (
-                        s.get("category") if isinstance(s.get("category"), str) else "",
-                        tuple(t for t in tags if isinstance(t, str)),
-                    )
-            cursor = data.get("cursor")
-            if not cursor or cursor in seen:
-                break
-            seen.add(cursor)
-        if not fresh:
-            raise ValueError("/series returned no series")
+        fresh, fees = _fetch_series_listing(client)
     except Exception as exc:  # never end a run over it (the live filter fails closed on {})
         logging.warning(
             "Series category listing unavailable (%s) — %s",
@@ -448,16 +577,137 @@ def load_series_categories(
         )
         return cached_map
     try:
-        _save_json_cache(_SERIES_CATEGORIES_CACHE, {
-            "fetched_at": now.isoformat(),
-            "series": {t: [cat, list(tags)] for t, (cat, tags) in fresh.items()},
-        })
+        _save_series_listing(now, fresh, fees)
     except Exception as exc:  # the listing is in hand: a failed write costs the cache only
         logging.warning(
             "Series categories: could not cache Kalshi's /series listing (%s) — this run "
             "still files by the %d series it fetched", _exception_summary(exc), len(fresh))
     logging.info("Series categories: %d series from Kalshi's /series listing", len(fresh))
     return fresh
+
+
+def _log_fee_multipliers(multipliers: dict[str, float]) -> None:
+    """
+    Log how many listed series charge less than the full fee.
+
+    Args:
+        multipliers (dict[str, float]): load_series_fee_multipliers' map.
+    """
+    below = [m for m in multipliers.values() if m < 1.0]
+    halves = sum(1 for m in below if m == 0.5)
+    zeros = sum(1 for m in below if m == 0.0)
+    logging.info(
+        "Series fee multipliers: %d series listed, %d below 1 (%d at 0.5, %d at 0, %d other)",
+        len(multipliers), len(below), halves, zeros, len(below) - halves - zeros)
+
+
+def _read_series_cache_quietly() -> dict | None:
+    """
+    Read series_categories.json for the fee reader, with no WARNING.
+
+    load_series_categories reads the same file first and warns about a file
+    it cannot use (through _load_json_cache); this parse is the fee reader's
+    own, so a corrupt file is not reported twice. A failure logs at INFO.
+
+    Returns:
+        dict | None: The parsed object, or None when the file is absent,
+            unreadable, corrupt or not an object.
+    """
+    try:
+        path = _SERIES_CATEGORIES_CACHE
+        if not path.exists():
+            return None
+        parsed = json.loads(path.read_text())
+    except Exception as exc:  # corrupt, unreadable, nested too deeply: the categories reader warns
+        logging.info(
+            "Series fee multipliers: could not read the cached /series listing (%s) — "
+            "treating it as missing", _exception_summary(exc))
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def load_series_fee_multipliers(
+    client: Any,
+    max_age_seconds: int = SERIES_CATEGORY_CACHE_MAX_AGE_SECONDS,
+    *,
+    upgrade: bool = False,
+) -> dict[str, float]:
+    """
+    Map every Kalshi series ticker to its fee multiplier, where one is known.
+
+    Kalshi's /series listing carries a fee_multiplier per series (1 on almost
+    all, 0.5 on MLB game and prop series, 0 on a few yearly crypto series on
+    2026-10-16). It sits in the same backtest_cache/series_categories.json
+    that load_series_categories reads, in a "fees" block beside "series".
+    Nothing prices, sizes or logs a trade on it yet; main._attach_series_labels
+    and the backtester carry it so a later change can.
+
+    This reader is a companion of load_series_categories, which a run calls
+    first with the same client and whose fetch (the weekly refresh) writes
+    both blocks. So it reads the file as it stands, with no request. The one
+    exception is opt-in: with upgrade=True, a file that load_series_categories
+    would serve as current (younger than max_age_seconds, its "series" block
+    non-empty) but that has no "fees" block (written before the block
+    existed) is upgraded by one fetch of the 19 MB listing, through the
+    retried GET. Live runs never upgrade (a retry can wait about a minute
+    and log WARNINGs): they read the file only, so an old file gives {} and
+    every market the full fee, which is safe while nothing reads it. The
+    backtest (backtest.py) upgrades. A missing or stale file is never fetched
+    here (the categories reader just tried). It never raises, and a failed
+    fetch, unreadable file or failed cache write adds no WARNING of the
+    categories reader's own: they log at INFO. Logs one INFO line counting
+    the series listed and those below 1.
+
+    Args:
+        client (Any): A KalshiClient pointed at prod, used only by an upgrade;
+            None reads the cached copy only (a dev run; no request is made).
+        max_age_seconds (int): How young the file must be to be upgraded.
+            Used only with upgrade=True.
+        upgrade (bool): Keyword-only. Allow the one upgrade fetch above.
+            Defaults to False.
+
+    Returns:
+        dict[str, float]: series ticker -> multiplier in [0, 1], for every
+            series whose multiplier is known; a series that is missing from
+            the map has an unknown multiplier (readers use 1.0, the full fee).
+    """
+    cached = _read_series_cache_quietly()
+    cached_fees: dict[str, tuple[str, float | None]] | None = None
+    fetched_at: datetime | None = None
+    has_series = False
+    if cached is not None:
+        cached_fees = _parse_series_fees(cached.get("fees"))
+        has_series = bool(_parse_series_categories(cached.get("series")))
+        try:
+            fetched_at = datetime.fromisoformat(cached.get("fetched_at"))
+        except (TypeError, ValueError):
+            fetched_at = None
+
+    def known(fees: dict[str, tuple[str, float | None]] | None) -> dict[str, float]:
+        return {t: m for t, (_, m) in (fees or {}).items() if m is not None}
+
+    result = known(cached_fees)
+    if upgrade and client is not None and cached_fees is None and has_series \
+            and fetched_at is not None and fetched_at.tzinfo is not None:
+        now = datetime.now(UTC)
+        if 0 <= (now - fetched_at).total_seconds() < max_age_seconds:
+            # A current file from before the "fees" block: upgrade it once
+            try:
+                fresh, fees = _fetch_series_listing(client)
+            except Exception as exc:  # never end a run over it (readers charge the full fee)
+                logging.info("Series fee listing unavailable (%s) — every series is charged "
+                             "the full fee", _exception_summary(exc))
+            else:
+                result = known(fees)
+                try:
+                    _save_series_listing(now, fresh, fees)
+                except Exception as exc:  # the listing is in hand: only the cache is lost
+                    logging.info(
+                        "Series fee multipliers: could not cache Kalshi's /series listing "
+                        "(%s) — this run still uses the %d series it fetched",
+                        _exception_summary(exc), len(fresh))
+    _log_fee_multipliers(result)
+    return result
 
 
 # Each event's competition label as the backtest's same-title check read it

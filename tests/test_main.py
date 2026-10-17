@@ -402,8 +402,10 @@ def _seed_series_listing(series: dict, fetched_at: datetime | None = None) -> No
     """
     stamp = datetime.now(UTC) if fetched_at is None else fetched_at
     historical._SERIES_CATEGORIES_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    # A "fees" block too (every series at the full fee), as the fetch writes it
     historical._SERIES_CATEGORIES_CACHE.write_text(json.dumps(
-        {"fetched_at": stamp.isoformat(), "series": series}))
+        {"fetched_at": stamp.isoformat(), "series": series,
+         "fees": {t: ["quadratic", 1] for t in series}}))
 
 
 def _main_with(monkeypatch, argv: list, **patches) -> dict:
@@ -3131,6 +3133,68 @@ class TestSeriesLabelsAreAttached:
             main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0,
                                                   max_horizon_days=None))
         assert caplog.messages.count(self._NO_LISTING) == 1
+
+    def test_each_market_carries_its_series_fee_multiplier(self):
+        # 1.0, the full fee, for a series the map lacks; the listed one otherwise
+        markets = [SimpleNamespace(event_ticker="KXMLBGAME-26OCT16LADNYM"),
+                   SimpleNamespace(event_ticker="KXBTCY-26DEC31"),
+                   SimpleNamespace(event_ticker="KXNCAAFGAME-26OCT16UKOKLA"),
+                   SimpleNamespace(event_ticker="")]
+        main._attach_series_labels(
+            markets, {}, fee_multipliers={"KXMLBGAME": 0.5, "KXBTCY": 0.0})
+        assert [m._fee_multiplier for m in markets] == [0.5, 0.0, 1.0, 1.0]
+
+    def test_no_multipliers_given_means_the_full_fee(self):
+        markets = [SimpleNamespace(event_ticker="KXMLBGAME-26OCT16LADNYM")]
+        main._attach_series_labels(markets, {"KXMLBGAME": ("Sports", ("Baseball",))})
+        assert markets[0]._fee_multiplier == 1.0
+        assert markets[0]._series_labels == ("Sports", "Baseball")
+
+    @staticmethod
+    def _spy_multipliers(monkeypatch) -> list:
+        reads: list = []
+        real = main.load_series_fee_multipliers
+
+        def load(client, **kwargs):
+            # A live run only reads the cache file: it never asks for an upgrade fetch
+            assert not kwargs.get("upgrade"), kwargs
+            reads.append(client)
+            return real(client, **kwargs)
+
+        monkeypatch.setattr(main, "load_series_fee_multipliers", load)
+        return reads
+
+    def test_a_production_run_reads_the_multipliers_once_with_its_client(self, monkeypatch):
+        client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD)
+        historical._SERIES_CATEGORIES_CACHE.write_text(json.dumps(
+            {"fetched_at": datetime.now(UTC).isoformat(),
+             "series": {"EXPEVT": ["Sports", ["Baseball"]]},
+             "fees": {"EXPEVT": ["quadratic", 0.5]}}))
+        reads = self._spy_multipliers(monkeypatch)
+        seen: list = []
+        real_st = main.find_same_title_pairs
+
+        def same_title(markets, *args, **kwargs):
+            seen.extend(markets)
+            return real_st(markets, *args, **kwargs)
+
+        monkeypatch.setattr(main, "find_same_title_pairs", same_title)
+        monkeypatch.setattr(main, "append_to_prod_log",
+                            lambda *a, **k: pathlib.Path("/fake/trade_log.xlsx"))
+        main._run_prod(client, _args(dry_run=True))
+        assert reads == [client]
+        # Every market is filed with a multiplier, 1.0 for every series the map lacks
+        assert {m._fee_multiplier for m in seen if m.event_ticker.startswith("EXPEVT")} == {0.5}
+        assert {m._fee_multiplier for m in seen
+                if not m.event_ticker.startswith("EXPEVT")} == {1.0}
+
+    def test_a_dev_run_reads_the_cached_multipliers_only(self, monkeypatch):
+        client = _live_shape_client(monkeypatch, balance_payload=_LIVE_BALANCE_PAYLOAD)
+        _capture_dev_simulation(monkeypatch)
+        reads = self._spy_multipliers(monkeypatch)
+        main._run_dev(client, SimpleNamespace(sandbox_balance=1000.0, max_horizon_days=None))
+        # No client: the sandbox key never signs a production request
+        assert reads == [None]
 
     def test_two_series_filed_differently_form_no_same_title_pair(self, monkeypatch, caplog):
         # The live-shape fixture's one tradeable pair (SAME-EXP / SAME-CHEAP)
