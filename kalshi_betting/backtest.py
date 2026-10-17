@@ -110,43 +110,30 @@ class StartingBalanceError(Exception):
 
 def _account_starting_balance(client) -> StartingBalance:
     """
-    Read what the Kalshi account is worth now, the starting balance of a run given no --balance.
+    Read what the Kalshi account is worth now, the starting balance when --balance is not given.
 
-    The amount is the account's portfolio value: the cash on every shard plus
-    what Kalshi says the open positions are worth. That is the figure a live
-    run sizes its trades on, so the backtest's trades are sized for the
-    account as it stands. When Kalshi's reply has no readable positions value,
-    the cash alone is used and a WARNING says so, as a live run does. The live
-    run's check of that value against the contracts held is not made here:
-    the backtest risks no money, and the source note names the cash and the
-    positions value apart, so a wrong part can be seen.
-
-    Makes one read-only GET of the account balance, retried on temporary
-    errors (auth.read_account_balance, which also logs its "Auth OK" line).
+    The amount is the account's cash plus what Kalshi says its open positions
+    are worth, the same figure a live run sizes its trades on. If Kalshi does
+    not report the positions' value, the cash alone is used, with a WARNING.
+    Makes one read-only request, retried on temporary errors.
 
     Args:
         client: A production KalshiClient, as historical.build_prod_live_client() makes.
 
     Returns:
-        StartingBalance: The account's value in dollars, and a note naming
-            when it was read and what it is made of: "the account's value at
-            <time> UTC: cash $X + open positions $Y", or, when the positions
-            value could not be read, "the account's cash at <time> UTC; its
-            open positions' value could not be read".
+        StartingBalance: The amount in dollars, with a note saying when it was
+            read and whether it includes the open positions.
 
     Raises:
-        StartingBalanceError: If the balance cannot be read (an error status
-            such as 401 for bad credentials, a reply with no readable cash,
-            or a network failure that outlasts the retries), or what was read
-            comes to nothing: an account worth $0, or no cash beside a
-            positions value that could not be read.
+        StartingBalanceError: If the balance cannot be read, or it comes to
+            nothing (an account worth $0, or no cash and an unknown
+            positions value).
     """
     try:
         # One retried read: the cash on each shard and Kalshi's value of the open positions
         account = read_account_balance(client)
     except Exception as e:
-        # The failure in one line (the HTTP status and Kalshi's error code, or
-        # the error's type and first line), never the SDK's multi-line text
+        # Describe the failure in one short line rather than the SDK's long error text
         raise StartingBalanceError(
             f"could not read the account balance ({api_error_summary(e)})") from e
     cash_cents = sum(account.shard_cash_cents.values())
@@ -154,7 +141,7 @@ def _account_starting_balance(client) -> StartingBalance:
     read_at = f"{datetime.now(UTC):%Y-%m-%d %H:%M} UTC"
     if positions_cents is None:
         if cash_cents <= 0:
-            # Positions of unknown worth may be held, so never say "worth $0"
+            # No cash, and positions of unknown worth: nothing safe to start from
             raise StartingBalanceError(
                 f"the account's cash is ${cash_cents / 100:,.2f} and its open positions' "
                 "value could not be read, so there is nothing to start from")
