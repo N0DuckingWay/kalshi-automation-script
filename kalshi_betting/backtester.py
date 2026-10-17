@@ -389,6 +389,7 @@ from zoneinfo import ZoneInfoNotFoundError
 import numpy as np
 import pandas as pd
 
+from . import market_details
 from .config import (
     BACKTEST_MARKETS_RAM_WARN,
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION,
@@ -398,6 +399,7 @@ from .config import (
     CANDLESTICK_FETCH_MAX_WORKERS,
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     CONTRACT_PAYOUT_DOLLARS,
+    INTEGRITY_MAX_EXAMPLES,
     INTERVAL_DISCOUNT_SWEEP,
     KELLY_TRIM_MIN_DAYS_SINCE_TRADE,
     LARGE_GROUP_WARN_THRESHOLD,
@@ -2267,6 +2269,20 @@ class _Candidates:
             corpus was a plain list (a test stub).
             Carried to BacktestSweep.corpus_provenance for the dashboard
             header.
+        details (dict): Ticker -> the full market_details record (timing
+            fields, numbers, strikes, rules text) of every PAIR market (the
+            tickers the candles are fetched for; the groupable markets that
+            form no pair are not loaded, there being a million of them on a
+            long window). Side data only: nothing in the backtest reads it to
+            decide a trade. Empty on a hand-built instance.
+        trade_summaries (dict): Pair-market ticker -> the small summary
+            market_details.audit_market kept of that market's trades (their
+            count, contracts and duplicates, whether the walk reached its end,
+            and the integrity failures found); the trades themselves are never
+            held.
+        candle_failures (dict): Ticker -> (failure count, up to
+            INTEGRITY_MAX_EXAMPLES sentences) for the candle series whose
+            open/high/low/close order does not hold; absent tickers passed.
     """
     all_pairs: list
     candles_by_ticker: dict
@@ -2275,6 +2291,9 @@ class _Candidates:
     max_horizon_days: int | None
     same_event_ladders: bool | None
     corpus_provenance: CorpusProvenance | None = None
+    details: dict = field(default_factory=dict)
+    trade_summaries: dict = field(default_factory=dict)
+    candle_failures: dict = field(default_factory=dict)
 
 
 def _curve_end_date(point: SweepPoint | None) -> date | None:
@@ -7920,7 +7939,8 @@ def _project_candles(candles: list[dict]) -> list[dict]:
 
 
 def _fetch_projected_candles(hist_client: Any, ticker: str, open_ts: int, close_ts: int,
-                             use_cache: bool, **endpoint: Any) -> list[dict]:
+                             use_cache: bool, *, check_out: dict | None = None,
+                             **endpoint: Any) -> list[dict]:
     """
     Fetch one ticker's candles and cut them to what the backtest keeps.
 
@@ -7933,13 +7953,22 @@ def _fetch_projected_candles(hist_client: Any, ticker: str, open_ts: int, close_
         open_ts (int): Window start, Unix seconds.
         close_ts (int): Window end, Unix seconds.
         use_cache (bool): Whether the candle cache may be read.
+        check_out (dict | None): When given, the full records are checked
+            (market_details.check_candles: the order of each hour's open, high,
+            low and close) before they are cut, and a ticker with failures is
+            entered as check_out[ticker] = (failure count, up to
+            INTEGRITY_MAX_EXAMPLES sentences). Each worker writes its own key.
         **endpoint: The series and live_first keywords for fetch_candlesticks, when any.
 
     Returns:
         list[dict]: _project_candles of what fetch_candlesticks returned.
     """
-    return _project_candles(
-        fetch_candlesticks(hist_client, ticker, open_ts, close_ts, use_cache, **endpoint))
+    full = fetch_candlesticks(hist_client, ticker, open_ts, close_ts, use_cache, **endpoint)
+    if check_out is not None:
+        failures = market_details.check_candles(full, ticker=ticker)
+        if failures:
+            check_out[ticker] = (len(failures), failures[:INTEGRITY_MAX_EXAMPLES])
+    return _project_candles(full)
 
 
 def _fetch_candles_parallel(
@@ -7949,6 +7978,7 @@ def _fetch_candles_parallel(
     use_cache: bool,
     *,
     cutoff_ts: int | None = None,
+    check_out: dict | None = None,
 ) -> dict[str, list[dict]]:
     """
     Fetch the hourly candlestick series for every needed ticker, in parallel.
@@ -8010,6 +8040,10 @@ def _fetch_candles_parallel(
             seconds): a market that settled at or after it is asked of the
             live endpoint first. None (default, and any corpus with no
             recorded cutoff) asks the archive first.
+        check_out (dict | None): Keyword-only. When given, each worker checks
+            its ticker's full candle records before cutting them
+            (_fetch_projected_candles) and enters the failures here. Nothing
+            else changes: the candles returned are the same either way.
 
     Returns:
         dict[str, list[dict]]: Ticker -> candle list (keys: ts, yes_ask_close,
@@ -8071,7 +8105,8 @@ def _fetch_candles_parallel(
             # cut from the cached per-ticker record (so a second run is much faster)
             futures = {
                 pool.submit(_fetch_projected_candles, hist_client, ticker,
-                            open_ts, close_ts, use_cache, **endpoint): ticker
+                            open_ts, close_ts, use_cache, check_out=check_out,
+                            **endpoint): ticker
                 for ticker, open_ts, close_ts, endpoint in work
             }
             done = 0
@@ -8762,6 +8797,124 @@ def _log_corpus_prefilter(total: int, eligible: int,
         )
 
 
+def _audit_pair_markets(
+    hist_client: Any,
+    needed_tickers: dict[str, dict],
+    details: dict[str, dict],
+    candles_by_ticker: dict[str, list[dict]],
+    trades_cutoff_ts: int | None,
+) -> dict[str, dict]:
+    """
+    Load each pair market's trades, check them against its details and candles, and keep summaries.
+
+    One worker per market on CANDLESTICK_FETCH_MAX_WORKERS threads
+    (market_details.audit_market), paced like the candle fetch. Each market's
+    trades are read from the cache or Kalshi, checked and dropped inside its
+    worker, so only the small summaries are held. A worker that fails
+    unexpectedly costs its market a summary marked incomplete and one WARNING;
+    nothing here can change a candle, a pair or a trade.
+
+    Args:
+        hist_client (Any): Historical KalshiClient, or None to read caches only.
+        needed_tickers (dict[str, dict]): Ticker -> market dict, the pair markets.
+        details (dict[str, dict]): Ticker -> market_details record.
+        candles_by_ticker (dict[str, list[dict]]): Ticker -> projected candles.
+        trades_cutoff_ts (int | None): Kalshi's trades archive cutoff, Unix
+            seconds; None when unknown (the archive endpoint is asked first).
+
+    Returns:
+        dict[str, dict]: Ticker -> market_details.audit_market's summary.
+    """
+    def _one(ticker: str) -> dict:
+        settled = _parse_iso_datetime(needed_tickers[ticker].get("settlement_ts"))
+        # The archive endpoint holds a market settled before the cutoff; with
+        # no cutoff or no settlement time it is asked first and a 404 asks the other
+        before = trades_cutoff_ts is None or settled is None or not _settled_after(
+            settled, trades_cutoff_ts)
+        try:
+            return market_details.audit_market(
+                hist_client, ticker, details.get(ticker), candles_by_ticker.get(ticker) or [],
+                settled_before_trades_cutoff=before)
+        except Exception as exc:  # side data must never end a backtest
+            logging.warning("Trades check failed for %s: %s", ticker, type(exc).__name__)
+            return {"trades": 0, "contracts": 0.0, "duplicates": 0, "price_failures": 0,
+                    "complete": False, "from_cache": False, "bytes": 0,
+                    "failure": f"the check raised {type(exc).__name__}", "failures": []}
+
+    summaries: dict[str, dict] = {}
+    if not needed_tickers:
+        return summaries
+    with ThreadPoolExecutor(max_workers=CANDLESTICK_FETCH_MAX_WORKERS) as pool:
+        futures = {pool.submit(_one, ticker): ticker for ticker in needed_tickers}
+        try:
+            for done, future in enumerate(as_completed(futures), start=1):
+                summaries[futures[future]] = future.result()
+                if done % 200 == 0:
+                    logging.info("  Trades progress: %d / %d", done, len(futures))
+        except BaseException:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+    return summaries
+
+
+def _log_extra_data(
+    full_stats: dict,
+    pair_count: int,
+    summaries: dict[str, dict],
+    candle_failures: dict[str, tuple[int, list[str]]],
+) -> None:
+    """
+    Report what the side data covers and what its integrity checks found.
+
+    Logs the market-details coverage and the trades coverage (INFO), one
+    WARNING when any pair market's trades could not be read to their end (the
+    count and the first market's reason, one line; the per-market lines are
+    DEBUG), and one INFO line per integrity check (market_details.CHECK_NAMES)
+    that is always logged, zero included, so a healthy run shows it; a check
+    with failures is followed by up to INTEGRITY_MAX_EXAMPLES example sentences.
+    The candle check counts markets (a market is one failure however many of
+    its hours fail); the others count the markets whose summary names them.
+
+    Args:
+        full_stats (dict): load_market_details' stats for the pair markets.
+        pair_count (int): How many pair markets there are.
+        summaries (dict[str, dict]): _audit_pair_markets' result.
+        candle_failures (dict): _fetch_candles_parallel's check_out.
+    """
+    logging.info(
+        "Market details: full records for %d of %d pair markets (%d from the cache)",
+        full_stats.get("full", 0), pair_count, full_stats.get("from_cache", 0),
+    )
+    complete = [s for s in summaries.values() if s["complete"]]
+    logging.info(
+        "Trades: %d of %d pair markets read to their end (%d trades, %.0f contracts; "
+        "%.1f MB cached)",
+        len(complete), pair_count, sum(s["trades"] for s in complete),
+        sum(s["contracts"] for s in complete), sum(s["bytes"] for s in complete) / 1e6,
+    )
+    unread = [(t, s["failure"]) for t, s in sorted(summaries.items()) if not s["complete"]]
+    if unread:
+        logging.warning(
+            "Trades: %d of %d pair markets could not be read to their end (first: %s: %s); "
+            "they are not cached and are asked again next run",
+            len(unread), pair_count, unread[0][0], unread[0][1] or "unknown reason")
+    failing: dict[str, list[str]] = {name: [] for name in market_details.CHECK_NAMES}
+    for ticker in sorted(summaries):
+        seen: set[str] = set()
+        for sentence in summaries[ticker]["failures"]:
+            name = market_details.failing_check(sentence)
+            if name in failing and name not in seen:
+                seen.add(name)
+                failing[name].append(sentence)
+    for ticker in sorted(candle_failures):
+        failing[market_details.CHECK_CANDLE_RANGE].append(candle_failures[ticker][1][0])
+    for name in market_details.CHECK_NAMES:
+        logging.info("Integrity check %s over the pair markets: %d failing",
+                     name, len(failing[name]))
+        for sentence in failing[name][:INTEGRITY_MAX_EXAMPLES]:
+            logging.info("  %s", sentence)
+
+
 def _prepare_candidates(
     hist_client: Any,
     live_client,
@@ -9092,12 +9245,29 @@ def _prepare_candidates(
     # each ticker to the endpoint that holds its candles; None (a corpus with
     # no recorded cutoff) asks the archive first and the live API on a 404
     cutoff = None if corpus_provenance is None else corpus_provenance.archive_cutoff
+    # The candle worker also checks each ticker's full record (the order of each
+    # hour's open, high, low and close); the failures come back through here
+    candle_failures: dict = {}
     candles_by_ticker = _fetch_candles_parallel(
         hist_client, needed_tickers, start_date, use_cache,
         cutoff_ts=None if cutoff is None else int(cutoff.timestamp()),
+        check_out=candle_failures,
     )
 
     logging.info("Candlestick fetch complete.")
+
+    # Side data for the pair markets: the full record of each (numbers, strikes,
+    # rules text), then each market's trades, read market by market, checked
+    # against the details and the candles and dropped. Reported only
+    full_stats: dict = {}
+    details = market_details.load_market_details(
+        hist_client, list(needed_tickers), full=frozenset(needed_tickers),
+        stats_out=full_stats)
+    trades_cutoff = None if hist_client is None else market_details.read_trades_cutoff(hist_client)
+    trade_summaries = _audit_pair_markets(
+        hist_client, needed_tickers, details, candles_by_ticker, trades_cutoff)
+    _log_extra_data(full_stats, len(needed_tickers), trade_summaries, candle_failures)
+    _log_rss("after the side-data loads")
 
     # Combine both pair types in scan order — time-series first, then
     # same-title — which is the order every entry pass walks and therefore the
@@ -9116,6 +9286,9 @@ def _prepare_candidates(
         max_horizon_days=max_horizon_days,
         same_event_ladders=same_event_ladders,
         corpus_provenance=corpus_provenance,
+        details=details,
+        trade_summaries=trade_summaries,
+        candle_failures=candle_failures,
     )
 
 

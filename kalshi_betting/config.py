@@ -2261,6 +2261,24 @@ CANDLESTICK_MAX_CANDLES_PER_REQUEST = 5000
 # so the older candlesticks/ folder is never read or written.
 CANDLESTICK_CACHE_FIELDS_VERSION = 3
 
+# The backtest's side data (market_details.py): each market's extra fields, its
+# trades and the checks that the candles, trades and market totals agree. Read
+# only by that module. A request asks for this many tickers at once on /markets
+# and /historical/markets (Kalshi's `tickers` filter), and for this many rows
+# per page of a listing or of trades (the most either endpoint serves). The
+# pause after each request is the one historical.fetch_candlesticks uses.
+MARKET_DETAILS_BATCH_SIZE = 100
+MARKET_DETAILS_PAGE_SIZE = 1000
+MARKET_DETAILS_REQUEST_PAUSE_SECONDS = 0.15
+
+# How far two contract totals may differ and still count as equal (volumes are
+# written to two decimals), the slack in seconds around a market's life within
+# which a trade or a candle still counts as part of it, and the most example
+# sentences a check keeps per ticker and logs per run.
+INTEGRITY_VOLUME_TOLERANCE = 0.005
+INTEGRITY_LIFE_SLACK_SECONDS = 3600
+INTEGRITY_MAX_EXAMPLES = 10
+
 # The highest NO ask a candle can carry: historical.fetch_candlesticks stores a
 # candle's NO ask as 1 - its YES bid, held within [0.01, this], so an empty YES-bid
 # book reads 0.99 just as a real 1c YES bid does; a NO ask here is therefore no

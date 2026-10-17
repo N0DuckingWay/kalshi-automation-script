@@ -5368,7 +5368,9 @@ class TestCandleEndpointRouting:
         monkeypatch.setattr(backtester, "_fetch_candles_parallel", _spy)
         backtester._prepare_candidates(MagicMock(), MagicMock(), date(2026, 1, 1),
                                        True, None)
-        assert seen == {"cutoff_ts": self.CUTOFF}
+        # The cutoff routes each ticker; check_out is the dict the candle worker
+        # fills with the open/high/low/close order failures (market_details)
+        assert seen == {"cutoff_ts": self.CUTOFF, "check_out": {}}
 
 
 class TestLogRss:
@@ -5465,8 +5467,10 @@ class TestPrepareEntriesMemoryInstrumentation:
                   if r.getMessage().startswith("Peak RSS")]
         # In order, and exactly the two that bracket grouping/pairing — the
         # window between the existing "Markets to analyze" and "Potential
-        # pairs" lines, where the peak lives and is otherwise invisible.
-        assert labels == ["before grouping", "after pair extraction"]
+        # pairs" lines, where the peak lives and is otherwise invisible; a
+        # third follows the side-data loads (market_details) after the candles.
+        assert labels == ["before grouping", "after pair extraction",
+                          "after the side-data loads"]
 
     def test_ram_warning_fires_above_the_threshold(self, monkeypatch, caplog):
         monkeypatch.setattr(backtester, "BACKTEST_MARKETS_RAM_WARN", 1)

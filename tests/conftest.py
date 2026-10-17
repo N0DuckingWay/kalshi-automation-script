@@ -4,13 +4,14 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Suite-wide pytest fixtures and two helpers. Nine autouse guards
+    Suite-wide pytest fixtures and two helpers. Eleven autouse guards
     (_offline_event_competitions_for_the_session,
     _isolate_event_title_accumulator, _isolate_treasury_rates,
     _fresh_order_write_pacer, _fresh_v2_mapping_disproof_state,
     _isolate_live_defaults_for_the_session, _isolate_live_defaults,
-    _isolate_live_runs and _isolate_live_dashboard, in the order described
-    here): one answers every event-competition read with "" (an event naming
+    _isolate_live_runs, _isolate_live_dashboard,
+    _offline_market_details_for_the_session and _isolate_market_details, in
+    the order described here): one answers every event-competition read with "" (an event naming
     no competition) and points the competition cache and Kalshi's cached
     /series listing at an empty session directory, in force during class
     setup too, so no test reaches Kalshi for a label and no class-scoped
@@ -36,7 +37,12 @@ Purpose:
     reads, its kept daily prices and its server log) and the trade log it
     reads (reporter.PROD_LOG_PATH, with its lock) at each test's own
     tmp_path, so no test writes them into the checkout or reads the
-    operator's trade log. pre_toggle_defaults pins
+    operator's trade log; and two keep market_details offline: the session one
+    replaces its request function with a stub (no markets and no trades
+    listed, a plain RuntimeError for anything else), points its three cache locations at an
+    empty session directory and removes the pause after each request, and the
+    per-test one points the same three locations at each test's tmp_path.
+    pre_toggle_defaults pins
     the live toggles for a test whose figures assume fixed values (they pin
     arithmetic, not config.py's policy); its helper, apply_pre_toggle_defaults,
     also serves class-scoped fixtures. save_config_live_defaults (and the
@@ -47,7 +53,8 @@ Dependencies:
     Imports kalshi_betting.historical (the four cache paths, and
     _fetch_event_competition, which the session guard replaces),
     kalshi_betting.treasury (its _RATES_CACHE path and _get_json),
-    kalshi_betting.trader (its _WritePacer, _ORDER_WRITE_PACER,
+    kalshi_betting.market_details (its request function and three cache
+    locations), kalshi_betting.trader (its _WritePacer, _ORDER_WRITE_PACER,
     _V2_NO_MAPPING_DISPROVEN, _V2_UNCHECKED_NO_LEGS and
     _V2_UNCHECKED_BASELINES), config (the toggle
     constants, the order-write rate and burst, LIVE_DEFAULTS_FILE,
@@ -86,7 +93,16 @@ Notes:
 """
 import pytest
 
-from kalshi_betting import backtest, backtester, config, historical, reporter, trader, treasury
+from kalshi_betting import (
+    backtest,
+    backtester,
+    config,
+    historical,
+    market_details,
+    reporter,
+    trader,
+    treasury,
+)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -121,6 +137,80 @@ def _offline_event_competitions_for_the_session(tmp_path_factory):
     mp.setattr(historical, "_fetch_event_competition", lambda client, event_ticker: "")
     yield
     mp.undo()
+
+
+def _offline_market_details_get(client, path, **params):
+    """
+    Stand in for market_details._get: no test reaches Kalshi for market details or trades.
+
+    The market listings and the two trades endpoints answer with nothing (no
+    markets, no trades), so the backtest's side data comes back empty and quiet
+    (a raised error there would be a WARNING in every test that prepares
+    candidates). Every other path (the cutoff, a capture) raises a plain
+    RuntimeError, which the callers treat as a failed request.
+
+    Args:
+        client: Ignored.
+        path (str): The API path asked for.
+        **params: Ignored.
+
+    Returns:
+        dict: {"markets": []} for a market listing, {"trades": []} for a
+            trades listing.
+
+    Raises:
+        RuntimeError: For any other path.
+    """
+    if path.endswith("/markets") or path.endswith("/historical/markets"):
+        return {"markets": [], "cursor": ""}
+    if path.endswith("/trades"):
+        return {"trades": [], "cursor": ""}
+    raise RuntimeError("offline: the test suite makes no request to Kalshi")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _offline_market_details_for_the_session(tmp_path_factory):
+    """
+    Keep market_details off the network and off the checkout, for the whole session.
+
+    Session-scoped, like the event-competition stub above, because the
+    backtester's class-scoped sweep fixtures run whole backtests (and so the
+    side-data loaders) before any function-scoped fixture is active. Replaces
+    market_details._get with _offline_market_details_get, points the three
+    cache locations at an empty session directory and removes the pause after
+    each request. The module's own tests put their fake exchange where the
+    stub is.
+
+    Args:
+        tmp_path_factory (pytest.TempPathFactory): pytest's session-wide
+            temporary-directory maker.
+
+    Yields:
+        None: The stub and the redirect hold until the session ends.
+    """
+    mp = pytest.MonkeyPatch()
+    folder = tmp_path_factory.mktemp("market-details")
+    mp.setattr(market_details, "_get", _offline_market_details_get)
+    mp.setattr(market_details, "_DETAILS_CACHE", folder / "market_details.json.gz")
+    mp.setattr(market_details, "_TRADES_DIR", folder / "trades")
+    mp.setattr(market_details, "_CLOSES_DIR", folder / "scheduled_closes")
+    mp.setattr(config, "MARKET_DETAILS_REQUEST_PAUSE_SECONDS", 0.0)
+    yield
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_market_details(tmp_path, monkeypatch):
+    """
+    Point market_details' three caches at the test's own tmp_path.
+
+    Args:
+        tmp_path (Path): pytest's per-test temporary directory.
+        monkeypatch (pytest.MonkeyPatch): Restores the session paths afterwards.
+    """
+    monkeypatch.setattr(market_details, "_DETAILS_CACHE", tmp_path / "market_details.json.gz")
+    monkeypatch.setattr(market_details, "_TRADES_DIR", tmp_path / "trades")
+    monkeypatch.setattr(market_details, "_CLOSES_DIR", tmp_path / "scheduled_closes")
 
 
 @pytest.fixture(autouse=True)
