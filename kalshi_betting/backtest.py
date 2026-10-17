@@ -548,6 +548,12 @@ def _without_docstrings(tree: ast.Module) -> ast.Module:
     """
     Remove every docstring from a parsed module, so a fingerprint reads its code alone.
 
+    Why: a rebuild is refused whenever the fingerprint differs, and the
+    simulator modules' docstrings are reworded often. Without this, a
+    docstring edit, which changes no simulation, would refuse every rebuild
+    until --accept-changed-simulator is passed, and a flag that has to be
+    passed for harmless edits soon gets passed for real ones too.
+
     A docstring is the string a module, class or function body opens with.
     Comments are never in the parsed tree, and ast.dump ignores line numbers
     and layout, so with docstrings gone an edit to wording alone leaves the
@@ -573,6 +579,12 @@ def _without_docstrings(tree: ast.Module) -> ast.Module:
 def _config_names_read(tree: ast.Module) -> set[str]:
     """
     The names a simulator module reads from config.py.
+
+    Why: the fingerprint covers only the parts of config.py the simulator
+    uses (with _config_closure), not the whole file. config.py also holds the
+    dashboard's own constants, and a change to one of those is exactly what a
+    rebuild is for; fingerprinting the whole file would refuse that rebuild.
+    These names are where that part starts.
 
     A module reads them as `from .config import NAME` (anywhere in it) or as
     `config.NAME` after `from . import config`, the two ways the package
@@ -606,6 +618,12 @@ def _config_names_read(tree: ast.Module) -> set[str]:
 def _config_closure(tree: ast.Module, names: set[str]) -> list[tuple[str, str]]:
     """
     The config.py statements that define the names read, and every config name they use.
+
+    Why: a name the simulator reads can depend on others it never names. The
+    backtester calls config.kelly_trim_min_days, which reads
+    KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX; a change to that constant changes
+    what a simulation does, so it must change the fingerprint, or a rebuild
+    would mix two versions of the code without a word.
 
     A constant defined from other constants, a function calling other
     functions, a class whose fields default to constants: each brings in the
