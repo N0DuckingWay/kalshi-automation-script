@@ -7847,6 +7847,101 @@ def _settled_after(settled: datetime | None, cutoff_ts: int | None) -> bool:
         return False
 
 
+def _hour_moved(candle: dict, prev_ask: float | None, prev_bid: float | None) -> bool:
+    """
+    Whether one hourly candle shows any trading or any change of quote.
+
+    The hour moved when contracts traded in it, or when its YES ask (open, high,
+    low or close) or its YES bid (open, high, low or close) differs, by more than
+    PRICE_EPSILON, from the previous hour's closing ask or bid. A price the
+    candle does not carry (no open/high/low, no bid) is not compared.
+
+    Args:
+        candle (dict): A candle from historical.fetch_candlesticks.
+        prev_ask (float | None): The previous hour's YES ask close.
+        prev_bid (float | None): The previous hour's YES bid close; None when
+            unknown.
+
+    Returns:
+        bool: True when the hour moved.
+    """
+    volume = candle.get("volume")
+    if isinstance(volume, (int, float)) and volume > 0:
+        return True
+    for prev, close_key, ohl_key in ((prev_ask, "yes_ask_close", "yes_ask_ohl"),
+                                     (prev_bid, "yes_bid_close", "yes_bid_ohl")):
+        if prev is None:
+            continue
+        seen = [candle.get(close_key), *(candle.get(ohl_key) or ())]
+        if any(isinstance(v, (int, float)) and abs(v - prev) > PRICE_EPSILON
+               for v in seen):
+            return True
+    return False
+
+
+def _project_candles(candles: list[dict]) -> list[dict]:
+    """
+    Keep, for each hourly candle, only what the backtest reads, plus two derived numbers.
+
+    historical.fetch_candlesticks returns the whole hourly record; holding every
+    ticker's full records for a run would cost far more memory than the four
+    fields the backtest reads, so each candle is cut to exactly "ts",
+    "yes_ask_close", "no_ask_close", "volume", "moved_ts" and "open_interest".
+    "moved_ts" is the end (ts) of the latest hour, at or before this one, in
+    which contracts traded or either side's quote changed (_hour_moved); the
+    series' first hour always counts as having moved. Nothing reads the two
+    new keys yet.
+
+    Args:
+        candles (list[dict]): One ticker's candles from fetch_candlesticks.
+
+    Returns:
+        list[dict]: New dicts, ascending by "ts" (the input is sorted first,
+            stably). Empty for no candles.
+    """
+    out: list[dict] = []
+    prev_ask: float | None = None
+    prev_bid: float | None = None
+    moved_ts: Any = None
+    for candle in sorted(candles, key=lambda c: c["ts"]):
+        if not out or _hour_moved(candle, prev_ask, prev_bid):
+            moved_ts = candle["ts"]
+        out.append({
+            "ts": candle["ts"],
+            "yes_ask_close": candle.get("yes_ask_close"),
+            "no_ask_close": candle.get("no_ask_close"),
+            "volume": candle.get("volume"),
+            "moved_ts": moved_ts,
+            "open_interest": candle.get("open_interest"),
+        })
+        prev_ask = candle.get("yes_ask_close")
+        prev_bid = candle.get("yes_bid_close")
+    return out
+
+
+def _fetch_projected_candles(hist_client: Any, ticker: str, open_ts: int, close_ts: int,
+                             use_cache: bool, **endpoint: Any) -> list[dict]:
+    """
+    Fetch one ticker's candles and cut them to what the backtest keeps.
+
+    Runs on a worker thread of _fetch_candles_parallel, so the full records are
+    dropped as soon as they are cut rather than held until every ticker is done.
+
+    Args:
+        hist_client (Any): Historical KalshiClient.
+        ticker (str): The market's ticker.
+        open_ts (int): Window start, Unix seconds.
+        close_ts (int): Window end, Unix seconds.
+        use_cache (bool): Whether the candle cache may be read.
+        **endpoint: The series and live_first keywords for fetch_candlesticks, when any.
+
+    Returns:
+        list[dict]: _project_candles of what fetch_candlesticks returned.
+    """
+    return _project_candles(
+        fetch_candlesticks(hist_client, ticker, open_ts, close_ts, use_cache, **endpoint))
+
+
 def _fetch_candles_parallel(
     hist_client: Any,
     needed_tickers: dict[str, dict],
@@ -7918,7 +8013,7 @@ def _fetch_candles_parallel(
 
     Returns:
         dict[str, list[dict]]: Ticker -> candle list (keys: ts, yes_ask_close,
-        no_ask_close, volume). Every key of needed_tickers is present; the value is an
+        no_ask_close, volume, moved_ts, open_interest — see _project_candles). Every key of needed_tickers is present; the value is an
         empty list for markets with no usable (missing or unparseable) close_time.
 
     Raises:
@@ -7972,10 +8067,10 @@ def _fetch_candles_parallel(
     if work:
         with ThreadPoolExecutor(max_workers=CANDLESTICK_FETCH_MAX_WORKERS) as pool:
             # Returns list[dict] with keys: ts (unix int), yes_ask_close (float),
-            # no_ask_close (float), volume (float or None) — cached per ticker,
-            # so a second run is much faster
+            # no_ask_close (float), volume (float or None), moved_ts, open_interest —
+            # cut from the cached per-ticker record (so a second run is much faster)
             futures = {
-                pool.submit(fetch_candlesticks, hist_client, ticker,
+                pool.submit(_fetch_projected_candles, hist_client, ticker,
                             open_ts, close_ts, use_cache, **endpoint): ticker
                 for ticker, open_ts, close_ts, endpoint in work
             }

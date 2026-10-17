@@ -2254,8 +2254,12 @@ CANDLESTICK_PERIOD_INTERVAL_MINUTES = 60
 CANDLESTICK_MAX_CANDLES_PER_REQUEST = 5000
 
 # Version of the fields a cached candle carries. A cache written under an
-# older version is fetched again (version 2 adds the hour's traded volume).
-CANDLESTICK_CACHE_FIELDS_VERSION = 2
+# older version is fetched again. Version 3 is the whole hourly record: the
+# closes and traded volume of version 2, plus each side's open/high/low, the
+# traded price block and the hour's open interest. Version 3 files live in their
+# own folder (historical._CANDLES_DIR, backtest_cache/candlesticks_v3/, gzipped),
+# so the older candlesticks/ folder is never read or written.
+CANDLESTICK_CACHE_FIELDS_VERSION = 3
 
 # The highest NO ask a candle can carry: historical.fetch_candlesticks stores a
 # candle's NO ask as 1 - its YES bid, held within [0.01, this], so an empty YES-bid

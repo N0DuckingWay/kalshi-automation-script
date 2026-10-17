@@ -49,6 +49,7 @@ from kalshi_betting.backtester import (
     _pair_key,
     _parse_iso_date,
     _parse_iso_datetime,
+    _project_candles,
     _settlement_receipt,
     run_backtest,
     run_backtest_sweep,
@@ -4790,6 +4791,105 @@ class TestExtractPairsPerformanceSmoke:
             assert abs((db - da).days) <= margin_days
 
 
+def _full_candle(ts, ask=0.50, bid=0.40, volume=0.0, ask_ohl=None, bid_ohl=None, **extra):
+    """One candle as historical.fetch_candlesticks returns it (the whole hourly record)."""
+    candle = {"ts": ts, "yes_ask_close": ask, "no_ask_close": 1.0 - bid, "volume": volume,
+              "yes_ask_ohl": ask_ohl, "yes_bid_ohl": bid_ohl, "yes_bid_close": bid,
+              "price": None, "open_interest": None}
+    candle.update(extra)
+    return candle
+
+
+class TestProjectCandles:
+    """_project_candles keeps six keys per candle and works out moved_ts."""
+
+    HOUR = 3600
+
+    def test_keys_are_exactly_the_six(self):
+        out = _project_candles([_full_candle(100, volume=2.0, open_interest=7.5,
+                                             price=(0.5, 0.5, 0.5, 0.5, 0.5, None))])
+        assert out == [{"ts": 100, "yes_ask_close": 0.50, "no_ask_close": 0.60,
+                        "volume": 2.0, "moved_ts": 100, "open_interest": 7.5}]
+        assert list(out[0]) == ["ts", "yes_ask_close", "no_ask_close", "volume",
+                                "moved_ts", "open_interest"]
+
+    def test_an_empty_series_is_empty(self):
+        assert _project_candles([]) == []
+
+    def test_the_first_candle_always_moved_and_flat_hours_carry_it_forward(self):
+        hours = [_full_candle(self.HOUR * h) for h in range(1, 5)]
+        assert [c["moved_ts"] for c in _project_candles(hours)] == [self.HOUR] * 4
+
+    def test_a_trade_moves_the_hour(self):
+        hours = [_full_candle(self.HOUR * 1), _full_candle(self.HOUR * 2),
+                 _full_candle(self.HOUR * 3, volume=1.5), _full_candle(self.HOUR * 4)]
+        assert [c["moved_ts"] for c in _project_candles(hours)] == [
+            self.HOUR, self.HOUR, self.HOUR * 3, self.HOUR * 3]
+
+    def test_an_unreadable_volume_is_not_a_trade(self):
+        hours = [_full_candle(self.HOUR * 1), _full_candle(self.HOUR * 2, volume=None)]
+        assert [c["moved_ts"] for c in _project_candles(hours)] == [self.HOUR] * 2
+
+    def test_a_close_that_changes_moves_the_hour_on_either_side(self):
+        ask_moves = [_full_candle(1 * self.HOUR), _full_candle(2 * self.HOUR, ask=0.52)]
+        bid_moves = [_full_candle(1 * self.HOUR), _full_candle(2 * self.HOUR, bid=0.38)]
+        assert _project_candles(ask_moves)[1]["moved_ts"] == 2 * self.HOUR
+        assert _project_candles(bid_moves)[1]["moved_ts"] == 2 * self.HOUR
+
+    def test_a_swing_inside_the_hour_moves_it_even_if_it_closes_where_it_started(self):
+        # Ask opened at 0.50 (the previous close), spiked to 0.60 and came back
+        spike = _full_candle(2 * self.HOUR, ask_ohl=(0.50, 0.60, 0.50))
+        # Bid dipped to 0.30 and came back
+        dip = _full_candle(3 * self.HOUR, bid_ohl=(0.40, 0.40, 0.30))
+        out = _project_candles([_full_candle(1 * self.HOUR), spike, dip,
+                                _full_candle(4 * self.HOUR)])
+        assert [c["moved_ts"] for c in out] == [self.HOUR, 2 * self.HOUR, 3 * self.HOUR,
+                                                3 * self.HOUR]
+
+    def test_a_range_that_stays_at_the_previous_close_did_not_move(self):
+        flat = _full_candle(2 * self.HOUR, ask_ohl=(0.50, 0.50, 0.50),
+                            bid_ohl=(0.40, 0.40, 0.40))
+        assert _project_candles([_full_candle(self.HOUR), flat])[1]["moved_ts"] == self.HOUR
+
+    def test_float_noise_is_not_a_move(self):
+        noisy = _full_candle(2 * self.HOUR, ask=0.50 + config.PRICE_EPSILON / 10,
+                             bid=0.40 - config.PRICE_EPSILON / 10)
+        assert _project_candles([_full_candle(self.HOUR), noisy])[1]["moved_ts"] == self.HOUR
+
+    def test_a_quote_is_compared_with_the_previous_close_not_the_previous_move(self):
+        # 0.50 -> 0.55 (moved), then 0.55 again: the quote stood still that hour
+        hours = [_full_candle(1 * self.HOUR), _full_candle(2 * self.HOUR, ask=0.55),
+                 _full_candle(3 * self.HOUR, ask=0.55)]
+        assert [c["moved_ts"] for c in _project_candles(hours)] == [
+            self.HOUR, 2 * self.HOUR, 2 * self.HOUR]
+
+    def test_a_series_without_bid_or_range_fields_moves_on_the_ask_close_and_volume(self):
+        # The four-key candles older tests and caches carry
+        bare = [{"ts": h * self.HOUR, "yes_ask_close": a, "no_ask_close": 0.5}
+                for h, a in ((1, 0.5), (2, 0.5), (3, 0.6))]
+        out = _project_candles(bare)
+        assert [c["moved_ts"] for c in out] == [self.HOUR, self.HOUR, 3 * self.HOUR]
+        assert all(c["volume"] is None and c["open_interest"] is None for c in out)
+
+    def test_an_unsorted_input_comes_back_ascending_and_does_not_change_the_input(self):
+        hours = [_full_candle(3 * self.HOUR, ask=0.55), _full_candle(1 * self.HOUR),
+                 _full_candle(2 * self.HOUR)]
+        before = copy.deepcopy(hours)
+        out = _project_candles(hours)
+        assert [c["ts"] for c in out] == [self.HOUR, 2 * self.HOUR, 3 * self.HOUR]
+        assert [c["moved_ts"] for c in out] == [self.HOUR, self.HOUR, 3 * self.HOUR]
+        assert hours == before
+
+    def test_the_parallel_fetch_hands_back_projected_candles(self, monkeypatch):
+        series = [_full_candle(_MONDAY_TS), _full_candle(_MONDAY_TS + self.HOUR, volume=3.0)]
+        monkeypatch.setattr(backtester, "fetch_candlesticks", lambda *_a, **_k: series)
+        out = _fetch_candles_parallel(
+            MagicMock(), {"M": {"ticker": "M", "close_time": "2026-02-01T00:00:00+00:00"}},
+            date(2026, 1, 1), False)
+        assert out == {"M": _project_candles(series)}
+        assert [c["moved_ts"] for c in out["M"]] == [_MONDAY_TS, _MONDAY_TS + self.HOUR]
+
+
 class TestFetchCandlesParallel:
     """The per-ticker candlestick fetch is the dominant cost of a backtest
     (~4.3 tickers/sec sequentially, live-measured 2026-08-03). It must overlap
@@ -4837,9 +4937,9 @@ class TestFetchCandlesParallel:
                                          date(2026, 1, 1), True)
 
         assert peak > 1, f"candlestick fetches ran sequentially (peak {peak})"
-        # Completion order is arbitrary, but the mapping must be byte-identical
-        # to what the old sequential loop produced.
-        assert result == expected
+        # Completion order is arbitrary, but the mapping must be what the old
+        # sequential loop produced, each series cut to what the backtest keeps.
+        assert result == {t: _project_candles(c) for t, c in expected.items()}
 
     def test_window_bounds_match_sequential_formula(self, monkeypatch):
         # With no open_time (the shape of a cache record written before
