@@ -235,40 +235,15 @@ def _log_corpus_provenance(sweep: BacktestSweep) -> None:
 
 def main() -> None:
     """
-    CLI entry point for the Kalshi backtester.
+    Run the backtester from the command line.
 
-    Parses command-line arguments (--start-date, --balance, --no-cache,
-    --max-horizon-days, --interval-discount, --no-sweep,
-    --same-event-ladders / --no-same-event-ladders, --spread-min,
-    --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep,
-    --no-sell-sweep, --no-trim-sweep, --no-trim-rise-sweep), configures
-    logging, constructs historical and live
-    Kalshi API clients, works out the starting balance (--balance, or else the
-    account's value now, read through _account_starting_balance; a read that
-    fails, or comes to nothing, stops the run with exit 1 before the
-    fetch), runs the full backtest simulation via run_backtest_sweep(), and generates
-    an interactive HTML dashboard via generate_dashboard(). Logs a summary
-    table of key metrics to
-    kalshi_backtest.log on completion (this module installs only a
-    RotatingFileHandler, no console handler, so nothing reaches stdout).
+    In order: read and check the options (a bad one stops the run before the
+    log file is touched), set up logging to kalshi_backtest.log (there is no
+    console output), work out the starting balance, run the backtest, log a
+    summary and write the HTML dashboard.
 
-    The summary block reports the PRIMARY point of the sweep — the run at the
-    effective interval discount, the primary spread band and the run's own
-    per-trade size cap — so a default run's summary block reads exactly as
-    the plain run_backtest() path's did. The other swept discounts and bands
-    exist for the dashboard (its page-wide filter bar, whose k select the
-    Interval Discount section follows, its scenario explorer and k-hat
-    breakdown) and the calibration report; the tier-floors-off family is read
-    by the dashboard's filter bar, k-hat breakdown and scenario explorer
-    (their Tier floors choice), carried to generate_dashboard on the sweep;
-    and the lazily simulated size caps (result.cap_sweep, and the
-    tier-floors-off family's at every cap, result.tier_off_cap_sweep) only
-    by the dashboard, which reads every cell as the page is built (its filter
-    bar, Interval Discount section and scenario explorer); the lazily
-    simulated add-on sweeps (result.add_on_cap_sweep, and
-    result.add_on_tier_off_cap_sweep), sell family (result.sell_sweep) and
-    Kelly-trim family (result.trim_sweep, with its minimum price rises) are
-    read the same way.
+    The summary reports the run's main scenario: the chosen k, spread band and
+    size cap. The other scenarios the run works out are shown on the dashboard.
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -280,7 +255,7 @@ def main() -> None:
         "--start-date", default="2024-01-01", metavar="YYYY-MM-DD",
         help="Earliest settlement date to include (default: 2024-01-01)",
     )
-    # None means "read the account": its value is only known once a client exists
+    # None means "read the account's value", which is done later, once a client exists
     parser.add_argument(
         "--balance", type=float, default=None, metavar="DOLLARS",
         help="Simulated starting balance in dollars (default: what the Kalshi "
@@ -309,11 +284,8 @@ def main() -> None:
         help="Skip the k sweep; with the band sweep on, each band is "
              "simulated at the primary k only",
     )
-    # BooleanOptionalAction gives --same-event-ladders and
-    # --no-same-event-ladders from one declaration; default=None is the "no
-    # override" sentinel run_backtest_sweep resolves at call time, exactly as
-    # --interval-discount's None resolves k. There is nothing to validate — the
-    # action can only ever yield True, False or None.
+    # Gives both --same-event-ladders and --no-same-event-ladders. None (neither
+    # given) means "use the config setting"
     parser.add_argument(
         "--same-event-ladders", action=argparse.BooleanOptionalAction, default=None,
         help="Pair two dated cumulative rungs of ONE event as a time-series "
@@ -322,10 +294,7 @@ def main() -> None:
              f"{'on' if TIME_SERIES_SAME_EVENT_LADDERS else 'off'}). Affects the "
              "backtest only — the live finder binds that constant at import.",
     )
-    # Each side is independently optional; the omitted one resolves from
-    # config's own default band (see the validation block below), not from a
-    # literal (0.0, 1.0) here — which is why the help names the constant
-    # rather than a number.
+    # Either side may be given alone; the other comes from config's default band
     parser.add_argument(
         "--spread-min", type=float, default=None, metavar="X",
         help="Time-series spread-band FLOOR (0-1) for the primary scenario; "
