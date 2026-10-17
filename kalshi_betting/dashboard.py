@@ -12717,19 +12717,21 @@ def _menu_html(menu_id: str, all_label: str, rows: list[str]) -> str:
     Render one check-box dropdown of the filter bar (the Category or the Tag menu).
 
     A <details> element: its <summary> is the button (the script writes what
-    is ticked on it), and under it one box that clears the menu — ticked
-    exactly when nothing else is — and one box per row. Every box is rendered
+    is ticked on it), and under it an "All" box and one box per row.
+    Clicking "All" ticks every row the menu shows, or unticks them when
+    every one is ticked already; it reads ticked while every row, or no
+    row, is ticked (no row ticked shows every trade). Every box is rendered
     disabled, and the menu greyed (class flt-off), until the script has
     loaded its data, as the bar's selects are; autocomplete="off" so a
     browser does not restore a stale tick on reload.
 
     Args:
         menu_id (str): "flt-cat" or "flt-tag": the <details> element's id.
-            The button is "<id>-label", the clearing box "<id>-all", row i's
+            The button is "<id>-label", the "All" box "<id>-all", row i's
             box "<id>-<i>", its text "<id>-<i>-text" and the row itself
             "<id>-<i>-row" (the script hides a tag row whose category is not
             ticked).
-        all_label (str): The clearing box's words ("All categories").
+        all_label (str): The "All" box's words ("All categories").
         rows (list[str]): Each row's text, already escaped, in index order.
 
     Returns:
@@ -13270,9 +13272,10 @@ _FILTER_JS = r"""
   var bandSel = document.getElementById('flt-band'), kSel = document.getElementById('flt-k');
   var capSel = document.getElementById('flt-cap');
   // "Category" and "Tag": two check-box menus (<details> elements), each
-  // with one box that clears it ("...-all", ticked exactly when nothing
-  // else is) and one box per category ("flt-cat-<i>") or per category · tag
-  // ("flt-tag-<i>")
+  // with an "All" box ("...-all": clicking it ticks every row it shows, or,
+  // when every one is ticked already, unticks them; it reads ticked while
+  // every row or no row is ticked) and one box
+  // per category ("flt-cat-<i>") or per category · tag ("flt-tag-<i>")
   var catMenu = document.getElementById('flt-cat'), tagMenu = document.getElementById('flt-tag');
   var catAll = document.getElementById('flt-cat-all');
   var tagAll = document.getElementById('flt-tag-all');
@@ -13337,7 +13340,7 @@ _FILTER_JS = r"""
   // button's hover text as Python rendered it.
   var TWINS = {}, NO_SAVE = {}, SAVE_TITLE = null;
   // PICK: the menus' ticks as last asked for (pickKey), so a click that
-  // leaves them as they were (the clearing box of an empty menu) redraws nothing
+  // leaves them as they were redraws nothing
   var PICK = '|';
 
   function byId(id) { return document.getElementById(id); }
@@ -13596,7 +13599,7 @@ _FILTER_JS = r"""
   }
 
   // The Category and Tag menus. A menu's boxes as the page holds them (the
-  // clearing box first), and the indexes ticked in it.
+  // "All" box first), and the indexes ticked in it.
   function boxesOf(menu) {
     return menu.querySelectorAll
       ? Array.prototype.slice.call(menu.querySelectorAll('input')) : [];
@@ -13609,8 +13612,27 @@ _FILTER_JS = r"""
     }
     return out;
   }
-  function catTicks() { return ticksOf('flt-cat-', D.categories.length); }
+  // The categories ticked, read as none (any category, every trade) while
+  // every one is ticked and no tag is, as the menu's "All" box ticked means
+  function boxCats() { return ticksOf('flt-cat-', D.categories.length); }
   function tagTicks() { return ticksOf('flt-tag-', D.subcats.length); }
+  function catTicks() {
+    var cats = boxCats();
+    return cats.length === D.categories.length && !tagTicks().length ? [] : cats;
+  }
+  // The tag rows the Tag menu shows for these ticked categories: theirs, or
+  // every tag while no category is ticked
+  function shownTags(cats) {
+    var out = [];
+    D.subcats.forEach(function(sc, i) {
+      if (!cats.length || cats.indexOf(sc[0]) >= 0) { out.push(i); }
+    });
+    return out;
+  }
+  // Every one of these indexes ticked, and the list not empty
+  function allIn(want, have) {
+    return want.length > 0 && want.every(function(i) { return have.indexOf(i) >= 0; });
+  }
   // Every tag of a twin group ticked as soon as one of them is
   function withTwins(tags) {
     var out = tags.slice();
@@ -13634,7 +13656,7 @@ _FILTER_JS = r"""
   // The ticks as one string, to tell whether a click changed them
   function pickKey() { return catTicks().join(',') + '|' + tagTicks().join(','); }
   // Before the data is in, a menu is cleared by its boxes alone (a browser
-  // can restore old ticks on a reload): only the clearing box stays ticked
+  // can restore old ticks on a reload): only the "All" box stays ticked
   function clearMenu(menu, allBox) {
     boxesOf(menu).forEach(function(box) { box.checked = box === allBox; });
   }
@@ -14550,21 +14572,22 @@ _FILTER_JS = r"""
   // count of the scenario on screen; the Tag menu showing the ticked
   // categories' tags only (every tag while no category is ticked), a tag
   // named with its category unless exactly one category is ticked; each
-  // clearing box ticked exactly when nothing else in its menu is; and each
-  // button reading nothing ticked, the one ticked name, or how many — in
-  // Python's words (D.text.menu_*)
+  // "All" box ticked when every row its menu shows is ticked, or none is;
+  // and each button reading nothing ticked, the one ticked name, or how
+  // many — in Python's words (D.text.menu_*)
   function refreshMenus() {
     var cats = catTicks(), tags = tagTicks(), T = D.text, lone = cats.length === 1;
+    var ticked = boxCats(), seen = shownTags(ticked);
     D.categories.forEach(function(name, i) {
       setText('flt-cat-' + i + '-text', name + ' (' + count('c' + i) + ')');
     });
     D.subcats.forEach(function(sc, i) {
       var row = byId('flt-tag-' + i + '-row');
-      if (row) { row.hidden = cats.length > 0 && cats.indexOf(sc[0]) < 0; }
+      if (row) { row.hidden = seen.indexOf(i) < 0; }
       setText('flt-tag-' + i + '-text', subName(i, !lone) + ' (' + count('s' + i) + ')');
     });
-    catAll.checked = !cats.length;
-    tagAll.checked = !tags.length;
+    catAll.checked = !ticked.length || ticked.length === D.categories.length;
+    tagAll.checked = !tags.length || allIn(seen, tags);
     setText('flt-cat-label', !cats.length ? T.menu_cat_all
       : (lone ? D.categories[cats[0]] : fill(T.menu_cat_n, {n: cats.length})));
     setText('flt-tag-label', !tags.length ? T.menu_tag_all
@@ -14956,8 +14979,10 @@ _FILTER_JS = r"""
     choose();
   });
   // A box of a menu was ticked or unticked (the event names the box). The
-  // ticks are put in order first: the clearing box empties its menu (the
-  // Category one both menus); unticking a category unticks its tags;
+  // ticks are put in order first: an "All" box ticks every row its menu
+  // shows (the Category one unticks every tag, so every category counts in
+  // full), or, when every one is ticked already, unticks them (the Category
+  // one both menus); unticking a category unticks its tags;
   // ticking a tag ticks its category, and ticking or unticking a tag does
   // the same to every tag of its category that differs from it only in
   // letter case (TWINS: the live filter reads them as one tag). Then the scenario is drawn again,
@@ -14966,12 +14991,20 @@ _FILTER_JS = r"""
   function onTick(menu, ev) {
     if (!D) { return; }
     var id = (ev && ev.target && ev.target.id) || '';
-    var cats = catTicks(), tags = tagTicks();
+    var cats = boxCats(), tags = tagTicks();
     if (menu === catMenu) {
-      if (id === 'flt-cat-all') { cats = []; }
+      if (id === 'flt-cat-all') {
+        var every = D.categories.map(function(_, i) { return i; });
+        cats = cats.length === every.length ? [] : every;
+        tags = [];
+      }
       tags = tags.filter(function(t) { return cats.indexOf(D.subcats[t][0]) >= 0; });
     } else if (id === 'flt-tag-all') {
-      tags = [];
+      var seen = shownTags(cats);
+      tags = allIn(seen, tags) ? [] : seen;
+      tags.forEach(function(t) {
+        if (cats.indexOf(D.subcats[t][0]) < 0) { cats.push(D.subcats[t][0]); }
+      });
     } else {
       // The box clicked takes its case twins with it, ticked or unticked
       var clicked = /^flt-tag-(\d+)$/.exec(id);
