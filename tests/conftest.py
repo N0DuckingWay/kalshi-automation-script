@@ -91,6 +91,8 @@ Notes:
     changes nothing, since the session stub never calls it. The session stub
     returns once the test's monkeypatch is undone.
 """
+from pathlib import Path
+
 import pytest
 
 from kalshi_betting import (
@@ -141,6 +143,20 @@ def _offline_event_competitions_for_the_session(tmp_path_factory):
     # an event that sets none (None), with their cache off the checkout too
     mp.setattr(historical, "_EVENT_FEE_OVERRIDES_CACHE", folder / "event_fee_overrides.json")
     mp.setattr(historical, "_fetch_event_fee_override", lambda client, event_ticker: None)
+
+    # Nothing is saved into the session directory. A class-scoped fixture that
+    # runs a backtest twice would otherwise see its second run read what its
+    # first run wrote (an "Event competitions: N events, C from the cache" line
+    # that differs between the two runs, and that depends on which tests ran
+    # first). A test body saves into its own tmp_path, which this does not touch.
+    real_save = historical._save_json_cache
+
+    def save_unless_session_dir(path, data, *args, **kwargs):
+        if Path(path).parent == folder:
+            return None
+        return real_save(path, data, *args, **kwargs)
+
+    mp.setattr(historical, "_save_json_cache", save_unless_session_dir)
     yield
     mp.undo()
 
