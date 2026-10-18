@@ -1728,7 +1728,7 @@ class TestFeeMultipliersReachPrepareCandidates:
     """Each series' fee multiplier (historical.load_series_fee_multipliers) is
     read beside the /series listing and carried on _Candidates; every entry
     point hands it, unchanged, to _prepare_candidates (None, a direct caller's
-    default, becomes the cached copy there). Nothing reads it for a decision."""
+    default, becomes the cached copy there). Each pair market's is then written on its record for its fees."""
 
     MULTIPLIERS = {"KXMLBGAME": 0.5, "KXBTCY": 0.0}
 
@@ -1802,6 +1802,60 @@ class TestFeeMultipliersReachPrepareCandidates:
     def test_no_cached_copy_carries_an_empty_map(self, monkeypatch):
         assert not historical._SERIES_CATEGORIES_CACHE.exists()
         assert self._prepare(monkeypatch).fee_multipliers == {}
+
+    def test_each_pair_market_carries_its_listed_multiplier_and_one_count(
+            self, monkeypatch, caplog):
+        # One cross-event time-series pair; only KXFEEA's series lists a multiplier
+        corpus = [_ss1_record("FA-1", "KXFEEA-1", "Will X happen by March 1, 2026?",
+                              close="2026-03-01"),
+                  _ss1_record("FB-1", "KXFEEB-1", "Will X happen by March 20, 2026?",
+                              close="2026-03-20")]
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        with caplog.at_level(logging.INFO):
+            candidates = backtester._prepare_candidates(
+                MagicMock(), MagicMock(), _SS1_START, True, None,
+                fee_multipliers={"KXFEEA": 0.5})
+        assert len(candidates.all_pairs) == 1
+        assert corpus[0][backtester._LISTED_FEE_KEY] == 0.5
+        # A market listing the full fee keeps the record it always was
+        assert backtester._LISTED_FEE_KEY not in corpus[1]
+        line = ("Fee multipliers listed but not confirmed (charged in full): 1 markets "
+                "(multipliers: 0.5 x 1)")
+        assert caplog.messages.count(line) == 1
+
+    @staticmethod
+    def _fee_corpus():
+        return [_ss1_record("FA-1", "KXFEEA-1", "Will X happen by March 1, 2026?",
+                            close="2026-03-01"),
+                _ss1_record("FB-1", "KXFEEB-1", "Will X happen by March 20, 2026?",
+                            close="2026-03-20")]
+
+    @pytest.mark.parametrize("override", [1.0, "unknown", "fail"])
+    def test_a_full_fee_or_unknown_event_override_keeps_the_full_fee(
+            self, monkeypatch, override):
+        # The event of a 0.5 series sets the full fee, or cannot be read: the
+        # market is charged the full fee, never the series' half
+        def fetch(client, ticker):
+            if override == "fail":
+                raise RuntimeError("no event")
+            return override
+        monkeypatch.setattr(historical, "_fetch_event_fee_override", fetch)
+        corpus = self._fee_corpus()
+        corpus[0][backtester._LISTED_FEE_KEY] = 0.5   # stale, from an earlier call
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        backtester._prepare_candidates(MagicMock(), MagicMock(), _SS1_START, True, None,
+                                       fee_multipliers={"KXFEEA": 0.5})
+        assert backtester._LISTED_FEE_KEY not in corpus[0]
+
+    def test_an_event_override_lowers_a_full_fee_series(self, monkeypatch):
+        monkeypatch.setattr(historical, "_fetch_event_fee_override",
+                            lambda client, ticker: 0.0 if ticker == "KXFEEB-1" else None)
+        corpus = self._fee_corpus()
+        TestGroupableSubset._patch(monkeypatch, corpus)
+        backtester._prepare_candidates(MagicMock(), MagicMock(), _SS1_START, True, None,
+                                       fee_multipliers={"KXFEEA": 0.5})
+        assert corpus[0][backtester._LISTED_FEE_KEY] == 0.5
+        assert corpus[1][backtester._LISTED_FEE_KEY] == 0.0
 
     def test_a_hand_built_instance_carries_none(self):
         field = backtester._Candidates.__dataclass_fields__["fee_multipliers"]
@@ -23893,3 +23947,66 @@ class TestWalkedSellSweep:
                                 walked += price < bid
         # Positions sell, and their sales walk past the best bid
         assert sold > 0 and walked > 0
+
+
+class TestFeeMultipliersInTheBacktest:
+    """Each backtest leg's fee uses its own market's series multiplier, written
+    on its record by _prepare_candidates, and only a confirmed one lowers it."""
+
+    @pytest.fixture
+    def zero_and_half_confirmed(self, monkeypatch):
+        monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS", frozenset({1.0, 0.5, 0.0}))
+
+    @staticmethod
+    def _thin_edge(listed=None):
+        # Edge 1 - 0.48 - 0.50 = 0.02, under the full fee (about 0.035)
+        mA = {"ticker": "EARLY", "event_ticker": "E1", "close_time": "2026-02-01T00:00:00+00:00"}
+        mB = {"ticker": "LATE", "event_ticker": "E2", "close_time": "2026-02-14T00:00:00+00:00"}
+        if listed is not None:
+            mA[backtester._LISTED_FEE_KEY] = listed
+            mB[backtester._LISTED_FEE_KEY] = listed
+        return ([_candle(_MONDAY_TS, 0.48, 0.52)], [_candle(_MONDAY_TS, 0.52, 0.50)], mA, mB)
+
+    def _entry(self, listed=None):
+        ca, cb, mA, mB = self._thin_edge(listed)
+        return _find_entry(ca, cb, mA, mB, "time_series", date(2026, 1, 1), tier_floors=False)
+
+    def test_the_fee_check_charges_a_confirmed_zero_nothing(self, zero_and_half_confirmed):
+        assert self._entry() is None
+        assert self._entry(0.0) is not None
+
+    def test_an_unconfirmed_zero_is_charged_in_full(self):
+        assert self._entry(0.0) is None
+
+    def test_the_record_reader_reads_by_type(self, zero_and_half_confirmed):
+        assert backtester._listed_fee_multiplier({}) == 1.0
+        assert backtester._listed_fee_multiplier({backtester._LISTED_FEE_KEY: "0.5"}) == 1.0
+        assert backtester._listed_fee_multiplier({backtester._LISTED_FEE_KEY: True}) == 1.0
+        assert backtester._charged_fee_multiplier({backtester._LISTED_FEE_KEY: 0.5}) == 0.5
+        assert backtester._charged_fee_multiplier({backtester._LISTED_FEE_KEY: 0.25}) == 1.0
+
+    def _run(self, mult_a=None, mult_b=None):
+        record = TestKellyShrinkParity._record(("SA", "SB"), ("EA", "EB"), date(2026, 1, 5))
+        for key, mult in (("mA", mult_a), ("mB", mult_b)):
+            if mult is not None:
+                record["entry"][key][backtester._LISTED_FEE_KEY] = mult
+        point = backtester._simulate_at_discount([record], date(2026, 1, 1), 1000.0,
+                                                 end_date=date(2026, 3, 1))
+        assert len(point.trades) == 1
+        return point.trades[0]
+
+    def test_a_trade_charges_each_leg_its_own_confirmed_multiplier(
+            self, zero_and_half_confirmed):
+        trade = self._run(mult_a=0.5)
+        assert (trade.fee_multiplier_a, trade.fee_multiplier_b) == (0.5, 1.0)
+        fill_a, fill_b = backtester._paid_prices(trade)
+        assert trade.fees == pytest.approx(
+            fee_leg_exact(trade.n, fill_a, multiplier=0.5) + fee_leg_exact(trade.n, fill_b))
+        # Each later fee on a leg reads that leg's own multiplier
+        assert backtester._trade_fee_multipliers(trade) == (0.5, 1.0)
+
+    def test_an_unconfirmed_multiplier_trades_exactly_as_none(self):
+        full = self._run()
+        listed = self._run(mult_a=0.5, mult_b=0.0)
+        assert listed == full
+        assert (listed.fee_multiplier_a, listed.fee_multiplier_b) == (1.0, 1.0)

@@ -62,6 +62,7 @@ from .config import (
     count_text,
     days_to_maturity,
     fee_leg_exact,
+    fee_multiplier,
     fee_per_pair_approx,
     held_pair_win_prob,
     kelly_hold_fraction,
@@ -76,7 +77,7 @@ from .config import (
     trade_day,
     trim_rise_reached,
 )
-from .historical import ask_before, bid_before, candle_reads_bid, recent_candles
+from .historical import ask_before, bid_before, candle_reads_bid, recent_candles, series_ticker
 from .scanner import (
     FillTimes,
     HeldPair,
@@ -91,6 +92,9 @@ from .scanner import (
     held_pairs,
     held_positions_bid_value,
     leg_sides,
+    listed_fee_multiplier,
+    market_event_fee_override,
+    market_fee_multiplier,
     market_for_labels,
     market_ladder_keys,
     walk_bids,
@@ -121,6 +125,11 @@ class SaleLeg:
         market (Any): The ApiMarket from this run's market list while held; None for a partner.
         payout_dollars (float | None): What a partner paid when it settled; None while held.
         paid_at (datetime | None): When a partner settled (UTC); None while held.
+        partner_fee_multiplier (float): For a paid-out partner (no market), the
+            fee multiplier it is listed at (scanner.listed_fee_multiplier of its
+            series' and its event's override, 1.0 when either is unknown), which
+            an earlier day's check charges its sale at; 1.0 for a held market,
+            whose own market carries its multiplier.
         held (int | None): For a Kelly trim, the contracts held there; None when
             `count` is all of them.
     """
@@ -132,6 +141,7 @@ class SaleLeg:
     market: Any = None
     payout_dollars: float | None = None
     paid_at: datetime | None = None
+    partner_fee_multiplier: float = 1.0
     held: int | None = None
 
 
@@ -352,12 +362,17 @@ class _Reads:
         hold_days (int): How many daily checks there are (0 for a Kelly trim, which
             makes none).
         lookups (int): Label lookups from the exchange so far (SALE_PARTNER_MAX_LOOKUPS at most).
+        fee_multipliers (dict): Series ticker -> fee multiplier
+            (historical.load_series_fee_multipliers), for a paid-out partner's fee.
     """
 
     def __init__(self, client: Any, held_positions: dict, markets_by_ticker: dict,
-                 now_ts: float, hold_days: int) -> None:
+                 now_ts: float, hold_days: int, *, fee_multipliers: dict | None = None) -> None:
         """Start with nothing read; each argument is the attribute of the same name."""
         self.client = client
+        self.fee_multipliers = fee_multipliers or {}
+        # Each settled market looked up for its labels (None: not found)
+        self._label_markets: dict = {}
         self.held_positions = held_positions
         self.markets_by_ticker = markets_by_ticker
         self.now_ts = now_ts
@@ -475,6 +490,7 @@ class _Reads:
         # match the held market's own (_find_partner compares their question labels)
         market = market_for_labels(self.client, ticker, self.markets_by_ticker,
                                    self._event_titles)
+        self._label_markets[ticker] = market
         if market is None:
             result = (None, f"settled market {ticker} could not be looked up, and it may "
                             "be the partner")
@@ -483,6 +499,29 @@ class _Reads:
             result = (market_ladder_keys(market), "")
         self._labels[ticker] = result
         return result
+
+    def partner_fee_multiplier(self, ticker: str, event_ticker: str) -> float:
+        """
+        The fee multiplier a paid-out partner is listed at.
+
+        scanner.listed_fee_multiplier of its series' multiplier and its event's
+        override, read from the market labels() found for it: 1.0, the full
+        fee, when the market was not found or its event's override is not
+        known, which includes a partner looked up outside the run's list
+        (scanner._fetch_held_market reads no override). A partner in the
+        run's list is charged as the backtest charges a pair's paid-out leg.
+
+        Args:
+            ticker (str): The partner's ticker.
+            event_ticker (str): Its event's ticker (its series names its multiplier).
+
+        Returns:
+            float: The listed multiplier (config.fee_multiplier charges it).
+        """
+        # Cross-module: the event's override, else the series'; unknown -> the full fee
+        return listed_fee_multiplier(
+            self.fee_multipliers.get(series_ticker(event_ticker or ""), 1.0),
+            market_event_fee_override(self._label_markets.get(ticker)))
 
 
 def _find_partner(reads: _Reads, ticker: str, side: str, count: int,
@@ -650,7 +689,9 @@ def _plan_one(pair: HeldPair, reads: _Reads, held_labels: dict, *, sell_at: floa
         legs.append(SaleLeg(partner.ticker, partner.event_ticker, other, count,
                             cost_basis + partner.fees_dollars,
                             payout_dollars=partner.revenue_dollars,
-                            paid_at=partner.settled_at))
+                            paid_at=partner.settled_at,
+                            partner_fee_multiplier=reads.partner_fee_multiplier(
+                                partner.ticker, partner.event_ticker)))
         text = (f"{side.upper()} {ticker} with paid-out {other.upper()} {partner.ticker} "
                 f"(settled {partner.result}, paid {_dollars(partner.revenue_dollars)})")
 
@@ -665,7 +706,10 @@ def _plan_one(pair: HeldPair, reads: _Reads, held_labels: dict, *, sell_at: floa
         return None
 
     # Each held market sold at its walk's average price, less the sale's taker fee
-    proceeds = sum(count * walked[leg.ticker][0] - fee_leg_exact(count, walked[leg.ticker][0])
+    # at that market's own fee multiplier
+    proceeds = sum(count * walked[leg.ticker][0]
+                   - fee_leg_exact(count, walked[leg.ticker][0],
+                                   multiplier=market_fee_multiplier(leg.market))
                    for leg in legs if leg.market is not None)
     # A partner paid out by now (one recorded later was refused above)
     value = proceeds + sum(leg.payout_dollars for leg in legs if leg.market is None)
@@ -694,8 +738,12 @@ def _plan_one(pair: HeldPair, reads: _Reads, held_labels: dict, *, sell_at: floa
                 not_selling(f"no {leg.side.upper()} bid on {leg.ticker} in the 24 hours "
                             f"before the check {back} day(s) before")
                 return None
-            # Cross-module: the taker fee on selling `count` at that bid
-            value += count * bid - fee_leg_exact(count, bid)
+            # Cross-module: the taker fee on selling `count` at that bid, at the
+            # market's own fee multiplier (a partner not yet paid out by this
+            # check, which carries no market, at the one it is listed at)
+            multiplier = (market_fee_multiplier(leg.market) if leg.market is not None
+                          else fee_multiplier(leg.partner_fee_multiplier))
+            value += count * bid - fee_leg_exact(count, bid, multiplier=multiplier)
         profits.append((value - cost, potential))
         # Cross-module: config.take_profit_reached, the rule's test at this check
         if not take_profit_reached(sell_at, value - cost, potential):
@@ -715,7 +763,8 @@ def _plan_one(pair: HeldPair, reads: _Reads, held_labels: dict, *, sell_at: floa
 
 
 def plan_sales(client: Any, held_positions: dict, held_labels: dict, markets_by_ticker: dict,
-               *, settings: LiveSettings, now: datetime) -> list[SalePlan]:
+               *, settings: LiveSettings, now: datetime,
+               fee_multipliers: dict | None = None) -> list[SalePlan]:
     """
     Find the held positions the take-profit rule sells this run, and plan each sale.
 
@@ -729,6 +778,11 @@ def plan_sales(client: Any, held_positions: dict, held_labels: dict, markets_by_
         markets_by_ticker (dict): This run's whole market list by ticker, held markets included.
         settings (LiveSettings): sell_at (None: sell nothing, read nothing) and sell_min_days.
         now (datetime): The run's moment, timezone-aware: the last check.
+        fee_multipliers (dict | None): Keyword-only. Series ticker -> fee
+            multiplier (historical.load_series_fee_multipliers, the map
+            main._run_prod reads), which a paid-out partner's fee is charged
+            at (Reads.partner_fee_multiplier); None charges every partner the
+            full fee.
 
     Returns:
         list[SalePlan]: The positions to sell, in ticker order; empty when none.
@@ -742,7 +796,8 @@ def plan_sales(client: Any, held_positions: dict, held_labels: dict, markets_by_
     hold_days = _hold_days()
     if not isinstance(now, datetime) or now.utcoffset() is None:
         raise ValueError(f"now must be a timezone-aware datetime, got {now!r}")
-    reads = _Reads(client, held_positions, markets_by_ticker, now.timestamp(), hold_days)
+    reads = _Reads(client, held_positions, markets_by_ticker, now.timestamp(), hold_days,
+                   fee_multipliers=fee_multipliers)
     never: Counter = Counter()
 
     unknown = sorted((t for t in held_positions if not held_labels.get(t)), key=str)
@@ -985,8 +1040,13 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
     bid_a, bid_b = ladders[market_a.ticker][0][0], ladders[market_b.ticker][0][0]
     # One contract pair's sale at the best bids, after the fee. Tested before the
     # price rise and the chance, so a pair they hold back still flags a wrong value
+    # Each market's fee multiplier, by ticker (market_a's goes with bid_a)
+    fee_mults = {market.ticker: market_fee_multiplier(market)
+                 for market in (market_a, market_b)}
     # Cross-module: the approximate fee on that sale
-    top_value = bid_a + bid_b - fee_per_pair_approx(bid_a, bid_b)
+    top_value = bid_a + bid_b - fee_per_pair_approx(
+        bid_a, bid_b, multiplier_a=fee_mults[market_a.ticker],
+        multiplier_b=fee_mults[market_b.ticker])
     # plan_trims also tests these pairs together
     fetched.append(count * top_value)
     if count * top_value > positions_value:
@@ -1043,12 +1103,14 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
         """What selling `pairs` contract pairs returns after fees; None when the bids
         within reach hold fewer."""
         total = 0.0
-        for ladder in ladders.values():
-            # Cross-module: the one bid walk, then the taker fee on that market's sale
+        for ticker, ladder in ladders.items():
+            # Cross-module: the one bid walk, then the taker fee on that market's
+            # sale at its own fee multiplier
             walk = walk_bids(ladder, pairs)
             if walk is None:
                 return None
-            total += pairs * walk[0] - fee_leg_exact(pairs, walk[0])
+            total += pairs * walk[0] - fee_leg_exact(pairs, walk[0],
+                                                     multiplier=fee_mults[ticker])
         return total
 
     # Cross-module: the pair's size cap, as a new trade of its kind is capped

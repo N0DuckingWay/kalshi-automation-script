@@ -433,6 +433,7 @@ from .config import (
     days_to_maturity,
     describe_time_series_rule,
     fee_leg_exact,
+    fee_multiplier,
     fee_per_pair_approx,
     held_pair_fraction,
     held_pair_win_prob,
@@ -450,6 +451,7 @@ from .config import (
     time_series_spread_band,
     time_series_spread_too_wide,
     trim_rise_reached,
+    unconfirmed_fee_multipliers_text,
 )
 from .depth_model import DepthModel, bid_ladder, can_start_at, volume_24h
 from .depth_model import book as _synthetic_book
@@ -461,6 +463,7 @@ from .historical import (
     fetch_candlesticks,
     infer_category,
     load_event_competitions,
+    load_event_fee_overrides,
     load_series_categories,
     load_series_fee_multipliers,
     series_labels,
@@ -473,6 +476,7 @@ from .scanner import (
     DEADLINE_UNKNOWN,
     ENRICH_UNAFFORDABLE,
     ENRICH_UNPROFITABLE,
+    EVENT_FEE_OVERRIDE_UNKNOWN,
     REFUSED_NO_STATED_DEADLINE,
     REFUSED_SAME_DEADLINE,
     REFUSED_SNAPSHOT,
@@ -493,6 +497,7 @@ from .scanner import (
     ladder_keys,
     leg_prices,
     leg_sides,
+    listed_fee_multiplier,
     same_event_ladder,
     stated_deadline,
     time_series_group_key,
@@ -1610,6 +1615,11 @@ class BacktestTrade:
         book_walked (bool): True when the trade was sized by walking a
             synthetic order book; False when it filled at the top of the book
             (no depth model, or no volume data that Monday).
+        fee_multiplier_a (float): The fee multiplier market A's leg was
+            charged at: config.fee_multiplier of its series' listed one, so
+            1.0 (the full fee) unless config.CONFIRMED_FEE_MULTIPLIERS holds
+            it. A sale or trim of that leg pays its fee at the same one.
+        fee_multiplier_b (float): The same for market B's leg.
     """
     pair_type: str       # "time_series" | "same_title"
     ticker_a: str
@@ -1688,6 +1698,11 @@ class BacktestTrade:
     fill_price_a: float | None = None
     fill_price_b: float | None = None
     book_walked: bool = False
+    # The fee multiplier each leg was charged at (config.fee_multiplier of its
+    # market's series' listed one; 1.0 is the full fee). Every fee the trade
+    # pays later — a sale's, a trim's — reads its own leg's
+    fee_multiplier_a: float = 1.0
+    fee_multiplier_b: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -2287,7 +2302,8 @@ class _Candidates:
         fee_multipliers (dict): Series ticker -> fee multiplier, from Kalshi's
             /series listing (historical.load_series_fee_multipliers); a
             series it lacks is charged the full fee (_fee_multiplier_of
-            reads 1.0). Carried only: nothing reads it for a decision yet.
+            reads 1.0). _prepare_candidates writes each pair market's on its
+            record (_LISTED_FEE_KEY), where every backtest fee reads it.
             Empty on a hand-built instance.
     """
     all_pairs: list
@@ -2309,7 +2325,10 @@ def _fee_multiplier_of(market: dict, fee_multipliers: dict | None) -> float:
 
     Looks the record's series (historical.series_ticker of its event ticker)
     up in the multipliers map; 1.0, the full fee, when the map or the series
-    is missing. Carried only: nothing in the backtest prices a fee with it yet.
+    is missing. _prepare_candidates files each pair market's multiplier from
+    it and its event's override (scanner.listed_fee_multiplier) onto the
+    record (_LISTED_FEE_KEY), which every backtest fee reads
+    (_charged_fee_multiplier).
 
     Args:
         market (dict): A cached market record (its event_ticker is read).
@@ -2320,6 +2339,46 @@ def _fee_multiplier_of(market: dict, fee_multipliers: dict | None) -> float:
         float: The series' multiplier, or 1.0 when it is not known.
     """
     return (fee_multipliers or {}).get(series_ticker(market.get("event_ticker") or ""), 1.0)
+
+
+# The key _prepare_candidates writes a pair market's listed fee multiplier
+# under, on its record, when the series lists one other than 1.0
+_LISTED_FEE_KEY = "_listed_fee_multiplier"
+
+
+def _listed_fee_multiplier(market: dict) -> float:
+    """
+    The fee multiplier a market's series lists, as _prepare_candidates wrote it on the record.
+
+    Read by type: a record without the key (every series listing none, and
+    every hand-built record) or with anything but a number reads 1.0.
+
+    Args:
+        market (dict): A market record.
+
+    Returns:
+        float: The listed multiplier, 1.0 when none.
+    """
+    raw = market.get(_LISTED_FEE_KEY, 1.0) if isinstance(market, dict) else 1.0
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 1.0
+    return float(raw)
+
+
+def _charged_fee_multiplier(market: dict) -> float:
+    """
+    The fee multiplier a market's leg is charged at: config.fee_multiplier of its listed one.
+
+    The full fee (1.0) unless config.CONFIRMED_FEE_MULTIPLIERS holds the
+    multiplier its series lists (_listed_fee_multiplier).
+
+    Args:
+        market (dict): A market record.
+
+    Returns:
+        float: The multiplier to price the leg's fee at.
+    """
+    return fee_multiplier(_listed_fee_multiplier(market))
 
 
 def _curve_end_date(point: SweepPoint | None) -> date | None:
@@ -4034,6 +4093,26 @@ def _leg_mark(trade: BacktestTrade, index: int, day: date) -> float:
     return trade.marks[index].at_checkpoint(day, side, price)
 
 
+def _trade_fee_multipliers(trade: BacktestTrade) -> tuple[float, float]:
+    """
+    Return the fee multipliers a trade's two legs were charged at, in market order.
+
+    Read by type, so a trade built without them (or a test double) reads 1.0,
+    the full fee, on both legs. Every later fee on the trade (a sale, a
+    trim, a lone leg's stake) reads its leg's here, so a leg is never charged
+    the other leg's multiplier.
+
+    Args:
+        trade (BacktestTrade): A trade.
+
+    Returns:
+        tuple[float, float]: (market A's multiplier, market B's), each through
+            config.fee_multiplier.
+    """
+    return (fee_multiplier(getattr(trade, "fee_multiplier_a", 1.0)),
+            fee_multiplier(getattr(trade, "fee_multiplier_b", 1.0)))
+
+
 def _open_leg_stake(trade: BacktestTrade, ticker: str, day: date) -> float:
     """
     What one leg of an open trade stakes at the checkpoint on `day`: its value at market plus its fee.
@@ -4056,9 +4135,11 @@ def _open_leg_stake(trade: BacktestTrade, ticker: str, day: date) -> float:
         float: The leg's stake in dollars.
     """
     index = 0 if trade.ticker_a == ticker else 1
-    # What the leg paid per contract, for the exact fee it was charged
+    # What the leg paid per contract, for the exact fee it was charged (at the
+    # leg's own fee multiplier)
     price = _paid_prices(trade)[index]
-    return trade.n * _leg_mark(trade, index, day) + fee_leg_exact(trade.n, price)
+    return trade.n * _leg_mark(trade, index, day) + fee_leg_exact(
+        trade.n, price, multiplier=_trade_fee_multipliers(trade)[index])
 
 
 # ─── Selling a position early ─────────────────────────────────────────────────
@@ -4486,15 +4567,17 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
     for trade in position:
         if trade.marks is None:
             return None
-        # Which side each leg holds (scanner.leg_sides, the one definition)
+        # Which side each leg holds (scanner.leg_sides, the one definition),
+        # and the fee multiplier that leg was charged at (market order)
         legs.append(list(zip((trade.ticker_a, trade.ticker_b), trade.marks,
-                             leg_sides(trade.pair_type), strict=True)))
+                             leg_sides(trade.pair_type), _trade_fee_multipliers(trade),
+                             strict=True)))
     # How many contract pairs each trade sells: all of them unless told otherwise
     counts = [trade.n for trade in position] if sold is None else sold
     # The contracts sold on each market, and its quotes
     held: dict[tuple[str, str], list] = {}
     for count, trade_legs in zip(counts, legs, strict=True):
-        for ticker, quotes, side in trade_legs:
+        for ticker, quotes, side, _multiplier in trade_legs:
             held.setdefault((ticker, side), [quotes, 0])[1] += count
     # One sale price per market; None when it has paid out
     prices: dict[tuple[str, str], float | None] = {}
@@ -4517,15 +4600,16 @@ def _position_sale_value(position: list[BacktestTrade], day: date,
     for trade, count, trade_legs in zip(position, counts, legs, strict=True):
         trade_value = fees = 0.0
         sale_prices: list[float | None] = []
-        for ticker, quotes, side in trade_legs:
+        for ticker, quotes, side, multiplier in trade_legs:
             price = prices[(ticker, side)]
             if price is None:
                 # Paid out: worth its payout, with nothing to sell
                 trade_value += count * (quotes.paid_yes if side == "yes" else quotes.paid_no)
                 sale_prices.append(None)
                 continue
-            # config.fee_leg_exact: the taker fee on selling the contracts at the price
-            fee = fee_leg_exact(count, price)
+            # config.fee_leg_exact: the taker fee on selling the contracts at
+            # the price, at this leg's own fee multiplier
+            fee = fee_leg_exact(count, price, multiplier=multiplier)
             trade_value += count * price - fee
             fees += fee
             sale_prices.append(price)
@@ -4841,7 +4925,11 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
     side_a, side_b = leg_sides(first.pair_type)
     bid_a = yes_bid_a if side_a == "yes" else no_bid_a
     bid_b = yes_bid_b if side_b == "yes" else no_bid_b
-    top_value = bid_a + bid_b - fee_per_pair_approx(bid_a, bid_b)
+    # Each leg at its own market's fee multiplier (every trade of an exact
+    # pair is the same two markets, so the first trade's are the pair's)
+    mult_a, mult_b = _trade_fee_multipliers(first)
+    top_value = bid_a + bid_b - fee_per_pair_approx(bid_a, bid_b, multiplier_a=mult_a,
+                                                    multiplier_b=mult_b)
     # Each sale the rule asks about, kept so the one it picks is not valued twice
     sales: dict[int, tuple] = {}
 
@@ -7427,6 +7515,10 @@ def _find_entry(
             only at a strictly positive spread; True (the default) layers
             the floor on the tier. Ignored by same_title pairs.
 
+    The fee check charges each leg at its own market's fee multiplier
+    (_charged_fee_multiplier: what _prepare_candidates wrote on the market
+    dict, so the full fee unless confirmed), never anything from the band.
+
     Returns:
         Optional[dict]: A dict with keys "entry_date" (date), "pA" (float), "pB"
             (float), "nA" (float), "nB" (float), "mA" (dict), "mB" (dict),
@@ -7610,6 +7702,11 @@ def _find_entry(
         # the only branch where the name would otherwise be unbound below.
         gap_days = None
 
+    # Each market's fee multiplier, read once from its own dict (after the
+    # time-series swap, so mA is the earlier contract); a same-title Monday
+    # that swaps its legs swaps these with them below
+    fee_mult_of_a = _charged_fee_multiplier(mA)
+    fee_mult_of_b = _charged_fee_multiplier(mB)
     # Every qualifying Monday, earliest first (see Returns)
     mondays: list[dict] = []
     # The Mondays to test (SCHEDULED_RUN's weekday), each at its checkpoint
@@ -7731,8 +7828,12 @@ def _find_entry(
         if price_a + price_b > 1.0 - threshold + PRICE_EPSILON:
             continue
 
-        # Check that the gross spread on the leg prices exceeds the continuous fee estimate
-        if (1.0 - price_a - price_b) <= fee_per_pair_approx(price_a, price_b):
+        # Check that the gross spread on the leg prices exceeds the continuous
+        # fee estimate, each leg at this Monday's own market's fee multiplier
+        mult_a, mult_b = ((fee_mult_of_a, fee_mult_of_b) if mA_i is mA
+                          else (fee_mult_of_b, fee_mult_of_a))
+        if (1.0 - price_a - price_b) <= fee_per_pair_approx(
+                price_a, price_b, multiplier_a=mult_a, multiplier_b=mult_b):
             continue
 
         mondays.append({
@@ -9008,7 +9109,8 @@ def _prepare_candidates(
             multiplier (historical.load_series_fee_multipliers); backtest.py
             hands in the copy it reads with the production client. None (the
             default) reads the cached copy only, with no request. Stored on
-            the result; nothing reads it for a decision yet.
+            the result, and each pair market's is written on its record
+            (_LISTED_FEE_KEY), where every backtest fee reads it.
 
     Returns:
         _Candidates | None: The candidate pairs (in scan order: time-series,
@@ -9217,7 +9319,9 @@ def _prepare_candidates(
     # Cross-module: None reads the cached copy only, making no request
     if series_categories is None:
         series_categories = load_series_categories(None)
-    # Each series' fee multiplier, carried on the result (nothing reads it yet)
+    # Each series' fee multiplier, carried on the result and filed onto each
+    # pair market's record below (with its event's override), where _find_entry,
+    # the Kelly gate, the live sizer and every sale and trim fee read it
     if fee_multipliers is None:
         fee_multipliers = load_series_fee_multipliers(None)
     if not series_categories and same_groups:
@@ -9269,6 +9373,37 @@ def _prepare_candidates(
     for mA, mB, _, _ in ts_pairs + same_pairs:
         needed_tickers[mA["ticker"]] = mA
         needed_tickers[mB["ticker"]] = mB
+    # Each pair market's series' listed fee multiplier, written on its record
+    # (only when not 1.0, so a market listing none is the record it always
+    # was): every later fee on the market reads it there
+    # (_charged_fee_multiplier), in this process and in a Sell worker's
+    pair_markets = [m for mA, mB, _, _ in ts_pairs + same_pairs for m in (mA, mB)]
+    # Cross-module: each pair market's event's fee override (cached; one
+    # read-only GET per new event), the events of reduced series first, since
+    # an override there can raise the fee back; an event not read is unknown
+    fee_overrides = load_event_fee_overrides(
+        live_client, {m.get("event_ticker") for m in pair_markets},
+        first={m.get("event_ticker") for m in pair_markets
+               if _fee_multiplier_of(m, fee_multipliers) != 1.0})
+    listed_by_ticker: dict[str, float] = {}
+    for m in pair_markets:
+        # Cross-module: the event's override, else the series'; an override not
+        # known is the full fee (scanner.listed_fee_multiplier)
+        listed = listed_fee_multiplier(
+            _fee_multiplier_of(m, fee_multipliers),
+            fee_overrides.get(m.get("event_ticker"), EVENT_FEE_OVERRIDE_UNKNOWN))
+        if listed != 1.0:
+            m[_LISTED_FEE_KEY] = listed
+        else:
+            # A record reused from an earlier call never keeps a stale reduced key
+            m.pop(_LISTED_FEE_KEY, None)
+        listed_by_ticker[m["ticker"]] = listed
+    listed_multipliers = list(listed_by_ticker.values())
+    # Cross-module: one line naming the pair markets whose series lists a fee
+    # multiplier that is not confirmed, so is charged in full (silent at zero)
+    unconfirmed = unconfirmed_fee_multipliers_text(listed_multipliers)
+    if unconfirmed is not None:
+        logging.info(unconfirmed)
 
     logging.info("Fetching candlesticks for %d markets (cached per ticker)...", len(needed_tickers))
 
@@ -10141,6 +10276,9 @@ def _candidate_pair(c: dict, held: HeldPair | None, markets: dict) -> CandidateP
         market = markets.get(id(m))
         if market is None:
             market = markets[id(m)] = _market_from_dict(m, m.get("event_title") or "")
+            # Its series' listed fee multiplier (1.0 when none), which the live
+            # sizer prices the leg's fee at through scanner.leg_fee_multipliers
+            market._fee_multiplier = _listed_fee_multiplier(m)
         built.append(market)
     gap = c["gap_days"]
     stated = (gap if c["pair_type"] == "time_series" and type(gap) is int else None)
@@ -10261,8 +10399,10 @@ def _held_pair(c: dict, stake: float, trades: list[BacktestTrade],
         # The held leg's own contracts and fee, in each trade
         cost = 0.0
         for t in trades:
-            price = _paid_prices(t)[0 if t.ticker_a == lone_ticker else 1]
-            cost += t.n * price + fee_leg_exact(t.n, price)
+            index = 0 if t.ticker_a == lone_ticker else 1
+            price = _paid_prices(t)[index]
+            cost += t.n * price + fee_leg_exact(
+                t.n, price, multiplier=_trade_fee_multipliers(t)[index])
     return HeldPair(sides=tuple(held), count=float(sum(t.n for t in trades)),
                     cost_dollars=cost, value_dollars=stake, fees_dollars=0.0)
 
@@ -10612,8 +10752,11 @@ def _simulate_at_discount(
             price_a, price_b = _leg_prices_for(pair_type, pA, nA, pB, nB)
 
             # ── Kelly fraction (sizing happens in Pass 2 against the checkpoint) ──
-            # Compute the net spread on the leg prices after the continuous fee approximation
-            fee_approx = fee_per_pair_approx(price_a, price_b)
+            # Compute the net spread on the leg prices after the continuous fee
+            # approximation, each leg at this Monday's own market's fee multiplier
+            mult_a, mult_b = _charged_fee_multiplier(mA), _charged_fee_multiplier(mB)
+            fee_approx = fee_per_pair_approx(price_a, price_b, multiplier_a=mult_a,
+                                             multiplier_b=mult_b)
             net_spread = (1.0 - price_a - price_b) - fee_approx
             # REPORTED/RANKED return on the contracts' cost (feeds
             # entry_monthly_ratio, the ranking key — see the note above
@@ -11386,7 +11529,10 @@ def _simulate_at_discount(
         # (the spec's own figures); every dollar figure below reads these
         fill_a, fill_b = leg_prices(spec.pair)
         walked = len(spec.pair.depth_levels) > 0
-        fee_a, fee_b = fee_leg_exact(n, fill_a), fee_leg_exact(n, fill_b)
+        # Each leg's fee at the multiplier the sizer priced it at (market order)
+        mult_a, mult_b = spec.fee_multipliers
+        fee_a = fee_leg_exact(n, fill_a, multiplier=mult_a)
+        fee_b = fee_leg_exact(n, fill_b, multiplier=mult_b)
         total_cost = spec.total_cost
         # Exact ceiling-rounded taker fees for both legs, charged at entry
         fees = fee_a + fee_b
@@ -11466,6 +11612,10 @@ def _simulate_at_discount(
             fill_price_a=fill_a,
             fill_price_b=fill_b,
             book_walked=walked,
+            # The multiplier each leg was charged at; a later sale or trim of
+            # the leg reads its own
+            fee_multiplier_a=mult_a,
+            fee_multiplier_b=mult_b,
         )
         trades.append(trade)
         if not walked:

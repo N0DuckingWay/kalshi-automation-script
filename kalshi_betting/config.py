@@ -55,7 +55,7 @@ import operator
 import os
 import pathlib
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, fields
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -1122,7 +1122,20 @@ MVE_SERIES_FAMILY_PREFIX      = "KXMVE"
 # Kalshi taker fee rate. The exact per-leg fee is:
 #   ceil(TAKER_FEE_RATE × n_contracts × price × (1 − price) × 100) / 100
 # The quadratic P*(1-P) factor means fees are highest near 50¢ and lowest near 1¢/99¢.
+# A series may list a fee multiplier (Kalshi's /series listing, fee_multiplier):
+# each leg's rate is then TAKER_FEE_RATE × that market's multiplier, but only
+# for a multiplier in CONFIRMED_FEE_MULTIPLIERS (fee_multiplier() below).
 TAKER_FEE_RATE                = 0.07
+
+# The series fee multipliers that are charged as listed. Any other multiplier
+# a series lists is charged as 1.0, the full fee, so a listed multiplier never
+# lowers a fee until fills Kalshi really charged show it does. Only 1.0 ships:
+# the account has no taker fill in a series listing 0.5, and of its 12 taker
+# fills in series listing 0, 8 were charged $0 and 4 between $0.00002 and
+# $0.008, where the full fee would have been $0.03 to $0.42 — close to free,
+# but not $0 to the cent. Adding 0.5 or 0 here is a decision of its own,
+# made only on fills (or a probe) that match it to the cent.
+CONFIRMED_FEE_MULTIPLIERS: frozenset[float] = frozenset({1.0})
 
 # Largest loss per contract, in cents below the NO leg's entry price, that
 # the unwind of a filled NO leg may take when the YES leg did not fill. The
@@ -2577,7 +2590,65 @@ def time_series_profit_prob(spread: float, k: float | None = None) -> float:
     return 1.0 - discount * max(0.0, spread)
 
 
-def fee_per_pair_approx(price_a: float, price_b: float) -> float:
+def fee_multiplier(raw: object) -> float:
+    """
+    Return the fee multiplier a leg is charged at: the listed one when confirmed, else 1.0.
+
+    A series' listed multiplier (historical.load_series_fee_multipliers) is
+    used only when it is a real, finite number (never a bool) found in
+    CONFIRMED_FEE_MULTIPLIERS. Anything else — a multiplier not yet checked
+    against fills Kalshi charged, a missing one, a value that is not a number —
+    is charged as 1.0, the full fee.
+
+    Args:
+        raw (object): The multiplier a market carries (its series' listed one).
+
+    Returns:
+        float: The multiplier to price that leg's fee at.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, numbers.Real):
+        return 1.0
+    value = float(raw)
+    if not math.isfinite(value) or value not in CONFIRMED_FEE_MULTIPLIERS:
+        return 1.0
+    return value
+
+
+def unconfirmed_fee_multipliers_text(listed: Iterable) -> str | None:
+    """
+    Return the one line naming markets whose listed fee multiplier is charged in full.
+
+    Counts each listed multiplier that is a real, finite number other than 1.0
+    and that fee_multiplier() does not confirm (so the market is charged the
+    full fee), by multiplier. A live run (main._attach_series_labels) and a
+    backtest (backtester._prepare_candidates) log it once each, at INFO.
+
+    Args:
+        listed (Iterable): One listed multiplier per market (its series' one,
+            or 1.0 for a series that lists none).
+
+    Returns:
+        str | None: "Fee multipliers listed but not confirmed (charged in
+            full): N markets (multipliers: 0.5 x A, 0 x B)", largest
+            multiplier first; None when there is none (silent at zero).
+    """
+    counts: dict[float, int] = {}
+    for raw in listed:
+        if isinstance(raw, bool) or not isinstance(raw, numbers.Real):
+            continue
+        value = float(raw)
+        if not math.isfinite(value) or value == 1.0 or fee_multiplier(value) != 1.0:
+            continue
+        counts[value] = counts.get(value, 0) + 1
+    if not counts:
+        return None
+    parts = ", ".join(f"{value:g} x {counts[value]}" for value in sorted(counts, reverse=True))
+    return (f"Fee multipliers listed but not confirmed (charged in full): "
+            f"{sum(counts.values())} markets (multipliers: {parts})")
+
+
+def fee_per_pair_approx(price_a: float, price_b: float, *,
+                        multiplier_a: float = 1.0, multiplier_b: float = 1.0) -> float:
     """
     Compute a continuous approximation of the total Kalshi taker fee for one pair trade.
 
@@ -2587,16 +2658,23 @@ def fee_per_pair_approx(price_a: float, price_b: float) -> float:
     suitable for threshold comparisons.
 
     The formula is: TAKER_FEE_RATE * (price_a*(1-price_a) + price_b*(1-price_b)),
-    which sums the quadratic fee contribution of the two legs. It is symmetric
-    in its arguments and side-agnostic: pass the per-contract cost of whatever
-    side each leg buys — (nA, pB) for a same-title pair, (pA, nB) for a
-    time-series pair, i.e. exactly scanner.leg_prices(pair).
+    which sums the quadratic fee contribution of the two legs, each leg's
+    contribution scaled by its own market's fee multiplier. It is
+    side-agnostic: pass the per-contract cost of whatever side each leg buys —
+    (nA, pB) for a same-title pair, (pA, nB) for a time-series pair, i.e.
+    exactly scanner.leg_prices(pair) — and the multipliers in the same MARKET
+    order, scanner.leg_fee_multipliers(pair): multiplier_a is market A's,
+    whichever side is bought there. With both multipliers 1.0 the arithmetic
+    is exactly the formula above, operation for operation.
 
     Args:
         price_a (float): Cost in dollars of the side bought on the first leg.
             Range: (0, 1).
         price_b (float): Cost in dollars of the side bought on the second leg.
             Range: (0, 1).
+        multiplier_a (float): Keyword-only. The fee multiplier of the first
+            leg's market (config.fee_multiplier of its series' listed one).
+        multiplier_b (float): Keyword-only. The same for the second leg.
 
     Returns:
         float: Approximate total taker fee per contract pair (in dollars).
@@ -2606,10 +2684,13 @@ def fee_per_pair_approx(price_a: float, price_b: float) -> float:
             be used for filtering: final validation always re-checks with
             fee_leg_exact() so an underestimated fee cannot admit a bad trade.
     """
-    return TAKER_FEE_RATE * (price_a * (1.0 - price_a) + price_b * (1.0 - price_b))
+    if multiplier_a == 1.0 and multiplier_b == 1.0:
+        return TAKER_FEE_RATE * (price_a * (1.0 - price_a) + price_b * (1.0 - price_b))
+    return TAKER_FEE_RATE * (multiplier_a * (price_a * (1.0 - price_a))
+                             + multiplier_b * (price_b * (1.0 - price_b)))
 
 
-def fee_leg_exact(n: int, p: float) -> float:
+def fee_leg_exact(n: int, p: float, *, multiplier: float = 1.0) -> float:
     """
     Compute the exact Kalshi taker fee for one order leg of n contracts at price p.
 
@@ -2619,20 +2700,25 @@ def fee_leg_exact(n: int, p: float) -> float:
     known (e.g. in strategy.py and backtester.py).
 
     Side-agnostic, like fee_per_pair_approx(): p is the cost of the side the
-    leg actually buys, whichever market and side that is.
+    leg actually buys, whichever market and side that is, and multiplier is
+    that same market's fee multiplier. With multiplier 1.0 the arithmetic is
+    exactly TAKER_FEE_RATE * n * p * (1 - p), operation for operation.
 
     Args:
         n (int): Number of contracts for this leg. Should be >= 1.
         p (float): Price in dollars of the side bought on this leg (the YES ask
             for a YES buy, the NO ask for a NO buy). Range: (0, 1).
+        multiplier (float): Keyword-only. The fee multiplier of this leg's
+            market (config.fee_multiplier of its series' listed one).
 
     Returns:
         float: Taker fee in dollars, rounded up to the nearest cent.
     """
+    rate = TAKER_FEE_RATE if multiplier == 1.0 else TAKER_FEE_RATE * multiplier
     # Round to 6 decimals before the ceiling so binary floating-point noise
     # (e.g. 0.07*100*0.25*100 = 175.00000000000003) cannot bump an exact
     # cent amount up an extra cent — Kalshi charges ceil of the TRUE value.
-    return math.ceil(round(TAKER_FEE_RATE * n * p * (1.0 - p) * 100, 6)) / 100
+    return math.ceil(round(rate * n * p * (1.0 - p) * 100, 6)) / 100
 
 
 def kelly_budget(bankroll: float, fraction: float, cash: float | None = None) -> float:

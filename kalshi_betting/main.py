@@ -53,7 +53,9 @@ Purpose:
     category/tag filter and the run summary read the same copy. The same
     listing's fee multipliers are read beside it
     (historical.load_series_fee_multipliers) and set on each market as
-    _fee_multiplier; nothing uses them for a fee yet.
+    _fee_multiplier, which prices that market's leg fees
+    (scanner.leg_fee_multipliers) when config.CONFIRMED_FEE_MULTIPLIERS holds
+    it; any other multiplier is charged as the full fee.
 
     A production run with sell_at set sells, before it buys, each held position
     (an exact held pair, or a lone held market whose partner has paid out)
@@ -185,6 +187,7 @@ from .config import (
     split_tag,
     trade_filter,
     trim_change_warnings,
+    unconfirmed_fee_multipliers_text,
 )
 from .historical import (
     infer_category,
@@ -217,6 +220,9 @@ from .scanner import (
     held_pairs,
     inactive_shard_indexes,
     leg_sides,
+    listed_fee_multiplier,
+    market_event_fee_override,
+    market_fee_multiplier,
     pair_held,
     resolve_held_ladders,
 )
@@ -525,8 +531,10 @@ def _with_simulated_proceeds(sales: list, cash_cents: int,
                 continue  # a paid-out partner has nothing to sell
             count = sale.sold.get(leg.ticker, 0)
             average = plan.walked[leg.ticker][0]
-            # Cross-module: the one fee rule, on selling `count` at that price
-            dollars = count * average - fee_leg_exact(count, average)
+            # Cross-module: the one fee rule, on selling `count` at that price,
+            # at the market's own fee multiplier
+            dollars = count * average - fee_leg_exact(
+                count, average, multiplier=market_fee_multiplier(leg.market))
             # Rounded to 6 places first so float noise never costs a cent, then floored
             cents = max(0, math.floor(round(dollars * 100, 6)))
             shard = leg.market.exchange_index
@@ -1017,9 +1025,14 @@ def _attach_series_labels(markets: list, series_categories: dict, *,
         series_categories (dict): Kalshi's /series listing (load_series_categories).
         fee_multipliers (dict | None): Keyword-only. series ticker -> fee
             multiplier (historical.load_series_fee_multipliers). Each market
-            also gets a _fee_multiplier attribute from it: its series'
-            multiplier, or 1.0 (the full fee) for a series the map lacks or
-            when no map is given. Carried only; nothing reads it for a fee yet.
+            also gets a _fee_multiplier attribute (scanner.listed_fee_multiplier):
+            the multiplier its event's override sets, else its series'
+            multiplier, and 1.0 (the full fee) for a series the map lacks, when
+            no map is given, or when the market carries no event override that
+            was read (_event_fee_override unknown). A leg's fee reads it through
+            scanner.leg_fee_multipliers, and only a multiplier in
+            config.CONFIRMED_FEE_MULTIPLIERS lowers a fee; one INFO line
+            counts the markets whose listed multiplier is charged in full.
     """
     if not series_categories:
         logging.warning(
@@ -1028,6 +1041,8 @@ def _attach_series_labels(markets: list, series_categories: dict, *,
             "series apart")
     # Many markets share an event, so each event is filed once
     by_event: dict = {}
+    # Each market's listed fee multiplier, for the unconfirmed-multiplier count
+    listed: list = []
     for market in markets:
         # A market with no event ticker is filed under "" (infer_category's
         # "Other"); the same-title finder refuses it on its series anyway
@@ -1037,7 +1052,19 @@ def _attach_series_labels(markets: list, series_categories: dict, *,
             by_event[event] = series_labels(event, infer_category(event), series_categories)
         market._series_labels = by_event[event]
         # The series' fee multiplier; the full fee when the listing gives none
-        market._fee_multiplier = (fee_multipliers or {}).get(series_ticker(event), 1.0)
+        # Cross-module: the event's override when its event was read with one,
+        # else the series' (1.0 when the listing gives none); an override not
+        # known (a market not from the run's event listing) is the full fee
+        listed_multiplier = listed_fee_multiplier(
+            (fee_multipliers or {}).get(series_ticker(event), 1.0),
+            market_event_fee_override(market))
+        market._fee_multiplier = listed_multiplier
+        listed.append(listed_multiplier)
+    # Cross-module: one line naming the markets whose listed multiplier is not
+    # confirmed, so is charged in full (silent at zero)
+    unconfirmed = unconfirmed_fee_multipliers_text(listed)
+    if unconfirmed is not None:
+        logging.info(unconfirmed)
 
 
 def _filter_by_category(pairs: list, settings: LiveSettings, listing_client, *,
@@ -1633,7 +1660,7 @@ def _run_dev(client, args, settings: LiveSettings | None = None,
     # a production request): each market's category and tag, which the
     # same-title sport check compares, and what the category/tag filter files by
     series_categories = load_series_categories(None)
-    # Each series' fee multiplier, from the same cached copy (carried only)
+    # Each series' fee multiplier, from the same cached copy (each leg's fee reads it when confirmed)
     fee_multipliers = load_series_fee_multipliers(None)
     _attach_series_labels(markets, series_categories, fee_multipliers=fee_multipliers)
 
@@ -1899,7 +1926,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
     # sale block, since live trimming reads it through held_pair_kind), and
     # what the category/tag filter and the run result file a pair by
     series_categories = load_series_categories(client)
-    # Each series' fee multiplier (carried only), read from the cache file the
+    # Each series' fee multiplier (each leg's fee, and a paid-out partner's in
+    # the sale block, read it when confirmed), read from the cache file the
     # listing above refreshed: no request of its own on a live run, so an old
     # file without fees gives {} (every market the full fee)
     fee_multipliers = load_series_fee_multipliers(client)
@@ -1944,7 +1972,8 @@ def _run_prod(client, args, settings: LiveSettings | None = None,
             moment = datetime.now(UTC)
             # Cross-module: the positions the take-profit rule sells (read-only requests)
             plans = plan_sales(client, held_positions, held_labels, markets_by_ticker,
-                               settings=settings, now=moment)
+                               settings=settings, now=moment,
+                               fee_multipliers=fee_multipliers)
             if trimming:
                 # Each gate below fails closed: a trim grows as the value it is sized
                 # on shrinks, so a value missing cash or positions would sell too much

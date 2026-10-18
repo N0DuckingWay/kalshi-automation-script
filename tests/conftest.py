@@ -118,7 +118,9 @@ def _offline_event_competitions_for_the_session(tmp_path_factory):
     before any function-scoped fixture is active. The stub answers "" (an
     event that names no competition), so every existing same-title fixture
     keeps pairing exactly as before; a test of the read itself replaces it.
-    The two caches point at an empty session directory, so class setup never
+    Each pair market's event's fee override (load_event_fee_overrides,
+    through _fetch_event_fee_override) is answered as none, so every market
+    keeps its series' multiplier. The caches point at an empty session directory, so class setup never
     reads the operator's series_categories.json or writes an
     event_competitions.json into the checkout; each test body sees its own
     tmp_path (the redirect below).
@@ -135,6 +137,10 @@ def _offline_event_competitions_for_the_session(tmp_path_factory):
     mp.setattr(historical, "_EVENT_COMPETITIONS_CACHE", folder / "event_competitions.json")
     mp.setattr(historical, "_SERIES_CATEGORIES_CACHE", folder / "series_categories.json")
     mp.setattr(historical, "_fetch_event_competition", lambda client, event_ticker: "")
+    # The pair markets' events' fee overrides, read the same way: answered as
+    # an event that sets none (None), with their cache off the checkout too
+    mp.setattr(historical, "_EVENT_FEE_OVERRIDES_CACHE", folder / "event_fee_overrides.json")
+    mp.setattr(historical, "_fetch_event_fee_override", lambda client, event_ticker: None)
     yield
     mp.undo()
 
@@ -231,6 +237,8 @@ def _isolate_event_title_accumulator(tmp_path, monkeypatch):
                         tmp_path / "series_categories.json")
     monkeypatch.setattr(historical, "_EVENT_COMPETITIONS_CACHE",
                         tmp_path / "event_competitions.json")
+    monkeypatch.setattr(historical, "_EVENT_FEE_OVERRIDES_CACHE",
+                        tmp_path / "event_fee_overrides.json")
 
 
 def apply_pre_toggle_defaults(mp) -> None:

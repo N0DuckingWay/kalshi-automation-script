@@ -7,6 +7,7 @@ MagicMock auto-attribute would TypeError inside compute_trade's arithmetic.
 """
 import ast
 import dataclasses
+import importlib
 import inspect
 import json
 import logging
@@ -3453,6 +3454,111 @@ class TestTimeSeriesKellyParity:
         assert _function_calls(backtester, "_live_settings_for_report", "live_defaults")
         assert _function_calls(backtest, "main", "live_defaults")
 
+    @staticmethod
+    def _fee_call_problems(source: str) -> list[str]:
+        """Every fee call in source that does not name its multiplier keyword(s)."""
+        wanted = {"fee_leg_exact": {"multiplier"},
+                  "fee_per_pair_approx": {"multiplier_a", "multiplier_b"},
+                  # Helpers whose multiplier keywords default to the full fee
+                  "_levels_with_edge_after_fee": {"yes_multiplier", "no_multiplier"},
+                  "_kelly_fraction": {"multiplier_a", "multiplier_b"},
+                  # A paid-out partner's fee reads the series map plan_sales is handed
+                  "plan_sales": {"fee_multipliers"}}
+        problems = []
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = (func.id if isinstance(func, ast.Name)
+                    else func.attr if isinstance(func, ast.Attribute) else None)
+            if name in wanted:
+                named = {k.arg for k in node.keywords}
+                if not wanted[name] <= named:
+                    problems.append(f"{name} at line {node.lineno}")
+        return problems
+
+    def test_ast_every_fee_call_names_its_multiplier(self):
+        # A fee call that leaves its multiplier to the 1.0 default would charge
+        # that leg the full fee once a reduced multiplier is confirmed, while
+        # its twin is charged the reduced one: every call in the package names
+        # each leg's multiplier, so none is missed
+        import pkgutil
+
+        import kalshi_betting
+        names = sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__))
+        found = 0
+        for name in names:
+            module = importlib.import_module(f"kalshi_betting.{name}")
+            source = inspect.getsource(module)
+            assert self._fee_call_problems(source) == [], name
+            found += sum(1 for node in ast.walk(ast.parse(source))
+                         if isinstance(node, ast.Call)
+                         and getattr(node.func, "id", getattr(node.func, "attr", None))
+                         in ("fee_leg_exact", "fee_per_pair_approx"))
+        # The calls exist (32 in eight modules), so the walk is not vacuous
+        assert found >= 30
+        # The check catches a call that leaves a multiplier out
+        assert self._fee_call_problems("fee_leg_exact(n, p)\n") == ["fee_leg_exact at line 1"]
+        assert self._fee_call_problems(
+            "config.fee_per_pair_approx(a, b, multiplier_a=x)\n") == [
+            "fee_per_pair_approx at line 1"]
+        assert self._fee_call_problems(
+            "fee_per_pair_approx(a, b, multiplier_a=x, multiplier_b=y)\n"
+            "config.fee_leg_exact(n, p, multiplier=m)\n") == []
+        assert self._fee_call_problems("_levels_with_edge_after_fee(q)\n") == [
+            "_levels_with_edge_after_fee at line 1"]
+        assert self._fee_call_problems("dashboard._kelly_fraction(1, 2, 3, 4, t)\n") == [
+            "_kelly_fraction at line 1"]
+        assert self._fee_call_problems("plan_sales(c, p, l, m, settings=s, now=n)\n") == [
+            "plan_sales at line 1"]
+
+    def test_ast_the_fee_multiplier_attribute_has_one_reader(self):
+        # scanner.market_fee_multiplier (behind scanner.leg_fee_multipliers)
+        # is the one reader of a market's _fee_multiplier; only
+        # main._attach_series_labels (live) and backtester._candidate_pair
+        # (the backtest) write it
+        import pkgutil
+
+        import kalshi_betting
+        reads, writes = set(), set()
+        for name in sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__)):
+            module = importlib.import_module(f"kalshi_betting.{name}")
+            tree = ast.parse(inspect.getsource(module))
+            for func in ast.walk(tree):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for node in ast.walk(func):
+                    if isinstance(node, ast.Attribute) and node.attr == "_fee_multiplier":
+                        (writes if isinstance(node.ctx, ast.Store) else reads).add(
+                            (name, func.name))
+                    elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                          and node.func.id in ("getattr", "setattr", "hasattr")
+                          and any(isinstance(a, ast.Constant) and a.value == "_fee_multiplier"
+                                  for a in node.args)):
+                        (writes if node.func.id == "setattr" else reads).add(
+                            (name, func.name))
+        assert reads == {("scanner", "market_fee_multiplier")}
+        # ... and an event's fee override has one reader too
+        override_reads = set()
+        for name in sorted(m.name for m in pkgutil.iter_modules(kalshi_betting.__path__)):
+            module = importlib.import_module(f"kalshi_betting.{name}")
+            for func in ast.walk(ast.parse(inspect.getsource(module))):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for node in ast.walk(func):
+                    if ((isinstance(node, ast.Attribute)
+                         and node.attr == "_event_fee_override")
+                            or (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                                and node.func.id == "getattr"
+                                and any(isinstance(a, ast.Constant)
+                                        and a.value == "_event_fee_override"
+                                        for a in node.args))):
+                        override_reads.add((name, func.name))
+        assert override_reads == {("scanner", "market_event_fee_override")}
+        assert writes == {("main", "_attach_series_labels"),
+                          ("backtester", "_candidate_pair")}
+        assert _function_calls(scanner, "leg_fee_multipliers", "market_fee_multiplier")
+
     def test_ast_every_sizer_caps_through_pair_size_cap(self):
         # config.pair_size_cap is the ONE definition of a pair's per-trade cap,
         # so the live sizer, enrichment's bound and the backtester agree
@@ -5619,3 +5725,63 @@ class TestPortfolioSummaryIsFeeInclusive:
         # These hand-built specs carry no order reserve, so the walk set aside
         # their fee-inclusive costs, rounded up to the cent
         assert "(up to $32.10 of cash at the orders' limit prices)" in line
+
+
+class TestComputeTradeChargesEachLegItsMultiplier:
+    """compute_trade prices each leg's fee at its own market's multiplier
+    (scanner.leg_fee_multipliers), and only a confirmed one lowers it."""
+
+    _TS_LEVELS = [(0.30, 0.38, 400.0), (0.31, 0.39, 400.0)]
+    _ST_LEVELS = [(0.30, 0.60, 500.0), (0.31, 0.61, 500.0)]
+
+    @staticmethod
+    def _fields(spec):
+        # Every field but the pair (whose markets carry the multiplier)
+        return {f.name: getattr(spec, f.name) for f in dataclasses.fields(spec)
+                if f.name not in ("pair", "fee_multipliers")}
+
+    def _pair(self, pair_type, mult_a=None, mult_b=None):
+        levels = self._TS_LEVELS if pair_type == "time_series" else self._ST_LEVELS
+        pair = make_booked_pair(levels, pair_type=pair_type, pB=0.62)
+        if mult_a is not None:
+            pair.market_a._fee_multiplier = mult_a
+        if mult_b is not None:
+            pair.market_b._fee_multiplier = mult_b
+        return pair
+
+    @pytest.mark.parametrize("pair_type, mult_a, mult_b", [
+        ("time_series", None, 0.5), ("time_series", 0.5, None),
+        ("same_title", 0.5, None), ("same_title", None, 0.5)])
+    def test_a_confirmed_half_halves_only_its_own_legs_fee(self, monkeypatch, caplog,
+                                                          pair_type, mult_a, mult_b):
+        monkeypatch.setattr(config, "CONFIRMED_FEE_MULTIPLIERS", frozenset({1.0, 0.5}))
+        with caplog.at_level(logging.INFO):
+            spec = compute_trade(self._pair(pair_type, mult_a, mult_b), 1_000_000,
+                                 settings=_live())
+        assert spec is not None
+        want = (mult_a or 1.0, mult_b or 1.0)
+        assert spec.fee_multipliers == want
+        price_a, price_b = leg_prices(spec.pair)
+        n = spec.x
+        fee_a = fee_leg_exact(n, price_a, multiplier=want[0])
+        fee_b = fee_leg_exact(n, price_b, multiplier=want[1])
+        assert spec.cost_with_fees_a == pytest.approx(n * price_a + fee_a)
+        assert spec.cost_with_fees_b == pytest.approx(n * price_b + fee_b)
+        assert spec.total_cost_with_fees == pytest.approx(n * (price_a + price_b) + fee_a + fee_b)
+        # The halved leg really is cheaper than the full fee there
+        halved = 0 if want[0] == 0.5 else 1
+        price = (price_a, price_b)[halved]
+        assert (fee_a, fee_b)[halved] < fee_leg_exact(n, price, multiplier=1.0)
+        assert f"| fee multipliers {want[0]:g}/{want[1]:g}" in caplog.text
+
+    @pytest.mark.parametrize("pair_type", ["time_series", "same_title"])
+    def test_an_unconfirmed_half_is_charged_in_full(self, caplog, pair_type):
+        full = compute_trade(self._pair(pair_type), 1_000_000, settings=_live())
+        with caplog.at_level(logging.INFO):
+            listed = compute_trade(self._pair(pair_type, 0.5, 0.0), 1_000_000,
+                                   settings=_live())
+        assert full is not None and listed is not None
+        assert listed.fee_multipliers == (1.0, 1.0)
+        assert self._fields(listed) == self._fields(full)
+        assert leg_prices(listed.pair) == leg_prices(full.pair)
+        assert "fee multipliers" not in caplog.text

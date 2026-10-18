@@ -7858,3 +7858,41 @@ class TestCandleReadsBid:
             assert historical.candle_reads_bid(0.25, "no") is True
         # Each bid is asked about as the other side's ask
         assert calls == [(0.75, "no"), (0.75, "yes")]
+
+
+class TestLoadEventFeeOverrides:
+    """Each pair market's event's fee override, cached; an event not read is
+    left out (unknown, so the full fee) and asked again next run."""
+
+    def test_reads_caches_and_leaves_unknown_out(self, monkeypatch):
+        answers = {"E-HALF": 0.5, "E-NONE": None, "E-ODD": historical.EVENT_FEE_OVERRIDE_UNKNOWN}
+        reads: list = []
+
+        def fetch(client, ticker):
+            reads.append(ticker)
+            if ticker == "E-FAIL":
+                raise RuntimeError("boom")
+            return answers[ticker]
+
+        monkeypatch.setattr(historical, "_fetch_event_fee_override", fetch)
+        got = historical.load_event_fee_overrides(
+            MagicMock(), ["E-HALF", "E-NONE", "E-ODD", "E-FAIL", "", None])
+        assert got == {"E-HALF": 0.5, "E-NONE": None}
+        # Only answers Kalshi gave are cached; the others are asked again
+        reads.clear()
+        got = historical.load_event_fee_overrides(MagicMock(), ["E-HALF", "E-NONE", "E-ODD"])
+        assert got == {"E-HALF": 0.5, "E-NONE": None}
+        assert reads == ["E-ODD"]
+
+    def test_no_client_reads_the_cache_only(self, monkeypatch):
+        monkeypatch.setattr(historical, "_fetch_event_fee_override",
+                            lambda c, t: pytest.fail("no read without a client"))
+        assert historical.load_event_fee_overrides(None, ["E1"]) == {}
+
+    def test_the_cap_reads_the_events_named_first_first(self, monkeypatch):
+        reads: list = []
+        monkeypatch.setattr(historical, "EVENT_COMPETITION_MAX_LOOKUPS", 1)
+        monkeypatch.setattr(historical, "_fetch_event_fee_override",
+                            lambda c, t: reads.append(t) or None)
+        got = historical.load_event_fee_overrides(MagicMock(), ["A-1", "Z-1"], first={"Z-1"})
+        assert reads == ["Z-1"] and got == {"Z-1": None}

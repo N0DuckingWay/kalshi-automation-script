@@ -203,7 +203,7 @@ from .config import (
     SETTLED_FETCH_CHUNK_RECORDS,
     SETTLED_FETCH_MAX_WORKERS,
 )
-from .scanner import event_competition, event_series
+from .scanner import EVENT_FEE_OVERRIDE_UNKNOWN, event_competition, event_fee_override, event_series
 
 # Optional acceleration for the day-slice store, which serializes and re-parses
 # tens of millions of compact market dicts per full-history fetch. orjson is an
@@ -651,7 +651,8 @@ def load_series_fee_multipliers(
     existed) is upgraded by one fetch of the 19 MB listing, through the
     retried GET. Live runs never upgrade (a retry can wait about a minute
     and log WARNINGs): they read the file only, so an old file gives {} and
-    every market the full fee, which is safe while nothing reads it. The
+    every market the full fee, the safe direction (a fee is never lowered
+    by a multiplier it could not read). The
     backtest (backtest.py) upgrades. A missing or stale file is never fetched
     here (the categories reader just tried). It never raises, and a failed
     fetch, unreadable file or failed cache write adds no WARNING of the
@@ -873,6 +874,153 @@ def load_event_competitions(client: Any, event_tickers: Iterable[str]) -> dict[s
     logging.info("Event competitions: %d events, %d from the cache, %d read from "
                  "Kalshi, %d unknown", len(wanted), len(wanted) - len(missing),
                  len(fresh), len(wanted) - len(found))
+    return found
+
+
+# Each event's fee multiplier override as the backtest read it
+# (load_event_fee_overrides): {"overrides": {event_ticker: null | number}},
+# null for an event that sets none. Only answers Kalshi gave are kept: an event
+# whose read failed, or whose override cannot be read, is not stored, so it is
+# unknown (the full fee) and a later run asks again.
+_EVENT_FEE_OVERRIDES_CACHE = CACHE_DIR / "event_fee_overrides.json"
+
+
+def _fetch_event_fee_override(client: Any, event_ticker: str) -> float | None | str:
+    """
+    Read one event's fee multiplier override from /events/{ticker}, then pause.
+
+    One read-only GET through _historical_get (retried on 429/5xx), whose event
+    object is read by scanner.event_fee_override, the reading live ingest uses.
+    Each read is followed by an EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS
+    pause, as _fetch_event_competition's are.
+
+    Args:
+        client (Any): The production live client.
+        event_ticker (str): The event to read.
+
+    Returns:
+        float | None | str: The override, None when the event sets none, or
+            scanner.EVENT_FEE_OVERRIDE_UNKNOWN when it cannot be read.
+
+    Raises:
+        ValueError: When the reply carries no event object.
+        Exception: Whatever the read itself raises once its retries are spent.
+    """
+    try:
+        data = _historical_get(client, f"{_API_PREFIX}/events/{event_ticker}")
+        event = data.get("event") if isinstance(data, dict) else None
+        if not isinstance(event, dict):
+            raise ValueError(f"/events/{event_ticker} returned no event object")
+        # Cross-module: the one reading of the override, shared with live ingest
+        return event_fee_override(event)
+    finally:
+        time.sleep(EVENT_TITLE_FALLBACK_RATE_LIMIT_SLEEP_SECONDS)
+
+
+def load_event_fee_overrides(client: Any, event_tickers: Iterable[str], *,
+                             first: Iterable[str] = ()) -> dict[str, float | None]:
+    """
+    Each event's fee multiplier override, from the cache or one read-only GET each.
+
+    The backtest's half of the event override rule (scanner.listed_fee_multiplier):
+    cached markets carry no event payload, so backtester._prepare_candidates asks
+    for the events of every pair market. An event already in
+    backtest_cache/event_fee_overrides.json costs no request; the others are
+    read on EVENT_TITLE_FALLBACK_MAX_WORKERS threads, at most
+    EVENT_COMPETITION_MAX_LOOKUPS per call, the events in `first` (those whose
+    series lists a multiplier below 1, where an override can raise the fee)
+    before the rest, each group in ticker order. An event left out — past the
+    cap, a read that failed, an override that cannot be read, no client — is
+    unknown, which the rule charges as the full fee, and is not stored, so a
+    later run asks again. New answers are merged into the cache (a failed save
+    is a WARNING). One INFO line counts where they came from. Never raises.
+
+    Args:
+        client (Any): The production live client, or None for the cache only.
+        event_tickers (Iterable[str]): The events wanted; blank or non-string
+            tickers are left out.
+        first (Iterable[str]): Keyword-only. Events to read before the others.
+
+    Returns:
+        dict[str, float | None]: Each wanted event whose override is known ->
+            the override, or None when it sets none. An event missing from it
+            is unknown.
+    """
+    wanted = sorted({t for t in event_tickers if isinstance(t, str) and t})
+    if not wanted:
+        return {}
+    cached: dict[str, float | None] = {}
+    cache_readable = True
+    try:
+        raw = _load_json_cache(_EVENT_FEE_OVERRIDES_CACHE)
+        block = raw.get("overrides") if isinstance(raw, dict) else None
+        if isinstance(block, dict):
+            for t, value in block.items():
+                if not isinstance(t, str):
+                    continue
+                # Only an answer the override rule reads alike is used
+                parsed = event_fee_override({"fee_multiplier_override": value})
+                if parsed != EVENT_FEE_OVERRIDE_UNKNOWN:
+                    cached[t] = parsed
+    except Exception as exc:  # a folder that cannot be searched, a file nested too deeply
+        logging.warning(
+            "Event fee overrides: could not read the cached overrides (%s) — reading the "
+            "wanted events from Kalshi, and leaving the cache file as it is",
+            _exception_summary(exc))
+        cached, cache_readable = {}, False
+
+    found = {t: cached[t] for t in wanted if t in cached}
+    early = {t for t in first if isinstance(t, str)}
+    missing = ([t for t in wanted if t not in found and t in early]
+               + [t for t in wanted if t not in found and t not in early])
+    to_read = [] if client is None else missing[:EVENT_COMPETITION_MAX_LOOKUPS]
+    if len(missing) > len(to_read):
+        logging.warning(
+            "Event fee overrides: %d events are not in the cache and %s, so their "
+            "markets are charged the full fee this run", len(missing) - len(to_read),
+            "no client was given" if client is None else
+            f"are past the cap EVENT_COMPETITION_MAX_LOOKUPS={EVENT_COMPETITION_MAX_LOOKUPS}")
+
+    def _read_one(ticker: str) -> tuple[str, Any, BaseException | None]:
+        """One event's read, with its failure kept rather than raised."""
+        try:
+            return ticker, _fetch_event_fee_override(client, ticker), None
+        except Exception as exc:
+            return ticker, None, exc
+
+    fresh: dict[str, float | None] = {}
+    if to_read:
+        try:
+            with ThreadPoolExecutor(
+                    max_workers=min(EVENT_TITLE_FALLBACK_MAX_WORKERS, len(to_read))) as pool:
+                for ticker, value, exc in pool.map(_read_one, to_read):
+                    if exc is not None:
+                        logging.warning(
+                            "Could not read the fee override of event %s: HTTP %s %s — its "
+                            "markets are charged the full fee this run", ticker,
+                            getattr(exc, "status", "?"), _exception_summary(exc))
+                    elif value == EVENT_FEE_OVERRIDE_UNKNOWN:
+                        logging.warning(
+                            "The fee override of event %s cannot be read — its markets are "
+                            "charged the full fee this run", ticker)
+                    else:
+                        fresh[ticker] = value
+        except Exception as exc:  # a pool that cannot start: keep what was read
+            logging.warning("Event fee overrides: the reads stopped (%s) — the events not "
+                            "read are charged the full fee", _exception_summary(exc))
+
+    if fresh and cache_readable:
+        try:
+            _save_json_cache(_EVENT_FEE_OVERRIDES_CACHE, {"overrides": {**cached, **fresh}})
+        except Exception as exc:  # the answers are in hand: a failed write costs the cache only
+            logging.warning(
+                "Event fee overrides: could not save the cached overrides (%s) — this run "
+                "still uses the %d it read", _exception_summary(exc), len(fresh))
+    found.update(fresh)
+    logging.info("Event fee overrides: %d events, %d from the cache, %d read from Kalshi, "
+                 "%d unknown (charged the full fee), %d with an override", len(wanted),
+                 len(wanted) - len(missing), len(fresh), len(wanted) - len(found),
+                 sum(1 for v in found.values() if v is not None))
     return found
 
 

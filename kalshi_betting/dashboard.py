@@ -560,6 +560,7 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 from . import backtester as _backtester
+from . import config as _config
 from .backtester import (
     _LIVE_RULE_LABEL,
     _LIVE_RULE_NONE,
@@ -1234,7 +1235,8 @@ def _score_text(value: float | None) -> str:
 
 
 def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
-                    k: float | None = None, *, spread: float | None = None) -> float:
+                    k: float | None = None, *, spread: float | None = None,
+                    multiplier_a: float = 1.0, multiplier_b: float = 1.0) -> float:
     """
     Uncapped Kelly fraction f* = p - (1-p)/b for one pair trade.
 
@@ -1283,6 +1285,9 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
             entry quotes' own (_entry_mid_spread), as the live sizer prices
             its legs at the fills and its forecast at the book's tops.
             Ignored for same_title.
+        multiplier_a (float): Keyword-only. Market A's fee multiplier, the one
+            the trade was priced at (BacktestTrade.fee_multiplier_a).
+        multiplier_b (float): Keyword-only. Market B's.
 
     Returns:
         float: Uncapped Kelly fraction, clamped to be >= 0.
@@ -1299,7 +1304,9 @@ def _kelly_fraction(pA: float, nA: float, pB: float, nB: float, pair_type: str,
         price_a, price_b = nA, pB
         p = SAME_TITLE_CO_RESOLVE_PROB
     cost = price_a + price_b
-    fee_approx = fee_per_pair_approx(price_a, price_b)
+    # Each leg at its own market's fee multiplier (market order, as price_a, price_b)
+    fee_approx = fee_per_pair_approx(price_a, price_b, multiplier_a=multiplier_a,
+                                     multiplier_b=multiplier_b)
     net_spread = (1.0 - price_a - price_b) - fee_approx
     if cost <= 0 or net_spread <= 0:
         return 0.0
@@ -6142,7 +6149,9 @@ def _kelly_points(trades: list[BacktestTrade],
     # trades were actually sized at rather than the config one
     kelly_fracs = [
         _kelly_fraction(*_quotes_at_fills(t), t.pair_type, k=k,
-                        spread=_entry_mid_spread(t))
+                        spread=_entry_mid_spread(t),
+                        multiplier_a=getattr(t, "fee_multiplier_a", 1.0),
+                        multiplier_b=getattr(t, "fee_multiplier_b", 1.0))
         for t in trades
     ]
     # The actual fraction uses the portfolio value at each trade's entry
@@ -10556,8 +10565,12 @@ class _SellTask:
         hold_days (int): backtester.TAKE_PROFIT_HOLD_DAYS as the parent reads
             it: how many days in a row a position must stay at a level
             before it is sold.
+        confirmed_fee_multipliers (frozenset): config.CONFIRMED_FEE_MULTIPLIERS
+            as the parent reads it: the series fee multipliers charged as
+            listed (config.fee_multiplier), so a worker charges each leg's
+            fee as the parent would.
         install (bool): Whether the task runs in a worker process of its own,
-            which then installs those three bindings first (a spawned process
+            which then installs those four bindings first (a spawned process
             imports backtester afresh, from config). False in the parent.
     """
     index: int
@@ -10579,6 +10592,7 @@ class _SellTask:
     same_title_size_cap: float
     scheduled_run: object
     hold_days: int
+    confirmed_fee_multipliers: frozenset = frozenset({1.0})
     install: bool = False
 
 
@@ -10828,8 +10842,8 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     dropped before the next is read.
 
     Runs in a worker process (task.install True: the parent's
-    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS are
-    installed first) or in the parent itself.
+    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and
+    config.CONFIRMED_FEE_MULTIPLIERS are installed first) or in the parent itself.
 
     Args:
         task (_SellTask): The task.
@@ -10848,6 +10862,9 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
         _backtester.SAME_TITLE_SIZE_CAP = task.same_title_size_cap
         _backtester.SCHEDULED_RUN = task.scheduled_run
         _backtester.TAKE_PROFIT_HOLD_DAYS = task.hold_days
+        # ... and charge each leg's fee at the multipliers the parent confirms
+        # (config.fee_multiplier reads config's own binding when called)
+        _config.CONFIRMED_FEE_MULTIPLIERS = task.confirmed_fee_multipliers
     family = task.family
     band = family.bands[0] if task.tier_floors else family.off_bands[0]
     axis_end = task.axis[-1] if len(task.axis) else None
@@ -10949,10 +10966,11 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
               "series_categories": series_categories, "cat_index": dict(chunker.cat_index),
               "sub_index": dict(chunker.sub_index), "risk_free": risk_free,
               "inline_keys": frozenset(chunker.seen), "out_dir": folder,
-              # The three bindings a spawned worker installs (_run_sell_task)
+              # The four bindings a spawned worker installs (_run_sell_task)
               "same_title_size_cap": _backtester.SAME_TITLE_SIZE_CAP,
               "scheduled_run": _backtester.SCHEDULED_RUN,
-              "hold_days": _backtester.TAKE_PROFIT_HOLD_DAYS}
+              "hold_days": _backtester.TAKE_PROFIT_HOLD_DAYS,
+              "confirmed_fee_multipliers": _config.CONFIRMED_FEE_MULTIPLIERS}
     tasks: list[_SellTask] = []
 
     def add(bi: int, band, tier_floors: bool, rows: dict) -> None:
