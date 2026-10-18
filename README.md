@@ -400,8 +400,9 @@ backtest.py (CLI)
   │    │                                                 against its details and candles and reduced to a
   │    │                                                 small summary; logged as coverage lines, one
   │    │                                                 WARNING if some trades could not be read, and one
-  │    │                                                 `Integrity check` line per check. Carried, never
-  │    │                                                 read to decide a trade
+  │    │                                                 `Integrity check` line per check, plus one line
+  │    │                                                 for Kalshi's own crossed candles (a data anomaly,
+  │    │                                                 not a failure). Carried, never read to decide a trade
   │    └─ _sweep_from_candidates()
   │         ├─ _entries_for_band()            — k-independent; records every qualifying Monday of each
   │         │                                    pair; one time-series _find_entry() pass per band:

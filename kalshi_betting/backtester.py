@@ -5272,7 +5272,8 @@ def _last_bought_first(position: list[BacktestTrade], pairs: int) -> list[int]:
 
 def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float,
                 k: float, cap: float, st_cap: float, *,
-                stale_check: bool = True) -> tuple[KellyTrim, tuple | None]:
+                stale_check: bool = True,
+                volume_cap: bool = True) -> tuple[KellyTrim, tuple | None]:
     """
     What the Kelly trim sells of one position at the checkpoint on `day`.
 
@@ -5302,6 +5303,9 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
         stale_check (bool): Keyword-only. False skips the stale-quote check
             (_fresh_bids, _position_sale_value): only for the walk's count of
             trims it held back, which changes nothing.
+        volume_cap (bool): Keyword-only. False skips the volume cap on the
+            sale ladders (_position_sale_value): likewise only for the walk's
+            count of trims the cap cut or held back.
 
     Returns:
         tuple[KellyTrim, tuple | None]: (the decision; its sale as (how many
@@ -5335,7 +5339,8 @@ def _kelly_trim(position: list[BacktestTrade], day: date, portfolio_value: float
     def net_sale(pairs: int) -> float | None:
         """What selling `pairs` contract pairs returns after fees; None when it cannot be sold."""
         sold = _last_bought_first(position, pairs)
-        valued = _position_sale_value(position, day, sold=sold, stale_check=stale_check)
+        valued = _position_sale_value(position, day, sold=sold, stale_check=stale_check,
+                                      volume_cap=volume_cap)
         # None: the bids hold fewer. A leg with no sale price has paid out,
         # so there is no pair left to sell
         if valued is None or any(None in sale[2] for sale in valued[0]):
@@ -8821,6 +8826,7 @@ def _project_candles(candles: list[dict], *, window_open: int | None = None,
 
 def _fetch_projected_candles(hist_client: Any, ticker: str, open_ts: int, close_ts: int,
                              use_cache: bool, *, check_out: dict | None = None,
+                             anomaly_out: dict | None = None,
                              market_open: int | None = None,
                              **endpoint: Any) -> list[dict]:
     """
@@ -8840,6 +8846,11 @@ def _fetch_projected_candles(hist_client: Any, ticker: str, open_ts: int, close_
             low and close) before they are cut, and a ticker with failures is
             entered as check_out[ticker] = (failure count, up to
             INTEGRITY_MAX_EXAMPLES sentences). Each worker writes its own key.
+            A data anomaly in Kalshi's own records (a candle whose close bid
+            sits above its close ask, market_details.ANOMALY_NAMES) is not a
+            failure and is never entered here.
+        anomaly_out (dict | None): Keyword-only. With check_out, a ticker with
+            data anomalies is entered here the same way (count, examples).
         market_open (int | None): Keyword-only. The market's open_time, Unix
             seconds (None: unknown), for _project_candles' moved times.
         **endpoint: The series and live_first keywords for fetch_candlesticks, when any.
@@ -8850,9 +8861,13 @@ def _fetch_projected_candles(hist_client: Any, ticker: str, open_ts: int, close_
     """
     full = fetch_candlesticks(hist_client, ticker, open_ts, close_ts, use_cache, **endpoint)
     if check_out is not None:
-        failures = market_details.check_candles(full, ticker=ticker)
+        # A crossed close is Kalshi's own data, not a bad parse: kept apart
+        failures, anomalies = market_details.split_candle_findings(
+            market_details.check_candles(full, ticker=ticker))
         if failures:
             check_out[ticker] = (len(failures), failures[:INTEGRITY_MAX_EXAMPLES])
+        if anomalies and anomaly_out is not None:
+            anomaly_out[ticker] = (len(anomalies), anomalies[:INTEGRITY_MAX_EXAMPLES])
     return _project_candles(full, window_open=open_ts, market_open=market_open)
 
 
@@ -8864,6 +8879,7 @@ def _fetch_candles_parallel(
     *,
     cutoff_ts: int | None = None,
     check_out: dict | None = None,
+    anomaly_out: dict | None = None,
 ) -> dict[str, list[dict]]:
     """
     Fetch the hourly candlestick series for every needed ticker, in parallel.
@@ -8929,6 +8945,8 @@ def _fetch_candles_parallel(
             its ticker's full candle records before cutting them
             (_fetch_projected_candles) and enters the failures here. Nothing
             else changes: the candles returned are the same either way.
+        anomaly_out (dict | None): Keyword-only. With check_out, the tickers
+            whose records hold a data anomaly (_fetch_projected_candles).
 
     Returns:
         dict[str, list[dict]]: Ticker -> candle list (keys: ts, yes_ask_close,
@@ -9000,7 +9018,7 @@ def _fetch_candles_parallel(
             futures = {
                 pool.submit(_fetch_projected_candles, hist_client, ticker,
                             open_ts, close_ts, use_cache, check_out=check_out,
-                            **endpoint): ticker
+                            anomaly_out=anomaly_out, **endpoint): ticker
                 for ticker, open_ts, close_ts, endpoint in work
             }
             done = 0
@@ -9756,6 +9774,7 @@ def _log_extra_data(
     pair_count: int,
     summaries: dict[str, dict],
     candle_failures: dict[str, tuple[int, list[str]]],
+    candle_anomalies: dict[str, tuple[int, list[str]]] | None = None,
 ) -> None:
     """
     Report what the side data covers and what its integrity checks found.
@@ -9768,12 +9787,17 @@ def _log_extra_data(
     with failures is followed by up to INTEGRITY_MAX_EXAMPLES example sentences.
     The candle check counts markets (a market is one failure however many of
     its hours fail); the others count the markets whose summary names them.
+    Data anomalies in Kalshi's own records (market_details.ANOMALY_NAMES: a
+    candle whose close bid sits above its close ask) are not failures: each
+    has one INFO line of its own, always logged, counting markets and hours,
+    with up to INTEGRITY_MAX_EXAMPLES examples.
 
     Args:
         full_stats (dict): load_market_details' stats for the pair markets.
         pair_count (int): How many pair markets there are.
         summaries (dict[str, dict]): _audit_pair_markets' result.
         candle_failures (dict): _fetch_candles_parallel's check_out.
+        candle_anomalies (dict | None): Its anomaly_out; None reads as none.
     """
     logging.info(
         "Market details: full records for %d of %d pair markets (%d from the cache)",
@@ -9807,6 +9831,14 @@ def _log_extra_data(
                      name, len(failing[name]))
         for sentence in failing[name][:INTEGRITY_MAX_EXAMPLES]:
             logging.info("  %s", sentence)
+    anomalies = candle_anomalies or {}
+    for name in market_details.ANOMALY_NAMES:
+        found = [anomalies[t] for t in sorted(anomalies)]
+        logging.info("Data anomaly %s in Kalshi's candles of the pair markets "
+                     "(reported, not a failure): %d markets, %d hours",
+                     name, len(found), sum(count for count, _ in found))
+        for _, examples in found[:INTEGRITY_MAX_EXAMPLES]:
+            logging.info("  %s", examples[0])
 
 
 def _write_scheduled_close(m: dict, timing: tuple | None, rules: dict) -> int | None:
@@ -10356,10 +10388,11 @@ def _prepare_candidates(
     # The candle worker also checks each ticker's full record (the order of each
     # hour's open, high, low and close); the failures come back through here
     candle_failures: dict = {}
+    candle_anomalies: dict = {}
     candles_by_ticker = _fetch_candles_parallel(
         hist_client, needed_tickers, start_date, use_cache,
         cutoff_ts=None if cutoff is None else int(cutoff.timestamp()),
-        check_out=candle_failures,
+        check_out=candle_failures, anomaly_out=candle_anomalies,
     )
 
     logging.info("Candlestick fetch complete.")
@@ -10374,7 +10407,8 @@ def _prepare_candidates(
     trades_cutoff = None if hist_client is None else market_details.read_trades_cutoff(hist_client)
     trade_summaries = _audit_pair_markets(
         hist_client, needed_tickers, details, candles_by_ticker, trades_cutoff)
-    _log_extra_data(full_stats, len(needed_tickers), trade_summaries, candle_failures)
+    _log_extra_data(full_stats, len(needed_tickers), trade_summaries, candle_failures,
+                    candle_anomalies)
     _log_rss("after the side-data loads")
 
     # Each pair market's scheduled close on its record, or none (switch off,
@@ -12220,7 +12254,7 @@ def _simulate_at_discount(
     volume_on = next((c["marks"][0].volume_share for c in candidates
                       if c["marks"] is not None and c["marks"][0].volume_share is not None),
                      None)
-    volume_cut = volume_not_made = volume_sales = 0
+    volume_cut = volume_not_made = volume_sales = volume_trims = 0
     # Selling of either kind visits every checkpoint, and needs each trade's pair
     selling = sell_level is not None or trimming
     # The live code's market objects, built once per record (_candidate_pair),
@@ -12438,7 +12472,7 @@ def _simulate_at_discount(
             list: (position, its sale) for each position that sells something
                 (_kelly_trim); empty when none does.
         """
-        nonlocal trim_floor, held_back, pairs_waiting, stale_trims
+        nonlocal trim_floor, held_back, pairs_waiting, stale_trims, volume_trims
         planned = []
         for position in _positions(open_now):
             # Skip a pair that traded too recently (config.kelly_trim_rested)
@@ -12463,6 +12497,13 @@ def _simulate_at_discount(
                 # Trimmed with the stale-quote check skipped: the check held
                 # it back (counting only; the decision above stands)
                 stale_trims += 1
+            if volume_on is not None and _volume_capped_leg(position, d):
+                # Sells more with the volume cap skipped: the cap cut the trim
+                # or held it back (counting only; the decision above stands)
+                free = _kelly_trim(position, d, value, effective_k, cap, st_cap,
+                                   volume_cap=False)[1]
+                if free is not None and sum(free[0]) > (0 if sale is None else sum(sale[0])):
+                    volume_trims += 1
             if sale is not None:
                 planned.append((position, sale))
                 # One entry per trim made, since every plan is carried out.
@@ -12905,6 +12946,12 @@ def _simulate_at_discount(
             logging.DEBUG if quiet else logging.INFO,
             "Sales held back by the volume cap (%s): %d",
             run_label, volume_sales,
+        )
+    if volume_trims:
+        logging.log(
+            logging.DEBUG if quiet else logging.INFO,
+            "Kelly trims cut or held back by the volume cap (%s): %d",
+            run_label, volume_trims,
         )
     if stale_trims:
         logging.log(

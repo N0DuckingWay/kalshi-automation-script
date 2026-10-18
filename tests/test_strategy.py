@@ -4072,15 +4072,16 @@ class TestTimeSeriesKellyParity:
         # sized on (the one checkpoint_value assignment)
         walk = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                     and node.name == "_simulate_at_discount")
-        [decided, counted] = _calls_to(walk, "_kelly_trim")
+        [decided, counted, capped] = _calls_to(walk, "_kelly_trim")
         assert [ast.unparse(arg) for arg in decided.args] == [
             "position", "d", "value", "effective_k", "cap", "st_cap"] and not decided.keywords
         # The second call only counts the trims the stale-quote check held
-        # back (C6): the same arguments with the check skipped, read for
-        # nothing but that count
-        assert [ast.unparse(arg) for arg in counted.args] == [
-            ast.unparse(arg) for arg in decided.args]
-        assert [ast.unparse(kw) for kw in counted.keywords] == ["stale_check=False"]
+        # back, and the third those the volume cap cut or held back: the same
+        # arguments with that one check skipped, read for nothing but the count
+        for call, skipped in ((counted, "stale_check=False"), (capped, "volume_cap=False")):
+            assert [ast.unparse(arg) for arg in call.args] == [
+                ast.unparse(arg) for arg in decided.args]
+            assert [ast.unparse(kw) for kw in call.keywords] == [skipped]
         plans = _calls_to(walk, "planned_trims")
         assert sorted(ast.unparse(call) for call in plans) == [
             "planned_trims(d, value, open_now)",
@@ -4161,9 +4162,9 @@ class TestTimeSeriesKellyParity:
                     and node.name == "planned_trims")
         [measured] = _calls_to(plan, "_price_rise")
         [tested] = _calls_to(plan, "trim_rise_reached")
-        # The decision; the call after it (stale_check=False) only counts
-        # the trims the stale-quote check held back
-        decided, _counted = _calls_to(plan, "_kelly_trim")
+        # The decision; the calls after it (stale_check=False,
+        # volume_cap=False) only count the trims those checks held back
+        decided, *_counted = _calls_to(plan, "_kelly_trim")
         assert measured.lineno < tested.lineno < decided.lineno
         assert [ast.unparse(arg) for arg in measured.args] == ["position", "d", "last_trim"]
         assert [ast.unparse(arg) for arg in tested.args] == ["rise", "min_rise"]
@@ -4218,7 +4219,7 @@ class TestTimeSeriesKellyParity:
         # counted on no other line and adds nothing to cap_free_from
         [measured] = _calls_to(plan, "_price_rise")
         [tested] = _calls_to(plan, "trim_rise_reached")
-        decided, _counted = _calls_to(plan, "_kelly_trim")
+        decided, *_counted = _calls_to(plan, "_kelly_trim")
         assert gate.lineno < gate.end_lineno < measured.lineno < tested.lineno < decided.lineno
         # Only the walk asks the rule. It needs no config.trade_day: its
         # checkpoints are already dates

@@ -5600,7 +5600,47 @@ class TestCandleEndpointRouting:
                                        True, None)
         # The cutoff routes each ticker; check_out is the dict the candle worker
         # fills with the open/high/low/close order failures (market_details)
-        assert seen == {"cutoff_ts": self.CUTOFF, "check_out": {}}
+        assert seen == {"cutoff_ts": self.CUTOFF, "check_out": {}, "anomaly_out": {}}
+
+
+class TestCandleAnomaliesAreKeptApart:
+    """A crossed close (the bid above the ask in Kalshi's own candle) is a data
+    anomaly, reported on a line of its own and never as an integrity failure."""
+
+    @staticmethod
+    def _full(crossed: bool) -> list[dict]:
+        bid = 0.55 if crossed else 0.45
+        return [{"ts": 7_200, "yes_ask_close": 0.50, "no_ask_close": 1 - bid, "volume": 1.0,
+                 "yes_ask_ohl": (0.50, 0.50, 0.50), "yes_bid_ohl": (bid, bid, bid),
+                 "yes_bid_close": bid, "price": None, "open_interest": None}]
+
+    @pytest.mark.parametrize("crossed", [True, False])
+    def test_the_worker_files_a_crossed_close_as_an_anomaly(self, monkeypatch, crossed):
+        monkeypatch.setattr(backtester, "fetch_candlesticks",
+                            lambda *a, **k: self._full(crossed))
+        failures, anomalies = {}, {}
+        backtester._fetch_projected_candles(MagicMock(), "T", 0, 10_000, True,
+                                            check_out=failures, anomaly_out=anomalies)
+        assert failures == {}
+        if crossed:
+            (count, examples), = anomalies.values()
+            assert count == 1 and examples[0].startswith("candle_crossed: ")
+        else:
+            assert anomalies == {}
+
+    def test_the_log_counts_anomalies_apart_from_failures(self, caplog):
+        anomalies = {"T": (3, ["candle_crossed: T example"])}
+        with caplog.at_level(logging.INFO):
+            backtester._log_extra_data({}, 1, {}, {}, anomalies)
+        assert ("Data anomaly candle_crossed in Kalshi's candles of the pair markets "
+                "(reported, not a failure): 1 markets, 3 hours") in caplog.messages
+        assert "  candle_crossed: T example" in caplog.messages
+        assert all(not m.endswith("failing") or m.endswith(": 0 failing")
+                   for m in caplog.messages if m.startswith("Integrity check"))
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            backtester._log_extra_data({}, 1, {}, {})
+        assert any(m.endswith("0 markets, 0 hours") for m in caplog.messages)
 
 
 class TestLogRss:
@@ -25566,6 +25606,27 @@ class TestVolumeCapSalesAndTrims:
         point = TestTrimToKelly()._sim(records, trim_to_kelly=True)
         (cut,) = [t for t in point.trades if t.sold and t.exit_date == _LADDER_M2]
         assert 0 < cut.n <= cap < first.n
+
+    _TRIM_LINE = "Kelly trims cut or held back by the volume cap ("
+
+    def test_a_trim_the_cap_cuts_is_counted(self, caplog):
+        free = TestTrimToKelly()._sim(
+            _capped_attached([self._SUITE._record()], self._candles({}), share=None),
+            trim_to_kelly=True)
+        (first,) = [t for t in free.trades if t.sold and t.exit_date == _LADDER_M2]
+        records = _capped_attached([self._SUITE._record()],
+                                   self._candles({_LADDER_M2: 10 * (first.n // 2)}))
+        with caplog.at_level(logging.INFO):
+            TestTrimToKelly()._sim(records, trim_to_kelly=True)
+        counted = [m for m in caplog.messages if m.startswith(self._TRIM_LINE)]
+        assert len(counted) == 1 and counted[0].endswith("): 1")
+
+    def test_no_count_when_the_cap_leaves_the_trim_whole_or_is_off(self, caplog):
+        for share in (_SHARE, None):
+            records = _capped_attached([self._SUITE._record()], self._candles({}), share=share)
+            with caplog.at_level(logging.INFO):
+                TestTrimToKelly()._sim(records, trim_to_kelly=True)
+        assert self._TRIM_LINE not in caplog.text
 
 
 class TestVolumeCapSwitch:
