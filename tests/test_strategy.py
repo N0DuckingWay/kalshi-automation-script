@@ -2903,8 +2903,10 @@ class TestTimeSeriesKellyParity:
         # Sortino, and nothing on the live trading path imports it; nor does
         # anything import live_dashboard, which serves that tab and imports
         # live_portfolio
+        # eda is reporting only (the backtest's Data page): khat_view imports
+        # backtester and dashboard inside the function, and nothing imports eda
         band_readers = {"config", "backtester", "backtest", "dashboard", "live_portfolio",
-                        "live_dashboard"}
+                        "live_dashboard", "eda"}
         names = {m.name for m in pkgutil.iter_modules(kalshi_betting.__path__)}
         # A rename must fail here, not silently shrink the allowlist
         assert band_readers <= names, band_readers - names
@@ -3470,8 +3472,10 @@ class TestTimeSeriesKellyParity:
         # live_portfolio (the Live trading tab) and live_dashboard (which serves
         # it) are left out of the live-path walk, since live_portfolio reads the
         # backtest page's ratios, so they are checked here: neither has any use
-        # for the live defaults, so neither names their readers either
-        from kalshi_betting import backtest, live_dashboard, live_portfolio
+        # for the live defaults, so neither names their readers either; eda
+        # (the backtest's Data page, which reads the backtest's own k-hat
+        # observations) is checked the same way
+        from kalshi_betting import backtest, eda, live_dashboard, live_portfolio
 
         writes = {"save_live_defaults", "_saved_text", "_sync_directory"}
         names = writes | self._SAVED_FILE_INTERNALS
@@ -3480,7 +3484,8 @@ class TestTimeSeriesKellyParity:
         for name in names | readers:
             assert hasattr(config, name), name
         forbidden_in = {backtester: names, backtest: names, dashboard: names,
-                        live_portfolio: names | readers, live_dashboard: names | readers}
+                        live_portfolio: names | readers, live_dashboard: names | readers,
+                        eda: names | readers}
         for module, forbidden in forbidden_in.items():
             mod = module.__name__.rsplit(".", 1)[-1]
             for node in ast.walk(ast.parse(inspect.getsource(module))):

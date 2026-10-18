@@ -232,6 +232,8 @@ CACHE_DIR = PROJECT_ROOT / "backtest_cache"
 # the plain-JSON "candlesticks" folder an older checkout still reads and writes, so
 # the two never refetch over each other; nothing here ever reads or writes that one.
 _CANDLES_DIR = CACHE_DIR / "candlesticks_v3"
+# A candle file's name is "<ticker>" plus this (eda.py lists the folder by it)
+_CANDLE_FILE_SUFFIX = ".json.gz"
 # Maps event_ticker → event_title, populated lazily by _load_or_build_event_titles
 # so the backtester can construct the same (event_title + market_title) grouping
 # key the live scanner uses. The "_v2" file holds GENUINE answers only; the
@@ -6994,7 +6996,7 @@ def fetch_candlesticks(
             one request of a paged window.
     """
     _CANDLES_DIR.mkdir(parents=True, exist_ok=True)
-    cache_path = _CANDLES_DIR / f"{ticker}.json.gz"
+    cache_path = _CANDLES_DIR / f"{ticker}{_CANDLE_FILE_SUFFIX}"
     if use_cache:
         # Guarded loader: absent OR corrupt (a truncated file from an
         # interrupted run) both read back as None, so a damaged cache falls

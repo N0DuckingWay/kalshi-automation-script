@@ -19,7 +19,7 @@ Dependencies:
     outside the pipeline's import graph: the verification CLI (see
     CLAUDE.md's pipeline-isolation rule), defaults_server.py, the local pages
     that save the live defaults and start live trading runs with them, and
-    live_dashboard.py, the read-only local server of the dashboard's two tabs.
+    live_dashboard.py, the read-only local server of the dashboard's three tabs.
 
 Notes:
     PROJECT_ROOT is derived from __file__ so the package works correctly on any
@@ -806,6 +806,85 @@ DASHBOARD_FILENAME = "backtest_dashboard.html"
 # deletes the folders of earlier builds when it replaces the page.
 DASHBOARD_FILES_DIRNAME = "backtest_dashboard_files"
 
+# ─── Exploratory data summaries (eda.py; reporting only) ──────────────────────
+# Nothing that trades, sizes or backtests reads any of these; eda.py reads all
+# of them (backtest.py reads EDA_MAX_WORKERS too, to cap the Data page's workers).
+# The exploratory Data page eda.build_eda_page writes under PROJECT_ROOT, beside
+# DASHBOARD_FILENAME: each backtest rebuilds it after its own page (unless
+# --no-eda), `python3 -m kalshi_betting.eda` rebuilds it from the cache without
+# a backtest, and the live dashboard serves it at /eda/ as its Data tab. Read at
+# call time.
+EDA_DASHBOARD_FILENAME = "eda_dashboard.html"
+# The folder under backtest_cache/ where each day slice's small summary is kept
+# (<this folder>/archive/<day>.json and <this folder>/live/<day>.json), so a
+# later run reads only the slices that are new or changed.
+EDA_SUMMARY_DIRNAME = "eda_days"
+# Bump when a summary gains or changes a field: every summary is then rebuilt.
+EDA_SUMMARY_VERSION = 2
+# The most worker processes the summaries are built in; each reads one slice
+# at a time, so memory grows with this number only by the record in hand,
+# besides what each worker imports (a worker started from a backtest also
+# imports backtest.py's modules, pandas and plotly among them). A backtest
+# uses the lower of this and its own --sell-workers count.
+EDA_MAX_WORKERS = 4
+# How long to wait for the first worker process to answer before counting
+# every slice in the calling process instead (a worker that cannot start, for
+# example because the calling script lacks an `if __name__ == "__main__":`
+# guard, would otherwise be waited on for ever).
+EDA_WORKER_START_TIMEOUT_SECONDS = 120
+# The longest the worker processes may take to summarise the day slices,
+# counted from when they are started. Past it they are stopped, one WARNING
+# says so, and every slice not yet summarised is named unreadable ("not
+# summarised in time"): nothing is saved for it, so the next build reads it
+# again. Every backtest reaches this build, so it must never wait for ever.
+# A first build of a full cache took about 10 minutes.
+EDA_BUILD_DEADLINE_SECONDS = 3600
+# How many newly summarised day slices between two progress lines in the log.
+EDA_PROGRESS_EVERY_SLICES = 100
+# Bucket edges, in hours, for a market's lifetime (close minus open). A
+# lifetime falls in the first bucket below the first edge, in the last at or
+# above the last edge, and otherwise in [edge, next edge).
+EDA_LIFETIME_EDGES_HOURS = (1, 6, 24, 72, 168, 720)
+# Bucket edges, in hours, for the settlement lag (settlement minus close). The
+# first edge is 0, so the first bucket holds the markets settled BEFORE their
+# listed close (an event decided early).
+EDA_LAG_EDGES_HOURS = (0, 1, 6, 24, 72, 168)
+# Width, in dollars, of the price bins of the calibration chart: a market's
+# midpoint price a set time before close is filed in the bin that holds it,
+# and each bin reports how many markets it holds and how many settled Yes.
+EDA_CALIBRATION_BIN = 0.05
+# How many hours before a market's close its price is read for the calibration
+# chart: the last hourly candle that ended at or before close minus this.
+EDA_PRICE_LEADS_HOURS = (1, 24, 168)
+# A candle price counts for a lead only when its candle ended no more than this
+# many hours before the moment the lead names (close minus the lead); an older
+# last candle gives no price at that lead (the market had gone quiet).
+EDA_PRICE_MAX_AGE_HOURS = 24
+# Bump when the per-file candle facts (<cache>/eda_days/candles.json) change
+# shape or meaning: only the candle files are read again, never the day slices.
+# Version 2 facts carry a per-lead "wide" flag and keep no price for a book
+# wider than EDA_MAX_BOOK_WIDTH.
+EDA_CANDLE_FACTS_VERSION = 2
+# A candle's price counts for the calibration only where its book was at most
+# this wide (dollars): the YES ask minus the YES bid, a missing bid counting as
+# a bid of 0. A book with an ask and no bid says only that nobody sold below
+# the ask, not that the market agreed on a price, so such a price would pull
+# the favourites' calibration down (a 99c ask with no bid settled Yes far less
+# often than a 99c ask with a bid).
+EDA_MAX_BOOK_WIDTH = 0.10
+# A point of a time series on the Data page (a category's share settled Yes in
+# one month) is drawn only when it holds at least this many markets, so a few
+# markets do not make a 0% or 100% spike.
+EDA_MIN_MARKETS_PER_POINT = 30
+# Width, in dollars, of the mid-spread bins of the k view: a deadline pair's
+# mid spread at entry is filed in the bin that holds it, and each bin reports
+# how often such pairs settled in between.
+EDA_KHAT_SPREAD_BIN = 0.05
+# Bump when the saved k view (<cache>/eda_days/khat.json) changes shape: a file
+# with another version, or none, is not shown (the page says no backtest has
+# saved its k figures until one does).
+EDA_KHAT_VERSION = 1
+
 # A build folder under DASHBOARD_FILES_DIRNAME still marked as being written
 # (its ".writing" file) is left alone while the mark is younger than this many
 # seconds — another backtest may be building its page at the same time — and
@@ -1018,7 +1097,8 @@ LIVE_DASHBOARD_FILE_BLOCK_BYTES = 1_048_576
 
 # The chart library the Live tab loads: the same Plotly build the backtest
 # page loads, and its integrity hash (the sha384 of that file, so the browser
-# runs it only when it is exactly that file).
+# runs it only when it is exactly that file). The Data page (eda.py) loads the
+# same copy.
 LIVE_DASHBOARD_PLOTLY_URL = "https://cdn.plot.ly/plotly-2.30.0.min.js"
 LIVE_DASHBOARD_PLOTLY_SRI = "sha384-H7GB7Kme/VbPI/0S4LNq7OixFNVRgRGE8kyqTntBuiXle1KBm8KWLQh/Ah6bXCYW"
 

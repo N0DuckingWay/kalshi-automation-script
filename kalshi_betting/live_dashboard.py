@@ -4,13 +4,16 @@ Author: Zachary Hoffman
 Last edited by: Zachary Hoffman
 
 Purpose:
-    Serves the dashboard's two tabs on this computer. 127.0.0.1:8766
+    Serves the dashboard's three tabs on this computer. 127.0.0.1:8766
     (config.LIVE_DASHBOARD_PORT) serves the tab page and the Live trading
     tab's data: GET /api/live reads the account from Kalshi through
     live_portfolio on every load and answers everything the tab shows, as
     JSON (payload). 127.0.0.1:8767 (config.LIVE_BACKTEST_PORT) serves the
-    backtest page, unchanged, with the chunk files beside it; the Backtest
-    tab loads it in a frame the first time the tab is chosen. Run it with
+    backtest page, unchanged, with the chunk files beside it, and the Data
+    page (config.EDA_DASHBOARD_FILENAME, written by eda.py after each
+    backtest or by `python3 -m kalshi_betting.eda`); the Backtest and Data
+    tabs each load their page in a frame the first time the tab is chosen.
+    Run it with
 
         python3 -m kalshi_betting.live_dashboard [--no-browser]
 
@@ -25,7 +28,7 @@ Purpose:
 Dependencies:
     config (the LIVE_DASHBOARD_* and LIVE_BACKTEST_PORT settings, the Plotly
     build and its hash, PROJECT_ROOT, DASHBOARD_FILENAME,
-    DASHBOARD_FILES_DIRNAME, LIVE_DASHBOARD_PERIODS, LIVE_CANDLE_DAY_ZONE,
+    DASHBOARD_FILES_DIRNAME, EDA_DASHBOARD_FILENAME, LIVE_DASHBOARD_PERIODS, LIVE_CANDLE_DAY_ZONE,
     RISK_FREE_BILL_TERM, count_text); live_portfolio (build_live_view,
     append_snapshot, trade_log_paths, OTHER_BETS and the view's types);
     historical (build_prod_live_client, the production client, built on the
@@ -34,7 +37,8 @@ Dependencies:
     Sharpe and Sortino ratios subtract; RiskFreeRates and SOURCE_CACHE);
     _http (api_error_summary, the one-line description of a failed read).
     Nothing imports this module: a person runs it, or start_dashboard.sh
-    starts it as a process of its own.
+    starts it as a process of its own. It does not import eda: it only
+    serves the file eda writes.
 
 Notes:
     Read-only: it sends Kalshi read-only requests only (through
@@ -46,11 +50,12 @@ Notes:
     browser, a same-origin request, and the tab page itself is refused when
     another web site sent the browser to it, so no other web page can make
     it read the account. Its own Kalshi client refuses every method but GET.
-    The backtest page is served from the second port, a different web
-    origin, so its scripts (and the chart library it loads from the web)
-    cannot read the account data; it may be framed only by the tab page,
-    in a sandboxed frame that cannot navigate the tab page, and no other
-    web site may load it or its chunk files except by navigating to it.
+    The backtest page and the Data page are served from the second port, a
+    different web origin, so their scripts (and the chart library they load
+    from the web) cannot read the account data; each may be framed only by
+    the tab page, in a sandboxed frame that cannot navigate the tab page,
+    and no other web site may load them or the chunk files except by
+    navigating to them.
 
     Every number and sentence the page shows is formatted here (payload);
     the page's script only places them. One read of the account runs at a
@@ -1154,6 +1159,8 @@ _JS_TYPE = "text/javascript; charset=utf-8"
 _PAGE_ORIGIN = f"http://{config.LIVE_DASHBOARD_HOST}:{config.LIVE_DASHBOARD_PORT}"
 _BACKTEST_ORIGIN = f"http://{config.LIVE_DASHBOARD_HOST}:{config.LIVE_BACKTEST_PORT}"
 BACKTEST_URL = f"{_BACKTEST_ORIGIN}/backtest/"
+# The Data tab's page, on the backtest page's port (the same origin and rules)
+DATA_URL = f"{_BACKTEST_ORIGIN}/eda/"
 
 # Every answer on the tab page's port that is not the page itself: never
 # stored, never sniffed, never framed, never loaded by another origin's page,
@@ -1349,12 +1356,13 @@ def _no_reader() -> Any:
 
 class BacktestApp:
     """
-    127.0.0.1:8767: the backtest page and its chunk files, for the Backtest tab only.
+    127.0.0.1:8767: the backtest page and its chunk files, and the Data page, for the Backtest and Data tabs only.
 
     It serves config.DASHBOARD_FILENAME from config.PROJECT_ROOT (read when
-    called) at /backtest/, and the .js files under
+    called) at /backtest/, the .js files under
     config.DASHBOARD_FILES_DIRNAME beside it, which the page loads by
-    relative address. Every answer may be framed only by the tab page.
+    relative address, and config.EDA_DASHBOARD_FILENAME at /eda/. Every
+    answer may be framed only by the tab page.
     """
 
     def __init__(self, port: int | None = None) -> None:
@@ -1381,8 +1389,9 @@ class BacktestApp:
         origin. "/backtest" is sent on to "/backtest/" (308), since the
         page's chunk addresses are relative to it; "/backtest/" is the page,
         or a short page saying there is none yet; "/backtest/<the files
-        folder>/..." is a chunk file (_sidecar). Anything else is 404. A
-        file answers If-None-Match (its ETag) and If-Modified-Since with 304
+        folder>/..." is a chunk file (_sidecar). "/eda" is sent on to
+        "/eda/" (308) and "/eda/" is the Data page, or a short page saying
+        there is none yet. Anything else is 404. A file answers If-None-Match (its ETag) and If-Modified-Since with 304
         when it has not changed.
 
         Args:
@@ -1417,6 +1426,14 @@ class BacktestApp:
             if target is None:
                 return self.not_found()
             return _file(target, _JS_TYPE, request)
+        if path == "/eda":
+            return _Response(308, "See /eda/\n", _TEXT_TYPE,
+                             _FRAMED_HEADERS + (("Location", "/eda/"),))
+        if path == "/eda/":
+            page = config.PROJECT_ROOT / config.EDA_DASHBOARD_FILENAME
+            if not page.is_file():
+                return _Response(200, _NO_DATA_HTML, _HTML_TYPE, _FRAMED_HEADERS)
+            return _file(page, _HTML_TYPE, request)
         return self.not_found()
 
     def not_found(self) -> _Response:
@@ -1539,6 +1556,13 @@ _NO_BACKTEST_HTML = (
     'padding:24px"><p>There is no backtest dashboard yet. Build one with <code>python3 -m '
     "kalshi_betting.backtest</code>, then choose the Backtest tab again.</p></body></html>")
 
+_NO_DATA_HTML = (
+    '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>No Data page yet</title>'
+    f'</head><body style="font-family:{escape(_FONT)};color:{_INK};background:{_PLANE};'
+    'padding:24px"><p>There is no Data page yet. It is built at the end of each backtest '
+    "(<code>python3 -m kalshi_betting.backtest</code>), or on its own with <code>python3 -m "
+    "kalshi_betting.eda</code>; then choose the Data tab again.</p></body></html>")
+
 
 # ---- the tab page ---------------------------------------------------------------
 
@@ -1555,6 +1579,7 @@ _SCRIPT_TEMPLATE = """
 (function () {
   'use strict';
   var BACKTEST_URL = __BACKTEST_URL__;
+  var DATA_URL = __DATA_URL__;
   var TEXT = __TEXT__;
   var HEADERS = __HEADERS__;
   var PERIODS = __PERIODS__;
@@ -1562,7 +1587,8 @@ _SCRIPT_TEMPLATE = """
   var CHART_CONFIG = __CHART_CONFIG__;
   var DATA = null;
   var CHOSEN = 0;
-  var OPENED = false;
+  var FRAMES = {backtest: ['backtest-frame', BACKTEST_URL], data: ['data-frame', DATA_URL]};
+  var OPENED = {};
   var LOADING = false;
 
   function byId(id) { return document.getElementById(id); }
@@ -1693,15 +1719,15 @@ _SCRIPT_TEMPLATE = """
   }
 
   function tab(name) {
-    var live = name === 'live';
-    byId('tab-live').setAttribute('aria-selected', live ? 'true' : 'false');
-    byId('tab-backtest').setAttribute('aria-selected', live ? 'false' : 'true');
-    byId('panel-live').hidden = !live;
-    byId('panel-backtest').hidden = live;
-    if (!live && !OPENED) {
-      byId('backtest-frame').src = BACKTEST_URL;
-      OPENED = true;
+    ['live', 'backtest', 'data'].forEach(function (t) {
+      byId('tab-' + t).setAttribute('aria-selected', t === name ? 'true' : 'false');
+      byId('panel-' + t).hidden = t !== name;
+    });
+    if (FRAMES[name] && !OPENED[name]) {
+      byId(FRAMES[name][0]).src = FRAMES[name][1];
+      OPENED[name] = true;
     }
+    var live = name === 'live';
     var P = charts();
     if (live && P && DATA) {
       if (DATA.area) { P.Plots.resize(byId('live-area')); }
@@ -1711,6 +1737,7 @@ _SCRIPT_TEMPLATE = """
 
   byId('tab-live').addEventListener('click', function () { tab('live'); });
   byId('tab-backtest').addEventListener('click', function () { tab('backtest'); });
+  byId('tab-data').addEventListener('click', function () { tab('data'); });
   byId('live-refresh').addEventListener('click', load);
   for (var k = 0; k < PERIODS; k++) {
     (function (i) {
@@ -1732,6 +1759,7 @@ def _script() -> str:
     """
     values = {
         "__BACKTEST_URL__": json.dumps(BACKTEST_URL),
+        "__DATA_URL__": json.dumps(DATA_URL),
         "__TEXT__": json.dumps(_SCRIPT_TEXT, ensure_ascii=False),
         "__HEADERS__": json.dumps({config.LIVE_DASHBOARD_REQUEST_HEADER: "1"}),
         "__PERIODS__": str(len(config.LIVE_DASHBOARD_PERIODS)),
@@ -1748,8 +1776,9 @@ _SCRIPT = _script()
 _SCRIPT_HASH = "sha256-" + b64encode(hashlib.sha256(_SCRIPT.encode("utf-8")).digest()).decode()
 
 # The page's Content-Security-Policy: its own script (by hash) and the one
-# Plotly file, no other script; its own data only; the backtest page as its
-# only frame; Plotly's PNG download (data: and blob: images)
+# Plotly file, no other script; its own data only; the backtest port's pages
+# (the backtest page and the Data page) as its only frames; Plotly's PNG
+# download (data: and blob: images)
 _PAGE_CSP = (f"default-src 'none'; script-src {config.LIVE_DASHBOARD_PLOTLY_URL} "
              f"'{_SCRIPT_HASH}'; style-src 'unsafe-inline'; connect-src 'self'; "
              f"frame-src {_BACKTEST_ORIGIN}; img-src data: blob:; base-uri 'none'; "
@@ -1821,7 +1850,7 @@ summary {{ color: var(--ink-2); cursor: pointer; }}
 .notes li {{ color: var(--ink-2); margin: 4px 0; }}
 .warnings li {{ color: var(--down); margin: 4px 0; }}
 .empty {{ color: var(--ink-2); font-size: 15px; }}
-#panel-backtest iframe {{ display: block; width: 100%; height: calc(100vh - 48px); border: 0;
+#panel-backtest iframe, #panel-data iframe {{ display: block; width: 100%; height: calc(100vh - 48px); border: 0;
   background: var(--surface); }}
 """
 
@@ -1833,10 +1862,15 @@ summary {{ color: var(--ink-2); cursor: pointer; }}
 _FRAME_SANDBOX = ("allow-scripts allow-same-origin allow-popups "
                   "allow-popups-to-escape-sandbox allow-downloads")
 
+# What the Data page may do in its frame: only what its charts need (its
+# script and Plotly, in its own origin, and a chart's picture saved). It
+# opens no window, so it gets no pop-up permission
+_DATA_FRAME_SANDBOX = "allow-scripts allow-same-origin allow-downloads"
+
 
 def _shell() -> str:
     """
-    The tab page: the two tabs, the Live trading panel's places, the backtest frame and the script.
+    The tab page: the three tabs, the Live trading panel's places, the backtest and Data frames and the script.
 
     Built once, from config: the period buttons from
     config.LIVE_DASHBOARD_PERIODS, the cards from CARD_LABELS, the Plotly
@@ -1869,6 +1903,7 @@ def _shell() -> str:
 <div class="tabs" role="tablist">
 <button type="button" id="tab-live" role="tab" aria-selected="true" aria-controls="panel-live">Live trading</button>
 <button type="button" id="tab-backtest" role="tab" aria-selected="false" aria-controls="panel-backtest">Backtest</button>
+<button type="button" id="tab-data" role="tab" aria-selected="false" aria-controls="panel-data">Data</button>
 </div>
 <section id="panel-live" role="tabpanel" aria-labelledby="tab-live">
 <div class="head"><h1>Live trading</h1><span id="live-status" class="status">{escape(_SCRIPT_TEXT["loading"])}</span>
@@ -1895,6 +1930,9 @@ def _shell() -> str:
 </section>
 <section id="panel-backtest" role="tabpanel" aria-labelledby="tab-backtest" hidden>
 <iframe id="backtest-frame" title="Backtest dashboard" sandbox="{_FRAME_SANDBOX}"></iframe>
+</section>
+<section id="panel-data" role="tabpanel" aria-labelledby="tab-data" hidden>
+<iframe id="data-frame" title="Data" sandbox="{_DATA_FRAME_SANDBOX}"></iframe>
 </section>
 <script>{_SCRIPT}</script>
 </body>
@@ -2419,7 +2457,7 @@ def _open_page(base: str, *, no_browser: bool) -> None:
         base (str): The tab page's address, "http://host:port".
         no_browser (bool): Whether to open nothing.
     """
-    logging.info("Open %s/ for the Live trading and Backtest tabs", base)
+    logging.info("Open %s/ for the Live trading, Backtest and Data tabs", base)
     if not no_browser:
         webbrowser.open(f"{base}/")
 
@@ -2464,7 +2502,7 @@ def _reuse_running_dashboard(parser: argparse.ArgumentParser, base: str, *,
 
 def main(argv: list[str] | None = None) -> None:
     """
-    Serve both tabs until Ctrl-C, or reopen this checkout's running dashboard's page.
+    Serve the three tabs until Ctrl-C, or reopen this checkout's running dashboard's page.
 
     It binds config.LIVE_DASHBOARD_PORT, then config.LIVE_BACKTEST_PORT, on
     config.LIVE_DASHBOARD_HOST. A port is taken when a program already
@@ -2474,7 +2512,7 @@ def main(argv: list[str] | None = None) -> None:
     anything else exits 2. Only once both are bound does it
     log, to the terminal and config.LIVE_DASHBOARD_LOG_FILE. It then starts
     downloading the T-bill yields (in the background, again daily), serves
-    the backtest page from a background thread and the tab page from this
+    the backtest and Data pages from a background thread and the tab page from this
     one, and opens the page unless --no-browser. The Kalshi client is built
     on the first read of the account.
 
@@ -2490,8 +2528,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="python3 -m kalshi_betting.live_dashboard",
         description="Serve the dashboard's Live trading tab (the account read from Kalshi on "
-                    "every load, read-only) and its Backtest tab. When this checkout's "
-                    "dashboard is already running, open its page again instead.")
+                    "every load, read-only), its Backtest tab and its Data tab. When this "
+                    "checkout's dashboard is already running, open its page again instead.")
     parser.add_argument("--no-browser", action="store_true",
                         help="Open nothing; only log the address to open")
     args = parser.parse_args(argv)
