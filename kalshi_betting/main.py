@@ -63,9 +63,9 @@ Purpose:
     (seller.plan_trims, planned right after the take-profit plans and before
     any sale order is sent; never a pair the take-profit rule sells). A pair
     waits a set number of calendar days after its last trade and, with
-    trim_min_rise set, until its price has risen that far. Nothing is
-    trimmed when a shard's cash or Kalshi's value of the open positions
-    cannot be counted (or that value is $0), when an order rests on the
+    trim_min_rise set, until its price has moved that far, up or down.
+    Nothing is trimmed when a shard's cash or Kalshi's value of the open
+    positions cannot be counted (or that value is $0), when an order rests on the
     account (Kalshi counts a resting order's cash in neither the balance nor
     the positions value) or when the resting orders cannot be read: a trim
     sized on too small a value would sell too much. A pair trimmed in part
@@ -156,6 +156,7 @@ from .config import (
     EXIT_TRADES_NEED_ATTENTION,
     LIVE_DEFAULTS_FROM_CONFIG,
     MIN_BALANCE_CENTS,
+    PRICE_MOVE_STEP_CENTS,
     PROJECT_ROOT,
     SALE_KIND_KELLY_TRIM,
     SALE_READ_BACK_RECHECK_SECONDS,
@@ -164,7 +165,6 @@ from .config import (
     SELL_AT_STEP,
     SIZE_CAP_STEP,
     TAG_SCOPE_SEPARATOR,
-    TRIM_PRICE_RISE_STEP_CENTS,
     V2_MAPPING_ZERO_RECHECK_DELAYS_SECONDS,
     LiveDefaultsError,
     LiveDefaultsMissing,
@@ -1493,9 +1493,9 @@ def _resolve_live_settings(args, parser) -> tuple[LiveSettings, LiveSettings]:
             message += (f" (--sell-at takes a whole percent, a multiple of {sell_step} "
                         f"from {sell_step} to 100, read as that percent / 100)")
         if any(dest == "trim_min_rise" for dest, _ in given):
-            # --trim-min-rise's unit, from its grid definition (TRIM_PRICE_RISE_STEP_CENTS)
+            # --trim-min-rise's unit, from its grid definition (PRICE_MOVE_STEP_CENTS)
             message += (" (--trim-min-rise takes whole cents, a multiple of "
-                        f"{TRIM_PRICE_RISE_STEP_CENTS} from {TRIM_PRICE_RISE_STEP_CENTS} to "
+                        f"{PRICE_MOVE_STEP_CENTS} from {PRICE_MOVE_STEP_CENTS} to "
                         "100, read as that many cents / 100 dollars)")
         if ("categories" in overrides and "tags" not in overrides
                 and _saved_tag_loses_its_category(reference, overrides["categories"])):
@@ -2421,20 +2421,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--trim-to-kelly", action=argparse.BooleanOptionalAction, default=None,
         help="Set the Kelly trim on for this run: before buying, sell part of each "
              "exact held pair that has outgrown its Kelly size, once "
-             "config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE calendar days have passed since "
+             "config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have passed since "
              "the pair's last trade. --no-trim-to-kelly sets it off and clears the "
              "saved minimum price rise too. Production runs only: a dev run holds "
              "nothing (default: the saved live defaults)",
     )
-    # The minimum's grid step in whole cents (TRIM_PRICE_RISE_STEP_CENTS)
-    rise_step = TRIM_PRICE_RISE_STEP_CENTS
+    # The minimum's grid step in whole cents (PRICE_MOVE_STEP_CENTS)
+    rise_step = PRICE_MOVE_STEP_CENTS
     trim_rise = live.add_mutually_exclusive_group()
     trim_rise.add_argument(
         "--trim-min-rise", type=int, default=None, metavar="CENTS",
-        help="The least rise, in whole cents, in a held pair's total price since the "
-             "last trade on it before the Kelly trim may sell part of it; a multiple "
-             f"of {rise_step} from {rise_step} to 100. Needs the Kelly trim on, saved "
-             "or given with --trim-to-kelly (default: the saved live defaults)",
+        help="The least move, up or down, in whole cents, in a held pair's total price "
+             "since the last trade on it before the Kelly trim may sell part of it; a "
+             f"multiple of {rise_step} from {rise_step} to 100. Needs the Kelly trim on, "
+             "saved or given with --trim-to-kelly (default: the saved live defaults)",
     )
     trim_rise.add_argument(
         "--no-trim-min-rise", action="store_true", default=None,

@@ -7216,9 +7216,9 @@ class TestAskBefore:
         from kalshi_betting import config
 
         # config gives the age limit in whole days; callers pass it in seconds
-        assert config.TRIM_PRICE_THEN_MAX_AGE_DAYS == 7
-        assert type(config.TRIM_PRICE_THEN_MAX_AGE_DAYS) is int
-        t, window = self._T, config.TRIM_PRICE_THEN_MAX_AGE_DAYS * self._DAY
+        assert config.PRICE_THEN_MAX_AGE_DAYS == 7
+        assert type(config.PRICE_THEN_MAX_AGE_DAYS) is int
+        t, window = self._T, config.PRICE_THEN_MAX_AGE_DAYS * self._DAY
         assert window == self._WEEK
         assert historical.ask_before([_bid_candle(t - window + 1, 0.40, 0.61)], t, "no",
                                      window=window) == 0.61

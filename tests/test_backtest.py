@@ -745,7 +745,7 @@ class TestTrimRiseSweepArgument:
         # The help names main.py --trim-min-rise, which sets one live run's minimum
         text = _option_help(monkeypatch, capsys, "--no-trim-rise-sweep", "--sell-workers")
         assert text.startswith("Skip the dashboard's Min. price rise select")
-        assert text.endswith("waits for a price rise by its own saved trim_min_rise "
+        assert text.endswith("waits for a price move by its own saved trim_min_rise "
                              "(main.py --trim-min-rise for one run)")
 
 
@@ -1999,8 +1999,8 @@ class TestSimulatorFingerprint:
             .replace("File: backtester.py", "File: backtester.py (reworded)", 1)
             + "\n\n# A comment added at the end\n")
         edited["config"] = sources["config"].replace(
-            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE = 7",
-            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE = (\n    7  # spread over two lines\n)")
+            "REBALANCE_MIN_DAYS_SINCE_TRADE = 7",
+            "REBALANCE_MIN_DAYS_SINCE_TRADE = (\n    7  # spread over two lines\n)")
         assert edited["config"] != sources["config"]
         assert backtest._simulator_fingerprint_parts(edited) == base
 
@@ -2016,20 +2016,20 @@ class TestSimulatorFingerprint:
         sources = self._sources()
         base = backtest._simulator_fingerprint_parts(sources)
         edited = {**sources, "config": sources["config"].replace(
-            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE = 7", "KELLY_TRIM_MIN_DAYS_SINCE_TRADE = 8")}
+            "REBALANCE_MIN_DAYS_SINCE_TRADE = 7", "REBALANCE_MIN_DAYS_SINCE_TRADE = 8")}
         assert self._changed(base, backtest._simulator_fingerprint_parts(edited)) == {"config"}
 
     def test_a_config_value_reached_through_another_changes_it_too(self):
-        # Read by config.kelly_trim_min_days, which the backtester calls; no
+        # Read by config.rebalance_min_days, which the backtester calls; no
         # simulator module names it itself
         sources = self._sources()
         read = set().union(*(backtest._config_names_read(ast.parse(sources[name]))
                              for name in backtest._SIMULATOR_MODULES))
-        assert "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX" not in read
+        assert "REBALANCE_MIN_DAYS_SINCE_TRADE_MAX" not in read
         base = backtest._simulator_fingerprint_parts(sources)
         edited = {**sources, "config": sources["config"].replace(
-            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX = 30",
-            "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX = 31")}
+            "REBALANCE_MIN_DAYS_SINCE_TRADE_MAX = 30",
+            "REBALANCE_MIN_DAYS_SINCE_TRADE_MAX = 31")}
         assert self._changed(base, backtest._simulator_fingerprint_parts(edited)) == {"config"}
 
     def test_config_the_simulator_never_reads_does_not_count(self):
@@ -2091,7 +2091,7 @@ def saved_golden_run(tmp_path_factory):
         mp.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
         mp.setattr(backtester, "TAKE_PROFIT_LEVELS", (0.05, 0.25, 0.5, 1.0))
         mp.setattr(backtester, "TAKE_PROFIT_MIN_DAYS", (1, 14, 30))
-        mp.setattr(backtester, "TRIM_MIN_PRICE_RISES", (0.05, 0.1, 0.3))
+        mp.setattr(backtester, "MIN_PRICE_MOVES", (0.05, 0.1, 0.3))
         # One clock for every run of the class, so their curves end on one day
         mp.setattr(backtester, "datetime", type(
             "Clock", (_tb.TestCapSweepEndDate._Clock,),

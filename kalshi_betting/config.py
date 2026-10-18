@@ -38,14 +38,14 @@ Notes:
     days_to_maturity) live here, where seller.py may import them, so live
     selling and the backtest apply the same arithmetic. The rule that trims
     a held pair to its Kelly size (held_pair_win_prob, kelly_hold_fraction,
-    kelly_trim_count) lives here too, with the test that can hold a trim
-    back until the pair's price has risen (pair_price_rise,
-    trim_rise_reached) and the test that holds it back until enough days
-    have passed since the pair's last trade (kelly_trim_min_days,
-    kelly_trim_rested). The backtest and seller.plan_trims (live trims) both
-    call them; trade_day and kelly_trim_bids are for live trims only. A live
-    run's switch and minimum are LiveSettings.trim_to_kelly and
-    trim_min_rise.
+    kelly_trim_count) lives here too, with the two tests a rebalance (an
+    add-on to a held pair, or a trim of one) must pass first: that the
+    pair's price has moved far enough, up or down, since its last trade
+    (pair_price_move, price_move_reached), and that enough days have passed
+    since that trade (rebalance_min_days, rebalance_rested). The backtest
+    and seller.plan_trims (live trims) both call them; trade_day and
+    kelly_trim_bids are for live trims only. A live run's switch and minimum
+    are LiveSettings.trim_to_kelly and trim_min_rise.
 """
 import fcntl
 import json
@@ -521,42 +521,44 @@ TAKE_PROFIT_HOLD_DAYS = 3
 # held each of its trades at every check (trades are bought only at checkpoints).
 TAKE_PROFIT_HOLD_DAYS_MAX = 7
 
-# The price rises the backtest dashboard's "Min. price rise" select offers
-# beside "any": with Trim to Kelly on, a held pair is trimmed only once its
-# total price (the price of the side held on each of its two markets, added)
-# is at least this many dollars above where it stood at the last trade on the
-# pair (its purchase, an add-on or an earlier trim). A fall never counts.
-# Every 5c from 5c to 95c, 19 values, each the float nearest its cents over
-# 100 (so 15c is exactly the float 0.15), all distinct and in (0, 1].
-# Backtest only: read by backtester.run_backtest_sweep(trim_rise_sweep=True),
-# which checks them before its fetch. A live run uses its own saved minimum
+# The price moves the backtest dashboard's "Min. price rise" select offers
+# beside "any". A rebalance (an add-on to a held pair, or a Kelly trim of one)
+# is made only once the pair's total price (the price of the side held on each
+# of its two markets, added) is at least this many dollars above or below
+# where it stood at the last trade on the pair (its purchase, an add-on or a
+# trim): a move up and a move down count alike. Every 5c from 5c to 95c, 19
+# values, each the float nearest its cents over 100 (so 15c is exactly the
+# float 0.15), all distinct and in (0, 1]. Backtest only: read by
+# backtester.run_backtest_sweep(trim_rise_sweep=True), which checks them
+# before its fetch. A live run uses its own saved minimum
 # (LiveSettings.trim_min_rise), which _step_rise holds to the same step,
-# TRIM_PRICE_RISE_STEP_CENTS, from 5c to $1.
-TRIM_PRICE_RISE_STEP_CENTS = 5
-TRIM_MIN_PRICE_RISES = tuple(
-    cents / 100 for cents in range(TRIM_PRICE_RISE_STEP_CENTS, 100, TRIM_PRICE_RISE_STEP_CENTS))
+# PRICE_MOVE_STEP_CENTS, from 5c to $1.
+PRICE_MOVE_STEP_CENTS = 5
+MIN_PRICE_MOVES = tuple(
+    cents / 100 for cents in range(PRICE_MOVE_STEP_CENTS, 100, PRICE_MOVE_STEP_CENTS))
 
 # Calendar days that must pass after the last trade of any sort on a held
-# pair (on either of its markets) before a Kelly trim may sell part of it.
-# Days are counted on the bot's own clock (trade_day) and kelly_trim_rested
-# reads no schedule, so a pair traded on a Tuesday may be trimmed from the
-# next Tuesday on, however often the bot runs. A whole number from 0 (no
-# wait) to the maximum below. Each module that applies the wait binds this
-# by value and checks its own copy, so a test patches that module's binding,
-# never config's.
-KELLY_TRIM_MIN_DAYS_SINCE_TRADE = 7
+# pair (on either of its markets) before it may be rebalanced: before a Kelly
+# trim may sell part of it, and, in the backtest, before an add-on may buy
+# more of it. Days are counted on the bot's own clock (trade_day) and
+# rebalance_rested reads no schedule, so a pair traded on a Tuesday may be
+# rebalanced from the next Tuesday on, however often the bot runs. A whole
+# number from 0 (no wait) to the maximum below. Each module that applies the
+# wait binds this by value and checks its own copy, so a test patches that
+# module's binding, never config's.
+REBALANCE_MIN_DAYS_SINCE_TRADE = 7
 
 # The longest wait allowed. A live run sees a pair's last trade only as far
 # back as Kalshi's list of the account's fills reaches (Kalshi moves older
 # fills to an archive), so the wait must stay short enough for that list.
-KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX = 30
+REBALANCE_MIN_DAYS_SINCE_TRADE_MAX = 30
 
-# With a minimum price rise set, the oldest (in days) a quote may be for
+# With a minimum price move set, the oldest (in days) a quote may be for
 # seller.plan_trims to read a held market's price at its pair's last trade
 # (historical.ask_before: the latest usable ask of the side held on an
 # hourly candle that ended at or before then). With no usable quote in that
 # window the price is unknown and the pair is not trimmed.
-TRIM_PRICE_THEN_MAX_AGE_DAYS = 7
+PRICE_THEN_MAX_AGE_DAYS = 7
 
 # How far below a held side's best bid, in dollars, a live Kelly trim may
 # sell. seller.plan_trims sizes and prices a trim only on the bids within
@@ -667,9 +669,9 @@ SELL_AT_STEP = 0.01
 # The backtest never reads this constant.
 TRIM_TO_KELLY = False
 
-# The least rise, in dollars, in a held pair's total price since its last
-# trade before a Kelly trim may sell part of it: on the 5c grid from 5c to $1,
-# or None for no minimum. Only with the switch above on. A live run reads the
+# The least move, in dollars, up or down, in a held pair's total price since
+# its last trade before a Kelly trim may sell part of it: on the 5c grid from
+# 5c to $1, or None for no minimum. Only with the switch above on. A live run reads the
 # saved live defaults' trim_min_rise instead (main.py --trim-min-rise CENTS /
 # --no-trim-min-rise for one run).
 TRIM_MIN_RISE: float | None = None
@@ -2748,10 +2750,10 @@ def _step_share(value, name: str) -> float:
 
 def _step_rise(value, name: str) -> float:
     """
-    Validate a minimum price rise and round it onto the 5c grid.
+    Validate a minimum price move and round it onto the 5c grid.
 
-    The grid (TRIM_PRICE_RISE_STEP_CENTS) is the dashboard's "Min. price
-    rise" step, so a live minimum always equals one of its options, or $1.
+    The grid (PRICE_MOVE_STEP_CENTS) is the dashboard's "Min. price rise"
+    step, so a live minimum always equals one of its options, or $1.
 
     Args:
         value: The minimum in dollars, from one step to 1.
@@ -2765,11 +2767,11 @@ def _step_rise(value, name: str) -> float:
     """
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise ValueError(f"{name} must be a number of dollars, got {value!r}")
-    step = TRIM_PRICE_RISE_STEP_CENTS
+    step = PRICE_MOVE_STEP_CENTS
     # NaN, infinities and values outside (0, 1] count as no steps, so nothing
     # too large to round is ever rounded
     steps = round(value * 100 / step) if 0.0 < value <= 1.0 else 0
-    # steps < 1 also refuses a rise within float noise of 0
+    # steps < 1 also refuses a minimum within float noise of 0
     if steps < 1 or abs(value - steps * step / 100) > PRICE_EPSILON:
         raise ValueError(f"{name} must be a multiple of {step}c from {step}c to $1, "
                          f"got {value!r}")
@@ -2971,9 +2973,10 @@ class LiveSettings:
         trim_to_kelly (bool): Whether a production run, before it buys, sells
             part of each exact held pair grown past its Kelly size; a real
             bool. Default False, also what a saved file without it reads as.
-        trim_min_rise (float | None): The least rise in a held pair's total
-            price since its last trade before a trim, in dollars on the 5c
-            grid from 5c to $1 (0.1 for 10c); None (default) is no minimum.
+        trim_min_rise (float | None): The least move, up or down, in a held
+            pair's total price since its last trade before a trim, in dollars
+            on the 5c grid from 5c to $1 (0.1 for 10c); None (default) is no
+            minimum.
             Refused with trim_to_kelly off.
         origin (str): Where these toggles' defaults were read: the saved defaults
             file with when (and from what) it was saved, or LIVE_DEFAULTS_FROM_CONFIG
@@ -3839,10 +3842,11 @@ def days_to_maturity(close_dates, day: date) -> int | None:
 # live here, not in strategy.py, so seller.py may import them. Then:
 # - kelly_trim_bids (live only) drops bids too far below a held side's best
 #   bid (the backtest's modeled ladder already ends there);
-# - pair_price_rise and trim_rise_reached ask whether the pair's price has
-#   risen enough since its last trade for a trim to be considered;
-# - kelly_trim_rested asks whether enough calendar days have passed since
-#   that trade (kelly_trim_min_days checks the number of days; trade_day,
+# - pair_price_move and price_move_reached ask whether the pair's price has
+#   moved far enough, up or down, since its last trade for a rebalance (a
+#   trim, or in the backtest an add-on) to be considered;
+# - rebalance_rested asks whether enough calendar days have passed since
+#   that trade (rebalance_min_days checks the number of days; trade_day,
 #   live only, turns a time into a day on the bot's clock). It compares two
 #   plain dates and reads no schedule, so the answer is the same however
 #   often a run happens.
@@ -4080,17 +4084,18 @@ def kelly_trim_bids(ladder, max_drop: float) -> list:
     return [level for level in ladder if level[0] >= lowest]
 
 
-def pair_price_rise(price_then: float, price_now: float) -> float:
+def pair_price_move(price_then: float, price_now: float) -> float:
     """
-    Return how far a held pair's total price has risen since the last trade on it.
+    Return how far a held pair's total price has moved since the last trade on it (now less then).
 
     A pair's total price is the price of the side held on each of its two
     markets, added: YES on the earlier market plus NO on the later one for a
     time-series pair, NO on the first plus YES on the second for a same-title
-    pair. Both prices must be the same kind of quote (two asks, say), so the
-    gap between a market's bid and ask never reads as a rise. This is the one
-    place the direction is decided: a caller hands in the two prices and never
-    subtracts them itself.
+    pair. (For a lone leg, one held market whose partner has paid out, it is
+    that one market's price.) Both prices must be the same kind of quote (two
+    asks, say), so the gap between a market's bid and ask never reads as a
+    move. This is the one place the sign is decided: a caller hands in the two
+    prices and never subtracts them itself.
 
     Args:
         price_then (float): The pair's total price at the last trade on it
@@ -4104,44 +4109,46 @@ def pair_price_rise(price_then: float, price_now: float) -> float:
     return price_now - price_then
 
 
-def trim_rise_reached(rise: float, min_rise: float | None) -> bool:
+def price_move_reached(move: float, min_move: float | None) -> bool:
     """
-    Return whether a held pair's price has risen far enough for a Kelly trim to be considered.
+    Return whether a held pair's price has moved far enough, up or down, for a rebalance.
 
-    With a minimum set, a pair is looked at for trimming only once its total
-    price is at least that far above where it stood at the last trade on it.
-    A fall never counts, however large. The comparison allows PRICE_EPSILON
-    of float noise, so a rise that is exactly the minimum (0.87 - 0.62
-    against 0.25) passes.
+    A rebalance is an add-on to a held pair or a Kelly trim of one. With a
+    minimum set, a pair is added to or trimmed only once its total price is
+    at least that far above or below where it stood at the last trade on it:
+    a rise and a fall of the same size count alike. The comparison allows
+    PRICE_EPSILON of float noise, so a move that is exactly the minimum
+    (0.87 - 0.62 against 0.25, or 0.62 - 0.87) passes.
 
     Args:
-        rise (float): How far the pair's total price has risen
-            (pair_price_rise), in dollars; negative for a fall.
-        min_rise (float | None): The least rise a trim needs, in dollars; None
-            for no minimum.
+        move (float): How far the pair's total price has moved
+            (pair_price_move), in dollars; negative for a fall.
+        min_move (float | None): The least move a rebalance needs, in
+            dollars; None for no minimum.
 
     Returns:
-        bool: True with no minimum, whatever the rise. With one: whether the
-            rise is at least the minimum. False when the rise or the minimum
-            is not a number.
+        bool: True with no minimum, whatever the move. With one: whether the
+            move's size is at least the minimum. False when the move or the
+            minimum is not a number.
     """
-    if min_rise is None:
+    if min_move is None:
         return True
-    # A rise that is not a number compares False, which holds the trim back
-    return math.isfinite(min_rise) and rise >= min_rise - PRICE_EPSILON
+    # abs of NaN is NaN, which compares False and holds the add-on or trim back
+    return math.isfinite(min_move) and abs(move) >= min_move - PRICE_EPSILON
 
 
-def kelly_trim_min_days(days) -> int:
+def rebalance_min_days(days) -> int:
     """
-    Check the days a held pair must go without a trade before a Kelly trim, and return them.
+    Check the days a held pair must go without a trade before a rebalance, and return them.
 
-    Each module that applies the wait checks its own copy of
-    KELLY_TRIM_MIN_DAYS_SINCE_TRADE here, so a mistyped constant stops the
-    run instead of shortening the wait; kelly_trim_rested checks it too.
+    The wait applies to Kelly trims and, in the backtest, to add-ons. Each
+    module that applies it checks its own copy of
+    REBALANCE_MIN_DAYS_SINCE_TRADE here, so a mistyped constant stops the
+    run instead of shortening the wait; rebalance_rested checks it too.
 
     Args:
         days: A whole number from 0 (no wait) to
-            KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX. A bool, a float (even 7.0)
+            REBALANCE_MIN_DAYS_SINCE_TRADE_MAX. A bool, a float (even 7.0)
             and a numpy duration (timedelta64) are refused.
 
     Returns:
@@ -4159,9 +4166,9 @@ def kelly_trim_min_days(days) -> int:
             whole = operator.index(days)
         except TypeError:
             whole = None
-    if whole is None or not 0 <= whole <= KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX:
-        raise ValueError("KELLY_TRIM_MIN_DAYS_SINCE_TRADE must be a whole number from 0 to "
-                         f"{KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX}, got {days!r}")
+    if whole is None or not 0 <= whole <= REBALANCE_MIN_DAYS_SINCE_TRADE_MAX:
+        raise ValueError("REBALANCE_MIN_DAYS_SINCE_TRADE must be a whole number from 0 to "
+                         f"{REBALANCE_MIN_DAYS_SINCE_TRADE_MAX}, got {days!r}")
     return whole
 
 
@@ -4171,7 +4178,7 @@ def trade_day(moment: datetime, run: ScheduledRun) -> date:
 
     The bot's clock is its schedule's time zone (Pacific for SCHEDULED_RUN),
     so a trade at 5:01pm Pacific belongs to that Pacific day although it is
-    already the next day in UTC. kelly_trim_rested counts days between two
+    already the next day in UTC. rebalance_rested counts days between two
     of these. Only the zone of `run` is read.
 
     Args:
@@ -4194,21 +4201,22 @@ def trade_day(moment: datetime, run: ScheduledRun) -> date:
     return moment.astimezone(run.zone()).date()
 
 
-def kelly_trim_rested(last_trade: date, day: date, min_days: int) -> bool:
+def rebalance_rested(last_trade: date, day: date, min_days: int) -> bool:
     """
-    Return whether a held pair has gone enough days without a trade for a Kelly trim.
+    Return whether a held pair has gone enough days without a trade for a rebalance.
 
-    With 7, a pair last traded on a Tuesday may be trimmed from the next
-    Tuesday on. It reads only the two dates, so it holds however often runs
-    happen. A last trade dated after `day` never counts as rested. Both dates
-    must be on one clock (live: trade_day of each time). A caller that does
-    not know a pair's last trade must not ask: None is refused, never read
-    as "never traded".
+    A rebalance is a Kelly trim or, in the backtest, an add-on. With 7, a pair
+    last traded on a Tuesday may be rebalanced from the next Tuesday on. It
+    reads only the two dates, so it holds however often runs happen. A last
+    trade dated after `day` never counts as rested. Both dates must be on
+    one clock (live: trade_day of each time). A caller that does not know a
+    pair's last trade must not ask: None is refused, never read as "never
+    traded".
 
     Args:
         last_trade (date): The day of the pair's last trade of any sort.
-        day (date): The day the trim would happen.
-        min_days (int): KELLY_TRIM_MIN_DAYS_SINCE_TRADE; 0 for no wait.
+        day (date): The day the trim or add-on would happen.
+        min_days (int): REBALANCE_MIN_DAYS_SINCE_TRADE; 0 for no wait.
 
     Returns:
         bool: True when `day` is at least `min_days` days after `last_trade`.
@@ -4216,13 +4224,13 @@ def kelly_trim_rested(last_trade: date, day: date, min_days: int) -> bool:
     Raises:
         TypeError: Either date is not a plain date (a datetime too: whole
             24-hour spans can be a day short of the calendar days).
-        ValueError: `min_days` is not one kelly_trim_min_days accepts.
+        ValueError: `min_days` is not one rebalance_min_days accepts.
     """
     # Exactly a date: a datetime is a date subclass, and None is refused
     if type(last_trade) is not date or type(day) is not date:
-        raise TypeError("kelly_trim_rested reads two calendar dates (trade_day of each "
+        raise TypeError("rebalance_rested reads two calendar dates (trade_day of each "
                         f"time), got {last_trade!r} and {day!r}")
-    return (day - last_trade).days >= kelly_trim_min_days(min_days)
+    return (day - last_trade).days >= rebalance_min_days(min_days)
 
 
 def _exact_number(value: float) -> str:

@@ -761,7 +761,7 @@ class TestLiveSettingsFlags:
                                         "--trim-min-rise", "7"])
         assert seen["code"] == 2
         err = " ".join(capsys.readouterr().err.split())
-        step = config.TRIM_PRICE_RISE_STEP_CENTS
+        step = config.PRICE_MOVE_STEP_CENTS
         assert (f"(--trim-min-rise takes whole cents, a multiple of {step} from {step} to "
                 "100, read as that many cents / 100 dollars)") in err, err
         # Not the percent note the cap and sell-level flags carry
@@ -1133,11 +1133,11 @@ class TestLiveSettingsFlags:
         # The trim flags. argparse may wrap a flag's name at a hyphen, so the
         # pinned words stop short of one
         assert ("before buying, sell part of each exact held pair that has outgrown its "
-                "Kelly size, once config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE calendar days have "
+                "Kelly size, once config.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have "
                 "passed since the pair's last trade.") in out
         assert "sets it off and clears the saved minimum price rise too." in out
         assert "no run acts on it" not in out
-        step = config.TRIM_PRICE_RISE_STEP_CENTS
+        step = config.PRICE_MOVE_STEP_CENTS
         assert (f"a multiple of {step} from {step} to 100. Needs the Kelly trim on, saved or "
                 "given with") in out
         assert ("Set no minimum price rise for the Kelly trim this run, whatever the saved "
@@ -7196,9 +7196,9 @@ class TestRunProdTrimsLive:
 @pytest.mark.usefixtures("pinned_config_toggles")
 class TestRunProdTrimsAfterAPriceRise:
     """--trim-min-rise CENTS holds back a pair's trim until its total price (the
-    ask of the side held on each market, added) has risen that far since its
-    last fill. The sellable pair is up 13c and the time-series pair 8c; under a
-    10% cap of $112.00 both have outgrown their share."""
+    ask of the side held on each market, added) has moved that far, up or down,
+    since its last fill. The sellable pair is up 13c and the time-series pair
+    8c; under a 10% cap of $112.00 both have outgrown their share."""
 
     # Each market's hourly candles before the last fill: (YES ask, YES bid). A
     # NO ask is 1 minus the YES bid (SELL-LATE's NO stood at 0.38, TS-LATE's at 0.36)
@@ -7258,7 +7258,7 @@ class TestRunProdTrimsAfterAPriceRise:
         assert check.startswith("Kelly trim check: YES SELL-EARLY / NO SELL-LATE ")
         assert "price $0.88 then, $1.01 now (+13c, minimum 10c)" in check
         assert check.endswith("may keep 10.0% of $112.00 -> sell 19")
-        assert ("Not trimming YES TS-EARLY / NO TS-LATE: its total price has not risen by the "
+        assert ("Not trimming YES TS-EARLY / NO TS-LATE: its total price has not moved by the "
                 "minimum since it last traded: price $0.62 then, $0.70 now (+8c, minimum "
                 "10c)") in messages
         assert "Pairs to trim this run: 1 of 2" in messages

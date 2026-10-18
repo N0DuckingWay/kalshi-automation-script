@@ -12062,9 +12062,9 @@ class TestTrimRiseView:
     def test_the_payload_names_every_minimum(self):
         _, _, base = _tr_payload(_kc_sweep_trim_rise())
         assert base["trim_rises"] == [
-            {"label": "5c", "phrase": " only after a 5c price rise", "value": 0.05},
-            {"label": "10c", "phrase": " only after a 10c price rise", "value": 0.10},
-            {"label": "25c", "phrase": " only after a 25c price rise", "value": 0.25}]
+            {"label": "5c", "phrase": " only after a 5c price move", "value": 0.05},
+            {"label": "10c", "phrase": " only after a 10c price move", "value": 0.10},
+            {"label": "25c", "phrase": " only after a 25c price move", "value": 0.25}]
         # The words a run at that minimum is labelled with in the backtest's log
         assert [entry["phrase"] for entry in base["trim_rises"]] == [
             backtester._trim_rise_label(rise) for rise in _TR_RISES]
@@ -12871,12 +12871,12 @@ class TestTrimSelect:
             {"value": "on", "text": "on (sell down to the Kelly size)", "selected": False}]}
         title = re.search(r'<select id="flt-trim"[^>]*title="([^"]*)"', page).group(1)
         # The hover text, at the wait the page's trim runs use
-        assert backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE == 7
-        shipped = dashboard._trim_select_title(backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE)
+        assert backtester.REBALANCE_MIN_DAYS_SINCE_TRADE == 7
+        shipped = dashboard._trim_select_title(backtester.REBALANCE_MIN_DAYS_SINCE_TRADE)
         assert html.unescape(title) == shipped
         # It says what the choice shuts and why, and what Save saves
         for words in ("Sell is set to no selling", "Each part sold counts as a trade of its own",
-                      "Min. price rise can make a trim wait",
+                      "Min. price rise can make a trim (and an add-on) wait",
                       "From a page that simulated trimming, Save as live defaults saves this "
                       "choice and the Min. price rise shown, for live runs to trim by; from any "
                       "other page it keeps the saved ones.",
@@ -12889,21 +12889,26 @@ class TestTrimSelect:
 
     def test_the_title_names_the_wait_after_a_trade(self, monkeypatch, tmp_path):
         title = dashboard._trim_select_title
-        rule = ("each week. A pair is trimmed only when at least {} passed since its last "
-                "purchase, add-on or trim{} Min. price rise can make a trim wait")
+        # The wait covers add-ons as well as trims, and so does the minimum
+        rule = ("each week. A pair is trimmed (or, with Add to held pairs on, added to) only "
+                "when at least {} passed since its last purchase, add-on or trim{} Min. price "
+                "rise can make a trim (and an add-on) wait until the pair's price has moved far "
+                "enough, up or down.")
         # Weekly runs are 7 days apart: a wait of 7 days or fewer holds no
-        # trim back, and the text says so
-        weekly = "; weekly runs are 7 days apart, so this never holds a trim back here."
+        # trim or add-on back, and the text says so
+        weekly = ("; weekly runs are 7 days apart, so this never holds a trim or an add-on "
+                  "back here.")
         assert rule.format("7 days have", weekly) in title(7)
         assert rule.format("1 day has", weekly) in title(1)
         assert rule.format("6 days have", weekly) in title(6)
         # A longer wait does hold trims back, so nothing of the kind is said
         for days in (8, 14, 30):
             assert rule.format(f"{days} days have", ".") in title(days)
-            assert "never holds a trim back" not in title(days)
+            assert "never holds a trim" not in title(days)
         # With no wait there is nothing to count
-        assert ("each week. A pair can be trimmed at any weekly run after a trade on it. "
-                "Min. price rise can make a trim wait") in title(0)
+        assert ("each week. A pair can be trimmed (or, with Add to held pairs on, added to) at "
+                "any weekly run after a trade on it. Min. price rise can make a trim (and an "
+                "add-on) wait") in title(0)
         assert "days have passed" not in title(0)
         # How a live run counts the wait: said only when there is a wait
         live = ("Each part sold counts as a trade of its own. A live run counts the wait in "
@@ -12921,7 +12926,7 @@ class TestTrimSelect:
         first, second = backtester._sale_checkpoints(date(2026, 1, 5), date(2026, 1, 12))
         assert (second - first).days == dashboard._DAYS_BETWEEN_WEEKLY_RUNS == 7
         # The page names the wait its trim runs read
-        monkeypatch.setattr(backtester, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", 14)
+        monkeypatch.setattr(backtester, "REBALANCE_MIN_DAYS_SINCE_TRADE", 14)
         page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
         shown = re.search(r'<select id="flt-trim"[^>]*title="([^"]*)"', page).group(1)
         assert html.unescape(shown) == title(14)
@@ -12936,10 +12941,10 @@ class TestTrimSelect:
         assert text.startswith("off: no part of a held pair is sold to cut its size.")
         assert text.endswith("always show it off.")
         if not isinstance(bad, (int, float)):
-            assert "never holds a trim back" not in text
+            assert "never holds a trim" not in text
         _, _, base = _tr_payload(_kc_sweep())
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(backtester, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE", bad)
+            mp.setattr(backtester, "REBALANCE_MIN_DAYS_SINCE_TRADE", bad)
             bar = dashboard._filter_bar_html(base, {"all": {"n": 3}})
         assert f'title="{html.escape(text)}"' in bar
 
@@ -12992,7 +12997,7 @@ class TestTrimRiseSelect:
 
     def test_the_select_follows_trim_to_kelly_with_any_and_every_minimum(
             self, monkeypatch, tmp_path):
-        rises = tuple(config.TRIM_MIN_PRICE_RISES)
+        rises = tuple(config.MIN_PRICE_MOVES)
         assert len(rises) == 19
         page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(min_rises=rises))
         # Right after Trim to Kelly and before Sell
@@ -13021,17 +13026,20 @@ class TestTrimRiseSelect:
         assert [entry["value"] for entry in data["trim_rises"]] == list(rises)
         title = re.search(r'title="([^"]*)"', select.group(1)).group(1)
         assert html.unescape(title) == dashboard._TRIM_RISE_TITLE
-        # The hover text says when it counts, which price, and that a fall never does
+        # The hover text says when it counts, which price, that a rise and a fall
+        # count alike, and that add-ons wait for it too
         for words in ("Used only while Trim to Kelly is on", "YES on the earlier market plus "
-                      "NO on the later one", "A fall never counts", "any: no minimum",
-                      "its purchase, an add-on (Add to held pairs) or an earlier trim",
-                      "trimmed whichever way its price moved"):
+                      "NO on the later one", "A rise and a fall count alike", "any: no minimum",
+                      "its purchase, an add-on or an earlier trim",
+                      "trimmed, and with Add to held pairs on added to,",
+                      "moved at least this many cents, up or down,"):
             assert words in dashboard._TRIM_RISE_TITLE
+        assert "A fall never counts" not in dashboard._TRIM_RISE_TITLE
         # ... and ends with what Save saves, and which pairs a live run cannot
-        # measure a rise for
+        # measure a move for
         assert dashboard._TRIM_RISE_TITLE.endswith(
-            " whichever way its price moved. From a page that simulated trimming, Save as live "
-            "defaults saves the minimum shown, for live runs to wait for (any, or Trim to Kelly "
+            " however little its price moved. From a page that simulated trimming, Save as live "
+            "defaults saves the minimum shown, for live trims to wait for (any, or Trim to Kelly "
             "off, saves none); from any other page it keeps the saved one. A live run reads "
             "the price at the pair's last fill on Kalshi, so with a minimum set it does not "
             "trim a pair whose last fill is older than Kalshi's list of the account's fills "
@@ -13119,7 +13127,7 @@ class TestTrimRiseSelect:
                      "choice and the Min. price rise shown, for live runs to trim by; from any "
                      "other page it keeps the saved ones.")
         rise_save = ("From a page that simulated trimming, Save as live defaults saves the "
-                     "minimum shown, for live runs to wait for (any, or Trim to Kelly off, "
+                     "minimum shown, for live trims to wait for (any, or Trim to Kelly off, "
                      "saves none); from any other page it keeps the saved one.")
         for sweep, has_view in ((_kc_sweep(), False), (_kc_sweep_trim(), True),
                                 (_kc_sweep_trim_rise(), True)):
@@ -13591,7 +13599,7 @@ class TestTrimRiseScript:
         assert cid not in _ao_ids(data["grid"]) | _ao_ids(data["grid_trim"])
         scenario = self._scenario(data, 0, 1, 1, 1)
         assert scenario.endswith(
-            "20% cap per trade, trimming to Kelly only after a 10c price rise")
+            "20% cap per trade, trimming to Kelly only after a 10c price move")
         snaps = self._run(tmp_path, page, [
             ["wait"], *self.ON, ["snap", "trim"], ["set", "flt-rise", "2"],
             ["fire", "flt-rise"], ["snap", "loading"], ["settle"], ["snap", "rise"]],
@@ -13745,7 +13753,7 @@ class TestTrimRiseScript:
         assert f"dash-chunk-{cid}" in snap["inflated"]
         scenario = self._scenario(data, 0, 1, 1, 1, add=True)
         assert scenario.endswith(
-            ", adding to held pairs, trimming to Kelly only after a 10c price rise")
+            ", adding to held pairs, trimming to Kelly only after a 10c price move")
         n = chunks[cid]["list"]["views"]["all"]["n"]
         assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], scenario, False, None, n, n, note="other_run", add_on=True, trim=True)
@@ -13895,7 +13903,7 @@ class TestTrimRiseScript:
         # A change event on the shut select draws nothing
         assert snaps["fired"]["reacts"] == []
         assert snaps["fired"]["inflated"] == snaps["on"]["inflated"]
-        assert "price rise" not in snaps["on"]["text"].get("flt-summary", "")
+        assert "price move" not in snaps["on"]["text"].get("flt-summary", "")
         assert ("trimming to Kelly" in snaps["on"]["text"].get("flt-summary", "")) is (
             view == "trim without minimums")
 
@@ -14027,7 +14035,7 @@ class TestTrimRiseScript:
         for snap in (on, rise):
             assert _explorer_calls(snap) == []
         assert rise["selects"]["flt-rise"]["value"] == "2"
-        assert "only after a 10c price rise" in rise["text"]["flt-summary"]
+        assert "only after a 10c price move" in rise["text"]["flt-summary"]
 
     def test_a_null_cell_of_a_trimmed_scenario_shows_its_trim_chunk(self, monkeypatch,
                                                                      tmp_path):
@@ -14851,9 +14859,9 @@ class TestSellGrid:
 
     def test_a_worker_sells_by_the_parent_s_day_count(self, monkeypatch, tmp_path):
         # Each task carries the parent's TAKE_PROFIT_HOLD_DAYS beside its
-        # same-title cap and schedule; a worker process, which imports
-        # backtester afresh, installs all three before it simulates
-        for name in ("SAME_TITLE_SIZE_CAP", "SCHEDULED_RUN"):
+        # same-title cap, schedule and wait; a worker process, which imports
+        # backtester afresh, installs all four before it simulates
+        for name in ("SAME_TITLE_SIZE_CAP", "SCHEDULED_RUN", "REBALANCE_MIN_DAYS_SINCE_TRADE"):
             monkeypatch.setattr(backtester, name, getattr(backtester, name))
         monkeypatch.setattr(backtester, "TAKE_PROFIT_HOLD_DAYS", 2)
         walked, chunker, _grid = _sl_build(_kc_sweep_sell(), tmp_path / "f")
@@ -14866,6 +14874,29 @@ class TestSellGrid:
         dashboard._run_sell_task(dataclasses.replace(tasks[0], cells=frozenset(),
                                                      install=True, hold_days=5))
         assert backtester.TAKE_PROFIT_HOLD_DAYS == 5
+
+    def test_a_worker_waits_by_the_parent_s_day_count(self, monkeypatch, tmp_path):
+        """
+        Each task carries the parent's REBALANCE_MIN_DAYS_SINCE_TRADE, and a worker installs it.
+
+        The Sell family's runs with Add to held pairs on hold an add-on back
+        until a held pair has gone that many days without a trade, so a
+        spawned worker, which imports backtester afresh from config, must
+        wait as the parent does or the Sell cells would mix two waits.
+        """
+        for name in ("SAME_TITLE_SIZE_CAP", "SCHEDULED_RUN", "TAKE_PROFIT_HOLD_DAYS"):
+            monkeypatch.setattr(backtester, name, getattr(backtester, name))
+        monkeypatch.setattr(backtester, "REBALANCE_MIN_DAYS_SINCE_TRADE", 14)
+        walked, chunker, _grid = _sl_build(_kc_sweep_sell(), tmp_path / "f")
+        tasks = dashboard._sell_tasks(walked, chunker, start_date=_FLT_START,
+                                      initial_balance=1000.0,
+                                      series_categories=_FLT_SERIES_TIERS, risk_free=None,
+                                      folder=tmp_path / "g")
+        assert tasks and all(task.rebalance_days == 14 for task in tasks)
+        # Run in this process as a worker would (nothing to cover, so no simulation)
+        dashboard._run_sell_task(dataclasses.replace(tasks[0], cells=frozenset(),
+                                                     install=True, rebalance_days=21))
+        assert backtester.REBALANCE_MIN_DAYS_SINCE_TRADE == 21
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_worker_processes_build_what_the_parent_builds(self, monkeypatch, tmp_path):
@@ -15180,7 +15211,7 @@ class TestLiveTrimRule:
     selling included)."""
 
     _NOTE = "; the live defaults trim to Kelly, which this run's primary does not"
-    _NOTE_10C = ("; the live defaults trim to Kelly (only after a 10c price rise), which this "
+    _NOTE_10C = ("; the live defaults trim to Kelly (only after a 10c price move), which this "
                  "run's primary does not")
     _SHOWN = ' — choose Trim to Kelly on and Min. price rise "{}" in the filter bar to see it'
     _NO_VIEW = " — this page has no Trim to Kelly view"
@@ -15371,7 +15402,7 @@ class TestLiveTrimRule:
         sweep = dataclasses.replace(_kc_sweep_trim_rise(), live_trim_to_kelly=True,
                                     live_trim_min_rise=0.1, live_tier_floors=True,
                                     live_spread_band=_KC_B0)
-        note = ("the live defaults trim to Kelly (only after a {}c price rise), which this "
+        note = ("the live defaults trim to Kelly (only after a {}c price move), which this "
                 "run's primary does not — ")
         page = _ao_page(monkeypatch, tmp_path, sweep)
         assert (note.format(10) + 'choose Trim to Kelly on and Min. price rise "10c" in the '

@@ -21,7 +21,8 @@ Purpose:
     Kelly sizing would put in it), by the backtest's rule
     (config.kelly_trim_count). A pair is trimmed only after enough calendar
     days without a fill (a trade) on either market and, with
-    LiveSettings.trim_min_rise set, once its price has risen that far since.
+    LiveSettings.trim_min_rise set, once its price has moved that far since,
+    up or down.
     A trim sells only into bids within config.KELLY_TRIM_MAX_BID_DROP of the
     best bid, never into a gap in a book.
 
@@ -48,8 +49,9 @@ from .config import (
     CANDLESTICK_PERIOD_INTERVAL_MINUTES,
     CONTRACT_PAYOUT_DOLLARS,
     KELLY_TRIM_MAX_BID_DROP,
-    KELLY_TRIM_MIN_DAYS_SINCE_TRADE,
     MIN_ACTIVE_PRICE_DOLLARS,
+    PRICE_THEN_MAX_AGE_DAYS,
+    REBALANCE_MIN_DAYS_SINCE_TRADE,
     SALE_KIND_KELLY_TRIM,
     SALE_KIND_TAKE_PROFIT,
     SALE_PARTNER_MAX_AGE_DAYS,
@@ -57,7 +59,6 @@ from .config import (
     SCHEDULED_RUN,
     TAKE_PROFIT_HOLD_DAYS,
     TAKE_PROFIT_HOLD_DAYS_MAX,
-    TRIM_PRICE_THEN_MAX_AGE_DAYS,
     LiveSettings,
     count_text,
     days_to_maturity,
@@ -67,14 +68,14 @@ from .config import (
     kelly_hold_fraction,
     kelly_trim_bids,
     kelly_trim_count,
-    kelly_trim_min_days,
-    kelly_trim_rested,
-    pair_price_rise,
+    pair_price_move,
     pair_size_cap,
+    price_move_reached,
     reached_every_check,
+    rebalance_min_days,
+    rebalance_rested,
     take_profit_reached,
     trade_day,
-    trim_rise_reached,
 )
 from .historical import ask_before, bid_before, candle_reads_bid, recent_candles
 from .scanner import (
@@ -195,21 +196,21 @@ def _hold_days() -> int:
     return int(days)
 
 
-def _trim_min_days() -> int:
+def _rebalance_min_days() -> int:
     """
-    Check how many days a held pair must go without a trade before a Kelly trim.
+    Check how many days a held pair must go without a trade before a rebalance (here, a Kelly trim).
 
-    Reads seller.KELLY_TRIM_MIN_DAYS_SINCE_TRADE when called: a test patches it
+    Reads seller.REBALANCE_MIN_DAYS_SINCE_TRADE when called: a test patches it
     here, never config's.
 
     Returns:
-        int: A whole number from 0 (no wait) to config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX.
+        int: A whole number from 0 (no wait) to config.REBALANCE_MIN_DAYS_SINCE_TRADE_MAX.
 
     Raises:
         ValueError: For any other value, a bool or a float included.
     """
     # Cross-module: config's one check of this number
-    return kelly_trim_min_days(KELLY_TRIM_MIN_DAYS_SINCE_TRADE)
+    return rebalance_min_days(REBALANCE_MIN_DAYS_SINCE_TRADE)
 
 
 def _day(moment: datetime) -> date:
@@ -394,9 +395,9 @@ class _Reads:
         """
         One side's ask (its buy price) on a market at a past moment, from hourly candles.
 
-        The Kelly trim's minimum price rise compares a pair's price now with its
+        The Kelly trim's minimum price move compares a pair's price now with its
         price at its last fill; this reads one market's part of the price then.
-        The candles cover the config.TRIM_PRICE_THEN_MAX_AGE_DAYS days before the
+        The candles cover the config.PRICE_THEN_MAX_AGE_DAYS days before the
         moment and are fetched once.
 
         Args:
@@ -408,7 +409,7 @@ class _Reads:
             float: The side's latest usable ask at or before the moment, in dollars;
                 NaN when the candles could not be read or hold none in those days.
         """
-        window = TRIM_PRICE_THEN_MAX_AGE_DAYS * _DAY_SECONDS
+        window = PRICE_THEN_MAX_AGE_DAYS * _DAY_SECONDS
         key = (market.ticker, moment)
         if key not in self._then_candles:
             # Cross-module: fresh hourly candles (never the backtest's cache), starting
@@ -805,7 +806,7 @@ def _cents_text(dollars: float) -> str:
     """
     Write a price change in cents with its sign, for a log line.
 
-    Written to the hundredth of a cent (Kalshi's finest price step), so a rise
+    Written to the hundredth of a cent (Kalshi's finest price step), so a move
     just short of a minimum never reads as the minimum.
 
     Args:
@@ -865,8 +866,9 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
          see. What the pair would fetch at its held sides' best bids, after the
          fee, goes into `fetched`; if that alone is more than all open
          positions are valued at, it stops here (see Returns).
-      5. With a minimum price rise set: the pair's total price (the asks of
-         the sides held, added) has risen that far since its last fill.
+      5. With a minimum price move set: the pair's total price (the asks of
+         the sides held, added) has moved that far, up or down, since its
+         last fill.
       6. Its chance of paying can be read (config.held_pair_win_prob).
 
     The sale is sized and priced only on bids within KELLY_TRIM_MAX_BID_DROP of
@@ -877,10 +879,10 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
         pair (HeldPair): An exact held pair, never a lone market.
         reads (_Reads): This planner call's reads.
         fills (FillTimes | None): When each market last traded; None only with no
-            wait in days and no minimum price rise.
+            wait in days and no minimum price move.
         settings (LiveSettings): The run's settings: k, both size caps and the
-            minimum price rise.
-        min_days (int): Days a pair must go without a trade (_trim_min_days).
+            minimum price move.
+        min_days (int): Days a pair must go without a trade (_rebalance_min_days).
         now_date (date): Today on the bot's own clock (_day).
         utc_date (date): Today in UTC, for the days left before maturity.
         value (float): What the trim is sized on, in dollars: cash plus open positions.
@@ -916,7 +918,7 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
     markets = {ticker: reads.markets_by_ticker[ticker] for ticker, _side in pair.sides}
 
     # The pair's last trade: the latest fill on either market (None when none is
-    # listed). The wait and the price rise both count from it
+    # listed). The wait and the price move both count from it
     listed = ([fills.latest[ticker] for ticker, _side in pair.sides if ticker in fills.latest]
               if fills is not None else [])
     last_fill = max(listed) if listed else None
@@ -931,7 +933,7 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
         last = _day(since)
         days = (now_date - last).days
         # Cross-module: config's one test of the wait
-        if not kelly_trim_rested(last, now_date, min_days):
+        if not rebalance_rested(last, now_date, min_days):
             ago = (f"{days} day(s) ago" if days >= 0
                    else f"after today ({now_date}) on the bot's own clock")
             not_trimming(f"it last traded {last}, {ago}, and a trim waits until {min_days} "
@@ -984,7 +986,7 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
                for market, side in ((market_a, side_a), (market_b, side_b))}
     bid_a, bid_b = ladders[market_a.ticker][0][0], ladders[market_b.ticker][0][0]
     # One contract pair's sale at the best bids, after the fee. Tested before the
-    # price rise and the chance, so a pair they hold back still flags a wrong value
+    # price move and the chance, so a pair they hold back still flags a wrong value
     # Cross-module: the approximate fee on that sale
     top_value = bid_a + bid_b - fee_per_pair_approx(bid_a, bid_b)
     # plan_trims also tests these pairs together
@@ -996,13 +998,13 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
                       f"each), more than the {_dollars(positions_value)} all open positions "
                       "are valued at")
 
-    rise_text = ""
+    move_text = ""
     if settings.trim_min_rise is not None:
-        # The pair's total price (the asks of the sides held, added) must have risen
-        # that far since its last fill
+        # The pair's total price (the asks of the sides held, added) must have moved
+        # that far, up or down, since its last fill
         if last_fill is None:
             not_trimming("no fill is listed on either market, so its price when it last "
-                         "traded cannot be read, and a minimum price rise is set")
+                         "traded cannot be read, and a minimum price move is set")
             return None, None
         moment = math.floor(last_fill.timestamp())
         # Its price then: each held side's ask at the last fill, from hourly candles
@@ -1013,21 +1015,22 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
             unread, side = (market_a, side_a) if then_a != then_a else (market_b, side_b)
             not_trimming(f"the {side.upper()} ask on {unread.ticker} when the pair last "
                          f"traded ({_day(last_fill)}) cannot be read (no usable quote in the "
-                         f"{TRIM_PRICE_THEN_MAX_AGE_DAYS} days before it, or its price "
-                         "history could not be read), and a minimum price rise is set")
+                         f"{PRICE_THEN_MAX_AGE_DAYS} days before it, or its price "
+                         "history could not be read), and a minimum price move is set")
             return None, None
         # Its price now, from the books just read
         now_a = 1.0 - bids[(market_a.ticker, _other(side_a))][0][0]
         now_b = 1.0 - bids[(market_b.ticker, _other(side_b))][0][0]
-        # Cross-module: the rise and its test, both shared with the backtest
-        rise = pair_price_rise(then_a + then_b, now_a + now_b)
+        # Cross-module: the move and its test, both shared with the backtest (a
+        # rise and a fall of the minimum count alike)
+        move = pair_price_move(then_a + then_b, now_a + now_b)
         prices = (f"price {_price_text(then_a + then_b)} then, {_price_text(now_a + now_b)} now "
-                  f"({_cents_text(rise)}, minimum {settings.trim_min_rise * 100:.0f}c)")
-        if not trim_rise_reached(rise, settings.trim_min_rise):
-            not_trimming("its total price has not risen by the minimum since it last "
+                  f"({_cents_text(move)}, minimum {settings.trim_min_rise * 100:.0f}c)")
+        if not price_move_reached(move, settings.trim_min_rise):
+            not_trimming("its total price has not moved by the minimum since it last "
                          f"traded: {prices}")
             return None, None
-        rise_text = prices + ", "
+        move_text = prices + ", "
 
     # Cross-module: the chance the pair pays, as a new trade of it would be sized
     # (each ask is 1 minus the other side's best bid)
@@ -1058,7 +1061,7 @@ def _trim_one(pair: HeldPair, reads: _Reads, fills: FillTimes | None, *,
     # Cross-module: the share Kelly lets the pair keep at its best bids, for the log line
     keep = min(cap, kelly_hold_fraction(win_prob, top_value))
     head = (f"Kelly trim check: {text} ({_KIND_WORDS.get(pair_type, pair_type)}), "
-            f"{count_text(count)} each, {waited}, {rise_text}pays {win_prob:.1%}, "
+            f"{count_text(count)} each, {waited}, {move_text}pays {win_prob:.1%}, "
             f"{_dollars(top_value)} a pair at the best bids, may keep {keep:.1%} of "
             f"{_dollars(value)}")
     sell = decision.sell
@@ -1105,7 +1108,7 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
       - Kalshi's value of the open positions is known and above zero (a trim
         sized on too small a value sells too much).
       - Every held market's ladder is known.
-      - With a wait in days or a minimum price rise set, the account's fills
+      - With a wait in days or a minimum price move set, the account's fills
         could be read, and with a wait, the list reaches back that many days.
         With neither set, the fills are not read.
       - The pairs whose best bids were read would not, alone or together, fetch
@@ -1136,13 +1139,13 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
 
     Raises:
         ValueError: Before any request, when now is not timezone-aware, cash_cents is
-            not a finite number at least 0, or KELLY_TRIM_MIN_DAYS_SINCE_TRADE is
+            not a finite number at least 0, or REBALANCE_MIN_DAYS_SINCE_TRADE is
             invalid; later, when KELLY_TRIM_MAX_BID_DROP is invalid.
     """
     if not settings.trim_to_kelly:
         return []
     # Checked first, so a bad number stops the run before any request
-    min_days = _trim_min_days()
+    min_days = _rebalance_min_days()
     if not isinstance(now, datetime) or now.utcoffset() is None:
         raise ValueError(f"now must be a timezone-aware datetime, got {now!r}")
     if (isinstance(cash_cents, bool) or not isinstance(cash_cents, numbers.Real)
@@ -1185,7 +1188,7 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
     now_date = _day(now)
     fills = None
     if min_days > 0 or settings.trim_min_rise is not None:
-        # Cross-module: one read of the account's fills serves the wait and the price rise
+        # Cross-module: one read of the account's fills serves the wait and the price move
         fills = get_fill_times(client)
         if fills is None:
             logging.warning(
@@ -1204,7 +1207,7 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
         if fills.oldest is None:
             problem = "the account's fills list is empty"
         # Cross-module: config's one test of the wait, asked of the list's oldest day
-        elif not kelly_trim_rested(_day(fills.oldest), now_date, min_days):
+        elif not rebalance_rested(_day(fills.oldest), now_date, min_days):
             problem = (f"the account's fills list starts {_day(fills.oldest)} on the bot's "
                        f"own clock, fewer than {min_days} day(s) ago")
         if problem is not None:
@@ -1231,7 +1234,7 @@ def plan_trims(client: Any, held_positions: dict, held_labels: dict, markets_by_
             "sell less", _dollars(kalshi_value), _dollars(floor))
 
     # 0 daily checks: a trim reads only the books now and, with a minimum price
-    # rise, each market's price at its pair's last fill
+    # move, each market's price at its pair's last fill
     reads = _Reads(client, held_positions, markets_by_ticker, now.timestamp(), 0)
     utc_date = now.astimezone(UTC).date()
     plans: list[SalePlan] = []

@@ -3,7 +3,7 @@ leg-side tuples, the deadline-gap tier (with the backtest's spread band and
 tier-floors switch), the live toggles (LiveSettings and its helpers), the saved
 live defaults (their file's reader and writer, the seed, and the comparison of
 two sets of defaults), the weekly run schedule (ScheduledRun), the wait
-before a Kelly trim (kelly_trim_rested, kelly_trim_min_days, trade_day), the values
+before a Kelly trim (rebalance_rested, rebalance_min_days, trade_day), the values
 config.py ships, conftest's apply_pre_toggle_defaults, the V2 order path's
 self-trade-prevention value, the startup check that refuses any order path but
 "v2" (order_api_version_error), the order-write pacer's budget, the live-run
@@ -1124,7 +1124,7 @@ class TestLiveSettings:
 
     def test_trim_min_rise_on_the_grid_is_accepted_as_a_float(self):
         # Every 5c step from 5c to $1, as its cents over 100
-        step = config.TRIM_PRICE_RISE_STEP_CENTS
+        step = config.PRICE_MOVE_STEP_CENTS
         assert step == 5
         for cents in range(step, 101, step):
             s = _settings(trim_to_kelly=True, trim_min_rise=cents / 100)
@@ -1135,13 +1135,13 @@ class TestLiveSettings:
 
     def test_trim_min_rise_is_normalised_onto_the_grid(self):
         # 0.05 * 3 is 0.15000000000000002; every minimum comes back as its cents
-        # over 100, as the dashboard's options (TRIM_MIN_PRICE_RISES) spell them
+        # over 100, as the dashboard's options (MIN_PRICE_MOVES) spell them
         assert 0.05 * 3 != 0.15
         assert _settings(trim_to_kelly=True, trim_min_rise=0.05 * 3).trim_min_rise == 0.15
         for steps in range(1, 21):
             assert _settings(trim_to_kelly=True,
                              trim_min_rise=0.05 * steps).trim_min_rise == steps * 5 / 100
-        for rise in config.TRIM_MIN_PRICE_RISES:
+        for rise in config.MIN_PRICE_MOVES:
             assert _settings(trim_to_kelly=True, trim_min_rise=rise).trim_min_rise == rise
         # Float noise well inside PRICE_EPSILON snaps to the step
         assert _settings(trim_to_kelly=True, trim_min_rise=0.1 + 1e-9).trim_min_rise == 0.1
@@ -2398,88 +2398,106 @@ class TestKellyTrimBids:
             config.kelly_trim_bids([], drop)
 
 
-class TestTrimMinPriceRises:
-    """config.TRIM_MIN_PRICE_RISES: the minimum price rises the dashboard's
-    Min. price rise select offers, every 5c from 5c to 95c."""
+class TestMinPriceMoves:
+    """config.MIN_PRICE_MOVES: the minimum price moves, up or down, the
+    dashboard's Min. price rise select offers, every 5c from 5c to 95c."""
 
     def test_every_five_cents_from_5c_to_95c(self):
-        rises = config.TRIM_MIN_PRICE_RISES
+        rises = config.MIN_PRICE_MOVES
         assert isinstance(rises, tuple) and len(rises) == 19
-        assert config.TRIM_PRICE_RISE_STEP_CENTS == 5
+        assert config.PRICE_MOVE_STEP_CENTS == 5
         # Each is the float nearest its cents over 100, so 15c is exactly 0.15
         assert list(rises) == [cents / 100 for cents in range(5, 100, 5)]
         assert rises[0] == 0.05 and rises[2] == 0.15 and rises[-1] == 0.95
 
     def test_they_are_distinct_ascending_shares_of_a_dollar(self):
-        rises = config.TRIM_MIN_PRICE_RISES
+        rises = config.MIN_PRICE_MOVES
         assert list(rises) == sorted(set(rises))
         assert all(0.0 < rise <= 1.0 for rise in rises)
 
 
-class TestPairPriceRise:
-    """config.pair_price_rise: how far a held pair's total price has risen
-    since the last trade on it, the one place the direction is decided."""
+class TestPairPriceMove:
+    """config.pair_price_move: how far a held pair's total price has moved
+    since the last trade on it, signed (above zero for a rise, below for a
+    fall), the one place the sign is decided."""
 
     def test_a_rise_is_above_zero_and_a_fall_below(self):
-        assert config.pair_price_rise(0.62, 0.87) == pytest.approx(0.25)
-        assert config.pair_price_rise(0.87, 0.77) == pytest.approx(-0.10)
-        assert config.pair_price_rise(0.70, 0.70) == 0.0
+        assert config.pair_price_move(0.62, 0.87) == pytest.approx(0.25)
+        assert config.pair_price_move(0.87, 0.77) == pytest.approx(-0.10)
+        assert config.pair_price_move(0.70, 0.70) == 0.0
 
     def test_it_is_the_price_now_less_the_price_then(self):
         rng = random.Random(20261013)
         for _ in range(200):
             then, now = rng.uniform(0.0, 1.0), rng.uniform(0.0, 1.0)
-            assert config.pair_price_rise(then, now) == now - then
+            assert config.pair_price_move(then, now) == now - then
 
 
-class TestTrimRiseReached:
-    """config.trim_rise_reached: whether a held pair's price has risen far
-    enough for a Kelly trim to be considered. A fall never counts."""
+class TestPriceMoveReached:
+    """config.price_move_reached: whether a held pair's price has moved far
+    enough, up or down, for a rebalance (an add-on or a Kelly trim). A rise
+    and a fall of the same size count alike; a move that is not a number
+    holds the rebalance back; a larger minimum never passes what a smaller
+    one held back, which is what lets the backtest reuse one run for a
+    stricter minimum."""
 
     def test_no_minimum_passes_anything(self):
-        for rise in (0.5, 0.0, -0.9, float("nan")):
-            assert config.trim_rise_reached(rise, None) is True
+        for move in (0.5, 0.0, -0.9, float("nan")):
+            assert config.price_move_reached(move, None) is True
 
-    def test_a_rise_at_or_above_the_minimum_passes(self):
-        assert config.trim_rise_reached(0.10, 0.10)
-        assert config.trim_rise_reached(0.33, 0.30)
-        assert not config.trim_rise_reached(0.08, 0.10)
-        assert not config.trim_rise_reached(0.0, 0.05)
+    def test_a_move_at_or_above_the_minimum_passes_either_way(self):
+        assert config.price_move_reached(0.10, 0.10)
+        assert config.price_move_reached(0.33, 0.30)
+        assert config.price_move_reached(-0.10, 0.10)
+        assert config.price_move_reached(-0.33, 0.30)
+        assert not config.price_move_reached(0.08, 0.10)
+        assert not config.price_move_reached(-0.08, 0.10)
+        assert not config.price_move_reached(0.0, 0.05)
 
-    def test_a_rise_exactly_on_the_minimum_passes_through_float_noise(self):
-        # 87c less 62c is the 25c minimum, whatever the floats make of it
-        assert config.trim_rise_reached(config.pair_price_rise(0.62, 0.87), 0.25)
-        assert config.trim_rise_reached(config.pair_price_rise(0.30, 0.35), 0.05)
-        # One real cent short is short
-        assert not config.trim_rise_reached(config.pair_price_rise(0.62, 0.86), 0.25)
+    def test_a_move_exactly_on_the_minimum_passes_through_float_noise(self):
+        # 87c less 62c is the 25c minimum, whatever the floats make of it, up or down
+        assert config.price_move_reached(config.pair_price_move(0.62, 0.87), 0.25)
+        assert config.price_move_reached(config.pair_price_move(0.87, 0.62), 0.25)
+        assert config.price_move_reached(config.pair_price_move(0.30, 0.35), 0.05)
+        assert config.price_move_reached(config.pair_price_move(0.35, 0.30), 0.05)
+        # One real cent short is short, either way
+        assert not config.price_move_reached(config.pair_price_move(0.62, 0.86), 0.25)
+        assert not config.price_move_reached(config.pair_price_move(0.86, 0.62), 0.25)
 
-    def test_a_fall_never_passes_any_minimum(self):
-        for fall in (-0.01, -0.10, -0.50, -0.95):
-            for minimum in config.TRIM_MIN_PRICE_RISES:
-                assert not config.trim_rise_reached(fall, minimum)
+    def test_a_fall_of_the_minimum_passes_as_its_rise_does(self):
+        for move in (0.01, 0.10, 0.50, 0.95):
+            for minimum in config.MIN_PRICE_MOVES:
+                assert (config.price_move_reached(-move, minimum)
+                        is config.price_move_reached(move, minimum))
+        # ... and a large fall passes every minimum on the grid
+        assert all(config.price_move_reached(-0.95, m) for m in config.MIN_PRICE_MOVES)
 
-    def test_a_rise_or_a_minimum_that_is_not_a_number_holds_the_trim_back(self):
-        assert not config.trim_rise_reached(float("nan"), 0.05)
-        assert not config.trim_rise_reached(0.50, float("nan"))
-        assert not config.trim_rise_reached(0.50, float("inf"))
+    def test_a_move_or_a_minimum_that_is_not_a_number_holds_the_rebalance_back(self):
+        assert not config.price_move_reached(float("nan"), 0.05)
+        assert not config.price_move_reached(-float("nan"), 0.05)
+        assert not config.price_move_reached(0.50, float("nan"))
+        assert not config.price_move_reached(0.50, float("inf"))
+        assert not config.price_move_reached(-0.50, float("inf"))
 
     def test_a_larger_minimum_never_passes_what_a_smaller_one_held_back(self):
         # What lets one run's result stand for a stricter minimum: the test
-        # only ever gets harder to pass as the minimum grows
+        # only ever gets harder to pass as the minimum grows, for a fall too
         rng = random.Random(20261013)
-        minimums = config.TRIM_MIN_PRICE_RISES
+        minimums = config.MIN_PRICE_MOVES
         for _ in range(500):
-            rise = rng.uniform(-1.0, 1.0)
-            passed = [config.trim_rise_reached(rise, minimum) for minimum in minimums]
+            move = rng.uniform(-1.0, 1.0)
+            passed = [config.price_move_reached(move, minimum) for minimum in minimums]
             # Once it fails it fails at every larger minimum
             assert passed == sorted(passed, reverse=True)
 
     def test_the_rule_reads_only_what_it_is_handed(self):
         # Plain arithmetic on its arguments, so a live seller can call it with
-        # its own prices: no name from outside but math and PRICE_EPSILON
+        # its own prices: no name from outside but math, PRICE_EPSILON and the
+        # builtin abs
         source = pathlib.Path(config.__file__).read_text()
         tree = ast.parse(source)
-        allowed = {"pair_price_rise": set(), "trim_rise_reached": {"math", "PRICE_EPSILON"}}
+        allowed = {"pair_price_move": set(),
+                   "price_move_reached": {"math", "PRICE_EPSILON", "abs"}}
         found = 0
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name in allowed:
@@ -2492,13 +2510,14 @@ class TestTrimRiseReached:
         assert found == 2
 
 
-# The message kelly_trim_min_days refuses a bad number of days with
-_BAD_TRIM_DAYS = r"KELLY_TRIM_MIN_DAYS_SINCE_TRADE must be a whole number from 0 to 30, got "
+# The message rebalance_min_days refuses a bad number of days with
+_BAD_TRIM_DAYS = r"REBALANCE_MIN_DAYS_SINCE_TRADE must be a whole number from 0 to 30, got "
 
 
-class TestKellyTrimRested:
-    """config.kelly_trim_rested and config.kelly_trim_min_days: the calendar
-    days a held pair must go without a trade before a Kelly trim (7 as shipped).
+class TestRebalanceRested:
+    """config.rebalance_rested and config.rebalance_min_days: the calendar
+    days a held pair must go without a trade before a rebalance (a Kelly trim
+    or, in the backtest, an add-on; 7 as shipped).
 
     The rule compares two plain dates with a checked number of days and reads
     no clock or schedule, so it holds however often runs happen. A missing
@@ -2506,12 +2525,12 @@ class TestKellyTrimRested:
     """
 
     def test_seven_days_ship(self):
-        assert config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE == 7
-        assert type(config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE) is int
-        assert config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX == 30
-        assert type(config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX) is int
+        assert config.REBALANCE_MIN_DAYS_SINCE_TRADE == 7
+        assert type(config.REBALANCE_MIN_DAYS_SINCE_TRADE) is int
+        assert config.REBALANCE_MIN_DAYS_SINCE_TRADE_MAX == 30
+        assert type(config.REBALANCE_MIN_DAYS_SINCE_TRADE_MAX) is int
         # The shipped wait passes its own check
-        assert config.kelly_trim_min_days(config.KELLY_TRIM_MIN_DAYS_SINCE_TRADE) == 7
+        assert config.rebalance_min_days(config.REBALANCE_MIN_DAYS_SINCE_TRADE) == 7
 
     @pytest.mark.parametrize("gap", range(0, 9))
     def test_every_gap_from_0_to_8_days(self, gap):
@@ -2520,7 +2539,7 @@ class TestKellyTrimRested:
         last = date(2026, 10, 6)
         assert last.weekday() == 1
         day = last + timedelta(days=gap)
-        assert config.kelly_trim_rested(last, day, 7) is (gap >= 7)
+        assert config.rebalance_rested(last, day, 7) is (gap >= 7)
 
     def test_the_gap_alone_decides_from_any_start_day(self):
         # Every start day of 2027-2028 (a leap day and clock changes among
@@ -2532,7 +2551,7 @@ class TestKellyTrimRested:
             for gap in range(33):
                 day = last + timedelta(days=gap)
                 for wait in (0, 1, 7, 8, 14, 15, 30):
-                    assert config.kelly_trim_rested(last, day, wait) is (gap >= wait), (
+                    assert config.rebalance_rested(last, day, wait) is (gap >= wait), (
                         last, day, wait)
 
     @pytest.mark.parametrize("wait", [0, 1, 7, 30])
@@ -2540,18 +2559,18 @@ class TestKellyTrimRested:
     def test_a_last_trade_after_the_day_never_rests(self, ahead, wait):
         # A last trade dated after the day never counts as rested, even with no wait
         day = date(2026, 10, 13)
-        assert config.kelly_trim_rested(day + timedelta(days=ahead), day, wait) is False
+        assert config.rebalance_rested(day + timedelta(days=ahead), day, wait) is False
 
     def test_no_wait_rests_from_the_day_of_the_trade(self):
         day = date(2026, 10, 13)
-        assert config.kelly_trim_rested(day, day, 0) is True
-        assert config.kelly_trim_rested(day, day, 1) is False
-        assert config.kelly_trim_rested(day - timedelta(days=1), day, 1) is True
+        assert config.rebalance_rested(day, day, 0) is True
+        assert config.rebalance_rested(day, day, 1) is False
+        assert config.rebalance_rested(day - timedelta(days=1), day, 1) is True
 
     def test_once_rested_a_pair_stays_rested_and_a_longer_wait_never_rests_sooner(self):
         last = date(2026, 10, 6)
         for wait in range(0, 31):
-            rested = [config.kelly_trim_rested(last, last + timedelta(days=gap), wait)
+            rested = [config.rebalance_rested(last, last + timedelta(days=gap), wait)
                       for gap in range(0, 40)]
             # False for the first `wait` days, True from then on
             assert rested == [False] * wait + [True] * (40 - wait)
@@ -2561,28 +2580,28 @@ class TestKellyTrimRested:
         # trim it, a run on Tuesday the 13th may
         bought = date(2026, 10, 6)
         for run_day in range(7, 13):
-            assert not config.kelly_trim_rested(bought, date(2026, 10, run_day), 7)
-        assert config.kelly_trim_rested(bought, date(2026, 10, 13), 7)
+            assert not config.rebalance_rested(bought, date(2026, 10, run_day), 7)
+        assert config.rebalance_rested(bought, date(2026, 10, 13), 7)
         # Trimmed on the 13th: a second run that day and runs on the 14th
         # through the 19th leave it alone
         trimmed = date(2026, 10, 13)
         for run_day in range(13, 20):
-            assert not config.kelly_trim_rested(trimmed, date(2026, 10, run_day), 7)
-        assert config.kelly_trim_rested(trimmed, date(2026, 10, 20), 7)
+            assert not config.rebalance_rested(trimmed, date(2026, 10, run_day), 7)
+        assert config.rebalance_rested(trimmed, date(2026, 10, 20), 7)
         # An add-on on Friday the 9th instead moves the first day to Friday the 16th
         added = date(2026, 10, 9)
-        assert not config.kelly_trim_rested(added, date(2026, 10, 13), 7)
-        assert not config.kelly_trim_rested(added, date(2026, 10, 15), 7)
-        assert config.kelly_trim_rested(added, date(2026, 10, 16), 7)
+        assert not config.rebalance_rested(added, date(2026, 10, 13), 7)
+        assert not config.rebalance_rested(added, date(2026, 10, 15), 7)
+        assert config.rebalance_rested(added, date(2026, 10, 16), 7)
 
     def test_a_missing_last_trade_is_an_error_never_rested(self):
         day = date(2026, 10, 13)
         # Not with the shipped wait, and not with no wait either
         for wait in (7, 0):
             with pytest.raises(TypeError, match="two calendar dates"):
-                config.kelly_trim_rested(None, day, wait)
+                config.rebalance_rested(None, day, wait)
             with pytest.raises(TypeError, match="two calendar dates"):
-                config.kelly_trim_rested(day, None, wait)
+                config.rebalance_rested(day, None, wait)
 
     def test_a_datetime_is_refused(self):
         # Datetimes count 24-hour spans, not calendar days (11pm on the 6th to
@@ -2590,11 +2609,11 @@ class TestKellyTrimRested:
         last = datetime(2026, 10, 6, 23, 0, tzinfo=UTC)
         now = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
         assert (now - last).days == 6
-        assert config.kelly_trim_rested(last.date(), now.date(), 7) is True
+        assert config.rebalance_rested(last.date(), now.date(), 7) is True
         for last_trade, day in ((last, now), (last, now.date()), (last.date(), now),
                                 (last.replace(tzinfo=None), now.date())):
             with pytest.raises(TypeError, match="two calendar dates"):
-                config.kelly_trim_rested(last_trade, day, 7)
+                config.rebalance_rested(last_trade, day, 7)
 
     def test_anything_but_a_plain_date_is_refused(self):
         class _Day(date):
@@ -2605,7 +2624,7 @@ class TestKellyTrimRested:
                     MagicMock(), timedelta(days=7)):
             for last_trade, day in ((bad, good), (good, bad), (bad, bad)):
                 with pytest.raises(TypeError, match="two calendar dates"):
-                    config.kelly_trim_rested(last_trade, day, 7)
+                    config.rebalance_rested(last_trade, day, 7)
 
     @pytest.mark.parametrize("bad", [True, False, 7.0, 7.5, -1, 31, None, "7", float("nan")],
                              ids=repr)
@@ -2616,18 +2635,18 @@ class TestKellyTrimRested:
                           (date(2026, 10, 13), date(2026, 10, 13)),
                           (date(2026, 10, 14), date(2026, 10, 13))):
             with pytest.raises(ValueError, match=_BAD_TRIM_DAYS):
-                config.kelly_trim_rested(last, day, bad)
+                config.rebalance_rested(last, day, bad)
 
     @pytest.mark.parametrize("days", [0, 1, 7, 8, 14, 15, 30])
     def test_min_days_returns_a_whole_number_in_range_as_a_plain_int(self, days):
-        checked = config.kelly_trim_min_days(days)
+        checked = config.rebalance_min_days(days)
         assert checked == days and type(checked) is int
 
     @pytest.mark.parametrize("bad", [True, False, 7.0, 7.5, -1, 31, 1000, None, "7", b"7", [7],
                                      float("nan"), float("inf")], ids=repr)
     def test_min_days_refuses_anything_else(self, bad):
         with pytest.raises(ValueError, match=_BAD_TRIM_DAYS) as refused:
-            config.kelly_trim_min_days(bad)
+            config.rebalance_min_days(bad)
         # The message shows what was handed in
         assert str(refused.value).endswith(f"got {bad!r}")
 
@@ -2636,11 +2655,11 @@ class TestKellyTrimRested:
 
         # A numpy whole number is a whole number, and comes back a plain int
         for good in (np.int64(7), np.uint8(7), np.int8(7), np.int32(7)):
-            checked = config.kelly_trim_min_days(good)
+            checked = config.rebalance_min_days(good)
             assert checked == 7 and type(checked) is int
         for bad in (np.bool_(True), np.float64(7.0), np.int64(31), np.int64(-1)):
             with pytest.raises(ValueError, match=_BAD_TRIM_DAYS):
-                config.kelly_trim_min_days(bad)
+                config.rebalance_min_days(bad)
 
     @pytest.mark.parametrize("unit", [None, "ns", "us", "ms", "s", "m", "h", "D", "W", "M", "Y"],
                              ids=str)
@@ -2652,7 +2671,7 @@ class TestKellyTrimRested:
         duration = np.timedelta64(7) if unit is None else np.timedelta64(7, unit)
         assert isinstance(duration, numbers.Integral)
         with pytest.raises(ValueError, match=_BAD_TRIM_DAYS) as refused:
-            config.kelly_trim_min_days(duration)
+            config.rebalance_min_days(duration)
         assert str(refused.value).endswith(f"got {duration!r}")
 
     def test_a_wait_written_as_a_month_is_not_read_as_one_day(self):
@@ -2664,7 +2683,7 @@ class TestKellyTrimRested:
                      np.timedelta64(1), np.timedelta64(1, "D")):
             for last in (day - timedelta(days=1), day - timedelta(days=7), day):
                 with pytest.raises(ValueError, match=_BAD_TRIM_DAYS):
-                    config.kelly_trim_rested(last, day, wait)
+                    config.rebalance_rested(last, day, wait)
 
     def test_min_days_reads_a_whole_number_by_subclass_as_a_plain_int(self):
         class _Days(enum.IntEnum):
@@ -2672,14 +2691,14 @@ class TestKellyTrimRested:
 
             WEEK = 7
 
-        checked = config.kelly_trim_min_days(_Days.WEEK)
+        checked = config.rebalance_min_days(_Days.WEEK)
         assert checked == 7 and type(checked) is int
 
     def test_the_maximum_is_read_when_the_check_runs(self, monkeypatch):
-        monkeypatch.setattr(config, "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX", 10)
-        assert config.kelly_trim_min_days(10) == 10
+        monkeypatch.setattr(config, "REBALANCE_MIN_DAYS_SINCE_TRADE_MAX", 10)
+        assert config.rebalance_min_days(10) == 10
         with pytest.raises(ValueError, match="whole number from 0 to 10, got 11"):
-            config.kelly_trim_min_days(11)
+            config.rebalance_min_days(11)
 
     def test_the_rule_reads_only_what_it_is_handed(self):
         # Each function may read only the names listed: no clock, no weekday,
@@ -2687,15 +2706,15 @@ class TestKellyTrimRested:
         # however often runs happen
         tree = ast.parse(pathlib.Path(config.__file__).read_text())
         allowed = {
-            "kelly_trim_min_days": {"isinstance", "bool", "numbers", "operator", "TypeError",
-                                    "ValueError", "KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX"},
+            "rebalance_min_days": {"isinstance", "bool", "numbers", "operator", "TypeError",
+                                    "ValueError", "REBALANCE_MIN_DAYS_SINCE_TRADE_MAX"},
             "trade_day": {"isinstance", "datetime", "ScheduledRun", "TypeError"},
-            "kelly_trim_rested": {"type", "date", "TypeError", "kelly_trim_min_days"},
+            "rebalance_rested": {"type", "date", "TypeError", "rebalance_min_days"},
         }
         # Attributes allowed: trade_day reads only its schedule's zone, and
-        # kelly_trim_min_days only operator.index (which refuses a numpy duration)
+        # rebalance_min_days only operator.index (which refuses a numpy duration)
         attributes = {("trade_day", "run"): {"zone"},
-                      ("kelly_trim_min_days", "operator"): {"index"}}
+                      ("rebalance_min_days", "operator"): {"index"}}
         found = 0
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name in allowed:
@@ -2837,9 +2856,9 @@ class TestTradeDay:
             """A datetime by subclass, as a clock-freezing stand-in is."""
 
         day = config.trade_day(_Moment(2026, 10, 14, 0, 30, tzinfo=UTC), SCHEDULED_RUN)
-        # Exactly what kelly_trim_rested accepts
+        # Exactly what rebalance_rested accepts
         assert type(day) is date and day == date(2026, 10, 13)
-        assert config.kelly_trim_rested(day, day, 0) is True
+        assert config.rebalance_rested(day, day, 0) is True
 
     def test_a_time_with_no_zone_is_refused(self):
         class _NoOffset(tzinfo):
@@ -2880,7 +2899,7 @@ class TestTradeDay:
 
     def test_evening_trades_on_either_side_of_midnight_pacific(self):
         def rested(fill: datetime, run: datetime) -> bool:
-            return config.kelly_trim_rested(config.trade_day(fill, SCHEDULED_RUN),
+            return config.rebalance_rested(config.trade_day(fill, SCHEDULED_RUN),
                                             config.trade_day(run, SCHEDULED_RUN), 7)
 
         # Traded at 11:59pm on Tuesday the 6th: a run just after midnight on
@@ -2903,10 +2922,10 @@ class TestTradeDay:
         run = datetime(2026, 10, 13, 16, 0, tzinfo=UTC)     # 9am Pacific, Tuesday the 13th
         last, today = config.trade_day(fill, SCHEDULED_RUN), config.trade_day(run, SCHEDULED_RUN)
         assert (last, today) == (date(2026, 10, 6), date(2026, 10, 13))
-        assert config.kelly_trim_rested(last, today, 7) is True
+        assert config.rebalance_rested(last, today, 7) is True
         # On a UTC clock the same two moments are six days apart
         utc_clock = ScheduledRun(0, 9, 0, "UTC")
-        assert config.kelly_trim_rested(config.trade_day(fill, utc_clock),
+        assert config.rebalance_rested(config.trade_day(fill, utc_clock),
                                         config.trade_day(run, utc_clock), 7) is False
 
     def test_a_run_at_any_hour_of_days_1_to_8_after_a_purchase(self):
@@ -2919,7 +2938,7 @@ class TestTradeDay:
                 for run_hour in (0, 9, 16, 17, 23):
                     run = datetime(2026, 10, 6 + days_after, run_hour, 15, tzinfo=_PACIFIC)
                     today = config.trade_day(run, SCHEDULED_RUN)
-                    assert config.kelly_trim_rested(last, today, 7) is (days_after >= 7), (
+                    assert config.rebalance_rested(last, today, 7) is (days_after >= 7), (
                         fill, run)
 
     def test_the_wait_at_any_two_moments_of_a_year(self):
@@ -2931,7 +2950,7 @@ class TestTradeDay:
         for _ in range(4000):
             fill = start + timedelta(seconds=rng.randrange(0, 350 * 86_400))
             run = fill + timedelta(seconds=rng.randrange(0, 10 * 86_400))
-            rested = config.kelly_trim_rested(config.trade_day(fill, SCHEDULED_RUN),
+            rested = config.rebalance_rested(config.trade_day(fill, SCHEDULED_RUN),
                                               config.trade_day(run, SCHEDULED_RUN), 7)
             by_hand = (_pacific_day_by_hand(run) - _pacific_day_by_hand(fill)).days >= 7
             assert rested is by_hand, (fill, run)

@@ -213,11 +213,12 @@ Notes:
     (main.py --trim-to-kelly for one run), which the dashboard's Save as
     live defaults… can set.
 
-    The family's minimum price rises are ON by default with it
+    The family's minimum price moves are ON by default with it
     (trim_rise_sweep=True): the TrimSweep also carries every minimum of
-    config.TRIM_MIN_PRICE_RISES (TrimSweep.min_rises), where a held pair is
-    trimmed only once its total price has risen that many cents since the
-    last trade on it (the dashboard's Min. price rise select). They too are
+    config.MIN_PRICE_MOVES (TrimSweep.min_rises), where a held pair is
+    trimmed (and, with adding to held pairs on, added to) only once its
+    total price has moved that many cents, up or down, since the last trade
+    on it (the dashboard's Min. price rise select). They too are
     simulated only when the dashboard is built. --no-trim-rise-sweep skips
     them and still builds Trim to Kelly itself; --no-trim-sweep skips both.
     A live run uses its own saved trim_min_rise (main.py --trim-min-rise
@@ -620,8 +621,8 @@ def _config_closure(tree: ast.Module, names: set[str]) -> list[tuple[str, str]]:
     The config.py statements that define the names read, and every config name they use.
 
     Why: a name the simulator reads can depend on others it never names. The
-    backtester calls config.kelly_trim_min_days, which reads
-    KELLY_TRIM_MIN_DAYS_SINCE_TRADE_MAX; a change to that constant changes
+    backtester calls config.rebalance_min_days, which reads
+    REBALANCE_MIN_DAYS_SINCE_TRADE_MAX; a change to that constant changes
     what a simulation does, so it must change the fingerprint, or a rebuild
     would mix two versions of the code without a word.
 
@@ -959,7 +960,7 @@ def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, add_on_sweep: bo
     select disabled and skips its simulations: a quick page for checking a
     change. Without the size-cap sweep, a run builds the add-on, Sell and Trim
     to Kelly families at its own cap alone, so those that stay are narrowed
-    to it too. Without the minimum price rises, the Trim to Kelly family stays
+    to it too. Without the minimum price moves, the Trim to Kelly family stays
     and carries none.
 
     Args:
@@ -1284,11 +1285,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-trim-rise-sweep", action="store_true",
         help="Skip the dashboard's Min. price rise select (with Trim to Kelly on, trim a "
-             "held pair only once its total price has risen a chosen number of cents since "
-             "the last trade on it): its simulations run only while the dashboard is built. "
-             "Trim to Kelly itself is still built. Backtest only — a live run waits for a "
-             "price rise by its own saved trim_min_rise (main.py --trim-min-rise for one "
-             "run)",
+             "held pair, and with Add to held pairs on add to it, only once its total price "
+             "has moved a chosen number of cents, up or down, since the last trade on it): "
+             "its simulations run only while the dashboard is built. Trim to Kelly itself "
+             "is still built. Backtest only — a live run waits for a price move by its own "
+             "saved trim_min_rise (main.py --trim-min-rise for one run)",
     )
     parser.add_argument(
         "--sell-workers", type=int, default=None, metavar="N",

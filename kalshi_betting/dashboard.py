@@ -101,7 +101,7 @@ Purpose:
     at each weekly run, a held pair that has outgrown its Kelly size at that
     day's sale prices (or the size cap) is sold down to it
     (backtester._simulate_at_discount's trim_to_kelly), but only once
-    backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE calendar days have passed
+    backtester.REBALANCE_MIN_DAYS_SINCE_TRADE calendar days have passed
     since its last trade (at weekly runs the shipped 7 days never hold a
     trim back; the select's hover text says so, _trim_select_title). With
     Add to held pairs on as well, a pair is topped up or sold down each week.
@@ -113,9 +113,10 @@ Purpose:
     is not simulated together with trimming). Save as live defaults… saves
     the choice as the live defaults' trim_to_kelly, which live runs trim by.
 
-    When that family carries minimum price rises
-    (backtester.TrimSweep.min_rises: trim a held pair only once its total
-    price has risen that far since the last trade on it), the walk's last
+    When that family carries minimum price moves
+    (backtester.TrimSweep.min_rises: trim a held pair, and with Add to held
+    pairs on add to it, only once its total price has moved that far, up or
+    down, since the last trade on it), the walk's last
     phase reads every Trim to Kelly scenario at each of them
     (_walk_trim_rise_cells, through TrimSweep.rise_grid, which simulates
     only the runs that differ). A run of its own is packed as a chunk; a run
@@ -246,11 +247,11 @@ Dependencies:
     rise_grid hands back a backtester.SameTrim for a minimum price rise that
     repeats another run) by their attributes; imports backtester itself to
     read, and in a worker process install, its SAME_TITLE_SIZE_CAP,
-    SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS (_run_sell_task; the last also
-    names the Sell select's rule, _sell_select_title), to read its
-    KELLY_TRIM_MIN_DAYS_SINCE_TRADE (named in the Trim to Kelly select's
-    hover text, _trim_select_title), and to word a minimum
-    price rise as a run's label does (_trim_rise_label) — and
+    SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and REBALANCE_MIN_DAYS_SINCE_TRADE
+    (_run_sell_task; the third also names the Sell select's rule,
+    _sell_select_title, and the fourth the Trim to Kelly select's hover
+    text, _trim_select_title), and to word a minimum price move as a run's
+    label does (_trim_rise_label) — and
     BACKTEST_OUTCOME_LABEL_WARN_FRACTION, PROJECT_ROOT, DASHBOARD_FILENAME (the
     page's file name, which defaults_server opens when run on its own and
     live_dashboard serves as its Backtest tab), DASHBOARD_FILES_DIRNAME
@@ -6551,7 +6552,7 @@ def _trim_select_title(days) -> str:
 
     Args:
         days: Calendar days a held pair must go without a trade before a
-            trim (backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE), as it stands.
+            trim (backtester.REBALANCE_MIN_DAYS_SINCE_TRADE), as it stands.
 
     Returns:
         str: The rule in plain words: the wait (at a week or less, that it
@@ -6568,15 +6569,16 @@ def _trim_select_title(days) -> str:
         # ArithmeticError): claim nothing about it
         none = one = covered = False
     if none:
-        wait = "A pair can be trimmed at any weekly run after a trade on it. "
+        wait = ("A pair can be trimmed (or, with Add to held pairs on, added to) at any "
+                "weekly run after a trade on it. ")
         # No wait for a live run to count either
         live = ""
     else:
         passed = "day has" if one else "days have"
-        wait = (f"A pair is trimmed only when at least {days} {passed} passed since its "
-                "last purchase, add-on or trim"
+        wait = (f"A pair is trimmed (or, with Add to held pairs on, added to) only when at "
+                f"least {days} {passed} passed since its last purchase, add-on or trim"
                 + (f"; weekly runs are {_DAYS_BETWEEN_WEEKLY_RUNS} days apart, so this never "
-                   "holds a trim back here. " if covered else ". "))
+                   "holds a trim or an add-on back here. " if covered else ". "))
         # A live run reads its trades from Kalshi's list of the account's fills
         live = ("A live run counts the wait in calendar days on the bot's own clock from "
                 "the last fill of any sort on either market, a trade by hand included, and "
@@ -6586,7 +6588,8 @@ def _trim_select_title(days) -> str:
             "pair that has grown past its Kelly size at that day's sale prices, or past the "
             "size cap, is sold down to it, the latest purchase first; with Add to held pairs "
             f"on as well, a pair is topped up or sold down each week. {wait}Min. price rise "
-            "can make a trim wait until the pair's price has gone up. Each part sold counts "
+            "can make a trim (and an add-on) wait until the pair's price has moved far "
+            "enough, up or down. Each part sold counts "
             f"as a trade of its own. {live}While this is on, Sell is set to no selling (the two "
             "are not simulated together). From a page that simulated trimming, Save as live "
             "defaults saves this choice and the Min. price rise shown, for live runs to trim "
@@ -6623,13 +6626,15 @@ _TRIM_REACH_NO_EXPLORER = ("Trim to Kelly changes the trade sections only; the k
 # "trim_rise_state"
 _TRIM_RISE_OPTION_ANY = "any"
 _TRIM_RISE_TITLE = (
-    "Used only while Trim to Kelly is on. A held pair is trimmed only if its price has "
-    "risen at least this many cents since the last trade on it: its purchase, an add-on "
-    "(Add to held pairs) or an earlier trim. The price is the two sides held, added: for "
-    "a time-series pair, YES on the earlier market plus NO on the later one. A fall never "
-    "counts. any: no minimum, so a pair can be trimmed whichever way its price moved. "
+    "Used only while Trim to Kelly is on. A held pair is trimmed, and with Add to held "
+    "pairs on added to, only if its price has moved at least this many cents, up or down, "
+    "since the last trade on it: its purchase, an add-on or an earlier trim. The price is "
+    "the two sides held, added: for a time-series pair, YES on the earlier market plus NO "
+    "on the later one (for a held market whose partner has paid out, its own price). A "
+    "rise and a fall count alike. any: no minimum, so a pair can be rebalanced however "
+    "little its price moved. "
     "From a page that simulated trimming, Save as live defaults saves the minimum shown, "
-    "for live runs to wait for (any, or Trim to Kelly off, saves none); from any other "
+    "for live trims to wait for (any, or Trim to Kelly off, saves none); from any other "
     "page it keeps the saved one. A live run reads the price at the pair's last fill on "
     "Kalshi, so with a minimum set it does not trim a pair whose last fill is older than "
     "Kalshi's list of the account's fills reaches.")
@@ -6668,7 +6673,7 @@ def _trim_rise_option(rise: float) -> str:
 
 def _trim_rise_phrase(rise: float) -> str:
     """
-    Name a minimum price rise as it follows the Trim to Kelly phrase in a scenario's summary.
+    Name a minimum price move as it follows the Trim to Kelly phrase in a scenario's summary.
 
     The words are the backtester's own (backtester._trim_rise_label), so the
     page names a run as that run's log line does. The base block ships it as
@@ -6678,8 +6683,8 @@ def _trim_rise_phrase(rise: float) -> str:
         rise (float): The minimum, in dollars, in (0, 1].
 
     Returns:
-        str: " only after a <cents>c price rise", e.g. " only after a 5c
-            price rise" for 0.05.
+        str: " only after a <cents>c price move", e.g. " only after a 5c
+            price move" for 0.05.
     """
     return _backtester._trim_rise_label(rise)
 
@@ -7322,10 +7327,10 @@ class _GridSource:
             walk's log; empty without the view.
         trim_rises (tuple[float, ...]): The minimum price rises the Trim to
             Kelly family covers (backtester.TrimSweep.min_rises), in
-            dollars, ascending: with one, a held pair is trimmed only once
-            its total price has risen that far since the last trade on it.
-            Empty when the family carries none, or the page has no Trim to
-            Kelly view.
+            dollars, ascending: with one, a held pair is trimmed (and, with
+            adding on, added to) only once its total price has moved that
+            far, up or down, since the last trade on it. Empty when the
+            family carries none, or the page has no Trim to Kelly view.
         trim_rise_cell: Callable (band, k, add, tier floors off, start) ->
             an iterator of (minimum price rise, {cap: SweepPoint | SameTrim}),
             one per minimum of trim_rises, ascending
@@ -8581,10 +8586,11 @@ def _walk_trim_cells(source: _GridSource, trim_takers: list,
     primary cap first.
 
     With `starts`, each cell also leaves behind what its minimum price rises
-    start from: per cap, how far the pair's price had risen before each trim
-    that cap's run made (SweepPoint.trim_rises). _walk_trim_rise_cells reads
-    the cells back in this order, and hands each cell's entry to
-    TrimSweep.rise_grid so the run with no minimum is not simulated twice.
+    start from: per cap, how far the pair's price had moved before each trim
+    and each add-on that cap's run made (SweepPoint.trim_rises).
+    _walk_trim_rise_cells reads the cells back in this order, and hands each
+    cell's entry to TrimSweep.rise_grid so the run with no minimum is not
+    simulated twice.
 
     Args:
         source (_GridSource): The grid (its trim_cell is not None).
@@ -10556,8 +10562,12 @@ class _SellTask:
         hold_days (int): backtester.TAKE_PROFIT_HOLD_DAYS as the parent reads
             it: how many days in a row a position must stay at a level
             before it is sold.
+        rebalance_days (int): backtester.REBALANCE_MIN_DAYS_SINCE_TRADE as
+            the parent reads it: how many days a held pair must go without a
+            trade before an add-on (the Sell family's runs with Add to held
+            pairs on read it).
         install (bool): Whether the task runs in a worker process of its own,
-            which then installs those three bindings first (a spawned process
+            which then installs those four bindings first (a spawned process
             imports backtester afresh, from config). False in the parent.
     """
     index: int
@@ -10579,6 +10589,7 @@ class _SellTask:
     same_title_size_cap: float
     scheduled_run: object
     hold_days: int
+    rebalance_days: int
     install: bool = False
 
 
@@ -10828,8 +10839,9 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
     dropped before the next is read.
 
     Runs in a worker process (task.install True: the parent's
-    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS are
-    installed first) or in the parent itself.
+    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and
+    REBALANCE_MIN_DAYS_SINCE_TRADE are installed first) or in the parent
+    itself.
 
     Args:
         task (_SellTask): The task.
@@ -10843,11 +10855,12 @@ def _run_sell_task(task: _SellTask) -> _SellResult:
             and leaves the task's cells uncovered.
     """
     if task.install:
-        # A spawned process imported backtester afresh: size, checkpoint and
-        # sell as the parent does
+        # A spawned process imported backtester afresh: size, checkpoint,
+        # sell and wait as the parent does
         _backtester.SAME_TITLE_SIZE_CAP = task.same_title_size_cap
         _backtester.SCHEDULED_RUN = task.scheduled_run
         _backtester.TAKE_PROFIT_HOLD_DAYS = task.hold_days
+        _backtester.REBALANCE_MIN_DAYS_SINCE_TRADE = task.rebalance_days
     family = task.family
     band = family.bands[0] if task.tier_floors else family.off_bands[0]
     axis_end = task.axis[-1] if len(task.axis) else None
@@ -10949,10 +10962,11 @@ def _sell_tasks(walked: _GridSource, chunker: "_ChunkVisitor", *, start_date: da
               "series_categories": series_categories, "cat_index": dict(chunker.cat_index),
               "sub_index": dict(chunker.sub_index), "risk_free": risk_free,
               "inline_keys": frozenset(chunker.seen), "out_dir": folder,
-              # The three bindings a spawned worker installs (_run_sell_task)
+              # The four bindings a spawned worker installs (_run_sell_task)
               "same_title_size_cap": _backtester.SAME_TITLE_SIZE_CAP,
               "scheduled_run": _backtester.SCHEDULED_RUN,
-              "hold_days": _backtester.TAKE_PROFIT_HOLD_DAYS}
+              "hold_days": _backtester.TAKE_PROFIT_HOLD_DAYS,
+              "rebalance_days": _backtester.REBALANCE_MIN_DAYS_SINCE_TRADE}
     tasks: list[_SellTask] = []
 
     def add(bi: int, band, tier_floors: bool, rows: dict) -> None:
@@ -11001,7 +11015,8 @@ def _run_sell_tasks(tasks: list[_SellTask], workers: int) -> dict[int, _SellResu
     With one worker (or one task) every task runs here, in order. Otherwise a
     pool of spawned processes runs them (spawn, not fork: safe on macOS, and
     a fresh import in each worker, which installs the parent's
-    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN and TAKE_PROFIT_HOLD_DAYS). A task
+    SAME_TITLE_SIZE_CAP, SCHEDULED_RUN, TAKE_PROFIT_HOLD_DAYS and
+    REBALANCE_MIN_DAYS_SINCE_TRADE). A task
     that raises costs its own cells only: one WARNING naming its band (the
     first with its traceback), and the rest go on; a pool that cannot run at
     all fails every task the same way.
@@ -12893,7 +12908,7 @@ def _filter_bar_html(payload: dict, primary_views: dict) -> str:
                  f"{html.escape(_TRIM_NOTES.get(trim_state, _TRIM_NOTES['not simulated']))}"
                  "</span>")
     # The hover text names the wait after a trade, as the page's trim runs read it
-    trim_title = html.escape(_trim_select_title(_backtester.KELLY_TRIM_MIN_DAYS_SINCE_TRADE))
+    trim_title = html.escape(_trim_select_title(_backtester.REBALANCE_MIN_DAYS_SINCE_TRADE))
     # The Min. price rise choice: any (no minimum, value "0") or a minimum,
     # each option's value its place in the payload's trim_rises plus one
     rise_opts = (f'<option value="0" selected>{html.escape(_TRIM_RISE_OPTION_ANY)}</option>'
@@ -13187,8 +13202,9 @@ def _pack_text(raw: str) -> str:
 # and it reaches neither the k-hat figures, the interval-discount section
 # nor the scenario explorer. The "Min. price rise" select after it
 # (SHOWN[10], appended last, so every other index keeps its meaning) picks
-# the least rise in a held pair's price a trim waits for: "0" is any (the
-# Trim to Kelly run itself), and i names D.trim_rises[i - 1]. It counts, and
+# the least move, up or down, in a held pair's price a trim (and, with Add
+# to held pairs on, an add-on) waits for: "0" is any (the Trim to Kelly run
+# itself), and i names D.trim_rises[i - 1]. It counts, and
 # is open, only while Trim to Kelly is on, on a page whose base block
 # carries D.grid_trim_rise (refreshRise, riseAt); shut, it keeps its value,
 # so trimming switched on again shows the minimum it still names. A
@@ -13295,9 +13311,9 @@ _FILTER_JS = r"""
   // "Trim to Kelly": the runs as simulated (off), or with each held pair
   // sold down to its Kelly size at every weekly run (on, D.grid_trim)
   var trimSel = document.getElementById('flt-trim');
-  // "Min. price rise": the least rise in a held pair's price a trim waits
-  // for ("0": any; i: D.trim_rises[i - 1]); it counts only while Trim to
-  // Kelly is on
+  // "Min. price rise": the least move, up or down, in a held pair's price a
+  // trim (and, with Add to held pairs on, an add-on) waits for ("0": any;
+  // i: D.trim_rises[i - 1]); it counts only while Trim to Kelly is on
   var riseSel = document.getElementById('flt-rise');
   if (!dataEl || !bandSel || !tierSel || !kSel || !capSel || !addSel || !trimSel || !riseSel
       || !sellSel || !daysSel || !catMenu || !tagMenu || !catAll || !tagAll) {
