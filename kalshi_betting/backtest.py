@@ -8,9 +8,8 @@ Purpose:
     arguments (--start-date, --balance, --no-cache, --max-horizon-days,
     --interval-discount, --no-sweep, --same-event-ladders /
     --no-same-event-ladders, --spread-min, --spread-max, --no-band-sweep,
-    --no-cap-sweep, --no-add-on-sweep, --no-sell-sweep, --sell-workers,
-    --no-trim-sweep, --no-trim-rise-sweep, --dashboard-only,
-    --accept-changed-simulator),
+    --no-cap-sweep, --no-sell-sweep, --sell-workers, --no-rebalance-sweep,
+    --no-move-sweep, --dashboard-only, --accept-changed-simulator),
     configures logging to kalshi_backtest.log, constructs the necessary API
     clients, works out the starting balance (--balance, or else what the Kalshi
     account is worth when the run starts), fits the depth model from the saved
@@ -184,47 +183,39 @@ Notes:
     its caps from its run's config.LiveSettings, built from the saved live
     defaults.
 
-    The "Add to held pairs" family is ON by default too (add_on_sweep=True):
-    the result carries two more lazy CapSweeps (BacktestSweep.add_on_cap_sweep,
-    and add_on_tier_off_cap_sweep over the tier-floors-off runs) whose every
-    simulation adds to pairs it still holds, for the "all" population only.
-    Like the cap sweeps they simulate nothing during the run — every figure and
-    point the run returns is unchanged — and each cell is simulated only when
-    the dashboard is built, so --no-add-on-sweep makes that step faster.
-
     The "Sell" family is ON by default too (sell_sweep=True): the result
     carries a lazy SellSweep (BacktestSweep.sell_sweep) that simulates, when
     the dashboard is built, every scenario selling a position early at each
     level of config.TAKE_PROFIT_LEVELS with each minimum of days before
     maturity of config.TAKE_PROFIT_MIN_DAYS (the dashboard's Sell and Min.
-    days to maturity selects). None of those scenarios adds to held pairs or
-    trims them: the dashboard sets Sell to no selling and shuts it while Add
-    to held pairs or Trim to Kelly is on. It simulates nothing during the
-    run; --no-sell-sweep skips it, leaving both selects disabled. Nothing here
+    days to maturity selects). None of those scenarios rebalances held
+    pairs: the dashboard sets Sell to no selling and shuts it while
+    Rebalance is yes. Like the cap sweeps it simulates nothing during the
+    run — every figure and point the run returns is unchanged — and
+    --no-sell-sweep skips it, leaving both selects disabled. Nothing here
     reaches live trading by itself: a live run sells at its saved sell_at
     level (main.py --sell-at overrides it for one run), which the dashboard's
     Save as live defaults… can set.
 
-    The "Trim to Kelly" family is ON by default too (trim_sweep=True): the
-    result carries a lazy TrimSweep (BacktestSweep.trim_sweep) that
-    simulates, when the dashboard is built, every scenario again with held
-    pairs sold down to their Kelly size at each weekly checkpoint, adding to
-    held pairs or not (the dashboard's Trim to Kelly select). It simulates
-    nothing during the run; --no-trim-sweep skips it, leaving the select
-    disabled. A live run trims only by its own saved trim_to_kelly
-    (main.py --trim-to-kelly for one run), which the dashboard's Save as
-    live defaults… can set.
+    The "Rebalance" family is ON by default too (rebalance_sweep=True): the
+    result carries a lazy RebalanceSweep (BacktestSweep.rebalance_sweep)
+    that simulates, when the dashboard is built, every scenario again with
+    held pairs rebalanced at each weekly checkpoint — topped up to their
+    Kelly size when they have room and sold down to it when they have
+    grown past it, the two together (the dashboard's Rebalance select). It
+    simulates nothing during the run; --no-rebalance-sweep skips it,
+    leaving the select disabled. A live run adds to and trims held pairs
+    only by its own saved settings (main.py's flags for one run), which the
+    dashboard's Save as live defaults… can set.
 
-    The family's minimum price moves are ON by default with it
-    (trim_rise_sweep=True): the TrimSweep also carries every minimum of
-    config.MIN_PRICE_MOVES (TrimSweep.min_rises), where a held pair is
-    trimmed (and, with adding to held pairs on, added to) only once its
-    total price has moved that many cents, up or down, since the last trade
-    on it (the dashboard's Min. price rise select). They too are
-    simulated only when the dashboard is built. --no-trim-rise-sweep skips
-    them and still builds Trim to Kelly itself; --no-trim-sweep skips both.
-    A live run uses its own saved trim_min_rise (main.py --trim-min-rise
-    for one run).
+    The family's minimum price movements are ON by default with it
+    (move_sweep=True): the RebalanceSweep also carries every minimum of
+    config.MIN_PRICE_MOVES (RebalanceSweep.min_moves), where a held pair is
+    added to or trimmed only once its total price has moved that many
+    cents, up or down, since the last trade on it (the dashboard's Min.
+    price movement select). They too are simulated only when the dashboard
+    is built. --no-move-sweep skips them and still builds Rebalance itself;
+    --no-rebalance-sweep skips both.
 
     Every full run saves what it hands generate_dashboard, right after the
     sweep and before the page is built, in config.BACKTEST_SWEEP_FILENAME in
@@ -508,7 +499,7 @@ def _log_corpus_provenance(sweep: BacktestSweep) -> None:
 
 # The modules whose code decides what a backtest simulates: during the run, and
 # again while its dashboard is built, when the lazy families (the size caps,
-# Add to held pairs, Sell and Trim to Kelly) simulate their cells. With the
+# Sell and Rebalance) simulate their cells. With the
 # parts of config.py they read, they make up the simulator fingerprint a saved
 # sweep is stamped with. dashboard.py is not among them: changing it is what a
 # rebuild from the saved sweep is for.
@@ -952,23 +943,23 @@ def _load_saved_inputs(path: Path) -> dict[str, Any]:
     return inputs
 
 
-def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, add_on_sweep: bool,
-                      sell_sweep: bool, trim_sweep: bool,
-                      trim_rise_sweep: bool) -> tuple[BacktestSweep, list[str]]:
+def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, sell_sweep: bool,
+                      rebalance_sweep: bool,
+                      move_sweep: bool) -> tuple[BacktestSweep, list[str]]:
     """
     Drop lazy families from a loaded sweep, as a run given the matching --no-*-sweep flags builds it.
 
     Each flag that is False drops its family, so the rebuilt page leaves its
     select disabled and skips its simulations: a quick page for checking a
-    change. Without the size-cap sweep, a run builds the add-on, Sell and Trim
-    to Kelly families at its own cap alone, so those that stay are narrowed
-    to it too. Without the minimum price moves, the Trim to Kelly family stays
-    and carries none.
+    change. Without the size-cap sweep, a run builds the Sell and Rebalance
+    families at its own cap alone, so those that stay are narrowed to it
+    too. Without the minimum price movements, the Rebalance family stays and
+    carries none.
 
     Args:
         sweep (BacktestSweep): The loaded sweep; left as it is.
-        cap_sweep, add_on_sweep, sell_sweep, trim_sweep, trim_rise_sweep
-            (bool): Whether each family stays.
+        cap_sweep, sell_sweep, rebalance_sweep, move_sweep (bool): Whether
+            each family stays.
 
     Returns:
         tuple[BacktestSweep, list[str]]: The sweep the page is built from
@@ -983,25 +974,21 @@ def _without_families(sweep: BacktestSweep, *, cap_sweep: bool, add_on_sweep: bo
             dropped.append("the size caps (--no-cap-sweep)")
         # The other lazy families at the run's own cap, as a run without the
         # size-cap sweep builds them
-        for name in ("add_on_cap_sweep", "add_on_tier_off_cap_sweep", "sell_sweep",
-                     "trim_sweep"):
+        for name in ("sell_sweep", "rebalance_sweep"):
             family = getattr(sweep, name)
             if family is not None and family.caps != (family.primary_cap,):
                 changes[name] = replace(family, caps=(family.primary_cap,))
-    if not add_on_sweep and (sweep.add_on_cap_sweep is not None
-                             or sweep.add_on_tier_off_cap_sweep is not None):
-        changes.update(add_on_cap_sweep=None, add_on_tier_off_cap_sweep=None)
-        dropped.append("Add to held pairs (--no-add-on-sweep)")
     if not sell_sweep and sweep.sell_sweep is not None:
         changes["sell_sweep"] = None
         dropped.append("Sell (--no-sell-sweep)")
-    if not trim_sweep and sweep.trim_sweep is not None:
-        changes["trim_sweep"] = None
-        dropped.append("Trim to Kelly (--no-trim-sweep)")
-    elif not trim_rise_sweep and sweep.trim_sweep is not None and sweep.trim_sweep.min_rises:
-        trimmed = changes.get("trim_sweep", sweep.trim_sweep)
-        changes["trim_sweep"] = replace(trimmed, min_rises=())
-        dropped.append("Min. price rise (--no-trim-rise-sweep)")
+    if not rebalance_sweep and sweep.rebalance_sweep is not None:
+        changes["rebalance_sweep"] = None
+        dropped.append("Rebalance (--no-rebalance-sweep)")
+    elif (not move_sweep and sweep.rebalance_sweep is not None
+          and sweep.rebalance_sweep.min_moves):
+        family = changes.get("rebalance_sweep", sweep.rebalance_sweep)
+        changes["rebalance_sweep"] = replace(family, min_moves=())
+        dropped.append("Min. price movement (--no-move-sweep)")
     return (replace(sweep, **changes) if changes else sweep), dropped
 
 
@@ -1121,7 +1108,7 @@ def _rebuild_dashboard(parser: argparse.ArgumentParser, args: argparse.Namespace
         parser.exit(2, (
             f"backtest: the run saved at {path} ({header.get('saved_at')}) was simulated by "
             f"other code: {', '.join(changed)} changed since it was saved{python_note}. "
-            "A rebuild simulates the size caps, Add to held pairs, Sell and Trim to Kelly "
+            "A rebuild simulates the size caps, Sell and Rebalance "
             "cells while the page is built, with the code as it is now, so the run's own "
             "figures and those cells would come from two different versions of the code. "
             "Run the backtest again, or pass --accept-changed-simulator to build the page "
@@ -1134,7 +1121,7 @@ def _rebuild_dashboard(parser: argparse.ArgumentParser, args: argparse.Namespace
     if changed:
         logging.warning(
             "The simulator's code changed since this run was saved (%s)%s: the page's "
-            "lazily simulated cells (size caps, Add to held pairs, Sell, Trim to Kelly) "
+            "lazily simulated cells (size caps, Sell, Rebalance) "
             "come from this code and its other figures from the run's "
             "(--accept-changed-simulator)", ", ".join(changed), python_note)
     started = time.perf_counter()
@@ -1146,9 +1133,8 @@ def _rebuild_dashboard(parser: argparse.ArgumentParser, args: argparse.Namespace
         raise SystemExit(f"backtest: {message}") from None
     logging.info("Loaded the saved run in %.1f s", time.perf_counter() - started)
     sweep, dropped = _without_families(
-        inputs["sweep"], cap_sweep=not args.no_cap_sweep, add_on_sweep=not args.no_add_on_sweep,
-        sell_sweep=not args.no_sell_sweep, trim_sweep=not args.no_trim_sweep,
-        trim_rise_sweep=not args.no_trim_rise_sweep)
+        inputs["sweep"], cap_sweep=not args.no_cap_sweep, sell_sweep=not args.no_sell_sweep,
+        rebalance_sweep=not args.no_rebalance_sweep, move_sweep=not args.no_move_sweep)
     if dropped:
         logging.info("Dashboard rebuilt without: %s", "; ".join(dropped))
     # The T-bill yields, read again: never raises (see the full run's read)
@@ -1255,14 +1241,6 @@ def _build_parser() -> argparse.ArgumentParser:
              "--same-title-size-cap for one live run",
     )
     parser.add_argument(
-        "--no-add-on-sweep", action="store_true",
-        help="Skip the dashboard's Add to held pairs choice: its simulations run "
-             "only while the dashboard is built, so skipping them makes that step "
-             "faster and leaves the choice disabled. Backtest only — live runs add "
-             "to held pairs when the saved live defaults say so, or main.py's own "
-             "--add-to-held-pairs / --no-add-to-held-pairs for one live run",
-    )
-    parser.add_argument(
         "--no-sell-sweep", action="store_true",
         help="Skip the dashboard's Sell and Min. days to maturity selects (sell a "
              "whole position once it has held a chosen share of the profit it could "
@@ -1275,23 +1253,24 @@ def _build_parser() -> argparse.ArgumentParser:
              "shown here",
     )
     parser.add_argument(
-        "--no-trim-sweep", action="store_true",
-        help="Skip the dashboard's Trim to Kelly select (sell part of a held pair, "
-             "at each weekly checkpoint, once it is worth more than its Kelly share "
-             "of the portfolio): its simulations run only while the dashboard is "
-             "built, so skipping them makes that step faster and leaves the select "
-             "disabled. Backtest only — a live run trims by its own saved "
-             "trim_to_kelly (main.py --trim-to-kelly for one run), which the "
-             "dashboard's Save as live defaults… can set to the choice shown here",
+        "--no-rebalance-sweep", action="store_true",
+        help="Skip the dashboard's Rebalance select and its Min. price movement select "
+             "(at each weekly checkpoint, top a held pair up to its Kelly share of the "
+             "portfolio when it has room and sell it down to it when it has grown past "
+             "it): their simulations run only while the dashboard is built, so skipping "
+             "them makes that step faster and leaves both selects disabled. Backtest "
+             "only — a live run adds to and trims held pairs by its own saved settings, "
+             "which the dashboard's Save as live defaults… can set to the choice shown "
+             "here",
     )
     parser.add_argument(
-        "--no-trim-rise-sweep", action="store_true",
-        help="Skip the dashboard's Min. price rise select (with Trim to Kelly on, trim a "
-             "held pair, and with Add to held pairs on add to it, only once its total price "
-             "has moved a chosen number of cents, up or down, since the last trade on it): "
-             "its simulations run only while the dashboard is built. Trim to Kelly itself "
-             "is still built. Backtest only — a live run waits for a price move by its own "
-             "saved trim_min_rise (main.py --trim-min-rise for one run)",
+        "--no-move-sweep", action="store_true",
+        help="Skip the dashboard's Min. price movement select (with Rebalance yes, add "
+             "to or trim a held pair only once its total price has moved a chosen "
+             "number of cents, up or down, since the last trade on it); Rebalance "
+             "itself is still built. Its simulations run only while the dashboard is "
+             "built. Backtest only — a live run waits for a price move by its own "
+             "saved minimum (main.py --trim-min-rise for one run)",
     )
     parser.add_argument(
         "--sell-workers", type=int, default=None, metavar="N",
@@ -1313,9 +1292,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--accept-changed-simulator", action="store_true",
         help="With --dashboard-only: build the page even though the simulator's code "
              "(backtester, strategy, scanner, depth_model, historical, or the config they "
-             "read) changed since the run was saved. The size caps, Add to held pairs, "
-             "Sell and Trim to Kelly cells are simulated while the page is built, so they "
-             "then come from this code and the run's other figures from the old code",
+             "read) changed since the run was saved. The size caps, Sell and Rebalance "
+             "cells are simulated while the page is built, so they then come from this "
+             "code and the run's other figures from the old code",
     )
     return parser
 
@@ -1327,8 +1306,8 @@ def main() -> None:
     Parses command-line arguments (--start-date, --balance, --no-cache,
     --max-horizon-days, --interval-discount, --no-sweep,
     --same-event-ladders / --no-same-event-ladders, --spread-min,
-    --spread-max, --no-band-sweep, --no-cap-sweep, --no-add-on-sweep,
-    --no-sell-sweep, --no-trim-sweep, --no-trim-rise-sweep, --sell-workers,
+    --spread-max, --no-band-sweep, --no-cap-sweep, --no-sell-sweep,
+    --no-rebalance-sweep, --no-move-sweep, --sell-workers,
     --dashboard-only, --accept-changed-simulator); with --dashboard-only it
     hands over to _rebuild_dashboard, which rebuilds the page from the saved
     inputs and runs nothing below. Otherwise it configures
@@ -1357,10 +1336,9 @@ def main() -> None:
     tier-floors-off family's at every cap, result.tier_off_cap_sweep) only
     by the dashboard, which reads every cell as the page is built (its filter
     bar, Interval Discount section and scenario explorer); the lazily
-    simulated add-on sweeps (result.add_on_cap_sweep, and
-    result.add_on_tier_off_cap_sweep), sell family (result.sell_sweep) and
-    Kelly-trim family (result.trim_sweep, with its minimum price rises) are
-    read the same way.
+    simulated sell family (result.sell_sweep) and Rebalance family
+    (result.rebalance_sweep, with its minimum price movements) are read the
+    same way.
     """
     parser = _build_parser()
     args = parser.parse_args()
@@ -1473,17 +1451,15 @@ def main() -> None:
     # opt-out saves nothing in the run itself — only the time and size of
     # whatever report reads the cells, and the entries kept alive for it
     cap_sweep = not args.no_cap_sweep
-    # ON by default, like the cap sweep, and for the same reason: nothing is
-    # simulated during the run, so the opt-out saves only the dashboard step
-    add_on_sweep = not args.no_add_on_sweep
-    # ON by default too, and lazy the same way: the dashboard simulates it
+    # ON by default too, and lazy the same way: the dashboard simulates it,
+    # so the opt-out saves only the dashboard step
     sell_sweep = not args.no_sell_sweep
-    # ... and so is the Trim to Kelly select's family
-    trim_sweep = not args.no_trim_sweep
-    # ... and, as part of that family, the minimum price rises its trims can
-    # be made to wait for (the Min. price rise select): on with it unless
-    # opted out, and off whenever the family itself is
-    trim_rise_sweep = trim_sweep and not args.no_trim_rise_sweep
+    # ... and so is the Rebalance select's family
+    rebalance_sweep = not args.no_rebalance_sweep
+    # ... and, as part of that family, the minimum price movements its
+    # add-ons and trims can be made to wait for (the Min. price movement
+    # select): on with it unless opted out, and off whenever the family is
+    move_sweep = rebalance_sweep and not args.no_move_sweep
     # The dashboard simulates the Sell select in worker processes: one less
     # than the CPUs (the main process waits on them), within the config bound
     sell_workers = _sell_workers(args.sell_workers)
@@ -1538,17 +1514,17 @@ def main() -> None:
 
     logging.info(
         "Backtest config: start=%s | balance=$%.2f | cache=%s | k=%.3f | ladders=%s "
-        "| spread band=%g-%g | band sweep=%s | cap sweep=%s | add-on sweep=%s "
-        "| sell sweep=%s | trim sweep=%s | live rule=%s | fills=%s",
+        "| spread band=%g-%g | band sweep=%s | cap sweep=%s "
+        "| sell sweep=%s | rebalance sweep=%s | live rule=%s | fills=%s",
         start_date, start.dollars, "on" if use_cache else "off", effective_k,
         ladders_echo, echo_floor, echo_ceiling,
         "on" if band_sweep else "off", "on" if cap_sweep else "off",
-        "on" if add_on_sweep else "off",
         f"on ({sell_workers} worker process{'' if sell_workers == 1 else 'es'})"
         if sell_sweep else "off",
-        # A default run reads "on"; the family without its minimum price rises says so
-        "off" if not trim_sweep else "on" if trim_rise_sweep
-        else "on (no minimum price rises)",
+        # A default run reads "on"; the family without its minimum price
+        # movements says so
+        "off" if not rebalance_sweep else "on" if move_sweep
+        else "on (no minimum price movements)",
         live_rule_echo, _fills_echo(depth_model),
     )
     # Warn on a ceiling that empties a tier. config.time_series_spread_band's
@@ -1619,20 +1595,18 @@ def main() -> None:
         # tier-bound bands simulated again with the tiers off (needs the grid)
         tier_off_sweep=band_sweep,
         cap_sweep=cap_sweep,
-        # The dashboard's "Add to held pairs: on" views, simulated lazily when
-        # the page is built (no simulation during the run)
-        add_on_sweep=add_on_sweep,
-        # The dashboard's Sell select, lazy the same way
+        # The dashboard's Sell select, simulated lazily when the page is built
+        # (no simulation during the run)
         sell_sweep=sell_sweep,
-        # ... and its Trim to Kelly select
-        trim_sweep=trim_sweep,
-        # ... with the Min. price rise select's minimums, part of that family
-        trim_rise_sweep=trim_rise_sweep,
+        # ... and its Rebalance select, lazy the same way
+        rebalance_sweep=rebalance_sweep,
+        # ... with the Min. price movement select's minimums, part of that family
+        move_sweep=move_sweep,
         # Every trade's order book is built from this table (None: top of book)
         depth_model=depth_model,
         # The listing the same-title label check files each series by
         series_categories=series_categories,
-    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy add-on sweeps (add_on_cap_sweep, and add_on_tier_off_cap_sweep with the band sweep) unless --no-add-on-sweep
+    )  # returns BacktestSweep — primary point, one point per swept k and the calibration, plus the band-sweep payload (scenarios, same_title_point, calibrations_by_band) and the tier-floors-off family (tier_off_scenarios, tier_off_calibrations_by_band) unless --no-band-sweep, the lazy size-cap sweeps (cap_sweep, and tier_off_cap_sweep with the band sweep) unless --no-cap-sweep, and the lazy sell and Rebalance families (sell_sweep, rebalance_sweep) unless --no-sell-sweep / --no-rebalance-sweep
     # What the dashboard is handed, saved before the page is built, so
     # --dashboard-only can rebuild the page (or finish a build that stopped)
     # without running the backtest again. period_end is the window's last day,
@@ -1652,8 +1626,8 @@ def main() -> None:
     # tier-floors-off family, result.tier_off_cap_sweep, simulated only when
     # a cell is read) only by the dashboard, whose one grid walk reads
     # every cell as the page is built (filter bar, Interval Discount section
-    # and scenario explorer). The add-on sweeps (result.add_on_cap_sweep and
-    # result.add_on_tier_off_cap_sweep) are lazy the same way.
+    # and scenario explorer). The sell and Rebalance families
+    # (result.sell_sweep and result.rebalance_sweep) are lazy the same way.
     trades, equity_df = result.primary.trades, result.primary.equity_df
 
     if not trades:
@@ -1688,8 +1662,9 @@ def main() -> None:
     # explorer's, from its tier-floors-off family), the lazy size-cap sweeps
     # (cap_sweep and tier_off_cap_sweep, None under --no-cap-sweep — every
     # cell of them is simulated here, in the page's one grid walk), the lazy
-    # add-on sweeps (add_on_cap_sweep and add_on_tier_off_cap_sweep, None
-    # under --no-add-on-sweep) and the header's run-settings line;
+    # sell and Rebalance families (sell_sweep and rebalance_sweep, None under
+    # --no-sell-sweep and --no-rebalance-sweep) and the header's run-settings
+    # line;
     # interval_discount is the resolved k these trades were sized at, which
     # the Risk section's Kelly scatter must price on
     #

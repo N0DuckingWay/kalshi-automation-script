@@ -7505,8 +7505,10 @@ class TestLiveTrimTextsSayWhatARunDoes:
 
     def test_each_save_step_says_what_the_button_does_to_the_other_setting(self):
         # On a page showing both, the Save button saves the other setting off
-        # (Trim to Kelly shuts Sell, and Sell needs Trim to Kelly off); a
-        # /confirm link that leaves it out keeps it. Each save step says so
+        # (Rebalance yes shuts Sell, and Sell needs Rebalance no); a
+        # /confirm link that leaves it out keeps it. Each save step says so.
+        # Rebalance yes also saves adding to held pairs on, which has a dry-run
+        # check of its own, so each trim save step says that too
         claude = self._lines("CLAUDE.md")
         [trim] = [x for x in claude if x.startswith("**First-run order for trimming.**")]
         [sell] = [x for x in claude
@@ -7521,20 +7523,21 @@ class TestLiveTrimTextsSayWhatARunDoes:
                      readme_step("### Turn on live trimming", "3. **Save the setting.**")):
             assert "also sends no selling" in step
             assert "names no sell level" in step
+            assert "also saves adding to held pairs on" in step
         for step in (sell.split("(3) ", 1)[1],
                      readme_step("### Turn on live selling", "3. **Save the level.**")):
             assert "also sends trimming off" in step
             assert "names no trim setting" in step
 
-    def test_the_save_button_is_said_to_send_the_trim_choices(self):
-        # From a page that simulated trimming the button sends the Trim to Kelly
-        # choice and the Min. price rise, so saving a scenario with Trim to Kelly
-        # off turns a saved live trim off
+    def test_the_save_button_is_said_to_send_the_rebalance_choices(self):
+        # From a page that simulated rebalancing the button sends the Rebalance
+        # choice and the Min. price movement, so saving a scenario with Rebalance
+        # no turns a saved live add-on and trim off
         section = self._readme_section("### Dashboard buttons")
         bullet = " ".join(section.split("- **Save as live defaults…**", 1)[1]
                           .split("- **Trade using defaults…**", 1)[0].split())
-        assert "add to held pairs, trim to Kelly and Min. price rise, Sell level" in bullet
-        assert "the Trim to Kelly choice with the Min. price rise shown" in bullet
+        assert "rebalance and Min. price movement, Sell level" in bullet
+        assert "the Rebalance choice with the Min. price movement shown" in bullet
 
     def test_the_live_tab_counts_a_trim_among_the_bots_sales(self):
         # A run with trim_to_kelly on and no sell level sells part of held pairs

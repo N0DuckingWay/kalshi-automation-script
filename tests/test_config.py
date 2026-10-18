@@ -2400,7 +2400,7 @@ class TestKellyTrimBids:
 
 class TestMinPriceMoves:
     """config.MIN_PRICE_MOVES: the minimum price moves, up or down, the
-    dashboard's Min. price rise select offers, every 5c from 5c to 95c."""
+    dashboard's Min. price movement select offers, every 5c from 5c to 95c."""
 
     def test_every_five_cents_from_5c_to_95c(self):
         rises = config.MIN_PRICE_MOVES

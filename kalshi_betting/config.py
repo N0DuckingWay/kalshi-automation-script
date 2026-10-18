@@ -521,7 +521,7 @@ TAKE_PROFIT_HOLD_DAYS = 3
 # held each of its trades at every check (trades are bought only at checkpoints).
 TAKE_PROFIT_HOLD_DAYS_MAX = 7
 
-# The price moves the backtest dashboard's "Min. price rise" select offers
+# The price moves the backtest dashboard's "Min. price movement" select offers
 # beside "any". A rebalance (an add-on to a held pair, or a Kelly trim of one)
 # is made only once the pair's total price (the price of the side held on each
 # of its two markets, added) is at least this many dollars above or below
@@ -529,7 +529,7 @@ TAKE_PROFIT_HOLD_DAYS_MAX = 7
 # trim): a move up and a move down count alike. Every 5c from 5c to 95c, 19
 # values, each the float nearest its cents over 100 (so 15c is exactly the
 # float 0.15), all distinct and in (0, 1]. Backtest only: read by
-# backtester.run_backtest_sweep(trim_rise_sweep=True), which checks them
+# backtester.run_backtest_sweep(move_sweep=True), which checks them
 # before its fetch. A live run uses its own saved minimum
 # (LiveSettings.trim_min_rise), which _step_rise holds to the same step,
 # PRICE_MOVE_STEP_CENTS, from 5c to $1.
@@ -826,10 +826,12 @@ BACKTEST_SWEEP_FILENAME = "backtest_sweep.pkl.gz"
 
 # The format the saved sweep file is written in: a gzip stream holding one
 # line of JSON (this tag, the simulator fingerprint, when it was saved,
-# under which Python, and the run's start date) and then the pickled inputs. A rebuild refuses a file
-# with any other tag; change it whenever the line's keys or the pickled
-# inputs' keys change, so an older file is refused rather than misread.
-BACKTEST_SWEEP_FORMAT = "backtest-sweep-v1"
+# under which Python, and the run's start date) and then the pickled inputs.
+# A rebuild refuses a file with any other tag; change it whenever the line's
+# keys, the pickled inputs' keys or the fields of the classes pickled in them
+# (BacktestSweep and the lazy families it holds) change, so an older file is
+# refused rather than misread.
+BACKTEST_SWEEP_FORMAT = "backtest-sweep-v2"
 
 # The most bytes a rebuild reads for the saved sweep file's first line (the
 # JSON one): the real line is a few hundred bytes, so a file that runs past
@@ -2752,7 +2754,7 @@ def _step_rise(value, name: str) -> float:
     """
     Validate a minimum price move and round it onto the 5c grid.
 
-    The grid (PRICE_MOVE_STEP_CENTS) is the dashboard's "Min. price rise"
+    The grid (PRICE_MOVE_STEP_CENTS) is the dashboard's "Min. price movement"
     step, so a live minimum always equals one of its options, or $1.
 
     Args:

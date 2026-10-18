@@ -6638,7 +6638,7 @@ class TestFilterScript:
         snap = _run_script(tmp_path, page, [["wait"], ["snap", "s"]],
                            no_decompression=True)["s"]
         assert all(snap["selects"][i]["disabled"]
-                   for i in (*_FLT_SELECTS, "flt-tier", "flt-add", "flt-trim", "flt-rise",
+                   for i in (*_FLT_SELECTS, "flt-tier", "flt-rebalance", "flt-move",
                              "khat-group"))
         assert snap["text"]["flt-summary"].startswith(
             "The filter could not load its data (this browser cannot decompress it)")
@@ -7379,8 +7379,8 @@ class TestSaveLiveDefaultsButton:
 
         Each number must read back as the base block's own value, and the
         query must carry the run's same-title cap, the source note and the
-        category and tag given, and no other field. The adding, selling and
-        trimming fields may also be present (pages with those views send
+        category and tag given, and no other field. The rebalancing and
+        selling fields may also be present (pages with those views send
         them); the caller checks their values.
 
         Args:
@@ -7408,9 +7408,12 @@ class TestSaveLiveDefaultsButton:
                  "same_title_size_cap", "source", "category", "tag", "add_to_held_pairs",
                  "sell_at", "sell_min_days", "trim_to_kelly", "trim_min_rise"}
         assert set(query) <= known
-        # The two trim fields are always sent together: a minimum sent alone is
-        # paired with the saved switch, and the server refuses a minimum with trimming off
-        assert ("trim_to_kelly" in query) is ("trim_min_rise" in query)
+        # Rebalance's three fields are always sent together, adding and
+        # trimming alike: the page shows the two only together, and the
+        # server refuses a minimum with trimming off
+        rebalance = ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise")
+        assert len({name in query for name in rebalance}) == 1
+        assert query.get("add_to_held_pairs") == query.get("trim_to_kelly")
 
     def test_the_button_is_rendered_disabled_with_its_words(self, monkeypatch, tmp_path):
         page = self._page(monkeypatch, tmp_path)
@@ -7728,28 +7731,26 @@ class TestSaveLiveDefaultsButton:
         assert target == {"url": _SAVE_URL, "same_title_size_cap": None,
                           "filed_by_listing": True,
                           "source": "backtest dashboard for 2026-01-05 to 2026-09-28",
-                          "live_adds_to_held_pairs": False, "live_sells": False,
-                          "live_trims": False,
+                          "live_rebalances": False, "live_sells": False,
                           # The most categories, and tags, one address may name
                           "max_names": config.DEFAULTS_SERVER_MAX_FILTER_NAMES}
-        # ... which is True only for a run that recorded saved defaults adding
-        for saved, said in ((True, True), (False, False), (None, False)):
-            swept = dataclasses.replace(sweep, live_add_to_held_pairs=saved)
+        # "live_rebalances" is True only for a run that recorded saved
+        # defaults adding to held pairs or trimming them (a minimum price
+        # rise alone is neither): Rebalance no turns off both
+        for adds, trims, rise, said in ((True, None, None, True), (None, True, None, True),
+                                        (True, True, 0.1, True), (False, True, 0.1, True),
+                                        (False, False, None, False), (None, None, None, False),
+                                        (None, None, 0.1, False)):
+            swept = dataclasses.replace(sweep, live_add_to_held_pairs=adds,
+                                        live_trim_to_kelly=trims, live_trim_min_rise=rise)
             assert dashboard._save_target(swept, _FLT_START, today, _FLT_SERIES)[
-                "live_adds_to_held_pairs"] is said
+                "live_rebalances"] is said, (adds, trims, rise)
         # ... and "live_sells" only for a recorded sell level (a minimum alone is no sale)
         for level, days, said in ((0.85, 3, True), (0.85, None, True), (None, None, False),
                                   (None, 3, False)):
             swept = dataclasses.replace(sweep, live_sell_at=level, live_sell_min_days=days)
             assert dashboard._save_target(swept, _FLT_START, today, _FLT_SERIES)[
                 "live_sells"] is said
-        # ... and "live_trims" only for saved defaults that trim to Kelly (a
-        # minimum price rise alone is no trim)
-        for trims, rise, said in ((True, None, True), (True, 0.1, True), (False, None, False),
-                                  (None, None, False), (None, 0.1, False)):
-            swept = dataclasses.replace(sweep, live_trim_to_kelly=trims, live_trim_min_rise=rise)
-            assert dashboard._save_target(swept, _FLT_START, today, _FLT_SERIES)[
-                "live_trims"] is said
         # Only a recorded setting that differs from a recorded switch is named
         for ladders, configured in ((True, True), (False, None), (None, True)):
             swept = dataclasses.replace(sweep, same_event_ladders=ladders,
@@ -7914,25 +7915,31 @@ class TestSaveLiveDefaultsButton:
             defaults_server._params(opened["url"].partition("?")[2]), current)
         assert (settings.sell_at, settings.sell_min_days) == (0.9, 5)
 
-    def test_a_page_without_the_trim_view_sends_neither_trim_field(self, monkeypatch, tmp_path):
-        # With neither field sent, the server keeps the saved trim settings
+    def test_a_page_without_the_rebalance_view_sends_none_of_its_fields(
+            self, monkeypatch, tmp_path):
+        # With none of the three sent, the server keeps the saved adding and
+        # trim settings
         config.save_live_defaults(
-            dataclasses.replace(config.live_settings(), trim_to_kelly=True, trim_min_rise=0.1),
+            dataclasses.replace(config.live_settings(), add_to_held_pairs=True,
+                                trim_to_kelly=True, trim_min_rise=0.1),
             source="")
         current = config.read_saved_live_defaults()
-        assert (current.trim_to_kelly, current.trim_min_rise) == (True, 0.1)
+        assert (current.add_to_held_pairs, current.trim_to_kelly,
+                current.trim_min_rise) == (True, True, 0.1)
         page = self._kc(monkeypatch, tmp_path)
         data = TestFilterPage._data(page)
-        assert data["grid_trim"] is None
+        assert data["grid_rebalance"] is None
         snap = _run_script(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "s"]], strict=True)["s"]
         [opened] = snap["opened"]
         query = self._query(data, opened)
         self._assert_sends(data, query, *data["primary"])
-        assert "trim_to_kelly" not in query and "trim_min_rise" not in query
+        for name in ("add_to_held_pairs", "trim_to_kelly", "trim_min_rise"):
+            assert name not in query, name
         settings, _ = defaults_server._proposal(
             defaults_server._params(opened["url"].partition("?")[2]), current)
-        assert (settings.trim_to_kelly, settings.trim_min_rise) == (True, 0.1)
+        assert (settings.add_to_held_pairs, settings.trim_to_kelly,
+                settings.trim_min_rise) == (True, True, 0.1)
 
     @pytest.mark.parametrize("saved", ["nothing", "not selling", "selling"])
     def test_the_sell_scenario_on_screen_is_what_the_defaults_server_reads(
@@ -7999,38 +8006,41 @@ class TestSaveLiveDefaultsButton:
         # Nothing was written by showing the page
         assert config.read_saved_live_defaults() == current
 
-    @pytest.mark.parametrize("saved_adds", [False, True], ids=["saved-off", "saved-on"])
-    def test_a_sell_level_from_a_page_with_the_add_on_view_sends_adding_off(
-            self, monkeypatch, tmp_path, saved_adds):
-        # Sell shows a level only while Add to held pairs is off, so from a page
-        # with both views the address at a Sell level names adding off (which
-        # turns saved adding off), and with adding on it names no selling. The
-        # defaults server's own application and parser read each address back,
-        # over saved defaults that add and ones that do not.
+    @pytest.mark.parametrize("saved", [False, True], ids=["saved-off", "saved-on"])
+    def test_a_sell_level_from_a_page_with_the_rebalance_view_sends_rebalance_no(
+            self, monkeypatch, tmp_path, saved):
+        # Sell shows a level only while Rebalance is no, so from a page with
+        # both views the address at a Sell level names adding and trimming off
+        # (which turns saved rebalancing off), and with Rebalance yes it names
+        # no selling. The defaults server's own application and parser read
+        # each address back, over saved defaults that rebalance and ones that
+        # do not.
         config.save_live_defaults(
-            dataclasses.replace(config.live_settings(), add_to_held_pairs=saved_adds),
+            dataclasses.replace(config.live_settings(), add_to_held_pairs=saved,
+                                trim_to_kelly=saved),
             source="")
         current = config.read_saved_live_defaults()
-        assert current.add_to_held_pairs is saved_adds
-        page = self._kc(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_add_on()))
+        assert current.add_to_held_pairs is saved and current.trim_to_kelly is saved
+        page = self._kc(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_rebalance()))
         data = TestFilterPage._data(page)
-        assert data["sell_blocks"] is not None and data["grid_add"] is not None
+        assert data["sell_blocks"] is not None and data["grid_rebalance"] is not None
         snaps = TestSellScript._run(tmp_path, page, [
             ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
             ["click", "flt-save"], ["snap", "level"],
             ["set", "flt-sell", "none"], ["fire", "flt-sell"], ["settle"],
-            ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"],
-            ["click", "flt-save"], ["snap", "adding"]],
-            strict=True, js="__BAR.push('flt-add');")
+            *TestRebalanceScript.ON, ["click", "flt-save"], ["snap", "rebalancing"]],
+            strict=True, js=TestRebalanceScript.WAIT)
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         level, minimum = data["sell_levels"][0]["value"], data["sell_days"][0]["value"]
         pb, pk, pc = data["primary"]
-        for name, adds, sell_at, sell_min_days in (("level", False, level, minimum),
-                                                   ("adding", True, None, None)):
+        for name, yes, sell_at, sell_min_days in (("level", False, level, minimum),
+                                                  ("rebalancing", True, None, None)):
             [opened] = snaps[name]["opened"]
             query = self._query(data, opened)
             self._assert_sends(data, query, pb, pk, pc)
-            assert query["add_to_held_pairs"] == ("on" if adds else "off"), name
+            assert query["add_to_held_pairs"] == query["trim_to_kelly"] == (
+                "on" if yes else "off"), name
+            assert query["trim_min_rise"] == "off", name
             assert query["sell_at"] == ("off" if sell_at is None else str(sell_at)), name
             assert query["sell_min_days"] == (
                 "off" if sell_min_days is None else str(sell_min_days)), name
@@ -8039,7 +8049,8 @@ class TestSaveLiveDefaultsButton:
                                                            _SAVE_HOST))
             assert response.status == 200, response.body
             settings, _ = defaults_server._proposal(defaults_server._params(raw), current)
-            assert settings.add_to_held_pairs is adds, name
+            assert settings.add_to_held_pairs is yes and settings.trim_to_kelly is yes, name
+            assert settings.trim_min_rise is None, name
             assert (settings.sell_at, settings.sell_min_days) == (sell_at, sell_min_days), name
         # Nothing was written by showing the page
         assert config.read_saved_live_defaults() == current
@@ -10826,26 +10837,28 @@ class TestTierOffAtEveryCap:
         assert dashboard._run_settings_html(without, tier_off_cap_sweep_unused=True) == healthy
 
 
-# ─── Add to held pairs (C6) ──────────────────────────────────────────────────
+# ─── Rebalance: add to and trim held pairs together ─────────────────────────
 
-_ADD_WARNING = ("An Add to held pairs simulation failed; the filter bar's Add to held pairs "
-                "select stays disabled")
-_ADD_MISMATCH = "The Add to held pairs simulations do not match the page's grid"
-_ADD_MISMATCH_OFF = ("The Add to held pairs simulations with the tier floors off do not match "
-                     "the page's grid; with the tier floors off, adding is not shown")
-_ADD_UNREAD = ("The Add to held pairs simulations could not be read; the filter bar's Add to "
-               "held pairs select stays disabled")
-_ADD_NO_BAND = ("The Add to held pairs simulations cannot be placed on a run whose primary "
-                "records no spread band; the filter bar's Add to held pairs select stays "
-                "disabled")
-_ADD_LOST_WITH_CAP_SWEEP = ("The Add to held pairs simulations are not shown, because the "
-                            "size-cap sweep they are read with could not be used; the filter "
-                            "bar's Add to held pairs select stays disabled")
-_ADD_NOT_SIMULATED = "(not simulated in this backtest)"
-_ADD_UNAVAILABLE = "(not available on this page; see the log)"
+_RB_WARNING = ("A Rebalance simulation failed; the filter bar's Rebalance select stays "
+               "disabled")
+_RB_MISMATCH = ("The Rebalance simulations do not match the page's grid (its bands, ks or "
+                "caps); the filter bar's Rebalance select stays disabled")
+_RB_MISMATCH_OFF = ("The Rebalance simulations with the tier floors off do not match the "
+                    "page's grid; with the tier floors off, rebalancing is not shown")
+_RB_UNREAD = ("The Rebalance simulations could not be read; the filter bar's Rebalance select "
+              "stays disabled")
+_RB_UNREAD_OFF = ("The Rebalance simulations with the tier floors off could not be read; with "
+                  "the tier floors off, rebalancing is not shown")
+_RB_NO_BAND = ("The Rebalance simulations cannot be placed on a run whose primary records no "
+               "spread band; the filter bar's Rebalance select stays disabled")
+_RB_LOST_WITH_CAP_SWEEP = ("The Rebalance simulations are not shown, because the size-cap "
+                           "sweep they are read with could not be used; the filter bar's "
+                           "Rebalance select stays disabled")
+_RB_NOT_SIMULATED = "(not simulated in this backtest)"
+_RB_UNAVAILABLE = "(not available on this page; see the log)"
 
 
-def _ao_trade(t: BacktestTrade, n: int = 2, event: str | None = None) -> BacktestTrade:
+def _rb_added(t: BacktestTrade, n: int = 2, event: str | None = None) -> BacktestTrade:
     """A trade that adds to a pair the run still holds: t at n contracts, marked
     add_on (and, with event, filed under that event and its own ticker)."""
     added = dataclasses.replace(_kc_resized(t, n), add_on=True)
@@ -10854,1002 +10867,336 @@ def _ao_trade(t: BacktestTrade, n: int = 2, event: str | None = None) -> Backtes
     return added
 
 
-def _kc_sweep_add_on(base: BacktestSweep | None = None, *, raise_on=None, off_raise_on=None,
-                     event: str | None = None) -> BacktestSweep:
-    """
-    A size-cap sweep (_kc_sweep() unless `base`) plus the Add to held pairs family.
-
-    The family is a fake CapSweep over the base grid's own bands, ks and caps:
-    at k 0.60 no pair is held twice, so its points are the base points' own
-    lists (its chunks are the base ones); at k 0.75 every list gains one add-on
-    trade — the caps at or above the peak sharing one list, as CapSweep shares
-    them; and (0.3-0.6, 0.60) is never simulated, as in the base. With a
-    tier-floors-off family on `base` (_kc_sweep_tiers()), a tier-floors-off twin
-    over its one binding band holds that family's list plus an add-on trade.
-    `raise_on` and `off_raise_on` make one cell of the family's tier-on or tier-off
-    sweep raise when it is read; `event` files the (0.3-0.6, 0.75) add-on trade
-    under another event (a series no other scenario trades).
-    """
-    sweep = base or _kc_sweep()
-    # The base sweep's points: one "all" point per cell (a size-cap sweep with
-    # the band sweep's checks holds a dict of populations there)
-    points = {key: (p["all"] if isinstance(p, dict) else p)
-              for key, p in sweep.cap_sweep.points.items()}
-    curves: dict = {}
-
-    def added(band, k, cap, trades, *, tier_floors=True) -> SweepPoint:
-        if id(trades) not in curves:
-            curves[id(trades)] = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
-        return SweepPoint(k=k, trades=trades, equity_df=curves[id(trades)], spread_band=band,
-                          size_cap=cap, tier_floors=tier_floors, add_to_held=True)
-
-    b0 = [points[(_KC_B0, 0.75, cap)].trades for cap in (0.05, 0.2)]
-    small = [*b0[0], _ao_trade(b0[0][0])]
-    full = [*b0[1], _ao_trade(b0[1][0])]
-    b1 = points[(_KC_B1, 0.75, 0.2)].trades
-    other = [*b1, _ao_trade(b1[0], event=event)]
-    family = {}
-    for cap in (0.05, 0.2, 1.0):
-        family[(_KC_B0, 0.6, cap)] = dataclasses.replace(points[(_KC_B0, 0.6, cap)],
-                                                         add_to_held=True)
-        family[(_KC_B0, 0.75, cap)] = added(_KC_B0, 0.75, cap, small if cap == 0.05 else full)
-        family[(_KC_B1, 0.75, cap)] = added(_KC_B1, 0.75, cap, other)
-    twin = None
-    if sweep.tier_off_scenarios:
-        off = sweep.tier_off_scenarios[0].trades
-        off_added = [*off, _ao_trade(off[0])]
-        twin = _FakeCapSweep(
-            {(_KC_B0, k, cap): added(_KC_B0, k, cap, off_added, tier_floors=False)
-             for k in (0.6, 0.75) for cap in (0.05, 0.2, 1.0)},
-            bands=(_KC_B0,), raise_on=off_raise_on)
-    return dataclasses.replace(sweep, add_on_cap_sweep=_FakeCapSweep(family, raise_on=raise_on),
-                               add_on_tier_off_cap_sweep=twin)
-
-
-def _ao_page(monkeypatch, tmp_path, sweep, series=_FLT_SERIES_TIERS) -> str:
-    """A whole page of a sweep, its trades filed by `series`."""
-    return TestFilterPage()._page(monkeypatch, tmp_path, sweep, series)
-
-
-def _ao_payload(sweep: BacktestSweep, state: str = "not simulated") -> tuple:
-    """(the grid walked, the chunk visitor, the base block) as generate_dashboard
-    builds them for a sweep, with the add-on state the page would pass."""
-    trades, curve = sweep.primary.trades, sweep.primary.equity_df
-    source = dashboard._grid_source(sweep, trades, curve, 0.75)
-    walked, chunker, kd = dashboard._build_filter_grid(
-        source, trades, curve, 0.75, _FLT_START, 1000.0, _FLT_SERIES_TIERS)
-    base = dashboard._filter_payload(walked, chunker, _FLT_START, 1000.0, _FLT_SERIES_TIERS,
-                                     kd=kd.payload(), add_on_state=state)
-    return walked, chunker, base
-
-
-def _ao_ids(grid) -> set[int]:
-    """Every chunk id a [band][k][cap] grid names."""
-    return {c for band in grid for ks in band for c in ks if c is not None}
-
-
-def _ao_chunks(chunker) -> list:
-    """The chunks a chunk visitor packed, inflated, in id order."""
-    return [_unpack(block) for block in chunker.chunks]
-
-
-class TestAddOnView:
-    """The bar's "Add to held pairs" view: a lazy family of add-on runs joins the
-    page's one walk, every scenario of it is its own run (or the run as
-    simulated, when adding traded nothing), and a family that does not fit, or
-    cannot be simulated, costs that choice alone."""
-
-    def test_the_family_joins_a_grid_it_fits(self):
-        sweep = _kc_sweep_add_on()
-        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
-                                        0.75)
-        family = sweep.add_on_cap_sweep
-        assert source.add_cell == family.cell and source.add_cap_sweep is family
-        assert source.add_off_cell is None and source.add_off_cap_sweep is None
-        # The categories and tags of what it can trade are known before any
-        # cell is read, and attaching it simulates nothing
-        assert source.events >= frozenset(family.entry_events())
-        assert family.reads == []
-
-    def test_every_add_on_scenario_is_its_own_chunk_or_the_base_one(self):
-        sweep = _kc_sweep_add_on()
-        _, source, base, chunks = _flt_payload(sweep)
-        assert base["grid"] == _KC_GRID
-        # k 0.60: nothing to add to, so its lists are the run as simulated
-        # and its chunks the base ones; k 0.75 gains a trade, so a list of its
-        # own — the caps above the peak sharing one; (0.3-0.6, 0.60) was never
-        # simulated
-        assert base["grid_add"] == [[[3, 2, 2], [6, 5, 5]], [[None, None, None], [7, 7, 7]]]
-        assert base["add_state"] == "shown" and base["grid_add_off"] is None
-        assert len(chunks) == 8
-        assert [chunks[c]["list"]["views"]["all"]["n"] for c in (5, 6, 7)] == [4, 4, 3]
-        # Each is priced at its own k, on its own trades — never the page's
-        added = sweep.add_on_cap_sweep.points[(_KC_B0, 0.75, 0.2)].trades
-        assert chunks[5]["list"]["kx"] == pytest.approx(dashboard._kelly_points(added, 0.75)[0])
-        assert len(chunks[5]["list"]["kx"]) == 4 != len(chunks[1]["list"]["kx"])
-        # The family's cells were each read once, the page's own first
-        assert sweep.add_on_cap_sweep.reads == [(_KC_B0, 0.6), (_KC_B0, 0.75), (_KC_B1, 0.6),
-                                                (_KC_B1, 0.75)]
-
-    def test_the_grids_the_page_ships_are_the_base_ones_beside_the_add_on(self):
-        # Adding the family changes no chunk or grid the page had without it:
-        # the add-on chunks are appended after the base ones
-        _, clean_chunker, clean_base = _ao_payload(_kc_sweep())
-        _, chunker, base = _ao_payload(_kc_sweep_add_on())
-        assert base["grid"] == clean_base["grid"]
-        assert base["rows"][:len(clean_base["rows"])] == clean_base["rows"]
-        assert _ao_chunks(chunker)[:5] == _ao_chunks(clean_chunker)
-
-    def test_without_the_family_the_payload_says_so(self):
-        _, _, base = _ao_payload(_kc_sweep())
-        assert base["grid_add"] is None and base["grid_add_off"] is None
-        assert base["add_state"] == "not simulated"
-        # ... and a page that had one it could not use says that instead
-        _, _, base = _ao_payload(_kc_sweep(), "unavailable")
-        assert base["grid_add"] is None and base["add_state"] == "unavailable"
-        # A page with the view is "shown", whatever state it was handed
-        _, _, base = _ao_payload(_kc_sweep_add_on(), "unavailable")
-        assert base["add_state"] == "shown" and base["grid_add"] is not None
-
-    def test_a_grid_of_nothing_is_never_shown_as_a_view(self):
-        # A family none of whose cells holds a point ships no grid at all
-        sweep = dataclasses.replace(_kc_sweep(), add_on_cap_sweep=_FakeCapSweep({}))
-        walked, chunker, base = _ao_payload(sweep, "unavailable")
-        assert walked.add_cell is not None and chunker.add_grid() is None
-        assert base["grid_add"] is None and base["add_state"] == "unavailable"
-
-    def test_the_tier_off_twin_pairs_with_the_tier_off_view_only(self):
-        sweep = _kc_sweep_add_on(_kc_sweep_tiers())
-        walked, chunker, base = _ao_payload(sweep)
-        assert walked.tier_binds == (True, False) and walked.add_off_cap_sweep is not None
-        add, off = base["grid_add"], base["grid_add_off"]
-        assert base["add_state"] == "shown" and add is not None
-        # A binding band's row is its own add-on-with-the-tiers-off chunks ...
-        assert off[0] != add[0] and all(c is not None for row in off[0] for c in row)
-        assert _ao_ids(off[:1]).isdisjoint(_ao_ids(add))
-        # ... and a band the tiers never bind at reads its add-on tier-on row
-        assert off[1] == add[1]
-        # A tier-off twin with no tier-off view beside it ships no off grid
-        _, _, no_view = _ao_payload(dataclasses.replace(
-            sweep, tier_off_scenarios=[], tier_off_calibrations_by_band={}))
-        assert no_view["grid_add_off"] is None and no_view["grid_add"] is not None
-
-    def test_a_tier_off_view_without_its_twin_reads_missing_only_at_the_binding_band(self):
-        sweep = dataclasses.replace(_kc_sweep_add_on(_kc_sweep_tiers()),
-                                    add_on_tier_off_cap_sweep=None)
-        walked, chunker, base = _ao_payload(sweep)
-        assert walked.add_off_cell is None and base["add_state"] == "shown"
-        off = base["grid_add_off"]
-        assert off[0] == [[None] * 3, [None] * 3] and off[1] == base["grid_add"][1]
-
-    # ─── A family that does not fit ───────────────────────────────────────────
-
-    @pytest.mark.parametrize("axis, value", [("bands", (_KC_B0,)), ("ks", (0.75,)),
-                                             ("caps", (0.05, 0.2))])
-    def test_a_family_on_other_axes_gives_no_view(
-            self, monkeypatch, tmp_path, caplog, axis, value):
-        sweep = _kc_sweep_add_on()
-        setattr(sweep.add_on_cap_sweep, axis, value)
-        with caplog.at_level(logging.WARNING):
-            source = dashboard._grid_source(sweep, sweep.primary.trades,
-                                            sweep.primary.equity_df, 0.75)
-        assert source.add_cell is None and source.add_cap_sweep is None
-        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
-                and "Add to held" in r.getMessage()] == [
-                    f"{_ADD_MISMATCH} (its bands, ks or caps); the filter bar's Add to held "
-                    "pairs select stays disabled"]
-        # The page keeps every other choice and says why the select is shut
-        page = _ao_page(monkeypatch, tmp_path, sweep)
-        data = TestFilterPage._data(page)
-        assert data["grid_add"] is None and data["add_state"] == "unavailable"
-        assert 'id="flt-add-note"' in page and 'id="flt-bar"' in page
-        assert data["grid"] == _KC_GRID
-        assert sweep.add_on_cap_sweep.reads == []
-
-    def test_a_family_that_cannot_be_read_gives_no_view(self, caplog):
-        sweep = _kc_sweep_add_on()
-
-        def broken():
-            raise ZeroDivisionError("entry events")
-        sweep.add_on_cap_sweep.entry_events = broken
-        with caplog.at_level(logging.WARNING):
-            source = dashboard._grid_source(sweep, sweep.primary.trades,
-                                            sweep.primary.equity_df, 0.75)
-        assert source.add_cell is None and source.cap_sweep is sweep.cap_sweep
-        [warned] = [r for r in caplog.records if "Add to held" in r.getMessage()]
-        assert warned.exc_info is not None and warned.getMessage() == _ADD_UNREAD
-
-    def test_a_tier_off_twin_on_other_axes_costs_the_tier_off_choice_only(self, caplog):
-        sweep = _kc_sweep_add_on(_kc_sweep_tiers())
-        sweep.add_on_tier_off_cap_sweep.caps = (0.05, 0.2)
-        with caplog.at_level(logging.WARNING):
-            walked, _, base = _ao_payload(sweep)
-        assert [r.getMessage() for r in caplog.records if "Add to held" in r.getMessage()] == [
-            _ADD_MISMATCH_OFF]
-        assert walked.add_cell is not None and walked.add_off_cell is None
-        assert base["add_state"] == "shown" and base["grid_add"] is not None
-        # With the tiers off, adding reads "missing" at the band they bind at
-        assert base["grid_add_off"][0] == [[None] * 3, [None] * 3]
-
-    def test_the_cap_axis_fallback_grid_has_no_view_and_no_warning(self, caplog):
-        sweep = _kc_sweep_add_on()
-        with caplog.at_level(logging.WARNING):
-            fallback = dashboard._grid_source(sweep, sweep.primary.trades,
-                                              sweep.primary.equity_df, 0.75,
-                                              use_cap_sweep=False)
-        assert fallback.add_cell is None and fallback.cap_sweep is None
-        assert not [r for r in caplog.records if "Add to held" in r.getMessage()]
-        assert sweep.add_on_cap_sweep.reads == []
-
-    def test_a_lost_cap_axis_costs_the_add_on_view_too(self, monkeypatch, tmp_path, caplog):
-        # The size-cap sweep's last cell raises: the walk falls back to the
-        # eager grid, which never carries the family (its caps are the size-cap
-        # grid's); the page says the choice could not be built, and no add-on
-        # cell was ever simulated
-        sweep = _kc_sweep_add_on(_kc_sweep(raise_on=(_KC_B1, 0.75)))
-        with caplog.at_level(logging.WARNING):
-            page = _ao_page(monkeypatch, tmp_path, sweep)
-        data = TestFilterPage._data(page)
-        assert data["grid_add"] is None and data["add_state"] == "unavailable"
-        assert _ADD_UNAVAILABLE in page and 'id="flt-bar"' in page
-        assert sweep.add_on_cap_sweep.reads == []
-        assert sum("size-cap sweep could not be simulated" in r.getMessage()
-                   for r in caplog.records) == 1
-        # ... and the log says what that cost the select, once
-        assert [r.getMessage() for r in caplog.records
-                if "Add to held" in r.getMessage()] == [_ADD_LOST_WITH_CAP_SWEEP]
-
-    def test_a_run_without_a_size_cap_sweep_offers_the_view_at_its_own_cap(self):
-        # The eager grid's caps are the run's own cap alone, and so are the
-        # family's: it fits, and only the cells it simulated hold a chunk
-        sweep = _flt_sweep()
-        primary = sweep.primary
-        added = dataclasses.replace(
-            primary, trades=[*primary.trades, _ao_trade(primary.trades[0])], add_to_held=True)
-        family = _FakeCapSweep({((0.0, 1.0), 0.75, 0.2): added},
-                               bands=((0.0, 1.0), (0.3, 0.6), (0.3, 1.0)),
-                               ks=(0.6, 0.75, 1.0), caps=(0.2,))
-        _, source, base, chunks = _flt_payload(dataclasses.replace(
-            sweep, add_on_cap_sweep=family))
-        assert source.cap_sweep is None and source.add_cell == family.cell
-        assert base["add_state"] == "shown"
-        assert base["grid_add"] == [[[None], [4], [None]], [[None]] * 3, [[None]] * 3]
-        assert chunks[4]["list"]["views"]["all"]["n"] == len(primary.trades) + 1
-
-    def test_a_family_on_a_run_without_a_band_is_set_aside_and_said(
-            self, monkeypatch, tmp_path, caplog):
-        # A hand-built sweep whose primary records no band cannot place the
-        # family's cells on a band axis either: its own WARNING (beside the
-        # size-cap sweep's), a shut select and no simulation
-        sweep = _kc_sweep_add_on()
-        primary = dataclasses.replace(sweep.primary, spread_band=None)
-        sweep = dataclasses.replace(sweep, primary=primary, points=[primary], scenarios=[])
-        with caplog.at_level(logging.WARNING):
-            page = _ao_page(monkeypatch, tmp_path, sweep)
-        assert [r.getMessage() for r in caplog.records
-                if "Add to held" in r.getMessage()] == [_ADD_NO_BAND]
-        data = TestFilterPage._data(page)
-        assert data["grid_add"] is None and data["add_state"] == "unavailable"
-        assert _ADD_UNAVAILABLE in page
-        assert sweep.add_on_cap_sweep.reads == []
-
-    @pytest.mark.parametrize("how", ["unreadable", "without the primary"])
-    def test_a_size_cap_sweep_set_aside_says_what_it_costs_the_add_on_view(
-            self, monkeypatch, tmp_path, caplog, how):
-        # The size-cap sweep the family is read with cannot be used (its events
-        # cannot be read, or it holds no scenario of the run's primary): its own
-        # WARNING names that, and one more says the select stays shut — never a
-        # complaint that the family's grid does not match the eager one
-        sweep = _kc_sweep_add_on()
-        if how == "unreadable":
-            def broken():
-                raise ZeroDivisionError("entry events")
-            sweep.cap_sweep.entry_events = broken
-        else:
-            sweep.cap_sweep.bands = (_KC_B1,)
-        with caplog.at_level(logging.WARNING):
-            source = dashboard._grid_source(sweep, sweep.primary.trades,
-                                            sweep.primary.equity_df, 0.75)
-        assert source.cap_sweep is None and source.add_cell is None
-        assert [r.getMessage() for r in caplog.records
-                if "Add to held" in r.getMessage()] == [_ADD_LOST_WITH_CAP_SWEEP]
-        assert sweep.add_on_cap_sweep.reads == []
-        # ... and the page says the choice is not available, pointing at the log
-        page = _ao_page(monkeypatch, tmp_path, sweep)
-        data = TestFilterPage._data(page)
-        assert data["grid_add"] is None and data["add_state"] == "unavailable"
-        assert _ADD_UNAVAILABLE in page
-
-    def test_a_run_without_the_family_says_nothing_when_the_cap_axis_is_lost(
-            self, monkeypatch, tmp_path, caplog):
-        with caplog.at_level(logging.WARNING):
-            _ao_page(monkeypatch, tmp_path, _kc_sweep(raise_on=(_KC_B1, 0.75)))
-        assert any("size-cap sweep could not be simulated" in r.getMessage()
-                   for r in caplog.records)
-        assert not [r for r in caplog.records if "Add to held" in r.getMessage()]
-
-    # ─── A cell that cannot be simulated ──────────────────────────────────────
-
-    def test_an_add_cell_that_raises_costs_only_the_add_on_view(
-            self, monkeypatch, tmp_path, caplog):
-        # The LAST add-on cell raises, after the earlier ones were packed: every
-        # add-on chunk and row head is dropped, and the page is the page it was
-        # without the family — chunk for chunk — beside the choice's own note
-        clean = _ao_page(monkeypatch, tmp_path, _kc_sweep())
-        sweep = _kc_sweep_add_on(raise_on=(_KC_B1, 0.75))
-        with caplog.at_level(logging.WARNING):
-            page = _ao_page(monkeypatch, tmp_path, sweep)
-        warned = [r for r in caplog.records if r.levelno == logging.WARNING
-                  and _ADD_WARNING in r.getMessage()]
-        assert len(warned) == 1 and warned[0].exc_info is not None
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        clean_data, clean_chunks = TestFilterPage._data(clean), TestFilterPage._chunks(clean)
-        assert data["grid_add"] is None and data["grid_add_off"] is None
-        assert data["add_state"] == "unavailable"
-        assert data["grid"] == clean_data["grid"] == _KC_GRID
-        assert data["rows"] == clean_data["rows"] and chunks == clean_chunks
-        assert data["text"] == clean_data["text"] and data["kd"] == clean_data["kd"]
-        assert 'id="flt-bar"' in page and _ADD_UNAVAILABLE in page
-        assert sweep.add_on_cap_sweep.reads == [
-            (_KC_B0, 0.6), (_KC_B0, 0.75), (_KC_B1, 0.6), (_KC_B1, 0.75)]
-
-    def test_a_tier_off_add_cell_that_raises_costs_only_the_add_on_view(
-            self, monkeypatch, tmp_path, caplog):
-        # The tier-floors-off twin's cell raises after the whole tier-on family
-        # was packed: both add-on grids go, the tier-off view stays
-        clean = _ao_page(monkeypatch, tmp_path, _kc_sweep_tiers())
-        sweep = _kc_sweep_add_on(_kc_sweep_tiers(), off_raise_on=(_KC_B0, 0.75))
-        with caplog.at_level(logging.WARNING):
-            page = _ao_page(monkeypatch, tmp_path, sweep)
-        assert len([r for r in caplog.records if _ADD_WARNING in r.getMessage()]) == 1
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        clean_data, clean_chunks = TestFilterPage._data(clean), TestFilterPage._chunks(clean)
-        assert data["grid_add"] is data["grid_add_off"] is None
-        assert data["add_state"] == "unavailable"
-        assert data["grid"] == clean_data["grid"] and data["grid_off"] == clean_data["grid_off"]
-        assert data["grid_off"] is not None
-        assert data["rows"] == clean_data["rows"] and chunks == clean_chunks
-
-    def test_a_failing_tier_off_size_cap_cell_keeps_the_add_on_view(
-            self, monkeypatch, tmp_path, caplog):
-        # The tier-floors-off SIZE-CAP sweep cannot simulate its cell: the walk
-        # swaps in the grid's eager tier-off lookup, which was built before the
-        # add-on family was attached — and must carry it, or the add-on phase
-        # would be skipped and no view shipped
-        sweep = _kc_sweep_add_on(_kc_sweep_tiers_capped(raise_on=(_KC_B0, 0.6)))
-        with caplog.at_level(logging.WARNING):
-            walked, chunker, base = _ao_payload(sweep)
-        assert any(_OFF_WARNING in r.getMessage() for r in caplog.records)
-        assert not any(_ADD_WARNING in r.getMessage() for r in caplog.records)
-        assert walked.off_cap_sweep is None            # the eager lookup was walked
-        assert walked.add_cell is not None and walked.add_off_cell is not None
-        assert base["add_state"] == "shown"
-        assert base["grid_add"] is not None and base["grid_add_off"] is not None
-        assert base["grid_off"] is not None
-
-    def test_a_walk_over_a_grid_with_a_missing_family_walks_nothing_extra(self, caplog):
-        sweep = _kc_sweep_add_on()
-        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
-                                        0.75)
-        stripped = dataclasses.replace(source, add_cell=None, add_off_cell=None,
-                                       add_cap_sweep=None, add_off_cap_sweep=None)
-        with caplog.at_level(logging.WARNING):
-            _, chunker, _ = dashboard._build_filter_grid(
-                stripped, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START,
-                1000.0, _FLT_SERIES_TIERS)
-        assert sweep.add_on_cap_sweep.reads == []
-        # No add-on phase ran: nothing was warned or packed for it
-        assert not [r for r in caplog.records if "Add to held" in r.getMessage()]
-        assert chunker.grid_add is None
-
-    # ─── What it never reaches ────────────────────────────────────────────────
-
-    def test_only_the_bar_s_visitors_take_the_add_on_cells(self):
-        assert hasattr(dashboard._ChunkVisitor, "add")
-        assert not hasattr(dashboard._ExplorerVisitor, "add")
-        assert not hasattr(dashboard._KdVisitor, "add")
-
-    def test_the_explorer_and_the_interval_discount_are_the_same_with_the_family(
-            self, monkeypatch, tmp_path):
-        # The scenario explorer's blocks and the interval-discount section's
-        # data are those of the page without the family: neither follows the choice
-        clean = _ao_page(monkeypatch, tmp_path, _ex_sweep_tiers())
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on(_ex_sweep_tiers()))
-        assert _scn_blocks(_ex_section(page)) == _scn_blocks(_ex_section(clean))
-        assert len(_scn_blocks(_ex_section(page))) > 3
-        assert TestFilterPage._data(page)["kd"] == TestFilterPage._data(clean)["kd"]
-        # ... and so are the k-hat figures, which are measured before sizing
-        assert TestFilterPage._data(page)["khat"] == TestFilterPage._data(clean)["khat"]
-        assert TestFilterPage._data(page)["khat_off"] == TestFilterPage._data(clean)["khat_off"]
-
-    def test_the_bar_lists_a_series_only_an_add_on_run_traded(self, monkeypatch, tmp_path):
-        # Kelly on a bigger position can trade a pair no other scenario traded;
-        # the bar must list its category and tag before any cell is simulated,
-        # or that chunk fails and costs the whole bar
-        sweep = _kc_sweep_add_on(event="KXRAIN-1")
-        page = _ao_page(monkeypatch, tmp_path, sweep)
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        assert 'id="flt-bar"' in page and data["grid_add"] is not None
-        assert "Climate" in data["categories"]
-        # Its chunk holds that category's view
-        climate = _key(data, "Climate")
-        assert chunks[data["grid_add"][1][1][1]]["list"]["views"][climate]["n"] == 1
-        # The page without the family never offers it
-        clean = TestFilterPage._data(_ao_page(monkeypatch, tmp_path, _kc_sweep()))
-        assert "Climate" not in clean["categories"]
-
-    # ─── The bar, the words ───────────────────────────────────────────────────
-
-    def test_the_words_are_short_and_plain(self):
-        assert dashboard._ADD_ON_OPTION_OFF == "off"
-        assert dashboard._ADD_ON_OPTION_ON == "on (up to the size cap)"
-        assert dashboard._ADD_ON_NOTES == {"not simulated": _ADD_NOT_SIMULATED,
-                                           "unavailable": _ADD_UNAVAILABLE}
-        assert dashboard._ADD_ON_PHRASE == ", adding to held pairs"
-        assert dashboard._SUMMARY_TEMPLATES["add_on"] == dashboard._ADD_ON_PHRASE
-        # The detail lives in the tooltip
-        assert "Live trading follows the saved live defaults" in dashboard._ADD_ON_SELECT_TITLE
-        assert "sits below the 1:1 line" in dashboard._ADD_ON_SELECT_TITLE
-        # While adding is on the bar shuts Sell, and the tooltip says so
-        assert dashboard._ADD_ON_SELECT_TITLE.endswith(
-            "While this is on, Sell is set to no selling (the two are not simulated together).")
-        # The Tier floors note keeps its own words, which a test finds by them
-        assert "not simulated for this run" not in " ".join(dashboard._ADD_ON_NOTES.values())
-
-    def test_the_select_follows_the_size_cap_and_is_rendered_shut(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
-        bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
-        assert bar.index('id="flt-cap"') < bar.index('id="flt-add"') < bar.index('id="flt-cat"')
-        assert "<label>Add to held pairs: <select" in bar
-        select = _page_elements(page)["selects"]["flt-add"]
-        assert select == {"disabled": True, "options": [
-            {"value": "off", "text": "off", "selected": True},
-            {"value": "on", "text": "on (up to the size cap)", "selected": False}]}
-        title = re.search(r'<select id="flt-add"[^>]*title="([^"]*)"', bar).group(1)
-        assert html.unescape(title) == dashboard._ADD_ON_SELECT_TITLE
-        # A page with the view has no note beside it
-        assert 'id="flt-add-note"' not in page
-
-    @pytest.mark.parametrize("state, note", [
-        ("not simulated", _ADD_NOT_SIMULATED),
-        ("unavailable", _ADD_UNAVAILABLE),
-        ("something else", _ADD_NOT_SIMULATED)])
-    def test_a_shut_select_says_why(self, state, note):
-        _, chunker, base = _ao_payload(_kc_sweep())
-        bar = dashboard._filter_bar_html({**base, "add_state": state}, {"all": {"n": 3}})
-        assert f'id="flt-add-note" style="color:#9E9E9E; font-size:13px;">{note}</span>' in bar
-        assert 'id="flt-add" disabled' in bar
-        shown = dashboard._filter_bar_html({**base, "add_state": "shown"}, {"all": {"n": 3}})
-        assert 'id="flt-add-note"' not in shown
-
-    def test_the_tier_floors_note_keeps_its_own_words(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
-        assert re.search(r'id="flt-tier-note"[^>]*>\(not simulated for this run\)</span>', page)
-        assert 'id="flt-add-note"' not in page
-        bare = _ao_page(monkeypatch, tmp_path, _kc_sweep())
-        assert re.search(r'id="flt-add-note"[^>]*>\(not simulated in this backtest\)</span>',
-                         bare)
-
-    def test_the_reach_sentence_names_the_page_it_is_on(self, monkeypatch, tmp_path):
-        # Without an explorer grid (the payload built here has none) ...
-        _, _, base = _ao_payload(_kc_sweep_add_on())
-        assert base["text"]["unfiltered"].endswith(" " + dashboard._ADD_ON_REACH_NO_EXPLORER)
-        assert dashboard._ADD_ON_REACH not in base["text"]["unfiltered"]
-        # ... with one (a band sweep's populations, so the page carries its grid) ...
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on(_ex_sweep()))
-        data = TestFilterPage._data(page)
-        assert data["text"]["unfiltered"].endswith(" " + dashboard._ADD_ON_REACH)
-        assert html.escape(dashboard._ADD_ON_REACH) in page
-        # ... and a page without the view never claims it
-        _, _, clean = _ao_payload(_kc_sweep())
-        assert "Add to held pairs" not in clean["text"]["unfiltered"]
-        assert "Add to held pairs" not in TestFilterPage._data(
-            _ao_page(monkeypatch, tmp_path, _kc_sweep()))["text"]["unfiltered"]
-
-    def test_the_save_button_names_the_choice(self):
-        assert "Add to held pairs choice (when this page simulated it)" in dashboard._SAVE_TITLE
-
-    def test_every_chunk_the_add_on_grids_name_is_on_the_page(self, monkeypatch, tmp_path):
-        # The chunk-id check of TestFilterPage's, over the add-on grids too
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on(_kc_sweep_tiers()))
-        data = TestFilterPage._data(page)
-        ids = (_ao_ids(data["grid"]) | _ao_ids(data["grid_off"]) | _ao_ids(data["grid_add"])
-               | _ao_ids(data["grid_add_off"]))
-        assert _ao_ids(data["grid_add"]) - _ao_ids(data["grid"])
-        assert _ao_ids(data["grid_add_off"]) - _ao_ids(data["grid_add"])
-        missing = sorted(i for i in ids if f'id="dash-chunk-{i}"' not in page)
-        assert ids and not missing
-        # Every chunk on the page is named by some grid: none is left over
-        assert set(TestFilterPage._chunks(page)) == ids
-
-    # ─── The header line ──────────────────────────────────────────────────────
-
-    def test_the_header_promises_a_view_only_where_the_bar_holds_one(self):
-        run = TestLiveRuleHeader
-        promise = " — choose Add to held pairs on in the filter bar to see it"
-        nothing = " — this page has no Add to held pairs view"
-        # Tiers on, at the primary band: its row of the add-on grid must hold a chunk
-        sweep = dataclasses.replace(run._sweep(), live_add_to_held_pairs=True)
-        for grid, tail in (([[[7]]], promise), ([[[None]]], nothing)):
-            assert run()._text(sweep, {**run._bar(), "grid_add": grid}).endswith(tail)
-        # Tiers off, at a band they bind at: the row of the tier-floors-off twin,
-        # not the tier-on row beside it
-        band = (0.0, 0.5)
-        off_sweep = dataclasses.replace(
-            run._sweep(live_tier_floors=False, live_spread_band=band,
-                       calibrations_by_band={(0.0, 1.0): None, band: None},
-                       tier_off_calibrations_by_band={(0.0, 1.0): None, band: None},
-                       tier_off_scenarios=[object()]),
-            live_add_to_held_pairs=True)
-        bar = {**run._bar(bands=[band, (0.0, 1.0)]), "grid_add": [[[3]], [[4]]]}
-        for twin, tail in (([[[7]], [[8]]], promise), ([[[None]], [[8]]], nothing),
-                           (None, nothing)):
-            assert run()._text(off_sweep, {**bar, "grid_add_off": twin}).endswith(tail)
-
-    def test_the_save_button_warns_that_saving_with_adding_off_turns_it_off(
-            self, monkeypatch, tmp_path):
-        note = ("The live defaults add to held pairs; saving with Add to held pairs off "
-                "here turns that off.")
-        assert dashboard._ADD_ON_SAVE_NOTE == note
-
-        def between(page):
-            bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
-            return bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
-
-        with_view = _kc_sweep_add_on()
-        page = _ao_page(monkeypatch, tmp_path, dataclasses.replace(
-            with_view, live_add_to_held_pairs=True))
-        # Right after the button, before the trade link, in Python's words
-        assert re.search(r'</button>&nbsp;<span id="flt-add-save-note"[^>]*>' + re.escape(note)
-                         + '</span>', between(page))
-        # No note when the saved defaults do not add (or the run recorded none) ...
-        for saved in (False, None):
-            page = _ao_page(monkeypatch, tmp_path, dataclasses.replace(
-                with_view, live_add_to_held_pairs=saved))
-            assert 'id="flt-add-save-note"' not in page
-        # ... nor on a page with no add-on view, whose Save sends no choice
-        page = _ao_page(monkeypatch, tmp_path, dataclasses.replace(
-            _kc_sweep(), live_add_to_held_pairs=True))
-        assert 'id="flt-add-save-note"' not in page and 'id="flt-save"' in page
-
-    def test_the_live_rule_header_names_adding_where_the_page_shows_the_rule(self):
-        run = TestLiveRuleHeader
-        rule = config.describe_time_series_rule(True, (0.0, 1.0))
-        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — "
-        note = "; the live defaults add to held pairs, which this run's primary does not"
-        sweep = dataclasses.replace(run._sweep(), live_add_to_held_pairs=True)
-        shown = {**run._bar(), "grid_add": [[[1]]]}
-        # The rule is the page's primary and the bar has the view: choose it
-        assert run()._text(sweep, shown) == (
-            head + "this run's primary" + note
-            + " — choose Add to held pairs on in the filter bar to see it")
-        # ... a bar without the view, or none at all: say so
-        for bar in (run._bar(), {**run._bar(), "grid_add": None}, None):
-            assert run()._text(sweep, bar) == (
-                head + "this run's primary" + note + " — this page has no Add to held pairs view")
-        # ... a rule the page does not show: the note alone, no promise of a view
-        elsewhere = dataclasses.replace(sweep, live_spread_band=(0.3, 0.6),
-                                        calibrations_by_band={(0.0, 1.0): None})
-        assert run()._text(elsewhere, shown).endswith("— not simulated by this run" + note)
-        # Not adding (or not recorded): no note at all
-        for saved in (False, None):
-            plain = dataclasses.replace(sweep, live_add_to_held_pairs=saved)
-            assert "add to held pairs" not in run()._text(plain, shown)
-
-    def test_the_header_of_a_whole_page_points_at_the_select(self, monkeypatch, tmp_path):
-        sweep = dataclasses.replace(_kc_sweep_add_on(), live_add_to_held_pairs=True,
-                                    live_tier_floors=True, live_spread_band=_KC_B0)
-        page = _ao_page(monkeypatch, tmp_path, sweep)
-        assert ("the live defaults add to held pairs, which this run's primary does not — "
-                "choose Add to held pairs on in the filter bar to see it</p>") in page
-        page = _ao_page(monkeypatch, tmp_path, dataclasses.replace(sweep, add_on_cap_sweep=None))
-        assert ("the live defaults add to held pairs, which this run's primary does not — "
-                "this page has no Add to held pairs view</p>") in page
-
-
-_TRIM_MISMATCH = ("The Trim to Kelly simulations do not match the page's grid (its bands, ks "
-                  "or caps); the filter bar's Trim to Kelly select stays disabled")
-_TRIM_MISMATCH_OFF = ("The Trim to Kelly simulations with the tier floors off do not match the "
-                      "page's grid; with the tier floors off, trimming is not shown")
-_TRIM_UNREAD = ("The Trim to Kelly simulations could not be read; the filter bar's Trim to "
-                "Kelly select stays disabled")
-_TRIM_WARNING = "A Trim to Kelly simulation failed"
-_TRIM_NO_BAND = ("The Trim to Kelly simulations cannot be placed on a run whose primary records "
-                 "no spread band; the filter bar's Trim to Kelly select stays disabled")
-_TRIM_LOST_WITH_CAP_SWEEP = ("The Trim to Kelly simulations are not shown, because the size-cap "
-                             "sweep they are read with could not be used; the filter bar's Trim "
-                             "to Kelly select stays disabled")
-
-
-class _FakeTrimSweep:
-    """
-    A backtester.TrimSweep stand-in carrying what the dashboard reads of one:
-    bands, off_bands, ks, caps, sweep() and entry_events().
-
-    `sweeps` maps (adding to held pairs, tier floors off) to the _FakeCapSweep
-    sweep() hands back for that setting; `asked` records each sweep() call.
-
-    With `min_rises` it also carries the family's minimum price rises and
-    rise_grid(), a generator as the real one is (nothing runs, and nothing
-    raises, before its first step is read). `rises` scripts it: (adding, tier
-    floors off, band, k) -> one {cap: SweepPoint | SameTrim} per minimum; a
-    cap, a minimum or a whole cell left out repeats that cell's Trim to Kelly
-    run (SameTrim(None)). Like the real one it refuses a `start` that holds
-    no rises for a cap, and adds what it yields to `stats`: a point as one
-    simulated, a SameTrim as one "same". `rise_raise` = (cell, step) makes
-    that cell's read raise as that step is read (step 0: the first).
-    `asked_rises` records each rise_grid() call as (cell, caps, start).
-    """
-
-    def __init__(self, sweeps: dict, *, bands=(_KC_B0, _KC_B1), off_bands=(),
-                 ks=(0.6, 0.75), caps=(0.05, 0.2, 1.0), min_rises=(), rises=None,
-                 rise_raise=None):
-        self.sweeps = sweeps
-        self.bands, self.off_bands, self.ks, self.caps = bands, off_bands, ks, caps
-        self.asked: list = []
-        self.min_rises = tuple(min_rises)
-        self.rises = rises or {}
-        self.rise_raise = rise_raise
-        self.asked_rises: list = []
-
-    def sweep(self, *, tier_floors=True, add_to_held=False):
-        self.asked.append((add_to_held, not tier_floors))
-        return self.sweeps[(add_to_held, not tier_floors)]
-
-    def rise_grid(self, band, k, *, tier_floors=True, add_to_held=False, caps=None,
-                  start=None, stats=None):
-        cell = (add_to_held, not tier_floors, band, k)
-        self.asked_rises.append((cell, tuple(caps), start))
-        missing = [cap for cap in caps if start.get(cap) is None]
-        if missing:
-            raise ValueError(f"start has no trim rises for size cap(s) {missing!r}")
-        for key in ("simulated", "reused", "same"):
-            stats.setdefault(key, 0)
-        steps = self.rises.get(cell, [])
-        for i, rise in enumerate(self.min_rises):
-            if self.rise_raise == (cell, i):
-                raise RuntimeError("the price-rise simulation failed")
-            scripted = steps[i] if i < len(steps) else {}
-            by_cap = {cap: scripted.get(cap, backtester.SameTrim(None)) for cap in caps}
-            same = sum(isinstance(entry, backtester.SameTrim) for entry in by_cap.values())
-            stats["same"] += same
-            stats["simulated"] += len(by_cap) - same
-            yield rise, by_cap
-
-    def entry_events(self):
-        return {event for capped in self.sweeps.values() for event in capped.entry_events()}
-
-
-def _tr_split(trades: list, event: str | None = None) -> list:
-    """A list whose first pair was trimmed: that trade as two records of one
-    contract pair each (the part sold and the part kept), then the rest."""
+def _rb_split(trades: list, event: str | None = None) -> list:
+    """A list whose first pair was sold down: that trade as two records of one
+    contract pair each (the part sold and the part kept), then the rest; with
+    event, the part sold is filed under that event."""
     part = _kc_resized(trades[0], 1)
     if event is not None:
         part = dataclasses.replace(part, event_ticker=event, ticker_a=f"{event}-A")
     return [part, _kc_resized(trades[0], 1), *trades[1:]]
 
 
-def _kc_sweep_trim(base: BacktestSweep | None = None, *, raise_on: dict | None = None,
-                   event: str | None = None) -> BacktestSweep:
-    """
-    A size-cap sweep (_kc_sweep() unless `base`) plus the Trim to Kelly family.
-
-    Trimming alone, tier floors on: at k 0.60 nothing is trimmed, so each
-    point holds the base point's own list; at k 0.75 the primary band's 5%
-    and 20% caps each trim their first pair (a list of their own) while no
-    cap trims nothing, and the other band trims nothing at any cap. With an
-    Add to held pairs family on `base`, the adding-on half does the same over
-    that family's lists. With a tier-floors-off family on `base`, the binding
-    band's twins trim that family's list at every cap. `raise_on` maps a
-    setting (adding, tier floors off) to the cell whose read raises; `event`
-    files the 20%-cap part sold under another event.
-    """
-    sweep = base or _kc_sweep()
-    raise_on = raise_on or {}
-    curves: dict = {}
-
-    def stamped(point, trades=None, **more) -> SweepPoint:
-        if trades is None:
-            return dataclasses.replace(point, trim_to_kelly=True, **more)
-        if id(trades) not in curves:
-            curves[id(trades)] = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
-        return dataclasses.replace(point, trades=trades, equity_df=curves[id(trades)],
-                                   trim_to_kelly=True, **more)
-
-    def half(points: dict, add: bool) -> _FakeCapSweep:
-        small = _tr_split(points[(_KC_B0, 0.75, 0.05)].trades)
-        full = _tr_split(points[(_KC_B0, 0.75, 0.2)].trades, event)
-        family = {}
-        for cap in (0.05, 0.2, 1.0):
-            family[(_KC_B0, 0.6, cap)] = stamped(points[(_KC_B0, 0.6, cap)])
-            family[(_KC_B1, 0.75, cap)] = stamped(points[(_KC_B1, 0.75, cap)])
-        family[(_KC_B0, 0.75, 0.05)] = stamped(points[(_KC_B0, 0.75, 0.05)], small)
-        family[(_KC_B0, 0.75, 0.2)] = stamped(points[(_KC_B0, 0.75, 0.2)], full)
-        family[(_KC_B0, 0.75, 1.0)] = stamped(points[(_KC_B0, 0.75, 1.0)])
-        return _FakeCapSweep(family, raise_on=raise_on.get((add, False)))
-
-    own = {key: (p["all"] if isinstance(p, dict) else p)
-           for key, p in sweep.cap_sweep.points.items()}
-    sweeps = {(False, False): half(own, False)}
-    adding = getattr(sweep, "add_on_cap_sweep", None)
-    sweeps[(True, False)] = half(adding.points if adding is not None else own, True)
-    off_bands = ()
-    if sweep.tier_off_scenarios:
-        off_bands = (_KC_B0,)
-        off = sweep.tier_off_scenarios[0]
-        for add in (False, True):
-            listed = _tr_split([*off.trades, _ao_trade(off.trades[0])] if add else off.trades)
-            sweeps[(add, True)] = _FakeCapSweep(
-                {(_KC_B0, k, cap): stamped(off, listed, k=k, size_cap=cap, add_to_held=add)
-                 for k in (0.6, 0.75) for cap in (0.05, 0.2, 1.0)},
-                bands=(_KC_B0,), raise_on=raise_on.get((add, True)))
-    return dataclasses.replace(sweep, trim_sweep=_FakeTrimSweep(sweeps, off_bands=off_bands))
-
-
-# The minimum price rises _kc_sweep_trim_rise's family carries
-_TR_RISES = (0.05, 0.10, 0.25)
-_TR_RISE_WARNING = ("A Trim to Kelly price-rise simulation failed; the filter bar's Min. price "
-                    "rise select stays disabled")
-_TR_RISE_GRIDS = ("grid_trim_rise", "grid_trim_rise_off", "grid_trim_rise_add",
-                  "grid_trim_rise_add_off")
-# Each trim grid beside the grid of its scenarios at every minimum price rise
-_TR_RISE_TWINS = tuple(zip(("grid_trim", "grid_trim_off", "grid_trim_add", "grid_trim_add_off"),
-                           _TR_RISE_GRIDS, strict=True))
-
-
-def _tr_rise_point(like: SweepPoint, trades: list, min_rise: float,
-                   rises: tuple = ()) -> SweepPoint:
-    """`like`'s scenario as a run that trims only after `min_rise`: its own
-    trade list and curve, and the rises behind the trims it still made."""
-    curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
-    return dataclasses.replace(like, trades=trades, equity_df=curve, trim_min_rise=min_rise,
-                               trim_rises=rises)
-
-
-def _tr_resplit(trades: list) -> list:
-    """A list whose first pair was trimmed by another amount than _tr_split
-    trims it by: no other scenario trades it."""
+def _rb_resplit(trades: list) -> list:
+    """A list whose first pair was sold down by another amount than _rb_split
+    sells it by: no other scenario trades it."""
     return [_kc_resized(trades[0], 2), _kc_resized(trades[0], 3), *trades[1:]]
 
 
-def _kc_sweep_trim_rise(base: BacktestSweep | None = None, *, min_rises=_TR_RISES,
-                        raise_on: dict | None = None, rise_raise=None,
-                        scripted: bool = True) -> BacktestSweep:
-    """
-    _kc_sweep_trim() whose Trim to Kelly family also carries minimum price rises.
-
-    Every trim point records the rises behind its trims: none where nothing
-    was trimmed, (0.12,) at the 5% cap and (0.07, 0.30) at the 20% cap of
-    (0-1, k 0.75) with the tier floors on, and (0.20,) at every cap with
-    them off. Unless `scripted` is False (every minimum then repeats its
-    Trim to Kelly run), the family's rise_grid reads, at (0-1, k 0.75):
-      * tier floors on, adding to held pairs off or on. 5% cap: 5c and 10c
-        repeat the Trim to Kelly run, and 25c holds its one trim back — a
-        run of its own that trades the scenario's untrimmed list. 20% cap:
-        5c repeats the Trim to Kelly run, 10c is a run of its own (a list no
-        other scenario trades) and 25c repeats the 10c run. No cap: nothing
-        was trimmed, so every minimum repeats it;
-      * tier floors off: 5c is one run every cap shares (again a list no
-        other scenario trades), which 10c and 25c repeat.
-    Every other cell repeats its Trim to Kelly run at every minimum.
-    `rise_raise` is _FakeTrimSweep's; `raise_on` is _kc_sweep_trim's.
-    """
-    sweep = _kc_sweep_trim(base, raise_on=raise_on)
-    family = sweep.trim_sweep
-    same = backtester.SameTrim
-    rises: dict = {}
-    for (add, off), capped in family.sweeps.items():
-        for key, point in list(capped.points.items()):
-            trimmed = (0.20,) if off else {(_KC_B0, 0.75, 0.05): (0.12,),
-                                           (_KC_B0, 0.75, 0.2): (0.07, 0.30)}.get(key, ())
-            capped.points[key] = dataclasses.replace(point, trim_rises=trimmed)
-        cell = (add, off, _KC_B0, 0.75)
-        if off:
-            listed = sweep.tier_off_scenarios[0].trades
-            shared = _tr_rise_point(
-                capped.points[(_KC_B0, 0.75, 0.2)],
-                _tr_resplit([*listed, _ao_trade(listed[0])] if add else listed), 0.05, (0.20,))
-            rises[cell] = [dict.fromkeys(family.caps, shared),
-                           dict.fromkeys(family.caps, same(0.05)),
-                           dict.fromkeys(family.caps, same(0.05))]
-            continue
-        # The lists the two scenarios traded before any trim: the size-cap
-        # sweep's own, or with adding on the Add to held pairs family's
-        plain = (sweep.add_on_cap_sweep if add and sweep.add_on_cap_sweep is not None
-                 else sweep.cap_sweep).points
-        untrimmed = {cap: (p["all"] if isinstance(p, dict) else p).trades
-                     for cap in (0.05, 0.2) for p in [plain[(_KC_B0, 0.75, cap)]]}
-        held_back = _tr_rise_point(capped.points[(_KC_B0, 0.75, 0.05)], untrimmed[0.05], 0.25)
-        own = _tr_rise_point(capped.points[(_KC_B0, 0.75, 0.2)], _tr_resplit(untrimmed[0.2]),
-                             0.10, (0.30,))
-        rises[cell] = [{}, {0.2: own}, {0.05: held_back, 0.2: same(0.10)}]
-    family.min_rises = tuple(min_rises)
-    family.rises = rises if scripted else {}
-    family.rise_raise = rise_raise
-    return sweep
+def _rb_page(monkeypatch, tmp_path, sweep, series=_FLT_SERIES_TIERS) -> str:
+    """A whole page of a sweep, its trades filed by `series`."""
+    return TestFilterPage()._page(monkeypatch, tmp_path, sweep, series)
 
 
-def _tr_payload(sweep: BacktestSweep, state: str = "not simulated",
-                rise_state: str = "not simulated") -> tuple:
+def _rb_payload(sweep: BacktestSweep, state: str = "not simulated",
+                move_state: str = "not simulated") -> tuple:
     """(the grid walked, the chunk visitor, the base block) as generate_dashboard
-    builds them for a sweep, with the trim state (and the state of its minimum
-    price rises) the page would pass."""
+    builds them for a sweep, with the Rebalance state (and the state of its
+    minimum price movements) the page would pass."""
     trades, curve = sweep.primary.trades, sweep.primary.equity_df
     source = dashboard._grid_source(sweep, trades, curve, 0.75)
     walked, chunker, kd = dashboard._build_filter_grid(
         source, trades, curve, 0.75, _FLT_START, 1000.0, _FLT_SERIES_TIERS)
     base = dashboard._filter_payload(walked, chunker, _FLT_START, 1000.0, _FLT_SERIES_TIERS,
-                                     kd=kd.payload(), trim_state=state,
-                                     trim_rise_state=rise_state)
+                                     kd=kd.payload(), rebalance_state=state,
+                                     move_state=move_state)
     return walked, chunker, base
 
 
-def _tr_warnings(caplog) -> list[str]:
-    """Every WARNING that names the Trim to Kelly view."""
+def _rb_ids(grid) -> set[int]:
+    """Every chunk id a [band][k][cap] grid names."""
+    return {c for band in grid for ks in band for c in ks if c is not None}
+
+
+def _rb_chunks(chunker) -> list:
+    """The chunks a chunk visitor packed, inflated, in id order."""
+    return [_unpack(block) for block in chunker.chunks]
+
+
+def _rb_warnings(caplog) -> list[str]:
+    """Every WARNING that names the Rebalance view."""
     return [r.getMessage() for r in caplog.records
-            if r.levelno == logging.WARNING and "Trim to Kelly" in r.getMessage()]
+            if r.levelno == logging.WARNING and "Rebalance" in r.getMessage()]
 
 
-class TestTrimView:
-    """The page's Trim to Kelly data: a lazy family of trimming runs joins the
-    page's one walk after the add-on cells, every scenario of it is its own
-    run (or the scenario's own chunk, when nothing was trimmed), and a family
-    that does not fit, or cannot be simulated, costs that view alone."""
+class _FakeRebalanceSweep:
+    """
+    A backtester.RebalanceSweep stand-in carrying what the dashboard reads of
+    one: bands, off_bands, ks, caps, sweep() and entry_events().
+
+    `sweeps` maps "tier floors off" (False, True) to the _FakeCapSweep sweep()
+    hands back for that setting; `asked` records each sweep() call by it.
+
+    With `min_moves` it also carries the family's minimum price movements and
+    move_grid(), a generator as the real one is (nothing runs, and nothing
+    raises, before its first step is read). `moves` scripts it: (tier floors
+    off, band, k) -> one {cap: SweepPoint | SameMove} per minimum; a cap, a
+    minimum or a whole cell left out repeats that cell's rebalancing run
+    (SameMove(None)). Like the real one it refuses a `start` that holds no
+    moves for a cap, and adds what it yields to `stats`: a point as one
+    simulated, a SameMove as one "same". `move_raise` = (cell, step) makes
+    that cell's read raise as that step is read (step 0: the first).
+    `asked_moves` records each move_grid() call as (cell, caps, start).
+    """
+
+    def __init__(self, sweeps: dict, *, bands=(_KC_B0, _KC_B1), off_bands=(),
+                 ks=(0.6, 0.75), caps=(0.05, 0.2, 1.0), min_moves=(), moves=None,
+                 move_raise=None):
+        self.sweeps = sweeps
+        self.bands, self.off_bands, self.ks, self.caps = bands, off_bands, ks, caps
+        self.asked: list = []
+        self.min_moves = tuple(min_moves)
+        self.moves = moves or {}
+        self.move_raise = move_raise
+        self.asked_moves: list = []
+
+    def sweep(self, *, tier_floors=True):
+        self.asked.append(not tier_floors)
+        return self.sweeps[not tier_floors]
+
+    def move_grid(self, band, k, *, tier_floors=True, caps=None, start=None, stats=None):
+        cell = (not tier_floors, band, k)
+        self.asked_moves.append((cell, tuple(caps), start))
+        missing = [cap for cap in caps if start.get(cap) is None]
+        if missing:
+            raise ValueError(f"start has no moves for size cap(s) {missing!r}")
+        for key in ("simulated", "reused", "same"):
+            stats.setdefault(key, 0)
+        steps = self.moves.get(cell, [])
+        for i, move in enumerate(self.min_moves):
+            if self.move_raise == (cell, i):
+                raise RuntimeError("the price-movement simulation failed")
+            scripted = steps[i] if i < len(steps) else {}
+            by_cap = {cap: scripted.get(cap, backtester.SameMove(None)) for cap in caps}
+            same = sum(isinstance(entry, backtester.SameMove) for entry in by_cap.values())
+            stats["same"] += same
+            stats["simulated"] += len(by_cap) - same
+            yield move, by_cap
+
+    def entry_events(self):
+        return {event for capped in self.sweeps.values() for event in capped.entry_events()}
+
+
+def _kc_sweep_rebalance(base: BacktestSweep | None = None, *, raise_on=None,
+                        off_raise_on=None, event: str | None = None) -> BacktestSweep:
+    """
+    A size-cap sweep (_kc_sweep() unless `base`) plus the Rebalance family.
+
+    Tier floors on: at k 0.60 no pair is topped up or sold down, so each
+    point holds the base point's own list (its chunks are the base ones); at
+    (0-1, k 0.75) the 5% and 20% caps each sold part of a pair (a list of
+    their own) while with no cap nothing changed; and at (0.3-0.6, k 0.75)
+    every cap added to a pair, the caps sharing one list; (0.3-0.6, 0.60) is
+    never simulated, as in the base. With a tier-floors-off family on `base`
+    (_kc_sweep_tiers()), a tier-floors-off twin over its one binding band
+    holds that family's list with a pair added to and sold down, at every k
+    and cap. `raise_on` and `off_raise_on` make one cell of the tier-on or
+    tier-off sweep raise when it is read; `event` files the 20%-cap part sold
+    under another event (a series no other scenario trades).
+    """
+    sweep = base or _kc_sweep()
+    curves: dict = {}
+
+    def stamped(point, trades=None, **more) -> SweepPoint:
+        if trades is None:
+            return dataclasses.replace(point, add_to_held=True, trim_to_kelly=True, **more)
+        if id(trades) not in curves:
+            curves[id(trades)] = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+        return dataclasses.replace(point, trades=trades, equity_df=curves[id(trades)],
+                                   add_to_held=True, trim_to_kelly=True, **more)
+
+    # The base sweep's points: one "all" point per cell (a size-cap sweep with
+    # the band sweep's checks holds a dict of populations there)
+    own = {key: (p["all"] if isinstance(p, dict) else p)
+           for key, p in sweep.cap_sweep.points.items()}
+    small = _rb_split(own[(_KC_B0, 0.75, 0.05)].trades)
+    full = _rb_split(own[(_KC_B0, 0.75, 0.2)].trades, event)
+    b1 = own[(_KC_B1, 0.75, 0.2)].trades
+    other = [*b1, _rb_added(b1[0])]
+    family = {}
+    for cap in (0.05, 0.2, 1.0):
+        family[(_KC_B0, 0.6, cap)] = stamped(own[(_KC_B0, 0.6, cap)])
+        family[(_KC_B1, 0.75, cap)] = stamped(own[(_KC_B1, 0.75, cap)], other)
+    family[(_KC_B0, 0.75, 0.05)] = stamped(own[(_KC_B0, 0.75, 0.05)], small)
+    family[(_KC_B0, 0.75, 0.2)] = stamped(own[(_KC_B0, 0.75, 0.2)], full)
+    family[(_KC_B0, 0.75, 1.0)] = stamped(own[(_KC_B0, 0.75, 1.0)])
+    sweeps = {False: _FakeCapSweep(family, raise_on=raise_on)}
+    off_bands = ()
+    if sweep.tier_off_scenarios:
+        off_bands = (_KC_B0,)
+        off = sweep.tier_off_scenarios[0]
+        listed = _rb_split([*off.trades, _rb_added(off.trades[0])])
+        sweeps[True] = _FakeCapSweep(
+            {(_KC_B0, k, cap): stamped(off, listed, k=k, size_cap=cap)
+             for k in (0.6, 0.75) for cap in (0.05, 0.2, 1.0)},
+            bands=(_KC_B0,), raise_on=off_raise_on)
+    return dataclasses.replace(sweep, rebalance_sweep=_FakeRebalanceSweep(
+        sweeps, off_bands=off_bands))
+
+
+# _kc_sweep_rebalance()'s tier-on grid: the base chunks (0 to 4) where nothing
+# changed, then (0-1, 0.75)'s 20% and 5% caps (5 and 6) and (0.3-0.6, 0.75) (7)
+_RB_GRID = [[[3, 2, 2], [6, 5, 0]], [[None, None, None], [7, 7, 7]]]
+
+
+class TestRebalanceView:
+    """The page's Rebalance data: a lazy family of runs that add to and sell
+    down held pairs joins the page's one walk after the tier-floors-off
+    cells, every scenario of it is its own run (or the scenario's own chunk,
+    when nothing was topped up or sold down), and a family that does not fit,
+    or cannot be simulated, costs that view alone."""
 
     def test_the_family_joins_a_grid_it_fits(self):
-        sweep = _kc_sweep_trim()
+        sweep = _kc_sweep_rebalance()
         source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
                                         0.75)
-        family = sweep.trim_sweep
-        assert source.trim_cell is not None and source.trim_off_cell is None
-        assert set(source.trim_sweeps) == {(False, False), (True, False)}
-        assert source.trim_sweeps[(False, False)] is family.sweeps[(False, False)]
+        family = sweep.rebalance_sweep
+        assert source.rebalance_cell is not None and source.rebalance_off_cell is None
+        assert set(source.rebalance_sweeps) == {False}
+        assert source.rebalance_sweeps[False] is family.sweeps[False]
+        assert family.asked == [False]
+        # The categories and tags of what it can trade are known before any
+        # cell is read, and attaching it simulates nothing
         assert source.events >= frozenset(family.entry_events())
-        # Attaching it simulates nothing
         assert all(capped.reads == [] for capped in family.sweeps.values())
 
-    def test_an_event_only_a_trimming_run_trades_is_listed_up_front(self):
+    def test_an_event_only_a_rebalancing_run_trades_is_listed_up_front(self):
         # The part sold is filed under an event no other scenario trades: the
         # grid knows it before any cell is read
-        clean, sweep = _kc_sweep(), _kc_sweep_trim(event="KXONLYTRIM-1")
+        clean, sweep = _kc_sweep(), _kc_sweep_rebalance(event="KXONLYREB-1")
         before = dashboard._grid_source(clean, clean.primary.trades, clean.primary.equity_df,
                                         0.75)
         source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
                                         0.75)
-        assert {event for event, _ in source.events - before.events} == {"KXONLYTRIM-1"}
-        assert all(capped.reads == [] for capped in sweep.trim_sweep.sweeps.values())
+        assert {event for event, _ in source.events - before.events} == {"KXONLYREB-1"}
+        assert all(capped.reads == [] for capped in sweep.rebalance_sweep.sweeps.values())
 
-    def test_every_trim_scenario_is_its_own_chunk_or_the_scenario_s_own(self):
-        sweep = _kc_sweep_trim()
+    def test_every_rebalance_scenario_is_its_own_chunk_or_the_scenario_s_own(self):
+        sweep = _kc_sweep_rebalance()
         _, source, base, chunks = _flt_payload(sweep)
         assert base["grid"] == _KC_GRID
-        # k 0.60 and the other band trim nothing: the scenario's own chunk. At
-        # (0-1, 0.75) the 5% and 20% caps each sold part of a pair, so each has
-        # a list of its own; with no cap nothing is trimmed
-        assert base["grid_trim"] == [[[3, 2, 2], [6, 5, 0]], [[None, None, None], [4, 4, 4]]]
-        assert base["trim_state"] == "shown"
-        assert base["grid_trim_off"] is None
-        # The page has no Add to held pairs view, so no adding-on half either,
-        # and those cells were never simulated
-        assert base["grid_trim_add"] is None and base["grid_trim_add_off"] is None
-        assert sweep.trim_sweep.sweeps[(True, False)].reads == []
-        assert len(chunks) == 7
-        assert [chunks[c]["list"]["views"]["all"]["n"] for c in (5, 6)] == [4, 4]
-        # Each is priced at its own k, on its own trades
-        trimmed = sweep.trim_sweep.sweeps[(False, False)].points[(_KC_B0, 0.75, 0.2)].trades
+        # k 0.60 changes nothing: the scenario's own chunk. At (0-1, 0.75) the
+        # 5% and 20% caps each sold part of a pair, so each has a list of its
+        # own; with no cap nothing changed. At (0.3-0.6, 0.75) every cap added
+        # to a pair, sharing one list
+        assert base["grid_rebalance"] == _RB_GRID
+        assert base["rebalance_state"] == "shown" and base["grid_rebalance_off"] is None
+        assert len(chunks) == 8
+        assert [chunks[c]["list"]["views"]["all"]["n"] for c in (5, 6, 7)] == [4, 4, 3]
+        # Each is priced at its own k, on its own trades — never the page's
+        rebalanced = sweep.rebalance_sweep.sweeps[False].points[(_KC_B0, 0.75, 0.2)].trades
         assert chunks[5]["list"]["kx"] == pytest.approx(
-            dashboard._kelly_points(trimmed, 0.75)[0])
+            dashboard._kelly_points(rebalanced, 0.75)[0])
+        assert len(chunks[5]["list"]["kx"]) == 4 != len(chunks[1]["list"]["kx"])
         # Every cell read once, the page's own first
-        assert sweep.trim_sweep.sweeps[(False, False)].reads == [
+        assert sweep.rebalance_sweep.sweeps[False].reads == [
             (_KC_B0, 0.6), (_KC_B0, 0.75), (_KC_B1, 0.6), (_KC_B1, 0.75)]
-
-    def test_the_reach_sentence_says_what_the_choice_changes(self):
-        _, _, base = _tr_payload(_kc_sweep_trim())
-        assert base["text"]["unfiltered"].endswith(dashboard._TRIM_REACH_NO_EXPLORER)
-        assert base["text"]["trim"] == ", trimming to Kelly"
-        assert base["text"]["trim_note"] == dashboard._TRIM_SUMMARY_NOTE
-        _, _, clean = _tr_payload(_kc_sweep())
-        assert "Trim to Kelly" not in clean["text"]["unfiltered"]
 
     def test_the_page_s_other_grids_and_chunks_are_unchanged_beside_it(self):
-        # The trim chunks come after every other chunk, so a page with the
-        # family holds the page without it, chunk for chunk, then its own
-        _, clean_chunker, clean_base = _ao_payload(_kc_sweep_add_on())
-        _, chunker, base = _tr_payload(_kc_sweep_trim(_kc_sweep_add_on()))
-        for key in ("grid", "grid_add", "grid_add_off", "add_state"):
+        # The rebalancing chunks come after every other chunk, so a page with
+        # the family holds the page without it, chunk for chunk, then its own
+        _, clean_chunker, clean_base = _rb_payload(_kc_sweep_tiers())
+        _, chunker, base = _rb_payload(_kc_sweep_rebalance(_kc_sweep_tiers()))
+        for key in ("grid", "grid_off"):
             assert base[key] == clean_base[key]
         assert base["rows"][:len(clean_base["rows"])] == clean_base["rows"]
-        assert _ao_chunks(chunker)[:len(clean_chunker.chunks)] == _ao_chunks(clean_chunker)
+        assert _rb_chunks(chunker)[:len(clean_chunker.chunks)] == _rb_chunks(clean_chunker)
         assert len(chunker.chunks) > len(clean_chunker.chunks)
 
-    def test_with_the_add_on_view_the_adding_half_is_built_too(self):
-        sweep = _kc_sweep_trim(_kc_sweep_add_on())
-        walked, chunker, base = _tr_payload(sweep)
-        add, trim, both = base["grid_add"], base["grid_trim"], base["grid_trim_add"]
-        assert base["trim_state"] == "shown" and both is not None
-        # Nothing trimmed: the cell is the Add to held pairs scenario's own chunk
-        assert both[0][0] == add[0][0] and both[1] == add[1]
-        assert both[0][1][2] == add[0][1][2]
-        # Trimmed: a list neither the add-on scenario nor the trim-alone one traded
-        for ci in (0, 1):
-            assert both[0][1][ci] not in _ao_ids(add) | _ao_ids(trim) | _ao_ids(base["grid"])
-        assert sweep.trim_sweep.sweeps[(True, False)].reads == [
-            (_KC_B0, 0.6), (_KC_B0, 0.75), (_KC_B1, 0.6), (_KC_B1, 0.75)]
+    def test_the_reach_sentence_says_what_the_choice_changes(self, monkeypatch, tmp_path):
+        # Without an explorer grid (the payload built here has none) ...
+        _, _, base = _rb_payload(_kc_sweep_rebalance())
+        assert base["text"]["unfiltered"].endswith(" " + dashboard._REBALANCE_REACH_NO_EXPLORER)
+        assert dashboard._REBALANCE_REACH not in base["text"]["unfiltered"]
+        assert base["text"]["rebalance"] == ", rebalancing"
+        assert base["text"]["rebalance_note"] == dashboard._REBALANCE_SUMMARY_NOTE
+        # ... with one (a band sweep's populations, so the page carries its grid) ...
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance(_ex_sweep()))
+        data = TestFilterPage._data(page)
+        assert data["text"]["unfiltered"].endswith(" " + dashboard._REBALANCE_REACH)
+        assert html.escape(dashboard._REBALANCE_REACH) in page
+        # ... and a page without the view never claims it
+        _, _, clean = _rb_payload(_kc_sweep())
+        assert "Rebalance" not in clean["text"]["unfiltered"]
+        assert "Rebalance" not in TestFilterPage._data(
+            _rb_page(monkeypatch, tmp_path, _kc_sweep()))["text"]["unfiltered"]
 
     def test_without_the_family_the_payload_says_so(self):
-        _, _, base = _tr_payload(_kc_sweep())
-        assert [base[key] for key in ("grid_trim", "grid_trim_off", "grid_trim_add",
-                                      "grid_trim_add_off")] == [None] * 4
-        assert base["trim_state"] == "not simulated"
-        _, _, base = _tr_payload(_kc_sweep(), "unavailable")
-        assert base["grid_trim"] is None and base["trim_state"] == "unavailable"
-        _, _, base = _tr_payload(_kc_sweep_trim(), "unavailable")
-        assert base["trim_state"] == "shown" and base["grid_trim"] is not None
+        _, _, base = _rb_payload(_kc_sweep())
+        assert base["grid_rebalance"] is None and base["grid_rebalance_off"] is None
+        assert base["rebalance_state"] == "not simulated"
+        # ... and a page that had one it could not use says that instead
+        _, _, base = _rb_payload(_kc_sweep(), "unavailable")
+        assert base["grid_rebalance"] is None and base["rebalance_state"] == "unavailable"
+        # A page with the view is "shown", whatever state it was handed
+        _, _, base = _rb_payload(_kc_sweep_rebalance(), "unavailable")
+        assert base["rebalance_state"] == "shown" and base["grid_rebalance"] is not None
+        # No grid of the old views survives under any name
+        for key in base:
+            assert not key.startswith(("grid_add", "grid_trim", "trim_", "add_")), key
 
     def test_a_grid_of_nothing_is_never_shown_as_a_view(self):
-        empty = {key: _FakeCapSweep({}) for key in ((False, False), (True, False))}
-        sweep = dataclasses.replace(_kc_sweep(), trim_sweep=_FakeTrimSweep(empty))
-        walked, chunker, base = _tr_payload(sweep, "unavailable")
-        assert walked.trim_cell is not None and chunker.trim_grid() is None
-        assert base["grid_trim"] is None and base["trim_state"] == "unavailable"
+        sweep = dataclasses.replace(_kc_sweep(), rebalance_sweep=_FakeRebalanceSweep(
+            {False: _FakeCapSweep({})}))
+        walked, chunker, base = _rb_payload(sweep, "unavailable")
+        assert walked.rebalance_cell is not None and chunker.rebalance_grid() is None
+        assert base["grid_rebalance"] is None and base["rebalance_state"] == "unavailable"
 
-    def test_the_tier_off_twins_pair_with_the_tier_off_view_only(self):
-        sweep = _kc_sweep_trim(_kc_sweep_add_on(_kc_sweep_tiers()))
-        walked, chunker, base = _tr_payload(sweep)
-        assert walked.tier_binds == (True, False) and walked.trim_off_cell is not None
-        for on_key, off_key in (("grid_trim", "grid_trim_off"),
-                                ("grid_trim_add", "grid_trim_add_off")):
-            on, off = base[on_key], base[off_key]
-            # A binding band's row is its own tier-floors-off chunks ...
-            assert all(c is not None for row in off[0] for c in row)
-            assert _ao_ids(off[:1]).isdisjoint(_ao_ids(on))
-            # ... and a band the tiers never bind at reads its tier-on row
-            assert off[1] == on[1]
-        assert _ao_ids(base["grid_trim_off"][:1]).isdisjoint(
-            _ao_ids(base["grid_trim_add_off"][:1]))
-        # Without a tier-off view beside them, no off grid is shipped
-        _, _, no_view = _tr_payload(dataclasses.replace(
-            sweep, tier_off_scenarios=[], tier_off_calibrations_by_band={},
-            add_on_tier_off_cap_sweep=None))
-        assert no_view["grid_trim_off"] is None and no_view["grid_trim_add_off"] is None
-        assert no_view["grid_trim"] is not None
+    def test_the_tier_off_twin_pairs_with_the_tier_off_view_only(self):
+        sweep = _kc_sweep_rebalance(_kc_sweep_tiers())
+        walked, chunker, base = _rb_payload(sweep)
+        assert walked.tier_binds == (True, False) and walked.rebalance_off_cell is not None
+        assert set(walked.rebalance_sweeps) == {False, True}
+        on, off = base["grid_rebalance"], base["grid_rebalance_off"]
+        # A binding band's row is its own tier-floors-off chunks ...
+        assert all(c is not None for row in off[0] for c in row)
+        assert _rb_ids(off[:1]).isdisjoint(_rb_ids(on))
+        # ... and a band the tiers never bind at reads its tier-on row
+        assert off[1] == on[1]
+        # Without a tier-off view beside it, no off grid is shipped and its
+        # half is not even read
+        no_view = dataclasses.replace(sweep, tier_off_scenarios=[],
+                                      tier_off_calibrations_by_band={})
+        no_view.rebalance_sweep.asked.clear()
+        walked, _, base = _rb_payload(no_view)
+        assert base["grid_rebalance_off"] is None and base["grid_rebalance"] is not None
+        assert walked.rebalance_off_cell is None and no_view.rebalance_sweep.asked == [False]
 
-    def test_trimming_with_adding_needs_the_add_on_runs_with_the_tiers_off_too(self):
-        # The page has no add-on run with the tier floors off at the band the
-        # tiers bind at, so it shows no trimming-with-adding run there either,
-        # and simulates none
-        sweep = dataclasses.replace(
-            _kc_sweep_trim(_kc_sweep_add_on(_kc_sweep_tiers())), add_on_tier_off_cap_sweep=None)
-        _, _, base = _tr_payload(sweep)
-        assert base["grid_add_off"][0] == [[None] * 3, [None] * 3]
-        assert base["grid_trim_add_off"][0] == [[None] * 3, [None] * 3]
-        assert base["grid_trim_add_off"][1] == base["grid_trim_add"][1]
-        assert sweep.trim_sweep.sweeps[(True, True)].reads == []
-        # Trimming alone with the tier floors off is still shown there
-        assert all(c is not None for row in base["grid_trim_off"][0] for c in row)
+    def test_a_family_without_the_binding_bands_costs_the_tier_off_half_only(self, caplog):
+        sweep = _kc_sweep_rebalance(_kc_sweep_tiers())
+        sweep.rebalance_sweep.off_bands = ()
+        with caplog.at_level(logging.WARNING):
+            walked, _, base = _rb_payload(sweep)
+        assert _rb_warnings(caplog) == [_RB_MISMATCH_OFF]
+        assert walked.rebalance_cell is not None and walked.rebalance_off_cell is None
+        assert set(walked.rebalance_sweeps) == {False}
+        assert base["rebalance_state"] == "shown"
+        # With the tiers off, rebalancing reads "missing" at the band they bind at
+        assert base["grid_rebalance_off"][0] == [[None] * 3, [None] * 3]
+        assert base["grid_rebalance_off"][1] == base["grid_rebalance"][1]
+        assert sweep.rebalance_sweep.sweeps[True].reads == []
 
     def test_a_tier_off_half_that_cannot_be_read_says_so(self, caplog):
-        sweep = _kc_sweep_trim(_kc_sweep_tiers())
-        real = sweep.trim_sweep.sweep
+        sweep = _kc_sweep_rebalance(_kc_sweep_tiers())
+        real = sweep.rebalance_sweep.sweep
 
-        def broken(*, tier_floors=True, add_to_held=False):
+        def broken(*, tier_floors=True):
             if not tier_floors:
                 raise ZeroDivisionError("off sweep")
-            return real(tier_floors=tier_floors, add_to_held=add_to_held)
-        sweep.trim_sweep.sweep = broken
+            return real(tier_floors=tier_floors)
+        sweep.rebalance_sweep.sweep = broken
         with caplog.at_level(logging.WARNING):
-            walked, _, base = _tr_payload(sweep)
-        [warned] = [r for r in caplog.records if "Trim to Kelly" in r.getMessage()]
-        assert warned.exc_info is not None and warned.getMessage() == (
-            "The Trim to Kelly simulations with the tier floors off could not be read; with "
-            "the tier floors off, trimming is not shown")
-        assert walked.trim_cell is not None and walked.trim_off_cell is None
-        assert base["trim_state"] == "shown" and base["grid_trim"] is not None
+            walked, _, base = _rb_payload(sweep)
+        [warned] = [r for r in caplog.records if "Rebalance" in r.getMessage()]
+        assert warned.exc_info is not None and warned.getMessage() == _RB_UNREAD_OFF
+        assert walked.rebalance_cell is not None and walked.rebalance_off_cell is None
+        assert base["rebalance_state"] == "shown" and base["grid_rebalance"] is not None
+        assert base["grid_rebalance_off"][0] == [[None] * 3, [None] * 3]
 
-    def test_a_chunk_visitor_that_has_failed_simulates_no_trim_cell(self, monkeypatch, caplog):
+    def test_a_chunk_visitor_that_has_failed_simulates_no_rebalance_cell(self, monkeypatch):
         # The bar is already lost (a chunk could not be built), so the page is
         # written without it: the family's cells are not simulated for nothing
-        sweep = _kc_sweep_trim()
+        sweep = _kc_sweep_rebalance()
         real = dashboard._ChunkVisitor.__call__
 
         def failing(self, bi, ki, ci, pops):
@@ -11860,71 +11207,78 @@ class TestTrimView:
         source = dashboard._grid_source(sweep, trades, curve, 0.75)
         dashboard._build_filter_grid(source, trades, curve, 0.75, _FLT_START, 1000.0,
                                      _FLT_SERIES_TIERS)
-        assert all(capped.reads == [] for capped in sweep.trim_sweep.sweeps.values())
-
-    def test_a_family_without_the_binding_bands_costs_the_tier_off_half_only(self, caplog):
-        sweep = _kc_sweep_trim(_kc_sweep_tiers())
-        sweep.trim_sweep.off_bands = ()
-        with caplog.at_level(logging.WARNING):
-            walked, _, base = _tr_payload(sweep)
-        assert _tr_warnings(caplog) == [_TRIM_MISMATCH_OFF]
-        assert walked.trim_cell is not None and walked.trim_off_cell is None
-        assert base["trim_state"] == "shown"
-        # With the tiers off, trimming reads "missing" at the band they bind at
-        assert base["grid_trim_off"][0] == [[None] * 3, [None] * 3]
-        assert base["grid_trim_off"][1] == base["grid_trim"][1]
-        assert sweep.trim_sweep.sweeps[(False, True)].reads == []
+        assert all(capped.reads == [] for capped in sweep.rebalance_sweep.sweeps.values())
 
     # ─── A family that does not fit ───────────────────────────────────────────
 
     @pytest.mark.parametrize("axis, value", [("bands", (_KC_B0,)), ("ks", (0.75,)),
                                              ("caps", (0.05, 0.2))])
-    def test_a_family_on_other_axes_gives_no_view(self, caplog, axis, value):
-        sweep = _kc_sweep_trim()
-        setattr(sweep.trim_sweep, axis, value)
+    def test_a_family_on_other_axes_gives_no_view(
+            self, monkeypatch, tmp_path, caplog, axis, value):
+        sweep = _kc_sweep_rebalance()
+        setattr(sweep.rebalance_sweep, axis, value)
         with caplog.at_level(logging.WARNING):
-            walked, _, base = _tr_payload(sweep, "unavailable")
-        assert _tr_warnings(caplog) == [_TRIM_MISMATCH]
-        assert walked.trim_cell is None and walked.trim_sweeps == {}
-        assert base["grid_trim"] is None and base["trim_state"] == "unavailable"
+            walked, _, base = _rb_payload(sweep, "unavailable")
+        assert _rb_warnings(caplog) == [_RB_MISMATCH]
+        assert walked.rebalance_cell is None and walked.rebalance_sweeps == {}
+        assert base["grid_rebalance"] is None and base["rebalance_state"] == "unavailable"
         assert base["grid"] == _KC_GRID
-        assert sweep.trim_sweep.asked == []
+        assert sweep.rebalance_sweep.asked == []
+        # The page keeps every other choice and says why the select is shut
+        page = _rb_page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert data["grid_rebalance"] is None and data["rebalance_state"] == "unavailable"
+        assert 'id="flt-rebalance-note"' in page and 'id="flt-bar"' in page
+        assert data["grid"] == _KC_GRID
 
     def test_a_family_that_cannot_be_read_gives_no_view(self, caplog):
-        sweep = _kc_sweep_trim()
+        sweep = _kc_sweep_rebalance()
 
         def broken():
             raise ZeroDivisionError("entry events")
-        sweep.trim_sweep.entry_events = broken
+        sweep.rebalance_sweep.entry_events = broken
         with caplog.at_level(logging.WARNING):
             source = dashboard._grid_source(sweep, sweep.primary.trades,
                                             sweep.primary.equity_df, 0.75)
-        assert source.trim_cell is None and source.cap_sweep is sweep.cap_sweep
-        [warned] = [r for r in caplog.records if "Trim to Kelly" in r.getMessage()]
-        assert warned.exc_info is not None and warned.getMessage() == _TRIM_UNREAD
+        assert source.rebalance_cell is None and source.cap_sweep is sweep.cap_sweep
+        [warned] = [r for r in caplog.records if "Rebalance" in r.getMessage()]
+        assert warned.exc_info is not None and warned.getMessage() == _RB_UNREAD
 
     def test_the_cap_axis_fallback_grid_has_no_view_and_no_warning(self, caplog):
-        sweep = _kc_sweep_trim()
+        sweep = _kc_sweep_rebalance()
         with caplog.at_level(logging.WARNING):
             fallback = dashboard._grid_source(sweep, sweep.primary.trades,
                                               sweep.primary.equity_df, 0.75,
                                               use_cap_sweep=False)
-        assert fallback.trim_cell is None and fallback.cap_sweep is None
-        assert _tr_warnings(caplog) == []
-        assert sweep.trim_sweep.asked == []
+        assert fallback.rebalance_cell is None and fallback.cap_sweep is None
+        assert _rb_warnings(caplog) == []
+        assert sweep.rebalance_sweep.asked == []
 
-    def test_a_lost_cap_axis_costs_the_trim_view_too(self, caplog):
-        sweep = _kc_sweep_trim(_kc_sweep(raise_on=(_KC_B1, 0.75)))
+    def test_a_lost_cap_axis_costs_the_rebalance_view_too(self, monkeypatch, tmp_path, caplog):
+        # The size-cap sweep's last cell raises: the walk falls back to the
+        # eager grid, which never carries the family (its caps are the size-cap
+        # grid's); the page says the choice could not be built, and no
+        # rebalancing cell was ever simulated
+        sweep = _kc_sweep_rebalance(_kc_sweep(raise_on=(_KC_B1, 0.75)))
         with caplog.at_level(logging.WARNING):
-            walked, _, base = _tr_payload(sweep, "unavailable")
-        assert walked.cap_sweep is None and walked.trim_cell is None
-        assert base["grid_trim"] is None and base["trim_state"] == "unavailable"
-        assert _tr_warnings(caplog) == [_TRIM_LOST_WITH_CAP_SWEEP]
-        assert all(capped.reads == [] for capped in sweep.trim_sweep.sweeps.values())
+            page = _rb_page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert data["grid_rebalance"] is None and data["rebalance_state"] == "unavailable"
+        assert _RB_UNAVAILABLE in page and 'id="flt-bar"' in page
+        assert all(capped.reads == [] for capped in sweep.rebalance_sweep.sweeps.values())
+        assert sum("size-cap sweep could not be simulated" in r.getMessage()
+                   for r in caplog.records) == 1
+        # ... and the log says what that cost the select, once
+        assert _rb_warnings(caplog) == [_RB_LOST_WITH_CAP_SWEEP]
 
     @pytest.mark.parametrize("how", ["unreadable", "without the primary"])
-    def test_a_size_cap_sweep_set_aside_says_what_it_costs_the_trim_view(self, caplog, how):
-        sweep = _kc_sweep_trim()
+    def test_a_size_cap_sweep_set_aside_says_what_it_costs_the_rebalance_view(
+            self, monkeypatch, tmp_path, caplog, how):
+        # The size-cap sweep the family is read with cannot be used (its events
+        # cannot be read, or it holds no scenario of the run's primary): its own
+        # WARNING names that, and one more says the select stays shut — never a
+        # complaint that the family's grid does not match the eager one
+        sweep = _kc_sweep_rebalance()
         if how == "unreadable":
             def broken():
                 raise ZeroDivisionError("entry events")
@@ -11934,103 +11288,124 @@ class TestTrimView:
         with caplog.at_level(logging.WARNING):
             source = dashboard._grid_source(sweep, sweep.primary.trades,
                                             sweep.primary.equity_df, 0.75)
-        assert source.cap_sweep is None and source.trim_cell is None
-        assert _tr_warnings(caplog) == [_TRIM_LOST_WITH_CAP_SWEEP]
-        assert sweep.trim_sweep.asked == []
+        assert source.cap_sweep is None and source.rebalance_cell is None
+        assert _rb_warnings(caplog) == [_RB_LOST_WITH_CAP_SWEEP]
+        assert sweep.rebalance_sweep.asked == []
+        # ... and the page says the choice is not available, pointing at the log
+        page = _rb_page(monkeypatch, tmp_path, sweep)
+        data = TestFilterPage._data(page)
+        assert data["grid_rebalance"] is None and data["rebalance_state"] == "unavailable"
+        assert _RB_UNAVAILABLE in page
 
-    def test_a_family_on_a_run_without_a_band_is_set_aside_and_said(self, caplog):
-        sweep = _kc_sweep_trim()
+    def test_a_run_without_the_family_says_nothing_when_the_cap_axis_is_lost(
+            self, monkeypatch, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING):
+            _rb_page(monkeypatch, tmp_path, _kc_sweep(raise_on=(_KC_B1, 0.75)))
+        assert any("size-cap sweep could not be simulated" in r.getMessage()
+                   for r in caplog.records)
+        assert _rb_warnings(caplog) == []
+
+    def test_a_family_on_a_run_without_a_band_is_set_aside_and_said(
+            self, monkeypatch, tmp_path, caplog):
+        # A hand-built sweep whose primary records no band cannot place the
+        # family's cells on a band axis either: its own WARNING (beside the
+        # size-cap sweep's), a shut select and no simulation
+        sweep = _kc_sweep_rebalance()
         primary = dataclasses.replace(sweep.primary, spread_band=None)
         sweep = dataclasses.replace(sweep, primary=primary, points=[primary], scenarios=[])
         with caplog.at_level(logging.WARNING):
-            source = dashboard._grid_source(sweep, sweep.primary.trades,
-                                            sweep.primary.equity_df, 0.75)
-        assert source.trim_cell is None and _tr_warnings(caplog) == [_TRIM_NO_BAND]
-        assert sweep.trim_sweep.asked == []
+            page = _rb_page(monkeypatch, tmp_path, sweep)
+        assert _rb_warnings(caplog) == [_RB_NO_BAND]
+        data = TestFilterPage._data(page)
+        assert data["grid_rebalance"] is None and data["rebalance_state"] == "unavailable"
+        assert _RB_UNAVAILABLE in page
+        assert sweep.rebalance_sweep.asked == []
 
     def test_a_run_without_a_size_cap_sweep_offers_the_view_at_its_own_cap(self):
+        # The eager grid's caps are the run's own cap alone, and so are the
+        # family's: it fits, and only the cells it simulated hold a chunk
         sweep = _flt_sweep()
         primary = sweep.primary
-        trimmed = dataclasses.replace(primary, trades=_tr_split(primary.trades),
-                                      trim_to_kelly=True)
+        rebalanced = dataclasses.replace(
+            primary, trades=[*_rb_split(primary.trades), _rb_added(primary.trades[0])],
+            add_to_held=True, trim_to_kelly=True)
         axes = {"bands": ((0.0, 1.0), (0.3, 0.6), (0.3, 1.0)), "ks": (0.6, 0.75, 1.0),
                 "caps": (0.2,)}
-        halves = {(False, False): _FakeCapSweep({((0.0, 1.0), 0.75, 0.2): trimmed}, **axes),
-                  (True, False): _FakeCapSweep({}, **axes)}
+        family = _FakeRebalanceSweep(
+            {False: _FakeCapSweep({((0.0, 1.0), 0.75, 0.2): rebalanced}, **axes)}, **axes)
         _, source, base, chunks = _flt_payload(dataclasses.replace(
-            sweep, trim_sweep=_FakeTrimSweep(halves, **axes)))
-        assert source.cap_sweep is None and source.trim_cell is not None
-        assert base["trim_state"] == "shown"
-        assert base["grid_trim"] == [[[None], [4], [None]], [[None]] * 3, [[None]] * 3]
-        assert chunks[4]["list"]["views"]["all"]["n"] == len(primary.trades) + 1
+            sweep, rebalance_sweep=family))
+        assert source.cap_sweep is None and source.rebalance_cell is not None
+        assert base["rebalance_state"] == "shown"
+        assert base["grid_rebalance"] == [[[None], [4], [None]], [[None]] * 3, [[None]] * 3]
+        assert chunks[4]["list"]["views"]["all"]["n"] == len(primary.trades) + 2
 
     # ─── A cell that cannot be simulated ──────────────────────────────────────
 
-    @pytest.mark.parametrize("setting", [(False, False), (True, False), (False, True),
-                                         (True, True)])
-    def test_a_trim_cell_that_raises_costs_only_the_trim_view(
-            self, monkeypatch, tmp_path, caplog, setting):
-        # One cell of one setting raises after earlier trim cells were packed:
-        # every trim chunk and row head is dropped, and the page is the page it
-        # was without the family, chunk for chunk
-        base_sweep = _kc_sweep_add_on(_kc_sweep_tiers())
-        clean = _ao_page(monkeypatch, tmp_path, base_sweep)
-        sweep = _kc_sweep_trim(_kc_sweep_add_on(_kc_sweep_tiers()),
-                               raise_on={setting: (_KC_B0, 0.75)})
+    @pytest.mark.parametrize("off", [False, True], ids=["tier-on", "tier-off"])
+    def test_a_rebalance_cell_that_raises_costs_only_the_rebalance_view(
+            self, monkeypatch, tmp_path, caplog, off):
+        # One cell raises after earlier rebalancing cells were packed: every
+        # rebalancing chunk and row head is dropped, and the page is the page
+        # it was without the family, chunk for chunk, beside the choice's note
+        clean = _rb_page(monkeypatch, tmp_path, _kc_sweep_tiers())
+        cell = (_KC_B0, 0.75)
+        sweep = _kc_sweep_rebalance(_kc_sweep_tiers(), raise_on=None if off else cell,
+                                    off_raise_on=cell if off else None)
         with caplog.at_level(logging.WARNING):
-            page = _ao_page(monkeypatch, tmp_path, sweep)
+            page = _rb_page(monkeypatch, tmp_path, sweep)
         warned = [r for r in caplog.records if r.levelno == logging.WARNING
-                  and _TRIM_WARNING in r.getMessage()]
+                  and _RB_WARNING in r.getMessage()]
         assert len(warned) == 1 and warned[0].exc_info is not None
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         clean_data, clean_chunks = TestFilterPage._data(clean), TestFilterPage._chunks(clean)
-        assert [data[key] for key in ("grid_trim", "grid_trim_off", "grid_trim_add",
-                                      "grid_trim_add_off")] == [None] * 4
-        assert data["trim_state"] == "unavailable"
-        for key in ("grid", "grid_off", "grid_add", "grid_add_off", "add_state", "rows",
-                    "text", "kd"):
+        assert data["grid_rebalance"] is None and data["grid_rebalance_off"] is None
+        assert data["rebalance_state"] == "unavailable"
+        for key in ("grid", "grid_off", "rows", "text", "kd"):
             assert data[key] == clean_data[key]
-        assert data["grid_add"] is not None and chunks == clean_chunks
-        assert 'id="flt-bar"' in page
+        assert data["grid_off"] is not None and chunks == clean_chunks
+        assert 'id="flt-bar"' in page and _RB_UNAVAILABLE in page
         # The walk had begun on the family before the cell that raised
-        assert sweep.trim_sweep.sweeps[(False, False)].reads[0] == (_KC_B0, 0.6)
+        assert sweep.rebalance_sweep.sweeps[False].reads[0] == (_KC_B0, 0.6)
 
-    def test_a_failing_add_on_cell_keeps_the_trim_view_without_its_adding_half(self, caplog):
-        # The Add to held pairs family cannot be simulated: its view goes, and
-        # the trim view is built for adding off alone — the adding-on cells are
-        # never read, since the page cannot show adding on
-        sweep = _kc_sweep_trim(_kc_sweep_add_on(raise_on=(_KC_B1, 0.75)))
+    def test_a_failing_tier_off_size_cap_cell_keeps_the_rebalance_view(self, caplog):
+        # The tier-floors-off SIZE-CAP sweep cannot simulate its cell: the walk
+        # swaps in the grid's eager tier-off lookup, which was built before the
+        # family was attached — and must carry it, or the rebalancing phase
+        # would be skipped and no view shipped
+        sweep = _kc_sweep_rebalance(_kc_sweep_tiers_capped(raise_on=(_KC_B0, 0.6)))
         with caplog.at_level(logging.WARNING):
-            walked, chunker, base = _tr_payload(sweep)
-        assert any(_ADD_WARNING in r.getMessage() for r in caplog.records)
-        assert _tr_warnings(caplog) == []
-        assert base["grid_add"] is None and base["trim_state"] == "shown"
-        assert base["grid_trim"] is not None and base["grid_trim_add"] is None
-        assert sweep.trim_sweep.sweeps[(True, False)].reads == []
-        # ... and the trim chunks sit right after the page's own
-        assert min(_ao_ids(base["grid_trim"]) - _ao_ids(base["grid"])) == 5
-
-    def test_a_failing_tier_off_size_cap_cell_keeps_the_trim_view(self, caplog):
-        # The walk swaps in the grid's eager tier-off lookup, which was built
-        # before the family was attached, and must still carry it
-        sweep = _kc_sweep_trim(_kc_sweep_tiers_capped(raise_on=(_KC_B0, 0.6)))
-        with caplog.at_level(logging.WARNING):
-            walked, chunker, base = _tr_payload(sweep)
+            walked, chunker, base = _rb_payload(sweep)
         assert any(_OFF_WARNING in r.getMessage() for r in caplog.records)
-        assert _tr_warnings(caplog) == []
-        assert walked.off_cap_sweep is None
-        assert walked.trim_cell is not None and walked.trim_off_cell is not None
-        assert base["trim_state"] == "shown"
-        assert base["grid_trim"] is not None and base["grid_trim_off"] is not None
+        assert _rb_warnings(caplog) == []
+        assert walked.off_cap_sweep is None            # the eager lookup was walked
+        assert walked.rebalance_cell is not None and walked.rebalance_off_cell is not None
+        assert base["rebalance_state"] == "shown"
+        assert base["grid_rebalance"] is not None and base["grid_rebalance_off"] is not None
+        assert base["grid_off"] is not None
 
-    def test_the_walk_reads_the_trim_cells_after_every_other_kind(self):
-        # The order the families are simulated in is what lets one family's
-        # chunks be dropped without cutting into another's
-        sweep = _kc_sweep_trim(_kc_sweep_add_on(_kc_sweep_tiers()))
+    def test_a_walk_over_a_grid_with_a_missing_family_walks_nothing_extra(self, caplog):
+        sweep = _kc_sweep_rebalance()
+        source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
+                                        0.75)
+        stripped = dataclasses.replace(source, rebalance_cell=None, rebalance_off_cell=None,
+                                       rebalance_sweeps={})
+        with caplog.at_level(logging.WARNING):
+            _, chunker, _ = dashboard._build_filter_grid(
+                stripped, sweep.primary.trades, sweep.primary.equity_df, 0.75, _FLT_START,
+                1000.0, _FLT_SERIES_TIERS)
+        assert all(capped.reads == [] for capped in sweep.rebalance_sweep.sweeps.values())
+        # No rebalancing phase ran: nothing was warned or packed for it
+        assert _rb_warnings(caplog) == [] and chunker.grids_rebalance == {}
+
+    def test_the_walk_reads_the_rebalance_cells_after_every_other_kind(self):
+        # The order the families are simulated in is what lets the
+        # rebalancing chunks be dropped without cutting into any other's
+        sweep = _kc_sweep_rebalance(_kc_sweep_tiers_capped())
         order: list[str] = []
-        named = {"cap": sweep.cap_sweep, "add": sweep.add_on_cap_sweep,
-                 "add off": sweep.add_on_tier_off_cap_sweep,
-                 **{f"trim {key}": capped for key, capped in sweep.trim_sweep.sweeps.items()}}
+        named = {"cap": sweep.cap_sweep, "cap off": sweep.tier_off_cap_sweep,
+                 **{f"rebalance {key}": capped
+                    for key, capped in sweep.rebalance_sweep.sweeps.items()}}
         for name, capped in named.items():
             read = capped.cell
 
@@ -12039,83 +11414,211 @@ class TestTrimView:
                     order.append(name)
                 return read(band, k)
             capped.cell = cell
-        _tr_payload(sweep)
-        assert order == ["cap", "add", "add off", "trim (False, False)", "trim (False, True)",
-                         "trim (True, False)", "trim (True, True)"]
+        _rb_payload(sweep)
+        assert order == ["cap", "cap off", "rebalance False", "rebalance True"]
+
+    # ─── What it never reaches ────────────────────────────────────────────────
+
+    def test_only_the_bar_s_visitors_take_the_rebalance_cells(self):
+        assert hasattr(dashboard._ChunkVisitor, "rebalance")
+        assert hasattr(dashboard._ChunkVisitor, "move")
+        for visitor in (dashboard._ExplorerVisitor, dashboard._KdVisitor):
+            assert not hasattr(visitor, "rebalance") and not hasattr(visitor, "move")
+        # ... and none takes the old add-on or trim cells
+        for visitor in (dashboard._ChunkVisitor, dashboard._ExplorerVisitor,
+                        dashboard._KdVisitor):
+            for old in ("add", "trim", "trim_rise"):
+                assert not hasattr(visitor, old), (visitor, old)
+
+    def test_the_explorer_and_the_interval_discount_are_the_same_with_the_family(
+            self, monkeypatch, tmp_path):
+        # The scenario explorer's blocks and the interval-discount section's
+        # data are those of the page without the family: neither follows the choice
+        clean = _rb_page(monkeypatch, tmp_path, _ex_sweep_tiers())
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance(_ex_sweep_tiers()))
+        assert _scn_blocks(_ex_section(page)) == _scn_blocks(_ex_section(clean))
+        assert len(_scn_blocks(_ex_section(page))) > 3
+        assert TestFilterPage._data(page)["kd"] == TestFilterPage._data(clean)["kd"]
+        # ... and so are the k-hat figures, which are measured before sizing
+        assert TestFilterPage._data(page)["khat"] == TestFilterPage._data(clean)["khat"]
+        assert TestFilterPage._data(page)["khat_off"] == TestFilterPage._data(clean)["khat_off"]
+
+    def test_the_bar_lists_a_series_only_a_rebalancing_run_traded(self, monkeypatch, tmp_path):
+        # A trim frees cash and an add-on spends it, so a rebalancing run can
+        # trade a pair no other scenario traded; the bar must list its category
+        # and tag before any cell is simulated, or that chunk fails and costs
+        # the whole bar
+        sweep = _kc_sweep_rebalance(event="KXRAIN-1")
+        page = _rb_page(monkeypatch, tmp_path, sweep)
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        assert 'id="flt-bar"' in page and data["grid_rebalance"] is not None
+        assert "Climate" in data["categories"]
+        # Its chunk holds that category's view
+        climate = _key(data, "Climate")
+        assert chunks[data["grid_rebalance"][0][1][1]]["list"]["views"][climate]["n"] == 1
+        # The page without the family never offers it
+        clean = TestFilterPage._data(_rb_page(monkeypatch, tmp_path, _kc_sweep()))
+        assert "Climate" not in clean["categories"]
+
+    def test_every_chunk_the_rebalance_grids_name_is_on_the_page(self, monkeypatch, tmp_path):
+        # The chunk-id check of TestFilterPage's, over the Rebalance grids too
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance(_kc_sweep_tiers()))
+        data = TestFilterPage._data(page)
+        ids = (_rb_ids(data["grid"]) | _rb_ids(data["grid_off"])
+               | _rb_ids(data["grid_rebalance"]) | _rb_ids(data["grid_rebalance_off"]))
+        assert _rb_ids(data["grid_rebalance"]) - _rb_ids(data["grid"])
+        assert _rb_ids(data["grid_rebalance_off"]) - _rb_ids(data["grid_rebalance"])
+        missing = sorted(i for i in ids if f'id="dash-chunk-{i}"' not in page)
+        assert ids and not missing
+        # Every chunk on the page is named by some grid: none is left over
+        assert set(TestFilterPage._chunks(page)) == ids
 
 
-def _tr_rise_warnings(caplog) -> list:
-    """Every WARNING record about the minimum price rises."""
+# The minimum price movements _kc_sweep_move's family carries
+_MV_MOVES = (0.05, 0.10, 0.25)
+_MV_WARNING = ("A Rebalance price-movement simulation failed; the filter bar's Min. price "
+               "movement select stays disabled")
+
+
+def _mv_point(like: SweepPoint, trades: list, min_move: float,
+              moves: tuple = ()) -> SweepPoint:
+    """`like`'s scenario as a run that rebalances only after a `min_move`
+    price movement: its own trade list and curve, and the moves behind the
+    add-ons and trims it still made."""
+    curve = backtester._build_equity_curve(trades, _FLT_START, 1000.0)
+    return dataclasses.replace(like, trades=trades, equity_df=curve, min_move=min_move,
+                               moves=moves)
+
+
+def _kc_sweep_move(base: BacktestSweep | None = None, *, min_moves=_MV_MOVES, raise_on=None,
+                   off_raise_on=None, move_raise=None, scripted: bool = True) -> BacktestSweep:
+    """
+    _kc_sweep_rebalance() whose family also carries minimum price movements.
+
+    Every rebalancing point records the moves behind its add-ons and trims:
+    none where nothing changed, (0.12,) at the 5% cap and (0.07, 0.30) at the
+    20% cap of (0-1, k 0.75), (0.40,) at every cap of (0.3-0.6, k 0.75), and
+    (0.20,) at every cap with the tier floors off. Unless `scripted` is False
+    (every minimum then repeats its rebalancing run), the family's move_grid
+    reads, at (0-1, k 0.75):
+      * tier floors on. 5% cap: 5c and 10c repeat the rebalancing run, and
+        25c holds its one trim back — a run of its own that trades the
+        scenario's own list. 20% cap: 5c repeats the rebalancing run, 10c is
+        a run of its own (a list no other scenario trades) and 25c repeats
+        the 10c run. No cap: nothing changed, so every minimum repeats it;
+      * tier floors off: 5c is one run every cap shares (again a list no
+        other scenario trades), which 10c and 25c repeat.
+    Every other cell repeats its rebalancing run at every minimum (the
+    (0.3-0.6, 0.75) add-on came after a 40c move, which every minimum lets
+    through). `move_raise` is _FakeRebalanceSweep's; `raise_on` and
+    `off_raise_on` are _kc_sweep_rebalance's.
+    """
+    sweep = _kc_sweep_rebalance(base, raise_on=raise_on, off_raise_on=off_raise_on)
+    family = sweep.rebalance_sweep
+    same = backtester.SameMove
+    moves: dict = {}
+    for off, capped in family.sweeps.items():
+        for key, point in list(capped.points.items()):
+            moved = (0.20,) if off else {(_KC_B0, 0.75, 0.05): (0.12,),
+                                         (_KC_B0, 0.75, 0.2): (0.07, 0.30)}.get(
+                key, (0.40,) if key[:2] == (_KC_B1, 0.75) else ())
+            capped.points[key] = dataclasses.replace(point, moves=moved)
+        cell = (off, _KC_B0, 0.75)
+        if off:
+            off_trades = sweep.tier_off_scenarios[0].trades
+            shared = _mv_point(capped.points[(_KC_B0, 0.75, 0.2)],
+                               _rb_resplit([*off_trades, _rb_added(off_trades[0])]), 0.05,
+                               (0.20,))
+            moves[cell] = [dict.fromkeys(family.caps, shared),
+                           dict.fromkeys(family.caps, same(0.05)),
+                           dict.fromkeys(family.caps, same(0.05))]
+            continue
+        # The lists the two scenarios traded before any trade on a held pair:
+        # the size-cap sweep's own
+        plain = sweep.cap_sweep.points
+        untouched = {cap: (p["all"] if isinstance(p, dict) else p).trades
+                     for cap in (0.05, 0.2) for p in [plain[(_KC_B0, 0.75, cap)]]}
+        held_back = _mv_point(capped.points[(_KC_B0, 0.75, 0.05)], untouched[0.05], 0.25)
+        own = _mv_point(capped.points[(_KC_B0, 0.75, 0.2)], _rb_resplit(untouched[0.2]),
+                        0.10, (0.30,))
+        moves[cell] = [{}, {0.2: own}, {0.05: held_back, 0.2: same(0.10)}]
+    family.min_moves = tuple(min_moves)
+    family.moves = moves if scripted else {}
+    family.move_raise = move_raise
+    return sweep
+
+
+def _mv_warnings(caplog) -> list:
+    """Every WARNING record about the minimum price movements."""
     return [r for r in caplog.records
-            if r.levelno == logging.WARNING and "price-rise" in r.getMessage()]
+            if r.levelno == logging.WARNING and "price-movement" in r.getMessage()]
 
 
-class TestTrimRiseView:
-    """The page's data for the Trim to Kelly family's minimum price rises: the
-    walk's last phase reads every trim scenario again at each minimum, a run
-    of its own gets a chunk, a run that repeats another stores that run's
-    chunk id, and a cell that cannot be read costs this view alone."""
+class TestMoveView:
+    """The page's data for the Rebalance family's minimum price movements: the
+    walk's last phase reads every rebalancing scenario again at each minimum,
+    a run of its own gets a chunk, a run that repeats another stores that
+    run's chunk id, and a cell that cannot be read costs this view alone."""
 
-    # (0-1, k 0.75) of _kc_sweep_trim_rise(), per cap and minimum: the 5% cap
-    # repeats its Trim to Kelly chunk (6) until 25c holds its trim back, which
-    # leaves the scenario's own untrimmed list (chunk 1); the 20% cap repeats
-    # its own (5), then makes a run of its own at 10c (its own chunk, 7) that 25c
-    # repeats; with no cap nothing was trimmed, so no minimum changes it
-    _CELL = [[6, 6, 1], [5, 7, 7], None]
+    # (0-1, k 0.75) of _kc_sweep_move(), per cap and minimum: the 5% cap
+    # repeats its rebalancing chunk (6) until 25c holds its trim back, which
+    # leaves the scenario's own list (chunk 1); the 20% cap repeats its own
+    # (5), then makes a run of its own at 10c (its own chunk, 8) that 25c
+    # repeats; with no cap nothing changed, so no minimum changes it
+    _CELL = [[6, 6, 1], [5, 8, 8], None]
 
     @staticmethod
     def _only_this_view_is_lost(base, chunks, clean_base, clean_chunks) -> None:
         """A page whose minimums could not be read is, but for saying so, the
         page of the same family without them: base block and chunks alike."""
-        assert [base[key] for key in _TR_RISE_GRIDS] == [None] * 4
-        assert base["trim_rises"] == [] and base["trim_rise_state"] == "unavailable"
-        assert base["trim_state"] == "shown" and base["grid_trim"] is not None
+        assert base["grid_move"] is None and base["grid_move_off"] is None
+        assert base["moves"] == [] and base["move_state"] == "unavailable"
+        assert base["rebalance_state"] == "shown" and base["grid_rebalance"] is not None
         assert set(base) == set(clean_base)
         for key in clean_base:
-            if key != "trim_rise_state":
+            if key != "move_state":
                 assert base[key] == clean_base[key], key
         assert chunks == clean_chunks
 
     def test_the_minimums_join_the_grid_with_their_family(self):
-        sweep = _kc_sweep_trim_rise()
+        sweep = _kc_sweep_move()
         source = dashboard._grid_source(sweep, sweep.primary.trades, sweep.primary.equity_df,
                                         0.75)
-        assert source.trim_rises == _TR_RISES and source.trim_rise_cell is not None
-        assert source.trim_rise_stats == {}
+        assert source.moves == _MV_MOVES and source.move_cell is not None
+        assert source.move_stats == {}
         # Attaching them reads nothing
-        assert sweep.trim_sweep.asked_rises == []
-        assert all(capped.reads == [] for capped in sweep.trim_sweep.sweeps.values())
+        assert sweep.rebalance_sweep.asked_moves == []
+        assert all(capped.reads == [] for capped in sweep.rebalance_sweep.sweeps.values())
 
     def test_a_minimum_is_its_own_chunk_or_the_chunk_of_the_run_it_repeats(self):
-        sweep = _kc_sweep_trim_rise()
+        sweep = _kc_sweep_move()
         _, source, base, chunks = _flt_payload(sweep)
         # The page's own grids are what they are without the minimums
-        assert base["grid"] == _KC_GRID
-        assert base["grid_trim"] == [[[3, 2, 2], [6, 5, 0]], [[None, None, None], [4, 4, 4]]]
-        # Everywhere but (0-1, 0.75) every minimum repeats the Trim to Kelly
+        assert base["grid"] == _KC_GRID and base["grid_rebalance"] == _RB_GRID
+        # Everywhere but (0-1, 0.75) every minimum repeats the rebalancing
         # run, and (0.3-0.6, 0.60) was never simulated: null cells
-        assert base["grid_trim_rise"] == [[[None, None, None], self._CELL],
-                                          [[None, None, None], [None, None, None]]]
-        assert base["trim_rise_state"] == "shown"
+        assert base["grid_move"] == [[[None, None, None], self._CELL],
+                                     [[None, None, None], [None, None, None]]]
+        assert base["move_state"] == "shown"
         # One list no other scenario trades: one chunk more
-        assert len(chunks) == 8
-        own = sweep.trim_sweep.rises[(False, False, _KC_B0, 0.75)][1][0.2]
-        assert chunks[7]["list"]["views"]["all"]["n"] == len(own.trades) == 4
+        assert len(chunks) == 9
+        own = sweep.rebalance_sweep.moves[(False, _KC_B0, 0.75)][1][0.2]
+        assert chunks[8]["list"]["views"]["all"]["n"] == len(own.trades) == 4
         # ... priced at its cell's k, on its own trades
-        assert chunks[7]["list"]["kx"] == pytest.approx(
+        assert chunks[8]["list"]["kx"] == pytest.approx(
             dashboard._kelly_points(own.trades, 0.75)[0])
-        # This page has no adding-on or tier-off view, so no such half
-        assert [base[key] for key in _TR_RISE_GRIDS[1:]] == [None] * 3
+        # This page has no tier-off view, so no such half
+        assert base["grid_move_off"] is None
 
     def test_the_payload_names_every_minimum(self):
-        _, _, base = _tr_payload(_kc_sweep_trim_rise())
-        assert base["trim_rises"] == [
+        _, _, base = _rb_payload(_kc_sweep_move())
+        assert base["moves"] == [
             {"label": "5c", "phrase": " only after a 5c price move", "value": 0.05},
             {"label": "10c", "phrase": " only after a 10c price move", "value": 0.10},
             {"label": "25c", "phrase": " only after a 25c price move", "value": 0.25}]
         # The words a run at that minimum is labelled with in the backtest's log
-        assert [entry["phrase"] for entry in base["trim_rises"]] == [
-            backtester._trim_rise_label(rise) for rise in _TR_RISES]
+        assert [entry["phrase"] for entry in base["moves"]] == [
+            backtester._move_label(move) for move in _MV_MOVES]
 
     def test_a_run_the_page_already_has_builds_no_payload(self, monkeypatch):
         # Of the 27 (cell, minimum, cap) entries read, 25 repeat a run and one
@@ -12127,126 +11630,98 @@ class TestTrimRiseView:
             built.append(listed)
             return real(listed, *args, **kwargs)
         monkeypatch.setattr(dashboard, "_list_payload", counting)
-        _, clean, _ = _tr_payload(_kc_sweep_trim())
+        _, clean, _ = _rb_payload(_kc_sweep_rebalance())
         without = len(built)
-        sweep = _kc_sweep_trim_rise()
-        _, chunker, _ = _tr_payload(sweep)
-        assert len(chunker.chunks) == len(clean.chunks) + 1 == 8
+        sweep = _kc_sweep_move()
+        _, chunker, _ = _rb_payload(sweep)
+        assert len(chunker.chunks) == len(clean.chunks) + 1 == 9
         assert len(built) == 2 * without + 1
-        assert built[-1] is sweep.trim_sweep.rises[(False, False, _KC_B0, 0.75)][1][0.2].trades
+        assert built[-1] is sweep.rebalance_sweep.moves[(False, _KC_B0, 0.75)][1][0.2].trades
 
     def test_a_grid_no_minimum_changes_is_still_the_view(self):
-        # No minimum holds any trim back: every cell is null, and that is a
-        # result, not a missing view
-        sweep = _kc_sweep_trim_rise(scripted=False)
-        _, clean, _ = _tr_payload(_kc_sweep_trim())
-        _, chunker, base = _tr_payload(sweep)
-        assert base["trim_rise_state"] == "shown" and len(base["trim_rises"]) == 3
-        assert base["grid_trim_rise"] == [[[None] * 3, [None] * 3], [[None] * 3, [None] * 3]]
+        # No minimum holds any add-on or trim back: every cell is null, and
+        # that is a result, not a missing view
+        sweep = _kc_sweep_move(scripted=False)
+        _, clean, _ = _rb_payload(_kc_sweep_rebalance())
+        _, chunker, base = _rb_payload(sweep)
+        assert base["move_state"] == "shown" and len(base["moves"]) == 3
+        assert base["grid_move"] == [[[None] * 3, [None] * 3], [[None] * 3, [None] * 3]]
         assert len(chunker.chunks) == len(clean.chunks)
-        assert len(sweep.trim_sweep.asked_rises) == 3
+        assert len(sweep.rebalance_sweep.asked_moves) == 3
 
-    def test_the_rise_chunks_come_after_every_trim_chunk(self):
+    def test_the_move_chunks_come_after_every_rebalance_chunk(self):
         # A page with the minimums holds the page without them, chunk for
         # chunk, then its own
-        _, clean_chunker, clean = _tr_payload(_kc_sweep_trim(_kc_sweep_add_on(_kc_sweep_tiers())))
-        _, chunker, base = _tr_payload(
-            _kc_sweep_trim_rise(_kc_sweep_add_on(_kc_sweep_tiers())))
-        kept = ("grid", "grid_off", "grid_add", "grid_add_off",
-                *(trim for trim, _ in _TR_RISE_TWINS))
-        for key in (*kept, "add_state", "trim_state"):
+        _, clean_chunker, clean = _rb_payload(_kc_sweep_rebalance(_kc_sweep_tiers()))
+        _, chunker, base = _rb_payload(_kc_sweep_move(_kc_sweep_tiers()))
+        kept = ("grid", "grid_off", "grid_rebalance", "grid_rebalance_off")
+        for key in (*kept, "rebalance_state"):
             assert base[key] == clean[key], key
         packed = len(clean_chunker.chunks)
         assert base["rows"][:len(clean["rows"])] == clean["rows"]
-        assert _ao_chunks(chunker)[:packed] == _ao_chunks(clean_chunker)
-        # One run of its own in each of the four settings, packed last
-        known = set().union(*(_ao_ids(clean[key]) for key in kept))
-        shown = {cid for _, rise in _TR_RISE_TWINS for band in base[rise] for cells in band
-                 for cell in cells if cell is not None for cid in cell}
-        assert sorted(shown - known) == list(range(packed, packed + 4))
-        assert len(chunker.chunks) == packed + 4
+        assert _rb_chunks(chunker)[:packed] == _rb_chunks(clean_chunker)
+        # One run of its own in each of the two settings, packed last
+        known = set().union(*(_rb_ids(clean[key]) for key in kept))
+        shown = {cid for key in ("grid_move", "grid_move_off") for band in base[key]
+                 for cells in band for cell in cells if cell is not None for cid in cell}
+        assert sorted(shown - known) == list(range(packed, packed + 2))
+        assert len(chunker.chunks) == packed + 2
 
-    def test_the_start_is_each_cap_s_rises_in_its_trim_cell(self):
-        sweep = _kc_sweep_trim_rise()
-        _tr_payload(sweep)
+    def test_the_start_is_each_cap_s_moves_in_its_rebalance_cell(self):
+        sweep = _kc_sweep_move()
+        _rb_payload(sweep)
         nothing = {0.05: (), 0.2: (), 1.0: ()}
-        # Each cell once, in the Trim to Kelly walk's order, over the page's
-        # caps; (0.3-0.6, 0.60) was never simulated, so it has nothing to read
-        assert sweep.trim_sweep.asked_rises == [
-            ((False, False, _KC_B0, 0.6), (0.05, 0.2, 1.0), nothing),
-            ((False, False, _KC_B0, 0.75), (0.05, 0.2, 1.0),
+        # Each cell once, in the Rebalance walk's order, over the page's caps;
+        # (0.3-0.6, 0.60) was never simulated, so it has nothing to read
+        assert sweep.rebalance_sweep.asked_moves == [
+            ((False, _KC_B0, 0.6), (0.05, 0.2, 1.0), nothing),
+            ((False, _KC_B0, 0.75), (0.05, 0.2, 1.0),
              {0.05: (0.12,), 0.2: (0.07, 0.30), 1.0: ()}),
-            ((False, False, _KC_B1, 0.75), (0.05, 0.2, 1.0), nothing)]
+            ((False, _KC_B1, 0.75), (0.05, 0.2, 1.0), {0.05: (0.40,), 0.2: (0.40,),
+                                                       1.0: (0.40,)})]
 
-    def test_each_half_appears_exactly_with_its_trim_twin(self):
-        sweep = _kc_sweep_trim_rise(_kc_sweep_add_on(_kc_sweep_tiers()))
-        _, _, base = _tr_payload(sweep)
-        assert all(base[trim] is not None and base[rise] is not None
-                   for trim, rise in _TR_RISE_TWINS)
-        assert {cell[:2] for cell, _, _ in sweep.trim_sweep.asked_rises} == {
-            (False, False), (False, True), (True, False), (True, True)}
-        for trim, rise in (_TR_RISE_TWINS[0], _TR_RISE_TWINS[2]):
-            # Tier floors on, at the 20% cap: the Trim to Kelly run at 5c, a
-            # run of its own at 10c, which 25c repeats
-            at_20 = base[rise][0][1][1]
-            assert at_20[0] == base[trim][0][1][1] and at_20[1] == at_20[2] != at_20[0]
-            assert base[rise][0][1][2] is None and base[rise][1] == [[None] * 3] * 2
-        for trim, rise in (_TR_RISE_TWINS[1], _TR_RISE_TWINS[3]):
-            # Tier floors off, at the band the tiers bind at: one run every
-            # cap and minimum shares, and not the Trim to Kelly cell's
-            cells = base[rise][0][1]
-            assert len({tuple(cell) for cell in cells}) == 1 and len(set(cells[0])) == 1
-            assert cells[0][0] not in _ao_ids(base[trim])
-            # ... while k 0.60 there repeats its Trim to Kelly run
-            assert base[rise][0][0] == [None] * 3
-            # A band the tiers never bind at reads its tier-on row
-            assert base[rise][1] == base[rise.replace("_off", "")][1]
-        assert (base["grid_trim_rise_off"][0][1][0][0]
-                != base["grid_trim_rise_add_off"][0][1][0][0])
-        # Without the Add to held pairs view: no adding half, none of it read
-        sweep = _kc_sweep_trim_rise(_kc_sweep_tiers())
-        _, _, base = _tr_payload(sweep)
-        assert ([base[rise] is None for _, rise in _TR_RISE_TWINS]
-                == [base[trim] is None for trim, _ in _TR_RISE_TWINS]
-                == [False, False, True, True])
-        assert {cell[0] for cell, _, _ in sweep.trim_sweep.asked_rises} == {False}
+    def test_each_half_appears_exactly_with_its_rebalance_twin(self):
+        sweep = _kc_sweep_move(_kc_sweep_tiers())
+        _, _, base = _rb_payload(sweep)
+        assert base["grid_rebalance_off"] is not None and base["grid_move_off"] is not None
+        assert {cell[0] for cell, _, _ in sweep.rebalance_sweep.asked_moves} == {False, True}
+        # Tier floors on, at the 20% cap: the rebalancing run at 5c, a run of
+        # its own at 10c, which 25c repeats
+        at_20 = base["grid_move"][0][1][1]
+        assert at_20[0] == base["grid_rebalance"][0][1][1] and at_20[1] == at_20[2] != at_20[0]
+        assert base["grid_move"][0][1][2] is None and base["grid_move"][1] == [[None] * 3] * 2
+        # Tier floors off, at the band the tiers bind at: one run every cap
+        # and minimum shares, and not the rebalancing cell's
+        cells = base["grid_move_off"][0][1]
+        assert len({tuple(cell) for cell in cells}) == 1 and len(set(cells[0])) == 1
+        assert cells[0][0] not in _rb_ids(base["grid_rebalance_off"])
+        # ... while k 0.60 there repeats its rebalancing run
+        assert base["grid_move_off"][0][0] == [None] * 3
+        # A band the tiers never bind at reads its tier-on row
+        assert base["grid_move_off"][1] == base["grid_move"][1]
         # Without the tier-floors-off view: no tier-off half, none of it read
-        sweep = _kc_sweep_trim_rise(_kc_sweep_add_on())
-        _, _, base = _tr_payload(sweep)
-        assert ([base[rise] is None for _, rise in _TR_RISE_TWINS]
-                == [base[trim] is None for trim, _ in _TR_RISE_TWINS]
-                == [False, True, False, True])
-        assert {cell[1] for cell, _, _ in sweep.trim_sweep.asked_rises} == {False}
-
-    def test_the_adding_half_with_the_tiers_off_follows_its_trim_grid(self):
-        # No add-on run with the tier floors off at the band the tiers bind
-        # at: no trimming-with-adding run there, so no minimum of one either
-        sweep = dataclasses.replace(
-            _kc_sweep_trim_rise(_kc_sweep_add_on(_kc_sweep_tiers())),
-            add_on_tier_off_cap_sweep=None)
-        _, _, base = _tr_payload(sweep)
-        assert base["grid_trim_add_off"][0] == [[None] * 3, [None] * 3]
-        assert base["grid_trim_rise_add_off"][0] == [[None] * 3, [None] * 3]
-        assert base["grid_trim_rise_add_off"][1] == base["grid_trim_rise_add"][1]
-        assert (True, True) not in {cell[:2] for cell, _, _ in sweep.trim_sweep.asked_rises}
+        sweep = _kc_sweep_move()
+        _, _, base = _rb_payload(sweep)
+        assert base["grid_move_off"] is None and base["grid_move"] is not None
+        assert {cell[0] for cell, _, _ in sweep.rebalance_sweep.asked_moves} == {False}
 
     def test_a_whole_page_carries_the_view(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        assert data["trim_rise_state"] == "shown"
-        assert [entry["label"] for entry in data["trim_rises"]] == ["5c", "10c", "25c"]
-        assert data["grid_trim_rise"][0][1] == self._CELL
-        assert sorted(chunks) == list(range(8)) and data["inline_chunks"] == 8
+        assert data["move_state"] == "shown"
+        assert [entry["label"] for entry in data["moves"]] == ["5c", "10c", "25c"]
+        assert data["grid_move"][0][1] == self._CELL
+        assert sorted(chunks) == list(range(9)) and data["inline_chunks"] == 9
         # A family that carries no minimum says so
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
         data = TestFilterPage._data(page)
-        assert data["trim_rise_state"] == "not simulated" and data["trim_rises"] == []
-        assert [data[key] for key in _TR_RISE_GRIDS] == [None] * 4
+        assert data["move_state"] == "not simulated" and data["moves"] == []
+        assert data["grid_move"] is None and data["grid_move_off"] is None
 
     def test_a_minimum_s_curve_is_cut_to_the_page_s_axis(self, monkeypatch):
         # A run simulated on a later UTC day runs a day past the page's dates
-        sweep = _kc_sweep_trim_rise()
-        steps = sweep.trim_sweep.rises[(False, False, _KC_B0, 0.75)]
+        sweep = _kc_sweep_move()
+        steps = sweep.rebalance_sweep.moves[(False, _KC_B0, 0.75)]
         axis_end = pd.Timestamp(sweep.primary.equity_df["date"].iloc[-1])
         late = backtester._build_equity_curve(
             steps[1][0.2].trades, _FLT_START, 1000.0,
@@ -12254,27 +11729,27 @@ class TestTrimRiseView:
         assert pd.Timestamp(late["date"].iloc[-1]) > axis_end
         steps[1][0.2] = dataclasses.replace(steps[1][0.2], equity_df=late)
         ends: list = []
-        real = dashboard._ChunkVisitor.trim_rise
+        real = dashboard._ChunkVisitor.move
 
-        def spy(self, bi, ki, ci, ri, entry, **kw):
+        def spy(self, bi, ki, ci, mi, entry, **kw):
             if isinstance(entry, SweepPoint):
                 ends.append(pd.Timestamp(entry.equity_df["date"].iloc[-1]))
-            real(self, bi, ki, ci, ri, entry, **kw)
-        monkeypatch.setattr(dashboard._ChunkVisitor, "trim_rise", spy)
-        _, _, base = _tr_payload(sweep)
+            real(self, bi, ki, ci, mi, entry, **kw)
+        monkeypatch.setattr(dashboard._ChunkVisitor, "move", spy)
+        _, _, base = _rb_payload(sweep)
         assert len(ends) == 2 and all(day <= axis_end for day in ends)
-        assert base["grid_trim_rise"][0][1] == self._CELL
+        assert base["grid_move"][0][1] == self._CELL
 
     def test_each_minimum_hands_over_the_primary_cap_first(self, monkeypatch):
         # The cap order of every other kind of cell: the run's own 20%, then the rest
         handed: list = []
-        real = dashboard._ChunkVisitor.trim_rise
+        real = dashboard._ChunkVisitor.move
 
-        def spy(self, bi, ki, ci, ri, entry, **kw):
-            handed.append((bi, ki, ri, ci))
-            real(self, bi, ki, ci, ri, entry, **kw)
-        monkeypatch.setattr(dashboard._ChunkVisitor, "trim_rise", spy)
-        _tr_payload(_kc_sweep_trim_rise())
+        def spy(self, bi, ki, ci, mi, entry, **kw):
+            handed.append((bi, ki, mi, ci))
+            real(self, bi, ki, ci, mi, entry, **kw)
+        monkeypatch.setattr(dashboard._ChunkVisitor, "move", spy)
+        _rb_payload(_kc_sweep_move())
         # (0-1, 0.60) first, one minimum at a time, ascending
         assert handed[:6] == [(0, 0, 0, 1), (0, 0, 0, 0), (0, 0, 0, 2),
                               (0, 0, 1, 1), (0, 0, 1, 0), (0, 0, 1, 2)]
@@ -12284,10 +11759,10 @@ class TestTrimRiseView:
         # One minimum's lists are gone before the next minimum's are made, so a
         # new list can sit where an old one did: a key remembered for a list
         # at one minimum is never read at another, even for the very same list
-        sweep = _kc_sweep_trim_rise()
-        steps = sweep.trim_sweep.rises[(False, False, _KC_B0, 0.75)]
+        sweep = _kc_sweep_move()
+        steps = sweep.rebalance_sweep.moves[(False, _KC_B0, 0.75)]
         own = steps[1][0.2]
-        steps[2][0.2] = dataclasses.replace(own, trim_min_rise=0.25)
+        steps[2][0.2] = dataclasses.replace(own, min_move=0.25)
         keyed: list = []
         real = dashboard._list_key
 
@@ -12295,48 +11770,42 @@ class TestTrimRiseView:
             keyed.append(id(listed))
             return real(k, listed)
         monkeypatch.setattr(dashboard, "_list_key", spy)
-        _, _, base = _tr_payload(sweep)
+        _, _, base = _rb_payload(sweep)
         assert keyed.count(id(own.trades)) == 2
-        assert base["grid_trim_rise"][0][1] == self._CELL
+        assert base["grid_move"][0][1] == self._CELL
 
     def test_the_log_counts_what_the_minimums_cost(self, caplog):
         with caplog.at_level(logging.INFO):
-            _tr_payload(_kc_sweep_trim_rise(_kc_sweep_add_on(_kc_sweep_tiers())))
+            _rb_payload(_kc_sweep_move(_kc_sweep_tiers()))
         lines = [r.getMessage() for r in caplog.records
-                 if "read from the Trim to Kelly minimum price rises" in r.getMessage()]
+                 if "read from the Rebalance minimum price movements" in r.getMessage()]
         # A line per cell (few cells), setting by setting. Tier floors on: four
         # cells, one never simulated; of the 27 entries read, two are runs of
         # their own
         assert lines[3] == (
-            "Dashboard: 4/4 band x k cells read from the Trim to Kelly minimum price rises "
+            "Dashboard: 4/4 band x k cells read from the Rebalance minimum price movements "
             "(2 cap points simulated, 0 shared across caps, 25 the same run as a lower "
             "minimum or none so far)")
         # Tier floors off: the binding band's two cells, 18 entries, three of
         # them the one run every cap shares at 5c
         assert lines[5] == (
-            "Dashboard: 2/2 binding band x k cells read from the Trim to Kelly minimum "
-            "price rises with the tier floors off (3 cap points simulated, 0 shared across "
+            "Dashboard: 2/2 binding band x k cells read from the Rebalance minimum price "
+            "movements with the tier floors off (3 cap points simulated, 0 shared across "
             "caps, 15 the same run as a lower minimum or none so far)")
-        assert lines[9].startswith(
-            "Dashboard: 4/4 band x k cells read from the Trim to Kelly minimum price rises, "
-            "adding to held pairs (")
-        assert lines[11].startswith(
-            "Dashboard: 2/2 binding band x k cells read from the Trim to Kelly minimum "
-            "price rises with the tier floors off, adding to held pairs (")
-        assert len(lines) == 12
+        assert len(lines) == 6
 
-    def test_the_walk_reads_the_minimums_after_every_trim_cell(self):
+    def test_the_walk_reads_the_minimums_after_every_rebalance_cell(self):
         # They are the last cells to pack a chunk, which is what lets their
         # chunks be dropped without cutting into any other family's
-        sweep = _kc_sweep_trim_rise(_kc_sweep_add_on(_kc_sweep_tiers()))
+        sweep = _kc_sweep_move(_kc_sweep_tiers())
         order: list[str] = []
 
         def note(name: str) -> None:
             if not order or order[-1] != name:
                 order.append(name)
-        named = {"cap": sweep.cap_sweep, "add": sweep.add_on_cap_sweep,
-                 "add off": sweep.add_on_tier_off_cap_sweep,
-                 **{f"trim {key}": capped for key, capped in sweep.trim_sweep.sweeps.items()}}
+        named = {"cap": sweep.cap_sweep,
+                 **{f"rebalance {key}": capped
+                    for key, capped in sweep.rebalance_sweep.sweeps.items()}}
         for name, capped in named.items():
             read = capped.cell
 
@@ -12344,145 +11813,142 @@ class TestTrimRiseView:
                 note(name)
                 return read(band, k)
             capped.cell = cell
-        real = sweep.trim_sweep.rise_grid
+        real = sweep.rebalance_sweep.move_grid
 
-        def rise_grid(band, k, **kw):
-            note(f"rise {(kw['add_to_held'], not kw['tier_floors'])}")
+        def move_grid(band, k, **kw):
+            note(f"move {not kw['tier_floors']}")
             return real(band, k, **kw)
-        sweep.trim_sweep.rise_grid = rise_grid
-        _tr_payload(sweep)
-        assert order == ["cap", "add", "add off", "trim (False, False)", "trim (False, True)",
-                         "trim (True, False)", "trim (True, True)", "rise (False, False)",
-                         "rise (False, True)", "rise (True, False)", "rise (True, True)"]
+        sweep.rebalance_sweep.move_grid = move_grid
+        _rb_payload(sweep)
+        assert order == ["cap", "rebalance False", "rebalance True", "move False",
+                         "move True"]
 
     # ─── A family without minimums ────────────────────────────────────────────
 
     @pytest.mark.parametrize("how", ["none", "no such attribute"])
     def test_a_family_without_minimums_has_no_such_view(self, how):
-        sweep = _kc_sweep_trim(_kc_sweep_add_on(_kc_sweep_tiers()))
+        sweep = _kc_sweep_rebalance(_kc_sweep_tiers())
         if how == "no such attribute":
             # A stand-in that knows nothing of them reads as a family with none
-            del sweep.trim_sweep.min_rises
-        walked, _, base = _tr_payload(sweep)
-        assert walked.trim_rises == () and walked.trim_rise_cell is None
-        assert [base[key] for key in _TR_RISE_GRIDS] == [None] * 4
-        assert base["trim_rises"] == [] and base["trim_rise_state"] == "not simulated"
-        assert base["trim_state"] == "shown" and base["grid_trim"] is not None
-        assert sweep.trim_sweep.asked_rises == []
+            del sweep.rebalance_sweep.min_moves
+        walked, _, base = _rb_payload(sweep)
+        assert walked.moves == () and walked.move_cell is None
+        assert base["grid_move"] is None and base["grid_move_off"] is None
+        assert base["moves"] == [] and base["move_state"] == "not simulated"
+        assert base["rebalance_state"] == "shown" and base["grid_rebalance"] is not None
+        assert sweep.rebalance_sweep.asked_moves == []
 
-    def test_without_the_trim_view_the_payload_passes_the_state_on(self):
+    def test_without_the_rebalance_view_the_payload_passes_the_state_on(self):
         for state in ("not simulated", "unavailable"):
-            _, _, base = _tr_payload(_kc_sweep(), rise_state=state)
-            assert base["trim_rise_state"] == state and base["grid_trim_rise"] is None
+            _, _, base = _rb_payload(_kc_sweep(), move_state=state)
+            assert base["move_state"] == state and base["grid_move"] is None
         # With the view, the state handed in is not read
-        _, _, base = _tr_payload(_kc_sweep_trim_rise(), rise_state="unavailable")
-        assert base["trim_rise_state"] == "shown"
+        _, _, base = _rb_payload(_kc_sweep_move(), move_state="unavailable")
+        assert base["move_state"] == "shown"
 
     # ─── Minimums that cannot be read ─────────────────────────────────────────
 
     @pytest.mark.parametrize("cell, step", [
         # The first step of the first cell: nothing was packed yet
-        ((False, False, _KC_B0, 0.6), 0),
+        ((False, _KC_B0, 0.6), 0),
         # Mid-cell, after a run of its own was packed for an earlier minimum
-        ((False, False, _KC_B0, 0.75), 2),
-        # The last setting, after every other setting's minimums were packed
-        ((True, True, _KC_B0, 0.75), 1),
+        ((False, _KC_B0, 0.75), 2),
+        # The last setting, after the other setting's minimums were packed
+        ((True, _KC_B0, 0.75), 1),
     ])
-    def test_a_rise_cell_that_raises_costs_only_this_view(
+    def test_a_move_cell_that_raises_costs_only_this_view(
             self, monkeypatch, tmp_path, caplog, cell, step):
-        clean = _ao_page(monkeypatch, tmp_path,
-                         _kc_sweep_trim(_kc_sweep_add_on(_kc_sweep_tiers())))
-        sweep = _kc_sweep_trim_rise(_kc_sweep_add_on(_kc_sweep_tiers()),
-                                    rise_raise=(cell, step))
+        clean = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance(_kc_sweep_tiers()))
+        sweep = _kc_sweep_move(_kc_sweep_tiers(), move_raise=(cell, step))
         with caplog.at_level(logging.WARNING):
-            page = _ao_page(monkeypatch, tmp_path, sweep)
-        [warned] = _tr_rise_warnings(caplog)
-        assert warned.getMessage() == _TR_RISE_WARNING
+            page = _rb_page(monkeypatch, tmp_path, sweep)
+        [warned] = _mv_warnings(caplog)
+        assert warned.getMessage() == _MV_WARNING
         assert isinstance(warned.exc_info[1], RuntimeError)
         # No other view of the family is said to be lost
-        assert _tr_warnings(caplog) == [_TR_RISE_WARNING]
-        assert TestFilterPage._data(clean)["trim_rise_state"] == "not simulated"
+        assert _rb_warnings(caplog) == [_MV_WARNING]
+        assert TestFilterPage._data(clean)["move_state"] == "not simulated"
         self._only_this_view_is_lost(
             TestFilterPage._data(page), TestFilterPage._chunks(page),
             TestFilterPage._data(clean), TestFilterPage._chunks(clean))
         assert 'id="flt-bar"' in page
         # The walk stopped at the cell that raised
-        assert sweep.trim_sweep.asked_rises[-1][0] == cell
+        assert sweep.rebalance_sweep.asked_moves[-1][0] == cell
 
-    def test_a_trim_point_that_records_no_rises_costs_only_this_view(self, caplog):
+    def test_a_rebalance_point_that_records_no_moves_costs_only_this_view(self, caplog):
         # Its minimums have nothing to start from, which the family refuses
-        sweep = _kc_sweep_trim_rise()
-        points = sweep.trim_sweep.sweeps[(False, False)].points
+        sweep = _kc_sweep_move()
+        points = sweep.rebalance_sweep.sweeps[False].points
         points[(_KC_B1, 0.75, 0.2)] = dataclasses.replace(points[(_KC_B1, 0.75, 0.2)],
-                                                          trim_rises=None)
-        _, clean_chunker, clean = _tr_payload(_kc_sweep_trim())
+                                                          moves=None)
+        _, clean_chunker, clean = _rb_payload(_kc_sweep_rebalance())
         with caplog.at_level(logging.WARNING):
-            walked, chunker, base = _tr_payload(sweep, rise_state="unavailable")
-        [warned] = _tr_rise_warnings(caplog)
-        assert warned.getMessage() == _TR_RISE_WARNING
-        assert "start has no trim rises for size cap(s) [0.2]" in str(warned.exc_info[1])
-        assert walked.trim_cell is not None
-        assert walked.trim_rise_cell is None and walked.trim_rises == ()
-        self._only_this_view_is_lost(base, _ao_chunks(chunker), clean,
-                                     _ao_chunks(clean_chunker))
+            walked, chunker, base = _rb_payload(sweep, move_state="unavailable")
+        [warned] = _mv_warnings(caplog)
+        assert warned.getMessage() == _MV_WARNING
+        assert "start has no moves for size cap(s) [0.2]" in str(warned.exc_info[1])
+        assert walked.rebalance_cell is not None
+        assert walked.move_cell is None and walked.moves == ()
+        self._only_this_view_is_lost(base, _rb_chunks(chunker), clean,
+                                     _rb_chunks(clean_chunker))
 
     def test_a_repeat_of_a_minimum_the_grid_lacks_costs_only_this_view(self, caplog):
         # Never from the real family: a cell that cannot be placed is a cell
         # that cannot be read, not a lost filter bar
-        sweep = _kc_sweep_trim_rise()
-        sweep.trim_sweep.rises[(False, False, _KC_B0, 0.75)][2][0.2] = backtester.SameTrim(0.5)
-        _, clean_chunker, clean = _tr_payload(_kc_sweep_trim())
+        sweep = _kc_sweep_move()
+        sweep.rebalance_sweep.moves[(False, _KC_B0, 0.75)][2][0.2] = backtester.SameMove(0.5)
+        _, clean_chunker, clean = _rb_payload(_kc_sweep_rebalance())
         with caplog.at_level(logging.WARNING):
-            _, chunker, base = _tr_payload(sweep, rise_state="unavailable")
-        [warned] = _tr_rise_warnings(caplog)
+            _, chunker, base = _rb_payload(sweep, move_state="unavailable")
+        [warned] = _mv_warnings(caplog)
         assert isinstance(warned.exc_info[1], ValueError) and not chunker.failed
-        self._only_this_view_is_lost(base, _ao_chunks(chunker), clean,
-                                     _ao_chunks(clean_chunker))
+        self._only_this_view_is_lost(base, _rb_chunks(chunker), clean,
+                                     _rb_chunks(clean_chunker))
 
-    def test_a_trim_cell_that_raises_drops_both_views(self, caplog):
-        sweep = _kc_sweep_trim_rise(raise_on={(False, False): (_KC_B1, 0.75)})
+    def test_a_rebalance_cell_that_raises_drops_both_views(self, caplog):
+        sweep = _kc_sweep_move(raise_on=(_KC_B1, 0.75))
         with caplog.at_level(logging.WARNING):
-            walked, chunker, base = _tr_payload(sweep, "unavailable", "unavailable")
-        # The Trim to Kelly failure is the one thing said
-        [warned] = _tr_warnings(caplog)
-        assert warned.startswith(_TRIM_WARNING) and _tr_rise_warnings(caplog) == []
-        assert walked.trim_cell is None and walked.trim_rise_cell is None
-        assert walked.trim_rises == () and walked.trim_rise_stats == {}
-        assert base["grid_trim"] is None and base["trim_state"] == "unavailable"
-        assert [base[key] for key in _TR_RISE_GRIDS] == [None] * 4
-        assert base["trim_rises"] == [] and base["trim_rise_state"] == "unavailable"
+            walked, chunker, base = _rb_payload(sweep, "unavailable", "unavailable")
+        # The Rebalance failure is the one thing said
+        [warned] = _rb_warnings(caplog)
+        assert warned.startswith(_RB_WARNING) and _mv_warnings(caplog) == []
+        assert walked.rebalance_cell is None and walked.move_cell is None
+        assert walked.moves == () and walked.move_stats == {}
+        assert base["grid_rebalance"] is None and base["rebalance_state"] == "unavailable"
+        assert base["grid_move"] is None and base["grid_move_off"] is None
+        assert base["moves"] == [] and base["move_state"] == "unavailable"
         assert base["grid"] == _KC_GRID and len(chunker.chunks) == 5
-        assert chunker.grids_trim == {} and chunker.grids_trim_rise == {}
-        assert sweep.trim_sweep.asked_rises == []
+        assert chunker.grids_rebalance == {} and chunker.grids_move == {}
+        assert sweep.rebalance_sweep.asked_moves == []
 
     def test_a_lost_cap_axis_costs_the_minimums_too(self):
-        sweep = _kc_sweep_trim_rise(_kc_sweep(raise_on=(_KC_B1, 0.75)))
-        walked, _, base = _tr_payload(sweep, "unavailable", "unavailable")
-        assert walked.cap_sweep is None and walked.trim_cell is None
-        assert walked.trim_rise_cell is None and walked.trim_rises == ()
-        assert base["grid_trim_rise"] is None and base["trim_rise_state"] == "unavailable"
-        assert sweep.trim_sweep.asked_rises == []
+        sweep = _kc_sweep_move(_kc_sweep(raise_on=(_KC_B1, 0.75)))
+        walked, _, base = _rb_payload(sweep, "unavailable", "unavailable")
+        assert walked.cap_sweep is None and walked.rebalance_cell is None
+        assert walked.move_cell is None and walked.moves == ()
+        assert base["grid_move"] is None and base["move_state"] == "unavailable"
+        assert sweep.rebalance_sweep.asked_moves == []
 
     def test_a_failing_tier_off_size_cap_cell_keeps_the_minimums(self, caplog):
         # The walk swaps in the grid's eager tier-off lookup, built before the
         # family was attached: it must still carry the minimums and their reader
-        sweep = _kc_sweep_trim_rise(_kc_sweep_tiers_capped(raise_on=(_KC_B0, 0.6)))
+        sweep = _kc_sweep_move(_kc_sweep_tiers_capped(raise_on=(_KC_B0, 0.6)))
         with caplog.at_level(logging.WARNING):
-            walked, _, base = _tr_payload(sweep)
+            walked, _, base = _rb_payload(sweep)
         assert any(_OFF_WARNING in r.getMessage() for r in caplog.records)
-        assert _tr_warnings(caplog) == []
+        assert _rb_warnings(caplog) == []
         assert walked.off_cap_sweep is None
-        assert walked.trim_rises == _TR_RISES and walked.trim_rise_cell is not None
-        assert set(walked.trim_rise_stats) == {(False, False), (False, True)}
-        assert base["trim_rise_state"] == "shown"
-        assert base["grid_trim_rise"][0][1][1][1] not in _ao_ids(base["grid_trim"])
-        assert base["grid_trim_rise_off"][0][1][0] is not None
+        assert walked.moves == _MV_MOVES and walked.move_cell is not None
+        assert set(walked.move_stats) == {False, True}
+        assert base["move_state"] == "shown"
+        assert base["grid_move"][0][1][1][1] not in _rb_ids(base["grid_rebalance"])
+        assert base["grid_move_off"][0][1][0] is not None
 
-    @pytest.mark.parametrize("lost_at", ["__call__", "trim"])
-    def test_a_chunk_visitor_that_has_failed_simulates_no_rise_cell(self, monkeypatch, lost_at):
+    @pytest.mark.parametrize("lost_at", ["__call__", "rebalance"])
+    def test_a_chunk_visitor_that_has_failed_simulates_no_move_cell(self, monkeypatch, lost_at):
         # The bar is already lost (a chunk could not be built), whether before
-        # the Trim to Kelly cells or among them: no minimum is simulated for it
-        sweep = _kc_sweep_trim_rise()
+        # the Rebalance cells or among them: no minimum is simulated for it
+        sweep = _kc_sweep_move()
         real = getattr(dashboard._ChunkVisitor, lost_at)
 
         def failing(self, *args, **kwargs):
@@ -12493,131 +11959,495 @@ class TestTrimRiseView:
         source = dashboard._grid_source(sweep, trades, curve, 0.75)
         dashboard._build_filter_grid(source, trades, curve, 0.75, _FLT_START, 1000.0,
                                      _FLT_SERIES_TIERS)
-        assert bool(sweep.trim_sweep.sweeps[(False, False)].reads) == (lost_at == "trim")
-        assert sweep.trim_sweep.asked_rises == []
+        assert bool(sweep.rebalance_sweep.sweeps[False].reads) == (lost_at == "rebalance")
+        assert sweep.rebalance_sweep.asked_moves == []
 
     def test_a_chunk_visitor_that_fails_among_the_minimums_stops_the_reading(self, monkeypatch):
         # Lost at the first minimum it packs: the cells after that one are
         # not read for it, where a healthy walk reads every one
         asked = []
         for fails in (False, True):
-            sweep = _kc_sweep_trim_rise()
+            sweep = _kc_sweep_move()
             with monkeypatch.context() as mp:
                 if fails:
-                    real = dashboard._ChunkVisitor.trim_rise
+                    real = dashboard._ChunkVisitor.move
 
                     def failing(self, *args, _real=real, **kwargs):
                         _real(self, *args, **kwargs)
                         self.failed = True
-                    mp.setattr(dashboard._ChunkVisitor, "trim_rise", failing)
+                    mp.setattr(dashboard._ChunkVisitor, "move", failing)
                 trades, curve = sweep.primary.trades, sweep.primary.equity_df
                 source = dashboard._grid_source(sweep, trades, curve, 0.75)
                 dashboard._build_filter_grid(source, trades, curve, 0.75, _FLT_START, 1000.0,
                                              _FLT_SERIES_TIERS)
-            asked.append(len(sweep.trim_sweep.asked_rises))
+            asked.append(len(sweep.rebalance_sweep.asked_moves))
         healthy, failed = asked
         assert healthy > 1 and failed == 1
 
-    def test_each_setting_s_minimums_start_from_its_own_trim_cell(self):
-        # The family decides every "same run" from the rises it is handed and
-        # cannot tell where they came from, so each (adding, tier floors off)
-        # setting must be handed its own Trim to Kelly cell's
-        sweep = _kc_sweep_trim_rise(_kc_sweep_add_on(_kc_sweep_tiers()))
-        _tr_payload(sweep)
-        family = sweep.trim_sweep
+    def test_each_setting_s_minimums_start_from_its_own_rebalance_cell(self):
+        # The family decides every "same run" from the moves it is handed and
+        # cannot tell where they came from, so each Tier floors setting must
+        # be handed its own rebalancing cell's
+        sweep = _kc_sweep_move(_kc_sweep_tiers())
+        _rb_payload(sweep)
+        family = sweep.rebalance_sweep
         settings = set()
-        for (add, off, band, k), caps, start in family.asked_rises:
-            points = family.sweeps[(add, off)].points
-            assert start == {cap: points[(band, k, cap)].trim_rises for cap in caps
-                             if (band, k, cap) in points}, (add, off, band, k)
-            settings.add((add, off))
-        assert settings == {(False, False), (False, True), (True, False), (True, True)}
-        # Not vacuous: the tier-floors-off cell's rises are not the tier-on cell's
-        on, off = ([start for (setting, _caps, start) in family.asked_rises
-                    if setting == (False, tiers_off, _KC_B0, 0.75)][0]
+        for (off, band, k), caps, start in family.asked_moves:
+            points = family.sweeps[off].points
+            assert start == {cap: points[(band, k, cap)].moves for cap in caps
+                             if (band, k, cap) in points}, (off, band, k)
+            settings.add(off)
+        assert settings == {False, True}
+        # Not vacuous: the tier-floors-off cell's moves are not the tier-on cell's
+        on, off = ([start for (setting, _caps, start) in family.asked_moves
+                    if setting == (tiers_off, _KC_B0, 0.75)][0]
                    for tiers_off in (False, True))
         assert on != off
 
     @staticmethod
-    def _non_binding_sweep(*, add_on: bool = False) -> BacktestSweep:
-        """_kc_sweep_trim_rise over the tier-off family, with a minimum that
-        changes the run at the band the tiers never bind at (0.3-0.6, k 0.75,
-        20% cap): its Trim to Kelly run trimmed after 12c, so 25c is a run of
-        its own."""
-        base = _kc_sweep_tiers()
-        sweep = _kc_sweep_trim_rise(_kc_sweep_add_on(base) if add_on else base)
-        family = sweep.trim_sweep
-        for (add, off), capped in family.sweeps.items():
-            if off:
-                continue
-            key = (_KC_B1, 0.75, 0.2)
-            point = capped.points[key]
-            capped.points[key] = dataclasses.replace(point, trim_rises=(0.12,))
-            own = _tr_rise_point(capped.points[key], _tr_resplit(point.trades), 0.25, ())
-            family.rises[(add, False, _KC_B1, 0.75)] = [{}, {}, {0.2: own}]
+    def _non_binding_sweep() -> BacktestSweep:
+        """_kc_sweep_move over the tier-off family, with a minimum that changes
+        the run at the band the tiers never bind at (0.3-0.6, k 0.75, 20%
+        cap): its rebalancing run added to a pair after 12c, so 25c is a run
+        of its own."""
+        sweep = _kc_sweep_move(_kc_sweep_tiers())
+        family = sweep.rebalance_sweep
+        capped = family.sweeps[False]
+        key = (_KC_B1, 0.75, 0.2)
+        point = capped.points[key]
+        capped.points[key] = dataclasses.replace(point, moves=(0.12,))
+        own = _mv_point(capped.points[key], _rb_resplit(point.trades), 0.25, ())
+        family.moves[(False, _KC_B1, 0.75)] = [{}, {}, {0.2: own}]
         return sweep
 
     def test_with_the_tiers_off_a_band_they_never_bind_at_keeps_its_tier_on_minimums(
             self, monkeypatch, tmp_path):
         # Such a band's tier-off view is its tier-on run, at every minimum too
-        page = _ao_page(monkeypatch, tmp_path, self._non_binding_sweep(add_on=True))
+        page = _rb_page(monkeypatch, tmp_path, self._non_binding_sweep())
         data = TestFilterPage._data(page)
         assert data["tier_binds"] == [True, False]
-        for on, off in (("grid_trim_rise", "grid_trim_rise_off"),
-                        ("grid_trim_rise_add", "grid_trim_rise_add_off")):
-            cell = data[on][1][1][1]
-            # Not null: 25c is a chunk of its own there
-            assert cell is not None and cell[2] != cell[0]
-            assert data[off][1] == data[on][1]
+        cell = data["grid_move"][1][1][1]
+        # Not null: 25c is a chunk of its own there
+        assert cell is not None and cell[2] != cell[0]
+        assert data["grid_move_off"][1] == data["grid_move"][1]
 
 
-class TestAddOnScript:
-    """The bar's Add to held pairs select under the page script (run outside a
-    browser): enabled only with the view, "on" loads the add-on scenario's chunk
-    and words it with Python's phrase, a chunk that cannot be loaded puts the
-    choice back, and the save address names the choice only where the page
-    simulated it. The explorer and the interval-discount section never follow
-    it. The harness's "wait" does not wait on flt-add (a page without the view
-    keeps it shut), so these tests ask for it: setup_js adds it to the wait
-    list. Skipped without a JavaScript runtime."""
+class TestRebalanceSelect:
+    """The bar's "Rebalance" select as Python renders it: after Size cap and
+    before Min. price movement and Sell, shut, with its two options, its rule
+    in the hover text and, on a page without the view, the reason beside it."""
 
-    WAIT = "__BAR.push('flt-add');"
+    def test_the_select_follows_the_size_cap_and_is_rendered_shut(self, monkeypatch, tmp_path):
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
+        ids = re.findall(r'<select id="(flt-[a-z]+)"', page)
+        assert ids == ["flt-band", "flt-tier", "flt-k", "flt-cap", "flt-rebalance", "flt-move",
+                       "flt-sell", "flt-days"]
+        # ... and before the Category and Tag menus
+        bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
+        assert (bar.index('id="flt-cap"') < bar.index('id="flt-rebalance"')
+                < bar.index('id="flt-cat"') < bar.index('id="flt-tag"'))
+        assert "<label>Rebalance: <select" in bar
+        # None of the old selects is left
+        for old in ("flt-add", "flt-trim", "flt-rise"):
+            assert f'id="{old}"' not in page
+        select = _page_elements(page)["selects"]["flt-rebalance"]
+        assert select == {"disabled": True, "options": [
+            {"value": "no", "text": "no", "selected": True},
+            {"value": "yes", "text": "yes", "selected": False}]}
+        assert ('<select id="flt-rebalance" disabled autocomplete="off" title="') in bar
+        title = re.search(r'<select id="flt-rebalance"[^>]*title="([^"]*)"', page).group(1)
+        # The hover text, at the wait the page's rebalancing runs use
+        assert backtester.REBALANCE_MIN_DAYS_SINCE_TRADE == 7
+        shipped = dashboard._rebalance_select_title(backtester.REBALANCE_MIN_DAYS_SINCE_TRADE)
+        assert html.unescape(title) == shipped
+        # It says what yes does, what it shuts and why, and what Save saves
+        for words in ("topped up to its Kelly size when it has room, and sold down to it when "
+                      "it has grown past it",
+                      "with a Min. price movement, once its price has moved that far up or down",
+                      "Each added purchase and each part sold counts as a trade of its own",
+                      "While yes, Sell is set to no selling",
+                      "From a page that simulated rebalancing, Save as live defaults saves this "
+                      "choice and the Min. price movement shown; from any other page it keeps "
+                      "the saved ones.",
+                      "With yes, saving from a page that simulated selling turns live selling "
+                      "off."):
+            assert words in shipped
+        assert shipped.startswith("no: a pair is bought once and held as it is. yes: ")
+        # A page with the view has no note beside it
+        assert 'id="flt-rebalance-note"' not in page
+
+    def test_the_words_are_short_and_plain(self):
+        assert dashboard._REBALANCE_OPTION_NO == "no"
+        assert dashboard._REBALANCE_OPTION_YES == "yes"
+        assert dashboard._REBALANCE_NOTES == {"not simulated": _RB_NOT_SIMULATED,
+                                              "unavailable": _RB_UNAVAILABLE}
+        assert dashboard._REBALANCE_PHRASE == ", rebalancing"
+        assert dashboard._SUMMARY_TEMPLATES["rebalance"] == dashboard._REBALANCE_PHRASE
+        assert (dashboard._SUMMARY_TEMPLATES["rebalance_note"]
+                == dashboard._REBALANCE_SUMMARY_NOTE)
+        for old in ("add_on", "add_on_note", "trim", "trim_note"):
+            assert old not in dashboard._SUMMARY_TEMPLATES
+        # The Tier floors note keeps its own words, which a test finds by them
+        assert "not simulated for this run" not in " ".join(dashboard._REBALANCE_NOTES.values())
+
+    def test_the_title_names_the_wait_after_a_trade(self, monkeypatch, tmp_path):
+        title = dashboard._rebalance_select_title
+        rule = ("sold down to it when it has grown past it, once at least {} passed since its "
+                "last trade (its purchase, an add-on or a trim) and, with a Min. price "
+                "movement, once its price has moved that far up or down.{}")
+        # Weekly runs are 7 days apart: a wait of 7 days or fewer holds nothing
+        # back, and the text says so
+        weekly = (" Weekly runs are 7 days apart, so the wait never holds anything back "
+                  "here.")
+        assert rule.format("7 days have", weekly) in title(7)
+        assert rule.format("1 day has", weekly) in title(1)
+        assert rule.format("6 days have", weekly) in title(6)
+        # A longer wait does hold a rebalance back, so nothing of the kind is said
+        for days in (8, 14, 30):
+            assert rule.format(f"{days} days have", "") in title(days)
+            assert "never holds anything back" not in title(days)
+        # With no wait there is nothing to count
+        assert ("sold down to it when it has grown past it, however recently it was last "
+                "traded and, with a Min. price movement,") in title(0)
+        assert "days have passed" not in title(0) and "Weekly runs" not in title(0)
+        # How a live trim counts the wait (a live add-on does not wait): said
+        # only when there is a wait
+        live = ("A live run waits this way before a trim only, counting calendar days on the "
+                "bot's own clock from the last fill of any sort on either market, a trade by "
+                "hand included. While yes,")
+        for days in (1, 7, 14):
+            assert live in title(days)
+        assert "A live run" not in title(0)
+        # Nothing but the wait's sentence differs between two waits
+        assert title(7).replace(rule.format("7 days have", weekly),
+                                rule.format("14 days have", "")) == title(14)
+        # The week is the gap between two of the backtest's checkpoints
+        first, second = backtester._sale_checkpoints(date(2026, 1, 5), date(2026, 1, 12))
+        assert (second - first).days == dashboard._DAYS_BETWEEN_WEEKLY_RUNS == 7
+        # The page names the wait its rebalancing runs read
+        monkeypatch.setattr(backtester, "REBALANCE_MIN_DAYS_SINCE_TRADE", 14)
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
+        shown = re.search(r'<select id="flt-rebalance"[^>]*title="([^"]*)"', page).group(1)
+        assert html.unescape(shown) == title(14)
+
+    @pytest.mark.parametrize("bad", [True, 7.5, 31, -1, "7", None, float("nan"), [7],
+                                     Decimal("NaN"), Decimal("sNaN")])
+    def test_a_bad_wait_never_stops_the_bar_being_drawn(self, bad):
+        # A backtest refuses these before it runs, but the hover text must
+        # still build, and says nothing about the week for a value it cannot
+        # compare with a number of days (a string, None, a decimal NaN)
+        text = dashboard._rebalance_select_title(bad)
+        assert text.startswith("no: a pair is bought once and held as it is.")
+        assert text.endswith("always show it as no.")
+        if not isinstance(bad, (int, float)):
+            assert "never holds anything back" not in text
+        _, _, base = _rb_payload(_kc_sweep())
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(backtester, "REBALANCE_MIN_DAYS_SINCE_TRADE", bad)
+            bar = dashboard._filter_bar_html(base, {"all": {"n": 3}})
+        assert f'title="{html.escape(text)}"' in bar
+
+    @pytest.mark.parametrize("state, note", [
+        ("not simulated", _RB_NOT_SIMULATED),
+        ("unavailable", _RB_UNAVAILABLE),
+        ("something else", _RB_NOT_SIMULATED)])
+    def test_a_shut_select_says_why(self, state, note):
+        _, _, base = _rb_payload(_kc_sweep())
+        bar = dashboard._filter_bar_html({**base, "rebalance_state": state}, {"all": {"n": 3}})
+        assert (f'id="flt-rebalance-note" style="color:#9E9E9E; font-size:13px;">{note}'
+                '</span>') in bar
+        assert 'id="flt-rebalance" disabled' in bar
+        shown = dashboard._filter_bar_html({**base, "rebalance_state": "shown"},
+                                           {"all": {"n": 3}})
+        assert 'id="flt-rebalance-note"' not in shown
+
+    def test_a_page_says_which_of_the_two_reasons_applies(self, monkeypatch, tmp_path):
+        # No family: not simulated. A family the page could not use: see the log
+        bare = _rb_page(monkeypatch, tmp_path, _kc_sweep())
+        assert re.search(
+            r'id="flt-rebalance-note"[^>]*>\(not simulated in this backtest\)</span>', bare)
+        sweep = _kc_sweep_rebalance()
+        sweep.rebalance_sweep.caps = (0.05, 0.2)
+        lost = _rb_page(monkeypatch, tmp_path, sweep)
+        assert re.search(
+            r'id="flt-rebalance-note"[^>]*>\(not available on this page; see the log\)</span>',
+            lost)
+        assert TestFilterPage._data(lost)["rebalance_state"] == "unavailable"
+
+    def test_the_tier_floors_note_keeps_its_own_words(self, monkeypatch, tmp_path):
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
+        assert re.search(r'id="flt-tier-note"[^>]*>\(not simulated for this run\)</span>', page)
+        assert 'id="flt-rebalance-note"' not in page
+
+    def test_the_summary_text_gains_the_rebalance_note(self):
+        _, _, base = _rb_payload(_kc_sweep_rebalance())
+        text = base["text"]
+        plain = dashboard._filter_summary_text(text, "S", False, None, 4, 4)
+        rebalanced = dashboard._filter_summary_text(text, "S", False, None, 4, 4,
+                                                    rebalance=True)
+        note = dashboard._REBALANCE_SUMMARY_NOTE
+        assert note.strip() == ("Each purchase that adds to a held pair, and each part of a "
+                                "pair a trim sells, counts as a trade of its own; in the Kelly "
+                                "chart an added purchase shows only what it added, and a "
+                                "trimmed pair shows as several smaller trades.")
+        assert rebalanced == plain[:-len(text["unfiltered"])] + note + text["unfiltered"]
+
+    def test_the_save_button_names_the_choice(self):
+        assert ("Rebalance choice and Min. price movement (when this page simulated "
+                "rebalancing)") in dashboard._SAVE_TITLE
+        for old in ("Add to held pairs", "Trim to Kelly", "Min. price rise"):
+            assert old not in dashboard._SAVE_TITLE
+
+
+class TestMoveSelect:
+    """The bar's "Min. price movement" select as Python renders it: right after
+    Rebalance and before Sell, on every page, shut, with "any" and one option
+    per minimum the page carries, its rule in the hover text and, on a page
+    that shows Rebalance without the minimums, the reason beside it."""
+
+    @staticmethod
+    def _select(page: str):
+        """The select's attributes and its options' markup on a page (or a bar)."""
+        return re.search(r'<select id="flt-move"([^>]*)>(.*?)</select>', page)
+
+    def test_the_select_follows_rebalance_with_any_and_every_minimum(
+            self, monkeypatch, tmp_path):
+        moves = tuple(config.MIN_PRICE_MOVES)
+        assert len(moves) == 19
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move(min_moves=moves))
+        # Right after Rebalance and before Sell
+        ids = re.findall(r'<(?:select|details) id="(flt-[a-z]+)"', page)
+        at = ids.index("flt-rebalance")
+        assert ids[at:at + 3] == ["flt-rebalance", "flt-move", "flt-sell"]
+        # ... with nothing but the gap between Rebalance's label and its own
+        assert ('</select></label>&nbsp;&nbsp;<label>Min. price movement: <select '
+                'id="flt-move" disabled autocomplete="off" title="') in page
+        select = self._select(page)
+        assert " disabled" in select.group(1) and 'autocomplete="off"' in select.group(1)
+        # "any" first and selected, then every 5c from 5c to 95c
+        cents = [f"{c}c" for c in range(5, 100, 5)]
+        assert [dashboard._move_option(move) for move in moves] == cents
+        assert re.findall(r'<option value="([^"]*)"( selected)?>(.*?)</option>',
+                          select.group(2)) == [
+            ("0", " selected", "any"), *((str(i + 1), "", c) for i, c in enumerate(cents))]
+        # ... every one of which the page-script tests can read
+        assert _page_elements(page)["selects"]["flt-move"] == {"disabled": True, "options": [
+            {"value": "0", "text": "any", "selected": True},
+            *({"value": str(i + 1), "text": c, "selected": False}
+              for i, c in enumerate(cents))]}
+        # Each option is the base block's own entry, in order
+        data = TestFilterPage._data(page)
+        assert [entry["label"] for entry in data["moves"]] == cents
+        assert [entry["value"] for entry in data["moves"]] == list(moves)
+        title = re.search(r'title="([^"]*)"', select.group(1)).group(1)
+        assert html.unescape(title) == dashboard._MOVE_TITLE
+        # The hover text says when it counts, which price, that up and down
+        # count alike, what 10c means, and that add-ons and trims both wait
+        for words in ("Used only while Rebalance is yes",
+                      "topped up or sold down only once its total price has moved at least "
+                      "this many cents, up or down, since its last trade",
+                      "its purchase, an add-on or a trim",
+                      "YES on the earlier market plus NO on the later one",
+                      "10c is 10% of a $1 payout", "any: no minimum"):
+            assert words in dashboard._MOVE_TITLE
+        # ... and ends with what Save saves, and which pairs a live run cannot
+        # measure a move for
+        assert dashboard._MOVE_TITLE.endswith(
+            " From a page that simulated rebalancing, Save as live defaults saves the minimum "
+            "shown (any, or Rebalance no, saves none); from any other page it keeps the saved "
+            "one. A live run reads the price at the pair's last fill on Kalshi, so with a "
+            "minimum set it does not trim a pair whose last fill is older than Kalshi's list "
+            "of the account's fills reaches.")
+        # A page with the view has no note beside either select
+        assert 'id="flt-move-note"' not in page and 'id="flt-rebalance-note"' not in page
+
+    def test_the_words_are_short_and_plain(self):
+        assert dashboard._MOVE_OPTION_ANY == "any"
+        assert dashboard._MOVE_NOTES == {"not simulated": _RB_NOT_SIMULATED,
+                                         "unavailable": _RB_UNAVAILABLE}
+        assert dashboard._move_option(0.1) == "10c"
+        assert dashboard._move_phrase(0.1) == " only after a 10c price move"
+        assert dashboard._move_phrase(0.1) == backtester._move_label(0.1)
+
+    def test_a_page_without_the_minimums_renders_any_alone(self, monkeypatch, tmp_path):
+        # The select is on every page (the script looks for it), with one option
+        for sweep in (_kc_sweep_rebalance(), _kc_sweep()):
+            page = _rb_page(monkeypatch, tmp_path, sweep)
+            select = self._select(page)
+            assert " disabled" in select.group(1)
+            assert select.group(2) == '<option value="0" selected>any</option>'
+            assert TestFilterPage._data(page)["moves"] == []
+
+    @pytest.mark.parametrize("rebalance_state, move_state, note", [
+        # Rebalance is shown and the minimums are not: this select says why
+        ("shown", "not simulated", _RB_NOT_SIMULATED),
+        ("shown", "unavailable", _RB_UNAVAILABLE),
+        ("shown", "something else", _RB_NOT_SIMULATED),
+        # Both shown: nothing to explain
+        ("shown", "shown", None),
+        # Rebalance is not shown: its own note covers both selects
+        ("not simulated", "not simulated", None),
+        ("unavailable", "unavailable", None),
+        ("not simulated", "unavailable", None),
+        ("something else", "not simulated", None)])
+    def test_the_note_is_said_only_beside_a_shown_rebalance(self, rebalance_state, move_state,
+                                                           note):
+        _, _, base = _rb_payload(_kc_sweep())
+        bar = dashboard._filter_bar_html(
+            {**base, "rebalance_state": rebalance_state, "move_state": move_state},
+            {"all": {"n": 3}})
+        assert 'id="flt-move" disabled' in bar
+        if note is None:
+            assert 'id="flt-move-note"' not in bar
+        else:
+            # Right after the select, in the Rebalance note's own style
+            assert ('</select></label>&nbsp;<span id="flt-move-note" style="color:#9E9E9E; '
+                    f'font-size:13px;">{note}</span>&nbsp;&nbsp;<label>Sell: ') in bar
+        assert ('id="flt-rebalance-note"' in bar) is (rebalance_state != "shown")
+
+    def test_a_payload_without_the_state_reads_as_not_simulated(self):
+        _, _, base = _rb_payload(_kc_sweep_rebalance())
+        del base["move_state"], base["moves"]
+        bar = dashboard._filter_bar_html(base, {"all": {"n": 3}})
+        assert ('id="flt-move-note" style="color:#9E9E9E; font-size:13px;">'
+                f"{_RB_NOT_SIMULATED}</span>") in bar
+        assert self._select(bar).group(2) == '<option value="0" selected>any</option>'
+
+    def test_a_page_says_which_of_the_two_reasons_applies(self, monkeypatch, tmp_path):
+        def note(page: str) -> str | None:
+            found = re.search(r'<span id="flt-move-note"[^>]*>([^<]*)</span>', page)
+            return found.group(1) if found else None
+
+        # A family without minimums: not simulated
+        assert note(_rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())) == _RB_NOT_SIMULATED
+        # A family whose minimums could not be read: see the log, and Rebalance
+        # itself is still shown
+        lost = _rb_page(monkeypatch, tmp_path, _kc_sweep_move(
+            move_raise=((False, _KC_B0, 0.6), 0)))
+        assert note(lost) == _RB_UNAVAILABLE and 'id="flt-rebalance-note"' not in lost
+        assert TestFilterPage._data(lost)["move_state"] == "unavailable"
+        # No family at all, or one the page could not use: Rebalance's own
+        # note says why, and this select has none
+        bare = _rb_page(monkeypatch, tmp_path, _kc_sweep())
+        assert note(bare) is None and 'id="flt-rebalance-note"' in bare
+        unfit = _kc_sweep_move()
+        unfit.rebalance_sweep.caps = (0.05, 0.2)
+        page = _rb_page(monkeypatch, tmp_path, unfit)
+        assert note(page) is None
+        assert re.search(
+            r'id="flt-rebalance-note"[^>]*>\(not available on this page; see the log\)</span>',
+            page)
+
+    def test_the_hover_texts_say_what_save_sends_on_every_page(self, monkeypatch, tmp_path):
+        # Each select has one hover text on every page, so what it says about
+        # Save must hold on pages with and without the Rebalance view (what
+        # Save sends: TestMoveScript.test_a_save_sends_the_minimum_shown,
+        # TestSaveLiveDefaultsButton.test_a_page_without_the_rebalance_view_sends_none_of_its_fields)
+        rebalance_save = ("From a page that simulated rebalancing, Save as live defaults saves "
+                          "this choice and the Min. price movement shown; from any other page "
+                          "it keeps the saved ones.")
+        move_save = ("From a page that simulated rebalancing, Save as live defaults saves the "
+                     "minimum shown (any, or Rebalance no, saves none); from any other page it "
+                     "keeps the saved one.")
+        for sweep, has_view in ((_kc_sweep(), False), (_kc_sweep_rebalance(), True),
+                                (_kc_sweep_move(), True)):
+            page = _rb_page(monkeypatch, tmp_path, sweep)
+            assert (TestFilterPage._data(page)["grid_rebalance"] is not None) is has_view
+            for select_id, said in (("flt-rebalance", rebalance_save), ("flt-move", move_save)):
+                title = html.unescape(re.search(
+                    rf'<select id="{select_id}"[^>]*title="([^"]*)"', page).group(1))
+                # Its one sentence on the save button names the pages it holds on
+                assert title.count("Save as live defaults") == 1, select_id
+                assert said in title, select_id
+
+    def test_the_reach_sentence_names_both_selects_only_with_the_minimums(
+            self, monkeypatch, tmp_path):
+        # Without an explorer grid (the payload built here has none) ...
+        _, _, base = _rb_payload(_kc_sweep_move())
+        closing = base["text"]["unfiltered"]
+        assert closing.endswith(" " + dashboard._MOVE_REACH_NO_EXPLORER)
+        assert dashboard._REBALANCE_REACH_NO_EXPLORER not in closing
+        assert dashboard._MOVE_REACH not in closing
+        # ... and with one (a band sweep's populations, so the page carries its grid)
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move(_ex_sweep()))
+        closing = TestFilterPage._data(page)["text"]["unfiltered"]
+        assert closing.endswith(" " + dashboard._MOVE_REACH)
+        assert dashboard._REBALANCE_REACH not in closing
+        assert html.escape(dashboard._MOVE_REACH) in page
+        # A page that shows Rebalance without the minimums names it alone
+        for sweep in (_kc_sweep_rebalance(),
+                      _kc_sweep_move(move_raise=((False, _KC_B0, 0.6), 0))):
+            _, _, base = _rb_payload(sweep, move_state="unavailable")
+            closing = base["text"]["unfiltered"]
+            assert closing.endswith(" " + dashboard._REBALANCE_REACH_NO_EXPLORER)
+            assert "Min. price movement" not in closing
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance(_ex_sweep()))
+        closing = TestFilterPage._data(page)["text"]["unfiltered"]
+        assert closing.endswith(" " + dashboard._REBALANCE_REACH)
+        assert "Min. price movement" not in closing
+        # A page with neither names neither
+        _, _, clean = _rb_payload(_kc_sweep())
+        assert "Rebalance" not in clean["text"]["unfiltered"]
+        # Both sentences say what the pair of selects leaves alone
+        for words in (dashboard._MOVE_REACH, dashboard._MOVE_REACH_NO_EXPLORER):
+            assert words.startswith("Rebalance and Min. price movement change the trade "
+                                    "sections only; the k̂ figures do not depend on them")
+            assert words.endswith("always show no rebalancing.") or words.endswith(
+                "always shows no rebalancing.")
+        assert "Scenario Explorer" in dashboard._MOVE_REACH
+        assert "Scenario Explorer" not in dashboard._MOVE_REACH_NO_EXPLORER
+
+
+class TestRebalanceScript:
+    """The bar's Rebalance select under the page script (run outside a
+    browser): enabled only with the view, "yes" loads and words the
+    rebalancing scenario, a chunk that cannot be loaded puts the choice back,
+    Sell is shut while it is yes, and Save sends the choice (as both of the
+    defaults server's adding and trimming settings) and the minimum price
+    movement, which the server reads back. The explorer never follows it.
+    setup_js adds flt-rebalance to the harness's "wait" (a page without the
+    view keeps it shut). Skipped without a JavaScript runtime."""
+
+    WAIT = "__BAR.push('flt-rebalance');"
+    ON = [["set", "flt-rebalance", "yes"], ["fire", "flt-rebalance"], ["settle"]]
+    OFF = [["set", "flt-rebalance", "no"], ["fire", "flt-rebalance"], ["settle"]]
 
     @classmethod
     def _run(cls, tmp_path, page, steps, **kwargs) -> dict:
-        """_run_script over a page, waiting on the add-on select too."""
+        """_run_script over a page, waiting on the Rebalance select too."""
         return _run_script(tmp_path, page, steps, setup_js=cls.WAIT + kwargs.pop("js", ""),
                            **kwargs)
 
     def test_the_select_is_enabled_only_with_the_view(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
         snaps = self._run(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
                           strict=True)
-        assert snaps["loaded"]["selects"]["flt-add"]["disabled"] is True
-        ready = snaps["ready"]["selects"]["flt-add"]
-        assert ready["disabled"] is False and ready["value"] == "off"
-        assert ready["options"] == [["off", "off"], ["on", "on (up to the size cap)"]]
+        assert snaps["loaded"]["selects"]["flt-rebalance"]["disabled"] is True
+        ready = snaps["ready"]["selects"]["flt-rebalance"]
+        assert ready["disabled"] is False and ready["value"] == "no"
+        assert ready["options"] == [["no", "no"], ["yes", "yes"]]
         # A page without the view keeps it shut, whatever else is chosen —
         # and reaches no element the page lacks
-        bare = _ao_page(monkeypatch, tmp_path, _kc_sweep())
+        bare = _rb_page(monkeypatch, tmp_path, _kc_sweep())
         snap = _run_script(tmp_path, bare, [
-            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
-            ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], ["snap", "s"]],
-            strict=True)["s"]
-        assert snap["selects"]["flt-add"]["disabled"] is True
+            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], *self.ON,
+            ["snap", "s"]], strict=True)["s"]
+        assert snap["selects"]["flt-rebalance"]["disabled"] is True
         # The change event on the shut select drew nothing more than the k's did
         assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-chunk-2"]
+        assert "rebalancing" not in snap["text"]["flt-summary"]
 
-    def test_on_loads_the_add_on_chunk_and_words_the_scenario(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
+    def test_yes_loads_the_rebalance_chunk_and_words_the_scenario(self, monkeypatch, tmp_path):
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        cid = data["grid_add"][0][1][1]
-        scenario = _phrase(data, 0, 1, 1) + data["text"]["add_on"]
-        assert scenario.endswith("20% cap per trade, adding to held pairs")
-        steps = [["wait"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["snap", "loading"],
-                 ["settle"], ["snap", "on"], ["set", "flt-add", "off"], ["fire", "flt-add"],
-                 ["settle"], ["snap", "off"]]
-        snaps = self._run(tmp_path, page, steps, strict=True)
+        cid = data["grid_rebalance"][0][1][1]
+        assert cid not in _rb_ids(data["grid"])
+        scenario = _phrase(data, 0, 1, 1) + data["text"]["rebalance"]
+        assert scenario.endswith("20% cap per trade, rebalancing")
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-rebalance", "yes"], ["fire", "flt-rebalance"],
+            ["snap", "loading"], ["settle"], ["snap", "on"], *self.OFF, ["snap", "off"]],
+            strict=True)
         # While its chunk inflates, the line says so, in Python's words
         assert snaps["loading"]["text"]["flt-summary"] == data["text"]["loading"].format(
             scenario=scenario)
@@ -12625,212 +12455,227 @@ class TestAddOnScript:
         assert snap["inflated"] == ["dash-data", "dash-chunk-0", f"dash-chunk-{cid}"]
         assert {r["id"] for r in snap["reacts"]} == _charts_redrawn()
         view = chunks[cid]["list"]["views"]["all"]
-        # The primary cell with adding on is its own simulation, not a slice
+        # The primary cell with Rebalance yes is its own simulation, and the
+        # line says what an added purchase and a part sold count as, in
+        # Python's words, just before the closing reach sentence
         assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], scenario, False, None, view["n"], view["n"], note="other_run",
-            add_on=True)
-        # ... which, while adding is on, says what an added purchase counts as,
-        # in Python's words, just before the closing reach sentence
-        note = dashboard._ADD_ON_SUMMARY_NOTE
-        assert note.strip() == ("Each purchase that adds to a held pair counts as a trade of "
-                                "its own; in the Kelly chart it shows only what it added.")
-        assert data["text"]["add_on_note"] == note
-        assert snap["text"]["flt-summary"].endswith(note + data["text"]["unfiltered"])
+            rebalance=True)
+        assert data["text"]["rebalance_note"] == dashboard._REBALANCE_SUMMARY_NOTE
+        assert snap["text"]["flt-summary"].endswith(
+            dashboard._REBALANCE_SUMMARY_NOTE + data["text"]["unfiltered"])
         assert snap["text"]["hdr-trades"] == str(view["n"]) == "4"
-        # The add-on list's own Kelly scatter, never the page's
+        # The rebalancing list's own Kelly scatter, never the page's
         assert _last_react(snap, "risk-kelly")["data"][0]["x"] == pytest.approx(
             chunks[cid]["list"]["kx"])
-        assert snap["selects"]["flt-add"]["value"] == "on"
-        # A slice of it is worded with the phrase too, its counts the add-on's own
-        sports = _key(data, "Sports")
-        snap = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"],
-            _tick_category(sports[1:]), ["settle"],
-            ["snap", "sports"]], strict=True)["sports"]
-        views = chunks[cid]["list"]["views"]
-        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], scenario, False, "Sports", views[sports]["n"], views["all"]["n"],
-            add_on=True)
-        # Off again is the page as rendered: the primary's chunk, kept, loads nothing
+        assert snap["selects"]["flt-rebalance"]["value"] == "yes"
+        # No again is the page as rendered: the primary's chunk, kept, loads nothing
         off = snaps["off"]
-        assert off["inflated"] == snaps["on"]["inflated"]
+        assert off["inflated"] == snap["inflated"]
         assert off["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], _phrase(data, 0, 1, 1), True, None, 3, 3)
-        assert note not in off["text"]["flt-summary"]
+        assert dashboard._REBALANCE_SUMMARY_NOTE not in off["text"]["flt-summary"]
         assert off["text"]["hdr-trades"] == "3"
 
-    def test_a_restored_on_is_set_back_to_off_and_loads_no_add_on_chunk(
+    def test_ticked_categories_and_tags_are_read_from_the_rebalance_scenario(
             self, monkeypatch, tmp_path):
-        # A browser restored a reader's last choice, "on": the bar goes back to
-        # the page as rendered, and no chunk of the add-on view is inflated
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
-        snaps = self._run(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
-                          pre=(("flt-add", "on"),), strict=True)
-        assert snaps["loaded"]["selects"]["flt-add"]["value"] == "off"
-        ready = snaps["ready"]
-        assert ready["selects"]["flt-add"] == {**ready["selects"]["flt-add"], "value": "off",
-                                               "disabled": False}
-        assert ready["inflated"] == ["dash-data", "dash-chunk-0"]
-        assert ready["reacts"] == []
-
-    def test_tier_floors_off_with_adding_on_reads_the_add_on_off_grid(
-            self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on(_kc_sweep_tiers()))
+        # One ticked category is a view of the rebalancing run's own chunk; the
+        # line words it with the Rebalance phrase and note, and its counts are
+        # that run's
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        binding, plain = data["grid_add_off"][0][1][1], data["grid_add_off"][1][1][1]
-        assert binding not in _ao_ids(data["grid_add"]) and plain in _ao_ids(data["grid_add"])
+        cid = data["grid_rebalance"][0][1][1]
+        views = chunks[cid]["list"]["views"]
+        scenario = _phrase(data, 0, 1, 1) + data["text"]["rebalance"]
+        sports = _key(data, "Sports")
         snaps = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
-            ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], ["snap", "binding"],
-            # A band the tiers never bind at: its off view is its add-on tier-on run
+            ["wait"], *self.ON, _tick_category(sports[1:]), ["settle"], ["snap", "sports"],
+            *self.OFF, ["snap", "off"]], strict=True)
+        snap = snaps["sports"]
+        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], scenario, False, "Sports", views[sports]["n"], views["all"]["n"],
+            rebalance=True)
+        assert snap["text"]["hdr-trades"] == str(views[sports]["n"])
+        # Rebalance no keeps the tick, on the page's own run
+        off = snaps["off"]
+        assert off["selects"]["flt-cat"]["value"] == sports[1:]
+        assert data["text"]["rebalance"] not in off["text"]["flt-summary"]
+        assert "Sports" in off["text"]["flt-summary"]
+
+    def test_a_scenario_that_changed_nothing_shows_the_scenario_s_own_chunk(
+            self, monkeypatch, tmp_path):
+        # With no cap nothing is topped up or sold down: the rebalancing run
+        # traded the list of the run without it, so no other chunk is loaded —
+        # and the line still names the choice
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
+        data = TestFilterPage._data(page)
+        assert data["grid_rebalance"][0][1][2] == data["grid"][0][1][2]
+        snap = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"],
+            ["snap", "plain"], *self.ON, ["snap", "on"]], strict=True)
+        assert snap["on"]["inflated"] == snap["plain"]["inflated"]
+        assert snap["on"]["text"]["hdr-trades"] == snap["plain"]["text"]["hdr-trades"]
+        assert data["text"]["rebalance"] in snap["on"]["text"]["flt-summary"]
+
+    def test_a_restored_yes_is_set_back_to_no_and_loads_no_rebalance_chunk(
+            self, monkeypatch, tmp_path):
+        # A browser restored a reader's last choice, "yes": the bar goes back to
+        # the page as rendered, and no chunk of the Rebalance view is inflated
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
+        snaps = self._run(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
+                          pre=(("flt-rebalance", "yes"),), strict=True)
+        assert snaps["loaded"]["selects"]["flt-rebalance"]["value"] == "no"
+        ready = snaps["ready"]
+        assert ready["selects"]["flt-rebalance"]["value"] == "no"
+        assert ready["selects"]["flt-rebalance"]["disabled"] is False
+        assert ready["inflated"] == ["dash-data", "dash-chunk-0"] and ready["reacts"] == []
+
+    def test_tier_floors_off_reads_the_rebalance_off_grid(self, monkeypatch, tmp_path):
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance(_kc_sweep_tiers()))
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        binding = data["grid_rebalance_off"][0][1][1]
+        plain = data["grid_rebalance_off"][1][1][1]
+        assert binding not in _rb_ids(data["grid_rebalance"])
+        assert plain in _rb_ids(data["grid_rebalance"])
+        snaps = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], *self.ON,
+            ["snap", "binding"],
+            # A band the tiers never bind at: its off view is its tier-on run
             ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "plain"]],
             strict=True)
-        add = data["text"]["add_on"]
+        phrase = data["text"]["rebalance"]
         view = chunks[binding]["list"]["views"]["all"]["n"]
         assert f"dash-chunk-{binding}" in snaps["binding"]["inflated"]
         assert snaps["binding"]["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], _phrase_off(data, 0, 1, 1) + add, False, None, view, view,
-            note="other_run", add_on=True)
+            data["text"], _phrase_off(data, 0, 1, 1) + phrase, False, None, view, view,
+            note="other_run", rebalance=True)
         view = chunks[plain]["list"]["views"]["all"]["n"]
         assert snaps["plain"]["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], _phrase_off(data, 1, 1, 1) + add, False, None, view, view,
-            add_on=True)
+            data["text"], _phrase_off(data, 1, 1, 1) + phrase, False, None, view, view,
+            rebalance=True)
         assert f"dash-chunk-{plain}" in snaps["plain"]["inflated"]
 
     def test_a_scenario_the_family_never_simulated_reads_missing_and_cannot_be_saved(
             self, monkeypatch, tmp_path):
-        # A tier-floors-off view with no add-on twin: adding "on" at a band the
-        # tiers bind at is a scenario the run never simulated
-        sweep = dataclasses.replace(_kc_sweep_add_on(_kc_sweep_tiers()),
-                                    add_on_tier_off_cap_sweep=None)
+        # The family holds no run with the tier floors off: rebalancing at a
+        # band the tiers bind at, with them off, was never simulated
+        sweep = _kc_sweep_rebalance(_kc_sweep_tiers())
+        sweep.rebalance_sweep.off_bands = ()
         page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, sweep)
         data = TestFilterPage._data(page)
-        snaps = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
-            ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], ["snap", "missing"]],
-            strict=True)
-        snap = snaps["missing"]
-        scenario = _phrase_off(data, 0, 1, 1) + data["text"]["add_on"]
-        # Nothing is shown, so nothing is said about what an added purchase counts as
+        snap = self._run(tmp_path, page, [
+            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], *self.ON,
+            ["snap", "missing"]], strict=True)["missing"]
+        scenario = _phrase_off(data, 0, 1, 1) + data["text"]["rebalance"]
+        # Nothing is shown, so nothing is said about what an added purchase or
+        # a part sold counts as
         assert snap["text"]["flt-summary"] == data["text"]["missing"].format(
             scenario=scenario) + data["text"]["unfiltered"]
         assert snap["buttons"]["flt-save"] is True and snap["text"]["hdr-trades"] == "0"
 
     def test_a_chunk_that_cannot_be_loaded_puts_the_choice_back(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
+        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, _kc_sweep_rebalance())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        cid = data["grid_add"][0][1][1]
-        add = data["text"]["add_on"]
+        cid = data["grid_rebalance"][0][1][1]
         snaps = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], ["snap", "bad"],
-            ["repair", f"dash-chunk-{cid}"],
-            ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], ["snap", "good"]],
+            ["wait"], *self.ON, ["snap", "bad"], ["click", "flt-save"], ["snap", "bad click"],
+            ["repair", f"dash-chunk-{cid}"], *self.ON, ["snap", "good"]],
             strict=True, damaged=(f"dash-chunk-{cid}",))
         bad = snaps["bad"]
-        assert bad["selects"]["flt-add"]["value"] == "off" and bad["reacts"] == []
-        # The line names the scenario that failed, in the phrase adding uses,
-        # and the one still shown
+        assert bad["selects"]["flt-rebalance"]["value"] == "no" and bad["reacts"] == []
+        # The line names the scenario that failed, in the phrase rebalancing
+        # uses, and the one still shown
         assert bad["text"]["flt-summary"] == data["text"]["unavailable"].format(
-            failed=_phrase(data, 0, 1, 1) + add, reason=f"Error: damaged block dash-chunk-{cid}",
-            scenario=_phrase(data, 0, 1, 1))
-        # The scenario still shown can be saved again
+            failed=_phrase(data, 0, 1, 1) + data["text"]["rebalance"],
+            reason=f"Error: damaged block dash-chunk-{cid}", scenario=_phrase(data, 0, 1, 1))
+        # Save sends the scenario still shown (no rebalancing), not the one
+        # that failed to load
         assert bad["buttons"]["flt-save"] is False
+        save = TestSaveLiveDefaultsButton()
+        [opened] = snaps["bad click"]["opened"]
+        query = save._query(data, opened)
+        save._assert_sends(data, query, 0, 1, 1)
+        assert [query[key] for key in ("add_to_held_pairs", "trim_to_kelly",
+                                       "trim_min_rise")] == ["off", "off", "off"]
         # Repaired, choosing it again draws it
         good = snaps["good"]
-        assert good["selects"]["flt-add"]["value"] == "on"
-        assert good["text"]["hdr-trades"] == str(
-            chunks[cid]["list"]["views"]["all"]["n"])
+        assert good["selects"]["flt-rebalance"]["value"] == "yes"
+        assert good["text"]["hdr-trades"] == str(chunks[cid]["list"]["views"]["all"]["n"])
 
-    def test_a_page_without_the_sell_view_keeps_sell_shut_either_way(
-            self, monkeypatch, tmp_path):
-        # Turning adding on and off reruns the Sell rule, which must leave Sell
-        # and Min. days shut on a page that has no Sell view
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
-        snaps = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"],
-            ["snap", "on"], ["set", "flt-add", "off"], ["fire", "flt-add"], ["settle"],
-            ["snap", "off"]], strict=True)
-        for name in ("on", "off"):
-            assert snaps[name]["selects"]["flt-add"]["value"] == name
-            assert snaps[name]["selects"]["flt-sell"]["disabled"] is True
-            assert snaps[name]["selects"]["flt-days"]["disabled"] is True
+    # ─── Save and Sell while rebalancing ──────────────────────────────────────
 
-    def test_the_bar_s_call_to_the_explorer_keeps_its_four_arguments(
-            self, monkeypatch, tmp_path):
-        # The explorer never follows the choice: the label call carries the band,
-        # k, size cap and Tier floors choice, whatever adding says
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on())
-        data = TestFilterPage._data(page)
-        spy = ("window.dashScenarioSelect = function() { var el = document.getElementById("
-               "'__spy'); var seen = el.textContent ? JSON.parse(el.textContent) : []; "
-               "seen.push(Array.prototype.slice.call(arguments)); "
-               "el.textContent = JSON.stringify(seen); };")
-        snaps = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"],
-            ["set", "flt-add", "off"], ["fire", "flt-add"], ["settle"], ["snap", "s"]], js=spy)
-        calls = json.loads(snaps["s"]["text"]["__spy"])
-        labels = [data["bands"][0]["label"], data["ks"][1]["label"], data["caps"][1]["label"],
-                  "on"]
-        assert calls == [labels, labels]
-        js = dashboard._FILTER_JS
-        [call] = re.findall(r"window\.dashScenarioSelect\(([^;]*)\);", js)
-        assert len(re.split(r",\s*(?![^\[]*\])", call)) == 4 and "SHOWN[6]" not in call
-
-    def test_the_explorer_s_selects_never_move_on_an_add_on_change(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_add_on(_ex_sweep_tiers()))
-        snaps = self._run(tmp_path, page, [
-            ["wait"], ["snap", "before"], ["set", "flt-add", "on"], ["fire", "flt-add"],
-            ["settle"], ["snap", "on"], ["set", "flt-add", "off"], ["fire", "flt-add"],
-            ["settle"], ["snap", "off"]], strict=True, explorer=True)
-        before, on, off = snaps["before"], snaps["on"], snaps["off"]
-        assert _scn_values(on) == _scn_values(off) == _scn_values(before)
-        for snap in (on, off):
-            assert snap["selects"]["scn-tier-select"]["value"] == "on"
-            # ... and nothing of the explorer was redrawn
-            assert _explorer_calls(snap) == []
-        assert on["selects"]["flt-add"]["value"] == "on"
-
-    # ─── The save address ─────────────────────────────────────────────────────
-
-    def test_the_address_names_the_choice_only_from_a_page_that_simulated_it(
-            self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("sell_view", [False, True], ids=["no-sell-view", "sell-view"])
+    def test_a_save_sends_the_rebalance_choice(self, monkeypatch, tmp_path, sell_view):
+        # Save sends the Rebalance choice as both of the defaults server's
+        # settings it covers (adding to held pairs and trimming to Kelly) and
+        # the minimum price movement ("off": this page has no minimums), and
+        # the server reads it back. Over saved defaults that sell, a page with
+        # the Sell view also sends no selling (Sell is shut while rebalancing);
+        # one without keeps the saved level
+        config.save_live_defaults(
+            dataclasses.replace(config.live_settings(), sell_at=0.9, sell_min_days=5),
+            source="")
+        current = config.read_saved_live_defaults()
         save = TestSaveLiveDefaultsButton()
-        page = save._kc(monkeypatch, tmp_path, _kc_sweep_add_on())
+        page = save._kc(monkeypatch, tmp_path,
+                        _kc_sweep_rebalance(_kc_sweep_sell() if sell_view else None))
         data = TestFilterPage._data(page)
+        assert (data["sell_blocks"] is not None) is sell_view
+        assert data["grid_rebalance"] is not None and data["moves"] == []
         snaps = self._run(tmp_path, page, [
-            ["wait"], ["click", "flt-save"], ["snap", "off"], ["set", "flt-add", "on"],
-            ["fire", "flt-add"], ["settle"], ["click", "flt-save"], ["snap", "on"]],
+            ["wait"], ["snap", "before"], *self.ON, ["click", "flt-save"], ["snap", "on"],
+            # ... also where rebalancing changed nothing (no cap: the same chunk)
+            ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"], ["click", "flt-save"],
+            ["snap", "same"], *self.OFF, ["click", "flt-save"], ["snap", "off"]],
+            js="__BAR.push('flt-sell');" if sell_view else "", files_root=tmp_path,
             strict=True)
-        for name, chosen in (("off", "off"), ("on", "on")):
-            [opened] = snaps[name]["opened"]
+        assert snaps["before"]["buttons"]["flt-save"] is False
+        app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
+        sold = {"sell_at": "off", "sell_min_days": "off"} if sell_view else {}
+        for name, ci, yes in (("on", 1, True), ("same", 2, True), ("off", 2, False)):
+            snap = snaps[name]
+            assert snap["buttons"]["flt-save"] is False, name
+            [opened] = snap["opened"]
             query = save._query(data, opened)
-            save._assert_sends(data, query, 0, 1, 1)
-            assert query["add_to_held_pairs"] == chosen
-        # A page without the view sends none: the server keeps the saved value
-        bare = save._kc(monkeypatch, tmp_path)
-        bare_data = TestFilterPage._data(bare)
-        [opened] = _run_script(tmp_path, bare, [["wait"], ["click", "flt-save"], ["snap", "s"]],
-                               strict=True)["s"]["opened"]
-        query = save._query(bare_data, opened)
-        save._assert_sends(bare_data, query, *bare_data["primary"])
-        assert "add_to_held_pairs" not in query
+            save._assert_sends(data, query, 0, 1, ci)
+            assert query["add_to_held_pairs"] == query["trim_to_kelly"] == (
+                "on" if yes else "off"), name
+            assert query["trim_min_rise"] == "off", name
+            assert {key: query[key] for key in ("sell_at", "sell_min_days")
+                    if key in query} == sold, name
+            raw = opened["url"].partition("?")[2]
+            response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
+                                                           _SAVE_HOST))
+            assert response.status == 200, response.body
+            settings, source = defaults_server._proposal(defaults_server._params(raw), current)
+            expected = config.LiveSettings(
+                tier_floors=True, spread_band=tuple(data["bands"][0]["value"]),
+                interval_discount=data["ks"][1]["value"], size_cap=data["caps"][ci]["value"],
+                same_title_size_cap=0.5, add_to_held_pairs=yes,
+                sell_at=None if sell_view else 0.9, sell_min_days=None if sell_view else 5,
+                trim_to_kelly=yes)
+            assert settings == expected, name
+            for field in config.LIVE_TOGGLE_FIELDS:
+                assert getattr(settings, field) == getattr(expected, field), (name, field)
+            assert source == data["save"]["source"]
+        # Nothing was written by showing the page
+        assert config.read_saved_live_defaults() == current
 
     @pytest.mark.parametrize("saved", [False, True])
     def test_the_address_is_what_the_defaults_server_reads(self, monkeypatch, tmp_path, saved):
         # The clicked address, handed to the server's own application and parser:
-        # the settings it reads carry the choice on screen — off explicitly at
-        # the page as rendered (so the seed's "on" does not leak in), on when
-        # chosen — whatever is saved
+        # the settings it read carry the choice on screen — no explicitly at
+        # the page as rendered (so the seed's adding does not leak in), yes when
+        # chosen — whatever is saved, with the tier floors, the k and a tag too
         save = TestSaveLiveDefaultsButton()
-        page = save._kc(monkeypatch, tmp_path, _kc_sweep_add_on(_kc_sweep_tiers()))
+        page = save._kc(monkeypatch, tmp_path, _kc_sweep_rebalance(_kc_sweep_tiers()))
         data = TestFilterPage._data(page)
         sports = data["categories"].index("Sports")
         hockey = str(data["subcats"].index([sports, "Hockey"]))
         snaps = self._run(tmp_path, page, [
             ["wait"], ["click", "flt-save"], ["snap", "primary"],
             ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
-            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"],
-            ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"],
+            ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], *self.ON,
             _tick_tag(hockey), ["settle"],
             ["click", "flt-save"], ["snap", "chosen"]], strict=True)
         if saved:
@@ -12843,12 +12688,13 @@ class TestAddOnScript:
                 tier_floors=True, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][pk]["value"],
                 size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
-                add_to_held_pairs=False)),
+                add_to_held_pairs=False, trim_to_kelly=False)),
             ("chosen", config.LiveSettings(
                 tier_floors=False, spread_band=tuple(data["bands"][pb]["value"]),
                 interval_discount=data["ks"][0]["value"],
                 size_cap=data["caps"][pc]["value"], same_title_size_cap=0.5,
-                categories=("Sports",), tags=("Sports · Hockey",), add_to_held_pairs=True)),
+                categories=("Sports",), tags=("Sports · Hockey",), add_to_held_pairs=True,
+                trim_to_kelly=True)),
         )
         for name, expected in cases:
             [opened] = snaps[name]["opened"]
@@ -12864,693 +12710,11 @@ class TestAddOnScript:
                 assert getattr(settings, field) == getattr(expected, field), (name, field)
             assert source == data["save"]["source"]
 
-
-class TestAddOnEndToEnd:
-    """A real run_backtest_sweep with the add-on family, over the backtester's
-    golden fixture narrowed to one band and one k, rendered through
-    generate_dashboard: every cap's add-on chunk is the scenario a fresh
-    simulation with add_to_held at that cap produces, figure for figure."""
-
-    @pytest.mark.usefixtures("pre_toggle_defaults")
-    def test_a_real_add_on_sweep_pages_every_cap_at_its_own_simulation(
-            self, monkeypatch, tmp_path):
-        golden = _tb.TestPrepareEntriesGolden()
-        golden._patch(monkeypatch)
-        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
-        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
-        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
-        run = backtester.run_backtest_sweep(
-            MagicMock(), MagicMock(), golden._START, 10_000.0, same_event_ladders=True,
-            interval_discount=0.5, band_sweep=True, cap_sweep=True, add_on_sweep=True)
-        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(dashboard.yf, "download",
-                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        page = dashboard.generate_dashboard(
-            run.primary.trades, run.primary.equity_df, golden._START, 10_000.0,
-            sweep=run).read_text(encoding="utf-8")
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        caps = run.add_on_cap_sweep.caps
-        assert data["add_state"] == "shown" and data["grid_add"] is not None
-        assert [c["value"] for c in data["caps"]] == list(caps) and len(caps) == 20
-        band, end = (0.0, 1.0), run.primary.equity_df["date"].iloc[-1]
-        added = 0
-        for ci, cap in enumerate(caps):
-            fresh = backtester._simulate_at_discount(
-                run.add_on_cap_sweep.entries_by_band[band], golden._START, 10_000.0, k=0.5,
-                spread_band=band, size_cap=cap, quiet=True, end_date=end, add_to_held=True)
-            view = chunks[data["grid_add"][0][0][ci]]["list"]["views"]["all"]
-            kpis = dashboard._performance_kpis(fresh.equity_df, fresh.trades, 10_000.0)
-            assert view["kpi"] == {key: value for key, _, value, _ in kpis}, cap
-            assert view["n"] == len(fresh.trades), cap
-            added += sum(t.add_on for t in fresh.trades)
-        # Not vacuous: adding made trades of its own, and the run as simulated differs
-        assert added > 0
-        assert data["grid_add"] != data["grid"]
-
-
-_TRIM_NOT_SIMULATED = "(not simulated in this backtest)"
-_TRIM_UNAVAILABLE = "(not available on this page; see the log)"
-
-
-class TestTrimSelect:
-    """The bar's "Trim to Kelly" select as Python renders it: after Add to held
-    pairs and before Sell, shut, with its two options, its rule in the hover
-    text and, on a page without the view, the reason beside it."""
-
-    def test_the_select_follows_add_to_held_pairs_and_is_rendered_shut(
-            self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
-        ids = re.findall(r'<select id="(flt-[a-z]+)"', page)
-        assert ids == ["flt-band", "flt-tier", "flt-k", "flt-cap", "flt-add", "flt-trim",
-                       "flt-rise", "flt-sell", "flt-days"]
-        # ... and before the Category and Tag menus
-        bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
-        assert bar.index('id="flt-trim"') < bar.index('id="flt-cat"') < bar.index('id="flt-tag"')
-        assert "<label>Trim to Kelly: <select" in page
-        select = _page_elements(page)["selects"]["flt-trim"]
-        assert select == {"disabled": True, "options": [
-            {"value": "off", "text": "off", "selected": True},
-            {"value": "on", "text": "on (sell down to the Kelly size)", "selected": False}]}
-        title = re.search(r'<select id="flt-trim"[^>]*title="([^"]*)"', page).group(1)
-        # The hover text, at the wait the page's trim runs use
-        assert backtester.REBALANCE_MIN_DAYS_SINCE_TRADE == 7
-        shipped = dashboard._trim_select_title(backtester.REBALANCE_MIN_DAYS_SINCE_TRADE)
-        assert html.unescape(title) == shipped
-        # It says what the choice shuts and why, and what Save saves
-        for words in ("Sell is set to no selling", "Each part sold counts as a trade of its own",
-                      "Min. price rise can make a trim (and an add-on) wait",
-                      "From a page that simulated trimming, Save as live defaults saves this "
-                      "choice and the Min. price rise shown, for live runs to trim by; from any "
-                      "other page it keeps the saved ones.",
-                      "With this on, saving from a page that simulated selling turns live "
-                      "selling off; saving from one that did not keeps the saved sell level."):
-            assert words in shipped
-        assert "does not trim" not in shipped and "unavailable" not in shipped
-        # A page with the view has no note beside it
-        assert 'id="flt-trim-note"' not in page
-
-    def test_the_title_names_the_wait_after_a_trade(self, monkeypatch, tmp_path):
-        title = dashboard._trim_select_title
-        # The wait covers add-ons as well as trims, and so does the minimum
-        rule = ("each week. A pair is trimmed (or, with Add to held pairs on, added to) only "
-                "when at least {} passed since its last purchase, add-on or trim{} Min. price "
-                "rise can make a trim (and an add-on) wait until the pair's price has moved far "
-                "enough, up or down.")
-        # Weekly runs are 7 days apart: a wait of 7 days or fewer holds no
-        # trim or add-on back, and the text says so
-        weekly = ("; weekly runs are 7 days apart, so this never holds a trim or an add-on "
-                  "back here.")
-        assert rule.format("7 days have", weekly) in title(7)
-        assert rule.format("1 day has", weekly) in title(1)
-        assert rule.format("6 days have", weekly) in title(6)
-        # A longer wait does hold trims back, so nothing of the kind is said
-        for days in (8, 14, 30):
-            assert rule.format(f"{days} days have", ".") in title(days)
-            assert "never holds a trim" not in title(days)
-        # With no wait there is nothing to count
-        assert ("each week. A pair can be trimmed (or, with Add to held pairs on, added to) at "
-                "any weekly run after a trade on it. Min. price rise can make a trim (and an "
-                "add-on) wait") in title(0)
-        assert "days have passed" not in title(0)
-        # How a live run counts the wait: said only when there is a wait
-        live = ("Each part sold counts as a trade of its own. A live run counts the wait in "
-                "calendar days on the bot's own clock from the last fill of any sort on "
-                "either market, a trade by hand included, and trims nothing while Kalshi's "
-                "list of the account's fills does not reach back that far. While this is on,")
-        for days in (1, 7, 14):
-            assert live in title(days)
-        assert "A live run" not in title(0)
-        assert ("Each part sold counts as a trade of its own. While this is on,") in title(0)
-        # Nothing but the wait's sentence differs between two waits
-        assert title(7).replace(rule.format("7 days have", weekly),
-                                rule.format("14 days have", ".")) == title(14)
-        # The week is the gap between two of the backtest's checkpoints
-        first, second = backtester._sale_checkpoints(date(2026, 1, 5), date(2026, 1, 12))
-        assert (second - first).days == dashboard._DAYS_BETWEEN_WEEKLY_RUNS == 7
-        # The page names the wait its trim runs read
-        monkeypatch.setattr(backtester, "REBALANCE_MIN_DAYS_SINCE_TRADE", 14)
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
-        shown = re.search(r'<select id="flt-trim"[^>]*title="([^"]*)"', page).group(1)
-        assert html.unescape(shown) == title(14)
-
-    @pytest.mark.parametrize("bad", [True, 7.5, 31, -1, "7", None, float("nan"), [7],
-                                     Decimal("NaN"), Decimal("sNaN")])
-    def test_a_bad_wait_never_stops_the_bar_being_drawn(self, bad):
-        # A backtest refuses these before it runs, but the hover text must
-        # still build, and says nothing about the week for a value it cannot
-        # compare with a number of days (a string, None, a decimal NaN)
-        text = dashboard._trim_select_title(bad)
-        assert text.startswith("off: no part of a held pair is sold to cut its size.")
-        assert text.endswith("always show it off.")
-        if not isinstance(bad, (int, float)):
-            assert "never holds a trim" not in text
-        _, _, base = _tr_payload(_kc_sweep())
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(backtester, "REBALANCE_MIN_DAYS_SINCE_TRADE", bad)
-            bar = dashboard._filter_bar_html(base, {"all": {"n": 3}})
-        assert f'title="{html.escape(text)}"' in bar
-
-    @pytest.mark.parametrize("state, note", [
-        ("not simulated", _TRIM_NOT_SIMULATED),
-        ("unavailable", _TRIM_UNAVAILABLE),
-        ("something else", _TRIM_NOT_SIMULATED)])
-    def test_a_shut_select_says_why(self, state, note):
-        _, chunker, base = _tr_payload(_kc_sweep())
-        bar = dashboard._filter_bar_html({**base, "trim_state": state}, {"all": {"n": 3}})
-        assert f'id="flt-trim-note" style="color:#9E9E9E; font-size:13px;">{note}</span>' in bar
-        assert 'id="flt-trim" disabled' in bar
-        shown = dashboard._filter_bar_html({**base, "trim_state": "shown"}, {"all": {"n": 3}})
-        assert 'id="flt-trim-note"' not in shown
-
-    def test_a_page_says_which_of_the_two_reasons_applies(self, monkeypatch, tmp_path):
-        # No family: not simulated. A family the page could not use: see the log
-        bare = _ao_page(monkeypatch, tmp_path, _kc_sweep())
-        assert re.search(r'id="flt-trim-note"[^>]*>\(not simulated in this backtest\)</span>',
-                         bare)
-        sweep = _kc_sweep_trim()
-        sweep.trim_sweep.caps = (0.05, 0.2)
-        lost = _ao_page(monkeypatch, tmp_path, sweep)
-        assert re.search(
-            r'id="flt-trim-note"[^>]*>\(not available on this page; see the log\)</span>', lost)
-        assert TestFilterPage._data(lost)["trim_state"] == "unavailable"
-
-    def test_the_summary_text_gains_the_trim_note_after_the_add_on_one(self):
-        _, _, base = _tr_payload(_kc_sweep_trim(_kc_sweep_add_on()))
-        text = base["text"]
-        plain = dashboard._filter_summary_text(text, "S", False, None, 4, 4)
-        trimmed = dashboard._filter_summary_text(text, "S", False, None, 4, 4, trim=True)
-        both = dashboard._filter_summary_text(text, "S", False, None, 4, 4, add_on=True,
-                                              trim=True)
-        note = dashboard._TRIM_SUMMARY_NOTE
-        assert trimmed == plain[:-len(text["unfiltered"])] + note + text["unfiltered"]
-        assert both.endswith(dashboard._ADD_ON_SUMMARY_NOTE + note + text["unfiltered"])
-
-
-class TestTrimRiseSelect:
-    """The bar's "Min. price rise" select as Python renders it: right after
-    Trim to Kelly and before Sell, on every page, shut, with "any" and one
-    option per minimum the page carries, its rule in the hover text and, on a
-    page that shows Trim to Kelly without the minimums, the reason beside it."""
-
-    @staticmethod
-    def _select(page: str):
-        """The select's attributes and its options' markup on a page (or a bar)."""
-        return re.search(r'<select id="flt-rise"([^>]*)>(.*?)</select>', page)
-
-    def test_the_select_follows_trim_to_kelly_with_any_and_every_minimum(
-            self, monkeypatch, tmp_path):
-        rises = tuple(config.MIN_PRICE_MOVES)
-        assert len(rises) == 19
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(min_rises=rises))
-        # Right after Trim to Kelly and before Sell
-        ids = re.findall(r'<(?:select|details) id="(flt-[a-z]+)"', page)
-        at = ids.index("flt-trim")
-        assert ids[at:at + 3] == ["flt-trim", "flt-rise", "flt-sell"]
-        # ... with nothing but the gap between Trim to Kelly's label and its own
-        assert ('</select></label>&nbsp;&nbsp;<label>Min. price rise: <select id="flt-rise" '
-                'disabled autocomplete="off" title="') in page
-        select = self._select(page)
-        assert " disabled" in select.group(1) and 'autocomplete="off"' in select.group(1)
-        # "any" first and selected, then every 5c from 5c to 95c
-        cents = [f"{c}c" for c in range(5, 100, 5)]
-        assert [dashboard._trim_rise_option(rise) for rise in rises] == cents
-        assert re.findall(r'<option value="([^"]*)"( selected)?>(.*?)</option>',
-                          select.group(2)) == [
-            ("0", " selected", "any"), *((str(i + 1), "", c) for i, c in enumerate(cents))]
-        # ... every one of which the page-script tests can read
-        assert _page_elements(page)["selects"]["flt-rise"] == {"disabled": True, "options": [
-            {"value": "0", "text": "any", "selected": True},
-            *({"value": str(i + 1), "text": c, "selected": False}
-              for i, c in enumerate(cents))]}
-        # Each option is the base block's own entry, in order
-        data = TestFilterPage._data(page)
-        assert [entry["label"] for entry in data["trim_rises"]] == cents
-        assert [entry["value"] for entry in data["trim_rises"]] == list(rises)
-        title = re.search(r'title="([^"]*)"', select.group(1)).group(1)
-        assert html.unescape(title) == dashboard._TRIM_RISE_TITLE
-        # The hover text says when it counts, which price, that a rise and a fall
-        # count alike, and that add-ons wait for it too
-        for words in ("Used only while Trim to Kelly is on", "YES on the earlier market plus "
-                      "NO on the later one", "A rise and a fall count alike", "any: no minimum",
-                      "its purchase, an add-on or an earlier trim",
-                      "trimmed, and with Add to held pairs on added to,",
-                      "moved at least this many cents, up or down,"):
-            assert words in dashboard._TRIM_RISE_TITLE
-        assert "A fall never counts" not in dashboard._TRIM_RISE_TITLE
-        # ... and ends with what Save saves, and which pairs a live run cannot
-        # measure a move for
-        assert dashboard._TRIM_RISE_TITLE.endswith(
-            " however little its price moved. From a page that simulated trimming, Save as live "
-            "defaults saves the minimum shown, for live trims to wait for (any, or Trim to Kelly "
-            "off, saves none); from any other page it keeps the saved one. A live run reads "
-            "the price at the pair's last fill on Kalshi, so with a minimum set it does not "
-            "trim a pair whose last fill is older than Kalshi's list of the account's fills "
-            "reaches.")
-        # A page with the view has no note beside either select
-        assert 'id="flt-rise-note"' not in page and 'id="flt-trim-note"' not in page
-        # Trim to Kelly keeps its two options
-        assert [o["text"] for o in _page_elements(page)["selects"]["flt-trim"]["options"]] == [
-            "off", "on (sell down to the Kelly size)"]
-
-    def test_a_page_without_the_minimums_renders_any_alone(self, monkeypatch, tmp_path):
-        # The select is on every page (the script looks for it), with one option
-        for sweep in (_kc_sweep_trim(), _kc_sweep()):
-            page = _ao_page(monkeypatch, tmp_path, sweep)
-            select = self._select(page)
-            assert " disabled" in select.group(1)
-            assert select.group(2) == '<option value="0" selected>any</option>'
-            assert TestFilterPage._data(page)["trim_rises"] == []
-
-    @pytest.mark.parametrize("trim_state, rise_state, note", [
-        # Trim to Kelly is shown and the minimums are not: this select says why
-        ("shown", "not simulated", _TRIM_NOT_SIMULATED),
-        ("shown", "unavailable", _TRIM_UNAVAILABLE),
-        ("shown", "something else", _TRIM_NOT_SIMULATED),
-        # Both shown: nothing to explain
-        ("shown", "shown", None),
-        # Trim to Kelly is not shown: its own note covers both selects
-        ("not simulated", "not simulated", None),
-        ("unavailable", "unavailable", None),
-        ("not simulated", "unavailable", None),
-        ("something else", "not simulated", None)])
-    def test_the_note_is_said_only_beside_a_shown_trim_to_kelly(self, trim_state, rise_state,
-                                                                note):
-        _, _, base = _tr_payload(_kc_sweep())
-        bar = dashboard._filter_bar_html(
-            {**base, "trim_state": trim_state, "trim_rise_state": rise_state},
-            {"all": {"n": 3}})
-        assert 'id="flt-rise" disabled' in bar
-        if note is None:
-            assert 'id="flt-rise-note"' not in bar
-        else:
-            # Right after the select, in the Trim to Kelly note's own style
-            assert ('</select></label>&nbsp;<span id="flt-rise-note" style="color:#9E9E9E; '
-                    f'font-size:13px;">{note}</span>&nbsp;&nbsp;<label>Sell: ') in bar
-        assert ('id="flt-trim-note"' in bar) is (trim_state != "shown")
-
-    def test_a_payload_without_the_state_reads_as_not_simulated(self):
-        _, _, base = _tr_payload(_kc_sweep_trim())
-        del base["trim_rise_state"], base["trim_rises"]
-        bar = dashboard._filter_bar_html(base, {"all": {"n": 3}})
-        assert ('id="flt-rise-note" style="color:#9E9E9E; font-size:13px;">'
-                f"{_TRIM_NOT_SIMULATED}</span>") in bar
-        assert self._select(bar).group(2) == '<option value="0" selected>any</option>'
-
-    def test_a_page_says_which_of_the_two_reasons_applies(self, monkeypatch, tmp_path):
-        def note(page: str) -> str | None:
-            found = re.search(r'<span id="flt-rise-note"[^>]*>([^<]*)</span>', page)
-            return found.group(1) if found else None
-
-        # A family without minimums: not simulated
-        assert note(_ao_page(monkeypatch, tmp_path, _kc_sweep_trim())) == _TRIM_NOT_SIMULATED
-        # A family whose minimums could not be read: see the log, and Trim to
-        # Kelly itself is still shown
-        lost = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(
-            rise_raise=((False, False, _KC_B0, 0.6), 0)))
-        assert note(lost) == _TRIM_UNAVAILABLE and 'id="flt-trim-note"' not in lost
-        assert TestFilterPage._data(lost)["trim_rise_state"] == "unavailable"
-        # No family at all, or one the page could not use: Trim to Kelly's own
-        # note says why, and this select has none
-        bare = _ao_page(monkeypatch, tmp_path, _kc_sweep())
-        assert note(bare) is None and 'id="flt-trim-note"' in bare
-        unfit = _kc_sweep_trim_rise()
-        unfit.trim_sweep.caps = (0.05, 0.2)
-        page = _ao_page(monkeypatch, tmp_path, unfit)
-        assert note(page) is None
-        assert re.search(
-            r'id="flt-trim-note"[^>]*>\(not available on this page; see the log\)</span>', page)
-
-    def test_the_hover_texts_say_what_save_sends_on_every_page(self, monkeypatch, tmp_path):
-        # Each select has one hover text on every page, so what it says about
-        # Save must hold on pages with and without the Trim to Kelly view
-        # (what Save sends: TestTrimRiseScript.test_a_save_sends_the_minimum_shown,
-        # TestSaveLiveDefaultsButton.test_a_page_without_the_trim_view_sends_neither_trim_field)
-        trim_save = ("From a page that simulated trimming, Save as live defaults saves this "
-                     "choice and the Min. price rise shown, for live runs to trim by; from any "
-                     "other page it keeps the saved ones.")
-        rise_save = ("From a page that simulated trimming, Save as live defaults saves the "
-                     "minimum shown, for live trims to wait for (any, or Trim to Kelly off, "
-                     "saves none); from any other page it keeps the saved one.")
-        for sweep, has_view in ((_kc_sweep(), False), (_kc_sweep_trim(), True),
-                                (_kc_sweep_trim_rise(), True)):
-            page = _ao_page(monkeypatch, tmp_path, sweep)
-            assert (TestFilterPage._data(page)["grid_trim"] is not None) is has_view
-            for select_id, said in (("flt-trim", trim_save), ("flt-rise", rise_save)):
-                title = html.unescape(re.search(
-                    rf'<select id="{select_id}"[^>]*title="([^"]*)"', page).group(1))
-                # Its one sentence on the save button names the pages it holds on
-                assert title.count("Save as live defaults") == 1, select_id
-                assert said in title, select_id
-
-    def test_the_reach_sentence_names_both_selects_only_with_the_minimums(
-            self, monkeypatch, tmp_path):
-        # Without an explorer grid (the payload built here has none) ...
-        _, _, base = _tr_payload(_kc_sweep_trim_rise())
-        closing = base["text"]["unfiltered"]
-        assert closing.endswith(" " + dashboard._TRIM_RISE_REACH_NO_EXPLORER)
-        assert dashboard._TRIM_REACH_NO_EXPLORER not in closing
-        assert dashboard._TRIM_RISE_REACH not in closing
-        # ... and with one (a band sweep's populations, so the page carries its grid)
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(_ex_sweep()))
-        closing = TestFilterPage._data(page)["text"]["unfiltered"]
-        assert closing.endswith(" " + dashboard._TRIM_RISE_REACH)
-        assert dashboard._TRIM_REACH not in closing
-        assert html.escape(dashboard._TRIM_RISE_REACH) in page
-        # A page that shows Trim to Kelly without the minimums names it alone
-        for sweep in (_kc_sweep_trim(),
-                      _kc_sweep_trim_rise(rise_raise=((False, False, _KC_B0, 0.6), 0))):
-            _, _, base = _tr_payload(sweep, rise_state="unavailable")
-            closing = base["text"]["unfiltered"]
-            assert closing.endswith(" " + dashboard._TRIM_REACH_NO_EXPLORER)
-            assert "Min. price rise" not in closing
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim(_ex_sweep()))
-        closing = TestFilterPage._data(page)["text"]["unfiltered"]
-        assert closing.endswith(" " + dashboard._TRIM_REACH) and "Min. price rise" not in closing
-        # A page with neither names neither
-        _, _, clean = _tr_payload(_kc_sweep())
-        assert "Trim to Kelly" not in clean["text"]["unfiltered"]
-        # Both sentences say what the pair of selects leaves alone
-        for words in (dashboard._TRIM_RISE_REACH, dashboard._TRIM_RISE_REACH_NO_EXPLORER):
-            assert words.startswith("Trim to Kelly and Min. price rise change the trade "
-                                    "sections only; the k̂ figures do not depend on them")
-            assert words.endswith("always show trimming off.") or words.endswith(
-                "always shows trimming off.")
-        assert "Scenario Explorer" in dashboard._TRIM_RISE_REACH
-        assert "Scenario Explorer" not in dashboard._TRIM_RISE_REACH_NO_EXPLORER
-
-
-class TestTrimScript:
-    """The bar's Trim to Kelly select under the page script (run outside a
-    browser): enabled only with the view, "on" loads and words the trimming
-    scenario (with Add to held pairs on, the runs that do both), a chunk that
-    cannot be loaded puts the choice back, Sell is shut while it is on, and
-    Save sends the choice and the minimum price rise, which the defaults
-    server reads back. The explorer never follows it. setup_js adds flt-trim
-    to the harness's "wait" (a page without the view keeps it shut). Skipped
-    without a JavaScript runtime."""
-
-    WAIT = "__BAR.push('flt-trim');"
-    ON = [["set", "flt-trim", "on"], ["fire", "flt-trim"], ["settle"]]
-    OFF = [["set", "flt-trim", "off"], ["fire", "flt-trim"], ["settle"]]
-
-    @classmethod
-    def _run(cls, tmp_path, page, steps, **kwargs) -> dict:
-        """_run_script over a page, waiting on the trim select too."""
-        return _run_script(tmp_path, page, steps, setup_js=cls.WAIT + kwargs.pop("js", ""),
-                           **kwargs)
-
-    def test_the_select_is_enabled_only_with_the_view(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
-        snaps = self._run(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
-                          strict=True)
-        assert snaps["loaded"]["selects"]["flt-trim"]["disabled"] is True
-        ready = snaps["ready"]["selects"]["flt-trim"]
-        assert ready["disabled"] is False and ready["value"] == "off"
-        assert ready["options"] == [["off", "off"], ["on", "on (sell down to the Kelly size)"]]
-        # A page without the view keeps it shut, whatever else is chosen
-        bare = _ao_page(monkeypatch, tmp_path, _kc_sweep())
-        snap = _run_script(tmp_path, bare, [
-            ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], *self.ON,
-            ["snap", "s"]], strict=True)["s"]
-        assert snap["selects"]["flt-trim"]["disabled"] is True
-        # The change event on the shut select drew nothing more than the k's did
-        assert snap["inflated"] == ["dash-data", "dash-chunk-0", "dash-chunk-2"]
-        assert "trimming to Kelly" not in snap["text"]["flt-summary"]
-
-    def test_on_loads_the_trim_chunk_and_words_the_scenario(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        cid = data["grid_trim"][0][1][1]
-        assert cid not in _ao_ids(data["grid"])
-        scenario = _phrase(data, 0, 1, 1) + data["text"]["trim"]
-        assert scenario.endswith("20% cap per trade, trimming to Kelly")
-        snaps = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-trim", "on"], ["fire", "flt-trim"], ["snap", "loading"],
-            ["settle"], ["snap", "on"], *self.OFF, ["snap", "off"]], strict=True)
-        assert snaps["loading"]["text"]["flt-summary"] == data["text"]["loading"].format(
-            scenario=scenario)
-        snap = snaps["on"]
-        assert snap["inflated"] == ["dash-data", "dash-chunk-0", f"dash-chunk-{cid}"]
-        assert {r["id"] for r in snap["reacts"]} == _charts_redrawn()
-        view = chunks[cid]["list"]["views"]["all"]
-        # The primary cell with trimming on is its own simulation, and the line
-        # says what a part sold counts as, in Python's words
-        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], scenario, False, None, view["n"], view["n"], note="other_run",
-            trim=True)
-        assert snap["text"]["flt-summary"].endswith(
-            dashboard._TRIM_SUMMARY_NOTE + data["text"]["unfiltered"])
-        assert snap["text"]["hdr-trades"] == str(view["n"]) == "4"
-        assert _last_react(snap, "risk-kelly")["data"][0]["x"] == pytest.approx(
-            chunks[cid]["list"]["kx"])
-        # Off again is the page as rendered: the primary's chunk, kept
-        off = snaps["off"]
-        assert off["inflated"] == snap["inflated"]
-        assert off["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], _phrase(data, 0, 1, 1), True, None, 3, 3)
-        assert off["text"]["hdr-trades"] == "3"
-
-    def test_ticked_categories_and_tags_are_read_from_the_trim_scenario(
-            self, monkeypatch, tmp_path):
-        # One ticked category is a view of the trimming run's own chunk; the
-        # line words it with the trim phrase and note, and its counts are that
-        # run's. Ticks that are a mix the script works out itself say so too.
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        cid = data["grid_trim"][0][1][1]
-        views = chunks[cid]["list"]["views"]
-        scenario = _phrase(data, 0, 1, 1) + data["text"]["trim"]
-        sports = _key(data, "Sports")
-        snaps = self._run(tmp_path, page, [
-            ["wait"], *self.ON, _tick_category(sports[1:]), ["settle"], ["snap", "sports"],
-            *self.OFF, ["snap", "off"]], strict=True)
-        snap = snaps["sports"]
-        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], scenario, False, "Sports", views[sports]["n"], views["all"]["n"],
-            trim=True)
-        assert snap["text"]["hdr-trades"] == str(views[sports]["n"])
-        # Trimming off keeps the tick, on the page's own run
-        off = snaps["off"]
-        assert off["selects"]["flt-cat"]["value"] == sports[1:]
-        assert data["text"]["trim"] not in off["text"]["flt-summary"]
-        assert "Sports" in off["text"]["flt-summary"]
-
-    def test_a_scenario_that_trimmed_nothing_shows_the_scenario_s_own_chunk(
-            self, monkeypatch, tmp_path):
-        # With no cap nothing is trimmed: the trimming run traded the list of
-        # the run without it, so no other chunk is loaded — and the line still
-        # names the choice
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
-        data = TestFilterPage._data(page)
-        assert data["grid_trim"][0][1][2] == data["grid"][0][1][2]
-        snap = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"],
-            ["snap", "plain"], *self.ON, ["snap", "on"]], strict=True)
-        assert snap["on"]["inflated"] == snap["plain"]["inflated"]
-        assert snap["on"]["text"]["hdr-trades"] == snap["plain"]["text"]["hdr-trades"]
-        assert data["text"]["trim"] in snap["on"]["text"]["flt-summary"]
-
-    def test_a_restored_on_is_set_back_to_off_and_loads_no_trim_chunk(
-            self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
-        snaps = self._run(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
-                          pre=(("flt-trim", "on"),), strict=True)
-        assert snaps["loaded"]["selects"]["flt-trim"]["value"] == "off"
-        ready = snaps["ready"]
-        assert ready["selects"]["flt-trim"]["value"] == "off"
-        assert ready["selects"]["flt-trim"]["disabled"] is False
-        assert ready["inflated"] == ["dash-data", "dash-chunk-0"] and ready["reacts"] == []
-
-    def test_with_adding_on_it_reads_the_grid_of_runs_that_do_both(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim(_kc_sweep_add_on()))
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        both = data["grid_trim_add"][0][1][1]
-        assert both not in (_ao_ids(data["grid"]) | _ao_ids(data["grid_add"])
-                            | _ao_ids(data["grid_trim"]))
-        snaps = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], *self.ON,
-            ["snap", "both"], ["set", "flt-add", "off"], ["fire", "flt-add"], ["settle"],
-            ["snap", "trim"]], js="__BAR.push('flt-add');", strict=True)
-        snap = snaps["both"]
-        assert f"dash-chunk-{both}" in snap["inflated"]
-        scenario = _phrase(data, 0, 1, 1) + data["text"]["add_on"] + data["text"]["trim"]
-        assert scenario.endswith(", adding to held pairs, trimming to Kelly")
-        view = chunks[both]["list"]["views"]["all"]["n"]
-        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], scenario, False, None, view, view, note="other_run", add_on=True,
-            trim=True)
-        # Adding off again: the trim-alone scenario's chunk
-        alone = data["grid_trim"][0][1][1]
-        assert f"dash-chunk-{alone}" in snaps["trim"]["inflated"]
-        assert snaps["trim"]["text"]["hdr-trades"] == str(
-            chunks[alone]["list"]["views"]["all"]["n"])
-
-    def test_tier_floors_off_reads_the_trim_off_grid(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim(_kc_sweep_tiers()))
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        binding, plain = data["grid_trim_off"][0][1][1], data["grid_trim_off"][1][1][1]
-        assert binding not in _ao_ids(data["grid_trim"]) and plain in _ao_ids(data["grid_trim"])
-        snaps = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], *self.ON,
-            ["snap", "binding"],
-            ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "plain"]],
-            strict=True)
-        trim = data["text"]["trim"]
-        view = chunks[binding]["list"]["views"]["all"]["n"]
-        assert f"dash-chunk-{binding}" in snaps["binding"]["inflated"]
-        assert snaps["binding"]["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], _phrase_off(data, 0, 1, 1) + trim, False, None, view, view,
-            note="other_run", trim=True)
-        view = chunks[plain]["list"]["views"]["all"]["n"]
-        assert snaps["plain"]["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], _phrase_off(data, 1, 1, 1) + trim, False, None, view, view,
-            trim=True)
-
-    def test_a_scenario_the_family_never_simulated_reads_missing(self, monkeypatch, tmp_path):
-        # The family holds no run with the tier floors off: trimming at a band
-        # the tiers bind at, with them off, was never simulated
-        sweep = _kc_sweep_trim(_kc_sweep_tiers())
-        sweep.trim_sweep.off_bands = ()
-        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, sweep)
-        data = TestFilterPage._data(page)
-        snap = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], *self.ON,
-            ["snap", "missing"]], strict=True)["missing"]
-        scenario = _phrase_off(data, 0, 1, 1) + data["text"]["trim"]
-        # Nothing is shown, so nothing is said about what a part sold counts as
-        assert snap["text"]["flt-summary"] == data["text"]["missing"].format(
-            scenario=scenario) + data["text"]["unfiltered"]
-        assert snap["buttons"]["flt-save"] is True and snap["text"]["hdr-trades"] == "0"
-
-    def test_a_chunk_that_cannot_be_loaded_puts_the_choice_back(self, monkeypatch, tmp_path):
-        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, _kc_sweep_trim())
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        cid = data["grid_trim"][0][1][1]
-        snaps = self._run(tmp_path, page, [
-            ["wait"], *self.ON, ["snap", "bad"], ["click", "flt-save"], ["snap", "bad click"],
-            ["repair", f"dash-chunk-{cid}"], *self.ON, ["snap", "good"]],
-            strict=True, damaged=(f"dash-chunk-{cid}",))
-        bad = snaps["bad"]
-        assert bad["selects"]["flt-trim"]["value"] == "off" and bad["reacts"] == []
-        assert bad["text"]["flt-summary"] == data["text"]["unavailable"].format(
-            failed=_phrase(data, 0, 1, 1) + data["text"]["trim"],
-            reason=f"Error: damaged block dash-chunk-{cid}", scenario=_phrase(data, 0, 1, 1))
-        # Save sends the scenario still shown (no trimming), not the one that
-        # failed to load
-        assert bad["buttons"]["flt-save"] is False
-        save = TestSaveLiveDefaultsButton()
-        [opened] = snaps["bad click"]["opened"]
-        query = save._query(data, opened)
-        save._assert_sends(data, query, 0, 1, 1)
-        assert (query["trim_to_kelly"], query["trim_min_rise"]) == ("off", "off")
-        good = snaps["good"]
-        assert good["selects"]["flt-trim"]["value"] == "on"
-        assert good["text"]["hdr-trades"] == str(chunks[cid]["list"]["views"]["all"]["n"])
-
-    # ─── Save and Sell while trimming ─────────────────────────────────────────
-
-    @pytest.mark.parametrize("sell_view", [False, True], ids=["no-sell-view", "sell-view"])
-    def test_a_save_sends_the_trim_choice(self, monkeypatch, tmp_path, sell_view):
-        # Save sends the Trim to Kelly choice and the minimum rise ("off": this
-        # page has no minimums), and the defaults server reads it back. Over
-        # saved defaults that sell, a page with the Sell view also sends no
-        # selling (Sell is shut while trimming); one without keeps the saved level
-        config.save_live_defaults(
-            dataclasses.replace(config.live_settings(), sell_at=0.9, sell_min_days=5),
-            source="")
-        current = config.read_saved_live_defaults()
-        save = TestSaveLiveDefaultsButton()
-        page = save._kc(monkeypatch, tmp_path,
-                        _kc_sweep_trim(_kc_sweep_sell() if sell_view else None))
-        data = TestFilterPage._data(page)
-        assert (data["sell_blocks"] is not None) is sell_view
-        assert data["grid_trim"] is not None and data["trim_rises"] == []
-        snaps = self._run(tmp_path, page, [
-            ["wait"], ["snap", "before"], *self.ON, ["click", "flt-save"], ["snap", "on"],
-            # ... also where trimming changed nothing (no cap: the same chunk)
-            ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"], ["click", "flt-save"],
-            ["snap", "same"], *self.OFF, ["click", "flt-save"], ["snap", "off"]],
-            js="__BAR.push('flt-sell');" if sell_view else "", files_root=tmp_path,
-            strict=True)
-        assert snaps["before"]["buttons"]["flt-save"] is False
-        app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
-        sold = {"sell_at": "off", "sell_min_days": "off"} if sell_view else {}
-        for name, ci, trims in (("on", 1, True), ("same", 2, True), ("off", 2, False)):
-            snap = snaps[name]
-            assert snap["buttons"]["flt-save"] is False, name
-            [opened] = snap["opened"]
-            query = save._query(data, opened)
-            save._assert_sends(data, query, 0, 1, ci)
-            assert query["trim_to_kelly"] == ("on" if trims else "off"), name
-            assert query["trim_min_rise"] == "off", name
-            assert {key: query[key] for key in ("sell_at", "sell_min_days")
-                    if key in query} == sold, name
-            raw = opened["url"].partition("?")[2]
-            response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
-                                                           _SAVE_HOST))
-            assert response.status == 200, response.body
-            settings, source = defaults_server._proposal(defaults_server._params(raw), current)
-            # The page names no add-to-held-pairs choice: the saved one is kept
-            expected = config.LiveSettings(
-                tier_floors=True, spread_band=tuple(data["bands"][0]["value"]),
-                interval_discount=data["ks"][1]["value"], size_cap=data["caps"][ci]["value"],
-                same_title_size_cap=0.5, add_to_held_pairs=current.add_to_held_pairs,
-                sell_at=None if sell_view else 0.9, sell_min_days=None if sell_view else 5,
-                trim_to_kelly=trims)
-            assert settings == expected, name
-            for field in config.LIVE_TOGGLE_FIELDS:
-                assert getattr(settings, field) == getattr(expected, field), (name, field)
-            assert source == data["save"]["source"]
-        # Nothing was written by showing the page
-        assert config.read_saved_live_defaults() == current
-
-    def test_sell_is_shut_at_no_selling_while_trimming_is_on(self, monkeypatch, tmp_path):
-        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_trim(_kc_sweep_sell()))
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        cid = data["grid_trim"][0][1][1]
-        snaps = _run_script(tmp_path, page, [
-            ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
-            ["snap", "level"], *self.ON, ["snap", "on"], *self.OFF, ["snap", "off"]],
-            setup_js=self.WAIT + "__BAR.push('flt-sell');", files_root=tmp_path, strict=True)
-        level = snaps["level"]["selects"]
-        assert level["flt-sell"]["value"] == "0" and level["flt-days"]["disabled"] is False
-        on = snaps["on"]
-        # Sell went back to no selling and both its selects are shut ...
-        assert on["selects"]["flt-sell"]["value"] == "none"
-        assert on["selects"]["flt-sell"]["disabled"] is True
-        assert on["selects"]["flt-days"]["disabled"] is True
-        # ... and the scenario drawn is the trimming one, with no sale in its words
-        assert f"dash-chunk-{cid}" in on["inflated"]
-        view = chunks[cid]["list"]["views"]["all"]["n"]
-        assert on["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], _phrase(data, 0, 1, 1) + data["text"]["trim"], False, None, view,
-            view, note="other_run", trim=True)
-        assert data["text"]["sell_note"] not in on["text"]["flt-summary"]
-        # Trimming off: Sell opens again, still at no selling
-        off = snaps["off"]["selects"]
-        assert off["flt-sell"] == {**off["flt-sell"], "value": "none", "disabled": False}
-        assert off["flt-days"]["disabled"] is True
-
-    def test_a_failed_trim_chunk_gives_the_sell_level_back(self, monkeypatch, tmp_path):
-        # A sell level was on screen when trimming was chosen and its chunk
-        # could not be loaded: the level, its days and both selects come back
-        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_trim(_kc_sweep_sell()))
-        data = TestFilterPage._data(page)
-        cid = data["grid_trim"][0][1][1]
-        snaps = _run_script(tmp_path, page, [
-            ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
-            ["snap", "level"], *self.ON, ["snap", "back"]],
-            setup_js=self.WAIT + "__BAR.push('flt-sell');", files_root=tmp_path, strict=True,
-            damaged=(f"dash-chunk-{cid}",))
-        back = snaps["back"]["selects"]
-        assert back["flt-trim"]["value"] == "off"
-        assert back["flt-sell"]["value"] == "0" and back["flt-sell"]["disabled"] is False
-        assert back["flt-days"]["disabled"] is False
-        assert snaps["back"]["text"]["hdr-trades"] == snaps["level"]["text"]["hdr-trades"]
-
     def test_a_page_without_the_sell_view_keeps_sell_shut_either_way(
             self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
+        # Choosing yes and no reruns the Sell rule, which must leave Sell and
+        # Min. days shut on a page that has no Sell view
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
         snaps = self._run(tmp_path, page, [["wait"], *self.ON, ["snap", "on"], *self.OFF,
                                            ["snap", "off"]], strict=True)
         for name in ("on", "off"):
@@ -13561,7 +12725,9 @@ class TestTrimScript:
 
     def test_the_bar_s_call_to_the_explorer_keeps_its_four_arguments(
             self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim())
+        # The explorer never follows the choice: the label call carries the band,
+        # k, size cap and Tier floors choice, whatever Rebalance says
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance())
         data = TestFilterPage._data(page)
         spy = ("window.dashScenarioSelect = function() { var el = document.getElementById("
                "'__spy'); var seen = el.textContent ? JSON.parse(el.textContent) : []; "
@@ -13574,218 +12740,223 @@ class TestTrimScript:
                   "on"]
         assert calls == [labels, labels]
         [call] = re.findall(r"window\.dashScenarioSelect\(([^;]*)\);", dashboard._FILTER_JS)
-        assert len(re.split(r",\s*(?![^\[]*\])", call)) == 4 and "SHOWN[9]" not in call
+        assert len(re.split(r",\s*(?![^\[]*\])", call)) == 4
+        assert "SHOWN[6]" not in call and "SHOWN[9]" not in call
 
-    def test_the_explorer_s_selects_never_move_on_a_trim_change(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim(_ex_sweep_tiers()))
+    def test_the_explorer_s_selects_never_move_on_a_rebalance_change(
+            self, monkeypatch, tmp_path):
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_rebalance(_ex_sweep_tiers()))
         snaps = self._run(tmp_path, page, [
             ["wait"], ["snap", "before"], *self.ON, ["snap", "on"], *self.OFF, ["snap", "off"]],
             strict=True, explorer=True)
         before, on, off = snaps["before"], snaps["on"], snaps["off"]
         assert _scn_values(on) == _scn_values(off) == _scn_values(before)
         for snap in (on, off):
+            assert snap["selects"]["scn-tier-select"]["value"] == "on"
+            # ... and nothing of the explorer was redrawn
             assert _explorer_calls(snap) == []
-        assert on["selects"]["flt-trim"]["value"] == "on"
+        assert on["selects"]["flt-rebalance"]["value"] == "yes"
 
 
-class TestTrimRiseScript:
-    """The bar's Min. price rise select under the page script (run outside a
-    browser): open only while Trim to Kelly is on; a minimum shows its own
-    run's chunk, or the Trim to Kelly chunk when it changes nothing, or the
-    plain run's when it holds every trim back; adding on and tier floors off
-    read their own grids; Trim to Kelly off shows the plain run and keeps the
+class TestMoveScript:
+    """The bar's Min. price movement select under the page script (run outside
+    a browser): open only while Rebalance is yes; a minimum shows its own
+    run's chunk, or the rebalancing chunk when it changes nothing, or the
+    plain run's when it holds every add-on and trim back; the tier floors off
+    read their own grid; Rebalance no shows the plain run and keeps the
     minimum; a chunk that cannot be loaded puts the choice back; Sell stays
-    shut; and Save sends the minimum shown ("off" for any, or with Trim to
-    Kelly off), which the defaults server reads back. The explorer never
-    follows it. flt-rise is shut on load, so these tests wait on flt-trim
-    (setup_js adds it). Skipped without a JavaScript runtime.
+    shut; and Save sends the minimum shown ("off" for any, or with Rebalance
+    no), which the defaults server reads back. The explorer never follows it.
+    flt-move is shut on load, so these tests wait on flt-rebalance (setup_js
+    adds it). Skipped without a JavaScript runtime.
 
-    The page is _kc_sweep_trim_rise()'s: at (0-1, k 0.75) the 5% cap shows
-    its Trim to Kelly chunk at 5c and 10c and the plain run's at 25c, the 20%
-    cap (the page's own) its Trim to Kelly chunk at 5c and a chunk of its own
-    at 10c and 25c, and with no cap, as in every other cell, no minimum
-    changes anything. The select's values: "0" any, "1" 5c, "2" 10c, "3" 25c."""
+    The page is _kc_sweep_move()'s: at (0-1, k 0.75) the 5% cap shows its
+    rebalancing chunk at 5c and 10c and the plain run's at 25c, the 20% cap
+    (the page's own) its rebalancing chunk at 5c and a chunk of its own at 10c
+    and 25c, and with no cap, as in every other cell, no minimum changes
+    anything. The select's values: "0" any, "1" 5c, "2" 10c, "3" 25c."""
 
-    WAIT = TestTrimScript.WAIT
-    ON, OFF = TestTrimScript.ON, TestTrimScript.OFF
+    WAIT = TestRebalanceScript.WAIT
+    ON, OFF = TestRebalanceScript.ON, TestRebalanceScript.OFF
 
     @staticmethod
-    def _rise(value) -> list:
-        """The steps of a reader choosing one option of the Min. price rise select."""
-        return [["set", "flt-rise", str(value)], ["fire", "flt-rise"], ["settle"]]
+    def _move(value) -> list:
+        """The steps of a reader choosing one option of the Min. price movement select."""
+        return [["set", "flt-move", str(value)], ["fire", "flt-move"], ["settle"]]
 
     @classmethod
     def _run(cls, tmp_path, page, steps, **kwargs) -> dict:
-        """_run_script over a page, waiting on the trim select too."""
+        """_run_script over a page, waiting on the Rebalance select too."""
         return _run_script(tmp_path, page, steps, setup_js=cls.WAIT + kwargs.pop("js", ""),
                            **kwargs)
 
     @staticmethod
-    def _scenario(data: dict, bi: int, ki: int, ci: int, ri: int | None = None, *,
-                  add: bool = False, off: bool = False) -> str:
-        """A trimming scenario in the summary's words, as the script builds it:
-        the band, k and cap, then Python's phrases for adding, for trimming
-        and for the minimum at index ri of the base block's trim_rises (None:
-        any, which adds no words)."""
-        return ((_phrase_off if off else _phrase)(data, bi, ki, ci)
-                + (data["text"]["add_on"] if add else "") + data["text"]["trim"]
-                + ("" if ri is None else data["trim_rises"][ri]["phrase"]))
+    def _scenario(data: dict, bi: int, ki: int, ci: int, mi: int | None = None, *,
+                  off: bool = False) -> str:
+        """A rebalancing scenario in the summary's words, as the script builds
+        it: the band, k and cap, then Python's phrases for rebalancing and for
+        the minimum at index mi of the base block's moves (None: any, which
+        adds no words)."""
+        return ((_phrase_off if off else _phrase)(data, bi, ki, ci) + data["text"]["rebalance"]
+                + ("" if mi is None else data["moves"][mi]["phrase"]))
 
-    def test_it_is_shut_on_load_and_while_trim_to_kelly_is_off(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+    def test_it_is_shut_on_load_and_while_rebalance_is_no(self, monkeypatch, tmp_path):
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move())
         snaps = self._run(tmp_path, page, [
-            ["snap", "loaded"], ["wait"], ["snap", "ready"], *self._rise(2), ["snap", "ignored"],
-            *self._rise(0), *self.ON, ["snap", "on"], *self.OFF, ["snap", "off"]], strict=True)
-        assert snaps["loaded"]["selects"]["flt-rise"]["disabled"] is True
+            ["snap", "loaded"], ["wait"], ["snap", "ready"], *self._move(2), ["snap", "ignored"],
+            *self._move(0), *self.ON, ["snap", "on"], *self.OFF, ["snap", "off"]], strict=True)
+        assert snaps["loaded"]["selects"]["flt-move"]["disabled"] is True
         ready = snaps["ready"]["selects"]
-        assert ready["flt-rise"]["disabled"] is True and ready["flt-rise"]["value"] == "0"
-        assert ready["flt-rise"]["options"] == [["0", "any"], ["1", "5c"], ["2", "10c"],
+        assert ready["flt-move"]["disabled"] is True and ready["flt-move"]["value"] == "0"
+        assert ready["flt-move"]["options"] == [["0", "any"], ["1", "5c"], ["2", "10c"],
                                                 ["3", "25c"]]
-        # Trim to Kelly beside it is open
-        assert ready["flt-trim"]["disabled"] is False
+        # Rebalance beside it is open
+        assert ready["flt-rebalance"]["disabled"] is False
         # A change event on the shut select draws nothing and loads nothing
         ignored = snaps["ignored"]
         assert ignored["reacts"] == [] and ignored["inflated"] == ["dash-data", "dash-chunk-0"]
         assert ignored["text"].get("flt-summary") == snaps["ready"]["text"].get("flt-summary")
-        assert ignored["selects"]["flt-rise"]["disabled"] is True
-        # It opens with Trim to Kelly and shuts with it
-        assert snaps["on"]["selects"]["flt-rise"]["disabled"] is False
-        assert snaps["on"]["selects"]["flt-rise"]["value"] == "0"
-        assert snaps["off"]["selects"]["flt-rise"]["disabled"] is True
+        assert ignored["selects"]["flt-move"]["disabled"] is True
+        # It opens with Rebalance yes and shuts with no
+        assert snaps["on"]["selects"]["flt-move"]["disabled"] is False
+        assert snaps["on"]["selects"]["flt-move"]["value"] == "0"
+        assert snaps["off"]["selects"]["flt-move"]["disabled"] is True
 
     def test_a_minimum_loads_its_own_chunk_and_words_the_scenario(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        trim, cid = data["grid_trim"][0][1][1], data["grid_trim_rise"][0][1][1][1]
+        rebalanced, cid = data["grid_rebalance"][0][1][1], data["grid_move"][0][1][1][1]
         # The 10c run at the 20% cap trades a list no other scenario does
-        assert cid not in _ao_ids(data["grid"]) | _ao_ids(data["grid_trim"])
+        assert cid not in _rb_ids(data["grid"]) | _rb_ids(data["grid_rebalance"])
         scenario = self._scenario(data, 0, 1, 1, 1)
-        assert scenario.endswith(
-            "20% cap per trade, trimming to Kelly only after a 10c price move")
+        assert scenario.endswith("20% cap per trade, rebalancing only after a 10c price move")
         snaps = self._run(tmp_path, page, [
-            ["wait"], *self.ON, ["snap", "trim"], ["set", "flt-rise", "2"],
-            ["fire", "flt-rise"], ["snap", "loading"], ["settle"], ["snap", "rise"]],
+            ["wait"], *self.ON, ["snap", "rebalance"], ["set", "flt-move", "2"],
+            ["fire", "flt-move"], ["snap", "loading"], ["settle"], ["snap", "move"]],
             strict=True)
         # While its chunk inflates, the line says so, in Python's words
         assert snaps["loading"]["text"]["flt-summary"] == data["text"]["loading"].format(
             scenario=scenario)
-        snap = snaps["rise"]
-        # Exactly its chunk was loaded, after the Trim to Kelly one
-        assert snaps["trim"]["inflated"] == ["dash-data", "dash-chunk-0", f"dash-chunk-{trim}"]
-        assert snap["inflated"] == [*snaps["trim"]["inflated"], f"dash-chunk-{cid}"]
+        snap = snaps["move"]
+        # Exactly its chunk was loaded, after the rebalancing one
+        assert snaps["rebalance"]["inflated"] == ["dash-data", "dash-chunk-0",
+                                                  f"dash-chunk-{rebalanced}"]
+        assert snap["inflated"] == [*snaps["rebalance"]["inflated"], f"dash-chunk-{cid}"]
         assert {r["id"] for r in snap["reacts"]} == _charts_redrawn()
         view = chunks[cid]["list"]["views"]["all"]
-        # Its own simulation, with Trim to Kelly's note on what a part sold counts as
+        # Its own simulation, with Rebalance's note on what an added purchase
+        # and a part sold count as
         assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], scenario, False, None, view["n"], view["n"], note="other_run",
-            trim=True)
+            rebalance=True)
         assert snap["text"]["hdr-trades"] == str(view["n"])
         assert {key: snap["text"][f"kpi-{key}"] for key in view["kpi"]} == view["kpi"]
         assert _last_react(snap, "risk-kelly")["data"][0]["x"] == pytest.approx(
             chunks[cid]["list"]["kx"])
-        assert snap["selects"]["flt-rise"]["value"] == "2"
-        assert snap["selects"]["flt-rise"]["disabled"] is False
+        assert snap["selects"]["flt-move"]["value"] == "2"
+        assert snap["selects"]["flt-move"]["disabled"] is False
 
     def test_a_ticked_category_is_read_from_the_minimum_s_chunk(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        views = chunks[data["grid_trim_rise"][0][1][1][1]]["list"]["views"]
+        views = chunks[data["grid_move"][0][1][1][1]]["list"]["views"]
         sports = _key(data, "Sports")
         snap = self._run(tmp_path, page, [
-            ["wait"], *self.ON, *self._rise(2), _tick_category(sports[1:]), ["settle"],
+            ["wait"], *self.ON, *self._move(2), _tick_category(sports[1:]), ["settle"],
             ["snap", "sports"]], strict=True)["sports"]
         assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], self._scenario(data, 0, 1, 1, 1), False, "Sports",
-            views[sports]["n"], views["all"]["n"], trim=True)
+            views[sports]["n"], views["all"]["n"], rebalance=True)
         assert snap["text"]["hdr-trades"] == str(views[sports]["n"])
 
-    def test_a_minimum_that_changes_nothing_shows_the_trim_to_kelly_chunk(
+    def test_a_minimum_that_changes_nothing_shows_the_rebalance_chunk(
             self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        trim = data["grid_trim"][0][1]
+        rebalanced = data["grid_rebalance"][0][1]
         # With no cap the cell is null (no minimum changes the run); at the
-        # 20% cap the 5c entry is the Trim to Kelly chunk's own id
-        assert data["grid_trim_rise"][0][1][2] is None
-        assert data["grid_trim_rise"][0][1][1][0] == trim[1]
+        # 20% cap the 5c entry is the rebalancing chunk's own id
+        assert data["grid_move"][0][1][2] is None
+        assert data["grid_move"][0][1][1][0] == rebalanced[1]
         snaps = self._run(tmp_path, page, [
-            ["wait"], *self.ON, ["snap", "trim"], *self._rise(1), ["snap", "five"],
+            ["wait"], *self.ON, ["snap", "rebalance"], *self._move(1), ["snap", "five"],
             ["set", "flt-cap", "2"], ["fire", "flt-cap"], ["settle"], ["snap", "null"],
-            *self._rise(3), ["snap", "null 25c"]], strict=True)
-        for name, ci, ri in (("five", 1, 0), ("null", 2, 0), ("null 25c", 2, 2)):
+            *self._move(3), ["snap", "null 25c"]], strict=True)
+        for name, ci, mi in (("five", 1, 0), ("null", 2, 0), ("null 25c", 2, 2)):
             snap = snaps[name]
-            # Nothing was loaded for it (no cap trims nothing, and shows the
-            # page's own chunk): the Trim to Kelly chunk, under the minimum's name
-            assert snap["inflated"] == snaps["trim"]["inflated"], name
-            n = chunks[trim[ci]]["list"]["views"]["all"]["n"]
+            # Nothing was loaded for it (no cap changes nothing, and shows the
+            # page's own chunk): the rebalancing chunk, under the minimum's name
+            assert snap["inflated"] == snaps["rebalance"]["inflated"], name
+            n = chunks[rebalanced[ci]]["list"]["views"]["all"]["n"]
             assert snap["text"]["hdr-trades"] == str(n), name
             assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
-                data["text"], self._scenario(data, 0, 1, ci, ri), False, None, n, n,
-                note="other_run" if ci == 1 else None, trim=True), name
+                data["text"], self._scenario(data, 0, 1, ci, mi), False, None, n, n,
+                note="other_run" if ci == 1 else None, rebalance=True), name
         # It was drawn again all the same (the words changed)
         assert {r["id"] for r in snaps["five"]["reacts"]} == _charts_redrawn()
 
-    def test_a_null_cell_elsewhere_on_the_grid_shows_its_trim_to_kelly_chunk(
+    def test_a_null_cell_elsewhere_on_the_grid_shows_its_rebalance_chunk(
             self, monkeypatch, tmp_path):
-        # k 0.60 trims nothing at any cap: every minimum is the cell's own chunk
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        # k 0.60 changes nothing at any cap: every minimum is the cell's own chunk
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move())
         data = TestFilterPage._data(page)
-        assert data["grid_trim_rise"][0][0] == [None, None, None]
-        assert data["grid_trim"][0][0] == data["grid"][0][0]
+        assert data["grid_move"][0][0] == [None, None, None]
+        assert data["grid_rebalance"][0][0] == data["grid"][0][0]
         snaps = self._run(tmp_path, page, [
             ["wait"], ["set", "flt-k", "0"], ["fire", "flt-k"], ["settle"], ["snap", "plain"],
-            *self.ON, *self._rise(2), ["snap", "rise"]], strict=True)
-        assert snaps["rise"]["inflated"] == snaps["plain"]["inflated"]
-        assert snaps["rise"]["text"]["hdr-trades"] == snaps["plain"]["text"]["hdr-trades"]
-        assert self._scenario(data, 0, 0, 1, 1) in snaps["rise"]["text"]["flt-summary"]
+            *self.ON, *self._move(2), ["snap", "move"]], strict=True)
+        assert snaps["move"]["inflated"] == snaps["plain"]["inflated"]
+        assert snaps["move"]["text"]["hdr-trades"] == snaps["plain"]["text"]["hdr-trades"]
+        assert self._scenario(data, 0, 0, 1, 1) in snaps["move"]["text"]["flt-summary"]
 
-    def test_a_minimum_that_holds_every_trim_back_shows_the_plain_run_s_chunk(
+    def test_a_minimum_that_holds_everything_back_shows_the_plain_run_s_chunk(
             self, monkeypatch, tmp_path):
         # At the 5% cap, 25c holds the one trim back: the run trades the list
-        # of the run without trimming, whose chunk the page already has
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        # of the run without rebalancing, whose chunk the page already has
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        plain, trim = data["grid"][0][1][0], data["grid_trim"][0][1][0]
-        assert data["grid_trim_rise"][0][1][0] == [trim, trim, plain] and plain != trim
+        plain, rebalanced = data["grid"][0][1][0], data["grid_rebalance"][0][1][0]
+        assert data["grid_move"][0][1][0] == [rebalanced, rebalanced, plain]
+        assert plain != rebalanced
         snaps = self._run(tmp_path, page, [
             ["wait"], ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], ["snap", "plain"],
-            *self.ON, ["snap", "trim"], *self._rise(3), ["snap", "rise"]], strict=True)
-        rise = snaps["rise"]
-        assert rise["inflated"] == snaps["trim"]["inflated"] == [
-            *snaps["plain"]["inflated"], f"dash-chunk-{trim}"]
+            *self.ON, ["snap", "rebalance"], *self._move(3), ["snap", "move"]], strict=True)
+        move = snaps["move"]
+        assert move["inflated"] == snaps["rebalance"]["inflated"] == [
+            *snaps["plain"]["inflated"], f"dash-chunk-{rebalanced}"]
         n = chunks[plain]["list"]["views"]["all"]["n"]
-        assert n != chunks[trim]["list"]["views"]["all"]["n"]
-        assert rise["text"]["hdr-trades"] == snaps["plain"]["text"]["hdr-trades"] == str(n)
-        # The line still names the choice: the run was simulated, and trimmed nothing
-        assert rise["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], self._scenario(data, 0, 1, 0, 2), False, None, n, n, trim=True)
+        assert n != chunks[rebalanced]["list"]["views"]["all"]["n"]
+        assert move["text"]["hdr-trades"] == snaps["plain"]["text"]["hdr-trades"] == str(n)
+        # The line still names the choice: the run was simulated, and changed nothing
+        assert move["text"]["flt-summary"] == dashboard._filter_summary_text(
+            data["text"], self._scenario(data, 0, 1, 0, 2), False, None, n, n, rebalance=True)
 
-    def test_trim_to_kelly_off_shows_the_plain_run_and_on_again_the_kept_minimum(
+    def test_rebalance_no_shows_the_plain_run_and_yes_again_the_kept_minimum(
             self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move())
         data = TestFilterPage._data(page)
         snaps = self._run(tmp_path, page, [
-            ["wait"], *self.ON, *self._rise(2), ["snap", "rise"], *self.OFF, ["snap", "off"],
+            ["wait"], *self.ON, *self._move(2), ["snap", "move"], *self.OFF, ["snap", "off"],
             *self.ON, ["snap", "again"]], strict=True)
-        rise, off, again = snaps["rise"], snaps["off"], snaps["again"]
-        # Off: the page as rendered, the select shut with its choice kept
-        assert off["selects"]["flt-rise"] == {**rise["selects"]["flt-rise"], "disabled": True}
-        assert off["selects"]["flt-rise"]["value"] == "2"
+        move, off, again = snaps["move"], snaps["off"], snaps["again"]
+        # No: the page as rendered, the select shut with its choice kept
+        assert off["selects"]["flt-move"] == {**move["selects"]["flt-move"], "disabled": True}
+        assert off["selects"]["flt-move"]["value"] == "2"
         assert off["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], _phrase(data, 0, 1, 1), True, None, 3, 3)
         assert off["text"]["hdr-trades"] == "3"
-        # On again: straight back to the minimum it still names, nothing loaded anew
-        assert again["selects"]["flt-rise"] == rise["selects"]["flt-rise"]
-        assert again["text"]["flt-summary"] == rise["text"]["flt-summary"]
-        assert again["text"]["hdr-trades"] == rise["text"]["hdr-trades"] != "3"
-        assert again["inflated"] == rise["inflated"]
+        # Yes again: straight back to the minimum it still names, nothing loaded anew
+        assert again["selects"]["flt-move"] == move["selects"]["flt-move"]
+        assert again["text"]["flt-summary"] == move["text"]["flt-summary"]
+        assert again["text"]["hdr-trades"] == move["text"]["hdr-trades"] != "3"
+        assert again["inflated"] == move["inflated"]
 
     def test_a_later_choice_supersedes_a_minimum_still_loading(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move())
         data = TestFilterPage._data(page)
-        cid = data["grid_trim_rise"][0][1][1][1]
+        cid = data["grid_move"][0][1][1][1]
         snaps = self._run(tmp_path, page, [
-            ["wait"], *self.ON, *self._rise(2), ["snap", "loading"], *self._rise(1),
+            ["wait"], *self.ON, *self._move(2), ["snap", "loading"], *self._move(1),
             ["snap", "five"], ["resolve", f"dash-chunk-{cid}"], ["snap", "arrived"]],
             strict=True, deferred=(f"dash-chunk-{cid}",))
         assert snaps["loading"]["pending"] == [f"dash-chunk-{cid}"]
@@ -13796,115 +12967,70 @@ class TestTrimRiseScript:
         # The 10c chunk arrives after 5c was chosen: it is not drawn over it
         assert arrived["reacts"] == []
         assert arrived["text"]["flt-summary"] == five["text"]["flt-summary"]
-        assert arrived["selects"]["flt-rise"]["value"] == "1"
-
-    # ─── Adding to held pairs, and the tier floors off ───────────────────────
-
-    def test_with_adding_on_it_reads_the_adding_grid(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(_kc_sweep_add_on()))
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        cid = data["grid_trim_rise_add"][0][1][1][1]
-        assert cid not in (_ao_ids(data["grid"]) | _ao_ids(data["grid_add"])
-                           | _ao_ids(data["grid_trim"]) | _ao_ids(data["grid_trim_add"]))
-        assert cid != data["grid_trim_rise"][0][1][1][1]
-        snaps = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], *self.ON,
-            *self._rise(2), ["snap", "both"], ["set", "flt-add", "off"], ["fire", "flt-add"],
-            ["settle"], ["snap", "alone"]], js="__BAR.push('flt-add');", strict=True)
-        snap = snaps["both"]
-        assert f"dash-chunk-{cid}" in snap["inflated"]
-        scenario = self._scenario(data, 0, 1, 1, 1, add=True)
-        assert scenario.endswith(
-            ", adding to held pairs, trimming to Kelly only after a 10c price move")
-        n = chunks[cid]["list"]["views"]["all"]["n"]
-        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], scenario, False, None, n, n, note="other_run", add_on=True, trim=True)
-        assert snap["text"]["hdr-trades"] == str(n)
-        # Adding off again: the same minimum of the trim-alone scenario
-        alone = data["grid_trim_rise"][0][1][1][1]
-        assert f"dash-chunk-{alone}" in snaps["alone"]["inflated"]
-        assert snaps["alone"]["text"]["hdr-trades"] == str(
-            chunks[alone]["list"]["views"]["all"]["n"])
-        assert snaps["alone"]["selects"]["flt-rise"]["value"] == "2"
+        assert arrived["selects"]["flt-move"]["value"] == "1"
 
     def test_tier_floors_off_reads_the_tier_off_grid(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(_kc_sweep_tiers()))
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move(_kc_sweep_tiers()))
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         # At the band the tiers bind at, 5c is a run of its own; at the other
         # band the off view is its tier-on run, which no minimum changes
-        binding = data["grid_trim_rise_off"][0][1][1][0]
-        assert binding not in _ao_ids(data["grid_trim_off"]) | _ao_ids(data["grid_trim"])
-        assert data["grid_trim_rise_off"][1][1][1] is None
-        plain = data["grid_trim_off"][1][1][1]
+        binding = data["grid_move_off"][0][1][1][0]
+        assert binding not in (_rb_ids(data["grid_rebalance_off"])
+                               | _rb_ids(data["grid_rebalance"]))
+        assert data["grid_move_off"][1][1][1] is None
+        plain = data["grid_rebalance_off"][1][1][1]
         snaps = self._run(tmp_path, page, [
             ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], *self.ON,
-            *self._rise(1), ["snap", "binding"],
+            *self._move(1), ["snap", "binding"],
             ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], ["snap", "plain"]],
             strict=True)
         n = chunks[binding]["list"]["views"]["all"]["n"]
         assert f"dash-chunk-{binding}" in snaps["binding"]["inflated"]
         assert snaps["binding"]["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], self._scenario(data, 0, 1, 1, 0, off=True), False, None, n, n,
-            note="other_run", trim=True)
+            note="other_run", rebalance=True)
         n = chunks[plain]["list"]["views"]["all"]["n"]
         assert snaps["plain"]["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], self._scenario(data, 1, 1, 1, 0, off=True), False, None, n, n,
-            trim=True)
+            rebalance=True)
         assert snaps["plain"]["text"]["hdr-trades"] == str(n)
-
-    def test_with_both_it_reads_the_grid_of_runs_that_do_both(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path,
-                        _kc_sweep_trim_rise(_kc_sweep_add_on(_kc_sweep_tiers())))
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        cid = data["grid_trim_rise_add_off"][0][1][1][0]
-        assert cid not in {data["grid_trim_rise_off"][0][1][1][0],
-                           data["grid_trim_rise_add"][0][1][1][0],
-                           data["grid_trim_add_off"][0][1][1]}
-        snap = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
-            ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"], *self.ON, *self._rise(1),
-            ["snap", "both"]], js="__BAR.push('flt-add');", strict=True)["both"]
-        assert f"dash-chunk-{cid}" in snap["inflated"]
-        n = chunks[cid]["list"]["views"]["all"]["n"]
-        assert snap["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], self._scenario(data, 0, 1, 1, 0, add=True, off=True), False, None,
-            n, n, note="other_run", add_on=True, trim=True)
 
     # ─── A chunk that cannot be loaded, and a restored choice ────────────────
 
     def test_a_chunk_that_cannot_be_loaded_puts_the_choice_back(self, monkeypatch, tmp_path):
-        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        page = TestSaveLiveDefaultsButton._kc(monkeypatch, tmp_path, _kc_sweep_move())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        cid = data["grid_trim_rise"][0][1][1][1]
+        cid = data["grid_move"][0][1][1][1]
         snaps = self._run(tmp_path, page, [
-            ["wait"], *self.ON, ["snap", "trim"], *self._rise(2), ["snap", "bad"],
+            ["wait"], *self.ON, ["snap", "rebalance"], *self._move(2), ["snap", "bad"],
             ["click", "flt-save"], ["snap", "bad click"],
             # ... and from another minimum, back to that one
-            *self._rise(1), ["snap", "five"], *self._rise(3), ["snap", "bad again"],
+            *self._move(1), ["snap", "five"], *self._move(3), ["snap", "bad again"],
             ["click", "flt-save"], ["snap", "again click"],
-            ["repair", f"dash-chunk-{cid}"], *self._rise(2), ["snap", "good"]],
+            ["repair", f"dash-chunk-{cid}"], *self._move(2), ["snap", "good"]],
             strict=True, damaged=(f"dash-chunk-{cid}",))
         reason = f"Error: damaged block dash-chunk-{cid}"
         bad = snaps["bad"]
         # The select goes back to the minimum still shown (any), open, and
         # the line says what could not be shown, in Python's words
-        assert bad["selects"]["flt-rise"]["value"] == "0" and bad["reacts"] == []
-        assert bad["selects"]["flt-rise"]["disabled"] is False
-        assert bad["selects"]["flt-trim"]["value"] == "on"
+        assert bad["selects"]["flt-move"]["value"] == "0" and bad["reacts"] == []
+        assert bad["selects"]["flt-move"]["disabled"] is False
+        assert bad["selects"]["flt-rebalance"]["value"] == "yes"
         assert bad["text"]["flt-summary"] == data["text"]["unavailable"].format(
             failed=self._scenario(data, 0, 1, 1, 1), reason=reason,
             scenario=self._scenario(data, 0, 1, 1))
-        # Save sends the scenario still shown (trimming, any minimum), not the
-        # 10c that failed to load
+        # Save sends the scenario still shown (rebalancing, any minimum), not
+        # the 10c that failed to load
         assert bad["buttons"]["flt-save"] is False
         save = TestSaveLiveDefaultsButton()
         [opened] = snaps["bad click"]["opened"]
         query = save._query(data, opened)
         save._assert_sends(data, query, 0, 1, 1)
-        assert (query["trim_to_kelly"], query["trim_min_rise"]) == ("on", "off")
+        assert (query["add_to_held_pairs"], query["trim_to_kelly"],
+                query["trim_min_rise"]) == ("on", "on", "off")
         # 25c is that same chunk: the choice goes back to 5c, which was shown
         again = snaps["bad again"]
-        assert again["selects"]["flt-rise"]["value"] == "1" and again["reacts"] == []
+        assert again["selects"]["flt-move"]["value"] == "1" and again["reacts"] == []
         assert again["text"]["flt-summary"] == data["text"]["unavailable"].format(
             failed=self._scenario(data, 0, 1, 1, 2), reason=reason,
             scenario=self._scenario(data, 0, 1, 1, 0))
@@ -13917,113 +13043,116 @@ class TestTrimRiseScript:
         assert query["trim_to_kelly"] == "on" and float(query["trim_min_rise"]) == 0.05
         # Repaired, choosing it again works
         good = snaps["good"]
-        assert good["selects"]["flt-rise"]["value"] == "2"
+        assert good["selects"]["flt-move"]["value"] == "2"
         assert good["text"]["hdr-trades"] == str(chunks[cid]["list"]["views"]["all"]["n"])
 
-    def test_a_failed_trim_chunk_shuts_the_select_again(self, monkeypatch, tmp_path):
-        # Trim to Kelly was chosen and its chunk could not be loaded: Trim to
-        # Kelly goes back to off, and the select it had opened shuts with it
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+    def test_a_failed_rebalance_chunk_shuts_the_select_again(self, monkeypatch, tmp_path):
+        # Rebalance yes was chosen and its chunk could not be loaded: Rebalance
+        # goes back to no, and the select it had opened shuts with it
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move())
         data = TestFilterPage._data(page)
-        cid = data["grid_trim"][0][1][1]
+        cid = data["grid_rebalance"][0][1][1]
         snap = self._run(tmp_path, page, [["wait"], *self.ON, ["snap", "back"]],
                          strict=True, damaged=(f"dash-chunk-{cid}",))["back"]
-        assert snap["selects"]["flt-trim"]["value"] == "off"
-        assert snap["selects"]["flt-rise"]["disabled"] is True
-        assert snap["selects"]["flt-rise"]["value"] == "0"
+        assert snap["selects"]["flt-rebalance"]["value"] == "no"
+        assert snap["selects"]["flt-move"]["disabled"] is True
+        assert snap["selects"]["flt-move"]["value"] == "0"
         assert snap["text"]["flt-summary"] == data["text"]["unavailable"].format(
             failed=self._scenario(data, 0, 1, 1),
             reason=f"Error: damaged block dash-chunk-{cid}", scenario=_phrase(data, 0, 1, 1))
 
     def test_a_restored_minimum_is_set_back_to_any(self, monkeypatch, tmp_path):
         # A browser restoring a reader's last choices on reload: both go back
-        # to the page as rendered, and no trimming chunk is loaded
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        # to the page as rendered, and no rebalancing chunk is loaded
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move())
         snaps = self._run(tmp_path, page, [["snap", "loaded"], ["wait"], ["snap", "ready"]],
-                          pre=(("flt-trim", "on"), ("flt-rise", "3")), strict=True)
-        assert snaps["loaded"]["selects"]["flt-rise"]["value"] == "0"
+                          pre=(("flt-rebalance", "yes"), ("flt-move", "3")), strict=True)
+        assert snaps["loaded"]["selects"]["flt-move"]["value"] == "0"
         ready = snaps["ready"]
-        assert ready["selects"]["flt-rise"]["value"] == "0"
-        assert ready["selects"]["flt-rise"]["disabled"] is True
-        assert ready["selects"]["flt-trim"]["value"] == "off"
+        assert ready["selects"]["flt-move"]["value"] == "0"
+        assert ready["selects"]["flt-move"]["disabled"] is True
+        assert ready["selects"]["flt-rebalance"]["value"] == "no"
         assert ready["inflated"] == ["dash-data", "dash-chunk-0"] and ready["reacts"] == []
 
     # ─── A page without the minimums ─────────────────────────────────────────
 
-    @pytest.mark.parametrize("view", ["trim without minimums", "no trim"])
+    @pytest.mark.parametrize("view", ["rebalance without minimums", "no rebalance"])
     def test_a_page_without_the_minimums_keeps_it_shut(self, monkeypatch, tmp_path, view):
-        page = _ao_page(monkeypatch, tmp_path,
-                        _kc_sweep_trim() if view == "trim without minimums" else _kc_sweep())
-        # A page with no Trim to Kelly view never opens flt-trim: not waited on
-        run = self._run if view == "trim without minimums" else _run_script
+        page = _rb_page(monkeypatch, tmp_path,
+                        _kc_sweep_rebalance() if view == "rebalance without minimums"
+                        else _kc_sweep())
+        # A page with no Rebalance view never opens flt-rebalance: not waited on
+        run = self._run if view == "rebalance without minimums" else _run_script
         snaps = run(tmp_path, page, [
-            ["snap", "loaded"], ["wait"], *self.ON, ["snap", "on"], *self._rise(0),
+            ["snap", "loaded"], ["wait"], *self.ON, ["snap", "on"], *self._move(0),
             ["snap", "fired"]], strict=True)
         for name in ("loaded", "on", "fired"):
-            select = snaps[name]["selects"]["flt-rise"]
+            select = snaps[name]["selects"]["flt-move"]
             assert select["disabled"] is True and select["options"] == [["0", "any"]], name
         # A change event on the shut select draws nothing
         assert snaps["fired"]["reacts"] == []
         assert snaps["fired"]["inflated"] == snaps["on"]["inflated"]
         assert "price move" not in snaps["on"]["text"].get("flt-summary", "")
-        assert ("trimming to Kelly" in snaps["on"]["text"].get("flt-summary", "")) is (
-            view == "trim without minimums")
+        assert ("rebalancing" in snaps["on"]["text"].get("flt-summary", "")) is (
+            view == "rebalance without minimums")
 
     # ─── Save and Sell at a minimum ──────────────────────────────────────────
 
     def test_a_save_sends_the_minimum_shown(self, monkeypatch, tmp_path):
         # trim_min_rise is "off" at any, else the minimum in dollars, which the
         # server reads back exactly (also at 5% cap, 25c, the plain run's
-        # chunk). With Trim to Kelly off, both fields are "off", though the
+        # chunk). With Rebalance no, all three fields are "off", though the
         # shut select still names a minimum
         save = TestSaveLiveDefaultsButton()
-        page = save._kc(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        page = save._kc(monkeypatch, tmp_path, _kc_sweep_move())
         data = TestFilterPage._data(page)
-        assert [entry["value"] for entry in data["trim_rises"]] == [0.05, 0.10, 0.25]
+        assert [entry["value"] for entry in data["moves"]] == [0.05, 0.10, 0.25]
         steps = [["wait"], ["snap", "before"], *self.ON, ["click", "flt-save"], ["snap", "0"]]
         for value in (1, 2, 3):
-            steps += [*self._rise(value), ["click", "flt-save"], ["snap", str(value)]]
+            steps += [*self._move(value), ["click", "flt-save"], ["snap", str(value)]]
         steps += [["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], ["click", "flt-save"],
                   ["snap", "plain chunk"], *self.OFF, ["click", "flt-save"], ["snap", "off"]]
         snaps = self._run(tmp_path, page, steps, strict=True)
         assert snaps["before"]["buttons"]["flt-save"] is False
-        # The 25c run at the 5% cap trades the list of the run without trimming
-        assert data["grid_trim_rise"][0][1][0][2] == data["grid"][0][1][0]
+        # The 25c run at the 5% cap trades the list of the run without rebalancing
+        assert data["grid_move"][0][1][0][2] == data["grid"][0][1][0]
         app = defaults_server._App(config.DEFAULTS_SERVER_PORT)
         cases = (("0", 1, True, None), ("1", 1, True, 0.05), ("2", 1, True, 0.10),
                  ("3", 1, True, 0.25), ("plain chunk", 0, True, 0.25), ("off", 0, False, None))
-        for name, ci, trims, rise in cases:
+        for name, ci, yes, move in cases:
             snap = snaps[name]
             assert snap["buttons"]["flt-save"] is False, name
             [opened] = snap["opened"]
             query = save._query(data, opened)
             save._assert_sends(data, query, 0, 1, ci)
-            assert query["trim_to_kelly"] == ("on" if trims else "off"), name
-            if rise is None:
+            assert query["add_to_held_pairs"] == query["trim_to_kelly"] == (
+                "on" if yes else "off"), name
+            if move is None:
                 assert query["trim_min_rise"] == "off", name
             else:
-                assert float(query["trim_min_rise"]) == rise, name
+                assert float(query["trim_min_rise"]) == move, name
             raw = opened["url"].partition("?")[2]
             response = app.handle(defaults_server._Request("GET", f"/confirm?{raw}",
                                                            _SAVE_HOST))
             assert response.status == 200, response.body
             settings, _ = defaults_server._proposal(defaults_server._params(raw), None)
-            assert (settings.trim_to_kelly, settings.trim_min_rise) == (trims, rise), name
-        # Trimming off: the shut select still names 25c, and the address none
-        assert snaps["off"]["selects"]["flt-rise"] == {
-            **snaps["off"]["selects"]["flt-rise"], "value": "3", "disabled": True}
+            assert (settings.add_to_held_pairs, settings.trim_to_kelly,
+                    settings.trim_min_rise) == (yes, yes, move), name
+        # Rebalance no: the shut select still names 25c, and the address none
+        assert snaps["off"]["selects"]["flt-move"] == {
+            **snaps["off"]["selects"]["flt-move"], "value": "3", "disabled": True}
 
     def test_a_minimum_the_page_never_simulated_cannot_be_saved(self, monkeypatch, tmp_path):
-        # No trim runs with the tier floors off: there, at a band the tiers
-        # bind at, Save stays shut; with the tiers on, the same minimum saves
-        sweep = _kc_sweep_trim_rise(_kc_sweep_tiers())
-        sweep.trim_sweep.off_bands = ()
+        # No rebalancing runs with the tier floors off: there, at a band the
+        # tiers bind at, Save stays shut; with the tiers on, the same minimum saves
+        sweep = _kc_sweep_move(_kc_sweep_tiers())
+        sweep.rebalance_sweep.off_bands = ()
         save = TestSaveLiveDefaultsButton()
         page = save._kc(monkeypatch, tmp_path, sweep)
         data = TestFilterPage._data(page)
         snaps = self._run(tmp_path, page, [
             ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"], *self.ON,
-            *self._rise(2), ["click", "flt-save"], ["snap", "missing"],
+            *self._move(2), ["click", "flt-save"], ["snap", "missing"],
             ["set", "flt-tier", "on"], ["fire", "flt-tier"], ["settle"],
             ["click", "flt-save"], ["snap", "back"]], strict=True)
         missing = snaps["missing"]
@@ -14032,403 +13161,611 @@ class TestTrimRiseScript:
         assert missing["buttons"]["flt-save"] is True and missing["opened"] == []
         back = snaps["back"]
         assert back["buttons"]["flt-save"] is False
-        assert back["selects"]["flt-rise"]["value"] == "2"
+        assert back["selects"]["flt-move"]["value"] == "2"
         [opened] = back["opened"]
         query = save._query(data, opened)
         save._assert_sends(data, query, 0, 1, 1)
         assert query["trim_to_kelly"] == "on" and float(query["trim_min_rise"]) == 0.10
 
     def test_sell_stays_shut_at_a_minimum(self, monkeypatch, tmp_path):
-        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(_kc_sweep_sell()))
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_move(_kc_sweep_sell()))
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        cid = data["grid_trim_rise"][0][1][1][1]
+        cid = data["grid_move"][0][1][1][1]
         snaps = _run_script(tmp_path, page, [
             ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
-            ["snap", "level"], *self.ON, *self._rise(2), ["snap", "rise"], *self.OFF,
+            ["snap", "level"], *self.ON, *self._move(2), ["snap", "move"], *self.OFF,
             ["snap", "off"]],
             setup_js=self.WAIT + "__BAR.push('flt-sell');", files_root=tmp_path, strict=True)
         assert snaps["level"]["selects"]["flt-sell"]["value"] == "0"
-        rise = snaps["rise"]
+        move = snaps["move"]
         # Sell is at no selling, and it and Min. days are shut; the minimum is open
-        assert rise["selects"]["flt-sell"]["value"] == "none"
-        assert rise["selects"]["flt-sell"]["disabled"] is True
-        assert rise["selects"]["flt-days"]["disabled"] is True
-        assert rise["selects"]["flt-rise"]["disabled"] is False
+        assert move["selects"]["flt-sell"]["value"] == "none"
+        assert move["selects"]["flt-sell"]["disabled"] is True
+        assert move["selects"]["flt-days"]["disabled"] is True
+        assert move["selects"]["flt-move"]["disabled"] is False
         # The scenario drawn is the minimum's, with no sale in its words
-        assert f"dash-chunk-{cid}" in rise["inflated"] and rise["files"] == snaps["level"]["files"]
+        assert f"dash-chunk-{cid}" in move["inflated"] and move["files"] == snaps["level"]["files"]
         n = chunks[cid]["list"]["views"]["all"]["n"]
-        assert rise["text"]["flt-summary"] == dashboard._filter_summary_text(
+        assert move["text"]["flt-summary"] == dashboard._filter_summary_text(
             data["text"], self._scenario(data, 0, 1, 1, 1), False, None, n, n,
-            note="other_run", trim=True)
-        assert data["text"]["sell_note"] not in rise["text"]["flt-summary"]
-        # Trimming off: Sell opens again and the minimum shuts
+            note="other_run", rebalance=True)
+        assert data["text"]["sell_note"] not in move["text"]["flt-summary"]
+        # Rebalance no: Sell opens again and the minimum shuts
         off = snaps["off"]["selects"]
         assert off["flt-sell"]["value"] == "none" and off["flt-sell"]["disabled"] is False
-        assert off["flt-rise"]["disabled"] is True
+        assert off["flt-move"]["disabled"] is True
 
     # ─── The explorer ────────────────────────────────────────────────────────
 
     def test_the_bar_s_call_to_the_explorer_keeps_its_four_arguments(
             self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise())
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move())
         data = TestFilterPage._data(page)
         spy = ("window.dashScenarioSelect = function() { var el = document.getElementById("
                "'__spy'); var seen = el.textContent ? JSON.parse(el.textContent) : []; "
                "seen.push(Array.prototype.slice.call(arguments)); "
                "el.textContent = JSON.stringify(seen); };")
-        snaps = self._run(tmp_path, page, [["wait"], *self.ON, *self._rise(2), *self.OFF,
+        snaps = self._run(tmp_path, page, [["wait"], *self.ON, *self._move(2), *self.OFF,
                                            ["snap", "s"]], js=spy)
         calls = json.loads(snaps["s"]["text"]["__spy"])
         labels = [data["bands"][0]["label"], data["ks"][1]["label"], data["caps"][1]["label"],
                   "on"]
-        # One call per redraw, none of them naming trimming or the minimum
+        # One call per redraw, none of them naming Rebalance or the minimum
         assert calls == [labels, labels, labels]
         [call] = re.findall(r"window\.dashScenarioSelect\(([^;]*)\);", dashboard._FILTER_JS)
         assert len(re.split(r",\s*(?![^\[]*\])", call)) == 4
-        assert "SHOWN[9]" not in call and "SHOWN[10]" not in call
+        assert "SHOWN[6]" not in call and "SHOWN[9]" not in call
 
     def test_the_explorer_s_selects_never_move_on_a_minimum_change(self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(_ex_sweep_tiers()))
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move(_ex_sweep_tiers()))
         snaps = self._run(tmp_path, page, [
-            ["wait"], ["snap", "before"], *self.ON, ["snap", "on"], *self._rise(2),
-            ["snap", "rise"]], strict=True, explorer=True)
-        before, on, rise = snaps["before"], snaps["on"], snaps["rise"]
-        assert _scn_values(rise) == _scn_values(on) == _scn_values(before)
-        for snap in (on, rise):
+            ["wait"], ["snap", "before"], *self.ON, ["snap", "on"], *self._move(2),
+            ["snap", "move"]], strict=True, explorer=True)
+        before, on, move = snaps["before"], snaps["on"], snaps["move"]
+        assert _scn_values(move) == _scn_values(on) == _scn_values(before)
+        for snap in (on, move):
             assert _explorer_calls(snap) == []
-        assert rise["selects"]["flt-rise"]["value"] == "2"
-        assert "only after a 10c price move" in rise["text"]["flt-summary"]
+        assert move["selects"]["flt-move"]["value"] == "2"
+        assert "only after a 10c price move" in move["text"]["flt-summary"]
 
-    def test_a_null_cell_of_a_trimmed_scenario_shows_its_trim_chunk(self, monkeypatch,
-                                                                     tmp_path):
-        # No minimum changes this scenario's run, and its Trim to Kelly run
-        # is not the plain run: every minimum shows the Trim to Kelly chunk
-        page = _ao_page(monkeypatch, tmp_path, _kc_sweep_trim_rise(scripted=False))
+    def test_a_null_cell_of_a_rebalanced_scenario_shows_its_rebalance_chunk(
+            self, monkeypatch, tmp_path):
+        # No minimum changes this scenario's run, and its rebalancing run is
+        # not the plain run: every minimum shows the rebalancing chunk
+        page = _rb_page(monkeypatch, tmp_path, _kc_sweep_move(scripted=False))
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        plain, trim = data["grid"][0][1][0], data["grid_trim"][0][1][0]
-        assert data["grid_trim_rise"][0][1][0] is None and plain != trim
-        n_plain, n_trim = (chunks[cid]["list"]["views"]["all"]["n"] for cid in (plain, trim))
-        assert n_plain != n_trim
+        plain, rebalanced = data["grid"][0][1][0], data["grid_rebalance"][0][1][0]
+        assert data["grid_move"][0][1][0] is None and plain != rebalanced
+        n_plain, n_rebalanced = (chunks[cid]["list"]["views"]["all"]["n"]
+                                 for cid in (plain, rebalanced))
+        assert n_plain != n_rebalanced
         snap = self._run(tmp_path, page, [
             ["wait"], ["set", "flt-cap", "0"], ["fire", "flt-cap"], ["settle"], *self.ON,
-            *self._rise(2), ["snap", "s"]], strict=True)["s"]
-        assert snap["text"]["hdr-trades"] == str(n_trim)
+            *self._move(2), ["snap", "s"]], strict=True)["s"]
+        assert snap["text"]["hdr-trades"] == str(n_rebalanced)
 
     def test_with_the_tiers_off_it_draws_a_non_binding_band_s_tier_on_minimum(
             self, monkeypatch, tmp_path):
-        page = _ao_page(monkeypatch, tmp_path, TestTrimRiseView._non_binding_sweep())
+        page = _rb_page(monkeypatch, tmp_path, TestMoveView._non_binding_sweep())
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        cell = data["grid_trim_rise_off"][1][1][1]
+        cell = data["grid_move_off"][1][1][1]
         assert cell is not None
-        own, trim = cell[2], data["grid_trim_off"][1][1][1]
-        n_own, n_trim = (chunks[cid]["list"]["views"]["all"]["n"] for cid in (own, trim))
-        assert own != trim and n_own != n_trim
+        own, rebalanced = cell[2], data["grid_rebalance_off"][1][1][1]
+        n_own, n_rebalanced = (chunks[cid]["list"]["views"]["all"]["n"]
+                               for cid in (own, rebalanced))
+        assert own != rebalanced and n_own != n_rebalanced
         snaps = self._run(tmp_path, page, [
             ["wait"], ["set", "flt-tier", "off"], ["fire", "flt-tier"], ["settle"],
             ["set", "flt-band", "1"], ["fire", "flt-band"], ["settle"], *self.ON,
-            ["snap", "trim"], *self._rise(3), ["snap", "rise"]], strict=True)
-        assert snaps["trim"]["text"]["hdr-trades"] == str(n_trim)
-        assert snaps["rise"]["text"]["hdr-trades"] == str(n_own)
-        assert f"dash-chunk-{own}" in snaps["rise"]["inflated"]
+            ["snap", "rebalance"], *self._move(3), ["snap", "move"]], strict=True)
+        assert snaps["rebalance"]["text"]["hdr-trades"] == str(n_rebalanced)
+        assert snaps["move"]["text"]["hdr-trades"] == str(n_own)
+        assert f"dash-chunk-{own}" in snaps["move"]["inflated"]
 
 
-class TestTrimEndToEnd:
-    """Real size-cap, add-on and trim sweeps over the backtester's trimming
-    fixture (TestTrimCapSweep's: a pair that outgrows its size cap, beside two
-    others), rendered through generate_dashboard: every cap's chunk, with
-    adding to held pairs off and on, is the scenario a fresh simulation that
-    trims at that cap produces, figure for figure."""
+class TestRebalanceEndToEnd:
+    """A real Rebalance family, rendered through generate_dashboard. With the
+    tier floors on it rebalances over the backtester's trimming fixture
+    (TestTrimCapSweep's: at k 0.75 a pair is trimmed after rises of 25c and
+    then 8c at the lowest caps and never at the higher ones); with them off,
+    over TestMoveGrid's add-on pair (added to on its second Monday after a
+    10c fall). The gate: at every cap, and at every minimum price movement,
+    the chunk the page names is the scenario a fresh simulation that adds and
+    trims at that cap and minimum produces, figure for figure, in both
+    settings; and the selects draw those chunks."""
 
-    def test_real_trim_sweeps_page_every_cap_at_its_own_simulation(
-            self, monkeypatch, tmp_path):
+    _MOVES = (0.05, 0.10, 0.25, 0.30, 0.35)
+
+    @classmethod
+    def _page(cls, monkeypatch, tmp_path, *, min_moves=_MOVES):
+        """generate_dashboard over a real Rebalance family with both settings.
+
+        Returns:
+            tuple: (page, fresh), where fresh(cap, off, **options) simulates
+                the setting's entries afresh at that cap (off: tier floors off).
+        """
         fixture = _tb.TestTrimCapSweep()
-        entries = fixture._entries()
+        on_entries, off_entries = fixture._entries(), _tb.TestMoveGrid._add_on_entries()
         band, k, start, end = fixture._BAND, 0.75, fixture._START, fixture._END
         caps = backtester.SIZE_CAP_SWEEP
 
-        def fresh(cap, **options):
+        def fresh(cap, off=False, **options):
             return backtester._simulate_at_discount(
-                entries, start, 10_000.0, k=k, spread_band=band, size_cap=cap, quiet=True,
-                end_date=end, **options)
+                off_entries if off else on_entries, start, 10_000.0, k=k, spread_band=band,
+                size_cap=cap, quiet=True, end_date=end, tier_floors=not off, **options)
 
-        primary = fresh(0.20)
+        primary, off_primary = fresh(0.20), fresh(0.20, off=True)
+        assert off_primary.tier_floors is False
         axes = {"caps": caps, "primary_cap": 0.20, "bands": (band,), "ks": (k,),
                 "primary_k": k, "start_date": start, "initial_balance": 10_000.0}
-        lazy = {**axes, "split_date": None, "checks": False,
-                "entries_by_band": {band: entries}, "st_entries": []}
+        lazy = {**axes, "split_date": None, "checks": False, "st_entries": []}
         days = {(band, k, "all"): end}
         run = BacktestSweep(
             primary=primary, points=[primary], calibration=None, scenarios=[primary],
             calibrations_by_band={band: None}, same_event_ladders=True,
-            cap_sweep=backtester.CapSweep(**lazy, eager={(band, k, "all"): primary}),
-            add_on_cap_sweep=backtester.CapSweep(**lazy, eager={}, add_to_held=True,
-                                                 end_dates=days),
-            trim_sweep=backtester.TrimSweep(
-                **axes, off_bands=(), entries_by_band={band: entries},
-                off_entries_by_band={}, end_dates=days, off_end_dates={}))
+            tier_off_scenarios=[off_primary], tier_off_calibrations_by_band={band: None},
+            cap_sweep=backtester.CapSweep(**lazy, entries_by_band={band: on_entries},
+                                          eager={(band, k, "all"): primary}),
+            tier_off_cap_sweep=backtester.CapSweep(
+                **lazy, entries_by_band={band: off_entries}, tier_floors=False,
+                eager={(band, k, "all"): off_primary}),
+            rebalance_sweep=backtester.RebalanceSweep(
+                **axes, off_bands=(band,), entries_by_band={band: on_entries},
+                off_entries_by_band={band: off_entries}, end_dates=days, off_end_dates=days,
+                min_moves=tuple(min_moves)))
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
         page = dashboard.generate_dashboard(
             primary.trades, primary.equity_df, start, 10_000.0,
             sweep=run).read_text(encoding="utf-8")
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        assert data["trim_state"] == "shown" and data["add_state"] == "shown"
-        assert [c["value"] for c in data["caps"]] == list(caps) and len(caps) == 20
-        trimmed = {False: 0, True: 0}
-        for add, key in ((False, "grid_trim"), (True, "grid_trim_add")):
-            assert data[key] is not None
-            for ci, cap in enumerate(caps):
-                point = fresh(cap, add_to_held=add, trim_to_kelly=True)
-                view = chunks[data[key][0][0][ci]]["list"]["views"]["all"]
-                kpis = dashboard._performance_kpis(point.equity_df, point.trades, 10_000.0)
-                assert view["kpi"] == {name: value for name, _, value, _ in kpis}, (add, cap)
-                assert view["n"] == len(point.trades), (add, cap)
-                trimmed[add] += any(t.sold for t in point.trades)
-        # Not vacuous: at some caps a pair was trimmed, in both halves, and at
-        # others nothing was, so those scenarios share the chunk of the run
-        # without trimming
-        assert 0 < trimmed[False] < len(caps) and 0 < trimmed[True] < len(caps)
-        for with_trim, without in (("grid_trim", "grid"), ("grid_trim_add", "grid_add")):
-            pairs = list(zip(data[with_trim][0][0], data[without][0][0], strict=True))
-            assert any(a != b for a, b in pairs) and any(a == b for a, b in pairs)
-        # The select is there to reach them
-        assert 'id="flt-trim" disabled' in page and 'id="flt-trim-note"' not in page
+        return page, fresh
 
+    @staticmethod
+    def _same(view: dict, point) -> None:
+        """Assert a chunk's whole-run view is the point's run, figure for figure."""
+        kpis = dashboard._performance_kpis(point.equity_df, point.trades, 10_000.0)
+        assert view["kpi"] == {name: value for name, _, value, _ in kpis}
+        assert view["n"] == len(point.trades)
 
-class TestTrimRiseEndToEnd:
-    """A real Trim to Kelly family that carries minimum price rises, over the
-    backtester's trimming fixture (TestTrimCapSweep's: at k 0.75 a pair is
-    trimmed after rises of 25c and then 8c at the lowest caps, and never at
-    the higher ones), rendered through generate_dashboard: at every minimum
-    and cap, with adding to held pairs off and on, the chunk the page names
-    is the scenario a fresh simulation that trims only after that rise
-    produces, figure for figure."""
-
-    _RISES = (0.05, 0.10, 0.25, 0.30, 0.35)
-
-    def test_real_minimums_page_every_cap_at_its_own_simulation(
-            self, monkeypatch, tmp_path, caplog):
-        fixture = _tb.TestTrimCapSweep()
-        entries = fixture._entries()
-        band, k, start, end = fixture._BAND, 0.75, fixture._START, fixture._END
-        caps = backtester.SIZE_CAP_SWEEP
-
-        def fresh(cap, **options):
-            return backtester._simulate_at_discount(
-                entries, start, 10_000.0, k=k, spread_band=band, size_cap=cap, quiet=True,
-                end_date=end, **options)
-
-        primary = fresh(0.20)
-        axes = {"caps": caps, "primary_cap": 0.20, "bands": (band,), "ks": (k,),
-                "primary_k": k, "start_date": start, "initial_balance": 10_000.0}
-        lazy = {**axes, "split_date": None, "checks": False,
-                "entries_by_band": {band: entries}, "st_entries": []}
-        days = {(band, k, "all"): end}
-        run = BacktestSweep(
-            primary=primary, points=[primary], calibration=None, scenarios=[primary],
-            calibrations_by_band={band: None}, same_event_ladders=True,
-            cap_sweep=backtester.CapSweep(**lazy, eager={(band, k, "all"): primary}),
-            add_on_cap_sweep=backtester.CapSweep(**lazy, eager={}, add_to_held=True,
-                                                 end_dates=days),
-            trim_sweep=backtester.TrimSweep(
-                **axes, off_bands=(), entries_by_band={band: entries},
-                off_entries_by_band={}, end_dates=days, off_end_dates={},
-                min_rises=self._RISES))
-        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(dashboard.yf, "download",
-                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+    def test_every_minimum_and_cap_is_its_own_simulation(self, monkeypatch, tmp_path, caplog):
         with caplog.at_level(logging.INFO):
-            page = dashboard.generate_dashboard(
-                primary.trades, primary.equity_df, start, 10_000.0,
-                sweep=run).read_text(encoding="utf-8")
+            page, fresh = self._page(monkeypatch, tmp_path)
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        assert data["trim_state"] == "shown" and data["trim_rise_state"] == "shown"
-        assert [entry["value"] for entry in data["trim_rises"]] == list(self._RISES)
-        assert [entry["label"] for entry in data["trim_rises"]] == [
-            "5c", "10c", "25c", "30c", "35c"]
+        caps = backtester.SIZE_CAP_SWEEP
+        assert data["rebalance_state"] == "shown" and data["move_state"] == "shown"
+        assert [entry["value"] for entry in data["moves"]] == list(self._MOVES)
+        assert [entry["label"] for entry in data["moves"]] == ["5c", "10c", "25c", "30c", "35c"]
         assert [c["value"] for c in data["caps"]] == list(caps) and len(caps) == 20
-        assert fresh(caps[0], trim_to_kelly=True).trim_rises == pytest.approx((0.25, 0.08))
-        for add, plain_key, trim_key, rise_key in (
-                (False, "grid", "grid_trim", "grid_trim_rise"),
-                (True, "grid_add", "grid_trim_add", "grid_trim_rise_add")):
-            assert data[trim_key] is not None and data[rise_key] is not None
+        assert data["tier_binds"] == [True]
+        # Every rebalancing simulation adds and trims together
+        assert fresh(caps[0], add_to_held=True, trim_to_kelly=True).moves == pytest.approx(
+            (0.25, 0.08))
+        for off, plain_key, rebalance_key, move_key in (
+                (False, "grid", "grid_rebalance", "grid_move"),
+                (True, "grid_off", "grid_rebalance_off", "grid_move_off")):
+            assert data[rebalance_key] is not None and data[move_key] is not None
             kinds: Counter = Counter()
             for ci, cap in enumerate(caps):
-                # A null cell: every minimum shows the Trim to Kelly chunk
-                own, cell = data[trim_key][0][0][ci], data[rise_key][0][0][ci]
-                assert cell is None or len(cell) == len(self._RISES)
+                own, cell = data[rebalance_key][0][0][ci], data[move_key][0][0][ci]
+                self._same(chunks[own]["list"]["views"]["all"],
+                           fresh(cap, off, add_to_held=True, trim_to_kelly=True))
+                assert cell is None or len(cell) == len(self._MOVES)
                 kinds["nothing differs"] += cell is None
-                if cell is not None:
-                    # No trim follows a 35c rise here: the scenario's own
-                    # chunk without trimming, with nothing packed for it
-                    assert cell[-1] == data[plain_key][0][0][ci] != own
-                for ri, rise in enumerate(self._RISES):
-                    cid = own if cell is None else cell[ri]
-                    point = fresh(cap, add_to_held=add, trim_to_kelly=True, trim_min_rise=rise)
-                    view = chunks[cid]["list"]["views"]["all"]
-                    kpis = dashboard._performance_kpis(point.equity_df, point.trades, 10_000.0)
-                    assert view["kpi"] == {name: value for name, _, value, _ in kpis}, (
-                        add, cap, rise)
-                    assert view["n"] == len(point.trades), (add, cap, rise)
+                for mi, move in enumerate(self._MOVES):
+                    cid = own if cell is None else cell[mi]
+                    point = fresh(cap, off, add_to_held=True, trim_to_kelly=True,
+                                  min_move=move)
+                    self._same(chunks[cid]["list"]["views"]["all"], point)
                     if cell is not None:
-                        kinds["the Trim to Kelly chunk" if cid == own else
-                              "another minimum's chunk" if cid in cell[:ri] else
+                        kinds["the Rebalance chunk" if cid == own else
+                              "the plain run's chunk" if cid == data[plain_key][0][0][ci] else
+                              "another minimum's chunk" if cid in cell[:mi] else
                               "a chunk of its own"] += 1
-            # Not vacuous: caps where no minimum changes the run, and, where
-            # one does, minimums that still show the Trim to Kelly chunk, that
-            # repeat a smaller minimum's run and that are a run of their own
-            for kind in ("nothing differs", "the Trim to Kelly chunk",
-                         "another minimum's chunk", "a chunk of its own"):
-                assert kinds[kind] > 0, (add, kind, kinds)
-        # The walk read each family's one cell once, from the Trim to Kelly run
-        # it already had: every (minimum, cap) was simulated, shared across
-        # caps, or the same run as a lower minimum, and nothing else was run
+            # Not vacuous: minimums that still show the Rebalance chunk, that
+            # repeat a smaller minimum's run, that are a run of their own and
+            # that hold every add-on and trim back (the run without
+            # rebalancing, whose chunk the page already has); and, with the
+            # tiers on, caps where no minimum changes the run (the add-on
+            # pair's first add-on follows a 10c fall at every cap)
+            for kind in ("the Rebalance chunk", "another minimum's chunk",
+                         "a chunk of its own", "the plain run's chunk"):
+                assert kinds[kind] > 0, (off, kind, kinds)
+            assert (kinds["nothing differs"] > 0) is (not off), kinds
+        # The two settings are two families of runs
+        assert data["grid_move"] != data["grid_move_off"]
+        # The walk read each setting's one cell once, from the Rebalance run it
+        # already had: every (minimum, cap) was simulated, shared across caps,
+        # or the same run as a lower minimum, and nothing else was run
         counted = [re.search(r"\((\d+) cap points simulated, (\d+) shared across caps, "
-                             r"(\d+) the same run as a lower minimum or none so far\)", r.getMessage())
+                             r"(\d+) the same run as a lower minimum or none so far\)",
+                             r.getMessage())
                    for r in caplog.records
-                   if "read from the Trim to Kelly minimum price rises" in r.getMessage()]
+                   if "read from the Rebalance minimum price movements" in r.getMessage()]
         assert len(counted) == 2
         for match in counted:
             simulated, shared, same = map(int, match.groups())
             assert simulated > 0 and same > 0
-            assert simulated + shared + same == len(self._RISES) * len(caps)
+            assert simulated + shared + same == len(self._MOVES) * len(caps)
+        # The selects are there to reach them
+        assert 'id="flt-rebalance" disabled' in page and 'id="flt-rebalance-note"' not in page
+        assert 'id="flt-move" disabled' in page and 'id="flt-move-note"' not in page
+
+    def test_a_family_without_minimums_still_pages_every_cap(self, monkeypatch, tmp_path):
+        page, fresh = self._page(monkeypatch, tmp_path, min_moves=())
+        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
+        assert data["rebalance_state"] == "shown" and data["move_state"] == "not simulated"
+        assert data["grid_move"] is None and data["moves"] == []
+        rebalanced = {False: 0, True: 0}
+        for off, key in ((False, "grid_rebalance"), (True, "grid_rebalance_off")):
+            for ci, cap in enumerate(backtester.SIZE_CAP_SWEEP):
+                point = fresh(cap, off, add_to_held=True, trim_to_kelly=True)
+                self._same(chunks[data[key][0][0][ci]]["list"]["views"]["all"], point)
+                rebalanced[off] += any(t.sold or t.add_on for t in point.trades)
+        # Not vacuous: something was added to or trimmed in both settings
+        assert rebalanced[False] > 0 and rebalanced[True] > 0
+        assert 'id="flt-move-note"' in page
 
     def test_the_selects_draw_each_minimum_s_own_simulation(self, monkeypatch, tmp_path):
-        # The same real page, driven through its script: Trim to Kelly on,
-        # then a size cap and a minimum of each kind of cell. What is drawn is
-        # the chunk the base block's grids name, and that chunk is the run a
-        # fresh simulation at that cap and minimum produces. Skipped without
-        # a JavaScript runtime.
-        fixture = _tb.TestTrimCapSweep()
-        entries = fixture._entries()
-        band, k, start, end = fixture._BAND, 0.75, fixture._START, fixture._END
-        caps = backtester.SIZE_CAP_SWEEP
-
-        def fresh(cap, **options):
-            return backtester._simulate_at_discount(
-                entries, start, 10_000.0, k=k, spread_band=band, size_cap=cap, quiet=True,
-                end_date=end, **options)
-
-        primary = fresh(0.20)
-        axes = {"caps": caps, "primary_cap": 0.20, "bands": (band,), "ks": (k,),
-                "primary_k": k, "start_date": start, "initial_balance": 10_000.0}
-        lazy = {**axes, "split_date": None, "checks": False,
-                "entries_by_band": {band: entries}, "st_entries": []}
-        days = {(band, k, "all"): end}
-        run = BacktestSweep(
-            primary=primary, points=[primary], calibration=None, scenarios=[primary],
-            calibrations_by_band={band: None}, same_event_ladders=True,
-            cap_sweep=backtester.CapSweep(**lazy, eager={(band, k, "all"): primary}),
-            trim_sweep=backtester.TrimSweep(
-                **axes, off_bands=(), entries_by_band={band: entries},
-                off_entries_by_band={}, end_dates=days, off_end_dates={},
-                min_rises=self._RISES))
-        monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(dashboard.yf, "download",
-                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
-        page = dashboard.generate_dashboard(
-            primary.trades, primary.equity_df, start, 10_000.0,
-            sweep=run).read_text(encoding="utf-8")
+        # The same real page, driven through its script: Rebalance yes, then
+        # a size cap and a minimum of each kind of cell, tier floors on, and
+        # one of each with them off. What is drawn is the chunk the base
+        # block's grids name, and that chunk is the run a fresh simulation at
+        # that cap and minimum produces. Skipped without a JavaScript runtime.
+        page, fresh = self._page(monkeypatch, tmp_path)
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        plain, trim, rises = (data[key][0][0] for key in ("grid", "grid_trim", "grid_trim_rise"))
-        # One (cap, minimum) of each kind of cell the page holds
-        picks: dict[str, tuple[int, int]] = {}
-        for ci, cell in enumerate(rises):
-            if cell is None:
-                # No minimum changes this cap's run: the cell is null
-                picks.setdefault("a null cell", (ci, 1))
-                continue
-            for ri, cid in enumerate(cell):
-                picks.setdefault(
-                    "the Trim to Kelly chunk" if cid == trim[ci] else
-                    "the plain run's chunk" if cid == plain[ci] else
-                    "another minimum's chunk" if cid in cell[:ri] else
-                    "a chunk of its own", (ci, ri))
-        assert set(picks) == {"a null cell", "the Trim to Kelly chunk", "the plain run's chunk",
-                              "another minimum's chunk", "a chunk of its own"}
-        steps = [["wait"], *TestTrimScript.ON]
-        for kind, (ci, ri) in picks.items():
-            steps += [["set", "flt-cap", str(ci)], ["fire", "flt-cap"], ["settle"],
-                      ["set", "flt-rise", str(ri + 1)], ["fire", "flt-rise"], ["settle"],
+        picks: dict[str, tuple[bool, int, int]] = {}
+        for off, plain_key, rebalance_key, move_key in (
+                (False, "grid", "grid_rebalance", "grid_move"),
+                (True, "grid_off", "grid_rebalance_off", "grid_move_off")):
+            plain, own, moves = (data[key][0][0] for key in (plain_key, rebalance_key, move_key))
+            for ci, cell in enumerate(moves):
+                if cell is None:
+                    # No minimum changes this cap's run: the cell is null
+                    picks.setdefault(f"a null cell, off {off}", (off, ci, 1))
+                    continue
+                for mi, cid in enumerate(cell):
+                    picks.setdefault(
+                        ("the Rebalance chunk" if cid == own[ci] else
+                         "the plain run's chunk" if cid == plain[ci] else
+                         "another minimum's chunk" if cid in cell[:mi] else
+                         "a chunk of its own") + f", off {off}", (off, ci, mi))
+        for off in (False, True):
+            for kind in ("the Rebalance chunk", "the plain run's chunk",
+                         "another minimum's chunk", "a chunk of its own"):
+                assert f"{kind}, off {off}" in picks, picks
+        assert "a null cell, off False" in picks, picks
+        steps = [["wait"], *TestRebalanceScript.ON]
+        for kind, (off, ci, mi) in picks.items():
+            steps += [["set", "flt-tier", "off" if off else "on"], ["fire", "flt-tier"],
+                      ["settle"], ["set", "flt-cap", str(ci)], ["fire", "flt-cap"], ["settle"],
+                      ["set", "flt-move", str(mi + 1)], ["fire", "flt-move"], ["settle"],
                       ["snap", kind]]
-        snaps = _run_script(tmp_path, page, steps, setup_js=TestTrimScript.WAIT, strict=True)
-        for kind, (ci, ri) in picks.items():
+        snaps = _run_script(tmp_path, page, steps, setup_js=TestRebalanceScript.WAIT,
+                            strict=True)
+        for kind, (off, ci, mi) in picks.items():
             snap = snaps[kind]
-            cid = trim[ci] if rises[ci] is None else rises[ci][ri]
+            rebalance_key, move_key = (("grid_rebalance_off", "grid_move_off") if off
+                                       else ("grid_rebalance", "grid_move"))
+            cell = data[move_key][0][0][ci]
+            cid = data[rebalance_key][0][0][ci] if cell is None else cell[mi]
             view = chunks[cid]["list"]["views"]["all"]
-            point = fresh(caps[ci], trim_to_kelly=True, trim_min_rise=self._RISES[ri])
+            point = fresh(backtester.SIZE_CAP_SWEEP[ci], off, add_to_held=True,
+                          trim_to_kelly=True, min_move=self._MOVES[mi])
             # The selects name the pick, and the chunk the grids resolve it to is drawn
+            assert snap["selects"]["flt-tier"]["value"] == ("off" if off else "on"), kind
             assert snap["selects"]["flt-cap"]["value"] == str(ci), kind
-            assert snap["selects"]["flt-rise"]["value"] == str(ri + 1), kind
+            assert snap["selects"]["flt-move"]["value"] == str(mi + 1), kind
             assert _last_react(snap, "risk-kelly")["data"][0]["x"] == pytest.approx(
                 chunks[cid]["list"]["kx"]), kind
             assert {key: snap["text"][f"kpi-{key}"] for key in view["kpi"]} == view["kpi"], kind
-            assert data["trim_rises"][ri]["phrase"] in snap["text"]["flt-summary"], kind
+            assert data["moves"][mi]["phrase"] in snap["text"]["flt-summary"], kind
             # ... which is that cap's run at that minimum, simulated afresh
             assert snap["text"]["hdr-trades"] == str(view["n"]) == str(len(point.trades)), kind
-            kpis = dashboard._performance_kpis(point.equity_df, point.trades, 10_000.0)
-            assert view["kpi"] == {name: value for name, _, value, _ in kpis}, kind
+            self._same(view, point)
         # Not vacuous: the picks do not all draw one trade count
         assert len({snaps[kind]["text"]["hdr-trades"] for kind in picks}) > 1
 
-    def test_where_adding_changes_the_rises_each_half_is_its_own_simulation(
+
+class TestLiveRebalanceRule:
+    """The page when the saved live defaults add to held pairs or trim them:
+    a grey note by the save button on a page with the Rebalance view (saving
+    with Rebalance no turns both off), and the header line naming the choices
+    that show the rebalancing, or why the page cannot (one of the two alone,
+    no Rebalance view, or rebalancing with selling)."""
+
+    _ADD = "; the live defaults add to held pairs, which this run's primary does not"
+    _TRIM = "; the live defaults trim to Kelly, which this run's primary does not"
+    _TRIM_10C = ("; the live defaults trim to Kelly (only after a 10c price move), which this "
+                 "run's primary does not")
+    _SHOWN = (' — choose Rebalance yes and Min. price movement "{}" in the filter bar to '
+              "see it")
+    _NO_VIEW = " — this page has no Rebalance view"
+    _NO_MOVE = " — this page cannot show that minimum price movement"
+    _ONE = " — this page shows adding to and trimming held pairs only together (Rebalance)"
+    _MOVES = [{"label": "5c", "value": 0.05}, {"label": "10c", "value": 0.1}]
+
+    @classmethod
+    def _view(cls, rebalance: list | None, move: list | None, *, moves: list | None = None,
+              suffix: str = "") -> dict:
+        """
+        The Rebalance keys of a filter bar's base block, as _filter_payload ships them.
+
+        Args:
+            rebalance (list | None): The rebalancing grid ([band][k][cap] ->
+                chunk id); None for none.
+            move (list | None): The minimums' grid (a cell holds one id per
+                minimum, or None when every minimum shows the rebalancing
+                cell); None for none.
+            moves (list | None): The minimums offered; None for 5c and 10c.
+            suffix (str): Which grids: "" (tier floors on) or "_off".
+
+        Returns:
+            dict: "grid_rebalance<suffix>", "moves" and "grid_move<suffix>".
+        """
+        return {"grid_rebalance" + suffix: rebalance,
+                "moves": cls._MOVES if moves is None else moves,
+                "grid_move" + suffix: move}
+
+    @staticmethod
+    def _both(sweep, **live) -> BacktestSweep:
+        """The sweep with saved defaults that add to held pairs and trim them."""
+        return dataclasses.replace(sweep, live_add_to_held_pairs=True, live_trim_to_kelly=True,
+                                   **live)
+
+    # ─── The save button's note ───────────────────────────────────────────────
+
+    def test_the_save_button_warns_that_saving_with_rebalance_no_turns_it_off(
             self, monkeypatch, tmp_path):
-        # On this fixture an add-on moves the price a rise is measured from,
-        # so the adding-on half's minimums are not the plain half's: each
-        # must start from its own Trim to Kelly runs
-        grid = _tb.TestTrimRiseGrid
-        entries = grid._add_on_entries()
-        band, k, start, end = grid._BAND, 0.75, grid._START, grid._END
-        caps = backtester.SIZE_CAP_SWEEP
-        rises = (0.05, 0.40, 0.45, 0.50)
+        note = "The live defaults rebalance; saving with Rebalance no here turns that off."
+        assert dashboard._REBALANCE_SAVE_NOTE == note
 
-        def fresh(cap, **options):
-            return backtester._simulate_at_discount(
-                entries, start, 10_000.0, k=k, spread_band=band, size_cap=cap, quiet=True,
-                end_date=end, **options)
+        def between(page):
+            bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
+            return bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
 
-        primary = fresh(0.20)
-        axes = {"caps": caps, "primary_cap": 0.20, "bands": (band,), "ks": (k,),
-                "primary_k": k, "start_date": start, "initial_balance": 10_000.0}
-        lazy = {**axes, "split_date": None, "checks": False,
-                "entries_by_band": {band: entries}, "st_entries": []}
-        days = {(band, k, "all"): end}
-        run = BacktestSweep(
-            primary=primary, points=[primary], calibration=None, scenarios=[primary],
-            calibrations_by_band={band: None}, same_event_ladders=True,
-            cap_sweep=backtester.CapSweep(**lazy, eager={(band, k, "all"): primary}),
-            add_on_cap_sweep=backtester.CapSweep(**lazy, eager={}, add_to_held=True,
-                                                 end_dates=days),
-            trim_sweep=backtester.TrimSweep(
-                **axes, off_bands=(), entries_by_band={band: entries},
-                off_entries_by_band={}, end_dates=days, off_end_dates={}, min_rises=rises))
+        with_view = _kc_sweep_rebalance()
+        page = _rb_page(monkeypatch, tmp_path, self._both(with_view))
+        # Right after the button, before the trade link, in Python's words
+        assert re.search(r'</button>&nbsp;<span id="flt-rebalance-save-note"[^>]*>'
+                         + re.escape(html.escape(note)) + '</span>', between(page))
+        assert note not in dashboard._FILTER_JS
+        # Either one saved alone is turned off by Rebalance no too
+        for saved in ({"live_add_to_held_pairs": True}, {"live_trim_to_kelly": True},
+                      {"live_trim_to_kelly": True, "live_trim_min_rise": 0.1}):
+            page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(with_view, **saved))
+            assert 'id="flt-rebalance-save-note"' in page, saved
+        # No note when the saved defaults do neither (or the run recorded none) ...
+        for saved in (False, None):
+            page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(
+                with_view, live_add_to_held_pairs=saved, live_trim_to_kelly=saved))
+            assert 'id="flt-rebalance-save-note"' not in page
+        # ... nor on a page with no Rebalance view, whose Save sends no choice
+        page = _rb_page(monkeypatch, tmp_path, self._both(_kc_sweep()))
+        assert 'id="flt-rebalance-save-note"' not in page and 'id="flt-save"' in page
+
+    def test_the_notes_follow_the_button_in_the_order_of_their_selects(
+            self, monkeypatch, tmp_path):
+        sweep = self._both(_kc_sweep_rebalance(_kc_sweep_sell()), live_sell_at=0.85)
+        page = _sl_page(monkeypatch, tmp_path, sweep)
+        bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
+        between = bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
+        # Rebalance, then Sell: the bar's own order
+        assert (between.index('id="flt-rebalance-save-note"')
+                < between.index('id="flt-sell-save-note"'))
+
+    # ─── The page-header line ─────────────────────────────────────────────────
+
+    def test_the_header_names_the_choices_that_show_the_rebalancing(self):
+        run = TestLiveRuleHeader
+        rule = config.describe_time_series_rule(True, (0.0, 1.0))
+        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
+        sweep = self._both(run._sweep())
+        shown = {**run._bar(), **self._view([[[7]]], [[[None]]])}
+        # The rule is the page's primary and the bar has the view: with no saved
+        # minimum, "any"; with one the page offers, that option. Said once,
+        # after the later of the two notes
+        assert run()._text(sweep, shown) == (head + self._ADD + self._TRIM
+                                             + self._SHOWN.format("any"))
+        ten = dataclasses.replace(sweep, live_trim_min_rise=0.1)
+        assert run()._text(ten, shown) == (head + self._ADD + self._TRIM_10C
+                                           + self._SHOWN.format("10c"))
+        # ... a minimum written with float noise still finds its option
+        noisy = dataclasses.replace(sweep, live_trim_min_rise=0.1 + 1e-12)
+        assert run()._text(noisy, shown).endswith(self._SHOWN.format("10c"))
+        # ... and a minimum that makes a run of its own shows it by its own chunk
+        own = {**run._bar(), **self._view([[[7]]], [[[[7, 9]]]])}
+        assert run()._text(ten, own).endswith(self._SHOWN.format("10c"))
+        # Without a saved minimum, "any" needs the rebalancing cell alone
+        alone = {**run._bar(), **self._view([[[7]]], None, moves=[])}
+        assert run()._text(sweep, alone).endswith(self._TRIM + self._SHOWN.format("any"))
+
+    def test_one_of_the_two_alone_is_said_to_need_the_other(self):
+        # The bar shows adding and trimming only together: saved defaults
+        # that do one alone are never shown, whatever the page holds
+        run = TestLiveRuleHeader
+        shown = {**run._bar(), **self._view([[[7]]], [[[None]]])}
+        adds = dataclasses.replace(run._sweep(), live_add_to_held_pairs=True)
+        assert run()._text(adds, shown).endswith(self._ADD + self._ONE)
+        trims = dataclasses.replace(run._sweep(), live_trim_to_kelly=True,
+                                    live_trim_min_rise=0.1)
+        assert run()._text(trims, shown).endswith(self._TRIM_10C + self._ONE)
+        assert self._ADD not in run()._text(trims, shown)
+        # ... and with no Rebalance view at all the same sentence stands
+        assert run()._text(adds, run._bar()).endswith(self._ADD + self._ONE)
+
+    def test_a_page_that_cannot_show_the_rebalancing_says_so(self):
+        run = TestLiveRuleHeader
+        sweep = self._both(run._sweep())
+        # No Rebalance view: no bar, a bar without one, a null grid, or no
+        # chunk for the band
+        for bar in (None, run._bar(), {**run._bar(), **self._view(None, [[[None]]])},
+                    {**run._bar(), **self._view([[[None]]], [[[None]]])}):
+            assert run()._text(sweep, bar).endswith(self._TRIM + self._NO_VIEW), bar
+        # A saved minimum the page cannot show: not offered, no grid of the
+        # minimums, or no chunk of the band at that minimum
+        ten = dataclasses.replace(sweep, live_trim_min_rise=0.1)
+        for bar in ({**run._bar(), **self._view([[[7]]], [[[None]]], moves=[])},
+                    {**run._bar(), **self._view([[[7]]], [[[None]]],
+                                                moves=[{"label": "15c", "value": 0.15}])},
+                    {**run._bar(), **self._view([[[7]]], None)},
+                    {**run._bar(), **self._view([[[7]]], [[[[3, None]]]])}):
+            assert run()._text(ten, bar).endswith(self._TRIM_10C + self._NO_MOVE), bar
+        # A rule the page does not show: the notes alone, no promise of a view
+        elsewhere = dataclasses.replace(sweep, live_spread_band=(0.3, 0.6),
+                                        calibrations_by_band={(0.0, 1.0): None})
+        assert run()._text(elsewhere, {**run._bar(), **self._view([[[7]]], [[[None]]])}).endswith(
+            "— not simulated by this run" + self._ADD + self._TRIM)
+        # Neither saved (or not recorded): no note at all, a minimum alone included
+        for saved, move in ((False, None), (None, None), (None, 0.1)):
+            plain = dataclasses.replace(sweep, live_add_to_held_pairs=saved,
+                                        live_trim_to_kelly=saved, live_trim_min_rise=move)
+            text = run()._text(plain, {**run._bar(), **self._view([[[7]]], [[[None]]])})
+            assert "trim" not in text.lower() and "held pairs" not in text
+            assert "Rebalance" not in text
+
+    def test_tiers_off_at_a_binding_band_reads_the_tier_off_grids(self):
+        run = TestLiveRuleHeader
+        band = (0.0, 0.5)
+        sweep = self._both(
+            run._sweep(live_tier_floors=False, live_spread_band=band,
+                       calibrations_by_band={(0.0, 1.0): None, band: None},
+                       tier_off_calibrations_by_band={(0.0, 1.0): None, band: None},
+                       tier_off_scenarios=[object()]),
+            live_trim_min_rise=0.1)
+        bar = {**run._bar(bands=[band, (0.0, 1.0)]),
+               **self._view([[[3]], [[4]]], [[[None]], [[None]]])}
+        cells = [[[None]], [[None]]]
+        for rebalance, move, said in (
+                ([[[7]], [[8]]], cells, self._SHOWN.format("10c")),
+                # a chunk for the band with the tiers on, none with them off
+                ([[[None]], [[8]]], cells, self._NO_VIEW),
+                # the tier-off minimums' grid is missing
+                ([[[7]], [[8]]], None, self._NO_MOVE)):
+            view = self._view(rebalance, move, suffix="_off")
+            assert run()._text(sweep, {**bar, **view}).endswith(said), (rebalance, move)
+
+    def test_defaults_that_sell_and_rebalance(self):
+        # The page never shows a sell level and rebalancing together: the
+        # Sell clause offers the selling alone, and the rebalance clause says why
+        run = TestLiveRuleHeader
+        rule = config.describe_time_series_rule(True, (0.0, 1.0))
+        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
+        together = " — this page cannot show rebalancing together with selling"
+        sweep = self._both(run._sweep(), live_sell_at=0.85, live_sell_min_days=3)
+        view = self._view([[[7]]], [[[None]]])
+        bar = {**run._bar(), **TestLiveSellRule._view(), **view}
+        assert run()._text(sweep, bar) == (
+            head + self._ADD + TestLiveSellRule._NOTE + ' — choose Sell "sell at 85% of '
+            'potential profit" and Min. days to maturity "3 days" in the filter bar to see '
+            "the selling alone" + self._TRIM + together)
+        # A page that cannot show the level says so; the rebalance clause is the same
+        assert run()._text(sweep, {**run._bar(), **view}) == (
+            head + self._ADD + TestLiveSellRule._NOTE + " — this page cannot show that Sell "
+            "level and minimum of days" + self._TRIM + together)
+        # A page with no Rebalance view says that, never that rebalancing
+        # could be shown there apart from the selling
+        assert run()._text(sweep, {**run._bar(), **TestLiveSellRule._view()}) == (
+            head + self._ADD + TestLiveSellRule._NOTE + ' — choose Sell "sell at 85% of '
+            'potential profit" and Min. days to maturity "3 days" in the filter bar to see '
+            "the selling alone" + self._TRIM + self._NO_VIEW)
+        # Selling with one of the two alone: the selling alone again, and the
+        # one-alone sentence
+        adds = dataclasses.replace(sweep, live_trim_to_kelly=False)
+        assert run()._text(adds, bar) == (
+            head + self._ADD + self._ONE + TestLiveSellRule._NOTE + ' — choose Sell "sell at '
+            '85% of potential profit" and Min. days to maturity "3 days" in the filter bar '
+            "to see the selling alone")
+        # Selling alone keeps its promise of the whole rule
+        sells = dataclasses.replace(sweep, live_add_to_held_pairs=False,
+                                    live_trim_to_kelly=False)
+        assert run()._text(sells, bar).endswith("in the filter bar to see it")
+
+    def test_the_header_of_a_whole_page_points_at_the_selects(self, monkeypatch, tmp_path):
+        sweep = self._both(_kc_sweep_move(), live_trim_min_rise=0.1, live_tier_floors=True,
+                           live_spread_band=_KC_B0)
+        note = ("the live defaults trim to Kelly (only after a {}c price move), which this "
+                "run's primary does not — ")
+        page = _rb_page(monkeypatch, tmp_path, sweep)
+        assert (note.format(10) + 'choose Rebalance yes and Min. price movement "10c" in the '
+                "filter bar to see it</p>") in page
+        # A saved minimum the page does not offer
+        page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(sweep, live_trim_min_rise=0.15))
+        assert note.format(15) + "this page cannot show that minimum price movement</p>" in page
+        # No Rebalance family
+        page = _rb_page(monkeypatch, tmp_path, dataclasses.replace(sweep, rebalance_sweep=None))
+        assert note.format(10) + "this page has no Rebalance view</p>" in page
+
+
+class TestNoHalfRebalancing:
+    """No simulation behind a dashboard page adds to held pairs without
+    trimming them, or trims without adding: while run_backtest_sweep and then
+    generate_dashboard build a page from the selling golden fixture with every
+    family on (band sweep, tier floors off, size caps, Sell, Rebalance with its
+    minimum price movements), every CapSweep built has add_to_held equal to
+    trim_to_kelly, and so does every _simulate_at_discount call made during the
+    run and the page build (none that adds and trims also sells); the page's
+    walk builds some sweeps that do both. Watching the simulations themselves,
+    not only the sweeps, also catches a direct call outside a CapSweep (an
+    eager loop, or a check re-simulating a point) that adds or trims alone."""
+
+    @pytest.mark.usefixtures("pre_toggle_defaults")
+    def test_every_cap_sweep_built_adds_and_trims_together(self, monkeypatch, tmp_path):
+        built: list[tuple[str, bool, bool]] = []
+        real = backtester.CapSweep.__post_init__
+        phase = ["run"]
+
+        def recording(self):
+            built.append((phase[0], self.add_to_held, self.trim_to_kelly))
+            real(self)
+        monkeypatch.setattr(backtester.CapSweep, "__post_init__", recording)
+        # (add_to_held, trim_to_kelly, sell_at) of every simulation; every
+        # caller reaches it through backtester's own global, and the Sell grid
+        # runs in this process (sell_workers is 1), so the spy sees them all
+        calls: list[tuple[bool, bool, object]] = []
+        real_sim = backtester._simulate_at_discount
+
+        def sim_spy(*args, **kw):
+            calls.append((bool(kw.get("add_to_held")), bool(kw.get("trim_to_kelly")),
+                          kw.get("sell_at")))
+            return real_sim(*args, **kw)
+        monkeypatch.setattr(backtester, "_simulate_at_discount", sim_spy)
+        golden = _tb._SellingGolden()
+        golden._patch(monkeypatch)
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_FLOORS", (0.0,))
+        monkeypatch.setattr(backtester, "SPREAD_BAND_SWEEP_CEILINGS", (1.0,))
+        monkeypatch.setattr(backtester, "INTERVAL_DISCOUNT_SWEEP", (0.5,))
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_LEVELS", (0.25, 1.0))
+        monkeypatch.setattr(backtester, "TAKE_PROFIT_MIN_DAYS", (1, 30))
+        monkeypatch.setattr(backtester, "MIN_PRICE_MOVES", (0.05, 0.25))
+        run = backtester.run_backtest_sweep(
+            MagicMock(), MagicMock(), golden._START, 10_000.0, same_event_ladders=True,
+            interval_discount=0.5, band_sweep=True, tier_off_sweep=True, cap_sweep=True,
+            sell_sweep=True, rebalance_sweep=True, move_sweep=True)
+        assert run.rebalance_sweep is not None and run.rebalance_sweep.min_moves == (0.05, 0.25)
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+        phase[0] = "page"
         page = dashboard.generate_dashboard(
-            primary.trades, primary.equity_df, start, 10_000.0,
+            run.primary.trades, run.primary.equity_df, golden._START, 10_000.0,
             sweep=run).read_text(encoding="utf-8")
-        data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        assert data["trim_rise_state"] == "shown"
-        # Not vacuous: at some caps the Trim to Kelly rises differ with adding
-        assert any(fresh(cap, trim_to_kelly=True).trim_rises
-                   != fresh(cap, trim_to_kelly=True, add_to_held=True).trim_rises
-                   for cap in caps)
-        for add, trim_key, rise_key in ((False, "grid_trim", "grid_trim_rise"),
-                                        (True, "grid_trim_add", "grid_trim_rise_add")):
-            assert data[rise_key] is not None
-            for ci, cap in enumerate(caps):
-                own, cell = data[trim_key][0][0][ci], data[rise_key][0][0][ci]
-                for ri, rise in enumerate(rises):
-                    cid = own if cell is None else cell[ri]
-                    point = fresh(cap, add_to_held=add, trim_to_kelly=True, trim_min_rise=rise)
-                    view = chunks[cid]["list"]["views"]["all"]
-                    kpis = dashboard._performance_kpis(point.equity_df, point.trades, 10_000.0)
-                    assert view["n"] == len(point.trades), (add, cap, rise)
-                    assert view["kpi"] == {name: value for name, _, value, _ in kpis}, (
-                        add, cap, rise)
-        assert data["grid_trim_rise"] != data["grid_trim_rise_add"]
+        data = TestFilterPage._data(page)
+        # Every view was built: the run's families reached the page
+        for state in ("rebalance_state", "move_state", "sell_state"):
+            assert data[state] == "shown", state
+        assert data["grid_rebalance_off"] is not None
+        # Not one simulation adds without trimming or trims without adding
+        assert [entry for entry in built if entry[1] != entry[2]] == []
+        # ... and the walk did build the rebalancing ones, with the tier floors
+        # on and off, beside the ones that do neither
+        page_sweeps = Counter((add, trim) for when, add, trim in built if when == "page")
+        assert page_sweeps[(True, True)] >= 2 and page_sweeps[(False, False)] > 0
+        # Every simulation itself, not only every CapSweep: none adds alone or
+        # trims alone, some do both, and none that does both also sells
+        assert [c for c in calls if c[0] != c[1]] == []
+        assert any(c[0] and c[1] for c in calls)
+        assert [c for c in calls if c[0] and c[2] is not None] == []
 
 
 # ─── Sell: every sell level of every scenario (sidecar chunks) ───────────────
@@ -14556,7 +13893,7 @@ def _kc_sweep_sell(base: BacktestSweep | None = None, *, raise_on=None,
     50%: only (_KC_B0, 0.75) at 20% sells, later and lower; at no cap it is
     exactly the 25% run (SameSale). Every other (level, minimum) of a cell
     that sells is its first minimum's run (SameSale). Sell runs neither add
-    to held pairs nor trim, so an add-on family on `base` adds no sell cells;
+    to held pairs nor trim, so a Rebalance family on `base` adds no sell cells;
     with a tier-floors-off family, the binding band (_KC_B0)'s run with the
     tiers off sells at 25% at the run's own cap.
     """
@@ -14809,13 +14146,13 @@ class TestSellGrid:
         # Its rows' heads are its own, and name the sale
         assert any("sold on" in head for head in chunk["heads"])
 
-    def test_the_tier_off_view_is_covered_and_the_add_on_view_is_not(self, tmp_path):
-        # The page also carries an Add to held pairs view, but Sell is shut
-        # while adding is on, so the Sell build covers the base grids alone
-        sweep = _kc_sweep_sell(_kc_sweep_add_on(_kc_sweep_tiers()))
+    def test_the_tier_off_view_is_covered_and_the_rebalance_view_is_not(self, tmp_path):
+        # The page also carries a Rebalance view, but Sell is shut while
+        # Rebalance is yes, so the Sell build covers the base grids alone
+        sweep = _kc_sweep_sell(_kc_sweep_rebalance(_kc_sweep_tiers()))
         walked, chunker, grid = _sl_build(sweep, tmp_path / "f")
         off = chunker.off_grid()
-        assert off is not None and chunker.add_grid() is not None
+        assert off is not None and chunker.rebalance_grid() is not None
         # Tasks: band 0.0-1 and 0.3-0.6 with the tiers on, then 0.0-1 (the one
         # the tiers bind at) off; 0.3-0.6 off reads its tier-on block
         assert grid.index == [[0, 1], [2, 1]]
@@ -14823,12 +14160,12 @@ class TestSellGrid:
         # Tier floors off: the binding band's own cell that sells is new, its
         # other cells (the family is at the run's own cap) stay the off view's;
         # the band the tiers never bind at shows its tier-on Sell rows
-        assert view[1][0][1][1] not in _ao_ids(off)
+        assert view[1][0][1][1] not in _rb_ids(off)
         assert view[1][0][1][0] == off[0][1][0] and view[1][0][0] == off[0][0]
         assert view[1][1] == view[0][1]
         # Every read was of a run that neither adds nor trims: a read names
         # (band, k, tier floors, caps), and the stand-in's sold_grid takes no
-        # Add to held pairs setting, so passing one would raise a TypeError
+        # rebalancing setting, so passing one would raise a TypeError
         assert (_KC_B0, 0.75, False, (0.05, 0.2, 1.0)) not in walked.sell.reads
         assert (_KC_B0, 0.75, False, (0.2,)) in walked.sell.reads
 
@@ -14938,7 +14275,7 @@ class TestSellGrid:
         fields = {f.name for f in dataclasses.fields(dashboard._SellTask)}
         assert {"same_title_size_cap", "scheduled_run", "hold_days", "install"} <= fields
         assert not {name for name in fields if "rebalance" in name}
-        # A cell a task covers is (k index, cap index): no Add to held pairs level
+        # A cell a task covers is (k index, cap index): no Rebalance level
         assert all(len(cell) == 2 for task in tasks for cell in task.cells)
         assert any(task.cells for task in tasks)
 
@@ -14988,12 +14325,12 @@ class TestSellPage:
                 "Min. days to maturity select names remain before its last market stops "
                 "trading. A position sold at a checkpoint") in one
         assert "days in a row" not in one
-        # Sell is shut while adding or trimming is on, and the title says so at
-        # every hold count
+        # Sell is shut while Rebalance is yes, and the title says so at every
+        # hold count
         for title in (one, three):
             assert ("A position sold at a checkpoint is not bought again there. Sell is shut "
-                    "(no selling) while Add to held pairs or Trim to Kelly is on: those are "
-                    "not simulated together with it. Save as live defaults…") in title
+                    "(no selling) while Rebalance is yes: the two are not simulated "
+                    "together. Save as live defaults…") in title
         assert ("has stayed at or above that share of its potential profit (its contract "
                 "pairs at $1.00 each, less what it cost) for 3 days in a row: it is checked "
                 "once a day, 24 hours apart, the last check at the checkpoint") in three
@@ -15155,12 +14492,13 @@ class TestLiveSellRule:
         assert 'id="flt-sell-save-note"' not in page and 'id="flt-save"' in page
 
     def test_both_notes_follow_the_button_when_both_apply(self, monkeypatch, tmp_path):
-        sweep = dataclasses.replace(_kc_sweep_sell(_kc_sweep_add_on()),
+        sweep = dataclasses.replace(_kc_sweep_sell(_kc_sweep_rebalance()),
                                     live_add_to_held_pairs=True, live_sell_at=0.85)
         page = _sl_page(monkeypatch, tmp_path, sweep)
         bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
         between = bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
-        assert between.index('id="flt-add-save-note"') < between.index('id="flt-sell-save-note"')
+        assert (between.index('id="flt-rebalance-save-note"')
+                < between.index('id="flt-sell-save-note"'))
 
     # ─── The page-header line ─────────────────────────────────────────────────
 
@@ -15251,254 +14589,6 @@ class TestLiveSellRule:
             "; the live defaults sell at 90% of potential profit (at least 1 day before "
             "maturity), which this run's primary does not — this page cannot show that Sell "
             "level and minimum of days")
-
-    def test_defaults_that_sell_and_add(self):
-        # The page never shows a sell level together with adding to held pairs
-        # (Sell is shut while Add to held pairs is on): the Sell clause offers
-        # the selling alone, and the add clause says why, as the trim clause
-        # does for selling and trimming
-        run = TestLiveRuleHeader
-        rule = config.describe_time_series_rule(True, (0.0, 1.0))
-        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
-        add_note = "; the live defaults add to held pairs, which this run's primary does not"
-        together = " — this page cannot show adding to held pairs together with selling"
-        sweep = dataclasses.replace(run._sweep(), live_add_to_held_pairs=True,
-                                    live_sell_at=0.85, live_sell_min_days=3)
-        bar = {**run._bar(), **self._view(), "grid_add": [[[1]]]}
-        shown = (' — choose Sell "sell at 85% of potential profit" and Min. days to maturity '
-                 '"3 days" in the filter bar to see the selling alone')
-        assert run()._text(sweep, bar) == head + add_note + together + self._NOTE + shown
-        # The add clause says the same on a page with no add-on view, and a
-        # page that cannot show the level says so in the Sell clause
-        no_add = {**run._bar(), **self._view()}
-        assert run()._text(sweep, no_add) == head + add_note + together + self._NOTE + shown
-        cannot = " — this page cannot show that Sell level and minimum of days"
-        assert run()._text(sweep, {**run._bar(), "grid_add": [[[1]]]}) == (
-            head + add_note + together + self._NOTE + cannot)
-        # Selling alone keeps its promise of the whole rule, and adding alone its own
-        sells = dataclasses.replace(sweep, live_add_to_held_pairs=False)
-        assert run()._text(sells, bar).endswith("in the filter bar to see it")
-        adds = dataclasses.replace(sweep, live_sell_at=None, live_sell_min_days=None)
-        assert run()._text(adds, bar) == (
-            head + add_note + " — choose Add to held pairs on in the filter bar to see it")
-        # Adding, trimming and selling saved together: the add and trim clauses
-        # both say why, and the Sell clause offers the selling alone
-        all_three = dataclasses.replace(sweep, live_trim_to_kelly=True)
-        text = run()._text(all_three, {**bar, **TestLiveTrimRule._view([[[7]]], [[[None]]])})
-        assert text == (head + add_note + together + self._NOTE + shown + TestLiveTrimRule._NOTE
-                        + " — this page cannot show trimming together with selling")
-
-
-class TestLiveTrimRule:
-    """The page when the saved live defaults trim to Kelly: a grey note by the
-    save button on a page with the Trim to Kelly view (saving with Trim to
-    Kelly off turns live trimming off), and the header line naming the
-    choices that show the trim, or why the page cannot (trimming with
-    selling included)."""
-
-    _NOTE = "; the live defaults trim to Kelly, which this run's primary does not"
-    _NOTE_10C = ("; the live defaults trim to Kelly (only after a 10c price move), which this "
-                 "run's primary does not")
-    _SHOWN = ' — choose Trim to Kelly on and Min. price rise "{}" in the filter bar to see it'
-    _NO_VIEW = " — this page has no Trim to Kelly view"
-    _NO_RISE = " — this page cannot show that minimum price rise"
-    _RISES = [{"label": "5c", "value": 0.05}, {"label": "10c", "value": 0.1}]
-
-    @classmethod
-    def _view(cls, trim: list | None, rise: list | None, *, rises: list | None = None,
-              suffix: str = "") -> dict:
-        """
-        The Trim to Kelly keys of a filter bar's base block, as _filter_payload ships them.
-
-        Args:
-            trim (list | None): The trim grid ([band][k][cap] -> chunk id); None for none.
-            rise (list | None): The minimums' grid (a cell holds one id per
-                minimum, or None when every minimum shows the trim cell); None for none.
-            rises (list | None): The minimums offered; None for 5c and 10c.
-            suffix (str): Which grids: "", "_off", "_add" or "_add_off".
-
-        Returns:
-            dict: "grid_trim<suffix>", "trim_rises" and "grid_trim_rise<suffix>".
-        """
-        return {"grid_trim" + suffix: trim,
-                "trim_rises": cls._RISES if rises is None else rises,
-                "grid_trim_rise" + suffix: rise}
-
-    # ─── The save button's note ───────────────────────────────────────────────
-
-    def test_the_save_button_warns_that_saving_with_trimming_off_turns_it_off(
-            self, monkeypatch, tmp_path):
-        note = ("The live defaults trim to Kelly; saving with Trim to Kelly off here turns "
-                "that off.")
-        assert dashboard._TRIM_SAVE_NOTE == note
-
-        def between(page):
-            bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
-            return bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
-
-        with_view = _kc_sweep_trim()
-        page = _ao_page(monkeypatch, tmp_path, dataclasses.replace(
-            with_view, live_trim_to_kelly=True))
-        # Right after the button, before the trade link, in Python's words
-        assert re.search(r'</button>&nbsp;<span id="flt-trim-save-note"[^>]*>'
-                         + re.escape(html.escape(note)) + '</span>', between(page))
-        assert note not in dashboard._FILTER_JS
-        # Trimming after a minimum price rise is trimming too
-        page = _ao_page(monkeypatch, tmp_path, dataclasses.replace(
-            with_view, live_trim_to_kelly=True, live_trim_min_rise=0.1))
-        assert 'id="flt-trim-save-note"' in page
-        # No note when the saved defaults do not trim (or the run recorded none) ...
-        for saved in (False, None):
-            page = _ao_page(monkeypatch, tmp_path, dataclasses.replace(
-                with_view, live_trim_to_kelly=saved))
-            assert 'id="flt-trim-save-note"' not in page
-        # ... nor on a page with no Trim to Kelly view, whose Save sends no choice
-        page = _ao_page(monkeypatch, tmp_path, dataclasses.replace(
-            _kc_sweep(), live_trim_to_kelly=True))
-        assert 'id="flt-trim-save-note"' not in page and 'id="flt-save"' in page
-
-    def test_the_notes_follow_the_button_in_the_order_of_their_selects(
-            self, monkeypatch, tmp_path):
-        sweep = dataclasses.replace(_kc_sweep_trim(_kc_sweep_sell(_kc_sweep_add_on())),
-                                    live_add_to_held_pairs=True, live_trim_to_kelly=True,
-                                    live_sell_at=0.85)
-        page = _sl_page(monkeypatch, tmp_path, sweep)
-        bar = page[page.index('id="flt-bar"'):page.index('id="flt-summary"')]
-        between = bar[bar.index('id="flt-save"'):bar.index('id="flt-trade"')]
-        # Add to held pairs, Trim to Kelly, Sell: the bar's own order
-        assert (between.index('id="flt-add-save-note"') < between.index('id="flt-trim-save-note"')
-                < between.index('id="flt-sell-save-note"'))
-
-    # ─── The page-header line ─────────────────────────────────────────────────
-
-    def test_the_header_names_the_choices_that_show_the_trim(self):
-        run = TestLiveRuleHeader
-        rule = config.describe_time_series_rule(True, (0.0, 1.0))
-        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
-        sweep = dataclasses.replace(run._sweep(), live_trim_to_kelly=True)
-        shown = {**run._bar(), **self._view([[[7]]], [[[None]]])}
-        # The rule is the page's primary and the bar has the view: with no saved
-        # minimum, "any"; with one the page offers, that option
-        assert run()._text(sweep, shown) == head + self._NOTE + self._SHOWN.format("any")
-        ten = dataclasses.replace(sweep, live_trim_min_rise=0.1)
-        assert run()._text(ten, shown) == head + self._NOTE_10C + self._SHOWN.format("10c")
-        # ... a minimum written with float noise still finds its option
-        noisy = dataclasses.replace(sweep, live_trim_min_rise=0.1 + 1e-12)
-        assert run()._text(noisy, shown).endswith(self._SHOWN.format("10c"))
-        # ... and a minimum that makes a run of its own shows it by its own chunk
-        own = {**run._bar(), **self._view([[[7]]], [[[[7, 9]]]])}
-        assert run()._text(ten, own).endswith(self._SHOWN.format("10c"))
-        # Without a saved minimum, "any" needs the Trim to Kelly cell alone
-        alone = {**run._bar(), **self._view([[[7]]], None, rises=[])}
-        assert run()._text(sweep, alone) == head + self._NOTE + self._SHOWN.format("any")
-
-    def test_a_page_that_cannot_show_the_trim_says_so(self):
-        run = TestLiveRuleHeader
-        rule = config.describe_time_series_rule(True, (0.0, 1.0))
-        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
-        sweep = dataclasses.replace(run._sweep(), live_trim_to_kelly=True)
-        # No Trim to Kelly view: no bar, a bar without one, a null grid, or no
-        # chunk for the band
-        for bar in (None, run._bar(), {**run._bar(), **self._view(None, [[[None]]])},
-                    {**run._bar(), **self._view([[[None]]], [[[None]]])}):
-            assert run()._text(sweep, bar) == head + self._NOTE + self._NO_VIEW, bar
-        # A saved minimum the page cannot show: not offered, no grid of the
-        # minimums, or no chunk of the band at that minimum
-        ten = dataclasses.replace(sweep, live_trim_min_rise=0.1)
-        for bar in ({**run._bar(), **self._view([[[7]]], [[[None]]], rises=[])},
-                    {**run._bar(), **self._view([[[7]]], [[[None]]],
-                                                rises=[{"label": "15c", "value": 0.15}])},
-                    {**run._bar(), **self._view([[[7]]], None)},
-                    {**run._bar(), **self._view([[[7]]], [[[[3, None]]]])}):
-            assert run()._text(ten, bar) == head + self._NOTE_10C + self._NO_RISE, bar
-        # A rule the page does not show: the note alone, no promise of a view
-        elsewhere = dataclasses.replace(sweep, live_spread_band=(0.3, 0.6),
-                                        calibrations_by_band={(0.0, 1.0): None})
-        assert run()._text(elsewhere, {**run._bar(), **self._view([[[7]]], [[[None]]])}).endswith(
-            "— not simulated by this run" + self._NOTE)
-        # Not trimming (or not recorded): no note at all, a minimum alone included
-        for trims, rise in ((False, None), (None, None), (None, 0.1)):
-            plain = dataclasses.replace(sweep, live_trim_to_kelly=trims, live_trim_min_rise=rise)
-            text = run()._text(plain, {**run._bar(), **self._view([[[7]]], [[[None]]])})
-            assert "trim" not in text.lower()
-
-    def test_defaults_that_add_read_the_trim_grids_with_adding_on(self):
-        run = TestLiveRuleHeader
-        sweep = dataclasses.replace(run._sweep(), live_trim_to_kelly=True,
-                                    live_add_to_held_pairs=True)
-        # The page's Trim to Kelly view has no adding-on half: none is shown
-        plain = {**run._bar(), "grid_add": [[[1]]], **self._view([[[7]]], [[[None]]])}
-        assert run()._text(sweep, plain).endswith(
-            self._NOTE + self._NO_VIEW + " with Add to held pairs on")
-        # With it, the trim is shown there ...
-        both = {**plain, **self._view([[[5]]], [[[None]]], suffix="_add")}
-        assert run()._text(sweep, both).endswith(self._NOTE + self._SHOWN.format("any"))
-        # ... and a minimum is read from the adding-on minimums' grid alone
-        ten = dataclasses.replace(sweep, live_trim_min_rise=0.1)
-        assert run()._text(ten, {**both, "grid_trim_rise_add": [[[[3, None]]]]}).endswith(
-            self._NO_RISE)
-        assert run()._text(ten, {**both, "grid_trim_rise": None}).endswith(
-            self._SHOWN.format("10c"))
-
-    def test_tiers_off_at_a_binding_band_reads_the_tier_off_grids(self):
-        run = TestLiveRuleHeader
-        band = (0.0, 0.5)
-        sweep = dataclasses.replace(
-            run._sweep(live_tier_floors=False, live_spread_band=band,
-                       calibrations_by_band={(0.0, 1.0): None, band: None},
-                       tier_off_calibrations_by_band={(0.0, 1.0): None, band: None},
-                       tier_off_scenarios=[object()]),
-            live_trim_to_kelly=True, live_trim_min_rise=0.1)
-        bar = {**run._bar(bands=[band, (0.0, 1.0)]),
-               **self._view([[[3]], [[4]]], [[[None]], [[None]]])}
-        cells = [[[None]], [[None]]]
-        for trim, rise, said in (
-                ([[[7]], [[8]]], cells, self._SHOWN.format("10c")),
-                # a chunk for the band with the tiers on, none with them off
-                ([[[None]], [[8]]], cells, self._NO_VIEW),
-                # the tier-off minimums' grid is missing
-                ([[[7]], [[8]]], None, self._NO_RISE)):
-            view = self._view(trim, rise, suffix="_off")
-            assert run()._text(sweep, {**bar, **view}).endswith(said), (trim, rise)
-
-    def test_defaults_that_sell_and_trim(self):
-        # The page never shows a sell level and trimming together: the Sell
-        # clause offers the selling alone, and the trim clause says why
-        run = TestLiveRuleHeader
-        rule = config.describe_time_series_rule(True, (0.0, 1.0))
-        head = f"Live rule (saved live defaults): {rule}; {run._CAP} — this run's primary"
-        together = " — this page cannot show trimming together with selling"
-        sweep = dataclasses.replace(run._sweep(), live_trim_to_kelly=True, live_sell_at=0.85,
-                                    live_sell_min_days=3)
-        trim = self._view([[[7]]], [[[None]]])
-        bar = {**run._bar(), **TestLiveSellRule._view(), **trim}
-        assert run()._text(sweep, bar) == (
-            head + TestLiveSellRule._NOTE + ' — choose Sell "sell at 85% of potential '
-            'profit" and Min. days to maturity "3 days" in the filter bar to see the selling '
-            "alone" + self._NOTE + together)
-        # A page that cannot show the level says so; the trim clause is the same
-        assert run()._text(sweep, {**run._bar(), **trim}) == (
-            head + TestLiveSellRule._NOTE + " — this page cannot show that Sell level and "
-            "minimum of days" + self._NOTE + together)
-        # Selling alone keeps its promise of the whole rule
-        sells = dataclasses.replace(sweep, live_trim_to_kelly=False)
-        assert run()._text(sells, bar).endswith("in the filter bar to see it")
-
-    def test_the_header_of_a_whole_page_points_at_the_selects(self, monkeypatch, tmp_path):
-        sweep = dataclasses.replace(_kc_sweep_trim_rise(), live_trim_to_kelly=True,
-                                    live_trim_min_rise=0.1, live_tier_floors=True,
-                                    live_spread_band=_KC_B0)
-        note = ("the live defaults trim to Kelly (only after a {}c price move), which this "
-                "run's primary does not — ")
-        page = _ao_page(monkeypatch, tmp_path, sweep)
-        assert (note.format(10) + 'choose Trim to Kelly on and Min. price rise "10c" in the '
-                "filter bar to see it</p>") in page
-        # A saved minimum the page does not offer
-        page = _ao_page(monkeypatch, tmp_path, dataclasses.replace(sweep, live_trim_min_rise=0.15))
-        assert note.format(15) + "this page cannot show that minimum price rise</p>" in page
-        # No Trim to Kelly family
-        page = _ao_page(monkeypatch, tmp_path, dataclasses.replace(sweep, trim_sweep=None))
-        assert note.format(10) + "this page has no Trim to Kelly view</p>" in page
 
 
 class TestSidecarFolders:
@@ -15645,8 +14735,8 @@ class TestSellScript:
     after which its address carries the level and minimum shown; a block that
     cannot be inflated, or a file that cannot be loaded or hands nothing over,
     puts both choices back in Python's words; Sell is set to no selling and
-    shut while Add to held pairs is on (a level beside adding is never looked
-    up, and a failed add-on chunk gives the level back). The harness's "wait"
+    shut while Rebalance is yes (a level beside rebalancing is never looked
+    up, and a failed rebalancing chunk gives the level back). The harness's "wait"
     does not wait on flt-sell (a page without the view keeps it shut), so
     setup_js adds it. Skipped without a JavaScript runtime."""
 
@@ -15703,26 +14793,27 @@ class TestSellScript:
         assert snaps["sold"]["selects"]["flt-days"]["disabled"] is False
         assert snaps["none"]["selects"]["flt-days"]["disabled"] is True
 
-    def test_sell_is_shut_at_no_selling_while_adding_is_on(self, monkeypatch, tmp_path):
+    def test_sell_is_shut_at_no_selling_while_rebalancing(self, monkeypatch, tmp_path):
         # A sell run neither adds to held pairs nor trims, so Sell goes back to
-        # no selling and shuts while Add to held pairs is on (as it does while
-        # Trim to Kelly is on), and opens again, at no selling, when it goes
-        # off. Save sends what is on screen: with adding on, no selling (the
-        # level shown before is gone), and with adding off again, still none.
-        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_add_on()))
+        # no selling and shuts while Rebalance is yes, and opens again, at no
+        # selling, when it goes back to no. Save sends what is on screen: with
+        # Rebalance yes, no selling (the level shown before is gone), and with
+        # it no again, still none.
+        rebalance = TestRebalanceScript
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_rebalance()))
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
-        cid = data["grid_add"][0][1][1]
+        cid = data["grid_rebalance"][0][1][1]
         snaps = self._run(tmp_path, page, [
             ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
-            ["snap", "level"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"],
-            ["click", "flt-save"], ["snap", "on"],
-            ["set", "flt-add", "off"], ["fire", "flt-add"], ["settle"],
-            ["click", "flt-save"], ["snap", "off"]], strict=True, js="__BAR.push('flt-add');")
+            ["snap", "level"], *rebalance.ON, ["click", "flt-save"], ["snap", "on"],
+            *rebalance.OFF, ["click", "flt-save"], ["snap", "off"]],
+            strict=True, js=rebalance.WAIT)
         for name in ("on", "off"):
             [opened] = snaps[name]["opened"]
             query = TestSaveLiveDefaultsButton._query(data, opened)
-            assert (query["add_to_held_pairs"], query["sell_at"], query["sell_min_days"]) == (
-                name, "off", "off"), name
+            assert (query["add_to_held_pairs"], query["trim_to_kelly"], query["trim_min_rise"],
+                    query["sell_at"], query["sell_min_days"]) == (
+                name, name, "off", "off", "off"), name
         level = snaps["level"]["selects"]
         assert level["flt-sell"]["value"] == "0" and level["flt-days"]["disabled"] is False
         on = snaps["on"]
@@ -15730,48 +14821,47 @@ class TestSellScript:
         assert on["selects"]["flt-sell"]["value"] == "none"
         assert on["selects"]["flt-sell"]["disabled"] is True
         assert on["selects"]["flt-days"]["disabled"] is True
-        # ... and the scenario drawn is the adding one, with no sale in its words
+        # ... and the scenario drawn is the rebalancing one, with no sale in its words
         assert f"dash-chunk-{cid}" in on["inflated"]
         view = chunks[cid]["list"]["views"]["all"]["n"]
         assert on["text"]["flt-summary"] == dashboard._filter_summary_text(
-            data["text"], _phrase(data, 0, 1, 1) + data["text"]["add_on"], False, None, view,
-            view, note="other_run", add_on=True)
+            data["text"], _phrase(data, 0, 1, 1) + data["text"]["rebalance"], False, None,
+            view, view, note="other_run", rebalance=True)
         assert data["text"]["sell_note"] not in on["text"]["flt-summary"]
-        # Adding off: Sell opens again, still at no selling, its days shut
+        # Rebalance no: Sell opens again, still at no selling, its days shut
         off = snaps["off"]["selects"]
         assert off["flt-sell"] == {**off["flt-sell"], "value": "none", "disabled": False}
         assert off["flt-days"]["disabled"] is True
 
-    def test_a_sell_level_beside_adding_is_never_looked_up(self, monkeypatch, tmp_path):
-        # Were a level ever chosen while adding is on (the select is shut then,
-        # so a test sets the choices without the change events), the page holds
-        # no scenario for it: no Sell block is inflated and no file is loaded
-        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_add_on()))
+    def test_a_sell_level_beside_rebalancing_is_never_looked_up(self, monkeypatch, tmp_path):
+        # Were a level ever chosen while Rebalance is yes (the select is shut
+        # then, so a test sets the choices without the change events), the page
+        # holds no scenario for it: no Sell block is inflated and no file is loaded
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_rebalance()))
         data = TestFilterPage._data(page)
         snap = self._run(tmp_path, page, [
-            ["wait"], ["set", "flt-add", "on"], ["set", "flt-sell", "0"],
+            ["wait"], ["set", "flt-rebalance", "yes"], ["set", "flt-sell", "0"],
             ["fire", "flt-sell"], ["settle"], ["snap", "s"]], strict=True,
-            js="__BAR.push('flt-add');")["s"]
+            js=TestRebalanceScript.WAIT)["s"]
         assert snap["files"] == [] and "dash-sell-0" not in snap["inflated"]
         assert snap["text"]["hdr-trades"] == "0"
-        assert data["text"]["add_on"] in snap["text"]["flt-summary"]
+        assert data["text"]["rebalance"] in snap["text"]["flt-summary"]
         assert data["sell_levels"][0]["phrase"] in snap["text"]["flt-summary"]
 
-    def test_a_failed_add_on_chunk_gives_the_sell_level_back(self, monkeypatch, tmp_path):
-        # A sell level was on screen when Add to held pairs was chosen (which
-        # set Sell to no selling and shut it) and the add-on chunk could not be
-        # loaded: adding goes back off, and the level, its days and both selects
-        # come back as they were
-        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_add_on()))
+    def test_a_failed_rebalance_chunk_gives_the_sell_level_back(self, monkeypatch, tmp_path):
+        # A sell level was on screen when Rebalance yes was chosen (which set
+        # Sell to no selling and shut it) and the rebalancing chunk could not
+        # be loaded: Rebalance goes back to no, and the level, its days and
+        # both selects come back as they were
+        page = _sl_page(monkeypatch, tmp_path, _kc_sweep_sell(_kc_sweep_rebalance()))
         data = TestFilterPage._data(page)
-        cid = data["grid_add"][0][1][1]
+        cid = data["grid_rebalance"][0][1][1]
         snaps = self._run(tmp_path, page, [
             ["wait"], ["set", "flt-sell", "0"], ["fire", "flt-sell"], ["settle"],
-            ["snap", "level"], ["set", "flt-add", "on"], ["fire", "flt-add"], ["settle"],
-            ["snap", "back"]], strict=True, js="__BAR.push('flt-add');",
-            damaged=(f"dash-chunk-{cid}",))
+            ["snap", "level"], *TestRebalanceScript.ON, ["snap", "back"]], strict=True,
+            js=TestRebalanceScript.WAIT, damaged=(f"dash-chunk-{cid}",))
         back = snaps["back"]["selects"]
-        assert back["flt-add"]["value"] == "off"
+        assert back["flt-rebalance"]["value"] == "no"
         assert back["flt-sell"]["value"] == "0" and back["flt-sell"]["disabled"] is False
         assert back["flt-days"]["disabled"] is False
         assert snaps["back"]["text"]["hdr-trades"] == snaps["level"]["text"]["hdr-trades"]
@@ -16087,7 +15177,7 @@ class TestSellEndToEnd:
         return backtester.run_backtest_sweep(
             MagicMock(), MagicMock(), golden._START, 10_000.0, same_event_ladders=True,
             interval_discount=0.5, band_sweep=True, tier_off_sweep=True, cap_sweep=True,
-            add_on_sweep=True, sell_sweep=True)
+            sell_sweep=True, rebalance_sweep=True)
 
     @pytest.mark.usefixtures("pre_toggle_defaults")
     def test_every_setting_pages_its_own_simulation(self, monkeypatch, tmp_path, caplog):
@@ -16331,34 +15421,24 @@ class TestFilterPageSize:
     works a mix out are about 34 KB of every variant, whatever its data.
 
     The Min. price rise select (its options and hover text, and the script
-    that reads it) is about 3.5 KB of every variant: each re-measured
-    2026-10-13 (same environment), in the constants below, beside its size
-    the same day before the select."""
+    that reads it) was about 3.5 KB of every variant (2026-10-13). The
+    Rebalance and Min. price movement selects, in place of Add to held pairs,
+    Trim to Kelly and Min. price rise, take 3,303 bytes off every variant:
+    each re-measured 2026-10-17 (same environment), in the constants below,
+    beside its size the same day before them."""
 
     # 837,197 before the mix data; 922,701 with it, the menus and the mix
     # script ("m" in place of "eq" alone); 897,445 with a tag view's other
     # curve series left out as well (2026-10-10); 905,055 with the Min. price
-    # rise select (2026-10-13; 901,542 the same day before it)
-    PAGE_BYTES_MEASURED = 905_055
+    # rise select (2026-10-13; 901,542 the same day before it); 925,829 with
+    # the Rebalance and Min. price movement selects (2026-10-17; 929,132 the
+    # same day before them)
+    PAGE_BYTES_MEASURED = 925_829
     BUDGET = int(PAGE_BYTES_MEASURED * 1.2)
-    # 1,119,167 before; 1,233,927; 1,193,307; 1,200,909 (1,197,396)
-    PAGE_BYTES_MEASURED_FAMILY = 1_200_909
+    # 1,119,167 before; 1,233,927; 1,193,307; 1,200,909 (1,197,396);
+    # 1,235,347 (1,238,650)
+    PAGE_BYTES_MEASURED_FAMILY = 1_235_347
     BUDGET_FAMILY = int(PAGE_BYTES_MEASURED_FAMILY * 1.2)
-    # The Add to held pairs view, where every band's add-on run trades yet
-    # another list (a worst case: a real run's add-on lists mostly equal the
-    # run as simulated and share its chunks): on its own it took the page
-    # from 815,777 to 1,274,895 bytes, and beside the tier-floors-off family
-    # (whose 18 binding bands each gain an add-on twin of their own) from
-    # 1,098,598 to 1,784,261 (2026-09-30). On 2026-10-10: 1,289,102 and
-    # 1,798,488 before the mix data; 1,424,198 and 1,987,940 with it, the
-    # menus and the mix script; and, with a tag view's other curve series
-    # left out as well, 1,367,286 and 1,899,628. On 2026-10-13, with the Min.
-    # price rise select, the constants below (1,371,379 and 1,903,729 the
-    # same day before it). Each budget is its measurement + 20%.
-    PAGE_BYTES_MEASURED_ADD_ON = 1_374_892
-    BUDGET_ADD_ON = int(PAGE_BYTES_MEASURED_ADD_ON * 1.2)
-    PAGE_BYTES_MEASURED_ADD_ON_FAMILY = 1_907_242
-    BUDGET_ADD_ON_FAMILY = int(PAGE_BYTES_MEASURED_ADD_ON_FAMILY * 1.2)
     # Every trade with quotes that move on most days it is held (a run valued
     # at market), the trade lists unchanged: each curve then changes on most
     # days a trade is open, where at cost it changed only on entry and pay-out
@@ -16371,31 +15451,33 @@ class TestFilterPageSize:
     # view's other curve series left out as well, 1,342,624 and 1,863,334 (a
     # curve that moves daily was the costly part of each tag view). On
     # 2026-10-13, with the Min. price rise select, the constants below
-    # (1,346,640 and 1,867,390 the same day before it).
-    PAGE_BYTES_MEASURED_QUOTED = 1_350_153
+    # (1,346,640 and 1,867,390 the same day before it). On 2026-10-17, with
+    # the Rebalance and Min. price movement selects, 1,370,924 and 1,905,370
+    # (1,374,227 and 1,908,673 the same day before them).
+    PAGE_BYTES_MEASURED_QUOTED = 1_370_924
     BUDGET_QUOTED = int(PAGE_BYTES_MEASURED_QUOTED * 1.2)
-    PAGE_BYTES_MEASURED_QUOTED_FAMILY = 1_870_903
+    PAGE_BYTES_MEASURED_QUOTED_FAMILY = 1_905_370
     BUDGET_QUOTED_FAMILY = int(PAGE_BYTES_MEASURED_QUOTED_FAMILY * 1.2)
-    # The Trim to Kelly view, where every band's trimming run trades yet
-    # another list (a worst case: a real trimming run mostly trades the list
-    # of the run without it and shares its chunk). Measured 1,286,299 bytes
-    # (2026-10-10, plotly 6.9.0 / pandas 3.0.3 / numpy 2.4.6). Re-measured
-    # 2026-10-13 (same environment): 1,365,630 before the Min. price rise
-    # select and 1,369,252 with it — shut on this page, whose family carries
-    # no minimum, with its note beside it. Its budget is that + 20%.
-    PAGE_BYTES_MEASURED_TRIM = 1_369_252
-    BUDGET_TRIM = int(PAGE_BYTES_MEASURED_TRIM * 1.2)
+    # The Rebalance view, where every band's rebalancing run trades yet
+    # another list (a worst case: a real rebalancing run mostly trades the
+    # list of the run without it and shares its chunk), and beside the
+    # tier-floors-off family, whose 18 binding bands each gain a rebalancing
+    # twin of their own. Measured 2026-10-17 (plotly 6.9.0, pandas 3.0.3,
+    # numpy 2.4.6): 1,396,467 and 1,943,061 bytes. Each budget is its
+    # measurement + 20%.
+    PAGE_BYTES_MEASURED_REBALANCE = 1_396_467
+    BUDGET_REBALANCE = int(PAGE_BYTES_MEASURED_REBALANCE * 1.2)
+    PAGE_BYTES_MEASURED_REBALANCE_FAMILY = 1_943_061
+    BUDGET_REBALANCE_FAMILY = int(PAGE_BYTES_MEASURED_REBALANCE_FAMILY * 1.2)
 
     @pytest.mark.parametrize(
-        "family, add_on, quoted, trim",
-        [(False, False, False, False), (True, False, False, False),
-         (False, True, False, False), (True, True, False, False),
-         (False, False, True, False), (True, False, True, False),
-         (False, False, False, True)],
-        ids=["tier-on-only", "tier-off-family", "add-on", "add-on-and-tier-off-family",
-             "quoted", "quoted-and-tier-off-family", "trim"])
+        "family, rebalance, quoted",
+        [(False, False, False), (True, False, False), (False, True, False),
+         (True, True, False), (False, False, True), (True, False, True)],
+        ids=["tier-on-only", "tier-off-family", "rebalance", "rebalance-and-tier-off-family",
+             "quoted", "quoted-and-tier-off-family"])
     def test_distinct_band_lists_stay_under_budget(self, monkeypatch, tmp_path, family,
-                                                   add_on, quoted, trim):
+                                                   rebalance, quoted):
         import random
         monkeypatch.setattr(dashboard, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(dashboard.yf, "download",
@@ -16447,44 +15529,31 @@ class TestFilterPageSize:
         for band in binding:
             off_scenarios.append(point(1000, band, tier_floors=False))
             off_cals[band] = calibration()
-        # The add-on family: one more list per band (and per binding band with
-        # the tiers off), each a run that added a trade of its own to the
-        # band's list, over the grid's one k and the run's own cap
-        add_points, add_off_points = {}, {}
-        if add_on:
-            def added(base: SweepPoint) -> SweepPoint:
-                extra = _ao_trade(base.trades[0], event=f"KXS00-{rng.randint(0, 10**9)}")
-                trades = sorted([*base.trades, extra], key=lambda t: t.entry_date)
-                return dataclasses.replace(
-                    base, trades=trades, add_to_held=True,
-                    equity_df=backtester._build_equity_curve(trades, start, 10_000.0))
-            add_points = {(p.spread_band, 0.75, 0.2): added(p) for p in scenarios}
-            add_off_points = {(p.spread_band, 0.75, 0.2): added(p) for p in off_scenarios}
         sweep = BacktestSweep(primary=scenarios[0], points=[scenarios[0]],
                               calibration=cals[bands[0]], label_coverage=_scn_coverage(),
                               scenarios=scenarios, calibrations_by_band=cals,
                               tier_off_scenarios=off_scenarios,
                               tier_off_calibrations_by_band=off_cals)
-        if add_on:
-            def fake_family(points: dict, band_list) -> _FakeCapSweep:
-                return _FakeCapSweep(points, bands=tuple(band_list), ks=(0.75,), caps=(0.2,))
-            sweep = dataclasses.replace(
-                sweep, add_on_cap_sweep=fake_family(add_points, bands),
-                add_on_tier_off_cap_sweep=(fake_family(add_off_points, binding)
-                                           if binding else None))
-        if trim:
-            # One more list per band: the band's list with its first pair sold
-            # in two parts, over the grid's one k and the run's own cap
-            def trimmed(base: SweepPoint) -> SweepPoint:
-                trades = sorted(_tr_split(base.trades), key=lambda t: t.entry_date)
+        if rebalance:
+            # One more list per band (and per binding band with the tiers
+            # off): the band's list with a trade added to its first pair and
+            # that pair sold down in two parts, over the grid's one k and the
+            # run's own cap
+            def rebalanced(base: SweepPoint) -> SweepPoint:
+                extra = _rb_added(base.trades[0], event=f"KXS00-{rng.randint(0, 10**9)}")
+                trades = sorted([*_rb_split(base.trades), extra], key=lambda t: t.entry_date)
                 return dataclasses.replace(
-                    base, trades=trades, trim_to_kelly=True,
+                    base, trades=trades, add_to_held=True, trim_to_kelly=True,
                     equity_df=backtester._build_equity_curve(trades, start, 10_000.0))
-            axes = {"bands": tuple(bands), "ks": (0.75,), "caps": (0.2,)}
-            sweep = dataclasses.replace(sweep, trim_sweep=_FakeTrimSweep({
-                (False, False): _FakeCapSweep(
-                    {(p.spread_band, 0.75, 0.2): trimmed(p) for p in scenarios}, **axes),
-                (True, False): _FakeCapSweep({}, **axes)}, **axes))
+
+            def capped(points, band_list) -> _FakeCapSweep:
+                return _FakeCapSweep({(p.spread_band, 0.75, 0.2): rebalanced(p) for p in points},
+                                     bands=tuple(band_list), ks=(0.75,), caps=(0.2,))
+            sweeps = {False: capped(scenarios, bands)}
+            if binding:
+                sweeps[True] = capped(off_scenarios, binding)
+            sweep = dataclasses.replace(sweep, rebalance_sweep=_FakeRebalanceSweep(
+                sweeps, bands=tuple(bands), off_bands=tuple(binding), ks=(0.75,), caps=(0.2,)))
         out = dashboard.generate_dashboard(
             scenarios[0].trades, scenarios[0].equity_df, start, 10_000.0, sweep=sweep,
             interval_discount=0.75, series_categories=categories)
@@ -16492,7 +15561,7 @@ class TestFilterPageSize:
         data, chunks = TestFilterPage._data(page), TestFilterPage._chunks(page)
         # Nothing collapsed: every list is its own
         assert len(chunks) == (54 if family else 36) + (
-            (36 + (18 if family else 0)) if add_on else 0) + (36 if trim else 0)
+            (36 + (18 if family else 0)) if rebalance else 0)
         assert all(band is not None for band in data["khat"])
         if family:
             assert len(binding) == 18 and len(data["bands_off"]) == 36
@@ -16506,28 +15575,19 @@ class TestFilterPageSize:
         else:
             assert data["bands_off"] is None and data["khat_off"] is None
             assert data["grid_off"] is None
-        if add_on:
-            # The view is on the page, and each add-on list is a chunk of its own
-            assert data["add_state"] == "shown"
-            assert len(_ao_ids(data["grid_add"])) == 36
-            assert _ao_ids(data["grid_add"]).isdisjoint(_ao_ids(data["grid"]))
-            assert (data["grid_add_off"] is not None) is family
+        if rebalance:
+            # The view is on the page, and each rebalancing list is a chunk of its own
+            assert data["rebalance_state"] == "shown"
+            assert len(_rb_ids(data["grid_rebalance"])) == 36
+            assert _rb_ids(data["grid_rebalance"]).isdisjoint(_rb_ids(data["grid"]))
+            assert (data["grid_rebalance_off"] is not None) is family
         else:
-            assert data["grid_add"] is None and data["grid_add_off"] is None
-        if trim:
-            # The view is on the page, and each trimming list is a chunk of its own
-            assert data["trim_state"] == "shown"
-            assert len(_ao_ids(data["grid_trim"])) == 36
-            assert _ao_ids(data["grid_trim"]).isdisjoint(_ao_ids(data["grid"]))
-            assert data["grid_trim_add"] is None
-        else:
-            assert data["grid_trim"] is None and data["trim_state"] == "not simulated"
-        if trim:
-            budget = self.BUDGET_TRIM
-        elif quoted:
+            assert data["grid_rebalance"] is None and data["grid_rebalance_off"] is None
+            assert data["rebalance_state"] == "not simulated"
+        if quoted:
             budget = self.BUDGET_QUOTED_FAMILY if family else self.BUDGET_QUOTED
-        elif add_on:
-            budget = self.BUDGET_ADD_ON_FAMILY if family else self.BUDGET_ADD_ON
+        elif rebalance:
+            budget = self.BUDGET_REBALANCE_FAMILY if family else self.BUDGET_REBALANCE
         else:
             budget = self.BUDGET_FAMILY if family else self.BUDGET
         assert out.stat().st_size <= budget, f"page was {out.stat().st_size} bytes"
