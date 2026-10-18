@@ -50,25 +50,43 @@ Purpose:
     interval by gap band and by category); save_khat() and load_khat() keep it
     in <cache>/eda_days/khat.json so a rebuild without a backtest can show it.
 
+    build_eda_page() draws all of that as the Data page, config.EDA_DASHBOARD_FILENAME
+    under config.PROJECT_ROOT: an inventory; the market universe; price
+    calibration; deadline ladders and k; data quality; and the Terms of
+    glossary.PAGE_DATA. Charts are plotly figures embedded with no copy of
+    Plotly (the page loads it once, from config.LIVE_DASHBOARD_PLOTLY_URL with
+    its integrity hash). Every switch (Non-combo / Combo / All; the calibration's
+    lead and price) is a group of buttons whose views Python has already drawn
+    and hidden; the page's one small script only shows one view and hides the
+    others. It never raises: a failed step is one WARNING and a line on the
+    page, and the rest is still written. `python3 -m kalshi_betting.eda
+    [--workers N]` (main) rebuilds the page from the cache without a backtest.
+    Every word of the page is a constant in the Data page block, except the
+    sentences of the coverage note, which merge() (_coverage) writes and the
+    page shows as they are.
+
 Dependencies:
     The standard library, config (EDA_SUMMARY_DIRNAME, EDA_SUMMARY_VERSION,
     EDA_MAX_WORKERS, EDA_WORKER_START_TIMEOUT_SECONDS,
     EDA_LIFETIME_EDGES_HOURS, EDA_LAG_EDGES_HOURS, EDA_CALIBRATION_BIN,
     EDA_PRICE_LEADS_HOURS, EDA_PRICE_MAX_AGE_HOURS, EDA_CANDLE_FACTS_VERSION,
-    EDA_KHAT_SPREAD_BIN, KHAT_CONFIDENCE_LEVEL,
+    EDA_KHAT_SPREAD_BIN, EDA_KHAT_VERSION, EDA_MAX_BOOK_WIDTH,
+    EDA_MIN_MARKETS_PER_POINT, EDA_DASHBOARD_FILENAME, PRICE_EPSILON, PROJECT_ROOT,
+    KHAT_CONFIDENCE_LEVEL, LIVE_DASHBOARD_PLOTLY_URL, LIVE_DASHBOARD_PLOTLY_SRI,
     CANDLESTICK_CACHE_FIELDS_VERSION, DEPTH_SNAPSHOTS_DIRNAME and
-    MVE_SERIES_FAMILY_PREFIX), historical (the slice reader _day_store_iter,
+    MVE_SERIES_FAMILY_PREFIX), glossary (the Data page's Terms), historical (the slice reader _day_store_iter,
     _SliceUnreadable, _iso_epoch, _read_title_file with _TITLE_FILE_ABSENT,
     the file names of _EVENT_TITLES_CACHE and _CANDLES_DIR, series_labels,
     series_ticker, infer_category, usable_candle_ask) and scanner
     (event_series, deadline_profile, stated_deadline, DEADLINE_CUMULATIVE).
     Imports no order-path module (trader, main, scheduler, run_lock,
     defaults_server, v2_probe, seller), and no module of the package imports
-    this one (tests/test_eda.py::TestIsolation). The one exception to "only
-    the standard library, config, historical and scanner" is khat_view(),
-    which imports backtester and dashboard INSIDE the function, so the
-    worker processes that count the day slices (which import this module
-    afresh) never load pandas or plotly.
+    this one (tests/test_eda.py::TestIsolation). The two exceptions to
+    "only the standard library, config, glossary, historical and scanner"
+    are khat_view(), which imports backtester and dashboard INSIDE the
+    function, and _plotly(), which imports plotly there, so the worker
+    processes that count the day slices (which import this module afresh)
+    never load pandas or plotly.
 
 Notes:
     Which slice counts which market. The archive phase of a fetch holds only
@@ -149,7 +167,10 @@ Notes:
     midpoint alone would drop most long shots. The price for a lead must come
     from a candle that ended within config.EDA_PRICE_MAX_AGE_HOURS before
     close minus the lead; an older last candle gives no price (counted as
-    stale). The close time used is the market's REALIZED close (the cache
+    stale). A one-sided book says little (a 99c ask with nobody bidding only
+    means nobody sold lower), so a price counts only where the book was at
+    most config.EDA_MAX_BOOK_WIDTH wide, a missing bid counting as 0 (counted
+    as wide otherwise). The close time used is the market's REALIZED close (the cache
     records when the market actually closed), so where trading carries on after
     the outcome is known, the 1 hour price can already reflect the outcome. The
     candles are those the backtest priced, so they are not a random sample of
@@ -159,9 +180,12 @@ Notes:
     and once per top-level entry for inventory(); nothing globs or sorts the
     candle folder. The candle files are read in this process, one at a time.
 """
+import argparse
 import gzip
+import html
 import json
 import logging
+import logging.handlers
 import math
 import multiprocessing
 import os
@@ -174,7 +198,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import config, historical, scanner
+from . import config, glossary, historical, scanner
 
 # The two kinds of day slice and the folder under the cache each lives in,
 # as historical._day_store_path names them.
@@ -1338,9 +1362,9 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _candle_prices(candle: Any) -> tuple[float | None, float | None]:
+def _candle_prices(candle: Any) -> tuple[float | None, float | None, bool]:
     """
-    The two prices one candle gives: the YES ask, and the midpoint.
+    The prices one candle gives: the YES ask, the midpoint, and whether the book was too wide.
 
     The YES ask is what betting Yes costs. The midpoint is halfway between the
     YES ask and the YES bid (1 minus the NO ask). Each ask counts only when
@@ -1349,22 +1373,37 @@ def _candle_prices(candle: Any) -> tuple[float | None, float | None]:
     shot's YES bid is under a cent, so its NO ask sits at the clamp: it still
     has a YES ask but no midpoint.
 
+    A one-sided book says little: a 99c ask with nobody bidding only means
+    nobody sold below 99c. So a price counts only where the book was at most
+    config.EDA_MAX_BOOK_WIDTH wide: the YES ask minus the YES bid, with a
+    missing bid (an unusable NO ask) counted as a bid of 0 (so a long shot
+    asked at 3c with no bid is 3c wide and counts, a 99c ask with no bid does
+    not). A wider book gives no price at all, and is reported as wide.
+
+    Residual: a real 1c YES bid reads as no bid (its NO ask sits at the 0.99
+    clamp, which is no quote), so a book 10 to 11c wide with a 1c bid counts
+    as wide.
+
     Args:
         candle (Any): One candle of a candle file.
 
     Returns:
-        tuple[float | None, float | None]: (YES ask, midpoint); each None when
-            not usable. A midpoint is never given without a YES ask.
+        tuple[float | None, float | None, bool]: (YES ask, midpoint, wide);
+            each price None when not usable or when the book was wide. A
+            midpoint is never given without a YES ask.
     """
     if not isinstance(candle, dict):
-        return None, None
+        return None, None, False
     yes = historical.usable_candle_ask(candle.get("yes_ask_close"), "yes")
     if math.isnan(yes):
-        return None, None
+        return None, None, False
     no = historical.usable_candle_ask(candle.get("no_ask_close"), "no")
+    bid = 0.0 if math.isnan(no) else 1.0 - no
+    if yes - bid > config.EDA_MAX_BOOK_WIDTH + config.PRICE_EPSILON:
+        return None, None, True
     if math.isnan(no):
-        return yes, None
-    return yes, (yes + (1.0 - no)) / 2.0
+        return yes, None, False
+    return yes, (yes + (1.0 - no)) / 2.0, False
 
 
 def _read_candle_file(path: Path, close_epoch: float | None, leads: tuple) -> dict:
@@ -1390,9 +1429,10 @@ def _read_candle_file(path: Path, close_epoch: float | None, leads: tuple) -> di
             when absent, 0 for anything else), "e" (True when the file holds
             no candle), "vol" (the traded volume summed over the candles that
             state one, None when none does), "asks" and "mids" (per lead, the
-            candle's YES ask and midpoint, or None) and "stale" (per lead,
+            candle's YES ask and midpoint, or None), "stale" (per lead,
             True when the last candle at or before the lead's moment is too
-            old to use).
+            old to use) and "wide" (per lead, True when the candle's book was
+            wider than config.EDA_MAX_BOOK_WIDTH, so no price is kept).
 
     Raises:
         Exception: When the file cannot be read or is not a candle file; the
@@ -1429,9 +1469,11 @@ def _read_candle_file(path: Path, close_epoch: float | None, leads: tuple) -> di
     max_age = config.EDA_PRICE_MAX_AGE_HOURS * _SECONDS_PER_HOUR
     stale = [best_ts[i] is not None and best_ts[i] <= targets[i] - max_age
              for i in range(len(leads))]
-    prices = [(None, None) if stale[i] else _candle_prices(best[i]) for i in range(len(leads))]
+    prices = [(None, None, False) if stale[i] else _candle_prices(best[i])
+              for i in range(len(leads))]
     return {"f": fields, "e": not candles, "vol": volume if has_volume else None,
-            "asks": [p[0] for p in prices], "mids": [p[1] for p in prices], "stale": stale}
+            "asks": [p[0] for p in prices], "mids": [p[1] for p in prices],
+            "stale": stale, "wide": [p[2] for p in prices]}
 
 
 def _load_candle_cache(path: Path, leads: tuple) -> dict:
@@ -1530,7 +1572,7 @@ def _fact_matches(fact: Any, size: int, mtime_ns: int, close: Any, leads: tuple)
             entry is well formed: "f" a whole number, "e" a bool, "vol" None
             or a finite number, "asks" and "mids" lists of one price (None or
             a finite number in (0, 1)) per lead, "stale" a list of one bool
-            per lead.
+            per lead, "wide" likewise.
     """
     if not isinstance(fact, dict):
         return False
@@ -1538,12 +1580,14 @@ def _fact_matches(fact: Any, size: int, mtime_ns: int, close: Any, leads: tuple)
             and fact.get("v") == config.EDA_CANDLE_FACTS_VERSION):
         return False
     count = len(leads)
-    stale = fact.get("stale")
+    stale, wide = fact.get("stale"), fact.get("wide")
     return (_is_int(fact.get("f")) and isinstance(fact.get("e"), bool)
             and "vol" in fact and (fact["vol"] is None or _finite(fact["vol"]) is not None)
             and _price_list(fact.get("asks"), count) and _price_list(fact.get("mids"), count)
             and isinstance(stale, list) and len(stale) == count
-            and all(isinstance(x, bool) for x in stale))
+            and all(isinstance(x, bool) for x in stale)
+            and isinstance(wide, list) and len(wide) == count
+            and all(isinstance(x, bool) for x in wide))
 
 
 def _new_cell(nbins: int) -> dict:
@@ -1554,9 +1598,9 @@ def _new_cell(nbins: int) -> dict:
         nbins (int): How many price bins.
 
     Returns:
-        dict: {"bins": [[markets, yes], ...], "n": 0, "brier_sum": 0.0}.
+        dict: {"bins": [[markets, yes, price sum], ...], "n": 0, "brier_sum": 0.0}.
     """
-    return {"bins": [[0, 0] for _ in range(nbins)], "n": 0, "brier_sum": 0.0}
+    return {"bins": [[0, 0, 0.0] for _ in range(nbins)], "n": 0, "brier_sum": 0.0}
 
 
 def _add_price(cell: dict, price: float, outcome: float, width: float) -> None:
@@ -1572,6 +1616,7 @@ def _add_price(cell: dict, price: float, outcome: float, width: float) -> None:
     slot = cell["bins"][_bin_index(price, width, len(cell["bins"]))]
     slot[0] += 1
     slot[1] += int(outcome)
+    slot[2] += price
     cell["n"] += 1
     cell["brier_sum"] += (price - outcome) ** 2
 
@@ -1587,7 +1632,9 @@ def summarise_candles(cache_dir: Path, candles: dict) -> dict:
     config.EDA_PRICE_LEADS_HOURS: the YES ask (the primary price: what betting
     Yes costs) and the midpoint (only where the NO side is usable too) of the
     last candle at or before close - lead, used only when it ended within
-    config.EDA_PRICE_MAX_AGE_HOURS of that moment. Each price is filed in a
+    config.EDA_PRICE_MAX_AGE_HOURS of that moment and only when its book was at
+    most config.EDA_MAX_BOOK_WIDTH wide (YES ask minus YES bid, a missing bid
+    counting as 0; see _candle_prices). Each price is filed in a
     bin of config.EDA_CALIBRATION_BIN dollars with how many of its markets
     settled Yes, and its Brier sum (price - outcome)^2 is kept, for a market
     whose result is "yes" or "no". The traded volume per category comes from
@@ -1604,12 +1651,15 @@ def summarise_candles(cache_dir: Path, candles: dict) -> dict:
     Returns:
         dict: "leads" (the hours), "bin_width", "bins" (the bin count),
             "calibration" (str(lead) -> category -> {"ask": cell, "mid": cell},
-            a cell being {"bins": [[markets, yes], ...], "n": markets priced,
+            a cell being {"bins": [[markets, yes, sum of their prices], ...],
+            "n": markets priced,
             "brier_sum": float}; a category appears at a lead once one of its
             markets has an ask there), "coverage" (str(lead) -> {"markets":
             joined non-combo markets with a yes or no result, "no_ask": of
             them with no YES ask price at the lead, "no_mid": with no
-            midpoint, "stale": whose last candle was too old}), "volume"
+            midpoint, "stale": whose last candle was too old, "wide": whose book
+            was too wide to price; a wide market is not also counted in no_ask
+            or no_mid}), "volume"
             (category -> contracts), "volume_files" (files that added to it),
             "files" (candle files seen), "by_fields" (field version as text,
             "0" for an odd one -> files), "empty", "unreadable", "unjoined"
@@ -1627,7 +1677,7 @@ def summarise_candles(cache_dir: Path, candles: dict) -> dict:
     saved = _load_candle_cache(cache_path, leads)
     fresh: dict[str, dict] = {}
     calibration: dict[str, dict[str, dict]] = {str(lead): {} for lead in leads}
-    coverage = {str(lead): {"markets": 0, "no_ask": 0, "no_mid": 0, "stale": 0}
+    coverage = {str(lead): {"markets": 0, "no_ask": 0, "no_mid": 0, "stale": 0, "wide": 0}
                 for lead in leads}
     volume: dict[str, float] = {}
     out = {"leads": list(leads), "bin_width": width, "bins": nbins,
@@ -1693,6 +1743,9 @@ def summarise_candles(cache_dir: Path, candles: dict) -> dict:
                 seen["markets"] += 1
                 seen["stale"] += bool(fact["stale"][i])
                 ask, mid = fact["asks"][i], fact["mids"][i]
+                if fact["wide"][i]:
+                    seen["wide"] += 1
+                    continue
                 seen["no_ask"] += ask is None
                 seen["no_mid"] += mid is None
                 if ask is None and mid is None:
@@ -2121,10 +2174,12 @@ def save_khat(cache_dir: Path, view: dict) -> None:
 
     Raises:
         ValueError: When the view holds a NaN or infinite number (strict JSON
-            has none); nothing is written and any earlier file stays.
+            has none); nothing is written and any earlier file stays. The file
+            also records config.EDA_KHAT_VERSION, which load_khat checks.
         OSError: When the file cannot be written.
     """
-    text = json.dumps(view, allow_nan=False, separators=(",", ":"))
+    text = json.dumps({**view, "version": config.EDA_KHAT_VERSION}, allow_nan=False,
+                      separators=(",", ":"))
     path = _khat_path(cache_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + _TMP_SUFFIX)
@@ -2160,11 +2215,1618 @@ def load_khat(cache_dir: Path) -> dict | None:
         cache_dir (Path): The cache folder.
 
     Returns:
-        dict | None: The view, or None when the file is missing, cannot be
-            read, is not strict JSON or is not a JSON object.
+        dict | None: The view as save_khat was given it (the version key is
+            taken off), or None when the file is missing, cannot be read, is not
+            strict JSON, is not a JSON object, or has a version other than
+            config.EDA_KHAT_VERSION or none.
     """
     try:
         view = json.loads(_khat_path(cache_dir).read_text(), parse_constant=_refuse_constant)
     except Exception:
         return None
-    return view if isinstance(view, dict) else None
+    if not isinstance(view, dict) or view.get("version") != config.EDA_KHAT_VERSION:
+        return None
+    return {key: value for key, value in view.items() if key != "version"}
+
+
+# ─── The Data page ────────────────────────────────────────────────────────────
+#
+# Everything below builds the page; nothing above depends on it. Every word the
+# page shows is one of the constants in this block, so the script that switches
+# views writes no text of its own.
+
+PAGE_TITLE = "Data"
+PAGE_BUILT = "Built {when} from {files:,} day files ({records:,} records)."
+PAGE_BUILT_NO_COUNTS = ("Built {when}. The day files could not be counted; see the notes "
+                        "below.")
+BUILT_TIME_FORMAT = "%Y-%m-%d %H:%M UTC"
+FAILURES_HEAD = "Some steps of this build failed, so parts of the page are missing:"
+FAILURE_LINE = "{step}: {reason}"
+STEP_SUMMARIES = "Counting the day files"
+STEP_CANDLES = "Reading the candle files"
+STEP_INVENTORY = "Listing the cache folder"
+STEP_KHAT = "Preparing the k figures"
+STEP_LISTING = "Reading Kalshi's series listing"
+STEP_CHARTS = "Loading the chart library"
+STEP_KHAT_SAVE = "Saving the k figures"
+CHARTS_UNAVAILABLE = "the chart library could not be loaded"
+PAGE_FAILED = "The page could not be put together ({reason})."
+MAIN_NO_PAGE = "No page could be written; see kalshi_eda.log."
+EDA_LOG_FILENAME = "kalshi_eda.log"
+SECTION_FAILED = "The {section} section could not be built ({reason})."
+NO_DAY_COUNTS = "The day-file counts are missing, so there is nothing to draw here."
+NO_CANDLES = "The candle figures are missing, so there is nothing to draw here."
+NO_MARKETS_IN_VIEW = "No markets in this view."
+NO_DATA_FOR_CHART = "Nothing to draw."
+
+HEADING_INVENTORY = "Inventory"
+HEADING_UNIVERSE = "Market universe"
+HEADING_CALIBRATION = "Price calibration"
+HEADING_LADDERS = "Deadline ladders and k"
+HEADING_QUALITY = "Data quality"
+
+INVENTORY_HEADERS = ("Item", "Files", "Size", "Dates", "What it is")
+INVENTORY_NOTE = ("Assembled corpora are filtered to the markets the backtest could trade, "
+                  "and candle files cover only the markets the backtest priced, so neither "
+                  "is the whole exchange. The day files are the unfiltered record of what "
+                  "settled.")
+INVENTORY_EMPTY = "The cache folder holds nothing."
+INVENTORY_DATES = "{first} to {last}"
+INVENTORY_START = "starts {value}"
+INVENTORY_FILTER = "filter {value}"
+INVENTORY_ASSEMBLED = "assembled {value}"
+INVENTORY_SNAPSHOTS = "{count:,} snapshots"
+INVENTORY_SNAPSHOT_ONE = "1 snapshot"
+INVENTORY_NEWEST = "newest {value} UTC"
+INVENTORY_META_ERROR = "first line unreadable: {reason}"
+INVENTORY_UNREADABLE_PARTS = "{count:,} unreadable parts"
+INVENTORY_ERROR = "could not be read: {reason}"
+NOT_AVAILABLE = "—"
+# Units, written in one place: an hour edge or lead below HOURS_AS_DAYS_FROM
+# hours is written in hours, otherwise in whole days when it is a whole number
+# of them; sizes step up every BYTES_PER_STEP.
+HOURS_TEXT = "{value:g} h"
+DAYS_TEXT = "{value:g} d"
+HOURS_AS_DAYS_FROM = 48
+HOURS_PER_DAY = 24
+BYTE_UNITS = ("B", "KB", "MB", "GB")
+BYTES_PER_STEP = 1000
+BYTES_TEXT = "{value:d} {unit}"
+BYTES_TEXT_DECIMAL = "{value:.1f} {unit}"
+
+SWITCH_COMBO_LABEL = "Show"
+VIEW_LABELS = {"noncombo": "Non-combo", "combo": "Combo", "all": "All"}
+LEAD_SWITCH_LABEL = "Price taken"
+LEAD_LABEL = "{span} before close"
+PRICE_SWITCH_LABEL = "Price"
+PRICE_LABELS = {"ask": "Yes ask", "mid": "Midpoint"}
+
+UNIVERSE_INTRO = ("Markets that have settled, by the week they settled in (weeks start on "
+                  "Monday, UTC). The Combo switch separates multi-leg tickets from "
+                  "ordinary markets; Non-combo is the default.")
+UNIVERSE_RESIDUAL = ("Each market is counted once per day file. The day files do not "
+                     "overlap, except that a market settled exactly on a UTC midnight may "
+                     "sit in two neighbouring live days and be counted twice.")
+UNIVERSE_UNKNOWN_WEEK = ("{count:,} markets have no readable settlement time; they are in "
+                         "the totals but not in the weekly charts.")
+CHART_SETTLED = "Markets settled per week"
+CHART_SETTLED_NOTE = ("Stacked by Kalshi category: the {top} largest, and the rest as "
+                      "More.")
+CHART_YES_BY_CATEGORY = "Share settled Yes, by category"
+CHART_YES_BY_CATEGORY_NOTE = ("Of the markets that settled Yes or No, the fraction that "
+                              "settled Yes, largest category first. A low share means the "
+                              "questions mostly ask about things that do not happen. "
+                              "Categories with no settled Yes or No market are left out.")
+CHART_YES_OVER_TIME = "Share settled Yes, by month"
+CHART_YES_OVER_TIME_NOTE = ("The largest categories, by the month of the settlement week. A "
+                            "category's month with fewer than {minimum} settled markets is "
+                            "left out, so a few markets do not make a 0% or 100% spike.")
+CHART_LIFETIME = "Market lifetime"
+CHART_LIFETIME_NOTE = "Close time minus open time."
+CHART_LAG = "Settlement lag"
+CHART_LAG_NOTE = "Settlement time minus close time."
+CHART_REGIME = "Tick regime over time"
+CHART_REGIME_NOTE = "Share of each week's settled markets by price tick structure."
+CHART_SHARD = "Exchange shard over time"
+CHART_SHARD_NOTE = "Share of each week's settled markets by exchange shard."
+CHART_VOLUME = "Traded volume, by category"
+CHART_VOLUME_NOTE = ("Contracts traded, summed from the candle files that record volume, "
+                     "for markets that are not combos: {files:,} of the {all:,} candle "
+                     "files joined to a settled non-combo market carry it.")
+AXIS_MARKETS = "Markets"
+AXIS_LADDERS = "Ladders"
+AXIS_SHARE_YES = "Share settled Yes (%)"
+AXIS_PERCENT = "Share (%)"
+AXIS_CONTRACTS = "Contracts"
+AXIS_MONTH = "Month"
+AXIS_WEEK = "Week"
+LABEL_MORE = "More"
+LABEL_NONE_RECORDED = "none recorded"
+LABEL_SHARD = "Shard {value}"
+LABEL_UNKNOWN_BUCKET = "unknown"
+LAG_FIRST_BUCKET = "before close"
+LIFETIME_FIRST_BUCKET = "under {edge}"
+BUCKET_MIDDLE = "{low} to {high}"
+BUCKET_LAST = "{edge} or more"
+HOVER_YES_SHARE = "%{x}: %{y:.1f}% Yes of %{customdata:,} settled"
+HOVER_YES_BAR = "%{y}: %{x:.1f}% Yes of %{customdata:,} settled"
+HOVER_COUNT_BAR = "%{y}: %{x:,}"
+TEXT_YES_BAR = "{share:.1f}% of {count:,}"
+
+CALIBRATION_INTRO = ("Each market's price at a set time before close, against how it "
+                     "settled. Pick when the price was taken and which price. Combo "
+                     "markets are not calibrated, so there is no Combo switch here: "
+                     "their prices are not what the strategy trades.")
+CALIBRATION_SAMPLE_NOTE = ("The markets are the ones the backtest priced, so they are not "
+                           "a random sample of Kalshi.")
+CALIBRATION_ASK_NOTE = ("The Yes ask is what betting Yes costs, so it includes the cost of "
+                        "trading; the midpoint is halfway between the Yes ask and the Yes "
+                        "bid and exists only where both sides had a quote.")
+CALIBRATION_CLOSE_NOTE = ("Close time is the realized close, so where trading went on "
+                          "after the outcome was known, the 1 h price can already show it.")
+CHART_RELIABILITY = "Price against share settled Yes"
+CHART_RELIABILITY_NOTE = ("Each dot is one price bin, placed at the average price in the bin; "
+                          "its size shows how many markets it holds. The line is where a "
+                          "fair price would sit. A price counts "
+                          "only where the gap between the Yes ask and the Yes bid was "
+                          "{width}c or less (a missing bid counts as 0), so one-sided "
+                          "quotes are left out.")
+CHART_GAP = "Share settled Yes minus price"
+CHART_GAP_NOTE = ("In percentage points, by price bin, at the average price in the bin: "
+                  "the share settled Yes minus that price. Below 0 at low prices means "
+                  "long shots are overpriced.")
+AXIS_PRICE = "Price ($)"
+AXIS_GAP = "Points"
+HOVER_GAP = "average price %{x:.3f}: %{y:+.1f} points, %{customdata:,} markets"
+HOVER_BIN = "average price %{x:.3f}: %{y:.1f}% Yes of %{customdata:,} markets"
+LABEL_FAIR = "Fair price"
+LABEL_BINS = "Price bins"
+BRIER_HEADERS = ("Category", "Markets", "Brier")
+BRIER_ALL = "All"
+BRIER_CAPTION = "Brier score by category for this price and time (lower is better)."
+COVERAGE_HEADERS = ("Lead", "Markets", "Priced (ask)", "No ask", "No midpoint", "Wide book",
+                    "Stale")
+COVERAGE_CAPTION = ("Markets with a yes or no result, by how many had no Yes ask, no "
+                    "midpoint, a book too wide to price, or a last candle too old to use "
+                    "at each time. Stale ones are also counted under No ask, and every "
+                    "market with no ask is also under No midpoint; a wide book is in "
+                    "neither. Priced (ask) is Markets minus No ask minus Wide book.")
+
+LADDERS_INTRO = ("Markets that ask the same question at several deadlines. The census "
+                 "and ladder charts are for markets that are not combos.")
+CHART_CENSUS = "Deadline wording, by category"
+CHART_CENSUS_NOTE = ("Whether each market's wording states a cumulative deadline (by a "
+                     "date), a snapshot (on a date) or neither.")
+CHART_LADDERS = "Deadline ladders per month"
+CHART_LADDERS_NOTE = ("Events with two or more cumulative rungs stating different days, "
+                      "by the month of the earliest day. Total: {total:,}.")
+CENSUS_NAMES = {"cumulative": "Cumulative", "snapshot": "Snapshot", "unknown": "Unknown"}
+CENSUS_COLORS = {"cumulative": "#2a78d6", "snapshot": "#eb6834", "unknown": "#898781"}
+KHAT_HEAD = "The k view"
+KHAT_NONE = "No backtest has saved its k figures yet."
+KHAT_FAILED = "The k figures could not be drawn ({reason})."
+KHAT_INTRO = ("From the last backtest's own deadline pairs: {observations:,} entries, "
+              "{non_positive:,} with a mid spread of 0 or less left out of the bins. The "
+              "mid spread is the later market's midpoint minus the earlier one's; a pair "
+              "is in between if the event happened between the two deadlines.")
+CHART_KHAT = "Mid spread against how often the event fell in between"
+CHART_KHAT_NOTE = ("Each dot is one mid-spread bin. The lines are y = k̂ x (what happened) "
+                   "and y = k x (what the strategy assumed, k = {k}).")
+LABEL_KHAT_LINE = "k̂ x"
+LABEL_K_LINE = "k x"
+LABEL_KHAT_DOTS = "Mid-spread bins"
+AXIS_MID_SPREAD = "Mid spread ($)"
+AXIS_IN_BETWEEN = "In between (%)"
+HOVER_KHAT_BIN = "mid spread %{x:.3f}: %{y:.1f}% in between of %{customdata:,} pairs"
+KHAT_HEADERS = ("Group", "Pairs", "Events", "k̂", "{level} CI")
+KHAT_POOLED = "All pairs"
+KHAT_BY_GAP = "k̂ by deadline gap"
+KHAT_BY_CATEGORY = "k̂ by category"
+KHAT_NOTE = ("k̂ is how often events fell in between, divided by the average mid spread. "
+             "The figures are the backtest page's own, saved by the last run; each event "
+             "counts once in the interval.")
+
+QUALITY_INTRO = ("How complete the stored records are, by the week the market settled. "
+                 "The Combo switch works as above.")
+CHART_QUALITY = "Records with a field missing"
+CHART_QUALITY_NOTE = ("Share of each week's markets. The event title is also shown after "
+                      "the saved title file is joined in.")
+QUALITY_SERIES = (("blank_subtitle", "Blank subtitle", "#2a78d6"),
+                  ("blank_title_before", "Blank event title", "#eb6834"),
+                  ("blank_title_after", "Blank event title after the join", "#1baf7a"),
+                  ("no_open", "Missing open time", "#eda100"))
+AXIS_MISSING = "Missing (%)"
+DAYFILES_HEADERS = ("Day files", "Count")
+DAYFILES_ARCHIVE = "Archive day files"
+DAYFILES_LIVE = "Live day files"
+DAYFILES_SKIPPED = "Live days left out (the archive covers them)"
+DAYFILES_GONE = "Live days kept after their file was deleted"
+DAYFILES_DROPPED = "Records at or after the archive cutoff, left out of archive days"
+CANDLEFILES_HEADERS = ("Candle files", "Count")
+CANDLEFILES_VERSION = "Field version {version}"
+CANDLEFILES_VERSION_CURRENT = "Field version {version} (current)"
+CANDLEFILES_EMPTY = "Empty"
+CANDLEFILES_UNREADABLE = "Unreadable"
+CANDLEFILES_UNJOINED = "No market in the day files"
+CANDLEFILES_COMBOS = "Combos, left out of the calibration"
+DEPTH_LINE = "Depth snapshots: {count:,}; newest {newest} UTC."
+DEPTH_LINE_NONE = "Depth snapshots: none saved."
+DEPTH_LINE_UNKNOWN = "Depth snapshots: not listed."
+UNREADABLE_HEAD = "Day files that could not be read"
+UNREADABLE_NONE = "Every day file was read."
+
+# How many of the largest categories get a colour of their own; the rest are
+# drawn together in grey as More.
+_TOP_CATEGORIES = 8
+# How many categories the share-over-time chart draws.
+_TOP_LINES = 6
+_PALETTE = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300",
+            "#4a3aa7", "#7a5c3e")
+_MORE_COLOR = "#898781"
+_INK = "#0b0b0b"
+_GRID = "#e1e0d9"
+_PLOT_CONFIG = {"displaylogo": False, "responsive": True}
+_CHART_HEIGHT = 340
+# Legend entries that fit on one row above a chart, and the height of a row.
+_LEGEND_PER_ROW = 5
+_LEGEND_ROW_PX = 22
+# Pixels per category of a horizontal bar chart, and its least height.
+_BAR_ROW_PX = 26
+# The view the page opens on for each switch.
+_DEFAULT_VIEW = "noncombo"
+_DEFAULT_LEAD = 24
+_DEFAULT_PRICE = "ask"
+# Combo flags of the merged keys that each view adds up.
+_VIEW_COMBOS = {"noncombo": ("0",), "combo": ("1",), "all": ("0", "1")}
+_VIEW_ORDER = ("noncombo", "combo", "all")
+_SCRIPT_ID = "eda-script"
+
+_CSS = """
+body { font-family: sans-serif; color: #0b0b0b; background: #ffffff; margin: 0;
+       padding: 0 16px 48px 16px; }
+main { max-width: 1100px; margin: 0 auto; }
+h1 { font-size: 26px; margin: 20px 0 4px 0; }
+h2 { font-size: 22px; margin: 40px 0 8px 0; padding-bottom: 8px;
+     border-bottom: 2px solid #E0E0E0; scroll-margin-top: 16px; }
+h3 { font-size: 16px; margin: 24px 0 2px 0; }
+p { font-size: 14px; line-height: 1.4; margin: 6px 0; }
+.note { color: #52514e; font-size: 13px; }
+.warn { background: #fff4d6; border: 1px solid #eda100; padding: 8px 12px;
+        border-radius: 4px; }
+.switch { margin: 12px 0 4px 0; font-size: 14px; }
+.switch span { margin-right: 8px; color: #52514e; }
+.switch button { font: inherit; padding: 4px 12px; margin-right: 4px; cursor: pointer;
+                 background: #f9f9f7; border: 1px solid #c3c2b7; border-radius: 4px; }
+.switch button[aria-pressed="true"] { background: #2a78d6; color: #ffffff;
+                                      border-color: #2a78d6; }
+table { font-size: 14px; border-collapse: collapse; margin: 12px 0; width: 100%; }
+caption { text-align: left; color: #52514e; font-size: 13px; padding: 4px 0; }
+th { padding: 6px 12px; text-align: left; background: #E3F2FD; }
+td { padding: 5px 12px; vertical-align: top; border-top: 1px solid #E0E0E0; }
+td.num, th.num { text-align: right; }
+.chart { margin: 8px 0 16px 0; }
+"""
+
+
+def _esc(value: Any) -> str:
+    """
+    Escape a value for use as HTML text or inside a double-quoted attribute.
+
+    Args:
+        value (Any): Anything; it is shown as text.
+
+    Returns:
+        str: The text with &, <, > and quotes escaped.
+    """
+    return html.escape(str(value), quote=True)
+
+
+def _plotly() -> Any:
+    """
+    Import plotly's graph objects.
+
+    Imported here rather than at the top of the module so the worker
+    processes that count day slices (which import this module) never load it.
+
+    Returns:
+        module: plotly.graph_objects.
+    """
+    import plotly.graph_objects as go  # local: keeps plotly out of the workers
+    return go
+
+
+def _human_bytes(count: Any) -> str:
+    """
+    A size in bytes as a short decimal figure.
+
+    Args:
+        count (Any): A byte count, or None.
+
+    Returns:
+        str: For example "512 B", "28.4 MB" or "24.6 GB"; NOT_AVAILABLE for
+            None or a value that is not a number.
+    """
+    if not isinstance(count, (int, float)) or isinstance(count, bool) or count < 0:
+        return NOT_AVAILABLE
+    size = float(count)
+    for unit in BYTE_UNITS:
+        if size < BYTES_PER_STEP or unit == BYTE_UNITS[-1]:
+            return (BYTES_TEXT.format(value=int(size), unit=unit) if unit == BYTE_UNITS[0]
+                    else BYTES_TEXT_DECIMAL.format(value=size, unit=unit))
+        size /= BYTES_PER_STEP
+    return NOT_AVAILABLE
+
+
+def _edge_text(hours: float) -> str:
+    """
+    A bucket edge, in hours, written as hours or days.
+
+    Args:
+        hours (float): The edge.
+
+    Returns:
+        str: "6 h" below two days, otherwise whole days ("3 d") when it is
+            a whole number of days.
+    """
+    if hours >= HOURS_AS_DAYS_FROM and hours % HOURS_PER_DAY == 0:
+        return DAYS_TEXT.format(value=hours // HOURS_PER_DAY)
+    return HOURS_TEXT.format(value=hours)
+
+
+def _bucket_labels(edges: tuple, first: str) -> list[str]:
+    """
+    The labels of a histogram's buckets, from its edges.
+
+    Args:
+        edges (tuple): Ascending edges, in hours.
+        first (str): The first bucket's label, or a template with {edge}.
+
+    Returns:
+        list[str]: len(edges) + 1 labels, matching _bucket's buckets.
+    """
+    labels = [first.format(edge=_edge_text(edges[0]))]
+    labels += [BUCKET_MIDDLE.format(low=_edge_text(lo), high=_edge_text(hi))
+               for lo, hi in zip(edges, edges[1:], strict=False)]
+    labels.append(BUCKET_LAST.format(edge=_edge_text(edges[-1])))
+    return labels
+
+
+def _lead_label(hours: Any) -> str:
+    """
+    The name of a lead on the page.
+
+    Args:
+        hours (Any): The lead, in hours.
+
+    Returns:
+        str: "1 h before close", "24 h before close" or "7 d before close".
+    """
+    return LEAD_LABEL.format(span=_edge_text(hours))
+
+
+def _short_lead(hours: Any) -> str:
+    """
+    A lead as the switch button names it.
+
+    Args:
+        hours (Any): The lead, in hours.
+
+    Returns:
+        str: "1 h", "24 h" or "7 d".
+    """
+    return _edge_text(hours)
+
+
+class _Reg:
+    """What one section tells the page script: its switches and the views they show."""
+
+    def __init__(self) -> None:
+        """Start with no switches and no panels."""
+        self.switches: dict[str, dict] = {}
+        self.panels: list[dict] = []
+
+    def switch(self, name: str, label: str, options: list[tuple[str, str]],
+               default: str) -> str:
+        """
+        Register a switch and return its buttons.
+
+        Args:
+            name (str): The switch's name (part of every button id).
+            label (str): The words in front of the buttons.
+            options (list[tuple[str, str]]): (value, button text) pairs.
+            default (str): The value that starts pressed.
+
+        Returns:
+            str: HTML for the switch; each button has aria-pressed.
+        """
+        self.switches[name] = {"options": {v: f"btn-{name}-{v}" for v, _ in options},
+                               "default": default}
+        buttons = "".join(
+            f'<button type="button" id="btn-{_esc(name)}-{_esc(v)}" '
+            f'aria-pressed="{"true" if v == default else "false"}">{_esc(text)}</button>'
+            for v, text in options)
+        return (f'<div class="switch" role="group" aria-label="{_esc(label)}">'
+                f'<span>{_esc(label)}</span>{buttons}</div>')
+
+    def panel(self, names: list[str], views: dict[str, dict]) -> None:
+        """
+        Register the views a set of switches chooses between.
+
+        Args:
+            names (list[str]): The switches, in the order their values make a key.
+            views (dict[str, dict]): key ("|"-joined values) -> {"div": the
+                view's id, "charts": ids of the charts inside it}.
+        """
+        self.panels.append({"switches": names, "views": views})
+
+    def absorb(self, other: "_Reg") -> None:
+        """
+        Take another registry's switches and panels.
+
+        Args:
+            other (_Reg): A finished section's registry.
+        """
+        self.switches.update(other.switches)
+        self.panels.extend(other.panels)
+
+
+def _table(headers: tuple, rows: list[list[str]], *, caption: str | None = None,
+           numeric: tuple = ()) -> str:
+    """
+    A table whose every cell is escaped.
+
+    Args:
+        headers (tuple): Column headers.
+        rows (list[list[str]]): Rows of cell text.
+        caption (str | None): A short line above the table.
+        numeric (tuple): Indexes of columns to right-align.
+
+    Returns:
+        str: HTML for the table.
+    """
+    head = "".join(f'<th{" class=num" if i in numeric else ""}>{_esc(h)}</th>'
+                   for i, h in enumerate(headers))
+    body = "".join(
+        "<tr>" + "".join(f'<td{" class=num" if i in numeric else ""}>{_esc(c)}</td>'
+                         for i, c in enumerate(row)) + "</tr>"
+        for row in rows)
+    cap = f"<caption>{_esc(caption)}</caption>" if caption else ""
+    return f"<table>{cap}<tr>{head}</tr>{body}</table>"
+
+
+def _note(text: str, css: str = "note") -> str:
+    """
+    A paragraph.
+
+    Args:
+        text (str): Its text, escaped here.
+        css (str): Its class: "note" (grey) or "warn" (amber box).
+
+    Returns:
+        str: HTML.
+    """
+    return f'<p class="{css}">{_esc(text)}</p>'
+
+
+def _chart(go: Any, title: str, note: str | None, traces: list, chart_id: str, ids: list,
+           *, x_title: str | None = None, y_title: str | None = None,
+           layout: dict | None = None, xaxis: dict | None = None,
+           yaxis: dict | None = None, height: int = _CHART_HEIGHT,
+           right: int = 16) -> str:
+    """
+    One chart: a heading, an optional note and the figure.
+
+    The figure carries no copy of Plotly itself (the page loads it once) and
+    no template, which keeps each chart a few KB.
+
+    Args:
+        go (Any): plotly.graph_objects.
+        title (str): The heading above the chart.
+        note (str | None): A grey line under the heading.
+        traces (list): The figure's traces.
+        chart_id (str): The chart's div id, added to `ids`.
+        ids (list): Collects the ids of the charts in one view, so the page
+            script can resize them when the view is shown.
+        x_title (str | None): The x axis title.
+        y_title (str | None): The y axis title.
+        layout (dict | None): Extra layout settings.
+        xaxis (dict | None): Extra x axis settings.
+        yaxis (dict | None): Extra y axis settings.
+        height (int): The plot's height in pixels; the legend's room is added.
+        right (int): The right margin in pixels (room for bar labels).
+
+    Returns:
+        str: HTML.
+    """
+    fig = go.Figure(data=traces)
+    # The legend sits above the plot, clear of the axis titles below it; with
+    # many entries it wraps onto more rows, so the top margin grows with them.
+    legend_rows = 0 if len(traces) < 2 else 1 + len(traces) // _LEGEND_PER_ROW
+    top = 12 + _LEGEND_ROW_PX * legend_rows
+    fig.update_layout(
+        template="none", height=height + top + 48,
+        margin={"l": 64, "r": right, "t": top, "b": 48},
+        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", font={"color": _INK, "size": 12},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.0, "x": 0},
+        xaxis={"gridcolor": _GRID, **({"title": {"text": x_title}} if x_title else {}),
+               **(xaxis or {})},
+        yaxis={"gridcolor": _GRID, **({"title": {"text": y_title}} if y_title else {}),
+               **(yaxis or {})},
+        **(layout or {}))
+    ids.append(chart_id)
+    figure = fig.to_html(full_html=False, include_plotlyjs=False, div_id=chart_id,
+                         config=_PLOT_CONFIG, default_height=f"{height + top + 48}px",
+                         default_width="100%")
+    note_html = _note(note) if note else ""
+    return f'<div class="chart"><h3>{_esc(title)}</h3>{note_html}{figure}</div>'
+
+
+def _split_key(key: str) -> list[str]:
+    """
+    Split a merged key into week, combo flag, category and tag.
+
+    Args:
+        key (str): "week|combo|category|tag".
+
+    Returns:
+        list[str]: Exactly four parts.
+    """
+    return (str(key).split(KEY_SEPARATOR) + ["", "", "", ""])[:4]
+
+
+def _add_list(into: list, more: Any) -> None:
+    """
+    Add a list of counts into another, element by element.
+
+    Args:
+        into (list): The running counts.
+        more (Any): Counts to add; ignored when not a list.
+    """
+    if isinstance(more, list):
+        for i, value in enumerate(more[: len(into)]):
+            into[i] += value
+
+
+def _aggregate(counts: dict, combos: tuple) -> dict:
+    """
+    Add up the merged counters of the keys whose combo flag is in `combos`.
+
+    Args:
+        counts (dict): merge()'s "counts".
+        combos (tuple): The combo flags to add ("0", "1").
+
+    Returns:
+        dict: "n"; "unknown" (markets with no readable week); "weekly"
+            (week -> category -> n); "cat_n"; "cat_yes" (category -> [yes,
+            yes + no]); "month" ((month, category) -> [yes, yes + no]); "life"
+            and "lag" (bucket counts) with "life_unknown" and "lag_unknown";
+            "regime" and "shard" (week -> name -> n); "quality" (week -> [n,
+            then the counts of the fields of QUALITY_SERIES]); "phrasing" (category ->
+            verdict -> n).
+    """
+    agg: dict = {"n": 0, "unknown": 0, "weekly": {}, "cat_n": {}, "cat_yes": {},
+                 "month": {}, "life": [0] * (len(config.EDA_LIFETIME_EDGES_HOURS) + 1),
+                 "life_unknown": 0, "lag": [0] * (len(config.EDA_LAG_EDGES_HOURS) + 1),
+                 "lag_unknown": 0, "regime": {}, "shard": {}, "quality": {}, "phrasing": {}}
+    for key, c in counts.items():
+        week, combo, category, _tag = _split_key(key)
+        if combo not in combos:
+            continue
+        n = c.get("n", 0)
+        agg["n"] += n
+        agg["cat_n"][category] = agg["cat_n"].get(category, 0) + n
+        pair = agg["cat_yes"].setdefault(category, [0, 0])
+        pair[0] += c.get("yes", 0)
+        pair[1] += c.get("yes", 0) + c.get("no", 0)
+        _add_list(agg["life"], c.get("lifetime_h"))
+        _add_list(agg["lag"], c.get("lag_h"))
+        agg["life_unknown"] += c.get("lifetime_unknown", 0)
+        agg["lag_unknown"] += c.get("lag_unknown", 0)
+        for verdict, count in (c.get("phrasing") or {}).items():
+            bucket = agg["phrasing"].setdefault(category, {})
+            bucket[verdict] = bucket.get(verdict, 0) + count
+        if week == UNKNOWN_WEEK:
+            agg["unknown"] += n
+            continue
+        by_cat = agg["weekly"].setdefault(week, {})
+        by_cat[category] = by_cat.get(category, 0) + n
+        month = agg["month"].setdefault((week[:7], category), [0, 0])
+        month[0] += c.get("yes", 0)
+        month[1] += c.get("yes", 0) + c.get("no", 0)
+        for name in ("regime", "shard"):
+            bucket = agg[name].setdefault(week, {})
+            for value, count in (c.get(name) or {}).items():
+                bucket[value] = bucket.get(value, 0) + count
+        quality = agg["quality"].setdefault(week, [0] * (1 + len(QUALITY_SERIES)))
+        quality[0] += n
+        for i, (field, _name, _color) in enumerate(QUALITY_SERIES, start=1):
+            quality[i] += c.get(field, 0)
+    return agg
+
+
+def _shares(pairs: dict) -> dict:
+    """
+    Turn [yes, settled] pairs into percentages.
+
+    Args:
+        pairs (dict): name -> [yes, yes + no].
+
+    Returns:
+        dict: name -> (percent Yes, markets), for names with at least one.
+    """
+    return {name: (100.0 * yes / total, total) for name, (yes, total) in pairs.items()
+            if total > 0}
+
+
+def _stack_traces(go: Any, weeks: list, series: list[tuple[str, list, str]]) -> list:
+    """
+    One stacked bar trace per series over the same weeks.
+
+    Args:
+        go (Any): plotly.graph_objects.
+        weeks (list): The x values.
+        series (list[tuple[str, list, str]]): (name, values, colour).
+
+    Returns:
+        list: go.Bar traces.
+    """
+    return [go.Bar(x=weeks, y=values, name=name, marker_color=color)
+            for name, values, color in series]
+
+
+def _histogram(go: Any, labels: list[str], values: list, unknown: int) -> list:
+    """
+    A one-trace bar histogram, with an extra bar for markets with no value.
+
+    Args:
+        go (Any): plotly.graph_objects.
+        labels (list[str]): Bucket labels.
+        values (list): Bucket counts.
+        unknown (int): Markets with no readable value.
+
+    Returns:
+        list: One go.Bar trace.
+    """
+    x, y = list(labels), list(values)
+    if unknown:
+        x.append(LABEL_UNKNOWN_BUCKET)
+        y.append(unknown)
+    return [go.Bar(x=x, y=y, marker_color=_PALETTE[0], showlegend=False)]
+
+
+def _universe_view(go: Any, agg: dict, view: str, ids: list) -> str:
+    """
+    The charts of the market universe for one combo view.
+
+    Args:
+        go (Any): plotly.graph_objects.
+        agg (dict): _aggregate's result for the view.
+        view (str): "noncombo", "combo" or "all" (part of the chart ids).
+        ids (list): Collects the chart ids.
+
+    Returns:
+        str: HTML for the view's charts.
+    """
+    if not agg["n"]:
+        return _note(NO_MARKETS_IN_VIEW)
+    parts = []
+    weeks = sorted(agg["weekly"])
+    order = sorted(agg["cat_n"], key=lambda c: (-agg["cat_n"][c], c))
+    top, rest = order[:_TOP_CATEGORIES], order[_TOP_CATEGORIES:]
+    colors = {c: _PALETTE[i] for i, c in enumerate(top)}
+    if agg["unknown"]:
+        parts.append(_note(UNIVERSE_UNKNOWN_WEEK.format(count=agg["unknown"])))
+    series = [(c, [agg["weekly"][w].get(c, 0) for w in weeks], colors[c]) for c in top]
+    if rest:
+        series.append((LABEL_MORE, [sum(n for c, n in agg["weekly"][w].items() if c in rest)
+                                    for w in weeks], _MORE_COLOR))
+    parts.append(_chart(go, CHART_SETTLED, CHART_SETTLED_NOTE.format(top=_TOP_CATEGORIES),
+                        _stack_traces(go, weeks, series),
+                        f"eda-{view}-settled", ids, x_title=AXIS_WEEK, y_title=AXIS_MARKETS,
+                        layout={"barmode": "stack"}))
+    shares = _shares(agg["cat_yes"])
+    names = [c for c in order if c in shares]
+    parts.append(_chart(
+        go, CHART_YES_BY_CATEGORY, CHART_YES_BY_CATEGORY_NOTE,
+        [go.Bar(y=names, x=[shares[c][0] for c in names], orientation="h",
+                customdata=[shares[c][1] for c in names], hovertemplate=HOVER_YES_BAR
+                + "<extra></extra>", marker_color=_PALETTE[0], showlegend=False,
+                text=[TEXT_YES_BAR.format(share=shares[c][0], count=shares[c][1])
+                      for c in names], textposition="outside", cliponaxis=False)],
+        f"eda-{view}-yes", ids, x_title=AXIS_SHARE_YES, xaxis={"range": [0, 100]},
+        yaxis={"autorange": "reversed", "automargin": True},
+        height=max(_CHART_HEIGHT, _BAR_ROW_PX * len(names) + 40), right=110))
+    months = sorted({m for m, _c in agg["month"]})
+    lines = []
+    for category in order[:_TOP_LINES]:
+        points = [(m, agg["month"][(m, category)]) for m in months
+                  if (m, category) in agg["month"]
+                  and agg["month"][(m, category)][1] >= config.EDA_MIN_MARKETS_PER_POINT]
+        lines.append(go.Scatter(
+            x=[m for m, _ in points], y=[100.0 * p[0] / p[1] for _, p in points],
+            customdata=[p[1] for _, p in points], mode="lines+markers", name=category,
+            line={"color": colors[category]}, hovertemplate=HOVER_YES_SHARE
+            + "<extra></extra>"))
+    parts.append(_chart(go, CHART_YES_OVER_TIME,
+                        CHART_YES_OVER_TIME_NOTE.format(minimum=config.EDA_MIN_MARKETS_PER_POINT),
+                        lines,
+                        f"eda-{view}-yes-time", ids, x_title=AXIS_MONTH,
+                        y_title=AXIS_SHARE_YES, yaxis={"range": [0, 100]}))
+    parts.append(_chart(
+        go, CHART_LIFETIME, CHART_LIFETIME_NOTE,
+        _histogram(go, _bucket_labels(config.EDA_LIFETIME_EDGES_HOURS, LIFETIME_FIRST_BUCKET),
+                   agg["life"], agg["life_unknown"]),
+        f"eda-{view}-life", ids, y_title=AXIS_MARKETS))
+    parts.append(_chart(
+        go, CHART_LAG, CHART_LAG_NOTE,
+        _histogram(go, _bucket_labels(config.EDA_LAG_EDGES_HOURS, LAG_FIRST_BUCKET),
+                   agg["lag"], agg["lag_unknown"]),
+        f"eda-{view}-lag", ids, y_title=AXIS_MARKETS))
+    for name, title, note, label in (
+            ("regime", CHART_REGIME, CHART_REGIME_NOTE, lambda v: v or LABEL_NONE_RECORDED),
+            ("shard", CHART_SHARD, CHART_SHARD_NOTE,
+             lambda v: LABEL_SHARD.format(value=v) if v != "" else LABEL_NONE_RECORDED)):
+        totals: dict = {}
+        for by_name in agg[name].values():
+            for value, count in by_name.items():
+                totals[value] = totals.get(value, 0) + count
+        kinds = sorted(totals, key=lambda v: (-totals[v], v))
+        traces = [go.Bar(x=weeks, y=[agg[name][w].get(kind, 0) for w in weeks],
+                         name=label(kind), marker_color=_PALETTE[i % len(_PALETTE)])
+                  for i, kind in enumerate(kinds)]
+        parts.append(_chart(go, title, note, traces, f"eda-{view}-{name}", ids,
+                            x_title=AXIS_WEEK, y_title=AXIS_PERCENT,
+                            layout={"barmode": "stack", "barnorm": "percent"}))
+    return "".join(parts)
+
+
+def _volume_block(go: Any, cal: dict | None) -> str:
+    """
+    The traded volume by category, from the candle files that record volume.
+
+    Args:
+        go (Any): plotly.graph_objects.
+        cal (dict | None): summarise_candles' result.
+
+    Returns:
+        str: HTML for the chart, or a note when there is nothing to draw.
+    """
+    if not cal or not cal.get("volume"):
+        return _note(NO_CANDLES if not cal else NO_DATA_FOR_CHART)
+    names = sorted(cal["volume"], key=lambda c: (-cal["volume"][c], c))
+    joined = (cal.get("files", 0) - cal.get("unreadable", 0) - cal.get("unjoined", 0)
+              - cal.get("combos_left_out", 0))
+    note = CHART_VOLUME_NOTE.format(files=cal.get("volume_files", 0), all=joined)
+    return _chart(go, CHART_VOLUME, note,
+                  [go.Bar(y=names, x=[cal["volume"][c] for c in names], orientation="h",
+                          hovertemplate=HOVER_COUNT_BAR + "<extra></extra>",
+                          marker_color=_PALETTE[0], showlegend=False)],
+                  "eda-volume", [], x_title=AXIS_CONTRACTS,
+                  yaxis={"autorange": "reversed", "automargin": True},
+                  height=max(_CHART_HEIGHT, _BAR_ROW_PX * len(names) + 40))
+
+
+def _view_div(section: str, key: str, default: bool, body: str) -> str:
+    """
+    One pre-drawn view, hidden unless it is the default.
+
+    Args:
+        section (str): The section's short name (part of the id).
+        key (str): The view's key, made safe for an id.
+        default (bool): Whether it starts shown.
+        body (str): Its HTML.
+
+    Returns:
+        str: HTML.
+    """
+    return f'<div id="view-{section}-{key}"{"" if default else " hidden"}>{body}</div>'
+
+
+def _combo_views(go: Any, counts: dict, section: str, reg: _Reg, draw) -> str:
+    """
+    The Non-combo / Combo / All switch and its three pre-drawn views.
+
+    Args:
+        go (Any): plotly.graph_objects.
+        counts (dict): merge()'s "counts".
+        section (str): The section's short name.
+        reg (_Reg): Where the switch and panel are registered.
+        draw (Callable): draw(go, agg, view, ids) -> the view's HTML.
+
+    Returns:
+        str: HTML for the switch and the views.
+    """
+    switch_name = f"combo-{section}"
+    switch = reg.switch(switch_name, SWITCH_COMBO_LABEL,
+                        [(v, VIEW_LABELS[v]) for v in _VIEW_ORDER], _DEFAULT_VIEW)
+    views, divs = {}, []
+    for view in _VIEW_ORDER:
+        ids: list = []
+        body = draw(go, _aggregate(counts, _VIEW_COMBOS[view]), view, ids)
+        divs.append(_view_div(section, view, view == _DEFAULT_VIEW, body))
+        views[view] = {"div": f"view-{section}-{view}", "charts": ids}
+    reg.panel([switch_name], views)
+    return switch + "".join(divs)
+
+
+def _universe_section(go: Any, merged: dict | None, cal: dict | None, reg: _Reg) -> str:
+    """
+    The market universe section.
+
+    Args:
+        go (Any): plotly.graph_objects.
+        merged (dict | None): merge()'s result.
+        cal (dict | None): summarise_candles' result.
+        reg (_Reg): Where the section's switch is registered.
+
+    Returns:
+        str: HTML for the section's body.
+    """
+    if not merged:
+        return _note(NO_DAY_COUNTS, "warn")
+    coverage = merged.get("coverage") or {}
+    css = "warn" if coverage.get("gap_days") else "note"
+    body = [_note(UNIVERSE_INTRO)]
+    if coverage.get("note"):
+        body.append(_note(coverage["note"], css))
+    body.append(_note(UNIVERSE_RESIDUAL))
+    body.append(_combo_views(go, merged.get("counts") or {}, "universe", reg, _universe_view))
+    body.append(_volume_block(go, cal))
+    return "".join(body)
+
+
+def _bins_total(cells: dict, price: str, nbins: int) -> tuple[list, int, float]:
+    """
+    Add one price's bins up over every category of a lead.
+
+    Args:
+        cells (dict): category -> {"ask": cell, "mid": cell}.
+        price (str): "ask" or "mid".
+        nbins (int): How many bins.
+
+    Returns:
+        tuple[list, int, float]: the summed [markets, yes, price sum] bins, the
+            markets priced and the Brier sum.
+    """
+    bins = [[0, 0, 0.0] for _ in range(nbins)]
+    n, brier = 0, 0.0
+    for cell in cells.values():
+        part = cell.get(price) or {}
+        for i, pair in enumerate((part.get("bins") or [])[:nbins]):
+            bins[i][0] += pair[0]
+            bins[i][1] += pair[1]
+            bins[i][2] += pair[2] if len(pair) > 2 else 0.0
+        n += part.get("n", 0)
+        brier += part.get("brier_sum", 0.0)
+    return bins, n, brier
+
+
+def _calibration_view(go: Any, cal: dict, lead: Any, price: str, ids: list) -> str:
+    """
+    The charts and the Brier table of one lead and price.
+
+    Args:
+        go (Any): plotly.graph_objects.
+        cal (dict): summarise_candles' result.
+        lead (Any): The lead, in hours.
+        price (str): "ask" or "mid".
+        ids (list): Collects the chart ids.
+
+    Returns:
+        str: HTML for the view.
+    """
+    cells = (cal.get("calibration") or {}).get(str(lead)) or {}
+    width = cal.get("bin_width") or config.EDA_CALIBRATION_BIN
+    nbins = cal.get("bins") or _bin_count(width)
+    bins, n, brier = _bins_total(cells, price, nbins)
+    if not n:
+        return _note(NO_MARKETS_IN_VIEW)
+    stamp = f"{lead}-{price}"
+    # Each dot sits at the average price of the markets in its bin, not at the
+    # bin's centre, so a bin of 1c prices is not drawn at 2.5c
+    points = [(pair[2] / pair[0], pair[1] / pair[0] * 100.0, pair[0])
+              for pair in bins if pair[0] > 0]
+    most = max(p[2] for p in points)
+    sizes = [6 + 26 * math.sqrt(p[2] / most) for p in points]
+    reliability = [
+        go.Scatter(x=[0, 1], y=[0, 100], mode="lines", name=LABEL_FAIR,
+                   line={"color": _MORE_COLOR, "dash": "dash"}, hoverinfo="skip"),
+        go.Scatter(x=[p[0] for p in points], y=[p[1] for p in points], mode="markers",
+                   name=LABEL_BINS, customdata=[p[2] for p in points],
+                   marker={"size": sizes, "color": _PALETTE[0]},
+                   hovertemplate=HOVER_BIN + "<extra></extra>")]
+    gap = [go.Bar(x=[p[0] for p in points], y=[p[1] - p[0] * 100.0 for p in points],
+                  customdata=[p[2] for p in points], marker_color=_PALETTE[1],
+                  width=width * 0.8, hovertemplate=HOVER_GAP + "<extra></extra>",
+                  showlegend=False)]
+    rows = sorted(((cat, cell[price]["n"], cell[price]["brier_sum"])
+                   for cat, cell in cells.items()
+                   if (cell.get(price) or {}).get("n")),
+                  key=lambda r: (-r[1], r[0]))
+    table_rows = [[BRIER_ALL, f"{n:,}", f"{brier / n:.3f}"]]
+    table_rows += [[cat, f"{count:,}", f"{total / count:.3f}"] for cat, count, total in rows]
+    width_note = CHART_RELIABILITY_NOTE.format(
+        width=round(config.EDA_MAX_BOOK_WIDTH * 100))
+    return (_chart(go, CHART_RELIABILITY, width_note, reliability,
+                   f"eda-cal-{stamp}-reliability", ids, x_title=AXIS_PRICE,
+                   y_title=AXIS_SHARE_YES, xaxis={"range": [0, 1]},
+                   yaxis={"range": [0, 100]})
+            + _chart(go, CHART_GAP, CHART_GAP_NOTE, gap, f"eda-cal-{stamp}-gap", ids,
+                     x_title=AXIS_PRICE, y_title=AXIS_GAP, xaxis={"range": [0, 1]})
+            + _table(BRIER_HEADERS, table_rows, caption=BRIER_CAPTION, numeric=(1, 2)))
+
+
+def _calibration_section(go: Any, cal: dict | None, reg: _Reg) -> str:
+    """
+    The price calibration section.
+
+    Args:
+        go (Any): plotly.graph_objects.
+        cal (dict | None): summarise_candles' result.
+        reg (_Reg): Where the Lead and Price switches are registered.
+
+    Returns:
+        str: HTML for the section's body.
+    """
+    if not cal:
+        return _note(NO_CANDLES, "warn")
+    leads = list(cal.get("leads") or [])
+    if not leads:
+        return _note(NO_DATA_FOR_CHART)
+    default_lead = str(_DEFAULT_LEAD if _DEFAULT_LEAD in leads else leads[0])
+    parts = [_note(CALIBRATION_INTRO), _note(CALIBRATION_SAMPLE_NOTE),
+             _note(CALIBRATION_ASK_NOTE), _note(CALIBRATION_CLOSE_NOTE)]
+    parts.append(reg.switch("lead", LEAD_SWITCH_LABEL,
+                            [(str(h), _short_lead(h)) for h in leads], default_lead))
+    parts.append(reg.switch("price", PRICE_SWITCH_LABEL,
+                            [(p, PRICE_LABELS[p]) for p in PRICE_LABELS], _DEFAULT_PRICE))
+    views = {}
+    for lead in leads:
+        for price in PRICE_LABELS:
+            ids: list = []
+            body = _calibration_view(go, cal, lead, price, ids)
+            shown = str(lead) == default_lead and price == _DEFAULT_PRICE
+            parts.append(_view_div("cal", f"{lead}-{price}", shown, body))
+            views[f"{lead}|{price}"] = {"div": f"view-cal-{lead}-{price}", "charts": ids}
+    reg.panel(["lead", "price"], views)
+    coverage = cal.get("coverage") or {}
+    rows = []
+    for h in leads:
+        seen = coverage.get(str(h), {})
+        priced = seen.get("markets", 0) - seen.get("no_ask", 0) - seen.get("wide", 0)
+        rows.append([_lead_label(h), f"{seen.get('markets', 0):,}", f"{priced:,}",
+                     f"{seen.get('no_ask', 0):,}", f"{seen.get('no_mid', 0):,}",
+                     f"{seen.get('wide', 0):,}", f"{seen.get('stale', 0):,}"])
+    parts.append(_table(COVERAGE_HEADERS, rows, caption=COVERAGE_CAPTION,
+                        numeric=(1, 2, 3, 4, 5, 6)))
+    return "".join(parts)
+
+
+def _khat_rows(stats: list) -> list[list[str]]:
+    """
+    Table rows for a list of k-hat figures.
+
+    Args:
+        stats (list): khat_view's _khat_stat dicts.
+
+    Returns:
+        list[list[str]]: Group, pairs, events, k-hat, interval.
+    """
+    rows = []
+    for s in stats:
+        k = s.get("k")
+        low, high = s.get("ci_low"), s.get("ci_high")
+        interval = NOT_AVAILABLE if low is None or high is None else f"{low:.3f} to {high:.3f}"
+        rows.append([str(s.get("label", "")), f"{s.get('n', 0):,}", f"{s.get('events', 0):,}",
+                     NOT_AVAILABLE if k is None else f"{k:.3f}", interval])
+    return rows
+
+
+def _khat_block(go: Any, khat: dict | None) -> str:
+    """
+    The k view: the mid-spread chart and the k-hat tables.
+
+    Args:
+        go (Any): plotly.graph_objects.
+        khat (dict | None): khat_view's result, or None.
+
+    Returns:
+        str: HTML.
+    """
+    head = f"<h3>{_esc(KHAT_HEAD)}</h3>"
+    if not khat:
+        return head + _note(KHAT_NONE)
+    parts = [head, _note(KHAT_INTRO.format(observations=khat.get("observations", 0),
+                                           non_positive=khat.get("non_positive", 0)))]
+    bins = khat.get("bins") or []
+    pooled = khat.get("pooled") or {}
+    k_hat, k = pooled.get("k"), khat.get("k")
+    if bins:
+        reach = max(b["implied"] for b in bins) * 1.05
+        traces = [go.Scatter(x=[b["implied"] for b in bins], y=[b["rate"] * 100.0 for b in bins],
+                             customdata=[b["n"] for b in bins], mode="markers",
+                             name=LABEL_KHAT_DOTS, hovertemplate=HOVER_KHAT_BIN
+                             + "<extra></extra>",
+                             marker={"size": [6 + 26 * math.sqrt(b["n"] / max(x["n"] for x in bins))
+                                              for b in bins], "color": _PALETTE[0]})]
+        for value, name, color in ((k_hat, LABEL_KHAT_LINE, _PALETTE[1]),
+                                   (k, LABEL_K_LINE, _PALETTE[2])):
+            if value is not None:
+                traces.append(go.Scatter(x=[0, reach], y=[0, value * reach * 100.0],
+                                         mode="lines", name=name, line={"color": color},
+                                         hoverinfo="skip"))
+        shown_k = NOT_AVAILABLE if k is None else f"{k:g}"
+        parts.append(_chart(go, CHART_KHAT, CHART_KHAT_NOTE.format(k=shown_k), traces,
+                            "eda-khat", [], x_title=AXIS_MID_SPREAD, y_title=AXIS_IN_BETWEEN,
+                            xaxis={"range": [0, reach]}))
+    level = khat.get("confidence_level", config.KHAT_CONFIDENCE_LEVEL)
+    headers = tuple(h.format(level=f"{level:.0%}") for h in KHAT_HEADERS)
+    if pooled:
+        parts.append(_table(headers, [[KHAT_POOLED, *_khat_rows([pooled])[0][1:]]],
+                            numeric=(1, 2, 3, 4)))
+    for caption, key in ((KHAT_BY_GAP, "gap_bands"), (KHAT_BY_CATEGORY, "categories")):
+        rows = _khat_rows(khat.get(key) or [])
+        if rows:
+            parts.append(_table(headers, rows, caption=caption, numeric=(1, 2, 3, 4)))
+    parts.append(_note(KHAT_NOTE))
+    return "".join(parts)
+
+
+def _ladders_section(go: Any, merged: dict | None, khat: dict | None) -> str:
+    """
+    The deadline ladders and k section.
+
+    Args:
+        go (Any): plotly.graph_objects.
+        merged (dict | None): merge()'s result.
+        khat (dict | None): khat_view's result or the saved one.
+
+    Returns:
+        str: HTML for the section's body.
+    """
+    parts = [_note(LADDERS_INTRO)]
+    if not merged:
+        parts.append(_note(NO_DAY_COUNTS, "warn"))
+    else:
+        agg = _aggregate(merged.get("counts") or {}, _VIEW_COMBOS["noncombo"])
+        order = sorted(agg["phrasing"], key=lambda c: (-sum(agg["phrasing"][c].values()), c))
+        if order:
+            traces = [go.Bar(y=order, x=[agg["phrasing"][c].get(v, 0) for c in order],
+                             orientation="h", name=CENSUS_NAMES[v],
+                             marker_color=CENSUS_COLORS[v])
+                      for v in CENSUS_NAMES]
+            parts.append(_chart(go, CHART_CENSUS, CHART_CENSUS_NOTE, traces, "eda-census", [],
+                                x_title=AXIS_MARKETS, layout={"barmode": "stack"},
+                                yaxis={"autorange": "reversed", "automargin": True},
+                                height=max(_CHART_HEIGHT, _BAR_ROW_PX * len(order) + 40)))
+        ladders = merged.get("ladders") or {}
+        if ladders:
+            months = sorted(ladders)
+            note = CHART_LADDERS_NOTE.format(total=merged.get("ladder_events", 0))
+            parts.append(_chart(
+                go, CHART_LADDERS, note,
+                [go.Bar(x=months, y=[ladders[m]["events"] for m in months],
+                        marker_color=_PALETTE[0], showlegend=False)],
+                "eda-ladders", [], x_title=AXIS_MONTH, y_title=AXIS_LADDERS))
+    try:
+        parts.append(_khat_block(go, khat))
+    except Exception as exc:
+        # A saved view in an unexpected shape costs the k block alone
+        logging.warning("Data page: the k view could not be drawn", exc_info=True)
+        parts.append(f"<h3>{_esc(KHAT_HEAD)}</h3>"
+                     + _note(KHAT_FAILED.format(reason=_one_line(exc)), "warn"))
+    return "".join(parts)
+
+
+def _quality_view(go: Any, agg: dict, view: str, ids: list) -> str:
+    """
+    The data quality chart for one combo view.
+
+    Args:
+        go (Any): plotly.graph_objects.
+        agg (dict): _aggregate's result for the view.
+        view (str): "noncombo", "combo" or "all".
+        ids (list): Collects the chart ids.
+
+    Returns:
+        str: HTML for the view.
+    """
+    weeks = sorted(w for w, counts in agg["quality"].items() if counts[0] > 0)
+    if not weeks:
+        return _note(NO_MARKETS_IN_VIEW)
+    traces = [go.Scatter(x=weeks, y=[100.0 * agg["quality"][w][i] / agg["quality"][w][0]
+                                     for w in weeks],
+                         mode="lines", name=name, line={"color": color})
+              for i, (_field, name, color) in enumerate(QUALITY_SERIES, start=1)]
+    return _chart(go, CHART_QUALITY, CHART_QUALITY_NOTE, traces, f"eda-{view}-quality", ids,
+                  x_title=AXIS_WEEK, y_title=AXIS_MISSING, yaxis={"range": [0, 100]})
+
+
+def _quality_section(go: Any, merged: dict | None, cal: dict | None, rows: list,
+                     reg: _Reg) -> str:
+    """
+    The data quality section.
+
+    Args:
+        go (Any): plotly.graph_objects.
+        merged (dict | None): merge()'s result.
+        cal (dict | None): summarise_candles' result.
+        rows (list): inventory()'s rows.
+        reg (_Reg): Where the section's switch is registered.
+
+    Returns:
+        str: HTML for the section's body.
+    """
+    parts = [_note(QUALITY_INTRO)]
+    if not merged:
+        parts.append(_note(NO_DAY_COUNTS, "warn"))
+    else:
+        parts.append(_combo_views(go, merged.get("counts") or {}, "quality", reg,
+                                  _quality_view))
+        slices, coverage = merged.get("slices") or {}, merged.get("coverage") or {}
+        parts.append(_table(DAYFILES_HEADERS, [
+            [DAYFILES_ARCHIVE, f"{slices.get('archive', 0):,}"],
+            [DAYFILES_LIVE, f"{slices.get('live', 0):,}"],
+            [DAYFILES_SKIPPED, f"{coverage.get('live_days_skipped', 0):,}"],
+            [DAYFILES_GONE, f"{coverage.get('live_days_without_slice', 0):,}"],
+            [DAYFILES_DROPPED, f"{merged.get('dropped_after_cutoff', 0):,}"]], numeric=(1,)))
+    if cal:
+        current = str(config.CANDLESTICK_CACHE_FIELDS_VERSION)
+        by_fields = cal.get("by_fields") or {}
+        table = [[(CANDLEFILES_VERSION_CURRENT if v == current else CANDLEFILES_VERSION)
+                  .format(version=v), f"{by_fields[v]:,}"] for v in sorted(by_fields)]
+        table += [[CANDLEFILES_EMPTY, f"{cal.get('empty', 0):,}"],
+                  [CANDLEFILES_UNREADABLE, f"{cal.get('unreadable', 0):,}"],
+                  [CANDLEFILES_UNJOINED, f"{cal.get('unjoined', 0):,}"],
+                  [CANDLEFILES_COMBOS, f"{cal.get('combos_left_out', 0):,}"]]
+        parts.append(_table(CANDLEFILES_HEADERS, table, numeric=(1,)))
+    depth = next((r for r in rows if r.get("name") == config.DEPTH_SNAPSHOTS_DIRNAME), None)
+    detail = (depth or {}).get("detail") or {}
+    if depth is None:
+        parts.append(_note(DEPTH_LINE_NONE))
+    elif "snapshots" not in detail:
+        parts.append(_note(DEPTH_LINE_UNKNOWN))
+    else:
+        newest = str(detail.get("newest") or NOT_AVAILABLE)[:16].replace("T", " ")
+        parts.append(_note(DEPTH_LINE.format(count=detail["snapshots"], newest=newest)))
+    unreadable = (merged or {}).get("unreadable") or []
+    parts.append(f"<h3>{_esc(UNREADABLE_HEAD)}</h3>")
+    if unreadable:
+        parts.append("<ul>" + "".join(f"<li>{_esc(u)}</li>" for u in unreadable) + "</ul>")
+    else:
+        parts.append(_note(UNREADABLE_NONE))
+    return "".join(parts)
+
+
+def _inventory_extra(row: dict) -> str:
+    """
+    The detail line under an inventory row's description.
+
+    Args:
+        row (dict): One inventory() row.
+
+    Returns:
+        str: The corpus meta or snapshot facts, or the row's error, joined by
+            semicolons; "" when there is none.
+    """
+    detail = row.get("detail") or {}
+    bits = []
+    if "meta_error" in detail:
+        bits.append(INVENTORY_META_ERROR.format(reason=detail["meta_error"]))
+    if detail.get("start_date") is not None:
+        bits.append(INVENTORY_START.format(value=detail["start_date"]))
+    if detail.get("prefilter_tag") is not None:
+        bits.append(INVENTORY_FILTER.format(value=detail["prefilter_tag"]))
+    if detail.get("assembled_at") is not None:
+        bits.append(INVENTORY_ASSEMBLED.format(value=str(detail["assembled_at"])[:19]))
+    if "snapshots" in detail:
+        bits.append(INVENTORY_SNAPSHOT_ONE if detail["snapshots"] == 1
+                    else INVENTORY_SNAPSHOTS.format(count=detail["snapshots"]))
+        if detail.get("newest"):
+            bits.append(INVENTORY_NEWEST.format(
+                value=str(detail["newest"])[:16].replace("T", " ")))
+    if detail.get("unreadable_parts"):
+        bits.append(INVENTORY_UNREADABLE_PARTS.format(count=detail["unreadable_parts"]))
+    if row.get("error"):
+        bits.append(INVENTORY_ERROR.format(reason=row["error"]))
+    return "; ".join(bits)
+
+
+def _inventory_section(rows: list | None) -> str:
+    """
+    The inventory section.
+
+    Args:
+        rows (list | None): inventory()'s rows.
+
+    Returns:
+        str: HTML for the section's body.
+    """
+    if not rows:
+        return _note(INVENTORY_EMPTY)
+    table = []
+    for row in rows:
+        name = str(row.get("name", "")) + ("/" if row.get("kind") == "folder" else "")
+        first, last = row.get("first_day"), row.get("last_day")
+        dates = INVENTORY_DATES.format(first=first, last=last) if first and last else NOT_AVAILABLE
+        files = row.get("files")
+        extra = _inventory_extra(row)
+        what = str(row.get("description", ""))
+        table.append([name, NOT_AVAILABLE if files is None else f"{files:,}",
+                      _human_bytes(row.get("bytes")), dates,
+                      f"{what} ({extra})" if extra else what])
+    return _table(INVENTORY_HEADERS, table, numeric=(1, 2)) + _note(INVENTORY_NOTE)
+
+
+# The page's one script. It only switches views: it writes the `hidden`
+# attribute and aria-pressed, never any text, and asks Plotly to resize the
+# charts of a view it reveals (a chart drawn while hidden has no width). It
+# does nothing else, and returns quietly if Plotly did not load. __CONFIG__ is
+# replaced by the switches and panels the sections registered.
+_SCRIPT = """(function () {
+  var cfg = __CONFIG__;
+  var state = {};
+  function byId(id) { return document.getElementById(id); }
+  function resize(ids) {
+    if (typeof Plotly === 'undefined' || !Plotly.Plots) { return; }
+    ids.forEach(function (id) {
+      var el = byId(id);
+      if (el) { try { Plotly.Plots.resize(el); } catch (e) { /* a chart that is not drawn */ } }
+    });
+  }
+  function show(panel) {
+    var key = panel.switches.map(function (s) { return state[s]; }).join('|');
+    Object.keys(panel.views).forEach(function (k) {
+      var view = panel.views[k];
+      var div = byId(view.div);
+      if (!div) { return; }
+      div.hidden = k !== key;
+      if (k === key) { resize(view.charts); }
+    });
+  }
+  function choose(name, option) {
+    var sw = cfg.switches[name];
+    state[name] = option;
+    Object.keys(sw.options).forEach(function (o) {
+      var button = byId(sw.options[o]);
+      if (button) { button.setAttribute('aria-pressed', o === option ? 'true' : 'false'); }
+    });
+    cfg.panels.forEach(function (p) { if (p.switches.indexOf(name) >= 0) { show(p); } });
+  }
+  Object.keys(cfg.switches).forEach(function (name) {
+    var sw = cfg.switches[name];
+    state[name] = sw['default'];
+    Object.keys(sw.options).forEach(function (o) {
+      var button = byId(sw.options[o]);
+      if (button) { button.addEventListener('click', function () { choose(name, o); }); }
+    });
+  });
+})();"""
+
+
+def _section(sec_id: str, heading: str, build, needs_charts: bool, go: Any,
+             reg: _Reg) -> str:
+    """
+    One section of the page; a section that cannot be built says so and the rest go on.
+
+    Args:
+        sec_id (str): The section's short name (its id is "sec-<this>").
+        heading (str): Its heading.
+        build (Callable): build(sub_registry) -> the section's HTML body.
+        needs_charts (bool): Whether it needs plotly.
+        go (Any): plotly.graph_objects, or None when it could not be imported.
+        reg (_Reg): The page's registry; the section's switches are added only
+            when it builds.
+
+    Returns:
+        str: HTML for the section.
+    """
+    sub = _Reg()
+    try:
+        if needs_charts and go is None:
+            raise RuntimeError(CHARTS_UNAVAILABLE)
+        body = build(sub)
+        reg.absorb(sub)
+    except Exception as exc:
+        logging.warning("Data page: the %s section could not be built", heading, exc_info=True)
+        body = _note(SECTION_FAILED.format(section=heading, reason=_one_line(exc)), "warn")
+    return f'<section id="sec-{_esc(sec_id)}"><h2>{_esc(heading)}</h2>{body}</section>'
+
+
+def _render(data: dict, failures: list[str], built: str) -> str:
+    """
+    The whole page.
+
+    Args:
+        data (dict): What the build steps returned: "merged", "candles",
+            "inventory" and "khat" (each None when its step failed or was
+            not run).
+        failures (list[str]): One line per failed step.
+        built (str): The build time as text.
+
+    Returns:
+        str: The page's HTML.
+    """
+    reg = _Reg()
+    go = None
+    try:
+        go = _plotly()
+    except Exception as exc:
+        logging.warning("Data page: plotly could not be imported", exc_info=True)
+        failures.append(FAILURE_LINE.format(step=STEP_CHARTS, reason=_one_line(exc)))
+    merged, candles = data.get("merged"), data.get("candles")
+    sections = [
+        _section("inventory", HEADING_INVENTORY,
+                 lambda r: _inventory_section(data.get("inventory")), False, go, reg),
+        _section("universe", HEADING_UNIVERSE,
+                 lambda r: _universe_section(go, merged, candles, r), True, go, reg),
+        _section("calibration", HEADING_CALIBRATION,
+                 lambda r: _calibration_section(go, candles, r), True, go, reg),
+        _section("ladders", HEADING_LADDERS,
+                 lambda r: _ladders_section(go, merged, data.get("khat")), True, go, reg),
+        _section("quality", HEADING_QUALITY,
+                 lambda r: _quality_section(go, merged, candles, data.get("inventory") or [], r),
+                 True, go, reg),
+    ]
+    if merged:
+        counted = sum((merged.get("slices") or {}).values())
+        built_line = PAGE_BUILT.format(when=built, files=counted,
+                                       records=merged.get("records", 0))
+    else:
+        built_line = PAGE_BUILT_NO_COUNTS.format(when=built)
+    failed = ""
+    if failures:
+        failed = (f'<div class="warn"><p>{_esc(FAILURES_HEAD)}</p><ul>'
+                  + "".join(f"<li>{_esc(f)}</li>" for f in failures) + "</ul></div>")
+    config_json = json.dumps({"switches": reg.switches, "panels": reg.panels},
+                             separators=(",", ":")).replace("</", "<\\/")
+    script = _SCRIPT.replace("__CONFIG__", config_json)
+    return (
+        '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>{_esc(PAGE_TITLE)}</title>"
+        f'<script src="{_esc(config.LIVE_DASHBOARD_PLOTLY_URL)}" '
+        f'integrity="{_esc(config.LIVE_DASHBOARD_PLOTLY_SRI)}" crossorigin="anonymous">'
+        f"</script><style>{_CSS}</style></head><body><main>"
+        f"<h1>{_esc(PAGE_TITLE)}</h1><p>{glossary.terms_link_html(glossary.PAGE_DATA)}</p>"
+        f'<p class="note" id="built">{_esc(built_line)}</p>{failed}'
+        + "".join(sections) + glossary.terms_section_html(glossary.PAGE_DATA)
+        + f'</main><script id="{_SCRIPT_ID}">{script}</script></body></html>\n')
+
+
+def _write_page(out: Path, text: str) -> Path:
+    """
+    Write the page beside its final name and rename it into place.
+
+    Args:
+        out (Path): The page's path.
+        text (str): Its HTML.
+
+    Returns:
+        Path: `out`.
+
+    Raises:
+        OSError: When the folder or file cannot be written; any earlier page
+            is left as it was. Whatever is raised, the temporary file is removed.
+    """
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + _TMP_SUFFIX)
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, out)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return out
+
+
+def _step(failures: list[str], name: str, func, *args, **kwargs) -> Any:
+    """
+    Run one build step; a failure is logged, named for the page and becomes None.
+
+    Args:
+        failures (list[str]): Collects one line per failed step.
+        name (str): The step's name on the page.
+        func (Callable): The step.
+        *args: Its arguments.
+        **kwargs: Its keyword arguments.
+
+    Returns:
+        Any: What the step returned, or None when it raised.
+    """
+    try:
+        return func(*args, **kwargs)
+    except Exception as exc:
+        logging.warning("Data page: %s failed", name.lower(), exc_info=True)
+        failures.append(FAILURE_LINE.format(step=name, reason=_one_line(exc)))
+        return None
+
+
+def _count_days(cache_dir: Path, series_categories: dict | None, workers: int) -> dict:
+    """
+    The day-file counts: every summary, built or reused, merged.
+
+    Args:
+        cache_dir (Path): The cache folder.
+        series_categories (dict | None): Kalshi's /series listing.
+        workers (int): The most worker processes for the day files.
+
+    Returns:
+        dict: merge()'s result.
+    """
+    summaries = load_or_build_summaries(cache_dir, workers=workers)
+    return merge(summaries, series_categories=series_categories,
+                 candle_set=candle_tickers(cache_dir))
+
+
+def _khat_for_page(cache_dir: Path, sweep: Any, series_categories: dict | None,
+                   failures: list[str]) -> dict | None:
+    """
+    The k view: this run's, saved for later, or the last one saved.
+
+    Args:
+        cache_dir (Path): The cache folder.
+        sweep (Any): A BacktestSweep, or None.
+        series_categories (dict | None): Kalshi's /series listing.
+        failures (list[str]): Collects failed steps.
+
+    Returns:
+        dict | None: khat_view's result for a sweep (None when the sweep has
+            no observations), else the saved view (None when none is saved).
+    """
+    if sweep is None:
+        return load_khat(cache_dir)
+    view = _step(failures, STEP_KHAT, khat_view, sweep, series_categories=series_categories)
+    if view is not None:
+        _step(failures, STEP_KHAT_SAVE, save_khat, cache_dir, view)
+    return view
+
+
+def build_eda_page(*, sweep: Any = None, series_categories: dict | None = None,
+                   workers: int = 1, cache_dir: Path | None = None,
+                   out_path: Path | None = None) -> Path | None:
+    """
+    Build the Data page from the cache and write it.
+
+    Counts the day files (reusing every saved summary that still matches),
+    joins them to the candle files, lists the cache folder and takes the k
+    figures from the sweep (and saves them) or, with no sweep, from the last
+    saved view; then writes the page to a temporary file beside `out_path` and
+    renames it into place. Reporting only, and it never raises: a step that
+    fails is logged as one WARNING with its traceback, named on the page, and
+    the rest of the page is still written.
+
+    Args:
+        sweep (Any): A backtester.BacktestSweep for the k view, or None to show
+            the last saved one.
+        series_categories (dict | None): Kalshi's /series listing; None reads
+            the cached copy (historical.load_series_categories(None)).
+        workers (int): The most worker processes for the day files (1 counts in
+            this process). With more than one, the caller must be under
+            `if __name__ == "__main__":`.
+        cache_dir (Path | None): The cache folder; None is historical.CACHE_DIR,
+            read now.
+        out_path (Path | None): Where to write the page; None is
+            config.PROJECT_ROOT / config.EDA_DASHBOARD_FILENAME, read now.
+
+    Returns:
+        Path | None: The page's path, or None when nothing could be written.
+    """
+    out: Path | None = None
+    failures: list[str] = []
+    try:
+        cache = Path(cache_dir) if cache_dir is not None else Path(historical.CACHE_DIR)
+        out = (Path(out_path) if out_path is not None
+               else Path(config.PROJECT_ROOT) / config.EDA_DASHBOARD_FILENAME)
+        if series_categories is None:
+            series_categories = _step(failures, STEP_LISTING,
+                                      historical.load_series_categories, None)
+        data: dict = {"merged": None, "candles": None}
+        data["merged"] = _step(failures, STEP_SUMMARIES, _count_days, cache,
+                               series_categories, workers)
+        if data["merged"] is not None:
+            data["candles"] = _step(failures, STEP_CANDLES, summarise_candles, cache,
+                                    data["merged"]["candles"])
+        data["inventory"] = _step(failures, STEP_INVENTORY, inventory, cache)
+        data["khat"] = _khat_for_page(cache, sweep, series_categories, failures)
+        built = datetime.now(UTC).strftime(BUILT_TIME_FORMAT)
+        text = _render(data, failures, built)
+    except Exception as exc:
+        logging.warning("Data page: the page could not be put together", exc_info=True)
+        if out is None:
+            return None
+        text = _fallback_page(_one_line(exc))
+    try:
+        return _write_page(out, text)
+    except Exception:
+        logging.warning("Data page: the page could not be written to %s", out, exc_info=True)
+        return None
+
+
+def _fallback_page(reason: str) -> str:
+    """
+    A page that only says the build failed.
+
+    Args:
+        reason (str): One line saying why.
+
+    Returns:
+        str: HTML.
+    """
+    return ('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+            f"<title>{_esc(PAGE_TITLE)}</title><style>{_CSS}</style></head><body><main>"
+            f"<h1>{_esc(PAGE_TITLE)}</h1>{_note(PAGE_FAILED.format(reason=reason), 'warn')}"
+            "</main></body></html>\n")
+
+
+def _configure_logging() -> None:
+    """
+    Send the log to kalshi_eda.log in PROJECT_ROOT, set up as backtest.py sets up its log.
+
+    No console handler: the path of the page is printed instead.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            # delay=True: the file is opened on the first message, so a run that
+            # exits before logging leaves no file (as backtest.py and main.py do)
+            logging.handlers.RotatingFileHandler(
+                Path(config.PROJECT_ROOT) / EDA_LOG_FILENAME, maxBytes=20 * 1024 * 1024,
+                backupCount=3, delay=True),
+        ],
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """
+    Rebuild the Data page from the cache, without a backtest.
+
+    It shows the k figures the last backtest saved (none yet is said on the
+    page). The page is written to config.PROJECT_ROOT /
+    config.EDA_DASHBOARD_FILENAME and its path printed.
+
+    Args:
+        argv (list[str] | None): Command-line arguments; None reads sys.argv.
+
+    Returns:
+        int: 0 when a page was written, 1 when none could be.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python3 -m kalshi_betting.eda",
+        description="Rebuild the Data page from backtest_cache/ (no backtest, no request "
+                    "to Kalshi). Reuses every saved day-file summary that still matches.")
+    parser.add_argument(
+        "--workers", type=int, default=_default_workers(),
+        help="Worker processes for counting day files (default: one less than this "
+             f"machine's CPUs, at most {config.EDA_MAX_WORKERS})")
+    args = parser.parse_args(argv)
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    _configure_logging()
+    page = build_eda_page(workers=min(args.workers, config.EDA_MAX_WORKERS))
+    if page is None:
+        print(MAIN_NO_PAGE)
+        return 1
+    print(page)
+    return 0
+
+
+def _default_workers() -> int:
+    """
+    The default number of worker processes.
+
+    Returns:
+        int: One less than the CPU count, at least 1 and at most config.EDA_MAX_WORKERS.
+    """
+    return max(1, min(config.EDA_MAX_WORKERS, (os.cpu_count() or 2) - 1))
+
+
+if __name__ == "__main__":
+    # Under this guard because summary workers are spawned and import this
+    # module again; without it each worker would run main() too.
+    raise SystemExit(main())

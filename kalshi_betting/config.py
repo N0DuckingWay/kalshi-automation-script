@@ -809,6 +809,10 @@ DASHBOARD_FILES_DIRNAME = "backtest_dashboard_files"
 # ─── Exploratory data summaries (eda.py; reporting only) ──────────────────────
 # Nothing that trades, sizes or backtests reads any of these; eda.py reads all
 # of them.
+# The exploratory Data page eda.build_eda_page writes under PROJECT_ROOT, beside
+# DASHBOARD_FILENAME (`python3 -m kalshi_betting.eda` rebuilds it from the cache
+# without a backtest). Read at call time.
+EDA_DASHBOARD_FILENAME = "eda_dashboard.html"
 # The folder under backtest_cache/ where each day slice's small summary is kept
 # (<this folder>/archive/<day>.json and <this folder>/live/<day>.json), so a
 # later run reads only the slices that are new or changed.
@@ -843,12 +847,29 @@ EDA_PRICE_LEADS_HOURS = (1, 24, 168)
 # last candle gives no price at that lead (the market had gone quiet).
 EDA_PRICE_MAX_AGE_HOURS = 24
 # Bump when the per-file candle facts (<cache>/eda_days/candles.json) change
-# shape: only the candle files are read again, never the day slices.
-EDA_CANDLE_FACTS_VERSION = 1
+# shape or meaning: only the candle files are read again, never the day slices.
+# Version 2 facts carry a per-lead "wide" flag and keep no price for a book
+# wider than EDA_MAX_BOOK_WIDTH.
+EDA_CANDLE_FACTS_VERSION = 2
+# A candle's price counts for the calibration only where its book was at most
+# this wide (dollars): the YES ask minus the YES bid, a missing bid counting as
+# a bid of 0. A book with an ask and no bid says only that nobody sold below
+# the ask, not that the market agreed on a price, so such a price would pull
+# the favourites' calibration down (a 99c ask with no bid settled Yes far less
+# often than a 99c ask with a bid).
+EDA_MAX_BOOK_WIDTH = 0.10
+# A point of a time series on the Data page (a category's share settled Yes in
+# one month) is drawn only when it holds at least this many markets, so a few
+# markets do not make a 0% or 100% spike.
+EDA_MIN_MARKETS_PER_POINT = 30
 # Width, in dollars, of the mid-spread bins of the k view: a deadline pair's
 # mid spread at entry is filed in the bin that holds it, and each bin reports
 # how often such pairs settled in between.
 EDA_KHAT_SPREAD_BIN = 0.05
+# Bump when the saved k view (<cache>/eda_days/khat.json) changes shape: a file
+# with another version, or none, is not shown (the page says no backtest has
+# saved its k figures until one does).
+EDA_KHAT_VERSION = 1
 
 # A build folder under DASHBOARD_FILES_DIRNAME still marked as being written
 # (its ".writing" file) is left alone while the mark is younger than this many
@@ -1062,7 +1083,8 @@ LIVE_DASHBOARD_FILE_BLOCK_BYTES = 1_048_576
 
 # The chart library the Live tab loads: the same Plotly build the backtest
 # page loads, and its integrity hash (the sha384 of that file, so the browser
-# runs it only when it is exactly that file).
+# runs it only when it is exactly that file). The Data page (eda.py) loads the
+# same copy.
 LIVE_DASHBOARD_PLOTLY_URL = "https://cdn.plot.ly/plotly-2.30.0.min.js"
 LIVE_DASHBOARD_PLOTLY_SRI = "sha384-H7GB7Kme/VbPI/0S4LNq7OixFNVRgRGE8kyqTntBuiXle1KBm8KWLQh/Ah6bXCYW"
 

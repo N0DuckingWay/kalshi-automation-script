@@ -7,14 +7,13 @@ Purpose:
     The short dictionary of the scores and terms the dashboards show: what
     each one means and why it is useful. Each term is tagged with the pages
     that show it, and a page lists only its own. The backtest dashboard and
-    the Data page (not built yet) will both render it from here, so a term
+    the Data page both render it from here, so a term
     reads the same on both. Reporting only: nothing that trades, sizes or
     backtests reads it.
 
 Dependencies:
     The standard library only (html). dashboard.py imports it for the backtest
-    page's Terms link and section; the Data page's builder will do the same
-    once it exists.
+    page's Terms link and section, and eda.py does the same for the Data page.
 
 Notes:
     Each definition describes how this codebase computes the figure, not the

@@ -28,6 +28,9 @@ scheduler_state.json.tmp
 backtest_cache/
 dashboard.html
 backtest_dashboard*.html
+# The exploratory Data page (config.EDA_DASHBOARD_FILENAME): rebuilt by
+# `python3 -m kalshi_betting.eda`
+eda_dashboard.html
 # The dashboard's sidecar data (config.DASHBOARD_FILES_DIRNAME): the chunks its
 # Sell select loads, one folder per build, kept beside the page
 /backtest_dashboard_files/
